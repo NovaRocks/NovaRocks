@@ -17,6 +17,7 @@
 
 //! Background worker and whole-table executor for standalone Iceberg OPTIMIZE.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Weak};
 use std::thread;
 use std::time::Duration;
@@ -440,6 +441,7 @@ pub(crate) fn execute_whole_table_rewrite(
         cleanup_path_mapper: abort_cleanup.path_mapper,
         cow_update_rewrite: None,
         target_ref: "main".to_string(),
+        snapshot_properties: BTreeMap::new(),
     }))??;
 
     invalidate_iceberg_caches(state, &target)?;

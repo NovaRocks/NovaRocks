@@ -23,6 +23,7 @@
 //! lifted from `table.file_io()` so that engine-side staging credentials and
 //! catalog-default credentials can differ when needed.
 
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -45,6 +46,22 @@ pub struct CommitCtx<'a> {
     /// Target ref for this commit. `"main"` is the default; non-`main`
     /// values are used for branch-qualified DML (`INSERT INTO t.branch_<x>`).
     pub target_ref: &'a str,
+    pub snapshot_properties: &'a BTreeMap<String, String>,
+}
+
+pub(super) fn merge_snapshot_summary_properties(
+    mut built_in: HashMap<String, String>,
+    snapshot_properties: &BTreeMap<String, String>,
+) -> Result<HashMap<String, String>, String> {
+    for key in snapshot_properties.keys() {
+        if built_in.contains_key(key) {
+            return Err(format!(
+                "snapshot property {key} conflicts with built-in summary field"
+            ));
+        }
+    }
+    built_in.extend(snapshot_properties.clone());
+    Ok(built_in)
 }
 
 #[async_trait]
@@ -55,4 +72,24 @@ pub trait IcebergCommitAction: Send + Sync {
     /// them up. On the success path the orchestrator does not call
     /// `AbortLog::cleanup`, so the records are harmless.
     async fn commit(&self, ctx: CommitCtx<'_>) -> Result<CommitOutcome, String>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_snapshot_summary_properties_rejects_builtin_collisions() {
+        let built_in = HashMap::from([("added-records".to_string(), "12".to_string())]);
+        let snapshot_properties = BTreeMap::from([
+            ("added-records".to_string(), "999".to_string()),
+            ("novarocks.mv.refresh_id".to_string(), "77".to_string()),
+        ]);
+
+        let err = merge_snapshot_summary_properties(built_in, &snapshot_properties).unwrap_err();
+        assert_eq!(
+            err,
+            "snapshot property added-records conflicts with built-in summary field"
+        );
+    }
 }

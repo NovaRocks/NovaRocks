@@ -1822,6 +1822,7 @@ mod tests {
         }
         block_on_iceberg(async {
             let file_io = loaded.table.file_io().clone();
+            let snapshot_properties = std::collections::BTreeMap::new();
             let ctx = CommitCtx {
                 collector: &collector,
                 table: &loaded.table,
@@ -1830,6 +1831,7 @@ mod tests {
                 commit_uuid: uuid::Uuid::new_v4(),
                 abort_handle: collector.abort_log.clone(),
                 target_ref: "main",
+                snapshot_properties: &snapshot_properties,
             };
             OverwriteCommit.commit(ctx).await
         })

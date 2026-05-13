@@ -2,6 +2,7 @@
 //! tables in the current Iceberg catalog. Aggregate shapes (phase4b) and any
 //! unsupported MV definitions are rejected here.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use iceberg::Catalog;
@@ -891,6 +892,7 @@ async fn commit_iceberg_mv_target_files(
         cleanup_path_mapper: abort_cleanup.path_mapper,
         cow_update_rewrite: None,
         target_ref: "main".to_string(),
+        snapshot_properties: BTreeMap::new(),
     })
     .await
 }

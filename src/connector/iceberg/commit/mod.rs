@@ -30,6 +30,7 @@ mod equality_delete_writer;
 pub mod expire_snapshots;
 mod fast_append;
 mod helpers;
+mod mv_refresh_ref;
 mod overwrite;
 mod overwrite_partitions;
 mod position_delete_writer;
@@ -55,6 +56,11 @@ pub use action::{CommitCtx, IcebergCommitAction};
 pub use collector::IcebergCommitCollector;
 pub use equality_delete_writer::{EqualityDeleteColumn, write_equality_delete_file};
 pub use fast_append::FastAppendCommit;
+pub use mv_refresh_ref::{
+    MV_ID_PROP, MV_REFRESH_ID_PROP, MV_REFRESH_TOKEN_PROP, MvRefreshPublishOutcome,
+    MvRefreshPublishPlan, MvRefreshSnapshotMarker, publish_staging_branch_to_main,
+    snapshot_matches_refresh_marker,
+};
 pub use overwrite::OverwriteCommit;
 pub use overwrite_partitions::OverwritePartitionsCommit;
 pub use position_delete_writer::{PositionDeleteGroup, write_position_delete_files};

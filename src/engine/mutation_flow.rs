@@ -315,6 +315,7 @@ fn execute_mor_update(
             cleanup_path_mapper: abort_cleanup.path_mapper,
             cow_update_rewrite: None,
             target_ref: target_ref.to_string(),
+            snapshot_properties: BTreeMap::new(),
         })
         .await
     })??;
@@ -509,6 +510,7 @@ fn execute_cow_update(
             cleanup_path_mapper: abort_cleanup.path_mapper,
             cow_update_rewrite: Some(rewrite),
             target_ref: target_ref.to_string(),
+            snapshot_properties: BTreeMap::new(),
         })
         .await
     })??;
@@ -1770,6 +1772,7 @@ fn execute_merge_matched_delete(
             cleanup_path_mapper: abort_cleanup.path_mapper,
             cow_update_rewrite: None,
             target_ref: "main".to_string(),
+            snapshot_properties: BTreeMap::new(),
         })
         .await
     })??;
@@ -1830,6 +1833,7 @@ fn execute_merge_unmatched_insert(
             cleanup_path_mapper: abort_cleanup.path_mapper,
             cow_update_rewrite: None,
             target_ref: "main".to_string(),
+            snapshot_properties: BTreeMap::new(),
         })
         .await
     })??;

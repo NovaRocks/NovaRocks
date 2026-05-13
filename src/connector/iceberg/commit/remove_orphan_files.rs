@@ -586,6 +586,7 @@ mod tests {
             });
             let file_io = current_table.file_io().clone();
             let abort_handle = collector.abort_log.clone();
+            let snapshot_properties = std::collections::BTreeMap::new();
             let ctx = CommitCtx {
                 collector: &collector,
                 table: &current_table,
@@ -594,6 +595,7 @@ mod tests {
                 commit_uuid: uuid::Uuid::new_v4(),
                 abort_handle,
                 target_ref: "main",
+                snapshot_properties: &snapshot_properties,
             };
             FastAppendCommit
                 .commit(ctx)

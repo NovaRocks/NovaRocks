@@ -28,6 +28,7 @@
 //! * `INSERT OVERWRITE iceberg VALUES (...)` — rejected with a clear error;
 //!   future Phase 1.x can lift this if the use case arises.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use iceberg::Catalog;
@@ -213,6 +214,7 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
             cleanup_path_mapper: abort_cleanup.path_mapper,
             cow_update_rewrite: None,
             target_ref: target_ref.to_string(),
+            snapshot_properties: BTreeMap::new(),
         })
         .await
     })??;

@@ -26,6 +26,7 @@
 //! other variant means we know the commit definitively failed and may safely
 //! clean up.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use iceberg::Catalog;
@@ -59,6 +60,7 @@ pub struct RunInput {
     /// Iceberg ref to commit to. `"main"` is the default; branch-qualified
     /// DML (`INSERT INTO t.branch_dev`) supplies the branch name here.
     pub target_ref: String,
+    pub snapshot_properties: BTreeMap<String, String>,
 }
 
 /// Dispatch a commit-action and handle abort/cleanup.
@@ -78,6 +80,7 @@ pub async fn run_iceberg_commit(input: RunInput) -> Result<CommitOutcome, String
         cleanup_path_mapper,
         cow_update_rewrite,
         target_ref,
+        snapshot_properties,
     } = input;
 
     let action: Box<dyn IcebergCommitAction> = match collector.op_kind {
@@ -111,6 +114,7 @@ pub async fn run_iceberg_commit(input: RunInput) -> Result<CommitOutcome, String
         commit_uuid: Uuid::new_v4(),
         abort_handle: collector.abort_log.clone(),
         target_ref: &target_ref,
+        snapshot_properties: &snapshot_properties,
     };
 
     match action.commit(ctx).await {

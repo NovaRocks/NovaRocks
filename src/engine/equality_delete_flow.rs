@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use arrow::array::{
@@ -142,6 +142,7 @@ pub(crate) fn execute_add_equality_delete_statement(
             cleanup_path_mapper: abort_cleanup.path_mapper,
             cow_update_rewrite: None,
             target_ref: "main".to_string(),
+            snapshot_properties: BTreeMap::new(),
         })
         .await
     })??;

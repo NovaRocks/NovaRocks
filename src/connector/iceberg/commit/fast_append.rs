@@ -20,6 +20,7 @@
 //! custom action so manifest-list `first_row_id` and snapshot row ranges are
 //! populated for subsequent `_row_id` scans and deletion-vector commits.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -33,7 +34,7 @@ use iceberg::transaction::{ActionCommit, ApplyTransactionAction, Transaction, Tr
 use iceberg::{TableRequirement, TableUpdate};
 use uuid::Uuid;
 
-use super::action::{CommitCtx, IcebergCommitAction};
+use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
 use super::data_file::written_file_to_iceberg_data_file;
 use super::helpers::{
     current_snapshot_total_records, generate_snapshot_id, metadata_dir, now_ms,
@@ -80,6 +81,13 @@ impl IcebergCommitAction for FastAppendCommit {
             IcebergWriteMode::RowLineageV3
         ) {
             return commit_v3_row_lineage_append(ctx, written).await;
+        }
+
+        if ctx.target_ref != "main" {
+            return Err(format!(
+                "FastAppendCommit branch target_ref={} requires the custom v3 row-lineage append path",
+                ctx.target_ref
+            ));
         }
 
         let data_files: Vec<iceberg::spec::DataFile> = written
@@ -135,6 +143,7 @@ async fn commit_v3_row_lineage_append(
         row_lineage_first_row_id,
         row_lineage_added_rows,
         target_ref: ctx.target_ref.to_string(),
+        snapshot_properties: ctx.snapshot_properties.clone(),
     };
 
     let tx = Transaction::new(ctx.table);
@@ -172,6 +181,7 @@ struct FastAppendV3TxnAction {
     row_lineage_first_row_id: u64,
     row_lineage_added_rows: u64,
     target_ref: String,
+    snapshot_properties: BTreeMap<String, String>,
 }
 
 #[async_trait]
@@ -192,6 +202,21 @@ impl TransactionAction for FastAppendV3TxnAction {
                     None
                 }
             });
+        let total_records = append_total_records(
+            &self.written,
+            current_snapshot_total_records(m).map_err(to_iceberg_unexpected)?,
+            parent_snapshot_id.is_some(),
+        )
+        .map_err(to_iceberg_unexpected)?;
+        let additional_properties = merge_snapshot_summary_properties(
+            append_summary(&self.written, total_records),
+            &self.snapshot_properties,
+        )
+        .map_err(to_iceberg_unexpected)?;
+        let summary = Summary {
+            operation: Operation::Append,
+            additional_properties,
+        };
         let metadata_dir = metadata_dir(table);
 
         let mut manifests: Vec<ManifestFile> = read_base_manifest_list(table, &self.file_io)
@@ -256,16 +281,6 @@ impl TransactionAction for FastAppendV3TxnAction {
             )));
         }
 
-        let total_records = append_total_records(
-            &self.written,
-            current_snapshot_total_records(m).map_err(to_iceberg_unexpected)?,
-            parent_snapshot_id.is_some(),
-        )
-        .map_err(to_iceberg_unexpected)?;
-        let summary = Summary {
-            operation: Operation::Append,
-            additional_properties: append_summary(&self.written, total_records),
-        };
         let snapshot = Snapshot::builder()
             .with_snapshot_id(new_snapshot_id)
             .with_parent_snapshot_id(parent_snapshot_id)
@@ -353,9 +368,18 @@ fn to_iceberg_unexpected(s: String) -> iceberg::Error {
 
 #[cfg(test)]
 mod tests {
-    use iceberg::spec::{DataContentType, DataFileFormat, Struct};
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::Arc;
+
+    use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+    use iceberg::spec::{
+        DataContentType, DataFileFormat, FormatVersion, NestedField, PrimitiveType, Schema, Struct,
+        Type,
+    };
+    use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 
     use super::*;
+    use crate::connector::iceberg::commit::{CommitOpKind, IcebergCommitCollector};
 
     #[test]
     fn type_compiles() {
@@ -389,6 +413,74 @@ mod tests {
         let summary = append_summary(&written, total_records);
 
         assert!(!summary.contains_key("total-records"));
+    }
+
+    #[tokio::test]
+    async fn v2_fast_append_rejects_branch_target_ref() {
+        let warehouse = format!("memory://test-warehouse-{}", Uuid::new_v4());
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            MemoryCatalogBuilder::default()
+                .load(
+                    "memory",
+                    HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse)]),
+                )
+                .await
+                .expect("MemoryCatalog::load"),
+        );
+        let namespace = NamespaceIdent::new("db".to_string());
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .expect("create_namespace");
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .expect("build schema");
+        let table = catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name("t".to_string())
+                    .schema(schema)
+                    .format_version(FormatVersion::V2)
+                    .build(),
+            )
+            .await
+            .expect("create_table");
+        let table_ident = TableIdent::new(namespace, "t".to_string());
+        let metadata = table.metadata();
+        let collector = Arc::new(IcebergCommitCollector::new(
+            CommitOpKind::FastAppend,
+            table_ident,
+            metadata.current_snapshot().map(|s| s.snapshot_id()),
+            metadata.last_sequence_number(),
+            metadata.current_schema().clone(),
+            metadata.default_partition_spec().clone(),
+            format!("{}/staging", metadata.location()),
+            crate::common::types::UniqueId { hi: 0, lo: 0 },
+        ));
+        collector.inject_written_file(test_written_data_file(1));
+        let file_io = table.file_io().clone();
+        let abort_handle = collector.abort_log.clone();
+        let snapshot_properties = BTreeMap::new();
+        let ctx = CommitCtx {
+            collector: &collector,
+            table: &table,
+            catalog: catalog.as_ref(),
+            file_io: &file_io,
+            commit_uuid: Uuid::new_v4(),
+            abort_handle,
+            target_ref: "branch_a",
+            snapshot_properties: &snapshot_properties,
+        };
+
+        let err = FastAppendCommit.commit(ctx).await.unwrap_err();
+        assert_eq!(
+            err,
+            "FastAppendCommit branch target_ref=branch_a requires the custom v3 row-lineage append path"
+        );
     }
 
     fn test_written_data_file(record_count: u64) -> WrittenFile {

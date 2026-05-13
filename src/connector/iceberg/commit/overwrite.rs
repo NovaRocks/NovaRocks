@@ -36,7 +36,7 @@
 //! 6. Returns an `ActionCommit` with `AddSnapshot + SetSnapshotRef` updates
 //!    and `AssertRefSnapshotId / SchemaId / SpecId` requirements.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -52,7 +52,7 @@ use iceberg::{TableRequirement, TableUpdate};
 use uuid::Uuid;
 
 use super::abort::AbortLog;
-use super::action::{CommitCtx, IcebergCommitAction};
+use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
 use super::helpers::{generate_snapshot_id, metadata_dir, now_ms, write_manifest_list};
 use super::types::{CommitOutcome, IcebergWriteMode, WrittenFile};
 
@@ -92,6 +92,7 @@ impl IcebergCommitAction for OverwriteCommit {
             row_lineage_first_row_id,
             row_lineage_added_rows,
             target_ref: ctx.target_ref.to_string(),
+            snapshot_properties: ctx.snapshot_properties.clone(),
         };
 
         let tx = Transaction::new(ctx.table);
@@ -132,6 +133,7 @@ struct OverwriteTxnAction {
     row_lineage_first_row_id: Option<u64>,
     row_lineage_added_rows: u64,
     target_ref: String,
+    snapshot_properties: BTreeMap<String, String>,
 }
 
 #[async_trait]
@@ -167,6 +169,16 @@ impl TransactionAction for OverwriteTxnAction {
         if self.written.is_empty() && existing.is_empty() {
             return Ok(ActionCommit::new(vec![], vec![]));
         }
+
+        let additional_properties = merge_snapshot_summary_properties(
+            overwrite_summary(&self.written, &existing),
+            &self.snapshot_properties,
+        )
+        .map_err(to_iceberg_unexpected)?;
+        let summary = Summary {
+            operation: Operation::Overwrite,
+            additional_properties,
+        };
 
         let mut new_manifests: Vec<ManifestFile> = Vec::with_capacity(2);
 
@@ -259,10 +271,6 @@ impl TransactionAction for OverwriteTxnAction {
         }
 
         // 5. Construct the Snapshot.
-        let summary = Summary {
-            operation: Operation::Overwrite,
-            additional_properties: overwrite_summary(&self.written, &existing),
-        };
         let snapshot = if let Some(first_row_id) = self.row_lineage_first_row_id {
             Snapshot::builder()
                 .with_snapshot_id(new_snapshot_id)

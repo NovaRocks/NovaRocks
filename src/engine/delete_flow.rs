@@ -221,6 +221,7 @@ pub(crate) fn execute_delete_statement(
                     cleanup_path_mapper: abort_cleanup.path_mapper,
                     cow_update_rewrite: None,
                     target_ref: target_ref.clone(),
+                    snapshot_properties: BTreeMap::new(),
                 })
                 .await
             })??;
@@ -254,6 +255,7 @@ pub(crate) fn execute_delete_statement(
                     cleanup_path_mapper: abort_cleanup.path_mapper,
                     cow_update_rewrite: None,
                     target_ref: target_ref.clone(),
+                    snapshot_properties: BTreeMap::new(),
                 })
                 .await
             })??;

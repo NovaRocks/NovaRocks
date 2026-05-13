@@ -29,6 +29,7 @@
 //! `TruncateCommit` action then drives the manifest writes through
 //! `run_iceberg_commit` exactly the same way `OverwriteCommit` does.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use iceberg::Catalog;
@@ -120,6 +121,7 @@ pub(crate) fn execute_iceberg_truncate_table(
             cleanup_path_mapper: abort_cleanup.path_mapper,
             cow_update_rewrite: None,
             target_ref: target_ref.to_string(),
+            snapshot_properties: BTreeMap::new(),
         })
         .await
     })??;

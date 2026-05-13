@@ -21,7 +21,7 @@
 //! Kept in its own module so the pattern can be reused for any future
 //! commit-action whose unit tests need a `MemoryCatalog`-backed table fixture.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
@@ -129,6 +129,7 @@ where
 
     let file_io = fixture.table.file_io().clone();
     let abort_handle = collector.abort_log.clone();
+    let snapshot_properties = BTreeMap::new();
     let ctx = CommitCtx {
         collector: &collector,
         table: &fixture.table,
@@ -137,6 +138,7 @@ where
         commit_uuid: Uuid::new_v4(),
         abort_handle,
         target_ref,
+        snapshot_properties: &snapshot_properties,
     };
 
     action.commit(ctx).await
@@ -193,6 +195,7 @@ pub(crate) async fn v3_table_with_n_data_files(n: usize) -> IcebergTestFixture {
     }
     let file_io = fixture.table.file_io().clone();
     let abort_handle = collector.abort_log.clone();
+    let snapshot_properties = BTreeMap::new();
     let ctx = CommitCtx {
         collector: &collector,
         table: &fixture.table,
@@ -201,6 +204,7 @@ pub(crate) async fn v3_table_with_n_data_files(n: usize) -> IcebergTestFixture {
         commit_uuid: Uuid::new_v4(),
         abort_handle,
         target_ref: "main",
+        snapshot_properties: &snapshot_properties,
     };
     FastAppendCommit
         .commit(ctx)
@@ -263,6 +267,7 @@ pub(crate) async fn v3_table_with_multi_batch_appends(batches: &[usize]) -> Iceb
         }
         let file_io = fixture.table.file_io().clone();
         let abort_handle = collector.abort_log.clone();
+        let snapshot_properties = BTreeMap::new();
         let ctx = CommitCtx {
             collector: &collector,
             table: &fixture.table,
@@ -271,6 +276,7 @@ pub(crate) async fn v3_table_with_multi_batch_appends(batches: &[usize]) -> Iceb
             commit_uuid: Uuid::new_v4(),
             abort_handle,
             target_ref: "main",
+            snapshot_properties: &snapshot_properties,
         };
         FastAppendCommit
             .commit(ctx)
@@ -426,6 +432,7 @@ pub(crate) async fn v3_partitioned_table_with_data() -> IcebergTestFixture {
     }
     let file_io = fixture.table.file_io().clone();
     let abort_handle = collector.abort_log.clone();
+    let snapshot_properties = BTreeMap::new();
     let ctx = CommitCtx {
         collector: &collector,
         table: &fixture.table,
@@ -434,6 +441,7 @@ pub(crate) async fn v3_partitioned_table_with_data() -> IcebergTestFixture {
         commit_uuid: Uuid::new_v4(),
         abort_handle,
         target_ref: "main",
+        snapshot_properties: &snapshot_properties,
     };
     FastAppendCommit
         .commit(ctx)
@@ -471,6 +479,7 @@ pub(crate) async fn run_overwrite_partitions_commit(
     }
     let file_io = fixture.table.file_io().clone();
     let abort_handle = collector.abort_log.clone();
+    let snapshot_properties = BTreeMap::new();
     let ctx = CommitCtx {
         collector: &collector,
         table: &fixture.table,
@@ -479,6 +488,7 @@ pub(crate) async fn run_overwrite_partitions_commit(
         commit_uuid: Uuid::new_v4(),
         abort_handle,
         target_ref: "main",
+        snapshot_properties: &snapshot_properties,
     };
     OverwritePartitionsCommit.commit(ctx).await
 }
