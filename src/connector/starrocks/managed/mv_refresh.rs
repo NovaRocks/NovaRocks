@@ -293,7 +293,11 @@ pub(crate) fn refresh_mv(
                 &tagged_select_sql,
                 source_files,
             )?;
-            let (chunks, row_delta) = tagged_projection_change_chunks(delta_result)?;
+            let (chunks, row_delta) = if mv_definition.primary_key_columns.is_empty() {
+                tagged_projection_insert_chunks(delta_result)?
+            } else {
+                tagged_projection_change_chunks(delta_result)?
+            };
             let resolved_mv = crate::engine::ResolvedLocalTableName {
                 database: db_name.clone(),
                 table: mv_name.clone(),
@@ -924,6 +928,55 @@ fn tagged_projection_change_chunks(result: QueryResult) -> Result<(Vec<Chunk>, i
             "projection/filter MV row-count delta overflow: inserts={insert_rows} deletes={delete_rows}"
         )
     })?;
+    Ok((chunks, row_delta))
+}
+
+fn tagged_projection_insert_chunks(result: QueryResult) -> Result<(Vec<Chunk>, i64), String> {
+    let mut chunks = Vec::new();
+    let mut row_delta = 0_i64;
+
+    for chunk in result.chunks {
+        let batch = chunk.batch;
+        let change_op_index = find_change_op_column(&batch)?;
+        let change_ops = batch
+            .column(change_op_index)
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .ok_or_else(|| {
+                format!(
+                    "projection/filter MV delta source column `{CHANGE_OP_COLUMN}` must be Int8"
+                )
+            })?;
+
+        for row in 0..batch.num_rows() {
+            if change_ops.is_null(row) {
+                return Err(format!(
+                    "projection/filter MV delta source column `{CHANGE_OP_COLUMN}` contains NULL"
+                ));
+            }
+            match change_ops.value(row) {
+                CHANGE_OP_INSERT => {}
+                CHANGE_OP_DELETE => {
+                    return Err(
+                        "non-primary-key projection/filter MV incremental refresh cannot apply delete rows; define PRIMARY KEY on the MV or use full refresh"
+                            .to_string(),
+                    );
+                }
+                op => {
+                    return Err(format!(
+                        "projection/filter MV delta source column `{CHANGE_OP_COLUMN}` contains invalid value {op}; expected {CHANGE_OP_INSERT} or {CHANGE_OP_DELETE}"
+                    ));
+                }
+            }
+        }
+
+        if batch.num_rows() > 0 {
+            row_delta = add_row_count(row_delta, batch.num_rows())?;
+            let without_change_op = record_batch_without_column(batch, change_op_index)?;
+            chunks.push(record_batch_to_chunk(without_change_op)?);
+        }
+    }
+
     Ok((chunks, row_delta))
 }
 
@@ -2137,6 +2190,47 @@ mod tests {
         let err = tagged_projection_change_chunks(result).expect_err("null op must fail");
 
         assert!(err.contains("contains NULL"));
+    }
+
+    #[test]
+    fn projection_insert_only_change_strips_change_op_for_non_pk_write() {
+        use arrow::array::{Int8Array, StringArray};
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new(
+                    crate::exec::change_op::CHANGE_OP_COLUMN,
+                    DataType::Int8,
+                    false,
+                ),
+                Field::new("name", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![10, 20])) as ArrayRef,
+                Arc::new(Int8Array::from(vec![1, 1])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef,
+            ],
+        )
+        .expect("record batch");
+        let result = QueryResult {
+            columns: Vec::new(),
+            chunks: vec![record_batch_to_chunk(batch).expect("chunk")],
+        };
+
+        let (chunks, row_delta) =
+            tagged_projection_insert_chunks(result).expect("insert-only chunks");
+
+        assert_eq!(row_delta, 2);
+        assert_eq!(chunks.len(), 1);
+        let names = chunks[0]
+            .batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["id", "name"]);
     }
 
     #[test]
