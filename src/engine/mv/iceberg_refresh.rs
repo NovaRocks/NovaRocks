@@ -112,7 +112,7 @@ pub(crate) fn create_iceberg_mv(
         .map_err(|e| e.to_string())?;
     }
 
-    // 2. Create the empty Iceberg v2 target table in the current catalog.
+    // 2. Create the empty Iceberg v3 target table in the current catalog.
     let columns = analysis
         .output_columns
         .iter()
@@ -125,7 +125,10 @@ pub(crate) fn create_iceberg_mv(
         &columns,
         None,
         &[],
-        &[("format-version".to_string(), "2".to_string())],
+        &[
+            ("format-version".to_string(), "3".to_string()),
+            ("write.row-lineage".to_string(), "true".to_string()),
+        ],
     )?;
 
     // 3. Persist MV metadata in the repository.
@@ -1506,6 +1509,42 @@ mod tests {
              AS SELECT id, name FROM ice.sales.orders"
         ));
         create_iceberg_mv(state, current_catalog, current_db, &stmt).expect("create iceberg mv");
+    }
+
+    #[test]
+    fn create_iceberg_mv_creates_branch_capable_v3_target() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_orders
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders",
+        );
+
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create iceberg mv");
+
+        let entry = {
+            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get("ice").expect("catalog")
+        };
+        let loaded =
+            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
+                .expect("load target table");
+        assert_eq!(
+            loaded.table.metadata().format_version(),
+            iceberg::spec::FormatVersion::V3
+        );
+        assert_eq!(
+            loaded
+                .table
+                .metadata()
+                .properties()
+                .get("write.row-lineage")
+                .map(String::as_str),
+            Some("true")
+        );
     }
 
     #[test]
