@@ -1984,9 +1984,153 @@ fn mv_repository_branch_staged_refresh_lifecycle() -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+#[test]
+fn mv_repository_lists_unfinished_refreshes() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = MvMetaRepository::default();
+    let mv_id = create_test_iceberg_mv(&provider, &repository)?;
+
+    let mut txn = provider.begin_write("begin refresh")?;
+    let refresh = repository.begin_iceberg_refresh_intent(
+        txn.as_mut(),
+        BeginIcebergMvRefreshRequest {
+            mv_id,
+            target_catalog: "ice".to_string(),
+            target_namespace: "analytics".to_string(),
+            target_table: "orders_mv".to_string(),
+            staging_branch: "__nova_mv_refresh_1_1".to_string(),
+            expected_main_snapshot_id: Some(10),
+            base_snapshots: BTreeMap::new(),
+            marker_token: "token".to_string(),
+        },
+    )?;
+    txn.commit()?;
+
+    let read = provider.begin_read()?;
+    let unfinished = repository.list_unfinished_refreshes(read.as_ref())?;
+    assert_eq!(unfinished.len(), 1);
+    assert_eq!(unfinished[0].refresh_id, refresh.refresh_id);
+    Ok(())
+}
+
+#[test]
+fn mv_repository_branch_staged_recovery_scan_filters_plain_refresh()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = MvMetaRepository::default();
+    let mv_id = create_test_iceberg_mv(&provider, &repository)?;
+
+    let mut txn = provider.begin_write("begin plain refresh")?;
+    repository.begin_refresh_intent(txn.as_mut(), mv_id, BTreeMap::new())?;
+    txn.commit()?;
+
+    let read = provider.begin_read()?;
+    let unfinished = repository.list_unfinished_branch_staged_iceberg_refreshes(read.as_ref())?;
+    assert!(unfinished.is_empty());
+    Ok(())
+}
+
+#[test]
+fn mv_repository_branch_staged_recovery_scan_returns_branch_staged()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = MvMetaRepository::default();
+    let mv_id = create_test_iceberg_mv(&provider, &repository)?;
+    let refresh_id = begin_test_branch_staged_refresh(&provider, &repository, mv_id)?;
+
+    let read = provider.begin_read()?;
+    let unfinished = repository.list_unfinished_branch_staged_iceberg_refreshes(read.as_ref())?;
+    assert_eq!(unfinished.len(), 1);
+    assert_eq!(unfinished[0].refresh_id, refresh_id);
+    Ok(())
+}
+
+#[test]
+fn mv_repository_branch_staged_recovery_scan_excludes_terminal_states()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = MvMetaRepository::default();
+    let aborted_mv_id = create_named_test_iceberg_mv(&provider, &repository, "aborted_mv")?;
+    let finalized_mv_id = create_named_test_iceberg_mv(&provider, &repository, "finalized_mv")?;
+    let aborted_refresh_id = begin_named_test_branch_staged_refresh(
+        &provider,
+        &repository,
+        aborted_mv_id,
+        "aborted_mv",
+    )?;
+    let finalized_refresh_id = begin_named_test_branch_staged_refresh(
+        &provider,
+        &repository,
+        finalized_mv_id,
+        "finalized_mv",
+    )?;
+
+    {
+        let mut txn = provider.begin_write("abort branch staged refresh")?;
+        repository.clear_refresh_progress(txn.as_mut(), aborted_mv_id)?;
+        txn.commit()?;
+    }
+
+    {
+        let mut txn = provider.begin_write("finalize branch staged refresh")?;
+        repository.record_staging_commit(
+            txn.as_mut(),
+            RecordStagingCommitRequest {
+                refresh_id: finalized_refresh_id,
+                staging_snapshot_id: 300,
+                rows: 3,
+                base_table_uuids: BTreeMap::new(),
+            },
+        )?;
+        repository.record_publish_commit(
+            txn.as_mut(),
+            RecordPublishCommitRequest {
+                refresh_id: finalized_refresh_id,
+                published_snapshot_id: 300,
+            },
+        )?;
+        repository.finalize_refresh(
+            txn.as_mut(),
+            MvRefreshFinalizeRequest {
+                refresh_id: finalized_refresh_id,
+                rows: 3,
+                base_snapshots: BTreeMap::new(),
+                base_table_uuids: BTreeMap::new(),
+                target_snapshot_id: Some(300),
+            },
+        )?;
+        txn.commit()?;
+    }
+
+    let read = provider.begin_read()?;
+    let unfinished = repository.list_unfinished_branch_staged_iceberg_refreshes(read.as_ref())?;
+    assert!(unfinished.is_empty());
+    let aborted = repository
+        .load_refresh(read.as_ref(), aborted_refresh_id)?
+        .expect("aborted refresh");
+    assert_eq!(aborted.state, MvRefreshState::Aborted);
+    let finalized = repository
+        .load_refresh(read.as_ref(), finalized_refresh_id)?
+        .expect("finalized refresh");
+    assert_eq!(finalized.state, MvRefreshState::Finalized);
+    Ok(())
+}
+
 fn create_test_iceberg_mv(
     provider: &SqliteMetaStoreProvider,
     repository: &MvMetaRepository,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    create_named_test_iceberg_mv(provider, repository, "orders_mv")
+}
+
+fn create_named_test_iceberg_mv(
+    provider: &SqliteMetaStoreProvider,
+    repository: &MvMetaRepository,
+    target_table: &str,
 ) -> Result<i64, Box<dyn std::error::Error>> {
     let mut txn = provider.begin_write("create test iceberg mv")?;
     let definition = repository.create_definition(
@@ -1998,7 +2142,7 @@ fn create_test_iceberg_mv(
             storage_engine: "iceberg".to_string(),
             target_catalog: Some("ice".to_string()),
             target_namespace: Some("analytics".to_string()),
-            target_table: Some("orders_mv".to_string()),
+            target_table: Some(target_table.to_string()),
             created_at_ms: 11,
         },
     )?;
@@ -2011,6 +2155,15 @@ fn begin_test_branch_staged_refresh(
     repository: &MvMetaRepository,
     mv_id: i64,
 ) -> Result<i64, Box<dyn std::error::Error>> {
+    begin_named_test_branch_staged_refresh(provider, repository, mv_id, "orders_mv")
+}
+
+fn begin_named_test_branch_staged_refresh(
+    provider: &SqliteMetaStoreProvider,
+    repository: &MvMetaRepository,
+    mv_id: i64,
+    target_table: &str,
+) -> Result<i64, Box<dyn std::error::Error>> {
     let mut txn = provider.begin_write("begin test branch staged refresh")?;
     let refresh = repository.begin_iceberg_refresh_intent(
         txn.as_mut(),
@@ -2018,8 +2171,8 @@ fn begin_test_branch_staged_refresh(
             mv_id,
             target_catalog: "ice".to_string(),
             target_namespace: "analytics".to_string(),
-            target_table: "orders_mv".to_string(),
-            staging_branch: "__nova_mv_refresh_1_1001".to_string(),
+            target_table: target_table.to_string(),
+            staging_branch: format!("__nova_mv_refresh_{mv_id}_1001"),
             expected_main_snapshot_id: Some(200),
             base_snapshots: BTreeMap::from([("iceberg.sales.orders".to_string(), 50)]),
             marker_token: "marker-token-1001".to_string(),

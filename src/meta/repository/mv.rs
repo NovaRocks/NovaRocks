@@ -622,6 +622,43 @@ impl MvMetaRepository {
         Ok(load_versioned_refresh(txn, refresh_id)?.map(|versioned| versioned.value))
     }
 
+    pub fn list_unfinished_refreshes(
+        &self,
+        txn: &dyn MetaReadTxn,
+    ) -> RepositoryResult<Vec<StoredMvRefresh>> {
+        Ok(txn
+            .scan(&key_prefix_refresh()?, None)?
+            .into_iter()
+            .map(decode_refresh_record)
+            .collect::<RepositoryResult<Vec<_>>>()?
+            .into_iter()
+            .map(|versioned| versioned.value)
+            .filter(|refresh| {
+                !matches!(
+                    refresh.state,
+                    MvRefreshState::Finalized | MvRefreshState::Aborted
+                )
+            })
+            .collect())
+    }
+
+    pub fn list_unfinished_branch_staged_iceberg_refreshes(
+        &self,
+        txn: &dyn MetaReadTxn,
+    ) -> RepositoryResult<Vec<StoredMvRefresh>> {
+        Ok(self
+            .list_unfinished_refreshes(txn)?
+            .into_iter()
+            .filter(|refresh| {
+                refresh.target_catalog.is_some()
+                    && refresh.target_namespace.is_some()
+                    && refresh.target_table.is_some()
+                    && refresh.staging_branch.is_some()
+                    && refresh.marker.is_some()
+            })
+            .collect())
+    }
+
     pub fn record_external_commit_outcome(
         &self,
         txn: &mut dyn MetaWriteTxn,
@@ -816,14 +853,16 @@ fn load_versioned_refresh(
     refresh_id: i64,
 ) -> RepositoryResult<Option<VersionedMvRefresh>> {
     txn.get(&key_refresh(refresh_id)?)?
-        .map(|record| {
-            let value = decode_record_payload(&record, MV_REFRESH_KIND, MV_REFRESH_SCHEMA_VERSION)?;
-            Ok(VersionedMvRefresh {
-                record_revision: record.revision,
-                value,
-            })
-        })
+        .map(decode_refresh_record)
         .transpose()
+}
+
+fn decode_refresh_record(record: MetaRecord) -> RepositoryResult<VersionedMvRefresh> {
+    let value = decode_record_payload(&record, MV_REFRESH_KIND, MV_REFRESH_SCHEMA_VERSION)?;
+    Ok(VersionedMvRefresh {
+        record_revision: record.revision,
+        value,
+    })
 }
 
 fn put_definition(
@@ -924,6 +963,10 @@ fn key_by_id(mv_id: i64) -> RepositoryResult<MetaKey> {
 
 fn key_prefix_by_id() -> RepositoryResult<MetaKeyPrefix> {
     Ok(MetaKeyPrefix::new(NS_MV, ["by-id"])?)
+}
+
+fn key_prefix_refresh() -> RepositoryResult<MetaKeyPrefix> {
+    Ok(MetaKeyPrefix::new(NS_MV, ["refresh"])?)
 }
 
 fn key_by_target(catalog: &str, namespace: &str, table: &str) -> RepositoryResult<MetaKey> {

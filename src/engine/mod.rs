@@ -1766,6 +1766,7 @@ fn resolve_relative_path(path: &Path, config_path: Option<&Path>) -> Result<Path
 fn restore_metadata_if_needed(state: &Arc<StandaloneState>) -> Result<(), String> {
     restore_managed_lake(state)?;
     restore_iceberg_catalogs(state)?;
+    crate::engine::mv::iceberg_refresh::recover_iceberg_mv_refreshes(state)?;
     crate::engine::mv::iceberg_refresh::restore_iceberg_mv_targets(state)?;
     Ok(())
 }

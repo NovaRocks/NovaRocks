@@ -17,7 +17,7 @@ use crate::connector::iceberg::changes::{
 use crate::connector::iceberg::commit::{
     CommitOpKind, CommitOutcome, IcebergCommitCollector, MvRefreshPublishPlan,
     MvRefreshSnapshotMarker, RefAction, RefActionPlan, RunInput, execute_ref_action,
-    publish_staging_branch_to_main, run_iceberg_commit,
+    publish_staging_branch_to_main, run_iceberg_commit, snapshot_matches_refresh_marker,
 };
 use crate::connector::iceberg::data_writer::write_record_batches_as_data_files;
 use crate::connector::starrocks::managed::model::{IcebergTableRef, ManagedMvStorageEngine};
@@ -38,7 +38,7 @@ use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::mv::{
     BeginIcebergMvRefreshRequest, CreateMvDefinitionRequest, MvRefreshFinalizeRequest,
     MvRefreshState, RecordPublishCommitRequest, RecordStagingCommitRequest, RefreshExternalOutcome,
-    StoredMvDefinition,
+    StoredMvDefinition, StoredMvRefresh,
 };
 use crate::runtime::global_async_runtime::data_block_on;
 #[cfg(test)]
@@ -309,6 +309,45 @@ pub(crate) fn restore_iceberg_mv_targets(state: &Arc<StandaloneState>) -> Result
     Ok(())
 }
 
+pub(crate) fn recover_iceberg_mv_refreshes(state: &Arc<StandaloneState>) -> Result<(), String> {
+    let Some(provider) = state.metadata_provider.as_ref() else {
+        return Ok(());
+    };
+    let read = provider
+        .begin_read()
+        .map_err(|e| format!("open iceberg MV refresh recovery read transaction failed: {e}"))?;
+    let unfinished = state
+        .mv_repo
+        .list_unfinished_branch_staged_iceberg_refreshes(read.as_ref())
+        .map_err(|e| format!("load unfinished iceberg MV refreshes failed: {e}"))?;
+    drop(read);
+    for refresh in unfinished {
+        recover_one_iceberg_mv_refresh(state, refresh)?;
+    }
+    Ok(())
+}
+
+fn recover_one_iceberg_mv_refresh(
+    state: &Arc<StandaloneState>,
+    refresh: StoredMvRefresh,
+) -> Result<(), String> {
+    let target =
+        IcebergMvTarget {
+            catalog: refresh.target_catalog.clone().ok_or_else(|| {
+                format!("mv refresh {} missing target catalog", refresh.refresh_id)
+            })?,
+            namespace: refresh.target_namespace.clone().ok_or_else(|| {
+                format!("mv refresh {} missing target namespace", refresh.refresh_id)
+            })?,
+            table: refresh
+                .target_table
+                .clone()
+                .ok_or_else(|| format!("mv refresh {} missing target table", refresh.refresh_id))?,
+        };
+    let (entry, catalog, loaded) = load_iceberg_mv_target(state, &target)?;
+    reconcile_iceberg_mv_refresh(state, refresh, &target, &entry, &catalog, &loaded.table)
+}
+
 pub(crate) fn resolve_refresh_target(
     current_catalog: Option<&str>,
     current_database: &str,
@@ -411,6 +450,7 @@ pub(crate) fn refresh_iceberg_mv(
 ) -> Result<StatementResult, String> {
     let _refresh_guard = acquire_mv_refresh_lock()?;
     let target = resolve_refresh_target(current_catalog, current_database, &stmt.name)?;
+    recover_iceberg_mv_refreshes(state)?;
     let mv_definition = load_iceberg_mv_definition_by_target(state, &target)?;
     let (target_entry, iceberg_catalog, target_loaded) = load_iceberg_mv_target(state, &target)?;
     validate_target_snapshot(&target, &mv_definition, &target_loaded.table)?;
@@ -546,32 +586,20 @@ pub(crate) fn refresh_iceberg_mv(
         }
 
         // Incremental: base snapshot has advanced.
-        (Some(prev), Some(cur)) => {
-            let refresh_id = begin_staged_iceberg_mv_refresh_intent(
-                state,
-                &target,
-                mv_definition.mv_id,
-                expected_main_snapshot_id,
-                single_snapshot_map(base_ref, cur),
-                &staging_branch,
-            )?;
-            incremental_refresh_iceberg_mv(
-                state,
-                &target,
-                &target_entry,
-                &iceberg_catalog,
-                expected_main_snapshot_id,
-                &staging_branch,
-                refresh_id,
-                current_database,
-                &mv_definition,
-                base_ref,
-                prev,
-                cur,
-                &loaded.table,
-                &current_table_uuid,
-            )
-        }
+        (Some(prev), Some(cur)) => incremental_refresh_iceberg_mv(
+            state,
+            &target,
+            &target_entry,
+            &iceberg_catalog,
+            expected_main_snapshot_id,
+            current_database,
+            &mv_definition,
+            base_ref,
+            prev,
+            cur,
+            &loaded.table,
+            &current_table_uuid,
+        ),
 
         // Previous snapshot no longer reachable.
         (Some(prev), None) => Err(format!(
@@ -711,6 +739,185 @@ fn mark_iceberg_mv_refresh_commit_unknown(
     txn.commit()
         .map_err(|e| format!("commit iceberg mv commit-unknown marker failed: {e}"))?;
     Ok(())
+}
+
+fn mark_iceberg_mv_refresh_aborted(
+    state: &Arc<StandaloneState>,
+    refresh_id: i64,
+) -> Result<(), String> {
+    abort_iceberg_mv_refresh(state, refresh_id)
+}
+
+fn reconcile_iceberg_mv_refresh(
+    state: &Arc<StandaloneState>,
+    refresh: StoredMvRefresh,
+    target: &IcebergMvTarget,
+    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    _catalog: &Arc<dyn iceberg::Catalog>,
+    table: &iceberg::table::Table,
+) -> Result<(), String> {
+    let main = table.metadata().current_snapshot().map(|s| s.snapshot_id());
+    let staging_branch = refresh
+        .staging_branch
+        .as_deref()
+        .ok_or_else(|| format!("mv refresh {} missing staging branch", refresh.refresh_id))?;
+    let staging = table
+        .metadata()
+        .refs()
+        .get(staging_branch)
+        .map(|r| r.snapshot_id);
+
+    match refresh.state {
+        MvRefreshState::IntentCreated => {
+            if main == refresh.expected_main_snapshot_id {
+                match staging {
+                    None => {
+                        mark_iceberg_mv_refresh_aborted(state, refresh.refresh_id)?;
+                        Ok(())
+                    }
+                    Some(staging_snapshot_id)
+                        if snapshot_id_matches_refresh_marker(
+                            table,
+                            staging_snapshot_id,
+                            &refresh,
+                        )? =>
+                    {
+                        drop_iceberg_mv_staging_branch(state, target, entry, staging_branch)?;
+                        mark_iceberg_mv_refresh_aborted(state, refresh.refresh_id)?;
+                        Ok(())
+                    }
+                    _ => mark_iceberg_mv_refresh_commit_unknown(state, refresh.refresh_id),
+                }
+            } else {
+                mark_iceberg_mv_refresh_commit_unknown(state, refresh.refresh_id)
+            }
+        }
+        MvRefreshState::StagingCommitted => {
+            if main == refresh.expected_main_snapshot_id
+                && staging.is_none()
+                && refresh.staging_snapshot_id.is_some()
+            {
+                mark_iceberg_mv_refresh_aborted(state, refresh.refresh_id)?;
+                return Ok(());
+            }
+            if main == refresh.expected_main_snapshot_id
+                && staging == refresh.staging_snapshot_id
+                && refresh
+                    .staging_snapshot_id
+                    .map(|snapshot_id| {
+                        snapshot_id_matches_refresh_marker(table, snapshot_id, &refresh)
+                    })
+                    .transpose()?
+                    == Some(true)
+            {
+                drop_iceberg_mv_staging_branch(state, target, entry, staging_branch)?;
+                mark_iceberg_mv_refresh_aborted(state, refresh.refresh_id)?;
+                return Ok(());
+            }
+            if main == refresh.staging_snapshot_id
+                && refresh
+                    .staging_snapshot_id
+                    .map(|snapshot_id| {
+                        snapshot_id_matches_refresh_marker(table, snapshot_id, &refresh)
+                    })
+                    .transpose()?
+                    == Some(true)
+            {
+                record_iceberg_mv_publish_commit(
+                    state,
+                    refresh.refresh_id,
+                    refresh.staging_snapshot_id.ok_or_else(|| {
+                        format!("mv refresh {} missing staging snapshot", refresh.refresh_id)
+                    })?,
+                )?;
+                if staging.is_some() {
+                    drop_iceberg_mv_staging_branch(state, target, entry, staging_branch)?;
+                }
+                finalize_recovered_iceberg_mv_refresh(state, &refresh)?;
+                return Ok(());
+            }
+            mark_iceberg_mv_refresh_commit_unknown(state, refresh.refresh_id)?;
+            Ok(())
+        }
+        MvRefreshState::PublishCommitted => {
+            let published_snapshot_id =
+                recovered_published_snapshot_id(&refresh).ok_or_else(|| {
+                    format!(
+                        "mv refresh {} missing published snapshot",
+                        refresh.refresh_id
+                    )
+                })?;
+            if main == Some(published_snapshot_id)
+                && snapshot_id_matches_refresh_marker(table, published_snapshot_id, &refresh)?
+            {
+                if staging.is_some() {
+                    drop_iceberg_mv_staging_branch(state, target, entry, staging_branch)?;
+                }
+                finalize_recovered_iceberg_mv_refresh(state, &refresh)?;
+                return Ok(());
+            }
+            mark_iceberg_mv_refresh_commit_unknown(state, refresh.refresh_id)?;
+            Ok(())
+        }
+        MvRefreshState::Finalized | MvRefreshState::Aborted => Ok(()),
+        _ => mark_iceberg_mv_refresh_commit_unknown(state, refresh.refresh_id),
+    }
+}
+
+fn snapshot_id_matches_refresh_marker(
+    table: &iceberg::table::Table,
+    snapshot_id: i64,
+    refresh: &StoredMvRefresh,
+) -> Result<bool, String> {
+    let Some(marker) = refresh.marker.as_ref() else {
+        return Ok(false);
+    };
+    let marker = MvRefreshSnapshotMarker {
+        refresh_id: marker.refresh_id,
+        mv_id: marker.mv_id,
+        token: marker.token.clone(),
+    };
+    let Some(snapshot) = table.metadata().snapshot_by_id(snapshot_id) else {
+        return Ok(false);
+    };
+    Ok(snapshot_matches_refresh_marker(snapshot, &marker))
+}
+
+fn recovered_published_snapshot_id(refresh: &StoredMvRefresh) -> Option<i64> {
+    refresh.published_snapshot_id.or_else(|| {
+        refresh
+            .external_outcome
+            .as_ref()
+            .and_then(|outcome| outcome.target_snapshot_id)
+    })
+}
+
+fn finalize_recovered_iceberg_mv_refresh(
+    state: &Arc<StandaloneState>,
+    refresh: &StoredMvRefresh,
+) -> Result<(), String> {
+    let target_snapshot_id = recovered_published_snapshot_id(refresh)
+        .or(refresh.staging_snapshot_id)
+        .ok_or_else(|| {
+            format!(
+                "mv refresh {} missing recovered target snapshot",
+                refresh.refresh_id
+            )
+        })?;
+    let rows = refresh.rows.ok_or_else(|| {
+        format!(
+            "mv refresh {} missing recovered row count",
+            refresh.refresh_id
+        )
+    })?;
+    finalize_iceberg_mv_refresh(
+        state,
+        refresh.refresh_id,
+        rows,
+        refresh.target_snapshots.clone(),
+        refresh.base_table_uuids.clone(),
+        target_snapshot_id,
+    )
 }
 
 fn handle_iceberg_mv_commit_error(
@@ -1161,6 +1368,9 @@ fn first_refresh_iceberg_mv(
         mv_definition.mv_id,
     )?;
     record_iceberg_mv_publish_commit(state, refresh_id, published_snapshot_id)?;
+    // Once publish is recorded, cleanup must happen before terminal metadata
+    // finalization so recovery can retry cleanup after a crash.
+    drop_iceberg_mv_staging_branch(state, target, target_entry, staging_branch)?;
     finalize_iceberg_mv_refresh(
         state,
         refresh_id,
@@ -1169,8 +1379,6 @@ fn first_refresh_iceberg_mv(
         table_uuids.clone(),
         published_snapshot_id,
     )?;
-    // 5. Drop the staging branch and update the in-memory catalog.
-    drop_iceberg_mv_staging_branch(state, target, target_entry, staging_branch)?;
 
     tracing::info!(
         "iceberg mv {}.{}.{}: first refresh complete: \
@@ -1284,6 +1492,7 @@ fn rebuild_iceberg_mv(
         mv_definition.mv_id,
     )?;
     record_iceberg_mv_publish_commit(state, refresh_id, published_snapshot_id)?;
+    drop_iceberg_mv_staging_branch(state, target, target_entry, staging_branch)?;
     finalize_iceberg_mv_refresh(
         state,
         refresh_id,
@@ -1292,7 +1501,6 @@ fn rebuild_iceberg_mv(
         table_uuids.clone(),
         published_snapshot_id,
     )?;
-    drop_iceberg_mv_staging_branch(state, target, target_entry, staging_branch)?;
 
     Ok(StatementResult::Ok)
 }
@@ -1463,8 +1671,6 @@ fn incremental_refresh_iceberg_mv(
     target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     iceberg_catalog: &Arc<dyn iceberg::Catalog>,
     expected_main_snapshot_id: Option<i64>,
-    staging_branch: &str,
-    refresh_id: i64,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
     base_ref: &IcebergTableRef,
@@ -1485,13 +1691,26 @@ fn incremental_refresh_iceberg_mv(
                     target.namespace,
                     target.table
                 );
+                let staging_branch = format!(
+                    "__nova_mv_refresh_{}_{}",
+                    mv_definition.mv_id,
+                    uuid::Uuid::new_v4().simple()
+                );
+                let refresh_id = begin_staged_iceberg_mv_refresh_intent(
+                    state,
+                    target,
+                    mv_definition.mv_id,
+                    expected_main_snapshot_id,
+                    single_snapshot_map(base_ref, current_snapshot_id),
+                    &staging_branch,
+                )?;
                 return rebuild_iceberg_mv(
                     state,
                     target,
                     target_entry,
                     iceberg_catalog,
                     expected_main_snapshot_id,
-                    staging_branch,
+                    &staging_branch,
                     refresh_id,
                     current_database,
                     mv_definition,
@@ -1501,13 +1720,11 @@ fn incremental_refresh_iceberg_mv(
                 );
             }
             IcebergChangePolicySignal::Unsupported { reason } => {
-                abort_iceberg_mv_refresh(state, refresh_id)?;
                 return Err(format!(
                     "iceberg-stored materialized view refresh unsupported: {reason}"
                 ));
             }
             IcebergChangePolicySignal::Incremental => {
-                abort_iceberg_mv_refresh(state, refresh_id)?;
                 return Err(
                     "iceberg-stored materialized view refresh produced invalid incremental policy from change planner"
                         .to_string(),
@@ -1529,13 +1746,26 @@ fn incremental_refresh_iceberg_mv(
             batch.equality_deletes.len(),
             batch.deleted_data_files.len()
         );
+        let staging_branch = format!(
+            "__nova_mv_refresh_{}_{}",
+            mv_definition.mv_id,
+            uuid::Uuid::new_v4().simple()
+        );
+        let refresh_id = begin_staged_iceberg_mv_refresh_intent(
+            state,
+            target,
+            mv_definition.mv_id,
+            expected_main_snapshot_id,
+            single_snapshot_map(base_ref, current_snapshot_id),
+            &staging_branch,
+        )?;
         return rebuild_iceberg_mv(
             state,
             target,
             target_entry,
             iceberg_catalog,
             expected_main_snapshot_id,
-            staging_branch,
+            &staging_branch,
             refresh_id,
             current_database,
             mv_definition,
@@ -1545,7 +1775,6 @@ fn incremental_refresh_iceberg_mv(
         );
     }
     if batch.current_snapshot_id != current_snapshot_id {
-        abort_iceberg_mv_refresh(state, refresh_id)?;
         return Err(format!(
             "iceberg mv incremental refresh: change batch snapshot mismatch (expected {current_snapshot_id}, got {})",
             batch.current_snapshot_id,
@@ -1575,10 +1804,7 @@ fn incremental_refresh_iceberg_mv(
         added_files,
     )
     .and_then(query_result_to_chunks)
-    .map_err(|err| {
-        let _ = abort_iceberg_mv_refresh(state, refresh_id);
-        err
-    })?;
+    .map_err(|err| err)?;
     let added_rows = chunks
         .iter()
         .map(|c| c.batch.num_rows() as i64)
@@ -1596,6 +1822,8 @@ fn incremental_refresh_iceberg_mv(
         let snapshots = single_snapshot_map(base_ref, current_snapshot_id);
         let table_uuids = single_table_uuid_map(base_ref, current_table_uuid);
         let target_snapshot_id = recorded_target_snapshot_id(target, mv_definition)?;
+        let refresh_id =
+            begin_iceberg_mv_refresh_intent(state, mv_definition.mv_id, snapshots.clone())?;
         finalize_iceberg_mv_refresh(
             state,
             refresh_id,
@@ -1608,13 +1836,26 @@ fn incremental_refresh_iceberg_mv(
     }
 
     // 4. Write and commit.
+    let staging_branch = format!(
+        "__nova_mv_refresh_{}_{}",
+        mv_definition.mv_id,
+        uuid::Uuid::new_v4().simple()
+    );
+    let refresh_id = begin_staged_iceberg_mv_refresh_intent(
+        state,
+        target,
+        mv_definition.mv_id,
+        expected_main_snapshot_id,
+        single_snapshot_map(base_ref, current_snapshot_id),
+        &staging_branch,
+    )?;
     let ident = iceberg_mv_table_ident(target)?;
     let marker = load_iceberg_mv_refresh_marker(state, refresh_id, mv_definition.mv_id)?
         .to_summary_properties();
     if let Err(err) = ensure_iceberg_mv_staging_branch(
         iceberg_catalog,
         target,
-        staging_branch,
+        &staging_branch,
         expected_main_snapshot_id,
     ) {
         abort_iceberg_mv_refresh(state, refresh_id)?;
@@ -1627,7 +1868,7 @@ fn incremental_refresh_iceberg_mv(
                 state,
                 target,
                 target_entry,
-                staging_branch,
+                &staging_branch,
                 refresh_id,
                 err,
             ));
@@ -1642,7 +1883,7 @@ fn incremental_refresh_iceberg_mv(
             &ident,
             CommitOpKind::FastAppend,
             written,
-            staging_branch,
+            &staging_branch,
             marker,
         )
         .await
@@ -1654,7 +1895,7 @@ fn incremental_refresh_iceberg_mv(
                 state,
                 target,
                 target_entry,
-                staging_branch,
+                &staging_branch,
                 refresh_id,
                 err,
             ));
@@ -1675,13 +1916,14 @@ fn incremental_refresh_iceberg_mv(
         state,
         target,
         target_entry,
-        staging_branch,
+        &staging_branch,
         expected_main_snapshot_id,
         new_snapshot_id,
         refresh_id,
         mv_definition.mv_id,
     )?;
     record_iceberg_mv_publish_commit(state, refresh_id, published_snapshot_id)?;
+    drop_iceberg_mv_staging_branch(state, target, target_entry, &staging_branch)?;
     finalize_iceberg_mv_refresh(
         state,
         refresh_id,
@@ -1690,8 +1932,6 @@ fn incremental_refresh_iceberg_mv(
         table_uuids.clone(),
         published_snapshot_id,
     )?;
-    // Drop the staging branch and update the in-memory catalog.
-    drop_iceberg_mv_staging_branch(state, target, target_entry, staging_branch)?;
 
     tracing::info!(
         "iceberg mv {}.{}.{}: incremental refresh complete: \
@@ -1894,7 +2134,7 @@ fn arrow_data_type_to_iceberg_primitive(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int32Array, Int64Array};
+    use arrow::array::{Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc as StdArc;
@@ -2136,6 +2376,42 @@ mod tests {
         create_iceberg_mv(state, current_catalog, current_db, &stmt).expect("create iceberg mv");
     }
 
+    fn create_mv_with_select_only(
+        state: &Arc<StandaloneState>,
+        current_catalog: Option<&str>,
+        current_db: &str,
+        mv_name: &str,
+        select_sql: &str,
+    ) {
+        let stmt = parse_create_mv(&format!(
+            "CREATE MATERIALIZED VIEW {mv_name}
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS {select_sql}"
+        ));
+        create_iceberg_mv(state, current_catalog, current_db, &stmt).expect("create iceberg mv");
+    }
+
+    fn load_all_mv_refreshes(state: &Arc<StandaloneState>) -> Vec<StoredMvRefresh> {
+        let provider = state.metadata_provider.as_ref().expect("metadata provider");
+        let read = provider.begin_read().expect("read txn");
+        let mut refreshes = read
+            .scan(
+                &crate::meta::MetaKeyPrefix::new(crate::meta::keys::NS_MV, ["refresh"])
+                    .expect("refresh key prefix"),
+                None,
+            )
+            .expect("scan refreshes")
+            .into_iter()
+            .map(|record| {
+                crate::meta::repository::decode_json_payload::<StoredMvRefresh>(&record.payload)
+                    .expect("decode refresh")
+            })
+            .collect::<Vec<_>>();
+        refreshes.sort_by_key(|refresh| refresh.refresh_id);
+        refreshes
+    }
+
     fn single_int_chunk(values: &[i32]) -> Vec<crate::exec::chunk::Chunk> {
         let arrow_schema = StdArc::new(ArrowSchema::new(vec![Field::new(
             "k",
@@ -2150,6 +2426,32 @@ mod tests {
         let chunk_schema_ref = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
             &arrow_schema,
             &[crate::common::ids::SlotId(0)],
+        )
+        .expect("chunk schema");
+        vec![crate::exec::chunk::Chunk::new_with_chunk_schema(
+            batch,
+            chunk_schema_ref,
+        )]
+    }
+
+    fn id_name_chunk(rows: &[(i32, &str)]) -> Vec<crate::exec::chunk::Chunk> {
+        let arrow_schema = StdArc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                StdArc::new(Int32Array::from_iter_values(rows.iter().map(|(id, _)| *id))),
+                StdArc::new(StringArray::from_iter_values(
+                    rows.iter().map(|(_, name)| *name),
+                )),
+            ],
+        )
+        .expect("record batch");
+        let chunk_schema_ref = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            &arrow_schema,
+            &[crate::common::ids::SlotId(0), crate::common::ids::SlotId(1)],
         )
         .expect("chunk schema");
         vec![crate::exec::chunk::Chunk::new_with_chunk_schema(
@@ -2471,6 +2773,581 @@ mod tests {
             .expect("mv definition after second refresh");
         assert_eq!(mv.last_refreshed_iceberg_snapshot_id, Some(second_snapshot));
         assert_eq!(mv.last_refresh_rows, Some(2));
+    }
+
+    #[test]
+    fn incremental_empty_delta_refresh_uses_metadata_only_intent() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_base_table_with_rows(&env.state, "ice", "sales", "orders", &[(20, "hit")]);
+        create_mv_with_select_only(
+            &env.state,
+            Some("ice"),
+            &env.current_db,
+            "mv_orders",
+            "SELECT id, name FROM ice.sales.orders WHERE id > 10",
+        );
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_orders");
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("first refresh");
+
+        insert_into_iceberg_table(&env.state, "ice", "sales", "orders", &[(1, "miss")]);
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("empty-delta incremental refresh");
+
+        let refreshes = load_all_mv_refreshes(&env.state);
+        let second_refresh = refreshes.last().expect("second refresh");
+        assert_eq!(second_refresh.state, MvRefreshState::Finalized);
+        assert_eq!(second_refresh.target_catalog, None);
+        assert_eq!(second_refresh.target_namespace, None);
+        assert_eq!(second_refresh.target_table, None);
+        assert_eq!(second_refresh.staging_branch, None);
+        assert_eq!(second_refresh.marker, None);
+
+        let provider = env
+            .state
+            .metadata_provider
+            .as_ref()
+            .expect("metadata provider");
+        let read = provider.begin_read().expect("read txn");
+        let unfinished = env
+            .state
+            .mv_repo
+            .list_unfinished_branch_staged_iceberg_refreshes(read.as_ref())
+            .expect("branch staged scan");
+        assert!(unfinished.is_empty());
+    }
+
+    #[test]
+    fn recover_staging_committed_refresh_aborts_when_main_not_advanced() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        create_mv_only(&env.state, Some("ice"), &env.current_db, "mv_orders");
+        let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
+            .expect("mv definition");
+        let target = IcebergMvTarget {
+            catalog: "ice".to_string(),
+            namespace: "analytics".to_string(),
+            table: "mv_orders".to_string(),
+        };
+        let entry = {
+            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get("ice").expect("catalog")
+        };
+        let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)
+            .expect("catalog");
+        let staging_branch = "__nova_mv_refresh_recover_staging";
+        let refresh_id = begin_staged_iceberg_mv_refresh_intent(
+            &env.state,
+            &target,
+            mv.mv_id,
+            None,
+            BTreeMap::new(),
+            staging_branch,
+        )
+        .expect("begin staged refresh");
+        let marker = load_iceberg_mv_refresh_marker(&env.state, refresh_id, mv.mv_id)
+            .expect("marker")
+            .to_summary_properties();
+
+        let staging_snapshot = data_block_on(async {
+            let ident = iceberg_mv_table_ident(&target).expect("ident");
+            let table = catalog.load_table(&ident).await.expect("load target");
+            let chunks = id_name_chunk(&[(1, "a")]);
+            let written = write_chunks_as_iceberg_data_files(&table, &chunks)
+                .await
+                .expect("write chunks");
+            commit_iceberg_mv_target_files_with_ref(
+                &table,
+                &catalog,
+                &entry,
+                &ident,
+                CommitOpKind::FastAppend,
+                written,
+                staging_branch,
+                marker,
+            )
+            .await
+            .expect("commit staging")
+            .new_snapshot_id
+        })
+        .expect("runtime");
+        record_iceberg_mv_staging_commit(
+            &env.state,
+            refresh_id,
+            staging_snapshot,
+            1,
+            BTreeMap::new(),
+        )
+        .expect("record staging");
+
+        recover_iceberg_mv_refreshes(&env.state).expect("recover refresh");
+
+        let provider = env
+            .state
+            .metadata_provider
+            .as_ref()
+            .expect("metadata provider");
+        let read = provider.begin_read().expect("read txn");
+        let refresh = env
+            .state
+            .mv_repo
+            .load_refresh(read.as_ref(), refresh_id)
+            .expect("load refresh")
+            .expect("refresh");
+        assert_eq!(refresh.state, MvRefreshState::Aborted);
+        let definition = env
+            .state
+            .mv_repo
+            .find_by_target(read.as_ref(), "ice", "analytics", "mv_orders")
+            .expect("find mv")
+            .expect("mv definition");
+        assert_eq!(definition.active_refresh_id, None);
+        assert!(!definition.refresh_in_progress);
+        drop(read);
+
+        let reloaded =
+            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
+                .expect("reload target");
+        assert_eq!(
+            reloaded
+                .table
+                .metadata()
+                .current_snapshot()
+                .map(|s| s.snapshot_id()),
+            None
+        );
+        assert!(
+            !reloaded
+                .table
+                .metadata()
+                .refs()
+                .contains_key(staging_branch),
+            "staging branch should be dropped"
+        );
+    }
+
+    #[test]
+    fn recover_staging_committed_refresh_finalizes_when_main_already_advanced() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        create_mv_only(&env.state, Some("ice"), &env.current_db, "mv_orders");
+        let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
+            .expect("mv definition");
+        let target = IcebergMvTarget {
+            catalog: "ice".to_string(),
+            namespace: "analytics".to_string(),
+            table: "mv_orders".to_string(),
+        };
+        let entry = {
+            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get("ice").expect("catalog")
+        };
+        let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)
+            .expect("catalog");
+        let staging_branch = "__nova_mv_refresh_recover_publish";
+        let refresh_id = begin_staged_iceberg_mv_refresh_intent(
+            &env.state,
+            &target,
+            mv.mv_id,
+            None,
+            BTreeMap::new(),
+            staging_branch,
+        )
+        .expect("begin staged refresh");
+        let marker = load_iceberg_mv_refresh_marker(&env.state, refresh_id, mv.mv_id)
+            .expect("marker")
+            .to_summary_properties();
+
+        let staging_snapshot = data_block_on(async {
+            let ident = iceberg_mv_table_ident(&target).expect("ident");
+            let table = catalog.load_table(&ident).await.expect("load target");
+            let chunks = id_name_chunk(&[(1, "a")]);
+            let written = write_chunks_as_iceberg_data_files(&table, &chunks)
+                .await
+                .expect("write chunks");
+            commit_iceberg_mv_target_files_with_ref(
+                &table,
+                &catalog,
+                &entry,
+                &ident,
+                CommitOpKind::FastAppend,
+                written,
+                staging_branch,
+                marker,
+            )
+            .await
+            .expect("commit staging")
+            .new_snapshot_id
+        })
+        .expect("runtime");
+        record_iceberg_mv_staging_commit(
+            &env.state,
+            refresh_id,
+            staging_snapshot,
+            1,
+            BTreeMap::new(),
+        )
+        .expect("record staging");
+        let published_snapshot = publish_iceberg_mv_refresh(
+            &env.state,
+            &target,
+            &entry,
+            staging_branch,
+            None,
+            staging_snapshot,
+            refresh_id,
+            mv.mv_id,
+        )
+        .expect("publish staging");
+
+        recover_iceberg_mv_refreshes(&env.state).expect("recover refresh");
+
+        let provider = env
+            .state
+            .metadata_provider
+            .as_ref()
+            .expect("metadata provider");
+        let read = provider.begin_read().expect("read txn");
+        let refresh = env
+            .state
+            .mv_repo
+            .load_refresh(read.as_ref(), refresh_id)
+            .expect("load refresh")
+            .expect("refresh");
+        assert_eq!(refresh.state, MvRefreshState::Finalized);
+        assert_eq!(refresh.published_snapshot_id, Some(published_snapshot));
+        let definition = env
+            .state
+            .mv_repo
+            .find_by_target(read.as_ref(), "ice", "analytics", "mv_orders")
+            .expect("find mv")
+            .expect("mv definition");
+        assert_eq!(
+            definition.last_refreshed_iceberg_snapshot_id,
+            Some(published_snapshot)
+        );
+        assert_eq!(definition.active_refresh_id, None);
+        assert!(!definition.refresh_in_progress);
+        drop(read);
+
+        let reloaded =
+            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
+                .expect("reload target");
+        assert_eq!(
+            reloaded
+                .table
+                .metadata()
+                .current_snapshot()
+                .map(|s| s.snapshot_id()),
+            Some(published_snapshot)
+        );
+        assert!(
+            !reloaded
+                .table
+                .metadata()
+                .refs()
+                .contains_key(staging_branch),
+            "staging branch should be dropped"
+        );
+    }
+
+    #[test]
+    fn recover_staging_committed_refresh_aborts_when_staging_already_missing() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        create_mv_only(&env.state, Some("ice"), &env.current_db, "mv_orders");
+        let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
+            .expect("mv definition");
+        let target = IcebergMvTarget {
+            catalog: "ice".to_string(),
+            namespace: "analytics".to_string(),
+            table: "mv_orders".to_string(),
+        };
+        let entry = {
+            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get("ice").expect("catalog")
+        };
+        let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)
+            .expect("catalog");
+        let staging_branch = "__nova_mv_refresh_recover_missing_staging";
+        let refresh_id = begin_staged_iceberg_mv_refresh_intent(
+            &env.state,
+            &target,
+            mv.mv_id,
+            None,
+            BTreeMap::new(),
+            staging_branch,
+        )
+        .expect("begin staged refresh");
+        let marker = load_iceberg_mv_refresh_marker(&env.state, refresh_id, mv.mv_id)
+            .expect("marker")
+            .to_summary_properties();
+
+        let staging_snapshot = data_block_on(async {
+            let ident = iceberg_mv_table_ident(&target).expect("ident");
+            let table = catalog.load_table(&ident).await.expect("load target");
+            let chunks = id_name_chunk(&[(1, "a")]);
+            let written = write_chunks_as_iceberg_data_files(&table, &chunks)
+                .await
+                .expect("write chunks");
+            commit_iceberg_mv_target_files_with_ref(
+                &table,
+                &catalog,
+                &entry,
+                &ident,
+                CommitOpKind::FastAppend,
+                written,
+                staging_branch,
+                marker,
+            )
+            .await
+            .expect("commit staging")
+            .new_snapshot_id
+        })
+        .expect("runtime");
+        record_iceberg_mv_staging_commit(
+            &env.state,
+            refresh_id,
+            staging_snapshot,
+            1,
+            BTreeMap::new(),
+        )
+        .expect("record staging");
+        drop_iceberg_mv_staging_branch(&env.state, &target, &entry, staging_branch)
+            .expect("drop staging before metadata abort");
+
+        recover_iceberg_mv_refreshes(&env.state).expect("recover refresh");
+
+        let provider = env
+            .state
+            .metadata_provider
+            .as_ref()
+            .expect("metadata provider");
+        let read = provider.begin_read().expect("read txn");
+        let refresh = env
+            .state
+            .mv_repo
+            .load_refresh(read.as_ref(), refresh_id)
+            .expect("load refresh")
+            .expect("refresh");
+        assert_eq!(refresh.state, MvRefreshState::Aborted);
+        let definition = env
+            .state
+            .mv_repo
+            .find_by_target(read.as_ref(), "ice", "analytics", "mv_orders")
+            .expect("find mv")
+            .expect("mv definition");
+        assert_eq!(definition.active_refresh_id, None);
+        assert!(!definition.refresh_in_progress);
+    }
+
+    #[test]
+    fn recover_publish_committed_refresh_drops_branch_before_finalize() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        create_mv_only(&env.state, Some("ice"), &env.current_db, "mv_orders");
+        let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
+            .expect("mv definition");
+        let target = IcebergMvTarget {
+            catalog: "ice".to_string(),
+            namespace: "analytics".to_string(),
+            table: "mv_orders".to_string(),
+        };
+        let entry = {
+            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get("ice").expect("catalog")
+        };
+        let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)
+            .expect("catalog");
+        let staging_branch = "__nova_mv_refresh_recover_publish_committed";
+        let refresh_id = begin_staged_iceberg_mv_refresh_intent(
+            &env.state,
+            &target,
+            mv.mv_id,
+            None,
+            BTreeMap::new(),
+            staging_branch,
+        )
+        .expect("begin staged refresh");
+        let marker = load_iceberg_mv_refresh_marker(&env.state, refresh_id, mv.mv_id)
+            .expect("marker")
+            .to_summary_properties();
+
+        let staging_snapshot = data_block_on(async {
+            let ident = iceberg_mv_table_ident(&target).expect("ident");
+            let table = catalog.load_table(&ident).await.expect("load target");
+            let chunks = id_name_chunk(&[(1, "a")]);
+            let written = write_chunks_as_iceberg_data_files(&table, &chunks)
+                .await
+                .expect("write chunks");
+            commit_iceberg_mv_target_files_with_ref(
+                &table,
+                &catalog,
+                &entry,
+                &ident,
+                CommitOpKind::FastAppend,
+                written,
+                staging_branch,
+                marker,
+            )
+            .await
+            .expect("commit staging")
+            .new_snapshot_id
+        })
+        .expect("runtime");
+        record_iceberg_mv_staging_commit(
+            &env.state,
+            refresh_id,
+            staging_snapshot,
+            1,
+            BTreeMap::new(),
+        )
+        .expect("record staging");
+        let published_snapshot = publish_iceberg_mv_refresh(
+            &env.state,
+            &target,
+            &entry,
+            staging_branch,
+            None,
+            staging_snapshot,
+            refresh_id,
+            mv.mv_id,
+        )
+        .expect("publish staging");
+        record_iceberg_mv_publish_commit(&env.state, refresh_id, published_snapshot)
+            .expect("record publish");
+
+        recover_iceberg_mv_refreshes(&env.state).expect("recover refresh");
+
+        let provider = env
+            .state
+            .metadata_provider
+            .as_ref()
+            .expect("metadata provider");
+        let read = provider.begin_read().expect("read txn");
+        let refresh = env
+            .state
+            .mv_repo
+            .load_refresh(read.as_ref(), refresh_id)
+            .expect("load refresh")
+            .expect("refresh");
+        assert_eq!(refresh.state, MvRefreshState::Finalized);
+        drop(read);
+
+        let reloaded =
+            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
+                .expect("reload target");
+        assert_eq!(
+            reloaded
+                .table
+                .metadata()
+                .current_snapshot()
+                .map(|s| s.snapshot_id()),
+            Some(published_snapshot)
+        );
+        assert!(
+            !reloaded
+                .table
+                .metadata()
+                .refs()
+                .contains_key(staging_branch),
+            "staging branch should be dropped before finalize"
+        );
+    }
+
+    #[test]
+    fn recover_publish_committed_refresh_finalizes_when_branch_already_missing() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        create_mv_only(&env.state, Some("ice"), &env.current_db, "mv_orders");
+        let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
+            .expect("mv definition");
+        let target = IcebergMvTarget {
+            catalog: "ice".to_string(),
+            namespace: "analytics".to_string(),
+            table: "mv_orders".to_string(),
+        };
+        let entry = {
+            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get("ice").expect("catalog")
+        };
+        let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)
+            .expect("catalog");
+        let staging_branch = "__nova_mv_refresh_recover_publish_missing_branch";
+        let refresh_id = begin_staged_iceberg_mv_refresh_intent(
+            &env.state,
+            &target,
+            mv.mv_id,
+            None,
+            BTreeMap::new(),
+            staging_branch,
+        )
+        .expect("begin staged refresh");
+        let marker = load_iceberg_mv_refresh_marker(&env.state, refresh_id, mv.mv_id)
+            .expect("marker")
+            .to_summary_properties();
+
+        let staging_snapshot = data_block_on(async {
+            let ident = iceberg_mv_table_ident(&target).expect("ident");
+            let table = catalog.load_table(&ident).await.expect("load target");
+            let chunks = id_name_chunk(&[(1, "a")]);
+            let written = write_chunks_as_iceberg_data_files(&table, &chunks)
+                .await
+                .expect("write chunks");
+            commit_iceberg_mv_target_files_with_ref(
+                &table,
+                &catalog,
+                &entry,
+                &ident,
+                CommitOpKind::FastAppend,
+                written,
+                staging_branch,
+                marker,
+            )
+            .await
+            .expect("commit staging")
+            .new_snapshot_id
+        })
+        .expect("runtime");
+        record_iceberg_mv_staging_commit(
+            &env.state,
+            refresh_id,
+            staging_snapshot,
+            1,
+            BTreeMap::new(),
+        )
+        .expect("record staging");
+        let published_snapshot = publish_iceberg_mv_refresh(
+            &env.state,
+            &target,
+            &entry,
+            staging_branch,
+            None,
+            staging_snapshot,
+            refresh_id,
+            mv.mv_id,
+        )
+        .expect("publish staging");
+        record_iceberg_mv_publish_commit(&env.state, refresh_id, published_snapshot)
+            .expect("record publish");
+        drop_iceberg_mv_staging_branch(&env.state, &target, &entry, staging_branch)
+            .expect("drop staging before finalize");
+
+        recover_iceberg_mv_refreshes(&env.state).expect("recover refresh");
+
+        let provider = env
+            .state
+            .metadata_provider
+            .as_ref()
+            .expect("metadata provider");
+        let read = provider.begin_read().expect("read txn");
+        let refresh = env
+            .state
+            .mv_repo
+            .load_refresh(read.as_ref(), refresh_id)
+            .expect("load refresh")
+            .expect("refresh");
+        assert_eq!(refresh.state, MvRefreshState::Finalized);
     }
 
     #[test]
