@@ -1,6 +1,6 @@
 -- @sequential=true
 -- @order_sensitive=true
--- @tags=write_path,managed_lake,mv,iceberg,phase4a
+-- @tags=write_path,mv,iceberg,ivm,storage_engine_iceberg,phase4a
 -- Test Objective:
 -- 1. CREATE MATERIALIZED VIEW with PROPERTIES('storage_engine' = 'iceberg') succeeds.
 -- 2. First REFRESH writes visible projection/filter result into the iceberg-backed MV.
@@ -14,7 +14,7 @@ CREATE EXTERNAL CATALOG mv_phase4a_${uuid0}
 PROPERTIES (
   "type" = "iceberg",
   "iceberg.catalog.type" = "hadoop",
-  "iceberg.catalog.warehouse" = "${managed_lake_warehouse}/iceberg_mv_phase4a_${uuid0}",
+  "iceberg.catalog.warehouse" = "${iceberg_catalog_warehouse}/iceberg_mv_phase4a_${uuid0}",
   "aws.s3.endpoint" = "${oss_endpoint}",
   "aws.s3.access_key" = "${oss_ak}",
   "aws.s3.secret_key" = "${oss_sk}",

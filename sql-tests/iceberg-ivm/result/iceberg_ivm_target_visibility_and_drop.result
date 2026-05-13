@@ -1,0 +1,8 @@
+-- query 2
+order_id	amount
+1	10
+2	20
+
+-- query 4
+count(*)
+2

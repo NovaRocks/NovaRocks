@@ -1,15 +1,14 @@
 MV-on-Iceberg SQL tests for NovaRocks.
 
-This suite isolates materialized view cases whose base tables live in an
-Iceberg catalog, so they can evolve independently from the local OLAP-only
-`materialized-view` suite.
+This suite isolates managed-lake materialized view cases whose base tables live
+in an Iceberg catalog, so they can evolve independently from the local
+OLAP-only `materialized-view` suite.
 
 Coverage notes:
-- MV build, refresh, rewrite, and inactive-state behavior over a local
-  Hadoop-style Iceberg catalog
+- managed-lake MV build, refresh, rewrite, and inactive-state behavior over a
+  local Hadoop-style Iceberg catalog
 - base-table drop/recreate regression coverage, including table-identity
   invalidation when a recreated Iceberg table reuses the same snapshot id
-- managed-lake materialized views whose base tables live in Iceberg catalogs
 - incremental refresh over append and delete snapshots, including Iceberg v3
   row-lineage / Puffin deletion-vector delete projection
 - aggregate MV retraction over Iceberg equality-delete snapshots
@@ -19,6 +18,9 @@ Coverage notes:
   part of the user-visible MV output
 - aggregate MV IVM coverage for COUNT/SUM/AVG/MIN/MAX and refresh policy
   fallbacks such as INSERT OVERWRITE
+
+Iceberg-backed MV targets created with
+`PROPERTIES('storage_engine' = 'iceberg')` live in `sql-tests/iceberg-ivm`.
 
 Recommended invocation:
 

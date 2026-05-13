@@ -1,0 +1,23 @@
+-- query 2
+order_id	amount	region
+
+-- query 4
+order_id	amount	region
+1	10	east
+2	20	west
+
+-- query 6
+order_id	amount	region
+1	10	east
+2	20	west
+
+-- query 8
+order_id	amount	region
+1	10	east
+2	20	west
+
+-- query 10
+order_id	amount	region
+1	10	east
+2	20	west
+4	40	north
