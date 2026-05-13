@@ -195,6 +195,7 @@ fn build_iceberg_table_def_with_data_files(
     data_files: Vec<super::registry::DataFileWithStats>,
 ) -> Result<TableDef, String> {
     let iceberg_table = Some(build_iceberg_table_info(&loaded));
+    let has_data_files = !data_files.is_empty();
     let storage = if entry.is_s3() {
         let cloud_properties = entry.cloud_properties_map();
         TableStorage::S3ParquetFiles {
@@ -204,7 +205,7 @@ fn build_iceberg_table_def_with_data_files(
                 .collect(),
             cloud_properties,
         }
-    } else if !data_files.is_empty() {
+    } else if has_data_files {
         // Local Iceberg tables can have multiple data files across snapshots.
         // Keep the per-file lineage metadata by using the multi-file scan
         // shape with empty cloud properties; file:// paths are handled by the
@@ -220,36 +221,37 @@ fn build_iceberg_table_def_with_data_files(
         register_empty_iceberg_table(namespace, table_name, &loaded.columns)?
     };
 
-    let iceberg_row_lineage_metadata_columns = if is_v3_row_lineage(loaded.table.metadata()) {
-        vec![
-            ColumnDef {
-                name: "_file".to_string(),
-                data_type: arrow::datatypes::DataType::Utf8,
-                nullable: false,
-                write_default: None,
-            },
-            ColumnDef {
-                name: "_pos".to_string(),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
-                write_default: None,
-            },
-            ColumnDef {
-                name: "_row_id".to_string(),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
-                write_default: None,
-            },
-            ColumnDef {
-                name: "_last_updated_sequence_number".to_string(),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
-                write_default: None,
-            },
-        ]
-    } else {
-        vec![]
-    };
+    let iceberg_row_lineage_metadata_columns =
+        if has_data_files && is_v3_row_lineage(loaded.table.metadata()) {
+            vec![
+                ColumnDef {
+                    name: "_file".to_string(),
+                    data_type: arrow::datatypes::DataType::Utf8,
+                    nullable: false,
+                    write_default: None,
+                },
+                ColumnDef {
+                    name: "_pos".to_string(),
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: false,
+                    write_default: None,
+                },
+                ColumnDef {
+                    name: "_row_id".to_string(),
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: false,
+                    write_default: None,
+                },
+                ColumnDef {
+                    name: "_last_updated_sequence_number".to_string(),
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: false,
+                    write_default: None,
+                },
+            ]
+        } else {
+            vec![]
+        };
 
     Ok(TableDef {
         name: table_name.to_string(),
@@ -434,11 +436,127 @@ impl TableSink for IcebergTableSink {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
-    use iceberg::spec::{ListType, MapType, NestedField, PrimitiveType, Schema, Type};
+    use iceberg::spec::{
+        FormatVersion, ListType, MapType, NestedField, PartitionSpec, PrimitiveType, Schema,
+        SortOrder, TableMetadataBuilder, Type,
+    };
+    use iceberg::table::Table;
+    use iceberg::{NamespaceIdent, TableIdent};
 
     use super::*;
+
+    fn test_entry() -> IcebergCatalogEntry {
+        let warehouse =
+            std::env::temp_dir().join(format!("novarocks_backend_test_{}", std::process::id()));
+        crate::connector::iceberg::catalog::registry::build_catalog_entry(
+            "ice",
+            &[(
+                "iceberg.catalog.warehouse".to_string(),
+                warehouse.to_string_lossy().to_string(),
+            )],
+        )
+        .expect("catalog entry")
+    }
+
+    fn v3_row_lineage_loaded_table() -> IcebergLoadedTable {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .expect("schema");
+        let metadata = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec().into_unbound(),
+            SortOrder::unsorted_order(),
+            "memory://test/table".to_string(),
+            FormatVersion::V3,
+            HashMap::from([("write.row-lineage".to_string(), "true".to_string())]),
+        )
+        .expect("metadata builder")
+        .build()
+        .expect("metadata")
+        .metadata;
+        let table = Table::builder()
+            .file_io(iceberg::io::FileIO::new_with_memory())
+            .metadata(metadata)
+            .identifier(TableIdent::new(
+                NamespaceIdent::new("db".to_string()),
+                "t".to_string(),
+            ))
+            .build()
+            .expect("table");
+
+        IcebergLoadedTable {
+            table,
+            columns: vec![ColumnDef {
+                name: "id".to_string(),
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: false,
+                write_default: None,
+            }],
+            logical_types: HashMap::new(),
+            key_desc: None,
+            column_aggregations: HashMap::new(),
+            object_store_config: None,
+        }
+    }
+
+    fn test_data_file() -> crate::connector::iceberg::catalog::registry::DataFileWithStats {
+        crate::connector::iceberg::catalog::registry::DataFileWithStats {
+            path: "file:///tmp/table/data.parquet".to_string(),
+            size: 12,
+            record_count: Some(1),
+            column_stats: None,
+            partition_spec_id: Some(0),
+            partition_key: None,
+            partition_values: None,
+            manifest_path: Some("file:///tmp/table/metadata/manifest.avro".to_string()),
+            partition_field_values: vec![],
+            first_row_id: Some(100),
+            data_sequence_number: Some(1),
+            delete_files: vec![],
+        }
+    }
+
+    #[test]
+    fn empty_v3_row_lineage_table_def_hides_metadata_columns() {
+        let table_def = build_iceberg_table_def_with_data_files(
+            &test_entry(),
+            "db",
+            "t",
+            v3_row_lineage_loaded_table(),
+            vec![],
+        )
+        .expect("table def");
+
+        assert!(table_def.iceberg_row_lineage_metadata_columns.is_empty());
+    }
+
+    #[test]
+    fn non_empty_v3_row_lineage_table_def_keeps_metadata_columns() {
+        let table_def = build_iceberg_table_def_with_data_files(
+            &test_entry(),
+            "db",
+            "t",
+            v3_row_lineage_loaded_table(),
+            vec![test_data_file()],
+        )
+        .expect("table def");
+
+        let names = table_def
+            .iceberg_row_lineage_metadata_columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec!["_file", "_pos", "_row_id", "_last_updated_sequence_number"]
+        );
+    }
 
     #[test]
     fn data_file_with_stats_to_s3_file_info_preserves_read_metadata() {
