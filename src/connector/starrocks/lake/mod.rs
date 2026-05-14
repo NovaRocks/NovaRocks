@@ -29,6 +29,7 @@ pub(crate) mod compaction;
 pub(crate) mod context;
 pub(crate) mod create_tablet;
 pub(crate) mod delete_payload_codec;
+pub(crate) mod delete_predicate_proto;
 #[allow(dead_code)]
 pub(crate) mod pk_applier;
 #[allow(dead_code)]
