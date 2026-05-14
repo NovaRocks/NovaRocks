@@ -29,10 +29,15 @@ fn collect_and_conjuncts_typed<'a>(expr: &'a TypedExpr, out: &mut Vec<&'a TypedE
 /// Must be deterministic — same expression always produces the same name.
 pub(crate) fn typed_expr_display_name(expr: &TypedExpr) -> String {
     match &expr.kind {
+        // Include the qualifier so two columns with the same bare name
+        // (e.g. `t1.c2` and `t3.c2` after a join) produce distinct keys.
+        // This name is used to register aggregate output slots in the
+        // codegen scope; a collision causes a `SELECT count(t1.c2),
+        // count(t3.c2)` projection to read both values from the same slot.
         ExprKind::ColumnRef {
-            qualifier: Some(_),
+            qualifier: Some(q),
             column,
-        } => column.clone(),
+        } => format!("{q}.{column}"),
         ExprKind::ColumnRef {
             qualifier: None,
             column,

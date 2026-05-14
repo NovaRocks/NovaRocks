@@ -78,6 +78,20 @@ fn apply_query_modifiers(
         let extra_items = collect_extra_sort_items(&order_by, &output_columns);
         let sort_items = rewrite_sort_items_to_projection_refs(&order_by, &extra_items);
         if !extra_items.is_empty() {
+            // Snapshot the original SELECT-list items (before we append the
+            // extra sort-only items). The post-sort projection below strips
+            // the extras by replaying these expressions, so two SELECT
+            // columns with the same bare name (e.g. `SELECT t1.c2, t2.c2`)
+            // keep their qualifiers and resolve to distinct slots in
+            // codegen. A previous version of this code rebuilt the final
+            // projection from `output_columns` alone, which lost the
+            // qualifier and collapsed both outputs onto the last-registered
+            // unqualified entry.
+            let original_select_items: Option<Vec<ProjectItem>> = match &body_plan {
+                LogicalPlan::Project(proj) => Some(proj.items.clone()),
+                _ => None,
+            };
+
             if let LogicalPlan::Project(ref mut proj) = body_plan {
                 if let LogicalPlan::Aggregate(ref mut agg) = *proj.input {
                     for extra in &extra_items {
@@ -97,7 +111,9 @@ fn apply_query_modifiers(
 
             // Strip synthetic sort-only columns after LIMIT/OFFSET so the
             // limit stays directly above Sort and can be rewritten to TopN.
-            final_projection = Some(
+            final_projection = Some(if let Some(items) = original_select_items {
+                items
+            } else {
                 output_columns
                     .iter()
                     .map(|col| ProjectItem {
@@ -111,8 +127,8 @@ fn apply_query_modifiers(
                         },
                         output_name: col.name.clone(),
                     })
-                    .collect(),
-            );
+                    .collect()
+            });
         } else {
             body_plan = LogicalPlan::Sort(SortNode {
                 input: Box::new(body_plan),
