@@ -31,16 +31,20 @@ pub fn build_delete_predicate_pb(
 }
 
 fn binary_to_pb(term: &BinaryTerm) -> BinaryPredicatePb {
+    // StarRocks BE's delete-predicate reader (see `parse_delete_binary_op` in
+    // src/formats/starrocks/plan.rs) accepts the symbolic forms only. The
+    // textual `EQ`/`NE`/... names from the proto enum are intentionally NOT
+    // recognized — they exist only for legacy hybrid sub_predicates strings.
     BinaryPredicatePb {
         column_name: Some(term.column.clone()),
         op: Some(
             match term.op {
-                CmpOp::Eq => "EQ",
-                CmpOp::Ne => "NE",
-                CmpOp::Lt => "LT",
-                CmpOp::Le => "LE",
-                CmpOp::Gt => "GT",
-                CmpOp::Ge => "GE",
+                CmpOp::Eq => "=",
+                CmpOp::Ne => "!=",
+                CmpOp::Lt => "<",
+                CmpOp::Le => "<=",
+                CmpOp::Gt => ">",
+                CmpOp::Ge => ">=",
             }
             .to_string(),
         ),
@@ -93,7 +97,7 @@ mod tests {
         );
         assert_eq!(pb.binary_predicates.len(), 1);
         assert_eq!(pb.binary_predicates[0].column_name.as_deref(), Some("id"));
-        assert_eq!(pb.binary_predicates[0].op.as_deref(), Some("EQ"));
+        assert_eq!(pb.binary_predicates[0].op.as_deref(), Some("="));
         assert_eq!(pb.binary_predicates[0].value.as_deref(), Some("42"));
         assert_eq!(pb.in_predicates.len(), 1);
         assert_eq!(pb.in_predicates[0].column_name.as_deref(), Some("name"));
@@ -123,6 +127,6 @@ mod tests {
             .iter()
             .map(|p| p.op.as_deref().expect("op"))
             .collect();
-        assert_eq!(ops, vec!["LT", "LE", "GT", "GE", "NE"]);
+        assert_eq!(ops, vec!["<", "<=", ">", ">=", "!="]);
     }
 }
