@@ -48,35 +48,12 @@ use crate::meta::repository::mv::{StoredMvDefinition, UpdateManagedMvRefreshSumm
 
 pub(crate) fn refresh_mv(
     state: &Arc<StandaloneState>,
-    current_catalog: Option<&str>,
+    _current_catalog: Option<&str>,
     current_database: &str,
     stmt: &RefreshMaterializedViewStmt,
 ) -> Result<StatementResult, String> {
     let (db_name, mv_name) = resolve_mv_name(&stmt.name, current_database)?;
     let _refresh_guard = acquire_mv_refresh_lock()?;
-
-    if current_catalog.is_some() {
-        let target = crate::engine::mv::iceberg_refresh::resolve_refresh_target(
-            current_catalog,
-            current_database,
-            &stmt.name,
-        )?;
-        if load_mv_definition_by_target(state, &target.catalog, &target.namespace, &target.table)?
-            .as_ref()
-            .is_some_and(|mv| {
-                mv.storage_engine
-                    .eq_ignore_ascii_case(ManagedMvStorageEngine::Iceberg.as_sql_str())
-            })
-        {
-            drop(_refresh_guard);
-            return crate::engine::mv::iceberg_refresh::refresh_iceberg_mv(
-                state,
-                current_catalog,
-                current_database,
-                stmt,
-            );
-        }
-    }
 
     if stmt.full {
         // REFRESH FULL is universally disabled pending redesign — see the
@@ -106,6 +83,15 @@ pub(crate) fn refresh_mv(
 
     let mut mv_definition = load_mv_definition_by_id(state, runtime.table.table_id)?
         .ok_or_else(|| format!("materialized view {db_name}.{mv_name} has no MV definition"))?;
+    if mv_definition
+        .storage_engine
+        .eq_ignore_ascii_case(ManagedMvStorageEngine::Iceberg.as_sql_str())
+    {
+        return Err(
+            "managed-lake MV backend cannot refresh storage_engine='iceberg' materialized views"
+                .to_string(),
+        );
+    }
     if mv_definition.refresh_in_progress || mv_definition.active_refresh_id.is_some() {
         tracing::warn!(
             "materialized view {db_name}.{mv_name}: clearing stale refresh progress before retry; target_snapshots={:?}",
@@ -1341,25 +1327,6 @@ fn load_mv_definition_by_id(
         .mv_repo
         .load_by_id(read.as_ref(), mv_id)
         .map_err(|e| format!("load mv definition failed: {e}"))
-}
-
-fn load_mv_definition_by_target(
-    state: &Arc<StandaloneState>,
-    catalog: &str,
-    namespace: &str,
-    table: &str,
-) -> Result<Option<StoredMvDefinition>, String> {
-    let provider = state
-        .metadata_provider
-        .as_ref()
-        .ok_or_else(|| "materialized view metadata provider is not configured".to_string())?;
-    let read = provider
-        .begin_read()
-        .map_err(|e| format!("open mv target read transaction failed: {e}"))?;
-    state
-        .mv_repo
-        .find_by_target(read.as_ref(), catalog, namespace, table)
-        .map_err(|e| format!("load mv target definition failed: {e}"))
 }
 
 fn begin_mv_refresh_intent(

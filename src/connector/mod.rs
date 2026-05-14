@@ -143,6 +143,15 @@ impl ConnectorRegistry {
             .ok_or_else(|| format!("unknown MV backend: {name}"))
     }
 
+    pub(crate) fn mv_backends(&self) -> Vec<Arc<dyn MvBackend>> {
+        let mut entries: Vec<_> = self.mv_backends.iter().collect();
+        entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+        entries
+            .into_iter()
+            .map(|(_, backend)| Arc::clone(backend))
+            .collect()
+    }
+
     pub fn create_scan_node(
         &self,
         connector_name: &str,
@@ -182,6 +191,9 @@ pub(crate) fn register_standalone_backends(state: &Arc<crate::engine::Standalone
     connectors.register_mv_backend(Arc::new(starrocks::managed::ManagedLakeMvBackend::new(
         state,
     )));
+    connectors.register_mv_backend(Arc::new(
+        crate::engine::mv::iceberg_backend::IcebergMvBackend::new(state),
+    ));
 }
 
 impl Default for ConnectorRegistry {

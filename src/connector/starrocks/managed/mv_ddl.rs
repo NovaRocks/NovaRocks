@@ -18,7 +18,7 @@ use crate::meta::repository::managed_lake::{
     CreateManagedColumnRequest, CreateManagedTableLayoutRequest,
     ManagedTableKind as RepoManagedTableKind,
 };
-use crate::meta::repository::mv::{CreateMvDefinitionRequest, StoredMvDefinition};
+use crate::meta::repository::mv::CreateMvDefinitionRequest;
 use crate::service::grpc_client::proto::starrocks::DeleteTabletRequest;
 use crate::sql::analysis::{ExprKind, OutputColumn, QueryBody, ResolvedQuery};
 use crate::sql::parser::ast::{
@@ -45,6 +45,7 @@ use crate::connector::starrocks::managed::model::{
 use crate::connector::starrocks::managed::mv_shape::{
     AggregateFunctionKind, AggregateMvShape, IncrementalMvShape, VisibleAggregateOutput,
 };
+use crate::engine::mv::lifecycle::{MvListRow, MvStorageEngine};
 use crate::engine::{QueryResult, QueryResultColumn, StandaloneState, StatementResult};
 
 /// Resolved base-table reference as the MV analyzer stage returns it.
@@ -140,11 +141,9 @@ pub(crate) fn create_mv(
     }
 
     if storage_engine == ManagedMvStorageEngine::Iceberg {
-        return crate::engine::mv::iceberg_refresh::create_iceberg_mv(
-            state,
-            current_catalog,
-            current_database,
-            stmt,
+        return Err(
+            "managed-lake MV backend cannot create storage_engine='iceberg' materialized views"
+                .to_string(),
         );
     }
 
@@ -757,29 +756,11 @@ pub(crate) fn descriptor_from_loaded(
 
 pub(crate) fn drop_mv(
     state: &Arc<StandaloneState>,
-    current_catalog: Option<&str>,
+    _current_catalog: Option<&str>,
     current_database: &str,
     stmt: &DropMaterializedViewStmt,
 ) -> Result<StatementResult, String> {
     let (db_name, mv_name) = resolve_mv_name(&stmt.name, current_database)?;
-    if let Some(catalog) = current_catalog {
-        let catalog = normalize_identifier(catalog)?;
-        if find_mv_definition_by_target(state, &catalog, &db_name, &mv_name)?
-            .as_ref()
-            .is_some_and(|mv| {
-                mv.storage_engine
-                    .eq_ignore_ascii_case(ManagedMvStorageEngine::Iceberg.as_sql_str())
-            })
-        {
-            return crate::engine::mv::iceberg_refresh::drop_iceberg_mv(
-                state,
-                current_catalog,
-                current_database,
-                stmt,
-            );
-        }
-    }
-
     let runtime = {
         let managed = state
             .managed_lake
@@ -827,35 +808,18 @@ pub(crate) fn drop_mv(
     Ok(StatementResult::Ok)
 }
 
-fn find_mv_definition_by_target(
-    state: &Arc<StandaloneState>,
-    catalog: &str,
-    namespace: &str,
-    table: &str,
-) -> Result<Option<StoredMvDefinition>, String> {
-    let Some(provider) = state.metadata_provider.as_ref() else {
-        return Ok(None);
-    };
-    let read = provider
-        .begin_read()
-        .map_err(|e| format!("open metadata read transaction failed: {e}"))?;
-    state
-        .mv_repo
-        .find_by_target(read.as_ref(), catalog, namespace, table)
-        .map_err(|e| format!("load materialized view definition failed: {e}"))
-}
-
 pub(crate) fn iceberg_table_ref_fqns(base_refs: &[IcebergTableRef]) -> Vec<String> {
     base_refs.iter().map(IcebergTableRef::fqn).collect()
 }
 
-pub(crate) fn list_mvs(
+pub(crate) fn list_mv_rows(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
     stmt: &ShowMaterializedViewsStmt,
-) -> Result<StatementResult, String> {
+    storage_filter: Option<MvStorageEngine>,
+) -> Result<Vec<MvListRow>, String> {
     let Some(provider) = state.metadata_provider.as_ref() else {
-        return Ok(StatementResult::Query(build_mv_rows_result(&[])?));
+        return Ok(vec![]);
     };
     let read = provider
         .begin_read()
@@ -873,10 +837,13 @@ pub(crate) fn list_mvs(
 
     let mut rows = Vec::new();
     for mv in &definitions {
-        if mv
-            .storage_engine
-            .eq_ignore_ascii_case(ManagedMvStorageEngine::Iceberg.as_sql_str())
+        let engine = MvStorageEngine::from_sql_str(&mv.storage_engine)?;
+        if let Some(filter) = storage_filter
+            && engine != filter
         {
+            continue;
+        }
+        if engine == MvStorageEngine::Iceberg {
             let Some(target_catalog) = mv.target_catalog.as_deref() else {
                 continue;
             };
@@ -896,7 +863,7 @@ pub(crate) fn list_mvs(
             let Some(target_table) = mv.target_table.clone() else {
                 continue;
             };
-            rows.push(ShowMvRow {
+            rows.push(MvListRow {
                 name: target_table,
                 database: target_namespace,
                 storage_engine: mv.storage_engine.clone(),
@@ -931,7 +898,7 @@ pub(crate) fn list_mvs(
         {
             continue;
         }
-        rows.push(ShowMvRow {
+        rows.push(MvListRow {
             name: table.name.clone(),
             database,
             storage_engine: mv.storage_engine.clone(),
@@ -944,13 +911,7 @@ pub(crate) fn list_mvs(
             select_text: mv.select_sql.clone(),
         });
     }
-    rows.sort_by(|left, right| {
-        left.database
-            .cmp(&right.database)
-            .then(left.name.cmp(&right.name))
-    });
-
-    Ok(StatementResult::Query(build_mv_rows_result(&rows)?))
+    Ok(rows)
 }
 
 #[derive(Clone, Debug)]
@@ -1474,19 +1435,7 @@ pub(crate) fn arrow_data_type_to_sql_type(data_type: &DataType) -> Result<SqlTyp
     }
 }
 
-#[derive(Clone, Debug)]
-struct ShowMvRow {
-    name: String,
-    database: String,
-    storage_engine: String,
-    refresh_mode: String,
-    last_refresh_time: Option<String>,
-    last_refresh_rows: Option<String>,
-    base_tables: String,
-    select_text: String,
-}
-
-fn build_mv_rows_result(rows: &[ShowMvRow]) -> Result<QueryResult, String> {
+pub(crate) fn build_mv_rows_result(rows: &[MvListRow]) -> Result<QueryResult, String> {
     let columns = vec![
         QueryResultColumn {
             name: "Name".to_string(),
@@ -1870,14 +1819,43 @@ mod tests {
         );
 
         let stmt = ShowMaterializedViewsStmt { database: None };
-        let StatementResult::Query(result) =
-            list_mvs(&state, Some("ice"), &stmt).expect("show mvs")
-        else {
-            panic!("expected query result");
-        };
+        let rows = list_mv_rows(&state, Some("ice"), &stmt, None).expect("show mvs");
+        let result = build_mv_rows_result(&rows).expect("build rows");
 
         assert_query_result_contains(&result, "mv_orders");
         assert_query_result_contains(&result, "iceberg");
+    }
+
+    #[test]
+    fn list_mv_rows_filters_managed_and_iceberg_storage_engines() {
+        let (state, _dir) = state_with_inflight_managed_mv();
+        insert_iceberg_mv_relationship(
+            &state,
+            "ice",
+            "analytics",
+            "mv_orders",
+            "SELECT id FROM ice.sales.orders",
+        );
+
+        let stmt = ShowMaterializedViewsStmt { database: None };
+        let managed = list_mv_rows(
+            &state,
+            Some("ice"),
+            &stmt,
+            Some(MvStorageEngine::ManagedLake),
+        )
+        .expect("managed rows");
+        let iceberg = list_mv_rows(&state, Some("ice"), &stmt, Some(MvStorageEngine::Iceberg))
+            .expect("iceberg rows");
+
+        assert!(!managed.is_empty(), "expected managed MV rows");
+        assert!(!iceberg.is_empty(), "expected iceberg MV rows");
+        assert!(
+            managed
+                .iter()
+                .all(|row| row.storage_engine == "managed_lake")
+        );
+        assert!(iceberg.iter().all(|row| row.storage_engine == "iceberg"));
     }
 
     #[test]

@@ -3,6 +3,10 @@
 use std::sync::Arc;
 
 use crate::engine::catalog::{InMemoryCatalog, normalize_identifier};
+use crate::engine::mv::lifecycle::{
+    CreateMvRequest, DropMvRequest, ListMvsRequest, MvStorageEngine, MvTarget, RefreshCtx,
+    RefreshError, RefreshRequest,
+};
 use crate::engine::query_prep::IcebergFileForQuery;
 use crate::engine::{StandaloneState, StatementResult, execute_query};
 use crate::runtime::query_result::QueryResult;
@@ -15,14 +19,333 @@ use crate::sql::parser::query_refs::{
     strip_catalog_from_three_part_names,
 };
 
-fn mv_backend(
+fn backend_by_engine(
     state: &Arc<StandaloneState>,
+    engine: MvStorageEngine,
 ) -> Result<Arc<dyn crate::connector::backend::MvBackend>, String> {
     state
         .connectors
         .read()
         .expect("connector registry read")
-        .mv_backend("managed")
+        .mv_backend(engine.backend_name())
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use std::sync::{Arc, Mutex};
+
+    use crate::connector::backend::MvBackend;
+    use crate::engine::mv::lifecycle::{
+        BackendRefreshOutcome, BackendRefreshPlan, CreateMvRequest, DropMvRequest, ListMvsRequest,
+        ManagedLakeRefreshOutcome, ManagedLakeRefreshPlan, MvBaseRef, MvListRow, MvStorageEngine,
+        MvTarget, RefreshCtx, RefreshError, RefreshMode, RefreshOutcome, RefreshPlan,
+        RefreshRequest,
+    };
+
+    #[derive(Default)]
+    struct Calls {
+        plan: usize,
+        execute: usize,
+        commit: usize,
+        rollback: usize,
+    }
+
+    struct MockBackend {
+        calls: Arc<Mutex<Calls>>,
+        plan_err: Option<RefreshError>,
+        execute_err: Option<RefreshError>,
+        commit_err: Option<RefreshError>,
+        rollback_err: Option<RefreshError>,
+    }
+
+    impl MockBackend {
+        fn ok(calls: Arc<Mutex<Calls>>) -> Self {
+            Self {
+                calls,
+                plan_err: None,
+                execute_err: None,
+                commit_err: None,
+                rollback_err: None,
+            }
+        }
+    }
+
+    impl MvBackend for MockBackend {
+        fn name(&self) -> &'static str {
+            "mock"
+        }
+
+        fn create_mv(&self, _req: CreateMvRequest) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn drop_mv(&self, _req: DropMvRequest) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn list_mvs(&self, _req: ListMvsRequest) -> Result<Vec<MvListRow>, String> {
+            Ok(vec![])
+        }
+
+        fn plan_refresh(&self, req: RefreshRequest) -> Result<RefreshPlan, RefreshError> {
+            self.calls.lock().unwrap().plan += 1;
+            if let Some(err) = &self.plan_err {
+                return Err(err.clone());
+            }
+            Ok(RefreshPlan {
+                mv_id: Some(1),
+                target: req.target,
+                storage_engine: MvStorageEngine::ManagedLake,
+                mode: RefreshMode::Incremental,
+                base_refs: vec![MvBaseRef {
+                    catalog: "ice".to_string(),
+                    namespace: "ns".to_string(),
+                    table: "base".to_string(),
+                }],
+                snapshot_pins: Default::default(),
+                backend_plan: BackendRefreshPlan::ManagedLake(ManagedLakeRefreshPlan {
+                    stmt: req.statement,
+                    current_catalog: req.current_catalog,
+                    current_database: req.current_database,
+                }),
+            })
+        }
+
+        fn execute_refresh(
+            &self,
+            plan: &RefreshPlan,
+            _ctx: &mut RefreshCtx,
+        ) -> Result<RefreshOutcome, RefreshError> {
+            self.calls.lock().unwrap().execute += 1;
+            if let Some(err) = &self.execute_err {
+                return Err(err.clone());
+            }
+            Ok(RefreshOutcome {
+                mv_id: plan.mv_id,
+                target: plan.target.clone(),
+                rows: Some(0),
+                base_snapshots: Default::default(),
+                base_table_uuids: Default::default(),
+                target_snapshot_id: None,
+                backend_outcome: BackendRefreshOutcome::ManagedLake(ManagedLakeRefreshOutcome {
+                    completed_inside_execute: true,
+                }),
+            })
+        }
+
+        fn commit_refresh(
+            &self,
+            _outcome: &RefreshOutcome,
+            _ctx: &mut RefreshCtx,
+        ) -> Result<(), RefreshError> {
+            self.calls.lock().unwrap().commit += 1;
+            if let Some(err) = &self.commit_err {
+                return Err(err.clone());
+            }
+            Ok(())
+        }
+
+        fn rollback_refresh(
+            &self,
+            _outcome: Option<&RefreshOutcome>,
+            _ctx: &mut RefreshCtx,
+        ) -> Result<(), RefreshError> {
+            self.calls.lock().unwrap().rollback += 1;
+            if let Some(err) = &self.rollback_err {
+                return Err(err.clone());
+            }
+            Ok(())
+        }
+    }
+
+    fn refresh_request() -> RefreshRequest {
+        let stmt = match crate::sql::parser::parse_sql("REFRESH MATERIALIZED VIEW mv1")
+            .expect("parse")
+            .remove(0)
+        {
+            crate::sql::parser::ast::Statement::RefreshMaterializedView(stmt) => stmt,
+            other => panic!("unexpected statement: {other:?}"),
+        };
+        RefreshRequest {
+            target: MvTarget {
+                catalog: None,
+                database: "default".to_string(),
+                name: "mv1".to_string(),
+            },
+            current_catalog: None,
+            current_database: "default".to_string(),
+            statement: stmt,
+        }
+    }
+
+    #[test]
+    fn plan_error_stops_lifecycle_without_rollback() {
+        let calls = Arc::new(Mutex::new(Calls::default()));
+        let mut backend = MockBackend::ok(Arc::clone(&calls));
+        backend.plan_err = Some(RefreshError::user("bad plan"));
+        let err = super::run_refresh_lifecycle(Arc::new(backend), refresh_request()).unwrap_err();
+        assert_eq!(err, "bad plan");
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.plan, 1);
+        assert_eq!(calls.execute, 0);
+        assert_eq!(calls.commit, 0);
+        assert_eq!(calls.rollback, 0);
+    }
+
+    #[test]
+    fn execute_error_rolls_back_without_commit() {
+        let calls = Arc::new(Mutex::new(Calls::default()));
+        let mut backend = MockBackend::ok(Arc::clone(&calls));
+        backend.execute_err = Some(RefreshError::pre_commit("execute failed"));
+        let err = super::run_refresh_lifecycle(Arc::new(backend), refresh_request()).unwrap_err();
+        assert_eq!(err, "execute failed");
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.plan, 1);
+        assert_eq!(calls.execute, 1);
+        assert_eq!(calls.commit, 0);
+        assert_eq!(calls.rollback, 1);
+    }
+
+    #[test]
+    fn execute_commit_unknown_does_not_roll_back() {
+        let calls = Arc::new(Mutex::new(Calls::default()));
+        let mut backend = MockBackend::ok(Arc::clone(&calls));
+        backend.execute_err = Some(RefreshError::commit_unknown("execute commit unknown"));
+        let err = super::run_refresh_lifecycle(Arc::new(backend), refresh_request()).unwrap_err();
+        assert_eq!(err, "execute commit unknown");
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.plan, 1);
+        assert_eq!(calls.execute, 1);
+        assert_eq!(calls.commit, 0);
+        assert_eq!(calls.rollback, 0);
+    }
+
+    #[test]
+    fn commit_unknown_does_not_roll_back() {
+        let calls = Arc::new(Mutex::new(Calls::default()));
+        let mut backend = MockBackend::ok(Arc::clone(&calls));
+        backend.commit_err = Some(RefreshError::commit_unknown("commit unknown"));
+        let err = super::run_refresh_lifecycle(Arc::new(backend), refresh_request()).unwrap_err();
+        assert_eq!(err, "commit unknown");
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.plan, 1);
+        assert_eq!(calls.execute, 1);
+        assert_eq!(calls.commit, 1);
+        assert_eq!(calls.rollback, 0);
+    }
+
+    #[test]
+    fn rollback_error_is_appended_to_original_error() {
+        let calls = Arc::new(Mutex::new(Calls::default()));
+        let mut backend = MockBackend::ok(Arc::clone(&calls));
+        backend.execute_err = Some(RefreshError::pre_commit("execute failed"));
+        backend.rollback_err = Some(RefreshError::pre_commit("rollback failed"));
+        let err = super::run_refresh_lifecycle(Arc::new(backend), refresh_request()).unwrap_err();
+        assert_eq!(
+            err,
+            "execute failed; additionally failed to rollback MV refresh: rollback failed"
+        );
+        assert_eq!(calls.lock().unwrap().rollback, 1);
+    }
+}
+
+fn default_mv_storage_engine(state: &Arc<StandaloneState>) -> &str {
+    state
+        .managed_lake_config
+        .as_ref()
+        .map(|config| config.mv_default_storage_engine.as_str())
+        .unwrap_or("managed_lake")
+}
+
+fn storage_engine_for_create(
+    state: &Arc<StandaloneState>,
+    stmt: &CreateMaterializedViewStmt,
+) -> Result<MvStorageEngine, String> {
+    let resolved = crate::connector::starrocks::managed::mv_ddl::resolve_mv_storage_engine(
+        &stmt.properties,
+        default_mv_storage_engine(state),
+    )?;
+    MvStorageEngine::from_sql_str(resolved.as_sql_str())
+}
+
+fn existing_mv_storage_engine_by_target(
+    state: &Arc<StandaloneState>,
+    target: &crate::engine::mv::iceberg_refresh::IcebergMvTarget,
+) -> Result<Option<MvStorageEngine>, String> {
+    let Some(provider) = state.metadata_provider.as_ref() else {
+        return Ok(None);
+    };
+    let read = provider
+        .begin_read()
+        .map_err(|e| format!("open MV metadata read transaction failed: {e}"))?;
+    let Some(definition) = state
+        .mv_repo
+        .find_by_target(
+            read.as_ref(),
+            &target.catalog,
+            &target.namespace,
+            &target.table,
+        )
+        .map_err(|e| format!("load MV definition by target failed: {e}"))?
+    else {
+        return Ok(None);
+    };
+    MvStorageEngine::from_sql_str(&definition.storage_engine).map(Some)
+}
+
+fn refresh_error_with_rollback(
+    original: RefreshError,
+    rollback: Result<(), RefreshError>,
+) -> String {
+    match rollback {
+        Ok(()) => original.to_string(),
+        Err(rollback_err) => format!(
+            "{}; additionally failed to rollback MV refresh: {}",
+            original, rollback_err
+        ),
+    }
+}
+
+fn run_refresh_lifecycle(
+    backend: Arc<dyn crate::connector::backend::MvBackend>,
+    req: RefreshRequest,
+) -> Result<(), String> {
+    let mut ctx = RefreshCtx::default();
+    let plan = backend.plan_refresh(req).map_err(|err| err.to_string())?;
+    let outcome = match backend.execute_refresh(&plan, &mut ctx) {
+        Ok(outcome) => outcome,
+        Err(err) if err.kind.should_rollback_after_commit() => {
+            let rollback = backend.rollback_refresh(None, &mut ctx);
+            return Err(refresh_error_with_rollback(err, rollback));
+        }
+        Err(err) => {
+            ctx.recovery_required = true;
+            tracing::warn!(
+                backend = backend.name(),
+                recovery_required = ctx.recovery_required,
+                error = %err,
+                "MV refresh execution returned a non-rollbackable error; recovery is required"
+            );
+            return Err(err.to_string());
+        }
+    };
+    match backend.commit_refresh(&outcome, &mut ctx) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind.should_rollback_after_commit() => {
+            let rollback = backend.rollback_refresh(Some(&outcome), &mut ctx);
+            Err(refresh_error_with_rollback(err, rollback))
+        }
+        Err(err) => {
+            ctx.recovery_required = true;
+            tracing::warn!(
+                backend = backend.name(),
+                recovery_required = ctx.recovery_required,
+                error = %err,
+                "MV refresh commit result is unknown; recovery is required"
+            );
+            Err(err.to_string())
+        }
+    }
 }
 
 pub(crate) fn create_mv(
@@ -31,7 +354,12 @@ pub(crate) fn create_mv(
     db: &str,
     stmt: &CreateMaterializedViewStmt,
 ) -> Result<StatementResult, String> {
-    mv_backend(state)?.create_mv(stmt, current_catalog, db)?;
+    let engine = storage_engine_for_create(state, stmt)?;
+    backend_by_engine(state, engine)?.create_mv(CreateMvRequest {
+        stmt: stmt.clone(),
+        current_catalog: current_catalog.map(str::to_string),
+        current_database: db.to_string(),
+    })?;
     Ok(StatementResult::Ok)
 }
 
@@ -41,7 +369,26 @@ pub(crate) fn drop_mv(
     db: &str,
     stmt: &DropMaterializedViewStmt,
 ) -> Result<StatementResult, String> {
-    mv_backend(state)?.drop_mv(stmt, current_catalog, db)?;
+    if current_catalog.is_some() {
+        let target = crate::engine::mv::iceberg_refresh::resolve_refresh_target(
+            current_catalog,
+            db,
+            &stmt.name,
+        )?;
+        if existing_mv_storage_engine_by_target(state, &target)? == Some(MvStorageEngine::Iceberg) {
+            backend_by_engine(state, MvStorageEngine::Iceberg)?.drop_mv(DropMvRequest {
+                stmt: stmt.clone(),
+                current_catalog: current_catalog.map(str::to_string),
+                current_database: db.to_string(),
+            })?;
+            return Ok(StatementResult::Ok);
+        }
+    }
+    backend_by_engine(state, MvStorageEngine::ManagedLake)?.drop_mv(DropMvRequest {
+        stmt: stmt.clone(),
+        current_catalog: current_catalog.map(str::to_string),
+        current_database: db.to_string(),
+    })?;
     Ok(StatementResult::Ok)
 }
 
@@ -51,7 +398,44 @@ pub(crate) fn refresh_mv(
     db: &str,
     stmt: &RefreshMaterializedViewStmt,
 ) -> Result<StatementResult, String> {
-    mv_backend(state)?.refresh_mv(stmt, current_catalog, db)?;
+    let (target, engine) = if current_catalog.is_some() {
+        let target = crate::engine::mv::iceberg_refresh::resolve_refresh_target(
+            current_catalog,
+            db,
+            &stmt.name,
+        )?;
+        let engine = existing_mv_storage_engine_by_target(state, &target)?
+            .unwrap_or(MvStorageEngine::ManagedLake);
+        (
+            MvTarget {
+                catalog: current_catalog.map(str::to_string),
+                database: target.namespace.clone(),
+                name: target.table.clone(),
+            },
+            engine,
+        )
+    } else {
+        let (database, name) =
+            crate::connector::starrocks::managed::mv_ddl::resolve_mv_name(&stmt.name, db)?;
+        (
+            MvTarget {
+                catalog: None,
+                database,
+                name,
+            },
+            MvStorageEngine::ManagedLake,
+        )
+    };
+    let backend = backend_by_engine(state, engine)?;
+    run_refresh_lifecycle(
+        backend,
+        RefreshRequest {
+            target,
+            current_catalog: current_catalog.map(str::to_string),
+            current_database: db.to_string(),
+            statement: stmt.clone(),
+        },
+    )?;
     Ok(StatementResult::Ok)
 }
 
@@ -60,8 +444,27 @@ pub(crate) fn list_mvs(
     current_catalog: Option<&str>,
     stmt: &ShowMaterializedViewsStmt,
 ) -> Result<StatementResult, String> {
-    let result: QueryResult = mv_backend(state)?.list_mvs(stmt, current_catalog)?;
-    Ok(StatementResult::Query(result))
+    let req = ListMvsRequest {
+        stmt: stmt.clone(),
+        current_catalog: current_catalog.map(str::to_string),
+    };
+    let mut rows = Vec::new();
+    let backends = state
+        .connectors
+        .read()
+        .expect("connector registry read")
+        .mv_backends();
+    for backend in backends {
+        rows.extend(backend.list_mvs(req.clone())?);
+    }
+    rows.sort_by(|left, right| {
+        left.database
+            .cmp(&right.database)
+            .then(left.name.cmp(&right.name))
+    });
+    Ok(StatementResult::Query(
+        crate::connector::starrocks::managed::mv_ddl::build_mv_rows_result(&rows)?,
+    ))
 }
 
 /// Analyze the output column types of a MV SELECT SQL without executing it.

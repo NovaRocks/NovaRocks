@@ -9,12 +9,13 @@
 
 use arrow::record_batch::RecordBatch;
 
-use crate::runtime::query_result::QueryResult;
+use crate::engine::mv::lifecycle::{
+    CreateMvRequest, DropMvRequest, ListMvsRequest, MvListRow, RefreshCtx, RefreshError,
+    RefreshOutcome, RefreshPlan, RefreshRequest,
+};
 use crate::sql::catalog::{ColumnDef, TableDef};
 use crate::sql::parser::ast::{
-    AlterIcebergPartitionSpecStmt, CreateMaterializedViewStmt, DropMaterializedViewStmt,
-    IcebergPartitionFieldExpr, Literal, RefreshMaterializedViewStmt, ShowMaterializedViewsStmt,
-    TableColumnDef, TableKeyDesc,
+    AlterIcebergPartitionSpecStmt, IcebergPartitionFieldExpr, Literal, TableColumnDef, TableKeyDesc,
 };
 
 /// Request to create a table. Unified shape across all catalog backends;
@@ -122,27 +123,25 @@ pub(crate) trait TableSink: Send + Sync {
 /// plug in here.
 pub(crate) trait MvBackend: Send + Sync {
     fn name(&self) -> &'static str;
-    fn create_mv(
+
+    fn create_mv(&self, req: CreateMvRequest) -> Result<(), String>;
+    fn drop_mv(&self, req: DropMvRequest) -> Result<(), String>;
+    fn list_mvs(&self, req: ListMvsRequest) -> Result<Vec<MvListRow>, String>;
+
+    fn plan_refresh(&self, req: RefreshRequest) -> Result<RefreshPlan, RefreshError>;
+    fn execute_refresh(
         &self,
-        stmt: &CreateMaterializedViewStmt,
-        current_catalog: Option<&str>,
-        current_database: &str,
-    ) -> Result<(), String>;
-    fn drop_mv(
+        plan: &RefreshPlan,
+        ctx: &mut RefreshCtx,
+    ) -> Result<RefreshOutcome, RefreshError>;
+    fn commit_refresh(
         &self,
-        stmt: &DropMaterializedViewStmt,
-        current_catalog: Option<&str>,
-        current_database: &str,
-    ) -> Result<(), String>;
-    fn refresh_mv(
+        outcome: &RefreshOutcome,
+        ctx: &mut RefreshCtx,
+    ) -> Result<(), RefreshError>;
+    fn rollback_refresh(
         &self,
-        stmt: &RefreshMaterializedViewStmt,
-        current_catalog: Option<&str>,
-        current_database: &str,
-    ) -> Result<(), String>;
-    fn list_mvs(
-        &self,
-        stmt: &ShowMaterializedViewsStmt,
-        current_catalog: Option<&str>,
-    ) -> Result<QueryResult, String>;
+        outcome: Option<&RefreshOutcome>,
+        ctx: &mut RefreshCtx,
+    ) -> Result<(), RefreshError>;
 }

@@ -40,6 +40,10 @@ use crate::engine::mv::iceberg_target_apply::{
     extract_apply_key_values_from_chunks, find_apply_key_field_id, iceberg_mv_physical_select_sql,
     load_target_apply_locator_inputs, locate_target_rows_by_apply_key,
 };
+use crate::engine::mv::lifecycle::{
+    BackendRefreshPlan, IcebergRefreshOutcome, IcebergRefreshPlan, MvBaseRef, MvStorageEngine,
+    MvTarget, RefreshError, RefreshMode, RefreshPlan,
+};
 use crate::engine::mv_flow::execute_query_for_mv_incremental_refresh;
 use crate::engine::query_prep::IcebergFileForQuery;
 use crate::engine::{StandaloneState, StatementResult};
@@ -768,6 +772,120 @@ pub(crate) fn refresh_iceberg_mv(
 //   - faithful preservation of the original DDL (partition_by,
 //     distribution, properties).
 // See the rejection in refresh_iceberg_mv for the user-facing error.
+
+pub(crate) fn plan_iceberg_mv_refresh(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    stmt: &RefreshMaterializedViewStmt,
+    target: MvTarget,
+) -> Result<RefreshPlan, RefreshError> {
+    let iceberg_target = resolve_refresh_target(current_catalog, current_database, &stmt.name)
+        .map_err(RefreshError::user)?;
+    if stmt.full {
+        return Err(RefreshError::user(
+            "REFRESH MATERIALIZED VIEW ... FULL is currently disabled pending redesign; \
+             its previous behavior (drop target + delete definition + recreate empty target) \
+             was misleading and non-atomic. To recover from a broken contract or corrupted \
+             target, run DROP MATERIALIZED VIEW <name>; CREATE MATERIALIZED VIEW <name> ...; \
+             REFRESH MATERIALIZED VIEW <name>; manually.",
+        ));
+    }
+
+    recover_iceberg_mv_refreshes(state).map_err(RefreshError::pre_commit)?;
+    let mv_definition =
+        load_iceberg_mv_definition_by_target(state, &iceberg_target).map_err(RefreshError::user)?;
+    let (_, _, target_loaded) =
+        load_iceberg_mv_target(state, &iceberg_target).map_err(RefreshError::user)?;
+    validate_target_snapshot(&iceberg_target, &mv_definition, &target_loaded.table)
+        .map_err(RefreshError::user)?;
+
+    let base_refs =
+        parse_iceberg_table_refs(&mv_definition.base_table_refs).map_err(RefreshError::user)?;
+    let [base_ref] = base_refs.as_slice() else {
+        return Err(RefreshError::user(
+            "iceberg materialized view refresh requires exactly one base table reference",
+        ));
+    };
+    let loaded = load_current_iceberg_base_table(state, base_ref).map_err(RefreshError::user)?;
+    let schema_contract = mv_definition.schema_contract.as_ref().ok_or_else(|| {
+        RefreshError::user(format!(
+            "iceberg MV target {}.{}.{} is missing A11 schema contract; rebuild or recreate the MV",
+            iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+        ))
+    })?;
+    match crate::engine::mv::schema_contract::validate_schema_contract(
+        schema_contract,
+        &loaded.table,
+        &target_loaded.table,
+    ) {
+        crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
+            return Err(RefreshError::user(format!("{err}")));
+        }
+        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
+            ..
+        }
+        | crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe => {}
+    }
+
+    let current_snapshot_id = loaded
+        .table
+        .metadata()
+        .current_snapshot()
+        .map(|s| s.snapshot_id());
+    let previous_snapshot_id = mv_definition
+        .last_refresh_snapshots
+        .get(&base_ref.fqn())
+        .copied();
+    let mode = match (previous_snapshot_id, current_snapshot_id) {
+        (None, None) => RefreshMode::Noop,
+        (None, Some(_)) => RefreshMode::Full,
+        (Some(prev), Some(cur)) if prev == cur => RefreshMode::Noop,
+        (Some(_), Some(_)) => RefreshMode::Incremental,
+        (Some(_), None) => RefreshMode::Rebuild,
+    };
+    let mut snapshot_pins = BTreeMap::new();
+    snapshot_pins.insert(base_ref.fqn(), current_snapshot_id);
+    Ok(RefreshPlan {
+        mv_id: Some(mv_definition.mv_id),
+        target,
+        storage_engine: MvStorageEngine::Iceberg,
+        mode,
+        base_refs: vec![MvBaseRef {
+            catalog: base_ref.catalog.clone(),
+            namespace: base_ref.namespace.clone(),
+            table: base_ref.table.clone(),
+        }],
+        snapshot_pins,
+        backend_plan: BackendRefreshPlan::Iceberg(IcebergRefreshPlan {
+            stmt: stmt.clone(),
+            current_catalog: current_catalog.map(str::to_string),
+            current_database: current_database.to_string(),
+        }),
+    })
+}
+
+pub(crate) fn execute_iceberg_mv_refresh(
+    state: &Arc<StandaloneState>,
+    plan: &IcebergRefreshPlan,
+) -> Result<IcebergRefreshOutcome, RefreshError> {
+    refresh_iceberg_mv(
+        state,
+        plan.current_catalog.as_deref(),
+        &plan.current_database,
+        &plan.stmt,
+    )
+    .map_err(|err| {
+        if is_iceberg_commit_unknown_error(&err) {
+            RefreshError::commit_unknown(err)
+        } else {
+            RefreshError::pre_commit(err)
+        }
+    })?;
+    Ok(IcebergRefreshOutcome {
+        completed_inside_execute: true,
+    })
+}
 
 fn load_iceberg_mv_definition_by_target(
     state: &Arc<StandaloneState>,
@@ -3211,6 +3329,53 @@ mod tests {
                 "storage_engine='iceberg' requires current catalog to be an Iceberg catalog"
             );
         }
+    }
+
+    #[test]
+    fn plan_iceberg_mv_refresh_requires_a11_schema_contract() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        create_base_table(&env.state, "ice", "analytics", "mv_orders");
+        let provider = env
+            .state
+            .metadata_provider
+            .as_ref()
+            .expect("metadata provider");
+        let mut txn = provider
+            .begin_write("seed iceberg mv without schema contract")
+            .expect("write txn");
+        env.state
+            .mv_repo
+            .create_definition(
+                txn.as_mut(),
+                CreateMvDefinitionRequest {
+                    select_sql: "SELECT id, name FROM ice.sales.orders".to_string(),
+                    base_table_refs: vec!["ice.sales.orders".to_string()],
+                    primary_key_columns: Vec::new(),
+                    storage_engine: ManagedMvStorageEngine::Iceberg.as_sql_str().to_string(),
+                    target_catalog: Some("ice".to_string()),
+                    target_namespace: Some("analytics".to_string()),
+                    target_table: Some("mv_orders".to_string()),
+                    schema_contract: None,
+                    created_at_ms: now_ms(),
+                },
+            )
+            .expect("create mv definition");
+        txn.commit().expect("commit mv definition");
+
+        let stmt = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_orders");
+        let target = crate::engine::mv::lifecycle::MvTarget {
+            catalog: Some("ice".to_string()),
+            database: "analytics".to_string(),
+            name: "mv_orders".to_string(),
+        };
+        let err = plan_iceberg_mv_refresh(&env.state, Some("ice"), &env.current_db, &stmt, target)
+            .expect_err("missing schema contract should fail");
+
+        assert!(
+            err.to_string().contains("missing A11 schema contract"),
+            "{err}"
+        );
     }
 
     #[test]

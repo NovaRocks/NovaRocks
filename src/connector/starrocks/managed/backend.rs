@@ -9,13 +9,14 @@ use arrow::record_batch::RecordBatch;
 use crate::connector::backend::{
     CatalogBackend, CreateTableRequest, MvBackend, ResolvedTable, TableSink, TableSource,
 };
-use crate::engine::{StandaloneState, StatementResult};
-use crate::runtime::query_result::QueryResult;
-use crate::sql::catalog::TableDef;
-use crate::sql::parser::ast::{
-    CreateMaterializedViewStmt, DropMaterializedViewStmt, Literal, ObjectName,
-    RefreshMaterializedViewStmt, ShowMaterializedViewsStmt,
+use crate::engine::StandaloneState;
+use crate::engine::mv::lifecycle::{
+    BackendRefreshOutcome, BackendRefreshPlan, CreateMvRequest, DropMvRequest, ListMvsRequest,
+    ManagedLakeRefreshOutcome, ManagedLakeRefreshPlan, MvBaseRef, MvListRow, MvStorageEngine,
+    RefreshCtx, RefreshError, RefreshMode, RefreshOutcome, RefreshPlan, RefreshRequest,
 };
+use crate::sql::catalog::TableDef;
+use crate::sql::parser::ast::{Literal, ObjectName};
 
 pub(crate) struct ManagedLakeBackend {
     state: Weak<StandaloneState>,
@@ -229,45 +230,102 @@ impl MvBackend for ManagedLakeMvBackend {
         "managed"
     }
 
-    fn create_mv(
-        &self,
-        stmt: &CreateMaterializedViewStmt,
-        current_catalog: Option<&str>,
-        db: &str,
-    ) -> Result<(), String> {
+    fn create_mv(&self, req: CreateMvRequest) -> Result<(), String> {
         let state = self.state()?;
-        super::mv_ddl::create_mv(&state, current_catalog, db, stmt).map(|_| ())
+        super::mv_ddl::create_mv(
+            &state,
+            req.current_catalog.as_deref(),
+            &req.current_database,
+            &req.stmt,
+        )
+        .map(|_| ())
     }
 
-    fn drop_mv(
-        &self,
-        stmt: &DropMaterializedViewStmt,
-        current_catalog: Option<&str>,
-        db: &str,
-    ) -> Result<(), String> {
+    fn drop_mv(&self, req: DropMvRequest) -> Result<(), String> {
         let state = self.state()?;
-        super::mv_ddl::drop_mv(&state, current_catalog, db, stmt).map(|_| ())
+        super::mv_ddl::drop_mv(
+            &state,
+            req.current_catalog.as_deref(),
+            &req.current_database,
+            &req.stmt,
+        )
+        .map(|_| ())
     }
 
-    fn refresh_mv(
-        &self,
-        stmt: &RefreshMaterializedViewStmt,
-        current_catalog: Option<&str>,
-        db: &str,
-    ) -> Result<(), String> {
+    fn list_mvs(&self, req: ListMvsRequest) -> Result<Vec<MvListRow>, String> {
         let state = self.state()?;
-        super::mv_refresh::refresh_mv(&state, current_catalog, db, stmt).map(|_| ())
+        super::mv_ddl::list_mv_rows(
+            &state,
+            req.current_catalog.as_deref(),
+            &req.stmt,
+            Some(MvStorageEngine::ManagedLake),
+        )
     }
 
-    fn list_mvs(
+    fn plan_refresh(&self, req: RefreshRequest) -> Result<RefreshPlan, RefreshError> {
+        Ok(RefreshPlan {
+            mv_id: None,
+            target: req.target,
+            storage_engine: MvStorageEngine::ManagedLake,
+            mode: RefreshMode::Incremental,
+            base_refs: vec![MvBaseRef {
+                catalog: "managed".to_string(),
+                namespace: req.current_database.clone(),
+                table: req.statement.name.parts.join("."),
+            }],
+            snapshot_pins: Default::default(),
+            backend_plan: BackendRefreshPlan::ManagedLake(ManagedLakeRefreshPlan {
+                stmt: req.statement,
+                current_catalog: req.current_catalog,
+                current_database: req.current_database,
+            }),
+        })
+    }
+
+    fn execute_refresh(
         &self,
-        stmt: &ShowMaterializedViewsStmt,
-        current_catalog: Option<&str>,
-    ) -> Result<QueryResult, String> {
-        let state = self.state()?;
-        match super::mv_ddl::list_mvs(&state, current_catalog, stmt)? {
-            StatementResult::Query(query) => Ok(query),
-            StatementResult::Ok => Err("list_mvs returned Ok; expected query result".to_string()),
-        }
+        plan: &RefreshPlan,
+        _ctx: &mut RefreshCtx,
+    ) -> Result<RefreshOutcome, RefreshError> {
+        let BackendRefreshPlan::ManagedLake(plan_payload) = &plan.backend_plan else {
+            return Err(RefreshError::user(
+                "managed-lake backend received non-managed refresh plan",
+            ));
+        };
+        let state = self.state().map_err(RefreshError::pre_commit)?;
+        super::mv_refresh::refresh_mv(
+            &state,
+            plan_payload.current_catalog.as_deref(),
+            &plan_payload.current_database,
+            &plan_payload.stmt,
+        )
+        .map_err(RefreshError::pre_commit)?;
+        Ok(RefreshOutcome {
+            mv_id: plan.mv_id,
+            target: plan.target.clone(),
+            rows: None,
+            base_snapshots: Default::default(),
+            base_table_uuids: Default::default(),
+            target_snapshot_id: None,
+            backend_outcome: BackendRefreshOutcome::ManagedLake(ManagedLakeRefreshOutcome {
+                completed_inside_execute: true,
+            }),
+        })
+    }
+
+    fn commit_refresh(
+        &self,
+        _outcome: &RefreshOutcome,
+        _ctx: &mut RefreshCtx,
+    ) -> Result<(), RefreshError> {
+        Ok(())
+    }
+
+    fn rollback_refresh(
+        &self,
+        _outcome: Option<&RefreshOutcome>,
+        _ctx: &mut RefreshCtx,
+    ) -> Result<(), RefreshError> {
+        Ok(())
     }
 }
