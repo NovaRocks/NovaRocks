@@ -490,6 +490,86 @@ const MANAGED_PK_OP_COLUMN: &str = "__op";
 const MANAGED_PK_OP_UPSERT: i8 = 0;
 const MANAGED_PK_OP_DELETE: i8 = 1;
 
+/// Drive a PRIMARY KEY DELETE through the existing managed-lake sink path.
+///
+/// `pk_chunks` come from running `SELECT <pk_cols> FROM t WHERE cond` through
+/// the standalone pipeline. Each chunk is appended a constant `__op = 1`
+/// control column so the lake writer (`parse_op_batch`) classifies the rows
+/// as deletes and emits a `.del` file via `encode_delete_keys_payload`.
+///
+/// Chunks coming out of the SELECT pipeline carry slot IDs that are
+/// local to that plan, not to the table's column layout. The routing path
+/// in `write_routed_chunks` resolves the distribution slot by looking up
+/// `plan.distributed_slot_ids` (1-indexed positions in `plan.columns`) inside
+/// the chunk schema, so we rebuild each chunk with slot IDs matching the
+/// destination plan's column order before appending `__op`.
+pub(crate) fn delete_managed_lake_pk_rows(
+    state: &Arc<StandaloneState>,
+    database_name: &str,
+    table_name: &str,
+    pk_chunks: &[Chunk],
+) -> Result<(), String> {
+    let resolved = ResolvedLocalTableName {
+        database: normalize_identifier(database_name)?,
+        table: normalize_identifier(table_name)?,
+    };
+    let plan = load_physical_insert_plan(state, &resolved, PartitionTarget::Active)?;
+    if plan.tablet_schema.keys_type != Some(KeysType::PrimaryKeys as i32) {
+        return Err(format!(
+            "delete_managed_lake_pk_rows called on non-PRIMARY_KEYS table {database_name}.{table_name}"
+        ));
+    }
+
+    let mut rebuilt = Vec::with_capacity(pk_chunks.len());
+    for chunk in pk_chunks {
+        if chunk.len() == 0 {
+            continue;
+        }
+        rebuilt.push(rebuild_pk_chunk_for_plan(chunk, &plan)?);
+    }
+    if rebuilt.is_empty() {
+        // No survivors matched the WHERE clause — nothing to delete.
+        return Ok(());
+    }
+    let op_chunks = append_primary_key_op_column(&rebuilt, MANAGED_PK_OP_DELETE)?;
+    write_chunks_into_managed_partition(state, plan, &op_chunks)?;
+    Ok(())
+}
+
+/// Reassign each column of `chunk` to its 1-indexed slot in `plan.columns`,
+/// matching the slot layout that `derive_distributed_slot_ids` expects. The
+/// chunk must contain only columns named in `plan.columns`; the order is
+/// preserved as-is but slot IDs are remapped by name.
+fn rebuild_pk_chunk_for_plan(
+    chunk: &Chunk,
+    plan: &ManagedInsertPlan,
+) -> Result<Chunk, String> {
+    let batch_fields = chunk
+        .batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect::<Vec<_>>();
+    let mut slot_ids = Vec::with_capacity(batch_fields.len());
+    for field in &batch_fields {
+        let idx = plan
+            .columns
+            .iter()
+            .position(|col| col.name.eq_ignore_ascii_case(field.name()))
+            .ok_or_else(|| {
+                format!(
+                    "PK delete chunk column `{}` is not present in destination plan",
+                    field.name()
+                )
+            })?;
+        slot_ids.push(SlotId::new(idx as u32 + 1));
+    }
+    let chunk_schema =
+        ChunkSchema::try_ref_from_schema_and_slot_ids(chunk.batch.schema().as_ref(), &slot_ids)?;
+    Ok(Chunk::new_with_chunk_schema(chunk.batch.clone(), chunk_schema))
+}
+
 fn append_primary_key_op_column(chunks: &[Chunk], op: i8) -> Result<Vec<Chunk>, String> {
     chunks
         .iter()

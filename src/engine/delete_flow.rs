@@ -373,8 +373,7 @@ fn execute_managed_delete_statement(
     }
 
     if table_info.keys_type == "PRIMARY_KEYS" {
-        // M4.T2 replaces this with execute_managed_pk_delete (SELECT pk_cols, 1 AS __op).
-        return execute_managed_cow_delete_legacy(state, target, stmt);
+        return execute_managed_pk_delete(state, target, stmt, &table_info);
     }
 
     let keys_type =
@@ -486,8 +485,75 @@ fn execute_managed_predicate_delete(
     Ok(StatementResult::Ok)
 }
 
-/// Legacy copy-on-write DELETE — kept temporarily for PRIMARY KEY tables
-/// while M4.T2 implements the `__op` + sink path. To be removed in M4.T3.
+/// Rewrite `DELETE FROM pk_t WHERE cond` into `SELECT <pk_cols> FROM pk_t
+/// WHERE cond`, run it through the standalone pipeline, then route the
+/// resulting chunks through the managed-lake sink with `__op = 1` appended.
+/// The sink's `parse_op_batch` recognizes the control column and emits a
+/// `.del` file per tablet; the PK-applier consumes it at publish time.
+///
+/// WHERE accepts any plannable form (non-key columns, functions, joins,
+/// subqueries) — same surface as StarRocks PK DELETE, no DeleteAnalyzer
+/// restrictions.
+fn execute_managed_pk_delete(
+    state: &Arc<StandaloneState>,
+    target: &crate::engine::backend_resolver::TargetBackend,
+    stmt: &DeleteStmt,
+    table_info: &ManagedTableInfo,
+) -> Result<StatementResult, String> {
+    if table_info.key_columns.is_empty() {
+        return Err(format!(
+            "managed-lake PRIMARY KEY table '{}' has no key columns",
+            target.table
+        ));
+    }
+    let pk_list = table_info.key_columns.join(", ");
+    let qualified = qualify_managed_table(target);
+    let where_sql = stmt.where_clause.to_string();
+    let select_sql = format!("SELECT {pk_list} FROM {qualified} WHERE {where_sql}");
+
+    let parsed = crate::sql::parser::parse_sql_raw(&select_sql)?;
+    let sqlast::Statement::Query(query) = parsed else {
+        return Err(format!(
+            "internal: managed PK DELETE rewrite did not parse as SELECT: {select_sql}"
+        ));
+    };
+
+    // Run the SELECT through the standalone pipeline. Clone-then-release the
+    // catalog read lock the same way insert_flow does, so the pipeline cannot
+    // starve concurrent writers.
+    let catalog_snapshot = state
+        .catalog
+        .read()
+        .expect("standalone catalog read lock")
+        .clone();
+    let query_result = crate::engine::execute_query(
+        query.as_ref(),
+        &catalog_snapshot,
+        &target.namespace,
+        state.exchange_port,
+        None,
+    )?;
+
+    crate::connector::starrocks::managed::txn::delete_managed_lake_pk_rows(
+        state,
+        &target.namespace,
+        &target.table,
+        &query_result.chunks,
+    )?;
+    Ok(StatementResult::Ok)
+}
+
+fn qualify_managed_table(target: &crate::engine::backend_resolver::TargetBackend) -> String {
+    if target.namespace.is_empty() {
+        target.table.clone()
+    } else {
+        format!("{}.{}", target.namespace, target.table)
+    }
+}
+
+/// Legacy copy-on-write DELETE — superseded by execute_managed_pk_delete in
+/// M4.T2. Kept here only to be removed in M4.T3 once the PK path is verified.
+#[allow(dead_code)]
 fn execute_managed_cow_delete_legacy(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,

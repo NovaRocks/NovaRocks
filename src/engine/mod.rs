@@ -5176,6 +5176,105 @@ enable_path_style_access = true
     }
 
     #[test]
+    fn managed_pk_delete_via_op_column_path() {
+        let _runtime_guard = lock_runtime_test_state();
+        let Some((_dir, config_path, _metadata_db_path)) = maybe_managed_lake_config() else {
+            return;
+        };
+        let engine = StandaloneNovaRocks::open(StandaloneOptions {
+            config_path: Some(config_path),
+            metadata_db_path: None,
+        })
+        .expect("open engine");
+        let session = engine.session();
+
+        session
+            .execute(
+                "create table t_pk (id bigint not null, payload string) primary key(id) \
+                 distributed by hash(id) buckets 2",
+            )
+            .expect("create pk");
+        session
+            .execute("insert into t_pk values (1,'a'),(2,'b'),(3,'c')")
+            .expect("insert");
+        session
+            .execute("delete from t_pk where id = 2")
+            .expect("delete pk row");
+
+        let remaining = session
+            .query("select id from t_pk order by id")
+            .expect("query remaining");
+        assert_eq!(remaining.row_count(), 2);
+    }
+
+    #[test]
+    fn managed_pk_delete_complex_where() {
+        let _runtime_guard = lock_runtime_test_state();
+        let Some((_dir, config_path, _metadata_db_path)) = maybe_managed_lake_config() else {
+            return;
+        };
+        let engine = StandaloneNovaRocks::open(StandaloneOptions {
+            config_path: Some(config_path),
+            metadata_db_path: None,
+        })
+        .expect("open engine");
+        let session = engine.session();
+        session
+            .execute(
+                "create table t_pk_cmplx (id int not null, k int, label string) primary key(id) \
+                 distributed by hash(id) buckets 2",
+            )
+            .expect("create cmplx");
+        session
+            .execute("insert into t_pk_cmplx values (1,10,'x'),(2,20,'y'),(3,30,'z')")
+            .expect("insert");
+        session
+            .execute("delete from t_pk_cmplx where lower(label) = 'y'")
+            .expect("delete by function on non-key");
+        let remaining = session
+            .query("select id from t_pk_cmplx order by id")
+            .expect("query remaining");
+        assert_eq!(remaining.row_count(), 2);
+    }
+
+    #[test]
+    fn managed_pk_delete_then_insert_same_pk_visible() {
+        let _runtime_guard = lock_runtime_test_state();
+        let Some((_dir, config_path, _metadata_db_path)) = maybe_managed_lake_config() else {
+            return;
+        };
+        let engine = StandaloneNovaRocks::open(StandaloneOptions {
+            config_path: Some(config_path),
+            metadata_db_path: None,
+        })
+        .expect("open engine");
+        let session = engine.session();
+        session
+            .execute(
+                "create table t_pk_cycle (id int not null, label string) primary key(id) \
+                 distributed by hash(id) buckets 1",
+            )
+            .expect("create cycle");
+        session
+            .execute("insert into t_pk_cycle values (1, 'old')")
+            .expect("insert old");
+        session
+            .execute("delete from t_pk_cycle where id = 1")
+            .expect("delete old");
+        session
+            .execute("insert into t_pk_cycle values (1, 'new')")
+            .expect("insert new");
+        let r = session
+            .query("select id, label from t_pk_cycle")
+            .expect("query");
+        assert_eq!(
+            r.row_count(),
+            1,
+            "expected exactly one row after delete-then-insert"
+        );
+    }
+
+    #[test]
     fn managed_dup_delete_via_delete_predicate_path() {
         let _runtime_guard = lock_runtime_test_state();
         let Some((_dir, config_path, _metadata_db_path)) = maybe_managed_lake_config() else {
