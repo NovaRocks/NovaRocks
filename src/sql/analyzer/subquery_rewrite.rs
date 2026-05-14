@@ -61,9 +61,630 @@ impl<'a> AnalyzerContext<'a> {
         }
 
         for sq_info in subqueries {
+            // Subqueries can appear in three locations:
+            //   1. WHERE / HAVING (the original path)
+            //   2. JOIN ... ON clauses inside `select.from`
+            //   3. Inside projection items (rare, handled by the scalar
+            //      rewrite which also touches projection)
+            //
+            // The existing rewrite functions (`rewrite_exists` /
+            // `rewrite_in_subquery` / `rewrite_scalar_subquery`) all assume
+            // the placeholder lives in `select.filter` / `select.having`.
+            // For JOIN-ON placeholders we need to do the rewrite locally on
+            // the containing JoinRelation: pre-compute the subquery as a
+            // derived table, attach it as a LEFT OUTER JOIN to the host
+            // join's left input, and replace the placeholder with a
+            // match-indicator expression. We handle the JOIN-ON case
+            // first; if no JOIN-ON match is found, fall through to the
+            // original WHERE/HAVING path.
+            let in_filter = select
+                .filter
+                .as_ref()
+                .map(|f| expr_contains_placeholder(f, sq_info.id))
+                .unwrap_or(false);
+            let in_having = select
+                .having
+                .as_ref()
+                .map(|f| expr_contains_placeholder(f, sq_info.id))
+                .unwrap_or(false);
+            if !in_filter && !in_having && let Some(from) = select.from.as_mut() {
+                let id = sq_info.id;
+                if self.rewrite_subquery_in_relation(from, scope, &sq_info)? {
+                    // Placeholder dispatched to JOIN-ON rewrite.
+                    debug_assert!(!expr_contains_placeholder_in_relation(from, id));
+                    continue;
+                }
+            }
             self.rewrite_single_subquery(select, scope, sq_info)?;
         }
 
+        Ok(())
+    }
+
+    /// Walk a Relation tree looking for a JoinRelation whose `condition`
+    /// contains the subquery placeholder. If found, rewrite it in place
+    /// (wrapping the join's left input with a LEFT OUTER JOIN against the
+    /// subquery, and replacing the placeholder with a match-indicator
+    /// expression). Returns Ok(true) if the placeholder was found and
+    /// rewritten.
+    fn rewrite_subquery_in_relation(
+        &self,
+        rel: &mut Relation,
+        scope: &mut AnalyzerScope,
+        sq_info: &SubqueryInfo,
+    ) -> Result<bool, String> {
+        match rel {
+            Relation::Join(join_box) => {
+                if self.rewrite_subquery_in_relation(&mut join_box.left, scope, sq_info)? {
+                    return Ok(true);
+                }
+                if self.rewrite_subquery_in_relation(&mut join_box.right, scope, sq_info)? {
+                    return Ok(true);
+                }
+                let has_placeholder = join_box
+                    .condition
+                    .as_ref()
+                    .map(|c| expr_contains_placeholder(c, sq_info.id))
+                    .unwrap_or(false);
+                if !has_placeholder {
+                    return Ok(false);
+                }
+                self.rewrite_join_on_subquery(join_box, scope, sq_info)?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Rewrite a single subquery placeholder living inside a JoinRelation's
+    /// ON clause. The placeholder is replaced with either:
+    /// - For uncorrelated IN: `__sq_alias.match IS NOT NULL` (or `IS NULL`
+    ///   for NOT IN), backed by a LEFT OUTER JOIN against `SELECT DISTINCT
+    ///   col FROM subquery` added to the host join's left input.
+    /// - For uncorrelated EXISTS: a constant boolean (or for NOT EXISTS).
+    ///   We add a LEFT OUTER JOIN against the subquery limited to one row
+    ///   and use `match IS NOT NULL`.
+    /// - For uncorrelated scalar: a CROSS JOIN exposing the scalar as a
+    ///   single-row column, plus a ColumnRef replacement.
+    ///
+    /// Correlated JOIN-ON subqueries are not yet supported and surface as
+    /// the original "unexpected SubqueryPlaceholder" codegen error.
+    fn rewrite_join_on_subquery(
+        &self,
+        join: &mut JoinRelation,
+        scope: &mut AnalyzerScope,
+        sq_info: &SubqueryInfo,
+    ) -> Result<(), String> {
+        let (resolved_sub, inner_scope) =
+            self.analyze_query_in_scope_with_inner(&sq_info.subquery, scope)?;
+
+        let is_correlated = match resolved_sub.body {
+            QueryBody::Select(ref sel) => sel
+                .filter
+                .as_ref()
+                .map(|f| !extract_correlation_predicates(f, &inner_scope, scope).is_empty())
+                .unwrap_or(false),
+            _ => false,
+        };
+
+        let sq_alias = format!("__sq_on_{}", sq_info.id);
+
+        if is_correlated {
+            return match &sq_info.kind {
+                SubqueryKind::InSubquery { negated } => self
+                    .rewrite_join_on_in_subquery_correlated(
+                        join,
+                        scope,
+                        sq_info,
+                        resolved_sub,
+                        sq_alias,
+                        *negated,
+                    ),
+                SubqueryKind::Exists { negated } => self.rewrite_join_on_exists_correlated(
+                    join,
+                    scope,
+                    sq_info,
+                    resolved_sub,
+                    sq_alias,
+                    *negated,
+                ),
+                SubqueryKind::Scalar => self.rewrite_join_on_scalar_correlated(
+                    join,
+                    scope,
+                    sq_info,
+                    resolved_sub,
+                    sq_alias,
+                ),
+            };
+        }
+
+        match &sq_info.kind {
+            SubqueryKind::InSubquery { negated } => self.rewrite_join_on_in_subquery(
+                join,
+                scope,
+                sq_info,
+                resolved_sub,
+                sq_alias,
+                *negated,
+            ),
+            SubqueryKind::Exists { negated } => self.rewrite_join_on_exists(
+                join,
+                scope,
+                sq_info,
+                resolved_sub,
+                sq_alias,
+                *negated,
+            ),
+            SubqueryKind::Scalar => {
+                self.rewrite_join_on_scalar(join, scope, sq_info, resolved_sub, sq_alias)
+            }
+        }
+    }
+
+    /// Correlated IN inside a JOIN ON clause. Extract the subquery's FROM
+    /// and lift the WHERE (which contains the correlation predicate) up
+    /// into the auxiliary LEFT OUTER JOIN's ON clause. The match-indicator
+    /// is a non-null literal projected by the subquery, so the placeholder
+    /// becomes `__match IS [NOT] NULL`.
+    fn rewrite_join_on_in_subquery_correlated(
+        &self,
+        join: &mut JoinRelation,
+        scope: &mut AnalyzerScope,
+        sq_info: &SubqueryInfo,
+        resolved_sub: ResolvedQuery,
+        sq_alias: String,
+        negated: bool,
+    ) -> Result<(), String> {
+        let in_expr_ast = sq_info
+            .in_expr
+            .as_ref()
+            .ok_or("IN subquery rewrite (JOIN ON, correlated): missing left-hand expression")?;
+        let lhs_typed = self.analyze_expr(in_expr_ast, scope)?;
+
+        let (sub_from, sub_filter) = match resolved_sub.body {
+            QueryBody::Select(sel) => (sel.from, sel.filter),
+            _ => return Err("correlated IN subquery must be a SELECT".into()),
+        };
+        let sub_first_col = resolved_sub
+            .output_columns
+            .first()
+            .ok_or("IN subquery must produce at least one column")?
+            .clone();
+        let sub_rel = sub_from
+            .ok_or("correlated IN subquery must have a FROM clause".to_string())?;
+
+        // Build the equality condition plus the lifted WHERE.
+        let eq_cond = TypedExpr {
+            data_type: DataType::Boolean,
+            nullable: false,
+            kind: ExprKind::BinaryOp {
+                left: Box::new(lhs_typed.clone()),
+                op: BinOp::Eq,
+                right: Box::new(TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        qualifier: None,
+                        column: sub_first_col.name.clone(),
+                    },
+                    data_type: sub_first_col.data_type.clone(),
+                    nullable: sub_first_col.nullable,
+                }),
+            },
+        };
+        let join_cond = match sub_filter.clone() {
+            Some(f) => Some(TypedExpr {
+                data_type: DataType::Boolean,
+                nullable: false,
+                kind: ExprKind::BinaryOp {
+                    left: Box::new(eq_cond),
+                    op: BinOp::And,
+                    right: Box::new(f),
+                },
+            }),
+            None => Some(eq_cond),
+        };
+
+        // Choose which side of the host join to attach the auxiliary
+        // join to, based on which side carries the correlation column.
+        let mut corr_exprs: Vec<TypedExpr> = vec![lhs_typed];
+        if let Some(f) = sub_filter.as_ref() {
+            corr_exprs.push(f.clone());
+        }
+        let side = choose_aux_join_side(join, &corr_exprs);
+        attach_aux_join(join, side, sub_rel, join_cond);
+
+        // The placeholder evaluates by checking the subquery's first column
+        // (now exposed on the auxiliary join's output via LEFT OUTER JOIN).
+        let replacement = TypedExpr {
+            data_type: DataType::Boolean,
+            nullable: false,
+            kind: ExprKind::IsNull {
+                expr: Box::new(TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        qualifier: None,
+                        column: sub_first_col.name.clone(),
+                    },
+                    data_type: sub_first_col.data_type.clone(),
+                    nullable: true,
+                }),
+                negated: !negated,
+            },
+        };
+        if let Some(cond) = join.condition.as_ref() {
+            join.condition = Some(replace_placeholder_in_expr(cond, sq_info.id, &replacement));
+        }
+
+        // Expose subquery columns in the outer scope so downstream
+        // references (e.g. ORDER BY on subquery column, though uncommon)
+        // resolve.
+        let _ = sq_alias; // sq_alias unused for unwrapped FROM
+        Ok(())
+    }
+
+    /// Correlated EXISTS inside JOIN ON. Lift sub-FROM and sub-WHERE
+    /// (which has correlation) into the auxiliary LEFT OUTER JOIN ON.
+    /// Placeholder becomes `<inner_col> IS [NOT] NULL`.
+    fn rewrite_join_on_exists_correlated(
+        &self,
+        join: &mut JoinRelation,
+        scope: &mut AnalyzerScope,
+        sq_info: &SubqueryInfo,
+        resolved_sub: ResolvedQuery,
+        sq_alias: String,
+        negated: bool,
+    ) -> Result<(), String> {
+        let (sub_from, sub_filter) = match resolved_sub.body {
+            QueryBody::Select(sel) => (sel.from, sel.filter),
+            _ => return Err("correlated EXISTS subquery must be a SELECT".into()),
+        };
+        // Pick the first projection column as the match indicator. For
+        // EXISTS with arbitrary projection this is fine — we just need a
+        // non-null indicator when a matching row exists.
+        let indicator = resolved_sub
+            .output_columns
+            .first()
+            .ok_or("EXISTS subquery must produce at least one column")?
+            .clone();
+        let sub_rel = sub_from
+            .ok_or("correlated EXISTS subquery must have a FROM clause".to_string())?;
+
+        let side = match sub_filter.as_ref() {
+            Some(f) => choose_aux_join_side(join, &[f.clone()]),
+            None => AuxJoinSide::Left,
+        };
+        attach_aux_join(join, side, sub_rel, sub_filter);
+
+        let replacement = TypedExpr {
+            data_type: DataType::Boolean,
+            nullable: false,
+            kind: ExprKind::IsNull {
+                expr: Box::new(TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        qualifier: None,
+                        column: indicator.name.clone(),
+                    },
+                    data_type: indicator.data_type.clone(),
+                    nullable: true,
+                }),
+                negated: !negated,
+            },
+        };
+        if let Some(cond) = join.condition.as_ref() {
+            join.condition = Some(replace_placeholder_in_expr(cond, sq_info.id, &replacement));
+        }
+        let _ = sq_alias;
+        Ok(())
+    }
+
+    /// Correlated scalar subquery inside JOIN ON. The subquery returns one
+    /// value per outer row; if the subquery is an aggregate (e.g.
+    /// `(SELECT count(*) FROM t WHERE pred(outer))`) we still emit a LEFT
+    /// OUTER JOIN against its FROM with the correlation predicate hoisted
+    /// into ON, then the placeholder becomes a reference to the aggregated
+    /// projection column.
+    fn rewrite_join_on_scalar_correlated(
+        &self,
+        join: &mut JoinRelation,
+        scope: &mut AnalyzerScope,
+        sq_info: &SubqueryInfo,
+        resolved_sub: ResolvedQuery,
+        sq_alias: String,
+    ) -> Result<(), String> {
+        // For correlated scalar (typically `SELECT agg(...) FROM t WHERE
+        // <correlated>`), we re-wrap the subquery as a Subquery relation
+        // but pre-extract the correlation predicate up into a LEFT OUTER
+        // JOIN's ON, similar to the WHERE-clause path
+        // (`build_correlated_scalar_subquery_from_resolved`). That helper
+        // builds a per-correlation-key aggregate, which is what we want.
+        // Reuse it.
+        if resolved_sub.output_columns.is_empty() {
+            return Err("correlated scalar subquery must produce at least one column".into());
+        }
+        let inner_scope_filter = match resolved_sub.body {
+            QueryBody::Select(ref s) => s.filter.clone(),
+            _ => None,
+        };
+        let inner_scope = match resolved_sub.body {
+            QueryBody::Select(_) => {
+                // Re-derive the inner scope from the subquery's analyzed FROM.
+                // For simplicity, recompute via `analyze_query_in_scope_with_inner`.
+                let (_, scope) = self.analyze_query_in_scope_with_inner(&sq_info.subquery, scope)?;
+                scope
+            }
+            _ => return Err("correlated scalar subquery must be a SELECT".into()),
+        };
+        let corr_preds = match (&inner_scope_filter, &resolved_sub.body) {
+            (Some(filter), QueryBody::Select(_)) => {
+                extract_correlation_predicates(filter, &inner_scope, scope)
+            }
+            _ => vec![],
+        };
+        let outer_corr_exprs: Vec<TypedExpr> =
+            corr_preds.iter().map(|p| p.outer_col.clone()).collect();
+        let (modified_sub, corr_join_conds) = self
+            .build_correlated_scalar_subquery_from_resolved(
+                resolved_sub,
+                scope,
+                &sq_alias,
+                &corr_preds,
+            )?;
+        let scalar_output = modified_sub.output_columns[0].clone();
+        let output_columns = modified_sub.output_columns.clone();
+        let sub_rel = Relation::Subquery {
+            query: Box::new(modified_sub),
+            alias: sq_alias.clone(),
+            output_columns,
+        };
+        scope.add_column(
+            Some(&sq_alias),
+            &scalar_output.name,
+            scalar_output.data_type.clone(),
+            true,
+        );
+
+        let side = choose_aux_join_side(join, &outer_corr_exprs);
+        attach_aux_join(join, side, sub_rel, corr_join_conds);
+
+        let replacement = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                qualifier: Some(sq_alias),
+                column: scalar_output.name,
+            },
+            data_type: scalar_output.data_type,
+            nullable: true,
+        };
+        if let Some(cond) = join.condition.as_ref() {
+            join.condition = Some(replace_placeholder_in_expr(cond, sq_info.id, &replacement));
+        }
+        Ok(())
+    }
+
+    fn rewrite_join_on_in_subquery(
+        &self,
+        join: &mut JoinRelation,
+        scope: &mut AnalyzerScope,
+        sq_info: &SubqueryInfo,
+        resolved_sub: ResolvedQuery,
+        sq_alias: String,
+        negated: bool,
+    ) -> Result<(), String> {
+        let in_expr_ast = sq_info
+            .in_expr
+            .as_ref()
+            .ok_or("IN subquery rewrite (JOIN ON): missing left-hand expression")?;
+        let lhs_typed = self.analyze_expr(in_expr_ast, scope)?;
+        if resolved_sub.output_columns.is_empty() {
+            return Err("IN subquery must produce at least one column".into());
+        }
+        let sub_col = resolved_sub.output_columns[0].clone();
+        let match_col = format!("__match_{}", sq_info.id);
+
+        // Augment the subquery: DISTINCT + match-indicator column equal to
+        // the IN target. After LEFT OUTER JOIN, the match column is NULL
+        // for non-matching outer rows and non-NULL for matches.
+        let mut modified_sub = resolved_sub;
+        if let QueryBody::Select(ref mut sel) = modified_sub.body {
+            sel.distinct = true;
+            sel.projection.push(ProjectItem {
+                expr: TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        qualifier: None,
+                        column: sub_col.name.clone(),
+                    },
+                    data_type: sub_col.data_type.clone(),
+                    nullable: sub_col.nullable,
+                },
+                output_name: match_col.clone(),
+            });
+        }
+        modified_sub.output_columns.push(OutputColumn {
+            name: match_col.clone(),
+            data_type: sub_col.data_type.clone(),
+            nullable: true,
+        });
+        let output_columns = modified_sub.output_columns.clone();
+        let sub_rel = Relation::Subquery {
+            query: Box::new(modified_sub),
+            alias: sq_alias.clone(),
+            output_columns,
+        };
+
+        // Expose the subquery alias in the outer scope so the rewritten
+        // ON expression can reference `<sq_alias>.<match>`.
+        scope.add_column(
+            Some(&sq_alias),
+            &sub_col.name,
+            sub_col.data_type.clone(),
+            true,
+        );
+        scope.add_column(
+            Some(&sq_alias),
+            &match_col,
+            sub_col.data_type.clone(),
+            true,
+        );
+
+        let eq_cond = TypedExpr {
+            data_type: DataType::Boolean,
+            nullable: false,
+            kind: ExprKind::BinaryOp {
+                left: Box::new(lhs_typed.clone()),
+                op: BinOp::Eq,
+                right: Box::new(TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        qualifier: Some(sq_alias.clone()),
+                        column: sub_col.name.clone(),
+                    },
+                    data_type: sub_col.data_type.clone(),
+                    nullable: true,
+                }),
+            },
+        };
+
+        // Attach the aux LEFT OUTER JOIN to whichever side of the host join
+        // exposes the LHS column(s); otherwise default to LEFT.
+        let side = choose_aux_join_side(join, std::slice::from_ref(&lhs_typed));
+        attach_aux_join(join, side, sub_rel, Some(eq_cond));
+
+        let replacement = TypedExpr {
+            data_type: DataType::Boolean,
+            nullable: false,
+            kind: ExprKind::IsNull {
+                expr: Box::new(TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        qualifier: Some(sq_alias),
+                        column: match_col,
+                    },
+                    data_type: sub_col.data_type.clone(),
+                    nullable: true,
+                }),
+                negated: !negated, // IN → IS NOT NULL; NOT IN → IS NULL
+            },
+        };
+        if let Some(cond) = join.condition.as_ref() {
+            join.condition = Some(replace_placeholder_in_expr(cond, sq_info.id, &replacement));
+        }
+        Ok(())
+    }
+
+    fn rewrite_join_on_exists(
+        &self,
+        join: &mut JoinRelation,
+        scope: &mut AnalyzerScope,
+        sq_info: &SubqueryInfo,
+        resolved_sub: ResolvedQuery,
+        sq_alias: String,
+        negated: bool,
+    ) -> Result<(), String> {
+        let match_col = format!("__exists_{}", sq_info.id);
+        // Project a single non-null indicator so LEFT OUTER JOIN against
+        // `__sq_alias` yields a row with `__exists IS NOT NULL` iff the
+        // subquery has any rows.
+        let mut modified_sub = resolved_sub;
+        if let QueryBody::Select(ref mut sel) = modified_sub.body {
+            sel.distinct = false;
+            sel.projection.clear();
+            sel.projection.push(ProjectItem {
+                expr: TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::Int(1)),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                },
+                output_name: match_col.clone(),
+            });
+            sel.has_aggregation = false;
+        }
+        modified_sub.output_columns = vec![OutputColumn {
+            name: match_col.clone(),
+            data_type: DataType::Int64,
+            nullable: true,
+        }];
+        modified_sub.limit = Some(1);
+        let output_columns = modified_sub.output_columns.clone();
+        let sub_rel = Relation::Subquery {
+            query: Box::new(modified_sub),
+            alias: sq_alias.clone(),
+            output_columns,
+        };
+
+        scope.add_column(Some(&sq_alias), &match_col, DataType::Int64, true);
+
+        let placeholder = std::mem::replace(&mut join.left, dummy_relation());
+        join.left = Relation::Join(Box::new(JoinRelation {
+            left: placeholder,
+            right: sub_rel,
+            join_type: JoinKind::LeftOuter,
+            condition: Some(TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Bool(true)),
+                data_type: DataType::Boolean,
+                nullable: false,
+            }),
+        }));
+
+        let replacement = TypedExpr {
+            data_type: DataType::Boolean,
+            nullable: false,
+            kind: ExprKind::IsNull {
+                expr: Box::new(TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        qualifier: Some(sq_alias),
+                        column: match_col,
+                    },
+                    data_type: DataType::Int64,
+                    nullable: true,
+                }),
+                negated: !negated, // EXISTS → IS NOT NULL; NOT EXISTS → IS NULL
+            },
+        };
+        if let Some(cond) = join.condition.as_ref() {
+            join.condition = Some(replace_placeholder_in_expr(cond, sq_info.id, &replacement));
+        }
+        Ok(())
+    }
+
+    fn rewrite_join_on_scalar(
+        &self,
+        join: &mut JoinRelation,
+        scope: &mut AnalyzerScope,
+        sq_info: &SubqueryInfo,
+        resolved_sub: ResolvedQuery,
+        sq_alias: String,
+    ) -> Result<(), String> {
+        if resolved_sub.output_columns.is_empty() {
+            return Err("scalar subquery must produce at least one column".into());
+        }
+        let scalar_col = resolved_sub.output_columns[0].clone();
+        let output_columns = resolved_sub.output_columns.clone();
+        let sub_rel = Relation::Subquery {
+            query: Box::new(resolved_sub),
+            alias: sq_alias.clone(),
+            output_columns,
+        };
+        scope.add_column(
+            Some(&sq_alias),
+            &scalar_col.name,
+            scalar_col.data_type.clone(),
+            true,
+        );
+
+        let placeholder = std::mem::replace(&mut join.left, dummy_relation());
+        join.left = Relation::Join(Box::new(JoinRelation {
+            left: placeholder,
+            right: sub_rel,
+            join_type: JoinKind::Cross,
+            condition: None,
+        }));
+
+        let replacement = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                qualifier: Some(sq_alias),
+                column: scalar_col.name,
+            },
+            data_type: scalar_col.data_type,
+            nullable: true,
+        };
+        if let Some(cond) = join.condition.as_ref() {
+            join.condition = Some(replace_placeholder_in_expr(cond, sq_info.id, &replacement));
+        }
         Ok(())
     }
 
@@ -262,14 +883,34 @@ impl<'a> AnalyzerContext<'a> {
             .as_ref()
             .ok_or("IN subquery rewrite: missing left-hand expression")?;
 
-        let lhs_typed = self.analyze_expr(in_expr_ast, scope)?;
+        // Multi-column LHS: `(a, b) IN (SELECT c, d FROM ...)`. sqlparser
+        // emits the LHS as `Expr::Tuple(items)` (possibly wrapped in
+        // `Expr::Nested`). Analyze each component separately and pair
+        // them with the subquery's output columns one-to-one.
+        let lhs_items_ast: Vec<&sqlparser::ast::Expr> = match in_expr_ast.as_ref() {
+            sqlparser::ast::Expr::Tuple(items) => items.iter().collect(),
+            sqlparser::ast::Expr::Nested(inner) => match inner.as_ref() {
+                sqlparser::ast::Expr::Tuple(items) => items.iter().collect(),
+                other => vec![other],
+            },
+            other => vec![other],
+        };
+        let lhs_typed_list: Vec<TypedExpr> = lhs_items_ast
+            .iter()
+            .map(|e| self.analyze_expr(e, scope))
+            .collect::<Result<Vec<_>, _>>()?;
 
         let (resolved_sub, inner_scope) =
             self.analyze_query_in_scope_with_inner(&sq_info.subquery, scope)?;
 
-        if resolved_sub.output_columns.is_empty() {
-            return Err("IN subquery must produce at least one column".into());
+        if resolved_sub.output_columns.len() != lhs_typed_list.len() {
+            return Err(format!(
+                "IN subquery column count mismatch: LHS has {} expression(s) but subquery produces {} column(s)",
+                lhs_typed_list.len(),
+                resolved_sub.output_columns.len()
+            ));
         }
+        let lhs_typed = lhs_typed_list[0].clone();
         let sub_output_col = resolved_sub.output_columns[0].clone();
 
         // Check if the IN placeholder is inside an OR expression.
@@ -307,56 +948,86 @@ impl<'a> AnalyzerContext<'a> {
 
         let sq_alias = format!("__sq_{}", sq_info.id);
 
-        // For IN subquery eq condition: use the subquery alias as qualifier
-        // for the right side to avoid tautology when both sides have the same
-        // bare column name (e.g., ss_item_sk IN (SELECT ss_item_sk FROM ...)).
-        let lhs_col_name = match &lhs_typed.kind {
-            ExprKind::ColumnRef { column, .. } => Some(column.to_lowercase()),
-            _ => None,
-        };
-        let rhs_needs_qualifier =
-            lhs_col_name.as_deref() == Some(&sub_output_col.name.to_lowercase());
+        if inside_or && lhs_typed_list.len() > 1 {
+            return Err(
+                "multi-column IN subquery inside OR is not yet supported".to_string(),
+            );
+        }
 
-        let rhs_ref = TypedExpr {
-            kind: ExprKind::ColumnRef {
-                qualifier: if rhs_needs_qualifier {
-                    Some(sq_alias.clone())
-                } else {
-                    None
+        // Build per-column equality conjuncts. For a single-column IN this
+        // collapses to the original behaviour; for `(a, b) IN (SELECT c, d
+        // ...)` we get `a = c AND b = d` (or the null-aware variant for
+        // NOT IN).
+        let mut eq_conjuncts: Vec<TypedExpr> = Vec::with_capacity(lhs_typed_list.len());
+        for (idx, lhs_i) in lhs_typed_list.iter().enumerate() {
+            let sub_col = &resolved_sub.output_columns[idx];
+            let lhs_name_lower = match &lhs_i.kind {
+                ExprKind::ColumnRef { column, .. } => Some(column.to_lowercase()),
+                _ => None,
+            };
+            let rhs_needs_qualifier =
+                lhs_name_lower.as_deref() == Some(&sub_col.name.to_lowercase());
+            let rhs_ref = TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    qualifier: if rhs_needs_qualifier {
+                        Some(sq_alias.clone())
+                    } else {
+                        None
+                    },
+                    column: sub_col.name.clone(),
                 },
-                column: sub_output_col.name.clone(),
-            },
-            data_type: sub_output_col.data_type.clone(),
-            nullable: sub_output_col.nullable,
-        };
-
-        // For IN (semi), plain equality is correct: NULLs never satisfy `=`
-        // so they're already excluded. For NOT IN (anti) we need null-aware
-        // equality so the LEFT ANTI join matches whenever either operand is
-        // NULL, matching SQL's "x NOT IN S returns UNKNOWN if x is NULL or
-        // S contains NULL" semantics. The previous approach of filtering
-        // NULLs out of the subquery was wrong: it produced TRUE for left
-        // rows that should yield UNKNOWN.
-        let eq_cond = if negated && !inside_or {
-            null_aware_eq(lhs_typed, rhs_ref)
-        } else {
-            TypedExpr {
-                data_type: DataType::Boolean,
-                nullable: false,
-                kind: ExprKind::BinaryOp {
-                    left: Box::new(lhs_typed),
-                    op: BinOp::Eq,
-                    right: Box::new(rhs_ref),
-                },
+                data_type: sub_col.data_type.clone(),
+                nullable: sub_col.nullable,
+            };
+            // For IN (semi), plain equality is correct: NULLs never satisfy
+            // `=` so they're already excluded. For NOT IN (anti) we need
+            // null-aware equality so the LEFT ANTI join matches whenever
+            // either operand is NULL, matching SQL's
+            // "x NOT IN S returns UNKNOWN if x is NULL or S contains NULL"
+            // semantics.
+            let eq = if negated && !inside_or {
+                null_aware_eq(lhs_i.clone(), rhs_ref)
+            } else {
+                TypedExpr {
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                    kind: ExprKind::BinaryOp {
+                        left: Box::new(lhs_i.clone()),
+                        op: BinOp::Eq,
+                        right: Box::new(rhs_ref),
+                    },
+                }
+            };
+            eq_conjuncts.push(eq);
+        }
+        let eq_cond = {
+            let mut iter = eq_conjuncts.into_iter();
+            let mut acc = iter.next().expect("at least one IN column");
+            for next in iter {
+                acc = TypedExpr {
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                    kind: ExprKind::BinaryOp {
+                        left: Box::new(acc),
+                        op: BinOp::And,
+                        right: Box::new(next),
+                    },
+                };
             }
+            acc
         };
 
-        scope.add_column(
-            Some(&sq_alias),
-            &sub_output_col.name,
-            sub_output_col.data_type.clone(),
-            true, // nullable for LEFT OUTER JOIN
-        );
+        // Expose every subquery output column under `__sq_<id>` so
+        // explicit references (e.g. in IN-inside-OR's match-indicator
+        // wrapping below) can resolve.
+        for sub_col in &resolved_sub.output_columns {
+            scope.add_column(
+                Some(&sq_alias),
+                &sub_col.name,
+                sub_col.data_type.clone(),
+                true, // nullable for LEFT OUTER JOIN
+            );
+        }
 
         let current_from = take_from_or_synthesize_single_row(&mut select.from);
 
@@ -1249,6 +1920,302 @@ fn is_outer_only_ref(
 
 fn is_placeholder(expr: &TypedExpr, id: usize) -> bool {
     matches!(&expr.kind, ExprKind::SubqueryPlaceholder { id: pid, .. } if *pid == id)
+}
+
+/// Synthetic placeholder Relation used with `std::mem::replace` while we
+/// shuffle a JoinRelation's left input. The value is immediately
+/// overwritten before any consumer sees it.
+fn dummy_relation() -> Relation {
+    Relation::GenerateSeries(GenerateSeriesRelation {
+        start: 0,
+        end: -1,
+        step: 1,
+        column_name: "__nr_dummy".to_string(),
+        alias: None,
+    })
+}
+
+/// Wrap `join.left` (or `join.right`) with a LEFT OUTER JOIN against the
+/// given subquery side relation. Used by the JOIN-ON subquery rewrite
+/// path to attach the auxiliary subquery to whichever side carries the
+/// correlation column.
+fn attach_aux_join(
+    join: &mut JoinRelation,
+    side: AuxJoinSide,
+    sub_rel: Relation,
+    condition: Option<TypedExpr>,
+) {
+    let host_side = match side {
+        AuxJoinSide::Left => &mut join.left,
+        AuxJoinSide::Right => &mut join.right,
+    };
+    let placeholder = std::mem::replace(host_side, dummy_relation());
+    *host_side = Relation::Join(Box::new(JoinRelation {
+        left: placeholder,
+        right: sub_rel,
+        join_type: JoinKind::LeftOuter,
+        condition,
+    }));
+}
+
+/// Recursively walk a TypedExpr looking for any `SubqueryPlaceholder` whose
+/// id matches `placeholder_id`.
+fn expr_contains_placeholder(expr: &TypedExpr, placeholder_id: usize) -> bool {
+    if is_placeholder(expr, placeholder_id) {
+        return true;
+    }
+    match &expr.kind {
+        ExprKind::BinaryOp { left, right, .. } => {
+            expr_contains_placeholder(left, placeholder_id)
+                || expr_contains_placeholder(right, placeholder_id)
+        }
+        ExprKind::UnaryOp { expr: inner, .. } => {
+            expr_contains_placeholder(inner, placeholder_id)
+        }
+        ExprKind::IsNull { expr: inner, .. } => {
+            expr_contains_placeholder(inner, placeholder_id)
+        }
+        ExprKind::Cast { expr: inner, .. } => {
+            expr_contains_placeholder(inner, placeholder_id)
+        }
+        ExprKind::Nested(inner) => expr_contains_placeholder(inner, placeholder_id),
+        ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
+            args.iter().any(|a| expr_contains_placeholder(a, placeholder_id))
+        }
+        ExprKind::InList { expr: inner, list, .. } => {
+            expr_contains_placeholder(inner, placeholder_id)
+                || list.iter().any(|i| expr_contains_placeholder(i, placeholder_id))
+        }
+        ExprKind::Between { expr: inner, low, high, .. } => {
+            expr_contains_placeholder(inner, placeholder_id)
+                || expr_contains_placeholder(low, placeholder_id)
+                || expr_contains_placeholder(high, placeholder_id)
+        }
+        ExprKind::Like { expr: inner, pattern, .. } => {
+            expr_contains_placeholder(inner, placeholder_id)
+                || expr_contains_placeholder(pattern, placeholder_id)
+        }
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(op) = operand {
+                if expr_contains_placeholder(op, placeholder_id) {
+                    return true;
+                }
+            }
+            for (when, then) in when_then {
+                if expr_contains_placeholder(when, placeholder_id)
+                    || expr_contains_placeholder(then, placeholder_id)
+                {
+                    return true;
+                }
+            }
+            if let Some(else_) = else_expr {
+                if expr_contains_placeholder(else_, placeholder_id) {
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Return true if the relation tree exposes a column with the given
+/// (lowercased) qualifier. Used to pick which side of a JoinRelation
+/// should host an auxiliary correlated subquery join.
+fn relation_exposes_qualifier(rel: &Relation, qual_lower: &str) -> bool {
+    match rel {
+        Relation::Scan(s) => {
+            let name = s.alias.as_deref().unwrap_or(&s.table.name);
+            name.eq_ignore_ascii_case(qual_lower)
+        }
+        Relation::IcebergMetadataScan(s) => {
+            let name = s.alias.as_deref().unwrap_or(&s.table.name);
+            name.eq_ignore_ascii_case(qual_lower)
+        }
+        Relation::Subquery { alias, .. } => alias.eq_ignore_ascii_case(qual_lower),
+        Relation::CTEConsume { alias, .. } => alias.eq_ignore_ascii_case(qual_lower),
+        Relation::GenerateSeries(g) => g
+            .alias
+            .as_deref()
+            .map(|n| n.eq_ignore_ascii_case(qual_lower))
+            .unwrap_or(false),
+        Relation::Unnest(u) => u
+            .alias
+            .as_deref()
+            .map(|n| n.eq_ignore_ascii_case(qual_lower))
+            .unwrap_or(false),
+        Relation::Join(j) => {
+            relation_exposes_qualifier(&j.left, qual_lower)
+                || relation_exposes_qualifier(&j.right, qual_lower)
+        }
+    }
+}
+
+/// Return true if the relation tree exposes an unqualified column with
+/// the given (lowercased) name. Used to disambiguate aux-join placement
+/// when the rewritten expression carries unqualified ColumnRefs.
+fn relation_exposes_column(rel: &Relation, col_lower: &str) -> bool {
+    match rel {
+        Relation::Scan(s) => s
+            .table
+            .columns
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(col_lower)),
+        Relation::IcebergMetadataScan(s) => s
+            .table
+            .columns
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(col_lower)),
+        Relation::Subquery {
+            output_columns, ..
+        } => output_columns
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(col_lower)),
+        Relation::CTEConsume {
+            output_columns, ..
+        } => output_columns
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(col_lower)),
+        Relation::GenerateSeries(g) => g.column_name.eq_ignore_ascii_case(col_lower),
+        Relation::Unnest(u) => u
+            .output_columns
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(col_lower)),
+        Relation::Join(j) => {
+            relation_exposes_column(&j.left, col_lower)
+                || relation_exposes_column(&j.right, col_lower)
+        }
+    }
+}
+
+/// Collect every distinct ColumnRef referenced by `expr`, returned as
+/// `(qualifier_lower_or_none, column_name_lower)` pairs. Used to decide
+/// whether a correlated subquery's auxiliary join should attach to the
+/// host join's LEFT input, RIGHT input, or above.
+fn collect_column_refs(expr: &TypedExpr, out: &mut Vec<(Option<String>, String)>) {
+    match &expr.kind {
+        ExprKind::ColumnRef { qualifier, column } => {
+            let entry = (
+                qualifier.as_ref().map(|q| q.to_lowercase()),
+                column.to_lowercase(),
+            );
+            if !out.iter().any(|x| *x == entry) {
+                out.push(entry);
+            }
+        }
+        ExprKind::BinaryOp { left, right, .. } => {
+            collect_column_refs(left, out);
+            collect_column_refs(right, out);
+        }
+        ExprKind::UnaryOp { expr: inner, .. } => collect_column_refs(inner, out),
+        ExprKind::IsNull { expr: inner, .. } => collect_column_refs(inner, out),
+        ExprKind::Cast { expr: inner, .. } => collect_column_refs(inner, out),
+        ExprKind::Nested(inner) => collect_column_refs(inner, out),
+        ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
+            for a in args {
+                collect_column_refs(a, out);
+            }
+        }
+        ExprKind::InList {
+            expr: inner, list, ..
+        } => {
+            collect_column_refs(inner, out);
+            for i in list {
+                collect_column_refs(i, out);
+            }
+        }
+        ExprKind::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            collect_column_refs(inner, out);
+            collect_column_refs(low, out);
+            collect_column_refs(high, out);
+        }
+        ExprKind::Like {
+            expr: inner,
+            pattern,
+            ..
+        } => {
+            collect_column_refs(inner, out);
+            collect_column_refs(pattern, out);
+        }
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(op) = operand {
+                collect_column_refs(op, out);
+            }
+            for (w, t) in when_then {
+                collect_column_refs(w, out);
+                collect_column_refs(t, out);
+            }
+            if let Some(e) = else_expr {
+                collect_column_refs(e, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Decide which side of a JoinRelation should host an auxiliary
+/// subquery join (or whether the placement is ambiguous). Returns
+/// `Side::Left` if `corr_exprs` only references columns reachable from
+/// `join.left`, `Side::Right` if only from `join.right`, and `None` if
+/// neither or both (ambiguous; falls back to LEFT).
+#[derive(Clone, Copy, Debug)]
+enum AuxJoinSide {
+    Left,
+    Right,
+}
+
+fn choose_aux_join_side(join: &JoinRelation, corr_exprs: &[TypedExpr]) -> AuxJoinSide {
+    let mut refs: Vec<(Option<String>, String)> = Vec::new();
+    for e in corr_exprs {
+        collect_column_refs(e, &mut refs);
+    }
+    // Probe each ref against the immediate left/right children of the host
+    // join. A ref reaches a side if either:
+    //   - its qualifier matches a relation alias on that side, OR
+    //   - it is unqualified and its column name is exposed there.
+    let on_side = |rel: &Relation, (q, c): &(Option<String>, String)| -> bool {
+        match q {
+            Some(qual) => relation_exposes_qualifier(rel, qual),
+            None => relation_exposes_column(rel, c),
+        }
+    };
+    let any_right = refs.iter().any(|r| on_side(&join.right, r));
+    let any_left = refs.iter().any(|r| on_side(&join.left, r));
+    if any_right && !any_left {
+        AuxJoinSide::Right
+    } else {
+        AuxJoinSide::Left
+    }
+}
+
+/// Walk a Relation tree (joins only — base scans / subqueries cannot
+/// carry placeholders themselves) looking for any JoinRelation whose
+/// `condition` references the given placeholder.
+fn expr_contains_placeholder_in_relation(rel: &Relation, placeholder_id: usize) -> bool {
+    match rel {
+        Relation::Join(j) => {
+            j.condition
+                .as_ref()
+                .map(|c| expr_contains_placeholder(c, placeholder_id))
+                .unwrap_or(false)
+                || expr_contains_placeholder_in_relation(&j.left, placeholder_id)
+                || expr_contains_placeholder_in_relation(&j.right, placeholder_id)
+        }
+        _ => false,
+    }
 }
 
 fn remove_placeholder_from_expr(expr: &TypedExpr, placeholder_id: usize) -> TypedExpr {
