@@ -66,15 +66,13 @@ pub fn load_expected_results(
         .filter_map(|(idx, line)| extract_query_number(line, marker_re).map(|num| (idx, num)))
         .collect();
 
-    if multi_step {
-        if markers.is_empty() {
-            println!(
-                "Warning: multi-step expected result must use '-- query N' sections: {}",
-                result_path.display()
-            );
-            return None;
-        }
-
+    // If the file is organised by `-- query N` markers, parse the
+    // bodies by section regardless of whether the case was tagged as
+    // multi_step. This handles tests like `function_cast` whose result-
+    // bearing SELECTs are interleaved with `USE`-prefixed steps that
+    // implicit-skip on the SQL side but still need their own result
+    // section keyed by query number.
+    if !markers.is_empty() {
         let mut result_sets = BTreeMap::new();
         for (idx, (start, query_number)) in markers.iter().enumerate() {
             let end = markers
@@ -87,10 +85,12 @@ pub fn load_expected_results(
         return Some(result_sets);
     }
 
-    if markers.len() == 1 && lines[..markers[0].0].iter().all(|line| line.trim().is_empty()) {
-        let (start, query_number) = markers[0];
-        let body_lines = lines[start + 1..].to_vec();
-        return Some(BTreeMap::from([(query_number, parse_result_set(&body_lines))]));
+    if multi_step {
+        println!(
+            "Warning: multi-step expected result must use '-- query N' sections: {}",
+            result_path.display()
+        );
+        return None;
     }
 
     // Single-result mode: the entire file is the result of the one

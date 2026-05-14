@@ -317,6 +317,10 @@ pub(crate) fn arrow_data_type_to_sql_type(dt: &DataType) -> Result<SqlType, Stri
         },
         DataType::Utf8 | DataType::LargeUtf8 => SqlType::String,
         DataType::Binary | DataType::LargeBinary => SqlType::Binary,
+        // StarRocks LARGEINT is stored as a fixed 16-byte signed integer.
+        DataType::FixedSizeBinary(w) if *w == crate::common::largeint::LARGEINT_BYTE_WIDTH => {
+            SqlType::LargeInt
+        }
         DataType::Date32 => SqlType::Date,
         DataType::Timestamp(_, _) => SqlType::DateTime,
         DataType::Time64(TimeUnit::Microsecond | TimeUnit::Nanosecond) => SqlType::Time,

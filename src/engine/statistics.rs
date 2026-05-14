@@ -107,10 +107,10 @@ pub(crate) fn try_handle_statement(
         return Ok(Some(StatementResult::Ok));
     }
     if lower.starts_with("create view ") {
-        return Ok(Some(StatementResult::Ok));
+        return handle_create_view(state, trimmed, current_database).map(Some);
     }
     if lower.starts_with("drop view ") {
-        return Ok(Some(StatementResult::Ok));
+        return handle_drop_view(state, trimmed, current_database).map(Some);
     }
     if lower.starts_with("alter table ") && lower.contains("enable_statistic_collect_on_first_load")
     {
@@ -384,6 +384,13 @@ pub(crate) fn drop_database(state: &Arc<StandaloneState>, database: &str) {
         .table_collect_on_first_load
         .retain(|key, _| key.db != db);
     stats.column_usage.retain(|key, _| key.db != db);
+    drop(stats);
+    // Views are tied to a database; remove all of this database's views from
+    // the in-memory registry so subsequent `CREATE VIEW` in a freshly-recreated
+    // database does not fail with "view already exists".
+    if let Ok(mut views) = state.views.write() {
+        views.retain(|(view_db, _), _| view_db != &db);
+    }
 }
 
 fn handle_admin_statement(state: &Arc<StandaloneState>, sql: &str) -> Result<(), String> {
@@ -2176,6 +2183,96 @@ fn string_result(columns: Vec<String>, rows: Vec<Vec<String>>) -> Result<QueryRe
             .collect(),
         chunks: vec![crate::engine::record_batch_to_chunk(batch)?],
     })
+}
+
+/// Handle `CREATE VIEW [IF NOT EXISTS] [db.]name AS <query>` by parsing
+/// the trailing query AST and registering it in the in-memory view
+/// registry on `StandaloneState`. The view is later expanded inline by
+/// the analyzer whenever a `FROM <view>` reference resolves to this
+/// name. Views live for the lifetime of the standalone process.
+fn handle_create_view(
+    state: &Arc<StandaloneState>,
+    trimmed: &str,
+    current_database: &str,
+) -> Result<StatementResult, String> {
+    use crate::sql::parser::dialect::StarRocksDialect;
+    use sqlparser::parser::Parser;
+    let dialect = StarRocksDialect;
+    let mut parser = Parser::new(&dialect)
+        .try_with_sql(trimmed)
+        .map_err(|e| format!("CREATE VIEW parse error: {e}"))?;
+    let stmt = parser
+        .parse_statement()
+        .map_err(|e| format!("CREATE VIEW parse error: {e}"))?;
+    let sqlparser::ast::Statement::CreateView(create_view) = stmt else {
+        return Err("CREATE VIEW: failed to parse statement".to_string());
+    };
+    let (db, name) = view_name_parts(&create_view.name, current_database)?;
+    let mut views = state
+        .views
+        .write()
+        .map_err(|e| format!("view registry write lock: {e}"))?;
+    if views.contains_key(&(db.clone(), name.clone())) && !create_view.or_replace {
+        return Err(format!("view already exists: {db}.{name}"));
+    }
+    views.insert((db, name), create_view.query);
+    Ok(StatementResult::Ok)
+}
+
+/// Handle `DROP VIEW [IF EXISTS] [db.]name` by removing the matching
+/// entry from the in-memory view registry.
+fn handle_drop_view(
+    state: &Arc<StandaloneState>,
+    trimmed: &str,
+    current_database: &str,
+) -> Result<StatementResult, String> {
+    use crate::sql::parser::dialect::StarRocksDialect;
+    use sqlparser::parser::Parser;
+    let dialect = StarRocksDialect;
+    let mut parser = Parser::new(&dialect)
+        .try_with_sql(trimmed)
+        .map_err(|e| format!("DROP VIEW parse error: {e}"))?;
+    let stmt = parser
+        .parse_statement()
+        .map_err(|e| format!("DROP VIEW parse error: {e}"))?;
+    let sqlparser::ast::Statement::Drop {
+        object_type: sqlparser::ast::ObjectType::View,
+        names,
+        ..
+    } = stmt
+    else {
+        return Err("DROP VIEW: failed to parse statement".to_string());
+    };
+    let mut views = state
+        .views
+        .write()
+        .map_err(|e| format!("view registry write lock: {e}"))?;
+    for name in names {
+        let (db, view) = view_name_parts(&name, current_database)?;
+        views.remove(&(db, view));
+    }
+    Ok(StatementResult::Ok)
+}
+
+fn view_name_parts(
+    name: &sqlparser::ast::ObjectName,
+    current_database: &str,
+) -> Result<(String, String), String> {
+    let parts: Vec<String> = name
+        .0
+        .iter()
+        .filter_map(|part| match part {
+            sqlparser::ast::ObjectNamePart::Identifier(ident) => Some(ident.value.clone()),
+            _ => None,
+        })
+        .collect();
+    let (db, view) = match parts.as_slice() {
+        [view] => (current_database.to_string(), view.clone()),
+        [db, view] => (db.clone(), view.clone()),
+        [_cat, db, view] => (db.clone(), view.clone()),
+        _ => return Err(format!("invalid view name: {name}")),
+    };
+    Ok((db.to_lowercase(), view.to_lowercase()))
 }
 
 #[cfg(test)]

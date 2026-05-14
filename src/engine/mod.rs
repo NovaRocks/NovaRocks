@@ -40,6 +40,7 @@ pub(crate) mod iceberg_ref_flow;
 pub(crate) mod information_schema;
 pub(crate) mod insert;
 pub(crate) mod insert_flow;
+pub(crate) mod managed_ctas;
 pub(crate) mod mutation_flow;
 pub(crate) mod mv;
 pub(crate) mod mv_flow;
@@ -50,6 +51,7 @@ pub(crate) mod sql_expr;
 pub(crate) mod statement;
 pub(crate) mod statistics;
 pub(crate) mod stream_load;
+pub(crate) mod view_rewrite;
 
 pub(crate) use self::name_resolve::ResolvedLocalTableName;
 
@@ -195,6 +197,12 @@ pub(crate) struct StandaloneState {
     pub(crate) iceberg_catalog_repo: IcebergCatalogMetaRepository,
     pub(crate) job_repo: JobMetaRepository,
     pub(crate) exchange_port: u16,
+    /// In-memory registry of user-defined views, keyed by lowercase
+    /// (database, view-name). Each entry stores the analysed `Query` AST
+    /// from `CREATE VIEW ... AS <query>`. The analyzer expands these to
+    /// derived tables on `FROM <view>` references.
+    pub(crate) views:
+        RwLock<std::collections::HashMap<(String, String), Box<sqlparser::ast::Query>>>,
     #[cfg(test)]
     pub(crate) _test_guard: Option<TestSerializationGuard>,
 }
@@ -215,6 +223,7 @@ impl Default for StandaloneState {
             iceberg_catalog_repo: IcebergCatalogMetaRepository::default(),
             job_repo: JobMetaRepository::default(),
             exchange_port: 0,
+            views: RwLock::new(std::collections::HashMap::new()),
             #[cfg(test)]
             _test_guard: None,
         }
@@ -691,6 +700,16 @@ impl StandaloneSession {
                 let sqlast::Statement::Query(ref query) = *statement else {
                     return Err("EXPLAIN only supports SELECT queries".to_string());
                 };
+                // Inline any user-defined views before the analyzer sees the
+                // EXPLAINed query. See the `Statement::Query` branch below for
+                // rationale.
+                let mut view_expanded = query.clone();
+                self::view_rewrite::expand_views_in_query(
+                    view_expanded.as_mut(),
+                    &self.inner.views,
+                    current_database,
+                );
+                let query = &view_expanded;
                 // Time-travel in EXPLAIN: rewrite version clauses before registration.
                 let mut time_travel_rewritten;
                 let query = if has_time_travel_refs(query) {
@@ -757,6 +776,18 @@ impl StandaloneSession {
                 {
                     return Ok(result);
                 }
+
+                // Inline any user-defined views referenced in the query so the
+                // remaining rewrites (time-travel, three-part-name, iceberg
+                // registration) see only base tables. `expand_views_in_query`
+                // is a no-op when no views are registered.
+                let mut view_expanded = query.clone();
+                self::view_rewrite::expand_views_in_query(
+                    view_expanded.as_mut(),
+                    &self.inner.views,
+                    current_database,
+                );
+                let query = &view_expanded;
 
                 // Time-travel: `SELECT ... FROM t FOR VERSION AS OF <v>`.
                 // Clone the query, rewrite version-bearing table refs to synthetic

@@ -845,11 +845,26 @@ pub(crate) fn execute_create_table_statement(
     current_database: &str,
 ) -> Result<StatementResult, String> {
     let legacy_range_partitions = stmt.legacy_range_partitions.clone();
-    // CTAS dispatch: when the statement carries an AS SELECT clause, the
-    // schema/partition/properties/data flow is governed by iceberg_ctas. The
-    // parser already rejected non-iceberg-compatible CTAS forms (branch
-    // target / format-version=2 / explicit columns / etc.).
+    // CTAS dispatch: when the statement carries an AS SELECT clause, route
+    // managed-lake targets to the managed CTAS helper and iceberg targets
+    // to the iceberg helper. The parser already rejected
+    // non-iceberg-compatible CTAS forms (branch target / format-version=2 /
+    // explicit columns / etc.).
     if stmt.as_select.is_some() {
+        let target = crate::engine::backend_resolver::resolve_table_target(
+            state,
+            &stmt.name,
+            current_catalog,
+            current_database,
+        )?;
+        if target.backend_name == "managed" {
+            return crate::engine::managed_ctas::execute_managed_ctas(
+                state,
+                stmt,
+                current_catalog,
+                current_database,
+            );
+        }
         return crate::engine::iceberg_ctas::execute_iceberg_ctas(
             state,
             stmt,
