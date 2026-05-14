@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Fields};
@@ -8,6 +9,46 @@ use crate::sql::analysis::JoinKind;
 // ---------------------------------------------------------------------------
 // SQL type -> Arrow type conversion
 // ---------------------------------------------------------------------------
+
+/// Metadata key attached to a `Field` so downstream type-desc construction can
+/// recover the StarRocks logical type (JSON, BITMAP, …) once the Arrow type
+/// system has collapsed it to a generic storage type such as `Utf8` or
+/// `Binary`. Without this side channel a nested cast like
+/// `cast(x AS map<string, json>)` would render its values as plain strings
+/// because the JSON-ness is no longer recoverable from the Arrow type alone.
+pub(crate) const NR_LOGICAL_TYPE_KEY: &str = "nr_logical_type";
+
+fn json_logical_metadata() -> HashMap<String, String> {
+    let mut m = HashMap::new();
+    m.insert(NR_LOGICAL_TYPE_KEY.to_string(), "json".to_string());
+    m
+}
+
+/// Build the `Field` for a nested JSON cell, tagging its metadata so the
+/// downstream type-desc walker can re-emit `TPrimitiveType::JSON`.
+fn nested_field_with_logical_type(
+    name: &str,
+    sql_type: &sqlast::DataType,
+    nullable: bool,
+) -> Result<Field, String> {
+    let arrow = sql_type_to_arrow(sql_type)?;
+    let mut field = Field::new(name, arrow, nullable);
+    if is_json_sql_type(sql_type) {
+        field = field.with_metadata(json_logical_metadata());
+    }
+    Ok(field)
+}
+
+fn is_json_sql_type(sql_type: &sqlast::DataType) -> bool {
+    match sql_type {
+        sqlast::DataType::JSON | sqlast::DataType::JSONB => true,
+        sqlast::DataType::Custom(name, _) => {
+            let n = name.to_string().to_ascii_lowercase();
+            n == "json" || n == "jsonb"
+        }
+        _ => false,
+    }
+}
 
 pub(super) fn sql_type_to_arrow(sql_type: &sqlast::DataType) -> Result<DataType, String> {
     match sql_type {
@@ -58,29 +99,29 @@ pub(super) fn sql_type_to_arrow(sql_type: &sqlast::DataType) -> Result<DataType,
             }
         }
         sqlast::DataType::Array(elem_def) => {
-            let inner = match elem_def {
+            let inner_sql = match elem_def {
                 sqlast::ArrayElemTypeDef::AngleBracket(inner_type)
                 | sqlast::ArrayElemTypeDef::SquareBracket(inner_type, _)
-                | sqlast::ArrayElemTypeDef::Parenthesis(inner_type) => {
-                    sql_type_to_arrow(inner_type)?
-                }
+                | sqlast::ArrayElemTypeDef::Parenthesis(inner_type) => inner_type.as_ref(),
                 sqlast::ArrayElemTypeDef::None => {
                     return Err("ARRAY type requires an element type".to_string());
                 }
             };
-            Ok(DataType::List(Arc::new(Field::new("item", inner, true))))
+            let item = nested_field_with_logical_type("item", inner_sql, true)?;
+            Ok(DataType::List(Arc::new(item)))
         }
-        sqlast::DataType::Map(key_type, value_type) => Ok(DataType::Map(
-            Arc::new(Field::new(
-                "entries",
-                DataType::Struct(Fields::from(vec![
-                    Arc::new(Field::new("key", sql_type_to_arrow(key_type)?, true)),
-                    Arc::new(Field::new("value", sql_type_to_arrow(value_type)?, true)),
-                ])),
+        sqlast::DataType::Map(key_type, value_type) => {
+            let key = nested_field_with_logical_type("key", key_type, true)?;
+            let value = nested_field_with_logical_type("value", value_type, true)?;
+            Ok(DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(Fields::from(vec![Arc::new(key), Arc::new(value)])),
+                    false,
+                )),
                 false,
-            )),
-            false,
-        )),
+            ))
+        }
         sqlast::DataType::Struct(fields, _) => {
             let out_fields: Vec<Arc<Field>> = fields
                 .iter()
@@ -91,11 +132,11 @@ pub(super) fn sql_type_to_arrow(sql_type: &sqlast::DataType) -> Result<DataType,
                         .as_ref()
                         .map(|ident| ident.value.clone())
                         .unwrap_or_else(|| format!("f{}", idx + 1));
-                    Ok(Arc::new(Field::new(
-                        name,
-                        sql_type_to_arrow(&field.field_type)?,
+                    Ok(Arc::new(nested_field_with_logical_type(
+                        &name,
+                        &field.field_type,
                         true,
-                    )))
+                    )?))
                 })
                 .collect::<Result<_, String>>()?;
             Ok(DataType::Struct(Fields::from(out_fields)))
@@ -114,8 +155,8 @@ fn custom_array_type_to_arrow(sql_type: &sqlast::DataType) -> Result<DataType, S
             modifiers.len()
         ));
     }
-    let inner = parse_custom_type_string(&modifiers[0])?;
-    Ok(DataType::List(Arc::new(Field::new("item", inner, true))))
+    let item = custom_field_with_logical_type("item", &modifiers[0])?;
+    Ok(DataType::List(Arc::new(item)))
 }
 
 fn custom_map_type_to_arrow(sql_type: &sqlast::DataType) -> Result<DataType, String> {
@@ -128,15 +169,12 @@ fn custom_map_type_to_arrow(sql_type: &sqlast::DataType) -> Result<DataType, Str
             modifiers.len()
         ));
     }
-    let key_type = parse_custom_type_string(&modifiers[0])?;
-    let value_type = parse_custom_type_string(&modifiers[1])?;
+    let key = custom_field_with_logical_type("key", &modifiers[0])?;
+    let value = custom_field_with_logical_type("value", &modifiers[1])?;
     Ok(DataType::Map(
         Arc::new(Field::new(
             "entries",
-            DataType::Struct(Fields::from(vec![
-                Arc::new(Field::new("key", key_type, true)),
-                Arc::new(Field::new("value", value_type, true)),
-            ])),
+            DataType::Struct(Fields::from(vec![Arc::new(key), Arc::new(value)])),
             false,
         )),
         false,
@@ -152,14 +190,32 @@ fn custom_struct_type_to_arrow(sql_type: &sqlast::DataType) -> Result<DataType, 
         .enumerate()
         .map(|(idx, field_spec)| {
             let (name, field_type) = split_custom_struct_field(field_spec)?;
-            Ok(Arc::new(Field::new(
-                name.unwrap_or_else(|| format!("f{}", idx + 1)),
-                parse_custom_type_string(field_type)?,
-                true,
-            )))
+            Ok(Arc::new(custom_field_with_logical_type(
+                &name.unwrap_or_else(|| format!("f{}", idx + 1)),
+                field_type,
+            )?))
         })
         .collect::<Result<Vec<_>, String>>()?;
     Ok(DataType::Struct(Fields::from(fields)))
+}
+
+/// Build a child `Field` from a custom-type modifier string (e.g. "json",
+/// "varchar"). Tags the field with `nr_logical_type=json` when the modifier
+/// names JSON so downstream rendering can preserve the JSON spelling inside
+/// nested types — `parse_custom_type_string` itself collapses JSON to
+/// `DataType::Utf8` (mirroring how StarRocks stores JSON as text).
+fn custom_field_with_logical_type(name: &str, modifier: &str) -> Result<Field, String> {
+    let inner = parse_custom_type_string(modifier)?;
+    let mut field = Field::new(name, inner, true);
+    if is_json_modifier(modifier) {
+        field = field.with_metadata(json_logical_metadata());
+    }
+    Ok(field)
+}
+
+fn is_json_modifier(modifier: &str) -> bool {
+    let lower = modifier.trim().to_ascii_lowercase();
+    lower == "json" || lower == "jsonb"
 }
 
 fn split_custom_struct_field(field_spec: &str) -> Result<(Option<String>, &str), String> {
@@ -204,11 +260,9 @@ fn parse_custom_type_string(type_sql: &str) -> Result<DataType, String> {
     }
 
     if let Some(inner) = strip_type_parameters(trimmed, "array")? {
-        return Ok(DataType::List(Arc::new(Field::new(
-            "item",
-            parse_custom_type_string(inner)?,
-            true,
-        ))));
+        return Ok(DataType::List(Arc::new(custom_field_with_logical_type(
+            "item", inner,
+        )?)));
     }
     if let Some(inner) = strip_type_parameters(trimmed, "map")? {
         let parts = split_top_level_type_items(inner, b',');
@@ -219,12 +273,8 @@ fn parse_custom_type_string(type_sql: &str) -> Result<DataType, String> {
             Arc::new(Field::new(
                 "entries",
                 DataType::Struct(Fields::from(vec![
-                    Arc::new(Field::new("key", parse_custom_type_string(parts[0])?, true)),
-                    Arc::new(Field::new(
-                        "value",
-                        parse_custom_type_string(parts[1])?,
-                        true,
-                    )),
+                    Arc::new(custom_field_with_logical_type("key", parts[0])?),
+                    Arc::new(custom_field_with_logical_type("value", parts[1])?),
                 ])),
                 false,
             )),
@@ -237,11 +287,10 @@ fn parse_custom_type_string(type_sql: &str) -> Result<DataType, String> {
             .enumerate()
             .map(|(idx, field_spec)| {
                 let (name, field_type) = split_custom_struct_field(field_spec)?;
-                Ok(Arc::new(Field::new(
-                    name.unwrap_or_else(|| format!("f{}", idx + 1)),
-                    parse_custom_type_string(field_type)?,
-                    true,
-                )))
+                Ok(Arc::new(custom_field_with_logical_type(
+                    &name.unwrap_or_else(|| format!("f{}", idx + 1)),
+                    field_type,
+                )?))
             })
             .collect::<Result<Vec<_>, String>>()?;
         return Ok(DataType::Struct(Fields::from(fields)));
@@ -633,12 +682,230 @@ fn format_cast_type(data_type: &sqlast::DataType) -> String {
         {
             "VARCHAR(65533)".to_string()
         }
+        // Custom MAP/STRUCT come from the parser-side rewrite of `map<…>` /
+        // `struct<…>` (see `rewrite_collection_type_generics`). Restore the
+        // original `<…>` spelling so display aliases match StarRocks FE — each
+        // modifier is the raw inner text we previously single-quoted.
+        sqlast::DataType::Custom(name, modifiers) => {
+            let lower = name.to_string().to_ascii_lowercase();
+            match lower.as_str() {
+                "map" => format!(
+                    "{}<{}>",
+                    lower,
+                    modifiers
+                        .iter()
+                        .map(|m| format_cast_type_modifier(m))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                "struct" => format!(
+                    "{}<{}>",
+                    lower,
+                    modifiers
+                        .iter()
+                        .map(|m| format_cast_type_struct_field(m))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                _ => format!("{name}"),
+            }
+        }
+        // ARRAY<…> bypasses the text rewriter (sqlparser parses it natively).
+        // StarRocks FE renders the top-level cast target with uppercase
+        // `ARRAY<…>` but nested arrays — those appearing inside a struct or
+        // map modifier string — with lowercase `array<…>`. We're in the
+        // top-level branch here, so emit the uppercase form; the nested case
+        // is handled separately via `format_cast_type_token`.
+        sqlast::DataType::Array(elem) => {
+            let inner = format_array_elem_for_cast(elem);
+            format!("ARRAY<{inner}>")
+        }
         sqlast::DataType::String(_) => "VARCHAR(65533)".to_string(),
         // `BINARY` and `BINARY(N)` are spelled `VARBINARY` in StarRocks FE
         // display because BE only has the variable-length variant.
         sqlast::DataType::Binary(_) => "VARBINARY".to_string(),
         other => format!("{other}"),
     }
+}
+
+/// Render the element type of an `Array(ArrayElemTypeDef::AngleBracket(...))`
+/// cast target back into its source-form spelling. The inner is a parsed
+/// `sqlast::DataType` (since sqlparser owns array parsing), so route through
+/// `format_cast_type` to canonicalise nested types consistently with the
+/// rest of the display logic — `int` becomes `int(11)`, nested
+/// `struct<…>`/`map<…>` re-render in `<…>` form, etc.
+fn format_array_elem_for_cast(elem: &sqlast::ArrayElemTypeDef) -> String {
+    let inner = match elem {
+        sqlast::ArrayElemTypeDef::AngleBracket(inner_type)
+        | sqlast::ArrayElemTypeDef::SquareBracket(inner_type, _)
+        | sqlast::ArrayElemTypeDef::Parenthesis(inner_type) => format_cast_type(inner_type),
+        sqlast::ArrayElemTypeDef::None => String::new(),
+    };
+    // Top-level scalars get their StarRocks display canonicalisation; other
+    // forms (already-rendered `<…>` / `(…)`) pass through unchanged.
+    canonicalize_array_inner_scalar(&inner)
+}
+
+/// Apply scalar canonicalisation (int → int(11), string → varchar(65533), …)
+/// to bare type names produced by `format_cast_type`. Collection or
+/// parenthesised forms are returned unchanged.
+fn canonicalize_array_inner_scalar(inner: &str) -> String {
+    let trimmed = inner.trim();
+    if trimmed.contains('<') || trimmed.contains('(') {
+        return trimmed.to_string();
+    }
+    format_cast_type_token(trimmed)
+}
+
+/// Render a single MAP modifier string back into its `<…>`-style spelling.
+/// The modifier is the raw type text that the parser rewrite captured between
+/// angle brackets (e.g. `int`, `array<int>`, `varchar`, `struct<col1 int>`) —
+/// render bare scalar names with StarRocks's display canonicalisation
+/// (int → int(11), …) and leave nested collection syntax untouched.
+fn format_cast_type_modifier(modifier: &str) -> String {
+    let trimmed = modifier.trim();
+    format_cast_type_token(trimmed)
+}
+
+/// Render a single `struct<…>` field spec back as `name type`, applying the
+/// same scalar canonicalisation as `format_cast_type_modifier` to the type
+/// half. Anonymous (positional) fields use the bare type.
+fn format_cast_type_struct_field(modifier: &str) -> String {
+    let trimmed = modifier.trim();
+    match split_struct_field_at_top_level(trimmed) {
+        Some((name, ty)) => {
+            format!("{name} {}", format_cast_type_token(ty))
+        }
+        None => format_cast_type_token(trimmed),
+    }
+}
+
+/// Split a struct field spec like `col1 int` into (name, type) at the first
+/// top-level whitespace. Returns None if the spec has no name component.
+fn split_struct_field_at_top_level(spec: &str) -> Option<(&str, &str)> {
+    let bytes = spec.as_bytes();
+    let mut depth_angle = 0i32;
+    let mut depth_paren = 0i32;
+    for (idx, b) in bytes.iter().enumerate() {
+        match b {
+            b'<' => depth_angle += 1,
+            b'>' => depth_angle -= 1,
+            b'(' => depth_paren += 1,
+            b')' => depth_paren -= 1,
+            _ if b.is_ascii_whitespace() && depth_angle == 0 && depth_paren == 0 => {
+                let name = spec[..idx].trim();
+                let ty = spec[idx + 1..].trim_start();
+                if !name.is_empty() && !ty.is_empty() {
+                    return Some((name, ty));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Canonicalise a bare type spelling for cast-display purposes. Mirrors the
+/// scalar rules already applied at the top level of `format_cast_type` —
+/// `int` → `int(11)`, `string` → `varchar(65533)`, etc. — and recurses into
+/// `array<…>` / `map<…>` / `struct<…>` so inner scalars are canonicalised
+/// the same way StarRocks FE renders them in result column names.
+fn format_cast_type_token(token: &str) -> String {
+    let trimmed = token.trim();
+    if let Some(inner) = strip_collection_brackets(trimmed, "array") {
+        return format!("array<{}>", format_cast_type_token(inner));
+    }
+    if let Some(inner) = strip_collection_brackets(trimmed, "map") {
+        let parts = split_top_level_comma(inner);
+        let rendered: Vec<String> = parts
+            .iter()
+            .map(|p| format_cast_type_token(p.trim()))
+            .collect();
+        return format!("map<{}>", rendered.join(", "));
+    }
+    if let Some(inner) = strip_collection_brackets(trimmed, "struct") {
+        let parts = split_top_level_comma(inner);
+        let rendered: Vec<String> = parts
+            .iter()
+            .map(|p| format_cast_type_struct_field(p))
+            .collect();
+        return format!("struct<{}>", rendered.join(", "));
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    match lower.as_str() {
+        "tinyint" => "tinyint(4)".to_string(),
+        "smallint" => "smallint(6)".to_string(),
+        "int" | "integer" => "int(11)".to_string(),
+        "bigint" => "bigint(20)".to_string(),
+        "string" => "varchar(65533)".to_string(),
+        "binary" => "varbinary".to_string(),
+        _ => trimmed.to_string(),
+    }
+}
+
+/// If `token` starts with the keyword followed by `<…>`, returns the inner
+/// substring (without the brackets). Used to recurse into nested cast-target
+/// type spellings during column-header rendering.
+fn strip_collection_brackets<'a>(token: &'a str, keyword: &str) -> Option<&'a str> {
+    let bytes = token.as_bytes();
+    let kw_bytes = keyword.as_bytes();
+    if bytes.len() < kw_bytes.len() {
+        return None;
+    }
+    if !token[..keyword.len()].eq_ignore_ascii_case(keyword) {
+        return None;
+    }
+    let mut cursor = keyword.len();
+    while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
+    if cursor >= bytes.len() || bytes[cursor] != b'<' {
+        return None;
+    }
+    // Find the matching `>`.
+    let mut depth = 1i32;
+    let mut idx = cursor + 1;
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b'<' => depth += 1,
+            b'>' => {
+                depth -= 1;
+                if depth == 0 {
+                    if token[idx + 1..].trim().is_empty() {
+                        return Some(&token[cursor + 1..idx]);
+                    } else {
+                        return None;
+                    }
+                }
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn split_top_level_comma(input: &str) -> Vec<&str> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut depth_angle = 0i32;
+    let mut depth_paren = 0i32;
+    for (idx, b) in bytes.iter().enumerate() {
+        match b {
+            b'<' => depth_angle += 1,
+            b'>' => depth_angle -= 1,
+            b'(' => depth_paren += 1,
+            b')' => depth_paren -= 1,
+            b',' if depth_angle == 0 && depth_paren == 0 => {
+                out.push(&input[start..idx]);
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&input[start..]);
+    out
 }
 
 fn decimal_kind(precision: u64) -> &'static str {

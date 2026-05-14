@@ -1,19 +1,34 @@
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Field};
 
 use crate::lower::thrift::type_lowering::scalar_type_desc;
 use crate::types;
 
+/// Metadata key on a `Field` that overrides the inferred StarRocks primitive.
+/// Mirrors `crate::sql::analyzer::helpers::NR_LOGICAL_TYPE_KEY` (kept duplicated
+/// to avoid pulling the analyzer module into codegen). Today only "json" is
+/// emitted; the analyzer attaches it when a CAST target is `json` nested
+/// inside `map<…>`/`array<…>`/`struct<…>` so the JSON-ness survives the
+/// JSON-to-`Utf8` collapse in `sql_type_to_arrow`.
+const NR_LOGICAL_TYPE_KEY: &str = "nr_logical_type";
+
 /// Convert Arrow DataType to Thrift TTypeDesc.
 pub(crate) fn arrow_type_to_type_desc(data_type: &DataType) -> Result<types::TTypeDesc, String> {
     let mut nodes = Vec::new();
-    append_arrow_type_nodes(data_type, &mut nodes)?;
+    append_arrow_type_nodes(data_type, None, &mut nodes)?;
     Ok(types::TTypeDesc::new(nodes))
 }
 
 fn append_arrow_type_nodes(
     data_type: &DataType,
+    parent_field: Option<&Field>,
     nodes: &mut Vec<types::TTypeNode>,
 ) -> Result<(), String> {
+    // If the enclosing `Field` carries a logical-type tag, override the
+    // inferred primitive so the child reports e.g. JSON instead of VARCHAR.
+    if let Some(primitive) = logical_type_override(parent_field) {
+        nodes.extend(scalar_type_desc(primitive).types.unwrap_or_default());
+        return Ok(());
+    }
     match data_type {
         DataType::List(field) => {
             nodes.push(types::TTypeNode {
@@ -22,7 +37,7 @@ fn append_arrow_type_nodes(
                 is_named: None,
                 struct_fields: None,
             });
-            append_arrow_type_nodes(field.data_type(), nodes)
+            append_arrow_type_nodes(field.data_type(), Some(field.as_ref()), nodes)
         }
         DataType::Map(entries, _) => {
             let DataType::Struct(fields) = entries.data_type() else {
@@ -43,8 +58,8 @@ fn append_arrow_type_nodes(
                 is_named: None,
                 struct_fields: None,
             });
-            append_arrow_type_nodes(fields[0].data_type(), nodes)?;
-            append_arrow_type_nodes(fields[1].data_type(), nodes)
+            append_arrow_type_nodes(fields[0].data_type(), Some(fields[0].as_ref()), nodes)?;
+            append_arrow_type_nodes(fields[1].data_type(), Some(fields[1].as_ref()), nodes)
         }
         DataType::Struct(fields) => {
             nodes.push(types::TTypeNode {
@@ -66,7 +81,7 @@ fn append_arrow_type_nodes(
                 ),
             });
             for field in fields {
-                append_arrow_type_nodes(field.data_type(), nodes)?;
+                append_arrow_type_nodes(field.data_type(), Some(field.as_ref()), nodes)?;
             }
             Ok(())
         }
@@ -105,6 +120,14 @@ fn append_arrow_type_nodes(
             nodes.extend(scalar_type_desc(primitive).types.unwrap_or_default());
             Ok(())
         }
+    }
+}
+
+fn logical_type_override(field: Option<&Field>) -> Option<types::TPrimitiveType> {
+    let logical = field?.metadata().get(NR_LOGICAL_TYPE_KEY)?;
+    match logical.as_str() {
+        "json" => Some(types::TPrimitiveType::JSON),
+        _ => None,
     }
 }
 

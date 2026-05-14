@@ -70,6 +70,18 @@ impl ChunkFieldSchema {
     }
 
     pub fn from_field(field: &Field) -> Result<Self, String> {
+        // Honour the `nr_logical_type` metadata tag attached by the analyzer's
+        // `sql_type_to_arrow`. Without this override the JSON-ness of a
+        // nested cast (e.g. `cast(x AS map<string, json>)`) would be lost
+        // once `JSON` collapses to `Utf8` at the Arrow level, and the
+        // standalone MySQL renderer would quote the value as a plain string
+        // instead of the JSON spelling StarRocks emits.
+        if let Some(desc) = logical_type_desc_from_field(field) {
+            return Ok(Self {
+                type_desc: Some(desc),
+                children: Vec::new(),
+            });
+        }
         Self::from_arrow_data_type(field.data_type())
     }
 
@@ -378,6 +390,21 @@ pub struct ChunkSchema {
 }
 
 pub type ChunkSchemaRef = Arc<ChunkSchema>;
+
+/// Metadata key set by the analyzer's `sql_type_to_arrow` for nested children
+/// whose StarRocks logical type would otherwise be lost in the Arrow type
+/// system (today: `JSON` collapsed to `Utf8`). Mirrored in
+/// `src/sql/analyzer/helpers.rs` and `src/sql/codegen/type_infer.rs`.
+const NR_LOGICAL_TYPE_KEY: &str = "nr_logical_type";
+
+fn logical_type_desc_from_field(field: &Field) -> Option<types::TTypeDesc> {
+    let logical = field.metadata().get(NR_LOGICAL_TYPE_KEY)?;
+    let primitive = match logical.as_str() {
+        "json" => types::TPrimitiveType::JSON,
+        _ => return None,
+    };
+    Some(crate::lower::type_lowering::scalar_type_desc(primitive))
+}
 
 fn is_compatible_chunk_field_type(expected: &DataType, actual: &DataType) -> bool {
     match (expected, actual) {

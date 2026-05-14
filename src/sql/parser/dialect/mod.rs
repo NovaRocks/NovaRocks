@@ -1300,22 +1300,57 @@ fn rewrite_cast_call_body(body: &str) -> Result<String, String> {
 }
 
 fn rewrite_map_type_generics(target: &str) -> Result<String, String> {
+    rewrite_collection_type_generics(target)
+}
+
+/// Rewrite CAST target syntax like `map<K, V>` / `array<T>` / `struct<n T, …>`
+/// into a form sqlparser's StarRocks dialect can tokenise via its generic
+/// `parse_optional_type_modifiers` path: `KEYWORD('item1', 'item2', …)`.
+///
+/// The angle-bracket forms collapse to `Custom(name, modifiers)` only if each
+/// modifier is a single token — but inner types like `array<int>` and struct
+/// field specs like `col1 int` are multi-token, so we wrap each top-level
+/// comma-separated item in a single-quoted string. Downstream the analyzer's
+/// `custom_*_type_to_arrow` re-parses the modifier strings (`parse_custom_type_string`
+/// already understands `array<…>`, `map<…>`, `struct<…>`, `decimal(p,s)`, …),
+/// so nesting works transparently.
+fn rewrite_collection_type_generics(target: &str) -> Result<String, String> {
     let mut output = String::with_capacity(target.len());
     let bytes = target.as_bytes();
     let mut idx = 0usize;
     while idx < bytes.len() {
-        if starts_with_keyword(bytes, idx, "map")
+        if let Some((keyword, name_len)) = collection_keyword_at(bytes, idx)
             && !is_identifier_byte(bytes.get(idx.wrapping_sub(1)).copied())
         {
-            let mut cursor = idx + "map".len();
+            let mut cursor = idx + name_len;
             while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
                 cursor += 1;
             }
             if cursor < bytes.len() && bytes[cursor] == b'<' {
                 let end_idx = find_matching_delimiter(target, cursor, b'<', b'>')?;
-                let inner = rewrite_map_type_generics(&target[cursor + 1..end_idx])?;
-                output.push_str("MAP(");
-                output.push_str(&inner);
+                let raw_inner = &target[cursor + 1..end_idx];
+                let items = split_top_level_by_comma(raw_inner);
+                output.push_str(keyword);
+                output.push('(');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        output.push_str(", ");
+                    }
+                    // Keep nested generics in their original `<…>` form inside
+                    // the quoted modifier — `parse_custom_type_string` in
+                    // `helpers.rs` understands both `<…>` and `(…)` and will
+                    // recursively walk them when we eventually re-parse this
+                    // modifier string at type-resolution time.
+                    let trimmed = item.trim();
+                    output.push('\'');
+                    for ch in trimmed.chars() {
+                        if ch == '\'' || ch == '\\' {
+                            output.push('\\');
+                        }
+                        output.push(ch);
+                    }
+                    output.push('\'');
+                }
                 output.push(')');
                 idx = end_idx + 1;
                 continue;
@@ -1324,6 +1359,46 @@ fn rewrite_map_type_generics(target: &str) -> Result<String, String> {
         idx = push_original_char(&mut output, target, idx);
     }
     Ok(output)
+}
+
+fn collection_keyword_at(bytes: &[u8], idx: usize) -> Option<(&'static str, usize)> {
+    // `array<…>` is left intact: sqlparser's `Keyword::ARRAY` path already
+    // accepts the angle-bracket form and recursively parses the element type
+    // (so nested `map<…>` / `struct<…>` inside an array still get rewritten
+    // because they match here on the recursive pass). MAP / STRUCT need the
+    // rewrite because sqlparser's StarRocks dialect has no native parser for
+    // those generics.
+    for (kw, upper) in [("map", "MAP"), ("struct", "STRUCT")] {
+        if starts_with_keyword(bytes, idx, kw) {
+            return Some((upper, kw.len()));
+        }
+    }
+    None
+}
+
+fn split_top_level_by_comma(input: &str) -> Vec<&str> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut depth_angle = 0i32;
+    let mut depth_paren = 0i32;
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b'<' => depth_angle += 1,
+            b'>' => depth_angle -= 1,
+            b'(' => depth_paren += 1,
+            b')' => depth_paren -= 1,
+            b',' if depth_angle == 0 && depth_paren == 0 => {
+                out.push(&input[start..idx]);
+                start = idx + 1;
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+    out.push(&input[start..]);
+    out
 }
 
 fn extract_set_user_variable_assignments(sql: &str) -> Result<Vec<(String, String)>, String> {
@@ -2162,10 +2237,34 @@ mod tests {
 
     #[test]
     fn normalize_for_raw_parse_rewrites_cast_map_target_syntax() {
+        // Outer / inner generics become single-quoted modifiers so sqlparser's
+        // StarRocks dialect can tokenise them; the analyzer's
+        // `parse_custom_type_string` re-reads the inner `<…>` form at type
+        // resolution time.
         let normalized =
             super::normalize_for_raw_parse("SELECT CAST(NULL AS MAP<INT, MAP<INT, INT>>)")
                 .expect("normalize should succeed");
-        assert_eq!(normalized, "SELECT CAST(NULL AS MAP(INT, MAP(INT, INT)))");
+        assert_eq!(
+            normalized,
+            "SELECT CAST(NULL AS MAP('INT', 'MAP<INT, INT>'))"
+        );
+    }
+
+    #[test]
+    fn normalize_for_raw_parse_rewrites_cast_struct_target_syntax() {
+        let normalized = super::normalize_for_raw_parse(
+            "SELECT CAST(NULL AS STRUCT<col1 INT, col2 ARRAY<INT>>)",
+        )
+        .expect("normalize should succeed");
+        assert_eq!(
+            normalized,
+            "SELECT CAST(NULL AS STRUCT('col1 INT', 'col2 ARRAY<INT>'))"
+        );
+        // ARRAY<…> is left as-is because sqlparser's StarRocks dialect can
+        // already tokenise it natively.
+        let normalized2 = super::normalize_for_raw_parse("SELECT CAST(NULL AS ARRAY<JSON>)")
+            .expect("normalize should succeed");
+        assert_eq!(normalized2, "SELECT CAST(NULL AS ARRAY<JSON>)");
     }
 
     #[test]
