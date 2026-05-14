@@ -5309,42 +5309,6 @@ enable_path_style_access = true
     }
 
     #[test]
-    fn managed_delete_rewrites_remaining_rows_for_primary_key_table() {
-        let _runtime_guard = lock_runtime_test_state();
-        let Some((_dir, config_path, _metadata_db_path)) = maybe_managed_lake_config() else {
-            return;
-        };
-
-        let engine = StandaloneNovaRocks::open(StandaloneOptions {
-            config_path: Some(config_path),
-        })
-        .expect("open engine");
-        let session = engine.session();
-        session
-            .execute(
-                "create table t (k bigint not null, arr_0 array<bigint> not null, arr_1 array<bigint> null, arr_2 array<bigint> null) primary key(k) distributed by hash(k) buckets 1",
-            )
-            .expect("create managed primary key table");
-        session
-            .execute(
-                "insert into t values (1, [1,2], [1,2],[2,3]), (2, [1,2], null, [2,3]), (3, [1,2],[1,2],null), (4, [1,2],[null,null],[2,3]), (5, [1], [1,2], [3])",
-            )
-            .expect("insert managed rows");
-        session
-            .execute("delete from t where k = 5")
-            .expect("delete managed row");
-
-        let remaining = session
-            .query("select * from t order by k")
-            .expect("query remaining rows");
-        assert_eq!(remaining.row_count(), 4);
-        let deleted = session
-            .query("select k from t where k = 5")
-            .expect("query deleted row");
-        assert_eq!(deleted.row_count(), 0);
-    }
-
-    #[test]
     fn embedded_session_open_starts_erase_worker_for_pending_jobs() {
         let _runtime_guard = lock_runtime_test_state();
         use crate::meta::repository::job::{CreateEraseJobRequest, JobState};

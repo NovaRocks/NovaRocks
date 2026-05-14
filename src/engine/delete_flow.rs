@@ -551,45 +551,6 @@ fn qualify_managed_table(target: &crate::engine::backend_resolver::TargetBackend
     }
 }
 
-/// Legacy copy-on-write DELETE — superseded by execute_managed_pk_delete in
-/// M4.T2. Kept here only to be removed in M4.T3 once the PK path is verified.
-#[allow(dead_code)]
-fn execute_managed_cow_delete_legacy(
-    state: &Arc<StandaloneState>,
-    target: &crate::engine::backend_resolver::TargetBackend,
-    stmt: &DeleteStmt,
-) -> Result<StatementResult, String> {
-    let (catalog, sink) = {
-        let reg = state.connectors.read().expect("connector registry read");
-        (
-            reg.catalog_backend(target.backend_name)?,
-            reg.table_sink(target.backend_name)?,
-        )
-    };
-    let resolved = catalog.load_table(&target.catalog, &target.namespace, &target.table)?;
-    let rewritten_sql = format!(
-        "SELECT * FROM {} WHERE NOT COALESCE(({}), FALSE)",
-        target.table, stmt.where_clause
-    );
-    let statement = crate::sql::parser::parse_sql_raw(&rewritten_sql)?;
-    let sqlast::Statement::Query(query) = statement else {
-        return Err("internal: managed DELETE rewrite did not parse as SELECT".to_string());
-    };
-    let batch = crate::engine::insert_flow::execute_insert_from_query_on_pipeline(
-        state,
-        target,
-        &resolved,
-        &[],
-        query.as_ref(),
-    )?;
-
-    crate::connector::truncate_managed_table(state, &target.namespace, &target.table)?;
-    if batch.num_rows() > 0 {
-        sink.append_batch(&resolved, batch)?;
-    }
-    Ok(StatementResult::Ok)
-}
-
 /// One side of a comparison must be a column reference and the other a literal.
 /// Returns `(column_name, literal_expr, flipped)` where `flipped = true`
 /// indicates the original was `<literal> <op> <column>`.
