@@ -5183,7 +5183,6 @@ enable_path_style_access = true
         };
         let engine = StandaloneNovaRocks::open(StandaloneOptions {
             config_path: Some(config_path),
-            metadata_db_path: None,
         })
         .expect("open engine");
         let session = engine.session();
@@ -5215,7 +5214,6 @@ enable_path_style_access = true
         };
         let engine = StandaloneNovaRocks::open(StandaloneOptions {
             config_path: Some(config_path),
-            metadata_db_path: None,
         })
         .expect("open engine");
         let session = engine.session();
@@ -5245,7 +5243,6 @@ enable_path_style_access = true
         };
         let engine = StandaloneNovaRocks::open(StandaloneOptions {
             config_path: Some(config_path),
-            metadata_db_path: None,
         })
         .expect("open engine");
         let session = engine.session();
@@ -5282,7 +5279,6 @@ enable_path_style_access = true
         };
         let engine = StandaloneNovaRocks::open(StandaloneOptions {
             config_path: Some(config_path),
-            metadata_db_path: None,
         })
         .expect("open engine");
         let session = engine.session();
@@ -6618,7 +6614,6 @@ enable_path_style_access = true
 
         let engine = StandaloneNovaRocks::open(StandaloneOptions {
             config_path: Some(config_path),
-            metadata_db_path: None,
         })
         .expect("open engine");
         let session = engine.session();
@@ -6652,7 +6647,6 @@ enable_path_style_access = true
         };
         let engine = StandaloneNovaRocks::open(StandaloneOptions {
             config_path: Some(config_path),
-            metadata_db_path: None,
         })
         .expect("open engine");
         let session = engine.session();

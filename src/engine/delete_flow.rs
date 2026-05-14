@@ -446,7 +446,7 @@ fn resolve_managed_table_info(
         keys_type: runtime.table.keys_type.clone(),
         is_materialized_view: matches!(
             runtime.table.kind,
-            crate::connector::starrocks::managed::store::ManagedTableKind::MaterializedView
+            crate::connector::starrocks::managed::model::ManagedTableKind::MaterializedView
         ),
         columns,
         key_columns,
