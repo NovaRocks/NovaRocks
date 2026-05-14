@@ -226,6 +226,14 @@ impl AnalyzerScope {
     /// fixed, re-enable the call site to make `SELECT *` over
     /// `FULL OUTER ... USING(...)` produce a single merged column.
     #[allow(dead_code)]
+    /// Remove any synthetic computed column (e.g. a FULL OUTER USING
+    /// COALESCE) registered for `name`. Used when a later non-FULL-OUTER
+    /// USING join changes which side owns the merged column, invalidating
+    /// the prior COALESCE chain.
+    pub(super) fn clear_computed_column(&mut self, name: &str) {
+        self.computed_columns.remove(&name.to_lowercase());
+    }
+
     pub(super) fn register_full_outer_using_coalesce(
         &mut self,
         using_cols: &[String],
@@ -242,14 +250,24 @@ impl AnalyzerScope {
                 continue;
             };
             let dt = dt.clone();
-            let left_ref = TypedExpr {
-                kind: ExprKind::ColumnRef {
-                    qualifier: Some(left_qual.to_string()),
-                    column: col_lower.clone(),
-                },
-                data_type: dt.clone(),
-                nullable: true,
-            };
+            // For chained FULL OUTER USING, the "left" of the new COALESCE
+            // is the previous COALESCE expression so that
+            // `(t1 FULL OUTER t2) FULL OUTER t3 USING(k1)` evaluates to
+            // `COALESCE(COALESCE(t1.k1, t2.k1), t3.k1)`. Without this, the
+            // second join overwrites the first's mapping and the inner
+            // table's value is lost on outer rows.
+            let left_ref = self
+                .computed_columns
+                .get(&col_lower)
+                .cloned()
+                .unwrap_or(TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        qualifier: Some(left_qual.to_string()),
+                        column: col_lower.clone(),
+                    },
+                    data_type: dt.clone(),
+                    nullable: true,
+                });
             let right_ref = TypedExpr {
                 kind: ExprKind::ColumnRef {
                     qualifier: Some(right_qual.to_string()),

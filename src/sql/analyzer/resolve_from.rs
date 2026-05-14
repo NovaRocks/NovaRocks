@@ -128,27 +128,77 @@ impl<'a> super::AnalyzerContext<'a> {
                     }
                 }
                 _ => {
+                    // For FULL OUTER USING, the joined column is the merge
+                    // of both sides (`COALESCE(left.col, right.col)`).
+                    // Capture the per-side qualifiers before
+                    // `apply_using_layout` deduplicates `ordered`.
+                    let coalesce_quals: Option<Vec<(String, String, String)>> =
+                        if matches!(join_kind, JoinKind::FullOuter)
+                            && let Some(sqlast::JoinConstraint::Using(using_cols_ast)) = constraint
+                        {
+                            let mut out = Vec::new();
+                            for c in using_cols_ast {
+                                let name = c.to_string();
+                                let name_lower = name.to_lowercase();
+                                let left_q = current_scope
+                                    .iter_columns()
+                                    .find(|(_, n, _, _)| n.to_lowercase() == name_lower)
+                                    .and_then(|(q, _, _, _)| q.clone());
+                                let right_q = right_scope
+                                    .iter_columns()
+                                    .find(|(_, n, _, _)| n.to_lowercase() == name_lower)
+                                    .and_then(|(q, _, _, _)| q.clone());
+                                match (left_q, right_q) {
+                                    (Some(l), Some(r)) => out.push((name, l, r)),
+                                    _ => return Err(format!(
+                                        "USING column `{name}` must exist on both sides"
+                                    )),
+                                }
+                            }
+                            Some(out)
+                        } else {
+                            None
+                        };
+
                     current_scope.merge(&right_scope);
                     // USING-clause column hiding: each USING column appears
                     // once in SELECT * and at the head of the column list.
                     // For RIGHT joins the preserved side is right, so the
-                    // surviving column resolves to the right binding.
-                    //
-                    // We intentionally skip the dedup / reorder transform
-                    // for FULL OUTER USING: the BE-side FULL OUTER hash
-                    // join exhibits a null-pad bug on the surviving side
-                    // when the projection list goes through a COALESCE
-                    // alias path. Leaving both sides exposed for FULL
-                    // OUTER USING preserves the baseline behaviour (each
-                    // join column appears twice in SELECT *) until the
-                    // BE bug is addressed.
-                    if matches!(join_kind, JoinKind::FullOuter) {
-                        // no-op
-                    } else if let Some(sqlast::JoinConstraint::Using(using_cols_ast)) = constraint {
+                    // surviving column resolves to the right binding. For
+                    // FULL OUTER, both sides can be NULL-padded so we
+                    // additionally register a `COALESCE(left.col,
+                    // right.col)` computed column so that unqualified
+                    // references and `SELECT *` see the merged value.
+                    if let Some(sqlast::JoinConstraint::Using(using_cols_ast)) = constraint {
                         let using_names: Vec<String> =
                             using_cols_ast.iter().map(|c| c.to_string()).collect();
                         let prefer_right = matches!(join_kind, JoinKind::RightOuter);
                         current_scope.apply_using_layout(&using_names, prefer_right);
+                        if let Some(quals) = coalesce_quals {
+                            for (col, l_q, r_q) in &quals {
+                                current_scope
+                                    .register_full_outer_using_coalesce(
+                                        &[col.clone()],
+                                        l_q,
+                                        r_q,
+                                    );
+                            }
+                        } else if matches!(join_kind, JoinKind::RightOuter) {
+                            // RIGHT JOIN USING after a previous FULL OUTER
+                            // USING: the right side now owns the merged
+                            // column, so the prior left-side COALESCE
+                            // chain no longer reflects reality. Drop the
+                            // computed_column so unqualified resolution
+                            // falls back to the right-side binding.
+                            // LEFT / INNER joins keep the COALESCE
+                            // unchanged — they preserve the left side or
+                            // require equality, so the chained value is
+                            // still correct.
+                            for c in using_cols_ast {
+                                current_scope
+                                    .clear_computed_column(&c.to_string());
+                            }
+                        }
                     }
                 }
             }

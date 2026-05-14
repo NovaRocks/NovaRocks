@@ -78,30 +78,72 @@ fn apply_query_modifiers(
         let extra_items = collect_extra_sort_items(&order_by, &output_columns);
         let sort_items = rewrite_sort_items_to_projection_refs(&order_by, &extra_items);
         if !extra_items.is_empty() {
-            // Snapshot the original SELECT-list items (before we append the
-            // extra sort-only items). The post-sort projection below strips
-            // the extras by replaying these expressions, so two SELECT
-            // columns with the same bare name (e.g. `SELECT t1.c2, t2.c2`)
-            // keep their qualifiers and resolve to distinct slots in
-            // codegen. A previous version of this code rebuilt the final
-            // projection from `output_columns` alone, which lost the
-            // qualifier and collapsed both outputs onto the last-registered
-            // unqualified entry.
-            let original_select_items: Option<Vec<ProjectItem>> = match &body_plan {
-                LogicalPlan::Project(proj) => Some(proj.items.clone()),
-                _ => None,
-            };
-
-            if let LogicalPlan::Project(ref mut proj) = body_plan {
-                if let LogicalPlan::Aggregate(ref mut agg) = *proj.input {
-                    for extra in &extra_items {
-                        collect_aggregates(&extra.expr, &mut agg.aggregates);
+            // We're about to add extra sort-only columns to the inner Project
+            // and then strip them with an outer Project after the sort. To
+            // make that outer Project's column references unambiguous — even
+            // when two SELECT items share an output name (e.g. `t1.c2,
+            // t2.c2` both default to `c2`) — rename each inner Project
+            // SELECT item to a unique synthetic name (`__nr_sel_<idx>`).
+            // The outer strip-projection then references those synthetic
+            // names and re-aliases each to the user-visible output name.
+            //
+            // Extras keep their display-name output_name because
+            // `sort_items` (rewritten above by
+            // `rewrite_sort_items_to_projection_refs`) references them
+            // through that exact name.
+            //
+            // Sort items that didn't match an extra (and therefore still
+            // hold their original ColumnRef into the SELECT projection)
+            // would otherwise fail to resolve after the rename, so we
+            // remap any `ColumnRef(<select_output_name>)` to the matching
+            // `__nr_sel_<idx>` below.
+            let user_select: Option<Vec<(String, arrow::datatypes::DataType, bool)>> =
+                if let LogicalPlan::Project(ref mut proj) = body_plan {
+                    if let LogicalPlan::Aggregate(ref mut agg) = *proj.input {
+                        for extra in &extra_items {
+                            collect_aggregates(&extra.expr, &mut agg.aggregates);
+                        }
                     }
-                }
-                for extra in &extra_items {
-                    proj.items.push(extra.clone());
-                }
-            }
+                    let user: Vec<(String, arrow::datatypes::DataType, bool)> = proj
+                        .items
+                        .iter()
+                        .map(|it| {
+                            (
+                                it.output_name.clone(),
+                                it.expr.data_type.clone(),
+                                it.expr.nullable,
+                            )
+                        })
+                        .collect();
+                    for (idx, item) in proj.items.iter_mut().enumerate() {
+                        item.output_name = format!("__nr_sel_{idx}");
+                    }
+                    for extra in &extra_items {
+                        proj.items.push(extra.clone());
+                    }
+                    Some(user)
+                } else {
+                    None
+                };
+
+            // After renaming, sort items that still hold ColumnRefs to
+            // pre-rename SELECT output names must be remapped onto the
+            // synthetic `__nr_sel_<idx>` slots. Without this, sort
+            // references like `ORDER BY v1` (matching SELECT v1 → renamed
+            // to `__nr_sel_1`) would fail to resolve at sort time.
+            let sort_items = if let Some(ref user) = user_select {
+                let name_to_idx: std::collections::HashMap<String, usize> = user
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, (name, _, _))| (name.to_lowercase(), idx))
+                    .collect();
+                sort_items
+                    .into_iter()
+                    .map(|item| remap_sort_to_synthetic(item, &name_to_idx))
+                    .collect()
+            } else {
+                sort_items
+            };
 
             // Sort with extended scope
             body_plan = LogicalPlan::Sort(SortNode {
@@ -111,8 +153,21 @@ fn apply_query_modifiers(
 
             // Strip synthetic sort-only columns after LIMIT/OFFSET so the
             // limit stays directly above Sort and can be rewritten to TopN.
-            final_projection = Some(if let Some(items) = original_select_items {
-                items
+            final_projection = Some(if let Some(user) = user_select {
+                user.into_iter()
+                    .enumerate()
+                    .map(|(idx, (name, dt, nullable))| ProjectItem {
+                        expr: TypedExpr {
+                            kind: ExprKind::ColumnRef {
+                                qualifier: None,
+                                column: format!("__nr_sel_{idx}"),
+                            },
+                            data_type: dt,
+                            nullable,
+                        },
+                        output_name: name,
+                    })
+                    .collect()
             } else {
                 output_columns
                     .iter()
@@ -172,6 +227,53 @@ fn collect_extra_sort_items(order_by: &[SortItem], output: &[OutputColumn]) -> V
         }
     }
     extra
+}
+
+/// Rewrite a sort item so any unqualified `ColumnRef` pointing at a
+/// pre-rename SELECT output name is remapped to the matching
+/// `__nr_sel_<idx>`. Used after the inner Project items have been renamed
+/// for the sort-extras flow so that simple `ORDER BY <select_alias>`
+/// references still resolve.
+fn remap_sort_to_synthetic(
+    item: SortItem,
+    name_to_idx: &std::collections::HashMap<String, usize>,
+) -> SortItem {
+    let SortItem {
+        expr,
+        asc,
+        nulls_first,
+    } = item;
+    SortItem {
+        expr: remap_select_alias_refs(expr, name_to_idx),
+        asc,
+        nulls_first,
+    }
+}
+
+fn remap_select_alias_refs(
+    expr: TypedExpr,
+    name_to_idx: &std::collections::HashMap<String, usize>,
+) -> TypedExpr {
+    match expr.kind {
+        ExprKind::ColumnRef {
+            qualifier: None,
+            ref column,
+        } => {
+            if let Some(idx) = name_to_idx.get(&column.to_lowercase()) {
+                TypedExpr {
+                    data_type: expr.data_type,
+                    nullable: expr.nullable,
+                    kind: ExprKind::ColumnRef {
+                        qualifier: None,
+                        column: format!("__nr_sel_{idx}"),
+                    },
+                }
+            } else {
+                expr
+            }
+        }
+        _ => expr,
+    }
 }
 
 fn rewrite_sort_items_to_projection_refs(
