@@ -849,7 +849,14 @@ impl<'a> super::AnalyzerContext<'a> {
         let mut args = Vec::with_capacity(array.elem.len());
         let mut item_type = DataType::Null;
         for item in &array.elem {
-            let typed = self.analyze_expr(item, scope)?;
+            let mut typed = self.analyze_expr(item, scope)?;
+            // StarRocks infers array literal element types from the
+            // narrowest integer width that holds the value (TINYINT for
+            // `[1, 2, 3]`). Narrow each integer literal here so the
+            // widened item type — and downstream `typeof()` — matches.
+            if let ExprKind::Literal(LiteralValue::Int(v)) = &typed.kind {
+                typed.data_type = narrow_int_literal_type(*v);
+            }
             item_type = wider_type(&item_type, &typed.data_type);
             args.push(typed);
         }
@@ -1150,6 +1157,30 @@ impl<'a> super::AnalyzerContext<'a> {
             && let sqlast::Expr::Cast { data_type, .. } = arg_exprs[0]
             && let Some(type_name) = sql_type_starrocks_name(data_type)
         {
+            return Ok(TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::String(type_name)),
+                data_type: DataType::Utf8,
+                nullable: false,
+            });
+        }
+        // typeof(<expr>) on a non-CAST argument: analyze the argument with
+        // StarRocks' narrowest-integer-literal-type rule applied, then map
+        // the resulting Arrow type to its StarRocks spelling. Some function
+        // families return BINARY/VARCHAR at the Arrow level but carry a
+        // distinct logical type (BITMAP/HLL/JSON/null literal) in
+        // StarRocks, so recognise those by the producing function name
+        // first.
+        if name == "typeof" && arg_exprs.len() == 1 {
+            if let Some(special) = sql_expr_logical_type_name(arg_exprs[0]) {
+                return Ok(TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::String(special)),
+                    data_type: DataType::Utf8,
+                    nullable: false,
+                });
+            }
+            let typed_arg = self.analyze_expr(arg_exprs[0], scope)?;
+            let narrowed = narrow_int_literals_in_typed_expr(typed_arg);
+            let type_name = arrow_type_to_starrocks_name(&narrowed.data_type);
             return Ok(TypedExpr {
                 kind: ExprKind::Literal(LiteralValue::String(type_name)),
                 data_type: DataType::Utf8,
@@ -3501,6 +3532,230 @@ fn is_integer_const_literal(expr: &sqlast::Expr) -> bool {
             expr,
         } => is_integer_const_literal(expr),
         _ => false,
+    }
+}
+
+/// Narrow an integer literal value to the smallest signed integer width
+/// that contains it (TINYINT/SMALLINT/INT/BIGINT). Used in array literal
+/// and `typeof()` contexts to match StarRocks' literal-width inference.
+fn narrow_int_literal_type(value: i64) -> DataType {
+    if i8::try_from(value).is_ok() {
+        DataType::Int8
+    } else if i16::try_from(value).is_ok() {
+        DataType::Int16
+    } else if i32::try_from(value).is_ok() {
+        DataType::Int32
+    } else {
+        DataType::Int64
+    }
+}
+
+/// Walk a `TypedExpr` tree, narrowing every integer literal to its
+/// smallest signed integer width and recomputing the result types of
+/// function calls whose return type depends on argument widths
+/// (greatest/least/coalesce/nvl/ifnull, array/map/struct literals).
+/// The original `kind` is preserved so codegen sees the same shape;
+/// only `data_type` is updated so `typeof()` can report the narrow
+/// spelling.
+fn narrow_int_literals_in_typed_expr(expr: TypedExpr) -> TypedExpr {
+    let kind = expr.kind.clone();
+    match kind {
+        ExprKind::Literal(LiteralValue::Int(v)) => TypedExpr {
+            data_type: narrow_int_literal_type(v),
+            nullable: expr.nullable,
+            kind: expr.kind,
+        },
+        ExprKind::UnaryOp { op, expr: inner } => {
+            let inner = narrow_int_literals_in_typed_expr(*inner);
+            let data_type = inner.data_type.clone();
+            TypedExpr {
+                data_type,
+                nullable: expr.nullable,
+                kind: ExprKind::UnaryOp {
+                    op,
+                    expr: Box::new(inner),
+                },
+            }
+        }
+        ExprKind::FunctionCall {
+            name,
+            args,
+            distinct,
+        } => {
+            let args: Vec<TypedExpr> = args
+                .into_iter()
+                .map(narrow_int_literals_in_typed_expr)
+                .collect();
+            let arg_types: Vec<DataType> = args.iter().map(|a| a.data_type.clone()).collect();
+            let new_type = match name.as_str() {
+                "greatest" | "least" | "coalesce" | "nvl" | "ifnull" => {
+                    if let Some(first) = arg_types.first() {
+                        let mut result = first.clone();
+                        for t in &arg_types[1..] {
+                            result = wider_type(&result, t);
+                        }
+                        if matches!(name.as_str(), "greatest" | "least")
+                            && matches!(result, DataType::Date32)
+                        {
+                            result =
+                                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None);
+                        }
+                        result
+                    } else {
+                        expr.data_type.clone()
+                    }
+                }
+                "__array_literal" => {
+                    let mut item = DataType::Null;
+                    for t in &arg_types {
+                        item = wider_type(&item, t);
+                    }
+                    DataType::List(arrow::datatypes::Field::new("item", item, true).into())
+                }
+                "map" if !arg_types.is_empty() && arg_types.len() % 2 == 0 => {
+                    let mut key_t = DataType::Null;
+                    let mut val_t = DataType::Null;
+                    for (i, t) in arg_types.iter().enumerate() {
+                        if i % 2 == 0 {
+                            key_t = wider_type(&key_t, t);
+                        } else {
+                            val_t = wider_type(&val_t, t);
+                        }
+                    }
+                    DataType::Map(
+                        std::sync::Arc::new(arrow::datatypes::Field::new(
+                            "entries",
+                            DataType::Struct(
+                                vec![
+                                    std::sync::Arc::new(arrow::datatypes::Field::new(
+                                        "key", key_t, true,
+                                    )),
+                                    std::sync::Arc::new(arrow::datatypes::Field::new(
+                                        "value", val_t, true,
+                                    )),
+                                ]
+                                .into(),
+                            ),
+                            false,
+                        )),
+                        false,
+                    )
+                }
+                "row" | "struct" | "named_struct" => {
+                    let fields: Vec<std::sync::Arc<arrow::datatypes::Field>> = args
+                        .iter()
+                        .enumerate()
+                        .map(|(i, a)| {
+                            std::sync::Arc::new(arrow::datatypes::Field::new(
+                                format!("col{}", i + 1),
+                                a.data_type.clone(),
+                                true,
+                            ))
+                        })
+                        .collect();
+                    DataType::Struct(fields.into())
+                }
+                _ => expr.data_type.clone(),
+            };
+            TypedExpr {
+                data_type: new_type,
+                nullable: expr.nullable,
+                kind: ExprKind::FunctionCall {
+                    name,
+                    args,
+                    distinct,
+                },
+            }
+        }
+        _ => expr,
+    }
+}
+
+/// Render an Arrow `DataType` as the StarRocks-style type name used by
+/// `typeof()`. Mirrors the codegen-level helper in `expr_compiler` so the
+/// analyzer can fold `typeof(<expr>)` into a string literal directly.
+fn arrow_type_to_starrocks_name(dt: &DataType) -> String {
+    match dt {
+        DataType::Boolean => "boolean".to_string(),
+        DataType::Int8 => "tinyint".to_string(),
+        DataType::Int16 => "smallint".to_string(),
+        DataType::Int32 => "int".to_string(),
+        DataType::Int64 => "bigint".to_string(),
+        DataType::UInt8 => "tinyint unsigned".to_string(),
+        DataType::UInt16 => "smallint unsigned".to_string(),
+        DataType::UInt32 => "int unsigned".to_string(),
+        DataType::UInt64 => "bigint unsigned".to_string(),
+        DataType::Float32 => "float".to_string(),
+        DataType::Float64 => "double".to_string(),
+        DataType::Decimal128(p, s) => format!("decimal128({}, {})", p, s),
+        DataType::FixedSizeBinary(w) if *w == crate::common::largeint::LARGEINT_BYTE_WIDTH => {
+            "largeint".to_string()
+        }
+        DataType::Utf8 | DataType::LargeUtf8 => "varchar".to_string(),
+        DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => {
+            "varbinary".to_string()
+        }
+        DataType::Date32 => "date".to_string(),
+        DataType::Timestamp(_, _) => "datetime".to_string(),
+        DataType::Time32(_) | DataType::Time64(_) => "time".to_string(),
+        DataType::List(field) => {
+            format!("array<{}>", arrow_type_to_starrocks_name(field.data_type()))
+        }
+        DataType::Map(entries, _) => match entries.data_type() {
+            DataType::Struct(fields) if fields.len() == 2 => format!(
+                "map<{},{}>",
+                arrow_type_to_starrocks_name(fields[0].data_type()),
+                arrow_type_to_starrocks_name(fields[1].data_type())
+            ),
+            _ => "map".to_string(),
+        },
+        DataType::Struct(fields) => {
+            let parts: Vec<String> = fields
+                .iter()
+                .map(|f| {
+                    format!(
+                        "{} {}",
+                        f.name(),
+                        arrow_type_to_starrocks_name(f.data_type())
+                    )
+                })
+                .collect();
+            format!("struct<{}>", parts.join(", "))
+        }
+        DataType::Null => "null".to_string(),
+        other => format!("{:?}", other).to_lowercase(),
+    }
+}
+
+/// Some StarRocks logical types (BITMAP / HLL / JSON) are represented as
+/// BINARY or VARCHAR at the Arrow level but should be reported as their
+/// own type name by `typeof()`. Detect the logical type by inspecting the
+/// producing function in the AST. Also handles the bare `NULL` literal.
+fn sql_expr_logical_type_name(expr: &sqlast::Expr) -> Option<String> {
+    match expr {
+        sqlast::Expr::Value(sqlast::ValueWithSpan { value, .. }) => match value {
+            sqlast::Value::Null => Some("null_type".to_string()),
+            _ => None,
+        },
+        sqlast::Expr::Function(function) => {
+            let name = function.name.to_string().to_ascii_lowercase();
+            let name = name.split('.').next_back().unwrap_or(name.as_str());
+            match name {
+                n if n.starts_with("bitmap_")
+                    || n == "to_bitmap"
+                    || n == "bitmap_agg"
+                    || n == "bitmap_union" =>
+                {
+                    Some("bitmap".to_string())
+                }
+                n if n.starts_with("hll_") || n == "hll_empty" || n == "hll_hash" => {
+                    Some("hll".to_string())
+                }
+                "parse_json" | "json_object" | "json_array" | "to_json" => Some("json".to_string()),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 

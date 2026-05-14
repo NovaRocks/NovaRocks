@@ -574,13 +574,26 @@ impl<'a> super::AnalyzerContext<'a> {
             .iter()
             .any(|a| matches!(a, sqlast::FunctionArg::Unnamed(_)));
         if any_named && any_positional {
-            // Surface the first stray positional token in the canonical
+            // Surface the first stray positional token. An
+            // `Identifier -> value` expression in a function-arg slot is
+            // not a valid named-arg operator in StarRocks; report it with
+            // the legacy `No viable statement for input` wording the FE
+            // uses. Other stray positional tokens get the canonical
             // `Unexpected input '<token>'` form.
             if let Some(sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e))) =
                 normalized_args
                     .iter()
                     .find(|a| matches!(a, sqlast::FunctionArg::Unnamed(_)))
             {
+                if matches!(
+                    e,
+                    sqlast::Expr::BinaryOp {
+                        op: sqlast::BinaryOperator::Arrow,
+                        ..
+                    }
+                ) {
+                    return Err(format!("No viable statement for input near '{e}'."));
+                }
                 return Err(format!("Unexpected input '{e}'."));
             }
             return Err("Unknown table function: generate_series".into());

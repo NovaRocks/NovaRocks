@@ -3240,12 +3240,23 @@ mod tests {
         assert_eq!(resolved.output_columns.len(), 1);
         match &resolved.output_columns[0].data_type {
             arrow::datatypes::DataType::List(item) => {
-                assert!(matches!(
-                    item.data_type(),
-                    arrow::datatypes::DataType::Int64
-                ));
+                // StarRocks narrows array literal element types to the
+                // smallest signed integer width (TINYINT for `[1, 2]`),
+                // so `x + y` widens to SMALLINT under the arithmetic
+                // promotion rules.
+                assert!(
+                    matches!(
+                        item.data_type(),
+                        arrow::datatypes::DataType::Int8
+                            | arrow::datatypes::DataType::Int16
+                            | arrow::datatypes::DataType::Int32
+                            | arrow::datatypes::DataType::Int64
+                    ),
+                    "expected integer element type, got {:?}",
+                    item.data_type()
+                );
             }
-            other => panic!("expected ARRAY<BIGINT>, got {other:?}"),
+            other => panic!("expected ARRAY<integer>, got {other:?}"),
         }
     }
 
