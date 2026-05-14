@@ -5176,6 +5176,40 @@ enable_path_style_access = true
     }
 
     #[test]
+    fn managed_dup_delete_via_delete_predicate_path() {
+        let _runtime_guard = lock_runtime_test_state();
+        let Some((_dir, config_path, _metadata_db_path)) = maybe_managed_lake_config() else {
+            return;
+        };
+        let engine = StandaloneNovaRocks::open(StandaloneOptions {
+            config_path: Some(config_path),
+            metadata_db_path: None,
+        })
+        .expect("open engine");
+        let session = engine.session();
+        session
+            .execute(
+                "create table t_dup (id int, name string) duplicate key(id) \
+                 distributed by hash(id) buckets 2",
+            )
+            .expect("create dup");
+        session
+            .execute("insert into t_dup values (1, 'a'), (2, 'b'), (3, 'c')")
+            .expect("insert");
+        session
+            .execute("delete from t_dup where id = 2")
+            .expect("delete via predicate");
+        let remaining = session
+            .query("select id from t_dup order by id")
+            .expect("query remaining");
+        assert_eq!(remaining.row_count(), 2);
+        let deleted = session
+            .query("select id from t_dup where id = 2")
+            .expect("query deleted");
+        assert_eq!(deleted.row_count(), 0);
+    }
+
+    #[test]
     fn managed_delete_rewrites_remaining_rows_for_primary_key_table() {
         let _runtime_guard = lock_runtime_test_state();
         let Some((_dir, config_path, _metadata_db_path)) = maybe_managed_lake_config() else {

@@ -363,6 +363,136 @@ fn execute_managed_delete_statement(
         ));
     }
 
+    let table_info = resolve_managed_table_info(state, target)?;
+    if table_info.is_materialized_view {
+        return Err(format!(
+            "The data of '{}' cannot be deleted because it is a materialized view; \
+             the data of materialized view must be consistent with the base table.",
+            target.table
+        ));
+    }
+
+    if table_info.keys_type == "PRIMARY_KEYS" {
+        // M4.T2 replaces this with execute_managed_pk_delete (SELECT pk_cols, 1 AS __op).
+        return execute_managed_cow_delete_legacy(state, target, stmt);
+    }
+
+    let keys_type =
+        crate::engine::delete_predicate_translate::KeysType::from_meta_str(&table_info.keys_type)
+            .ok_or_else(|| {
+            format!(
+                "DELETE not supported for managed-lake keys_type `{}`",
+                table_info.keys_type
+            )
+        })?;
+    execute_managed_predicate_delete(state, target, stmt, &table_info, keys_type)
+}
+
+struct ManagedTableInfo {
+    keys_type: String,
+    is_materialized_view: bool,
+    columns: Vec<crate::engine::catalog::ColumnDef>,
+    key_columns: Vec<String>,
+}
+
+fn resolve_managed_table_info(
+    state: &Arc<StandaloneState>,
+    target: &crate::engine::backend_resolver::TargetBackend,
+) -> Result<ManagedTableInfo, String> {
+    use crate::connector::starrocks::managed::catalog::arrow_type_from_tablet_column;
+    use crate::engine::catalog::ColumnDef;
+
+    let managed = state
+        .managed_lake
+        .read()
+        .expect("standalone managed lake read lock");
+    let runtime = managed.table(&target.namespace, &target.table)?;
+
+    let key_columns: Vec<String> = runtime
+        .columns
+        .iter()
+        .filter(|column| column.is_key)
+        .map(|column| column.column_name.clone())
+        .collect();
+
+    let mut columns = Vec::with_capacity(runtime.columns.len());
+    for column in &runtime.columns {
+        if !column.visible {
+            continue;
+        }
+        let schema_column = runtime
+            .tablet_schema
+            .column
+            .iter()
+            .find(|sc| {
+                sc.name
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&column.column_name))
+            })
+            .ok_or_else(|| {
+                format!(
+                    "managed table {}.{} missing tablet schema column `{}`",
+                    runtime.database_name, runtime.table.name, column.column_name
+                )
+            })?;
+        columns.push(ColumnDef {
+            name: column.column_name.clone(),
+            data_type: arrow_type_from_tablet_column(schema_column)?,
+            nullable: column.nullable,
+            write_default: None,
+        });
+    }
+
+    Ok(ManagedTableInfo {
+        keys_type: runtime.table.keys_type.clone(),
+        is_materialized_view: matches!(
+            runtime.table.kind,
+            crate::connector::starrocks::managed::store::ManagedTableKind::MaterializedView
+        ),
+        columns,
+        key_columns,
+    })
+}
+
+fn execute_managed_predicate_delete(
+    state: &Arc<StandaloneState>,
+    target: &crate::engine::backend_resolver::TargetBackend,
+    stmt: &DeleteStmt,
+    table_info: &ManagedTableInfo,
+    keys_type: crate::engine::delete_predicate_translate::KeysType,
+) -> Result<StatementResult, String> {
+    use crate::connector::starrocks::lake::delete_predicate_proto::build_delete_predicate_pb;
+    use crate::engine::delete_predicate_translate::translate_to_delete_predicate;
+
+    let terms = translate_to_delete_predicate(
+        &stmt.where_clause,
+        &table_info.columns,
+        &table_info.key_columns,
+        keys_type,
+    )?;
+
+    // The version field is informational on the wire; backends derive the
+    // actual rowset version from the txn publish. StarRocks emits the next
+    // partition version here for parity, so do the same.
+    let predicate_version = 0_i32;
+    let predicate_pb = build_delete_predicate_pb(&terms, predicate_version);
+
+    crate::connector::starrocks::managed::txn::delete_managed_lake_table_by_predicate(
+        state,
+        &target.namespace,
+        &target.table,
+        predicate_pb,
+    )?;
+    Ok(StatementResult::Ok)
+}
+
+/// Legacy copy-on-write DELETE — kept temporarily for PRIMARY KEY tables
+/// while M4.T2 implements the `__op` + sink path. To be removed in M4.T3.
+fn execute_managed_cow_delete_legacy(
+    state: &Arc<StandaloneState>,
+    target: &crate::engine::backend_resolver::TargetBackend,
+    stmt: &DeleteStmt,
+) -> Result<StatementResult, String> {
     let (catalog, sink) = {
         let reg = state.connectors.read().expect("connector registry read");
         (

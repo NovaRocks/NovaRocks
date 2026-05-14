@@ -28,7 +28,8 @@ use crate::meta::repository::mv::UpdateManagedMvRefreshSummaryRequest;
 use crate::runtime::query_result::QueryResult;
 use crate::runtime::starlet_shard_registry::S3StoreConfig;
 use crate::service::grpc_client::proto::starrocks::{
-    KeysType, PublishVersionRequest, TabletSchemaPb,
+    DeleteDataRequest, DeletePredicatePb, KeysType, PublishVersionRequest, TableSchemaKeyPb,
+    TabletSchemaPb,
 };
 use crate::sql::parser::ast::{InsertSource, Literal, ObjectName};
 
@@ -992,6 +993,134 @@ fn take_chunk_rows(chunk: &Chunk, row_indices: &[u32]) -> Result<Chunk, String> 
         batch,
         chunk.chunk_schema_ref(),
     ))
+}
+
+/// Apply a `DeletePredicatePb` to every tablet of a DUP/UNIQUE/AGG managed-lake
+/// table's active partition. Writes one `op_write { rowset.delete_predicate }`
+/// txn log per tablet via [`crate::connector::starrocks::lake::transactions::delete_data`],
+/// then publishes the txn and refreshes the in-memory catalog.
+///
+/// PRIMARY_KEYS tables do not use this path: their DELETE is rewritten into
+/// a `SELECT pk_cols, 1 AS __op` insert that flows through the regular sink
+/// path so the PK-applier consumes `.del` files.
+pub(crate) fn delete_managed_lake_table_by_predicate(
+    state: &Arc<StandaloneState>,
+    database_name: &str,
+    table_name: &str,
+    delete_predicate_pb: DeletePredicatePb,
+) -> Result<(), String> {
+    let mut managed = state
+        .managed_lake
+        .write()
+        .expect("standalone managed lake write lock");
+    let runtime = managed.table(database_name, table_name)?.clone();
+
+    if matches!(runtime.table.kind, super::store::ManagedTableKind::MaterializedView) {
+        return Err(format!(
+            "The data of '{}.{}' cannot be deleted because it is a materialized view; \
+             the data of materialized view must be consistent with the base table.",
+            database_name, table_name
+        ));
+    }
+
+    let metadata_store = state
+        .metadata_store
+        .as_ref()
+        .ok_or_else(|| "managed delete requires sqlite metadata store".to_string())?;
+
+    let active_partition = runtime
+        .partitions
+        .iter()
+        .find(|partition| partition.state == super::store::ManagedPartitionState::Active)
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "managed table {database_name}.{table_name} does not have an active partition"
+            )
+        })?;
+
+    let tablet_ids: Vec<i64> = runtime
+        .tablets
+        .iter()
+        .filter(|tablet| tablet.partition_id == active_partition.partition_id)
+        .map(|tablet| tablet.tablet_id)
+        .collect();
+    if tablet_ids.is_empty() {
+        return Err(format!(
+            "managed table {database_name}.{table_name} active partition has no tablets"
+        ));
+    }
+
+    let prepared = metadata_store.prepare_txn(
+        runtime.table.table_id,
+        active_partition.partition_id,
+        active_partition.visible_version,
+    )?;
+
+    let abort_on_err = |metadata_store: &super::store::SqliteMetadataStore,
+                        txn_id: i64,
+                        err: String|
+     -> String {
+        if let Err(abort_err) = metadata_store.mark_txn_aborted(txn_id) {
+            return format!(
+                "managed delete failed: {err}; additionally mark_txn_aborted failed: {abort_err}"
+            );
+        }
+        err
+    };
+
+    let request = DeleteDataRequest {
+        tablet_ids: tablet_ids.clone(),
+        txn_id: Some(prepared.txn_id),
+        delete_predicate: Some(delete_predicate_pb),
+        schema_key: Some(TableSchemaKeyPb {
+            db_id: Some(runtime.table.db_id),
+            table_id: Some(runtime.table.table_id),
+            schema_id: Some(runtime.table.current_schema_id),
+        }),
+    };
+
+    let response = crate::connector::starrocks::lake::transactions::delete_data(&request)
+        .map_err(|e| abort_on_err(metadata_store, prepared.txn_id, e))?;
+    if !response.failed_tablets.is_empty() {
+        return Err(abort_on_err(
+            metadata_store,
+            prepared.txn_id,
+            format!("delete_data failed for tablets {:?}", response.failed_tablets),
+        ));
+    }
+
+    metadata_store.mark_txn_written(prepared.txn_id)?;
+
+    publish_tablets_at_version(
+        tablet_ids,
+        prepared.txn_id,
+        prepared.base_version,
+        prepared.commit_version,
+    )
+    .map_err(|e| {
+        abort_on_err(
+            metadata_store,
+            prepared.txn_id,
+            format!("managed delete publish failed: {e}"),
+        )
+    })?;
+
+    metadata_store.mark_txn_visible(prepared.txn_id, prepared.commit_version)?;
+
+    let table_id =
+        managed.advance_partition_version(active_partition.partition_id, prepared.commit_version)?;
+    let refreshed_runtime = managed
+        .runtime_by_table_id(table_id)
+        .cloned()
+        .ok_or_else(|| format!("managed runtime missing for table_id={table_id}"))?;
+
+    let mut catalog = state
+        .catalog
+        .write()
+        .expect("standalone catalog write lock");
+    register_managed_table_in_catalog(&mut catalog, &refreshed_runtime)?;
+    Ok(())
 }
 
 fn publish_managed_txn(
