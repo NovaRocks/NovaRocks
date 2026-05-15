@@ -279,7 +279,7 @@ pub(crate) async fn locate_target_rows_by_apply_key(
                 row,
                 file,
                 pos,
-                &existing_deletes_by_file,
+                existing_deletes_by_file,
             )? {
                 continue;
             }

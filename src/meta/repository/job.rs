@@ -635,7 +635,7 @@ fn is_runnable(job: &StoredEraseJob, now_ms: i64) -> bool {
 }
 
 fn is_retry_due(retry_at_ms: Option<i64>, now_ms: i64) -> bool {
-    retry_at_ms.map_or(true, |retry_at_ms| retry_at_ms <= now_ms)
+    retry_at_ms.is_none_or(|retry_at_ms| retry_at_ms <= now_ms)
 }
 
 fn key_erase_job(job_id: i64) -> RepositoryResult<MetaKey> {

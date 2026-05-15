@@ -146,7 +146,20 @@ fn erase_root(root_path: &str, config: &ManagedLakeConfig) -> Result<(), String>
     let (operator, rel_path) =
         resolve_oss_operator_and_path_with_config(root_path, &object_store_cfg)
             .map_err(|e| format!("resolve erase root `{root_path}` failed: {e}"))?;
-    let erase_prefix = erase_prefix_path(&rel_path)
+    // Normalize the warehouse URI through the same resolver so the safety
+    // check below compares the requested erase target against the same
+    // bucket-relative key shape (the OpenDAL operator now always operates
+    // from the bucket root, so the warehouse path component lives entirely
+    // in the key prefix).
+    let (_, warehouse_rel) =
+        resolve_oss_operator_and_path_with_config(&config.warehouse_uri, &object_store_cfg)
+            .map_err(|e| {
+                format!(
+                    "resolve managed lake warehouse `{}` failed: {e}",
+                    config.warehouse_uri
+                )
+            })?;
+    let erase_prefix = erase_prefix_path(&rel_path, &warehouse_rel)
         .map_err(|e| format!("refuse to erase managed lake root `{root_path}`: {e}"))?;
     let remove_result = oss_block_on(operator.remove_all(&erase_prefix))
         .map_err(|e| format!("run erase root `{root_path}` failed: {e}"))?;
@@ -154,9 +167,13 @@ fn erase_root(root_path: &str, config: &ManagedLakeConfig) -> Result<(), String>
     Ok(())
 }
 
-fn erase_prefix_path(rel_path: &str) -> Result<String, String> {
+fn erase_prefix_path(rel_path: &str, warehouse_rel: &str) -> Result<String, String> {
     let trimmed = rel_path.trim_matches('/');
-    if trimmed.is_empty() {
+    let warehouse_trimmed = warehouse_rel.trim_matches('/');
+    // Refuse erasing the bucket root or the entire managed warehouse —
+    // these would otherwise wipe data belonging to other managed tables
+    // or even the entire bucket.
+    if trimmed.is_empty() || trimmed == warehouse_trimmed {
         return Err("empty managed lake root".to_string());
     }
     Ok(format!("{trimmed}/"))
@@ -197,7 +214,6 @@ mod tests {
             s3: S3StoreConfig {
                 endpoint: "http://127.0.0.1:9000".to_string(),
                 bucket: "test".to_string(),
-                root: "warehouse".to_string(),
                 access_key_id: "ak".to_string(),
                 access_key_secret: "sk".to_string(),
                 region: Some("us-east-1".to_string()),
@@ -687,17 +703,31 @@ mod tests {
     #[test]
     fn erase_prefix_path_keeps_directory_boundary() {
         assert_eq!(
-            super::erase_prefix_path("warehouse/db_70/table_124").expect("prefix"),
+            super::erase_prefix_path("warehouse/db_70/table_124", "warehouse").expect("prefix"),
             "warehouse/db_70/table_124/"
         );
         assert_eq!(
-            super::erase_prefix_path("warehouse/db_70/table_124/").expect("prefix"),
+            super::erase_prefix_path("warehouse/db_70/table_124/", "warehouse").expect("prefix"),
             "warehouse/db_70/table_124/"
         );
         assert!(
-            super::erase_prefix_path("/")
+            super::erase_prefix_path("/", "warehouse")
                 .expect_err("empty root must be rejected")
                 .contains("empty")
         );
+    }
+
+    #[test]
+    fn erase_prefix_path_rejects_warehouse_root_itself() {
+        // After the cluster-level S3 refactor the OpenDAL operator always
+        // runs from the bucket root, so the warehouse path component lives
+        // in the relative key. The safety check must therefore explicitly
+        // refuse keys that resolve back to the warehouse root.
+        let err = super::erase_prefix_path("warehouse", "warehouse")
+            .expect_err("warehouse root itself must be rejected");
+        assert!(err.contains("empty"), "err={err}");
+        let err = super::erase_prefix_path("/warehouse/", "warehouse")
+            .expect_err("warehouse root with surrounding slashes must be rejected");
+        assert!(err.contains("empty"), "err={err}");
     }
 }

@@ -209,18 +209,21 @@ fn resolve_tablet_paths_for_refs(
     let missing_after_local = collect_missing_tablet_ids(&requested_tablet_ids, &local_paths);
     if !missing_after_local.is_empty() {
         match recover_missing_paths_from_starmgr(&missing_after_local) {
-            Ok(recovered_paths) => {
-                if !recovered_paths.is_empty() {
-                    let recovered_infos = recovered_paths
+            Ok(recovered) => {
+                if !recovered.is_empty() {
+                    // StarManager already provides the cluster-level S3
+                    // profile alongside the freshly resolved tablet path,
+                    // so carry it forward directly. Re-inferring from the
+                    // registry here is what historically grafted a stale
+                    // `root` onto the new full_path.
+                    let recovered_infos = recovered
                         .iter()
-                        .map(|(tablet_id, path)| {
+                        .map(|(tablet_id, info)| {
                             (
                                 *tablet_id,
                                 crate::runtime::starlet_shard_registry::StarletShardInfo {
-                                    full_path: path.clone(),
-                                    // Build the inferred config before upsert_many_infos acquires
-                                    // the shard registry mutex to avoid lock re-entry deadlock.
-                                    s3: starlet_shard_registry::infer_s3_config_for_path(path),
+                                    full_path: info.full_path.clone(),
+                                    s3: info.s3.clone(),
                                 },
                             )
                         })
@@ -234,7 +237,9 @@ fn resolve_tablet_paths_for_refs(
                             "recovered tablet root paths from StarManager GetShard because local shard cache was incomplete"
                         );
                     }
-                    local_paths.extend(recovered_paths);
+                    for (tablet_id, info) in recovered {
+                        local_paths.insert(tablet_id, info.full_path);
+                    }
                 }
             }
             Err(err) => {
@@ -268,9 +273,11 @@ fn resolve_tablet_paths_for_refs(
     select_paths_for_refs(local_paths, refs)
 }
 
-fn recover_missing_paths_from_starmgr(tablet_ids: &[i64]) -> Result<HashMap<i64, String>, String> {
+fn recover_missing_paths_from_starmgr(
+    tablet_ids: &[i64],
+) -> Result<HashMap<i64, starlet_shard_registry::StarletShardInfo>, String> {
     let recovered = starmgr::retrieve_shard_infos(tablet_ids)?;
-    let mut paths = HashMap::with_capacity(recovered.len());
+    let mut out = HashMap::with_capacity(recovered.len());
     for (tablet_id, info) in recovered {
         let normalized = normalize_storage_path(&info.full_path).ok_or_else(|| {
             format!(
@@ -278,9 +285,15 @@ fn recover_missing_paths_from_starmgr(tablet_ids: &[i64]) -> Result<HashMap<i64,
                 info.full_path
             )
         })?;
-        paths.insert(tablet_id, normalized);
+        out.insert(
+            tablet_id,
+            starlet_shard_registry::StarletShardInfo {
+                full_path: normalized,
+                s3: info.s3,
+            },
+        );
     }
-    Ok(paths)
+    Ok(out)
 }
 
 fn recover_missing_paths_from_runtime_registry(
@@ -506,7 +519,6 @@ mod tests {
             s3_config: Some(crate::runtime::starlet_shard_registry::S3StoreConfig {
                 endpoint: "http://127.0.0.1:9000".to_string(),
                 bucket: "bucket".to_string(),
-                root: "persisted".to_string(),
                 access_key_id: "ak".to_string(),
                 access_key_secret: "sk".to_string(),
                 region: Some("us-east-1".to_string()),

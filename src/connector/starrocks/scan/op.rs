@@ -521,12 +521,12 @@ fn resolve_object_store_profile<'a>(
                 .as_ref()
                 .map(|config| {
                     eprintln!(
-                        "[DEBUG] starrocks direct read inferred object store config bucket={} endpoint={} root={}",
-                        config.bucket, config.endpoint, config.root
+                        "[DEBUG] starrocks direct read inferred object store config bucket={} endpoint={}",
+                        config.bucket, config.endpoint
                     );
                     info!(
-                        "starrocks direct read inferred object store config bucket={} endpoint={} root={}",
-                        config.bucket, config.endpoint, config.root
+                        "starrocks direct read inferred object store config bucket={} endpoint={}",
+                        config.bucket, config.endpoint
                     );
                     ObjectStoreProfile::from_s3_store_config(config)
                 })
@@ -648,5 +648,23 @@ mod tests {
             partition_storage_paths.get(&17).map(String::as_str),
             Some("s3://bucket/root/table/17")
         );
+    }
+
+    #[test]
+    fn direct_read_fails_fast_when_no_cluster_profile_is_available() {
+        // No FE properties, no shard registry entry, and the scan path is
+        // an object-store URI. The lake scan flow must surface an explicit
+        // error instead of synthesising a config from unrelated tablets.
+        //
+        // This test deliberately reuses the managed-lake runtime mutex
+        // (`lock_runtime_test_state`) so the registry clear here cannot
+        // race against a test that has just populated the registry via
+        // `register_tablet_runtime`.
+        let _guard = crate::connector::starrocks::lake::context::lock_runtime_test_state();
+        let props = BTreeMap::new();
+        let paths = vec!["s3://orphan-bucket/lake/orders/p1/0001".to_string()];
+        let err = resolve_object_store_profile(&props, paths.iter())
+            .expect_err("must fail fast for unknown cluster profile");
+        assert!(err.contains("missing object store config"), "err={err}");
     }
 }

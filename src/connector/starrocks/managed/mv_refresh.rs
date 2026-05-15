@@ -1027,13 +1027,15 @@ fn record_batch_without_column(
         .fields()
         .iter()
         .enumerate()
-        .filter_map(|(index, field)| (index != column_index).then(|| field.as_ref().clone()))
+        .filter(|(index, _)| *index != column_index)
+        .map(|(_, field)| field.as_ref().clone())
         .collect::<Vec<_>>();
     let columns = batch
         .columns()
         .iter()
         .enumerate()
-        .filter_map(|(index, column)| (index != column_index).then(|| Arc::clone(column)))
+        .filter(|(index, _)| *index != column_index)
+        .map(|(_, column)| Arc::clone(column))
         .collect::<Vec<_>>();
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .map_err(|e| format!("remove projection MV change-op column failed: {e}"))
@@ -2283,9 +2285,15 @@ mod tests {
         session
             .execute_in_database("create database ice.ns", "default")
             .expect("create iceberg namespace");
+        // Iceberg equality-delete reverse projection on the MV side needs
+        // the data file's `first_row_id` (v3 row-lineage metadata) to
+        // retract the deleted base rows from the materialized view. The
+        // table is created with format-version=3 so the writes carry
+        // row-lineage and the incremental refresh can proceed without
+        // falling back to a full rebuild.
         session
             .execute_in_database(
-                r#"create table ice.ns.orders (id bigint not null, customer string, amount bigint) tblproperties("format-version"="2")"#,
+                r#"create table ice.ns.orders (id bigint not null, customer string, amount bigint) tblproperties("format-version"="3")"#,
                 "default",
             )
             .expect("create iceberg orders table");
@@ -3537,7 +3545,6 @@ enable_path_style_access = true
             s3: S3StoreConfig {
                 endpoint,
                 bucket,
-                root,
                 access_key_id,
                 access_key_secret,
                 region: Some("us-east-1".to_string()),
@@ -3590,7 +3597,6 @@ enable_path_style_access = true
             s3: S3StoreConfig {
                 endpoint: "http://127.0.0.1:9000".to_string(),
                 bucket: "test".to_string(),
-                root: "warehouse".to_string(),
                 access_key_id: "ak".to_string(),
                 access_key_secret: "sk".to_string(),
                 region: Some("us-east-1".to_string()),

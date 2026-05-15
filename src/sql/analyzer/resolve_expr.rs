@@ -3558,10 +3558,10 @@ fn unescape_sql_string(s: &str) -> String {
 /// (`3.2`) are explicitly rejected.
 fn is_integer_const_literal(expr: &sqlast::Expr) -> bool {
     match expr {
-        sqlast::Expr::Value(sqlast::ValueWithSpan { value, .. }) => match value {
-            sqlast::Value::Number(s, _) => s.parse::<i64>().is_ok(),
-            _ => false,
-        },
+        sqlast::Expr::Value(sqlast::ValueWithSpan {
+            value: sqlast::Value::Number(s, _),
+            ..
+        }) => s.parse::<i64>().is_ok(),
         sqlast::Expr::UnaryOp {
             op: sqlast::UnaryOperator::Minus | sqlast::UnaryOperator::Plus,
             expr,
@@ -3647,7 +3647,7 @@ fn narrow_int_literals_in_typed_expr(expr: TypedExpr) -> TypedExpr {
                     }
                     DataType::List(arrow::datatypes::Field::new("item", item, true).into())
                 }
-                "map" if !arg_types.is_empty() && arg_types.len() % 2 == 0 => {
+                "map" if !arg_types.is_empty() && arg_types.len().is_multiple_of(2) => {
                     let mut key_t = DataType::Null;
                     let mut val_t = DataType::Null;
                     for (i, t) in arg_types.iter().enumerate() {
@@ -3768,10 +3768,11 @@ fn arrow_type_to_starrocks_name(dt: &DataType) -> String {
 /// producing function in the AST. Also handles the bare `NULL` literal.
 fn sql_expr_logical_type_name(expr: &sqlast::Expr) -> Option<String> {
     match expr {
-        sqlast::Expr::Value(sqlast::ValueWithSpan { value, .. }) => match value {
-            sqlast::Value::Null => Some("null_type".to_string()),
-            _ => None,
-        },
+        sqlast::Expr::Value(sqlast::ValueWithSpan {
+            value: sqlast::Value::Null,
+            ..
+        }) => Some("null_type".to_string()),
+        sqlast::Expr::Value(_) => None,
         sqlast::Expr::Function(function) => {
             let name = function.name.to_string().to_ascii_lowercase();
             let name = name.split('.').next_back().unwrap_or(name.as_str());

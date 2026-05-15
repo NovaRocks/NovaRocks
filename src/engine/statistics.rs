@@ -910,10 +910,12 @@ fn observe_sales_data_insert(
         let count = if enabled { 20 } else { 12 };
         append_duplicate_column_stats(state, key, "id", count, 8, "8", "1");
         add_analyze_status(state, key, "ALL", "SAMPLE", false);
-    } else if enabled && !matches!(overwrite_mode, OverwriteMode::FullTable) {
-        append_duplicate_column_stats(state, key, "id", 2, 1, "101", "101");
-        add_analyze_status(state, key, "ALL", "SAMPLE", true);
-    } else if enabled && matches!(overwrite_mode, OverwriteMode::FullTable) {
+    } else if enabled {
+        // Both `OverwriteMode::FullTable` and the non-full variants go through
+        // the same observation here: any enabled re-analyze of an existing
+        // statistic re-publishes the same probe rows. Kept as a single arm
+        // because previously splitting these into two identical branches was
+        // a redundant `if same_then_else` clippy violation.
         append_duplicate_column_stats(state, key, "id", 2, 1, "101", "101");
         add_analyze_status(state, key, "ALL", "SAMPLE", true);
     }

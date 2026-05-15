@@ -522,7 +522,7 @@ pub(crate) fn delete_managed_lake_pk_rows(
 
     let mut rebuilt = Vec::with_capacity(pk_chunks.len());
     for chunk in pk_chunks {
-        if chunk.len() == 0 {
+        if chunk.is_empty() {
             continue;
         }
         rebuilt.push(rebuild_pk_chunk_for_plan(chunk, &plan)?);
@@ -540,10 +540,7 @@ pub(crate) fn delete_managed_lake_pk_rows(
 /// matching the slot layout that `derive_distributed_slot_ids` expects. The
 /// chunk must contain only columns named in `plan.columns`; the order is
 /// preserved as-is but slot IDs are remapped by name.
-fn rebuild_pk_chunk_for_plan(
-    chunk: &Chunk,
-    plan: &ManagedInsertPlan,
-) -> Result<Chunk, String> {
+fn rebuild_pk_chunk_for_plan(chunk: &Chunk, plan: &ManagedInsertPlan) -> Result<Chunk, String> {
     let batch_fields = chunk
         .batch
         .schema()
@@ -567,13 +564,16 @@ fn rebuild_pk_chunk_for_plan(
     }
     let chunk_schema =
         ChunkSchema::try_ref_from_schema_and_slot_ids(chunk.batch.schema().as_ref(), &slot_ids)?;
-    Ok(Chunk::new_with_chunk_schema(chunk.batch.clone(), chunk_schema))
+    Ok(Chunk::new_with_chunk_schema(
+        chunk.batch.clone(),
+        chunk_schema,
+    ))
 }
 
 fn append_primary_key_op_column(chunks: &[Chunk], op: i8) -> Result<Vec<Chunk>, String> {
     chunks
         .iter()
-        .filter(|chunk| chunk.len() > 0)
+        .filter(|chunk| !chunk.is_empty())
         .map(|chunk| {
             let mut fields = chunk
                 .batch
@@ -1147,7 +1147,10 @@ pub(crate) fn delete_managed_lake_table_by_predicate(
     if !response.failed_tablets.is_empty() {
         return Err(abort(
             prepared.txn_id,
-            format!("delete_data failed for tablets {:?}", response.failed_tablets),
+            format!(
+                "delete_data failed for tablets {:?}",
+                response.failed_tablets
+            ),
         ));
     }
 
@@ -1159,7 +1162,12 @@ pub(crate) fn delete_managed_lake_table_by_predicate(
         prepared.base_version,
         prepared.commit_version,
     )
-    .map_err(|e| abort(prepared.txn_id, format!("managed delete publish failed: {e}")))?;
+    .map_err(|e| {
+        abort(
+            prepared.txn_id,
+            format!("managed delete publish failed: {e}"),
+        )
+    })?;
 
     mark_managed_txn_visible(state, prepared.txn_id)?;
 
@@ -2392,7 +2400,6 @@ mod mv_target_tests {
             s3: S3StoreConfig {
                 endpoint: "http://127.0.0.1:9000".to_string(),
                 bucket: "bucket".to_string(),
-                root: "warehouse".to_string(),
                 access_key_id: "ak".to_string(),
                 access_key_secret: "sk".to_string(),
                 region: None,
@@ -2775,7 +2782,6 @@ mod mv_target_tests {
                     s3: S3StoreConfig {
                         endpoint: "http://127.0.0.1:9000".to_string(),
                         bucket: "bucket".to_string(),
-                        root: "warehouse".to_string(),
                         access_key_id: "ak".to_string(),
                         access_key_secret: "sk".to_string(),
                         region: None,
@@ -3099,7 +3105,6 @@ mod mv_target_tests {
             s3: S3StoreConfig {
                 endpoint,
                 bucket,
-                root,
                 access_key_id,
                 access_key_secret,
                 region: None,

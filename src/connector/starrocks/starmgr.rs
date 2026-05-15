@@ -194,7 +194,11 @@ pub(crate) fn parse_s3_config_from_file_path_info(
     } else {
         s3.bucket.trim().to_string()
     };
-    let root = s3.path_prefix.trim_matches('/').to_string();
+    // `s3.path_prefix` is the FileStore-level root, not a tablet root. It is
+    // intentionally dropped here: the tablet's location lives in `full_path`
+    // and the OpenDAL operator is built from the bucket. Carrying it into
+    // S3StoreConfig caused stale roots to be re-attached to unrelated tablet
+    // paths during recovery flows.
     let (access_key_id, access_key_secret) = parse_s3_credential(
         s3.credential.as_ref(),
         endpoint,
@@ -212,7 +216,6 @@ pub(crate) fn parse_s3_config_from_file_path_info(
     Ok(Some(S3StoreConfig {
         endpoint: endpoint.to_string(),
         bucket,
-        root,
         access_key_id,
         access_key_secret,
         region,
@@ -220,9 +223,18 @@ pub(crate) fn parse_s3_config_from_file_path_info(
     }))
 }
 
+/// Parsed StarOS FileStore record used by `retrieve_s3_config_for_path_async`
+/// to pick the file store whose configured path_prefix actually covers the
+/// requested object key. `path_prefix` stays local to that matching step and
+/// never enters [`S3StoreConfig`].
+struct FileStoreS3Record {
+    cfg: S3StoreConfig,
+    path_prefix: String,
+}
+
 fn parse_s3_config_from_file_store_info(
     fs_info: &staros::FileStoreInfo,
-) -> Result<Option<S3StoreConfig>, String> {
+) -> Result<Option<FileStoreS3Record>, String> {
     if fs_info.fs_type != staros::FileStoreType::S3 as i32 {
         return Ok(None);
     }
@@ -254,14 +266,16 @@ fn parse_s3_config_from_file_store_info(
         _ => None,
     };
 
-    Ok(Some(S3StoreConfig {
-        endpoint: endpoint.to_string(),
-        bucket: bucket.to_string(),
-        root: s3.path_prefix.trim_matches('/').to_string(),
-        access_key_id,
-        access_key_secret,
-        region: normalize_region(&s3.region),
-        enable_path_style_access,
+    Ok(Some(FileStoreS3Record {
+        cfg: S3StoreConfig {
+            endpoint: endpoint.to_string(),
+            bucket: bucket.to_string(),
+            access_key_id,
+            access_key_secret,
+            region: normalize_region(&s3.region),
+            enable_path_style_access,
+        },
+        path_prefix: s3.path_prefix.trim_matches('/').to_string(),
     }))
 }
 
@@ -535,28 +549,36 @@ async fn retrieve_s3_config_for_path_async(path: &str) -> Result<Option<S3StoreC
     let response = response.into_inner();
     require_ok_status(response.status.as_ref(), "ListFileStore")?;
 
+    // Two passes:
+    //   1. The strongest signal is "the requested key sits under this file
+    //      store's path_prefix". Pick the longest matching prefix.
+    //   2. Otherwise fall back to any file store in the same bucket, but
+    //      only if every entry agrees on the cluster-level profile.
+    //
+    // `path_prefix` only feeds the matching here; it is never written into
+    // the returned `S3StoreConfig`.
     let mut best: Option<(usize, S3StoreConfig)> = None;
     let mut unique_bucket_cfg: Option<S3StoreConfig> = None;
     let mut bucket_conflict = false;
     for fs_info in &response.fs_infos {
-        let Some(cfg) = parse_s3_config_from_file_store_info(fs_info)? else {
+        let Some(record) = parse_s3_config_from_file_store_info(fs_info)? else {
             continue;
         };
-        if cfg.bucket != target_bucket {
+        if record.cfg.bucket != target_bucket {
             continue;
         }
         match unique_bucket_cfg.as_ref() {
-            None => unique_bucket_cfg = Some(cfg.clone()),
-            Some(existing) if existing == &cfg => {}
+            None => unique_bucket_cfg = Some(record.cfg.clone()),
+            Some(existing) if existing == &record.cfg => {}
             Some(_) => bucket_conflict = true,
         }
-        if !key_matches_root(&target_key, &cfg.root) {
+        if !key_matches_root(&target_key, &record.path_prefix) {
             continue;
         }
-        let score = cfg.root.len();
+        let score = record.path_prefix.len();
         match &best {
             Some((best_score, _)) if *best_score >= score => {}
-            _ => best = Some((score, cfg)),
+            _ => best = Some((score, record.cfg)),
         }
     }
     if let Some((_, cfg)) = best {
@@ -701,22 +723,23 @@ mod tests {
             .expect("s3 config");
         assert_eq!(cfg.endpoint, "http://127.0.0.1:9000");
         assert_eq!(cfg.bucket, "bucket");
-        assert_eq!(cfg.root, "lake/root");
         assert_eq!(cfg.access_key_id, "ak");
         assert_eq!(cfg.access_key_secret, "sk");
     }
 
     #[test]
     fn parse_s3_config_from_file_store_info_reads_staros_payload() {
-        let cfg = parse_s3_config_from_file_store_info(&sample_file_store_info())
+        let record = parse_s3_config_from_file_store_info(&sample_file_store_info())
             .expect("parse file store s3 config")
-            .expect("s3 config");
-        assert_eq!(cfg.endpoint, "http://127.0.0.1:9000");
-        assert_eq!(cfg.bucket, "bucket");
-        assert_eq!(cfg.root, "lake/root");
-        assert_eq!(cfg.access_key_id, "ak");
-        assert_eq!(cfg.access_key_secret, "sk");
-        assert_eq!(cfg.enable_path_style_access, Some(true));
+            .expect("file store record");
+        assert_eq!(record.cfg.endpoint, "http://127.0.0.1:9000");
+        assert_eq!(record.cfg.bucket, "bucket");
+        assert_eq!(record.cfg.access_key_id, "ak");
+        assert_eq!(record.cfg.access_key_secret, "sk");
+        assert_eq!(record.cfg.enable_path_style_access, Some(true));
+        // path_prefix is kept local to the file-store matching step and must
+        // not leak into the returned cluster-level S3StoreConfig.
+        assert_eq!(record.path_prefix, "lake/root");
     }
 
     #[test]

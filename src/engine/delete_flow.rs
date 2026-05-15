@@ -731,7 +731,7 @@ async fn scan_for_position_deletes_at(
         )?;
     }
 
-    Ok(by_file
+    by_file
         .into_iter()
         .map(|(referenced_data_file, positions)| {
             let partition = referenced_data_file_partitions
@@ -748,7 +748,7 @@ async fn scan_for_position_deletes_at(
                 positions,
             })
         })
-        .collect::<Result<Vec<_>, String>>()?)
+        .collect::<Result<Vec<_>, String>>()
 }
 
 async fn scan_for_position_deletes(

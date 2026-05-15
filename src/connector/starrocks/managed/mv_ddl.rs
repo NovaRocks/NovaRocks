@@ -1661,7 +1661,6 @@ mod tests {
             s3: S3StoreConfig {
                 endpoint: "http://127.0.0.1:9000".to_string(),
                 bucket: "test".to_string(),
-                root: "warehouse".to_string(),
                 access_key_id: "ak".to_string(),
                 access_key_secret: "sk".to_string(),
                 region: Some("us-east-1".to_string()),
@@ -1882,6 +1881,12 @@ mod tests {
 
     #[test]
     fn drop_managed_mv_preserves_repo_definition_when_legacy_drop_rejects() {
+        // `state_with_inflight_managed_mv` builds a real managed-lake
+        // catalog snapshot and `rebuild_from_repository` registers each
+        // tablet into the global shard registry via `register_tablet_runtime`.
+        // Hold the runtime-test mutex so this registration cannot race
+        // against parallel tests that consult or mutate the same registry.
+        let _runtime_guard = crate::connector::starrocks::lake::context::lock_runtime_test_state();
         let (state, _dir) = state_with_inflight_managed_mv();
         let mv_id = state
             .managed_lake

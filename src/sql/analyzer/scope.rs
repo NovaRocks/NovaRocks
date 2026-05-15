@@ -359,7 +359,7 @@ impl AnalyzerScope {
                 front.push(self.ordered.remove(pos));
             }
         }
-        front.extend(self.ordered.drain(..));
+        front.append(&mut self.ordered);
         self.ordered = front;
 
         // For `prefer_right`, also override the unqualified entry so that
@@ -370,7 +370,7 @@ impl AnalyzerScope {
                 .ordered
                 .iter()
                 .take(names_lower.len())
-                .map(|e| e.clone())
+                .cloned()
                 .collect::<Vec<_>>()
             {
                 self.unqualified.insert(name.to_lowercase(), (dt, nullable));

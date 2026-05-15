@@ -1012,7 +1012,6 @@ mod tests {
             s3: S3StoreConfig {
                 endpoint: "http://127.0.0.1:9000".to_string(),
                 bucket: "test".to_string(),
-                root: "warehouse".to_string(),
                 access_key_id: "ak".to_string(),
                 access_key_secret: "sk".to_string(),
                 region: Some("us-east-1".to_string()),
@@ -1080,7 +1079,6 @@ mod tests {
             s3: S3StoreConfig {
                 endpoint: "http://127.0.0.1:9000".to_string(),
                 bucket: "bucket".to_string(),
-                root: "warehouse".to_string(),
                 access_key_id: "ak".to_string(),
                 access_key_secret: "sk".to_string(),
                 region: Some("us-east-1".to_string()),

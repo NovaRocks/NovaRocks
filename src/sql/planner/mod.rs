@@ -1373,14 +1373,13 @@ fn plan_relation_scoped(
 }
 
 fn is_lateral_unnest_condition_supported(condition: &Option<TypedExpr>) -> bool {
-    match condition {
-        None => true,
-        Some(TypedExpr {
+    matches!(
+        condition,
+        None | Some(TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Bool(true)),
             ..
-        }) => true,
-        _ => false,
-    }
+        })
+    )
 }
 
 /// Lower an analyzer-built `IcebergMetadataScanRelation` into a regular

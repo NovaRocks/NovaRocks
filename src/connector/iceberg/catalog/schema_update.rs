@@ -1918,10 +1918,7 @@ pub(crate) fn find_field_by_path(
 #[allow(dead_code)]
 pub(crate) fn apply_drop_at(schema: &Schema, path: &ColumnPath) -> Result<Schema, String> {
     let identifier_field_ids: Vec<i32> = schema.identifier_field_ids().collect();
-    let new_fields = drop_in_fields(
-        schema.as_struct().fields().iter().cloned().collect(),
-        path.segments(),
-    )?;
+    let new_fields = drop_in_fields(schema.as_struct().fields().to_vec(), path.segments())?;
     let arc_fields: Vec<NestedFieldRef> = new_fields.into_iter().map(Arc::new).collect();
     Schema::builder()
         .with_fields(arc_fields)
@@ -1965,7 +1962,7 @@ fn drop_in_fields(
 fn drop_in_type(ty: &Type, segments: &[String]) -> Result<Type, String> {
     match ty {
         Type::Struct(s) => {
-            let new = drop_in_fields(s.fields().iter().cloned().collect(), segments)?;
+            let new = drop_in_fields(s.fields().to_vec(), segments)?;
             let arc_fields: Vec<NestedFieldRef> = new.into_iter().map(Arc::new).collect();
             Ok(Type::Struct(StructType::new(arc_fields)))
         }
@@ -1988,7 +1985,7 @@ pub(crate) fn apply_rename_at(
 ) -> Result<Schema, String> {
     let identifier_field_ids: Vec<i32> = schema.identifier_field_ids().collect();
     let new_fields = rename_in_fields(
-        schema.as_struct().fields().iter().cloned().collect(),
+        schema.as_struct().fields().to_vec(),
         path.segments(),
         new_name,
     )?;
@@ -2051,7 +2048,7 @@ fn rename_in_fields(
 fn rename_in_type(ty: &Type, segments: &[String], new_name: &str) -> Result<Type, String> {
     match ty {
         Type::Struct(s) => {
-            let new = rename_in_fields(s.fields().iter().cloned().collect(), segments, new_name)?;
+            let new = rename_in_fields(s.fields().to_vec(), segments, new_name)?;
             Ok(Type::Struct(StructType::new(
                 new.into_iter().map(Arc::new).collect(),
             )))
@@ -2076,7 +2073,7 @@ pub(crate) fn apply_modify_at(
 ) -> Result<Schema, String> {
     let identifier_field_ids: Vec<i32> = schema.identifier_field_ids().collect();
     let new_fields = modify_in_fields(
-        schema.as_struct().fields().iter().cloned().collect(),
+        schema.as_struct().fields().to_vec(),
         path.segments(),
         new_type,
     )?;
@@ -2130,7 +2127,7 @@ fn modify_in_type(ty: &Type, segments: &[String], new_type: &SqlType) -> Result<
         Type::Struct(s) => {
             // Re-enter modify_in_fields with the same segments: modify_in_fields will consume
             // `head` by matching it against the struct's child fields.
-            let new = modify_in_fields(s.fields().iter().cloned().collect(), segments, new_type)?;
+            let new = modify_in_fields(s.fields().to_vec(), segments, new_type)?;
             Ok(Type::Struct(StructType::new(
                 new.into_iter().map(Arc::new).collect(),
             )))
@@ -2193,7 +2190,7 @@ pub(crate) fn apply_set_nullable_at(
         }
     }
     let new_fields = set_nullable_in_fields(
-        schema.as_struct().fields().iter().cloned().collect(),
+        schema.as_struct().fields().to_vec(),
         path.segments(),
         nullable,
     )?;
@@ -2241,8 +2238,7 @@ fn set_nullable_in_fields(
 fn set_nullable_in_type(ty: &Type, segments: &[String], nullable: bool) -> Result<Type, String> {
     match ty {
         Type::Struct(s) => {
-            let new =
-                set_nullable_in_fields(s.fields().iter().cloned().collect(), segments, nullable)?;
+            let new = set_nullable_in_fields(s.fields().to_vec(), segments, nullable)?;
             Ok(Type::Struct(StructType::new(
                 new.into_iter().map(Arc::new).collect(),
             )))
@@ -2684,7 +2680,7 @@ pub(crate) fn apply_add_at(
     *last_column_id = next_nested_id - 1;
 
     let new_fields = add_in_fields(
-        schema.as_struct().fields().iter().cloned().collect(),
+        schema.as_struct().fields().to_vec(),
         parent.segments(),
         new_field,
         &position,
@@ -2755,12 +2751,7 @@ fn add_in_type(
 ) -> Result<Type, String> {
     match ty {
         Type::Struct(s) => {
-            let new = add_in_fields(
-                s.fields().iter().cloned().collect(),
-                parent_segments,
-                new_field,
-                position,
-            )?;
+            let new = add_in_fields(s.fields().to_vec(), parent_segments, new_field, position)?;
             Ok(Type::Struct(StructType::new(
                 new.into_iter().map(Arc::new).collect(),
             )))
@@ -2825,7 +2816,7 @@ pub(crate) fn apply_reorder_at(
 ) -> Result<Schema, String> {
     let identifier_field_ids: Vec<i32> = schema.identifier_field_ids().collect();
     let new_fields = reorder_in_fields(
-        schema.as_struct().fields().iter().cloned().collect(),
+        schema.as_struct().fields().to_vec(),
         path.segments(),
         position,
     )?;
@@ -2880,7 +2871,7 @@ fn reorder_in_fields(
 fn reorder_in_type(ty: &Type, segments: &[String], position: &AddPosition) -> Result<Type, String> {
     match ty {
         Type::Struct(s) => {
-            let new = reorder_in_fields(s.fields().iter().cloned().collect(), segments, position)?;
+            let new = reorder_in_fields(s.fields().to_vec(), segments, position)?;
             Ok(Type::Struct(StructType::new(
                 new.into_iter().map(Arc::new).collect(),
             )))

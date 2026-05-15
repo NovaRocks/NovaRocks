@@ -776,14 +776,8 @@ pub(crate) fn build_lake_properties(
                     Some(prev) => {
                         return Err(format!(
                             "inconsistent S3 config across tablets in one lake scan; \
-                            tablet_id={} endpoint={} bucket={} root={} conflicts with endpoint={} bucket={} root={}",
-                            tablet_id,
-                            s3_cfg.endpoint,
-                            s3_cfg.bucket,
-                            s3_cfg.root,
-                            prev.endpoint,
-                            prev.bucket,
-                            prev.root
+                            tablet_id={} endpoint={} bucket={} conflicts with endpoint={} bucket={}",
+                            tablet_id, s3_cfg.endpoint, s3_cfg.bucket, prev.endpoint, prev.bucket,
                         ));
                     }
                 }

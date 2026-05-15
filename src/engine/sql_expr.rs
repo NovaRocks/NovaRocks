@@ -514,7 +514,7 @@ fn array_map_cast_string_lambda_matches(args: &[&sqlparser::ast::Expr]) -> Resul
     let Some((param_name, body)) = parse_single_arrow_lambda(args[0]) else {
         return Ok(false);
     };
-    Ok(lambda_body_casts_param_to_string(body, &param_name)?)
+    lambda_body_casts_param_to_string(body, &param_name)
 }
 
 fn parse_single_arrow_lambda(

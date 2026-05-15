@@ -163,7 +163,6 @@ fn normalize_s3_config(cfg: &S3StoreConfig) -> Result<S3StoreConfig, String> {
     Ok(S3StoreConfig {
         endpoint: endpoint.to_string(),
         bucket: bucket.to_string(),
-        root: cfg.root.trim_matches('/').to_string(),
         access_key_id: access_key_id.to_string(),
         access_key_secret: access_key_secret.to_string(),
         region: cfg

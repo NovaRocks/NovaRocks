@@ -2795,9 +2795,7 @@ fn starrocks_type_name(dt: &DataType) -> String {
         DataType::Float32 => "float".to_string(),
         DataType::Float64 => "double".to_string(),
         DataType::Decimal128(p, s) => format!("decimal128({}, {})", p, s),
-        DataType::FixedSizeBinary(w)
-            if *w == crate::common::largeint::LARGEINT_BYTE_WIDTH as i32 =>
-        {
+        DataType::FixedSizeBinary(w) if *w == crate::common::largeint::LARGEINT_BYTE_WIDTH => {
             "largeint".to_string()
         }
         DataType::Utf8 | DataType::LargeUtf8 => "varchar".to_string(),

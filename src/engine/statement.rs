@@ -2343,11 +2343,9 @@ pub(crate) fn looks_like_alter_partition_column(sql: &str) -> bool {
         return false;
     }
 
-    let is_partition_action = (parser.parse_keyword(Keyword::ADD)
-        || parser.parse_keyword(Keyword::DROP))
+    (parser.parse_keyword(Keyword::ADD) || parser.parse_keyword(Keyword::DROP))
         && parser.parse_keyword(Keyword::PARTITION)
-        && peek_token_word_eq(&parser, "COLUMN");
-    is_partition_action
+        && peek_token_word_eq(&parser, "COLUMN")
 }
 
 pub(crate) fn parse_alter_partition_column_sql(

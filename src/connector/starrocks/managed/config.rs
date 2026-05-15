@@ -20,7 +20,11 @@ impl ManagedLakeConfig {
         if warehouse_uri.is_empty() {
             return Err("standalone managed lake warehouse_uri is empty".to_string());
         }
-        let (bucket, root) = parse_s3_path(&warehouse_uri)?;
+        // Only the bucket is extracted into the cluster-level S3 profile.
+        // The warehouse path component lives in `warehouse_uri` and is
+        // reused by `tablet_root_path` to mint absolute tablet URIs; the
+        // OpenDAL operator never depends on it as a builder root.
+        let (bucket, _warehouse_path) = parse_s3_path(&warehouse_uri)?;
         let mv_default_storage_engine = config
             .mv_default_storage_engine
             .as_deref()
@@ -38,7 +42,6 @@ impl ManagedLakeConfig {
             s3: S3StoreConfig {
                 endpoint: config.endpoint.trim().to_string(),
                 bucket,
-                root: root.trim_matches('/').to_string(),
                 access_key_id: config.access_key_id.trim().to_string(),
                 access_key_secret: config.access_key_secret.trim().to_string(),
                 region: config.region.as_ref().map(|value| value.trim().to_string()),

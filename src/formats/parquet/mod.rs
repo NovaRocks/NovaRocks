@@ -1527,15 +1527,13 @@ fn build_iceberg_root_projection_indices(
             });
             if field_id_match.is_some() || root_has_field_ids {
                 field_id_match
+            } else if case_sensitive {
+                arrow_schema.index_of(target.name()).ok()
             } else {
-                if case_sensitive {
-                    arrow_schema.index_of(target.name()).ok()
-                } else {
-                    arrow_schema
-                        .fields()
-                        .iter()
-                        .position(|field| field.name().eq_ignore_ascii_case(target.name()))
-                }
+                arrow_schema
+                    .fields()
+                    .iter()
+                    .position(|field| field.name().eq_ignore_ascii_case(target.name()))
             }
         } else if case_sensitive {
             arrow_schema.index_of(target.name()).ok()

@@ -2103,7 +2103,7 @@ fn collect_column_refs(expr: &TypedExpr, out: &mut Vec<(Option<String>, String)>
                 qualifier.as_ref().map(|q| q.to_lowercase()),
                 column.to_lowercase(),
             );
-            if !out.iter().any(|x| *x == entry) {
+            if !out.contains(&entry) {
                 out.push(entry);
             }
         }

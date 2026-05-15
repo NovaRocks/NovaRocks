@@ -304,6 +304,13 @@ pub(crate) struct MaterializedChanges {
 /// single snapshot in the lineage. `Replace` snapshots are validated by
 /// `classify_snapshot` itself and never produce a `LineageAction` —
 /// they're silently absorbed once the validator passes.
+//
+// The `Collect*` prefix is intentional: each variant pairs a verb
+// ("collect from this snapshot") with a noun describing what to collect.
+// Renaming the variants to drop the prefix would make the call sites
+// ambiguous (e.g. `LineageAction::Inserts` reads like a value rather than
+// a unit of work). Suppress the corresponding clippy lint instead.
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum LineageAction {
     /// Walk the snapshot's data manifests, collect entries with

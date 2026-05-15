@@ -1386,7 +1386,6 @@ mod tests {
             s3: S3StoreConfig {
                 endpoint: "http://127.0.0.1:9000".to_string(),
                 bucket: "test".to_string(),
-                root: "warehouse".to_string(),
                 access_key_id: "ak".to_string(),
                 access_key_secret: "sk".to_string(),
                 region: Some("us-east-1".to_string()),
@@ -1859,6 +1858,10 @@ mod tests {
 
     #[test]
     fn drop_managed_table_removes_catalog_entry_and_marks_metadata_dropping() {
+        // `seeded_state` registers managed tablets into the global shard
+        // registry via `register_tablet_runtime`. Serialize with other tests
+        // that read/write the same registry to avoid clobbering each other.
+        let _runtime_guard = crate::connector::starrocks::lake::context::lock_runtime_test_state();
         let (_dir, state) = seeded_state();
 
         drop_managed_table(&state, DEFAULT_DATABASE, "orders").expect("drop managed table");
@@ -1916,6 +1919,9 @@ mod tests {
 
     #[test]
     fn truncate_managed_table_replaces_active_partition_and_updates_catalog_layout() {
+        // See drop_managed_table_removes_catalog_entry_and_marks_metadata_dropping
+        // for why we hold the runtime-test lock here.
+        let _runtime_guard = crate::connector::starrocks::lake::context::lock_runtime_test_state();
         let (_dir, state) = seeded_state();
 
         truncate_managed_table_with_hooks(

@@ -632,7 +632,7 @@ fn validate_cow_update_inputs(
             }
         }
     }
-    for row_id in updated_row_ids.difference(&rewrite_row_ids) {
+    if let Some(row_id) = updated_row_ids.difference(&rewrite_row_ids).next() {
         return Err(format!(
             "CowUpdateCommit rewrite updated_row_ids contains row id {row_id}, but touched files are missing touched row id {row_id}"
         ));

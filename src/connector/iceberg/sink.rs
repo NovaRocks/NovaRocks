@@ -871,7 +871,11 @@ fn resolve_sink_s3_config(
     sink: &data_sinks::TIcebergTableSink,
     data_location: &str,
 ) -> Result<Option<S3StoreConfig>, String> {
-    let Some((bucket, root)) = parse_object_store_bucket_and_root(data_location) else {
+    // The bucket is the only part of `data_location` we put on the
+    // cluster-level S3 profile; the warehouse/table prefix stays in the
+    // data file path passed to `normalize_oss_path`, which derives the
+    // bucket-relative key directly.
+    let Some((bucket, _data_root)) = parse_object_store_bucket_and_root(data_location) else {
         return Ok(None);
     };
     let cloud = sink.cloud_configuration.as_ref().ok_or_else(|| {
@@ -922,7 +926,6 @@ fn resolve_sink_s3_config(
     Ok(Some(S3StoreConfig {
         endpoint,
         bucket,
-        root,
         access_key_id,
         access_key_secret,
         region,
