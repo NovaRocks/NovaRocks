@@ -1631,8 +1631,8 @@ fn build_iceberg_schema(
                 NestedField::required(field_id, &column.name, iceberg_type)
             };
             // Persist DEFAULT literal for v3; reject non-NULL defaults on v1/v2.
-            if let Some(default_literal) = &column.default {
-                if let Some(iceberg_lit) =
+            if let Some(default_literal) = &column.default
+                && let Some(iceberg_lit) =
                     crate::connector::iceberg::default_value::default_literal_to_iceberg(
                         default_literal,
                         &column.data_type,
@@ -1646,7 +1646,6 @@ fn build_iceberg_schema(
                         .with_initial_default(iceberg_lit.clone())
                         .with_write_default(iceberg_lit);
                 }
-            }
             Ok(field.into())
         })
         .collect::<Result<Vec<_>, String>>()?;

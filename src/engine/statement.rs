@@ -1437,16 +1437,14 @@ pub(crate) fn parse_alter_table_rewrite_manifests_sql(
     // Reject branch / tag suffix per spec §1.1.
     // Rule: the LAST part starts with `branch_` or `tag_` AND there are ≥ 2 parts.
     // (A single-part table named `branch_x` is a legitimate table name, not a suffix.)
-    if table.parts.len() >= 2 {
-        if let Some(last) = table.parts.last() {
-            if last.starts_with("branch_") || last.starts_with("tag_") {
+    if table.parts.len() >= 2
+        && let Some(last) = table.parts.last()
+            && (last.starts_with("branch_") || last.starts_with("tag_")) {
                 return Err(format!(
                     "REWRITE MANIFESTS does not support branch/tag suffix on table name: {}",
                     table.parts.join(".")
                 ));
             }
-        }
-    }
 
     expect_word(&mut parser, "REWRITE")?;
     expect_word(&mut parser, "MANIFESTS")?;
@@ -1511,16 +1509,14 @@ pub(crate) fn parse_alter_table_expire_snapshots_sql(
 
     // Reject branch / tag suffix per spec §1.1.
     // Rule: the LAST part starts with `branch_` or `tag_` AND there are ≥ 2 parts.
-    if table.parts.len() >= 2 {
-        if let Some(last) = table.parts.last() {
-            if last.starts_with("branch_") || last.starts_with("tag_") {
+    if table.parts.len() >= 2
+        && let Some(last) = table.parts.last()
+            && (last.starts_with("branch_") || last.starts_with("tag_")) {
                 return Err(format!(
                     "EXPIRE SNAPSHOTS does not support branch/tag suffix on table name: {}",
                     table.parts.join(".")
                 ));
             }
-        }
-    }
 
     expect_word(&mut parser, "EXPIRE")?;
     expect_word(&mut parser, "SNAPSHOTS")?;
@@ -1669,16 +1665,14 @@ pub(crate) fn parse_alter_table_remove_orphan_files_sql(
         .collect::<Result<Vec<_>, _>>()?;
 
     // Reject branch / tag suffix per spec §1.1.
-    if table.parts.len() >= 2 {
-        if let Some(last) = table.parts.last() {
-            if last.starts_with("branch_") || last.starts_with("tag_") {
+    if table.parts.len() >= 2
+        && let Some(last) = table.parts.last()
+            && (last.starts_with("branch_") || last.starts_with("tag_")) {
                 return Err(format!(
                     "REMOVE ORPHAN FILES does not support branch/tag suffix on table name: {}",
                     table.parts.join(".")
                 ));
             }
-        }
-    }
 
     expect_word(&mut parser, "REMOVE")?;
     expect_word(&mut parser, "ORPHAN")?;

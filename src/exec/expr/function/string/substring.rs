@@ -158,18 +158,15 @@ pub fn eval_substring(
     let mut start_values = start_values;
     let mut length_values = length_values;
     for i in 0..len {
-        if let Some(v) = start_values[i] {
-            if i32::try_from(v).is_err() {
+        if let Some(v) = start_values[i]
+            && i32::try_from(v).is_err() {
                 start_values[i] = None;
             }
-        }
-        if user_supplied_length {
-            if let Some(v) = length_values[i] {
-                if i32::try_from(v).is_err() {
+        if user_supplied_length
+            && let Some(v) = length_values[i]
+                && i32::try_from(v).is_err() {
                     length_values[i] = None;
                 }
-            }
-        }
     }
 
     // Process each row

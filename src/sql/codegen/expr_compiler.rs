@@ -1139,11 +1139,10 @@ impl<'a> ExprCompiler<'a> {
         // overflow INT (i32); column overflow is handled per-row at runtime.
         if matches!(name, "substr" | "substring") {
             for arg in args.iter().skip(1) {
-                if let Some(v) = constant_i64_value(arg) {
-                    if i32::try_from(v).is_err() {
+                if let Some(v) = constant_i64_value(arg)
+                    && i32::try_from(v).is_err() {
                         return Err(format!("Cast argument {} to int type failed", v));
                     }
-                }
             }
         }
 

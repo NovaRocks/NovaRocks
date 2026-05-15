@@ -570,8 +570,8 @@ fn rewrite_inline_null_treatment(sql: &str) -> String {
             // Only attempt the keyword match at a word boundary so we don't
             // collide with identifiers like `IGNORED_NULLS`.
             let prev = idx.checked_sub(1).map(|p| bytes[p]);
-            if !is_identifier_byte(prev) {
-                if let Some((treatment, consumed)) = match_inline_null_treatment(bytes, idx) {
+            if !is_identifier_byte(prev)
+                && let Some((treatment, consumed)) = match_inline_null_treatment(bytes, idx) {
                     if let Some(slot) = pending_at_depth.last_mut()
                         && slot.is_none()
                     {
@@ -580,7 +580,6 @@ fn rewrite_inline_null_treatment(sql: &str) -> String {
                     idx += consumed;
                     continue;
                 }
-            }
         }
 
         output.push(byte as char);

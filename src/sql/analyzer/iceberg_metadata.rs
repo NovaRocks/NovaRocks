@@ -11,16 +11,13 @@ use crate::connector::iceberg::IcebergMetadataTableType;
 /// matches `__nr_meta_<type>__`, return the parts with the suffix stripped
 /// plus the parsed metadata-table type.
 pub fn split_metadata_suffix(parts: &[String]) -> (Vec<String>, Option<IcebergMetadataTableType>) {
-    if let Some(last) = parts.last() {
-        if let Some(inner) = last
+    if let Some(last) = parts.last()
+        && let Some(inner) = last
             .strip_prefix("__nr_meta_")
             .and_then(|s| s.strip_suffix("__"))
-        {
-            if let Ok(ty) = IcebergMetadataTableType::parse(inner) {
+            && let Ok(ty) = IcebergMetadataTableType::parse(inner) {
                 return (parts[..parts.len() - 1].to_vec(), Some(ty));
             }
-        }
-    }
     (parts.to_vec(), None)
 }
 

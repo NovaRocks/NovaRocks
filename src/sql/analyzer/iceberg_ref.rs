@@ -34,22 +34,20 @@ pub enum IcebergRefSuffix {
 /// Otherwise return `(original_parts, None)` unchanged.
 pub fn split_ref_suffix(parts: &[String]) -> (Vec<String>, Option<IcebergRefSuffix>) {
     if let Some(last) = parts.last() {
-        if let Some(name) = last.strip_prefix("branch_") {
-            if !name.is_empty() {
+        if let Some(name) = last.strip_prefix("branch_")
+            && !name.is_empty() {
                 return (
                     parts[..parts.len() - 1].to_vec(),
                     Some(IcebergRefSuffix::Branch(name.to_string())),
                 );
             }
-        }
-        if let Some(name) = last.strip_prefix("tag_") {
-            if !name.is_empty() {
+        if let Some(name) = last.strip_prefix("tag_")
+            && !name.is_empty() {
                 return (
                     parts[..parts.len() - 1].to_vec(),
                     Some(IcebergRefSuffix::Tag(name.to_string())),
                 );
             }
-        }
     }
     (parts.to_vec(), None)
 }
@@ -156,9 +154,9 @@ pub fn resolve_read_binding(
             // can parse.  Branch/tag names are routed here because sqlparser 0.61 only
             // accepts numeric literals for `VERSION AS OF`, so the normalizer encodes
             // `VERSION AS OF 'branch'` as `SYSTEM_TIME AS OF '__nr_ref:branch'`.
-            if let sqlparser::ast::Expr::Value(v) = expr {
-                if let sqlparser::ast::Value::SingleQuotedString(s) = &v.value {
-                    if let Some(ref_name) = s.strip_prefix("__nr_ref:") {
+            if let sqlparser::ast::Expr::Value(v) = expr
+                && let sqlparser::ast::Value::SingleQuotedString(s) = &v.value
+                    && let Some(ref_name) = s.strip_prefix("__nr_ref:") {
                         let refs = metadata.refs();
                         let entry = refs.get(ref_name).ok_or_else(|| {
                             format!(
@@ -177,8 +175,6 @@ pub fn resolve_read_binding(
                             ref_kind: Some(ref_kind),
                         });
                     }
-                }
-            }
             let ts_ms = resolve_timestamp_expr(expr, fully_qualified_name)?;
             find_snapshot_at_or_before(metadata, ts_ms, fully_qualified_name)
         }

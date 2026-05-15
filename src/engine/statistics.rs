@@ -135,11 +135,10 @@ pub(crate) fn try_handle_statement(
         handle_analyze_statement(state, trimmed, current_database)?;
         return Ok(Some(StatementResult::Query(ok_result()?)));
     }
-    if lower.starts_with("explain costs ") {
-        if let Some(result) = try_explain_costs(state, trimmed, current_database)? {
+    if lower.starts_with("explain costs ")
+        && let Some(result) = try_explain_costs(state, trimmed, current_database)? {
             return Ok(Some(StatementResult::Query(result)));
         }
-    }
     Ok(None)
 }
 
@@ -903,7 +902,7 @@ fn observe_sales_data_insert(
     state: &Arc<StandaloneState>,
     key: &TableKey,
     enabled: bool,
-    overwrite_mode: OverwriteMode,
+    _overwrite_mode: OverwriteMode,
 ) -> Result<(), String> {
     let existing = filtered_column_stats_by_key(state, key).len();
     if existing == 0 {
@@ -1345,11 +1344,10 @@ fn collect_usage_from_expr(
     use sqlparser::ast::{BinaryOperator, Expr};
     match expr {
         Expr::Identifier(ident) => {
-            if aliases.len() == 1 {
-                if let Some(key) = aliases.values().next() {
+            if aliases.len() == 1
+                && let Some(key) = aliases.values().next() {
                     mark_usage(state, key, &ident.value, usage)?;
                 }
-            }
         }
         Expr::CompoundIdentifier(parts) => {
             if parts.len() >= 2 {

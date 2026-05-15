@@ -1253,11 +1253,10 @@ pub(crate) fn execute_merge_statement(
     // requirement up front instead of letting the executor surface it.
     let _ = select_iceberg_update_mode(&table)?;
 
-    if let Some(clause) = stmt.matched.as_ref() {
-        if let MergeMatchedAction::Update { assignments } = &clause.action {
+    if let Some(clause) = stmt.matched.as_ref()
+        && let MergeMatchedAction::Update { assignments } = &clause.action {
             validate_update_assignments(assignments, &target_columns, &partition_columns)?;
         }
-    }
     let insert_columns_resolved = if let Some(clause) = stmt.not_matched.as_ref() {
         Some(resolve_merge_insert_columns(
             &clause.action,

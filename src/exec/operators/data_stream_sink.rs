@@ -1119,6 +1119,7 @@ struct PendingPayload {
     encode_ns: u128,
     sequence: i64,
     eos: bool,
+    contains_wire_meta: bool,
     accounting: Option<TrackedBytes>,
 }
 
@@ -1571,6 +1572,22 @@ impl DataStreamSinkOperator {
         Ok(PayloadEnqueue::Enqueued)
     }
 
+    fn mark_wire_meta_sent_if_needed(
+        &mut self,
+        dest_idx: usize,
+        contains_wire_meta: bool,
+    ) -> Result<(), String> {
+        if !contains_wire_meta {
+            return Ok(());
+        }
+        let sent = self
+            .wire_meta_sent_per_dest
+            .get_mut(dest_idx)
+            .ok_or_else(|| "wire meta marker index out of range".to_string())?;
+        *sent = true;
+        Ok(())
+    }
+
     fn transmit_partition(
         &mut self,
         dest_idx: usize,
@@ -1619,15 +1636,13 @@ impl DataStreamSinkOperator {
                 .get(dest_idx)
                 .copied()
                 .unwrap_or(false);
+        let contains_wire_meta = include_slot_ids;
         let encode_start = std::time::Instant::now();
         let payload = exchange::encode_chunks(chunks, include_slot_ids)
             .map_err(|e| format!("failed to encode chunks: {e}"))?;
         let encode_ns = encode_start.elapsed().as_nanos();
         let payload_bytes = payload.len();
         let payload_capacity_bytes = payload.capacity().max(payload_bytes);
-        if include_slot_ids && let Some(sent) = self.wire_meta_sent_per_dest.get_mut(dest_idx) {
-            *sent = true;
-        }
 
         if let Some(profile) = self.profiles.as_ref() {
             profile.common.counter_add(
@@ -1652,11 +1667,13 @@ impl DataStreamSinkOperator {
             encode_ns,
             sequence,
             eos,
+            contains_wire_meta,
             accounting,
         };
 
         match self.try_enqueue_payload(dest, payload, allow_overflow)? {
             PayloadEnqueue::Enqueued => {
+                self.mark_wire_meta_sent_if_needed(dest_idx, contains_wire_meta)?;
                 debug!(
                     "DataStreamSink::transmit_partition enqueued: dest_finst={} node_id={} eos={} seq={} bytes={}",
                     dest_finst_id, self.sink.dest_node_id, eos, sequence, payload_bytes
@@ -1760,8 +1777,11 @@ impl DataStreamSinkOperator {
                 .ok_or_else(|| "pending payload index out of range".to_string())?
                 .take();
             if let Some(payload) = pending_payload {
+                let contains_wire_meta = payload.contains_wire_meta;
                 match self.try_enqueue_payload(dest, payload, allow_overflow)? {
-                    PayloadEnqueue::Enqueued => {}
+                    PayloadEnqueue::Enqueued => {
+                        self.mark_wire_meta_sent_if_needed(i, contains_wire_meta)?;
+                    }
                     PayloadEnqueue::NoCapacity(payload) => {
                         self.pending_payloads_per_dest[i] = Some(payload);
                         return Ok(());
@@ -2132,6 +2152,31 @@ mod tests {
         assert!(op.has_pending_data());
         assert!(!op.should_flush_pending_dest(0, false));
         assert!(op.should_flush_pending_dest(0, true));
+    }
+
+    #[test]
+    fn queued_wire_meta_payload_marks_sent_only_after_enqueue_confirmation() {
+        let mut op = make_test_operator();
+        op.wire_meta_sent_per_dest = vec![false];
+        op.pending_payloads_per_dest = vec![Some(PendingPayload {
+            payload: vec![1],
+            payload_bytes: 1,
+            encode_ns: 0,
+            sequence: 0,
+            eos: false,
+            contains_wire_meta: true,
+            accounting: None,
+        })];
+
+        assert!(!op.wire_meta_sent_per_dest[0]);
+        let payload = op.pending_payloads_per_dest[0]
+            .take()
+            .expect("pending payload should exist");
+        assert!(payload.contains_wire_meta);
+
+        op.mark_wire_meta_sent_if_needed(0, payload.contains_wire_meta)
+            .expect("mark sent");
+        assert!(op.wire_meta_sent_per_dest[0]);
     }
 
     #[test]

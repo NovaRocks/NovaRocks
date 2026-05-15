@@ -326,7 +326,7 @@ impl<'a> AnalyzerContext<'a> {
     fn rewrite_join_on_exists_correlated(
         &self,
         join: &mut JoinRelation,
-        scope: &mut AnalyzerScope,
+        _scope: &mut AnalyzerScope,
         sq_info: &SubqueryInfo,
         resolved_sub: ResolvedQuery,
         sq_alias: String,
@@ -348,7 +348,7 @@ impl<'a> AnalyzerContext<'a> {
             .ok_or("correlated EXISTS subquery must have a FROM clause".to_string())?;
 
         let side = match sub_filter.as_ref() {
-            Some(f) => choose_aux_join_side(join, &[f.clone()]),
+            Some(f) => choose_aux_join_side(join, std::slice::from_ref(f)),
             None => AuxJoinSide::Left,
         };
         attach_aux_join(join, side, sub_rel, sub_filter);
@@ -2000,11 +2000,10 @@ fn expr_contains_placeholder(expr: &TypedExpr, placeholder_id: usize) -> bool {
             when_then,
             else_expr,
         } => {
-            if let Some(op) = operand {
-                if expr_contains_placeholder(op, placeholder_id) {
+            if let Some(op) = operand
+                && expr_contains_placeholder(op, placeholder_id) {
                     return true;
                 }
-            }
             for (when, then) in when_then {
                 if expr_contains_placeholder(when, placeholder_id)
                     || expr_contains_placeholder(then, placeholder_id)
@@ -2012,11 +2011,10 @@ fn expr_contains_placeholder(expr: &TypedExpr, placeholder_id: usize) -> bool {
                     return true;
                 }
             }
-            if let Some(else_) = else_expr {
-                if expr_contains_placeholder(else_, placeholder_id) {
+            if let Some(else_) = else_expr
+                && expr_contains_placeholder(else_, placeholder_id) {
                     return true;
                 }
-            }
             false
         }
         _ => false,

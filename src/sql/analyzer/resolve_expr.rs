@@ -1248,8 +1248,8 @@ impl<'a> super::AnalyzerContext<'a> {
                 let mut rewritten: Vec<sqlast::Expr> = Vec::with_capacity(arg_exprs.len() + 1);
                 for (idx, e) in arg_exprs.iter().enumerate() {
                     // Position 1 is the interval; expand it into value + unit.
-                    if idx == 1 {
-                        if let sqlast::Expr::Interval(interval) = e {
+                    if idx == 1
+                        && let sqlast::Expr::Interval(interval) = e {
                             // StarRocks rejects non-integer constant
                             // intervals at planning time; mirror that error
                             // here rather than silently producing NULL.
@@ -1270,7 +1270,6 @@ impl<'a> super::AnalyzerContext<'a> {
                             }));
                             continue;
                         }
-                    }
                     let token = match e {
                         sqlast::Expr::Identifier(ident) => Some(ident.value.to_ascii_lowercase()),
                         sqlast::Expr::CompoundIdentifier(parts) if parts.len() == 1 => {

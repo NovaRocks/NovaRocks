@@ -2668,15 +2668,14 @@ pub(crate) fn apply_add_at(
         &mut next_nested_id,
     )?;
     let mut new_field = NestedField::optional(new_id, name, new_ty);
-    if let Some(lit) = default {
-        if let Some(iceberg_lit) =
+    if let Some(lit) = default
+        && let Some(iceberg_lit) =
             crate::connector::iceberg::default_value::default_literal_to_iceberg(lit, data_type)?
         {
             new_field = new_field
                 .with_initial_default(iceberg_lit.clone())
                 .with_write_default(iceberg_lit);
         }
-    }
     *last_column_id = next_nested_id - 1;
 
     let new_fields = add_in_fields(
@@ -3387,8 +3386,8 @@ fn validate_unset_keys_present(
     op: &PropertiesOp,
     existing: &std::collections::HashMap<String, String>,
 ) -> Result<(), String> {
-    if let PropertiesOp::Unset { keys, if_exists } = op {
-        if !*if_exists {
+    if let PropertiesOp::Unset { keys, if_exists } = op
+        && !*if_exists {
             for k in keys {
                 if !existing.contains_key(k) {
                     return Err(format!(
@@ -3397,7 +3396,6 @@ fn validate_unset_keys_present(
                 }
             }
         }
-    }
     Ok(())
 }
 

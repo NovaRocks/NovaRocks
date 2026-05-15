@@ -178,7 +178,7 @@ impl<'a> super::AnalyzerContext<'a> {
                             for (col, l_q, r_q) in &quals {
                                 current_scope
                                     .register_full_outer_using_coalesce(
-                                        &[col.clone()],
+                                        std::slice::from_ref(col),
                                         l_q,
                                         r_q,
                                     );
@@ -270,13 +270,12 @@ impl<'a> super::AnalyzerContext<'a> {
                 let (base_parts, metadata_suffix) = split_metadata_suffix(&parts);
                 if let Some(metadata_ty) = metadata_suffix {
                     // Reject branch/tag combo: `t.branch_dev$snapshots` is meaningless.
-                    if let Some(last) = base_parts.last() {
-                        if last.starts_with("branch_") || last.starts_with("tag_") {
+                    if let Some(last) = base_parts.last()
+                        && (last.starts_with("branch_") || last.starts_with("tag_")) {
                             return Err(format!(
                                 "iceberg metadata table cannot be combined with branch/tag suffix: {parts:?}"
                             ));
                         }
-                    }
 
                     let (db_lower, tbl_lower) = match base_parts.as_slice() {
                         [tbl] => (self.current_database.to_lowercase(), tbl.to_lowercase()),

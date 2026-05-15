@@ -96,6 +96,7 @@ fn no_matching_signature(name: &str, arg_types: &[DataType]) -> String {
     )
 }
 
+#[cfg(test)]
 pub(super) fn validate_scalar_function_call(
     name: &str,
     arg_types: &[DataType],
