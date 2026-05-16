@@ -781,31 +781,6 @@ fn rewrite_full_refresh_select_with_pin(
     Ok(stmt.to_string())
 }
 
-fn resolve_pinned_base_schema(
-    base_ref: &IcebergTableRef,
-    table: &iceberg::table::Table,
-    pinned_snapshot_id: Option<i64>,
-) -> Result<Arc<iceberg::spec::Schema>, String> {
-    let snapshot_id = pinned_snapshot_id.ok_or_else(|| {
-        format!(
-            "refresh pin missing snapshot for base {} after non-empty base probe",
-            base_ref.fqn()
-        )
-    })?;
-    let snapshot = table.metadata().snapshot_by_id(snapshot_id).ok_or_else(|| {
-        format!(
-            "refresh pin snapshot {snapshot_id} for base {} is missing from post-pin loaded table metadata",
-            base_ref.fqn()
-        )
-    })?;
-    snapshot.schema(table.metadata()).map_err(|e| {
-        format!(
-            "refresh pin snapshot {snapshot_id} for base {} has unresolvable schema: {e}",
-            base_ref.fqn()
-        )
-    })
-}
-
 /// Refresh an iceberg-backed materialized view.
 ///
 /// Strategy dispatch:
@@ -927,42 +902,40 @@ pub(crate) fn refresh_iceberg_mv(
         })?
         .to_string();
     let loaded = load_current_iceberg_base_table(state, base_ref)?;
-    let pinned_base_schema =
-        resolve_pinned_base_schema(base_ref, &loaded.table, current_snapshot_id)?;
 
     // A11 contract guard. Validate the full base ↔ output ↔ target
     // contract after the refresh pin is captured and the base table is
-    // reloaded. validate_schema_contract subsumes the earlier
+    // reloaded. Use the current table schema, not the pinned data snapshot's
+    // schema: Iceberg schema evolution can be metadata-only and leave the
+    // current snapshot id unchanged. validate_schema_contract subsumes the earlier
     // ensure_base_row_lineage_contract check (it already enforces v3 +
     // row-lineage).
-    let effective_definition =
-        match crate::engine::mv::schema_contract::validate_schema_contract_with_base_schema(
-            schema_contract,
-            &loaded.table,
-            pinned_base_schema.as_ref(),
-            &target_loaded.table,
-        ) {
-            crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
-                return Err(format!("{err}"));
-            }
-            crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
-                rebound_columns,
-            } => {
-                tracing::info!(
-                    target = ?target,
-                    rebound = ?rebound_columns,
-                    "iceberg MV refresh: base columns rebound by field id; rewriting select_sql",
-                );
-                let rewritten_sql =
-                    rewrite_select_sql_for_rebind(&mv_definition.select_sql, &rebound_columns)?;
-                let mut def = mv_definition.clone();
-                def.select_sql = rewritten_sql;
-                def
-            }
-            crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe => {
-                mv_definition.clone()
-            }
-        };
+    let effective_definition = match crate::engine::mv::schema_contract::validate_schema_contract(
+        schema_contract,
+        &loaded.table,
+        &target_loaded.table,
+    ) {
+        crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
+            return Err(format!("{err}"));
+        }
+        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
+            rebound_columns,
+        } => {
+            tracing::info!(
+                target = ?target,
+                rebound = ?rebound_columns,
+                "iceberg MV refresh: base columns rebound by field id; rewriting select_sql",
+            );
+            let rewritten_sql =
+                rewrite_select_sql_for_rebind(&mv_definition.select_sql, &rebound_columns)?;
+            let mut def = mv_definition.clone();
+            def.select_sql = rewritten_sql;
+            def
+        }
+        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe => {
+            mv_definition.clone()
+        }
+    };
     let mv_definition = &effective_definition;
     let pinned_full_select_sql =
         rewrite_full_refresh_select_with_pin(&mv_definition.select_sql, &pin, base_ref)?;
@@ -1296,13 +1269,9 @@ pub(crate) fn plan_iceberg_mv_refresh(
     .map_err(RefreshError::user)?;
     let current_snapshot_id = pin.get(base_ref);
     let loaded = load_current_iceberg_base_table(state, base_ref).map_err(RefreshError::user)?;
-    let pinned_base_schema =
-        resolve_pinned_base_schema(base_ref, &loaded.table, current_snapshot_id)
-            .map_err(RefreshError::user)?;
-    match crate::engine::mv::schema_contract::validate_schema_contract_with_base_schema(
+    match crate::engine::mv::schema_contract::validate_schema_contract(
         schema_contract,
         &loaded.table,
-        pinned_base_schema.as_ref(),
         &target_loaded.table,
     ) {
         crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
