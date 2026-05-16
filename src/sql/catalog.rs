@@ -81,6 +81,13 @@ pub struct IcebergSchemaFieldDef {
     pub name: String,
     pub initial_default: Option<iceberg::spec::Literal>,
     pub write_default: Option<iceberg::spec::Literal>,
+    /// Spec-compliant JSON encoding of `initial_default` precomputed at the
+    /// point of construction where the iceberg `Type` is still available.
+    /// Necessary because `iceberg::spec::Literal::Int128` carries no scale,
+    /// so decimal defaults cannot be serialised correctly from the literal
+    /// alone in `descriptors::to_thrift_iceberg_schema_field`.
+    /// `None` falls back to the type-blind serializer.
+    pub initial_default_json: Option<String>,
     pub children: Vec<IcebergSchemaFieldDef>,
 }
 
@@ -260,11 +267,13 @@ mod tests {
                         name: "order_id".to_string(),
                         initial_default: None,
                         write_default: None,
+                        initial_default_json: None,
                         children: vec![IcebergSchemaFieldDef {
                             field_id: 11,
                             name: "nested".to_string(),
                             initial_default: None,
                             write_default: None,
+                            initial_default_json: None,
                             children: vec![],
                         }],
                     }],

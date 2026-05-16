@@ -1,0 +1,2 @@
+id	c_bool	c_tinyint	c_smallint	c_int	c_bigint	c_float	c_double	c_decimal	c_string	c_date	c_datetime
+1	1	1	2	3	4	1.5	2.25	3.14	hi	1970-01-02	1970-01-01 00:00:01

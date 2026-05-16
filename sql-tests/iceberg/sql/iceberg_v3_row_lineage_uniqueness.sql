@@ -49,7 +49,7 @@ ALTER TABLE uniq_${uuid0}.ns_${uuid0}.uniq CREATE TAG t3;
 -- query 5
 -- @skip_result_check=true
 -- @wait_alter_optimize=uniq
--- @db=ns_${uuid0}
+-- @db=uniq_${uuid0}.ns_${uuid0}
 ALTER TABLE uniq OPTIMIZE;
 
 -- query 6
@@ -61,7 +61,7 @@ ALTER TABLE uniq_${uuid0}.ns_${uuid0}.uniq CREATE TAG t5;
 -- query 7
 -- @skip_result_check=true
 -- @wait_alter_optimize=uniq
--- @db=ns_${uuid0}
+-- @db=uniq_${uuid0}.ns_${uuid0}
 ALTER TABLE uniq OPTIMIZE;
 
 -- query 8
@@ -70,12 +70,12 @@ ALTER TABLE uniq_${uuid0}.ns_${uuid0}.uniq CREATE TAG t6;
 
 -- query 9
 -- I1 — current snapshot intra-snapshot uniqueness.
--- @db=ns_${uuid0}
+-- @db=uniq_${uuid0}.ns_${uuid0}
 SELECT count(*) - count(DISTINCT _row_id) AS row_id_collisions FROM uniq;
 
 -- query 10
 -- I1 — same invariant on each historical tag.
--- @db=ns_${uuid0}
+-- @db=uniq_${uuid0}.ns_${uuid0}
 SELECT
   (SELECT count(*) - count(DISTINCT _row_id) FROM uniq FOR VERSION AS OF 't1') AS t1_collisions,
   (SELECT count(*) - count(DISTINCT _row_id) FROM uniq FOR VERSION AS OF 't2') AS t2_collisions,
@@ -88,7 +88,7 @@ SELECT
 -- I2 — cross-snapshot row-id uniqueness per logical id.
 -- For every id observed across all tags, the set of _row_id values must
 -- have size 1 (id keeps the same row-lineage identity through its life).
--- @db=ns_${uuid0}
+-- @db=uniq_${uuid0}.ns_${uuid0}
 SELECT max(distinct_row_ids) AS max_row_ids_per_id
   FROM (
     SELECT id, count(DISTINCT _row_id) AS distinct_row_ids

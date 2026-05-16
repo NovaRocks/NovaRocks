@@ -716,17 +716,15 @@ fn scan_equality_delete_rows_for_snapshot(
             &read_snapshot,
             &delete_file,
         ) {
-            let first_row_id = data_file.first_row_id.ok_or_else(|| {
-                format!(
-                    "iceberg MV equality-delete reverse projection requires first_row_id for data file {}; rebuild the MV after enabling Iceberg v3 row-lineage metadata",
-                    data_file.path
-                )
-            })?;
+            // first_row_id is only present on Iceberg v3 row-lineage tables.
+            // For v2 base tables we still need the equality-delete reverse
+            // projection to power aggregate / projection MV retraction —
+            // mirror the position-delete v2 path (no `_row_id` column added).
             out.extend(read_data_file_matching_equality_deletes_with_base_row_id(
                 &data_file.path,
                 u64::try_from(data_file.size).ok(),
                 &sets,
-                first_row_id,
+                data_file.first_row_id,
                 factory,
                 |path| {
                     normalize_delete_projection_path(path, object_store_config)
@@ -938,7 +936,7 @@ fn read_data_file_matching_equality_deletes_with_base_row_id<N>(
     data_file_path: &str,
     data_file_size: Option<u64>,
     sets: &[crate::connector::iceberg::equality_delete::EqualityDeleteSet],
-    first_row_id: i64,
+    first_row_id: Option<i64>,
     factory: &crate::fs::opendal::OpendalRangeReaderFactory,
     normalize_path: N,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String>
@@ -1020,14 +1018,22 @@ where
             )
         })?;
         if filtered.num_rows() > 0 {
-            out.push(
-                crate::connector::iceberg::scan_deletes::append_base_row_id_column(
-                    &filtered,
-                    first_row_id,
-                    &matched_positions,
-                )
-                .map_err(|e| e.to_string())?,
-            );
+            // v3 row-lineage tables carry first_row_id, so we synthesise the
+            // `_row_id` virtual column for downstream IVM. v2 tables omit it —
+            // matching the position-delete v2 path, where the projection just
+            // emits the matched data columns.
+            let projected = match first_row_id {
+                Some(first_row_id) => {
+                    crate::connector::iceberg::scan_deletes::append_base_row_id_column(
+                        &filtered,
+                        first_row_id,
+                        &matched_positions,
+                    )
+                    .map_err(|e| e.to_string())?
+                }
+                None => filtered,
+            };
+            out.push(projected);
         }
         next_position = next_position.checked_add(row_count as u64).ok_or_else(|| {
             format!("row position overflow while scanning equality deletes for {data_file_path}")
@@ -2062,7 +2068,7 @@ mod tests {
             "data.parquet",
             Some(std::fs::metadata(&data_path).expect("metadata").len()),
             &sets,
-            300,
+            Some(300),
             &factory,
             |path| Ok(path.to_string()),
         )

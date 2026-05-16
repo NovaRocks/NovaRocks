@@ -441,6 +441,7 @@ fn register_external_tables_for_query_impl(
     };
 
     for name in names {
+        let original_parts_len = name.parts.len();
         let Ok(target) = resolve_table_target(state, &name, current_catalog, current_database)
         else {
             continue;
@@ -469,14 +470,27 @@ fn register_external_tables_for_query_impl(
         }
         drop_registered_external_table(state, &target.namespace, &target.table)?;
 
-        let resolved = catalog
-            .load_table(&target.catalog, &target.namespace, &target.table)
-            .map_err(|err| {
-                format!(
-                    "load iceberg table {}.{}.{} failed: {err}",
-                    target.catalog, target.namespace, target.table
-                )
-            })?;
+        let resolved = match catalog.load_table(&target.catalog, &target.namespace, &target.table) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                // 3-part names came from explicit `cat.db.tbl` references in the
+                // SQL — a load failure there is a real query error. 1-part /
+                // 2-part fallbacks are inferred from the session's catalog +
+                // database and are best-effort: the SELECT may legitimately
+                // target a table in a different catalog (e.g. an MV target
+                // table in `default_catalog` while the session catalog is an
+                // iceberg catalog used to read the base). Swallow those so
+                // the downstream relation resolver can route the lookup
+                // through the correct catalog.
+                if original_parts_len >= 3 {
+                    return Err(format!(
+                        "load iceberg table {}.{}.{} failed: {err}",
+                        target.catalog, target.namespace, target.table
+                    ));
+                }
+                continue;
+            }
+        };
         let table_def = source.build_table_def(&resolved)?;
         register_external_table(state, &target.namespace, table_def)?;
     }
@@ -491,18 +505,31 @@ fn query_table_names(
     // Always collect fully-qualified 3-part references (including 4-part
     // __nr_meta_*__ forms reduced to 3-part). They register against the
     // catalog encoded in the name regardless of session catalog.
-    let mut names: Vec<ObjectName> = extract_three_part_table_refs(query)
-        .into_iter()
+    let three_part_refs = extract_three_part_table_refs(query);
+    let three_part_tables: std::collections::HashSet<&str> = three_part_refs
+        .iter()
+        .map(|(_, _, table)| table.as_str())
+        .collect();
+    let mut names: Vec<ObjectName> = three_part_refs
+        .iter()
         .map(|(catalog, namespace, table)| ObjectName {
-            parts: vec![catalog, namespace, table],
+            parts: vec![catalog.clone(), namespace.clone(), table.clone()],
         })
         .collect();
 
     // When the session has a current catalog, also collect 1-part names so
     // that unqualified references in the query register through the session
-    // catalog + current database.
+    // catalog + current database. Skip any table whose name already appears
+    // as a 3-part ref: registering it again with the (current_catalog,
+    // current_database) target would resolve to the wrong db when the SQL
+    // explicitly named a different one, and abort the query with a spurious
+    // "no metadata files" failure even though the 3-part registration above
+    // already loaded the table successfully.
     if current_catalog.is_some() {
         for table in extract_table_names_from_query(query) {
+            if three_part_tables.contains(table.as_str()) {
+                continue;
+            }
             names.push(ObjectName { parts: vec![table] });
         }
     }

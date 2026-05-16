@@ -460,11 +460,22 @@ fn iceberg_schema_def(schema: &iceberg::spec::Schema) -> IcebergSchemaDef {
 }
 
 fn iceberg_field_def(field: &iceberg::spec::NestedField) -> IcebergSchemaFieldDef {
+    let initial_default_json = field
+        .initial_default
+        .as_ref()
+        .and_then(|literal| {
+            literal
+                .clone()
+                .try_into_json(field.field_type.as_ref())
+                .ok()
+                .map(|json| json.to_string())
+        });
     IcebergSchemaFieldDef {
         field_id: field.id,
         name: field.name.clone(),
         initial_default: field.initial_default.clone(),
         write_default: field.write_default.clone(),
+        initial_default_json,
         children: iceberg_type_children(field.field_type.as_ref()),
     }
 }

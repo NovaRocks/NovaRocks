@@ -1,7 +1,10 @@
 use crate::sql::analyzer::iceberg_metadata::split_metadata_suffix;
 
 /// Extract table names from a query AST, using the last object-name part and
-/// ignoring catalog/database qualifiers.
+/// ignoring catalog/database qualifiers. Callers must dedupe against
+/// `extract_three_part_table_refs` to avoid double-registering a 3-part name
+/// against the current session db (which would fail when the session db is
+/// not the explicit qualifier).
 pub(crate) fn extract_table_names_from_query(query: &sqlparser::ast::Query) -> Vec<String> {
     let mut names = Vec::new();
     if let Some(with) = &query.with {

@@ -310,9 +310,18 @@ fn execute_wait_alter(
     interval: Duration,
     log: &mut String,
 ) -> (bool, Duration) {
+    // Test cases may scope @db as `catalog.db` to switch catalog before running
+    // the wrapped statement. SHOW ALTER TABLE OPTIMIZE FROM <name> expects the
+    // engine to receive each identifier part quoted independently — wrapping
+    // `catalog.db` in a single backtick group flattens it into one db name and
+    // makes the lookup miss.
+    let qualified_from = match db_name.split_once('.') {
+        Some((catalog, db)) => format!("`{}`.`{}`", catalog, db),
+        None => format!("`{}`", db_name),
+    };
     let show_sql = format!(
-        "SHOW ALTER TABLE {} FROM `{}` WHERE TableName = '{}' ORDER BY CreateTime DESC LIMIT 1",
-        kind, db_name, table_name,
+        "SHOW ALTER TABLE {} FROM {} WHERE TableName = '{}' ORDER BY CreateTime DESC LIMIT 1",
+        kind, qualified_from, table_name,
     );
     let mut total_elapsed = Duration::ZERO;
     for attempt in 0..max_retries {

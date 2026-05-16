@@ -1036,14 +1036,31 @@ const MV_OP_DELETE: i8 = 1;
 const MV_OP_COLUMN: &str = "__op";
 
 fn tagged_projection_change_chunks(result: QueryResult) -> Result<(Vec<Chunk>, i64), String> {
-    let mut delete_chunks = Vec::new();
-    let mut insert_chunks = Vec::new();
-    let mut delete_rows = 0_i64;
-    let mut insert_rows = 0_i64;
+    // Collect raw delete/upsert record batches first so we can dedupe a delete
+    // row against an upsert row that share the same MV apply key. Reason: the
+    // managed-lake txn log coalesces all rowsets written in a single txn into
+    // ONE op_write.rowset. When that merged rowset carries both a `del_file`
+    // and upsert segments for the same PK, the PK applier removes the row
+    // after the upsert lands, so a COW UPDATE (deleted row + inserted row
+    // with matching `_row_id` → matching apply key) ends up dropping the
+    // updated PK entirely. Drop the delete side of the pair so the upsert
+    // wins and the MV reflects the update.
+    let mut delete_batches: Vec<RecordBatch> = Vec::new();
+    let mut insert_batches: Vec<RecordBatch> = Vec::new();
+    let mut change_op_index_for_batches: Option<usize> = None;
 
     for chunk in result.chunks {
         let batch = chunk.batch;
         let change_op_index = find_change_op_column(&batch)?;
+        if let Some(prev) = change_op_index_for_batches {
+            if prev != change_op_index {
+                return Err(format!(
+                    "projection/filter MV delta source column `{CHANGE_OP_COLUMN}` index drifted across batches"
+                ));
+            }
+        } else {
+            change_op_index_for_batches = Some(change_op_index);
+        }
         let change_ops = batch
             .column(change_op_index)
             .as_any()
@@ -1079,29 +1096,60 @@ fn tagged_projection_change_chunks(result: QueryResult) -> Result<(Vec<Chunk>, i
             }
         }
 
-        let delete_count = delete_mask.iter().filter(|keep| **keep).count();
-        if delete_count > 0 {
-            delete_rows = add_row_count(delete_rows, delete_count)?;
+        if delete_mask.iter().any(|keep| *keep) {
             let filtered = filter_record_batch(&batch, &BooleanArray::from(delete_mask))
                 .map_err(|e| format!("filter projection MV deletes failed: {e}"))?;
             let without_change_op = record_batch_without_column(filtered, change_op_index)?;
-            delete_chunks.push(record_batch_to_chunk(append_mv_op_column(
-                without_change_op,
-                MV_OP_DELETE,
-            )?)?);
+            delete_batches.push(without_change_op);
         }
 
-        let insert_count = insert_mask.iter().filter(|keep| **keep).count();
-        if insert_count > 0 {
-            insert_rows = add_row_count(insert_rows, insert_count)?;
+        if insert_mask.iter().any(|keep| *keep) {
             let filtered = filter_record_batch(&batch, &BooleanArray::from(insert_mask))
                 .map_err(|e| format!("filter projection MV upserts failed: {e}"))?;
             let without_change_op = record_batch_without_column(filtered, change_op_index)?;
-            insert_chunks.push(record_batch_to_chunk(append_mv_op_column(
-                without_change_op,
-                MV_OP_UPSERT,
-            )?)?);
+            insert_batches.push(without_change_op);
         }
+    }
+
+    let mut insert_apply_keys: std::collections::HashSet<Vec<u8>> =
+        std::collections::HashSet::new();
+    for batch in &insert_batches {
+        for sig in collect_apply_key_signatures(batch)? {
+            insert_apply_keys.insert(sig);
+        }
+    }
+
+    let mut delete_chunks: Vec<Chunk> = Vec::new();
+    let mut delete_rows = 0_i64;
+    for batch in delete_batches {
+        let filtered = if insert_apply_keys.is_empty() {
+            batch
+        } else {
+            let mut keep_mask = Vec::with_capacity(batch.num_rows());
+            for sig in collect_apply_key_signatures(&batch)? {
+                keep_mask.push(!insert_apply_keys.contains(&sig));
+            }
+            filter_record_batch(&batch, &BooleanArray::from(keep_mask))
+                .map_err(|e| format!("dedupe delete vs upsert apply-key failed: {e}"))?
+        };
+        if filtered.num_rows() == 0 {
+            continue;
+        }
+        delete_rows = add_row_count(delete_rows, filtered.num_rows())?;
+        delete_chunks.push(record_batch_to_chunk(append_mv_op_column(
+            filtered,
+            MV_OP_DELETE,
+        )?)?);
+    }
+
+    let mut insert_chunks: Vec<Chunk> = Vec::new();
+    let mut insert_rows = 0_i64;
+    for batch in insert_batches {
+        insert_rows = add_row_count(insert_rows, batch.num_rows())?;
+        insert_chunks.push(record_batch_to_chunk(append_mv_op_column(
+            batch,
+            MV_OP_UPSERT,
+        )?)?);
     }
 
     let mut chunks = Vec::with_capacity(delete_chunks.len() + insert_chunks.len());
@@ -1113,6 +1161,32 @@ fn tagged_projection_change_chunks(result: QueryResult) -> Result<(Vec<Chunk>, i
         )
     })?;
     Ok((chunks, row_delta))
+}
+
+/// Build per-row signatures over the MV apply-key column. The apply key is
+/// the leading column produced by the projection-MV pipeline (typically
+/// `__mv_pk_id` for a single-column PK MV, or the synthesized hidden PK
+/// column for join MVs); collecting its byte representation per row lets us
+/// dedupe deletes against upserts that target the same MV row identity.
+fn collect_apply_key_signatures(batch: &RecordBatch) -> Result<Vec<Vec<u8>>, String> {
+    use arrow::row::{RowConverter, SortField};
+    if batch.num_columns() == 0 {
+        return Err(
+            "projection/filter MV chunk has no columns; cannot derive apply-key signature"
+                .to_string(),
+        );
+    }
+    let key_col = batch.column(0).clone();
+    let converter = RowConverter::new(vec![SortField::new(key_col.data_type().clone())])
+        .map_err(|e| format!("apply-key row converter init failed: {e}"))?;
+    let rows = converter
+        .convert_columns(&[key_col])
+        .map_err(|e| format!("apply-key row encode failed: {e}"))?;
+    let mut out = Vec::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        out.push(rows.row(row).as_ref().to_vec());
+    }
+    Ok(out)
 }
 
 fn tagged_projection_insert_chunks(result: QueryResult) -> Result<(Vec<Chunk>, i64), String> {

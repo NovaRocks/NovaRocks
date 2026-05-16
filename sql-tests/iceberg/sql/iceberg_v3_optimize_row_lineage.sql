@@ -42,19 +42,19 @@ ALTER TABLE opt_rl_${uuid0}.ns_${uuid0}.olineage CREATE TAG pre_opt;
 
 -- query 3
 -- BEFORE OPTIMIZE: 5 surviving rows, each with a unique `_row_id`.
--- @db=ns_${uuid0}
+-- @db=opt_rl_${uuid0}.ns_${uuid0}
 SELECT count(*) AS n_rows, count(DISTINCT _row_id) AS n_unique_row_ids
   FROM olineage;
 
 -- query 4
 -- @skip_result_check=true
 -- @wait_alter_optimize=olineage
--- @db=ns_${uuid0}
+-- @db=opt_rl_${uuid0}.ns_${uuid0}
 ALTER TABLE olineage OPTIMIZE;
 
 -- query 5
 -- AFTER OPTIMIZE: same row count, same number of unique row-ids.
--- @db=ns_${uuid0}
+-- @db=opt_rl_${uuid0}.ns_${uuid0}
 SELECT count(*) AS n_rows, count(DISTINCT _row_id) AS n_unique_row_ids
   FROM olineage;
 
@@ -62,7 +62,7 @@ SELECT count(*) AS n_rows, count(DISTINCT _row_id) AS n_unique_row_ids
 -- Cross-check: every (id, _row_id, _last_updated_sequence_number) triple in
 -- the post-OPTIMIZE live set must also exist in the pre-OPTIMIZE tag. A
 -- non-zero count here means OPTIMIZE rewrote a row identity that changed.
--- @db=ns_${uuid0}
+-- @db=opt_rl_${uuid0}.ns_${uuid0}
 SELECT count(*) AS rows_changed_by_optimize
   FROM (
     SELECT id, _row_id, _last_updated_sequence_number FROM olineage
@@ -73,7 +73,7 @@ SELECT count(*) AS rows_changed_by_optimize
 
 -- query 7
 -- The latest snapshot is a Replace (the OPTIMIZE rewrite).
--- @db=ns_${uuid0}
+-- @db=opt_rl_${uuid0}.ns_${uuid0}
 SELECT operation
   FROM olineage$snapshots
   ORDER BY committed_at DESC

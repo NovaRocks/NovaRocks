@@ -2657,6 +2657,16 @@ fn rewrite_legacy_partition_references(
     sql: &str,
     current_database: &str,
 ) -> Result<String, String> {
+    // TRUNCATE TABLE ... PARTITION (...) is intentionally rejected by the
+    // TRUNCATE parser with a "PARTITION (...) is not supported" error. The
+    // legacy-partition rewriter must not see TRUNCATE's PARTITION clause as a
+    // legacy SELECT/INSERT partition reference — it would try to resolve
+    // `id=1` as an identifier and surface a confusing "unsupported
+    // identifier" diagnostic before the parser even runs.
+    let trimmed = sql.trim_start();
+    if trimmed.len() >= 8 && trimmed[..8].eq_ignore_ascii_case("truncate") {
+        return Ok(sql.to_string());
+    }
     let sql = rewrite_insert_partition_target(sql);
     rewrite_select_partition_table_refs(state, &sql, current_database)
 }

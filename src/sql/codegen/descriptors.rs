@@ -229,20 +229,23 @@ fn to_thrift_iceberg_schema(schema: &IcebergSchemaDef) -> descriptors::TIcebergS
 fn to_thrift_iceberg_schema_field(
     field: &IcebergSchemaFieldDef,
 ) -> descriptors::TIcebergSchemaField {
-    let initial_default_json = field
-        .initial_default
-        .as_ref()
-        .map(serialize_iceberg_literal_json)
-        .transpose()
-        // Fallible serialization should never reach the codegen layer because
-        // the parser-side type validation rejects unsupported variants before
-        // they can be persisted. If it does, propagate as None so we don't
-        // crash the whole codegen — the read-side will simply see "no
-        // default" and fall through to NULL fill.
-        .unwrap_or_else(|err| {
-            tracing::warn!(error = %err, "drop initial_default_json: {err}");
-            None
-        });
+    // Prefer the spec-compliant JSON precomputed at iceberg-field construction
+    // time (where the iceberg `Type` is available — required for decimal
+    // because `Literal::Int128` carries no scale). Fall back to the
+    // type-blind serializer for non-decimal cases that still arrive without
+    // a precomputed JSON.
+    let initial_default_json = match field.initial_default_json.clone() {
+        Some(json) => Some(json),
+        None => field
+            .initial_default
+            .as_ref()
+            .map(serialize_iceberg_literal_json)
+            .transpose()
+            .unwrap_or_else(|err| {
+                tracing::warn!(error = %err, "drop initial_default_json: {err}");
+                None
+            }),
+    };
     descriptors::TIcebergSchemaField::new(
         Some(field.field_id),
         Some(field.name.clone()),
@@ -308,11 +311,13 @@ mod tests {
                         name: "order_id".to_string(),
                         initial_default: None,
                         write_default: None,
+                        initial_default_json: None,
                         children: vec![IcebergSchemaFieldDef {
                             field_id: 8,
                             name: "nested".to_string(),
                             initial_default: None,
                             write_default: None,
+                            initial_default_json: None,
                             children: vec![],
                         }],
                     }],
@@ -371,6 +376,7 @@ mod tests {
                 iceberg::spec::PrimitiveLiteral::Int(5),
             )),
             write_default: None,
+            initial_default_json: None,
             children: vec![],
         };
         let thrift = to_thrift_iceberg_schema_field(&field);
@@ -387,6 +393,7 @@ mod tests {
                 iceberg::spec::PrimitiveLiteral::String("a\nb\\c\"d".into()),
             )),
             write_default: None,
+            initial_default_json: None,
             children: vec![],
         };
         let thrift = to_thrift_iceberg_schema_field(&field);

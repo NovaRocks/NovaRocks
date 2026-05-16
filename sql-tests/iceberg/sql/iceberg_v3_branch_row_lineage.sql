@@ -45,13 +45,13 @@ DELETE FROM br_rl_${uuid0}.ns_${uuid0}.brlineage.branch_feat WHERE id = 3;
 
 -- query 4
 -- main is unchanged: still 3 rows with their original row-lineage triples.
--- @db=ns_${uuid0}
+-- @db=br_rl_${uuid0}.ns_${uuid0}
 SELECT count(*) AS n_main_rows, count(DISTINCT _row_id) AS n_main_unique
   FROM brlineage;
 
 -- query 5
 -- main is identical to the snap0 tag (no diff in row-lineage triples).
--- @db=ns_${uuid0}
+-- @db=br_rl_${uuid0}.ns_${uuid0}
 SELECT count(*) AS n_main_diverged
   FROM (
     SELECT id, _row_id, _last_updated_sequence_number FROM brlineage
@@ -62,7 +62,7 @@ SELECT count(*) AS n_main_diverged
 
 -- query 6
 -- branch_feat sees: 1 (unchanged), 2 (UPDATEd, _row_id preserved), 4 (new).
--- @db=ns_${uuid0}
+-- @db=br_rl_${uuid0}.ns_${uuid0}
 SELECT count(*) AS n_branch_rows, count(DISTINCT _row_id) AS n_branch_unique
   FROM brlineage FOR VERSION AS OF 'feat';
 
@@ -70,7 +70,7 @@ SELECT count(*) AS n_branch_rows, count(DISTINCT _row_id) AS n_branch_unique
 -- The UPDATEd row on branch retains its main-side _row_id (V3 row-lineage
 -- preservation under UPDATE). Compare id=2's _row_id between snap0 and
 -- branch_feat — they must be identical.
--- @db=ns_${uuid0}
+-- @db=br_rl_${uuid0}.ns_${uuid0}
 SELECT
   (SELECT _row_id FROM brlineage FOR VERSION AS OF 'snap0' WHERE id = 2)
   =
