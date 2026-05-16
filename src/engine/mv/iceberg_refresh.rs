@@ -218,31 +218,34 @@ pub(crate) fn create_iceberg_mv(
             ),
         ],
     )?;
-    entry.invalidate_table_cache(&target.namespace, &target.table);
-    let target_loaded =
-        crate::connector::iceberg::catalog::load_table(&entry, &target.namespace, &target.table)?;
-    let actual_apply_key_field_id =
-        find_apply_key_field_id_by_column(&target_loaded.table, apply_key_column_name)?;
-    if actual_apply_key_field_id != expected_apply_key_field_id {
-        return Err(format!(
-            "Iceberg MV target apply-key field id mismatch: expected {expected_apply_key_field_id}, got {actual_apply_key_field_id}"
-        ));
-    }
+    let post_create = (|| {
+        entry.invalidate_table_cache(&target.namespace, &target.table);
+        let target_loaded = crate::connector::iceberg::catalog::load_table(
+            &entry,
+            &target.namespace,
+            &target.table,
+        )?;
+        let actual_apply_key_field_id =
+            find_apply_key_field_id_by_column(&target_loaded.table, apply_key_column_name)?;
+        if actual_apply_key_field_id != expected_apply_key_field_id {
+            return Err(format!(
+                "Iceberg MV target apply-key field id mismatch: expected {expected_apply_key_field_id}, got {actual_apply_key_field_id}"
+            ));
+        }
 
-    // 3. Build A11 lineage from the resolved query and the base Iceberg schema.
-    let schema_contract = build_iceberg_mv_schema_contract(
-        &shape,
-        &analysis,
-        &loaded_bases,
-        &target,
-        &target_loaded,
-        actual_apply_key_field_id,
-    )?;
+        // 3. Build A11 lineage from the resolved query and the base Iceberg schema.
+        let schema_contract = build_iceberg_mv_schema_contract(
+            &shape,
+            &analysis,
+            &loaded_bases,
+            &target,
+            &target_loaded,
+            actual_apply_key_field_id,
+        )?;
 
-    // 4. Persist MV metadata in the repository.
-    let primary_key_columns = stmt.primary_key.clone().unwrap_or_default();
-    let created_at_ms = now_ms();
-    if let Err(err) = (|| {
+        // 4. Persist MV metadata in the repository.
+        let primary_key_columns = stmt.primary_key.clone().unwrap_or_default();
+        let created_at_ms = now_ms();
         let provider = state
             .metadata_provider
             .as_ref()
@@ -270,19 +273,28 @@ pub(crate) fn create_iceberg_mv(
         txn.commit()
             .map_err(|e| format!("commit iceberg MV repository metadata failed: {e}"))?;
         Ok::<(), String>(())
-    })() {
-        let drop_result = crate::connector::iceberg::catalog::registry::drop_table(
-            &entry,
-            &target.namespace,
-            &target.table,
-        );
-        return Err(format!(
-            "create iceberg MV repository metadata failed: {err}; target cleanup={drop_result:?}"
+    })();
+    if let Err(err) = post_create {
+        return Err(cleanup_created_iceberg_mv_target_after_failure(
+            &entry, &target, err,
         ));
     }
     register_iceberg_mv_target_in_catalog(state, &target)?;
 
     Ok(StatementResult::Ok)
+}
+
+fn cleanup_created_iceberg_mv_target_after_failure(
+    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    target: &IcebergMvTarget,
+    err: String,
+) -> String {
+    let drop_result = crate::connector::iceberg::catalog::registry::drop_table(
+        entry,
+        &target.namespace,
+        &target.table,
+    );
+    format!("{err}; target cleanup={drop_result:?}")
 }
 
 fn resolve_iceberg_mv_target(
@@ -435,7 +447,7 @@ fn build_iceberg_mv_schema_contract(
                 right_fields,
             );
             crate::meta::repository::mv_contract::MvSchemaContract {
-                contract_version: 1,
+                contract_version: 2,
                 base: left_contract.clone(),
                 bases: vec![left_contract, right_contract],
                 output: crate::meta::repository::mv_contract::OutputContract {
@@ -3764,6 +3776,41 @@ mod tests {
         }
     }
 
+    fn open_test_state_with_iceberg_catalog_without_metadata(
+        catalog: &str,
+        current_db: &str,
+    ) -> IcebergMvTestState {
+        let metadata_dir = TempDir::new().expect("metadata tempdir");
+        let warehouse_dir = TempDir::new().expect("warehouse tempdir");
+        let state = Arc::new(StandaloneState {
+            metadata_provider: None,
+            ..StandaloneState::default()
+        });
+        crate::connector::register_standalone_backends(&state);
+        {
+            let mut catalogs = state.iceberg_catalogs.write().expect("iceberg catalogs");
+            catalogs
+                .create_catalog(
+                    catalog,
+                    &[
+                        ("type".to_string(), "iceberg".to_string()),
+                        ("iceberg.catalog.type".to_string(), "memory".to_string()),
+                        (
+                            "iceberg.catalog.warehouse".to_string(),
+                            warehouse_dir.path().display().to_string(),
+                        ),
+                    ],
+                )
+                .expect("create iceberg catalog");
+        }
+        IcebergMvTestState {
+            state,
+            current_db: current_db.to_string(),
+            _metadata_dir: metadata_dir,
+            _warehouse_dir: warehouse_dir,
+        }
+    }
+
     fn open_test_state_with_hadoop_iceberg_catalog(
         catalog: &str,
         current_db: &str,
@@ -4442,6 +4489,33 @@ mod tests {
         assert_eq!(
             err,
             "Iceberg MV target table ice.analytics.mv_orders already exists"
+        );
+    }
+
+    #[test]
+    fn create_iceberg_mv_post_create_failure_drops_target_table() {
+        let env = open_test_state_with_iceberg_catalog_without_metadata("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_orders
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders",
+        );
+
+        let err = create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect_err("missing metadata provider should fail after target create");
+        assert!(err.contains("metadata provider required for iceberg mv"));
+        assert!(err.contains("target cleanup=Ok(())"), "err={err}");
+
+        let entry = {
+            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get("ice").expect("catalog")
+        };
+        assert!(
+            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
+                .is_err(),
+            "target table should be dropped after post-create failure"
         );
     }
 

@@ -338,11 +338,17 @@ fn check_target_schema(
             reason: "hidden apply-key column must be required".to_string(),
         });
     }
+    let expected_apply_key_type = match expected.source {
+        ApplyKeySource::BaseRowId => iceberg::spec::PrimitiveType::Long,
+        ApplyKeySource::JoinRowKey => iceberg::spec::PrimitiveType::String,
+    };
     match field.field_type.as_ref() {
-        iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long) => {}
+        iceberg::spec::Type::Primitive(actual) if actual == &expected_apply_key_type => {}
         other => {
             return Some(SchemaEvolutionError::HiddenApplyKeyContractBroken {
-                reason: format!("hidden apply-key column must be long, got {other}"),
+                reason: format!(
+                    "hidden apply-key column must be {expected_apply_key_type:?}, got {other}"
+                ),
             });
         }
     }
@@ -519,7 +525,7 @@ mod tests {
                 Arc::new(iceberg::spec::NestedField::required(
                     2,
                     JOIN_APPLY_KEY_COLUMN_NAME,
-                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long),
+                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::String),
                 )),
             ])
             .build()
