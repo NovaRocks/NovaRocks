@@ -8,7 +8,9 @@
 //! Decisions are explicit. There is NO fallback path: incompatible
 //! contracts result in fail-fast errors that propagate to the user.
 
-use crate::meta::repository::mv_contract::{HIDDEN_APPLY_KEY_COLUMN_NAME, MvSchemaContract};
+use crate::meta::repository::mv_contract::{
+    ApplyKeySource, HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME, MvSchemaContract,
+};
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ContractDecision {
@@ -319,9 +321,13 @@ fn check_target_schema(
             ),
         });
     };
+    let expected_hidden_apply_key_column = match expected.source {
+        ApplyKeySource::BaseRowId => HIDDEN_APPLY_KEY_COLUMN_NAME,
+        ApplyKeySource::JoinRowKey => JOIN_APPLY_KEY_COLUMN_NAME,
+    };
     if !field
         .name
-        .eq_ignore_ascii_case(HIDDEN_APPLY_KEY_COLUMN_NAME)
+        .eq_ignore_ascii_case(expected_hidden_apply_key_column)
     {
         return Some(SchemaEvolutionError::HiddenApplyKeyContractBroken {
             reason: format!("hidden apply-key column renamed to {}", field.name),
@@ -355,8 +361,9 @@ mod tests {
     use super::*;
     use crate::meta::repository::mv_contract::{
         ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
-        ExpressionLineage, HiddenApplyKeyContract, OutputColumnLineage, OutputContract,
-        TargetContract, TargetVisibleColumn,
+        ExpressionLineage, HiddenApplyKeyContract, JOIN_APPLY_KEY_COLUMN_NAME, JoinContract,
+        JoinContractKind, JoinPredicateLineage, OutputColumnLineage, OutputContract,
+        QualifiedFieldLineage, TargetContract, TargetVisibleColumn,
     };
     use std::sync::Arc;
 
@@ -491,5 +498,121 @@ mod tests {
                 rebound_columns: vec![(1, "id".to_string(), "renamed_id".to_string())],
             }
         );
+    }
+
+    #[test]
+    fn join_row_key_target_hidden_column_is_accepted() {
+        let target_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int);
+        let base_schema = iceberg::spec::Schema::builder()
+            .with_schema_id(7)
+            .with_fields(vec![])
+            .build()
+            .expect("base schema");
+        let target_schema = iceberg::spec::Schema::builder()
+            .with_schema_id(11)
+            .with_fields(vec![
+                Arc::new(iceberg::spec::NestedField::required(
+                    1,
+                    "id",
+                    target_type.clone(),
+                )),
+                Arc::new(iceberg::spec::NestedField::required(
+                    2,
+                    JOIN_APPLY_KEY_COLUMN_NAME,
+                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long),
+                )),
+            ])
+            .build()
+            .expect("target schema");
+        let contract = MvSchemaContract {
+            contract_version: 2,
+            base: BaseContract {
+                table_fqn: "ice.db.left".to_string(),
+                table_uuid: "left-uuid".to_string(),
+                alias_at_create: None,
+                schema_id_at_create: 0,
+                schema_at_create: BaseSchemaSnapshot { fields: vec![] },
+            },
+            bases: vec![
+                BaseContract {
+                    table_fqn: "ice.db.left".to_string(),
+                    table_uuid: "left-uuid".to_string(),
+                    alias_at_create: Some("l".to_string()),
+                    schema_id_at_create: 0,
+                    schema_at_create: BaseSchemaSnapshot {
+                        fields: vec![BaseFieldRecord {
+                            field_id: 1,
+                            name_at_create: "id".to_string(),
+                            type_signature: format!("{target_type}"),
+                            required: true,
+                        }],
+                    },
+                },
+                BaseContract {
+                    table_fqn: "ice.db.right".to_string(),
+                    table_uuid: "right-uuid".to_string(),
+                    alias_at_create: Some("r".to_string()),
+                    schema_id_at_create: 0,
+                    schema_at_create: BaseSchemaSnapshot {
+                        fields: vec![BaseFieldRecord {
+                            field_id: 2,
+                            name_at_create: "id".to_string(),
+                            type_signature: format!("{target_type}"),
+                            required: true,
+                        }],
+                    },
+                },
+            ],
+            output: OutputContract {
+                columns: vec![OutputColumnLineage {
+                    expression: ExpressionLineage {
+                        kind: ExpressionKind::Column,
+                        referenced_base_field_ids: vec![],
+                        referenced_base_fields: vec![QualifiedFieldLineage {
+                            table_fqn: "ice.db.left".to_string(),
+                            qualifier_at_create: "l".to_string(),
+                            field_id: 1,
+                        }],
+                    },
+                }],
+                filter: None,
+            },
+            join: Some(JoinContract {
+                kind: JoinContractKind::InnerEquiJoin,
+                predicates: vec![JoinPredicateLineage {
+                    left: QualifiedFieldLineage {
+                        table_fqn: "ice.db.left".to_string(),
+                        qualifier_at_create: "l".to_string(),
+                        field_id: 1,
+                    },
+                    right: QualifiedFieldLineage {
+                        table_fqn: "ice.db.right".to_string(),
+                        qualifier_at_create: "r".to_string(),
+                        field_id: 2,
+                    },
+                }],
+            }),
+            target: TargetContract {
+                table_fqn: "ice.db.mv_join".to_string(),
+                table_uuid: "target-uuid".to_string(),
+                schema_id_at_create: 0,
+                visible_columns: vec![TargetVisibleColumn {
+                    output_name: "id".to_string(),
+                    target_field_id: 1,
+                    type_signature: format!("{target_type}"),
+                    nullable: false,
+                }],
+                hidden_apply_key: HiddenApplyKeyContract {
+                    column_name: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
+                    target_field_id: 2,
+                    source: ApplyKeySource::JoinRowKey,
+                },
+            },
+        };
+
+        let decision =
+            validate_schema_contract_after_identity(&contract, &base_schema, &target_schema);
+
+        assert_eq!(decision, ContractDecision::CompatibleSafe);
     }
 }
