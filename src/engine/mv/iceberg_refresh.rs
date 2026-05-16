@@ -127,7 +127,7 @@ pub(crate) fn create_iceberg_mv(
                 })
                 .collect::<Result<Vec<_>, String>>()?
         }
-        IncrementalMvShape::Aggregate(_) => {
+        IncrementalMvShape::Aggregate(_) | IncrementalMvShape::JoinAggregate(_) => {
             return Err(
                 "iceberg-backed materialized views do not support aggregate shapes in this phase"
                     .to_string(),
@@ -158,7 +158,9 @@ pub(crate) fn create_iceberg_mv(
                         .to_string(),
                 );
             }
-            IncrementalMvShape::Aggregate(_) => unreachable!("aggregate shape was rejected above"),
+            IncrementalMvShape::Aggregate(_) | IncrementalMvShape::JoinAggregate(_) => {
+                unreachable!("aggregate shape was rejected above")
+            }
         }
     }
 
@@ -166,12 +168,16 @@ pub(crate) fn create_iceberg_mv(
     let apply_key_column_name = match &shape {
         IncrementalMvShape::ProjectionFilter(_) => ICEBERG_MV_APPLY_KEY_COLUMN,
         IncrementalMvShape::JoinProjectionFilter(_) => ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
-        IncrementalMvShape::Aggregate(_) => unreachable!("aggregate shape was rejected above"),
+        IncrementalMvShape::Aggregate(_) | IncrementalMvShape::JoinAggregate(_) => {
+            unreachable!("aggregate shape was rejected above")
+        }
     };
     let apply_key_source_property = match &shape {
         IncrementalMvShape::ProjectionFilter(_) => ICEBERG_MV_APPLY_KEY_SOURCE_BASE_ROW_ID,
         IncrementalMvShape::JoinProjectionFilter(_) => ICEBERG_MV_APPLY_KEY_SOURCE_JOIN_ROW_KEY,
-        IncrementalMvShape::Aggregate(_) => unreachable!("aggregate shape was rejected above"),
+        IncrementalMvShape::Aggregate(_) | IncrementalMvShape::JoinAggregate(_) => {
+            unreachable!("aggregate shape was rejected above")
+        }
     };
     if analysis
         .output_columns
@@ -190,7 +196,9 @@ pub(crate) fn create_iceberg_mv(
     columns.push(match &shape {
         IncrementalMvShape::ProjectionFilter(_) => apply_key_table_column(),
         IncrementalMvShape::JoinProjectionFilter(_) => join_apply_key_table_column(),
-        IncrementalMvShape::Aggregate(_) => unreachable!("aggregate shape was rejected above"),
+        IncrementalMvShape::Aggregate(_) | IncrementalMvShape::JoinAggregate(_) => {
+            unreachable!("aggregate shape was rejected above")
+        }
     });
     let expected_apply_key_field_id = i32::try_from(columns.len())
         .map_err(|_| "too many iceberg MV output columns".to_string())?;
@@ -471,7 +479,9 @@ fn build_iceberg_mv_schema_contract(
                 )?,
             }
         }
-        IncrementalMvShape::Aggregate(_) => unreachable!("aggregate shape was rejected above"),
+        IncrementalMvShape::Aggregate(_) | IncrementalMvShape::JoinAggregate(_) => {
+            unreachable!("aggregate shape was rejected above")
+        }
     };
     contract
         .ensure_self_consistent()

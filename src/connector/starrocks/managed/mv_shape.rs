@@ -3,6 +3,7 @@ pub(crate) enum IncrementalMvShape {
     ProjectionFilter(ProjectionFilterMvShape),
     Aggregate(AggregateMvShape),
     JoinProjectionFilter(JoinProjectionFilterMvShape),
+    JoinAggregate(JoinAggregateMvShape),
 }
 
 impl IncrementalMvShape {
@@ -10,7 +11,7 @@ impl IncrementalMvShape {
         match self {
             IncrementalMvShape::ProjectionFilter(shape) => &shape.base_table,
             IncrementalMvShape::Aggregate(shape) => &shape.base_table,
-            IncrementalMvShape::JoinProjectionFilter(_) => {
+            IncrementalMvShape::JoinProjectionFilter(_) | IncrementalMvShape::JoinAggregate(_) => {
                 panic!("base_table() is only valid for single-base MV shapes")
             }
         }
@@ -22,6 +23,9 @@ impl IncrementalMvShape {
             IncrementalMvShape::Aggregate(shape) => vec![&shape.base_table],
             IncrementalMvShape::JoinProjectionFilter(shape) => {
                 vec![&shape.left_table, &shape.right_table]
+            }
+            IncrementalMvShape::JoinAggregate(shape) => {
+                vec![&shape.join.left_table, &shape.join.right_table]
             }
         }
     }
@@ -47,6 +51,25 @@ pub(crate) struct JoinProjectionFilterMvShape {
     pub(crate) right_table: sqlparser::ast::ObjectName,
     pub(crate) right_alias: String,
     pub(crate) join_keys: Vec<JoinKeyPairShape>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct JoinAggregateMvShape {
+    pub(crate) join: JoinProjectionFilterMvShape,
+    pub(crate) group_keys: Vec<GroupKeyShape>,
+    pub(crate) aggregates: Vec<AggregateCallShape>,
+    pub(crate) visible_outputs: Vec<VisibleAggregateOutput>,
+}
+
+impl JoinAggregateMvShape {
+    pub(crate) fn as_aggregate_shape_for_layout(&self) -> AggregateMvShape {
+        AggregateMvShape {
+            base_table: self.join.left_table.clone(),
+            group_keys: self.group_keys.clone(),
+            aggregates: self.aggregates.clone(),
+            visible_outputs: self.visible_outputs.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,10 +115,11 @@ pub(crate) enum VisibleAggregateOutput {
 pub(crate) fn classify_incremental_mv_query(
     query: &sqlparser::ast::Query,
 ) -> Result<IncrementalMvShape, String> {
-    match classify_aggregate_mv_query(query) {
-        Ok(shape) => return Ok(IncrementalMvShape::Aggregate(shape)),
-        Err(err) if is_probably_aggregate_query(query) => return Err(err),
-        Err(_) => {}
+    if is_probably_aggregate_query(query) {
+        if is_probably_join_query(query) {
+            return classify_join_aggregate_mv_query(query).map(IncrementalMvShape::JoinAggregate);
+        }
+        return classify_aggregate_mv_query(query).map(IncrementalMvShape::Aggregate);
     }
 
     match classify_join_projection_filter_mv_query(query) {
@@ -138,6 +162,48 @@ fn classify_aggregate_mv_query(query: &sqlparser::ast::Query) -> Result<Aggregat
         reject_unsupported_expr(selection).map_err(aggregate_expr_error)?;
     }
 
+    let (group_keys, aggregates, visible_outputs) = classify_aggregate_select_outputs(select)?;
+    Ok(AggregateMvShape {
+        base_table,
+        group_keys,
+        aggregates,
+        visible_outputs,
+    })
+}
+
+fn classify_join_aggregate_mv_query(
+    query: &sqlparser::ast::Query,
+) -> Result<JoinAggregateMvShape, String> {
+    reject_unsupported_query_clauses(query).map_err(|_| aggregate_error())?;
+
+    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return Err(aggregate_error());
+    };
+    reject_unsupported_aggregate_select_clauses(select)?;
+    if let Some(selection) = &select.selection {
+        reject_unsupported_expr(selection).map_err(aggregate_expr_error)?;
+    }
+
+    let join = classify_join_projection_filter_mv_query_for_select(select)?;
+    let (group_keys, aggregates, visible_outputs) = classify_aggregate_select_outputs(select)?;
+    Ok(JoinAggregateMvShape {
+        join,
+        group_keys,
+        aggregates,
+        visible_outputs,
+    })
+}
+
+fn classify_aggregate_select_outputs(
+    select: &sqlparser::ast::Select,
+) -> Result<
+    (
+        Vec<GroupKeyShape>,
+        Vec<AggregateCallShape>,
+        Vec<VisibleAggregateOutput>,
+    ),
+    String,
+> {
     let group_by_exprs = aggregate_group_by_exprs(&select.group_by)?;
     for expr in group_by_exprs {
         reject_unsupported_expr(expr).map_err(aggregate_expr_error)?;
@@ -184,12 +250,7 @@ fn classify_aggregate_mv_query(query: &sqlparser::ast::Query) -> Result<Aggregat
         return Err("incremental aggregate MV requires at least one aggregate output".to_string());
     }
 
-    Ok(AggregateMvShape {
-        base_table,
-        group_keys,
-        aggregates,
-        visible_outputs,
-    })
+    Ok((group_keys, aggregates, visible_outputs))
 }
 
 fn classify_join_projection_filter_mv_query(
@@ -205,6 +266,12 @@ fn classify_join_projection_filter_mv_query(
     reject_unsupported_projection_filter_exprs(select)
         .map_err(|_| join_projection_filter_error())?;
 
+    classify_join_projection_filter_mv_query_for_select(select)
+}
+
+fn classify_join_projection_filter_mv_query_for_select(
+    select: &sqlparser::ast::Select,
+) -> Result<JoinProjectionFilterMvShape, String> {
     let [from] = select.from.as_slice() else {
         return Err(join_projection_filter_error());
     };
@@ -1664,6 +1731,82 @@ mod tests {
              join ice.ns.extra x on x.id = r.id",
         )
         .expect_err("three table join rejected");
+        assert!(err.contains("exactly two"), "err={err}");
+    }
+
+    fn as_join_aggregate_shape(shape: IncrementalMvShape) -> JoinAggregateMvShape {
+        match shape {
+            IncrementalMvShape::JoinAggregate(shape) => shape,
+            other => panic!("expected join aggregate shape, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn join_aggregate_accepts_two_table_inner_equi_join() {
+        let shape = as_join_aggregate_shape(
+            classify_sql(
+                "select d.region, count(*) as c, sum(f.amount) as s \
+                 from ice.ns.fact f join ice.ns.dim d on f.dim_id = d.id \
+                 group by d.region",
+            )
+            .expect("classify join aggregate"),
+        );
+
+        assert_eq!(shape.join.left_alias, "f");
+        assert_eq!(shape.join.right_alias, "d");
+        assert_eq!(shape.join.join_keys.len(), 1);
+        assert_eq!(shape.group_keys.len(), 1);
+        assert_eq!(shape.aggregates.len(), 2);
+        assert_eq!(shape.visible_outputs.len(), 3);
+    }
+
+    #[test]
+    fn join_aggregate_does_not_fall_into_join_projection_shape() {
+        let shape = classify_sql(
+            "select d.region, count(*) as c \
+             from ice.ns.fact f join ice.ns.dim d on f.dim_id = d.id \
+             group by d.region",
+        )
+        .expect("classify join aggregate");
+
+        assert!(matches!(shape, IncrementalMvShape::JoinAggregate(_)));
+    }
+
+    #[test]
+    fn join_aggregate_rejects_outer_join() {
+        let err = classify_sql(
+            "select d.region, count(*) as c \
+             from ice.ns.fact f left join ice.ns.dim d on f.dim_id = d.id \
+             group by d.region",
+        )
+        .expect_err("outer join rejected");
+        assert!(err.contains("two-table inner equi-join"), "err={err}");
+    }
+
+    #[test]
+    fn join_aggregate_rejects_missing_projected_group_key() {
+        let err = classify_sql(
+            "select count(*) as c \
+             from ice.ns.fact f join ice.ns.dim d on f.dim_id = d.id \
+             group by d.region",
+        )
+        .expect_err("missing projected group key rejected");
+        assert!(
+            err.contains("projection must include every GROUP BY key"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn join_aggregate_rejects_three_table_join() {
+        let err = classify_sql(
+            "select d.region, count(*) as c \
+             from ice.ns.fact f \
+             join ice.ns.dim d on f.dim_id = d.id \
+             join ice.ns.extra e on e.id = d.id \
+             group by d.region",
+        )
+        .expect_err("three-table join rejected");
         assert!(err.contains("exactly two"), "err={err}");
     }
 

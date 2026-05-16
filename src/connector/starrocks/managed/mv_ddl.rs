@@ -481,6 +481,10 @@ fn build_mv_storage_layout(
             "join projection/filter IMV storage layout is not supported by legacy managed MV DDL"
                 .to_string(),
         ),
+        IncrementalMvShape::JoinAggregate(_) => Err(
+            "join aggregate IMV storage layout is not supported by legacy managed MV DDL"
+                .to_string(),
+        ),
     }
 }
 
@@ -543,6 +547,10 @@ fn validate_incremental_mv_analyzed_types(
         }
         IncrementalMvShape::JoinProjectionFilter(_) => Err(
             "join projection/filter IMV analyzer validation is not supported by legacy managed MV DDL"
+                .to_string(),
+        ),
+        IncrementalMvShape::JoinAggregate(_) => Err(
+            "join aggregate IMV analyzer validation is not supported by legacy managed MV DDL"
                 .to_string(),
         ),
     }

@@ -469,6 +469,9 @@ where
             "join projection/filter IMV refresh is not supported by legacy managed MV refresh"
                 .to_string(),
         ),
+        (super::mv_shape::IncrementalMvShape::JoinAggregate(_), _) => Err(
+            "join aggregate IMV refresh is not supported by legacy managed MV refresh".to_string(),
+        ),
         (
             super::mv_shape::IncrementalMvShape::ProjectionFilter(_),
             MvRefreshPolicy::FullRefresh { .. },

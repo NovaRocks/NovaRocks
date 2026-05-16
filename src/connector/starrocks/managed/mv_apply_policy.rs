@@ -30,6 +30,11 @@ pub(crate) fn apply_policy_for_change(
         IncrementalMvShape::JoinProjectionFilter(_) => MvApplyPolicy::Unsupported {
             reason: "join projection/filter IMV refresh is not supported by the legacy managed MV apply policy".to_string(),
         },
+        IncrementalMvShape::JoinAggregate(_) => MvApplyPolicy::Unsupported {
+            reason:
+                "join aggregate IMV refresh is not supported by the legacy managed MV apply policy"
+                    .to_string(),
+        },
     }
 }
 
