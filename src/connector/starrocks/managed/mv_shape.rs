@@ -219,6 +219,9 @@ fn classify_join_projection_filter_mv_query(
     }
     let (left_table, left_alias) = table_factor_name_and_alias(&from.relation)?;
     let (right_table, right_alias) = table_factor_name_and_alias(&join.relation)?;
+    if left_alias.eq_ignore_ascii_case(&right_alias) {
+        return Err("incremental join MV requires distinct join aliases".to_string());
+    }
     let condition = match &join.join_operator {
         sqlparser::ast::JoinOperator::Join(sqlparser::ast::JoinConstraint::On(expr))
         | sqlparser::ast::JoinOperator::Inner(sqlparser::ast::JoinConstraint::On(expr)) => expr,
@@ -1615,6 +1618,19 @@ mod tests {
         assert!(
             err.contains("two-table inner equi-join")
                 || err.contains(&join_projection_filter_error()),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn join_projection_filter_rejects_duplicate_aliases() {
+        let err = parse_shape(
+            "select d.id, d.label \
+             from ice.ns.orders d join ice.ns.dim d on d.dim_id = d.id",
+        )
+        .expect_err("duplicate alias rejected");
+        assert!(
+            err.contains("distinct") && err.contains("alias"),
             "err={err}"
         );
     }

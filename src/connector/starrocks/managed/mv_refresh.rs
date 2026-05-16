@@ -294,6 +294,11 @@ pub(crate) fn refresh_mv(
                         move |ctx| run_projection_mv_select_and_chunks(ctx, &primary_key_columns),
                     );
                 }
+                MvApplyPolicy::Unsupported { reason } => {
+                    return Err(format!(
+                        "iceberg materialized view refresh unsupported: {reason}"
+                    ));
+                }
             }
 
             let source_files = build_delta_source_files(
@@ -643,6 +648,11 @@ fn refresh_aggregate_mv_incremental(
                 ctx.pinned_full_select_sql.clone(),
                 ctx.pinned_base_metadata.clone(),
             );
+        }
+        MvApplyPolicy::Unsupported { reason } => {
+            return Err(format!(
+                "iceberg materialized view refresh unsupported: {reason}"
+            ));
         }
     }
 

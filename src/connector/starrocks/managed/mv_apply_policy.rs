@@ -4,6 +4,7 @@ use super::mv_shape::{AggregateFunctionKind, AggregateMvShape, IncrementalMvShap
 pub(crate) enum MvApplyPolicy {
     Incremental,
     FullRefresh { reason: String },
+    Unsupported { reason: String },
 }
 
 pub(crate) fn apply_policy_for_change(
@@ -26,7 +27,7 @@ pub(crate) fn apply_policy_for_change(
         IncrementalMvShape::Aggregate(aggregate) => {
             aggregate_policy(aggregate, has_inserts, has_deletes)
         }
-        IncrementalMvShape::JoinProjectionFilter(_) => MvApplyPolicy::FullRefresh {
+        IncrementalMvShape::JoinProjectionFilter(_) => MvApplyPolicy::Unsupported {
             reason: "join projection/filter IMV refresh is not supported by the legacy managed MV apply policy".to_string(),
         },
     }
@@ -57,7 +58,7 @@ mod tests {
     use super::*;
     use crate::connector::starrocks::managed::mv_shape::{
         AggregateCallShape, AggregateFunctionKind, AggregateInput, AggregateMvShape,
-        IncrementalMvShape, ProjectionFilterMvShape,
+        IncrementalMvShape, JoinProjectionFilterMvShape, ProjectionFilterMvShape,
     };
 
     fn object_name() -> sqlparser::ast::ObjectName {
@@ -84,6 +85,16 @@ mod tests {
                 input: AggregateInput::Star,
             }],
             visible_outputs: Vec::new(),
+        })
+    }
+
+    fn join_shape() -> IncrementalMvShape {
+        IncrementalMvShape::JoinProjectionFilter(JoinProjectionFilterMvShape {
+            left_table: object_name(),
+            left_alias: "l".to_string(),
+            right_table: object_name(),
+            right_alias: "r".to_string(),
+            join_keys: Vec::new(),
         })
     }
 
@@ -141,5 +152,16 @@ mod tests {
                 reason: "MIN/MAX aggregate cannot retract DELETE state incrementally".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn join_shape_is_unsupported_by_apply_policy() {
+        let policy = apply_policy_for_change(&join_shape(), true, true, true);
+        match policy {
+            MvApplyPolicy::Unsupported { reason } => {
+                assert!(reason.contains("join projection/filter IMV"), "reason={reason}");
+            }
+            other => panic!("expected unsupported policy, got {other:?}"),
+        }
     }
 }
