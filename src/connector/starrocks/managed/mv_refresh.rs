@@ -460,6 +460,10 @@ where
         FnOnce(&super::mv_shape::AggregateMvShape, i64, i64) -> Result<StatementResult, String>,
 {
     match (mv_shape, strategy) {
+        (super::mv_shape::IncrementalMvShape::JoinProjectionFilter(_), _) => Err(
+            "join projection/filter IMV refresh is not supported by legacy managed MV refresh"
+                .to_string(),
+        ),
         (
             super::mv_shape::IncrementalMvShape::ProjectionFilter(_),
             MvRefreshPolicy::FullRefresh { .. },

@@ -2,6 +2,7 @@
 pub(crate) enum IncrementalMvShape {
     ProjectionFilter(ProjectionFilterMvShape),
     Aggregate(AggregateMvShape),
+    JoinProjectionFilter(JoinProjectionFilterMvShape),
 }
 
 impl IncrementalMvShape {
@@ -9,6 +10,19 @@ impl IncrementalMvShape {
         match self {
             IncrementalMvShape::ProjectionFilter(shape) => &shape.base_table,
             IncrementalMvShape::Aggregate(shape) => &shape.base_table,
+            IncrementalMvShape::JoinProjectionFilter(_) => {
+                panic!("base_table() is only valid for single-base MV shapes")
+            }
+        }
+    }
+
+    pub(crate) fn base_tables(&self) -> Vec<&sqlparser::ast::ObjectName> {
+        match self {
+            IncrementalMvShape::ProjectionFilter(shape) => vec![&shape.base_table],
+            IncrementalMvShape::Aggregate(shape) => vec![&shape.base_table],
+            IncrementalMvShape::JoinProjectionFilter(shape) => {
+                vec![&shape.left_table, &shape.right_table]
+            }
         }
     }
 }
@@ -24,6 +38,21 @@ pub(crate) struct AggregateMvShape {
     pub(crate) group_keys: Vec<GroupKeyShape>,
     pub(crate) aggregates: Vec<AggregateCallShape>,
     pub(crate) visible_outputs: Vec<VisibleAggregateOutput>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct JoinProjectionFilterMvShape {
+    pub(crate) left_table: sqlparser::ast::ObjectName,
+    pub(crate) left_alias: String,
+    pub(crate) right_table: sqlparser::ast::ObjectName,
+    pub(crate) right_alias: String,
+    pub(crate) join_keys: Vec<JoinKeyPairShape>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct JoinKeyPairShape {
+    pub(crate) left_expr: sqlparser::ast::Expr,
+    pub(crate) right_expr: sqlparser::ast::Expr,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,6 +95,12 @@ pub(crate) fn classify_incremental_mv_query(
     match classify_aggregate_mv_query(query) {
         Ok(shape) => return Ok(IncrementalMvShape::Aggregate(shape)),
         Err(err) if is_probably_aggregate_query(query) => return Err(err),
+        Err(_) => {}
+    }
+
+    match classify_join_projection_filter_mv_query(query) {
+        Ok(shape) => return Ok(IncrementalMvShape::JoinProjectionFilter(shape)),
+        Err(err) if is_probably_join_query(query) => return Err(err),
         Err(_) => {}
     }
 
@@ -155,6 +190,171 @@ fn classify_aggregate_mv_query(query: &sqlparser::ast::Query) -> Result<Aggregat
         aggregates,
         visible_outputs,
     })
+}
+
+fn classify_join_projection_filter_mv_query(
+    query: &sqlparser::ast::Query,
+) -> Result<JoinProjectionFilterMvShape, String> {
+    reject_unsupported_query_clauses(query).map_err(|_| join_projection_filter_error())?;
+    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return Err(join_projection_filter_error());
+    };
+    reject_unsupported_select_clauses(select).map_err(|_| join_projection_filter_error())?;
+    reject_match_against_before_from_shape_check(select)
+        .map_err(|_| join_projection_filter_error())?;
+    reject_unsupported_projection_filter_exprs(select)
+        .map_err(|_| join_projection_filter_error())?;
+
+    let [from] = select.from.as_slice() else {
+        return Err(
+            "incremental join MV requires exactly one FROM item with exactly two tables"
+                .to_string(),
+        );
+    };
+    let [join] = from.joins.as_slice() else {
+        return Err("incremental join MV requires exactly two Iceberg base tables".to_string());
+    };
+    if !matches!(
+        join.join_operator,
+        sqlparser::ast::JoinOperator::Join(_) | sqlparser::ast::JoinOperator::Inner(_)
+    ) {
+        return Err("incremental join MV supports only two-table inner equi-join".to_string());
+    }
+    let (left_table, left_alias) = table_factor_name_and_alias(&from.relation)?;
+    let (right_table, right_alias) = table_factor_name_and_alias(&join.relation)?;
+    let condition = match &join.join_operator {
+        sqlparser::ast::JoinOperator::Join(sqlparser::ast::JoinConstraint::On(expr))
+        | sqlparser::ast::JoinOperator::Inner(sqlparser::ast::JoinConstraint::On(expr)) => expr,
+        _ => return Err("incremental join MV requires JOIN ... ON equi predicates".to_string()),
+    };
+    let mut join_keys = Vec::new();
+    collect_equi_join_keys(condition, &left_alias, &right_alias, &mut join_keys)?;
+    if join_keys.is_empty() {
+        return Err("incremental join MV requires at least one equi-join predicate".to_string());
+    }
+    Ok(JoinProjectionFilterMvShape {
+        left_table,
+        left_alias,
+        right_table,
+        right_alias,
+        join_keys,
+    })
+}
+
+fn table_factor_name_and_alias(
+    factor: &sqlparser::ast::TableFactor,
+) -> Result<(sqlparser::ast::ObjectName, String), String> {
+    let sqlparser::ast::TableFactor::Table {
+        name,
+        alias,
+        args,
+        with_hints,
+        version,
+        with_ordinality,
+        partitions,
+        json_path,
+        sample,
+        index_hints,
+        ..
+    } = factor
+    else {
+        return Err("incremental join MV base relation must be a table".to_string());
+    };
+    if args.is_some()
+        || !with_hints.is_empty()
+        || version.is_some()
+        || *with_ordinality
+        || !partitions.is_empty()
+        || json_path.is_some()
+        || sample.is_some()
+        || !index_hints.is_empty()
+        || !is_three_part_object_name(name)
+    {
+        return Err(
+            "incremental join MV base relation must be a plain 3-part Iceberg table".to_string(),
+        );
+    }
+    let fallback = name
+        .0
+        .last()
+        .and_then(|part| match part {
+            sqlparser::ast::ObjectNamePart::Identifier(ident) => Some(ident.value.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| "incremental join MV table name has no identifier".to_string())?;
+    let alias = alias
+        .as_ref()
+        .map(|a| a.name.value.clone())
+        .unwrap_or(fallback);
+    Ok((name.clone(), alias))
+}
+
+fn collect_equi_join_keys(
+    expr: &sqlparser::ast::Expr,
+    left_alias: &str,
+    right_alias: &str,
+    out: &mut Vec<JoinKeyPairShape>,
+) -> Result<(), String> {
+    match expr {
+        sqlparser::ast::Expr::BinaryOp { left, op, right }
+            if matches!(op, sqlparser::ast::BinaryOperator::And) =>
+        {
+            collect_equi_join_keys(left, left_alias, right_alias, out)?;
+            collect_equi_join_keys(right, left_alias, right_alias, out)
+        }
+        sqlparser::ast::Expr::BinaryOp { left, op, right }
+            if matches!(op, sqlparser::ast::BinaryOperator::Eq) =>
+        {
+            let left_q = qualified_column_alias(left)?;
+            let right_q = qualified_column_alias(right)?;
+            if left_q.eq_ignore_ascii_case(left_alias) && right_q.eq_ignore_ascii_case(right_alias)
+            {
+                out.push(JoinKeyPairShape {
+                    left_expr: left.as_ref().clone(),
+                    right_expr: right.as_ref().clone(),
+                });
+                Ok(())
+            } else if left_q.eq_ignore_ascii_case(right_alias)
+                && right_q.eq_ignore_ascii_case(left_alias)
+            {
+                out.push(JoinKeyPairShape {
+                    left_expr: right.as_ref().clone(),
+                    right_expr: left.as_ref().clone(),
+                });
+                Ok(())
+            } else {
+                Err(
+                    "incremental join MV equi predicate must compare the two join aliases"
+                        .to_string(),
+                )
+            }
+        }
+        _ => Err("incremental join MV supports only AND-combined equi-join predicates".to_string()),
+    }
+}
+
+fn qualified_column_alias(expr: &sqlparser::ast::Expr) -> Result<String, String> {
+    let sqlparser::ast::Expr::CompoundIdentifier(parts) = expr else {
+        return Err(
+            "incremental join MV join key must be a qualified column reference".to_string(),
+        );
+    };
+    let [alias, _column] = parts.as_slice() else {
+        return Err("incremental join MV join key must be <alias>.<column>".to_string());
+    };
+    Ok(alias.value.clone())
+}
+
+fn is_probably_join_query(query: &sqlparser::ast::Query) -> bool {
+    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return false;
+    };
+    select.from.iter().any(|from| !from.joins.is_empty())
+}
+
+fn join_projection_filter_error() -> String {
+    "incremental join MV supports only two-table inner equi-join projection/filter shapes"
+        .to_string()
 }
 
 fn reject_unsupported_query_clauses(query: &sqlparser::ast::Query) -> Result<(), String> {
@@ -1260,6 +1460,16 @@ mod tests {
         classify_incremental_mv_query(&query)
     }
 
+    fn parse_shape(sql: &str) -> Result<IncrementalMvShape, String> {
+        let normalized =
+            crate::sql::parser::dialect::normalize_for_raw_parse(sql).expect("normalize");
+        let stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized).expect("parse");
+        let sqlparser::ast::Statement::Query(query) = stmt else {
+            panic!("expected query");
+        };
+        classify_incremental_mv_query(&query)
+    }
+
     fn assert_rejects_with(sql: &str, needle: &str) {
         let err = classify_sql(sql).expect_err("query should be rejected");
         assert!(
@@ -1355,6 +1565,58 @@ mod tests {
     }
 
     #[test]
+    fn join_projection_filter_accepts_two_table_inner_equi_join() {
+        let shape = parse_shape(
+            "select l.id, r.label \
+             from ice.ns.orders l join ice.ns.dim r on l.dim_id = r.id \
+             where l.amount > 10",
+        )
+        .expect("join shape");
+        match shape {
+            IncrementalMvShape::JoinProjectionFilter(join) => {
+                assert_eq!(join.left_alias, "l");
+                assert_eq!(join.right_alias, "r");
+                assert_eq!(join.join_keys.len(), 1);
+                assert_eq!(join.left_table.to_string(), "ice.ns.orders");
+                assert_eq!(join.right_table.to_string(), "ice.ns.dim");
+            }
+            other => panic!("expected join shape, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn join_projection_filter_rejects_outer_join() {
+        let err = parse_shape(
+            "select l.id, r.label \
+             from ice.ns.orders l left join ice.ns.dim r on l.dim_id = r.id",
+        )
+        .expect_err("outer join rejected");
+        assert!(err.contains("two-table inner equi-join"), "err={err}");
+    }
+
+    #[test]
+    fn join_projection_filter_rejects_non_equi_join() {
+        let err = parse_shape(
+            "select l.id, r.label \
+             from ice.ns.orders l join ice.ns.dim r on l.dim_id > r.id",
+        )
+        .expect_err("non-equi join rejected");
+        assert!(err.contains("equi-join"), "err={err}");
+    }
+
+    #[test]
+    fn join_projection_filter_rejects_three_table_join() {
+        let err = parse_shape(
+            "select l.id, r.label, x.name \
+             from ice.ns.orders l \
+             join ice.ns.dim r on l.dim_id = r.id \
+             join ice.ns.extra x on x.id = r.id",
+        )
+        .expect_err("three table join rejected");
+        assert!(err.contains("exactly two"), "err={err}");
+    }
+
+    #[test]
     fn rejects_min_max_star() {
         assert_rejects_with(
             "select k1, min(*) from ice.ns.orders group by k1",
@@ -1402,10 +1664,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_multi_table_join() {
+    fn rejects_three_table_join_for_single_table_projection_filter() {
         assert_rejects_with(
-            "select o.k1 from ice.ns.orders o join ice.ns.items i on o.k1 = i.k1",
-            "single Iceberg base table",
+            "select o.k1 from ice.ns.orders o \
+             join ice.ns.items i on o.k1 = i.k1 \
+             join ice.ns.extra e on e.k1 = i.k1",
+            "exactly two",
         );
     }
 
