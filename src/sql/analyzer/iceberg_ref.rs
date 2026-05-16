@@ -35,19 +35,21 @@ pub enum IcebergRefSuffix {
 pub fn split_ref_suffix(parts: &[String]) -> (Vec<String>, Option<IcebergRefSuffix>) {
     if let Some(last) = parts.last() {
         if let Some(name) = last.strip_prefix("branch_")
-            && !name.is_empty() {
-                return (
-                    parts[..parts.len() - 1].to_vec(),
-                    Some(IcebergRefSuffix::Branch(name.to_string())),
-                );
-            }
+            && !name.is_empty()
+        {
+            return (
+                parts[..parts.len() - 1].to_vec(),
+                Some(IcebergRefSuffix::Branch(name.to_string())),
+            );
+        }
         if let Some(name) = last.strip_prefix("tag_")
-            && !name.is_empty() {
-                return (
-                    parts[..parts.len() - 1].to_vec(),
-                    Some(IcebergRefSuffix::Tag(name.to_string())),
-                );
-            }
+            && !name.is_empty()
+        {
+            return (
+                parts[..parts.len() - 1].to_vec(),
+                Some(IcebergRefSuffix::Tag(name.to_string())),
+            );
+        }
     }
     (parts.to_vec(), None)
 }
@@ -156,25 +158,24 @@ pub fn resolve_read_binding(
             // `VERSION AS OF 'branch'` as `SYSTEM_TIME AS OF '__nr_ref:branch'`.
             if let sqlparser::ast::Expr::Value(v) = expr
                 && let sqlparser::ast::Value::SingleQuotedString(s) = &v.value
-                    && let Some(ref_name) = s.strip_prefix("__nr_ref:") {
-                        let refs = metadata.refs();
-                        let entry = refs.get(ref_name).ok_or_else(|| {
-                            format!(
-                                "iceberg time travel: ref '{ref_name}' not found in {fully_qualified_name}"
-                            )
-                        })?;
-                        let ref_kind = match &entry.retention {
-                            iceberg::spec::SnapshotRetention::Branch { .. } => {
-                                IcebergRefKind::Branch
-                            }
-                            iceberg::spec::SnapshotRetention::Tag { .. } => IcebergRefKind::Tag,
-                        };
-                        return Ok(IcebergRefBinding {
-                            snapshot_id: entry.snapshot_id,
-                            ref_name: Some(ref_name.to_string()),
-                            ref_kind: Some(ref_kind),
-                        });
-                    }
+                && let Some(ref_name) = s.strip_prefix("__nr_ref:")
+            {
+                let refs = metadata.refs();
+                let entry = refs.get(ref_name).ok_or_else(|| {
+                    format!(
+                        "iceberg time travel: ref '{ref_name}' not found in {fully_qualified_name}"
+                    )
+                })?;
+                let ref_kind = match &entry.retention {
+                    iceberg::spec::SnapshotRetention::Branch { .. } => IcebergRefKind::Branch,
+                    iceberg::spec::SnapshotRetention::Tag { .. } => IcebergRefKind::Tag,
+                };
+                return Ok(IcebergRefBinding {
+                    snapshot_id: entry.snapshot_id,
+                    ref_name: Some(ref_name.to_string()),
+                    ref_kind: Some(ref_kind),
+                });
+            }
             let ts_ms = resolve_timestamp_expr(expr, fully_qualified_name)?;
             find_snapshot_at_or_before(metadata, ts_ms, fully_qualified_name)
         }

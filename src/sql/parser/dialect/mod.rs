@@ -571,15 +571,16 @@ fn rewrite_inline_null_treatment(sql: &str) -> String {
             // collide with identifiers like `IGNORED_NULLS`.
             let prev = idx.checked_sub(1).map(|p| bytes[p]);
             if !is_identifier_byte(prev)
-                && let Some((treatment, consumed)) = match_inline_null_treatment(bytes, idx) {
-                    if let Some(slot) = pending_at_depth.last_mut()
-                        && slot.is_none()
-                    {
-                        *slot = Some(treatment);
-                    }
-                    idx += consumed;
-                    continue;
+                && let Some((treatment, consumed)) = match_inline_null_treatment(bytes, idx)
+            {
+                if let Some(slot) = pending_at_depth.last_mut()
+                    && slot.is_none()
+                {
+                    *slot = Some(treatment);
                 }
+                idx += consumed;
+                continue;
+            }
         }
 
         output.push(byte as char);

@@ -1140,9 +1140,10 @@ impl<'a> ExprCompiler<'a> {
         if matches!(name, "substr" | "substring") {
             for arg in args.iter().skip(1) {
                 if let Some(v) = constant_i64_value(arg)
-                    && i32::try_from(v).is_err() {
-                        return Err(format!("Cast argument {} to int type failed", v));
-                    }
+                    && i32::try_from(v).is_err()
+                {
+                    return Err(format!("Cast argument {} to int type failed", v));
+                }
             }
         }
 

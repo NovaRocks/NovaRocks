@@ -1254,9 +1254,10 @@ pub(crate) fn execute_merge_statement(
     let _ = select_iceberg_update_mode(&table)?;
 
     if let Some(clause) = stmt.matched.as_ref()
-        && let MergeMatchedAction::Update { assignments } = &clause.action {
-            validate_update_assignments(assignments, &target_columns, &partition_columns)?;
-        }
+        && let MergeMatchedAction::Update { assignments } = &clause.action
+    {
+        validate_update_assignments(assignments, &target_columns, &partition_columns)?;
+    }
     let insert_columns_resolved = if let Some(clause) = stmt.not_matched.as_ref() {
         Some(resolve_merge_insert_columns(
             &clause.action,

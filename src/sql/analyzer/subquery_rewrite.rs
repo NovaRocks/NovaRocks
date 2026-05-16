@@ -1999,9 +1999,10 @@ fn expr_contains_placeholder(expr: &TypedExpr, placeholder_id: usize) -> bool {
             else_expr,
         } => {
             if let Some(op) = operand
-                && expr_contains_placeholder(op, placeholder_id) {
-                    return true;
-                }
+                && expr_contains_placeholder(op, placeholder_id)
+            {
+                return true;
+            }
             for (when, then) in when_then {
                 if expr_contains_placeholder(when, placeholder_id)
                     || expr_contains_placeholder(then, placeholder_id)
@@ -2010,9 +2011,10 @@ fn expr_contains_placeholder(expr: &TypedExpr, placeholder_id: usize) -> bool {
                 }
             }
             if let Some(else_) = else_expr
-                && expr_contains_placeholder(else_, placeholder_id) {
-                    return true;
-                }
+                && expr_contains_placeholder(else_, placeholder_id)
+            {
+                return true;
+            }
             false
         }
         _ => false,

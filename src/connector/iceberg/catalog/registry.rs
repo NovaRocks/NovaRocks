@@ -1637,15 +1637,15 @@ fn build_iceberg_schema(
                         default_literal,
                         &column.data_type,
                     )?
-                {
-                    crate::connector::iceberg::default_value::require_v3_for_default(
-                        format_version,
-                        &Some(iceberg_lit.clone()),
-                    )?;
-                    field = field
-                        .with_initial_default(iceberg_lit.clone())
-                        .with_write_default(iceberg_lit);
-                }
+            {
+                crate::connector::iceberg::default_value::require_v3_for_default(
+                    format_version,
+                    &Some(iceberg_lit.clone()),
+                )?;
+                field = field
+                    .with_initial_default(iceberg_lit.clone())
+                    .with_write_default(iceberg_lit);
+            }
             Ok(field.into())
         })
         .collect::<Result<Vec<_>, String>>()?;

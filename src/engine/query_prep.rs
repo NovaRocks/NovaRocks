@@ -297,13 +297,14 @@ fn rewrite_time_travel_in_factor(
             if let Some(last) = parts.last() {
                 for prefix in &["branch_", "tag_"] {
                     if let Some(ref_name) = last.strip_prefix(prefix)
-                        && !ref_name.is_empty() {
-                            return Err(format!(
-                                "iceberg ref: branch suffix '.{}_{}' conflicts with FOR VERSION AS OF clause",
-                                prefix.trim_end_matches('_'),
-                                ref_name,
-                            ));
-                        }
+                        && !ref_name.is_empty()
+                    {
+                        return Err(format!(
+                            "iceberg ref: branch suffix '.{}_{}' conflicts with FOR VERSION AS OF clause",
+                            prefix.trim_end_matches('_'),
+                            ref_name,
+                        ));
+                    }
                 }
             }
 

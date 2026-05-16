@@ -551,10 +551,12 @@ mod tests {
         assert!(decoded.bases.is_empty());
         assert!(decoded.join.is_none());
         assert_eq!(decoded.base.alias_at_create, None);
-        assert!(decoded.output.columns[0]
-            .expression
-            .referenced_base_fields
-            .is_empty());
+        assert!(
+            decoded.output.columns[0]
+                .expression
+                .referenced_base_fields
+                .is_empty()
+        );
         decoded.ensure_self_consistent().expect("self check");
     }
 
@@ -728,10 +730,7 @@ mod tests {
             });
         assert!(matches!(
             contract.ensure_self_consistent(),
-            Err(ContractSelfCheckError::DuplicateBaseFieldIdWithDifferentType {
-                field_id: 2,
-                ..
-            })
+            Err(ContractSelfCheckError::DuplicateBaseFieldIdWithDifferentType { field_id: 2, .. })
         ));
     }
 

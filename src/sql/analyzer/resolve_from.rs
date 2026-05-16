@@ -178,12 +178,11 @@ impl<'a> super::AnalyzerContext<'a> {
                         current_scope.apply_using_layout(&using_names, prefer_right);
                         if let Some(quals) = coalesce_quals {
                             for (col, l_q, r_q) in &quals {
-                                current_scope
-                                    .register_full_outer_using_coalesce(
-                                        std::slice::from_ref(col),
-                                        l_q,
-                                        r_q,
-                                    );
+                                current_scope.register_full_outer_using_coalesce(
+                                    std::slice::from_ref(col),
+                                    l_q,
+                                    r_q,
+                                );
                             }
                         } else if matches!(join_kind, JoinKind::RightOuter) {
                             // RIGHT JOIN USING after a previous FULL OUTER
@@ -298,11 +297,12 @@ impl<'a> super::AnalyzerContext<'a> {
                 if let Some(metadata_ty) = metadata_suffix {
                     // Reject branch/tag combo: `t.branch_dev$snapshots` is meaningless.
                     if let Some(last) = base_parts.last()
-                        && (last.starts_with("branch_") || last.starts_with("tag_")) {
-                            return Err(format!(
-                                "iceberg metadata table cannot be combined with branch/tag suffix: {parts:?}"
-                            ));
-                        }
+                        && (last.starts_with("branch_") || last.starts_with("tag_"))
+                    {
+                        return Err(format!(
+                            "iceberg metadata table cannot be combined with branch/tag suffix: {parts:?}"
+                        ));
+                    }
 
                     let (db_lower, tbl_lower) = match base_parts.as_slice() {
                         [tbl] => (self.current_database.to_lowercase(), tbl.to_lowercase()),

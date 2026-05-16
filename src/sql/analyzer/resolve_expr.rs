@@ -1249,27 +1249,28 @@ impl<'a> super::AnalyzerContext<'a> {
                 for (idx, e) in arg_exprs.iter().enumerate() {
                     // Position 1 is the interval; expand it into value + unit.
                     if idx == 1
-                        && let sqlast::Expr::Interval(interval) = e {
-                            // StarRocks rejects non-integer constant
-                            // intervals at planning time; mirror that error
-                            // here rather than silently producing NULL.
-                            if !is_integer_const_literal(interval.value.as_ref()) {
-                                return Err(format!(
-                                    "{name} requires second parameter must be a constant interval"
-                                ));
-                            }
-                            rewritten.push((*interval.value).clone());
-                            let unit = interval
-                                .leading_field
-                                .as_ref()
-                                .map(|f| format!("{f}").to_ascii_lowercase())
-                                .unwrap_or_else(|| "second".to_string());
-                            rewritten.push(sqlast::Expr::Value(sqlast::ValueWithSpan {
-                                value: sqlast::Value::SingleQuotedString(unit),
-                                span: sqlparser::tokenizer::Span::empty(),
-                            }));
-                            continue;
+                        && let sqlast::Expr::Interval(interval) = e
+                    {
+                        // StarRocks rejects non-integer constant
+                        // intervals at planning time; mirror that error
+                        // here rather than silently producing NULL.
+                        if !is_integer_const_literal(interval.value.as_ref()) {
+                            return Err(format!(
+                                "{name} requires second parameter must be a constant interval"
+                            ));
                         }
+                        rewritten.push((*interval.value).clone());
+                        let unit = interval
+                            .leading_field
+                            .as_ref()
+                            .map(|f| format!("{f}").to_ascii_lowercase())
+                            .unwrap_or_else(|| "second".to_string());
+                        rewritten.push(sqlast::Expr::Value(sqlast::ValueWithSpan {
+                            value: sqlast::Value::SingleQuotedString(unit),
+                            span: sqlparser::tokenizer::Span::empty(),
+                        }));
+                        continue;
+                    }
                     let token = match e {
                         sqlast::Expr::Identifier(ident) => Some(ident.value.to_ascii_lowercase()),
                         sqlast::Expr::CompoundIdentifier(parts) if parts.len() == 1 => {

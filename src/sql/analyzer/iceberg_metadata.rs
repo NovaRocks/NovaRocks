@@ -15,9 +15,10 @@ pub fn split_metadata_suffix(parts: &[String]) -> (Vec<String>, Option<IcebergMe
         && let Some(inner) = last
             .strip_prefix("__nr_meta_")
             .and_then(|s| s.strip_suffix("__"))
-            && let Ok(ty) = IcebergMetadataTableType::parse(inner) {
-                return (parts[..parts.len() - 1].to_vec(), Some(ty));
-            }
+        && let Ok(ty) = IcebergMetadataTableType::parse(inner)
+    {
+        return (parts[..parts.len() - 1].to_vec(), Some(ty));
+    }
     (parts.to_vec(), None)
 }
 

@@ -431,11 +431,12 @@ pub(crate) fn classify_lineage(
     previous_snapshot_id: i64,
     current_snapshot_id: i64,
 ) -> Result<LineagePlan, ChangeError> {
-    let current_snapshot = metadata
-        .snapshot_by_id(current_snapshot_id)
-        .ok_or(ChangeError::LineageBroken {
-            previous_snapshot: previous_snapshot_id,
-        })?;
+    let current_snapshot =
+        metadata
+            .snapshot_by_id(current_snapshot_id)
+            .ok_or(ChangeError::LineageBroken {
+                previous_snapshot: previous_snapshot_id,
+            })?;
 
     if current_snapshot_id == previous_snapshot_id {
         return Ok(LineagePlan {

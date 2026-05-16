@@ -159,7 +159,10 @@ mod tests {
         let policy = apply_policy_for_change(&join_shape(), true, true, true);
         match policy {
             MvApplyPolicy::Unsupported { reason } => {
-                assert!(reason.contains("join projection/filter IMV"), "reason={reason}");
+                assert!(
+                    reason.contains("join projection/filter IMV"),
+                    "reason={reason}"
+                );
             }
             other => panic!("expected unsupported policy, got {other:?}"),
         }

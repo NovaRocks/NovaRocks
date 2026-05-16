@@ -2671,11 +2671,11 @@ pub(crate) fn apply_add_at(
     if let Some(lit) = default
         && let Some(iceberg_lit) =
             crate::connector::iceberg::default_value::default_literal_to_iceberg(lit, data_type)?
-        {
-            new_field = new_field
-                .with_initial_default(iceberg_lit.clone())
-                .with_write_default(iceberg_lit);
-        }
+    {
+        new_field = new_field
+            .with_initial_default(iceberg_lit.clone())
+            .with_write_default(iceberg_lit);
+    }
     *last_column_id = next_nested_id - 1;
 
     let new_fields = add_in_fields(
@@ -3387,15 +3387,16 @@ fn validate_unset_keys_present(
     existing: &std::collections::HashMap<String, String>,
 ) -> Result<(), String> {
     if let PropertiesOp::Unset { keys, if_exists } = op
-        && !*if_exists {
-            for k in keys {
-                if !existing.contains_key(k) {
-                    return Err(format!(
-                        "UNSET TBLPROPERTIES key '{k}' does not exist; use IF EXISTS to silently skip"
-                    ));
-                }
+        && !*if_exists
+    {
+        for k in keys {
+            if !existing.contains_key(k) {
+                return Err(format!(
+                    "UNSET TBLPROPERTIES key '{k}' does not exist; use IF EXISTS to silently skip"
+                ));
             }
         }
+    }
     Ok(())
 }
 

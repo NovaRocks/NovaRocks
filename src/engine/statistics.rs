@@ -136,9 +136,10 @@ pub(crate) fn try_handle_statement(
         return Ok(Some(StatementResult::Query(ok_result()?)));
     }
     if lower.starts_with("explain costs ")
-        && let Some(result) = try_explain_costs(state, trimmed, current_database)? {
-            return Ok(Some(StatementResult::Query(result)));
-        }
+        && let Some(result) = try_explain_costs(state, trimmed, current_database)?
+    {
+        return Ok(Some(StatementResult::Query(result)));
+    }
     Ok(None)
 }
 
@@ -1345,9 +1346,10 @@ fn collect_usage_from_expr(
     match expr {
         Expr::Identifier(ident) => {
             if aliases.len() == 1
-                && let Some(key) = aliases.values().next() {
-                    mark_usage(state, key, &ident.value, usage)?;
-                }
+                && let Some(key) = aliases.values().next()
+            {
+                mark_usage(state, key, &ident.value, usage)?;
+            }
         }
         Expr::CompoundIdentifier(parts) => {
             if parts.len() >= 2 {
