@@ -206,10 +206,7 @@ fn classify_join_projection_filter_mv_query(
         .map_err(|_| join_projection_filter_error())?;
 
     let [from] = select.from.as_slice() else {
-        return Err(
-            "incremental join MV requires exactly one FROM item with exactly two tables"
-                .to_string(),
-        );
+        return Err(join_projection_filter_error());
     };
     let [join] = from.joins.as_slice() else {
         return Err("incremental join MV requires exactly two Iceberg base tables".to_string());
@@ -296,6 +293,9 @@ fn collect_equi_join_keys(
     out: &mut Vec<JoinKeyPairShape>,
 ) -> Result<(), String> {
     match expr {
+        sqlparser::ast::Expr::Nested(inner) => {
+            collect_equi_join_keys(inner, left_alias, right_alias, out)
+        }
         sqlparser::ast::Expr::BinaryOp { left, op, right }
             if matches!(op, sqlparser::ast::BinaryOperator::And) =>
         {
@@ -334,6 +334,9 @@ fn collect_equi_join_keys(
 }
 
 fn qualified_column_alias(expr: &sqlparser::ast::Expr) -> Result<String, String> {
+    if let sqlparser::ast::Expr::Nested(inner) = expr {
+        return qualified_column_alias(inner);
+    }
     let sqlparser::ast::Expr::CompoundIdentifier(parts) = expr else {
         return Err(
             "incremental join MV join key must be a qualified column reference".to_string(),
@@ -349,7 +352,7 @@ fn is_probably_join_query(query: &sqlparser::ast::Query) -> bool {
     let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
         return false;
     };
-    select.from.iter().any(|from| !from.joins.is_empty())
+    select.from.len() > 1 || select.from.iter().any(|from| !from.joins.is_empty())
 }
 
 fn join_projection_filter_error() -> String {
@@ -1582,6 +1585,38 @@ mod tests {
             }
             other => panic!("expected join shape, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn join_projection_filter_accepts_parenthesized_equi_join() {
+        let shape = parse_shape(
+            "select l.id, r.label \
+             from ice.ns.orders l join ice.ns.dim r on (l.dim_id = r.id)",
+        )
+        .expect("join shape");
+        match shape {
+            IncrementalMvShape::JoinProjectionFilter(join) => {
+                assert_eq!(join.left_alias, "l");
+                assert_eq!(join.right_alias, "r");
+                assert_eq!(join.join_keys.len(), 1);
+            }
+            other => panic!("expected join shape, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn join_projection_filter_rejects_comma_join_as_join_shape() {
+        let err = parse_shape(
+            "select l.id, r.label \
+             from ice.ns.orders l, ice.ns.dim r \
+             where l.dim_id = r.id",
+        )
+        .expect_err("comma join rejected");
+        assert!(
+            err.contains("two-table inner equi-join")
+                || err.contains(&join_projection_filter_error()),
+            "err={err}"
+        );
     }
 
     #[test]
