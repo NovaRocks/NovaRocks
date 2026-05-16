@@ -517,7 +517,7 @@ fn collect_column_refs(
             kind.saw_func();
             collect_column_refs(expr, out, kind);
         }
-        ExprKind::FunctionCall { args, .. } => {
+        ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
             kind.saw_func();
             for a in args {
                 collect_column_refs(a, out, kind);
@@ -571,9 +571,9 @@ fn collect_column_refs(
         ExprKind::Nested(inner) => {
             collect_column_refs(inner, out, kind);
         }
-        // Lambda, window, aggregate, subquery placeholder, lambda param —
-        // not expected in A11 phase 1 projection/filter MVs. A9 shape
-        // classification rejects them before reaching here.
+        // Lambda, window, subquery placeholder, lambda param — not expected
+        // in A11 phase 1 projection/filter MVs. A9 shape classification
+        // rejects them before reaching here.
         _ => {
             kind.saw_func();
         }
@@ -655,6 +655,67 @@ mod tests {
         right_schema: Schema,
     }
 
+    struct SingleLineageFixture {
+        schema: Schema,
+    }
+
+    impl SingleLineageFixture {
+        fn new() -> Self {
+            Self {
+                schema: base_schema(),
+            }
+        }
+
+        fn analyze(&self, sql: &str) -> ResolvedQuery {
+            let stmt = crate::sql::parser::parse_sql_raw(sql).expect("parse");
+            let sqlparser::ast::Statement::Query(query) = stmt else {
+                panic!("expected query");
+            };
+            let (resolved, _registry) =
+                crate::sql::analyzer::analyze(&query, &SingleLineageCatalog, "default")
+                    .expect("analyze");
+            resolved
+        }
+    }
+
+    struct SingleLineageCatalog;
+
+    impl CatalogProvider for SingleLineageCatalog {
+        fn get_table(&self, _database: &str, table: &str) -> Result<TableDef, String> {
+            match table {
+                "fact" => Ok(TableDef {
+                    name: table.to_string(),
+                    columns: vec![
+                        ColumnDef {
+                            name: "id".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                            write_default: None,
+                        },
+                        ColumnDef {
+                            name: "region".to_string(),
+                            data_type: arrow::datatypes::DataType::Utf8,
+                            nullable: false,
+                            write_default: None,
+                        },
+                        ColumnDef {
+                            name: "amount".to_string(),
+                            data_type: arrow::datatypes::DataType::Float64,
+                            nullable: true,
+                            write_default: None,
+                        },
+                    ],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    iceberg_table: None,
+                    storage: TableStorage::LocalParquetFile {
+                        path: std::path::PathBuf::from("/tmp/fact.parquet"),
+                    },
+                }),
+                _ => Err(format!("table not found: {table}")),
+            }
+        }
+    }
+
     impl JoinLineageFixture {
         fn new() -> Self {
             Self {
@@ -686,6 +747,11 @@ mod tests {
                             21,
                             "payload",
                             Type::Primitive(PrimitiveType::String),
+                        )),
+                        Arc::new(NestedField::optional(
+                            22,
+                            "amount",
+                            Type::Primitive(PrimitiveType::Double),
                         )),
                     ])
                     .build()
@@ -725,6 +791,12 @@ mod tests {
                             nullable: true,
                             write_default: None,
                         },
+                        ColumnDef {
+                            name: "amount".to_string(),
+                            data_type: arrow::datatypes::DataType::Float64,
+                            nullable: true,
+                            write_default: None,
+                        },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
@@ -735,6 +807,49 @@ mod tests {
                 _ => Err(format!("table not found: {table}")),
             }
         }
+    }
+
+    #[test]
+    fn single_base_aggregate_lineage_records_aggregate_input_columns() {
+        let fixture = SingleLineageFixture::new();
+        let resolved = fixture.analyze(
+            "select region, sum(amount) as total, count(amount) as non_null_amounts, count(*) as rows \
+             from ns.fact group by region",
+        );
+
+        let result = build_projection_filter_lineage(&resolved, &fixture.schema).expect("lineage");
+
+        assert_eq!(result.output_columns.len(), 4);
+        assert_eq!(
+            result.output_columns[0]
+                .expression
+                .referenced_base_field_ids,
+            vec![2]
+        );
+        assert_eq!(
+            result.output_columns[1]
+                .expression
+                .referenced_base_field_ids,
+            vec![3]
+        );
+        assert_eq!(
+            result.output_columns[2]
+                .expression
+                .referenced_base_field_ids,
+            vec![3]
+        );
+        assert!(
+            result.output_columns[3]
+                .expression
+                .referenced_base_field_ids
+                .is_empty()
+        );
+        let base_field_ids = result
+            .base_fields
+            .iter()
+            .map(|field| field.field_id)
+            .collect::<Vec<_>>();
+        assert_eq!(base_field_ids, vec![2, 3]);
     }
 
     mod join_lineage {
@@ -828,6 +943,40 @@ mod tests {
             assert!(
                 err.contains("one column from each join side"),
                 "unexpected error: {err}"
+            );
+        }
+
+        #[test]
+        fn aggregate_output_records_qualified_input_columns() {
+            let sql = "select l.id, sum(r.amount) as total \
+                       from ns.left_tbl l join ns.right_tbl r on l.id = r.id \
+                       group by l.id";
+            let fixture = JoinLineageFixture::new();
+            let resolved = fixture.analyze(sql);
+            let result = build_join_projection_filter_lineage(
+                &resolved,
+                &[
+                    ("ice.ns.left_tbl", "l", &fixture.left_schema),
+                    ("ice.ns.right_tbl", "r", &fixture.right_schema),
+                ],
+            )
+            .expect("join lineage");
+
+            assert_eq!(
+                result.output_columns[0].expression.referenced_base_fields,
+                vec![QualifiedFieldLineage {
+                    table_fqn: "ice.ns.left_tbl".to_string(),
+                    qualifier_at_create: "l".to_string(),
+                    field_id: 10,
+                }]
+            );
+            assert_eq!(
+                result.output_columns[1].expression.referenced_base_fields,
+                vec![QualifiedFieldLineage {
+                    table_fqn: "ice.ns.right_tbl".to_string(),
+                    qualifier_at_create: "r".to_string(),
+                    field_id: 22,
+                }]
             );
         }
     }

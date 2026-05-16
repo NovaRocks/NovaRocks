@@ -624,7 +624,7 @@ fn validate_aggregate_mv_input_type(
     ))
 }
 
-fn validate_unique_aggregate_physical_column_names(
+pub(crate) fn validate_unique_aggregate_physical_column_names(
     physical_columns: &[ManagedPhysicalColumn],
 ) -> Result<(), String> {
     let mut names = HashSet::with_capacity(physical_columns.len());
