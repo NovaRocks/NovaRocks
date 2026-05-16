@@ -166,6 +166,9 @@ pub enum ContractSelfCheckError {
         table_fqn: String,
         field_id: i32,
     },
+    JoinRowKeyRequiresJoinContract,
+    BaseRowIdRejectsJoinContract,
+    EmptyJoinPredicates,
     EmptyBaseTableUuid,
     NegativeBaseSchemaId(i32),
     DuplicateBaseFieldIdWithDifferentType {
@@ -236,6 +239,21 @@ impl std::fmt::Display for ContractSelfCheckError {
                     "MV contract JOIN predicate references unknown base field {table_fqn}#{field_id}"
                 )
             }
+            Self::JoinRowKeyRequiresJoinContract => {
+                write!(
+                    f,
+                    "MV contract JoinRowKey apply-key source requires a non-empty join contract"
+                )
+            }
+            Self::BaseRowIdRejectsJoinContract => {
+                write!(
+                    f,
+                    "MV contract BaseRowId apply-key source cannot be used with a join contract"
+                )
+            }
+            Self::EmptyJoinPredicates => {
+                write!(f, "MV contract join predicates must not be empty")
+            }
             Self::EmptyBaseTableUuid => write!(f, "MV contract base.table_uuid is empty"),
             Self::NegativeBaseSchemaId(id) => {
                 write!(f, "MV contract base.schema_id_at_create is negative: {id}")
@@ -288,20 +306,32 @@ impl MvSchemaContract {
                 actual: self.target.hidden_apply_key.column_name.clone(),
             });
         }
-        if self.base.table_uuid.is_empty() {
-            return Err(ContractSelfCheckError::EmptyBaseTableUuid);
+        match self.target.hidden_apply_key.source {
+            ApplyKeySource::JoinRowKey => match &self.join {
+                Some(join) if join.predicates.is_empty() => {
+                    return Err(ContractSelfCheckError::EmptyJoinPredicates);
+                }
+                Some(_) => {}
+                None => return Err(ContractSelfCheckError::JoinRowKeyRequiresJoinContract),
+            },
+            ApplyKeySource::BaseRowId => {
+                if self.join.is_some() {
+                    return Err(ContractSelfCheckError::BaseRowIdRejectsJoinContract);
+                }
+            }
         }
-        if self.base.schema_id_at_create < 0 {
-            return Err(ContractSelfCheckError::NegativeBaseSchemaId(
-                self.base.schema_id_at_create,
-            ));
+        let bases = self.effective_bases();
+        for base in &bases {
+            validate_base_contract(base)?;
         }
-        let known_field_ids: std::collections::BTreeSet<i32> = self
-            .base
-            .schema_at_create
-            .fields
+        let known_field_ids: std::collections::BTreeSet<i32> = bases
             .iter()
-            .map(|f| f.field_id)
+            .flat_map(|base| {
+                base.schema_at_create
+                    .fields
+                    .iter()
+                    .map(|field| field.field_id)
+            })
             .collect();
         for (i, col) in self.output.columns.iter().enumerate() {
             for fid in &col.expression.referenced_base_field_ids {
@@ -322,7 +352,6 @@ impl MvSchemaContract {
                 }
             }
         }
-        let bases = self.effective_bases();
         for (i, col) in self.output.columns.iter().enumerate() {
             for field in &col.expression.referenced_base_fields {
                 if !qualified_field_known(&bases, field) {
@@ -362,24 +391,36 @@ impl MvSchemaContract {
                 }
             }
         }
-        let mut seen: std::collections::BTreeMap<i32, &str> = std::collections::BTreeMap::new();
-        for f in &self.base.schema_at_create.fields {
-            if let Some(prev) = seen.get(&f.field_id) {
-                if *prev != f.type_signature.as_str() {
-                    return Err(
-                        ContractSelfCheckError::DuplicateBaseFieldIdWithDifferentType {
-                            field_id: f.field_id,
-                            first: prev.to_string(),
-                            second: f.type_signature.clone(),
-                        },
-                    );
-                }
-            } else {
-                seen.insert(f.field_id, &f.type_signature);
-            }
-        }
         Ok(())
     }
+}
+
+fn validate_base_contract(base: &BaseContract) -> Result<(), ContractSelfCheckError> {
+    if base.table_uuid.is_empty() {
+        return Err(ContractSelfCheckError::EmptyBaseTableUuid);
+    }
+    if base.schema_id_at_create < 0 {
+        return Err(ContractSelfCheckError::NegativeBaseSchemaId(
+            base.schema_id_at_create,
+        ));
+    }
+    let mut seen: std::collections::BTreeMap<i32, &str> = std::collections::BTreeMap::new();
+    for field in &base.schema_at_create.fields {
+        if let Some(prev) = seen.get(&field.field_id) {
+            if *prev != field.type_signature.as_str() {
+                return Err(
+                    ContractSelfCheckError::DuplicateBaseFieldIdWithDifferentType {
+                        field_id: field.field_id,
+                        first: prev.to_string(),
+                        second: field.type_signature.clone(),
+                    },
+                );
+            }
+        } else {
+            seen.insert(field.field_id, &field.type_signature);
+        }
+    }
+    Ok(())
 }
 
 fn qualified_field_known(bases: &[&BaseContract], field: &QualifiedFieldLineage) -> bool {
@@ -596,6 +637,15 @@ mod tests {
     }
 
     #[test]
+    fn contract_v2_accepts_legacy_field_id_from_secondary_base() {
+        let mut contract = sample_join_contract();
+        contract.output.columns[0]
+            .expression
+            .referenced_base_field_ids = vec![2];
+        contract.ensure_self_consistent().expect("self check");
+    }
+
+    #[test]
     fn contract_v2_rejects_output_reference_to_unknown_base() {
         let mut contract = sample_join_contract();
         contract.output.columns[0]
@@ -651,6 +701,68 @@ mod tests {
         assert!(matches!(
             contract.ensure_self_consistent(),
             Err(ContractSelfCheckError::HiddenApplyKeyColumnNameWrong { .. })
+        ));
+    }
+
+    #[test]
+    fn contract_v2_rejects_secondary_base_with_empty_uuid() {
+        let mut contract = sample_join_contract();
+        contract.bases[1].table_uuid = String::new();
+        assert!(matches!(
+            contract.ensure_self_consistent(),
+            Err(ContractSelfCheckError::EmptyBaseTableUuid)
+        ));
+    }
+
+    #[test]
+    fn contract_v2_rejects_secondary_base_duplicate_field_id_with_different_type() {
+        let mut contract = sample_join_contract();
+        contract.bases[1]
+            .schema_at_create
+            .fields
+            .push(BaseFieldRecord {
+                field_id: 2,
+                name_at_create: "id_again".to_string(),
+                type_signature: "string".to_string(),
+                required: true,
+            });
+        assert!(matches!(
+            contract.ensure_self_consistent(),
+            Err(ContractSelfCheckError::DuplicateBaseFieldIdWithDifferentType {
+                field_id: 2,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn contract_v2_rejects_join_row_key_without_join_contract() {
+        let mut contract = sample_join_contract();
+        contract.join = None;
+        assert!(matches!(
+            contract.ensure_self_consistent(),
+            Err(ContractSelfCheckError::JoinRowKeyRequiresJoinContract)
+        ));
+    }
+
+    #[test]
+    fn contract_v2_rejects_join_contract_with_empty_predicates() {
+        let mut contract = sample_join_contract();
+        contract.join.as_mut().expect("join").predicates.clear();
+        assert!(matches!(
+            contract.ensure_self_consistent(),
+            Err(ContractSelfCheckError::EmptyJoinPredicates)
+        ));
+    }
+
+    #[test]
+    fn contract_v2_rejects_base_row_id_with_join_contract() {
+        let mut contract = sample_join_contract();
+        contract.target.hidden_apply_key.column_name = HIDDEN_APPLY_KEY_COLUMN_NAME.to_string();
+        contract.target.hidden_apply_key.source = ApplyKeySource::BaseRowId;
+        assert!(matches!(
+            contract.ensure_self_consistent(),
+            Err(ContractSelfCheckError::BaseRowIdRejectsJoinContract)
         ));
     }
 
