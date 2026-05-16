@@ -385,6 +385,10 @@ impl MvSchemaContract {
 fn qualified_field_known(bases: &[&BaseContract], field: &QualifiedFieldLineage) -> bool {
     bases.iter().any(|base| {
         base.table_fqn == field.table_fqn
+            && matches!(
+                base.alias_at_create.as_deref(),
+                Some(alias) if alias.eq_ignore_ascii_case(&field.qualifier_at_create)
+            )
             && base
                 .schema_at_create
                 .fields
@@ -603,6 +607,15 @@ mod tests {
                 field_id: 99,
             });
         let err = contract.ensure_self_consistent().expect_err("unknown base");
+        assert!(err.to_string().contains("unknown base field"), "err={err}");
+    }
+
+    #[test]
+    fn contract_v2_rejects_output_reference_with_wrong_alias() {
+        let mut contract = sample_join_contract();
+        contract.output.columns[0].expression.referenced_base_fields[0].qualifier_at_create =
+            "wrong".to_string();
+        let err = contract.ensure_self_consistent().expect_err("wrong alias");
         assert!(err.to_string().contains("unknown base field"), "err={err}");
     }
 
