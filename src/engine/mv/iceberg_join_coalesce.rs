@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use arrow::array::{Array, ArrayRef, Int8Array, Int64Array, UInt32Array};
+use arrow::array::{Array, ArrayRef, Int64Array, Int8Array, UInt32Array};
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 
@@ -33,18 +33,8 @@ impl JoinDeltaCoalescer {
     }
 
     pub(crate) fn push_batch(&self, batch: RecordBatch) -> Result<(), String> {
-        let op_idx = batch
-            .schema()
-            .index_of(crate::exec::change_op::CHANGE_OP_COLUMN)
-            .map_err(|_| "join coalesce batch missing __change_op".to_string())?;
-        let left_idx = batch
-            .schema()
-            .index_of(crate::engine::mv::iceberg_join_branch::JOIN_LEFT_ROW_ID_COLUMN)
-            .map_err(|_| "join coalesce batch missing left row id".to_string())?;
-        let right_idx = batch
-            .schema()
-            .index_of(crate::engine::mv::iceberg_join_branch::JOIN_RIGHT_ROW_ID_COLUMN)
-            .map_err(|_| "join coalesce batch missing right row id".to_string())?;
+        let hidden_indices = hidden_column_indices(batch.schema().as_ref())?;
+        let [op_idx, left_idx, right_idx] = hidden_indices;
         let ops = batch
             .column(op_idx)
             .as_any()
@@ -83,9 +73,10 @@ impl JoinDeltaCoalescer {
                 &self.right_table_uuid,
                 right_ids.value(row),
             );
-            let payload = take_one_row_without_hidden_columns(&batch, row)?;
+            let payload = take_one_row_without_hidden_columns(&batch, row, &hidden_indices)?;
+            let mut remove_zero_net_key = false;
             {
-                let entry = rows.entry(key).or_insert(CoalescedRow {
+                let entry = rows.entry(key.clone()).or_insert(CoalescedRow {
                     net: 0,
                     payload: None,
                 });
@@ -99,6 +90,18 @@ impl JoinDeltaCoalescer {
                     }
                     entry.payload = Some(payload);
                 }
+                if entry.net.abs() > 1 {
+                    return Err(format!(
+                        "join coalesce net change_op {} for key {key}",
+                        entry.net
+                    ));
+                }
+                if entry.net == 0 {
+                    remove_zero_net_key = true;
+                }
+            }
+            if remove_zero_net_key {
+                rows.remove(&key);
             }
             if rows.len() > self.max_keys {
                 return Err(format!(
@@ -148,25 +151,51 @@ pub(crate) fn stable_join_row_key(
     format!("v1:{}", hex::encode(&digest[..16]))
 }
 
+fn hidden_column_indices(schema: &Schema) -> Result<[usize; 3], String> {
+    Ok([
+        find_unique_hidden_column(schema, crate::exec::change_op::CHANGE_OP_COLUMN)?,
+        find_unique_hidden_column(
+            schema,
+            crate::engine::mv::iceberg_join_branch::JOIN_LEFT_ROW_ID_COLUMN,
+        )?,
+        find_unique_hidden_column(
+            schema,
+            crate::engine::mv::iceberg_join_branch::JOIN_RIGHT_ROW_ID_COLUMN,
+        )?,
+    ])
+}
+
+fn find_unique_hidden_column(schema: &Schema, name: &str) -> Result<usize, String> {
+    let mut exact_idx = None;
+    for (idx, field) in schema.fields().iter().enumerate() {
+        if field.name() == name {
+            if exact_idx.replace(idx).is_some() {
+                return Err(format!(
+                    "join coalesce hidden column {name} appears more than once"
+                ));
+            }
+        } else if field.name().eq_ignore_ascii_case(name) {
+            return Err(format!(
+                "join coalesce hidden column {name} collides with field {}",
+                field.name()
+            ));
+        }
+    }
+    exact_idx.ok_or_else(|| format!("join coalesce batch missing {name}"))
+}
+
 fn take_one_row_without_hidden_columns(
     batch: &RecordBatch,
     row: usize,
+    hidden_indices: &[usize; 3],
 ) -> Result<RecordBatch, String> {
-    let hidden = [
-        crate::exec::change_op::CHANGE_OP_COLUMN,
-        crate::engine::mv::iceberg_join_branch::JOIN_LEFT_ROW_ID_COLUMN,
-        crate::engine::mv::iceberg_join_branch::JOIN_RIGHT_ROW_ID_COLUMN,
-    ];
     let row_u32 = u32::try_from(row).map_err(|_| format!("row index {row} exceeds u32"))?;
     let indices = UInt32Array::from(vec![row_u32]);
     let schema = batch.schema();
     let mut fields = Vec::new();
     let mut columns: Vec<ArrayRef> = Vec::new();
     for (idx, field) in schema.fields().iter().enumerate() {
-        if hidden
-            .iter()
-            .any(|name| field.name().eq_ignore_ascii_case(name))
-        {
+        if hidden_indices.contains(&idx) {
             continue;
         }
         fields.push(field.as_ref().clone());
@@ -291,7 +320,7 @@ impl crate::exec::pipeline::operator::ProcessorOperator for IcebergJoinCoalesceS
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int8Array, Int64Array, StringArray};
+    use arrow::array::{Int64Array, Int8Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
@@ -347,10 +376,66 @@ mod tests {
         coalescer
             .push_batch(batch(crate::exec::change_op::CHANGE_OP_INSERT, 1, 2, "a"))
             .unwrap();
-        coalescer
+        let err = coalescer
             .push_batch(batch(crate::exec::change_op::CHANGE_OP_INSERT, 1, 2, "a"))
-            .unwrap();
-        let err = coalescer.finish_for_test().expect_err("net > 1");
+            .expect_err("net > 1");
         assert!(err.contains("net change_op"), "err={err}");
+    }
+
+    #[test]
+    fn coalescer_drops_zero_net_keys_before_budget_check() {
+        let coalescer =
+            JoinDeltaCoalescer::new("left-uuid".to_string(), "right-uuid".to_string(), 1);
+        for key in 0..16 {
+            coalescer
+                .push_batch(batch(crate::exec::change_op::CHANGE_OP_INSERT, key, 2, "a"))
+                .unwrap();
+            coalescer
+                .push_batch(batch(crate::exec::change_op::CHANGE_OP_DELETE, key, 2, "a"))
+                .unwrap();
+        }
+        let rows = coalescer.finish_for_test().unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn coalescer_rejects_case_insensitive_hidden_column_collision() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("value", DataType::Utf8, false),
+                Field::new(
+                    crate::exec::change_op::CHANGE_OP_COLUMN,
+                    DataType::Int8,
+                    false,
+                ),
+                Field::new("__CHANGE_OP", DataType::Utf8, false),
+                Field::new(
+                    crate::engine::mv::iceberg_join_branch::JOIN_LEFT_ROW_ID_COLUMN,
+                    DataType::Int64,
+                    false,
+                ),
+                Field::new(
+                    crate::engine::mv::iceberg_join_branch::JOIN_RIGHT_ROW_ID_COLUMN,
+                    DataType::Int64,
+                    false,
+                ),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["a"])),
+                Arc::new(Int8Array::from(vec![
+                    crate::exec::change_op::CHANGE_OP_INSERT,
+                ])),
+                Arc::new(StringArray::from(vec!["visible"])),
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![2])),
+            ],
+        )
+        .unwrap();
+        let coalescer =
+            JoinDeltaCoalescer::new("left-uuid".to_string(), "right-uuid".to_string(), 10_000);
+        let err = coalescer
+            .push_batch(batch)
+            .expect_err("hidden column collision");
+        assert!(err.contains("collides with field __CHANGE_OP"), "err={err}");
     }
 }
