@@ -1,0 +1,14 @@
+-- query 4
+id	amount	label
+1	100	old-a
+2	200	old-b
+
+-- query 7
+id	amount	label
+2	200	new-b
+3	300	new-c
+
+-- query 8
+id	amount	label
+2	200	new-b
+3	300	new-c

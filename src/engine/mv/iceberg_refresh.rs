@@ -3657,13 +3657,19 @@ fn append_join_apply_hidden_projection(
     constant_insert: bool,
 ) -> Result<(), String> {
     let change_expr = if constant_insert {
-        sqlparser::ast::Expr::Value(
-            sqlparser::ast::Value::Number(
-                crate::exec::change_op::CHANGE_OP_INSERT.to_string(),
-                false,
-            )
-            .into(),
-        )
+        sqlparser::ast::Expr::Cast {
+            kind: sqlparser::ast::CastKind::Cast,
+            expr: Box::new(sqlparser::ast::Expr::Value(
+                sqlparser::ast::Value::Number(
+                    crate::exec::change_op::CHANGE_OP_INSERT.to_string(),
+                    false,
+                )
+                .into(),
+            )),
+            data_type: sqlparser::ast::DataType::TinyInt(None),
+            array: false,
+            format: None,
+        }
     } else {
         return Err("join hidden projection requires a constant insert marker".to_string());
     };
@@ -5847,6 +5853,48 @@ mod tests {
 
         assert!(rewritten.contains("VERSION AS OF"));
         assert!(rewritten.contains(&snapshot_id.to_string()));
+    }
+
+    #[test]
+    fn rewrite_join_full_refresh_uses_tinyint_change_op() {
+        let mut query = parse_select_query(
+            "SELECT l.id FROM ice.db.left_orders AS l \
+             JOIN ice.db.right_orders AS r ON l.rid = r.rid",
+        );
+        let left_ref = IcebergTableRef {
+            catalog: "ice".to_string(),
+            namespace: "db".to_string(),
+            table: "left_orders".to_string(),
+        };
+        let right_ref = IcebergTableRef {
+            catalog: "ice".to_string(),
+            namespace: "db".to_string(),
+            table: "right_orders".to_string(),
+        };
+
+        rewrite_join_full_refresh_query(&mut query, &left_ref, 11, &right_ref, 22, "l", "r")
+            .expect("rewrite join full refresh");
+
+        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected select");
+        };
+        let change_item = select
+            .projection
+            .iter()
+            .rev()
+            .nth(2)
+            .expect("change-op projection");
+        let sqlparser::ast::SelectItem::ExprWithAlias { expr, alias } = change_item else {
+            panic!("expected aliased change-op projection");
+        };
+        assert_eq!(alias.value, crate::exec::change_op::CHANGE_OP_COLUMN);
+        assert!(matches!(
+            expr,
+            sqlparser::ast::Expr::Cast {
+                data_type: sqlparser::ast::DataType::TinyInt(_),
+                ..
+            }
+        ));
     }
 
     #[test]

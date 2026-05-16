@@ -2288,6 +2288,28 @@ fn choose_standalone_execution(build_result: MultiFragmentBuildResult) -> Standa
     StandaloneExecutionPlan::Coordinated(Box::new(build_result))
 }
 
+fn collapse_distribution_enforcers_for_single_fragment(
+    mut node: crate::sql::optimizer::PhysicalPlanNode,
+) -> crate::sql::optimizer::PhysicalPlanNode {
+    use crate::sql::optimizer::operator::{JoinDistribution, Operator};
+
+    node.children = node
+        .children
+        .into_iter()
+        .map(collapse_distribution_enforcers_for_single_fragment)
+        .collect();
+
+    if let Operator::PhysicalHashJoin(join) = &mut node.op {
+        join.distribution = JoinDistribution::Broadcast;
+    }
+
+    if matches!(&node.op, Operator::PhysicalDistribution(_)) && node.children.len() == 1 {
+        return node.children.into_iter().next().expect("single child");
+    }
+
+    node
+}
+
 /// Produce EXPLAIN output for a query without executing it.
 fn explain_query(
     query: &sqlparser::ast::Query,
@@ -2355,7 +2377,11 @@ pub(crate) fn execute_query_with_options(
     let (resolved, cte_registry) = crate::sql::analyzer::analyze(query, catalog, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry)?;
     let table_stats = build_table_stats_from_plan(&logical);
-    let physical = crate::sql::optimizer::optimize(logical, &table_stats)?;
+    let mut physical = crate::sql::optimizer::optimize(logical, &table_stats)?;
+    let force_single_fragment = terminal_sink.is_some();
+    if force_single_fragment {
+        physical = collapse_distribution_enforcers_for_single_fragment(physical);
+    }
     let build_result = crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
         &physical,
         catalog,
@@ -3029,6 +3055,76 @@ path = "{metadata_path}"
         )
         .expect("write metadata config");
         config_path
+    }
+
+    #[test]
+    fn single_fragment_collapse_removes_distribution_enforcers() {
+        use crate::sql::analysis::JoinKind;
+        use crate::sql::optimizer::operator::{
+            JoinDistribution, Operator, PhysicalDistributionOp, PhysicalHashJoinOp,
+            PhysicalValuesOp,
+        };
+        use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
+        use crate::sql::optimizer::property::DistributionSpec;
+        use crate::sql::optimizer::statistics::Statistics;
+
+        fn stats() -> Statistics {
+            Statistics {
+                output_row_count: 0.0,
+                column_statistics: Default::default(),
+            }
+        }
+
+        fn values_node() -> PhysicalPlanNode {
+            PhysicalPlanNode {
+                op: Operator::PhysicalValues(PhysicalValuesOp {
+                    rows: Vec::new(),
+                    columns: Vec::new(),
+                }),
+                children: Vec::new(),
+                stats: stats(),
+                output_columns: Vec::new(),
+            }
+        }
+
+        fn distributed_values_node() -> PhysicalPlanNode {
+            PhysicalPlanNode {
+                op: Operator::PhysicalDistribution(PhysicalDistributionOp {
+                    spec: DistributionSpec::Gather,
+                }),
+                children: vec![values_node()],
+                stats: stats(),
+                output_columns: Vec::new(),
+            }
+        }
+
+        let plan = PhysicalPlanNode {
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: Vec::new(),
+                other_condition: None,
+                distribution: JoinDistribution::Shuffle,
+            }),
+            children: vec![distributed_values_node(), distributed_values_node()],
+            stats: stats(),
+            output_columns: Vec::new(),
+        };
+
+        let collapsed = super::collapse_distribution_enforcers_for_single_fragment(plan);
+
+        assert!(matches!(
+            &collapsed.op,
+            Operator::PhysicalHashJoin(join)
+                if matches!(&join.distribution, JoinDistribution::Broadcast)
+        ));
+        assert!(matches!(
+            &collapsed.children[0].op,
+            Operator::PhysicalValues(_)
+        ));
+        assert!(matches!(
+            &collapsed.children[1].op,
+            Operator::PhysicalValues(_)
+        ));
     }
 
     #[test]
