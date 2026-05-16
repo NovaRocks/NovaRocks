@@ -65,16 +65,22 @@ pub(crate) fn rewrite_join_branch_query(
     let [join] = from.joins.as_mut_slice() else {
         return Err("join branch rewrite requires one JOIN".to_string());
     };
-    let effective_left_alias =
+    let left_branch =
         rewrite_branch_factor(&mut from.relation, &plan.left_base, plan.left, left_alias)?;
-    let effective_right_alias = rewrite_branch_factor(
+    let right_branch = rewrite_branch_factor(
         &mut join.relation,
         &plan.right_base,
         plan.right,
         right_alias,
     )?;
-    append_join_hidden_projection(select, &effective_left_alias, &effective_right_alias);
+    append_join_hidden_projection(select, &left_branch, &right_branch)?;
     Ok(query)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BranchRewrite {
+    alias: sqlparser::ast::Ident,
+    is_delta: bool,
 }
 
 fn rewrite_branch_factor(
@@ -82,67 +88,81 @@ fn rewrite_branch_factor(
     base: &crate::connector::starrocks::managed::model::IcebergTableRef,
     side: BranchSide,
     alias: &str,
-) -> Result<String, String> {
+) -> Result<BranchRewrite, String> {
     match side {
         BranchSide::Delta(window) => {
-            let effective_alias = table_factor_alias_name(factor)
+            let effective_alias = table_factor_alias(factor)
                 .ok_or_else(|| "join branch delta side must be a table".to_string())?
-                .unwrap_or_else(|| alias.to_string());
-            *factor = build_nr_ivm_delta_table_factor_for_join(base, window, &effective_alias);
-            Ok(effective_alias)
+                .unwrap_or_else(|| sqlparser::ast::Ident::new(alias));
+            *factor =
+                build_nr_ivm_delta_table_factor_for_join(base, window, effective_alias.clone());
+            Ok(BranchRewrite {
+                alias: effective_alias,
+                is_delta: true,
+            })
         }
         BranchSide::Snapshot(snapshot_id) => {
             let sqlparser::ast::TableFactor::Table {
                 name,
                 version,
                 alias: factor_alias,
+                args,
                 ..
             } = factor
             else {
                 return Err("join branch snapshot side must be a table".to_string());
             };
-            *name = snapshot_table_object_name(base, snapshot_id);
-            *version = None;
+            if args.is_some() {
+                return Err("join branch snapshot side must be a base table".to_string());
+            }
+            *name = base_table_object_name(base);
+            *version = Some(sqlparser::ast::TableVersion::VersionAsOf(
+                sqlparser::ast::Expr::Value(
+                    sqlparser::ast::Value::Number(snapshot_id.to_string(), false).into(),
+                ),
+            ));
             let effective_alias = factor_alias
                 .as_ref()
-                .map(|alias| alias.name.value.clone())
-                .unwrap_or_else(|| alias.to_string());
+                .map(|alias| alias.name.clone())
+                .unwrap_or_else(|| sqlparser::ast::Ident::new(alias));
             if factor_alias.is_none() {
                 *factor_alias = Some(sqlparser::ast::TableAlias {
                     explicit: true,
-                    name: sqlparser::ast::Ident::new(&effective_alias),
+                    name: effective_alias.clone(),
                     columns: Vec::new(),
                 });
             }
-            Ok(effective_alias)
+            Ok(BranchRewrite {
+                alias: effective_alias,
+                is_delta: false,
+            })
         }
     }
 }
 
-fn table_factor_alias_name(factor: &sqlparser::ast::TableFactor) -> Option<Option<String>> {
+fn table_factor_alias(
+    factor: &sqlparser::ast::TableFactor,
+) -> Option<Option<sqlparser::ast::Ident>> {
     let sqlparser::ast::TableFactor::Table { alias, .. } = factor else {
         return None;
     };
-    Some(alias.as_ref().map(|alias| alias.name.value.clone()))
+    Some(alias.as_ref().map(|alias| alias.name.clone()))
 }
 
-fn snapshot_table_object_name(
+fn base_table_object_name(
     base: &crate::connector::starrocks::managed::model::IcebergTableRef,
-    snapshot_id: i64,
 ) -> sqlparser::ast::ObjectName {
     sqlparser::ast::ObjectName(vec![
+        sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new(&base.catalog)),
         sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new(&base.namespace)),
-        sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new(format!(
-            "{}__at_{}",
-            base.table, snapshot_id
-        ))),
+        sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new(&base.table)),
     ])
 }
 
 fn build_nr_ivm_delta_table_factor_for_join(
     base: &crate::connector::starrocks::managed::model::IcebergTableRef,
     window: SnapshotWindow,
-    alias: &str,
+    alias: sqlparser::ast::Ident,
 ) -> sqlparser::ast::TableFactor {
     use sqlparser::ast as sqlast;
     let make_string_arg = |s: String| -> sqlast::FunctionArg {
@@ -161,7 +181,7 @@ fn build_nr_ivm_delta_table_factor_for_join(
         )]),
         alias: Some(sqlast::TableAlias {
             explicit: true,
-            name: sqlast::Ident::new(alias),
+            name: alias,
             columns: Vec::new(),
         }),
         args: Some(sqlast::TableFunctionArgs {
@@ -184,29 +204,50 @@ fn build_nr_ivm_delta_table_factor_for_join(
 
 fn append_join_hidden_projection(
     select: &mut sqlparser::ast::Select,
-    left_alias: &str,
-    right_alias: &str,
-) {
+    left_branch: &BranchRewrite,
+    right_branch: &BranchRewrite,
+) -> Result<(), String> {
+    let delta_alias = match (left_branch.is_delta, right_branch.is_delta) {
+        (true, false) => &left_branch.alias,
+        (false, true) => &right_branch.alias,
+        (false, false) => {
+            return Err("join branch rewrite requires exactly one delta side".to_string());
+        }
+        (true, true) => {
+            return Err("join branch rewrite requires exactly one delta side".to_string());
+        }
+    };
+    select.projection.push(change_op_alias(delta_alias));
     select
         .projection
-        .push(sqlparser::ast::SelectItem::UnnamedExpr(
-            sqlparser::ast::Expr::Identifier(sqlparser::ast::Ident::new(
-                crate::exec::change_op::CHANGE_OP_COLUMN,
-            )),
-        ));
+        .push(row_id_alias(&left_branch.alias, JOIN_LEFT_ROW_ID_COLUMN));
     select
         .projection
-        .push(row_id_alias(left_alias, JOIN_LEFT_ROW_ID_COLUMN));
-    select
-        .projection
-        .push(row_id_alias(right_alias, JOIN_RIGHT_ROW_ID_COLUMN));
+        .push(row_id_alias(&right_branch.alias, JOIN_RIGHT_ROW_ID_COLUMN));
+    Ok(())
 }
 
-fn row_id_alias(alias: &str, output: &str) -> sqlparser::ast::SelectItem {
+fn change_op_alias(alias: &sqlparser::ast::Ident) -> sqlparser::ast::SelectItem {
+    qualified_alias(
+        alias,
+        crate::exec::change_op::CHANGE_OP_COLUMN,
+        crate::exec::change_op::CHANGE_OP_COLUMN,
+    )
+}
+
+fn row_id_alias(alias: &sqlparser::ast::Ident, output: &str) -> sqlparser::ast::SelectItem {
+    qualified_alias(alias, "_row_id", output)
+}
+
+fn qualified_alias(
+    qualifier: &sqlparser::ast::Ident,
+    column: &str,
+    output: &str,
+) -> sqlparser::ast::SelectItem {
     sqlparser::ast::SelectItem::ExprWithAlias {
         expr: sqlparser::ast::Expr::CompoundIdentifier(vec![
-            sqlparser::ast::Ident::new(alias),
-            sqlparser::ast::Ident::new("_row_id"),
+            qualifier.clone(),
+            sqlparser::ast::Ident::new(column),
         ]),
         alias: sqlparser::ast::Ident::new(output),
     }
@@ -285,9 +326,74 @@ mod tests {
         let rewritten = rewrite_join_branch_query(&query, &plan, "l", "r").expect("rewrite");
         let rendered = rewritten.to_string();
         assert!(rendered.contains("__nr_ivm_delta"), "sql={rendered}");
-        assert!(rendered.contains("right__at_20"), "sql={rendered}");
+        assert!(rendered.contains("VERSION AS OF 20"), "sql={rendered}");
+        assert!(
+            rendered.contains("l.__change_op AS __change_op"),
+            "sql={rendered}"
+        );
         assert!(rendered.contains("__nova_left_row_id"), "sql={rendered}");
         assert!(rendered.contains("__nova_right_row_id"), "sql={rendered}");
+    }
+
+    #[test]
+    fn branch_rewrite_snapshot_left_delta_right_qualifies_change_op_with_right_alias() {
+        let query = parse_query(
+            "select l.id, r.label from ice.ns.left l join ice.ns.right r on l.id = r.id",
+        );
+        let left = base("left");
+        let right = base("right");
+        let plan = JoinDeltaBranchPlan {
+            left_base: left,
+            right_base: right,
+            left: BranchSide::Snapshot(11),
+            right: BranchSide::Delta(SnapshotWindow { from: 20, to: 21 }),
+        };
+        let rewritten = rewrite_join_branch_query(&query, &plan, "l", "r").expect("rewrite");
+        let rendered = rewritten.to_string();
+        assert!(rendered.contains("VERSION AS OF 11"), "sql={rendered}");
+        assert!(
+            rendered.contains("r.__change_op AS __change_op"),
+            "sql={rendered}"
+        );
+        assert!(rendered.contains("__nr_ivm_delta"), "sql={rendered}");
+        assert!(rendered.contains("__nova_left_row_id"), "sql={rendered}");
+        assert!(rendered.contains("__nova_right_row_id"), "sql={rendered}");
+    }
+
+    #[test]
+    fn branch_rewrite_preserves_quoted_aliases_in_hidden_projection() {
+        let query = parse_query(
+            "select `Left Alias`.id, `Right Alias`.label \
+             from ice.ns.left as `Left Alias` \
+             join ice.ns.right as `Right Alias` on `Left Alias`.id = `Right Alias`.id",
+        );
+        let left = base("left");
+        let right = base("right");
+        let plan = JoinDeltaBranchPlan {
+            left_base: left,
+            right_base: right,
+            left: BranchSide::Delta(SnapshotWindow { from: 10, to: 11 }),
+            right: BranchSide::Snapshot(20),
+        };
+        let rewritten = rewrite_join_branch_query(&query, &plan, "fallback_left", "fallback_right")
+            .expect("rewrite");
+        let rendered = rewritten.to_string();
+        assert!(
+            rendered.contains("`Left Alias`.__change_op AS __change_op"),
+            "sql={rendered}"
+        );
+        assert!(
+            rendered.contains("`Left Alias`._row_id AS __nova_left_row_id"),
+            "sql={rendered}"
+        );
+        assert!(
+            rendered.contains("`Right Alias`._row_id AS __nova_right_row_id"),
+            "sql={rendered}"
+        );
+        assert!(
+            !rendered.contains("fallback_left") && !rendered.contains("fallback_right"),
+            "sql={rendered}"
+        );
     }
 
     fn parse_query(sql: &str) -> sqlparser::ast::Query {
