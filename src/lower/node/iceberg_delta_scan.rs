@@ -141,6 +141,11 @@ pub(crate) fn lower_iceberg_delta_scan_node(
         } else {
             std::collections::HashMap::new()
         };
+        let deleted_data_file_paths = batch
+            .deleted_data_files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect();
         let previous_delete_visibility =
             crate::engine::delete_flow::load_existing_delete_visibility_by_data_file_at(
                 &loaded.table,
@@ -151,6 +156,7 @@ pub(crate) fn lower_iceberg_delta_scan_node(
             base_data_file_lineage,
             previous_delete_visibility,
             previous_data_file_lineage,
+            deleted_data_file_paths,
         })
     } else {
         None

@@ -85,7 +85,7 @@ impl JoinDeltaCoalescer {
             );
             let payload = take_one_row_without_hidden_columns(&batch, row, &hidden_indices)?;
             let entry = rows.entry(key.clone()).or_default();
-            entry.push_delta(delta, payload, &key)?;
+            entry.push_delta(delta, payload)?;
             if entry.is_empty() {
                 rows.remove(&key);
             }
@@ -221,7 +221,7 @@ impl JoinDeltaCoalescer {
 }
 
 impl CoalescedRow {
-    fn push_delta(&mut self, delta: i32, payload: RecordBatch, key: &str) -> Result<(), String> {
+    fn push_delta(&mut self, delta: i32, payload: RecordBatch) -> Result<(), String> {
         if let Some(pos) = self.payloads.iter().position(|existing| {
             existing.net == -delta && payloads_equal(&existing.payload, &payload)
         }) {
@@ -238,19 +238,13 @@ impl CoalescedRow {
             .find(|existing| payloads_equal(&existing.payload, &payload))
         {
             existing.net += delta;
-            if existing.net.abs() > 1 {
-                return Err(format!(
-                    "join coalesce net change_op {} for key {key}",
-                    existing.net
-                ));
-            }
-            return self.validate_pending_shape(key);
+            return Ok(());
         }
         self.payloads.push(CoalescedPayload {
             net: delta,
             payload,
         });
-        self.validate_pending_shape(key)
+        Ok(())
     }
 
     fn pending_payloads(&self, key: &str) -> Result<Vec<&CoalescedPayload>, String> {
@@ -615,16 +609,62 @@ mod tests {
     }
 
     #[test]
-    fn coalescer_rejects_abs_net_greater_than_one() {
+    fn coalescer_allows_transient_multiple_inserts_before_matching_delete() {
+        let coalescer =
+            JoinDeltaCoalescer::new("left-uuid".to_string(), "right-uuid".to_string(), 10_000);
+        coalescer
+            .push_batch(batch(crate::exec::change_op::CHANGE_OP_INSERT, 1, 2, "old"))
+            .unwrap();
+        coalescer
+            .push_batch(batch(crate::exec::change_op::CHANGE_OP_INSERT, 1, 2, "new"))
+            .unwrap();
+        coalescer
+            .push_batch(batch(crate::exec::change_op::CHANGE_OP_DELETE, 1, 2, "old"))
+            .unwrap();
+
+        let pending = coalescer.pending_change_counts().unwrap();
+        assert_eq!(pending.added_rows, 1);
+        assert_eq!(pending.deleted_rows, 0);
+    }
+
+    #[test]
+    fn coalescer_rejects_unbalanced_duplicate_same_sign_payload_at_finish() {
         let coalescer =
             JoinDeltaCoalescer::new("left-uuid".to_string(), "right-uuid".to_string(), 10_000);
         coalescer
             .push_batch(batch(crate::exec::change_op::CHANGE_OP_INSERT, 1, 2, "a"))
             .unwrap();
-        let err = coalescer
+        coalescer
             .push_batch(batch(crate::exec::change_op::CHANGE_OP_INSERT, 1, 2, "a"))
-            .expect_err("net > 1");
-        assert!(err.contains("net change_op"), "err={err}");
+            .unwrap();
+
+        let err = match coalescer.pending_change_counts() {
+            Ok(_) => panic!("expected unbalanced duplicate same-sign payload"),
+            Err(err) => err,
+        };
+        assert!(err.contains("unsupported net change_op 2"), "err={err}");
+    }
+
+    #[test]
+    fn coalescer_balances_duplicate_same_payload_telescope_events() {
+        let coalescer =
+            JoinDeltaCoalescer::new("left-uuid".to_string(), "right-uuid".to_string(), 10_000);
+        coalescer
+            .push_batch(batch(crate::exec::change_op::CHANGE_OP_INSERT, 1, 2, "a"))
+            .unwrap();
+        coalescer
+            .push_batch(batch(crate::exec::change_op::CHANGE_OP_INSERT, 1, 2, "a"))
+            .unwrap();
+        coalescer
+            .push_batch(batch(crate::exec::change_op::CHANGE_OP_DELETE, 1, 2, "a"))
+            .unwrap();
+        coalescer
+            .push_batch(batch(crate::exec::change_op::CHANGE_OP_DELETE, 1, 2, "a"))
+            .unwrap();
+
+        let pending = coalescer.pending_change_counts().unwrap();
+        assert_eq!(pending.added_rows, 0);
+        assert_eq!(pending.deleted_rows, 0);
     }
 
     #[test]

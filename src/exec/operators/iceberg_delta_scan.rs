@@ -612,16 +612,28 @@ fn open_position_delete_scanner(
             file.path
         )
     })?;
+    let lineage = position_delete_lineage_lookup(delete_side);
     let rows = crate::connector::iceberg::changes::scan_position_delete_rows_for_targets(
         &node.iceberg_runtime.base_table,
         &delete,
-        &delete_side.base_data_file_lineage,
+        &lineage,
+        &delete_side.deleted_data_file_paths,
         node.iceberg_runtime.object_store_factory.as_ref(),
         node.object_store_config.as_ref(),
     )?;
     Ok(Box::new(PositionDeleteScanner {
         batches: rows.into_iter(),
     }))
+}
+
+fn position_delete_lineage_lookup(
+    delete_side: &crate::exec::node::iceberg_delta_scan::DeltaScanDeleteSide,
+) -> std::collections::HashMap<String, crate::exec::node::iceberg_delta_scan::BaseDataFileLineage> {
+    let mut lineage = delete_side.base_data_file_lineage.clone();
+    for (path, previous) in &delete_side.previous_data_file_lineage {
+        lineage.entry(path.clone()).or_insert(*previous);
+    }
+    lineage
 }
 
 struct EqualityDeleteScanner {
@@ -755,6 +767,51 @@ fn open_deleted_data_file_scanner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn position_delete_lineage_lookup_falls_back_to_previous_snapshot_files() {
+        let mut current = std::collections::HashMap::new();
+        current.insert(
+            "current.parquet".to_string(),
+            crate::exec::node::iceberg_delta_scan::BaseDataFileLineage {
+                first_row_id: 100,
+                data_sequence_number: 7,
+            },
+        );
+        current.insert(
+            "rewritten.parquet".to_string(),
+            crate::exec::node::iceberg_delta_scan::BaseDataFileLineage {
+                first_row_id: 200,
+                data_sequence_number: 8,
+            },
+        );
+        let mut previous = std::collections::HashMap::new();
+        previous.insert(
+            "deleted-later.parquet".to_string(),
+            crate::exec::node::iceberg_delta_scan::BaseDataFileLineage {
+                first_row_id: 300,
+                data_sequence_number: 9,
+            },
+        );
+        previous.insert(
+            "rewritten.parquet".to_string(),
+            crate::exec::node::iceberg_delta_scan::BaseDataFileLineage {
+                first_row_id: 400,
+                data_sequence_number: 10,
+            },
+        );
+        let delete_side = crate::exec::node::iceberg_delta_scan::DeltaScanDeleteSide {
+            base_data_file_lineage: current,
+            previous_delete_visibility: Default::default(),
+            previous_data_file_lineage: previous,
+            deleted_data_file_paths: Default::default(),
+        };
+
+        let lineage = position_delete_lineage_lookup(&delete_side);
+        assert_eq!(lineage["current.parquet"].first_row_id, 100);
+        assert_eq!(lineage["deleted-later.parquet"].first_row_id, 300);
+        assert_eq!(lineage["rewritten.parquet"].first_row_id, 200);
+    }
 
     /// Compile-only smoke test: the factory type is wired up and its trait
     /// implementations resolve. Semantic verification of empty-stream

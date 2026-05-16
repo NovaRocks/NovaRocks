@@ -150,8 +150,8 @@ pub struct IcebergRuntimeHandles {
 /// Per-target-data-file v3 row-lineage metadata required by the delete-side
 /// scanners in `IcebergDeltaScanOperator` to synthesize the
 /// `_file` / `_pos` / `_row_id` / `_last_updated_sequence_number` virtual
-/// columns when reverse-projecting deleted rows. Filled in by
-/// `base_data_file_lineage_index` from the previous-snapshot read view.
+/// columns when reverse-projecting deleted rows. Filled in from the relevant
+/// snapshot read views.
 #[derive(Clone, Copy, Debug)]
 pub struct BaseDataFileLineage {
     pub first_row_id: i64,
@@ -172,4 +172,8 @@ pub struct DeltaScanDeleteSide {
     /// the manifest-level `first_row_id` on the original APPEND, leaving
     /// the per-DataFile field `None`).
     pub previous_data_file_lineage: std::collections::HashMap<String, BaseDataFileLineage>,
+    /// Data files removed by overwrite snapshots inside this delta range.
+    /// Position deletes that target one of these files are subsumed by the
+    /// deleted-data-file role and must not be emitted a second time.
+    pub(crate) deleted_data_file_paths: std::collections::HashSet<String>,
 }

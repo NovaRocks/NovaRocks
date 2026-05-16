@@ -567,6 +567,7 @@ pub(crate) fn scan_position_delete_rows_for_targets(
         String,
         crate::exec::node::iceberg_delta_scan::BaseDataFileLineage,
     >,
+    suppressed_data_files: &std::collections::HashSet<String>,
     factory: &crate::fs::opendal::OpendalRangeReaderFactory,
     object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
@@ -577,6 +578,7 @@ pub(crate) fn scan_position_delete_rows_for_targets(
         base_table.file_io(),
         size_lookup,
         |path| base_data_file_lineage.get(path).copied(),
+        suppressed_data_files,
         |path| normalize_delete_projection_path(path, object_store_config),
     )
     .map_err(|e| e.to_string())
