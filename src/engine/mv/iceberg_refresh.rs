@@ -411,6 +411,7 @@ fn build_iceberg_mv_schema_contract(
                     filter: lineage.filter,
                 },
                 join: None,
+                aggregate: None,
                 target: target_contract(
                     analysis,
                     target,
@@ -469,6 +470,7 @@ fn build_iceberg_mv_schema_contract(
                     filter: join_lineage.filter,
                 },
                 join: Some(join_lineage.join),
+                aggregate: None,
                 target: target_contract(
                     analysis,
                     target,
@@ -4807,6 +4809,7 @@ fn incremental_refresh_iceberg_mv(
         collector: Arc::clone(&collector),
         locator_state,
         apply_key_column: ICEBERG_MV_APPLY_KEY_COLUMN.to_string(),
+        apply_key_value_type: crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::Int64,
     };
     let merge_sink =
         crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkFactory::new(merge_sink_plan);

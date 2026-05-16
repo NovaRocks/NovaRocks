@@ -35,11 +35,18 @@ use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::global_async_runtime::data_block_on;
 use crate::runtime::runtime_state::RuntimeState;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApplyKeyValueType {
+    Int64,
+    Utf8,
+}
+
 pub struct IcebergMergeSinkPlan {
     pub target_table: iceberg::table::Table,
     pub collector: Arc<IcebergCommitCollector>,
     pub locator_state: Option<TargetLocatorState>,
     pub apply_key_column: String,
+    pub apply_key_value_type: ApplyKeyValueType,
 }
 
 pub struct TargetLocatorState {
@@ -184,24 +191,59 @@ impl IcebergMergeSinkOperator {
              load_target_apply_locator_inputs when has_deletes)"
                 .to_string()
         })?;
-        let apply_keys =
-            extract_apply_key_values_from_record_batch(&batch, &self.plan.apply_key_column)?;
-        if apply_keys.is_empty() {
-            return Ok(());
-        }
-        let groups = data_block_on(
-            crate::engine::mv::iceberg_target_apply::locate_target_rows_by_apply_key(
-                &self.plan.target_table,
-                &apply_keys,
-                &locator_state.existing_deletes_by_file,
-                &locator_state.referenced_data_file_partitions,
-            ),
-        )??;
+        let groups = match self.plan.apply_key_value_type {
+            ApplyKeyValueType::Int64 => {
+                validate_i64_apply_key_column(&self.plan.apply_key_column)?;
+                let apply_keys = extract_i64_apply_key_values_from_record_batch(
+                    &batch,
+                    &self.plan.apply_key_column,
+                )?;
+                if apply_keys.is_empty() {
+                    return Ok(());
+                }
+                data_block_on(
+                    crate::engine::mv::iceberg_target_apply::locate_target_rows_by_apply_key(
+                        &self.plan.target_table,
+                        &apply_keys,
+                        &locator_state.existing_deletes_by_file,
+                        &locator_state.referenced_data_file_partitions,
+                    ),
+                )??
+            }
+            ApplyKeyValueType::Utf8 => {
+                let apply_keys = extract_utf8_apply_key_values_from_record_batch(
+                    &batch,
+                    &self.plan.apply_key_column,
+                )?;
+                if apply_keys.is_empty() {
+                    return Ok(());
+                }
+                data_block_on(
+                    crate::engine::mv::iceberg_target_apply::locate_target_rows_by_string_apply_key(
+                        &self.plan.target_table,
+                        &self.plan.apply_key_column,
+                        &apply_keys,
+                        &locator_state.existing_deletes_by_file,
+                        &locator_state.referenced_data_file_partitions,
+                    ),
+                )??
+            }
+        };
         for group in groups {
             self.plan.collector.inject_delete_group(group);
         }
         Ok(())
     }
+}
+
+fn validate_i64_apply_key_column(apply_key_column: &str) -> Result<(), String> {
+    if apply_key_column != crate::engine::mv::iceberg_target_apply::ICEBERG_MV_APPLY_KEY_COLUMN {
+        return Err(format!(
+            "merge sink: Int64 apply-key column must be {}, got {apply_key_column}",
+            crate::engine::mv::iceberg_target_apply::ICEBERG_MV_APPLY_KEY_COLUMN
+        ));
+    }
+    Ok(())
 }
 
 struct FailedSinkOperator {
@@ -313,7 +355,7 @@ fn strip_change_op(batch: RecordBatch) -> Result<RecordBatch, String> {
         .map_err(|e| format!("merge sink strip __change_op: {e}"))
 }
 
-fn extract_apply_key_values_from_record_batch(
+fn extract_i64_apply_key_values_from_record_batch(
     batch: &RecordBatch,
     apply_key_column: &str,
 ) -> Result<Vec<i64>, String> {
@@ -334,10 +376,31 @@ fn extract_apply_key_values_from_record_batch(
         .collect()
 }
 
+fn extract_utf8_apply_key_values_from_record_batch(
+    batch: &RecordBatch,
+    apply_key_column: &str,
+) -> Result<Vec<String>, String> {
+    let idx = batch.schema().index_of(apply_key_column).map_err(|_| {
+        format!("merge sink: DELETE batch missing apply-key column {apply_key_column}")
+    })?;
+    let arr = batch
+        .column(idx)
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .ok_or_else(|| format!("merge sink: apply-key column {apply_key_column} must be Utf8"))?;
+    arr.iter()
+        .map(|v| {
+            v.map(str::to_string).ok_or_else(|| {
+                format!("merge sink: null value in apply-key column {apply_key_column}")
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{ArrayRef, Int8Array, Int32Array};
+    use arrow::array::{ArrayRef, Int8Array, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
 
@@ -427,8 +490,35 @@ mod tests {
             vec![Arc::new(Int32Array::from(vec![1])) as ArrayRef],
         )
         .unwrap();
-        let err =
-            extract_apply_key_values_from_record_batch(&batch, "__nova_base_row_id").unwrap_err();
+        let err = extract_i64_apply_key_values_from_record_batch(&batch, "__nova_base_row_id")
+            .unwrap_err();
         assert!(err.contains("missing apply-key column"));
+    }
+
+    #[test]
+    fn extract_utf8_apply_key_values_accepts_strings() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "__row_id__",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec!["g1", "g2"])) as ArrayRef],
+        )
+        .unwrap();
+
+        let values = extract_utf8_apply_key_values_from_record_batch(&batch, "__row_id__")
+            .expect("utf8 keys");
+
+        assert_eq!(values, vec!["g1".to_string(), "g2".to_string()]);
+    }
+
+    #[test]
+    fn int64_apply_key_column_rejects_non_base_row_id_column() {
+        let err = validate_i64_apply_key_column("__some_other_i64").unwrap_err();
+
+        assert!(err.contains("__some_other_i64"), "err={err}");
+        assert!(err.contains("__nova_base_row_id"), "err={err}");
     }
 }

@@ -9,8 +9,8 @@
 //! contracts result in fail-fast errors that propagate to the user.
 
 use crate::meta::repository::mv_contract::{
-    ApplyKeySource, HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME,
-    MvPartitionTransformContract, MvSchemaContract,
+    ApplyKeySource, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME,
+    JOIN_APPLY_KEY_COLUMN_NAME, MvPartitionTransformContract, MvSchemaContract,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -67,6 +67,9 @@ pub(crate) enum SchemaEvolutionError {
         reason: String,
     },
     TargetPartitionSpecChanged {
+        reason: String,
+    },
+    AggregateStateContractBroken {
         reason: String,
     },
 }
@@ -137,6 +140,10 @@ impl std::fmt::Display for SchemaEvolutionError {
                 f,
                 "iceberg MV refresh blocked: target partition spec changed externally ({reason}); recreate the MV"
             ),
+            Self::AggregateStateContractBroken { reason } => write!(
+                f,
+                "iceberg MV refresh blocked: target aggregate state contract broken ({reason}); recreate the MV"
+            ),
         }
     }
 }
@@ -191,6 +198,11 @@ fn validate_schema_contract_after_identity(
     if base_schema.schema_id() == contract.base.schema_id_at_create
         && target_schema.schema_id() == contract.target.schema_id_at_create
     {
+        if contract.aggregate.is_some() {
+            if let Some(err) = check_target_schema(contract, target_schema) {
+                return ContractDecision::Incompatible(err);
+            }
+        }
         return ContractDecision::CompatibleSafe;
     }
     // Stage 2 precise base check.
@@ -433,6 +445,7 @@ fn check_target_schema(
     let expected_hidden_apply_key_column = match expected.source {
         ApplyKeySource::BaseRowId => HIDDEN_APPLY_KEY_COLUMN_NAME,
         ApplyKeySource::JoinRowKey => JOIN_APPLY_KEY_COLUMN_NAME,
+        ApplyKeySource::GroupRowId => GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
     };
     if !field
         .name
@@ -442,6 +455,9 @@ fn check_target_schema(
             reason: format!("hidden apply-key column renamed to {}", field.name),
         });
     }
+    if let Some(err) = check_aggregate_state_schema(contract, current) {
+        return Some(err);
+    }
     if !field.required {
         return Some(SchemaEvolutionError::HiddenApplyKeyContractBroken {
             reason: "hidden apply-key column must be required".to_string(),
@@ -449,7 +465,9 @@ fn check_target_schema(
     }
     let expected_apply_key_type = match expected.source {
         ApplyKeySource::BaseRowId => iceberg::spec::PrimitiveType::Long,
-        ApplyKeySource::JoinRowKey => iceberg::spec::PrimitiveType::String,
+        ApplyKeySource::JoinRowKey | ApplyKeySource::GroupRowId => {
+            iceberg::spec::PrimitiveType::String
+        }
     };
     match field.field_type.as_ref() {
         iceberg::spec::Type::Primitive(actual) if actual == &expected_apply_key_type => {}
@@ -457,6 +475,127 @@ fn check_target_schema(
             return Some(SchemaEvolutionError::HiddenApplyKeyContractBroken {
                 reason: format!(
                     "hidden apply-key column must be {expected_apply_key_type:?}, got {other}"
+                ),
+            });
+        }
+    }
+    None
+}
+
+fn check_aggregate_state_schema(
+    contract: &MvSchemaContract,
+    current: &iceberg::spec::StructType,
+) -> Option<SchemaEvolutionError> {
+    let aggregate = contract.aggregate.as_ref()?;
+    if aggregate.state_layout_version != 1 {
+        return Some(SchemaEvolutionError::AggregateStateContractBroken {
+            reason: format!(
+                "aggregate state layout version {} is unsupported; expected 1",
+                aggregate.state_layout_version
+            ),
+        });
+    }
+    if aggregate.state_columns.is_empty() {
+        return Some(SchemaEvolutionError::AggregateStateContractBroken {
+            reason: "aggregate state columns must not be empty".to_string(),
+        });
+    }
+    if aggregate.row_id_column_name != GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME {
+        return Some(SchemaEvolutionError::AggregateStateContractBroken {
+            reason: format!(
+                "aggregate row-id column name expected {}, got {}",
+                GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, aggregate.row_id_column_name
+            ),
+        });
+    }
+    let mut row_id_matches = current.fields().iter().filter(|field| {
+        field
+            .name
+            .eq_ignore_ascii_case(&aggregate.row_id_column_name)
+    });
+    let Some(row_id_field) = row_id_matches.next() else {
+        return Some(SchemaEvolutionError::AggregateStateContractBroken {
+            reason: format!(
+                "aggregate row-id column {} not found",
+                aggregate.row_id_column_name
+            ),
+        });
+    };
+    if row_id_matches.next().is_some() {
+        return Some(SchemaEvolutionError::AggregateStateContractBroken {
+            reason: format!(
+                "aggregate row-id column {} is duplicated",
+                aggregate.row_id_column_name
+            ),
+        });
+    }
+    if row_id_field.id != contract.target.hidden_apply_key.target_field_id {
+        return Some(SchemaEvolutionError::AggregateStateContractBroken {
+            reason: format!(
+                "aggregate row-id field id {} must match hidden apply-key field id {}",
+                row_id_field.id, contract.target.hidden_apply_key.target_field_id
+            ),
+        });
+    }
+    if !row_id_field.required {
+        return Some(SchemaEvolutionError::AggregateStateContractBroken {
+            reason: format!(
+                "aggregate row-id column {} must be required",
+                aggregate.row_id_column_name
+            ),
+        });
+    }
+    match row_id_field.field_type.as_ref() {
+        iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::String) => {}
+        other => {
+            return Some(SchemaEvolutionError::AggregateStateContractBroken {
+                reason: format!(
+                    "aggregate row-id column {} must be String, got {other}",
+                    aggregate.row_id_column_name
+                ),
+            });
+        }
+    }
+
+    for state_col in &aggregate.state_columns {
+        let Some(field) = current
+            .fields()
+            .iter()
+            .find(|field| field.id == state_col.target_field_id)
+        else {
+            return Some(SchemaEvolutionError::AggregateStateContractBroken {
+                reason: format!(
+                    "aggregate state column {} field id {} not found",
+                    state_col.column_name, state_col.target_field_id
+                ),
+            });
+        };
+        if !field.name.eq_ignore_ascii_case(&state_col.column_name) {
+            return Some(SchemaEvolutionError::AggregateStateContractBroken {
+                reason: format!(
+                    "aggregate state column {} field id {} renamed to {}",
+                    state_col.column_name, state_col.target_field_id, field.name
+                ),
+            });
+        }
+        let sig = format!("{}", field.field_type);
+        if sig != state_col.type_signature {
+            return Some(SchemaEvolutionError::AggregateStateContractBroken {
+                reason: format!(
+                    "aggregate state column {} field id {} changed type from {} to {}",
+                    state_col.column_name, state_col.target_field_id, state_col.type_signature, sig
+                ),
+            });
+        }
+        let actual_nullable = !field.required;
+        if actual_nullable != state_col.nullable {
+            return Some(SchemaEvolutionError::AggregateStateContractBroken {
+                reason: format!(
+                    "aggregate state column {} field id {} nullable changed from {} to {}",
+                    state_col.column_name,
+                    state_col.target_field_id,
+                    state_col.nullable,
+                    actual_nullable
                 ),
             });
         }
@@ -475,11 +614,13 @@ fn row_lineage_enabled(props: &std::collections::HashMap<String, String>) -> boo
 mod tests {
     use super::*;
     use crate::meta::repository::mv_contract::{
+        AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
         ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
-        ExpressionLineage, HiddenApplyKeyContract, JOIN_APPLY_KEY_COLUMN_NAME, JoinContract,
-        JoinContractKind, JoinPredicateLineage, MvPartitionContract, MvPartitionFieldContract,
-        MvPartitionTransformContract, OutputColumnLineage, OutputContract, QualifiedFieldLineage,
-        TargetContract, TargetVisibleColumn,
+        ExpressionLineage, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HiddenApplyKeyContract,
+        JOIN_APPLY_KEY_COLUMN_NAME, JoinContract, JoinContractKind, JoinPredicateLineage,
+        MvPartitionContract, MvPartitionFieldContract, MvPartitionTransformContract,
+        OutputColumnLineage, OutputContract, QualifiedFieldLineage, TargetContract,
+        TargetVisibleColumn,
     };
     use std::sync::Arc;
 
@@ -643,6 +784,7 @@ mod tests {
                 filter: None,
             },
             join: None,
+            aggregate: None,
             target: TargetContract {
                 table_fqn: "ice.db.mv_orders".to_string(),
                 table_uuid: "target-uuid".to_string(),
@@ -703,6 +845,7 @@ mod tests {
                 filter: None,
             },
             join: None,
+            aggregate: None,
             target: TargetContract {
                 table_fqn: "ice.db.mv_orders".to_string(),
                 table_uuid: "target-uuid".to_string(),
@@ -815,6 +958,7 @@ mod tests {
                     },
                 }],
             }),
+            aggregate: None,
             target: TargetContract {
                 table_fqn: "ice.db.mv_join".to_string(),
                 table_uuid: "target-uuid".to_string(),
@@ -838,5 +982,307 @@ mod tests {
             validate_schema_contract_after_identity(&contract, &base_schema, &target_schema);
 
         assert_eq!(decision, ContractDecision::CompatibleSafe);
+    }
+
+    #[test]
+    fn aggregate_state_target_layout_is_accepted() {
+        let target_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long);
+        let base_schema = iceberg::spec::Schema::builder()
+            .with_schema_id(7)
+            .with_fields(vec![])
+            .build()
+            .expect("base schema");
+        let target_schema =
+            aggregate_target_schema("__agg_state_c", iceberg::spec::PrimitiveType::Long, false);
+        let contract = aggregate_schema_contract(format!("{target_type}"));
+
+        let decision =
+            validate_schema_contract_after_identity(&contract, &base_schema, &target_schema);
+
+        assert_eq!(decision, ContractDecision::CompatibleSafe);
+    }
+
+    #[test]
+    fn aggregate_state_target_layout_rejects_renamed_state_column() {
+        let target_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long);
+        let base_schema = iceberg::spec::Schema::builder()
+            .with_schema_id(7)
+            .with_fields(vec![])
+            .build()
+            .expect("base schema");
+        let target_schema =
+            aggregate_target_schema("renamed_state", iceberg::spec::PrimitiveType::Long, false);
+        let contract = aggregate_schema_contract(format!("{target_type}"));
+
+        let decision =
+            validate_schema_contract_after_identity(&contract, &base_schema, &target_schema);
+
+        match decision {
+            ContractDecision::Incompatible(
+                SchemaEvolutionError::AggregateStateContractBroken { reason },
+            ) => {
+                assert!(reason.contains("__agg_state_c"), "reason={reason}");
+                assert!(reason.contains("renamed"), "reason={reason}");
+            }
+            other => panic!("unexpected decision: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aggregate_state_target_layout_rejects_type_changed_state_column() {
+        let target_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long);
+        let base_schema = iceberg::spec::Schema::builder()
+            .with_schema_id(7)
+            .with_fields(vec![])
+            .build()
+            .expect("base schema");
+        let target_schema =
+            aggregate_target_schema("__agg_state_c", iceberg::spec::PrimitiveType::String, false);
+        let contract = aggregate_schema_contract(format!("{target_type}"));
+
+        let decision =
+            validate_schema_contract_after_identity(&contract, &base_schema, &target_schema);
+
+        match decision {
+            ContractDecision::Incompatible(
+                SchemaEvolutionError::AggregateStateContractBroken { reason },
+            ) => {
+                assert!(reason.contains("__agg_state_c"), "reason={reason}");
+                assert!(reason.contains("changed type"), "reason={reason}");
+            }
+            other => panic!("unexpected decision: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aggregate_state_validation_runs_on_schema_id_fast_path() {
+        let target_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long);
+        let base_schema = iceberg::spec::Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![])
+            .build()
+            .expect("base schema");
+        let target_schema =
+            aggregate_target_schema("__agg_state_c", iceberg::spec::PrimitiveType::String, false);
+        let mut contract = aggregate_schema_contract(format!("{target_type}"));
+        contract.target.schema_id_at_create = 11;
+
+        let decision =
+            validate_schema_contract_after_identity(&contract, &base_schema, &target_schema);
+
+        match decision {
+            ContractDecision::Incompatible(
+                SchemaEvolutionError::AggregateStateContractBroken { reason },
+            ) => {
+                assert!(reason.contains("__agg_state_c"), "reason={reason}");
+                assert!(reason.contains("changed type"), "reason={reason}");
+            }
+            other => panic!("unexpected decision: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aggregate_state_target_layout_rejects_nullable_row_id_column() {
+        let target_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long);
+        let base_schema = iceberg::spec::Schema::builder()
+            .with_schema_id(7)
+            .with_fields(vec![])
+            .build()
+            .expect("base schema");
+        let target_schema = aggregate_target_schema_with_row_id(
+            "__agg_state_c",
+            iceberg::spec::PrimitiveType::Long,
+            false,
+            2,
+            true,
+        );
+        let contract = aggregate_schema_contract(format!("{target_type}"));
+
+        let decision =
+            validate_schema_contract_after_identity(&contract, &base_schema, &target_schema);
+
+        match decision {
+            ContractDecision::Incompatible(
+                SchemaEvolutionError::AggregateStateContractBroken { reason },
+            ) => {
+                assert!(reason.contains("row-id"), "reason={reason}");
+                assert!(reason.contains("required"), "reason={reason}");
+            }
+            other => panic!("unexpected decision: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aggregate_state_target_layout_rejects_row_id_that_is_not_hidden_apply_key() {
+        let target_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long);
+        let base_schema = iceberg::spec::Schema::builder()
+            .with_schema_id(7)
+            .with_fields(vec![])
+            .build()
+            .expect("base schema");
+        let target_schema = aggregate_target_schema_with_extra_string_column(
+            "__agg_state_c",
+            iceberg::spec::PrimitiveType::Long,
+            "other_key",
+            false,
+        );
+        let mut contract = aggregate_schema_contract(format!("{target_type}"));
+        contract
+            .aggregate
+            .as_mut()
+            .expect("aggregate")
+            .row_id_column_name = "other_key".to_string();
+
+        let decision =
+            validate_schema_contract_after_identity(&contract, &base_schema, &target_schema);
+
+        match decision {
+            ContractDecision::Incompatible(
+                SchemaEvolutionError::AggregateStateContractBroken { reason },
+            ) => {
+                assert!(reason.contains("row-id"), "reason={reason}");
+                assert!(reason.contains("__row_id__"), "reason={reason}");
+            }
+            other => panic!("unexpected decision: {other:?}"),
+        }
+    }
+
+    fn aggregate_target_schema_with_extra_string_column(
+        state_column_name: &str,
+        state_column_type: iceberg::spec::PrimitiveType,
+        extra_column_name: &str,
+        extra_nullable: bool,
+    ) -> iceberg::spec::Schema {
+        let extra_field = if extra_nullable {
+            iceberg::spec::NestedField::optional(
+                4,
+                extra_column_name,
+                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::String),
+            )
+        } else {
+            iceberg::spec::NestedField::required(
+                4,
+                extra_column_name,
+                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::String),
+            )
+        };
+        let mut fields = aggregate_target_schema(state_column_name, state_column_type, false)
+            .as_struct()
+            .fields()
+            .to_vec();
+        fields.push(Arc::new(extra_field));
+        iceberg::spec::Schema::builder()
+            .with_schema_id(11)
+            .with_fields(fields)
+            .build()
+            .expect("target schema")
+    }
+
+    fn aggregate_target_schema(
+        state_column_name: &str,
+        state_column_type: iceberg::spec::PrimitiveType,
+        state_column_nullable: bool,
+    ) -> iceberg::spec::Schema {
+        aggregate_target_schema_with_row_id(
+            state_column_name,
+            state_column_type,
+            state_column_nullable,
+            2,
+            false,
+        )
+    }
+
+    fn aggregate_target_schema_with_row_id(
+        state_column_name: &str,
+        state_column_type: iceberg::spec::PrimitiveType,
+        state_column_nullable: bool,
+        row_id_field_id: i32,
+        row_id_nullable: bool,
+    ) -> iceberg::spec::Schema {
+        let state_type = iceberg::spec::Type::Primitive(state_column_type);
+        let state_field = if state_column_nullable {
+            iceberg::spec::NestedField::optional(3, state_column_name, state_type)
+        } else {
+            iceberg::spec::NestedField::required(3, state_column_name, state_type)
+        };
+        let row_id_field = if row_id_nullable {
+            iceberg::spec::NestedField::optional(
+                row_id_field_id,
+                GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
+                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::String),
+            )
+        } else {
+            iceberg::spec::NestedField::required(
+                row_id_field_id,
+                GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
+                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::String),
+            )
+        };
+        iceberg::spec::Schema::builder()
+            .with_schema_id(11)
+            .with_fields(vec![
+                Arc::new(iceberg::spec::NestedField::required(
+                    1,
+                    "id",
+                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long),
+                )),
+                Arc::new(row_id_field),
+                Arc::new(state_field),
+            ])
+            .build()
+            .expect("target schema")
+    }
+
+    fn aggregate_schema_contract(state_type_signature: String) -> MvSchemaContract {
+        MvSchemaContract {
+            contract_version: 3,
+            base: BaseContract {
+                table_fqn: "ice.db.orders".to_string(),
+                table_uuid: "base-uuid".to_string(),
+                alias_at_create: None,
+                schema_id_at_create: 0,
+                schema_at_create: BaseSchemaSnapshot { fields: vec![] },
+            },
+            bases: vec![],
+            output: OutputContract {
+                columns: vec![OutputColumnLineage {
+                    expression: ExpressionLineage {
+                        kind: ExpressionKind::Column,
+                        referenced_base_field_ids: vec![],
+                        referenced_base_fields: vec![],
+                    },
+                }],
+                filter: None,
+            },
+            join: None,
+            aggregate: Some(AggregateStateContract {
+                state_layout_version: 1,
+                row_id_column_name: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
+                state_columns: vec![AggregateStateColumnContract {
+                    column_name: "__agg_state_c".to_string(),
+                    target_field_id: 3,
+                    type_signature: state_type_signature,
+                    nullable: false,
+                    role: AggregateStateRoleContract::Single,
+                }],
+            }),
+            target: TargetContract {
+                table_fqn: "ice.db.mv_agg".to_string(),
+                table_uuid: "target-uuid".to_string(),
+                schema_id_at_create: 0,
+                visible_columns: vec![TargetVisibleColumn {
+                    output_name: "id".to_string(),
+                    target_field_id: 1,
+                    type_signature: "long".to_string(),
+                    nullable: false,
+                }],
+                hidden_apply_key: HiddenApplyKeyContract {
+                    column_name: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
+                    target_field_id: 2,
+                    source: ApplyKeySource::GroupRowId,
+                },
+                partition: None,
+            },
+        }
     }
 }

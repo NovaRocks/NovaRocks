@@ -15,6 +15,8 @@ pub struct MvSchemaContract {
     pub output: OutputContract,
     #[serde(default)]
     pub join: Option<JoinContract>,
+    #[serde(default)]
+    pub aggregate: Option<AggregateStateContract>,
     pub target: TargetContract,
 }
 
@@ -75,6 +77,31 @@ pub enum JoinContractKind {
 pub struct JoinPredicateLineage {
     pub left: QualifiedFieldLineage,
     pub right: QualifiedFieldLineage,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AggregateStateContract {
+    pub state_layout_version: u16,
+    pub row_id_column_name: String,
+    pub state_columns: Vec<AggregateStateColumnContract>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AggregateStateColumnContract {
+    pub column_name: String,
+    pub target_field_id: i32,
+    pub type_signature: String,
+    pub nullable: bool,
+    pub role: AggregateStateRoleContract,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AggregateStateRoleContract {
+    Single,
+    AvgSum,
+    AvgCount,
+    RetractionCount,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,6 +188,7 @@ pub enum MvPartitionTransformContract {
 pub enum ApplyKeySource {
     BaseRowId,
     JoinRowKey,
+    GroupRowId,
 }
 
 /// Errors returned by `MvSchemaContract::ensure_self_consistent`.
@@ -198,6 +226,13 @@ pub enum ContractSelfCheckError {
     },
     JoinRowKeyRequiresJoinContract,
     BaseRowIdRejectsJoinContract,
+    GroupRowIdRequiresAggregateContract,
+    AggregateRowIdColumnNameWrong {
+        expected: String,
+        actual: String,
+    },
+    UnsupportedAggregateStateLayoutVersion(u16),
+    EmptyAggregateStateColumns,
     EmptyJoinPredicates,
     EmptyBaseTableUuid,
     NegativeBaseSchemaId(i32),
@@ -288,6 +323,27 @@ impl std::fmt::Display for ContractSelfCheckError {
                     "MV contract BaseRowId apply-key source cannot be used with a join contract"
                 )
             }
+            Self::GroupRowIdRequiresAggregateContract => {
+                write!(
+                    f,
+                    "MV contract GroupRowId apply-key source requires an aggregate state contract"
+                )
+            }
+            Self::AggregateRowIdColumnNameWrong { expected, actual } => {
+                write!(
+                    f,
+                    "MV contract aggregate row-id column name expected {expected}, got {actual}"
+                )
+            }
+            Self::UnsupportedAggregateStateLayoutVersion(version) => {
+                write!(
+                    f,
+                    "MV contract aggregate state layout version {version} is unsupported; expected 1"
+                )
+            }
+            Self::EmptyAggregateStateColumns => {
+                write!(f, "MV contract aggregate state columns must not be empty")
+            }
             Self::EmptyJoinPredicates => {
                 write!(f, "MV contract join predicates must not be empty")
             }
@@ -328,6 +384,7 @@ impl std::error::Error for ContractSelfCheckError {}
 
 pub const HIDDEN_APPLY_KEY_COLUMN_NAME: &str = "__nova_base_row_id";
 pub const JOIN_APPLY_KEY_COLUMN_NAME: &str = "__nova_join_row_key";
+pub const GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME: &str = "__row_id__";
 
 impl MvSchemaContract {
     fn effective_bases(&self) -> Vec<&BaseContract> {
@@ -351,6 +408,7 @@ impl MvSchemaContract {
         let expected_hidden_apply_key_column = match self.target.hidden_apply_key.source {
             ApplyKeySource::BaseRowId => HIDDEN_APPLY_KEY_COLUMN_NAME,
             ApplyKeySource::JoinRowKey => JOIN_APPLY_KEY_COLUMN_NAME,
+            ApplyKeySource::GroupRowId => GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
         };
         if self.target.hidden_apply_key.column_name != expected_hidden_apply_key_column {
             return Err(ContractSelfCheckError::HiddenApplyKeyColumnNameWrong {
@@ -370,6 +428,29 @@ impl MvSchemaContract {
                 if self.join.is_some() {
                     return Err(ContractSelfCheckError::BaseRowIdRejectsJoinContract);
                 }
+            }
+            ApplyKeySource::GroupRowId => {
+                if self.aggregate.is_none() {
+                    return Err(ContractSelfCheckError::GroupRowIdRequiresAggregateContract);
+                }
+            }
+        }
+        if let Some(aggregate) = &self.aggregate {
+            if aggregate.row_id_column_name != GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME {
+                return Err(ContractSelfCheckError::AggregateRowIdColumnNameWrong {
+                    expected: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
+                    actual: aggregate.row_id_column_name.clone(),
+                });
+            }
+            if aggregate.state_layout_version != 1 {
+                return Err(
+                    ContractSelfCheckError::UnsupportedAggregateStateLayoutVersion(
+                        aggregate.state_layout_version,
+                    ),
+                );
+            }
+            if aggregate.state_columns.is_empty() {
+                return Err(ContractSelfCheckError::EmptyAggregateStateColumns);
             }
         }
         let bases = self.effective_bases();
@@ -553,6 +634,7 @@ mod tests {
                 filter: None,
             },
             join: None,
+            aggregate: None,
             target: TargetContract {
                 table_fqn: "ice.mv.orders_mv".to_string(),
                 table_uuid: "22222222-2222-2222-2222-222222222222".to_string(),
@@ -743,6 +825,133 @@ mod tests {
             contract.target.hidden_apply_key.source,
             ApplyKeySource::JoinRowKey
         );
+    }
+
+    #[test]
+    fn aggregate_contract_accepts_group_row_id_with_join_contract() {
+        let mut contract = sample_contract();
+        contract.contract_version = 3;
+        let mut fact_base = contract.base.clone();
+        fact_base.alias_at_create = Some("f".to_string());
+        let mut dim_base = contract.base.clone();
+        dim_base.alias_at_create = Some("d".to_string());
+        contract.bases = vec![fact_base, dim_base];
+        contract.join = Some(JoinContract {
+            kind: JoinContractKind::InnerEquiJoin,
+            predicates: vec![JoinPredicateLineage {
+                left: QualifiedFieldLineage {
+                    table_fqn: contract.base.table_fqn.clone(),
+                    qualifier_at_create: "f".to_string(),
+                    field_id: 1,
+                },
+                right: QualifiedFieldLineage {
+                    table_fqn: contract.base.table_fqn.clone(),
+                    qualifier_at_create: "d".to_string(),
+                    field_id: 1,
+                },
+            }],
+        });
+        contract.aggregate = Some(AggregateStateContract {
+            state_layout_version: 1,
+            row_id_column_name: "__row_id__".to_string(),
+            state_columns: vec![AggregateStateColumnContract {
+                column_name: "__agg_state_c".to_string(),
+                target_field_id: 3,
+                type_signature: "long".to_string(),
+                nullable: false,
+                role: AggregateStateRoleContract::Single,
+            }],
+        });
+        contract.target.hidden_apply_key = HiddenApplyKeyContract {
+            column_name: "__row_id__".to_string(),
+            target_field_id: 1,
+            source: ApplyKeySource::GroupRowId,
+        };
+
+        contract.ensure_self_consistent().expect("self check");
+    }
+
+    #[test]
+    fn group_row_id_apply_key_requires_aggregate_contract() {
+        let mut contract = sample_contract();
+        contract.contract_version = 3;
+        contract.target.hidden_apply_key = HiddenApplyKeyContract {
+            column_name: "__row_id__".to_string(),
+            target_field_id: 1,
+            source: ApplyKeySource::GroupRowId,
+        };
+
+        let err = contract.ensure_self_consistent().expect_err("rejected");
+        assert!(err.to_string().contains("GroupRowId"), "err={err}");
+    }
+
+    #[test]
+    fn aggregate_contract_rejects_wrong_row_id_column_name() {
+        let mut contract = sample_contract();
+        contract.contract_version = 3;
+        contract.aggregate = Some(AggregateStateContract {
+            state_layout_version: 1,
+            row_id_column_name: "other_key".to_string(),
+            state_columns: vec![AggregateStateColumnContract {
+                column_name: "__agg_state_c".to_string(),
+                target_field_id: 3,
+                type_signature: "long".to_string(),
+                nullable: false,
+                role: AggregateStateRoleContract::Single,
+            }],
+        });
+        contract.target.hidden_apply_key = HiddenApplyKeyContract {
+            column_name: "__row_id__".to_string(),
+            target_field_id: 1,
+            source: ApplyKeySource::GroupRowId,
+        };
+
+        let err = contract.ensure_self_consistent().expect_err("rejected");
+        assert!(err.to_string().contains("row-id"), "err={err}");
+    }
+
+    #[test]
+    fn aggregate_contract_rejects_unsupported_layout_version() {
+        let mut contract = sample_contract();
+        contract.contract_version = 3;
+        contract.aggregate = Some(AggregateStateContract {
+            state_layout_version: 2,
+            row_id_column_name: "__row_id__".to_string(),
+            state_columns: vec![AggregateStateColumnContract {
+                column_name: "__agg_state_c".to_string(),
+                target_field_id: 3,
+                type_signature: "long".to_string(),
+                nullable: false,
+                role: AggregateStateRoleContract::Single,
+            }],
+        });
+        contract.target.hidden_apply_key = HiddenApplyKeyContract {
+            column_name: "__row_id__".to_string(),
+            target_field_id: 1,
+            source: ApplyKeySource::GroupRowId,
+        };
+
+        let err = contract.ensure_self_consistent().expect_err("rejected");
+        assert!(err.to_string().contains("layout version"), "err={err}");
+    }
+
+    #[test]
+    fn aggregate_contract_rejects_empty_state_columns() {
+        let mut contract = sample_contract();
+        contract.contract_version = 3;
+        contract.aggregate = Some(AggregateStateContract {
+            state_layout_version: 1,
+            row_id_column_name: "__row_id__".to_string(),
+            state_columns: vec![],
+        });
+        contract.target.hidden_apply_key = HiddenApplyKeyContract {
+            column_name: "__row_id__".to_string(),
+            target_field_id: 1,
+            source: ApplyKeySource::GroupRowId,
+        };
+
+        let err = contract.ensure_self_consistent().expect_err("rejected");
+        assert!(err.to_string().contains("state columns"), "err={err}");
     }
 
     #[test]
@@ -941,6 +1150,7 @@ mod tests {
                     },
                 }],
             }),
+            aggregate: None,
             target: TargetContract {
                 table_fqn: "ice.ns.mv".to_string(),
                 table_uuid: "target-uuid".to_string(),
