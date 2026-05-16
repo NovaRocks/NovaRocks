@@ -1113,6 +1113,13 @@ fn rewrite_full_refresh_select_with_pin(
     Ok(stmt.to_string())
 }
 
+fn iceberg_aggregate_first_refresh_select_sql(
+    select_sql: &str,
+    shape: &crate::connector::starrocks::managed::mv_shape::AggregateMvShape,
+) -> Result<String, String> {
+    crate::connector::starrocks::managed::mv_shape::rewrite_select_sql_for_state(select_sql, shape)
+}
+
 /// Refresh an iceberg-backed materialized view.
 ///
 /// Strategy dispatch:
@@ -1162,6 +1169,22 @@ pub(crate) fn refresh_iceberg_mv(
         current_database,
     );
     let shape = classify_incremental_mv_query(&canonical_select_query)?;
+    if let Some(aggregate_shape) = aggregate_shape_for_layout(&shape) {
+        return refresh_iceberg_aggregate_mv(
+            state,
+            &target,
+            &target_entry,
+            &iceberg_catalog,
+            &target_loaded.table,
+            expected_main_snapshot_id_from_table(&target_loaded.table),
+            current_catalog,
+            current_database,
+            &mv_definition,
+            &base_refs,
+            &shape,
+            &aggregate_shape,
+        );
+    }
     if is_join_projection_filter_mv(&shape) {
         let IncrementalMvShape::JoinProjectionFilter(join_shape) = &shape else {
             unreachable!("checked join shape above");
@@ -1385,6 +1408,386 @@ pub(crate) fn refresh_iceberg_mv(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn refresh_iceberg_aggregate_mv(
+    state: &Arc<StandaloneState>,
+    target: &IcebergMvTarget,
+    target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    iceberg_catalog: &Arc<dyn iceberg::Catalog>,
+    target_table: &iceberg::table::Table,
+    expected_main_snapshot_id: Option<i64>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    mv_definition: &StoredMvDefinition,
+    base_refs: &[IcebergTableRef],
+    shape: &IncrementalMvShape,
+    aggregate_shape: &AggregateMvShape,
+) -> Result<StatementResult, String> {
+    let schema_contract = validate_aggregate_schema_contract_metadata(target, mv_definition)?;
+    match shape {
+        IncrementalMvShape::Aggregate(_) => refresh_single_aggregate_iceberg_mv(
+            state,
+            target,
+            target_entry,
+            iceberg_catalog,
+            target_table,
+            expected_main_snapshot_id,
+            current_catalog,
+            current_database,
+            mv_definition,
+            base_refs,
+            schema_contract,
+            aggregate_shape,
+        ),
+        IncrementalMvShape::JoinAggregate(join_aggregate_shape) => {
+            refresh_join_aggregate_iceberg_mv(
+                state,
+                target,
+                target_entry,
+                iceberg_catalog,
+                target_table,
+                expected_main_snapshot_id,
+                current_catalog,
+                current_database,
+                mv_definition,
+                base_refs,
+                schema_contract,
+                &join_aggregate_shape.join,
+                aggregate_shape,
+            )
+        }
+        _ => Err(
+            "iceberg aggregate MV refresh dispatcher requires aggregate or join aggregate shape"
+                .to_string(),
+        ),
+    }
+}
+
+fn validate_aggregate_schema_contract_metadata<'a>(
+    target: &IcebergMvTarget,
+    mv_definition: &'a StoredMvDefinition,
+) -> Result<&'a crate::meta::repository::mv_contract::MvSchemaContract, String> {
+    let schema_contract = mv_definition.schema_contract.as_ref().ok_or_else(|| {
+        format!(
+            "iceberg MV target {}.{}.{} is missing A11 schema contract; rebuild or recreate the MV",
+            target.catalog, target.namespace, target.table
+        )
+    })?;
+    if schema_contract.contract_version != 3 {
+        return Err(format!(
+            "iceberg aggregate MV {}.{}.{} requires schema contract version 3, got {}",
+            target.catalog, target.namespace, target.table, schema_contract.contract_version
+        ));
+    }
+    if schema_contract.aggregate.is_none() {
+        return Err(format!(
+            "iceberg aggregate MV {}.{}.{} is missing aggregate schema contract; recreate the MV",
+            target.catalog, target.namespace, target.table
+        ));
+    }
+    Ok(schema_contract)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn refresh_single_aggregate_iceberg_mv(
+    state: &Arc<StandaloneState>,
+    target: &IcebergMvTarget,
+    target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    iceberg_catalog: &Arc<dyn iceberg::Catalog>,
+    target_table: &iceberg::table::Table,
+    expected_main_snapshot_id: Option<i64>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    mv_definition: &StoredMvDefinition,
+    base_refs: &[IcebergTableRef],
+    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    aggregate_shape: &AggregateMvShape,
+) -> Result<StatementResult, String> {
+    let [base_ref] = base_refs else {
+        return Err(
+            "iceberg aggregate materialized view refresh requires exactly one base table reference"
+                .to_string(),
+        );
+    };
+    let pre_pin_loaded = load_current_iceberg_base_table(state, base_ref)?;
+    let current_before_pin = expected_main_snapshot_id_from_table(&pre_pin_loaded.table);
+    let previous = mv_definition
+        .last_refresh_snapshots
+        .get(&base_ref.fqn())
+        .copied();
+
+    match (previous, current_before_pin) {
+        (None, None) => {
+            tracing::info!(
+                "iceberg aggregate mv {}.{}.{}: base table has no snapshot; skipping refresh",
+                target.catalog,
+                target.namespace,
+                target.table
+            );
+            return Ok(StatementResult::Ok);
+        }
+        (Some(prev), None) => {
+            return Err(format!(
+                "cannot refresh iceberg aggregate materialized view {}.{}.{}: previously-refreshed base snapshot {prev} is no longer reachable",
+                target.catalog, target.namespace, target.table
+            ));
+        }
+        _ => {}
+    }
+
+    let pin = crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin::capture(
+        state, base_refs,
+    )?;
+    validate_refresh_pin_table_uuids(mv_definition, &pin, base_refs)?;
+    let current = pin
+        .get(base_ref)
+        .ok_or_else(|| format!("missing refresh pin for {}", base_ref.fqn()))?;
+    let loaded = load_current_iceberg_base_table(state, base_ref)?;
+    let effective_definition = match crate::engine::mv::schema_contract::validate_schema_contract(
+        schema_contract,
+        &loaded.table,
+        target_table,
+    ) {
+        crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
+            return Err(format!("{err}"));
+        }
+        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
+            rebound_columns,
+        } => {
+            tracing::info!(
+                target = ?target,
+                rebound = ?rebound_columns,
+                "iceberg aggregate MV refresh: base columns rebound by field id; rewriting select_sql",
+            );
+            let rewritten_sql =
+                rewrite_select_sql_for_rebind(&mv_definition.select_sql, &rebound_columns)?;
+            let mut def = mv_definition.clone();
+            def.select_sql = rewritten_sql;
+            def
+        }
+        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe => {
+            mv_definition.clone()
+        }
+    };
+    let mv_definition = &effective_definition;
+
+    match previous {
+        None => {
+            let staging_branch = format!(
+                "__nova_mv_refresh_{}_{}",
+                mv_definition.mv_id,
+                uuid::Uuid::new_v4().simple()
+            );
+            let refresh_id = begin_staged_iceberg_mv_refresh_intent(
+                state,
+                target,
+                mv_definition.mv_id,
+                expected_main_snapshot_id,
+                pin.to_snapshot_map(),
+                &staging_branch,
+            )?;
+            first_refresh_iceberg_aggregate_mv(
+                state,
+                target,
+                target_entry,
+                iceberg_catalog,
+                expected_main_snapshot_id,
+                &staging_branch,
+                refresh_id,
+                current_catalog,
+                current_database,
+                mv_definition,
+                aggregate_shape,
+                &pin,
+            )
+        }
+        Some(prev) if prev == current => {
+            tracing::info!(
+                "iceberg aggregate mv {}.{}.{}: base snapshot {current} unchanged; updating metadata only",
+                target.catalog,
+                target.namespace,
+                target.table
+            );
+            finalize_iceberg_mv_metadata_only_refresh(
+                state,
+                target,
+                mv_definition,
+                pin.to_snapshot_map(),
+                pin.to_table_uuid_map(),
+            )
+        }
+        Some(_) => Err(format!(
+            "iceberg aggregate MV {}.{}.{} incremental refresh is not enabled yet; recreate or wait for aggregate incremental refresh support",
+            target.catalog, target.namespace, target.table
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn refresh_join_aggregate_iceberg_mv(
+    state: &Arc<StandaloneState>,
+    target: &IcebergMvTarget,
+    target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    iceberg_catalog: &Arc<dyn iceberg::Catalog>,
+    target_table: &iceberg::table::Table,
+    expected_main_snapshot_id: Option<i64>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    mv_definition: &StoredMvDefinition,
+    base_refs: &[IcebergTableRef],
+    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    join_shape: &crate::connector::starrocks::managed::mv_shape::JoinProjectionFilterMvShape,
+    aggregate_shape: &AggregateMvShape,
+) -> Result<StatementResult, String> {
+    if base_refs.len() != 2 {
+        return Err(
+            "iceberg join aggregate MV refresh requires exactly two base table references"
+                .to_string(),
+        );
+    }
+    validate_join_shape_base_refs(join_shape, base_refs)?;
+    let (left_ref, right_ref) = join_base_refs_for_shape(join_shape, base_refs)?;
+    let left_loaded_before_pin = load_current_iceberg_base_table(state, left_ref)?;
+    let right_loaded_before_pin = load_current_iceberg_base_table(state, right_ref)?;
+    let left_current_before_pin =
+        expected_main_snapshot_id_from_table(&left_loaded_before_pin.table);
+    let right_current_before_pin =
+        expected_main_snapshot_id_from_table(&right_loaded_before_pin.table);
+    let left_previous = mv_definition
+        .last_refresh_snapshots
+        .get(&left_ref.fqn())
+        .copied();
+    let right_previous = mv_definition
+        .last_refresh_snapshots
+        .get(&right_ref.fqn())
+        .copied();
+
+    match (
+        left_previous,
+        right_previous,
+        left_current_before_pin,
+        right_current_before_pin,
+    ) {
+        (None, None, None, None) => {
+            tracing::info!(
+                "iceberg join aggregate mv {}.{}.{}: both base tables have no snapshot; skipping refresh",
+                target.catalog,
+                target.namespace,
+                target.table
+            );
+            return Ok(StatementResult::Ok);
+        }
+        (None, None, Some(_), None) | (None, None, None, Some(_)) => {
+            tracing::info!(
+                "iceberg join aggregate mv {}.{}.{}: one base table has no snapshot; skipping initial refresh",
+                target.catalog,
+                target.namespace,
+                target.table
+            );
+            return Ok(StatementResult::Ok);
+        }
+        (Some(prev), _, None, _) => {
+            return Err(format!(
+                "cannot refresh iceberg join aggregate MV {}.{}.{}: previously-refreshed left base snapshot {prev} is no longer reachable",
+                target.catalog, target.namespace, target.table
+            ));
+        }
+        (_, Some(prev), _, None) => {
+            return Err(format!(
+                "cannot refresh iceberg join aggregate MV {}.{}.{}: previously-refreshed right base snapshot {prev} is no longer reachable",
+                target.catalog, target.namespace, target.table
+            ));
+        }
+        _ => {}
+    }
+
+    let pin = crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin::capture(
+        state, base_refs,
+    )?;
+    if pin.len() != 2 {
+        return Err(format!(
+            "iceberg join aggregate MV refresh expected two refresh pins, got {}",
+            pin.len()
+        ));
+    }
+    validate_refresh_pin_table_uuids(mv_definition, &pin, base_refs)?;
+
+    let left_loaded = load_current_iceberg_base_table(state, left_ref)?;
+    let right_loaded = load_current_iceberg_base_table(state, right_ref)?;
+    validate_join_schema_contract(
+        schema_contract,
+        &[
+            (left_ref, &left_loaded.table),
+            (right_ref, &right_loaded.table),
+        ],
+        target_table,
+    )?;
+
+    let left_current = pin
+        .get(left_ref)
+        .ok_or_else(|| format!("missing refresh pin for {}", left_ref.fqn()))?;
+    let right_current = pin
+        .get(right_ref)
+        .ok_or_else(|| format!("missing refresh pin for {}", right_ref.fqn()))?;
+
+    match (left_previous, right_previous) {
+        (None, None) => {
+            let staging_branch = format!(
+                "__nova_mv_refresh_{}_{}",
+                mv_definition.mv_id,
+                uuid::Uuid::new_v4().simple()
+            );
+            let refresh_id = begin_staged_iceberg_mv_refresh_intent(
+                state,
+                target,
+                mv_definition.mv_id,
+                expected_main_snapshot_id,
+                pin.to_snapshot_map(),
+                &staging_branch,
+            )?;
+            first_refresh_iceberg_aggregate_mv(
+                state,
+                target,
+                target_entry,
+                iceberg_catalog,
+                expected_main_snapshot_id,
+                &staging_branch,
+                refresh_id,
+                current_catalog,
+                current_database,
+                mv_definition,
+                aggregate_shape,
+                &pin,
+            )
+        }
+        (Some(left_prev), Some(right_prev))
+            if left_prev == left_current && right_prev == right_current =>
+        {
+            tracing::info!(
+                "iceberg join aggregate mv {}.{}.{}: base snapshots unchanged; updating metadata only",
+                target.catalog,
+                target.namespace,
+                target.table
+            );
+            finalize_iceberg_mv_metadata_only_refresh(
+                state,
+                target,
+                mv_definition,
+                pin.to_snapshot_map(),
+                pin.to_table_uuid_map(),
+            )
+        }
+        (Some(_), Some(_)) => Err(format!(
+            "iceberg join aggregate MV {}.{}.{} incremental refresh is not enabled yet; recreate or wait for aggregate incremental refresh support",
+            target.catalog, target.namespace, target.table
+        )),
+        _ => Err(format!(
+            "iceberg join aggregate MV {}.{}.{} has partial previous refresh snapshots; recreate the MV",
+            target.catalog, target.namespace, target.table
+        )),
+    }
+}
+
 // Previous implementation of REFRESH FULL — `refresh_full_iceberg_mv` —
 // was removed. It dropped the target table + deleted the MV definition +
 // re-ran create_iceberg_mv (which leaves the new target empty), and the
@@ -1437,6 +1840,20 @@ pub(crate) fn plan_iceberg_mv_refresh(
     );
     let shape =
         classify_incremental_mv_query(&canonical_select_query).map_err(RefreshError::user)?;
+    if aggregate_shape_for_layout(&shape).is_some() {
+        return plan_iceberg_aggregate_mv_refresh(
+            state,
+            &iceberg_target,
+            &target_loaded.table,
+            target,
+            stmt,
+            current_catalog,
+            current_database,
+            &mv_definition,
+            &base_refs,
+            &shape,
+        );
+    }
     if let IncrementalMvShape::JoinProjectionFilter(join_shape) = &shape {
         if base_refs.len() != 2 {
             return Err(RefreshError::user(
@@ -1703,6 +2120,213 @@ pub(crate) fn plan_iceberg_mv_refresh(
             current_database: current_database.to_string(),
         }),
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_iceberg_aggregate_mv_refresh(
+    state: &Arc<StandaloneState>,
+    iceberg_target: &IcebergMvTarget,
+    target_table: &iceberg::table::Table,
+    target: MvTarget,
+    stmt: &RefreshMaterializedViewStmt,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    mv_definition: &StoredMvDefinition,
+    base_refs: &[IcebergTableRef],
+    shape: &IncrementalMvShape,
+) -> Result<RefreshPlan, RefreshError> {
+    let schema_contract =
+        validate_aggregate_schema_contract_metadata(iceberg_target, mv_definition)
+            .map_err(RefreshError::user)?;
+    match shape {
+        IncrementalMvShape::Aggregate(_) => {
+            let [base_ref] = base_refs else {
+                return Err(RefreshError::user(
+                    "iceberg aggregate materialized view refresh requires exactly one base table reference",
+                ));
+            };
+            let loaded =
+                load_current_iceberg_base_table(state, base_ref).map_err(RefreshError::user)?;
+            match crate::engine::mv::schema_contract::validate_schema_contract(
+                schema_contract,
+                &loaded.table,
+                target_table,
+            ) {
+                crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
+                    return Err(RefreshError::user(format!("{err}")));
+                }
+                crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe
+                | crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
+                    ..
+                } => {}
+            }
+            let current = expected_main_snapshot_id_from_table(&loaded.table);
+            let previous = mv_definition
+                .last_refresh_snapshots
+                .get(&base_ref.fqn())
+                .copied();
+            let mode = match (previous, current) {
+                (None, None) => RefreshMode::Noop,
+                (None, Some(_)) => RefreshMode::Full,
+                (Some(prev), Some(cur)) if prev == cur => RefreshMode::Noop,
+                (Some(_), Some(_)) => {
+                    return Err(RefreshError::user(format!(
+                        "iceberg aggregate MV {}.{}.{} incremental refresh is not enabled yet; recreate or wait for aggregate incremental refresh support",
+                        iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+                    )));
+                }
+                (Some(prev), None) => {
+                    return Err(RefreshError::user(format!(
+                        "cannot refresh iceberg aggregate materialized view {}.{}.{}: previously-refreshed base snapshot {prev} is no longer reachable",
+                        iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+                    )));
+                }
+            };
+            let mut snapshot_pins = BTreeMap::new();
+            snapshot_pins.insert(base_ref.fqn(), current);
+            Ok(build_iceberg_refresh_plan(
+                mv_definition,
+                target,
+                stmt,
+                current_catalog,
+                current_database,
+                base_refs,
+                snapshot_pins,
+                mode,
+            ))
+        }
+        IncrementalMvShape::JoinAggregate(join_aggregate_shape) => {
+            if base_refs.len() != 2 {
+                return Err(RefreshError::user(
+                    "iceberg join aggregate MV refresh requires exactly two base table references",
+                ));
+            }
+            validate_join_shape_base_refs(&join_aggregate_shape.join, base_refs)
+                .map_err(RefreshError::user)?;
+            let (left_ref, right_ref) =
+                join_base_refs_for_shape(&join_aggregate_shape.join, base_refs)
+                    .map_err(RefreshError::user)?;
+            let left_loaded =
+                load_current_iceberg_base_table(state, left_ref).map_err(RefreshError::user)?;
+            let right_loaded =
+                load_current_iceberg_base_table(state, right_ref).map_err(RefreshError::user)?;
+            validate_join_schema_contract(
+                schema_contract,
+                &[
+                    (left_ref, &left_loaded.table),
+                    (right_ref, &right_loaded.table),
+                ],
+                target_table,
+            )
+            .map_err(RefreshError::user)?;
+
+            let mut snapshot_pins = BTreeMap::new();
+            let mut current_snapshots = BTreeMap::new();
+            current_snapshots.insert(
+                left_ref.fqn(),
+                expected_main_snapshot_id_from_table(&left_loaded.table),
+            );
+            current_snapshots.insert(
+                right_ref.fqn(),
+                expected_main_snapshot_id_from_table(&right_loaded.table),
+            );
+            for base_ref in base_refs {
+                snapshot_pins.insert(
+                    base_ref.fqn(),
+                    current_snapshots.get(&base_ref.fqn()).copied().flatten(),
+                );
+            }
+            let previous_snapshots = &mv_definition.last_refresh_snapshots;
+            let has_previous = base_refs
+                .iter()
+                .any(|base_ref| previous_snapshots.contains_key(&base_ref.fqn()));
+            let all_previous = base_refs
+                .iter()
+                .all(|base_ref| previous_snapshots.contains_key(&base_ref.fqn()));
+            let all_current = current_snapshots.values().all(Option::is_some);
+            if has_previous && !all_previous {
+                return Err(RefreshError::user(format!(
+                    "iceberg join aggregate MV {}.{}.{} has partial previous refresh snapshots; recreate the MV",
+                    iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+                )));
+            }
+            if has_previous {
+                for base_ref in base_refs {
+                    let fqn = base_ref.fqn();
+                    if current_snapshots.get(&fqn).copied().flatten().is_none() {
+                        return Err(RefreshError::user(format!(
+                            "cannot refresh iceberg join aggregate MV {}.{}.{}: previously-refreshed base snapshot for {} is no longer reachable",
+                            iceberg_target.catalog,
+                            iceberg_target.namespace,
+                            iceberg_target.table,
+                            fqn
+                        )));
+                    }
+                }
+            }
+            let mode = if !has_previous && !all_current {
+                RefreshMode::Noop
+            } else if !has_previous {
+                RefreshMode::Full
+            } else if base_refs.iter().all(|base_ref| {
+                let fqn = base_ref.fqn();
+                previous_snapshots.get(&fqn).copied()
+                    == current_snapshots.get(&fqn).copied().flatten()
+            }) {
+                RefreshMode::Noop
+            } else {
+                return Err(RefreshError::user(format!(
+                    "iceberg join aggregate MV {}.{}.{} incremental refresh is not enabled yet; recreate or wait for aggregate incremental refresh support",
+                    iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+                )));
+            };
+            Ok(build_iceberg_refresh_plan(
+                mv_definition,
+                target,
+                stmt,
+                current_catalog,
+                current_database,
+                base_refs,
+                snapshot_pins,
+                mode,
+            ))
+        }
+        _ => Err(RefreshError::user(
+            "iceberg aggregate MV refresh plan requires aggregate or join aggregate shape",
+        )),
+    }
+}
+
+fn build_iceberg_refresh_plan(
+    mv_definition: &StoredMvDefinition,
+    target: MvTarget,
+    stmt: &RefreshMaterializedViewStmt,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    base_refs: &[IcebergTableRef],
+    snapshot_pins: BTreeMap<String, Option<i64>>,
+    mode: RefreshMode,
+) -> RefreshPlan {
+    RefreshPlan {
+        mv_id: Some(mv_definition.mv_id),
+        target,
+        storage_engine: MvStorageEngine::Iceberg,
+        mode,
+        base_refs: base_refs
+            .iter()
+            .map(|base_ref| MvBaseRef {
+                catalog: base_ref.catalog.clone(),
+                namespace: base_ref.namespace.clone(),
+                table: base_ref.table.clone(),
+            })
+            .collect(),
+        snapshot_pins,
+        backend_plan: BackendRefreshPlan::Iceberg(IcebergRefreshPlan {
+            stmt: stmt.clone(),
+            current_catalog: current_catalog.map(str::to_string),
+            current_database: current_database.to_string(),
+        }),
+    }
 }
 
 pub(crate) fn execute_iceberg_mv_refresh(
@@ -2507,6 +3131,215 @@ fn first_refresh_iceberg_mv(
         target.table
     );
     Ok(StatementResult::Ok)
+}
+
+fn run_mv_full_select_result(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    mut query: sqlparser::ast::Query,
+) -> Result<crate::runtime::query_result::QueryResult, String> {
+    if crate::engine::query_prep::has_time_travel_refs(&query) {
+        crate::engine::query_prep::rewrite_time_travel_refs(
+            state,
+            current_catalog,
+            current_database,
+            &mut query,
+        )?;
+    }
+    let three_parts = crate::sql::parser::query_refs::extract_three_part_table_refs(&query);
+    if current_catalog.is_some() || !three_parts.is_empty() {
+        crate::engine::query_prep::refresh_external_tables_for_query(
+            state,
+            current_catalog,
+            current_database,
+            &query,
+        )?;
+    }
+
+    if !three_parts.is_empty() {
+        crate::sql::parser::query_refs::strip_catalog_from_three_part_names(&mut query);
+    }
+    let catalog_snapshot = state
+        .catalog
+        .read()
+        .expect("standalone catalog read lock")
+        .clone();
+    crate::engine::execute_query(
+        &query,
+        &catalog_snapshot,
+        current_database,
+        state.exchange_port,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn first_refresh_iceberg_aggregate_mv(
+    state: &Arc<StandaloneState>,
+    target: &IcebergMvTarget,
+    target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    iceberg_catalog: &Arc<dyn iceberg::Catalog>,
+    expected_main_snapshot_id: Option<i64>,
+    staging_branch: &str,
+    refresh_id: i64,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    mv_definition: &StoredMvDefinition,
+    aggregate_shape: &AggregateMvShape,
+    pin: &crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin,
+) -> Result<StatementResult, String> {
+    let chunks = match prepare_aggregate_first_refresh_chunks(
+        state,
+        current_catalog,
+        current_database,
+        mv_definition,
+        aggregate_shape,
+        pin,
+    ) {
+        Ok(chunks) => chunks,
+        Err(err) => {
+            abort_iceberg_mv_refresh(state, refresh_id)?;
+            return Err(err);
+        }
+    };
+    let total_rows: i64 = chunks.iter().map(|c| c.batch.num_rows() as i64).sum();
+
+    if total_rows == 0 {
+        tracing::info!(
+            "iceberg aggregate mv {}.{}.{}: first refresh produced 0 rows; \
+             skipping snapshot commit so next REFRESH can retry",
+            target.catalog,
+            target.namespace,
+            target.table
+        );
+        abort_iceberg_mv_refresh(state, refresh_id)?;
+        return Ok(StatementResult::Ok);
+    }
+
+    let ident = iceberg_mv_table_ident(target)?;
+    let marker = load_iceberg_mv_refresh_marker(state, refresh_id, mv_definition.mv_id)?
+        .to_summary_properties();
+    if let Err(err) = ensure_iceberg_mv_staging_branch(
+        iceberg_catalog,
+        target,
+        staging_branch,
+        expected_main_snapshot_id,
+    ) {
+        abort_iceberg_mv_refresh(state, refresh_id)?;
+        return Err(err);
+    }
+    let target_table = match reload_iceberg_mv_target_table(target_entry, target) {
+        Ok(table) => table,
+        Err(err) => {
+            return Err(handle_iceberg_mv_definite_pre_publish_error(
+                state,
+                target,
+                target_entry,
+                staging_branch,
+                refresh_id,
+                err,
+            ));
+        }
+    };
+    let new_snapshot_id = match data_block_on(async {
+        let data_files = write_chunks_as_iceberg_data_files(&target_table, &chunks).await?;
+        commit_iceberg_mv_target_files_with_ref(
+            &target_table,
+            iceberg_catalog,
+            target_entry,
+            &ident,
+            CommitOpKind::FastAppend,
+            data_files,
+            staging_branch,
+            marker,
+        )
+        .await
+        .map(|outcome| outcome.new_snapshot_id)
+    }) {
+        Ok(Ok(snapshot_id)) => snapshot_id,
+        Ok(Err(err)) | Err(err) => {
+            return Err(handle_iceberg_mv_commit_error(
+                state,
+                target,
+                target_entry,
+                staging_branch,
+                refresh_id,
+                err,
+            ));
+        }
+    };
+
+    let snapshots = pin.to_snapshot_map();
+    let table_uuids = pin.to_table_uuid_map();
+    record_iceberg_mv_staging_commit(
+        state,
+        refresh_id,
+        new_snapshot_id,
+        total_rows,
+        table_uuids.clone(),
+    )?;
+    let published_snapshot_id = publish_iceberg_mv_refresh(
+        state,
+        target,
+        target_entry,
+        staging_branch,
+        expected_main_snapshot_id,
+        new_snapshot_id,
+        refresh_id,
+        mv_definition.mv_id,
+    )?;
+    record_iceberg_mv_publish_commit(state, refresh_id, published_snapshot_id)?;
+    drop_iceberg_mv_staging_branch(state, target, target_entry, staging_branch)?;
+    finalize_iceberg_mv_refresh(
+        state,
+        refresh_id,
+        total_rows,
+        snapshots,
+        table_uuids,
+        published_snapshot_id,
+    )?;
+    tracing::info!(
+        "iceberg aggregate mv {}.{}.{}: first refresh complete: \
+         rows={total_rows} iceberg_snapshot={published_snapshot_id}",
+        target.catalog,
+        target.namespace,
+        target.table
+    );
+    Ok(StatementResult::Ok)
+}
+
+fn prepare_aggregate_first_refresh_chunks(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    mv_definition: &StoredMvDefinition,
+    aggregate_shape: &AggregateMvShape,
+    pin: &crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin,
+) -> Result<Vec<crate::exec::chunk::Chunk>, String> {
+    let state_sql =
+        iceberg_aggregate_first_refresh_select_sql(&mv_definition.select_sql, aggregate_shape)?;
+    let mut state_query = parse_mv_select_query(&state_sql)?;
+    crate::connector::starrocks::managed::refresh_pin::inject_pin_as_for_version_as_of(
+        &mut state_query,
+        pin,
+        &HashSet::new(),
+        current_catalog,
+        current_database,
+    )?;
+    let visible_query = parse_mv_select_query(&mv_definition.select_sql)?;
+    let visible_analysis =
+        analyze_mv_select(state, current_catalog, current_database, &visible_query)?;
+    let layout = crate::connector::starrocks::managed::mv_agg_state::build_aggregate_mv_layout(
+        aggregate_shape,
+        &visible_analysis.output_columns,
+    )?;
+    let result = run_mv_full_select_result(state, current_catalog, current_database, state_query)?;
+    crate::connector::starrocks::managed::mv_agg_state::materialize_aggregate_result_chunks(
+        result,
+        &layout,
+        aggregate_shape,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5467,6 +6300,163 @@ mod tests {
         );
     }
 
+    #[test]
+    fn aggregate_first_refresh_uses_state_shaped_select() {
+        let sql = "select region, avg(amount) as a \
+                   from ice.ns.fact group by region";
+        let query = parse_select_query(sql);
+        let shape = match classify_incremental_mv_query(&query).expect("shape") {
+            IncrementalMvShape::Aggregate(shape) => shape,
+            other => panic!("expected aggregate shape, got {other:?}"),
+        };
+
+        let state_sql = iceberg_aggregate_first_refresh_select_sql(sql, &shape).expect("rewrite");
+        let upper = state_sql.to_uppercase();
+
+        assert!(
+            upper.contains("SUM(AMOUNT) AS __AGG_STATE_A__SUM"),
+            "sql={state_sql}"
+        );
+        assert!(
+            upper.contains("COUNT(AMOUNT) AS __AGG_STATE_A__COUNT"),
+            "sql={state_sql}"
+        );
+        assert!(!upper.contains("__ROW_ID__"), "sql={state_sql}");
+    }
+
+    #[test]
+    fn aggregate_first_refresh_writes_state_and_blocks_incremental() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_aggregate_fact_table(&env.state, "ice", "sales", "fact");
+        insert_into_aggregate_fact_table(
+            &env.state,
+            "ice",
+            "sales",
+            "fact",
+            &[(1, "east", 10), (2, "west", 7), (3, "east", 5)],
+        );
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_fact_region
+             DISTRIBUTED BY HASH(region) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT region, count(*) AS c, sum(amount) AS s
+                FROM ice.sales.fact
+                GROUP BY region",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create aggregate iceberg mv");
+
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_fact_region");
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("first aggregate refresh");
+
+        let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_fact_region")
+            .expect("mv definition after aggregate refresh");
+        assert_eq!(mv.last_refresh_rows, Some(2));
+        assert_eq!(mv.last_refresh_snapshots.len(), 1);
+        assert_eq!(mv.last_refresh_table_uuids.len(), 1);
+        let entry = {
+            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get("ice").expect("catalog")
+        };
+        let loaded =
+            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_fact_region")
+                .expect("load aggregate mv target");
+        let fields = loaded
+            .table
+            .metadata()
+            .current_schema()
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(fields.contains(&"__row_id__"), "fields={fields:?}");
+        assert!(fields.contains(&"__agg_state_c"), "fields={fields:?}");
+        assert!(fields.contains(&"__agg_state_s"), "fields={fields:?}");
+        assert!(loaded.table.metadata().current_snapshot().is_some());
+
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("unchanged aggregate refresh should be metadata-only");
+        insert_into_aggregate_fact_table(&env.state, "ice", "sales", "fact", &[(4, "west", 3)]);
+        let err = refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect_err("aggregate incremental refresh should fail fast for now");
+        assert!(
+            err.contains("iceberg aggregate MV ice.analytics.mv_fact_region incremental refresh is not enabled yet"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn join_aggregate_first_refresh_writes_state_for_two_bases() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_aggregate_fact_table(&env.state, "ice", "sales", "fact");
+        create_aggregate_dim_table(&env.state, "ice", "sales", "dim");
+        insert_into_aggregate_fact_table(
+            &env.state,
+            "ice",
+            "sales",
+            "fact",
+            &[(1, "unused", 10), (2, "unused", 7), (3, "unused", 5)],
+        );
+        insert_into_aggregate_dim_table(
+            &env.state,
+            "ice",
+            "sales",
+            "dim",
+            &[(1, "east"), (2, "west"), (3, "east")],
+        );
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_fact_dim_region
+             DISTRIBUTED BY HASH(category) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT d.category, count(*) AS c, sum(f.amount) AS s
+                FROM ice.sales.fact f JOIN ice.sales.dim d ON f.id = d.id
+                GROUP BY d.category",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create join aggregate iceberg mv");
+
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_fact_dim_region");
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("first join aggregate refresh");
+
+        let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_fact_dim_region")
+            .expect("mv definition after join aggregate refresh");
+        assert_eq!(mv.last_refresh_rows, Some(2));
+        assert_eq!(mv.last_refresh_snapshots.len(), 2);
+        assert_eq!(mv.last_refresh_table_uuids.len(), 2);
+        assert!(mv.last_refresh_snapshots.contains_key("ice.sales.fact"));
+        assert!(mv.last_refresh_snapshots.contains_key("ice.sales.dim"));
+
+        let entry = {
+            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get("ice").expect("catalog")
+        };
+        let loaded = crate::connector::iceberg::catalog::load_table(
+            &entry,
+            "analytics",
+            "mv_fact_dim_region",
+        )
+        .expect("load join aggregate mv target");
+        let fields = loaded
+            .table
+            .metadata()
+            .current_schema()
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(fields.contains(&"__row_id__"), "fields={fields:?}");
+        assert!(fields.contains(&"__agg_state_c"), "fields={fields:?}");
+        assert!(fields.contains(&"__agg_state_s"), "fields={fields:?}");
+        assert!(loaded.table.metadata().current_snapshot().is_some());
+
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("unchanged join aggregate refresh should be metadata-only");
+    }
+
     fn test_base_ref() -> IcebergTableRef {
         IcebergTableRef {
             catalog: "ice".to_string(),
@@ -5906,6 +6896,55 @@ mod tests {
             .collect::<Vec<_>>();
         crate::connector::iceberg::catalog::registry::insert_rows(&entry, namespace, table, &rows)
             .expect("insert iceberg rows");
+    }
+
+    fn insert_into_aggregate_fact_table(
+        state: &Arc<StandaloneState>,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        rows: &[(i32, &str, i64)],
+    ) {
+        let entry = {
+            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get(catalog).expect("catalog")
+        };
+        let rows = rows
+            .iter()
+            .map(|(id, region, amount)| {
+                vec![
+                    crate::sql::Literal::Int(i64::from(*id)),
+                    crate::sql::Literal::String((*region).to_string()),
+                    crate::sql::Literal::Int(*amount),
+                ]
+            })
+            .collect::<Vec<_>>();
+        crate::connector::iceberg::catalog::registry::insert_rows(&entry, namespace, table, &rows)
+            .expect("insert aggregate fact iceberg rows");
+    }
+
+    fn insert_into_aggregate_dim_table(
+        state: &Arc<StandaloneState>,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        rows: &[(i32, &str)],
+    ) {
+        let entry = {
+            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get(catalog).expect("catalog")
+        };
+        let rows = rows
+            .iter()
+            .map(|(id, category)| {
+                vec![
+                    crate::sql::Literal::Int(i64::from(*id)),
+                    crate::sql::Literal::String((*category).to_string()),
+                ]
+            })
+            .collect::<Vec<_>>();
+        crate::connector::iceberg::catalog::registry::insert_rows(&entry, namespace, table, &rows)
+            .expect("insert aggregate dim iceberg rows");
     }
 
     fn create_base_table_with_rows(

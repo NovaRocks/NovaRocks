@@ -2378,7 +2378,9 @@ pub(crate) fn execute_query_with_options(
     let logical = crate::sql::planner::plan_query(resolved, cte_registry)?;
     let table_stats = build_table_stats_from_plan(&logical);
     let mut physical = crate::sql::optimizer::optimize(logical, &table_stats)?;
-    let force_single_fragment = terminal_sink.is_some();
+    // Unit-test states may not start the standalone exchange server.
+    // Collapse distribution nodes instead of building an unusable coordinated plan.
+    let force_single_fragment = terminal_sink.is_some() || exchange_port == 0;
     if force_single_fragment {
         physical = collapse_distribution_enforcers_for_single_fragment(physical);
     }
