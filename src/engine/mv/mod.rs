@@ -1,5 +1,6 @@
 pub(crate) mod iceberg_backend;
 pub(crate) mod iceberg_join_branch;
+pub(crate) mod iceberg_join_coalesce;
 pub(crate) mod iceberg_merge_sink;
 pub(crate) mod iceberg_refresh;
 pub(crate) mod iceberg_target_apply;
