@@ -441,6 +441,7 @@ mod tests {
             base: BaseContract {
                 table_fqn: "ice.db.orders".to_string(),
                 table_uuid: "base-uuid".to_string(),
+                alias_at_create: None,
                 schema_id_at_create: 1,
                 schema_at_create: BaseSchemaSnapshot {
                     fields: vec![BaseFieldRecord {
@@ -451,15 +452,18 @@ mod tests {
                     }],
                 },
             },
+            bases: vec![],
             output: OutputContract {
                 columns: vec![OutputColumnLineage {
                     expression: ExpressionLineage {
                         kind: ExpressionKind::Column,
                         referenced_base_field_ids: vec![1],
+                        referenced_base_fields: vec![],
                     },
                 }],
                 filter: None,
             },
+            join: None,
             target: TargetContract {
                 table_fqn: "ice.db.mv_orders".to_string(),
                 table_uuid: "target-uuid".to_string(),

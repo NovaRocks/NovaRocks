@@ -60,6 +60,7 @@ pub(crate) fn build_projection_filter_lineage(
             expression: ExpressionLineage {
                 kind: kind_hint.into_kind(),
                 referenced_base_field_ids: field_ids,
+                referenced_base_fields: vec![],
             },
         });
     }
@@ -86,6 +87,7 @@ pub(crate) fn build_projection_filter_lineage(
         field_ids.dedup();
         Some(FilterLineage {
             referenced_base_field_ids: field_ids,
+            referenced_base_fields: vec![],
         })
     } else {
         None

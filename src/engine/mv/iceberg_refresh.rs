@@ -211,6 +211,7 @@ pub(crate) fn create_iceberg_mv(
                             base: crate::meta::repository::mv_contract::BaseContract {
                                 table_fqn: base_ref.fqn(),
                                 table_uuid: loaded_base.table.metadata().uuid().to_string(),
+                                alias_at_create: None,
                                 schema_id_at_create: loaded_base
                                     .table
                                     .metadata()
@@ -220,10 +221,12 @@ pub(crate) fn create_iceberg_mv(
                                         fields: lineage.base_fields.clone(),
                                     },
                             },
+                            bases: vec![],
                             output: crate::meta::repository::mv_contract::OutputContract {
                                 columns: lineage.output_columns.clone(),
                                 filter: lineage.filter.clone(),
                             },
+                            join: None,
                             target: crate::meta::repository::mv_contract::TargetContract {
                                 table_fqn: format!(
                                     "{}.{}.{}",
