@@ -35,9 +35,11 @@ use crate::connector::starrocks::managed::mv_shape::{
 };
 use crate::engine::mv::iceberg_target_apply::{
     ICEBERG_MV_APPLY_KEY_COLUMN, ICEBERG_MV_APPLY_KEY_SOURCE_BASE_ROW_ID,
+    ICEBERG_MV_APPLY_KEY_SOURCE_JOIN_ROW_KEY, ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
     ICEBERG_MV_PROP_APPLY_KEY_COLUMN, ICEBERG_MV_PROP_APPLY_KEY_FIELD_ID,
     ICEBERG_MV_PROP_APPLY_KEY_SOURCE, apply_key_table_column, ensure_base_row_lineage_contract,
-    find_apply_key_field_id, iceberg_mv_physical_select_sql, load_target_apply_locator_inputs,
+    find_apply_key_field_id_by_column, iceberg_mv_physical_select_sql, join_apply_key_table_column,
+    load_target_apply_locator_inputs,
 };
 use crate::engine::mv::lifecycle::{
     BackendRefreshPlan, IcebergRefreshOutcome, IcebergRefreshPlan, MvBaseRef, MvStorageEngine,
@@ -84,7 +86,7 @@ pub(crate) fn create_iceberg_mv(
         ));
     }
 
-    // 1. Analyze and classify shape — phase4a only accepts projection/filter.
+    // 1. Analyze and classify shape.
     let canonical_select_query =
         canonicalize_iceberg_mv_select_query(&stmt.select_query, current_catalog, current_database);
     let analysis = analyze_mv_select(
@@ -96,42 +98,88 @@ pub(crate) fn create_iceberg_mv(
     validate_mv_partition_columns(stmt.partition_by.as_deref(), &analysis.output_columns)?;
     let base_refs = extract_base_table_refs(&analysis.resolved_refs)?;
     let shape = classify_incremental_mv_query(&canonical_select_query)?;
-    if !matches!(shape, IncrementalMvShape::ProjectionFilter(_)) {
-        return Err(
-            "phase4a iceberg-backed materialized views support only projection/filter shapes; aggregates are phase4b"
-                .to_string(),
-        );
-    }
-    let [base_ref] = base_refs.as_slice() else {
-        return Err(
-            "iceberg-backed materialized views require exactly one iceberg base table".to_string(),
-        );
+    let loaded_bases = match &shape {
+        IncrementalMvShape::ProjectionFilter(_) => {
+            let [base_ref] = base_refs.as_slice() else {
+                return Err(
+                    "iceberg-backed projection/filter materialized views require exactly one iceberg base table"
+                        .to_string(),
+                );
+            };
+            let loaded_base = load_current_iceberg_base_table(state, base_ref)?;
+            ensure_base_row_lineage_contract(&loaded_base.table, &base_ref.fqn())?;
+            vec![(base_ref.clone(), loaded_base)]
+        }
+        IncrementalMvShape::JoinProjectionFilter(join_shape) => {
+            if base_refs.len() != 2 {
+                return Err(
+                    "iceberg-backed join materialized views require exactly two iceberg base tables"
+                        .to_string(),
+                );
+            }
+            validate_join_shape_base_refs(join_shape, &base_refs)?;
+            base_refs
+                .iter()
+                .map(|base_ref| {
+                    let loaded_base = load_current_iceberg_base_table(state, base_ref)?;
+                    ensure_base_row_lineage_contract(&loaded_base.table, &base_ref.fqn())?;
+                    Ok((base_ref.clone(), loaded_base))
+                })
+                .collect::<Result<Vec<_>, String>>()?
+        }
+        IncrementalMvShape::Aggregate(_) => {
+            return Err(
+                "iceberg-backed materialized views do not support aggregate shapes in this phase"
+                    .to_string(),
+            );
+        }
     };
-    let loaded_base = load_current_iceberg_base_table(state, base_ref)?;
-    ensure_base_row_lineage_contract(&loaded_base.table, &base_ref.fqn())?;
 
     // IVM Phase-2 PRIMARY KEY validation. Only runs when the user opted in
     // by writing `PRIMARY KEY (...)` in the DDL; otherwise behavior is
     // unchanged. Reuses the same descriptor + validator as the managed-
     // lake-stored path in mv_ddl::create_mv.
     if let Some(pk_cols) = stmt.primary_key.as_deref() {
-        let descriptor =
-            crate::connector::starrocks::managed::mv_ddl::descriptor_from_loaded(&loaded_base);
-        crate::connector::starrocks::managed::mv_ddl::validate_ivm_primary_key(
-            pk_cols,
-            &descriptor,
-        )
-        .map_err(|e| e.to_string())?;
+        match &shape {
+            IncrementalMvShape::ProjectionFilter(_) => {
+                let descriptor =
+                    crate::connector::starrocks::managed::mv_ddl::descriptor_from_loaded(
+                        &loaded_bases[0].1,
+                    );
+                crate::connector::starrocks::managed::mv_ddl::validate_ivm_primary_key(
+                    pk_cols,
+                    &descriptor,
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            IncrementalMvShape::JoinProjectionFilter(_) => {
+                return Err(
+                    "iceberg-backed join materialized views do not support PRIMARY KEY in this phase"
+                        .to_string(),
+                );
+            }
+            IncrementalMvShape::Aggregate(_) => unreachable!("aggregate shape was rejected above"),
+        }
     }
 
     // 2. Create the empty Iceberg v3 target table in the current catalog.
-    if analysis.output_columns.iter().any(|column| {
-        column
-            .name
-            .eq_ignore_ascii_case(ICEBERG_MV_APPLY_KEY_COLUMN)
-    }) {
+    let apply_key_column_name = match &shape {
+        IncrementalMvShape::ProjectionFilter(_) => ICEBERG_MV_APPLY_KEY_COLUMN,
+        IncrementalMvShape::JoinProjectionFilter(_) => ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+        IncrementalMvShape::Aggregate(_) => unreachable!("aggregate shape was rejected above"),
+    };
+    let apply_key_source_property = match &shape {
+        IncrementalMvShape::ProjectionFilter(_) => ICEBERG_MV_APPLY_KEY_SOURCE_BASE_ROW_ID,
+        IncrementalMvShape::JoinProjectionFilter(_) => ICEBERG_MV_APPLY_KEY_SOURCE_JOIN_ROW_KEY,
+        IncrementalMvShape::Aggregate(_) => unreachable!("aggregate shape was rejected above"),
+    };
+    if analysis
+        .output_columns
+        .iter()
+        .any(|column| column.name.eq_ignore_ascii_case(apply_key_column_name))
+    {
         return Err(format!(
-            "Iceberg MV output column name {ICEBERG_MV_APPLY_KEY_COLUMN} is reserved for internal apply key"
+            "Iceberg MV output column name {apply_key_column_name} is reserved for internal apply key"
         ));
     }
     let mut columns = analysis
@@ -139,7 +187,11 @@ pub(crate) fn create_iceberg_mv(
         .iter()
         .map(output_column_to_table_column)
         .collect::<Result<Vec<_>, _>>()?;
-    columns.push(apply_key_table_column());
+    columns.push(match &shape {
+        IncrementalMvShape::ProjectionFilter(_) => apply_key_table_column(),
+        IncrementalMvShape::JoinProjectionFilter(_) => join_apply_key_table_column(),
+        IncrementalMvShape::Aggregate(_) => unreachable!("aggregate shape was rejected above"),
+    });
     let expected_apply_key_field_id = i32::try_from(columns.len())
         .map_err(|_| "too many iceberg MV output columns".to_string())?;
     crate::connector::iceberg::catalog::registry::create_table(
@@ -154,11 +206,11 @@ pub(crate) fn create_iceberg_mv(
             ("write.row-lineage".to_string(), "true".to_string()),
             (
                 ICEBERG_MV_PROP_APPLY_KEY_COLUMN.to_string(),
-                ICEBERG_MV_APPLY_KEY_COLUMN.to_string(),
+                apply_key_column_name.to_string(),
             ),
             (
                 ICEBERG_MV_PROP_APPLY_KEY_SOURCE.to_string(),
-                ICEBERG_MV_APPLY_KEY_SOURCE_BASE_ROW_ID.to_string(),
+                apply_key_source_property.to_string(),
             ),
             (
                 ICEBERG_MV_PROP_APPLY_KEY_FIELD_ID.to_string(),
@@ -169,7 +221,8 @@ pub(crate) fn create_iceberg_mv(
     entry.invalidate_table_cache(&target.namespace, &target.table);
     let target_loaded =
         crate::connector::iceberg::catalog::load_table(&entry, &target.namespace, &target.table)?;
-    let actual_apply_key_field_id = find_apply_key_field_id(&target_loaded.table)?;
+    let actual_apply_key_field_id =
+        find_apply_key_field_id_by_column(&target_loaded.table, apply_key_column_name)?;
     if actual_apply_key_field_id != expected_apply_key_field_id {
         return Err(format!(
             "Iceberg MV target apply-key field id mismatch: expected {expected_apply_key_field_id}, got {actual_apply_key_field_id}"
@@ -177,9 +230,13 @@ pub(crate) fn create_iceberg_mv(
     }
 
     // 3. Build A11 lineage from the resolved query and the base Iceberg schema.
-    let lineage = crate::sql::analyzer::mv_lineage::build_projection_filter_lineage(
-        &analysis.resolved_query,
-        loaded_base.table.metadata().current_schema(),
+    let schema_contract = build_iceberg_mv_schema_contract(
+        &shape,
+        &analysis,
+        &loaded_bases,
+        &target,
+        &target_loaded,
+        actual_apply_key_field_id,
     )?;
 
     // 4. Persist MV metadata in the repository.
@@ -205,74 +262,7 @@ pub(crate) fn create_iceberg_mv(
                     target_catalog: Some(target.catalog.clone()),
                     target_namespace: Some(target.namespace.clone()),
                     target_table: Some(target.table.clone()),
-                    schema_contract: {
-                        let contract = crate::meta::repository::mv_contract::MvSchemaContract {
-                            contract_version: 1,
-                            base: crate::meta::repository::mv_contract::BaseContract {
-                                table_fqn: base_ref.fqn(),
-                                table_uuid: loaded_base.table.metadata().uuid().to_string(),
-                                alias_at_create: None,
-                                schema_id_at_create: loaded_base
-                                    .table
-                                    .metadata()
-                                    .current_schema_id(),
-                                schema_at_create:
-                                    crate::meta::repository::mv_contract::BaseSchemaSnapshot {
-                                        fields: lineage.base_fields.clone(),
-                                    },
-                            },
-                            bases: vec![],
-                            output: crate::meta::repository::mv_contract::OutputContract {
-                                columns: lineage.output_columns.clone(),
-                                filter: lineage.filter.clone(),
-                            },
-                            join: None,
-                            target: crate::meta::repository::mv_contract::TargetContract {
-                                table_fqn: format!(
-                                    "{}.{}.{}",
-                                    target.catalog, target.namespace, target.table
-                                ),
-                                table_uuid: target_loaded.table.metadata().uuid().to_string(),
-                                schema_id_at_create: target_loaded
-                                    .table
-                                    .metadata()
-                                    .current_schema_id(),
-                                visible_columns: analysis
-                                    .output_columns
-                                    .iter()
-                                    .map(|col| {
-                                        let field = target_loaded
-                                            .table
-                                            .metadata()
-                                            .current_schema()
-                                            .as_struct()
-                                            .fields()
-                                            .iter()
-                                            .find(|f| f.name.eq_ignore_ascii_case(&col.name))
-                                            .expect("target schema was built from the same output_columns; name lookup cannot fail");
-                                        crate::meta::repository::mv_contract::TargetVisibleColumn {
-                                            output_name: col.name.clone(),
-                                            target_field_id: field.id,
-                                            type_signature: format!("{}", field.field_type),
-                                            nullable: !field.required,
-                                        }
-                                    })
-                                    .collect(),
-                                hidden_apply_key:
-                                    crate::meta::repository::mv_contract::HiddenApplyKeyContract {
-                                        column_name: crate::meta::repository::mv_contract::HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
-                                        target_field_id: actual_apply_key_field_id,
-                                        source: crate::meta::repository::mv_contract::ApplyKeySource::BaseRowId,
-                                    },
-                            },
-                        };
-                        contract
-                            .ensure_self_consistent()
-                            .map_err(|e| {
-                                format!("Iceberg MV schema contract is self-inconsistent: {e}")
-                            })?;
-                        Some(contract)
-                    },
+                    schema_contract: Some(schema_contract.clone()),
                     created_at_ms,
                 },
             )
@@ -340,6 +330,210 @@ fn iceberg_mv_target_exists(
             Ok(false)
         }
         Err(err) => Err(err),
+    }
+}
+
+fn validate_join_shape_base_refs(
+    shape: &crate::connector::starrocks::managed::mv_shape::JoinProjectionFilterMvShape,
+    base_refs: &[IcebergTableRef],
+) -> Result<(), String> {
+    for name in [
+        shape.left_table.to_string().to_ascii_lowercase(),
+        shape.right_table.to_string().to_ascii_lowercase(),
+    ] {
+        if !base_refs
+            .iter()
+            .any(|base| base.fqn().eq_ignore_ascii_case(&name))
+        {
+            return Err(format!(
+                "join MV shape references base {name} but analyzer resolved {base_refs:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn build_iceberg_mv_schema_contract(
+    shape: &IncrementalMvShape,
+    analysis: &crate::connector::starrocks::managed::mv_ddl::MvAnalysis,
+    loaded_bases: &[(
+        IcebergTableRef,
+        crate::connector::iceberg::catalog::IcebergLoadedTable,
+    )],
+    target: &IcebergMvTarget,
+    target_loaded: &crate::connector::iceberg::catalog::IcebergLoadedTable,
+    actual_apply_key_field_id: i32,
+) -> Result<crate::meta::repository::mv_contract::MvSchemaContract, String> {
+    let contract = match shape {
+        IncrementalMvShape::ProjectionFilter(_) => {
+            let [(base_ref, loaded_base)] = loaded_bases else {
+                return Err(
+                    "projection/filter iceberg MV schema contract requires one loaded base"
+                        .to_string(),
+                );
+            };
+            let lineage = crate::sql::analyzer::mv_lineage::build_projection_filter_lineage(
+                &analysis.resolved_query,
+                loaded_base.table.metadata().current_schema(),
+            )?;
+            crate::meta::repository::mv_contract::MvSchemaContract {
+                contract_version: 1,
+                base: base_contract(base_ref, loaded_base, None, lineage.base_fields.clone()),
+                bases: vec![],
+                output: crate::meta::repository::mv_contract::OutputContract {
+                    columns: lineage.output_columns,
+                    filter: lineage.filter,
+                },
+                join: None,
+                target: target_contract(
+                    analysis,
+                    target,
+                    target_loaded,
+                    actual_apply_key_field_id,
+                    crate::meta::repository::mv_contract::HIDDEN_APPLY_KEY_COLUMN_NAME,
+                    crate::meta::repository::mv_contract::ApplyKeySource::BaseRowId,
+                ),
+            }
+        }
+        IncrementalMvShape::JoinProjectionFilter(join_shape) => {
+            let (left_ref, left_loaded) =
+                loaded_base_for_shape_table(loaded_bases, &join_shape.left_table)?;
+            let (right_ref, right_loaded) =
+                loaded_base_for_shape_table(loaded_bases, &join_shape.right_table)?;
+            let left_schema = left_loaded.table.metadata().current_schema();
+            let right_schema = right_loaded.table.metadata().current_schema();
+            let left_fqn = left_ref.fqn();
+            let right_fqn = right_ref.fqn();
+            let join_lineage =
+                crate::sql::analyzer::mv_lineage::build_join_projection_filter_lineage(
+                    &analysis.resolved_query,
+                    &[
+                        (&left_fqn, &join_shape.left_alias, left_schema.as_ref()),
+                        (&right_fqn, &join_shape.right_alias, right_schema.as_ref()),
+                    ],
+                )?;
+            let left_fields = join_lineage
+                .base_fields_by_table
+                .get(&left_fqn)
+                .cloned()
+                .unwrap_or_default();
+            let right_fields = join_lineage
+                .base_fields_by_table
+                .get(&right_fqn)
+                .cloned()
+                .unwrap_or_default();
+            let left_contract = base_contract(
+                left_ref,
+                left_loaded,
+                Some(join_shape.left_alias.clone()),
+                left_fields,
+            );
+            let right_contract = base_contract(
+                right_ref,
+                right_loaded,
+                Some(join_shape.right_alias.clone()),
+                right_fields,
+            );
+            crate::meta::repository::mv_contract::MvSchemaContract {
+                contract_version: 1,
+                base: left_contract.clone(),
+                bases: vec![left_contract, right_contract],
+                output: crate::meta::repository::mv_contract::OutputContract {
+                    columns: join_lineage.output_columns,
+                    filter: join_lineage.filter,
+                },
+                join: Some(join_lineage.join),
+                target: target_contract(
+                    analysis,
+                    target,
+                    target_loaded,
+                    actual_apply_key_field_id,
+                    crate::meta::repository::mv_contract::JOIN_APPLY_KEY_COLUMN_NAME,
+                    crate::meta::repository::mv_contract::ApplyKeySource::JoinRowKey,
+                ),
+            }
+        }
+        IncrementalMvShape::Aggregate(_) => unreachable!("aggregate shape was rejected above"),
+    };
+    contract
+        .ensure_self_consistent()
+        .map_err(|e| format!("Iceberg MV schema contract is self-inconsistent: {e}"))?;
+    Ok(contract)
+}
+
+fn loaded_base_for_shape_table<'a>(
+    loaded_bases: &'a [(
+        IcebergTableRef,
+        crate::connector::iceberg::catalog::IcebergLoadedTable,
+    )],
+    shape_table: &sqlparser::ast::ObjectName,
+) -> Result<
+    &'a (
+        IcebergTableRef,
+        crate::connector::iceberg::catalog::IcebergLoadedTable,
+    ),
+    String,
+> {
+    let table_name = shape_table.to_string();
+    loaded_bases
+        .iter()
+        .find(|(base_ref, _)| base_ref.fqn().eq_ignore_ascii_case(&table_name))
+        .ok_or_else(|| format!("join MV shape base {table_name} was not loaded"))
+}
+
+fn base_contract(
+    base_ref: &IcebergTableRef,
+    loaded_base: &crate::connector::iceberg::catalog::IcebergLoadedTable,
+    alias_at_create: Option<String>,
+    fields: Vec<crate::meta::repository::mv_contract::BaseFieldRecord>,
+) -> crate::meta::repository::mv_contract::BaseContract {
+    crate::meta::repository::mv_contract::BaseContract {
+        table_fqn: base_ref.fqn(),
+        table_uuid: loaded_base.table.metadata().uuid().to_string(),
+        alias_at_create,
+        schema_id_at_create: loaded_base.table.metadata().current_schema_id(),
+        schema_at_create: crate::meta::repository::mv_contract::BaseSchemaSnapshot { fields },
+    }
+}
+
+fn target_contract(
+    analysis: &crate::connector::starrocks::managed::mv_ddl::MvAnalysis,
+    target: &IcebergMvTarget,
+    target_loaded: &crate::connector::iceberg::catalog::IcebergLoadedTable,
+    actual_apply_key_field_id: i32,
+    hidden_apply_key_column_name: &str,
+    hidden_apply_key_source: crate::meta::repository::mv_contract::ApplyKeySource,
+) -> crate::meta::repository::mv_contract::TargetContract {
+    crate::meta::repository::mv_contract::TargetContract {
+        table_fqn: format!("{}.{}.{}", target.catalog, target.namespace, target.table),
+        table_uuid: target_loaded.table.metadata().uuid().to_string(),
+        schema_id_at_create: target_loaded.table.metadata().current_schema_id(),
+        visible_columns: analysis
+            .output_columns
+            .iter()
+            .map(|col| {
+                let field = target_loaded
+                    .table
+                    .metadata()
+                    .current_schema()
+                    .as_struct()
+                    .fields()
+                    .iter()
+                    .find(|f| f.name.eq_ignore_ascii_case(&col.name))
+                    .expect("target schema was built from the same output_columns; name lookup cannot fail");
+                crate::meta::repository::mv_contract::TargetVisibleColumn {
+                    output_name: col.name.clone(),
+                    target_field_id: field.id,
+                    type_signature: format!("{}", field.field_type),
+                    nullable: !field.required,
+                }
+            })
+            .collect(),
+        hidden_apply_key: crate::meta::repository::mv_contract::HiddenApplyKeyContract {
+            column_name: hidden_apply_key_column_name.to_string(),
+            target_field_id: actual_apply_key_field_id,
+            source: hidden_apply_key_source,
+        },
     }
 }
 
@@ -3374,6 +3568,15 @@ mod tests {
             panic!("expected SELECT");
         };
         *q
+    }
+
+    #[test]
+    fn iceberg_join_mv_uses_join_apply_key_column() {
+        let column = crate::engine::mv::iceberg_target_apply::join_apply_key_table_column();
+        assert_eq!(
+            column.name,
+            crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN
+        );
     }
 
     fn test_base_ref() -> IcebergTableRef {
