@@ -12,7 +12,7 @@ use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, JoinRelation, QueryBody, Relation, ResolvedQuery, ResolvedSelect,
     TypedExpr,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) struct LineageResult {
     pub base_fields: Vec<BaseFieldRecord>,
@@ -261,8 +261,9 @@ impl<'a> QualifiedLineageCollector<'a> {
             .condition
             .as_ref()
             .ok_or_else(|| "join MV requires ON condition".to_string())?;
+        let sides = join_side_qualifiers(join)?;
         let mut predicates = Vec::new();
-        self.collect_join_predicates(condition, &mut predicates)?;
+        self.collect_join_predicates(condition, &sides, &mut predicates)?;
         if predicates.is_empty() {
             return Err("incremental join MV requires at least one join predicate".to_string());
         }
@@ -275,16 +276,17 @@ impl<'a> QualifiedLineageCollector<'a> {
     fn collect_join_predicates(
         &mut self,
         expr: &TypedExpr,
+        sides: &JoinSideQualifiers,
         out: &mut Vec<JoinPredicateLineage>,
     ) -> Result<(), String> {
-        match &expr.kind {
+        match &unwrap_nested_expr(expr).kind {
             ExprKind::BinaryOp {
                 left,
                 op: BinOp::And,
                 right,
             } => {
-                self.collect_join_predicates(left, out)?;
-                self.collect_join_predicates(right, out)
+                self.collect_join_predicates(left, sides, out)?;
+                self.collect_join_predicates(right, sides, out)
             }
             ExprKind::BinaryOp {
                 left,
@@ -293,10 +295,7 @@ impl<'a> QualifiedLineageCollector<'a> {
             } => {
                 let left_ref = self.single_qualified_column(left)?;
                 let right_ref = self.single_qualified_column(right)?;
-                out.push(JoinPredicateLineage {
-                    left: left_ref,
-                    right: right_ref,
-                });
+                out.push(normalize_join_predicate(left_ref, right_ref, sides)?);
                 Ok(())
             }
             _ => Err(
@@ -309,7 +308,7 @@ impl<'a> QualifiedLineageCollector<'a> {
         &mut self,
         expr: &TypedExpr,
     ) -> Result<QualifiedFieldLineage, String> {
-        let ExprKind::ColumnRef { qualifier, column } = &expr.kind else {
+        let ExprKind::ColumnRef { qualifier, column } = &unwrap_nested_expr(expr).kind else {
             return Err(
                 "incremental join MV join key must be a qualified column reference".to_string(),
             );
@@ -326,6 +325,90 @@ impl<'a> QualifiedLineageCollector<'a> {
             .map(|(table, fields)| (table, fields.into_values().collect()))
             .collect()
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JoinSide {
+    Left,
+    Right,
+}
+
+struct JoinSideQualifiers {
+    left: BTreeSet<String>,
+    right: BTreeSet<String>,
+}
+
+fn join_side_qualifiers(join: &JoinRelation) -> Result<JoinSideQualifiers, String> {
+    Ok(JoinSideQualifiers {
+        left: relation_qualifiers(&join.left, "left")?,
+        right: relation_qualifiers(&join.right, "right")?,
+    })
+}
+
+fn relation_qualifiers(relation: &Relation, side_name: &str) -> Result<BTreeSet<String>, String> {
+    match relation {
+        Relation::Scan(scan) => {
+            let qualifier = scan.alias.as_deref().unwrap_or(&scan.table.name);
+            Ok(one_qualifier(qualifier))
+        }
+        Relation::Subquery { alias, .. } => Ok(one_qualifier(alias)),
+        _ => Err(format!(
+            "join MV lineage requires a single scan or subquery on the {side_name} side"
+        )),
+    }
+}
+
+fn one_qualifier(qualifier: &str) -> BTreeSet<String> {
+    BTreeSet::from([qualifier.to_ascii_lowercase()])
+}
+
+fn normalize_join_predicate(
+    left_ref: QualifiedFieldLineage,
+    right_ref: QualifiedFieldLineage,
+    sides: &JoinSideQualifiers,
+) -> Result<JoinPredicateLineage, String> {
+    let left_side = join_side_for_qualifier(&left_ref.qualifier_at_create, sides)?;
+    let right_side = join_side_for_qualifier(&right_ref.qualifier_at_create, sides)?;
+    match (left_side, right_side) {
+        (JoinSide::Left, JoinSide::Right) => Ok(JoinPredicateLineage {
+            left: left_ref,
+            right: right_ref,
+        }),
+        (JoinSide::Right, JoinSide::Left) => Ok(JoinPredicateLineage {
+            left: right_ref,
+            right: left_ref,
+        }),
+        _ => Err(
+            "incremental join MV join predicate must reference one column from each join side"
+                .to_string(),
+        ),
+    }
+}
+
+fn join_side_for_qualifier(
+    qualifier: &str,
+    sides: &JoinSideQualifiers,
+) -> Result<JoinSide, String> {
+    let key = qualifier.to_ascii_lowercase();
+    let on_left = sides.left.contains(&key);
+    let on_right = sides.right.contains(&key);
+    match (on_left, on_right) {
+        (true, false) => Ok(JoinSide::Left),
+        (false, true) => Ok(JoinSide::Right),
+        (true, true) => Err(format!(
+            "join MV qualifier `{qualifier}` is ambiguous across join sides"
+        )),
+        (false, false) => Err(format!(
+            "join MV qualifier `{qualifier}` does not match either join side"
+        )),
+    }
+}
+
+fn unwrap_nested_expr(mut expr: &TypedExpr) -> &TypedExpr {
+    while let ExprKind::Nested(inner) = &expr.kind {
+        expr = inner.as_ref();
+    }
+    expr
 }
 
 fn typed_expr_children(expr: &TypedExpr) -> Vec<&TypedExpr> {
@@ -657,21 +740,26 @@ mod tests {
     mod join_lineage {
         use super::*;
 
-        #[test]
-        fn distinguishes_same_named_columns_by_alias() {
-            let sql = "select l.id as left_id, r.id as right_id \
-                       from ns.left_tbl l join ns.right_tbl r on l.id = r.id \
-                       where l.id > 0";
+        fn lineage_for_on(on_expr: &str) -> Result<JoinLineageResult, String> {
+            let sql = format!(
+                "select l.id as left_id, r.id as right_id \
+                 from ns.left_tbl l join ns.right_tbl r on {on_expr} \
+                 where l.id > 0"
+            );
             let fixture = JoinLineageFixture::new();
-            let resolved = fixture.analyze(sql);
-            let result = build_join_projection_filter_lineage(
+            let resolved = fixture.analyze(&sql);
+            build_join_projection_filter_lineage(
                 &resolved,
                 &[
                     ("ice.ns.left_tbl", "l", &fixture.left_schema),
                     ("ice.ns.right_tbl", "r", &fixture.right_schema),
                 ],
             )
-            .expect("join lineage");
+        }
+
+        #[test]
+        fn distinguishes_same_named_columns_by_alias() {
+            let result = lineage_for_on("l.id = r.id").expect("join lineage");
             assert_eq!(result.output_columns.len(), 2);
             assert_eq!(
                 result.output_columns[0].expression.referenced_base_fields[0].table_fqn,
@@ -697,6 +785,50 @@ mod tests {
             );
             assert_eq!(result.base_fields_by_table["ice.ns.left_tbl"].len(), 1);
             assert_eq!(result.base_fields_by_table["ice.ns.right_tbl"].len(), 1);
+        }
+
+        #[test]
+        fn accepts_parenthesized_join_predicate() {
+            let result = lineage_for_on("(l.id = r.id)").expect("join lineage");
+            assert_eq!(result.join.predicates.len(), 1);
+            assert_eq!(result.join.predicates[0].left.table_fqn, "ice.ns.left_tbl");
+            assert_eq!(
+                result.join.predicates[0].right.table_fqn,
+                "ice.ns.right_tbl"
+            );
+        }
+
+        #[test]
+        fn accepts_parenthesized_join_key_operands() {
+            let result = lineage_for_on("(l.id) = (r.id)").expect("join lineage");
+            assert_eq!(result.join.predicates.len(), 1);
+            assert_eq!(result.join.predicates[0].left.qualifier_at_create, "l");
+            assert_eq!(result.join.predicates[0].right.qualifier_at_create, "r");
+        }
+
+        #[test]
+        fn normalizes_reversed_join_predicate_to_left_right_order() {
+            let result = lineage_for_on("r.id = l.id").expect("join lineage");
+            assert_eq!(result.join.predicates.len(), 1);
+            assert_eq!(result.join.predicates[0].left.table_fqn, "ice.ns.left_tbl");
+            assert_eq!(result.join.predicates[0].left.qualifier_at_create, "l");
+            assert_eq!(
+                result.join.predicates[0].right.table_fqn,
+                "ice.ns.right_tbl"
+            );
+            assert_eq!(result.join.predicates[0].right.qualifier_at_create, "r");
+        }
+
+        #[test]
+        fn rejects_same_side_join_predicate() {
+            let err = match lineage_for_on("l.id = l.id") {
+                Ok(_) => panic!("same side predicate should be rejected"),
+                Err(err) => err,
+            };
+            assert!(
+                err.contains("one column from each join side"),
+                "unexpected error: {err}"
+            );
         }
     }
 
