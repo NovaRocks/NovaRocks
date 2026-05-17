@@ -2887,6 +2887,7 @@ mod tests {
                 record_count: Some(1),
                 partition_spec_id: Some(0),
                 partition_key: None,
+                partition_values: Vec::new(),
                 first_row_id: Some(0),
                 data_sequence_number: Some(1),
             }],

@@ -139,8 +139,56 @@ pub(crate) struct DataFileRef {
     pub record_count: Option<i64>,
     pub partition_spec_id: Option<i32>,
     pub partition_key: Option<String>,
+    pub partition_values: Vec<ChangePartitionFieldValue>,
     pub first_row_id: Option<i64>,
     pub data_sequence_number: Option<i64>,
+}
+
+/// A single Iceberg partition field value carried with an Iceberg change ref.
+///
+/// This is intentionally local to change planning. Unlike catalog-level
+/// `IcebergPartitionFieldValue`, PR2 stores only conservative string
+/// representations for primitive values so later MV partition planning can
+/// decide whether a value is safe to consume without depending on catalog
+/// typed-value semantics.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ChangePartitionFieldValue {
+    /// Stable Iceberg source field id from the partition spec.
+    pub source_field_id: i32,
+    /// Optional diagnostic source table column name resolved from the current
+    /// Iceberg schema for `source_field_id`. Consumers that need stability
+    /// should use `source_field_id`; this is `None` when the current schema no
+    /// longer contains the source field id.
+    pub source_column: Option<String>,
+    /// Iceberg partition field name from the partition spec.
+    pub field_name: String,
+    /// Iceberg partition transform name, such as `identity`, `bucket(8)`, or
+    /// `month`.
+    pub transform: String,
+    /// Partition field value. `Null` means the manifest explicitly carries a
+    /// null partition value. `Unsupported` means a value exists but PR2 should
+    /// not treat it as safely usable for MV partition planning.
+    pub value: ChangePartitionValue,
+}
+
+/// Conservative partition value representation for Iceberg change planning.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ChangePartitionValue {
+    /// Actual NULL partition value in the manifest partition struct.
+    Null,
+    /// Primitive partition value rendered as a stable string for planner use.
+    Primitive(String),
+    /// Value exists, but this PR2 metadata path cannot represent it safely.
+    Unsupported(String),
+}
+
+impl ChangePartitionValue {
+    pub(crate) fn as_primitive_str(&self) -> Option<&str> {
+        match self {
+            ChangePartitionValue::Primitive(value) => Some(value.as_str()),
+            ChangePartitionValue::Null | ChangePartitionValue::Unsupported(_) => None,
+        }
+    }
 }
 
 /// Reference to a data file removed by an Iceberg overwrite snapshot. Reading
@@ -152,6 +200,7 @@ pub(crate) struct DeletedDataFileRef {
     pub record_count: Option<i64>,
     pub partition_spec_id: Option<i32>,
     pub partition_key: Option<String>,
+    pub partition_values: Vec<ChangePartitionFieldValue>,
     pub first_row_id: Option<i64>,
     pub data_sequence_number: Option<i64>,
 }
@@ -183,6 +232,7 @@ pub(crate) struct PositionDeleteRef {
     /// `deletion-vector-v1` blob inside the Puffin file. Must be `None` when
     /// `file_format == Parquet`.
     pub content_size_in_bytes: Option<i64>,
+    pub partition_values: Vec<ChangePartitionFieldValue>,
 }
 
 /// Reference to a single equality-delete file added to the table. Unlike
@@ -198,6 +248,7 @@ pub(crate) struct EqualityDeleteRef {
     pub sequence_number: Option<i64>,
     pub partition_spec_id: Option<i32>,
     pub partition_key: Option<String>,
+    pub partition_values: Vec<ChangePartitionFieldValue>,
 }
 
 fn iceberg_partition_key(partition: &iceberg::spec::Struct) -> Option<String> {
@@ -205,6 +256,85 @@ fn iceberg_partition_key(partition: &iceberg::spec::Struct) -> Option<String> {
         None
     } else {
         Some(format!("{partition:?}"))
+    }
+}
+
+fn change_partition_field_values(
+    metadata: &iceberg::spec::TableMetadata,
+    spec_id: i32,
+    partition: &iceberg::spec::Struct,
+) -> Result<Vec<ChangePartitionFieldValue>, ChangeError> {
+    let Some(spec) = metadata.partition_spec_by_id(spec_id) else {
+        return Err(ChangeError::InternalInconsistency(format!(
+            "iceberg table metadata missing partition spec id {spec_id}"
+        )));
+    };
+    let schema = metadata.current_schema();
+    let mut values = Vec::with_capacity(spec.fields().len());
+    for (idx, field) in spec.fields().iter().enumerate() {
+        let source_column = schema
+            .field_by_id(field.source_id)
+            .map(|source| source.name.clone());
+        let Some(literal) = partition.fields().get(idx) else {
+            return Err(ChangeError::InternalInconsistency(format!(
+                "iceberg partition struct for spec id {spec_id} is missing field {} at index {idx}",
+                field.name
+            )));
+        };
+        let value = change_partition_value(literal.as_ref());
+        values.push(ChangePartitionFieldValue {
+            source_field_id: field.source_id,
+            source_column,
+            field_name: field.name.clone(),
+            transform: change_partition_transform_name(&field.transform),
+            value,
+        });
+    }
+    Ok(values)
+}
+
+fn change_partition_transform_name(transform: &iceberg::spec::Transform) -> String {
+    match transform {
+        iceberg::spec::Transform::Identity => "identity".to_string(),
+        other => format!("{other:?}").to_ascii_lowercase(),
+    }
+}
+
+fn change_partition_value(literal: Option<&iceberg::spec::Literal>) -> ChangePartitionValue {
+    let Some(literal) = literal else {
+        return ChangePartitionValue::Null;
+    };
+    let iceberg::spec::Literal::Primitive(value) = literal else {
+        return ChangePartitionValue::Unsupported("non-primitive partition value".to_string());
+    };
+    match value {
+        iceberg::spec::PrimitiveLiteral::Boolean(v) => {
+            ChangePartitionValue::Primitive(v.to_string())
+        }
+        iceberg::spec::PrimitiveLiteral::Int(v) => ChangePartitionValue::Primitive(v.to_string()),
+        iceberg::spec::PrimitiveLiteral::Long(v) => ChangePartitionValue::Primitive(v.to_string()),
+        iceberg::spec::PrimitiveLiteral::Float(v) => {
+            ChangePartitionValue::Primitive(v.0.to_string())
+        }
+        iceberg::spec::PrimitiveLiteral::Double(v) => {
+            ChangePartitionValue::Primitive(v.0.to_string())
+        }
+        iceberg::spec::PrimitiveLiteral::String(v) => ChangePartitionValue::Primitive(v.clone()),
+        iceberg::spec::PrimitiveLiteral::Binary(_) => {
+            ChangePartitionValue::Unsupported("binary partition value".to_string())
+        }
+        iceberg::spec::PrimitiveLiteral::Int128(_) => {
+            ChangePartitionValue::Unsupported("int128 partition value".to_string())
+        }
+        iceberg::spec::PrimitiveLiteral::UInt128(_) => {
+            ChangePartitionValue::Unsupported("uint128 partition value".to_string())
+        }
+        iceberg::spec::PrimitiveLiteral::AboveMax => {
+            ChangePartitionValue::Unsupported("above-max partition value".to_string())
+        }
+        iceberg::spec::PrimitiveLiteral::BelowMin => {
+            ChangePartitionValue::Unsupported("below-min partition value".to_string())
+        }
     }
 }
 
@@ -1598,6 +1728,7 @@ async fn collect_files(
         match action {
             LineageAction::CollectInserts { .. } => {
                 collect_added_data_files_for_manifest_list(
+                    metadata,
                     snapshot_id,
                     file_io,
                     &manifest_list,
@@ -1607,6 +1738,7 @@ async fn collect_files(
             }
             LineageAction::CollectDeletes { .. } => {
                 collect_added_data_files_for_manifest_list(
+                    metadata,
                     snapshot_id,
                     file_io,
                     &manifest_list,
@@ -1614,6 +1746,7 @@ async fn collect_files(
                 )
                 .await?;
                 collect_added_delete_files_for_manifest_list(
+                    metadata,
                     snapshot_id,
                     file_io,
                     &manifest_list,
@@ -1624,6 +1757,7 @@ async fn collect_files(
             }
             LineageAction::CollectOverwriteDiff { .. } => {
                 collect_added_data_files_for_manifest_list(
+                    metadata,
                     snapshot_id,
                     file_io,
                     &manifest_list,
@@ -1631,6 +1765,7 @@ async fn collect_files(
                 )
                 .await?;
                 collect_deleted_data_files_for_manifest_list(
+                    metadata,
                     snapshot_id,
                     file_io,
                     &manifest_list,
@@ -1645,6 +1780,7 @@ async fn collect_files(
 }
 
 async fn collect_added_data_files_for_manifest_list(
+    metadata: &iceberg::spec::TableMetadata,
     snapshot_id: i64,
     file_io: &iceberg::io::FileIO,
     manifest_list: &iceberg::spec::ManifestList,
@@ -1710,6 +1846,11 @@ async fn collect_added_data_files_for_manifest_list(
                 record_count: Some(record_count),
                 partition_spec_id: Some(manifest_file.partition_spec_id),
                 partition_key: iceberg_partition_key(df.partition()),
+                partition_values: change_partition_field_values(
+                    metadata,
+                    manifest_file.partition_spec_id,
+                    df.partition(),
+                )?,
                 first_row_id,
                 data_sequence_number: Some(
                     entry
@@ -1723,6 +1864,7 @@ async fn collect_added_data_files_for_manifest_list(
 }
 
 async fn collect_deleted_data_files_for_manifest_list(
+    metadata: &iceberg::spec::TableMetadata,
     snapshot_id: i64,
     file_io: &iceberg::io::FileIO,
     manifest_list: &iceberg::spec::ManifestList,
@@ -1767,6 +1909,11 @@ async fn collect_deleted_data_files_for_manifest_list(
                 record_count: Some(record_count),
                 partition_spec_id: Some(manifest_file.partition_spec_id),
                 partition_key: iceberg_partition_key(df.partition()),
+                partition_values: change_partition_field_values(
+                    metadata,
+                    manifest_file.partition_spec_id,
+                    df.partition(),
+                )?,
                 first_row_id: df.first_row_id(),
                 data_sequence_number: Some(
                     entry
@@ -1780,6 +1927,7 @@ async fn collect_deleted_data_files_for_manifest_list(
 }
 
 async fn collect_added_delete_files_for_manifest_list(
+    metadata: &iceberg::spec::TableMetadata,
     snapshot_id: i64,
     file_io: &iceberg::io::FileIO,
     manifest_list: &iceberg::spec::ManifestList,
@@ -1823,6 +1971,11 @@ async fn collect_added_delete_files_for_manifest_list(
                             file_format: DataFileFormat::Parquet,
                             content_offset: None,
                             content_size_in_bytes: None,
+                            partition_values: change_partition_field_values(
+                                metadata,
+                                manifest_file.partition_spec_id,
+                                df.partition(),
+                            )?,
                         },
                         DataFileFormat::Puffin => {
                             let referenced = df.referenced_data_file().ok_or_else(|| {
@@ -1854,6 +2007,11 @@ async fn collect_added_delete_files_for_manifest_list(
                                 file_format: DataFileFormat::Puffin,
                                 content_offset: Some(offset),
                                 content_size_in_bytes: Some(length),
+                                partition_values: change_partition_field_values(
+                                    metadata,
+                                    manifest_file.partition_spec_id,
+                                    df.partition(),
+                                )?,
                             }
                         }
                         other => {
@@ -1900,6 +2058,11 @@ async fn collect_added_delete_files_for_manifest_list(
                         ),
                         partition_spec_id: Some(manifest_file.partition_spec_id),
                         partition_key: iceberg_partition_key(df.partition()),
+                        partition_values: change_partition_field_values(
+                            metadata,
+                            manifest_file.partition_spec_id,
+                            df.partition(),
+                        )?,
                     });
                 }
                 DataContentType::Data => {
@@ -1938,6 +2101,7 @@ mod tests {
         CommitCtx, CommitOpKind, IcebergCommitAction, IcebergCommitCollector, OverwriteCommit,
     };
     use crate::fs::object_store::ObjectStoreConfig;
+    use crate::sql::parser::ast::IcebergPartitionFieldExpr;
     use crate::sql::{Literal, SqlType, TableColumnDef};
 
     use super::plan_changes;
@@ -1986,6 +2150,7 @@ mod tests {
             record_count: Some(3),
             partition_spec_id: None,
             partition_key: None,
+            partition_values: Vec::new(),
             first_row_id: Some(200),
             data_sequence_number: None,
         }];
@@ -2093,14 +2258,81 @@ mod tests {
             record_count: Some(2),
             partition_spec_id: Some(4),
             partition_key: Some("city=A".to_string()),
+            partition_values: vec![super::ChangePartitionFieldValue {
+                source_field_id: 7,
+                source_column: Some("city".to_string()),
+                field_name: "city".to_string(),
+                transform: "identity".to_string(),
+                value: super::ChangePartitionValue::Primitive("A".to_string()),
+            }],
             first_row_id: Some(100),
             data_sequence_number: Some(12),
         };
 
         assert_eq!(file.partition_spec_id, Some(4));
         assert_eq!(file.partition_key.as_deref(), Some("city=A"));
+        assert_eq!(file.partition_values[0].source_field_id, 7);
+        assert_eq!(
+            file.partition_values[0].source_column.as_deref(),
+            Some("city")
+        );
+        assert_eq!(file.partition_values[0].field_name, "city");
+        assert_eq!(file.partition_values[0].transform, "identity");
+        assert_eq!(file.partition_values[0].value.as_primitive_str(), Some("A"));
         assert_eq!(file.first_row_id, Some(100));
         assert_eq!(file.data_sequence_number, Some(12));
+    }
+
+    #[test]
+    fn change_partition_value_distinguishes_null_from_unsupported() {
+        use iceberg::spec::{Literal as IcebergLiteral, PrimitiveLiteral, Struct};
+
+        assert_eq!(
+            super::change_partition_value(None),
+            super::ChangePartitionValue::Null
+        );
+        assert_eq!(
+            super::change_partition_value(Some(&IcebergLiteral::Primitive(
+                PrimitiveLiteral::Binary(vec![1, 2, 3]),
+            ))),
+            super::ChangePartitionValue::Unsupported("binary partition value".to_string())
+        );
+        assert_eq!(
+            super::change_partition_value(Some(&IcebergLiteral::Struct(Struct::empty()))),
+            super::ChangePartitionValue::Unsupported("non-primitive partition value".to_string())
+        );
+    }
+
+    #[test]
+    fn position_delete_ref_preserves_partition_metadata() {
+        let delete = super::PositionDeleteRef {
+            delete_file_path: "s3://bucket/t/delete.parquet".to_string(),
+            delete_file_size: 20,
+            record_count: Some(1),
+            referenced_data_file: Some("s3://bucket/t/data.parquet".to_string()),
+            file_format: iceberg::spec::DataFileFormat::Parquet,
+            content_offset: None,
+            content_size_in_bytes: None,
+            partition_values: vec![super::ChangePartitionFieldValue {
+                source_field_id: 7,
+                source_column: Some("city".to_string()),
+                field_name: "city".to_string(),
+                transform: "identity".to_string(),
+                value: super::ChangePartitionValue::Primitive("A".to_string()),
+            }],
+        };
+
+        delete.validate_invariants().expect("valid position delete");
+        assert_eq!(delete.partition_values[0].source_field_id, 7);
+        assert_eq!(
+            delete.partition_values[0].source_column.as_deref(),
+            Some("city")
+        );
+        assert_eq!(delete.partition_values[0].field_name, "city");
+        assert_eq!(
+            delete.partition_values[0].value.as_primitive_str(),
+            Some("A")
+        );
     }
 
     fn test_hadoop_catalog_entry(catalog_name: &str, warehouse_uri: &str) -> IcebergCatalogEntry {
@@ -2509,7 +2741,9 @@ mod tests {
                 default: None,
             }],
             None,
-            &[],
+            &[IcebergPartitionFieldExpr::Identity {
+                column: "k1".to_string(),
+            }],
             &[],
         )
         .expect("table");
@@ -2538,6 +2772,13 @@ mod tests {
         assert!(!batch.inserts.is_empty());
         assert!(batch.deletes.is_empty());
         assert!(batch.equality_deletes.is_empty());
+        let partition_values = &batch.inserts[0].partition_values;
+        assert_eq!(partition_values.len(), 1);
+        assert_eq!(partition_values[0].source_field_id, 1);
+        assert_eq!(partition_values[0].source_column.as_deref(), Some("k1"));
+        assert_eq!(partition_values[0].field_name, "k1");
+        assert_eq!(partition_values[0].transform, "identity");
+        assert_eq!(partition_values[0].value.as_primitive_str(), Some("2"));
         let returned_rows: i64 = batch
             .inserts
             .iter()
@@ -2917,6 +3158,7 @@ mod tests {
             file_format: iceberg::spec::DataFileFormat::Parquet,
             content_offset: None,
             content_size_in_bytes: None,
+            partition_values: Vec::new(),
         };
         r.validate_invariants().expect("ok");
     }
@@ -2931,6 +3173,7 @@ mod tests {
             file_format: iceberg::spec::DataFileFormat::Parquet,
             content_offset: Some(0),
             content_size_in_bytes: None,
+            partition_values: Vec::new(),
         };
         let err = r.validate_invariants().expect_err("must reject");
         assert!(matches!(err, super::ChangeError::InternalInconsistency(_)));
@@ -2946,6 +3189,7 @@ mod tests {
             file_format: iceberg::spec::DataFileFormat::Parquet,
             content_offset: None,
             content_size_in_bytes: Some(120),
+            partition_values: Vec::new(),
         };
         let err = r.validate_invariants().expect_err("must reject");
         assert!(matches!(err, super::ChangeError::InternalInconsistency(_)));
@@ -2961,6 +3205,7 @@ mod tests {
             file_format: iceberg::spec::DataFileFormat::Puffin,
             content_offset: Some(4),
             content_size_in_bytes: Some(120),
+            partition_values: Vec::new(),
         };
         r.validate_invariants().expect("ok");
     }
@@ -2975,6 +3220,7 @@ mod tests {
             file_format: iceberg::spec::DataFileFormat::Puffin,
             content_offset: None,
             content_size_in_bytes: Some(120),
+            partition_values: Vec::new(),
         };
         let err = r.validate_invariants().expect_err("must reject");
         assert!(matches!(err, super::ChangeError::InternalInconsistency(_)));
@@ -2990,6 +3236,7 @@ mod tests {
             file_format: iceberg::spec::DataFileFormat::Puffin,
             content_offset: Some(4),
             content_size_in_bytes: Some(120),
+            partition_values: Vec::new(),
         };
         let err = r.validate_invariants().expect_err("must reject");
         assert!(matches!(err, super::ChangeError::InternalInconsistency(_)));

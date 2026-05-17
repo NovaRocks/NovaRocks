@@ -1160,6 +1160,7 @@ mod tests {
             file_format: iceberg::spec::DataFileFormat::Parquet,
             content_offset: None,
             content_size_in_bytes: None,
+            partition_values: Vec::new(),
         }];
         let map =
             read_delete_positions_per_data_file(&refs, &factory_for_dir(dir.path())).expect("ok");
@@ -1234,6 +1235,7 @@ mod tests {
             file_format: iceberg::spec::DataFileFormat::Parquet,
             content_offset: None,
             content_size_in_bytes: None,
+            partition_values: Vec::new(),
         }];
         let batches = scan_deletes(
             &refs,
@@ -1266,6 +1268,7 @@ mod tests {
             file_format: iceberg::spec::DataFileFormat::Parquet,
             content_offset: None,
             content_size_in_bytes: None,
+            partition_values: Vec::new(),
         }];
 
         let batches = scan_deletes_with_base_row_id_lookup(
@@ -1304,6 +1307,7 @@ mod tests {
             file_format: iceberg::spec::DataFileFormat::Parquet,
             content_offset: None,
             content_size_in_bytes: None,
+            partition_values: Vec::new(),
         }];
 
         let batches = scan_deletes_with_path_normalizer(
@@ -1353,6 +1357,7 @@ mod tests {
             file_format: iceberg::spec::DataFileFormat::Parquet,
             content_offset: None,
             content_size_in_bytes: None,
+            partition_values: Vec::new(),
         }];
         let batches = scan_deletes(
             &refs,
@@ -1383,6 +1388,7 @@ mod tests {
             file_format: DataFileFormat::Puffin,
             content_offset: Some(written.content_offset),
             content_size_in_bytes: Some(written.content_size_in_bytes),
+            partition_values: Vec::new(),
         }];
         let map = read_dv_positions_per_data_file(&refs, &file_io)
             .await
@@ -1429,6 +1435,7 @@ mod tests {
                 file_format: DataFileFormat::Parquet,
                 content_offset: None,
                 content_size_in_bytes: None,
+                partition_values: Vec::new(),
             },
             PositionDeleteRef {
                 delete_file_path: dv_written.path.clone(),
@@ -1438,6 +1445,7 @@ mod tests {
                 file_format: DataFileFormat::Puffin,
                 content_offset: Some(dv_written.content_offset),
                 content_size_in_bytes: Some(dv_written.content_size_in_bytes),
+                partition_values: Vec::new(),
             },
         ];
 

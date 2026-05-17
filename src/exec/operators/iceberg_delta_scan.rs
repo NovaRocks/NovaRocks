@@ -604,6 +604,7 @@ fn open_position_delete_scanner(
         file_format: iceberg_format,
         content_offset,
         content_size_in_bytes,
+        partition_values: Vec::new(),
     };
     let delete_side = node.iceberg_runtime.delete_side.as_ref().ok_or_else(|| {
         format!(
@@ -663,6 +664,7 @@ fn open_equality_delete_scanner(
         sequence_number: file.data_sequence_number,
         partition_spec_id: file.partition_spec_id,
         partition_key: file.partition_key.clone(),
+        partition_values: Vec::new(),
     };
     let rows =
         crate::connector::iceberg::changes::scan_equality_delete_rows_for_one_with_v3_lineage_at(
@@ -750,6 +752,7 @@ fn open_deleted_data_file_scanner(
         record_count: None,
         partition_spec_id: file.partition_spec_id,
         partition_key: file.partition_key.clone(),
+        partition_values: Vec::new(),
         first_row_id: Some(resolved_first_row_id),
         data_sequence_number: Some(resolved_data_sequence_number),
     };
