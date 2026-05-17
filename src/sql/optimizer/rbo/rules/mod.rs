@@ -9,9 +9,14 @@ use crate::sql::optimizer::statistics::TableStatistics;
 pub(crate) mod column_pruning;
 pub(crate) mod join_reorder;
 pub(crate) mod predicate_pushdown;
+pub(crate) mod ukfk;
 
 pub(crate) fn column_pruning_rules() -> Vec<Box<dyn RewriteRule>> {
-    vec![Box::new(column_pruning::PruneColumns)]
+    vec![
+        Box::new(column_pruning::PruneColumns),
+        Box::new(ukfk::PruneUkFkJoin),
+        Box::new(ukfk::EliminateUniqueAggregate),
+    ]
 }
 
 /// Predicate pushdown rules only (no column pruning). Used in the
@@ -60,14 +65,16 @@ mod tests {
     #[test]
     fn registry_contains_expected_rules() {
         let rules = all_rbo_rules(&HashMap::new());
-        assert_eq!(rules.len(), 7);
+        assert_eq!(rules.len(), 9);
         let mut names: Vec<&str> = rules.iter().map(|r| r.name()).collect();
         names.sort();
         assert_eq!(
             names,
             vec![
+                "EliminateUniqueAggregate",
                 "JoinReorder",
                 "PruneColumns",
+                "PruneUkFkJoin",
                 "PushDownPredicateAggregate",
                 "PushDownPredicateJoin",
                 "PushDownPredicateProject",

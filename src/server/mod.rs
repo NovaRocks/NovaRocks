@@ -27,6 +27,7 @@ use self::encoding::write_query_result;
 use crate::engine::catalog::{DEFAULT_DATABASE, normalize_identifier};
 use crate::engine::statement::looks_like_show_alter_table_optimize;
 use crate::engine::{StandaloneNovaRocks, StandaloneOptions, StatementResult};
+use crate::sql::optimizer::options::SessionOptimizerSettings;
 
 const DEFAULT_MYSQL_PORT: u16 = 9030;
 const DEFAULT_CATALOG: &str = "default_catalog";
@@ -259,6 +260,7 @@ struct NovaRocksMysqlShim {
     /// Per-session group_concat limit (in bytes).
     /// Set via `SET group_concat_max_len = N`.
     group_concat_max_len: i64,
+    optimizer_settings: SessionOptimizerSettings,
     user_variables: BTreeMap<String, String>,
 }
 
@@ -272,6 +274,7 @@ impl NovaRocksMysqlShim {
             current_db: DEFAULT_DATABASE.to_string(),
             query_timeout_secs: None,
             group_concat_max_len: 1024,
+            optimizer_settings: SessionOptimizerSettings::default(),
             user_variables: BTreeMap::new(),
         }
     }
@@ -536,6 +539,27 @@ fn parse_set_group_concat_max_len(query: &str) -> Option<i64> {
     i64::try_from(value).ok()
 }
 
+fn parse_set_boolean(query: &str) -> Option<(String, bool)> {
+    let normalized = query.replace('=', " = ");
+    let mut parts = normalized.split_whitespace();
+    let head = parts.next()?;
+    if !head.eq_ignore_ascii_case("set") {
+        return None;
+    }
+    let name = parts.next()?.to_ascii_lowercase();
+    let next = parts.next()?;
+    let value = if next == "=" { parts.next()? } else { next };
+    if parts.next().is_some() {
+        return None;
+    }
+    let enabled = match value.to_ascii_lowercase().as_str() {
+        "true" | "on" | "1" => true,
+        "false" | "off" | "0" => false,
+        _ => return None,
+    };
+    Some((name, enabled))
+}
+
 fn parse_set_user_variable_query(query: &str) -> Option<(String, String)> {
     let trimmed = query.trim();
     if !trimmed
@@ -670,6 +694,20 @@ async fn execute_statement_text(
         return Ok(StatementResult::Ok);
     }
 
+    if let Some((name, enabled)) = parse_set_boolean(trimmed) {
+        match name.as_str() {
+            "enable_ukfk_opt" => shim.optimizer_settings.enable_ukfk_opt = enabled,
+            "enable_rbo_table_prune" => shim.optimizer_settings.enable_rbo_table_prune = enabled,
+            "enable_cbo_table_prune" => shim.optimizer_settings.enable_cbo_table_prune = enabled,
+            "enable_table_prune_on_update" => {
+                shim.optimizer_settings.enable_table_prune_on_update = enabled
+            }
+            "enable_eliminate_agg" => shim.optimizer_settings.enable_eliminate_agg = enabled,
+            _ => return Ok(StatementResult::Ok),
+        }
+        return Ok(StatementResult::Ok);
+    }
+
     if let Some((name, value)) = parse_set_user_variable_query(trimmed) {
         shim.user_variables.insert(name, value);
         return Ok(StatementResult::Ok);
@@ -720,18 +758,21 @@ async fn execute_statement_text(
     let current_catalog = shim.current_catalog.clone();
     let current_db = shim.current_db.clone();
     let query_timeout = shim.query_timeout_secs;
+    let optimizer_settings = shim.optimizer_settings.clone();
     let query_options = crate::internal_service::TQueryOptions {
         group_concat_max_len: Some(shim.group_concat_max_len),
         ..Default::default()
     };
 
     let join_handle = task::spawn_blocking(move || {
-        session.execute_in_context(
-            &sql,
-            current_catalog.as_deref(),
-            &current_db,
-            Some(query_options),
-        )
+        crate::sql::optimizer::options::with_session_optimizer_settings(optimizer_settings, || {
+            session.execute_in_context(
+                &sql,
+                current_catalog.as_deref(),
+                &current_db,
+                Some(query_options),
+            )
+        })
     });
 
     let result = match query_timeout {

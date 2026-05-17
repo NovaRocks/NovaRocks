@@ -1,7 +1,38 @@
 //! Per-optimize-call configuration shared by the RBO and CBO drivers.
 
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::time::Duration;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SessionOptimizerSettings {
+    pub enable_ukfk_opt: bool,
+    pub enable_rbo_table_prune: bool,
+    pub enable_cbo_table_prune: bool,
+    pub enable_table_prune_on_update: bool,
+    pub enable_eliminate_agg: bool,
+}
+
+thread_local! {
+    static SESSION_OPTIMIZER_SETTINGS: RefCell<SessionOptimizerSettings> =
+        RefCell::new(SessionOptimizerSettings::default());
+}
+
+pub(crate) fn with_session_optimizer_settings<T>(
+    settings: SessionOptimizerSettings,
+    f: impl FnOnce() -> T,
+) -> T {
+    SESSION_OPTIMIZER_SETTINGS.with(|cell| {
+        let previous = cell.replace(settings);
+        let result = f();
+        cell.replace(previous);
+        result
+    })
+}
+
+pub(crate) fn current_session_optimizer_settings() -> SessionOptimizerSettings {
+    SESSION_OPTIMIZER_SETTINGS.with(|cell| cell.borrow().clone())
+}
 
 /// Controls which rules fire and bounds resource use.
 ///

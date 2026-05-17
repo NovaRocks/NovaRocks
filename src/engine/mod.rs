@@ -5588,6 +5588,24 @@ enable_path_style_access = true
         )
     }
 
+    fn current_live_data_file_first_row_ids(
+        engine: &StandaloneNovaRocks,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) -> Vec<Option<i64>> {
+        let registry = engine.inner.iceberg_catalogs.read().expect("registry");
+        let entry = registry.get(catalog).expect("entry");
+        entry.invalidate_table_cache(namespace, table);
+        let loaded =
+            crate::connector::iceberg::catalog::load_table(&entry, namespace, table).expect("load");
+        crate::connector::iceberg::catalog::registry::extract_data_files_with_stats(&loaded.table)
+            .expect("extract data files")
+            .into_iter()
+            .map(|file| file.first_row_id)
+            .collect()
+    }
+
     fn current_snapshot_has_position_delete_parquet(
         engine: &StandaloneNovaRocks,
         catalog: &str,
@@ -5806,6 +5824,15 @@ enable_path_style_access = true
             row_range_after,
             Some((next_row_id_before, 0)),
             "Preserve-mode OPTIMIZE must record (next_row_id, 0) row_range"
+        );
+        let first_row_ids = current_live_data_file_first_row_ids(&engine, "ice", "db1", "t");
+        assert!(
+            !first_row_ids.is_empty(),
+            "OPTIMIZE must leave at least one live data file"
+        );
+        assert!(
+            first_row_ids.iter().all(Option::is_some),
+            "OPTIMIZE preserve-mode data files must keep effective first_row_id values: {first_row_ids:?}"
         );
     }
 

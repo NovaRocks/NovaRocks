@@ -5,9 +5,10 @@ use std::sync::Arc;
 
 use arrow::array::{
     ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int32Array,
-    Int32Builder, Int64Array, Int64Builder, ListBuilder, StringArray, StringBuilder,
-    Time64MicrosecondArray, TimestampMicrosecondArray,
+    Int32Builder, Int64Array, Int64Builder, ListArray, ListBuilder, NullBufferBuilder, StringArray,
+    StringBuilder, StructArray, Time64MicrosecondArray, TimestampMicrosecondArray,
 };
+use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
@@ -2040,6 +2041,92 @@ fn build_literal_array(
                 offsets,
                 values,
                 nulls,
+            )))
+        }
+        DataType::List(field) => {
+            let mut offsets = Vec::with_capacity(values.len() + 1);
+            let mut nulls = NullBufferBuilder::new(values.len());
+            let mut flattened = Vec::new();
+            offsets.push(0_i32);
+
+            for literal in values {
+                match literal {
+                    Literal::Null => {
+                        nulls.append(false);
+                        offsets.push(i32::try_from(flattened.len()).map_err(|_| {
+                            "iceberg insert list value count exceeds i32 range".to_string()
+                        })?);
+                    }
+                    Literal::Array(items) => {
+                        nulls.append(true);
+                        flattened.extend(items.iter());
+                        offsets.push(i32::try_from(flattened.len()).map_err(|_| {
+                            "iceberg insert list value count exceeds i32 range".to_string()
+                        })?);
+                    }
+                    other => {
+                        return Err(format!(
+                            "literal {:?} is not valid for ARRAY<{:?}>",
+                            other,
+                            field.data_type()
+                        ));
+                    }
+                }
+            }
+
+            let values = build_literal_array(field.data_type(), &flattened, None)?;
+            Ok(Arc::new(ListArray::new(
+                field.clone(),
+                OffsetBuffer::new(offsets.into()),
+                values,
+                nulls.finish(),
+            )))
+        }
+        DataType::Struct(fields) => {
+            let mut struct_nulls = NullBufferBuilder::new(values.len());
+            let mut child_values = vec![Vec::with_capacity(values.len()); fields.len()];
+            for literal in values {
+                match literal {
+                    Literal::Null => {
+                        struct_nulls.append(false);
+                        for child in &mut child_values {
+                            child.push(Literal::Null);
+                        }
+                    }
+                    Literal::Struct(items) => {
+                        if items.len() != fields.len() {
+                            return Err(format!(
+                                "literal {:?} does not match STRUCT field count {}",
+                                literal,
+                                fields.len()
+                            ));
+                        }
+                        struct_nulls.append(true);
+                        for (idx, item) in items.iter().enumerate() {
+                            child_values[idx].push(item.clone());
+                        }
+                    }
+                    other => {
+                        return Err(format!(
+                            "literal {:?} is not valid for STRUCT<{:?}>",
+                            other, fields
+                        ));
+                    }
+                }
+            }
+
+            let child_arrays = fields
+                .iter()
+                .enumerate()
+                .map(|(idx, field)| {
+                    let refs = child_values[idx].iter().collect::<Vec<_>>();
+                    build_literal_array(field.data_type(), &refs, None)
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(Arc::new(StructArray::new(
+                fields.clone(),
+                child_arrays,
+                struct_nulls.finish(),
             )))
         }
         DataType::LargeBinary => {

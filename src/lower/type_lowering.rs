@@ -67,9 +67,10 @@ pub(crate) fn arrow_type_from_primitive(primitive: types::TPrimitiveType) -> Opt
         t if t == types::TPrimitiveType::FLOAT => DataType::Float32,
         t if t == types::TPrimitiveType::DOUBLE => DataType::Float64,
         t if t == types::TPrimitiveType::DATE => DataType::Date32,
-        t if t == types::TPrimitiveType::DATETIME || t == types::TPrimitiveType::TIME => {
+        t if t == types::TPrimitiveType::DATETIME => {
             DataType::Timestamp(TimeUnit::Microsecond, None)
         }
+        t if t == types::TPrimitiveType::TIME => DataType::Time64(TimeUnit::Microsecond),
         t if t == types::TPrimitiveType::BINARY || t == types::TPrimitiveType::VARBINARY => {
             DataType::Binary
         }
@@ -126,9 +127,10 @@ pub(crate) fn arrow_type_from_nodes(
                 t if t == types::TPrimitiveType::FLOAT => DataType::Float32,
                 t if t == types::TPrimitiveType::DOUBLE => DataType::Float64,
                 t if t == types::TPrimitiveType::DATE => DataType::Date32,
-                t if t == types::TPrimitiveType::DATETIME || t == types::TPrimitiveType::TIME => {
+                t if t == types::TPrimitiveType::DATETIME => {
                     DataType::Timestamp(TimeUnit::Microsecond, None)
                 }
+                t if t == types::TPrimitiveType::TIME => DataType::Time64(TimeUnit::Microsecond),
                 t if t == types::TPrimitiveType::DECIMALV2 => {
                     DataType::Decimal128(LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE)
                 }

@@ -148,17 +148,20 @@ fn build_hdfs_scan_node(
         _ => None,
     };
 
-    let (serialized_table, metadata_table_type) = match &resolved.table.storage {
-        TableStorage::IcebergMetadataTable {
-            metadata_table_type,
-            serialized_table,
-            ..
-        } => (
-            Some(serialized_table.clone()),
-            Some(iceberg_metadata_table_type_thrift_str(metadata_table_type).to_string()),
-        ),
-        _ => (None, None),
-    };
+    let (serialized_table, metadata_table_type, serialized_predicate) =
+        match &resolved.table.storage {
+            TableStorage::IcebergMetadataTable {
+                metadata_table_type,
+                serialized_table,
+                metadata_payload,
+                ..
+            } => (
+                Some(serialized_table.clone()),
+                Some(iceberg_metadata_table_type_thrift_str(metadata_table_type).to_string()),
+                metadata_payload.clone(),
+            ),
+            _ => (None, None, None),
+        };
 
     node.hdfs_scan_node = Some(plan_nodes::THdfsScanNode::new(
         Some(scan_tuple_id),
@@ -186,7 +189,7 @@ fn build_hdfs_scan_node(
         None::<bool>,
         None::<types::TTupleId>,
         serialized_table,
-        None::<String>,
+        serialized_predicate,
         None::<bool>,
         metadata_table_type,
         None::<crate::data_cache::TDataCacheOptions>,

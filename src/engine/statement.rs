@@ -1968,10 +1968,14 @@ pub(crate) fn looks_like_alter_iceberg_properties(sql: &str) -> bool {
         return false;
     }
     // Use peek_word_eq for both SET and UNSET so no tokens are consumed before the check.
-    if crate::sql::parser::dialect::peek_word_eq(&parser, 0, "SET")
-        && crate::sql::parser::dialect::peek_word_eq(&parser, 1, "TBLPROPERTIES")
-    {
-        return true;
+    if crate::sql::parser::dialect::peek_word_eq(&parser, 0, "SET") {
+        if crate::sql::parser::dialect::peek_word_eq(&parser, 1, "TBLPROPERTIES") {
+            return true;
+        }
+        parser.next_token();
+        if parser.peek_token_ref().token == Token::LParen {
+            return true;
+        }
     }
     if crate::sql::parser::dialect::peek_word_eq(&parser, 0, "UNSET")
         && crate::sql::parser::dialect::peek_word_eq(&parser, 1, "TBLPROPERTIES")
@@ -2000,10 +2004,11 @@ pub(crate) fn parse_alter_iceberg_properties_sql(
     )?;
 
     let op = if parser.parse_keyword(Keyword::SET) {
-        if !crate::sql::parser::dialect::peek_word_eq(&parser, 0, "TBLPROPERTIES") {
-            return Err("expected TBLPROPERTIES after SET".to_string());
+        if crate::sql::parser::dialect::peek_word_eq(&parser, 0, "TBLPROPERTIES") {
+            parser.next_token(); // consume TBLPROPERTIES
+        } else if parser.peek_token_ref().token != Token::LParen {
+            return Err("expected TBLPROPERTIES or property list after SET".to_string());
         }
-        parser.next_token(); // consume TBLPROPERTIES
         let entries = parse_property_entries(&mut parser)?;
         PropertiesOp::Set { entries }
     } else if parser.parse_keyword(Keyword::UNSET) {
@@ -3185,6 +3190,13 @@ mod parse_alter_iceberg_properties_tests {
     }
 
     #[test]
+    fn looks_like_set_property_list() {
+        assert!(looks_like_alter_iceberg_properties(
+            "ALTER TABLE ice.db.t SET ('unique_constraints' = 'id')"
+        ));
+    }
+
+    #[test]
     fn looks_like_unset_tblproperties() {
         assert!(looks_like_alter_iceberg_properties(
             "ALTER TABLE ice.db.t UNSET TBLPROPERTIES ('k')"
@@ -3224,6 +3236,22 @@ mod parse_alter_iceberg_properties_tests {
                 "write.parquet.compression-codec".to_string(),
                 "zstd".to_string()
             )]
+        );
+    }
+
+    #[test]
+    fn parse_set_property_list_one_pair() {
+        let stmt = parse_alter_iceberg_properties_sql(
+            "ALTER TABLE ice.db.t SET ('unique_constraints' = 'id')",
+        )
+        .expect("parse");
+        assert_eq!(stmt.table.parts, vec!["ice", "db", "t"]);
+        let PropertiesOp::Set { entries } = stmt.op else {
+            panic!()
+        };
+        assert_eq!(
+            entries,
+            vec![("unique_constraints".to_string(), "id".to_string())]
         );
     }
 

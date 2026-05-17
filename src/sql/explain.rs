@@ -279,10 +279,19 @@ fn format_physical_node(
                 "{pad}SCAN {}.{}{alias}{costs_suffix}",
                 op.database, op.table.name
             ));
+            out.push(format!(
+                "{pad}     TABLE: {}.{}",
+                op.database, op.table.name
+            ));
             if let Some(ref cols) = op.required_columns
                 && matches!(level, ExplainLevel::Verbose | ExplainLevel::Costs)
             {
                 out.push(format!("{pad}     columns: {}", cols.join(", ")));
+                if matches!(level, ExplainLevel::Verbose) {
+                    for line in scan_pruned_type_lines(op, cols) {
+                        out.push(format!("{pad}     {line}"));
+                    }
+                }
             }
             let local_hints = explain_hints_for_scan(op);
             if matches!(level, ExplainLevel::Costs) && local_hints.has_decode {
@@ -615,6 +624,127 @@ fn explain_hints_for_scan(
     LocalScanExplainHints {
         has_decode: scan_supports_decode_hint(&op.table, required_columns),
         has_min_max_stats: scan_supports_min_max_stats(&op.table, required_columns),
+    }
+}
+
+fn scan_pruned_type_lines(
+    op: &crate::sql::optimizer::operator::PhysicalScanOp,
+    required_columns: &[String],
+) -> Vec<String> {
+    required_columns
+        .iter()
+        .filter_map(|required| {
+            let (slot, data_type) = scan_required_column_type(op, required)?;
+            if !is_complex_type(data_type) {
+                return None;
+            }
+            Some(format!(
+                "Pruned type: {slot} <-> [{}]",
+                format_scan_pruned_type(data_type, true)
+            ))
+        })
+        .collect()
+}
+
+fn scan_required_column_type<'a>(
+    op: &'a crate::sql::optimizer::operator::PhysicalScanOp,
+    required: &str,
+) -> Option<(usize, &'a DataType)> {
+    let table_pos = op
+        .table
+        .columns
+        .iter()
+        .position(|column| column.name.eq_ignore_ascii_case(required))?;
+    let data_type = op
+        .columns
+        .iter()
+        .find(|column| column.name.eq_ignore_ascii_case(required))
+        .map(|column| &column.data_type)
+        .or_else(|| {
+            op.table
+                .columns
+                .get(table_pos)
+                .map(|column| &column.data_type)
+        })?;
+    Some((table_pos + 1, data_type))
+}
+
+fn is_complex_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::FixedSizeList(_, _)
+            | DataType::Map(_, _)
+            | DataType::Struct(_)
+    )
+}
+
+fn format_scan_pruned_type(data_type: &DataType, top_level: bool) -> String {
+    match data_type {
+        DataType::Null => "null_type".to_string(),
+        DataType::Boolean => "boolean".to_string(),
+        DataType::Int8 => "tinyint".to_string(),
+        DataType::Int16 => "smallint".to_string(),
+        DataType::Int32 => "int".to_string(),
+        DataType::Int64 => "bigint".to_string(),
+        DataType::UInt8 => "tinyint unsigned".to_string(),
+        DataType::UInt16 => "smallint unsigned".to_string(),
+        DataType::UInt32 => "int unsigned".to_string(),
+        DataType::UInt64 => "bigint unsigned".to_string(),
+        DataType::Float32 => "float".to_string(),
+        DataType::Float64 => "double".to_string(),
+        DataType::Utf8 | DataType::LargeUtf8 => "varchar(1073741824)".to_string(),
+        DataType::Binary | DataType::LargeBinary => "varbinary".to_string(),
+        DataType::Date32 => "date".to_string(),
+        DataType::Timestamp(_, _) => "datetime".to_string(),
+        DataType::Time32(_) | DataType::Time64(_) => "time".to_string(),
+        DataType::Decimal128(precision, scale) | DataType::Decimal256(precision, scale) => {
+            format!("decimal({precision},{scale})")
+        }
+        DataType::List(field) | DataType::LargeList(field) => {
+            let inner = format_scan_pruned_type(field.data_type(), false);
+            if top_level {
+                format!("ARRAY<{inner}>")
+            } else {
+                format!("array<{inner}>")
+            }
+        }
+        DataType::FixedSizeList(field, _) => {
+            let inner = format_scan_pruned_type(field.data_type(), false);
+            if top_level {
+                format!("ARRAY<{inner}>")
+            } else {
+                format!("array<{inner}>")
+            }
+        }
+        DataType::Map(entries, _) => {
+            let DataType::Struct(fields) = entries.data_type() else {
+                return "map<unknown,unknown>".to_string();
+            };
+            if fields.len() != 2 {
+                return "map<unknown,unknown>".to_string();
+            }
+            format!(
+                "map<{},{}>",
+                format_scan_pruned_type(fields[0].data_type(), false),
+                format_scan_pruned_type(fields[1].data_type(), false)
+            )
+        }
+        DataType::Struct(fields) => {
+            let fields = fields
+                .iter()
+                .map(|field| {
+                    format!(
+                        "`{}` {}",
+                        field.name(),
+                        format_scan_pruned_type(field.data_type(), false)
+                    )
+                })
+                .collect::<Vec<_>>();
+            format!("struct<{}>", fields.join(", "))
+        }
+        other => format!("{other:?}").to_lowercase(),
     }
 }
 
@@ -982,8 +1112,9 @@ fn format_expr_kind(kind: &ExprKind) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
+    use std::sync::Arc;
 
-    use arrow::datatypes::DataType;
+    use arrow::datatypes::{DataType, Field, Fields};
 
     use super::{ExplainLevel, explain_physical_plan};
     use crate::sql::analysis::OutputColumn;
@@ -1081,6 +1212,67 @@ mod tests {
         assert!(
             lines.iter().any(|line| line.contains("Decode")),
             "costs explain lines: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn verbose_scan_explain_reports_complex_required_column_type() {
+        let nested_string_array =
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+        let column_type = DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Struct(Fields::from(vec![
+                Arc::new(Field::new("user", DataType::Utf8, true)),
+                Arc::new(Field::new("family", DataType::Utf8, true)),
+                Arc::new(Field::new("given", nested_string_array.clone(), true)),
+                Arc::new(Field::new("prefix", nested_string_array.clone(), true)),
+                Arc::new(Field::new("suffix", nested_string_array, true)),
+            ])),
+            true,
+        )));
+        let column = ColumnDef {
+            name: "name".to_string(),
+            data_type: column_type,
+            nullable: true,
+            write_default: None,
+        };
+        let plan = PhysicalPlanNode {
+            op: Operator::PhysicalScan(PhysicalScanOp {
+                database: "db1".to_string(),
+                table: TableDef {
+                    name: "ice_tbl".to_string(),
+                    columns: vec![column.clone()],
+                    iceberg_row_lineage_metadata_columns: Vec::new(),
+                    iceberg_table: None,
+                    storage: TableStorage::S3ParquetFiles {
+                        files: Vec::new(),
+                        cloud_properties: BTreeMap::new(),
+                    },
+                },
+                alias: None,
+                columns: vec![OutputColumn {
+                    name: column.name.clone(),
+                    data_type: column.data_type.clone(),
+                    nullable: column.nullable,
+                }],
+                predicates: Vec::new(),
+                required_columns: Some(vec![column.name.clone()]),
+            }),
+            children: Vec::new(),
+            stats: Statistics {
+                output_row_count: 3.0,
+                column_statistics: HashMap::new(),
+            },
+            output_columns: Vec::new(),
+        };
+
+        let lines = explain_physical_plan(&plan, ExplainLevel::Verbose);
+
+        assert!(
+            lines.iter().any(|line| line.contains(
+                "Pruned type: 1 <-> [ARRAY<struct<`user` varchar(1073741824), `family` varchar(1073741824), `given` array<varchar(1073741824)>, `prefix` array<varchar(1073741824)>, `suffix` array<varchar(1073741824)>>>]"
+            )),
+            "verbose explain lines: {lines:?}"
         );
     }
 }

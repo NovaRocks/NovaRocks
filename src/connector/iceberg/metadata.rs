@@ -122,14 +122,14 @@ impl IcebergMetadataScanOp {
         match cfg.metadata_table_type {
             IcebergMetadataTableType::Snapshots
             | IcebergMetadataTableType::History
-            | IcebergMetadataTableType::Refs => {}
+            | IcebergMetadataTableType::Refs
+            | IcebergMetadataTableType::Partitions => {}
             IcebergMetadataTableType::Files
             | IcebergMetadataTableType::Manifests
-            | IcebergMetadataTableType::Partitions
             | IcebergMetadataTableType::LogicalIcebergMetadata => {
                 return Err(format!(
                     "Iceberg metadata table `{}` is not yet implemented in the \
-                     native-Rust scan path; only Snapshots / History / Refs are \
+                     native-Rust scan path; only Snapshots / History / Refs / Partitions are \
                      currently supported",
                     cfg.metadata_table_type.as_uppercase_str()
                 ));
@@ -240,7 +240,6 @@ impl ScanOp for IcebergMetadataScanOp {
         let chunks = match self.cfg.metadata_table_type {
             IcebergMetadataTableType::Files
             | IcebergMetadataTableType::Manifests
-            | IcebergMetadataTableType::Partitions
             | IcebergMetadataTableType::LogicalIcebergMetadata => {
                 // Constructor (`IcebergMetadataScanOp::new`) already rejects
                 // these flavors; reaching here means construction was bypassed.
@@ -273,6 +272,16 @@ impl ScanOp for IcebergMetadataScanOp {
             IcebergMetadataTableType::Refs => {
                 let rows = load_ref_rows(&self.cfg)?;
                 build_ref_chunks(
+                    &rows,
+                    &self.cfg.output_columns,
+                    &self.output_schema,
+                    &self.output_chunk_schema,
+                    self.cfg.batch_size,
+                )?
+            }
+            IcebergMetadataTableType::Partitions => {
+                let rows = load_partition_rows(&self.cfg)?;
+                build_partition_chunks(
                     &rows,
                     &self.cfg.output_columns,
                     &self.output_schema,
@@ -694,6 +703,90 @@ fn build_ref_array(
     }
 }
 
+#[derive(Clone, Debug, serde::Deserialize)]
+struct PartitionMetadataPayload {
+    version: i32,
+    rows: Vec<PartitionMetadataRow>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct PartitionMetadataRow {
+    record_count: i64,
+    file_count: i64,
+    position_delete_file_count: Option<i64>,
+    equality_delete_file_count: Option<i64>,
+}
+
+fn load_partition_rows(
+    cfg: &IcebergMetadataScanConfig,
+) -> Result<Vec<PartitionMetadataRow>, String> {
+    if cfg.serialized_predicate.trim().is_empty() {
+        return Err(
+            "iceberg partitions metadata scan missing partition aggregate payload".to_string(),
+        );
+    }
+    let payload: PartitionMetadataPayload = serde_json::from_str(&cfg.serialized_predicate)
+        .map_err(|e| format!("parse iceberg partitions metadata payload failed: {e}"))?;
+    if payload.version != 1 {
+        return Err(format!(
+            "unsupported iceberg partitions metadata payload version {}",
+            payload.version
+        ));
+    }
+    Ok(payload.rows)
+}
+
+fn build_partition_chunks(
+    rows: &[PartitionMetadataRow],
+    output_columns: &[IcebergMetadataOutputColumn],
+    output_schema: &SchemaRef,
+    output_chunk_schema: &Arc<ChunkSchema>,
+    batch_size: usize,
+) -> Result<Vec<Chunk>, String> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let arrays = output_columns
+        .iter()
+        .map(|column| build_partition_array(column, rows))
+        .collect::<Result<Vec<_>, _>>()?;
+    build_chunks(
+        output_schema,
+        output_chunk_schema,
+        arrays,
+        rows.len(),
+        batch_size,
+    )
+}
+
+fn build_partition_array(
+    column: &IcebergMetadataOutputColumn,
+    rows: &[PartitionMetadataRow],
+) -> Result<ArrayRef, String> {
+    match column.name.as_str() {
+        "record_count" => Ok(Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.record_count).collect::<Vec<_>>(),
+        ))),
+        "file_count" => Ok(Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.file_count).collect::<Vec<_>>(),
+        ))),
+        "position_delete_file_count" => Ok(Arc::new(Int64Array::from(
+            rows.iter()
+                .map(|r| r.position_delete_file_count)
+                .collect::<Vec<_>>(),
+        ))),
+        "equality_delete_file_count" => Ok(Arc::new(Int64Array::from(
+            rows.iter()
+                .map(|r| r.equality_delete_file_count)
+                .collect::<Vec<_>>(),
+        ))),
+        other => Err(format!(
+            "unsupported iceberg partitions metadata column: {}",
+            other
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -734,14 +827,13 @@ mod tests {
 
     #[test]
     fn test_metadata_scan_rejects_unimplemented_flavors() {
-        // Files / Manifests / Partitions / LogicalIcebergMetadata require a
+        // Files / Manifests / LogicalIcebergMetadata require a
         // manifest-walk that the native-Rust path does not yet implement.
         // The constructor must fail-fast with a clear error so callers
         // surface a usable message instead of hanging in the pipeline.
         for ty in [
             IcebergMetadataTableType::Files,
             IcebergMetadataTableType::Manifests,
-            IcebergMetadataTableType::Partitions,
             IcebergMetadataTableType::LogicalIcebergMetadata,
         ] {
             let err = IcebergMetadataScanOp::new(IcebergMetadataScanConfig {
@@ -900,6 +992,43 @@ mod tests {
     }
 
     #[test]
+    fn test_build_partition_arrays_basic_shapes() {
+        use super::PartitionMetadataRow;
+        let rows = vec![
+            PartitionMetadataRow {
+                record_count: 2,
+                file_count: 1,
+                position_delete_file_count: Some(0),
+                equality_delete_file_count: Some(0),
+            },
+            PartitionMetadataRow {
+                record_count: 1,
+                file_count: 1,
+                position_delete_file_count: Some(1),
+                equality_delete_file_count: Some(0),
+            },
+        ];
+        let count_col = super::IcebergMetadataOutputColumn {
+            name: "record_count".into(),
+            slot_id: SlotId::new(1),
+            data_type: DataType::Int64,
+            nullable: false,
+        };
+        let arr = super::build_partition_array(&count_col, &rows).unwrap();
+        assert_eq!(arr.len(), 2);
+
+        let position_delete_col = super::IcebergMetadataOutputColumn {
+            name: "position_delete_file_count".into(),
+            slot_id: SlotId::new(2),
+            data_type: DataType::Int64,
+            nullable: true,
+        };
+        let arr = super::build_partition_array(&position_delete_col, &rows).unwrap();
+        assert_eq!(arr.len(), 2);
+        assert!(!arr.is_null(1));
+    }
+
+    #[test]
     fn test_build_ref_arrays_basic_shapes() {
         use super::RefMetadataRow;
         let rows = vec![
@@ -965,9 +1094,6 @@ mod tests {
         );
     }
 
-    // Tests for the partitions metadata-table flavor were removed along
-    // with the JVM-bridge backed `PartitionMetadataRow` / build helpers.
-    // The native-Rust path rejects `Partitions` at construction; the
-    // `test_metadata_scan_rejects_unimplemented_flavors` test above covers
-    // that policy.
+    // Partition metadata payload parsing is exercised by the SQL suite; unit
+    // tests above keep the Arrow array contract pinned.
 }

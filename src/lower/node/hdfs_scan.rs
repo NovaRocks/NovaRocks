@@ -16,6 +16,9 @@
 // under the License.
 use std::collections::{HashMap, HashSet};
 
+use arrow::datatypes::{DataType, Field, Schema};
+use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+
 use crate::cache::{CacheOptions, DataCacheManager, ExternalDataCacheRangeOptions};
 use crate::common::ids::SlotId;
 use crate::connector::iceberg::position_delete::{
@@ -48,25 +51,31 @@ pub(crate) fn cache_iceberg_table_locations(desc_tbl: Option<&descriptors::TDesc
     crate::connector::iceberg::cache_iceberg_table_locations(desc_tbl);
 }
 
-/// Build a `ChunkSchema` covering only the given slot ids, preserving their
-/// order and copying per-slot metadata from `parent`. Used to expose a
-/// physical-columns-only schema to the parquet reader when the scan node's
-/// output layout also includes synthesized virtual columns.
-fn sub_chunk_schema(
-    _desc_tbl: &descriptors::TDescriptorTable,
-    slot_ids: &[crate::common::ids::SlotId],
-    parent: &crate::exec::chunk::ChunkSchemaRef,
-) -> Result<crate::exec::chunk::ChunkSchemaRef, String> {
-    let mut slots = Vec::with_capacity(slot_ids.len());
-    for slot_id in slot_ids {
-        let slot = parent
-            .slot(*slot_id)
-            .ok_or_else(|| format!("parquet chunk schema missing slot_id {}", slot_id))?;
-        slots.push(slot.clone());
-    }
-    Ok(std::sync::Arc::new(
-        crate::exec::chunk::ChunkSchema::try_new(slots)?,
-    ))
+fn next_hidden_slot_id(visible_slot_ids: &[SlotId]) -> Result<SlotId, String> {
+    let max_slot = visible_slot_ids
+        .iter()
+        .map(|slot_id| slot_id.as_u32())
+        .max()
+        .unwrap_or(0);
+    let next = max_slot
+        .checked_add(1)
+        .ok_or_else(|| "cannot allocate hidden iceberg row-lineage slot id".to_string())?;
+    Ok(SlotId::new(next))
+}
+
+fn advance_hidden_slot_id(slot_id: SlotId) -> Result<SlotId, String> {
+    slot_id
+        .as_u32()
+        .checked_add(1)
+        .map(SlotId::new)
+        .ok_or_else(|| "cannot allocate hidden iceberg row-lineage slot id".to_string())
+}
+
+fn iceberg_reserved_field(name: &str, nullable: bool, field_id: i32) -> Field {
+    Field::new(name, DataType::Int64, nullable).with_metadata(HashMap::from([(
+        PARQUET_FIELD_ID_META_KEY.to_string(),
+        field_id.to_string(),
+    )]))
 }
 
 fn apply_path_rewrite(ranges: &mut [FileScanRange]) -> Result<(), String> {
@@ -455,6 +464,7 @@ pub(crate) fn lower_hdfs_scan_node(
     let mut data_columns = Vec::new();
     let mut data_slot_ids = Vec::new();
     let mut data_slot_types = Vec::new();
+    let mut data_fields = Vec::new();
     let mut iceberg_projected_columns = Vec::new();
 
     let mut row_source_slot: Option<SlotId> = None;
@@ -593,6 +603,7 @@ pub(crate) fn lower_hdfs_scan_node(
         data_columns.push(name.clone());
         data_slot_ids.push(slot_id);
         data_slot_types.push(primitive);
+        data_fields.push(Field::new(name.clone(), arrow_type.clone(), nullable));
         iceberg_projected_columns.push(IcebergArrowColumn {
             name,
             data_type: arrow_type,
@@ -695,8 +706,7 @@ pub(crate) fn lower_hdfs_scan_node(
     // for the Iceberg Java SDK; it now runs natively against
     // iceberg-rust's `TableMetadata`. The operator constructor itself
     // (`IcebergMetadataScanOp::new`) rejects flavors the native path does
-    // not yet implement (Files / Manifests / Partitions /
-    // LogicalIcebergMetadata).
+    // not yet implement (Files / Manifests / LogicalIcebergMetadata).
     let is_iceberg_metadata_scan = iceberg_metadata_table_type.is_some();
     let mut ranges: Vec<FileScanRange> = Vec::new();
     let mut iceberg_metadata_ranges: Vec<IcebergMetadataScanRange> = Vec::new();
@@ -1089,6 +1099,43 @@ pub(crate) fn lower_hdfs_scan_node(
             node.node_id
         ));
     }
+    if iceberg_table.is_some()
+        && (iceberg_virtual_row_id_slot.is_some()
+            || iceberg_virtual_last_updated_seq_slot.is_some())
+    {
+        let mut hidden_slot_id = next_hidden_slot_id(&slot_ids)?;
+        if iceberg_virtual_row_id_slot.is_some() {
+            data_columns.push(crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string());
+            data_slot_ids.push(hidden_slot_id);
+            data_slot_types.push(types::TPrimitiveType::BIGINT);
+            data_fields.push(iceberg_reserved_field(
+                crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                true,
+                crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_ROW_ID,
+            ));
+            iceberg_projected_columns.push(IcebergArrowColumn {
+                name: crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+            });
+            hidden_slot_id = advance_hidden_slot_id(hidden_slot_id)?;
+        }
+        if iceberg_virtual_last_updated_seq_slot.is_some() {
+            data_columns.push(crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string());
+            data_slot_ids.push(hidden_slot_id);
+            data_slot_types.push(types::TPrimitiveType::BIGINT);
+            data_fields.push(iceberg_reserved_field(
+                crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+                true,
+                crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+            ));
+            iceberg_projected_columns.push(IcebergArrowColumn {
+                name: crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+            });
+        }
+    }
     let iceberg_output_schema = iceberg_table
         .as_ref()
         .map(|iceberg| build_projected_output_schema(iceberg, &iceberg_projected_columns))
@@ -1099,7 +1146,10 @@ pub(crate) fn lower_hdfs_scan_node(
     // `_pos` are synthesized by the scan runner afterwards), so its chunk
     // schema must omit virtual-column slots to keep the column-count check on
     // the parquet side happy.
-    let parquet_chunk_schema = sub_chunk_schema(desc_tbl, &data_slot_ids, &output_chunk_schema)?;
+    let parquet_chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+        &Schema::new(data_fields),
+        &data_slot_ids,
+    )?;
     let parquet_cfg = ParquetScanConfig {
         columns: data_columns,
         chunk_schema: parquet_chunk_schema,

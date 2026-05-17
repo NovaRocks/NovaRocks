@@ -221,7 +221,7 @@ impl TransactionAction for RewriteDataFilesTxnAction {
                 self.commit_uuid
             );
             self.record_manifest_path(path.clone());
-            let mf = write_added_data_manifest(
+            let mut mf = write_added_data_manifest(
                 &self.file_io,
                 &path,
                 &self.written,
@@ -233,6 +233,15 @@ impl TransactionAction for RewriteDataFilesTxnAction {
             )
             .await
             .map_err(to_iceberg_unexpected)?;
+            if self.preserve_row_lineage {
+                let first_row_id = self.row_lineage_first_row_id.ok_or_else(|| {
+                    to_iceberg_unexpected(
+                        "preserve-mode RewriteDataFilesCommit requires row_lineage_first_row_id"
+                            .to_string(),
+                    )
+                })?;
+                mf.first_row_id = Some(first_row_id);
+            }
             new_manifests.push(mf);
         }
 
@@ -265,18 +274,12 @@ impl TransactionAction for RewriteDataFilesTxnAction {
             new_snapshot_id, self.commit_uuid
         );
         self.record_manifest_path(manifest_list_path.clone());
-        // In preserve mode the data files already carry `_row_id` at the
-        // reserved field IDs, so we must NOT let the manifest list writer
-        // mint fresh row-id ranges for manifest entries (would advance
-        // `next_row_id` past the allocated row identities). Pass `None` to
-        // suppress the writer's auto-assignment; the snapshot's row_range
-        // separately stamps `(current_next_row_id, 0)` to satisfy the V3
-        // spec without reserving new ids.
-        let manifest_list_first_row_id = if self.preserve_row_lineage {
-            None
-        } else {
-            self.row_lineage_first_row_id
-        };
+        // Preserve-mode replacement files store `_row_id` at the reserved
+        // field IDs, but the v3 manifest-list writer still needs a starting
+        // point so unassigned deleted-data manifests are accepted. The added
+        // data manifest is marked above as already assigned, so initializing
+        // the writer does not allocate fresh row ids for rewritten rows.
+        let manifest_list_first_row_id = self.row_lineage_first_row_id;
         let manifest_list_next_row_id = write_manifest_list(
             &self.file_io,
             &manifest_list_path,

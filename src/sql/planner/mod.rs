@@ -8,6 +8,7 @@ pub(crate) mod plan;
 
 use crate::sql::analysis::cte::CTERegistry;
 use crate::sql::analysis::*;
+use crate::sql::catalog::{IcebergDeleteFileContent, S3FileInfo};
 use crate::sql::codegen::helpers::typed_expr_display_name;
 use plan::*;
 
@@ -1435,6 +1436,8 @@ fn plan_iceberg_metadata_scan(rel: IcebergMetadataScanRelation) -> Result<Logica
         } => cloud_properties.clone(),
         _ => Default::default(),
     };
+    let metadata_payload =
+        build_iceberg_metadata_payload(&rel.metadata_table_type, &rel.table.storage)?;
     let synthetic_name = format!("{}__nr_meta__", rel.table.name);
     let synthetic_table = TableDef {
         name: synthetic_name,
@@ -1445,6 +1448,7 @@ fn plan_iceberg_metadata_scan(rel: IcebergMetadataScanRelation) -> Result<Logica
             metadata_table_type: rel.metadata_table_type,
             serialized_table,
             cloud_properties,
+            metadata_payload,
         },
     };
     Ok(LogicalPlan::Scan(ScanNode {
@@ -1455,6 +1459,113 @@ fn plan_iceberg_metadata_scan(rel: IcebergMetadataScanRelation) -> Result<Logica
         predicates: vec![],
         required_columns: None,
     }))
+}
+
+#[derive(Default)]
+struct PartitionMetadataAgg {
+    record_count: i64,
+    file_count: i64,
+    total_data_file_size_in_bytes: i64,
+    position_delete_files: std::collections::BTreeSet<String>,
+    equality_delete_files: std::collections::BTreeSet<String>,
+}
+
+fn build_iceberg_metadata_payload(
+    metadata_table_type: &crate::connector::iceberg::IcebergMetadataTableType,
+    storage: &crate::sql::catalog::TableStorage,
+) -> Result<Option<String>, String> {
+    use crate::connector::iceberg::IcebergMetadataTableType;
+    use crate::sql::catalog::TableStorage;
+    match metadata_table_type {
+        IcebergMetadataTableType::Partitions => {
+            let TableStorage::S3ParquetFiles { files, .. } = storage else {
+                return Err(
+                    "iceberg partitions metadata table requires catalog-resolved data files"
+                        .to_string(),
+                );
+            };
+            build_iceberg_partitions_payload(files).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn build_iceberg_partitions_payload(files: &[S3FileInfo]) -> Result<String, String> {
+    let mut groups = std::collections::BTreeMap::<(i32, String), PartitionMetadataAgg>::new();
+    for file in files {
+        let spec_id = file.partition_spec_id.ok_or_else(|| {
+            format!(
+                "iceberg partitions metadata requires partition spec id for data file {}",
+                file.path
+            )
+        })?;
+        let record_count = file.row_count.ok_or_else(|| {
+            format!(
+                "iceberg partitions metadata requires record_count for data file {}",
+                file.path
+            )
+        })?;
+        let partition_key = file
+            .partition_key
+            .clone()
+            .unwrap_or_else(|| "Struct([])".to_string());
+        let agg = groups.entry((spec_id, partition_key)).or_default();
+        agg.record_count = agg
+            .record_count
+            .checked_add(record_count)
+            .ok_or_else(|| "iceberg partitions metadata record_count overflow".to_string())?;
+        agg.file_count = agg
+            .file_count
+            .checked_add(1)
+            .ok_or_else(|| "iceberg partitions metadata file_count overflow".to_string())?;
+        agg.total_data_file_size_in_bytes = agg
+            .total_data_file_size_in_bytes
+            .checked_add(file.size)
+            .ok_or_else(|| {
+                "iceberg partitions metadata total_data_file_size_in_bytes overflow".to_string()
+            })?;
+        for delete_file in &file.delete_files {
+            match delete_file.file_content {
+                IcebergDeleteFileContent::Position => {
+                    agg.position_delete_files.insert(delete_file.path.clone());
+                }
+                IcebergDeleteFileContent::Equality => {
+                    agg.equality_delete_files.insert(delete_file.path.clone());
+                }
+            }
+        }
+    }
+    let rows = groups
+        .into_iter()
+        .map(
+            |((spec_id, partition), agg)| -> Result<serde_json::Value, String> {
+                let position_delete_file_count = i64::try_from(agg.position_delete_files.len())
+                    .map_err(|_| {
+                        "iceberg partitions metadata position_delete_file_count overflow"
+                            .to_string()
+                    })?;
+                let equality_delete_file_count = i64::try_from(agg.equality_delete_files.len())
+                    .map_err(|_| {
+                        "iceberg partitions metadata equality_delete_file_count overflow"
+                            .to_string()
+                    })?;
+                Ok(serde_json::json!({
+                    "spec_id": spec_id,
+                    "partition": partition,
+                    "record_count": agg.record_count,
+                    "file_count": agg.file_count,
+                    "total_data_file_size_in_bytes": agg.total_data_file_size_in_bytes,
+                    "position_delete_file_count": position_delete_file_count,
+                    "equality_delete_file_count": equality_delete_file_count,
+                }))
+            },
+        )
+        .collect::<Result<Vec<_>, _>>()?;
+    serde_json::to_string(&serde_json::json!({
+        "version": 1,
+        "rows": rows,
+    }))
+    .map_err(|e| format!("serialize iceberg partitions metadata payload failed: {e}"))
 }
 
 /// Lower an analyzer-built `IcebergDeltaScanRelation` into a regular

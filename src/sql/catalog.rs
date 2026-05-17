@@ -188,6 +188,9 @@ pub enum TableStorage {
         /// with regular HDFS scans; the native metadata-scan path itself
         /// does not need them today.
         cloud_properties: BTreeMap<String, String>,
+        /// Native-Rust metadata table payload used by flavors that need
+        /// manifest-derived file aggregates after planning.
+        metadata_payload: Option<String>,
     },
     /// IVM-A1 plan-time Iceberg delta-scan placeholder. Produced by the
     /// analyzer/planner when it recognizes the

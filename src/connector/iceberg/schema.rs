@@ -21,6 +21,10 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::descriptors;
+use crate::exec::row_position::{
+    ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+    ICEBERG_RESERVED_FIELD_ID_ROW_ID, ICEBERG_ROW_ID_COL,
+};
 use crate::lower::type_lowering::arrow_type_from_desc;
 
 const VIRTUAL_COUNT_COLUMN: &str = "___count___";
@@ -99,6 +103,10 @@ pub fn build_projected_output_schema(
             fields.push(Field::new(column.name.clone(), DataType::Boolean, false));
             continue;
         }
+        if let Some(field) = build_reserved_row_lineage_projected_field(column)? {
+            fields.push(field);
+            continue;
+        }
         let schema_field = schema_fields
             .iter()
             .find(|field| field.name.as_deref() == Some(column.name.as_str()))
@@ -117,6 +125,32 @@ pub fn build_projected_output_schema(
         fields.push(field);
     }
     Ok(Some(Arc::new(Schema::new(fields))))
+}
+
+fn build_reserved_row_lineage_projected_field(
+    column: &IcebergArrowColumn,
+) -> Result<Option<Field>, String> {
+    let field_id = if column.name.eq_ignore_ascii_case(ICEBERG_ROW_ID_COL) {
+        ICEBERG_RESERVED_FIELD_ID_ROW_ID
+    } else if column
+        .name
+        .eq_ignore_ascii_case(ICEBERG_LAST_UPDATED_SEQ_COL)
+    {
+        ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER
+    } else {
+        return Ok(None);
+    };
+    if !matches!(column.data_type, DataType::Int64) {
+        return Err(format!(
+            "iceberg reserved row-lineage column {} expects Int64, got {:?}",
+            column.name, column.data_type
+        ));
+    }
+    let mut meta = std::collections::HashMap::new();
+    meta.insert(PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string());
+    Ok(Some(
+        Field::new(column.name.clone(), DataType::Int64, column.nullable).with_metadata(meta),
+    ))
 }
 
 pub fn apply_field_id_recursive(

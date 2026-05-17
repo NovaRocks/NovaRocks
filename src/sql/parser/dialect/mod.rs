@@ -108,6 +108,12 @@ pub(crate) fn convert_sql_type(data_type: sqlast::DataType) -> Result<SqlType, S
         sqlast::DataType::JSON | sqlast::DataType::JSONB => Ok(SqlType::Json),
         sqlast::DataType::Date => Ok(SqlType::Date),
         sqlast::DataType::Datetime(_) | sqlast::DataType::Timestamp(_, _) => Ok(SqlType::DateTime),
+        sqlast::DataType::Time(_, timezone) => match timezone {
+            sqlast::TimezoneInfo::None | sqlast::TimezoneInfo::WithoutTimeZone => Ok(SqlType::Time),
+            sqlast::TimezoneInfo::WithTimeZone | sqlast::TimezoneInfo::Tz => {
+                Err("TIME WITH TIME ZONE is not supported".to_string())
+            }
+        },
         sqlast::DataType::Decimal(info)
         | sqlast::DataType::Dec(info)
         | sqlast::DataType::Numeric(info) => match info {
