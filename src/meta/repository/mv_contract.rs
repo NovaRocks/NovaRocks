@@ -109,6 +109,8 @@ pub struct TargetContract {
     pub schema_id_at_create: i32,
     pub visible_columns: Vec<TargetVisibleColumn>,
     pub hidden_apply_key: HiddenApplyKeyContract,
+    #[serde(default)]
+    pub partition: Option<MvPartitionContract>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +126,34 @@ pub struct HiddenApplyKeyContract {
     pub column_name: String,
     pub target_field_id: i32,
     pub source: ApplyKeySource,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MvPartitionContract {
+    pub target_spec_id: i32,
+    pub fields: Vec<MvPartitionFieldContract>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MvPartitionFieldContract {
+    pub partition_field_id: i32,
+    pub partition_field_name: String,
+    pub source_target_field_id: i32,
+    pub source_column_name: String,
+    pub transform: MvPartitionTransformContract,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MvPartitionTransformContract {
+    Identity,
+    Year,
+    Month,
+    Day,
+    Hour,
+    Bucket { num_buckets: u32 },
+    Truncate { width: u32 },
+    Void,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -175,6 +205,13 @@ pub enum ContractSelfCheckError {
         field_id: i32,
         first: String,
         second: String,
+    },
+    DuplicatePartitionFieldId {
+        partition_field_id: i32,
+    },
+    PartitionReferencesUnknownTargetFieldId {
+        partition_field_name: String,
+        source_target_field_id: i32,
     },
 }
 
@@ -268,6 +305,21 @@ impl std::fmt::Display for ContractSelfCheckError {
                     "MV contract base.schema_at_create contains field id {field_id} twice with different type signatures: {first} vs {second}"
                 )
             }
+            Self::DuplicatePartitionFieldId { partition_field_id } => {
+                write!(
+                    f,
+                    "MV contract partition field id {partition_field_id} appears more than once"
+                )
+            }
+            Self::PartitionReferencesUnknownTargetFieldId {
+                partition_field_name,
+                source_target_field_id,
+            } => {
+                write!(
+                    f,
+                    "MV contract partition field {partition_field_name} references unknown target visible field id {source_target_field_id}"
+                )
+            }
         }
     }
 }
@@ -324,6 +376,7 @@ impl MvSchemaContract {
         for base in &bases {
             validate_base_contract(base)?;
         }
+        validate_partition_contract(self)?;
         let known_field_ids: std::collections::BTreeSet<i32> = bases
             .iter()
             .flat_map(|base| {
@@ -423,6 +476,35 @@ fn validate_base_contract(base: &BaseContract) -> Result<(), ContractSelfCheckEr
     Ok(())
 }
 
+fn validate_partition_contract(contract: &MvSchemaContract) -> Result<(), ContractSelfCheckError> {
+    let Some(partition) = &contract.target.partition else {
+        return Ok(());
+    };
+    let visible_target_field_ids: std::collections::BTreeSet<i32> = contract
+        .target
+        .visible_columns
+        .iter()
+        .map(|field| field.target_field_id)
+        .collect();
+    let mut partition_field_ids = std::collections::BTreeSet::new();
+    for field in &partition.fields {
+        if !partition_field_ids.insert(field.partition_field_id) {
+            return Err(ContractSelfCheckError::DuplicatePartitionFieldId {
+                partition_field_id: field.partition_field_id,
+            });
+        }
+        if !visible_target_field_ids.contains(&field.source_target_field_id) {
+            return Err(
+                ContractSelfCheckError::PartitionReferencesUnknownTargetFieldId {
+                    partition_field_name: field.partition_field_name.clone(),
+                    source_target_field_id: field.source_target_field_id,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
 fn qualified_field_known(bases: &[&BaseContract], field: &QualifiedFieldLineage) -> bool {
     bases.iter().any(|base| {
         base.table_fqn == field.table_fqn
@@ -486,6 +568,16 @@ mod tests {
                     target_field_id: 2,
                     source: ApplyKeySource::BaseRowId,
                 },
+                partition: Some(MvPartitionContract {
+                    target_spec_id: 0,
+                    fields: vec![MvPartitionFieldContract {
+                        partition_field_id: 1000,
+                        partition_field_name: "id_bucket_16".to_string(),
+                        source_target_field_id: 1,
+                        source_column_name: "id".to_string(),
+                        transform: MvPartitionTransformContract::Bucket { num_buckets: 16 },
+                    }],
+                }),
             },
         }
     }
@@ -550,6 +642,7 @@ mod tests {
         let decoded: MvSchemaContract = serde_json::from_str(json).expect("deserialize v1");
         assert!(decoded.bases.is_empty());
         assert!(decoded.join.is_none());
+        assert!(decoded.target.partition.is_none());
         assert_eq!(decoded.base.alias_at_create, None);
         assert!(
             decoded.output.columns[0]
@@ -580,6 +673,20 @@ mod tests {
                 target_len: 2,
             }) => {}
             other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn self_check_rejects_partition_source_not_in_visible_target_columns() {
+        let mut c = sample_contract();
+        c.target.partition.as_mut().expect("partition").fields[0].source_target_field_id =
+            c.target.hidden_apply_key.target_field_id;
+        match c.ensure_self_consistent() {
+            Err(ContractSelfCheckError::PartitionReferencesUnknownTargetFieldId {
+                partition_field_name,
+                source_target_field_id: 2,
+            }) => assert_eq!(partition_field_name, "id_bucket_16"),
+            other => panic!("unexpected result: {other:?}"),
         }
     }
 
@@ -849,6 +956,7 @@ mod tests {
                     target_field_id: 2,
                     source: ApplyKeySource::JoinRowKey,
                 },
+                partition: None,
             },
         }
     }

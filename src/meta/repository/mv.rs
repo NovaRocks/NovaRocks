@@ -33,6 +33,8 @@ pub struct StoredMvDefinition {
     pub target_table: Option<String>,
     #[serde(default)]
     pub schema_contract: Option<crate::meta::repository::mv_contract::MvSchemaContract>,
+    #[serde(default)]
+    pub partition_spec: Option<crate::meta::repository::mv_contract::MvPartitionContract>,
     pub last_refresh_ms: Option<i64>,
     pub last_refresh_rows: Option<i64>,
     pub last_refresh_snapshots: BTreeMap<String, i64>,
@@ -61,6 +63,7 @@ pub struct CreateMvDefinitionRequest {
     pub target_namespace: Option<String>,
     pub target_table: Option<String>,
     pub schema_contract: Option<crate::meta::repository::mv_contract::MvSchemaContract>,
+    pub partition_spec: Option<crate::meta::repository::mv_contract::MvPartitionContract>,
     pub created_at_ms: i64,
 }
 
@@ -242,6 +245,7 @@ impl MvMetaRepository {
             target_namespace: req.target_namespace,
             target_table: req.target_table,
             schema_contract: req.schema_contract,
+            partition_spec: req.partition_spec,
             last_refresh_ms: None,
             last_refresh_rows: None,
             last_refresh_snapshots: BTreeMap::new(),

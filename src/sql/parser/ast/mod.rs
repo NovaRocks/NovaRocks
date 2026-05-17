@@ -96,10 +96,9 @@ pub(crate) struct MaterializedViewDistribution {
 pub(crate) struct CreateMaterializedViewStmt {
     pub name: ObjectName,
     pub if_not_exists: bool,
-    /// Simple `PARTITION BY col[, ...]` compatibility clause. NovaRocks keeps
-    /// this in the AST so semantic validation can ensure referenced columns are
-    /// real MV outputs.
-    pub partition_by: Option<Vec<String>>,
+    /// Iceberg-style MV partition spec. Semantic validation ensures source
+    /// columns reference visible MV outputs before the target table is created.
+    pub partition_by: Option<Vec<IcebergPartitionFieldExpr>>,
     pub distribution: Option<MaterializedViewDistribution>,
     pub refresh_manual_explicit: bool,
     /// Raw SQL text of the SELECT body after `AS`. Produced by re-serializing

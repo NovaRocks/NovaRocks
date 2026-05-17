@@ -25,6 +25,7 @@ fn refresh_transaction_can_recover_after_external_commit_before_finalize()
             target_namespace: Some("ns".to_string()),
             target_table: Some("orders_mv".to_string()),
             schema_contract: None,
+            partition_spec: None,
             created_at_ms: 1,
         },
     )?;

@@ -11,9 +11,11 @@ use sqlparser::tokenizer::Token;
 
 use super::{convert_object_name, peek_word_eq};
 use crate::sql::parser::ast::{
-    CreateMaterializedViewStmt, DropMaterializedViewStmt, MaterializedViewDistribution,
-    RefreshMaterializedViewStmt, ShowMaterializedViewsStmt, Statement,
+    CreateMaterializedViewStmt, DropMaterializedViewStmt, IcebergPartitionFieldExpr,
+    MaterializedViewDistribution, RefreshMaterializedViewStmt, ShowMaterializedViewsStmt,
+    Statement,
 };
+use crate::sql::parser::dialect::create_table::parse_partition_field_expr;
 
 /// Check if the current position looks like `CREATE MATERIALIZED VIEW ...`.
 /// The parser is not advanced.
@@ -146,45 +148,38 @@ pub(crate) fn parse_create_materialized_view(parser: &mut Parser<'_>) -> Result<
     ))
 }
 
-fn parse_partition_by(parser: &mut Parser<'_>) -> Result<Option<Vec<String>>, String> {
+fn parse_partition_by(
+    parser: &mut Parser<'_>,
+) -> Result<Option<Vec<IcebergPartitionFieldExpr>>, String> {
     if !parser.parse_keywords(&[Keyword::PARTITION, Keyword::BY]) {
         return Ok(None);
     }
 
-    let mut columns = Vec::new();
+    let mut fields = Vec::new();
     if parser.consume_token(&Token::LParen) {
         loop {
             if parser.consume_token(&Token::RParen) {
                 break;
             }
-            let ident = parser
-                .parse_identifier()
-                .map_err(|e| format!("parse PARTITION BY column failed: {e}"))?;
-            columns.push(ident.value);
+            fields.push(parse_partition_field_expr(parser)?);
             if parser.consume_token(&Token::RParen) {
                 break;
             }
             parser
                 .expect_token(&Token::Comma)
-                .map_err(|e| format!("expected , or ) in PARTITION BY column list: {e}"))?;
+                .map_err(|e| format!("expected , or ) in PARTITION BY field list: {e}"))?;
         }
     } else {
-        let ident = parser
-            .parse_identifier()
-            .map_err(|e| format!("parse PARTITION BY column failed: {e}"))?;
-        columns.push(ident.value);
+        fields.push(parse_partition_field_expr(parser)?);
         while parser.consume_token(&Token::Comma) {
-            let ident = parser
-                .parse_identifier()
-                .map_err(|e| format!("parse PARTITION BY column failed: {e}"))?;
-            columns.push(ident.value);
+            fields.push(parse_partition_field_expr(parser)?);
         }
     }
 
-    if columns.is_empty() {
-        return Err("PARTITION BY requires at least one column".to_string());
+    if fields.is_empty() {
+        return Err("PARTITION BY requires at least one field".to_string());
     }
-    Ok(Some(columns))
+    Ok(Some(fields))
 }
 
 fn parse_distributed_by(
@@ -429,7 +424,7 @@ pub(crate) fn parse_show_materialized_views(parser: &mut Parser<'_>) -> Result<S
 
 #[cfg(test)]
 mod tests {
-    use crate::sql::parser::ast::Statement;
+    use crate::sql::parser::ast::{IcebergPartitionFieldExpr, Statement};
     use crate::sql::parser::parse_sql;
 
     fn parse_one(sql: &str) -> Statement {
@@ -500,7 +495,57 @@ mod tests {
             Statement::CreateMaterializedView(mv) => mv,
             other => panic!("unexpected stmt: {other:?}"),
         };
-        assert_eq!(mv.partition_by, Some(vec!["k1".to_string()]));
+        assert_eq!(
+            mv.partition_by,
+            Some(vec![IcebergPartitionFieldExpr::Identity {
+                column: "k1".to_string()
+            }])
+        );
+    }
+
+    #[test]
+    fn parse_create_mv_accepts_iceberg_partition_transforms() {
+        let stmt = parse_one(
+            "CREATE MATERIALIZED VIEW mv1 \
+             PARTITION BY (year(ts), month(ts), day(ts), hour(ts), bucket(tenant_id, 8), truncate(region, 4), void(deleted_at), tenant_id) \
+             DISTRIBUTED BY HASH(tenant_id) BUCKETS 1 \
+             AS SELECT tenant_id, ts, region, deleted_at FROM iceberg_cat.ns.orders",
+        );
+        let mv = match stmt {
+            Statement::CreateMaterializedView(mv) => mv,
+            other => panic!("unexpected stmt: {other:?}"),
+        };
+        assert_eq!(
+            mv.partition_by,
+            Some(vec![
+                IcebergPartitionFieldExpr::Year {
+                    column: "ts".to_string()
+                },
+                IcebergPartitionFieldExpr::Month {
+                    column: "ts".to_string()
+                },
+                IcebergPartitionFieldExpr::Day {
+                    column: "ts".to_string()
+                },
+                IcebergPartitionFieldExpr::Hour {
+                    column: "ts".to_string()
+                },
+                IcebergPartitionFieldExpr::Bucket {
+                    column: "tenant_id".to_string(),
+                    num_buckets: 8
+                },
+                IcebergPartitionFieldExpr::Truncate {
+                    column: "region".to_string(),
+                    width: 4
+                },
+                IcebergPartitionFieldExpr::Void {
+                    column: "deleted_at".to_string()
+                },
+                IcebergPartitionFieldExpr::Identity {
+                    column: "tenant_id".to_string()
+                }
+            ])
+        );
     }
 
     #[test]

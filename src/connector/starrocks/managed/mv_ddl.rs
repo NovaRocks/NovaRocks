@@ -22,8 +22,9 @@ use crate::meta::repository::mv::CreateMvDefinitionRequest;
 use crate::service::grpc_client::proto::starrocks::DeleteTabletRequest;
 use crate::sql::analysis::{ExprKind, OutputColumn, QueryBody, ResolvedQuery};
 use crate::sql::parser::ast::{
-    CreateMaterializedViewStmt, DropMaterializedViewStmt, MaterializedViewDistribution, ObjectName,
-    ShowMaterializedViewsStmt, SqlType, TableColumnDef, TableKeyDesc, TableKeyKind,
+    CreateMaterializedViewStmt, DropMaterializedViewStmt, IcebergPartitionFieldExpr,
+    MaterializedViewDistribution, ObjectName, ShowMaterializedViewsStmt, SqlType, TableColumnDef,
+    TableKeyDesc, TableKeyKind,
 };
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -156,7 +157,7 @@ pub(crate) fn create_mv(
     })?;
 
     let analysis = analyze_mv_select(state, current_catalog, current_database, &stmt.select_query)?;
-    validate_mv_partition_columns(stmt.partition_by.as_deref(), &analysis.output_columns)?;
+    validate_managed_mv_partition_columns(stmt.partition_by.as_deref(), &analysis.output_columns)?;
     let base_refs = extract_base_table_refs(&analysis.resolved_refs)?;
 
     // IVM Phase-2 PRIMARY KEY validation. Only runs when the user opted in
@@ -317,6 +318,7 @@ pub(crate) fn create_mv(
                 target_namespace: None,
                 target_table: None,
                 schema_contract: None,
+                partition_spec: None,
                 created_at_ms,
             },
         )
@@ -1202,7 +1204,7 @@ pub(crate) fn resolve_mv_name(
 }
 
 pub(crate) fn validate_mv_partition_columns(
-    partition_by: Option<&[String]>,
+    partition_by: Option<&[IcebergPartitionFieldExpr]>,
     output_columns: &[OutputColumn],
 ) -> Result<(), String> {
     let Some(partition_by) = partition_by else {
@@ -1212,7 +1214,8 @@ pub(crate) fn validate_mv_partition_columns(
         .iter()
         .map(|column| normalize_identifier(&column.name))
         .collect::<Result<HashSet<_>, _>>()?;
-    for column in partition_by {
+    for field in partition_by {
+        let column = mv_partition_source_column(field);
         let normalized = normalize_identifier(column)?;
         if !output_names.contains(&normalized) {
             return Err(format!(
@@ -1221,6 +1224,36 @@ pub(crate) fn validate_mv_partition_columns(
         }
     }
     Ok(())
+}
+
+fn validate_managed_mv_partition_columns(
+    partition_by: Option<&[IcebergPartitionFieldExpr]>,
+    output_columns: &[OutputColumn],
+) -> Result<(), String> {
+    if let Some(fields) = partition_by {
+        for field in fields {
+            if !matches!(field, IcebergPartitionFieldExpr::Identity { .. }) {
+                return Err(
+                    "managed-lake materialized view PARTITION BY only supports identity columns"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    validate_mv_partition_columns(partition_by, output_columns)
+}
+
+fn mv_partition_source_column(field: &IcebergPartitionFieldExpr) -> &str {
+    match field {
+        IcebergPartitionFieldExpr::Identity { column }
+        | IcebergPartitionFieldExpr::Year { column }
+        | IcebergPartitionFieldExpr::Month { column }
+        | IcebergPartitionFieldExpr::Day { column }
+        | IcebergPartitionFieldExpr::Hour { column }
+        | IcebergPartitionFieldExpr::Bucket { column, .. }
+        | IcebergPartitionFieldExpr::Truncate { column, .. }
+        | IcebergPartitionFieldExpr::Void { column } => column,
+    }
 }
 
 fn collect_table_refs_from_query(
@@ -1730,6 +1763,7 @@ mod tests {
                     target_namespace: None,
                     target_table: None,
                     schema_contract: None,
+                    partition_spec: None,
                     created_at_ms: now_ms(),
                 },
             )
@@ -1782,6 +1816,7 @@ mod tests {
                     target_namespace: Some(namespace.to_string()),
                     target_table: Some(table.to_string()),
                     schema_contract: None,
+                    partition_spec: None,
                     created_at_ms: now_ms(),
                 },
             )
@@ -1916,6 +1951,22 @@ mod tests {
         .expect("ok");
         assert_eq!(refs.len(), 2);
         assert_eq!(refs[0].fqn(), "iceberg_cat.ns.orders");
+    }
+
+    #[test]
+    fn managed_mv_partition_validation_rejects_iceberg_transforms() {
+        let output_columns = vec![OutputColumn {
+            name: "ts".to_string(),
+            data_type: DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+            nullable: true,
+        }];
+        let fields = vec![IcebergPartitionFieldExpr::Day {
+            column: "ts".to_string(),
+        }];
+
+        let err = validate_managed_mv_partition_columns(Some(&fields), &output_columns)
+            .expect_err("managed-lake MV should not accept Iceberg partition transforms");
+        assert!(err.contains("only supports identity"), "err={err}");
     }
 
     #[test]

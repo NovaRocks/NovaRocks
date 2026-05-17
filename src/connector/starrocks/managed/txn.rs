@@ -2296,6 +2296,7 @@ mod mv_target_tests {
                         target_namespace: mv.target_namespace.clone(),
                         target_table: mv.target_table.clone(),
                         schema_contract: None,
+                        partition_spec: None,
                         created_at_ms: mv.created_at_ms,
                     },
                 )

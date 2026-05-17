@@ -97,6 +97,7 @@ fn sample_mv_definition_request(select_sql: &str) -> CreateMvDefinitionRequest {
         target_namespace: None,
         target_table: None,
         schema_contract: None,
+        partition_spec: None,
         created_at_ms: 7,
     }
 }
@@ -1563,6 +1564,7 @@ fn mv_repository_creates_definition_and_target_lookup() -> Result<(), Box<dyn st
                 target_namespace: Some("ns".to_string()),
                 target_table: Some("orders_mv".to_string()),
                 schema_contract: None,
+                partition_spec: None,
                 created_at_ms: 11,
             },
         )?;
@@ -1606,6 +1608,7 @@ fn mv_repository_creates_and_drops_definition_with_explicit_id()
                 target_namespace: None,
                 target_table: None,
                 schema_contract: None,
+                partition_spec: None,
                 created_at_ms: 7,
             },
         )?;
@@ -1691,6 +1694,7 @@ fn mv_repository_shares_id_allocator_with_managed_tables() -> Result<(), Box<dyn
                 target_namespace: Some("analytics".to_string()),
                 target_table: Some("orders_mv".to_string()),
                 schema_contract: None,
+                partition_spec: None,
                 created_at_ms: 7,
             },
         )?;
@@ -1751,6 +1755,7 @@ fn mv_repository_refresh_intent_finalizes_once() -> Result<(), Box<dyn std::erro
                 target_namespace: Some("ns".to_string()),
                 target_table: Some("orders_mv".to_string()),
                 schema_contract: None,
+                partition_spec: None,
                 created_at_ms: 11,
             },
         )?;
@@ -1880,6 +1885,7 @@ fn mv_repository_branch_staged_refresh_lifecycle() -> Result<(), Box<dyn std::er
                 target_namespace: Some("analytics".to_string()),
                 target_table: Some("orders_mv".to_string()),
                 schema_contract: None,
+                partition_spec: None,
                 created_at_ms: 11,
             },
         )?;
@@ -2150,6 +2156,7 @@ fn create_named_test_iceberg_mv(
             target_namespace: Some("analytics".to_string()),
             target_table: Some(target_table.to_string()),
             schema_contract: None,
+            partition_spec: None,
             created_at_ms: 11,
         },
     )?;
@@ -2555,6 +2562,7 @@ fn mv_repository_rejects_second_refresh_intent() -> Result<(), Box<dyn std::erro
                 target_namespace: Some("ns".to_string()),
                 target_table: Some("orders_mv".to_string()),
                 schema_contract: None,
+                partition_spec: None,
                 created_at_ms: 11,
             },
         )?;
@@ -2646,6 +2654,55 @@ fn mv_repository_rejects_definition_schema_version_mismatch()
         err.to_string()
             .contains("metadata record by-id/1 has schema version 999")
     );
+
+    Ok(())
+}
+
+#[test]
+fn mv_repository_loads_v2_definition_without_partition_spec()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = MvMetaRepository::default();
+    let key = MetaKey::new("mv", ["by-id", "1"])?;
+    let payload = serde_json::json!({
+        "mv_id": 1,
+        "select_sql": "SELECT id FROM iceberg.sales.orders",
+        "base_table_refs": ["iceberg.sales.orders"],
+        "primary_key_columns": ["id"],
+        "storage_engine": "iceberg",
+        "target_catalog": "ice",
+        "target_namespace": "ns",
+        "target_table": "orders_mv",
+        "schema_contract": null,
+        "last_refresh_ms": null,
+        "last_refresh_rows": null,
+        "last_refresh_snapshots": {},
+        "last_refresh_table_uuids": {},
+        "last_refreshed_iceberg_snapshot_id": null,
+        "refresh_in_progress": false,
+        "active_refresh_id": null,
+        "refresh_target_snapshots": {},
+        "created_at_ms": 11
+    });
+
+    {
+        let mut txn = provider.begin_write("write v2 mv definition")?;
+        txn.put(MetaRecordPut::new(
+            key,
+            MetaRecordKind::new("mv.definition")?,
+            ExpectedRevision::NotExists,
+            encode_json_payload(2, &payload)?,
+        ))?;
+        txn.commit()?;
+    }
+
+    let read = provider.begin_read()?;
+    let definition = repository
+        .load_by_id(read.as_ref(), 1)?
+        .expect("v2 definition should load");
+    assert_eq!(definition.mv_id, 1);
+    assert!(definition.partition_spec.is_none());
 
     Ok(())
 }
@@ -2774,6 +2831,7 @@ fn iceberg_catalog_repository_deletes_table_and_related_mv_lookup()
                 target_namespace: Some("ns".to_string()),
                 target_table: Some("orders_mv".to_string()),
                 schema_contract: None,
+                partition_spec: None,
                 created_at_ms: 11,
             },
         )?;
@@ -2833,6 +2891,7 @@ fn iceberg_catalog_repository_rejects_delete_when_target_mv_refresh_is_active()
                 target_namespace: Some("ns".to_string()),
                 target_table: Some("orders_mv".to_string()),
                 schema_contract: None,
+                partition_spec: None,
                 created_at_ms: 11,
             },
         )?;
@@ -2892,6 +2951,7 @@ fn mv_repository_rejects_stale_target_lookup_without_deleting_wrong_definition()
                 target_namespace: Some("ns".to_string()),
                 target_table: Some("other_mv".to_string()),
                 schema_contract: None,
+                partition_spec: None,
                 created_at_ms: 11,
             },
         )?;
@@ -2952,6 +3012,7 @@ fn mv_repository_lists_definitions() -> Result<(), Box<dyn std::error::Error>> {
                 target_namespace: Some("sales".to_string()),
                 target_table: Some("orders_mv".to_string()),
                 schema_contract: None,
+                partition_spec: None,
                 created_at_ms: 11,
             },
         )?;
@@ -2966,6 +3027,7 @@ fn mv_repository_lists_definitions() -> Result<(), Box<dyn std::error::Error>> {
                 target_namespace: None,
                 target_table: None,
                 schema_contract: None,
+                partition_spec: None,
                 created_at_ms: 12,
             },
         )?;

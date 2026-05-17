@@ -9,7 +9,8 @@
 //! contracts result in fail-fast errors that propagate to the user.
 
 use crate::meta::repository::mv_contract::{
-    ApplyKeySource, HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME, MvSchemaContract,
+    ApplyKeySource, HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME,
+    MvPartitionTransformContract, MvSchemaContract,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -63,6 +64,9 @@ pub(crate) enum SchemaEvolutionError {
         to: String,
     },
     HiddenApplyKeyContractBroken {
+        reason: String,
+    },
+    TargetPartitionSpecChanged {
         reason: String,
     },
 }
@@ -129,6 +133,10 @@ impl std::fmt::Display for SchemaEvolutionError {
                 f,
                 "iceberg MV refresh blocked: target hidden apply-key column contract broken ({reason}); recreate the MV"
             ),
+            Self::TargetPartitionSpecChanged { reason } => write!(
+                f,
+                "iceberg MV refresh blocked: target partition spec changed externally ({reason}); recreate the MV"
+            ),
         }
     }
 }
@@ -159,6 +167,12 @@ pub(crate) fn validate_schema_contract_with_base_schema(
     // Stage 1: identity guard.
     if let Some(err) = validate_identity_guards(contract, current_base_table, current_target_table)
     {
+        return ContractDecision::Incompatible(err);
+    }
+    if let Some(err) = check_target_partition_spec(
+        contract,
+        current_target_table.metadata().default_partition_spec(),
+    ) {
         return ContractDecision::Incompatible(err);
     }
     validate_schema_contract_after_identity(
@@ -279,6 +293,101 @@ fn check_base_referenced_fields(
     Ok(rebound)
 }
 
+fn check_target_partition_spec(
+    contract: &MvSchemaContract,
+    current_spec: &iceberg::spec::PartitionSpec,
+) -> Option<SchemaEvolutionError> {
+    let Some(expected) = &contract.target.partition else {
+        return None;
+    };
+    if current_spec.spec_id() != expected.target_spec_id {
+        return Some(SchemaEvolutionError::TargetPartitionSpecChanged {
+            reason: format!(
+                "expected default spec id {}, got {}",
+                expected.target_spec_id,
+                current_spec.spec_id()
+            ),
+        });
+    }
+    let fields = current_spec.fields();
+    if fields.len() != expected.fields.len() {
+        return Some(SchemaEvolutionError::TargetPartitionSpecChanged {
+            reason: format!(
+                "expected {} partition fields, got {}",
+                expected.fields.len(),
+                fields.len()
+            ),
+        });
+    }
+    for (idx, (actual, expected)) in fields.iter().zip(expected.fields.iter()).enumerate() {
+        if actual.field_id != expected.partition_field_id {
+            return Some(SchemaEvolutionError::TargetPartitionSpecChanged {
+                reason: format!(
+                    "partition field #{idx} id expected {}, got {}",
+                    expected.partition_field_id, actual.field_id
+                ),
+            });
+        }
+        if actual.source_id != expected.source_target_field_id {
+            return Some(SchemaEvolutionError::TargetPartitionSpecChanged {
+                reason: format!(
+                    "partition field {} source id expected {}, got {}",
+                    expected.partition_field_name,
+                    expected.source_target_field_id,
+                    actual.source_id
+                ),
+            });
+        }
+        if actual.name != expected.partition_field_name {
+            return Some(SchemaEvolutionError::TargetPartitionSpecChanged {
+                reason: format!(
+                    "partition field #{idx} name expected {}, got {}",
+                    expected.partition_field_name, actual.name
+                ),
+            });
+        }
+        let Some(actual_transform) = partition_transform_contract(&actual.transform) else {
+            return Some(SchemaEvolutionError::TargetPartitionSpecChanged {
+                reason: format!(
+                    "partition field {} has unsupported transform {:?}",
+                    actual.name, actual.transform
+                ),
+            });
+        };
+        if actual_transform != expected.transform {
+            return Some(SchemaEvolutionError::TargetPartitionSpecChanged {
+                reason: format!(
+                    "partition field {} transform expected {:?}, got {:?}",
+                    expected.partition_field_name, expected.transform, actual_transform
+                ),
+            });
+        }
+    }
+    None
+}
+
+fn partition_transform_contract(
+    transform: &iceberg::spec::Transform,
+) -> Option<MvPartitionTransformContract> {
+    match transform {
+        iceberg::spec::Transform::Identity => Some(MvPartitionTransformContract::Identity),
+        iceberg::spec::Transform::Year => Some(MvPartitionTransformContract::Year),
+        iceberg::spec::Transform::Month => Some(MvPartitionTransformContract::Month),
+        iceberg::spec::Transform::Day => Some(MvPartitionTransformContract::Day),
+        iceberg::spec::Transform::Hour => Some(MvPartitionTransformContract::Hour),
+        iceberg::spec::Transform::Bucket(num_buckets) => {
+            Some(MvPartitionTransformContract::Bucket {
+                num_buckets: *num_buckets,
+            })
+        }
+        iceberg::spec::Transform::Truncate(width) => {
+            Some(MvPartitionTransformContract::Truncate { width: *width })
+        }
+        iceberg::spec::Transform::Void => Some(MvPartitionTransformContract::Void),
+        iceberg::spec::Transform::Unknown => None,
+    }
+}
+
 fn check_target_schema(
     contract: &MvSchemaContract,
     target_schema: &iceberg::spec::Schema,
@@ -368,8 +477,9 @@ mod tests {
     use crate::meta::repository::mv_contract::{
         ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
         ExpressionLineage, HiddenApplyKeyContract, JOIN_APPLY_KEY_COLUMN_NAME, JoinContract,
-        JoinContractKind, JoinPredicateLineage, OutputColumnLineage, OutputContract,
-        QualifiedFieldLineage, TargetContract, TargetVisibleColumn,
+        JoinContractKind, JoinPredicateLineage, MvPartitionContract, MvPartitionFieldContract,
+        MvPartitionTransformContract, OutputColumnLineage, OutputContract, QualifiedFieldLineage,
+        TargetContract, TargetVisibleColumn,
     };
     use std::sync::Arc;
 
@@ -418,6 +528,62 @@ mod tests {
             name_at_create: "amount".into(),
         });
         let _ = err; // just ensure it compiles
+    }
+
+    #[test]
+    fn target_partition_spec_guard_detects_external_transform_change() {
+        use iceberg::spec::{
+            NestedField, PrimitiveType, Schema, Transform, Type, UnboundPartitionSpec,
+        };
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    Arc::new(NestedField::required(
+                        1,
+                        "id",
+                        Type::Primitive(PrimitiveType::Int),
+                    )),
+                    Arc::new(NestedField::required(
+                        2,
+                        HIDDEN_APPLY_KEY_COLUMN_NAME,
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                ])
+                .build()
+                .expect("schema"),
+        );
+        let matching_spec = UnboundPartitionSpec::builder()
+            .with_spec_id(0)
+            .add_partition_field(1, "id_bucket_16", Transform::Bucket(16))
+            .expect("partition field")
+            .build()
+            .bind(Arc::clone(&schema))
+            .expect("bind spec");
+        let changed_spec = UnboundPartitionSpec::builder()
+            .with_spec_id(0)
+            .add_partition_field(1, "id_bucket_8", Transform::Bucket(8))
+            .expect("partition field")
+            .build()
+            .bind(schema)
+            .expect("bind spec");
+        let mut contract = minimal_base_row_id_contract();
+        contract.target.partition = Some(MvPartitionContract {
+            target_spec_id: 0,
+            fields: vec![MvPartitionFieldContract {
+                partition_field_id: 1000,
+                partition_field_name: "id_bucket_16".to_string(),
+                source_target_field_id: 1,
+                source_column_name: "id".to_string(),
+                transform: MvPartitionTransformContract::Bucket { num_buckets: 16 },
+            }],
+        });
+
+        assert_eq!(check_target_partition_spec(&contract, &matching_spec), None);
+        assert!(matches!(
+            check_target_partition_spec(&contract, &changed_spec),
+            Some(SchemaEvolutionError::TargetPartitionSpecChanged { .. })
+        ));
     }
 
     #[test]
@@ -492,6 +658,7 @@ mod tests {
                     target_field_id: 2,
                     source: ApplyKeySource::BaseRowId,
                 },
+                partition: None,
             },
         };
 
@@ -504,6 +671,56 @@ mod tests {
                 rebound_columns: vec![(1, "id".to_string(), "renamed_id".to_string())],
             }
         );
+    }
+
+    fn minimal_base_row_id_contract() -> MvSchemaContract {
+        let target_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int);
+        MvSchemaContract {
+            contract_version: 1,
+            base: BaseContract {
+                table_fqn: "ice.db.orders".to_string(),
+                table_uuid: "base-uuid".to_string(),
+                alias_at_create: None,
+                schema_id_at_create: 1,
+                schema_at_create: BaseSchemaSnapshot {
+                    fields: vec![BaseFieldRecord {
+                        field_id: 1,
+                        name_at_create: "id".to_string(),
+                        type_signature: format!("{target_type}"),
+                        required: true,
+                    }],
+                },
+            },
+            bases: vec![],
+            output: OutputContract {
+                columns: vec![OutputColumnLineage {
+                    expression: ExpressionLineage {
+                        kind: ExpressionKind::Column,
+                        referenced_base_field_ids: vec![1],
+                        referenced_base_fields: vec![],
+                    },
+                }],
+                filter: None,
+            },
+            join: None,
+            target: TargetContract {
+                table_fqn: "ice.db.mv_orders".to_string(),
+                table_uuid: "target-uuid".to_string(),
+                schema_id_at_create: 11,
+                visible_columns: vec![TargetVisibleColumn {
+                    output_name: "id".to_string(),
+                    target_field_id: 1,
+                    type_signature: format!("{target_type}"),
+                    nullable: false,
+                }],
+                hidden_apply_key: HiddenApplyKeyContract {
+                    column_name: HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
+                    target_field_id: 2,
+                    source: ApplyKeySource::BaseRowId,
+                },
+                partition: None,
+            },
+        }
     }
 
     #[test]
@@ -613,6 +830,7 @@ mod tests {
                     target_field_id: 2,
                     source: ApplyKeySource::JoinRowKey,
                 },
+                partition: None,
             },
         };
 

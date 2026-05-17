@@ -194,13 +194,14 @@ pub(crate) fn create_iceberg_mv(
     });
     let expected_apply_key_field_id = i32::try_from(columns.len())
         .map_err(|_| "too many iceberg MV output columns".to_string())?;
+    let partition_fields = stmt.partition_by.as_deref().unwrap_or(&[]);
     crate::connector::iceberg::catalog::registry::create_table(
         &entry,
         &target.namespace,
         &target.table,
         &columns,
         None,
-        &[],
+        partition_fields,
         &[
             ("format-version".to_string(), "3".to_string()),
             ("write.row-lineage".to_string(), "true".to_string()),
@@ -266,6 +267,7 @@ pub(crate) fn create_iceberg_mv(
                     target_namespace: Some(target.namespace.clone()),
                     target_table: Some(target.table.clone()),
                     schema_contract: Some(schema_contract.clone()),
+                    partition_spec: schema_contract.target.partition.clone(),
                     created_at_ms,
                 },
             )
@@ -408,7 +410,7 @@ fn build_iceberg_mv_schema_contract(
                     actual_apply_key_field_id,
                     crate::meta::repository::mv_contract::HIDDEN_APPLY_KEY_COLUMN_NAME,
                     crate::meta::repository::mv_contract::ApplyKeySource::BaseRowId,
-                ),
+                )?,
             }
         }
         IncrementalMvShape::JoinProjectionFilter(join_shape) => {
@@ -466,7 +468,7 @@ fn build_iceberg_mv_schema_contract(
                     actual_apply_key_field_id,
                     crate::meta::repository::mv_contract::JOIN_APPLY_KEY_COLUMN_NAME,
                     crate::meta::repository::mv_contract::ApplyKeySource::JoinRowKey,
-                ),
+                )?,
             }
         }
         IncrementalMvShape::Aggregate(_) => unreachable!("aggregate shape was rejected above"),
@@ -519,8 +521,8 @@ fn target_contract(
     actual_apply_key_field_id: i32,
     hidden_apply_key_column_name: &str,
     hidden_apply_key_source: crate::meta::repository::mv_contract::ApplyKeySource,
-) -> crate::meta::repository::mv_contract::TargetContract {
-    crate::meta::repository::mv_contract::TargetContract {
+) -> Result<crate::meta::repository::mv_contract::TargetContract, String> {
+    Ok(crate::meta::repository::mv_contract::TargetContract {
         table_fqn: format!("{}.{}.{}", target.catalog, target.namespace, target.table),
         table_uuid: target_loaded.table.metadata().uuid().to_string(),
         schema_id_at_create: target_loaded.table.metadata().current_schema_id(),
@@ -536,20 +538,94 @@ fn target_contract(
                     .fields()
                     .iter()
                     .find(|f| f.name.eq_ignore_ascii_case(&col.name))
-                    .expect("target schema was built from the same output_columns; name lookup cannot fail");
-                crate::meta::repository::mv_contract::TargetVisibleColumn {
+                    .ok_or_else(|| {
+                        format!(
+                            "iceberg MV target schema is missing visible output column `{}`",
+                            col.name
+                        )
+                    })?;
+                Ok(crate::meta::repository::mv_contract::TargetVisibleColumn {
                     output_name: col.name.clone(),
                     target_field_id: field.id,
                     type_signature: format!("{}", field.field_type),
                     nullable: !field.required,
-                }
+                })
             })
-            .collect(),
+            .collect::<Result<Vec<_>, String>>()?,
         hidden_apply_key: crate::meta::repository::mv_contract::HiddenApplyKeyContract {
             column_name: hidden_apply_key_column_name.to_string(),
             target_field_id: actual_apply_key_field_id,
             source: hidden_apply_key_source,
         },
+        partition: Some(target_partition_contract(target_loaded)?),
+    })
+}
+
+fn target_partition_contract(
+    target_loaded: &crate::connector::iceberg::catalog::IcebergLoadedTable,
+) -> Result<crate::meta::repository::mv_contract::MvPartitionContract, String> {
+    let metadata = target_loaded.table.metadata();
+    let schema = metadata.current_schema();
+    let spec = metadata.default_partition_spec();
+    let mut fields = Vec::with_capacity(spec.fields().len());
+    for field in spec.fields() {
+        let source = schema.field_by_id(field.source_id).ok_or_else(|| {
+            format!(
+                "iceberg MV target partition field {} references missing target field id {}",
+                field.name, field.source_id
+            )
+        })?;
+        fields.push(
+            crate::meta::repository::mv_contract::MvPartitionFieldContract {
+                partition_field_id: field.field_id,
+                partition_field_name: field.name.clone(),
+                source_target_field_id: field.source_id,
+                source_column_name: source.name.clone(),
+                transform: mv_partition_transform_contract(&field.transform)?,
+            },
+        );
+    }
+    Ok(crate::meta::repository::mv_contract::MvPartitionContract {
+        target_spec_id: spec.spec_id(),
+        fields,
+    })
+}
+
+fn mv_partition_transform_contract(
+    transform: &iceberg::spec::Transform,
+) -> Result<crate::meta::repository::mv_contract::MvPartitionTransformContract, String> {
+    match transform {
+        iceberg::spec::Transform::Identity => {
+            Ok(crate::meta::repository::mv_contract::MvPartitionTransformContract::Identity)
+        }
+        iceberg::spec::Transform::Year => {
+            Ok(crate::meta::repository::mv_contract::MvPartitionTransformContract::Year)
+        }
+        iceberg::spec::Transform::Month => {
+            Ok(crate::meta::repository::mv_contract::MvPartitionTransformContract::Month)
+        }
+        iceberg::spec::Transform::Day => {
+            Ok(crate::meta::repository::mv_contract::MvPartitionTransformContract::Day)
+        }
+        iceberg::spec::Transform::Hour => {
+            Ok(crate::meta::repository::mv_contract::MvPartitionTransformContract::Hour)
+        }
+        iceberg::spec::Transform::Bucket(num_buckets) => Ok(
+            crate::meta::repository::mv_contract::MvPartitionTransformContract::Bucket {
+                num_buckets: *num_buckets,
+            },
+        ),
+        iceberg::spec::Transform::Truncate(width) => Ok(
+            crate::meta::repository::mv_contract::MvPartitionTransformContract::Truncate {
+                width: *width,
+            },
+        ),
+        iceberg::spec::Transform::Void => {
+            Ok(crate::meta::repository::mv_contract::MvPartitionTransformContract::Void)
+        }
+        iceberg::spec::Transform::Unknown => {
+            Err("iceberg MV target partition contract cannot persist unknown transform".to_string())
+        }
     }
 }
 
@@ -879,6 +955,11 @@ pub(crate) fn refresh_iceberg_mv(
         previous_snapshot_id.is_none() && current_snapshot_id_before_pin.is_none();
 
     if is_empty_base_noop {
+        ensure_schema_contract_compatible_for_refresh(
+            schema_contract,
+            &pre_pin_loaded.table,
+            &target_loaded.table,
+        )?;
         tracing::info!(
             "iceberg mv {}.{}.{}: base table has no snapshot; skipping refresh",
             target.catalog,
@@ -1107,19 +1188,49 @@ pub(crate) fn plan_iceberg_mv_refresh(
             ));
         }
         validate_join_shape_base_refs(join_shape, &base_refs).map_err(RefreshError::user)?;
-        let mut snapshot_pins = BTreeMap::new();
-        let mut current_snapshots = BTreeMap::new();
-        for base_ref in &base_refs {
-            let loaded =
-                load_current_iceberg_base_table(state, base_ref).map_err(RefreshError::user)?;
-            let current = loaded
-                .table
-                .metadata()
-                .current_snapshot()
-                .map(|s| s.snapshot_id());
-            snapshot_pins.insert(base_ref.fqn(), current);
-            current_snapshots.insert(base_ref.fqn(), current);
+        let schema_contract = mv_definition.schema_contract.as_ref().ok_or_else(|| {
+            RefreshError::user(format!(
+                "iceberg MV target {}.{}.{} is missing A11 schema contract; rebuild or recreate the MV",
+                iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+            ))
+        })?;
+        if schema_contract.contract_version != 2 {
+            return Err(RefreshError::user(format!(
+                "iceberg join MV {}.{}.{} requires schema contract version 2, got {}",
+                iceberg_target.catalog,
+                iceberg_target.namespace,
+                iceberg_target.table,
+                schema_contract.contract_version
+            )));
         }
+        let (left_ref, right_ref) =
+            join_base_refs_for_shape(join_shape, &base_refs).map_err(RefreshError::user)?;
+        let left_loaded =
+            load_current_iceberg_base_table(state, left_ref).map_err(RefreshError::user)?;
+        let right_loaded =
+            load_current_iceberg_base_table(state, right_ref).map_err(RefreshError::user)?;
+        let join_bases = [
+            (left_ref, &left_loaded.table),
+            (right_ref, &right_loaded.table),
+        ];
+        validate_join_schema_contract(schema_contract, &join_bases, &target_loaded.table)
+            .map_err(RefreshError::user)?;
+        let left_current = left_loaded
+            .table
+            .metadata()
+            .current_snapshot()
+            .map(|s| s.snapshot_id());
+        let right_current = right_loaded
+            .table
+            .metadata()
+            .current_snapshot()
+            .map(|s| s.snapshot_id());
+        let mut snapshot_pins = BTreeMap::new();
+        snapshot_pins.insert(left_ref.fqn(), left_current);
+        snapshot_pins.insert(right_ref.fqn(), right_current);
+        let mut current_snapshots = BTreeMap::new();
+        current_snapshots.insert(left_ref.fqn(), left_current);
+        current_snapshots.insert(right_ref.fqn(), right_current);
         let previous_snapshots = &mv_definition.last_refresh_snapshots;
         let has_previous = base_refs
             .iter()
@@ -1242,6 +1353,12 @@ pub(crate) fn plan_iceberg_mv_refresh(
     let is_empty_base_noop =
         previous_snapshot_id.is_none() && current_snapshot_id_before_pin.is_none();
     if is_empty_base_noop {
+        ensure_schema_contract_compatible_for_refresh(
+            schema_contract,
+            &pre_pin_loaded.table,
+            &target_loaded.table,
+        )
+        .map_err(RefreshError::user)?;
         let mut snapshot_pins = BTreeMap::new();
         snapshot_pins.insert(base_ref.fqn(), None);
         return Ok(RefreshPlan {
@@ -3009,6 +3126,26 @@ fn expected_main_snapshot_id_from_table(table: &iceberg::table::Table) -> Option
     table.metadata().current_snapshot().map(|s| s.snapshot_id())
 }
 
+fn ensure_schema_contract_compatible_for_refresh(
+    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    base_table: &iceberg::table::Table,
+    target_table: &iceberg::table::Table,
+) -> Result<(), String> {
+    match crate::engine::mv::schema_contract::validate_schema_contract(
+        schema_contract,
+        base_table,
+        target_table,
+    ) {
+        crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
+            Err(format!("{err}"))
+        }
+        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe
+        | crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
+            ..
+        } => Ok(()),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn refresh_iceberg_join_mv(
     state: &Arc<StandaloneState>,
@@ -3053,6 +3190,11 @@ fn refresh_iceberg_join_mv(
         .last_refresh_snapshots
         .get(&right_ref.fqn())
         .copied();
+    let pre_pin_join_bases = [
+        (left_ref, &left_loaded_before_pin.table),
+        (right_ref, &right_loaded_before_pin.table),
+    ];
+    validate_join_schema_contract(schema_contract, &pre_pin_join_bases, target_table)?;
 
     match (
         left_previous,
@@ -5432,6 +5574,37 @@ mod tests {
         create_iceberg_mv(state, current_catalog, current_db, &stmt).expect("create iceberg mv");
     }
 
+    fn add_target_identity_partition_column(
+        state: &Arc<StandaloneState>,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        column: &str,
+    ) {
+        let entry = {
+            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get(catalog).expect("catalog")
+        };
+        crate::connector::iceberg::catalog::registry::alter_partition_spec(
+            &entry,
+            namespace,
+            table,
+            crate::sql::parser::ast::AlterIcebergPartitionSpecStmt::AddPartitionColumn {
+                table: crate::sql::parser::ast::ObjectName {
+                    parts: vec![
+                        catalog.to_string(),
+                        namespace.to_string(),
+                        table.to_string(),
+                    ],
+                },
+                field: crate::sql::parser::ast::IcebergPartitionFieldExpr::Identity {
+                    column: column.to_string(),
+                },
+            },
+        )
+        .expect("alter target partition spec");
+    }
+
     fn create_mv_with_select_only(
         state: &Arc<StandaloneState>,
         current_catalog: Option<&str>,
@@ -5736,6 +5909,52 @@ mod tests {
     }
 
     #[test]
+    fn create_iceberg_mv_creates_partitioned_target_from_partition_by() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_orders
+             PARTITION BY (bucket(id, 16), truncate(name, 8))
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders",
+        );
+
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create iceberg mv");
+
+        let entry = {
+            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get("ice").expect("catalog")
+        };
+        let loaded =
+            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
+                .expect("load target table");
+        let spec = loaded.table.metadata().default_partition_spec();
+        assert_eq!(spec.spec_id(), 0);
+        let fields = spec.fields();
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name, "id_bucket_16");
+        assert_eq!(fields[0].source_id, 1);
+        assert_eq!(fields[0].transform, iceberg::spec::Transform::Bucket(16));
+        assert_eq!(fields[1].name, "name_truncate_8");
+        assert_eq!(fields[1].source_id, 2);
+        assert_eq!(fields[1].transform, iceberg::spec::Transform::Truncate(8));
+        let definition = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
+            .expect("mv definition");
+        let stored_partition = definition.partition_spec.expect("stored partition spec");
+        assert_eq!(stored_partition.target_spec_id, 0);
+        assert_eq!(stored_partition.fields.len(), 2);
+        let contract_partition = definition
+            .schema_contract
+            .expect("schema contract")
+            .target
+            .partition
+            .expect("target partition contract");
+        assert_eq!(contract_partition, stored_partition);
+    }
+
+    #[test]
     fn create_iceberg_mv_uses_current_catalog_target_without_managed_table_row() {
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
         create_base_table(&env.state, "ice", "sales", "orders");
@@ -5796,6 +6015,84 @@ mod tests {
         assert_eq!(
             plan.snapshot_pins.get("ice.sales.orders").copied(),
             Some(None)
+        );
+    }
+
+    #[test]
+    fn empty_base_noop_refresh_rejects_external_target_partition_change() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        create_mv_only(&env.state, Some("ice"), &env.current_db, "mv_orders");
+        add_target_identity_partition_column(&env.state, "ice", "analytics", "mv_orders", "id");
+
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_orders");
+        let err = refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect_err("refresh should reject partition spec drift before no-op");
+        assert!(
+            err.contains("target partition spec changed externally"),
+            "unexpected refresh error: {err}"
+        );
+
+        let target = crate::engine::mv::lifecycle::MvTarget {
+            catalog: Some("ice".to_string()),
+            database: "analytics".to_string(),
+            name: "mv_orders".to_string(),
+        };
+        let plan_err =
+            plan_iceberg_mv_refresh(&env.state, Some("ice"), &env.current_db, &refresh, target)
+                .expect_err("plan should reject partition spec drift before no-op");
+        assert!(
+            plan_err
+                .message
+                .contains("target partition spec changed externally"),
+            "unexpected plan error: {plan_err:?}"
+        );
+    }
+
+    #[test]
+    fn empty_join_base_noop_refresh_rejects_external_target_partition_change() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "left_orders");
+        create_base_table(&env.state, "ice", "sales", "right_orders");
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_join_orders
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT l.id, l.name
+                FROM ice.sales.left_orders l
+                JOIN ice.sales.right_orders r ON l.id = r.id",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create join iceberg mv");
+        add_target_identity_partition_column(
+            &env.state,
+            "ice",
+            "analytics",
+            "mv_join_orders",
+            "id",
+        );
+
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_join_orders");
+        let err = refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect_err("join refresh should reject partition spec drift before no-op");
+        assert!(
+            err.contains("target partition spec changed externally"),
+            "unexpected join refresh error: {err}"
+        );
+
+        let target = crate::engine::mv::lifecycle::MvTarget {
+            catalog: Some("ice".to_string()),
+            database: "analytics".to_string(),
+            name: "mv_join_orders".to_string(),
+        };
+        let plan_err =
+            plan_iceberg_mv_refresh(&env.state, Some("ice"), &env.current_db, &refresh, target)
+                .expect_err("join plan should reject partition spec drift before no-op");
+        assert!(
+            plan_err
+                .message
+                .contains("target partition spec changed externally"),
+            "unexpected join plan error: {plan_err:?}"
         );
     }
 
@@ -6082,6 +6379,7 @@ mod tests {
                     target_namespace: Some("analytics".to_string()),
                     target_table: Some("mv_orders".to_string()),
                     schema_contract: None,
+                    partition_spec: None,
                     created_at_ms: now_ms(),
                 },
             )
