@@ -2712,6 +2712,9 @@ pub(crate) fn plan_iceberg_mv_refresh(
                 })
                 .collect(),
             snapshot_pins,
+            affected_partitions: crate::engine::mv::partition::AffectedMvPartitions::unknown(
+                "iceberg MV affected partition planning is not wired",
+            ),
             backend_plan: BackendRefreshPlan::Iceberg(IcebergRefreshPlan {
                 stmt: stmt.clone(),
                 current_catalog: current_catalog.map(str::to_string),
@@ -2768,6 +2771,9 @@ pub(crate) fn plan_iceberg_mv_refresh(
                 table: base_ref.table.clone(),
             }],
             snapshot_pins,
+            affected_partitions: crate::engine::mv::partition::AffectedMvPartitions::unknown(
+                "iceberg MV affected partition planning is not wired",
+            ),
             backend_plan: BackendRefreshPlan::Iceberg(IcebergRefreshPlan {
                 stmt: stmt.clone(),
                 current_catalog: current_catalog.map(str::to_string),
@@ -2837,6 +2843,9 @@ pub(crate) fn plan_iceberg_mv_refresh(
             table: base_ref.table.clone(),
         }],
         snapshot_pins,
+        affected_partitions: crate::engine::mv::partition::AffectedMvPartitions::unknown(
+            "iceberg MV affected partition planning is not wired",
+        ),
         backend_plan: BackendRefreshPlan::Iceberg(IcebergRefreshPlan {
             stmt: stmt.clone(),
             current_catalog: current_catalog.map(str::to_string),

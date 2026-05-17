@@ -114,6 +114,7 @@ pub(crate) struct RefreshPlan {
     pub mode: RefreshMode,
     pub base_refs: Vec<MvBaseRef>,
     pub snapshot_pins: BTreeMap<String, Option<i64>>,
+    pub affected_partitions: crate::engine::mv::partition::AffectedMvPartitions,
     pub backend_plan: BackendRefreshPlan,
 }
 

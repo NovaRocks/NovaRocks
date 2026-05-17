@@ -274,6 +274,9 @@ impl MvBackend for ManagedLakeMvBackend {
                 table: req.statement.name.parts.join("."),
             }],
             snapshot_pins: Default::default(),
+            affected_partitions: crate::engine::mv::partition::AffectedMvPartitions::unknown(
+                "managed-lake MV partition planning is not implemented",
+            ),
             backend_plan: BackendRefreshPlan::ManagedLake(ManagedLakeRefreshPlan {
                 stmt: req.statement,
                 current_catalog: req.current_catalog,

@@ -102,6 +102,9 @@ mod lifecycle_tests {
                     table: "base".to_string(),
                 }],
                 snapshot_pins: Default::default(),
+                affected_partitions: crate::engine::mv::partition::AffectedMvPartitions::unknown(
+                    "mock MV backend does not plan affected partitions",
+                ),
                 backend_plan: BackendRefreshPlan::ManagedLake(ManagedLakeRefreshPlan {
                     stmt: req.statement,
                     current_catalog: req.current_catalog,
