@@ -10,6 +10,12 @@ pub(crate) enum BranchSide {
     Snapshot(i64),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BranchDeltaSide {
+    Left,
+    Right,
+}
+
 pub(crate) const JOIN_LEFT_ROW_ID_COLUMN: &str = "__nova_left_row_id";
 pub(crate) const JOIN_RIGHT_ROW_ID_COLUMN: &str = "__nova_right_row_id";
 
@@ -19,6 +25,16 @@ pub(crate) struct JoinDeltaBranchPlan {
     pub(crate) right_base: crate::connector::starrocks::managed::model::IcebergTableRef,
     pub(crate) left: BranchSide,
     pub(crate) right: BranchSide,
+}
+
+impl JoinDeltaBranchPlan {
+    pub(crate) fn delta_side(&self) -> Result<BranchDeltaSide, String> {
+        match (self.left, self.right) {
+            (BranchSide::Delta(_), BranchSide::Snapshot(_)) => Ok(BranchDeltaSide::Left),
+            (BranchSide::Snapshot(_), BranchSide::Delta(_)) => Ok(BranchDeltaSide::Right),
+            _ => Err("join branch plan must contain exactly one delta side".to_string()),
+        }
+    }
 }
 
 pub(crate) fn plan_join_delta_branches(

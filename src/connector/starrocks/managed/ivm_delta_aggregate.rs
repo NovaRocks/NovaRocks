@@ -93,7 +93,7 @@ fn signed_delta_projection(
                 })?;
                 projection.push(SelectItem::ExprWithAlias {
                     expr: group_key.expr.clone(),
-                    alias: Ident::new(group_key.output_name.clone()),
+                    alias: select_alias_ident(&group_key.output_name),
                 });
             }
             VisibleAggregateOutput::Aggregate(aggregate_index) => {
@@ -215,8 +215,25 @@ fn make_aggregate_select_item(func_name: &str, arg: Expr, alias: &str) -> Select
     };
     SelectItem::ExprWithAlias {
         expr: Expr::Function(function),
-        alias: Ident::new(alias),
+        alias: select_alias_ident(alias),
     }
+}
+
+fn select_alias_ident(alias: &str) -> Ident {
+    if is_plain_identifier(alias) {
+        Ident::new(alias)
+    } else {
+        Ident::with_quote('`', alias)
+    }
+}
+
+fn is_plain_identifier(alias: &str) -> bool {
+    let mut chars = alias.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 #[cfg(test)]
