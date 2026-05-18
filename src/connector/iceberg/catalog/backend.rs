@@ -25,6 +25,7 @@ use super::registry::{
 };
 
 const NOVAROCKS_MV_APPLY_KEY_COLUMN_PROPERTY: &str = "novarocks.mv.apply-key.column";
+const NOVAROCKS_MV_HIDDEN_COLUMNS_PROPERTY: &str = "novarocks.mv.hidden-columns";
 
 pub(crate) struct IcebergCatalogBackend {
     registry: Arc<RwLock<IcebergCatalogRegistry>>,
@@ -234,7 +235,7 @@ pub(crate) fn build_iceberg_table_def_for_delta_scan(
     }
     let iceberg_table = Some(build_iceberg_table_info(&loaded));
     let columns =
-        hide_novarocks_mv_apply_key_columns(loaded.table.metadata(), loaded.columns.clone())?;
+        hide_novarocks_mv_internal_columns(loaded.table.metadata(), loaded.columns.clone())?;
     let storage = register_empty_iceberg_table(namespace, table_name, &loaded.columns)?;
     let iceberg_row_lineage_metadata_columns = vec![
         ColumnDef {
@@ -294,7 +295,7 @@ fn build_iceberg_table_def_with_data_files(
     // "missing first_row_id" for every file that lacks it.
     let all_files_have_first_row_id = data_files.iter().all(|f| f.first_row_id.is_some());
     let columns =
-        hide_novarocks_mv_apply_key_columns(loaded.table.metadata(), loaded.columns.clone())?;
+        hide_novarocks_mv_internal_columns(loaded.table.metadata(), loaded.columns.clone())?;
     let storage = if entry.is_s3() {
         let cloud_properties = entry.cloud_properties_map();
         TableStorage::S3ParquetFiles {
@@ -375,46 +376,85 @@ fn build_iceberg_table_def_with_data_files(
     })
 }
 
-fn hide_novarocks_mv_apply_key_columns(
+fn hide_novarocks_mv_internal_columns(
     metadata: &iceberg::spec::TableMetadata,
     columns: Vec<ColumnDef>,
 ) -> Result<Vec<ColumnDef>, String> {
-    hide_novarocks_mv_apply_key_columns_by_property(
+    hide_novarocks_mv_internal_columns_by_property(
         metadata
             .properties()
             .get(NOVAROCKS_MV_APPLY_KEY_COLUMN_PROPERTY)
+            .map(String::as_str),
+        metadata
+            .properties()
+            .get(NOVAROCKS_MV_HIDDEN_COLUMNS_PROPERTY)
             .map(String::as_str),
         columns,
     )
 }
 
-fn hide_novarocks_mv_apply_key_columns_by_property(
+fn hide_novarocks_mv_internal_columns_by_property(
     apply_key_column: Option<&str>,
+    hidden_columns: Option<&str>,
     columns: Vec<ColumnDef>,
 ) -> Result<Vec<ColumnDef>, String> {
-    let Some(apply_key_column) = apply_key_column else {
+    let hidden_column_names = hidden_internal_column_names(apply_key_column, hidden_columns);
+    if hidden_column_names.is_empty() {
         return Ok(columns);
     };
 
-    let matching_count = columns
-        .iter()
-        .filter(|column| column.name.eq_ignore_ascii_case(apply_key_column))
-        .count();
-    if matching_count == 0 {
-        return Err(format!(
-            "Iceberg MV target schema is missing apply-key column '{apply_key_column}'"
-        ));
-    }
-    if matching_count > 1 {
-        return Err(format!(
-            "Iceberg MV target schema has {matching_count} apply-key columns named '{apply_key_column}'"
-        ));
+    for hidden_column in &hidden_column_names {
+        let matching_count = columns
+            .iter()
+            .filter(|column| column.name.eq_ignore_ascii_case(hidden_column))
+            .count();
+        if matching_count == 0 {
+            return Err(format!(
+                "Iceberg MV target schema is missing hidden internal column '{hidden_column}'"
+            ));
+        }
+        if matching_count > 1 {
+            return Err(format!(
+                "Iceberg MV target schema has {matching_count} hidden internal columns named '{hidden_column}'"
+            ));
+        }
     }
 
     Ok(columns
         .into_iter()
-        .filter(|column| !column.name.eq_ignore_ascii_case(apply_key_column))
+        .filter(|column| {
+            !hidden_column_names
+                .iter()
+                .any(|hidden| column.name.eq_ignore_ascii_case(hidden))
+        })
         .collect())
+}
+
+fn hidden_internal_column_names(
+    apply_key_column: Option<&str>,
+    hidden_columns: Option<&str>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(apply_key_column) = apply_key_column {
+        let trimmed = apply_key_column.trim();
+        if !trimmed.is_empty() {
+            out.push(trimmed.to_string());
+        }
+    }
+    if let Some(hidden_columns) = hidden_columns {
+        for hidden_column in hidden_columns.split(',') {
+            let trimmed = hidden_column.trim();
+            if trimmed.is_empty()
+                || out
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(trimmed))
+            {
+                continue;
+            }
+            out.push(trimmed.to_string());
+        }
+    }
+    out
 }
 
 fn data_file_with_stats_to_s3_file_info(file: super::registry::DataFileWithStats) -> S3FileInfo {
@@ -698,7 +738,7 @@ mod tests {
     fn hide_apply_key_columns_returns_columns_when_property_absent() {
         let columns = vec![test_column("id"), test_column("__nova_base_row_id")];
 
-        let hidden = hide_novarocks_mv_apply_key_columns_by_property(None, columns.clone())
+        let hidden = hide_novarocks_mv_internal_columns_by_property(None, None, columns.clone())
             .expect("hide columns");
 
         assert_eq!(
@@ -717,9 +757,12 @@ mod tests {
     fn hide_apply_key_columns_removes_one_case_insensitive_match() {
         let columns = vec![test_column("id"), test_column("__NOVA_BASE_ROW_ID")];
 
-        let hidden =
-            hide_novarocks_mv_apply_key_columns_by_property(Some("__nova_base_row_id"), columns)
-                .expect("hide columns");
+        let hidden = hide_novarocks_mv_internal_columns_by_property(
+            Some("__nova_base_row_id"),
+            None,
+            columns,
+        )
+        .expect("hide columns");
 
         assert_eq!(
             hidden
@@ -732,14 +775,41 @@ mod tests {
 
     #[test]
     fn hide_apply_key_columns_errors_when_marked_column_is_missing() {
-        let err = hide_novarocks_mv_apply_key_columns_by_property(
+        let err = hide_novarocks_mv_internal_columns_by_property(
             Some("__nova_base_row_id"),
+            None,
             vec![test_column("id")],
         )
         .expect_err("missing apply-key column should fail");
 
-        assert!(err.contains("missing apply-key column"));
+        assert!(err.contains("missing hidden internal column"));
         assert!(err.contains("__nova_base_row_id"));
+    }
+
+    #[test]
+    fn hide_internal_columns_removes_apply_key_and_aggregate_state_columns() {
+        let columns = vec![
+            test_column("__row_id__"),
+            test_column("region"),
+            test_column("c"),
+            test_column("__agg_state_c"),
+            test_column("__agg_state_s"),
+        ];
+
+        let hidden = hide_novarocks_mv_internal_columns_by_property(
+            Some("__row_id__"),
+            Some("__agg_state_c, __agg_state_s"),
+            columns,
+        )
+        .expect("hide columns");
+
+        assert_eq!(
+            hidden
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["region", "c"]
+        );
     }
 
     #[test]

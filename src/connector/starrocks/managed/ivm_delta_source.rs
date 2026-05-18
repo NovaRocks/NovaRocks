@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use sqlparser::ast::{Expr, Ident, SelectItem, SetExpr, Statement};
@@ -61,12 +61,43 @@ pub(crate) fn build_delta_source_files(
             let _ = path;
             None
         };
+        let deleted_data_file_paths = batch
+            .deleted_data_files
+            .iter()
+            .map(|file| normalize_delete_projection_path(&file.path, object_store_config))
+            .collect::<Result<HashSet<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        let current_lineage = if !batch.deletes.is_empty() {
+            crate::connector::iceberg::changes::base_data_file_lineage_index_at(
+                &input.loaded.table,
+                batch.current_snapshot_id,
+            )?
+        } else {
+            HashMap::new()
+        };
+        let previous_lineage = if !batch.deletes.is_empty() && !batch.deleted_data_files.is_empty()
+        {
+            previous_snapshot_data_file_lineage_index(
+                &input.loaded.table,
+                batch.previous_snapshot_id,
+            )?
+        } else {
+            HashMap::new()
+        };
+        let lineage_lookup = |path: &str| {
+            current_lineage
+                .get(path)
+                .or_else(|| previous_lineage.get(path))
+                .map(|lineage| lineage.first_row_id)
+        };
         let mut deleted_rows =
-            crate::connector::iceberg::scan_deletes::scan_deletes_with_path_normalizer(
+            crate::connector::iceberg::scan_deletes::scan_deletes_with_base_row_id_lookup_and_path_normalizer(
                 &batch.deletes,
                 &factory,
                 input.loaded.table.file_io(),
                 size_lookup,
+                lineage_lookup,
+                &deleted_data_file_paths,
                 |path| normalize_delete_projection_path(path, object_store_config),
             )
             .map_err(|e| e.to_string())?;
@@ -87,6 +118,7 @@ pub(crate) fn build_delta_source_files(
             deleted_data_files.as_ref(),
             object_store_config,
         )?);
+        let deleted_rows = dedupe_deleted_rows_by_row_id(deleted_rows)?;
         if !deleted_rows.is_empty() {
             let (path, size, record_count) = crate::engine::mv_flow::write_mv_delete_temp_parquet(
                 &input.base_ref.namespace,
@@ -190,6 +222,49 @@ pub(crate) fn projection_select_with_change_op(select_sql: &str) -> Result<Strin
     Ok(statement.to_string())
 }
 
+fn dedupe_deleted_rows_by_row_id(
+    batches: Vec<arrow::record_batch::RecordBatch>,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
+    use arrow::array::{Array, BooleanArray, Int64Array};
+    use arrow::compute::filter_record_batch;
+
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::with_capacity(batches.len());
+    for batch in batches {
+        let row_id_index = batch
+            .schema()
+            .fields()
+            .iter()
+            .position(|field| field.name().eq_ignore_ascii_case("_row_id"))
+            .ok_or_else(|| {
+                "IVM delta delete source requires Iceberg v3 `_row_id` column".to_string()
+            })?;
+        let row_ids = batch
+            .column(row_id_index)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| "IVM delta delete source `_row_id` column must be BIGINT".to_string())?;
+        let keep = (0..batch.num_rows())
+            .map(|row| {
+                if row_ids.is_null(row) {
+                    return Err("IVM delta delete source `_row_id` cannot be NULL".to_string());
+                }
+                Ok(seen.insert(row_ids.value(row)))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        if keep.iter().all(|keep| *keep) {
+            out.push(batch);
+        } else if keep.iter().any(|keep| *keep) {
+            let filtered = filter_record_batch(&batch, &BooleanArray::from(keep))
+                .map_err(|e| format!("deduplicate IVM delta delete rows by _row_id failed: {e}"))?;
+            if filtered.num_rows() > 0 {
+                out.push(filtered);
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn sql_mentions_identifier(sql: &str, identifier: &str) -> bool {
     sql.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
         .any(|token| token.eq_ignore_ascii_case(identifier))
@@ -249,10 +324,14 @@ mod tests {
 
     use crate::connector::iceberg::changes::DeletedDataFileRef;
     use crate::exec::node::iceberg_delta_scan::BaseDataFileLineage;
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
 
     use super::{
-        deleted_data_files_need_previous_lineage, enrich_deleted_data_files_with_previous_lineage,
-        projection_select_with_change_op,
+        dedupe_deleted_rows_by_row_id, deleted_data_files_need_previous_lineage,
+        enrich_deleted_data_files_with_previous_lineage, projection_select_with_change_op,
     };
 
     fn deleted_ref(
@@ -375,5 +454,41 @@ mod tests {
         assert!(
             err.contains("previous-snapshot data-file lineage index does not contain the file")
         );
+    }
+
+    #[test]
+    fn dedupe_deleted_rows_by_row_id_keeps_each_base_row_once() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("region", DataType::Utf8, true),
+            Field::new("_row_id", DataType::Int64, false),
+        ]));
+        let first = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["west", "east"])),
+                Arc::new(Int64Array::from(vec![10, 11])),
+            ],
+        )
+        .expect("first batch");
+        let second = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["west", "north", "east"])),
+                Arc::new(Int64Array::from(vec![10, 12, 11])),
+            ],
+        )
+        .expect("second batch");
+
+        let deduped = dedupe_deleted_rows_by_row_id(vec![first, second]).expect("dedupe");
+
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(deduped[0].num_rows(), 2);
+        assert_eq!(deduped[1].num_rows(), 1);
+        let row_ids = deduped[1]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("row ids");
+        assert_eq!(row_ids.value(0), 12);
     }
 }

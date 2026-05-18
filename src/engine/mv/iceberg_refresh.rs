@@ -39,9 +39,9 @@ use crate::engine::mv::iceberg_target_apply::{
     ICEBERG_MV_APPLY_KEY_SOURCE_GROUP_ROW_ID, ICEBERG_MV_APPLY_KEY_SOURCE_JOIN_ROW_KEY,
     ICEBERG_MV_GROUP_APPLY_KEY_COLUMN, ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
     ICEBERG_MV_PROP_APPLY_KEY_COLUMN, ICEBERG_MV_PROP_APPLY_KEY_FIELD_ID,
-    ICEBERG_MV_PROP_APPLY_KEY_SOURCE, apply_key_table_column, ensure_base_row_lineage_contract,
-    find_apply_key_field_id_by_column, iceberg_mv_physical_select_sql, join_apply_key_table_column,
-    load_target_apply_locator_inputs,
+    ICEBERG_MV_PROP_APPLY_KEY_SOURCE, ICEBERG_MV_PROP_HIDDEN_COLUMNS, apply_key_table_column,
+    ensure_base_row_lineage_contract, find_apply_key_field_id_by_column,
+    iceberg_mv_physical_select_sql, join_apply_key_table_column, load_target_apply_locator_inputs,
 };
 use crate::engine::mv::lifecycle::{
     BackendRefreshPlan, IcebergRefreshOutcome, IcebergRefreshPlan, MvBaseRef, MvStorageEngine,
@@ -247,6 +247,41 @@ pub(crate) fn create_iceberg_mv(
             )
         })?;
     let partition_fields = stmt.partition_by.as_deref().unwrap_or(&[]);
+    let aggregate_state_hidden_columns = if let Some(aggregate_shape) = aggregate_shape.as_ref() {
+        let layout = crate::connector::starrocks::managed::mv_agg_state::build_aggregate_mv_layout(
+            aggregate_shape,
+            &analysis.output_columns,
+        )?;
+        layout
+            .state_columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let mut target_properties = vec![
+        ("format-version".to_string(), "3".to_string()),
+        ("write.row-lineage".to_string(), "true".to_string()),
+        (
+            ICEBERG_MV_PROP_APPLY_KEY_COLUMN.to_string(),
+            apply_key_column_name.to_string(),
+        ),
+        (
+            ICEBERG_MV_PROP_APPLY_KEY_SOURCE.to_string(),
+            apply_key_source_property.to_string(),
+        ),
+        (
+            ICEBERG_MV_PROP_APPLY_KEY_FIELD_ID.to_string(),
+            expected_apply_key_field_id.to_string(),
+        ),
+    ];
+    if !aggregate_state_hidden_columns.is_empty() {
+        target_properties.push((
+            ICEBERG_MV_PROP_HIDDEN_COLUMNS.to_string(),
+            aggregate_state_hidden_columns.join(","),
+        ));
+    }
     crate::connector::iceberg::catalog::registry::create_table(
         &entry,
         &target.namespace,
@@ -254,22 +289,7 @@ pub(crate) fn create_iceberg_mv(
         &columns,
         None,
         partition_fields,
-        &[
-            ("format-version".to_string(), "3".to_string()),
-            ("write.row-lineage".to_string(), "true".to_string()),
-            (
-                ICEBERG_MV_PROP_APPLY_KEY_COLUMN.to_string(),
-                apply_key_column_name.to_string(),
-            ),
-            (
-                ICEBERG_MV_PROP_APPLY_KEY_SOURCE.to_string(),
-                apply_key_source_property.to_string(),
-            ),
-            (
-                ICEBERG_MV_PROP_APPLY_KEY_FIELD_ID.to_string(),
-                expected_apply_key_field_id.to_string(),
-            ),
-        ],
+        &target_properties,
     )?;
     let post_create = (|| {
         entry.invalidate_table_cache(&target.namespace, &target.table);
@@ -8354,6 +8374,23 @@ mod tests {
 
         create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
             .expect("create aggregate iceberg mv");
+
+        let entry = {
+            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get("ice").expect("catalog")
+        };
+        let loaded =
+            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_fact_region")
+                .expect("load aggregate target table");
+        assert_eq!(
+            loaded
+                .table
+                .metadata()
+                .properties()
+                .get(ICEBERG_MV_PROP_HIDDEN_COLUMNS)
+                .map(String::as_str),
+            Some("__agg_state_c,__agg_state_s")
+        );
 
         let contract = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_fact_region")
             .expect("mv definition")

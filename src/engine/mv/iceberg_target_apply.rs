@@ -7,6 +7,7 @@ pub(crate) const ICEBERG_MV_APPLY_KEY_SOURCE_GROUP_ROW_ID: &str = "GroupRowId";
 pub(crate) const ICEBERG_MV_PROP_APPLY_KEY_COLUMN: &str = "novarocks.mv.apply-key.column";
 pub(crate) const ICEBERG_MV_PROP_APPLY_KEY_SOURCE: &str = "novarocks.mv.apply-key.source";
 pub(crate) const ICEBERG_MV_PROP_APPLY_KEY_FIELD_ID: &str = "novarocks.mv.apply-key.field-id";
+pub(crate) const ICEBERG_MV_PROP_HIDDEN_COLUMNS: &str = "novarocks.mv.hidden-columns";
 
 pub(crate) fn apply_key_table_column() -> crate::sql::parser::ast::TableColumnDef {
     crate::sql::parser::ast::TableColumnDef {

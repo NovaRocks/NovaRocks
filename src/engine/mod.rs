@@ -2378,9 +2378,13 @@ pub(crate) fn execute_query_with_options(
     let logical = crate::sql::planner::plan_query(resolved, cte_registry)?;
     let table_stats = build_table_stats_from_plan(&logical);
     let mut physical = crate::sql::optimizer::optimize(logical, &table_stats)?;
-    // Unit-test states may not start the standalone exchange server.
-    // Collapse distribution nodes instead of building an unusable coordinated plan.
-    let force_single_fragment = terminal_sink.is_some() || exchange_port == 0;
+    // Unit-test states may not start the standalone exchange server. IVM-A1
+    // internal queries also pass runtime-local handles (`terminal_sink` or
+    // `iceberg_catalogs`) that coordinated fragments cannot currently clone
+    // into remote fragment execution. Collapse distribution nodes before
+    // fragment building so those refresh queries stay local.
+    let force_single_fragment =
+        terminal_sink.is_some() || iceberg_catalogs.is_some() || exchange_port == 0;
     if force_single_fragment {
         physical = collapse_distribution_enforcers_for_single_fragment(physical);
     }

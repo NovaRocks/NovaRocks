@@ -791,6 +791,7 @@ where
         file_io,
         data_file_size_lookup,
         first_row_id_lookup,
+        &std::collections::HashSet::new(),
         normalize_local_fs_path_owned,
     )
 }
@@ -801,6 +802,7 @@ pub(crate) fn scan_deletes_with_base_row_id_lookup_and_path_normalizer<F, R, N>(
     file_io: &iceberg::io::FileIO,
     data_file_size_lookup: F,
     first_row_id_lookup: R,
+    suppressed_data_files: &std::collections::HashSet<String>,
     normalize_path: N,
 ) -> Result<Vec<RecordBatch>, ChangeError>
 where
@@ -834,6 +836,9 @@ where
         for (path, treemap) in dv_positions {
             *positions_per_file.entry(path).or_default() |= treemap;
         }
+    }
+    for path in suppressed_data_files {
+        positions_per_file.remove(path);
     }
 
     let mut out: Vec<RecordBatch> = Vec::new();
