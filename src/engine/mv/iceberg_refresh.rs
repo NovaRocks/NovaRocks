@@ -2532,7 +2532,7 @@ fn unknown_join_affected_partitions() -> crate::engine::mv::partition::AffectedM
 fn noop_affected_partitions(
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
 ) -> crate::engine::mv::partition::AffectedMvPartitions {
-    if schema_contract.target.partition.is_none() {
+    if is_unpartitioned_mv_contract(schema_contract) {
         crate::engine::mv::partition::AffectedMvPartitions::Unpartitioned
     } else {
         crate::engine::mv::partition::AffectedMvPartitions::known(
@@ -2540,6 +2540,16 @@ fn noop_affected_partitions(
             std::iter::empty::<crate::engine::mv::partition::MvPartitionKey>(),
         )
     }
+}
+
+fn is_unpartitioned_mv_contract(
+    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+) -> bool {
+    schema_contract
+        .target
+        .partition
+        .as_ref()
+        .is_none_or(|partition| partition.fields.is_empty())
 }
 
 fn log_planned_iceberg_mv_affected_partitions(
@@ -2868,27 +2878,37 @@ pub(crate) fn plan_iceberg_mv_refresh(
     let affected_partitions = match mode {
         RefreshMode::Noop => noop_affected_partitions(schema_contract),
         RefreshMode::Incremental => {
-            let previous = previous_snapshot_id.expect("incremental refresh has previous snapshot");
-            let current = current_snapshot_id.expect("incremental refresh has current snapshot");
-            match plan_changes(&loaded.table, previous, Some(current), &[]) {
-                Ok(batch) => crate::engine::mv::partition::planner::plan_affected_partitions(
-                    &crate::engine::mv::partition::planner::AffectedPartitionPlanInput {
-                        schema_contract,
-                        change_batch: Some(&batch),
-                    },
-                ),
-                Err(err) => crate::engine::mv::partition::AffectedMvPartitions::unknown(format!(
-                    "failed to plan Iceberg changes for affected partitions: {err}"
-                )),
+            if is_unpartitioned_mv_contract(schema_contract) {
+                crate::engine::mv::partition::AffectedMvPartitions::Unpartitioned
+            } else {
+                let previous =
+                    previous_snapshot_id.expect("incremental refresh has previous snapshot");
+                let current =
+                    current_snapshot_id.expect("incremental refresh has current snapshot");
+                match plan_changes(&loaded.table, previous, Some(current), &[]) {
+                    Ok(batch) => crate::engine::mv::partition::planner::plan_affected_partitions(
+                        &crate::engine::mv::partition::planner::AffectedPartitionPlanInput {
+                            schema_contract,
+                            change_batch: Some(&batch),
+                        },
+                    ),
+                    Err(err) => crate::engine::mv::partition::AffectedMvPartitions::unknown(
+                        format!("failed to plan Iceberg changes for affected partitions: {err}"),
+                    ),
+                }
             }
         }
         RefreshMode::Full | RefreshMode::Rebuild => {
-            crate::engine::mv::partition::planner::plan_affected_partitions(
-                &crate::engine::mv::partition::planner::AffectedPartitionPlanInput {
-                    schema_contract,
-                    change_batch: None,
-                },
-            )
+            if is_unpartitioned_mv_contract(schema_contract) {
+                crate::engine::mv::partition::AffectedMvPartitions::Unpartitioned
+            } else {
+                crate::engine::mv::partition::planner::plan_affected_partitions(
+                    &crate::engine::mv::partition::planner::AffectedPartitionPlanInput {
+                        schema_contract,
+                        change_batch: None,
+                    },
+                )
+            }
         }
     };
     log_planned_iceberg_mv_affected_partitions(&iceberg_target, &affected_partitions);
@@ -3150,6 +3170,9 @@ fn build_iceberg_refresh_plan(
             })
             .collect(),
         snapshot_pins,
+        affected_partitions: crate::engine::mv::partition::AffectedMvPartitions::unknown(
+            "aggregate MV affected partition planning is not implemented",
+        ),
         backend_plan: BackendRefreshPlan::Iceberg(IcebergRefreshPlan {
             stmt: stmt.clone(),
             current_catalog: current_catalog.map(str::to_string),
@@ -8056,6 +8079,51 @@ mod tests {
         .expect("create aggregate dim iceberg table");
     }
 
+    fn create_identity_partitioned_base_table(
+        state: &Arc<StandaloneState>,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) {
+        let entry = {
+            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get(catalog).expect("catalog")
+        };
+        let columns = vec![
+            crate::sql::TableColumnDef {
+                name: "id".to_string(),
+                data_type: crate::sql::SqlType::Int,
+                nullable: false,
+                aggregation: None,
+                default: None,
+            },
+            crate::sql::TableColumnDef {
+                name: "name".to_string(),
+                data_type: crate::sql::SqlType::String,
+                nullable: true,
+                aggregation: None,
+                default: None,
+            },
+        ];
+        crate::connector::iceberg::catalog::registry::create_table(
+            &entry,
+            namespace,
+            table,
+            &columns,
+            None,
+            &[
+                crate::sql::parser::ast::IcebergPartitionFieldExpr::Identity {
+                    column: "id".to_string(),
+                },
+            ],
+            &[
+                ("format-version".to_string(), "3".to_string()),
+                ("write.row-lineage".to_string(), "true".to_string()),
+            ],
+        )
+        .expect("create identity-partitioned iceberg table");
+    }
+
     fn insert_into_iceberg_table(
         state: &Arc<StandaloneState>,
         catalog: &str,
@@ -9201,6 +9269,125 @@ mod tests {
                 "storage_engine='iceberg' requires current catalog to be an Iceberg catalog"
             );
         }
+    }
+
+    #[test]
+    fn plan_iceberg_mv_refresh_reports_append_insert_affected_partitions() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_identity_partitioned_base_table(&env.state, "ice", "sales", "orders");
+        insert_into_iceberg_table(&env.state, "ice", "sales", "orders", &[(1, "a")]);
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_orders
+             PARTITION BY (id)
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create partitioned iceberg mv");
+
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_orders");
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("first refresh");
+        insert_into_iceberg_table(&env.state, "ice", "sales", "orders", &[(2, "b")]);
+
+        let target = crate::engine::mv::lifecycle::MvTarget {
+            catalog: Some("ice".to_string()),
+            database: "analytics".to_string(),
+            name: "mv_orders".to_string(),
+        };
+        let plan =
+            plan_iceberg_mv_refresh(&env.state, Some("ice"), &env.current_db, &refresh, target)
+                .expect("second refresh plan");
+
+        let crate::engine::mv::partition::AffectedMvPartitions::Known {
+            new_partitions,
+            old_partitions,
+        } = plan.affected_partitions
+        else {
+            panic!(
+                "expected known affected partitions: {:?}",
+                plan.affected_partitions
+            );
+        };
+        let entry = {
+            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get("ice").expect("catalog")
+        };
+        let target_spec_id =
+            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
+                .expect("load target table")
+                .table
+                .metadata()
+                .default_partition_spec()
+                .spec_id();
+        let expected_partition = crate::engine::mv::partition::MvPartitionKey::new(
+            target_spec_id,
+            vec![crate::engine::mv::partition::MvPartitionKeyField::new(
+                "id".to_string(),
+                crate::engine::mv::partition::MvPartitionValue::String("2".to_string()),
+            )],
+        );
+        assert_eq!(
+            new_partitions.into_iter().collect::<Vec<_>>(),
+            vec![expected_partition]
+        );
+        assert!(old_partitions.is_empty());
+    }
+
+    #[test]
+    fn plan_iceberg_mv_refresh_reports_unpartitioned_for_unpartitioned_mv() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table_with_rows(&env.state, "ice", "sales", "orders", &[(1, "a")]);
+        create_mv_and_refresh_once(&env.state, Some("ice"), &env.current_db, "mv_orders");
+        insert_into_iceberg_table(&env.state, "ice", "sales", "orders", &[(2, "b")]);
+
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_orders");
+        let target = crate::engine::mv::lifecycle::MvTarget {
+            catalog: Some("ice".to_string()),
+            database: "analytics".to_string(),
+            name: "mv_orders".to_string(),
+        };
+        let plan =
+            plan_iceberg_mv_refresh(&env.state, Some("ice"), &env.current_db, &refresh, target)
+                .expect("unpartitioned refresh plan");
+
+        assert_eq!(
+            plan.affected_partitions,
+            crate::engine::mv::partition::AffectedMvPartitions::Unpartitioned
+        );
+    }
+
+    #[test]
+    fn plan_iceberg_mv_refresh_reports_unknown_for_join_mv() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "left_orders");
+        create_base_table(&env.state, "ice", "sales", "right_orders");
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_join_orders
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT l.id, l.name
+                FROM ice.sales.left_orders l
+                JOIN ice.sales.right_orders r ON l.id = r.id",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create join iceberg mv");
+
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_join_orders");
+        let target = crate::engine::mv::lifecycle::MvTarget {
+            catalog: Some("ice".to_string()),
+            database: "analytics".to_string(),
+            name: "mv_join_orders".to_string(),
+        };
+        let plan =
+            plan_iceberg_mv_refresh(&env.state, Some("ice"), &env.current_db, &refresh, target)
+                .expect("join refresh plan");
+
+        assert_eq!(
+            plan.affected_partitions.unknown_reason(),
+            Some("join MV affected partition planning is not implemented")
+        );
     }
 
     #[test]

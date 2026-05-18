@@ -104,6 +104,7 @@ mod tests {
                 filter: None,
             },
             join: None,
+            aggregate: None,
             target: TargetContract {
                 table_fqn: "ice.analytics.mv_orders".to_string(),
                 table_uuid: "target-uuid".to_string(),
