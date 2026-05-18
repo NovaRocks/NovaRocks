@@ -2523,6 +2523,39 @@ fn execute_join_aggregate_delta_branch(
 //     distribution, properties).
 // See the rejection in refresh_iceberg_mv for the user-facing error.
 
+fn unknown_join_affected_partitions() -> crate::engine::mv::partition::AffectedMvPartitions {
+    crate::engine::mv::partition::AffectedMvPartitions::unknown(
+        "join MV affected partition planning is not implemented",
+    )
+}
+
+fn noop_affected_partitions(
+    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+) -> crate::engine::mv::partition::AffectedMvPartitions {
+    if schema_contract.target.partition.is_none() {
+        crate::engine::mv::partition::AffectedMvPartitions::Unpartitioned
+    } else {
+        crate::engine::mv::partition::AffectedMvPartitions::known(
+            std::iter::empty::<crate::engine::mv::partition::MvPartitionKey>(),
+            std::iter::empty::<crate::engine::mv::partition::MvPartitionKey>(),
+        )
+    }
+}
+
+fn log_planned_iceberg_mv_affected_partitions(
+    iceberg_target: &IcebergMvTarget,
+    affected_partitions: &crate::engine::mv::partition::AffectedMvPartitions,
+) {
+    tracing::info!(
+        target = %format!(
+            "{}.{}.{}",
+            iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+        ),
+        affected_partitions = ?affected_partitions,
+        "planned iceberg MV affected partitions"
+    );
+}
+
 pub(crate) fn plan_iceberg_mv_refresh(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
@@ -2698,6 +2731,8 @@ pub(crate) fn plan_iceberg_mv_refresh(
         } else {
             RefreshMode::Incremental
         };
+        let affected_partitions = unknown_join_affected_partitions();
+        log_planned_iceberg_mv_affected_partitions(&iceberg_target, &affected_partitions);
         return Ok(RefreshPlan {
             mv_id: Some(mv_definition.mv_id),
             target,
@@ -2712,9 +2747,7 @@ pub(crate) fn plan_iceberg_mv_refresh(
                 })
                 .collect(),
             snapshot_pins,
-            affected_partitions: crate::engine::mv::partition::AffectedMvPartitions::unknown(
-                "iceberg MV affected partition planning is not wired",
-            ),
+            affected_partitions,
             backend_plan: BackendRefreshPlan::Iceberg(IcebergRefreshPlan {
                 stmt: stmt.clone(),
                 current_catalog: current_catalog.map(str::to_string),
@@ -2760,6 +2793,8 @@ pub(crate) fn plan_iceberg_mv_refresh(
         .map_err(RefreshError::user)?;
         let mut snapshot_pins = BTreeMap::new();
         snapshot_pins.insert(base_ref.fqn(), None);
+        let affected_partitions = noop_affected_partitions(schema_contract);
+        log_planned_iceberg_mv_affected_partitions(&iceberg_target, &affected_partitions);
         return Ok(RefreshPlan {
             mv_id: Some(mv_definition.mv_id),
             target,
@@ -2771,9 +2806,7 @@ pub(crate) fn plan_iceberg_mv_refresh(
                 table: base_ref.table.clone(),
             }],
             snapshot_pins,
-            affected_partitions: crate::engine::mv::partition::AffectedMvPartitions::unknown(
-                "iceberg MV affected partition planning is not wired",
-            ),
+            affected_partitions,
             backend_plan: BackendRefreshPlan::Iceberg(IcebergRefreshPlan {
                 stmt: stmt.clone(),
                 current_catalog: current_catalog.map(str::to_string),
@@ -2832,6 +2865,33 @@ pub(crate) fn plan_iceberg_mv_refresh(
     };
     let mut snapshot_pins = BTreeMap::new();
     snapshot_pins.insert(base_ref.fqn(), current_snapshot_id);
+    let affected_partitions = match mode {
+        RefreshMode::Noop => noop_affected_partitions(schema_contract),
+        RefreshMode::Incremental => {
+            let previous = previous_snapshot_id.expect("incremental refresh has previous snapshot");
+            let current = current_snapshot_id.expect("incremental refresh has current snapshot");
+            match plan_changes(&loaded.table, previous, Some(current), &[]) {
+                Ok(batch) => crate::engine::mv::partition::planner::plan_affected_partitions(
+                    &crate::engine::mv::partition::planner::AffectedPartitionPlanInput {
+                        schema_contract,
+                        change_batch: Some(&batch),
+                    },
+                ),
+                Err(err) => crate::engine::mv::partition::AffectedMvPartitions::unknown(format!(
+                    "failed to plan Iceberg changes for affected partitions: {err}"
+                )),
+            }
+        }
+        RefreshMode::Full | RefreshMode::Rebuild => {
+            crate::engine::mv::partition::planner::plan_affected_partitions(
+                &crate::engine::mv::partition::planner::AffectedPartitionPlanInput {
+                    schema_contract,
+                    change_batch: None,
+                },
+            )
+        }
+    };
+    log_planned_iceberg_mv_affected_partitions(&iceberg_target, &affected_partitions);
     Ok(RefreshPlan {
         mv_id: Some(mv_definition.mv_id),
         target,
@@ -2843,9 +2903,7 @@ pub(crate) fn plan_iceberg_mv_refresh(
             table: base_ref.table.clone(),
         }],
         snapshot_pins,
-        affected_partitions: crate::engine::mv::partition::AffectedMvPartitions::unknown(
-            "iceberg MV affected partition planning is not wired",
-        ),
+        affected_partitions,
         backend_plan: BackendRefreshPlan::Iceberg(IcebergRefreshPlan {
             stmt: stmt.clone(),
             current_catalog: current_catalog.map(str::to_string),
