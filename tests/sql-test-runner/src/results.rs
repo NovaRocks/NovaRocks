@@ -429,6 +429,40 @@ pub fn find_legacy_result_paths(result_dir: &Path, case_id: &str) -> Result<Vec<
     Ok(paths)
 }
 
+/// Replace timing values in the canonical EXPLAIN ANALYZE header line
+/// with literal `<MS>` tokens. Only cells matching
+/// `^Planning: \d+ ms / Execution: \d+ ms / Rows: (\d+)$` are rewritten;
+/// row count is preserved. All other cells pass through verbatim.
+///
+/// Resist the urge to normalize more — silent normalization is how
+/// plan-shape drift hides.
+pub fn normalize_explain_timing_cell(cell: &str) -> String {
+    use std::sync::OnceLock;
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"^Planning: \d+ ms / Execution: \d+ ms / Rows: (\d+)$")
+            .expect("static regex compiles")
+    });
+    match re.captures(cell) {
+        Some(caps) => format!(
+            "Planning: <MS> ms / Execution: <MS> ms / Rows: {}",
+            caps.get(1).unwrap().as_str(),
+        ),
+        None => cell.to_string(),
+    }
+}
+
+/// Apply `normalize_explain_timing_cell` to every cell of every row.
+pub fn normalize_explain_timing_rows(rows: &[Vec<String>]) -> Vec<Vec<String>> {
+    rows.iter()
+        .map(|row| {
+            row.iter()
+                .map(|cell| normalize_explain_timing_cell(cell))
+                .collect()
+        })
+        .collect()
+}
+
 pub fn step_allows_missing_expected_result(step: &SqlStep) -> bool {
     step.meta.expect_error.is_some()
         || step.meta.skip_result_check
@@ -449,7 +483,8 @@ pub fn step_has_implicit_skip_result(step: &SqlStep) -> bool {
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase();
-    if normalized.starts_with("refresh materialized view ") && normalized.contains(" with sync mode")
+    if normalized.starts_with("refresh materialized view ")
+        && normalized.contains(" with sync mode")
     {
         return true;
     }
@@ -477,9 +512,7 @@ pub fn step_has_implicit_skip_result(step: &SqlStep) -> bool {
         "submit ",
         "cancel ",
     ];
-    DDL_DML_PREFIXES
-        .iter()
-        .any(|p| normalized.starts_with(p))
+    DDL_DML_PREFIXES.iter().any(|p| normalized.starts_with(p))
 }
 
 pub fn step_retry_count(step: &SqlStep) -> usize {
@@ -524,4 +557,37 @@ pub fn write_mismatch_artifacts(
     fs::write(out_dir.join("diff.txt"), format!("{}\n", reason))
         .with_context(|| format!("write diff failed: {}", out_dir.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod normalize_explain_tests {
+    use super::*;
+
+    #[test]
+    fn normalize_rewrites_only_header_cell() {
+        let rows = vec![
+            vec!["Planning: 12 ms / Execution: 345 ms / Rows: 7".to_string()],
+            vec!["Some other line about Planning: 99 ms".to_string()],
+            vec!["Planning: notdigits ms / Execution: 0 ms / Rows: 0".to_string()],
+        ];
+        let out = normalize_explain_timing_rows(&rows);
+        assert_eq!(
+            out[0][0],
+            "Planning: <MS> ms / Execution: <MS> ms / Rows: 7"
+        );
+        assert_eq!(out[1][0], rows[1][0]); // non-header untouched
+        assert_eq!(out[2][0], rows[2][0]); // header-shaped but non-digit, untouched
+    }
+
+    #[test]
+    fn normalize_preserves_row_count() {
+        let rows = vec![vec![
+            "Planning: 1 ms / Execution: 2 ms / Rows: 42".to_string(),
+        ]];
+        let out = normalize_explain_timing_rows(&rows);
+        assert_eq!(
+            out[0][0],
+            "Planning: <MS> ms / Execution: <MS> ms / Rows: 42"
+        );
+    }
 }

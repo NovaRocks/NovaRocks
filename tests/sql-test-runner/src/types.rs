@@ -25,6 +25,8 @@ pub struct QueryMeta {
     pub result_contains: Vec<String>,
     pub result_contains_any: Vec<String>,
     pub result_not_contains: Vec<String>,
+    pub explain_contains: Vec<String>,
+    pub normalize_explain_timing: bool,
     pub tags: Vec<String>,
     pub skip_result_check: bool,
     pub retry_count: Option<usize>,

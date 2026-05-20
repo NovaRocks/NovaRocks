@@ -14,9 +14,9 @@ use crate::config::{
 use crate::parser::load_suite_hook;
 use crate::results::{
     case_result_path, compare_result_sets, find_legacy_result_paths, load_expected_results,
-    step_allows_missing_expected_result, step_has_implicit_skip_result,
-    step_requires_recorded_result, step_retry_count, step_retry_interval, verify_text_assertions,
-    write_mismatch_artifacts, write_result_file,
+    normalize_explain_timing_rows, step_allows_missing_expected_result,
+    step_has_implicit_skip_result, step_requires_recorded_result, step_retry_count,
+    step_retry_interval, verify_text_assertions, write_mismatch_artifacts, write_result_file,
 };
 use crate::runner::{error_message_matches, parse_selector_list, summarize_connection};
 use crate::session::{MysqlSession, drop_case_database, execute_suite_hook, reset_case_database};
@@ -403,6 +403,78 @@ fn run_step_wait_alters(
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// @explain_contains helpers
+// ---------------------------------------------------------------------------
+
+/// If `sql` begins with an EXPLAIN prefix, strip it so the runner can
+/// wrap `EXPLAIN VERBOSE` around the underlying query body. Handles
+/// `EXPLAIN [VERBOSE|COSTS|ANALYZE]` case-insensitively.
+fn explain_contains_target_body(sql: &str) -> String {
+    let trimmed = sql.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    for prefix in [
+        "explain verbose ",
+        "explain costs ",
+        "explain analyze ",
+        "explain ",
+    ] {
+        if lower.starts_with(prefix) {
+            return trimmed[prefix.len()..].trim_start().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+/// Cheap leading-keyword sniff: only SELECT or WITH bodies are valid
+/// EXPLAIN targets. (DDL and DML are explicitly rejected for
+/// @explain_contains.)
+fn is_select_or_with(body: &str) -> bool {
+    let head = body
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    head == "select" || head == "with"
+}
+
+/// Run the `@explain_contains` assertion for a step: issue `EXPLAIN VERBOSE`
+/// on the step's SQL body and assert each needle substring is present.
+/// Returns `Ok(())` if all assertions pass, or `Err(message)` on the first failure.
+fn run_explain_contains_check(
+    step: &SqlStep,
+    session: &mut crate::session::MysqlSession,
+    query_timeout: u64,
+    log: &mut String,
+) -> Result<(), String> {
+    let body = explain_contains_target_body(&step.sql);
+    if !is_select_or_with(&body) {
+        return Err(format!(
+            "@explain_contains is only valid on SELECT / WITH statements (got: {})",
+            body.split_whitespace().next().unwrap_or("(empty)")
+        ));
+    }
+    let explain_sql = format!("EXPLAIN VERBOSE {}", body);
+    let _ = writeln!(log, "    @explain_contains: running EXPLAIN VERBOSE");
+    let (ok, exec, msg) = session.execute_query(query_timeout, &explain_sql, None);
+    if !ok {
+        return Err(format!(
+            "@explain_contains: EXPLAIN VERBOSE failed.\n  error: {}",
+            msg
+        ));
+    }
+    let explain_text = exec.map(|e| e.text_output).unwrap_or_default();
+    for needle in &step.meta.explain_contains {
+        if !explain_text.contains(needle.as_str()) {
+            return Err(format!(
+                "@explain_contains assertion failed.\n  expected substring: {}\n  EXPLAIN VERBOSE output:\n{}",
+                needle, explain_text
+            ));
+        }
+    }
+    Ok(())
+}
+
 // Per-case execution
 // ---------------------------------------------------------------------------
 
@@ -783,11 +855,20 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             .as_ref()
                             .and_then(|results| results.get(&step.query_number))
                         {
+                            let (cmp_expected_rows, cmp_actual_rows) =
+                                if step.meta.normalize_explain_timing {
+                                    (
+                                        normalize_explain_timing_rows(&expected.rows),
+                                        normalize_explain_timing_rows(&execution.rows),
+                                    )
+                                } else {
+                                    (expected.rows.clone(), execution.rows.clone())
+                                };
                             let (same, reason) = compare_result_sets(
                                 &expected.header,
-                                &expected.rows,
+                                &cmp_expected_rows,
                                 &execution.header,
-                                &execution.rows,
+                                &cmp_actual_rows,
                                 order_sensitive,
                                 epsilon,
                             );
@@ -852,38 +933,62 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     case_elapsed += wait_elapsed;
                     if !wait_ok {
                         case_failed = true;
-                    } else if !ctx.verify_enabled {
-                        let _ = writeln!(
-                            log,
-                            "    ✅ PASS (verify disabled) ({:.2}s)",
-                            execution.elapsed.as_secs_f64()
-                        );
-                    } else if step.meta.skip_result_check || step_has_implicit_skip_result(step) {
-                        let _ = writeln!(
-                            log,
-                            "    ✅ PASS ({:.2}s, skip_result_check)",
-                            execution.elapsed.as_secs_f64()
-                        );
-                    } else if expected_results
-                        .as_ref()
-                        .and_then(|results| results.get(&step.query_number))
-                        .is_some()
-                    {
-                        let _ = writeln!(
-                            log,
-                            "    ✅ PASS ({:.2}s, rows={})",
-                            execution.elapsed.as_secs_f64(),
-                            execution.rows.len()
-                        );
-                        for row in execution.rows.iter().take(ctx.preview_lines) {
-                            let _ = writeln!(log, "    {:?}", row);
-                        }
                     } else {
-                        let _ = writeln!(
-                            log,
-                            "    ✅ PASS ({:.2}s, text assertions only)",
-                            execution.elapsed.as_secs_f64()
-                        );
+                        // @explain_contains: issue EXPLAIN VERBOSE and assert substrings.
+                        let explain_ok = if !step.meta.explain_contains.is_empty() {
+                            match run_explain_contains_check(
+                                step,
+                                &mut target_session,
+                                ctx.query_timeout,
+                                &mut log,
+                            ) {
+                                Ok(()) => true,
+                                Err(msg) => {
+                                    case_failed = true;
+                                    let _ = writeln!(log, "    ❌ {}", msg);
+                                    false
+                                }
+                            }
+                        } else {
+                            true
+                        };
+                        if explain_ok {
+                            if !ctx.verify_enabled {
+                                let _ = writeln!(
+                                    log,
+                                    "    ✅ PASS (verify disabled) ({:.2}s)",
+                                    execution.elapsed.as_secs_f64()
+                                );
+                            } else if step.meta.skip_result_check
+                                || step_has_implicit_skip_result(step)
+                            {
+                                let _ = writeln!(
+                                    log,
+                                    "    ✅ PASS ({:.2}s, skip_result_check)",
+                                    execution.elapsed.as_secs_f64()
+                                );
+                            } else if expected_results
+                                .as_ref()
+                                .and_then(|results| results.get(&step.query_number))
+                                .is_some()
+                            {
+                                let _ = writeln!(
+                                    log,
+                                    "    ✅ PASS ({:.2}s, rows={})",
+                                    execution.elapsed.as_secs_f64(),
+                                    execution.rows.len()
+                                );
+                                for row in execution.rows.iter().take(ctx.preview_lines) {
+                                    let _ = writeln!(log, "    {:?}", row);
+                                }
+                            } else {
+                                let _ = writeln!(
+                                    log,
+                                    "    ✅ PASS ({:.2}s, text assertions only)",
+                                    execution.elapsed.as_secs_f64()
+                                );
+                            }
+                        }
                     }
                 } else {
                     case_failed = true;
@@ -1030,28 +1135,53 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     if !wait_ok {
                         case_failed = true;
                     } else {
-                        if step_requires_recorded_result(step) {
-                            recorded_results.insert(
-                                step.query_number,
-                                ResultSet {
-                                    header: execution.header.clone(),
-                                    rows: execution.rows.clone(),
-                                },
-                            );
-                        }
-                        if step.meta.skip_result_check || step_has_implicit_skip_result(step) {
-                            let _ = writeln!(
-                                log,
-                                "    ✅ STEP RECORDED ({:.2}s, skip_result_check)",
-                                execution.elapsed.as_secs_f64()
-                            );
+                        // @explain_contains: validate during record too.
+                        let explain_ok = if !step.meta.explain_contains.is_empty() {
+                            match run_explain_contains_check(
+                                step,
+                                &mut target_session,
+                                ctx.query_timeout,
+                                &mut log,
+                            ) {
+                                Ok(()) => true,
+                                Err(msg) => {
+                                    case_failed = true;
+                                    let _ = writeln!(log, "    ❌ {}", msg);
+                                    false
+                                }
+                            }
                         } else {
-                            let _ = writeln!(
-                                log,
-                                "    ✅ STEP RECORDED ({:.2}s, rows={})",
-                                execution.elapsed.as_secs_f64(),
-                                execution.rows.len()
-                            );
+                            true
+                        };
+                        if explain_ok {
+                            if step_requires_recorded_result(step) {
+                                let record_rows = if step.meta.normalize_explain_timing {
+                                    normalize_explain_timing_rows(&execution.rows)
+                                } else {
+                                    execution.rows.clone()
+                                };
+                                recorded_results.insert(
+                                    step.query_number,
+                                    ResultSet {
+                                        header: execution.header.clone(),
+                                        rows: record_rows,
+                                    },
+                                );
+                            }
+                            if step.meta.skip_result_check || step_has_implicit_skip_result(step) {
+                                let _ = writeln!(
+                                    log,
+                                    "    ✅ STEP RECORDED ({:.2}s, skip_result_check)",
+                                    execution.elapsed.as_secs_f64()
+                                );
+                            } else {
+                                let _ = writeln!(
+                                    log,
+                                    "    ✅ STEP RECORDED ({:.2}s, rows={})",
+                                    execution.elapsed.as_secs_f64(),
+                                    execution.rows.len()
+                                );
+                            }
                         }
                     }
                 } else {
@@ -2069,8 +2199,8 @@ mod tests {
         let path = temp_result_path("empty_load");
         fs::write(&path, "\n").expect("write empty file");
         let marker_re = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").expect("marker regex");
-        let loaded =
-            load_expected_results(&path, false, &marker_re, None).expect("must parse empty result file");
+        let loaded = load_expected_results(&path, false, &marker_re, None)
+            .expect("must parse empty result file");
         let result_set = loaded.get(&1).expect("single-step result");
         assert!(result_set.header.is_empty());
         assert!(result_set.rows.is_empty());
@@ -2084,8 +2214,8 @@ mod tests {
         let content = fs::read_to_string(&path).expect("read empty result file");
         assert_eq!(content, "");
         let marker_re = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").expect("marker regex");
-        let loaded =
-            load_expected_results(&path, false, &marker_re, None).expect("must parse empty result file");
+        let loaded = load_expected_results(&path, false, &marker_re, None)
+            .expect("must parse empty result file");
         let result_set = loaded.get(&1).expect("single-step result");
         assert!(result_set.header.is_empty());
         assert!(result_set.rows.is_empty());
@@ -2268,5 +2398,36 @@ mod tests {
         assert_eq!(catalog.as_deref(), Some("iceberg_cat_abc123"));
         assert_eq!(db.as_deref(), Some("tpch"));
         assert_eq!(sql, "CREATE EXTERNAL CATALOG `iceberg_cat_abc123`;");
+    }
+
+    #[test]
+    fn explain_contains_target_body_strips_explain_prefix() {
+        assert_eq!(crate::explain_contains_target_body("SELECT 1"), "SELECT 1");
+        assert_eq!(
+            crate::explain_contains_target_body("EXPLAIN VERBOSE SELECT 1"),
+            "SELECT 1"
+        );
+        assert_eq!(
+            crate::explain_contains_target_body("explain analyze select 2"),
+            "select 2"
+        );
+        assert_eq!(
+            crate::explain_contains_target_body("EXPLAIN COSTS SELECT 3"),
+            "SELECT 3"
+        );
+        assert_eq!(
+            crate::explain_contains_target_body("EXPLAIN SELECT 4"),
+            "SELECT 4"
+        );
+    }
+
+    #[test]
+    fn is_select_or_with_accepts_select_and_with() {
+        assert!(crate::is_select_or_with("SELECT 1"));
+        assert!(crate::is_select_or_with(
+            "WITH cte AS (SELECT 1) SELECT * FROM cte"
+        ));
+        assert!(!crate::is_select_or_with("CREATE TABLE foo (a INT)"));
+        assert!(!crate::is_select_or_with("INSERT INTO foo VALUES (1)"));
     }
 }

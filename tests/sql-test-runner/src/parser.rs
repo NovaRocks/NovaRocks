@@ -63,7 +63,9 @@ fn detect_case_sequential(lines: &[String], file_meta_lines: &[String], meta_re:
         parse_meta_line(line, meta_re)
             .map(|(k, v)| k == "sequential" && parse_bool(&v).unwrap_or(false))
             .unwrap_or(false)
-    }) || lines.iter().any(|line| legacy_name_line_has_sequential_tag(line))
+    }) || lines
+        .iter()
+        .any(|line| legacy_name_line_has_sequential_tag(line))
 }
 
 pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
@@ -99,6 +101,12 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
             }
             "result_not_contains" => {
                 meta.result_not_contains.push(raw_value);
+            }
+            "explain_contains" => {
+                meta.explain_contains.push(raw_value);
+            }
+            "normalize_explain_timing" => {
+                meta.normalize_explain_timing = parse_bool(&raw_value)?;
             }
             "catalog" => {
                 bail!(
@@ -173,6 +181,13 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         } else {
             override_meta.result_not_contains.clone()
         },
+        explain_contains: if override_meta.explain_contains.is_empty() {
+            base.explain_contains.clone()
+        } else {
+            override_meta.explain_contains.clone()
+        },
+        normalize_explain_timing: override_meta.normalize_explain_timing
+            || base.normalize_explain_timing,
         tags: if override_meta.tags.is_empty() {
             base.tags.clone()
         } else {
@@ -464,4 +479,59 @@ pub fn load_suite_hook(
         catalog,
         db,
     }))
+}
+
+#[cfg(test)]
+mod opt5_directive_tests {
+    use super::*;
+    use regex::Regex;
+
+    fn meta_re() -> Regex {
+        // Same regex used by the runner — see tests/sql-test-runner/src/main.rs:1600.
+        Regex::new(r"^--\s*@([a-zA-Z0-9_]+)\s*=\s*(.+?)\s*$").unwrap()
+    }
+
+    #[test]
+    fn parse_meta_collects_explain_contains() {
+        let re = meta_re();
+        let lines = vec![
+            "-- @explain_contains=INNER JOIN".to_string(),
+            "-- @explain_contains=stats={rows=".to_string(),
+        ];
+        let meta = parse_meta(&lines, &re).expect("parse ok");
+        assert_eq!(
+            meta.explain_contains,
+            vec!["INNER JOIN".to_string(), "stats={rows=".to_string()],
+        );
+    }
+
+    #[test]
+    fn parse_meta_parses_normalize_explain_timing() {
+        let re = meta_re();
+        let lines = vec!["-- @normalize_explain_timing=true".to_string()];
+        let meta = parse_meta(&lines, &re).expect("parse ok");
+        assert!(meta.normalize_explain_timing);
+    }
+
+    #[test]
+    fn merge_meta_inherits_explain_contains_from_base_when_override_empty() {
+        let base = QueryMeta {
+            explain_contains: vec!["X".to_string()],
+            ..QueryMeta::default()
+        };
+        let override_meta = QueryMeta::default();
+        let merged = merge_meta(&base, &override_meta);
+        assert_eq!(merged.explain_contains, vec!["X".to_string()]);
+    }
+
+    #[test]
+    fn merge_meta_normalize_timing_is_logical_or() {
+        let base = QueryMeta {
+            normalize_explain_timing: true,
+            ..QueryMeta::default()
+        };
+        let override_meta = QueryMeta::default();
+        let merged = merge_meta(&base, &override_meta);
+        assert!(merged.normalize_explain_timing);
+    }
 }
