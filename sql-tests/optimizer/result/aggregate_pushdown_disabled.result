@@ -1,0 +1,44 @@
+-- query 9
+Explain String
+GATHER EXCHANGE stats={rows=10}
+  PROJECT [a.k AS k, sum(a.v)] stats={rows=10}
+    HASH AGGREGATE (GLOBAL, group by: [a.k]) stats={rows=10}
+      aggregations: sum(__nr_agg_pd_0)
+      HASH EXCHANGE (hash: [a.k]) stats={rows=10}
+        HASH AGGREGATE (LOCAL, group by: [a.k]) stats={rows=10}
+          aggregations: sum(__nr_agg_pd_0)
+          HASH JOIN (BROADCAST, INNER, eq: [a.k = b.k]) stats={rows=100000}
+            HASH AGGREGATE (GLOBAL, group by: [a.k]) stats={rows=10}
+              aggregations: sum(a.v)
+              HASH EXCHANGE (hash: [a.k]) stats={rows=10}
+                HASH AGGREGATE (LOCAL, group by: [a.k]) stats={rows=10}
+                  aggregations: sum(a.v)
+                  SCAN db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_a (alias=a) stats={rows=100000}
+                       TABLE: db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_a
+                       columns: k, v
+                       min-max stats
+            GATHER EXCHANGE stats={rows=100000}
+              SCAN db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_b (alias=b) stats={rows=100000}
+                   TABLE: db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_b
+                   columns: k
+                   min-max stats
+
+-- query 11
+Explain String
+GATHER EXCHANGE stats={rows=10}
+  PROJECT [a.k AS k, sum(a.v)] stats={rows=10}
+    HASH AGGREGATE (GLOBAL, group by: [a.k]) stats={rows=10}
+      aggregations: sum(a.v)
+      HASH EXCHANGE (hash: [a.k]) stats={rows=10}
+        HASH AGGREGATE (LOCAL, group by: [a.k]) stats={rows=10}
+          aggregations: sum(a.v)
+          HASH JOIN (BROADCAST, INNER, eq: [a.k = b.k]) stats={rows=1000000000}
+            SCAN db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_a (alias=a) stats={rows=100000}
+                 TABLE: db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_a
+                 columns: k, v
+                 min-max stats
+            GATHER EXCHANGE stats={rows=100000}
+              SCAN db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_b (alias=b) stats={rows=100000}
+                   TABLE: db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_b
+                   columns: k
+                   min-max stats

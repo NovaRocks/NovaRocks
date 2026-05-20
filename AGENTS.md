@@ -659,6 +659,15 @@ cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
   for plan-golden cases, and `-- @explain_contains=<substr>` /
   `-- @normalize_explain_timing` in any sql-test case to assert plan-shape
   facts alongside the result golden.
+- **Aggregate pushdown rule (OPT-1)**: see
+  `src/sql/optimizer/rbo/rules/aggregate_pushdown/`. Pushes
+  `LogicalAggregate` past inner/outer joins toward leaves when NDV
+  bucketing predicts a real row-count reduction. White-list functions
+  are SUM/MIN/MAX/COUNT(col). Disable via
+  `SET disable_optimizer_rules = 'AggregatePushdown'`. Plan-shape
+  cases live under `sql-tests/optimizer/aggregate_pushdown_*.sql`. The
+  idempotency guard is `AggregateNode::already_pushed` — other rules
+  must preserve the flag when cloning.
 
 ---
 

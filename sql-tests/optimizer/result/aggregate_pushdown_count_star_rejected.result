@@ -1,0 +1,16 @@
+Explain String
+GATHER EXCHANGE stats={rows=1}
+  PROJECT [count() AS count(*)] stats={rows=1}
+    HASH AGGREGATE (SINGLE) stats={rows=1}
+      aggregations: count()
+      GATHER EXCHANGE stats={rows=1000000000}
+        HASH JOIN (BROADCAST, INNER, eq: [a.k = b.k]) stats={rows=1000000000}
+          SCAN db_sqlt_f6521d6ed49857d9.t_agg_pd_neg_a (alias=a) stats={rows=100000}
+               TABLE: db_sqlt_f6521d6ed49857d9.t_agg_pd_neg_a
+               columns: k
+               min-max stats
+          GATHER EXCHANGE stats={rows=100000}
+            SCAN db_sqlt_f6521d6ed49857d9.t_agg_pd_neg_b (alias=b) stats={rows=100000}
+                 TABLE: db_sqlt_f6521d6ed49857d9.t_agg_pd_neg_b
+                 columns: k
+                 min-max stats
