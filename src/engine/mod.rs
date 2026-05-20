@@ -711,55 +711,8 @@ impl StandaloneSession {
                 let sqlast::Statement::Query(ref query) = *statement else {
                     return Err("EXPLAIN only supports SELECT queries".to_string());
                 };
-                // Inline any user-defined views before the analyzer sees the
-                // EXPLAINed query. See the `Statement::Query` branch below for
-                // rationale.
-                let mut view_expanded = query.clone();
-                self::view_rewrite::expand_views_in_query(
-                    view_expanded.as_mut(),
-                    &self.inner.views,
-                    current_database,
-                );
-                let query = &view_expanded;
-                // Time-travel in EXPLAIN: rewrite version clauses before registration.
-                let mut time_travel_rewritten;
-                let query = if has_time_travel_refs(query) {
-                    time_travel_rewritten = query.as_ref().clone();
-                    rewrite_time_travel_refs(
-                        &self.inner,
-                        current_catalog,
-                        current_database,
-                        &mut time_travel_rewritten,
-                    )?;
-                    &time_travel_rewritten
-                } else {
-                    query.as_ref()
-                };
-                if current_catalog.is_some() {
-                    register_iceberg_tables_for_query(
-                        &self.inner,
-                        current_catalog,
-                        current_database,
-                        query,
-                    )?;
-                }
-                let mut rewritten_three_part_query;
-                let three_parts = extract_three_part_table_refs(query);
-                let query = if !three_parts.is_empty() {
-                    if current_catalog.is_none() {
-                        register_iceberg_tables_for_query(
-                            &self.inner,
-                            None,
-                            current_database,
-                            query,
-                        )?;
-                    }
-                    rewritten_three_part_query = query.clone();
-                    strip_catalog_from_three_part_names(&mut rewritten_three_part_query);
-                    &rewritten_three_part_query
-                } else {
-                    query
-                };
+                let prepared =
+                    prepare_explain_query(&self.inner, current_catalog, current_database, query)?;
                 let level = forced_explain_level.unwrap_or({
                     if verbose {
                         crate::sql::explain::ExplainLevel::Verbose
@@ -772,7 +725,7 @@ impl StandaloneSession {
                     .catalog
                     .read()
                     .expect("standalone catalog read lock");
-                let result = explain_query(query, &catalog, current_database, level)?;
+                let result = explain_query(&prepared, &catalog, current_database, level)?;
                 drop(catalog);
                 Ok(StatementResult::Query(result))
             }
@@ -2308,6 +2261,42 @@ fn collapse_distribution_enforcers_for_single_fragment(
     }
 
     node
+}
+
+/// Common preparation pipeline shared by `EXPLAIN` and `EXPLAIN ANALYZE`:
+/// inline user-defined views, rewrite time-travel refs, register Iceberg
+/// tables, and strip three-part catalog names. Returns the rewritten query.
+fn prepare_explain_query(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    query: &sqlparser::ast::Query,
+) -> Result<sqlparser::ast::Query, String> {
+    // Inline any user-defined views before the analyzer sees the query.
+    let mut prepared = query.clone();
+    self::view_rewrite::expand_views_in_query(&mut prepared, &state.views, current_database);
+
+    // Time-travel: rewrite version clauses before Iceberg registration.
+    if has_time_travel_refs(&prepared) {
+        rewrite_time_travel_refs(state, current_catalog, current_database, &mut prepared)?;
+    }
+
+    // When current_catalog is an Iceberg catalog, materialize referenced
+    // Iceberg tables into the local catalog first.
+    if current_catalog.is_some() {
+        register_iceberg_tables_for_query(state, current_catalog, current_database, &prepared)?;
+    }
+
+    // Three-part catalog.database.table names: register and strip.
+    let three_parts = extract_three_part_table_refs(&prepared);
+    if !three_parts.is_empty() {
+        if current_catalog.is_none() {
+            register_iceberg_tables_for_query(state, None, current_database, &prepared)?;
+        }
+        strip_catalog_from_three_part_names(&mut prepared);
+    }
+
+    Ok(prepared)
 }
 
 /// Produce EXPLAIN output for a query without executing it.
