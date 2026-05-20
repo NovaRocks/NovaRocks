@@ -2337,6 +2337,11 @@ fn explain_analyze_query(
 ) -> Result<QueryResult, String> {
     use crate::sql::explain::{ExplainLevel, explain_physical_plan};
 
+    // NOTE: planning_ms covers only the outer analyze + plan_query +
+    // optimize call below; execute_query re-plans internally and its
+    // planning work is charged to execution_ms. This double-count is
+    // an acknowledged limitation; per-operator profile merge in a
+    // follow-up PR will replace the query-level timing summary.
     let t_plan = Instant::now();
     let (resolved, cte_registry) = crate::sql::analyzer::analyze(query, catalog, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry)?;

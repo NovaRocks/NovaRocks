@@ -37,10 +37,9 @@ pub(crate) enum ExplainLevel {
     Normal,
     Verbose,
     Costs,
-    /// Produce node-level output identical to Verbose; the execution
-    /// stats header is added by explain_analyze_query (lands in OPT-5
-    /// Task 5).
-    #[allow(dead_code)]
+    /// Produce node-level output identical to Verbose; the
+    /// Planning/Execution/Rows header is added by
+    /// `explain_analyze_query` in `src/engine/mod.rs`.
     Analyze,
 }
 
