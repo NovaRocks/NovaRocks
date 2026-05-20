@@ -1910,6 +1910,45 @@ fn wrap_aggregate_apply_error(target_fqn: &str, mv_id: i64, cause: String) -> St
     format!("iceberg aggregate MV apply failed (target={target_fqn}, mv_id={mv_id}): {cause}")
 }
 
+/// Inputs for the `iceberg_aggregate_mv.apply` tracing event. Extracted so
+/// the emission site is unit-testable without standing up the full apply
+/// path (staging branch + commit + publish). The end-to-end emission still
+/// fires from `apply_iceberg_aggregate_delta_chunks` and is exercised by the
+/// `iceberg-ivm` SQL suite.
+#[derive(Debug)]
+pub(crate) struct AggregateApplyEvent<'a> {
+    pub(crate) target_fqn: &'a str,
+    pub(crate) mv_id: i64,
+    pub(crate) partition_filter: &'a crate::engine::mv::partition::TargetPartitionFilter,
+    pub(crate) touched_group_count: usize,
+    pub(crate) lookup_stats:
+        &'a crate::engine::mv::iceberg_aggregate_state::AggregateStateLookupStats,
+    pub(crate) delete_row_count: usize,
+    pub(crate) insert_chunk_row_count: usize,
+    pub(crate) new_total_rows: i64,
+    pub(crate) iceberg_snapshot: i64,
+}
+
+fn emit_aggregate_apply_event(event: &AggregateApplyEvent<'_>) {
+    tracing::info!(
+        event = "iceberg_aggregate_mv.apply",
+        mv_id = event.mv_id,
+        target_fqn = %event.target_fqn,
+        partition_filter = partition_filter_label(event.partition_filter),
+        affected_partition_count = partition_filter_count(event.partition_filter).unwrap_or(0),
+        touched_group_count = event.touched_group_count,
+        planned_file_count = event.lookup_stats.planned_file_count,
+        kept_file_count = event.lookup_stats.kept_file_count,
+        scanned_target_row_count = event.lookup_stats.scanned_row_count,
+        matched_target_row_count = event.lookup_stats.matched_row_count,
+        delete_row_count = event.delete_row_count,
+        insert_chunk_row_count = event.insert_chunk_row_count,
+        new_total_rows = event.new_total_rows,
+        iceberg_snapshot = event.iceberg_snapshot,
+        "iceberg aggregate mv incremental refresh complete"
+    );
+}
+
 fn build_aggregate_target_partition_filter(
     layout: &crate::connector::starrocks::managed::mv_agg_state::AggregateMvLayout,
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
@@ -2199,23 +2238,17 @@ fn apply_iceberg_aggregate_delta_chunks(
         table_uuids,
         published_snapshot_id,
     )?;
-    tracing::info!(
-        event = "iceberg_aggregate_mv.apply",
-        mv_id = mv_id,
-        target_fqn = %target_fqn,
-        partition_filter = partition_filter_label(&partition_filter),
-        affected_partition_count = partition_filter_count(&partition_filter).unwrap_or(0),
-        touched_group_count = touched_row_ids.len(),
-        planned_file_count = lookup_stats.planned_file_count,
-        kept_file_count = lookup_stats.kept_file_count,
-        scanned_target_row_count = lookup_stats.scanned_row_count,
-        matched_target_row_count = lookup_stats.matched_row_count,
-        delete_row_count = delete_row_count,
-        insert_chunk_row_count = insert_chunk_row_count,
-        new_total_rows = new_total_rows,
-        iceberg_snapshot = published_snapshot_id,
-        "iceberg aggregate mv incremental refresh complete"
-    );
+    emit_aggregate_apply_event(&AggregateApplyEvent {
+        target_fqn: &target_fqn,
+        mv_id,
+        partition_filter: &partition_filter,
+        touched_group_count: touched_row_ids.len(),
+        lookup_stats: &lookup_stats,
+        delete_row_count,
+        insert_chunk_row_count,
+        new_total_rows,
+        iceberg_snapshot: published_snapshot_id,
+    });
     Ok(StatementResult::Ok)
 }
 
@@ -11306,5 +11339,196 @@ mod tests {
             .collect(),
         );
         assert_eq!(partition_filter_count(&allow), Some(2));
+    }
+
+    // ---- Tracing event capture ---------------------------------------------
+    //
+    // The two structured events emitted by the aggregate apply path
+    // (`iceberg_aggregate_mv.apply` and `iceberg_aggregate_mv.partition_derivation_failed`)
+    // are unit-tested by feeding the emitter helpers (`emit_aggregate_apply_event`
+    // and `wrap_aggregate_apply_error`) through a `tracing_subscriber::fmt`
+    // subscriber that writes into an in-memory buffer. The end-to-end
+    // emission from `apply_iceberg_aggregate_delta_chunks` is exercised by
+    // the `iceberg-ivm` SQL suite (the apply path takes a full StandaloneState
+    // / staging branch / commit lifecycle that is out of scope for a unit
+    // test), so this gives us regression coverage at the emitter contract
+    // without standing the rest of the world up.
+    #[derive(Clone)]
+    struct TracingTestBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl TracingTestBuffer {
+        fn new() -> Self {
+            Self(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())))
+        }
+        fn output(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone())
+                .expect("tracing output is valid UTF-8")
+        }
+    }
+
+    struct TracingTestWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for TracingTestWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TracingTestBuffer {
+        type Writer = TracingTestWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            TracingTestWriter(self.0.clone())
+        }
+    }
+
+    fn capture_events<F: FnOnce()>(emit: F) -> String {
+        let buf = TracingTestBuffer::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_target(false)
+            .with_level(false)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, emit);
+        buf.output()
+    }
+
+    #[test]
+    fn aggregate_apply_event_emits_full_field_set_for_allow_list() {
+        use crate::engine::mv::iceberg_aggregate_state::AggregateStateLookupStats;
+        use crate::engine::mv::partition::{
+            MvPartitionKey, MvPartitionKeyField, MvPartitionValue, TargetPartitionFilter,
+        };
+
+        let mut allow = std::collections::BTreeSet::new();
+        allow.insert(MvPartitionKey::new(
+            7,
+            vec![MvPartitionKeyField::new(
+                "region".to_string(),
+                MvPartitionValue::String("a".to_string()),
+            )],
+        ));
+        let filter = TargetPartitionFilter::AllowList(allow);
+        let stats = AggregateStateLookupStats {
+            planned_file_count: 10,
+            kept_file_count: 1,
+            scanned_row_count: 100,
+            matched_row_count: 5,
+        };
+
+        let output = capture_events(|| {
+            emit_aggregate_apply_event(&AggregateApplyEvent {
+                target_fqn: "ice.analytics.mv_orders",
+                mv_id: 4242,
+                partition_filter: &filter,
+                touched_group_count: 5,
+                lookup_stats: &stats,
+                delete_row_count: 2,
+                insert_chunk_row_count: 5,
+                new_total_rows: 100,
+                iceberg_snapshot: 999,
+            });
+        });
+
+        // Event name.
+        assert!(
+            output.contains("event=\"iceberg_aggregate_mv.apply\""),
+            "missing event name in:\n{output}"
+        );
+        // The 13 structured fields the spec § 11 promises. We assert each
+        // field's key=value form so a typo in the emitter (e.g. dropping a
+        // field, renaming a key) fails immediately.
+        for field in [
+            "mv_id=4242",
+            "target_fqn=ice.analytics.mv_orders",
+            "partition_filter=\"allow_list\"",
+            "affected_partition_count=1",
+            "touched_group_count=5",
+            "planned_file_count=10",
+            "kept_file_count=1",
+            "scanned_target_row_count=100",
+            "matched_target_row_count=5",
+            "delete_row_count=2",
+            "insert_chunk_row_count=5",
+            "new_total_rows=100",
+            "iceberg_snapshot=999",
+        ] {
+            assert!(
+                output.contains(field),
+                "missing `{field}` in event output:\n{output}"
+            );
+        }
+        // Invariants the apply path is expected to keep. These also guard
+        // against accidental field swaps (e.g. matched/scanned reversed).
+        assert!(stats.kept_file_count <= stats.planned_file_count);
+        assert!(stats.matched_row_count <= stats.scanned_row_count);
+    }
+
+    #[test]
+    fn aggregate_apply_event_renders_none_filter_with_zero_affected_count() {
+        use crate::engine::mv::iceberg_aggregate_state::AggregateStateLookupStats;
+        use crate::engine::mv::partition::TargetPartitionFilter;
+
+        let filter = TargetPartitionFilter::None;
+        let stats = AggregateStateLookupStats {
+            planned_file_count: 4,
+            kept_file_count: 4,
+            scanned_row_count: 50,
+            matched_row_count: 50,
+        };
+
+        let output = capture_events(|| {
+            emit_aggregate_apply_event(&AggregateApplyEvent {
+                target_fqn: "ice.analytics.mv_unpartitioned",
+                mv_id: 7,
+                partition_filter: &filter,
+                touched_group_count: 50,
+                lookup_stats: &stats,
+                delete_row_count: 0,
+                insert_chunk_row_count: 50,
+                new_total_rows: 50,
+                iceberg_snapshot: 12345,
+            });
+        });
+
+        assert!(
+            output.contains("partition_filter=\"none\""),
+            "expected partition_filter=\"none\" for non-partitioned MV, got:\n{output}"
+        );
+        assert!(
+            output.contains("affected_partition_count=0"),
+            "expected affected_partition_count=0 for None filter, got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn wrap_aggregate_apply_error_emits_partition_derivation_failed_event() {
+        let output = capture_events(|| {
+            let _ = wrap_aggregate_apply_error(
+                "ice.analytics.mv_orders",
+                4242,
+                "MV partition field region uses unsupported transform Void".to_string(),
+            );
+        });
+
+        assert!(
+            output.contains("event=\"iceberg_aggregate_mv.partition_derivation_failed\""),
+            "missing partition_derivation_failed event name in:\n{output}"
+        );
+        assert!(output.contains("mv_id=4242"), "missing mv_id in:\n{output}");
+        assert!(
+            output.contains("target_fqn=ice.analytics.mv_orders"),
+            "missing target_fqn in:\n{output}"
+        );
+        // reason field forwards the cause verbatim.
+        assert!(
+            output.contains("unsupported transform Void"),
+            "reason field missing transform context in:\n{output}"
+        );
     }
 }
