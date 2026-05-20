@@ -113,6 +113,15 @@ impl TargetPartitionFilter {
     }
 }
 
+impl std::fmt::Display for TargetPartitionFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => write!(f, "None"),
+            Self::AllowList(set) => write!(f, "AllowList({} keys)", set.len()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,5 +199,19 @@ mod tests {
         let filter = TargetPartitionFilter::AllowList(std::collections::BTreeSet::new());
         assert!(!filter.matches(&key(1, "id", "1")));
         assert_eq!(filter.allow_list_len(), Some(0));
+    }
+
+    #[test]
+    fn target_partition_filter_display_summarizes_allow_list_size() {
+        let none = TargetPartitionFilter::None;
+        assert_eq!(format!("{none}"), "None");
+
+        let empty = TargetPartitionFilter::AllowList(std::collections::BTreeSet::new());
+        assert_eq!(format!("{empty}"), "AllowList(0 keys)");
+
+        let two = TargetPartitionFilter::AllowList(
+            [key(1, "id", "1"), key(1, "id", "2")].into_iter().collect(),
+        );
+        assert_eq!(format!("{two}"), "AllowList(2 keys)");
     }
 }
