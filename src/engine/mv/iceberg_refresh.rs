@@ -1881,8 +1881,31 @@ fn target_fqn_string(target: &IcebergMvTarget) -> String {
     format!("{}.{}.{}", target.catalog, target.namespace, target.table)
 }
 
+fn partition_filter_label(filter: &crate::engine::mv::partition::TargetPartitionFilter) -> &'static str {
+    match filter {
+        crate::engine::mv::partition::TargetPartitionFilter::None => "none",
+        crate::engine::mv::partition::TargetPartitionFilter::AllowList(_) => "allow_list",
+    }
+}
+
+fn partition_filter_count(filter: &crate::engine::mv::partition::TargetPartitionFilter) -> Option<usize> {
+    match filter {
+        crate::engine::mv::partition::TargetPartitionFilter::None => None,
+        crate::engine::mv::partition::TargetPartitionFilter::AllowList(set) => Some(set.len()),
+    }
+}
+
 fn wrap_aggregate_apply_error(target_fqn: &str, mv_id: i64, cause: String) -> String {
-    format!("iceberg aggregate MV apply failed (target={target_fqn}, mv_id={mv_id}): {cause}")
+    tracing::error!(
+        event = "iceberg_aggregate_mv.partition_derivation_failed",
+        mv_id = mv_id,
+        target_fqn = %target_fqn,
+        reason = %cause,
+        "iceberg aggregate MV apply failed"
+    );
+    format!(
+        "iceberg aggregate MV apply failed (target={target_fqn}, mv_id={mv_id}): {cause}"
+    )
 }
 
 fn build_aggregate_target_partition_filter(
@@ -1982,7 +2005,7 @@ fn apply_iceberg_aggregate_delta_chunks(
     let (partition_filter, touched_row_ids) =
         build_aggregate_target_partition_filter(layout, schema_contract, delta_chunks)
             .map_err(|e| wrap_aggregate_apply_error(&target_fqn, mv_id, e))?;
-    let (old_chunks, _lookup_stats) =
+    let (old_chunks, lookup_stats) =
         crate::engine::mv::iceberg_aggregate_state::load_touched_aggregate_target_state(
             target_table,
             layout,
@@ -2007,6 +2030,12 @@ fn apply_iceberg_aggregate_delta_chunks(
         mv_definition.last_refresh_rows.unwrap_or(0) - old_touched_rows + merge.new_total_rows;
     let delete_row_ids = merge.delete_row_ids.clone();
     let insert_chunks = merge.insert_chunks.clone();
+    let delete_row_count = merge.delete_row_ids.len();
+    let insert_chunk_row_count: usize = merge
+        .insert_chunks
+        .iter()
+        .map(|chunk| chunk.batch.num_rows())
+        .sum();
     if delete_row_ids.is_empty()
         && insert_chunks
             .iter()
@@ -2169,10 +2198,21 @@ fn apply_iceberg_aggregate_delta_chunks(
         published_snapshot_id,
     )?;
     tracing::info!(
-        "iceberg aggregate mv {}.{}.{}: incremental refresh complete: total_rows={new_total_rows} iceberg_snapshot={published_snapshot_id}",
-        target.catalog,
-        target.namespace,
-        target.table
+        event = "iceberg_aggregate_mv.apply",
+        mv_id = mv_id,
+        target_fqn = %target_fqn,
+        partition_filter = partition_filter_label(&partition_filter),
+        affected_partition_count = partition_filter_count(&partition_filter).unwrap_or(0),
+        touched_group_count = touched_row_ids.len(),
+        planned_file_count = lookup_stats.planned_file_count,
+        kept_file_count = lookup_stats.kept_file_count,
+        scanned_target_row_count = lookup_stats.scanned_row_count,
+        matched_target_row_count = lookup_stats.matched_row_count,
+        delete_row_count = delete_row_count,
+        insert_chunk_row_count = insert_chunk_row_count,
+        new_total_rows = new_total_rows,
+        iceberg_snapshot = published_snapshot_id,
+        "iceberg aggregate mv incremental refresh complete"
     );
     Ok(StatementResult::Ok)
 }
@@ -11211,5 +11251,58 @@ mod tests {
         assert!(err.contains("mv_id=4242"), "{err}");
         assert!(err.contains(target_fqn), "{err}");
         assert!(err.contains("void"), "{err}");
+    }
+
+    #[test]
+    fn tracing_field_partition_filter_label_renders_none_and_allow_list() {
+        use crate::engine::mv::partition::{
+            MvPartitionKey, MvPartitionKeyField, MvPartitionValue, TargetPartitionFilter,
+        };
+        let none = TargetPartitionFilter::None;
+        assert_eq!(partition_filter_label(&none), "none");
+        let allow = TargetPartitionFilter::AllowList(
+            [MvPartitionKey::new(
+                7,
+                vec![MvPartitionKeyField::new(
+                    "region".to_string(),
+                    MvPartitionValue::String("a".to_string()),
+                )],
+            )]
+            .into_iter()
+            .collect(),
+        );
+        assert_eq!(partition_filter_label(&allow), "allow_list");
+        let empty_allow = TargetPartitionFilter::AllowList(std::collections::BTreeSet::new());
+        assert_eq!(partition_filter_label(&empty_allow), "allow_list");
+    }
+
+    #[test]
+    fn tracing_field_partition_filter_count_returns_kept_size() {
+        use crate::engine::mv::partition::{
+            MvPartitionKey, MvPartitionKeyField, MvPartitionValue, TargetPartitionFilter,
+        };
+        let none = TargetPartitionFilter::None;
+        assert_eq!(partition_filter_count(&none), None);
+        let allow = TargetPartitionFilter::AllowList(
+            [
+                MvPartitionKey::new(
+                    7,
+                    vec![MvPartitionKeyField::new(
+                        "region".to_string(),
+                        MvPartitionValue::String("a".to_string()),
+                    )],
+                ),
+                MvPartitionKey::new(
+                    7,
+                    vec![MvPartitionKeyField::new(
+                        "region".to_string(),
+                        MvPartitionValue::String("b".to_string()),
+                    )],
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        assert_eq!(partition_filter_count(&allow), Some(2));
     }
 }
