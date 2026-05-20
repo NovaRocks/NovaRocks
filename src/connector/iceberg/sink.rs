@@ -564,6 +564,16 @@ struct ParquetWriteResult {
     file_size: u64,
     split_offsets: Option<Vec<i64>>,
     column_stats: Option<types::TIcebergColumnStats>,
+    /// Per-primitive-column Theta sketches keyed by Iceberg field id. None
+    /// when the sink could not compute sketches (e.g. schema lacks parquet
+    /// field-id metadata). Wrapped in `Option` so the existing
+    /// position-delete path that does not produce sketches stays cheap.
+    ///
+    /// NOTE: this field is populated but not yet consumed by the commit
+    /// action plumbing (Phase 2.3). The `dead_code` lint is suppressed
+    /// because the field is intentionally written ahead of its reader.
+    #[allow(dead_code)]
+    theta_sketches: Option<HashMap<i32, super::theta_sketch::ThetaSketchHandle>>,
 }
 
 #[derive(Default)]
@@ -996,7 +1006,11 @@ fn write_parquet_file(
         .close()
         .map_err(|e| format!("close parquet writer failed: {e}"))?;
     let meta = fs::metadata(&path_buf).map_err(|e| format!("stat parquet file failed: {e}"))?;
-    Ok(build_parquet_write_result(meta.len(), &parquet_metadata))
+    Ok(build_parquet_write_result(
+        meta.len(),
+        &parquet_metadata,
+        Some(batch),
+    ))
 }
 
 fn write_parquet_to_bytes(
@@ -1017,15 +1031,21 @@ fn write_parquet_to_bytes(
             .close()
             .map_err(|e| format!("close parquet writer failed: {e}"))?;
     }
-    let write_result = build_parquet_write_result(buffer.len() as u64, &parquet_metadata);
+    let write_result =
+        build_parquet_write_result(buffer.len() as u64, &parquet_metadata, Some(batch));
     Ok((buffer, write_result))
 }
 
-fn build_parquet_write_result(file_size: u64, metadata: &ParquetMetaData) -> ParquetWriteResult {
+fn build_parquet_write_result(
+    file_size: u64,
+    metadata: &ParquetMetaData,
+    batch: Option<&RecordBatch>,
+) -> ParquetWriteResult {
     ParquetWriteResult {
         file_size,
         split_offsets: collect_split_offsets(metadata),
         column_stats: collect_iceberg_column_stats(metadata),
+        theta_sketches: batch.and_then(collect_theta_sketches),
     }
 }
 
@@ -1121,6 +1141,247 @@ fn collect_iceberg_column_stats(metadata: &ParquetMetaData) -> Option<types::TIc
         lower_bounds: has_bounds.then_some(lower_bounds),
         upper_bounds: has_bounds.then_some(upper_bounds),
     })
+}
+
+/// Compute a Theta sketch per primitive column from the input RecordBatch.
+///
+/// Each Arrow `Field` whose metadata carries `PARQUET_FIELD_ID_META_KEY`
+/// becomes a `field_id → ThetaSketchHandle` entry; columns without a field
+/// id, or whose type is non-primitive (struct/list/map/binary), are skipped.
+///
+/// The hash is computed over the canonical byte representation of the value
+/// (little-endian for integers/floats, raw UTF-8 bytes for strings,
+/// IEEE 754 bytes for floats with NaN normalization). Nulls are not pushed
+/// into the sketch.
+///
+/// Returns `None` when no primitive column with a parquet field id is
+/// found — there is nothing to write into a Puffin blob in that case.
+fn collect_theta_sketches(
+    batch: &RecordBatch,
+) -> Option<HashMap<i32, super::theta_sketch::ThetaSketchHandle>> {
+    use arrow::array::{
+        BooleanArray, Date32Array, Date64Array, Decimal128Array, Float32Array, Float64Array,
+        Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray,
+    };
+    use arrow::datatypes::TimeUnit;
+
+    use super::theta_sketch::ThetaSketchHandle;
+
+    // Apache DataSketches Java/Spark default lg_k = 12 (k = 4096, ~1.5% error)
+    // matches the spec. Kept hard-coded here; the table property override is
+    // a follow-up wired through the sink plan.
+    const LG_K: u8 = 12;
+
+    let schema = batch.schema();
+    let mut sketches: HashMap<i32, ThetaSketchHandle> = HashMap::new();
+
+    for (col_idx, field) in schema.fields().iter().enumerate() {
+        let Some(field_id_str) = field.metadata().get(PARQUET_FIELD_ID_META_KEY) else {
+            continue;
+        };
+        let Ok(field_id) = field_id_str.parse::<i32>() else {
+            continue;
+        };
+        let array = batch.column(col_idx);
+        let mut sketch = ThetaSketchHandle::new(LG_K);
+        let mut updated = false;
+        match field.data_type() {
+            DataType::Boolean => {
+                if let Some(arr) = array.as_any().downcast_ref::<BooleanArray>() {
+                    for i in 0..arr.len() {
+                        if !arr.is_null(i) {
+                            let v: u8 = if arr.value(i) { 1 } else { 0 };
+                            sketch.update(v);
+                            updated = true;
+                        }
+                    }
+                }
+            }
+            DataType::Int8 => {
+                if let Some(arr) = array.as_any().downcast_ref::<Int8Array>() {
+                    for i in 0..arr.len() {
+                        if !arr.is_null(i) {
+                            sketch.update(arr.value(i));
+                            updated = true;
+                        }
+                    }
+                }
+            }
+            DataType::Int16 => {
+                if let Some(arr) = array.as_any().downcast_ref::<Int16Array>() {
+                    for i in 0..arr.len() {
+                        if !arr.is_null(i) {
+                            sketch.update(arr.value(i));
+                            updated = true;
+                        }
+                    }
+                }
+            }
+            DataType::Int32 => {
+                if let Some(arr) = array.as_any().downcast_ref::<Int32Array>() {
+                    for i in 0..arr.len() {
+                        if !arr.is_null(i) {
+                            sketch.update(arr.value(i));
+                            updated = true;
+                        }
+                    }
+                }
+            }
+            DataType::Int64 => {
+                if let Some(arr) = array.as_any().downcast_ref::<Int64Array>() {
+                    for i in 0..arr.len() {
+                        if !arr.is_null(i) {
+                            sketch.update(arr.value(i));
+                            updated = true;
+                        }
+                    }
+                }
+            }
+            DataType::Float32 => {
+                if let Some(arr) = array.as_any().downcast_ref::<Float32Array>() {
+                    for i in 0..arr.len() {
+                        if !arr.is_null(i) {
+                            // NaN normalization: collapse all NaNs to a single
+                            // canonical bit pattern before hashing so that two
+                            // independent NaN encodings count as one distinct
+                            // value.
+                            let v = arr.value(i);
+                            let bits = if v.is_nan() {
+                                f32::NAN.to_bits()
+                            } else {
+                                v.to_bits()
+                            };
+                            sketch.update(bits);
+                            updated = true;
+                        }
+                    }
+                }
+            }
+            DataType::Float64 => {
+                if let Some(arr) = array.as_any().downcast_ref::<Float64Array>() {
+                    for i in 0..arr.len() {
+                        if !arr.is_null(i) {
+                            let v = arr.value(i);
+                            let bits = if v.is_nan() {
+                                f64::NAN.to_bits()
+                            } else {
+                                v.to_bits()
+                            };
+                            sketch.update(bits);
+                            updated = true;
+                        }
+                    }
+                }
+            }
+            DataType::Date32 => {
+                if let Some(arr) = array.as_any().downcast_ref::<Date32Array>() {
+                    for i in 0..arr.len() {
+                        if !arr.is_null(i) {
+                            sketch.update(arr.value(i));
+                            updated = true;
+                        }
+                    }
+                }
+            }
+            DataType::Date64 => {
+                if let Some(arr) = array.as_any().downcast_ref::<Date64Array>() {
+                    for i in 0..arr.len() {
+                        if !arr.is_null(i) {
+                            sketch.update(arr.value(i));
+                            updated = true;
+                        }
+                    }
+                }
+            }
+            DataType::Timestamp(unit, _) => match unit {
+                TimeUnit::Second => {
+                    if let Some(arr) = array.as_any().downcast_ref::<TimestampSecondArray>() {
+                        for i in 0..arr.len() {
+                            if !arr.is_null(i) {
+                                sketch.update(arr.value(i));
+                                updated = true;
+                            }
+                        }
+                    }
+                }
+                TimeUnit::Millisecond => {
+                    if let Some(arr) = array.as_any().downcast_ref::<TimestampMillisecondArray>() {
+                        for i in 0..arr.len() {
+                            if !arr.is_null(i) {
+                                sketch.update(arr.value(i));
+                                updated = true;
+                            }
+                        }
+                    }
+                }
+                TimeUnit::Microsecond => {
+                    if let Some(arr) = array.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+                        for i in 0..arr.len() {
+                            if !arr.is_null(i) {
+                                sketch.update(arr.value(i));
+                                updated = true;
+                            }
+                        }
+                    }
+                }
+                TimeUnit::Nanosecond => {
+                    if let Some(arr) = array.as_any().downcast_ref::<TimestampNanosecondArray>() {
+                        for i in 0..arr.len() {
+                            if !arr.is_null(i) {
+                                sketch.update(arr.value(i));
+                                updated = true;
+                            }
+                        }
+                    }
+                }
+            },
+            DataType::Decimal128(_, _) => {
+                if let Some(arr) = array.as_any().downcast_ref::<Decimal128Array>() {
+                    for i in 0..arr.len() {
+                        if !arr.is_null(i) {
+                            sketch.update(arr.value(i));
+                            updated = true;
+                        }
+                    }
+                }
+            }
+            DataType::Utf8 => {
+                if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
+                    for i in 0..arr.len() {
+                        if !arr.is_null(i) {
+                            sketch.update(arr.value(i));
+                            updated = true;
+                        }
+                    }
+                }
+            }
+            DataType::LargeUtf8 => {
+                if let Some(arr) = array.as_any().downcast_ref::<LargeStringArray>() {
+                    for i in 0..arr.len() {
+                        if !arr.is_null(i) {
+                            sketch.update(arr.value(i));
+                            updated = true;
+                        }
+                    }
+                }
+            }
+            // Nested types (struct/list/map), binary, and other unsupported
+            // primitives are intentionally skipped — the Iceberg spec only
+            // requires NDV sketches for primitive scalar columns.
+            _ => {}
+        }
+        if updated {
+            sketches.insert(field_id, sketch);
+        }
+    }
+
+    if sketches.is_empty() {
+        None
+    } else {
+        Some(sketches)
+    }
 }
 
 fn merge_statistics(current: &mut Statistics, next: &Statistics) {

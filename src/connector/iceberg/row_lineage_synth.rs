@@ -213,8 +213,7 @@ mod tests {
     fn synthesize_row_id_uses_stored_when_present_and_non_null() {
         let schema = schema_with_stored_row_id();
         let id_col: ArrayRef = Arc::new(Int64Array::from(vec![100i64, 200, 300]));
-        let stored_row_id: ArrayRef =
-            Arc::new(Int64Array::from(vec![Some(42i64), None, Some(7)]));
+        let stored_row_id: ArrayRef = Arc::new(Int64Array::from(vec![Some(42i64), None, Some(7)]));
         let stored_seq: ArrayRef =
             Arc::new(Int64Array::from(vec![None as Option<i64>, None, None]));
         let columns = vec![id_col, stored_row_id, stored_seq];
@@ -241,14 +240,8 @@ mod tests {
         let id_col: ArrayRef = Arc::new(Int64Array::from(vec![100i64, 200]));
         let columns = vec![id_col];
 
-        let row_ids = synthesize_row_id(
-            &schema,
-            &columns,
-            2,
-            500,
-            Some(&[3, 9]),
-        )
-        .expect("synthesize ok");
+        let row_ids =
+            synthesize_row_id(&schema, &columns, 2, 500, Some(&[3, 9])).expect("synthesize ok");
 
         assert_eq!(row_ids, vec![503, 509]);
     }
@@ -257,10 +250,8 @@ mod tests {
     fn synthesize_last_updated_seq_uses_stored_when_non_null() {
         let schema = schema_with_stored_row_id();
         let id_col: ArrayRef = Arc::new(Int64Array::from(vec![100i64, 200]));
-        let stored_row_id: ArrayRef =
-            Arc::new(Int64Array::from(vec![None as Option<i64>, None]));
-        let stored_seq: ArrayRef =
-            Arc::new(Int64Array::from(vec![Some(11i64), None]));
+        let stored_row_id: ArrayRef = Arc::new(Int64Array::from(vec![None as Option<i64>, None]));
+        let stored_seq: ArrayRef = Arc::new(Int64Array::from(vec![Some(11i64), None]));
         let columns = vec![id_col, stored_row_id, stored_seq];
 
         let seqs = synthesize_last_updated_sequence_number(&schema, &columns, 2, 99)

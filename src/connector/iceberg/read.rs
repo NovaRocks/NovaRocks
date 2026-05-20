@@ -346,11 +346,13 @@ pub(crate) fn build_read_snapshot_at(
                 }
 
                 let null_counts = df.null_value_counts();
+                let value_counts = df.value_counts();
                 let col_sizes = df.column_sizes();
                 let lower = df.lower_bounds();
                 let upper = df.upper_bounds();
 
                 let has_any_stats = !null_counts.is_empty()
+                    || !value_counts.is_empty()
                     || !col_sizes.is_empty()
                     || !lower.is_empty()
                     || !upper.is_empty();
@@ -358,6 +360,7 @@ pub(crate) fn build_read_snapshot_at(
                 let column_stats = if has_any_stats {
                     let mut all_ids = std::collections::HashSet::new();
                     all_ids.extend(null_counts.keys());
+                    all_ids.extend(value_counts.keys());
                     all_ids.extend(col_sizes.keys());
                     all_ids.extend(lower.keys());
                     all_ids.extend(upper.keys());
@@ -377,6 +380,9 @@ pub(crate) fn build_read_snapshot_at(
                                 col_name.clone(),
                                 IcebergColumnStats {
                                     null_count: null_counts
+                                        .get(&fid)
+                                        .map(|&v| i64::try_from(v).unwrap_or(i64::MAX)),
+                                    value_count: value_counts
                                         .get(&fid)
                                         .map(|&v| i64::try_from(v).unwrap_or(i64::MAX)),
                                     column_size: col_sizes

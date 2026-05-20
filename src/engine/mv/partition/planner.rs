@@ -165,6 +165,7 @@ mod tests {
             partition_values: vec![partition_value(value)],
             first_row_id: None,
             data_sequence_number: None,
+            row_id_allow_list: None,
         }
     }
 

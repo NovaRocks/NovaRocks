@@ -2569,7 +2569,11 @@ fn collect_scan_stats(
         LogicalPlan::Scan(s) => {
             if let crate::sql::catalog::TableStorage::S3ParquetFiles { files, .. } =
                 &s.table.storage
-                && let Some(ts) = crate::sql::optimizer::statistics::build_table_statistics(files)
+                && let Some(ts) =
+                    crate::sql::optimizer::statistics::build_table_statistics_with_columns(
+                        files,
+                        &s.table.columns,
+                    )
             {
                 // Insert by table name (canonical key).
                 out.insert(s.table.name.clone(), ts.clone());

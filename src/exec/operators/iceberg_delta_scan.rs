@@ -567,8 +567,9 @@ fn append_data_file_lineage_columns(
     let pos_values: Vec<i64> = (0..row_count as i64).map(|i| pos_start + i).collect();
 
     // V3-compliant synthesis: stored column wins, fall back to first_row_id + pos.
-    let stored_idx =
-        crate::connector::iceberg::row_lineage_synth::stored_row_lineage_indices(batch.schema().as_ref());
+    let stored_idx = crate::connector::iceberg::row_lineage_synth::stored_row_lineage_indices(
+        batch.schema().as_ref(),
+    );
     let row_id_values = crate::connector::iceberg::row_lineage_synth::synthesize_row_id(
         batch.schema().as_ref(),
         batch.columns(),
@@ -916,12 +917,11 @@ mod tests {
             stored_row_id_field,
         ]));
         let id_col: ArrayRef = std::sync::Arc::new(Int64Array::from(vec![100i64, 200]));
-        let stored_col: ArrayRef =
-            std::sync::Arc::new(Int64Array::from(vec![Some(42i64), None]));
+        let stored_col: ArrayRef = std::sync::Arc::new(Int64Array::from(vec![Some(42i64), None]));
         let batch = RecordBatch::try_new(schema, vec![id_col, stored_col]).expect("batch");
 
-        let out = append_data_file_lineage_columns(&batch, "f.parquet", 7, 1000, 99)
-            .expect("append ok");
+        let out =
+            append_data_file_lineage_columns(&batch, "f.parquet", 7, 1000, 99).expect("append ok");
 
         let out_schema = out.schema();
         let names: Vec<&str> = out_schema
@@ -931,7 +931,13 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["id", "_file", "_pos", "_row_id", "_last_updated_sequence_number"]
+            vec![
+                "id",
+                "_file",
+                "_pos",
+                "_row_id",
+                "_last_updated_sequence_number"
+            ]
         );
 
         let row_ids = out
@@ -939,7 +945,11 @@ mod tests {
             .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
             .expect("row id array");
         assert_eq!(row_ids.value(0), 42, "stored row id wins on row 0");
-        assert_eq!(row_ids.value(1), 1008, "fallback first_row_id + position on row 1");
+        assert_eq!(
+            row_ids.value(1),
+            1008,
+            "fallback first_row_id + position on row 1"
+        );
     }
 
     #[test]
@@ -955,8 +965,8 @@ mod tests {
         let id_col: ArrayRef = std::sync::Arc::new(Int64Array::from(vec![100i64, 200, 300]));
         let batch = RecordBatch::try_new(schema, vec![id_col]).expect("batch");
 
-        let out = append_data_file_lineage_columns(&batch, "g.parquet", 0, 500, 12)
-            .expect("append ok");
+        let out =
+            append_data_file_lineage_columns(&batch, "g.parquet", 0, 500, 12).expect("append ok");
 
         let row_ids = out
             .column_by_name("_row_id")

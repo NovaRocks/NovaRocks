@@ -3352,6 +3352,7 @@ mod tests {
                 "id".to_string(),
                 IcebergColumnStats {
                     null_count: Some(0),
+                    value_count: None,
                     column_size: None,
                     lower_bound: Some(min.to_le_bytes().to_vec()),
                     upper_bound: Some(max.to_le_bytes().to_vec()),

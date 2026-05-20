@@ -32,6 +32,10 @@ pub struct LegacyRangePartition {
 #[derive(Clone, Debug)]
 pub struct IcebergColumnStats {
     pub null_count: Option<i64>,
+    /// Total value count (including nulls) from manifest `value_counts`. The
+    /// optimizer treats this as an upper bound on NDV when no precise Puffin
+    /// sketch is available.
+    pub value_count: Option<i64>,
     pub column_size: Option<i64>,
     pub lower_bound: Option<Vec<u8>>,
     pub upper_bound: Option<Vec<u8>>,
