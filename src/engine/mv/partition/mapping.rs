@@ -221,4 +221,20 @@ mod tests {
         assert!(err.contains("unsupported partition value"));
         assert!(err.contains("binary partition value"));
     }
+
+    #[test]
+    fn change_partition_field_values_is_reachable_for_mv_partition_module() {
+        use crate::connector::iceberg::changes::change_partition_field_values;
+        // We do not need to drive Iceberg metadata in a unit test — just make
+        // sure the symbol is visible at the call site. If this fn ever becomes
+        // private again, this test will fail to compile.
+        let _fn_ptr: fn(
+            &iceberg::spec::TableMetadata,
+            i32,
+            &iceberg::spec::Struct,
+        ) -> Result<
+            Vec<crate::connector::iceberg::changes::ChangePartitionFieldValue>,
+            crate::connector::iceberg::changes::ChangeError,
+        > = change_partition_field_values;
+    }
 }

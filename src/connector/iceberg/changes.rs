@@ -259,7 +259,7 @@ fn iceberg_partition_key(partition: &iceberg::spec::Struct) -> Option<String> {
     }
 }
 
-fn change_partition_field_values(
+pub(crate) fn change_partition_field_values(
     metadata: &iceberg::spec::TableMetadata,
     spec_id: i32,
     partition: &iceberg::spec::Struct,
@@ -293,7 +293,7 @@ fn change_partition_field_values(
     Ok(values)
 }
 
-fn change_partition_transform_name(transform: &iceberg::spec::Transform) -> String {
+pub(crate) fn change_partition_transform_name(transform: &iceberg::spec::Transform) -> String {
     match transform {
         iceberg::spec::Transform::Identity => "identity".to_string(),
         other => format!("{other:?}").to_ascii_lowercase(),
