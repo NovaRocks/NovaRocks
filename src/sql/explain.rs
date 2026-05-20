@@ -15,6 +15,22 @@ use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
 use crate::sql::optimizer::property::DistributionSpec;
 use crate::sql::planner::plan::LogicalPlan;
 
+/// Build the per-node `stats={...}` trailer surfaced under
+/// `Verbose | Costs | Analyze` levels. Future PRs (OPT-3 NDV, OPT-4
+/// distribution) append keys after `rows=`; never reorder existing
+/// keys — golden files depend on stable ordering.
+pub(crate) fn format_stats_trailer(
+    stats: &crate::sql::optimizer::statistics::Statistics,
+) -> String {
+    let rows = stats.output_row_count;
+    let rows_str: String = if rows.is_nan() || rows <= 0.0 {
+        "?".to_string()
+    } else {
+        (rows.round() as i64).to_string()
+    };
+    format!("stats={{rows={rows_str}}}")
+}
+
 /// Detail level for EXPLAIN output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ExplainLevel {
@@ -274,6 +290,14 @@ fn format_physical_node(
     } else {
         String::new()
     };
+    let stats_suffix = if matches!(
+        level,
+        ExplainLevel::Verbose | ExplainLevel::Costs | ExplainLevel::Analyze
+    ) {
+        format!(" {}", format_stats_trailer(&node.stats))
+    } else {
+        String::new()
+    };
 
     match &node.op {
         Operator::PhysicalScan(op) => {
@@ -283,7 +307,7 @@ fn format_physical_node(
                 .map(|a| format!(" (alias={a})"))
                 .unwrap_or_default();
             out.push(format!(
-                "{pad}SCAN {}.{}{alias}{costs_suffix}",
+                "{pad}SCAN {}.{}{alias}{costs_suffix}{stats_suffix}",
                 op.database, op.table.name
             ));
             out.push(format!(
@@ -318,7 +342,7 @@ fn format_physical_node(
             }
         }
         Operator::PhysicalFilter(op) => {
-            out.push(format!("{pad}FILTER{costs_suffix}"));
+            out.push(format!("{pad}FILTER{costs_suffix}{stats_suffix}"));
             out.push(format!("{pad}  predicate: {}", format_expr(&op.predicate)));
             for child in &node.children {
                 format_physical_node(child, level, indent + 1, out);
@@ -337,7 +361,10 @@ fn format_physical_node(
                     }
                 })
                 .collect();
-            out.push(format!("{pad}PROJECT [{}]{costs_suffix}", items.join(", ")));
+            out.push(format!(
+                "{pad}PROJECT [{}]{costs_suffix}{stats_suffix}",
+                items.join(", ")
+            ));
             for child in &node.children {
                 format_physical_node(child, level, indent + 1, out);
             }
@@ -372,7 +399,7 @@ fn format_physical_node(
                 })
                 .collect();
             out.push(format!(
-                "{pad}HASH JOIN ({dist}, {join_str}, eq: [{}]){costs_suffix}",
+                "{pad}HASH JOIN ({dist}, {join_str}, eq: [{}]){costs_suffix}{stats_suffix}",
                 eq.join(", ")
             ));
             if let Some(ref other) = op.other_condition {
@@ -394,7 +421,9 @@ fn format_physical_node(
                 JoinKind::LeftAnti => "LEFT ANTI",
                 JoinKind::RightAnti => "RIGHT ANTI",
             };
-            out.push(format!("{pad}NEST LOOP JOIN ({join_str}){costs_suffix}"));
+            out.push(format!(
+                "{pad}NEST LOOP JOIN ({join_str}){costs_suffix}{stats_suffix}"
+            ));
             if let Some(ref cond) = op.condition {
                 out.push(format!("{pad}  on: {}", format_expr(cond)));
             }
@@ -424,7 +453,7 @@ fn format_physical_node(
             if !groups.is_empty() {
                 let _ = write!(detail, ", group by: [{}]", groups.join(", "));
             }
-            let _ = write!(detail, "){costs_suffix}");
+            let _ = write!(detail, "){costs_suffix}{stats_suffix}");
             out.push(detail);
             if !aggs.is_empty() {
                 out.push(format!("{pad}  aggregations: {}", aggs.join(", ")));
@@ -447,7 +476,10 @@ fn format_physical_node(
                     format!("{} {dir}{nulls}", format_expr(&s.expr))
                 })
                 .collect();
-            out.push(format!("{pad}SORT BY [{}]{costs_suffix}", items.join(", ")));
+            out.push(format!(
+                "{pad}SORT BY [{}]{costs_suffix}{stats_suffix}",
+                items.join(", ")
+            ));
             for child in &node.children {
                 format_physical_node(child, level, indent + 1, out);
             }
@@ -474,7 +506,7 @@ fn format_physical_node(
                 parts.push(format!("offset={o}"));
             }
             out.push(format!(
-                "{pad}TOP-N ({}) [{}]{costs_suffix}",
+                "{pad}TOP-N ({}) [{}]{costs_suffix}{stats_suffix}",
                 parts.join(", "),
                 items.join(", ")
             ));
@@ -490,7 +522,10 @@ fn format_physical_node(
             if let Some(offset) = op.offset {
                 parts.push(format!("offset={offset}"));
             }
-            out.push(format!("{pad}LIMIT [{}]{costs_suffix}", parts.join(", ")));
+            out.push(format!(
+                "{pad}LIMIT [{}]{costs_suffix}{stats_suffix}",
+                parts.join(", ")
+            ));
             for child in &node.children {
                 format_physical_node(child, level, indent + 1, out);
             }
@@ -510,7 +545,7 @@ fn format_physical_node(
                     format!("HASH EXCHANGE (hash: [{}])", col_names.join(", "))
                 }
             };
-            out.push(format!("{pad}{label}{costs_suffix}"));
+            out.push(format!("{pad}{label}{costs_suffix}{stats_suffix}"));
             for child in &node.children {
                 format_physical_node(child, level, indent + 1, out);
             }
@@ -524,14 +559,17 @@ fn format_physical_node(
                     format!("{}({})", w.name, args.join(", "))
                 })
                 .collect();
-            out.push(format!("{pad}WINDOW [{}]{costs_suffix}", fns.join("; ")));
+            out.push(format!(
+                "{pad}WINDOW [{}]{costs_suffix}{stats_suffix}",
+                fns.join("; ")
+            ));
             for child in &node.children {
                 format_physical_node(child, level, indent + 1, out);
             }
         }
         Operator::PhysicalCTEAnchor(op) => {
             out.push(format!(
-                "{pad}CTE ANCHOR (cte_id={}){costs_suffix}",
+                "{pad}CTE ANCHOR (cte_id={}){costs_suffix}{stats_suffix}",
                 op.cte_id
             ));
             for child in &node.children {
@@ -540,7 +578,7 @@ fn format_physical_node(
         }
         Operator::PhysicalCTEProduce(op) => {
             out.push(format!(
-                "{pad}CTE PRODUCE (cte_id={}){costs_suffix}",
+                "{pad}CTE PRODUCE (cte_id={}){costs_suffix}{stats_suffix}",
                 op.cte_id
             ));
             for child in &node.children {
@@ -549,13 +587,13 @@ fn format_physical_node(
         }
         Operator::PhysicalCTEConsume(op) => {
             out.push(format!(
-                "{pad}CTE CONSUME (cte_id={}){costs_suffix}",
+                "{pad}CTE CONSUME (cte_id={}){costs_suffix}{stats_suffix}",
                 op.cte_id
             ));
         }
         Operator::PhysicalRepeat(op) => {
             out.push(format!(
-                "{pad}REPEAT ({} grouping sets){costs_suffix}",
+                "{pad}REPEAT ({} grouping sets){costs_suffix}{stats_suffix}",
                 op.grouping_ids.len()
             ));
             for child in &node.children {
@@ -564,39 +602,39 @@ fn format_physical_node(
         }
         Operator::PhysicalUnion(op) => {
             let kind = if op.all { "UNION ALL" } else { "UNION" };
-            out.push(format!("{pad}{kind}{costs_suffix}"));
+            out.push(format!("{pad}{kind}{costs_suffix}{stats_suffix}"));
             for child in &node.children {
                 format_physical_node(child, level, indent + 1, out);
             }
         }
         Operator::PhysicalIntersect(_) => {
-            out.push(format!("{pad}INTERSECT{costs_suffix}"));
+            out.push(format!("{pad}INTERSECT{costs_suffix}{stats_suffix}"));
             for child in &node.children {
                 format_physical_node(child, level, indent + 1, out);
             }
         }
         Operator::PhysicalExcept(_) => {
-            out.push(format!("{pad}EXCEPT{costs_suffix}"));
+            out.push(format!("{pad}EXCEPT{costs_suffix}{stats_suffix}"));
             for child in &node.children {
                 format_physical_node(child, level, indent + 1, out);
             }
         }
         Operator::PhysicalValues(op) => {
             out.push(format!(
-                "{pad}VALUES ({} rows){costs_suffix}",
+                "{pad}VALUES ({} rows){costs_suffix}{stats_suffix}",
                 op.rows.len()
             ));
         }
         Operator::PhysicalGenerateSeries(op) => {
             out.push(format!(
-                "{pad}GENERATE_SERIES({}, {}, {}){costs_suffix}",
+                "{pad}GENERATE_SERIES({}, {}, {}){costs_suffix}{stats_suffix}",
                 op.start, op.end, op.step
             ));
         }
         Operator::PhysicalTableFunction(op) => {
             let join_type = if op.is_left_join { "LEFT" } else { "CROSS" };
             out.push(format!(
-                "{pad}TABLE_FUNCTION [{} {}]{costs_suffix}",
+                "{pad}TABLE_FUNCTION [{} {}]{costs_suffix}{stats_suffix}",
                 join_type,
                 op.function_name.to_uppercase()
             ));
@@ -605,14 +643,19 @@ fn format_physical_node(
             }
         }
         Operator::PhysicalSubqueryAlias(op) => {
-            out.push(format!("{pad}SUBQUERY ALIAS [{}]{costs_suffix}", op.alias));
+            out.push(format!(
+                "{pad}SUBQUERY ALIAS [{}]{costs_suffix}{stats_suffix}",
+                op.alias
+            ));
             for child in &node.children {
                 format_physical_node(child, level, indent + 1, out);
             }
         }
         // Logical operators should not appear in physical plan
         _ => {
-            out.push(format!("{pad}<logical operator>{costs_suffix}"));
+            out.push(format!(
+                "{pad}<logical operator>{costs_suffix}{stats_suffix}"
+            ));
         }
     }
 }
@@ -1128,7 +1171,7 @@ mod tests {
 
     use arrow::datatypes::{DataType, Field, Fields};
 
-    use super::{ExplainLevel, explain_physical_plan};
+    use super::{ExplainLevel, explain_physical_plan, format_stats_trailer};
     use crate::sql::analysis::OutputColumn;
     use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
     use crate::sql::optimizer::operator::{Operator, PhysicalScanOp};
@@ -1337,5 +1380,67 @@ mod tests {
             )),
             "verbose explain lines: {lines:?}"
         );
+    }
+
+    #[test]
+    fn stats_trailer_emits_rows_question_mark_for_unset_stats() {
+        let stats = Statistics {
+            output_row_count: 0.0,
+            column_statistics: HashMap::new(),
+        };
+        assert_eq!(format_stats_trailer(&stats), "stats={rows=?}");
+    }
+
+    #[test]
+    fn stats_trailer_emits_rows_value_for_positive_estimate() {
+        let stats = Statistics {
+            output_row_count: 123.7,
+            column_statistics: HashMap::new(),
+        };
+        assert_eq!(format_stats_trailer(&stats), "stats={rows=124}");
+    }
+
+    #[test]
+    fn stats_trailer_emits_question_mark_for_nan() {
+        let stats = Statistics {
+            output_row_count: f64::NAN,
+            column_statistics: HashMap::new(),
+        };
+        assert_eq!(format_stats_trailer(&stats), "stats={rows=?}");
+    }
+
+    #[test]
+    fn stats_trailer_emits_question_mark_for_negative() {
+        let stats = Statistics {
+            output_row_count: -1.0,
+            column_statistics: HashMap::new(),
+        };
+        assert_eq!(format_stats_trailer(&stats), "stats={rows=?}");
+    }
+
+    #[test]
+    fn verbose_explain_includes_stats_trailer_on_scan() {
+        let plan = build_minimal_scan_plan_for_explain_test();
+        let lines = explain_physical_plan(&plan, ExplainLevel::Verbose);
+        let scan_line = lines
+            .iter()
+            .find(|l| l.contains("SCAN"))
+            .expect("scan line");
+        assert!(
+            scan_line.contains("stats={rows="),
+            "scan node should end with stats trailer: {scan_line}"
+        );
+    }
+
+    #[test]
+    fn normal_level_does_not_include_stats_trailer() {
+        let plan = build_minimal_scan_plan_for_explain_test();
+        let lines = explain_physical_plan(&plan, ExplainLevel::Normal);
+        for line in &lines {
+            assert!(
+                !line.contains("stats={rows="),
+                "Normal level must not include stats trailer: {line}"
+            );
+        }
     }
 }
