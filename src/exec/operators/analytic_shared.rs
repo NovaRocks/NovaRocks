@@ -2824,7 +2824,20 @@ fn compute_frames_for_partition(
         return Ok(Vec::new());
     }
     let Some(w) = window else {
-        return Ok(vec![(part_start, part_end); n]);
+        // SQL standard default frame:
+        //   - with ORDER BY: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        //     (current row expands to the end of its peer group);
+        //   - without ORDER BY: the whole partition.
+        // `compute_peer_groups` returns a single (part_start, part_end) group
+        // when there are no order keys, so both cases collapse onto the
+        // peer-group expansion below.
+        let mut out = Vec::with_capacity(n);
+        for (g_start, g_end) in peer_groups {
+            for _ in *g_start..*g_end {
+                out.push((part_start, *g_end));
+            }
+        }
+        return Ok(out);
     };
 
     match w.window_type {
@@ -3042,5 +3055,102 @@ mod tests {
         let out_arr = out.as_any().downcast_ref::<Int32Array>().unwrap();
         let actual: Vec<i32> = (0..out_arr.len()).map(|i| out_arr.value(i)).collect();
         assert_eq!(actual, vec![10, 10, 10, 20]);
+    }
+
+    // SQL standard default frame with ORDER BY is RANGE BETWEEN UNBOUNDED
+    // PRECEDING AND CURRENT ROW. For first_value(... IGNORE NULLS) this means
+    // a leading NULL produces NULL (the frame only contains the leading row),
+    // not the partition's first non-null value.
+    #[test]
+    fn first_value_ignore_nulls_default_frame_returns_null_for_leading_null() {
+        // Partition layout matches v1=2 in sql-tests/analytic/analytic_test_ignore_nulls:
+        // v2: 1 2 3 4 5 6
+        // v3: NULL 2 NULL 4 NULL 6
+        let values = Arc::new(Int32Array::from(vec![
+            None,
+            Some(2),
+            None,
+            Some(4),
+            None,
+            Some(6),
+        ])) as ArrayRef;
+        let order = Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6])) as ArrayRef;
+
+        let partitions = vec![(0usize, 6usize)];
+        // window = None -> SQL default: RANGE UNBOUNDED PRECEDING ~ CURRENT ROW
+        let out = compute_first_last_value(
+            std::slice::from_ref(&values),
+            &partitions,
+            &[order],
+            None,
+            true,
+            true,
+            6,
+        )
+        .unwrap();
+        let out_arr = out.as_any().downcast_ref::<Int32Array>().unwrap();
+        let actual: Vec<Option<i32>> = (0..out_arr.len())
+            .map(|i| {
+                if out_arr.is_null(i) {
+                    None
+                } else {
+                    Some(out_arr.value(i))
+                }
+            })
+            .collect();
+        // Row 0: frame=[0,1), only NULL                 -> NULL
+        // Row 1: frame=[0,2), first non-null at row 1   -> 2
+        // Row 2..5: first non-null still row 1          -> 2
+        assert_eq!(
+            actual,
+            vec![None, Some(2), Some(2), Some(2), Some(2), Some(2)]
+        );
+    }
+
+    // Last value with default frame should reflect the running window
+    // [partition_start, current_peer_group_end), not the entire partition.
+    #[test]
+    fn last_value_default_frame_is_running_not_full_partition() {
+        let values = Arc::new(Int32Array::from(vec![Some(10), Some(20), Some(30)])) as ArrayRef;
+        let order = Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef;
+        let partitions = vec![(0usize, 3usize)];
+
+        let out = compute_first_last_value(
+            std::slice::from_ref(&values),
+            &partitions,
+            &[order],
+            None,
+            false,
+            false,
+            3,
+        )
+        .unwrap();
+        let out_arr = out.as_any().downcast_ref::<Int32Array>().unwrap();
+        let actual: Vec<i32> = (0..out_arr.len()).map(|i| out_arr.value(i)).collect();
+        assert_eq!(actual, vec![10, 20, 30]);
+    }
+
+    // Without ORDER BY (single peer group covering the whole partition),
+    // the default frame is the full partition.
+    #[test]
+    fn first_value_no_order_by_uses_full_partition() {
+        let values = Arc::new(Int32Array::from(vec![Some(10), Some(20), Some(30)])) as ArrayRef;
+        // order_keys empty -> compute_peer_groups returns [(0, 3)]
+        let order_keys: Vec<ArrayRef> = Vec::new();
+        let partitions = vec![(0usize, 3usize)];
+
+        let out = compute_first_last_value(
+            std::slice::from_ref(&values),
+            &partitions,
+            &order_keys,
+            None,
+            false,
+            true,
+            3,
+        )
+        .unwrap();
+        let out_arr = out.as_any().downcast_ref::<Int32Array>().unwrap();
+        let actual: Vec<i32> = (0..out_arr.len()).map(|i| out_arr.value(i)).collect();
+        assert_eq!(actual, vec![10, 10, 10]);
     }
 }

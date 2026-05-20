@@ -1699,10 +1699,22 @@ impl DataStreamSinkOperator {
         self.ensure_pending_buffers_initialized();
         let dests = self.destinations().to_vec();
         let per_dest_chunks = self.partition_chunk(&chunk)?;
-        for (i, mut chunks) in per_dest_chunks.into_iter().enumerate() {
+        for (i, chunks) in per_dest_chunks.into_iter().enumerate() {
             if chunks.is_empty() || Self::is_pseudo_destination(&dests[i]) {
                 continue;
             }
+            // Upstream operators (notably hash join with a high per-key
+            // fan-out) can emit a single chunk many MB in size — large enough
+            // that its Arrow-IPC encoding exceeds `GRPC_MAX_MESSAGE_BYTES`
+            // (64 MiB), causing h2 to reject the payload with a generic
+            // protocol error. Slice oversize chunks down well below the wire
+            // limit, but keep the slices large enough that downstream
+            // per-chunk overhead (sort/analytic frame buffers) does not blow
+            // up from a 360× fan-out. The drainer batches smaller chunks
+            // back together up to `max_transmit_batched_bytes` per gRPC
+            // payload, so the slice size is a hard upper bound only.
+            let max_chunk_bytes = OVERSIZED_CHUNK_SPLIT_TARGET_BYTES;
+            let mut chunks = split_oversized_chunks(chunks, max_chunk_bytes);
             if let Some(tracker) = self.pending_chunks_mem_tracker.as_ref() {
                 for chunk in chunks.iter_mut() {
                     chunk.transfer_to(tracker);
@@ -1983,6 +1995,46 @@ impl DataStreamSinkFinishState {
     }
 }
 
+/// Target slice size for [`split_oversized_chunks`]. Sits well below
+/// `GRPC_MAX_MESSAGE_BYTES` (64 MiB) so even with Arrow-IPC framing overhead
+/// the encoded payload stays under the wire limit, while large enough that a
+/// runaway hash-join chunk produces only a handful of slices — not the
+/// hundreds we'd get if we reused the much smaller `max_transmit_batched_bytes`
+/// (256 KiB) value, which blew up downstream window-operator per-chunk
+/// bookkeeping for the F1-with_join JOIN-then-window pipeline.
+const OVERSIZED_CHUNK_SPLIT_TARGET_BYTES: usize = 16 * 1024 * 1024;
+
+/// Slice each chunk that exceeds `target_bytes` in memory into a series of
+/// smaller chunks whose individual in-memory size sits at or below the
+/// target. The split row count is derived from the chunk's average per-row
+/// memory footprint, so wide rows yield smaller slices and narrow rows yield
+/// larger ones. Chunks already under the target are returned untouched.
+fn split_oversized_chunks(chunks: Vec<Chunk>, target_bytes: usize) -> Vec<Chunk> {
+    let target_bytes = target_bytes.max(1);
+    let mut out = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        let bytes = chunk.batch.get_array_memory_size();
+        let rows = chunk.batch.num_rows();
+        if rows <= 1 || bytes <= target_bytes {
+            out.push(chunk);
+            continue;
+        }
+        // ceil_div(bytes, target_bytes) — number of slices needed for the
+        // chunk to fit under the target. `bytes_per_row` is the implied
+        // per-row footprint; rows_per_slice is sized so that one slice is
+        // ~target_bytes.
+        let bytes_per_row = bytes.div_ceil(rows).max(1);
+        let rows_per_slice = (target_bytes / bytes_per_row).max(1);
+        let mut offset = 0;
+        while offset < rows {
+            let len = rows_per_slice.min(rows - offset);
+            out.push(chunk.slice(offset, len));
+            offset += len;
+        }
+    }
+    out
+}
+
 fn project_chunk_by_slot_ids(chunk: &Chunk, slot_ids: &[SlotId]) -> Result<Chunk, String> {
     if slot_ids.is_empty() || chunk.is_empty() {
         return Ok(chunk.clone());
@@ -2205,5 +2257,58 @@ mod tests {
                 .sum::<usize>(),
             3
         );
+    }
+
+    fn int64_chunk(rows: usize) -> Chunk {
+        let array = Arc::new(arrow::array::Int64Array::from_iter_values(0..rows as i64))
+            as arrow::array::ArrayRef;
+        let field = Arc::new(Field::new("v", DataType::Int64, false));
+        let schema = Arc::new(Schema::new(vec![field.as_ref().clone()]));
+        let batch = arrow::array::RecordBatch::try_new(schema, vec![array]).expect("batch");
+        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId(1)],
+        )
+        .expect("chunk schema");
+        Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk")
+    }
+
+    #[test]
+    fn split_oversized_chunks_passes_small_chunks_through_unchanged() {
+        let chunks = vec![int64_chunk(8)];
+        let out = split_oversized_chunks(chunks, 1024 * 1024);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].batch.num_rows(), 8);
+    }
+
+    #[test]
+    fn split_oversized_chunks_slices_large_chunk_into_pieces_with_row_count_preserved() {
+        // 10_000 int64 rows ≈ 80 KiB in-memory. Slice at a 8 KiB target. The
+        // sliced chunks share the underlying Arrow buffers and therefore
+        // still report the same `get_array_memory_size`, but the encoded IPC
+        // payload (which is the wire size we actually care about) is sized
+        // to the logical row range, so the slice count and row preservation
+        // are what matters here.
+        let rows = 10_000;
+        let target_bytes = 8 * 1024;
+        let chunks = vec![int64_chunk(rows)];
+        let out = split_oversized_chunks(chunks, target_bytes);
+        assert!(out.len() > 1, "expected multiple slices, got {}", out.len());
+        let total_rows: usize = out.iter().map(|c| c.batch.num_rows()).sum();
+        assert_eq!(total_rows, rows);
+        for piece in &out {
+            assert!(piece.batch.num_rows() > 0, "slice produced zero-row chunk");
+        }
+    }
+
+    #[test]
+    fn split_oversized_chunks_handles_single_row_oversized_chunk() {
+        // A chunk with a single row that nonetheless exceeds the target
+        // (e.g. a very wide row) should be returned untouched rather than
+        // split into zero-row slices.
+        let chunks = vec![int64_chunk(1)];
+        let out = split_oversized_chunks(chunks, 1);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].batch.num_rows(), 1);
     }
 }

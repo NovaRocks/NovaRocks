@@ -83,7 +83,7 @@ pub(super) fn sql_type_to_arrow(sql_type: &sqlast::DataType) -> Result<DataType,
             sqlast::ExactNumberInfo::Precision(p) => Ok(DataType::Decimal128(*p as u8, 0)),
             sqlast::ExactNumberInfo::None => Ok(DataType::Decimal128(38, 0)),
         },
-        sqlast::DataType::Custom(name, _) => {
+        sqlast::DataType::Custom(name, modifiers) => {
             let type_name = name.to_string().to_lowercase();
             match type_name.as_str() {
                 "string" => Ok(DataType::Utf8),
@@ -95,6 +95,14 @@ pub(super) fn sql_type_to_arrow(sql_type: &sqlast::DataType) -> Result<DataType,
                 "array" => custom_array_type_to_arrow(sql_type),
                 "map" => custom_map_type_to_arrow(sql_type),
                 "struct" => custom_struct_type_to_arrow(sql_type),
+                // StarRocks-style storage-width decimal aliases. Arrow only has
+                // Decimal128 (and Decimal256) — the 32/64/128 distinction is a
+                // StarRocks storage optimization, not a logical type. Map all
+                // three to Decimal128 with the requested precision/scale.
+                "decimal32" | "decimal64" | "decimal128" => {
+                    let (precision, scale) = parse_custom_decimal_modifiers(modifiers);
+                    Ok(DataType::Decimal128(precision, scale))
+                }
                 _ => Err(format!("unsupported SQL type: {name}")),
             }
         }
@@ -157,6 +165,24 @@ fn custom_array_type_to_arrow(sql_type: &sqlast::DataType) -> Result<DataType, S
     }
     let item = custom_field_with_logical_type("item", &modifiers[0])?;
     Ok(DataType::List(Arc::new(item)))
+}
+
+/// Parse precision and scale from custom decimal-width type modifiers like
+/// `decimal64(18, 5)` → `["18", "5"]`. Defaults to `(38, 0)` when the
+/// modifiers are missing or unparseable, matching the parser-side helper.
+fn parse_custom_decimal_modifiers(modifiers: &[String]) -> (u8, i8) {
+    match modifiers.len() {
+        0 => (38, 0),
+        1 => {
+            let p = modifiers[0].trim().parse::<u8>().unwrap_or(38);
+            (p, 0)
+        }
+        _ => {
+            let p = modifiers[0].trim().parse::<u8>().unwrap_or(38);
+            let s = modifiers[1].trim().parse::<i8>().unwrap_or(0);
+            (p, s)
+        }
+    }
 }
 
 fn custom_map_type_to_arrow(sql_type: &sqlast::DataType) -> Result<DataType, String> {
@@ -947,11 +973,12 @@ fn format_function_display_name(function: &sqlast::Function) -> String {
     if canonical_name == "map" {
         return format_map_display_name(function);
     }
+    let formatted_args =
+        format_function_arguments_with_ignore_nulls_after_first(&function.args, &canonical_name)
+            .unwrap_or_else(|| format_function_arguments(&function.args));
     let mut out = format!(
         "{}{}{}",
-        canonical_name,
-        function.parameters,
-        format_function_arguments(&function.args)
+        canonical_name, function.parameters, formatted_args
     );
     if !function.within_group.is_empty() {
         out.push_str(" WITHIN GROUP (ORDER BY ");
@@ -982,6 +1009,63 @@ fn format_function_display_name(function: &sqlast::Function) -> String {
         out.push_str(&format_window_display_name(over));
     }
     out
+}
+
+/// StarRocks-style display for `LEAD(v IGNORE NULLS, n)` / `LAG(v IGNORE NULLS, n)` /
+/// `NTH_VALUE(v IGNORE NULLS, n)`: the modifier appears between the first arg and the
+/// remaining args, not at the end of the argument list. sqlparser's standard rendering
+/// places `IgnoreOrRespectNulls` at the end of args, which produces
+/// `LEAD(v, n ignore nulls)` — wrong. This helper rewrites the formatting only when
+/// the function is one of the lead-family and the clause is present.
+fn format_function_arguments_with_ignore_nulls_after_first(
+    args: &sqlast::FunctionArguments,
+    canonical_name: &str,
+) -> Option<String> {
+    if !matches!(canonical_name, "lead" | "lag" | "nth_value") {
+        return None;
+    }
+    let sqlast::FunctionArguments::List(list) = args else {
+        return None;
+    };
+    if list.args.len() < 2 {
+        return None;
+    }
+    let mut null_modifier: Option<&'static str> = None;
+    let mut other_clauses: Vec<&sqlast::FunctionArgumentClause> = Vec::new();
+    for clause in &list.clauses {
+        if let sqlast::FunctionArgumentClause::IgnoreOrRespectNulls(t) = clause {
+            null_modifier = Some(match t {
+                sqlast::NullTreatment::IgnoreNulls => "ignore nulls",
+                sqlast::NullTreatment::RespectNulls => "respect nulls",
+            });
+        } else {
+            other_clauses.push(clause);
+        }
+    }
+    let modifier = null_modifier?;
+
+    let mut inner = String::new();
+    if let Some(duplicate_treatment) = list.duplicate_treatment {
+        inner.push_str(&duplicate_treatment.to_string());
+        inner.push(' ');
+    }
+    inner.push_str(&format_function_arg_display_name(&list.args[0]));
+    inner.push(' ');
+    inner.push_str(modifier);
+    for arg in &list.args[1..] {
+        inner.push_str(", ");
+        inner.push_str(&format_function_arg_display_name(arg));
+    }
+    let extra_visible: Vec<String> = other_clauses
+        .iter()
+        .map(|clause| format_function_clause_display_name(clause, &list.args))
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !extra_visible.is_empty() {
+        inner.push(' ');
+        inner.push_str(&extra_visible.join(" "));
+    }
+    Some(format!("({inner})"))
 }
 
 fn format_array_agg_distinct_display_name(
