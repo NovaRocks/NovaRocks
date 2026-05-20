@@ -1,22 +1,27 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use arrow::datatypes::DataType;
 
 use crate::sql::analysis::LambdaParam;
 use crate::sql::catalog::ColumnDef;
+use crate::sql::column_id::{ColumnId, ColumnRefFactory};
 
 /// Tracks column names and types visible at the current query level.
 /// Similar to `ExprScope` in `resolve.rs` but without physical binding
 /// (no tuple_id / slot_id).
 #[derive(Clone)]
 pub(super) struct AnalyzerScope {
-    /// (qualifier_lower, col_name_lower) -> (DataType, nullable)
-    qualified: HashMap<(String, String), (DataType, bool)>,
-    /// col_name_lower -> (DataType, nullable)
-    unqualified: HashMap<String, (DataType, bool)>,
+    /// Shared factory for allocating globally unique ColumnIds.
+    factory: Rc<RefCell<ColumnRefFactory>>,
+    /// (qualifier_lower, col_name_lower) -> (ColumnId, DataType, nullable)
+    qualified: HashMap<(String, String), (ColumnId, DataType, bool)>,
+    /// col_name_lower -> (ColumnId, DataType, nullable)
+    unqualified: HashMap<String, (ColumnId, DataType, bool)>,
     /// Ordered columns for SELECT * expansion:
-    /// (qualifier, col_name, DataType, nullable)
-    ordered: Vec<(Option<String>, String, DataType, bool)>,
+    /// (qualifier, col_name, ColumnId, DataType, nullable)
+    ordered: Vec<(Option<String>, String, ColumnId, DataType, bool)>,
     /// Lambda parameters visible in the current expression scope.
     lambda_params: HashMap<String, LambdaParam>,
     /// For column names that have a canonical qualifier — e.g. a USING-join
@@ -41,8 +46,9 @@ pub(super) struct AnalyzerScope {
 }
 
 impl AnalyzerScope {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(factory: Rc<RefCell<ColumnRefFactory>>) -> Self {
         Self {
+            factory,
             qualified: HashMap::new(),
             unqualified: HashMap::new(),
             ordered: Vec::new(),
@@ -52,6 +58,11 @@ impl AnalyzerScope {
             qualified_logical_types: HashMap::new(),
             unqualified_logical_types: HashMap::new(),
         }
+    }
+
+    /// Return a reference to the shared ColumnRefFactory.
+    pub(super) fn factory(&self) -> &Rc<RefCell<ColumnRefFactory>> {
+        &self.factory
     }
 
     /// Look up the logical type tag for a column reference. Returns the
@@ -83,7 +94,7 @@ impl AnalyzerScope {
         &self,
         expr: &crate::sql::analysis::TypedExpr,
     ) -> Option<crate::sql::SqlType> {
-        if let crate::sql::analysis::ExprKind::ColumnRef { qualifier, column } = &expr.kind {
+        if let crate::sql::analysis::ExprKind::ColumnRef { qualifier, column, .. } = &expr.kind {
             self.logical_type_for(qualifier.as_deref(), column)
         } else {
             None
@@ -113,10 +124,16 @@ impl AnalyzerScope {
     pub(super) fn add_table(&mut self, qualifier: Option<&str>, columns: &[ColumnDef]) {
         for col in columns {
             let name_lower = col.name.to_lowercase();
+            let id = self.factory.borrow_mut().create(
+                qualifier.map(|s| s.to_string()),
+                col.name.clone(),
+                col.data_type.clone(),
+                col.nullable,
+            );
             if let Some(q) = qualifier {
                 self.qualified.insert(
                     (q.to_lowercase(), name_lower.clone()),
-                    (col.data_type.clone(), col.nullable),
+                    (id, col.data_type.clone(), col.nullable),
                 );
                 if let Some(logical) = col.logical_type.clone() {
                     self.qualified_logical_types
@@ -124,7 +141,7 @@ impl AnalyzerScope {
                 }
             }
             self.unqualified
-                .insert(name_lower.clone(), (col.data_type.clone(), col.nullable));
+                .insert(name_lower.clone(), (id, col.data_type.clone(), col.nullable));
             if let Some(logical) = col.logical_type.clone() {
                 self.unqualified_logical_types.insert(name_lower, logical);
             }
@@ -132,6 +149,7 @@ impl AnalyzerScope {
             self.ordered.push((
                 qualifier.map(|s| s.to_lowercase()),
                 col.name.clone(),
+                id,
                 col.data_type.clone(),
                 col.nullable,
             ));
@@ -145,20 +163,57 @@ impl AnalyzerScope {
         name: &str,
         data_type: DataType,
         nullable: bool,
+    ) -> ColumnId {
+        let name_lower = name.to_lowercase();
+        let id = self.factory.borrow_mut().create(
+            qualifier.map(|s| s.to_string()),
+            name.to_string(),
+            data_type.clone(),
+            nullable,
+        );
+        if let Some(q) = qualifier {
+            self.qualified.insert(
+                (q.to_lowercase(), name_lower.clone()),
+                (id, data_type.clone(), nullable),
+            );
+        }
+        self.unqualified
+            .insert(name_lower, (id, data_type.clone(), nullable));
+        // Store original-case name in ordered for SELECT * display.
+        self.ordered.push((
+            qualifier.map(|s| s.to_lowercase()),
+            name.to_string(),
+            id,
+            data_type,
+            nullable,
+        ));
+        id
+    }
+
+    /// Register a single column with an already-allocated ColumnId.
+    /// Used when constructing SubqueryAlias output from inner query output
+    /// to preserve ColumnId identity across alias boundaries.
+    pub(super) fn add_column_with_id(
+        &mut self,
+        qualifier: Option<&str>,
+        name: &str,
+        column_id: ColumnId,
+        data_type: DataType,
+        nullable: bool,
     ) {
         let name_lower = name.to_lowercase();
         if let Some(q) = qualifier {
             self.qualified.insert(
                 (q.to_lowercase(), name_lower.clone()),
-                (data_type.clone(), nullable),
+                (column_id, data_type.clone(), nullable),
             );
         }
         self.unqualified
-            .insert(name_lower, (data_type.clone(), nullable));
-        // Store original-case name in ordered for SELECT * display.
+            .insert(name_lower, (column_id, data_type.clone(), nullable));
         self.ordered.push((
             qualifier.map(|s| s.to_lowercase()),
             name.to_string(),
+            column_id,
             data_type,
             nullable,
         ));
@@ -172,16 +227,18 @@ impl AnalyzerScope {
         self.lambda_params.get(&name.to_lowercase()).cloned()
     }
 
-    /// Resolve a column reference. Returns a spec-aligned error message when
-    /// the column name is one of the two Iceberg V3 row-lineage reserved names
-    /// but the table did not register them (i.e. it is not a V3 row-lineage
-    /// table), so the user gets a clear diagnostic instead of a generic
-    /// "cannot be resolved" message.
+    /// Resolve a column reference. Returns `(ColumnId, DataType, nullable)`.
+    ///
+    /// Returns a spec-aligned error message when the column name is one of
+    /// the two Iceberg V3 row-lineage reserved names but the table did not
+    /// register them (i.e. it is not a V3 row-lineage table), so the user
+    /// gets a clear diagnostic instead of a generic "cannot be resolved"
+    /// message.
     pub(super) fn resolve(
         &self,
         qualifier: Option<&str>,
         name: &str,
-    ) -> Result<(DataType, bool), String> {
+    ) -> Result<(ColumnId, DataType, bool), String> {
         let name_lower = name.to_lowercase();
         if let Some(q) = qualifier {
             let q_lower = q.to_lowercase();
@@ -210,25 +267,31 @@ impl AnalyzerScope {
         let q_lower = qualifier.to_lowercase();
         for col in columns {
             let name_lower = col.name.to_lowercase();
+            let id = self.factory.borrow_mut().create(
+                Some(qualifier.to_string()),
+                col.name.clone(),
+                col.data_type.clone(),
+                col.nullable,
+            );
             self.qualified.insert(
                 (q_lower.clone(), name_lower.clone()),
-                (col.data_type.clone(), col.nullable),
+                (id, col.data_type.clone(), col.nullable),
             );
             self.unqualified
-                .insert(name_lower, (col.data_type.clone(), col.nullable));
+                .insert(name_lower, (id, col.data_type.clone(), col.nullable));
         }
     }
 
     /// Merge another scope into this one (for JOINs).
     pub(super) fn merge(&mut self, other: &AnalyzerScope) {
-        for ((qualifier, name), (dt, nullable)) in &other.qualified {
+        for ((qualifier, name), (id, dt, nullable)) in &other.qualified {
             self.qualified
-                .insert((qualifier.clone(), name.clone()), (dt.clone(), *nullable));
+                .insert((qualifier.clone(), name.clone()), (*id, dt.clone(), *nullable));
         }
-        for (name, (dt, nullable)) in &other.unqualified {
+        for (name, (id, dt, nullable)) in &other.unqualified {
             self.unqualified
                 .entry(name.clone())
-                .or_insert_with(|| (dt.clone(), *nullable));
+                .or_insert_with(|| (*id, dt.clone(), *nullable));
         }
         for entry in &other.ordered {
             self.ordered.push(entry.clone());
@@ -244,7 +307,7 @@ impl AnalyzerScope {
     /// Iterate columns in declaration order (for SELECT * expansion).
     pub(super) fn iter_columns(
         &self,
-    ) -> impl Iterator<Item = &(Option<String>, String, DataType, bool)> {
+    ) -> impl Iterator<Item = &(Option<String>, String, ColumnId, DataType, bool)> {
         self.ordered.iter()
     }
 
@@ -252,11 +315,11 @@ impl AnalyzerScope {
     pub(super) fn iter_qualified_columns(
         &self,
         qualifier: &str,
-    ) -> impl Iterator<Item = &(Option<String>, String, DataType, bool)> {
+    ) -> impl Iterator<Item = &(Option<String>, String, ColumnId, DataType, bool)> {
         let q_lower = qualifier.to_lowercase();
         self.ordered
             .iter()
-            .filter(move |(q, _, _, _)| q.as_deref() == Some(q_lower.as_str()))
+            .filter(move |(q, _, _, _, _)| q.as_deref() == Some(q_lower.as_str()))
     }
 
     /// Register `COALESCE(left.col, right.col)` for every USING column.
@@ -295,13 +358,21 @@ impl AnalyzerScope {
         use crate::sql::analysis::{ExprKind, TypedExpr};
         for col in using_cols {
             let col_lower = col.to_lowercase();
-            let Some((dt, _)) = self
+            let Some((left_id, dt, _)) = self
                 .qualified
                 .get(&(left_qual.to_lowercase(), col_lower.clone()))
             else {
                 continue;
             };
+            let left_id = *left_id;
             let dt = dt.clone();
+
+            let right_id = self
+                .qualified
+                .get(&(right_qual.to_lowercase(), col_lower.clone()))
+                .map(|(id, _, _)| *id)
+                .unwrap_or(ColumnId::UNSET);
+
             // For chained FULL OUTER USING, the "left" of the new COALESCE
             // is the previous COALESCE expression so that
             // `(t1 FULL OUTER t2) FULL OUTER t3 USING(k1)` evaluates to
@@ -314,6 +385,7 @@ impl AnalyzerScope {
                 .cloned()
                 .unwrap_or(TypedExpr {
                     kind: ExprKind::ColumnRef {
+                        column_id: left_id,
                         qualifier: Some(left_qual.to_string()),
                         column: col_lower.clone(),
                     },
@@ -322,6 +394,7 @@ impl AnalyzerScope {
                 });
             let right_ref = TypedExpr {
                 kind: ExprKind::ColumnRef {
+                    column_id: right_id,
                     qualifier: Some(right_qual.to_string()),
                     column: col_lower.clone(),
                 },
@@ -370,14 +443,14 @@ impl AnalyzerScope {
             // Reverse-scan dedup: keep the *last* occurrence of each USING name.
             let mut keep_indices: std::collections::HashMap<String, usize> =
                 std::collections::HashMap::new();
-            for (idx, (_, name, _, _)) in self.ordered.iter().enumerate() {
+            for (idx, (_, name, _, _, _)) in self.ordered.iter().enumerate() {
                 let n = name.to_lowercase();
                 if names_lower.contains(&n) {
                     keep_indices.insert(n, idx);
                 }
             }
             let mut i = 0;
-            self.ordered.retain(|(_, name, _, _)| {
+            self.ordered.retain(|(_, name, _, _, _)| {
                 let n = name.to_lowercase();
                 let keep = if names_lower.contains(&n) {
                     keep_indices.get(&n) == Some(&i)
@@ -390,7 +463,7 @@ impl AnalyzerScope {
         } else {
             // Forward-scan dedup: keep the first occurrence of each USING name.
             let mut seen = std::collections::HashSet::new();
-            self.ordered.retain(|(_, name, _, _)| {
+            self.ordered.retain(|(_, name, _, _, _)| {
                 let n = name.to_lowercase();
                 if names_lower.contains(&n) {
                     seen.insert(n)
@@ -400,13 +473,13 @@ impl AnalyzerScope {
             });
         }
         // Move USING columns to the front in USING-clause order.
-        let mut front: Vec<(Option<String>, String, DataType, bool)> =
+        let mut front: Vec<(Option<String>, String, ColumnId, DataType, bool)> =
             Vec::with_capacity(names_lower.len());
         for using_name in &names_lower {
             if let Some(pos) = self
                 .ordered
                 .iter()
-                .position(|(_, n, _, _)| n.to_lowercase() == *using_name)
+                .position(|(_, n, _, _, _)| n.to_lowercase() == *using_name)
             {
                 front.push(self.ordered.remove(pos));
             }
@@ -418,14 +491,15 @@ impl AnalyzerScope {
         // an unqualified `id1` in WHERE / SELECT / ORDER BY resolves to the
         // right-side binding (matching the column that wins in `ordered`).
         if prefer_right {
-            for (_, name, dt, nullable) in self
+            for (_, name, id, dt, nullable) in self
                 .ordered
                 .iter()
                 .take(names_lower.len())
                 .cloned()
                 .collect::<Vec<_>>()
             {
-                self.unqualified.insert(name.to_lowercase(), (dt, nullable));
+                self.unqualified
+                    .insert(name.to_lowercase(), (id, dt, nullable));
             }
         }
 
@@ -439,7 +513,7 @@ impl AnalyzerScope {
             .ordered
             .iter()
             .take(names_lower.len())
-            .map(|(q, n, _, _)| (n.to_lowercase(), q.clone()))
+            .map(|(q, n, _, _, _)| (n.to_lowercase(), q.clone()))
             .collect();
         for (name, qual) in collected {
             if let Some(q) = qual {
@@ -456,9 +530,23 @@ impl AnalyzerScope {
         let q_lower = qualifier.to_lowercase();
         for col in columns {
             let name_lower = col.name.to_lowercase();
+            // Reuse existing ColumnId from the unqualified map if available,
+            // since this is just an alias for the same column.
+            let id = self
+                .unqualified
+                .get(&name_lower)
+                .map(|(id, _, _)| *id)
+                .unwrap_or_else(|| {
+                    self.factory.borrow_mut().create(
+                        Some(qualifier.to_string()),
+                        col.name.clone(),
+                        col.data_type.clone(),
+                        col.nullable,
+                    )
+                });
             self.qualified.insert(
                 (q_lower.clone(), name_lower),
-                (col.data_type.clone(), col.nullable),
+                (id, col.data_type.clone(), col.nullable),
             );
         }
     }
@@ -486,6 +574,10 @@ mod tests {
     use crate::sql::catalog::ColumnDef;
     use arrow::datatypes::DataType;
 
+    fn test_factory() -> Rc<RefCell<ColumnRefFactory>> {
+        Rc::new(RefCell::new(ColumnRefFactory::new()))
+    }
+
     fn col(name: &str, ty: DataType, nullable: bool) -> ColumnDef {
         ColumnDef {
             name: name.to_string(),
@@ -498,7 +590,7 @@ mod tests {
 
     #[test]
     fn rejects_row_id_on_non_iceberg_table() {
-        let mut scope = AnalyzerScope::new();
+        let mut scope = AnalyzerScope::new(test_factory());
         scope.add_table(Some("t"), &[col("id", DataType::Int64, false)]);
         let err = scope.resolve(None, "_row_id").expect_err("must fail");
         assert!(err.contains("only available on Iceberg V3 row-lineage tables"));
@@ -506,7 +598,7 @@ mod tests {
 
     #[test]
     fn rejects_row_id_on_v2_iceberg_table_no_metadata_added() {
-        let mut scope = AnalyzerScope::new();
+        let mut scope = AnalyzerScope::new(test_factory());
         scope.add_table(Some("ice"), &[col("id", DataType::Int64, false)]);
         // V2 path adds no row-lineage metadata columns.
         let err = scope.resolve(None, "_row_id").expect_err("must fail");
@@ -515,7 +607,7 @@ mod tests {
 
     #[test]
     fn accepts_row_id_on_v3_row_lineage_table() {
-        let mut scope = AnalyzerScope::new();
+        let mut scope = AnalyzerScope::new(test_factory());
         scope.add_table(Some("ice"), &[col("id", DataType::Int64, false)]);
         scope.add_iceberg_metadata_columns(
             "ice",
@@ -524,19 +616,19 @@ mod tests {
                 col("_last_updated_sequence_number", DataType::Int64, false),
             ],
         );
-        let (ty, nullable) = scope.resolve(None, "_row_id").expect("ok");
+        let (_id, ty, nullable) = scope.resolve(None, "_row_id").expect("ok");
         assert_eq!(ty, DataType::Int64);
         assert!(!nullable);
     }
 
     #[test]
     fn select_star_does_not_expose_row_lineage_pseudo_columns() {
-        let mut scope = AnalyzerScope::new();
+        let mut scope = AnalyzerScope::new(test_factory());
         scope.add_table(Some("ice"), &[col("id", DataType::Int64, false)]);
         scope.add_iceberg_metadata_columns("ice", &[col("_row_id", DataType::Int64, false)]);
         let names: Vec<_> = scope
             .iter_columns()
-            .map(|(_, n, _, _)| n.as_str())
+            .map(|(_, n, _, _, _)| n.as_str())
             .collect();
         assert_eq!(names, vec!["id"]);
     }

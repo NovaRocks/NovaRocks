@@ -283,7 +283,7 @@ pub(crate) fn collect_qualified_column_refs(expr: &TypedExpr) -> Vec<QualifiedRe
 
 fn collect_qualified_column_refs_inner(expr: &TypedExpr, out: &mut Vec<QualifiedRef>) {
     match &expr.kind {
-        ExprKind::ColumnRef { qualifier, column } => {
+        ExprKind::ColumnRef { qualifier, column, .. } => {
             out.push((
                 qualifier.as_ref().map(|q| q.to_lowercase()),
                 column.to_lowercase(),

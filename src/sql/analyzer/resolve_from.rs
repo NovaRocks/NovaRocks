@@ -37,24 +37,25 @@ impl<'a> super::AnalyzerContext<'a> {
             let condition = match constraint {
                 Some(sqlast::JoinConstraint::On(on_expr)) => {
                     // Build a merged scope for analyzing the ON condition
-                    let mut merged = AnalyzerScope::new();
+                    let mut merged = self.new_scope();
                     merged.merge(&current_scope);
                     merged.merge(&right_scope);
                     Some(self.analyze_expr(on_expr, &merged)?)
                 }
                 Some(sqlast::JoinConstraint::Using(columns)) => {
                     // Convert USING(col1, col2) to ON left.col1 = right.col1 AND ...
-                    let mut merged = AnalyzerScope::new();
+                    let mut merged = AnalyzerScope::new(current_scope.factory().clone());
                     merged.merge(&current_scope);
                     merged.merge(&right_scope);
                     let mut conds = Vec::new();
                     for col_obj in columns {
                         let col_name = col_obj.to_string();
-                        let (dt, nullable) = merged
+                        let (column_id, dt, nullable) = merged
                             .resolve(None, &col_name)
-                            .unwrap_or((DataType::Utf8, true));
+                            .unwrap_or((crate::sql::column_id::ColumnId::UNSET, DataType::Utf8, true));
                         let col_ref = TypedExpr {
                             kind: ExprKind::ColumnRef {
+                                column_id,
                                 qualifier: None,
                                 column: col_name,
                             },
@@ -142,12 +143,12 @@ impl<'a> super::AnalyzerContext<'a> {
                                 let name_lower = name.to_lowercase();
                                 let left_q = current_scope
                                     .iter_columns()
-                                    .find(|(_, n, _, _)| n.to_lowercase() == name_lower)
-                                    .and_then(|(q, _, _, _)| q.clone());
+                                    .find(|(_, n, _, _, _)| n.to_lowercase() == name_lower)
+                                    .and_then(|(q, _, _, _, _)| q.clone());
                                 let right_q = right_scope
                                     .iter_columns()
-                                    .find(|(_, n, _, _)| n.to_lowercase() == name_lower)
-                                    .and_then(|(q, _, _, _)| q.clone());
+                                    .find(|(_, n, _, _, _)| n.to_lowercase() == name_lower)
+                                    .and_then(|(q, _, _, _, _)| q.clone());
                                 match (left_q, right_q) {
                                     (Some(l), Some(r)) => out.push((name, l, r)),
                                     _ => {
@@ -320,7 +321,7 @@ impl<'a> super::AnalyzerContext<'a> {
 
                     // Build scope from the fixed metadata schema.
                     let cols = metadata_table_schema(metadata_ty.clone());
-                    let mut scope = AnalyzerScope::new();
+                    let mut scope = self.new_scope();
                     let qualifier = alias_name.as_deref().unwrap_or(&table_def.name);
                     for col in &cols {
                         scope.add_column(
@@ -365,11 +366,12 @@ impl<'a> super::AnalyzerContext<'a> {
                             .map(|a| a.name.value.clone())
                             .unwrap_or_else(|| tbl.clone());
                         let output_columns = entry.output_columns.clone();
-                        let mut scope = AnalyzerScope::new();
+                        let mut scope = self.new_scope();
                         for col in &output_columns {
-                            scope.add_column(
+                            scope.add_column_with_id(
                                 Some(&alias_name),
                                 &col.name,
+                                col.column_id,
                                 col.data_type.clone(),
                                 col.nullable,
                             );
@@ -389,7 +391,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 let alias_name = alias.as_ref().map(|a| a.name.value.clone());
 
                 // Build scope
-                let mut scope = AnalyzerScope::new();
+                let mut scope = self.new_scope();
                 let qualifier = alias_name.as_deref().unwrap_or(&table_def.name);
                 scope.add_table(Some(qualifier), &table_def.columns);
                 // If alias differs from table name, also register with table name
@@ -428,12 +430,15 @@ impl<'a> super::AnalyzerContext<'a> {
                 let output_columns =
                     derived_table_output_columns(&resolved_query.output_columns, alias.as_ref())?;
 
-                // Build scope from subquery output columns
-                let mut scope = AnalyzerScope::new();
+                // Build scope from subquery output columns.
+                // Reuse the inner query's ColumnId so that distribution /
+                // equivalence specs remain valid across the alias boundary.
+                let mut scope = self.new_scope();
                 for col in &output_columns {
-                    scope.add_column(
+                    scope.add_column_with_id(
                         Some(&alias_name),
                         &col.name,
+                        col.column_id,
                         col.data_type.clone(),
                         col.nullable,
                     );
@@ -553,7 +558,7 @@ impl<'a> super::AnalyzerContext<'a> {
         let qualifier = alias_name.as_deref().unwrap_or("unnest");
         let mut args = Vec::with_capacity(array_exprs.len());
         let mut output_columns = Vec::with_capacity(array_exprs.len());
-        let mut scope = AnalyzerScope::new();
+        let mut scope = self.new_scope();
 
         for (idx, expr) in array_exprs.iter().enumerate() {
             let typed = self.analyze_expr(expr, outer_scope)?;
@@ -573,8 +578,9 @@ impl<'a> super::AnalyzerContext<'a> {
             });
             let data_type = item_field.data_type().clone();
             let nullable = true;
-            scope.add_column(Some(qualifier), &col_name, data_type.clone(), nullable);
+            let column_id = scope.add_column(Some(qualifier), &col_name, data_type.clone(), nullable);
             output_columns.push(OutputColumn {
+                column_id,
                 name: col_name,
                 data_type,
                 nullable,
@@ -758,7 +764,7 @@ impl<'a> super::AnalyzerContext<'a> {
         let alias_name = alias.map(|a| a.name.value.clone());
         let qualifier = alias_name.as_deref().unwrap_or("generate_series");
 
-        let mut scope = AnalyzerScope::new();
+        let mut scope = self.new_scope();
         scope.add_column(Some(qualifier), &column_name, DataType::Int64, false);
 
         let relation = Relation::GenerateSeries(GenerateSeriesRelation {
@@ -856,7 +862,7 @@ impl<'a> super::AnalyzerContext<'a> {
         // Output schema = base table columns + row-lineage metadata columns.
         // Both are exposed as resolvable columns under the alias / table name.
         let alias_name = alias.map(|a| a.name.value.clone());
-        let mut scope = AnalyzerScope::new();
+        let mut scope = self.new_scope();
         let qualifier = alias_name.as_deref().unwrap_or(&table_def.name);
         scope.add_table(Some(qualifier), &table_def.columns);
         scope.add_iceberg_metadata_columns(
@@ -924,6 +930,7 @@ fn derived_table_output_columns(
         .iter()
         .zip(alias.columns.iter())
         .map(|(col, alias_col)| OutputColumn {
+            column_id: col.column_id,
             name: alias_col.name.value.clone(),
             data_type: col.data_type.clone(),
             nullable: col.nullable,

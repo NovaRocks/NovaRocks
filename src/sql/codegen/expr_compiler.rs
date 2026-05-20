@@ -368,7 +368,7 @@ impl<'a> ExprCompiler<'a> {
 
     fn compile_typed_inner(&mut self, expr: &TypedExpr) -> Result<DataType, String> {
         match &expr.kind {
-            ExprKind::ColumnRef { qualifier, column } => {
+            ExprKind::ColumnRef { qualifier, column, .. } => {
                 // Inside a lambda body, parameter references resolve to the
                 // allocated lambda-arg slot ids (tuple_id = 0, since they do
                 // not belong to any tuple descriptor).

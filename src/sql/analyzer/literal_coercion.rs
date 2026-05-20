@@ -87,6 +87,7 @@ mod coercion_tests {
     fn column(ty: DataType) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
+                column_id: crate::sql::column_id::ColumnId::UNSET,
                 qualifier: None,
                 column: "c".to_string(),
             },

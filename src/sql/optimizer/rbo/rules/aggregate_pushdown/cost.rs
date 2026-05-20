@@ -54,6 +54,7 @@ mod tests {
     use super::*;
     use crate::sql::analysis::OutputColumn;
     use crate::sql::catalog::{TableDef, TableStorage};
+    use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::statistics::ColumnStatistic;
     use crate::sql::planner::plan::ScanNode;
     use arrow::datatypes::DataType;
@@ -61,6 +62,7 @@ mod tests {
     fn col_ref(name: &str) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
+                column_id: ColumnId::UNSET,
                 qualifier: None,
                 column: name.into(),
             },
@@ -88,6 +90,7 @@ mod tests {
             },
             alias: None,
             columns: vec![OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: col.into(),
                 data_type: DataType::Int64,
                 nullable: false,

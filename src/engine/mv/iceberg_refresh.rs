@@ -7961,6 +7961,7 @@ mod tests {
 
     fn output_col(name: &str, ty: DataType, nullable: bool) -> OutputColumn {
         OutputColumn {
+            column_id: crate::sql::column_id::ColumnId::UNSET,
             name: name.to_string(),
             data_type: ty,
             nullable,

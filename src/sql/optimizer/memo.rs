@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use super::operator::Operator;
 use crate::sql::analysis::OutputColumn;
 use crate::sql::analysis::cte::CteId;
+use crate::sql::column_id::ColumnRefFactory;
 
 // ---------------------------------------------------------------------------
 // Core type aliases
@@ -28,6 +29,11 @@ pub(crate) struct Memo {
     /// Populated during plan-to-memo conversion so that CTEConsume
     /// nodes can look up the produce group's row count.
     pub(crate) cte_produce_groups: HashMap<CteId, GroupId>,
+    /// Column metadata factory threaded from the analyzer. Used by
+    /// optimizer rules and codegen to look up column names, types,
+    /// and qualifiers from [`ColumnId`]s in distribution specs,
+    /// sort keys, and equivalence classes.
+    pub(crate) factory: ColumnRefFactory,
 }
 
 impl Memo {
@@ -35,6 +41,7 @@ impl Memo {
         Self {
             groups: Vec::new(),
             cte_produce_groups: HashMap::new(),
+            factory: ColumnRefFactory::new(),
         }
     }
 

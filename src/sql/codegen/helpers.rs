@@ -37,10 +37,12 @@ pub(crate) fn typed_expr_display_name(expr: &TypedExpr) -> String {
         ExprKind::ColumnRef {
             qualifier: Some(q),
             column,
+            ..
         } => format!("{q}.{column}"),
         ExprKind::ColumnRef {
             qualifier: None,
             column,
+            ..
         } => column.clone(),
         ExprKind::LambdaParamRef { name, .. } => name.clone(),
         ExprKind::Literal(query_ir::LiteralValue::Null) => "NULL".to_string(),
@@ -217,10 +219,12 @@ fn typed_expr_path_display_name(expr: &TypedExpr) -> String {
         ExprKind::ColumnRef {
             qualifier: Some(qualifier),
             column,
+            ..
         } => format!("{qualifier}.{column}"),
         ExprKind::ColumnRef {
             qualifier: None,
             column,
+            ..
         } => column.clone(),
         ExprKind::LambdaParamRef { name, .. } => name.clone(),
         ExprKind::FunctionCall { name, args, .. } => {
@@ -435,6 +439,7 @@ mod tests {
     fn col(name: &str) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
+                column_id: crate::sql::column_id::ColumnId::UNSET,
                 qualifier: None,
                 column: name.to_string(),
             },

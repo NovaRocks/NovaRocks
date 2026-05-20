@@ -1,6 +1,7 @@
 //! Aggregate pushdown rewriter — phase 2 of the rule.
 
 use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
+use crate::sql::column_id::ColumnId;
 use crate::sql::planner::plan::{AggregateCall, AggregateNode, LogicalPlan};
 
 use super::context::PushPlan;
@@ -34,6 +35,7 @@ pub(crate) fn rewrite(original: &AggregateNode, plan: PushPlan) -> LogicalPlan {
         .iter()
         .enumerate()
         .map(|(i, call)| OutputColumn {
+            column_id: ColumnId::UNSET,
             name: format!("{}{}", PARTIAL_OUTPUT_PREFIX, i),
             data_type: call.result_type.clone(),
             nullable: true,
@@ -46,6 +48,7 @@ pub(crate) fn rewrite(original: &AggregateNode, plan: PushPlan) -> LogicalPlan {
         .iter()
         .filter_map(|gb| match &gb.kind {
             ExprKind::ColumnRef { column, .. } => Some(OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: column.clone(),
                 data_type: gb.data_type.clone(),
                 nullable: gb.nullable,
@@ -90,6 +93,7 @@ pub(crate) fn rewrite(original: &AggregateNode, plan: PushPlan) -> LogicalPlan {
             name: final_fn_name(&orig.name),
             args: vec![TypedExpr {
                 kind: ExprKind::ColumnRef {
+                    column_id: ColumnId::UNSET,
                     qualifier: None,
                     column: pc.name.clone(),
                 },
@@ -133,6 +137,7 @@ mod tests {
     fn col_ref(name: &str, ty: DataType) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
+                column_id: ColumnId::UNSET,
                 qualifier: None,
                 column: name.into(),
             },
@@ -157,6 +162,7 @@ mod tests {
             columns: cols
                 .iter()
                 .map(|(n, ty)| OutputColumn {
+                    column_id: ColumnId::UNSET,
                     name: (*n).into(),
                     data_type: ty.clone(),
                     nullable: false,
@@ -201,6 +207,7 @@ mod tests {
             group_by: vec![col_ref("k", DataType::Int64)],
             aggregates: vec![count_call],
             output_columns: vec![OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "k".into(),
                 data_type: DataType::Int64,
                 nullable: true,
@@ -296,11 +303,13 @@ mod tests {
             }],
             output_columns: vec![
                 OutputColumn {
+                    column_id: ColumnId::UNSET,
                     name: "k".into(),
                     data_type: DataType::Int64,
                     nullable: true,
                 },
                 OutputColumn {
+                    column_id: ColumnId::UNSET,
                     name: "total".into(),
                     data_type: DataType::Int64,
                     nullable: true,

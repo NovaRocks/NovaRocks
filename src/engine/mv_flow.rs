@@ -538,7 +538,7 @@ pub(crate) fn analyze_visible_output_types(
         strip_catalog_from_three_part_names(&mut analyzable);
     }
     let catalog = state.catalog.read().expect("standalone catalog read lock");
-    let (resolved, _cte_registry) =
+    let (resolved, _cte_registry, _factory) =
         crate::sql::analyzer::analyze(&analyzable, &*catalog, current_database)
             .map_err(|e| format!("aggregate MV visible type analysis failed: {e}"))?;
     Ok(resolved.output_columns)

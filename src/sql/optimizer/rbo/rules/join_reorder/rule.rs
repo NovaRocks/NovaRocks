@@ -60,6 +60,7 @@ mod tests {
     use super::*;
     use crate::sql::analysis::OutputColumn;
     use crate::sql::catalog::{TableDef, TableStorage};
+    use crate::sql::column_id::ColumnId;
     use crate::sql::planner::plan::ScanNode;
     use arrow::datatypes::DataType;
 
@@ -77,6 +78,7 @@ mod tests {
             },
             alias: None,
             columns: vec![OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "id".into(),
                 data_type: DataType::Int32,
                 nullable: false,

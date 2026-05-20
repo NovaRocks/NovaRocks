@@ -92,6 +92,7 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr};
     use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
+    use crate::sql::column_id::ColumnId;
     use arrow::datatypes::DataType;
 
     fn col(name: &str) -> TypedExpr {
@@ -99,6 +100,7 @@ mod tests {
             data_type: DataType::Int64,
             nullable: true,
             kind: ExprKind::ColumnRef {
+                column_id: ColumnId::UNSET,
                 qualifier: None,
                 column: name.into(),
             },
@@ -150,6 +152,7 @@ mod tests {
             columns: cols
                 .iter()
                 .map(|n| OutputColumn {
+                    column_id: ColumnId::UNSET,
                     name: (*n).into(),
                     data_type: DataType::Int64,
                     nullable: true,
@@ -174,11 +177,13 @@ mod tests {
             }],
             output_columns: vec![
                 OutputColumn {
+                    column_id: ColumnId::UNSET,
                     name: "a".into(),
                     data_type: DataType::Int64,
                     nullable: true,
                 },
                 OutputColumn {
+                    column_id: ColumnId::UNSET,
                     name: "sum_b".into(),
                     data_type: DataType::Int64,
                     nullable: true,

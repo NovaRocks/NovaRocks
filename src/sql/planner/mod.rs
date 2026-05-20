@@ -10,7 +10,17 @@ use crate::sql::analysis::cte::CTERegistry;
 use crate::sql::analysis::*;
 use crate::sql::catalog::{IcebergDeleteFileContent, S3FileInfo};
 use crate::sql::codegen::helpers::typed_expr_display_name;
+use crate::sql::column_id::{ColumnId, ColumnRefFactory};
 use plan::*;
+
+/// Extract ColumnId from a TypedExpr, or allocate a new one from the factory.
+fn expr_column_id(expr: &TypedExpr, name: &str, factory: &mut ColumnRefFactory) -> ColumnId {
+    if let ExprKind::ColumnRef { column_id, .. } = &expr.kind {
+        *column_id
+    } else {
+        factory.create(None, name.to_string(), expr.data_type.clone(), expr.nullable)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Public entry
@@ -21,13 +31,15 @@ use plan::*;
 pub(crate) fn plan_query(
     resolved: ResolvedQuery,
     cte_registry: CTERegistry,
+    factory: &mut ColumnRefFactory,
 ) -> Result<LogicalPlan, String> {
-    plan_scoped_query(resolved, &cte_registry)
+    plan_scoped_query(resolved, &cte_registry, factory)
 }
 
 fn plan_scoped_query(
     resolved: ResolvedQuery,
     cte_registry: &CTERegistry,
+    factory: &mut ColumnRefFactory,
 ) -> Result<LogicalPlan, String> {
     let ResolvedQuery {
         body,
@@ -38,18 +50,19 @@ fn plan_scoped_query(
         local_cte_ids,
     } = resolved;
     let mut root = apply_query_modifiers(
-        plan_body_scoped(body, cte_registry)?,
+        plan_body_scoped(body, cte_registry, factory)?,
         order_by,
         output_columns,
         limit,
         offset,
+        factory,
     );
 
     for cte_id in local_cte_ids.into_iter().rev() {
         let entry = cte_registry
             .get(cte_id)
             .ok_or_else(|| format!("missing CTE entry for id {cte_id}"))?;
-        let produce_input = plan_scoped_query(entry.resolved_query.clone(), cte_registry)?;
+        let produce_input = plan_scoped_query(entry.resolved_query.clone(), cte_registry, factory)?;
         let produce = LogicalPlan::CTEProduce(CTEProduceNode {
             cte_id: entry.id,
             input: Box::new(produce_input),
@@ -71,6 +84,7 @@ fn apply_query_modifiers(
     output_columns: Vec<OutputColumn>,
     limit: Option<i64>,
     offset: Option<i64>,
+    factory: &mut ColumnRefFactory,
 ) -> LogicalPlan {
     let mut final_projection: Option<Vec<ProjectItem>> = None;
 
@@ -159,16 +173,21 @@ fn apply_query_modifiers(
             final_projection = Some(if let Some(user) = user_select {
                 user.into_iter()
                     .enumerate()
-                    .map(|(idx, (name, dt, nullable))| ProjectItem {
-                        expr: TypedExpr {
-                            kind: ExprKind::ColumnRef {
-                                qualifier: None,
-                                column: format!("__nr_sel_{idx}"),
+                    .map(|(idx, (name, dt, nullable))| {
+                        let syn_name = format!("__nr_sel_{idx}");
+                        let cid = factory.create(None, syn_name.clone(), dt.clone(), nullable);
+                        ProjectItem {
+                            expr: TypedExpr {
+                                kind: ExprKind::ColumnRef {
+                                    column_id: cid,
+                                    qualifier: None,
+                                    column: syn_name,
+                                },
+                                data_type: dt,
+                                nullable,
                             },
-                            data_type: dt,
-                            nullable,
-                        },
-                        output_name: name,
+                            output_name: name,
+                        }
                     })
                     .collect()
             } else {
@@ -177,6 +196,7 @@ fn apply_query_modifiers(
                     .map(|col| ProjectItem {
                         expr: TypedExpr {
                             kind: ExprKind::ColumnRef {
+                                column_id: col.column_id,
                                 qualifier: None,
                                 column: col.name.clone(),
                             },
@@ -263,12 +283,14 @@ fn remap_select_alias_refs(
         ExprKind::ColumnRef {
             qualifier: None,
             ref column,
+            ..
         } => {
             if let Some(idx) = name_to_idx.get(&column.to_lowercase()) {
                 TypedExpr {
                     data_type: expr.data_type,
                     nullable: expr.nullable,
                     kind: ExprKind::ColumnRef {
+                        column_id: ColumnId::UNSET,
                         qualifier: None,
                         column: format!("__nr_sel_{idx}"),
                     },
@@ -304,6 +326,7 @@ fn rewrite_sort_items_to_projection_refs(
                 SortItem {
                     expr: TypedExpr {
                         kind: ExprKind::ColumnRef {
+                            column_id: ColumnId::UNSET,
                             qualifier: None,
                             column: extra.output_name.clone(),
                         },
@@ -324,11 +347,11 @@ fn rewrite_sort_items_to_projection_refs(
 // Body planning
 // ---------------------------------------------------------------------------
 
-fn plan_body_scoped(body: QueryBody, cte_registry: &CTERegistry) -> Result<LogicalPlan, String> {
+fn plan_body_scoped(body: QueryBody, cte_registry: &CTERegistry, factory: &mut ColumnRefFactory) -> Result<LogicalPlan, String> {
     match body {
-        QueryBody::Select(select) => plan_select_scoped(select, cte_registry),
-        QueryBody::SetOperation(set_op) => plan_set_operation_scoped(set_op, cte_registry),
-        QueryBody::Values(values) => plan_values(values),
+        QueryBody::Select(select) => plan_select_scoped(select, cte_registry, factory),
+        QueryBody::SetOperation(set_op) => plan_set_operation_scoped(set_op, cte_registry, factory),
+        QueryBody::Values(values) => plan_values(values, factory),
     }
 }
 
@@ -339,11 +362,12 @@ fn plan_body_scoped(body: QueryBody, cte_registry: &CTERegistry) -> Result<Logic
 fn plan_select_scoped(
     mut select: ResolvedSelect,
     cte_registry: &CTERegistry,
+    factory: &mut ColumnRefFactory,
 ) -> Result<LogicalPlan, String> {
     const REPEAT_GROUP_QUALIFIER: &str = "__repeat_group";
 
     let mut current = match select.from.take() {
-        Some(relation) => plan_relation_scoped(relation, cte_registry)?,
+        Some(relation) => plan_relation_scoped(relation, cte_registry, factory)?,
         None => LogicalPlan::Values(ValuesNode {
             rows: vec![vec![]],
             columns: vec![],
@@ -387,6 +411,7 @@ fn plan_select_scoped(
             &select.projection,
             &select.group_by,
             select.having.as_ref(),
+            factory,
         );
         current = LogicalPlan::Aggregate(AggregateNode {
             input: Box::new(current),
@@ -402,14 +427,14 @@ fn plan_select_scoped(
             });
         }
 
-        current = build_window_and_project(current, project_items, &select.projection)?;
+        current = build_window_and_project(current, project_items, &select.projection, factory)?;
     } else {
-        current = build_window_and_project(current, select.projection.clone(), &select.projection)?;
+        current = build_window_and_project(current, select.projection.clone(), &select.projection, factory)?;
     }
 
     // SELECT DISTINCT → Aggregate on all output columns (deduplication)
     if select.distinct {
-        current = build_distinct(current, &select.projection);
+        current = build_distinct(current, &select.projection, factory);
     }
 
     Ok(current)
@@ -445,11 +470,12 @@ fn prepare_repeat_input(
 
     for (original_name, alias_name) in &grouping_key_aliases {
         if let Some(source_expr) = select.group_by.iter().find_map(|expr| match &expr.kind {
-            ExprKind::ColumnRef { qualifier, column }
+            ExprKind::ColumnRef { column_id, qualifier, column }
                 if column.eq_ignore_ascii_case(original_name) =>
             {
                 Some(TypedExpr {
                     kind: ExprKind::ColumnRef {
+                        column_id: *column_id,
                         qualifier: qualifier.clone(),
                         column: column.clone(),
                     },
@@ -473,6 +499,7 @@ fn prepare_repeat_input(
 
     for gb_expr in &mut select.group_by {
         if let ExprKind::ColumnRef {
+            column_id: existing_cid,
             qualifier: _,
             column,
         } = &gb_expr.kind
@@ -481,6 +508,7 @@ fn prepare_repeat_input(
                 .any(|(original_name, _)| column.eq_ignore_ascii_case(original_name))
         {
             gb_expr.kind = ExprKind::ColumnRef {
+                column_id: *existing_cid,
                 qualifier: Some(repeat_group_qualifier.to_string()),
                 column: column.clone(),
             };
@@ -521,7 +549,7 @@ fn collect_repeat_input_refs(
     seen: &mut std::collections::HashSet<(Option<String>, String)>,
 ) {
     match &expr.kind {
-        ExprKind::ColumnRef { qualifier, column } => {
+        ExprKind::ColumnRef { qualifier, column, .. } => {
             if qualifier.is_none() && column.starts_with("__grouping_") {
                 return;
             }
@@ -595,12 +623,14 @@ fn collect_repeat_input_refs(
 
 /// Build a deduplication Aggregate for SELECT DISTINCT.
 /// Uses all projection columns as GROUP BY keys with no aggregate functions.
-fn build_distinct(input: LogicalPlan, projection: &[ProjectItem]) -> LogicalPlan {
+fn build_distinct(input: LogicalPlan, projection: &[ProjectItem], factory: &mut ColumnRefFactory) -> LogicalPlan {
     let mut group_by = Vec::new();
     let mut output_columns = Vec::new();
     for item in projection {
+        let cid = expr_column_id(&item.expr, &item.output_name, factory);
         group_by.push(TypedExpr {
             kind: ExprKind::ColumnRef {
+                column_id: cid,
                 qualifier: None,
                 column: item.output_name.clone(),
             },
@@ -608,6 +638,7 @@ fn build_distinct(input: LogicalPlan, projection: &[ProjectItem]) -> LogicalPlan
             nullable: item.expr.nullable,
         });
         output_columns.push(OutputColumn {
+            column_id: cid,
             name: item.output_name.clone(),
             data_type: item.expr.data_type.clone(),
             nullable: item.expr.nullable,
@@ -629,6 +660,7 @@ fn build_window_and_project(
     input: LogicalPlan,
     project_items: Vec<ProjectItem>,
     original_projection: &[ProjectItem],
+    factory: &mut ColumnRefFactory,
 ) -> Result<LogicalPlan, String> {
     let has_window = project_items.iter().any(|item| has_window_call(&item.expr));
     if has_window {
@@ -636,6 +668,7 @@ fn build_window_and_project(
         let mut output_columns = Vec::new();
         for item in original_projection {
             output_columns.push(OutputColumn {
+                column_id: factory.create(None, item.output_name.clone(), item.expr.data_type.clone(), item.expr.nullable),
                 name: item.output_name.clone(),
                 data_type: item.expr.data_type.clone(),
                 nullable: item.expr.nullable,
@@ -794,6 +827,7 @@ fn rewrite_window_calls(
             });
             TypedExpr {
                 kind: ExprKind::ColumnRef {
+                    column_id: ColumnId::UNSET,
                     qualifier: None,
                     column: win_output_name,
                 },
@@ -1043,6 +1077,7 @@ fn split_projection_for_aggregate(
     projection: &[ProjectItem],
     group_by: &[TypedExpr],
     having: Option<&TypedExpr>,
+    factory: &mut ColumnRefFactory,
 ) -> (Vec<ProjectItem>, Vec<AggregateCall>, Vec<OutputColumn>) {
     let mut agg_calls = Vec::new();
     let mut output_columns = Vec::new();
@@ -1052,6 +1087,7 @@ fn split_projection_for_aggregate(
     for item in projection {
         collect_aggregates(&item.expr, &mut agg_calls);
         output_columns.push(OutputColumn {
+            column_id: expr_column_id(&item.expr, &item.output_name, factory),
             name: item.output_name.clone(),
             data_type: item.expr.data_type.clone(),
             nullable: item.expr.nullable,
@@ -1075,8 +1111,17 @@ fn rewrite_exact_group_by_expr_ref(expr: &TypedExpr, group_by: &[TypedExpr]) -> 
     let expr_name = typed_expr_display_name(expr);
     for gb in group_by {
         if typed_expr_display_name(gb) == expr_name {
+            // Reuse the group-by expression's ColumnId if it is a ColumnRef.
+            let cid = if let ExprKind::ColumnRef { column_id, .. } = &gb.kind {
+                *column_id
+            } else if let ExprKind::ColumnRef { column_id, .. } = &expr.kind {
+                *column_id
+            } else {
+                ColumnId::UNSET
+            };
             return TypedExpr {
                 kind: ExprKind::ColumnRef {
+                    column_id: cid,
                     qualifier: None,
                     column: expr_name,
                 },
@@ -1221,16 +1266,16 @@ fn collect_non_agg_column_refs_inner(
             // Don't recurse into aggregate calls — columns inside aggregates
             // are handled by the aggregate function itself, not as pass-through keys.
         }
-        ExprKind::ColumnRef { qualifier, column } => {
+        ExprKind::ColumnRef { qualifier, column, .. } => {
             if !inside_agg {
                 // Check if this column is already in group_by
                 let already_grouped = group_by.iter().any(|gb| {
-                    matches!(&gb.kind, ExprKind::ColumnRef { qualifier: gq, column: gc }
+                    matches!(&gb.kind, ExprKind::ColumnRef { qualifier: gq, column: gc, .. }
                         if gc == column && gq == qualifier)
                 });
                 // Check if already collected
                 let already_collected = out.iter().any(|o| {
-                    matches!(&o.kind, ExprKind::ColumnRef { qualifier: oq, column: oc }
+                    matches!(&o.kind, ExprKind::ColumnRef { qualifier: oq, column: oc, .. }
                         if oc == column && oq == qualifier)
                 });
                 if !already_grouped && !already_collected {
@@ -1286,6 +1331,7 @@ fn collect_non_agg_column_refs_inner(
 fn plan_relation_scoped(
     relation: Relation,
     cte_registry: &CTERegistry,
+    factory: &mut ColumnRefFactory,
 ) -> Result<LogicalPlan, String> {
     match relation {
         Relation::Scan(scan) => {
@@ -1294,6 +1340,12 @@ fn plan_relation_scoped(
                 .columns
                 .iter()
                 .map(|c| OutputColumn {
+                    column_id: factory.create(
+                        scan.alias.as_ref().or(Some(&scan.table.name)).cloned(),
+                        c.name.clone(),
+                        c.data_type.clone(),
+                        c.nullable,
+                    ),
                     name: c.name.clone(),
                     data_type: c.data_type.clone(),
                     nullable: c.nullable,
@@ -1313,7 +1365,9 @@ fn plan_relation_scoped(
             alias,
             output_columns,
         } => {
-            let inner_plan = plan_scoped_query(*query, cte_registry)?;
+            let inner_plan = plan_scoped_query(*query, cte_registry, factory)?;
+            // SubqueryAlias MUST reuse the inner query's ColumnIds.
+            // The output_columns from the analyzer already carry the right ids.
             Ok(LogicalPlan::SubqueryAlias(SubqueryAliasNode {
                 input: Box::new(inner_plan),
                 alias,
@@ -1343,7 +1397,7 @@ fn plan_relation_scoped(
                             "LATERAL UNNEST currently requires no condition or ON TRUE".into()
                         );
                     }
-                    let left = plan_relation_scoped(left, cte_registry)?;
+                    let left = plan_relation_scoped(left, cte_registry, factory)?;
                     Ok(LogicalPlan::TableFunction(TableFunctionNode {
                         input: Box::new(left),
                         function_name: "unnest".to_string(),
@@ -1354,8 +1408,8 @@ fn plan_relation_scoped(
                     }))
                 }
                 right => {
-                    let left = plan_relation_scoped(left, cte_registry)?;
-                    let right = plan_relation_scoped(right, cte_registry)?;
+                    let left = plan_relation_scoped(left, cte_registry, factory)?;
+                    let right = plan_relation_scoped(right, cte_registry, factory)?;
                     Ok(LogicalPlan::Join(JoinNode {
                         left: Box::new(left),
                         right: Box::new(right),
@@ -1382,8 +1436,8 @@ fn plan_relation_scoped(
             alias,
             output_columns,
         })),
-        Relation::IcebergMetadataScan(rel) => plan_iceberg_metadata_scan(rel),
-        Relation::IcebergDeltaScan(rel) => plan_iceberg_delta_scan(rel),
+        Relation::IcebergMetadataScan(rel) => plan_iceberg_metadata_scan(rel, factory),
+        Relation::IcebergDeltaScan(rel) => plan_iceberg_delta_scan(rel, factory),
     }
 }
 
@@ -1403,7 +1457,7 @@ fn is_lateral_unnest_condition_supported(condition: &Option<TypedExpr>) -> bool 
 /// like any other Scan; codegen branches on the storage variant to emit
 /// an `HDFS_SCAN_NODE` whose lowering wires up the native-Rust
 /// `IcebergMetadataScanOp` (no JNI bridge).
-fn plan_iceberg_metadata_scan(rel: IcebergMetadataScanRelation) -> Result<LogicalPlan, String> {
+fn plan_iceberg_metadata_scan(rel: IcebergMetadataScanRelation, factory: &mut ColumnRefFactory) -> Result<LogicalPlan, String> {
     use crate::sql::analyzer::iceberg_metadata::metadata_table_schema;
     use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
 
@@ -1427,6 +1481,7 @@ fn plan_iceberg_metadata_scan(rel: IcebergMetadataScanRelation) -> Result<Logica
     let output_columns: Vec<OutputColumn> = cols
         .iter()
         .map(|c| OutputColumn {
+            column_id: factory.create(None, c.name.clone(), c.data_type.clone(), c.nullable),
             name: c.name.clone(),
             data_type: c.data_type.clone(),
             nullable: c.nullable,
@@ -1588,7 +1643,7 @@ fn build_iceberg_partitions_payload(files: &[S3FileInfo]) -> Result<String, Stri
 /// storage variant and emits `TPlanNodeType::ICEBERG_DELTA_SCAN_NODE`
 /// (rather than `HDFS_SCAN_NODE`); the lowering layer resolves the
 /// actual change file list via `connector::iceberg::changes::plan_changes`.
-fn plan_iceberg_delta_scan(rel: IcebergDeltaScanRelation) -> Result<LogicalPlan, String> {
+fn plan_iceberg_delta_scan(rel: IcebergDeltaScanRelation, factory: &mut ColumnRefFactory) -> Result<LogicalPlan, String> {
     use crate::sql::catalog::{TableDef, TableStorage};
 
     // Output schema: base columns + iceberg v3 row-lineage metadata columns.
@@ -1600,6 +1655,7 @@ fn plan_iceberg_delta_scan(rel: IcebergDeltaScanRelation) -> Result<LogicalPlan,
         .columns
         .iter()
         .map(|c| OutputColumn {
+            column_id: factory.create(None, c.name.clone(), c.data_type.clone(), c.nullable),
             name: c.name.clone(),
             data_type: c.data_type.clone(),
             nullable: c.nullable,
@@ -1607,6 +1663,7 @@ fn plan_iceberg_delta_scan(rel: IcebergDeltaScanRelation) -> Result<LogicalPlan,
         .collect();
     for col in &rel.table.iceberg_row_lineage_metadata_columns {
         output_columns.push(OutputColumn {
+            column_id: factory.create(None, col.name.clone(), col.data_type.clone(), col.nullable),
             name: col.name.clone(),
             data_type: col.data_type.clone(),
             nullable: col.nullable,
@@ -1646,9 +1703,10 @@ fn plan_iceberg_delta_scan(rel: IcebergDeltaScanRelation) -> Result<LogicalPlan,
 fn plan_set_operation_scoped(
     set_op: ResolvedSetOp,
     cte_registry: &CTERegistry,
+    factory: &mut ColumnRefFactory,
 ) -> Result<LogicalPlan, String> {
-    let left = plan_scoped_query(*set_op.left, cte_registry)?;
-    let right = plan_scoped_query(*set_op.right, cte_registry)?;
+    let left = plan_scoped_query(*set_op.left, cte_registry, factory)?;
+    let right = plan_scoped_query(*set_op.right, cte_registry, factory)?;
 
     match set_op.kind {
         SetOpKind::Union => Ok(LogicalPlan::Union(UnionNode {
@@ -1668,15 +1726,19 @@ fn plan_set_operation_scoped(
 // VALUES planning
 // ---------------------------------------------------------------------------
 
-fn plan_values(values: ResolvedValues) -> Result<LogicalPlan, String> {
+fn plan_values(values: ResolvedValues, factory: &mut ColumnRefFactory) -> Result<LogicalPlan, String> {
     let columns = values
         .column_types
         .iter()
         .enumerate()
-        .map(|(i, dt)| OutputColumn {
-            name: format!("column_{}", i),
-            data_type: dt.clone(),
-            nullable: true,
+        .map(|(i, dt)| {
+            let name = format!("column_{}", i);
+            OutputColumn {
+                column_id: factory.create(None, name.clone(), dt.clone(), true),
+                name,
+                data_type: dt.clone(),
+                nullable: true,
+            }
         })
         .collect();
     Ok(LogicalPlan::Values(ValuesNode {
@@ -1771,9 +1833,9 @@ mod tests {
             sqlparser::ast::Statement::Query(q) => q,
             _ => return Err("expected query".into()),
         };
-        let (resolved, cte_registry) =
+        let (resolved, cte_registry, mut factory) =
             crate::sql::analyzer::analyze(&query, &TestCatalog, "default")?;
-        plan_query(resolved, cte_registry)
+        plan_query(resolved, cte_registry, &mut factory)
     }
 
     fn find_subquery_input(plan: &LogicalPlan) -> Option<&LogicalPlan> {
@@ -1853,7 +1915,7 @@ mod tests {
         let LogicalPlan::Project(project) = *sort.input else {
             panic!("expected Project under Sort");
         };
-        let ExprKind::ColumnRef { qualifier, column } = &project.items[0].expr.kind else {
+        let ExprKind::ColumnRef { qualifier, column, .. } = &project.items[0].expr.kind else {
             panic!(
                 "expected group key projection to be a ColumnRef, got {:?}",
                 project.items[0].expr

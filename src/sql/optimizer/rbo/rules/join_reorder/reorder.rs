@@ -1268,6 +1268,7 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{BinOp, ExprKind, JoinKind, OutputColumn, TypedExpr};
     use crate::sql::catalog::{ColumnDef, S3FileInfo, TableDef, TableStorage};
+    use crate::sql::column_id::ColumnId;
     use arrow::datatypes::DataType;
 
     /// Helper: build a `TableDef` backed by S3 parquet files with the given
@@ -1310,6 +1311,7 @@ mod tests {
             table: table.clone(),
             alias: None,
             columns: vec![OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "id".to_string(),
                 data_type: DataType::Int32,
                 nullable: false,
@@ -1324,6 +1326,7 @@ mod tests {
             kind: ExprKind::BinaryOp {
                 left: Box::new(TypedExpr {
                     kind: ExprKind::ColumnRef {
+                        column_id: ColumnId::UNSET,
                         qualifier: Some("a".to_string()),
                         column: "id".to_string(),
                     },
@@ -1333,6 +1336,7 @@ mod tests {
                 op: BinOp::Eq,
                 right: Box::new(TypedExpr {
                     kind: ExprKind::ColumnRef {
+                        column_id: ColumnId::UNSET,
                         qualifier: Some("b".to_string()),
                         column: "id".to_string(),
                     },
@@ -1665,6 +1669,7 @@ mod tests {
             table: table.clone(),
             alias: Some(alias.to_string()),
             columns: vec![OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "id".to_string(),
                 data_type: DataType::Int32,
                 nullable: false,
@@ -1679,6 +1684,7 @@ mod tests {
             kind: ExprKind::BinaryOp {
                 left: Box::new(TypedExpr {
                     kind: ExprKind::ColumnRef {
+                        column_id: ColumnId::UNSET,
                         qualifier: Some(left_q.to_string()),
                         column: "id".to_string(),
                     },
@@ -1688,6 +1694,7 @@ mod tests {
                 op: BinOp::Eq,
                 right: Box::new(TypedExpr {
                     kind: ExprKind::ColumnRef {
+                        column_id: ColumnId::UNSET,
                         qualifier: Some(right_q.to_string()),
                         column: "id".to_string(),
                     },

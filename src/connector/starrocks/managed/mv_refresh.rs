@@ -1322,6 +1322,7 @@ fn query_result_column_to_output_column(
     column: &crate::engine::QueryResultColumn,
 ) -> Result<crate::sql::analysis::OutputColumn, String> {
     Ok(crate::sql::analysis::OutputColumn {
+        column_id: crate::sql::column_id::ColumnId::UNSET,
         name: column.name.clone(),
         data_type: column.data_type.clone(),
         nullable: column.nullable,
@@ -1866,6 +1867,7 @@ mod tests {
     use crate::meta::MetaStoreProvider;
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
     use crate::sql::analysis::OutputColumn;
+    use crate::sql::column_id::ColumnId;
     use crate::sql::parser::ast::{TableKeyDesc, TableKeyKind};
     use arrow::array::{Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -4373,16 +4375,19 @@ enable_path_style_access = true
     fn aggregate_output_columns() -> Vec<OutputColumn> {
         vec![
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "k1".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
             },
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "c".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
             },
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "s".to_string(),
                 data_type: DataType::Int64,
                 nullable: true,

@@ -536,10 +536,7 @@ fn format_physical_node(
                 DistributionSpec::HashPartitioned(cols) => {
                     let col_names: Vec<String> = cols
                         .iter()
-                        .map(|c| match &c.qualifier {
-                            Some(q) => format!("{q}.{}", c.column),
-                            None => c.column.clone(),
-                        })
+                        .map(|c| format!("{}", c))
                         .collect();
                     format!("HASH EXCHANGE (hash: [{}])", col_names.join(", "))
                 }
@@ -1016,7 +1013,7 @@ fn format_expr(expr: &TypedExpr) -> String {
 
 fn format_expr_kind(kind: &ExprKind) -> String {
     match kind {
-        ExprKind::ColumnRef { qualifier, column } => match qualifier {
+        ExprKind::ColumnRef { qualifier, column, .. } => match qualifier {
             Some(q) => format!("{q}.{column}"),
             None => column.clone(),
         },
@@ -1173,6 +1170,7 @@ mod tests {
     use super::{ExplainLevel, explain_physical_plan, format_stats_trailer};
     use crate::sql::analysis::OutputColumn;
     use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
+    use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{Operator, PhysicalScanOp};
     use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
     use crate::sql::optimizer::statistics::Statistics;
@@ -1201,6 +1199,7 @@ mod tests {
                 },
                 alias: None,
                 columns: vec![OutputColumn {
+                    column_id: ColumnId::UNSET,
                     name: column.name.clone(),
                     data_type: column.data_type.clone(),
                     nullable: column.nullable,
@@ -1248,6 +1247,7 @@ mod tests {
                 },
                 alias: None,
                 columns: vec![OutputColumn {
+                    column_id: ColumnId::UNSET,
                     name: column.name.clone(),
                     data_type: column.data_type.clone(),
                     nullable: column.nullable,
@@ -1294,6 +1294,7 @@ mod tests {
                 },
                 alias: None,
                 columns: vec![OutputColumn {
+                    column_id: ColumnId::UNSET,
                     name: column.name.clone(),
                     data_type: column.data_type.clone(),
                     nullable: column.nullable,
@@ -1360,6 +1361,7 @@ mod tests {
                 },
                 alias: None,
                 columns: vec![OutputColumn {
+                    column_id: ColumnId::UNSET,
                     name: column.name.clone(),
                     data_type: column.data_type.clone(),
                     nullable: column.nullable,

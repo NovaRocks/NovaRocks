@@ -243,7 +243,7 @@ fn classify_column_ref(
     right_cols: &HashSet<(Option<String>, String)>,
 ) -> Option<(Side, String)> {
     match &expr.kind {
-        ExprKind::ColumnRef { qualifier, column } => {
+        ExprKind::ColumnRef { qualifier, column, .. } => {
             let reference = (
                 qualifier.as_ref().map(|q| q.to_ascii_lowercase()),
                 column.to_ascii_lowercase(),
@@ -425,6 +425,7 @@ fn add_not_null_filter(plan: LogicalPlan, scan: &ScanNode, columns: &[String]) -
                             data_type: output.data_type.clone(),
                             nullable: output.nullable,
                             kind: ExprKind::ColumnRef {
+                                column_id: crate::sql::column_id::ColumnId::UNSET,
                                 qualifier: Some(qualifier.clone()),
                                 column: output.name.clone(),
                             },

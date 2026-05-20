@@ -11,6 +11,7 @@ use super::physical_plan::PhysicalPlanNode;
 use super::property::{OrderingSpec, PhysicalPropertySet};
 use super::search::{EnforcerKind, Winner, required_input_properties};
 use crate::sql::analysis::{ExprKind, SortItem, TypedExpr};
+use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::statistics::Statistics;
 
 /// Extract the best physical plan tree from the Memo.
@@ -140,8 +141,9 @@ fn ordering_spec_to_sort_items(ordering: &OrderingSpec) -> Vec<SortItem> {
             .map(|sk| SortItem {
                 expr: TypedExpr {
                     kind: ExprKind::ColumnRef {
-                        qualifier: sk.column.qualifier.clone(),
-                        column: sk.column.column.clone(),
+                        column_id: sk.column,
+                        qualifier: None,
+                        column: format!("{}", sk.column),
                     },
                     data_type: arrow::datatypes::DataType::Null,
                     nullable: true,

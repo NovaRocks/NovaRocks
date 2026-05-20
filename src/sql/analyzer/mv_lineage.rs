@@ -193,7 +193,7 @@ impl<'a> QualifiedLineageCollector<'a> {
         kind: &mut ExpressionKindHint,
     ) -> Result<(), String> {
         match &expr.kind {
-            ExprKind::ColumnRef { qualifier, column } => {
+            ExprKind::ColumnRef { qualifier, column, .. } => {
                 kind.saw_column();
                 let qualifier = qualifier
                     .as_ref()
@@ -308,7 +308,7 @@ impl<'a> QualifiedLineageCollector<'a> {
         &mut self,
         expr: &TypedExpr,
     ) -> Result<QualifiedFieldLineage, String> {
-        let ExprKind::ColumnRef { qualifier, column } = &unwrap_nested_expr(expr).kind else {
+        let ExprKind::ColumnRef { qualifier, column, .. } = &unwrap_nested_expr(expr).kind else {
             return Err(
                 "incremental join MV join key must be a qualified column reference".to_string(),
             );
@@ -494,7 +494,7 @@ fn collect_column_refs(
     kind: &mut ExpressionKindHint,
 ) {
     match &expr.kind {
-        ExprKind::ColumnRef { qualifier, column } => {
+        ExprKind::ColumnRef { qualifier, column, .. } => {
             out.push((qualifier.clone(), column.clone()));
             kind.saw_column();
         }
@@ -671,7 +671,7 @@ mod tests {
             let sqlparser::ast::Statement::Query(query) = stmt else {
                 panic!("expected query");
             };
-            let (resolved, _registry) =
+            let (resolved, _registry, _factory) =
                 crate::sql::analyzer::analyze(&query, &SingleLineageCatalog, "default")
                     .expect("analyze");
             resolved
@@ -767,7 +767,7 @@ mod tests {
             let sqlparser::ast::Statement::Query(query) = stmt else {
                 panic!("expected query");
             };
-            let (resolved, _registry) =
+            let (resolved, _registry, _factory) =
                 crate::sql::analyzer::analyze(&query, &JoinLineageCatalog, "default")
                     .expect("analyze");
             resolved

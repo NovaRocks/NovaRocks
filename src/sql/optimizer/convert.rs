@@ -304,6 +304,7 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, TypedExpr};
     use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
+    use crate::sql::column_id::ColumnId;
     use crate::sql::planner::plan::{FilterNode, ScanNode};
     use arrow::datatypes::DataType;
     use std::path::PathBuf;
@@ -328,6 +329,7 @@ mod tests {
 
     fn dummy_output_columns() -> Vec<OutputColumn> {
         vec![OutputColumn {
+            column_id: ColumnId::UNSET,
             name: "id".to_string(),
             data_type: DataType::Int32,
             nullable: false,

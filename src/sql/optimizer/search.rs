@@ -12,6 +12,7 @@ use super::memo::{Cost, GroupId, Memo};
 use super::operator::*;
 use super::property::*;
 use super::stats::derive_statistics;
+use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::statistics::TableStatistics;
 
 // ---------------------------------------------------------------------------
@@ -296,7 +297,7 @@ fn output_properties(op: &Operator) -> PhysicalPropertySet {
             let mut all_columns = true;
             for we in &w.window_exprs {
                 for pbe in &we.partition_by {
-                    if let Some(col) = typed_expr_to_column_ref(pbe) {
+                    if let Some(col) = typed_expr_to_column_id(pbe) {
                         if !partition_cols.contains(&col) {
                             partition_cols.push(col);
                         }
@@ -318,7 +319,7 @@ fn output_properties(op: &Operator) -> PhysicalPropertySet {
         // Hash join (Shuffle): output is Hash(left_eq_keys).
         Operator::PhysicalHashJoin(j) => match j.distribution {
             JoinDistribution::Shuffle => {
-                let cols = eq_keys_to_column_refs(&j.eq_conditions, Side::Left);
+                let cols = eq_keys_to_column_ids(&j.eq_conditions, Side::Left);
                 PhysicalPropertySet {
                     distribution: if cols.is_empty() {
                         DistributionSpec::Any
@@ -343,7 +344,7 @@ fn output_properties(op: &Operator) -> PhysicalPropertySet {
         //   - Local: Hash(group_keys)
         //   - Global: Hash(group_keys)
         Operator::PhysicalHashAggregate(a) => {
-            let cols = typed_exprs_to_column_refs(&a.group_by);
+            let cols = typed_exprs_to_column_ids(&a.group_by);
             if cols.is_empty() {
                 // Scalar aggregate -> result is a single row.
                 PhysicalPropertySet::gather()
@@ -365,7 +366,7 @@ fn output_properties(op: &Operator) -> PhysicalPropertySet {
                 .items
                 .iter()
                 .filter_map(|item| {
-                    typed_expr_to_column_ref(&item.expr).map(|col| SortKey {
+                    typed_expr_to_column_id(&item.expr).map(|col| SortKey {
                         column: col,
                         asc: item.asc,
                         nulls_first: item.nulls_first,
@@ -375,7 +376,7 @@ fn output_properties(op: &Operator) -> PhysicalPropertySet {
             let distribution = if s.analytic_partition_exprs.is_empty() {
                 DistributionSpec::Gather
             } else {
-                let partition_cols = typed_exprs_to_column_refs(&s.analytic_partition_exprs);
+                let partition_cols = typed_exprs_to_column_ids(&s.analytic_partition_exprs);
                 if partition_cols.len() == s.analytic_partition_exprs.len() {
                     DistributionSpec::HashPartitioned(partition_cols)
                 } else {
@@ -401,7 +402,7 @@ fn output_properties(op: &Operator) -> PhysicalPropertySet {
                 .items
                 .iter()
                 .filter_map(|item| {
-                    typed_expr_to_column_ref(&item.expr).map(|col| SortKey {
+                    typed_expr_to_column_id(&item.expr).map(|col| SortKey {
                         column: col,
                         asc: item.asc,
                         nulls_first: item.nulls_first,
@@ -468,15 +469,15 @@ pub(super) fn required_input_properties(
         // handles join reorder swapping the eq condition pair order.
         Operator::PhysicalHashJoin(j) => match j.distribution {
             JoinDistribution::Shuffle => {
-                let all_cols: Vec<ColumnRef> = j
+                let all_cols: Vec<ColumnId> = j
                     .eq_conditions
                     .iter()
                     .flat_map(|eq| {
                         let mut v = Vec::new();
-                        if let Some(c) = typed_expr_to_column_ref(&eq.left) {
+                        if let Some(c) = typed_expr_to_column_id(&eq.left) {
                             v.push(c);
                         }
-                        if let Some(c) = typed_expr_to_column_ref(&eq.right) {
+                        if let Some(c) = typed_expr_to_column_id(&eq.right) {
                             v.push(c);
                         }
                         v
@@ -530,7 +531,7 @@ pub(super) fn required_input_properties(
             }
             AggMode::Local => vec![PhysicalPropertySet::any()],
             AggMode::Global => {
-                let cols = typed_exprs_to_column_refs(&a.group_by);
+                let cols = typed_exprs_to_column_ids(&a.group_by);
                 if cols.is_empty() {
                     vec![PhysicalPropertySet::gather()]
                 } else {
@@ -544,7 +545,7 @@ pub(super) fn required_input_properties(
             // group_by includes the distinct column, so the enforcer inserts a
             // Hash(group_by) exchange between LOCAL and DISTINCT_GLOBAL.
             AggMode::DistinctGlobal => {
-                let cols = typed_exprs_to_column_refs(&a.group_by);
+                let cols = typed_exprs_to_column_ids(&a.group_by);
                 if cols.is_empty() {
                     // Shouldn't happen — SplitDistinctAgg always adds the
                     // distinct column to group_by — but handle defensively.
@@ -574,7 +575,7 @@ pub(super) fn required_input_properties(
             // `ColumnRef`s. Convert here and fall back to Gather if any
             // partition expression isn't a plain column reference (very
             // rare — partition_by is almost always a column).
-            let partition_cols = typed_exprs_to_column_refs(&sort.analytic_partition_exprs);
+            let partition_cols = typed_exprs_to_column_ids(&sort.analytic_partition_exprs);
             if partition_cols.is_empty()
                 || partition_cols.len() != sort.analytic_partition_exprs.len()
             {
@@ -621,7 +622,7 @@ pub(super) fn required_input_properties(
             let mut partition_cols = Vec::new();
             for we in &w.window_exprs {
                 for pbe in &we.partition_by {
-                    if let Some(col) = typed_expr_to_column_ref(pbe)
+                    if let Some(col) = typed_expr_to_column_id(pbe)
                         && !partition_cols.contains(&col)
                     {
                         partition_cols.push(col);
@@ -742,11 +743,11 @@ enum Side {
     Right,
 }
 
-/// Extract `ColumnRef`s from the left or right side of equi-join conditions.
-fn eq_keys_to_column_refs(
+/// Extract `ColumnId`s from the left or right side of equi-join conditions.
+fn eq_keys_to_column_ids(
     eq_conditions: &[crate::sql::optimizer::operator::PhysicalHashJoinEqCondition],
     side: Side,
-) -> Vec<ColumnRef> {
+) -> Vec<ColumnId> {
     eq_conditions
         .iter()
         .filter_map(|eq| {
@@ -754,26 +755,23 @@ fn eq_keys_to_column_refs(
                 Side::Left => &eq.left,
                 Side::Right => &eq.right,
             };
-            typed_expr_to_column_ref(expr)
+            typed_expr_to_column_id(expr)
         })
         .collect()
 }
 
-/// Try to extract a `ColumnRef` from a `TypedExpr`.
+/// Try to extract a `ColumnId` from a `TypedExpr`.
 /// Only succeeds for direct column references.
-fn typed_expr_to_column_ref(expr: &crate::sql::analysis::TypedExpr) -> Option<ColumnRef> {
+fn typed_expr_to_column_id(expr: &crate::sql::analysis::TypedExpr) -> Option<ColumnId> {
     match &expr.kind {
-        crate::sql::analysis::ExprKind::ColumnRef { qualifier, column } => Some(ColumnRef {
-            qualifier: qualifier.clone(),
-            column: column.clone(),
-        }),
+        crate::sql::analysis::ExprKind::ColumnRef { column_id, .. } => Some(*column_id),
         _ => None,
     }
 }
 
-/// Extract `ColumnRef`s from a list of `TypedExpr`, skipping non-column-refs.
-fn typed_exprs_to_column_refs(exprs: &[crate::sql::analysis::TypedExpr]) -> Vec<ColumnRef> {
-    exprs.iter().filter_map(typed_expr_to_column_ref).collect()
+/// Extract `ColumnId`s from a list of `TypedExpr`, skipping non-column-refs.
+fn typed_exprs_to_column_ids(exprs: &[crate::sql::analysis::TypedExpr]) -> Vec<ColumnId> {
+    exprs.iter().filter_map(typed_expr_to_column_id).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -905,6 +903,7 @@ mod tests {
 
         let col_ref = crate::sql::analysis::TypedExpr {
             kind: crate::sql::analysis::ExprKind::ColumnRef {
+                column_id: ColumnId(1),
                 qualifier: None,
                 column: "id".into(),
             },
@@ -931,6 +930,7 @@ mod tests {
 
         let col_c0 = TypedExpr {
             kind: ExprKind::ColumnRef {
+                column_id: ColumnId(2),
                 qualifier: None,
                 column: "c0".into(),
             },
@@ -956,7 +956,7 @@ mod tests {
         match &props.distribution {
             DistributionSpec::HashPartitioned(cols) => {
                 assert_eq!(cols.len(), 1);
-                assert_eq!(cols[0].column, "c0");
+                assert_eq!(cols[0], ColumnId(2));
             }
             other => panic!("expected HashPartitioned([c0]), got {:?}", other),
         }
@@ -989,6 +989,7 @@ mod tests {
     fn output_properties_hash_agg_with_group_by() {
         let col_ref = crate::sql::analysis::TypedExpr {
             kind: crate::sql::analysis::ExprKind::ColumnRef {
+                column_id: ColumnId(3),
                 qualifier: Some("t".into()),
                 column: "city".into(),
             },
@@ -1006,7 +1007,7 @@ mod tests {
         match &props.distribution {
             DistributionSpec::HashPartitioned(cols) => {
                 assert_eq!(cols.len(), 1);
-                assert_eq!(cols[0].column, "city");
+                assert_eq!(cols[0], ColumnId(3));
             }
             other => panic!("expected HashPartitioned, got {:?}", other),
         }
@@ -1018,6 +1019,7 @@ mod tests {
 
         let col_g = TypedExpr {
             kind: ExprKind::ColumnRef {
+                column_id: ColumnId(4),
                 qualifier: None,
                 column: "g".into(),
             },
@@ -1026,6 +1028,7 @@ mod tests {
         };
         let col_x = TypedExpr {
             kind: ExprKind::ColumnRef {
+                column_id: ColumnId(5),
                 qualifier: None,
                 column: "x".into(),
             },
@@ -1069,6 +1072,7 @@ mod tests {
 
         let left_key = TypedExpr {
             kind: ExprKind::ColumnRef {
+                column_id: ColumnId(6),
                 qualifier: Some("a".into()),
                 column: "id".into(),
             },
@@ -1077,6 +1081,7 @@ mod tests {
         };
         let right_key = TypedExpr {
             kind: ExprKind::ColumnRef {
+                column_id: ColumnId(7),
                 qualifier: Some("b".into()),
                 column: "id".into(),
             },
@@ -1110,26 +1115,24 @@ mod tests {
                     assert_eq!(
                         cols.len(),
                         2,
-                        "{} side should receive both eq column refs",
+                        "{} side should receive both eq column ids",
                         side_label
                     );
-                    let qualifiers: std::collections::HashSet<&str> =
-                        cols.iter().filter_map(|c| c.qualifier.as_deref()).collect();
+                    // Both sides should get ColumnId(6) (a.id) and ColumnId(7) (b.id).
+                    let ids: std::collections::HashSet<ColumnId> =
+                        cols.iter().copied().collect();
                     assert!(
-                        qualifiers.contains("a"),
-                        "{} side missing a.id, got qualifiers {:?}",
+                        ids.contains(&ColumnId(6)),
+                        "{} side missing ColumnId(6), got {:?}",
                         side_label,
-                        qualifiers
+                        ids
                     );
                     assert!(
-                        qualifiers.contains("b"),
-                        "{} side missing b.id, got qualifiers {:?}",
+                        ids.contains(&ColumnId(7)),
+                        "{} side missing ColumnId(7), got {:?}",
                         side_label,
-                        qualifiers
+                        ids
                     );
-                    for c in cols {
-                        assert_eq!(c.column, "id");
-                    }
                 }
                 other => panic!(
                     "expected HashPartitioned for {} side, got {:?}",

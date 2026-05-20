@@ -2344,10 +2344,10 @@ fn explain_analyze_query(
     // an acknowledged limitation; per-operator profile merge in a
     // follow-up PR will replace the query-level timing summary.
     let t_plan = Instant::now();
-    let (resolved, cte_registry) = crate::sql::analyzer::analyze(query, catalog, current_database)?;
-    let logical = crate::sql::planner::plan_query(resolved, cte_registry)?;
+    let (resolved, cte_registry, mut factory) = crate::sql::analyzer::analyze(query, catalog, current_database)?;
+    let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
     let table_stats = build_table_stats_from_plan(&logical);
-    let physical = crate::sql::optimizer::optimize(logical, &table_stats)?;
+    let physical = crate::sql::optimizer::optimize(logical, &table_stats, factory)?;
     let planning_ms = t_plan.elapsed().as_millis() as u64;
 
     let t_exec = Instant::now();
@@ -2373,10 +2373,10 @@ fn explain_query(
 ) -> Result<QueryResult, String> {
     use crate::sql::explain::{ExplainLevel, explain_physical_plan};
 
-    let (resolved, cte_registry) = crate::sql::analyzer::analyze(query, catalog, current_database)?;
-    let logical = crate::sql::planner::plan_query(resolved, cte_registry)?;
+    let (resolved, cte_registry, mut factory) = crate::sql::analyzer::analyze(query, catalog, current_database)?;
+    let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
     let table_stats = build_table_stats_from_plan(&logical);
-    let physical = crate::sql::optimizer::optimize(logical, &table_stats)?;
+    let physical = crate::sql::optimizer::optimize(logical, &table_stats, factory)?;
 
     let mut lines = Vec::new();
     if matches!(level, ExplainLevel::Costs) {
@@ -2428,10 +2428,10 @@ pub(crate) fn execute_query_with_options(
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
 ) -> Result<QueryResult, String> {
-    let (resolved, cte_registry) = crate::sql::analyzer::analyze(query, catalog, current_database)?;
-    let logical = crate::sql::planner::plan_query(resolved, cte_registry)?;
+    let (resolved, cte_registry, mut factory) = crate::sql::analyzer::analyze(query, catalog, current_database)?;
+    let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
     let table_stats = build_table_stats_from_plan(&logical);
-    let mut physical = crate::sql::optimizer::optimize(logical, &table_stats)?;
+    let mut physical = crate::sql::optimizer::optimize(logical, &table_stats, factory)?;
     // Unit-test states may not start the standalone exchange server. IVM-A1
     // internal queries also pass runtime-local handles (`terminal_sink` or
     // `iceberg_catalogs`) that coordinated fragments cannot currently clone
@@ -3805,11 +3805,11 @@ enable_path_style_access = true
             panic!("expected query statement");
         };
 
-        let (resolved, cte_registry) =
+        let (resolved, cte_registry, mut factory) =
             crate::sql::analyzer::analyze(&query, &catalog, "default").expect("analyze query");
-        let logical = crate::sql::planner::plan_query(resolved, cte_registry).expect("plan query");
+        let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory).expect("plan query");
         let table_stats = super::build_table_stats_from_plan(&logical);
-        let physical = crate::sql::optimizer::optimize(logical, &table_stats).expect("optimize");
+        let physical = crate::sql::optimizer::optimize(logical, &table_stats, factory).expect("optimize");
         crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
             &physical, &catalog, "default",
         )

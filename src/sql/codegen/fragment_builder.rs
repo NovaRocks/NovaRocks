@@ -23,6 +23,7 @@ use crate::types;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::catalog::CatalogProvider;
 use crate::sql::codegen::FragmentId;
+use crate::sql::column_id::ColumnId;
 use crate::sql::codegen::descriptors::DescriptorTableBuilder;
 use crate::sql::codegen::expr_compiler::{self, ExprCompiler};
 use crate::sql::codegen::helpers::{
@@ -661,6 +662,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             if let ExprKind::ColumnRef {
                 qualifier: Some(ref q),
                 ref column,
+                ..
             } = item.expr.kind
             {
                 project_scope.add_qualified_alias(
@@ -1008,6 +1010,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             if let ExprKind::ColumnRef {
                 qualifier: Some(ref q),
                 ref column,
+                ..
             } = gb_expr.kind
             {
                 agg_scope.add_qualified_alias(q.clone(), column.clone(), binding);
@@ -1399,7 +1402,7 @@ impl<'a> PlanFragmentBuilder<'a> {
 
         // Close the partial fragment with Unpartitioned/Gather sender into the merging exchange.
         let gather_spec = crate::sql::optimizer::property::DistributionSpec::Gather;
-        let output_partition = self.build_output_partition(&gather_spec, &child_scope)?;
+        let output_partition = self.build_output_partition(&gather_spec, &child_scope, &node.children[0].output_columns)?;
         let exchange_partition_type = output_partition.type_;
 
         self.completed_fragments.push(FragmentBuildResult {
@@ -1509,7 +1512,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         } = child;
 
         let gather_spec = crate::sql::optimizer::property::DistributionSpec::Gather;
-        let output_partition = self.build_output_partition(&gather_spec, &child_scope)?;
+        let output_partition = self.build_output_partition(&gather_spec, &child_scope, &node.children[0].output_columns)?;
         let exchange_partition_type = output_partition.type_;
 
         self.completed_fragments.push(FragmentBuildResult {
@@ -2116,6 +2119,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             table: table_def,
             alias: op.alias.clone(),
             columns: vec![crate::sql::analysis::OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: col_name.clone(),
                 data_type: ArrowDataType::Int64,
                 nullable: false,
@@ -2627,6 +2631,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         &self,
         spec: &crate::sql::optimizer::property::DistributionSpec,
         child_scope: &ExprScope,
+        output_columns: &[crate::sql::analysis::OutputColumn],
     ) -> Result<partitions::TDataPartition, String> {
         match spec {
             crate::sql::optimizer::property::DistributionSpec::Gather => {
@@ -2635,14 +2640,24 @@ impl<'a> PlanFragmentBuilder<'a> {
             crate::sql::optimizer::property::DistributionSpec::HashPartitioned(cols) => {
                 // For shuffle joins, cols contains ALL eq key columns from both
                 // sides. Pick the ones that resolve in this child's scope.
+                //
+                // Look up column names from the plan node's output_columns using
+                // the ColumnId. When the analyzer assigns real ColumnIds this
+                // will be a direct id-match; during the UNSET-bootstrap phase
+                // the lookup may not find a match and the branch falls through.
                 let mut partition_exprs = Vec::new();
                 let mut used = std::collections::HashSet::new();
-                for col in cols.iter() {
-                    if used.contains(&col.column.to_lowercase()) {
+                for col_id in cols.iter() {
+                    let col_meta = output_columns.iter().find(|oc| oc.column_id == *col_id);
+                    let col_name = match col_meta {
+                        Some(oc) => oc.name.clone(),
+                        None => continue, // column not in this child's output
+                    };
+                    if used.contains(&col_name.to_lowercase()) {
                         continue; // skip duplicate column names
                     }
                     if let Ok(binding) =
-                        child_scope.resolve_column(col.qualifier.as_deref(), &col.column)
+                        child_scope.resolve_column(None, &col_name)
                     {
                         let binding = binding.clone();
                         let type_desc = expr_compiler::binding_type_desc(&binding)?;
@@ -2651,13 +2666,13 @@ impl<'a> PlanFragmentBuilder<'a> {
                             binding.tuple_id,
                             type_desc,
                         ));
-                        used.insert(col.column.to_lowercase());
+                        used.insert(col_name.to_lowercase());
                     }
                 }
                 if partition_exprs.is_empty() {
                     return Err(format!(
                         "no hash partition columns resolved in child scope from {:?}",
-                        cols.iter().map(|c| &c.column).collect::<Vec<_>>()
+                        cols
                     ));
                 }
                 Ok(partitions::TDataPartition::new(
@@ -2698,7 +2713,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             cte_exchange_nodes,
         } = child;
 
-        let output_partition = self.build_output_partition(&op.spec, &scope)?;
+        let output_partition = self.build_output_partition(&op.spec, &scope, &node.children[0].output_columns)?;
         let exchange_partition_type = output_partition.type_;
 
         self.completed_fragments.push(FragmentBuildResult {
@@ -2831,6 +2846,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                     .scope
                     .iter_columns()
                     .map(|(name, binding)| crate::sql::analysis::OutputColumn {
+                        column_id: ColumnId::UNSET,
                         name: name.clone(),
                         data_type: binding.data_type.clone(),
                         nullable: binding.nullable,
@@ -3310,6 +3326,7 @@ mod tests {
 
     fn output_columns() -> Vec<OutputColumn> {
         vec![OutputColumn {
+            column_id: crate::sql::column_id::ColumnId::UNSET,
             name: "id".to_string(),
             data_type: DataType::Int32,
             nullable: false,
@@ -3319,6 +3336,7 @@ mod tests {
     fn id_expr() -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
+                column_id: crate::sql::column_id::ColumnId::UNSET,
                 qualifier: None,
                 column: "id".to_string(),
             },
@@ -3985,6 +4003,7 @@ mod tests {
                 eq_conditions: vec![PhysicalHashJoinEqCondition {
                     left: TypedExpr {
                         kind: ExprKind::ColumnRef {
+                            column_id: crate::sql::column_id::ColumnId::UNSET,
                             qualifier: Some("ice_t".to_string()),
                             column: "id".to_string(),
                         },
@@ -3993,6 +4012,7 @@ mod tests {
                     },
                     right: TypedExpr {
                         kind: ExprKind::ColumnRef {
+                            column_id: crate::sql::column_id::ColumnId::UNSET,
                             qualifier: Some("managed_t".to_string()),
                             column: "id".to_string(),
                         },
@@ -4114,10 +4134,7 @@ mod tests {
         let plan = PhysicalPlanNode {
             op: Operator::PhysicalDistribution(PhysicalDistributionOp {
                 spec: DistributionSpec::HashPartitioned(vec![
-                    crate::sql::optimizer::property::ColumnRef {
-                        qualifier: None,
-                        column: "id".to_string(),
-                    },
+                    crate::sql::column_id::ColumnId::UNSET,
                 ]),
             }),
             children: vec![scan_plan(file.path().to_path_buf())],

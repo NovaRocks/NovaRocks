@@ -21,6 +21,7 @@ use crate::meta::repository::managed_lake::{
 use crate::meta::repository::mv::CreateMvDefinitionRequest;
 use crate::service::grpc_client::proto::starrocks::DeleteTabletRequest;
 use crate::sql::analysis::{ExprKind, OutputColumn, QueryBody, ResolvedQuery};
+use crate::sql::column_id::ColumnId;
 use crate::sql::parser::ast::{
     CreateMaterializedViewStmt, DropMaterializedViewStmt, IcebergPartitionFieldExpr,
     MaterializedViewDistribution, ObjectName, ShowMaterializedViewsStmt, SqlType, TableColumnDef,
@@ -952,7 +953,7 @@ pub(crate) fn analyze_mv_select(
         crate::sql::parser::query_refs::strip_catalog_from_three_part_names(&mut analyzed_query);
     }
     let catalog = state.catalog.read().expect("standalone catalog read lock");
-    let (resolved, _) =
+    let (resolved, _, _factory) =
         crate::sql::analyzer::analyze(&analyzed_query, &*catalog, current_database)?;
     drop(catalog);
 
@@ -1133,6 +1134,7 @@ fn resolved_output_columns_from_body(resolved: &ResolvedQuery) -> Vec<OutputColu
             .projection
             .iter()
             .map(|item| OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: item.output_name.clone(),
                 data_type: item.expr.data_type.clone(),
                 nullable: item.expr.nullable,
@@ -1964,6 +1966,7 @@ mod tests {
     #[test]
     fn managed_mv_partition_validation_rejects_iceberg_transforms() {
         let output_columns = vec![OutputColumn {
+            column_id: ColumnId::UNSET,
             name: "ts".to_string(),
             data_type: DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
             nullable: true,
@@ -2003,6 +2006,7 @@ mod tests {
 
         let group_key = TypedExpr {
             kind: ExprKind::ColumnRef {
+                column_id: ColumnId::UNSET,
                 qualifier: None,
                 column: "k".to_string(),
             },
@@ -2011,6 +2015,7 @@ mod tests {
         };
         let avg_arg = TypedExpr {
             kind: ExprKind::ColumnRef {
+                column_id: ColumnId::UNSET,
                 qualifier: None,
                 column: "v".to_string(),
             },
@@ -2098,16 +2103,19 @@ WHERE amount > 0",
             .expect("projection shape");
         let output_columns = vec![
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "id".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
             },
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "customer".to_string(),
                 data_type: DataType::Utf8,
                 nullable: true,
             },
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "amount".to_string(),
                 data_type: DataType::Int64,
                 nullable: true,
@@ -2158,11 +2166,13 @@ WHERE amount > 0",
             .expect("projection shape");
         let output_columns = vec![
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "customer".to_string(),
                 data_type: DataType::Utf8,
                 nullable: true,
             },
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "amount".to_string(),
                 data_type: DataType::Int64,
                 nullable: true,
@@ -2209,16 +2219,19 @@ GROUP BY k1",
             .expect("aggregate shape");
         let output_columns = vec![
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "k1".to_string(),
                 data_type: DataType::Int32,
                 nullable: false,
             },
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "c".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
             },
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "s".to_string(),
                 data_type: DataType::Int64,
                 nullable: true,
@@ -2333,11 +2346,13 @@ GROUP BY k1",
             .expect("aggregate shape");
         let output_columns = vec![
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "__agg_state_c".to_string(),
                 data_type: DataType::Int32,
                 nullable: false,
             },
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "c".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,

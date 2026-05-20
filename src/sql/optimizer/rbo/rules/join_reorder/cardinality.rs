@@ -407,6 +407,7 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn};
     use crate::sql::catalog::{ColumnDef, S3FileInfo, TableDef, TableStorage};
+    use crate::sql::column_id::ColumnId;
     use arrow::datatypes::DataType;
 
     fn make_table_stats(
@@ -440,6 +441,7 @@ mod tests {
         let columns: Vec<OutputColumn> = cols
             .iter()
             .map(|c| OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: c.to_string(),
                 data_type: DataType::Int32,
                 nullable: false,
@@ -490,6 +492,7 @@ mod tests {
     fn col_ref(name: &str) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
+                column_id: ColumnId::UNSET,
                 qualifier: None,
                 column: name.to_string(),
             },
@@ -704,6 +707,7 @@ mod tests {
             group_by: vec![col_ref("status")],
             aggregates: vec![],
             output_columns: vec![OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "status".to_string(),
                 data_type: DataType::Int32,
                 nullable: false,

@@ -2681,16 +2681,19 @@ mod mv_target_tests {
         let shape = aggregate_mv_shape_for_txn_test();
         let output_columns = vec![
             crate::sql::analysis::OutputColumn {
+                column_id: crate::sql::column_id::ColumnId::UNSET,
                 name: "k1".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
             },
             crate::sql::analysis::OutputColumn {
+                column_id: crate::sql::column_id::ColumnId::UNSET,
                 name: "c".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
             },
             crate::sql::analysis::OutputColumn {
+                column_id: crate::sql::column_id::ColumnId::UNSET,
                 name: "s".to_string(),
                 data_type: DataType::Int64,
                 nullable: true,

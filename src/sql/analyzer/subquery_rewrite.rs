@@ -260,6 +260,7 @@ impl<'a> AnalyzerContext<'a> {
                 op: BinOp::Eq,
                 right: Box::new(TypedExpr {
                     kind: ExprKind::ColumnRef {
+                        column_id: sub_first_col.column_id,
                         qualifier: None,
                         column: sub_first_col.name.clone(),
                     },
@@ -298,6 +299,7 @@ impl<'a> AnalyzerContext<'a> {
             kind: ExprKind::IsNull {
                 expr: Box::new(TypedExpr {
                     kind: ExprKind::ColumnRef {
+                        column_id: sub_first_col.column_id,
                         qualifier: None,
                         column: sub_first_col.name.clone(),
                     },
@@ -357,6 +359,7 @@ impl<'a> AnalyzerContext<'a> {
             kind: ExprKind::IsNull {
                 expr: Box::new(TypedExpr {
                     kind: ExprKind::ColumnRef {
+                        column_id: indicator.column_id,
                         qualifier: None,
                         column: indicator.name.clone(),
                     },
@@ -444,6 +447,7 @@ impl<'a> AnalyzerContext<'a> {
 
         let replacement = TypedExpr {
             kind: ExprKind::ColumnRef {
+                column_id: scalar_output.column_id,
                 qualifier: Some(sq_alias),
                 column: scalar_output.name,
             },
@@ -485,6 +489,7 @@ impl<'a> AnalyzerContext<'a> {
             sel.projection.push(ProjectItem {
                 expr: TypedExpr {
                     kind: ExprKind::ColumnRef {
+                        column_id: sub_col.column_id,
                         qualifier: None,
                         column: sub_col.name.clone(),
                     },
@@ -494,7 +499,14 @@ impl<'a> AnalyzerContext<'a> {
                 output_name: match_col.clone(),
             });
         }
+        let match_col_id = self.alloc_column_id(
+            Some(sq_alias.clone()),
+            match_col.clone(),
+            sub_col.data_type.clone(),
+            true,
+        );
         modified_sub.output_columns.push(OutputColumn {
+            column_id: match_col_id,
             name: match_col.clone(),
             data_type: sub_col.data_type.clone(),
             nullable: true,
@@ -524,6 +536,7 @@ impl<'a> AnalyzerContext<'a> {
                 op: BinOp::Eq,
                 right: Box::new(TypedExpr {
                     kind: ExprKind::ColumnRef {
+                        column_id: sub_col.column_id,
                         qualifier: Some(sq_alias.clone()),
                         column: sub_col.name.clone(),
                     },
@@ -544,6 +557,7 @@ impl<'a> AnalyzerContext<'a> {
             kind: ExprKind::IsNull {
                 expr: Box::new(TypedExpr {
                     kind: ExprKind::ColumnRef {
+                        column_id: match_col_id,
                         qualifier: Some(sq_alias),
                         column: match_col,
                     },
@@ -586,7 +600,14 @@ impl<'a> AnalyzerContext<'a> {
             });
             sel.has_aggregation = false;
         }
+        let exists_col_id = self.alloc_column_id(
+            Some(sq_alias.clone()),
+            match_col.clone(),
+            DataType::Int64,
+            true,
+        );
         modified_sub.output_columns = vec![OutputColumn {
+            column_id: exists_col_id,
             name: match_col.clone(),
             data_type: DataType::Int64,
             nullable: true,
@@ -619,6 +640,7 @@ impl<'a> AnalyzerContext<'a> {
             kind: ExprKind::IsNull {
                 expr: Box::new(TypedExpr {
                     kind: ExprKind::ColumnRef {
+                        column_id: exists_col_id,
                         qualifier: Some(sq_alias),
                         column: match_col,
                     },
@@ -669,6 +691,7 @@ impl<'a> AnalyzerContext<'a> {
 
         let replacement = TypedExpr {
             kind: ExprKind::ColumnRef {
+                column_id: scalar_col.column_id,
                 qualifier: Some(sq_alias),
                 column: scalar_col.name,
             },
@@ -783,9 +806,10 @@ impl<'a> AnalyzerContext<'a> {
                             let unq = |col: &TypedExpr| -> TypedExpr {
                                 if same_bare_name {
                                     col.clone() // Keep qualifier for self-join
-                                } else if let ExprKind::ColumnRef { column, .. } = &col.kind {
+                                } else if let ExprKind::ColumnRef { column_id, column, .. } = &col.kind {
                                     TypedExpr {
                                         kind: ExprKind::ColumnRef {
+                                            column_id: *column_id,
                                             qualifier: None,
                                             column: column.clone(),
                                         },
@@ -960,6 +984,7 @@ impl<'a> AnalyzerContext<'a> {
                 lhs_name_lower.as_deref() == Some(&sub_col.name.to_lowercase());
             let rhs_ref = TypedExpr {
                 kind: ExprKind::ColumnRef {
+                    column_id: sub_col.column_id,
                     qualifier: if rhs_needs_qualifier {
                         Some(sq_alias.clone())
                     } else {
@@ -1043,7 +1068,14 @@ impl<'a> AnalyzerContext<'a> {
             if let QueryBody::Select(ref mut sel) = modified_sub.body {
                 sel.distinct = true;
             }
+            let in_match_col_id = self.alloc_column_id(
+                Some(sq_alias.clone()),
+                match_col_name.clone(),
+                sub_output_col.data_type.clone(),
+                true,
+            );
             modified_sub.output_columns.push(OutputColumn {
+                column_id: in_match_col_id,
                 name: match_col_name.clone(),
                 data_type: sub_output_col.data_type.clone(),
                 nullable: true,
@@ -1052,6 +1084,7 @@ impl<'a> AnalyzerContext<'a> {
                 sel.projection.push(ProjectItem {
                     expr: TypedExpr {
                         kind: ExprKind::ColumnRef {
+                            column_id: sub_output_col.column_id,
                             qualifier: None,
                             column: sub_output_col.name.clone(),
                         },
@@ -1083,6 +1116,7 @@ impl<'a> AnalyzerContext<'a> {
                 kind: ExprKind::IsNull {
                     expr: Box::new(TypedExpr {
                         kind: ExprKind::ColumnRef {
+                            column_id: in_match_col_id,
                             qualifier: None,
                             column: match_col_name,
                         },
@@ -1265,6 +1299,7 @@ impl<'a> AnalyzerContext<'a> {
                     &corr_preds,
                 )?;
 
+            let scalar_output_id = modified_sub.output_columns[0].column_id;
             let scalar_output_name = modified_sub.output_columns[0].name.clone();
             let scalar_data_type = modified_sub.output_columns[0].data_type.clone();
             let scalar_nullable = true;
@@ -1296,6 +1331,7 @@ impl<'a> AnalyzerContext<'a> {
             // producing columns with the same name resolve to distinct bindings.
             let replacement = TypedExpr {
                 kind: ExprKind::ColumnRef {
+                    column_id: scalar_output_id,
                     qualifier: Some(sq_alias.clone()),
                     column: scalar_output_name,
                 },
@@ -1338,6 +1374,7 @@ impl<'a> AnalyzerContext<'a> {
             // producing columns with the same name resolve to distinct bindings.
             let replacement = TypedExpr {
                 kind: ExprKind::ColumnRef {
+                    column_id: scalar_col.column_id,
                     qualifier: Some(sq_alias.clone()),
                     column: scalar_col.name.clone(),
                 },
@@ -1369,6 +1406,7 @@ impl<'a> AnalyzerContext<'a> {
         let child_ctx = AnalyzerContext {
             catalog: self.catalog,
             current_database: self.current_database,
+            factory: self.factory.clone(),
             ctes: self.ctes.clone(),
             pending_ctes: self.pending_ctes.clone(),
             next_subquery_id: std::cell::Cell::new(self.next_subquery_id.get()),
@@ -1451,7 +1489,7 @@ impl<'a> AnalyzerContext<'a> {
                         output_columns: cols,
                         local_cte_ids,
                     },
-                    AnalyzerScope::new(),
+                    self.new_scope(),
                 ))
             }
         };
@@ -1475,7 +1513,7 @@ impl<'a> AnalyzerContext<'a> {
 
         // --- FROM clause ---
         let (from, inner_scope) = if select.from.is_empty() {
-            (None, AnalyzerScope::new())
+            (None, self.new_scope())
         } else if select.from.len() == 1 {
             let (rel, scope) = self.analyze_from(&select.from[0])?;
             (Some(rel), scope)
@@ -1628,7 +1666,17 @@ impl<'a> AnalyzerContext<'a> {
                 ExprKind::ColumnRef { column, .. } => column.clone(),
                 _ => format!("__corr_key_{}", idx),
             };
+            let corr_col_id = match &inner_col.kind {
+                ExprKind::ColumnRef { column_id, .. } => *column_id,
+                _ => self.alloc_column_id(
+                    None,
+                    col_name.clone(),
+                    inner_col.data_type.clone(),
+                    inner_col.nullable,
+                ),
+            };
             extra_output.push(OutputColumn {
+                column_id: corr_col_id,
                 name: col_name.clone(),
                 data_type: inner_col.data_type.clone(),
                 nullable: inner_col.nullable,
@@ -1649,6 +1697,7 @@ impl<'a> AnalyzerContext<'a> {
                     op: pred.op,
                     right: Box::new(TypedExpr {
                         kind: ExprKind::ColumnRef {
+                            column_id: corr_col_id,
                             qualifier: None,
                             column: col_name,
                         },
@@ -1696,7 +1745,7 @@ impl<'a> AnalyzerContext<'a> {
         outer_scope: &AnalyzerScope,
     ) -> Result<ResolvedQuery, String> {
         if let QueryBody::Select(ref mut sel) = resolved.body {
-            let mut scope = AnalyzerScope::new();
+            let mut scope = self.new_scope();
             if let Some(ref from_rel) = sel.from {
                 self.collect_relation_scope(from_rel, &mut scope)?;
             }
@@ -1895,7 +1944,7 @@ fn is_outer_only_ref(
     outer_scope: &AnalyzerScope,
 ) -> bool {
     match &expr.kind {
-        ExprKind::ColumnRef { qualifier, column } => {
+        ExprKind::ColumnRef { qualifier, column, .. } => {
             let in_inner = inner_scope.resolve(qualifier.as_deref(), column).is_ok();
             let in_outer = outer_scope.resolve(qualifier.as_deref(), column).is_ok();
             // Outer-only: in outer but not in inner
@@ -2106,7 +2155,7 @@ fn relation_exposes_column(rel: &Relation, col_lower: &str) -> bool {
 /// host join's LEFT input, RIGHT input, or above.
 fn collect_column_refs(expr: &TypedExpr, out: &mut Vec<(Option<String>, String)>) {
     match &expr.kind {
-        ExprKind::ColumnRef { qualifier, column } => {
+        ExprKind::ColumnRef { qualifier, column, .. } => {
             let entry = (
                 qualifier.as_ref().map(|q| q.to_lowercase()),
                 column.to_lowercase(),

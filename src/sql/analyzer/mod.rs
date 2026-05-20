@@ -49,10 +49,21 @@ pub(crate) fn analyze(
     query: &sqlast::Query,
     catalog: &impl CatalogProvider,
     current_database: &str,
-) -> Result<(ResolvedQuery, crate::sql::analysis::cte::CTERegistry), String> {
+) -> Result<
+    (
+        ResolvedQuery,
+        crate::sql::analysis::cte::CTERegistry,
+        crate::sql::column_id::ColumnRefFactory,
+    ),
+    String,
+> {
+    let factory = std::rc::Rc::new(std::cell::RefCell::new(
+        crate::sql::column_id::ColumnRefFactory::new(),
+    ));
     let ctx = AnalyzerContext {
         catalog,
         current_database,
+        factory: factory.clone(),
         ctes: std::collections::HashMap::new(),
         pending_ctes: std::collections::HashSet::new(),
         next_subquery_id: std::cell::Cell::new(0),
@@ -62,7 +73,10 @@ pub(crate) fn analyze(
     };
     let resolved = ctx.analyze_query(query)?;
     let registry = ctx.cte_registry.into_inner();
-    Ok((resolved, registry))
+    let col_factory = std::rc::Rc::try_unwrap(factory)
+        .map(|cell| cell.into_inner())
+        .unwrap_or_else(|rc| rc.borrow().clone());
+    Ok((resolved, registry, col_factory))
 }
 
 // ---------------------------------------------------------------------------
@@ -72,6 +86,8 @@ pub(crate) fn analyze(
 pub(super) struct AnalyzerContext<'a> {
     pub(super) catalog: &'a dyn CatalogProvider,
     pub(super) current_database: &'a str,
+    /// Shared factory for allocating globally unique ColumnIds.
+    pub(super) factory: std::rc::Rc<std::cell::RefCell<crate::sql::column_id::ColumnRefFactory>>,
     /// Currently visible CTE definitions from outer scopes or earlier entries
     /// in the same WITH clause, keyed by lowercase name.
     pub(super) ctes: std::collections::HashMap<String, crate::sql::analysis::cte::CteId>,
@@ -90,6 +106,24 @@ pub(super) struct AnalyzerContext<'a> {
 }
 
 impl<'a> AnalyzerContext<'a> {
+    /// Create a new empty AnalyzerScope sharing this context's factory.
+    pub(super) fn new_scope(&self) -> scope::AnalyzerScope {
+        scope::AnalyzerScope::new(self.factory.clone())
+    }
+
+    /// Allocate a fresh ColumnId from the shared factory.
+    pub(super) fn alloc_column_id(
+        &self,
+        qualifier: Option<String>,
+        name: String,
+        data_type: arrow::datatypes::DataType,
+        nullable: bool,
+    ) -> crate::sql::column_id::ColumnId {
+        self.factory
+            .borrow_mut()
+            .create(qualifier, name, data_type, nullable)
+    }
+
     /// Allocate a unique subquery placeholder ID.
     pub(super) fn alloc_subquery_id(&self) -> usize {
         let id = self.next_subquery_id.get();
@@ -119,6 +153,7 @@ impl<'a> AnalyzerContext<'a> {
         let mut child_ctx = AnalyzerContext {
             catalog: self.catalog,
             current_database: self.current_database,
+            factory: self.factory.clone(),
             ctes: self.ctes.clone(),
             pending_ctes: pending_ctes.clone(),
             next_subquery_id: std::cell::Cell::new(self.next_subquery_id.get()),
@@ -238,7 +273,14 @@ impl<'a> AnalyzerContext<'a> {
                 let mut output_cols = Vec::with_capacity(left_cols.len());
                 for (lc, rc) in left_cols.iter().zip(right_cols.iter()) {
                     let dt = wider_type(&lc.data_type, &rc.data_type);
+                    let column_id = self.alloc_column_id(
+                        None,
+                        lc.name.clone(),
+                        dt.clone(),
+                        lc.nullable || rc.nullable,
+                    );
                     output_cols.push(OutputColumn {
+                        column_id,
                         name: lc.name.clone(),
                         data_type: dt,
                         nullable: lc.nullable || rc.nullable,
@@ -300,7 +342,7 @@ impl<'a> AnalyzerContext<'a> {
         &self,
         values: &sqlast::Values,
     ) -> Result<(ResolvedValues, Vec<OutputColumn>), String> {
-        let scope = AnalyzerScope::new(); // VALUES has no table scope
+        let scope = self.new_scope(); // VALUES has no table scope
         let mut resolved_rows = Vec::with_capacity(values.rows.len());
         let mut column_types: Vec<DataType> = Vec::new();
 
@@ -321,10 +363,15 @@ impl<'a> AnalyzerContext<'a> {
         let output_cols: Vec<OutputColumn> = column_types
             .iter()
             .enumerate()
-            .map(|(i, dt)| OutputColumn {
-                name: format!("column_{i}"),
-                data_type: dt.clone(),
-                nullable: true,
+            .map(|(i, dt)| {
+                let name = format!("column_{i}");
+                let column_id = self.alloc_column_id(None, name.clone(), dt.clone(), true);
+                OutputColumn {
+                    column_id,
+                    name,
+                    data_type: dt.clone(),
+                    nullable: true,
+                }
             })
             .collect();
 
@@ -345,7 +392,7 @@ impl<'a> AnalyzerContext<'a> {
         // --- FROM clause ---
         let (from, scope) = if select.from.is_empty() {
             // SELECT without FROM (dual)
-            (None, AnalyzerScope::new())
+            (None, self.new_scope())
         } else if select.from.len() == 1 {
             let (rel, scope) = self.analyze_from(&select.from[0])?;
             (Some(rel), scope)
@@ -545,6 +592,7 @@ impl<'a> AnalyzerContext<'a> {
             ExprKind::ColumnRef {
                 ref qualifier,
                 ref column,
+                ..
             } if qualifier.is_none() && !inside_agg => {
                 if from_scope.resolve(None, column).is_ok() {
                     // The FROM clause already binds this column; do not
@@ -743,6 +791,7 @@ impl<'a> AnalyzerContext<'a> {
             ExprKind::ColumnRef {
                 ref qualifier,
                 ref column,
+                ..
             } if qualifier.is_none() && !inside_agg => {
                 // Check if this column name matches a SELECT alias
                 let col_lower = column.to_lowercase();
@@ -1288,8 +1337,15 @@ impl<'a> AnalyzerContext<'a> {
         // Also add each GROUPING() virtual column as a GROUP BY key so it
         // passes through the Aggregate operator.
         for (fn_name, _) in &grouping_fn_args {
+            let column_id = self.alloc_column_id(
+                None,
+                fn_name.clone(),
+                DataType::Int64,
+                false,
+            );
             sel.group_by.push(TypedExpr {
                 kind: ExprKind::ColumnRef {
+                    column_id,
                     qualifier: None,
                     column: fn_name.clone(),
                 },
@@ -1331,11 +1387,23 @@ impl<'a> AnalyzerContext<'a> {
                     let typed = self.analyze_expr(expr, &effective_scope)?;
                     let typed =
                         self.substitute_select_aliases_for_select(typed, &projection, scope);
-                    let name = match &typed.kind {
-                        ExprKind::ColumnRef { column, .. } => column.clone(),
-                        _ => expr_display_name(expr),
+                    let (name, column_id) = match &typed.kind {
+                        ExprKind::ColumnRef { column_id, column, .. } => {
+                            (column.clone(), *column_id)
+                        }
+                        _ => {
+                            let n = expr_display_name(expr);
+                            let id = self.alloc_column_id(
+                                None,
+                                n.clone(),
+                                typed.data_type.clone(),
+                                typed.nullable,
+                            );
+                            (n, id)
+                        }
                     };
                     output_columns.push(OutputColumn {
+                        column_id,
                         name: name.clone(),
                         data_type: typed.data_type.clone(),
                         nullable: typed.nullable,
@@ -1350,7 +1418,17 @@ impl<'a> AnalyzerContext<'a> {
                     let typed =
                         self.substitute_select_aliases_for_select(typed, &projection, scope);
                     let name = alias.value.clone();
+                    let column_id = match &typed.kind {
+                        ExprKind::ColumnRef { column_id, .. } => *column_id,
+                        _ => self.alloc_column_id(
+                            None,
+                            name.clone(),
+                            typed.data_type.clone(),
+                            typed.nullable,
+                        ),
+                    };
                     output_columns.push(OutputColumn {
+                        column_id,
                         name: name.clone(),
                         data_type: typed.data_type.clone(),
                         nullable: typed.nullable,
@@ -1375,7 +1453,7 @@ impl<'a> AnalyzerContext<'a> {
                     });
                 }
                 sqlast::SelectItem::Wildcard(_) => {
-                    for (qualifier, col_name, data_type, nullable) in scope.iter_columns() {
+                    for (qualifier, col_name, col_id, data_type, nullable) in scope.iter_columns() {
                         // FULL OUTER USING columns are exposed as a synthetic
                         // `COALESCE(left.col, right.col)` expression. SELECT *
                         // expansion must use that expression instead of the
@@ -1386,6 +1464,7 @@ impl<'a> AnalyzerContext<'a> {
                         } else {
                             TypedExpr {
                                 kind: ExprKind::ColumnRef {
+                                    column_id: *col_id,
                                     qualifier: qualifier.clone(),
                                     column: col_name.clone(),
                                 },
@@ -1394,6 +1473,7 @@ impl<'a> AnalyzerContext<'a> {
                             }
                         };
                         output_columns.push(OutputColumn {
+                            column_id: *col_id,
                             name: col_name.clone(),
                             data_type: data_type.clone(),
                             nullable: *nullable,
@@ -1412,12 +1492,13 @@ impl<'a> AnalyzerContext<'a> {
                         _ => return Err("unsupported qualified wildcard expression".into()),
                     };
                     let mut found = false;
-                    for (qualifier, col_name, data_type, nullable) in
+                    for (qualifier, col_name, col_id, data_type, nullable) in
                         scope.iter_qualified_columns(&qualifier_str)
                     {
                         found = true;
                         let typed = TypedExpr {
                             kind: ExprKind::ColumnRef {
+                                column_id: *col_id,
                                 qualifier: qualifier.clone(),
                                 column: col_name.clone(),
                             },
@@ -1425,6 +1506,7 @@ impl<'a> AnalyzerContext<'a> {
                             nullable: *nullable,
                         };
                         output_columns.push(OutputColumn {
+                            column_id: *col_id,
                             name: col_name.clone(),
                             data_type: data_type.clone(),
                             nullable: *nullable,
@@ -1460,10 +1542,12 @@ impl<'a> AnalyzerContext<'a> {
         for item in items {
             match item {
                 sqlast::SelectItem::Wildcard(_) => {
-                    for (qualifier, col_name, data_type, nullable) in wildcard_scope.iter_columns()
+                    for (qualifier, col_name, col_id, data_type, nullable) in
+                        wildcard_scope.iter_columns()
                     {
                         let typed = TypedExpr {
                             kind: ExprKind::ColumnRef {
+                                column_id: *col_id,
                                 qualifier: qualifier.clone(),
                                 column: col_name.clone(),
                             },
@@ -1471,6 +1555,7 @@ impl<'a> AnalyzerContext<'a> {
                             nullable: *nullable,
                         };
                         output_columns.push(OutputColumn {
+                            column_id: *col_id,
                             name: col_name.clone(),
                             data_type: data_type.clone(),
                             nullable: *nullable,
@@ -1497,7 +1582,7 @@ impl<'a> AnalyzerContext<'a> {
     /// Rebuild the FROM scope from an already-resolved Relation tree.
     /// Used by ORDER BY fallback when the expression doesn't match projection columns.
     fn rebuild_from_scope(&self, relation: &Relation) -> Result<((), AnalyzerScope), String> {
-        let mut scope = AnalyzerScope::new();
+        let mut scope = self.new_scope();
         self.collect_relation_scope(relation, &mut scope)?;
         Ok(((), scope))
     }
@@ -1620,7 +1705,7 @@ impl<'a> AnalyzerContext<'a> {
         };
 
         // Build a projection scope from body output columns for ORDER BY resolution.
-        let mut projection_scope = AnalyzerScope::new();
+        let mut projection_scope = self.new_scope();
         for col in body_output {
             projection_scope.add_column(None, &col.name, col.data_type.clone(), col.nullable);
         }
@@ -1631,6 +1716,7 @@ impl<'a> AnalyzerContext<'a> {
                 if let ExprKind::ColumnRef {
                     qualifier: Some(ref q),
                     ref column,
+                    ..
                 } = item.expr.kind
                 {
                     projection_scope.add_column(
@@ -1665,6 +1751,7 @@ impl<'a> AnalyzerContext<'a> {
                     let col = &body_output[pos - 1];
                     TypedExpr {
                         kind: ExprKind::ColumnRef {
+                            column_id: col.column_id,
                             qualifier: None,
                             column: col.name.clone(),
                         },
@@ -1714,8 +1801,18 @@ impl<'a> AnalyzerContext<'a> {
                             // projection-output scope rather than against
                             // the pre-aggregation FROM-scope.
                             if ir_item.output_name.to_lowercase() == ob_text {
+                                let col_id = match &ir_item.expr.kind {
+                                    ExprKind::ColumnRef { column_id, .. } => *column_id,
+                                    _ => self.alloc_column_id(
+                                        None,
+                                        ir_item.output_name.clone(),
+                                        ir_item.expr.data_type.clone(),
+                                        ir_item.expr.nullable,
+                                    ),
+                                };
                                 matched_alias = Some(TypedExpr {
                                     kind: ExprKind::ColumnRef {
+                                        column_id: col_id,
                                         qualifier: None,
                                         column: ir_item.output_name.clone(),
                                     },
@@ -2158,6 +2255,7 @@ fn replace_grouping_markers_in_typed_expr(
             if let Some((fn_name, _)) = grouping_fn_args.get(idx) {
                 return TypedExpr {
                     kind: ExprKind::ColumnRef {
+                        column_id: crate::sql::column_id::ColumnId::UNSET,
                         qualifier: None,
                         column: fn_name.clone(),
                     },
@@ -2626,7 +2724,7 @@ mod tests {
             sqlparser::ast::Statement::Query(q) => q,
             _ => return Err("expected a query".into()),
         };
-        let (resolved, _registry) = analyze(&query, &TestCatalog, "default")?;
+        let (resolved, _registry, _factory) = analyze(&query, &TestCatalog, "default")?;
         Ok(resolved)
     }
 
@@ -2643,7 +2741,8 @@ mod tests {
             sqlparser::ast::Statement::Query(q) => q,
             _ => return Err("expected a query".into()),
         };
-        analyze(&query, &TestCatalog, "default")
+        let (resolved, registry, _factory) = analyze(&query, &TestCatalog, "default")?;
+        Ok((resolved, registry))
     }
 
     fn parse_raw_and_analyze(sql: &str) -> Result<ResolvedQuery, String> {
@@ -2652,7 +2751,7 @@ mod tests {
             sqlparser::ast::Statement::Query(q) => q,
             _ => return Err("expected a query".into()),
         };
-        let (resolved, _registry) = analyze(&query, &TestCatalog, "default")?;
+        let (resolved, _registry, _factory) = analyze(&query, &TestCatalog, "default")?;
         Ok(resolved)
     }
 
@@ -2674,7 +2773,7 @@ mod tests {
         };
         assert_eq!(query.output_columns[0].name, "column_0");
         assert_eq!(output_columns[0].name, "col1");
-        let ExprKind::ColumnRef { qualifier, column } = &select.projection[0].expr.kind else {
+        let ExprKind::ColumnRef { qualifier, column, .. } = &select.projection[0].expr.kind else {
             panic!("expected column ref projection");
         };
         assert_eq!(qualifier.as_deref(), None);
@@ -3432,7 +3531,7 @@ mod tests {
     fn select_alias_inside_lambda_body_is_fully_substituted() {
         fn contains_unresolved_l(expr: &TypedExpr) -> bool {
             match &expr.kind {
-                ExprKind::ColumnRef { qualifier, column } => {
+                ExprKind::ColumnRef { qualifier, column, .. } => {
                     qualifier.is_none() && column.eq_ignore_ascii_case("l")
                 }
                 ExprKind::BinaryOp { left, right, .. } => {

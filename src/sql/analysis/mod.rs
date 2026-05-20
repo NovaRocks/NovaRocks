@@ -8,6 +8,7 @@ pub(crate) mod cte;
 use arrow::datatypes::DataType;
 
 use crate::sql::catalog::TableDef;
+use crate::sql::column_id::ColumnId;
 
 // ---------------------------------------------------------------------------
 // Top-level query
@@ -26,6 +27,7 @@ pub(crate) struct ResolvedQuery {
 
 #[derive(Clone, Debug)]
 pub(crate) struct OutputColumn {
+    pub column_id: ColumnId,
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
@@ -255,6 +257,7 @@ pub(crate) struct LambdaParam {
 pub(crate) enum ExprKind {
     /// Resolved column reference.
     ColumnRef {
+        column_id: ColumnId,
         qualifier: Option<String>,
         column: String,
     },

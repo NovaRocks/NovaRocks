@@ -1501,6 +1501,7 @@ mod tests {
             &[
                 TypedExpr {
                     kind: ExprKind::ColumnRef {
+                        column_id: crate::sql::column_id::ColumnId::UNSET,
                         qualifier: None,
                         column: "aad_1".to_string(),
                     },
@@ -1523,6 +1524,7 @@ mod tests {
             &[
                 TypedExpr {
                     kind: ExprKind::ColumnRef {
+                        column_id: crate::sql::column_id::ColumnId::UNSET,
                         qualifier: None,
                         column: "aad_1".to_string(),
                     },

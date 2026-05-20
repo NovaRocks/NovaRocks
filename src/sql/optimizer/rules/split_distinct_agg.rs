@@ -9,6 +9,7 @@
 //! Mirrors StarRocks's `SplitAggregateRule` / `AggType.java` convention.
 
 use crate::sql::analysis::{ExprKind, TypedExpr};
+use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::memo::{MExpr, Memo};
 use crate::sql::optimizer::operator::{
     AggMode, LogicalAggregateOp, Operator, PhysicalHashAggregateOp,
@@ -113,10 +114,12 @@ fn typed_exprs_structurally_equal(a: &TypedExpr, b: &TypedExpr) -> bool {
             ExprKind::ColumnRef {
                 qualifier: qa,
                 column: ca,
+                ..
             },
             ExprKind::ColumnRef {
                 qualifier: qb,
                 column: cb,
+                ..
             },
         ) => qa == qb && ca == cb,
         _ => false,
@@ -343,6 +346,7 @@ mod tests {
     fn col(name: &str) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
+                column_id: ColumnId::UNSET,
                 qualifier: None,
                 column: name.into(),
             },
@@ -594,16 +598,19 @@ mod tests {
                 aggregates: vec![count_distinct("x"), sum_non_distinct("a")],
                 output_columns: vec![
                     OutputColumn {
+                        column_id: ColumnId::UNSET,
                         name: "g".into(),
                         data_type: DataType::Int64,
                         nullable: false,
                     },
                     OutputColumn {
+                        column_id: ColumnId::UNSET,
                         name: "count(distinct x)".into(),
                         data_type: DataType::Int64,
                         nullable: true,
                     },
                     OutputColumn {
+                        column_id: ColumnId::UNSET,
                         name: "sum(a)".into(),
                         data_type: DataType::Int64,
                         nullable: true,
@@ -701,11 +708,13 @@ mod tests {
                 aggregates: vec![count_distinct("x"), sum_non_distinct("a")],
                 output_columns: vec![
                     OutputColumn {
+                        column_id: ColumnId::UNSET,
                         name: "count(distinct x)".into(),
                         data_type: DataType::Int64,
                         nullable: true,
                     },
                     OutputColumn {
+                        column_id: ColumnId::UNSET,
                         name: "sum(a)".into(),
                         data_type: DataType::Int64,
                         nullable: true,

@@ -1670,6 +1670,7 @@ mod tests {
     use crate::connector::starrocks::managed::mv_shape::{
         IncrementalMvShape, classify_incremental_mv_query,
     };
+    use crate::sql::column_id::ColumnId;
     use arrow::array::{Array, Int64Array, StringArray};
 
     fn test_shape() -> AggregateMvShape {
@@ -1729,16 +1730,19 @@ mod tests {
     fn output_columns() -> Vec<OutputColumn> {
         vec![
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "k1".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
             },
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "c".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
             },
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "s".to_string(),
                 data_type: DataType::Int64,
                 nullable: true,
@@ -1749,11 +1753,13 @@ mod tests {
     fn aggregate_first_output_columns() -> Vec<OutputColumn> {
         vec![
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "c".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
             },
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "k1".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
@@ -1764,11 +1770,13 @@ mod tests {
     fn count_expr_output_columns() -> Vec<OutputColumn> {
         vec![
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "k1".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
             },
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "c".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
@@ -1779,11 +1787,13 @@ mod tests {
     fn sum_only_output_columns() -> Vec<OutputColumn> {
         vec![
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "k1".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
             },
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "s".to_string(),
                 data_type: DataType::Int64,
                 nullable: true,
@@ -2686,11 +2696,13 @@ mod tests {
         };
         let outputs = vec![
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "k".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
             },
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "a".to_string(),
                 data_type: DataType::Decimal128(38, 10),
                 nullable: true,
@@ -2727,11 +2739,13 @@ mod tests {
 
         let float_outputs = vec![
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "k".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
             },
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "a".to_string(),
                 data_type: DataType::Float64,
                 nullable: true,
@@ -2895,11 +2909,13 @@ mod tests {
         let shape = avg_state_shape();
         let output_columns = vec![
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "k1".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
             },
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "a".to_string(),
                 data_type: DataType::Float64,
                 nullable: true,
@@ -3208,11 +3224,13 @@ mod tests {
         // Output columns: [k1 Int64, a AVG(Decimal(20,4)) -> Decimal128(38, 10)]
         let output_columns = vec![
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "k1".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
             },
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "a".to_string(),
                 data_type: DataType::Decimal128(38, 10),
                 nullable: true,

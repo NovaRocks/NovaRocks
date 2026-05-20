@@ -312,6 +312,7 @@ mod tests {
         BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
     use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
+    use crate::sql::column_id::ColumnId;
     use arrow::datatypes::DataType;
 
     fn three_col_table() -> TableDef {
@@ -357,6 +358,7 @@ mod tests {
                 .columns
                 .iter()
                 .map(|c| OutputColumn {
+                    column_id: ColumnId::UNSET,
                     name: c.name.clone(),
                     data_type: c.data_type.clone(),
                     nullable: c.nullable,
@@ -370,6 +372,7 @@ mod tests {
     fn col_ref(name: &str, ty: DataType) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
+                column_id: ColumnId::UNSET,
                 qualifier: None,
                 column: name.to_string(),
             },
@@ -498,11 +501,13 @@ mod tests {
             }],
             output_columns: vec![
                 OutputColumn {
+                    column_id: ColumnId::UNSET,
                     name: "b".to_string(),
                     data_type: DataType::Utf8,
                     nullable: true,
                 },
                 OutputColumn {
+                    column_id: ColumnId::UNSET,
                     name: "sum_c".to_string(),
                     data_type: DataType::Float64,
                     nullable: true,

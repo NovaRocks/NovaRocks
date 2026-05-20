@@ -1,12 +1,6 @@
 //! Physical properties for Cascades optimizer.
 
-/// A column reference used in distribution/ordering specs.
-/// Uses column name (not TypedExpr) for hashability.
-#[derive(Clone, Debug, Hash, Eq, PartialEq)]
-pub(crate) struct ColumnRef {
-    pub qualifier: Option<String>,
-    pub column: String,
-}
+use crate::sql::column_id::ColumnId;
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub(crate) struct PhysicalPropertySet {
@@ -39,7 +33,7 @@ impl PhysicalPropertySet {
 pub(crate) enum DistributionSpec {
     Any,
     Gather,
-    HashPartitioned(Vec<ColumnRef>),
+    HashPartitioned(Vec<ColumnId>),
 }
 
 impl DistributionSpec {
@@ -103,7 +97,7 @@ impl OrderingSpec {
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub(crate) struct SortKey {
-    pub column: ColumnRef,
+    pub column: ColumnId,
     pub asc: bool,
     pub nulls_first: bool,
 }
@@ -112,27 +106,23 @@ pub(crate) struct SortKey {
 mod tests {
     use super::*;
 
-    fn col(name: &str) -> ColumnRef {
-        ColumnRef {
-            qualifier: None,
-            column: name.to_string(),
-        }
-    }
-
     #[test]
     fn hash_partitioned_satisfies_exact_match() {
-        let provided = DistributionSpec::HashPartitioned(vec![col("a"), col("b")]);
-        let required = DistributionSpec::HashPartitioned(vec![col("a"), col("b")]);
+        let provided =
+            DistributionSpec::HashPartitioned(vec![ColumnId(1), ColumnId(2)]);
+        let required =
+            DistributionSpec::HashPartitioned(vec![ColumnId(1), ColumnId(2)]);
         assert!(provided.satisfies(&required));
     }
 
     #[test]
     fn hash_partitioned_satisfies_when_provider_has_superset() {
-        // Child hashes on (a, b); a downstream operator that only needs
-        // hash(a) is satisfied because each (a,b) bucket is homogeneous
-        // in `a` — the StarRocks `satisfyContainAll` rule.
-        let provided = DistributionSpec::HashPartitioned(vec![col("a"), col("b")]);
-        let required = DistributionSpec::HashPartitioned(vec![col("a")]);
+        // Child hashes on (c1, c2); a downstream operator that only needs
+        // hash(c1) is satisfied because each (c1,c2) bucket is homogeneous
+        // in `c1` — the StarRocks `satisfyContainAll` rule.
+        let provided =
+            DistributionSpec::HashPartitioned(vec![ColumnId(1), ColumnId(2)]);
+        let required = DistributionSpec::HashPartitioned(vec![ColumnId(1)]);
         assert!(provided.satisfies(&required));
     }
 
@@ -140,33 +130,38 @@ mod tests {
     fn hash_partitioned_satisfies_when_required_in_any_position() {
         // Order within the hash key vector doesn't matter — what matters
         // is that the required column is part of the hash.
-        let provided = DistributionSpec::HashPartitioned(vec![col("a"), col("b"), col("c")]);
-        let required = DistributionSpec::HashPartitioned(vec![col("b")]);
+        let provided = DistributionSpec::HashPartitioned(vec![
+            ColumnId(1),
+            ColumnId(2),
+            ColumnId(3),
+        ]);
+        let required = DistributionSpec::HashPartitioned(vec![ColumnId(2)]);
         assert!(provided.satisfies(&required));
     }
 
     #[test]
     fn hash_partitioned_does_not_satisfy_disjoint_columns() {
-        let provided = DistributionSpec::HashPartitioned(vec![col("a")]);
-        let required = DistributionSpec::HashPartitioned(vec![col("b")]);
+        let provided = DistributionSpec::HashPartitioned(vec![ColumnId(1)]);
+        let required = DistributionSpec::HashPartitioned(vec![ColumnId(2)]);
         assert!(!provided.satisfies(&required));
     }
 
     #[test]
     fn hash_partitioned_does_not_satisfy_when_required_has_extra() {
-        // Provided hash(a) does NOT satisfy required hash(a, b) — a
+        // Provided hash(c1) does NOT satisfy required hash(c1, c2) — a
         // single bucket of the provider can contain rows with different
-        // `b` values, so an operator that needs (a, b)-locality is not
+        // `c2` values, so an operator that needs (c1, c2)-locality is not
         // safe.
-        let provided = DistributionSpec::HashPartitioned(vec![col("a")]);
-        let required = DistributionSpec::HashPartitioned(vec![col("a"), col("b")]);
+        let provided = DistributionSpec::HashPartitioned(vec![ColumnId(1)]);
+        let required =
+            DistributionSpec::HashPartitioned(vec![ColumnId(1), ColumnId(2)]);
         assert!(!provided.satisfies(&required));
     }
 
     #[test]
     fn gather_does_not_satisfy_hash_partitioned() {
         let provided = DistributionSpec::Gather;
-        let required = DistributionSpec::HashPartitioned(vec![col("a")]);
+        let required = DistributionSpec::HashPartitioned(vec![ColumnId(1)]);
         assert!(!provided.satisfies(&required));
     }
 
@@ -175,7 +170,7 @@ mod tests {
         for provided in [
             DistributionSpec::Any,
             DistributionSpec::Gather,
-            DistributionSpec::HashPartitioned(vec![col("a")]),
+            DistributionSpec::HashPartitioned(vec![ColumnId(1)]),
         ] {
             assert!(provided.satisfies(&DistributionSpec::Any));
         }

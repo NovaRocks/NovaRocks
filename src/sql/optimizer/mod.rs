@@ -25,6 +25,7 @@ pub(crate) use property::PhysicalPropertySet;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use crate::sql::column_id::ColumnRefFactory;
 use crate::sql::optimizer::statistics::TableStatistics;
 use crate::sql::planner::plan::LogicalPlan;
 use memo::MExpr;
@@ -46,6 +47,7 @@ const EXPLORE_MAX_GROUPS: usize = 5000;
 pub(crate) fn optimize(
     plan: LogicalPlan,
     table_stats: &HashMap<String, TableStatistics>,
+    factory: ColumnRefFactory,
 ) -> Result<PhysicalPlanNode, String> {
     let deadline = Instant::now() + OPTIMIZE_TIMEOUT;
 
@@ -99,6 +101,7 @@ pub(crate) fn optimize(
 
     // 5. Convert to Memo.
     let mut memo = Memo::new();
+    memo.factory = factory;
     let root_group = convert::logical_plan_to_memo(&rewritten, &mut memo);
 
     // 6. Derive initial statistics.

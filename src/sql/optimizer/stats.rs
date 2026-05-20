@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 use super::memo::{LogicalProperties, MExpr, Memo};
 use super::operator::Operator;
+use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::statistics::*;
 
 // ---------------------------------------------------------------------------
@@ -981,10 +982,18 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
         Operator::LogicalProject(p) => p
             .items
             .iter()
-            .map(|item| crate::sql::analysis::OutputColumn {
-                name: item.output_name.clone(),
-                data_type: item.expr.data_type.clone(),
-                nullable: item.expr.nullable,
+            .map(|item| {
+                let cid = if let crate::sql::analysis::ExprKind::ColumnRef { column_id, .. } = &item.expr.kind {
+                    *column_id
+                } else {
+                    ColumnId::UNSET
+                };
+                crate::sql::analysis::OutputColumn {
+                    column_id: cid,
+                    name: item.output_name.clone(),
+                    data_type: item.expr.data_type.clone(),
+                    nullable: item.expr.nullable,
+                }
             })
             .collect(),
         Operator::LogicalAggregate(a) => a.output_columns.clone(),
@@ -996,6 +1005,9 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
         Operator::LogicalCTEConsume(c) => c.output_columns.clone(),
         Operator::LogicalGenerateSeries(g) => {
             vec![crate::sql::analysis::OutputColumn {
+                // GenerateSeries columns don't originate from the analyzer;
+                // use UNSET as there is no factory available in this read-only context.
+                column_id: ColumnId::UNSET,
                 name: g.column_name.clone(),
                 data_type: arrow::datatypes::DataType::Int64,
                 nullable: false,
@@ -1060,10 +1072,18 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
         Operator::PhysicalProject(p) => p
             .items
             .iter()
-            .map(|item| crate::sql::analysis::OutputColumn {
-                name: item.output_name.clone(),
-                data_type: item.expr.data_type.clone(),
-                nullable: item.expr.nullable,
+            .map(|item| {
+                let cid = if let crate::sql::analysis::ExprKind::ColumnRef { column_id, .. } = &item.expr.kind {
+                    *column_id
+                } else {
+                    ColumnId::UNSET
+                };
+                crate::sql::analysis::OutputColumn {
+                    column_id: cid,
+                    name: item.output_name.clone(),
+                    data_type: item.expr.data_type.clone(),
+                    nullable: item.expr.nullable,
+                }
             })
             .collect(),
         Operator::PhysicalHashAggregate(a) => a.output_columns.clone(),
@@ -1075,6 +1095,7 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
         Operator::PhysicalCTEConsume(c) => c.output_columns.clone(),
         Operator::PhysicalGenerateSeries(g) => {
             vec![crate::sql::analysis::OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: g.column_name.clone(),
                 data_type: arrow::datatypes::DataType::Int64,
                 nullable: false,
@@ -1403,6 +1424,7 @@ mod tests {
         let columns: Vec<OutputColumn> = cols
             .iter()
             .map(|c| OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: c.to_string(),
                 data_type: DataType::Int32,
                 nullable: false,
@@ -1453,6 +1475,7 @@ mod tests {
     fn col_ref(name: &str) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
+                column_id: ColumnId::UNSET,
                 qualifier: None,
                 column: name.to_string(),
             },
@@ -1569,6 +1592,7 @@ mod tests {
             group_by: vec![col_ref("status")],
             aggregates: vec![],
             output_columns: vec![OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "status".to_string(),
                 data_type: DataType::Int32,
                 nullable: false,
@@ -1624,6 +1648,7 @@ mod tests {
             cte_id: 1,
             input: Box::new(scan),
             output_columns: vec![OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "id".to_string(),
                 data_type: DataType::Int32,
                 nullable: false,
@@ -1633,6 +1658,7 @@ mod tests {
             cte_id: 1,
             alias: "cte_orders".to_string(),
             output_columns: vec![OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "id".to_string(),
                 data_type: DataType::Int32,
                 nullable: false,
@@ -1701,6 +1727,7 @@ mod tests {
         let plan = LogicalPlan::Values(ValuesNode {
             rows: vec![vec![], vec![], vec![]],
             columns: vec![OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "x".to_string(),
                 data_type: DataType::Int32,
                 nullable: false,
@@ -1725,6 +1752,7 @@ mod join_widening_tests {
 
     fn c(name: &str, nullable: bool) -> OutputColumn {
         OutputColumn {
+            column_id: ColumnId::UNSET,
             name: name.into(),
             data_type: DataType::Int32,
             nullable,

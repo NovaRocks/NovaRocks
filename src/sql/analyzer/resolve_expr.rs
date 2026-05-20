@@ -51,7 +51,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 if let Some(expr) = scope.computed_column_for(&ident.value) {
                     return Ok(expr.clone());
                 }
-                let (data_type, nullable) = scope.resolve(None, &ident.value)?;
+                let (column_id, data_type, nullable) = scope.resolve(None, &ident.value)?;
                 // If the scope tracks a canonical qualifier for this column
                 // name (USING-join shared column resolves to one specific
                 // side), normalize the ColumnRef to be qualified so the
@@ -60,6 +60,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 let qualifier = scope.canonical_qualifier_for(&ident.value);
                 Ok(TypedExpr {
                     kind: ExprKind::ColumnRef {
+                        column_id,
                         qualifier,
                         column: ident.value.to_lowercase(),
                     },
@@ -705,9 +706,10 @@ impl<'a> super::AnalyzerContext<'a> {
         if parts.len() == 2 {
             let qualifier = &parts[0].value;
             let col_name = &parts[1].value;
-            if let Ok((data_type, nullable)) = scope.resolve(Some(qualifier), col_name) {
+            if let Ok((column_id, data_type, nullable)) = scope.resolve(Some(qualifier), col_name) {
                 return Ok(TypedExpr {
                     kind: ExprKind::ColumnRef {
+                        column_id,
                         qualifier: Some(qualifier.to_lowercase()),
                         column: col_name.to_lowercase(),
                     },
@@ -718,9 +720,10 @@ impl<'a> super::AnalyzerContext<'a> {
         } else if parts.len() == 3 {
             let qualifier = &parts[1].value;
             let col_name = &parts[2].value;
-            if let Ok((data_type, nullable)) = scope.resolve(Some(qualifier), col_name) {
+            if let Ok((column_id, data_type, nullable)) = scope.resolve(Some(qualifier), col_name) {
                 return Ok(TypedExpr {
                     kind: ExprKind::ColumnRef {
+                        column_id,
                         qualifier: Some(qualifier.to_lowercase()),
                         column: col_name.to_lowercase(),
                     },
@@ -745,9 +748,10 @@ impl<'a> super::AnalyzerContext<'a> {
             }
             return Ok(current);
         }
-        let (data_type, nullable) = scope.resolve(None, base_name)?;
+        let (column_id, data_type, nullable) = scope.resolve(None, base_name)?;
         let mut current = TypedExpr {
             kind: ExprKind::ColumnRef {
+                column_id,
                 qualifier: None,
                 column: base_name.to_lowercase(),
             },
@@ -2409,6 +2413,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 ExprKind::ColumnRef {
                     qualifier: _,
                     column,
+                    ..
                 } if column.starts_with("ds_")
             ) && matches!(arg.data_type, DataType::Utf8 | DataType::LargeUtf8);
         if matches!(arg.data_type, DataType::Binary | DataType::LargeBinary)
@@ -3931,7 +3936,7 @@ fn sql_type_starrocks_name(sql_type: &sqlast::DataType) -> Option<String> {
 /// uses — but fall back to a placeholder so the format string never panics.
 fn column_name_of_expr(expr: &TypedExpr) -> String {
     match &expr.kind {
-        ExprKind::ColumnRef { qualifier, column } => match qualifier {
+        ExprKind::ColumnRef { qualifier, column, .. } => match qualifier {
             Some(q) => format!("{q}.{column}"),
             None => column.clone(),
         },

@@ -260,12 +260,14 @@ fn collect_output_column_names(plan: &LogicalPlan) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::sql::analysis::{ExprKind, OutputColumn};
+    use crate::sql::column_id::ColumnId;
     use crate::sql::planner::plan::{AggregateCall, AggregateNode, LogicalPlan, ValuesNode};
     use arrow::datatypes::DataType;
 
     fn col_ref(name: &str, ty: DataType) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
+                column_id: ColumnId::UNSET,
                 qualifier: None,
                 column: name.into(),
             },
@@ -433,6 +435,7 @@ mod tests {
             columns: cols
                 .iter()
                 .map(|(n, ty)| OutputColumn {
+                    column_id: ColumnId::UNSET,
                     name: (*n).into(),
                     data_type: ty.clone(),
                     nullable: false,
