@@ -14,7 +14,9 @@ use crate::meta::repository::mv_contract::{ExpressionKind, MvSchemaContract};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AffectedAggregateTargetPartitions {
     Unpartitioned,
-    Known { partitions: BTreeSet<MvPartitionKey> },
+    Known {
+        partitions: BTreeSet<MvPartitionKey>,
+    },
 }
 
 impl AffectedAggregateTargetPartitions {
@@ -162,7 +164,11 @@ pub(crate) fn derive_from_aggregate_delta(
         }
 
         // Step 3: verify output_index is in the layout's group key (defense in depth).
-        if !input.layout.group_key_source_indexes.contains(&output_index) {
+        if !input
+            .layout
+            .group_key_source_indexes
+            .contains(&output_index)
+        {
             return Err(AffectedPartitionError::OutputLineageNotPureColumn {
                 field: partition_field.partition_field_name.clone(),
             });
@@ -175,9 +181,7 @@ pub(crate) fn derive_from_aggregate_delta(
             .get(output_index)
             .ok_or_else(|| AffectedPartitionError::GroupKeyColumnMissing {
                 field: partition_field.partition_field_name.clone(),
-                reason: format!(
-                    "layout has no visible column for output index {output_index}"
-                ),
+                reason: format!("layout has no visible column for output index {output_index}"),
             })?;
 
         let transform = contract_transform_to_iceberg(
@@ -208,21 +212,23 @@ pub(crate) fn derive_from_aggregate_delta(
                 .index_of(&field.column_name)
                 .map_err(|e| AffectedPartitionError::GroupKeyColumnMissing {
                     field: field.partition_field_name.clone(),
-                    reason: format!(
-                        "delta chunk is missing column `{}`: {e}",
-                        field.column_name
-                    ),
+                    reason: format!("delta chunk is missing column `{}`: {e}", field.column_name),
                 })?;
             let array = chunk.batch.column(col_index).clone();
-            let xform = iceberg::transform::create_transform_function(&field.transform)
-                .map_err(|e| AffectedPartitionError::TransformFailed {
-                    field: field.partition_field_name.clone(),
-                    source: e.to_string(),
+            let xform =
+                iceberg::transform::create_transform_function(&field.transform).map_err(|e| {
+                    AffectedPartitionError::TransformFailed {
+                        field: field.partition_field_name.clone(),
+                        source: e.to_string(),
+                    }
                 })?;
-            let out = xform.transform(array).map_err(|e| AffectedPartitionError::TransformFailed {
-                field: field.partition_field_name.clone(),
-                source: e.to_string(),
-            })?;
+            let out =
+                xform
+                    .transform(array)
+                    .map_err(|e| AffectedPartitionError::TransformFailed {
+                        field: field.partition_field_name.clone(),
+                        source: e.to_string(),
+                    })?;
             transformed.push(out);
         }
 
@@ -252,13 +258,13 @@ fn arrow_array_row_to_partition_value(
     row: usize,
     field: &str,
 ) -> Result<crate::engine::mv::partition::MvPartitionValue, AffectedPartitionError> {
+    use crate::engine::mv::partition::MvPartitionValue;
     use arrow::array::{
         BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int32Array,
         Int64Array, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
         TimestampNanosecondArray, TimestampSecondArray,
     };
     use arrow::datatypes::{DataType, TimeUnit};
-    use crate::engine::mv::partition::MvPartitionValue;
 
     if array.is_null(row) {
         return Ok(MvPartitionValue::Null);
@@ -389,9 +395,7 @@ fn contract_transform_to_iceberg(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::mv::partition::{
-        MvPartitionKey, MvPartitionKeyField, MvPartitionValue,
-    };
+    use crate::engine::mv::partition::{MvPartitionKey, MvPartitionKeyField, MvPartitionValue};
 
     fn sample_key(value: &str) -> MvPartitionKey {
         MvPartitionKey::new(
@@ -405,9 +409,11 @@ mod tests {
 
     #[test]
     fn affected_aggregate_target_partitions_known_dedupes_and_sorts() {
-        let result = AffectedAggregateTargetPartitions::known(
-            [sample_key("b"), sample_key("a"), sample_key("a")],
-        );
+        let result = AffectedAggregateTargetPartitions::known([
+            sample_key("b"),
+            sample_key("a"),
+            sample_key("a"),
+        ]);
         let AffectedAggregateTargetPartitions::Known { partitions } = result else {
             panic!("expected Known");
         };
@@ -439,11 +445,26 @@ mod tests {
     #[test]
     fn contract_transform_to_iceberg_handles_all_first_class_transforms() {
         for (input, expect) in [
-            (MvPartitionTransformContract::Identity, iceberg::spec::Transform::Identity),
-            (MvPartitionTransformContract::Year, iceberg::spec::Transform::Year),
-            (MvPartitionTransformContract::Month, iceberg::spec::Transform::Month),
-            (MvPartitionTransformContract::Day, iceberg::spec::Transform::Day),
-            (MvPartitionTransformContract::Hour, iceberg::spec::Transform::Hour),
+            (
+                MvPartitionTransformContract::Identity,
+                iceberg::spec::Transform::Identity,
+            ),
+            (
+                MvPartitionTransformContract::Year,
+                iceberg::spec::Transform::Year,
+            ),
+            (
+                MvPartitionTransformContract::Month,
+                iceberg::spec::Transform::Month,
+            ),
+            (
+                MvPartitionTransformContract::Day,
+                iceberg::spec::Transform::Day,
+            ),
+            (
+                MvPartitionTransformContract::Hour,
+                iceberg::spec::Transform::Hour,
+            ),
             (
                 MvPartitionTransformContract::Bucket { num_buckets: 8 },
                 iceberg::spec::Transform::Bucket(8),
@@ -461,11 +482,8 @@ mod tests {
 
     #[test]
     fn contract_transform_to_iceberg_rejects_void() {
-        let err = contract_transform_to_iceberg(
-            &MvPartitionTransformContract::Void,
-            "test_field",
-        )
-        .unwrap_err();
+        let err = contract_transform_to_iceberg(&MvPartitionTransformContract::Void, "test_field")
+            .unwrap_err();
         assert!(matches!(
             err,
             AffectedPartitionError::TransformUnsupported { ref field, ref transform }
@@ -474,8 +492,8 @@ mod tests {
     }
 
     use arrow::array::{
-        BooleanArray, Date32Array, Float32Array, Float64Array, Int32Array, Int64Array,
-        StringArray, TimestampMicrosecondArray,
+        BooleanArray, Date32Array, Float32Array, Float64Array, Int32Array, Int64Array, StringArray,
+        TimestampMicrosecondArray,
     };
     use std::sync::Arc as StdArc;
 
@@ -496,12 +514,14 @@ mod tests {
             arrow_array_row_to_partition_value(long_arr.as_ref(), 0, "f").unwrap(),
             MvPartitionValue::String("20000".to_string())
         );
-        let float_arr = StdArc::new(Float32Array::from(vec![Some(1.5f32)])) as arrow::array::ArrayRef;
+        let float_arr =
+            StdArc::new(Float32Array::from(vec![Some(1.5f32)])) as arrow::array::ArrayRef;
         assert_eq!(
             arrow_array_row_to_partition_value(float_arr.as_ref(), 0, "f").unwrap(),
             MvPartitionValue::String("1.5".to_string())
         );
-        let double_arr = StdArc::new(Float64Array::from(vec![Some(2.5f64)])) as arrow::array::ArrayRef;
+        let double_arr =
+            StdArc::new(Float64Array::from(vec![Some(2.5f64)])) as arrow::array::ArrayRef;
         assert_eq!(
             arrow_array_row_to_partition_value(double_arr.as_ref(), 0, "f").unwrap(),
             MvPartitionValue::String("2.5".to_string())
@@ -518,8 +538,9 @@ mod tests {
             MvPartitionValue::String("19500".to_string())
         );
         // TimestampMicrosecond: integer micros since epoch.
-        let ts_arr = StdArc::new(TimestampMicrosecondArray::from(vec![Some(1_700_000_000_000_000)]))
-            as arrow::array::ArrayRef;
+        let ts_arr = StdArc::new(TimestampMicrosecondArray::from(vec![Some(
+            1_700_000_000_000_000,
+        )])) as arrow::array::ArrayRef;
         assert_eq!(
             arrow_array_row_to_partition_value(ts_arr.as_ref(), 0, "f").unwrap(),
             MvPartitionValue::String("1700000000000000".to_string())
@@ -538,8 +559,8 @@ mod tests {
     #[test]
     fn arrow_row_to_partition_value_rejects_unsupported_arrow_type() {
         // Use a UInt32Array — not an Iceberg-native partition output type.
-        let arr =
-            StdArc::new(arrow::array::UInt32Array::from(vec![Some(1u32)])) as arrow::array::ArrayRef;
+        let arr = StdArc::new(arrow::array::UInt32Array::from(vec![Some(1u32)]))
+            as arrow::array::ArrayRef;
         let err = arrow_array_row_to_partition_value(arr.as_ref(), 0, "f").unwrap_err();
         assert!(matches!(
             err,
@@ -585,8 +606,7 @@ mod tests {
         ];
         for (lit, arr) in cases {
             let manifest_value = manifest_primitive_to_string(&lit);
-            let client_value =
-                arrow_array_row_to_partition_value(arr.as_ref(), 0, "f").unwrap();
+            let client_value = arrow_array_row_to_partition_value(arr.as_ref(), 0, "f").unwrap();
             assert_eq!(
                 MvPartitionValue::String(manifest_value),
                 client_value,
@@ -633,12 +653,15 @@ mod tests {
         data_type: DataType,
         sql_type: SqlType,
     ) -> AggregateMvLayout {
-        let row_id =
-            managed_physical_column("__row_id__".to_string(), SqlType::String, false, false, true);
-        let group =
-            managed_physical_column(name.to_string(), sql_type.clone(), true, true, false);
-        let counter =
-            managed_physical_column("c".to_string(), SqlType::BigInt, false, true, false);
+        let row_id = managed_physical_column(
+            "__row_id__".to_string(),
+            SqlType::String,
+            false,
+            false,
+            true,
+        );
+        let group = managed_physical_column(name.to_string(), sql_type.clone(), true, true, false);
+        let counter = managed_physical_column("c".to_string(), SqlType::BigInt, false, true, false);
         let state = managed_physical_column(
             "__agg_state_c".to_string(),
             SqlType::BigInt,
@@ -763,8 +786,7 @@ mod tests {
     fn batch_with_group_key(name: &str, dt: DataType, values: arrow::array::ArrayRef) -> Chunk {
         let n = values.len();
         let row_ids: Vec<String> = (0..n).map(|i| format!("rid-{i}")).collect();
-        let row_id_arr: arrow::array::ArrayRef =
-            StdArc::new(StringArray::from(row_ids));
+        let row_id_arr: arrow::array::ArrayRef = StdArc::new(StringArray::from(row_ids));
         let counts: arrow::array::ArrayRef = StdArc::new(Int64Array::from(vec![1i64; n]));
         let states: arrow::array::ArrayRef = StdArc::new(Int64Array::from(vec![1i64; n]));
         let schema = StdArc::new(Schema::new(vec![
@@ -773,19 +795,15 @@ mod tests {
             Field::new("c", DataType::Int64, false),
             Field::new("__agg_state_c", DataType::Int64, false),
         ]));
-        let batch =
-            RecordBatch::try_new(schema, vec![row_id_arr, values, counts, states]).unwrap();
+        let batch = RecordBatch::try_new(schema, vec![row_id_arr, values, counts, states]).unwrap();
         crate::engine::record_batch_to_chunk(batch).unwrap()
     }
 
     #[test]
     fn derive_identity_returns_known_partition_per_unique_value() {
         let layout = count_layout_with_group_key("region", DataType::Utf8, SqlType::String);
-        let contract = count_contract_with_partition(
-            "region",
-            MvPartitionTransformContract::Identity,
-            11,
-        );
+        let contract =
+            count_contract_with_partition("region", MvPartitionTransformContract::Identity, 11);
         let chunk = batch_with_group_key(
             "region",
             DataType::Utf8,
@@ -819,14 +837,16 @@ mod tests {
     #[test]
     fn derive_day_transform_normalizes_dates_to_day_buckets() {
         let layout = count_layout_with_group_key("ts", DataType::Date32, SqlType::Date);
-        let contract =
-            count_contract_with_partition("ts", MvPartitionTransformContract::Day, 11);
+        let contract = count_contract_with_partition("ts", MvPartitionTransformContract::Day, 11);
         // Two distinct days: 19500 and 19501.
         let chunk = batch_with_group_key(
             "ts",
             DataType::Date32,
-            StdArc::new(Date32Array::from(vec![Some(19500), Some(19501), Some(19500)]))
-                as arrow::array::ArrayRef,
+            StdArc::new(Date32Array::from(vec![
+                Some(19500),
+                Some(19501),
+                Some(19500),
+            ])) as arrow::array::ArrayRef,
         );
 
         let input = AggregateDeltaPartitionInput {
@@ -876,10 +896,7 @@ mod tests {
         let out = xform.transform(arr).expect("apply");
         let expected: Vec<String> = (0..out.len())
             .map(|i| {
-                let arr = out
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .expect("int32");
+                let arr = out.as_any().downcast_ref::<Int32Array>().expect("int32");
                 arr.value(i).to_string()
             })
             .collect();
@@ -907,11 +924,8 @@ mod tests {
     #[test]
     fn derive_unpartitioned_contract_returns_unpartitioned() {
         let layout = count_layout_with_group_key("region", DataType::Utf8, SqlType::String);
-        let mut contract = count_contract_with_partition(
-            "region",
-            MvPartitionTransformContract::Identity,
-            11,
-        );
+        let mut contract =
+            count_contract_with_partition("region", MvPartitionTransformContract::Identity, 11);
         contract.target.partition = None;
         let chunk = batch_with_group_key(
             "region",
@@ -933,11 +947,8 @@ mod tests {
     #[test]
     fn derive_void_transform_returns_unsupported_error() {
         let layout = count_layout_with_group_key("region", DataType::Utf8, SqlType::String);
-        let contract = count_contract_with_partition(
-            "region",
-            MvPartitionTransformContract::Void,
-            11,
-        );
+        let contract =
+            count_contract_with_partition("region", MvPartitionTransformContract::Void, 11);
         let chunk = batch_with_group_key(
             "region",
             DataType::Utf8,
@@ -960,18 +971,9 @@ mod tests {
     #[test]
     fn derive_missing_target_field_returns_group_key_missing() {
         let layout = count_layout_with_group_key("region", DataType::Utf8, SqlType::String);
-        let mut contract = count_contract_with_partition(
-            "region",
-            MvPartitionTransformContract::Identity,
-            11,
-        );
-        contract
-            .target
-            .partition
-            .as_mut()
-            .unwrap()
-            .fields[0]
-            .source_target_field_id = 999;
+        let mut contract =
+            count_contract_with_partition("region", MvPartitionTransformContract::Identity, 11);
+        contract.target.partition.as_mut().unwrap().fields[0].source_target_field_id = 999;
         let chunk = batch_with_group_key(
             "region",
             DataType::Utf8,
@@ -993,11 +995,8 @@ mod tests {
     #[test]
     fn derive_non_pure_output_lineage_returns_error() {
         let layout = count_layout_with_group_key("region", DataType::Utf8, SqlType::String);
-        let mut contract = count_contract_with_partition(
-            "region",
-            MvPartitionTransformContract::Identity,
-            11,
-        );
+        let mut contract =
+            count_contract_with_partition("region", MvPartitionTransformContract::Identity, 11);
         // Force the output column to look like a non-pure expression.
         contract.output.columns[0].expression.kind = ExpressionKind::Func;
         contract.output.columns[0]
@@ -1024,14 +1023,10 @@ mod tests {
     #[test]
     fn derive_missing_chunk_column_returns_group_key_missing() {
         let layout = count_layout_with_group_key("region", DataType::Utf8, SqlType::String);
-        let contract = count_contract_with_partition(
-            "region",
-            MvPartitionTransformContract::Identity,
-            11,
-        );
+        let contract =
+            count_contract_with_partition("region", MvPartitionTransformContract::Identity, 11);
         // Build a chunk whose group-key column name does NOT match the layout's.
-        let row_ids: arrow::array::ArrayRef =
-            StdArc::new(StringArray::from(vec![Some("rid-0")]));
+        let row_ids: arrow::array::ArrayRef = StdArc::new(StringArray::from(vec![Some("rid-0")]));
         let other: arrow::array::ArrayRef = StdArc::new(StringArray::from(vec![Some("a")]));
         let counts: arrow::array::ArrayRef = StdArc::new(Int64Array::from(vec![1i64]));
         let states: arrow::array::ArrayRef = StdArc::new(Int64Array::from(vec![1i64]));
@@ -1041,8 +1036,7 @@ mod tests {
             Field::new("c", DataType::Int64, false),
             Field::new("__agg_state_c", DataType::Int64, false),
         ]));
-        let batch =
-            RecordBatch::try_new(schema, vec![row_ids, other, counts, states]).unwrap();
+        let batch = RecordBatch::try_new(schema, vec![row_ids, other, counts, states]).unwrap();
         let chunk = crate::engine::record_batch_to_chunk(batch).unwrap();
 
         let input = AggregateDeltaPartitionInput {
@@ -1060,16 +1054,12 @@ mod tests {
     #[test]
     fn derive_empty_chunks_returns_known_empty_set() {
         let layout = count_layout_with_group_key("region", DataType::Utf8, SqlType::String);
-        let contract = count_contract_with_partition(
-            "region",
-            MvPartitionTransformContract::Identity,
-            11,
-        );
+        let contract =
+            count_contract_with_partition("region", MvPartitionTransformContract::Identity, 11);
         let chunk = batch_with_group_key(
             "region",
             DataType::Utf8,
-            StdArc::new(StringArray::from(Vec::<Option<&str>>::new()))
-                as arrow::array::ArrayRef,
+            StdArc::new(StringArray::from(Vec::<Option<&str>>::new())) as arrow::array::ArrayRef,
         );
 
         let input = AggregateDeltaPartitionInput {
