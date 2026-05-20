@@ -1881,14 +1881,18 @@ fn target_fqn_string(target: &IcebergMvTarget) -> String {
     format!("{}.{}.{}", target.catalog, target.namespace, target.table)
 }
 
-fn partition_filter_label(filter: &crate::engine::mv::partition::TargetPartitionFilter) -> &'static str {
+fn partition_filter_label(
+    filter: &crate::engine::mv::partition::TargetPartitionFilter,
+) -> &'static str {
     match filter {
         crate::engine::mv::partition::TargetPartitionFilter::None => "none",
         crate::engine::mv::partition::TargetPartitionFilter::AllowList(_) => "allow_list",
     }
 }
 
-fn partition_filter_count(filter: &crate::engine::mv::partition::TargetPartitionFilter) -> Option<usize> {
+fn partition_filter_count(
+    filter: &crate::engine::mv::partition::TargetPartitionFilter,
+) -> Option<usize> {
     match filter {
         crate::engine::mv::partition::TargetPartitionFilter::None => None,
         crate::engine::mv::partition::TargetPartitionFilter::AllowList(set) => Some(set.len()),
@@ -1903,9 +1907,7 @@ fn wrap_aggregate_apply_error(target_fqn: &str, mv_id: i64, cause: String) -> St
         reason = %cause,
         "iceberg aggregate MV apply failed"
     );
-    format!(
-        "iceberg aggregate MV apply failed (target={target_fqn}, mv_id={mv_id}): {cause}"
-    )
+    format!("iceberg aggregate MV apply failed (target={target_fqn}, mv_id={mv_id}): {cause}")
 }
 
 fn build_aggregate_target_partition_filter(

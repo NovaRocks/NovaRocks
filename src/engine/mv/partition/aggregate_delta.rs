@@ -1090,17 +1090,16 @@ mod tests {
     #[test]
     fn derive_accepts_join_aggregate_pure_column_lineage() {
         let layout = count_layout_with_group_key("region", DataType::Utf8, SqlType::String);
-        let mut contract = count_contract_with_partition(
-            "region",
-            MvPartitionTransformContract::Identity,
-            11,
-        );
+        let mut contract =
+            count_contract_with_partition("region", MvPartitionTransformContract::Identity, 11);
         // Swap the lineage from single-base form to join form: clear
         // referenced_base_field_ids and populate referenced_base_fields
         // with a single qualified ref. This simulates a join-aggregate MV
         // where the output column is backed by a qualified field reference
         // instead of a direct base field id.
-        contract.output.columns[0].expression.referenced_base_field_ids = Vec::new();
+        contract.output.columns[0]
+            .expression
+            .referenced_base_field_ids = Vec::new();
         contract.output.columns[0].expression.referenced_base_fields =
             vec![QualifiedFieldLineage {
                 table_fqn: "ice.sales.orders".to_string(),
@@ -1128,16 +1127,15 @@ mod tests {
     #[test]
     fn derive_rejects_join_aggregate_multi_base_field_lineage() {
         let layout = count_layout_with_group_key("region", DataType::Utf8, SqlType::String);
-        let mut contract = count_contract_with_partition(
-            "region",
-            MvPartitionTransformContract::Identity,
-            11,
-        );
+        let mut contract =
+            count_contract_with_partition("region", MvPartitionTransformContract::Identity, 11);
         // Two base-field refs simulates a computed/joined expression, which
         // is NOT a pure passthrough and should be rejected. This represents
         // a scenario where the output column depends on multiple base fields
         // (e.g., a computed column in a join context).
-        contract.output.columns[0].expression.referenced_base_field_ids = Vec::new();
+        contract.output.columns[0]
+            .expression
+            .referenced_base_field_ids = Vec::new();
         contract.output.columns[0].expression.referenced_base_fields = vec![
             QualifiedFieldLineage {
                 table_fqn: "ice.sales.orders".to_string(),
