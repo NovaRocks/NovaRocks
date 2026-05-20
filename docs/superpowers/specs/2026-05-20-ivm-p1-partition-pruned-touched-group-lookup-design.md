@@ -385,11 +385,11 @@ manifest 端的 transform 文本与 contract enum 的对应关系（PR2 `change_
 | Month | `month` |
 | Day | `day` |
 | Hour | `hour` |
-| Bucket { num_buckets } | `bucket[{num_buckets}]` |
-| Truncate { width } | `truncate[{width}]` |
+| Bucket { num_buckets } | `bucket({num_buckets})` |
+| Truncate { width } | `truncate({width})` |
 | Void | `void` |
 
-`mapping.rs` 比对 transform 时按 enum 等价，不依赖文本相等（避免 `bucket(N)` vs `bucket[N]` 写法不一致引起的 false negative）。
+`mapping.rs` 比对 transform 时通过 `contract_transform_manifest_text` 把 contract enum 渲染成与 `change_partition_transform_name` 完全一致的文本（Rust Debug + ASCII lowercase，对 Bucket / Truncate 用圆括号），然后做 `eq_ignore_ascii_case` 比较，确保两个独立生成的文本走完全相同的规则。
 
 ## 11. Observability
 
