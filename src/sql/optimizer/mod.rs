@@ -123,6 +123,28 @@ pub(crate) fn optimize(
     extract::extract_best(&memo, root_group, &root_required, &ctx.winners)
 }
 
+/// True if `name` is the stable name of any rule that participates in
+/// the standard `optimize()` rule pipelines (RBO predicate pushdown,
+/// RBO column pruning, CBO transformations, CBO implementations).
+///
+/// Used by the server-side `SET disable_optimizer_rules` parser to
+/// detect typos in rule names so they can be surfaced via `warn!`
+/// without rejecting the SET statement.
+pub(crate) fn is_known_rule_name(name: &str) -> bool {
+    rules::all_transformation_rules()
+        .iter()
+        .any(|r| r.name() == name)
+        || rules::all_implementation_rules()
+            .iter()
+            .any(|r| r.name() == name)
+        || rbo::rules::predicate_pushdown_rbo_rules()
+            .iter()
+            .any(|r| r.name() == name)
+        || rbo::rules::column_pruning_rules()
+            .iter()
+            .any(|r| r.name() == name)
+}
+
 fn check_deadline(deadline: Instant) -> Result<(), String> {
     if Instant::now() > deadline {
         return Err(format!(
@@ -257,4 +279,23 @@ fn implement(memo: &mut Memo, rules: &[Box<dyn Rule>], options: &options::Optimi
 /// keep a duplicate in the group).
 fn op_equal(a: &Operator, b: &Operator) -> bool {
     format!("{:?}", a) == format!("{:?}", b)
+}
+
+#[cfg(test)]
+mod is_known_rule_name_tests {
+    use super::*;
+
+    #[test]
+    fn is_known_rule_name_recognizes_real_rule() {
+        // JoinCommutativity is a transformation rule that has been stable
+        // for a while; if this assertion fails because the rule was renamed,
+        // pick another known rule name from src/sql/optimizer/rules/.
+        assert!(is_known_rule_name("JoinCommutativity"));
+    }
+
+    #[test]
+    fn is_known_rule_name_rejects_typos() {
+        assert!(!is_known_rule_name("TotallyNotARealRule"));
+        assert!(!is_known_rule_name(""));
+    }
 }

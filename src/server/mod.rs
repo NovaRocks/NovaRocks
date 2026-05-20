@@ -560,6 +560,48 @@ fn parse_set_boolean(query: &str) -> Option<(String, bool)> {
     Some((name, enabled))
 }
 
+/// Parse `SET <name> = '<comma-list>'`. The value MUST be single-quoted
+/// (matching mysql session-variable convention); inner items are
+/// comma-separated, whitespace-trimmed, and empty items are dropped.
+/// Returns the list (possibly empty) when the statement matches the
+/// expected name, else None.
+///
+/// The name match requires a word boundary: e.g. `expected_name` of
+/// "disable_optimizer_rules" does NOT match
+/// "disable_optimizer_rules_extra".
+fn parse_set_string_csv(query: &str, expected_name: &str) -> Option<Vec<String>> {
+    let trimmed = query.trim();
+    let head = trimmed.get(..3)?;
+    if !head.eq_ignore_ascii_case("set") {
+        return None;
+    }
+    let after_set = trimmed[3..].trim_start();
+
+    let prefix_len = expected_name.len();
+    let head = after_set.get(..prefix_len)?;
+    if !head.eq_ignore_ascii_case(expected_name) {
+        return None;
+    }
+    let following = after_set.as_bytes().get(prefix_len)?;
+    if !matches!(*following, b' ' | b'\t' | b'=') {
+        return None;
+    }
+    let rest = after_set[prefix_len..].trim_start();
+
+    let value_str = rest.strip_prefix('=')?.trim();
+    let inner = value_str
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))?;
+
+    let items: Vec<String> = inner
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    Some(items)
+}
+
 fn parse_set_user_variable_query(query: &str) -> Option<(String, String)> {
     let trimmed = query.trim();
     if !trimmed
@@ -706,6 +748,18 @@ async fn execute_statement_text(
             _ => return Ok(StatementResult::Ok),
         }
         return Ok(StatementResult::Ok);
+    }
+
+    for name in ["disable_optimizer_rules", "cbo_disabled_rules"] {
+        if let Some(rules) = parse_set_string_csv(trimmed, name) {
+            for rule in &rules {
+                if !crate::sql::optimizer::is_known_rule_name(rule) {
+                    warn!("unknown optimizer rule disabled via session: {rule}");
+                }
+            }
+            shim.optimizer_settings.disabled_rules = rules;
+            return Ok(StatementResult::Ok);
+        }
     }
 
     if let Some((name, value)) = parse_set_user_variable_query(trimmed) {
@@ -1103,5 +1157,104 @@ mod tests {
             parse_admin_failpoint_query("admin enable failpoint agg_hash_set_bad_alloc").is_err()
         );
         assert_eq!(parse_admin_failpoint_query("admin show config"), Ok(None));
+    }
+
+    #[test]
+    fn parse_set_string_csv_accepts_quoted_value() {
+        assert_eq!(
+            parse_set_string_csv(
+                "SET disable_optimizer_rules = 'JoinCommutativity'",
+                "disable_optimizer_rules"
+            ),
+            Some(vec!["JoinCommutativity".to_string()]),
+        );
+    }
+
+    #[test]
+    fn parse_set_string_csv_splits_comma_list() {
+        assert_eq!(
+            parse_set_string_csv(
+                "SET disable_optimizer_rules = 'A,B,C'",
+                "disable_optimizer_rules"
+            ),
+            Some(vec!["A".to_string(), "B".to_string(), "C".to_string()]),
+        );
+    }
+
+    #[test]
+    fn parse_set_string_csv_trims_spaces_within_list() {
+        assert_eq!(
+            parse_set_string_csv(
+                "SET disable_optimizer_rules = ' A , B '",
+                "disable_optimizer_rules"
+            ),
+            Some(vec!["A".to_string(), "B".to_string()]),
+        );
+    }
+
+    #[test]
+    fn parse_set_string_csv_empty_value_returns_empty_list() {
+        assert_eq!(
+            parse_set_string_csv(
+                "SET disable_optimizer_rules = ''",
+                "disable_optimizer_rules"
+            ),
+            Some(vec![]),
+        );
+    }
+
+    #[test]
+    fn parse_set_string_csv_accepts_alias_target_name() {
+        assert_eq!(
+            parse_set_string_csv("SET cbo_disabled_rules = 'X'", "cbo_disabled_rules"),
+            Some(vec!["X".to_string()]),
+        );
+        // And rejects the wrong name.
+        assert_eq!(
+            parse_set_string_csv("SET disable_optimizer_rules = 'X'", "cbo_disabled_rules"),
+            None,
+        );
+    }
+
+    #[test]
+    fn parse_set_string_csv_rejects_unrelated_set_statements() {
+        assert_eq!(
+            parse_set_string_csv("SET query_timeout = 60", "disable_optimizer_rules"),
+            None,
+        );
+        assert_eq!(
+            parse_set_string_csv("SELECT 1", "disable_optimizer_rules"),
+            None,
+        );
+    }
+
+    #[test]
+    fn parse_set_string_csv_requires_word_boundary_after_name() {
+        // disable_optimizer_rules_extra should NOT match disable_optimizer_rules.
+        assert_eq!(
+            parse_set_string_csv(
+                "SET disable_optimizer_rules_extra = 'X'",
+                "disable_optimizer_rules"
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn parse_set_string_csv_accepts_unknown_rule_name() {
+        // The server-side warn! path is in execute_statement_text; we can't
+        // easily integration-test that without a running shim. Here we just
+        // confirm parse_set_string_csv itself doesn't filter unknown names —
+        // they pass through and the runtime is_known_rule_name check fires
+        // the warn separately.
+        let rules = parse_set_string_csv(
+            "SET disable_optimizer_rules = 'TotallyNotARealRule'",
+            "disable_optimizer_rules",
+        )
+        .expect("parse ok");
+        assert_eq!(rules, vec!["TotallyNotARealRule".to_string()]);
+        assert!(!crate::sql::optimizer::is_known_rule_name(
+            "TotallyNotARealRule"
+        ));
     }
 }
