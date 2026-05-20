@@ -2,9 +2,13 @@
 
 use std::collections::HashMap;
 
-use crate::sql::analysis::{ExprKind, TypedExpr};
+use crate::sql::analysis::ExprKind;
 use crate::sql::optimizer::rbo::rules::join_reorder::cardinality::estimate_statistics;
 use crate::sql::optimizer::statistics::TableStatistics;
+
+#[cfg(test)]
+use crate::sql::analysis::TypedExpr;
+#[cfg(test)]
 use crate::sql::planner::plan::LogicalPlan;
 
 use super::context::PushPlan;
