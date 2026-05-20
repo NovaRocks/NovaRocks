@@ -1277,6 +1277,7 @@ mod tests {
             data_type: DataType::Int64,
             nullable: false,
             write_default: None,
+            logical_type: None,
         };
         PhysicalPlanNode {
             op: Operator::PhysicalScan(PhysicalScanOp {
