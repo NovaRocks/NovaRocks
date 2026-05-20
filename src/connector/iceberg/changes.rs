@@ -142,6 +142,11 @@ pub(crate) struct DataFileRef {
     pub partition_values: Vec<ChangePartitionFieldValue>,
     pub first_row_id: Option<i64>,
     pub data_sequence_number: Option<i64>,
+    /// IVM-only filter applied at scan time. When `Some`, only emit rows whose
+    /// stored or synthesized `_row_id` is in this set; when `None`, emit all
+    /// rows in the file. Populated by `compute_overwrite_unchanged_rows` for
+    /// CoW UPDATE replacement files so unchanged rows are skipped.
+    pub row_id_allow_list: Option<std::collections::BTreeSet<i64>>,
 }
 
 /// A single Iceberg partition field value carried with an Iceberg change ref.
@@ -666,10 +671,20 @@ pub(crate) fn plan_changes(
 
     let file_io = table.file_io();
     let collect = collect_files(metadata, file_io, &plan.actions);
-    let (inserts, deletes, equality_deletes, deleted_data_files) =
+    let (mut inserts, deletes, equality_deletes, deleted_data_files) =
         crate::connector::iceberg::catalog::registry::block_on_iceberg(collect).map_err(
             |e| ChangeError::InternalInconsistency(format!("plan_changes runtime: {e}")),
         )??;
+
+    // V3 row-lineage optimisation: when an Overwrite snapshot's added file
+    // shares stored `_row_id`s with a deleted file in the same partition,
+    // those rows are unchanged and IVM can skip them. Populate per-file
+    // `row_id_allow_list`s describing the rows that ARE actually new.
+    // Conservative on errors: silently leave the allow list as `None`,
+    // which preserves the current (correct but over-counted) behaviour.
+    if !deleted_data_files.is_empty() && !inserts.is_empty() {
+        compute_overwrite_unchanged_rows(table, &mut inserts, &deleted_data_files, None)?;
+    }
 
     Ok(IcebergChangeBatch {
         previous_snapshot_id,
@@ -679,6 +694,130 @@ pub(crate) fn plan_changes(
         equality_deletes,
         deleted_data_files,
     })
+}
+
+/// V3 row-lineage optimisation for CoW UPDATE / Overwrite snapshots.
+///
+/// When the change window contains an Overwrite snapshot, the added data
+/// files (`inserts`) and the deleted data files (`deleted_data_files`)
+/// together describe a physical rewrite. Rows present on both sides with
+/// the same stored `_row_id` are unchanged — they only moved positions.
+/// IVM does not need to materialise them as +Insert / -Delete pairs
+/// downstream: emitting nothing for these rows is equivalent and saves
+/// IO + downstream coalescing work.
+///
+/// For each added file we populate `row_id_allow_list` with the set of
+/// stored row ids that ARE new (= stored row ids not present in any
+/// matching deleted file). When the allow list is `None`, downstream
+/// emits every row (current behaviour). The function is best-effort and
+/// silently falls back when files lack `first_row_id`, when matching
+/// partitions can't be determined, or when a file read fails — these
+/// over-emit but stay correct.
+///
+/// Matching rule: pair `(added_file, deleted_file)` iff they share the
+/// same `partition_spec_id` AND the same `partition_key`. Cross-spec or
+/// cross-partition rewrites are not paired (partition evolution).
+pub(crate) fn compute_overwrite_unchanged_rows(
+    table: &iceberg::table::Table,
+    added_files: &mut [DataFileRef],
+    deleted_files: &[DeletedDataFileRef],
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+) -> Result<(), ChangeError> {
+    use std::collections::BTreeMap;
+    if deleted_files.is_empty() || added_files.is_empty() {
+        return Ok(());
+    }
+
+    type PartKey = (Option<i32>, Option<String>);
+    let mut deleted_row_ids_by_partition: BTreeMap<PartKey, std::collections::BTreeSet<i64>> =
+        BTreeMap::new();
+
+    for del in deleted_files {
+        let Some(first_row_id) = del.first_row_id else {
+            continue;
+        };
+        let row_ids = match read_stored_row_ids_from_file(
+            table,
+            &del.path,
+            del.size,
+            first_row_id,
+            object_store_config,
+        ) {
+            Ok(ids) => ids,
+            Err(_) => continue,
+        };
+        let key = (del.partition_spec_id, del.partition_key.clone());
+        deleted_row_ids_by_partition
+            .entry(key)
+            .or_default()
+            .extend(row_ids);
+    }
+
+    if deleted_row_ids_by_partition.is_empty() {
+        return Ok(());
+    }
+
+    for added in added_files.iter_mut() {
+        let Some(first_row_id) = added.first_row_id else {
+            continue;
+        };
+        let key = (added.partition_spec_id, added.partition_key.clone());
+        let Some(deleted_ids) = deleted_row_ids_by_partition.get(&key) else {
+            continue;
+        };
+        let stored_ids = match read_stored_row_ids_from_file(
+            table,
+            &added.path,
+            added.size,
+            first_row_id,
+            object_store_config,
+        ) {
+            Ok(ids) => ids,
+            Err(_) => continue,
+        };
+        // Build allow list = stored ids NOT in the deleted side. Rows
+        // shared with the deleted side are "unchanged" and skipped.
+        let kept: std::collections::BTreeSet<i64> = stored_ids
+            .into_iter()
+            .filter(|rid| !deleted_ids.contains(rid))
+            .collect();
+        added.row_id_allow_list = Some(kept);
+    }
+    Ok(())
+}
+
+fn read_stored_row_ids_from_file(
+    table: &iceberg::table::Table,
+    path: &str,
+    size: i64,
+    first_row_id: i64,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+) -> Result<Vec<i64>, String> {
+    let factory = build_factory_for_table(table, object_store_config)?;
+    let normalized = normalize_delete_projection_path(path, object_store_config)
+        .map_err(|e| format!("normalize path {path}: {e}"))?;
+    let len = u64::try_from(size).ok();
+    let batches = read_full_data_file(&normalized, len, &factory)?;
+    let mut out = Vec::new();
+    let mut cursor: i64 = 0;
+    for batch in &batches {
+        let schema = batch.schema();
+        let columns = batch.columns();
+        let num_rows = batch.num_rows();
+        let positions: Vec<i64> = (0..num_rows as i64).map(|i| cursor + i).collect();
+        let row_ids = crate::connector::iceberg::row_lineage_synth::synthesize_row_id(
+            schema.as_ref(),
+            columns,
+            num_rows,
+            first_row_id,
+            Some(&positions),
+        )?;
+        out.extend(row_ids);
+        cursor = cursor
+            .checked_add(num_rows as i64)
+            .ok_or_else(|| format!("position cursor overflow reading {path}"))?;
+    }
+    Ok(out)
 }
 
 /// Helper for `IcebergDeltaScanOperator`: scan one position-delete file
@@ -1857,6 +1996,7 @@ async fn collect_added_data_files_for_manifest_list(
                         .sequence_number()
                         .unwrap_or(manifest_file.sequence_number),
                 ),
+                row_id_allow_list: None,
             });
         }
     }
@@ -2267,6 +2407,7 @@ mod tests {
             }],
             first_row_id: Some(100),
             data_sequence_number: Some(12),
+            row_id_allow_list: None,
         };
 
         assert_eq!(file.partition_spec_id, Some(4));

@@ -48,6 +48,7 @@ pub(crate) fn build_delta_source_files(
             first_row_id: f.first_row_id,
             data_sequence_number: f.data_sequence_number,
             change_op: Some(CHANGE_OP_INSERT),
+            row_id_allow_list: None,
         })
         .collect();
 

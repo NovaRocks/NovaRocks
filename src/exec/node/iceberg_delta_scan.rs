@@ -69,6 +69,14 @@ pub struct DeltaSourceFile {
     pub partition_key: Option<String>,
     pub first_row_id: Option<i64>,
     pub data_sequence_number: Option<i64>,
+    /// V3 row-lineage CoW-aware filter: when `Some`, the data-file scanner
+    /// only emits rows whose synthesized `_row_id` is in this set. Populated
+    /// by the IVM planner for CoW UPDATE replacement files so unchanged rows
+    /// (those whose stored `_row_id` also appears in a deleted file in the
+    /// same partition) are skipped. `None` means "emit all rows" (current
+    /// behaviour for plain INSERT files and for files where the optimisation
+    /// is not applicable).
+    pub row_id_allow_list: Option<std::collections::BTreeSet<i64>>,
 }
 
 #[derive(Clone, Debug)]

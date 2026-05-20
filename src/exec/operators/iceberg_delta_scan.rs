@@ -436,6 +436,9 @@ struct DataFileScanner {
     /// Rows emitted so far across all batches in this scanner. Used to make
     /// `_pos` and `_row_id` strictly monotonic over the file.
     rows_emitted: i64,
+    /// V3 CoW-aware filter (Bug 3): when `Some`, only emit rows whose
+    /// synthesized `_row_id` is in this set. `None` = emit all rows.
+    row_id_allow_list: Option<std::collections::BTreeSet<i64>>,
 }
 
 impl DeltaFileScanner for DataFileScanner {
@@ -461,6 +464,36 @@ impl DeltaFileScanner for DataFileScanner {
                     self.file_path, self.rows_emitted, row_count
                 )
             })?;
+
+        // V3 CoW-unchanged-row filter: drop rows whose `_row_id` is not in
+        // the allow list. `None` (no filter) is the common case.
+        if let Some(allow_list) = self.row_id_allow_list.as_ref() {
+            use arrow::array::{Array, BooleanArray, Int64Array};
+            use arrow::compute::filter_record_batch;
+            let row_ids_array = enriched
+                .column_by_name("_row_id")
+                .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                .ok_or_else(|| {
+                    format!(
+                        "ivm-a1 data-file scanner: enriched batch has no _row_id column for {}",
+                        self.file_path
+                    )
+                })?;
+            let keep: Vec<bool> = (0..row_ids_array.len())
+                .map(|i| !row_ids_array.is_null(i) && allow_list.contains(&row_ids_array.value(i)))
+                .collect();
+            // Skip filtering work when nothing to drop.
+            if !keep.iter().all(|&k| k) {
+                let mask = BooleanArray::from(keep);
+                let filtered = filter_record_batch(&enriched, &mask).map_err(|e| {
+                    format!(
+                        "ivm-a1 data-file scanner: filter by allow_list failed for {}: {e}",
+                        self.file_path
+                    )
+                })?;
+                return Ok(Some(filtered));
+            }
+        }
         Ok(Some(enriched))
     }
 
@@ -502,6 +535,7 @@ fn open_data_file_scanner(
         first_row_id,
         data_sequence_number,
         rows_emitted: 0,
+        row_id_allow_list: file.row_id_allow_list.clone(),
     }))
 }
 

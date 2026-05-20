@@ -25,6 +25,7 @@ pub(crate) struct IcebergFileForQuery {
     pub(crate) first_row_id: Option<i64>,
     pub(crate) data_sequence_number: Option<i64>,
     pub(crate) change_op: Option<i8>,
+    pub(crate) row_id_allow_list: Option<std::collections::BTreeSet<i64>>,
 }
 
 pub(crate) fn delete_temp_iceberg_file_for_query(
@@ -42,6 +43,7 @@ pub(crate) fn delete_temp_iceberg_file_for_query(
         first_row_id: None,
         data_sequence_number: None,
         change_op,
+        row_id_allow_list: None,
     }
 }
 
@@ -781,6 +783,7 @@ mod tests {
             first_row_id: None,
             data_sequence_number: None,
             change_op,
+            row_id_allow_list: None,
         }
     }
 

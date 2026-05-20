@@ -237,6 +237,7 @@ fn build_delta_source_files_from_batch(
             partition_key: ins.partition_key.clone(),
             first_row_id: ins.first_row_id,
             data_sequence_number: ins.data_sequence_number,
+            row_id_allow_list: ins.row_id_allow_list.clone(),
         });
     }
     for del in &batch.deletes {
@@ -277,6 +278,7 @@ fn build_delta_source_files_from_batch(
             partition_key: None,
             first_row_id: None,
             data_sequence_number: None,
+            row_id_allow_list: None,
         });
     }
     for eq in &batch.equality_deletes {
@@ -295,6 +297,7 @@ fn build_delta_source_files_from_batch(
             partition_key: eq.partition_key.clone(),
             first_row_id: None,
             data_sequence_number: eq.sequence_number,
+            row_id_allow_list: None,
         });
     }
     for d in &batch.deleted_data_files {
@@ -308,6 +311,7 @@ fn build_delta_source_files_from_batch(
             partition_key: d.partition_key.clone(),
             first_row_id: d.first_row_id,
             data_sequence_number: d.data_sequence_number,
+            row_id_allow_list: None,
         });
     }
     Ok(out)
