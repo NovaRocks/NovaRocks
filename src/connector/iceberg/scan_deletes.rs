@@ -260,24 +260,18 @@ fn positions_to_row_selection(positions: &RoaringTreemap) -> Result<RowSelection
     Ok(RowSelection::from(selectors))
 }
 
-/// Append (or validate) the stored `_row_id` column on a delete-side reverse-
-/// projection batch.
+/// Append (or rebuild) the `_row_id` column on a delete-side reverse-
+/// projection batch following Iceberg V3 row-lineage semantics: stored
+/// non-NULL value wins, NULL or absent falls back to
+/// `first_row_id + position`.
 ///
-/// **V3 spec note (TODO):** this function computes `_row_id = first_row_id +
-/// position` and validates any pre-existing `_row_id` column against the
-/// computed value, rejecting mismatches with `InternalInconsistency`. That
-/// behaviour is incompatible with V3 row-lineage's "stored value wins"
-/// contract when the file was written by CoW UPDATE / compaction — a
-/// replacement file carries inherited row_ids in its stored column that
-/// deliberately differ from `first_row_id + position`. Until the delete-side
-/// reverse projection is migrated to use
-/// [`crate::connector::iceberg::row_lineage_synth::synthesize_row_id`], CoW
-/// UPDATE deletes through this path will either error out or produce wrong
-/// row_ids in unusual mixed-snapshot windows. Bug 1's primary fix sits on the
-/// insert-side scanner (`IcebergDeltaScan`), which is sufficient for
-/// `iceberg_ivm_join_key_update_multiplicity`. A follow-up commit will
-/// migrate this path too; tracked as out-of-scope for the immediate Bug 1
-/// commit.
+/// CoW UPDATE replacement files carry stored row ids inherited from their
+/// matched rows; those values can legitimately differ from the computed
+/// fallback formula. The previous behaviour — validating stored against
+/// computed and rejecting mismatches as `InternalInconsistency` — was
+/// incorrect under V3 (and broke `iceberg_ivm_base_delete_row_lineage`,
+/// `iceberg_ivm_join_aggregate`, and others once Bug 2 stopped aliasing
+/// manifest `first_row_id` to `min(touched_row_ids)`).
 pub(crate) fn append_base_row_id_column(
     batch: &RecordBatch,
     first_row_id: i64,
@@ -290,20 +284,13 @@ pub(crate) fn append_base_row_id_column(
             positions.len()
         )));
     }
-    let mut row_ids = Vec::with_capacity(positions.len());
-    for position in positions {
-        let position = i64::try_from(*position).map_err(|_| {
-            ChangeError::InternalInconsistency(format!(
-                "iceberg row position {position} exceeds i64 while materializing {ROW_ID_COLUMN}"
-            ))
-        })?;
-        row_ids.push(first_row_id.checked_add(position).ok_or_else(|| {
-            ChangeError::InternalInconsistency(format!(
-                "iceberg {ROW_ID_COLUMN} overflow: first_row_id={first_row_id}, position={position}"
-            ))
-        })?);
-    }
 
+    // V3 row-lineage: when the file carries a stored `_row_id` column, the
+    // stored non-NULL value is the row_id (covers CoW UPDATE replacement
+    // files whose stored row ids are inherited from the matched rows and
+    // therefore differ from `first_row_id + position`). When stored is NULL
+    // or the column is absent (plain INSERT files), fall back to the
+    // computed formula.
     if let Some((idx, _)) = batch
         .schema()
         .fields()
@@ -325,19 +312,61 @@ pub(crate) fn append_base_row_id_column(
                     "existing {ROW_ID_COLUMN} is not BIGINT after cast"
                 ))
             })?;
-        for (row, expected) in row_ids.iter().enumerate() {
-            if existing.is_null(row) || existing.value(row) != *expected {
-                let actual = if existing.is_null(row) {
-                    "NULL".to_string()
-                } else {
-                    existing.value(row).to_string()
-                };
-                return Err(ChangeError::InternalInconsistency(format!(
-                    "delete reverse projection found inconsistent {ROW_ID_COLUMN} at row {row}: expected {expected}, got {actual}"
-                )));
+        // If every existing value is non-null, batch already has correct
+        // row_ids — return as-is (we don't need to rebuild).
+        let any_null = (0..existing.len()).any(|r| existing.is_null(r));
+        if !any_null {
+            return Ok(batch.clone());
+        }
+        // Mixed: build a row_id column that takes stored when non-NULL and
+        // computed when NULL. Rebuild the batch with this row_id replacing
+        // the existing column.
+        let mut row_ids = Vec::with_capacity(positions.len());
+        for (row, position) in positions.iter().enumerate() {
+            let position = i64::try_from(*position).map_err(|_| {
+                ChangeError::InternalInconsistency(format!(
+                    "iceberg row position {position} exceeds i64 while materializing {ROW_ID_COLUMN}"
+                ))
+            })?;
+            if existing.is_null(row) {
+                row_ids.push(first_row_id.checked_add(position).ok_or_else(|| {
+                    ChangeError::InternalInconsistency(format!(
+                        "iceberg {ROW_ID_COLUMN} overflow: first_row_id={first_row_id}, position={position}"
+                    ))
+                })?);
+            } else {
+                row_ids.push(existing.value(row));
             }
         }
-        return Ok(batch.clone());
+        let mut fields = batch.schema().fields().iter().cloned().collect::<Vec<_>>();
+        fields[idx] = Arc::new(Field::new(
+            ROW_ID_COLUMN,
+            arrow::datatypes::DataType::Int64,
+            false,
+        ));
+        let schema = Arc::new(arrow::datatypes::Schema::new(fields));
+        let mut columns = batch.columns().to_vec();
+        columns[idx] = Arc::new(Int64Array::from(row_ids)) as ArrayRef;
+        return RecordBatch::try_new(schema, columns).map_err(|e| {
+            ChangeError::InternalInconsistency(format!(
+                "rebuild delete reverse projection batch with stored+computed row ids: {e}"
+            ))
+        });
+    }
+
+    // No stored column at all: pure computed fallback.
+    let mut row_ids = Vec::with_capacity(positions.len());
+    for position in positions {
+        let position = i64::try_from(*position).map_err(|_| {
+            ChangeError::InternalInconsistency(format!(
+                "iceberg row position {position} exceeds i64 while materializing {ROW_ID_COLUMN}"
+            ))
+        })?;
+        row_ids.push(first_row_id.checked_add(position).ok_or_else(|| {
+            ChangeError::InternalInconsistency(format!(
+                "iceberg {ROW_ID_COLUMN} overflow: first_row_id={first_row_id}, position={position}"
+            ))
+        })?);
     }
 
     let mut fields = batch.schema().fields().iter().cloned().collect::<Vec<_>>();
