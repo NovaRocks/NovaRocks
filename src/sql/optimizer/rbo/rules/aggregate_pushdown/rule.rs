@@ -28,9 +28,13 @@ impl RewriteRule for AggregatePushdownRule {
         matches!(plan, LogicalPlan::Aggregate(_))
     }
 
-    fn apply(&self, _plan: LogicalPlan) -> Option<LogicalPlan> {
-        // Stub: return None until collector + rewriter land in Tasks 4-7.
-        None
+    fn apply(&self, plan: LogicalPlan) -> Option<LogicalPlan> {
+        let agg = match &plan {
+            LogicalPlan::Aggregate(a) => a,
+            _ => return None,
+        };
+        let push = super::collector::collect_push_plan(agg, &self.table_stats)?;
+        Some(super::rewriter::rewrite(agg, push))
     }
 }
 
