@@ -1084,4 +1084,87 @@ mod tests {
         };
         assert!(partitions.is_empty());
     }
+
+    use crate::meta::repository::mv_contract::QualifiedFieldLineage;
+
+    #[test]
+    fn derive_accepts_join_aggregate_pure_column_lineage() {
+        let layout = count_layout_with_group_key("region", DataType::Utf8, SqlType::String);
+        let mut contract = count_contract_with_partition(
+            "region",
+            MvPartitionTransformContract::Identity,
+            11,
+        );
+        // Swap the lineage from single-base form to join form: clear
+        // referenced_base_field_ids and populate referenced_base_fields
+        // with a single qualified ref. This simulates a join-aggregate MV
+        // where the output column is backed by a qualified field reference
+        // instead of a direct base field id.
+        contract.output.columns[0].expression.referenced_base_field_ids = Vec::new();
+        contract.output.columns[0].expression.referenced_base_fields =
+            vec![QualifiedFieldLineage {
+                table_fqn: "ice.sales.orders".to_string(),
+                qualifier_at_create: "base".to_string(),
+                field_id: 1,
+            }];
+
+        let chunk = batch_with_group_key(
+            "region",
+            DataType::Utf8,
+            StdArc::new(StringArray::from(vec![Some("a"), Some("b")])) as arrow::array::ArrayRef,
+        );
+        let input = AggregateDeltaPartitionInput {
+            layout: &layout,
+            schema_contract: &contract,
+            delta_chunks: &[chunk],
+        };
+        let result = derive_from_aggregate_delta(&input).expect("derive");
+        let AffectedAggregateTargetPartitions::Known { partitions } = result else {
+            panic!("expected Known");
+        };
+        assert_eq!(partitions.len(), 2);
+    }
+
+    #[test]
+    fn derive_rejects_join_aggregate_multi_base_field_lineage() {
+        let layout = count_layout_with_group_key("region", DataType::Utf8, SqlType::String);
+        let mut contract = count_contract_with_partition(
+            "region",
+            MvPartitionTransformContract::Identity,
+            11,
+        );
+        // Two base-field refs simulates a computed/joined expression, which
+        // is NOT a pure passthrough and should be rejected. This represents
+        // a scenario where the output column depends on multiple base fields
+        // (e.g., a computed column in a join context).
+        contract.output.columns[0].expression.referenced_base_field_ids = Vec::new();
+        contract.output.columns[0].expression.referenced_base_fields = vec![
+            QualifiedFieldLineage {
+                table_fqn: "ice.sales.orders".to_string(),
+                qualifier_at_create: "f".to_string(),
+                field_id: 1,
+            },
+            QualifiedFieldLineage {
+                table_fqn: "ice.sales.orders".to_string(),
+                qualifier_at_create: "d".to_string(),
+                field_id: 2,
+            },
+        ];
+
+        let chunk = batch_with_group_key(
+            "region",
+            DataType::Utf8,
+            StdArc::new(StringArray::from(vec![Some("a")])) as arrow::array::ArrayRef,
+        );
+        let input = AggregateDeltaPartitionInput {
+            layout: &layout,
+            schema_contract: &contract,
+            delta_chunks: &[chunk],
+        };
+        let err = derive_from_aggregate_delta(&input).unwrap_err();
+        assert!(matches!(
+            err,
+            AffectedPartitionError::OutputLineageNotPureColumn { ref field } if field == "region"
+        ));
+    }
 }
