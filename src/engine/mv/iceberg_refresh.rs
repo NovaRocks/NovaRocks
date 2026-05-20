@@ -1921,9 +1921,7 @@ fn aggregate_delta_touched_row_ids(
     for chunk in delta_chunks {
         let schema = chunk.batch.schema();
         let row_id_index = schema.index_of(row_id_column).map_err(|e| {
-            format!(
-                "iceberg aggregate delta missing row id column `{row_id_column}`: {e}"
-            )
+            format!("iceberg aggregate delta missing row id column `{row_id_column}`: {e}")
         })?;
         let row_id_array = chunk
             .batch
@@ -1931,9 +1929,7 @@ fn aggregate_delta_touched_row_ids(
             .as_any()
             .downcast_ref::<StringArray>()
             .ok_or_else(|| {
-                format!(
-                    "iceberg aggregate delta row id column `{row_id_column}` must be Utf8"
-                )
+                format!("iceberg aggregate delta row id column `{row_id_column}` must be Utf8")
             })?;
         for row in 0..row_id_array.len() {
             if row_id_array.is_null(row) {
@@ -1994,9 +1990,8 @@ fn apply_iceberg_aggregate_delta_chunks(
     // merge.new_total_rows is the count of groups after merging the PARTIAL old state
     // (touched groups only) with the delta. Adjust by the previous total so that
     // groups not touched by this refresh are still counted.
-    let new_total_rows = mv_definition.last_refresh_rows.unwrap_or(0)
-        - old_touched_rows
-        + merge.new_total_rows;
+    let new_total_rows =
+        mv_definition.last_refresh_rows.unwrap_or(0) - old_touched_rows + merge.new_total_rows;
     let delete_row_ids = merge.delete_row_ids.clone();
     let insert_chunks = merge.insert_chunks.clone();
     if delete_row_ids.is_empty()
@@ -11088,11 +11083,7 @@ mod tests {
             }
         }
 
-        pub(super) fn batch_with_group_key(
-            name: &str,
-            dt: DataType,
-            values: ArrayRef,
-        ) -> Chunk {
+        pub(super) fn batch_with_group_key(name: &str, dt: DataType, values: ArrayRef) -> Chunk {
             let n = values.len();
             let row_ids: Vec<String> = (0..n).map(|i| format!("rid-{i}")).collect();
             let row_id_arr: ArrayRef = Arc::new(StringArray::from(row_ids));
