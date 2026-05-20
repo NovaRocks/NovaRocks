@@ -141,6 +141,7 @@ impl JoinDeltaCoalescer {
                     &delete_keys,
                     &existing_deletes_by_file,
                     &referenced_data_file_partitions,
+                    &crate::engine::mv::partition::TargetPartitionFilter::None,
                 ),
             )??
         } else {

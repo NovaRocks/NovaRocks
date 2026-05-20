@@ -1988,6 +1988,7 @@ fn apply_iceberg_aggregate_delta_chunks(
                 &delete_row_ids,
                 &existing_deletes_by_file,
                 &referenced_data_file_partitions,
+                &crate::engine::mv::partition::TargetPartitionFilter::None,
             ),
         ) {
             Ok(Ok(groups)) => groups,

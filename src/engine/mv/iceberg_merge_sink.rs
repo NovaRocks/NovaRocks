@@ -207,6 +207,7 @@ impl IcebergMergeSinkOperator {
                         &apply_keys,
                         &locator_state.existing_deletes_by_file,
                         &locator_state.referenced_data_file_partitions,
+                        &crate::engine::mv::partition::TargetPartitionFilter::None,
                     ),
                 )??
             }
@@ -225,6 +226,7 @@ impl IcebergMergeSinkOperator {
                         &apply_keys,
                         &locator_state.existing_deletes_by_file,
                         &locator_state.referenced_data_file_partitions,
+                        &crate::engine::mv::partition::TargetPartitionFilter::None,
                     ),
                 )??
             }
