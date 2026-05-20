@@ -1882,9 +1882,7 @@ fn target_fqn_string(target: &IcebergMvTarget) -> String {
 }
 
 fn wrap_aggregate_apply_error(target_fqn: &str, mv_id: i64, cause: String) -> String {
-    format!(
-        "iceberg aggregate MV apply failed (target={target_fqn}, mv_id={mv_id}): {cause}"
-    )
+    format!("iceberg aggregate MV apply failed (target={target_fqn}, mv_id={mv_id}): {cause}")
 }
 
 fn build_aggregate_target_partition_filter(
@@ -11193,9 +11191,8 @@ mod tests {
     #[test]
     fn aggregate_apply_error_message_includes_mv_id_and_target_fqn() {
         let layout = aggregate_apply_test_helpers::count_layout("region");
-        let contract = aggregate_apply_test_helpers::count_contract_with_void_partition(
-            "region", 11,
-        );
+        let contract =
+            aggregate_apply_test_helpers::count_contract_with_void_partition("region", 11);
         let chunk = aggregate_apply_test_helpers::batch_with_group_key(
             "region",
             arrow::datatypes::DataType::Utf8,
