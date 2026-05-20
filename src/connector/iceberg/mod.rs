@@ -33,6 +33,7 @@ pub mod schema;
 pub mod sink;
 mod state;
 pub(crate) mod stats_assembler;
+pub(crate) mod stats_loader;
 pub(crate) mod theta_sketch;
 pub(crate) mod variant_write;
 

@@ -50,6 +50,7 @@ use uuid::Uuid;
 
 use super::abort::AbortLog;
 use super::action::{CommitCtx, IcebergCommitAction};
+use super::fast_append::carry_forward_puffin_stats;
 use super::helpers::{
     effective_next_row_id, generate_snapshot_id, metadata_dir, now_ms, read_base_manifest_list,
     write_manifest_list,
@@ -106,6 +107,12 @@ impl IcebergCommitAction for RowDeltaCommit {
             target_ref: ctx.target_ref.to_string(),
         };
 
+        let prev_snapshot_id = ctx
+            .table
+            .metadata()
+            .current_snapshot()
+            .map(|s| s.snapshot_id());
+
         let tx = Transaction::new(ctx.table);
         let tx = action
             .apply(tx)
@@ -119,6 +126,11 @@ impl IcebergCommitAction for RowDeltaCommit {
             .current_snapshot()
             .map(|s| s.snapshot_id())
             .ok_or_else(|| "RowDelta committed but new snapshot is not visible".to_string())?;
+        // DELETE preserves NDV upper-bound semantics — carry forward the
+        // previous snapshot's Puffin entry to the new snapshot id.
+        if let Some(prev) = prev_snapshot_id {
+            carry_forward_puffin_stats(&table_after, ctx.catalog, new_snapshot_id, prev).await;
+        }
         let written_manifest_paths = manifest_paths_out
             .lock()
             .expect("manifest_paths_out poisoned")

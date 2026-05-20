@@ -348,13 +348,24 @@ impl IcebergTableSinkOperator {
                 continue;
             }
             let (file_path, partition_path) = self.build_file_path(state, &key.path)?;
-            let write_result = write_parquet_file(
+            let mut write_result = write_parquet_file(
                 &file_path,
                 self.plan.object_store_s3.as_ref(),
                 Arc::clone(&self.plan.output_schema),
                 &part_batch,
                 self.plan.compression,
             )?;
+
+            // Hand off the per-file Theta sketches to the side channel that
+            // the commit collector will drain at commit time. Done before
+            // `data_file` consumes `file_path` so the sketch set carries
+            // the correct path.
+            if let Some(sketches) = write_result.theta_sketches.take() {
+                state.add_iceberg_sketch_set(super::stats_assembler::FileSketchSet {
+                    file_path: file_path.clone(),
+                    sketches,
+                });
+            }
 
             let data_file = types::TIcebergDataFile {
                 path: Some(file_path),
@@ -1156,6 +1167,16 @@ fn collect_iceberg_column_stats(metadata: &ParquetMetaData) -> Option<types::TIc
 ///
 /// Returns `None` when no primitive column with a parquet field id is
 /// found — there is nothing to write into a Puffin blob in that case.
+///
+/// Public wrapper used by the standalone iceberg_writer path; the
+/// pipeline-driven sink calls this through the internal Parquet write
+/// helper.
+pub(crate) fn compute_theta_sketches_for_batch(
+    batch: &RecordBatch,
+) -> Option<HashMap<i32, super::theta_sketch::ThetaSketchHandle>> {
+    collect_theta_sketches(batch)
+}
+
 fn collect_theta_sketches(
     batch: &RecordBatch,
 ) -> Option<HashMap<i32, super::theta_sketch::ThetaSketchHandle>> {

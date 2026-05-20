@@ -42,6 +42,7 @@ use super::helpers::{
 };
 use super::overwrite::write_added_data_manifest;
 use super::types::{CommitOutcome, IcebergWriteMode, WrittenFile};
+use crate::connector::iceberg::stats_assembler::{CommitType, FileSketchSet, StatsAssembler};
 
 pub struct FastAppendCommit;
 
@@ -95,6 +96,13 @@ impl IcebergCommitAction for FastAppendCommit {
             .map(|f| written_file_to_iceberg_data_file(f, ctx.collector))
             .collect::<Result<Vec<_>, _>>()?;
 
+        let sketch_sets = ctx.collector.take_sketch_sets();
+        let prev_snapshot_id = ctx
+            .table
+            .metadata()
+            .current_snapshot()
+            .map(|s| s.snapshot_id());
+
         let tx = Transaction::new(ctx.table);
         let action = tx
             .fast_append()
@@ -112,12 +120,136 @@ impl IcebergCommitAction for FastAppendCommit {
             .current_snapshot()
             .map(|s| s.snapshot_id())
             .ok_or_else(|| "fast_append committed but new snapshot not visible".to_string())?;
+        let new_sequence_number = table_after.metadata().last_sequence_number();
+        // Best-effort Puffin NDV registration; failure must not abort the
+        // commit because data is already published.
+        register_puffin_stats(
+            &table_after,
+            ctx.catalog,
+            ctx.file_io,
+            CommitType::Append,
+            sketch_sets,
+            new_snapshot_id,
+            new_sequence_number,
+            prev_snapshot_id,
+        )
+        .await;
         Ok(CommitOutcome {
             new_snapshot_id,
             // FastAppendAction owns its manifest lifecycle; nothing for us
             // to clean up on later abort.
             written_manifest_paths: vec![],
         })
+    }
+}
+
+/// Run `StatsAssembler::assemble` and, on success, apply
+/// `UpdateStatisticsAction` against the post-commit table. Logs and swallows
+/// errors so a stats failure never reverts a successful data commit.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn register_puffin_stats(
+    table_after: &Table,
+    catalog: &dyn iceberg::Catalog,
+    file_io: &FileIO,
+    commit_type: CommitType,
+    sketch_sets: Vec<FileSketchSet>,
+    new_snapshot_id: i64,
+    new_sequence_number: i64,
+    prev_snapshot_id: Option<i64>,
+) {
+    match StatsAssembler::assemble(
+        table_after,
+        commit_type,
+        sketch_sets,
+        new_snapshot_id,
+        new_sequence_number,
+        prev_snapshot_id,
+        file_io,
+    )
+    .await
+    {
+        Ok(Some(stats_file)) => {
+            // Apply the update via a follow-up Transaction.
+            let tx = Transaction::new(table_after);
+            let action = tx.update_statistics().set_statistics(stats_file);
+            let tx = match action.apply(tx) {
+                Ok(tx) => tx,
+                Err(err) => {
+                    tracing::warn!(
+                        new_snapshot_id,
+                        error = %err,
+                        "iceberg puffin stats apply failed; snapshot committed without stats",
+                    );
+                    return;
+                }
+            };
+            if let Err(err) = tx.commit(catalog).await {
+                tracing::warn!(
+                    new_snapshot_id,
+                    error = %err,
+                    "iceberg puffin stats commit failed; snapshot committed without stats",
+                );
+            }
+        }
+        Ok(None) => {
+            // Either no new sketches available (empty input) or the
+            // assembler chose to reuse the previous Puffin (DELETE /
+            // REWRITE). Carry-forward registration is handled by the
+            // delete / rewrite paths directly.
+        }
+        Err(err) => {
+            tracing::warn!(
+                new_snapshot_id,
+                error = %err,
+                "iceberg puffin stats assemble failed; snapshot committed without stats",
+            );
+        }
+    }
+}
+
+/// Carry forward the previous snapshot's Puffin statistics entry to
+/// `new_snapshot_id`. Used by DELETE / REWRITE commits where NDV remains
+/// a valid upper bound — the statistics file path is identical, only the
+/// snapshot_id key on the metadata entry changes.
+///
+/// Errors are logged and swallowed; missing previous stats is normal.
+pub(crate) async fn carry_forward_puffin_stats(
+    table_after: &Table,
+    catalog: &dyn iceberg::Catalog,
+    new_snapshot_id: i64,
+    prev_snapshot_id: i64,
+) {
+    let Some(prev) = table_after
+        .metadata()
+        .statistics_for_snapshot(prev_snapshot_id)
+    else {
+        return;
+    };
+    let mut entry = prev.clone();
+    entry.snapshot_id = new_snapshot_id;
+    // Reseat each blob's snapshot_id so the metadata entry is self-consistent.
+    for blob in entry.blob_metadata.iter_mut() {
+        blob.snapshot_id = new_snapshot_id;
+    }
+    let tx = Transaction::new(table_after);
+    let action = tx.update_statistics().set_statistics(entry);
+    let tx = match action.apply(tx) {
+        Ok(tx) => tx,
+        Err(err) => {
+            tracing::warn!(
+                new_snapshot_id,
+                error = %err,
+                "iceberg puffin carry-forward stats apply failed",
+            );
+            return;
+        }
+    };
+    if let Err(err) = tx.commit(catalog).await {
+        tracing::warn!(
+            new_snapshot_id,
+            error = %err,
+            "iceberg puffin carry-forward stats commit failed",
+        );
     }
 }
 
@@ -146,6 +278,13 @@ async fn commit_v3_row_lineage_append(
         snapshot_properties: ctx.snapshot_properties.clone(),
     };
 
+    let sketch_sets = ctx.collector.take_sketch_sets();
+    let prev_snapshot_id = ctx
+        .table
+        .metadata()
+        .current_snapshot()
+        .map(|s| s.snapshot_id());
+
     let tx = Transaction::new(ctx.table);
     let tx = action
         .apply(tx)
@@ -159,6 +298,18 @@ async fn commit_v3_row_lineage_append(
         .current_snapshot()
         .map(|s| s.snapshot_id())
         .ok_or_else(|| "fast_append v3 committed but new snapshot not visible".to_string())?;
+    let new_sequence_number = table_after.metadata().last_sequence_number();
+    register_puffin_stats(
+        &table_after,
+        ctx.catalog,
+        ctx.file_io,
+        CommitType::Append,
+        sketch_sets,
+        new_snapshot_id,
+        new_sequence_number,
+        prev_snapshot_id,
+    )
+    .await;
     let written_manifest_paths = manifest_paths_out
         .lock()
         .expect("manifest_paths_out poisoned")

@@ -29,16 +29,13 @@
 //! | Append     | union(previous aggregate, new file sketches)   |
 //! | Delete     | reuse previous Puffin (returns `None`)         |
 //! | Rewrite    | reuse previous Puffin (returns `None`)         |
-//! | Overwrite  | full rescan (deferred — returns `None` today)  |
+//! | Overwrite  | aggregate of new file sketches (first-commit shape) |
 //!
-//! "First commit" with no prior Puffin currently follows the Overwrite path
-//! and therefore returns `None`. The full rescan logic is left to a follow-up
-//! agent that wires file I/O into the read-back path.
-//!
-//! NOTE: This module's public surface is not yet called from any commit
-//! action — Phase 2.3 of the implementation plan (commit hook integration)
-//! is owned by the next agent. The `#[allow(dead_code)]` attributes below
-//! keep the unused-warning suppressed until then.
+//! "First commit" with no prior Puffin follows the Overwrite path: the new
+//! files are the only live data, so the per-column aggregate over their
+//! sketches is the snapshot's NDV. INSERT OVERWRITE / REPLACE shares the
+//! same shape because Iceberg overwrite swaps every live data file for the
+//! newly-written ones.
 
 #![allow(dead_code)]
 
@@ -176,21 +173,40 @@ impl StatsAssembler {
         .await
     }
 
-    /// OVERWRITE / first-commit path: needs a full rescan over the current
-    /// snapshot's data files. Deferred — returns `None` so the caller skips
-    /// statistics registration for this commit.
+    /// OVERWRITE / first-commit path.
+    ///
+    /// Iceberg's OVERWRITE semantics replace every live data file with the
+    /// freshly-written ones, so the new aggregate is exactly the union of
+    /// the `new_file_sketches` already supplied by the sink — no rescan over
+    /// existing parquet payload is required (the sketches over the obsoleted
+    /// files would not contribute to the new snapshot's NDV anyway). The
+    /// first-commit path is identical: there is no prior Puffin and the new
+    /// files are the only live ones.
+    ///
+    /// If the caller supplies an empty `new_file_sketches` (e.g. INSERT
+    /// OVERWRITE of zero rows or a table with no primitive columns) we
+    /// return `None` so the caller can carry forward the previous entry or
+    /// skip registration.
     async fn assemble_overwrite(
-        _table: &Table,
-        _new_file_sketches: Vec<FileSketchSet>,
-        _current_snapshot_id: i64,
-        _current_sequence_number: i64,
-        _file_io: &FileIO,
+        table: &Table,
+        new_file_sketches: Vec<FileSketchSet>,
+        current_snapshot_id: i64,
+        current_sequence_number: i64,
+        file_io: &FileIO,
     ) -> Result<Option<StatisticsFile>, String> {
-        // Full rescan implementation is the responsibility of the follow-up
-        // agent that wires file I/O into the commit path. See
-        // docs/superpowers/plans/2026-05-20-iceberg-puffin-ndv-stats.md
-        // Step 2.2 "OVERWRITE logic".
-        Ok(None)
+        let per_column = aggregate_per_column(new_file_sketches);
+        if per_column.is_empty() {
+            return Ok(None);
+        }
+        let puffin_path = puffin_path_for_snapshot(table.metadata(), current_snapshot_id);
+        write_puffin(
+            file_io,
+            &puffin_path,
+            current_snapshot_id,
+            current_sequence_number,
+            &per_column,
+        )
+        .await
     }
 }
 

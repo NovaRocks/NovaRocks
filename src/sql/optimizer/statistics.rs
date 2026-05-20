@@ -104,6 +104,27 @@ pub fn build_table_statistics_with_columns(
     files: &[crate::sql::catalog::S3FileInfo],
     columns: &[crate::sql::catalog::ColumnDef],
 ) -> Option<TableStatistics> {
+    build_table_statistics_with_ndv(files, columns, &HashMap::new(), &HashMap::new())
+}
+
+/// Like `build_table_statistics_with_columns`, but additionally accepts an
+/// Iceberg Puffin NDV map keyed by column name (lowercased) so that the
+/// optimizer can use precise Theta-sketch cardinality where available.
+///
+/// `name_to_field_id` is unused by this function (NDV is keyed by name to
+/// match the column lookup), but is retained on the signature so callers can
+/// pre-compute it from `IcebergSchemaDef` once per query.
+///
+/// Priority for `distinct_values_count`:
+///   1. Puffin NDV when present for the column.
+///   2. Manifest `value_counts` (as an upper bound).
+///   3. `sqrt(non_null) * 10` heuristic.
+pub fn build_table_statistics_with_ndv(
+    files: &[crate::sql::catalog::S3FileInfo],
+    columns: &[crate::sql::catalog::ColumnDef],
+    ndv_by_name: &HashMap<String, f64>,
+    _name_to_field_id: &HashMap<String, i32>,
+) -> Option<TableStatistics> {
     // Need at least one file with a row count to produce meaningful stats.
     let all_have_row_count = !files.is_empty() && files.iter().all(|f| f.row_count.is_some());
     if !all_have_row_count {
@@ -197,15 +218,22 @@ pub fn build_table_statistics_with_columns(
                 } else {
                     8.0
                 },
-                // NDV: prefer manifest value_counts (treated as an upper bound)
-                // when available; otherwise fall back to a sqrt heuristic.
+                // NDV priority:
+                //   1. Iceberg Puffin theta sketch when present.
+                //   2. Manifest value_counts as an upper bound.
+                //   3. sqrt(non_null) * 10 heuristic.
                 // value_count is total rows including nulls, so cap by
                 // non_null rows.
                 distinct_values_count: {
                     let non_null = (total_rows as f64 * (1.0 - nulls_fraction)).max(1.0);
-                    match value_count {
-                        Some(vc) if vc > 0 => (vc as f64).min(non_null).max(1.0),
-                        _ => (non_null.sqrt() * 10.0).min(non_null).max(1.0),
+                    let key = col_name.to_lowercase();
+                    if let Some(&ndv) = ndv_by_name.get(&key) {
+                        ndv.min(non_null).max(1.0)
+                    } else {
+                        match value_count {
+                            Some(vc) if vc > 0 => (vc as f64).min(non_null).max(1.0),
+                            _ => (non_null.sqrt() * 10.0).min(non_null).max(1.0),
+                        }
                     }
                 },
             },
@@ -600,5 +628,95 @@ mod tests {
         let col = ts.column_stats.get("x").expect("col stats present");
         // No value_count → fallback heuristic = sqrt(10000)*10 = 1000.0
         assert!((col.distinct_values_count - 1000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn build_table_statistics_with_ndv_overrides_value_count_heuristic() {
+        use crate::sql::catalog::{ColumnDef, IcebergColumnStats, S3FileInfo};
+
+        let file = S3FileInfo {
+            path: "f1.parquet".to_string(),
+            size: 100,
+            row_count: Some(10_000),
+            column_stats: Some(HashMap::from([(
+                "x".to_string(),
+                IcebergColumnStats {
+                    null_count: Some(0),
+                    // Manifest value_count would give NDV=8000; the Puffin
+                    // NDV must override.
+                    value_count: Some(8000),
+                    column_size: None,
+                    lower_bound: None,
+                    upper_bound: None,
+                },
+            )])),
+            partition_spec_id: None,
+            partition_key: None,
+            first_row_id: None,
+            data_sequence_number: Some(1),
+            ivm_change_op: None,
+            delete_files: vec![],
+            manifest_path: None,
+            partition_values: vec![],
+        };
+        let cols = vec![ColumnDef {
+            name: "x".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        }];
+        let mut ndv_by_name = HashMap::new();
+        ndv_by_name.insert("x".to_string(), 1234.0);
+        let ts = build_table_statistics_with_ndv(&[file], &cols, &ndv_by_name, &HashMap::new())
+            .expect("table stats");
+        let col = ts.column_stats.get("x").expect("col stats present");
+        // Puffin NDV (1234) wins over manifest value_count (8000) and the
+        // heuristic (sqrt(10000)*10 = 1000).
+        assert!((col.distinct_values_count - 1234.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn build_table_statistics_with_ndv_clamps_to_non_null_count() {
+        use crate::sql::catalog::{ColumnDef, IcebergColumnStats, S3FileInfo};
+
+        let file = S3FileInfo {
+            path: "f1.parquet".to_string(),
+            size: 100,
+            row_count: Some(1_000),
+            column_stats: Some(HashMap::from([(
+                "x".to_string(),
+                IcebergColumnStats {
+                    null_count: Some(0),
+                    value_count: Some(1000),
+                    column_size: None,
+                    lower_bound: None,
+                    upper_bound: None,
+                },
+            )])),
+            partition_spec_id: None,
+            partition_key: None,
+            first_row_id: None,
+            data_sequence_number: Some(1),
+            ivm_change_op: None,
+            delete_files: vec![],
+            manifest_path: None,
+            partition_values: vec![],
+        };
+        let cols = vec![ColumnDef {
+            name: "x".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        }];
+        // NDV overshoots row count — clamp.
+        let mut ndv_by_name = HashMap::new();
+        ndv_by_name.insert("x".to_string(), 1e7);
+        let ts = build_table_statistics_with_ndv(&[file], &cols, &ndv_by_name, &HashMap::new())
+            .expect("table stats");
+        let col = ts.column_stats.get("x").expect("col stats present");
+        // Clamped to non_null = 1000.
+        assert!((col.distinct_values_count - 1000.0).abs() < f64::EPSILON);
     }
 }

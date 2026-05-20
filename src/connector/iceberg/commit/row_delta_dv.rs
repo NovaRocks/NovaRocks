@@ -59,6 +59,7 @@ use uuid::Uuid;
 
 use super::abort::AbortLog;
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
+use super::fast_append::{carry_forward_puffin_stats, register_puffin_stats};
 use super::helpers::{
     current_snapshot_total_records, effective_next_row_id, generate_snapshot_id, metadata_dir,
     now_ms, write_manifest_list,
@@ -69,6 +70,7 @@ use super::puffin_dv::{
     write_single_deletion_vector_puffin,
 };
 use super::types::{CommitOutcome, WrittenFile};
+use crate::connector::iceberg::stats_assembler::CommitType;
 
 pub struct RowDeltaDvCommit;
 
@@ -113,6 +115,14 @@ impl IcebergCommitAction for RowDeltaDvCommit {
             snapshot_properties: ctx.snapshot_properties.clone(),
         };
 
+        let sketch_sets = ctx.collector.take_sketch_sets();
+        let prev_snapshot_id = ctx
+            .table
+            .metadata()
+            .current_snapshot()
+            .map(|s| s.snapshot_id());
+        let has_new_data_files = !sketch_sets.is_empty();
+
         let tx = Transaction::new(ctx.table);
         let tx = action
             .apply(tx)
@@ -126,6 +136,25 @@ impl IcebergCommitAction for RowDeltaDvCommit {
             .current_snapshot()
             .map(|s| s.snapshot_id())
             .ok_or_else(|| "RowDeltaDv committed but new snapshot is not visible".to_string())?;
+        let new_sequence_number = table_after.metadata().last_sequence_number();
+        // MOR UPDATE writes new data files alongside the DV; treat as Append
+        // so the new NDV reflects both the carried-forward sketches and the
+        // new file sketches. Pure DELETE has no new files — carry forward.
+        if has_new_data_files {
+            register_puffin_stats(
+                &table_after,
+                ctx.catalog,
+                ctx.file_io,
+                CommitType::Append,
+                sketch_sets,
+                new_snapshot_id,
+                new_sequence_number,
+                prev_snapshot_id,
+            )
+            .await;
+        } else if let Some(prev) = prev_snapshot_id {
+            carry_forward_puffin_stats(&table_after, ctx.catalog, new_snapshot_id, prev).await;
+        }
         let written_manifest_paths = manifest_paths_out
             .lock()
             .expect("manifest_paths_out poisoned")

@@ -189,6 +189,23 @@ impl RuntimeState {
         sink_commit::add(finst_id, info);
     }
 
+    /// Push a per-file Theta sketch set produced by the Iceberg sink into
+    /// the per-fragment-instance side channel. Subsequently drained by the
+    /// commit collector via [`crate::runtime::sink_commit::take_sketch_sets`].
+    pub(crate) fn add_iceberg_sketch_set(
+        &self,
+        set: crate::connector::iceberg::stats_assembler::FileSketchSet,
+    ) {
+        let Some(finst_id) = self.fragment_instance_id else {
+            debug!(
+                target: "novarocks::sink_commit",
+                "skip iceberg sketch set because fragment_instance_id is missing"
+            );
+            return;
+        };
+        sink_commit::add_sketch_set(finst_id, set);
+    }
+
     pub(crate) fn add_sink_load_stats(
         &self,
         loaded_rows: i64,

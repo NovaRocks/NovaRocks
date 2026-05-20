@@ -2567,19 +2567,28 @@ fn collect_scan_stats(
 
     match plan {
         LogicalPlan::Scan(s) => {
-            if let crate::sql::catalog::TableStorage::S3ParquetFiles { files, .. } =
-                &s.table.storage
-                && let Some(ts) =
-                    crate::sql::optimizer::statistics::build_table_statistics_with_columns(
-                        files,
-                        &s.table.columns,
-                    )
+            if let crate::sql::catalog::TableStorage::S3ParquetFiles {
+                files,
+                cloud_properties,
+            } = &s.table.storage
             {
-                // Insert by table name (canonical key).
-                out.insert(s.table.name.clone(), ts.clone());
-                // Also insert by alias so that aliased scans can find their stats.
-                if let Some(ref alias) = s.alias {
-                    out.insert(alias.clone(), ts);
+                // Best-effort: pull NDV from registered Puffin statistics for
+                // the table's current snapshot. Any failure quietly degrades
+                // to manifest heuristics (see StatsLoader contract).
+                let (ndv_by_name, name_to_field_id) =
+                    load_iceberg_puffin_ndv(s.table.iceberg_table.as_ref(), cloud_properties);
+                if let Some(ts) = crate::sql::optimizer::statistics::build_table_statistics_with_ndv(
+                    files,
+                    &s.table.columns,
+                    &ndv_by_name,
+                    &name_to_field_id,
+                ) {
+                    // Insert by table name (canonical key).
+                    out.insert(s.table.name.clone(), ts.clone());
+                    // Also insert by alias so that aliased scans can find their stats.
+                    if let Some(ref alias) = s.alias {
+                        out.insert(alias.clone(), ts);
+                    }
                 }
             }
         }
@@ -2618,6 +2627,146 @@ fn collect_scan_stats(
         LogicalPlan::Repeat(n) => collect_scan_stats(&n.input, out),
         LogicalPlan::Values(_) | LogicalPlan::GenerateSeries(_) | LogicalPlan::CTEConsume(_) => {}
     }
+}
+
+/// Best-effort load of Iceberg Puffin NDV statistics for a scan target.
+///
+/// Returns `(ndv_by_name, name_to_field_id)`. Both maps are keyed by the
+/// lowercased column name. The second map is currently unused by callers
+/// (NDV is keyed by name to match the column lookup) but is returned so
+/// future schema-evolution-aware paths can use it without changing the
+/// function signature.
+///
+/// Any failure (no Iceberg metadata, no current snapshot, no statistics
+/// entry, Puffin parse error) yields a pair of empty maps so the optimizer
+/// falls back to manifest-based heuristics — never blocking query planning.
+fn load_iceberg_puffin_ndv(
+    iceberg_table: Option<&crate::sql::catalog::IcebergTableInfo>,
+    cloud_properties: &std::collections::BTreeMap<String, String>,
+) -> (
+    std::collections::HashMap<String, f64>,
+    std::collections::HashMap<String, i32>,
+) {
+    use crate::connector::iceberg::stats_loader::StatsLoader;
+    use crate::runtime::global_async_runtime::data_block_on;
+
+    let empty = (
+        std::collections::HashMap::new(),
+        std::collections::HashMap::new(),
+    );
+
+    let Some(info) = iceberg_table else {
+        return empty;
+    };
+    let Some(serialized) = info.serialized_metadata.as_ref() else {
+        return empty;
+    };
+
+    let metadata: iceberg::spec::TableMetadata = match serde_json::from_str(serialized) {
+        Ok(m) => m,
+        Err(err) => {
+            tracing::debug!(error = %err, "iceberg ndv: parse table metadata json failed");
+            return empty;
+        }
+    };
+    let Some(snapshot) = metadata.current_snapshot() else {
+        return empty;
+    };
+    if metadata
+        .statistics_for_snapshot(snapshot.snapshot_id())
+        .is_none()
+    {
+        return empty;
+    }
+
+    // Build name → field_id map from the iceberg schema definition.
+    let mut name_to_field_id: std::collections::HashMap<String, i32> =
+        std::collections::HashMap::new();
+    for field in &info.schema.fields {
+        name_to_field_id.insert(field.name.to_lowercase(), field.field_id);
+    }
+
+    // Build FileIO matching the iceberg location scheme. For S3 / OSS paths
+    // we honor the cloud properties; otherwise default to the local FS.
+    let file_io = match build_stats_file_io(&info.location, cloud_properties) {
+        Ok(io) => io,
+        Err(err) => {
+            tracing::debug!(error = %err, "iceberg ndv: build FileIO failed");
+            return empty;
+        }
+    };
+
+    let ndv_by_field_id = match data_block_on(StatsLoader::load_ndv(
+        &metadata,
+        snapshot.snapshot_id(),
+        &file_io,
+    )) {
+        Ok(map) => map,
+        Err(err) => {
+            tracing::debug!(error = %err, "iceberg ndv: block_on StatsLoader::load_ndv failed");
+            return empty;
+        }
+    };
+
+    // Translate field_id → name using the schema map. Lowercased name keys
+    // match the optimizer's column lookup convention.
+    let mut field_id_to_name: std::collections::HashMap<i32, String> =
+        std::collections::HashMap::new();
+    for (name, fid) in &name_to_field_id {
+        field_id_to_name.insert(*fid, name.clone());
+    }
+    let mut ndv_by_name: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    for (field_id, ndv) in ndv_by_field_id {
+        if let Some(name) = field_id_to_name.get(&field_id) {
+            ndv_by_name.insert(name.clone(), ndv);
+        }
+    }
+    (ndv_by_name, name_to_field_id)
+}
+
+/// Build a `FileIO` capable of reading the table's Puffin statistics. For
+/// `file://` and bare-path locations we return the local-FS variant; for
+/// `s3://`/`s3a://`/`oss://` paths we honour the catalog's cloud_properties
+/// when present. When required properties are missing the call gracefully
+/// fails so the optimizer falls back to manifest heuristics.
+fn build_stats_file_io(
+    location: &str,
+    cloud_properties: &std::collections::BTreeMap<String, String>,
+) -> Result<iceberg::io::FileIO, String> {
+    let scheme = location.split("://").next().unwrap_or("");
+    let is_s3 = matches!(scheme, "s3" | "s3a" | "oss");
+    if !is_s3 {
+        return Ok(iceberg::io::FileIO::new_with_fs());
+    }
+
+    // Reuse the same property-name conventions as the catalog code path.
+    let endpoint = cloud_properties
+        .get("aws.s3.endpoint")
+        .ok_or_else(|| "missing aws.s3.endpoint".to_string())?;
+    let access_key = cloud_properties
+        .get("aws.s3.access_key")
+        .ok_or_else(|| "missing aws.s3.access_key".to_string())?;
+    let secret_key = cloud_properties
+        .get("aws.s3.secret_key")
+        .ok_or_else(|| "missing aws.s3.secret_key".to_string())?;
+    let region = cloud_properties
+        .get("aws.s3.region")
+        .cloned()
+        .unwrap_or_else(|| "us-east-1".to_string());
+    let path_style = cloud_properties
+        .get("aws.s3.enable_path_style_access")
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    use std::sync::Arc;
+    let factory = crate::connector::iceberg::catalog::s3_storage::S3StorageFactory {
+        endpoint: endpoint.clone(),
+        access_key_id: access_key.clone(),
+        access_key_secret: secret_key.clone(),
+        region,
+        enable_path_style: path_style,
+    };
+    Ok(iceberg::io::FileIOBuilder::new(Arc::new(factory)).build())
 }
 
 fn execute_plan(

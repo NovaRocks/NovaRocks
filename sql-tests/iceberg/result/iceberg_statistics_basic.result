@@ -1,0 +1,9 @@
+-- query 4
+n
+5
+
+-- query 5
+id	amount
+3	30.0
+4	40.0
+5	50.0

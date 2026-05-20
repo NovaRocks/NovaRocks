@@ -39,6 +39,7 @@ use uuid::Uuid;
 
 use super::abort::AbortLog;
 use super::action::{CommitCtx, IcebergCommitAction};
+use super::fast_append::carry_forward_puffin_stats;
 use super::helpers::{generate_snapshot_id, metadata_dir, now_ms, write_manifest_list};
 use super::overwrite::write_added_data_manifest;
 use super::types::{CommitOutcome, IcebergWriteMode, WrittenFile};
@@ -106,6 +107,12 @@ impl IcebergCommitAction for RewriteDataFilesCommit {
             target_ref: ctx.target_ref.to_string(),
         };
 
+        let prev_snapshot_id = ctx
+            .table
+            .metadata()
+            .current_snapshot()
+            .map(|s| s.snapshot_id());
+
         let tx = Transaction::new(ctx.table);
         let tx = action
             .apply(tx)
@@ -119,6 +126,11 @@ impl IcebergCommitAction for RewriteDataFilesCommit {
             .current_snapshot()
             .map(|s| s.snapshot_id())
             .unwrap_or(0);
+        // Rewrite/compaction preserves logical row contents, so the previous
+        // snapshot's Puffin NDV stays valid. Carry it forward unchanged.
+        if let Some(prev) = prev_snapshot_id {
+            carry_forward_puffin_stats(&table_after, ctx.catalog, new_snapshot_id, prev).await;
+        }
         let written_manifest_paths = manifest_paths_out
             .lock()
             .expect("manifest_paths_out poisoned")

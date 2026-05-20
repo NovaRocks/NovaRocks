@@ -199,6 +199,27 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
         collector.inject_written_file(wf);
     }
 
+    // Compute Theta sketches from the source chunks and push them through the
+    // collector so the commit action can register Puffin NDV statistics. We
+    // emit one sketch set per chunk; StatsAssembler unions sketches across
+    // sets per field id, so per-file attribution is not required to get
+    // accurate aggregate NDV.
+    for (idx, chunk) in chunks.iter().enumerate() {
+        if chunk.batch.num_rows() == 0 {
+            continue;
+        }
+        if let Some(sketches) =
+            crate::connector::iceberg::sink::compute_theta_sketches_for_batch(&chunk.batch)
+        {
+            collector.inject_sketch_set(
+                crate::connector::iceberg::stats_assembler::FileSketchSet {
+                    file_path: format!("standalone_insert_chunk_{idx}"),
+                    sketches,
+                },
+            );
+        }
+    }
+
     // 6. Build the OpenDAL Operator + FileIO.
     let abort_cleanup = build_abort_cleanup_for_catalog_entry(&entry)?;
     let file_io = table.file_io().clone();

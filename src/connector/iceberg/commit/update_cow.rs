@@ -38,9 +38,11 @@ use uuid::Uuid;
 
 use super::abort::AbortLog;
 use super::action::{CommitCtx, IcebergCommitAction};
+use super::fast_append::register_puffin_stats;
 use super::helpers::{generate_snapshot_id, metadata_dir, now_ms, write_manifest_list};
 use super::overwrite::{write_added_data_manifest, write_overwrite_deletes_manifest};
 use super::types::{CommitOutcome, WrittenFile};
+use crate::connector::iceberg::stats_assembler::CommitType;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CowUpdateRewriteSet {
@@ -100,6 +102,13 @@ impl IcebergCommitAction for CowUpdateCommit {
             target_ref: ctx.target_ref.to_string(),
         };
 
+        let sketch_sets = ctx.collector.take_sketch_sets();
+        let prev_snapshot_id = ctx
+            .table
+            .metadata()
+            .current_snapshot()
+            .map(|s| s.snapshot_id());
+
         let tx = Transaction::new(ctx.table);
         let tx = action
             .apply(tx)
@@ -113,6 +122,21 @@ impl IcebergCommitAction for CowUpdateCommit {
             .current_snapshot()
             .map(|s| s.snapshot_id())
             .ok_or_else(|| "CowUpdate committed but new snapshot is not visible".to_string())?;
+        let new_sequence_number = table_after.metadata().last_sequence_number();
+        // CowUpdate replaces touched data files with rewritten ones; the
+        // un-touched files remain live. Treat as Append so the new NDV is
+        // an upper bound combining previous aggregate + new file sketches.
+        register_puffin_stats(
+            &table_after,
+            ctx.catalog,
+            ctx.file_io,
+            CommitType::Append,
+            sketch_sets,
+            new_snapshot_id,
+            new_sequence_number,
+            prev_snapshot_id,
+        )
+        .await;
         let written_manifest_paths = manifest_paths_out
             .lock()
             .expect("manifest_paths_out poisoned")

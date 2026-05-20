@@ -37,6 +37,7 @@ use crate::common::types::UniqueId;
 use super::abort::AbortLog;
 use super::position_delete_writer::PositionDeleteGroup;
 use super::types::{CommitOpKind, WrittenFile};
+use crate::connector::iceberg::stats_assembler::FileSketchSet;
 
 /// Query-scoped Iceberg INSERT / INSERT OVERWRITE / DELETE state.
 pub struct IcebergCommitCollector {
@@ -63,6 +64,11 @@ pub struct IcebergCommitCollector {
     /// `op_kind == CommitOpKind::RowDeltaDv`. The `RowDeltaDvCommit` action
     /// drains this channel via [`take_delete_groups`].
     delete_groups: Mutex<Vec<PositionDeleteGroup>>,
+    /// Per-file Theta sketch sets produced by the sink for Iceberg Puffin
+    /// NDV statistics. One entry per written Parquet data file. Optional —
+    /// non-Iceberg sinks and tests that do not exercise stats can leave
+    /// this empty. Drained by [`take_sketch_sets`] at commit time.
+    sketch_sets: Mutex<Vec<FileSketchSet>>,
     /// When set, signals that the engine wrote data files whose `_row_id`
     /// values are already stamped at the reserved field IDs inside the
     /// file (e.g. the OPTIMIZE row-lineage preserve path). The commit
@@ -97,6 +103,7 @@ impl IcebergCommitCollector {
             abort_log: Arc::new(AbortLog::new()),
             injected: Mutex::new(Vec::new()),
             delete_groups: Mutex::new(Vec::new()),
+            sketch_sets: Mutex::new(Vec::new()),
             preserve_row_lineage: AtomicBool::new(false),
             committed: AtomicBool::new(false),
         }
@@ -134,6 +141,33 @@ impl IcebergCommitCollector {
             .lock()
             .expect("collector delete_groups lock poisoned");
         std::mem::take(&mut *guard)
+    }
+
+    /// Record a per-file Theta sketch set produced by the sink for Iceberg
+    /// Puffin NDV statistics. Used by both the runtime IcebergSink (pipeline
+    /// path) and the standalone iceberg_writer path.
+    pub fn inject_sketch_set(&self, set: FileSketchSet) {
+        self.sketch_sets
+            .lock()
+            .expect("collector sketch_sets lock poisoned")
+            .push(set);
+    }
+
+    /// Drain the per-file sketch sets registered via
+    /// [`inject_sketch_set`] plus any pushed through the runtime
+    /// `sink_commit` side channel for this query's fragment instance.
+    /// Each call is destructive — sketches cannot be cloned, so the
+    /// caller (typically `StatsAssembler::assemble`) consumes them once.
+    pub fn take_sketch_sets(&self) -> Vec<FileSketchSet> {
+        let mut sets = {
+            let mut guard = self
+                .sketch_sets
+                .lock()
+                .expect("collector sketch_sets lock poisoned");
+            std::mem::take(&mut *guard)
+        };
+        sets.extend(crate::runtime::sink_commit::take_sketch_sets(self.finst_id));
+        sets
     }
 
     /// Sum of `record_count` across all currently-injected
