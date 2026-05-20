@@ -179,6 +179,13 @@ pub(crate) struct AggregateNode {
     pub group_by: Vec<TypedExpr>,
     pub aggregates: Vec<AggregateCall>,
     pub output_columns: Vec<OutputColumn>,
+    /// Set to true by `AggregatePushdownRule`'s rewriter on the FINAL
+    /// (top-level) aggregate after a partial aggregate has been spliced
+    /// below. The collector treats `already_pushed = true` as a hard
+    /// "skip" signal so the rule does not re-fire on its own output.
+    /// Other rules (predicate pushdown, column pruning, cte rewrite,
+    /// etc.) MUST preserve this flag when cloning `AggregateNode`.
+    pub already_pushed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -235,4 +242,24 @@ pub(crate) struct IntersectNode {
 #[derive(Clone, Debug)]
 pub(crate) struct ExceptNode {
     pub inputs: Vec<LogicalPlan>,
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+
+    #[test]
+    fn aggregate_node_already_pushed_defaults_false_via_construction() {
+        let node = AggregateNode {
+            input: Box::new(LogicalPlan::Values(ValuesNode {
+                rows: vec![],
+                columns: vec![],
+            })),
+            group_by: vec![],
+            aggregates: vec![],
+            output_columns: vec![],
+            already_pushed: false,
+        };
+        assert!(!node.already_pushed);
+    }
 }

@@ -707,6 +707,7 @@ mod tests {
                 data_type: DataType::Int32,
                 nullable: false,
             }],
+            already_pushed: false,
         });
 
         let stats = estimate_statistics(&plan, &table_stats);

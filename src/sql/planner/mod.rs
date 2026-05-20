@@ -389,6 +389,7 @@ fn plan_select_scoped(
             group_by: select.group_by,
             aggregates: agg_calls,
             output_columns,
+            already_pushed: false,
         });
         if let Some(having) = select.having {
             current = LogicalPlan::Filter(FilterNode {
@@ -613,6 +614,7 @@ fn build_distinct(input: LogicalPlan, projection: &[ProjectItem]) -> LogicalPlan
         group_by,
         aggregates: vec![],
         output_columns,
+        already_pushed: false,
     })
 }
 

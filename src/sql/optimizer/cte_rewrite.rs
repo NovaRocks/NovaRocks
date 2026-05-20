@@ -83,6 +83,7 @@ pub(crate) fn inline_single_use_ctes(plan: LogicalPlan, ctx: &CTEContext) -> Log
             group_by: node.group_by,
             aggregates: node.aggregates,
             output_columns: node.output_columns,
+            already_pushed: node.already_pushed,
         }),
         LogicalPlan::Join(node) => LogicalPlan::Join(JoinNode {
             left: Box::new(inline_single_use_ctes(*node.left, ctx)),
@@ -200,6 +201,7 @@ fn replace_cte_consume(plan: LogicalPlan, cte_id: CteId, replacement: &LogicalPl
             group_by: node.group_by,
             aggregates: node.aggregates,
             output_columns: node.output_columns,
+            already_pushed: node.already_pushed,
         }),
         LogicalPlan::Join(node) => LogicalPlan::Join(JoinNode {
             left: Box::new(replace_cte_consume(*node.left, cte_id, replacement)),

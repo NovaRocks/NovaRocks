@@ -195,6 +195,7 @@ mod tests {
             group_by: vec![],
             aggregates: vec![],
             output_columns: vec![],
+            already_pushed: false,
         });
 
         let cost = estimate_operator_cost(&plan, &own_stats, &[&input_stats]);
