@@ -648,6 +648,17 @@ cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
 - **Connector behavior**: inspect `src/connector/*`, `src/connector/iceberg/**`,
   `src/connector/starrocks/managed/**`, and `src/formats/*`.
 - **FE/BE interface behavior**: inspect `src/service/internal_service.rs`, `src/service/backend_service.rs`, `src/service/engine_ffi.rs`, `src/shim/compat.h`.
+- **Optimizer observability / plan-shape regression**: see
+  `src/sql/explain.rs` for the EXPLAIN formatter (Normal/Verbose/Costs/
+  Analyze). `EXPLAIN ANALYZE` returns a query-level Planning/Execution/
+  Rows header above the Verbose plan; per-operator runtime stats are a
+  follow-up. Verbose/Costs/Analyze append a stable `stats={rows=N}`
+  trailer to each physical node. `SET disable_optimizer_rules = 'RuleA,RuleB'`
+  (alias `cbo_disabled_rules`) bisects optimizer rules at session level;
+  see `src/sql/optimizer/options.rs`. Use the `sql-tests/optimizer/` suite
+  for plan-golden cases, and `-- @explain_contains=<substr>` /
+  `-- @normalize_explain_timing` in any sql-test case to assert plan-shape
+  facts alongside the result golden.
 
 ---
 
