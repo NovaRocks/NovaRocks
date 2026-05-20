@@ -34,6 +34,9 @@ impl RewriteRule for AggregatePushdownRule {
             _ => return None,
         };
         let push = super::collector::collect_push_plan(agg, &self.table_stats)?;
+        if !super::cost::should_push(&push, &self.table_stats) {
+            return None;
+        }
         Some(super::rewriter::rewrite(agg, push))
     }
 }
