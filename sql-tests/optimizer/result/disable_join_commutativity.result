@@ -1,0 +1,30 @@
+-- query 7
+Explain String
+GATHER EXCHANGE stats={rows=1000000000}
+  PROJECT [lo.lo_orderkey AS lo_orderkey, d.d_year AS d_year] stats={rows=1000000000}
+    HASH JOIN (BROADCAST, RIGHT OUTER, eq: [lo.lo_datekey = d.d_datekey]) stats={rows=1000000000}
+      SCAN db_sqlt_113e43a4caf4f95c.lineorder (alias=lo) stats={rows=1000000}
+           TABLE: db_sqlt_113e43a4caf4f95c.lineorder
+           columns: lo_orderkey, lo_datekey
+           min-max stats
+      GATHER EXCHANGE stats={rows=10000}
+        SCAN db_sqlt_113e43a4caf4f95c.date_dim (alias=d) stats={rows=10000}
+             TABLE: db_sqlt_113e43a4caf4f95c.date_dim
+             columns: d_datekey, d_year
+             min-max stats
+
+-- query 9
+Explain String
+GATHER EXCHANGE stats={rows=1000000000}
+  PROJECT [lo.lo_orderkey AS lo_orderkey, d.d_year AS d_year] stats={rows=1000000000}
+    HASH JOIN (SHUFFLE, LEFT OUTER, eq: [d.d_datekey = lo.lo_datekey]) stats={rows=1000000000}
+      HASH EXCHANGE (hash: [d.d_datekey, lo.lo_datekey]) stats={rows=10000}
+        SCAN db_sqlt_113e43a4caf4f95c.date_dim (alias=d) stats={rows=10000}
+             TABLE: db_sqlt_113e43a4caf4f95c.date_dim
+             columns: d_datekey, d_year
+             min-max stats
+      HASH EXCHANGE (hash: [d.d_datekey, lo.lo_datekey]) stats={rows=1000000}
+        SCAN db_sqlt_113e43a4caf4f95c.lineorder (alias=lo) stats={rows=1000000}
+             TABLE: db_sqlt_113e43a4caf4f95c.lineorder
+             columns: lo_orderkey, lo_datekey
+             min-max stats

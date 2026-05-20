@@ -18,6 +18,8 @@ INSERT INTO ${case_db}.t_filter_basic_comparison VALUES
   (2, 20, 'b'),
   (3, NULL, 'c'),
   (4, 30, NULL);
+-- @explain_contains=stats={rows=
+-- @explain_contains=SCAN
 SELECT id, v, name
 FROM ${case_db}.t_filter_basic_comparison
 WHERE v >= 20

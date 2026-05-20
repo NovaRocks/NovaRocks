@@ -1,0 +1,11 @@
+Explain String
+Planning: <MS> ms / Execution: <MS> ms / Rows: 1
+GATHER EXCHANGE stats={rows=1}
+  PROJECT [count() AS count(*)] stats={rows=1}
+    HASH AGGREGATE (SINGLE) stats={rows=1}
+      aggregations: count()
+      GATHER EXCHANGE stats={rows=100000}
+        SCAN db_sqlt_c2ef190265c86c9f.t_analyze_header stats={rows=100000}
+             TABLE: db_sqlt_c2ef190265c86c9f.t_analyze_header
+             columns: k
+             min-max stats

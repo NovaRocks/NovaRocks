@@ -1,0 +1,13 @@
+Explain String
+GATHER EXCHANGE stats={rows=1000000000}
+  PROJECT [a.k AS k, a.v AS v, b.w AS w] stats={rows=1000000000}
+    HASH JOIN (BROADCAST, INNER, eq: [a.k = b.k]) stats={rows=1000000000}
+      SCAN db_sqlt_8ae1ae7dfcc764f7.t_optimizer_baseline_a (alias=a) stats={rows=100000}
+           TABLE: db_sqlt_8ae1ae7dfcc764f7.t_optimizer_baseline_a
+           columns: k, v
+           min-max stats
+      GATHER EXCHANGE stats={rows=100000}
+        SCAN db_sqlt_8ae1ae7dfcc764f7.t_optimizer_baseline_b (alias=b) stats={rows=100000}
+             TABLE: db_sqlt_8ae1ae7dfcc764f7.t_optimizer_baseline_b
+             columns: k, w
+             min-max stats
