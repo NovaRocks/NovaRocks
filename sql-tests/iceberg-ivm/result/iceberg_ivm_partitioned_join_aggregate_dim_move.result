@@ -1,0 +1,27 @@
+-- query 3
+region	c	s
+east	2	300
+south	1	70
+west	1	50
+
+-- query 5
+region	c	s
+north	2	300
+south	1	70
+west	1	50
+
+-- query 6
+region	c	s
+north	2	300
+south	1	70
+west	1	50
+region	c	s
+north	2	300
+south	1	70
+west	1	50
+
+-- query 8
+region	c	s
+north	2	300
+south	1	70
+west	1	500

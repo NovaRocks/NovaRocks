@@ -147,6 +147,14 @@ pub(crate) fn derive_from_aggregate_delta(
             })?;
 
         // Step 2: verify output column lineage is a pure column expression.
+        //
+        // Single-base MVs populate `referenced_base_field_ids` (len == 1).
+        // Join-aggregate MVs populate `referenced_base_fields` (qualified refs,
+        // len == 1) and leave `referenced_base_field_ids` empty.  Both forms
+        // represent an unambiguous passthrough of exactly one base column, so
+        // both are acceptable here.  Only the Arrow column name (from the layout,
+        // step 4) is needed for the delta-chunk derivation path; neither form of
+        // field-id is used beyond this verification gate.
         let lineage = input
             .schema_contract
             .output
@@ -155,9 +163,12 @@ pub(crate) fn derive_from_aggregate_delta(
             .ok_or_else(|| AffectedPartitionError::OutputLineageNotPureColumn {
                 field: partition_field.partition_field_name.clone(),
             })?;
-        if lineage.expression.kind != ExpressionKind::Column
-            || lineage.expression.referenced_base_field_ids.len() != 1
-        {
+        let is_single_base_column = lineage.expression.kind == ExpressionKind::Column
+            && lineage.expression.referenced_base_field_ids.len() == 1;
+        let is_join_column = lineage.expression.kind == ExpressionKind::Column
+            && lineage.expression.referenced_base_field_ids.is_empty()
+            && lineage.expression.referenced_base_fields.len() == 1;
+        if !is_single_base_column && !is_join_column {
             return Err(AffectedPartitionError::OutputLineageNotPureColumn {
                 field: partition_field.partition_field_name.clone(),
             });
