@@ -610,6 +610,7 @@ mod tests {
     use arrow::array::{ArrayRef, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use crate::engine::mv::partition::TargetPartitionFilter;
     use iceberg::spec::Struct;
     use std::sync::Arc;
 
@@ -907,8 +908,6 @@ mod tests {
         }
         partitions
     }
-
-    use crate::engine::mv::partition::TargetPartitionFilter;
 
     #[test]
     fn empty_request_with_filter_none_returns_empty_groups() {
