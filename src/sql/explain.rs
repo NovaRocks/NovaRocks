@@ -16,12 +16,12 @@ use crate::sql::optimizer::property::DistributionSpec;
 use crate::sql::planner::plan::LogicalPlan;
 
 /// Detail level for EXPLAIN output.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ExplainLevel {
     Normal,
     Verbose,
     Costs,
+    Analyze,
 }
 
 /// Format a single LogicalPlan tree as EXPLAIN text lines.
@@ -48,7 +48,10 @@ fn format_node(plan: &LogicalPlan, level: ExplainLevel, indent: usize, out: &mut
                 tbl = node.table.name
             ));
             if let Some(ref cols) = node.required_columns
-                && matches!(level, ExplainLevel::Verbose | ExplainLevel::Costs)
+                && matches!(
+                    level,
+                    ExplainLevel::Verbose | ExplainLevel::Costs | ExplainLevel::Analyze
+                )
             {
                 out.push(format!("{pad}     columns: {}", cols.join(", ")));
             }
@@ -284,10 +287,13 @@ fn format_physical_node(
                 op.database, op.table.name
             ));
             if let Some(ref cols) = op.required_columns
-                && matches!(level, ExplainLevel::Verbose | ExplainLevel::Costs)
+                && matches!(
+                    level,
+                    ExplainLevel::Verbose | ExplainLevel::Costs | ExplainLevel::Analyze
+                )
             {
                 out.push(format!("{pad}     columns: {}", cols.join(", ")));
-                if matches!(level, ExplainLevel::Verbose) {
+                if matches!(level, ExplainLevel::Verbose | ExplainLevel::Analyze) {
                     for line in scan_pruned_type_lines(op, cols) {
                         out.push(format!("{pad}     {line}"));
                     }
@@ -297,7 +303,9 @@ fn format_physical_node(
             if matches!(level, ExplainLevel::Costs) && local_hints.has_decode {
                 out.push(format!("{pad}     Decode"));
             }
-            if matches!(level, ExplainLevel::Verbose) && local_hints.has_min_max_stats {
+            if matches!(level, ExplainLevel::Verbose | ExplainLevel::Analyze)
+                && local_hints.has_min_max_stats
+            {
                 out.push(format!("{pad}     min-max stats"));
             }
             if !op.predicates.is_empty() {
@@ -1212,6 +1220,57 @@ mod tests {
         assert!(
             lines.iter().any(|line| line.contains("Decode")),
             "costs explain lines: {lines:?}"
+        );
+    }
+
+    fn build_minimal_scan_plan_for_explain_test() -> PhysicalPlanNode {
+        let column = ColumnDef {
+            name: "id".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            write_default: None,
+        };
+        PhysicalPlanNode {
+            op: Operator::PhysicalScan(PhysicalScanOp {
+                database: "db1".to_string(),
+                table: TableDef {
+                    name: "t1".to_string(),
+                    columns: vec![column.clone()],
+                    iceberg_row_lineage_metadata_columns: Vec::new(),
+                    iceberg_table: None,
+                    storage: TableStorage::S3ParquetFiles {
+                        files: Vec::new(),
+                        cloud_properties: BTreeMap::new(),
+                    },
+                },
+                alias: None,
+                columns: vec![OutputColumn {
+                    name: column.name.clone(),
+                    data_type: column.data_type.clone(),
+                    nullable: column.nullable,
+                }],
+                predicates: Vec::new(),
+                required_columns: Some(vec![column.name.clone()]),
+            }),
+            children: Vec::new(),
+            stats: Statistics {
+                output_row_count: 1.0,
+                column_statistics: HashMap::new(),
+            },
+            output_columns: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn analyze_level_is_treated_like_verbose_in_formatter() {
+        let plan = build_minimal_scan_plan_for_explain_test();
+        let verbose = explain_physical_plan(&plan, ExplainLevel::Verbose);
+        let analyze = explain_physical_plan(&plan, ExplainLevel::Analyze);
+        // Same per-node body text. Header is added by explain_analyze_query
+        // later, not by explain_physical_plan itself.
+        assert_eq!(
+            verbose, analyze,
+            "Analyze level must format nodes same as Verbose"
         );
     }
 
