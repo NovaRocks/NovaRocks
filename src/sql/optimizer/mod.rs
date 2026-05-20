@@ -76,6 +76,15 @@ pub(crate) fn optimize(
         &options,
         deadline,
     )?;
+    // OPT-1: aggregate pushdown. Runs after predicates settle and joins
+    // are reordered (so the join shape is final), but before column
+    // pruning (which needs to see the partial aggregate's required cols).
+    let rewritten = rbo::driver::rewrite_to_fixed_point(
+        rewritten,
+        &rbo::rules::aggregate_pushdown::aggregate_pushdown_rules(table_stats),
+        &options,
+        deadline,
+    )?;
     let rewritten = rbo::driver::rewrite_to_fixed_point(
         rewritten,
         &rbo::rules::column_pruning_rules(),
