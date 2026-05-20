@@ -6,6 +6,7 @@ use std::sync::Arc;
 use super::rule::RewriteRule;
 use crate::sql::optimizer::statistics::TableStatistics;
 
+pub(crate) mod aggregate_pushdown;
 pub(crate) mod column_pruning;
 pub(crate) mod join_reorder;
 pub(crate) mod predicate_pushdown;
@@ -55,6 +56,7 @@ pub(crate) fn all_rbo_rules(
     all.extend(predicate_pushdown_rbo_rules());
     all.extend(column_pruning_rules());
     all.extend(join_reorder_rules(table_stats));
+    all.extend(aggregate_pushdown::aggregate_pushdown_rules(table_stats));
     all
 }
 
@@ -65,12 +67,13 @@ mod tests {
     #[test]
     fn registry_contains_expected_rules() {
         let rules = all_rbo_rules(&HashMap::new());
-        assert_eq!(rules.len(), 9);
+        assert_eq!(rules.len(), 10);
         let mut names: Vec<&str> = rules.iter().map(|r| r.name()).collect();
         names.sort();
         assert_eq!(
             names,
             vec![
+                "AggregatePushdown",
                 "EliminateUniqueAggregate",
                 "JoinReorder",
                 "PruneColumns",
