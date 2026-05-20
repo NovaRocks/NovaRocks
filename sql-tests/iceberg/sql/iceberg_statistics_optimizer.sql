@@ -38,7 +38,7 @@ INSERT INTO iceberg_cat_${suite_uuid0}.iceberg_opt_stats_db_${uuid0}.orders_${uu
   (105, 1, 75.0), (106, 2, 60.0), (107, 5, 90.0), (108, 6, 40.0);
 
 -- query 6
--- @explain_contains=HASH_JOIN
+-- @explain_contains=HASH JOIN
 -- @explain_contains=stats={rows=
 -- Join cardinality is computed from NDV; we only check that the join shape
 -- and stats trailer are present. With NDV(users.user_id)=10 and
