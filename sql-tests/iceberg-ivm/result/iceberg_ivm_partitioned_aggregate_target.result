@@ -1,0 +1,33 @@
+-- query 3
+region	c	c_amount	s	a
+east	2	2	30	15
+south	1	1	5	5
+west	1	0	NULL	NULL
+
+-- query 5
+region	c	c_amount	s	a
+east	3	3	60	20
+south	2	2	20	10
+west	1	0	NULL	NULL
+
+-- query 7
+region	c	c_amount	s	a
+east	2	2	130	65
+south	2	2	20	10
+west	1	0	NULL	NULL
+
+-- query 9
+region	c	c_amount	s	a
+east	2	2	130	65
+south	2	2	20	10
+west	2	1	42	42
+
+-- query 10
+region	c	c_amount	s	a
+east	2	2	130	65
+south	2	2	20	10
+west	2	1	42	42
+region	c	c_amount	s	a
+east	2	2	130	65
+south	2	2	20	10
+west	2	1	42	42
