@@ -15,16 +15,14 @@ pub(crate) fn map_file_partition_to_mv_key(
 
     let mut mapped_fields = Vec::with_capacity(partition.fields.len());
     for partition_field in &partition.fields {
-        if !matches!(
-            partition_field.transform,
-            MvPartitionTransformContract::Identity
-        ) {
-            return Err(format!(
-                "MV partition field {} uses unsupported transform {}",
-                partition_field.partition_field_name,
-                partition_transform_name(&partition_field.transform)
-            ));
-        }
+        let expected_transform_text = contract_transform_manifest_text(&partition_field.transform)
+            .ok_or_else(|| {
+                format!(
+                    "MV partition field {} uses unsupported transform {}",
+                    partition_field.partition_field_name,
+                    partition_transform_name(&partition_field.transform)
+                )
+            })?;
 
         let output_index = contract
             .target
@@ -54,14 +52,37 @@ pub(crate) fn map_file_partition_to_mv_key(
         }
 
         let base_field_id = output_lineage.expression.referenced_base_field_ids[0];
+
+        let mut matched_by_id_count = 0;
+        let mut transform_mismatch: Option<&str> = None;
         let file_partition_value = file_partition_values
             .iter()
-            .find(|value| value.source_field_id == base_field_id && value.transform == "identity")
+            .find(|value| {
+                if value.source_field_id != base_field_id {
+                    return false;
+                }
+                matched_by_id_count += 1;
+                if value.transform.eq_ignore_ascii_case(&expected_transform_text) {
+                    true
+                } else {
+                    transform_mismatch = Some(value.transform.as_str());
+                    false
+                }
+            })
             .ok_or_else(|| {
-                format!(
-                    "MV partition field {} cannot be proven from Iceberg file partition metadata for file spec {}",
-                    partition_field.partition_field_name, file_spec_id
-                )
+                if matched_by_id_count == 0 {
+                    format!(
+                        "MV partition field {} cannot be proven from Iceberg file partition metadata for file spec {}",
+                        partition_field.partition_field_name, file_spec_id
+                    )
+                } else {
+                    format!(
+                        "MV partition field {} file metadata transform {} mismatches contract transform {}",
+                        partition_field.partition_field_name,
+                        transform_mismatch.unwrap_or("<unknown>"),
+                        expected_transform_text
+                    )
+                }
             })?;
 
         let value = match &file_partition_value.value {
@@ -86,6 +107,21 @@ pub(crate) fn map_file_partition_to_mv_key(
     )))
 }
 
+fn contract_transform_manifest_text(transform: &MvPartitionTransformContract) -> Option<String> {
+    match transform {
+        MvPartitionTransformContract::Identity => Some("identity".to_string()),
+        MvPartitionTransformContract::Year => Some("year".to_string()),
+        MvPartitionTransformContract::Month => Some("month".to_string()),
+        MvPartitionTransformContract::Day => Some("day".to_string()),
+        MvPartitionTransformContract::Hour => Some("hour".to_string()),
+        MvPartitionTransformContract::Bucket { num_buckets } => {
+            Some(format!("bucket({num_buckets})"))
+        }
+        MvPartitionTransformContract::Truncate { width } => Some(format!("truncate({width})")),
+        MvPartitionTransformContract::Void => None,
+    }
+}
+
 fn partition_transform_name(transform: &MvPartitionTransformContract) -> String {
     match transform {
         MvPartitionTransformContract::Identity => "identity".to_string(),
@@ -97,7 +133,7 @@ fn partition_transform_name(transform: &MvPartitionTransformContract) -> String 
             format!("bucket({num_buckets})")
         }
         MvPartitionTransformContract::Truncate { width } => format!("truncate({width})"),
-        MvPartitionTransformContract::Void => "void".to_string(),
+        MvPartitionTransformContract::Void => "Void".to_string(),
     }
 }
 
@@ -110,6 +146,30 @@ mod tests {
         MvPartitionTransformContract, MvSchemaContract, OutputColumnLineage, OutputContract,
         TargetContract, TargetVisibleColumn,
     };
+
+    fn contract_with_partition(transform: MvPartitionTransformContract) -> MvSchemaContract {
+        let mut contract = contract_with_identity_partition();
+        let partition = contract
+            .target
+            .partition
+            .as_mut()
+            .expect("identity helper always builds a partition");
+        partition.fields[0].transform = transform;
+        contract
+    }
+
+    fn partition_value(
+        transform_text: &str,
+        value: ChangePartitionValue,
+    ) -> ChangePartitionFieldValue {
+        ChangePartitionFieldValue {
+            source_field_id: 1,
+            source_column: Some("id".to_string()),
+            field_name: "id".to_string(),
+            transform: transform_text.to_string(),
+            value,
+        }
+    }
 
     fn contract_with_identity_partition() -> MvSchemaContract {
         MvSchemaContract {
@@ -220,6 +280,130 @@ mod tests {
 
         assert!(err.contains("unsupported partition value"));
         assert!(err.contains("binary partition value"));
+    }
+
+    #[test]
+    fn maps_year_transform_to_mv_key() {
+        let contract = contract_with_partition(MvPartitionTransformContract::Year);
+        let mapped = map_file_partition_to_mv_key(
+            &contract,
+            7,
+            &[partition_value(
+                "year",
+                ChangePartitionValue::Primitive("55".to_string()),
+            )],
+        )
+        .unwrap();
+
+        assert_eq!(
+            mapped.unwrap().fields[0].value,
+            MvPartitionValue::String("55".to_string())
+        );
+    }
+
+    #[test]
+    fn maps_month_day_hour_transforms() {
+        for (contract_transform, manifest_text, value) in [
+            (MvPartitionTransformContract::Month, "month", "660"),
+            (MvPartitionTransformContract::Day, "day", "20000"),
+            (MvPartitionTransformContract::Hour, "hour", "480000"),
+        ] {
+            let contract = contract_with_partition(contract_transform.clone());
+            let mapped = map_file_partition_to_mv_key(
+                &contract,
+                7,
+                &[partition_value(
+                    manifest_text,
+                    ChangePartitionValue::Primitive(value.to_string()),
+                )],
+            )
+            .unwrap();
+            assert_eq!(
+                mapped.unwrap().fields[0].value,
+                MvPartitionValue::String(value.to_string()),
+                "transform {contract_transform:?} did not round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn maps_bucket_transform_with_matching_arity() {
+        let contract =
+            contract_with_partition(MvPartitionTransformContract::Bucket { num_buckets: 8 });
+        let mapped = map_file_partition_to_mv_key(
+            &contract,
+            7,
+            &[partition_value(
+                "bucket(8)",
+                ChangePartitionValue::Primitive("3".to_string()),
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            mapped.unwrap().fields[0].value,
+            MvPartitionValue::String("3".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_bucket_transform_arity_mismatch() {
+        let contract =
+            contract_with_partition(MvPartitionTransformContract::Bucket { num_buckets: 8 });
+        let err = map_file_partition_to_mv_key(
+            &contract,
+            7,
+            &[partition_value(
+                "bucket(16)",
+                ChangePartitionValue::Primitive("3".to_string()),
+            )],
+        )
+        .unwrap_err();
+        assert!(err.contains("file metadata transform"), "{err}");
+        assert!(err.contains("bucket(16)"), "{err}");
+        assert!(err.contains("bucket(8)"), "{err}");
+    }
+
+    #[test]
+    fn maps_truncate_transform_with_matching_width() {
+        let contract =
+            contract_with_partition(MvPartitionTransformContract::Truncate { width: 16 });
+        let mapped = map_file_partition_to_mv_key(
+            &contract,
+            7,
+            &[partition_value(
+                "truncate(16)",
+                ChangePartitionValue::Primitive("ho".to_string()),
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            mapped.unwrap().fields[0].value,
+            MvPartitionValue::String("ho".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_void_transform() {
+        let contract = contract_with_partition(MvPartitionTransformContract::Void);
+        let err = map_file_partition_to_mv_key(
+            &contract,
+            7,
+            &[partition_value("void", ChangePartitionValue::Null)],
+        )
+        .unwrap_err();
+        assert!(err.contains("Void"), "{err}");
+    }
+
+    #[test]
+    fn null_partition_value_renders_as_mv_null() {
+        let contract = contract_with_partition(MvPartitionTransformContract::Day);
+        let mapped = map_file_partition_to_mv_key(
+            &contract,
+            7,
+            &[partition_value("day", ChangePartitionValue::Null)],
+        )
+        .unwrap();
+        assert_eq!(mapped.unwrap().fields[0].value, MvPartitionValue::Null);
     }
 
     #[test]
