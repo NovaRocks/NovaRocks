@@ -729,6 +729,31 @@ impl StandaloneSession {
                 drop(catalog);
                 Ok(StatementResult::Query(result))
             }
+            sqlast::Statement::Explain {
+                statement,
+                analyze: true,
+                ..
+            } => {
+                let sqlast::Statement::Query(ref query) = *statement else {
+                    return Err("EXPLAIN ANALYZE only supports SELECT queries".to_string());
+                };
+                let prepared =
+                    prepare_explain_query(&self.inner, current_catalog, current_database, query)?;
+                let catalog = self
+                    .inner
+                    .catalog
+                    .read()
+                    .expect("standalone catalog read lock");
+                let result = explain_analyze_query(
+                    &prepared,
+                    &catalog,
+                    current_database,
+                    self.inner.exchange_port,
+                    None,
+                )?;
+                drop(catalog);
+                Ok(StatementResult::Query(result))
+            }
             sqlast::Statement::Query(ref query) => {
                 if let Some(result) =
                     self::statistics::try_query(&self.inner, &normalized, query, current_database)?
@@ -2297,6 +2322,40 @@ fn prepare_explain_query(
     }
 
     Ok(prepared)
+}
+
+/// Execute the query, then produce an EXPLAIN-style result whose first row is
+/// `Planning: <ms> / Execution: <ms> / Rows: <N>` followed by the Verbose
+/// plan body. Per-operator runtime stats merge is out of scope for OPT-5;
+/// the pipeline has no systematic profile collection yet.
+fn explain_analyze_query(
+    query: &sqlparser::ast::Query,
+    catalog: &InMemoryCatalog,
+    current_database: &str,
+    exchange_port: u16,
+    query_opts: Option<crate::internal_service::TQueryOptions>,
+) -> Result<QueryResult, String> {
+    use crate::sql::explain::{ExplainLevel, explain_physical_plan};
+
+    let t_plan = Instant::now();
+    let (resolved, cte_registry) = crate::sql::analyzer::analyze(query, catalog, current_database)?;
+    let logical = crate::sql::planner::plan_query(resolved, cte_registry)?;
+    let table_stats = build_table_stats_from_plan(&logical);
+    let physical = crate::sql::optimizer::optimize(logical, &table_stats)?;
+    let planning_ms = t_plan.elapsed().as_millis() as u64;
+
+    let t_exec = Instant::now();
+    let executed = execute_query(query, catalog, current_database, exchange_port, query_opts)?;
+    let rows: u64 = executed.chunks.iter().map(|c| c.len() as u64).sum();
+    let execution_ms = t_exec.elapsed().as_millis() as u64;
+
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "Planning: {planning_ms} ms / Execution: {execution_ms} ms / Rows: {rows}"
+    ));
+    lines.extend(explain_physical_plan(&physical, ExplainLevel::Analyze));
+
+    build_string_query_result("Explain String", lines)
 }
 
 /// Produce EXPLAIN output for a query without executing it.
