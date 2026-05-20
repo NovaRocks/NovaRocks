@@ -27,6 +27,7 @@ pub mod metadata;
 pub(crate) mod partition_spec;
 pub mod position_delete;
 pub(crate) mod read;
+pub(crate) mod row_lineage_synth;
 pub mod scan_deletes;
 pub mod schema;
 pub mod sink;

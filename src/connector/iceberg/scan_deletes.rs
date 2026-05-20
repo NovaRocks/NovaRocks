@@ -260,6 +260,24 @@ fn positions_to_row_selection(positions: &RoaringTreemap) -> Result<RowSelection
     Ok(RowSelection::from(selectors))
 }
 
+/// Append (or validate) the stored `_row_id` column on a delete-side reverse-
+/// projection batch.
+///
+/// **V3 spec note (TODO):** this function computes `_row_id = first_row_id +
+/// position` and validates any pre-existing `_row_id` column against the
+/// computed value, rejecting mismatches with `InternalInconsistency`. That
+/// behaviour is incompatible with V3 row-lineage's "stored value wins"
+/// contract when the file was written by CoW UPDATE / compaction — a
+/// replacement file carries inherited row_ids in its stored column that
+/// deliberately differ from `first_row_id + position`. Until the delete-side
+/// reverse projection is migrated to use
+/// [`crate::connector::iceberg::row_lineage_synth::synthesize_row_id`], CoW
+/// UPDATE deletes through this path will either error out or produce wrong
+/// row_ids in unusual mixed-snapshot windows. Bug 1's primary fix sits on the
+/// insert-side scanner (`IcebergDeltaScan`), which is sufficient for
+/// `iceberg_ivm_join_key_update_multiplicity`. A follow-up commit will
+/// migrate this path too; tracked as out-of-scope for the immediate Bug 1
+/// commit.
 pub(crate) fn append_base_row_id_column(
     batch: &RecordBatch,
     first_row_id: i64,

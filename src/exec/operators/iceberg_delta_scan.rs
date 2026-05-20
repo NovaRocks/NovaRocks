@@ -510,6 +510,13 @@ fn open_data_file_scanner(
 /// Mirrors the order codegen registers in the scan-tuple descriptor through
 /// `build_iceberg_table_def_for_delta_scan::iceberg_row_lineage_metadata_columns`,
 /// so the chunk schema contract length matches.
+///
+/// V3 row-lineage rule: if the data file carries stored `_row_id` /
+/// `_last_updated_sequence_number` columns, the stored non-NULL values take
+/// precedence over the file-level `first_row_id + position` fallback. This
+/// helper drops the stored lineage columns from the output schema and emits
+/// only the synthesized virtual columns at the end of the batch — matching
+/// the scan-tuple descriptor's column count and ordering.
 fn append_data_file_lineage_columns(
     batch: &RecordBatch,
     file_path: &str,
@@ -521,28 +528,58 @@ fn append_data_file_lineage_columns(
     use arrow::datatypes::{DataType, Field, Schema};
 
     let row_count = batch.num_rows();
-    let file_col: ArrayRef = Arc::new(StringArray::from(vec![file_path.to_string(); row_count]));
+
+    // Compute absolute positions for this batch within its source data file.
     let pos_values: Vec<i64> = (0..row_count as i64).map(|i| pos_start + i).collect();
-    let pos_col: ArrayRef = Arc::new(Int64Array::from(pos_values.clone()));
-    let row_id_values = pos_values
-        .iter()
-        .map(|pos| {
-            first_row_id.checked_add(*pos).ok_or_else(|| {
-                format!(
-                    "ivm-a1 data-file scanner _row_id overflow: first_row_id={first_row_id} pos={pos} file={file_path}"
-                )
-            })
-        })
-        .collect::<Result<Vec<i64>, String>>()?;
+
+    // V3-compliant synthesis: stored column wins, fall back to first_row_id + pos.
+    let stored_idx =
+        crate::connector::iceberg::row_lineage_synth::stored_row_lineage_indices(batch.schema().as_ref());
+    let row_id_values = crate::connector::iceberg::row_lineage_synth::synthesize_row_id(
+        batch.schema().as_ref(),
+        batch.columns(),
+        row_count,
+        first_row_id,
+        Some(&pos_values),
+    )?;
+    let last_updated_seq_values =
+        crate::connector::iceberg::row_lineage_synth::synthesize_last_updated_sequence_number(
+            batch.schema().as_ref(),
+            batch.columns(),
+            row_count,
+            data_sequence_number,
+        )?;
+
+    let file_col: ArrayRef = Arc::new(StringArray::from(vec![file_path.to_string(); row_count]));
+    let pos_col: ArrayRef = Arc::new(Int64Array::from(pos_values));
     let row_id_col: ArrayRef = Arc::new(Int64Array::from(row_id_values));
-    let seq_col: ArrayRef = Arc::new(Int64Array::from(vec![data_sequence_number; row_count]));
+    let seq_col: ArrayRef = Arc::new(Int64Array::from(last_updated_seq_values));
+
+    // Strip stored row-lineage columns from the output: we are emitting them as
+    // virtual columns at the end of the batch, and the codegen scan-tuple
+    // descriptor does not include the stored columns.
+    let drop_indices: std::collections::HashSet<usize> = stored_idx
+        .row_id
+        .into_iter()
+        .chain(stored_idx.last_updated_seq.into_iter())
+        .collect();
 
     let mut fields: Vec<arrow::datatypes::Field> = batch
         .schema()
         .fields()
         .iter()
-        .map(|f| f.as_ref().clone())
+        .enumerate()
+        .filter(|(idx, _)| !drop_indices.contains(idx))
+        .map(|(_, f)| f.as_ref().clone())
         .collect();
+    let mut columns: Vec<ArrayRef> = batch
+        .columns()
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| !drop_indices.contains(idx))
+        .map(|(_, c)| c.clone())
+        .collect();
+
     fields.push(Field::new("_file", DataType::Utf8, false));
     fields.push(Field::new("_pos", DataType::Int64, false));
     fields.push(Field::new("_row_id", DataType::Int64, false));
@@ -551,14 +588,13 @@ fn append_data_file_lineage_columns(
         DataType::Int64,
         false,
     ));
-    let new_schema = Arc::new(Schema::new(fields));
-    let mut columns = batch.columns().to_vec();
     columns.push(file_col);
     columns.push(pos_col);
     columns.push(row_id_col);
     columns.push(seq_col);
-    RecordBatch::try_new(new_schema, columns)
-        .map_err(|e| format!("append data-file lineage columns failed: {e}"))
+
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map_err(|e| format!("ivm-a1 data-file scanner: rebuild lineage batch failed: {e}"))
 }
 
 struct PositionDeleteScanner {
@@ -824,5 +860,84 @@ mod tests {
     fn iceberg_delta_scan_factory_compiles_as_operator_factory() {
         fn assert_is_factory<T: OperatorFactory + ?Sized>() {}
         assert_is_factory::<IcebergDeltaScanFactory>();
+    }
+
+    #[test]
+    fn append_data_file_lineage_columns_uses_stored_row_id() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field};
+        use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+        use std::collections::HashMap;
+
+        let mut meta_row_id = HashMap::new();
+        meta_row_id.insert(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_ROW_ID.to_string(),
+        );
+        let user_field = Field::new("id", DataType::Int64, false);
+        let stored_row_id_field =
+            Field::new("_row_id", DataType::Int64, true).with_metadata(meta_row_id);
+        let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+            user_field,
+            stored_row_id_field,
+        ]));
+        let id_col: ArrayRef = std::sync::Arc::new(Int64Array::from(vec![100i64, 200]));
+        let stored_col: ArrayRef =
+            std::sync::Arc::new(Int64Array::from(vec![Some(42i64), None]));
+        let batch = RecordBatch::try_new(schema, vec![id_col, stored_col]).expect("batch");
+
+        let out = append_data_file_lineage_columns(&batch, "f.parquet", 7, 1000, 99)
+            .expect("append ok");
+
+        let out_schema = out.schema();
+        let names: Vec<&str> = out_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["id", "_file", "_pos", "_row_id", "_last_updated_sequence_number"]
+        );
+
+        let row_ids = out
+            .column_by_name("_row_id")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+            .expect("row id array");
+        assert_eq!(row_ids.value(0), 42, "stored row id wins on row 0");
+        assert_eq!(row_ids.value(1), 1008, "fallback first_row_id + position on row 1");
+    }
+
+    #[test]
+    fn append_data_file_lineage_columns_falls_back_without_stored_column() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field};
+
+        let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+        let id_col: ArrayRef = std::sync::Arc::new(Int64Array::from(vec![100i64, 200, 300]));
+        let batch = RecordBatch::try_new(schema, vec![id_col]).expect("batch");
+
+        let out = append_data_file_lineage_columns(&batch, "g.parquet", 0, 500, 12)
+            .expect("append ok");
+
+        let row_ids = out
+            .column_by_name("_row_id")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+            .expect("row id array");
+        assert_eq!(row_ids.value(0), 500);
+        assert_eq!(row_ids.value(1), 501);
+        assert_eq!(row_ids.value(2), 502);
+
+        let seqs = out
+            .column_by_name("_last_updated_sequence_number")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+            .expect("seq array");
+        assert_eq!(seqs.value(0), 12);
+        assert_eq!(seqs.value(1), 12);
+        assert_eq!(seqs.value(2), 12);
     }
 }
