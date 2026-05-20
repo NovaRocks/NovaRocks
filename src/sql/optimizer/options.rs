@@ -11,6 +11,7 @@ pub(crate) struct SessionOptimizerSettings {
     pub enable_cbo_table_prune: bool,
     pub enable_table_prune_on_update: bool,
     pub enable_eliminate_agg: bool,
+    pub disabled_rules: Vec<String>,
 }
 
 thread_local! {
@@ -65,9 +66,16 @@ impl OptimizerOptions {
         !self.disabled_rules.contains(rule_name)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn disable(&mut self, rule_name: &str) {
         self.disabled_rules.insert(rule_name.to_string());
+    }
+
+    pub(crate) fn from_session(settings: &SessionOptimizerSettings) -> Self {
+        let mut opts = Self::default_settings();
+        for rule_name in &settings.disabled_rules {
+            opts.disable(rule_name);
+        }
+        opts
     }
 }
 
@@ -96,5 +104,25 @@ mod tests {
         assert_eq!(opts.rbo_max_iterations, 32);
         assert_eq!(opts.cbo_max_groups, 5000);
         assert_eq!(opts.optimize_timeout, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn from_session_copies_disabled_rules() {
+        let settings = SessionOptimizerSettings {
+            disabled_rules: vec!["JoinCommutativity".to_string(), "FooRule".to_string()],
+            ..Default::default()
+        };
+        let opts = OptimizerOptions::from_session(&settings);
+        assert!(!opts.is_enabled("JoinCommutativity"));
+        assert!(!opts.is_enabled("FooRule"));
+        assert!(opts.is_enabled("UnrelatedRule"));
+    }
+
+    #[test]
+    fn from_session_empty_disabled_rules_enables_everything() {
+        let settings = SessionOptimizerSettings::default();
+        let opts = OptimizerOptions::from_session(&settings);
+        assert!(opts.is_enabled("JoinCommutativity"));
+        assert!(opts.is_enabled("AnyRuleAtAll"));
     }
 }

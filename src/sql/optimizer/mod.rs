@@ -61,7 +61,8 @@ pub(crate) fn optimize(
     //    point loop causes the needed-column set to shrink across iterations
     //    (predicates get reshuffled between join conditions), incorrectly
     //    dropping join-key or select-list columns from scan required_columns.
-    let options = options::OptimizerOptions::default_settings();
+    let options =
+        options::OptimizerOptions::from_session(&options::current_session_optimizer_settings());
     let rewritten = rbo::driver::rewrite_to_fixed_point(
         plan,
         &rbo::rules::predicate_pushdown_rbo_rules(),
@@ -98,13 +99,13 @@ pub(crate) fn optimize(
 
     // 7. Explore: apply transformation rules (logical -> logical).
     let transform_rules = rules::all_transformation_rules();
-    explore(&mut memo, &transform_rules, deadline)?;
+    explore(&mut memo, &transform_rules, &options, deadline)?;
 
     check_deadline(deadline)?;
 
     // 8. Implement: apply implementation rules (logical -> physical).
     let impl_rules = rules::all_implementation_rules();
-    implement(&mut memo, &impl_rules);
+    implement(&mut memo, &impl_rules, &options);
 
     // 9. Re-derive statistics for any newly created groups (e.g. from AggSplit).
     stats::derive_group_statistics(&mut memo, table_stats);
@@ -141,7 +142,12 @@ fn check_deadline(deadline: Instant) -> Result<(), String> {
 /// - Wall-clock deadline exceeded
 const EXPLORE_MAX_ITERATIONS: usize = 16;
 
-fn explore(memo: &mut Memo, rules: &[Box<dyn Rule>], deadline: Instant) -> Result<(), String> {
+fn explore(
+    memo: &mut Memo,
+    rules: &[Box<dyn Rule>],
+    options: &options::OptimizerOptions,
+    deadline: Instant,
+) -> Result<(), String> {
     for _round in 0..EXPLORE_MAX_ITERATIONS {
         if Instant::now() > deadline {
             return Err(format!(
@@ -161,6 +167,9 @@ fn explore(memo: &mut Memo, rules: &[Box<dyn Rule>], deadline: Instant) -> Resul
             let exprs: Vec<MExpr> = memo.groups[group_id].logical_exprs.clone();
             for expr in &exprs {
                 for rule in rules {
+                    if !options.is_enabled(rule.name()) {
+                        continue;
+                    }
                     // Skip JoinAssociativity when the memo has grown large
                     // to prevent combinatorial explosion. RBO join reorder
                     // already handles join ordering for large join graphs.
@@ -205,7 +214,7 @@ fn explore(memo: &mut Memo, rules: &[Box<dyn Rule>], deadline: Instant) -> Resul
 /// Apply implementation rules to all groups.
 ///
 /// Single pass — each logical expr gets physical alternatives once.
-fn implement(memo: &mut Memo, rules: &[Box<dyn Rule>]) {
+fn implement(memo: &mut Memo, rules: &[Box<dyn Rule>], options: &options::OptimizerOptions) {
     let mut changed = true;
     while changed {
         changed = false;
@@ -214,6 +223,9 @@ fn implement(memo: &mut Memo, rules: &[Box<dyn Rule>]) {
             let exprs: Vec<MExpr> = memo.groups[group_id].logical_exprs.clone();
             for expr in &exprs {
                 for rule in rules {
+                    if !options.is_enabled(rule.name()) {
+                        continue;
+                    }
                     if rule.matches(&expr.op) {
                         let new_exprs = rule.apply(expr, memo);
                         for new_expr in new_exprs {
