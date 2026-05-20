@@ -107,14 +107,22 @@ fn expr_uses_nondeterministic(expr: &TypedExpr) -> bool {
     }
 }
 
-/// Top-level collector entry. To be wired in subsequent tasks (5-6).
+/// Top-level collector entry.
 #[allow(dead_code)]
 pub(crate) fn collect_push_plan(
     aggregate: &AggregateNode,
     _table_stats: &HashMap<String, TableStatistics>,
 ) -> Option<PushPlan> {
-    let _ctx = entry_safety_check(aggregate)?;
-    // Traversal added in Tasks 5 and 6.
+    let ctx = entry_safety_check(aggregate)?;
+    // v1: aggregate.input MUST be a Join directly. Filter/Project
+    // intermediation and nested-Join targets are OPT-1 follow-ups.
+    let join = match aggregate.input.as_ref() {
+        LogicalPlan::Join(j) => j,
+        _ => return None,
+    };
+    // split_at_join lands in Task 6.
+    let _ = ctx;
+    let _ = join;
     None
 }
 
@@ -273,5 +281,103 @@ mod tests {
         assert_eq!(ctx.original_aggregates.len(), 1);
         assert!(ctx.required_columns.contains(&"k".to_string()));
         assert!(ctx.required_columns.contains(&"v".to_string()));
+    }
+
+    use crate::sql::analysis::{JoinKind, ProjectItem};
+    use crate::sql::catalog::{TableDef, TableStorage};
+    use crate::sql::planner::plan::{FilterNode, JoinNode, ProjectNode, ScanNode};
+
+    fn dummy_scan_with_cols(cols: &[(&str, DataType)]) -> LogicalPlan {
+        LogicalPlan::Scan(ScanNode {
+            database: "db".into(),
+            table: TableDef {
+                name: "t".into(),
+                columns: vec![],
+                iceberg_row_lineage_metadata_columns: vec![],
+                iceberg_table: None,
+                storage: TableStorage::LocalParquetFile {
+                    path: std::path::PathBuf::from("/tmp/t.parquet"),
+                },
+            },
+            alias: None,
+            columns: cols
+                .iter()
+                .map(|(n, ty)| OutputColumn {
+                    name: (*n).into(),
+                    data_type: ty.clone(),
+                    nullable: false,
+                })
+                .collect(),
+            predicates: vec![],
+            required_columns: None,
+        })
+    }
+
+    #[test]
+    fn rejects_when_input_is_scan_directly() {
+        // No Join means no work to do — would just wrap the scan with an
+        // identity partial that buys nothing. v1 rejects.
+        let scan = dummy_scan_with_cols(&[("k", DataType::Int64), ("v", DataType::Int64)]);
+        let agg = AggregateNode {
+            input: Box::new(scan),
+            group_by: vec![col_ref("k", DataType::Int64)],
+            aggregates: vec![sum_call("v")],
+            output_columns: vec![],
+            already_pushed: false,
+        };
+        assert!(collect_push_plan(&agg, &HashMap::new()).is_none());
+    }
+
+    #[test]
+    fn rejects_when_input_is_filter_above_join() {
+        // Filter intermediation between Aggregate and Join is an OPT-1
+        // follow-up. v1 rejects.
+        let scan_a = dummy_scan_with_cols(&[("k", DataType::Int64), ("v", DataType::Int64)]);
+        let scan_b = dummy_scan_with_cols(&[("k", DataType::Int64)]);
+        let join = LogicalPlan::Join(JoinNode {
+            left: Box::new(scan_a),
+            right: Box::new(scan_b),
+            join_type: JoinKind::Inner,
+            condition: Some(col_ref("k", DataType::Boolean)),
+        });
+        let filter = LogicalPlan::Filter(FilterNode {
+            input: Box::new(join),
+            predicate: col_ref("k", DataType::Boolean),
+        });
+        let agg = AggregateNode {
+            input: Box::new(filter),
+            group_by: vec![col_ref("k", DataType::Int64)],
+            aggregates: vec![sum_call("v")],
+            output_columns: vec![],
+            already_pushed: false,
+        };
+        assert!(collect_push_plan(&agg, &HashMap::new()).is_none());
+    }
+
+    #[test]
+    fn rejects_when_input_is_project_above_join() {
+        let scan_a = dummy_scan_with_cols(&[("k", DataType::Int64), ("v", DataType::Int64)]);
+        let scan_b = dummy_scan_with_cols(&[("k", DataType::Int64)]);
+        let join = LogicalPlan::Join(JoinNode {
+            left: Box::new(scan_a),
+            right: Box::new(scan_b),
+            join_type: JoinKind::Inner,
+            condition: Some(col_ref("k", DataType::Boolean)),
+        });
+        let project = LogicalPlan::Project(ProjectNode {
+            input: Box::new(join),
+            items: vec![ProjectItem {
+                expr: col_ref("k", DataType::Int64),
+                output_name: "k".into(),
+            }],
+        });
+        let agg = AggregateNode {
+            input: Box::new(project),
+            group_by: vec![col_ref("k", DataType::Int64)],
+            aggregates: vec![sum_call("v")],
+            output_columns: vec![],
+            already_pushed: false,
+        };
+        assert!(collect_push_plan(&agg, &HashMap::new()).is_none());
     }
 }
