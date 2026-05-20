@@ -82,6 +82,37 @@ pub(crate) enum MvPartitionValue {
     String(String),
 }
 
+/// Optional partition predicate that the aggregate target state loader and
+/// the iceberg MV target locator share. `None` means "do not prune"; an
+/// `AllowList` means "drop FileScanTasks whose target partition key is not in
+/// this set". The empty allow-list is a legitimate state (no partition is
+/// affected); callers MUST NOT silently treat it as "no filter".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TargetPartitionFilter {
+    None,
+    AllowList(BTreeSet<MvPartitionKey>),
+}
+
+impl TargetPartitionFilter {
+    pub(crate) fn matches(&self, key: &MvPartitionKey) -> bool {
+        match self {
+            Self::None => true,
+            Self::AllowList(set) => set.contains(key),
+        }
+    }
+
+    pub(crate) fn allow_list_len(&self) -> Option<usize> {
+        match self {
+            Self::None => None,
+            Self::AllowList(set) => Some(set.len()),
+        }
+    }
+
+    pub(crate) fn is_allow_list(&self) -> bool {
+        matches!(self, Self::AllowList(_))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +164,31 @@ mod tests {
     fn unpartitioned_is_not_unknown() {
         assert!(!AffectedMvPartitions::Unpartitioned.is_unknown());
         assert_eq!(AffectedMvPartitions::Unpartitioned.partition_count(), 0);
+    }
+
+    #[test]
+    fn target_partition_filter_none_passes_any_key() {
+        let filter = TargetPartitionFilter::None;
+        assert!(filter.matches(&key(1, "id", "1")));
+        assert_eq!(filter.allow_list_len(), None);
+    }
+
+    #[test]
+    fn target_partition_filter_allow_list_matches_only_listed_keys() {
+        let filter = TargetPartitionFilter::AllowList(
+            [key(1, "id", "1"), key(1, "id", "2")].into_iter().collect(),
+        );
+        assert!(filter.matches(&key(1, "id", "1")));
+        assert!(filter.matches(&key(1, "id", "2")));
+        assert!(!filter.matches(&key(1, "id", "3")));
+        assert!(!filter.matches(&key(2, "id", "1")));
+        assert_eq!(filter.allow_list_len(), Some(2));
+    }
+
+    #[test]
+    fn target_partition_filter_empty_allow_list_matches_nothing() {
+        let filter = TargetPartitionFilter::AllowList(std::collections::BTreeSet::new());
+        assert!(!filter.matches(&key(1, "id", "1")));
+        assert_eq!(filter.allow_list_len(), Some(0));
     }
 }
