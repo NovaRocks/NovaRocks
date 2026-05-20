@@ -60,7 +60,14 @@ pub(crate) fn extract_best(
             }
             EnforcerKind::Sort(ordering) => {
                 let items = ordering_spec_to_sort_items(ordering);
-                Operator::PhysicalSort(PhysicalSortOp { items })
+                // Sort enforcers inserted by the property-derivation pass are
+                // pure ORDER BY enforcers, not analytic precursor sorts —
+                // those come from `WindowToPhysical`. Leave the analytic
+                // partition tag empty so this Sort still requires Gather.
+                Operator::PhysicalSort(PhysicalSortOp {
+                    items,
+                    analytic_partition_exprs: Vec::new(),
+                })
             }
         };
 

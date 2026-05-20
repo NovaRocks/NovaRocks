@@ -267,7 +267,10 @@ mod tests {
     #[test]
     fn sort_cost_nlogn() {
         let s = stats(1024.0, 10.0);
-        let op = Operator::PhysicalSort(PhysicalSortOp { items: vec![] });
+        let op = Operator::PhysicalSort(PhysicalSortOp {
+            items: vec![],
+            analytic_partition_exprs: Vec::new(),
+        });
         let cost = compute_cost(&op, &s, &[]);
         // 1024 * log2(1024) = 1024 * 10 = 10240
         assert!((cost - 10_240.0).abs() < 1.0);
@@ -322,7 +325,10 @@ mod tests {
         // while its child's output (the scan) has 10M rows.
         let input = stats(10_000_000.0, 50.0);
         let own = stats(100.0, 50.0);
-        let sort = Operator::PhysicalSort(PhysicalSortOp { items: vec![] });
+        let sort = Operator::PhysicalSort(PhysicalSortOp {
+            items: vec![],
+            analytic_partition_exprs: Vec::new(),
+        });
         let top_n = Operator::PhysicalTopN(PhysicalTopNOp {
             items: vec![],
             limit: Some(100),
@@ -347,7 +353,10 @@ mod tests {
         // equals Sort's cost (both are n * log2(n)).
         let input = stats(100.0, 10.0);
         let own = stats(100.0, 10.0); // unlimited output (limit exceeds input)
-        let sort = Operator::PhysicalSort(PhysicalSortOp { items: vec![] });
+        let sort = Operator::PhysicalSort(PhysicalSortOp {
+            items: vec![],
+            analytic_partition_exprs: Vec::new(),
+        });
         let top_n = Operator::PhysicalTopN(PhysicalTopNOp {
             items: vec![],
             limit: Some(10_000),

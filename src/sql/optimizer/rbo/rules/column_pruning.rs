@@ -201,6 +201,7 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
             LogicalPlan::Sort(SortNode {
                 input: Box::new(input),
                 items: node.items,
+                analytic_partition_by: node.analytic_partition_by,
             })
         }
 

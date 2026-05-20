@@ -105,7 +105,10 @@ mod tests {
 
         let sort_mexpr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalSort(LogicalSortOp { items: vec![] }),
+            op: Operator::LogicalSort(LogicalSortOp {
+                items: vec![],
+                analytic_partition_exprs: Vec::new(),
+            }),
             children: vec![scan_group],
         };
         let sort_group = memo.new_group(sort_mexpr);
@@ -166,7 +169,10 @@ mod tests {
 
         let sort_mexpr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalSort(LogicalSortOp { items: vec![] }),
+            op: Operator::LogicalSort(LogicalSortOp {
+                items: vec![],
+                analytic_partition_exprs: Vec::new(),
+            }),
             children: vec![scan_group],
         };
         let sort_group = memo.new_group(sort_mexpr);

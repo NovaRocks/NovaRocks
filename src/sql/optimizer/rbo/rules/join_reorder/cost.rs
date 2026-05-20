@@ -212,6 +212,7 @@ mod tests {
         let plan = LogicalPlan::Sort(SortNode {
             input: Box::new(dummy_values()),
             items: vec![],
+            analytic_partition_by: Vec::new(),
         });
 
         let cost = estimate_operator_cost(&plan, &own_stats, &[&input_stats]);

@@ -93,6 +93,7 @@ pub(crate) fn inline_single_use_ctes(plan: LogicalPlan, ctx: &CTEContext) -> Log
         LogicalPlan::Sort(node) => LogicalPlan::Sort(SortNode {
             input: Box::new(inline_single_use_ctes(*node.input, ctx)),
             items: node.items,
+            analytic_partition_by: node.analytic_partition_by,
         }),
         LogicalPlan::Limit(node) => LogicalPlan::Limit(LimitNode {
             input: Box::new(inline_single_use_ctes(*node.input, ctx)),
@@ -210,6 +211,7 @@ fn replace_cte_consume(plan: LogicalPlan, cte_id: CteId, replacement: &LogicalPl
         LogicalPlan::Sort(node) => LogicalPlan::Sort(SortNode {
             input: Box::new(replace_cte_consume(*node.input, cte_id, replacement)),
             items: node.items,
+            analytic_partition_by: node.analytic_partition_by,
         }),
         LogicalPlan::Limit(node) => LogicalPlan::Limit(LimitNode {
             input: Box::new(replace_cte_consume(*node.input, cte_id, replacement)),

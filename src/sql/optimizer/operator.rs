@@ -85,6 +85,15 @@ pub(crate) struct LogicalJoinOp {
 #[derive(Clone, Debug)]
 pub(crate) struct LogicalSortOp {
     pub items: Vec<SortItem>,
+    /// Set by `build_window_and_project` when this Sort was inserted as a
+    /// precursor to a Window (PARTITION BY + ORDER BY). Empty otherwise.
+    /// When non-empty, the sort can be done locally per partition after a
+    /// HASH EXCHANGE keyed on these columns — no global Gather needed.
+    /// Mirrors StarRocks's `TSortNode.analytic_partition_exprs`. Stored as
+    /// `TypedExpr` (not `ColumnRef`) so the fragment builder can compile
+    /// them back to wire-level `TExpr`s; the optimizer converts to
+    /// `ColumnRef` on demand for distribution-property matching.
+    pub analytic_partition_exprs: Vec<crate::sql::analysis::TypedExpr>,
 }
 
 #[derive(Clone, Debug)]
@@ -237,6 +246,9 @@ pub(crate) struct PhysicalHashAggregateOp {
 #[derive(Clone, Debug)]
 pub(crate) struct PhysicalSortOp {
     pub items: Vec<SortItem>,
+    /// Propagated from `LogicalSortOp::analytic_partition_exprs`. See the
+    /// LogicalSortOp doc-comment for semantics.
+    pub analytic_partition_exprs: Vec<crate::sql::analysis::TypedExpr>,
 }
 
 #[derive(Clone, Debug)]

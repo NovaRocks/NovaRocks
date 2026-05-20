@@ -774,6 +774,9 @@ impl Rule for SortToPhysical {
         vec![NewExpr {
             op: Operator::PhysicalSort(PhysicalSortOp {
                 items: op.items.clone(),
+                // Propagate the analytic-partition tag through Logical→Physical
+                // so the optimizer's required-distribution logic can see it.
+                analytic_partition_exprs: op.analytic_partition_exprs.clone(),
             }),
             children: expr.children.clone(),
         }]

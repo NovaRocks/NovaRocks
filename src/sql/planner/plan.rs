@@ -194,6 +194,12 @@ pub(crate) struct AggregateCall {
 pub(crate) struct SortNode {
     pub input: Box<LogicalPlan>,
     pub items: Vec<SortItem>,
+    /// Populated by `build_window_and_project` when this Sort was inserted
+    /// as a precursor to a Window operator (PARTITION BY ...). Carries the
+    /// window's partition_by columns, which become the analytic-partition
+    /// tag on the downstream LogicalSortOp / PhysicalSortOp / TSortNode.
+    /// Empty for top-level `ORDER BY` sorts.
+    pub analytic_partition_by: Vec<TypedExpr>,
 }
 
 #[derive(Clone, Debug)]

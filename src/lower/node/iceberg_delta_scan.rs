@@ -84,8 +84,11 @@ pub(crate) fn lower_iceberg_delta_scan_node(
     }
 
     let entry = iceberg_catalogs.get(&payload.catalog)?;
-    let loaded =
-        crate::connector::iceberg::catalog::load_table(&entry, &payload.iceberg_namespace, &payload.table)?;
+    let loaded = crate::connector::iceberg::catalog::load_table(
+        &entry,
+        &payload.iceberg_namespace,
+        &payload.table,
+    )?;
 
     // The snapshot interval is (from_snapshot_id, to_snapshot_id] semantically.
     // Lineage validation (to in metadata, from is a descendant ancestor of to)

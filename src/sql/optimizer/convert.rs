@@ -93,6 +93,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
             let child = logical_plan_to_memo(&node.input, memo);
             let op = Operator::LogicalSort(LogicalSortOp {
                 items: node.items.clone(),
+                analytic_partition_exprs: node.analytic_partition_by.clone(),
             });
             let expr = MExpr {
                 id: memo.next_expr_id(),

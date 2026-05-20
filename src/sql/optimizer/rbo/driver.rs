@@ -127,6 +127,7 @@ fn rewrite_children(
                 LogicalPlan::Sort(SortNode {
                     input,
                     items: n.items,
+                    analytic_partition_by: n.analytic_partition_by,
                 }),
                 ch,
             )

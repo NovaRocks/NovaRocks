@@ -1164,7 +1164,14 @@ impl<'a> PlanFragmentBuilder<'a> {
         let child = self.visit(&node.children[0])?;
 
         let sort_node_id = self.alloc_node();
-        let sort_tuple_id = *child.tuple_ids.last().unwrap();
+        // Pass all of child's tuples through Sort. Previously the optimizer
+        // forced a GATHER EXCHANGE before Sort whenever the Sort wasn't
+        // top-level, which collapsed multi-tuple JOIN output into a single
+        // exchange tuple — so taking `.last()` happened to work. With
+        // analytic-partition Sorts running directly above multi-tuple JOIN
+        // output (no Gather), we must pass every tuple through, otherwise
+        // the lowering layout-match check at `lower/node/sort.rs:306` fails
+        // with `output column count mismatch`.
 
         let mut ordering_exprs = Vec::new();
         let mut is_asc = Vec::new();
@@ -1178,6 +1185,22 @@ impl<'a> PlanFragmentBuilder<'a> {
             nulls_first_list.push(item.nulls_first);
         }
 
+        // Compile analytic-partition exprs (set when this Sort precedes a
+        // Window). Emitting them as TSortNode.analytic_partition_exprs tells
+        // the pipeline engine to run sort locally per partition instead of
+        // doing a global merge — matching StarRocks's parallel analytic
+        // sort behaviour. Empty for plain ORDER BY.
+        let analytic_partition_exprs = if op.analytic_partition_exprs.is_empty() {
+            None
+        } else {
+            let mut out = Vec::with_capacity(op.analytic_partition_exprs.len());
+            for expr in &op.analytic_partition_exprs {
+                let mut compiler = ExprCompiler::new(self.slot_allocator(), &child.scope);
+                out.push(compiler.compile_typed(expr)?);
+            }
+            Some(out)
+        };
+
         let sort_info = plan_nodes::TSortInfo::new(
             ordering_exprs,
             is_asc,
@@ -1190,7 +1213,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         sort_plan_node.node_type = plan_nodes::TPlanNodeType::SORT_NODE;
         sort_plan_node.num_children = 1;
         sort_plan_node.limit = -1;
-        sort_plan_node.row_tuples = vec![sort_tuple_id];
+        sort_plan_node.row_tuples = child.tuple_ids.clone();
         sort_plan_node.nullable_tuples = vec![];
         sort_plan_node.compact_data = true;
         sort_plan_node.sort_node = Some(plan_nodes::TSortNode {
@@ -1204,7 +1227,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             sort_tuple_slot_exprs: None,
             has_outer_join_child: None,
             sql_sort_keys: None,
-            analytic_partition_exprs: None,
+            analytic_partition_exprs,
             partition_exprs: None,
             partition_limit: None,
             topn_type: None,
@@ -3986,6 +4009,7 @@ mod tests {
                     asc: true,
                     nulls_first: false,
                 }],
+                analytic_partition_exprs: Vec::new(),
             }),
             children: vec![PhysicalPlanNode {
                 op: Operator::PhysicalDistribution(PhysicalDistributionOp {
@@ -4033,6 +4057,7 @@ mod tests {
                     asc: true,
                     nulls_first: false,
                 }],
+                analytic_partition_exprs: Vec::new(),
             }),
             children: vec![PhysicalPlanNode {
                 op: Operator::PhysicalDistribution(PhysicalDistributionOp {

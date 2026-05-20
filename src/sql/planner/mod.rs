@@ -150,6 +150,8 @@ fn apply_query_modifiers(
             body_plan = LogicalPlan::Sort(SortNode {
                 input: Box::new(body_plan),
                 items: sort_items,
+                // Top-level ORDER BY — no analytic partition.
+                analytic_partition_by: Vec::new(),
             });
 
             // Strip synthetic sort-only columns after LIMIT/OFFSET so the
@@ -189,6 +191,8 @@ fn apply_query_modifiers(
             body_plan = LogicalPlan::Sort(SortNode {
                 input: Box::new(body_plan),
                 items: sort_items,
+                // Top-level ORDER BY — no analytic partition.
+                analytic_partition_by: Vec::new(),
             });
         }
     }
@@ -652,12 +656,19 @@ fn build_window_and_project(
         for ob in &first_win.order_by {
             sort_items.push(ob.clone());
         }
+        // Tag the Sort with the window's partition columns so the optimizer
+        // can require Hash(partition_by) distribution from the child instead
+        // of forcing Gather — letting the sort run locally per analytic
+        // partition. This mirrors StarRocks's
+        // `TSortNode.analytic_partition_exprs` mechanism.
+        let analytic_partition_by = first_win.partition_by.clone();
         let sorted_input = if sort_items.is_empty() {
             input
         } else {
             LogicalPlan::Sort(SortNode {
                 input: Box::new(input),
                 items: sort_items,
+                analytic_partition_by,
             })
         };
 

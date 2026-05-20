@@ -325,7 +325,11 @@ fn output_properties(op: &Operator) -> PhysicalPropertySet {
             }
         }
 
-        // Sort: Gather distribution + Ordered.
+        // Sort: distribution depends on whether this sort was inserted as
+        // an analytic precursor (then its output is Hash on the partition
+        // columns, since each instance only saw rows for some buckets) or a
+        // top-level ORDER BY (then output is Gather). Ordering output is
+        // the sort keys either way.
         Operator::PhysicalSort(s) => {
             let sort_keys: Vec<SortKey> = s
                 .items
@@ -338,8 +342,18 @@ fn output_properties(op: &Operator) -> PhysicalPropertySet {
                     })
                 })
                 .collect();
+            let distribution = if s.analytic_partition_exprs.is_empty() {
+                DistributionSpec::Gather
+            } else {
+                let partition_cols = typed_exprs_to_column_refs(&s.analytic_partition_exprs);
+                if partition_cols.len() == s.analytic_partition_exprs.len() {
+                    DistributionSpec::HashPartitioned(partition_cols)
+                } else {
+                    DistributionSpec::Gather
+                }
+            };
             PhysicalPropertySet {
-                distribution: DistributionSpec::Gather,
+                distribution,
                 ordering: if sort_keys.is_empty() {
                     OrderingSpec::Any
                 } else {
@@ -517,8 +531,31 @@ pub(super) fn required_input_properties(
             AggMode::DistinctLocal => vec![PhysicalPropertySet::any()],
         },
 
-        // Sort: child must be Gather.
-        Operator::PhysicalSort(_) => vec![PhysicalPropertySet::gather()],
+        // Sort: child must be Gather (for a top-level ORDER BY), UNLESS the
+        // Sort carries an `analytic_partition_exprs` tag. The tag is set by
+        // the planner when this Sort is a precursor to a Window function;
+        // in that case the sort can run locally on each analytic partition
+        // after a HASH EXCHANGE keyed on the partition columns — no global
+        // single-node merge needed. Mirrors StarRocks's
+        // `TSortNode.analytic_partition_exprs` mechanism.
+        Operator::PhysicalSort(sort) => {
+            // The tag is stored as `TypedExpr`s (to round-trip back to the
+            // codegen / TSortNode) but distribution matching needs
+            // `ColumnRef`s. Convert here and fall back to Gather if any
+            // partition expression isn't a plain column reference (very
+            // rare — partition_by is almost always a column).
+            let partition_cols = typed_exprs_to_column_refs(&sort.analytic_partition_exprs);
+            if partition_cols.is_empty()
+                || partition_cols.len() != sort.analytic_partition_exprs.len()
+            {
+                vec![PhysicalPropertySet::gather()]
+            } else {
+                vec![PhysicalPropertySet {
+                    distribution: DistributionSpec::HashPartitioned(partition_cols),
+                    ordering: OrderingSpec::Any,
+                }]
+            }
+        }
 
         // TopN child requirement depends on phase/is_split:
         //   - Partial: child is Any (don't force gather; we run per-instance).
@@ -850,6 +887,7 @@ mod tests {
                 asc: true,
                 nulls_first: false,
             }],
+            analytic_partition_exprs: Vec::new(),
         });
         let props = output_properties(&op);
         assert_eq!(props.distribution, DistributionSpec::Gather);
