@@ -13,6 +13,14 @@ use crate::engine::record_batch_to_chunk;
 use crate::exec::change_op::{ChangeOp, change_op_array, change_op_field};
 use crate::exec::chunk::Chunk;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AggregateStateLookupStats {
+    pub planned_file_count: usize,
+    pub pruned_file_count: usize,
+    pub scanned_row_count: usize,
+    pub matched_row_count: usize,
+}
+
 pub(crate) struct IcebergAggregateMergeResult {
     pub(crate) delete_row_ids: Vec<String>,
     pub(crate) insert_chunks: Vec<Chunk>,
@@ -145,6 +153,195 @@ pub(crate) fn load_current_aggregate_target_state(
         target_table,
         layout,
     ))?
+}
+
+pub(crate) fn load_touched_aggregate_target_state(
+    target_table: &iceberg::table::Table,
+    layout: &AggregateMvLayout,
+    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    touched_row_ids: &std::collections::BTreeSet<String>,
+    partition_filter: &crate::engine::mv::partition::TargetPartitionFilter,
+) -> Result<(Vec<Chunk>, AggregateStateLookupStats), String> {
+    crate::runtime::global_async_runtime::data_block_on(load_touched_aggregate_target_state_async(
+        target_table,
+        layout,
+        schema_contract,
+        touched_row_ids,
+        partition_filter,
+    ))?
+}
+
+pub(crate) async fn load_touched_aggregate_target_state_async(
+    target_table: &iceberg::table::Table,
+    layout: &AggregateMvLayout,
+    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    touched_row_ids: &std::collections::BTreeSet<String>,
+    partition_filter: &crate::engine::mv::partition::TargetPartitionFilter,
+) -> Result<(Vec<Chunk>, AggregateStateLookupStats), String> {
+    use futures::StreamExt;
+    use iceberg::arrow::ArrowReaderBuilder;
+
+    let mut stats = AggregateStateLookupStats::default();
+
+    if touched_row_ids.is_empty() {
+        return Ok((Vec::new(), stats));
+    }
+    if let crate::engine::mv::partition::TargetPartitionFilter::AllowList(set) = partition_filter
+        && set.is_empty()
+    {
+        return Err(
+            "aggregate target lookup: empty partition allow-list with non-empty touched groups"
+                .to_string(),
+        );
+    }
+
+    let select_cols = layout
+        .physical_columns
+        .iter()
+        .map(|column| column.column.name.clone())
+        .collect::<Vec<_>>();
+    let scan = target_table
+        .scan()
+        .select(select_cols)
+        .build()
+        .map_err(|e| format!("build iceberg aggregate target state scan failed: {e}"))?;
+    let task_stream = scan
+        .plan_files()
+        .await
+        .map_err(|e| format!("plan iceberg aggregate target state files failed: {e}"))?;
+    let target_metadata = target_table.metadata_ref();
+
+    let mut kept_tasks = Vec::new();
+    let collected: Vec<_> = task_stream.collect().await;
+    for task_result in collected {
+        let mut task =
+            task_result.map_err(|e| format!("iceberg aggregate target state task error: {e}"))?;
+        stats.planned_file_count += 1;
+        task.predicate = None;
+        if let crate::engine::mv::partition::TargetPartitionFilter::AllowList(_) = partition_filter
+        {
+            let Some(partition_struct) = task.partition.as_ref() else {
+                return Err(format!(
+                    "iceberg aggregate target state task for `{}` missing partition metadata",
+                    task.data_file_path
+                ));
+            };
+            // iceberg-rust 0.9 always sets partition_spec = None in FileScanTask;
+            // fall back to the table's default partition spec id, which is correct
+            // as long as the MV target has not evolved its partition spec.
+            let spec_id = task
+                .partition_spec
+                .as_ref()
+                .map(|spec| spec.spec_id())
+                .unwrap_or_else(|| target_metadata.default_partition_spec().spec_id());
+            let values = crate::connector::iceberg::changes::change_partition_field_values(
+                &target_metadata,
+                spec_id,
+                partition_struct,
+            )
+            .map_err(|e| {
+                format!(
+                    "iceberg aggregate target state task for `{}`: cannot derive partition values: {e}",
+                    task.data_file_path
+                )
+            })?;
+            // Build the MV partition key directly from the target table's partition values.
+            // We do not route through map_file_partition_to_mv_key here because that
+            // function matches by base-table field IDs; the target scan values carry
+            // target-table field IDs.
+            let mut fields = Vec::with_capacity(values.len());
+            for value in &values {
+                let mv_value =
+                    crate::engine::mv::partition::mapping::change_partition_value_to_mv_value(
+                        &task.data_file_path,
+                        &value.value,
+                    )?;
+                fields.push(crate::engine::mv::partition::MvPartitionKeyField::new(
+                    value.field_name.clone(),
+                    mv_value,
+                ));
+            }
+            let key = crate::engine::mv::partition::MvPartitionKey::new(
+                schema_contract
+                    .target
+                    .partition
+                    .as_ref()
+                    .map(|p| p.target_spec_id)
+                    .unwrap_or(spec_id),
+                fields,
+            );
+            if !partition_filter.matches(&key) {
+                continue;
+            }
+        }
+        stats.pruned_file_count += 1;
+        kept_tasks.push(task);
+    }
+
+    if kept_tasks.is_empty() {
+        return Ok((Vec::new(), stats));
+    }
+
+    let task_stream = futures::stream::iter(kept_tasks.into_iter().map(Ok::<_, iceberg::Error>));
+    let arrow_reader = ArrowReaderBuilder::new(target_table.file_io().clone())
+        .with_row_group_filtering_enabled(false)
+        .build();
+    let mut stream = arrow_reader
+        .read(Box::pin(task_stream))
+        .map_err(|e| format!("read iceberg aggregate target state scan failed: {e}"))?;
+
+    let row_id_column_name = layout.row_id_column.column.name.clone();
+    let mut chunks = Vec::new();
+    while let Some(batch_result) = stream.next().await {
+        let batch =
+            batch_result.map_err(|e| format!("iceberg aggregate target state scan error: {e}"))?;
+        validate_physical_aggregate_schema(layout, &batch, "iceberg aggregate target state scan")?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        stats.scanned_row_count += batch.num_rows();
+        let row_id_index = batch.schema().index_of(&row_id_column_name).map_err(|e| {
+            format!(
+                "iceberg aggregate target state scan missing row id column `{row_id_column_name}`: {e}"
+            )
+        })?;
+        let row_id_array = batch
+            .column(row_id_index)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .ok_or_else(|| {
+                format!(
+                    "iceberg aggregate target state scan row id column `{row_id_column_name}` must be Utf8"
+                )
+            })?;
+        let keep: Vec<bool> = (0..row_id_array.len())
+            .map(|row| {
+                if row_id_array.is_null(row) {
+                    false
+                } else {
+                    touched_row_ids.contains(row_id_array.value(row))
+                }
+            })
+            .collect();
+        let matched = keep.iter().filter(|k| **k).count();
+        if matched == 0 {
+            continue;
+        }
+        stats.matched_row_count += matched;
+        let filter = BooleanArray::from(keep);
+        let columns = batch
+            .columns()
+            .iter()
+            .map(|column| {
+                arrow::compute::filter(column.as_ref(), &filter)
+                    .map_err(|e| format!("filter iceberg aggregate target state batch failed: {e}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let filtered = RecordBatch::try_new(batch.schema(), columns)
+            .map_err(|e| format!("rebuild iceberg aggregate target state batch failed: {e}"))?;
+        chunks.push(record_batch_to_chunk(filtered)?);
+    }
+    Ok((chunks, stats))
 }
 
 fn delta_row_ids(
@@ -628,6 +825,416 @@ mod tests {
 
         assert!(err.contains("insert chunk"), "err={err}");
         assert!(err.contains("expected `region`"), "err={err}");
+    }
+
+    use crate::engine::mv::partition::{
+        MvPartitionKey, MvPartitionKeyField, MvPartitionValue, TargetPartitionFilter,
+    };
+    use crate::meta::repository::mv_contract::{
+        ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
+        ExpressionLineage, HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,
+        MvPartitionTransformContract, MvSchemaContract, OutputColumnLineage, OutputContract,
+        TargetContract, TargetVisibleColumn,
+    };
+
+    fn count_schema_contract_with_region_partition() -> MvSchemaContract {
+        MvSchemaContract {
+            contract_version: 1,
+            base: BaseContract {
+                table_fqn: "ice.sales.orders".to_string(),
+                table_uuid: "base-uuid".to_string(),
+                alias_at_create: None,
+                schema_id_at_create: 0,
+                schema_at_create: BaseSchemaSnapshot {
+                    fields: vec![BaseFieldRecord {
+                        field_id: 1,
+                        name_at_create: "region".to_string(),
+                        type_signature: "string".to_string(),
+                        required: true,
+                    }],
+                },
+            },
+            bases: Vec::new(),
+            output: OutputContract {
+                columns: vec![
+                    OutputColumnLineage {
+                        expression: ExpressionLineage {
+                            kind: ExpressionKind::Column,
+                            referenced_base_field_ids: vec![1],
+                            referenced_base_fields: Vec::new(),
+                        },
+                    },
+                    OutputColumnLineage {
+                        expression: ExpressionLineage {
+                            kind: ExpressionKind::Column,
+                            referenced_base_field_ids: Vec::new(),
+                            referenced_base_fields: Vec::new(),
+                        },
+                    },
+                ],
+                filter: None,
+            },
+            join: None,
+            aggregate: None,
+            target: TargetContract {
+                table_fqn: "ice.analytics.mv_orders".to_string(),
+                table_uuid: "target-uuid".to_string(),
+                schema_id_at_create: 0,
+                visible_columns: vec![
+                    TargetVisibleColumn {
+                        output_name: "region".to_string(),
+                        target_field_id: 11,
+                        type_signature: "string".to_string(),
+                        nullable: true,
+                    },
+                    TargetVisibleColumn {
+                        output_name: "c".to_string(),
+                        target_field_id: 12,
+                        type_signature: "bigint".to_string(),
+                        nullable: false,
+                    },
+                ],
+                hidden_apply_key: HiddenApplyKeyContract {
+                    column_name: "__row_id__".to_string(),
+                    target_field_id: 10,
+                    source: ApplyKeySource::GroupRowId,
+                },
+                partition: Some(MvPartitionContract {
+                    target_spec_id: 7,
+                    fields: vec![MvPartitionFieldContract {
+                        partition_field_id: 100,
+                        partition_field_name: "region".to_string(),
+                        source_target_field_id: 11,
+                        source_column_name: "region".to_string(),
+                        transform: MvPartitionTransformContract::Identity,
+                    }],
+                }),
+            },
+        }
+    }
+
+    /// Build a minimal in-memory Iceberg table that matches the aggregate
+    /// physical schema (row_id, region, c, __agg_state_c) with identity
+    /// partitioning on `region`. No data files are written; the table is empty.
+    /// Returns `(Table, Arc<dyn Catalog>)` — the catalog must be kept alive.
+    fn build_memory_iceberg_partitioned_aggregate_target()
+    -> (iceberg::table::Table, std::sync::Arc<dyn iceberg::Catalog>) {
+        use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+        use iceberg::spec::{
+            FormatVersion, NestedField, PrimitiveType, Schema as IcebergSchema, Transform, Type,
+            UnboundPartitionSpec,
+        };
+        use iceberg::{CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
+        use std::collections::HashMap;
+        use uuid::Uuid;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let warehouse = format!("memory://test-warehouse-{}", Uuid::new_v4());
+            let catalog: std::sync::Arc<dyn iceberg::Catalog> = std::sync::Arc::new(
+                MemoryCatalogBuilder::default()
+                    .load(
+                        "memory",
+                        HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse)]),
+                    )
+                    .await
+                    .expect("MemoryCatalog::load"),
+            );
+
+            let namespace = NamespaceIdent::new("db".to_string());
+            catalog
+                .create_namespace(&namespace, HashMap::new())
+                .await
+                .expect("create_namespace");
+
+            // Schema: __row_id__ (Utf8/String required), region (String optional),
+            //         c (Long required), __agg_state_c (Long required).
+            // Field IDs chosen to match the aggregate layout contract.
+            let schema = IcebergSchema::builder()
+                .with_fields(vec![
+                    NestedField::required(10, "__row_id__", Type::Primitive(PrimitiveType::String))
+                        .into(),
+                    NestedField::optional(11, "region", Type::Primitive(PrimitiveType::String))
+                        .into(),
+                    NestedField::required(12, "c", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::required(
+                        13,
+                        "__agg_state_c",
+                        Type::Primitive(PrimitiveType::Long),
+                    )
+                    .into(),
+                ])
+                .build()
+                .expect("build schema");
+
+            // Partition spec: identity(region) — source field_id=11.
+            let partition_spec = UnboundPartitionSpec::builder()
+                .add_partition_field(11, "region", Transform::Identity)
+                .expect("add partition field")
+                .build();
+
+            let table_ident = TableIdent::new(namespace.clone(), "mv_agg_target".to_string());
+            catalog
+                .create_table(
+                    &namespace,
+                    TableCreation::builder()
+                        .name("mv_agg_target".to_string())
+                        .schema(schema)
+                        .partition_spec(partition_spec)
+                        .format_version(FormatVersion::V2)
+                        .build(),
+                )
+                .await
+                .expect("create_table");
+
+            let table = catalog.load_table(&table_ident).await.expect("load_table");
+            (table, catalog)
+        })
+    }
+
+    /// Build a partitioned aggregate target seeded with two data files:
+    ///   - one row in `region=a`, row_id = row_ids[0]
+    ///   - one row in `region=b`, row_id = row_ids[1]
+    ///
+    /// Returns `(Table, Vec<String>, Arc<dyn Catalog>)`. The catalog must be
+    /// kept alive for the duration of the test.
+    fn build_memory_iceberg_partitioned_aggregate_target_with_rows() -> (
+        iceberg::table::Table,
+        Vec<String>,
+        std::sync::Arc<dyn iceberg::Catalog>,
+    ) {
+        use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+        use iceberg::spec::{
+            FormatVersion, NestedField, PrimitiveType, Schema as IcebergSchema, Transform, Type,
+            UnboundPartitionSpec,
+        };
+        use iceberg::transaction::{ApplyTransactionAction, Transaction};
+        use iceberg::{CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
+        use std::collections::HashMap;
+        use uuid::Uuid;
+
+        let row_id_a = encoded_utf8_group_row_id("a");
+        let row_id_b = encoded_utf8_group_row_id("b");
+        let row_ids = vec![row_id_a.clone(), row_id_b.clone()];
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (table, catalog) = rt.block_on(async {
+            let warehouse = format!("memory://test-warehouse-{}", Uuid::new_v4());
+            let catalog: std::sync::Arc<dyn iceberg::Catalog> = std::sync::Arc::new(
+                MemoryCatalogBuilder::default()
+                    .load(
+                        "memory",
+                        HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse)]),
+                    )
+                    .await
+                    .expect("MemoryCatalog::load"),
+            );
+
+            let namespace = NamespaceIdent::new("db".to_string());
+            catalog
+                .create_namespace(&namespace, HashMap::new())
+                .await
+                .expect("create_namespace");
+
+            let schema = IcebergSchema::builder()
+                .with_fields(vec![
+                    NestedField::required(10, "__row_id__", Type::Primitive(PrimitiveType::String))
+                        .into(),
+                    NestedField::optional(11, "region", Type::Primitive(PrimitiveType::String))
+                        .into(),
+                    NestedField::required(12, "c", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::required(
+                        13,
+                        "__agg_state_c",
+                        Type::Primitive(PrimitiveType::Long),
+                    )
+                    .into(),
+                ])
+                .build()
+                .expect("build schema");
+
+            let partition_spec = UnboundPartitionSpec::builder()
+                .add_partition_field(11, "region", Transform::Identity)
+                .expect("add partition field")
+                .build();
+
+            let table_ident = TableIdent::new(namespace.clone(), "mv_agg_target".to_string());
+            let table = catalog
+                .create_table(
+                    &namespace,
+                    TableCreation::builder()
+                        .name("mv_agg_target".to_string())
+                        .schema(schema)
+                        .partition_spec(partition_spec)
+                        .format_version(FormatVersion::V2)
+                        .build(),
+                )
+                .await
+                .expect("create_table");
+
+            // Write region=a batch (row_id_a) and region=b batch (row_id_b)
+            // as two separate data files through the data_writer path.
+            let batch_a = count_physical_batch(&[(&row_id_a, "a", 1, 1)]);
+            let batch_b = count_physical_batch(&[(&row_id_b, "b", 1, 1)]);
+            let data_files =
+                crate::connector::iceberg::data_writer::write_record_batches_as_data_files(
+                    &table,
+                    vec![batch_a, batch_b],
+                )
+                .await
+                .expect("write data files");
+            assert_eq!(data_files.len(), 2, "expected one data file per partition");
+
+            // Commit via fast_append transaction.
+            let tx = Transaction::new(&table);
+            let action = tx
+                .fast_append()
+                .add_data_files(data_files)
+                .set_commit_uuid(Uuid::new_v4());
+            let tx = action.apply(tx).expect("fast_append apply");
+            let _table_after: iceberg::table::Table = tx
+                .commit(catalog.as_ref())
+                .await
+                .expect("fast_append commit");
+
+            let refreshed = catalog
+                .load_table(&table_ident)
+                .await
+                .expect("reload table");
+            (refreshed, catalog)
+        });
+
+        (table, row_ids, catalog)
+    }
+
+    #[test]
+    fn empty_touched_row_ids_short_circuits() {
+        let layout = test_count_layout();
+        let contract = count_schema_contract_with_region_partition();
+        let (target_table, _catalog) = build_memory_iceberg_partitioned_aggregate_target();
+        let touched: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let filter = TargetPartitionFilter::None;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (chunks, stats) = rt
+            .block_on(super::load_touched_aggregate_target_state_async(
+                &target_table,
+                &layout,
+                &contract,
+                &touched,
+                &filter,
+            ))
+            .expect("lookup");
+        assert!(chunks.is_empty());
+        assert_eq!(stats.planned_file_count, 0);
+        assert_eq!(stats.pruned_file_count, 0);
+        assert_eq!(stats.scanned_row_count, 0);
+        assert_eq!(stats.matched_row_count, 0);
+    }
+
+    #[test]
+    fn allow_list_prunes_other_partitions_and_row_id_filters_remaining_rows() {
+        let layout = test_count_layout();
+        let contract = count_schema_contract_with_region_partition();
+        let (target_table, row_ids, _catalog) =
+            build_memory_iceberg_partitioned_aggregate_target_with_rows();
+        let mut touched = std::collections::BTreeSet::new();
+        touched.insert(row_ids[0].clone());
+        let mut allow = std::collections::BTreeSet::new();
+        allow.insert(MvPartitionKey::new(
+            7,
+            vec![MvPartitionKeyField::new(
+                "region".to_string(),
+                MvPartitionValue::String("a".to_string()),
+            )],
+        ));
+        let filter = TargetPartitionFilter::AllowList(allow);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (chunks, stats) = rt
+            .block_on(super::load_touched_aggregate_target_state_async(
+                &target_table,
+                &layout,
+                &contract,
+                &touched,
+                &filter,
+            ))
+            .expect("lookup");
+        let returned_row_ids: Vec<_> = chunks
+            .iter()
+            .flat_map(|chunk| {
+                let col = chunk
+                    .batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .expect("row id");
+                (0..col.len()).map(move |row| col.value(row).to_string())
+            })
+            .collect();
+        assert_eq!(returned_row_ids, vec![row_ids[0].clone()]);
+        assert_eq!(stats.pruned_file_count, 1);
+        assert!(stats.planned_file_count >= 2, "stats={stats:?}");
+        assert_eq!(stats.matched_row_count, 1);
+    }
+
+    #[test]
+    fn empty_allow_list_with_non_empty_touched_returns_err() {
+        let layout = test_count_layout();
+        let contract = count_schema_contract_with_region_partition();
+        let (target_table, row_ids, _catalog) =
+            build_memory_iceberg_partitioned_aggregate_target_with_rows();
+        let mut touched = std::collections::BTreeSet::new();
+        touched.insert(row_ids[0].clone());
+        let filter = TargetPartitionFilter::AllowList(std::collections::BTreeSet::new());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = rt
+            .block_on(super::load_touched_aggregate_target_state_async(
+                &target_table,
+                &layout,
+                &contract,
+                &touched,
+                &filter,
+            ))
+            .expect_err("lookup should fail fast");
+        assert!(
+            err.contains("empty partition allow-list with non-empty touched groups"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn none_filter_keeps_all_partitions_and_still_filters_by_row_id() {
+        let layout = test_count_layout();
+        let contract = count_schema_contract_with_region_partition();
+        let (target_table, row_ids, _catalog) =
+            build_memory_iceberg_partitioned_aggregate_target_with_rows();
+        let mut touched = std::collections::BTreeSet::new();
+        touched.insert(row_ids[1].clone());
+        let filter = TargetPartitionFilter::None;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (chunks, stats) = rt
+            .block_on(super::load_touched_aggregate_target_state_async(
+                &target_table,
+                &layout,
+                &contract,
+                &touched,
+                &filter,
+            ))
+            .expect("lookup");
+        let returned_row_ids: Vec<_> = chunks
+            .iter()
+            .flat_map(|chunk| {
+                let col = chunk
+                    .batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .expect("row id");
+                (0..col.len()).map(move |row| col.value(row).to_string())
+            })
+            .collect();
+        assert_eq!(returned_row_ids, vec![row_ids[1].clone()]);
+        assert_eq!(stats.pruned_file_count, stats.planned_file_count);
+        assert_eq!(stats.matched_row_count, 1);
     }
 
     #[test]

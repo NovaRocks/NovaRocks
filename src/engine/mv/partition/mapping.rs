@@ -107,6 +107,24 @@ pub(crate) fn map_file_partition_to_mv_key(
     )))
 }
 
+/// Convert a single `ChangePartitionValue` to an `MvPartitionValue`,
+/// returning an error string describing the file context when the value is
+/// `Unsupported`. Used by callers that bypass `map_file_partition_to_mv_key` —
+/// notably the iceberg MV target locator, which derives the key field-by-field
+/// rather than through the schema contract.
+pub(crate) fn change_partition_value_to_mv_value(
+    file_path: &str,
+    value: &ChangePartitionValue,
+) -> Result<MvPartitionValue, String> {
+    match value {
+        ChangePartitionValue::Primitive(v) => Ok(MvPartitionValue::String(v.clone())),
+        ChangePartitionValue::Null => Ok(MvPartitionValue::Null),
+        ChangePartitionValue::Unsupported(reason) => Err(format!(
+            "iceberg file `{file_path}` has unsupported partition value: {reason}"
+        )),
+    }
+}
+
 /// Maps a contract transform to the manifest text produced by
 /// `crate::connector::iceberg::changes::change_partition_transform_name`,
 /// which uses `{:?}` (Rust Debug) on `iceberg::spec::Transform` and lowercases
@@ -360,9 +378,8 @@ mod tests {
 
     #[test]
     fn rejects_truncate_transform_width_mismatch() {
-        let contract = contract_with_partition(MvPartitionTransformContract::Truncate {
-            width: 16,
-        });
+        let contract =
+            contract_with_partition(MvPartitionTransformContract::Truncate { width: 16 });
         let err = map_file_partition_to_mv_key(
             &contract,
             7,

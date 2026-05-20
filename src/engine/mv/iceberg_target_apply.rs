@@ -522,25 +522,14 @@ async fn locate_target_rows_by_apply_key_impl(
             })?;
             let mut fields = Vec::with_capacity(values.len());
             for value in &values {
-                let mv_value = match &value.value {
-                    crate::connector::iceberg::changes::ChangePartitionValue::Primitive(v) => {
-                        crate::engine::mv::partition::MvPartitionValue::String(v.clone())
-                    }
-                    crate::connector::iceberg::changes::ChangePartitionValue::Null => {
-                        crate::engine::mv::partition::MvPartitionValue::Null
-                    }
-                    crate::connector::iceberg::changes::ChangePartitionValue::Unsupported(
-                        reason,
-                    ) => {
-                        return Err(iceberg::Error::new(
-                            iceberg::ErrorKind::DataInvalid,
-                            format!(
-                                "iceberg MV target locator: file `{}` has unsupported partition value: {reason}",
-                                task.data_file_path
-                            ),
-                        ));
-                    }
-                };
+                let mv_value =
+                    crate::engine::mv::partition::mapping::change_partition_value_to_mv_value(
+                        &task.data_file_path,
+                        &value.value,
+                    )
+                    .map_err(|e| {
+                        iceberg::Error::new(iceberg::ErrorKind::DataInvalid, e)
+                    })?;
                 fields.push(crate::engine::mv::partition::MvPartitionKeyField::new(
                     value.field_name.clone(),
                     mv_value,
@@ -607,10 +596,10 @@ pub(crate) async fn locate_target_rows_by_apply_key_string(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::mv::partition::TargetPartitionFilter;
     use arrow::array::{ArrayRef, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use crate::engine::mv::partition::TargetPartitionFilter;
     use iceberg::spec::Struct;
     use std::sync::Arc;
 
@@ -672,10 +661,7 @@ mod tests {
                 .await
                 .expect("create_table");
 
-            catalog
-                .load_table(&table_ident)
-                .await
-                .expect("load_table")
+            catalog.load_table(&table_ident).await.expect("load_table")
         })
     }
 
