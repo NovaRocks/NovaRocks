@@ -282,8 +282,38 @@ fn output_properties(op: &Operator) -> PhysicalPropertySet {
         | Operator::PhysicalCTEProduce(_)
         | Operator::PhysicalRepeat(_) => PhysicalPropertySet::any(),
 
-        // Window: passthrough child.
-        Operator::PhysicalWindow(_) => PhysicalPropertySet::any(),
+        // Window: input must be `Hash(partition_by)` (enforced by
+        // `derive_required_properties`), and Window doesn't shuffle —
+        // it merely scans through and stamps the analytic column.
+        // So the output stays partitioned on the same columns, which
+        // lets downstream operators (a second Window with the same
+        // PARTITION BY, an aggregate on a subset of the keys, the
+        // SHUFFLE side of a join keyed on a subset) reuse the
+        // distribution via `satisfyContainAll` instead of forcing
+        // another HASH EXCHANGE.
+        Operator::PhysicalWindow(w) => {
+            let mut partition_cols = Vec::new();
+            let mut all_columns = true;
+            for we in &w.window_exprs {
+                for pbe in &we.partition_by {
+                    if let Some(col) = typed_expr_to_column_ref(pbe) {
+                        if !partition_cols.contains(&col) {
+                            partition_cols.push(col);
+                        }
+                    } else {
+                        all_columns = false;
+                    }
+                }
+            }
+            if !all_columns || partition_cols.is_empty() {
+                PhysicalPropertySet::any()
+            } else {
+                PhysicalPropertySet {
+                    distribution: DistributionSpec::HashPartitioned(partition_cols),
+                    ordering: OrderingSpec::Any,
+                }
+            }
+        }
 
         // Hash join (Shuffle): output is Hash(left_eq_keys).
         Operator::PhysicalHashJoin(j) => match j.distribution {
@@ -892,6 +922,67 @@ mod tests {
         let props = output_properties(&op);
         assert_eq!(props.distribution, DistributionSpec::Gather);
         assert!(matches!(props.ordering, OrderingSpec::Required(_)));
+    }
+
+    #[test]
+    fn output_properties_window_propagates_partition_distribution() {
+        use crate::sql::analysis::{ExprKind, TypedExpr};
+        use crate::sql::planner::plan::WindowExpr;
+
+        let col_c0 = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                qualifier: None,
+                column: "c0".into(),
+            },
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+        };
+        let window_expr = WindowExpr {
+            name: "max".into(),
+            args: vec![],
+            partition_by: vec![col_c0.clone()],
+            order_by: vec![],
+            window_frame: None,
+            ignore_nulls: false,
+            distinct: false,
+            output_name: "win".into(),
+            result_type: arrow::datatypes::DataType::Int64,
+        };
+        let op = Operator::PhysicalWindow(PhysicalWindowOp {
+            window_exprs: vec![window_expr],
+            output_columns: vec![],
+        });
+        let props = output_properties(&op);
+        match &props.distribution {
+            DistributionSpec::HashPartitioned(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert_eq!(cols[0].column, "c0");
+            }
+            other => panic!("expected HashPartitioned([c0]), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn output_properties_window_without_partition_by_is_any() {
+        use crate::sql::planner::plan::WindowExpr;
+
+        let window_expr = WindowExpr {
+            name: "row_number".into(),
+            args: vec![],
+            partition_by: vec![],
+            order_by: vec![],
+            window_frame: None,
+            ignore_nulls: false,
+            distinct: false,
+            output_name: "win".into(),
+            result_type: arrow::datatypes::DataType::Int64,
+        };
+        let op = Operator::PhysicalWindow(PhysicalWindowOp {
+            window_exprs: vec![window_expr],
+            output_columns: vec![],
+        });
+        let props = output_properties(&op);
+        assert_eq!(props.distribution, DistributionSpec::Any);
     }
 
     #[test]
