@@ -15,10 +15,14 @@ use crate::exec::chunk::Chunk;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AggregateStateLookupStats {
-    pub planned_file_count: usize,
-    pub pruned_file_count: usize,
-    pub scanned_row_count: usize,
-    pub matched_row_count: usize,
+    pub(crate) planned_file_count: usize,
+    /// Number of files that passed the partition filter (i.e., were kept and
+    /// scanned). `None`-filter runs keep every file; `AllowList` runs keep
+    /// only matching ones. Compare against `planned_file_count` to see how
+    /// many files were pruned away.
+    pub(crate) kept_file_count: usize,
+    pub(crate) scanned_row_count: usize,
+    pub(crate) matched_row_count: usize,
 }
 
 pub(crate) struct IcebergAggregateMergeResult {
@@ -195,6 +199,17 @@ pub(crate) async fn load_touched_aggregate_target_state_async(
         );
     }
 
+    if matches!(
+        partition_filter,
+        crate::engine::mv::partition::TargetPartitionFilter::AllowList(_)
+    ) && schema_contract.target.partition.is_none()
+    {
+        return Err(
+            "aggregate target lookup: AllowList partition filter passed but schema contract is unpartitioned"
+                .to_string(),
+        );
+    }
+
     let select_cols = layout
         .physical_columns
         .iter()
@@ -274,7 +289,7 @@ pub(crate) async fn load_touched_aggregate_target_state_async(
                 continue;
             }
         }
-        stats.pruned_file_count += 1;
+        stats.kept_file_count += 1;
         kept_tasks.push(task);
     }
 
@@ -1126,7 +1141,7 @@ mod tests {
             .expect("lookup");
         assert!(chunks.is_empty());
         assert_eq!(stats.planned_file_count, 0);
-        assert_eq!(stats.pruned_file_count, 0);
+        assert_eq!(stats.kept_file_count, 0);
         assert_eq!(stats.scanned_row_count, 0);
         assert_eq!(stats.matched_row_count, 0);
     }
@@ -1171,7 +1186,7 @@ mod tests {
             })
             .collect();
         assert_eq!(returned_row_ids, vec![row_ids[0].clone()]);
-        assert_eq!(stats.pruned_file_count, 1);
+        assert_eq!(stats.kept_file_count, 1);
         assert!(stats.planned_file_count >= 2, "stats={stats:?}");
         assert_eq!(stats.matched_row_count, 1);
     }
@@ -1199,6 +1214,37 @@ mod tests {
             err.contains("empty partition allow-list with non-empty touched groups"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn allow_list_with_unpartitioned_contract_returns_err() {
+        let layout = test_count_layout();
+        let mut contract = count_schema_contract_with_region_partition();
+        contract.target.partition = None;
+        let (target_table, row_ids, _resources) =
+            build_memory_iceberg_partitioned_aggregate_target_with_rows();
+        let mut touched = std::collections::BTreeSet::new();
+        touched.insert(row_ids[0].clone());
+        let mut allow = std::collections::BTreeSet::new();
+        allow.insert(crate::engine::mv::partition::MvPartitionKey::new(
+            7,
+            vec![crate::engine::mv::partition::MvPartitionKeyField::new(
+                "region".to_string(),
+                crate::engine::mv::partition::MvPartitionValue::String("a".to_string()),
+            )],
+        ));
+        let filter = crate::engine::mv::partition::TargetPartitionFilter::AllowList(allow);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = rt
+            .block_on(super::load_touched_aggregate_target_state_async(
+                &target_table,
+                &layout,
+                &contract,
+                &touched,
+                &filter,
+            ))
+            .expect_err("lookup should fail fast on unpartitioned contract + AllowList");
+        assert!(err.contains("schema contract is unpartitioned"), "{err}");
     }
 
     #[test]
@@ -1233,7 +1279,7 @@ mod tests {
             })
             .collect();
         assert_eq!(returned_row_ids, vec![row_ids[1].clone()]);
-        assert_eq!(stats.pruned_file_count, stats.planned_file_count);
+        assert_eq!(stats.kept_file_count, stats.planned_file_count);
         assert_eq!(stats.matched_row_count, 1);
     }
 

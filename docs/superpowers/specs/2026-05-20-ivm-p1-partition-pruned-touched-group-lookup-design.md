@@ -201,7 +201,7 @@ PR2 仅支持 identity。本任务在 mapping 层面同样扩展到完整一类 
 ```text
 pub(crate) struct AggregateStateLookupStats {
     pub(crate) planned_file_count: usize,
-    pub(crate) pruned_file_count: usize,
+    pub(crate) kept_file_count: usize,
     pub(crate) scanned_row_count: usize,
     pub(crate) matched_row_count: usize,
 }
@@ -402,7 +402,7 @@ partition_filter            // "none" | "allow_list"
 affected_partition_count    // usize
 touched_group_count         // usize
 planned_file_count          // from AggregateStateLookupStats
-pruned_file_count           // 实际进入 scan 的 file 数
+kept_file_count             // files that survived partition filtering and were actually scanned
 scanned_target_row_count    // batch 总行数（pre row-id filter）
 matched_target_row_count    // post row-id filter 行数
 delete_row_count            // merge.delete_row_ids.len()
