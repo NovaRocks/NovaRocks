@@ -1877,6 +1877,16 @@ fn incremental_refresh_iceberg_aggregate_mv(
     )
 }
 
+fn target_fqn_string(target: &IcebergMvTarget) -> String {
+    format!("{}.{}.{}", target.catalog, target.namespace, target.table)
+}
+
+fn wrap_aggregate_apply_error(target_fqn: &str, mv_id: i64, cause: String) -> String {
+    format!(
+        "iceberg aggregate MV apply failed (target={target_fqn}, mv_id={mv_id}): {cause}"
+    )
+}
+
 fn build_aggregate_target_partition_filter(
     layout: &crate::connector::starrocks::managed::mv_agg_state::AggregateMvLayout,
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
@@ -1968,8 +1978,12 @@ fn apply_iceberg_aggregate_delta_chunks(
         );
     }
 
+    let target_fqn = target_fqn_string(target);
+    let mv_id = mv_definition.mv_id;
+
     let (partition_filter, touched_row_ids) =
-        build_aggregate_target_partition_filter(layout, schema_contract, delta_chunks)?;
+        build_aggregate_target_partition_filter(layout, schema_contract, delta_chunks)
+            .map_err(|e| wrap_aggregate_apply_error(&target_fqn, mv_id, e))?;
     let (old_chunks, _lookup_stats) =
         crate::engine::mv::iceberg_aggregate_state::load_touched_aggregate_target_state(
             target_table,
@@ -1977,7 +1991,8 @@ fn apply_iceberg_aggregate_delta_chunks(
             schema_contract,
             &touched_row_ids,
             &partition_filter,
-        )?;
+        )
+        .map_err(|e| wrap_aggregate_apply_error(&target_fqn, mv_id, e))?;
     let old_touched_rows = old_chunks
         .iter()
         .map(|c| c.batch.num_rows() as i64)
@@ -11172,6 +11187,32 @@ mod tests {
         let err =
             build_aggregate_target_partition_filter(&layout, &contract, &[chunk]).unwrap_err();
         assert!(err.contains("region"), "{err}");
+        assert!(err.contains("void"), "{err}");
+    }
+
+    #[test]
+    fn aggregate_apply_error_message_includes_mv_id_and_target_fqn() {
+        let layout = aggregate_apply_test_helpers::count_layout("region");
+        let contract = aggregate_apply_test_helpers::count_contract_with_void_partition(
+            "region", 11,
+        );
+        let chunk = aggregate_apply_test_helpers::batch_with_group_key(
+            "region",
+            arrow::datatypes::DataType::Utf8,
+            std::sync::Arc::new(arrow::array::StringArray::from(vec![Some("a")]))
+                as arrow::array::ArrayRef,
+        );
+        let target_fqn = "ice.analytics.mv_orders";
+        let mv_id = 4242i64;
+        let err = wrap_aggregate_apply_error(
+            target_fqn,
+            mv_id,
+            build_aggregate_target_partition_filter(&layout, &contract, &[chunk])
+                .err()
+                .unwrap(),
+        );
+        assert!(err.contains("mv_id=4242"), "{err}");
+        assert!(err.contains(target_fqn), "{err}");
         assert!(err.contains("void"), "{err}");
     }
 }
