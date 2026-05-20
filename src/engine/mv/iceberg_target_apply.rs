@@ -1105,8 +1105,7 @@ mod tests {
         use crate::engine::mv::partition::{MvPartitionKey, MvPartitionKeyField, MvPartitionValue};
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let (target_table, file_paths, _catalog) =
-            build_partitioned_apply_key_target_with_rows();
+        let (target_table, file_paths, _catalog) = build_partitioned_apply_key_target_with_rows();
 
         // The contract's target_spec_id is 7 — intentionally different from the
         // table's raw default spec_id (0) to reproduce the production mismatch.
