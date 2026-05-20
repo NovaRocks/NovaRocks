@@ -107,6 +107,12 @@ pub(crate) fn map_file_partition_to_mv_key(
     )))
 }
 
+/// Maps a contract transform to the manifest text produced by
+/// `crate::connector::iceberg::changes::change_partition_transform_name`,
+/// which uses `{:?}` (Rust Debug) on `iceberg::spec::Transform` and lowercases
+/// the result. This gives `bucket(8)` / `truncate(16)` with round parens,
+/// NOT the `bucket[8]` form from Iceberg's `Display` impl. Returns `None` for
+/// `Void` — void partitions carry no useful pruning information.
 fn contract_transform_manifest_text(transform: &MvPartitionTransformContract) -> Option<String> {
     match transform {
         MvPartitionTransformContract::Identity => Some("identity".to_string()),
@@ -123,18 +129,7 @@ fn contract_transform_manifest_text(transform: &MvPartitionTransformContract) ->
 }
 
 fn partition_transform_name(transform: &MvPartitionTransformContract) -> String {
-    match transform {
-        MvPartitionTransformContract::Identity => "identity".to_string(),
-        MvPartitionTransformContract::Year => "year".to_string(),
-        MvPartitionTransformContract::Month => "month".to_string(),
-        MvPartitionTransformContract::Day => "day".to_string(),
-        MvPartitionTransformContract::Hour => "hour".to_string(),
-        MvPartitionTransformContract::Bucket { num_buckets } => {
-            format!("bucket({num_buckets})")
-        }
-        MvPartitionTransformContract::Truncate { width } => format!("truncate({width})"),
-        MvPartitionTransformContract::Void => "Void".to_string(),
-    }
+    contract_transform_manifest_text(transform).unwrap_or_else(|| "Void".to_string())
 }
 
 #[cfg(test)]
@@ -361,6 +356,25 @@ mod tests {
         assert!(err.contains("file metadata transform"), "{err}");
         assert!(err.contains("bucket(16)"), "{err}");
         assert!(err.contains("bucket(8)"), "{err}");
+    }
+
+    #[test]
+    fn rejects_truncate_transform_width_mismatch() {
+        let contract = contract_with_partition(MvPartitionTransformContract::Truncate {
+            width: 16,
+        });
+        let err = map_file_partition_to_mv_key(
+            &contract,
+            7,
+            &[partition_value(
+                "truncate(32)",
+                ChangePartitionValue::Primitive("ho".to_string()),
+            )],
+        )
+        .unwrap_err();
+        assert!(err.contains("file metadata transform"), "{err}");
+        assert!(err.contains("truncate(32)"), "{err}");
+        assert!(err.contains("truncate(16)"), "{err}");
     }
 
     #[test]
