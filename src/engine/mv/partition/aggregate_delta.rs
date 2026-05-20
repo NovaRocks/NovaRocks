@@ -112,6 +112,26 @@ pub(crate) fn derive_from_aggregate_delta(
     unimplemented!("derive_from_aggregate_delta: implementation added in Task 2")
 }
 
+fn contract_transform_to_iceberg(
+    transform: &crate::meta::repository::mv_contract::MvPartitionTransformContract,
+    field: &str,
+) -> Result<iceberg::spec::Transform, AffectedPartitionError> {
+    use crate::meta::repository::mv_contract::MvPartitionTransformContract as C;
+    match transform {
+        C::Identity => Ok(iceberg::spec::Transform::Identity),
+        C::Year => Ok(iceberg::spec::Transform::Year),
+        C::Month => Ok(iceberg::spec::Transform::Month),
+        C::Day => Ok(iceberg::spec::Transform::Day),
+        C::Hour => Ok(iceberg::spec::Transform::Hour),
+        C::Bucket { num_buckets } => Ok(iceberg::spec::Transform::Bucket(*num_buckets)),
+        C::Truncate { width } => Ok(iceberg::spec::Transform::Truncate(*width)),
+        C::Void => Err(AffectedPartitionError::TransformUnsupported {
+            field: field.to_string(),
+            transform: "void".to_string(),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,5 +178,44 @@ mod tests {
     fn affected_aggregate_target_partitions_unpartitioned_has_no_partitions() {
         let result = AffectedAggregateTargetPartitions::Unpartitioned;
         assert!(result.partitions().is_none());
+    }
+
+    use crate::meta::repository::mv_contract::MvPartitionTransformContract;
+
+    #[test]
+    fn contract_transform_to_iceberg_handles_all_first_class_transforms() {
+        for (input, expect) in [
+            (MvPartitionTransformContract::Identity, iceberg::spec::Transform::Identity),
+            (MvPartitionTransformContract::Year, iceberg::spec::Transform::Year),
+            (MvPartitionTransformContract::Month, iceberg::spec::Transform::Month),
+            (MvPartitionTransformContract::Day, iceberg::spec::Transform::Day),
+            (MvPartitionTransformContract::Hour, iceberg::spec::Transform::Hour),
+            (
+                MvPartitionTransformContract::Bucket { num_buckets: 8 },
+                iceberg::spec::Transform::Bucket(8),
+            ),
+            (
+                MvPartitionTransformContract::Truncate { width: 16 },
+                iceberg::spec::Transform::Truncate(16),
+            ),
+        ] {
+            let result =
+                contract_transform_to_iceberg(&input, "test_field").expect("transform conversion");
+            assert_eq!(result, expect, "input={input:?}");
+        }
+    }
+
+    #[test]
+    fn contract_transform_to_iceberg_rejects_void() {
+        let err = contract_transform_to_iceberg(
+            &MvPartitionTransformContract::Void,
+            "test_field",
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AffectedPartitionError::TransformUnsupported { ref field, ref transform }
+                if field == "test_field" && transform == "void"
+        ));
     }
 }
