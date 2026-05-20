@@ -1475,6 +1475,24 @@ struct TLookUpNode {
 
 // This is essentially a union of all messages corresponding to subclasses
 // of PlanNode.
+// NovaRocks-only: IVM-A1 Iceberg incremental delta scan source. Carries only
+// lightweight descriptors (catalog/namespace/table strings + from/to
+// snapshot ids). The list of change files and runtime state (delete
+// visibility, first_row_id index, opendal factory) are computed at
+// lower_plan time by `plan_changes` so they never traverse the Thrift
+// wire format.
+struct TIcebergDeltaScanNode {
+  // `namespace` is a C++ reserved keyword and thrift's C++ codegen emits the
+  // field name verbatim (no escaping), so we have to spell it differently
+  // here to keep `--features compat` building. Field id 2 stays the same so
+  // the on-wire encoding is unchanged.
+  1: required string catalog
+  2: required string iceberg_namespace
+  3: required string table
+  4: required i64 from_snapshot_id
+  5: required i64 to_snapshot_id
+}
+
 struct TPlanNode {
   // node id, needed to reassemble tree structure
   1: required Types.TPlanNodeId node_id
@@ -1561,20 +1579,6 @@ struct TPlanNode {
   // NovaRocks-only payloads start at field 1000 to mirror the
   // TPlanNodeType id offset (see enum above).
   1000: optional TIcebergDeltaScanNode iceberg_delta_scan_node;
-}
-
-// NovaRocks-only: IVM-A1 Iceberg incremental delta scan source. Carries only
-// lightweight descriptors (catalog/namespace/table strings + from/to
-// snapshot ids). The list of change files and runtime state (delete
-// visibility, first_row_id index, opendal factory) are computed at
-// lower_plan time by `plan_changes` so they never traverse the Thrift
-// wire format.
-struct TIcebergDeltaScanNode {
-  1: required string catalog
-  2: required string namespace
-  3: required string table
-  4: required i64 from_snapshot_id
-  5: required i64 to_snapshot_id
 }
 
 // A flattened representation of a tree of PlanNodes, obtained by depth-first

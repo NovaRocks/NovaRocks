@@ -73,19 +73,19 @@ pub(crate) fn lower_iceberg_delta_scan_node(
     if payload.from_snapshot_id < 0 {
         return Err(format!(
             "ivm-a1 lower delta-scan (node_id={node_id}, {}.{}.{}): from_snapshot_id must be non-negative, got {}",
-            payload.catalog, payload.namespace, payload.table, payload.from_snapshot_id,
+            payload.catalog, payload.iceberg_namespace, payload.table, payload.from_snapshot_id,
         ));
     }
     if payload.to_snapshot_id < 0 {
         return Err(format!(
             "ivm-a1 lower delta-scan (node_id={node_id}, {}.{}.{}): to_snapshot_id must be non-negative, got {}",
-            payload.catalog, payload.namespace, payload.table, payload.to_snapshot_id,
+            payload.catalog, payload.iceberg_namespace, payload.table, payload.to_snapshot_id,
         ));
     }
 
     let entry = iceberg_catalogs.get(&payload.catalog)?;
     let loaded =
-        crate::connector::iceberg::catalog::load_table(&entry, &payload.namespace, &payload.table)?;
+        crate::connector::iceberg::catalog::load_table(&entry, &payload.iceberg_namespace, &payload.table)?;
 
     // The snapshot interval is (from_snapshot_id, to_snapshot_id] semantically.
     // Lineage validation (to in metadata, from is a descendant ancestor of to)
@@ -100,7 +100,7 @@ pub(crate) fn lower_iceberg_delta_scan_node(
         format!(
             "ivm-a1 lower delta-scan: plan_changes failed for {}.{}.{} from_snapshot={} to_snapshot={}: {e}",
             payload.catalog,
-            payload.namespace,
+            payload.iceberg_namespace,
             payload.table,
             payload.from_snapshot_id,
             payload.to_snapshot_id
@@ -177,7 +177,7 @@ pub(crate) fn lower_iceberg_delta_scan_node(
     let exec_node = IcebergDeltaScanNode {
         base_table_ident: BaseTableIdent {
             catalog: payload.catalog.clone(),
-            namespace: payload.namespace.clone(),
+            namespace: payload.iceberg_namespace.clone(),
             table: payload.table.clone(),
         },
         from_snapshot_id: payload.from_snapshot_id,

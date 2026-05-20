@@ -97,13 +97,13 @@ fn build_iceberg_delta_scan_node(
         Some(conjuncts)
     };
     node.compact_data = true;
-    node.iceberg_delta_scan_node = Some(Box::new(plan_nodes::TIcebergDeltaScanNode {
+    node.iceberg_delta_scan_node = Some(plan_nodes::TIcebergDeltaScanNode {
         catalog,
-        namespace,
+        iceberg_namespace: namespace,
         table,
         from_snapshot_id,
         to_snapshot_id,
-    }));
+    });
     node
 }
 
