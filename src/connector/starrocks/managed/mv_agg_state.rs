@@ -145,10 +145,7 @@ pub(crate) fn build_aggregate_mv_layout(
         let count_star = matches!(aggregate.input, AggregateInput::Star);
 
         match aggregate.function {
-            AggregateFunctionKind::Count
-            | AggregateFunctionKind::Sum
-            | AggregateFunctionKind::Min
-            | AggregateFunctionKind::Max => {
+            AggregateFunctionKind::Count | AggregateFunctionKind::Sum => {
                 let state_name = format!("{}{}", AGG_STATE_PREFIX, sanitized);
                 validate_state_column_type(
                     aggregate.function,
@@ -168,6 +165,63 @@ pub(crate) fn build_aggregate_mv_layout(
                     data_type: visible.data_type.clone(),
                     sql_type: visible_sql_type,
                     nullable: visible.nullable,
+                    visible_source_index,
+                    aggregate_index,
+                    function: aggregate.function,
+                    state_role: AggregateStateRole::Single,
+                    count_star,
+                });
+            }
+            AggregateFunctionKind::Min | AggregateFunctionKind::Max => {
+                // IVM-P5 (Phase 2): MIN/MAX state is a value-count detail map
+                // (`Map<input_type, Int64>`). Map keys are the distinct values
+                // observed in the group; values are the per-key occurrence
+                // counts. Downstream phases (rewriter / merge / derive) will
+                // consume this shape; the DDL gate in
+                // `iceberg_refresh::reject_min_max_for_iceberg_target_aggregate`
+                // still rejects MIN/MAX, so this is a schema-only change.
+                let state_name = format!("{}{}", AGG_STATE_PREFIX, sanitized);
+                let key_arrow_type = visible.data_type.clone();
+                let key_sql_type = mv_ddl::arrow_data_type_to_sql_type(&key_arrow_type)?;
+                let entries_struct = DataType::Struct(arrow::datatypes::Fields::from(vec![
+                    Arc::new(Field::new(
+                        "key",
+                        key_arrow_type,
+                        /* nullable = */ false,
+                    )),
+                    Arc::new(Field::new(
+                        "value",
+                        DataType::Int64,
+                        /* nullable = */ false,
+                    )),
+                ]));
+                let map_arrow_type = DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        entries_struct,
+                        /* nullable = */ false,
+                    )),
+                    /* keys_sorted = */ false,
+                );
+                let map_sql_type = SqlType::Map(Box::new(key_sql_type), Box::new(SqlType::BigInt));
+                validate_state_column_type(
+                    aggregate.function,
+                    AggregateStateRole::Single,
+                    &map_arrow_type,
+                    &state_name,
+                )?;
+                physical_columns.push(managed_physical_column(
+                    state_name.clone(),
+                    map_sql_type.clone(),
+                    /* nullable = */ false,
+                    false,
+                    false,
+                ));
+                state_columns.push(AggregateStateColumn {
+                    name: state_name,
+                    data_type: map_arrow_type,
+                    sql_type: map_sql_type,
+                    nullable: false,
                     visible_source_index,
                     aggregate_index,
                     function: aggregate.function,
@@ -1345,25 +1399,72 @@ fn validate_state_column_type(
             )),
         },
         (AggregateFunctionKind::Min, AggregateStateRole::Single)
-        | (AggregateFunctionKind::Max, AggregateStateRole::Single) => match data_type {
-            DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::Float32
-            | DataType::Float64
-            | DataType::Decimal128(_, _)
-            | DataType::Decimal256(_, _)
-            | DataType::Utf8
-            | DataType::Date32
-            | DataType::Timestamp(_, _) => Ok(()),
-            DataType::Boolean => Err(format!(
-                "MIN/MAX state type is unsupported for column `{state_name}`: Boolean"
-            )),
-            other => Err(format!(
-                "MIN/MAX state type is unsupported for column `{state_name}`: {other:?}"
-            )),
-        },
+        | (AggregateFunctionKind::Max, AggregateStateRole::Single) => {
+            // IVM-P5 (Phase 2): MIN/MAX state is a `Map<input_type, Int64>`
+            // value-count detail map. Reject any other Arrow shape with a
+            // clear error so future schema bugs are loud, not silent.
+            let DataType::Map(entries_field, _keys_sorted) = data_type else {
+                return Err(format!(
+                    "MIN/MAX state type for column `{state_name}` must be Map<K, Int64>, got {data_type:?}"
+                ));
+            };
+            let DataType::Struct(struct_fields) = entries_field.data_type() else {
+                return Err(format!(
+                    "MIN/MAX state map entries type for column `{state_name}` must be Struct, got {:?}",
+                    entries_field.data_type()
+                ));
+            };
+            if struct_fields.len() != 2 {
+                return Err(format!(
+                    "MIN/MAX state map entries struct for column `{state_name}` must have exactly 2 fields, got {}",
+                    struct_fields.len()
+                ));
+            }
+            let value_field = struct_fields
+                .iter()
+                .find(|f| f.name() == "value")
+                .ok_or_else(|| {
+                    format!(
+                        "MIN/MAX state map entries struct for column `{state_name}` is missing `value` field"
+                    )
+                })?;
+            if value_field.data_type() != &DataType::Int64 {
+                return Err(format!(
+                    "MIN/MAX state map value type for column `{state_name}` must be Int64, got {:?}",
+                    value_field.data_type()
+                ));
+            }
+            // Validate the key Arrow type matches the scalar primitives we
+            // accept as MIN/MAX inputs (mirrors the pre-Phase-2 acceptance
+            // list, minus Boolean which AggScalarValue does not support).
+            let key_field = struct_fields
+                .iter()
+                .find(|f| f.name() == "key")
+                .ok_or_else(|| {
+                    format!(
+                        "MIN/MAX state map entries struct for column `{state_name}` is missing `key` field"
+                    )
+                })?;
+            match key_field.data_type() {
+                DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::Float32
+                | DataType::Float64
+                | DataType::Decimal128(_, _)
+                | DataType::Decimal256(_, _)
+                | DataType::Utf8
+                | DataType::Date32
+                | DataType::Timestamp(_, _) => Ok(()),
+                DataType::Boolean => Err(format!(
+                    "MIN/MAX state key type is unsupported for column `{state_name}`: Boolean"
+                )),
+                other => Err(format!(
+                    "MIN/MAX state key type is unsupported for column `{state_name}`: {other:?}"
+                )),
+            }
+        }
         (function, role) => Err(format!(
             "internal: invalid (function, state_role) pair: ({function:?}, {role:?}) for column `{state_name}`"
         )),
@@ -2098,6 +2199,303 @@ mod tests {
         assert!(err.contains("SUM state type is unsupported"), "err={err}");
         assert!(err.contains("__agg_state_s"), "err={err}");
         assert!(err.contains("Float64"), "err={err}");
+    }
+
+    /// Shape: `select k1, min(v1) as m from ice.ns.orders group by k1`
+    fn min_only_shape() -> AggregateMvShape {
+        let shape = classify_incremental_mv_query(&parse_query(
+            "select k1, min(v1) as m from ice.ns.orders group by k1",
+        ))
+        .expect("classify");
+        let IncrementalMvShape::Aggregate(shape) = shape else {
+            panic!("expected aggregate shape");
+        };
+        shape
+    }
+
+    /// Shape: `select k1, max(v1) as m from ice.ns.orders group by k1`
+    fn max_only_shape() -> AggregateMvShape {
+        let shape = classify_incremental_mv_query(&parse_query(
+            "select k1, max(v1) as m from ice.ns.orders group by k1",
+        ))
+        .expect("classify");
+        let IncrementalMvShape::Aggregate(shape) = shape else {
+            panic!("expected aggregate shape");
+        };
+        shape
+    }
+
+    /// Output columns for `min/max(v1) as m group by k1`: [k1: Int64, m: <typ>].
+    fn min_max_output_columns(value_type: DataType) -> Vec<OutputColumn> {
+        vec![
+            OutputColumn {
+                name: "k1".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+            OutputColumn {
+                name: "m".to_string(),
+                data_type: value_type,
+                nullable: true,
+            },
+        ]
+    }
+
+    /// Build the Arrow Map<key_type, Int64> type used by MIN/MAX state.
+    fn expected_min_max_state_arrow_type(key_type: DataType) -> DataType {
+        DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(arrow::datatypes::Fields::from(vec![
+                    Arc::new(Field::new("key", key_type, false)),
+                    Arc::new(Field::new("value", DataType::Int64, false)),
+                ])),
+                false,
+            )),
+            false,
+        )
+    }
+
+    #[test]
+    fn build_layout_min_int64_input_produces_map_state_column() {
+        let shape = min_only_shape();
+        let layout = build_aggregate_mv_layout(&shape, &min_max_output_columns(DataType::Int64))
+            .expect("layout");
+        assert_eq!(layout.state_columns.len(), 2);
+        let state = &layout.state_columns[0];
+        assert_eq!(state.name, "__agg_state_m");
+        assert_eq!(state.function, AggregateFunctionKind::Min);
+        assert_eq!(state.state_role, AggregateStateRole::Single);
+        assert!(!state.nullable);
+        assert!(!state.count_star);
+        assert_eq!(
+            state.data_type,
+            expected_min_max_state_arrow_type(DataType::Int64)
+        );
+        assert_eq!(
+            state.sql_type,
+            SqlType::Map(Box::new(SqlType::BigInt), Box::new(SqlType::BigInt))
+        );
+        // The retraction-count hidden state is the second state column.
+        assert_eq!(
+            layout.state_columns[1].state_role,
+            AggregateStateRole::RetractionCount
+        );
+    }
+
+    #[test]
+    fn build_layout_max_utf8_input_produces_map_state_column() {
+        let shape = max_only_shape();
+        let layout = build_aggregate_mv_layout(&shape, &min_max_output_columns(DataType::Utf8))
+            .expect("layout");
+        let state = &layout.state_columns[0];
+        assert_eq!(state.name, "__agg_state_m");
+        assert_eq!(state.function, AggregateFunctionKind::Max);
+        assert_eq!(state.state_role, AggregateStateRole::Single);
+        assert!(!state.nullable);
+        assert_eq!(
+            state.data_type,
+            expected_min_max_state_arrow_type(DataType::Utf8)
+        );
+        assert_eq!(
+            state.sql_type,
+            SqlType::Map(Box::new(SqlType::String), Box::new(SqlType::BigInt))
+        );
+    }
+
+    #[test]
+    fn build_layout_sum_count_avg_branches_unchanged() {
+        // Regression: SUM/COUNT/AVG state columns remain scalar Int64; no Map
+        // shape leaks in from the Phase-2 MIN/MAX change.
+        let shape = classify_incremental_mv_query(&parse_query(
+            "select k1, sum(v1) as s, count(*) as c, avg(v1) as a from ice.ns.orders group by k1",
+        ))
+        .expect("classify");
+        let IncrementalMvShape::Aggregate(shape) = shape else {
+            panic!("expected aggregate shape");
+        };
+        let columns = vec![
+            OutputColumn {
+                name: "k1".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+            OutputColumn {
+                name: "s".to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+            },
+            OutputColumn {
+                name: "c".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+            OutputColumn {
+                name: "a".to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+            },
+        ];
+        let layout = build_aggregate_mv_layout(&shape, &columns).expect("layout");
+        // Expected state columns (ordering follows shape.aggregates):
+        //   SUM:Single -> Int64
+        //   COUNT(*):Single -> Int64
+        //   AVG:AvgSum -> Int64, AvgCount -> Int64
+        // No RetractionCount hidden state because the shape includes COUNT(*).
+        let state_types: Vec<&DataType> =
+            layout.state_columns.iter().map(|c| &c.data_type).collect();
+        for (idx, dt) in state_types.iter().enumerate() {
+            assert!(
+                !matches!(dt, DataType::Map(..)),
+                "state column {idx} unexpectedly Map: {dt:?}"
+            );
+            assert_eq!(**dt, DataType::Int64, "state column {idx} expected Int64");
+        }
+        // Sanity-check the (function, state_role) ordering: SUM Single,
+        // COUNT(*) Single, AVG AvgSum, AVG AvgCount.
+        let roles: Vec<(AggregateFunctionKind, AggregateStateRole)> = layout
+            .state_columns
+            .iter()
+            .map(|c| (c.function, c.state_role))
+            .collect();
+        assert_eq!(
+            roles,
+            vec![
+                (AggregateFunctionKind::Sum, AggregateStateRole::Single),
+                (AggregateFunctionKind::Count, AggregateStateRole::Single),
+                (AggregateFunctionKind::Avg, AggregateStateRole::AvgSum),
+                (AggregateFunctionKind::Avg, AggregateStateRole::AvgCount),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_layout_min_max_combined_with_sum_count() {
+        // Combined shape: min(v1) -> Int64, sum(v1) -> Int64,
+        // count(*) -> Int64, max(s1) -> Utf8.
+        let shape = classify_incremental_mv_query(&parse_query(
+            "select k1, min(v1) as mn, sum(v1) as s, count(*) as c, max(s1) as mx \
+             from ice.ns.orders group by k1",
+        ))
+        .expect("classify");
+        let IncrementalMvShape::Aggregate(shape) = shape else {
+            panic!("expected aggregate shape");
+        };
+        let columns = vec![
+            OutputColumn {
+                name: "k1".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+            OutputColumn {
+                name: "mn".to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+            },
+            OutputColumn {
+                name: "s".to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+            },
+            OutputColumn {
+                name: "c".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+            OutputColumn {
+                name: "mx".to_string(),
+                data_type: DataType::Utf8,
+                nullable: true,
+            },
+        ];
+        let layout = build_aggregate_mv_layout(&shape, &columns).expect("layout");
+        // Expected: [Map<Int64,Int64>, Int64, Int64, Map<Utf8,Int64>],
+        // matching the (Min, Sum, Count(*), Max) aggregate ordering. No
+        // RetractionCount hidden state because COUNT(*) covers it.
+        let expected_types = vec![
+            expected_min_max_state_arrow_type(DataType::Int64),
+            DataType::Int64,
+            DataType::Int64,
+            expected_min_max_state_arrow_type(DataType::Utf8),
+        ];
+        let actual_types: Vec<DataType> = layout
+            .state_columns
+            .iter()
+            .map(|c| c.data_type.clone())
+            .collect();
+        assert_eq!(actual_types, expected_types);
+        // Sanity-check the function ordering matches our expectation.
+        let funcs: Vec<AggregateFunctionKind> =
+            layout.state_columns.iter().map(|c| c.function).collect();
+        assert_eq!(
+            funcs,
+            vec![
+                AggregateFunctionKind::Min,
+                AggregateFunctionKind::Sum,
+                AggregateFunctionKind::Count,
+                AggregateFunctionKind::Max,
+            ]
+        );
+    }
+
+    #[test]
+    fn validate_state_column_type_accepts_map_int64_for_min() {
+        let ok_map = expected_min_max_state_arrow_type(DataType::Int64);
+        validate_state_column_type(
+            AggregateFunctionKind::Min,
+            AggregateStateRole::Single,
+            &ok_map,
+            "__agg_state_m",
+        )
+        .expect("Map<Int64,Int64> must be accepted for MIN");
+
+        let ok_map_utf8 = expected_min_max_state_arrow_type(DataType::Utf8);
+        validate_state_column_type(
+            AggregateFunctionKind::Max,
+            AggregateStateRole::Single,
+            &ok_map_utf8,
+            "__agg_state_m",
+        )
+        .expect("Map<Utf8,Int64> must be accepted for MAX");
+    }
+
+    #[test]
+    fn validate_state_column_type_rejects_map_with_non_int64_value_for_min() {
+        // Map<Int64, Utf8> — wrong value type, must be rejected.
+        let bad_map = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(arrow::datatypes::Fields::from(vec![
+                    Arc::new(Field::new("key", DataType::Int64, false)),
+                    Arc::new(Field::new("value", DataType::Utf8, false)),
+                ])),
+                false,
+            )),
+            false,
+        );
+        let err = validate_state_column_type(
+            AggregateFunctionKind::Min,
+            AggregateStateRole::Single,
+            &bad_map,
+            "__agg_state_m",
+        )
+        .expect_err("Map<Int64, Utf8> must be rejected for MIN");
+        assert!(err.contains("value type"), "err={err}");
+        assert!(err.contains("Int64"), "err={err}");
+    }
+
+    #[test]
+    fn validate_state_column_type_rejects_scalar_for_min() {
+        // Pre-Phase-2 scalar Int64 state must now be rejected — MIN/MAX state
+        // is required to be a value-count detail Map.
+        let err = validate_state_column_type(
+            AggregateFunctionKind::Min,
+            AggregateStateRole::Single,
+            &DataType::Int64,
+            "__agg_state_m",
+        )
+        .expect_err("scalar Int64 must be rejected as MIN state type");
+        assert!(err.contains("Map<K, Int64>"), "err={err}");
     }
 
     #[test]
