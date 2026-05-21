@@ -20,7 +20,20 @@ fn typed_exprs_to_column_ids(exprs: &[TypedExpr]) -> Vec<ColumnId> {
 
 impl DeriveOutput for PhysicalHashAggregateOp {
     fn derive_output(&self, _children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
-        let cols = typed_exprs_to_column_ids(&self.group_by);
+        // For Local / Single the group_by may contain non-ColumnRef
+        // expressions (e.g. `GROUP BY mod(k, 2)`); reading the column id
+        // from `output_columns` instead of the typed group_by exprs is the
+        // only way to recover the planner-minted ColumnId for those
+        // synthesised slots so the Local-emitted distribution matches what
+        // Global asks for. Mirrors the G1 fix that previously lived in
+        // search.rs::output_properties.
+        let cols: Vec<ColumnId> = self
+            .output_columns
+            .iter()
+            .take(self.group_by.len())
+            .map(|oc| oc.column_id)
+            .filter(|id| *id != ColumnId::UNSET)
+            .collect();
         if cols.is_empty() {
             PhysicalPropertySet::gather()
         } else {
@@ -77,7 +90,7 @@ impl DeriveRequired for PhysicalHashAggregateOp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::{ExprKind, TypedExpr};
+    use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
 
     #[test]
@@ -95,7 +108,12 @@ mod tests {
             mode: AggMode::Single,
             group_by: vec![col_ref],
             aggregates: vec![],
-            output_columns: vec![],
+            output_columns: vec![OutputColumn {
+                column_id: ColumnId(3),
+                name: "city".into(),
+                data_type: arrow::datatypes::DataType::Utf8,
+                nullable: false,
+            }],
             is_merge: vec![],
         };
         let props = op.derive_output(&[]);
