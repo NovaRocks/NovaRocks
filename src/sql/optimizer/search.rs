@@ -38,6 +38,11 @@ pub(crate) struct Winner {
     pub(crate) cost: Cost,
     /// If present, the winner needs an enforcer on top of the physical expr.
     pub(crate) enforcer: Option<EnforcerInfo>,
+    /// The actual physical-property set this winner delivers. For an
+    /// enforcer winner, this equals the required properties (because the
+    /// enforcer was selected to bridge `provided -> required`). Otherwise
+    /// it equals the natural output of the chosen physical expression.
+    pub(crate) output: PhysicalPropertySet,
 }
 
 /// Describes the enforcer node that must wrap the winner expression.
@@ -248,6 +253,7 @@ impl SearchContext {
             expr_index: best_index,
             cost: best_cost,
             enforcer: best_enforcer,
+            output: PhysicalPropertySet::any(), // placeholder; populated for real in Task 14
         };
         self.winners.insert(cache_key, winner);
         Ok(best_cost)
@@ -1132,8 +1138,7 @@ mod tests {
                         side_label
                     );
                     // Both sides should get ColumnId(6) (a.id) and ColumnId(7) (b.id).
-                    let ids: std::collections::HashSet<ColumnId> =
-                        cols.iter().copied().collect();
+                    let ids: std::collections::HashSet<ColumnId> = cols.iter().copied().collect();
                     assert!(
                         ids.contains(&ColumnId(6)),
                         "{} side missing ColumnId(6), got {:?}",
