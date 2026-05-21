@@ -414,9 +414,15 @@ fn parse_map_type(ty: &DataType) -> Result<(Arc<Field>, arrow::datatypes::Fields
 }
 
 fn build_default_map_type(key_field: Arc<Field>, value_field: Arc<Field>) -> DataType {
+    // Iceberg-rust convention: entries-struct field is named "key_value"
+    // (iceberg-0.9 `DEFAULT_MAP_FIELD_NAME`) and the value field is nullable.
+    // `map_value_count` backs the IVM-P5 MIN/MAX detail-state, whose output
+    // lands directly in the Iceberg target sink — so the runtime MapArray
+    // must already follow the Iceberg shape to avoid a field-name / null
+    // mismatch when the sink re-annotates field IDs.
     DataType::Map(
         Arc::new(Field::new(
-            "entries",
+            "key_value",
             DataType::Struct(arrow::datatypes::Fields::from(vec![
                 Arc::new(Field::new(
                     "key",
@@ -445,9 +451,12 @@ mod tests {
     use std::mem::MaybeUninit;
 
     fn map_type_with_key(key_type: DataType) -> DataType {
+        // Mirrors the iceberg-rust convention applied in
+        // `build_default_map_type` (entries-field name `"key_value"`,
+        // value field nullable).
         DataType::Map(
             Arc::new(Field::new(
-                "entries",
+                "key_value",
                 DataType::Struct(arrow::datatypes::Fields::from(vec![
                     Arc::new(Field::new("key", key_type, false)),
                     Arc::new(Field::new("value", DataType::Int64, true)),

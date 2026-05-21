@@ -191,6 +191,13 @@ pub(crate) fn build_aggregate_mv_layout(
                 let state_name = format!("{}{}", AGG_STATE_PREFIX, sanitized);
                 let key_arrow_type = visible.data_type.clone();
                 let key_sql_type = mv_ddl::arrow_data_type_to_sql_type(&key_arrow_type)?;
+                // Iceberg-rust convention: entries-struct field is named
+                // "key_value" (iceberg-0.9 `DEFAULT_MAP_FIELD_NAME`) and the
+                // value field is nullable. Aligning the MV state column
+                // declaration with this convention lets the Iceberg sink
+                // re-annotate field IDs on the runtime chunk without a
+                // schema-name mismatch (the runtime aggregate emits the same
+                // shape via `map_value_count`).
                 let entries_struct = DataType::Struct(arrow::datatypes::Fields::from(vec![
                     Arc::new(Field::new(
                         "key",
@@ -200,12 +207,12 @@ pub(crate) fn build_aggregate_mv_layout(
                     Arc::new(Field::new(
                         "value",
                         DataType::Int64,
-                        /* nullable = */ false,
+                        /* nullable = */ true,
                     )),
                 ]));
                 let map_arrow_type = DataType::Map(
                     Arc::new(Field::new(
-                        "entries",
+                        "key_value",
                         entries_struct,
                         /* nullable = */ false,
                     )),
@@ -1633,13 +1640,25 @@ fn validate_state_column_type(
         (AggregateFunctionKind::Min, AggregateStateRole::Single)
         | (AggregateFunctionKind::Max, AggregateStateRole::Single) => {
             // IVM-P5 (Phase 2): MIN/MAX state is a `Map<input_type, Int64>`
-            // value-count detail map. Reject any other Arrow shape with a
-            // clear error so future schema bugs are loud, not silent.
+            // value-count detail map. The Arrow shape follows the iceberg-rust
+            // convention so the Iceberg sink can re-annotate batch field IDs
+            // without a structural mismatch:
+            //   entries-struct field name = "key_value"
+            //   value field nullable = true
+            //   key field non-null
+            // Reject any other Arrow shape with a clear error so future schema
+            // bugs are loud, not silent.
             let DataType::Map(entries_field, _keys_sorted) = data_type else {
                 return Err(format!(
                     "MIN/MAX state type for column `{state_name}` must be Map<K, Int64>, got {data_type:?}"
                 ));
             };
+            if entries_field.name() != "key_value" {
+                return Err(format!(
+                    "MIN/MAX state map entries field for column `{state_name}` must be named `key_value` (iceberg-rust convention), got `{}`",
+                    entries_field.name()
+                ));
+            }
             let DataType::Struct(struct_fields) = entries_field.data_type() else {
                 return Err(format!(
                     "MIN/MAX state map entries type for column `{state_name}` must be Struct, got {:?}",
@@ -1666,6 +1685,11 @@ fn validate_state_column_type(
                     value_field.data_type()
                 ));
             }
+            if !value_field.is_nullable() {
+                return Err(format!(
+                    "MIN/MAX state map value field for column `{state_name}` must be nullable (iceberg-rust convention)"
+                ));
+            }
             // Validate the key Arrow type matches the scalar primitives we
             // accept as MIN/MAX inputs (mirrors the pre-Phase-2 acceptance
             // list, minus Boolean which AggScalarValue does not support).
@@ -1677,6 +1701,11 @@ fn validate_state_column_type(
                         "MIN/MAX state map entries struct for column `{state_name}` is missing `key` field"
                     )
                 })?;
+            if key_field.is_nullable() {
+                return Err(format!(
+                    "MIN/MAX state map key field for column `{state_name}` must be non-null"
+                ));
+            }
             match key_field.data_type() {
                 // MIN/MAX detail-state currently can't ingest NaN keys (the
                 // comparator underlying merge/sort returns Err on NaN, which
@@ -2520,13 +2549,15 @@ mod tests {
     }
 
     /// Build the Arrow Map<key_type, Int64> type used by MIN/MAX state.
+    /// Mirrors the iceberg-rust convention applied in `build_aggregate_mv_layout`
+    /// (entries-field name `"key_value"`, value field nullable).
     fn expected_min_max_state_arrow_type(key_type: DataType) -> DataType {
         DataType::Map(
             Arc::new(Field::new(
-                "entries",
+                "key_value",
                 DataType::Struct(arrow::datatypes::Fields::from(vec![
                     Arc::new(Field::new("key", key_type, false)),
-                    Arc::new(Field::new("value", DataType::Int64, false)),
+                    Arc::new(Field::new("value", DataType::Int64, true)),
                 ])),
                 false,
             )),
@@ -2739,13 +2770,15 @@ mod tests {
 
     #[test]
     fn validate_state_column_type_rejects_map_with_non_int64_value_for_min() {
-        // Map<Int64, Utf8> — wrong value type, must be rejected.
+        // Map<Int64, Utf8> — wrong value type, must be rejected. Uses the
+        // iceberg-rust entries-field name ("key_value") and nullable value
+        // field so we exercise the value-type check, not the shape check.
         let bad_map = DataType::Map(
             Arc::new(Field::new(
-                "entries",
+                "key_value",
                 DataType::Struct(arrow::datatypes::Fields::from(vec![
                     Arc::new(Field::new("key", DataType::Int64, false)),
-                    Arc::new(Field::new("value", DataType::Utf8, false)),
+                    Arc::new(Field::new("value", DataType::Utf8, true)),
                 ])),
                 false,
             )),
@@ -3695,10 +3728,10 @@ mod tests {
             name: "__agg_state_mn".to_string(),
             data_type: DataType::Map(
                 Arc::new(Field::new(
-                    "entries",
+                    "key_value",
                     DataType::Struct(arrow::datatypes::Fields::from(vec![
                         Arc::new(Field::new("key", DataType::Int64, false)),
-                        Arc::new(Field::new("value", DataType::Int64, false)),
+                        Arc::new(Field::new("value", DataType::Int64, true)),
                     ])),
                     false,
                 )),
@@ -3976,7 +4009,7 @@ mod tests {
         let entries_struct = StructArray::new(
             arrow::datatypes::Fields::from(vec![
                 Arc::new(Field::new("key", DataType::Int64, false)),
-                Arc::new(Field::new("value", DataType::Int64, false)),
+                Arc::new(Field::new("value", DataType::Int64, true)),
             ]),
             vec![
                 Arc::new(Int64Array::from(vec![10_i64, 20_i64])) as ArrayRef,
@@ -4076,7 +4109,7 @@ mod tests {
         let entries_struct = StructArray::new(
             arrow::datatypes::Fields::from(vec![
                 Arc::new(Field::new("key", DataType::Int64, false)),
-                Arc::new(Field::new("value", DataType::Int64, false)),
+                Arc::new(Field::new("value", DataType::Int64, true)),
             ]),
             vec![
                 Arc::new(Int64Array::from(vec![10_i64, 20_i64])) as ArrayRef,

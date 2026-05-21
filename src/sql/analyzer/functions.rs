@@ -1341,10 +1341,14 @@ pub(super) fn infer_agg_return_type(name: &str, arg_types: &[DataType]) -> DataT
         }
         "map_value_count" | "map_value_count_signed" => {
             // Output type: Map<input_type_K, Int64>. The first argument's type is the key.
+            // Uses the iceberg-rust convention (entries-field name "key_value",
+            // value field nullable) so the MIN/MAX IVM detail-state map can
+            // flow into the Iceberg sink without a field-name / nullability
+            // mismatch when the sink re-annotates field IDs.
             let key_type = arg_types.first().cloned().unwrap_or(DataType::Null);
             DataType::Map(
                 Arc::new(arrow::datatypes::Field::new(
-                    "entries",
+                    "key_value",
                     DataType::Struct(
                         vec![
                             Arc::new(arrow::datatypes::Field::new("key", key_type, false)),
