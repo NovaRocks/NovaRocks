@@ -1,4 +1,4 @@
-//! HashAggregate output / required derivation. Four modes:
+//! HashAggregate output / required derivation. Five modes:
 //! Single / Local / Global / DistinctLocal / DistinctGlobal.
 
 use crate::sql::analysis::TypedExpr;

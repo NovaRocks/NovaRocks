@@ -29,7 +29,7 @@ use crate::sql::optimizer::operator::{
 
 use super::{DeriveOutput, DeriveRequired};
 
-// Refactor-phase impls: output is still Any (today's behaviour). Task 19
+// Refactor-phase impls: output is still Any (today's behaviour). Task 20
 // flips this to passthrough_output(children_outputs).
 macro_rules! passthrough_impls {
     ($($op:ty),+ $(,)?) => {
