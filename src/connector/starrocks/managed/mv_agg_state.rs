@@ -180,13 +180,14 @@ pub(crate) fn build_aggregate_mv_layout(
                 });
             }
             AggregateFunctionKind::Min | AggregateFunctionKind::Max => {
-                // IVM-P5 (Phase 2): MIN/MAX state is a value-count detail map
+                // IVM-P5: MIN/MAX state is a value-count detail map
                 // (`Map<input_type, Int64>`). Map keys are the distinct values
                 // observed in the group; values are the per-key occurrence
-                // counts. Downstream phases (rewriter / merge / derive) will
-                // consume this shape; the DDL gate in
-                // `iceberg_refresh::reject_min_max_for_iceberg_target_aggregate`
-                // still rejects MIN/MAX, so this is a schema-only change.
+                // counts. The rewriter / merge / derive / DDL paths are all
+                // wired through Phase 5. Float keys are still rejected by
+                // `validate_state_column_type` until canonical-NaN handling
+                // lands; non-Float MIN/MAX is fully incremental, including
+                // on DELETE deltas.
                 let state_name = format!("{}{}", AGG_STATE_PREFIX, sanitized);
                 let key_arrow_type = visible.data_type.clone();
                 let key_sql_type = mv_ddl::arrow_data_type_to_sql_type(&key_arrow_type)?;
@@ -338,20 +339,6 @@ pub(crate) fn aggregate_shape_needs_retraction_count_state(shape: &AggregateMvSh
     !shape.aggregates.iter().any(|aggregate| {
         aggregate.function == AggregateFunctionKind::Count
             && matches!(aggregate.input, AggregateInput::Star)
-    })
-}
-
-/// Returns true if any state column on the layout uses MIN or MAX.
-/// Used by the refresh dispatch to decide whether to fall back to a full
-/// refresh when the incremental change batch contains DELETE files (MIN/MAX
-/// state has no closed-form retract — see `negate_aggregate_state_chunks`).
-#[allow(dead_code)]
-pub(crate) fn layout_has_min_or_max(layout: &AggregateMvLayout) -> bool {
-    layout.state_columns.iter().any(|col| {
-        matches!(
-            col.function,
-            AggregateFunctionKind::Min | AggregateFunctionKind::Max
-        )
     })
 }
 
@@ -3810,7 +3797,10 @@ mod tests {
         )
         .expect("merge");
         let value = r.expect("merged map");
-        assert_eq!(map_state_pairs(&value), vec![(1, 1), (2, 1), (3, 1), (4, 1)]);
+        assert_eq!(
+            map_state_pairs(&value),
+            vec![(1, 1), (2, 1), (3, 1), (4, 1)]
+        );
     }
 
     #[test]
@@ -3916,7 +3906,10 @@ mod tests {
         )
         .expect("merge insert")
         .expect("some");
-        assert_eq!(map_state_pairs(&after_insert), vec![(10, 2), (20, 2), (30, 1)]);
+        assert_eq!(
+            map_state_pairs(&after_insert),
+            vec![(10, 2), (20, 2), (30, 1)]
+        );
 
         // DELETE 10 (boundary — 10 was the current MIN). With 2 prior 10s
         // and one deletion, the merged state has 10 -> 2 + (-1) = 1.
@@ -3933,8 +3926,7 @@ mod tests {
         assert_eq!(map_state_pairs(&after_delete), vec![(20, 2), (30, 1)]);
 
         // Derive visible MIN — should now be 20 (the second-smallest value).
-        let visible = derive_visible_from_detail_map(&after_delete, MinMax::Min)
-            .expect("derive");
+        let visible = derive_visible_from_detail_map(&after_delete, MinMax::Min).expect("derive");
         assert!(
             matches!(visible, Some(AggScalarValue::Int64(20))),
             "expected Some(Int64(20)), got {visible:?}"
@@ -4419,123 +4411,5 @@ mod tests {
         let rows = load_aggregate_physical_rows(&[chunk], &layout)
             .expect("MIN(Float64) load must succeed");
         assert_eq!(rows.len(), 1);
-    }
-
-    // ---- layout_has_min_or_max tests ----
-
-    #[test]
-    fn layout_has_min_or_max_detects() {
-        let mut layout = AggregateMvLayout {
-            row_id_column: managed_physical_column(
-                ROW_ID_COLUMN.to_string(),
-                SqlType::String,
-                false,
-                false,
-                true,
-            ),
-            visible_columns: Vec::new(),
-            state_columns: Vec::new(),
-            group_key_source_indexes: Vec::new(),
-            physical_columns: Vec::new(),
-        };
-        assert!(!layout_has_min_or_max(&layout));
-
-        layout.state_columns.push(AggregateStateColumn {
-            name: "__agg_state_c".to_string(),
-            data_type: DataType::Int64,
-            sql_type: SqlType::BigInt,
-            nullable: false,
-            visible_source_index: 0,
-            aggregate_index: 0,
-            function: AggregateFunctionKind::Count,
-            state_role: AggregateStateRole::Single,
-            count_star: true,
-        });
-        assert!(!layout_has_min_or_max(&layout));
-
-        layout.state_columns.push(AggregateStateColumn {
-            name: "__agg_state_mn".to_string(),
-            data_type: DataType::Int64,
-            sql_type: SqlType::BigInt,
-            nullable: true,
-            visible_source_index: 1,
-            aggregate_index: 1,
-            function: AggregateFunctionKind::Min,
-            state_role: AggregateStateRole::Single,
-            count_star: false,
-        });
-        assert!(layout_has_min_or_max(&layout));
-    }
-
-    #[test]
-    fn fallback_predicate_truth_table_for_min_max() {
-        // Locks the boolean shape of the fall-back gate
-        // (`deletes_present && layout_has_min_or_max(...)`) used in
-        // refresh_aggregate_mv_incremental. The integration path is
-        // not unit-tested here — see spec §8.2: DELETE -> fall-back is
-        // covered exclusively by Rust unit tests rather than the SQL suite.
-        let layout_with_min = AggregateMvLayout {
-            row_id_column: managed_physical_column(
-                ROW_ID_COLUMN.to_string(),
-                SqlType::String,
-                false,
-                false,
-                true,
-            ),
-            visible_columns: Vec::new(),
-            state_columns: vec![AggregateStateColumn {
-                name: "__agg_state_mn".to_string(),
-                data_type: DataType::Int64,
-                sql_type: SqlType::BigInt,
-                nullable: true,
-                visible_source_index: 0,
-                aggregate_index: 0,
-                function: AggregateFunctionKind::Min,
-                state_role: AggregateStateRole::Single,
-                count_star: false,
-            }],
-            group_key_source_indexes: Vec::new(),
-            physical_columns: Vec::new(),
-        };
-
-        let layout_count_only = AggregateMvLayout {
-            row_id_column: managed_physical_column(
-                ROW_ID_COLUMN.to_string(),
-                SqlType::String,
-                false,
-                false,
-                true,
-            ),
-            visible_columns: Vec::new(),
-            state_columns: vec![AggregateStateColumn {
-                name: "__agg_state_c".to_string(),
-                data_type: DataType::Int64,
-                sql_type: SqlType::BigInt,
-                nullable: false,
-                visible_source_index: 0,
-                aggregate_index: 0,
-                function: AggregateFunctionKind::Count,
-                state_role: AggregateStateRole::Single,
-                count_star: true,
-            }],
-            group_key_source_indexes: Vec::new(),
-            physical_columns: Vec::new(),
-        };
-
-        let deletes_present = true;
-
-        // Fall-back fires: deletes present AND layout has MIN/MAX.
-        assert!(deletes_present && layout_has_min_or_max(&layout_with_min));
-
-        // No fall-back: COUNT-only layout does not trigger MIN/MAX gate.
-        assert!(!(deletes_present && layout_has_min_or_max(&layout_count_only)));
-
-        // No fall-back: no deletes regardless of layout — the gate only fires when
-        // both conditions are true. Verify layout_has_min_or_max returns true for
-        // the min layout (confirming the helper works) while the overall predicate
-        // is false because no deletes are present.
-        let no_deletes = false;
-        assert!(layout_has_min_or_max(&layout_with_min));
-        assert!(!(no_deletes && layout_has_min_or_max(&layout_with_min)));
     }
 }

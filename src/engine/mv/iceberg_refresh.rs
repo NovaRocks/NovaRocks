@@ -31,8 +31,7 @@ use crate::connector::starrocks::managed::mv_refresh::{
     run_mv_full_select_chunks, single_snapshot_map, single_table_uuid_map,
 };
 use crate::connector::starrocks::managed::mv_shape::{
-    AggregateFunctionKind, AggregateMvShape, IncrementalMvShape, JoinAggregateMvShape,
-    classify_incremental_mv_query,
+    AggregateMvShape, IncrementalMvShape, JoinAggregateMvShape, classify_incremental_mv_query,
 };
 use crate::engine::mv::iceberg_target_apply::{
     ICEBERG_MV_APPLY_KEY_COLUMN, ICEBERG_MV_APPLY_KEY_SOURCE_BASE_ROW_ID,
@@ -102,9 +101,6 @@ pub(crate) fn create_iceberg_mv(
     let base_refs = extract_base_table_refs(&analysis.resolved_refs)?;
     let shape = classify_incremental_mv_query(&canonical_select_query)?;
     let aggregate_shape = aggregate_shape_for_layout(&shape);
-    if let Some(aggregate_shape) = aggregate_shape.as_ref() {
-        reject_min_max_for_iceberg_target_aggregate(aggregate_shape)?;
-    }
     let loaded_bases = match &shape {
         IncrementalMvShape::ProjectionFilter(_) => {
             let [base_ref] = base_refs.as_slice() else {
@@ -468,21 +464,6 @@ fn iceberg_aggregate_target_columns(
             &layout.physical_columns,
         ),
     )
-}
-
-fn reject_min_max_for_iceberg_target_aggregate(shape: &AggregateMvShape) -> Result<(), String> {
-    if shape.aggregates.iter().any(|aggregate| {
-        matches!(
-            aggregate.function,
-            AggregateFunctionKind::Min | AggregateFunctionKind::Max
-        )
-    }) {
-        return Err(
-            "iceberg-backed aggregate materialized views do not support MIN/MAX in incremental mode"
-                .to_string(),
-        );
-    }
-    Ok(())
 }
 
 fn build_iceberg_mv_schema_contract(
@@ -8213,6 +8194,54 @@ mod tests {
         .expect("create aggregate fact iceberg table");
     }
 
+    fn create_aggregate_fact_table_with_float(
+        state: &Arc<StandaloneState>,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) {
+        let entry = {
+            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get(catalog).expect("catalog")
+        };
+        let columns = vec![
+            crate::sql::TableColumnDef {
+                name: "id".to_string(),
+                data_type: crate::sql::SqlType::Int,
+                nullable: false,
+                aggregation: None,
+                default: None,
+            },
+            crate::sql::TableColumnDef {
+                name: "region".to_string(),
+                data_type: crate::sql::SqlType::String,
+                nullable: true,
+                aggregation: None,
+                default: None,
+            },
+            crate::sql::TableColumnDef {
+                name: "price".to_string(),
+                data_type: crate::sql::SqlType::Double,
+                nullable: true,
+                aggregation: None,
+                default: None,
+            },
+        ];
+        crate::connector::iceberg::catalog::registry::create_table(
+            &entry,
+            namespace,
+            table,
+            &columns,
+            None,
+            &[],
+            &[
+                ("format-version".to_string(), "3".to_string()),
+                ("write.row-lineage".to_string(), "true".to_string()),
+            ],
+        )
+        .expect("create aggregate fact (float) iceberg table");
+    }
+
     fn create_aggregate_dim_table(
         state: &Arc<StandaloneState>,
         catalog: &str,
@@ -9027,23 +9056,146 @@ mod tests {
     }
 
     #[test]
-    fn create_iceberg_aggregate_mv_rejects_min_max() {
+    fn iceberg_aggregate_mv_with_min_max_int64_passes_validation() {
+        // IVM-P5 Phase 5: the DDL-time MIN/MAX rejection is removed. With
+        // Phase 1-4 already wiring the detail-map state runtime path,
+        // creating an aggregate MV containing MIN(int64_col) and
+        // MAX(int64_col) succeeds end-to-end.
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
         create_aggregate_fact_table(&env.state, "ice", "sales", "fact");
         let stmt = parse_create_mv(
             "CREATE MATERIALIZED VIEW mv_fact_region
              DISTRIBUTED BY HASH(region) BUCKETS 1
              PROPERTIES('storage_engine'='iceberg')
-             AS SELECT region, min(amount) AS min_amount
+             AS SELECT region, min(amount) AS min_amount, max(amount) AS max_amount
                 FROM ice.sales.fact
                 GROUP BY region",
         );
 
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("MIN/MAX on int64 column should be accepted post-Phase-5");
+
+        // Verify the resulting layout has Map<Int64, Int64> state columns
+        // for both MIN and MAX (the visible scalar SQL type is BigInt, but
+        // the physical state column stores a value-count detail map).
+        let contract = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_fact_region")
+            .expect("mv definition")
+            .schema_contract
+            .expect("schema contract");
+        let aggregate = contract.aggregate.expect("aggregate contract");
+        // Two MIN/MAX state columns plus one retraction-count state column
+        // (no explicit COUNT(*) in the shape — see
+        // `aggregate_shape_needs_retraction_count_state`).
+        assert_eq!(
+            aggregate.state_columns.len(),
+            3,
+            "unexpected state column layout: {:?}",
+            aggregate
+                .state_columns
+                .iter()
+                .map(|c| c.column_name.clone())
+                .collect::<Vec<_>>()
+        );
+        let by_name: std::collections::HashMap<&str, &str> = aggregate
+            .state_columns
+            .iter()
+            .map(|c| (c.column_name.as_str(), c.type_signature.as_str()))
+            .collect();
+        // MIN and MAX state columns are Map<key, Int64> — iceberg's Type
+        // display renders Map types as the literal string "map".
+        assert_eq!(by_name.get("__agg_state_min_amount").copied(), Some("map"));
+        assert_eq!(by_name.get("__agg_state_max_amount").copied(), Some("map"));
+    }
+
+    #[test]
+    fn iceberg_aggregate_mv_with_min_max_combined_with_others_passes_validation() {
+        // IVM-P5 Phase 5: MIN/MAX coexists with SUM/COUNT/AVG aggregates.
+        // Validates that the layout builder handles a mixed-aggregate shape
+        // and produces the expected mix of Map and scalar state columns.
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_aggregate_fact_table(&env.state, "ice", "sales", "fact");
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_fact_mix
+             DISTRIBUTED BY HASH(region) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT region,
+                       min(amount) AS min_amount,
+                       max(region) AS max_region,
+                       sum(amount) AS sum_amount,
+                       count(*) AS row_count,
+                       avg(amount) AS avg_amount
+                FROM ice.sales.fact
+                GROUP BY region",
+        );
+
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("mixed aggregate MV with MIN/MAX should be accepted post-Phase-5");
+
+        let contract = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_fact_mix")
+            .expect("mv definition")
+            .schema_contract
+            .expect("schema contract");
+        let aggregate = contract.aggregate.expect("aggregate contract");
+        // 1 (MIN map) + 1 (MAX map) + 1 (SUM scalar) + 1 (COUNT(*) scalar)
+        // + 2 (AVG: sum + count) = 6 state columns.
+        assert_eq!(
+            aggregate.state_columns.len(),
+            6,
+            "unexpected state column layout: {:?}",
+            aggregate
+                .state_columns
+                .iter()
+                .map(|c| c.column_name.clone())
+                .collect::<Vec<_>>()
+        );
+        let by_name: std::collections::HashMap<&str, &str> = aggregate
+            .state_columns
+            .iter()
+            .map(|c| (c.column_name.as_str(), c.type_signature.as_str()))
+            .collect();
+        // MIN/MAX state columns are Map<key, Int64> — iceberg's Type display
+        // renders Map types as the literal string "map".
+        assert_eq!(by_name.get("__agg_state_min_amount").copied(), Some("map"));
+        assert_eq!(by_name.get("__agg_state_max_region").copied(), Some("map"));
+        // SUM / COUNT(*) / AVG components are scalar state columns.
+        assert_eq!(by_name.get("__agg_state_sum_amount").copied(), Some("long"));
+        assert_eq!(by_name.get("__agg_state_row_count").copied(), Some("long"));
+        assert_eq!(
+            by_name.get("__agg_state_avg_amount__sum").copied(),
+            Some("long")
+        );
+        assert_eq!(
+            by_name.get("__agg_state_avg_amount__count").copied(),
+            Some("long")
+        );
+    }
+
+    #[test]
+    fn iceberg_aggregate_mv_with_min_float_still_rejected() {
+        // IVM-P5 Phase 5 regression: even though the broad DDL gate is
+        // removed, Float MIN/MAX must still be rejected by the
+        // validate_state_column_type validator (Phase 4 follow-up) until
+        // canonical-NaN handling is added.
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_aggregate_fact_table_with_float(&env.state, "ice", "sales", "fact_float");
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_fact_float
+             DISTRIBUTED BY HASH(region) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT region, min(price) AS min_price
+                FROM ice.sales.fact_float
+                GROUP BY region",
+        );
+
         let err = create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect_err("MIN/MAX should be rejected");
+            .expect_err("Float MIN/MAX should still be rejected at the validator layer");
         assert!(
-            err.contains("iceberg-backed aggregate materialized views do not support MIN/MAX in incremental mode"),
-            "err={err}"
+            err.contains("Float"),
+            "expected error to mention Float, got: {err}"
+        );
+        assert!(
+            err.contains("MIN/MAX"),
+            "expected error to mention MIN/MAX, got: {err}"
         );
     }
 

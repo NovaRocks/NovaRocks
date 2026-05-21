@@ -37,7 +37,6 @@ pub(crate) enum FullRefreshReason {
     SchemaEvolutionSafeFallback {
         detail: String,
     },
-    MinMaxDeleteRetractUnsupported,
 }
 
 impl std::fmt::Display for FullRefreshReason {
@@ -59,9 +58,6 @@ impl std::fmt::Display for FullRefreshReason {
             ),
             FullRefreshReason::SchemaEvolutionSafeFallback { detail } => {
                 write!(f, "schema evolution safe fallback: {detail}")
-            }
-            FullRefreshReason::MinMaxDeleteRetractUnsupported => {
-                write!(f, "MIN/MAX aggregate delete retract unsupported")
             }
         }
     }

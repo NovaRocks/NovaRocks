@@ -1,4 +1,4 @@
-use super::mv_shape::{AggregateFunctionKind, AggregateMvShape, IncrementalMvShape};
+use super::mv_shape::IncrementalMvShape;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MvApplyPolicy {
@@ -9,7 +9,7 @@ pub(crate) enum MvApplyPolicy {
 
 pub(crate) fn apply_policy_for_change(
     shape: &IncrementalMvShape,
-    has_inserts: bool,
+    _has_inserts: bool,
     has_deletes: bool,
     row_identity_available: bool,
 ) -> MvApplyPolicy {
@@ -24,9 +24,10 @@ pub(crate) fn apply_policy_for_change(
                 MvApplyPolicy::Incremental
             }
         }
-        IncrementalMvShape::Aggregate(aggregate) => {
-            aggregate_policy(aggregate, has_inserts, has_deletes)
-        }
+        // IVM-P5 Phase 5: MIN/MAX no longer forces a full refresh on DELETE.
+        // Phase 4 wired the detail-map state through merge / negate /
+        // derive-visible, so DELETE deltas are handled incrementally.
+        IncrementalMvShape::Aggregate(_) => MvApplyPolicy::Incremental,
         IncrementalMvShape::JoinProjectionFilter(_) => MvApplyPolicy::Unsupported {
             reason: "join projection/filter IMV refresh is not supported by the legacy managed MV apply policy".to_string(),
         },
@@ -36,26 +37,6 @@ pub(crate) fn apply_policy_for_change(
                     .to_string(),
         },
     }
-}
-
-fn aggregate_policy(
-    aggregate: &AggregateMvShape,
-    _has_inserts: bool,
-    has_deletes: bool,
-) -> MvApplyPolicy {
-    if has_deletes
-        && aggregate.aggregates.iter().any(|call| {
-            matches!(
-                call.function,
-                AggregateFunctionKind::Min | AggregateFunctionKind::Max
-            )
-        })
-    {
-        return MvApplyPolicy::FullRefresh {
-            reason: "MIN/MAX aggregate cannot retract DELETE state incrementally".to_string(),
-        };
-    }
-    MvApplyPolicy::Incremental
 }
 
 #[cfg(test)]
@@ -145,7 +126,10 @@ mod tests {
     }
 
     #[test]
-    fn max_delete_falls_back_to_full_refresh() {
+    fn max_delete_is_incremental_after_phase5() {
+        // IVM-P5 Phase 5: DELETE on MIN/MAX no longer falls back to full
+        // refresh. The detail-map state (Phase 2-4) merges DELETE deltas
+        // incrementally via key-wise count subtraction.
         assert_eq!(
             apply_policy_for_change(
                 &aggregate_shape(AggregateFunctionKind::Max),
@@ -153,9 +137,20 @@ mod tests {
                 true,
                 false,
             ),
-            MvApplyPolicy::FullRefresh {
-                reason: "MIN/MAX aggregate cannot retract DELETE state incrementally".to_string(),
-            }
+            MvApplyPolicy::Incremental
+        );
+    }
+
+    #[test]
+    fn min_delete_is_incremental_after_phase5() {
+        assert_eq!(
+            apply_policy_for_change(
+                &aggregate_shape(AggregateFunctionKind::Min),
+                false,
+                true,
+                false,
+            ),
+            MvApplyPolicy::Incremental
         );
     }
 
