@@ -2,6 +2,7 @@
 
 pub(crate) mod convert;
 pub(crate) mod cost;
+pub(crate) mod derive;
 pub(crate) mod cte_rewrite;
 pub(crate) mod extract;
 pub(crate) mod memo;
