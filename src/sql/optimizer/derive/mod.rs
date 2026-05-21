@@ -74,6 +74,7 @@ pub(crate) fn derive_output(
         Operator::PhysicalWindow(o) => o.derive_output(children_outputs),
         Operator::PhysicalNestLoopJoin(o) => o.derive_output(children_outputs),
         Operator::PhysicalHashAggregate(o) => o.derive_output(children_outputs),
+        Operator::PhysicalSort(o) => o.derive_output(children_outputs),
         _ => PhysicalPropertySet::any(),
     }
 }
@@ -105,6 +106,7 @@ pub(crate) fn derive_required(
         Operator::PhysicalWindow(o) => o.derive_required(parent_required, num_children),
         Operator::PhysicalNestLoopJoin(o) => o.derive_required(parent_required, num_children),
         Operator::PhysicalHashAggregate(o) => o.derive_required(parent_required, num_children),
+        Operator::PhysicalSort(o) => o.derive_required(parent_required, num_children),
         _ => vec![PhysicalPropertySet::any(); num_children],
     }
 }
@@ -170,4 +172,5 @@ pub(crate) mod nest_loop_join;
 pub(crate) mod passthrough;
 pub(crate) mod scan;
 pub(crate) mod set_op;
+pub(crate) mod sort;
 pub(crate) mod window;
