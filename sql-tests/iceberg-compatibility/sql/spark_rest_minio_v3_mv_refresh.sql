@@ -18,6 +18,7 @@ CREATE TABLE ice_rest.nr_compat_${suite_uuid0}.spark_v3_mv_base_${uuid0} (
 ) USING iceberg
 TBLPROPERTIES (
   'format-version' = '3',
+  'write.row-lineage' = 'true',
   'write.format.default' = 'parquet'
 );
 

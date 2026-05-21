@@ -120,6 +120,8 @@ configured_minio_port="${NOVA_ENV_MINIO_PORT:-9000}"
 configured_minio_console_port="${NOVA_ENV_MINIO_CONSOLE_PORT:-9001}"
 configured_rest_port="${NOVA_ENV_REST_PORT:-8181}"
 configured_spark_ui_port="${NOVA_ENV_SPARK_UI_PORT:-4040}"
+configured_spark_version="${NOVA_ENV_SPARK_VERSION:-3.5.5-java17}"
+configured_iceberg_version="${NOVA_ENV_ICEBERG_VERSION:-1.11.0}"
 
 if [[ -f "$exports_file" ]]; then
   # shellcheck disable=SC1090
@@ -161,10 +163,28 @@ fi
 
 minio_user="${MINIO_ROOT_USER:-admin}"
 minio_password="${MINIO_ROOT_PASSWORD:-admin123}"
-rest_image="${ICEBERG_REST_IMAGE:-apache/iceberg-rest-fixture:1.8.1}"
-rest_mirror_image="dockerproxy.net/apache/iceberg-rest-fixture:1.8.1"
-spark_image="${SPARK_ICEBERG_IMAGE:-tabulario/spark-iceberg:3.5.5_1.8.1}"
-spark_mirror_image="docker.1panel.live/tabulario/spark-iceberg:3.5.5_1.8.1"
+default_rest_image="apache/iceberg-rest-fixture:1.10.1"
+default_spark_image="novarocks/spark-iceberg:3.5.5_1.11.0"
+rest_image="${ICEBERG_REST_IMAGE:-$default_rest_image}"
+rest_mirror_image="dockerproxy.net/apache/iceberg-rest-fixture:1.10.1"
+spark_image="${SPARK_ICEBERG_IMAGE:-$default_spark_image}"
+spark_build_context="$SCRIPT_DIR/spark"
+spark_version="$configured_spark_version"
+iceberg_version="$configured_iceberg_version"
+
+build_default_spark_image() {
+  local image="$1"
+  if [[ ! -f "$spark_build_context/Dockerfile" ]]; then
+    echo "Missing Spark Iceberg Dockerfile: $spark_build_context/Dockerfile" >&2
+    return 1
+  fi
+
+  docker build \
+    --build-arg "SPARK_VERSION=$spark_version" \
+    --build-arg "ICEBERG_VERSION=$iceberg_version" \
+    -t "$image" \
+    "$spark_build_context"
+}
 
 if [[ "$prepare_only" != true ]]; then
   if docker_image_exists "$rest_image"; then
@@ -182,7 +202,7 @@ Docker Desktop may be unhealthy. Check it manually before running setup again:
 EOF
       exit 1
     fi
-    if [[ "$rest_image" == "apache/iceberg-rest-fixture:1.8.1" ]] \
+    if [[ "$rest_image" == "$default_rest_image" ]] \
       && docker_image_exists "$rest_mirror_image"; then
       docker tag "$rest_mirror_image" "$rest_image"
     else
@@ -190,8 +210,7 @@ EOF
 Missing Iceberg REST image: $rest_image
 
 Pull it first, for example:
-  docker pull --platform linux/arm64 dockerproxy.net/apache/iceberg-rest-fixture:1.8.1
-  docker tag dockerproxy.net/apache/iceberg-rest-fixture:1.8.1 apache/iceberg-rest-fixture:1.8.1
+  docker pull --platform linux/arm64 apache/iceberg-rest-fixture:1.10.1
 
 Or set ICEBERG_REST_IMAGE to an already available image.
 EOF
@@ -214,16 +233,14 @@ Docker Desktop may be unhealthy. Check it manually before running setup again:
 EOF
       exit 1
     fi
-    if [[ "$spark_image" == "tabulario/spark-iceberg:3.5.5_1.8.1" ]] \
-      && docker_image_exists "$spark_mirror_image"; then
-      docker tag "$spark_mirror_image" "$spark_image"
+    if [[ "$spark_image" == "$default_spark_image" ]]; then
+      build_default_spark_image "$spark_image"
     else
       cat >&2 <<EOF
 Missing Spark Iceberg image: $spark_image
 
 Pull it first, for example:
-  docker pull docker.1panel.live/tabulario/spark-iceberg:3.5.5_1.8.1
-  docker tag docker.1panel.live/tabulario/spark-iceberg:3.5.5_1.8.1 tabulario/spark-iceberg:3.5.5_1.8.1
+  docker pull $spark_image
 
 Or set SPARK_ICEBERG_IMAGE to an already available image that contains spark-sql
 and the Iceberg Spark runtime.
@@ -259,6 +276,8 @@ MINIO_ROOT_USER=$minio_user
 MINIO_ROOT_PASSWORD=$minio_password
 ICEBERG_REST_IMAGE=$rest_image
 SPARK_ICEBERG_IMAGE=$spark_image
+NOVA_ENV_SPARK_VERSION=$spark_version
+NOVA_ENV_ICEBERG_VERSION=$iceberg_version
 EOF
 
 cat > "$runtime_dir/standalone-managed-lake.toml" <<EOF
@@ -353,6 +372,7 @@ CREATE TABLE ice_rest.nr_v3.spark_v3_smoke (
 ) USING iceberg
 TBLPROPERTIES (
   'format-version' = '3',
+  'write.row-lineage' = 'true',
   'write.format.default' = 'parquet'
 );
 
@@ -397,6 +417,8 @@ export NOVAROCKS_STANDALONE_CONFIG="$runtime_dir/standalone-managed-lake.toml"
 export NOVAROCKS_SQL_TEST_CONFIG="$runtime_dir/sql-test.conf"
 export NOVAROCKS_ICE_REST_CATALOG_SQL="$runtime_dir/ice-rest-catalog.sql"
 export NOVAROCKS_SPARK_IMAGE="$spark_image"
+export NOVA_ENV_SPARK_VERSION="$spark_version"
+export NOVA_ENV_ICEBERG_VERSION="$iceberg_version"
 export NOVAROCKS_SPARK_UI="http://127.0.0.1:$spark_ui_port"
 export NOVAROCKS_SPARK_REST_URI="$spark_rest_uri"
 export NOVAROCKS_SPARK_S3_ENDPOINT="$spark_minio_endpoint"
@@ -430,6 +452,8 @@ cat > "$manifest_file" <<EOF
   },
   "spark": {
     "image": "$spark_image",
+    "spark_version": "$spark_version",
+    "iceberg_version": "$iceberg_version",
     "ui": "http://127.0.0.1:$spark_ui_port",
     "container_rest_uri": "$spark_rest_uri",
     "container_minio_endpoint": "$spark_minio_endpoint",

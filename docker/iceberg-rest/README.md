@@ -58,7 +58,7 @@ Important generated files (under the runtime entry):
 - `sql-test.conf` — SQL test runner config.
 - `ice-rest-catalog.sql` — REST catalog DDL for this workspace.
 - `spark-defaults.conf` — Spark catalog config for REST Catalog + MinIO.
-- `spark-iceberg-v3-smoke.sql` — Spark SQL that creates and writes a format-v3 Iceberg table.
+- `spark-iceberg-v3-smoke.sql` — Spark SQL that creates and writes a format-v3 Iceberg row-lineage table.
 
 Use the generated configs:
 
@@ -132,27 +132,41 @@ worktree environment. It does not stop or remove shared Docker services.
 
 ## Required Images
 
-Pull these once before first use:
+Pull the external service images once before first use:
 
 ```bash
 docker pull quay.io/minio/minio:latest
 docker pull quay.io/minio/mc:latest
-docker pull apache/iceberg-rest-fixture:1.8.1
-docker pull tabulario/spark-iceberg:3.5.5_1.8.1
+docker pull --platform linux/arm64 apache/iceberg-rest-fixture:1.10.1
 ```
 
-The default REST Catalog image is `apache/iceberg-rest-fixture:1.8.1`
-because `tabulario/iceberg-rest:1.6.0` rejects Iceberg format-version 3
-tables.
+The default REST Catalog image is `apache/iceberg-rest-fixture:1.10.1`.
+
+The default Spark image is built locally from `docker/iceberg-rest/spark/` and
+tagged as `novarocks/spark-iceberg:3.5.5_1.11.0`. It uses the Apache Spark
+official image plus these Iceberg jars:
+
+- `iceberg-spark-runtime-3.5_2.12-1.11.0.jar`
+- `iceberg-aws-bundle-1.11.0.jar`
+
+Build it explicitly if you want to prepare Docker images ahead of `up.sh`:
+
+```bash
+docker build \
+  --build-arg SPARK_VERSION=3.5.5-java17 \
+  --build-arg ICEBERG_VERSION=1.11.0 \
+  -t novarocks/spark-iceberg:3.5.5_1.11.0 \
+  docker/iceberg-rest/spark
+```
+
+If the default Spark image is missing, `docker/iceberg-rest/up.sh` builds it
+before starting Docker Compose.
 
 If Docker Hub is unavailable, pull and tag from a mirror first:
 
 ```bash
-docker pull --platform linux/arm64 dockerproxy.net/apache/iceberg-rest-fixture:1.8.1
-docker tag dockerproxy.net/apache/iceberg-rest-fixture:1.8.1 apache/iceberg-rest-fixture:1.8.1
-
-docker pull docker.1panel.live/tabulario/spark-iceberg:3.5.5_1.8.1
-docker tag docker.1panel.live/tabulario/spark-iceberg:3.5.5_1.8.1 tabulario/spark-iceberg:3.5.5_1.8.1
+docker pull --platform linux/arm64 dockerproxy.net/apache/iceberg-rest-fixture:1.10.1
+docker tag dockerproxy.net/apache/iceberg-rest-fixture:1.10.1 apache/iceberg-rest-fixture:1.10.1
 ```
 
 Override the images with `ICEBERG_REST_IMAGE=<image>` or

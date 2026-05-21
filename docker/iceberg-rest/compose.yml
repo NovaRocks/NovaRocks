@@ -36,7 +36,7 @@ services:
       - iceberg_net
 
   rest:
-    image: ${ICEBERG_REST_IMAGE:-apache/iceberg-rest-fixture:1.8.1}
+    image: ${ICEBERG_REST_IMAGE:-apache/iceberg-rest-fixture:1.10.1}
     pull_policy: missing
     depends_on:
       mc:
@@ -61,7 +61,12 @@ services:
       - iceberg_net
 
   spark:
-    image: ${SPARK_ICEBERG_IMAGE:-tabulario/spark-iceberg:3.5.5_1.8.1}
+    image: ${SPARK_ICEBERG_IMAGE:-novarocks/spark-iceberg:3.5.5_1.11.0}
+    build:
+      context: ./spark
+      args:
+        SPARK_VERSION: ${NOVA_ENV_SPARK_VERSION:-3.5.5-java17}
+        ICEBERG_VERSION: ${NOVA_ENV_ICEBERG_VERSION:-1.11.0}
     pull_policy: missing
     depends_on:
       rest:
