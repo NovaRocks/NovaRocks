@@ -74,7 +74,7 @@ USE analytics_${uuid0};
 DROP MATERIALIZED VIEW mv_orders_${uuid0};
 
 -- query 11
--- @expect_error=does not exist
+-- @expect_error=unknown table
 SELECT COUNT(*) FROM mv_orders_${uuid0};
 
 -- query 12

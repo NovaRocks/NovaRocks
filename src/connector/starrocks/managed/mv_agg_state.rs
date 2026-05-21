@@ -3393,8 +3393,8 @@ mod tests {
             schema,
             vec![
                 Arc::new(StringArray::from(vec![""])) as ArrayRef,
-                Arc::new(Float64Array::from(vec![Some(3.14)])) as ArrayRef,
-                Arc::new(Float64Array::from(vec![Some(3.14)])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![Some(1.25)])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![Some(1.25)])) as ArrayRef,
             ],
         )
         .expect("batch");

@@ -393,9 +393,9 @@ mod tests {
 
     #[test]
     fn encode_double_for_floats() {
-        let v = round_trip("3.14");
+        let v = round_trip("1.25");
         let f = variant_to_f64(&v).unwrap();
-        assert!((f - 3.14).abs() < 1e-9);
+        assert!((f - 1.25).abs() < 1e-9);
     }
 
     #[test]

@@ -439,9 +439,9 @@ mod tests {
 
     #[test]
     fn decode_double_bound_le_bytes() {
-        let bytes = (3.14159_f64).to_le_bytes();
+        let bytes = (12.345_f64).to_le_bytes();
         let v = decode_bound_to_f64(&bytes, &DataType::Float64).expect("decode double");
-        assert!((v - 3.14159).abs() < 1e-9);
+        assert!((v - 12.345).abs() < 1e-9);
     }
 
     #[test]
