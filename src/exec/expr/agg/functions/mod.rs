@@ -74,6 +74,8 @@ pub(super) enum AggKind {
     },
     MultiDistinctSum,
     MapAgg,
+    MapValueCount,
+    MapValueCountSigned,
     SumMap,
     ArrayAgg {
         is_distinct: bool,
@@ -125,6 +127,7 @@ mod histogram;
 mod hll_raw;
 mod mann_whitney_u_test;
 mod map_agg;
+mod map_value_count;
 mod max;
 mod max_by;
 mod min;
@@ -156,6 +159,7 @@ use histogram::{HistogramAgg, HistogramHllNdvAgg};
 use hll_raw::HllRawAgg;
 use mann_whitney_u_test::MannWhitneyUTestAgg;
 use map_agg::MapAggAgg;
+use map_value_count::MapValueCountAgg;
 use max::MaxAgg;
 use max_by::MaxMinByAgg;
 use min::MinAgg;
@@ -235,6 +239,7 @@ static COVAR_CORR: CovarCorrAgg = CovarCorrAgg;
 static MAX_MIN_BY: MaxMinByAgg = MaxMinByAgg;
 static MULTI_DISTINCT_SUM: MultiDistinctSumAgg = MultiDistinctSumAgg;
 static MAP_AGG: MapAggAgg = MapAggAgg;
+static MAP_VALUE_COUNT: MapValueCountAgg = MapValueCountAgg;
 static SUM_MAP: SumMapAgg = SumMapAgg;
 static RETENTION: RetentionAgg = RetentionAgg;
 static WINDOW_FUNNEL: WindowFunnelAgg = WindowFunnelAgg;
@@ -272,6 +277,7 @@ fn resolve_by_func(func: &AggFunction) -> Result<&'static dyn AggregateFunction,
         "max_by" | "min_by" | "max_by_v2" | "min_by_v2" => Ok(&MAX_MIN_BY),
         "multi_distinct_sum" => Ok(&MULTI_DISTINCT_SUM),
         "map_agg" => Ok(&MAP_AGG),
+        "map_value_count" | "map_value_count_signed" => Ok(&MAP_VALUE_COUNT),
         "sum_map" => Ok(&SUM_MAP),
         "retention" => Ok(&RETENTION),
         "window_funnel" => Ok(&WINDOW_FUNNEL),
@@ -340,6 +346,7 @@ fn resolve_by_kind(kind: &AggKind) -> &'static dyn AggregateFunction {
         AggKind::MaxBy | AggKind::MinBy | AggKind::MaxByV2 | AggKind::MinByV2 => &MAX_MIN_BY,
         AggKind::MultiDistinctSum => &MULTI_DISTINCT_SUM,
         AggKind::MapAgg => &MAP_AGG,
+        AggKind::MapValueCount | AggKind::MapValueCountSigned => &MAP_VALUE_COUNT,
         AggKind::SumMap => &SUM_MAP,
         AggKind::Retention => &RETENTION,
         AggKind::WindowFunnel => &WINDOW_FUNNEL,

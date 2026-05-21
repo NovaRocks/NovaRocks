@@ -1244,6 +1244,8 @@ fn is_aggregate_function(name: &str) -> bool {
             | "array_unique_agg"
             | "sum_map"
             | "map_agg"
+            | "map_value_count"
+            | "map_value_count_signed"
             | "percentile_approx"
             | "percentile_approx_weighted"
             | "percentile_cont"

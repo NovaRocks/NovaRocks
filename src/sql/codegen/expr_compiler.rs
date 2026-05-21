@@ -1647,6 +1647,14 @@ fn semantic_aggregate_type_desc(
             typed_expr_type_desc(&args[1])?,
         );
     }
+    if matches!(name, "map_value_count" | "map_value_count_signed")
+        && let Some(key_arg) = args.first()
+    {
+        return map_type_desc(
+            typed_expr_type_desc(key_arg)?,
+            arrow_type_to_type_desc(&DataType::Int64)?,
+        );
+    }
     if name == "approx_top_k"
         && let Some(item) = args.first()
     {
@@ -2637,6 +2645,27 @@ fn infer_agg_function_types(
                         vec![
                             Arc::new(arrow::datatypes::Field::new("key", key_type, true)),
                             Arc::new(arrow::datatypes::Field::new("value", value_type, true)),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            );
+            Ok((map.clone(), Some(map)))
+        }
+        "map_value_count" | "map_value_count_signed" => {
+            // Output / intermediate type: Map<input_type_K, Int64>. The first arg's
+            // type drives the key; the second arg (when present) is change_op Int8
+            // and is not part of the output map.
+            let key_type = arg_types.first().cloned().unwrap_or(DataType::Null);
+            let map = DataType::Map(
+                Arc::new(arrow::datatypes::Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Arc::new(arrow::datatypes::Field::new("key", key_type, false)),
+                            Arc::new(arrow::datatypes::Field::new("value", DataType::Int64, true)),
                         ]
                         .into(),
                     ),
