@@ -12,6 +12,17 @@ use crate::sql::optimizer::property::{DistributionSpec, OrderingSpec, PhysicalPr
 
 use super::{DeriveOutput, DeriveRequired};
 
+/// Join types whose output rows are streamed from the left side intact —
+/// the join only filters/augments by attaching right-side data on a per-
+/// row basis. For these, output distribution follows the left child.
+///
+/// For RightOuter / RightSemi / RightAnti / FullOuter the output is NOT
+/// preserved-left (see hash_join.rs derive_output's else branch).
+fn preserves_left(jk: &crate::sql::analysis::JoinKind) -> bool {
+    use crate::sql::analysis::JoinKind::*;
+    matches!(jk, Inner | LeftOuter | LeftSemi | LeftAnti | Cross)
+}
+
 #[allow(dead_code)]
 enum Side {
     Left,
@@ -42,7 +53,7 @@ fn eq_keys_to_column_ids(
 }
 
 impl DeriveOutput for PhysicalHashJoinOp {
-    fn derive_output(&self, _children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
+    fn derive_output(&self, children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
         match self.distribution {
             JoinDistribution::Shuffle => {
                 let cols = eq_keys_to_column_ids(&self.eq_conditions, Side::Left);
@@ -56,8 +67,19 @@ impl DeriveOutput for PhysicalHashJoinOp {
                 }
             }
             JoinDistribution::Broadcast | JoinDistribution::Colocate => {
-                // Refactor-phase placeholder. Replaced in Tasks 16–18.
-                PhysicalPropertySet::any()
+                if preserves_left(&self.join_type) {
+                    let left = children
+                        .first()
+                        .copied()
+                        .cloned()
+                        .unwrap_or_else(PhysicalPropertySet::any);
+                    PhysicalPropertySet {
+                        distribution: left.distribution,
+                        ordering: OrderingSpec::Any,
+                    }
+                } else {
+                    PhysicalPropertySet::any()
+                }
             }
         }
     }
@@ -118,8 +140,49 @@ impl DeriveRequired for PhysicalHashJoinOp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::{ExprKind, TypedExpr};
+    use crate::sql::analysis::{ExprKind, JoinKind, TypedExpr};
     use crate::sql::column_id::ColumnId;
+
+    fn col(id: u32) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId(id),
+                qualifier: None,
+                column: format!("c{id}"),
+            },
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+        }
+    }
+
+    fn broadcast_inner(eq_left: u32, eq_right: u32) -> PhysicalHashJoinOp {
+        PhysicalHashJoinOp {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![PhysicalHashJoinEqCondition {
+                left: col(eq_left),
+                right: col(eq_right),
+                null_safe: false,
+            }],
+            other_condition: None,
+            distribution: JoinDistribution::Broadcast,
+        }
+    }
+
+    #[test]
+    fn hash_join_broadcast_inner_preserves_left_distribution() {
+        let op = broadcast_inner(10, 20);
+        let left_out = PhysicalPropertySet {
+            distribution: DistributionSpec::HashPartitioned(vec![ColumnId(10)]),
+            ordering: OrderingSpec::Any,
+        };
+        let right_out = PhysicalPropertySet::gather();
+        let out = op.derive_output(&[&left_out, &right_out]);
+        assert_eq!(
+            out.distribution,
+            DistributionSpec::HashPartitioned(vec![ColumnId(10)])
+        );
+        assert_eq!(out.ordering, OrderingSpec::Any);
+    }
 
     #[test]
     fn required_input_shuffle_join() {
