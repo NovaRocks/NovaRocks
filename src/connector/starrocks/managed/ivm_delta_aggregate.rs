@@ -39,18 +39,6 @@ pub(crate) fn rewrite_select_sql_for_signed_delta_state_with_change_op_qualifier
         return Err("rewrite_select_sql_for_signed_delta_state: expected SELECT body".to_string());
     };
 
-    if shape.aggregates.iter().any(|agg| {
-        matches!(
-            agg.function,
-            AggregateFunctionKind::Min | AggregateFunctionKind::Max
-        )
-    }) {
-        return Err(
-            "MIN/MAX aggregate outputs are not reversible: delete-bearing signed delta state cannot be consumed incrementally"
-                .to_string(),
-        );
-    }
-
     let change_op = ChangeOpExpr::new(change_op_qualifier);
     select.projection = signed_delta_projection(shape, &change_op)?;
 
@@ -169,7 +157,30 @@ fn push_signed_aggregate_state_projection(
             ));
         }
         AggregateFunctionKind::Min | AggregateFunctionKind::Max => {
-            unreachable!("MIN/MAX aggregate functions are rejected before projection rewrite")
+            // IVM-P5 (Phase 3): MIN/MAX delta state is a per-group
+            // `Map<value, Int64>` detail map. In the signed-delta path the
+            // map values are signed by `__change_op` (+1 for INSERT, -1 for
+            // DELETE), so we emit `map_value_count_signed(arg, change_op)`
+            // as the state-column projection. The visible MIN/MAX value is
+            // never sourced from the delta in this path — Phase 4 will
+            // re-derive it from the merged detail map at write time — so we
+            // do not emit a visible projection here. (Compare with COUNT/
+            // SUM, where the same expression doubles as both visible and
+            // state value.)
+            let AggregateInput::Expr(expr) = &aggregate.input else {
+                return Err(
+                    "rewrite_select_sql_for_signed_delta_state: MIN/MAX requires an expression input"
+                        .to_string(),
+                );
+            };
+            let sanitized = sanitize_state_column_name(&aggregate.output_name);
+            let state_alias = format!("__agg_state_{sanitized}");
+            projection.push(make_two_arg_aggregate_select_item(
+                "map_value_count_signed",
+                expr.as_ref().clone(),
+                change_op.expr(),
+                &state_alias,
+            ));
         }
     }
     Ok(())
@@ -206,6 +217,35 @@ fn make_aggregate_select_item(func_name: &str, arg: Expr, alias: &str) -> Select
         args: FunctionArguments::List(FunctionArgumentList {
             duplicate_treatment: None,
             args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(arg))],
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+    };
+    SelectItem::ExprWithAlias {
+        expr: Expr::Function(function),
+        alias: select_alias_ident(alias),
+    }
+}
+
+fn make_two_arg_aggregate_select_item(
+    func_name: &str,
+    arg1: Expr,
+    arg2: Expr,
+    alias: &str,
+) -> SelectItem {
+    let function = Function {
+        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(func_name))]),
+        uses_odbc_syntax: false,
+        parameters: FunctionArguments::None,
+        args: FunctionArguments::List(FunctionArgumentList {
+            duplicate_treatment: None,
+            args: vec![
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(arg1)),
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(arg2)),
+            ],
             clauses: vec![],
         }),
         filter: None,
@@ -371,16 +411,79 @@ mod tests {
     }
 
     #[test]
-    fn signed_delta_rewrite_rejects_min_max() {
+    fn signed_delta_rewrite_accepts_min_max_with_map_value_count_signed() {
         let sql = "select k1, min(v2) as mn, max(v2) as mx from ice.ns.orders group by k1";
         let shape = parse_aggregate_shape(sql);
-        let err = rewrite_select_sql_for_signed_delta_state(sql, &shape).expect_err("reject");
+        let rewritten =
+            rewrite_select_sql_for_signed_delta_state(sql, &shape).expect("rewrite signed delta");
+        let upper = rewritten.to_uppercase();
 
-        assert!(err.contains("MIN/MAX"), "err={err}");
+        // MIN/MAX state columns become `map_value_count_signed(arg, __change_op)`.
         assert!(
-            err.contains("delete-bearing signed delta state"),
-            "err={err}"
+            upper.contains("MAP_VALUE_COUNT_SIGNED(V2, __CHANGE_OP)"),
+            "got: {rewritten}"
         );
-        assert!(err.contains("incrementally"), "err={err}");
+        // Two state projections, one per MIN/MAX, with sanitized aliases.
+        assert!(
+            rewritten.contains("__agg_state_mn"),
+            "missing mn state alias; got: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("__agg_state_mx"),
+            "missing mx state alias; got: {rewritten}"
+        );
+        // Visible MIN/MAX scalars are NOT emitted by the signed-delta rewriter;
+        // Phase 4 will re-derive the visible value from the merged detail map.
+        assert!(
+            !upper.contains("MIN(V2)") && !upper.contains("MAX(V2)"),
+            "signed-delta rewrite should not project visible MIN/MAX; got: {rewritten}"
+        );
+        // Retraction count row column must still be present.
+        assert!(
+            upper.contains("SUM(__CHANGE_OP) AS __AGG_STATE___IVM_ROW_COUNT"),
+            "got: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn signed_delta_rewrite_combined_min_max_and_others() {
+        let sql = "select k1, count(*) as c, sum(v2) as s, min(v2) as mn, max(v3) as mx \
+                   from ice.ns.orders group by k1";
+        let shape = parse_aggregate_shape(sql);
+        let rewritten =
+            rewrite_select_sql_for_signed_delta_state(sql, &shape).expect("rewrite signed delta");
+        let upper = rewritten.to_uppercase();
+
+        // COUNT(*) -> SUM(__change_op) AS c
+        assert!(upper.contains("SUM(__CHANGE_OP) AS C"), "got: {rewritten}");
+        // SUM(v2) -> SUM(v2 * __change_op) AS s
+        assert!(
+            upper.contains("SUM(V2 * __CHANGE_OP)") || upper.contains("SUM((V2 * __CHANGE_OP))"),
+            "got: {rewritten}"
+        );
+        assert!(upper.contains("AS S"), "got: {rewritten}");
+        // MIN(v2) -> map_value_count_signed(v2, __change_op) AS __agg_state_mn
+        assert!(
+            upper.contains("MAP_VALUE_COUNT_SIGNED(V2, __CHANGE_OP)"),
+            "got: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("__agg_state_mn"),
+            "missing mn state alias; got: {rewritten}"
+        );
+        // MAX(v3) -> map_value_count_signed(v3, __change_op) AS __agg_state_mx
+        assert!(
+            upper.contains("MAP_VALUE_COUNT_SIGNED(V3, __CHANGE_OP)"),
+            "got: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("__agg_state_mx"),
+            "missing mx state alias; got: {rewritten}"
+        );
+        // No literal MIN(...) / MAX(...) projection in signed-delta path.
+        assert!(
+            !upper.contains("MIN(V2)") && !upper.contains("MAX(V3)"),
+            "signed-delta rewrite must not project visible MIN/MAX; got: {rewritten}"
+        );
     }
 }

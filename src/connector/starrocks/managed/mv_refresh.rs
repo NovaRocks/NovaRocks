@@ -702,35 +702,15 @@ fn refresh_aggregate_mv_incremental(
     let layout =
         super::mv_agg_state::build_aggregate_mv_layout(ctx.shape, &visible_output_columns)?;
 
-    let signed_state_sql =
-        match super::ivm_delta_aggregate::rewrite_select_sql_for_signed_delta_state(
-            ctx.select_sql,
-            ctx.shape,
-        ) {
-            Ok(sql) => sql,
-            Err(err)
-                if err.contains("MIN/MAX") && err.contains("delete-bearing signed delta state") =>
-            {
-                tracing::info!(
-                    target: "mv_refresh",
-                    mv = %format!("{}.{}", ctx.database, ctx.mv_name),
-                    base = %ctx.base_ref.fqn(),
-                    snapshot_from = ctx.previous_snapshot_id,
-                    snapshot_to = ctx.current_snapshot_id,
-                    error = %err,
-                    "mv_refresh fall-back to Full from signed delta aggregate rewrite"
-                );
-                return refresh_aggregate_mv_full_with_pinned_metadata(
-                    ctx.state,
-                    ctx.database,
-                    ctx.mv_name,
-                    ctx.shape,
-                    ctx.pinned_full_select_sql.clone(),
-                    ctx.pinned_base_metadata.clone(),
-                );
-            }
-            Err(err) => return Err(err),
-        };
+    // IVM-P5 (Phase 3): the signed-delta rewriter now handles MIN/MAX via
+    // `map_value_count_signed`, so it no longer returns the historical
+    // "MIN/MAX aggregate outputs are not reversible" rejection that used to
+    // trigger a fall-back to full refresh. Any error from the rewriter is now
+    // a real error.
+    let signed_state_sql = super::ivm_delta_aggregate::rewrite_select_sql_for_signed_delta_state(
+        ctx.select_sql,
+        ctx.shape,
+    )?;
     let delta_result = execute_delta_source_query(
         IvmDeltaSourceInput {
             state: ctx.state,
