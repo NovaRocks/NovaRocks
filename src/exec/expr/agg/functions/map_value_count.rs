@@ -37,7 +37,9 @@ use crate::exec::node::aggregate::AggFunction;
 
 use super::super::*;
 use super::AggregateFunction;
-use super::common::{AggScalarValue, build_scalar_array, compare_scalar_values, scalar_from_array};
+use super::common::{
+    AggScalarValue, build_scalar_array, compare_scalar_values, key_fingerprint, scalar_from_array,
+};
 
 pub(super) struct MapValueCountAgg;
 
@@ -362,12 +364,18 @@ fn update_signed(
         })?;
 
     for (row, &base) in state_ptrs.iter().enumerate() {
+        // A struct-level null row means "no contribution from this row" —
+        // even if the inner key cell is non-null, treat the row as absent.
+        // Without this, scalar_from_array would happily return the inner key
+        // and we'd insert a phantom (key, 0) entry.
+        if struct_arr.is_null(row) {
+            continue;
+        }
         let Some(key) = scalar_from_array(&key_arr, row)? else {
             continue;
         };
-        // NULL change_op is treated as 0 (defensive). The struct-level null
-        // would also imply null components.
-        let delta = if struct_arr.is_null(row) || op_arr.is_null(row) {
+        // NULL change_op is treated as 0 (defensive).
+        let delta = if op_arr.is_null(row) {
             0_i64
         } else {
             op_arr.value(row) as i64
@@ -425,114 +433,6 @@ fn build_default_map_type(key_field: Arc<Field>, value_field: Arc<Field>) -> Dat
         )),
         false,
     )
-}
-
-/// Stable byte fingerprint of an AggScalarValue. Suitable as a hashmap key
-/// across the supported scalar types K. Composite types (List/Struct/Map)
-/// are unsupported for map_value_count and rejected upstream, but encode
-/// here for safety.
-fn key_fingerprint(key: &AggScalarValue) -> Vec<u8> {
-    fn encode_scalar(out: &mut Vec<u8>, key: &AggScalarValue) {
-        match key {
-            AggScalarValue::Bool(v) => {
-                out.push(1);
-                out.push(if *v { 1 } else { 0 });
-            }
-            AggScalarValue::Int64(v) => {
-                out.push(2);
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-            AggScalarValue::Float64(v) => {
-                out.push(3);
-                // Normalize NaN: any NaN maps to the same fingerprint so
-                // multiple NaN inputs collapse into one bucket.
-                let bits = if v.is_nan() {
-                    f64::NAN.to_bits()
-                } else {
-                    v.to_bits()
-                };
-                out.extend_from_slice(&bits.to_le_bytes());
-            }
-            AggScalarValue::Utf8(v) => {
-                out.push(4);
-                let len = v.len() as u32;
-                out.extend_from_slice(&len.to_le_bytes());
-                out.extend_from_slice(v.as_bytes());
-            }
-            AggScalarValue::Date32(v) => {
-                out.push(5);
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-            AggScalarValue::Timestamp(v) => {
-                out.push(6);
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-            AggScalarValue::Decimal128(v) => {
-                out.push(7);
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-            AggScalarValue::Decimal256(v) => {
-                out.push(11);
-                let text = v.to_string();
-                let len = text.len() as u32;
-                out.extend_from_slice(&len.to_le_bytes());
-                out.extend_from_slice(text.as_bytes());
-            }
-            AggScalarValue::Struct(items) => {
-                out.push(8);
-                let len = items.len() as u32;
-                out.extend_from_slice(&len.to_le_bytes());
-                for item in items {
-                    match item {
-                        Some(v) => {
-                            out.push(1);
-                            encode_scalar(out, v);
-                        }
-                        None => out.push(0),
-                    }
-                }
-            }
-            AggScalarValue::Map(items) => {
-                out.push(9);
-                let len = items.len() as u32;
-                out.extend_from_slice(&len.to_le_bytes());
-                for (k, v) in items {
-                    match k {
-                        Some(k) => {
-                            out.push(1);
-                            encode_scalar(out, k);
-                        }
-                        None => out.push(0),
-                    }
-                    match v {
-                        Some(v) => {
-                            out.push(1);
-                            encode_scalar(out, v);
-                        }
-                        None => out.push(0),
-                    }
-                }
-            }
-            AggScalarValue::List(items) => {
-                out.push(10);
-                let len = items.len() as u32;
-                out.extend_from_slice(&len.to_le_bytes());
-                for item in items {
-                    match item {
-                        Some(v) => {
-                            out.push(1);
-                            encode_scalar(out, v);
-                        }
-                        None => out.push(0),
-                    }
-                }
-            }
-        }
-    }
-
-    let mut out = Vec::new();
-    encode_scalar(&mut out, key);
-    out
 }
 
 #[cfg(test)]
@@ -900,5 +800,68 @@ mod tests {
         assert_eq!(map.len(), 1);
         assert!(!map.is_null(0));
         assert_eq!(map.value_length(0), 0);
+    }
+
+    #[test]
+    fn test_map_value_count_int8_round_trip() {
+        // Drive update_unsigned with Int8 input. The accumulator widens to
+        // AggScalarValue::Int64 internally; build_scalar_array must narrow
+        // back to Int8 when finalizing against an Int8-keyed map type.
+        let spec = build_spec("map_value_count", DataType::Int8);
+        let mut cell = StateCell::new(spec);
+        let arr = Arc::new(Int8Array::from(vec![1_i8, 2, 1, 3, 2, 1])) as ArrayRef;
+        cell.update(arr);
+        let out = cell.finalize();
+        let map = out.as_any().downcast_ref::<MapArray>().unwrap();
+        // Key type must round-trip back to Int8, not stay widened to Int64.
+        assert_eq!(*map.keys().data_type(), DataType::Int8);
+        assert_eq!(*map.values().data_type(), DataType::Int64);
+        let start = map.value_offsets()[0] as usize;
+        let end = map.value_offsets()[1] as usize;
+        let keys = map.keys().as_any().downcast_ref::<Int8Array>().unwrap();
+        let vals = map.values().as_any().downcast_ref::<Int64Array>().unwrap();
+        let mut got: Vec<(i8, i64)> = (start..end)
+            .map(|i| (keys.value(i), vals.value(i)))
+            .collect();
+        got.sort_by_key(|&(k, _)| k);
+        assert_eq!(got, vec![(1_i8, 3), (2, 2), (3, 1)]);
+    }
+
+    #[test]
+    fn test_map_value_count_signed_skips_struct_null_row() {
+        // Build a row-nullable StructArray: row 0 is null at the struct level
+        // but its inner key cell is non-null. Without the struct-level null
+        // guard, update_signed would read the inner key and insert a phantom
+        // (key, 0) entry. With the guard, the row is skipped entirely.
+        let key_arr = Arc::new(Int64Array::from(vec![Some(7_i64), Some(8)])) as ArrayRef;
+        let op_arr = Arc::new(Int8Array::from(vec![Some(1_i8), Some(1)])) as ArrayRef;
+        let fields = arrow::datatypes::Fields::from(vec![
+            Arc::new(Field::new("k", DataType::Int64, true)),
+            Arc::new(Field::new("op", DataType::Int8, true)),
+        ]);
+        let mut nulls = arrow_buffer::NullBufferBuilder::new(2);
+        nulls.append_null(); // row 0: struct-level null (but inner key=7 is non-null)
+        nulls.append_non_null(); // row 1: live struct, key=8 op=1
+        let struct_arr = Arc::new(StructArray::new(
+            fields,
+            vec![key_arr, op_arr],
+            nulls.finish(),
+        )) as ArrayRef;
+        // Sanity: row 0 is null at the struct level but its inner key cell is non-null.
+        let raw_struct = struct_arr.as_any().downcast_ref::<StructArray>().unwrap();
+        assert!(raw_struct.is_null(0));
+        assert!(!raw_struct.column(0).is_null(0));
+
+        let struct_ty = DataType::Struct(arrow::datatypes::Fields::from(vec![
+            Arc::new(Field::new("k", DataType::Int64, true)),
+            Arc::new(Field::new("op", DataType::Int8, true)),
+        ]));
+        let spec = build_spec("map_value_count_signed", struct_ty);
+        let mut cell = StateCell::new(spec);
+        cell.update(struct_arr);
+        let out = cell.finalize();
+        let entries = collect_int_map(&out);
+        // Only the live row 1 contributes; the null struct row does NOT add (7, 0).
+        assert_eq!(entries, vec![(8, 1)]);
     }
 }

@@ -25,7 +25,7 @@ use crate::exec::node::aggregate::AggFunction;
 
 use super::super::*;
 use super::AggregateFunction;
-use super::common::{AggScalarValue, build_scalar_array, scalar_from_array};
+use super::common::{AggScalarValue, build_scalar_array, key_fingerprint, scalar_from_array};
 
 pub(super) struct MapAggAgg;
 
@@ -311,101 +311,6 @@ fn build_default_map_type(key_field: Arc<Field>, value_field: Arc<Field>) -> Dat
         )),
         false,
     )
-}
-
-fn key_fingerprint(key: &AggScalarValue) -> Vec<u8> {
-    fn encode_scalar(out: &mut Vec<u8>, key: &AggScalarValue) {
-        match key {
-            AggScalarValue::Bool(v) => {
-                out.push(1);
-                out.push(if *v { 1 } else { 0 });
-            }
-            AggScalarValue::Int64(v) => {
-                out.push(2);
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-            AggScalarValue::Float64(v) => {
-                out.push(3);
-                out.extend_from_slice(&v.to_bits().to_le_bytes());
-            }
-            AggScalarValue::Utf8(v) => {
-                out.push(4);
-                out.extend_from_slice(v.as_bytes());
-            }
-            AggScalarValue::Date32(v) => {
-                out.push(5);
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-            AggScalarValue::Timestamp(v) => {
-                out.push(6);
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-            AggScalarValue::Decimal128(v) => {
-                out.push(7);
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-            AggScalarValue::Decimal256(v) => {
-                out.push(11);
-                let text = v.to_string();
-                let len = text.len() as u32;
-                out.extend_from_slice(&len.to_le_bytes());
-                out.extend_from_slice(text.as_bytes());
-            }
-            AggScalarValue::Struct(items) => {
-                out.push(8);
-                let len = items.len() as u32;
-                out.extend_from_slice(&len.to_le_bytes());
-                for item in items {
-                    match item {
-                        Some(v) => {
-                            out.push(1);
-                            encode_scalar(out, v);
-                        }
-                        None => out.push(0),
-                    }
-                }
-            }
-            AggScalarValue::Map(items) => {
-                out.push(9);
-                let len = items.len() as u32;
-                out.extend_from_slice(&len.to_le_bytes());
-                for (k, v) in items {
-                    match k {
-                        Some(k) => {
-                            out.push(1);
-                            encode_scalar(out, k);
-                        }
-                        None => out.push(0),
-                    }
-                    match v {
-                        Some(v) => {
-                            out.push(1);
-                            encode_scalar(out, v);
-                        }
-                        None => out.push(0),
-                    }
-                }
-            }
-            AggScalarValue::List(items) => {
-                out.push(10);
-                let len = items.len() as u32;
-                out.extend_from_slice(&len.to_le_bytes());
-                for item in items {
-                    match item {
-                        Some(v) => {
-                            out.push(1);
-                            encode_scalar(out, v);
-                        }
-                        None => out.push(0),
-                    }
-                }
-            }
-        }
-    }
-
-    let mut out = Vec::new();
-    encode_scalar(&mut out, key);
-    out
 }
 
 #[cfg(test)]
