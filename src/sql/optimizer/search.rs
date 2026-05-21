@@ -343,8 +343,21 @@ fn output_properties(op: &Operator) -> PhysicalPropertySet {
         //   - Single without group keys: Gather
         //   - Local: Hash(group_keys)
         //   - Global: Hash(group_keys)
+        //
+        // For Local / Single the group_by may contain non-ColumnRef
+        // expressions (e.g. `GROUP BY mod(k, 2)`); reading the column id
+        // from `output_columns` instead of the typed group_by exprs is the
+        // only way to recover the planner-minted ColumnId for those
+        // synthesised slots so the Local-emitted distribution matches what
+        // Global asks for.
         Operator::PhysicalHashAggregate(a) => {
-            let cols = typed_exprs_to_column_ids(&a.group_by);
+            let cols: Vec<ColumnId> = a
+                .output_columns
+                .iter()
+                .take(a.group_by.len())
+                .map(|oc| oc.column_id)
+                .filter(|id| *id != ColumnId::UNSET)
+                .collect();
             if cols.is_empty() {
                 // Scalar aggregate -> result is a single row.
                 PhysicalPropertySet::gather()

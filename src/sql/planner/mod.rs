@@ -1335,17 +1335,30 @@ fn plan_relation_scoped(
 ) -> Result<LogicalPlan, String> {
     match relation {
         Relation::Scan(scan) => {
+            // G1: reuse the ColumnIds the analyzer already minted for this
+            // table's columns (carried on `scan.column_ids`). Minting fresh
+            // ids here would desync the analyzer-produced `ColumnRef`s in
+            // the rest of the plan (Window PARTITION BY, GROUP BY, ORDER BY,
+            // join eq keys, etc.) from the scan output, and distribution
+            // matching would fail.
             let columns = scan
                 .table
                 .columns
                 .iter()
-                .map(|c| OutputColumn {
-                    column_id: factory.create(
-                        scan.alias.as_ref().or(Some(&scan.table.name)).cloned(),
-                        c.name.clone(),
-                        c.data_type.clone(),
-                        c.nullable,
-                    ),
+                .enumerate()
+                .map(|(idx, c)| OutputColumn {
+                    column_id: scan
+                        .column_ids
+                        .get(idx)
+                        .copied()
+                        .unwrap_or_else(|| {
+                            factory.create(
+                                scan.alias.as_ref().or(Some(&scan.table.name)).cloned(),
+                                c.name.clone(),
+                                c.data_type.clone(),
+                                c.nullable,
+                            )
+                        }),
                     name: c.name.clone(),
                     data_type: c.data_type.clone(),
                     nullable: c.nullable,

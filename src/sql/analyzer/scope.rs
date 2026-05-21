@@ -121,7 +121,17 @@ impl AnalyzerScope {
     }
 
     /// Register all columns from a table (or subquery output).
-    pub(super) fn add_table(&mut self, qualifier: Option<&str>, columns: &[ColumnDef]) {
+    /// Returns the freshly-allocated `ColumnId`s in the same order as
+    /// `columns` so callers (e.g. analyzer `Relation::Scan` construction)
+    /// can record them and pass them down to the planner — this is what
+    /// keeps the G1 ColumnId invariant ("scan output ids == analyzer ids")
+    /// intact across the analyzer → planner boundary.
+    pub(super) fn add_table(
+        &mut self,
+        qualifier: Option<&str>,
+        columns: &[ColumnDef],
+    ) -> Vec<ColumnId> {
+        let mut ids = Vec::with_capacity(columns.len());
         for col in columns {
             let name_lower = col.name.to_lowercase();
             let id = self.factory.borrow_mut().create(
@@ -130,6 +140,7 @@ impl AnalyzerScope {
                 col.data_type.clone(),
                 col.nullable,
             );
+            ids.push(id);
             if let Some(q) = qualifier {
                 self.qualified.insert(
                     (q.to_lowercase(), name_lower.clone()),
@@ -154,6 +165,7 @@ impl AnalyzerScope {
                 col.nullable,
             ));
         }
+        ids
     }
 
     /// Register a single column (used for subquery output columns, etc.).

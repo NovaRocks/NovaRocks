@@ -442,7 +442,20 @@ impl<'a> PlanFragmentBuilder<'a> {
                 type_desc: None,
                 nullable: col.nullable,
             };
-            scope.add_column(
+            // G1: pick up the per-column ColumnId from `op.columns` so the
+            // scope's by-id index is populated for base-table reads. This is
+            // what lets the optimizer's `DistributionSpec::HashPartitioned`
+            // (which is now a `Vec<ColumnId>`) resolve directly against the
+            // scan's child scope without having to round-trip through the
+            // display name.
+            let col_id = op
+                .columns
+                .iter()
+                .find(|oc| oc.name.eq_ignore_ascii_case(&col.name))
+                .map(|oc| oc.column_id)
+                .unwrap_or(crate::sql::column_id::ColumnId::UNSET);
+            scope.add_column_with_id(
+                col_id,
                 qualifier.map(|s| s.to_string()),
                 col.name.clone(),
                 binding.clone(),
@@ -643,7 +656,17 @@ impl<'a> PlanFragmentBuilder<'a> {
                 nullable,
             });
 
-            project_scope.add_column(
+            // G1: a Project that is itself a pass-through ColumnRef must
+            // expose the upstream ColumnId so the by-id index in the scope
+            // stays continuous across the Project — without this, the
+            // distribution requirement for an Aggregate on top of a
+            // SubqueryAlias-wrapped relation fails to resolve the column.
+            let item_column_id = match &item.expr.kind {
+                ExprKind::ColumnRef { column_id, .. } => *column_id,
+                _ => crate::sql::column_id::ColumnId::UNSET,
+            };
+            project_scope.add_column_with_id(
+                item_column_id,
                 None,
                 name.clone(),
                 ColumnBinding {
@@ -2418,27 +2441,34 @@ impl<'a> PlanFragmentBuilder<'a> {
             .map(|(_, binding)| binding.clone())
             .collect();
 
-        // Register all output columns with the alias as qualifier
+        // Register all output columns with the alias as qualifier. Per the
+        // G1 invariant ("SubqueryAlias does not create new ids, only changes
+        // the display name") we also re-index each binding under the alias's
+        // ColumnId so the by-id lookup follows the column through the alias
+        // boundary.
         for (idx, col) in op.output_columns.iter().enumerate() {
             let col_name_lower = col.name.to_lowercase();
             let binding = child
                 .scope
-                .resolve_column(None, &col_name_lower)
+                .resolve_by_id(col.column_id)
                 .cloned()
-                .or_else(|_| {
-                    child_output_bindings.get(idx).cloned().ok_or_else(|| {
-                        format!(
-                            "subquery alias '{}' exposes column '{}' at position {} but child has only {} columns",
-                            op.alias,
-                            col.name,
-                            idx,
-                            child_output_bindings.len()
-                        )
-                    })
+                .or_else(|| child.scope.resolve_column(None, &col_name_lower).cloned().ok())
+                .or_else(|| child_output_bindings.get(idx).cloned())
+                .ok_or_else(|| {
+                    format!(
+                        "subquery alias '{}' exposes column '{}' at position {} but child has only {} columns",
+                        op.alias,
+                        col.name,
+                        idx,
+                        child_output_bindings.len()
+                    )
                 })?;
-            child
-                .scope
-                .add_column(Some(op.alias.clone()), col.name.clone(), binding);
+            child.scope.add_column_with_id(
+                col.column_id,
+                Some(op.alias.clone()),
+                col.name.clone(),
+                binding,
+            );
         }
 
         Ok(child)

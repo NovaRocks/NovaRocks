@@ -672,26 +672,32 @@ impl Rule for JoinToNestLoop {
 
 pub(crate) struct AggToHashAgg;
 
-fn aggregate_group_key_output_ref(expr: &TypedExpr) -> TypedExpr {
+fn aggregate_group_key_output_ref(
+    expr: &TypedExpr,
+    output_column: Option<&crate::sql::analysis::OutputColumn>,
+) -> TypedExpr {
     // Global aggregate references each Local-emitted group-by slot. Per the
-    // G1 invariant — "pass-through operators (Project, SubqueryAlias, Window,
-    // and here the two-phase aggregate split) reuse the upstream ColumnId,
-    // only the display name changes" — we propagate the input expr's id
-    // when it is a ColumnRef. For non-ColumnRef group-by exprs (e.g.
-    // `GROUP BY a + b`) the planner would need a ColumnRefFactory to mint
-    // a fresh id for the synthesized slot; that is not yet wired into
-    // Rule::apply, so we fall back to UNSET for that case. GROUPING SETS /
-    // CUBE / ROLLUP group_by entries are always ColumnRefs so they hit the
-    // id-propagation arm.
+    // G1 invariant — "pass-through operators (Project, SubqueryAlias, Window)
+    // reuse the upstream ColumnId" — we propagate the input expr's id when
+    // it is itself a ColumnRef. For derived group-by exprs (e.g.
+    // `GROUP BY mod(k, 2)` or `GROUP BY a + b`) the planner has already
+    // minted a fresh ColumnId for the synthesised slot and stored it in the
+    // LogicalAggregate's `output_columns`, so we reuse that id here. Minting
+    // a brand-new id at this point would desynchronise Local's output
+    // distribution from Global's input requirement and the optimizer would
+    // loop trying to enforce an unreachable shuffle.
+    let display_name = typed_expr_display_name(expr);
     let column_id = match &expr.kind {
         ExprKind::ColumnRef { column_id, .. } => *column_id,
-        _ => crate::sql::column_id::ColumnId::UNSET,
+        _ => output_column
+            .map(|oc| oc.column_id)
+            .unwrap_or(crate::sql::column_id::ColumnId::UNSET),
     };
     TypedExpr {
         kind: ExprKind::ColumnRef {
             column_id,
             qualifier: None,
-            column: typed_expr_display_name(expr),
+            column: display_name,
         },
         data_type: expr.data_type.clone(),
         nullable: expr.nullable,
@@ -745,10 +751,16 @@ impl Rule for AggToHashAgg {
             children: expr.children.clone(),
         };
         let local_group_id = memo.new_group(local_mexpr);
+        // LogicalAggregate.output_columns lays out group-by columns first
+        // (in the order they appear in op.group_by), followed by aggregate
+        // result columns. We pair each group_by expr with its corresponding
+        // output_columns entry so derived group-by columns inherit the
+        // ColumnId the planner already minted.
         let global_group_by = op
             .group_by
             .iter()
-            .map(aggregate_group_key_output_ref)
+            .enumerate()
+            .map(|(idx, gb)| aggregate_group_key_output_ref(gb, op.output_columns.get(idx)))
             .collect();
 
         let global = NewExpr {

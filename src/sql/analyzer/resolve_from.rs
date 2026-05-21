@@ -393,7 +393,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 // Build scope
                 let mut scope = self.new_scope();
                 let qualifier = alias_name.as_deref().unwrap_or(&table_def.name);
-                scope.add_table(Some(qualifier), &table_def.columns);
+                let column_ids = scope.add_table(Some(qualifier), &table_def.columns);
                 // If alias differs from table name, also register with table name
                 if let Some(ref a) = alias_name
                     && !a.eq_ignore_ascii_case(&table_def.name)
@@ -414,6 +414,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     database: db_lower,
                     table: table_def,
                     alias: alias_name,
+                    column_ids,
                 });
 
                 Ok((relation, scope))
