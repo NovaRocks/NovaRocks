@@ -673,9 +673,23 @@ impl Rule for JoinToNestLoop {
 pub(crate) struct AggToHashAgg;
 
 fn aggregate_group_key_output_ref(expr: &TypedExpr) -> TypedExpr {
+    // Global aggregate references each Local-emitted group-by slot. Per the
+    // G1 invariant — "pass-through operators (Project, SubqueryAlias, Window,
+    // and here the two-phase aggregate split) reuse the upstream ColumnId,
+    // only the display name changes" — we propagate the input expr's id
+    // when it is a ColumnRef. For non-ColumnRef group-by exprs (e.g.
+    // `GROUP BY a + b`) the planner would need a ColumnRefFactory to mint
+    // a fresh id for the synthesized slot; that is not yet wired into
+    // Rule::apply, so we fall back to UNSET for that case. GROUPING SETS /
+    // CUBE / ROLLUP group_by entries are always ColumnRefs so they hit the
+    // id-propagation arm.
+    let column_id = match &expr.kind {
+        ExprKind::ColumnRef { column_id, .. } => *column_id,
+        _ => crate::sql::column_id::ColumnId::UNSET,
+    };
     TypedExpr {
         kind: ExprKind::ColumnRef {
-            column_id: crate::sql::column_id::ColumnId::UNSET,
+            column_id,
             qualifier: None,
             column: typed_expr_display_name(expr),
         },

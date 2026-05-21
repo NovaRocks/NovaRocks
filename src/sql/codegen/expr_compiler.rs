@@ -368,7 +368,11 @@ impl<'a> ExprCompiler<'a> {
 
     fn compile_typed_inner(&mut self, expr: &TypedExpr) -> Result<DataType, String> {
         match &expr.kind {
-            ExprKind::ColumnRef { qualifier, column, .. } => {
+            ExprKind::ColumnRef {
+                column_id,
+                qualifier,
+                column,
+            } => {
                 // Inside a lambda body, parameter references resolve to the
                 // allocated lambda-arg slot ids (tuple_id = 0, since they do
                 // not belong to any tuple descriptor).
@@ -382,7 +386,17 @@ impl<'a> ExprCompiler<'a> {
                     self.last_nullable = nullable;
                     return Ok(data_type);
                 }
-                let binding = self.scope.resolve_column(qualifier.as_deref(), column)?;
+                // G1: prefer ColumnId-based lookup when the scope has an
+                // id-indexed binding for this column. This is what lets the
+                // SELECT projection above a GROUPING SETS / CUBE / ROLLUP
+                // Aggregate still resolve `k1` even though the Aggregate's
+                // output slot is named `__repeat_group.k1`. Fall back to the
+                // name-based lookup for scopes / call sites that have not
+                // yet been migrated to register ColumnIds.
+                let binding = match self.scope.resolve_by_id(*column_id) {
+                    Some(b) => b,
+                    None => self.scope.resolve_column(qualifier.as_deref(), column)?,
+                };
                 let type_desc = binding_type_desc(binding)?;
                 self.nodes
                     .push(slot_ref_node(binding.slot_id, binding.tuple_id, type_desc));

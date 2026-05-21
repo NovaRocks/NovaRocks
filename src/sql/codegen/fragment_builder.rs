@@ -1006,7 +1006,18 @@ impl<'a> PlanFragmentBuilder<'a> {
                 type_desc: Some(slot_type_desc),
                 nullable,
             };
-            agg_scope.add_column(None, name, binding.clone());
+            // G1: when the group-by expression is itself a ColumnRef with a
+            // real ColumnId, register the agg's output slot under that id so
+            // upstream operators (the SELECT projection on top of a GROUPING
+            // SETS / CUBE Aggregate, the Global merge above a Local agg,
+            // etc.) can resolve the column by id regardless of the slot's
+            // display name. Non-ColumnRef group-by exprs (e.g. `a + b`)
+            // remain name-indexed only.
+            let gb_column_id = match &gb_expr.kind {
+                ExprKind::ColumnRef { column_id, .. } => *column_id,
+                _ => crate::sql::column_id::ColumnId::UNSET,
+            };
+            agg_scope.add_column_with_id(gb_column_id, None, name, binding.clone());
             if let ExprKind::ColumnRef {
                 qualifier: Some(ref q),
                 ref column,
@@ -2641,24 +2652,19 @@ impl<'a> PlanFragmentBuilder<'a> {
                 // For shuffle joins, cols contains ALL eq key columns from both
                 // sides. Pick the ones that resolve in this child's scope.
                 //
-                // Look up column names from the plan node's output_columns using
-                // the ColumnId. When the analyzer assigns real ColumnIds this
-                // will be a direct id-match; during the UNSET-bootstrap phase
-                // the lookup may not find a match and the branch falls through.
+                // G1: prefer ColumnId-based lookup against the child scope's
+                // id index. Fall back to the legacy path that resolves a
+                // ColumnId → display name (via output_columns) → name lookup
+                // for scopes / call sites that have not yet been migrated to
+                // register ColumnIds.
                 let mut partition_exprs = Vec::new();
-                let mut used = std::collections::HashSet::new();
+                let mut used_ids = std::collections::HashSet::new();
+                let mut used_names = std::collections::HashSet::new();
                 for col_id in cols.iter() {
-                    let col_meta = output_columns.iter().find(|oc| oc.column_id == *col_id);
-                    let col_name = match col_meta {
-                        Some(oc) => oc.name.clone(),
-                        None => continue, // column not in this child's output
-                    };
-                    if used.contains(&col_name.to_lowercase()) {
-                        continue; // skip duplicate column names
+                    if used_ids.contains(col_id) {
+                        continue; // skip duplicate column ids
                     }
-                    if let Ok(binding) =
-                        child_scope.resolve_column(None, &col_name)
-                    {
+                    if let Some(binding) = child_scope.resolve_by_id(*col_id) {
                         let binding = binding.clone();
                         let type_desc = expr_compiler::binding_type_desc(&binding)?;
                         partition_exprs.push(expr_compiler::build_slot_ref_texpr(
@@ -2666,7 +2672,27 @@ impl<'a> PlanFragmentBuilder<'a> {
                             binding.tuple_id,
                             type_desc,
                         ));
-                        used.insert(col_name.to_lowercase());
+                        used_ids.insert(*col_id);
+                        continue;
+                    }
+                    // Fallback: ColumnId → name (via output_columns) → name lookup.
+                    let col_meta = output_columns.iter().find(|oc| oc.column_id == *col_id);
+                    let col_name = match col_meta {
+                        Some(oc) => oc.name.clone(),
+                        None => continue, // column not in this child's output
+                    };
+                    if used_names.contains(&col_name.to_lowercase()) {
+                        continue; // skip duplicate column names
+                    }
+                    if let Ok(binding) = child_scope.resolve_column(None, &col_name) {
+                        let binding = binding.clone();
+                        let type_desc = expr_compiler::binding_type_desc(&binding)?;
+                        partition_exprs.push(expr_compiler::build_slot_ref_texpr(
+                            binding.slot_id,
+                            binding.tuple_id,
+                            type_desc,
+                        ));
+                        used_names.insert(col_name.to_lowercase());
                     }
                 }
                 if partition_exprs.is_empty() {
