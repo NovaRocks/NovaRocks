@@ -274,7 +274,7 @@ mod tests {
     use crate::sql::optimizer::memo::MExpr;
 
     /// Build a simple memo with a single PhysicalScan group.
-    fn single_scan_memo() -> (Memo, GroupId) {
+    pub(super) fn single_scan_memo() -> (Memo, GroupId) {
         let mut memo = Memo::new();
         let scan_op = Operator::PhysicalScan(PhysicalScanOp {
             database: "db".into(),
@@ -301,7 +301,7 @@ mod tests {
         (memo, gid)
     }
 
-    fn make_table_stats() -> HashMap<String, TableStatistics> {
+    pub(super) fn make_table_stats() -> HashMap<String, TableStatistics> {
         let mut ts = HashMap::new();
         ts.insert(
             "t".to_string(),
@@ -386,6 +386,198 @@ mod tests {
             .unwrap();
         assert!((cost1 - cost2).abs() < f64::EPSILON);
     }
-
 }
 
+#[cfg(test)]
+mod cascaded_derivation_tests {
+    use super::*;
+    use crate::sql::analysis::{ExprKind, JoinKind, TypedExpr};
+    use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::memo::MExpr;
+    use crate::sql::optimizer::operator::*;
+    use arrow::datatypes::DataType;
+
+    fn col(id: u32) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId(id),
+                qualifier: None,
+                column: format!("c{id}"),
+            },
+            data_type: DataType::Int64,
+            nullable: false,
+        }
+    }
+
+    fn scan_op(table: &str) -> Operator {
+        Operator::PhysicalScan(PhysicalScanOp {
+            database: "db".into(),
+            table: crate::sql::catalog::TableDef {
+                name: table.into(),
+                columns: vec![],
+                iceberg_row_lineage_metadata_columns: vec![],
+                iceberg_table: None,
+                storage: crate::sql::catalog::TableStorage::LocalParquetFile {
+                    path: std::path::PathBuf::from(format!("/tmp/{table}.parquet")),
+                },
+            },
+            alias: None,
+            columns: vec![],
+            predicates: vec![],
+            required_columns: None,
+        })
+    }
+
+    fn table_stats_for_cascaded() -> HashMap<String, TableStatistics> {
+        let mut ts = HashMap::new();
+        ts.insert(
+            "a".to_string(),
+            TableStatistics {
+                row_count: 10_000,
+                column_stats: HashMap::new(),
+            },
+        );
+        ts.insert(
+            "b".to_string(),
+            TableStatistics {
+                row_count: 10_000,
+                column_stats: HashMap::new(),
+            },
+        );
+        // Small enough for broadcast (< BROADCAST_ROW_COUNT_LIMIT).
+        ts.insert(
+            "small".to_string(),
+            TableStatistics {
+                row_count: 100,
+                column_stats: HashMap::new(),
+            },
+        );
+        ts
+    }
+
+    /// Build: Window[part=c10] -> BroadcastJoin(inner) -> (ShuffleJoin(a.c10 = b.c10), small)
+    /// Returns (memo, root_group_id, broadcast_join_group_id).
+    fn memo_window_over_broadcast_join() -> (Memo, GroupId, GroupId) {
+        let mut memo = Memo::new();
+
+        let g_a = memo.new_group(MExpr {
+            id: 0,
+            op: scan_op("a"),
+            children: vec![],
+        });
+        let g_b = memo.new_group(MExpr {
+            id: 1,
+            op: scan_op("b"),
+            children: vec![],
+        });
+        let g_small = memo.new_group(MExpr {
+            id: 2,
+            op: scan_op("small"),
+            children: vec![],
+        });
+
+        let shuffle_join = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![PhysicalHashJoinEqCondition {
+                left: col(10),
+                right: col(10),
+                null_safe: false,
+            }],
+            other_condition: None,
+            distribution: JoinDistribution::Shuffle,
+        });
+        let g_sj = memo.new_group(MExpr {
+            id: 3,
+            op: shuffle_join,
+            children: vec![g_a, g_b],
+        });
+
+        let broadcast_join = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![PhysicalHashJoinEqCondition {
+                left: col(10),
+                right: col(99),
+                null_safe: false,
+            }],
+            other_condition: None,
+            distribution: JoinDistribution::Broadcast,
+        });
+        let g_bj = memo.new_group(MExpr {
+            id: 4,
+            op: broadcast_join,
+            children: vec![g_sj, g_small],
+        });
+
+        let window = Operator::PhysicalWindow(PhysicalWindowOp {
+            window_exprs: vec![crate::sql::planner::plan::WindowExpr {
+                name: "max".into(),
+                args: vec![],
+                partition_by: vec![col(10)],
+                order_by: vec![],
+                window_frame: None,
+                ignore_nulls: false,
+                distinct: false,
+                output_name: "win".into(),
+                result_type: DataType::Int64,
+            }],
+            output_columns: vec![],
+        });
+        let g_w = memo.new_group(MExpr {
+            id: 5,
+            op: window,
+            children: vec![g_bj],
+        });
+
+        (memo, g_w, g_bj)
+    }
+
+    #[test]
+    fn winner_records_actual_output_for_scan() {
+        let (memo, gid) = super::tests::single_scan_memo();
+        let mut ctx = SearchContext::new(super::tests::make_table_stats());
+        ctx.optimize_group(&memo, gid, &PhysicalPropertySet::any())
+            .unwrap();
+        let w = ctx.winners.get(&(gid, PhysicalPropertySet::any())).unwrap();
+        assert_eq!(w.output, PhysicalPropertySet::any());
+    }
+
+    #[test]
+    fn cascaded_output_through_broadcast_join_skips_enforcer() {
+        let (memo, root, g_bj) = memo_window_over_broadcast_join();
+        let mut ctx = SearchContext::new(table_stats_for_cascaded());
+        let cost = ctx
+            .optimize_group(&memo, root, &PhysicalPropertySet::any())
+            .unwrap();
+        assert!(cost.is_finite(), "search must produce a feasible plan");
+
+        // Window group's winner: no enforcer between Window and the
+        // Broadcast Join below. (Broadcast inherits Hash([c10]) from the
+        // SHUFFLE_JOIN below, which is a superset of what Window needs.)
+        let w = ctx
+            .winners
+            .get(&(root, PhysicalPropertySet::any()))
+            .unwrap();
+        assert!(
+            w.enforcer.is_none(),
+            "Window should reuse Broadcast Join's left distribution; no enforcer needed. winner = {w:?}"
+        );
+
+        // The Broadcast Join's winner output must be Hash([c10]) (inherited
+        // from the SHUFFLE_JOIN's natural Hash([c10]) output).
+        let bj_req = PhysicalPropertySet {
+            distribution: DistributionSpec::HashPartitioned(vec![ColumnId(10)]),
+            ordering: OrderingSpec::Any,
+        };
+        let bj_winner = ctx.winners.get(&(g_bj, bj_req)).unwrap();
+        match &bj_winner.output.distribution {
+            DistributionSpec::HashPartitioned(cols) => {
+                assert!(
+                    cols.contains(&ColumnId(10)),
+                    "Broadcast Join should inherit Hash with c10, got {:?}",
+                    cols
+                );
+            }
+            other => panic!("expected HashPartitioned containing c10, got {:?}", other),
+        }
+    }
+}
