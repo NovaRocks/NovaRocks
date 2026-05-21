@@ -59,6 +59,9 @@ pub(crate) fn derive_output(
         Operator::PhysicalValues(o) => o.derive_output(children_outputs),
         Operator::PhysicalGenerateSeries(o) => o.derive_output(children_outputs),
         Operator::PhysicalCTEConsume(o) => o.derive_output(children_outputs),
+        Operator::PhysicalUnion(o) => o.derive_output(children_outputs),
+        Operator::PhysicalIntersect(o) => o.derive_output(children_outputs),
+        Operator::PhysicalExcept(o) => o.derive_output(children_outputs),
         _ => PhysicalPropertySet::any(),
     }
 }
@@ -75,6 +78,9 @@ pub(crate) fn derive_required(
         Operator::PhysicalValues(o) => o.derive_required(parent_required, num_children),
         Operator::PhysicalGenerateSeries(o) => o.derive_required(parent_required, num_children),
         Operator::PhysicalCTEConsume(o) => o.derive_required(parent_required, num_children),
+        Operator::PhysicalUnion(o) => o.derive_required(parent_required, num_children),
+        Operator::PhysicalIntersect(o) => o.derive_required(parent_required, num_children),
+        Operator::PhysicalExcept(o) => o.derive_required(parent_required, num_children),
         _ => vec![PhysicalPropertySet::any(); num_children],
     }
 }
@@ -135,3 +141,4 @@ pub(crate) enum EnforcerKind {
 
 pub(crate) mod passthrough;
 pub(crate) mod scan;
+pub(crate) mod set_op;
