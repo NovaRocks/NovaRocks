@@ -71,6 +71,7 @@ pub(crate) fn derive_output(
         Operator::PhysicalCTEProduce(o) => o.derive_output(children_outputs),
         Operator::PhysicalRepeat(o) => o.derive_output(children_outputs),
         Operator::PhysicalTableFunction(o) => o.derive_output(children_outputs),
+        Operator::PhysicalWindow(o) => o.derive_output(children_outputs),
         _ => PhysicalPropertySet::any(),
     }
 }
@@ -99,6 +100,7 @@ pub(crate) fn derive_required(
         Operator::PhysicalCTEProduce(o) => o.derive_required(parent_required, num_children),
         Operator::PhysicalRepeat(o) => o.derive_required(parent_required, num_children),
         Operator::PhysicalTableFunction(o) => o.derive_required(parent_required, num_children),
+        Operator::PhysicalWindow(o) => o.derive_required(parent_required, num_children),
         _ => vec![PhysicalPropertySet::any(); num_children],
     }
 }
@@ -162,3 +164,4 @@ pub(crate) mod enforcer;
 pub(crate) mod passthrough;
 pub(crate) mod scan;
 pub(crate) mod set_op;
+pub(crate) mod window;
