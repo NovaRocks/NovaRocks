@@ -256,4 +256,64 @@ mod tests {
             }
         }
     }
+
+    // ── Task 17: Broadcast non-preserves-left → output stays Any ─────────────
+
+    fn broadcast_with_type(jk: crate::sql::analysis::JoinKind) -> PhysicalHashJoinOp {
+        PhysicalHashJoinOp {
+            join_type: jk,
+            eq_conditions: vec![PhysicalHashJoinEqCondition {
+                left: col(10),
+                right: col(20),
+                null_safe: false,
+            }],
+            other_condition: None,
+            distribution: JoinDistribution::Broadcast,
+        }
+    }
+
+    #[test]
+    fn hash_join_broadcast_right_outer_returns_any() {
+        let op = broadcast_with_type(crate::sql::analysis::JoinKind::RightOuter);
+        let left_out = PhysicalPropertySet {
+            distribution: DistributionSpec::HashPartitioned(vec![ColumnId(10)]),
+            ordering: OrderingSpec::Any,
+        };
+        let out = op.derive_output(&[&left_out, &PhysicalPropertySet::gather()]);
+        assert_eq!(out.distribution, DistributionSpec::Any);
+    }
+
+    #[test]
+    fn hash_join_broadcast_right_semi_returns_any() {
+        let op = broadcast_with_type(crate::sql::analysis::JoinKind::RightSemi);
+        let left_out = PhysicalPropertySet {
+            distribution: DistributionSpec::HashPartitioned(vec![ColumnId(10)]),
+            ordering: OrderingSpec::Any,
+        };
+        let out = op.derive_output(&[&left_out, &PhysicalPropertySet::gather()]);
+        assert_eq!(out.distribution, DistributionSpec::Any);
+    }
+
+    #[test]
+    fn hash_join_broadcast_right_anti_returns_any() {
+        let op = broadcast_with_type(crate::sql::analysis::JoinKind::RightAnti);
+        let left_out = PhysicalPropertySet {
+            distribution: DistributionSpec::HashPartitioned(vec![ColumnId(10)]),
+            ordering: OrderingSpec::Any,
+        };
+        let out = op.derive_output(&[&left_out, &PhysicalPropertySet::gather()]);
+        assert_eq!(out.distribution, DistributionSpec::Any);
+    }
+
+    #[test]
+    fn hash_join_broadcast_full_outer_returns_any() {
+        let op = broadcast_with_type(crate::sql::analysis::JoinKind::FullOuter);
+        let left_out = PhysicalPropertySet {
+            distribution: DistributionSpec::HashPartitioned(vec![ColumnId(10)]),
+            ordering: OrderingSpec::Any,
+        };
+        let out = op.derive_output(&[&left_out, &PhysicalPropertySet::gather()]);
+        assert_eq!(out.distribution, DistributionSpec::Any);
+    }
+
 }
