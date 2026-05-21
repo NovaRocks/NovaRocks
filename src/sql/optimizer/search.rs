@@ -42,6 +42,7 @@ pub(crate) struct Winner {
     /// enforcer winner, this equals the required properties (because the
     /// enforcer was selected to bridge `provided -> required`). Otherwise
     /// it equals the natural output of the chosen physical expression.
+    #[allow(dead_code)]
     pub(crate) output: PhysicalPropertySet,
 }
 
