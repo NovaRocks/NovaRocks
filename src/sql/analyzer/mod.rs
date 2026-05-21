@@ -3580,6 +3580,47 @@ mod tests {
     }
 
     #[test]
+    fn test_group_by_grouping_sets_single_column_resolves() {
+        // Reduced from sql-tests/aggregate/agg_grouping_sets_v1 query 5:
+        //     GROUP BY GROUPING SETS((), (k1))
+        // Failed in standalone server with "Column 'k1' cannot be resolved.".
+        let sql = "SELECT o_orderstatus, count(*) AS cnt \
+                   FROM orders \
+                   GROUP BY GROUPING SETS((), (o_orderstatus))";
+        let resolved =
+            parse_and_analyze(sql).expect("GROUPING SETS with single-column set should analyze");
+        if let QueryBody::Select(ref sel) = resolved.body {
+            let repeat = sel
+                .repeat
+                .as_ref()
+                .expect("GROUPING SETS should produce RepeatInfo");
+            assert_eq!(repeat.repeat_column_ref_list.len(), 2);
+        } else {
+            panic!("expected Select body with RepeatInfo");
+        }
+    }
+
+    #[test]
+    fn test_group_by_grouping_sets_single_column_via_starrocks_dialect() {
+        // Same as the test above but uses the StarRocks dialect via
+        // parse_and_analyze_with_registry — the production parse path.
+        let sql = "SELECT o_orderstatus, count(*) AS cnt \
+                   FROM orders \
+                   GROUP BY GROUPING SETS((), (o_orderstatus))";
+        let (resolved, _) = parse_and_analyze_with_registry(sql)
+            .expect("GROUPING SETS via StarRocks dialect should analyze");
+        if let QueryBody::Select(ref sel) = resolved.body {
+            let repeat = sel
+                .repeat
+                .as_ref()
+                .expect("GROUPING SETS should produce RepeatInfo");
+            assert_eq!(repeat.repeat_column_ref_list.len(), 2);
+        } else {
+            panic!("expected Select body with RepeatInfo");
+        }
+    }
+
+    #[test]
     fn test_group_by_grouping_sets_with_grouping_id() {
         let sql = "SELECT o_orderstatus, o_orderpriority, \
                           grouping_id(o_orderstatus, o_orderpriority) as gid, \

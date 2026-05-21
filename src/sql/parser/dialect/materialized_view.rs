@@ -29,7 +29,7 @@ pub(crate) fn looks_like_create_materialized_view(parser: &Parser<'_>) -> bool {
 ///   [COMMENT '...']
 ///   [PARTITION BY col[, ...]]    -- parsed and retained
 ///   DISTRIBUTED BY HASH(col, ...) [BUCKETS n]
-///   [REFRESH DEFERRED MANUAL]    -- IMMEDIATE / ASYNC rejected
+///   [REFRESH [DEFERRED] MANUAL]  -- IMMEDIATE / ASYNC rejected
 ///   [ORDER BY ...]               -- rejected
 ///   [PROPERTIES(...)]            -- parsed and retained on the AST node
 ///   AS <query>`
@@ -232,17 +232,17 @@ fn parse_refresh_clause(parser: &mut Parser<'_>) -> Result<bool, String> {
     if parser.parse_keyword(Keyword::IMMEDIATE) {
         return Err("REFRESH IMMEDIATE is not supported yet".to_string());
     }
+    // DEFERRED is optional per StarRocks grammar
+    // (`REFRESH (IMMEDIATE | DEFERRED)? (ASYNC ... | MANUAL)`).
+    let _ = parser.parse_keyword(Keyword::DEFERRED);
     // ASYNC is not a sqlparser keyword; detect it textually.
     if peek_word_eq(parser, 0, "ASYNC") {
         parser.next_token();
         return Err("REFRESH ASYNC is not supported yet".to_string());
     }
-    parser
-        .expect_keyword(Keyword::DEFERRED)
-        .map_err(|e| format!("expected REFRESH DEFERRED MANUAL: {e}"))?;
     // MANUAL is not a sqlparser keyword; detect it textually.
     if !peek_word_eq(parser, 0, "MANUAL") {
-        return Err("expected REFRESH DEFERRED MANUAL".to_string());
+        return Err("expected REFRESH [DEFERRED] MANUAL".to_string());
     }
     parser.next_token(); // MANUAL
     Ok(true)
@@ -463,6 +463,21 @@ mod tests {
                 .bucket_count,
             Some(4)
         );
+        assert!(mv.refresh_manual_explicit);
+    }
+
+    #[test]
+    fn parse_create_mv_accepts_refresh_manual_without_deferred() {
+        let stmt = parse_one(
+            "CREATE MATERIALIZED VIEW mv1 \
+             DISTRIBUTED BY HASH(k1) BUCKETS 4 \
+             REFRESH MANUAL \
+             AS SELECT k1 FROM iceberg_cat.ns.orders",
+        );
+        let mv = match stmt {
+            Statement::CreateMaterializedView(mv) => mv,
+            other => panic!("unexpected stmt: {other:?}"),
+        };
         assert!(mv.refresh_manual_explicit);
     }
 
