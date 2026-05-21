@@ -64,6 +64,13 @@ pub(crate) fn derive_output(
         Operator::PhysicalExcept(o) => o.derive_output(children_outputs),
         Operator::PhysicalCTEAnchor(o) => o.derive_output(children_outputs),
         Operator::PhysicalDistribution(o) => o.derive_output(children_outputs),
+        Operator::PhysicalFilter(o) => o.derive_output(children_outputs),
+        Operator::PhysicalProject(o) => o.derive_output(children_outputs),
+        Operator::PhysicalLimit(o) => o.derive_output(children_outputs),
+        Operator::PhysicalSubqueryAlias(o) => o.derive_output(children_outputs),
+        Operator::PhysicalCTEProduce(o) => o.derive_output(children_outputs),
+        Operator::PhysicalRepeat(o) => o.derive_output(children_outputs),
+        Operator::PhysicalTableFunction(o) => o.derive_output(children_outputs),
         _ => PhysicalPropertySet::any(),
     }
 }
@@ -85,6 +92,13 @@ pub(crate) fn derive_required(
         Operator::PhysicalExcept(o) => o.derive_required(parent_required, num_children),
         Operator::PhysicalCTEAnchor(o) => o.derive_required(parent_required, num_children),
         Operator::PhysicalDistribution(o) => o.derive_required(parent_required, num_children),
+        Operator::PhysicalFilter(o) => o.derive_required(parent_required, num_children),
+        Operator::PhysicalProject(o) => o.derive_required(parent_required, num_children),
+        Operator::PhysicalLimit(o) => o.derive_required(parent_required, num_children),
+        Operator::PhysicalSubqueryAlias(o) => o.derive_required(parent_required, num_children),
+        Operator::PhysicalCTEProduce(o) => o.derive_required(parent_required, num_children),
+        Operator::PhysicalRepeat(o) => o.derive_required(parent_required, num_children),
+        Operator::PhysicalTableFunction(o) => o.derive_required(parent_required, num_children),
         _ => vec![PhysicalPropertySet::any(); num_children],
     }
 }
