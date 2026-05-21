@@ -316,4 +316,52 @@ mod tests {
         assert_eq!(out.distribution, DistributionSpec::Any);
     }
 
+    // ── Task 18: Colocate preserves-left + negative ───────────────────────────
+
+    fn colocate_inner(eq_left: u32, eq_right: u32) -> PhysicalHashJoinOp {
+        PhysicalHashJoinOp {
+            join_type: crate::sql::analysis::JoinKind::Inner,
+            eq_conditions: vec![PhysicalHashJoinEqCondition {
+                left: col(eq_left),
+                right: col(eq_right),
+                null_safe: false,
+            }],
+            other_condition: None,
+            distribution: JoinDistribution::Colocate,
+        }
+    }
+
+    #[test]
+    fn hash_join_colocate_inner_preserves_left_distribution() {
+        let op = colocate_inner(10, 20);
+        let left_out = PhysicalPropertySet {
+            distribution: DistributionSpec::HashPartitioned(vec![ColumnId(10)]),
+            ordering: OrderingSpec::Any,
+        };
+        let right_out = PhysicalPropertySet {
+            distribution: DistributionSpec::HashPartitioned(vec![ColumnId(20)]),
+            ordering: OrderingSpec::Any,
+        };
+        let out = op.derive_output(&[&left_out, &right_out]);
+        assert_eq!(
+            out.distribution,
+            DistributionSpec::HashPartitioned(vec![ColumnId(10)])
+        );
+    }
+
+    #[test]
+    fn hash_join_colocate_right_outer_returns_any() {
+        let mut op = colocate_inner(10, 20);
+        op.join_type = crate::sql::analysis::JoinKind::RightOuter;
+        let left_out = PhysicalPropertySet {
+            distribution: DistributionSpec::HashPartitioned(vec![ColumnId(10)]),
+            ordering: OrderingSpec::Any,
+        };
+        let right_out = PhysicalPropertySet {
+            distribution: DistributionSpec::HashPartitioned(vec![ColumnId(20)]),
+            ordering: OrderingSpec::Any,
+        };
+        let out = op.derive_output(&[&left_out, &right_out]);
+        assert_eq!(out.distribution, DistributionSpec::Any);
+    }
 }
