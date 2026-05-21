@@ -76,6 +76,7 @@ pub(crate) fn derive_output(
         Operator::PhysicalHashAggregate(o) => o.derive_output(children_outputs),
         Operator::PhysicalSort(o) => o.derive_output(children_outputs),
         Operator::PhysicalTopN(o) => o.derive_output(children_outputs),
+        Operator::PhysicalHashJoin(o) => o.derive_output(children_outputs),
         _ => PhysicalPropertySet::any(),
     }
 }
@@ -109,6 +110,7 @@ pub(crate) fn derive_required(
         Operator::PhysicalHashAggregate(o) => o.derive_required(parent_required, num_children),
         Operator::PhysicalSort(o) => o.derive_required(parent_required, num_children),
         Operator::PhysicalTopN(o) => o.derive_required(parent_required, num_children),
+        Operator::PhysicalHashJoin(o) => o.derive_required(parent_required, num_children),
         _ => vec![PhysicalPropertySet::any(); num_children],
     }
 }
@@ -170,6 +172,7 @@ pub(crate) enum EnforcerKind {
 pub(crate) mod cte;
 pub(crate) mod enforcer;
 pub(crate) mod hash_aggregate;
+pub(crate) mod hash_join;
 pub(crate) mod nest_loop_join;
 pub(crate) mod passthrough;
 pub(crate) mod scan;
