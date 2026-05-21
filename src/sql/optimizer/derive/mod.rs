@@ -54,9 +54,11 @@ pub(crate) fn derive_output(
     // Each per-op match arm is added by its own Task in this plan.
     // The catch-all returns Any so unimplemented ops fall back to today's
     // conservative behaviour during incremental rollout.
-    let _ = children_outputs;
     match op {
-        // arms inserted by Tasks 3–13
+        Operator::PhysicalScan(o) => o.derive_output(children_outputs),
+        Operator::PhysicalValues(o) => o.derive_output(children_outputs),
+        Operator::PhysicalGenerateSeries(o) => o.derive_output(children_outputs),
+        Operator::PhysicalCTEConsume(o) => o.derive_output(children_outputs),
         _ => PhysicalPropertySet::any(),
     }
 }
@@ -68,9 +70,11 @@ pub(crate) fn derive_required(
     parent_required: &PhysicalPropertySet,
     num_children: usize,
 ) -> Vec<PhysicalPropertySet> {
-    let _ = parent_required;
     match op {
-        // arms inserted by Tasks 3–13
+        Operator::PhysicalScan(o) => o.derive_required(parent_required, num_children),
+        Operator::PhysicalValues(o) => o.derive_required(parent_required, num_children),
+        Operator::PhysicalGenerateSeries(o) => o.derive_required(parent_required, num_children),
+        Operator::PhysicalCTEConsume(o) => o.derive_required(parent_required, num_children),
         _ => vec![PhysicalPropertySet::any(); num_children],
     }
 }
@@ -130,3 +134,4 @@ pub(crate) enum EnforcerKind {
 // ---------------------------------------------------------------------------
 
 pub(crate) mod passthrough;
+pub(crate) mod scan;
