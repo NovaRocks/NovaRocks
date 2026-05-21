@@ -1,6 +1,25 @@
-//! Shared helpers for "passthrough" operators (Filter, Project, Limit,
-//! SubqueryAlias, CTEProduce, Repeat, TableFunction) — operators that
-//! preserve their single child's distribution and ordering.
+//! Passthrough operators — operators with a single child whose output mirrors
+//! the child's output. Two flavours:
+//!
+//! 1. **Distribution-blind** (Filter / Project / SubqueryAlias / CTEProduce /
+//!    Repeat): these operators do not constrain their child's distribution.
+//!    Their `derive_required` therefore returns `Any` for the child slot,
+//!    letting the optimizer freely choose the cheapest distribution for the
+//!    subtree below. Any mismatch with the parent's required distribution is
+//!    handled by an enforcer placed **above** the passthrough — preserving
+//!    distributed execution of the passthrough's computation (StarRocks
+//!    canonical: `Gather → Project → Scan` rather than `Project → Gather →
+//!    Scan`).
+//!
+//! 2. **Full-passthrough** (Limit / TableFunction): the parent's required
+//!    distribution is propagated to the child. For Limit this is required
+//!    for correctness — a global `LIMIT 10` must run on a single instance,
+//!    so the child must already be Gather-ed before Limit fires.
+//!    TableFunction's semantics are operator-specific and not generally
+//!    distribution-blind; we keep the safe pass-through here.
+//!
+//! For both flavours `derive_output` is the single child's output (via
+//! `passthrough_output`).
 
 use crate::sql::optimizer::property::PhysicalPropertySet;
 
@@ -13,8 +32,21 @@ pub(crate) fn passthrough_output(children_outputs: &[&PhysicalPropertySet]) -> P
         .unwrap_or_else(PhysicalPropertySet::any)
 }
 
-/// Required input of a passthrough operator equals its parent's required.
-pub(crate) fn passthrough_required(
+/// Required input of a **distribution-blind** passthrough operator: returns
+/// `[Any]` so the child is free to pick the cheapest distribution. Any
+/// mismatch with the parent's required distribution is resolved by an
+/// enforcer placed above the passthrough.
+pub(crate) fn passthrough_required_distribution_blind(
+    _parent_required: &PhysicalPropertySet,
+) -> Vec<PhysicalPropertySet> {
+    vec![PhysicalPropertySet::any()]
+}
+
+/// Required input of a **full-passthrough** operator: forwards the parent's
+/// required distribution and ordering verbatim. Use for operators whose
+/// correctness depends on the child satisfying the parent's distribution
+/// before they fire (e.g. global `LIMIT` requires Gather).
+pub(crate) fn passthrough_required_full(
     parent_required: &PhysicalPropertySet,
 ) -> Vec<PhysicalPropertySet> {
     vec![parent_required.clone()]
@@ -27,9 +59,8 @@ use crate::sql::optimizer::operator::{
 
 use super::{DeriveOutput, DeriveRequired};
 
-// Output follows the single child via passthrough_output. Required input is
-// passed through via passthrough_required.
-macro_rules! passthrough_impls {
+/// Distribution-blind passthroughs: `derive_required` returns `[Any]`.
+macro_rules! passthrough_distribution_blind_impls {
     ($($op:ty),+ $(,)?) => {
         $(
             impl DeriveOutput for $op {
@@ -47,22 +78,48 @@ macro_rules! passthrough_impls {
                     parent_required: &PhysicalPropertySet,
                     _n: usize,
                 ) -> Vec<PhysicalPropertySet> {
-                    passthrough_required(parent_required)
+                    passthrough_required_distribution_blind(parent_required)
                 }
             }
         )+
     };
 }
 
-passthrough_impls!(
+passthrough_distribution_blind_impls!(
     PhysicalFilterOp,
     PhysicalProjectOp,
-    PhysicalLimitOp,
     PhysicalSubqueryAliasOp,
     PhysicalCTEProduceOp,
     PhysicalRepeatOp,
-    PhysicalTableFunctionOp,
 );
+
+/// Full-passthrough operators: `derive_required` forwards `parent_required`.
+macro_rules! passthrough_full_impls {
+    ($($op:ty),+ $(,)?) => {
+        $(
+            impl DeriveOutput for $op {
+                fn derive_output(
+                    &self,
+                    children: &[&PhysicalPropertySet],
+                ) -> PhysicalPropertySet {
+                    passthrough_output(children)
+                }
+            }
+
+            impl DeriveRequired for $op {
+                fn derive_required(
+                    &self,
+                    parent_required: &PhysicalPropertySet,
+                    _n: usize,
+                ) -> Vec<PhysicalPropertySet> {
+                    passthrough_required_full(parent_required)
+                }
+            }
+        )+
+    };
+}
+
+passthrough_full_impls!(PhysicalLimitOp, PhysicalTableFunctionOp);
 
 #[cfg(test)]
 mod tests {
@@ -101,18 +158,44 @@ mod tests {
         }
     }
 
-    // --- pre-existing test (kept) ---
+    // --- Required derivation ---
 
     #[test]
-    fn filter_passthrough_parent_required() {
+    fn filter_required_is_distribution_blind() {
+        // Filter does not constrain its child's distribution: returning [Any]
+        // lets the child pick the cheapest plan; any mismatch with the
+        // parent's required distribution becomes an enforcer above Filter.
         let op = bool_filter();
         let parent_req = PhysicalPropertySet::gather();
         let child_reqs = op.derive_required(&parent_req, 1);
         assert_eq!(child_reqs.len(), 1);
-        assert_eq!(child_reqs[0], parent_req);
+        assert_eq!(child_reqs[0], PhysicalPropertySet::any());
     }
 
-    // --- new TDD tests for Task 20 ---
+    #[test]
+    fn project_required_is_distribution_blind() {
+        let op = make_minimal_project_op();
+        let parent_req = PhysicalPropertySet {
+            distribution: DistributionSpec::HashPartitioned(vec![ColumnId(1)]),
+            ordering: OrderingSpec::Any,
+        };
+        let child_reqs = op.derive_required(&parent_req, 1);
+        assert_eq!(child_reqs.len(), 1);
+        assert_eq!(child_reqs[0], PhysicalPropertySet::any());
+    }
+
+    #[test]
+    fn limit_required_forwards_parent() {
+        // Limit is a *full-passthrough*: a global LIMIT must run on a single
+        // instance, so the child must already satisfy the parent's
+        // distribution (typically Gather) before Limit fires.
+        let op = make_minimal_limit_op();
+        let parent = PhysicalPropertySet::gather();
+        let reqs = op.derive_required(&parent, 1);
+        assert_eq!(reqs, vec![parent]);
+    }
+
+    // --- Output derivation (follows single child) ---
 
     #[test]
     fn passthrough_filter_output_follows_child() {
@@ -135,14 +218,6 @@ mod tests {
         };
         let out = op.derive_output(&[&child]);
         assert_eq!(out, child);
-    }
-
-    #[test]
-    fn passthrough_required_returns_parent() {
-        let op = make_minimal_limit_op();
-        let parent = PhysicalPropertySet::gather();
-        let reqs = op.derive_required(&parent, 1);
-        assert_eq!(reqs, vec![parent]);
     }
 
     #[test]

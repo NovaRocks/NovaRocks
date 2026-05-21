@@ -118,13 +118,30 @@ src/sql/optimizer/derive/
 ```
 
 Each file implements both traits on the corresponding physical-op struct.
-`passthrough.rs` exposes two helpers used by all seven passthrough impls:
+`passthrough.rs` exposes three helpers; passthrough operators are split into
+two flavours based on whether they constrain the child's distribution (see
+§3.4 for the rationale):
 
 ```rust
 pub(crate) fn passthrough_output(children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
     children.first().copied().cloned().unwrap_or_else(PhysicalPropertySet::any)
 }
-pub(crate) fn passthrough_required(parent: &PhysicalPropertySet) -> Vec<PhysicalPropertySet> {
+
+/// Distribution-blind passthrough (Filter, Project, SubqueryAlias,
+/// CTEProduce, Repeat): child's required distribution is `Any`. Any
+/// mismatch with the parent's required distribution becomes an enforcer
+/// placed *above* the passthrough.
+pub(crate) fn passthrough_required_distribution_blind(
+    _parent: &PhysicalPropertySet,
+) -> Vec<PhysicalPropertySet> {
+    vec![PhysicalPropertySet::any()]
+}
+
+/// Full-passthrough (Limit, TableFunction): forwards parent's required.
+/// Used when the operator's correctness depends on the child satisfying
+/// the parent's distribution before the operator fires (e.g. global
+/// `LIMIT` requires Gather).
+pub(crate) fn passthrough_required_full(parent: &PhysicalPropertySet) -> Vec<PhysicalPropertySet> {
     vec![parent.clone()]
 }
 ```
@@ -142,7 +159,8 @@ Bold rows are the operators whose behaviour changes vs. today.
 | Op | `derive_output` | `derive_required` | Δ |
 |---|---|---|---|
 | `Scan` / `Values` / `GenerateSeries` / `CTEConsume` | `Any` | `[]` | = |
-| **`Filter` / `Project` / `Limit` / `SubqueryAlias` / `CTEProduce` / `Repeat` / `TableFunction`** | **child[0]** | `[parent_required]` | **★ output now follows child** |
+| **`Filter` / `Project` / `SubqueryAlias` / `CTEProduce` / `Repeat`** (distribution-blind passthrough — see §3.4) | **child[0]** | **`[Any]`** | **★ output follows child; required is distribution-blind** |
+| **`Limit` / `TableFunction`** (full-passthrough — see §3.4) | **child[0]** | `[parent_required]` | **★ output now follows child** |
 | `Window` | `Hash(partition_cols)` if all PARTITION BY entries are column-refs; else `Any` | `[Hash(partition_cols)]` if non-empty; else `[Gather]` | = |
 | `HashJoin` (Shuffle) | `Hash(left_eq_keys)` | `[Hash(all_eq_cols), Hash(all_eq_cols)]` | = |
 | **`HashJoin` (Broadcast, preserves-left)** | **`child[0].distribution`**, ordering `Any` | `[push_or_any, Gather]` — see §3.2 | **★** |
@@ -226,6 +244,48 @@ combined output indeed satisfies `parent_required`.
 Pushing through Colocate is meaningful only once `HashSource` (G4) can
 distinguish "colocate-bucketed hash" from "shuffle-produced hash" — left for
 G4.
+
+### §3.4 Two flavours of passthrough
+
+The seven single-child operators that "preserve" their input split into two
+distribution flavours:
+
+| Flavour | Operators | `derive_required` |
+|---|---|---|
+| **Distribution-blind** | `Filter` / `Project` / `SubqueryAlias` / `CTEProduce` / `Repeat` | `[Any]` |
+| **Full-passthrough** | `Limit` / `TableFunction` | `[parent_required]` |
+
+**Why distribution-blind for Filter/Project/etc**: these operators do not
+themselves constrain the distribution of their input. If the parent above
+requires `Gather` (e.g. a top-level result on a single instance), forwarding
+`Gather` to the child means the entire subtree runs single-instance, with
+the passthrough sitting **above** a `Gather` operator that has already
+serialised everything. That defeats the parallelism the passthrough could
+have provided — `Project` evaluating a column rewrite is perfectly happy to
+run distributed, and so are `Filter` and `SubqueryAlias`.
+
+Returning `[Any]` instead lets the child pick the cheapest distribution
+(usually whatever the underlying scan or join naturally produces); the
+mismatch with the parent's required is resolved by an enforcer placed
+**above** the passthrough, yielding the StarRocks-canonical shape
+`Gather → Filter/Project → ...` rather than `Filter/Project → Gather → ...`.
+The passthrough's own `derive_output` still follows its child (Invariant 3),
+so when the child genuinely already satisfies the parent's distribution
+(e.g. via subset hash partitioning) no enforcer is needed at all.
+
+**Why full-passthrough for Limit**: a global `LIMIT 10` is only correct when
+executed on a single instance. If we returned `[Any]` for Limit, the
+optimizer could choose to run Limit distributed (each instance retaining 10
+rows), then Gather above Limit, yielding up to `10 × N` rows in the result —
+incorrect. Forwarding the parent's `Gather` to Limit's child forces the
+child to deliver gathered output, and Limit operates on the single-instance
+data.
+
+**Why full-passthrough for TableFunction**: `PhysicalTableFunctionOp` covers
+a heterogeneous family of UDTF-like operators with operator-specific
+semantics (positional dependence, side effects, ordering sensitivity). We
+keep the safe full-passthrough behaviour here; refining individual table
+functions to be distribution-blind is a follow-up.
 
 ---
 
@@ -365,7 +425,9 @@ Concrete must-have cases:
 | `hash_join_colocate_required_returns_any_any` | parent=Hash([c0]) → both child reqs=Any |
 | `passthrough_filter_output_follows_child` | child=Hash([c0]) → output=Hash([c0]) |
 | `passthrough_project_output_preserves_ordering` | child=Hash+Required → output preserves both |
-| `passthrough_required_returns_parent` | parent=Gather → child_req=Gather |
+| `filter_required_is_distribution_blind` | parent=Gather → child_req=Any (distribution-blind) |
+| `project_required_is_distribution_blind` | parent=Hash([c1]) → child_req=Any |
+| `limit_required_forwards_parent` | parent=Gather → child_req=Gather (full-passthrough) |
 | `passthrough_no_children_falls_back_to_any` | children=[] → output=Any (defensive) |
 
 All existing tests in `search.rs::tests` and `search.rs::top_n_property_tests`
