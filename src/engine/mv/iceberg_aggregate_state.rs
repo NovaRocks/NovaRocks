@@ -131,7 +131,18 @@ fn validate_physical_aggregate_schema(
                         "{context}: convert expected physical aggregate column `{expected_name}` type failed: {e}"
                     )
                 })?;
-        if actual.data_type() != &expected_type {
+        // Use a metadata-ignoring shape comparison instead of strict `!=`.
+        // Map<K, V> columns scanned from Iceberg parquet carry
+        // `PARQUET:field_id` metadata on inner Struct fields that the
+        // layout-derived `expected_type` does not have, and the Iceberg map
+        // convention uses non-null inner key fields while the
+        // `sql_type_to_arrow_type`-derived expected uses nullable inner key
+        // fields. Both are semantically the same shape. Top-level column
+        // nullability is still enforced by the `is_nullable` check below.
+        if !crate::engine::sql_expr::arrow_type_equals_ignoring_metadata(
+            actual.data_type(),
+            &expected_type,
+        ) {
             return Err(format!(
                 "{context}: physical aggregate schema column {idx} `{expected_name}` type mismatch: got {:?} expected {:?}",
                 actual.data_type(),
@@ -1343,5 +1354,146 @@ mod tests {
             validate_physical_aggregate_schema(&layout, &wrong_nullability, "wrong nullability")
                 .expect_err("wrong nullability rejected");
         assert!(err.contains("nullability mismatch"), "err={err}");
+    }
+
+    /// Regression test for IVM-P5 four-bug-chain bug #4: Map<K, V> columns
+    /// scanned from Iceberg parquet carry `PARQUET:field_id` metadata on
+    /// the inner Struct fields, the Iceberg map convention names the
+    /// entries field `key_value`, and the inner key is non-nullable.
+    /// `validate_physical_aggregate_schema` must accept this shape against a
+    /// layout-derived expected type that uses `sql_type_to_arrow_type`'s
+    /// "entries" + nullable-inner-key convention with no metadata.
+    ///
+    /// The test rebuilds a synthetic batch whose Map column carries
+    /// PARQUET:field_id metadata on inner Struct fields, then casts the
+    /// Map array values into the field-id-annotated type so the batch is
+    /// constructable. Validation must succeed.
+    #[test]
+    fn validate_physical_schema_accepts_min_max_state_map_with_field_id_metadata() {
+        use std::collections::HashMap;
+
+        let row_id_column = managed_physical_column(
+            "__row_id__".to_string(),
+            SqlType::String,
+            false,
+            false,
+            true,
+        );
+        let region_column =
+            managed_physical_column("region".to_string(), SqlType::String, true, true, false);
+        let mn_column =
+            managed_physical_column("mn".to_string(), SqlType::BigInt, true, true, false);
+        let state_column = managed_physical_column(
+            "__agg_state_mn".to_string(),
+            SqlType::Map(Box::new(SqlType::BigInt), Box::new(SqlType::BigInt)),
+            false,
+            false,
+            false,
+        );
+
+        let layout = AggregateMvLayout {
+            row_id_column: row_id_column.clone(),
+            visible_columns: vec![
+                AggregateVisibleColumn {
+                    name: "region".to_string(),
+                    data_type: DataType::Utf8,
+                    sql_type: SqlType::String,
+                    nullable: true,
+                    source_index: 0,
+                },
+                AggregateVisibleColumn {
+                    name: "mn".to_string(),
+                    data_type: DataType::Int64,
+                    sql_type: SqlType::BigInt,
+                    nullable: true,
+                    source_index: 1,
+                },
+            ],
+            state_columns: vec![AggregateStateColumn {
+                name: "__agg_state_mn".to_string(),
+                data_type: DataType::Int64,
+                sql_type: SqlType::BigInt,
+                nullable: false,
+                visible_source_index: 1,
+                aggregate_index: 0,
+                function: AggregateFunctionKind::Min,
+                state_role: AggregateStateRole::Single,
+                count_star: false,
+            }],
+            group_key_source_indexes: vec![0],
+            physical_columns: vec![row_id_column, region_column, mn_column, state_column],
+        };
+
+        // Step 1: build an empty Map via the standard MapBuilder using
+        // Iceberg-rust 0.9 convention (entries field name "key_value",
+        // non-null inner key).
+        let mut builder = arrow::array::MapBuilder::new(
+            Some(arrow::array::MapFieldNames {
+                entry: "key_value".to_string(),
+                key: "key".to_string(),
+                value: "value".to_string(),
+            }),
+            arrow::array::Int64Builder::new(),
+            arrow::array::Int64Builder::new(),
+        );
+        builder.append(true).expect("append empty map row");
+        let raw_map = builder.finish();
+
+        // Step 2: synthesize a MapArray whose inner Struct Fields carry
+        // PARQUET:field_id metadata, by reconstructing the MapArray from
+        // its children using a Field with the new metadata.
+        let mut key_meta = HashMap::new();
+        key_meta.insert("PARQUET:field_id".to_string(), "9".to_string());
+        let mut value_meta = HashMap::new();
+        value_meta.insert("PARQUET:field_id".to_string(), "10".to_string());
+        let key_field = Arc::new(Field::new("key", DataType::Int64, false).with_metadata(key_meta));
+        let value_field =
+            Arc::new(Field::new("value", DataType::Int64, true).with_metadata(value_meta));
+        let entries_struct_type = DataType::Struct(arrow::datatypes::Fields::from(vec![
+            key_field.as_ref().clone(),
+            value_field.as_ref().clone(),
+        ]));
+        let entries_field = Arc::new(Field::new("key_value", entries_struct_type.clone(), false));
+
+        let raw_struct = raw_map.entries();
+        let new_struct = arrow::array::StructArray::new(
+            arrow::datatypes::Fields::from(vec![
+                key_field.as_ref().clone(),
+                value_field.as_ref().clone(),
+            ]),
+            raw_struct.columns().to_vec(),
+            raw_struct.nulls().cloned(),
+        );
+        let map_with_field_ids = arrow::array::MapArray::new(
+            entries_field.clone(),
+            raw_map.offsets().clone(),
+            new_struct,
+            raw_map.nulls().cloned(),
+            false,
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("__row_id__", DataType::Utf8, false),
+            Field::new("region", DataType::Utf8, true),
+            Field::new("mn", DataType::Int64, true),
+            Field::new("__agg_state_mn", DataType::Map(entries_field, false), false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["r1"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["r1"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                Arc::new(map_with_field_ids) as ArrayRef,
+            ],
+        )
+        .expect("field-id annotated map batch");
+
+        // The validator must accept this shape, even though it would fail
+        // under strict `!=` (PARQUET:field_id metadata on inner Struct
+        // fields plus differing inner-key nullability vs the expected type
+        // derived from sql_type_to_arrow_type).
+        validate_physical_aggregate_schema(&layout, &batch, "field-id annotated map")
+            .expect("Map<K, V> column with field-id metadata must validate");
     }
 }

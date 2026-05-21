@@ -391,12 +391,8 @@ fn annotate_batch(
         .zip(annotated_schema.fields().iter())
         .enumerate()
     {
-        let new_col = reannotate_array(col, target_field.data_type()).map_err(|e| {
-            format!(
-                "annotate_batch column {idx} ({}): {e}",
-                target_field.name()
-            )
-        })?;
+        let new_col = reannotate_array(col, target_field.data_type())
+            .map_err(|e| format!("annotate_batch column {idx} ({}): {e}", target_field.name()))?;
         new_columns.push(new_col);
     }
     RecordBatch::try_new(Arc::clone(annotated_schema), new_columns)
@@ -474,9 +470,12 @@ fn reannotate_array(
             Ok(Arc::new(new_map) as ArrayRef)
         }
         (DataType::Struct(_), DataType::Struct(target_fields)) => {
-            let struct_arr = array.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
-                "reannotate_array: Struct data_type but array is not StructArray".to_string()
-            })?;
+            let struct_arr = array
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| {
+                    "reannotate_array: Struct data_type but array is not StructArray".to_string()
+                })?;
             if struct_arr.num_columns() != target_fields.len() {
                 return Err(format!(
                     "reannotate_array: Struct child count mismatch: array={} target={}",
@@ -760,8 +759,11 @@ mod tests {
         ));
         let keys = Arc::new(Int64Array::from(vec![1_i64, 2, 3])) as ArrayRef;
         let values = Arc::new(Int64Array::from(vec![Some(10_i64), Some(20), None])) as ArrayRef;
-        let runtime_entries =
-            StructArray::new(runtime_entries_struct_fields.clone(), vec![keys, values], None);
+        let runtime_entries = StructArray::new(
+            runtime_entries_struct_fields.clone(),
+            vec![keys, values],
+            None,
+        );
         let offsets = OffsetBuffer::new(vec![0_i32, 2, 3].into());
         let runtime_map = MapArray::try_new(
             runtime_entries_field.clone(),
@@ -797,8 +799,12 @@ mod tests {
             false,
         ));
         let target_map_field = Arc::new(
-            Field::new("m", DataType::Map(target_entries_field.clone(), false), false)
-                .with_metadata(id_meta("5")),
+            Field::new(
+                "m",
+                DataType::Map(target_entries_field.clone(), false),
+                false,
+            )
+            .with_metadata(id_meta("5")),
         );
         let annotated_schema = Arc::new(Schema::new(vec![target_map_field]));
 

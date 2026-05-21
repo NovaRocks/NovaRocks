@@ -1105,6 +1105,72 @@ pub(crate) fn sql_type_to_arrow_type(sql_type: &SqlType) -> Result<DataType, Str
     }
 }
 
+/// Compare two Arrow [`DataType`]s for structural equality while ignoring
+/// nested [`Field`] metadata and nested-field nullability.
+///
+/// Motivation: Maps / Structs / Lists scanned from Iceberg parquet carry
+/// `PARQUET:field_id` metadata on every inner Field, and the Iceberg map
+/// convention uses non-null map keys, whereas the layout-derived expected
+/// type produced by [`sql_type_to_arrow_type`] does not carry any metadata
+/// and conservatively marks every nested field nullable. The two are
+/// semantically the same shape; the strict `PartialEq` on `DataType` rejects
+/// them.
+///
+/// This helper recurses through the container types (Map, Struct, List,
+/// LargeList, FixedSizeList, Dictionary, Union, RunEndEncoded) and compares
+/// only inner `DataType`s — never inner `Field` metadata, names, or
+/// nullability. Scalar types fall through to strict equality.
+///
+/// Callers that need top-level column nullability enforcement must keep
+/// their own `Field::is_nullable()` check; this helper deliberately operates
+/// on `DataType` only.
+pub(crate) fn arrow_type_equals_ignoring_metadata(a: &DataType, b: &DataType) -> bool {
+    use DataType::*;
+    match (a, b) {
+        (List(a), List(b))
+        | (LargeList(a), LargeList(b))
+        | (ListView(a), ListView(b))
+        | (LargeListView(a), LargeListView(b)) => {
+            arrow_type_equals_ignoring_metadata(a.data_type(), b.data_type())
+        }
+        (FixedSizeList(a, a_size), FixedSizeList(b, b_size)) => {
+            a_size == b_size && arrow_type_equals_ignoring_metadata(a.data_type(), b.data_type())
+        }
+        (Struct(a), Struct(b)) => {
+            a.len() == b.len()
+                && a.iter().zip(b.iter()).all(|(af, bf)| {
+                    arrow_type_equals_ignoring_metadata(af.data_type(), bf.data_type())
+                })
+        }
+        (Map(a_field, a_sorted), Map(b_field, b_sorted)) => {
+            a_sorted == b_sorted
+                && arrow_type_equals_ignoring_metadata(a_field.data_type(), b_field.data_type())
+        }
+        (Dictionary(a_key, a_value), Dictionary(b_key, b_value)) => {
+            arrow_type_equals_ignoring_metadata(a_key, b_key)
+                && arrow_type_equals_ignoring_metadata(a_value, b_value)
+        }
+        (RunEndEncoded(a_run_ends, a_values), RunEndEncoded(b_run_ends, b_values)) => {
+            arrow_type_equals_ignoring_metadata(a_run_ends.data_type(), b_run_ends.data_type())
+                && arrow_type_equals_ignoring_metadata(a_values.data_type(), b_values.data_type())
+        }
+        (Union(a_fields, a_mode), Union(b_fields, b_mode)) => {
+            a_mode == b_mode
+                && a_fields.len() == b_fields.len()
+                && a_fields.iter().all(|(a_tag, a_field)| {
+                    b_fields.iter().any(|(b_tag, b_field)| {
+                        a_tag == b_tag
+                            && arrow_type_equals_ignoring_metadata(
+                                a_field.data_type(),
+                                b_field.data_type(),
+                            )
+                    })
+                })
+        }
+        _ => a == b,
+    }
+}
+
 pub(crate) fn compare_literals(
     left: &Literal,
     right: &Literal,
@@ -1595,5 +1661,89 @@ mod tests {
         };
         let lit = sqlparser_function_to_literal(func).expect("BIGINT cast must fold");
         assert!(matches!(lit, Literal::String(_)));
+    }
+
+    #[test]
+    fn arrow_type_equals_ignoring_metadata_handles_scalar_and_nested_shapes() {
+        use std::collections::HashMap;
+        let mut meta = HashMap::new();
+        meta.insert("PARQUET:field_id".to_string(), "1".to_string());
+
+        // Scalars compare by equality.
+        assert!(arrow_type_equals_ignoring_metadata(
+            &DataType::Int64,
+            &DataType::Int64
+        ));
+        assert!(!arrow_type_equals_ignoring_metadata(
+            &DataType::Int64,
+            &DataType::Int32
+        ));
+
+        // Map: entries-field name and metadata differ; inner-key nullability
+        // differs. Helper must still report equal.
+        let actual = DataType::Map(
+            Arc::new(Field::new(
+                "key_value",
+                DataType::Struct(arrow::datatypes::Fields::from(vec![
+                    Field::new("key", DataType::Int64, false).with_metadata(meta.clone()),
+                    Field::new("value", DataType::Int64, true).with_metadata(meta.clone()),
+                ])),
+                false,
+            )),
+            false,
+        );
+        let expected = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(arrow::datatypes::Fields::from(vec![
+                    Field::new("key", DataType::Int64, true),
+                    Field::new("value", DataType::Int64, true),
+                ])),
+                false,
+            )),
+            false,
+        );
+        assert!(arrow_type_equals_ignoring_metadata(&actual, &expected));
+
+        // Map: differing inner value DataType must still be rejected.
+        let mismatched_value = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(arrow::datatypes::Fields::from(vec![
+                    Field::new("key", DataType::Int64, true),
+                    Field::new("value", DataType::Int32, true), // differs
+                ])),
+                false,
+            )),
+            false,
+        );
+        assert!(!arrow_type_equals_ignoring_metadata(
+            &actual,
+            &mismatched_value
+        ));
+
+        // List nesting: same shape with and without metadata compare equal.
+        let actual_list = DataType::List(Arc::new(
+            Field::new("item", DataType::Int64, true).with_metadata(meta.clone()),
+        ));
+        let expected_list = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
+        assert!(arrow_type_equals_ignoring_metadata(
+            &actual_list,
+            &expected_list
+        ));
+
+        // Map keys_sorted flag must still differentiate.
+        let sorted = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(arrow::datatypes::Fields::from(vec![
+                    Field::new("key", DataType::Int64, true),
+                    Field::new("value", DataType::Int64, true),
+                ])),
+                false,
+            )),
+            true,
+        );
+        assert!(!arrow_type_equals_ignoring_metadata(&expected, &sorted));
     }
 }
