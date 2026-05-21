@@ -88,7 +88,7 @@ impl DeriveOutput for PhysicalHashJoinOp {
 impl DeriveRequired for PhysicalHashJoinOp {
     fn derive_required(
         &self,
-        _parent: &PhysicalPropertySet,
+        parent_required: &PhysicalPropertySet,
         _n: usize,
     ) -> Vec<PhysicalPropertySet> {
         match self.distribution {
@@ -127,8 +127,19 @@ impl DeriveRequired for PhysicalHashJoinOp {
                 ]
             }
             JoinDistribution::Broadcast => {
-                // Refactor-phase placeholder. Task 19 adds pushdown.
-                vec![PhysicalPropertySet::any(), PhysicalPropertySet::gather()]
+                let left_req = if preserves_left(&self.join_type)
+                    && matches!(
+                        parent_required.distribution,
+                        DistributionSpec::HashPartitioned(_)
+                    ) {
+                    PhysicalPropertySet {
+                        distribution: parent_required.distribution.clone(),
+                        ordering: OrderingSpec::Any,
+                    }
+                } else {
+                    PhysicalPropertySet::any()
+                };
+                vec![left_req, PhysicalPropertySet::gather()]
             }
             JoinDistribution::Colocate => {
                 vec![PhysicalPropertySet::any(), PhysicalPropertySet::any()]
@@ -363,5 +374,55 @@ mod tests {
         };
         let out = op.derive_output(&[&left_out, &right_out]);
         assert_eq!(out.distribution, DistributionSpec::Any);
+    }
+
+    // ── Task 19: Broadcast required pushdown ─────────────────────────────────
+
+    #[test]
+    fn hash_join_broadcast_required_pushes_down_hash() {
+        let op = broadcast_inner(10, 20);
+        let parent = PhysicalPropertySet {
+            distribution: DistributionSpec::HashPartitioned(vec![ColumnId(10)]),
+            ordering: OrderingSpec::Any,
+        };
+        let reqs = op.derive_required(&parent, 2);
+        assert_eq!(
+            reqs[0].distribution,
+            DistributionSpec::HashPartitioned(vec![ColumnId(10)])
+        );
+        assert_eq!(reqs[1].distribution, DistributionSpec::Gather);
+    }
+
+    #[test]
+    fn hash_join_broadcast_required_does_not_push_gather() {
+        let op = broadcast_inner(10, 20);
+        let parent = PhysicalPropertySet::gather();
+        let reqs = op.derive_required(&parent, 2);
+        assert_eq!(reqs[0].distribution, DistributionSpec::Any);
+        assert_eq!(reqs[1].distribution, DistributionSpec::Gather);
+    }
+
+    #[test]
+    fn hash_join_broadcast_required_does_not_push_right_outer() {
+        let op = broadcast_with_type(crate::sql::analysis::JoinKind::RightOuter);
+        let parent = PhysicalPropertySet {
+            distribution: DistributionSpec::HashPartitioned(vec![ColumnId(10)]),
+            ordering: OrderingSpec::Any,
+        };
+        let reqs = op.derive_required(&parent, 2);
+        assert_eq!(reqs[0].distribution, DistributionSpec::Any);
+        assert_eq!(reqs[1].distribution, DistributionSpec::Gather);
+    }
+
+    #[test]
+    fn hash_join_colocate_required_returns_any_any() {
+        let op = colocate_inner(10, 20);
+        let parent = PhysicalPropertySet {
+            distribution: DistributionSpec::HashPartitioned(vec![ColumnId(10)]),
+            ordering: OrderingSpec::Any,
+        };
+        let reqs = op.derive_required(&parent, 2);
+        assert_eq!(reqs[0].distribution, DistributionSpec::Any);
+        assert_eq!(reqs[1].distribution, DistributionSpec::Any);
     }
 }
