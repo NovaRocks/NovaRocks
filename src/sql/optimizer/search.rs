@@ -12,8 +12,9 @@ use super::memo::{Cost, GroupId, Memo};
 use super::operator::*;
 use super::property::*;
 use super::stats::derive_statistics;
-use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::statistics::TableStatistics;
+
+pub(crate) use super::derive::EnforcerKind;
 
 // ---------------------------------------------------------------------------
 // Broadcast row-count threshold
@@ -42,7 +43,6 @@ pub(crate) struct Winner {
     /// enforcer winner, this equals the required properties (because the
     /// enforcer was selected to bridge `provided -> required`). Otherwise
     /// it equals the natural output of the chosen physical expression.
-    #[allow(dead_code)]
     pub(crate) output: PhysicalPropertySet,
 }
 
@@ -51,14 +51,10 @@ pub(crate) struct Winner {
 pub(crate) struct EnforcerInfo {
     pub(crate) kind: EnforcerKind,
     /// The child properties that the enforcer's input was optimized for.
+    /// Kept for debugging / future cross-checks; extract.rs walks the
+    /// underlying expr via `winner.expr_index` instead.
+    #[allow(dead_code)]
     pub(crate) child_props: PhysicalPropertySet,
-}
-
-/// The type of enforcer to insert.
-#[derive(Clone, Debug)]
-pub(crate) enum EnforcerKind {
-    Distribution(DistributionSpec),
-    Sort(OrderingSpec),
 }
 
 // ---------------------------------------------------------------------------
@@ -126,16 +122,12 @@ impl SearchContext {
         let mut best_cost = f64::INFINITY;
         let mut best_index: usize = 0;
         let mut best_enforcer: Option<EnforcerInfo> = None;
+        let mut best_output = PhysicalPropertySet::any();
 
         for expr_idx in 0..num_physical {
-            // We must re-borrow the group each iteration because
-            // optimize_group may be called recursively (but Memo is &-shared).
             let expr = &memo.groups[group_id].physical_exprs[expr_idx];
 
-            // --- Broadcast row-count threshold ---
-            // If this is a broadcast hash join, check whether the build side
-            // (right child) exceeds the hard row-count limit.  If so, skip
-            // this alternative entirely to avoid broadcasting large tables.
+            // Broadcast row-count threshold (unchanged from today).
             if let Operator::PhysicalHashJoin(ref j) = expr.op
                 && matches!(j.distribution, JoinDistribution::Broadcast)
                 && expr.children.get(1).is_some_and(|&build_group_id| {
@@ -147,100 +139,76 @@ impl SearchContext {
                 continue;
             }
 
-            let provided = output_properties(&expr.op);
+            // 1. Determine each child's required properties (top-down — no child
+            //    visibility yet).
+            let child_reqs =
+                super::derive::derive_required(&expr.op, required, expr.children.len());
 
-            if provided.satisfies(required) {
-                // --- Direct satisfaction path ---
-                let child_reqs = required_input_properties(&expr.op, required, expr.children.len());
+            // 2. Compute own cost.
+            let own_stats = derive_statistics(expr, memo, &self.table_stats);
+            let child_stats_vec: Vec<_> = expr
+                .children
+                .iter()
+                .map(|&cg| stats_for_group(&memo.groups[cg], memo, &self.table_stats))
+                .collect();
+            let child_stats_refs: Vec<&_> = child_stats_vec.iter().collect();
+            let own_cost = compute_cost(&expr.op, &own_stats, &child_stats_refs);
 
-                // Compute own cost.
-                let own_stats = derive_statistics(expr, memo, &self.table_stats);
-                let child_stats_vec: Vec<_> = expr
-                    .children
-                    .iter()
-                    .map(|&cg| {
-                        let child_group = &memo.groups[cg];
-                        stats_for_group(child_group, memo, &self.table_stats)
-                    })
-                    .collect();
-                let child_stats_refs: Vec<&_> = child_stats_vec.iter().collect();
-                let own_cost = compute_cost(&expr.op, &own_stats, &child_stats_refs);
-
-                // Recurse into children.
-                let mut total = own_cost;
-                let mut feasible = true;
-                for (i, &child_group_id) in expr.children.iter().enumerate() {
-                    let child_cost = self.optimize_group(memo, child_group_id, &child_reqs[i])?;
-                    if child_cost.is_infinite() {
-                        feasible = false;
-                        break;
-                    }
-                    total += child_cost;
+            // 3. Optimize each child; collect its winner output.
+            let mut total = own_cost;
+            let mut child_outputs: Vec<PhysicalPropertySet> =
+                Vec::with_capacity(expr.children.len());
+            let mut feasible = true;
+            for (i, &cg) in expr.children.iter().enumerate() {
+                let child_cost = self.optimize_group(memo, cg, &child_reqs[i])?;
+                if child_cost.is_infinite() {
+                    feasible = false;
+                    break;
                 }
+                total += child_cost;
+                let cw = self
+                    .winners
+                    .get(&(cg, child_reqs[i].clone()))
+                    .expect("child just optimized — winner must be in cache");
+                child_outputs.push(cw.output.clone());
+            }
+            if !feasible {
+                continue;
+            }
 
-                if feasible && total < best_cost {
-                    best_cost = total;
-                    best_index = expr_idx;
-                    best_enforcer = None;
-                }
+            // 4. Derive this node's actual output from children winner outputs.
+            let child_output_refs: Vec<&PhysicalPropertySet> = child_outputs.iter().collect();
+            let provided = super::derive::derive_output(&expr.op, &child_output_refs);
+
+            // 5. Bridge provided → required via enforcer if needed.
+            let (actual_output, enforcer_info, candidate_cost) = if provided.satisfies(required) {
+                (provided, None, total)
             } else {
-                // --- Enforcer path ---
-                // The expr cannot directly satisfy `required`.  We optimize
-                // the *same group* for the properties the expr naturally
-                // provides, then add an enforcer on top.
-                //
-                // Important: use `provided` (not `required`) to break the
-                // self-referencing loop. The winner cache prevents infinite
-                // recursion: once we cache a result for (group_id, provided),
-                // a recursive call for the same pair returns immediately.
-
-                // Determine what kind of enforcer we need.
-                let enforcers = needed_enforcers(required, &provided);
+                let enforcers = super::derive::needed_enforcers(required, &provided);
                 if enforcers.is_empty() {
                     continue;
                 }
-
-                // Optimize the group for the natural provided properties.
-                let child_cost = self.optimize_group(memo, group_id, &provided)?;
-                if child_cost.is_infinite() {
-                    continue;
-                }
-
-                // Compute the group statistics for enforcer cost estimation.
                 let group_stats = stats_for_group(&memo.groups[group_id], memo, &self.table_stats);
+                let enforcer_cost: Cost = enforcers
+                    .iter()
+                    .map(|e| super::derive::estimate_enforcer_cost(e, &group_stats))
+                    .sum();
+                let kind = enforcers.into_iter().next().unwrap();
+                (
+                    required.clone(),
+                    Some(EnforcerInfo {
+                        kind,
+                        child_props: provided,
+                    }),
+                    total + enforcer_cost,
+                )
+            };
 
-                // Sum up enforcer costs.
-                let mut enforcer_cost = 0.0;
-                for enforcer in &enforcers {
-                    enforcer_cost += estimate_enforcer_cost(enforcer, &group_stats);
-                }
-
-                let total = enforcer_cost + child_cost;
-                if total < best_cost {
-                    best_cost = total;
-                    // The winner's expr_index refers to the best expr for `provided`,
-                    // which was just cached. We record the enforcer so that extraction
-                    // knows to wrap it.
-                    //
-                    // For the expr_index, we use the winner of the `provided` search
-                    // (which is now in the cache).
-                    let provided_key = (group_id, provided.clone());
-                    if let Some(inner_winner) = self.winners.get(&provided_key) {
-                        best_index = inner_winner.expr_index;
-                    } else {
-                        // The child_cost was not infinite and we just optimized it,
-                        // so the winner must exist. If somehow it doesn't, skip.
-                        continue;
-                    }
-
-                    // Use the first (most important) enforcer.  In practice we
-                    // rarely need both distribution + sort enforcers simultaneously;
-                    // when we do, the sort enforcer subsumes Gather distribution.
-                    best_enforcer = Some(EnforcerInfo {
-                        kind: enforcers.into_iter().next().unwrap(),
-                        child_props: provided.clone(),
-                    });
-                }
+            if candidate_cost < best_cost {
+                best_cost = candidate_cost;
+                best_index = expr_idx;
+                best_enforcer = enforcer_info;
+                best_output = actual_output;
             }
         }
 
@@ -254,466 +222,10 @@ impl SearchContext {
             expr_index: best_index,
             cost: best_cost,
             enforcer: best_enforcer,
-            output: PhysicalPropertySet::any(), // placeholder; populated for real in Task 14
+            output: best_output,
         };
         self.winners.insert(cache_key, winner);
         Ok(best_cost)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// output_properties: what a physical operator naturally provides
-// ---------------------------------------------------------------------------
-
-/// Derive the physical properties that a physical operator naturally produces.
-fn output_properties(op: &Operator) -> PhysicalPropertySet {
-    match op {
-        // Leaf: scan provides Any distribution, Any ordering.
-        Operator::PhysicalScan(_) => PhysicalPropertySet::any(),
-
-        // Values / GenerateSeries: single-node leaf, treat as Any.
-        Operator::PhysicalValues(_) | Operator::PhysicalGenerateSeries(_) => {
-            PhysicalPropertySet::any()
-        }
-
-        // CTE consume: leaf-like, Any.
-        Operator::PhysicalCTEConsume(_) => PhysicalPropertySet::any(),
-
-        // Filter, Project, Limit, SubqueryAlias, CTE Anchor, CTE Produce, Repeat:
-        // currently modeled conservatively as Any-only structural operators.
-        Operator::PhysicalFilter(_)
-        | Operator::PhysicalProject(_)
-        | Operator::PhysicalLimit(_)
-        | Operator::PhysicalSubqueryAlias(_)
-        | Operator::PhysicalTableFunction(_)
-        | Operator::PhysicalCTEAnchor(_)
-        | Operator::PhysicalCTEProduce(_)
-        | Operator::PhysicalRepeat(_) => PhysicalPropertySet::any(),
-
-        // Window: input must be `Hash(partition_by)` (enforced by
-        // `derive_required_properties`), and Window doesn't shuffle —
-        // it merely scans through and stamps the analytic column.
-        // So the output stays partitioned on the same columns, which
-        // lets downstream operators (a second Window with the same
-        // PARTITION BY, an aggregate on a subset of the keys, the
-        // SHUFFLE side of a join keyed on a subset) reuse the
-        // distribution via `satisfyContainAll` instead of forcing
-        // another HASH EXCHANGE.
-        Operator::PhysicalWindow(w) => {
-            let mut partition_cols = Vec::new();
-            let mut all_columns = true;
-            for we in &w.window_exprs {
-                for pbe in &we.partition_by {
-                    if let Some(col) = typed_expr_to_column_id(pbe) {
-                        if !partition_cols.contains(&col) {
-                            partition_cols.push(col);
-                        }
-                    } else {
-                        all_columns = false;
-                    }
-                }
-            }
-            if !all_columns || partition_cols.is_empty() {
-                PhysicalPropertySet::any()
-            } else {
-                PhysicalPropertySet {
-                    distribution: DistributionSpec::HashPartitioned(partition_cols),
-                    ordering: OrderingSpec::Any,
-                }
-            }
-        }
-
-        // Hash join (Shuffle): output is Hash(left_eq_keys).
-        Operator::PhysicalHashJoin(j) => match j.distribution {
-            JoinDistribution::Shuffle => {
-                let cols = eq_keys_to_column_ids(&j.eq_conditions, Side::Left);
-                PhysicalPropertySet {
-                    distribution: if cols.is_empty() {
-                        DistributionSpec::Any
-                    } else {
-                        DistributionSpec::HashPartitioned(cols)
-                    },
-                    ordering: OrderingSpec::Any,
-                }
-            }
-            JoinDistribution::Broadcast | JoinDistribution::Colocate => {
-                // Broadcast/Colocate: output follows left child, approximate as Any.
-                PhysicalPropertySet::any()
-            }
-        },
-
-        // Nest-loop join: always Gather (both inputs are Gather).
-        Operator::PhysicalNestLoopJoin(_) => PhysicalPropertySet::gather(),
-
-        // Hash aggregate:
-        //   - Single with group keys: Hash(group_keys)
-        //   - Single without group keys: Gather
-        //   - Local: Hash(group_keys)
-        //   - Global: Hash(group_keys)
-        //
-        // For Local / Single the group_by may contain non-ColumnRef
-        // expressions (e.g. `GROUP BY mod(k, 2)`); reading the column id
-        // from `output_columns` instead of the typed group_by exprs is the
-        // only way to recover the planner-minted ColumnId for those
-        // synthesised slots so the Local-emitted distribution matches what
-        // Global asks for.
-        Operator::PhysicalHashAggregate(a) => {
-            let cols: Vec<ColumnId> = a
-                .output_columns
-                .iter()
-                .take(a.group_by.len())
-                .map(|oc| oc.column_id)
-                .filter(|id| *id != ColumnId::UNSET)
-                .collect();
-            if cols.is_empty() {
-                // Scalar aggregate -> result is a single row.
-                PhysicalPropertySet::gather()
-            } else {
-                PhysicalPropertySet {
-                    distribution: DistributionSpec::HashPartitioned(cols),
-                    ordering: OrderingSpec::Any,
-                }
-            }
-        }
-
-        // Sort: distribution depends on whether this sort was inserted as
-        // an analytic precursor (then its output is Hash on the partition
-        // columns, since each instance only saw rows for some buckets) or a
-        // top-level ORDER BY (then output is Gather). Ordering output is
-        // the sort keys either way.
-        Operator::PhysicalSort(s) => {
-            let sort_keys: Vec<SortKey> = s
-                .items
-                .iter()
-                .filter_map(|item| {
-                    typed_expr_to_column_id(&item.expr).map(|col| SortKey {
-                        column: col,
-                        asc: item.asc,
-                        nulls_first: item.nulls_first,
-                    })
-                })
-                .collect();
-            let distribution = if s.analytic_partition_exprs.is_empty() {
-                DistributionSpec::Gather
-            } else {
-                let partition_cols = typed_exprs_to_column_ids(&s.analytic_partition_exprs);
-                if partition_cols.len() == s.analytic_partition_exprs.len() {
-                    DistributionSpec::HashPartitioned(partition_cols)
-                } else {
-                    DistributionSpec::Gather
-                }
-            };
-            PhysicalPropertySet {
-                distribution,
-                ordering: if sort_keys.is_empty() {
-                    OrderingSpec::Any
-                } else {
-                    OrderingSpec::Required(sort_keys)
-                },
-            }
-        }
-
-        // TopN provided properties depend on phase:
-        //   - Partial: Any distribution (preserves child layout). Ordering = Required
-        //     if sort keys present (each partial's output is sorted).
-        //   - Final (split or not): Gather (final output serialized to one instance).
-        Operator::PhysicalTopN(t) => {
-            let sort_keys: Vec<SortKey> = t
-                .items
-                .iter()
-                .filter_map(|item| {
-                    typed_expr_to_column_id(&item.expr).map(|col| SortKey {
-                        column: col,
-                        asc: item.asc,
-                        nulls_first: item.nulls_first,
-                    })
-                })
-                .collect();
-            let ordering = if sort_keys.is_empty() {
-                OrderingSpec::Any
-            } else {
-                OrderingSpec::Required(sort_keys)
-            };
-            let distribution = match t.phase {
-                TopNPhase::Partial => DistributionSpec::Any,
-                TopNPhase::Final => DistributionSpec::Gather,
-            };
-            PhysicalPropertySet {
-                distribution,
-                ordering,
-            }
-        }
-
-        // Distribution enforcer: outputs whatever its spec says.
-        Operator::PhysicalDistribution(d) => PhysicalPropertySet {
-            distribution: d.spec.clone(),
-            ordering: OrderingSpec::Any,
-        },
-
-        // Union/Intersect/Except: Any (multi-child).
-        Operator::PhysicalUnion(_)
-        | Operator::PhysicalIntersect(_)
-        | Operator::PhysicalExcept(_) => PhysicalPropertySet::any(),
-
-        // Logical operators should not appear in the physical search.
-        _ => PhysicalPropertySet::any(),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// required_input_properties: what a physical operator needs from its children
-// ---------------------------------------------------------------------------
-
-/// Determine the required physical properties for each child of a physical operator.
-pub(super) fn required_input_properties(
-    op: &Operator,
-    parent_required: &PhysicalPropertySet,
-    num_children: usize,
-) -> Vec<PhysicalPropertySet> {
-    match op {
-        // Leaf operators: no children.
-        Operator::PhysicalScan(_)
-        | Operator::PhysicalValues(_)
-        | Operator::PhysicalGenerateSeries(_)
-        | Operator::PhysicalCTEConsume(_) => vec![],
-
-        // CTE anchor is structurally wired only for now. Do not imply real
-        // property passthrough until the runtime path models it end-to-end.
-        Operator::PhysicalCTEAnchor(_) => {
-            vec![PhysicalPropertySet::any(), PhysicalPropertySet::any()]
-        }
-
-        // Shuffle join: both children hash-partitioned on eq keys.
-        // Provide ALL eq column refs to each side — the fragment builder
-        // resolves only those that exist in each child's scope. This
-        // handles join reorder swapping the eq condition pair order.
-        Operator::PhysicalHashJoin(j) => match j.distribution {
-            JoinDistribution::Shuffle => {
-                let all_cols: Vec<ColumnId> = j
-                    .eq_conditions
-                    .iter()
-                    .flat_map(|eq| {
-                        let mut v = Vec::new();
-                        if let Some(c) = typed_expr_to_column_id(&eq.left) {
-                            v.push(c);
-                        }
-                        if let Some(c) = typed_expr_to_column_id(&eq.right) {
-                            v.push(c);
-                        }
-                        v
-                    })
-                    .collect();
-                vec![
-                    PhysicalPropertySet {
-                        distribution: if all_cols.is_empty() {
-                            DistributionSpec::Any
-                        } else {
-                            DistributionSpec::HashPartitioned(all_cols.clone())
-                        },
-                        ordering: OrderingSpec::Any,
-                    },
-                    PhysicalPropertySet {
-                        distribution: if all_cols.is_empty() {
-                            DistributionSpec::Any
-                        } else {
-                            DistributionSpec::HashPartitioned(all_cols)
-                        },
-                        ordering: OrderingSpec::Any,
-                    },
-                ]
-            }
-            JoinDistribution::Broadcast => {
-                // Left: Any, Right: Gather (broadcast the right side).
-                vec![PhysicalPropertySet::any(), PhysicalPropertySet::gather()]
-            }
-            JoinDistribution::Colocate => {
-                // Both sides already co-located.
-                vec![PhysicalPropertySet::any(), PhysicalPropertySet::any()]
-            }
-        },
-
-        // Nest-loop join: both sides must be Gather.
-        Operator::PhysicalNestLoopJoin(_) => {
-            vec![PhysicalPropertySet::gather(), PhysicalPropertySet::gather()]
-        }
-
-        // Hash aggregate:
-        //   Single: [Any] (or [Gather] if scalar agg with no group by)
-        //   Local:  [Any]
-        //   Global: [Hash(group_keys)]
-        Operator::PhysicalHashAggregate(a) => match a.mode {
-            AggMode::Single => {
-                if a.group_by.is_empty() {
-                    vec![PhysicalPropertySet::gather()]
-                } else {
-                    vec![PhysicalPropertySet::any()]
-                }
-            }
-            AggMode::Local => vec![PhysicalPropertySet::any()],
-            AggMode::Global => {
-                let cols = typed_exprs_to_column_ids(&a.group_by);
-                if cols.is_empty() {
-                    vec![PhysicalPropertySet::gather()]
-                } else {
-                    vec![PhysicalPropertySet {
-                        distribution: DistributionSpec::HashPartitioned(cols),
-                        ordering: OrderingSpec::Any,
-                    }]
-                }
-            }
-            // DISTINCT_GLOBAL receives shuffled-by-group_by input. Its own
-            // group_by includes the distinct column, so the enforcer inserts a
-            // Hash(group_by) exchange between LOCAL and DISTINCT_GLOBAL.
-            AggMode::DistinctGlobal => {
-                let cols = typed_exprs_to_column_ids(&a.group_by);
-                if cols.is_empty() {
-                    // Shouldn't happen — SplitDistinctAgg always adds the
-                    // distinct column to group_by — but handle defensively.
-                    vec![PhysicalPropertySet::gather()]
-                } else {
-                    vec![PhysicalPropertySet {
-                        distribution: DistributionSpec::HashPartitioned(cols),
-                        ordering: OrderingSpec::Any,
-                    }]
-                }
-            }
-            // DISTINCT_LOCAL runs per-instance on DISTINCT_GLOBAL's output; no
-            // exchange needed between them.
-            AggMode::DistinctLocal => vec![PhysicalPropertySet::any()],
-        },
-
-        // Sort: child must be Gather (for a top-level ORDER BY), UNLESS the
-        // Sort carries an `analytic_partition_exprs` tag. The tag is set by
-        // the planner when this Sort is a precursor to a Window function;
-        // in that case the sort can run locally on each analytic partition
-        // after a HASH EXCHANGE keyed on the partition columns — no global
-        // single-node merge needed. Mirrors StarRocks's
-        // `TSortNode.analytic_partition_exprs` mechanism.
-        Operator::PhysicalSort(sort) => {
-            // The tag is stored as `TypedExpr`s (to round-trip back to the
-            // codegen / TSortNode) but distribution matching needs
-            // `ColumnRef`s. Convert here and fall back to Gather if any
-            // partition expression isn't a plain column reference (very
-            // rare — partition_by is almost always a column).
-            let partition_cols = typed_exprs_to_column_ids(&sort.analytic_partition_exprs);
-            if partition_cols.is_empty()
-                || partition_cols.len() != sort.analytic_partition_exprs.len()
-            {
-                vec![PhysicalPropertySet::gather()]
-            } else {
-                vec![PhysicalPropertySet {
-                    distribution: DistributionSpec::HashPartitioned(partition_cols),
-                    ordering: OrderingSpec::Any,
-                }]
-            }
-        }
-
-        // TopN child requirement depends on phase/is_split:
-        //   - Partial: child is Any (don't force gather; we run per-instance).
-        //   - Final + split=true: child is the PARTIAL with Any distribution; the
-        //     fragment builder materializes the merging exchange, so no Gather
-        //     enforcer between FINAL(split) and PARTIAL.
-        //   - Final + !split (single-stage, today's behavior): child must be Gather.
-        Operator::PhysicalTopN(t) => {
-            let req = match (t.phase, t.is_split) {
-                (TopNPhase::Partial, _) => PhysicalPropertySet::any(),
-                (TopNPhase::Final, true) => PhysicalPropertySet::any(),
-                (TopNPhase::Final, false) => PhysicalPropertySet::gather(),
-            };
-            vec![req]
-        }
-
-        // Filter, Project, Limit, TableFunction: passthrough parent requirement.
-        Operator::PhysicalFilter(_)
-        | Operator::PhysicalProject(_)
-        | Operator::PhysicalLimit(_)
-        | Operator::PhysicalTableFunction(_) => vec![parent_required.clone()],
-
-        // SubqueryAlias, CTE Produce, Repeat: passthrough parent requirement.
-        Operator::PhysicalSubqueryAlias(_)
-        | Operator::PhysicalCTEProduce(_)
-        | Operator::PhysicalRepeat(_) => {
-            vec![parent_required.clone()]
-        }
-
-        // Window: requires Hash(partition_keys) or Gather (if no partition).
-        Operator::PhysicalWindow(w) => {
-            // Collect partition-by columns from all window exprs.
-            let mut partition_cols = Vec::new();
-            for we in &w.window_exprs {
-                for pbe in &we.partition_by {
-                    if let Some(col) = typed_expr_to_column_id(pbe)
-                        && !partition_cols.contains(&col)
-                    {
-                        partition_cols.push(col);
-                    }
-                }
-            }
-            if partition_cols.is_empty() {
-                vec![PhysicalPropertySet::gather()]
-            } else {
-                vec![PhysicalPropertySet {
-                    distribution: DistributionSpec::HashPartitioned(partition_cols),
-                    ordering: OrderingSpec::Any,
-                }]
-            }
-        }
-
-        // Distribution enforcer: no child requirements (it IS the enforcer).
-        // In practice, distribution nodes have one child that was already
-        // optimized for the child properties recorded in the enforcer info.
-        Operator::PhysicalDistribution(_) => vec![PhysicalPropertySet::any()],
-
-        // Union/Intersect/Except: each child gets Any.
-        Operator::PhysicalUnion(_)
-        | Operator::PhysicalIntersect(_)
-        | Operator::PhysicalExcept(_) => vec![PhysicalPropertySet::any(); num_children],
-
-        // Logical operators should not appear here.
-        _ => vec![PhysicalPropertySet::any()],
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Enforcer helpers
-// ---------------------------------------------------------------------------
-
-/// Determine what enforcers are needed to bridge `provided` -> `required`.
-fn needed_enforcers(
-    required: &PhysicalPropertySet,
-    provided: &PhysicalPropertySet,
-) -> Vec<EnforcerKind> {
-    let mut enforcers = Vec::new();
-
-    if !provided.distribution.satisfies(&required.distribution) {
-        enforcers.push(EnforcerKind::Distribution(required.distribution.clone()));
-    }
-
-    if !provided.ordering.satisfies(&required.ordering) {
-        enforcers.push(EnforcerKind::Sort(required.ordering.clone()));
-    }
-
-    enforcers
-}
-
-/// Network cost multiplier, matching `cost.rs`.
-const NETWORK_COST: f64 = 1.5;
-
-/// Estimate the cost of an enforcer given group statistics.
-fn estimate_enforcer_cost(
-    enforcer: &EnforcerKind,
-    stats: &crate::sql::optimizer::statistics::Statistics,
-) -> Cost {
-    match enforcer {
-        EnforcerKind::Distribution(_) => {
-            // Distribution enforcer = network transfer.
-            stats.compute_size() * NETWORK_COST
-        }
-        EnforcerKind::Sort(_) => {
-            // Sort enforcer = n * log2(n).
-            let n = stats.output_row_count.max(1.0);
-            n * n.log2()
-        }
     }
 }
 
@@ -753,55 +265,36 @@ fn stats_for_group(
 }
 
 // ---------------------------------------------------------------------------
-// Column reference extraction helpers
-// ---------------------------------------------------------------------------
-
-/// Which side of a join equi-condition to extract columns from.
-#[allow(dead_code)]
-enum Side {
-    Left,
-    Right,
-}
-
-/// Extract `ColumnId`s from the left or right side of equi-join conditions.
-fn eq_keys_to_column_ids(
-    eq_conditions: &[crate::sql::optimizer::operator::PhysicalHashJoinEqCondition],
-    side: Side,
-) -> Vec<ColumnId> {
-    eq_conditions
-        .iter()
-        .filter_map(|eq| {
-            let expr = match side {
-                Side::Left => &eq.left,
-                Side::Right => &eq.right,
-            };
-            typed_expr_to_column_id(expr)
-        })
-        .collect()
-}
-
-/// Try to extract a `ColumnId` from a `TypedExpr`.
-/// Only succeeds for direct column references.
-fn typed_expr_to_column_id(expr: &crate::sql::analysis::TypedExpr) -> Option<ColumnId> {
-    match &expr.kind {
-        crate::sql::analysis::ExprKind::ColumnRef { column_id, .. } => Some(*column_id),
-        _ => None,
-    }
-}
-
-/// Extract `ColumnId`s from a list of `TypedExpr`, skipping non-column-refs.
-fn typed_exprs_to_column_ids(exprs: &[crate::sql::analysis::TypedExpr]) -> Vec<ColumnId> {
-    exprs.iter().filter_map(typed_expr_to_column_id).collect()
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::MExpr;
+
+    // Thin wrappers that delegate to the new per-op derive dispatcher.
+    // Keeps the existing assertions short; the underlying logic lives in
+    // `super::derive`.
+    fn output_properties(op: &Operator) -> PhysicalPropertySet {
+        super::super::derive::derive_output(op, &[])
+    }
+
+    fn required_input_properties(
+        op: &Operator,
+        parent_required: &PhysicalPropertySet,
+        num_children: usize,
+    ) -> Vec<PhysicalPropertySet> {
+        super::super::derive::derive_required(op, parent_required, num_children)
+    }
+
+    fn needed_enforcers(
+        required: &PhysicalPropertySet,
+        provided: &PhysicalPropertySet,
+    ) -> Vec<EnforcerKind> {
+        super::super::derive::needed_enforcers(required, provided)
+    }
 
     /// Build a simple memo with a single PhysicalScan group.
     fn single_scan_memo() -> (Memo, GroupId) {
@@ -1213,6 +706,18 @@ mod tests {
 mod top_n_property_tests {
     use super::*;
     use crate::sql::optimizer::operator::{PhysicalTopNOp, TopNPhase};
+
+    fn output_properties(op: &Operator) -> PhysicalPropertySet {
+        super::super::derive::derive_output(op, &[])
+    }
+
+    fn required_input_properties(
+        op: &Operator,
+        parent_required: &PhysicalPropertySet,
+        num_children: usize,
+    ) -> Vec<PhysicalPropertySet> {
+        super::super::derive::derive_required(op, parent_required, num_children)
+    }
 
     #[test]
     fn top_n_output_is_gather_when_sort_keys_resolve() {

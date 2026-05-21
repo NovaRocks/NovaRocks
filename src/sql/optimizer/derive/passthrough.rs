@@ -15,7 +15,6 @@ pub(crate) fn passthrough_output(children_outputs: &[&PhysicalPropertySet]) -> P
 }
 
 /// Required input of a passthrough operator equals its parent's required.
-#[allow(dead_code)]
 pub(crate) fn passthrough_required(
     parent_required: &PhysicalPropertySet,
 ) -> Vec<PhysicalPropertySet> {

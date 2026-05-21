@@ -43,14 +43,10 @@ pub(crate) trait DeriveRequired {
 // ---------------------------------------------------------------------------
 
 /// Dispatch `derive_output` based on the operator's concrete variant.
-#[allow(dead_code)]
 pub(crate) fn derive_output(
     op: &Operator,
     children_outputs: &[&PhysicalPropertySet],
 ) -> PhysicalPropertySet {
-    // Each per-op match arm is added by its own Task in this plan.
-    // The catch-all returns Any so unimplemented ops fall back to today's
-    // conservative behaviour during incremental rollout.
     match op {
         Operator::PhysicalScan(o) => o.derive_output(children_outputs),
         Operator::PhysicalValues(o) => o.derive_output(children_outputs),
@@ -74,12 +70,17 @@ pub(crate) fn derive_output(
         Operator::PhysicalSort(o) => o.derive_output(children_outputs),
         Operator::PhysicalTopN(o) => o.derive_output(children_outputs),
         Operator::PhysicalHashJoin(o) => o.derive_output(children_outputs),
-        _ => PhysicalPropertySet::any(),
+        op => {
+            debug_assert!(
+                !op.is_physical(),
+                "missing dispatch arm for physical operator: {op:?}"
+            );
+            unreachable!("derive_output called on logical operator: {op:?}");
+        }
     }
 }
 
 /// Dispatch `derive_required` based on the operator's concrete variant.
-#[allow(dead_code)]
 pub(crate) fn derive_required(
     op: &Operator,
     parent_required: &PhysicalPropertySet,
@@ -108,16 +109,21 @@ pub(crate) fn derive_required(
         Operator::PhysicalSort(o) => o.derive_required(parent_required, num_children),
         Operator::PhysicalTopN(o) => o.derive_required(parent_required, num_children),
         Operator::PhysicalHashJoin(o) => o.derive_required(parent_required, num_children),
-        _ => vec![PhysicalPropertySet::any(); num_children],
+        op => {
+            debug_assert!(
+                !op.is_physical(),
+                "missing dispatch arm for physical operator: {op:?}"
+            );
+            unreachable!("derive_required called on logical operator: {op:?}");
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Enforcer helpers (search.rs unifies with these in Task 14)
+// Enforcer helpers — single source of truth (search.rs re-exports EnforcerKind).
 // ---------------------------------------------------------------------------
 
 /// Determine what enforcers are needed to bridge `provided` → `required`.
-#[allow(dead_code)]
 pub(crate) fn needed_enforcers(
     required: &PhysicalPropertySet,
     provided: &PhysicalPropertySet,
@@ -136,7 +142,6 @@ pub(crate) fn needed_enforcers(
 const NETWORK_COST: f64 = 1.5;
 
 /// Estimate the cost of an enforcer given group statistics.
-#[allow(dead_code)]
 pub(crate) fn estimate_enforcer_cost(enforcer: &EnforcerKind, stats: &Statistics) -> Cost {
     match enforcer {
         EnforcerKind::Distribution(_) => stats.compute_size() * NETWORK_COST,
@@ -148,11 +153,9 @@ pub(crate) fn estimate_enforcer_cost(enforcer: &EnforcerKind, stats: &Statistics
 }
 
 // ---------------------------------------------------------------------------
-// EnforcerKind type — defined here in the derive layer. Search.rs has its
-// own copy until Task 14 unifies them by re-exporting from here.
+// EnforcerKind type — single source of truth, re-exported from search.rs.
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) enum EnforcerKind {
     Distribution(DistributionSpec),

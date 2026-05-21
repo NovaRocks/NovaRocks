@@ -5,13 +5,13 @@
 
 use std::collections::HashMap;
 
+use super::derive::derive_required;
 use super::memo::{GroupId, Memo};
 use super::operator::{Operator, PhysicalDistributionOp, PhysicalSortOp};
 use super::physical_plan::PhysicalPlanNode;
 use super::property::{OrderingSpec, PhysicalPropertySet};
-use super::search::{EnforcerKind, Winner, required_input_properties};
+use super::search::{EnforcerKind, Winner};
 use crate::sql::analysis::{ExprKind, SortItem, TypedExpr};
-use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::statistics::Statistics;
 
 /// Extract the best physical plan tree from the Memo.
@@ -20,7 +20,7 @@ use crate::sql::optimizer::statistics::Statistics;
 /// For each winner, if it has an enforcer, an enforcer PhysicalPlanNode is
 /// created wrapping the recursive extraction with the enforcer's child props.
 /// Otherwise, the winner's physical expression is used directly with children
-/// extracted according to `required_input_properties`.
+/// extracted according to `derive_required`.
 pub(crate) fn extract_best(
     memo: &Memo,
     root_group: GroupId,
@@ -50,11 +50,47 @@ pub(crate) fn extract_best(
         .map(|lp| lp.output_columns.clone())
         .unwrap_or_default();
 
-    // If the winner has an enforcer, create the enforcer node on top.
-    if let Some(ref enforcer_info) = winner.enforcer {
-        // Recursively extract the child plan with the enforcer's child properties.
-        let child_node = extract_best(memo, root_group, &enforcer_info.child_props, winners)?;
+    // Extract the underlying physical expression (the winner's expr_index).
+    // After G3, the new search loop optimises children with `child_reqs` derived
+    // from (op, required) directly — i.e. there is no separate cached winner
+    // for (group, provided). The enforcer, if present, simply wraps this node.
+    let expr = group.physical_exprs.get(winner.expr_index).ok_or_else(|| {
+        format!(
+            "winner expr_index {} out of bounds for group {} (has {} physical exprs)",
+            winner.expr_index,
+            root_group,
+            group.physical_exprs.len()
+        )
+    })?;
 
+    // Determine child required properties — same call that the search loop made.
+    let child_reqs = derive_required(&expr.op, required, expr.children.len());
+
+    // Recursively extract children.
+    let mut children = Vec::with_capacity(expr.children.len());
+    for (i, &child_group_id) in expr.children.iter().enumerate() {
+        let child_req = child_reqs
+            .get(i)
+            .cloned()
+            .unwrap_or_else(PhysicalPropertySet::any);
+        let child_node = extract_best(memo, child_group_id, &child_req, winners)?;
+        children.push(child_node);
+    }
+
+    let op = match &expr.op {
+        Operator::PhysicalCTEAnchor(op) => Operator::PhysicalCTEAnchor(op.clone()),
+        other => other.clone(),
+    };
+
+    let inner_node = PhysicalPlanNode {
+        op,
+        children,
+        stats: group_stats.clone(),
+        output_columns: output_columns.clone(),
+    };
+
+    // If the winner has an enforcer, wrap the inner node.
+    if let Some(ref enforcer_info) = winner.enforcer {
         let enforcer_op = match &enforcer_info.kind {
             EnforcerKind::Distribution(spec) => {
                 Operator::PhysicalDistribution(PhysicalDistributionOp { spec: spec.clone() })
@@ -74,47 +110,13 @@ pub(crate) fn extract_best(
 
         return Ok(PhysicalPlanNode {
             op: enforcer_op,
-            children: vec![child_node],
+            children: vec![inner_node],
             stats: group_stats,
             output_columns,
         });
     }
 
-    // No enforcer: extract the physical expression directly.
-    let expr = group.physical_exprs.get(winner.expr_index).ok_or_else(|| {
-        format!(
-            "winner expr_index {} out of bounds for group {} (has {} physical exprs)",
-            winner.expr_index,
-            root_group,
-            group.physical_exprs.len()
-        )
-    })?;
-
-    // Determine child required properties.
-    let child_reqs = required_input_properties(&expr.op, required, expr.children.len());
-
-    // Recursively extract children.
-    let mut children = Vec::with_capacity(expr.children.len());
-    for (i, &child_group_id) in expr.children.iter().enumerate() {
-        let child_req = child_reqs
-            .get(i)
-            .cloned()
-            .unwrap_or_else(PhysicalPropertySet::any);
-        let child_node = extract_best(memo, child_group_id, &child_req, winners)?;
-        children.push(child_node);
-    }
-
-    let op = match &expr.op {
-        Operator::PhysicalCTEAnchor(op) => Operator::PhysicalCTEAnchor(op.clone()),
-        other => other.clone(),
-    };
-
-    Ok(PhysicalPlanNode {
-        op,
-        children,
-        stats: group_stats,
-        output_columns,
-    })
+    Ok(inner_node)
 }
 
 /// Build a `Statistics` from a group's logical properties.
