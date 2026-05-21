@@ -1401,25 +1401,24 @@ pub(crate) fn rewrite_select_sql_for_state(
                 &sum_alias,
             ));
             new_projection.push(make_aggregate_select_item("COUNT", arg_expr, &count_alias));
-        } else if let Some((kind, arg_expr, alias)) = extract_min_max_expr_and_alias(&item) {
-            // IVM-P5 (Phase 3): MIN/MAX produces a per-group `Map<value, Int64>`
-            // detail-state column in addition to the visible scalar value. The
-            // visible projection (MIN(arg) / MAX(arg)) is preserved unchanged;
-            // the state projection emits `map_value_count(arg) AS
-            // __agg_state_<sanitized>`. Phase 4 will consume the map state when
-            // merging and re-deriving the visible value.
-            new_projection.push(item.clone());
+        } else if let Some((arg_expr, alias)) = extract_min_max_expr_and_alias(&item) {
+            // IVM-P5: MIN/MAX emits ONLY the detail-state projection
+            // `map_value_count(arg) AS __agg_state_<sanitized>`. The visible
+            // scalar value is NOT projected here; it is derived from the
+            // merged detail map at materialize time by
+            // `update_visible_values_from_state` in `mv_agg_state.rs`. This
+            // matches the signed-delta-path rewriter in
+            // `ivm_delta_aggregate.rs`, keeping insert and signed-delta
+            // paths consistent. Emitting both visible + state would break
+            // the column-count contract in
+            // `materialize_aggregate_result_batch`, which allocates one
+            // batch column per MIN/MAX-Single aggregate (same as
+            // COUNT/SUM, not AVG).
             let sanitized =
                 crate::connector::starrocks::managed::mv_agg_state::sanitize_state_column_name(
                     &alias,
                 );
             let state_alias = format!("__agg_state_{sanitized}");
-            // Tag the kind in a debug-only assertion to silence the unused
-            // variable warning while keeping the intent explicit.
-            debug_assert!(matches!(
-                kind,
-                AggregateFunctionKind::Min | AggregateFunctionKind::Max
-            ));
             new_projection.push(make_aggregate_select_item(
                 "map_value_count",
                 arg_expr,
@@ -1439,12 +1438,12 @@ pub(crate) fn rewrite_select_sql_for_state(
     Ok(stmt.to_string())
 }
 
-/// Returns `(kind, arg_expr, alias)` if the select item is
+/// Returns `(arg_expr, alias)` if the select item is
 /// `MIN(expr) AS alias` / `MAX(expr) AS alias` (or without alias).
 /// Returns `None` for all other items.
 fn extract_min_max_expr_and_alias(
     item: &sqlparser::ast::SelectItem,
-) -> Option<(AggregateFunctionKind, sqlparser::ast::Expr, String)> {
+) -> Option<(sqlparser::ast::Expr, String)> {
     use sqlparser::ast::{Expr, SelectItem};
 
     let (expr, alias) = match item {
@@ -1458,11 +1457,9 @@ fn extract_min_max_expr_and_alias(
     };
 
     let name = func.name.to_string().to_ascii_lowercase();
-    let kind = match name.as_str() {
-        "min" => AggregateFunctionKind::Min,
-        "max" => AggregateFunctionKind::Max,
-        _ => return None,
-    };
+    if !matches!(name.as_str(), "min" | "max") {
+        return None;
+    }
     if func.uses_odbc_syntax
         || func.null_treatment.is_some()
         || func.over.is_some()
@@ -1474,7 +1471,7 @@ fn extract_min_max_expr_and_alias(
     }
 
     let arg_expr = extract_single_expr_arg(func)?;
-    Some((kind, arg_expr, alias))
+    Some((arg_expr, alias))
 }
 
 /// Returns `(arg_expr, alias)` if the select item is `AVG(expr) AS alias` or `AVG(expr)`.
@@ -2247,8 +2244,14 @@ mod tests {
         let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
         let upper = rewritten.to_uppercase();
 
-        // Visible MIN(amount) projection is preserved.
-        assert!(upper.contains("MIN(AMOUNT)"), "got: {rewritten}");
+        // IVM-P5: visible MIN(amount) projection is NOT emitted; only the
+        // map_value_count state projection appears. The visible scalar is
+        // derived from the merged detail map by
+        // `update_visible_values_from_state` at materialize time.
+        assert!(
+            !upper.contains("MIN(AMOUNT)"),
+            "visible MIN(amount) projection must be absent; got: {rewritten}"
+        );
         // State projection: map_value_count(amount) AS __agg_state_<sanitized>.
         // Without an alias, the visible output_name for MIN(amount) is the
         // expression text "MIN(amount)"; sanitize_state_column_name lowercases
@@ -2273,8 +2276,12 @@ mod tests {
         let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
         let upper = rewritten.to_uppercase();
 
-        // Visible MAX(name) projection is preserved.
-        assert!(upper.contains("MAX(NAME)"), "got: {rewritten}");
+        // IVM-P5: visible MAX(name) projection is NOT emitted; only the
+        // map_value_count state projection appears.
+        assert!(
+            !upper.contains("MAX(NAME)"),
+            "visible MAX(name) projection must be absent; got: {rewritten}"
+        );
         // State projection: map_value_count(name).
         assert!(upper.contains("MAP_VALUE_COUNT(NAME)"), "got: {rewritten}");
         assert!(
@@ -2290,7 +2297,13 @@ mod tests {
         let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
         let upper = rewritten.to_uppercase();
 
-        assert!(upper.contains("MIN(AMOUNT) AS MN"), "got: {rewritten}");
+        // IVM-P5: visible MIN(amount) AS mn projection is NOT emitted; the
+        // alias is now consumed by the state projection's __agg_state_mn
+        // suffix.
+        assert!(
+            !upper.contains("MIN(AMOUNT)"),
+            "visible MIN(amount) projection must be absent; got: {rewritten}"
+        );
         assert!(
             upper.contains("MAP_VALUE_COUNT(AMOUNT)"),
             "got: {rewritten}"
@@ -2309,14 +2322,24 @@ mod tests {
         let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
         let upper = rewritten.to_uppercase();
 
-        // MIN/MAX: visible scalar preserved + map_value_count state projection.
-        assert!(upper.contains("MIN(V2) AS MN"), "got: {rewritten}");
+        // MIN/MAX: ONLY the map_value_count state projection appears; the
+        // visible scalar is NOT projected. This matches the signed-delta
+        // rewriter and is required to keep the column count in lockstep
+        // with `compute_batch_col_indexes`, which allocates one batch
+        // column per MIN/MAX-Single aggregate.
+        assert!(
+            !upper.contains("MIN(V2)"),
+            "visible MIN(v2) must be absent; got: {rewritten}"
+        );
         assert!(upper.contains("MAP_VALUE_COUNT(V2)"), "got: {rewritten}");
         assert!(
             rewritten.contains("__agg_state_mn"),
             "missing mn state alias; got: {rewritten}"
         );
-        assert!(upper.contains("MAX(V3) AS MX"), "got: {rewritten}");
+        assert!(
+            !upper.contains("MAX(V3)"),
+            "visible MAX(v3) must be absent; got: {rewritten}"
+        );
         assert!(upper.contains("MAP_VALUE_COUNT(V3)"), "got: {rewritten}");
         assert!(
             rewritten.contains("__agg_state_mx"),
