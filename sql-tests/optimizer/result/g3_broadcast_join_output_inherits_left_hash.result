@@ -1,0 +1,16 @@
+Explain String
+GATHER EXCHANGE stats={rows=10000000000000}
+  PROJECT [a.k AS k, a.v AS v, b.w AS w, rn] stats={rows=10000000000000}
+    WINDOW [row_number()] stats={rows=10000000000000}
+      SORT BY [a.k ASC NULLS FIRST, a.v ASC NULLS FIRST] stats={rows=10000000000000}
+        HASH JOIN (BROADCAST, INNER, eq: [a.k = b.k]) stats={rows=10000000000000}
+          HASH JOIN (BROADCAST, INNER, eq: [a.k = s.s]) stats={rows=1000000000}
+            HASH EXCHANGE (hash: [c1]) stats={rows=100000}
+              SCAN db_sqlt_fc3e81882b2a0111.g3_bj_left (alias=a) stats={rows=100000}
+                   TABLE: db_sqlt_fc3e81882b2a0111.g3_bj_left
+            GATHER EXCHANGE stats={rows=100000}
+              SCAN db_sqlt_fc3e81882b2a0111.g3_bj_small (alias=s) stats={rows=100000}
+                   TABLE: db_sqlt_fc3e81882b2a0111.g3_bj_small
+          GATHER EXCHANGE stats={rows=100000}
+            SCAN db_sqlt_fc3e81882b2a0111.g3_bj_right (alias=b) stats={rows=100000}
+                 TABLE: db_sqlt_fc3e81882b2a0111.g3_bj_right
