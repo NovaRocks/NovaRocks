@@ -375,8 +375,148 @@ fn annotate_batch(
     batch: &RecordBatch,
     annotated_schema: &arrow::datatypes::SchemaRef,
 ) -> Result<RecordBatch, String> {
-    RecordBatch::try_new(Arc::clone(annotated_schema), batch.columns().to_vec())
+    use arrow::array::ArrayRef;
+
+    if batch.num_columns() != annotated_schema.fields().len() {
+        return Err(format!(
+            "annotate_batch column count mismatch: batch={} schema={}",
+            batch.num_columns(),
+            annotated_schema.fields().len()
+        ));
+    }
+    let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+    for (idx, (col, target_field)) in batch
+        .columns()
+        .iter()
+        .zip(annotated_schema.fields().iter())
+        .enumerate()
+    {
+        let new_col = reannotate_array(col, target_field.data_type()).map_err(|e| {
+            format!(
+                "annotate_batch column {idx} ({}): {e}",
+                target_field.name()
+            )
+        })?;
+        new_columns.push(new_col);
+    }
+    RecordBatch::try_new(Arc::clone(annotated_schema), new_columns)
         .map_err(|e| format!("re-annotate batch with iceberg field ids failed: {e}"))
+}
+
+/// Rebuild `array` so its `data_type()` matches `target_dtype` exactly,
+/// preserving the underlying data buffers.
+///
+/// Arrow's `RecordBatch::try_new` performs a strict recursive `PartialEq`
+/// on data types. For scalar / primitive columns the comparison succeeds
+/// because the field-level metadata (e.g. `PARQUET:field_id`) lives on the
+/// `Schema`'s top-level `Field`, not inside the `DataType`. But for
+/// `DataType::Map(entries_field, _)`, `DataType::List(child_field)`, and
+/// `DataType::Struct(fields)`, the inner `Field` definitions are part of
+/// the `DataType` itself, so any difference in their metadata or
+/// nullability fails the comparison.
+///
+/// The Iceberg sink produces an annotated schema whose inner fields carry
+/// `PARQUET:field_id`; the runtime chunk does not. This helper deep-rebuilds
+/// the array so its inner field layout matches the target, while keeping the
+/// original buffers.
+fn reannotate_array(
+    array: &arrow::array::ArrayRef,
+    target_dtype: &arrow::datatypes::DataType,
+) -> Result<arrow::array::ArrayRef, String> {
+    use arrow::array::{ArrayRef, ListArray, MapArray, StructArray};
+    use arrow::buffer::OffsetBuffer;
+    use arrow::datatypes::DataType;
+
+    if array.data_type() == target_dtype {
+        return Ok(array.clone());
+    }
+
+    match (array.data_type(), target_dtype) {
+        (DataType::Map(_, _), DataType::Map(target_entries_field, target_sorted)) => {
+            let map = array.as_any().downcast_ref::<MapArray>().ok_or_else(|| {
+                "reannotate_array: Map data_type but array is not MapArray".to_string()
+            })?;
+            let target_entries_struct_fields = match target_entries_field.data_type() {
+                DataType::Struct(fields) => fields,
+                other => {
+                    return Err(format!(
+                        "reannotate_array: target Map entries must be Struct, got {other:?}"
+                    ));
+                }
+            };
+            if target_entries_struct_fields.len() != 2 {
+                return Err(format!(
+                    "reannotate_array: target Map entries Struct must have 2 fields, got {}",
+                    target_entries_struct_fields.len()
+                ));
+            }
+            let target_key_field = &target_entries_struct_fields[0];
+            let target_value_field = &target_entries_struct_fields[1];
+
+            let keys_in: ArrayRef = Arc::new(map.keys().clone());
+            let values_in: ArrayRef = Arc::new(map.values().clone());
+            let new_keys = reannotate_array(&keys_in, target_key_field.data_type())?;
+            let new_values = reannotate_array(&values_in, target_value_field.data_type())?;
+
+            let new_entries = StructArray::new(
+                target_entries_struct_fields.clone(),
+                vec![new_keys, new_values],
+                map.entries().nulls().cloned(),
+            );
+            let new_map = MapArray::try_new(
+                target_entries_field.clone(),
+                OffsetBuffer::new(map.value_offsets().to_vec().into()),
+                new_entries,
+                map.nulls().cloned(),
+                *target_sorted,
+            )
+            .map_err(|e| format!("reannotate_array: rebuild MapArray failed: {e}"))?;
+            Ok(Arc::new(new_map) as ArrayRef)
+        }
+        (DataType::Struct(_), DataType::Struct(target_fields)) => {
+            let struct_arr = array.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
+                "reannotate_array: Struct data_type but array is not StructArray".to_string()
+            })?;
+            if struct_arr.num_columns() != target_fields.len() {
+                return Err(format!(
+                    "reannotate_array: Struct child count mismatch: array={} target={}",
+                    struct_arr.num_columns(),
+                    target_fields.len()
+                ));
+            }
+            let mut new_children: Vec<ArrayRef> = Vec::with_capacity(target_fields.len());
+            for (i, target_child_field) in target_fields.iter().enumerate() {
+                let child = struct_arr.column(i).clone();
+                let new_child = reannotate_array(&child, target_child_field.data_type())?;
+                new_children.push(new_child);
+            }
+            let new_struct = StructArray::new(
+                target_fields.clone(),
+                new_children,
+                struct_arr.nulls().cloned(),
+            );
+            Ok(Arc::new(new_struct) as ArrayRef)
+        }
+        (DataType::List(_), DataType::List(target_child_field)) => {
+            let list = array.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+                "reannotate_array: List data_type but array is not ListArray".to_string()
+            })?;
+            let values_in: ArrayRef = list.values().clone();
+            let new_values = reannotate_array(&values_in, target_child_field.data_type())?;
+            let new_list = ListArray::try_new(
+                target_child_field.clone(),
+                OffsetBuffer::new(list.value_offsets().to_vec().into()),
+                new_values,
+                list.nulls().cloned(),
+            )
+            .map_err(|e| format!("reannotate_array: rebuild ListArray failed: {e}"))?;
+            Ok(Arc::new(new_list) as ArrayRef)
+        }
+        (a, b) if a == b => Ok(array.clone()),
+        (a, b) => Err(format!(
+            "reannotate_array: incompatible data types: array={a:?}, target={b:?}"
+        )),
+    }
 }
 
 fn unique_file_suffix() -> String {
@@ -595,6 +735,115 @@ mod tests {
             annotated.schema().field(2).name(),
             "_last_updated_sequence_number"
         );
+    }
+
+    #[test]
+    fn annotate_batch_reannotates_map_column_with_field_ids() {
+        use arrow::array::{ArrayRef, Int64Array, MapArray, StructArray};
+        use arrow::buffer::OffsetBuffer;
+        use arrow::datatypes::{DataType, Field, Fields, Schema};
+        use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        // Build a runtime MapArray with NO PARQUET:field_id metadata on its
+        // inner key / value fields, mirroring what the aggregate's
+        // map_value_count produces.
+        let runtime_key_field = Arc::new(Field::new("key", DataType::Int64, false));
+        let runtime_value_field = Arc::new(Field::new("value", DataType::Int64, true));
+        let runtime_entries_struct_fields: Fields =
+            vec![runtime_key_field.clone(), runtime_value_field.clone()].into();
+        let runtime_entries_field = Arc::new(Field::new(
+            "key_value",
+            DataType::Struct(runtime_entries_struct_fields.clone()),
+            false,
+        ));
+        let keys = Arc::new(Int64Array::from(vec![1_i64, 2, 3])) as ArrayRef;
+        let values = Arc::new(Int64Array::from(vec![Some(10_i64), Some(20), None])) as ArrayRef;
+        let runtime_entries =
+            StructArray::new(runtime_entries_struct_fields.clone(), vec![keys, values], None);
+        let offsets = OffsetBuffer::new(vec![0_i32, 2, 3].into());
+        let runtime_map = MapArray::try_new(
+            runtime_entries_field.clone(),
+            offsets,
+            runtime_entries,
+            None,
+            false,
+        )
+        .expect("runtime map");
+        let runtime_schema = Arc::new(Schema::new(vec![Field::new(
+            "m",
+            DataType::Map(runtime_entries_field.clone(), false),
+            false,
+        )]));
+        let runtime_batch =
+            RecordBatch::try_new(runtime_schema, vec![Arc::new(runtime_map)]).expect("batch");
+
+        // Build the annotated target schema where the inner key / value
+        // Fields carry PARQUET:field_id metadata. This mirrors what
+        // schema_to_arrow_schema produces for an Iceberg Map column.
+        let id_meta = |id: &str| -> HashMap<String, String> {
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())])
+        };
+        let target_key_field =
+            Arc::new(Field::new("key", DataType::Int64, false).with_metadata(id_meta("9")));
+        let target_value_field =
+            Arc::new(Field::new("value", DataType::Int64, true).with_metadata(id_meta("10")));
+        let target_entries_struct_fields: Fields =
+            vec![target_key_field, target_value_field].into();
+        let target_entries_field = Arc::new(Field::new(
+            "key_value",
+            DataType::Struct(target_entries_struct_fields.clone()),
+            false,
+        ));
+        let target_map_field = Arc::new(
+            Field::new("m", DataType::Map(target_entries_field.clone(), false), false)
+                .with_metadata(id_meta("5")),
+        );
+        let annotated_schema = Arc::new(Schema::new(vec![target_map_field]));
+
+        // The trivial path (RecordBatch::try_new with no rebuild) should fail
+        // because the inner Struct fields differ in metadata. Our new
+        // annotate_batch must succeed by deep-rebuilding the column.
+        let trivial = RecordBatch::try_new(
+            Arc::clone(&annotated_schema),
+            runtime_batch.columns().to_vec(),
+        );
+        assert!(
+            trivial.is_err(),
+            "sanity check: strict RecordBatch::try_new should reject the runtime Map column"
+        );
+
+        let annotated =
+            annotate_batch(&runtime_batch, &annotated_schema).expect("annotate map column");
+        assert_eq!(annotated.num_columns(), 1);
+        let out_map = annotated
+            .column(0)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("MapArray");
+        assert_eq!(out_map.len(), 2);
+        // The output's data_type must exactly equal the target's; otherwise
+        // try_new would not have returned Ok.
+        assert_eq!(
+            annotated.schema().field(0).data_type(),
+            &DataType::Map(target_entries_field, false)
+        );
+        // Buffers preserved.
+        let out_keys = out_map
+            .keys()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64Array keys");
+        assert_eq!(out_keys.values(), &[1, 2, 3]);
+        let out_values = out_map
+            .values()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64Array values");
+        assert_eq!(out_values.value(0), 10);
+        assert_eq!(out_values.value(1), 20);
+        assert!(out_values.is_null(2));
     }
 
     #[tokio::test]
