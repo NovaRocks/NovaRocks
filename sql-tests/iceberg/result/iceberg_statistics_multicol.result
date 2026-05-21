@@ -1,0 +1,23 @@
+-- query 4
+n
+10
+
+-- query 5
+ndv_dim10
+10
+
+-- query 6
+ndv_dim5
+5
+
+-- query 7
+ndv_dim2
+2
+
+-- query 8
+n_joined
+10
+
+-- query 9
+n_joined
+50

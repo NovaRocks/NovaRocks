@@ -1,0 +1,14 @@
+-- query 5
+n
+3
+
+-- query 6
+bucket	total
+1	1000
+2	2000
+3	3000
+
+-- query 7
+bucket
+2
+3

@@ -1,0 +1,18 @@
+-- query 6
+n
+13
+
+-- query 7
+distinct_ids
+10
+
+-- query 8
+id	category
+1	a
+1	a-dup
+2	b
+2	b-dup
+3	c
+3	c-dup
+4	d
+5	e
