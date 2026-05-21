@@ -8,9 +8,7 @@ use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::{
     JoinDistribution, PhysicalHashJoinEqCondition, PhysicalHashJoinOp,
 };
-use crate::sql::optimizer::property::{
-    DistributionSpec, OrderingSpec, PhysicalPropertySet,
-};
+use crate::sql::optimizer::property::{DistributionSpec, OrderingSpec, PhysicalPropertySet};
 
 use super::{DeriveOutput, DeriveRequired};
 

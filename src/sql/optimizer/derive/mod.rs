@@ -24,10 +24,7 @@ pub(crate) trait DeriveOutput {
     /// Compute the physical-property set this operator's chosen physical
     /// expression actually delivers, given the children's chosen-winner
     /// outputs (in child-slot order).
-    fn derive_output(
-        &self,
-        children_outputs: &[&PhysicalPropertySet],
-    ) -> PhysicalPropertySet;
+    fn derive_output(&self, children_outputs: &[&PhysicalPropertySet]) -> PhysicalPropertySet;
 }
 
 pub(crate) trait DeriveRequired {
@@ -140,10 +137,7 @@ const NETWORK_COST: f64 = 1.5;
 
 /// Estimate the cost of an enforcer given group statistics.
 #[allow(dead_code)]
-pub(crate) fn estimate_enforcer_cost(
-    enforcer: &EnforcerKind,
-    stats: &Statistics,
-) -> Cost {
+pub(crate) fn estimate_enforcer_cost(enforcer: &EnforcerKind, stats: &Statistics) -> Cost {
     match enforcer {
         EnforcerKind::Distribution(_) => stats.compute_size() * NETWORK_COST,
         EnforcerKind::Sort(_) => {

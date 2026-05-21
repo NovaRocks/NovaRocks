@@ -6,9 +6,7 @@ use crate::sql::optimizer::property::PhysicalPropertySet;
 
 /// Output of a passthrough operator equals its single child's output.
 #[allow(dead_code)]
-pub(crate) fn passthrough_output(
-    children_outputs: &[&PhysicalPropertySet],
-) -> PhysicalPropertySet {
+pub(crate) fn passthrough_output(children_outputs: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
     children_outputs
         .first()
         .copied()
@@ -25,8 +23,8 @@ pub(crate) fn passthrough_required(
 }
 
 use crate::sql::optimizer::operator::{
-    PhysicalCTEProduceOp, PhysicalFilterOp, PhysicalLimitOp, PhysicalProjectOp,
-    PhysicalRepeatOp, PhysicalSubqueryAliasOp, PhysicalTableFunctionOp,
+    PhysicalCTEProduceOp, PhysicalFilterOp, PhysicalLimitOp, PhysicalProjectOp, PhysicalRepeatOp,
+    PhysicalSubqueryAliasOp, PhysicalTableFunctionOp,
 };
 
 use super::{DeriveOutput, DeriveRequired};

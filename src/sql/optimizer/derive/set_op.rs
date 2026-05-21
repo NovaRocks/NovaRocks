@@ -1,9 +1,7 @@
 //! Set operators: Union, Intersect, Except.
 //! Today's behaviour: output Any; each child required Any.
 
-use crate::sql::optimizer::operator::{
-    PhysicalExceptOp, PhysicalIntersectOp, PhysicalUnionOp,
-};
+use crate::sql::optimizer::operator::{PhysicalExceptOp, PhysicalIntersectOp, PhysicalUnionOp};
 use crate::sql::optimizer::property::PhysicalPropertySet;
 
 use super::{DeriveOutput, DeriveRequired};

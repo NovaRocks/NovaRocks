@@ -61,8 +61,7 @@ impl DeriveRequired for PhysicalSortOp {
         _n: usize,
     ) -> Vec<PhysicalPropertySet> {
         let partition_cols = typed_exprs_to_column_ids(&self.analytic_partition_exprs);
-        if partition_cols.is_empty()
-            || partition_cols.len() != self.analytic_partition_exprs.len()
+        if partition_cols.is_empty() || partition_cols.len() != self.analytic_partition_exprs.len()
         {
             vec![PhysicalPropertySet::gather()]
         } else {
