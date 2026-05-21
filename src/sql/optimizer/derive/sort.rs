@@ -72,3 +72,34 @@ impl DeriveRequired for PhysicalSortOp {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::analysis::SortItem;
+    use crate::sql::column_id::ColumnId;
+
+    #[test]
+    fn output_properties_sort_has_gather_and_ordering() {
+        let col_ref = crate::sql::analysis::TypedExpr {
+            kind: crate::sql::analysis::ExprKind::ColumnRef {
+                column_id: ColumnId(1),
+                qualifier: None,
+                column: "id".into(),
+            },
+            data_type: arrow::datatypes::DataType::Int32,
+            nullable: false,
+        };
+        let op = PhysicalSortOp {
+            items: vec![SortItem {
+                expr: col_ref,
+                asc: true,
+                nulls_first: false,
+            }],
+            analytic_partition_exprs: Vec::new(),
+        };
+        let props = op.derive_output(&[]);
+        assert_eq!(props.distribution, DistributionSpec::Gather);
+        assert!(matches!(props.ordering, OrderingSpec::Required(_)));
+    }
+}

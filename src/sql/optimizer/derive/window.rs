@@ -67,3 +67,68 @@ impl DeriveRequired for PhysicalWindowOp {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::analysis::{ExprKind, TypedExpr};
+    use crate::sql::column_id::ColumnId;
+    use crate::sql::planner::plan::WindowExpr;
+
+    #[test]
+    fn output_properties_window_propagates_partition_distribution() {
+        let col_c0 = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId(2),
+                qualifier: None,
+                column: "c0".into(),
+            },
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+        };
+        let window_expr = WindowExpr {
+            name: "max".into(),
+            args: vec![],
+            partition_by: vec![col_c0.clone()],
+            order_by: vec![],
+            window_frame: None,
+            ignore_nulls: false,
+            distinct: false,
+            output_name: "win".into(),
+            result_type: arrow::datatypes::DataType::Int64,
+        };
+        let op = PhysicalWindowOp {
+            window_exprs: vec![window_expr],
+            output_columns: vec![],
+        };
+        let props = op.derive_output(&[]);
+        match &props.distribution {
+            DistributionSpec::HashPartitioned(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert_eq!(cols[0], ColumnId(2));
+            }
+            other => panic!("expected HashPartitioned([c0]), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn output_properties_window_without_partition_by_is_any() {
+        let window_expr = WindowExpr {
+            name: "row_number".into(),
+            args: vec![],
+            partition_by: vec![],
+            order_by: vec![],
+            window_frame: None,
+            ignore_nulls: false,
+            distinct: false,
+            output_name: "win".into(),
+            result_type: arrow::datatypes::DataType::Int64,
+        };
+        let op = PhysicalWindowOp {
+            window_exprs: vec![window_expr],
+            output_columns: vec![],
+        };
+        let props = op.derive_output(&[]);
+        assert_eq!(props.distribution, DistributionSpec::Any);
+    }
+}

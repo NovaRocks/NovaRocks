@@ -162,6 +162,31 @@ pub(crate) enum EnforcerKind {
     Sort(OrderingSpec),
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn needed_enforcers_distribution_mismatch() {
+        let required = PhysicalPropertySet::gather();
+        let provided = PhysicalPropertySet::any();
+        let enforcers = needed_enforcers(&required, &provided);
+        assert_eq!(enforcers.len(), 1);
+        assert!(matches!(
+            enforcers[0],
+            EnforcerKind::Distribution(DistributionSpec::Gather)
+        ));
+    }
+
+    #[test]
+    fn needed_enforcers_no_mismatch() {
+        let required = PhysicalPropertySet::any();
+        let provided = PhysicalPropertySet::gather();
+        let enforcers = needed_enforcers(&required, &provided);
+        assert!(enforcers.is_empty());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Sub-modules — populated by Tasks 3–13
 // ---------------------------------------------------------------------------

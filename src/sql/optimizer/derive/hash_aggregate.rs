@@ -73,3 +73,89 @@ impl DeriveRequired for PhysicalHashAggregateOp {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::analysis::{ExprKind, TypedExpr};
+    use crate::sql::column_id::ColumnId;
+
+    #[test]
+    fn output_properties_hash_agg_with_group_by() {
+        let col_ref = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId(3),
+                qualifier: Some("t".into()),
+                column: "city".into(),
+            },
+            data_type: arrow::datatypes::DataType::Utf8,
+            nullable: false,
+        };
+        let op = PhysicalHashAggregateOp {
+            mode: AggMode::Single,
+            group_by: vec![col_ref],
+            aggregates: vec![],
+            output_columns: vec![],
+            is_merge: vec![],
+        };
+        let props = op.derive_output(&[]);
+        match &props.distribution {
+            DistributionSpec::HashPartitioned(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert_eq!(cols[0], ColumnId(3));
+            }
+            other => panic!("expected HashPartitioned, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn distinct_global_requires_hash_on_group_by() {
+        let col_g = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId(4),
+                qualifier: None,
+                column: "g".into(),
+            },
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+        };
+        let col_x = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId(5),
+                qualifier: None,
+                column: "x".into(),
+            },
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+        };
+        let op = PhysicalHashAggregateOp {
+            mode: AggMode::DistinctGlobal,
+            group_by: vec![col_g, col_x],
+            aggregates: vec![],
+            output_columns: vec![],
+            is_merge: vec![],
+        };
+        let reqs = op.derive_required(&PhysicalPropertySet::any(), 1);
+        assert_eq!(reqs.len(), 1);
+        match &reqs[0].distribution {
+            DistributionSpec::HashPartitioned(cols) => {
+                assert_eq!(cols.len(), 2, "Hash on both g and x");
+            }
+            other => panic!("expected HashPartitioned, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn distinct_local_requires_any() {
+        let op = PhysicalHashAggregateOp {
+            mode: AggMode::DistinctLocal,
+            group_by: vec![],
+            aggregates: vec![],
+            output_columns: vec![],
+            is_merge: vec![],
+        };
+        let reqs = op.derive_required(&PhysicalPropertySet::gather(), 1);
+        assert_eq!(reqs.len(), 1);
+        assert!(matches!(reqs[0].distribution, DistributionSpec::Any));
+    }
+}

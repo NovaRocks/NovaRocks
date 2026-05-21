@@ -59,3 +59,71 @@ impl DeriveRequired for PhysicalTopNOp {
         vec![req]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn top_n_output_is_gather_when_sort_keys_resolve() {
+        let op = PhysicalTopNOp {
+            items: vec![],
+            limit: Some(100),
+            offset: None,
+            phase: TopNPhase::Final,
+            is_split: false,
+        };
+        let out = op.derive_output(&[]);
+        // With no sort keys, ordering is Any but distribution should still be Gather
+        // because TopN produces a globally-ordered single-partition output.
+        assert!(matches!(out.distribution, DistributionSpec::Gather));
+    }
+
+    #[test]
+    fn top_n_requires_gather_input() {
+        let op = PhysicalTopNOp {
+            items: vec![],
+            limit: Some(100),
+            offset: None,
+            phase: TopNPhase::Final,
+            is_split: false,
+        };
+        let req = op.derive_required(&PhysicalPropertySet::gather(), 1);
+        assert_eq!(req.len(), 1);
+        assert!(matches!(req[0].distribution, DistributionSpec::Gather));
+    }
+
+    #[test]
+    fn top_n_partial_requires_any_and_provides_any() {
+        let op = PhysicalTopNOp {
+            items: vec![],
+            limit: Some(100),
+            offset: None,
+            phase: TopNPhase::Partial,
+            is_split: false,
+        };
+        let out = op.derive_output(&[]);
+        assert!(matches!(out.distribution, DistributionSpec::Any));
+
+        let reqs = op.derive_required(&PhysicalPropertySet::any(), 1);
+        assert_eq!(reqs.len(), 1);
+        assert!(matches!(reqs[0].distribution, DistributionSpec::Any));
+    }
+
+    #[test]
+    fn top_n_final_split_requires_any_and_provides_gather() {
+        let op = PhysicalTopNOp {
+            items: vec![],
+            limit: Some(100),
+            offset: None,
+            phase: TopNPhase::Final,
+            is_split: true,
+        };
+        let out = op.derive_output(&[]);
+        assert!(matches!(out.distribution, DistributionSpec::Gather));
+
+        let reqs = op.derive_required(&PhysicalPropertySet::gather(), 1);
+        assert_eq!(reqs.len(), 1);
+        assert!(matches!(reqs[0].distribution, DistributionSpec::Any));
+    }
+}

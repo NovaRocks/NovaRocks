@@ -64,3 +64,25 @@ passthrough_impls!(
     PhysicalRepeatOp,
     PhysicalTableFunctionOp,
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filter_passthrough_parent_required() {
+        let op = PhysicalFilterOp {
+            predicate: crate::sql::analysis::TypedExpr {
+                kind: crate::sql::analysis::ExprKind::Literal(
+                    crate::sql::analysis::LiteralValue::Bool(true),
+                ),
+                data_type: arrow::datatypes::DataType::Boolean,
+                nullable: false,
+            },
+        };
+        let parent_req = PhysicalPropertySet::gather();
+        let child_reqs = op.derive_required(&parent_req, 1);
+        assert_eq!(child_reqs.len(), 1);
+        assert_eq!(child_reqs[0], parent_req);
+    }
+}

@@ -114,3 +114,83 @@ impl DeriveRequired for PhysicalHashJoinOp {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::analysis::{ExprKind, TypedExpr};
+    use crate::sql::column_id::ColumnId;
+
+    #[test]
+    fn required_input_shuffle_join() {
+        let left_key = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId(6),
+                qualifier: Some("a".into()),
+                column: "id".into(),
+            },
+            data_type: arrow::datatypes::DataType::Int32,
+            nullable: false,
+        };
+        let right_key = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId(7),
+                qualifier: Some("b".into()),
+                column: "id".into(),
+            },
+            data_type: arrow::datatypes::DataType::Int32,
+            nullable: false,
+        };
+        let op = PhysicalHashJoinOp {
+            join_type: crate::sql::analysis::JoinKind::Inner,
+            eq_conditions: vec![PhysicalHashJoinEqCondition {
+                left: left_key,
+                right: right_key,
+                null_safe: false,
+            }],
+            other_condition: None,
+            distribution: JoinDistribution::Shuffle,
+        };
+        let reqs = op.derive_required(&PhysicalPropertySet::any(), 2);
+        assert_eq!(reqs.len(), 2);
+
+        // Design note (mirrors the production code path in this file): a
+        // shuffle join's required_input_properties provides ALL eq column
+        // refs (from both sides) to each child. Fragment builder resolves
+        // only those that exist in each child's scope. This gives the
+        // optimizer freedom when JoinCommutativity swaps children and the
+        // eq_condition pair order becomes ambiguous. We therefore check
+        // that both "a.id" and "b.id" appear on each side, regardless of
+        // index order.
+        for (side_label, req) in [("left", &reqs[0]), ("right", &reqs[1])] {
+            match &req.distribution {
+                DistributionSpec::HashPartitioned(cols) => {
+                    assert_eq!(
+                        cols.len(),
+                        2,
+                        "{} side should receive both eq column ids",
+                        side_label
+                    );
+                    // Both sides should get ColumnId(6) (a.id) and ColumnId(7) (b.id).
+                    let ids: std::collections::HashSet<ColumnId> = cols.iter().copied().collect();
+                    assert!(
+                        ids.contains(&ColumnId(6)),
+                        "{} side missing ColumnId(6), got {:?}",
+                        side_label,
+                        ids
+                    );
+                    assert!(
+                        ids.contains(&ColumnId(7)),
+                        "{} side missing ColumnId(7), got {:?}",
+                        side_label,
+                        ids
+                    );
+                }
+                other => panic!(
+                    "expected HashPartitioned for {} side, got {:?}",
+                    side_label, other
+                ),
+            }
+        }
+    }
+}
