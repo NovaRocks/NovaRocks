@@ -2,6 +2,155 @@
 
 use crate::sql::column_id::ColumnId;
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Hash)]
+pub(crate) struct ColumnIdSet {
+    columns: Vec<ColumnId>,
+}
+
+impl ColumnIdSet {
+    #[allow(dead_code)]
+    pub(crate) fn new() -> Self {
+        Self { columns: Vec::new() }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn single(column: ColumnId) -> Self {
+        Self::from_columns([column])
+    }
+
+    pub(crate) fn from_columns<I>(columns: I) -> Self
+    where
+        I: IntoIterator<Item = ColumnId>,
+    {
+        let mut columns: Vec<ColumnId> = columns
+            .into_iter()
+            .filter(|id| *id != ColumnId::UNSET)
+            .collect();
+        columns.sort_unstable();
+        columns.dedup();
+        Self { columns }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.columns.is_empty()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.columns.len()
+    }
+
+    pub(crate) fn contains(&self, column: ColumnId) -> bool {
+        self.columns.binary_search(&column).is_ok()
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = ColumnId> + '_ {
+        self.columns.iter().copied()
+    }
+
+    pub(crate) fn min_column(&self) -> Option<ColumnId> {
+        self.columns.first().copied()
+    }
+
+    pub(crate) fn union(&self, other: &Self) -> Self {
+        Self::from_columns(self.iter().chain(other.iter()))
+    }
+
+    pub(crate) fn is_subset(&self, other: &Self) -> bool {
+        self.iter().all(|id| other.contains(id))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn intersects(&self, other: &Self) -> bool {
+        self.iter().any(|id| other.contains(id))
+    }
+}
+
+impl FromIterator<ColumnId> for ColumnIdSet {
+    fn from_iter<T: IntoIterator<Item = ColumnId>>(iter: T) -> Self {
+        Self::from_columns(iter)
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct EquivalenceClasses {
+    classes: Vec<ColumnIdSet>,
+}
+
+impl EquivalenceClasses {
+    pub(crate) fn classes(&self) -> &[ColumnIdSet] {
+        &self.classes
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.classes.is_empty()
+    }
+
+    pub(crate) fn merge_pair(&mut self, left: ColumnId, right: ColumnId) {
+        if left == ColumnId::UNSET || right == ColumnId::UNSET || left == right {
+            return;
+        }
+
+        let mut matched = Vec::new();
+        for (idx, class) in self.classes.iter().enumerate() {
+            if class.contains(left) || class.contains(right) {
+                matched.push(idx);
+            }
+        }
+
+        match matched.as_slice() {
+            [] => self.classes.push(ColumnIdSet::from_columns([left, right])),
+            [idx] => {
+                let merged = self.classes[*idx].union(&ColumnIdSet::from_columns([left, right]));
+                self.classes[*idx] = merged;
+            }
+            _ => {
+                let mut merged = ColumnIdSet::from_columns([left, right]);
+                for idx in matched.iter().rev() {
+                    let class = self.classes.remove(*idx);
+                    merged = merged.union(&class);
+                }
+                self.classes.push(merged);
+                self.normalize();
+            }
+        }
+    }
+
+    pub(crate) fn extend_from(&mut self, other: &Self) {
+        for class in other.classes() {
+            let ids: Vec<ColumnId> = class.iter().collect();
+            if let Some((&first, rest)) = ids.split_first() {
+                for id in rest {
+                    self.merge_pair(first, *id);
+                }
+            }
+        }
+        self.normalize();
+    }
+
+    pub(crate) fn class_containing(&self, column: ColumnId) -> Option<&ColumnIdSet> {
+        self.classes.iter().find(|class| class.contains(column))
+    }
+
+    pub(crate) fn retain_subset_of(&mut self, output_columns: &ColumnIdSet) {
+        self.classes = self
+            .classes
+            .iter()
+            .map(|class| {
+                ColumnIdSet::from_columns(class.iter().filter(|id| output_columns.contains(*id)))
+            })
+            .filter(|class| class.len() >= 2)
+            .collect();
+        self.normalize();
+    }
+
+    pub(crate) fn normalize(&mut self) {
+        self.classes
+            .sort_by_key(|class| class.min_column().unwrap_or(ColumnId::UNSET));
+        self.classes.dedup();
+    }
+}
+
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub(crate) struct PhysicalPropertySet {
     pub distribution: DistributionSpec,
@@ -174,5 +323,50 @@ mod tests {
         ] {
             assert!(provided.satisfies(&DistributionSpec::Any));
         }
+    }
+
+    #[test]
+    fn column_id_set_sorts_dedups_and_drops_unset() {
+        let set = ColumnIdSet::from_columns([
+            ColumnId(3),
+            ColumnId::UNSET,
+            ColumnId(1),
+            ColumnId(3),
+            ColumnId(2),
+        ]);
+        assert_eq!(set.iter().collect::<Vec<_>>(), vec![ColumnId(1), ColumnId(2), ColumnId(3)]);
+        assert!(set.contains(ColumnId(2)));
+        assert!(!set.contains(ColumnId::UNSET));
+    }
+
+    #[test]
+    fn column_id_set_union_keeps_stable_order() {
+        let left = ColumnIdSet::from_columns([ColumnId(3), ColumnId(1)]);
+        let right = ColumnIdSet::from_columns([ColumnId(2), ColumnId(3)]);
+        assert_eq!(
+            left.union(&right).iter().collect::<Vec<_>>(),
+            vec![ColumnId(1), ColumnId(2), ColumnId(3)]
+        );
+    }
+
+    #[test]
+    fn equivalence_classes_merge_transitively() {
+        let mut classes = EquivalenceClasses::default();
+        classes.merge_pair(ColumnId(1), ColumnId(2));
+        classes.merge_pair(ColumnId(2), ColumnId(3));
+        let class = classes.class_containing(ColumnId(1)).expect("class for c1");
+        assert_eq!(class.iter().collect::<Vec<_>>(), vec![ColumnId(1), ColumnId(2), ColumnId(3)]);
+        assert_eq!(classes.classes().len(), 1);
+    }
+
+    #[test]
+    fn equivalence_classes_extend_merges_overlapping_classes() {
+        let mut left = EquivalenceClasses::default();
+        left.merge_pair(ColumnId(1), ColumnId(2));
+        let mut right = EquivalenceClasses::default();
+        right.merge_pair(ColumnId(2), ColumnId(4));
+        left.extend_from(&right);
+        let class = left.class_containing(ColumnId(4)).expect("class for c4");
+        assert_eq!(class.iter().collect::<Vec<_>>(), vec![ColumnId(1), ColumnId(2), ColumnId(4)]);
     }
 }
