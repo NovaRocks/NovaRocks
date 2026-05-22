@@ -534,10 +534,7 @@ fn format_physical_node(
                 DistributionSpec::Any => "ANY EXCHANGE".to_string(),
                 DistributionSpec::Gather => "GATHER EXCHANGE".to_string(),
                 DistributionSpec::HashPartitioned(cols) => {
-                    let col_names: Vec<String> = cols
-                        .iter()
-                        .map(|c| format!("{}", c))
-                        .collect();
+                    let col_names: Vec<String> = cols.iter().map(|c| format!("{}", c)).collect();
                     format!("HASH EXCHANGE (hash: [{}])", col_names.join(", "))
                 }
             };
@@ -1013,7 +1010,9 @@ fn format_expr(expr: &TypedExpr) -> String {
 
 fn format_expr_kind(kind: &ExprKind) -> String {
     match kind {
-        ExprKind::ColumnRef { qualifier, column, .. } => match qualifier {
+        ExprKind::ColumnRef {
+            qualifier, column, ..
+        } => match qualifier {
             Some(q) => format!("{q}.{column}"),
             None => column.clone(),
         },

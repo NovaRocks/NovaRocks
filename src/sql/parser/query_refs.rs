@@ -4,9 +4,7 @@ use crate::sql::analyzer::iceberg_metadata::split_metadata_suffix;
 /// AST. Only returns pairs where the reference is exactly 2 parts (no catalog,
 /// no metadata suffix). Callers should dedupe against
 /// `extract_three_part_table_refs` to avoid double-registering 3-part names.
-pub(crate) fn extract_two_part_table_refs(
-    query: &sqlparser::ast::Query,
-) -> Vec<(String, String)> {
+pub(crate) fn extract_two_part_table_refs(query: &sqlparser::ast::Query) -> Vec<(String, String)> {
     let mut refs = Vec::new();
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
@@ -89,10 +87,7 @@ fn extract_two_part_refs_from_factor(
     }
 }
 
-fn extract_two_part_refs_from_expr(
-    expr: &sqlparser::ast::Expr,
-    refs: &mut Vec<(String, String)>,
-) {
+fn extract_two_part_refs_from_expr(expr: &sqlparser::ast::Expr, refs: &mut Vec<(String, String)>) {
     use sqlparser::ast::Expr;
     match expr {
         Expr::Subquery(query)
@@ -840,9 +835,7 @@ mod tests {
 
     #[test]
     fn extracts_two_part_refs_deduplicates() {
-        let query = parse_query(
-            "SELECT * FROM db.t1 UNION ALL SELECT * FROM db.t1",
-        );
+        let query = parse_query("SELECT * FROM db.t1 UNION ALL SELECT * FROM db.t1");
 
         assert_eq!(
             query_refs::extract_two_part_table_refs(&query),

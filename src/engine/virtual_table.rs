@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
+    Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
     StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::{DataType, Schema};
@@ -202,9 +202,13 @@ fn rewrite_table_factor(
                         .expect("iceberg catalog registry read lock");
                     match registry.get(cat) {
                         Ok(entry) => {
-                            let databases = crate::connector::iceberg::catalog::list_namespaces(&entry)?;
-                            let schemata_cols = crate::engine::information_schema::schemata_columns();
-                            let batches = crate::engine::information_schema::build_schemata_batch(cat, &databases)?;
+                            let databases =
+                                crate::connector::iceberg::catalog::list_namespaces(&entry)?;
+                            let schemata_cols =
+                                crate::engine::information_schema::schemata_columns();
+                            let batches = crate::engine::information_schema::build_schemata_batch(
+                                cat, &databases,
+                            )?;
                             let tbl_name = tbl.clone();
                             let alias = alias.take().unwrap_or_else(|| sqlast::TableAlias {
                                 explicit: false,
@@ -305,7 +309,11 @@ fn derived_values_factor(
             let mut row = Vec::with_capacity(columns.len());
             for (col_idx, col_def) in columns.iter().enumerate() {
                 let array = batch.column(col_idx);
-                row.push(array_value_to_expr(array.as_ref(), row_idx, &col_def.data_type)?);
+                row.push(array_value_to_expr(
+                    array.as_ref(),
+                    row_idx,
+                    &col_def.data_type,
+                )?);
             }
             rows.push(row);
         }
@@ -347,9 +355,7 @@ fn array_value_to_expr(
     declared: &DataType,
 ) -> Result<sqlast::Expr, String> {
     if array.is_null(row) {
-        return Ok(sqlast::Expr::Value(
-            sqlast::Value::Null.with_empty_span(),
-        ));
+        return Ok(sqlast::Expr::Value(sqlast::Value::Null.with_empty_span()));
     }
     match declared {
         DataType::Utf8 | DataType::LargeUtf8 => {
@@ -488,9 +494,10 @@ mod tests {
     /// registered under `catalog_name`, whose warehouse is `warehouse_path`.
     fn state_with_local_catalog(catalog_name: &str, warehouse_path: &str) -> Arc<StandaloneState> {
         let state = Arc::new(StandaloneState::default());
-        let properties = vec![
-            ("iceberg.catalog.warehouse".to_string(), warehouse_path.to_string()),
-        ];
+        let properties = vec![(
+            "iceberg.catalog.warehouse".to_string(),
+            warehouse_path.to_string(),
+        )];
         let entry = build_catalog_entry(catalog_name, &properties).expect("build catalog entry");
         state
             .iceberg_catalogs
@@ -576,8 +583,7 @@ mod tests {
         let warehouse_path = warehouse_dir.path().to_str().unwrap();
         let state = state_with_local_catalog("myice", warehouse_path);
 
-        let mut query =
-            parse_query("SELECT schema_name FROM myice.information_schema.schemata");
+        let mut query = parse_query("SELECT schema_name FROM myice.information_schema.schemata");
         super::rewrite_query(&state, &mut query).expect("rewrite_query");
 
         // The FROM clause must now be a VALUES-backed Derived table (not a raw

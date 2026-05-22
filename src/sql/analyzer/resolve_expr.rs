@@ -3948,7 +3948,9 @@ fn sql_type_starrocks_name(sql_type: &sqlast::DataType) -> Option<String> {
 /// uses — but fall back to a placeholder so the format string never panics.
 fn column_name_of_expr(expr: &TypedExpr) -> String {
     match &expr.kind {
-        ExprKind::ColumnRef { qualifier, column, .. } => match qualifier {
+        ExprKind::ColumnRef {
+            qualifier, column, ..
+        } => match qualifier {
             Some(q) => format!("{q}.{column}"),
             None => column.clone(),
         },

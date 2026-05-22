@@ -806,7 +806,10 @@ impl<'a> AnalyzerContext<'a> {
                             let unq = |col: &TypedExpr| -> TypedExpr {
                                 if same_bare_name {
                                     col.clone() // Keep qualifier for self-join
-                                } else if let ExprKind::ColumnRef { column_id, column, .. } = &col.kind {
+                                } else if let ExprKind::ColumnRef {
+                                    column_id, column, ..
+                                } = &col.kind
+                                {
                                     TypedExpr {
                                         kind: ExprKind::ColumnRef {
                                             column_id: *column_id,
@@ -1944,7 +1947,9 @@ fn is_outer_only_ref(
     outer_scope: &AnalyzerScope,
 ) -> bool {
     match &expr.kind {
-        ExprKind::ColumnRef { qualifier, column, .. } => {
+        ExprKind::ColumnRef {
+            qualifier, column, ..
+        } => {
             let in_inner = inner_scope.resolve(qualifier.as_deref(), column).is_ok();
             let in_outer = outer_scope.resolve(qualifier.as_deref(), column).is_ok();
             // Outer-only: in outer but not in inner
@@ -2155,7 +2160,9 @@ fn relation_exposes_column(rel: &Relation, col_lower: &str) -> bool {
 /// host join's LEFT input, RIGHT input, or above.
 fn collect_column_refs(expr: &TypedExpr, out: &mut Vec<(Option<String>, String)>) {
     match &expr.kind {
-        ExprKind::ColumnRef { qualifier, column, .. } => {
+        ExprKind::ColumnRef {
+            qualifier, column, ..
+        } => {
             let entry = (
                 qualifier.as_ref().map(|q| q.to_lowercase()),
                 column.to_lowercase(),

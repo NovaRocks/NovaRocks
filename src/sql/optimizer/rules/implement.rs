@@ -1340,8 +1340,8 @@ mod top_n_tests {
 #[cfg(test)]
 mod eq_pair_tests {
     use super::*;
-    use arrow::datatypes::DataType;
     use crate::sql::column_id::ColumnId;
+    use arrow::datatypes::DataType;
 
     fn col(name: &str) -> TypedExpr {
         TypedExpr {
@@ -2000,7 +2000,9 @@ mod two_phase_agg_tests {
         };
         assert!(matches!(global.mode, AggMode::Global));
         match &global.group_by[0].kind {
-            ExprKind::ColumnRef { qualifier, column, .. } => {
+            ExprKind::ColumnRef {
+                qualifier, column, ..
+            } => {
                 assert!(qualifier.is_none());
                 assert_eq!(column, "city % 2");
             }

@@ -140,7 +140,11 @@ mod tests {
             Statement::Truncate { name, target_ref } => {
                 assert_eq!(
                     name.parts,
-                    vec!["mycat".to_string(), "mydb".to_string(), "mytable".to_string()]
+                    vec![
+                        "mycat".to_string(),
+                        "mydb".to_string(),
+                        "mytable".to_string()
+                    ]
                 );
                 assert_eq!(target_ref, "main");
             }
@@ -155,7 +159,11 @@ mod tests {
             Statement::Truncate { name, target_ref } => {
                 assert_eq!(
                     name.parts,
-                    vec!["mycat".to_string(), "mydb".to_string(), "mytable".to_string()]
+                    vec![
+                        "mycat".to_string(),
+                        "mydb".to_string(),
+                        "mytable".to_string()
+                    ]
                 );
                 assert_eq!(target_ref, "dev");
             }

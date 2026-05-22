@@ -50,9 +50,9 @@ impl<'a> super::AnalyzerContext<'a> {
                     let mut conds = Vec::new();
                     for col_obj in columns {
                         let col_name = col_obj.to_string();
-                        let (column_id, dt, nullable) = merged
-                            .resolve(None, &col_name)
-                            .unwrap_or((crate::sql::column_id::ColumnId::UNSET, DataType::Utf8, true));
+                        let (column_id, dt, nullable) = merged.resolve(None, &col_name).unwrap_or(
+                            (crate::sql::column_id::ColumnId::UNSET, DataType::Utf8, true),
+                        );
                         let col_ref = TypedExpr {
                             kind: ExprKind::ColumnRef {
                                 column_id,
@@ -579,7 +579,8 @@ impl<'a> super::AnalyzerContext<'a> {
             });
             let data_type = item_field.data_type().clone();
             let nullable = true;
-            let column_id = scope.add_column(Some(qualifier), &col_name, data_type.clone(), nullable);
+            let column_id =
+                scope.add_column(Some(qualifier), &col_name, data_type.clone(), nullable);
             output_columns.push(OutputColumn {
                 column_id,
                 name: col_name,

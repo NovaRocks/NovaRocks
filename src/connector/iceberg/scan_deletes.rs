@@ -817,13 +817,11 @@ where
     // index attaches each delete file to every applicable data file, so the
     // same delete-file ref can appear N times. Reading it once is enough.
     let mut seen = std::collections::HashSet::new();
-    parquet_dels.retain(|d| {
-        seen.insert((d.delete_file_path.clone(), d.referenced_data_file.clone()))
-    });
+    parquet_dels
+        .retain(|d| seen.insert((d.delete_file_path.clone(), d.referenced_data_file.clone())));
     let mut seen = std::collections::HashSet::new();
-    puffin_dels.retain(|d| {
-        seen.insert((d.delete_file_path.clone(), d.referenced_data_file.clone()))
-    });
+    puffin_dels
+        .retain(|d| seen.insert((d.delete_file_path.clone(), d.referenced_data_file.clone())));
 
     let mut positions_per_file = read_delete_positions_per_data_file_with_path_normalizer(
         &parquet_dels,
@@ -1522,7 +1520,11 @@ mod tests {
             .as_any()
             .downcast_ref::<Int32Array>()
             .expect("id col");
-        assert_eq!(id.value(0), 50, "remaining row must be the newly-deleted one");
+        assert_eq!(
+            id.value(0),
+            50,
+            "remaining row must be the newly-deleted one"
+        );
         let row_id = batch
             .column(batch.schema().index_of("_row_id").expect("_row_id column"))
             .as_any()

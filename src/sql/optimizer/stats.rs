@@ -983,7 +983,9 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
             .items
             .iter()
             .map(|item| {
-                let cid = if let crate::sql::analysis::ExprKind::ColumnRef { column_id, .. } = &item.expr.kind {
+                let cid = if let crate::sql::analysis::ExprKind::ColumnRef { column_id, .. } =
+                    &item.expr.kind
+                {
                     *column_id
                 } else {
                     ColumnId::UNSET
@@ -1073,7 +1075,9 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
             .items
             .iter()
             .map(|item| {
-                let cid = if let crate::sql::analysis::ExprKind::ColumnRef { column_id, .. } = &item.expr.kind {
+                let cid = if let crate::sql::analysis::ExprKind::ColumnRef { column_id, .. } =
+                    &item.expr.kind
+                {
                     *column_id
                 } else {
                     ColumnId::UNSET

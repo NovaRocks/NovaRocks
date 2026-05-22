@@ -516,14 +516,15 @@ fn reannotate_array(
         // (e.g. from an explicit CAST) but the iceberg sink expects DECIMAL(tp,ts).
         // Narrow the array with half-up rounding using the same relaxed cast that
         // the expression evaluator uses for DECIMAL→DECIMAL casts.
-        (DataType::Decimal128(_, source_scale), DataType::Decimal128(target_precision, target_scale)) => {
-            crate::exec::expr::cast_with_special_rules(array, target_dtype).map_err(|e| {
-                format!(
-                    "reannotate_array: coerce Decimal128(_, {source_scale}) \
+        (
+            DataType::Decimal128(_, source_scale),
+            DataType::Decimal128(target_precision, target_scale),
+        ) => crate::exec::expr::cast_with_special_rules(array, target_dtype).map_err(|e| {
+            format!(
+                "reannotate_array: coerce Decimal128(_, {source_scale}) \
                      to Decimal128({target_precision}, {target_scale}) failed: {e}"
-                )
-            })
-        }
+            )
+        }),
         // Integer narrowing: INSERT-SELECT may produce a wider integer type (e.g. BIGINT/Int64)
         // when the sink column is a narrower integer (e.g. INT/Int32, SMALLINT/Int16, TINYINT/Int8).
         // Arrow's default cast uses safe=true semantics: out-of-range values become NULL,
@@ -1067,7 +1068,8 @@ mod tests {
             None,
         ]));
 
-        let result = reannotate_array(&src, &DataType::Int32).expect("lossless narrow must succeed");
+        let result =
+            reannotate_array(&src, &DataType::Int32).expect("lossless narrow must succeed");
         let out = result
             .as_any()
             .downcast_ref::<Int32Array>()
@@ -1145,8 +1147,7 @@ mod tests {
         use std::sync::Arc;
 
         let src: ArrayRef = Arc::new(Int32Array::from(vec![Some(7_i32), None]));
-        let result =
-            reannotate_array(&src, &DataType::Int32).expect("same Int32 must succeed");
+        let result = reannotate_array(&src, &DataType::Int32).expect("same Int32 must succeed");
         assert!(Arc::ptr_eq(&src, &result));
     }
 }

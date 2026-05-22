@@ -337,8 +337,12 @@ pub(crate) fn list_namespaces(entry: &IcebergCatalogEntry) -> Result<Vec<String>
         .map_err(|e| format!("list iceberg namespaces runtime failed: {e}"))?
     } else {
         let warehouse_path = &entry.warehouse_path;
-        let entries = std::fs::read_dir(warehouse_path)
-            .map_err(|e| format!("read warehouse directory {} failed: {e}", warehouse_path.display()))?;
+        let entries = std::fs::read_dir(warehouse_path).map_err(|e| {
+            format!(
+                "read warehouse directory {} failed: {e}",
+                warehouse_path.display()
+            )
+        })?;
         let mut names = Vec::new();
         for item in entries.flatten() {
             let path = item.path();

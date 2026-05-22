@@ -243,7 +243,9 @@ fn classify_column_ref(
     right_cols: &HashSet<(Option<String>, String)>,
 ) -> Option<(Side, String)> {
     match &expr.kind {
-        ExprKind::ColumnRef { qualifier, column, .. } => {
+        ExprKind::ColumnRef {
+            qualifier, column, ..
+        } => {
             let reference = (
                 qualifier.as_ref().map(|q| q.to_ascii_lowercase()),
                 column.to_ascii_lowercase(),

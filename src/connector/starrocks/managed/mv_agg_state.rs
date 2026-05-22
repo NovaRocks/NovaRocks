@@ -3122,11 +3122,13 @@ mod tests {
         assert_eq!(entries.len(), 3);
         let nan_entries: Vec<_> = entries
             .iter()
-            .filter(|(k, _)| {
-                matches!(k, Some(AggScalarValue::Float64(v)) if v.is_nan())
-            })
+            .filter(|(k, _)| matches!(k, Some(AggScalarValue::Float64(v)) if v.is_nan()))
             .collect();
-        assert_eq!(nan_entries.len(), 1, "NaN keys should aggregate to one entry");
+        assert_eq!(
+            nan_entries.len(),
+            1,
+            "NaN keys should aggregate to one entry"
+        );
         match &nan_entries[0].1 {
             Some(AggScalarValue::Int64(c)) => assert_eq!(*c, 5),
             other => panic!("expected NaN count=5, got {other:?}"),

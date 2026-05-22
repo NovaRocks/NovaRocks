@@ -673,15 +673,11 @@ fn apply_scalar_fn_to_cell(fn_name: &str, cell: CellValue) -> Result<CellValue, 
     match fn_name {
         "lower" => match cell {
             CellValue::String(s) => Ok(CellValue::String(s.to_lowercase())),
-            other => Err(format!(
-                "LOWER() requires a string column, got {other:?}"
-            )),
+            other => Err(format!("LOWER() requires a string column, got {other:?}")),
         },
         "upper" => match cell {
             CellValue::String(s) => Ok(CellValue::String(s.to_uppercase())),
-            other => Err(format!(
-                "UPPER() requires a string column, got {other:?}"
-            )),
+            other => Err(format!("UPPER() requires a string column, got {other:?}")),
         },
         "trim" => match cell {
             CellValue::String(s) => Ok(CellValue::String(s.trim().to_string())),
@@ -697,9 +693,7 @@ fn apply_scalar_fn_to_cell(fn_name: &str, cell: CellValue) -> Result<CellValue, 
         },
         "length" | "char_length" => match cell {
             CellValue::String(s) => Ok(CellValue::Long(s.chars().count() as i64)),
-            other => Err(format!(
-                "LENGTH() requires a string column, got {other:?}"
-            )),
+            other => Err(format!("LENGTH() requires a string column, got {other:?}")),
         },
         other => Err(format!(
             "phase 1 DELETE WHERE: unsupported scalar function `{other}`"
@@ -814,9 +808,7 @@ fn literal_to_datum(
                 .or_else(|_| NaiveDateTime::parse_from_str(lit_str, "%Y-%m-%d %H:%M:%S"))
                 .map(|dt| dt.and_utc().timestamp_micros())
                 .map_err(|e| {
-                    format!(
-                        "parse DATETIME literal `{lit_str}` for column `{column_name}`: {e}"
-                    )
+                    format!("parse DATETIME literal `{lit_str}` for column `{column_name}`: {e}")
                 })?;
             Ok(Datum::timestamp_micros(micros))
         }
@@ -825,9 +817,7 @@ fn literal_to_datum(
                 .or_else(|_| NaiveDateTime::parse_from_str(lit_str, "%Y-%m-%d %H:%M:%S"))
                 .map(|dt| dt.and_utc().timestamp_micros())
                 .map_err(|e| {
-                    format!(
-                        "parse TIMESTAMPTZ literal `{lit_str}` for column `{column_name}`: {e}"
-                    )
+                    format!("parse TIMESTAMPTZ literal `{lit_str}` for column `{column_name}`: {e}")
                 })?;
             Ok(Datum::timestamptz_micros(micros))
         }
@@ -1287,7 +1277,8 @@ fn evaluate_where_at_row(
                     // LOWER returns STRING, LENGTH returns LONG).  Build a synthetic
                     // string-typed schema using the transformed cell type so
                     // literal_to_datum can parse the literal correctly.
-                    let cmp = compare_cell_to_scalar_fn_literal(&cell, value_expr, &col_name, schema)?;
+                    let cmp =
+                        compare_cell_to_scalar_fn_literal(&cell, value_expr, &col_name, schema)?;
                     return Ok(match (op, flipped) {
                         (sqlast::BinaryOperator::Eq, _) => cmp == std::cmp::Ordering::Equal,
                         (sqlast::BinaryOperator::NotEq, _) => cmp != std::cmp::Ordering::Equal,
@@ -1298,9 +1289,7 @@ fn evaluate_where_at_row(
                             cmp != std::cmp::Ordering::Greater
                         }
                         (sqlast::BinaryOperator::Gt, false)
-                        | (sqlast::BinaryOperator::Lt, true) => {
-                            cmp == std::cmp::Ordering::Greater
-                        }
+                        | (sqlast::BinaryOperator::Lt, true) => cmp == std::cmp::Ordering::Greater,
                         (sqlast::BinaryOperator::GtEq, false)
                         | (sqlast::BinaryOperator::LtEq, true) => cmp != std::cmp::Ordering::Less,
                         _ => unreachable!("unsupported binary operator already rejected upstream"),
@@ -2051,11 +2040,9 @@ mod tests {
                 name: sqlast::ObjectName::from(vec![sqlast::Ident::new("lower")]),
                 args: sqlast::FunctionArguments::List(sqlast::FunctionArgumentList {
                     duplicate_treatment: None,
-                    args: vec![sqlast::FunctionArg::Unnamed(
-                        sqlast::FunctionArgExpr::Expr(sqlast::Expr::Identifier(
-                            sqlast::Ident::new("label"),
-                        )),
-                    )],
+                    args: vec![sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(
+                        sqlast::Expr::Identifier(sqlast::Ident::new("label")),
+                    ))],
                     clauses: vec![],
                 }),
                 filter: None,
@@ -2079,11 +2066,9 @@ mod tests {
                 name: sqlast::ObjectName::from(vec![sqlast::Ident::new("upper")]),
                 args: sqlast::FunctionArguments::List(sqlast::FunctionArgumentList {
                     duplicate_treatment: None,
-                    args: vec![sqlast::FunctionArg::Unnamed(
-                        sqlast::FunctionArgExpr::Expr(sqlast::Expr::Identifier(
-                            sqlast::Ident::new("label"),
-                        )),
-                    )],
+                    args: vec![sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(
+                        sqlast::Expr::Identifier(sqlast::Ident::new("label")),
+                    ))],
                     clauses: vec![],
                 }),
                 filter: None,

@@ -2357,7 +2357,8 @@ fn explain_analyze_query(
     // an acknowledged limitation; per-operator profile merge in a
     // follow-up PR will replace the query-level timing summary.
     let t_plan = Instant::now();
-    let (resolved, cte_registry, mut factory) = crate::sql::analyzer::analyze(query, catalog, current_database)?;
+    let (resolved, cte_registry, mut factory) =
+        crate::sql::analyzer::analyze(query, catalog, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
     let table_stats = build_table_stats_from_plan(&logical);
     let physical = crate::sql::optimizer::optimize(logical, &table_stats, factory)?;
@@ -2386,7 +2387,8 @@ fn explain_query(
 ) -> Result<QueryResult, String> {
     use crate::sql::explain::{ExplainLevel, explain_physical_plan};
 
-    let (resolved, cte_registry, mut factory) = crate::sql::analyzer::analyze(query, catalog, current_database)?;
+    let (resolved, cte_registry, mut factory) =
+        crate::sql::analyzer::analyze(query, catalog, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
     let table_stats = build_table_stats_from_plan(&logical);
     let physical = crate::sql::optimizer::optimize(logical, &table_stats, factory)?;
@@ -2441,7 +2443,8 @@ pub(crate) fn execute_query_with_options(
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
 ) -> Result<QueryResult, String> {
-    let (resolved, cte_registry, mut factory) = crate::sql::analyzer::analyze(query, catalog, current_database)?;
+    let (resolved, cte_registry, mut factory) =
+        crate::sql::analyzer::analyze(query, catalog, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
     let table_stats = build_table_stats_from_plan(&logical);
     let mut physical = crate::sql::optimizer::optimize(logical, &table_stats, factory)?;
@@ -3820,9 +3823,11 @@ enable_path_style_access = true
 
         let (resolved, cte_registry, mut factory) =
             crate::sql::analyzer::analyze(&query, &catalog, "default").expect("analyze query");
-        let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory).expect("plan query");
+        let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)
+            .expect("plan query");
         let table_stats = super::build_table_stats_from_plan(&logical);
-        let physical = crate::sql::optimizer::optimize(logical, &table_stats, factory).expect("optimize");
+        let physical =
+            crate::sql::optimizer::optimize(logical, &table_stats, factory).expect("optimize");
         crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
             &physical, &catalog, "default",
         )

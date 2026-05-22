@@ -108,10 +108,8 @@ mod tests {
 
     #[test]
     fn hash_partitioned_satisfies_exact_match() {
-        let provided =
-            DistributionSpec::HashPartitioned(vec![ColumnId(1), ColumnId(2)]);
-        let required =
-            DistributionSpec::HashPartitioned(vec![ColumnId(1), ColumnId(2)]);
+        let provided = DistributionSpec::HashPartitioned(vec![ColumnId(1), ColumnId(2)]);
+        let required = DistributionSpec::HashPartitioned(vec![ColumnId(1), ColumnId(2)]);
         assert!(provided.satisfies(&required));
     }
 
@@ -120,8 +118,7 @@ mod tests {
         // Child hashes on (c1, c2); a downstream operator that only needs
         // hash(c1) is satisfied because each (c1,c2) bucket is homogeneous
         // in `c1` — the StarRocks `satisfyContainAll` rule.
-        let provided =
-            DistributionSpec::HashPartitioned(vec![ColumnId(1), ColumnId(2)]);
+        let provided = DistributionSpec::HashPartitioned(vec![ColumnId(1), ColumnId(2)]);
         let required = DistributionSpec::HashPartitioned(vec![ColumnId(1)]);
         assert!(provided.satisfies(&required));
     }
@@ -130,11 +127,8 @@ mod tests {
     fn hash_partitioned_satisfies_when_required_in_any_position() {
         // Order within the hash key vector doesn't matter — what matters
         // is that the required column is part of the hash.
-        let provided = DistributionSpec::HashPartitioned(vec![
-            ColumnId(1),
-            ColumnId(2),
-            ColumnId(3),
-        ]);
+        let provided =
+            DistributionSpec::HashPartitioned(vec![ColumnId(1), ColumnId(2), ColumnId(3)]);
         let required = DistributionSpec::HashPartitioned(vec![ColumnId(2)]);
         assert!(provided.satisfies(&required));
     }
@@ -153,8 +147,7 @@ mod tests {
         // `c2` values, so an operator that needs (c1, c2)-locality is not
         // safe.
         let provided = DistributionSpec::HashPartitioned(vec![ColumnId(1)]);
-        let required =
-            DistributionSpec::HashPartitioned(vec![ColumnId(1), ColumnId(2)]);
+        let required = DistributionSpec::HashPartitioned(vec![ColumnId(1), ColumnId(2)]);
         assert!(!provided.satisfies(&required));
     }
 

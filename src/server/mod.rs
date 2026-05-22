@@ -1203,11 +1203,7 @@ mod tests {
         let mut vars = BTreeMap::new();
         vars.insert("@i".to_string(), "5".to_string());
         assert_eq!(
-            substitute_session_user_variables(
-                "INSERT INTO t VALUES (@i, @i)",
-                &vars
-            )
-            .unwrap(),
+            substitute_session_user_variables("INSERT INTO t VALUES (@i, @i)", &vars).unwrap(),
             "INSERT INTO t VALUES (5, 5)"
         );
     }

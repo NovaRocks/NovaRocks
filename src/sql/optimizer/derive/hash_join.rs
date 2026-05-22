@@ -249,8 +249,14 @@ mod tests {
         match &out.distribution {
             DistributionSpec::HashPartitioned(cols) => {
                 let ids: std::collections::HashSet<ColumnId> = cols.iter().copied().collect();
-                assert!(ids.contains(&ColumnId(10)), "expected ColumnId(10), got {ids:?}");
-                assert!(ids.contains(&ColumnId(20)), "expected ColumnId(20), got {ids:?}");
+                assert!(
+                    ids.contains(&ColumnId(10)),
+                    "expected ColumnId(10), got {ids:?}"
+                );
+                assert!(
+                    ids.contains(&ColumnId(20)),
+                    "expected ColumnId(20), got {ids:?}"
+                );
             }
             other => panic!("expected HashPartitioned([10, 20]), got {other:?}"),
         }
@@ -422,8 +428,14 @@ mod tests {
         match &out.distribution {
             DistributionSpec::HashPartitioned(cols) => {
                 let ids: std::collections::HashSet<ColumnId> = cols.iter().copied().collect();
-                assert!(ids.contains(&ColumnId(10)), "expected ColumnId(10), got {ids:?}");
-                assert!(ids.contains(&ColumnId(20)), "expected ColumnId(20), got {ids:?}");
+                assert!(
+                    ids.contains(&ColumnId(10)),
+                    "expected ColumnId(10), got {ids:?}"
+                );
+                assert!(
+                    ids.contains(&ColumnId(20)),
+                    "expected ColumnId(20), got {ids:?}"
+                );
             }
             other => panic!("expected HashPartitioned([10, 20]), got {other:?}"),
         }

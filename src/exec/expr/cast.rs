@@ -1103,7 +1103,11 @@ fn cast_float_to_decimal_with_rounding(
     retag_decimal_array(&wide, precision, scale)
 }
 
-pub(crate) fn format_timestamp_for_varchar(unit: &TimeUnit, value: i64, tz: Option<&str>) -> String {
+pub(crate) fn format_timestamp_for_varchar(
+    unit: &TimeUnit,
+    value: i64,
+    tz: Option<&str>,
+) -> String {
     let timestamp_str = match unit {
         TimeUnit::Second => {
             let dt = DateTime::from_timestamp(value, 0)

@@ -1337,12 +1337,7 @@ impl<'a> AnalyzerContext<'a> {
         // Also add each GROUPING() virtual column as a GROUP BY key so it
         // passes through the Aggregate operator.
         for (fn_name, _) in &grouping_fn_args {
-            let column_id = self.alloc_column_id(
-                None,
-                fn_name.clone(),
-                DataType::Int64,
-                false,
-            );
+            let column_id = self.alloc_column_id(None, fn_name.clone(), DataType::Int64, false);
             sel.group_by.push(TypedExpr {
                 kind: ExprKind::ColumnRef {
                     column_id,
@@ -1388,9 +1383,9 @@ impl<'a> AnalyzerContext<'a> {
                     let typed =
                         self.substitute_select_aliases_for_select(typed, &projection, scope);
                     let (name, column_id) = match &typed.kind {
-                        ExprKind::ColumnRef { column_id, column, .. } => {
-                            (column.clone(), *column_id)
-                        }
+                        ExprKind::ColumnRef {
+                            column_id, column, ..
+                        } => (column.clone(), *column_id),
                         _ => {
                             let n = expr_display_name(expr);
                             let id = self.alloc_column_id(
@@ -2773,7 +2768,10 @@ mod tests {
         };
         assert_eq!(query.output_columns[0].name, "column_0");
         assert_eq!(output_columns[0].name, "col1");
-        let ExprKind::ColumnRef { qualifier, column, .. } = &select.projection[0].expr.kind else {
+        let ExprKind::ColumnRef {
+            qualifier, column, ..
+        } = &select.projection[0].expr.kind
+        else {
             panic!("expected column ref projection");
         };
         assert_eq!(qualifier.as_deref(), None);
@@ -3531,9 +3529,9 @@ mod tests {
     fn select_alias_inside_lambda_body_is_fully_substituted() {
         fn contains_unresolved_l(expr: &TypedExpr) -> bool {
             match &expr.kind {
-                ExprKind::ColumnRef { qualifier, column, .. } => {
-                    qualifier.is_none() && column.eq_ignore_ascii_case("l")
-                }
+                ExprKind::ColumnRef {
+                    qualifier, column, ..
+                } => qualifier.is_none() && column.eq_ignore_ascii_case("l"),
                 ExprKind::BinaryOp { left, right, .. } => {
                     contains_unresolved_l(left) || contains_unresolved_l(right)
                 }

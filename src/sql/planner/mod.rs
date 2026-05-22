@@ -18,7 +18,12 @@ fn expr_column_id(expr: &TypedExpr, name: &str, factory: &mut ColumnRefFactory) 
     if let ExprKind::ColumnRef { column_id, .. } = &expr.kind {
         *column_id
     } else {
-        factory.create(None, name.to_string(), expr.data_type.clone(), expr.nullable)
+        factory.create(
+            None,
+            name.to_string(),
+            expr.data_type.clone(),
+            expr.nullable,
+        )
     }
 }
 
@@ -347,7 +352,11 @@ fn rewrite_sort_items_to_projection_refs(
 // Body planning
 // ---------------------------------------------------------------------------
 
-fn plan_body_scoped(body: QueryBody, cte_registry: &CTERegistry, factory: &mut ColumnRefFactory) -> Result<LogicalPlan, String> {
+fn plan_body_scoped(
+    body: QueryBody,
+    cte_registry: &CTERegistry,
+    factory: &mut ColumnRefFactory,
+) -> Result<LogicalPlan, String> {
     match body {
         QueryBody::Select(select) => plan_select_scoped(select, cte_registry, factory),
         QueryBody::SetOperation(set_op) => plan_set_operation_scoped(set_op, cte_registry, factory),
@@ -429,7 +438,12 @@ fn plan_select_scoped(
 
         current = build_window_and_project(current, project_items, &select.projection, factory)?;
     } else {
-        current = build_window_and_project(current, select.projection.clone(), &select.projection, factory)?;
+        current = build_window_and_project(
+            current,
+            select.projection.clone(),
+            &select.projection,
+            factory,
+        )?;
     }
 
     // SELECT DISTINCT → Aggregate on all output columns (deduplication)
@@ -470,19 +484,19 @@ fn prepare_repeat_input(
 
     for (original_name, alias_name) in &grouping_key_aliases {
         if let Some(source_expr) = select.group_by.iter().find_map(|expr| match &expr.kind {
-            ExprKind::ColumnRef { column_id, qualifier, column }
-                if column.eq_ignore_ascii_case(original_name) =>
-            {
-                Some(TypedExpr {
-                    kind: ExprKind::ColumnRef {
-                        column_id: *column_id,
-                        qualifier: qualifier.clone(),
-                        column: column.clone(),
-                    },
-                    data_type: expr.data_type.clone(),
-                    nullable: expr.nullable,
-                })
-            }
+            ExprKind::ColumnRef {
+                column_id,
+                qualifier,
+                column,
+            } if column.eq_ignore_ascii_case(original_name) => Some(TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: *column_id,
+                    qualifier: qualifier.clone(),
+                    column: column.clone(),
+                },
+                data_type: expr.data_type.clone(),
+                nullable: expr.nullable,
+            }),
             _ => None,
         }) {
             project_items.push(ProjectItem {
@@ -549,7 +563,9 @@ fn collect_repeat_input_refs(
     seen: &mut std::collections::HashSet<(Option<String>, String)>,
 ) {
     match &expr.kind {
-        ExprKind::ColumnRef { qualifier, column, .. } => {
+        ExprKind::ColumnRef {
+            qualifier, column, ..
+        } => {
             if qualifier.is_none() && column.starts_with("__grouping_") {
                 return;
             }
@@ -623,7 +639,11 @@ fn collect_repeat_input_refs(
 
 /// Build a deduplication Aggregate for SELECT DISTINCT.
 /// Uses all projection columns as GROUP BY keys with no aggregate functions.
-fn build_distinct(input: LogicalPlan, projection: &[ProjectItem], factory: &mut ColumnRefFactory) -> LogicalPlan {
+fn build_distinct(
+    input: LogicalPlan,
+    projection: &[ProjectItem],
+    factory: &mut ColumnRefFactory,
+) -> LogicalPlan {
     let mut group_by = Vec::new();
     let mut output_columns = Vec::new();
     for item in projection {
@@ -668,7 +688,12 @@ fn build_window_and_project(
         let mut output_columns = Vec::new();
         for item in original_projection {
             output_columns.push(OutputColumn {
-                column_id: factory.create(None, item.output_name.clone(), item.expr.data_type.clone(), item.expr.nullable),
+                column_id: factory.create(
+                    None,
+                    item.output_name.clone(),
+                    item.expr.data_type.clone(),
+                    item.expr.nullable,
+                ),
                 name: item.output_name.clone(),
                 data_type: item.expr.data_type.clone(),
                 nullable: item.expr.nullable,
@@ -892,15 +917,8 @@ fn rewrite_window_calls(
             // For FIRST_VALUE / LAST_VALUE the reversal also swaps the function
             // because reversing the iteration direction inverts which row is
             // "first" vs "last".
-            let (
-                rewritten_name,
-                rewritten_order_by,
-                rewritten_frame,
-            ) = normalize_window_frame_for_be(
-                name,
-                order_by.clone(),
-                window_frame.clone(),
-            );
+            let (rewritten_name, rewritten_order_by, rewritten_frame) =
+                normalize_window_frame_for_be(name, order_by.clone(), window_frame.clone());
 
             window_exprs.push(WindowExpr {
                 name: rewritten_name,
@@ -1354,7 +1372,9 @@ fn collect_non_agg_column_refs_inner(
             // Don't recurse into aggregate calls — columns inside aggregates
             // are handled by the aggregate function itself, not as pass-through keys.
         }
-        ExprKind::ColumnRef { qualifier, column, .. } => {
+        ExprKind::ColumnRef {
+            qualifier, column, ..
+        } => {
             if !inside_agg {
                 // Check if this column is already in group_by
                 let already_grouped = group_by.iter().any(|gb| {
@@ -1435,18 +1455,14 @@ fn plan_relation_scoped(
                 .iter()
                 .enumerate()
                 .map(|(idx, c)| OutputColumn {
-                    column_id: scan
-                        .column_ids
-                        .get(idx)
-                        .copied()
-                        .unwrap_or_else(|| {
-                            factory.create(
-                                scan.alias.as_ref().or(Some(&scan.table.name)).cloned(),
-                                c.name.clone(),
-                                c.data_type.clone(),
-                                c.nullable,
-                            )
-                        }),
+                    column_id: scan.column_ids.get(idx).copied().unwrap_or_else(|| {
+                        factory.create(
+                            scan.alias.as_ref().or(Some(&scan.table.name)).cloned(),
+                            c.name.clone(),
+                            c.data_type.clone(),
+                            c.nullable,
+                        )
+                    }),
                     name: c.name.clone(),
                     data_type: c.data_type.clone(),
                     nullable: c.nullable,
@@ -1558,7 +1574,10 @@ fn is_lateral_unnest_condition_supported(condition: &Option<TypedExpr>) -> bool 
 /// like any other Scan; codegen branches on the storage variant to emit
 /// an `HDFS_SCAN_NODE` whose lowering wires up the native-Rust
 /// `IcebergMetadataScanOp` (no JNI bridge).
-fn plan_iceberg_metadata_scan(rel: IcebergMetadataScanRelation, factory: &mut ColumnRefFactory) -> Result<LogicalPlan, String> {
+fn plan_iceberg_metadata_scan(
+    rel: IcebergMetadataScanRelation,
+    factory: &mut ColumnRefFactory,
+) -> Result<LogicalPlan, String> {
     use crate::sql::analyzer::iceberg_metadata::metadata_table_schema;
     use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
 
@@ -1744,7 +1763,10 @@ fn build_iceberg_partitions_payload(files: &[S3FileInfo]) -> Result<String, Stri
 /// storage variant and emits `TPlanNodeType::ICEBERG_DELTA_SCAN_NODE`
 /// (rather than `HDFS_SCAN_NODE`); the lowering layer resolves the
 /// actual change file list via `connector::iceberg::changes::plan_changes`.
-fn plan_iceberg_delta_scan(rel: IcebergDeltaScanRelation, factory: &mut ColumnRefFactory) -> Result<LogicalPlan, String> {
+fn plan_iceberg_delta_scan(
+    rel: IcebergDeltaScanRelation,
+    factory: &mut ColumnRefFactory,
+) -> Result<LogicalPlan, String> {
     use crate::sql::catalog::{TableDef, TableStorage};
 
     // Output schema: base columns + iceberg v3 row-lineage metadata columns.
@@ -1827,7 +1849,10 @@ fn plan_set_operation_scoped(
 // VALUES planning
 // ---------------------------------------------------------------------------
 
-fn plan_values(values: ResolvedValues, factory: &mut ColumnRefFactory) -> Result<LogicalPlan, String> {
+fn plan_values(
+    values: ResolvedValues,
+    factory: &mut ColumnRefFactory,
+) -> Result<LogicalPlan, String> {
     let columns = values
         .column_types
         .iter()
@@ -2016,7 +2041,10 @@ mod tests {
         let LogicalPlan::Project(project) = *sort.input else {
             panic!("expected Project under Sort");
         };
-        let ExprKind::ColumnRef { qualifier, column, .. } = &project.items[0].expr.kind else {
+        let ExprKind::ColumnRef {
+            qualifier, column, ..
+        } = &project.items[0].expr.kind
+        else {
             panic!(
                 "expected group key projection to be a ColumnRef, got {:?}",
                 project.items[0].expr

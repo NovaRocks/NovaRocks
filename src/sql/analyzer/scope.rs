@@ -94,7 +94,10 @@ impl AnalyzerScope {
         &self,
         expr: &crate::sql::analysis::TypedExpr,
     ) -> Option<crate::sql::SqlType> {
-        if let crate::sql::analysis::ExprKind::ColumnRef { qualifier, column, .. } = &expr.kind {
+        if let crate::sql::analysis::ExprKind::ColumnRef {
+            qualifier, column, ..
+        } = &expr.kind
+        {
             self.logical_type_for(qualifier.as_deref(), column)
         } else {
             None
@@ -151,8 +154,10 @@ impl AnalyzerScope {
                         .insert((q.to_lowercase(), name_lower.clone()), logical);
                 }
             }
-            self.unqualified
-                .insert(name_lower.clone(), (id, col.data_type.clone(), col.nullable));
+            self.unqualified.insert(
+                name_lower.clone(),
+                (id, col.data_type.clone(), col.nullable),
+            );
             if let Some(logical) = col.logical_type.clone() {
                 self.unqualified_logical_types.insert(name_lower, logical);
             }
@@ -297,8 +302,10 @@ impl AnalyzerScope {
     /// Merge another scope into this one (for JOINs).
     pub(super) fn merge(&mut self, other: &AnalyzerScope) {
         for ((qualifier, name), (id, dt, nullable)) in &other.qualified {
-            self.qualified
-                .insert((qualifier.clone(), name.clone()), (*id, dt.clone(), *nullable));
+            self.qualified.insert(
+                (qualifier.clone(), name.clone()),
+                (*id, dt.clone(), *nullable),
+            );
         }
         for (name, (id, dt, nullable)) in &other.unqualified {
             self.unqualified

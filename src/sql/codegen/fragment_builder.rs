@@ -23,7 +23,6 @@ use crate::types;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::catalog::CatalogProvider;
 use crate::sql::codegen::FragmentId;
-use crate::sql::column_id::ColumnId;
 use crate::sql::codegen::descriptors::DescriptorTableBuilder;
 use crate::sql::codegen::expr_compiler::{self, ExprCompiler};
 use crate::sql::codegen::helpers::{
@@ -35,6 +34,7 @@ use crate::sql::codegen::type_infer;
 use crate::sql::codegen::{
     FragmentBuildResult, FragmentEdge, FragmentEdgeKind, MultiFragmentBuildResult, OutputColumn,
 };
+use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::operator::{
     AggMode, PhysicalCTEAnchorOp, PhysicalCTEConsumeOp, PhysicalCTEProduceOp,
@@ -1436,7 +1436,11 @@ impl<'a> PlanFragmentBuilder<'a> {
 
         // Close the partial fragment with Unpartitioned/Gather sender into the merging exchange.
         let gather_spec = crate::sql::optimizer::property::DistributionSpec::Gather;
-        let output_partition = self.build_output_partition(&gather_spec, &child_scope, &node.children[0].output_columns)?;
+        let output_partition = self.build_output_partition(
+            &gather_spec,
+            &child_scope,
+            &node.children[0].output_columns,
+        )?;
         let exchange_partition_type = output_partition.type_;
 
         self.completed_fragments.push(FragmentBuildResult {
@@ -1546,7 +1550,11 @@ impl<'a> PlanFragmentBuilder<'a> {
         } = child;
 
         let gather_spec = crate::sql::optimizer::property::DistributionSpec::Gather;
-        let output_partition = self.build_output_partition(&gather_spec, &child_scope, &node.children[0].output_columns)?;
+        let output_partition = self.build_output_partition(
+            &gather_spec,
+            &child_scope,
+            &node.children[0].output_columns,
+        )?;
         let exchange_partition_type = output_partition.type_;
 
         self.completed_fragments.push(FragmentBuildResult {
@@ -2769,7 +2777,8 @@ impl<'a> PlanFragmentBuilder<'a> {
             cte_exchange_nodes,
         } = child;
 
-        let output_partition = self.build_output_partition(&op.spec, &scope, &node.children[0].output_columns)?;
+        let output_partition =
+            self.build_output_partition(&op.spec, &scope, &node.children[0].output_columns)?;
         let exchange_partition_type = output_partition.type_;
 
         self.completed_fragments.push(FragmentBuildResult {
