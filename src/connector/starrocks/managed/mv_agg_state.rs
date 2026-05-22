@@ -2612,11 +2612,13 @@ mod tests {
     fn min_max_output_columns(value_type: DataType) -> Vec<OutputColumn> {
         vec![
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "k1".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
             },
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "m".to_string(),
                 data_type: value_type,
                 nullable: true,
@@ -2701,21 +2703,25 @@ mod tests {
         };
         let columns = vec![
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "k1".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
             },
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "s".to_string(),
                 data_type: DataType::Int64,
                 nullable: true,
             },
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "c".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
             },
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "a".to_string(),
                 data_type: DataType::Int64,
                 nullable: true,
@@ -2768,26 +2774,31 @@ mod tests {
         };
         let columns = vec![
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "k1".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
             },
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "mn".to_string(),
                 data_type: DataType::Int64,
                 nullable: true,
             },
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "s".to_string(),
                 data_type: DataType::Int64,
                 nullable: true,
             },
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "c".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
             },
             OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: "mx".to_string(),
                 data_type: DataType::Utf8,
                 nullable: true,
