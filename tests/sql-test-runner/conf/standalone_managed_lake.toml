@@ -1,5 +1,5 @@
-# NovaRocks standalone-server config for running the write-path
-# managed-lake SQL regressions against a local MinIO.
+# NovaRocks standalone-server config for running managed-lake SQL
+# regressions against a local MinIO.
 #
 # Usage:
 #     NO_PROXY=127.0.0.1,localhost \
@@ -7,7 +7,7 @@
 #       tests/sql-test-runner/conf/standalone_managed_lake.toml
 #     cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
 #       --config tests/sql-test-runner/conf/standalone_managed_lake.conf \
-#       --suite write-path --only managed_lake_insert_select,managed_lake_lifecycle --mode verify
+#       --suite iceberg-dml --mode verify
 
 [server]
 host = "127.0.0.1"
