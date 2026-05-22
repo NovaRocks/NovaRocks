@@ -524,6 +524,23 @@ fn reannotate_array(
                 )
             })
         }
+        // Integer narrowing: INSERT-SELECT may produce a wider integer type (e.g. BIGINT/Int64)
+        // when the sink column is a narrower integer (e.g. INT/Int32, SMALLINT/Int16, TINYINT/Int8).
+        // Arrow's default cast uses safe=true semantics: out-of-range values become NULL,
+        // matching the DECIMAL overflow convention used above.
+        (DataType::Int64, DataType::Int32)
+        | (DataType::Int64, DataType::Int16)
+        | (DataType::Int64, DataType::Int8)
+        | (DataType::Int32, DataType::Int16)
+        | (DataType::Int32, DataType::Int8) => {
+            crate::exec::expr::cast_with_special_rules(array, target_dtype).map_err(|e| {
+                format!(
+                    "reannotate_array: narrow integer {:?} to {:?} failed: {e}",
+                    array.data_type(),
+                    target_dtype
+                )
+            })
+        }
         (a, b) => Err(format!(
             "reannotate_array: incompatible data types: array={a:?}, target={b:?}"
         )),
@@ -1033,6 +1050,103 @@ mod tests {
         let target_dtype = DataType::Decimal128(10, 2);
         let result = reannotate_array(&src, &target_dtype).expect("same-type must succeed");
         // The early equality check returns the original Arc.
+        assert!(Arc::ptr_eq(&src, &result));
+    }
+
+    /// reannotate_array must narrow Int64 → Int32 losslessly when every value fits.
+    #[test]
+    fn reannotate_int64_narrows_to_int32_lossless() {
+        use arrow::array::{ArrayRef, Int32Array, Int64Array};
+        use arrow::datatypes::DataType;
+        use std::sync::Arc;
+
+        let src: ArrayRef = Arc::new(Int64Array::from(vec![
+            Some(1_i64),
+            Some(20_i64),
+            Some(99999_i64),
+            None,
+        ]));
+
+        let result = reannotate_array(&src, &DataType::Int32).expect("lossless narrow must succeed");
+        let out = result
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("Int32Array");
+
+        assert_eq!(out.len(), 4);
+        assert_eq!(out.value(0), 1_i32);
+        assert_eq!(out.value(1), 20_i32);
+        assert_eq!(out.value(2), 99999_i32);
+        assert!(out.is_null(3));
+    }
+
+    /// reannotate_array must produce NULL (not error) when Int64 → Int32 overflows.
+    #[test]
+    fn reannotate_int64_to_int32_overflow_returns_null() {
+        use arrow::array::{ArrayRef, Int32Array, Int64Array};
+        use arrow::datatypes::DataType;
+        use std::sync::Arc;
+
+        // i32::MAX is 2_147_483_647; values beyond that should become NULL.
+        let src: ArrayRef = Arc::new(Int64Array::from(vec![
+            Some(42_i64),
+            Some(i64::from(i32::MAX) + 1), // overflows
+            Some(-1_i64),
+            None,
+        ]));
+
+        let result =
+            reannotate_array(&src, &DataType::Int32).expect("overflow arm must not return Err");
+        let out = result
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("Int32Array");
+
+        assert_eq!(out.len(), 4);
+        assert_eq!(out.value(0), 42_i32);
+        assert!(out.is_null(1), "overflowing value must become NULL");
+        assert_eq!(out.value(2), -1_i32);
+        assert!(out.is_null(3));
+    }
+
+    /// reannotate_array must narrow Int32 → Int16 losslessly.
+    #[test]
+    fn reannotate_int32_narrows_to_int16() {
+        use arrow::array::{ArrayRef, Int16Array, Int32Array};
+        use arrow::datatypes::DataType;
+        use std::sync::Arc;
+
+        let src: ArrayRef = Arc::new(Int32Array::from(vec![
+            Some(100_i32),
+            Some(-200_i32),
+            None,
+            Some(i32::from(i16::MAX) + 1), // overflows i16
+        ]));
+
+        let result =
+            reannotate_array(&src, &DataType::Int16).expect("Int32->Int16 must not return Err");
+        let out = result
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .expect("Int16Array");
+
+        assert_eq!(out.len(), 4);
+        assert_eq!(out.value(0), 100_i16);
+        assert_eq!(out.value(1), -200_i16);
+        assert!(out.is_null(2));
+        assert!(out.is_null(3), "overflow must become NULL");
+    }
+
+    /// reannotate_array: same Int32 type is a passthrough (regression guard).
+    #[test]
+    fn reannotate_int32_same_type_is_passthrough() {
+        use arrow::array::{ArrayRef, Int32Array};
+        use arrow::datatypes::DataType;
+        use std::sync::Arc;
+
+        let src: ArrayRef = Arc::new(Int32Array::from(vec![Some(7_i32), None]));
+        let result =
+            reannotate_array(&src, &DataType::Int32).expect("same Int32 must succeed");
         assert!(Arc::ptr_eq(&src, &result));
     }
 }
