@@ -1,0 +1,17 @@
+-- query 3
+region	mn	mx	c
+LA	7	47	5
+NY	11	55	5
+SF	10	50	5
+
+-- query 5
+region	mn	mx	c
+LA	7	47	5
+NY	22	55	4
+SF	20	50	4
+
+-- query 6
+region	mn	mx	c
+LA	7	47	5
+NY	22	55	4
+SF	20	50	4

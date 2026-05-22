@@ -1,0 +1,23 @@
+-- query 3
+user_region	mn	mx	c
+east	25	75	2
+south	99	99	1
+west	40	60	2
+
+-- query 4
+user_region	mn	mx	c
+east	25	75	2
+south	99	99	1
+west	40	60	2
+
+-- query 6
+user_region	mn	mx	c
+east	75	75	1
+south	99	99	1
+west	40	60	2
+
+-- query 7
+user_region	mn	mx	c
+east	75	75	1
+south	99	99	1
+west	40	60	2

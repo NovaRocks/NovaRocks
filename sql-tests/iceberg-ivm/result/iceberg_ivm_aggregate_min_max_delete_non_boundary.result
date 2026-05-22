@@ -1,0 +1,11 @@
+-- query 3
+region	mn	mx	c
+east	10	50	5
+
+-- query 5
+region	mn	mx	c
+east	10	50	4
+
+-- query 6
+region	mn	mx	c
+east	10	50	4
