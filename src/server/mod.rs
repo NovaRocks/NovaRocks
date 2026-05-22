@@ -547,6 +547,13 @@ fn parse_set_boolean(query: &str) -> Option<(String, bool)> {
         return None;
     }
     let name = parts.next()?.to_ascii_lowercase();
+    // User variables (@name) are handled by parse_set_user_variable_query.
+    // Returning None here ensures the user variable path is reached before
+    // parse_set_boolean can silently swallow `SET @i = 1` (which matches the
+    // boolean pattern because `"1"` is a recognised bool token).
+    if name.starts_with('@') {
+        return None;
+    }
     let next = parts.next()?;
     let value = if next == "=" { parts.next()? } else { next };
     if parts.next().is_some() {
@@ -1117,6 +1124,91 @@ mod tests {
                 "@var".to_string(),
                 "array_map(x -> CAST(x AS STRING), array_generate(1, 2000000, 1))".to_string()
             ))
+        );
+    }
+
+    #[test]
+    fn parse_set_user_variable_accepts_integer_literal() {
+        assert_eq!(
+            parse_set_user_variable_query("SET @i = 1"),
+            Some(("@i".to_string(), "1".to_string()))
+        );
+        assert_eq!(
+            parse_set_user_variable_query("SET @counter = 42"),
+            Some(("@counter".to_string(), "42".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_set_user_variable_accepts_string_literal() {
+        assert_eq!(
+            parse_set_user_variable_query("SET @s = 'hello'"),
+            Some(("@s".to_string(), "'hello'".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_set_user_variable_accepts_null() {
+        assert_eq!(
+            parse_set_user_variable_query("SET @n = NULL"),
+            Some(("@n".to_string(), "NULL".to_string()))
+        );
+    }
+
+    /// Regression test: `parse_set_boolean` must not swallow `SET @i = 1`
+    /// before `parse_set_user_variable_query` gets a chance to handle it.
+    /// Previously, `"1"` matched the boolean token `"1"` and the user
+    /// variable was silently discarded.
+    #[test]
+    fn parse_set_boolean_does_not_swallow_user_variables() {
+        // @i = 1 must NOT be matched by the boolean handler.
+        assert_eq!(parse_set_boolean("SET @i = 1"), None);
+        assert_eq!(parse_set_boolean("SET @i = 0"), None);
+        assert_eq!(parse_set_boolean("SET @flag = true"), None);
+    }
+
+    #[test]
+    fn substitute_session_user_variables_replaces_integer() {
+        let mut vars = BTreeMap::new();
+        vars.insert("@i".to_string(), "1".to_string());
+        assert_eq!(
+            substitute_session_user_variables("SELECT @i AS val", &vars).unwrap(),
+            "SELECT 1 AS val"
+        );
+    }
+
+    #[test]
+    fn substitute_session_user_variables_replaces_string() {
+        let mut vars = BTreeMap::new();
+        vars.insert("@s".to_string(), "'hello'".to_string());
+        assert_eq!(
+            substitute_session_user_variables("SELECT @s AS val", &vars).unwrap(),
+            "SELECT 'hello' AS val"
+        );
+    }
+
+    #[test]
+    fn substitute_session_user_variables_leaves_unbound_as_null_placeholder() {
+        let vars = BTreeMap::new();
+        // Unbound: pass-through (will fail downstream in the engine, but that
+        // is handled by treating @unbound as NULL after substitution lands).
+        assert_eq!(
+            substitute_session_user_variables("SELECT @unbound AS v", &vars).unwrap(),
+            "SELECT @unbound AS v"
+        );
+    }
+
+    #[test]
+    fn substitute_session_user_variables_in_insert_values() {
+        let mut vars = BTreeMap::new();
+        vars.insert("@i".to_string(), "5".to_string());
+        assert_eq!(
+            substitute_session_user_variables(
+                "INSERT INTO t VALUES (@i, @i)",
+                &vars
+            )
+            .unwrap(),
+            "INSERT INTO t VALUES (5, 5)"
         );
     }
 

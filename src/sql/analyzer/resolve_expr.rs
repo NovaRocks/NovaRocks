@@ -35,6 +35,18 @@ impl<'a> super::AnalyzerContext<'a> {
                         nullable: false,
                     });
                 }
+                // `@var` is a MySQL-style user variable. Bound variables are
+                // substituted textually by the standalone server before the SQL
+                // reaches the analyzer. If an `@var` token still arrives here,
+                // it means the variable was not bound — MySQL semantics for an
+                // unbound user variable is NULL.
+                if ident.value.starts_with('@') {
+                    return Ok(TypedExpr {
+                        kind: ExprKind::Literal(LiteralValue::Null),
+                        data_type: DataType::Null,
+                        nullable: true,
+                    });
+                }
                 if let Some(param) = scope.resolve_lambda_param(&ident.value) {
                     return Ok(TypedExpr {
                         kind: ExprKind::LambdaParamRef {
