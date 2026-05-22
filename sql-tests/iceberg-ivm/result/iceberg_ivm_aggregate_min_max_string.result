@@ -1,0 +1,27 @@
+-- query 3
+region	mn	mx	c
+east	apple	elderberry	6
+
+-- query 4
+region	mn	mx	c
+east	apple	elderberry	6
+
+-- query 6
+region	mn	mx	c
+east	banana	elderberry	5
+
+-- query 7
+region	mn	mx	c
+east	banana	elderberry	5
+
+-- query 9
+region	mn	mx	c
+east	banana	date	4
+
+-- query 10
+region	mn	mx	c
+east	banana	date	4
+
+-- query 12
+region	mn	mx	c
+east	banana	date	3
