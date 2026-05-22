@@ -847,6 +847,11 @@ impl<'a> ExprCompiler<'a> {
         }
     }
 
+    // Thin dispatcher. The actual work lives in per-op-group helpers below,
+    // each marked `#[inline(never)]` so that recursion through `BinaryOp`
+    // chains (e.g. `a + b + c + ... + k` parsed as a left-leaning tree) does
+    // not pile up a single large stack frame.  See the design note above
+    // `compile_typed_inner` for the underlying reason.
     fn compile_typed_binary_op(
         &mut self,
         left: &TypedExpr,
@@ -854,159 +859,188 @@ impl<'a> ExprCompiler<'a> {
         right: &TypedExpr,
     ) -> Result<DataType, String> {
         match op {
-            // Comparison operators
             BinOp::Eq
             | BinOp::Ne
             | BinOp::Lt
             | BinOp::Le
             | BinOp::Gt
             | BinOp::Ge
-            | BinOp::EqForNull => {
-                let opcode = match op {
-                    BinOp::Eq => opcodes::TExprOpcode::EQ,
-                    BinOp::Ne => opcodes::TExprOpcode::NE,
-                    BinOp::Lt => opcodes::TExprOpcode::LT,
-                    BinOp::Le => opcodes::TExprOpcode::LE,
-                    BinOp::Gt => opcodes::TExprOpcode::GT,
-                    BinOp::Ge => opcodes::TExprOpcode::GE,
-                    BinOp::EqForNull => opcodes::TExprOpcode::EQ_FOR_NULL,
-                    _ => unreachable!(),
-                };
-                let compare_type = wider_type(&left.data_type, &right.data_type);
-                let parent_idx = self.nodes.len();
-                self.nodes.push(default_expr_node()); // placeholder
-
-                // Compile left, inserting cast if needed
-                if left.data_type != compare_type
-                    && needs_comparison_cast(&left.data_type, &compare_type)
-                {
-                    let cast_type_desc = arrow_type_to_type_desc(&compare_type)?;
-                    self.nodes.push(exprs::TExprNode {
-                        node_type: exprs::TExprNodeType::CAST_EXPR,
-                        type_: cast_type_desc,
-                        num_children: 1,
-                        opcode: None,
-                        ..default_expr_node()
-                    });
-                }
-                self.compile_typed_inner(left)?;
-
-                // Compile right, inserting cast if needed
-                if right.data_type != compare_type
-                    && needs_comparison_cast(&right.data_type, &compare_type)
-                {
-                    let cast_type_desc = arrow_type_to_type_desc(&compare_type)?;
-                    self.nodes.push(exprs::TExprNode {
-                        node_type: exprs::TExprNodeType::CAST_EXPR,
-                        type_: cast_type_desc,
-                        num_children: 1,
-                        opcode: None,
-                        ..default_expr_node()
-                    });
-                }
-                self.compile_typed_inner(right)?;
-
-                let child_type_desc = arrow_type_to_type_desc(&compare_type).ok();
-                let type_desc = scalar_type_desc(types::TPrimitiveType::BOOLEAN);
-                self.nodes[parent_idx] = exprs::TExprNode {
-                    node_type: exprs::TExprNodeType::BINARY_PRED,
-                    type_: type_desc,
-                    opcode: Some(opcode),
-                    num_children: 2,
-                    child_type_desc,
-                    ..default_expr_node()
-                };
-                self.last_type = DataType::Boolean;
-                self.last_nullable = false;
-                Ok(DataType::Boolean)
-            }
-            // Logical operators
-            BinOp::And => {
-                let type_desc = scalar_type_desc(types::TPrimitiveType::BOOLEAN);
-                self.nodes.push(exprs::TExprNode {
-                    node_type: exprs::TExprNodeType::COMPOUND_PRED,
-                    type_: type_desc,
-                    opcode: Some(opcodes::TExprOpcode::COMPOUND_AND),
-                    num_children: 2,
-                    ..default_expr_node()
-                });
-                self.compile_typed_inner(left)?;
-                self.compile_typed_inner(right)?;
-                self.last_type = DataType::Boolean;
-                Ok(DataType::Boolean)
-            }
-            BinOp::Or => {
-                let type_desc = scalar_type_desc(types::TPrimitiveType::BOOLEAN);
-                self.nodes.push(exprs::TExprNode {
-                    node_type: exprs::TExprNodeType::COMPOUND_PRED,
-                    type_: type_desc,
-                    opcode: Some(opcodes::TExprOpcode::COMPOUND_OR),
-                    num_children: 2,
-                    ..default_expr_node()
-                });
-                self.compile_typed_inner(left)?;
-                self.compile_typed_inner(right)?;
-                self.last_type = DataType::Boolean;
-                Ok(DataType::Boolean)
-            }
-            // Arithmetic operators
+            | BinOp::EqForNull => self.compile_binary_comparison(left, op, right),
+            BinOp::And => self.compile_binary_and(left, right),
+            BinOp::Or => self.compile_binary_or(left, right),
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
-                let opcode = match op {
-                    BinOp::Add => opcodes::TExprOpcode::ADD,
-                    BinOp::Sub => opcodes::TExprOpcode::SUBTRACT,
-                    BinOp::Mul => opcodes::TExprOpcode::MULTIPLY,
-                    BinOp::Div => opcodes::TExprOpcode::DIVIDE,
-                    BinOp::Mod => opcodes::TExprOpcode::MOD,
-                    _ => unreachable!(),
-                };
-                // Use op-aware result type for correct Decimal precision/scale.
-                let op_str = match op {
-                    BinOp::Mul => "mul",
-                    BinOp::Div => "div",
-                    _ => "add",
-                };
-                let result_type =
-                    arithmetic_result_type_with_op(&left.data_type, &right.data_type, op_str);
-
-                let parent_idx = self.nodes.len();
-                self.nodes.push(default_expr_node()); // placeholder
-
-                // Compile left, wrapping with implicit CAST if needed
-                if needs_arithmetic_cast(&left.data_type, &result_type) {
-                    let cast_type_desc = arrow_type_to_type_desc(&result_type)?;
-                    self.nodes.push(exprs::TExprNode {
-                        node_type: exprs::TExprNodeType::CAST_EXPR,
-                        type_: cast_type_desc,
-                        num_children: 1,
-                        ..default_expr_node()
-                    });
-                }
-                self.compile_typed_inner(left)?;
-
-                // Compile right, wrapping with implicit CAST if needed
-                if needs_arithmetic_cast(&right.data_type, &result_type) {
-                    let cast_type_desc = arrow_type_to_type_desc(&result_type)?;
-                    self.nodes.push(exprs::TExprNode {
-                        node_type: exprs::TExprNodeType::CAST_EXPR,
-                        type_: cast_type_desc,
-                        num_children: 1,
-                        ..default_expr_node()
-                    });
-                }
-                self.compile_typed_inner(right)?;
-
-                let type_desc = arrow_type_to_type_desc(&result_type)?;
-                self.nodes[parent_idx] = exprs::TExprNode {
-                    node_type: exprs::TExprNodeType::ARITHMETIC_EXPR,
-                    type_: type_desc,
-                    opcode: Some(opcode),
-                    num_children: 2,
-                    ..default_expr_node()
-                };
-                self.last_type = result_type.clone();
-                Ok(result_type)
+                self.compile_binary_arithmetic(left, op, right)
             }
         }
+    }
+
+    #[inline(never)]
+    fn compile_binary_comparison(
+        &mut self,
+        left: &TypedExpr,
+        op: BinOp,
+        right: &TypedExpr,
+    ) -> Result<DataType, String> {
+        let opcode = match op {
+            BinOp::Eq => opcodes::TExprOpcode::EQ,
+            BinOp::Ne => opcodes::TExprOpcode::NE,
+            BinOp::Lt => opcodes::TExprOpcode::LT,
+            BinOp::Le => opcodes::TExprOpcode::LE,
+            BinOp::Gt => opcodes::TExprOpcode::GT,
+            BinOp::Ge => opcodes::TExprOpcode::GE,
+            BinOp::EqForNull => opcodes::TExprOpcode::EQ_FOR_NULL,
+            _ => unreachable!(),
+        };
+        let compare_type = wider_type(&left.data_type, &right.data_type);
+        let parent_idx = self.nodes.len();
+        self.nodes.push(default_expr_node()); // placeholder
+
+        // Compile left, inserting cast if needed
+        if left.data_type != compare_type
+            && needs_comparison_cast(&left.data_type, &compare_type)
+        {
+            let cast_type_desc = arrow_type_to_type_desc(&compare_type)?;
+            self.nodes.push(exprs::TExprNode {
+                node_type: exprs::TExprNodeType::CAST_EXPR,
+                type_: cast_type_desc,
+                num_children: 1,
+                opcode: None,
+                ..default_expr_node()
+            });
+        }
+        self.compile_typed_inner(left)?;
+
+        // Compile right, inserting cast if needed
+        if right.data_type != compare_type
+            && needs_comparison_cast(&right.data_type, &compare_type)
+        {
+            let cast_type_desc = arrow_type_to_type_desc(&compare_type)?;
+            self.nodes.push(exprs::TExprNode {
+                node_type: exprs::TExprNodeType::CAST_EXPR,
+                type_: cast_type_desc,
+                num_children: 1,
+                opcode: None,
+                ..default_expr_node()
+            });
+        }
+        self.compile_typed_inner(right)?;
+
+        let child_type_desc = arrow_type_to_type_desc(&compare_type).ok();
+        let type_desc = scalar_type_desc(types::TPrimitiveType::BOOLEAN);
+        self.nodes[parent_idx] = exprs::TExprNode {
+            node_type: exprs::TExprNodeType::BINARY_PRED,
+            type_: type_desc,
+            opcode: Some(opcode),
+            num_children: 2,
+            child_type_desc,
+            ..default_expr_node()
+        };
+        self.last_type = DataType::Boolean;
+        self.last_nullable = false;
+        Ok(DataType::Boolean)
+    }
+
+    #[inline(never)]
+    fn compile_binary_and(
+        &mut self,
+        left: &TypedExpr,
+        right: &TypedExpr,
+    ) -> Result<DataType, String> {
+        let type_desc = scalar_type_desc(types::TPrimitiveType::BOOLEAN);
+        self.nodes.push(exprs::TExprNode {
+            node_type: exprs::TExprNodeType::COMPOUND_PRED,
+            type_: type_desc,
+            opcode: Some(opcodes::TExprOpcode::COMPOUND_AND),
+            num_children: 2,
+            ..default_expr_node()
+        });
+        self.compile_typed_inner(left)?;
+        self.compile_typed_inner(right)?;
+        self.last_type = DataType::Boolean;
+        Ok(DataType::Boolean)
+    }
+
+    #[inline(never)]
+    fn compile_binary_or(
+        &mut self,
+        left: &TypedExpr,
+        right: &TypedExpr,
+    ) -> Result<DataType, String> {
+        let type_desc = scalar_type_desc(types::TPrimitiveType::BOOLEAN);
+        self.nodes.push(exprs::TExprNode {
+            node_type: exprs::TExprNodeType::COMPOUND_PRED,
+            type_: type_desc,
+            opcode: Some(opcodes::TExprOpcode::COMPOUND_OR),
+            num_children: 2,
+            ..default_expr_node()
+        });
+        self.compile_typed_inner(left)?;
+        self.compile_typed_inner(right)?;
+        self.last_type = DataType::Boolean;
+        Ok(DataType::Boolean)
+    }
+
+    #[inline(never)]
+    fn compile_binary_arithmetic(
+        &mut self,
+        left: &TypedExpr,
+        op: BinOp,
+        right: &TypedExpr,
+    ) -> Result<DataType, String> {
+        let opcode = match op {
+            BinOp::Add => opcodes::TExprOpcode::ADD,
+            BinOp::Sub => opcodes::TExprOpcode::SUBTRACT,
+            BinOp::Mul => opcodes::TExprOpcode::MULTIPLY,
+            BinOp::Div => opcodes::TExprOpcode::DIVIDE,
+            BinOp::Mod => opcodes::TExprOpcode::MOD,
+            _ => unreachable!(),
+        };
+        // Use op-aware result type for correct Decimal precision/scale.
+        let op_str = match op {
+            BinOp::Mul => "mul",
+            BinOp::Div => "div",
+            _ => "add",
+        };
+        let result_type =
+            arithmetic_result_type_with_op(&left.data_type, &right.data_type, op_str);
+
+        let parent_idx = self.nodes.len();
+        self.nodes.push(default_expr_node()); // placeholder
+
+        // Compile left, wrapping with implicit CAST if needed
+        if needs_arithmetic_cast(&left.data_type, &result_type) {
+            let cast_type_desc = arrow_type_to_type_desc(&result_type)?;
+            self.nodes.push(exprs::TExprNode {
+                node_type: exprs::TExprNodeType::CAST_EXPR,
+                type_: cast_type_desc,
+                num_children: 1,
+                ..default_expr_node()
+            });
+        }
+        self.compile_typed_inner(left)?;
+
+        // Compile right, wrapping with implicit CAST if needed
+        if needs_arithmetic_cast(&right.data_type, &result_type) {
+            let cast_type_desc = arrow_type_to_type_desc(&result_type)?;
+            self.nodes.push(exprs::TExprNode {
+                node_type: exprs::TExprNodeType::CAST_EXPR,
+                type_: cast_type_desc,
+                num_children: 1,
+                ..default_expr_node()
+            });
+        }
+        self.compile_typed_inner(right)?;
+
+        let type_desc = arrow_type_to_type_desc(&result_type)?;
+        self.nodes[parent_idx] = exprs::TExprNode {
+            node_type: exprs::TExprNodeType::ARITHMETIC_EXPR,
+            type_: type_desc,
+            opcode: Some(opcode),
+            num_children: 2,
+            ..default_expr_node()
+        };
+        self.last_type = result_type.clone();
+        Ok(result_type)
     }
 
     fn compile_literal(
