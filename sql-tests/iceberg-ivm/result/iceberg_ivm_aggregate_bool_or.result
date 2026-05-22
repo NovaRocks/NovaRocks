@@ -1,0 +1,37 @@
+-- query 3
+region	any_true	c
+east	1	5
+west	0	2
+
+-- query 4
+region	any_true	c
+east	1	5
+west	0	2
+
+-- query 6
+region	any_true	c
+east	0	4
+west	0	2
+
+-- query 7
+region	any_true	c
+east	0	4
+west	0	2
+
+-- query 9
+region	any_true	c
+east	0	3
+west	0	2
+
+-- query 11
+region	any_true	c
+west	0	2
+
+-- query 12
+region	any_true	c
+west	0	2
+
+-- query 14
+region	any_true	c
+east	1	1
+west	0	2

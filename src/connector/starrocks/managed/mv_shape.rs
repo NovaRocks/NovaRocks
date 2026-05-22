@@ -98,6 +98,12 @@ pub(crate) enum AggregateFunctionKind {
     Avg,
     Min,
     Max,
+    /// `BOOL_OR(col)` / `boolor_agg(col)`. Uses `Map<Boolean, Int64>` detail
+    /// state, same framework as `MIN/MAX`.
+    BoolOr,
+    /// `BOOL_AND(col)` / `booland_agg(col)`. Uses `Map<Boolean, Int64>` detail
+    /// state, same framework as `MIN/MAX`.
+    BoolAnd,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -619,6 +625,14 @@ fn classify_aggregate_call(
             AggregateFunctionKind::Max,
             classify_min_max_input(&args.args)?,
         ),
+        "bool_or" | "boolor_agg" => (
+            AggregateFunctionKind::BoolOr,
+            classify_bool_or_and_input(&args.args)?,
+        ),
+        "bool_and" | "booland_agg" => (
+            AggregateFunctionKind::BoolAnd,
+            classify_bool_or_and_input(&args.args)?,
+        ),
         _ => return Err(aggregate_error()),
     };
 
@@ -678,6 +692,23 @@ fn classify_min_max_input(args: &[sqlparser::ast::FunctionArg]) -> Result<Aggreg
     };
     let sqlparser::ast::FunctionArgExpr::Expr(expr) = simple_aggregate_arg_expr(arg)? else {
         return Err("MIN/MAX aggregate requires a column expression argument".to_string());
+    };
+    reject_unsupported_expr(expr).map_err(aggregate_expr_error)?;
+    Ok(AggregateInput::Expr(Box::new(expr.clone())))
+}
+
+fn classify_bool_or_and_input(
+    args: &[sqlparser::ast::FunctionArg],
+) -> Result<AggregateInput, String> {
+    // BOOL_OR / BOOL_AND require a single scalar Boolean-typed expression.
+    // The input type is enforced later when state column physical types are
+    // validated (`validate_state_column_type`); shape classification only
+    // sees the SQL AST so it can only check structural constraints here.
+    let [arg] = args else {
+        return Err("BOOL_OR/BOOL_AND aggregate requires a column expression argument".to_string());
+    };
+    let sqlparser::ast::FunctionArgExpr::Expr(expr) = simple_aggregate_arg_expr(arg)? else {
+        return Err("BOOL_OR/BOOL_AND aggregate requires a column expression argument".to_string());
     };
     reject_unsupported_expr(expr).map_err(aggregate_expr_error)?;
     Ok(AggregateInput::Expr(Box::new(expr.clone())))
@@ -1359,15 +1390,21 @@ pub(crate) fn rewrite_select_sql_for_state(
         .aggregates
         .iter()
         .any(|agg| agg.function == AggregateFunctionKind::Avg);
-    let has_min_or_max = shape.aggregates.iter().any(|agg| {
+    // IVM-BoolAgg (2026-05-23): BOOL_OR / BOOL_AND join MIN/MAX in the
+    // detail-state rewriter family — same `Map<K, Int64>` state shape,
+    // same `map_value_count(arg)` projection on the insert path.
+    let has_detail_state = shape.aggregates.iter().any(|agg| {
         matches!(
             agg.function,
-            AggregateFunctionKind::Min | AggregateFunctionKind::Max
+            AggregateFunctionKind::Min
+                | AggregateFunctionKind::Max
+                | AggregateFunctionKind::BoolOr
+                | AggregateFunctionKind::BoolAnd
         )
     });
     let needs_retraction_count =
         crate::connector::starrocks::managed::mv_agg_state::aggregate_shape_needs_retraction_count_state(shape);
-    if !has_avg && !has_min_or_max && !needs_retraction_count {
+    if !has_avg && !has_detail_state && !needs_retraction_count {
         return Ok(select_sql.to_string());
     }
 
@@ -1401,7 +1438,7 @@ pub(crate) fn rewrite_select_sql_for_state(
                 &sum_alias,
             ));
             new_projection.push(make_aggregate_select_item("COUNT", arg_expr, &count_alias));
-        } else if let Some((arg_expr, alias)) = extract_min_max_expr_and_alias(&item) {
+        } else if let Some((arg_expr, alias)) = extract_detail_state_expr_and_alias(&item) {
             // IVM-P5: MIN/MAX emits ONLY the detail-state projection
             // `map_value_count(arg) AS __agg_state_<sanitized>`. The visible
             // scalar value is NOT projected here; it is derived from the
@@ -1414,6 +1451,11 @@ pub(crate) fn rewrite_select_sql_for_state(
             // `materialize_aggregate_result_batch`, which allocates one
             // batch column per MIN/MAX-Single aggregate (same as
             // COUNT/SUM, not AVG).
+            //
+            // IVM-BoolAgg (2026-05-23): BOOL_OR / BOOL_AND share the same
+            // detail-state contract; the unified extractor
+            // `extract_detail_state_expr_and_alias` recognizes all four
+            // function names.
             let sanitized =
                 crate::connector::starrocks::managed::mv_agg_state::sanitize_state_column_name(
                     &alias,
@@ -1441,7 +1483,12 @@ pub(crate) fn rewrite_select_sql_for_state(
 /// Returns `(arg_expr, alias)` if the select item is
 /// `MIN(expr) AS alias` / `MAX(expr) AS alias` (or without alias).
 /// Returns `None` for all other items.
-fn extract_min_max_expr_and_alias(
+/// Recognize SELECT items whose aggregate uses the detail-state
+/// (`Map<K, Int64>`) state shape and the `map_value_count` /
+/// `map_value_count_signed` rewriter family. The current member set is
+/// `{ MIN, MAX, BOOL_OR, BOOL_AND }` (with their `*_agg` aliases). Returns
+/// `(arg_expr, alias)` on match, `None` otherwise.
+fn extract_detail_state_expr_and_alias(
     item: &sqlparser::ast::SelectItem,
 ) -> Option<(sqlparser::ast::Expr, String)> {
     use sqlparser::ast::{Expr, SelectItem};
@@ -1457,7 +1504,10 @@ fn extract_min_max_expr_and_alias(
     };
 
     let name = func.name.to_string().to_ascii_lowercase();
-    if !matches!(name.as_str(), "min" | "max") {
+    if !matches!(
+        name.as_str(),
+        "min" | "max" | "bool_or" | "boolor_agg" | "bool_and" | "booland_agg"
+    ) {
         return None;
     }
     if func.uses_odbc_syntax
@@ -2235,6 +2285,46 @@ mod tests {
             "got: {rewritten}"
         );
         assert!(!upper.contains("AVG(V2 + 1)"), "got: {rewritten}");
+    }
+
+    #[test]
+    fn rewrite_select_sql_for_state_emits_map_value_count_for_bool_or() {
+        // IVM-BoolAgg (2026-05-23): BOOL_OR / BOOL_AND share the detail-state
+        // family with MIN/MAX — the rewriter must replace the visible
+        // BOOL_OR(flag) with map_value_count(flag) projection (state-only).
+        let original = "SELECT region, BOOL_OR(flag) AS any_true, COUNT(*) AS c FROM ice.ns.events GROUP BY region";
+        let shape = as_aggregate_shape(classify_sql(original).expect("classify"));
+        let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
+        let upper = rewritten.to_uppercase();
+        assert!(
+            !upper.contains("BOOL_OR(FLAG)"),
+            "BOOL_OR(flag) visible projection must be absent; got: {rewritten}"
+        );
+        assert!(
+            upper.contains("MAP_VALUE_COUNT(FLAG)"),
+            "must emit map_value_count(flag); got: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("__agg_state_any_true"),
+            "missing __agg_state_any_true alias; got: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn rewrite_select_sql_for_state_emits_map_value_count_for_bool_and() {
+        let original =
+            "SELECT region, BOOL_AND(flag) AS all_true FROM ice.ns.events GROUP BY region";
+        let shape = as_aggregate_shape(classify_sql(original).expect("classify"));
+        let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
+        let upper = rewritten.to_uppercase();
+        assert!(
+            !upper.contains("BOOL_AND(FLAG)"),
+            "BOOL_AND(flag) visible projection must be absent; got: {rewritten}"
+        );
+        assert!(
+            upper.contains("MAP_VALUE_COUNT(FLAG)"),
+            "must emit map_value_count(flag); got: {rewritten}"
+        );
     }
 
     #[test]

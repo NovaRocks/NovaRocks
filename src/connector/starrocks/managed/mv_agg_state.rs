@@ -179,15 +179,21 @@ pub(crate) fn build_aggregate_mv_layout(
                     count_star,
                 });
             }
-            AggregateFunctionKind::Min | AggregateFunctionKind::Max => {
+            AggregateFunctionKind::Min
+            | AggregateFunctionKind::Max
+            | AggregateFunctionKind::BoolOr
+            | AggregateFunctionKind::BoolAnd => {
                 // IVM-P5: MIN/MAX state is a value-count detail map
                 // (`Map<input_type, Int64>`). Map keys are the distinct values
                 // observed in the group; values are the per-key occurrence
                 // counts. The rewriter / merge / derive / DDL paths are all
-                // wired through Phase 5. Float keys are still rejected by
-                // `validate_state_column_type` until canonical-NaN handling
-                // lands; non-Float MIN/MAX is fully incremental, including
-                // on DELETE deltas.
+                // wired through Phase 5.
+                //
+                // IVM-BoolAgg (2026-05-23): BOOL_OR / BOOL_AND use the same
+                // `Map<Boolean, Int64>` detail-state shape; the only difference
+                // from MIN/MAX is the visible-derivation step. The visible
+                // column for BOOL_OR / BOOL_AND is Boolean, so the auto-derived
+                // `visible.data_type` here is already Boolean.
                 let state_name = format!("{}{}", AGG_STATE_PREFIX, sanitized);
                 let key_arrow_type = visible.data_type.clone();
                 let key_sql_type = mv_ddl::arrow_data_type_to_sql_type(&key_arrow_type)?;
@@ -859,11 +865,18 @@ pub(crate) fn negate_aggregate_state_chunks(
                 .clone();
             arrays[column_index] = if matches!(
                 state_column.function,
-                AggregateFunctionKind::Min | AggregateFunctionKind::Max
+                AggregateFunctionKind::Min
+                    | AggregateFunctionKind::Max
+                    | AggregateFunctionKind::BoolOr
+                    | AggregateFunctionKind::BoolAnd
             ) {
                 // IVM-P5 Phase 4: MIN/MAX state is `Map<K, Int64>`. Negate
                 // the per-entry counts and rebuild the MapArray, preserving
                 // keys and per-row offsets.
+                //
+                // IVM-BoolAgg (2026-05-23): BOOL_OR / BOOL_AND share the
+                // exact same `Map<Boolean, Int64>` shape, so the same
+                // map-aware negate path applies.
                 negate_map_state_array(&original, state_column)?
             } else {
                 negate_state_array(&original, state_column)?
@@ -1011,10 +1024,16 @@ fn merge_state_value(
             merge_count_state_value(old, delta, state_column)
         }
         (AggregateFunctionKind::Min, AggregateStateRole::Single)
-        | (AggregateFunctionKind::Max, AggregateStateRole::Single) => {
+        | (AggregateFunctionKind::Max, AggregateStateRole::Single)
+        | (AggregateFunctionKind::BoolOr, AggregateStateRole::Single)
+        | (AggregateFunctionKind::BoolAnd, AggregateStateRole::Single) => {
             // IVM-P5 (Phase 4): MIN/MAX state is a `Map<K, Int64>` value-count
             // detail map; merge is key-wise count addition followed by
             // zero-pruning (spec §3.5 — eager pruning at every merge step).
+            //
+            // IVM-BoolAgg (2026-05-23): BOOL_OR / BOOL_AND use the same
+            // `Map<Boolean, Int64>` shape; merge logic is identical
+            // (key-wise count addition + zero prune is type-agnostic).
             merge_value_count_map_state(old, delta, state_column)
         }
         (function, role) => Err(format!(
@@ -1357,6 +1376,113 @@ pub(crate) fn derive_visible_from_detail_map(
     Ok(current)
 }
 
+/// Derive the visible `BOOL_OR` value from a `Map<Boolean, Int64>` detail
+/// state.
+///
+/// Semantics (matches standard SQL / NovaRocks plain `BOOL_OR`):
+///   - At least one `true` entry with `count > 0` → `Some(Bool(true))`
+///   - Only `false` entries with `count > 0`     → `Some(Bool(false))`
+///   - Empty / no positive counts                → `None` (visible NULL)
+///
+/// NULL Boolean inputs are skipped at write time by `map_value_count` /
+/// `map_value_count_signed` (NULL keys are not inserted into the detail
+/// map), matching the SQL convention of ignoring NULL inputs to aggregate
+/// functions.
+pub(crate) fn derive_bool_or_from_detail_map(
+    value: &AggScalarValue,
+) -> Result<Option<AggScalarValue>, String> {
+    let AggScalarValue::Map(entries) = value else {
+        return Err(format!(
+            "derive_bool_or_from_detail_map: expected Map, got {value:?}"
+        ));
+    };
+    let mut has_true = false;
+    let mut has_false = false;
+    for (key, count) in entries {
+        let count_i64 = match count {
+            Some(AggScalarValue::Int64(v)) => *v,
+            None => 0,
+            Some(other) => {
+                return Err(format!(
+                    "derive_bool_or_from_detail_map: expected Int64 count, got {other:?}"
+                ));
+            }
+        };
+        if count_i64 <= 0 {
+            continue;
+        }
+        match key {
+            Some(AggScalarValue::Bool(true)) => has_true = true,
+            Some(AggScalarValue::Bool(false)) => has_false = true,
+            Some(other) => {
+                return Err(format!(
+                    "derive_bool_or_from_detail_map: expected Bool key, got {other:?}"
+                ));
+            }
+            None => {
+                // NULL keys are filtered out at write time; skip defensively.
+            }
+        }
+    }
+    if has_true {
+        Ok(Some(AggScalarValue::Bool(true)))
+    } else if has_false {
+        Ok(Some(AggScalarValue::Bool(false)))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Derive the visible `BOOL_AND` value from a `Map<Boolean, Int64>` detail
+/// state.
+///
+/// Semantics (matches standard SQL / NovaRocks plain `BOOL_AND`):
+///   - At least one `false` entry with `count > 0` → `Some(Bool(false))`
+///   - Only `true` entries with `count > 0`        → `Some(Bool(true))`
+///   - Empty / no positive counts                  → `None` (visible NULL)
+pub(crate) fn derive_bool_and_from_detail_map(
+    value: &AggScalarValue,
+) -> Result<Option<AggScalarValue>, String> {
+    let AggScalarValue::Map(entries) = value else {
+        return Err(format!(
+            "derive_bool_and_from_detail_map: expected Map, got {value:?}"
+        ));
+    };
+    let mut has_true = false;
+    let mut has_false = false;
+    for (key, count) in entries {
+        let count_i64 = match count {
+            Some(AggScalarValue::Int64(v)) => *v,
+            None => 0,
+            Some(other) => {
+                return Err(format!(
+                    "derive_bool_and_from_detail_map: expected Int64 count, got {other:?}"
+                ));
+            }
+        };
+        if count_i64 <= 0 {
+            continue;
+        }
+        match key {
+            Some(AggScalarValue::Bool(true)) => has_true = true,
+            Some(AggScalarValue::Bool(false)) => has_false = true,
+            Some(other) => {
+                return Err(format!(
+                    "derive_bool_and_from_detail_map: expected Bool key, got {other:?}"
+                ));
+            }
+            None => {}
+        }
+    }
+    if has_false {
+        Ok(Some(AggScalarValue::Bool(false)))
+    } else if has_true {
+        Ok(Some(AggScalarValue::Bool(true)))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Pick min or max of two scalar values using the executor's stable
 /// comparator.
 ///
@@ -1457,7 +1583,14 @@ fn zero_state_value(state_column: &AggregateStateColumn) -> Option<AggScalarValu
         // asymmetry with SUM (also None) is intentional: SUM uses scalar
         // None as the additive identity, while MIN/MAX None means "empty
         // detail map", and the merge helper distinguishes them by state shape.
-        (AggregateFunctionKind::Min, _) | (AggregateFunctionKind::Max, _) => None,
+        //
+        // IVM-BoolAgg (2026-05-23): BOOL_OR / BOOL_AND share the same
+        // detail-state shape (`Map<Boolean, Int64>`), so identical
+        // None-as-empty semantics apply.
+        (AggregateFunctionKind::Min, _)
+        | (AggregateFunctionKind::Max, _)
+        | (AggregateFunctionKind::BoolOr, _)
+        | (AggregateFunctionKind::BoolAnd, _) => None,
         // Catch-all for unexpected combinations.
         (function, role) => {
             // This should never happen with well-formed layouts.
@@ -1526,16 +1659,22 @@ fn validate_loaded_physical_row(
         // visible column is scalar K. They never compare equal, so skip the
         // check for MIN/MAX too — correctness for those is enforced by the
         // post-merge derive-visible step in `update_visible_values_from_state`.
-        let is_min_max_single = matches!(
+        //
+        // IVM-BoolAgg (2026-05-23): BOOL_OR / BOOL_AND have the same
+        // visible-scalar / state-map asymmetry, so the same skip applies.
+        let is_detail_state_single = matches!(
             (state_column.function, state_column.state_role),
             (
-                AggregateFunctionKind::Min | AggregateFunctionKind::Max,
+                AggregateFunctionKind::Min
+                    | AggregateFunctionKind::Max
+                    | AggregateFunctionKind::BoolOr
+                    | AggregateFunctionKind::BoolAnd,
                 AggregateStateRole::Single
             )
         );
         if !allow_negative_counts
             && matches!(state_column.state_role, AggregateStateRole::Single)
-            && !is_min_max_single
+            && !is_detail_state_single
         {
             let visible_value =
                 visible_values
@@ -1702,7 +1841,9 @@ fn validate_state_column_type(
             )),
         },
         (AggregateFunctionKind::Min, AggregateStateRole::Single)
-        | (AggregateFunctionKind::Max, AggregateStateRole::Single) => {
+        | (AggregateFunctionKind::Max, AggregateStateRole::Single)
+        | (AggregateFunctionKind::BoolOr, AggregateStateRole::Single)
+        | (AggregateFunctionKind::BoolAnd, AggregateStateRole::Single) => {
             // IVM-P5 (Phase 2): MIN/MAX state is a `Map<input_type, Int64>`
             // value-count detail map. The Arrow shape follows the iceberg-rust
             // convention so the Iceberg sink can re-annotate batch field IDs
@@ -1712,26 +1853,41 @@ fn validate_state_column_type(
             //   key field non-null
             // Reject any other Arrow shape with a clear error so future schema
             // bugs are loud, not silent.
+            //
+            // IVM-BoolAgg (2026-05-23): BOOL_OR / BOOL_AND reuse the exact same
+            // Map<K, Int64> shape — only the accepted key type differs (Boolean
+            // only for BOOL_OR/BOOL_AND; all primitive scalars for MIN/MAX).
+            // MIN/MAX over Boolean is now also accepted — the prior reject
+            // referenced a stale "AggScalarValue does not support Boolean"
+            // comment that has been incorrect since `AggScalarValue::Bool`
+            // landed in IVM-P5.
+            let agg_label = match function {
+                AggregateFunctionKind::Min | AggregateFunctionKind::Max => "MIN/MAX",
+                AggregateFunctionKind::BoolOr | AggregateFunctionKind::BoolAnd => {
+                    "BOOL_OR/BOOL_AND"
+                }
+                _ => unreachable!(),
+            };
             let DataType::Map(entries_field, _keys_sorted) = data_type else {
                 return Err(format!(
-                    "MIN/MAX state type for column `{state_name}` must be Map<K, Int64>, got {data_type:?}"
+                    "{agg_label} state type for column `{state_name}` must be Map<K, Int64>, got {data_type:?}"
                 ));
             };
             if entries_field.name() != "key_value" {
                 return Err(format!(
-                    "MIN/MAX state map entries field for column `{state_name}` must be named `key_value` (iceberg-rust convention), got `{}`",
+                    "{agg_label} state map entries field for column `{state_name}` must be named `key_value` (iceberg-rust convention), got `{}`",
                     entries_field.name()
                 ));
             }
             let DataType::Struct(struct_fields) = entries_field.data_type() else {
                 return Err(format!(
-                    "MIN/MAX state map entries type for column `{state_name}` must be Struct, got {:?}",
+                    "{agg_label} state map entries type for column `{state_name}` must be Struct, got {:?}",
                     entries_field.data_type()
                 ));
             };
             if struct_fields.len() != 2 {
                 return Err(format!(
-                    "MIN/MAX state map entries struct for column `{state_name}` must have exactly 2 fields, got {}",
+                    "{agg_label} state map entries struct for column `{state_name}` must have exactly 2 fields, got {}",
                     struct_fields.len()
                 ));
             }
@@ -1740,18 +1896,18 @@ fn validate_state_column_type(
                 .find(|f| f.name() == "value")
                 .ok_or_else(|| {
                     format!(
-                        "MIN/MAX state map entries struct for column `{state_name}` is missing `value` field"
+                        "{agg_label} state map entries struct for column `{state_name}` is missing `value` field"
                     )
                 })?;
             if value_field.data_type() != &DataType::Int64 {
                 return Err(format!(
-                    "MIN/MAX state map value type for column `{state_name}` must be Int64, got {:?}",
+                    "{agg_label} state map value type for column `{state_name}` must be Int64, got {:?}",
                     value_field.data_type()
                 ));
             }
             if !value_field.is_nullable() {
                 return Err(format!(
-                    "MIN/MAX state map value field for column `{state_name}` must be nullable (iceberg-rust convention)"
+                    "{agg_label} state map value field for column `{state_name}` must be nullable (iceberg-rust convention)"
                 ));
             }
             // Validate the key Arrow type matches the scalar primitives we
@@ -1762,42 +1918,60 @@ fn validate_state_column_type(
                 .find(|f| f.name() == "key")
                 .ok_or_else(|| {
                     format!(
-                        "MIN/MAX state map entries struct for column `{state_name}` is missing `key` field"
+                        "{agg_label} state map entries struct for column `{state_name}` is missing `key` field"
                     )
                 })?;
             if key_field.is_nullable() {
                 return Err(format!(
-                    "MIN/MAX state map key field for column `{state_name}` must be non-null"
+                    "{agg_label} state map key field for column `{state_name}` must be non-null"
                 ));
             }
-            match key_field.data_type() {
-                // IVM-P5 Float follow-up: Float MIN/MAX now supported.
-                // NaN is handled in three sites:
-                //   1. `scalar_keys_equal` — bit-pattern-agnostic NaN==NaN so
-                //      detail map aggregates duplicate NaNs into one entry.
-                //   2. `sort_map_entries_by_key` — NaN sorts to the end of
-                //      the run (Ordering::Greater) instead of erroring out.
-                //   3. `derive_visible_from_detail_map` — skips NaN keys
-                //      when reducing MIN/MAX (NaN is ignored, like NULL).
-                // Float32 is widened to Float64 at AggScalarValue level
-                // (`scalar_from_array`), so handling Float64 covers both.
-                DataType::Int8
-                | DataType::Int16
-                | DataType::Int32
-                | DataType::Int64
-                | DataType::Float32
-                | DataType::Float64
-                | DataType::Decimal128(_, _)
-                | DataType::Decimal256(_, _)
-                | DataType::Utf8
-                | DataType::Date32
-                | DataType::Timestamp(_, _) => Ok(()),
-                DataType::Boolean => Err(format!(
-                    "MIN/MAX state key type is unsupported for column `{state_name}`: Boolean"
-                )),
-                other => Err(format!(
-                    "MIN/MAX state key type is unsupported for column `{state_name}`: {other:?}"
-                )),
+            // Validate the key Arrow type per function:
+            //   - MIN/MAX: accept all primitive scalar types we have
+            //     AggScalarValue support for, including Boolean
+            //     (`AggKind::MinBool` / `MaxBool` already work in the plain
+            //     executor — false < true).
+            //   - BOOL_OR/BOOL_AND: only Boolean.
+            //
+            // IVM-P5 Float follow-up: Float MIN/MAX is supported. NaN is
+            // handled in three sites:
+            //   1. `scalar_keys_equal` — bit-pattern-agnostic NaN==NaN so
+            //      detail map aggregates duplicate NaNs into one entry.
+            //   2. `sort_map_entries_by_key` — NaN sorts to the end of the
+            //      run (Ordering::Greater) instead of erroring out.
+            //   3. `derive_visible_from_detail_map` — uses `f64::total_cmp`
+            //      so NaN occupies the maximum end of the total order.
+            // Float32 is widened to Float64 at AggScalarValue level
+            // (`scalar_from_array`), so handling Float64 covers both.
+            match function {
+                AggregateFunctionKind::Min | AggregateFunctionKind::Max => {
+                    match key_field.data_type() {
+                        DataType::Boolean
+                        | DataType::Int8
+                        | DataType::Int16
+                        | DataType::Int32
+                        | DataType::Int64
+                        | DataType::Float32
+                        | DataType::Float64
+                        | DataType::Decimal128(_, _)
+                        | DataType::Decimal256(_, _)
+                        | DataType::Utf8
+                        | DataType::Date32
+                        | DataType::Timestamp(_, _) => Ok(()),
+                        other => Err(format!(
+                            "MIN/MAX state key type is unsupported for column `{state_name}`: {other:?}"
+                        )),
+                    }
+                }
+                AggregateFunctionKind::BoolOr | AggregateFunctionKind::BoolAnd => {
+                    match key_field.data_type() {
+                        DataType::Boolean => Ok(()),
+                        other => Err(format!(
+                            "BOOL_OR/BOOL_AND requires a Boolean input column; got key type {other:?} for column `{state_name}`"
+                        )),
+                    }
+                }
+                _ => unreachable!(),
             }
         }
         (function, role) => Err(format!(
@@ -2042,6 +2216,38 @@ fn update_visible_values_from_state(
                 let count_val = row.state_values[count_idx].clone();
                 row.visible_values[visible_idx] =
                     derive_avg_visible(sum_val, count_val, visible_dt)?;
+            }
+            AggregateFunctionKind::BoolOr | AggregateFunctionKind::BoolAnd => {
+                // IVM-BoolAgg Phase 4: visible BOOL_OR / BOOL_AND is derived
+                // from the `Map<Boolean, Int64>` detail-state by scanning
+                // entries with count > 0. Same retract-friendly path as
+                // MIN/MAX detail-state (P5 Phase 4); the only difference
+                // is the visible reduction rule. NULL Boolean rows do not
+                // appear in the detail map (filtered by map_value_count),
+                // so an empty / all-zero-count map yields visible NULL.
+                let state_index = state_indexes[0];
+                let state_column = &layout.state_columns[state_index];
+                let derive = match primary.function {
+                    AggregateFunctionKind::BoolOr => derive_bool_or_from_detail_map,
+                    AggregateFunctionKind::BoolAnd => derive_bool_and_from_detail_map,
+                    _ => unreachable!(),
+                };
+                let derived = match row.state_values[state_index].as_ref() {
+                    Some(value @ AggScalarValue::Map(_)) => derive(value).map_err(|e| {
+                        format!(
+                            "derive visible for column `{}` failed: {e}",
+                            state_column.name
+                        )
+                    })?,
+                    Some(other) => {
+                        return Err(format!(
+                            "BOOL_OR/BOOL_AND state on column `{}` must be Map, got {other:?}",
+                            state_column.name
+                        ));
+                    }
+                    None => None,
+                };
+                row.visible_values[state_column.visible_source_index] = derived;
             }
         }
     }
@@ -3122,11 +3328,13 @@ mod tests {
         assert_eq!(entries.len(), 3);
         let nan_entries: Vec<_> = entries
             .iter()
-            .filter(|(k, _)| {
-                matches!(k, Some(AggScalarValue::Float64(v)) if v.is_nan())
-            })
+            .filter(|(k, _)| matches!(k, Some(AggScalarValue::Float64(v)) if v.is_nan()))
             .collect();
-        assert_eq!(nan_entries.len(), 1, "NaN keys should aggregate to one entry");
+        assert_eq!(
+            nan_entries.len(),
+            1,
+            "NaN keys should aggregate to one entry"
+        );
         match &nan_entries[0].1 {
             Some(AggScalarValue::Int64(c)) => assert_eq!(*c, 5),
             other => panic!("expected NaN count=5, got {other:?}"),
@@ -4271,6 +4479,261 @@ mod tests {
             "expected Some(Int64(30)), got {max:?}"
         );
         let _ = column;
+    }
+
+    // ---- IVM-BoolAgg (2026-05-23): BOOL_OR / BOOL_AND / MIN-MAX-Boolean ----
+
+    /// Build a `Map<Boolean, Int64>` AggScalarValue from `(key, count)` pairs.
+    fn make_bool_map_state(entries: &[(bool, i64)]) -> AggScalarValue {
+        AggScalarValue::Map(
+            entries
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        Some(AggScalarValue::Bool(*k)),
+                        Some(AggScalarValue::Int64(*v)),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn derive_bool_or_returns_true_when_any_true_count_positive() {
+        let m = make_bool_map_state(&[(true, 3), (false, 5)]);
+        let r = derive_bool_or_from_detail_map(&m).expect("derive");
+        assert!(
+            matches!(r, Some(AggScalarValue::Bool(true))),
+            "expected Some(Bool(true)), got {r:?}"
+        );
+    }
+
+    #[test]
+    fn derive_bool_or_returns_false_when_only_false() {
+        let m = make_bool_map_state(&[(false, 4)]);
+        let r = derive_bool_or_from_detail_map(&m).expect("derive");
+        assert!(
+            matches!(r, Some(AggScalarValue::Bool(false))),
+            "expected Some(Bool(false)), got {r:?}"
+        );
+    }
+
+    #[test]
+    fn derive_bool_or_returns_none_for_empty_or_zero() {
+        let empty = make_bool_map_state(&[]);
+        assert!(
+            derive_bool_or_from_detail_map(&empty)
+                .expect("derive")
+                .is_none(),
+            "empty map → None"
+        );
+        let zero = make_bool_map_state(&[(true, 0), (false, 0)]);
+        assert!(
+            derive_bool_or_from_detail_map(&zero)
+                .expect("derive")
+                .is_none(),
+            "zero-count map → None"
+        );
+    }
+
+    #[test]
+    fn derive_bool_or_skips_negative_counts() {
+        // A negative count entry (transient retract state) should not
+        // resurface as a visible value. Result depends on remaining
+        // positive-count entries.
+        let m = make_bool_map_state(&[(true, -2), (false, 3)]);
+        let r = derive_bool_or_from_detail_map(&m).expect("derive");
+        assert!(
+            matches!(r, Some(AggScalarValue::Bool(false))),
+            "expected Some(Bool(false)) — the only positive-count key is `false`; got {r:?}"
+        );
+    }
+
+    #[test]
+    fn derive_bool_and_returns_false_when_any_false_count_positive() {
+        let m = make_bool_map_state(&[(true, 3), (false, 5)]);
+        let r = derive_bool_and_from_detail_map(&m).expect("derive");
+        assert!(
+            matches!(r, Some(AggScalarValue::Bool(false))),
+            "expected Some(Bool(false)), got {r:?}"
+        );
+    }
+
+    #[test]
+    fn derive_bool_and_returns_true_when_only_true() {
+        let m = make_bool_map_state(&[(true, 7)]);
+        let r = derive_bool_and_from_detail_map(&m).expect("derive");
+        assert!(
+            matches!(r, Some(AggScalarValue::Bool(true))),
+            "expected Some(Bool(true)), got {r:?}"
+        );
+    }
+
+    #[test]
+    fn derive_bool_and_returns_none_for_empty_or_zero() {
+        let empty = make_bool_map_state(&[]);
+        assert!(
+            derive_bool_and_from_detail_map(&empty)
+                .expect("derive")
+                .is_none(),
+            "empty map → None"
+        );
+        let zero = make_bool_map_state(&[(true, 0), (false, 0)]);
+        assert!(
+            derive_bool_and_from_detail_map(&zero)
+                .expect("derive")
+                .is_none(),
+            "zero-count map → None"
+        );
+    }
+
+    #[test]
+    fn derive_bool_and_skips_negative_counts() {
+        // A negative count entry should be ignored. With only (true, -1) the
+        // result is None; adding a positive false entry makes it Bool(false).
+        let only_neg = make_bool_map_state(&[(true, -1)]);
+        assert!(
+            derive_bool_and_from_detail_map(&only_neg)
+                .expect("derive")
+                .is_none(),
+            "only negative entry → None"
+        );
+        let m = make_bool_map_state(&[(true, -1), (false, 2)]);
+        let r = derive_bool_and_from_detail_map(&m).expect("derive");
+        assert!(
+            matches!(r, Some(AggScalarValue::Bool(false))),
+            "expected Some(Bool(false)), got {r:?}"
+        );
+    }
+
+    #[test]
+    fn derive_visible_from_detail_map_min_over_bool_picks_false() {
+        // false < true; with both keys present MIN must be false.
+        let m = make_bool_map_state(&[(true, 1), (false, 1)]);
+        let r = derive_visible_from_detail_map(&m, MinMax::Min).expect("derive");
+        assert!(
+            matches!(r, Some(AggScalarValue::Bool(false))),
+            "expected Some(Bool(false)) for MIN, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn derive_visible_from_detail_map_max_over_bool_picks_true() {
+        let m = make_bool_map_state(&[(true, 1), (false, 1)]);
+        let r = derive_visible_from_detail_map(&m, MinMax::Max).expect("derive");
+        assert!(
+            matches!(r, Some(AggScalarValue::Bool(true))),
+            "expected Some(Bool(true)) for MAX, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn derive_visible_from_detail_map_min_max_over_bool_only_one_key() {
+        // Only false present → MIN=MAX=false.
+        let m_false = make_bool_map_state(&[(false, 4)]);
+        let min_false = derive_visible_from_detail_map(&m_false, MinMax::Min).expect("min");
+        let max_false = derive_visible_from_detail_map(&m_false, MinMax::Max).expect("max");
+        assert!(
+            matches!(min_false, Some(AggScalarValue::Bool(false))),
+            "MIN over (false,4) = false"
+        );
+        assert!(
+            matches!(max_false, Some(AggScalarValue::Bool(false))),
+            "MAX over (false,4) = false"
+        );
+        // Only true present → MIN=MAX=true.
+        let m_true = make_bool_map_state(&[(true, 2)]);
+        let min_true = derive_visible_from_detail_map(&m_true, MinMax::Min).expect("min");
+        let max_true = derive_visible_from_detail_map(&m_true, MinMax::Max).expect("max");
+        assert!(matches!(min_true, Some(AggScalarValue::Bool(true))));
+        assert!(matches!(max_true, Some(AggScalarValue::Bool(true))));
+    }
+
+    #[test]
+    fn validate_bool_or_accepts_boolean_key_only() {
+        // Build a `Map<Boolean, Int64>` Arrow type matching what
+        // `AggregateMvLayout` produces for BoolOr.
+        let bool_map_dt = DataType::Map(
+            Arc::new(Field::new(
+                "key_value",
+                DataType::Struct(arrow::datatypes::Fields::from(vec![
+                    Arc::new(Field::new("key", DataType::Boolean, false)),
+                    Arc::new(Field::new("value", DataType::Int64, true)),
+                ])),
+                false,
+            )),
+            false,
+        );
+        assert!(
+            validate_state_column_type(
+                AggregateFunctionKind::BoolOr,
+                AggregateStateRole::Single,
+                &bool_map_dt,
+                "__agg_state_b",
+            )
+            .is_ok(),
+            "BOOL_OR with Boolean key must validate"
+        );
+
+        // Int64 key must be rejected for BoolOr.
+        let int_map_dt = DataType::Map(
+            Arc::new(Field::new(
+                "key_value",
+                DataType::Struct(arrow::datatypes::Fields::from(vec![
+                    Arc::new(Field::new("key", DataType::Int64, false)),
+                    Arc::new(Field::new("value", DataType::Int64, true)),
+                ])),
+                false,
+            )),
+            false,
+        );
+        assert!(
+            validate_state_column_type(
+                AggregateFunctionKind::BoolOr,
+                AggregateStateRole::Single,
+                &int_map_dt,
+                "__agg_state_b",
+            )
+            .is_err(),
+            "BOOL_OR with Int64 key must be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_min_max_accepts_boolean_key() {
+        // Boolean MIN/MAX is now unlocked (the stale "AggScalarValue does not
+        // support Boolean" reject is gone).
+        let bool_map_dt = DataType::Map(
+            Arc::new(Field::new(
+                "key_value",
+                DataType::Struct(arrow::datatypes::Fields::from(vec![
+                    Arc::new(Field::new("key", DataType::Boolean, false)),
+                    Arc::new(Field::new("value", DataType::Int64, true)),
+                ])),
+                false,
+            )),
+            false,
+        );
+        assert!(
+            validate_state_column_type(
+                AggregateFunctionKind::Min,
+                AggregateStateRole::Single,
+                &bool_map_dt,
+                "__agg_state_b",
+            )
+            .is_ok(),
+            "MIN with Boolean key must validate"
+        );
+        assert!(
+            validate_state_column_type(
+                AggregateFunctionKind::Max,
+                AggregateStateRole::Single,
+                &bool_map_dt,
+                "__agg_state_b",
+            )
+            .is_ok(),
+            "MAX with Boolean key must validate"
+        );
     }
 
     /// Sibling test for `negate_aggregate_state_chunks_flips_count_and_sum`:

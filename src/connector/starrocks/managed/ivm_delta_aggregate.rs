@@ -156,7 +156,10 @@ fn push_signed_aggregate_state_projection(
                 &count_alias,
             ));
         }
-        AggregateFunctionKind::Min | AggregateFunctionKind::Max => {
+        AggregateFunctionKind::Min
+        | AggregateFunctionKind::Max
+        | AggregateFunctionKind::BoolOr
+        | AggregateFunctionKind::BoolAnd => {
             // IVM-P5 (Phase 3): MIN/MAX delta state is a per-group
             // `Map<value, Int64>` detail map. In the signed-delta path the
             // map values are signed by `__change_op` (+1 for INSERT, -1 for
@@ -167,11 +170,22 @@ fn push_signed_aggregate_state_projection(
             // do not emit a visible projection here. (Compare with COUNT/
             // SUM, where the same expression doubles as both visible and
             // state value.)
+            //
+            // IVM-BoolAgg (2026-05-23): BOOL_OR / BOOL_AND share the exact
+            // same `Map<Boolean, Int64>` detail-state contract; the only
+            // difference vs MIN/MAX is the visible-derivation logic in
+            // `update_visible_values_from_state` (Phase 4 hook).
+            let aggregate_label = match aggregate.function {
+                AggregateFunctionKind::Min | AggregateFunctionKind::Max => "MIN/MAX",
+                AggregateFunctionKind::BoolOr | AggregateFunctionKind::BoolAnd => {
+                    "BOOL_OR/BOOL_AND"
+                }
+                _ => unreachable!(),
+            };
             let AggregateInput::Expr(expr) = &aggregate.input else {
-                return Err(
-                    "rewrite_select_sql_for_signed_delta_state: MIN/MAX requires an expression input"
-                        .to_string(),
-                );
+                return Err(format!(
+                    "rewrite_select_sql_for_signed_delta_state: {aggregate_label} requires an expression input"
+                ));
             };
             let sanitized = sanitize_state_column_name(&aggregate.output_name);
             let state_alias = format!("__agg_state_{sanitized}");
