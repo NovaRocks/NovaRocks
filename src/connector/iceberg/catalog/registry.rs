@@ -282,6 +282,78 @@ pub(crate) fn namespace_exists(
     }
 }
 
+/// List all top-level namespace names in the given catalog entry.
+///
+/// For REST catalogs: uses the REST API (`list_namespaces`).
+/// For S3/Hadoop catalogs: lists directory prefixes under the warehouse root.
+/// For local Hadoop catalogs: lists subdirectories of the warehouse path.
+///
+/// Hidden entries (names starting with `.`) are excluded. Results are returned
+/// sorted and deduplicated.
+pub(crate) fn list_namespaces(entry: &IcebergCatalogEntry) -> Result<Vec<String>, String> {
+    if matches!(entry.kind, IcebergCatalogKind::Rest) {
+        let catalog = block_on_iceberg(async { build_rest_catalog(entry).await })??;
+        let namespaces = block_on_iceberg(async { catalog.list_namespaces(None).await })
+            .map_err(|e| format!("list REST namespaces runtime failed: {e}"))?
+            .map_err(|e| format!("list REST namespaces failed: {e}"))?;
+        let mut names: Vec<String> = namespaces
+            .into_iter()
+            .flat_map(|ns| ns.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+            .filter(|name| !name.starts_with('.'))
+            .collect();
+        names.sort();
+        names.dedup();
+        return Ok(names);
+    }
+    if let Some(s3_config) = &entry.s3_config {
+        let op = crate::fs::object_store::build_oss_operator(s3_config)
+            .map_err(|e| format!("build S3 operator for list namespaces: {e}"))?;
+        let (_, root_prefix) =
+            crate::connector::iceberg::catalog::add_files::parse_s3_path(&entry.warehouse_uri)
+                .map_err(|e| format!("parse warehouse URI: {e}"))?;
+        // Trailing slash ensures we list direct children of the warehouse root.
+        let warehouse_prefix = if root_prefix.trim_matches('/').is_empty() {
+            String::new()
+        } else {
+            format!("{}/", root_prefix.trim_end_matches('/'))
+        };
+        block_on_iceberg(async {
+            let entries = op
+                .list(&warehouse_prefix)
+                .await
+                .map_err(|e| format!("list warehouse prefix {warehouse_prefix}: {e}"))?;
+            let mut names = Vec::new();
+            for e in entries {
+                if e.metadata().is_dir() {
+                    let name = e.name().trim_end_matches('/').to_string();
+                    if !name.is_empty() && !name.starts_with('.') {
+                        names.push(name);
+                    }
+                }
+            }
+            names.sort();
+            Ok(names)
+        })
+        .map_err(|e| format!("list iceberg namespaces runtime failed: {e}"))?
+    } else {
+        let warehouse_path = &entry.warehouse_path;
+        let entries = std::fs::read_dir(warehouse_path)
+            .map_err(|e| format!("read warehouse directory {} failed: {e}", warehouse_path.display()))?;
+        let mut names = Vec::new();
+        for item in entries.flatten() {
+            let path = item.path();
+            if path.is_dir() {
+                let name = item.file_name().to_string_lossy().to_string();
+                if !name.starts_with('.') {
+                    names.push(name);
+                }
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+}
+
 pub(crate) fn drop_namespace(
     entry: &IcebergCatalogEntry,
     namespace_name: &str,

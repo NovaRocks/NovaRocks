@@ -480,34 +480,71 @@ impl VirtualTableProvider for SchemataProvider {
         databases.sort();
         databases.dedup();
 
-        let row_count = databases.len();
-        let catalog_name = StringArray::from(vec!["default_catalog"; row_count]);
-        let schema_name = StringArray::from_iter_values(databases.iter().map(String::as_str));
-        let default_charset = StringArray::from(vec!["utf8"; row_count]);
-        let default_collation = StringArray::from(vec!["utf8_general_ci"; row_count]);
-        let sql_path: StringArray = std::iter::repeat::<Option<&str>>(None).take(row_count).collect();
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("catalog_name", DataType::Utf8, false),
-            Field::new("schema_name", DataType::Utf8, false),
-            Field::new("default_character_set_name", DataType::Utf8, false),
-            Field::new("default_collation_name", DataType::Utf8, false),
-            Field::new("sql_path", DataType::Utf8, true),
-        ]));
-
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(catalog_name) as ArrayRef,
-                Arc::new(schema_name) as ArrayRef,
-                Arc::new(default_charset) as ArrayRef,
-                Arc::new(default_collation) as ArrayRef,
-                Arc::new(sql_path) as ArrayRef,
-            ],
-        )
-        .map_err(|e| format!("build information_schema.schemata batch failed: {e}"))?;
-        Ok(vec![batch])
+        build_schemata_batch("default_catalog", &databases)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers for schemata batch construction
+// ---------------------------------------------------------------------------
+//
+// These are used both by `SchemataProvider::scan` (for the local
+// `default_catalog`) and by `virtual_table::rewrite_table_factor` when it
+// intercepts `<external_cat>.information_schema.schemata` queries and
+// enumerates databases from the external Iceberg catalog.
+
+/// Return the column definitions for `information_schema.schemata`. Called by
+/// the virtual-table rewriter when building a VALUES-backed derived table for
+/// an external catalog.
+pub(crate) fn schemata_columns() -> Vec<ColumnDef> {
+    SCHEMATA_COLUMNS
+        .iter()
+        .map(|(name, nullable)| ColumnDef {
+            name: (*name).to_string(),
+            data_type: DataType::Utf8,
+            nullable: *nullable,
+            write_default: None,
+            logical_type: None,
+        })
+        .collect()
+}
+
+/// Build a single `RecordBatch` for `information_schema.schemata` whose rows
+/// enumerate `databases` with `catalog_name` set to `catalog`. The batch
+/// schema exactly matches `schemata_columns()`.
+pub(crate) fn build_schemata_batch(
+    catalog: &str,
+    databases: &[String],
+) -> Result<Vec<RecordBatch>, String> {
+    let row_count = databases.len();
+    let catalog_name = StringArray::from(vec![catalog; row_count]);
+    let schema_name = StringArray::from_iter_values(databases.iter().map(String::as_str));
+    let default_charset = StringArray::from(vec!["utf8"; row_count]);
+    let default_collation = StringArray::from(vec!["utf8_general_ci"; row_count]);
+    let sql_path: StringArray = std::iter::repeat::<Option<&str>>(None)
+        .take(row_count)
+        .collect();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("catalog_name", DataType::Utf8, false),
+        Field::new("schema_name", DataType::Utf8, false),
+        Field::new("default_character_set_name", DataType::Utf8, false),
+        Field::new("default_collation_name", DataType::Utf8, false),
+        Field::new("sql_path", DataType::Utf8, true),
+    ]));
+
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(catalog_name) as ArrayRef,
+            Arc::new(schema_name) as ArrayRef,
+            Arc::new(default_charset) as ArrayRef,
+            Arc::new(default_collation) as ArrayRef,
+            Arc::new(sql_path) as ArrayRef,
+        ],
+    )
+    .map_err(|e| format!("build information_schema.schemata batch failed: {e}"))?;
+    Ok(vec![batch])
 }
 
 #[cfg(test)]

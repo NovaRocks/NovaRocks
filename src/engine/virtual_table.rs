@@ -170,13 +170,56 @@ fn rewrite_table_factor(
         sqlast::TableFactor::Table { name, alias, .. } => {
             let parts = object_name_idents(name);
             // Recognize 2-part `information_schema.X` and 3-part
-            // `default_catalog.information_schema.X`. We do not match plain
-            // 1-part references because the session's current database may
-            // legitimately shadow them with a real table.
-            let key = match parts.as_slice() {
+            // `<catalog>.information_schema.X`.
+            //
+            // For `default_catalog` (the local catalog), we look up the provider
+            // in the registry and scan it against the local InMemoryCatalog.
+            //
+            // For any other 3-part name where the catalog is a registered external
+            // Iceberg catalog, we intercept `information_schema.schemata` and
+            // enumerate that catalog's databases directly, bypassing the Iceberg
+            // table load path that would otherwise fail with a "no metadata files"
+            // error.
+            //
+            // We do NOT match plain 1-part references because the session's current
+            // database may legitimately shadow them with a real table.
+            let key: Option<(String, String)> = match parts.as_slice() {
                 [db, tbl] => Some((db.clone(), tbl.clone())),
                 [cat, db, tbl] if cat.eq_ignore_ascii_case("default_catalog") => {
                     Some((db.clone(), tbl.clone()))
+                }
+                [cat, db, tbl]
+                    if db.eq_ignore_ascii_case(INFORMATION_SCHEMA_DB)
+                        && tbl.eq_ignore_ascii_case("schemata") =>
+                {
+                    // External catalog 3-part name: `<cat>.information_schema.schemata`.
+                    // Check whether <cat> is a registered Iceberg catalog; if so,
+                    // enumerate its databases. If not, leave the reference alone so
+                    // downstream resolvers can emit "unknown catalog".
+                    let registry = state
+                        .iceberg_catalogs
+                        .read()
+                        .expect("iceberg catalog registry read lock");
+                    match registry.get(cat) {
+                        Ok(entry) => {
+                            let databases = crate::connector::iceberg::catalog::list_namespaces(&entry)?;
+                            let schemata_cols = crate::engine::information_schema::schemata_columns();
+                            let batches = crate::engine::information_schema::build_schemata_batch(cat, &databases)?;
+                            let tbl_name = tbl.clone();
+                            let alias = alias.take().unwrap_or_else(|| sqlast::TableAlias {
+                                explicit: false,
+                                name: sqlast::Ident::new(tbl_name),
+                                columns: Vec::new(),
+                            });
+                            *factor = derived_values_factor(&schemata_cols, &batches, alias)?;
+                            return Ok(());
+                        }
+                        Err(_) => {
+                            // Unknown catalog — leave untouched; downstream will produce
+                            // a proper "unknown catalog" error.
+                            return Ok(());
+                        }
+                    }
                 }
                 _ => None,
             };
@@ -416,4 +459,139 @@ fn num_to_expr<N: std::fmt::Display>(n: N) -> Result<sqlast::Expr, String> {
     Ok(sqlast::Expr::Value(
         sqlast::Value::Number(format!("{n}"), false).with_empty_span(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::connector::iceberg::catalog::registry::build_catalog_entry;
+    use crate::engine::StandaloneState;
+    use crate::sql::parser::dialect::StarRocksDialect;
+    use sqlparser::parser::Parser;
+
+    /// Parse a SELECT query into a mutable `sqlparser::ast::Query`.
+    fn parse_query(sql: &str) -> Box<sqlparser::ast::Query> {
+        let dialect = StarRocksDialect;
+        let stmt = Parser::new(&dialect)
+            .try_with_sql(sql)
+            .expect("lex")
+            .parse_statement()
+            .expect("parse");
+        let sqlparser::ast::Statement::Query(q) = stmt else {
+            panic!("expected Query statement")
+        };
+        q
+    }
+
+    /// Build a minimal `StandaloneState` with a local Iceberg (Hadoop) catalog
+    /// registered under `catalog_name`, whose warehouse is `warehouse_path`.
+    fn state_with_local_catalog(catalog_name: &str, warehouse_path: &str) -> Arc<StandaloneState> {
+        let state = Arc::new(StandaloneState::default());
+        let properties = vec![
+            ("iceberg.catalog.warehouse".to_string(), warehouse_path.to_string()),
+        ];
+        let entry = build_catalog_entry(catalog_name, &properties).expect("build catalog entry");
+        state
+            .iceberg_catalogs
+            .write()
+            .expect("registry lock")
+            .create_catalog(catalog_name, &properties)
+            .expect("register catalog");
+        let _ = entry;
+        state
+    }
+
+    // -----------------------------------------------------------------------
+    // default_catalog regression test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rewrite_default_catalog_information_schema_schemata() {
+        // `default_catalog.information_schema.schemata` must be rewritten into
+        // a VALUES-backed derived table even when the local in-memory catalog is
+        // empty.
+        let state = Arc::new(StandaloneState::default());
+        // Seed one database so the rewriter has at least one row to produce.
+        {
+            let mut cat = state.catalog.write().expect("catalog lock");
+            cat.create_database("mydb").expect("create db");
+        }
+        let mut query =
+            parse_query("SELECT schema_name FROM default_catalog.information_schema.schemata");
+        super::rewrite_query(&state, &mut query).expect("rewrite_query");
+        // After rewriting the FROM clause must be a Derived (VALUES) table, not a
+        // plain Table reference.
+        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected Select body");
+        };
+        assert_eq!(select.from.len(), 1);
+        assert!(
+            matches!(
+                select.from[0].relation,
+                sqlparser::ast::TableFactor::Derived { .. }
+            ),
+            "expected Derived VALUES factor, got {:?}",
+            select.from[0].relation
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // External Iceberg catalog: unknown catalog left untouched
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rewrite_unknown_catalog_information_schema_schemata_is_noop() {
+        // A 3-part reference to an unregistered catalog must NOT be rewritten.
+        // The rewriter leaves the AST untouched so downstream resolvers can
+        // surface the proper "unknown catalog" error.
+        let state = Arc::new(StandaloneState::default());
+        let mut query =
+            parse_query("SELECT schema_name FROM no_such_cat.information_schema.schemata");
+        super::rewrite_query(&state, &mut query).expect("rewrite_query returns Ok for unknown cat");
+        // The FROM clause must still be a plain Table reference (not rewritten).
+        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected Select body");
+        };
+        assert!(
+            matches!(
+                select.from[0].relation,
+                sqlparser::ast::TableFactor::Table { .. }
+            ),
+            "expected Table factor (not rewritten) for unknown catalog"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // External Iceberg catalog: registered catalog rewrites to VALUES
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rewrite_registered_iceberg_catalog_information_schema_schemata() {
+        // Create a temporary warehouse directory with one namespace subdirectory.
+        let warehouse_dir = tempfile::tempdir().expect("tempdir");
+        let ns_dir = warehouse_dir.path().join("ns_alpha");
+        std::fs::create_dir_all(&ns_dir).expect("create namespace dir");
+
+        let warehouse_path = warehouse_dir.path().to_str().unwrap();
+        let state = state_with_local_catalog("myice", warehouse_path);
+
+        let mut query =
+            parse_query("SELECT schema_name FROM myice.information_schema.schemata");
+        super::rewrite_query(&state, &mut query).expect("rewrite_query");
+
+        // The FROM clause must now be a VALUES-backed Derived table (not a raw
+        // Iceberg Table reference).
+        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected Select body");
+        };
+        assert!(
+            matches!(
+                select.from[0].relation,
+                sqlparser::ast::TableFactor::Derived { .. }
+            ),
+            "expected Derived VALUES factor for registered external catalog, got {:?}",
+            select.from[0].relation
+        );
+    }
 }
