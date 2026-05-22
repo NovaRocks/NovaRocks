@@ -1,0 +1,15 @@
+-- query 3
+region	c
+east	5
+
+-- query 5
+region	c
+east	4
+
+-- query 7
+region	c
+east	3
+
+-- query 8
+region	c
+east	3

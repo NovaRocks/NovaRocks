@@ -91,6 +91,30 @@ pub(crate) fn build_delta_source_files(
                 .or_else(|| previous_lineage.get(path))
                 .map(|lineage| lineage.first_row_id)
         };
+        // Iceberg v3 Puffin DV is cumulative per data file: the DV file added
+        // at the current snapshot replaces the prior one with the *union* of
+        // its positions. If we let `scan_deletes_*` reverse-project that union
+        // straight into the delta stream, every refresh would re-emit deletes
+        // already applied at previous refreshes, double-counting against the
+        // MV aggregate state. Subtract the prior snapshot's position-delete
+        // set so the IVM delta source sees only the *newly* deleted rows.
+        let touched_referenced_data_files: HashSet<String> = batch
+            .deletes
+            .iter()
+            .filter_map(|d| d.referenced_data_file.clone())
+            .collect();
+        let previously_deleted_positions = if !touched_referenced_data_files.is_empty() {
+            crate::connector::iceberg::scan_deletes::previously_deleted_positions_at_snapshot(
+                &input.loaded.table,
+                batch.previous_snapshot_id,
+                &factory,
+                &|path: &str| normalize_delete_projection_path(path, object_store_config),
+                |data_file_path: &str| touched_referenced_data_files.contains(data_file_path),
+            )
+            .map_err(|e| e.to_string())?
+        } else {
+            HashMap::new()
+        };
         let mut deleted_rows =
             crate::connector::iceberg::scan_deletes::scan_deletes_with_base_row_id_lookup_and_path_normalizer(
                 &batch.deletes,
@@ -99,6 +123,7 @@ pub(crate) fn build_delta_source_files(
                 size_lookup,
                 lineage_lookup,
                 &deleted_data_file_paths,
+                &previously_deleted_positions,
                 |path| normalize_delete_projection_path(path, object_store_config),
             )
             .map_err(|e| e.to_string())?;

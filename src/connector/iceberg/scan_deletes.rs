@@ -714,6 +714,139 @@ pub(crate) async fn read_dv_positions_per_data_file(
     Ok(out)
 }
 
+/// Compute the set of base-data-file positions already marked deleted at
+/// `snapshot_id`. Output keys match the raw `referenced_data_file` strings
+/// from the prior delete files (matching the key space of
+/// `read_delete_positions_per_data_file*` / `read_dv_positions_per_data_file`)
+/// so the result can be set-subtracted from the current-refresh
+/// `positions_per_file` map without further normalization.
+///
+/// Used by IVM refresh to subtract previously-applied deletes from the current
+/// snapshot's cumulative Puffin DVs (Iceberg v3 deletion vectors are
+/// union-replacements per data file).
+///
+/// `data_file_path_filter` is consulted (against the data file's raw Iceberg
+/// path) before opening any prior delete file: only data files where the
+/// filter returns `true` contribute to the output. IVM passes a filter limited
+/// to the data files about to be reverse-projected in the current refresh,
+/// keeping the I/O proportional to the touched set.
+pub(crate) fn previously_deleted_positions_at_snapshot<N, P>(
+    table: &iceberg::table::Table,
+    snapshot_id: i64,
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    delete_file_path_normalizer: &N,
+    data_file_path_filter: P,
+) -> Result<HashMap<String, RoaringTreemap>, ChangeError>
+where
+    N: Fn(&str) -> Result<String, ChangeError>,
+    P: Fn(&str) -> bool,
+{
+    use crate::connector::iceberg::read::{
+        IcebergReadDeleteFormat, IcebergReadDeleteKind, build_read_snapshot_at,
+    };
+    use iceberg::spec::DataFileFormat;
+
+    let prior_snapshot = build_read_snapshot_at(table, snapshot_id).map_err(|e| {
+        ChangeError::InternalInconsistency(format!(
+            "build prior snapshot {snapshot_id} for IVM delete subtraction: {e}"
+        ))
+    })?;
+
+    let mut parquet_dels: Vec<PositionDeleteRef> = Vec::new();
+    let mut puffin_dels: Vec<PositionDeleteRef> = Vec::new();
+    for data_file in &prior_snapshot.files {
+        if !data_file_path_filter(&data_file.path) {
+            continue;
+        }
+        for delete in &data_file.deletes {
+            if !matches!(delete.kind, IcebergReadDeleteKind::Position) {
+                continue;
+            }
+            // Position-delete files in Iceberg always carry their referenced
+            // data file path either directly (DV) or in their parquet content
+            // (file_path column). Fall back to the attached data_file's path
+            // for global v2 position-delete files that omit the referenced
+            // pointer; the content's file_path column is still authoritative
+            // for parquet payloads.
+            let referenced = delete
+                .referenced_data_file
+                .clone()
+                .unwrap_or_else(|| data_file.path.clone());
+            match delete.file_format {
+                IcebergReadDeleteFormat::Parquet => {
+                    parquet_dels.push(PositionDeleteRef {
+                        delete_file_path: delete.path.clone(),
+                        delete_file_size: delete.length.unwrap_or(0),
+                        record_count: None,
+                        referenced_data_file: Some(referenced),
+                        file_format: DataFileFormat::Parquet,
+                        content_offset: None,
+                        content_size_in_bytes: None,
+                        partition_values: Vec::new(),
+                    });
+                }
+                IcebergReadDeleteFormat::Puffin => {
+                    let offset = delete.content_offset.ok_or_else(|| {
+                        ChangeError::InternalInconsistency(format!(
+                            "prior-snapshot Puffin DV {} missing content_offset",
+                            delete.path
+                        ))
+                    })?;
+                    let length = delete.content_size_in_bytes.ok_or_else(|| {
+                        ChangeError::InternalInconsistency(format!(
+                            "prior-snapshot Puffin DV {} missing content_size_in_bytes",
+                            delete.path
+                        ))
+                    })?;
+                    puffin_dels.push(PositionDeleteRef {
+                        delete_file_path: delete.path.clone(),
+                        delete_file_size: delete.length.unwrap_or(0),
+                        record_count: None,
+                        referenced_data_file: Some(referenced),
+                        file_format: DataFileFormat::Puffin,
+                        content_offset: Some(offset),
+                        content_size_in_bytes: Some(length),
+                        partition_values: Vec::new(),
+                    });
+                }
+            }
+        }
+    }
+
+    // Dedupe by (delete_file_path, referenced_data_file): the read-snapshot
+    // index attaches each delete file to every applicable data file, so the
+    // same delete-file ref can appear N times. Reading it once is enough.
+    let mut seen = std::collections::HashSet::new();
+    parquet_dels.retain(|d| {
+        seen.insert((d.delete_file_path.clone(), d.referenced_data_file.clone()))
+    });
+    let mut seen = std::collections::HashSet::new();
+    puffin_dels.retain(|d| {
+        seen.insert((d.delete_file_path.clone(), d.referenced_data_file.clone()))
+    });
+
+    let mut positions_per_file = read_delete_positions_per_data_file_with_path_normalizer(
+        &parquet_dels,
+        factory,
+        delete_file_path_normalizer,
+    )?;
+    if !puffin_dels.is_empty() {
+        let dv_positions = block_on_dv_read(read_dv_positions_per_data_file(
+            &puffin_dels,
+            table.file_io(),
+        ))
+        .map_err(|e| {
+            ChangeError::InternalInconsistency(format!(
+                "previously_deleted_positions: block_on_dv_read: {e}"
+            ))
+        })??;
+        for (raw_path, treemap) in dv_positions {
+            *positions_per_file.entry(raw_path).or_default() |= treemap;
+        }
+    }
+    Ok(positions_per_file)
+}
+
 fn block_on_dv_read<F>(future: F) -> Result<F::Output, String>
 where
     F: std::future::Future,
@@ -839,10 +972,26 @@ where
         data_file_size_lookup,
         first_row_id_lookup,
         &std::collections::HashSet::new(),
+        &HashMap::new(),
         normalize_local_fs_path_owned,
     )
 }
 
+/// Reverse-project the positions in `delete_files` into base rows, then
+/// subtract any positions already deleted at the previous MV refresh's
+/// snapshot (`previously_deleted_positions_per_file`).
+///
+/// IVM correctness requirement: Iceberg v3 Puffin deletion vectors are
+/// **cumulative** — the DV file added by a row-delta snapshot replaces the
+/// prior DV for the same data file with the union of {prior positions, new
+/// positions}. Without subtraction, a subsequent IVM refresh whose plan-changes
+/// lineage walks that row-delta snapshot would re-emit every already-applied
+/// delete as a new one, double-counting against the MV's aggregate state.
+///
+/// `previously_deleted_positions_per_file` keys are normalized data-file paths
+/// (matching `normalize_path` output). For any data file present here, the
+/// returned per-file position set is set-difference with the previous one;
+/// data files absent from the map are scanned in full.
 pub(crate) fn scan_deletes_with_base_row_id_lookup_and_path_normalizer<F, R, N>(
     delete_files: &[PositionDeleteRef],
     factory: &crate::fs::opendal::OpendalRangeReaderFactory,
@@ -850,6 +999,7 @@ pub(crate) fn scan_deletes_with_base_row_id_lookup_and_path_normalizer<F, R, N>(
     data_file_size_lookup: F,
     first_row_id_lookup: R,
     suppressed_data_files: &std::collections::HashSet<String>,
+    previously_deleted_positions_per_file: &HashMap<String, RoaringTreemap>,
     normalize_path: N,
 ) -> Result<Vec<RecordBatch>, ChangeError>
 where
@@ -887,6 +1037,15 @@ where
     for path in suppressed_data_files {
         positions_per_file.remove(path);
     }
+    // Cumulative-DV correction: subtract positions that were already deleted
+    // at the previous MV refresh's snapshot so we only emit *newly* deleted
+    // positions through the IVM signed-delta pipeline.
+    for (path, prior) in previously_deleted_positions_per_file {
+        if let Some(current) = positions_per_file.get_mut(path) {
+            *current -= prior;
+        }
+    }
+    positions_per_file.retain(|_, positions| !positions.is_empty());
 
     let mut out: Vec<RecordBatch> = Vec::new();
     // Sort keys for deterministic output ordering — useful for tests
@@ -1293,6 +1452,125 @@ mod tests {
         .expect("ok");
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 2);
+    }
+
+    /// Regression: Iceberg v3 Puffin DV is cumulative — the DV file added by
+    /// a row-delta snapshot replaces the prior DV with the *union* of its
+    /// positions. The IVM refresh path must subtract the previous snapshot's
+    /// position-delete set so a row deleted by an earlier refresh is not
+    /// re-emitted (which would double-count against the MV's aggregate state).
+    ///
+    /// This test isolates the subtraction at the lowest layer:
+    /// `scan_deletes_with_base_row_id_lookup_and_path_normalizer` accepts a
+    /// `previously_deleted_positions_per_file` map and must filter it out of
+    /// the projected delete rows.
+    #[test]
+    fn scan_deletes_subtracts_previously_deleted_positions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_path = dir.path().join("data.parquet");
+        write_data_parquet(
+            &data_path,
+            &[10, 20, 30, 40, 50],
+            &["a", "b", "c", "d", "e"],
+        );
+        // Simulates the cumulative-DV snapshot: the current refresh's DV says
+        // "positions 0 and 4 are deleted in this data file" — but position 0
+        // was already accounted for at the previous refresh.
+        let delete_path = dir.path().join("cumulative_dv.parquet");
+        let data_uri = "data.parquet";
+        write_delete_parquet(&delete_path, &[data_uri, data_uri], &[0, 4]);
+        let refs = vec![PositionDeleteRef {
+            delete_file_path: "cumulative_dv.parquet".to_string(),
+            delete_file_size: 0,
+            record_count: Some(2),
+            referenced_data_file: Some(data_uri.to_string()),
+            file_format: iceberg::spec::DataFileFormat::Parquet,
+            content_offset: None,
+            content_size_in_bytes: None,
+            partition_values: Vec::new(),
+        }];
+
+        // Previous snapshot already had position 0 deleted for this data file.
+        let mut prior = std::collections::HashMap::new();
+        let mut prior_positions = RoaringTreemap::new();
+        prior_positions.insert(0);
+        prior.insert(data_uri.to_string(), prior_positions);
+
+        let batches = super::scan_deletes_with_base_row_id_lookup_and_path_normalizer(
+            &refs,
+            &factory_for_dir(dir.path()),
+            &make_local_file_io(),
+            |_| None,
+            |path| (path == data_uri).then_some(1_000),
+            &std::collections::HashSet::new(),
+            &prior,
+            super::normalize_local_fs_path_owned,
+        )
+        .expect("scan with prior subtraction");
+
+        // Only position 4 (the new delete) should survive.
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total, 1,
+            "subtraction must exclude previously-deleted positions"
+        );
+        let batch = batches.first().expect("one batch with the new delete");
+        let id = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("id col");
+        assert_eq!(id.value(0), 50, "remaining row must be the newly-deleted one");
+        let row_id = batch
+            .column(batch.schema().index_of("_row_id").expect("_row_id column"))
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("_row_id col");
+        assert_eq!(row_id.values(), &[1_004]);
+    }
+
+    /// Regression: when the entire current-snapshot position set has already
+    /// been seen at the previous snapshot (e.g. an idempotent re-refresh that
+    /// walks the same Puffin DV), subtraction must yield zero rows — not an
+    /// internal error from reading data-file positions that are no longer
+    /// part of the (now-empty) selection.
+    #[test]
+    fn scan_deletes_subtracts_to_empty_when_prior_covers_all_positions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_path = dir.path().join("data.parquet");
+        write_data_parquet(&data_path, &[10, 20, 30], &["a", "b", "c"]);
+        let delete_path = dir.path().join("dv.parquet");
+        let data_uri = "data.parquet";
+        write_delete_parquet(&delete_path, &[data_uri], &[1]);
+        let refs = vec![PositionDeleteRef {
+            delete_file_path: "dv.parquet".to_string(),
+            delete_file_size: 0,
+            record_count: Some(1),
+            referenced_data_file: Some(data_uri.to_string()),
+            file_format: iceberg::spec::DataFileFormat::Parquet,
+            content_offset: None,
+            content_size_in_bytes: None,
+            partition_values: Vec::new(),
+        }];
+
+        let mut prior = std::collections::HashMap::new();
+        let mut prior_positions = RoaringTreemap::new();
+        prior_positions.insert(1);
+        prior.insert(data_uri.to_string(), prior_positions);
+
+        let batches = super::scan_deletes_with_base_row_id_lookup_and_path_normalizer(
+            &refs,
+            &factory_for_dir(dir.path()),
+            &make_local_file_io(),
+            |_| None,
+            |path| (path == data_uri).then_some(7_000),
+            &std::collections::HashSet::new(),
+            &prior,
+            super::normalize_local_fs_path_owned,
+        )
+        .expect("scan must succeed even when prior covers all positions");
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 0);
     }
 
     #[test]
