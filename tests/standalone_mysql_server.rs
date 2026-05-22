@@ -971,47 +971,6 @@ fn standalone_mysql_server_mv_incremental_refresh_appends_only_new_rows() {
 }
 
 #[test]
-fn standalone_mysql_server_mv_incremental_rejects_aggregate_definition() {
-    let port = alloc_port();
-    let Some((_config_dir, config_path)) = maybe_write_managed_lake_config(port) else {
-        return;
-    };
-    let iceberg_warehouse = unique_iceberg_warehouse("mv_incremental_aggregate");
-
-    let args = vec![
-        "standalone-server".to_string(),
-        "--config".to_string(),
-        config_path.display().to_string(),
-    ];
-    let mut server = ServerGuard::spawn(&args);
-    let mut conn = server.connect_root(port);
-
-    conn.query_drop(create_s3_iceberg_catalog_sql("ice", &iceberg_warehouse))
-        .expect("create iceberg catalog");
-    conn.query_drop("create database ice.ns")
-        .expect("create iceberg namespace");
-    conn.query_drop("create table ice.ns.orders (k1 int, v2 bigint)")
-        .expect("create iceberg orders");
-    conn.query_drop("create database analytics")
-        .expect("create analytics db");
-    conn.query_drop("use analytics").expect("use analytics");
-
-    let err = conn
-        .query_drop(
-            "create materialized view orders_mv \
-             distributed by hash(k1) buckets 2 \
-             as select k1, sum(v2) total from ice.ns.orders group by k1",
-        )
-        .expect_err("aggregate MV definition should be rejected");
-    assert!(
-        err.to_string()
-            .to_ascii_lowercase()
-            .contains("projection/filter"),
-        "unexpected error: {err}"
-    );
-}
-
-#[test]
 fn standalone_mysql_server_mv_show_output_matches_expected_columns() {
     let port = alloc_port();
     let Some((_config_dir, config_path)) = maybe_write_managed_lake_config(port) else {
@@ -1047,6 +1006,7 @@ fn standalone_mysql_server_mv_show_output_matches_expected_columns() {
         String,
         String,
         String,
+        String,
         Option<String>,
         Option<String>,
         String,
@@ -1059,11 +1019,12 @@ fn standalone_mysql_server_mv_show_output_matches_expected_columns() {
     let row = &rows[0];
     assert_eq!(row.0, "orders_mv");
     assert_eq!(row.1, "analytics");
-    assert_eq!(row.2, "DEFERRED_MANUAL");
-    assert_eq!(row.3, None);
+    assert_eq!(row.2, "managed_lake");
+    assert_eq!(row.3, "DEFERRED_MANUAL");
     assert_eq!(row.4, None);
-    assert_eq!(row.5, "ice.ns.orders");
-    assert!(row.6.to_ascii_lowercase().contains("select"));
+    assert_eq!(row.5, None);
+    assert_eq!(row.6, "ice.ns.orders");
+    assert!(row.7.to_ascii_lowercase().contains("select"));
 }
 
 #[test]

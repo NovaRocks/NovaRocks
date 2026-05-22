@@ -1644,9 +1644,11 @@ fn test_substring_multiple_rows() {
 fn test_substring_edge_cases() {
     let mut arena = ExprArena::default();
 
-    // Edge cases from StarRocks test suite
-    test_substring_3args(&mut arena, "123456789", 1, i64::MAX, "123456789");
-    test_substring_3args(&mut arena, "123456789", 2, i64::MAX, "23456789");
+    // Edge cases from StarRocks test suite. StarRocks BE uses INT_MAX (i32::MAX)
+    // because the BE substr signature narrows BIGINT→INT; passing i64::MAX here
+    // would collide with the runtime sentinel reserved for the 2-arg form.
+    test_substring_3args(&mut arena, "123456789", 1, i32::MAX as i64, "123456789");
+    test_substring_3args(&mut arena, "123456789", 2, i32::MAX as i64, "23456789");
     test_substring_3args(&mut arena, "123456789", -9, 9, "123456789");
     test_substring_3args(&mut arena, "123456789", -9, 10, "123456789");
     test_substring_3args(&mut arena, "123456789", -4, 5, "6789");
@@ -1704,7 +1706,7 @@ fn test_substring_comprehensive_starrocks_cases() {
     test_substring_3args(&mut arena, "123456789", -1, 1, "9");
     test_substring_3args(&mut arena, "123456789", -1, 2, "9");
     test_substring_3args(&mut arena, "123456789", 0, 1, "");
-    test_substring_3args(&mut arena, "123456789", 1, i64::MAX, "123456789");
+    test_substring_3args(&mut arena, "123456789", 1, i32::MAX as i64, "123456789");
     test_substring_3args(&mut arena, "123456789", 1, -2, "");
     test_substring_3args(&mut arena, "123456789", -3, -2, "");
 }
@@ -1731,7 +1733,13 @@ fn test_substring_chinese_comprehensive() {
     test_substring_3args(&mut arena, test_str, -1, 1, "玖");
     test_substring_3args(&mut arena, test_str, -1, 2, "玖");
     test_substring_3args(&mut arena, test_str, 0, 1, "");
-    test_substring_3args(&mut arena, test_str, 1, i64::MAX, "壹贰叁肆伍陆柒捌玖");
+    test_substring_3args(
+        &mut arena,
+        test_str,
+        1,
+        i32::MAX as i64,
+        "壹贰叁肆伍陆柒捌玖",
+    );
 }
 
 // ---------------------------------------------------------------------------
