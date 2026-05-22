@@ -1111,23 +1111,28 @@ pub(crate) fn execute_truncate_table_statement(
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<StatementResult, String> {
-    let resolved = resolve_local_table_name(name, current_database)?;
-    if current_catalog.is_none()
-        && state
+    // Managed-lake check only applies to local (1- or 2-part) names with no
+    // active external catalog. Three-part names (catalog.db.table) are always
+    // routed to the iceberg backend resolver below.
+    if current_catalog.is_none() && name.parts.len() <= 2 {
+        let resolved = resolve_local_table_name(name, current_database)?;
+        if state
             .managed_lake
             .read()
             .expect("standalone managed lake read lock")
             .contains_table(&resolved.database, &resolved.table)?
-    {
-        if target_ref != "main" {
-            return Err(format!(
-                "TRUNCATE TABLE: branch target `{target_ref}` is only supported for iceberg tables"
-            ));
+        {
+            if target_ref != "main" {
+                return Err(format!(
+                    "TRUNCATE TABLE: branch target `{target_ref}` is only supported for iceberg tables"
+                ));
+            }
+            return truncate_managed_lake_table(state, &resolved.database, &resolved.table);
         }
-        return truncate_managed_lake_table(state, &resolved.database, &resolved.table);
     }
 
-    // Fall through to iceberg backend resolution.
+    // Fall through to iceberg backend resolution (handles 1-, 2-, and 3-part
+    // names, including catalog.db.table three-part form).
     let target = crate::engine::backend_resolver::resolve_existing_table_target(
         state,
         name,
@@ -1137,7 +1142,7 @@ pub(crate) fn execute_truncate_table_statement(
     if target.backend_name != "iceberg" {
         return Err(format!(
             "TRUNCATE TABLE only supports managed-lake or iceberg tables: {}.{}",
-            resolved.database, resolved.table
+            target.namespace, target.table
         ));
     }
     let catalog = {

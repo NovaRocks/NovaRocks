@@ -120,4 +120,46 @@ mod tests {
             "expected WHERE rejection, got {err}",
         );
     }
+
+    #[test]
+    fn parse_truncate_table_two_part() {
+        let stmt = parse_one("TRUNCATE TABLE mydb.mytable").expect("parse");
+        match stmt {
+            Statement::Truncate { name, target_ref } => {
+                assert_eq!(name.parts, vec!["mydb".to_string(), "mytable".to_string()]);
+                assert_eq!(target_ref, "main");
+            }
+            other => panic!("expected Truncate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_truncate_table_three_part() {
+        let stmt = parse_one("TRUNCATE TABLE mycat.mydb.mytable").expect("parse");
+        match stmt {
+            Statement::Truncate { name, target_ref } => {
+                assert_eq!(
+                    name.parts,
+                    vec!["mycat".to_string(), "mydb".to_string(), "mytable".to_string()]
+                );
+                assert_eq!(target_ref, "main");
+            }
+            other => panic!("expected Truncate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_truncate_table_three_part_with_branch() {
+        let stmt = parse_one("TRUNCATE TABLE mycat.mydb.mytable.branch_dev").expect("parse");
+        match stmt {
+            Statement::Truncate { name, target_ref } => {
+                assert_eq!(
+                    name.parts,
+                    vec!["mycat".to_string(), "mydb".to_string(), "mytable".to_string()]
+                );
+                assert_eq!(target_ref, "dev");
+            }
+            other => panic!("expected Truncate, got {other:?}"),
+        }
+    }
 }

@@ -36,7 +36,7 @@ use iceberg::Catalog;
 use iceberg::{NamespaceIdent, TableIdent};
 
 use crate::connector::backend::ResolvedTable;
-use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_hadoop_catalog};
+use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
 use crate::connector::iceberg::commit::{
     CommitOpKind, IcebergCommitCollector, RunInput, run_iceberg_commit,
 };
@@ -63,8 +63,7 @@ pub(crate) fn execute_iceberg_truncate_table(
             .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
         registry.get(&target.catalog)?
     };
-    let hadoop_catalog = build_hadoop_catalog(&entry)?;
-    let catalog: Arc<dyn Catalog> = Arc::new(hadoop_catalog);
+    let catalog: Arc<dyn Catalog> = build_iceberg_catalog(&entry)?;
     let table_ident = TableIdent::new(
         NamespaceIdent::new(target.namespace.clone()),
         target.table.clone(),
