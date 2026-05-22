@@ -172,8 +172,28 @@ pub(crate) fn sqlparser_expr_to_literal(expr: &sqlparser::ast::Expr) -> Result<L
             expr: inner,
         } => negate_literal(sqlparser_expr_to_literal(inner)?),
         sqlast::Expr::Nested(inner) => sqlparser_expr_to_literal(inner),
-        // Handle CAST(expr AS type) — evaluate inner and convert to string
-        sqlast::Expr::Cast { expr: inner, .. } => sqlparser_expr_to_literal(inner),
+        // Handle CAST(expr AS type): peel the CAST and evaluate the inner literal,
+        // EXCEPT for DECIMAL targets. CAST to a DECIMAL type carries an explicit
+        // (precision, scale) that the literal fast-path ignores — it always writes
+        // the raw literal value against the *sink* column's scale, which may be
+        // narrower and would produce a false "too many fractional digits" error.
+        // Returning Err here causes select_projection_requires_pipeline to route
+        // the INSERT through the full query pipeline instead, where the CAST is
+        // evaluated with its declared type and the narrowing to the sink's
+        // DECIMAL(p,s) is handled at write time (with rounding).
+        sqlast::Expr::Cast {
+            expr: inner,
+            data_type,
+            ..
+        } => {
+            if cast_data_type_is_decimal(data_type) {
+                Err(format!(
+                    "CAST to DECIMAL in INSERT SELECT requires pipeline evaluation: {expr}"
+                ))
+            } else {
+                sqlparser_expr_to_literal(inner)
+            }
+        }
         // Handle DATE '2024-01-01' typed strings
         sqlast::Expr::TypedString(typed) => Ok(Literal::String(typed.value.to_string())),
         // In MySQL mode, "value" is parsed as an identifier — treat as string literal
@@ -232,6 +252,25 @@ pub(crate) fn sqlparser_expr_to_literal(expr: &sqlparser::ast::Expr) -> Result<L
                 .collect::<Result<Vec<_>, String>>()?,
         )),
         _ => Err(format!("unsupported expression in INSERT VALUES: {expr}")),
+    }
+}
+
+/// Returns true if the given sqlparser DataType is a DECIMAL variant (including
+/// StarRocks-style DECIMAL32/DECIMAL64/DECIMAL128 custom names). Used to decide
+/// whether a CAST-to-DECIMAL expression should be routed through the full query
+/// pipeline rather than being folded into a bare literal.
+fn cast_data_type_is_decimal(data_type: &sqlparser::ast::DataType) -> bool {
+    use sqlparser::ast::DataType as DT;
+    match data_type {
+        DT::Decimal(_) | DT::Dec(_) | DT::Numeric(_) => true,
+        DT::Custom(name, _) => {
+            let lower = name.to_string().to_lowercase();
+            matches!(
+                lower.as_str(),
+                "decimal" | "decimal32" | "decimal64" | "decimal128"
+            )
+        }
+        _ => false,
     }
 }
 
@@ -1745,5 +1784,43 @@ mod tests {
             true,
         );
         assert!(!arrow_type_equals_ignoring_metadata(&expected, &sorted));
+    }
+
+    /// CAST(literal AS DECIMAL(...)) must NOT fold to a bare literal — it must
+    /// return Err so that the INSERT fast-path routes via the query pipeline
+    /// instead of writing the raw literal against the (possibly narrower) sink
+    /// scale and producing a spurious "too many fractional digits" error.
+    #[test]
+    fn cast_to_decimal_returns_err_to_force_pipeline_routing() {
+        // Standard DECIMAL(p,s) forms
+        let exprs = &[
+            "CAST(1.2344 AS DECIMAL(10, 4))",
+            "CAST(1.2344 AS DEC(10, 4))",
+            "CAST(1.2344 AS NUMERIC(10, 4))",
+        ];
+        for sql in exprs {
+            let expr = parse_expr(sql);
+            let result = sqlparser_expr_to_literal(&expr);
+            assert!(
+                result.is_err(),
+                "Expected Err for `{sql}` but got {:?}",
+                result
+            );
+        }
+
+        // Non-DECIMAL CASTs must still fold successfully.
+        let non_decimal = &[
+            ("CAST(5 AS BIGINT)", Literal::Int(5)),
+            ("CAST(5 AS INT)", Literal::Int(5)),
+        ];
+        for (sql, expected) in non_decimal {
+            let expr = parse_expr(sql);
+            let result = sqlparser_expr_to_literal(&expr)
+                .unwrap_or_else(|e| panic!("Expected Ok for `{sql}` but got Err: {e}"));
+            assert_eq!(
+                result, *expected,
+                "CAST to non-DECIMAL `{sql}` folded to wrong literal"
+            );
+        }
     }
 }

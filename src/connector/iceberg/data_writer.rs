@@ -512,6 +512,18 @@ fn reannotate_array(
             Ok(Arc::new(new_list) as ArrayRef)
         }
         (a, b) if a == b => Ok(array.clone()),
+        // Decimal128 type mismatch: the SELECT produced a wider DECIMAL(sp,ss)
+        // (e.g. from an explicit CAST) but the iceberg sink expects DECIMAL(tp,ts).
+        // Narrow the array with half-up rounding using the same relaxed cast that
+        // the expression evaluator uses for DECIMAL→DECIMAL casts.
+        (DataType::Decimal128(_, source_scale), DataType::Decimal128(target_precision, target_scale)) => {
+            crate::exec::expr::cast_with_special_rules(array, target_dtype).map_err(|e| {
+                format!(
+                    "reannotate_array: coerce Decimal128(_, {source_scale}) \
+                     to Decimal128({target_precision}, {target_scale}) failed: {e}"
+                )
+            })
+        }
         (a, b) => Err(format!(
             "reannotate_array: incompatible data types: array={a:?}, target={b:?}"
         )),
@@ -958,5 +970,69 @@ mod tests {
             "v parent group must carry LogicalType::Variant; got {:?}",
             v_field.get_basic_info().logical_type_ref()
         );
+    }
+
+    /// reannotate_array must narrow Decimal128(src_p, src_s) → Decimal128(tgt_p, tgt_s)
+    /// with half-up rounding rather than returning an error.
+    #[test]
+    fn reannotate_decimal128_narrows_scale_with_rounding() {
+        use arrow::array::{ArrayRef, Decimal128Array};
+        use arrow::datatypes::DataType;
+        use std::sync::Arc;
+
+        // Source: DECIMAL(13, 4) — values as returned by CAST(x AS DECIMAL(13,4)).
+        let src = Arc::new(
+            Decimal128Array::from(vec![
+                Some(12344_i128),  // 1.2344 -> rounds DOWN to 1.23
+                Some(12356_i128),  // 1.2356 -> rounds UP to 1.24
+                Some(-23444_i128), // -2.3444 -> rounds DOWN (toward 0) to -2.34
+                Some(-23456_i128), // -2.3456 -> rounds away from 0 to -2.35
+                None,              // NULL preserves NULL
+            ])
+            .with_precision_and_scale(13, 4)
+            .expect("src decimal"),
+        ) as ArrayRef;
+
+        let target_dtype = DataType::Decimal128(10, 2);
+        let result = reannotate_array(&src, &target_dtype).expect("reannotate must succeed");
+
+        let out = result
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("Decimal128Array");
+
+        assert_eq!(out.precision(), 10);
+        assert_eq!(out.scale(), 2);
+        assert_eq!(out.len(), 5);
+
+        // 1.2344 -> 1.23
+        assert_eq!(out.value(0), 123_i128);
+        // 1.2356 -> 1.24
+        assert_eq!(out.value(1), 124_i128);
+        // -2.3444 -> -2.34
+        assert_eq!(out.value(2), -234_i128);
+        // -2.3456 -> -2.35
+        assert_eq!(out.value(3), -235_i128);
+        // NULL
+        assert!(out.is_null(4));
+    }
+
+    /// reannotate_array: same Decimal128 precision and scale is a no-op (fast path).
+    #[test]
+    fn reannotate_decimal128_same_type_is_passthrough() {
+        use arrow::array::{ArrayRef, Decimal128Array};
+        use arrow::datatypes::DataType;
+        use std::sync::Arc;
+
+        let src = Arc::new(
+            Decimal128Array::from(vec![Some(100_i128), None])
+                .with_precision_and_scale(10, 2)
+                .expect("src"),
+        ) as ArrayRef;
+
+        let target_dtype = DataType::Decimal128(10, 2);
+        let result = reannotate_array(&src, &target_dtype).expect("same-type must succeed");
+        // The early equality check returns the original Arc.
+        assert!(Arc::ptr_eq(&src, &result));
     }
 }
