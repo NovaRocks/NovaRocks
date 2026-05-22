@@ -268,6 +268,11 @@ fn split_sql_statements(sql: &str) -> Result<Vec<String>> {
         Backtick,
         LineComment,
         BlockComment,
+        // MySQL optimizer hint `/*+ ... */` looks like a block comment but is
+        // semantically part of the statement (parsed by the server). Preserve
+        // its full text — stripping it would silently drop SET_VAR hints like
+        // `recursive_cte_max_depth=N` and change query behavior.
+        OptimizerHint,
     }
 
     let mut statements = Vec::new();
@@ -316,6 +321,12 @@ fn split_sql_statements(sql: &str) -> Result<Vec<String>> {
                     buffer.push(ch);
                 }
                 '/' if i + 1 < sql.len() && bytes[i + 1] == b'*' => {
+                    if i + 2 < sql.len() && bytes[i + 2] == b'+' {
+                        buffer.push_str("/*+");
+                        state = State::OptimizerHint;
+                        i += 3;
+                        continue;
+                    }
                     state = State::BlockComment;
                     i += 2;
                     continue;
@@ -359,6 +370,15 @@ fn split_sql_statements(sql: &str) -> Result<Vec<String>> {
                     continue;
                 }
             }
+            State::OptimizerHint => {
+                if ch == '*' && i + 1 < sql.len() && bytes[i + 1] == b'/' {
+                    buffer.push_str("*/");
+                    state = State::Normal;
+                    i += 2;
+                    continue;
+                }
+                buffer.push(ch);
+            }
         }
         i += char_len;
     }
@@ -368,6 +388,7 @@ fn split_sql_statements(sql: &str) -> Result<Vec<String>> {
             bail!("unterminated quoted string in SQL batch");
         }
         State::BlockComment => bail!("unterminated /* */ block comment in SQL batch"),
+        State::OptimizerHint => bail!("unterminated /*+ */ optimizer hint in SQL batch"),
         _ => {}
     }
 
@@ -606,6 +627,22 @@ DELETE FROM t WHERE c = '2020-01-01 00:00:00.0';";
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0], "SELECT '-- not a comment'");
         assert_eq!(parts[1], "SELECT '/* also not */'");
+    }
+
+    #[test]
+    fn optimizer_hint_is_preserved() {
+        // MySQL `/*+ ... */` optimizer hints are part of the statement (the
+        // server parses them) — stripping them would silently drop SET_VAR
+        // values such as `recursive_cte_max_depth`.
+        let sql =
+            "SELECT /*+ SET_VAR(recursive_cte_max_depth=10) */ n FROM fib; SELECT 2;";
+        let parts = split_sql_statements(sql).expect("split");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(
+            parts[0],
+            "SELECT /*+ SET_VAR(recursive_cte_max_depth=10) */ n FROM fib"
+        );
+        assert_eq!(parts[1], "SELECT 2");
     }
 
     #[test]
