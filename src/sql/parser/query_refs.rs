@@ -1,5 +1,128 @@
 use crate::sql::analyzer::iceberg_metadata::split_metadata_suffix;
 
+/// Extract `(namespace, table)` pairs from 2-part table references in a query
+/// AST. Only returns pairs where the reference is exactly 2 parts (no catalog,
+/// no metadata suffix). Callers should dedupe against
+/// `extract_three_part_table_refs` to avoid double-registering 3-part names.
+pub(crate) fn extract_two_part_table_refs(
+    query: &sqlparser::ast::Query,
+) -> Vec<(String, String)> {
+    let mut refs = Vec::new();
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            extract_two_part_refs_from_set_expr(cte.query.body.as_ref(), &mut refs);
+        }
+    }
+    extract_two_part_refs_from_set_expr(query.body.as_ref(), &mut refs);
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+fn extract_two_part_refs_from_set_expr(
+    expr: &sqlparser::ast::SetExpr,
+    refs: &mut Vec<(String, String)>,
+) {
+    match expr {
+        sqlparser::ast::SetExpr::Select(select) => {
+            for from in &select.from {
+                extract_two_part_refs_from_factor(&from.relation, refs);
+                for join in &from.joins {
+                    extract_two_part_refs_from_factor(&join.relation, refs);
+                }
+            }
+            if let Some(sel) = &select.selection {
+                extract_two_part_refs_from_expr(sel, refs);
+            }
+            if let Some(having) = &select.having {
+                extract_two_part_refs_from_expr(having, refs);
+            }
+            for projection in &select.projection {
+                match projection {
+                    sqlparser::ast::SelectItem::UnnamedExpr(expr)
+                    | sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } => {
+                        extract_two_part_refs_from_expr(expr, refs);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
+            extract_two_part_refs_from_set_expr(left, refs);
+            extract_two_part_refs_from_set_expr(right, refs);
+        }
+        sqlparser::ast::SetExpr::Query(q) => {
+            extract_two_part_refs_from_set_expr(q.body.as_ref(), refs);
+        }
+        _ => {}
+    }
+}
+
+fn extract_two_part_refs_from_factor(
+    factor: &sqlparser::ast::TableFactor,
+    refs: &mut Vec<(String, String)>,
+) {
+    match factor {
+        sqlparser::ast::TableFactor::Table { name, .. } => {
+            let parts: Vec<String> = name
+                .0
+                .iter()
+                .filter_map(|part| match part {
+                    sqlparser::ast::ObjectNamePart::Identifier(ident) => {
+                        Some(ident.value.to_ascii_lowercase())
+                    }
+                    _ => None,
+                })
+                .collect();
+            let (base_parts, metadata_suffix) = split_metadata_suffix(&parts);
+            if metadata_suffix.is_some() {
+                return;
+            }
+            if base_parts.len() == 2 {
+                refs.push((base_parts[0].clone(), base_parts[1].clone()));
+            }
+        }
+        sqlparser::ast::TableFactor::Derived { subquery, .. } => {
+            extract_two_part_refs_from_set_expr(subquery.body.as_ref(), refs);
+        }
+        _ => {}
+    }
+}
+
+fn extract_two_part_refs_from_expr(
+    expr: &sqlparser::ast::Expr,
+    refs: &mut Vec<(String, String)>,
+) {
+    use sqlparser::ast::Expr;
+    match expr {
+        Expr::Subquery(query)
+        | Expr::Exists {
+            subquery: query, ..
+        } => {
+            extract_two_part_refs_from_set_expr(query.body.as_ref(), refs);
+        }
+        Expr::InSubquery { subquery, expr, .. } => {
+            extract_two_part_refs_from_set_expr(subquery.body.as_ref(), refs);
+            extract_two_part_refs_from_expr(expr, refs);
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            extract_two_part_refs_from_expr(left, refs);
+            extract_two_part_refs_from_expr(right, refs);
+        }
+        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) => {
+            extract_two_part_refs_from_expr(expr, refs);
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            extract_two_part_refs_from_expr(expr, refs);
+            extract_two_part_refs_from_expr(low, refs);
+            extract_two_part_refs_from_expr(high, refs);
+        }
+        _ => {}
+    }
+}
+
 /// Extract table names from a query AST, using the last object-name part and
 /// ignoring catalog/database qualifiers. Callers must dedupe against
 /// `extract_three_part_table_refs` to avoid double-registering a 3-part name
@@ -654,6 +777,76 @@ mod tests {
         assert_eq!(
             query_refs::extract_table_names_from_query(&query),
             Vec::<String>::new(),
+        );
+    }
+
+    // --- extract_two_part_table_refs tests ---
+
+    #[test]
+    fn extracts_two_part_refs_from_simple_select() {
+        let query = parse_query("SELECT * FROM mydb.mytable");
+
+        assert_eq!(
+            query_refs::extract_two_part_table_refs(&query),
+            vec![("mydb".to_string(), "mytable".to_string())],
+        );
+    }
+
+    #[test]
+    fn extracts_two_part_refs_from_join() {
+        let query = parse_query("SELECT * FROM db1.t1 JOIN db2.t2 ON true");
+
+        assert_eq!(
+            query_refs::extract_two_part_table_refs(&query),
+            vec![
+                ("db1".to_string(), "t1".to_string()),
+                ("db2".to_string(), "t2".to_string()),
+            ],
+        );
+    }
+
+    #[test]
+    fn two_part_extractor_ignores_one_part_and_three_part_refs() {
+        // 1-part name: not captured; 3-part name: not captured.
+        let query = parse_query("SELECT * FROM plain JOIN cat.db.three ON true");
+
+        assert_eq!(
+            query_refs::extract_two_part_table_refs(&query),
+            Vec::<(String, String)>::new(),
+        );
+    }
+
+    #[test]
+    fn two_part_extractor_ignores_metadata_suffix() {
+        // `db.t.__nr_meta_history__` is a 3-part metadata ref; base_parts len
+        // == 2 but it has a metadata suffix, so it must not be emitted.
+        let query = parse_query("SELECT * FROM db.t.__nr_meta_history__");
+
+        assert_eq!(
+            query_refs::extract_two_part_table_refs(&query),
+            Vec::<(String, String)>::new(),
+        );
+    }
+
+    #[test]
+    fn extracts_two_part_refs_from_cte_body() {
+        let query = parse_query("WITH x AS (SELECT * FROM ns.base) SELECT * FROM x");
+
+        assert_eq!(
+            query_refs::extract_two_part_table_refs(&query),
+            vec![("ns".to_string(), "base".to_string())],
+        );
+    }
+
+    #[test]
+    fn extracts_two_part_refs_deduplicates() {
+        let query = parse_query(
+            "SELECT * FROM db.t1 UNION ALL SELECT * FROM db.t1",
+        );
+
+        assert_eq!(
+            query_refs::extract_two_part_table_refs(&query),
+            vec![("db".to_string(), "t1".to_string())],
         );
     }
 }

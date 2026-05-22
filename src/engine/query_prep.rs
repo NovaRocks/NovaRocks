@@ -12,7 +12,7 @@ use crate::sql::analyzer::iceberg_ref::resolve_read_binding;
 use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
 use crate::sql::parser::ast::ObjectName;
 use crate::sql::parser::query_refs::{
-    extract_table_names_from_query, extract_three_part_table_refs,
+    extract_table_names_from_query, extract_three_part_table_refs, extract_two_part_table_refs,
 };
 
 #[derive(Clone, Debug)]
@@ -519,17 +519,48 @@ fn query_table_names(
         })
         .collect();
 
-    // When the session has a current catalog, also collect 1-part names so
-    // that unqualified references in the query register through the session
-    // catalog + current database. Skip any table whose name already appears
-    // as a 3-part ref: registering it again with the (current_catalog,
-    // current_database) target would resolve to the wrong db when the SQL
-    // explicitly named a different one, and abort the query with a spurious
-    // "no metadata files" failure even though the 3-part registration above
-    // already loaded the table successfully.
+    // When the session has a current catalog, also collect 1-part and 2-part
+    // names so that unqualified and db-qualified references in the query
+    // register through the session catalog.
+    //
+    // 2-part `db.table` references are collected with both parts preserved so
+    // they resolve against the explicit namespace rather than the session's
+    // current database. This is the critical fix for INSERT-SELECT and SELECT
+    // that reference `db.table` when `db` differs from the current database:
+    // the name is resolved against the active catalog's `db` namespace, not
+    // against `current_database`.
+    //
+    // Skip any table whose name already appears as a 3-part ref: registering
+    // it again with the (current_catalog, current_database) target would
+    // resolve to the wrong db when the SQL explicitly named a different one,
+    // and abort the query with a spurious "no metadata files" failure even
+    // though the 3-part registration above already loaded the table
+    // successfully.
     if current_catalog.is_some() {
-        for table in extract_table_names_from_query(query) {
+        // Collect 2-part (namespace, table) references first.
+        let two_part_refs = extract_two_part_table_refs(query);
+        // Build a set of table names covered by 2-part refs so we can skip
+        // them in the 1-part pass (avoids double-registration under the wrong
+        // namespace when the same table appears as both `db.t` and bare `t`).
+        let two_part_tables: std::collections::HashSet<String> = two_part_refs
+            .iter()
+            .map(|(_, table)| table.clone())
+            .collect();
+        for (namespace, table) in two_part_refs {
             if three_part_tables.contains(table.as_str()) {
+                continue;
+            }
+            names.push(ObjectName {
+                parts: vec![namespace, table],
+            });
+        }
+
+        // Collect 1-part (unqualified) table names, skipping any that were
+        // already captured via the 2-part or 3-part paths above.
+        for table in extract_table_names_from_query(query) {
+            if three_part_tables.contains(table.as_str())
+                || two_part_tables.contains(table.as_str())
+            {
                 continue;
             }
             names.push(ObjectName { parts: vec![table] });
@@ -772,6 +803,112 @@ fn stamp_delta_table_def_change_ops(
 mod tests {
     use crate::engine::query_prep::IcebergFileForQuery;
     use crate::sql::catalog::{TableDef, TableStorage};
+    use crate::sql::parser::ast::ObjectName;
+
+    fn parse_query_for_table_names(sql: &str) -> sqlparser::ast::Query {
+        let stmt = crate::sql::parser::parse_sql_raw(sql).expect("parse sql");
+        let sqlparser::ast::Statement::Query(query) = stmt else {
+            panic!("expected query statement");
+        };
+        *query
+    }
+
+    // --- query_table_names tests ---
+    // These tests verify that 1-part, 2-part and 3-part table references are
+    // collected correctly under various catalog / database contexts.
+
+    #[test]
+    fn query_table_names_one_part_with_catalog() {
+        // 1-part unqualified name: collected as 1-part when catalog is set.
+        let query = parse_query_for_table_names("SELECT * FROM t");
+        let names = super::query_table_names(Some("mycat"), &query);
+        assert!(
+            names.iter().any(|n| n.parts == vec!["t"]),
+            "expected 1-part name 't', got {names:?}",
+        );
+    }
+
+    #[test]
+    fn query_table_names_one_part_without_catalog() {
+        // Without a catalog nothing is collected (no iceberg session context).
+        let query = parse_query_for_table_names("SELECT * FROM t");
+        let names = super::query_table_names(None, &query);
+        // Only 3-part refs are ever collected regardless of catalog; a bare
+        // 1-part name with no catalog should not appear.
+        assert!(
+            names.iter().all(|n| n.parts.len() == 3),
+            "expected only 3-part names without catalog, got {names:?}",
+        );
+    }
+
+    #[test]
+    fn query_table_names_two_part_with_catalog() {
+        // 2-part `db.table` reference: collected as 2-part ObjectName so the
+        // registration resolves against `db`, not the session current_database.
+        let query = parse_query_for_table_names("SELECT * FROM testdb.t_src");
+        let names = super::query_table_names(Some("mycat"), &query);
+        assert!(
+            names.iter().any(|n| n.parts == vec!["testdb", "t_src"]),
+            "expected 2-part name ['testdb', 't_src'], got {names:?}",
+        );
+        // Must not also appear as a bare 1-part name.
+        assert!(
+            !names.iter().any(|n| n.parts == vec!["t_src"]),
+            "2-part ref must not also appear as 1-part, got {names:?}",
+        );
+    }
+
+    #[test]
+    fn query_table_names_two_part_without_catalog() {
+        // Without a catalog context 2-part names are not collected either.
+        let query = parse_query_for_table_names("SELECT * FROM testdb.t_src");
+        let names = super::query_table_names(None, &query);
+        assert!(
+            names.iter().all(|n| n.parts.len() == 3),
+            "expected only 3-part names without catalog, got {names:?}",
+        );
+    }
+
+    #[test]
+    fn query_table_names_three_part_always_collected() {
+        // 3-part names are always collected regardless of catalog.
+        let query = parse_query_for_table_names("SELECT * FROM cat.db.t");
+        let names_with_cat = super::query_table_names(Some("other"), &query);
+        let names_no_cat = super::query_table_names(None, &query);
+        let expected = ObjectName {
+            parts: vec!["cat".to_string(), "db".to_string(), "t".to_string()],
+        };
+        assert!(
+            names_with_cat.iter().any(|n| n == &expected),
+            "3-part ref missing with catalog, got {names_with_cat:?}",
+        );
+        assert!(
+            names_no_cat.iter().any(|n| n == &expected),
+            "3-part ref missing without catalog, got {names_no_cat:?}",
+        );
+    }
+
+    #[test]
+    fn query_table_names_two_part_not_duplicated_as_one_part() {
+        // When the query has `testdb.t_src`, only the 2-part form should be in
+        // the output. The 1-part name `t_src` must not also appear.
+        let query =
+            parse_query_for_table_names("SELECT * FROM testdb.t_src JOIN testdb.t_sink ON true");
+        let names = super::query_table_names(Some("mycat"), &query);
+        let one_part_count = names.iter().filter(|n| n.parts.len() == 1).count();
+        assert_eq!(
+            one_part_count, 0,
+            "expected no 1-part names when all refs are 2-part, got {names:?}",
+        );
+        assert!(
+            names.iter().any(|n| n.parts == vec!["testdb", "t_src"]),
+            "missing ['testdb', 't_src'], got {names:?}",
+        );
+        assert!(
+            names.iter().any(|n| n.parts == vec!["testdb", "t_sink"]),
+            "missing ['testdb', 't_sink'], got {names:?}",
+        );
+    }
 
     fn file(change_op: Option<i8>) -> IcebergFileForQuery {
         IcebergFileForQuery {

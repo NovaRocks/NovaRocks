@@ -327,9 +327,19 @@ pub(crate) fn run_select_to_chunks(
     // prior statement in the same session and the cached `TableDef` would
     // miss the new files. Refreshing here is mandatory before running the
     // SELECT so it sees all data files committed up to this point.
+    //
+    // Pass `current_catalog` when the target is an iceberg table so that
+    // 1-part and 2-part table references in the SELECT (e.g. `db.table`)
+    // are resolved against the active catalog rather than being silently
+    // skipped. This is the same pattern used by `run_select_to_chunks_and_schema`.
+    let current_catalog = if target.backend_name == "iceberg" && !target.catalog.is_empty() {
+        Some(target.catalog.as_str())
+    } else {
+        None
+    };
     crate::engine::query_prep::refresh_external_tables_for_query(
         state,
-        None,
+        current_catalog,
         &target.namespace,
         query,
     )?;
