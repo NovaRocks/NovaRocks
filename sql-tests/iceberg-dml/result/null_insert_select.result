@@ -1,0 +1,4 @@
+id	c_int	c_str	c_dec	c_dt
+1	NULL	NULL	NULL	NULL
+2	20	ok	12.30	2024-01-02 03:04:05
+3	NULL	tail	NULL	2024-06-01 00:00:00
