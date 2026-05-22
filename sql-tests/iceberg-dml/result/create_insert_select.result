@@ -1,0 +1,4 @@
+id	name	qty
+1	apple	10
+2	banana	20
+3	banana	NULL
