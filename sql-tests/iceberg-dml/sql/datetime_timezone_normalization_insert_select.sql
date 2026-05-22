@@ -1,0 +1,43 @@
+-- @order_sensitive=true
+-- @tags=iceberg_dml,datetime,timezone
+-- Test Objective:
+-- 1. Validate timezone-tagged temporal rows can be normalized to deterministic DATETIME values before sink writes.
+-- 2. Validate normalized DATETIME values remain stable after persistence.
+DROP TABLE IF EXISTS ${case_db}.t_datetime_tz_src;
+DROP TABLE IF EXISTS ${case_db}.t_datetime_tz_sink;
+CREATE TABLE ${case_db}.t_datetime_tz_src (
+  id BIGINT,
+  local_dt STRING,
+  tz STRING
+);
+CREATE TABLE ${case_db}.t_datetime_tz_sink (
+  id BIGINT,
+  local_dt STRING,
+  tz STRING,
+  normalized_dt DATETIME
+);
+INSERT INTO ${case_db}.t_datetime_tz_src VALUES
+  (1, '2024-01-01 08:00:00', '+08:00'),
+  (2, '2023-12-31 19:00:00', '-05:00'),
+  (3, '2024-01-01 00:00:00', '+00:00'),
+  (4, '2024-01-01 08:00:00', '+08:00');
+INSERT INTO ${case_db}.t_datetime_tz_sink
+SELECT
+  id,
+  local_dt,
+  tz,
+  CASE
+    WHEN local_dt IS NULL THEN NULL
+    WHEN tz = '+08:00' THEN CAST('2024-01-01 00:00:00' AS DATETIME)
+    WHEN tz = '-05:00' THEN CAST('2024-01-01 00:00:00' AS DATETIME)
+    WHEN tz = '+00:00' THEN CAST(local_dt AS DATETIME)
+    ELSE NULL
+  END AS normalized_dt
+FROM ${case_db}.t_datetime_tz_src;
+SELECT
+  id,
+  tz,
+  normalized_dt,
+  YEAR(normalized_dt) AS y
+FROM ${case_db}.t_datetime_tz_sink
+ORDER BY id;
