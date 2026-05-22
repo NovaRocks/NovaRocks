@@ -1,5 +1,6 @@
 //! Rule registration for the Cascades optimizer.
 
+pub(crate) mod equivalence_predicate;
 pub(crate) mod implement;
 pub(crate) mod join_associativity;
 pub(crate) mod join_commutativity;
@@ -42,6 +43,7 @@ pub(crate) fn all_transformation_rules() -> Vec<Box<dyn Rule>> {
     vec![
         Box::new(join_commutativity::JoinCommutativity),
         Box::new(join_associativity::JoinAssociativity),
+        Box::new(equivalence_predicate::InnerJoinEquivalencePredicateRule),
         Box::new(sort_limit_to_top_n::SortLimitToTopN),
         Box::new(split_top_n::SplitTopN),
     ]
