@@ -5,6 +5,7 @@ pub(crate) mod cost;
 pub(crate) mod cte_rewrite;
 pub(crate) mod derive;
 pub(crate) mod extract;
+pub(crate) mod logical_props;
 pub(crate) mod memo;
 pub(crate) mod operator;
 pub(crate) mod options;

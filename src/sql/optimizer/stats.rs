@@ -631,10 +631,12 @@ pub(crate) fn derive_group_statistics(
         // Derive output columns from the operator.
         let output_columns = derive_output_columns(memo, group_idx);
 
-        memo.groups[group_idx].logical_props = Some(LogicalProperties {
+        memo.groups[group_idx].logical_props = Some(super::logical_props::derive_for_group(
+            memo,
+            group_idx,
             output_columns,
-            row_count: stats.output_row_count,
-        });
+            stats.output_row_count,
+        ));
     }
 }
 

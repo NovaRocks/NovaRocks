@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 
 use super::operator::Operator;
+use super::property::{ColumnIdSet, EquivalenceClasses};
 use crate::sql::analysis::OutputColumn;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::column_id::ColumnRefFactory;
@@ -105,6 +106,19 @@ pub(crate) struct Group {
 pub(crate) struct LogicalProperties {
     pub(crate) output_columns: Vec<OutputColumn>,
     pub(crate) row_count: f64,
+    pub(crate) equivalence_classes: EquivalenceClasses,
+    pub(crate) unique_columns: Vec<ColumnIdSet>,
+}
+
+impl LogicalProperties {
+    pub(crate) fn new(output_columns: Vec<OutputColumn>, row_count: f64) -> Self {
+        Self {
+            output_columns,
+            row_count,
+            equivalence_classes: EquivalenceClasses::default(),
+            unique_columns: Vec::new(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

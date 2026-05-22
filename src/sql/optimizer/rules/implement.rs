@@ -1462,10 +1462,7 @@ mod join_demotion_tests {
         };
         let gid = memo.new_group(scan_mexpr);
         // Inject logical_props so get_group_column_names returns the column names.
-        memo.groups[gid].logical_props = Some(LogicalProperties {
-            output_columns,
-            row_count: 100.0,
-        });
+        memo.groups[gid].logical_props = Some(LogicalProperties::new(output_columns, 100.0));
         gid
     }
 
