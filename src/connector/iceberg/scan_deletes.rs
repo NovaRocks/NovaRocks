@@ -988,10 +988,12 @@ where
 /// lineage walks that row-delta snapshot would re-emit every already-applied
 /// delete as a new one, double-counting against the MV's aggregate state.
 ///
-/// `previously_deleted_positions_per_file` keys are normalized data-file paths
-/// (matching `normalize_path` output). For any data file present here, the
-/// returned per-file position set is set-difference with the previous one;
-/// data files absent from the map are scanned in full.
+/// `previously_deleted_positions_per_file` keys are **raw** data-file path
+/// strings, matching the `referenced_data_file` / `file_path` form emitted by
+/// `read_delete_positions_per_data_file_with_path_normalizer` and
+/// `read_dv_positions_per_data_file` (neither normalizes). For any data file
+/// present here, the returned per-file position set is set-difference with
+/// the previous one; data files absent from the map are scanned in full.
 pub(crate) fn scan_deletes_with_base_row_id_lookup_and_path_normalizer<F, R, N>(
     delete_files: &[PositionDeleteRef],
     factory: &crate::fs::opendal::OpendalRangeReaderFactory,
