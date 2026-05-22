@@ -431,6 +431,34 @@ pub(crate) fn parse_partition_field_expr(
     }
 
     let transform = name.to_ascii_lowercase();
+
+    // identity() is unary: identity(col).  No args and multi-arg forms are rejected.
+    if transform == "identity" {
+        // Reject identity() — no column arg.
+        if parser.consume_token(&Token::RParen) {
+            return Err(
+                "identity() requires exactly one column argument: identity(column)".to_string(),
+            );
+        }
+        let column = parser
+            .parse_identifier()
+            .map_err(|e| {
+                format!("expected column argument for partition transform `identity`: {e}")
+            })?
+            .value;
+        let column = normalize_identifier(&column)?;
+        // Reject identity(a, b) — multiple args.
+        if parser.consume_token(&Token::Comma) {
+            return Err(
+                "identity() requires exactly one column argument: identity(column)".to_string(),
+            );
+        }
+        parser
+            .expect_token(&Token::RParen)
+            .map_err(|e| format!("expected ) after identity argument: {e}"))?;
+        return Ok(IcebergPartitionFieldExpr::Identity { column });
+    }
+
     let column = parser
         .parse_identifier()
         .map_err(|e| format!("expected column argument for partition transform `{name}`: {e}"))?
@@ -1377,6 +1405,54 @@ mod tests {
                 }]
             );
         }
+    }
+
+    #[test]
+    fn create_table_parser_accepts_identity_function_call_form() {
+        // identity(col) is the verbose canonical form of the bare-column shorthand.
+        for sql in [
+            "create table tbl (p bigint) partition by identity(p)",
+            r#"create table tbl (p bigint, k bigint, v bigint) partition by identity(p) tblproperties("format-version"="3")"#,
+        ] {
+            let dialect = StarRocksDialect;
+            let mut parser = Parser::new(&dialect).try_with_sql(sql).expect("parser");
+            let stmt = parse_create_table_statement(&mut parser).expect("create table stmt");
+            let CreateTableKind::Iceberg {
+                partition_fields, ..
+            } = stmt.kind;
+            assert_eq!(
+                partition_fields,
+                vec![IcebergPartitionFieldExpr::Identity {
+                    column: "p".to_string()
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn create_table_parser_rejects_identity_with_no_args() {
+        let sql = "create table tbl (p bigint) partition by identity()";
+        let dialect = StarRocksDialect;
+        let mut parser = Parser::new(&dialect).try_with_sql(sql).expect("parser");
+        let err = parse_create_table_statement(&mut parser)
+            .expect_err("should reject identity() with no arg");
+        assert!(
+            err.contains("identity()"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn create_table_parser_rejects_identity_with_multiple_args() {
+        let sql = "create table tbl (a bigint, b bigint) partition by identity(a, b)";
+        let dialect = StarRocksDialect;
+        let mut parser = Parser::new(&dialect).try_with_sql(sql).expect("parser");
+        let err = parse_create_table_statement(&mut parser)
+            .expect_err("should reject identity(a, b) with multiple args");
+        assert!(
+            err.contains("identity()"),
+            "unexpected error message: {err}"
+        );
     }
 
     #[test]
