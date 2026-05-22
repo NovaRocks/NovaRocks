@@ -1,0 +1,29 @@
+-- query 5
+Explain String
+GATHER EXCHANGE stats={rows=1000000000}
+  PROJECT [l.lk AS lk, r.rk AS rk] stats={rows=1000000000}
+    HASH JOIN (BROADCAST, INNER, eq: [l.lk = r.rk]) stats={rows=1000000000}
+      SCAN db_sqlt_78546de01468a3d3.g7_l (alias=l) stats={rows=100000}
+           TABLE: db_sqlt_78546de01468a3d3.g7_l
+           columns: lk
+           min-max stats
+      GATHER EXCHANGE stats={rows=100000}
+        SCAN db_sqlt_78546de01468a3d3.g7_r (alias=r) stats={rows=100000}
+             TABLE: db_sqlt_78546de01468a3d3.g7_r
+             columns: rk
+             min-max stats
+
+-- query 6
+Explain String
+GATHER EXCHANGE stats={rows=1000000000}
+  PROJECT [l.lk AS lk, r.rk AS rk] stats={rows=1000000000}
+    HASH JOIN (BROADCAST, INNER, eq: [l.lk = r.rk]) stats={rows=1000000000}
+      SCAN db_sqlt_78546de01468a3d3.g7_l (alias=l) stats={rows=100000}
+           TABLE: db_sqlt_78546de01468a3d3.g7_l
+           columns: lk
+           min-max stats
+      GATHER EXCHANGE stats={rows=100000}
+        SCAN db_sqlt_78546de01468a3d3.g7_r (alias=r) stats={rows=100000}
+             TABLE: db_sqlt_78546de01468a3d3.g7_r
+             columns: rk
+             min-max stats
