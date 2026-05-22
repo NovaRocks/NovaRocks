@@ -1218,9 +1218,23 @@ fn accumulate_map_entry(
 /// (the same ordering the executor uses for stable map output). `None` keys
 /// are never produced by our aggregates, but we handle them defensively so
 /// behaviour stays deterministic if a corrupted state ever appears.
+///
+/// **NaN handling** (IVM-P5 Float follow-up): IEEE 754 says `NaN != NaN`, so
+/// `compare_agg_scalar_values` returns `Err` on NaN-vs-NaN, which would let
+/// the same NaN value re-enter the detail map as a fresh key on every refresh.
+/// We short-circuit two `Float64::NaN` values as equal (StarRocks-style, but
+/// going further: where StarRocks lets the phmap silently duplicate, we
+/// canonicalize so the detail map stays compact). Any specific NaN bit
+/// pattern (signaling vs quiet, payload) is treated the same — `f64::is_nan`
+/// is bit-pattern-agnostic.
 fn scalar_keys_equal(left: &Option<AggScalarValue>, right: &Option<AggScalarValue>) -> bool {
     match (left, right) {
         (None, None) => true,
+        (Some(AggScalarValue::Float64(l)), Some(AggScalarValue::Float64(r)))
+            if l.is_nan() && r.is_nan() =>
+        {
+            true
+        }
         (Some(l), Some(r)) => matches!(
             compare_agg_scalar_values(l, r),
             Ok(std::cmp::Ordering::Equal)
@@ -1242,24 +1256,44 @@ fn prune_zero_entries_from_map_entries(entries: Vec<MapEntry>) -> Vec<MapEntry> 
 /// Sort map entries by key using the same ordering the aggregate executor
 /// emits. Keeps the merged state deterministic across runs and makes
 /// equality assertions in unit tests stable.
+///
+/// **NaN handling** (IVM-P5 Float follow-up): IEEE 754 makes `NaN` unordered
+/// w.r.t. every other value (including itself), so `compare_agg_scalar_values`
+/// returns `Err` on any NaN comparison. We treat NaN as the maximum element
+/// (sorts to the end of the run) and equal to other NaNs. This keeps Float
+/// MIN/MAX detail-state usable: `derive_visible_from_detail_map` skips NaN
+/// keys when reducing min/max (NaN never participates in the result), and the
+/// stable position lets `merge_value_count_map_state` produce a deterministic
+/// output across refreshes. Bit-pattern-agnostic via `f64::is_nan`.
 fn sort_map_entries_by_key(
     mut entries: Vec<MapEntry>,
     state_column: &AggregateStateColumn,
 ) -> Result<Vec<MapEntry>, String> {
     let mut had_error: Option<String> = None;
     entries.sort_by(|a, b| match (&a.0, &b.0) {
-        (Some(l), Some(r)) => match compare_agg_scalar_values(l, r) {
-            Ok(ord) => ord,
-            Err(_) => {
-                had_error.get_or_insert_with(|| {
-                    format!(
-                        "MIN/MAX detail-map state on column `{}` has incomparable keys: {l:?} vs {r:?}",
-                        state_column.name
-                    )
-                });
-                std::cmp::Ordering::Equal
+        (Some(l), Some(r)) => {
+            // NaN-aware short-circuit before reaching the strict comparator.
+            if let (AggScalarValue::Float64(lx), AggScalarValue::Float64(rx)) = (l, r) {
+                match (lx.is_nan(), rx.is_nan()) {
+                    (true, true) => return std::cmp::Ordering::Equal,
+                    (true, false) => return std::cmp::Ordering::Greater,
+                    (false, true) => return std::cmp::Ordering::Less,
+                    (false, false) => {} // both finite: fall through to strict comparator
+                }
             }
-        },
+            match compare_agg_scalar_values(l, r) {
+                Ok(ord) => ord,
+                Err(_) => {
+                    had_error.get_or_insert_with(|| {
+                        format!(
+                            "MIN/MAX detail-map state on column `{}` has incomparable keys: {l:?} vs {r:?}",
+                            state_column.name
+                        )
+                    });
+                    std::cmp::Ordering::Equal
+                }
+            }
+        }
         (None, None) => std::cmp::Ordering::Equal,
         (None, Some(_)) => std::cmp::Ordering::Less,
         (Some(_), None) => std::cmp::Ordering::Greater,
@@ -1305,6 +1339,16 @@ pub(crate) fn derive_visible_from_detail_map(
             // defensively.
             continue;
         };
+        // IVM-P5 Float follow-up: NaN handling is centralized in
+        // `pick_min_max_scalar` via `f64::total_cmp` (IEEE 754 total order:
+        // +NaN is the maximum, finite values sort below). This mirrors
+        // NovaRocks's plain MIN/MAX accumulator (`update_max_float` /
+        // `update_min_float` in `src/exec/expr/agg/functions/{max,min}.rs`)
+        // which also uses `v.total_cmp(&state.value)`. Net effect:
+        //   - MIN over (NaN, finite, ...) → finite minimum (NaN > finite in
+        //     total_cmp, never picked as MIN)
+        //   - MAX over (NaN, finite, ...) → NaN (NaN > finite, picked as MAX)
+        //   - MIN/MAX over NaN-only group → NaN (the single entry)
         current = Some(match current {
             None => key,
             Some(c) => pick_min_max_scalar(c, key, op)?,
@@ -1314,18 +1358,38 @@ pub(crate) fn derive_visible_from_detail_map(
 }
 
 /// Pick min or max of two scalar values using the executor's stable
-/// comparator. Returns an error if the two values are incomparable
-/// (different variants or NaN floats) — should never happen for
-/// well-formed state, since `map_value_count` keys come from one
-/// typed input column.
+/// comparator.
+///
+/// **Float NaN handling**: For Float64-vs-Float64 we use `f64::total_cmp`
+/// (IEEE 754 total order) instead of `compare_agg_scalar_values` (which
+/// returns `Err` on any NaN comparison). Total order places +NaN at the
+/// extreme so:
+///   - MIN(NaN, finite) → finite minimum (finite < +NaN in total order;
+///     NaN never picked as MIN unless every entry is NaN)
+///   - MAX(NaN, finite) → NaN (NaN > finite in total order)
+///   - MIN(NaN-only) / MAX(NaN-only) → NaN (the single entry)
+///
+/// This matches NovaRocks's plain MIN/MAX accumulator (`update_max_float` /
+/// `update_min_float` in `src/exec/expr/agg/functions/{max,min}.rs`, both
+/// using `v.total_cmp(&state.value)`), so the MV always mirrors plain
+/// GROUP BY semantics on Float columns.
+///
+/// For non-Float types, `compare_agg_scalar_values` is used as before;
+/// returns `Err` if the two values are incomparable (different variants) —
+/// should not happen for well-formed state since `map_value_count` keys
+/// come from one typed input column.
 fn pick_min_max_scalar(
     a: AggScalarValue,
     b: AggScalarValue,
     op: MinMax,
 ) -> Result<AggScalarValue, String> {
-    let ordering = compare_agg_scalar_values(&a, &b).map_err(|e| {
-        format!("derive_visible_from_detail_map: incomparable map keys: {a:?} vs {b:?}: {e}")
-    })?;
+    let ordering = if let (AggScalarValue::Float64(av), AggScalarValue::Float64(bv)) = (&a, &b) {
+        av.total_cmp(bv)
+    } else {
+        compare_agg_scalar_values(&a, &b).map_err(|e| {
+            format!("derive_visible_from_detail_map: incomparable map keys: {a:?} vs {b:?}: {e}")
+        })?
+    };
     let pick_a = match op {
         MinMax::Min => {
             ordering == std::cmp::Ordering::Less || ordering == std::cmp::Ordering::Equal
@@ -1707,20 +1771,22 @@ fn validate_state_column_type(
                 ));
             }
             match key_field.data_type() {
-                // MIN/MAX detail-state currently can't ingest NaN keys (the
-                // comparator underlying merge/sort returns Err on NaN, which
-                // would silently miscount or hard-error at refresh time).
-                // Reject Float MIN/MAX in detail-state MVs until a follow-up
-                // PR adds canonical-NaN handling.
-                DataType::Float32 | DataType::Float64 => Err(format!(
-                    "MIN/MAX over Float types is not yet supported in incremental MVs \
-                     (column `{state_name}`): NaN handling pending; use a non-Float column or \
-                     non-incremental MV"
-                )),
+                // IVM-P5 Float follow-up: Float MIN/MAX now supported.
+                // NaN is handled in three sites:
+                //   1. `scalar_keys_equal` — bit-pattern-agnostic NaN==NaN so
+                //      detail map aggregates duplicate NaNs into one entry.
+                //   2. `sort_map_entries_by_key` — NaN sorts to the end of
+                //      the run (Ordering::Greater) instead of erroring out.
+                //   3. `derive_visible_from_detail_map` — skips NaN keys
+                //      when reducing MIN/MAX (NaN is ignored, like NULL).
+                // Float32 is widened to Float64 at AggScalarValue level
+                // (`scalar_from_array`), so handling Float64 covers both.
                 DataType::Int8
                 | DataType::Int16
                 | DataType::Int32
                 | DataType::Int64
+                | DataType::Float32
+                | DataType::Float64
                 | DataType::Decimal128(_, _)
                 | DataType::Decimal256(_, _)
                 | DataType::Utf8
@@ -2820,33 +2886,239 @@ mod tests {
     }
 
     #[test]
-    fn validate_state_column_type_rejects_float_min_max() {
-        // Float MIN/MAX detail-state cannot be supported yet: the underlying
-        // comparator (`compare_agg_scalar_values`) returns `Err` on NaN, which
-        // means `merge_value_count_map_state` / `sort_map_entries_by_key`
-        // would silently miscount or hard-error at refresh time. Reject at
-        // schema-validate time until canonical-NaN handling lands.
+    fn validate_state_column_type_accepts_float_min_max() {
+        // IVM-P5 Float follow-up: Float MIN/MAX detail-state is now supported.
+        // NaN handling lives in three sites: `scalar_keys_equal` treats two
+        // NaNs as bit-equal, `sort_map_entries_by_key` sorts NaN to the end,
+        // and `derive_visible_from_detail_map` skips NaN keys when reducing
+        // MIN/MAX. See the tests below for each behaviour.
         for key_type in [DataType::Float32, DataType::Float64] {
             let map = expected_min_max_state_arrow_type(key_type.clone());
             for function in [AggregateFunctionKind::Min, AggregateFunctionKind::Max] {
-                let result = validate_state_column_type(
+                validate_state_column_type(
                     function,
                     AggregateStateRole::Single,
                     &map,
                     "__agg_state_m",
-                );
-                let err = result.expect_err(&format!(
-                    "expected Float MIN/MAX rejection error for {key_type:?} {function:?}"
-                ));
-                assert!(
-                    err.contains("Float"),
-                    "expected error to mention Float, got: {err}"
-                );
-                assert!(
-                    err.contains("MIN/MAX"),
-                    "expected error to mention MIN/MAX, got: {err}"
-                );
+                )
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "expected Float MIN/MAX to be accepted for {key_type:?} {function:?}, got error: {err}"
+                    );
+                });
             }
+        }
+    }
+
+    #[test]
+    fn scalar_keys_equal_treats_nan_as_equal() {
+        // IEEE-754 says NaN != NaN, but for detail-map keys we want every
+        // NaN to collapse to a single entry. This is bit-pattern-agnostic:
+        // any NaN payload (signaling/quiet, different mantissas) must hash
+        // to the same equivalence class.
+        let nan1 = Some(AggScalarValue::Float64(f64::NAN));
+        // Different NaN bit pattern (mantissa payload differs). Still a NaN
+        // because the exponent is all-1s and the mantissa is non-zero.
+        let nan2_value = f64::from_bits(f64::NAN.to_bits() ^ 0x42);
+        assert!(nan2_value.is_nan(), "nan2 should still be NaN");
+        let nan2 = Some(AggScalarValue::Float64(nan2_value));
+        assert!(scalar_keys_equal(&nan1, &nan2));
+        assert!(scalar_keys_equal(&nan1, &nan1));
+
+        // NaN vs finite is NOT equal.
+        let finite = Some(AggScalarValue::Float64(1.5));
+        assert!(!scalar_keys_equal(&nan1, &finite));
+        assert!(!scalar_keys_equal(&finite, &nan1));
+
+        // Finite-vs-finite still works through the strict comparator.
+        let a = Some(AggScalarValue::Float64(1.5));
+        let b = Some(AggScalarValue::Float64(1.5));
+        assert!(scalar_keys_equal(&a, &b));
+        let c = Some(AggScalarValue::Float64(2.5));
+        assert!(!scalar_keys_equal(&a, &c));
+    }
+
+    #[test]
+    fn sort_map_entries_by_key_with_nan_sorts_to_end_no_error() {
+        // Before the Float follow-up, NaN keys would cause sort_map_entries_by_key
+        // to return Err (the strict comparator rejected them). Now NaN sorts
+        // to the end of the run and the function succeeds.
+        let state_col = AggregateStateColumn {
+            name: "__agg_state_mn".to_string(),
+            data_type: DataType::Map(
+                Arc::new(arrow::datatypes::Field::new(
+                    "key_value",
+                    DataType::Struct(arrow::datatypes::Fields::from(vec![
+                        arrow::datatypes::Field::new("key", DataType::Float64, false),
+                        arrow::datatypes::Field::new("value", DataType::Int64, true),
+                    ])),
+                    false,
+                )),
+                false,
+            ),
+            sql_type: SqlType::Map(Box::new(SqlType::Double), Box::new(SqlType::BigInt)),
+            nullable: false,
+            visible_source_index: 0,
+            aggregate_index: 0,
+            function: AggregateFunctionKind::Min,
+            state_role: AggregateStateRole::Single,
+            count_star: false,
+        };
+
+        let entries: Vec<MapEntry> = vec![
+            (
+                Some(AggScalarValue::Float64(f64::NAN)),
+                Some(AggScalarValue::Int64(1)),
+            ),
+            (
+                Some(AggScalarValue::Float64(2.5)),
+                Some(AggScalarValue::Int64(1)),
+            ),
+            (
+                Some(AggScalarValue::Float64(1.5)),
+                Some(AggScalarValue::Int64(1)),
+            ),
+        ];
+
+        let sorted = sort_map_entries_by_key(entries, &state_col).expect("sort should succeed");
+        assert_eq!(sorted.len(), 3);
+        // Expect: 1.5, 2.5, NaN (NaN sorts to the end).
+        match &sorted[0].0 {
+            Some(AggScalarValue::Float64(v)) => assert_eq!(*v, 1.5),
+            other => panic!("expected 1.5 at index 0, got {other:?}"),
+        }
+        match &sorted[1].0 {
+            Some(AggScalarValue::Float64(v)) => assert_eq!(*v, 2.5),
+            other => panic!("expected 2.5 at index 1, got {other:?}"),
+        }
+        match &sorted[2].0 {
+            Some(AggScalarValue::Float64(v)) => assert!(v.is_nan()),
+            other => panic!("expected NaN at index 2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn derive_visible_from_detail_map_with_nan_min_finite_max_nan() {
+        // {1.5: 1, NaN: 1, 2.5: 1} per `f64::total_cmp` ordering:
+        //   - MIN should be 1.5 (NaN is total-cmp max, never picked as MIN)
+        //   - MAX should be NaN (NaN dominates in total-cmp order)
+        // This matches NovaRocks's plain MIN/MAX over Float64 (both use
+        // total_cmp). The MV thus mirrors plain GROUP BY exactly.
+        let map = AggScalarValue::Map(vec![
+            (
+                Some(AggScalarValue::Float64(1.5)),
+                Some(AggScalarValue::Int64(1)),
+            ),
+            (
+                Some(AggScalarValue::Float64(f64::NAN)),
+                Some(AggScalarValue::Int64(1)),
+            ),
+            (
+                Some(AggScalarValue::Float64(2.5)),
+                Some(AggScalarValue::Int64(1)),
+            ),
+        ]);
+
+        let min = derive_visible_from_detail_map(&map, MinMax::Min).expect("derive min");
+        assert!(matches!(min, Some(AggScalarValue::Float64(v)) if v == 1.5));
+
+        let max = derive_visible_from_detail_map(&map, MinMax::Max).expect("derive max");
+        assert!(matches!(max, Some(AggScalarValue::Float64(v)) if v.is_nan()));
+    }
+
+    #[test]
+    fn derive_visible_from_detail_map_all_nan_returns_nan() {
+        // Group with only NaN entries: total_cmp picks NaN for both MIN
+        // and MAX (the single entry is NaN; no finite value to beat it
+        // for MIN, no finite value to lose to it for MAX).
+        // This matches plain MIN/MAX over a NaN-only Float64 column.
+        let map = AggScalarValue::Map(vec![
+            (
+                Some(AggScalarValue::Float64(f64::NAN)),
+                Some(AggScalarValue::Int64(3)),
+            ),
+            (
+                Some(AggScalarValue::Float64(f64::NAN)),
+                Some(AggScalarValue::Int64(1)),
+            ),
+        ]);
+
+        let min = derive_visible_from_detail_map(&map, MinMax::Min).expect("derive min");
+        assert!(matches!(min, Some(AggScalarValue::Float64(v)) if v.is_nan()));
+
+        let max = derive_visible_from_detail_map(&map, MinMax::Max).expect("derive max");
+        assert!(matches!(max, Some(AggScalarValue::Float64(v)) if v.is_nan()));
+    }
+
+    #[test]
+    fn merge_value_count_map_state_aggregates_nan_into_one_entry() {
+        // Two delta states both containing NaN: after merge, the result map
+        // should have a SINGLE NaN entry with the summed count — not two
+        // separate NaN entries (which would happen with IEEE-754 equality).
+        // This is where NovaRocks goes further than StarRocks (whose phmap
+        // silently duplicates NaN keys).
+        let state_col = AggregateStateColumn {
+            name: "__agg_state_mn".to_string(),
+            data_type: DataType::Map(
+                Arc::new(arrow::datatypes::Field::new(
+                    "key_value",
+                    DataType::Struct(arrow::datatypes::Fields::from(vec![
+                        arrow::datatypes::Field::new("key", DataType::Float64, false),
+                        arrow::datatypes::Field::new("value", DataType::Int64, true),
+                    ])),
+                    false,
+                )),
+                false,
+            ),
+            sql_type: SqlType::Map(Box::new(SqlType::Double), Box::new(SqlType::BigInt)),
+            nullable: false,
+            visible_source_index: 0,
+            aggregate_index: 0,
+            function: AggregateFunctionKind::Min,
+            state_role: AggregateStateRole::Single,
+            count_star: false,
+        };
+
+        let old = Some(AggScalarValue::Map(vec![
+            (
+                Some(AggScalarValue::Float64(1.5)),
+                Some(AggScalarValue::Int64(1)),
+            ),
+            (
+                Some(AggScalarValue::Float64(f64::NAN)),
+                Some(AggScalarValue::Int64(2)),
+            ),
+        ]));
+        let delta = Some(AggScalarValue::Map(vec![
+            (
+                Some(AggScalarValue::Float64(f64::NAN)),
+                Some(AggScalarValue::Int64(3)),
+            ),
+            (
+                Some(AggScalarValue::Float64(2.5)),
+                Some(AggScalarValue::Int64(1)),
+            ),
+        ]));
+
+        let merged = merge_value_count_map_state(old, delta, &state_col)
+            .expect("merge")
+            .expect("non-empty result");
+        let AggScalarValue::Map(entries) = merged else {
+            panic!("expected Map result");
+        };
+
+        // Expect 3 entries: 1.5 (count=1), 2.5 (count=1), NaN (count=5).
+        assert_eq!(entries.len(), 3);
+        let nan_entries: Vec<_> = entries
+            .iter()
+            .filter(|(k, _)| {
+                matches!(k, Some(AggScalarValue::Float64(v)) if v.is_nan())
+            })
+            .collect();
+        assert_eq!(nan_entries.len(), 1, "NaN keys should aggregate to one entry");
+        match &nan_entries[0].1 {
+            Some(AggScalarValue::Int64(c)) => assert_eq!(*c, 5),
+            other => panic!("expected NaN count=5, got {other:?}"),
         }
     }
 

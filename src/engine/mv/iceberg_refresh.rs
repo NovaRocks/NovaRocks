@@ -9172,11 +9172,13 @@ mod tests {
     }
 
     #[test]
-    fn iceberg_aggregate_mv_with_min_float_still_rejected() {
-        // IVM-P5 Phase 5 regression: even though the broad DDL gate is
-        // removed, Float MIN/MAX must still be rejected by the
-        // validate_state_column_type validator (Phase 4 follow-up) until
-        // canonical-NaN handling is added.
+    fn iceberg_aggregate_mv_with_min_float_is_accepted() {
+        // IVM-P5 Float follow-up: Float MIN/MAX is now supported in
+        // detail-state aggregate IMVs. NaN handling lives in three sites:
+        // `scalar_keys_equal` (NaN == NaN), `sort_map_entries_by_key`
+        // (NaN sorts to end), and `derive_visible_from_detail_map` (skips
+        // NaN keys — matches SQL standard "ignore NaN in MIN/MAX").
+        // This replaces the previous Phase 5 rejection test.
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
         create_aggregate_fact_table_with_float(&env.state, "ice", "sales", "fact_float");
         let stmt = parse_create_mv(
@@ -9188,16 +9190,8 @@ mod tests {
                 GROUP BY region",
         );
 
-        let err = create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect_err("Float MIN/MAX should still be rejected at the validator layer");
-        assert!(
-            err.contains("Float"),
-            "expected error to mention Float, got: {err}"
-        );
-        assert!(
-            err.contains("MIN/MAX"),
-            "expected error to mention MIN/MAX, got: {err}"
-        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("Float MIN/MAX should now be accepted at the validator layer");
     }
 
     #[test]

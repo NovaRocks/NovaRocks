@@ -1,0 +1,23 @@
+-- query 3
+region	mn	mx	c
+north	10.5	NaN	6
+
+-- query 4
+region	mn	mx	c
+north	10.5	NaN	6
+
+-- query 6
+region	mn	mx	c
+north	20.25	NaN	5
+
+-- query 7
+region	mn	mx	c
+north	20.25	NaN	5
+
+-- query 9
+region	mn	mx	c
+north	20.25	50.5	4
+
+-- query 10
+region	mn	mx	c
+north	20.25	50.5	4
