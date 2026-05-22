@@ -18,10 +18,11 @@ use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Int8Array, Int16Array, Int32Array, Int32Builder,
-    Int64Array, LargeBinaryArray, LargeStringArray, StringArray, UInt8Array, UInt16Array,
-    UInt32Array, UInt64Array,
+    Int64Array, LargeBinaryArray, LargeStringArray, StringArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
 };
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, TimeUnit};
 use std::sync::Arc;
 
 const MURMUR3_32_SEED: u32 = 104_729;
@@ -143,6 +144,41 @@ fn try_stringify_scalar(input: &ArrayRef, row: usize) -> Result<Option<String>, 
                 .ok_or_else(|| "downcast BooleanArray failed".to_string())?;
             // StarRocks casts BOOLEAN → VARCHAR as "1"/"0".
             Ok(Some(if arr.value(row) { "1" } else { "0" }.to_string()))
+        }
+        // Arrow's default cast for Timestamp produces ISO 8601 with a `T`
+        // separator (e.g. `2024-01-01T12:34:56`), but StarRocks's
+        // VARCHAR-viewer of DATETIME uses a space (`2024-01-01 12:34:56`).
+        // Use NovaRocks's StarRocks-compatible formatter so
+        // `murmur_hash3_32(datetime_col)` hashes the same bytes StarRocks
+        // would, including inside `array_map` over `array<datetime>`.
+        DataType::Timestamp(unit, tz) => {
+            let value = match unit {
+                TimeUnit::Second => input
+                    .as_any()
+                    .downcast_ref::<TimestampSecondArray>()
+                    .ok_or_else(|| "downcast TimestampSecondArray failed".to_string())?
+                    .value(row),
+                TimeUnit::Millisecond => input
+                    .as_any()
+                    .downcast_ref::<TimestampMillisecondArray>()
+                    .ok_or_else(|| "downcast TimestampMillisecondArray failed".to_string())?
+                    .value(row),
+                TimeUnit::Microsecond => input
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .ok_or_else(|| "downcast TimestampMicrosecondArray failed".to_string())?
+                    .value(row),
+                TimeUnit::Nanosecond => input
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .ok_or_else(|| "downcast TimestampNanosecondArray failed".to_string())?
+                    .value(row),
+            };
+            Ok(Some(crate::exec::expr::cast::format_timestamp_for_varchar(
+                unit,
+                value,
+                tz.as_deref(),
+            )))
         }
         _ => {
             // Fall back to arrow's cast-to-string formatter for everything else

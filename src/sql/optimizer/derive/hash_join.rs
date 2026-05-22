@@ -52,11 +52,53 @@ fn eq_keys_to_column_ids(
         .collect()
 }
 
+/// Given a set of column ids representing a HashPartitioned key, and the
+/// join's `eq_conditions`, return the input extended with the
+/// equivalence-class partner from each matching eq pair.
+///
+/// Rationale: after `JOIN ON L = R`, output rows satisfy `L == R`, so the
+/// output is HashPartitioned by `L` iff it is HashPartitioned by `R`.
+/// Carrying both ids in the output's HashPartitioned vector lets the
+/// optimizer's containAll `satisfies` check accept a downstream requirement
+/// on either side — even when join children get re-oriented (commutativity
+/// or `orient_eq_pair` ambiguity from colliding column names) so that the
+/// physical hash key is on the other side.
+fn expand_with_eq_equivalents(
+    cols: &[ColumnId],
+    eq_conditions: &[PhysicalHashJoinEqCondition],
+) -> Vec<ColumnId> {
+    let mut out: Vec<ColumnId> = cols.to_vec();
+    for eq in eq_conditions {
+        let (Some(lc), Some(rc)) = (
+            typed_expr_to_column_id(&eq.left),
+            typed_expr_to_column_id(&eq.right),
+        ) else {
+            continue;
+        };
+        if out.contains(&lc) && !out.contains(&rc) {
+            out.push(rc);
+        }
+        if out.contains(&rc) && !out.contains(&lc) {
+            out.push(lc);
+        }
+    }
+    out
+}
+
 impl DeriveOutput for PhysicalHashJoinOp {
     fn derive_output(&self, children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
         match self.distribution {
             JoinDistribution::Shuffle => {
-                let cols = eq_keys_to_column_ids(&self.eq_conditions, Side::Left);
+                // Symmetric over both sides of each eq pair — a shuffle join
+                // partitions both inputs on their respective eq columns, so
+                // its output's HashPartitioned key is an equivalence class
+                // containing every eq column from either side.
+                let mut cols = eq_keys_to_column_ids(&self.eq_conditions, Side::Left);
+                for rc in eq_keys_to_column_ids(&self.eq_conditions, Side::Right) {
+                    if !cols.contains(&rc) {
+                        cols.push(rc);
+                    }
+                }
                 PhysicalPropertySet {
                     distribution: if cols.is_empty() {
                         DistributionSpec::Any
@@ -73,8 +115,21 @@ impl DeriveOutput for PhysicalHashJoinOp {
                         .copied()
                         .cloned()
                         .unwrap_or_else(PhysicalPropertySet::any);
+                    // Enrich left's HashPartitioned key with eq-equivalents
+                    // so a downstream requirement keyed on the OTHER side
+                    // of an eq pair (e.g. after JoinCommutativity put the
+                    // hash-providing side on the right) is also satisfied.
+                    let distribution = match left.distribution {
+                        DistributionSpec::HashPartitioned(cols) => {
+                            DistributionSpec::HashPartitioned(expand_with_eq_equivalents(
+                                &cols,
+                                &self.eq_conditions,
+                            ))
+                        }
+                        other => other,
+                    };
                     PhysicalPropertySet {
-                        distribution: left.distribution,
+                        distribution,
                         ordering: OrderingSpec::Any,
                     }
                 } else {
@@ -88,7 +143,7 @@ impl DeriveOutput for PhysicalHashJoinOp {
 impl DeriveRequired for PhysicalHashJoinOp {
     fn derive_required(
         &self,
-        parent_required: &PhysicalPropertySet,
+        _parent_required: &PhysicalPropertySet,
         _n: usize,
     ) -> Vec<PhysicalPropertySet> {
         match self.distribution {
@@ -127,19 +182,19 @@ impl DeriveRequired for PhysicalHashJoinOp {
                 ]
             }
             JoinDistribution::Broadcast => {
-                let left_req = if preserves_left(&self.join_type)
-                    && matches!(
-                        parent_required.distribution,
-                        DistributionSpec::HashPartitioned(_)
-                    ) {
-                    PhysicalPropertySet {
-                        distribution: parent_required.distribution.clone(),
-                        ordering: OrderingSpec::Any,
-                    }
-                } else {
-                    PhysicalPropertySet::any()
-                };
-                vec![left_req, PhysicalPropertySet::gather()]
+                // Do NOT propagate the parent's HashPartitioned requirement
+                // into the LEFT child. Pushing HashPart([X]) down can place
+                // a Distribution enforcer over a child whose logical scope
+                // does not contain X (after JoinCommutativity swaps children
+                // or when the parent's required col is the RIGHT side of an
+                // eq pair — `orient_eq_pair` cannot distinguish these when
+                // both children share a column name like `c0`). Instead,
+                // rely on `derive_output`'s eq-equivalent enrichment to let
+                // the join's output satisfy the parent natively; if not,
+                // the optimizer places a single Distribution enforcer ON
+                // TOP of the join, where every column the parent named is
+                // in scope.
+                vec![PhysicalPropertySet::any(), PhysicalPropertySet::gather()]
             }
             JoinDistribution::Colocate => {
                 vec![PhysicalPropertySet::any(), PhysicalPropertySet::any()]
@@ -188,10 +243,17 @@ mod tests {
         };
         let right_out = PhysicalPropertySet::gather();
         let out = op.derive_output(&[&left_out, &right_out]);
-        assert_eq!(
-            out.distribution,
-            DistributionSpec::HashPartitioned(vec![ColumnId(10)])
-        );
+        // The join's output carries the eq-equivalence class: a left-side
+        // HashPartitioned([10]) becomes HashPartitioned([10, 20]) because the
+        // eq `10 = 20` makes both columns equivalent on the join output.
+        match &out.distribution {
+            DistributionSpec::HashPartitioned(cols) => {
+                let ids: std::collections::HashSet<ColumnId> = cols.iter().copied().collect();
+                assert!(ids.contains(&ColumnId(10)), "expected ColumnId(10), got {ids:?}");
+                assert!(ids.contains(&ColumnId(20)), "expected ColumnId(20), got {ids:?}");
+            }
+            other => panic!("expected HashPartitioned([10, 20]), got {other:?}"),
+        }
         assert_eq!(out.ordering, OrderingSpec::Any);
     }
 
@@ -354,10 +416,17 @@ mod tests {
             ordering: OrderingSpec::Any,
         };
         let out = op.derive_output(&[&left_out, &right_out]);
-        assert_eq!(
-            out.distribution,
-            DistributionSpec::HashPartitioned(vec![ColumnId(10)])
-        );
+        // Like Broadcast preserves-left, Colocate enriches the left's
+        // HashPartitioned with its eq-equivalence partner so a downstream
+        // requirement on either side of the eq pair is satisfied.
+        match &out.distribution {
+            DistributionSpec::HashPartitioned(cols) => {
+                let ids: std::collections::HashSet<ColumnId> = cols.iter().copied().collect();
+                assert!(ids.contains(&ColumnId(10)), "expected ColumnId(10), got {ids:?}");
+                assert!(ids.contains(&ColumnId(20)), "expected ColumnId(20), got {ids:?}");
+            }
+            other => panic!("expected HashPartitioned([10, 20]), got {other:?}"),
+        }
     }
 
     #[test]
@@ -376,20 +445,26 @@ mod tests {
         assert_eq!(out.distribution, DistributionSpec::Any);
     }
 
-    // ── Task 19: Broadcast required pushdown ─────────────────────────────────
+    // ── Broadcast required: never propagates HashPart to left ───────────────
+    //
+    // A Broadcast join's left-required is now always Any (gather-on-right).
+    // Pushing parent's HashPart([X]) into the LEFT child was unsafe: when
+    // CBO swapped the children (or when the parent's required col is the
+    // RIGHT side of the eq under ambiguous orient_eq_pair), the enforcer
+    // ended up over a child whose logical scope did not contain X.
+    // derive_output's eq-equivalence enrichment lets the join's output
+    // satisfy the parent natively; if not, the enforcer is placed on the
+    // join's output (where every column the parent named is in scope).
 
     #[test]
-    fn hash_join_broadcast_required_pushes_down_hash() {
+    fn hash_join_broadcast_required_never_pushes_hash_to_left() {
         let op = broadcast_inner(10, 20);
         let parent = PhysicalPropertySet {
             distribution: DistributionSpec::HashPartitioned(vec![ColumnId(10)]),
             ordering: OrderingSpec::Any,
         };
         let reqs = op.derive_required(&parent, 2);
-        assert_eq!(
-            reqs[0].distribution,
-            DistributionSpec::HashPartitioned(vec![ColumnId(10)])
-        );
+        assert_eq!(reqs[0].distribution, DistributionSpec::Any);
         assert_eq!(reqs[1].distribution, DistributionSpec::Gather);
     }
 
@@ -403,7 +478,7 @@ mod tests {
     }
 
     #[test]
-    fn hash_join_broadcast_required_does_not_push_right_outer() {
+    fn hash_join_broadcast_required_right_outer_returns_any_gather() {
         let op = broadcast_with_type(crate::sql::analysis::JoinKind::RightOuter);
         let parent = PhysicalPropertySet {
             distribution: DistributionSpec::HashPartitioned(vec![ColumnId(10)]),
@@ -424,5 +499,88 @@ mod tests {
         let reqs = op.derive_required(&parent, 2);
         assert_eq!(reqs[0].distribution, DistributionSpec::Any);
         assert_eq!(reqs[1].distribution, DistributionSpec::Any);
+    }
+
+    // ── eq-equivalence enrichment of derive_output ─────────────────────────
+
+    #[test]
+    fn broadcast_output_left_any_stays_any() {
+        // No HashPartitioned to enrich → output should pass through unchanged.
+        let op = broadcast_inner(10, 20);
+        let left_out = PhysicalPropertySet::any();
+        let right_out = PhysicalPropertySet::gather();
+        let out = op.derive_output(&[&left_out, &right_out]);
+        assert_eq!(out.distribution, DistributionSpec::Any);
+    }
+
+    #[test]
+    fn broadcast_output_enrichment_is_idempotent() {
+        // When left already contains both eq columns, enrichment must not
+        // duplicate ids.
+        let op = broadcast_inner(10, 20);
+        let left_out = PhysicalPropertySet {
+            distribution: DistributionSpec::HashPartitioned(vec![ColumnId(10), ColumnId(20)]),
+            ordering: OrderingSpec::Any,
+        };
+        let right_out = PhysicalPropertySet::gather();
+        let out = op.derive_output(&[&left_out, &right_out]);
+        match &out.distribution {
+            DistributionSpec::HashPartitioned(cols) => {
+                assert_eq!(cols.len(), 2, "no duplicates expected, got {cols:?}");
+                let ids: std::collections::HashSet<ColumnId> = cols.iter().copied().collect();
+                assert!(ids.contains(&ColumnId(10)));
+                assert!(ids.contains(&ColumnId(20)));
+            }
+            other => panic!("expected HashPartitioned, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn broadcast_output_enrichment_via_right_eq_id() {
+        // Mirrors the failing-test shape: after CBO swap, LEFT child provides
+        // HashPartitioned([RIGHT eq column id]). Enrichment must add the
+        // LEFT eq column id so a downstream requirement keyed on the LEFT
+        // side of the original SQL eq is still satisfied.
+        let op = broadcast_inner(10, 20);
+        let left_out = PhysicalPropertySet {
+            distribution: DistributionSpec::HashPartitioned(vec![ColumnId(20)]),
+            ordering: OrderingSpec::Any,
+        };
+        let right_out = PhysicalPropertySet::gather();
+        let out = op.derive_output(&[&left_out, &right_out]);
+        match &out.distribution {
+            DistributionSpec::HashPartitioned(cols) => {
+                let ids: std::collections::HashSet<ColumnId> = cols.iter().copied().collect();
+                assert!(ids.contains(&ColumnId(10)));
+                assert!(ids.contains(&ColumnId(20)));
+            }
+            other => panic!("expected HashPartitioned([10, 20]), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shuffle_output_is_symmetric_over_eq_cols() {
+        // Shuffle's output's HashPartitioned vector must contain BOTH sides
+        // of every eq pair — a shuffle partitions both inputs on their
+        // respective eq columns, so the output is hash-equivalent in either.
+        let op = PhysicalHashJoinOp {
+            join_type: crate::sql::analysis::JoinKind::Inner,
+            eq_conditions: vec![PhysicalHashJoinEqCondition {
+                left: col(10),
+                right: col(20),
+                null_safe: false,
+            }],
+            other_condition: None,
+            distribution: JoinDistribution::Shuffle,
+        };
+        let out = op.derive_output(&[&PhysicalPropertySet::any(), &PhysicalPropertySet::any()]);
+        match &out.distribution {
+            DistributionSpec::HashPartitioned(cols) => {
+                let ids: std::collections::HashSet<ColumnId> = cols.iter().copied().collect();
+                assert!(ids.contains(&ColumnId(10)));
+                assert!(ids.contains(&ColumnId(20)));
+            }
+            other => panic!("expected HashPartitioned([10, 20]), got {other:?}"),
+        }
     }
 }

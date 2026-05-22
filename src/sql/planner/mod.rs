@@ -761,6 +761,72 @@ fn has_window_call(expr: &TypedExpr) -> bool {
     }
 }
 
+/// Converse of a window-frame boundary: swap PRECEDING ↔ FOLLOWING (including
+/// unbounded variants) and leave CURRENT_ROW alone. Matches StarRocks FE
+/// `AnalyticWindowBoundary.BoundaryType.converse()`.
+fn converse_window_bound(bound: &WindowBound) -> WindowBound {
+    match bound {
+        WindowBound::UnboundedPreceding => WindowBound::UnboundedFollowing,
+        WindowBound::UnboundedFollowing => WindowBound::UnboundedPreceding,
+        WindowBound::Preceding(n) => WindowBound::Following(*n),
+        WindowBound::Following(n) => WindowBound::Preceding(*n),
+        WindowBound::CurrentRow => WindowBound::CurrentRow,
+    }
+}
+
+/// Reverse a window frame in place: new_start = converse(old_end),
+/// new_end = converse(old_start). Mirrors StarRocks FE
+/// `AnalyticWindow.reverse()`.
+fn reverse_window_frame(frame: &WindowFrame) -> WindowFrame {
+    WindowFrame {
+        frame_type: frame.frame_type,
+        start: converse_window_bound(&frame.end),
+        end: converse_window_bound(&frame.start),
+    }
+}
+
+/// Normalize a window frame so the BE only sees frames whose start is
+/// UNBOUNDED PRECEDING. When the original frame ends at UNBOUNDED FOLLOWING
+/// and does not start at UNBOUNDED PRECEDING, we reverse the ORDER BY
+/// direction and converse the frame bounds. For FIRST_VALUE / LAST_VALUE we
+/// also swap the function name because reversing the iteration flips which
+/// row is "first" vs "last".
+///
+/// Mirrors StarRocks FE `WindowTransformer.visit(AnalyticExpr)`.
+fn normalize_window_frame_for_be(
+    name: &str,
+    order_by: Vec<SortItem>,
+    window_frame: Option<WindowFrame>,
+) -> (String, Vec<SortItem>, Option<WindowFrame>) {
+    let Some(frame) = window_frame else {
+        return (name.to_string(), order_by, None);
+    };
+
+    let needs_reverse = matches!(frame.end, WindowBound::UnboundedFollowing)
+        && !matches!(frame.start, WindowBound::UnboundedPreceding);
+    if !needs_reverse {
+        return (name.to_string(), order_by, Some(frame));
+    }
+
+    let reversed_order_by = order_by
+        .into_iter()
+        .map(|item| SortItem {
+            expr: item.expr,
+            asc: !item.asc,
+            nulls_first: !item.nulls_first,
+        })
+        .collect();
+    let reversed_frame = reverse_window_frame(&frame);
+
+    let reversed_name = match name.to_ascii_lowercase().as_str() {
+        "first_value" => "last_value".to_string(),
+        "last_value" => "first_value".to_string(),
+        _ => name.to_string(),
+    };
+
+    (reversed_name, reversed_order_by, Some(reversed_frame))
+}
+
 /// Extract window function calls from the projection items.
 /// Returns (window_exprs, rewritten_projection_items).
 /// Each window call is replaced with a ColumnRef to its output name.
@@ -814,13 +880,35 @@ fn rewrite_window_calls(
                 format!("{}__win{}", base_name, counter)
             };
             *counter += 1;
+
+            // Normalize frames that end at UNBOUNDED FOLLOWING by reversing the
+            // ORDER BY direction and converse-ing the frame bounds, so the BE
+            // only sees frames whose start is UNBOUNDED PRECEDING. This mirrors
+            // StarRocks FE `WindowTransformer.visit(AnalyticExpr)` which reverses
+            // such frames before lowering; the BE analytor relies on this
+            // invariant (it `DCHECK`s !window_start for RANGE and assumes
+            // cumulative processing).
+            //
+            // For FIRST_VALUE / LAST_VALUE the reversal also swaps the function
+            // because reversing the iteration direction inverts which row is
+            // "first" vs "last".
+            let (
+                rewritten_name,
+                rewritten_order_by,
+                rewritten_frame,
+            ) = normalize_window_frame_for_be(
+                name,
+                order_by.clone(),
+                window_frame.clone(),
+            );
+
             window_exprs.push(WindowExpr {
-                name: name.clone(),
+                name: rewritten_name,
                 args: args.clone(),
                 distinct: *distinct,
                 partition_by: partition_by.clone(),
-                order_by: order_by.clone(),
-                window_frame: window_frame.clone(),
+                order_by: rewritten_order_by,
+                window_frame: rewritten_frame,
                 result_type: expr.data_type.clone(),
                 output_name: win_output_name.clone(),
                 ignore_nulls: *ignore_nulls,
