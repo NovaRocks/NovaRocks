@@ -219,9 +219,12 @@ fn has_literal_equality_in_side(
     literal: &TypedExpr,
 ) -> bool {
     let signature = literal_signature(literal);
-    if join_literals.iter().any(|(existing_column, existing_literal)| {
-        *existing_column == column_id && literal_signature(existing_literal) == signature
-    }) {
+    if join_literals
+        .iter()
+        .any(|(existing_column, existing_literal)| {
+            *existing_column == column_id && literal_signature(existing_literal) == signature
+        })
+    {
         return true;
     }
     literal_equalities_from_group(memo, group_id)
@@ -236,7 +239,8 @@ fn literal_signature(expr: &TypedExpr) -> String {
 }
 
 fn add_filter_group(memo: &mut Memo, child_group: GroupId, predicates: Vec<TypedExpr>) -> GroupId {
-    let predicate = combine_with_and(predicates).expect("filter group needs at least one predicate");
+    let predicate =
+        combine_with_and(predicates).expect("filter group needs at least one predicate");
     let filter_expr = MExpr {
         id: memo.next_expr_id(),
         op: Operator::LogicalFilter(LogicalFilterOp { predicate }),
@@ -352,7 +356,10 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
-                condition: Some(and(eq(col(1, "lk"), col(2, "rk")), eq(col(1, "lk"), lit(10)))),
+                condition: Some(and(
+                    eq(col(1, "lk"), col(2, "rk")),
+                    eq(col(1, "lk"), lit(10)),
+                )),
             }),
             children: vec![left, right],
         };
@@ -380,12 +387,19 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::LeftOuter,
-                condition: Some(and(eq(col(1, "lk"), col(2, "rk")), eq(col(1, "lk"), lit(10)))),
+                condition: Some(and(
+                    eq(col(1, "lk"), col(2, "rk")),
+                    eq(col(1, "lk"), lit(10)),
+                )),
             }),
             children: vec![left, right],
         };
         assert!(!InnerJoinEquivalencePredicateRule.matches(&join.op));
-        assert!(InnerJoinEquivalencePredicateRule.apply(&join, &mut memo).is_empty());
+        assert!(
+            InnerJoinEquivalencePredicateRule
+                .apply(&join, &mut memo)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -406,10 +420,17 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
-                condition: Some(and(eq(col(1, "lk"), col(2, "rk")), eq(col(1, "lk"), lit(10)))),
+                condition: Some(and(
+                    eq(col(1, "lk"), col(2, "rk")),
+                    eq(col(1, "lk"), lit(10)),
+                )),
             }),
             children: vec![left, right_filter],
         };
-        assert!(InnerJoinEquivalencePredicateRule.apply(&join, &mut memo).is_empty());
+        assert!(
+            InnerJoinEquivalencePredicateRule
+                .apply(&join, &mut memo)
+                .is_empty()
+        );
     }
 }

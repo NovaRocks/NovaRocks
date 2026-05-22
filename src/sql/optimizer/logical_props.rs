@@ -60,9 +60,10 @@ pub(crate) fn derive_for_expr(
                 inherit_from_child(memo, expr, 0, &output_ids, &mut props);
                 inherit_from_child(memo, expr, 1, &output_ids, &mut props);
                 for eq in &join.eq_conditions {
-                    if let (Some(left), Some(right)) =
-                        (column_id_from_expr(&eq.left), column_id_from_expr(&eq.right))
-                    {
+                    if let (Some(left), Some(right)) = (
+                        column_id_from_expr(&eq.left),
+                        column_id_from_expr(&eq.right),
+                    ) {
                         props.equivalence_classes.merge_pair(left, right);
                     }
                 }
@@ -417,8 +418,7 @@ mod tests {
             }),
             children: vec![left, right],
         });
-        let props =
-            derive_for_group(&memo, join, vec![output(1, "lk"), output(2, "rk")], 10.0);
+        let props = derive_for_group(&memo, join, vec![output(1, "lk"), output(2, "rk")], 10.0);
         let class = props
             .equivalence_classes
             .class_containing(ColumnId(2))
@@ -445,9 +445,18 @@ mod tests {
             }),
             children: vec![left, right],
         });
-        let props =
-            derive_for_group(&memo, join, vec![output(1, "lk"), output(2, "rk")], 10.0);
-        assert!(props.equivalence_classes.class_containing(ColumnId(1)).is_none());
-        assert!(props.equivalence_classes.class_containing(ColumnId(2)).is_none());
+        let props = derive_for_group(&memo, join, vec![output(1, "lk"), output(2, "rk")], 10.0);
+        assert!(
+            props
+                .equivalence_classes
+                .class_containing(ColumnId(1))
+                .is_none()
+        );
+        assert!(
+            props
+                .equivalence_classes
+                .class_containing(ColumnId(2))
+                .is_none()
+        );
     }
 }

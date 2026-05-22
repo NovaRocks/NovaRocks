@@ -10,7 +10,9 @@ pub(crate) struct ColumnIdSet {
 impl ColumnIdSet {
     #[allow(dead_code)]
     pub(crate) fn new() -> Self {
-        Self { columns: Vec::new() }
+        Self {
+            columns: Vec::new(),
+        }
     }
 
     #[allow(dead_code)]
@@ -257,10 +259,8 @@ mod tests {
 
     #[test]
     fn hash_partitioned_satisfies_exact_match() {
-        let provided =
-            DistributionSpec::HashPartitioned(vec![ColumnId(1), ColumnId(2)]);
-        let required =
-            DistributionSpec::HashPartitioned(vec![ColumnId(1), ColumnId(2)]);
+        let provided = DistributionSpec::HashPartitioned(vec![ColumnId(1), ColumnId(2)]);
+        let required = DistributionSpec::HashPartitioned(vec![ColumnId(1), ColumnId(2)]);
         assert!(provided.satisfies(&required));
     }
 
@@ -269,8 +269,7 @@ mod tests {
         // Child hashes on (c1, c2); a downstream operator that only needs
         // hash(c1) is satisfied because each (c1,c2) bucket is homogeneous
         // in `c1` — the StarRocks `satisfyContainAll` rule.
-        let provided =
-            DistributionSpec::HashPartitioned(vec![ColumnId(1), ColumnId(2)]);
+        let provided = DistributionSpec::HashPartitioned(vec![ColumnId(1), ColumnId(2)]);
         let required = DistributionSpec::HashPartitioned(vec![ColumnId(1)]);
         assert!(provided.satisfies(&required));
     }
@@ -279,11 +278,8 @@ mod tests {
     fn hash_partitioned_satisfies_when_required_in_any_position() {
         // Order within the hash key vector doesn't matter — what matters
         // is that the required column is part of the hash.
-        let provided = DistributionSpec::HashPartitioned(vec![
-            ColumnId(1),
-            ColumnId(2),
-            ColumnId(3),
-        ]);
+        let provided =
+            DistributionSpec::HashPartitioned(vec![ColumnId(1), ColumnId(2), ColumnId(3)]);
         let required = DistributionSpec::HashPartitioned(vec![ColumnId(2)]);
         assert!(provided.satisfies(&required));
     }
@@ -302,8 +298,7 @@ mod tests {
         // `c2` values, so an operator that needs (c1, c2)-locality is not
         // safe.
         let provided = DistributionSpec::HashPartitioned(vec![ColumnId(1)]);
-        let required =
-            DistributionSpec::HashPartitioned(vec![ColumnId(1), ColumnId(2)]);
+        let required = DistributionSpec::HashPartitioned(vec![ColumnId(1), ColumnId(2)]);
         assert!(!provided.satisfies(&required));
     }
 
@@ -334,7 +329,10 @@ mod tests {
             ColumnId(3),
             ColumnId(2),
         ]);
-        assert_eq!(set.iter().collect::<Vec<_>>(), vec![ColumnId(1), ColumnId(2), ColumnId(3)]);
+        assert_eq!(
+            set.iter().collect::<Vec<_>>(),
+            vec![ColumnId(1), ColumnId(2), ColumnId(3)]
+        );
         assert!(set.contains(ColumnId(2)));
         assert!(!set.contains(ColumnId::UNSET));
     }
@@ -355,7 +353,10 @@ mod tests {
         classes.merge_pair(ColumnId(1), ColumnId(2));
         classes.merge_pair(ColumnId(2), ColumnId(3));
         let class = classes.class_containing(ColumnId(1)).expect("class for c1");
-        assert_eq!(class.iter().collect::<Vec<_>>(), vec![ColumnId(1), ColumnId(2), ColumnId(3)]);
+        assert_eq!(
+            class.iter().collect::<Vec<_>>(),
+            vec![ColumnId(1), ColumnId(2), ColumnId(3)]
+        );
         assert_eq!(classes.classes().len(), 1);
     }
 
@@ -367,6 +368,9 @@ mod tests {
         right.merge_pair(ColumnId(2), ColumnId(4));
         left.extend_from(&right);
         let class = left.class_containing(ColumnId(4)).expect("class for c4");
-        assert_eq!(class.iter().collect::<Vec<_>>(), vec![ColumnId(1), ColumnId(2), ColumnId(4)]);
+        assert_eq!(
+            class.iter().collect::<Vec<_>>(),
+            vec![ColumnId(1), ColumnId(2), ColumnId(4)]
+        );
     }
 }
