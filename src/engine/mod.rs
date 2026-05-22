@@ -52,6 +52,7 @@ pub(crate) mod statement;
 pub(crate) mod statistics;
 pub(crate) mod stream_load;
 pub(crate) mod view_rewrite;
+pub(crate) mod virtual_table;
 
 pub(crate) use self::name_resolve::ResolvedLocalTableName;
 
@@ -203,6 +204,11 @@ pub(crate) struct StandaloneState {
     /// derived tables on `FROM <view>` references.
     pub(crate) views:
         RwLock<std::collections::HashMap<(String, String), Box<sqlparser::ast::Query>>>,
+    /// information_schema virtual tables (`schemata`, ...). Rows are
+    /// materialized at query rewrite time by [`virtual_table::inject_query_refs`]
+    /// and injected into a cloned catalog snapshot, so the standard SQL
+    /// pipeline scans them as ordinary base tables.
+    pub(crate) virtual_tables: virtual_table::VirtualTableRegistry,
     #[cfg(test)]
     pub(crate) _test_guard: Option<TestSerializationGuard>,
 }
@@ -224,6 +230,7 @@ impl Default for StandaloneState {
             job_repo: JobMetaRepository,
             exchange_port: 0,
             views: RwLock::new(std::collections::HashMap::new()),
+            virtual_tables: virtual_table::VirtualTableRegistry::with_defaults(),
             #[cfg(test)]
             _test_guard: None,
         }
@@ -776,6 +783,12 @@ impl StandaloneSession {
                     &self.inner.views,
                     current_database,
                 );
+                // Materialize information_schema virtual tables (e.g. `schemata`)
+                // into VALUES-backed derived tables. Run after view expansion
+                // (a view may project from a virtual table) and before iceberg
+                // registration / 3-part stripping so those passes never see
+                // the synthetic references.
+                self::virtual_table::rewrite_query(&self.inner, view_expanded.as_mut())?;
                 let query = &view_expanded;
 
                 // Time-travel: `SELECT ... FROM t FOR VERSION AS OF <v>`.

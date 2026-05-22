@@ -6,7 +6,9 @@ use arrow::record_batch::RecordBatch;
 use sqlparser::ast as sqlast;
 
 use crate::connector::starrocks::managed::model::{ManagedTableKind, ManagedTableState};
+use crate::engine::virtual_table::{INFORMATION_SCHEMA_DB, VirtualTableProvider};
 use crate::engine::{QueryResult, QueryResultColumn, StandaloneState, StatementResult};
+use crate::sql::catalog::ColumnDef;
 
 #[derive(Clone, Debug)]
 struct MaterializedViewInfoRow {
@@ -425,6 +427,87 @@ fn object_name_parts(name: &sqlast::ObjectName) -> Vec<String> {
 
 fn normalize_column_name(name: &str) -> String {
     name.trim_matches('`').to_ascii_lowercase()
+}
+
+// ---------------------------------------------------------------------------
+// information_schema.schemata virtual table
+// ---------------------------------------------------------------------------
+
+/// Column layout for `information_schema.schemata` (MySQL / StarRocks-aligned:
+/// 5 columns — catalog_name, schema_name, default_character_set_name,
+/// default_collation_name, sql_path).
+const SCHEMATA_COLUMNS: &[(&str, bool)] = &[
+    ("catalog_name", false),
+    ("schema_name", false),
+    ("default_character_set_name", false),
+    ("default_collation_name", false),
+    ("sql_path", true),
+];
+
+pub(crate) struct SchemataProvider;
+
+impl VirtualTableProvider for SchemataProvider {
+    fn database(&self) -> &str {
+        INFORMATION_SCHEMA_DB
+    }
+
+    fn table(&self) -> &str {
+        "schemata"
+    }
+
+    fn columns(&self) -> Vec<ColumnDef> {
+        SCHEMATA_COLUMNS
+            .iter()
+            .map(|(name, nullable)| ColumnDef {
+                name: (*name).to_string(),
+                data_type: DataType::Utf8,
+                nullable: *nullable,
+                write_default: None,
+                logical_type: None,
+            })
+            .collect()
+    }
+
+    fn scan(&self, state: &StandaloneState) -> Result<Vec<RecordBatch>, String> {
+        // Mirror StarRocks: list databases visible under default_catalog
+        // (the local in-memory catalog includes managed-lake databases
+        // that CREATE DATABASE registers via the managed connector backend,
+        // so a single enumeration covers both the synthetic info_schema
+        // entry and every user-created namespace).
+        let catalog = state.catalog.read().expect("standalone catalog read lock");
+        let mut databases: Vec<String> = catalog.database_names().map(str::to_string).collect();
+        drop(catalog);
+        databases.sort();
+        databases.dedup();
+
+        let row_count = databases.len();
+        let catalog_name = StringArray::from(vec!["default_catalog"; row_count]);
+        let schema_name = StringArray::from_iter_values(databases.iter().map(String::as_str));
+        let default_charset = StringArray::from(vec!["utf8"; row_count]);
+        let default_collation = StringArray::from(vec!["utf8_general_ci"; row_count]);
+        let sql_path: StringArray = std::iter::repeat::<Option<&str>>(None).take(row_count).collect();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("catalog_name", DataType::Utf8, false),
+            Field::new("schema_name", DataType::Utf8, false),
+            Field::new("default_character_set_name", DataType::Utf8, false),
+            Field::new("default_collation_name", DataType::Utf8, false),
+            Field::new("sql_path", DataType::Utf8, true),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(catalog_name) as ArrayRef,
+                Arc::new(schema_name) as ArrayRef,
+                Arc::new(default_charset) as ArrayRef,
+                Arc::new(default_collation) as ArrayRef,
+                Arc::new(sql_path) as ArrayRef,
+            ],
+        )
+        .map_err(|e| format!("build information_schema.schemata batch failed: {e}"))?;
+        Ok(vec![batch])
+    }
 }
 
 #[cfg(test)]

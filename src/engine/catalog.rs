@@ -72,6 +72,10 @@ impl InMemoryCatalog {
         Ok(self.databases.contains_key(&key))
     }
 
+    pub(crate) fn database_names(&self) -> impl Iterator<Item = &str> {
+        self.databases.keys().map(String::as_str)
+    }
+
     pub(crate) fn register(&mut self, database_name: &str, table: TableDef) -> Result<(), String> {
         let db_key = normalize_identifier(database_name)?;
         let db = self

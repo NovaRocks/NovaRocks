@@ -20,20 +20,44 @@ pub(crate) struct TargetBackend {
     pub(crate) table: String,
 }
 
+const DEFAULT_CATALOG_SENTINEL: &str = "default_catalog";
+
+/// StarRocks-compat shorthand: `default_catalog.<db>.<tbl>` is a fully-qualified
+/// reference to the local (standalone) catalog. Strip the prefix and surface a
+/// 2-part name so the downstream resolver routes through the local catalog
+/// path instead of being treated as an iceberg table reference.
+fn strip_default_catalog(name: &ObjectName) -> Option<ObjectName> {
+    if name.parts.len() == 3 && name.parts[0].eq_ignore_ascii_case(DEFAULT_CATALOG_SENTINEL) {
+        Some(ObjectName {
+            parts: name.parts[1..].to_vec(),
+        })
+    } else {
+        None
+    }
+}
+
 pub(crate) fn resolve_table_target(
     state: &Arc<StandaloneState>,
     name: &ObjectName,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<TargetBackend, String> {
-    if current_catalog.is_none() && name.parts.len() <= 2 {
-        let resolved = resolve_local_table_name(name, current_database)?;
+    let stripped = strip_default_catalog(name);
+    let effective_name = stripped.as_ref().unwrap_or(name);
+    let effective_catalog = if stripped.is_some() {
+        None
+    } else {
+        current_catalog
+    };
+
+    if effective_catalog.is_none() && effective_name.parts.len() <= 2 {
+        let resolved = resolve_local_table_name(effective_name, current_database)?;
         let managed_exists = state
             .managed_lake
             .read()
             .expect("standalone managed lake read lock")
             .contains_table(&resolved.database, &resolved.table)?;
-        if managed_exists || state.managed_lake_config.is_some() {
+        if managed_exists || state.managed_lake_config.is_some() || stripped.is_some() {
             return Ok(TargetBackend {
                 backend_name: "managed",
                 catalog: String::new(),
@@ -43,7 +67,8 @@ pub(crate) fn resolve_table_target(
         }
     }
 
-    let resolved = resolve_iceberg_table_name(name.clone(), current_catalog, current_database)?;
+    let resolved =
+        resolve_iceberg_table_name(effective_name.clone(), effective_catalog, current_database)?;
     Ok(TargetBackend {
         backend_name: "iceberg",
         catalog: resolved.catalog,
@@ -58,14 +83,22 @@ pub(crate) fn resolve_existing_table_target(
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<TargetBackend, String> {
-    if current_catalog.is_none() && name.parts.len() <= 2 {
-        let resolved = resolve_local_table_name(name, current_database)?;
+    let stripped = strip_default_catalog(name);
+    let effective_name = stripped.as_ref().unwrap_or(name);
+    let effective_catalog = if stripped.is_some() {
+        None
+    } else {
+        current_catalog
+    };
+
+    if effective_catalog.is_none() && effective_name.parts.len() <= 2 {
+        let resolved = resolve_local_table_name(effective_name, current_database)?;
         let managed_exists = state
             .managed_lake
             .read()
             .expect("standalone managed lake read lock")
             .contains_table(&resolved.database, &resolved.table)?;
-        if managed_exists {
+        if managed_exists || stripped.is_some() {
             return Ok(TargetBackend {
                 backend_name: "managed",
                 catalog: String::new(),
@@ -75,7 +108,8 @@ pub(crate) fn resolve_existing_table_target(
         }
     }
 
-    let resolved = resolve_iceberg_table_name(name.clone(), current_catalog, current_database)?;
+    let resolved =
+        resolve_iceberg_table_name(effective_name.clone(), effective_catalog, current_database)?;
     Ok(TargetBackend {
         backend_name: "iceberg",
         catalog: resolved.catalog,
