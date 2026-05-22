@@ -59,6 +59,7 @@ pub(super) enum AggKind {
     StddevSamp,
     AnyValue,
     BoolOr,
+    BoolAnd,
     CovarPop,
     CovarSamp,
     Corr,
@@ -113,6 +114,7 @@ mod approx_top_k;
 mod array_agg;
 mod avg;
 mod bitmap_union_int;
+mod bool_and;
 mod bool_or;
 pub(crate) mod common;
 mod corr_covar;
@@ -146,6 +148,7 @@ use approx_top_k::ApproxTopKAgg;
 use array_agg::ArrayAggAgg;
 use avg::AvgAgg;
 use bitmap_union_int::BitmapUnionIntAgg;
+use bool_and::BoolAndAgg;
 use bool_or::BoolOrAgg;
 use corr_covar::CovarCorrAgg;
 use count::CountAgg;
@@ -235,6 +238,7 @@ static ARRAY_AGG: ArrayAggAgg = ArrayAggAgg;
 static VAR_STD: VarStdAgg = VarStdAgg;
 static ANY_VALUE: AnyValueAgg = AnyValueAgg;
 static BOOL_OR: BoolOrAgg = BoolOrAgg;
+static BOOL_AND: BoolAndAgg = BoolAndAgg;
 static COVAR_CORR: CovarCorrAgg = CovarCorrAgg;
 static MAX_MIN_BY: MaxMinByAgg = MaxMinByAgg;
 static MULTI_DISTINCT_SUM: MultiDistinctSumAgg = MultiDistinctSumAgg;
@@ -273,6 +277,7 @@ fn resolve_by_func(func: &AggFunction) -> Result<&'static dyn AggregateFunction,
         "percentile_union" | "percentile_approx" | "percentile_approx_weighted" => Ok(&PERCENTILE),
         "percentile_disc" | "percentile_cont" | "percentile_disc_lc" => Ok(&PERCENTILE_PLACEHOLDER),
         "bool_or" | "boolor_agg" => Ok(&BOOL_OR),
+        "bool_and" | "booland_agg" => Ok(&BOOL_AND),
         "covar_pop" | "covar_samp" | "corr" => Ok(&COVAR_CORR),
         "max_by" | "min_by" | "max_by_v2" | "min_by_v2" => Ok(&MAX_MIN_BY),
         "multi_distinct_sum" => Ok(&MULTI_DISTINCT_SUM),
@@ -342,6 +347,7 @@ fn resolve_by_kind(kind: &AggKind) -> &'static dyn AggregateFunction {
         }
         AggKind::AnyValue => &ANY_VALUE,
         AggKind::BoolOr => &BOOL_OR,
+        AggKind::BoolAnd => &BOOL_AND,
         AggKind::CovarPop | AggKind::CovarSamp | AggKind::Corr => &COVAR_CORR,
         AggKind::MaxBy | AggKind::MinBy | AggKind::MaxByV2 | AggKind::MinByV2 => &MAX_MIN_BY,
         AggKind::MultiDistinctSum => &MULTI_DISTINCT_SUM,
