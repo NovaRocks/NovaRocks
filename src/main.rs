@@ -25,21 +25,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use arrow::util::pretty::pretty_format_batches;
 use novarocks::common::network;
-use novarocks::engine::{StandaloneNovaRocks, StandaloneOptions};
 use novarocks::novarocks_config;
 use novarocks::novarocks_logging;
 use novarocks::server::{StandaloneServerOptions, StandaloneTableConfig, run_standalone_server};
 use std::eprintln;
-
-#[derive(Debug, PartialEq, Eq)]
-struct StandaloneCliArgs {
-    table_name: String,
-    parquet_path: String,
-    sql: String,
-    config_path: Option<String>,
-}
 
 #[derive(Debug, PartialEq, Eq)]
 struct StandaloneServerCliArgs {
@@ -50,24 +40,13 @@ struct StandaloneServerCliArgs {
 
 fn print_main_usage() {
     eprintln!(
-        "Usage: novarocks [run|start|stop|restart|standalone|standalone-server] [--config <path>]"
+        "Usage: novarocks [run|start|stop|restart|standalone-server] [--config <path>]"
     );
     eprintln!("  run       - Run in foreground (default)");
     eprintln!("  start     - Run in background as daemon");
     eprintln!("  stop      - Stop running daemon");
     eprintln!("  restart   - Restart daemon");
-    eprintln!("  standalone  - Execute one local standalone query against a parquet file");
     eprintln!("  standalone-server - Run a local MySQL-compatible standalone server");
-}
-
-fn print_standalone_usage() {
-    eprintln!(
-        "Usage: novarocks standalone --table <name> --path <parquet> --sql <query> [--config <path>]"
-    );
-    eprintln!("Example:");
-    eprintln!(
-        "  novarocks standalone --table tbl --path ./tbl.parquet --sql \"select * from tbl\""
-    );
 }
 
 fn print_standalone_server_usage() {
@@ -76,67 +55,6 @@ fn print_standalone_server_usage() {
     );
     eprintln!("Example:");
     eprintln!("  novarocks standalone-server --port 9030 --table tbl=/abs/path/tbl.parquet");
-}
-
-fn parse_standalone_args(args: &[String]) -> Result<Option<StandaloneCliArgs>, String> {
-    let mut idx = 0usize;
-    let mut table_name: Option<String> = None;
-    let mut parquet_path: Option<String> = None;
-    let mut sql: Option<String> = None;
-    let mut config_path: Option<String> = None;
-
-    while let Some(arg) = args.get(idx) {
-        match arg.as_str() {
-            "--table" => {
-                idx += 1;
-                table_name = args.get(idx).cloned();
-                if table_name.is_none() {
-                    return Err("missing value for --table".to_string());
-                }
-                idx += 1;
-            }
-            "--path" => {
-                idx += 1;
-                parquet_path = args.get(idx).cloned();
-                if parquet_path.is_none() {
-                    return Err("missing value for --path".to_string());
-                }
-                idx += 1;
-            }
-            "--sql" => {
-                idx += 1;
-                sql = args.get(idx).cloned();
-                if sql.is_none() {
-                    return Err("missing value for --sql".to_string());
-                }
-                idx += 1;
-            }
-            "--config" | "-c" => {
-                idx += 1;
-                config_path = args.get(idx).cloned();
-                if config_path.is_none() {
-                    return Err("missing value for --config/-c".to_string());
-                }
-                idx += 1;
-            }
-            "--help" | "-h" => return Ok(None),
-            other => {
-                return Err(format!(
-                    "unknown standalone arg: {other} (try `novarocks standalone --help`)"
-                ));
-            }
-        }
-    }
-
-    let table_name = table_name.ok_or_else(|| "missing required arg --table".to_string())?;
-    let parquet_path = parquet_path.ok_or_else(|| "missing required arg --path".to_string())?;
-    let sql = sql.ok_or_else(|| "missing required arg --sql".to_string())?;
-    Ok(Some(StandaloneCliArgs {
-        table_name,
-        parquet_path,
-        sql,
-        config_path,
-    }))
 }
 
 fn parse_standalone_server_table(raw: &str) -> Result<StandaloneTableConfig, String> {
@@ -207,29 +125,6 @@ fn parse_standalone_server_args(
         tables,
         config_path,
     }))
-}
-
-fn run_standalone(cli: StandaloneCliArgs) -> Result<(), String> {
-    let engine = StandaloneNovaRocks::open(StandaloneOptions {
-        config_path: cli.config_path.map(Into::into),
-    })?;
-    engine.register_parquet_table(&cli.table_name, &cli.parquet_path)?;
-    let session = engine.session();
-    let result = session.query(&cli.sql)?;
-    let batches = result
-        .chunks
-        .iter()
-        .map(|chunk| chunk.batch.clone())
-        .collect::<Vec<_>>();
-    if batches.is_empty() {
-        println!("(0 rows)");
-        return Ok(());
-    }
-    let rendered =
-        pretty_format_batches(&batches).map_err(|e| format!("render query result failed: {e}"))?;
-    println!("{rendered}");
-    println!("rows: {}", result.row_count());
-    Ok(())
 }
 
 fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> Result<(), String> {
@@ -447,27 +342,6 @@ fn main() {
     } else {
         "run"
     };
-
-    if mode == "standalone" {
-        match parse_standalone_args(&args[idx..]) {
-            Ok(Some(cli)) => {
-                if let Err(err) = run_standalone(cli) {
-                    eprintln!("{err}");
-                    process::exit(1);
-                }
-                return;
-            }
-            Ok(None) => {
-                print_standalone_usage();
-                process::exit(0);
-            }
-            Err(err) => {
-                eprintln!("{err}");
-                print_standalone_usage();
-                process::exit(1);
-            }
-        }
-    }
 
     if mode == "standalone-server" {
         match parse_standalone_server_args(&args[idx..]) {
@@ -882,68 +756,8 @@ fn main() {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{
-        StandaloneCliArgs, StandaloneServerCliArgs, parse_standalone_args,
-        parse_standalone_server_args,
-    };
+    use super::{StandaloneServerCliArgs, parse_standalone_server_args};
     use novarocks::server::StandaloneTableConfig;
-
-    #[test]
-    fn parse_standalone_args_accepts_required_shape() {
-        let args = vec![
-            "--table".to_string(),
-            "tbl".to_string(),
-            "--path".to_string(),
-            "/tmp/tbl.parquet".to_string(),
-            "--sql".to_string(),
-            "select * from tbl".to_string(),
-        ];
-        let parsed = parse_standalone_args(&args)
-            .expect("parse standalone args")
-            .expect("standalone args");
-        assert_eq!(parsed.table_name, "tbl");
-        assert_eq!(parsed.parquet_path, "/tmp/tbl.parquet");
-        assert_eq!(parsed.sql, "select * from tbl");
-        assert_eq!(parsed.config_path, None);
-    }
-
-    #[test]
-    fn parse_standalone_args_accepts_config() {
-        let args = vec![
-            "--table".to_string(),
-            "tbl".to_string(),
-            "--path".to_string(),
-            "/tmp/tbl.parquet".to_string(),
-            "--sql".to_string(),
-            "select * from tbl".to_string(),
-            "--config".to_string(),
-            "/tmp/novarocks.toml".to_string(),
-        ];
-        let parsed = parse_standalone_args(&args)
-            .expect("parse standalone args")
-            .expect("standalone args");
-        assert_eq!(
-            parsed,
-            StandaloneCliArgs {
-                table_name: "tbl".to_string(),
-                parquet_path: "/tmp/tbl.parquet".to_string(),
-                sql: "select * from tbl".to_string(),
-                config_path: Some("/tmp/novarocks.toml".to_string()),
-            }
-        );
-    }
-
-    #[test]
-    fn parse_standalone_args_rejects_missing_sql() {
-        let args = vec![
-            "--table".to_string(),
-            "tbl".to_string(),
-            "--path".to_string(),
-            "/tmp/tbl.parquet".to_string(),
-        ];
-        let err = parse_standalone_args(&args).expect_err("missing sql");
-        assert!(err.contains("missing required arg --sql"));
-    }
 
     #[test]
     fn parse_standalone_server_args_accepts_tables_and_port() {

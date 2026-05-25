@@ -59,9 +59,8 @@ StarRocks FE
 ### 2.2 Standalone SQL Engine Mode
 
 ```text
-SQL client / SQL test runner / one-shot CLI
-  |- MySQL protocol -----------> Rust: src/server/mod.rs
-  `- CLI standalone -----------> Rust: src/main.rs
+SQL client / SQL test runner
+  `- MySQL protocol -----------> Rust: src/server/mod.rs
                                       |
                                       v
                             Standalone Engine: src/engine/**
@@ -112,7 +111,7 @@ SQL client / SQL test runner / one-shot CLI
 
 - `src/main.rs`
   Process entry. Dispatches FE-compatible modes (`run`, `start`, `stop`,
-  `restart`) and standalone modes (`standalone`, `standalone-server`).
+  `restart`) and the `standalone-server` mode.
 
 - `src/server/mod.rs`
   MySQL-compatible standalone server, session context, SQL batch splitting,
@@ -307,7 +306,7 @@ SQL client / SQL test runner / one-shot CLI
 ### 5.2 Standalone SQL Path
 
 1. A MySQL client or SQL test runner connects to `standalone-server`
-   (`src/server/mod.rs`), or the one-shot CLI calls `novarocks standalone`.
+   (`src/server/mod.rs`).
 2. The standalone server resolves session state (`USE`, `SET catalog`,
    timeouts, current database) and forwards supported statements to
    `StandaloneSession::execute_in_context`.
