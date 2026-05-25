@@ -135,6 +135,13 @@ pub(crate) fn create_mv(
     )?;
     let dependency_target =
         crate::engine::mv::dependency::managed_mv_dependency_ref(&db_name, &mv_name);
+    // Defensive: this check runs after the managed-lake "already exists" guard
+    // above, so user-facing CREATE statements can't reach it (a brand-new MV
+    // target has no inbound edges, while an existing target fails on existence
+    // first). Kept as a safety net for future paths that bypass the existence
+    // check — e.g. ALTER MATERIALIZED VIEW rewriting a SELECT, or racy
+    // metadata writes. Algorithm coverage lives in
+    // src/engine/mv/dependency.rs::tests.
     crate::engine::mv::dependency::validate_no_create_cycle(
         state,
         &dependency_target,

@@ -109,6 +109,13 @@ pub(crate) fn create_iceberg_mv(
         &target.namespace,
         &target.table,
     );
+    // Defensive: this check runs after the `iceberg_mv_target_exists` guard
+    // above, so user-facing CREATE statements can't reach it (a brand-new MV
+    // target has no inbound edges, while an already-existing target fails on
+    // existence first). Kept as a safety net for future paths that bypass the
+    // existence check — e.g. ALTER MATERIALIZED VIEW rewriting a SELECT, or
+    // racy metadata writes. Algorithm coverage lives in
+    // src/engine/mv/dependency.rs::tests.
     crate::engine::mv::dependency::validate_no_create_cycle(
         state,
         &dependency_target,
