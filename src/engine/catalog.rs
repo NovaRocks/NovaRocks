@@ -1,16 +1,12 @@
 //! In-memory database/table catalog and shared catalog utilities.
 //!
 //! Holds the logical `InMemoryCatalog` (databases -> tables + physical
-//! layouts), the `normalize_identifier` helper used across the SQL and
-//! engine layers, and `build_parquet_table` for registering external
-//! parquet files. Everything here is backend-agnostic — the managed-lake
-//! and iceberg subsystems both query this catalog for table metadata.
+//! layouts) and the `normalize_identifier` helper used across the SQL
+//! and engine layers. Everything here is backend-agnostic — the
+//! managed-lake and iceberg subsystems both query this catalog for
+//! table metadata.
 
 use std::collections::HashMap;
-use std::fs::File;
-use std::path::Path;
-
-use ::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 // Re-export from sql::catalog so callers can use either
 // `crate::engine::catalog::*` or `crate::sql::catalog::*`
@@ -308,36 +304,6 @@ pub(crate) fn normalize_identifier(raw: &str) -> Result<String, String> {
         return Err(format!("unsupported identifier `{trimmed}`"));
     }
     Ok(trimmed.to_ascii_lowercase())
-}
-
-pub(crate) fn build_parquet_table(
-    table_name: &str,
-    path: impl AsRef<Path>,
-) -> Result<TableDef, String> {
-    let normalized_name = normalize_identifier(table_name)?;
-    let path = std::fs::canonicalize(path.as_ref())
-        .map_err(|e| format!("canonicalize parquet path failed: {e}"))?;
-    let file = File::open(&path).map_err(|e| format!("open parquet file failed: {e}"))?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-        .map_err(|e| format!("open parquet metadata failed: {e}"))?;
-    let schema = builder.schema();
-    let mut columns = Vec::with_capacity(schema.fields().len());
-    for field in schema.fields() {
-        columns.push(ColumnDef {
-            name: field.name().clone(),
-            data_type: field.data_type().clone(),
-            nullable: field.is_nullable(),
-            write_default: None,
-            logical_type: None,
-        });
-    }
-    Ok(TableDef {
-        name: normalized_name,
-        columns,
-        iceberg_row_lineage_metadata_columns: vec![],
-        iceberg_table: None,
-        storage: TableStorage::LocalParquetFile { path },
-    })
 }
 
 #[cfg(test)]

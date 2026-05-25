@@ -15,7 +15,7 @@ use crate::novarocks_config;
 use crate::plan_nodes::TFileFormatType;
 use crate::runtime::global_async_runtime::data_block_on;
 
-use self::catalog::{DEFAULT_DATABASE, InMemoryCatalog, build_parquet_table, normalize_identifier};
+use self::catalog::{DEFAULT_DATABASE, InMemoryCatalog, normalize_identifier};
 use crate::connector::{
     IcebergCatalogRegistry, ManagedLakeCatalog, ManagedLakeConfig, create_iceberg_namespace,
     iceberg_namespace_exists, register_existing_iceberg_table, register_managed_tables_in_catalog,
@@ -392,47 +392,6 @@ impl StandaloneNovaRocks {
             visible_version,
             tablets,
         })
-    }
-
-    pub fn register_parquet_table(
-        &self,
-        table_name: &str,
-        path: impl AsRef<Path>,
-    ) -> Result<(), String> {
-        self.register_parquet_table_in_database(DEFAULT_DATABASE, table_name, path)
-    }
-
-    pub fn register_parquet_table_in_database(
-        &self,
-        database_name: &str,
-        table_name: &str,
-        path: impl AsRef<Path>,
-    ) -> Result<(), String> {
-        let table = build_parquet_table(table_name, path)?;
-        match &table.storage {
-            TableStorage::LocalParquetFile { .. } => {}
-            TableStorage::S3ParquetFiles { .. } => {
-                return Err("register_parquet_table_in_database does not support S3".to_string());
-            }
-            TableStorage::IcebergMetadataTable { .. } => {
-                return Err(
-                    "register_parquet_table_in_database does not support iceberg metadata tables"
-                        .to_string(),
-                );
-            }
-            TableStorage::IcebergDeltaTable { .. } => {
-                return Err(
-                    "register_parquet_table_in_database does not support IVM iceberg delta tables"
-                        .to_string(),
-                );
-            }
-        }
-        let mut guard = self
-            .inner
-            .catalog
-            .write()
-            .expect("standalone catalog write lock");
-        guard.register(database_name, table)
     }
 
     pub fn database_exists(&self, database_name: &str) -> Result<bool, String> {
@@ -3403,33 +3362,9 @@ mod tests {
         Array, FixedSizeBinaryArray, Int32Array, Int64Array, ListArray, StringArray,
     };
     use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::record_batch::RecordBatch;
-    use parquet::arrow::ArrowWriter;
     use std::path::PathBuf;
     use std::sync::Arc;
-    use tempfile::{NamedTempFile, TempDir};
-
-    fn write_parquet_file() -> NamedTempFile {
-        let file = NamedTempFile::new().expect("create temp file");
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("name", DataType::Utf8, true),
-        ]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int32Array::from(vec![1, 2, 3])),
-                Arc::new(StringArray::from(vec![Some("a"), Some("b"), None])),
-            ],
-        )
-        .expect("build record batch");
-        let writer_file = std::fs::File::create(file.path()).expect("open parquet output");
-        let mut writer =
-            ArrowWriter::try_new(writer_file, schema, None).expect("create parquet writer");
-        writer.write(&batch).expect("write batch");
-        writer.close().expect("close parquet writer");
-        file
-    }
+    use tempfile::TempDir;
 
     fn write_test_metadata_config(dir: &TempDir, metadata_path: &str) -> PathBuf {
         let config_path = dir.path().join("novarocks.toml");
@@ -3951,16 +3886,41 @@ enable_path_style_access = true
     }
 
     fn build_fragments_for_query(sql: &str) -> crate::sql::codegen::MultiFragmentBuildResult {
+        use crate::sql::catalog::{ColumnDef, S3FileInfo, TableDef, TableStorage};
         use crate::sql::parser::dialect::{StarRocksDialect, normalize_for_raw_parse};
 
-        let parquet = write_parquet_file();
+        // Build a synthetic `tbl(id int, name varchar)` table-def directly.
+        // The fragment builder only consults columns + storage shape; no
+        // parquet bytes are ever read on this code path.
         let mut catalog = super::InMemoryCatalog::default();
+        let table = TableDef {
+            name: "tbl".to_string(),
+            columns: vec![
+                ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                },
+                ColumnDef {
+                    name: "name".to_string(),
+                    data_type: DataType::Utf8,
+                    nullable: true,
+                    write_default: None,
+                    logical_type: None,
+                },
+            ],
+            iceberg_row_lineage_metadata_columns: vec![],
+            iceberg_table: None,
+            storage: TableStorage::S3ParquetFiles {
+                files: Vec::<S3FileInfo>::new(),
+                cloud_properties: Default::default(),
+            },
+        };
         catalog
-            .register(
-                "default",
-                super::build_parquet_table("tbl", parquet.path()).expect("build parquet table"),
-            )
-            .expect("register parquet table");
+            .register("default", table)
+            .expect("register synthetic tbl");
 
         let normalized = normalize_for_raw_parse(sql).expect("normalize sql");
         let mut parser = sqlparser::parser::Parser::new(&StarRocksDialect)
@@ -4401,144 +4361,6 @@ enable_path_style_access = true
     }
 
     #[test]
-    fn embedded_query_select_all_from_registered_parquet_table() {
-        let parquet = write_parquet_file();
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
-        engine
-            .register_parquet_table("tbl", parquet.path())
-            .expect("register table");
-
-        let session = engine.session();
-        let result = session.query("select * from tbl").expect("execute query");
-        assert_eq!(result.row_count(), 3);
-        assert_eq!(result.chunks.len(), 1);
-        let chunk = &result.chunks[0];
-        assert_eq!(chunk.schema().field(0).name(), "id");
-        assert_eq!(chunk.schema().field(1).name(), "name");
-        assert_eq!(chunk.len(), 3);
-    }
-
-    #[test]
-    fn embedded_query_projects_selected_columns() {
-        let parquet = write_parquet_file();
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
-        engine
-            .register_parquet_table("tbl", parquet.path())
-            .expect("register table");
-
-        let session = engine.session();
-        let result = session
-            .query("select name from tbl")
-            .expect("execute query");
-        assert_eq!(result.row_count(), 3);
-        assert_eq!(result.chunks.len(), 1);
-        let chunk = &result.chunks[0];
-        assert_eq!(chunk.schema().fields().len(), 1);
-        assert_eq!(chunk.schema().field(0).name(), "name");
-    }
-
-    #[test]
-    fn embedded_query_executes_with_unused_cte_definition() {
-        let parquet = write_parquet_file();
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
-        engine
-            .register_parquet_table("tbl", parquet.path())
-            .expect("register table");
-
-        let session = engine.session();
-        let result = session
-            .query("WITH unused AS (SELECT id FROM tbl) SELECT name FROM tbl ORDER BY 1")
-            .expect("execute query with unused CTE");
-        assert_eq!(result.row_count(), 3);
-    }
-
-    #[test]
-    fn embedded_query_executes_with_dead_nested_cte_definition() {
-        let parquet = write_parquet_file();
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
-        engine
-            .register_parquet_table("tbl", parquet.path())
-            .expect("register table");
-
-        let session = engine.session();
-        let result = session
-            .query(
-                "WITH unused AS ( \
-                    WITH inner_cte AS (SELECT id FROM tbl) \
-                    SELECT a.id FROM inner_cte a JOIN inner_cte b ON a.id = b.id \
-                ) \
-                SELECT name FROM tbl ORDER BY 1",
-            )
-            .expect("execute query with dead nested CTE");
-        assert_eq!(result.row_count(), 3);
-    }
-
-    #[test]
-    fn embedded_query_filters_rows_and_projects_output() {
-        let parquet = write_parquet_file();
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
-        engine
-            .register_parquet_table("tbl", parquet.path())
-            .expect("register table");
-
-        let session = engine.session();
-        let result = session
-            .query("select name from tbl where id = 2")
-            .expect("execute query");
-        assert_eq!(result.row_count(), 1);
-        let chunk = &result.chunks[0];
-        assert_eq!(chunk.schema().fields().len(), 1);
-        let names = chunk.batch.column(0);
-        let names = names
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .expect("string array");
-        assert_eq!(names.value(0), "b");
-    }
-
-    #[test]
-    fn embedded_query_counts_subquery_with_limit_offset_without_order_by() {
-        let parquet = write_parquet_file();
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
-        engine
-            .register_parquet_table("tbl", parquet.path())
-            .expect("register table");
-
-        let session = engine.session();
-        let result = session
-            .query("SELECT count(*) FROM (SELECT * FROM tbl LIMIT 1, 1) x")
-            .expect("execute limit offset query");
-        assert_eq!(result.row_count(), 1);
-        let counts = result.chunks[0]
-            .batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("count array");
-        assert_eq!(counts.value(0), 1);
-    }
-
-    #[test]
-    fn embedded_query_executes_single_use_cte_through_cascades() {
-        let parquet = write_parquet_file();
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
-        engine
-            .register_parquet_table("tbl", parquet.path())
-            .expect("register table");
-
-        let session = engine.session();
-        let result = session
-            .query(
-                "WITH t AS (SELECT id, name FROM tbl WHERE id >= 2) SELECT name FROM t ORDER BY 1",
-            )
-            .expect("execute query");
-
-        assert_eq!(result.row_count(), 2);
-        let chunk = &result.chunks[0];
-        assert_eq!(chunk.schema().field(0).name(), "name");
-    }
-
-    #[test]
     fn embedded_query_executes_inline_values_cte_without_catalog_table() {
         let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
 
@@ -4561,86 +4383,6 @@ enable_path_style_access = true
     }
 
     #[test]
-    fn embedded_query_executes_multi_use_cte_through_multicast_reuse() {
-        let parquet = write_parquet_file();
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
-        engine
-            .register_parquet_table("tbl", parquet.path())
-            .expect("register table");
-
-        let session = engine.session();
-        let result = session
-            .query(
-                "WITH t AS (SELECT id FROM tbl) \
-                    SELECT a.id FROM t a JOIN t b ON a.id = b.id ORDER BY 1",
-            )
-            .expect("execute query");
-
-        assert_eq!(result.row_count(), 3);
-        let chunk = &result.chunks[0];
-        assert_eq!(chunk.schema().field(0).name(), "id");
-    }
-
-    #[test]
-    fn embedded_query_explain_for_multi_use_cte_shows_physical_cte_nodes() {
-        let parquet = write_parquet_file();
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
-        engine
-            .register_parquet_table("tbl", parquet.path())
-            .expect("register table");
-
-        let session = engine.session();
-        let explain = session
-            .query("EXPLAIN WITH t AS (SELECT id FROM tbl) SELECT a.id FROM t a JOIN t b ON a.id = b.id")
-            .expect("execute explain");
-
-        assert!(explain.row_count() > 0);
-        let text = explain
-            .chunks
-            .iter()
-            .flat_map(|chunk| {
-                let col = chunk.batch.column(0);
-                let arr = col
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .expect("string array");
-                (0..arr.len())
-                    .map(|idx| arr.value(idx).to_string())
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert!(text.contains("CTE ANCHOR"), "text={text}");
-        assert!(text.contains("CTE PRODUCE"), "text={text}");
-        assert!(text.contains("CTE CONSUME"), "text={text}");
-    }
-
-    #[test]
-    fn embedded_query_executes_nested_multi_use_cte_through_multicast_reuse() {
-        let parquet = write_parquet_file();
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
-        engine
-            .register_parquet_table("tbl", parquet.path())
-            .expect("register table");
-
-        let session = engine.session();
-        let result = session
-            .query(
-                "WITH outer_cte AS ( \
-                    WITH inner_cte AS (SELECT id FROM tbl) \
-                    SELECT a.id FROM inner_cte a JOIN inner_cte b ON a.id = b.id \
-                ) \
-                SELECT x.id FROM outer_cte x JOIN outer_cte y ON x.id = y.id ORDER BY 1",
-            )
-            .expect("execute query");
-
-        assert_eq!(result.row_count(), 3);
-        let chunk = &result.chunks[0];
-        assert_eq!(chunk.schema().field(0).name(), "id");
-    }
-
-    #[test]
     fn embedded_query_builder_splits_non_cte_join_into_multiple_fragments() {
         let build = build_fragments_for_query(
             "SELECT a.id FROM tbl a JOIN tbl b ON a.id = b.id ORDER BY 1",
@@ -4657,59 +4399,6 @@ enable_path_style_access = true
                 crate::sql::codegen::FragmentEdgeKind::Stream
             )
         }));
-    }
-
-    #[test]
-    fn embedded_query_explain_for_non_cte_join_shows_physical_exchange() {
-        let parquet = write_parquet_file();
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
-        engine
-            .register_parquet_table("tbl", parquet.path())
-            .expect("register table");
-
-        let session = engine.session();
-        let explain = session
-            .query("EXPLAIN SELECT a.id FROM tbl a JOIN tbl b ON a.id = b.id ORDER BY 1")
-            .expect("execute explain");
-
-        let text = explain
-            .chunks
-            .iter()
-            .flat_map(|chunk| {
-                let col = chunk.batch.column(0);
-                let arr = col
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .expect("string array");
-                (0..arr.len())
-                    .map(|idx| arr.value(idx).to_string())
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert!(
-            text.contains("GATHER EXCHANGE") || text.contains("HASH EXCHANGE"),
-            "text={text}"
-        );
-    }
-
-    #[test]
-    fn embedded_query_executes_non_cte_join_through_stream_exchange() {
-        let parquet = write_parquet_file();
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
-        engine
-            .register_parquet_table("tbl", parquet.path())
-            .expect("register table");
-
-        let session = engine.session();
-        let result = session
-            .query("SELECT a.id FROM tbl a JOIN tbl b ON a.id = b.id ORDER BY 1")
-            .expect("execute query");
-
-        assert_eq!(result.row_count(), 3);
-        let chunk = &result.chunks[0];
-        assert_eq!(chunk.schema().field(0).name(), "id");
     }
 
     #[test]
@@ -4730,34 +4419,6 @@ enable_path_style_access = true
     }
 
     #[test]
-    fn embedded_query_cte_union_with_four_way_self_join() {
-        let parquet = write_parquet_file();
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
-        engine
-            .register_parquet_table("tbl", parquet.path())
-            .expect("register table");
-
-        let session = engine.session();
-        // Simulates TPC-DS q11 pattern: CTE with UNION ALL, 4-way self-join
-        let result = session.query(
-            "WITH year_total AS ( \
-                SELECT id, name FROM tbl \
-                UNION ALL \
-                SELECT id, name FROM tbl \
-            ) \
-            SELECT a.id \
-            FROM year_total a, year_total b, year_total c, year_total d \
-            WHERE a.id = b.id AND b.id = c.id AND c.id = d.id \
-            ORDER BY 1 \
-            LIMIT 10",
-        );
-        match &result {
-            Ok(r) => assert!(r.row_count() > 0),
-            Err(e) => panic!("q11 pattern failed: {e}"),
-        }
-    }
-
-    #[test]
     fn embedded_query_rejects_unknown_table() {
         let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
         let session = engine.session();
@@ -4765,57 +4426,6 @@ enable_path_style_access = true
             .query("select * from missing")
             .expect_err("missing table");
         assert!(err.contains("unknown table"));
-    }
-
-    #[test]
-    fn register_parquet_table_normalizes_identifier() {
-        let parquet = write_parquet_file();
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
-        engine
-            .register_parquet_table("TBL", parquet.path())
-            .expect("register table");
-        let session = engine.session();
-        let result = session.query("SELECT * FROM tbl;").expect("execute query");
-        assert_eq!(result.row_count(), 3);
-    }
-
-    #[test]
-    fn embedded_session_supports_create_database_create_table_and_drop_table() {
-        let parquet = write_parquet_file();
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
-        let session = engine.session();
-
-        let create_db = session
-            .execute_in_database("create database analytics", "default")
-            .expect("create database");
-        assert!(matches!(create_db, StatementResult::Ok));
-        assert!(
-            engine
-                .database_exists("analytics")
-                .expect("check database exists")
-        );
-
-        engine
-            .register_parquet_table_in_database("analytics", "tbl", parquet.path())
-            .expect("register parquet table in analytics");
-
-        let query_result = session
-            .execute_in_database("select name from tbl where id = 2", "analytics")
-            .expect("query table");
-        let StatementResult::Query(query_result) = query_result else {
-            panic!("expected query result");
-        };
-        assert_eq!(query_result.row_count(), 1);
-
-        let drop_table = session
-            .execute_in_database("drop table tbl", "analytics")
-            .expect("drop table");
-        assert!(matches!(drop_table, StatementResult::Ok));
-
-        let err = session
-            .execute_in_database("select * from tbl", "analytics")
-            .expect_err("dropped table must be missing");
-        assert!(err.contains("unknown table"), "err={err}");
     }
 
     #[test]
@@ -5076,33 +4686,6 @@ enable_path_style_access = true
             .expect("int32 array");
         assert_eq!(c1.value(0), 1);
         assert_eq!(c1.value(1), 2);
-    }
-
-    #[test]
-    fn embedded_session_does_not_restore_external_preloaded_parquet_tables() {
-        let parquet = write_parquet_file();
-        let metadata_dir = TempDir::new().expect("create metadata dir");
-        let config_path = write_test_metadata_config(&metadata_dir, "standalone.sqlite");
-
-        {
-            let engine = StandaloneNovaRocks::open(StandaloneOptions {
-                config_path: Some(config_path.clone()),
-            })
-            .expect("open engine");
-            engine
-                .register_parquet_table("ext_tbl", parquet.path())
-                .expect("register external parquet");
-        }
-
-        let reopened = StandaloneNovaRocks::open(StandaloneOptions {
-            config_path: Some(config_path),
-        })
-        .expect("reopen engine");
-        let err = reopened
-            .session()
-            .query("select * from ext_tbl")
-            .expect_err("external preload must not be restored");
-        assert!(err.contains("unknown table"), "err={err}");
     }
 
     #[test]
