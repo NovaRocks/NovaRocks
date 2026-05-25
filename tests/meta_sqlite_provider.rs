@@ -338,7 +338,10 @@ fn sqlite_provider_rejects_nonempty_store_missing_format_marker() -> TestResult 
         err.kind(),
         novarocks::meta::MetaErrorKind::ProviderCorruption
     );
-    assert!(err.to_string().contains("missing store_format marker"), "{err}");
+    assert!(
+        err.to_string().contains("missing store_format marker"),
+        "{err}"
+    );
     Ok(())
 }
 

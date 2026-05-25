@@ -8585,8 +8585,11 @@ mod tests {
             .expect("scan refreshes")
             .into_iter()
             .map(|record| {
-                crate::meta::repository::decode_json_payload::<StoredMvRefresh>(&record.payload)
-                    .expect("decode refresh")
+                crate::meta::repository::decode_payload_for_kind::<StoredMvRefresh>(
+                    "mv.refresh",
+                    &record.payload,
+                )
+                .expect("decode refresh")
             })
             .collect::<Vec<_>>();
         refreshes.sort_by_key(|refresh| refresh.refresh_id);

@@ -1613,8 +1613,8 @@ mod mv_target_tests {
         empty_tablet_metadata, write_bundle_meta_file,
     };
     use crate::formats::starrocks::writer::layout::txn_log_file_path;
-    use crate::meta::repository::encode_json_payload;
     use crate::meta::repository::mv::{CreateMvDefinitionRequest, MvMetaRepository};
+    use crate::meta::repository::test_avro_seed::encode_seed_payload;
     use crate::meta::{
         ExpectedRevision, MetaKey, MetaRecordKind, MetaRecordPut, MetaStoreProvider,
         SqliteMetaStoreProvider,
@@ -2320,7 +2320,7 @@ mod mv_target_tests {
             MetaKey::new(namespace, path).map_err(|e| e.to_string())?,
             MetaRecordKind::new(kind).map_err(|e| e.to_string())?,
             ExpectedRevision::NotExists,
-            encode_json_payload(1, &payload).map_err(|e| e.to_string())?,
+            encode_seed_payload(kind, &payload).map_err(|e| e.to_string())?,
         ))
         .map_err(|e| e.to_string())
     }

@@ -1,9 +1,9 @@
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
+use crate::meta::MetaPayload;
 use crate::meta::avro;
 use crate::meta::repository::RepositoryResult;
-use crate::meta::MetaPayload;
 
 pub fn encode_record_payload<T>(kind: &str, value: &T) -> RepositoryResult<MetaPayload>
 where

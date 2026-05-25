@@ -1447,7 +1447,7 @@ mod tests {
     use crate::connector::starrocks::managed::{ManagedLakeCatalog, ManagedLakeConfig};
     use crate::engine::StandaloneState;
     use crate::engine::catalog::{DEFAULT_DATABASE, InMemoryCatalog};
-    use crate::meta::repository::{encode_json_payload, id_scopes};
+    use crate::meta::repository::{id_scopes, test_avro_seed::encode_seed_payload};
     use crate::meta::{
         ExpectedRevision, MetaKey, MetaRecordKind, MetaRecordPut, MetaStoreProvider,
         SqliteMetaStoreProvider,
@@ -1868,7 +1868,7 @@ mod tests {
             MetaKey::new(namespace, path).map_err(|e| e.to_string())?,
             MetaRecordKind::new(kind).map_err(|e| e.to_string())?,
             ExpectedRevision::NotExists,
-            encode_json_payload(1, &payload).map_err(|e| e.to_string())?,
+            encode_seed_payload(kind, &payload).map_err(|e| e.to_string())?,
         ))
         .map_err(|e| e.to_string())
     }

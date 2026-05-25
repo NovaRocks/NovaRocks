@@ -4300,7 +4300,8 @@ enable_path_style_access = true
             crate::meta::MetaKey::new(namespace, path).map_err(|e| e.to_string())?,
             crate::meta::MetaRecordKind::new(kind).map_err(|e| e.to_string())?,
             crate::meta::ExpectedRevision::NotExists,
-            crate::meta::repository::encode_json_payload(1, &payload).map_err(|e| e.to_string())?,
+            crate::meta::repository::test_avro_seed::encode_seed_payload(kind, &payload)
+                .map_err(|e| e.to_string())?,
         ))
         .map_err(|e| e.to_string())
     }

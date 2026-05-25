@@ -202,7 +202,7 @@ mod tests {
         StoredManagedTxn,
     };
     use crate::engine::StandaloneState;
-    use crate::meta::repository::encode_json_payload;
+    use crate::meta::repository::test_avro_seed::encode_seed_payload;
     use crate::meta::{
         ExpectedRevision, MetaKey, MetaRecordKind, MetaRecordPut, MetaStoreProvider,
         SqliteMetaStoreProvider,
@@ -387,7 +387,7 @@ mod tests {
             MetaKey::new(namespace, path).expect("key"),
             MetaRecordKind::new(kind).expect("kind"),
             ExpectedRevision::NotExists,
-            encode_json_payload(1, &payload).expect("payload"),
+            encode_seed_payload(kind, &payload).expect("payload"),
         ))
         .expect("put record");
     }

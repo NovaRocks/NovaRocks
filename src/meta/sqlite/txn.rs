@@ -1,7 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::meta::{
     ExpectedRevision, IdScope, MetaCommitOutcome, MetaError, MetaErrorKind, MetaKey, MetaKeyPrefix,

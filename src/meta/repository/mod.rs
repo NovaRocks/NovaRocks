@@ -12,6 +12,119 @@ pub mod mv_contract;
 
 pub use crate::meta::payload::{decode_payload_for_kind, encode_record_payload};
 
+#[cfg(test)]
+pub(crate) mod test_avro_seed {
+    use std::fmt;
+
+    use serde::de::{Error as DeError, SeqAccess, Visitor};
+    use serde::ser::Serializer;
+    use serde::{Deserialize, Serialize};
+
+    use crate::meta::MetaPayload;
+    use crate::meta::repository::job::{StoredEraseJob, StoredIcebergOptimizeJob};
+    use crate::meta::repository::managed_lake::{
+        StoredManagedColumn, StoredManagedDatabase, StoredManagedIndex, StoredManagedPartition,
+        StoredManagedTable, StoredManagedTablet,
+    };
+    use crate::meta::repository::managed_txn::StoredManagedTxn;
+    use crate::meta::repository::{RepositoryError, RepositoryResult, encode_record_payload};
+
+    pub(crate) fn encode_seed_payload(
+        kind: &str,
+        payload: &serde_json::Value,
+    ) -> RepositoryResult<MetaPayload> {
+        match kind {
+            "managed.database" => encode_from_json::<StoredManagedDatabase>(kind, payload),
+            "managed.table" => encode_from_json::<StoredManagedTable>(kind, payload),
+            "managed.schema" => encode_from_json::<StoredManagedSchemaAvro>(kind, payload),
+            "managed.column" => encode_from_json::<StoredManagedColumn>(kind, payload),
+            "managed.partition" => encode_from_json::<StoredManagedPartition>(kind, payload),
+            "managed.index" => encode_from_json::<StoredManagedIndex>(kind, payload),
+            "managed.tablet" => encode_from_json::<StoredManagedTablet>(kind, payload),
+            "managed.txn" => encode_from_json::<StoredManagedTxn>(kind, payload),
+            "job.erase" => encode_from_json::<StoredEraseJob>(kind, payload),
+            "job.iceberg_optimize" => encode_from_json::<StoredIcebergOptimizeJob>(kind, payload),
+            _ => Err(RepositoryError::invalid(format!(
+                "unsupported test seed metadata kind `{kind}`"
+            ))),
+        }
+    }
+
+    fn encode_from_json<T>(kind: &str, payload: &serde_json::Value) -> RepositoryResult<MetaPayload>
+    where
+        T: for<'de> Deserialize<'de> + Serialize,
+    {
+        let value = serde_json::from_value::<T>(payload.clone()).map_err(|err| {
+            RepositoryError::invalid(format!(
+                "failed to materialize test seed payload for `{kind}`: {err}"
+            ))
+        })?;
+        encode_record_payload(kind, &value)
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    struct StoredManagedSchemaAvro {
+        schema_id: i64,
+        table_id: i64,
+        schema_version: i64,
+        #[serde(with = "avro_bytes_vec")]
+        tablet_schema_pb: Vec<u8>,
+    }
+
+    mod avro_bytes_vec {
+        use super::*;
+
+        pub fn serialize<S>(value: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            serializer.serialize_bytes(value)
+        }
+
+        pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_byte_buf(BytesVecVisitor)
+        }
+
+        struct BytesVecVisitor;
+
+        impl<'de> Visitor<'de> for BytesVecVisitor {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("Avro bytes")
+            }
+
+            fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+            where
+                E: DeError,
+            {
+                Ok(value.to_vec())
+            }
+
+            fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
+            where
+                E: DeError,
+            {
+                Ok(value)
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(byte) = seq.next_element::<u8>()? {
+                    bytes.push(byte);
+                }
+                Ok(bytes)
+            }
+        }
+    }
+}
+
 pub type RepositoryResult<T> = Result<T, RepositoryError>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
