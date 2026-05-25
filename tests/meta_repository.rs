@@ -3450,6 +3450,60 @@ fn mv_repository_reports_downstream_dependents_for_drop_guard()
 }
 
 #[test]
+fn mv_repository_drop_guard_sorts_downstream_ids_numerically()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = MvMetaRepository::default();
+    let upstream = iceberg_mv_ref("sales", "upstream_mv");
+
+    // Seed two downstream dependencies whose mv_ids would lex-sort as
+    // ("10", "2") but should numeric-sort as (2, 10). The guard's error
+    // message must render them in numeric order so operators can read it
+    // sensibly when many MVs fan out from the same upstream.
+    {
+        let mut txn = provider.begin_write("seed downstream id 10")?;
+        repository.replace_dependencies_for_mv(
+            txn.as_mut(),
+            10,
+            vec![CreateMvDependencyRequest {
+                upstream: upstream.clone(),
+                created_at_ms: 1,
+            }],
+        )?;
+        txn.commit()?;
+    }
+    {
+        let mut txn = provider.begin_write("seed downstream id 2")?;
+        repository.replace_dependencies_for_mv(
+            txn.as_mut(),
+            2,
+            vec![CreateMvDependencyRequest {
+                upstream: upstream.clone(),
+                created_at_ms: 2,
+            }],
+        )?;
+        txn.commit()?;
+    }
+
+    let read = provider.begin_read()?;
+    let err = repository
+        .ensure_no_downstream_dependencies(read.as_ref(), &upstream)
+        .expect_err("upstream should be protected");
+    assert_eq!(err.kind(), RepositoryErrorKind::Conflict);
+    let msg = err.to_string();
+    assert!(
+        msg.contains("downstream materialized views: 2, 10"),
+        "expected numeric-sorted downstream ids, got: {msg}"
+    );
+    assert!(
+        !msg.contains("downstream materialized views: 10, 2"),
+        "downstream ids should not be lex-sorted, got: {msg}"
+    );
+    Ok(())
+}
+
+#[test]
 fn mv_repository_drop_definition_removes_dependency_edges() -> Result<(), Box<dyn std::error::Error>>
 {
     let dir = tempfile::tempdir()?;

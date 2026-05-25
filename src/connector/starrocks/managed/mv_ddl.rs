@@ -65,40 +65,6 @@ pub(crate) enum ResolvedTableRef {
     },
 }
 
-#[allow(dead_code)]
-pub(crate) fn extract_base_table_refs(
-    resolved: &[ResolvedTableRef],
-) -> Result<Vec<IcebergTableRef>, String> {
-    let mut out = Vec::new();
-    for table_ref in resolved {
-        match table_ref {
-            ResolvedTableRef::Iceberg {
-                catalog,
-                namespace,
-                table,
-            } => {
-                let candidate = IcebergTableRef {
-                    catalog: catalog.clone(),
-                    namespace: namespace.clone(),
-                    table: table.clone(),
-                };
-                if !out.contains(&candidate) {
-                    out.push(candidate);
-                }
-            }
-            ResolvedTableRef::ManagedLake { database, table } => {
-                return Err(format!(
-                    "materialized view base tables must be Iceberg tables; found managed lake table `{database}.{table}`"
-                ));
-            }
-        }
-    }
-    if out.is_empty() {
-        return Err("materialized view base tables must be Iceberg tables".to_string());
-    }
-    Ok(out)
-}
-
 pub(crate) fn resolve_mv_storage_engine(
     properties: &[(String, String)],
     default_from_config: &str,
@@ -1909,16 +1875,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_base_table_refs_rejects_non_iceberg_tables() {
-        let err = extract_base_table_refs(&[ResolvedTableRef::ManagedLake {
-            database: "analytics".to_string(),
-            table: "orders_raw".to_string(),
-        }])
-        .expect_err("should reject non-iceberg");
-        assert!(err.contains("Iceberg"), "err={err}");
-    }
-
-    #[test]
     fn show_materialized_views_lists_iceberg_relationship_without_managed_table_row() {
         let (state, _dir) = open_state_with_sqlite_store();
         insert_iceberg_mv_relationship(
@@ -2001,25 +1957,6 @@ mod tests {
             mv_definition_exists(&state, mv_id),
             "legacy-owned MV must remain visible through repository reads when legacy drop rejects"
         );
-    }
-
-    #[test]
-    fn extract_base_table_refs_returns_iceberg_fqns() {
-        let refs = extract_base_table_refs(&[
-            ResolvedTableRef::Iceberg {
-                catalog: "iceberg_cat".to_string(),
-                namespace: "ns".to_string(),
-                table: "orders".to_string(),
-            },
-            ResolvedTableRef::Iceberg {
-                catalog: "iceberg_cat".to_string(),
-                namespace: "ns".to_string(),
-                table: "items".to_string(),
-            },
-        ])
-        .expect("ok");
-        assert_eq!(refs.len(), 2);
-        assert_eq!(refs[0].fqn(), "iceberg_cat.ns.orders");
     }
 
     #[test]

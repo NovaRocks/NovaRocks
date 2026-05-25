@@ -951,13 +951,17 @@ impl MvMetaRepository {
         }
         let mut ids = downstream
             .iter()
-            .map(|dep| dep.downstream_mv_id.to_string())
-            .collect::<Vec<_>>();
+            .map(|dep| dep.downstream_mv_id)
+            .collect::<Vec<i64>>();
         ids.sort();
+        let ids_str = ids
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
         Err(RepositoryError::conflict(format!(
-            "{} has downstream materialized views: {}",
+            "{} has downstream materialized views: {ids_str}",
             upstream.display_name(),
-            ids.join(", ")
         )))
     }
 
