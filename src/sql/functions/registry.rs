@@ -359,15 +359,12 @@ fn register_numeric_fns(m: &mut HashMap<String, Vec<Signature>>) {
         Signature::new(vec![TypeSpec::Utf8], TypeSpec::Int64),
     );
 
-    // greatest / least preserve input type (over any number of args of
-    // the same type). Polymorphic, variadic.
-    for name in ["greatest", "least"] {
-        add(
-            m,
-            name,
-            Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Any("T")),
-        );
-    }
+    // `greatest` / `least` are intentionally NOT registered: StarRocks
+    // widens pure Date32 inputs to Datetime (because the BE only ships
+    // a DATETIME-typed implementation), and that semantic isn't
+    // expressible as a `TypeSpec` widening. The legacy
+    // `infer_scalar_return_type` slim match in `sql/analyzer/functions.rs`
+    // handles them with the Date32→Datetime promotion.
 }
 
 // ---------------------------------------------------------------------------
