@@ -192,12 +192,21 @@ pub(crate) fn wider_type(a: &DataType, b: &DataType) -> DataType {
         // for comparison/greatest/least/coalesce with mixed date+datetime input).
         (DataType::Timestamp(u, tz), DataType::Date32)
         | (DataType::Date32, DataType::Timestamp(u, tz)) => DataType::Timestamp(*u, tz.clone()),
+        // VARCHAR vs any other type → VARCHAR (StarRocks fallback when
+        // mixing string with numeric/temporal): every primitive cast-formats
+        // into a string, so the analyzer's `ifnull`/`coalesce`/`case`
+        // unifies a mixed pair to VARCHAR and inserts a cast on the
+        // numeric side. Must precede the numeric arms below — otherwise
+        // `wider_type(Utf8, Int64)` would silently win Int64 first and
+        // disagree with the executor's runtime widening (which produces
+        // VARCHAR), producing a `Map<I32, Int64>` slot descriptor for
+        // a batch the executor actually emits as `Map<I32, Utf8>`.
+        (DataType::Utf8, _) | (_, DataType::Utf8) => DataType::Utf8,
+        (DataType::LargeUtf8, _) | (_, DataType::LargeUtf8) => DataType::Utf8,
         (DataType::Float64, _) | (_, DataType::Float64) => DataType::Float64,
         (DataType::Float32, _) | (_, DataType::Float32) => DataType::Float64,
         (DataType::Int64, _) | (_, DataType::Int64) => DataType::Int64,
         (DataType::Int32, _) | (_, DataType::Int32) => DataType::Int64,
-        (DataType::Utf8, _) | (_, DataType::Utf8) => DataType::Utf8,
-        (DataType::LargeUtf8, _) | (_, DataType::LargeUtf8) => DataType::Utf8,
         _ => a.clone(),
     }
 }

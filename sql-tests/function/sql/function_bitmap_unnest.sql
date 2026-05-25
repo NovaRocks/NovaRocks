@@ -25,21 +25,23 @@ insert into ${case_db}.t_unnest select 4, bitmap_agg(generate_series) from table
 insert into ${case_db}.t_unnest select 5, null;
 
 -- query 3
--- Sum of all c1 values participating in unnest (rows with empty/null bitmap excluded from unnest_bitmap)
+-- Sum of all c1 values participating in unnest (rows with empty/null bitmap excluded)
 -- c1=1: bitmap_empty → no rows; c1=2: 1 row; c1=3: 12278 rows; c1=4: 17 rows; c1=5: null → no rows
 -- sum(c1) = 2*1 + 3*12278 + 4*17 = 2 + 36834 + 68 = 36904
--- sum(unnest_bitmap) = 2 + sum(3..12280) + sum(4..20) = 2 + (3+12280)*12278/2 + (4+20)*17/2
-select sum(c1), sum(unnest_bitmap) from ${case_db}.t_unnest, unnest_bitmap(c2);
+-- sum(unnest) = 2 + sum(3..12280) + sum(4..20) = 2 + (3+12280)*12278/2 + (4+20)*17/2
+-- Standalone-server doesn't ship the `unnest_bitmap` table function;
+-- `unnest(bitmap_to_array(...))` exercises the same path.
+select sum(c1), sum(unnest) from ${case_db}.t_unnest, unnest(bitmap_to_array(c2));
 
 -- query 4
 -- @order_sensitive=true
 -- First 5 rows ascending: smallest values from c1=2 (just 2), then c1=3 (3,4,5,6)
-select c1, unnest_bitmap as c3 from ${case_db}.t_unnest, unnest_bitmap(c2) order by c1 asc, c3 asc limit 5;
+select c1, unnest as c3 from ${case_db}.t_unnest, unnest(bitmap_to_array(c2)) order by c1 asc, c3 asc limit 5;
 
 -- query 5
 -- @order_sensitive=true
 -- Last 5 rows descending: from c1=4 (20,19,18,17,16)
-select c1, unnest_bitmap as c3 from ${case_db}.t_unnest, unnest_bitmap(c2) order by c1 desc, c3 desc limit 5;
+select c1, unnest as c3 from ${case_db}.t_unnest, unnest(bitmap_to_array(c2)) order by c1 desc, c3 desc limit 5;
 
 -- query 6
 -- @skip_result_check=true

@@ -820,8 +820,11 @@ async fn execute_statement_text(
     let current_db = shim.current_db.clone();
     let query_timeout = shim.query_timeout_secs;
     let optimizer_settings = shim.optimizer_settings.clone();
+    let allow_throw_exception =
+        crate::sql::parser::set_var_hint::extract_allow_throw_exception(&sql);
     let query_options = crate::internal_service::TQueryOptions {
         group_concat_max_len: Some(shim.group_concat_max_len),
+        allow_throw_exception: if allow_throw_exception { Some(true) } else { None },
         ..Default::default()
     };
 

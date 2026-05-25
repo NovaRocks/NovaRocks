@@ -1,5 +1,5 @@
 -- query 3
-sum(c1)	sum(unnest_bitmap)
+sum(c1)	sum(unnest)
 36904	75405543
 
 -- query 4

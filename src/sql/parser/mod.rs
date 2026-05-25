@@ -5,6 +5,7 @@ pub(crate) mod dialect;
 pub(crate) mod query_refs;
 pub(crate) mod raw;
 pub(crate) mod recursive_cte;
+pub(crate) mod set_var_hint;
 
 use sqlparser::parser::Parser;
 
