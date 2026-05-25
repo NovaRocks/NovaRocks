@@ -27,7 +27,7 @@ use std::collections::HashSet;
 use super::cardinality;
 use super::cost;
 use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, TypedExpr};
-use crate::sql::catalog::TableStorage;
+use crate::sql::catalog::ScanSource;
 use crate::sql::optimizer::statistics::*;
 use crate::sql::planner::plan::*;
 use arrow::datatypes::DataType;
@@ -78,8 +78,8 @@ fn has_equijoin_predicate(expr: &TypedExpr) -> bool {
 fn estimate_size(plan: &LogicalPlan) -> u64 {
     match plan {
         LogicalPlan::Scan(s) => {
-            let raw_size = match &s.table.storage {
-                TableStorage::S3ParquetFiles { files, .. } => {
+            let raw_size = match &s.table.source {
+                ScanSource::S3ParquetFiles { files, .. } => {
                     // Prefer row_count when available (from Iceberg metadata).
                     // Fall back to file size in bytes if any file lacks row_count.
                     let all_have_row_count =
@@ -100,14 +100,14 @@ fn estimate_size(plan: &LogicalPlan) -> u64 {
                 // entries which are bounded by the table's history depth.
                 // A small constant keeps them at the bottom of any join
                 // reorder ordering without forcing a separate stats path.
-                TableStorage::IcebergMetadataTable { .. } => 1,
+                ScanSource::IcebergMetadataTable { .. } => 1,
                 // IVM delta-scan placeholders carry no static rows. The
                 // change file list is resolved at lower_plan time. Treat
                 // them as small for join-reorder purposes; IVM refresh
                 // plans usually do not involve multi-table joins anyway.
-                TableStorage::IcebergDeltaTable { .. } => 1,
+                ScanSource::IcebergDeltaTable { .. } => 1,
                 // Managed-lake tables don't carry per-file size on
-                // `TableDef.storage`; tablet/version info lives on
+                // `TableDef.source`; tablet/version info lives on
                 // `PhysicalTableLayout` separately, and the proper row-
                 // count source is the analyzed-stats path. As a heuristic
                 // fallback for join-reorder when stats are absent, treat
@@ -115,7 +115,7 @@ fn estimate_size(plan: &LogicalPlan) -> u64 {
                 // file-system-metadata fallback the legacy
                 // `LocalParquetFile` arm produced when its placeholder
                 // path didn't exist).
-                TableStorage::ManagedLake => 1_000_000,
+                ScanSource::ManagedLake => 1_000_000,
             };
             // Apply selectivity for pushed-down predicates on the scan
             let num_predicates = s.predicates.len();
@@ -1274,7 +1274,7 @@ fn expr_eq(a: &TypedExpr, b: &TypedExpr) -> bool {
 mod tests {
     use super::*;
     use crate::sql::analysis::{BinOp, ExprKind, JoinKind, OutputColumn, TypedExpr};
-    use crate::sql::catalog::{ColumnDef, S3FileInfo, TableDef, TableStorage};
+    use crate::sql::catalog::{ColumnDef, S3FileInfo, TableDef, ScanSource};
     use crate::sql::column_id::ColumnId;
     use arrow::datatypes::DataType;
 
@@ -1292,7 +1292,7 @@ mod tests {
             }],
             iceberg_row_lineage_metadata_columns: vec![],
             iceberg_table: None,
-            storage: TableStorage::S3ParquetFiles {
+            source: ScanSource::S3ParquetFiles {
                 files: vec![S3FileInfo {
                     path: format!("s3://bucket/{}.parquet", name),
                     size: total_bytes,
@@ -1589,7 +1589,7 @@ mod tests {
             }],
             iceberg_row_lineage_metadata_columns: vec![],
             iceberg_table: None,
-            storage: TableStorage::S3ParquetFiles {
+            source: ScanSource::S3ParquetFiles {
                 files: vec![S3FileInfo {
                     path: format!("s3://bucket/{}.parquet", name),
                     size: total_bytes,

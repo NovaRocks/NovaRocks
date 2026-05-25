@@ -290,7 +290,7 @@ fn serialize_iceberg_literal_json(literal: &iceberg::spec::Literal) -> Result<St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::catalog::{ColumnDef, IcebergTableInfo, TableStorage};
+    use crate::sql::catalog::{ColumnDef, IcebergTableInfo, ScanSource};
 
     #[test]
     fn descriptor_builder_emits_iceberg_schema_field_ids() {
@@ -325,7 +325,7 @@ mod tests {
                 },
                 serialized_metadata: None,
             }),
-            storage: TableStorage::S3ParquetFiles {
+            source: ScanSource::S3ParquetFiles {
                 files: vec![],
                 cloud_properties: Default::default(),
             },

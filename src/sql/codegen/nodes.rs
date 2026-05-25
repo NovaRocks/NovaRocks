@@ -13,7 +13,7 @@ use super::resolve::ResolvedTable;
 
 use crate::sql::catalog::{
     IcebergColumnStats, IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
-    IcebergPartitionValue, S3FileInfo, TableStorage,
+    IcebergPartitionValue, S3FileInfo, ScanSource,
 };
 
 // ---------------------------------------------------------------------------
@@ -43,8 +43,8 @@ pub(crate) fn build_scan_node(
         return build_lake_scan_node(node_id, scan_tuple_id, resolved, conjuncts);
     }
     if matches!(
-        resolved.table.storage,
-        TableStorage::IcebergDeltaTable { .. }
+        resolved.table.source,
+        ScanSource::IcebergDeltaTable { .. }
     ) {
         return build_iceberg_delta_scan_node(node_id, scan_tuple_id, resolved, conjuncts);
     }
@@ -68,8 +68,8 @@ fn build_iceberg_delta_scan_node(
     conjuncts: Vec<exprs::TExpr>,
 ) -> plan_nodes::TPlanNode {
     let (catalog, namespace, table, from_snapshot_id, to_snapshot_id) =
-        match &resolved.table.storage {
-            TableStorage::IcebergDeltaTable {
+        match &resolved.table.source {
+            ScanSource::IcebergDeltaTable {
                 catalog,
                 namespace,
                 table,
@@ -133,11 +133,11 @@ fn build_hdfs_scan_node(
     };
     node.compact_data = true;
 
-    let cloud_config = match &resolved.table.storage {
-        TableStorage::S3ParquetFiles {
+    let cloud_config = match &resolved.table.source {
+        ScanSource::S3ParquetFiles {
             cloud_properties, ..
         }
-        | TableStorage::IcebergMetadataTable {
+        | ScanSource::IcebergMetadataTable {
             cloud_properties, ..
         } => Some(crate::cloud_configuration::TCloudConfiguration::new(
             None::<crate::cloud_configuration::TCloudType>,
@@ -149,8 +149,8 @@ fn build_hdfs_scan_node(
     };
 
     let (serialized_table, metadata_table_type, serialized_predicate) =
-        match &resolved.table.storage {
-            TableStorage::IcebergMetadataTable {
+        match &resolved.table.source {
+            ScanSource::IcebergMetadataTable {
                 metadata_table_type,
                 serialized_table,
                 metadata_payload,
@@ -592,8 +592,8 @@ pub(crate) fn build_exec_params_multi(
                 .map(|tablet| build_internal_scan_range_params(resolved, layout, tablet))
                 .collect()
         } else {
-            match &resolved.table.storage {
-                TableStorage::S3ParquetFiles { files, .. } => {
+            match &resolved.table.source {
+                ScanSource::S3ParquetFiles { files, .. } => {
                     let file_predicates = scan_file_min_max_predicates(planned);
                     let change_op_slot = planned_change_op_slot(planned);
                     let mut ranges = Vec::new();
@@ -605,21 +605,21 @@ pub(crate) fn build_exec_params_multi(
                     }
                     ranges
                 }
-                TableStorage::IcebergMetadataTable { .. } => {
+                ScanSource::IcebergMetadataTable { .. } => {
                     // The JVM metadata bridge produces all rows in a single
                     // call keyed off `serialized_table`. We still need at
                     // least one scan range so the runtime allocates a morsel
                     // and dispatches to `IcebergMetadataScanOp`.
                     vec![build_iceberg_metadata_scan_range_params()]
                 }
-                TableStorage::IcebergDeltaTable { .. } => {
+                ScanSource::IcebergDeltaTable { .. } => {
                     // IVM delta-scan is a single-instance operator: the
                     // change-file enumeration happens inside lower_plan
                     // from `plan_changes`, so we emit one placeholder
                     // morsel for the runtime to dispatch on.
                     vec![build_iceberg_metadata_scan_range_params()]
                 }
-                TableStorage::ManagedLake => {
+                ScanSource::ManagedLake => {
                     // Managed-lake tables reach this builder via the
                     // outer `if let Some(layout)` branch above; falling
                     // through to here means the planner produced a
@@ -1250,7 +1250,7 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::{PlannedScanTable, build_exec_params_multi, build_hdfs_scan_range_params};
-    use crate::sql::catalog::{ColumnDef, S3FileInfo, TableDef, TableStorage};
+    use crate::sql::catalog::{ColumnDef, S3FileInfo, TableDef, ScanSource};
     use crate::sql::codegen::resolve::ResolvedTable;
 
     fn hdfs_range(
@@ -1321,7 +1321,7 @@ mod tests {
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
-                    storage: TableStorage::S3ParquetFiles {
+                    source: ScanSource::S3ParquetFiles {
                         files: vec![S3FileInfo {
                             path: "s3://bucket/path/file.parquet".to_string(),
                             size: 1024,
@@ -1377,7 +1377,7 @@ mod tests {
                         logical_type: None,
                     }],
                     iceberg_table: None,
-                    storage: TableStorage::S3ParquetFiles {
+                    source: ScanSource::S3ParquetFiles {
                         files: vec![S3FileInfo {
                             path: "s3://bucket/path/file.parquet".to_string(),
                             size: 1024,

@@ -9,7 +9,7 @@ use crate::engine::backend_resolver::resolve_table_target;
 use crate::engine::build_string_query_result;
 use crate::engine::statement::parse_add_files_sql;
 use crate::sql::analyzer::iceberg_ref::resolve_read_binding;
-use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
+use crate::sql::catalog::{ColumnDef, TableDef, ScanSource};
 use crate::sql::parser::ast::ObjectName;
 use crate::sql::parser::query_refs::{
     extract_table_names_from_query, extract_three_part_table_refs, extract_two_part_table_refs,
@@ -774,7 +774,7 @@ fn stamp_delta_table_def_change_ops(
             logical_type: None,
         });
 
-    let TableStorage::S3ParquetFiles { files, .. } = &mut table_def.storage else {
+    let ScanSource::S3ParquetFiles { files, .. } = &mut table_def.source else {
         return Err(
             "iceberg delta source requires S3 parquet file storage for synthetic files".to_string(),
         );
@@ -795,7 +795,7 @@ fn stamp_delta_table_def_change_ops(
 #[cfg(test)]
 mod tests {
     use crate::engine::query_prep::IcebergFileForQuery;
-    use crate::sql::catalog::{TableDef, TableStorage};
+    use crate::sql::catalog::{TableDef, ScanSource};
     use crate::sql::parser::ast::ObjectName;
 
     fn parse_query_for_table_names(sql: &str) -> sqlparser::ast::Query {
@@ -942,7 +942,7 @@ mod tests {
             columns: vec![],
             iceberg_row_lineage_metadata_columns: vec![],
             iceberg_table: None,
-            storage: TableStorage::S3ParquetFiles {
+            source: ScanSource::S3ParquetFiles {
                 files: vec![crate::sql::catalog::S3FileInfo {
                     path: "file:///tmp/data.parquet".to_string(),
                     size: 10,
@@ -971,7 +971,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("__change_op", &arrow::datatypes::DataType::Int8, false)]
         );
-        let TableStorage::S3ParquetFiles { files, .. } = &table_def.storage else {
+        let ScanSource::S3ParquetFiles { files, .. } = &table_def.source else {
             panic!("expected s3 parquet storage");
         };
         assert_eq!(files[0].ivm_change_op, Some(1));
@@ -1013,7 +1013,7 @@ mod tests {
                 },
             ],
             iceberg_table: None,
-            storage: TableStorage::S3ParquetFiles {
+            source: ScanSource::S3ParquetFiles {
                 files: vec![crate::sql::catalog::S3FileInfo {
                     path: "file:///tmp/data.parquet".to_string(),
                     size: 10,
@@ -1052,7 +1052,7 @@ mod tests {
                 ("__change_op", &arrow::datatypes::DataType::Int8, false),
             ]
         );
-        let TableStorage::S3ParquetFiles { files, .. } = &table_def.storage else {
+        let ScanSource::S3ParquetFiles { files, .. } = &table_def.source else {
             panic!("expected s3 parquet storage");
         };
         assert_eq!(files[0].ivm_change_op, Some(-1));
@@ -1064,7 +1064,7 @@ mod tests {
         // requires the base table to be backed by `S3ParquetFiles`
         // (real or synthetic). An empty Iceberg snapshot legitimately
         // produces `S3ParquetFiles { files: vec![] }` (see
-        // `connector/iceberg/catalog/backend.rs::empty_iceberg_table_storage`);
+        // `connector/iceberg/catalog/backend.rs::empty_iceberg_scan_source`);
         // ensure that path round-trips correctly when stamping with an
         // empty change-op slice.
         let mut table_def = TableDef {
@@ -1072,7 +1072,7 @@ mod tests {
             columns: vec![],
             iceberg_row_lineage_metadata_columns: vec![],
             iceberg_table: None,
-            storage: TableStorage::S3ParquetFiles {
+            source: ScanSource::S3ParquetFiles {
                 files: Vec::new(),
                 cloud_properties: Default::default(),
             },
@@ -1089,7 +1089,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("__change_op", &arrow::datatypes::DataType::Int8, false)]
         );
-        let TableStorage::S3ParquetFiles { files, .. } = &table_def.storage else {
+        let ScanSource::S3ParquetFiles { files, .. } = &table_def.source else {
             panic!("expected empty delta to use s3 parquet storage");
         };
         assert!(files.is_empty());

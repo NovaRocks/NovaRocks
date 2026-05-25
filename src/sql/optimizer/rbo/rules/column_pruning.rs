@@ -311,7 +311,7 @@ mod tests {
     use crate::sql::analysis::{
         BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
-    use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
+    use crate::sql::catalog::{ColumnDef, TableDef, ScanSource};
     use crate::sql::column_id::ColumnId;
     use arrow::datatypes::DataType;
 
@@ -343,7 +343,7 @@ mod tests {
             ],
             iceberg_row_lineage_metadata_columns: vec![],
             iceberg_table: None,
-            storage: TableStorage::ManagedLake,
+            source: ScanSource::ManagedLake,
         }
     }
 

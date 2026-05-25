@@ -53,7 +53,7 @@ pub(crate) fn should_push(plan: &PushPlan, table_stats: &HashMap<String, TableSt
 mod tests {
     use super::*;
     use crate::sql::analysis::OutputColumn;
-    use crate::sql::catalog::{TableDef, TableStorage};
+    use crate::sql::catalog::{TableDef, ScanSource};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::statistics::ColumnStatistic;
     use crate::sql::planner::plan::ScanNode;
@@ -84,7 +84,7 @@ mod tests {
                 columns: vec![],
                 iceberg_row_lineage_metadata_columns: vec![],
                 iceberg_table: None,
-                storage: TableStorage::ManagedLake,
+                source: ScanSource::ManagedLake,
             },
             alias: None,
             columns: vec![OutputColumn {

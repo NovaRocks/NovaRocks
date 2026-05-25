@@ -8,7 +8,7 @@
 //! from the current `StandaloneState`.
 //!
 //! Rows are eagerly materialized at query-rewrite time and embedded as a
-//! `TableStorage::SystemRows` variant in a cloned catalog snapshot, so the
+//! `ScanSource::SystemRows` variant in a cloned catalog snapshot, so the
 //! standard SQL pipeline (analyzer / planner / optimizer / codegen / pipeline)
 //! handles them like any other base table — no handler-style SQL-subset
 //! interpretation required.

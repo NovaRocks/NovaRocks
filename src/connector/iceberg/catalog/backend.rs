@@ -11,7 +11,7 @@ use crate::connector::backend::{
 use crate::connector::iceberg::catalog::IcebergLoadedTable;
 use crate::sql::catalog::{
     ColumnDef, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo, S3FileInfo, TableDef,
-    TableStorage,
+    ScanSource,
 };
 use crate::sql::parser::ast::Literal;
 
@@ -234,7 +234,7 @@ pub(crate) fn build_iceberg_table_def_for_delta_scan(
     let iceberg_table = Some(build_iceberg_table_info(&loaded));
     let columns =
         hide_novarocks_mv_internal_columns(loaded.table.metadata(), loaded.columns.clone())?;
-    let storage = empty_iceberg_table_storage();
+    let source = empty_iceberg_scan_source();
     let iceberg_row_lineage_metadata_columns = vec![
         ColumnDef {
             name: "_file".to_string(),
@@ -277,7 +277,7 @@ pub(crate) fn build_iceberg_table_def_for_delta_scan(
         columns,
         iceberg_row_lineage_metadata_columns,
         iceberg_table,
-        storage,
+        source,
     })
 }
 
@@ -299,9 +299,9 @@ fn build_iceberg_table_def_with_data_files(
     let all_files_have_first_row_id = data_files.iter().all(|f| f.first_row_id.is_some());
     let columns =
         hide_novarocks_mv_internal_columns(loaded.table.metadata(), loaded.columns.clone())?;
-    let storage = if entry.is_s3() {
+    let source = if entry.is_s3() {
         let cloud_properties = entry.cloud_properties_map();
-        TableStorage::S3ParquetFiles {
+        ScanSource::S3ParquetFiles {
             files: data_files
                 .into_iter()
                 .map(data_file_with_stats_to_s3_file_info)
@@ -313,7 +313,7 @@ fn build_iceberg_table_def_with_data_files(
         // Keep the per-file lineage metadata by using the multi-file scan
         // shape with empty cloud properties; file:// paths are handled by the
         // local scan path and do not require object-store credentials.
-        TableStorage::S3ParquetFiles {
+        ScanSource::S3ParquetFiles {
             files: data_files
                 .into_iter()
                 .map(data_file_with_stats_to_s3_file_info)
@@ -321,7 +321,7 @@ fn build_iceberg_table_def_with_data_files(
             cloud_properties: Default::default(),
         }
     } else {
-        empty_iceberg_table_storage()
+        empty_iceberg_scan_source()
     };
 
     let iceberg_row_lineage_metadata_columns = if has_data_files
@@ -379,7 +379,7 @@ fn build_iceberg_table_def_with_data_files(
         columns,
         iceberg_row_lineage_metadata_columns,
         iceberg_table,
-        storage,
+        source,
     })
 }
 
@@ -585,8 +585,8 @@ pub(crate) fn row_lineage_enabled(metadata: &iceberg::spec::TableMetadata) -> bo
 /// `/tmp/novarocks_iceberg_empty/${ns}_${tbl}.parquet` placeholder file
 /// — that was a workaround for the `LocalParquetFile` lane which is
 /// being retired.
-fn empty_iceberg_table_storage() -> TableStorage {
-    TableStorage::S3ParquetFiles {
+fn empty_iceberg_scan_source() -> ScanSource {
+    ScanSource::S3ParquetFiles {
         files: Vec::new(),
         cloud_properties: Default::default(),
     }

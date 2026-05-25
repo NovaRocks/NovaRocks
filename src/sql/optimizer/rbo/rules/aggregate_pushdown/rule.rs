@@ -45,7 +45,7 @@ impl RewriteRule for AggregatePushdownRule {
 mod tests {
     use super::*;
     use crate::sql::analysis::OutputColumn;
-    use crate::sql::catalog::{TableDef, TableStorage};
+    use crate::sql::catalog::{TableDef, ScanSource};
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::plan::{AggregateNode, ScanNode};
     use arrow::datatypes::DataType;
@@ -59,7 +59,7 @@ mod tests {
                     columns: vec![],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
-                    storage: TableStorage::ManagedLake,
+                    source: ScanSource::ManagedLake,
                 },
                 alias: None,
                 columns: vec![OutputColumn {
@@ -111,7 +111,7 @@ mod tests {
                     columns: vec![],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
-                    storage: TableStorage::ManagedLake,
+                    source: ScanSource::ManagedLake,
                 },
                 alias: None,
                 columns: cols

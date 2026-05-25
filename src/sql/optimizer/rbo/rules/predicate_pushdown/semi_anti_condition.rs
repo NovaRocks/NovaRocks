@@ -115,7 +115,7 @@ impl RewriteRule for PushSemiAntiRightOnlyCondition {
 mod tests {
     use super::*;
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr};
-    use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
+    use crate::sql::catalog::{ColumnDef, TableDef, ScanSource};
     use crate::sql::column_id::ColumnId;
     use arrow::datatypes::DataType;
 
@@ -180,7 +180,7 @@ mod tests {
                     .collect(),
                 iceberg_row_lineage_metadata_columns: vec![],
                 iceberg_table: None,
-                storage: TableStorage::ManagedLake,
+                source: ScanSource::ManagedLake,
             },
             alias: Some(table_name.into()),
             columns: cols

@@ -1570,7 +1570,7 @@ fn is_lateral_unnest_condition_supported(condition: &Option<TypedExpr>) -> bool 
 
 /// Lower an analyzer-built `IcebergMetadataScanRelation` into a regular
 /// `LogicalPlan::Scan` whose `TableDef` carries the synthetic
-/// `TableStorage::IcebergMetadataTable` storage. The optimizer treats it
+/// `ScanSource::IcebergMetadataTable` storage. The optimizer treats it
 /// like any other Scan; codegen branches on the storage variant to emit
 /// an `HDFS_SCAN_NODE` whose lowering wires up the native-Rust
 /// `IcebergMetadataScanOp` (no JNI bridge).
@@ -1579,7 +1579,7 @@ fn plan_iceberg_metadata_scan(
     factory: &mut ColumnRefFactory,
 ) -> Result<LogicalPlan, String> {
     use crate::sql::analyzer::iceberg_metadata::metadata_table_schema;
-    use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
+    use crate::sql::catalog::{ColumnDef, TableDef, ScanSource};
 
     let cols = metadata_table_schema(rel.metadata_table_type.clone());
     if cols.is_empty() {
@@ -1619,21 +1619,21 @@ fn plan_iceberg_metadata_scan(
                 rel.table.name
             )
         })?;
-    let cloud_properties = match &rel.table.storage {
-        TableStorage::S3ParquetFiles {
+    let cloud_properties = match &rel.table.source {
+        ScanSource::S3ParquetFiles {
             cloud_properties, ..
         } => cloud_properties.clone(),
         _ => Default::default(),
     };
     let metadata_payload =
-        build_iceberg_metadata_payload(&rel.metadata_table_type, &rel.table.storage)?;
+        build_iceberg_metadata_payload(&rel.metadata_table_type, &rel.table.source)?;
     let synthetic_name = format!("{}__nr_meta__", rel.table.name);
     let synthetic_table = TableDef {
         name: synthetic_name,
         columns: column_defs,
         iceberg_row_lineage_metadata_columns: vec![],
         iceberg_table: rel.table.iceberg_table.clone(),
-        storage: TableStorage::IcebergMetadataTable {
+        source: ScanSource::IcebergMetadataTable {
             metadata_table_type: rel.metadata_table_type,
             serialized_table,
             cloud_properties,
@@ -1661,13 +1661,13 @@ struct PartitionMetadataAgg {
 
 fn build_iceberg_metadata_payload(
     metadata_table_type: &crate::connector::iceberg::IcebergMetadataTableType,
-    storage: &crate::sql::catalog::TableStorage,
+    storage: &crate::sql::catalog::ScanSource,
 ) -> Result<Option<String>, String> {
     use crate::connector::iceberg::IcebergMetadataTableType;
-    use crate::sql::catalog::TableStorage;
+    use crate::sql::catalog::ScanSource;
     match metadata_table_type {
         IcebergMetadataTableType::Partitions => {
-            let TableStorage::S3ParquetFiles { files, .. } = storage else {
+            let ScanSource::S3ParquetFiles { files, .. } = storage else {
                 return Err(
                     "iceberg partitions metadata table requires catalog-resolved data files"
                         .to_string(),
@@ -1759,7 +1759,7 @@ fn build_iceberg_partitions_payload(files: &[S3FileInfo]) -> Result<String, Stri
 
 /// Lower an analyzer-built `IcebergDeltaScanRelation` into a regular
 /// `LogicalPlan::Scan` whose `TableDef` carries the synthetic
-/// `TableStorage::IcebergDeltaTable` storage. Codegen recognizes this
+/// `ScanSource::IcebergDeltaTable` storage. Codegen recognizes this
 /// storage variant and emits `TPlanNodeType::ICEBERG_DELTA_SCAN_NODE`
 /// (rather than `HDFS_SCAN_NODE`); the lowering layer resolves the
 /// actual change file list via `connector::iceberg::changes::plan_changes`.
@@ -1767,7 +1767,7 @@ fn plan_iceberg_delta_scan(
     rel: IcebergDeltaScanRelation,
     factory: &mut ColumnRefFactory,
 ) -> Result<LogicalPlan, String> {
-    use crate::sql::catalog::{TableDef, TableStorage};
+    use crate::sql::catalog::{TableDef, ScanSource};
 
     // Output schema: base columns + iceberg v3 row-lineage metadata columns.
     // The delta scan emits both: scanner-side projection re-uses the same
@@ -1801,7 +1801,7 @@ fn plan_iceberg_delta_scan(
             .iceberg_row_lineage_metadata_columns
             .clone(),
         iceberg_table: rel.table.iceberg_table.clone(),
-        storage: TableStorage::IcebergDeltaTable {
+        source: ScanSource::IcebergDeltaTable {
             catalog: rel.catalog,
             namespace: rel.namespace.clone(),
             table: rel.table_name.clone(),
@@ -1876,7 +1876,7 @@ fn plan_values(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::catalog::{CatalogProvider, ColumnDef, TableDef, TableStorage};
+    use crate::sql::catalog::{CatalogProvider, ColumnDef, TableDef, ScanSource};
 
     struct TestCatalog;
 
@@ -1903,7 +1903,7 @@ mod tests {
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
-                    storage: TableStorage::ManagedLake,
+                    source: ScanSource::ManagedLake,
                 }),
                 "maps" => Ok(TableDef {
                     name: "maps".to_string(),
@@ -1937,7 +1937,7 @@ mod tests {
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
-                    storage: TableStorage::ManagedLake,
+                    source: ScanSource::ManagedLake,
                 }),
                 other => Err(format!("unknown test table: {other}")),
             }

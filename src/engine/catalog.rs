@@ -13,7 +13,7 @@ use std::collections::HashMap;
 // interchangeably without double-defining the types.
 use crate::sql::catalog::LegacyRangePartition;
 pub use crate::sql::catalog::{
-    CatalogProvider, ColumnDef, ManagedTabletRef, PhysicalTableLayout, TableDef, TableStorage,
+    CatalogProvider, ColumnDef, ManagedTabletRef, PhysicalTableLayout, TableDef, ScanSource,
 };
 
 #[derive(Clone, Debug)]
@@ -324,7 +324,7 @@ mod tests {
             }],
             iceberg_row_lineage_metadata_columns: vec![],
             iceberg_table: None,
-            storage: TableStorage::ManagedLake,
+            source: ScanSource::ManagedLake,
         }
     }
 

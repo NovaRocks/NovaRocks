@@ -130,7 +130,7 @@ fn final_fn_name(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::sql::analysis::{BinOp, JoinKind, OutputColumn};
-    use crate::sql::catalog::{TableDef, TableStorage};
+    use crate::sql::catalog::{TableDef, ScanSource};
     use crate::sql::planner::plan::*;
     use arrow::datatypes::DataType;
 
@@ -154,7 +154,7 @@ mod tests {
                 columns: vec![],
                 iceberg_row_lineage_metadata_columns: vec![],
                 iceberg_table: None,
-                storage: TableStorage::ManagedLake,
+                source: ScanSource::ManagedLake,
             },
             alias: None,
             columns: cols

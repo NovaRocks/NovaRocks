@@ -21,7 +21,7 @@ use super::model::{
 };
 use crate::connector::starrocks::managed::config::ManagedLakeConfig;
 use crate::engine::catalog::{
-    ColumnDef, InMemoryCatalog, ManagedTabletRef, PhysicalTableLayout, TableDef, TableStorage,
+    ColumnDef, InMemoryCatalog, ManagedTabletRef, PhysicalTableLayout, TableDef, ScanSource,
     normalize_identifier,
 };
 
@@ -619,7 +619,7 @@ fn managed_table_def(runtime: &ManagedTableRuntime) -> Result<TableDef, String> 
         columns,
         iceberg_row_lineage_metadata_columns: vec![],
         iceberg_table: None,
-        storage: TableStorage::ManagedLake,
+        source: ScanSource::ManagedLake,
     })
 }
 
@@ -964,7 +964,7 @@ mod tests {
                 },
             ]
         );
-        assert!(matches!(table.storage, TableStorage::ManagedLake));
+        assert!(matches!(table.source, ScanSource::ManagedLake));
 
         let layout = catalog
             .get_physical_layout(DEFAULT_DATABASE, "managed_tbl")

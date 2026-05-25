@@ -629,7 +629,7 @@ impl ExpressionKindHint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::catalog::{CatalogProvider, ColumnDef, TableDef, TableStorage};
+    use crate::sql::catalog::{CatalogProvider, ColumnDef, TableDef, ScanSource};
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
     use std::sync::Arc;
 
@@ -717,7 +717,7 @@ mod tests {
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
-                    storage: TableStorage::ManagedLake,
+                    source: ScanSource::ManagedLake,
                 }),
                 _ => Err(format!("table not found: {table}")),
             }
@@ -811,7 +811,7 @@ mod tests {
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
-                    storage: TableStorage::ManagedLake,
+                    source: ScanSource::ManagedLake,
                 }),
                 _ => Err(format!("table not found: {table}")),
             }
