@@ -14,6 +14,7 @@ use crate::engine::catalog::normalize_identifier;
 use crate::engine::query_prep::drop_registered_external_table;
 use crate::engine::record_batch_to_chunk;
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
+use crate::meta::MetaReadTxn;
 use crate::meta::repository::managed_lake::{
     CreateManagedColumnRequest, CreateManagedTableLayoutRequest,
     ManagedTableKind as RepoManagedTableKind,
@@ -833,6 +834,12 @@ pub(crate) fn list_mv_rows(
     let Some(provider) = state.metadata_provider.as_ref() else {
         return Ok(vec![]);
     };
+    // Share a single read transaction across `list_definitions` and every
+    // per-row `dependency_display_for_mv` lookup. This avoids M+1 RAII
+    // open/close cycles for M materialized views and, more importantly,
+    // gives the entire SHOW MATERIALIZED VIEWS result a consistent
+    // metadata snapshot: concurrent CREATE/DROP MV writers cannot make
+    // dependency display drift away from the MV list we just read.
     let read = provider
         .begin_read()
         .map_err(|e| format!("open metadata read transaction failed: {e}"))?;
@@ -886,7 +893,7 @@ pub(crate) fn list_mv_rows(
                 last_refresh_rows: mv.last_refresh_rows.map(|value| value.to_string()),
                 base_tables: mv.base_table_refs.join(", "),
                 select_text: mv.select_sql.clone(),
-                dependencies: dependency_display_for_mv(state, mv.mv_id)?,
+                dependencies: dependency_display_for_mv(state, read.as_ref(), mv.mv_id)?,
             });
             continue;
         }
@@ -922,22 +929,23 @@ pub(crate) fn list_mv_rows(
             last_refresh_rows: mv.last_refresh_rows.map(|value| value.to_string()),
             base_tables: mv.base_table_refs.join(", "),
             select_text: mv.select_sql.clone(),
-            dependencies: dependency_display_for_mv(state, mv.mv_id)?,
+            dependencies: dependency_display_for_mv(state, read.as_ref(), mv.mv_id)?,
         });
     }
     Ok(rows)
 }
 
-fn dependency_display_for_mv(state: &Arc<StandaloneState>, mv_id: i64) -> Result<String, String> {
-    let Some(provider) = state.metadata_provider.as_ref() else {
-        return Ok(String::new());
-    };
-    let read = provider
-        .begin_read()
-        .map_err(|e| format!("open MV dependency display read failed: {e}"))?;
+/// Render the dependency-column text for a single MV row. Callers must pass
+/// the shared read transaction opened by `list_mv_rows` so that every row
+/// observes the same metadata snapshot and we avoid M+1 transaction opens.
+fn dependency_display_for_mv(
+    state: &Arc<StandaloneState>,
+    read: &dyn MetaReadTxn,
+    mv_id: i64,
+) -> Result<String, String> {
     let dependencies = state
         .mv_repo
-        .list_dependencies_by_downstream(read.as_ref(), mv_id)
+        .list_dependencies_by_downstream(read, mv_id)
         .map_err(|e| format!("load MV dependencies for display failed: {e}"))?;
     Ok(dependencies
         .iter()
