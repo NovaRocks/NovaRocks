@@ -104,7 +104,7 @@ pub(crate) enum Relation {
     /// IVM-A1 plan-time delta scan: `__nr_ivm_delta('cat.ns.tbl', from, to)`.
     /// Produced by the analyzer when it recognizes the `__nr_ivm_delta`
     /// table function. Lowered by the planner into a regular `Scan` over a
-    /// synthetic `TableDef` whose storage is `TableStorage::IcebergDeltaTable`,
+    /// synthetic `TableDef` whose storage is `ScanSource::IcebergDeltaTable`,
     /// and emitted by codegen as `TPlanNodeType::ICEBERG_DELTA_SCAN_NODE`.
     IcebergDeltaScan(IcebergDeltaScanRelation),
     /// A subquery in FROM: `(SELECT ...) AS alias`.

@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 use arrow::datatypes::DataType;
 
@@ -114,10 +113,15 @@ pub struct IcebergTableInfo {
     pub schema: IcebergSchemaDef,
     /// JSON-serialized iceberg `TableMetadata`. Required when the table
     /// is referenced as an Iceberg metadata table (`t$snapshots`,
-    /// `t$history`, `t$refs`, `t$partitions`) — the JNI metadata-scan
-    /// bridge consumes this string to materialise the metadata rows.
-    /// `None` for tables resolved via paths that do not have access to
-    /// the iceberg `TableMetadata` (e.g. synthetic test fixtures).
+    /// `t$history`, `t$refs`, `t$partitions`) — the native-Rust
+    /// `IcebergMetadataScanOp` parses this string back via
+    /// `serde_json::from_str::<TableMetadata>` to materialise the
+    /// metadata rows. The Thrift field on `THdfsScanRange` is still
+    /// named `use_iceberg_jni_metadata_reader` for wire compatibility
+    /// with the StarRocks FE/BE protocol, even though there is no JNI
+    /// bridge on the NovaRocks side. `None` for tables resolved via
+    /// paths that do not have access to the iceberg `TableMetadata`
+    /// (e.g. synthetic test fixtures).
     pub serialized_metadata: Option<String>,
 }
 
@@ -170,8 +174,21 @@ pub struct PhysicalTableLayout {
     pub tablets: Vec<ManagedTabletRef>,
 }
 
+/// Plan-time description of how the scan operator enumerates physical
+/// inputs for a table. Each variant covers a different lane:
+///
+/// - `ManagedLake`: managed-lake table; the actual tablet/version
+///   layout flows separately through `PhysicalTableLayout`.
+/// - `S3ParquetFiles`: Iceberg `rest`/`hadoop`/IVM-delta-stamped /
+///   `generate_series` parquet files — a concrete list of data files
+///   plus optional cloud-store credentials.
+/// - `IcebergMetadataTable`: synthetic source for iceberg metadata
+///   tables (`t$snapshots` etc.); the operator reads
+///   `iceberg::spec::TableMetadata` natively in Rust.
+/// - `IcebergDeltaTable`: lightweight identity for IVM-A1 delta
+///   scans; the actual change-file list is resolved at lower time.
 #[derive(Clone, Debug)]
-pub enum TableStorage {
+pub enum ScanSource {
     /// Managed-lake table: data lives in object storage (s3:// or
     /// file://) and metadata lives in a `MetaStoreProvider` (currently
     /// SQLite). The per-table physical layout (tablet/partition/version
@@ -183,13 +200,14 @@ pub enum TableStorage {
         files: Vec<S3FileInfo>,
         cloud_properties: BTreeMap<String, String>,
     },
-    /// Synthetic storage backing an Iceberg metadata-table reference
+    /// Synthetic scan source for an Iceberg metadata-table reference
     /// (`t$snapshots` / `t$history` / `t$refs` / `t$partitions`). The
     /// analyzer rewrites such references into a regular `Scan` over a
-    /// synthetic `TableDef` whose storage is this variant; codegen then
+    /// synthetic `TableDef` whose source is this variant; codegen then
     /// emits an `HDFS_SCAN_NODE` whose lowering builds an
     /// `IcebergMetadataScanOp` that reads `iceberg::spec::TableMetadata`
-    /// natively (no JNI bridge) — see
+    /// natively in Rust (no JVM / JNI bridge — the embedded-JVM path
+    /// was removed in favor of iceberg-rust) — see
     /// `src/connector/iceberg/metadata.rs`.
     IcebergMetadataTable {
         metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType,
@@ -238,7 +256,7 @@ pub struct TableDef {
     /// expansion.
     pub iceberg_row_lineage_metadata_columns: Vec<ColumnDef>,
     pub iceberg_table: Option<IcebergTableInfo>,
-    pub storage: TableStorage,
+    pub source: ScanSource,
 }
 
 /// Catalog abstraction for SQL analysis.
@@ -300,7 +318,7 @@ mod tests {
                 },
                 serialized_metadata: None,
             }),
-            storage: TableStorage::S3ParquetFiles {
+            source: ScanSource::S3ParquetFiles {
                 files: vec![],
                 cloud_properties: BTreeMap::new(),
             },

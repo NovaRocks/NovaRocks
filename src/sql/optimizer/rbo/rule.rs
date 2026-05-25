@@ -29,7 +29,7 @@ pub(crate) trait RewriteRule: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::catalog::{TableDef, TableStorage};
+    use crate::sql::catalog::{TableDef, ScanSource};
     use crate::sql::planner::plan::ScanNode;
 
     /// Test-only helper: a no-op rule that never fires.
@@ -71,7 +71,7 @@ mod tests {
                 columns: vec![],
                 iceberg_row_lineage_metadata_columns: vec![],
                 iceberg_table: None,
-                storage: TableStorage::ManagedLake,
+                source: ScanSource::ManagedLake,
             },
             alias: None,
             columns: vec![],

@@ -9,7 +9,7 @@ use arrow::datatypes::DataType;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, TypedExpr, UnOp};
-use crate::sql::catalog::TableStorage;
+use crate::sql::catalog::ScanSource;
 use crate::sql::optimizer::operator::{AggMode, JoinDistribution, Operator};
 use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
 use crate::sql::optimizer::property::DistributionSpec;
@@ -804,8 +804,8 @@ fn scan_supports_decode_hint(
     table: &crate::sql::catalog::TableDef,
     required_columns: &[String],
 ) -> bool {
-    match &table.storage {
-        TableStorage::S3ParquetFiles { .. } | TableStorage::ManagedLake => {
+    match &table.source {
+        ScanSource::S3ParquetFiles { .. } | ScanSource::ManagedLake => {
             required_columns.iter().any(|required| {
                 table
                     .columns
@@ -817,9 +817,9 @@ fn scan_supports_decode_hint(
         }
         // Iceberg metadata-table scans are JVM-bridged; the parquet decode
         // hint path does not apply.
-        TableStorage::IcebergMetadataTable { .. } => false,
+        ScanSource::IcebergMetadataTable { .. } => false,
         // IVM delta-scan does not produce stable column-dictionary stats.
-        TableStorage::IcebergDeltaTable { .. } => false,
+        ScanSource::IcebergDeltaTable { .. } => false,
     }
 }
 
@@ -827,12 +827,12 @@ fn scan_supports_min_max_stats(
     table: &crate::sql::catalog::TableDef,
     required_columns: &[String],
 ) -> bool {
-    match &table.storage {
-        TableStorage::S3ParquetFiles { .. } | TableStorage::ManagedLake => {}
+    match &table.source {
+        ScanSource::S3ParquetFiles { .. } | ScanSource::ManagedLake => {}
         // Iceberg metadata tables do not produce parquet column statistics.
-        TableStorage::IcebergMetadataTable { .. } => return false,
+        ScanSource::IcebergMetadataTable { .. } => return false,
         // IVM delta-scan is a synthetic placeholder; no parquet stats.
-        TableStorage::IcebergDeltaTable { .. } => return false,
+        ScanSource::IcebergDeltaTable { .. } => return false,
     }
     required_columns.iter().all(|required| {
         table
@@ -1041,7 +1041,7 @@ mod tests {
 
     use super::{ExplainLevel, explain_physical_plan, format_physical_node, format_stats_trailer};
     use crate::sql::analysis::OutputColumn;
-    use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
+    use crate::sql::catalog::{ColumnDef, TableDef, ScanSource};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{Operator, PhysicalDistributionOp, PhysicalScanOp};
     use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
@@ -1065,7 +1065,7 @@ mod tests {
                     columns: vec![column.clone()],
                     iceberg_row_lineage_metadata_columns: Vec::new(),
                     iceberg_table: None,
-                    storage: TableStorage::S3ParquetFiles {
+                    source: ScanSource::S3ParquetFiles {
                         files: Vec::new(),
                         cloud_properties: BTreeMap::new(),
                     },
@@ -1113,7 +1113,7 @@ mod tests {
                     columns: vec![column.clone()],
                     iceberg_row_lineage_metadata_columns: Vec::new(),
                     iceberg_table: None,
-                    storage: TableStorage::S3ParquetFiles {
+                    source: ScanSource::S3ParquetFiles {
                         files: Vec::new(),
                         cloud_properties: BTreeMap::new(),
                     },
@@ -1183,7 +1183,7 @@ mod tests {
                     columns: vec![column.clone()],
                     iceberg_row_lineage_metadata_columns: Vec::new(),
                     iceberg_table: None,
-                    storage: TableStorage::S3ParquetFiles {
+                    source: ScanSource::S3ParquetFiles {
                         files: Vec::new(),
                         cloud_properties: BTreeMap::new(),
                     },
@@ -1250,7 +1250,7 @@ mod tests {
                     columns: vec![column.clone()],
                     iceberg_row_lineage_metadata_columns: Vec::new(),
                     iceberg_table: None,
-                    storage: TableStorage::S3ParquetFiles {
+                    source: ScanSource::S3ParquetFiles {
                         files: Vec::new(),
                         cloud_properties: BTreeMap::new(),
                     },

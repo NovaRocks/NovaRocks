@@ -92,7 +92,7 @@ pub struct StandaloneOptions {
 
 pub use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 use crate::sql::catalog::LegacyRangePartition;
-pub use crate::sql::catalog::{CatalogProvider, ColumnDef, TableDef, TableStorage};
+pub use crate::sql::catalog::{CatalogProvider, ColumnDef, TableDef, ScanSource};
 
 fn stream_load_engine_cell() -> &'static OnceLock<StandaloneNovaRocks> {
     static ENGINE: OnceLock<StandaloneNovaRocks> = OnceLock::new();
@@ -2705,10 +2705,10 @@ fn collect_scan_stats(
 
     match plan {
         LogicalPlan::Scan(s) => {
-            if let crate::sql::catalog::TableStorage::S3ParquetFiles {
+            if let crate::sql::catalog::ScanSource::S3ParquetFiles {
                 files,
                 cloud_properties,
-            } = &s.table.storage
+            } = &s.table.source
             {
                 // Best-effort: pull NDV from registered Puffin statistics for
                 // the table's current snapshot. Any failure quietly degrades
@@ -3993,7 +3993,7 @@ enable_path_style_access = true
     }
 
     fn build_fragments_for_query(sql: &str) -> crate::sql::codegen::MultiFragmentBuildResult {
-        use crate::sql::catalog::{ColumnDef, S3FileInfo, TableDef, TableStorage};
+        use crate::sql::catalog::{ColumnDef, S3FileInfo, TableDef, ScanSource};
         use crate::sql::parser::dialect::{StarRocksDialect, normalize_for_raw_parse};
 
         // Build a synthetic `tbl(id int, name varchar)` table-def directly.
@@ -4020,7 +4020,7 @@ enable_path_style_access = true
             ],
             iceberg_row_lineage_metadata_columns: vec![],
             iceberg_table: None,
-            storage: TableStorage::S3ParquetFiles {
+            source: ScanSource::S3ParquetFiles {
                 files: Vec::<S3FileInfo>::new(),
                 cloud_properties: Default::default(),
             },

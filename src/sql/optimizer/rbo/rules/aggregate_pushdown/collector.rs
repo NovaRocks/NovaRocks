@@ -416,7 +416,7 @@ mod tests {
     }
 
     use crate::sql::analysis::{JoinKind, ProjectItem};
-    use crate::sql::catalog::{TableDef, TableStorage};
+    use crate::sql::catalog::{TableDef, ScanSource};
     use crate::sql::planner::plan::{FilterNode, JoinNode, ProjectNode, ScanNode};
 
     fn dummy_scan_with_cols(cols: &[(&str, DataType)]) -> LogicalPlan {
@@ -427,7 +427,7 @@ mod tests {
                 columns: vec![],
                 iceberg_row_lineage_metadata_columns: vec![],
                 iceberg_table: None,
-                storage: TableStorage::ManagedLake,
+                source: ScanSource::ManagedLake,
             },
             alias: None,
             columns: cols

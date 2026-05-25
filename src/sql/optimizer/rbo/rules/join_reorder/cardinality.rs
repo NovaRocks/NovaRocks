@@ -406,7 +406,7 @@ fn get_join_key_ndv(
 mod tests {
     use super::*;
     use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn};
-    use crate::sql::catalog::{ColumnDef, S3FileInfo, TableDef, TableStorage};
+    use crate::sql::catalog::{ColumnDef, S3FileInfo, TableDef, ScanSource};
     use crate::sql::column_id::ColumnId;
     use arrow::datatypes::DataType;
 
@@ -464,7 +464,7 @@ mod tests {
                 columns: col_defs,
                 iceberg_row_lineage_metadata_columns: vec![],
                 iceberg_table: None,
-                storage: TableStorage::S3ParquetFiles {
+                source: ScanSource::S3ParquetFiles {
                     files: vec![S3FileInfo {
                         path: format!("s3://bucket/{}.parquet", name),
                         size: 1000,

@@ -273,7 +273,7 @@ fn rewrite_children(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::catalog::{TableDef, TableStorage};
+    use crate::sql::catalog::{TableDef, ScanSource};
     use crate::sql::optimizer::rbo::rule::RewriteRule;
     use crate::sql::planner::plan::{FilterNode, ScanNode};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -286,7 +286,7 @@ mod tests {
                 columns: vec![],
                 iceberg_row_lineage_metadata_columns: vec![],
                 iceberg_table: None,
-                storage: TableStorage::ManagedLake,
+                source: ScanSource::ManagedLake,
             },
             alias: None,
             columns: vec![],

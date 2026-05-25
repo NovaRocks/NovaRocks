@@ -285,7 +285,7 @@ pub(crate) fn combine_with_and(mut predicates: Vec<TypedExpr>) -> Option<TypedEx
 mod tests {
     use super::*;
     use crate::sql::analysis::LiteralValue;
-    use crate::sql::catalog::{TableDef, TableStorage};
+    use crate::sql::catalog::{TableDef, ScanSource};
     use crate::sql::optimizer::memo::MExpr;
     use crate::sql::optimizer::operator::{LogicalFilterOp, LogicalJoinOp, LogicalScanOp};
     use std::path::PathBuf;
@@ -353,7 +353,7 @@ mod tests {
                     columns: Vec::new(),
                     iceberg_row_lineage_metadata_columns: Vec::new(),
                     iceberg_table: None,
-                    storage: TableStorage::ManagedLake,
+                    source: ScanSource::ManagedLake,
                 },
                 alias: None,
                 columns: vec![output(id, name)],

@@ -264,7 +264,7 @@ fn add_filter_group(memo: &mut Memo, child_group: GroupId, predicates: Vec<Typed
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::catalog::{TableDef, TableStorage};
+    use crate::sql::catalog::{TableDef, ScanSource};
     use crate::sql::optimizer::operator::LogicalScanOp;
     use std::path::PathBuf;
 
@@ -331,7 +331,7 @@ mod tests {
                     columns: Vec::new(),
                     iceberg_row_lineage_metadata_columns: Vec::new(),
                     iceberg_table: None,
-                    storage: TableStorage::ManagedLake,
+                    source: ScanSource::ManagedLake,
                 },
                 alias: None,
                 columns: vec![output(id, name)],

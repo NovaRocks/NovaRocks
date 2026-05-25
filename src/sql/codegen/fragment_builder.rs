@@ -86,7 +86,7 @@ fn add_iceberg_equality_delete_required_columns(
     required: &mut std::collections::HashSet<String>,
     table: &crate::sql::catalog::TableDef,
 ) -> Result<(), String> {
-    let crate::sql::catalog::TableStorage::S3ParquetFiles { files, .. } = &table.storage else {
+    let crate::sql::catalog::ScanSource::S3ParquetFiles { files, .. } = &table.source else {
         return Ok(());
     };
     let field_id_to_name: HashMap<i32, String> = table
@@ -2161,7 +2161,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             }],
             iceberg_row_lineage_metadata_columns: vec![],
             iceberg_table: None,
-            storage: crate::sql::catalog::TableStorage::S3ParquetFiles {
+            source: crate::sql::catalog::ScanSource::S3ParquetFiles {
                 files: vec![crate::sql::catalog::S3FileInfo {
                     path: path.display().to_string(),
                     size: file_len,
@@ -3348,7 +3348,7 @@ mod tests {
         CatalogProvider, ColumnDef, IcebergColumnStats, IcebergDeleteFileContent,
         IcebergDeleteFileFormat, IcebergDeleteFileInfo, IcebergPartitionFieldValue,
         IcebergPartitionValue, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
-        ManagedTabletRef, PhysicalTableLayout, S3FileInfo, TableDef, TableStorage,
+        ManagedTabletRef, PhysicalTableLayout, S3FileInfo, TableDef, ScanSource,
     };
     use crate::sql::optimizer::operator::{
         JoinDistribution, Operator, PhysicalDistributionOp, PhysicalHashJoinEqCondition,
@@ -3552,7 +3552,7 @@ mod tests {
                 },
                 serialized_metadata: None,
             }),
-            storage: TableStorage::S3ParquetFiles {
+            source: ScanSource::S3ParquetFiles {
                 files: vec![crate::sql::catalog::S3FileInfo {
                     path: "s3://bucket/data.parquet".to_string(),
                     size: 1,
@@ -3682,7 +3682,7 @@ mod tests {
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
-                    storage: TableStorage::S3ParquetFiles {
+                    source: ScanSource::S3ParquetFiles {
                         files: vec![crate::sql::catalog::S3FileInfo {
                             path: path.display().to_string(),
                             size: 0,
@@ -3726,7 +3726,7 @@ mod tests {
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
-                    storage: TableStorage::S3ParquetFiles {
+                    source: ScanSource::S3ParquetFiles {
                         files: vec![],
                         cloud_properties: BTreeMap::new(),
                     },
@@ -3770,7 +3770,7 @@ mod tests {
                         },
                         serialized_metadata: None,
                     }),
-                    storage: TableStorage::S3ParquetFiles {
+                    source: ScanSource::S3ParquetFiles {
                         files: vec![],
                         cloud_properties: BTreeMap::new(),
                     },
@@ -3814,7 +3814,7 @@ mod tests {
                         },
                         serialized_metadata: None,
                     }),
-                    storage: TableStorage::S3ParquetFiles {
+                    source: ScanSource::S3ParquetFiles {
                         files: vec![
                             iceberg_i32_file("s3://bucket/file-1-5.parquet", 1, 5),
                             iceberg_i32_file("s3://bucket/file-10-20.parquet", 10, 20),
@@ -3861,7 +3861,7 @@ mod tests {
                         },
                         serialized_metadata: None,
                     }),
-                    storage: TableStorage::S3ParquetFiles {
+                    source: ScanSource::S3ParquetFiles {
                         files: vec![
                             iceberg_i32_partition_file("s3://bucket/id-1.parquet", 1),
                             iceberg_i32_partition_file("s3://bucket/id-12.parquet", 12),
@@ -3910,7 +3910,7 @@ mod tests {
                         },
                         serialized_metadata: None,
                     }),
-                    storage: TableStorage::S3ParquetFiles {
+                    source: ScanSource::S3ParquetFiles {
                         files: vec![file],
                         cloud_properties: BTreeMap::new(),
                     },
@@ -3958,7 +3958,7 @@ mod tests {
                         },
                         serialized_metadata: None,
                     }),
-                    storage: TableStorage::S3ParquetFiles {
+                    source: ScanSource::S3ParquetFiles {
                         files: vec![file],
                         cloud_properties: BTreeMap::new(),
                     },

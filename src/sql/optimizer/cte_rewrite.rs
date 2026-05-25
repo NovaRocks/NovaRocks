@@ -277,7 +277,7 @@ fn replace_cte_consume(plan: LogicalPlan, cte_id: CteId, replacement: &LogicalPl
 mod tests {
     use super::*;
     use crate::sql::analysis::OutputColumn;
-    use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
+    use crate::sql::catalog::{ColumnDef, TableDef, ScanSource};
     use crate::sql::column_id::ColumnId;
     use arrow::datatypes::DataType;
     use std::path::PathBuf;
@@ -296,7 +296,7 @@ mod tests {
                 }],
                 iceberg_row_lineage_metadata_columns: vec![],
                 iceberg_table: None,
-                storage: TableStorage::ManagedLake,
+                source: ScanSource::ManagedLake,
             },
             alias: None,
             columns: vec![OutputColumn {

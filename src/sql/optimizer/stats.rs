@@ -1393,7 +1393,7 @@ fn child_output_columns(
 mod tests {
     use super::*;
     use crate::sql::analysis::{JoinKind, OutputColumn};
-    use crate::sql::catalog::{ColumnDef, S3FileInfo, TableDef, TableStorage};
+    use crate::sql::catalog::{ColumnDef, S3FileInfo, TableDef, ScanSource};
     use crate::sql::optimizer::convert::logical_plan_to_memo;
     use crate::sql::optimizer::memo::Memo;
     use crate::sql::planner::plan::*;
@@ -1453,7 +1453,7 @@ mod tests {
                 columns: col_defs,
                 iceberg_row_lineage_metadata_columns: vec![],
                 iceberg_table: None,
-                storage: TableStorage::S3ParquetFiles {
+                source: ScanSource::S3ParquetFiles {
                     files: vec![S3FileInfo {
                         path: format!("s3://bucket/{}.parquet", name),
                         size: 1000,

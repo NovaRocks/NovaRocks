@@ -4507,9 +4507,9 @@ enable_path_style_access = true
     /// `ns.orders(k BIGINT NOT NULL, v BIGINT)` so that
     /// `analyze_visible_output_types` can resolve the table schema.
     ///
-    /// The `TableStorage` path is unused during analysis-only calls.
+    /// The `ScanSource` path is unused during analysis-only calls.
     fn state_with_orders_table() -> Arc<crate::engine::StandaloneState> {
-        use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
+        use crate::sql::catalog::{ColumnDef, TableDef, ScanSource};
         let state = Arc::new(crate::engine::StandaloneState::default());
         {
             let mut catalog = state.catalog.write().expect("catalog write lock");
@@ -4535,7 +4535,7 @@ enable_path_style_access = true
                                 logical_type: None,
                             },
                         ],
-                        storage: TableStorage::ManagedLake,
+                        source: ScanSource::ManagedLake,
                         iceberg_row_lineage_metadata_columns: vec![],
                         iceberg_table: None,
                     },
