@@ -3,8 +3,6 @@
 
 use std::sync::{Arc, RwLock};
 
-use arrow::array::ArrayRef;
-use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::connector::backend::{
@@ -236,7 +234,7 @@ pub(crate) fn build_iceberg_table_def_for_delta_scan(
     let iceberg_table = Some(build_iceberg_table_info(&loaded));
     let columns =
         hide_novarocks_mv_internal_columns(loaded.table.metadata(), loaded.columns.clone())?;
-    let storage = register_empty_iceberg_table(namespace, table_name, &loaded.columns)?;
+    let storage = empty_iceberg_table_storage();
     let iceberg_row_lineage_metadata_columns = vec![
         ColumnDef {
             name: "_file".to_string(),
@@ -323,7 +321,7 @@ fn build_iceberg_table_def_with_data_files(
             cloud_properties: Default::default(),
         }
     } else {
-        register_empty_iceberg_table(namespace, table_name, &loaded.columns)?
+        empty_iceberg_table_storage()
     };
 
     let iceberg_row_lineage_metadata_columns = if has_data_files
@@ -579,38 +577,19 @@ pub(crate) fn row_lineage_enabled(metadata: &iceberg::spec::TableMetadata) -> bo
     }
 }
 
-fn register_empty_iceberg_table(
-    namespace: &str,
-    table_name: &str,
-    columns: &[ColumnDef],
-) -> Result<TableStorage, String> {
-    let dir = std::env::temp_dir().join("novarocks_iceberg_empty");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create empty dir: {e}"))?;
-    let path = dir.join(format!("{}_{}.parquet", namespace, table_name));
-    let schema = Arc::new(Schema::new(
-        columns
-            .iter()
-            .map(|column| Field::new(&column.name, column.data_type.clone(), column.nullable))
-            .collect::<Vec<_>>(),
-    ));
-    let empty_arrays: Vec<ArrayRef> = schema
-        .fields()
-        .iter()
-        .map(|field| arrow::array::new_empty_array(field.data_type()))
-        .collect();
-    let empty_batch = RecordBatch::try_new(Arc::clone(&schema), empty_arrays)
-        .map_err(|e| format!("build empty batch: {e}"))?;
-    let file =
-        std::fs::File::create(&path).map_err(|e| format!("create parquet file failed: {e}"))?;
-    let mut writer = parquet::arrow::ArrowWriter::try_new(file, schema, None)
-        .map_err(|e| format!("create parquet writer failed: {e}"))?;
-    writer
-        .write(&empty_batch)
-        .map_err(|e| format!("write parquet batch failed: {e}"))?;
-    writer
-        .close()
-        .map_err(|e| format!("close parquet writer failed: {e}"))?;
-    Ok(TableStorage::LocalParquetFile { path })
+/// Storage marker for an Iceberg table that has no data files yet.
+///
+/// The scan path treats `S3ParquetFiles { files: vec![] }` as "no
+/// ranges to read"; the runtime returns an empty result without ever
+/// touching the filesystem. This replaces the previous
+/// `/tmp/novarocks_iceberg_empty/${ns}_${tbl}.parquet` placeholder file
+/// — that was a workaround for the `LocalParquetFile` lane which is
+/// being retired.
+fn empty_iceberg_table_storage() -> TableStorage {
+    TableStorage::S3ParquetFiles {
+        files: Vec::new(),
+        cloud_properties: Default::default(),
+    }
 }
 
 pub(crate) struct IcebergTableSink {
