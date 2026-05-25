@@ -177,7 +177,7 @@ pub struct PhysicalTableLayout {
 /// Plan-time description of how the scan operator enumerates physical
 /// inputs for a table. Each variant covers a different lane:
 ///
-/// - `ManagedLake`: managed-lake table; the actual tablet/version
+/// - `StarRocks`: managed-lake table; the actual tablet/version
 ///   layout flows separately through `PhysicalTableLayout`.
 /// - `S3ParquetFiles`: Iceberg `rest`/`hadoop`/IVM-delta-stamped /
 ///   `generate_series` parquet files — a concrete list of data files
@@ -195,7 +195,7 @@ pub enum ScanSource {
     /// list) is carried separately on `PhysicalTableLayout`, so this
     /// variant is a marker without payload — the catalog only needs to
     /// know "this table flows through the managed-lake scan path".
-    ManagedLake,
+    StarRocks,
     S3ParquetFiles {
         files: Vec<S3FileInfo>,
         cloud_properties: BTreeMap<String, String>,

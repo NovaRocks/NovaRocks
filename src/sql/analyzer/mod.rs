@@ -2429,7 +2429,7 @@ mod tests {
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
-                    source: ScanSource::ManagedLake,
+                    source: ScanSource::StarRocks,
                 }),
                 "lineitem" => Ok(TableDef {
                     name: "lineitem".to_string(),
@@ -2500,7 +2500,7 @@ mod tests {
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
-                    source: ScanSource::ManagedLake,
+                    source: ScanSource::StarRocks,
                 }),
                 "supplier" => Ok(TableDef {
                     name: "supplier".to_string(),
@@ -2529,7 +2529,7 @@ mod tests {
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
-                    source: ScanSource::ManagedLake,
+                    source: ScanSource::StarRocks,
                 }),
                 "part" => Ok(TableDef {
                     name: "part".to_string(),
@@ -2558,7 +2558,7 @@ mod tests {
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
-                    source: ScanSource::ManagedLake,
+                    source: ScanSource::StarRocks,
                 }),
                 "partsupp" => Ok(TableDef {
                     name: "partsupp".to_string(),
@@ -2594,7 +2594,7 @@ mod tests {
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
-                    source: ScanSource::ManagedLake,
+                    source: ScanSource::StarRocks,
                 }),
                 "customer" => Ok(TableDef {
                     name: "customer".to_string(),
@@ -2623,7 +2623,7 @@ mod tests {
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
-                    source: ScanSource::ManagedLake,
+                    source: ScanSource::StarRocks,
                 }),
                 "nation" => Ok(TableDef {
                     name: "nation".to_string(),
@@ -2645,7 +2645,7 @@ mod tests {
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
-                    source: ScanSource::ManagedLake,
+                    source: ScanSource::StarRocks,
                 }),
                 // IVM-A1 v3-row-lineage fixture: an iceberg-backed base
                 // table exposing the row-lineage metadata pseudo-columns

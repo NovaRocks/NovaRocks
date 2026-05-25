@@ -11,28 +11,28 @@ use crate::sql::parser::ast::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MvStorageEngine {
-    ManagedLake,
+    StarRocks,
     Iceberg,
 }
 
 impl MvStorageEngine {
     pub(crate) fn as_sql_str(self) -> &'static str {
         match self {
-            Self::ManagedLake => "managed_lake",
+            Self::StarRocks => "managed_lake",
             Self::Iceberg => "iceberg",
         }
     }
 
     pub(crate) fn backend_name(self) -> &'static str {
         match self {
-            Self::ManagedLake => "managed",
+            Self::StarRocks => "managed",
             Self::Iceberg => "iceberg",
         }
     }
 
     pub(crate) fn from_sql_str(value: &str) -> Result<Self, String> {
         match value.to_ascii_lowercase().as_str() {
-            "managed_lake" | "managed" => Ok(Self::ManagedLake),
+            "managed_lake" | "managed" => Ok(Self::StarRocks),
             "iceberg" => Ok(Self::Iceberg),
             _ => Err(format!(
                 "unknown materialized view storage_engine `{value}`"
@@ -120,7 +120,7 @@ pub(crate) struct RefreshPlan {
 
 #[derive(Clone, Debug)]
 pub(crate) enum BackendRefreshPlan {
-    ManagedLake(ManagedLakeRefreshPlan),
+    StarRocks(ManagedLakeRefreshPlan),
     Iceberg(IcebergRefreshPlan),
 }
 
@@ -151,7 +151,7 @@ pub(crate) struct RefreshOutcome {
 
 #[derive(Clone, Debug)]
 pub(crate) enum BackendRefreshOutcome {
-    ManagedLake(ManagedLakeRefreshOutcome),
+    StarRocks(ManagedLakeRefreshOutcome),
     Iceberg(IcebergRefreshOutcome),
 }
 
@@ -273,17 +273,17 @@ mod tests {
 
     #[test]
     fn storage_engine_maps_to_backend_name() {
-        assert_eq!(MvStorageEngine::ManagedLake.as_sql_str(), "managed_lake");
-        assert_eq!(MvStorageEngine::ManagedLake.backend_name(), "managed");
+        assert_eq!(MvStorageEngine::StarRocks.as_sql_str(), "managed_lake");
+        assert_eq!(MvStorageEngine::StarRocks.backend_name(), "managed");
         assert_eq!(MvStorageEngine::Iceberg.as_sql_str(), "iceberg");
         assert_eq!(MvStorageEngine::Iceberg.backend_name(), "iceberg");
         assert_eq!(
             MvStorageEngine::from_sql_str("managed_lake").unwrap(),
-            MvStorageEngine::ManagedLake
+            MvStorageEngine::StarRocks
         );
         assert_eq!(
             MvStorageEngine::from_sql_str("managed").unwrap(),
-            MvStorageEngine::ManagedLake
+            MvStorageEngine::StarRocks
         );
         assert_eq!(
             MvStorageEngine::from_sql_str("iceberg").unwrap(),

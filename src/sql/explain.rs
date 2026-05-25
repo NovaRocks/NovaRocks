@@ -805,7 +805,7 @@ fn scan_supports_decode_hint(
     required_columns: &[String],
 ) -> bool {
     match &table.source {
-        ScanSource::S3ParquetFiles { .. } | ScanSource::ManagedLake => {
+        ScanSource::S3ParquetFiles { .. } | ScanSource::StarRocks => {
             required_columns.iter().any(|required| {
                 table
                     .columns
@@ -828,7 +828,7 @@ fn scan_supports_min_max_stats(
     required_columns: &[String],
 ) -> bool {
     match &table.source {
-        ScanSource::S3ParquetFiles { .. } | ScanSource::ManagedLake => {}
+        ScanSource::S3ParquetFiles { .. } | ScanSource::StarRocks => {}
         // Iceberg metadata tables do not produce parquet column statistics.
         ScanSource::IcebergMetadataTable { .. } => return false,
         // IVM delta-scan is a synthetic placeholder; no parquet stats.

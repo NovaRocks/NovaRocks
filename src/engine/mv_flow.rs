@@ -98,7 +98,7 @@ mod lifecycle_tests {
             Ok(RefreshPlan {
                 mv_id: Some(1),
                 target: req.target,
-                storage_engine: MvStorageEngine::ManagedLake,
+                storage_engine: MvStorageEngine::StarRocks,
                 mode: RefreshMode::Incremental,
                 base_refs: vec![MvBaseRef {
                     catalog: "ice".to_string(),
@@ -109,7 +109,7 @@ mod lifecycle_tests {
                 affected_partitions: crate::engine::mv::partition::AffectedMvPartitions::unknown(
                     "mock MV backend does not plan affected partitions",
                 ),
-                backend_plan: BackendRefreshPlan::ManagedLake(ManagedLakeRefreshPlan {
+                backend_plan: BackendRefreshPlan::StarRocks(ManagedLakeRefreshPlan {
                     stmt: req.statement,
                     current_catalog: req.current_catalog,
                     current_database: req.current_database,
@@ -133,7 +133,7 @@ mod lifecycle_tests {
                 base_snapshots: Default::default(),
                 base_table_uuids: Default::default(),
                 target_snapshot_id: None,
-                backend_outcome: BackendRefreshOutcome::ManagedLake(ManagedLakeRefreshOutcome {
+                backend_outcome: BackendRefreshOutcome::StarRocks(ManagedLakeRefreshOutcome {
                     completed_inside_execute: true,
                 }),
             })
@@ -484,7 +484,7 @@ pub(crate) fn drop_mv(
             return Ok(StatementResult::Ok);
         }
     }
-    backend_by_engine(state, MvStorageEngine::ManagedLake)?.drop_mv(DropMvRequest {
+    backend_by_engine(state, MvStorageEngine::StarRocks)?.drop_mv(DropMvRequest {
         stmt: stmt.clone(),
         current_catalog: current_catalog.map(str::to_string),
         current_database: db.to_string(),
@@ -552,7 +552,7 @@ pub(crate) fn refresh_mv(
             &stmt.name,
         )?;
         let engine = existing_mv_storage_engine_by_target(state, &target)?
-            .unwrap_or(MvStorageEngine::ManagedLake);
+            .unwrap_or(MvStorageEngine::StarRocks);
         (
             MvTarget {
                 catalog: current_catalog.map(str::to_string),
@@ -570,7 +570,7 @@ pub(crate) fn refresh_mv(
                 database,
                 name,
             },
-            MvStorageEngine::ManagedLake,
+            MvStorageEngine::StarRocks,
         )
     };
     let requested_object = match engine {
@@ -582,7 +582,7 @@ pub(crate) fn refresh_mv(
             &target.database,
             &target.name,
         ),
-        MvStorageEngine::ManagedLake => {
+        MvStorageEngine::StarRocks => {
             crate::engine::mv::dependency::managed_mv_dependency_ref(&target.database, &target.name)
         }
     };

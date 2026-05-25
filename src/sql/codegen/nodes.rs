@@ -620,11 +620,11 @@ pub(crate) fn build_exec_params_multi(
                     // morsel for the runtime to dispatch on.
                     vec![build_iceberg_metadata_scan_range_params()]
                 }
-                ScanSource::ManagedLake => {
+                ScanSource::StarRocks => {
                     // Managed-lake tables reach this builder via the
                     // outer `if let Some(layout)` branch above; falling
                     // through to here means the planner produced a
-                    // `ManagedLake` TableDef without a populated
+                    // `StarRocks` TableDef without a populated
                     // `PhysicalTableLayout`, which is a bug.
                     return Err(format!(
                         "managed-lake table {}.{} reached scan-range builder \

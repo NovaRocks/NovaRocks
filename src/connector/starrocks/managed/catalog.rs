@@ -619,7 +619,7 @@ fn managed_table_def(runtime: &ManagedTableRuntime) -> Result<TableDef, String> 
         columns,
         iceberg_row_lineage_metadata_columns: vec![],
         iceberg_table: None,
-        source: ScanSource::ManagedLake,
+        source: ScanSource::StarRocks,
     })
 }
 
@@ -964,7 +964,7 @@ mod tests {
                 },
             ]
         );
-        assert!(matches!(table.source, ScanSource::ManagedLake));
+        assert!(matches!(table.source, ScanSource::StarRocks));
 
         let layout = catalog
             .get_physical_layout(DEFAULT_DATABASE, "managed_tbl")

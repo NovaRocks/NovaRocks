@@ -180,7 +180,7 @@ mod tests {
                     .collect(),
                 iceberg_row_lineage_metadata_columns: vec![],
                 iceberg_table: None,
-                source: ScanSource::ManagedLake,
+                source: ScanSource::StarRocks,
             },
             alias: Some(table_name.into()),
             columns: cols

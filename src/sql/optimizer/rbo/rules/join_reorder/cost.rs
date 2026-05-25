@@ -149,7 +149,7 @@ mod tests {
                 columns: vec![],
                 iceberg_row_lineage_metadata_columns: vec![],
                 iceberg_table: None,
-                source: crate::sql::catalog::ScanSource::ManagedLake,
+                source: crate::sql::catalog::ScanSource::StarRocks,
             },
             alias: None,
             columns: vec![],

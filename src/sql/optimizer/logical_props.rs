@@ -353,7 +353,7 @@ mod tests {
                     columns: Vec::new(),
                     iceberg_row_lineage_metadata_columns: Vec::new(),
                     iceberg_table: None,
-                    source: ScanSource::ManagedLake,
+                    source: ScanSource::StarRocks,
                 },
                 alias: None,
                 columns: vec![output(id, name)],

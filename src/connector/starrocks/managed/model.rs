@@ -97,21 +97,21 @@ pub(crate) struct StoredMaterializedView {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ManagedMvStorageEngine {
-    ManagedLake,
+    StarRocks,
     Iceberg,
 }
 
 impl ManagedMvStorageEngine {
     pub(crate) fn as_sql_str(self) -> &'static str {
         match self {
-            Self::ManagedLake => "managed_lake",
+            Self::StarRocks => "managed_lake",
             Self::Iceberg => "iceberg",
         }
     }
 
     pub(crate) fn parse_sql_str(value: &str) -> Result<Self, String> {
         match value.to_ascii_lowercase().as_str() {
-            "managed_lake" => Ok(Self::ManagedLake),
+            "managed_lake" => Ok(Self::StarRocks),
             "iceberg" => Ok(Self::Iceberg),
             _ => Err(format!(
                 "unknown materialized view storage_engine `{value}`"

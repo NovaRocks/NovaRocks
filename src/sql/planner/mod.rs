@@ -1904,7 +1904,7 @@ mod tests {
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
-                    source: ScanSource::ManagedLake,
+                    source: ScanSource::StarRocks,
                 }),
                 "maps" => Ok(TableDef {
                     name: "maps".to_string(),
@@ -1938,7 +1938,7 @@ mod tests {
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
-                    source: ScanSource::ManagedLake,
+                    source: ScanSource::StarRocks,
                 }),
                 other => Err(format!("unknown test table: {other}")),
             }

@@ -115,7 +115,7 @@ fn estimate_size(plan: &LogicalPlan) -> u64 {
                 // file-system-metadata fallback the legacy
                 // `LocalParquetFile` arm produced when its placeholder
                 // path didn't exist).
-                ScanSource::ManagedLake => 1_000_000,
+                ScanSource::StarRocks => 1_000_000,
             };
             // Apply selectivity for pushed-down predicates on the scan
             let num_predicates = s.predicates.len();

@@ -258,7 +258,7 @@ impl MvBackend for ManagedLakeMvBackend {
             &state,
             req.current_catalog.as_deref(),
             &req.stmt,
-            Some(MvStorageEngine::ManagedLake),
+            Some(MvStorageEngine::StarRocks),
         )
     }
 
@@ -266,7 +266,7 @@ impl MvBackend for ManagedLakeMvBackend {
         Ok(RefreshPlan {
             mv_id: None,
             target: req.target,
-            storage_engine: MvStorageEngine::ManagedLake,
+            storage_engine: MvStorageEngine::StarRocks,
             mode: RefreshMode::Incremental,
             base_refs: vec![MvBaseRef {
                 catalog: "managed".to_string(),
@@ -277,7 +277,7 @@ impl MvBackend for ManagedLakeMvBackend {
             affected_partitions: crate::engine::mv::partition::AffectedMvPartitions::unknown(
                 "managed-lake MV partition planning is not implemented",
             ),
-            backend_plan: BackendRefreshPlan::ManagedLake(ManagedLakeRefreshPlan {
+            backend_plan: BackendRefreshPlan::StarRocks(ManagedLakeRefreshPlan {
                 stmt: req.statement,
                 current_catalog: req.current_catalog,
                 current_database: req.current_database,
@@ -290,7 +290,7 @@ impl MvBackend for ManagedLakeMvBackend {
         plan: &RefreshPlan,
         _ctx: &mut RefreshCtx,
     ) -> Result<RefreshOutcome, RefreshError> {
-        let BackendRefreshPlan::ManagedLake(plan_payload) = &plan.backend_plan else {
+        let BackendRefreshPlan::StarRocks(plan_payload) = &plan.backend_plan else {
             return Err(RefreshError::user(
                 "managed-lake backend received non-managed refresh plan",
             ));
@@ -310,7 +310,7 @@ impl MvBackend for ManagedLakeMvBackend {
             base_snapshots: Default::default(),
             base_table_uuids: Default::default(),
             target_snapshot_id: None,
-            backend_outcome: BackendRefreshOutcome::ManagedLake(ManagedLakeRefreshOutcome {
+            backend_outcome: BackendRefreshOutcome::StarRocks(ManagedLakeRefreshOutcome {
                 completed_inside_execute: true,
             }),
         })

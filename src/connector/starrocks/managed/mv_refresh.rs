@@ -3971,7 +3971,7 @@ enable_path_style_access = true
                         select_sql: "SELECT id FROM missing_catalog.ns.orders".to_string(),
                         base_table_refs: vec!["missing_catalog.ns.orders".to_string()],
                         primary_key_columns: Vec::new(),
-                        storage_engine: ManagedMvStorageEngine::ManagedLake
+                        storage_engine: ManagedMvStorageEngine::StarRocks
                             .as_sql_str()
                             .to_string(),
                         target_catalog: None,
@@ -4120,7 +4120,7 @@ enable_path_style_access = true
                 last_refresh_table_uuids: Default::default(),
                 primary_key_columns: Vec::new(),
                 created_at_ms: 1,
-                storage_engine: ManagedMvStorageEngine::ManagedLake,
+                storage_engine: ManagedMvStorageEngine::StarRocks,
                 iceberg_table_identifier: None,
                 target_catalog: None,
                 target_namespace: None,
@@ -4535,7 +4535,7 @@ enable_path_style_access = true
                                 logical_type: None,
                             },
                         ],
-                        source: ScanSource::ManagedLake,
+                        source: ScanSource::StarRocks,
                         iceberg_row_lineage_metadata_columns: vec![],
                         iceberg_table: None,
                     },

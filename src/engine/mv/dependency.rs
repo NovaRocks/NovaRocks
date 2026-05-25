@@ -43,7 +43,7 @@ pub(crate) fn managed_mv_dependency_ref(database: &str, table: &str) -> MvDepend
         database_or_namespace: database.to_string(),
         name: table.to_string(),
         object_type: MvDependencyObjectType::MaterializedView,
-        storage_engine: MvDependencyStorageEngine::ManagedLake,
+        storage_engine: MvDependencyStorageEngine::StarRocks,
     }
 }
 
@@ -67,7 +67,7 @@ pub(crate) fn managed_table_object_ref(database: &str, table: &str) -> MvDepende
         database_or_namespace: database.to_string(),
         name: table.to_string(),
         object_type: MvDependencyObjectType::Table,
-        storage_engine: MvDependencyStorageEngine::ManagedLake,
+        storage_engine: MvDependencyStorageEngine::StarRocks,
     }
 }
 
@@ -156,7 +156,7 @@ pub(crate) fn resolve_create_mv_dependencies(
                     created_at_ms,
                 });
             }
-            ResolvedTableRef::ManagedLake { database, table } => {
+            ResolvedTableRef::StarRocks { database, table } => {
                 let managed = state
                     .managed_lake
                     .read()
@@ -396,8 +396,8 @@ pub(crate) fn refresh_step_for_dependency_object(
         ));
     }
     let storage_engine = match object.storage_engine {
-        MvDependencyStorageEngine::ManagedLake => {
-            crate::engine::mv::lifecycle::MvStorageEngine::ManagedLake
+        MvDependencyStorageEngine::StarRocks => {
+            crate::engine::mv::lifecycle::MvStorageEngine::StarRocks
         }
         MvDependencyStorageEngine::Iceberg => {
             crate::engine::mv::lifecycle::MvStorageEngine::Iceberg
