@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use bytes::Bytes;
 use novarocks::meta::keys::{NS_JOB, NS_MANAGED_TXN};
 use novarocks::meta::repository::iceberg_catalog::{
     IcebergCatalogMetaRepository, IcebergCatalogProperties, IcebergNamespaceRecord,
@@ -163,6 +164,40 @@ fn sample_mv_partition_contract() -> MvPartitionContract {
             transform: MvPartitionTransformContract::Bucket { num_buckets: 16 },
         }],
     }
+}
+
+#[test]
+fn repository_rejects_unknown_avro_schema_id() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let key = MetaKey::new("mv", ["by-id", "777"])?;
+    {
+        let mut txn = provider.begin_write("write unknown schema id")?;
+        txn.put(MetaRecordPut::new(
+            key,
+            MetaRecordKind::new("mv.definition")?,
+            ExpectedRevision::NotExists,
+            novarocks::meta::MetaPayload::avro(
+                999,
+                "0000000000000000",
+                Bytes::from_static(b"not-valid-avro"),
+            ),
+        ))?;
+        txn.commit()?;
+    }
+
+    let repository = MvMetaRepository::default();
+    let read = provider.begin_read()?;
+    let err = repository
+        .load_by_id(read.as_ref(), 777)
+        .expect_err("unknown schema id should fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unknown Avro schema entry for subject `mv.definition` id 999"),
+        "{err}"
+    );
+    assert!(msg.contains("by-id/777"), "{err}");
+    Ok(())
 }
 
 #[test]

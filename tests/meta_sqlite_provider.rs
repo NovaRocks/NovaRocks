@@ -296,6 +296,49 @@ fn sqlite_provider_rejects_avro_store_with_json_payload_rows() -> TestResult {
 }
 
 #[test]
+fn sqlite_provider_rejects_nonempty_store_missing_format_marker() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("meta.sqlite");
+    {
+        let conn = Connection::open(&path)?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE meta_provider_schema (
+                key TEXT PRIMARY KEY,
+                value BLOB NOT NULL
+            );
+            CREATE TABLE meta_records (
+                namespace TEXT NOT NULL,
+                key TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                payload_encoding TEXT NOT NULL,
+                payload_schema_id INTEGER NOT NULL,
+                payload_schema_fingerprint TEXT NOT NULL,
+                payload BLOB NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY(namespace, key)
+            );
+            CREATE TABLE meta_id_scopes (
+                scope TEXT PRIMARY KEY,
+                next_id INTEGER NOT NULL
+            );
+            INSERT INTO meta_records(
+                namespace, key, kind, revision, payload_encoding, payload_schema_id,
+                payload_schema_fingerprint, payload, created_at_ms, updated_at_ms
+            )
+            VALUES('mv', 'by-id/1', 'mv.definition', 1, 'avro', 1, '0000000000000000', X'00', 1, 1);
+            "#,
+        )?;
+    }
+
+    let err = SqliteMetaStoreProvider::open(&path).expect_err("missing marker must fail");
+    assert!(err.to_string().contains("missing store_format marker"), "{err}");
+    Ok(())
+}
+
+#[test]
 fn sqlite_provider_rejects_empty_legacy_json_store_with_id_scopes() -> TestResult {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("meta.sqlite");
