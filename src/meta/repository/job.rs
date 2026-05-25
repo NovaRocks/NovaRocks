@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::meta::keys::NS_JOB;
 use crate::meta::repository::{
-    RepositoryError, RepositoryResult, decode_json_payload, encode_json_payload, id_scopes,
+    RepositoryError, RepositoryResult, decode_payload_for_kind, encode_record_payload, id_scopes,
 };
 use crate::meta::{
     ExpectedRevision, MetaKey, MetaKeyPrefix, MetaReadTxn, MetaRecord, MetaRecordKind,
@@ -11,8 +11,6 @@ use crate::meta::{
 
 const ERASE_JOB_KIND: &str = "job.erase";
 const ICEBERG_OPTIMIZE_JOB_KIND: &str = "job.iceberg_optimize";
-const ERASE_JOB_SCHEMA_VERSION: i32 = 1;
-const ICEBERG_OPTIMIZE_JOB_SCHEMA_VERSION: i32 = 1;
 
 #[derive(Default)]
 pub struct JobMetaRepository;
@@ -241,7 +239,7 @@ impl JobMetaRepository {
     ) -> RepositoryResult<Vec<StoredEraseJob>> {
         txn.scan(&key_prefix_erase_jobs()?, None)?
             .into_iter()
-            .map(|record| decode_record_payload(&record, ERASE_JOB_KIND, ERASE_JOB_SCHEMA_VERSION))
+            .map(|record| decode_record_payload(&record, ERASE_JOB_KIND))
             .filter_map(|result| match result {
                 Ok(job) if is_runnable(&job, now_ms) => Some(Ok(job)),
                 Ok(_) => None,
@@ -480,7 +478,7 @@ fn load_versioned_erase_job(
 ) -> RepositoryResult<Option<VersionedEraseJob>> {
     txn.get(&key_erase_job(job_id)?)?
         .map(|record| {
-            let value = decode_record_payload(&record, ERASE_JOB_KIND, ERASE_JOB_SCHEMA_VERSION)?;
+            let value = decode_record_payload(&record, ERASE_JOB_KIND)?;
             Ok(VersionedEraseJob {
                 record_revision: record.revision,
                 value,
@@ -493,7 +491,7 @@ fn load_versioned_erase_jobs(txn: &dyn MetaReadTxn) -> RepositoryResult<Vec<Vers
     txn.scan(&key_prefix_erase_jobs()?, None)?
         .into_iter()
         .map(|record| {
-            let value = decode_record_payload(&record, ERASE_JOB_KIND, ERASE_JOB_SCHEMA_VERSION)?;
+            let value = decode_record_payload(&record, ERASE_JOB_KIND)?;
             Ok(VersionedEraseJob {
                 record_revision: record.revision,
                 value,
@@ -511,7 +509,7 @@ fn put_erase_job(
         key_erase_job(stored.job_id)?,
         record_kind(ERASE_JOB_KIND)?,
         expected,
-        encode_json_payload(ERASE_JOB_SCHEMA_VERSION, stored)?,
+        encode_record_payload(ERASE_JOB_KIND, stored)?,
     ))?;
     Ok(())
 }
@@ -531,11 +529,7 @@ fn load_versioned_iceberg_optimize_job(
 ) -> RepositoryResult<Option<VersionedIcebergOptimizeJob>> {
     txn.get(&key_iceberg_optimize_job(job_id)?)?
         .map(|record| {
-            let value = decode_record_payload(
-                &record,
-                ICEBERG_OPTIMIZE_JOB_KIND,
-                ICEBERG_OPTIMIZE_JOB_SCHEMA_VERSION,
-            )?;
+            let value = decode_record_payload(&record, ICEBERG_OPTIMIZE_JOB_KIND)?;
             Ok(VersionedIcebergOptimizeJob {
                 record_revision: record.revision,
                 value,
@@ -550,11 +544,7 @@ fn load_versioned_iceberg_optimize_jobs(
     txn.scan(&key_prefix_iceberg_optimize_jobs()?, None)?
         .into_iter()
         .map(|record| {
-            let value = decode_record_payload(
-                &record,
-                ICEBERG_OPTIMIZE_JOB_KIND,
-                ICEBERG_OPTIMIZE_JOB_SCHEMA_VERSION,
-            )?;
+            let value = decode_record_payload(&record, ICEBERG_OPTIMIZE_JOB_KIND)?;
             Ok(VersionedIcebergOptimizeJob {
                 record_revision: record.revision,
                 value,
@@ -592,16 +582,12 @@ fn put_iceberg_optimize_job(
         key_iceberg_optimize_job(stored.id)?,
         record_kind(ICEBERG_OPTIMIZE_JOB_KIND)?,
         expected,
-        encode_json_payload(ICEBERG_OPTIMIZE_JOB_SCHEMA_VERSION, stored)?,
+        encode_record_payload(ICEBERG_OPTIMIZE_JOB_KIND, stored)?,
     ))?;
     Ok(())
 }
 
-fn decode_record_payload<T>(
-    record: &MetaRecord,
-    expected_kind: &str,
-    expected_schema_version: i32,
-) -> RepositoryResult<T>
+fn decode_record_payload<T>(record: &MetaRecord, expected_kind: &str) -> RepositoryResult<T>
 where
     T: for<'de> Deserialize<'de>,
 {
@@ -612,14 +598,12 @@ where
             record.kind.as_str()
         )));
     }
-    if record.payload.schema_version != expected_schema_version {
-        return Err(RepositoryError::provider(format!(
-            "metadata record {} has schema version {}, expected {expected_schema_version}",
-            record.key.canonical_path(),
-            record.payload.schema_version
-        )));
-    }
-    decode_json_payload(&record.payload)
+    decode_payload_for_kind(expected_kind, &record.payload).map_err(|err| {
+        RepositoryError::provider(format!(
+            "failed to decode metadata record {} as {expected_kind}: {err}",
+            record.key.canonical_path()
+        ))
+    })
 }
 
 fn record_kind(value: &str) -> RepositoryResult<MetaRecordKind> {

@@ -1,8 +1,10 @@
+use serde::de::{Error as DeError, SeqAccess, Visitor};
+use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 
 use crate::meta::keys::{NS_MANAGED, normalize_lookup_name};
 use crate::meta::repository::{
-    RepositoryError, RepositoryResult, decode_json_payload, encode_json_payload, id_scopes,
+    RepositoryError, RepositoryResult, decode_payload_for_kind, encode_record_payload, id_scopes,
 };
 use crate::meta::{
     ExpectedRevision, MetaKey, MetaKeyPrefix, MetaReadTxn, MetaRecord, MetaRecordKind,
@@ -18,16 +20,6 @@ const MANAGED_COLUMN_KIND: &str = "managed.column";
 const MANAGED_PARTITION_KIND: &str = "managed.partition";
 const MANAGED_INDEX_KIND: &str = "managed.index";
 const MANAGED_TABLET_KIND: &str = "managed.tablet";
-
-const MANAGED_DATABASE_SCHEMA_VERSION: i32 = 1;
-const MANAGED_DATABASE_NAME_SCHEMA_VERSION: i32 = 1;
-const MANAGED_TABLE_SCHEMA_VERSION: i32 = 1;
-const MANAGED_TABLE_NAME_SCHEMA_VERSION: i32 = 1;
-const MANAGED_SCHEMA_SCHEMA_VERSION: i32 = 1;
-const MANAGED_COLUMN_SCHEMA_VERSION: i32 = 1;
-const MANAGED_PARTITION_SCHEMA_VERSION: i32 = 1;
-const MANAGED_INDEX_SCHEMA_VERSION: i32 = 1;
-const MANAGED_TABLET_SCHEMA_VERSION: i32 = 1;
 
 #[derive(Default)]
 pub struct ManagedLakeMetaRepository;
@@ -67,6 +59,90 @@ pub struct StoredManagedSchema {
     pub table_id: i64,
     pub schema_version: i64,
     pub tablet_schema_pb: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredManagedSchemaAvro {
+    schema_id: i64,
+    table_id: i64,
+    schema_version: i64,
+    #[serde(with = "avro_bytes_vec")]
+    tablet_schema_pb: Vec<u8>,
+}
+
+impl From<&StoredManagedSchema> for StoredManagedSchemaAvro {
+    fn from(value: &StoredManagedSchema) -> Self {
+        Self {
+            schema_id: value.schema_id,
+            table_id: value.table_id,
+            schema_version: value.schema_version,
+            tablet_schema_pb: value.tablet_schema_pb.clone(),
+        }
+    }
+}
+
+impl From<StoredManagedSchemaAvro> for StoredManagedSchema {
+    fn from(value: StoredManagedSchemaAvro) -> Self {
+        Self {
+            schema_id: value.schema_id,
+            table_id: value.table_id,
+            schema_version: value.schema_version,
+            tablet_schema_pb: value.tablet_schema_pb,
+        }
+    }
+}
+
+mod avro_bytes_vec {
+    use super::*;
+
+    pub fn serialize<S>(value: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(value)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_byte_buf(BytesVecVisitor)
+    }
+
+    struct BytesVecVisitor;
+
+    impl<'de> Visitor<'de> for BytesVecVisitor {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("Avro bytes")
+        }
+
+        fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+        where
+            E: DeError,
+        {
+            Ok(value.to_vec())
+        }
+
+        fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
+        where
+            E: DeError,
+        {
+            Ok(value)
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+            while let Some(byte) = seq.next_element()? {
+                bytes.push(byte);
+            }
+            Ok(bytes)
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -256,11 +332,7 @@ impl ManagedLakeMetaRepository {
         let Some(record) = txn.get(&key_database_name(name)?)? else {
             return Ok(None);
         };
-        let lookup: IdLookup = decode_record_payload(
-            &record,
-            MANAGED_DATABASE_NAME_KIND,
-            MANAGED_DATABASE_NAME_SCHEMA_VERSION,
-        )?;
+        let lookup: IdLookup = decode_record_payload(&record, MANAGED_DATABASE_NAME_KIND)?;
         self.load_database(txn, lookup.id)
     }
 
@@ -270,13 +342,7 @@ impl ManagedLakeMetaRepository {
         db_id: i64,
     ) -> RepositoryResult<Option<StoredManagedDatabase>> {
         txn.get(&key_database(db_id)?)?
-            .map(|record| {
-                decode_record_payload(
-                    &record,
-                    MANAGED_DATABASE_KIND,
-                    MANAGED_DATABASE_SCHEMA_VERSION,
-                )
-            })
+            .map(|record| decode_record_payload(&record, MANAGED_DATABASE_KIND))
             .transpose()
     }
 
@@ -287,11 +353,7 @@ impl ManagedLakeMetaRepository {
     ) -> RepositoryResult<StoredManagedDatabase> {
         let lookup_key = key_database_name(&req.name)?;
         if let Some(record) = txn.get(&lookup_key)? {
-            let _: IdLookup = decode_record_payload(
-                &record,
-                MANAGED_DATABASE_NAME_KIND,
-                MANAGED_DATABASE_NAME_SCHEMA_VERSION,
-            )?;
+            let _: IdLookup = decode_record_payload(&record, MANAGED_DATABASE_NAME_KIND)?;
             return Err(RepositoryError::conflict(format!(
                 "managed database {} already exists",
                 req.name
@@ -306,16 +368,13 @@ impl ManagedLakeMetaRepository {
             key_database(database.db_id)?,
             record_kind(MANAGED_DATABASE_KIND)?,
             ExpectedRevision::NotExists,
-            encode_json_payload(MANAGED_DATABASE_SCHEMA_VERSION, &database)?,
+            encode_record_payload(MANAGED_DATABASE_KIND, &database)?,
         ))?;
         txn.put(MetaRecordPut::new(
             lookup_key,
             record_kind(MANAGED_DATABASE_NAME_KIND)?,
             ExpectedRevision::NotExists,
-            encode_json_payload(
-                MANAGED_DATABASE_NAME_SCHEMA_VERSION,
-                &IdLookup { id: database.db_id },
-            )?,
+            encode_record_payload(MANAGED_DATABASE_NAME_KIND, &IdLookup { id: database.db_id })?,
         ))?;
         Ok(database)
     }
@@ -327,11 +386,7 @@ impl ManagedLakeMetaRepository {
     ) -> RepositoryResult<StoredManagedTable> {
         let lookup_key = key_table_name(req.db_id, &req.name)?;
         if let Some(record) = txn.get(&lookup_key)? {
-            let _: IdLookup = decode_record_payload(
-                &record,
-                MANAGED_TABLE_NAME_KIND,
-                MANAGED_TABLE_NAME_SCHEMA_VERSION,
-            )?;
+            let _: IdLookup = decode_record_payload(&record, MANAGED_TABLE_NAME_KIND)?;
             return Err(RepositoryError::conflict(format!(
                 "managed table {} already exists",
                 req.name
@@ -352,16 +407,13 @@ impl ManagedLakeMetaRepository {
             key_table(table.table_id)?,
             record_kind(MANAGED_TABLE_KIND)?,
             ExpectedRevision::NotExists,
-            encode_json_payload(MANAGED_TABLE_SCHEMA_VERSION, &table)?,
+            encode_record_payload(MANAGED_TABLE_KIND, &table)?,
         ))?;
         txn.put(MetaRecordPut::new(
             lookup_key,
             record_kind(MANAGED_TABLE_NAME_KIND)?,
             ExpectedRevision::NotExists,
-            encode_json_payload(
-                MANAGED_TABLE_NAME_SCHEMA_VERSION,
-                &IdLookup { id: table.table_id },
-            )?,
+            encode_record_payload(MANAGED_TABLE_NAME_KIND, &IdLookup { id: table.table_id })?,
         ))?;
         Ok(table)
     }
@@ -383,11 +435,7 @@ impl ManagedLakeMetaRepository {
 
         let lookup_key = key_table_name(req.db_id, &req.table_name)?;
         if let Some(record) = txn.get(&lookup_key)? {
-            let _: IdLookup = decode_record_payload(
-                &record,
-                MANAGED_TABLE_NAME_KIND,
-                MANAGED_TABLE_NAME_SCHEMA_VERSION,
-            )?;
+            let _: IdLookup = decode_record_payload(&record, MANAGED_TABLE_NAME_KIND)?;
             return Err(RepositoryError::conflict(format!(
                 "managed table {} already exists",
                 req.table_name
@@ -416,10 +464,7 @@ impl ManagedLakeMetaRepository {
             lookup_key,
             record_kind(MANAGED_TABLE_NAME_KIND)?,
             ExpectedRevision::NotExists,
-            encode_json_payload(
-                MANAGED_TABLE_NAME_SCHEMA_VERSION,
-                &IdLookup { id: table.table_id },
-            )?,
+            encode_record_payload(MANAGED_TABLE_NAME_KIND, &IdLookup { id: table.table_id })?,
         ))?;
 
         let schema = StoredManagedSchema {
@@ -512,48 +557,16 @@ impl ManagedLakeMetaRepository {
 
     pub fn load_snapshot(&self, txn: &dyn MetaReadTxn) -> RepositoryResult<ManagedLakeSnapshot> {
         let mut snapshot = ManagedLakeSnapshot {
-            databases: scan_values(
-                txn,
-                "database",
-                MANAGED_DATABASE_KIND,
-                MANAGED_DATABASE_SCHEMA_VERSION,
-            )?,
-            tables: scan_values(
-                txn,
-                "table",
-                MANAGED_TABLE_KIND,
-                MANAGED_TABLE_SCHEMA_VERSION,
-            )?,
-            schemas: scan_values(
-                txn,
-                "schema",
-                MANAGED_SCHEMA_KIND,
-                MANAGED_SCHEMA_SCHEMA_VERSION,
-            )?,
-            columns: scan_values(
-                txn,
-                "column",
-                MANAGED_COLUMN_KIND,
-                MANAGED_COLUMN_SCHEMA_VERSION,
-            )?,
-            partitions: scan_values(
-                txn,
-                "partition",
-                MANAGED_PARTITION_KIND,
-                MANAGED_PARTITION_SCHEMA_VERSION,
-            )?,
-            indexes: scan_values(
-                txn,
-                "index",
-                MANAGED_INDEX_KIND,
-                MANAGED_INDEX_SCHEMA_VERSION,
-            )?,
-            tablets: scan_values(
-                txn,
-                "tablet",
-                MANAGED_TABLET_KIND,
-                MANAGED_TABLET_SCHEMA_VERSION,
-            )?,
+            databases: scan_values(txn, "database", MANAGED_DATABASE_KIND)?,
+            tables: scan_values(txn, "table", MANAGED_TABLE_KIND)?,
+            schemas: scan_values::<StoredManagedSchemaAvro>(txn, "schema", MANAGED_SCHEMA_KIND)?
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            columns: scan_values(txn, "column", MANAGED_COLUMN_KIND)?,
+            partitions: scan_values(txn, "partition", MANAGED_PARTITION_KIND)?,
+            indexes: scan_values(txn, "index", MANAGED_INDEX_KIND)?,
+            tablets: scan_values(txn, "tablet", MANAGED_TABLET_KIND)?,
         };
         snapshot.databases.sort_by_key(|value| value.db_id);
         snapshot.tables.sort_by_key(|value| value.table_id);
@@ -585,11 +598,7 @@ impl ManagedLakeMetaRepository {
         txn.get(&key_partition(partition_id)?)?
             .map(|record| {
                 let revision = record.revision.clone();
-                let partition = decode_record_payload(
-                    &record,
-                    MANAGED_PARTITION_KIND,
-                    MANAGED_PARTITION_SCHEMA_VERSION,
-                )?;
+                let partition = decode_record_payload(&record, MANAGED_PARTITION_KIND)?;
                 Ok((revision, partition))
             })
             .transpose()
@@ -1042,11 +1051,7 @@ impl ManagedLakeMetaRepository {
         let Some(record) = txn.get(&lookup_key)? else {
             return Ok(false);
         };
-        let lookup: IdLookup = decode_record_payload(
-            &record,
-            MANAGED_DATABASE_NAME_KIND,
-            MANAGED_DATABASE_NAME_SCHEMA_VERSION,
-        )?;
+        let lookup: IdLookup = decode_record_payload(&record, MANAGED_DATABASE_NAME_KIND)?;
         let Some(database_record) = txn.get(&key_database(lookup.id)?)? else {
             txn.delete(&lookup_key, ExpectedRevision::Exact(record.revision))?;
             return Ok(true);
@@ -1143,11 +1148,7 @@ impl ManagedLakeMetaRepository {
         txn.get(&key_table(table_id)?)?
             .map(|record| {
                 let revision = record.revision.clone();
-                let table = decode_record_payload(
-                    &record,
-                    MANAGED_TABLE_KIND,
-                    MANAGED_TABLE_SCHEMA_VERSION,
-                )?;
+                let table = decode_record_payload(&record, MANAGED_TABLE_KIND)?;
                 Ok((revision, table))
             })
             .transpose()
@@ -1265,11 +1266,7 @@ fn delete_table_name_lookup_if_matches(
     let Some(record) = txn.get(&lookup_key)? else {
         return Ok(());
     };
-    let lookup: IdLookup = decode_record_payload(
-        &record,
-        MANAGED_TABLE_NAME_KIND,
-        MANAGED_TABLE_NAME_SCHEMA_VERSION,
-    )?;
+    let lookup: IdLookup = decode_record_payload(&record, MANAGED_TABLE_NAME_KIND)?;
     if lookup.id == table_id {
         txn.delete(&lookup_key, ExpectedRevision::Exact(record.revision))?;
     }
@@ -1285,7 +1282,7 @@ fn put_partition(
         key_partition(partition.partition_id)?,
         record_kind(MANAGED_PARTITION_KIND)?,
         expected,
-        encode_json_payload(MANAGED_PARTITION_SCHEMA_VERSION, partition)?,
+        encode_record_payload(MANAGED_PARTITION_KIND, partition)?,
     ))?;
     Ok(())
 }
@@ -1299,7 +1296,7 @@ fn put_table(
         key_table(table.table_id)?,
         record_kind(MANAGED_TABLE_KIND)?,
         expected,
-        encode_json_payload(MANAGED_TABLE_SCHEMA_VERSION, table)?,
+        encode_record_payload(MANAGED_TABLE_KIND, table)?,
     ))?;
     Ok(())
 }
@@ -1313,7 +1310,7 @@ fn put_schema(
         key_schema(schema.schema_id)?,
         record_kind(MANAGED_SCHEMA_KIND)?,
         expected,
-        encode_json_payload(MANAGED_SCHEMA_SCHEMA_VERSION, schema)?,
+        encode_record_payload(MANAGED_SCHEMA_KIND, &StoredManagedSchemaAvro::from(schema))?,
     ))?;
     Ok(())
 }
@@ -1327,7 +1324,7 @@ fn put_column(
         key_column(column.schema_id, column.ordinal)?,
         record_kind(MANAGED_COLUMN_KIND)?,
         expected,
-        encode_json_payload(MANAGED_COLUMN_SCHEMA_VERSION, column)?,
+        encode_record_payload(MANAGED_COLUMN_KIND, column)?,
     ))?;
     Ok(())
 }
@@ -1341,7 +1338,7 @@ fn put_index(
         key_index(index.index_id)?,
         record_kind(MANAGED_INDEX_KIND)?,
         expected,
-        encode_json_payload(MANAGED_INDEX_SCHEMA_VERSION, index)?,
+        encode_record_payload(MANAGED_INDEX_KIND, index)?,
     ))?;
     Ok(())
 }
@@ -1355,7 +1352,7 @@ fn put_tablet(
         key_tablet(tablet.tablet_id)?,
         record_kind(MANAGED_TABLET_KIND)?,
         expected,
-        encode_json_payload(MANAGED_TABLET_SCHEMA_VERSION, tablet)?,
+        encode_record_payload(MANAGED_TABLET_KIND, tablet)?,
     ))?;
     Ok(())
 }
@@ -1363,22 +1360,19 @@ fn put_tablet(
 fn load_versioned_tables(
     txn: &dyn MetaReadTxn,
 ) -> RepositoryResult<Vec<(MetaRevision, StoredManagedTable)>> {
-    scan_versioned_values(
-        txn,
-        "table",
-        MANAGED_TABLE_KIND,
-        MANAGED_TABLE_SCHEMA_VERSION,
-    )
+    scan_versioned_values(txn, "table", MANAGED_TABLE_KIND)
 }
 
 fn load_versioned_schemas(
     txn: &dyn MetaReadTxn,
 ) -> RepositoryResult<Vec<(MetaRevision, StoredManagedSchema)>> {
-    scan_versioned_values(
-        txn,
-        "schema",
-        MANAGED_SCHEMA_KIND,
-        MANAGED_SCHEMA_SCHEMA_VERSION,
+    scan_versioned_values::<StoredManagedSchemaAvro>(txn, "schema", MANAGED_SCHEMA_KIND).map(
+        |schemas| {
+            schemas
+                .into_iter()
+                .map(|(revision, schema)| (revision, schema.into()))
+                .collect()
+        },
     )
 }
 
@@ -1389,8 +1383,9 @@ fn load_versioned_schema(
     txn.get(&key_schema(schema_id)?)?
         .map(|record| {
             let revision = record.revision.clone();
-            let schema =
-                decode_record_payload(&record, MANAGED_SCHEMA_KIND, MANAGED_SCHEMA_SCHEMA_VERSION)?;
+            let schema: StoredManagedSchema =
+                decode_record_payload::<StoredManagedSchemaAvro>(&record, MANAGED_SCHEMA_KIND)?
+                    .into();
             Ok((revision, schema))
         })
         .transpose()
@@ -1399,34 +1394,19 @@ fn load_versioned_schema(
 fn load_versioned_columns(
     txn: &dyn MetaReadTxn,
 ) -> RepositoryResult<Vec<(MetaRevision, StoredManagedColumn)>> {
-    scan_versioned_values(
-        txn,
-        "column",
-        MANAGED_COLUMN_KIND,
-        MANAGED_COLUMN_SCHEMA_VERSION,
-    )
+    scan_versioned_values(txn, "column", MANAGED_COLUMN_KIND)
 }
 
 fn load_versioned_partitions(
     txn: &dyn MetaReadTxn,
 ) -> RepositoryResult<Vec<(MetaRevision, StoredManagedPartition)>> {
-    scan_versioned_values(
-        txn,
-        "partition",
-        MANAGED_PARTITION_KIND,
-        MANAGED_PARTITION_SCHEMA_VERSION,
-    )
+    scan_versioned_values(txn, "partition", MANAGED_PARTITION_KIND)
 }
 
 fn load_versioned_indexes(
     txn: &dyn MetaReadTxn,
 ) -> RepositoryResult<Vec<(MetaRevision, StoredManagedIndex)>> {
-    scan_versioned_values(
-        txn,
-        "index",
-        MANAGED_INDEX_KIND,
-        MANAGED_INDEX_SCHEMA_VERSION,
-    )
+    scan_versioned_values(txn, "index", MANAGED_INDEX_KIND)
 }
 
 fn load_versioned_indexes_for_partition(
@@ -1444,12 +1424,7 @@ fn load_versioned_indexes_for_partition(
 fn load_versioned_tablets(
     txn: &dyn MetaReadTxn,
 ) -> RepositoryResult<Vec<(MetaRevision, StoredManagedTablet)>> {
-    scan_versioned_values(
-        txn,
-        "tablet",
-        MANAGED_TABLET_KIND,
-        MANAGED_TABLET_SCHEMA_VERSION,
-    )
+    scan_versioned_values(txn, "tablet", MANAGED_TABLET_KIND)
 }
 
 fn load_versioned_tablets_for_partition(
@@ -1468,7 +1443,6 @@ fn scan_values<T>(
     txn: &dyn MetaReadTxn,
     path: &str,
     expected_kind: &str,
-    expected_schema_version: i32,
 ) -> RepositoryResult<Vec<T>>
 where
     T: for<'de> Deserialize<'de>,
@@ -1476,7 +1450,7 @@ where
     let prefix = MetaKeyPrefix::new(NS_MANAGED, [path.to_string()])?;
     txn.scan(&prefix, None)?
         .into_iter()
-        .map(|record| decode_record_payload(&record, expected_kind, expected_schema_version))
+        .map(|record| decode_record_payload(&record, expected_kind))
         .collect()
 }
 
@@ -1484,7 +1458,6 @@ fn scan_versioned_values<T>(
     txn: &dyn MetaReadTxn,
     path: &str,
     expected_kind: &str,
-    expected_schema_version: i32,
 ) -> RepositoryResult<Vec<(MetaRevision, T)>>
 where
     T: for<'de> Deserialize<'de>,
@@ -1494,17 +1467,12 @@ where
         .into_iter()
         .map(|record| {
             let revision = record.revision.clone();
-            decode_record_payload(&record, expected_kind, expected_schema_version)
-                .map(|value| (revision, value))
+            decode_record_payload(&record, expected_kind).map(|value| (revision, value))
         })
         .collect()
 }
 
-fn decode_record_payload<T>(
-    record: &MetaRecord,
-    expected_kind: &str,
-    expected_schema_version: i32,
-) -> RepositoryResult<T>
+fn decode_record_payload<T>(record: &MetaRecord, expected_kind: &str) -> RepositoryResult<T>
 where
     T: for<'de> Deserialize<'de>,
 {
@@ -1515,14 +1483,12 @@ where
             record.kind.as_str()
         )));
     }
-    if record.payload.schema_version != expected_schema_version {
-        return Err(RepositoryError::provider(format!(
-            "metadata record {} has schema version {}, expected {expected_schema_version}",
-            record.key.canonical_path(),
-            record.payload.schema_version
-        )));
-    }
-    decode_json_payload(&record.payload)
+    decode_payload_for_kind(expected_kind, &record.payload).map_err(|err| {
+        RepositoryError::provider(format!(
+            "failed to decode metadata record {} as {expected_kind}: {err}",
+            record.key.canonical_path()
+        ))
+    })
 }
 
 fn record_kind(value: &str) -> RepositoryResult<MetaRecordKind> {

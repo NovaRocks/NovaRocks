@@ -1,9 +1,8 @@
 use std::collections::BTreeMap;
 
-use bytes::Bytes;
 use novarocks::meta::keys::{NS_JOB, NS_MANAGED_TXN};
 use novarocks::meta::repository::iceberg_catalog::{
-    IcebergCatalogMetaRepository, IcebergCatalogProperties,
+    IcebergCatalogMetaRepository, IcebergCatalogProperties, IcebergNamespaceRecord,
 };
 use novarocks::meta::repository::job::{
     CreateEraseJobRequest, CreateIcebergOptimizeJobRequest, IcebergOptimizeJobOutcome,
@@ -24,30 +23,20 @@ use novarocks::meta::repository::mv::{
     RecordStagingCommitRequest, RefreshCommitMarker, RefreshExternalOutcome, StoredMvRefreshPolicy,
     UpdateManagedMvRefreshSummaryRequest, UpdateMvRefreshMetadataRequest,
 };
+use novarocks::meta::repository::mv_contract::{
+    ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
+    ExpressionLineage, HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,
+    MvPartitionTransformContract, MvSchemaContract, OutputColumnLineage, OutputContract,
+    TargetContract, TargetVisibleColumn,
+};
 use novarocks::meta::repository::{
-    decode_payload_for_kind, encode_record_payload, id_scopes, RepositoryError, RepositoryErrorKind,
+    RepositoryError, RepositoryErrorKind, decode_payload_for_kind, encode_record_payload, id_scopes,
 };
 use novarocks::meta::{
     ExpectedRevision, MetaKey, MetaRecordKind, MetaRecordPut, MetaStoreProvider,
     SqliteMetaStoreProvider,
 };
 use serde::{Deserialize, Serialize};
-
-fn encode_json_payload<T>(
-    schema_version: i32,
-    value: &T,
-) -> Result<novarocks::meta::MetaPayload, RepositoryError>
-where
-    T: Serialize,
-{
-    let bytes = serde_json::to_vec(value).map_err(|err| {
-        RepositoryError::invalid(format!("failed to encode JSON payload: {err}"))
-    })?;
-    Ok(novarocks::meta::MetaPayload::json(
-        schema_version,
-        Bytes::from(bytes),
-    ))
-}
 
 fn create_managed_table_with_partition(
     provider: &SqliteMetaStoreProvider,
@@ -93,7 +82,7 @@ fn put_managed_txn_record(
         MetaKey::new(NS_MANAGED_TXN, [managed_txn.txn_id.to_string()])?,
         MetaRecordKind::new("managed.txn")?,
         ExpectedRevision::NotExists,
-        encode_json_payload(1, &managed_txn)?,
+        encode_record_payload("managed.txn", &managed_txn)?,
     ))?;
     Ok(())
 }
@@ -110,6 +99,69 @@ fn sample_mv_definition_request(select_sql: &str) -> CreateMvDefinitionRequest {
         schema_contract: None,
         partition_spec: None,
         created_at_ms: 7,
+    }
+}
+
+fn sample_mv_schema_contract(partition: MvPartitionContract) -> MvSchemaContract {
+    MvSchemaContract {
+        contract_version: 1,
+        base: BaseContract {
+            table_fqn: "ice.sales.orders".to_string(),
+            table_uuid: "11111111-1111-1111-1111-111111111111".to_string(),
+            alias_at_create: Some("orders".to_string()),
+            schema_id_at_create: 7,
+            schema_at_create: BaseSchemaSnapshot {
+                fields: vec![BaseFieldRecord {
+                    field_id: 1,
+                    name_at_create: "id".to_string(),
+                    type_signature: "long".to_string(),
+                    required: true,
+                }],
+            },
+        },
+        bases: vec![],
+        output: OutputContract {
+            columns: vec![OutputColumnLineage {
+                expression: ExpressionLineage {
+                    kind: ExpressionKind::Column,
+                    referenced_base_field_ids: vec![1],
+                    referenced_base_fields: vec![],
+                },
+            }],
+            filter: None,
+        },
+        join: None,
+        aggregate: None,
+        target: TargetContract {
+            table_fqn: "ice.analytics.orders_mv".to_string(),
+            table_uuid: "22222222-2222-2222-2222-222222222222".to_string(),
+            schema_id_at_create: 11,
+            visible_columns: vec![TargetVisibleColumn {
+                output_name: "id".to_string(),
+                target_field_id: 10,
+                type_signature: "long".to_string(),
+                nullable: false,
+            }],
+            hidden_apply_key: HiddenApplyKeyContract {
+                column_name: "__nova_base_row_id".to_string(),
+                target_field_id: 99,
+                source: ApplyKeySource::BaseRowId,
+            },
+            partition: Some(partition),
+        },
+    }
+}
+
+fn sample_mv_partition_contract() -> MvPartitionContract {
+    MvPartitionContract {
+        target_spec_id: 3,
+        fields: vec![MvPartitionFieldContract {
+            partition_field_id: 1000,
+            partition_field_name: "id_bucket_16".to_string(),
+            source_target_field_id: 10,
+            source_column_name: "id".to_string(),
+            transform: MvPartitionTransformContract::Bucket { num_buckets: 16 },
+        }],
     }
 }
 
@@ -864,46 +916,6 @@ fn job_repository_finish_pending_returns_conflict() -> Result<(), Box<dyn std::e
         .finish_erase_job(txn.as_mut(), job.job_id, 1200)
         .expect_err("pending erase job should not finish");
     assert_eq!(err.kind(), RepositoryErrorKind::Conflict);
-
-    Ok(())
-}
-
-#[test]
-fn job_repository_rejects_schema_version_mismatch() -> Result<(), Box<dyn std::error::Error>> {
-    let dir = tempfile::tempdir()?;
-    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
-    let repository = JobMetaRepository::default();
-    let key = MetaKey::new(NS_JOB, ["erase", "1"])?;
-    let payload = serde_json::json!({
-        "job_id": 1,
-        "table_id": 10,
-        "partition_id": 20,
-        "root_path": "s3://bucket/db/table/partition",
-        "state": "PENDING",
-        "retry_at_ms": null,
-        "updated_at_ms": 1000,
-        "last_error": null
-    });
-
-    {
-        let mut txn = provider.begin_write("write mismatched erase job")?;
-        txn.put(MetaRecordPut::new(
-            key,
-            MetaRecordKind::new("job.erase")?,
-            ExpectedRevision::NotExists,
-            encode_json_payload(999, &payload)?,
-        ))?;
-        txn.commit()?;
-    }
-
-    let read = provider.begin_read()?;
-    let err = repository
-        .load_erase_job(read.as_ref(), 1)
-        .expect_err("schema version mismatch should fail");
-    assert!(
-        err.to_string()
-            .contains("metadata record erase/1 has schema version 999")
-    );
 
     Ok(())
 }
@@ -2350,33 +2362,6 @@ fn begin_named_test_branch_staged_refresh(
     Ok(refresh.refresh_id)
 }
 
-fn overwrite_refresh_with_legacy_external_committed_payload(
-    provider: &SqliteMetaStoreProvider,
-    refresh_id: i64,
-    mv_id: i64,
-    target_snapshot_id: i64,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let payload = serde_json::json!({
-        "refresh_id": refresh_id,
-        "mv_id": mv_id,
-        "state": "EXTERNAL_COMMITTED",
-        "target_snapshots": {},
-        "external_outcome": {
-            "target_snapshot_id": target_snapshot_id,
-            "commit_id": format!("legacy-snapshot-{target_snapshot_id}")
-        }
-    });
-    let mut txn = provider.begin_write("write legacy external committed refresh")?;
-    txn.put(MetaRecordPut::new(
-        MetaKey::new("mv", ["refresh".to_string(), refresh_id.to_string()])?,
-        MetaRecordKind::new("mv.refresh")?,
-        ExpectedRevision::Any,
-        encode_json_payload(1, &payload)?,
-    ))?;
-    txn.commit()?;
-    Ok(())
-}
-
 #[test]
 fn mv_repository_staging_commit_retry_is_value_checked() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
@@ -2550,71 +2535,6 @@ fn mv_repository_finalize_rejects_mismatched_published_snapshot()
 }
 
 #[test]
-fn mv_repository_finalizes_legacy_external_committed_refresh()
--> Result<(), Box<dyn std::error::Error>> {
-    let dir = tempfile::tempdir()?;
-    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
-    let repository = MvMetaRepository::default();
-    let mv_id = create_test_iceberg_mv(&provider, &repository)?;
-    let refresh_id = begin_test_branch_staged_refresh(&provider, &repository, mv_id)?;
-    overwrite_refresh_with_legacy_external_committed_payload(&provider, refresh_id, mv_id, 300)?;
-
-    {
-        let mut txn = provider.begin_write("finalize with mismatched legacy snapshot")?;
-        let err = repository
-            .finalize_refresh(
-                txn.as_mut(),
-                MvRefreshFinalizeRequest {
-                    refresh_id,
-                    rows: 3,
-                    base_snapshots: BTreeMap::new(),
-                    base_table_uuids: BTreeMap::new(),
-                    target_snapshot_id: Some(301),
-                },
-            )
-            .expect_err("mismatched legacy snapshot should conflict");
-        assert_eq!(err.kind(), RepositoryErrorKind::Conflict);
-    }
-
-    {
-        let mut txn = provider.begin_write("finalize with legacy snapshot")?;
-        repository.finalize_refresh(
-            txn.as_mut(),
-            MvRefreshFinalizeRequest {
-                refresh_id,
-                rows: 3,
-                base_snapshots: BTreeMap::new(),
-                base_table_uuids: BTreeMap::new(),
-                target_snapshot_id: Some(300),
-            },
-        )?;
-        txn.commit()?;
-    }
-
-    let read = provider.begin_read()?;
-    let refresh = repository
-        .load_refresh(read.as_ref(), refresh_id)?
-        .expect("refresh should persist");
-    assert_eq!(refresh.state, MvRefreshState::Finalized);
-    assert_eq!(refresh.published_snapshot_id, None);
-    assert_eq!(
-        refresh
-            .external_outcome
-            .as_ref()
-            .and_then(|outcome| outcome.target_snapshot_id),
-        Some(300)
-    );
-    let definition = repository
-        .load_by_id(read.as_ref(), mv_id)?
-        .expect("definition should persist");
-    assert_eq!(definition.last_refreshed_iceberg_snapshot_id, Some(300));
-    assert_eq!(definition.active_refresh_id, None);
-    assert!(!definition.refresh_in_progress);
-
-    Ok(())
-}
-
-#[test]
 fn mv_repository_managed_summary_rejects_active_commit_unknown()
 -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
@@ -2763,100 +2683,97 @@ fn mv_repository_rejects_second_refresh_intent() -> Result<(), Box<dyn std::erro
 }
 
 #[test]
-fn mv_repository_rejects_definition_schema_version_mismatch()
--> Result<(), Box<dyn std::error::Error>> {
+fn mv_repository_rejects_definition_fingerprint_mismatch() -> Result<(), Box<dyn std::error::Error>>
+{
     let dir = tempfile::tempdir()?;
     let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
     let repository = MvMetaRepository::default();
-    let key = MetaKey::new("mv", ["by-id", "1"])?;
-    let payload = serde_json::json!({
-        "mv_id": 1,
-        "select_sql": "SELECT id FROM iceberg.sales.orders",
-        "base_table_refs": ["iceberg.sales.orders"],
-        "primary_key_columns": ["id"],
-        "storage_engine": "iceberg",
-        "target_catalog": "ice",
-        "target_namespace": "ns",
-        "target_table": "orders_mv",
-        "last_refresh_ms": null,
-        "last_refresh_rows": null,
-        "last_refresh_snapshots": {},
-        "last_refresh_table_uuids": {},
-        "last_refreshed_iceberg_snapshot_id": null,
-        "refresh_in_progress": false,
-        "active_refresh_id": null,
-        "refresh_target_snapshots": {},
-        "created_at_ms": 11
-    });
+    let mv_id = {
+        let mut txn = provider.begin_write("create mv definition")?;
+        let definition = repository.create_definition(
+            txn.as_mut(),
+            CreateMvDefinitionRequest {
+                select_sql: "SELECT id FROM iceberg.sales.orders".to_string(),
+                base_table_refs: vec!["iceberg.sales.orders".to_string()],
+                primary_key_columns: vec!["id".to_string()],
+                storage_engine: "iceberg".to_string(),
+                target_catalog: Some("ice".to_string()),
+                target_namespace: Some("ns".to_string()),
+                target_table: Some("orders_mv".to_string()),
+                schema_contract: None,
+                partition_spec: None,
+                created_at_ms: 11,
+            },
+        )?;
+        txn.commit()?;
+        definition.mv_id
+    };
 
     {
-        let mut txn = provider.begin_write("write mismatched mv definition")?;
+        let mut txn = provider.begin_write("corrupt mv definition fingerprint")?;
+        let key = MetaKey::new("mv", ["by-id".to_string(), mv_id.to_string()])?;
+        let mut record = txn
+            .get(&key)?
+            .expect("mv definition record should exist before corruption");
+        record.payload.schema_fingerprint = "ffffffffffffffff".to_string();
         txn.put(MetaRecordPut::new(
             key,
             MetaRecordKind::new("mv.definition")?,
-            ExpectedRevision::NotExists,
-            encode_json_payload(999, &payload)?,
+            ExpectedRevision::Exact(record.revision),
+            record.payload,
         ))?;
         txn.commit()?;
     }
 
     let read = provider.begin_read()?;
     let err = repository
-        .load_by_id(read.as_ref(), 1)
-        .expect_err("schema version mismatch should fail");
+        .load_by_id(read.as_ref(), mv_id)
+        .expect_err("fingerprint mismatch should fail");
     assert!(
         err.to_string()
-            .contains("metadata record by-id/1 has schema version 999")
+            .contains("failed to decode metadata record by-id/")
     );
+    assert!(err.to_string().contains("as mv.definition"));
+    assert!(err.to_string().contains("fingerprint mismatch"));
 
     Ok(())
 }
 
 #[test]
-fn mv_repository_loads_v2_definition_without_partition_spec()
--> Result<(), Box<dyn std::error::Error>> {
+fn mv_repository_round_trips_non_null_contracts() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
     let repository = MvMetaRepository::default();
-    let key = MetaKey::new("mv", ["by-id", "1"])?;
-    let payload = serde_json::json!({
-        "mv_id": 1,
-        "select_sql": "SELECT id FROM iceberg.sales.orders",
-        "base_table_refs": ["iceberg.sales.orders"],
-        "primary_key_columns": ["id"],
-        "storage_engine": "iceberg",
-        "target_catalog": "ice",
-        "target_namespace": "ns",
-        "target_table": "orders_mv",
-        "schema_contract": null,
-        "last_refresh_ms": null,
-        "last_refresh_rows": null,
-        "last_refresh_snapshots": {},
-        "last_refresh_table_uuids": {},
-        "last_refreshed_iceberg_snapshot_id": null,
-        "refresh_in_progress": false,
-        "active_refresh_id": null,
-        "refresh_target_snapshots": {},
-        "created_at_ms": 11
-    });
+    let partition = sample_mv_partition_contract();
+    let schema_contract = sample_mv_schema_contract(partition.clone());
 
-    {
-        let mut txn = provider.begin_write("write v2 mv definition")?;
-        txn.put(MetaRecordPut::new(
-            key,
-            MetaRecordKind::new("mv.definition")?,
-            ExpectedRevision::NotExists,
-            encode_json_payload(2, &payload)?,
-        ))?;
+    let mv_id = {
+        let mut txn = provider.begin_write("create mv definition with contracts")?;
+        let definition = repository.create_definition(
+            txn.as_mut(),
+            CreateMvDefinitionRequest {
+                select_sql: "SELECT id FROM ice.sales.orders".to_string(),
+                base_table_refs: vec!["ice.sales.orders".to_string()],
+                primary_key_columns: vec!["id".to_string()],
+                storage_engine: "iceberg".to_string(),
+                target_catalog: Some("ice".to_string()),
+                target_namespace: Some("analytics".to_string()),
+                target_table: Some("orders_mv".to_string()),
+                schema_contract: Some(schema_contract.clone()),
+                partition_spec: Some(partition.clone()),
+                created_at_ms: 11,
+            },
+        )?;
         txn.commit()?;
-    }
+        definition.mv_id
+    };
 
     let read = provider.begin_read()?;
     let definition = repository
-        .load_by_id(read.as_ref(), 1)?
-        .expect("v2 definition should load");
-    assert_eq!(definition.mv_id, 1);
-    assert!(definition.partition_spec.is_none());
+        .load_by_id(read.as_ref(), mv_id)?
+        .expect("definition should persist");
+    assert_eq!(definition.schema_contract, Some(schema_contract));
+    assert_eq!(definition.partition_spec, Some(partition));
 
     Ok(())
 }
@@ -3113,8 +3030,8 @@ fn mv_repository_rejects_stale_target_lookup_without_deleting_wrong_definition()
             MetaKey::new("mv", ["by-target", "ice", "ns", "orders_mv"])?,
             MetaRecordKind::new("mv.target_lookup")?,
             ExpectedRevision::NotExists,
-            encode_json_payload(
-                1,
+            encode_record_payload(
+                "mv.target_lookup",
                 &MvTargetLookup {
                     mv_id: definition.mv_id,
                 },
@@ -3397,7 +3314,7 @@ fn mv_repository_rejects_dependency_object_key_separator() -> Result<(), Box<dyn
 }
 
 #[test]
-fn iceberg_catalog_repository_rejects_wrong_kind_and_schema_in_exists_apis()
+fn iceberg_catalog_repository_rejects_wrong_kind_in_exists_apis()
 -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
@@ -3409,49 +3326,24 @@ fn iceberg_catalog_repository_rejects_wrong_kind_and_schema_in_exists_apis()
             MetaKey::new("iceberg_catalog", ["catalog", "ice"])?,
             MetaRecordKind::new("iceberg.namespace")?,
             ExpectedRevision::NotExists,
-            encode_json_payload(
-                1,
-                &IcebergCatalogProperties {
-                    properties: vec![("type".to_string(), "rest".to_string())],
+            encode_record_payload(
+                "iceberg.namespace",
+                &IcebergNamespaceRecord {
+                    catalog: "ice".to_string(),
+                    namespace: "ns".to_string(),
                 },
             )?,
         ))?;
         txn.put(MetaRecordPut::new(
-            MetaKey::new("iceberg_catalog", ["namespace", "ice", "bad_schema"])?,
+            MetaKey::new("iceberg_catalog", ["table", "ice", "ns", "orders"])?,
             MetaRecordKind::new("iceberg.namespace")?,
             ExpectedRevision::NotExists,
-            encode_json_payload(
-                999,
-                &serde_json::json!({
-                    "catalog": "ice",
-                    "namespace": "bad_schema"
-                }),
-            )?,
-        ))?;
-        txn.put(MetaRecordPut::new(
-            MetaKey::new("iceberg_catalog", ["table", "ice", "ns", "orders"])?,
-            MetaRecordKind::new("iceberg.catalog")?,
-            ExpectedRevision::NotExists,
-            encode_json_payload(
-                1,
-                &serde_json::json!({
-                    "catalog": "ice",
-                    "namespace": "ns",
-                    "table": "orders"
-                }),
-            )?,
-        ))?;
-        txn.put(MetaRecordPut::new(
-            MetaKey::new("iceberg_catalog", ["table", "ice", "ns", "bad_schema"])?,
-            MetaRecordKind::new("iceberg.table_registration")?,
-            ExpectedRevision::NotExists,
-            encode_json_payload(
-                999,
-                &serde_json::json!({
-                    "catalog": "ice",
-                    "namespace": "ns",
-                    "table": "bad_schema"
-                }),
+            encode_record_payload(
+                "iceberg.namespace",
+                &IcebergNamespaceRecord {
+                    catalog: "ice".to_string(),
+                    namespace: "ns".to_string(),
+                },
             )?,
         ))?;
         txn.commit()?;
@@ -3467,27 +3359,11 @@ fn iceberg_catalog_repository_rejects_wrong_kind_and_schema_in_exists_apis()
     );
 
     let err = repository
-        .namespace_exists(read.as_ref(), "ice", "bad_schema")
-        .expect_err("wrong namespace schema should fail");
-    assert!(
-        err.to_string()
-            .contains("metadata record namespace/ice/bad_schema has schema version 999")
-    );
-
-    let err = repository
         .table_exists(read.as_ref(), "ice", "ns", "orders")
         .expect_err("wrong table kind should fail");
     assert!(
         err.to_string()
-            .contains("metadata record table/ice/ns/orders has kind iceberg.catalog")
-    );
-
-    let err = repository
-        .table_exists(read.as_ref(), "ice", "ns", "bad_schema")
-        .expect_err("wrong table schema should fail");
-    assert!(
-        err.to_string()
-            .contains("metadata record table/ice/ns/bad_schema has schema version 999")
+            .contains("metadata record table/ice/ns/orders has kind iceberg.namespace")
     );
 
     Ok(())

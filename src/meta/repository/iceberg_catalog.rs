@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::meta::keys::{NS_ICEBERG_CATALOG, normalize_lookup_name};
 use crate::meta::repository::mv::MvMetaRepository;
 use crate::meta::repository::{
-    RepositoryError, RepositoryResult, decode_json_payload, encode_json_payload,
+    RepositoryError, RepositoryResult, decode_payload_for_kind, encode_record_payload,
 };
 use crate::meta::{
     ExpectedRevision, MetaKey, MetaKeyPrefix, MetaReadTxn, MetaRecord, MetaRecordKind,
@@ -13,9 +13,6 @@ use crate::meta::{
 const ICEBERG_CATALOG_KIND: &str = "iceberg.catalog";
 const ICEBERG_NAMESPACE_KIND: &str = "iceberg.namespace";
 const ICEBERG_TABLE_KIND: &str = "iceberg.table_registration";
-const ICEBERG_CATALOG_SCHEMA_VERSION: i32 = 1;
-const ICEBERG_NAMESPACE_SCHEMA_VERSION: i32 = 1;
-const ICEBERG_TABLE_SCHEMA_VERSION: i32 = 1;
 
 #[derive(Default)]
 pub struct IcebergCatalogMetaRepository;
@@ -23,6 +20,44 @@ pub struct IcebergCatalogMetaRepository;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IcebergCatalogProperties {
     pub properties: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct IcebergCatalogPropertiesAvro {
+    properties: Vec<StringPairAvro>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct StringPairAvro {
+    key: String,
+    value: String,
+}
+
+impl From<&IcebergCatalogProperties> for IcebergCatalogPropertiesAvro {
+    fn from(value: &IcebergCatalogProperties) -> Self {
+        Self {
+            properties: value
+                .properties
+                .iter()
+                .map(|(key, value)| StringPairAvro {
+                    key: key.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<IcebergCatalogPropertiesAvro> for IcebergCatalogProperties {
+    fn from(value: IcebergCatalogPropertiesAvro) -> Self {
+        Self {
+            properties: value
+                .properties
+                .into_iter()
+                .map(|pair| (pair.key, pair.value))
+                .collect(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,7 +90,10 @@ impl IcebergCatalogMetaRepository {
             key_catalog(catalog)?,
             record_kind(ICEBERG_CATALOG_KIND)?,
             ExpectedRevision::Any,
-            encode_json_payload(ICEBERG_CATALOG_SCHEMA_VERSION, &properties)?,
+            encode_record_payload(
+                ICEBERG_CATALOG_KIND,
+                &IcebergCatalogPropertiesAvro::from(&properties),
+            )?,
         ))?;
         Ok(())
     }
@@ -99,7 +137,7 @@ impl IcebergCatalogMetaRepository {
             key_namespace(catalog, namespace)?,
             record_kind(ICEBERG_NAMESPACE_KIND)?,
             ExpectedRevision::Any,
-            encode_json_payload(ICEBERG_NAMESPACE_SCHEMA_VERSION, &record)?,
+            encode_record_payload(ICEBERG_NAMESPACE_KIND, &record)?,
         ))?;
         Ok(())
     }
@@ -143,7 +181,7 @@ impl IcebergCatalogMetaRepository {
             key_table(catalog, namespace, table)?,
             record_kind(ICEBERG_TABLE_KIND)?,
             ExpectedRevision::Any,
-            encode_json_payload(ICEBERG_TABLE_SCHEMA_VERSION, &record)?,
+            encode_record_payload(ICEBERG_TABLE_KIND, &record)?,
         ))?;
         Ok(())
     }
@@ -260,26 +298,19 @@ impl IcebergCatalogMetaRepository {
 }
 
 fn decode_catalog_record(record: &MetaRecord) -> RepositoryResult<IcebergCatalogProperties> {
-    decode_record_payload(record, ICEBERG_CATALOG_KIND, ICEBERG_CATALOG_SCHEMA_VERSION)
+    let value: IcebergCatalogPropertiesAvro = decode_record_payload(record, ICEBERG_CATALOG_KIND)?;
+    Ok(value.into())
 }
 
 fn decode_namespace_record(record: &MetaRecord) -> RepositoryResult<IcebergNamespaceRecord> {
-    decode_record_payload(
-        record,
-        ICEBERG_NAMESPACE_KIND,
-        ICEBERG_NAMESPACE_SCHEMA_VERSION,
-    )
+    decode_record_payload(record, ICEBERG_NAMESPACE_KIND)
 }
 
 fn decode_table_record(record: &MetaRecord) -> RepositoryResult<IcebergTableRecord> {
-    decode_record_payload(record, ICEBERG_TABLE_KIND, ICEBERG_TABLE_SCHEMA_VERSION)
+    decode_record_payload(record, ICEBERG_TABLE_KIND)
 }
 
-fn decode_record_payload<T>(
-    record: &MetaRecord,
-    expected_kind: &str,
-    expected_schema_version: i32,
-) -> RepositoryResult<T>
+fn decode_record_payload<T>(record: &MetaRecord, expected_kind: &str) -> RepositoryResult<T>
 where
     T: for<'de> Deserialize<'de>,
 {
@@ -290,14 +321,12 @@ where
             record.kind.as_str()
         )));
     }
-    if record.payload.schema_version != expected_schema_version {
-        return Err(RepositoryError::provider(format!(
-            "metadata record {} has schema version {}, expected {expected_schema_version}",
-            record.key.canonical_path(),
-            record.payload.schema_version
-        )));
-    }
-    decode_json_payload(&record.payload)
+    decode_payload_for_kind(expected_kind, &record.payload).map_err(|err| {
+        RepositoryError::provider(format!(
+            "failed to decode metadata record {} as {expected_kind}: {err}",
+            record.key.canonical_path()
+        ))
+    })
 }
 
 fn record_kind(value: &str) -> RepositoryResult<MetaRecordKind> {

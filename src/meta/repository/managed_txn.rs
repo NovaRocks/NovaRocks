@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::meta::keys::NS_MANAGED_TXN;
 use crate::meta::repository::managed_lake::ManagedLakeMetaRepository;
 use crate::meta::repository::{
-    RepositoryError, RepositoryResult, decode_json_payload, encode_json_payload, id_scopes,
+    RepositoryError, RepositoryResult, decode_payload_for_kind, encode_record_payload, id_scopes,
 };
 use crate::meta::{
     ExpectedRevision, MetaKey, MetaKeyPrefix, MetaReadTxn, MetaRecord, MetaRecordKind,
@@ -11,7 +11,6 @@ use crate::meta::{
 };
 
 const MANAGED_TXN_KIND: &str = "managed.txn";
-const MANAGED_TXN_SCHEMA_VERSION: i32 = 1;
 
 #[derive(Default)]
 pub struct ManagedLakeTxnRepository;
@@ -95,9 +94,7 @@ impl ManagedLakeTxnRepository {
     pub fn list_all(&self, txn: &dyn MetaReadTxn) -> RepositoryResult<Vec<StoredManagedTxn>> {
         txn.scan(&key_prefix_txns()?, None)?
             .into_iter()
-            .map(|record| {
-                decode_record_payload(&record, MANAGED_TXN_KIND, MANAGED_TXN_SCHEMA_VERSION)
-            })
+            .map(|record| decode_record_payload(&record, MANAGED_TXN_KIND))
             .collect()
     }
 
@@ -340,8 +337,7 @@ fn load_versioned_txn(
 ) -> RepositoryResult<Option<VersionedManagedTxn>> {
     txn.get(&key_txn(txn_id)?)?
         .map(|record| {
-            let value =
-                decode_record_payload(&record, MANAGED_TXN_KIND, MANAGED_TXN_SCHEMA_VERSION)?;
+            let value = decode_record_payload(&record, MANAGED_TXN_KIND)?;
             Ok(VersionedManagedTxn {
                 record_revision: record.revision,
                 value,
@@ -354,8 +350,7 @@ fn load_versioned_txns(txn: &dyn MetaReadTxn) -> RepositoryResult<Vec<VersionedM
     txn.scan(&key_prefix_txns()?, None)?
         .into_iter()
         .map(|record| {
-            let value =
-                decode_record_payload(&record, MANAGED_TXN_KIND, MANAGED_TXN_SCHEMA_VERSION)?;
+            let value = decode_record_payload(&record, MANAGED_TXN_KIND)?;
             Ok(VersionedManagedTxn {
                 record_revision: record.revision,
                 value,
@@ -373,16 +368,12 @@ fn put_txn(
         key_txn(stored.txn_id)?,
         record_kind(MANAGED_TXN_KIND)?,
         expected,
-        encode_json_payload(MANAGED_TXN_SCHEMA_VERSION, stored)?,
+        encode_record_payload(MANAGED_TXN_KIND, stored)?,
     ))?;
     Ok(())
 }
 
-fn decode_record_payload<T>(
-    record: &MetaRecord,
-    expected_kind: &str,
-    expected_schema_version: i32,
-) -> RepositoryResult<T>
+fn decode_record_payload<T>(record: &MetaRecord, expected_kind: &str) -> RepositoryResult<T>
 where
     T: for<'de> Deserialize<'de>,
 {
@@ -393,14 +384,12 @@ where
             record.kind.as_str()
         )));
     }
-    if record.payload.schema_version != expected_schema_version {
-        return Err(RepositoryError::provider(format!(
-            "metadata record {} has schema version {}, expected {expected_schema_version}",
-            record.key.canonical_path(),
-            record.payload.schema_version
-        )));
-    }
-    decode_json_payload(&record.payload)
+    decode_payload_for_kind(expected_kind, &record.payload).map_err(|err| {
+        RepositoryError::provider(format!(
+            "failed to decode metadata record {} as {expected_kind}: {err}",
+            record.key.canonical_path()
+        ))
+    })
 }
 
 fn record_kind(value: &str) -> RepositoryResult<MetaRecordKind> {
