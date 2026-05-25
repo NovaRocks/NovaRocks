@@ -753,30 +753,89 @@ pub fn eval_bitmap_from_binary(
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
+    use arrow::datatypes::DataType as DT;
     let input = arena.eval(args[0], chunk)?;
-    let arr_opt = as_binary_or_null_array(&input, "bitmap_from_binary")?;
-    let len = arr_opt.map(|a| a.len()).unwrap_or(chunk.len());
+    let input_len = input.len();
     let mut builder = BinaryBuilder::new();
-    for row in 0..chunk.len() {
-        let idx = row_index(row, len, "bitmap_from_binary", 0, chunk.len())?;
-        if arr_opt.is_none_or(|arr| arr.is_null(idx)) {
+    // Match StarRocks: `bitmap_from_binary` accepts both VARBINARY and
+    // VARCHAR — the latter is treated as raw bytes (StarRocks VARCHAR is
+    // 8-bit-clean), which is how the user may have stored bitmap binary
+    // in a STRING column. Returns NULL on malformed input.
+    let bytes_per_row: Result<Vec<Option<Vec<u8>>>, String> = match input.data_type() {
+        DT::Null => Ok(vec![None; chunk.len()]),
+        DT::Binary => {
+            let arr = input.as_any().downcast_ref::<BinaryArray>().unwrap();
+            (0..chunk.len())
+                .map(|row| {
+                    let idx = row_index(row, input_len, "bitmap_from_binary", 0, chunk.len())?;
+                    Ok(if arr.is_null(idx) {
+                        None
+                    } else {
+                        Some(arr.value(idx).to_vec())
+                    })
+                })
+                .collect()
+        }
+        DT::LargeBinary => {
+            let arr = input.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+            (0..chunk.len())
+                .map(|row| {
+                    let idx = row_index(row, input_len, "bitmap_from_binary", 0, chunk.len())?;
+                    Ok(if arr.is_null(idx) {
+                        None
+                    } else {
+                        Some(arr.value(idx).to_vec())
+                    })
+                })
+                .collect()
+        }
+        DT::Utf8 => {
+            let arr = input.as_any().downcast_ref::<StringArray>().unwrap();
+            (0..chunk.len())
+                .map(|row| {
+                    let idx = row_index(row, input_len, "bitmap_from_binary", 0, chunk.len())?;
+                    Ok(if arr.is_null(idx) {
+                        None
+                    } else {
+                        Some(arr.value(idx).as_bytes().to_vec())
+                    })
+                })
+                .collect()
+        }
+        DT::LargeUtf8 => {
+            let arr = input.as_any().downcast_ref::<LargeStringArray>().unwrap();
+            (0..chunk.len())
+                .map(|row| {
+                    let idx = row_index(row, input_len, "bitmap_from_binary", 0, chunk.len())?;
+                    Ok(if arr.is_null(idx) {
+                        None
+                    } else {
+                        Some(arr.value(idx).as_bytes().to_vec())
+                    })
+                })
+                .collect()
+        }
+        other => {
+            return Err(format!(
+                "bitmap_from_binary expects BITMAP/BINARY/VARCHAR input, got {other:?}"
+            ));
+        }
+    };
+    for opt_payload in bytes_per_row? {
+        let Some(payload) = opt_payload else {
             builder.append_null();
             continue;
-        }
-        let arr = arr_opt.unwrap();
-        let payload = arr.value(idx);
+        };
         if payload.is_empty() {
             builder.append_null();
             continue;
         }
-        let values = match super::bitmap_common::decode_external_bitmap(payload) {
-            Ok(values) => values,
-            Err(_) => {
-                builder.append_null();
-                continue;
+        match super::bitmap_common::decode_external_bitmap(&payload) {
+            Ok(values) => {
+                builder.append_value(super::bitmap_common::encode_internal_bitmap(&values)?);
             }
-        };
-        builder.append_value(super::bitmap_common::encode_internal_bitmap(&values)?);
+            Err(_) => builder.append_null(),
+        }
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }

@@ -304,6 +304,10 @@ pub(crate) enum ColumnAggregation {
     Min,
     Max,
     Replace,
+    /// `REPLACE_IF_NOT_NULL` — replace the existing value with the incoming
+    /// value, but only when the incoming value is non-NULL. NULL inserts are
+    /// silently ignored.
+    ReplaceIfNotNull,
     BitmapUnion,
     HllUnion,
 }

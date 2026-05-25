@@ -2419,6 +2419,7 @@ fn format_column_aggregation(aggregation: ColumnAggregation) -> &'static str {
         ColumnAggregation::Min => "min",
         ColumnAggregation::Max => "max",
         ColumnAggregation::Replace => "replace",
+        ColumnAggregation::ReplaceIfNotNull => "replace_if_not_null",
         ColumnAggregation::BitmapUnion => "bitmap_union",
         ColumnAggregation::HllUnion => "hll_union",
     }
@@ -2430,6 +2431,7 @@ fn parse_column_aggregation(value: &str) -> Option<ColumnAggregation> {
         "min" => Some(ColumnAggregation::Min),
         "max" => Some(ColumnAggregation::Max),
         "replace" => Some(ColumnAggregation::Replace),
+        "replace_if_not_null" => Some(ColumnAggregation::ReplaceIfNotNull),
         "bitmap_union" => Some(ColumnAggregation::BitmapUnion),
         "hll_union" => Some(ColumnAggregation::HllUnion),
         _ => None,

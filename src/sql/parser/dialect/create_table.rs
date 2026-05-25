@@ -736,6 +736,8 @@ fn parse_column_aggregation(parser: &mut Parser<'_>) -> Option<ColumnAggregation
         Some(ColumnAggregation::Min)
     } else if peek_word_eq(parser, 0, "MAX") {
         Some(ColumnAggregation::Max)
+    } else if peek_word_eq(parser, 0, "REPLACE_IF_NOT_NULL") {
+        Some(ColumnAggregation::ReplaceIfNotNull)
     } else if peek_word_eq(parser, 0, "REPLACE") {
         Some(ColumnAggregation::Replace)
     } else if peek_word_eq(parser, 0, "BITMAP_UNION") {
