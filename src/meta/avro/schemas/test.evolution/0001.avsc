@@ -1,0 +1,9 @@
+{
+  "type": "record",
+  "name": "TestEvolution",
+  "namespace": "novarocks.meta.test",
+  "fields": [
+    { "name": "id", "type": "long" },
+    { "name": "name", "type": "string" }
+  ]
+}
