@@ -1035,7 +1035,7 @@ mod tests {
             select_sql: "SELECT 1".to_string(),
             base_table_refs: Vec::new(),
             primary_key_columns: Vec::new(),
-            storage_engine: "managed_lake".to_string(),
+            storage_engine: "starrocks".to_string(),
             target_catalog: None,
             target_namespace: None,
             target_table: None,

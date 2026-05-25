@@ -92,7 +92,7 @@ pub(crate) fn create_mv(
         .managed_lake_config
         .as_ref()
         .map(|c| c.mv_default_storage_engine.as_str())
-        .unwrap_or("managed_lake");
+        .unwrap_or("starrocks");
     let storage_engine = resolve_mv_storage_engine(&stmt.properties, default_engine)?;
     {
         let catalog = state.catalog.read().expect("standalone catalog read lock");
@@ -1867,7 +1867,7 @@ mod tests {
                 region: Some("us-east-1".to_string()),
                 enable_path_style_access: Some(true),
             },
-            mv_default_storage_engine: "managed_lake".to_string(),
+            mv_default_storage_engine: "starrocks".to_string(),
         }
     }
 
@@ -2242,7 +2242,7 @@ mod tests {
         assert!(
             managed
                 .iter()
-                .all(|row| row.storage_engine == "managed_lake")
+                .all(|row| row.storage_engine == "starrocks")
         );
         assert!(iceberg.iter().all(|row| row.storage_engine == "iceberg"));
     }
@@ -2700,7 +2700,7 @@ GROUP BY k1",
         let stmt = parse_create_mv(stmt_sql);
         // resolve_storage_engine takes (PROPERTIES, default_from_config) and returns the resolved enum.
         let resolved =
-            resolve_mv_storage_engine(&stmt.properties, "managed_lake").expect("resolve");
+            resolve_mv_storage_engine(&stmt.properties, "starrocks").expect("resolve");
         assert_eq!(resolved, ManagedMvStorageEngine::Iceberg);
     }
 
@@ -2721,7 +2721,7 @@ GROUP BY k1",
             PROPERTIES('storage_engine' = 'duckdb') \
             AS SELECT k FROM ice.ns.t";
         let stmt = parse_create_mv(stmt_sql);
-        let err = resolve_mv_storage_engine(&stmt.properties, "managed_lake").unwrap_err();
+        let err = resolve_mv_storage_engine(&stmt.properties, "starrocks").unwrap_err();
         assert!(err.contains("duckdb"));
     }
 

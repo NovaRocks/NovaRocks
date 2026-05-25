@@ -260,7 +260,7 @@ fn default_mv_storage_engine(state: &Arc<StandaloneState>) -> &str {
         .managed_lake_config
         .as_ref()
         .map(|config| config.mv_default_storage_engine.as_str())
-        .unwrap_or("managed_lake")
+        .unwrap_or("starrocks")
 }
 
 fn storage_engine_for_create(

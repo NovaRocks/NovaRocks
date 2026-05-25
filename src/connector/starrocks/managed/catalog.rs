@@ -1033,7 +1033,7 @@ mod tests {
                 region: Some("us-east-1".to_string()),
                 enable_path_style_access: Some(true),
             },
-            mv_default_storage_engine: "managed_lake".to_string(),
+            mv_default_storage_engine: "starrocks".to_string(),
         }
     }
 
@@ -1100,7 +1100,7 @@ mod tests {
                 region: Some("us-east-1".to_string()),
                 enable_path_style_access: Some(true),
             },
-            mv_default_storage_engine: "managed_lake".to_string(),
+            mv_default_storage_engine: "starrocks".to_string(),
         };
 
         assert_eq!(

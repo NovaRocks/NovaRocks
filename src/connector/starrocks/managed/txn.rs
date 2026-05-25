@@ -2293,7 +2293,7 @@ mod mv_target_tests {
                         select_sql: mv.select_sql.clone(),
                         base_table_refs: mv.base_table_refs.iter().map(|r| r.fqn()).collect(),
                         primary_key_columns: mv.primary_key_columns.clone(),
-                        storage_engine: "managed_lake".to_string(),
+                        storage_engine: "starrocks".to_string(),
                         target_catalog: mv.target_catalog.clone(),
                         target_namespace: mv.target_namespace.clone(),
                         target_table: mv.target_table.clone(),
@@ -2408,7 +2408,7 @@ mod mv_target_tests {
                 region: None,
                 enable_path_style_access: Some(true),
             },
-            mv_default_storage_engine: "managed_lake".to_string(),
+            mv_default_storage_engine: "starrocks".to_string(),
         };
         let active_tablet_root = format!("{metadata_root}/db_1/table_10/partition_20");
         let tablet_schema = aggregate_primary_key_tablet_schema();
@@ -2793,7 +2793,7 @@ mod mv_target_tests {
                         region: None,
                         enable_path_style_access: Some(true),
                     },
-                    mv_default_storage_engine: "managed_lake".to_string(),
+                    mv_default_storage_engine: "starrocks".to_string(),
                 };
                 (
                     config,
@@ -3116,7 +3116,7 @@ mod mv_target_tests {
                 region: None,
                 enable_path_style_access: Some(true),
             },
-            mv_default_storage_engine: "managed_lake".to_string(),
+            mv_default_storage_engine: "starrocks".to_string(),
         })
     }
 

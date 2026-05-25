@@ -104,14 +104,14 @@ pub(crate) enum ManagedMvStorageEngine {
 impl ManagedMvStorageEngine {
     pub(crate) fn as_sql_str(self) -> &'static str {
         match self {
-            Self::StarRocks => "managed_lake",
+            Self::StarRocks => "starrocks",
             Self::Iceberg => "iceberg",
         }
     }
 
     pub(crate) fn parse_sql_str(value: &str) -> Result<Self, String> {
         match value.to_ascii_lowercase().as_str() {
-            "managed_lake" => Ok(Self::StarRocks),
+            "starrocks" => Ok(Self::StarRocks),
             "iceberg" => Ok(Self::Iceberg),
             _ => Err(format!(
                 "unknown materialized view storage_engine `{value}`"

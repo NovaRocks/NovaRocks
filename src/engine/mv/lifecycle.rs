@@ -18,7 +18,7 @@ pub(crate) enum MvStorageEngine {
 impl MvStorageEngine {
     pub(crate) fn as_sql_str(self) -> &'static str {
         match self {
-            Self::StarRocks => "managed_lake",
+            Self::StarRocks => "starrocks",
             Self::Iceberg => "iceberg",
         }
     }
@@ -32,7 +32,7 @@ impl MvStorageEngine {
 
     pub(crate) fn from_sql_str(value: &str) -> Result<Self, String> {
         match value.to_ascii_lowercase().as_str() {
-            "managed_lake" | "managed" => Ok(Self::StarRocks),
+            "starrocks" => Ok(Self::StarRocks),
             "iceberg" => Ok(Self::Iceberg),
             _ => Err(format!(
                 "unknown materialized view storage_engine `{value}`"
@@ -273,21 +273,22 @@ mod tests {
 
     #[test]
     fn storage_engine_maps_to_backend_name() {
-        assert_eq!(MvStorageEngine::StarRocks.as_sql_str(), "managed_lake");
+        assert_eq!(MvStorageEngine::StarRocks.as_sql_str(), "starrocks");
         assert_eq!(MvStorageEngine::StarRocks.backend_name(), "managed");
         assert_eq!(MvStorageEngine::Iceberg.as_sql_str(), "iceberg");
         assert_eq!(MvStorageEngine::Iceberg.backend_name(), "iceberg");
         assert_eq!(
-            MvStorageEngine::from_sql_str("managed_lake").unwrap(),
-            MvStorageEngine::StarRocks
-        );
-        assert_eq!(
-            MvStorageEngine::from_sql_str("managed").unwrap(),
+            MvStorageEngine::from_sql_str("starrocks").unwrap(),
             MvStorageEngine::StarRocks
         );
         assert_eq!(
             MvStorageEngine::from_sql_str("iceberg").unwrap(),
             MvStorageEngine::Iceberg
+        );
+        assert!(
+            MvStorageEngine::from_sql_str("managed")
+                .unwrap_err()
+                .contains("unknown materialized view storage_engine"),
         );
         assert_eq!(
             MvStorageEngine::from_sql_str("duckdb").unwrap_err(),

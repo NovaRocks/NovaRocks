@@ -1311,7 +1311,7 @@ fn dependency_object_key(object: &MvDependencyObjectRef) -> RepositoryResult<Str
         MvDependencyObjectType::MaterializedView => "mv",
     };
     let storage_engine = match object.storage_engine {
-        MvDependencyStorageEngine::StarRocks => "managed_lake",
+        MvDependencyStorageEngine::StarRocks => "starrocks",
         MvDependencyStorageEngine::Iceberg => "iceberg",
         MvDependencyStorageEngine::ExternalTable => "external_table",
     };

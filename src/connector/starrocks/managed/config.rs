@@ -30,11 +30,11 @@ impl ManagedLakeConfig {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .unwrap_or("managed_lake")
+            .unwrap_or("starrocks")
             .to_string();
-        if mv_default_storage_engine != "managed_lake" && mv_default_storage_engine != "iceberg" {
+        if mv_default_storage_engine != "starrocks" && mv_default_storage_engine != "iceberg" {
             return Err(format!(
-                "invalid mv_default_storage_engine `{mv_default_storage_engine}`; allowed: managed_lake, iceberg"
+                "invalid mv_default_storage_engine `{mv_default_storage_engine}`; allowed: starrocks, iceberg"
             ));
         }
         Ok(Self {
@@ -93,7 +93,7 @@ mod tests {
             mv_default_storage_engine: None,
         };
         let cfg = ManagedLakeConfig::from_app_config(app).expect("config");
-        assert_eq!(cfg.mv_default_storage_engine, "managed_lake");
+        assert_eq!(cfg.mv_default_storage_engine, "starrocks");
     }
 
     #[test]
@@ -109,7 +109,7 @@ mod tests {
         };
         let err = ManagedLakeConfig::from_app_config(app).unwrap_err();
         assert!(err.contains("duckdb"), "err={err}");
-        assert!(err.contains("managed_lake"), "err={err}");
+        assert!(err.contains("starrocks"), "err={err}");
         assert!(err.contains("iceberg"), "err={err}");
     }
 }
