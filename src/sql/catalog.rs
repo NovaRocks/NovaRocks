@@ -113,10 +113,15 @@ pub struct IcebergTableInfo {
     pub schema: IcebergSchemaDef,
     /// JSON-serialized iceberg `TableMetadata`. Required when the table
     /// is referenced as an Iceberg metadata table (`t$snapshots`,
-    /// `t$history`, `t$refs`, `t$partitions`) — the JNI metadata-scan
-    /// bridge consumes this string to materialise the metadata rows.
-    /// `None` for tables resolved via paths that do not have access to
-    /// the iceberg `TableMetadata` (e.g. synthetic test fixtures).
+    /// `t$history`, `t$refs`, `t$partitions`) — the native-Rust
+    /// `IcebergMetadataScanOp` parses this string back via
+    /// `serde_json::from_str::<TableMetadata>` to materialise the
+    /// metadata rows. The Thrift field on `THdfsScanRange` is still
+    /// named `use_iceberg_jni_metadata_reader` for wire compatibility
+    /// with the StarRocks FE/BE protocol, even though there is no JNI
+    /// bridge on the NovaRocks side. `None` for tables resolved via
+    /// paths that do not have access to the iceberg `TableMetadata`
+    /// (e.g. synthetic test fixtures).
     pub serialized_metadata: Option<String>,
 }
 

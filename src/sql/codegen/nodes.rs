@@ -606,10 +606,11 @@ pub(crate) fn build_exec_params_multi(
                     ranges
                 }
                 ScanSource::IcebergMetadataTable { .. } => {
-                    // The JVM metadata bridge produces all rows in a single
-                    // call keyed off `serialized_table`. We still need at
-                    // least one scan range so the runtime allocates a morsel
-                    // and dispatches to `IcebergMetadataScanOp`.
+                    // The native iceberg-rust metadata scan operator
+                    // produces all rows in a single call keyed off
+                    // `serialized_table`. We still need at least one
+                    // scan range so the runtime allocates a morsel and
+                    // dispatches to `IcebergMetadataScanOp`.
                     vec![build_iceberg_metadata_scan_range_params()]
                 }
                 ScanSource::IcebergDeltaTable { .. } => {
@@ -1181,11 +1182,13 @@ fn build_hdfs_scan_range_params(
     ))
 }
 
-/// Build a single placeholder scan range that drives the iceberg metadata
-/// JVM bridge. The bridge keys off `serialized_table` on the
-/// `THdfsScanNode`, so the per-range payload only needs to satisfy
-/// `lower::node::hdfs_scan` invariants: a non-empty path and the
-/// `use_iceberg_jni_metadata_reader` flag set.
+/// Build a single placeholder scan range that drives the native
+/// iceberg-rust metadata scan operator. The operator keys off
+/// `serialized_table` on the `THdfsScanNode`, so the per-range payload
+/// only needs to satisfy `lower::node::hdfs_scan` invariants: a
+/// non-empty path. (The earlier embedded-JVM bridge keyed the same
+/// way; that path has been replaced by `IcebergMetadataScanOp` —
+/// see `src/connector/iceberg/metadata.rs`.)
 fn build_iceberg_metadata_scan_range_params() -> internal_service::TScanRangeParams {
     let hdfs_scan_range = plan_nodes::THdfsScanRange::new(
         None::<String>,

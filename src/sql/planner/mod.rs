@@ -1570,10 +1570,11 @@ fn is_lateral_unnest_condition_supported(condition: &Option<TypedExpr>) -> bool 
 
 /// Lower an analyzer-built `IcebergMetadataScanRelation` into a regular
 /// `LogicalPlan::Scan` whose `TableDef` carries the synthetic
-/// `ScanSource::IcebergMetadataTable` storage. The optimizer treats it
-/// like any other Scan; codegen branches on the storage variant to emit
+/// `ScanSource::IcebergMetadataTable` source. The optimizer treats it
+/// like any other Scan; codegen branches on the source variant to emit
 /// an `HDFS_SCAN_NODE` whose lowering wires up the native-Rust
-/// `IcebergMetadataScanOp` (no JNI bridge).
+/// `IcebergMetadataScanOp` (no JVM / JNI bridge — the embedded-Java
+/// path was removed in favor of iceberg-rust).
 fn plan_iceberg_metadata_scan(
     rel: IcebergMetadataScanRelation,
     factory: &mut ColumnRefFactory,
