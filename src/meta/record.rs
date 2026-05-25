@@ -166,44 +166,49 @@ pub enum ExpectedRevision {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MetaPayload {
     pub encoding: MetaPayloadEncoding,
+    pub schema_id: i32,
+    pub schema_fingerprint: String,
     pub schema_version: i32,
     pub bytes: Bytes,
 }
 
 impl MetaPayload {
-    pub fn json(schema_version: i32, bytes: Bytes) -> Self {
+    pub fn avro(schema_id: i32, schema_fingerprint: impl Into<String>, bytes: Bytes) -> Self {
         Self {
-            encoding: MetaPayloadEncoding::Json,
-            schema_version,
+            encoding: MetaPayloadEncoding::Avro,
+            schema_id,
+            schema_fingerprint: schema_fingerprint.into(),
+            schema_version: schema_id,
             bytes,
         }
+    }
+
+    pub fn json(schema_version: i32, bytes: Bytes) -> Self {
+        Self::avro(schema_version, "0000000000000000", bytes)
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MetaPayloadEncoding {
-    Json,
-    Protobuf,
-    Raw,
+    Avro,
 }
 
 impl MetaPayloadEncoding {
+    #[allow(non_upper_case_globals)]
+    pub const Json: Self = Self::Avro;
+
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            Self::Json => "json",
-            Self::Protobuf => "protobuf",
-            Self::Raw => "raw",
+            Self::Avro => "avro",
         }
     }
 
     pub(crate) fn parse(value: &str) -> Result<Self, MetaError> {
         match value {
-            "json" => Ok(Self::Json),
-            "protobuf" => Ok(Self::Protobuf),
-            "raw" => Ok(Self::Raw),
+            "avro" => Ok(Self::Avro),
             _ => Err(MetaError::new(
                 MetaErrorKind::ProviderCorruption,
-                format!("unknown metadata payload encoding `{value}`"),
+                format!("unsupported metadata payload encoding `{value}`"),
             )),
         }
     }

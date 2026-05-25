@@ -8,6 +8,10 @@ use novarocks::meta::{
 
 type TestResult = Result<(), Box<dyn Error>>;
 
+fn test_payload(bytes: &'static [u8]) -> MetaPayload {
+    MetaPayload::avro(1, "0000000000000000", Bytes::from_static(bytes))
+}
+
 #[allow(dead_code)]
 pub fn run_meta_provider_conformance<P, G, F>(mut new_provider: F) -> TestResult
 where
@@ -35,7 +39,7 @@ where
     let (_guard, provider) = new_provider()?;
     let key = MetaKey::new("mv", ["by-id", "123"])?;
     let kind = MetaRecordKind::new("mv.definition")?;
-    let payload = MetaPayload::json(1, Bytes::from_static(br#"{"name":"mv1"}"#));
+    let payload = test_payload(b"payload-mv1");
 
     {
         let mut txn = provider.begin_write("create mv")?;
@@ -66,7 +70,7 @@ where
     let (_guard, provider) = new_provider()?;
     let key = MetaKey::new("mv", ["by-id", "123"])?;
     let kind = MetaRecordKind::new("mv.definition")?;
-    let initial_payload = MetaPayload::json(1, Bytes::from_static(br#"{"name":"mv1"}"#));
+    let initial_payload = test_payload(b"payload-mv1");
 
     {
         let mut txn = provider.begin_write("create mv")?;
@@ -83,7 +87,7 @@ where
         .begin_read()?
         .get(&key)?
         .expect("record should exist");
-    let updated_payload = MetaPayload::json(1, Bytes::from_static(br#"{"name":"mv2"}"#));
+    let updated_payload = test_payload(b"payload-mv2");
 
     {
         let mut txn = provider.begin_write("update mv")?;
@@ -115,7 +119,7 @@ where
     let (_guard, provider) = new_provider()?;
     let key = MetaKey::new("mv", ["by-id", "123"])?;
     let kind = MetaRecordKind::new("mv.definition")?;
-    let payload = MetaPayload::json(1, Bytes::from_static(br#"{"name":"mv1"}"#));
+    let payload = test_payload(b"payload-mv1");
 
     {
         let mut txn = provider.begin_write("create mv")?;
@@ -157,7 +161,7 @@ where
                 key,
                 kind.clone(),
                 ExpectedRevision::NotExists,
-                MetaPayload::json(1, Bytes::from_static(br#"{}"#)),
+                test_payload(b"payload-mv1"),
             ))?;
         }
         txn.commit()?;
@@ -218,7 +222,7 @@ where
             key.clone(),
             kind.clone(),
             ExpectedRevision::NotExists,
-            MetaPayload::json(1, Bytes::from_static(br#"{"name":"mv1"}"#)),
+            test_payload(b"payload-mv1"),
         ))?;
         txn.commit()?;
     }
@@ -229,7 +233,7 @@ where
             missing_key,
             kind.clone(),
             ExpectedRevision::Exists,
-            MetaPayload::json(1, Bytes::from_static(br#"{"name":"missing"}"#)),
+            test_payload(b"payload-missing"),
         ))
         .expect_err("missing Exists update should fail")
     };
@@ -241,7 +245,7 @@ where
             key.clone(),
             kind,
             ExpectedRevision::Exists,
-            MetaPayload::json(1, Bytes::from_static(br#"{"name":"mv2"}"#)),
+            test_payload(b"payload-mv2"),
         ))?;
         txn.commit()?;
     }
@@ -250,10 +254,7 @@ where
         .begin_read()?
         .get(&key)?
         .expect("record should exist after Exists update");
-    assert_eq!(
-        record.payload.bytes,
-        Bytes::from_static(br#"{"name":"mv2"}"#)
-    );
+    assert_eq!(record.payload.bytes, Bytes::from_static(b"payload-mv2"));
     Ok(())
 }
 
@@ -273,7 +274,7 @@ where
             key.clone(),
             kind,
             ExpectedRevision::NotExists,
-            MetaPayload::json(1, Bytes::from_static(br#"{"name":"mv1"}"#)),
+            test_payload(b"payload-mv1"),
         ))?;
         txn.commit()?;
     }
@@ -300,7 +301,7 @@ where
             key.clone(),
             kind,
             ExpectedRevision::NotExists,
-            MetaPayload::json(1, Bytes::from_static(br#"{"name":"mv1"}"#)),
+            test_payload(b"payload-mv1"),
         ))?;
         txn.abort()?;
     }
@@ -329,7 +330,7 @@ where
             key.clone(),
             kind.clone(),
             ExpectedRevision::NotExists,
-            MetaPayload::json(1, Bytes::from_static(br#"{"name":"mv1"}"#)),
+            test_payload(b"payload-mv1"),
         ))?;
         txn.commit()?;
     }
@@ -344,7 +345,7 @@ where
             key.clone(),
             kind.clone(),
             ExpectedRevision::Exists,
-            MetaPayload::json(1, Bytes::from_static(br#"{"name":"mv2"}"#)),
+            test_payload(b"payload-mv2"),
         ))?;
         txn.commit()?;
     }
@@ -355,7 +356,7 @@ where
             key,
             kind,
             ExpectedRevision::Exact(first.revision),
-            MetaPayload::json(1, Bytes::from_static(br#"{"name":"mv3"}"#)),
+            test_payload(b"payload-mv3"),
         ))
         .expect_err("stale Exact update should fail")
     };
@@ -378,7 +379,7 @@ where
             key.clone(),
             kind.clone(),
             ExpectedRevision::Any,
-            MetaPayload::json(1, Bytes::from_static(br#"{"name":"mv1"}"#)),
+            test_payload(b"payload-mv1"),
         ))?;
         txn.commit()?;
     }
@@ -388,7 +389,7 @@ where
             key.clone(),
             kind,
             ExpectedRevision::Any,
-            MetaPayload::json(1, Bytes::from_static(br#"{"name":"mv2"}"#)),
+            test_payload(b"payload-mv2"),
         ))?;
         txn.commit()?;
     }
@@ -397,9 +398,6 @@ where
         .begin_read()?
         .get(&key)?
         .expect("record should exist");
-    assert_eq!(
-        record.payload.bytes,
-        Bytes::from_static(br#"{"name":"mv2"}"#)
-    );
+    assert_eq!(record.payload.bytes, Bytes::from_static(b"payload-mv2"));
     Ok(())
 }

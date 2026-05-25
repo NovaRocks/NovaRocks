@@ -1,7 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::meta::{
     ExpectedRevision, IdScope, MetaCommitOutcome, MetaError, MetaErrorKind, MetaKey, MetaKeyPrefix,
@@ -118,7 +118,7 @@ impl Drop for SqliteWriteTxn {
 fn get_record(conn: &Connection, key: &MetaKey) -> Result<Option<MetaRecord>, MetaError> {
     conn.query_row(
         r#"
-        SELECT kind, revision, payload_encoding, payload_schema_version, payload,
+        SELECT kind, revision, payload_encoding, payload_schema_id, payload_schema_fingerprint, payload,
                created_at_ms, updated_at_ms
         FROM meta_records
         WHERE namespace = ?1 AND key = ?2
@@ -129,19 +129,22 @@ fn get_record(conn: &Connection, key: &MetaKey) -> Result<Option<MetaRecord>, Me
             let revision = MetaRevision::from_sqlite_i64(row.get::<_, i64>(1)?);
             let encoding =
                 MetaPayloadEncoding::parse(&row.get::<_, String>(2)?).map_err(to_sql_error)?;
-            let schema_version = row.get::<_, i32>(3)?;
-            let payload = Bytes::from(row.get::<_, Vec<u8>>(4)?);
+            let schema_id = row.get::<_, i32>(3)?;
+            let schema_fingerprint = row.get::<_, String>(4)?;
+            let payload = Bytes::from(row.get::<_, Vec<u8>>(5)?);
             Ok(MetaRecord {
                 key: key.clone(),
                 kind,
                 revision,
                 payload: MetaPayload {
                     encoding,
-                    schema_version,
+                    schema_id,
+                    schema_fingerprint,
+                    schema_version: schema_id,
                     bytes: payload,
                 },
-                created_at_ms: row.get(5)?,
-                updated_at_ms: row.get(6)?,
+                created_at_ms: row.get(6)?,
+                updated_at_ms: row.get(7)?,
             })
         },
     )
@@ -159,7 +162,8 @@ fn scan_records(
         let mut stmt = conn
             .prepare(
                 r#"
-                SELECT key, kind, revision, payload_encoding, payload_schema_version, payload,
+                SELECT key, kind, revision, payload_encoding, payload_schema_id,
+                       payload_schema_fingerprint, payload,
                        created_at_ms, updated_at_ms
                 FROM meta_records
                 WHERE namespace = ?1
@@ -184,7 +188,8 @@ fn scan_records(
         let mut stmt = conn
             .prepare(
                 r#"
-                SELECT key, kind, revision, payload_encoding, payload_schema_version, payload,
+                SELECT key, kind, revision, payload_encoding, payload_schema_id,
+                       payload_schema_fingerprint, payload,
                        created_at_ms, updated_at_ms
                 FROM meta_records
                 WHERE namespace = ?1
@@ -217,19 +222,22 @@ fn row_to_record(namespace: &str, row: &rusqlite::Row<'_>) -> Result<MetaRecord,
     let kind = MetaRecordKind::new(row.get::<_, String>(1)?).map_err(to_sql_error)?;
     let revision = MetaRevision::from_sqlite_i64(row.get::<_, i64>(2)?);
     let encoding = MetaPayloadEncoding::parse(&row.get::<_, String>(3)?).map_err(to_sql_error)?;
-    let schema_version = row.get::<_, i32>(4)?;
-    let payload = Bytes::from(row.get::<_, Vec<u8>>(5)?);
+    let schema_id = row.get::<_, i32>(4)?;
+    let schema_fingerprint = row.get::<_, String>(5)?;
+    let payload = Bytes::from(row.get::<_, Vec<u8>>(6)?);
     Ok(MetaRecord {
         key,
         kind,
         revision,
         payload: MetaPayload {
             encoding,
-            schema_version,
+            schema_id,
+            schema_fingerprint,
+            schema_version: schema_id,
             bytes: payload,
         },
-        created_at_ms: row.get(6)?,
-        updated_at_ms: row.get(7)?,
+        created_at_ms: row.get(7)?,
+        updated_at_ms: row.get(8)?,
     })
 }
 
@@ -238,17 +246,18 @@ fn insert_record(conn: &Connection, record: MetaRecordPut) -> Result<(), MetaErr
     conn.execute(
         r#"
         INSERT INTO meta_records(
-            namespace, key, kind, revision, payload_encoding, payload_schema_version,
-            payload, created_at_ms, updated_at_ms
+            namespace, key, kind, revision, payload_encoding, payload_schema_id,
+            payload_schema_fingerprint, payload, created_at_ms, updated_at_ms
         )
-        VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, ?7)
+        VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, ?8, ?8)
         "#,
         params![
             record.key.namespace(),
             record.key.canonical_path(),
             record.kind.as_str(),
             record.payload.encoding.as_str(),
-            record.payload.schema_version,
+            record.payload.schema_id,
+            record.payload.schema_fingerprint,
             record.payload.bytes.as_ref(),
             now,
         ],
@@ -283,15 +292,17 @@ fn update_record_exact(
                SET kind = ?1,
                    revision = revision + 1,
                    payload_encoding = ?2,
-                   payload_schema_version = ?3,
-                   payload = ?4,
-                   updated_at_ms = ?5
-             WHERE namespace = ?6 AND key = ?7 AND revision = ?8
+                   payload_schema_id = ?3,
+                   payload_schema_fingerprint = ?4,
+                   payload = ?5,
+                   updated_at_ms = ?6
+             WHERE namespace = ?7 AND key = ?8 AND revision = ?9
             "#,
             params![
                 record.kind.as_str(),
                 record.payload.encoding.as_str(),
-                record.payload.schema_version,
+                record.payload.schema_id,
+                record.payload.schema_fingerprint,
                 record.payload.bytes.as_ref(),
                 now,
                 record.key.namespace(),
@@ -332,15 +343,17 @@ fn update_record_exists(conn: &Connection, record: MetaRecordPut) -> Result<(), 
                SET kind = ?1,
                    revision = revision + 1,
                    payload_encoding = ?2,
-                   payload_schema_version = ?3,
-                   payload = ?4,
-                   updated_at_ms = ?5
-             WHERE namespace = ?6 AND key = ?7
+                   payload_schema_id = ?3,
+                   payload_schema_fingerprint = ?4,
+                   payload = ?5,
+                   updated_at_ms = ?6
+             WHERE namespace = ?7 AND key = ?8
             "#,
             params![
                 record.kind.as_str(),
                 record.payload.encoding.as_str(),
-                record.payload.schema_version,
+                record.payload.schema_id,
+                record.payload.schema_fingerprint,
                 record.payload.bytes.as_ref(),
                 now,
                 record.key.namespace(),
