@@ -161,10 +161,7 @@ fn ensure_store_marker(conn: &Connection) -> Result<(), MetaError> {
             format!("unsupported metadata store format `{other}`"),
         )),
         None => {
-            let records: i64 = conn
-                .query_row("SELECT COUNT(*) FROM meta_records", [], |row| row.get(0))
-                .map_err(super::txn::sqlite_error)?;
-            if records != 0 {
+            if legacy_provider_state_count(conn)? != 0 {
                 return Err(MetaError::new(
                     MetaErrorKind::ProviderCorruption,
                     "legacy or unsupported metadata store is non-empty; missing store_format marker",

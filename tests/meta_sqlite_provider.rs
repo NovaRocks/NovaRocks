@@ -346,6 +346,53 @@ fn sqlite_provider_rejects_nonempty_store_missing_format_marker() -> TestResult 
 }
 
 #[test]
+fn sqlite_provider_rejects_markerless_store_with_id_scopes() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("meta.sqlite");
+    {
+        let conn = Connection::open(&path)?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE meta_provider_schema (
+                key TEXT PRIMARY KEY,
+                value BLOB NOT NULL
+            );
+            CREATE TABLE meta_records (
+                namespace TEXT NOT NULL,
+                key TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                payload_encoding TEXT NOT NULL,
+                payload_schema_id INTEGER NOT NULL,
+                payload_schema_fingerprint TEXT NOT NULL,
+                payload BLOB NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY(namespace, key)
+            );
+            CREATE TABLE meta_id_scopes (
+                scope TEXT PRIMARY KEY,
+                next_id INTEGER NOT NULL
+            );
+            INSERT INTO meta_id_scopes(scope, next_id) VALUES('mv.id', 42);
+            "#,
+        )?;
+    }
+
+    let err =
+        SqliteMetaStoreProvider::open(&path).expect_err("missing marker with ID state must fail");
+    assert_eq!(
+        err.kind(),
+        novarocks::meta::MetaErrorKind::ProviderCorruption
+    );
+    assert!(
+        err.to_string().contains("missing store_format marker"),
+        "{err}"
+    );
+    Ok(())
+}
+
+#[test]
 fn sqlite_provider_rejects_empty_legacy_json_store_with_id_scopes() -> TestResult {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("meta.sqlite");
@@ -431,8 +478,9 @@ fn sqlite_provider_rejects_unknown_metadata_epoch() -> TestResult {
         err.kind(),
         novarocks::meta::MetaErrorKind::ProviderCorruption
     );
-    assert!(err
-        .to_string()
-        .contains("metadata epoch 999 is newer than supported epoch 1"));
+    assert!(
+        err.to_string()
+            .contains("metadata epoch 999 is newer than supported epoch 1")
+    );
     Ok(())
 }

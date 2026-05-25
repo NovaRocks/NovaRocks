@@ -182,10 +182,6 @@ impl MetaPayload {
             bytes,
         }
     }
-
-    pub fn json(schema_version: i32, bytes: Bytes) -> Self {
-        Self::avro(schema_version, "0000000000000000", bytes)
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -194,9 +190,6 @@ pub enum MetaPayloadEncoding {
 }
 
 impl MetaPayloadEncoding {
-    #[allow(non_upper_case_globals)]
-    pub const Json: Self = Self::Avro;
-
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Avro => "avro",
