@@ -191,6 +191,7 @@ fn repository_rejects_unknown_avro_schema_id() -> Result<(), Box<dyn std::error:
     let err = repository
         .load_by_id(read.as_ref(), 777)
         .expect_err("unknown schema id should fail");
+    assert_eq!(err.kind(), RepositoryErrorKind::Provider);
     let msg = err.to_string();
     assert!(
         msg.contains("unknown Avro schema entry for subject `mv.definition` id 999"),
