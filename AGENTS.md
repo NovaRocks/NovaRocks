@@ -391,7 +391,7 @@ SQL client / SQL test runner
 
 - `[standalone_server]`
   `mysql_port`, `user`, `metadata_db_path`, `warehouse_uri`,
-  `mv_default_storage_engine`, and `tables`.
+  and `mv_default_storage_engine`.
 
 - `[standalone_server.object_store]`
   Object-store endpoint and credentials for managed-lake standalone storage.

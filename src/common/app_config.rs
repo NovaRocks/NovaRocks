@@ -223,12 +223,6 @@ impl Default for ServerConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-pub struct StandaloneTableConfig {
-    pub name: String,
-    pub path: PathBuf,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct MetadataConfig {
     #[serde(default)]
@@ -269,8 +263,6 @@ pub struct StandaloneServerConfig {
     pub object_store: Option<StandaloneObjectStoreConfig>,
     #[serde(default)]
     pub mv_default_storage_engine: Option<String>,
-    #[serde(default)]
-    pub tables: Vec<StandaloneTableConfig>,
 }
 
 fn default_standalone_server_mysql_port() -> u16 {
@@ -289,7 +281,6 @@ impl Default for StandaloneServerConfig {
             warehouse_uri: None,
             object_store: None,
             mv_default_storage_engine: None,
-            tables: Vec::new(),
         }
     }
 }
@@ -1132,7 +1123,6 @@ starlet_port = 19070
                 warehouse_uri: None,
                 object_store: None,
                 mv_default_storage_engine: None,
-                tables: Vec::new(),
             })
         );
     }
@@ -1151,28 +1141,6 @@ mysql_port = 19030
         let metadata = cfg.metadata.expect("metadata config");
         assert_eq!(metadata.provider, MetadataProviderConfig::Sqlite);
         assert_eq!(metadata.path, PathBuf::from("meta/catalog.db"));
-    }
-
-    #[test]
-    fn test_standalone_server_tables_can_be_overridden() {
-        let cfg: NovaRocksConfig = toml::from_str(
-            r#"
-[standalone_server]
-mysql_port = 19030
-user = "root"
-
-[[standalone_server.tables]]
-name = "tbl"
-path = "data/tbl.parquet"
-"#,
-        )
-        .expect("parse config");
-        let standalone = cfg.standalone_server.expect("standalone server config");
-        assert_eq!(standalone.mysql_port, 19030);
-        assert_eq!(standalone.user, "root");
-        assert_eq!(standalone.tables.len(), 1);
-        assert_eq!(standalone.tables[0].name, "tbl");
-        assert_eq!(standalone.tables[0].path, PathBuf::from("data/tbl.parquet"));
     }
 
     #[test]

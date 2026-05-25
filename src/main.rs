@@ -28,13 +28,12 @@ use std::time::{Duration, Instant};
 use novarocks::common::network;
 use novarocks::novarocks_config;
 use novarocks::novarocks_logging;
-use novarocks::server::{StandaloneServerOptions, StandaloneTableConfig, run_standalone_server};
+use novarocks::server::{StandaloneServerOptions, run_standalone_server};
 use std::eprintln;
 
 #[derive(Debug, PartialEq, Eq)]
 struct StandaloneServerCliArgs {
     mysql_port: Option<u16>,
-    tables: Vec<StandaloneTableConfig>,
     config_path: Option<String>,
 }
 
@@ -51,27 +50,10 @@ fn print_main_usage() {
 
 fn print_standalone_server_usage() {
     eprintln!(
-        "Usage: novarocks standalone-server [--port <port>] [--table <name>=<absolute_parquet_path>]... [--config <path>]"
+        "Usage: novarocks standalone-server [--port <port>] [--config <path>]"
     );
     eprintln!("Example:");
-    eprintln!("  novarocks standalone-server --port 9030 --table tbl=/abs/path/tbl.parquet");
-}
-
-fn parse_standalone_server_table(raw: &str) -> Result<StandaloneTableConfig, String> {
-    let (name, path) = raw.split_once('=').ok_or_else(|| {
-        format!("invalid --table value `{raw}`; expected <name>=<absolute_parquet_path>")
-    })?;
-    let path = PathBuf::from(path);
-    if !path.is_absolute() {
-        return Err(format!(
-            "standalone-server --table path must be absolute: {}",
-            path.display()
-        ));
-    }
-    Ok(StandaloneTableConfig {
-        name: name.to_string(),
-        path,
-    })
+    eprintln!("  novarocks standalone-server --port 9030 --config /etc/novarocks/novarocks.toml");
 }
 
 fn parse_standalone_server_args(
@@ -79,7 +61,6 @@ fn parse_standalone_server_args(
 ) -> Result<Option<StandaloneServerCliArgs>, String> {
     let mut idx = 0usize;
     let mut mysql_port: Option<u16> = None;
-    let mut tables = Vec::new();
     let mut config_path: Option<String> = None;
 
     while let Some(arg) = args.get(idx) {
@@ -93,14 +74,6 @@ fn parse_standalone_server_args(
                     raw.parse::<u16>()
                         .map_err(|e| format!("invalid --port value `{raw}`: {e}"))?,
                 );
-                idx += 1;
-            }
-            "--table" => {
-                idx += 1;
-                let raw = args
-                    .get(idx)
-                    .ok_or_else(|| "missing value for --table".to_string())?;
-                tables.push(parse_standalone_server_table(raw)?);
                 idx += 1;
             }
             "--config" | "-c" => {
@@ -122,7 +95,6 @@ fn parse_standalone_server_args(
 
     Ok(Some(StandaloneServerCliArgs {
         mysql_port,
-        tables,
         config_path,
     }))
 }
@@ -131,7 +103,6 @@ fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> Result<(), String>
     run_standalone_server(StandaloneServerOptions {
         config_path: cli.config_path.map(PathBuf::from),
         mysql_port: cli.mysql_port,
-        tables: cli.tables,
     })
 }
 
@@ -754,20 +725,15 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::{StandaloneServerCliArgs, parse_standalone_server_args};
-    use novarocks::server::StandaloneTableConfig;
 
     #[test]
-    fn parse_standalone_server_args_accepts_tables_and_port() {
+    fn parse_standalone_server_args_accepts_port_and_config() {
         let args = vec![
             "--port".to_string(),
             "19030".to_string(),
-            "--table".to_string(),
-            "tbl=/tmp/tbl.parquet".to_string(),
-            "--table".to_string(),
-            "tbl2=/tmp/tbl2.parquet".to_string(),
+            "--config".to_string(),
+            "/tmp/novarocks.toml".to_string(),
         ];
         let parsed = parse_standalone_server_args(&args)
             .expect("parse standalone-server args")
@@ -776,41 +742,29 @@ mod tests {
             parsed,
             StandaloneServerCliArgs {
                 mysql_port: Some(19030),
-                tables: vec![
-                    StandaloneTableConfig {
-                        name: "tbl".to_string(),
-                        path: PathBuf::from("/tmp/tbl.parquet"),
-                    },
-                    StandaloneTableConfig {
-                        name: "tbl2".to_string(),
-                        path: PathBuf::from("/tmp/tbl2.parquet"),
-                    },
-                ],
-                config_path: None,
-            }
-        );
-    }
-
-    #[test]
-    fn parse_standalone_server_args_accepts_config_without_tables() {
-        let args = vec!["--config".to_string(), "/tmp/novarocks.toml".to_string()];
-        let parsed = parse_standalone_server_args(&args)
-            .expect("parse standalone-server args")
-            .expect("standalone-server args");
-        assert_eq!(
-            parsed,
-            StandaloneServerCliArgs {
-                mysql_port: None,
-                tables: Vec::new(),
                 config_path: Some("/tmp/novarocks.toml".to_string()),
             }
         );
     }
 
     #[test]
-    fn parse_standalone_server_args_rejects_relative_table_path() {
-        let args = vec!["--table".to_string(), "tbl=./tbl.parquet".to_string()];
-        let err = parse_standalone_server_args(&args).expect_err("relative path must fail");
-        assert!(err.contains("must be absolute"));
+    fn parse_standalone_server_args_accepts_empty() {
+        let parsed = parse_standalone_server_args(&[])
+            .expect("parse standalone-server args")
+            .expect("standalone-server args");
+        assert_eq!(
+            parsed,
+            StandaloneServerCliArgs {
+                mysql_port: None,
+                config_path: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_standalone_server_args_rejects_unknown_flag() {
+        let args = vec!["--unknown".to_string()];
+        let err = parse_standalone_server_args(&args).expect_err("unknown flag must fail");
+        assert!(err.contains("unknown standalone-server arg"));
     }
 }
