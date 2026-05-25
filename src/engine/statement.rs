@@ -970,6 +970,15 @@ pub(crate) fn execute_drop_catalog_statement(
     catalog_name: &str,
     if_exists: bool,
 ) -> Result<StatementResult, String> {
+    // The catalog name passed in by the user may carry quoting/case the
+    // dependency graph normalizes away; `ensure_no_external_iceberg_dependents`
+    // already does case-insensitive matching, so pass the user-typed value
+    // straight through.
+    crate::engine::mv::dependency::ensure_no_external_iceberg_dependents(
+        state,
+        catalog_name,
+        None,
+    )?;
     let mut guard = state
         .iceberg_catalogs
         .write()
@@ -1007,6 +1016,13 @@ pub(crate) fn execute_drop_database_statement(
         } else {
             Err(format!("unknown database `{}`", name.parts.join(".")))
         };
+    }
+    if target.backend_name == "iceberg" {
+        crate::engine::mv::dependency::ensure_no_external_iceberg_dependents(
+            state,
+            &target.catalog,
+            Some(&target.namespace),
+        )?;
     }
     match backend.drop_namespace(&target.catalog, &target.namespace, force) {
         Ok(()) => {

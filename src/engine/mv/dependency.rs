@@ -186,6 +186,105 @@ pub(crate) fn resolve_create_mv_dependencies(
     })
 }
 
+fn object_in_iceberg_scope(
+    object: &MvDependencyObjectRef,
+    scope_catalog: &str,
+    scope_namespace: Option<&str>,
+) -> bool {
+    if object.storage_engine != MvDependencyStorageEngine::Iceberg {
+        return false;
+    }
+    let Some(obj_catalog) = object.catalog.as_deref() else {
+        return false;
+    };
+    if !obj_catalog.eq_ignore_ascii_case(scope_catalog) {
+        return false;
+    }
+    if let Some(ns) = scope_namespace
+        && !object.database_or_namespace.eq_ignore_ascii_case(ns)
+    {
+        return false;
+    }
+    true
+}
+
+/// Pure orphan-prevention check: given the full set of MV targets and their
+/// upstream dependencies, reject the scope drop if any MV outside the scope
+/// depends on an upstream inside the scope.
+pub(crate) fn validate_no_external_dependents_for_scope(
+    scope_catalog: &str,
+    scope_namespace: Option<&str>,
+    definitions_with_deps: &[(MvDependencyObjectRef, Vec<MvDependencyObjectRef>)],
+) -> Result<(), String> {
+    let mut external_dependents: Vec<String> = Vec::new();
+    for (target, upstreams) in definitions_with_deps {
+        let target_in_scope = object_in_iceberg_scope(target, scope_catalog, scope_namespace);
+        if target_in_scope {
+            continue;
+        }
+        for upstream in upstreams {
+            if object_in_iceberg_scope(upstream, scope_catalog, scope_namespace) {
+                external_dependents.push(format!(
+                    "{} depends on {}",
+                    target.display_name(),
+                    upstream.display_name(),
+                ));
+                break;
+            }
+        }
+    }
+
+    if external_dependents.is_empty() {
+        return Ok(());
+    }
+    external_dependents.sort();
+    let scope_str = match scope_namespace {
+        Some(ns) => format!("`{scope_catalog}.{ns}`"),
+        None => format!("`{scope_catalog}`"),
+    };
+    Err(format!(
+        "cannot drop {scope_str}: would orphan downstream materialized views: {}",
+        external_dependents.join(", ")
+    ))
+}
+
+/// State-aware wrapper around `validate_no_external_dependents_for_scope`:
+/// loads MV definitions and their upstream dependencies from the repository,
+/// then delegates to the pure helper.
+pub(crate) fn ensure_no_external_iceberg_dependents(
+    state: &Arc<StandaloneState>,
+    scope_catalog: &str,
+    scope_namespace: Option<&str>,
+) -> Result<(), String> {
+    let Some(provider) = state.metadata_provider.as_ref() else {
+        return Ok(());
+    };
+    let read = provider
+        .begin_read()
+        .map_err(|e| format!("open MV dependency drop scope read failed: {e}"))?;
+
+    let definitions = state
+        .mv_repo
+        .list_definitions(read.as_ref())
+        .map_err(|e| format!("load MV definitions for drop scope check failed: {e}"))?;
+
+    let mut edges: Vec<(MvDependencyObjectRef, Vec<MvDependencyObjectRef>)> =
+        Vec::with_capacity(definitions.len());
+    for def in &definitions {
+        let mv_target = stored_definition_dependency_ref_from_state(state, def)?;
+        let upstreams = state
+            .mv_repo
+            .list_dependencies_by_downstream(read.as_ref(), def.mv_id)
+            .map_err(|e| format!("load MV dependencies for drop scope check failed: {e}"))?
+            .into_iter()
+            .map(|dep| dep.upstream)
+            .collect::<Vec<_>>();
+        edges.push((mv_target, upstreams));
+    }
+
+    validate_no_external_dependents_for_scope(scope_catalog, scope_namespace, &edges)
+}
+
 pub(crate) fn validate_no_cycle_for_edges(
     new_target: &MvDependencyObjectRef,
     new_upstreams: &[MvDependencyObjectRef],
@@ -486,6 +585,84 @@ mod tests {
 
         let order = topological_upstream_order_for_edges(&mv_c, &edges).expect("order");
         assert_eq!(order, vec![mv_a, mv_b, mv_c]);
+    }
+
+    #[test]
+    fn external_dependents_scope_passes_when_scope_is_self_contained() {
+        // Downstream MV is *inside* the scope (cat1.db1), so dropping the
+        // scope also drops the downstream — no orphan risk.
+        let mv_target = iceberg_mv_dependency_ref("cat1", "db1", "mv_inside");
+        let upstream = iceberg_table_object_ref("cat1", "db1", "orders");
+        let edges = vec![(mv_target, vec![upstream])];
+
+        validate_no_external_dependents_for_scope("cat1", Some("db1"), &edges)
+            .expect("scope-internal MV must not block the drop");
+    }
+
+    #[test]
+    fn external_dependents_scope_rejects_external_dependent() {
+        // Downstream MV lives outside the scope but depends on a table inside
+        // it — dropping the scope would orphan the MV.
+        let mv_target = iceberg_mv_dependency_ref("cat2", "db2", "mv_outside");
+        let upstream = iceberg_table_object_ref("cat1", "db1", "orders");
+        let edges = vec![(mv_target, vec![upstream])];
+
+        let err = validate_no_external_dependents_for_scope("cat1", Some("db1"), &edges)
+            .expect_err("orphaning MV must be rejected");
+        assert!(
+            err.contains("cannot drop `cat1.db1`"),
+            "err missing scope label: {err}"
+        );
+        assert!(
+            err.contains("mv:cat2.db2.mv_outside depends on cat1.db1.orders"),
+            "err missing dependent detail: {err}"
+        );
+    }
+
+    #[test]
+    fn external_dependents_scope_at_catalog_granularity() {
+        // DROP CATALOG cat1 — same risk, but the scope spans every namespace
+        // under cat1. An MV in cat2.* depending on anything under cat1.*
+        // must block the drop.
+        let mv_target = iceberg_mv_dependency_ref("cat2", "db2", "mv_outside");
+        let upstream_a = iceberg_table_object_ref("cat1", "ns1", "events");
+        let upstream_b = iceberg_table_object_ref("cat1", "ns2", "orders");
+        let edges = vec![(mv_target, vec![upstream_a.clone(), upstream_b.clone()])];
+
+        let err = validate_no_external_dependents_for_scope("cat1", None, &edges)
+            .expect_err("catalog-wide drop must reject the orphan");
+        assert!(err.contains("cannot drop `cat1`"), "err: {err}");
+
+        // Reverse: dropping cat2 should be fine — cat2.mv depends only on
+        // cat1.* upstreams; nothing inside cat2 has external dependents.
+        validate_no_external_dependents_for_scope("cat2", None, &edges)
+            .expect("dropping the catalog that contains only an MV is allowed");
+    }
+
+    #[test]
+    fn external_dependents_scope_ignores_non_iceberg_upstreams() {
+        // Managed-lake upstreams are never in an Iceberg scope, even if the
+        // catalog/namespace strings happen to match.
+        let mv_target = iceberg_mv_dependency_ref("cat2", "db2", "mv_outside");
+        let upstream = managed_table_object_ref("cat1", "orders");
+        let edges = vec![(mv_target, vec![upstream])];
+
+        validate_no_external_dependents_for_scope("cat1", Some("orders"), &edges)
+            .expect("non-iceberg upstreams must not block iceberg-scope drops");
+    }
+
+    #[test]
+    fn external_dependents_scope_case_insensitive_matching() {
+        // Catalog/namespace identifiers are normalized to lowercase by the
+        // resolver; ensure the scope check also works when the caller passes
+        // mixed-case values.
+        let mv_target = iceberg_mv_dependency_ref("cat2", "db2", "mv_outside");
+        let upstream = iceberg_table_object_ref("cat1", "db1", "orders");
+        let edges = vec![(mv_target, vec![upstream])];
+
+        let err = validate_no_external_dependents_for_scope("CAT1", Some("DB1"), &edges)
+            .expect_err("case-insensitive scope match must still reject orphan");
+        assert!(err.contains("cannot drop `CAT1.DB1`"), "err: {err}");
     }
 
     #[test]
