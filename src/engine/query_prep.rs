@@ -1059,16 +1059,27 @@ mod tests {
     }
 
     #[test]
-    fn delta_table_builder_accepts_empty_local_storage() {
+    fn delta_table_builder_accepts_empty_iceberg_storage() {
+        // The IVM-A1 delta source `stamp_delta_table_def_change_ops`
+        // requires the base table to be backed by `S3ParquetFiles`
+        // (real or synthetic). An empty Iceberg snapshot legitimately
+        // produces `S3ParquetFiles { files: vec![] }` (see
+        // `connector/iceberg/catalog/backend.rs::empty_iceberg_table_storage`);
+        // ensure that path round-trips correctly when stamping with an
+        // empty change-op slice.
         let mut table_def = TableDef {
             name: "t".to_string(),
             columns: vec![],
             iceberg_row_lineage_metadata_columns: vec![],
             iceberg_table: None,
-            storage: TableStorage::S3ParquetFiles { files: Vec::new(), cloud_properties: Default::default() },
+            storage: TableStorage::S3ParquetFiles {
+                files: Vec::new(),
+                cloud_properties: Default::default(),
+            },
         };
 
-        super::stamp_delta_table_def_change_ops(&mut table_def, &[]).expect("stamp empty delta");
+        super::stamp_delta_table_def_change_ops(&mut table_def, &[])
+            .expect("stamp empty delta over empty iceberg storage");
 
         assert_eq!(
             table_def

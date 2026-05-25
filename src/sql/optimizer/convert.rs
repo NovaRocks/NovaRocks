@@ -321,7 +321,7 @@ mod tests {
             }],
             iceberg_row_lineage_metadata_columns: vec![],
             iceberg_table: None,
-            storage: TableStorage::S3ParquetFiles { files: Vec::new(), cloud_properties: Default::default() },
+            storage: TableStorage::ManagedLake,
         }
     }
 
