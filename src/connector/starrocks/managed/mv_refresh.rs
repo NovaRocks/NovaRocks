@@ -4535,9 +4535,7 @@ enable_path_style_access = true
                                 logical_type: None,
                             },
                         ],
-                        storage: TableStorage::LocalParquetFile {
-                            path: std::path::PathBuf::from("/unused/for/analysis"),
-                        },
+                        storage: TableStorage::S3ParquetFiles { files: Vec::new(), cloud_properties: Default::default() },
                         iceberg_row_lineage_metadata_columns: vec![],
                         iceberg_table: None,
                     },

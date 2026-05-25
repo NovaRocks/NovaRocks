@@ -2429,9 +2429,7 @@ mod tests {
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
-                    storage: TableStorage::LocalParquetFile {
-                        path: std::path::PathBuf::from("/tmp/orders.parquet"),
-                    },
+                    storage: TableStorage::S3ParquetFiles { files: Vec::new(), cloud_properties: Default::default() },
                 }),
                 "lineitem" => Ok(TableDef {
                     name: "lineitem".to_string(),
@@ -2502,9 +2500,7 @@ mod tests {
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
-                    storage: TableStorage::LocalParquetFile {
-                        path: std::path::PathBuf::from("/tmp/lineitem.parquet"),
-                    },
+                    storage: TableStorage::S3ParquetFiles { files: Vec::new(), cloud_properties: Default::default() },
                 }),
                 "supplier" => Ok(TableDef {
                     name: "supplier".to_string(),
@@ -2533,9 +2529,7 @@ mod tests {
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
-                    storage: TableStorage::LocalParquetFile {
-                        path: std::path::PathBuf::from("/tmp/supplier.parquet"),
-                    },
+                    storage: TableStorage::S3ParquetFiles { files: Vec::new(), cloud_properties: Default::default() },
                 }),
                 "part" => Ok(TableDef {
                     name: "part".to_string(),
@@ -2564,9 +2558,7 @@ mod tests {
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
-                    storage: TableStorage::LocalParquetFile {
-                        path: std::path::PathBuf::from("/tmp/part.parquet"),
-                    },
+                    storage: TableStorage::S3ParquetFiles { files: Vec::new(), cloud_properties: Default::default() },
                 }),
                 "partsupp" => Ok(TableDef {
                     name: "partsupp".to_string(),
@@ -2602,9 +2594,7 @@ mod tests {
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
-                    storage: TableStorage::LocalParquetFile {
-                        path: std::path::PathBuf::from("/tmp/partsupp.parquet"),
-                    },
+                    storage: TableStorage::S3ParquetFiles { files: Vec::new(), cloud_properties: Default::default() },
                 }),
                 "customer" => Ok(TableDef {
                     name: "customer".to_string(),
@@ -2633,9 +2623,7 @@ mod tests {
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
-                    storage: TableStorage::LocalParquetFile {
-                        path: std::path::PathBuf::from("/tmp/customer.parquet"),
-                    },
+                    storage: TableStorage::S3ParquetFiles { files: Vec::new(), cloud_properties: Default::default() },
                 }),
                 "nation" => Ok(TableDef {
                     name: "nation".to_string(),
@@ -2657,9 +2645,7 @@ mod tests {
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
-                    storage: TableStorage::LocalParquetFile {
-                        path: std::path::PathBuf::from("/tmp/nation.parquet"),
-                    },
+                    storage: TableStorage::S3ParquetFiles { files: Vec::new(), cloud_properties: Default::default() },
                 }),
                 // IVM-A1 v3-row-lineage fixture: an iceberg-backed base
                 // table exposing the row-lineage metadata pseudo-columns

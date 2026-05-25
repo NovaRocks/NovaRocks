@@ -805,9 +805,6 @@ fn scan_supports_decode_hint(
     required_columns: &[String],
 ) -> bool {
     match &table.storage {
-        TableStorage::LocalParquetFile { path } => {
-            local_parquet_has_low_cardinality_string_dict(table, path)
-        }
         TableStorage::S3ParquetFiles { .. } => required_columns.iter().any(|required| {
             table
                 .columns
@@ -829,7 +826,7 @@ fn scan_supports_min_max_stats(
     required_columns: &[String],
 ) -> bool {
     match &table.storage {
-        TableStorage::LocalParquetFile { .. } | TableStorage::S3ParquetFiles { .. } => {}
+        TableStorage::S3ParquetFiles { .. } => {}
         // Iceberg metadata tables do not produce parquet column statistics.
         TableStorage::IcebergMetadataTable { .. } => return false,
         // IVM delta-scan is a synthetic placeholder; no parquet stats.
@@ -877,136 +874,6 @@ fn supports_scan_decode_hint(data_type: &DataType) -> bool {
     )
 }
 
-fn local_parquet_has_low_cardinality_string_dict(
-    table: &crate::sql::catalog::TableDef,
-    path: &std::path::Path,
-) -> bool {
-    const LOW_CARDINALITY_THRESHOLD: usize = 256;
-
-    let candidate_columns: Vec<String> = table
-        .columns
-        .iter()
-        .filter(|column| {
-            matches!(
-                column.data_type,
-                DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary
-            )
-        })
-        .map(|column| column.name.clone())
-        .collect();
-    if candidate_columns.is_empty() {
-        return false;
-    }
-
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(_) => return false,
-    };
-    let reader = match ParquetRecordBatchReaderBuilder::try_new(file)
-        .and_then(|builder| builder.with_batch_size(4096).build())
-    {
-        Ok(reader) => reader,
-        Err(_) => return false,
-    };
-
-    let mut distinct_sets: Vec<HashSet<Vec<u8>>> = candidate_columns
-        .iter()
-        .map(|_| HashSet::with_capacity(LOW_CARDINALITY_THRESHOLD + 1))
-        .collect();
-    let mut non_null_counts = vec![0usize; candidate_columns.len()];
-
-    for batch in reader {
-        let Ok(batch) = batch else {
-            return false;
-        };
-        for (idx, column_name) in candidate_columns.iter().enumerate() {
-            if distinct_sets[idx].len() > LOW_CARDINALITY_THRESHOLD {
-                continue;
-            }
-            let Some(column_index) = batch
-                .schema()
-                .fields()
-                .iter()
-                .position(|field| field.name().eq_ignore_ascii_case(column_name))
-            else {
-                continue;
-            };
-            let column = batch.column(column_index);
-            match column.data_type() {
-                DataType::Utf8 => {
-                    let Some(values) = column.as_any().downcast_ref::<StringArray>() else {
-                        continue;
-                    };
-                    for row in 0..values.len() {
-                        if values.is_null(row) {
-                            continue;
-                        }
-                        non_null_counts[idx] += 1;
-                        distinct_sets[idx].insert(values.value(row).as_bytes().to_vec());
-                        if distinct_sets[idx].len() > LOW_CARDINALITY_THRESHOLD {
-                            break;
-                        }
-                    }
-                }
-                DataType::LargeUtf8 => {
-                    let Some(values) = column.as_any().downcast_ref::<LargeStringArray>() else {
-                        continue;
-                    };
-                    for row in 0..values.len() {
-                        if values.is_null(row) {
-                            continue;
-                        }
-                        non_null_counts[idx] += 1;
-                        distinct_sets[idx].insert(values.value(row).as_bytes().to_vec());
-                        if distinct_sets[idx].len() > LOW_CARDINALITY_THRESHOLD {
-                            break;
-                        }
-                    }
-                }
-                DataType::Binary => {
-                    let Some(values) = column.as_any().downcast_ref::<BinaryArray>() else {
-                        continue;
-                    };
-                    for row in 0..values.len() {
-                        if values.is_null(row) {
-                            continue;
-                        }
-                        non_null_counts[idx] += 1;
-                        distinct_sets[idx].insert(values.value(row).to_vec());
-                        if distinct_sets[idx].len() > LOW_CARDINALITY_THRESHOLD {
-                            break;
-                        }
-                    }
-                }
-                DataType::LargeBinary => {
-                    let Some(values) = column.as_any().downcast_ref::<LargeBinaryArray>() else {
-                        continue;
-                    };
-                    for row in 0..values.len() {
-                        if values.is_null(row) {
-                            continue;
-                        }
-                        non_null_counts[idx] += 1;
-                        distinct_sets[idx].insert(values.value(row).to_vec());
-                        if distinct_sets[idx].len() > LOW_CARDINALITY_THRESHOLD {
-                            break;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    distinct_sets
-        .iter()
-        .zip(non_null_counts.iter())
-        .any(|(distinct, non_null_count)| {
-            *non_null_count > distinct.len()
-                && !distinct.is_empty()
-                && distinct.len() <= LOW_CARDINALITY_THRESHOLD
-        })
-}
 
 fn format_expr(expr: &TypedExpr) -> String {
     format_expr_kind(&expr.kind)

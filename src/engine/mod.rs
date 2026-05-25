@@ -5431,13 +5431,14 @@ enable_path_style_access = true
     #[test]
     fn iceberg_insert_select_drives_a_new_snapshot() {
         // INSERT INTO ... SELECT writes data files + a new snapshot. The
-        // standalone iceberg backend's `TableStorage::LocalParquetFile`
-        // currently only registers the *first* data file for local-FS
-        // tables (see backend.rs:172-179), so a SELECT-side verification
-        // would only see the seed file even though the new snapshot
-        // includes both. This is a separate NovaRocks-side gap tracked
-        // outside Phase 1; here we verify the iceberg layer's snapshot
-        // chain advanced as expected via the registry.
+        // standalone iceberg backend's local-FS path historically only
+        // registered the *first* data file for local-FS tables (see
+        // `connector/iceberg/catalog/backend.rs`'s data-files branch), so
+        // a SELECT-side verification would only see the seed file even
+        // though the new snapshot includes both. This is a separate
+        // NovaRocks-side gap tracked outside Phase 1; here we verify the
+        // iceberg layer's snapshot chain advanced as expected via the
+        // registry.
         let warehouse = TempDir::new().expect("warehouse");
         let (engine, session) = open_iceberg_session_with_table(&warehouse, "3");
         session

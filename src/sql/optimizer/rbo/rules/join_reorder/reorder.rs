@@ -95,9 +95,6 @@ fn estimate_size(plan: &LogicalPlan) -> u64 {
                         total.max(1)
                     }
                 }
-                TableStorage::LocalParquetFile { path } => std::fs::metadata(path)
-                    .map(|m| m.len())
-                    .unwrap_or(1_000_000),
                 // Iceberg metadata tables (snapshots/history/refs/partitions)
                 // are tiny by design — they enumerate snapshot/history/ref
                 // entries which are bounded by the table's history depth.

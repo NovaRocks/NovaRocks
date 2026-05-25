@@ -593,23 +593,6 @@ pub(crate) fn build_exec_params_multi(
                 .collect()
         } else {
             match &resolved.table.storage {
-                TableStorage::LocalParquetFile { path } => {
-                    let metadata = std::fs::metadata(path)
-                        .map_err(|e| format!("stat parquet file failed: {e}"))?;
-                    let file_len = i64::try_from(metadata.len())
-                        .map_err(|_| "parquet file is too large".to_string())?;
-                    vec![build_hdfs_scan_range_params(
-                        &path.display().to_string(),
-                        file_len,
-                        0,
-                        file_len,
-                        None,
-                        None,
-                        None,
-                        None,
-                        &[],
-                    )?]
-                }
                 TableStorage::S3ParquetFiles { files, .. } => {
                     let file_predicates = scan_file_min_max_predicates(planned);
                     let change_op_slot = planned_change_op_slot(planned);

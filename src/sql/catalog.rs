@@ -172,9 +172,6 @@ pub struct PhysicalTableLayout {
 
 #[derive(Clone, Debug)]
 pub enum TableStorage {
-    LocalParquetFile {
-        path: PathBuf,
-    },
     S3ParquetFiles {
         files: Vec<S3FileInfo>,
         cloud_properties: BTreeMap<String, String>,

@@ -283,9 +283,7 @@ mod tests {
                 columns: vec![],
                 iceberg_row_lineage_metadata_columns: vec![],
                 iceberg_table: None,
-                storage: crate::sql::catalog::TableStorage::LocalParquetFile {
-                    path: std::path::PathBuf::from("/tmp/t.parquet"),
-                },
+                storage: crate::sql::catalog::TableStorage::S3ParquetFiles { files: Vec::new(), cloud_properties: Default::default() },
             },
             alias: None,
             columns: vec![],
@@ -351,9 +349,7 @@ mod tests {
                 columns: vec![],
                 iceberg_row_lineage_metadata_columns: vec![],
                 iceberg_table: None,
-                storage: crate::sql::catalog::TableStorage::LocalParquetFile {
-                    path: std::path::PathBuf::from("/tmp/t.parquet"),
-                },
+                storage: crate::sql::catalog::TableStorage::S3ParquetFiles { files: Vec::new(), cloud_properties: Default::default() },
             },
             alias: None,
             columns: vec![],
@@ -417,8 +413,9 @@ mod cascaded_derivation_tests {
                 columns: vec![],
                 iceberg_row_lineage_metadata_columns: vec![],
                 iceberg_table: None,
-                storage: crate::sql::catalog::TableStorage::LocalParquetFile {
-                    path: std::path::PathBuf::from(format!("/tmp/{table}.parquet")),
+                storage: crate::sql::catalog::TableStorage::S3ParquetFiles {
+                    files: Vec::new(),
+                    cloud_properties: Default::default(),
                 },
             },
             alias: None,

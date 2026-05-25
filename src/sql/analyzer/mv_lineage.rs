@@ -717,9 +717,7 @@ mod tests {
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
-                    storage: TableStorage::LocalParquetFile {
-                        path: std::path::PathBuf::from("/tmp/fact.parquet"),
-                    },
+                    storage: TableStorage::S3ParquetFiles { files: Vec::new(), cloud_properties: Default::default() },
                 }),
                 _ => Err(format!("table not found: {table}")),
             }
@@ -813,8 +811,9 @@ mod tests {
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
-                    storage: TableStorage::LocalParquetFile {
-                        path: std::path::PathBuf::from(format!("/tmp/{table}.parquet")),
+                    storage: TableStorage::S3ParquetFiles {
+                        files: Vec::new(),
+                        cloud_properties: Default::default(),
                     },
                 }),
                 _ => Err(format!("table not found: {table}")),

@@ -343,9 +343,7 @@ mod tests {
             ],
             iceberg_row_lineage_metadata_columns: vec![],
             iceberg_table: None,
-            storage: TableStorage::LocalParquetFile {
-                path: std::path::PathBuf::from("/tmp/test.parquet"),
-            },
+            storage: TableStorage::S3ParquetFiles { files: Vec::new(), cloud_properties: Default::default() },
         }
     }
 

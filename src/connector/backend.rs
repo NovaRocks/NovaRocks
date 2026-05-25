@@ -89,7 +89,7 @@ pub(crate) trait TableSource: Send + Sync {
 
     /// Build a `TableDef` suitable for registration in the in-memory logical
     /// catalog. Different backends pick different `TableStorage` variants
-    /// (LocalParquetFile / S3ParquetFiles / ManagedLake).
+    /// (S3ParquetFiles / IcebergMetadataTable / IcebergDeltaTable).
     fn build_table_def(&self, table: &ResolvedTable) -> Result<TableDef, String>;
 
     /// Phase-1 entry point for time-travel-aware table-def construction.

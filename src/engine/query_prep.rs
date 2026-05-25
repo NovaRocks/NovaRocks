@@ -774,13 +774,6 @@ fn stamp_delta_table_def_change_ops(
             logical_type: None,
         });
 
-    if change_ops.is_empty() && matches!(table_def.storage, TableStorage::LocalParquetFile { .. }) {
-        table_def.storage = TableStorage::S3ParquetFiles {
-            files: Vec::new(),
-            cloud_properties: Default::default(),
-        };
-    }
-
     let TableStorage::S3ParquetFiles { files, .. } = &mut table_def.storage else {
         return Err(
             "iceberg delta source requires S3 parquet file storage for synthetic files".to_string(),
@@ -1072,9 +1065,7 @@ mod tests {
             columns: vec![],
             iceberg_row_lineage_metadata_columns: vec![],
             iceberg_table: None,
-            storage: TableStorage::LocalParquetFile {
-                path: std::env::temp_dir().join("empty-delta.parquet"),
-            },
+            storage: TableStorage::S3ParquetFiles { files: Vec::new(), cloud_properties: Default::default() },
         };
 
         super::stamp_delta_table_def_change_ops(&mut table_def, &[]).expect("stamp empty delta");

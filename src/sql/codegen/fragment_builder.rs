@@ -2139,8 +2139,17 @@ impl<'a> PlanFragmentBuilder<'a> {
             op.start, op.end, op.step, self.next_node_id
         ));
         crate::sql::codegen::write_parquet_to_path(&path, &batch)?;
+        let file_len = std::fs::metadata(&path)
+            .map_err(|e| format!("stat generate_series parquet failed: {e}"))?
+            .len();
+        let file_len = i64::try_from(file_len)
+            .map_err(|_| "generate_series parquet file is too large".to_string())?;
 
-        // Build a TableDef and emit as a scan
+        // Build a TableDef wrapping the synthetic parquet file as a single-
+        // file S3 source. The scan path is happy to consume local
+        // (file:// or absolute) paths through this lane (see
+        // `connector/iceberg/catalog/backend.rs` comment near the
+        // multi-file empty-cloud-properties branch).
         let table_def = crate::sql::catalog::TableDef {
             name: op.alias.as_deref().unwrap_or("generate_series").to_string(),
             columns: vec![crate::sql::catalog::ColumnDef {
@@ -2152,7 +2161,23 @@ impl<'a> PlanFragmentBuilder<'a> {
             }],
             iceberg_row_lineage_metadata_columns: vec![],
             iceberg_table: None,
-            storage: crate::sql::catalog::TableStorage::LocalParquetFile { path },
+            storage: crate::sql::catalog::TableStorage::S3ParquetFiles {
+                files: vec![crate::sql::catalog::S3FileInfo {
+                    path: path.display().to_string(),
+                    size: file_len,
+                    row_count: None,
+                    column_stats: None,
+                    partition_spec_id: None,
+                    partition_key: None,
+                    first_row_id: None,
+                    data_sequence_number: None,
+                    ivm_change_op: None,
+                    delete_files: Vec::new(),
+                    manifest_path: None,
+                    partition_values: Vec::new(),
+                }],
+                cloud_properties: Default::default(),
+            },
         };
 
         // Create a PhysicalScanOp and delegate to visit_scan
@@ -3657,7 +3682,23 @@ mod tests {
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
-                    storage: TableStorage::LocalParquetFile { path },
+                    storage: TableStorage::S3ParquetFiles {
+                        files: vec![crate::sql::catalog::S3FileInfo {
+                            path: path.display().to_string(),
+                            size: 0,
+                            row_count: None,
+                            column_stats: None,
+                            partition_spec_id: None,
+                            partition_key: None,
+                            first_row_id: None,
+                            data_sequence_number: None,
+                            ivm_change_op: None,
+                            delete_files: Vec::new(),
+                            manifest_path: None,
+                            partition_values: Vec::new(),
+                        }],
+                        cloud_properties: Default::default(),
+                    },
                 },
                 alias: None,
                 columns: output_columns(),

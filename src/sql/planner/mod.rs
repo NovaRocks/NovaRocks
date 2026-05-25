@@ -1903,9 +1903,7 @@ mod tests {
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
-                    storage: TableStorage::LocalParquetFile {
-                        path: std::path::PathBuf::from("/tmp/orders.parquet"),
-                    },
+                    storage: TableStorage::S3ParquetFiles { files: Vec::new(), cloud_properties: Default::default() },
                 }),
                 "maps" => Ok(TableDef {
                     name: "maps".to_string(),
@@ -1939,9 +1937,7 @@ mod tests {
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
-                    storage: TableStorage::LocalParquetFile {
-                        path: std::path::PathBuf::from("/tmp/maps.parquet"),
-                    },
+                    storage: TableStorage::S3ParquetFiles { files: Vec::new(), cloud_properties: Default::default() },
                 }),
                 other => Err(format!("unknown test table: {other}")),
             }
