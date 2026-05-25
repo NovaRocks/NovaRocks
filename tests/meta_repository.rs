@@ -25,7 +25,7 @@ use novarocks::meta::repository::mv::{
     UpdateManagedMvRefreshSummaryRequest, UpdateMvRefreshMetadataRequest,
 };
 use novarocks::meta::repository::{
-    RepositoryError, RepositoryErrorKind, decode_json_payload, encode_json_payload, id_scopes,
+    decode_payload_for_kind, encode_record_payload, id_scopes, RepositoryError, RepositoryErrorKind,
 };
 use novarocks::meta::{
     ExpectedRevision, MetaKey, MetaRecordKind, MetaRecordPut, MetaStoreProvider,
@@ -33,10 +33,20 @@ use novarocks::meta::{
 };
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct SamplePayload {
-    id: i64,
-    name: String,
+fn encode_json_payload<T>(
+    schema_version: i32,
+    value: &T,
+) -> Result<novarocks::meta::MetaPayload, RepositoryError>
+where
+    T: Serialize,
+{
+    let bytes = serde_json::to_vec(value).map_err(|err| {
+        RepositoryError::invalid(format!("failed to encode JSON payload: {err}"))
+    })?;
+    Ok(novarocks::meta::MetaPayload::json(
+        schema_version,
+        Bytes::from(bytes),
+    ))
 }
 
 fn create_managed_table_with_partition(
@@ -239,20 +249,28 @@ fn mv_repository_rejects_invalid_refresh_policy_metadata() -> Result<(), Box<dyn
 }
 
 #[test]
-fn repository_payload_json_round_trips() {
-    let payload = SamplePayload {
-        id: 7,
-        name: "orders".to_string(),
-    };
-    let encoded = encode_json_payload(1, &payload).expect("encode payload");
-    assert_eq!(encoded.schema_version, 1);
-    assert_eq!(
-        encoded.bytes,
-        Bytes::from_static(br#"{"id":7,"name":"orders"}"#)
-    );
+fn repository_avro_payload_round_trips_sample_payload() -> Result<(), Box<dyn std::error::Error>> {
+    #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+    struct TestEvolution {
+        id: i64,
+        name: String,
+        tags: Vec<String>,
+    }
 
-    let decoded: SamplePayload = decode_json_payload(&encoded).expect("decode payload");
-    assert_eq!(decoded, payload);
+    let value = TestEvolution {
+        id: 42,
+        name: "sample".to_string(),
+        tags: vec!["metadata".to_string()],
+    };
+
+    let payload = encode_record_payload("test.evolution", &value)?;
+    assert_eq!(payload.encoding, novarocks::meta::MetaPayloadEncoding::Avro);
+    assert_eq!(payload.schema_id, 2);
+    assert_eq!(payload.schema_fingerprint.len(), 16);
+
+    let decoded: TestEvolution = decode_payload_for_kind("test.evolution", &payload)?;
+    assert_eq!(decoded, value);
+    Ok(())
 }
 
 #[test]

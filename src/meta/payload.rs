@@ -1,29 +1,20 @@
-use bytes::Bytes;
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::Serialize;
 
-use crate::meta::repository::{RepositoryError, RepositoryResult};
-use crate::meta::{MetaPayload, MetaPayloadEncoding};
+use crate::meta::avro;
+use crate::meta::repository::RepositoryResult;
+use crate::meta::MetaPayload;
 
-pub fn encode_json_payload<T>(schema_version: i32, value: &T) -> RepositoryResult<MetaPayload>
+pub fn encode_record_payload<T>(kind: &str, value: &T) -> RepositoryResult<MetaPayload>
 where
     T: Serialize,
 {
-    let bytes = serde_json::to_vec(value)
-        .map_err(|err| RepositoryError::invalid(format!("failed to encode JSON payload: {err}")))?;
-    Ok(MetaPayload::json(schema_version, Bytes::from(bytes)))
+    avro::encode_payload(kind, value)
 }
 
-pub fn decode_json_payload<T>(payload: &MetaPayload) -> RepositoryResult<T>
+pub fn decode_payload_for_kind<T>(kind: &str, payload: &MetaPayload) -> RepositoryResult<T>
 where
     T: DeserializeOwned,
 {
-    if payload.encoding != MetaPayloadEncoding::Json {
-        return Err(RepositoryError::invalid(format!(
-            "expected JSON payload, got {:?}",
-            payload.encoding
-        )));
-    }
-    serde_json::from_slice(&payload.bytes)
-        .map_err(|err| RepositoryError::invalid(format!("failed to decode JSON payload: {err}")))
+    avro::decode_payload(kind, payload)
 }

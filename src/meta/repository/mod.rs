@@ -10,7 +10,7 @@ pub mod managed_txn;
 pub mod mv;
 pub mod mv_contract;
 
-pub use crate::meta::payload::{decode_json_payload, encode_json_payload};
+pub use crate::meta::payload::{decode_payload_for_kind, encode_record_payload};
 
 pub type RepositoryResult<T> = Result<T, RepositoryError>;
 
