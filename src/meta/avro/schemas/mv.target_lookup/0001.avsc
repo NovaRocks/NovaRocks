@@ -1,0 +1,8 @@
+{
+  "type": "record",
+  "name": "MvTargetLookup",
+  "namespace": "novarocks.meta.mv",
+  "fields": [
+    { "name": "mv_id", "type": "long" }
+  ]
+}

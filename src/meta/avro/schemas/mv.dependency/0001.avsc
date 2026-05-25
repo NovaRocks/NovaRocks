@@ -1,0 +1,37 @@
+{
+  "type": "record",
+  "name": "StoredMvDependency",
+  "namespace": "novarocks.meta.mv",
+  "fields": [
+    { "name": "downstream_mv_id", "type": "long" },
+    {
+      "name": "upstream",
+      "type": {
+        "type": "record",
+        "name": "MvDependencyObjectRef",
+        "fields": [
+          { "name": "catalog", "type": ["null", "string"], "default": null },
+          { "name": "database_or_namespace", "type": "string" },
+          { "name": "name", "type": "string" },
+          {
+            "name": "object_type",
+            "type": {
+              "type": "enum",
+              "name": "MvDependencyObjectType",
+              "symbols": ["TABLE", "MATERIALIZED_VIEW"]
+            }
+          },
+          {
+            "name": "storage_engine",
+            "type": {
+              "type": "enum",
+              "name": "MvDependencyStorageEngine",
+              "symbols": ["MANAGED_LAKE", "ICEBERG", "EXTERNAL_TABLE"]
+            }
+          }
+        ]
+      }
+    },
+    { "name": "created_at_ms", "type": "long" }
+  ]
+}

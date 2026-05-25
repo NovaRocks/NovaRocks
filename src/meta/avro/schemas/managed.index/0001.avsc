@@ -1,0 +1,19 @@
+{
+  "type": "record",
+  "name": "StoredManagedIndex",
+  "namespace": "novarocks.meta.managed",
+  "fields": [
+    { "name": "index_id", "type": "long" },
+    { "name": "table_id", "type": "long" },
+    { "name": "partition_id", "type": "long" },
+    { "name": "index_type", "type": "string" },
+    {
+      "name": "state",
+      "type": {
+        "type": "enum",
+        "name": "ManagedIndexState",
+        "symbols": ["CREATING", "ACTIVE", "RETIRED", "FAILED"]
+      }
+    }
+  ]
+}

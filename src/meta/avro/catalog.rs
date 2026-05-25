@@ -168,6 +168,101 @@ struct SchemaSource {
 fn schema_sources() -> &'static [SchemaSource] {
     &[
         SchemaSource {
+            subject: "iceberg.catalog",
+            id: 1,
+            raw_schema: include_str!("schemas/iceberg.catalog/0001.avsc"),
+        },
+        SchemaSource {
+            subject: "iceberg.namespace",
+            id: 1,
+            raw_schema: include_str!("schemas/iceberg.namespace/0001.avsc"),
+        },
+        SchemaSource {
+            subject: "iceberg.table_registration",
+            id: 1,
+            raw_schema: include_str!("schemas/iceberg.table_registration/0001.avsc"),
+        },
+        SchemaSource {
+            subject: "job.erase",
+            id: 1,
+            raw_schema: include_str!("schemas/job.erase/0001.avsc"),
+        },
+        SchemaSource {
+            subject: "job.iceberg_optimize",
+            id: 1,
+            raw_schema: include_str!("schemas/job.iceberg_optimize/0001.avsc"),
+        },
+        SchemaSource {
+            subject: "managed.database",
+            id: 1,
+            raw_schema: include_str!("schemas/managed.database/0001.avsc"),
+        },
+        SchemaSource {
+            subject: "managed.database_name",
+            id: 1,
+            raw_schema: include_str!("schemas/managed.database_name/0001.avsc"),
+        },
+        SchemaSource {
+            subject: "managed.table",
+            id: 1,
+            raw_schema: include_str!("schemas/managed.table/0001.avsc"),
+        },
+        SchemaSource {
+            subject: "managed.table_name",
+            id: 1,
+            raw_schema: include_str!("schemas/managed.table_name/0001.avsc"),
+        },
+        SchemaSource {
+            subject: "managed.schema",
+            id: 1,
+            raw_schema: include_str!("schemas/managed.schema/0001.avsc"),
+        },
+        SchemaSource {
+            subject: "managed.column",
+            id: 1,
+            raw_schema: include_str!("schemas/managed.column/0001.avsc"),
+        },
+        SchemaSource {
+            subject: "managed.partition",
+            id: 1,
+            raw_schema: include_str!("schemas/managed.partition/0001.avsc"),
+        },
+        SchemaSource {
+            subject: "managed.index",
+            id: 1,
+            raw_schema: include_str!("schemas/managed.index/0001.avsc"),
+        },
+        SchemaSource {
+            subject: "managed.tablet",
+            id: 1,
+            raw_schema: include_str!("schemas/managed.tablet/0001.avsc"),
+        },
+        SchemaSource {
+            subject: "managed.txn",
+            id: 1,
+            raw_schema: include_str!("schemas/managed.txn/0001.avsc"),
+        },
+        SchemaSource {
+            subject: "mv.definition",
+            id: 1,
+            raw_schema: include_str!("schemas/mv.definition/0001.avsc"),
+        },
+        SchemaSource {
+            subject: "mv.target_lookup",
+            id: 1,
+            raw_schema: include_str!("schemas/mv.target_lookup/0001.avsc"),
+        },
+        SchemaSource {
+            subject: "mv.refresh",
+            id: 1,
+            raw_schema: include_str!("schemas/mv.refresh/0001.avsc"),
+        },
+        SchemaSource {
+            subject: "mv.dependency",
+            id: 1,
+            raw_schema: include_str!("schemas/mv.dependency/0001.avsc"),
+        },
+        SchemaSource {
             subject: "test.evolution",
             id: 1,
             raw_schema: include_str!("schemas/test.evolution/0001.avsc"),

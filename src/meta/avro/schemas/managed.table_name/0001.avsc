@@ -1,0 +1,8 @@
+{
+  "type": "record",
+  "name": "ManagedTableNameLookup",
+  "namespace": "novarocks.meta.managed",
+  "fields": [
+    { "name": "id", "type": "long" }
+  ]
+}

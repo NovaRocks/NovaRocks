@@ -1,0 +1,20 @@
+{
+  "type": "record",
+  "name": "StoredManagedPartition",
+  "namespace": "novarocks.meta.managed",
+  "fields": [
+    { "name": "partition_id", "type": "long" },
+    { "name": "table_id", "type": "long" },
+    { "name": "name", "type": "string" },
+    { "name": "visible_version", "type": "long" },
+    { "name": "next_version", "type": "long" },
+    {
+      "name": "state",
+      "type": {
+        "type": "enum",
+        "name": "ManagedPartitionState",
+        "symbols": ["CREATING", "ACTIVE", "RETIRED", "FAILED"]
+      }
+    }
+  ]
+}

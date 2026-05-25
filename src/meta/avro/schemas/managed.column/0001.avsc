@@ -1,0 +1,14 @@
+{
+  "type": "record",
+  "name": "StoredManagedColumn",
+  "namespace": "novarocks.meta.managed",
+  "fields": [
+    { "name": "schema_id", "type": "long" },
+    { "name": "ordinal", "type": "long" },
+    { "name": "column_name", "type": "string" },
+    { "name": "logical_type", "type": "string" },
+    { "name": "nullable", "type": "boolean" },
+    { "name": "visible", "type": "boolean" },
+    { "name": "is_key", "type": "boolean" }
+  ]
+}

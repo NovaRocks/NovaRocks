@@ -1376,7 +1376,26 @@ const ERASE_JOB_SCHEMA_VERSION: i32 = 1;
 
 Keep record kind constants. Record kind is now the Avro subject.
 
-- [ ] **Step 5: Handle MV contract JSON string adapter**
+- [ ] **Step 5: Add DTO adapters for Avro boundary shapes**
+
+Do not encode production repository domain structs directly when their shape differs from the Avro v1 boundary.
+
+For `iceberg.catalog`, Task 3 intentionally stores `properties` as an array of named key/value records in Avro while the domain type is still `Vec<(String, String)>`. Add private Avro DTO structs inside `src/meta/repository/iceberg_catalog.rs` and convert at the repository boundary:
+
+```rust
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct IcebergCatalogPropertiesAvro {
+    properties: Vec<StringPairAvro>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct StringPairAvro {
+    key: String,
+    value: String,
+}
+```
+
+Encode by converting each `(String, String)` pair into `StringPairAvro { key, value }`. Decode by converting each `StringPairAvro` back into the domain tuple. Keep the `iceberg.catalog/0001.avsc` `StringPair` record shape; do not replace it with tuple arrays.
 
 Because Task 3 stores `schema_contract` and `partition_spec` as nullable JSON strings in Avro v1, add private Avro DTO structs inside `src/meta/repository/mv.rs`:
 
@@ -1461,7 +1480,13 @@ impl TryFrom<&StoredMvDefinition> for StoredMvDefinitionAvro {
 
 Use the inverse conversion when decoding `mv.definition`, parsing the JSON strings back into `MvSchemaContract` and `MvPartitionContract`.
 
-- [ ] **Step 6: Run repository tests**
+- [ ] **Step 6: Remove legacy schema-version guards before Avro writes**
+
+Before any domain repository writes Avro payloads, remove all old `*_SCHEMA_VERSION` decode guards and call sites. Avro `payload.schema_id` is the Avro catalog schema id, not the legacy JSON repository schema version.
+
+Do not add `src/meta/avro/schemas/mv.definition/0002.avsc` only to match `MV_DEFINITION_SCHEMA_VERSION = 2`. The initial Avro `mv.definition` schema remains id 1, and the repository migration must treat that id as independent from the old JSON schema-version constants.
+
+- [ ] **Step 7: Run repository tests**
 
 Run:
 
@@ -1471,7 +1496,7 @@ cargo test --test meta_repository
 
 Expected: PASS after Steps 1-5 are complete. If this command reports a stale `encode_json_payload`, `decode_json_payload`, or `*_SCHEMA_VERSION` symbol, apply the exact replacements from Steps 1-4 and rerun the same command.
 
-- [ ] **Step 7: Replace schema-version mismatch tests**
+- [ ] **Step 8: Replace schema-version mismatch tests**
 
 Remove tests that assert old JSON schema version mismatch strings. Add a fingerprint mismatch test:
 
@@ -1521,7 +1546,7 @@ fn mv_repository_rejects_definition_fingerprint_mismatch()
 }
 ```
 
-- [ ] **Step 8: Run repository tests**
+- [ ] **Step 9: Run repository tests**
 
 Run:
 
@@ -1531,7 +1556,7 @@ cargo test --test meta_repository
 
 Expected: PASS.
 
-- [ ] **Step 9: Commit repository migration**
+- [ ] **Step 10: Commit repository migration**
 
 ```bash
 git add src/meta/repository src/meta/payload.rs tests/meta_repository.rs

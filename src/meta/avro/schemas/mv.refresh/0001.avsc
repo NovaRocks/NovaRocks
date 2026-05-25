@@ -1,0 +1,66 @@
+{
+  "type": "record",
+  "name": "StoredMvRefresh",
+  "namespace": "novarocks.meta.mv",
+  "fields": [
+    { "name": "refresh_id", "type": "long" },
+    { "name": "mv_id", "type": "long" },
+    {
+      "name": "state",
+      "type": {
+        "type": "enum",
+        "name": "MvRefreshState",
+        "symbols": [
+          "INTENT_CREATED",
+          "STAGING_COMMITTED",
+          "PUBLISH_COMMITTED",
+          "FINALIZED",
+          "ABORT_REQUESTED",
+          "ABORTED",
+          "COMMIT_UNKNOWN"
+        ]
+      }
+    },
+    { "name": "target_catalog", "type": ["null", "string"], "default": null },
+    { "name": "target_namespace", "type": ["null", "string"], "default": null },
+    { "name": "target_table", "type": ["null", "string"], "default": null },
+    { "name": "staging_branch", "type": ["null", "string"], "default": null },
+    { "name": "expected_main_snapshot_id", "type": ["null", "long"], "default": null },
+    { "name": "staging_snapshot_id", "type": ["null", "long"], "default": null },
+    { "name": "published_snapshot_id", "type": ["null", "long"], "default": null },
+    { "name": "target_snapshots", "type": { "type": "map", "values": "long" } },
+    { "name": "base_table_uuids", "type": { "type": "map", "values": "string" } },
+    { "name": "rows", "type": ["null", "long"], "default": null },
+    {
+      "name": "marker",
+      "type": [
+        "null",
+        {
+          "type": "record",
+          "name": "RefreshCommitMarker",
+          "fields": [
+            { "name": "refresh_id", "type": "long" },
+            { "name": "mv_id", "type": "long" },
+            { "name": "token", "type": "string" }
+          ]
+        }
+      ],
+      "default": null
+    },
+    {
+      "name": "external_outcome",
+      "type": [
+        "null",
+        {
+          "type": "record",
+          "name": "RefreshExternalOutcome",
+          "fields": [
+            { "name": "target_snapshot_id", "type": ["null", "long"], "default": null },
+            { "name": "commit_id", "type": "string" }
+          ]
+        }
+      ],
+      "default": null
+    }
+  ]
+}

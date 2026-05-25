@@ -1,0 +1,12 @@
+{
+  "type": "record",
+  "name": "StoredManagedTablet",
+  "namespace": "novarocks.meta.managed",
+  "fields": [
+    { "name": "tablet_id", "type": "long" },
+    { "name": "partition_id", "type": "long" },
+    { "name": "index_id", "type": "long" },
+    { "name": "bucket_seq", "type": "long" },
+    { "name": "tablet_root_path", "type": "string" }
+  ]
+}

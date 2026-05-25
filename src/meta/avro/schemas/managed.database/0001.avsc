@@ -1,0 +1,9 @@
+{
+  "type": "record",
+  "name": "StoredManagedDatabase",
+  "namespace": "novarocks.meta.managed",
+  "fields": [
+    { "name": "db_id", "type": "long" },
+    { "name": "name", "type": "string" }
+  ]
+}

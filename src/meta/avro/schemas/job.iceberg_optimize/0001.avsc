@@ -1,0 +1,42 @@
+{
+  "type": "record",
+  "name": "StoredIcebergOptimizeJob",
+  "namespace": "novarocks.meta.job",
+  "fields": [
+    { "name": "id", "type": "long" },
+    { "name": "catalog", "type": "string" },
+    { "name": "namespace", "type": "string" },
+    { "name": "table", "type": "string" },
+    { "name": "base_snapshot_id", "type": "long" },
+    {
+      "name": "state",
+      "type": {
+        "type": "enum",
+        "name": "IcebergOptimizeJobState",
+        "symbols": ["PENDING", "RUNNING", "FINISHED", "FAILED"]
+      }
+    },
+    { "name": "created_at_ms", "type": "long" },
+    { "name": "started_at_ms", "type": ["null", "long"], "default": null },
+    { "name": "finished_at_ms", "type": ["null", "long"], "default": null },
+    { "name": "error_message", "type": ["null", "string"], "default": null },
+    {
+      "name": "outcome",
+      "type": [
+        "null",
+        {
+          "type": "record",
+          "name": "IcebergOptimizeJobOutcome",
+          "fields": [
+            { "name": "target_snapshot_id", "type": ["null", "long"], "default": null },
+            { "name": "rewritten_data_files", "type": "long" },
+            { "name": "deleted_data_files", "type": "long" },
+            { "name": "added_data_files", "type": "long" },
+            { "name": "output_record_count", "type": "long" }
+          ]
+        }
+      ],
+      "default": null
+    }
+  ]
+}

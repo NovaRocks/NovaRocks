@@ -1,0 +1,22 @@
+{
+  "type": "record",
+  "name": "StoredEraseJob",
+  "namespace": "novarocks.meta.job",
+  "fields": [
+    { "name": "job_id", "type": "long" },
+    { "name": "table_id", "type": "long" },
+    { "name": "partition_id", "type": ["null", "long"], "default": null },
+    { "name": "root_path", "type": "string" },
+    {
+      "name": "state",
+      "type": {
+        "type": "enum",
+        "name": "JobState",
+        "symbols": ["PENDING", "RUNNING", "FAILED", "FINISHED"]
+      }
+    },
+    { "name": "retry_at_ms", "type": ["null", "long"], "default": null },
+    { "name": "updated_at_ms", "type": "long" },
+    { "name": "last_error", "type": ["null", "string"], "default": null }
+  ]
+}

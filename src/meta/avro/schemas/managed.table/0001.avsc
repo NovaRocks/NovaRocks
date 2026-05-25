@@ -1,0 +1,29 @@
+{
+  "type": "record",
+  "name": "StoredManagedTable",
+  "namespace": "novarocks.meta.managed",
+  "fields": [
+    { "name": "table_id", "type": "long" },
+    { "name": "db_id", "type": "long" },
+    { "name": "name", "type": "string" },
+    { "name": "keys_type", "type": "string" },
+    { "name": "bucket_num", "type": "long" },
+    { "name": "current_schema_id", "type": "long" },
+    {
+      "name": "state",
+      "type": {
+        "type": "enum",
+        "name": "ManagedTableState",
+        "symbols": ["CREATING", "ACTIVE", "DROPPING", "FAILED"]
+      }
+    },
+    {
+      "name": "kind",
+      "type": {
+        "type": "enum",
+        "name": "ManagedTableKind",
+        "symbols": ["TABLE", "MATERIALIZED_VIEW"]
+      }
+    }
+  ]
+}

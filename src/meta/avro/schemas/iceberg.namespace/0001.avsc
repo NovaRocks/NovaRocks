@@ -1,0 +1,9 @@
+{
+  "type": "record",
+  "name": "IcebergNamespaceRecord",
+  "namespace": "novarocks.meta.iceberg",
+  "fields": [
+    { "name": "catalog", "type": "string" },
+    { "name": "namespace", "type": "string" }
+  ]
+}
