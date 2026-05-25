@@ -619,10 +619,7 @@ fn managed_table_def(runtime: &ManagedTableRuntime) -> Result<TableDef, String> 
         columns,
         iceberg_row_lineage_metadata_columns: vec![],
         iceberg_table: None,
-        storage: TableStorage::S3ParquetFiles {
-            files: vec![],
-            cloud_properties: BTreeMap::new(),
-        },
+        storage: TableStorage::ManagedLake,
     })
 }
 
@@ -967,13 +964,7 @@ mod tests {
                 },
             ]
         );
-        assert!(matches!(
-            table.storage,
-            TableStorage::S3ParquetFiles {
-                files,
-                cloud_properties
-            } if files.is_empty() && cloud_properties == BTreeMap::new()
-        ));
+        assert!(matches!(table.storage, TableStorage::ManagedLake));
 
         let layout = catalog
             .get_physical_layout(DEFAULT_DATABASE, "managed_tbl")

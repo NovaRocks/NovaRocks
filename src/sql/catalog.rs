@@ -172,6 +172,13 @@ pub struct PhysicalTableLayout {
 
 #[derive(Clone, Debug)]
 pub enum TableStorage {
+    /// Managed-lake table: data lives in object storage (s3:// or
+    /// file://) and metadata lives in a `MetaStoreProvider` (currently
+    /// SQLite). The per-table physical layout (tablet/partition/version
+    /// list) is carried separately on `PhysicalTableLayout`, so this
+    /// variant is a marker without payload — the catalog only needs to
+    /// know "this table flows through the managed-lake scan path".
+    ManagedLake,
     S3ParquetFiles {
         files: Vec<S3FileInfo>,
         cloud_properties: BTreeMap<String, String>,
