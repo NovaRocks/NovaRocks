@@ -21,6 +21,18 @@ use std::collections::BTreeMap;
 pub(crate) const STATE_VERSION_V1: u8 = 0x01;
 const CANONICAL_F32_NAN_BITS: u32 = 0x7FC0_0000;
 const CANONICAL_F64_NAN_BITS: u64 = 0x7FF8_0000_0000_0000;
+const KEY_TYPE_BOOLEAN: u8 = 0x01;
+const KEY_TYPE_INT8: u8 = 0x02;
+const KEY_TYPE_INT16: u8 = 0x03;
+const KEY_TYPE_INT32: u8 = 0x04;
+const KEY_TYPE_INT64: u8 = 0x05;
+const KEY_TYPE_FLOAT32: u8 = 0x06;
+const KEY_TYPE_FLOAT64: u8 = 0x07;
+const KEY_TYPE_DECIMAL128: u8 = 0x08;
+const KEY_TYPE_DATE32: u8 = 0x09;
+const KEY_TYPE_TIMESTAMP_MICROS: u8 = 0x0A;
+const KEY_TYPE_UTF8: u8 = 0x0B;
+const KEY_TYPE_LARGE_UTF8: u8 = 0x0C;
 
 /// Returns `true` iff `bytes` is the empty state (zero-length).
 #[inline]
@@ -106,33 +118,58 @@ pub(crate) struct MultisetEntry {
 
 /// Serializes entries in supplied order; callers that need persistent canonical
 /// state should pass normalized/sorted entries, typically from `union_multisets`.
-pub(crate) fn encode_multiset(entries: &[MultisetEntry]) -> Vec<u8> {
+pub(crate) fn encode_multiset(
+    entries: &[MultisetEntry],
+    key_dtype: &DataType,
+) -> Result<Vec<u8>, String> {
+    let key_type_tag = key_type_tag_for_data_type(key_dtype)?;
     if entries.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let mut out = Vec::new();
     out.push(STATE_VERSION_V1);
+    out.push(key_type_tag);
     write_uleb128(&mut out, entries.len() as u64);
     for entry in entries {
         out.extend_from_slice(&entry.key_bytes);
         write_sleb128(&mut out, entry.count);
     }
-    out
+    Ok(out)
 }
 
 pub(crate) fn decode_multiset_with_key_type(
     bytes: &[u8],
     key_dtype: &DataType,
 ) -> Result<Vec<MultisetEntry>, String> {
+    let (tag_dtype, entries) = decode_multiset_self_describing(bytes)?;
     if is_empty_state(bytes) {
-        return Ok(Vec::new());
+        return Ok(entries);
+    }
+    let tag = key_type_tag_for_data_type(&tag_dtype)?;
+    if !key_type_tag_matches_data_type(tag, key_dtype) {
+        return Err(format!(
+            "state_codec: multiset key type tag {tag} does not match expected {key_dtype:?}"
+        ));
+    }
+    Ok(entries)
+}
+
+pub(crate) fn decode_multiset_self_describing(
+    bytes: &[u8],
+) -> Result<(DataType, Vec<MultisetEntry>), String> {
+    if is_empty_state(bytes) {
+        return Ok((DataType::Null, Vec::new()));
     }
     if bytes.first().copied() != Some(STATE_VERSION_V1) {
         return Err("state_codec: multiset unsupported version byte".to_string());
     }
 
-    let mut cursor = &bytes[1..];
+    let Some((&key_type_tag, rest)) = bytes[1..].split_first() else {
+        return Err("state_codec: multiset missing key type tag".to_string());
+    };
+    let key_dtype = data_type_for_key_type_tag(key_type_tag)?;
+    let mut cursor = rest;
     let num_entries = read_uleb128(&mut cursor)?;
     if num_entries == 0 {
         return Err("state_codec: multiset zero entry count must use empty state".to_string());
@@ -140,7 +177,7 @@ pub(crate) fn decode_multiset_with_key_type(
     let mut entries = Vec::new();
     for _ in 0..num_entries {
         let before_key = cursor;
-        read_key(&mut cursor, key_dtype)?;
+        read_key(&mut cursor, &key_dtype)?;
         let key_len = before_key.len() - cursor.len();
         let key_bytes = before_key[..key_len].to_vec();
         let count = read_sleb128(&mut cursor)?;
@@ -150,7 +187,7 @@ pub(crate) fn decode_multiset_with_key_type(
     if !cursor.is_empty() {
         return Err("state_codec: multiset trailing bytes after entries".to_string());
     }
-    Ok(entries)
+    Ok((key_dtype, entries))
 }
 
 #[cfg(test)]
@@ -172,9 +209,68 @@ pub(crate) fn union_multisets(
 
     Ok(counts
         .into_iter()
-        .filter_map(|(key_bytes, count)| (count > 0).then_some(MultisetEntry { key_bytes, count }))
+        .filter_map(|(key_bytes, count)| (count != 0).then_some(MultisetEntry { key_bytes, count }))
         // BTreeMap iteration gives storage-canonical raw-byte order only; it is not SQL value order.
         .collect())
+}
+
+pub(crate) fn key_type_tag_for_data_type(dtype: &DataType) -> Result<u8, String> {
+    match dtype {
+        DataType::Boolean => Ok(KEY_TYPE_BOOLEAN),
+        DataType::Int8 => Ok(KEY_TYPE_INT8),
+        DataType::Int16 => Ok(KEY_TYPE_INT16),
+        DataType::Int32 => Ok(KEY_TYPE_INT32),
+        DataType::Int64 => Ok(KEY_TYPE_INT64),
+        DataType::Float32 => Ok(KEY_TYPE_FLOAT32),
+        DataType::Float64 => Ok(KEY_TYPE_FLOAT64),
+        DataType::Decimal128(_, _) => Ok(KEY_TYPE_DECIMAL128),
+        DataType::Date32 => Ok(KEY_TYPE_DATE32),
+        DataType::Timestamp(TimeUnit::Microsecond, _) => Ok(KEY_TYPE_TIMESTAMP_MICROS),
+        DataType::Utf8 => Ok(KEY_TYPE_UTF8),
+        DataType::LargeUtf8 => Ok(KEY_TYPE_LARGE_UTF8),
+        other => Err(format!(
+            "state_codec: unsupported multiset key type {other:?}"
+        )),
+    }
+}
+
+pub(crate) fn data_type_for_key_type_tag(tag: u8) -> Result<DataType, String> {
+    match tag {
+        KEY_TYPE_BOOLEAN => Ok(DataType::Boolean),
+        KEY_TYPE_INT8 => Ok(DataType::Int8),
+        KEY_TYPE_INT16 => Ok(DataType::Int16),
+        KEY_TYPE_INT32 => Ok(DataType::Int32),
+        KEY_TYPE_INT64 => Ok(DataType::Int64),
+        KEY_TYPE_FLOAT32 => Ok(DataType::Float32),
+        KEY_TYPE_FLOAT64 => Ok(DataType::Float64),
+        KEY_TYPE_DECIMAL128 => Ok(DataType::Decimal128(38, 0)),
+        KEY_TYPE_DATE32 => Ok(DataType::Date32),
+        KEY_TYPE_TIMESTAMP_MICROS => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
+        KEY_TYPE_UTF8 => Ok(DataType::Utf8),
+        KEY_TYPE_LARGE_UTF8 => Ok(DataType::LargeUtf8),
+        _ => Err(format!("state_codec: unknown multiset key type tag {tag}")),
+    }
+}
+
+pub(crate) fn key_type_tag_matches_data_type(tag: u8, dtype: &DataType) -> bool {
+    matches!(
+        (tag, dtype),
+        (KEY_TYPE_BOOLEAN, DataType::Boolean)
+            | (KEY_TYPE_INT8, DataType::Int8)
+            | (KEY_TYPE_INT16, DataType::Int16)
+            | (KEY_TYPE_INT32, DataType::Int32)
+            | (KEY_TYPE_INT64, DataType::Int64)
+            | (KEY_TYPE_FLOAT32, DataType::Float32)
+            | (KEY_TYPE_FLOAT64, DataType::Float64)
+            | (KEY_TYPE_DECIMAL128, DataType::Decimal128(_, _))
+            | (KEY_TYPE_DATE32, DataType::Date32)
+            | (
+                KEY_TYPE_TIMESTAMP_MICROS,
+                DataType::Timestamp(TimeUnit::Microsecond, _)
+            )
+            | (KEY_TYPE_UTF8, DataType::Utf8)
+            | (KEY_TYPE_LARGE_UTF8, DataType::LargeUtf8)
+    )
 }
 
 pub(crate) fn write_uleb128(out: &mut Vec<u8>, mut value: u64) {
@@ -955,7 +1051,7 @@ mod multiset_tests {
 
     #[test]
     fn multiset_empty_round_trip() {
-        let bytes = encode_multiset(&[]);
+        let bytes = encode_multiset(&[], &DataType::Int64).unwrap();
         assert_eq!(bytes, Vec::<u8>::new());
         assert_eq!(
             decode_multiset(&bytes).unwrap(),
@@ -966,9 +1062,22 @@ mod multiset_tests {
     #[test]
     fn multiset_single_entry_round_trip() {
         let entries = vec![entry_int(42, 3)];
-        let bytes = encode_multiset(&entries);
+        let bytes = encode_multiset(&entries, &DataType::Int64).unwrap();
         assert_eq!(bytes[0], STATE_VERSION_V1);
+        assert_eq!(
+            bytes[1],
+            key_type_tag_for_data_type(&DataType::Int64).unwrap()
+        );
         assert_eq!(decode_multiset(&bytes).unwrap(), entries);
+    }
+
+    #[test]
+    fn decode_multiset_self_describing_reports_key_type_tag() {
+        let entries = vec![entry_int(42, 3)];
+        let bytes = encode_multiset(&entries, &DataType::Int64).unwrap();
+        let (key_type, decoded) = decode_multiset_self_describing(&bytes).unwrap();
+        assert_eq!(key_type, DataType::Int64);
+        assert_eq!(decoded, entries);
     }
 
     #[test]
@@ -988,6 +1097,14 @@ mod multiset_tests {
         let b = vec![entry_int(1, -2), entry_int(2, 4)];
         let merged = union_multisets(&a, &b).unwrap();
         assert_eq!(merged, vec![entry_int(2, 4)]);
+    }
+
+    #[test]
+    fn multiset_union_preserves_negative_counts() {
+        let a = vec![entry_int(1, -2)];
+        let b = vec![entry_int(2, 4)];
+        let merged = union_multisets(&a, &b).unwrap();
+        assert_eq!(merged, vec![entry_int(1, -2), entry_int(2, 4)]);
     }
 
     #[test]
@@ -1017,7 +1134,7 @@ mod multiset_tests {
 
     #[test]
     fn decode_multiset_with_key_type_rejects_wrong_version() {
-        let mut bytes = encode_multiset(&[entry_int(1, 1)]);
+        let mut bytes = encode_multiset(&[entry_int(1, 1)], &DataType::Int64).unwrap();
         bytes[0] = 0x02;
         assert!(
             decode_multiset_with_key_type(&bytes, &DataType::Int64)
@@ -1028,7 +1145,11 @@ mod multiset_tests {
 
     #[test]
     fn decode_multiset_rejects_non_canonical_empty_encoding() {
-        let bytes = vec![STATE_VERSION_V1, 0x00];
+        let bytes = vec![
+            STATE_VERSION_V1,
+            key_type_tag_for_data_type(&DataType::Int64).unwrap(),
+            0x00,
+        ];
         assert!(
             decode_multiset_with_key_type(&bytes, &DataType::Int64)
                 .unwrap_err()
@@ -1038,14 +1159,17 @@ mod multiset_tests {
 
     #[test]
     fn decode_multiset_rejects_huge_count_without_preallocating() {
-        let mut bytes = vec![STATE_VERSION_V1];
+        let mut bytes = vec![
+            STATE_VERSION_V1,
+            key_type_tag_for_data_type(&DataType::Int64).unwrap(),
+        ];
         write_uleb128(&mut bytes, u64::MAX);
         assert!(decode_multiset_with_key_type(&bytes, &DataType::Int64).is_err());
     }
 
     #[test]
     fn decode_multiset_with_key_type_rejects_trailing_bytes() {
-        let mut bytes = encode_multiset(&[entry_int(1, 1)]);
+        let mut bytes = encode_multiset(&[entry_int(1, 1)], &DataType::Int64).unwrap();
         bytes.push(0xAA);
         assert!(
             decode_multiset_with_key_type(&bytes, &DataType::Int64)
@@ -1056,7 +1180,10 @@ mod multiset_tests {
 
     #[test]
     fn decode_multiset_with_key_type_rejects_non_canonical_key_bytes() {
-        let mut bool_bytes = vec![STATE_VERSION_V1];
+        let mut bool_bytes = vec![
+            STATE_VERSION_V1,
+            key_type_tag_for_data_type(&DataType::Boolean).unwrap(),
+        ];
         write_uleb128(&mut bool_bytes, 1);
         bool_bytes.push(2);
         write_sleb128(&mut bool_bytes, 1);
@@ -1066,7 +1193,10 @@ mod multiset_tests {
                 .contains("non-canonical")
         );
 
-        let mut float_bytes = vec![STATE_VERSION_V1];
+        let mut float_bytes = vec![
+            STATE_VERSION_V1,
+            key_type_tag_for_data_type(&DataType::Float64).unwrap(),
+        ];
         write_uleb128(&mut float_bytes, 1);
         float_bytes.extend_from_slice(&(-0.0_f64).to_bits().to_le_bytes());
         write_sleb128(&mut float_bytes, 1);
@@ -1079,7 +1209,10 @@ mod multiset_tests {
 
     #[test]
     fn decode_multiset_with_key_type_rejects_non_canonical_sleb128_counts() {
-        let mut bytes = vec![STATE_VERSION_V1];
+        let mut bytes = vec![
+            STATE_VERSION_V1,
+            key_type_tag_for_data_type(&DataType::Int64).unwrap(),
+        ];
         write_uleb128(&mut bytes, 1);
         bytes.extend_from_slice(&1i64.to_le_bytes());
         bytes.extend_from_slice(&[0x80, 0x00]);
@@ -1093,7 +1226,17 @@ mod multiset_tests {
     #[test]
     fn encode_multiset_preserves_supplied_entry_order() {
         let entries = vec![entry_int(5, 1), entry_int(1, 2), entry_int(3, 4)];
-        let bytes = encode_multiset(&entries);
+        let bytes = encode_multiset(&entries, &DataType::Int64).unwrap();
         assert_eq!(decode_multiset(&bytes).unwrap(), entries);
+    }
+
+    #[test]
+    fn decode_multiset_with_key_type_rejects_mismatched_key_type_tag() {
+        let bytes = encode_multiset(&[entry_int(1, 1)], &DataType::Int64).unwrap();
+        assert!(
+            decode_multiset_with_key_type(&bytes, &DataType::Boolean)
+                .unwrap_err()
+                .contains("key type tag")
+        );
     }
 }

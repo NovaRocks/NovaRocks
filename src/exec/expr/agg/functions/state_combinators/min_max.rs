@@ -93,12 +93,12 @@ impl AggregateFunction for MinMaxStateAgg {
 
     fn build_array(
         &self,
-        _spec: &AggSpec,
+        spec: &AggSpec,
         offset: usize,
         group_states: &[AggStatePtr],
         _output_intermediate: bool,
     ) -> Result<ArrayRef, String> {
-        build_min_max_state_array(offset, group_states)
+        build_min_max_state_array(spec, offset, group_states)
     }
 }
 
@@ -174,12 +174,12 @@ impl AggregateFunction for MinMaxStateSignedAgg {
 
     fn build_array(
         &self,
-        _spec: &AggSpec,
+        spec: &AggSpec,
         offset: usize,
         group_states: &[AggStatePtr],
         _output_intermediate: bool,
     ) -> Result<ArrayRef, String> {
-        build_min_max_state_array(offset, group_states)
+        build_min_max_state_array(spec, offset, group_states)
     }
 }
 
@@ -190,13 +190,15 @@ fn build_min_max_state_spec(
     signed: bool,
 ) -> Result<AggSpec, String> {
     let name = min_max_name(func, signed);
+    let logical_input_type;
     if input_is_intermediate {
-        let key_type = func
+        logical_input_type = func
             .types
             .as_ref()
             .and_then(|t| t.input_arg_type.as_ref())
+            .cloned()
             .ok_or_else(|| format!("{name} merge requires original logical input type"))?;
-        validate_key_type(name, merge_key_type(key_type))?;
+        validate_key_type(name, merge_key_type(&logical_input_type))?;
     } else {
         let input_type = input_type.ok_or_else(|| format!("{name} input type missing"))?;
         if signed {
@@ -204,13 +206,14 @@ fn build_min_max_state_spec(
         } else {
             validate_key_type(name, input_type)?;
         }
+        logical_input_type = input_type.clone();
     }
 
     Ok(AggSpec {
         kind: min_max_kind_for_name(name),
         output_type: DataType::Binary,
         intermediate_type: DataType::Binary,
-        input_arg_type: func.types.as_ref().and_then(|t| t.input_arg_type.clone()),
+        input_arg_type: Some(logical_input_type),
         count_all: false,
     })
 }
@@ -537,9 +540,21 @@ fn merge_key_type(data_type: &DataType) -> &DataType {
 }
 
 fn build_min_max_state_array(
+    spec: &AggSpec,
     offset: usize,
     group_states: &[AggStatePtr],
 ) -> Result<ArrayRef, String> {
+    let key_type = spec
+        .input_arg_type
+        .as_ref()
+        .map(merge_key_type)
+        .ok_or_else(|| {
+            format!(
+                "{} build_array requires original logical input type",
+                min_max_name_for_kind(&spec.kind)
+            )
+        })?;
+    validate_key_type(min_max_name_for_kind(&spec.kind), key_type)?;
     let mut builder = BinaryBuilder::new();
     for &base in group_states {
         let state = unsafe { &*state_slot(base, offset) };
@@ -553,7 +568,7 @@ fn build_min_max_state_array(
                 })
             })
             .collect();
-        builder.append_value(encode_multiset(&entries));
+        builder.append_value(encode_multiset(&entries, key_type)?);
     }
     Ok(Arc::new(builder.finish()))
 }
@@ -896,24 +911,32 @@ mod tests {
         let mut cell = StateCell::new(spec);
         let input = Arc::new(BinaryArray::from(vec![
             Some(
-                encode_multiset(&[
-                    MultisetEntry {
-                        key_bytes: 1i64.to_le_bytes().to_vec(),
-                        count: 2,
-                    },
-                    MultisetEntry {
-                        key_bytes: 2i64.to_le_bytes().to_vec(),
-                        count: 1,
-                    },
-                ])
+                encode_multiset(
+                    &[
+                        MultisetEntry {
+                            key_bytes: 1i64.to_le_bytes().to_vec(),
+                            count: 2,
+                        },
+                        MultisetEntry {
+                            key_bytes: 2i64.to_le_bytes().to_vec(),
+                            count: 1,
+                        },
+                    ],
+                    &DataType::Int64,
+                )
+                .unwrap()
                 .as_slice(),
             ),
             Some(&[][..]),
             Some(
-                encode_multiset(&[MultisetEntry {
-                    key_bytes: 1i64.to_le_bytes().to_vec(),
-                    count: -2,
-                }])
+                encode_multiset(
+                    &[MultisetEntry {
+                        key_bytes: 1i64.to_le_bytes().to_vec(),
+                        count: -2,
+                    }],
+                    &DataType::Int64,
+                )
+                .unwrap()
                 .as_slice(),
             ),
         ])) as ArrayRef;
@@ -935,14 +958,22 @@ mod tests {
         let spec = build_merge_spec("min_state", DataType::Int64);
         let mut cell = StateCell::new(spec);
         let key = 1i64.to_le_bytes().to_vec();
-        let first = encode_multiset(&[MultisetEntry {
-            key_bytes: key.clone(),
-            count: i64::MAX,
-        }]);
-        let second = encode_multiset(&[MultisetEntry {
-            key_bytes: key.clone(),
-            count: 1,
-        }]);
+        let first = encode_multiset(
+            &[MultisetEntry {
+                key_bytes: key.clone(),
+                count: i64::MAX,
+            }],
+            &DataType::Int64,
+        )
+        .unwrap();
+        let second = encode_multiset(
+            &[MultisetEntry {
+                key_bytes: key.clone(),
+                count: 1,
+            }],
+            &DataType::Int64,
+        )
+        .unwrap();
 
         let err = cell
             .try_merge(Arc::new(BinaryArray::from(vec![
@@ -959,10 +990,14 @@ mod tests {
     fn min_state_merge_malformed_after_valid_row_does_not_partially_mutate() {
         let spec = build_merge_spec("min_state", DataType::Int64);
         let mut cell = StateCell::new(spec);
-        let valid = encode_multiset(&[MultisetEntry {
-            key_bytes: 1i64.to_le_bytes().to_vec(),
-            count: 1,
-        }]);
+        let valid = encode_multiset(
+            &[MultisetEntry {
+                key_bytes: 1i64.to_le_bytes().to_vec(),
+                count: 1,
+            }],
+            &DataType::Int64,
+        )
+        .unwrap();
 
         let err = cell
             .try_merge(Arc::new(BinaryArray::from(vec![
@@ -980,10 +1015,14 @@ mod tests {
         let spec = build_merge_spec("min_state", DataType::Int64);
         let mut cell = StateCell::new(spec);
         let key = 1i64.to_le_bytes().to_vec();
-        let existing = encode_multiset(&[MultisetEntry {
-            key_bytes: key,
-            count: i64::MAX,
-        }]);
+        let existing = encode_multiset(
+            &[MultisetEntry {
+                key_bytes: key,
+                count: i64::MAX,
+            }],
+            &DataType::Int64,
+        )
+        .unwrap();
         cell.merge(Arc::new(BinaryArray::from(vec![Some(existing.as_slice())])));
         let before = cell.final_bytes();
 
