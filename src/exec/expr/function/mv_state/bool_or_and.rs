@@ -17,12 +17,13 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanBuilder, LargeBinaryArray};
-use arrow::datatypes::DataType;
+use arrow::array::{ArrayRef, BinaryBuilder, BooleanBuilder};
 
 use crate::connector::starrocks::managed::state_codec::{decode_bool_state, encode_bool_state};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
+
+use super::common::{binary_value_or_empty, row_count, row_index};
 
 pub(crate) fn bool_or_state_union(a: &[u8], b: &[u8]) -> Result<Vec<u8>, String> {
     bool_state_union(a, b, "bool_or_state_union")
@@ -193,70 +194,6 @@ fn eval_bool_state_visible_array(
         }
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
-}
-
-fn row_count(fn_name: &str, lhs_len: usize, rhs_len: usize) -> Result<usize, String> {
-    if lhs_len == rhs_len {
-        return Ok(lhs_len);
-    }
-    if lhs_len == 1 {
-        return Ok(rhs_len);
-    }
-    if rhs_len == 1 {
-        return Ok(lhs_len);
-    }
-    Err(format!(
-        "{fn_name} row count mismatch: lhs_len={lhs_len} rhs_len={rhs_len}"
-    ))
-}
-
-fn row_index(row: usize, len: usize) -> Result<usize, String> {
-    if len == 1 {
-        Ok(0)
-    } else if row < len {
-        Ok(row)
-    } else {
-        Err(format!("row index {row} out of bounds for len {len}"))
-    }
-}
-
-fn binary_value_or_empty<'a>(
-    array: &'a ArrayRef,
-    row: usize,
-    fn_name: &str,
-    arg_idx: usize,
-) -> Result<&'a [u8], String> {
-    match array.data_type() {
-        DataType::Binary => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| {
-                    format!("{fn_name} downcast BinaryArray failed for arg {arg_idx}")
-                })?;
-            if arr.is_null(row) {
-                Ok(&[])
-            } else {
-                Ok(arr.value(row))
-            }
-        }
-        DataType::LargeBinary => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<LargeBinaryArray>()
-                .ok_or_else(|| {
-                    format!("{fn_name} downcast LargeBinaryArray failed for arg {arg_idx}")
-                })?;
-            if arr.is_null(row) {
-                Ok(&[])
-            } else {
-                Ok(arr.value(row))
-            }
-        }
-        other => Err(format!(
-            "{fn_name} expects Binary input for arg {arg_idx}, got {other:?}"
-        )),
-    }
 }
 
 #[cfg(test)]

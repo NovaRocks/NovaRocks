@@ -27,6 +27,7 @@
 pub(super) mod approx_count_distinct;
 pub(super) mod avg;
 pub(super) mod bool_or_and;
+pub(super) mod common;
 pub(super) mod count;
 pub(super) mod count_distinct;
 pub(super) mod debug_dump;
