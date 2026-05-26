@@ -5735,7 +5735,6 @@ fn finalize_iceberg_mv_metadata_only_refresh(
     Ok(StatementResult::Ok)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn first_refresh_iceberg_join_mv(
     state: &Arc<StandaloneState>,
     ctx: &IcebergMvRefreshContext,
