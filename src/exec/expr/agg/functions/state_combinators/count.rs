@@ -403,6 +403,23 @@ mod tests {
         }
     }
 
+    fn count_func_with_signature(
+        name: &str,
+        output_type: DataType,
+        intermediate_type: DataType,
+    ) -> AggFunction {
+        AggFunction {
+            name: name.to_string(),
+            inputs: vec![],
+            input_is_intermediate: false,
+            types: Some(AggTypeSignature {
+                intermediate_type: Some(intermediate_type),
+                output_type: Some(output_type),
+                input_arg_type: None,
+            }),
+        }
+    }
+
     fn build_spec(name: &str, input_type: Option<&DataType>) -> AggSpec {
         CountStateAgg
             .build_spec_from_type(&count_func(name), input_type, false)
@@ -625,5 +642,17 @@ mod tests {
         assert!(matches!(signed_spec.kind, AggKind::CountStateSigned));
         assert_eq!(signed_spec.output_type, DataType::Binary);
         assert_eq!(signed_spec.intermediate_type, DataType::Binary);
+    }
+
+    #[test]
+    fn count_state_rejects_utf8_type_signature() {
+        let err = crate::exec::expr::agg::spec::build_spec_from_type(
+            &count_func_with_signature("count_state", DataType::Utf8, DataType::Binary),
+            Some(&DataType::Int64),
+            false,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("state combinator output_type must be Binary"));
     }
 }

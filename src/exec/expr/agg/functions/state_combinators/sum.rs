@@ -1034,7 +1034,7 @@ mod tests {
             false,
         )
         .unwrap_err();
-        assert!(output_err.contains("aggregate output type signature mismatch for sum_state"));
+        assert!(output_err.contains("state combinator output_type must be Binary"));
 
         let intermediate_err = crate::exec::expr::agg::spec::build_spec_from_type(
             &sum_func_with_signature(
@@ -1047,10 +1047,36 @@ mod tests {
             false,
         )
         .unwrap_err();
-        assert!(
-            intermediate_err
-                .contains("aggregate intermediate type signature mismatch for sum_state_signed")
-        );
+        assert!(intermediate_err.contains("state combinator intermediate_type must be Binary"));
+    }
+
+    #[test]
+    fn sum_state_rejects_utf8_type_signature() {
+        let output_err = crate::exec::expr::agg::spec::build_spec_from_type(
+            &sum_func_with_signature(
+                "sum_state",
+                DataType::Utf8,
+                DataType::Binary,
+                Some(DataType::Int64),
+            ),
+            Some(&DataType::Int64),
+            false,
+        )
+        .unwrap_err();
+        assert!(output_err.contains("state combinator output_type must be Binary"));
+
+        let intermediate_err = crate::exec::expr::agg::spec::build_spec_from_type(
+            &sum_func_with_signature(
+                "sum_state_signed",
+                DataType::Binary,
+                DataType::Utf8,
+                Some(signed_type(DataType::Int64)),
+            ),
+            Some(&signed_type(DataType::Int64)),
+            false,
+        )
+        .unwrap_err();
+        assert!(intermediate_err.contains("state combinator intermediate_type must be Binary"));
     }
 
     #[test]

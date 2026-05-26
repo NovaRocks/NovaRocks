@@ -85,6 +85,11 @@ fn apply_type_signature(
         .ok_or_else(|| "aggregate output_type signature is required".to_string())?;
 
     let mut out = spec;
+    validate_state_combinator_binary_signature(
+        &out.kind,
+        output_type,
+        sig.intermediate_type.as_ref(),
+    )?;
     if !is_compatible_signature_type(&out.output_type, output_type) {
         return Err(format!(
             "aggregate output type signature mismatch for {}: expected {:?}, got {:?}",
@@ -108,6 +113,45 @@ fn apply_type_signature(
         out.input_arg_type = Some(t.clone());
     }
     Ok(out)
+}
+
+fn validate_state_combinator_binary_signature(
+    kind: &AggKind,
+    output_type: &DataType,
+    intermediate_type: Option<&DataType>,
+) -> Result<(), String> {
+    if !is_opaque_state_combinator_kind(kind) {
+        return Ok(());
+    }
+    if output_type != &DataType::Binary {
+        return Err(format!(
+            "state combinator output_type must be Binary, got {:?}",
+            output_type
+        ));
+    }
+    if let Some(intermediate_type) = intermediate_type
+        && intermediate_type != &DataType::Binary
+    {
+        return Err(format!(
+            "state combinator intermediate_type must be Binary, got {:?}",
+            intermediate_type
+        ));
+    }
+    Ok(())
+}
+
+fn is_opaque_state_combinator_kind(kind: &AggKind) -> bool {
+    matches!(
+        kind,
+        AggKind::CountState
+            | AggKind::CountStateSigned
+            | AggKind::BoolState
+            | AggKind::BoolStateSigned
+            | AggKind::SumStateInt64
+            | AggKind::SumStateDecimal128
+            | AggKind::SumStateSignedInt64
+            | AggKind::SumStateSignedDecimal128
+    )
 }
 
 #[derive(Clone, Debug)]
