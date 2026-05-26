@@ -547,7 +547,7 @@ fn build_min_max_state_array(
             .counts
             .iter()
             .filter_map(|(key_bytes, &count)| {
-                (count > 0).then_some(MultisetEntry {
+                (count != 0).then_some(MultisetEntry {
                     key_bytes: key_bytes.clone(),
                     count,
                 })
@@ -718,6 +718,10 @@ mod tests {
             .collect()
     }
 
+    fn decode_entries(bytes: &[u8], key_type: &DataType) -> Vec<MultisetEntry> {
+        decode_multiset_with_key_type(bytes, key_type).unwrap()
+    }
+
     fn signed_i64_input(
         values: Vec<Option<i64>>,
         ops: Vec<Option<i8>>,
@@ -793,6 +797,42 @@ mod tests {
         max_cell.update(input);
 
         assert_eq!(min_cell.final_bytes(), max_cell.final_bytes());
+    }
+
+    #[test]
+    fn min_state_signed_delete_only_preserves_negative_delta() {
+        let input_type = signed_input_type(DataType::Int64);
+        let mut cell = StateCell::new(build_spec("min_state_signed", &input_type));
+
+        cell.update(signed_i64_input(vec![Some(5)], vec![Some(1)], None));
+
+        assert_eq!(
+            decode_entries(&cell.final_bytes(), &DataType::Int64),
+            vec![MultisetEntry {
+                key_bytes: 5i64.to_le_bytes().to_vec(),
+                count: -1,
+            }]
+        );
+    }
+
+    #[test]
+    fn max_state_signed_delete_only_matches_min_state_signed_bytes() {
+        let input_type = signed_input_type(DataType::Int64);
+        let input = signed_i64_input(vec![Some(5)], vec![Some(1)], None);
+        let mut min_cell = StateCell::new(build_spec("min_state_signed", &input_type));
+        let mut max_cell = StateCell::new(build_spec("max_state_signed", &input_type));
+
+        min_cell.update(input.clone());
+        max_cell.update(input);
+
+        assert_eq!(min_cell.final_bytes(), max_cell.final_bytes());
+        assert_eq!(
+            decode_entries(&max_cell.final_bytes(), &DataType::Int64),
+            vec![MultisetEntry {
+                key_bytes: 5i64.to_le_bytes().to_vec(),
+                count: -1,
+            }]
+        );
     }
 
     #[test]
@@ -916,6 +956,26 @@ mod tests {
     }
 
     #[test]
+    fn min_state_merge_malformed_after_valid_row_does_not_partially_mutate() {
+        let spec = build_merge_spec("min_state", DataType::Int64);
+        let mut cell = StateCell::new(spec);
+        let valid = encode_multiset(&[MultisetEntry {
+            key_bytes: 1i64.to_le_bytes().to_vec(),
+            count: 1,
+        }]);
+
+        let err = cell
+            .try_merge(Arc::new(BinaryArray::from(vec![
+                Some(valid.as_slice()),
+                Some(&[0xff][..]),
+            ])))
+            .unwrap_err();
+
+        assert!(err.contains("unsupported version byte"));
+        assert!(cell.final_bytes().is_empty());
+    }
+
+    #[test]
     fn min_state_update_overflow_errors_without_partial_mutation() {
         let spec = build_merge_spec("min_state", DataType::Int64);
         let mut cell = StateCell::new(spec);
@@ -952,6 +1012,35 @@ mod tests {
 
         assert!(err.contains("unknown min_state_signed change_op"));
         assert!(cell.final_bytes().is_empty());
+    }
+
+    #[test]
+    fn min_state_update_staging_splits_distinct_state_pointers() {
+        let spec = build_spec("min_state", &DataType::Int64);
+        let mut cell_a = StateCell::new(spec.clone());
+        let mut cell_b = StateCell::new(spec);
+        let input = Arc::new(Int64Array::from(vec![Some(1), Some(10), Some(1)])) as ArrayRef;
+        let input_slot = Some(input);
+        let view = super::super::super::build_input_view(&cell_a.spec, &input_slot).unwrap();
+        let ptr_a = cell_a.ptr();
+        let ptr_b = cell_b.ptr();
+
+        super::super::super::update_batch(&cell_a.spec, 0, &[ptr_a, ptr_b, ptr_a], &view).unwrap();
+
+        assert_eq!(
+            decode_entries(&cell_a.final_bytes(), &DataType::Int64),
+            vec![MultisetEntry {
+                key_bytes: 1i64.to_le_bytes().to_vec(),
+                count: 2,
+            }]
+        );
+        assert_eq!(
+            decode_entries(&cell_b.final_bytes(), &DataType::Int64),
+            vec![MultisetEntry {
+                key_bytes: 10i64.to_le_bytes().to_vec(),
+                count: 1,
+            }]
+        );
     }
 
     #[test]
