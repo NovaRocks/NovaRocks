@@ -1590,7 +1590,15 @@ impl<'a> AnalyzerContext<'a> {
         match relation {
             Relation::Scan(scan) => {
                 let qualifier = scan.alias.as_deref().unwrap_or(&scan.table.name);
-                scope.add_table(Some(qualifier), &scan.table.columns);
+                if scan.column_ids.len() == scan.table.columns.len() {
+                    scope.add_table_with_ids(
+                        Some(qualifier),
+                        &scan.table.columns,
+                        &scan.column_ids,
+                    );
+                } else {
+                    scope.add_table(Some(qualifier), &scan.table.columns);
+                }
                 if !scan.table.iceberg_row_lineage_metadata_columns.is_empty() {
                     scope.add_iceberg_metadata_columns(
                         qualifier,

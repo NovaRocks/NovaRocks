@@ -136,7 +136,6 @@ impl AnalyzerScope {
     ) -> Vec<ColumnId> {
         let mut ids = Vec::with_capacity(columns.len());
         for col in columns {
-            let name_lower = col.name.to_lowercase();
             let id = self.factory.borrow_mut().create(
                 qualifier.map(|s| s.to_string()),
                 col.name.clone(),
@@ -144,33 +143,69 @@ impl AnalyzerScope {
                 col.nullable,
             );
             ids.push(id);
-            if let Some(q) = qualifier {
-                self.qualified.insert(
-                    (q.to_lowercase(), name_lower.clone()),
-                    (id, col.data_type.clone(), col.nullable),
-                );
-                if let Some(logical) = col.logical_type.clone() {
-                    self.qualified_logical_types
-                        .insert((q.to_lowercase(), name_lower.clone()), logical);
-                }
-            }
-            self.unqualified.insert(
-                name_lower.clone(),
+            self.insert_table_column_binding(qualifier, col, id);
+        }
+        ids
+    }
+
+    /// Register a table's columns using pre-allocated `ColumnId`s.
+    ///
+    /// Used when rebuilding a FROM-scope from a `Relation::Scan` whose
+    /// `column_ids` were already minted during the initial analyzer pass —
+    /// reusing them keeps the by-id lookup index continuous so downstream
+    /// `ColumnRef` nodes (e.g. group-by keys carried through Repeat /
+    /// Aggregate) still resolve via `resolve_by_id` instead of falling
+    /// back to name-based lookup. The fallback path breaks for ROLLUP /
+    /// CUBE / GROUPING SETS because the planner rewrites the group-by
+    /// ColumnRef's qualifier to `__repeat_group`, so the bare-name entry
+    /// is gone from the codegen scope.
+    pub(super) fn add_table_with_ids(
+        &mut self,
+        qualifier: Option<&str>,
+        columns: &[ColumnDef],
+        column_ids: &[ColumnId],
+    ) {
+        assert_eq!(
+            columns.len(),
+            column_ids.len(),
+            "add_table_with_ids: columns/column_ids length mismatch"
+        );
+        for (col, &id) in columns.iter().zip(column_ids.iter()) {
+            self.insert_table_column_binding(qualifier, col, id);
+        }
+    }
+
+    fn insert_table_column_binding(
+        &mut self,
+        qualifier: Option<&str>,
+        col: &ColumnDef,
+        id: ColumnId,
+    ) {
+        let name_lower = col.name.to_lowercase();
+        if let Some(q) = qualifier {
+            self.qualified.insert(
+                (q.to_lowercase(), name_lower.clone()),
                 (id, col.data_type.clone(), col.nullable),
             );
             if let Some(logical) = col.logical_type.clone() {
-                self.unqualified_logical_types.insert(name_lower, logical);
+                self.qualified_logical_types
+                    .insert((q.to_lowercase(), name_lower.clone()), logical);
             }
-            // Store original-case name in ordered for SELECT * display.
-            self.ordered.push((
-                qualifier.map(|s| s.to_lowercase()),
-                col.name.clone(),
-                id,
-                col.data_type.clone(),
-                col.nullable,
-            ));
         }
-        ids
+        self.unqualified.insert(
+            name_lower.clone(),
+            (id, col.data_type.clone(), col.nullable),
+        );
+        if let Some(logical) = col.logical_type.clone() {
+            self.unqualified_logical_types.insert(name_lower, logical);
+        }
+        self.ordered.push((
+            qualifier.map(|s| s.to_lowercase()),
+            col.name.clone(),
+            id,
+            col.data_type.clone(),
+            col.nullable,
+        ));
     }
 
     /// Register a single column (used for subquery output columns, etc.).
