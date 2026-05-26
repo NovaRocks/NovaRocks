@@ -340,6 +340,9 @@ impl ExprArena {
                     FunctionKind::Object(name) => {
                         function::eval_object_function(name, self, id, args, chunk)
                     }
+                    FunctionKind::MvState(name) => {
+                        function::eval_mv_state_function(name, self, id, args, chunk)
+                    }
                     FunctionKind::NullIf => {
                         function::eval_nullif(self, id, args[0], args[1], chunk)
                     }

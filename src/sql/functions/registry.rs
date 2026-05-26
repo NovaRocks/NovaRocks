@@ -50,6 +50,7 @@ static SCALAR_FN_SIGNATURES: LazyLock<HashMap<String, Vec<Signature>>> = LazyLoc
     register_hll_fns(&mut m);
     register_json_fns(&mut m);
     register_iceberg_transform_fns(&mut m);
+    register_mv_state_fns(&mut m);
     register_misc_fns(&mut m);
     register_aggregate_in_expr_fns(&mut m);
     m
@@ -1134,6 +1135,23 @@ fn register_hll_fns(m: &mut HashMap<String, Vec<Signature>>) {
             Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Binary),
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// IVM materialized view state functions.
+// ---------------------------------------------------------------------------
+
+fn register_mv_state_fns(m: &mut HashMap<String, Vec<Signature>>) {
+    add(
+        m,
+        "count_state_union",
+        Signature::new(vec![TypeSpec::Binary, TypeSpec::Binary], TypeSpec::Binary),
+    );
+    add(
+        m,
+        "count_state_visible",
+        Signature::new(vec![TypeSpec::Binary], TypeSpec::Int64),
+    );
 }
 
 // ---------------------------------------------------------------------------

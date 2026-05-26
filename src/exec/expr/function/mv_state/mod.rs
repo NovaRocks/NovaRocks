@@ -24,11 +24,14 @@
 //! Plus the debug helper:
 //!   - DEBUG_DUMP_MV_STATE(mv_name, row_id) -> Utf8 (JSON representation)
 
-pub(super) mod count;
-pub(super) mod bool_or_and;
-pub(super) mod sum;
-pub(super) mod avg;
-pub(super) mod min_max;
-pub(super) mod count_distinct;
 pub(super) mod approx_count_distinct;
+pub(super) mod avg;
+pub(super) mod bool_or_and;
+pub(super) mod count;
+pub(super) mod count_distinct;
 pub(super) mod debug_dump;
+pub(super) mod dispatch;
+pub(super) mod min_max;
+pub(super) mod sum;
+
+pub use dispatch::{eval_mv_state_function, metadata, register};

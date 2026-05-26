@@ -60,6 +60,7 @@ pub use matching::eval_matching_function;
 pub use math::eval_abs;
 pub use math::eval_math_function;
 pub use math::eval_round;
+pub(crate) use mv_state::eval_mv_state_function;
 pub use object::eval_object_function;
 pub use string::eval_split;
 pub use string::eval_string_function;
@@ -129,6 +130,9 @@ pub enum FunctionKind {
 
     // Object-family functions (generic dispatcher)
     Object(&'static str),
+
+    // IVM materialized view state functions (generic dispatcher)
+    MvState(&'static str),
 
     // Condition functions
     NullIf,
@@ -251,6 +255,9 @@ pub static FUNCTION_REGISTRY: Lazy<HashMap<&'static str, FunctionKind>> = Lazy::
 
     // Object-family functions
     object::register(&mut m);
+
+    // IVM materialized view state functions
+    mv_state::register(&mut m);
 
     m
 });
@@ -460,6 +467,17 @@ pub fn function_metadata(kind: FunctionKind) -> FunctionMetadata {
         FunctionKind::Object(name) => {
             let meta = object::metadata(name).unwrap_or_else(|| {
                 panic!("missing object function metadata for {}", name);
+            });
+            FunctionMetadata {
+                name: meta.name,
+                min_args: meta.min_args,
+                max_args: meta.max_args,
+                kind,
+            }
+        }
+        FunctionKind::MvState(name) => {
+            let meta = mv_state::metadata(name).unwrap_or_else(|| {
+                panic!("missing mv_state function metadata for {}", name);
             });
             FunctionMetadata {
                 name: meta.name,
