@@ -883,6 +883,10 @@ pub(crate) fn eval_array_generate_literal(args: &[Literal]) -> Result<Literal, S
     if args.is_empty() || args.len() > 3 {
         return Err("array_generate expects 1 to 3 numeric arguments".to_string());
     }
+    // SQL NULL propagation: if any argument is NULL, the whole call is NULL.
+    if args.iter().any(|a| matches!(a, Literal::Null)) {
+        return Ok(Literal::Null);
+    }
     let literal_to_i64 = |value: &Literal| match value {
         Literal::Int(v) => Ok(*v),
         other => Err(format!(

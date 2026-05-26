@@ -87,6 +87,17 @@ pub fn eval_array_top_n(
 ) -> Result<ArrayRef, String> {
     let arr = arena.eval(args[0], chunk)?;
     let n_arr = arena.eval(args[1], chunk)?;
+    // SQL NULL propagation: a literal `NULL` (DataType::Null) input means
+    // the whole call collapses to NULL — produce an all-NULL array of the
+    // expected output type so downstream consumers see one row of NULL per
+    // input row instead of an internal "expects ListArray" error.
+    if matches!(arr.data_type(), DataType::Null) {
+        let out_type = arena
+            .data_type(expr)
+            .cloned()
+            .unwrap_or(DataType::Null);
+        return Ok(arrow::array::new_null_array(&out_type, chunk.len()));
+    }
     let list = arr
         .as_any()
         .downcast_ref::<ListArray>()

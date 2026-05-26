@@ -106,6 +106,11 @@ fn is_array_element_compatible(
         | (_, DataType::Struct(_))
         | (DataType::Map(_, _), _)
         | (_, DataType::Map(_, _)) => false,
+        // Utf8 literals are routinely used as date/timestamp values
+        // (`array_remove(array_date, '2025-01-01')`) — accept them at the
+        // lowering check and let the runtime cast Utf8 → Date32 / Timestamp.
+        (DataType::Date32 | DataType::Timestamp(_, _), DataType::Utf8)
+        | (DataType::Utf8, DataType::Date32 | DataType::Timestamp(_, _)) => true,
         _ => is_numeric_like_type(expected) && is_numeric_like_type(actual),
     }
 }
@@ -139,6 +144,11 @@ fn is_array_pair_compatible(left: &DataType, right: &DataType) -> bool {
         | (_, DataType::Struct(_))
         | (DataType::Map(_, _), _)
         | (_, DataType::Map(_, _)) => false,
+        // `Utf8` literals are commonly used to spell date/timestamp values
+        // (`array_contains_all(array_date, ['2025-01-01'])`); accept them
+        // and let the runtime cast Utf8 → Date32 / Timestamp.
+        (DataType::Date32 | DataType::Timestamp(_, _), DataType::Utf8)
+        | (DataType::Utf8, DataType::Date32 | DataType::Timestamp(_, _)) => true,
         _ => is_numeric_like_type(left) && is_numeric_like_type(right),
     }
 }
@@ -423,13 +433,35 @@ pub(crate) fn lower_function_call(
                     let (DataType::List(item0), DataType::List(item1)) = (arg0, &data_type) else {
                         return Err("array_cum_sum expects ARRAY and returns ARRAY".to_string());
                     };
-                    match item0.data_type() {
-                        DataType::Int64 if matches!(item1.data_type(), DataType::Int64) => {}
-                        DataType::Float64 if matches!(item1.data_type(), DataType::Float64) => {}
-                        other => {
+                    // The output element type was already promoted by
+                    // `infer_array_numeric_list_return_type` in the analyzer —
+                    // any integer kind goes to BIGINT, any float-like kind
+                    // goes to DOUBLE. The runtime `eval_array_cum_sum`
+                    // performs the corresponding cast on input. So here we
+                    // only need to verify that the *output* element type is
+                    // one of the two supported summing types; the input is
+                    // allowed to be a narrower numeric and will be widened
+                    // at runtime.
+                    let input_is_numeric_int = matches!(
+                        item0.data_type(),
+                        DataType::Int8
+                            | DataType::Int16
+                            | DataType::Int32
+                            | DataType::Int64
+                            | DataType::Boolean
+                    );
+                    let input_is_numeric_float = matches!(
+                        item0.data_type(),
+                        DataType::Float32 | DataType::Float64
+                    );
+                    match item1.data_type() {
+                        DataType::Int64 if input_is_numeric_int => {}
+                        DataType::Float64 if input_is_numeric_float || input_is_numeric_int => {}
+                        _ => {
                             return Err(format!(
-                                "array_cum_sum only supports ARRAY<BIGINT/DOUBLE>, got {:?}",
-                                other
+                                "array_cum_sum only supports ARRAY<BIGINT/DOUBLE>, got input={:?} output={:?}",
+                                item0.data_type(),
+                                item1.data_type()
                             ));
                         }
                     }
@@ -506,14 +538,13 @@ pub(crate) fn lower_function_call(
                     let arg1 = arena
                         .data_type(children[1])
                         .ok_or_else(|| "array_filter missing arg1 type".to_string())?;
-                    let DataType::List(item_out) = &data_type else {
-                        return Err(
-                            "array_filter expects ARRAY as first argument and return ARRAY"
-                                .to_string(),
-                        );
-                    };
-                    match arg0 {
-                        DataType::List(item0) => {
+                    // When arg0 is a NULL literal the analyzer's return-type
+                    // inference (`arg_types.first()`) hands back `Null` —
+                    // which is fine, the runtime `eval_array_filter` already
+                    // short-circuits to an all-NULL output. Allow it through
+                    // lowering instead of insisting on a List return type.
+                    match (&data_type, arg0) {
+                        (DataType::List(item_out), DataType::List(item0)) => {
                             if item0.data_type() != item_out.data_type() {
                                 return Err(format!(
                                     "array_filter return element type mismatch: {:?} vs {:?}",
@@ -522,7 +553,7 @@ pub(crate) fn lower_function_call(
                                 ));
                             }
                         }
-                        DataType::Null => {}
+                        (DataType::Null, DataType::Null) | (DataType::List(_), DataType::Null) => {}
                         _ => {
                             return Err(
                                 "array_filter expects ARRAY as first argument and return ARRAY"
@@ -947,6 +978,12 @@ pub(crate) fn lower_function_call(
                             let arg_ty = arena
                                 .data_type(*child)
                                 .ok_or_else(|| format!("array_generate missing arg{} type", idx))?;
+                            // NULL literal arguments are permitted — the
+                            // function-call evaluator returns NULL for the
+                            // whole row when any arg is NULL.
+                            if matches!(arg_ty, DataType::Null) {
+                                continue;
+                            }
                             if !check_int(arg_ty) {
                                 return Err(format!(
                                     "array_generate expects integer arguments, got {:?}",

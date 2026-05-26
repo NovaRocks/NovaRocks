@@ -123,6 +123,27 @@ fn validate_scalar_function_call_impl(
     if name == "map" && !arg_types.len().is_multiple_of(2) {
         return Err(no_matching_signature(name, arg_types));
     }
+    // MAP keys must be a comparable scalar type — Iceberg / Trino / StarRocks
+    // all reject ARRAY, MAP, and STRUCT as map keys because they have no
+    // canonical bytewise identity. Catch the construction site (`map(k, v)`)
+    // so the user sees a clear "Map key don't supported type: …" error
+    // instead of an opaque runtime CAST failure further downstream.
+    if name == "map" {
+        for (idx, ty) in arg_types.iter().enumerate() {
+            if !idx.is_multiple_of(2) {
+                continue;
+            }
+            let kind = match ty {
+                DataType::List(_) | DataType::LargeList(_) => Some("ARRAY"),
+                DataType::Map(_, _) => Some("MAP"),
+                DataType::Struct(_) => Some("struct"),
+                _ => None,
+            };
+            if let Some(k) = kind {
+                return Err(format!("Map key don't supported type: {k}"));
+            }
+        }
+    }
     if name == "arrays_overlap" {
         if let Some(args) = typed_args {
             validate_arrays_overlap_typed_arguments(args)?;
