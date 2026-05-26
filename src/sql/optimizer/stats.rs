@@ -1393,7 +1393,7 @@ fn child_output_columns(
 mod tests {
     use super::*;
     use crate::sql::analysis::{JoinKind, OutputColumn};
-    use crate::sql::catalog::{ColumnDef, S3FileInfo, TableDef, ScanSource};
+    use crate::sql::catalog::{ColumnDef, S3FileInfo, ScanSource, TableDef};
     use crate::sql::optimizer::convert::logical_plan_to_memo;
     use crate::sql::optimizer::memo::Memo;
     use crate::sql::planner::plan::*;

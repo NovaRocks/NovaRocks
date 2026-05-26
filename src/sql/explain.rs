@@ -876,7 +876,6 @@ fn supports_scan_decode_hint(data_type: &DataType) -> bool {
     )
 }
 
-
 fn format_expr(expr: &TypedExpr) -> String {
     format_expr_kind(&expr.kind)
 }
@@ -1041,7 +1040,7 @@ mod tests {
 
     use super::{ExplainLevel, explain_physical_plan, format_physical_node, format_stats_trailer};
     use crate::sql::analysis::OutputColumn;
-    use crate::sql::catalog::{ColumnDef, TableDef, ScanSource};
+    use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{Operator, PhysicalDistributionOp, PhysicalScanOp};
     use crate::sql::optimizer::physical_plan::PhysicalPlanNode;

@@ -2227,23 +2227,14 @@ mod tests {
         );
 
         let stmt = ShowMaterializedViewsStmt { database: None };
-        let managed = list_mv_rows(
-            &state,
-            Some("ice"),
-            &stmt,
-            Some(MvStorageEngine::StarRocks),
-        )
-        .expect("managed rows");
+        let managed = list_mv_rows(&state, Some("ice"), &stmt, Some(MvStorageEngine::StarRocks))
+            .expect("managed rows");
         let iceberg = list_mv_rows(&state, Some("ice"), &stmt, Some(MvStorageEngine::Iceberg))
             .expect("iceberg rows");
 
         assert!(!managed.is_empty(), "expected managed MV rows");
         assert!(!iceberg.is_empty(), "expected iceberg MV rows");
-        assert!(
-            managed
-                .iter()
-                .all(|row| row.storage_engine == "starrocks")
-        );
+        assert!(managed.iter().all(|row| row.storage_engine == "starrocks"));
         assert!(iceberg.iter().all(|row| row.storage_engine == "iceberg"));
     }
 
@@ -2699,8 +2690,7 @@ GROUP BY k1",
             AS SELECT k FROM ice.ns.t";
         let stmt = parse_create_mv(stmt_sql);
         // resolve_storage_engine takes (PROPERTIES, default_from_config) and returns the resolved enum.
-        let resolved =
-            resolve_mv_storage_engine(&stmt.properties, "starrocks").expect("resolve");
+        let resolved = resolve_mv_storage_engine(&stmt.properties, "starrocks").expect("resolve");
         assert_eq!(resolved, ManagedMvStorageEngine::Iceberg);
     }
 

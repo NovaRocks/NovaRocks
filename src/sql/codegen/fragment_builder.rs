@@ -3348,7 +3348,7 @@ mod tests {
         CatalogProvider, ColumnDef, IcebergColumnStats, IcebergDeleteFileContent,
         IcebergDeleteFileFormat, IcebergDeleteFileInfo, IcebergPartitionFieldValue,
         IcebergPartitionValue, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
-        ManagedTabletRef, PhysicalTableLayout, S3FileInfo, TableDef, ScanSource,
+        ManagedTabletRef, PhysicalTableLayout, S3FileInfo, ScanSource, TableDef,
     };
     use crate::sql::optimizer::operator::{
         JoinDistribution, Operator, PhysicalDistributionOp, PhysicalHashJoinEqCondition,

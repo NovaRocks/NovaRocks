@@ -21,7 +21,7 @@ use super::model::{
 };
 use crate::connector::starrocks::managed::config::ManagedLakeConfig;
 use crate::engine::catalog::{
-    ColumnDef, InMemoryCatalog, ManagedTabletRef, PhysicalTableLayout, TableDef, ScanSource,
+    ColumnDef, InMemoryCatalog, ManagedTabletRef, PhysicalTableLayout, ScanSource, TableDef,
     normalize_identifier,
 };
 

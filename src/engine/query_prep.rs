@@ -9,7 +9,7 @@ use crate::engine::backend_resolver::resolve_table_target;
 use crate::engine::build_string_query_result;
 use crate::engine::statement::parse_add_files_sql;
 use crate::sql::analyzer::iceberg_ref::resolve_read_binding;
-use crate::sql::catalog::{ColumnDef, TableDef, ScanSource};
+use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
 use crate::sql::parser::ast::ObjectName;
 use crate::sql::parser::query_refs::{
     extract_table_names_from_query, extract_three_part_table_refs, extract_two_part_table_refs,
@@ -795,7 +795,7 @@ fn stamp_delta_table_def_change_ops(
 #[cfg(test)]
 mod tests {
     use crate::engine::query_prep::IcebergFileForQuery;
-    use crate::sql::catalog::{TableDef, ScanSource};
+    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::parser::ast::ObjectName;
 
     fn parse_query_for_table_names(sql: &str) -> sqlparser::ast::Query {

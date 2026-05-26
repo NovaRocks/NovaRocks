@@ -3971,9 +3971,7 @@ enable_path_style_access = true
                         select_sql: "SELECT id FROM missing_catalog.ns.orders".to_string(),
                         base_table_refs: vec!["missing_catalog.ns.orders".to_string()],
                         primary_key_columns: Vec::new(),
-                        storage_engine: ManagedMvStorageEngine::StarRocks
-                            .as_sql_str()
-                            .to_string(),
+                        storage_engine: ManagedMvStorageEngine::StarRocks.as_sql_str().to_string(),
                         target_catalog: None,
                         target_namespace: None,
                         target_table: None,
@@ -4510,7 +4508,7 @@ enable_path_style_access = true
     ///
     /// The `ScanSource` path is unused during analysis-only calls.
     fn state_with_orders_table() -> Arc<crate::engine::StandaloneState> {
-        use crate::sql::catalog::{ColumnDef, TableDef, ScanSource};
+        use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
         let state = Arc::new(crate::engine::StandaloneState::default());
         {
             let mut catalog = state.catalog.write().expect("catalog write lock");

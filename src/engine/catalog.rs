@@ -13,7 +13,7 @@ use std::collections::HashMap;
 // interchangeably without double-defining the types.
 use crate::sql::catalog::LegacyRangePartition;
 pub use crate::sql::catalog::{
-    CatalogProvider, ColumnDef, ManagedTabletRef, PhysicalTableLayout, TableDef, ScanSource,
+    CatalogProvider, ColumnDef, ManagedTabletRef, PhysicalTableLayout, ScanSource, TableDef,
 };
 
 #[derive(Clone, Debug)]

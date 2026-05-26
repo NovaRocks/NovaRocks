@@ -93,7 +93,7 @@ pub struct StandaloneOptions {
 
 pub use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 use crate::sql::catalog::LegacyRangePartition;
-pub use crate::sql::catalog::{CatalogProvider, ColumnDef, TableDef, ScanSource};
+pub use crate::sql::catalog::{CatalogProvider, ColumnDef, ScanSource, TableDef};
 
 fn stream_load_engine_cell() -> &'static OnceLock<StandaloneNovaRocks> {
     static ENGINE: OnceLock<StandaloneNovaRocks> = OnceLock::new();
@@ -3997,7 +3997,7 @@ enable_path_style_access = true
     }
 
     fn build_fragments_for_query(sql: &str) -> crate::sql::codegen::MultiFragmentBuildResult {
-        use crate::sql::catalog::{ColumnDef, S3FileInfo, TableDef, ScanSource};
+        use crate::sql::catalog::{ColumnDef, S3FileInfo, ScanSource, TableDef};
         use crate::sql::parser::dialect::{StarRocksDialect, normalize_for_raw_parse};
 
         // Build a synthetic `tbl(id int, name varchar)` table-def directly.

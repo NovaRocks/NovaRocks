@@ -108,10 +108,7 @@ impl IcebergMvRewriteContext {
         target_schema: Arc<Schema>,
         schema_contract: Option<Arc<MvSchemaContract>>,
     ) -> Result<Self, String> {
-        let target_fqn = format!(
-            "{}.{}.{}",
-            target.catalog, target.namespace, target.table
-        );
+        let target_fqn = format!("{}.{}.{}", target.catalog, target.namespace, target.table);
         let schema_contract = schema_contract.ok_or_else(|| {
             err(format!(
                 "missing schema contract on target {target_fqn}; rebuild or recreate the MV"
@@ -315,9 +312,8 @@ mod tests {
     use crate::meta::repository::mv::StoredMvDefinition;
     use crate::meta::repository::mv_contract::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
-        ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot,
-        HiddenApplyKeyContract, MvSchemaContract, OutputContract, TargetContract,
-        TargetVisibleColumn,
+        ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, HiddenApplyKeyContract,
+        MvSchemaContract, OutputContract, TargetContract, TargetVisibleColumn,
     };
 
     use super::*;
@@ -441,8 +437,7 @@ mod tests {
 
     fn parse_query(sql: &str) -> sqlparser::ast::Query {
         let dialect = sqlparser::dialect::GenericDialect {};
-        let statements =
-            sqlparser::parser::Parser::parse_sql(&dialect, sql).expect("parse_sql");
+        let statements = sqlparser::parser::Parser::parse_sql(&dialect, sql).expect("parse_sql");
         match statements.into_iter().next().expect("one statement") {
             sqlparser::ast::Statement::Query(q) => *q,
             other => panic!("expected SELECT, got {other:?}"),
@@ -462,8 +457,7 @@ mod tests {
         let target = make_target();
         let mv_def = Arc::new(make_mv_definition());
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[IcebergTableRef]> =
-            Arc::from(vec![make_ref("ice", "db", "b")]);
+        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
         let schema = make_target_schema();
         let contract = Arc::new(make_schema_contract());
@@ -617,7 +611,10 @@ mod tests {
             Some(contract),
         )
         .expect_err("missing pin uuid must fail");
-        assert!(err.contains("refresh pin missing uuid for base"), "got: {err}");
+        assert!(
+            err.contains("refresh pin missing uuid for base"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -648,10 +645,7 @@ mod tests {
             Some(contract),
         )
         .expect_err("identity drift must fail");
-        assert!(
-            err.contains("base table identity changed"),
-            "got: {err}"
-        );
+        assert!(err.contains("base table identity changed"), "got: {err}");
     }
 
     #[test]
@@ -772,25 +766,46 @@ mod tests {
         let schema = make_target_schema();
         let mut def_for_three_bases = make_mv_definition();
         def_for_three_bases.last_refresh_snapshots.clear();
-        def_for_three_bases.last_refresh_snapshots.insert("ice.db.b".to_string(), 11);
+        def_for_three_bases
+            .last_refresh_snapshots
+            .insert("ice.db.b".to_string(), 11);
         def_for_three_bases.last_refresh_table_uuids.clear();
-        def_for_three_bases.last_refresh_table_uuids.insert("ice.db.b".to_string(), "uuid-b".to_string());
-        def_for_three_bases.last_refresh_table_uuids.insert("ice.db.a".to_string(), "uuid-a".to_string());
-        def_for_three_bases.last_refresh_table_uuids.insert("ice.db.c".to_string(), "uuid-c".to_string());
+        def_for_three_bases
+            .last_refresh_table_uuids
+            .insert("ice.db.b".to_string(), "uuid-b".to_string());
+        def_for_three_bases
+            .last_refresh_table_uuids
+            .insert("ice.db.a".to_string(), "uuid-a".to_string());
+        def_for_three_bases
+            .last_refresh_table_uuids
+            .insert("ice.db.c".to_string(), "uuid-c".to_string());
         let mv_def = Arc::new(def_for_three_bases);
         let contract = Arc::new(make_schema_contract());
 
         let ctx = IcebergMvRewriteContext::from_parts(
-            target, 42, None, "db".to_string(),
-            mv_def, query, base_refs, pin,
-            Some(99), "uuid-tgt".to_string(), schema, Some(contract),
+            target,
+            42,
+            None,
+            "db".to_string(),
+            mv_def,
+            query,
+            base_refs,
+            pin,
+            Some(99),
+            "uuid-tgt".to_string(),
+            schema,
+            Some(contract),
         )
         .expect("ctx happy path");
 
         let summary = ctx.summary();
         assert_eq!(
             summary.base_fqns,
-            vec!["ice.db.b".to_string(), "ice.db.a".to_string(), "ice.db.c".to_string()],
+            vec![
+                "ice.db.b".to_string(),
+                "ice.db.a".to_string(),
+                "ice.db.c".to_string()
+            ],
             "base_fqns must use base_refs declared order"
         );
         assert_eq!(

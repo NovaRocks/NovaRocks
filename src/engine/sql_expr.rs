@@ -524,17 +524,20 @@ pub(crate) fn sqlparser_function_to_literal(
                 }
             };
             // Mirror runtime semantics: malformed string -> NULL (not error).
-            let values = match crate::exec::expr::function::object::bitmap_common::parse_bitmap_string(&text) {
-                Ok(v) => v,
-                Err(_) => return Ok(Literal::Null),
-            };
+            let values =
+                match crate::exec::expr::function::object::bitmap_common::parse_bitmap_string(&text)
+                {
+                    Ok(v) => v,
+                    Err(_) => return Ok(Literal::Null),
+                };
             // Use the EXTERNAL (storage / SeriV1-style) encoding here —
             // that's the format the StarRocks managed-lake bitmap column
             // reader expects, matching `bitmap_empty` / `to_bitmap`'s
             // const-fold output. The internal varint format only round-
             // trips through the runtime expression layer.
-            let bytes =
-                crate::exec::expr::function::object::bitmap_common::encode_external_bitmap(&values)?;
+            let bytes = crate::exec::expr::function::object::bitmap_common::encode_external_bitmap(
+                &values,
+            )?;
             Ok(Literal::String(bytes_to_latin1_string(&bytes)))
         }
         "to_bitmap" => {

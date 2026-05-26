@@ -1580,7 +1580,7 @@ fn plan_iceberg_metadata_scan(
     factory: &mut ColumnRefFactory,
 ) -> Result<LogicalPlan, String> {
     use crate::sql::analyzer::iceberg_metadata::metadata_table_schema;
-    use crate::sql::catalog::{ColumnDef, TableDef, ScanSource};
+    use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
 
     let cols = metadata_table_schema(rel.metadata_table_type.clone());
     if cols.is_empty() {
@@ -1768,7 +1768,7 @@ fn plan_iceberg_delta_scan(
     rel: IcebergDeltaScanRelation,
     factory: &mut ColumnRefFactory,
 ) -> Result<LogicalPlan, String> {
-    use crate::sql::catalog::{TableDef, ScanSource};
+    use crate::sql::catalog::{ScanSource, TableDef};
 
     // Output schema: base columns + iceberg v3 row-lineage metadata columns.
     // The delta scan emits both: scanner-side projection re-uses the same
@@ -1877,7 +1877,7 @@ fn plan_values(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::catalog::{CatalogProvider, ColumnDef, TableDef, ScanSource};
+    use crate::sql::catalog::{CatalogProvider, ColumnDef, ScanSource, TableDef};
 
     struct TestCatalog;
 

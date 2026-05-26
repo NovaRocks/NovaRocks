@@ -195,7 +195,8 @@ mod tests {
 
     #[test]
     fn detects_among_other_set_vars() {
-        let sql = "SELECT /*+ SET_VAR(query_timeout=60, sql_mode='ALLOW_THROW_EXCEPTION', x=1) */ 1";
+        let sql =
+            "SELECT /*+ SET_VAR(query_timeout=60, sql_mode='ALLOW_THROW_EXCEPTION', x=1) */ 1";
         assert!(extract_allow_throw_exception(sql));
     }
 }

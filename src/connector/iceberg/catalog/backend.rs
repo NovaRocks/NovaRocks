@@ -10,8 +10,8 @@ use crate::connector::backend::{
 };
 use crate::connector::iceberg::catalog::IcebergLoadedTable;
 use crate::sql::catalog::{
-    ColumnDef, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo, S3FileInfo, TableDef,
-    ScanSource,
+    ColumnDef, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo, S3FileInfo, ScanSource,
+    TableDef,
 };
 use crate::sql::parser::ast::Literal;
 

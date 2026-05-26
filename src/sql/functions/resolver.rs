@@ -66,14 +66,12 @@ pub(crate) fn resolve_scalar_function(
     name: &str,
     arg_types: &[DataType],
 ) -> Result<DataType, ResolveError> {
-    let candidates = registry::scalar_signatures(name)
-        .ok_or(ResolveError::UnknownFunction)?;
+    let candidates = registry::scalar_signatures(name).ok_or(ResolveError::UnknownFunction)?;
 
     // Pass 1: strict — every spec anchor-matches the concrete argument.
     for sig in candidates {
         if strict_matches(sig, arg_types) {
-            return realize(&sig.ret, &Bindings::default())
-                .map_err(ResolveError::BadSignature);
+            return realize(&sig.ret, &Bindings::default()).map_err(ResolveError::BadSignature);
         }
     }
 
@@ -175,8 +173,7 @@ mod tests {
 
     #[test]
     fn resolve_unknown_function_returns_unknown_function_error() {
-        let r =
-            resolve_scalar_function("definitely_not_a_real_function", &[DataType::Int64]);
+        let r = resolve_scalar_function("definitely_not_a_real_function", &[DataType::Int64]);
         assert_eq!(r, Err(ResolveError::UnknownFunction));
     }
 
@@ -224,10 +221,8 @@ mod tests {
     #[test]
     fn resolve_array_append_propagates_element_type() {
         // `array_append(List<T>, T) -> List<T>` — polymorphic.
-        let r = resolve_scalar_function(
-            "array_append",
-            &[list_of(DataType::Int64), DataType::Int64],
-        );
+        let r =
+            resolve_scalar_function("array_append", &[list_of(DataType::Int64), DataType::Int64]);
         assert_eq!(r, Ok(list_of(DataType::Int64)));
     }
 
@@ -235,10 +230,8 @@ mod tests {
     fn resolve_array_append_rejects_mismatched_element_type() {
         // `array_append(List<Int64>, Utf8)` should not match — T is bound
         // to Int64 by the first arg, second arg violates the binding.
-        let r = resolve_scalar_function(
-            "array_append",
-            &[list_of(DataType::Int64), DataType::Utf8],
-        );
+        let r =
+            resolve_scalar_function("array_append", &[list_of(DataType::Int64), DataType::Utf8]);
         assert!(matches!(r, Err(ResolveError::NoMatchingSignature { .. })));
     }
 
@@ -254,10 +247,8 @@ mod tests {
     #[test]
     fn resolve_if_widens_then_and_else() {
         // `if(Boolean, Int8, Int64)` → Int64.
-        let r = resolve_scalar_function(
-            "if",
-            &[DataType::Boolean, DataType::Int8, DataType::Int64],
-        );
+        let r =
+            resolve_scalar_function("if", &[DataType::Boolean, DataType::Int8, DataType::Int64]);
         assert_eq!(r, Ok(DataType::Int64));
     }
 
@@ -282,9 +273,6 @@ mod tests {
     #[test]
     fn resolve_now_returns_datetime_with_no_args() {
         let r = resolve_scalar_function("now", &[]);
-        assert_eq!(
-            r,
-            Ok(DataType::Timestamp(TimeUnit::Microsecond, None))
-        );
+        assert_eq!(r, Ok(DataType::Timestamp(TimeUnit::Microsecond, None)));
     }
 }

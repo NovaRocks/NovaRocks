@@ -42,10 +42,7 @@ pub(crate) fn build_scan_node(
     if resolved.physical_layout.is_some() {
         return build_lake_scan_node(node_id, scan_tuple_id, resolved, conjuncts);
     }
-    if matches!(
-        resolved.table.source,
-        ScanSource::IcebergDeltaTable { .. }
-    ) {
+    if matches!(resolved.table.source, ScanSource::IcebergDeltaTable { .. }) {
         return build_iceberg_delta_scan_node(node_id, scan_tuple_id, resolved, conjuncts);
     }
     build_hdfs_scan_node(node_id, scan_tuple_id, resolved, conjuncts)
@@ -67,23 +64,23 @@ fn build_iceberg_delta_scan_node(
     resolved: &ResolvedTable,
     conjuncts: Vec<exprs::TExpr>,
 ) -> plan_nodes::TPlanNode {
-    let (catalog, namespace, table, from_snapshot_id, to_snapshot_id) =
-        match &resolved.table.source {
-            ScanSource::IcebergDeltaTable {
-                catalog,
-                namespace,
-                table,
-                from_snapshot_id,
-                to_snapshot_id,
-            } => (
-                catalog.clone(),
-                namespace.clone(),
-                table.clone(),
-                *from_snapshot_id,
-                *to_snapshot_id,
-            ),
-            _ => unreachable!("build_iceberg_delta_scan_node called on non-IcebergDeltaTable"),
-        };
+    let (catalog, namespace, table, from_snapshot_id, to_snapshot_id) = match &resolved.table.source
+    {
+        ScanSource::IcebergDeltaTable {
+            catalog,
+            namespace,
+            table,
+            from_snapshot_id,
+            to_snapshot_id,
+        } => (
+            catalog.clone(),
+            namespace.clone(),
+            table.clone(),
+            *from_snapshot_id,
+            *to_snapshot_id,
+        ),
+        _ => unreachable!("build_iceberg_delta_scan_node called on non-IcebergDeltaTable"),
+    };
     let mut node = default_plan_node();
     node.node_id = node_id;
     node.node_type = plan_nodes::TPlanNodeType::ICEBERG_DELTA_SCAN_NODE;
@@ -148,20 +145,20 @@ fn build_hdfs_scan_node(
         _ => None,
     };
 
-    let (serialized_table, metadata_table_type, serialized_predicate) =
-        match &resolved.table.source {
-            ScanSource::IcebergMetadataTable {
-                metadata_table_type,
-                serialized_table,
-                metadata_payload,
-                ..
-            } => (
-                Some(serialized_table.clone()),
-                Some(iceberg_metadata_table_type_thrift_str(metadata_table_type).to_string()),
-                metadata_payload.clone(),
-            ),
-            _ => (None, None, None),
-        };
+    let (serialized_table, metadata_table_type, serialized_predicate) = match &resolved.table.source
+    {
+        ScanSource::IcebergMetadataTable {
+            metadata_table_type,
+            serialized_table,
+            metadata_payload,
+            ..
+        } => (
+            Some(serialized_table.clone()),
+            Some(iceberg_metadata_table_type_thrift_str(metadata_table_type).to_string()),
+            metadata_payload.clone(),
+        ),
+        _ => (None, None, None),
+    };
 
     node.hdfs_scan_node = Some(plan_nodes::THdfsScanNode::new(
         Some(scan_tuple_id),
@@ -1253,7 +1250,7 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::{PlannedScanTable, build_exec_params_multi, build_hdfs_scan_range_params};
-    use crate::sql::catalog::{ColumnDef, S3FileInfo, TableDef, ScanSource};
+    use crate::sql::catalog::{ColumnDef, S3FileInfo, ScanSource, TableDef};
     use crate::sql::codegen::resolve::ResolvedTable;
 
     fn hdfs_range(

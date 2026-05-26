@@ -3001,10 +3001,27 @@ mod tests {
 
         // ---------------- string -> Utf8 (single arg) ----------------
         for name in [
-            "upper", "lower", "trim", "ltrim", "rtrim", "reverse", "initcap",
-            "md5", "to_base64", "from_base64", "url_encode", "url_decode",
-            "char", "hex", "unhex", "bar", "money_format",
-            "append_trailing_char_if_absent", "md5sum", "sm3", "parse_url",
+            "upper",
+            "lower",
+            "trim",
+            "ltrim",
+            "rtrim",
+            "reverse",
+            "initcap",
+            "md5",
+            "to_base64",
+            "from_base64",
+            "url_encode",
+            "url_decode",
+            "char",
+            "hex",
+            "unhex",
+            "bar",
+            "money_format",
+            "append_trailing_char_if_absent",
+            "md5sum",
+            "sm3",
+            "parse_url",
             "from_binary",
         ] {
             probes.push((name, vec![DataType::Utf8]));
@@ -3012,15 +3029,25 @@ mod tests {
 
         // ---------------- string length/position -> Int32 -----------
         for name in [
-            "length", "char_length", "character_length", "bit_length",
-            "octet_length", "ascii", "ord",
+            "length",
+            "char_length",
+            "character_length",
+            "bit_length",
+            "octet_length",
+            "ascii",
+            "ord",
         ] {
             probes.push((name, vec![DataType::Utf8]));
         }
 
         // (Utf8, Utf8) -> Int32 — multi-string position / compare.
         for name in [
-            "instr", "locate", "position", "find_in_set", "strcmp", "field",
+            "instr",
+            "locate",
+            "position",
+            "find_in_set",
+            "strcmp",
+            "field",
             "regexp_position",
         ] {
             probes.push((name, vec![DataType::Utf8, DataType::Utf8]));
@@ -3035,26 +3062,32 @@ mod tests {
 
         // (Utf8, Utf8) -> Utf8 — two-arg string transforms.
         for name in [
-            "replace", "regexp_extract", "regexp_extract_all", "regexp_replace",
-            "split_part", "substring_index", "translate",
+            "replace",
+            "regexp_extract",
+            "regexp_extract_all",
+            "regexp_replace",
+            "split_part",
+            "substring_index",
+            "translate",
         ] {
             probes.push((name, vec![DataType::Utf8, DataType::Utf8]));
         }
 
         // substring 2/3 args; left/right; strleft/strright.
-        for name in ["substr", "substring", "left", "right", "strleft", "strright"] {
+        for name in [
+            "substr",
+            "substring",
+            "left",
+            "right",
+            "strleft",
+            "strright",
+        ] {
             probes.push((name, vec![DataType::Utf8, DataType::Int64]));
-            probes.push((
-                name,
-                vec![DataType::Utf8, DataType::Int64, DataType::Int64],
-            ));
+            probes.push((name, vec![DataType::Utf8, DataType::Int64, DataType::Int64]));
         }
         // lpad / rpad
         for name in ["lpad", "rpad"] {
-            probes.push((
-                name,
-                vec![DataType::Utf8, DataType::Int64, DataType::Utf8],
-            ));
+            probes.push((name, vec![DataType::Utf8, DataType::Int64, DataType::Utf8]));
         }
         probes.push(("repeat", vec![DataType::Utf8, DataType::Int64]));
         probes.push(("space", vec![DataType::Int64]));
@@ -3082,9 +3115,8 @@ mod tests {
         }
         // Single-arg float-math -> Float64.
         for name in [
-            "sqrt", "cbrt", "exp", "ln", "log2", "log10", "sin", "cos", "tan",
-            "asin", "acos", "atan", "sinh", "cosh", "tanh", "cot", "square",
-            "radians", "degrees", "sign",
+            "sqrt", "cbrt", "exp", "ln", "log2", "log10", "sin", "cos", "tan", "asin", "acos",
+            "atan", "sinh", "cosh", "tanh", "cot", "square", "radians", "degrees", "sign",
         ] {
             probes.push((name, vec![DataType::Float64]));
             probes.push((name, vec![DataType::Int64]));
@@ -3104,8 +3136,14 @@ mod tests {
 
         // ---------------- datetime constructors / extractors --------
         for name in [
-            "now", "current_timestamp", "localtimestamp", "localtime",
-            "curdate", "current_date", "to_datetime", "to_datetime_ntz",
+            "now",
+            "current_timestamp",
+            "localtimestamp",
+            "localtime",
+            "curdate",
+            "current_date",
+            "to_datetime",
+            "to_datetime_ntz",
         ] {
             probes.push((name, vec![]));
         }
@@ -3121,10 +3159,24 @@ mod tests {
         probes.push(("from_unixtime", vec![DataType::Int64]));
         // date_add / date_sub family
         for name in [
-            "date_add", "date_sub", "adddate", "subdate", "days_add", "days_sub",
-            "months_add", "months_sub", "years_add", "years_sub", "weeks_add",
-            "weeks_sub", "hours_add", "hours_sub", "minutes_add", "minutes_sub",
-            "seconds_add", "seconds_sub",
+            "date_add",
+            "date_sub",
+            "adddate",
+            "subdate",
+            "days_add",
+            "days_sub",
+            "months_add",
+            "months_sub",
+            "years_add",
+            "years_sub",
+            "weeks_add",
+            "weeks_sub",
+            "hours_add",
+            "hours_sub",
+            "minutes_add",
+            "minutes_sub",
+            "seconds_add",
+            "seconds_sub",
         ] {
             probes.push((name, vec![dt.clone(), DataType::Int64]));
             probes.push((name, vec![DataType::Date32, DataType::Int64]));
@@ -3134,17 +3186,35 @@ mod tests {
         probes.push(("date_trunc", vec![DataType::Utf8, dt.clone()]));
         // Datetime extractors -> Int32.
         for name in [
-            "year", "month", "day", "dayofmonth", "hour", "minute", "second",
-            "dayofweek", "yearweek", "dayofyear", "weekofyear", "quarter",
+            "year",
+            "month",
+            "day",
+            "dayofmonth",
+            "hour",
+            "minute",
+            "second",
+            "dayofweek",
+            "yearweek",
+            "dayofyear",
+            "weekofyear",
+            "quarter",
             "hour_from_unixtime",
         ] {
             probes.push((name, vec![dt.clone()]));
         }
         // Diff family -> Int64.
         for name in [
-            "datediff", "timestampdiff", "months_diff", "years_diff", "weeks_diff",
-            "days_diff", "hours_diff", "minutes_diff", "seconds_diff",
-            "to_days", "time_to_sec",
+            "datediff",
+            "timestampdiff",
+            "months_diff",
+            "years_diff",
+            "weeks_diff",
+            "days_diff",
+            "hours_diff",
+            "minutes_diff",
+            "seconds_diff",
+            "to_days",
+            "time_to_sec",
         ] {
             probes.push((name, vec![dt.clone(), dt.clone()]));
         }
@@ -3154,7 +3224,11 @@ mod tests {
             probes.push((name, vec![DataType::Utf8]));
         }
         for name in [
-            "to_date", "str_to_date", "from_days", "makedate", "last_day",
+            "to_date",
+            "str_to_date",
+            "from_days",
+            "makedate",
+            "last_day",
             "next_day",
         ] {
             probes.push((name, vec![DataType::Utf8]));
@@ -3169,9 +3243,7 @@ mod tests {
         probes.push(("sleep", vec![DataType::Int64]));
 
         // ---------------- array -------------------
-        for name in [
-            "array_length", "cardinality", "array_size",
-        ] {
+        for name in ["array_length", "cardinality", "array_size"] {
             probes.push((name, vec![list_of(DataType::Int64)]));
         }
         probes.push((
@@ -3190,34 +3262,13 @@ mod tests {
             "array_contains",
             vec![list_of(DataType::Int64), DataType::Int64],
         ));
-        probes.push((
-            "all_match",
-            vec![list_of(DataType::Boolean)],
-        ));
-        probes.push((
-            "any_match",
-            vec![list_of(DataType::Boolean)],
-        ));
-        probes.push((
-            "array_distinct",
-            vec![list_of(DataType::Int64)],
-        ));
-        probes.push((
-            "array_sort",
-            vec![list_of(DataType::Int64)],
-        ));
-        probes.push((
-            "array_reverse",
-            vec![list_of(DataType::Int64)],
-        ));
-        probes.push((
-            "array_min",
-            vec![list_of(DataType::Int64)],
-        ));
-        probes.push((
-            "array_max",
-            vec![list_of(DataType::Int64)],
-        ));
+        probes.push(("all_match", vec![list_of(DataType::Boolean)]));
+        probes.push(("any_match", vec![list_of(DataType::Boolean)]));
+        probes.push(("array_distinct", vec![list_of(DataType::Int64)]));
+        probes.push(("array_sort", vec![list_of(DataType::Int64)]));
+        probes.push(("array_reverse", vec![list_of(DataType::Int64)]));
+        probes.push(("array_min", vec![list_of(DataType::Int64)]));
+        probes.push(("array_max", vec![list_of(DataType::Int64)]));
         probes.push((
             "__array_element_at",
             vec![list_of(DataType::Int64), DataType::Int64],
@@ -3251,7 +3302,13 @@ mod tests {
         }
 
         // ---------------- window -------------------
-        for name in ["rank", "dense_rank", "row_number", "cume_dist", "percent_rank"] {
+        for name in [
+            "rank",
+            "dense_rank",
+            "row_number",
+            "cume_dist",
+            "percent_rank",
+        ] {
             probes.push((name, vec![]));
         }
         probes.push(("ntile", vec![DataType::Int64]));
@@ -3267,7 +3324,10 @@ mod tests {
         probes.push(("bitmap_contains", vec![DataType::Binary, DataType::Int64]));
         probes.push(("bitmap_has_any", vec![DataType::Binary, DataType::Int64]));
         for name in [
-            "bitmap_min", "bitmap_max", "bitmap_count", "bitmap_union_int",
+            "bitmap_min",
+            "bitmap_max",
+            "bitmap_count",
+            "bitmap_union_int",
             "bitmap_union_count",
         ] {
             probes.push((name, vec![DataType::Binary]));
@@ -3275,25 +3335,42 @@ mod tests {
         probes.push(("bitmap_to_string", vec![DataType::Binary]));
         probes.push(("bitmap_to_array", vec![DataType::Binary]));
         for name in [
-            "to_bitmap", "bitmap_or", "bitmap_xor", "bitmap_andnot",
-            "bitmap_intersect", "bitmap_from_string", "bitmap_empty",
-            "bitmap_and", "sub_bitmap", "bitmap_to_binary", "bitmap_from_binary",
-            "bitmap_to_base64", "bitmap_agg", "bitmap_union",
+            "to_bitmap",
+            "bitmap_or",
+            "bitmap_xor",
+            "bitmap_andnot",
+            "bitmap_intersect",
+            "bitmap_from_string",
+            "bitmap_empty",
+            "bitmap_and",
+            "sub_bitmap",
+            "bitmap_to_binary",
+            "bitmap_from_binary",
+            "bitmap_to_base64",
+            "bitmap_agg",
+            "bitmap_union",
         ] {
             probes.push((name, vec![DataType::Binary]));
         }
 
         // ---------------- hll -------------------
         for name in [
-            "hll_union_agg", "hll_cardinality", "ndv", "approx_count_distinct",
-            "approx_count_distinct_hll_sketch", "ds_hll_count_distinct",
+            "hll_union_agg",
+            "hll_cardinality",
+            "ndv",
+            "approx_count_distinct",
+            "approx_count_distinct_hll_sketch",
+            "ds_hll_count_distinct",
             "ds_hll_count_distinct_merge",
         ] {
             probes.push((name, vec![DataType::Int64]));
         }
         for name in [
-            "hll_hash", "hll_union", "hll_raw_agg",
-            "ds_hll_count_distinct_state", "ds_hll_count_distinct_union",
+            "hll_hash",
+            "hll_union",
+            "hll_raw_agg",
+            "ds_hll_count_distinct_state",
+            "ds_hll_count_distinct_union",
         ] {
             probes.push((name, vec![DataType::Binary]));
         }
@@ -3309,16 +3386,25 @@ mod tests {
             probes.push((name, vec![DataType::Utf8, DataType::Utf8]));
         }
         for name in [
-            "json_query", "json_extract", "get_json_string", "get_json_object",
-            "json_object", "json_array", "to_json", "parse_json", "variant_typeof",
+            "json_query",
+            "json_extract",
+            "get_json_string",
+            "get_json_object",
+            "json_object",
+            "json_array",
+            "to_json",
+            "parse_json",
+            "variant_typeof",
         ] {
             probes.push((name, vec![DataType::Utf8, DataType::Utf8]));
         }
 
         // ---------------- iceberg transforms -------------------
         for name in [
-            "__iceberg_transform_year", "__iceberg_transform_month",
-            "__iceberg_transform_day", "__iceberg_transform_hour",
+            "__iceberg_transform_year",
+            "__iceberg_transform_month",
+            "__iceberg_transform_day",
+            "__iceberg_transform_hour",
             "__iceberg_transform_bucket",
         ] {
             probes.push((name, vec![DataType::Int64]));
@@ -3327,7 +3413,14 @@ mod tests {
         probes.push(("__iceberg_transform_truncate", vec![DataType::Int64]));
 
         // ---------------- misc -------------------
-        for name in ["version", "database", "current_user", "user", "uuid", "typeof"] {
+        for name in [
+            "version",
+            "database",
+            "current_user",
+            "user",
+            "uuid",
+            "typeof",
+        ] {
             probes.push((name, vec![]));
         }
         probes.push(("murmur_hash3_32", vec![DataType::Utf8]));
@@ -3347,14 +3440,27 @@ mod tests {
             probes.push((name, vec![DataType::Boolean]));
         }
         for name in [
-            "corr", "covar_pop", "covar_samp", "var_pop", "var_samp", "variance",
-            "variance_pop", "variance_samp", "stddev", "stddev_pop", "stddev_samp",
+            "corr",
+            "covar_pop",
+            "covar_samp",
+            "var_pop",
+            "var_samp",
+            "variance",
+            "variance_pop",
+            "variance_samp",
+            "stddev",
+            "stddev_pop",
+            "stddev_samp",
         ] {
             probes.push((name, vec![DataType::Float64]));
         }
         for name in [
-            "percentile_cont", "percentile_disc", "percentile_disc_lc",
-            "percentile_approx", "percentile_approx_weighted", "percentile_approx_raw",
+            "percentile_cont",
+            "percentile_disc",
+            "percentile_disc_lc",
+            "percentile_approx",
+            "percentile_approx_weighted",
+            "percentile_approx_raw",
         ] {
             probes.push((name, vec![DataType::Float64]));
         }
@@ -3364,8 +3470,7 @@ mod tests {
         let mut mismatches: Vec<String> = Vec::new();
 
         for (name, arg_types) in probes {
-            let registry_result =
-                crate::sql::functions::resolve_scalar_function(name, &arg_types);
+            let registry_result = crate::sql::functions::resolve_scalar_function(name, &arg_types);
             let legacy_result = infer_scalar_function_return_type(name, &arg_types);
 
             match (registry_result, legacy_result) {

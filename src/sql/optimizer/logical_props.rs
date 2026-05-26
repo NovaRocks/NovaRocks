@@ -285,7 +285,7 @@ pub(crate) fn combine_with_and(mut predicates: Vec<TypedExpr>) -> Option<TypedEx
 mod tests {
     use super::*;
     use crate::sql::analysis::LiteralValue;
-    use crate::sql::catalog::{TableDef, ScanSource};
+    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::optimizer::memo::MExpr;
     use crate::sql::optimizer::operator::{LogicalFilterOp, LogicalJoinOp, LogicalScanOp};
     use std::path::PathBuf;

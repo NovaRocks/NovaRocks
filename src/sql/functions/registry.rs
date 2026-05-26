@@ -36,25 +36,24 @@ pub(crate) fn scalar_signatures(name: &str) -> Option<&'static [Signature]> {
         .map(|v| v.as_slice())
 }
 
-static SCALAR_FN_SIGNATURES: LazyLock<HashMap<String, Vec<Signature>>> =
-    LazyLock::new(|| {
-        let mut m: HashMap<String, Vec<Signature>> = HashMap::new();
-        register_string_fns(&mut m);
-        register_numeric_fns(&mut m);
-        register_datetime_fns(&mut m);
-        register_condition_fns(&mut m);
-        register_array_fns(&mut m);
-        register_map_fns(&mut m);
-        register_bitwise_fns(&mut m);
-        register_window_fns(&mut m);
-        register_bitmap_fns(&mut m);
-        register_hll_fns(&mut m);
-        register_json_fns(&mut m);
-        register_iceberg_transform_fns(&mut m);
-        register_misc_fns(&mut m);
-        register_aggregate_in_expr_fns(&mut m);
-        m
-    });
+static SCALAR_FN_SIGNATURES: LazyLock<HashMap<String, Vec<Signature>>> = LazyLock::new(|| {
+    let mut m: HashMap<String, Vec<Signature>> = HashMap::new();
+    register_string_fns(&mut m);
+    register_numeric_fns(&mut m);
+    register_datetime_fns(&mut m);
+    register_condition_fns(&mut m);
+    register_array_fns(&mut m);
+    register_map_fns(&mut m);
+    register_bitwise_fns(&mut m);
+    register_window_fns(&mut m);
+    register_bitmap_fns(&mut m);
+    register_hll_fns(&mut m);
+    register_json_fns(&mut m);
+    register_iceberg_transform_fns(&mut m);
+    register_misc_fns(&mut m);
+    register_aggregate_in_expr_fns(&mut m);
+    m
+});
 
 // ---------------------------------------------------------------------------
 // Registration helpers
@@ -125,7 +124,11 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "parse_url",
         "from_binary",
     ] {
-        add(m, name, Signature::new(vec![TypeSpec::Utf8], TypeSpec::Utf8));
+        add(
+            m,
+            name,
+            Signature::new(vec![TypeSpec::Utf8], TypeSpec::Utf8),
+        );
     }
 
     // (Utf8) -> Int32 — length / position / ascii family.
@@ -138,7 +141,11 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "ascii",
         "ord",
     ] {
-        add(m, name, Signature::new(vec![TypeSpec::Utf8], TypeSpec::Int32));
+        add(
+            m,
+            name,
+            Signature::new(vec![TypeSpec::Utf8], TypeSpec::Int32),
+        );
     }
 
     // (Utf8, Utf8) -> Int32 — multi-string position / compare.
@@ -167,7 +174,12 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
         m,
         "equiwidth_bucket",
         Signature::new(
-            vec![TypeSpec::Float64, TypeSpec::Float64, TypeSpec::Float64, TypeSpec::Int64],
+            vec![
+                TypeSpec::Float64,
+                TypeSpec::Float64,
+                TypeSpec::Float64,
+                TypeSpec::Int64,
+            ],
             TypeSpec::Int64,
         ),
     );
@@ -199,7 +211,14 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
     }
 
     // substring(str, start) / substring(str, start, length) — overloaded
-    for name in ["substr", "substring", "left", "right", "strleft", "strright"] {
+    for name in [
+        "substr",
+        "substring",
+        "left",
+        "right",
+        "strleft",
+        "strright",
+    ] {
         add(
             m,
             name,
@@ -288,9 +307,9 @@ fn register_numeric_fns(m: &mut HashMap<String, Vec<Signature>>) {
     // here (not in preserve-input) because NovaRocks's legacy path puts
     // it alongside the math family.
     for name in [
-        "sqrt", "dsqrt", "cbrt", "exp", "dexp", "ln", "log2", "log10", "dlog10", "dlog1",
-        "dround", "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh",
-        "cot", "square", "radians", "degrees", "degress", "sign", "positive",
+        "sqrt", "dsqrt", "cbrt", "exp", "dexp", "ln", "log2", "log10", "dlog10", "dlog1", "dround",
+        "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh", "cot", "square",
+        "radians", "degrees", "degress", "sign", "positive",
     ] {
         for t in NUMERIC_PRESERVING_TYPES {
             add(m, name, Signature::new(vec![t.clone()], TypeSpec::Float64));
@@ -299,8 +318,7 @@ fn register_numeric_fns(m: &mut HashMap<String, Vec<Signature>>) {
 
     // Two-arg math returning Float64.
     for name in [
-        "pow", "fpow", "dpow", "power", "log", "mod", "fmod", "pmod",
-        "atan2",
+        "pow", "fpow", "dpow", "power", "log", "mod", "fmod", "pmod", "atan2",
     ] {
         for tl in NUMERIC_PRESERVING_TYPES {
             for tr in NUMERIC_PRESERVING_TYPES {
@@ -434,10 +452,7 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
         add(
             m,
             name,
-            Signature::new(
-                vec![TypeSpec::Datetime, TypeSpec::Utf8],
-                TypeSpec::Utf8,
-            ),
+            Signature::new(vec![TypeSpec::Datetime, TypeSpec::Utf8], TypeSpec::Utf8),
         );
         add(
             m,
@@ -502,10 +517,7 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
     add(
         m,
         "date_trunc",
-        Signature::new(
-            vec![TypeSpec::Utf8, TypeSpec::Datetime],
-            TypeSpec::Datetime,
-        ),
+        Signature::new(vec![TypeSpec::Utf8, TypeSpec::Datetime], TypeSpec::Datetime),
     );
     add(
         m,
@@ -534,7 +546,11 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
             name,
             Signature::new(vec![TypeSpec::Datetime], TypeSpec::Int32),
         );
-        add(m, name, Signature::new(vec![TypeSpec::Date], TypeSpec::Int32));
+        add(
+            m,
+            name,
+            Signature::new(vec![TypeSpec::Date], TypeSpec::Int32),
+        );
     }
 
     // Diff family -> Int64.
@@ -578,13 +594,32 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
             name,
             Signature::new(vec![TypeSpec::Date], TypeSpec::Int64),
         );
-        add(m, name, Signature::new(vec![TypeSpec::Utf8], TypeSpec::Int64));
+        add(
+            m,
+            name,
+            Signature::new(vec![TypeSpec::Utf8], TypeSpec::Int64),
+        );
     }
 
     // Date constructors -> Date32.
-    for name in ["to_date", "str_to_date", "from_days", "makedate", "last_day", "next_day"] {
-        add(m, name, Signature::new(vec![TypeSpec::Utf8], TypeSpec::Date));
-        add(m, name, Signature::new(vec![TypeSpec::Int64], TypeSpec::Date));
+    for name in [
+        "to_date",
+        "str_to_date",
+        "from_days",
+        "makedate",
+        "last_day",
+        "next_day",
+    ] {
+        add(
+            m,
+            name,
+            Signature::new(vec![TypeSpec::Utf8], TypeSpec::Date),
+        );
+        add(
+            m,
+            name,
+            Signature::new(vec![TypeSpec::Int64], TypeSpec::Date),
+        );
         add(
             m,
             name,
@@ -667,8 +702,7 @@ fn register_condition_fns(m: &mut HashMap<String, Vec<Signature>>) {
         add(
             m,
             name,
-            Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Any("T"))
-                .with_widening(),
+            Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Any("T")).with_widening(),
         );
     }
     // `if(cond, t, e)`: cond is Boolean, t/e widen. The first position
@@ -913,10 +947,7 @@ fn register_map_fns(m: &mut HashMap<String, Vec<Signature>>) {
                     Box::new(TypeSpec::Any("K")),
                     Box::new(TypeSpec::Any("V")),
                 )],
-                TypeSpec::Map(
-                    Box::new(TypeSpec::Any("K")),
-                    Box::new(TypeSpec::Any("V")),
-                ),
+                TypeSpec::Map(Box::new(TypeSpec::Any("K")), Box::new(TypeSpec::Any("V"))),
             ),
         );
     }
@@ -927,10 +958,7 @@ fn register_map_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "__map_element_at",
         Signature::new(
             vec![
-                TypeSpec::Map(
-                    Box::new(TypeSpec::Any("K")),
-                    Box::new(TypeSpec::Any("V")),
-                ),
+                TypeSpec::Map(Box::new(TypeSpec::Any("K")), Box::new(TypeSpec::Any("V"))),
                 TypeSpec::Any("K"),
             ],
             TypeSpec::Any("V"),
@@ -952,7 +980,11 @@ fn register_bitwise_fns(m: &mut HashMap<String, Vec<Signature>>) {
         Signature::new(vec![t.clone()], t.clone())
     });
     // Shifts take (T, BIGINT) -> T.
-    for name in ["bit_shift_left", "bit_shift_right", "bit_shift_right_logical"] {
+    for name in [
+        "bit_shift_left",
+        "bit_shift_right",
+        "bit_shift_right_logical",
+    ] {
         add_for_every(m, name, INTEGER_TYPES, |t| {
             Signature::new(vec![t.clone(), TypeSpec::Int64], t.clone())
         });
@@ -968,7 +1000,11 @@ fn register_window_fns(m: &mut HashMap<String, Vec<Signature>>) {
     for name in ["rank", "dense_rank", "row_number"] {
         add(m, name, Signature::new(vec![], TypeSpec::Int64));
     }
-    add(m, "ntile", Signature::new(vec![TypeSpec::Int64], TypeSpec::Int64));
+    add(
+        m,
+        "ntile",
+        Signature::new(vec![TypeSpec::Int64], TypeSpec::Int64),
+    );
     for name in ["cume_dist", "percent_rank"] {
         add(m, name, Signature::new(vec![], TypeSpec::Int64));
     }
@@ -1196,7 +1232,14 @@ fn register_iceberg_transform_fns(m: &mut HashMap<String, Vec<Signature>>) {
 
 fn register_misc_fns(m: &mut HashMap<String, Vec<Signature>>) {
     // -> Utf8 (no args / Utf8 args)
-    for name in ["version", "database", "current_user", "user", "uuid", "typeof"] {
+    for name in [
+        "version",
+        "database",
+        "current_user",
+        "user",
+        "uuid",
+        "typeof",
+    ] {
         add(m, name, Signature::new(vec![], TypeSpec::Utf8));
     }
     // murmur_hash3_32 -> Int32

@@ -38,9 +38,7 @@ struct StandaloneServerCliArgs {
 }
 
 fn print_main_usage() {
-    eprintln!(
-        "Usage: novarocks [run|start|stop|restart|standalone-server] [--config <path>]"
-    );
+    eprintln!("Usage: novarocks [run|start|stop|restart|standalone-server] [--config <path>]");
     eprintln!("  run       - Run in foreground (default)");
     eprintln!("  start     - Run in background as daemon");
     eprintln!("  stop      - Stop running daemon");
@@ -49,9 +47,7 @@ fn print_main_usage() {
 }
 
 fn print_standalone_server_usage() {
-    eprintln!(
-        "Usage: novarocks standalone-server [--port <port>] [--config <path>]"
-    );
+    eprintln!("Usage: novarocks standalone-server [--port <port>] [--config <path>]");
     eprintln!("Example:");
     eprintln!("  novarocks standalone-server --port 9030 --config /etc/novarocks/novarocks.toml");
 }

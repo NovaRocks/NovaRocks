@@ -153,10 +153,7 @@ pub(crate) fn anchor_matches(spec: &TypeSpec, dt: &DataType) -> bool {
 /// Returns `Err` if the spec references an unbound type variable, which is
 /// a bug in the registry (return type referencing a name that does not
 /// appear in `args`).
-pub(crate) fn realize(
-    spec: &TypeSpec,
-    bindings: &Bindings,
-) -> Result<DataType, String> {
+pub(crate) fn realize(spec: &TypeSpec, bindings: &Bindings) -> Result<DataType, String> {
     Ok(match spec {
         TypeSpec::Boolean => DataType::Boolean,
         TypeSpec::Int8 => DataType::Int8,
@@ -399,8 +396,18 @@ mod tests {
         // binds T to the wider type (Int64).
         let arg_spec = TypeSpec::Any("T");
         let mut b = Bindings::default();
-        assert!(unify(&arg_spec, &DataType::Int8, &mut b, BindMode::Widening));
-        assert!(unify(&arg_spec, &DataType::Int64, &mut b, BindMode::Widening));
+        assert!(unify(
+            &arg_spec,
+            &DataType::Int8,
+            &mut b,
+            BindMode::Widening
+        ));
+        assert!(unify(
+            &arg_spec,
+            &DataType::Int64,
+            &mut b,
+            BindMode::Widening
+        ));
         assert_eq!(b.lookup("T"), Some(DataType::Int64));
     }
 
@@ -410,7 +417,12 @@ mod tests {
         let arg0 = TypeSpec::List(Box::new(TypeSpec::Any("T")));
         let arg1 = TypeSpec::Any("T");
         let mut b = Bindings::default();
-        assert!(unify(&arg0, &list_of(DataType::Int64), &mut b, BindMode::Strict));
+        assert!(unify(
+            &arg0,
+            &list_of(DataType::Int64),
+            &mut b,
+            BindMode::Strict
+        ));
         assert!(unify(&arg1, &DataType::Int64, &mut b, BindMode::Strict));
         assert_eq!(b.lookup("T"), Some(DataType::Int64));
     }

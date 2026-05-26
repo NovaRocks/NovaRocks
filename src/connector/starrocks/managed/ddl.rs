@@ -1151,9 +1151,7 @@ fn column_aggregation_to_thrift(aggregation: ColumnAggregation) -> crate::types:
         ColumnAggregation::Min => crate::types::TAggregationType::MIN,
         ColumnAggregation::Max => crate::types::TAggregationType::MAX,
         ColumnAggregation::Replace => crate::types::TAggregationType::REPLACE,
-        ColumnAggregation::ReplaceIfNotNull => {
-            crate::types::TAggregationType::REPLACE_IF_NOT_NULL
-        }
+        ColumnAggregation::ReplaceIfNotNull => crate::types::TAggregationType::REPLACE_IF_NOT_NULL,
         ColumnAggregation::BitmapUnion => crate::types::TAggregationType::BITMAP_UNION,
         ColumnAggregation::HllUnion => crate::types::TAggregationType::HLL_UNION,
     }
