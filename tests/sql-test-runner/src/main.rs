@@ -1,3 +1,4 @@
+mod benchmark_bootstrap;
 mod config;
 mod parser;
 mod results;
