@@ -40,15 +40,15 @@ impl AggregateFunction for MinMaxStateAgg {
         spec: &AggSpec,
         array: &'a Option<ArrayRef>,
     ) -> Result<AggInputView<'a>, String> {
-        build_min_max_state_input_view("min_state", spec, array)
+        build_min_max_state_input_view(min_max_name_for_kind(&spec.kind), spec, array)
     }
 
     fn build_merge_view<'a>(
         &self,
-        _spec: &AggSpec,
+        spec: &AggSpec,
         array: &'a Option<ArrayRef>,
     ) -> Result<AggInputView<'a>, String> {
-        build_min_max_state_merge_view("min_state", array)
+        build_min_max_state_merge_view(min_max_name_for_kind(&spec.kind), array)
     }
 
     fn init_state(&self, _spec: &AggSpec, ptr: *mut u8) {
@@ -66,7 +66,13 @@ impl AggregateFunction for MinMaxStateAgg {
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
     ) -> Result<(), String> {
-        update_min_max_state("min_state", spec, offset, state_ptrs, input)
+        update_min_max_state(
+            min_max_name_for_kind(&spec.kind),
+            spec,
+            offset,
+            state_ptrs,
+            input,
+        )
     }
 
     fn merge_batch(
@@ -76,7 +82,13 @@ impl AggregateFunction for MinMaxStateAgg {
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
     ) -> Result<(), String> {
-        merge_min_max_state("min_state", spec, offset, state_ptrs, input)
+        merge_min_max_state(
+            min_max_name_for_kind(&spec.kind),
+            spec,
+            offset,
+            state_ptrs,
+            input,
+        )
     }
 
     fn build_array(
@@ -109,15 +121,15 @@ impl AggregateFunction for MinMaxStateSignedAgg {
         spec: &AggSpec,
         array: &'a Option<ArrayRef>,
     ) -> Result<AggInputView<'a>, String> {
-        build_min_max_state_input_view("min_state_signed", spec, array)
+        build_min_max_state_input_view(min_max_name_for_kind(&spec.kind), spec, array)
     }
 
     fn build_merge_view<'a>(
         &self,
-        _spec: &AggSpec,
+        spec: &AggSpec,
         array: &'a Option<ArrayRef>,
     ) -> Result<AggInputView<'a>, String> {
-        build_min_max_state_merge_view("min_state_signed", array)
+        build_min_max_state_merge_view(min_max_name_for_kind(&spec.kind), array)
     }
 
     fn init_state(&self, _spec: &AggSpec, ptr: *mut u8) {
@@ -135,7 +147,13 @@ impl AggregateFunction for MinMaxStateSignedAgg {
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
     ) -> Result<(), String> {
-        update_min_max_state("min_state_signed", spec, offset, state_ptrs, input)
+        update_min_max_state(
+            min_max_name_for_kind(&spec.kind),
+            spec,
+            offset,
+            state_ptrs,
+            input,
+        )
     }
 
     fn merge_batch(
@@ -145,7 +163,13 @@ impl AggregateFunction for MinMaxStateSignedAgg {
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
     ) -> Result<(), String> {
-        merge_min_max_state("min_state_signed", spec, offset, state_ptrs, input)
+        merge_min_max_state(
+            min_max_name_for_kind(&spec.kind),
+            spec,
+            offset,
+            state_ptrs,
+            input,
+        )
     }
 
     fn build_array(
@@ -183,16 +207,31 @@ fn build_min_max_state_spec(
     }
 
     Ok(AggSpec {
-        kind: if signed {
-            AggKind::MinMaxStateSigned
-        } else {
-            AggKind::MinMaxState
-        },
+        kind: min_max_kind_for_name(name),
         output_type: DataType::Binary,
         intermediate_type: DataType::Binary,
         input_arg_type: func.types.as_ref().and_then(|t| t.input_arg_type.clone()),
         count_all: false,
     })
+}
+
+fn min_max_kind_for_name(name: &str) -> AggKind {
+    match name {
+        "max_state" => AggKind::MaxState,
+        "min_state_signed" => AggKind::MinStateSigned,
+        "max_state_signed" => AggKind::MaxStateSigned,
+        _ => AggKind::MinState,
+    }
+}
+
+fn min_max_name_for_kind(kind: &AggKind) -> &'static str {
+    match kind {
+        AggKind::MinState => "min_state",
+        AggKind::MaxState => "max_state",
+        AggKind::MinStateSigned => "min_state_signed",
+        AggKind::MaxStateSigned => "max_state_signed",
+        other => unreachable!("unexpected kind for min/max state: {:?}", other),
+    }
 }
 
 fn min_max_name(func: &AggFunction, signed: bool) -> &str {
@@ -252,7 +291,10 @@ fn validate_key_type(name: &str, data_type: &DataType) -> Result<(), String> {
 
 fn min_max_state_layout_for(kind: &AggKind) -> (usize, usize) {
     match kind {
-        AggKind::MinMaxState | AggKind::MinMaxStateSigned => (
+        AggKind::MinState
+        | AggKind::MaxState
+        | AggKind::MinStateSigned
+        | AggKind::MaxStateSigned => (
             std::mem::size_of::<MinMaxState>(),
             std::mem::align_of::<MinMaxState>(),
         ),
@@ -269,8 +311,10 @@ fn build_min_max_state_input_view<'a>(
         .as_ref()
         .ok_or_else(|| format!("{name} input missing"))?;
     match spec.kind {
-        AggKind::MinMaxState => validate_key_type(name, arr.data_type())?,
-        AggKind::MinMaxStateSigned => validate_signed_input_type(name, arr.data_type())?,
+        AggKind::MinState | AggKind::MaxState => validate_key_type(name, arr.data_type())?,
+        AggKind::MinStateSigned | AggKind::MaxStateSigned => {
+            validate_signed_input_type(name, arr.data_type())?
+        }
         _ => return Err(format!("{name} input kind mismatch")),
     }
     Ok(AggInputView::Any(arr))
@@ -314,8 +358,12 @@ fn update_min_max_state(
     input: &AggInputView,
 ) -> Result<(), String> {
     match spec.kind {
-        AggKind::MinMaxState => update_min_max_state_unsigned(name, offset, state_ptrs, input),
-        AggKind::MinMaxStateSigned => update_min_max_state_signed(name, offset, state_ptrs, input),
+        AggKind::MinState | AggKind::MaxState => {
+            update_min_max_state_unsigned(name, offset, state_ptrs, input)
+        }
+        AggKind::MinStateSigned | AggKind::MaxStateSigned => {
+            update_min_max_state_signed(name, offset, state_ptrs, input)
+        }
         _ => Err(format!("{name} update kind mismatch")),
     }
 }
@@ -329,19 +377,17 @@ fn update_min_max_state_unsigned(
     let AggInputView::Any(array) = input else {
         return Err(format!("{name} batch input type mismatch"));
     };
+    let mut staged = BTreeMap::<usize, BTreeMap<Vec<u8>, i64>>::new();
     for (row, &base) in state_ptrs.iter().enumerate() {
         if array.is_null(row) {
             continue;
         }
         let mut key_bytes = Vec::new();
-        write_key_at(&mut key_bytes, array, row)?;
-        add_count(
-            unsafe { &mut *state_slot(base, offset) },
-            key_bytes,
-            1,
-            name,
-        )?;
+        write_key_at(&mut key_bytes, array, row).map_err(|err| format!("{name}: {err}"))?;
+        let state = staged_state(&mut staged, base, offset);
+        add_count_to_map(state, key_bytes, 1, name)?;
     }
+    commit_staged(staged);
     Ok(())
 }
 
@@ -352,6 +398,7 @@ fn update_min_max_state_signed(
     input: &AggInputView,
 ) -> Result<(), String> {
     let (struct_arr, value_arr, op_arr) = signed_parts(name, input)?;
+    let mut staged = BTreeMap::<usize, BTreeMap<Vec<u8>, i64>>::new();
     for (row, &base) in state_ptrs.iter().enumerate() {
         if struct_arr.is_null(row) || value_arr.is_null(row) {
             continue;
@@ -361,14 +408,11 @@ fn update_min_max_state_signed(
             None => continue,
         };
         let mut key_bytes = Vec::new();
-        write_key_at(&mut key_bytes, value_arr, row)?;
-        add_count(
-            unsafe { &mut *state_slot(base, offset) },
-            key_bytes,
-            delta,
-            name,
-        )?;
+        write_key_at(&mut key_bytes, value_arr, row).map_err(|err| format!("{name}: {err}"))?;
+        let state = staged_state(&mut staged, base, offset);
+        add_count_to_map(state, key_bytes, delta, name)?;
     }
+    commit_staged(staged);
     Ok(())
 }
 
@@ -414,18 +458,37 @@ fn signed_delta(name: &str, op_arr: &Int8Array, row: usize) -> Result<Option<i64
     }
 }
 
-fn add_count(
-    state: &mut MinMaxState,
+fn staged_state(
+    staged: &mut BTreeMap<usize, BTreeMap<Vec<u8>, i64>>,
+    base: AggStatePtr,
+    offset: usize,
+) -> &mut BTreeMap<Vec<u8>, i64> {
+    let ptr = state_slot(base, offset);
+    staged
+        .entry(ptr as usize)
+        .or_insert_with(|| unsafe { (*ptr).counts.clone() })
+}
+
+fn add_count_to_map(
+    counts: &mut BTreeMap<Vec<u8>, i64>,
     key_bytes: Vec<u8>,
     delta: i64,
     context: &str,
 ) -> Result<(), String> {
-    let current = *state.counts.get(&key_bytes).unwrap_or(&0);
+    let current = *counts.get(&key_bytes).unwrap_or(&0);
     let next = current
         .checked_add(delta)
         .ok_or_else(|| format!("{context} overflow while adding multiset count"))?;
-    state.counts.insert(key_bytes, next);
+    counts.insert(key_bytes, next);
     Ok(())
+}
+
+fn commit_staged(staged: BTreeMap<usize, BTreeMap<Vec<u8>, i64>>) {
+    for (ptr, counts) in staged {
+        unsafe {
+            (*(ptr as *mut MinMaxState)).counts = counts;
+        }
+    }
 }
 
 fn merge_min_max_state(
@@ -455,19 +518,12 @@ fn merge_min_max_state(
             .entry(ptr as usize)
             .or_insert_with(|| unsafe { (*ptr).counts.clone() });
         for entry in decode_multiset_with_key_type(array.value(row), key_type)? {
-            let current = *state.get(&entry.key_bytes).unwrap_or(&0);
-            let next = current
-                .checked_add(entry.count)
-                .ok_or_else(|| format!("{name} overflow while merging multiset count"))?;
-            state.insert(entry.key_bytes, next);
+            add_count_to_map(state, entry.key_bytes, entry.count, name)
+                .map_err(|_| format!("{name} overflow while merging multiset count"))?;
         }
     }
 
-    for (ptr, counts) in staged {
-        unsafe {
-            (*(ptr as *mut MinMaxState)).counts = counts;
-        }
-    }
+    commit_staged(staged);
     Ok(())
 }
 
@@ -609,6 +665,16 @@ mod tests {
             let ptr = self.ptr();
             let state_ptrs = vec![ptr; rows];
             super::super::super::update_batch(&self.spec, 0, &state_ptrs, &view)
+        }
+
+        fn try_update_view(
+            &mut self,
+            input: super::super::super::AggInputView<'_>,
+            rows: usize,
+        ) -> Result<(), String> {
+            let ptr = self.ptr();
+            let state_ptrs = vec![ptr; rows];
+            super::super::super::update_batch(&self.spec, 0, &state_ptrs, &input)
         }
 
         fn merge(&mut self, input: ArrayRef) {
@@ -759,6 +825,32 @@ mod tests {
     }
 
     #[test]
+    fn max_state_runtime_errors_use_max_name() {
+        let mut cell = StateCell::new(build_spec("max_state", &DataType::Int64));
+        let input = Arc::new(BinaryArray::from(vec![Some(&b"x"[..])])) as ArrayRef;
+
+        let err = cell
+            .try_update_view(AggInputView::Any(&input), input.len())
+            .unwrap_err();
+
+        assert!(err.contains("max_state"));
+        assert!(!err.contains("min_state"));
+    }
+
+    #[test]
+    fn max_state_signed_runtime_errors_use_max_signed_name() {
+        let input_type = signed_input_type(DataType::Int64);
+        let mut cell = StateCell::new(build_spec("max_state_signed", &input_type));
+
+        let err = cell
+            .try_update(signed_i64_input(vec![Some(1)], vec![Some(7)], None))
+            .unwrap_err();
+
+        assert!(err.contains("unknown max_state_signed change_op"));
+        assert!(!err.contains("min_state_signed"));
+    }
+
+    #[test]
     fn min_state_merge_decodes_binary_states_and_drops_canceled_entries() {
         let spec = build_merge_spec("min_state", DataType::Int64);
         let mut cell = StateCell::new(spec);
@@ -824,6 +916,45 @@ mod tests {
     }
 
     #[test]
+    fn min_state_update_overflow_errors_without_partial_mutation() {
+        let spec = build_merge_spec("min_state", DataType::Int64);
+        let mut cell = StateCell::new(spec);
+        let key = 1i64.to_le_bytes().to_vec();
+        let existing = encode_multiset(&[MultisetEntry {
+            key_bytes: key,
+            count: i64::MAX,
+        }]);
+        cell.merge(Arc::new(BinaryArray::from(vec![Some(existing.as_slice())])));
+        let before = cell.final_bytes();
+
+        let input = Arc::new(Int64Array::from(vec![Some(2), Some(1)])) as ArrayRef;
+        let input_slot = Some(input);
+        let view = super::super::super::build_input_view(&cell.spec, &input_slot).unwrap();
+        let ptr = cell.ptr();
+        let err = super::super::super::update_batch(&cell.spec, 0, &[ptr, ptr], &view).unwrap_err();
+
+        assert!(err.contains("overflow"));
+        assert_eq!(cell.final_bytes(), before);
+    }
+
+    #[test]
+    fn min_state_signed_update_error_does_not_partially_mutate_state() {
+        let input_type = signed_input_type(DataType::Int64);
+        let mut cell = StateCell::new(build_spec("min_state_signed", &input_type));
+
+        let err = cell
+            .try_update(signed_i64_input(
+                vec![Some(1), Some(2)],
+                vec![Some(0), Some(7)],
+                None,
+            ))
+            .unwrap_err();
+
+        assert!(err.contains("unknown min_state_signed change_op"));
+        assert!(cell.final_bytes().is_empty());
+    }
+
+    #[test]
     fn min_state_bool_key_round_trips_with_key_type() {
         let spec = build_spec("min_state", &DataType::Boolean);
         let mut cell = StateCell::new(spec);
@@ -843,17 +974,17 @@ mod tests {
     #[test]
     fn registration_resolves_all_names_to_binary_state() {
         for (name, input_type, expected_kind) in [
-            ("min_state", DataType::Int64, AggKind::MinMaxState),
-            ("max_state", DataType::Int64, AggKind::MinMaxState),
+            ("min_state", DataType::Int64, AggKind::MinState),
+            ("max_state", DataType::Int64, AggKind::MaxState),
             (
                 "min_state_signed",
                 signed_input_type(DataType::Int64),
-                AggKind::MinMaxStateSigned,
+                AggKind::MinStateSigned,
             ),
             (
                 "max_state_signed",
                 signed_input_type(DataType::Int64),
-                AggKind::MinMaxStateSigned,
+                AggKind::MaxStateSigned,
             ),
         ] {
             let spec = super::super::super::build_spec_from_type(

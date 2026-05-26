@@ -147,8 +147,10 @@ fn is_opaque_state_combinator_kind(kind: &AggKind) -> bool {
             | AggKind::CountStateSigned
             | AggKind::BoolState
             | AggKind::BoolStateSigned
-            | AggKind::MinMaxState
-            | AggKind::MinMaxStateSigned
+            | AggKind::MinState
+            | AggKind::MaxState
+            | AggKind::MinStateSigned
+            | AggKind::MaxStateSigned
             | AggKind::SumStateInt64
             | AggKind::SumStateDecimal128
             | AggKind::SumStateSignedInt64
