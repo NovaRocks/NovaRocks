@@ -10,9 +10,7 @@
 CREATE TABLE ${case_db}.test_map (
     col_int INT,
     col_map MAP<VARCHAR(50), INT>
-) DUPLICATE KEY(col_int)
-DISTRIBUTED BY HASH(col_int) BUCKETS 1
-PROPERTIES ("replication_num" = "1");
+);
 
 INSERT INTO ${case_db}.test_map VALUES
     (1, map{"a":1,"b":2}),

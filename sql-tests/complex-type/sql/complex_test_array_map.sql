@@ -14,9 +14,6 @@ USE sql_tests_complex_test_array_map;
 CREATE TABLE t1 (
     k1 bigint,
     c1 array < varchar(65536) > 
-) ENGINE = OLAP 
-DUPLICATE KEY(k1) PROPERTIES (
-    "replication_num" = "1"
 );
 
 -- query 3
@@ -25,9 +22,6 @@ USE sql_tests_complex_test_array_map;
 CREATE TABLE t2 (
     k1 bigint,
     c1 bigint
-) ENGINE = OLAP 
-DUPLICATE KEY(k1) PROPERTIES (
-    "replication_num" = "1"
 );
 
 -- query 4

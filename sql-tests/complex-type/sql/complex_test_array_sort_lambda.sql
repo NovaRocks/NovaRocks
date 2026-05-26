@@ -21,7 +21,7 @@ create table t0 (
     c1 array<smallint>,
     c2 array<int>,
     c3 array<bigint>,
-    c4 array<largeint>,
+    c4 array<DECIMAL(38, 0)>,
     c5 array<double>,
     c6 array<float>
 )

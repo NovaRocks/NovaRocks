@@ -10,9 +10,7 @@
 CREATE TABLE ${case_db}.map_top_n (
     c1 INT,
     c2 MAP<VARCHAR(8), INT>
-) PRIMARY KEY(c1)
-DISTRIBUTED BY HASH(c1) BUCKETS 1
-PROPERTIES ("replication_num" = "1");
+);
 
 INSERT INTO ${case_db}.map_top_n VALUES
     (1, map{"key1":1}),

@@ -17,16 +17,11 @@ CREATE TABLE test_array_top_n (
     array_bigint ARRAY<BIGINT>,
     array_float ARRAY<FLOAT>,
     array_double ARRAY<DOUBLE>,
-    array_decimalv2 ARRAY<DECIMALV2(10, 2)>,
+    array_decimalv2 ARRAY<DECIMAL(10, 2)>,
     array_boolean ARRAY<BOOLEAN>,
     array_date ARRAY<DATE>,
     array_datetime ARRAY<DATETIME>,
     array_varchar ARRAY<VARCHAR(100)>
-) ENGINE=OLAP
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id) BUCKETS 3
-PROPERTIES (
-    "replication_num" = "1"
 );
 
 -- query 3

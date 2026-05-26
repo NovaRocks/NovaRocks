@@ -18,8 +18,8 @@ CREATE TABLE test_array_min_max (
     array_smallint ARRAY<SMALLINT>,
     array_int ARRAY<INT>,
     array_bigint ARRAY<BIGINT>,
-    array_largeint ARRAY<LARGEINT>,
-    array_decimalv2 ARRAY<DECIMALV2(10, 2)>,
+    array_largeint ARRAY<DECIMAL(38, 0)>,
+    array_decimalv2 ARRAY<DECIMAL(10, 2)>,
     array_decimal32 ARRAY<DECIMAL32(9, 2)>,
     array_decimal64 ARRAY<DECIMAL64(18, 2)>,
     array_decimal128 ARRAY<DECIMAL128(38, 10)>,
@@ -28,11 +28,6 @@ CREATE TABLE test_array_min_max (
     array_varchar ARRAY<VARCHAR(100)>,
     array_date ARRAY<DATE>,
     array_datetime ARRAY<DATETIME>
-) ENGINE=OLAP
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id) BUCKETS 3
-PROPERTIES (
-    "replication_num" = "1"
 );
 
 -- query 3

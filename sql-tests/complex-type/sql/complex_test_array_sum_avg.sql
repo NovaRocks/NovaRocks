@@ -18,17 +18,14 @@ CREATE TABLE test_array_functions (
     array_smallint ARRAY<SMALLINT>,
     array_int ARRAY<INT>,
     array_bigint ARRAY<BIGINT>,
-    array_largeint ARRAY<LARGEINT>,
+    array_largeint ARRAY<DECIMAL(38, 0)>,
     array_float ARRAY<FLOAT>,
     array_double ARRAY<DOUBLE>,
     array_decimal32 ARRAY<DECIMAL32(9, 2)>,
     array_decimal64 ARRAY<DECIMAL64(18, 2)>,
     array_decimal128 ARRAY<DECIMAL128(38, 10)>,
-    array_decimalv2 ARRAY<DECIMALV2>
-) 
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id) BUCKETS 4
-PROPERTIES ("replication_num" = "1");
+    array_decimalv2 ARRAY<DECIMAL(27, 9)>
+);
 
 -- query 3
 -- @skip_result_check=true

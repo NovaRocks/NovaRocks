@@ -15,13 +15,6 @@ CREATE TABLE ${case_db}.sc2 (
   `map2` MAP<INT, ARRAY<INT>> NULL,
   `map3` MAP<INT, STRUCT<c INT, b INT>> NULL,
   `st1` STRUCT<s1 int, s2 ARRAY<INT>, s3 MAP<INT, INT>, s4 Struct<e INT, f INT>>
-) ENGINE=OLAP
-DUPLICATE KEY(`v1`)
-COMMENT "OLAP"
-DISTRIBUTED BY HASH(`v1`) BUCKETS 3
-PROPERTIES (
-"replication_num" = "1",
-"compression" = "LZ4"
 );
 
 insert into ${case_db}.sc2 values (1, [11,NULL,31,41], [map{11: 110}, map{101: 101}], [row(11, 12), row(12, 13)], map{14: 41, NULL: 11, 12: 31}, map{101: [1, 10, 11, 23]}, map{101: row(NULL, 12)}, row(1, [1, 10, 11], map{101: 111, NULL: NULL}, row(111, 110)));

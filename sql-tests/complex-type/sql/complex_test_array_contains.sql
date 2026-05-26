@@ -17,11 +17,6 @@ str string,
 arr_bigint array<bigint>,
 arr_str array<string>,
 arr_decimal array<decimal(38,5)>
-) ENGINE=OLAP
-DUPLICATE KEY(`pk`)
-DISTRIBUTED BY HASH(`pk`) BUCKETS 3
-PROPERTIES (
-"replication_num" = "1"
 );
 
 -- query 3
@@ -150,9 +145,7 @@ create table t (
     v1 array<decimal(38,5)>,
     v2 array<array<decimal(38,5)>>,
     v3 array<array<array<decimal(38,5)>>>
-) duplicate key (`k`)
-distributed by random buckets 1
-properties('replication_num'='1');
+);
 
 -- query 32
 -- @skip_result_check=true
@@ -209,11 +202,6 @@ CREATE TABLE t (
   arr_0 array<bigint(20)> NOT NULL,
   arr_1 array<bigint(20)>,
   arr_2 array<bigint(20)>
-) ENGINE=OLAP
-DUPLICATE KEY(`k`)
-DISTRIBUTED BY RANDOM BUCKETS 1
-PROPERTIES (
-"replication_num" = "1"
 );
 
 -- query 44
@@ -441,8 +429,8 @@ CREATE TABLE test_array_contains (
     array_smallint ARRAY<SMALLINT>,
     array_int ARRAY<INT>,
     array_bigint ARRAY<BIGINT>,
-    array_largeint ARRAY<LARGEINT>,
-    array_decimalv2 ARRAY<DECIMALV2(10, 2)>,
+    array_largeint ARRAY<DECIMAL(38, 0)>,
+    array_decimalv2 ARRAY<DECIMAL(10, 2)>,
     array_decimal32 ARRAY<DECIMAL32(9, 2)>,
     array_decimal64 ARRAY<DECIMAL64(18, 2)>,
     array_decimal128 ARRAY<DECIMAL128(38, 10)>,
@@ -451,11 +439,6 @@ CREATE TABLE test_array_contains (
     array_varchar ARRAY<VARCHAR(100)>,
     array_date ARRAY<DATE>,
     array_datetime ARRAY<DATETIME>
-) ENGINE=OLAP
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id) BUCKETS 3
-PROPERTIES (
-    "replication_num" = "1"
 );
 
 -- query 94
@@ -1356,10 +1339,7 @@ CREATE TABLE test_array_contains_complex_type (
     array_map ARRAY<MAP<STRING, INT>>,
     array_json ARRAY<JSON>,
     array_struct ARRAY<STRUCT<f1 INT, f2 STRING>>
-) ENGINE=OLAP
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id) BUCKETS 3
-PROPERTIES ("replication_num" = "1");
+);
 
 -- query 286
 -- @skip_result_check=true
@@ -1575,11 +1555,6 @@ str string,
 arr_bigint array<bigint>,
 arr_str array<string>,
 arr_decimal array<decimal(38,5)>
-) ENGINE=OLAP
-DUPLICATE KEY(`pk`)
-DISTRIBUTED BY HASH(`pk`) BUCKETS 3
-PROPERTIES (
-"replication_num" = "1"
 );
 
 -- query 335

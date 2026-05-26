@@ -17,12 +17,6 @@ CREATE TABLE t1 (
     array_col2 ARRAY<DOUBLE>,
     array_col3 ARRAY<VARCHAR(20)>,
     array_col4 ARRAY<DATE>
-) ENGINE=OLAP
-DUPLICATE KEY(id)
-COMMENT "OLAP"
-DISTRIBUTED BY HASH(id)
-PROPERTIES (
-    "replication_num" = "1"
 );
 
 -- query 3
@@ -58,11 +52,6 @@ select id, array_col1, array_col2, array_sortby(array_col1, array_col2) from t1 
 USE ${case_db};
 CREATE TABLE __row_util_base (
   k1 bigint NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`k1`)
-DISTRIBUTED BY HASH(`k1`) BUCKETS 32
-PROPERTIES (
-    "replication_num" = "1"
 );
 
 -- query 8
@@ -83,11 +72,6 @@ insert into __row_util_base select * from __row_util_base; -- 640000
 CREATE TABLE __row_util (
   idx bigint NULL,
   array_c1 ARRAY<INT>
-) ENGINE=OLAP
-DUPLICATE KEY(`idx`)
-DISTRIBUTED BY HASH(`idx`) BUCKETS 32
-PROPERTIES (
-    "replication_num" = "1"
 );
 
 -- query 10
@@ -109,12 +93,6 @@ CREATE TABLE t1 (
     int_2 ARRAY<INT>,
     str_1 ARRAY<VARCHAR(20)>,
     date_1 ARRAY<DATE>
-) ENGINE=OLAP
-DUPLICATE KEY(id)
-COMMENT "OLAP"
-DISTRIBUTED BY HASH(id) BUCKETS 32
-PROPERTIES (
-    "replication_num" = "1"
 );
 
 -- query 12
@@ -178,12 +156,6 @@ CREATE TABLE t2 (
     int_2 ARRAY<INT>,
     str_1 ARRAY<VARCHAR(20)>,
     date_1 ARRAY<DATE>
-) ENGINE=OLAP
-DUPLICATE KEY(id)
-COMMENT "OLAP"
-DISTRIBUTED BY HASH(id) BUCKETS 32
-PROPERTIES (
-    "replication_num" = "1"
 );
 
 -- query 18
@@ -247,12 +219,6 @@ CREATE TABLE t3 (
     int_2 ARRAY<INT> not null,
     str_1 ARRAY<VARCHAR(20)> not null,
     date_1 ARRAY<DATE> not null
-) ENGINE=OLAP
-DUPLICATE KEY(id)
-COMMENT "OLAP"
-DISTRIBUTED BY HASH(id) BUCKETS 32
-PROPERTIES (
-    "replication_num" = "1"
 );
 
 -- query 24
@@ -400,21 +366,18 @@ CREATE TABLE test_array_sortby (
     array_smallint ARRAY<SMALLINT>,
     array_int ARRAY<INT>,
     array_bigint ARRAY<BIGINT>,
-    array_largeint ARRAY<LARGEINT>,
+    array_largeint ARRAY<DECIMAL(38, 0)>,
     array_float ARRAY<FLOAT>,
     array_double ARRAY<DOUBLE>,
     array_decimal32 ARRAY<DECIMAL32(9, 2)>,
     array_decimal64 ARRAY<DECIMAL64(18, 2)>,
     array_decimal128 ARRAY<DECIMAL128(38, 10)>,
-    array_decimalv2 ARRAY<DECIMALV2>,
+    array_decimalv2 ARRAY<DECIMAL(27, 9)>,
     array_varchar ARRAY<VARCHAR(100)>,
     array_datetime ARRAY<DATETIME>,
     array_date ARRAY<DATE>,
     array_json ARRAY<JSON>
-) 
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id) BUCKETS 4
-PROPERTIES ("replication_num" = "1");
+);
 
 -- query 47
 -- @skip_result_check=true

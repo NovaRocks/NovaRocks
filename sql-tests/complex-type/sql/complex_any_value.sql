@@ -12,13 +12,6 @@ CREATE TABLE ${case_db}.sc3 (
   `m1` MAP<INT, INT> NULL,
   `m2` MAP<INT, STRUCT<c INT, b ARRAY<INT>>> NULL,
   `s1` STRUCT<s1 int, s2 ARRAY<STRUCT<a int, b int>>, s3 MAP<INT, INT>, s4 Struct<e INT, f INT>>
-) ENGINE=OLAP
-DUPLICATE KEY(`v1`)
-COMMENT "OLAP"
-DISTRIBUTED BY HASH(`v1`) BUCKETS 3
-PROPERTIES (
-"replication_num" = "1",
-"compression" = "LZ4"
 );
 
 CREATE TABLE ${case_db}.t0 (
@@ -26,13 +19,6 @@ CREATE TABLE ${case_db}.t0 (
   `v2` bigint(20) NOT NULL COMMENT "",
   `v3` string NULL COMMENT "",
   `v4` string NOT NULL COMMENT ""
-) ENGINE=OLAP
-DUPLICATE KEY(`v1`)
-COMMENT "OLAP"
-DISTRIBUTED BY HASH(`v1`) BUCKETS 3
-PROPERTIES (
-"replication_num" = "1",
-"compression" = "LZ4"
 );
 
 insert into ${case_db}.sc3 values (1, [1,2,3],[row(1,11),row(2,21),row(3,31)], map{1:11, 2:21}, map{1:row(11, [111, 221, 331]), 2:row(22, [221, 221, 331])}, row(1, [row(1,1), row(2,1)], map{1:11, 2:21}, row(1,1)));

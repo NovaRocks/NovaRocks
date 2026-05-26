@@ -21,11 +21,7 @@ CREATE TABLE array_data_type
     c2  array<bigint>, 
     c3  array<bigint>,
     c4  array<bigint> not null, 
-    c5  array<bigint> not null)
-    PRIMARY KEY(c1) 
-    DISTRIBUTED BY HASH(c1) 
-    BUCKETS 1 
-    PROPERTIES ("replication_num" = "1");
+    c5  array<bigint> not null);
 
 -- query 4
 -- @skip_result_check=true
@@ -86,11 +82,7 @@ CREATE TABLE array_data_type_1
     c3  array<float>,
     c4  array<varchar(10)>,
     c5  array<varchar(20)>,
-    c6  array<array<varchar(10)>>)
-    PRIMARY KEY(c1)
-    DISTRIBUTED BY HASH(c1)
-    BUCKETS 1
-    PROPERTIES ("replication_num" = "1");
+    c6  array<array<varchar(10)>>);
 
 -- query 15
 -- @skip_result_check=true
@@ -136,11 +128,7 @@ select c6[0] > array_map((x) -> concat(x, 'a'), c5) from array_data_type_1;
 USE sql_tests_complex_test_array;
 CREATE TABLE array_top_n
     (c1 int,
-    c2 array<int>)
-    PRIMARY KEY(c1)
-    DISTRIBUTED BY HASH(c1)
-    BUCKETS 1
-    PROPERTIES ("replication_num" = "1");
+    c2 array<int>);
 
 -- query 24
 -- @skip_result_check=true
@@ -185,11 +173,7 @@ CREATE TABLE array_exprr
     (
     c1 int not null,
     c2 int not null
-    )
-    PRIMARY KEY(c1)
-    DISTRIBUTED BY HASH(c1)
-    BUCKETS 1
-    PROPERTIES ("replication_num" = "1");
+    );
 
 -- query 32
 -- @skip_result_check=true
@@ -256,15 +240,6 @@ CREATE TABLE `t2` (
   `pk` bigint(20) NOT NULL COMMENT "",
   `aas_1` array<array<array<varchar(65533)>>> NULL COMMENT "",
   `aad_1` array<array<array<DECIMAL128(26,2)>>> NULL COMMENT ""
-) ENGINE=OLAP 
-DUPLICATE KEY(`pk`)
-DISTRIBUTED BY HASH(`pk`) BUCKETS 3 
-PROPERTIES (
-"replication_num" = "1",
-"enable_persistent_index" = "true",
-"replicated_storage" = "true",
-"fast_schema_evolution" = "true",
-"compression" = "LZ4"
 );
 
 -- query 43

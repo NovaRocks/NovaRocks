@@ -16,11 +16,6 @@ CREATE TABLE `t` (
   `arr_0` array<bigint(20)> NOT NULL COMMENT "",
   `arr_1` array<bigint(20)> NULL COMMENT "",
   `arr_2` array<bigint(20)> NULL COMMENT ""
-) ENGINE=OLAP
-DUPLICATE KEY(`k`)
-DISTRIBUTED BY RANDOM BUCKETS 1
-PROPERTIES (
-"replication_num" = "1"
 );
 
 -- query 3

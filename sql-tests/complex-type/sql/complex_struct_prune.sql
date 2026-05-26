@@ -10,26 +10,12 @@ CREATE TABLE ${case_db}.sc2 (
   `map1` MAP<int,MAP<int,MAP<int,int>>> NULL COMMENT "",
   `st1` STRUCT<s1 int, sm2 MAP<int,int>, sm3 MAP<int,MAP<int,int>>> NULL COMMENT "",
   `st2` STRUCT<s1 int, sa2 ARRAY<int>, ss3 STRUCT<sss1 int, sss2 STRUCT<ssss1 int, ssss2 int>>> NULL COMMENT ""
-) ENGINE=OLAP
-DUPLICATE KEY(`v1`)
-COMMENT "OLAP"
-DISTRIBUTED BY HASH(`v1`) BUCKETS 3
-PROPERTIES (
-"replication_num" = "1",
-"compression" = "LZ4"
 );
 
 CREATE TABLE ${case_db}.t1 (
   `v1` bigint(20) NULL COMMENT "",
   `v2` bigint(20) NULL COMMENT "",
   `v3` bigint(20) NULL COMMENT ""
-) ENGINE=OLAP
-DUPLICATE KEY(`v1`)
-COMMENT "OLAP"
-DISTRIBUTED BY HASH(`v1`) BUCKETS 3
-PROPERTIES (
-"replication_num" = "1",
-"compression" = "LZ4"
 );
 
 insert into ${case_db}.t1 values (1, 2, 3);
