@@ -18,6 +18,10 @@ pub fn is_benchmark_suite(suite: &str) -> bool {
     matches!(suite, "ssb" | "tpc-h" | "tpc-ds")
 }
 
+pub fn is_auto_bootstrap_supported_suite(suite: &str) -> bool {
+    matches!(suite, "ssb")
+}
+
 pub fn parse_benchmark_scale_override(
     raw: &str,
     options: &mut BenchmarkBootstrapOptions,
@@ -155,7 +159,7 @@ pub fn ensure_benchmark_data(
     mysql_user: &str,
     mysql_password: Option<&str>,
 ) -> Result<()> {
-    if !options.enabled || !is_benchmark_suite(suite) {
+    if !options.enabled || !is_auto_bootstrap_supported_suite(suite) {
         return Ok(());
     }
 
@@ -263,6 +267,54 @@ mod tests {
         assert!(is_benchmark_suite("tpc-h"));
         assert!(is_benchmark_suite("tpc-ds"));
         assert!(!is_benchmark_suite("join"));
+    }
+
+    #[test]
+    fn first_phase_auto_bootstrap_supports_only_ssb() {
+        assert!(is_auto_bootstrap_supported_suite("ssb"));
+        assert!(!is_auto_bootstrap_supported_suite("tpc-h"));
+        assert!(!is_auto_bootstrap_supported_suite("tpc-ds"));
+        assert!(!is_auto_bootstrap_supported_suite("join"));
+    }
+
+    #[test]
+    fn ensure_benchmark_data_noops_for_unsupported_benchmark_suites() {
+        let options = BenchmarkBootstrapOptions {
+            enabled: true,
+            rebuild: false,
+            scales: parse_scale_overrides(&["tpc-h=10".to_string(), "tpc-ds=1GB".to_string()])
+                .unwrap(),
+        };
+        let mut runner_config = RunnerConfig::default();
+        runner_config.values.insert(
+            "benchmark_bootstrap_script".to_string(),
+            "/definitely/missing/bootstrap_benchmark_data.sh".to_string(),
+        );
+
+        ensure_benchmark_data(
+            &options,
+            &runner_config,
+            Path::new("."),
+            "tpc-h",
+            "iceberg_cat",
+            "127.0.0.1",
+            "23223",
+            "root",
+            Some("secret"),
+        )
+        .unwrap();
+        ensure_benchmark_data(
+            &options,
+            &runner_config,
+            Path::new("."),
+            "tpc-ds",
+            "iceberg_cat",
+            "127.0.0.1",
+            "23223",
+            "root",
+            Some("secret"),
+        )
+        .unwrap();
     }
 
     #[test]
