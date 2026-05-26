@@ -138,6 +138,7 @@ mod multi_distinct_sum;
 mod percentile;
 mod percentile_placeholder;
 mod retention;
+mod state_combinators;
 mod sum;
 mod sum_map;
 mod variance;
