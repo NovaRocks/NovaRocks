@@ -92,9 +92,10 @@ pub(crate) struct IcebergMvRewriteContext {
     pub previous_snapshot_ids: BTreeMap<String, i64>,
     pub previous_table_uuids: BTreeMap<String, String>,
 
-    // ---- Target table inputs ----
+    // ---- Target table inputs (extracted from target_table.metadata()) ----
     pub target_snapshot_id: Option<i64>,
     pub target_table_uuid: String,
+    pub target_schema: Arc<iceberg::spec::Schema>,
 
     // ---- Contracts ----
     pub schema_contract: Arc<MvSchemaContract>,
@@ -183,7 +184,13 @@ impl IcebergMvRefreshContext {
 
 The constructor:
 1. Derives `previous_snapshot_ids` / `previous_table_uuids` from `mv_definition`.
-2. Reads `target_snapshot_id` and `target_table_uuid` from `target_table.metadata()`.
+2. Reads `target_snapshot_id`, `target_table_uuid`, and `target_schema` from
+   `target_table.metadata()`. These are then stored inside the rewrite layer
+   so future optimizer rules (task 2 / 3) never need to touch
+   `iceberg::table::Table` — keeping the rewrite layer free of execution
+   handles. Unit tests synthesise the rewrite layer directly with primitive
+   inputs (a private `IcebergMvRewriteContext::from_parts(...)` helper) and
+   exercise the full self-check without needing a real `iceberg::table::Table`.
 3. Resolves `schema_contract` from `mv_definition` (absence is a construction
    error). `schema_contract.target.partition` and `target.visible_columns`
    ride along inside the same `Arc`.
