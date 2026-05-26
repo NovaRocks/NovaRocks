@@ -700,13 +700,28 @@ impl<'a> super::AnalyzerContext<'a> {
                             cast_null_preserving_target_type(index_typed, fields[0].data_type());
                         fields[1].data_type().clone()
                     }
-                    DataType::Struct(_) => {
+                    DataType::Struct(fields) => {
                         return match &index_typed.kind {
                             ExprKind::Literal(LiteralValue::String(field_name)) => {
                                 self.analyze_struct_field_access(base, field_name.clone())
                             }
+                            // 1-based positional access: `struct_val[1]` →
+                            // first field of the STRUCT. Matches StarRocks /
+                            // Spark / Trino convention.
+                            ExprKind::Literal(LiteralValue::Int(pos)) => {
+                                if *pos < 1 || (*pos as usize) > fields.len() {
+                                    return Err(format!(
+                                        "struct subscript {} is out of range (1..{})",
+                                        pos,
+                                        fields.len()
+                                    ));
+                                }
+                                let field_name =
+                                    fields[(*pos as usize) - 1].name().clone();
+                                self.analyze_struct_field_access(base, field_name)
+                            }
                             _ => Err(format!(
-                                "struct subscript requires a string literal field name, got {:?}",
+                                "struct subscript requires a string literal field name or 1-based integer index, got {:?}",
                                 index_typed.kind
                             )),
                         };
@@ -1808,6 +1823,42 @@ impl<'a> super::AnalyzerContext<'a> {
         } else {
             // Scalar function
             let mut return_type = infer_scalar_return_type(&name, &arg_types);
+            // `named_struct(name0, val0, name1, val1, …)` needs to carry the
+            // user-supplied field *names* in its returned STRUCT schema.
+            // `infer_scalar_return_type` only sees arg types and falls back
+            // to `col1/col2/…`; patch the schema here where we still have the
+            // analyzed arg expressions and can read the string-literal names.
+            if name == "named_struct"
+                && !args_typed.is_empty()
+                && args_typed.len() % 2 == 0
+                && let DataType::Struct(_) = &return_type
+            {
+                let mut fields: Vec<std::sync::Arc<arrow::datatypes::Field>> =
+                    Vec::with_capacity(args_typed.len() / 2);
+                let mut all_have_names = true;
+                for (i, chunk) in args_typed.chunks(2).enumerate() {
+                    let [name_expr, value_expr] = chunk else {
+                        all_have_names = false;
+                        break;
+                    };
+                    let field_name = match &name_expr.kind {
+                        ExprKind::Literal(LiteralValue::String(s)) => s.clone(),
+                        _ => {
+                            all_have_names = false;
+                            break;
+                        }
+                    };
+                    fields.push(std::sync::Arc::new(arrow::datatypes::Field::new(
+                        field_name,
+                        value_expr.data_type.clone(),
+                        true,
+                    )));
+                    let _ = i;
+                }
+                if all_have_names {
+                    return_type = DataType::Struct(fields.into());
+                }
+            }
             // For round/truncate with decimal input and constant 2nd arg,
             // use the target decimal places as the output scale.
             if matches!(name.as_str(), "round" | "truncate")
@@ -3843,7 +3894,7 @@ fn narrow_int_literals_in_typed_expr(expr: TypedExpr) -> TypedExpr {
                         false,
                     )
                 }
-                "row" | "struct" | "named_struct" => {
+                "row" | "struct" => {
                     let fields: Vec<std::sync::Arc<arrow::datatypes::Field>> = args
                         .iter()
                         .enumerate()
@@ -3851,6 +3902,37 @@ fn narrow_int_literals_in_typed_expr(expr: TypedExpr) -> TypedExpr {
                             std::sync::Arc::new(arrow::datatypes::Field::new(
                                 format!("col{}", i + 1),
                                 a.data_type.clone(),
+                                true,
+                            ))
+                        })
+                        .collect();
+                    DataType::Struct(fields.into())
+                }
+                // `named_struct(name0, val0, name1, val1, …)` — the field
+                // names come from the *odd-indexed* string-literal arguments,
+                // not from auto-generated `col1/col2/…` names. The initial
+                // return-type inference in `functions.rs::infer_named_struct_return_type`
+                // can't see the arg expressions (only types), so it falls back
+                // to `col{i+1}`; this refinement pass has the full TypedExpr
+                // args available and fixes the field names properly.
+                "named_struct" => {
+                    let fields: Vec<std::sync::Arc<arrow::datatypes::Field>> = args
+                        .chunks(2)
+                        .enumerate()
+                        .map(|(i, chunk)| {
+                            let (field_name, value_type) = match chunk {
+                                [name_expr, value_expr] => {
+                                    let name = match &name_expr.kind {
+                                        ExprKind::Literal(LiteralValue::String(s)) => s.clone(),
+                                        _ => format!("col{}", i + 1),
+                                    };
+                                    (name, value_expr.data_type.clone())
+                                }
+                                _ => (format!("col{}", i + 1), DataType::Null),
+                            };
+                            std::sync::Arc::new(arrow::datatypes::Field::new(
+                                field_name,
+                                value_type,
                                 true,
                             ))
                         })

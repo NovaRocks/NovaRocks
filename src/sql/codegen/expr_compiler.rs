@@ -1686,7 +1686,53 @@ fn semantic_function_type_desc(
     {
         return list_type_desc(typed_expr_type_desc(item)?);
     }
+    // `named_struct(name0, val0, name1, val1, …)`: derive the STRUCT field
+    // names from the odd-indexed string-literal arguments instead of relying
+    // on the analyzer-side `return_type`, which may have been computed by an
+    // earlier pass that only saw arg *types* and fell back to `col1/col2/…`.
+    // Reading directly from args here gives the runtime / MySQL response the
+    // schema the user actually wrote.
+    if name == "named_struct" && !args.is_empty() && args.len() % 2 == 0 {
+        let mut field_descs = Vec::with_capacity(args.len() / 2);
+        for chunk in args.chunks(2) {
+            let [name_expr, value_expr] = chunk else {
+                return arrow_type_to_type_desc(return_type);
+            };
+            let field_name = match &name_expr.kind {
+                ExprKind::Literal(LiteralValue::String(s)) => s.clone(),
+                _ => return arrow_type_to_type_desc(return_type),
+            };
+            field_descs.push((field_name, typed_expr_type_desc(value_expr)?));
+        }
+        return struct_type_desc(&field_descs);
+    }
     arrow_type_to_type_desc(return_type)
+}
+
+fn struct_type_desc(
+    fields: &[(String, types::TTypeDesc)],
+) -> Result<types::TTypeDesc, String> {
+    let total_child = fields
+        .iter()
+        .map(|(_, td)| td.types.as_ref().map_or(0, |v| v.len()))
+        .sum::<usize>();
+    let mut nodes = Vec::with_capacity(1 + total_child);
+    let struct_fields: Vec<types::TStructField> = fields
+        .iter()
+        .map(|(name, _)| types::TStructField::new(Some(name.clone()), None, None, None))
+        .collect();
+    nodes.push(types::TTypeNode {
+        type_: types::TTypeNodeType::STRUCT,
+        scalar_type: None,
+        is_named: None,
+        struct_fields: Some(struct_fields),
+    });
+    for (_, td) in fields {
+        if let Some(child_nodes) = td.types.as_ref() {
+            nodes.extend(child_nodes.iter().cloned());
+        }
+    }
+    Ok(types::TTypeDesc::new(nodes))
 }
 
 fn semantic_aggregate_type_desc(

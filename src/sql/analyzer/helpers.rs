@@ -532,16 +532,26 @@ pub(super) fn expr_display_name(expr: &sqlast::Expr) -> String {
             parts.last().unwrap().value.clone()
         }
         sqlast::Expr::CompoundFieldAccess { root, access_chain } => {
-            // Determine whether the *last* access is a Dot, in which case the
-            // header is just that trailing field name. For Subscript accesses
-            // we still need the full path (e.g. `m['k']`, `arr[0]`).
-            let last_dot_is_terminal = matches!(
-                access_chain.last(),
-                Some(sqlast::AccessExpr::Dot(_))
-            ) && access_chain
-                .iter()
-                .all(|a| matches!(a, sqlast::AccessExpr::Dot(_)));
-            if last_dot_is_terminal
+            // When the root is an identifier (a column / qualified column
+            // reference) and the access chain is purely a series of Dot
+            // accesses, the MySQL-style header is just the trailing field
+            // name: `t.s.field`, `c2.field`, `db.tbl.col` all show as the
+            // last segment.
+            //
+            // Skip this shortcut when the root is a function call or any
+            // other non-identifier expression — e.g. `row(map1).col1` keeps
+            // the full path because the user is extracting a named field
+            // from an inline value expression, not naming a base column.
+            let root_is_ident = matches!(
+                root.as_ref(),
+                sqlast::Expr::Identifier(_) | sqlast::Expr::CompoundIdentifier(_)
+            );
+            let all_dot = !access_chain.is_empty()
+                && access_chain
+                    .iter()
+                    .all(|a| matches!(a, sqlast::AccessExpr::Dot(_)));
+            if root_is_ident
+                && all_dot
                 && let Some(sqlast::AccessExpr::Dot(last)) = access_chain.last()
             {
                 return expr_display_name_preserve_path(last);
