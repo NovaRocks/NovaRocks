@@ -141,8 +141,8 @@ source_env() {
   : "${NOVA_ENV_COMPOSE_FILE:?missing NOVA_ENV_COMPOSE_FILE in $ENV_FILE}"
   : "${CATALOG_WAREHOUSE_URI:?missing CATALOG_WAREHOUSE_URI in $ENV_FILE}"
   : "${AWS_S3_ENDPOINT:?missing AWS_S3_ENDPOINT in $ENV_FILE}"
-  : "${AWS_S3_ACCESS_KEY_ID:?missing AWS_S3_ACCESS_KEY_ID in $ENV_FILE}"
-  : "${AWS_S3_SECRET_ACCESS_KEY:?missing AWS_S3_SECRET_ACCESS_KEY in $ENV_FILE}"
+  AWS_S3_ACCESS_KEY_ID="${AWS_S3_ACCESS_KEY_ID:-admin}"
+  AWS_S3_SECRET_ACCESS_KEY="${AWS_S3_SECRET_ACCESS_KEY:-admin123}"
 }
 
 resolve_paths() {
@@ -223,7 +223,10 @@ EOF
 check_manifest() {
   local path
   path="$(s3_to_mc_path "$manifest_uri")"
-  "${compose_args[@]}" run --rm -T --entrypoint /bin/sh mc -c "
+  "${compose_args[@]}" run --rm -T \
+    -e "MINIO_ROOT_USER=$AWS_S3_ACCESS_KEY_ID" \
+    -e "MINIO_ROOT_PASSWORD=$AWS_S3_SECRET_ACCESS_KEY" \
+    --entrypoint /bin/sh mc -c "
     set -eu
     /usr/bin/mc alias set minio http://minio:9000 \"\$MINIO_ROOT_USER\" \"\$MINIO_ROOT_PASSWORD\" >/dev/null
     /usr/bin/mc ls '$path' >/dev/null
@@ -232,13 +235,13 @@ check_manifest() {
 
 check_readiness() {
   log "Checking benchmark data readiness..."
-  create_target_catalog
-  run_sql "USE $(quote_ident "$target_catalog").$(quote_ident ssb);"
+  create_target_catalog || return 1
+  run_sql "USE $(quote_ident "$target_catalog").$(quote_ident ssb);" || return 1
   local table
   for table in "${SSB_TABLES[@]}"; do
-    run_sql "USE $(quote_ident "$target_catalog").$(quote_ident ssb); SELECT * FROM $(quote_ident "$table") LIMIT 1;" >/dev/null
+    run_sql "USE $(quote_ident "$target_catalog").$(quote_ident ssb); SELECT * FROM $(quote_ident "$table") LIMIT 1;" >/dev/null || return 1
   done
-  check_manifest
+  check_manifest || return 1
   log "Benchmark data is ready: suite=$suite scale=$scale catalog=$target_catalog"
 }
 
@@ -307,7 +310,10 @@ upload_raw_files() {
   local target_path
   target_path="$(s3_to_mc_path "$raw_uri")"
   log "Uploading raw files to $raw_uri..."
-  tar -C "$raw_dir" -cf - . | "${compose_args[@]}" run --rm -T --entrypoint /bin/sh mc -c "
+  tar -C "$raw_dir" -cf - . | "${compose_args[@]}" run --rm -T \
+    -e "MINIO_ROOT_USER=$AWS_S3_ACCESS_KEY_ID" \
+    -e "MINIO_ROOT_PASSWORD=$AWS_S3_SECRET_ACCESS_KEY" \
+    --entrypoint /bin/sh mc -c "
     set -eu
     tmp_dir=/tmp/novarocks-ssb-raw-\$\$
     rm -rf \"\$tmp_dir\"
