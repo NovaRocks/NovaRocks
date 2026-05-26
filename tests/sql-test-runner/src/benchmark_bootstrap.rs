@@ -1,9 +1,10 @@
 #![allow(dead_code)]
 
+use crate::types::RunnerConfig;
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -39,6 +40,14 @@ pub fn parse_benchmark_scale_override(
 
     options.scales.insert(suite.to_string(), scale.to_string());
     Ok(())
+}
+
+pub fn parse_scale_overrides(raw_overrides: &[String]) -> Result<BTreeMap<String, String>> {
+    let mut options = BenchmarkBootstrapOptions::default();
+    for raw in raw_overrides {
+        parse_benchmark_scale_override(raw, &mut options)?;
+    }
+    Ok(options.scales)
 }
 
 pub fn benchmark_scale_for_suite(
@@ -137,8 +146,9 @@ pub fn run_benchmark_bootstrap_command(command: &mut Command) -> Result<bool> {
 #[allow(clippy::too_many_arguments)]
 pub fn ensure_benchmark_data(
     options: &BenchmarkBootstrapOptions,
+    runner_config: &RunnerConfig,
+    base_dir: &Path,
     suite: &str,
-    script_path: &Path,
     target_catalog: &str,
     mysql_host: &str,
     mysql_port: &str,
@@ -149,9 +159,10 @@ pub fn ensure_benchmark_data(
         return Ok(());
     }
 
+    let script_path = benchmark_bootstrap_script_path(runner_config, base_dir);
     let scale = benchmark_scale_for_suite(options, suite)?;
     let mut check_command = build_benchmark_bootstrap_command(
-        script_path,
+        &script_path,
         suite,
         &scale,
         target_catalog,
@@ -167,7 +178,7 @@ pub fn ensure_benchmark_data(
     }
 
     let mut bootstrap_command = build_benchmark_bootstrap_command(
-        script_path,
+        &script_path,
         suite,
         &scale,
         target_catalog,
@@ -186,7 +197,7 @@ pub fn ensure_benchmark_data(
     }
 
     let mut recheck_command = build_benchmark_bootstrap_command(
-        script_path,
+        &script_path,
         suite,
         &scale,
         target_catalog,
@@ -205,6 +216,26 @@ pub fn ensure_benchmark_data(
     }
 
     Ok(())
+}
+
+fn benchmark_bootstrap_script_path(runner_config: &RunnerConfig, base_dir: &Path) -> PathBuf {
+    runner_config
+        .values
+        .get("benchmark_bootstrap_script")
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                base_dir.join(path)
+            }
+        })
+        .unwrap_or_else(|| {
+            base_dir
+                .join("sql-tests")
+                .join("bootstrap")
+                .join("bootstrap_benchmark_data.sh")
+        })
 }
 
 fn shell_quote(value: &OsStr) -> String {
@@ -246,6 +277,17 @@ mod tests {
             benchmark_scale_for_suite(&options, "tpc-ds").unwrap(),
             "1GB"
         );
+    }
+
+    #[test]
+    fn parses_cli_scale_override_list() {
+        let overrides = vec!["ssb=10".to_string(), "tpc-ds=100GB".to_string()];
+
+        let scales = parse_scale_overrides(&overrides).unwrap();
+
+        assert_eq!(scales.get("ssb").map(String::as_str), Some("10"));
+        assert_eq!(scales.get("tpc-ds").map(String::as_str), Some("100GB"));
+        assert_eq!(scales.get("tpc-h"), None);
     }
 
     #[test]

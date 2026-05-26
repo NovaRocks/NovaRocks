@@ -7,6 +7,9 @@ mod session;
 mod shell;
 mod types;
 
+use crate::benchmark_bootstrap::{
+    BenchmarkBootstrapOptions, ensure_benchmark_data, parse_scale_overrides,
+};
 use crate::config::{
     build_suite_configs, case_auto_db_name, env_optional, env_or_default, list_sql_files,
     load_runner_config, placeholder_variables, resolve_config_path, resolve_path,
@@ -160,6 +163,15 @@ struct Cli {
 
     #[arg(long, action = ArgAction::SetTrue)]
     fail_fast: bool,
+
+    #[arg(long, action = ArgAction::SetTrue)]
+    no_auto_bootstrap_benchmark_data: bool,
+
+    #[arg(long = "benchmark-scale", value_name = "BENCHMARK_SCALE", action = ArgAction::Append)]
+    benchmark_scale: Vec<String>,
+
+    #[arg(long, action = ArgAction::SetTrue)]
+    benchmark_bootstrap_rebuild: bool,
 
     /// Number of parallel test workers.  0 = auto-detect (number of logical CPUs).
     /// 1 = serial execution (legacy behaviour).
@@ -1678,6 +1690,12 @@ fn main() -> Result<()> {
         }
     }
 
+    let benchmark_bootstrap_options = BenchmarkBootstrapOptions {
+        enabled: !cli.no_auto_bootstrap_benchmark_data,
+        rebuild: cli.benchmark_bootstrap_rebuild,
+        scales: parse_scale_overrides(&cli.benchmark_scale)?,
+    };
+
     // Resolve global connection params
     let reference_required = cli.mode == Mode::Diff
         || (cli.mode == Mode::Record && cli.record_from == RecordFrom::Reference);
@@ -1811,7 +1829,7 @@ fn main() -> Result<()> {
             port: target_port.clone(),
             user: target_user.clone(),
             password: target_password.clone(),
-            catalog: Some(target_catalog_name),
+            catalog: Some(target_catalog_name.clone()),
             db: if target_db_default.is_empty() {
                 None
             } else {
@@ -1938,6 +1956,21 @@ fn main() -> Result<()> {
                 fs::create_dir_all(dir)
                     .with_context(|| format!("create result_dir failed: {}", dir.display()))?;
             }
+        }
+
+        if !cli.dry_run {
+            ensure_benchmark_data(
+                &benchmark_bootstrap_options,
+                &runner_config,
+                &base_dir,
+                &suite.name,
+                &target_catalog_name,
+                &target_host,
+                &target_port,
+                &target_user,
+                target_password.as_deref(),
+            )
+            .with_context(|| format!("failed to prepare benchmark data for {}", suite.name))?;
         }
 
         // Print suite header
@@ -2193,6 +2226,17 @@ mod tests {
             std::process::id(),
             nanos
         ))
+    }
+
+    #[test]
+    fn help_includes_benchmark_bootstrap_options() {
+        let help = <crate::Cli as clap::CommandFactory>::command()
+            .render_long_help()
+            .to_string();
+
+        assert!(help.contains("--no-auto-bootstrap-benchmark-data"));
+        assert!(help.contains("--benchmark-scale <BENCHMARK_SCALE>"));
+        assert!(help.contains("--benchmark-bootstrap-rebuild"));
     }
 
     #[test]
