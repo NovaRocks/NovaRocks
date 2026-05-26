@@ -16,6 +16,7 @@ use arrow::array::{
     TimestampMicrosecondArray,
 };
 use arrow::datatypes::{DataType, TimeUnit};
+use std::collections::BTreeMap;
 
 pub(crate) const STATE_VERSION_V1: u8 = 0x01;
 const CANONICAL_F32_NAN_BITS: u32 = 0x7FC0_0000;
@@ -94,6 +95,85 @@ pub(crate) use decode_sum_decimal128 as decode_avg_decimal128;
 pub(crate) use decode_sum_int64 as decode_avg_int64;
 pub(crate) use encode_sum_decimal128 as encode_avg_decimal128;
 pub(crate) use encode_sum_int64 as encode_avg_int64;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MultisetEntry {
+    pub(crate) key_bytes: Vec<u8>,
+    pub(crate) count: i64,
+}
+
+/// Serializes entries in supplied order; callers that need persistent canonical
+/// state should pass normalized/sorted entries, typically from `union_multisets`.
+pub(crate) fn encode_multiset(entries: &[MultisetEntry]) -> Vec<u8> {
+    if entries.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    out.push(STATE_VERSION_V1);
+    write_uleb128(&mut out, entries.len() as u64);
+    for entry in entries {
+        out.extend_from_slice(&entry.key_bytes);
+        write_sleb128(&mut out, entry.count);
+    }
+    out
+}
+
+pub(crate) fn decode_multiset_with_key_type(
+    bytes: &[u8],
+    key_dtype: &DataType,
+) -> Result<Vec<MultisetEntry>, String> {
+    if is_empty_state(bytes) {
+        return Ok(Vec::new());
+    }
+    if bytes.first().copied() != Some(STATE_VERSION_V1) {
+        return Err("state_codec: multiset unsupported version byte".to_string());
+    }
+
+    let mut cursor = &bytes[1..];
+    let num_entries = read_uleb128(&mut cursor)?;
+    if num_entries == 0 {
+        return Err("state_codec: multiset zero entry count must use empty state".to_string());
+    }
+    let mut entries = Vec::new();
+    for _ in 0..num_entries {
+        let before_key = cursor;
+        read_key(&mut cursor, key_dtype)?;
+        let key_len = before_key.len() - cursor.len();
+        let key_bytes = before_key[..key_len].to_vec();
+        let count = read_sleb128(&mut cursor)?;
+        entries.push(MultisetEntry { key_bytes, count });
+    }
+
+    if !cursor.is_empty() {
+        return Err("state_codec: multiset trailing bytes after entries".to_string());
+    }
+    Ok(entries)
+}
+
+#[cfg(test)]
+pub(crate) fn decode_multiset(bytes: &[u8]) -> Result<Vec<MultisetEntry>, String> {
+    decode_multiset_with_key_type(bytes, &DataType::Int64)
+}
+
+pub(crate) fn union_multisets(
+    a: &[MultisetEntry],
+    b: &[MultisetEntry],
+) -> Result<Vec<MultisetEntry>, String> {
+    let mut counts = BTreeMap::<Vec<u8>, i64>::new();
+    for entry in a.iter().chain(b.iter()) {
+        let current = counts.entry(entry.key_bytes.clone()).or_default();
+        *current = current.checked_add(entry.count).ok_or_else(|| {
+            "state_codec: multiset count overflow while unioning entries".to_string()
+        })?;
+    }
+
+    Ok(counts
+        .into_iter()
+        .filter_map(|(key_bytes, count)| (count > 0).then_some(MultisetEntry { key_bytes, count }))
+        // BTreeMap iteration gives storage-canonical raw-byte order only; it is not SQL value order.
+        .collect())
+}
 
 pub(crate) fn write_uleb128(out: &mut Vec<u8>, mut value: u64) {
     loop {
@@ -857,5 +937,161 @@ mod key_tests {
         let mut cursor: &[u8] = &[];
         let err = read_key(&mut cursor, &DataType::Binary).unwrap_err();
         assert!(err.contains("unsupported type"));
+    }
+}
+
+#[cfg(test)]
+mod multiset_tests {
+    use super::*;
+
+    fn entry_int(k: i64, c: i64) -> MultisetEntry {
+        MultisetEntry {
+            key_bytes: k.to_le_bytes().to_vec(),
+            count: c,
+        }
+    }
+
+    #[test]
+    fn multiset_empty_round_trip() {
+        let bytes = encode_multiset(&[]);
+        assert_eq!(bytes, Vec::<u8>::new());
+        assert_eq!(
+            decode_multiset(&bytes).unwrap(),
+            Vec::<MultisetEntry>::new()
+        );
+    }
+
+    #[test]
+    fn multiset_single_entry_round_trip() {
+        let entries = vec![entry_int(42, 3)];
+        let bytes = encode_multiset(&entries);
+        assert_eq!(bytes[0], STATE_VERSION_V1);
+        assert_eq!(decode_multiset(&bytes).unwrap(), entries);
+    }
+
+    #[test]
+    fn multiset_union_sums_counts_at_shared_keys() {
+        let a = vec![entry_int(1, 2), entry_int(3, 1)];
+        let b = vec![entry_int(1, 1), entry_int(2, 5)];
+        let merged = union_multisets(&a, &b).unwrap();
+        assert_eq!(
+            merged,
+            vec![entry_int(1, 3), entry_int(2, 5), entry_int(3, 1)]
+        );
+    }
+
+    #[test]
+    fn multiset_union_drops_canceled_entries() {
+        let a = vec![entry_int(1, 2)];
+        let b = vec![entry_int(1, -2), entry_int(2, 4)];
+        let merged = union_multisets(&a, &b).unwrap();
+        assert_eq!(merged, vec![entry_int(2, 4)]);
+    }
+
+    #[test]
+    fn multiset_union_uses_storage_canonical_raw_byte_order() {
+        let a = vec![entry_int(5, 1), entry_int(1, 1)];
+        let b = vec![entry_int(3, 1)];
+        let merged = union_multisets(&a, &b).unwrap();
+        // For positive little-endian i64 values this happens to match numeric order,
+        // but this is storage canonical raw-byte order, not a SQL value-order contract.
+        let keys: Vec<i64> = merged
+            .iter()
+            .map(|e| i64::from_le_bytes(e.key_bytes[..8].try_into().unwrap()))
+            .collect();
+        assert_eq!(keys, vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn multiset_union_errors_on_count_overflow() {
+        let a = vec![entry_int(1, i64::MAX)];
+        let b = vec![entry_int(1, 1)];
+        assert!(
+            union_multisets(&a, &b)
+                .unwrap_err()
+                .contains("count overflow")
+        );
+    }
+
+    #[test]
+    fn decode_multiset_with_key_type_rejects_wrong_version() {
+        let mut bytes = encode_multiset(&[entry_int(1, 1)]);
+        bytes[0] = 0x02;
+        assert!(
+            decode_multiset_with_key_type(&bytes, &DataType::Int64)
+                .unwrap_err()
+                .contains("version")
+        );
+    }
+
+    #[test]
+    fn decode_multiset_rejects_non_canonical_empty_encoding() {
+        let bytes = vec![STATE_VERSION_V1, 0x00];
+        assert!(
+            decode_multiset_with_key_type(&bytes, &DataType::Int64)
+                .unwrap_err()
+                .contains("zero entry count must use empty state")
+        );
+    }
+
+    #[test]
+    fn decode_multiset_rejects_huge_count_without_preallocating() {
+        let mut bytes = vec![STATE_VERSION_V1];
+        write_uleb128(&mut bytes, u64::MAX);
+        assert!(decode_multiset_with_key_type(&bytes, &DataType::Int64).is_err());
+    }
+
+    #[test]
+    fn decode_multiset_with_key_type_rejects_trailing_bytes() {
+        let mut bytes = encode_multiset(&[entry_int(1, 1)]);
+        bytes.push(0xAA);
+        assert!(
+            decode_multiset_with_key_type(&bytes, &DataType::Int64)
+                .unwrap_err()
+                .contains("trailing")
+        );
+    }
+
+    #[test]
+    fn decode_multiset_with_key_type_rejects_non_canonical_key_bytes() {
+        let mut bool_bytes = vec![STATE_VERSION_V1];
+        write_uleb128(&mut bool_bytes, 1);
+        bool_bytes.push(2);
+        write_sleb128(&mut bool_bytes, 1);
+        assert!(
+            decode_multiset_with_key_type(&bool_bytes, &DataType::Boolean)
+                .unwrap_err()
+                .contains("non-canonical")
+        );
+
+        let mut float_bytes = vec![STATE_VERSION_V1];
+        write_uleb128(&mut float_bytes, 1);
+        float_bytes.extend_from_slice(&(-0.0_f64).to_bits().to_le_bytes());
+        write_sleb128(&mut float_bytes, 1);
+        assert!(
+            decode_multiset_with_key_type(&float_bytes, &DataType::Float64)
+                .unwrap_err()
+                .contains("non-canonical")
+        );
+    }
+
+    #[test]
+    fn decode_multiset_with_key_type_rejects_non_canonical_sleb128_counts() {
+        let mut bytes = vec![STATE_VERSION_V1];
+        write_uleb128(&mut bytes, 1);
+        bytes.extend_from_slice(&1i64.to_le_bytes());
+        bytes.extend_from_slice(&[0x80, 0x00]);
+        assert!(
+            decode_multiset_with_key_type(&bytes, &DataType::Int64)
+                .unwrap_err()
+                .contains("SLEB128")
+        );
+    }
+
+    #[test]
+    fn encode_multiset_preserves_supplied_entry_order() {
+        let entries = vec![entry_int(5, 1), entry_int(1, 2), entry_int(3, 4)];
+        let bytes = encode_multiset(&entries);
+        assert_eq!(decode_multiset(&bytes).unwrap(), entries);
     }
 }
