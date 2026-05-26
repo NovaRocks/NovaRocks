@@ -354,14 +354,16 @@ fn add_int_delta(
     context: &str,
 ) -> Result<(), String> {
     unsafe {
-        (*state).row_count = (*state)
+        let next_row_count = (*state)
             .row_count
             .checked_add(row_count_delta)
             .ok_or_else(|| format!("{context} overflow while adding row_count delta"))?;
-        (*state).sum = (*state)
+        let next_sum = (*state)
             .sum
             .checked_add(sum_delta)
             .ok_or_else(|| format!("{context} overflow while adding sum delta"))?;
+        (*state).row_count = next_row_count;
+        (*state).sum = next_sum;
     }
     Ok(())
 }
@@ -373,14 +375,16 @@ fn add_decimal_delta(
     context: &str,
 ) -> Result<(), String> {
     unsafe {
-        (*state).row_count = (*state)
+        let next_row_count = (*state)
             .row_count
             .checked_add(row_count_delta)
             .ok_or_else(|| format!("{context} overflow while adding row_count delta"))?;
-        (*state).sum = (*state)
+        let next_sum = (*state)
             .sum
             .checked_add(sum_delta)
             .ok_or_else(|| format!("{context} overflow while adding sum delta"))?;
+        (*state).row_count = next_row_count;
+        (*state).sum = next_sum;
     }
     Ok(())
 }
@@ -768,6 +772,15 @@ mod tests {
             super::super::super::merge_batch(&self.spec, 0, &state_ptrs, &view).unwrap();
         }
 
+        fn try_merge(&mut self, input: ArrayRef) -> Result<(), String> {
+            let rows = input.len();
+            let input_slot = Some(input);
+            let view = super::super::super::build_merge_view(&self.spec, &input_slot).unwrap();
+            let ptr = self.ptr();
+            let state_ptrs = vec![ptr; rows];
+            super::super::super::merge_batch(&self.spec, 0, &state_ptrs, &view)
+        }
+
         fn finalize(&mut self) -> ArrayRef {
             let ptr = self.ptr();
             super::super::super::build_array(&self.spec, 0, &[ptr], false).unwrap()
@@ -924,6 +937,24 @@ mod tests {
     }
 
     #[test]
+    fn sum_state_layouts_match_state_structs() {
+        assert_eq!(
+            SumStateAgg.state_layout_for(&AggKind::SumStateInt64),
+            (
+                std::mem::size_of::<SumInt64State>(),
+                std::mem::align_of::<SumInt64State>()
+            )
+        );
+        assert_eq!(
+            SumStateAgg.state_layout_for(&AggKind::SumStateDecimal128),
+            (
+                std::mem::size_of::<SumDecimal128State>(),
+                std::mem::align_of::<SumDecimal128State>()
+            )
+        );
+    }
+
+    #[test]
     fn sum_state_signed_decimal_insert_delete() {
         let mut cell = StateCell::new(build_signed_spec(&signed_type(DataType::Decimal128(18, 6))));
         let input = signed_decimal_input(
@@ -980,6 +1011,21 @@ mod tests {
         cell.merge(input);
 
         assert_eq!(final_int_state(&cell.finalize()), (1, 25));
+    }
+
+    #[test]
+    fn sum_state_int_overflow_does_not_partially_mutate_state() {
+        let mut cell = StateCell::new(build_spec(&DataType::Int64));
+        let near_max = encode_sum_int64(1, i64::MAX - 1);
+        cell.merge(Arc::new(BinaryArray::from(vec![Some(&near_max[..])])) as ArrayRef);
+
+        let input = Arc::new(Int64Array::from(vec![Some(2)])) as ArrayRef;
+        let input_slot = Some(input);
+        let view = super::super::super::build_input_view(&cell.spec, &input_slot).unwrap();
+        let err = cell.try_update(view, 1).unwrap_err();
+
+        assert!(err.contains("sum_state overflow while adding sum delta"));
+        assert_eq!(final_int_state(&cell.finalize()), (1, i64::MAX - 1));
     }
 
     #[test]
@@ -1113,6 +1159,25 @@ mod tests {
         cell.merge(input);
 
         assert_eq!(final_decimal_state(&cell.finalize()), (0, 750_000));
+    }
+
+    #[test]
+    fn sum_state_decimal_overflow_does_not_partially_mutate_state() {
+        let mut cell = StateCell::new(build_spec(&DataType::Decimal128(18, 6)));
+        let near_max = encode_sum_decimal128(1, i128::MAX - 1);
+        cell.merge(Arc::new(BinaryArray::from(vec![Some(&near_max[..])])) as ArrayRef);
+
+        let input = Arc::new(
+            Decimal128Array::from(vec![Some(2_i128)])
+                .with_precision_and_scale(18, 6)
+                .unwrap(),
+        ) as ArrayRef;
+        let input_slot = Some(input);
+        let view = super::super::super::build_input_view(&cell.spec, &input_slot).unwrap();
+        let err = cell.try_update(view, 1).unwrap_err();
+
+        assert!(err.contains("sum_state overflow while adding sum delta"));
+        assert_eq!(final_decimal_state(&cell.finalize()), (1, i128::MAX - 1));
     }
 
     #[test]
