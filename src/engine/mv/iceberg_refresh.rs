@@ -1750,7 +1750,6 @@ fn refresh_single_aggregate_iceberg_mv(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn incremental_refresh_iceberg_aggregate_mv(
     state: &Arc<StandaloneState>,
     ctx: &IcebergMvRefreshContext,
