@@ -523,12 +523,29 @@ pub(super) fn expr_display_name(expr: &sqlast::Expr) -> String {
         // the SELECT modifier and `(col)` is a Nested expression.
         sqlast::Expr::Nested(inner) => expr_display_name(inner),
         sqlast::Expr::Value(value) => format_literal_display_name(&value.value),
-        sqlast::Expr::CompoundIdentifier(parts) if !parts.is_empty() => parts
-            .iter()
-            .map(|ident| ident.value.clone())
-            .collect::<Vec<_>>()
-            .join("."),
+        // MySQL/StarRocks convention: a `t.col` column reference (or
+        // `db.tbl.col` and deeper qualifications, and `struct_col.field`
+        // struct subfield access) displays as just the trailing identifier
+        // in the result header. The qualifier chain only exists for
+        // disambiguation during name resolution.
+        sqlast::Expr::CompoundIdentifier(parts) if !parts.is_empty() => {
+            parts.last().unwrap().value.clone()
+        }
         sqlast::Expr::CompoundFieldAccess { root, access_chain } => {
+            // Determine whether the *last* access is a Dot, in which case the
+            // header is just that trailing field name. For Subscript accesses
+            // we still need the full path (e.g. `m['k']`, `arr[0]`).
+            let last_dot_is_terminal = matches!(
+                access_chain.last(),
+                Some(sqlast::AccessExpr::Dot(_))
+            ) && access_chain
+                .iter()
+                .all(|a| matches!(a, sqlast::AccessExpr::Dot(_)));
+            if last_dot_is_terminal
+                && let Some(sqlast::AccessExpr::Dot(last)) = access_chain.last()
+            {
+                return expr_display_name_preserve_path(last);
+            }
             let mut out = expr_display_name_preserve_path(root);
             for access in access_chain {
                 match access {
@@ -972,6 +989,21 @@ fn format_function_display_name(function: &sqlast::Function) -> String {
     }
     if canonical_name == "map" {
         return format_map_display_name(function);
+    }
+    // `element_at(container, key)` is rendered as `container[key]` to match
+    // the subscript-syntax variant — the two forms are semantically identical
+    // and downstream consumers (sql-tests, MySQL clients reading column
+    // headers) expect a single canonical name regardless of which spelling
+    // the user wrote.
+    if canonical_name == "element_at"
+        && let sqlast::FunctionArguments::List(list) = &function.args
+        && list.args.len() == 2
+        && matches!(list.args[0], sqlast::FunctionArg::Unnamed(_))
+        && matches!(list.args[1], sqlast::FunctionArg::Unnamed(_))
+    {
+        let container = format_function_arg_display_name(&list.args[0]);
+        let key = format_function_arg_display_name(&list.args[1]);
+        return format!("{container}[{key}]");
     }
     let formatted_args =
         format_function_arguments_with_ignore_nulls_after_first(&function.args, &canonical_name)

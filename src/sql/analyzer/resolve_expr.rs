@@ -355,6 +355,35 @@ impl<'a> super::AnalyzerContext<'a> {
             }
 
             sqlast::Expr::CompoundFieldAccess { root, access_chain } => {
+                // When the access chain starts with `Identifier root` followed
+                // by one or more `Dot(Identifier)` accesses, those leading
+                // pieces may form a multi-segment column reference (alias.col,
+                // db.tbl.col, alias.col.field, …). Hand them to
+                // `analyze_compound_identifier`, which knows the alias/db/struct
+                // resolution rules, and only let the remaining (Subscript /
+                // non-trivial Dot) accesses go through the per-access path.
+                if let sqlast::Expr::Identifier(root_ident) = root.as_ref() {
+                    let mut ident_parts: Vec<sqlast::Ident> = vec![root_ident.clone()];
+                    let mut chain_start = 0;
+                    for (idx, access) in access_chain.iter().enumerate() {
+                        match access {
+                            sqlast::AccessExpr::Dot(sqlast::Expr::Identifier(ident)) => {
+                                ident_parts.push(ident.clone());
+                                chain_start = idx + 1;
+                            }
+                            _ => break,
+                        }
+                    }
+                    if ident_parts.len() >= 2 {
+                        let mut current =
+                            self.analyze_compound_identifier(&ident_parts, scope)?;
+                        for access in &access_chain[chain_start..] {
+                            current =
+                                self.analyze_compound_field_access(current, access, scope)?;
+                        }
+                        return Ok(current);
+                    }
+                }
                 let mut current = self.analyze_expr(root, scope)?;
                 for access in access_chain {
                     current = self.analyze_compound_field_access(current, access, scope)?;
@@ -715,36 +744,20 @@ impl<'a> super::AnalyzerContext<'a> {
         parts: &[sqlast::Ident],
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, String> {
-        if parts.len() == 2 {
-            let qualifier = &parts[0].value;
-            let col_name = &parts[1].value;
-            if let Ok((column_id, data_type, nullable)) = scope.resolve(Some(qualifier), col_name) {
-                return Ok(TypedExpr {
-                    kind: ExprKind::ColumnRef {
-                        column_id,
-                        qualifier: Some(qualifier.to_lowercase()),
-                        column: col_name.to_lowercase(),
-                    },
-                    data_type,
-                    nullable,
-                });
-            }
-        } else if parts.len() == 3 {
-            let qualifier = &parts[1].value;
-            let col_name = &parts[2].value;
-            if let Ok((column_id, data_type, nullable)) = scope.resolve(Some(qualifier), col_name) {
-                return Ok(TypedExpr {
-                    kind: ExprKind::ColumnRef {
-                        column_id,
-                        qualifier: Some(qualifier.to_lowercase()),
-                        column: col_name.to_lowercase(),
-                    },
-                    data_type,
-                    nullable,
-                });
-            }
-        }
-
+        // A compound identifier `a.b.c.d...` can mean several different things
+        // depending on schema and aliases. Try them in order of specificity:
+        //
+        //   1. `qual.col` (+ optional `.field.field…` struct chain) — the most
+        //      common form. The qualifier may be a table name, a FROM-clause
+        //      alias, or a CTE alias.
+        //   2. `db.tbl.col` (+ optional struct chain) — fully qualified
+        //      reference where the database prefix is ignored for resolution
+        //      because the analyzer has already attached the column to a
+        //      specific table.
+        //   3. `col.field.field…` — implicit qualifier, the leading identifier
+        //      *is* the column and the rest walk into a STRUCT.
+        //
+        // Lambda parameters short-circuit before column lookup.
         let base_name = &parts[0].value;
         if let Some(param) = scope.resolve_lambda_param(base_name) {
             let mut current = TypedExpr {
@@ -760,16 +773,62 @@ impl<'a> super::AnalyzerContext<'a> {
             }
             return Ok(current);
         }
-        let (column_id, data_type, nullable) = scope.resolve(None, base_name)?;
-        let mut current = TypedExpr {
+
+        let build_column_ref = |column_id, data_type, nullable, qualifier: Option<String>, column: &str| TypedExpr {
             kind: ExprKind::ColumnRef {
                 column_id,
-                qualifier: None,
-                column: base_name.to_lowercase(),
+                qualifier,
+                column: column.to_lowercase(),
             },
             data_type,
             nullable,
         };
+
+        // Form 1: parts[0] is a qualifier, parts[1] is a column, parts[2..] are
+        // struct subfields. Supports `t.col`, `t.col.field`, `t.col.f1.f2`, …
+        if parts.len() >= 2 {
+            let qualifier = &parts[0].value;
+            let col_name = &parts[1].value;
+            if let Ok((column_id, data_type, nullable)) = scope.resolve(Some(qualifier), col_name) {
+                let mut current = build_column_ref(
+                    column_id,
+                    data_type,
+                    nullable,
+                    Some(qualifier.to_lowercase()),
+                    col_name,
+                );
+                for field in &parts[2..] {
+                    current = self.analyze_struct_field_access(current, field.value.clone())?;
+                }
+                return Ok(current);
+            }
+        }
+
+        // Form 2: `db.tbl.col[.field…]`. Drop the database prefix and resolve
+        // the remaining `tbl.col[.field…]` as form 1.
+        if parts.len() >= 3 {
+            let qualifier = &parts[1].value;
+            let col_name = &parts[2].value;
+            if let Ok((column_id, data_type, nullable)) = scope.resolve(Some(qualifier), col_name) {
+                let mut current = build_column_ref(
+                    column_id,
+                    data_type,
+                    nullable,
+                    Some(qualifier.to_lowercase()),
+                    col_name,
+                );
+                for field in &parts[3..] {
+                    current = self.analyze_struct_field_access(current, field.value.clone())?;
+                }
+                return Ok(current);
+            }
+        }
+
+        // Form 3: leading identifier is the column itself, the rest walk a
+        // STRUCT. Falls back to producing a `Column 'X' cannot be resolved`
+        // error from `scope.resolve` if even this fails.
+        let (column_id, data_type, nullable) = scope.resolve(None, base_name)?;
+        let mut current = build_column_ref(column_id, data_type, nullable, None, base_name);
         for field in &parts[1..] {
             current = self.analyze_struct_field_access(current, field.value.clone())?;
         }
@@ -787,13 +846,20 @@ impl<'a> super::AnalyzerContext<'a> {
                 base.data_type
             ));
         };
+        // STRUCT field names are case-insensitive for resolution (Iceberg and
+        // StarRocks both treat them as identifiers). The literal we pass to
+        // `__struct_subfield` must be the *canonical* name from the schema so
+        // the downstream evaluator (which does an exact-byte match against
+        // `StructArray::fields()`) succeeds regardless of how the user spelled
+        // it in the SQL.
         let field = fields
             .iter()
-            .find(|field| field.name() == &field_name)
+            .find(|field| field.name().eq_ignore_ascii_case(&field_name))
             .ok_or_else(|| format!("struct field '{}' does not exist", field_name))?;
         let field_type = field.data_type().clone();
+        let canonical_field_name = field.name().clone();
         let field_name_expr = TypedExpr {
-            kind: ExprKind::Literal(LiteralValue::String(field_name)),
+            kind: ExprKind::Literal(LiteralValue::String(canonical_field_name)),
             data_type: DataType::Utf8,
             nullable: false,
         };
@@ -1812,13 +1878,17 @@ impl<'a> super::AnalyzerContext<'a> {
                 base.data_type
             ));
         };
+        // Same case-insensitive resolution + canonical name forwarding as the
+        // plain struct subfield path above; the array-of-struct variant
+        // (`array_sortby(...).field`) needs to match identically.
         let field = fields
             .iter()
-            .find(|field| field.name() == &field_name)
+            .find(|field| field.name().eq_ignore_ascii_case(&field_name))
             .ok_or_else(|| format!("struct field '{}' does not exist", field_name))?;
         let field_type = field.data_type().clone();
+        let canonical_field_name = field.name().clone();
         let field_name_expr = TypedExpr {
-            kind: ExprKind::Literal(LiteralValue::String(field_name)),
+            kind: ExprKind::Literal(LiteralValue::String(canonical_field_name)),
             data_type: DataType::Utf8,
             nullable: false,
         };

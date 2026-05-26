@@ -1774,6 +1774,16 @@ fn cast_with_special_rules_with_field_schema(
     if array.data_type() == target_type {
         return Ok(array.clone());
     }
+    // Cast-to-Null: produce an all-NULL array. Arrow's stock kernel rejects
+    // most `<T> → Null` casts even though it is semantically well-defined —
+    // the Null type only has the NULL value, so every input row collapses to
+    // NULL. This shows up in queries like `map{}['a']`, where the empty map
+    // literal is typed `MAP<Null, Null>` and the key argument must be cast to
+    // the Null key type before lookup (the lookup itself trivially returns
+    // NULL).
+    if target_type == &DataType::Null {
+        return Ok(new_null_array(&DataType::Null, array.len()));
+    }
     match (array.data_type(), target_type) {
         (DataType::Utf8, DataType::Date32) => {
             let arr = array
