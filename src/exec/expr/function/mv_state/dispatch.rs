@@ -55,6 +55,18 @@ pub fn eval_mv_state_function(
     match canonical {
         "count_state_union" => super::count::eval_count_state_union(arena, expr, args, chunk),
         "count_state_visible" => super::count::eval_count_state_visible(arena, expr, args, chunk),
+        "bool_or_state_union" => {
+            super::bool_or_and::eval_bool_or_state_union(arena, expr, args, chunk)
+        }
+        "bool_or_state_visible" => {
+            super::bool_or_and::eval_bool_or_state_visible(arena, expr, args, chunk)
+        }
+        "bool_and_state_union" => {
+            super::bool_or_and::eval_bool_and_state_union(arena, expr, args, chunk)
+        }
+        "bool_and_state_visible" => {
+            super::bool_or_and::eval_bool_and_state_visible(arena, expr, args, chunk)
+        }
         other => Err(format!("unsupported mv_state function: {}", other)),
     }
 }
@@ -62,6 +74,10 @@ pub fn eval_mv_state_function(
 static MV_STATE_FUNCTIONS: &[(&str, &str)] = &[
     ("count_state_union", "count_state_union"),
     ("count_state_visible", "count_state_visible"),
+    ("bool_or_state_union", "bool_or_state_union"),
+    ("bool_or_state_visible", "bool_or_state_visible"),
+    ("bool_and_state_union", "bool_and_state_union"),
+    ("bool_and_state_visible", "bool_and_state_visible"),
 ];
 
 static MV_STATE_METADATA: &[FunctionMeta] = &[
@@ -72,6 +88,26 @@ static MV_STATE_METADATA: &[FunctionMeta] = &[
     },
     FunctionMeta {
         name: "count_state_visible",
+        min_args: 1,
+        max_args: 1,
+    },
+    FunctionMeta {
+        name: "bool_or_state_union",
+        min_args: 2,
+        max_args: 2,
+    },
+    FunctionMeta {
+        name: "bool_or_state_visible",
+        min_args: 1,
+        max_args: 1,
+    },
+    FunctionMeta {
+        name: "bool_and_state_union",
+        min_args: 2,
+        max_args: 2,
+    },
+    FunctionMeta {
+        name: "bool_and_state_visible",
         min_args: 1,
         max_args: 1,
     },

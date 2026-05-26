@@ -154,8 +154,8 @@ fn validate_scalar_function_call_impl(
     if matches!(name, "array_contains_all" | "array_contains_seq") {
         validate_array_pair_arguments(name, arg_types)?;
     }
-    if matches!(name, "count_state_union" | "count_state_visible") {
-        validate_count_state_scalar_function(name, arg_types)?;
+    if is_mv_state_scalar_function(name) {
+        validate_mv_state_scalar_function(name, arg_types)?;
     }
     let expected_arity = match name {
         "cardinality" | "array_length" | "map_size" | "map_keys" | "map_values" | "array_min"
@@ -172,10 +172,22 @@ fn validate_scalar_function_call_impl(
     Ok(())
 }
 
-fn validate_count_state_scalar_function(name: &str, arg_types: &[DataType]) -> Result<(), String> {
+fn is_mv_state_scalar_function(name: &str) -> bool {
+    matches!(
+        name,
+        "count_state_union"
+            | "count_state_visible"
+            | "bool_or_state_union"
+            | "bool_or_state_visible"
+            | "bool_and_state_union"
+            | "bool_and_state_visible"
+    )
+}
+
+fn validate_mv_state_scalar_function(name: &str, arg_types: &[DataType]) -> Result<(), String> {
     let expected = match name {
-        "count_state_union" => 2,
-        "count_state_visible" => 1,
+        "count_state_union" | "bool_or_state_union" | "bool_and_state_union" => 2,
+        "count_state_visible" | "bool_or_state_visible" | "bool_and_state_visible" => 1,
         _ => return Ok(()),
     };
     if arg_types.len() != expected
@@ -900,8 +912,9 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         | "bitmap_to_base64" => DataType::Binary,
         "bitmap_contains" | "bitmap_has_any" => DataType::Boolean,
         "bitmap_min" | "bitmap_max" | "bitmap_count" | "hll_cardinality" => DataType::Int64,
-        "count_state_union" => DataType::Binary,
+        "count_state_union" | "bool_or_state_union" | "bool_and_state_union" => DataType::Binary,
         "count_state_visible" => DataType::Int64,
+        "bool_or_state_visible" | "bool_and_state_visible" => DataType::Boolean,
         "bitmap_to_array" => DataType::List(Arc::new(arrow::datatypes::Field::new(
             "item",
             DataType::Int64,
@@ -1536,6 +1549,33 @@ mod tests {
         assert_eq!(
             err,
             "No matching function with signature: count_state_union(varchar(255))."
+        );
+    }
+
+    #[test]
+    fn bool_state_scalar_functions_require_binary_inputs() {
+        for name in ["bool_or_state_union", "bool_and_state_union"] {
+            assert_eq!(
+                infer_scalar_return_type(name, &[DataType::Binary, DataType::Binary]),
+                DataType::Binary
+            );
+            validate_scalar_function_call(name, &[DataType::LargeBinary, DataType::Binary])
+                .unwrap();
+        }
+
+        for name in ["bool_or_state_visible", "bool_and_state_visible"] {
+            assert_eq!(
+                infer_scalar_return_type(name, &[DataType::LargeBinary]),
+                DataType::Boolean
+            );
+            validate_scalar_function_call(name, &[DataType::Binary]).unwrap();
+        }
+
+        let err = validate_scalar_function_call("bool_or_state_union", &[DataType::Utf8])
+            .expect_err("bool_or_state_union should reject non-binary arity/type");
+        assert_eq!(
+            err,
+            "No matching function with signature: bool_or_state_union(varchar(255))."
         );
     }
 

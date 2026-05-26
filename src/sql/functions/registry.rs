@@ -1152,6 +1152,20 @@ fn register_mv_state_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "count_state_visible",
         Signature::new(vec![TypeSpec::Binary], TypeSpec::Int64),
     );
+    for name in ["bool_or_state_union", "bool_and_state_union"] {
+        add(
+            m,
+            name,
+            Signature::new(vec![TypeSpec::Binary, TypeSpec::Binary], TypeSpec::Binary),
+        );
+    }
+    for name in ["bool_or_state_visible", "bool_and_state_visible"] {
+        add(
+            m,
+            name,
+            Signature::new(vec![TypeSpec::Binary], TypeSpec::Boolean),
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
