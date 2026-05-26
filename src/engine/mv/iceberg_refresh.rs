@@ -1657,18 +1657,22 @@ fn refresh_single_aggregate_iceberg_mv(
         }
     };
     let mv_definition = &effective_definition;
+    // Canonicalize once; reused for both reclassification (rebind branch) and
+    // ctx construction below.
+    let canonical_select_query = canonicalize_iceberg_mv_select_query(
+        &parse_mv_select_query(&mv_definition.select_sql)?,
+        current_catalog,
+        current_database,
+    );
     // When rebind rewrote stored SELECT, the original `aggregate_shape`
     // captured by `plan_iceberg_aggregate_mv_refresh` still references the
     // pre-rebind base column names. Reclassify against the rewritten SQL so
     // downstream signed-delta/full-state rewrites consistently use the
     // current base column names.
     let reclassified_aggregate_shape = if rebind_happened {
-        let new_query = parse_mv_select_query(&mv_definition.select_sql)?;
-        let canonical_new =
-            canonicalize_iceberg_mv_select_query(&new_query, current_catalog, current_database);
         let new_shape =
             crate::connector::starrocks::managed::mv_shape::classify_incremental_mv_query(
-                &canonical_new,
+                &canonical_select_query,
             )?;
         aggregate_shape_for_layout(&new_shape).ok_or_else(|| {
             "iceberg aggregate MV rebind broke aggregate classification".to_string()
@@ -1677,12 +1681,6 @@ fn refresh_single_aggregate_iceberg_mv(
         aggregate_shape.clone()
     };
     let aggregate_shape = &reclassified_aggregate_shape;
-
-    let canonical_select_query = canonicalize_iceberg_mv_select_query(
-        &parse_mv_select_query(&mv_definition.select_sql)?,
-        current_catalog,
-        current_database,
-    );
     let ctx = IcebergMvRefreshContext::new(
         target.clone(),
         mv_definition.mv_id,
@@ -2397,16 +2395,20 @@ fn refresh_join_aggregate_iceberg_mv(
     );
     let effective_definition = decision.into_definition(mv_definition)?;
     let mv_definition = &effective_definition;
+    // Canonicalize once; reused for both reclassification (rebind branch) and
+    // ctx construction below.
+    let canonical_select_query = canonicalize_iceberg_mv_select_query(
+        &parse_mv_select_query(&mv_definition.select_sql)?,
+        current_catalog,
+        current_database,
+    );
     // Reclassify the join aggregate shape against the rewritten SELECT so
     // downstream signed-delta / branch rewrites use the current base column
     // names (join key and group key).
     let reclassified_join_aggregate_shape = if rebind_happened {
-        let new_query = parse_mv_select_query(&mv_definition.select_sql)?;
-        let canonical_new =
-            canonicalize_iceberg_mv_select_query(&new_query, current_catalog, current_database);
         let new_shape =
             crate::connector::starrocks::managed::mv_shape::classify_incremental_mv_query(
-                &canonical_new,
+                &canonical_select_query,
             )?;
         match new_shape {
             IncrementalMvShape::JoinAggregate(shape) => shape,
@@ -2427,12 +2429,6 @@ fn refresh_join_aggregate_iceberg_mv(
         aggregate_shape.clone()
     };
     let aggregate_shape = &reclassified_aggregate_shape;
-
-    let canonical_select_query = canonicalize_iceberg_mv_select_query(
-        &parse_mv_select_query(&mv_definition.select_sql)?,
-        current_catalog,
-        current_database,
-    );
     let ctx = IcebergMvRefreshContext::new(
         target.clone(),
         mv_definition.mv_id,

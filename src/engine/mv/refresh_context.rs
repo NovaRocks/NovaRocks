@@ -949,6 +949,7 @@ mod tests {
         let mut contract = make_schema_contract();
         contract.target.hidden_apply_key.column_name = "__row_id__".to_string();
         contract.target.hidden_apply_key.target_field_id = 999;
+        contract.target.hidden_apply_key.source = ApplyKeySource::GroupRowId;
         contract.aggregate = Some(AggregateStateContract {
             state_layout_version: 1,
             row_id_column_name: "__row_id__".to_string(),
