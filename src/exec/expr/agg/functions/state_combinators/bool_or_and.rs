@@ -418,6 +418,7 @@ mod tests {
 
     use arrow::array::{Array, ArrayRef, BinaryArray, BooleanArray, Int8Array, StructArray};
     use arrow::datatypes::{DataType, Field};
+    use arrow_buffer::NullBufferBuilder;
 
     use crate::connector::starrocks::managed::state_codec::{decode_bool_state, encode_bool_state};
     use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
@@ -533,6 +534,33 @@ mod tests {
         )) as ArrayRef
     }
 
+    fn signed_input_with_struct_nulls(
+        values: Vec<Option<bool>>,
+        ops: Vec<Option<i8>>,
+        struct_valid: Vec<bool>,
+    ) -> ArrayRef {
+        assert_eq!(values.len(), ops.len());
+        assert_eq!(values.len(), struct_valid.len());
+        let value_arr = Arc::new(BooleanArray::from(values)) as ArrayRef;
+        let op_arr = Arc::new(Int8Array::from(ops)) as ArrayRef;
+        let mut struct_nulls = NullBufferBuilder::new(struct_valid.len());
+        for valid in struct_valid {
+            if valid {
+                struct_nulls.append_non_null();
+            } else {
+                struct_nulls.append_null();
+            }
+        }
+        Arc::new(StructArray::new(
+            arrow::datatypes::Fields::from(vec![
+                Arc::new(Field::new("v", DataType::Boolean, true)),
+                Arc::new(Field::new("op", DataType::Int8, true)),
+            ]),
+            vec![value_arr, op_arr],
+            struct_nulls.finish(),
+        )) as ArrayRef
+    }
+
     #[test]
     fn bool_or_state_counts_true_and_false() {
         let spec = build_spec("bool_or_state");
@@ -644,6 +672,23 @@ mod tests {
         cell.update(view, 3);
 
         assert_eq!(final_counts(&cell.finalize()), (1, 0));
+    }
+
+    #[test]
+    fn bool_state_signed_skips_struct_null_rows() {
+        let spec = build_signed_spec("bool_or_state_signed");
+        let mut cell = StateCell::new(spec);
+        let input = signed_input_with_struct_nulls(
+            vec![Some(true), Some(false), Some(true)],
+            vec![Some(0), Some(0), Some(1)],
+            vec![true, false, true],
+        );
+        let input_slot = Some(input);
+        let view = super::super::super::build_input_view(&cell.spec, &input_slot).unwrap();
+
+        cell.update(view, 3);
+
+        assert_eq!(final_counts(&cell.finalize()), (0, 0));
     }
 
     #[test]
