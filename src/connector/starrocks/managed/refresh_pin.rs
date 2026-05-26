@@ -97,6 +97,22 @@ impl RefreshSnapshotPin {
     }
 }
 
+#[cfg(test)]
+impl RefreshSnapshotPin {
+    /// Build a pin with explicit entries; for use from other modules' unit
+    /// tests that need to construct a `RefreshSnapshotPin` without going
+    /// through `capture`. Each tuple is `(fqn, snapshot_id, table_uuid)`.
+    pub(crate) fn from_entries_for_tests(entries: &[(&str, i64, &str)]) -> Self {
+        let mut pin = RefreshSnapshotPin::default();
+        for (fqn, snapshot_id, uuid) in entries {
+            pin.snapshots.insert((*fqn).to_string(), *snapshot_id);
+            pin.table_uuids
+                .insert((*fqn).to_string(), (*uuid).to_string());
+        }
+        pin
+    }
+}
+
 /// Walk `query` in place. For each `TableFactor::Table` whose 3-part name
 /// resolves into the pin and is not in `delta_bearing`, set
 /// `version = Some(VersionAsOf(Number(pin[base])))`. Returns the number
