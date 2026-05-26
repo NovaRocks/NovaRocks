@@ -27,6 +27,7 @@ pub mod iceberg;
 pub mod map;
 pub mod matching;
 pub mod math;
+pub(crate) mod mv_state;
 pub mod object;
 pub mod string;
 pub mod struct_fn;
