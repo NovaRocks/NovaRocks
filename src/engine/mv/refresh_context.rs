@@ -65,6 +65,23 @@ pub(crate) struct IcebergMvRefreshContext {
     pub target_table: iceberg::table::Table,
 }
 
+/// Debug-only view of an `IcebergMvRewriteContext`. No `Display` impl — log
+/// via `tracing::info!(summary = ?ctx.rewrite.summary(), ...)`.
+#[derive(Debug)]
+pub(crate) struct CtxSummary<'a> {
+    pub target: &'a IcebergMvTarget,
+    pub mv_id: i64,
+    pub base_count: usize,
+    pub base_fqns: Vec<String>,
+    pub pinned_snapshots: Vec<(String, i64)>,
+    pub previous_snapshots: Vec<(String, Option<i64>)>,
+    pub target_snapshot_id: Option<i64>,
+    pub schema_contract_version: u16,
+    pub partition_contract_present: bool,
+    pub visible_output_column_count: usize,
+    pub hidden_apply_key_column: &'a str,
+}
+
 fn err(msg: impl Into<String>) -> String {
     format!("IcebergMvRewriteContext::new: {}", msg.into())
 }
@@ -190,6 +207,44 @@ impl IcebergMvRewriteContext {
             target_schema,
             schema_contract,
         })
+    }
+
+    pub(crate) fn summary(&self) -> CtxSummary<'_> {
+        let base_fqns: Vec<String> = self.base_refs.iter().map(|r| r.fqn()).collect();
+        let pinned_snapshots: Vec<(String, i64)> = self
+            .base_refs
+            .iter()
+            .map(|r| {
+                let snap = self
+                    .pin
+                    .get(r)
+                    .expect("pin coverage verified in constructor");
+                (r.fqn(), snap)
+            })
+            .collect();
+        let previous_snapshots: Vec<(String, Option<i64>)> = self
+            .base_refs
+            .iter()
+            .map(|r| {
+                let fqn = r.fqn();
+                let prev = self.previous_snapshot_ids.get(&fqn).copied();
+                (fqn, prev)
+            })
+            .collect();
+
+        CtxSummary {
+            target: &self.target,
+            mv_id: self.mv_id,
+            base_count: self.base_refs.len(),
+            base_fqns,
+            pinned_snapshots,
+            previous_snapshots,
+            target_snapshot_id: self.target_snapshot_id,
+            schema_contract_version: self.schema_contract.contract_version,
+            partition_contract_present: self.schema_contract.target.partition.is_some(),
+            visible_output_column_count: self.schema_contract.target.visible_columns.len(),
+            hidden_apply_key_column: &self.schema_contract.target.hidden_apply_key.column_name,
+        }
     }
 }
 
@@ -687,6 +742,59 @@ mod tests {
         assert!(
             err.contains("target schema/contract field id mismatch"),
             "got: {err}"
+        );
+    }
+
+    #[test]
+    fn summary_orders_by_base_refs_declared_order() {
+        let target = make_target();
+        let query = Arc::new(parse_query("SELECT k FROM ice.db.b"));
+        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![
+            make_ref("ice", "db", "b"),
+            make_ref("ice", "db", "a"),
+            make_ref("ice", "db", "c"),
+        ]);
+        let pin = Arc::new(make_pin(&[
+            // Insert in NON-declared order to confirm summary reorders.
+            ("ice.db.a", 30, "uuid-a"),
+            ("ice.db.c", 50, "uuid-c"),
+            ("ice.db.b", 20, "uuid-b"),
+        ]));
+        let schema = make_target_schema();
+        let mut def_for_three_bases = make_mv_definition();
+        def_for_three_bases.last_refresh_snapshots.clear();
+        def_for_three_bases.last_refresh_snapshots.insert("ice.db.b".to_string(), 11);
+        def_for_three_bases.last_refresh_table_uuids.clear();
+        def_for_three_bases.last_refresh_table_uuids.insert("ice.db.b".to_string(), "uuid-b".to_string());
+        def_for_three_bases.last_refresh_table_uuids.insert("ice.db.a".to_string(), "uuid-a".to_string());
+        def_for_three_bases.last_refresh_table_uuids.insert("ice.db.c".to_string(), "uuid-c".to_string());
+        let mv_def = Arc::new(def_for_three_bases);
+        let contract = Arc::new(make_schema_contract());
+
+        let ctx = IcebergMvRewriteContext::from_parts(
+            target, 42, None, "db".to_string(),
+            mv_def, query, base_refs, pin,
+            Some(99), "uuid-tgt".to_string(), schema, Some(contract),
+        )
+        .expect("ctx happy path");
+
+        let summary = ctx.summary();
+        assert_eq!(
+            summary.pinned_snapshots,
+            vec![
+                ("ice.db.b".to_string(), 20),
+                ("ice.db.a".to_string(), 30),
+                ("ice.db.c".to_string(), 50),
+            ],
+            "summary must use base_refs declared order, not BTreeMap key order"
+        );
+        assert_eq!(
+            summary.previous_snapshots,
+            vec![
+                ("ice.db.b".to_string(), Some(11)),
+                ("ice.db.a".to_string(), None),
+                ("ice.db.c".to_string(), None),
+            ]
         );
     }
 
