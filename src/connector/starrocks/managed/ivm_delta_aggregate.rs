@@ -199,6 +199,9 @@ fn push_signed_aggregate_state_projection(
         AggregateFunctionKind::CountDistinct => {
             unimplemented!("CountDistinct: see Task 4.x")
         }
+        AggregateFunctionKind::ApproxCountDistinct => {
+            unimplemented!("ApproxCountDistinct: see Task 5.x")
+        }
     }
     Ok(())
 }

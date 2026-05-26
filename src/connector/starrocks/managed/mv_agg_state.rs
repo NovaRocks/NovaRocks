@@ -312,6 +312,9 @@ pub(crate) fn build_aggregate_mv_layout(
             AggregateFunctionKind::CountDistinct => {
                 unimplemented!("CountDistinct: see Task 4.x")
             }
+            AggregateFunctionKind::ApproxCountDistinct => {
+                unimplemented!("ApproxCountDistinct: see Task 5.x")
+            }
         }
     }
 
@@ -2254,6 +2257,9 @@ fn update_visible_values_from_state(
             }
             AggregateFunctionKind::CountDistinct => {
                 unimplemented!("CountDistinct: see Task 4.x")
+            }
+            AggregateFunctionKind::ApproxCountDistinct => {
+                unimplemented!("ApproxCountDistinct: see Task 5.x")
             }
         }
     }

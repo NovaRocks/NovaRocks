@@ -107,6 +107,9 @@ pub(crate) enum AggregateFunctionKind {
     /// `count(DISTINCT col)` / `count_distinct(col)` / `multi_distinct_count(col)`.
     /// Uses shared multiset state encoding; visible counts positive entries.
     CountDistinct,
+    /// `approx_count_distinct(col)` / `ndv(col)` / `hll_ndv(col)`.
+    /// Shares multiset state with CountDistinct; visible computes an HLL estimate.
+    ApproxCountDistinct,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
