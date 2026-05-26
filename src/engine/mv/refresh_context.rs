@@ -159,11 +159,13 @@ impl IcebergMvRewriteContext {
         }
 
         // The target schema is the union of visible columns (those listed in
-        // `schema_contract.target.visible_columns`) and the hidden apply-key
-        // column (`schema_contract.target.hidden_apply_key.target_field_id`).
-        // The hidden apply-key field id can coincide with a visible column
-        // (when the apply-key aliases an existing user column) or be a
-        // distinct field (the common case, e.g. `__nova_base_row_id`).
+        // `schema_contract.target.visible_columns`), the hidden apply-key
+        // column (`schema_contract.target.hidden_apply_key.target_field_id`),
+        // and — for aggregate MVs — the hidden aggregate-state columns listed
+        // in `schema_contract.aggregate.state_columns`. The hidden apply-key
+        // field id can coincide with a visible column (when the apply-key
+        // aliases an existing user column) or be a distinct field (the
+        // common case, e.g. `__nova_base_row_id` / `__row_id__`).
         let schema_field_ids: BTreeSet<i32> = target_schema
             .as_ref()
             .as_struct()
@@ -178,6 +180,11 @@ impl IcebergMvRewriteContext {
             .map(|c| c.target_field_id)
             .collect();
         contract_field_ids.insert(schema_contract.target.hidden_apply_key.target_field_id);
+        if let Some(aggregate) = &schema_contract.aggregate {
+            for state_col in &aggregate.state_columns {
+                contract_field_ids.insert(state_col.target_field_id);
+            }
+        }
         if schema_field_ids != contract_field_ids {
             return Err(err(format!(
                 "target schema/contract field id mismatch: schema has {:?}, contract has {:?}",
@@ -307,6 +314,7 @@ mod tests {
     use crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin;
     use crate::meta::repository::mv::StoredMvDefinition;
     use crate::meta::repository::mv_contract::{
+        AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
         ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot,
         HiddenApplyKeyContract, MvSchemaContract, OutputContract, TargetContract,
         TargetVisibleColumn,
@@ -890,5 +898,93 @@ mod tests {
             Some(contract),
         )
         .expect("ctx must succeed when apply-key is a distinct hidden schema field");
+    }
+
+    #[test]
+    fn from_parts_succeeds_with_aggregate_state_columns_in_schema() {
+        let target = make_target();
+        let mv_def = Arc::new(make_mv_definition());
+        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
+        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
+
+        // Aggregate target schema: visible columns 100=k and 101=v, hidden
+        // apply key 999=__row_id__, and aggregate-state columns
+        // 200=__agg_state_c, 201=__agg_state_s. All must be accepted by
+        // from_parts.
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(7)
+                .with_fields(vec![
+                    Arc::new(NestedField::required(
+                        100,
+                        "k",
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                    Arc::new(NestedField::optional(
+                        101,
+                        "v",
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                    Arc::new(NestedField::required(
+                        999,
+                        "__row_id__",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                    Arc::new(NestedField::optional(
+                        200,
+                        "__agg_state_c",
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                    Arc::new(NestedField::optional(
+                        201,
+                        "__agg_state_s",
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                ])
+                .build()
+                .expect("build schema"),
+        );
+
+        let mut contract = make_schema_contract();
+        contract.target.hidden_apply_key.column_name = "__row_id__".to_string();
+        contract.target.hidden_apply_key.target_field_id = 999;
+        contract.aggregate = Some(AggregateStateContract {
+            state_layout_version: 1,
+            row_id_column_name: "__row_id__".to_string(),
+            state_columns: vec![
+                AggregateStateColumnContract {
+                    column_name: "__agg_state_c".to_string(),
+                    target_field_id: 200,
+                    type_signature: "long".to_string(),
+                    nullable: true,
+                    role: AggregateStateRoleContract::Single,
+                },
+                AggregateStateColumnContract {
+                    column_name: "__agg_state_s".to_string(),
+                    target_field_id: 201,
+                    type_signature: "long".to_string(),
+                    nullable: true,
+                    role: AggregateStateRoleContract::Single,
+                },
+            ],
+        });
+        let contract = Arc::new(contract);
+
+        IcebergMvRewriteContext::from_parts(
+            target,
+            42,
+            None,
+            "db".to_string(),
+            mv_def,
+            query,
+            base_refs,
+            pin,
+            Some(99),
+            "uuid-tgt".to_string(),
+            schema,
+            Some(contract),
+        )
+        .expect("ctx must accept aggregate state columns in target schema");
     }
 }
