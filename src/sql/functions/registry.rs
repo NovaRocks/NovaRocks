@@ -1157,6 +1157,16 @@ fn register_mv_state_fns(m: &mut HashMap<String, Vec<Signature>>) {
     );
     add(
         m,
+        "count_distinct_state_union",
+        Signature::new(vec![TypeSpec::Binary, TypeSpec::Binary], TypeSpec::Binary),
+    );
+    add(
+        m,
+        "count_distinct_state_visible",
+        Signature::new(vec![TypeSpec::Binary], TypeSpec::Int64),
+    );
+    add(
+        m,
         "avg_state_union",
         Signature::new(vec![TypeSpec::Binary, TypeSpec::Binary], TypeSpec::Binary),
     );

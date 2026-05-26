@@ -177,6 +177,8 @@ fn is_mv_state_scalar_function(name: &str) -> bool {
         name,
         "count_state_union"
             | "count_state_visible"
+            | "count_distinct_state_union"
+            | "count_distinct_state_visible"
             | "avg_state_union"
             | "avg_state_visible"
             | "sum_state_union"
@@ -196,6 +198,7 @@ fn validate_mv_state_scalar_function(name: &str, arg_types: &[DataType]) -> Resu
     let binary_arg = |ty: &DataType| matches!(ty, DataType::Binary | DataType::LargeBinary);
     let expected = match name {
         "count_state_union"
+        | "count_distinct_state_union"
         | "avg_state_union"
         | "sum_state_union"
         | "min_state_union"
@@ -203,6 +206,7 @@ fn validate_mv_state_scalar_function(name: &str, arg_types: &[DataType]) -> Resu
         | "bool_or_state_union"
         | "bool_and_state_union" => 2,
         "count_state_visible"
+        | "count_distinct_state_visible"
         | "avg_state_visible"
         | "sum_state_visible"
         | "min_state_visible"
@@ -930,14 +934,17 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         "bitmap_contains" | "bitmap_has_any" => DataType::Boolean,
         "bitmap_min" | "bitmap_max" | "bitmap_count" | "hll_cardinality" => DataType::Int64,
         "count_state_union"
+        | "count_distinct_state_union"
         | "sum_state_union"
         | "min_state_union"
         | "max_state_union"
         | "bool_or_state_union"
         | "bool_and_state_union" => DataType::Binary,
-        "count_state_visible" | "sum_state_visible" | "min_state_visible" | "max_state_visible" => {
-            DataType::Int64
-        }
+        "count_state_visible"
+        | "count_distinct_state_visible"
+        | "sum_state_visible"
+        | "min_state_visible"
+        | "max_state_visible" => DataType::Int64,
         "bool_or_state_visible" | "bool_and_state_visible" => DataType::Boolean,
         "bitmap_to_array" => DataType::List(Arc::new(arrow::datatypes::Field::new(
             "item",
@@ -1687,6 +1694,34 @@ mod tests {
         assert_eq!(
             err,
             "No matching function with signature: min_state_union(varchar(255))."
+        );
+    }
+
+    #[test]
+    fn count_distinct_state_scalar_functions_require_binary_inputs() {
+        assert_eq!(
+            infer_scalar_return_type(
+                "count_distinct_state_union",
+                &[DataType::Binary, DataType::Binary]
+            ),
+            DataType::Binary
+        );
+        assert_eq!(
+            infer_scalar_return_type("count_distinct_state_visible", &[DataType::LargeBinary]),
+            DataType::Int64
+        );
+        validate_scalar_function_call(
+            "count_distinct_state_union",
+            &[DataType::LargeBinary, DataType::Binary],
+        )
+        .unwrap();
+        validate_scalar_function_call("count_distinct_state_visible", &[DataType::Binary]).unwrap();
+
+        let err = validate_scalar_function_call("count_distinct_state_visible", &[DataType::Utf8])
+            .expect_err("count_distinct_state_visible should reject non-binary input");
+        assert_eq!(
+            err,
+            "No matching function with signature: count_distinct_state_visible(varchar(255))."
         );
     }
 
