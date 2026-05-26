@@ -187,6 +187,7 @@ use retention::RetentionAgg;
 use state_combinators::avg::{AvgStateAgg, AvgStateSignedAgg};
 use state_combinators::bool_or_and::{BoolStateAgg, BoolStateSignedAgg};
 use state_combinators::count::{CountStateAgg, CountStateSignedAgg};
+use state_combinators::count_distinct::{CountDistinctStateAgg, CountDistinctStateSignedAgg};
 use state_combinators::min_max::{MinMaxStateAgg, MinMaxStateSignedAgg};
 use state_combinators::sum::{SumStateAgg, SumStateSignedAgg};
 use sum::SumAgg;
@@ -247,6 +248,8 @@ pub(super) trait AggregateFunction {
 static COUNT: CountAgg = CountAgg;
 static COUNT_STATE: CountStateAgg = CountStateAgg;
 static COUNT_STATE_SIGNED: CountStateSignedAgg = CountStateSignedAgg;
+static COUNT_DISTINCT_STATE: CountDistinctStateAgg = CountDistinctStateAgg;
+static COUNT_DISTINCT_STATE_SIGNED: CountDistinctStateSignedAgg = CountDistinctStateSignedAgg;
 static BOOL_STATE: BoolStateAgg = BoolStateAgg;
 static BOOL_STATE_SIGNED: BoolStateSignedAgg = BoolStateSignedAgg;
 static MIN_MAX_STATE: MinMaxStateAgg = MinMaxStateAgg;
@@ -293,6 +296,8 @@ fn resolve_by_func(func: &AggFunction) -> Result<&'static dyn AggregateFunction,
         "count" => Ok(&COUNT),
         "count_state" => Ok(&COUNT_STATE),
         "count_state_signed" => Ok(&COUNT_STATE_SIGNED),
+        "count_distinct_state" => Ok(&COUNT_DISTINCT_STATE),
+        "count_distinct_state_signed" => Ok(&COUNT_DISTINCT_STATE_SIGNED),
         "bool_or_state" | "bool_and_state" => Ok(&BOOL_STATE),
         "bool_or_state_signed" | "bool_and_state_signed" => Ok(&BOOL_STATE_SIGNED),
         "min_state" | "max_state" => Ok(&MIN_MAX_STATE),
