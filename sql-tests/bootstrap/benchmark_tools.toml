@@ -1,10 +1,59 @@
 [ssb]
 name = "ssb-dbgen"
-version = "219403ad7d1dd32ae1f97b5553abf92129fccd7f"
-archive_url = "https://github.com/electrum/ssb-dbgen/archive/219403ad7d1dd32ae1f97b5553abf92129fccd7f.zip"
-archive_sha256 = "2653bb57c165bbf9b41ea37d1da6cd2f81c0505a6ed20839111985f53dec2ee6"
-archive_root = "ssb-dbgen-219403ad7d1dd32ae1f97b5553abf92129fccd7f"
-build_command = "make"
+version = "d006a6c49ff1a145a7d4ac7d837427627b213091"
+archive_url = "https://github.com/greenlion/ssb-dbgen/archive/d006a6c49ff1a145a7d4ac7d837427627b213091.zip"
+archive_sha256 = "fe38fc04bfffec954dd9a5264be295768edc2227fbafc2cb58fa7ca3ad459f3d"
+archive_root = "ssb-dbgen-d006a6c49ff1a145a7d4ac7d837427627b213091"
+build_command = "make dbgen"
 binary = "dbgen"
 default_scale = "1"
 raw_tables = ["customer", "date", "lineorder", "part", "supplier"]
+
+[tpc-h]
+name = "tpch-dbgen"
+version = "6985da461c641fd0d255b214f2d693f1bf08bc33"
+archive_url = "https://codeload.github.com/databricks/tpch-dbgen/tar.gz/6985da461c641fd0d255b214f2d693f1bf08bc33"
+archive_sha256 = "0357de7004ad47ede32e2ace83f7a468bbd8bedb7dcfc7e317751efe2b399f1a"
+archive_root = "tpch-dbgen-6985da461c641fd0d255b214f2d693f1bf08bc33"
+build_command = "make dbgen"
+binary = "dbgen"
+default_scale = "1"
+raw_tables = ["customer", "lineitem", "nation", "orders", "part", "partsupp", "region", "supplier"]
+schema_ddl = "dss.ddl"
+
+[tpc-ds]
+name = "tpcds-kit"
+version = "1b7fb7529edae091684201fab142d956d6afd881"
+archive_url = "https://codeload.github.com/databricks/tpcds-kit/tar.gz/1b7fb7529edae091684201fab142d956d6afd881"
+archive_sha256 = "c67d62cfdab1571a7625aaab29771e123cf6be3f9dd615606d822bf7e1bb4221"
+archive_root = "tpcds-kit-1b7fb7529edae091684201fab142d956d6afd881"
+build_command = "make dsdgen OS=LINUX"
+binary = "tools/dsdgen"
+default_scale = "1GB"
+raw_tables = [
+  "call_center",
+  "catalog_page",
+  "catalog_returns",
+  "catalog_sales",
+  "customer",
+  "customer_address",
+  "customer_demographics",
+  "date_dim",
+  "household_demographics",
+  "income_band",
+  "inventory",
+  "item",
+  "promotion",
+  "reason",
+  "ship_mode",
+  "store",
+  "store_returns",
+  "store_sales",
+  "time_dim",
+  "warehouse",
+  "web_page",
+  "web_returns",
+  "web_sales",
+  "web_site",
+]
+schema_ddl = "tools/tpcds.sql"

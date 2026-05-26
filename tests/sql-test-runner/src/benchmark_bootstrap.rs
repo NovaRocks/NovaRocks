@@ -19,7 +19,7 @@ pub fn is_benchmark_suite(suite: &str) -> bool {
 }
 
 pub fn is_auto_bootstrap_supported_suite(suite: &str) -> bool {
-    matches!(suite, "ssb")
+    matches!(suite, "ssb" | "tpc-h" | "tpc-ds")
 }
 
 pub fn parse_benchmark_scale_override(
@@ -270,20 +270,19 @@ mod tests {
     }
 
     #[test]
-    fn first_phase_auto_bootstrap_supports_only_ssb() {
+    fn auto_bootstrap_supports_standard_benchmark_suites() {
         assert!(is_auto_bootstrap_supported_suite("ssb"));
-        assert!(!is_auto_bootstrap_supported_suite("tpc-h"));
-        assert!(!is_auto_bootstrap_supported_suite("tpc-ds"));
+        assert!(is_auto_bootstrap_supported_suite("tpc-h"));
+        assert!(is_auto_bootstrap_supported_suite("tpc-ds"));
         assert!(!is_auto_bootstrap_supported_suite("join"));
     }
 
     #[test]
-    fn ensure_benchmark_data_noops_for_unsupported_benchmark_suites() {
+    fn ensure_benchmark_data_runs_bootstrap_for_tpc_h() {
         let options = BenchmarkBootstrapOptions {
             enabled: true,
             rebuild: false,
-            scales: parse_scale_overrides(&["tpc-h=10".to_string(), "tpc-ds=1GB".to_string()])
-                .unwrap(),
+            scales: BTreeMap::new(),
         };
         let mut runner_config = RunnerConfig::default();
         runner_config.values.insert(
@@ -302,7 +301,22 @@ mod tests {
             "root",
             Some("secret"),
         )
-        .unwrap();
+        .expect_err("supported suite should attempt to run the configured bootstrap script");
+    }
+
+    #[test]
+    fn ensure_benchmark_data_runs_bootstrap_for_tpc_ds() {
+        let options = BenchmarkBootstrapOptions {
+            enabled: true,
+            rebuild: false,
+            scales: BTreeMap::new(),
+        };
+        let mut runner_config = RunnerConfig::default();
+        runner_config.values.insert(
+            "benchmark_bootstrap_script".to_string(),
+            "/definitely/missing/bootstrap_benchmark_data.sh".to_string(),
+        );
+
         ensure_benchmark_data(
             &options,
             &runner_config,
@@ -314,7 +328,7 @@ mod tests {
             "root",
             Some("secret"),
         )
-        .unwrap();
+        .expect_err("supported suite should attempt to run the configured bootstrap script");
     }
 
     #[test]

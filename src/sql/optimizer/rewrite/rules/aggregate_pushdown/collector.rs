@@ -183,10 +183,7 @@ fn split_at_join(
         .cloned()
         .collect();
     for (left_key, right_key) in &equi_keys {
-        let candidate = match side {
-            Side::Left => left_key,
-            Side::Right => right_key,
-        };
+        let candidate = side_bound_equi_key(left_key, right_key, side_cols)?;
         let already = partial_groupby
             .iter()
             .any(|gb| match (&gb.kind, &candidate.kind) {
@@ -206,6 +203,29 @@ fn split_at_join(
         partial_groupby,
         partial_aggregates: ctx.original_aggregates,
     })
+}
+
+fn side_bound_equi_key<'a>(
+    left_key: &'a TypedExpr,
+    right_key: &'a TypedExpr,
+    side_cols: &[String],
+) -> Option<&'a TypedExpr> {
+    let left_col = column_ref_name(left_key)?;
+    let right_col = column_ref_name(right_key)?;
+    let left_in_side = side_cols.contains(left_col);
+    let right_in_side = side_cols.contains(right_col);
+    match (left_in_side, right_in_side) {
+        (true, false) => Some(left_key),
+        (false, true) => Some(right_key),
+        _ => None,
+    }
+}
+
+fn column_ref_name(expr: &TypedExpr) -> Option<&String> {
+    match &expr.kind {
+        ExprKind::ColumnRef { column, .. } => Some(column),
+        _ => None,
+    }
 }
 
 fn extract_equi_key_pairs(cond: &TypedExpr) -> Vec<(TypedExpr, TypedExpr)> {
@@ -528,17 +548,17 @@ mod tests {
 
     #[test]
     fn pushes_sum_under_inner_join_to_left() {
-        let a = dummy_scan_with_cols(&[("k", DataType::Int64), ("v", DataType::Int64)]);
-        let b = dummy_scan_with_cols(&[("k", DataType::Int64)]);
+        let a = dummy_scan_with_cols(&[("lk", DataType::Int64), ("v", DataType::Int64)]);
+        let b = dummy_scan_with_cols(&[("rk", DataType::Int64)]);
         let join = LogicalPlan::Join(JoinNode {
             left: Box::new(a),
             right: Box::new(b),
             join_type: JoinKind::Inner,
-            condition: Some(eq("k", "k")),
+            condition: Some(eq("lk", "rk")),
         });
         let agg = AggregateNode {
             input: Box::new(join),
-            group_by: vec![col_ref("k", DataType::Int64)],
+            group_by: vec![col_ref("lk", DataType::Int64)],
             aggregates: vec![sum_call("v")],
             output_columns: vec![],
             already_pushed: false,
@@ -549,19 +569,46 @@ mod tests {
     }
 
     #[test]
+    fn orients_reversed_join_key_to_target_side() {
+        let a = dummy_scan_with_cols(&[("lk", DataType::Int64), ("v", DataType::Int64)]);
+        let b = dummy_scan_with_cols(&[("rk", DataType::Int64)]);
+        let join = LogicalPlan::Join(JoinNode {
+            left: Box::new(a),
+            right: Box::new(b),
+            join_type: JoinKind::Inner,
+            condition: Some(eq("rk", "lk")),
+        });
+        let agg = AggregateNode {
+            input: Box::new(join),
+            group_by: vec![col_ref("lk", DataType::Int64)],
+            aggregates: vec![sum_call("v")],
+            output_columns: vec![],
+            already_pushed: false,
+        };
+        let plan = collect_push_plan(&agg, &HashMap::new()).expect("should push to left");
+        let group_columns: Vec<_> = plan
+            .partial_groupby
+            .iter()
+            .filter_map(|expr| column_ref_name(expr).map(String::as_str))
+            .collect();
+        assert!(group_columns.contains(&"lk"));
+        assert!(!group_columns.contains(&"rk"));
+    }
+
+    #[test]
     fn rejects_outer_join_amplifier_side() {
-        let a = dummy_scan_with_cols(&[("k", DataType::Int64)]);
-        let b = dummy_scan_with_cols(&[("k", DataType::Int64), ("v", DataType::Int64)]);
+        let a = dummy_scan_with_cols(&[("lk", DataType::Int64)]);
+        let b = dummy_scan_with_cols(&[("rk", DataType::Int64), ("v", DataType::Int64)]);
         // LEFT OUTER JOIN; aggregate on right (amplifier) — must reject.
         let join = LogicalPlan::Join(JoinNode {
             left: Box::new(a),
             right: Box::new(b),
             join_type: JoinKind::LeftOuter,
-            condition: Some(eq("k", "k")),
+            condition: Some(eq("lk", "rk")),
         });
         let agg = AggregateNode {
             input: Box::new(join),
-            group_by: vec![col_ref("k", DataType::Int64)],
+            group_by: vec![col_ref("rk", DataType::Int64)],
             aggregates: vec![sum_call("v")],
             output_columns: vec![],
             already_pushed: false,
@@ -571,17 +618,17 @@ mod tests {
 
     #[test]
     fn accepts_left_outer_when_agg_on_preserved_left() {
-        let a = dummy_scan_with_cols(&[("k", DataType::Int64), ("v", DataType::Int64)]);
-        let b = dummy_scan_with_cols(&[("k", DataType::Int64)]);
+        let a = dummy_scan_with_cols(&[("lk", DataType::Int64), ("v", DataType::Int64)]);
+        let b = dummy_scan_with_cols(&[("rk", DataType::Int64)]);
         let join = LogicalPlan::Join(JoinNode {
             left: Box::new(a),
             right: Box::new(b),
             join_type: JoinKind::LeftOuter,
-            condition: Some(eq("k", "k")),
+            condition: Some(eq("rk", "lk")),
         });
         let agg = AggregateNode {
             input: Box::new(join),
-            group_by: vec![col_ref("k", DataType::Int64)],
+            group_by: vec![col_ref("lk", DataType::Int64)],
             aggregates: vec![sum_call("v")],
             output_columns: vec![],
             already_pushed: false,

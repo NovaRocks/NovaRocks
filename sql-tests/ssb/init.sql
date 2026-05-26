@@ -12,8 +12,8 @@ PROPERTIES (
 );
 
 USE `iceberg_cat_${uuid0}`.`ssb`;
-SELECT 1 FROM `customer` LIMIT 1;
-SELECT 1 FROM `dates` LIMIT 1;
-SELECT 1 FROM `lineorder` LIMIT 1;
-SELECT 1 FROM `part` LIMIT 1;
-SELECT 1 FROM `supplier` LIMIT 1;
+SHOW CREATE TABLE `customer`;
+SHOW CREATE TABLE `dates`;
+SHOW CREATE TABLE `lineorder`;
+SHOW CREATE TABLE `part`;
+SHOW CREATE TABLE `supplier`;
