@@ -98,28 +98,24 @@ pub(crate) struct IcebergMvRewriteContext {
 
     // ---- Contracts ----
     pub schema_contract: Arc<MvSchemaContract>,
-    pub partition_contract: Option<Arc<MvPartitionContract>>,
-    pub required_output_columns: Arc<[MvOutputColumn]>,
 }
 ```
 
-`MvOutputColumn` is a new minimal type derived from the target Iceberg schema
-plus the schema contract, declared in the same module:
+`MvSchemaContract` already nests:
+- `target.visible_columns: Vec<TargetVisibleColumn>` — the user-facing
+  required output columns (output_name, target_field_id, type_signature,
+  nullable). This is the rewrite output contract; no separate
+  `required_output_columns` field needs to be denormalized into the ctx —
+  callers read `ctx.rewrite.schema_contract.target.visible_columns`.
+- `target.hidden_apply_key: HiddenApplyKeyContract` — the row-identity
+  apply key.
+- `target.partition: Option<MvPartitionContract>` — the partition contract.
 
-```rust
-pub(crate) struct MvOutputColumn {
-    pub field_id: i32,
-    pub name: String,
-    pub data_type: iceberg::spec::Type,
-    pub nullable: bool,
-}
-```
-
-Rationale for separating `MvOutputColumn` from existing `MvSchemaContract`
-column models: the schema-contract column model carries rebind/migration
-semantics; the rewrite output contract is the simpler "what columns must the
-root projection produce, in what order" view. Keeping them apart prevents
-schema-contract changes from rippling into optimizer rule code.
+For these reasons the ctx stores `schema_contract` once and exposes the
+sub-views through helper accessors rather than duplicating
+`partition_contract` or `required_output_columns` as parallel fields. Earlier
+drafts of this spec listed those as separate fields; consolidation here
+reflects the actual `MvSchemaContract` shape.
 
 Why `Arc` on most fields: future `ImvRewriteRule` implementations (task 2)
 will build logical sub-plans that need to share fragments of context with
@@ -188,12 +184,11 @@ impl IcebergMvRefreshContext {
 The constructor:
 1. Derives `previous_snapshot_ids` / `previous_table_uuids` from `mv_definition`.
 2. Reads `target_snapshot_id` and `target_table_uuid` from `target_table.metadata()`.
-3. Resolves `schema_contract` / `partition_contract` from `mv_definition`
-   (schema contract absence is a construction error).
-4. Builds `required_output_columns` by walking the target schema in declared
-   order and joining each column against the schema contract.
-5. Runs the self-check (§4.5).
-6. Wraps everything into `Arc<IcebergMvRewriteContext>` inside the outer
+3. Resolves `schema_contract` from `mv_definition` (absence is a construction
+   error). `schema_contract.target.partition` and `target.visible_columns`
+   ride along inside the same `Arc`.
+4. Runs the self-check (§4.5).
+5. Wraps everything into `Arc<IcebergMvRewriteContext>` inside the outer
    `IcebergMvRefreshContext`.
 
 ### 4.5 Self-check
@@ -210,8 +205,8 @@ plus two new cross-shape consistency checks:
 | `pin.entries_len() == base_refs.len()` | `refresh pin covers {n} bases but definition has {m}` |
 | For each `base_ref`: `pin.uuid(base_ref).is_some()` | `refresh pin missing uuid for base {fqn}` |
 | For each base with a recorded previous uuid: `previous_table_uuids[fqn] == pin.uuid(fqn)` | `base table identity changed for {fqn}; incremental refresh unsafe, rebuild the MV` |
-| `required_output_columns.len() == target_schema.columns.len()` and every column's `field_id` is present in `schema_contract` | `target schema/contract column count mismatch: schema has {n}, contract has {m}` |
-| `target_schema.identifier_field_ids()` matches `schema_contract.primary_key_field_ids` (when contract declares any) | `target identifier fields drifted from schema contract` |
+| Every `target_schema.fields()` field_id appears in `schema_contract.target.visible_columns` (and vice versa) | `target schema/contract column count mismatch: schema has {n}, contract has {m}` |
+| `schema_contract.target.hidden_apply_key.column_name` resolves to an existing target schema column | `target apply-key column {col} not present in target schema` |
 
 The last two checks are new — they consolidate consistency that current code
 either does per-shape or relies on later commit-time validation to surface.
@@ -241,9 +236,10 @@ pub(crate) struct CtxSummary<'a> {
     pub pinned_snapshots: Vec<(&'a str, i64)>,
     pub previous_snapshots: Vec<(&'a str, Option<i64>)>,
     pub target_snapshot_id: Option<i64>,
-    pub schema_contract_version: i32,
-    pub partition_contract_spec_id: Option<i32>,
-    pub required_output_column_count: usize,
+    pub schema_contract_version: u16,
+    pub partition_contract_present: bool,
+    pub visible_output_column_count: usize,
+    pub hidden_apply_key_column: &'a str,
 }
 ```
 
@@ -269,7 +265,6 @@ logs across runs are stable for the same MV.
 - New file: [`src/engine/mv/refresh_context.rs`](../../../src/engine/mv/refresh_context.rs)
   - `pub(crate) struct IcebergMvRewriteContext`
   - `pub(crate) struct IcebergMvRefreshContext`
-  - `pub(crate) struct MvOutputColumn`
   - `pub(crate) struct CtxSummary<'a>`
   - `impl IcebergMvRefreshContext { fn new(...) -> Result<Self, String> }`
   - `impl IcebergMvRewriteContext { fn summary(&self) -> CtxSummary<'_> }`
@@ -302,8 +297,7 @@ logs across runs are stable for the same MV.
 
 1. **Happy path** — synthesise a `StoredMvDefinition`, `Pin`, and target
    table metadata; assert every derived field (`previous_snapshot_ids`,
-   `target_snapshot_id`, `target_table_uuid`, `required_output_columns`
-   field_id ordering).
+   `target_snapshot_id`, `target_table_uuid`).
 2. **Missing schema contract** — assert error contains target fqn.
 3. **Base count mismatch** — pin has fewer / more entries than `base_refs`.
 4. **Base identity drift** — `previous_table_uuids[fqn]` differs from
@@ -311,10 +305,12 @@ logs across runs are stable for the same MV.
    shape (this is the test that proves the hoist works).
 5. **First refresh** — empty `previous_snapshot_ids`; constructor succeeds
    and does not treat missing previous as an error.
-6. **Output-column derivation** — target schema with N columns and a contract
-   covering all N produces a constructor success; contract missing one
-   field_id produces the mismatch error.
-7. **Summary ordering** — synthesise a definition with `base_refs` declared
+6. **Target schema / contract mismatch** — target schema has a field_id not
+   present in `schema_contract.target.visible_columns`; constructor returns
+   the mismatch error.
+7. **Hidden apply key missing in target schema** — `hidden_apply_key.column_name`
+   not in target schema; constructor returns the apply-key error.
+8. **Summary ordering** — synthesise a definition with `base_refs` declared
    in `[b, a, c]` order; `summary().pinned_snapshots` must reflect that
    order, not BTreeMap key order.
 
@@ -364,7 +360,8 @@ This task is done when:
 - A construction failure (e.g., missing schema contract, base identity
   drift) produces a deterministic error message and never partially mutates
   state.
-- The seven self-check rules in §4.5 are covered by unit tests.
+- The seven self-check rules in §4.5 are covered by unit tests
+  (happy path + each failure mode).
 
 ## 10. Out-of-scope follow-ups
 
