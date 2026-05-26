@@ -641,6 +641,10 @@ fn classify_aggregate_call(
             AggregateFunctionKind::CountDistinct,
             classify_count_distinct_input(&args.args)?,
         ),
+        "approx_count_distinct" | "ndv" | "hll_ndv" => (
+            AggregateFunctionKind::ApproxCountDistinct,
+            classify_approx_count_distinct_input(&args.args)?,
+        ),
         "sum" => (AggregateFunctionKind::Sum, classify_sum_input(&args.args)?),
         "avg" => (AggregateFunctionKind::Avg, classify_avg_input(&args.args)?),
         "min" => (
@@ -715,6 +719,25 @@ fn classify_count_distinct_input(
     };
     let sqlparser::ast::FunctionArgExpr::Expr(expr) = simple_aggregate_arg_expr(arg)? else {
         return Err("COUNT(DISTINCT *) is not supported".to_string());
+    };
+    reject_unsupported_expr(expr).map_err(aggregate_expr_error)?;
+    Ok(AggregateInput::Expr(Box::new(expr.clone())))
+}
+
+fn classify_approx_count_distinct_input(
+    args: &[sqlparser::ast::FunctionArg],
+) -> Result<AggregateInput, String> {
+    if args.len() > 1 {
+        return Err(format!(
+            "APPROX_COUNT_DISTINCT with {} arguments is not supported in incremental materialized views; the precision hint argument is not supported in IVM. Please use the single-argument form: APPROX_COUNT_DISTINCT(col)",
+            args.len()
+        ));
+    }
+    let [arg] = args else {
+        return Err("APPROX_COUNT_DISTINCT requires exactly one column expression".to_string());
+    };
+    let sqlparser::ast::FunctionArgExpr::Expr(expr) = simple_aggregate_arg_expr(arg)? else {
+        return Err("APPROX_COUNT_DISTINCT(*) is not supported".to_string());
     };
     reject_unsupported_expr(expr).map_err(aggregate_expr_error)?;
     Ok(AggregateInput::Expr(Box::new(expr.clone())))
@@ -1414,7 +1437,7 @@ fn projection_filter_error() -> String {
 }
 
 fn aggregate_error() -> String {
-    "incremental aggregate MV query must be a single-table SELECT with non-empty GROUP BY and only count/sum/avg/min/max/count_distinct aggregate outputs".to_string()
+    "incremental aggregate MV query must be a single-table SELECT with non-empty GROUP BY and only supported aggregate outputs".to_string()
 }
 
 fn aggregate_expr_error(_err: String) -> String {
@@ -1837,6 +1860,53 @@ mod tests {
             shape.aggregates[0].function,
             AggregateFunctionKind::CountDistinct
         );
+    }
+
+    #[test]
+    fn classify_approx_count_distinct_aliases() {
+        for function_name in ["approx_count_distinct", "ndv", "hll_ndv"] {
+            let sql = format!(
+                "select region, {function_name}(user_id) from ice.ns.events group by region"
+            );
+            let shape = classify_sql(&sql).unwrap();
+            let IncrementalMvShape::Aggregate(shape) = shape else {
+                panic!("expected aggregate shape");
+            };
+            assert_eq!(
+                shape.aggregates[0].function,
+                AggregateFunctionKind::ApproxCountDistinct
+            );
+        }
+    }
+
+    #[test]
+    fn classify_approx_count_distinct_hint_rejected() {
+        let err = classify_sql(
+            "select region, approx_count_distinct(user_id, 14) from ice.ns.events group by region",
+        )
+        .unwrap_err();
+
+        assert!(err.contains("precision hint"), "got: {err}");
+    }
+
+    #[test]
+    fn classify_approx_count_distinct_star_rejected() {
+        let err = classify_sql(
+            "select region, approx_count_distinct(*) from ice.ns.events group by region",
+        )
+        .unwrap_err();
+
+        assert!(err.contains("APPROX_COUNT_DISTINCT(*)"), "got: {err}");
+    }
+
+    #[test]
+    fn classify_approx_count_distinct_distinct_modifier_rejected() {
+        let err = classify_sql(
+            "select region, approx_count_distinct(distinct user_id) from ice.ns.events group by region",
+        )
+        .unwrap_err();
+
+        assert!(err.contains("DISTINCT"), "got: {err}");
     }
 
     #[test]
