@@ -348,6 +348,7 @@ mod tests {
         assert!(Arc::ptr_eq(&ctx.mv_definition, &mv_def));
         assert!(Arc::ptr_eq(&ctx.canonical_select_query, &query));
         assert_eq!(ctx.base_refs.len(), 1);
+        assert!(Arc::ptr_eq(&ctx.base_refs, &base_refs));
         assert!(Arc::ptr_eq(&ctx.pin, &pin));
         assert_eq!(ctx.previous_snapshot_ids.get("ice.db.b"), Some(&11));
         assert_eq!(
