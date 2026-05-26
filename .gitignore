@@ -11,7 +11,9 @@
 /.idea
 /dev
 /output
-/sql-tests/bootstrap
+/sql-tests/bootstrap/cache/
+/sql-tests/bootstrap/generated/
+/sql-tests/bootstrap/parquet/
 /sql-tests/.sql_test_catalog
 /tools/target
 /tests/sql-test-runner/target
