@@ -141,4 +141,34 @@ mod tests {
             "CountDistinct signed state must be byte-identical to Min signed state on same input"
         );
     }
+
+    #[test]
+    fn count_distinct_state_rejects_unsupported_binary_key() {
+        let err = super::super::super::build_spec_from_type(
+            &agg_func("count_distinct_state", Some(DataType::Binary)),
+            Some(&DataType::Binary),
+            false,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("unsupported key type Binary"));
+    }
+
+    #[test]
+    fn count_distinct_state_signed_rejects_unsupported_nested_key() {
+        let input_type = signed_input_type(DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Int64,
+            true,
+        ))));
+
+        let err = super::super::super::build_spec_from_type(
+            &agg_func("count_distinct_state_signed", Some(input_type.clone())),
+            Some(&input_type),
+            false,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("unsupported key type List"));
+    }
 }

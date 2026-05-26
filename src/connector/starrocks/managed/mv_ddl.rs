@@ -607,9 +607,20 @@ fn validate_aggregate_mv_input_type(
     output_name: &str,
     args: &[crate::sql::analysis::TypedExpr],
 ) -> Result<(), String> {
-    if function != AggregateFunctionKind::Avg {
-        return Ok(());
+    match function {
+        AggregateFunctionKind::Avg => validate_avg_mv_input_type(analyzed_name, output_name, args),
+        AggregateFunctionKind::CountDistinct => {
+            validate_count_distinct_mv_input_type(analyzed_name, output_name, args)
+        }
+        _ => Ok(()),
     }
+}
+
+fn validate_avg_mv_input_type(
+    analyzed_name: &str,
+    output_name: &str,
+    args: &[crate::sql::analysis::TypedExpr],
+) -> Result<(), String> {
     if !analyzed_name.eq_ignore_ascii_case("avg") {
         return Err(format!(
             "aggregate MV analyzed aggregate mismatch for `{output_name}`: expected AVG, got {analyzed_name}"
@@ -632,6 +643,49 @@ fn validate_aggregate_mv_input_type(
     Err(format!(
         "AVG state type is unsupported for aggregate `{output_name}` input: {input_type:?}"
     ))
+}
+
+fn validate_count_distinct_mv_input_type(
+    analyzed_name: &str,
+    output_name: &str,
+    args: &[crate::sql::analysis::TypedExpr],
+) -> Result<(), String> {
+    if !matches!(
+        analyzed_name.to_ascii_lowercase().as_str(),
+        "count" | "count_distinct" | "multi_distinct_count"
+    ) {
+        return Err(format!(
+            "aggregate MV analyzed aggregate mismatch for `{output_name}`: expected COUNT DISTINCT, got {analyzed_name}"
+        ));
+    }
+    let input_type = args
+        .first()
+        .map(|arg| &arg.data_type)
+        .ok_or_else(|| "COUNT(DISTINCT) requires exactly one column expression".to_string())?;
+    if count_distinct_key_type_allowed(input_type) {
+        return Ok(());
+    }
+    Err(format!(
+        "COUNT(DISTINCT) state key type is unsupported for aggregate `{output_name}` input: {input_type:?}; project to a supported scalar key type"
+    ))
+}
+
+fn count_distinct_key_type_allowed(input_type: &DataType) -> bool {
+    matches!(
+        input_type,
+        DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal128(_, _)
+            | DataType::Date32
+            | DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, _)
+            | DataType::Utf8
+            | DataType::LargeUtf8
+    )
 }
 
 pub(crate) fn validate_unique_aggregate_physical_column_names(
@@ -2379,6 +2433,75 @@ mod tests {
             .expect("avg shape")
     }
 
+    fn resolved_count_distinct_query(arg_type: DataType) -> ResolvedQuery {
+        use crate::sql::analysis::{ExprKind, ProjectItem, ResolvedSelect, TypedExpr};
+
+        let group_key = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId::UNSET,
+                qualifier: None,
+                column: "k".to_string(),
+            },
+            data_type: DataType::Int64,
+            nullable: false,
+        };
+        let distinct_arg = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId::UNSET,
+                qualifier: None,
+                column: "v".to_string(),
+            },
+            data_type: arg_type,
+            nullable: true,
+        };
+        let count_distinct = TypedExpr {
+            kind: ExprKind::AggregateCall {
+                name: "count_distinct".to_string(),
+                args: vec![distinct_arg],
+                distinct: false,
+                order_by: Vec::new(),
+            },
+            data_type: DataType::Int64,
+            nullable: false,
+        };
+
+        ResolvedQuery {
+            body: QueryBody::Select(ResolvedSelect {
+                from: None,
+                filter: None,
+                group_by: vec![group_key.clone()],
+                having: None,
+                projection: vec![
+                    ProjectItem {
+                        expr: group_key,
+                        output_name: "k".to_string(),
+                    },
+                    ProjectItem {
+                        expr: count_distinct,
+                        output_name: "cd".to_string(),
+                    },
+                ],
+                has_aggregation: true,
+                distinct: false,
+                repeat: None,
+            }),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            output_columns: Vec::new(),
+            local_cte_ids: Vec::new(),
+        }
+    }
+
+    fn count_distinct_shape() -> IncrementalMvShape {
+        let stmt = parse_create_mv(
+            "create materialized view mv1 distributed by hash(k) buckets 2 \
+             as select k, count_distinct(v) as cd from ice.ns.orders group by k",
+        );
+        super::super::mv_shape::classify_incremental_mv_query(&stmt.select_query)
+            .expect("count_distinct shape")
+    }
+
     #[test]
     fn aggregate_mv_analyzed_types_accepts_avg_integer_input() {
         let shape = avg_shape();
@@ -2394,6 +2517,50 @@ mod tests {
             let err = validate_incremental_mv_analyzed_types(&shape, &resolved)
                 .expect_err("unsupported AVG input should be rejected");
             assert!(err.contains("AVG state type is unsupported"), "err={err}");
+            assert!(err.contains(&format!("{data_type:?}")), "err={err}");
+        }
+    }
+
+    #[test]
+    fn aggregate_mv_analyzed_types_accepts_count_distinct_scalar_keys() {
+        let shape = count_distinct_shape();
+        for data_type in [
+            DataType::Boolean,
+            DataType::Int64,
+            DataType::Float64,
+            DataType::Decimal128(18, 2),
+            DataType::Date32,
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+            DataType::Utf8,
+            DataType::LargeUtf8,
+        ] {
+            let resolved = resolved_count_distinct_query(data_type.clone());
+            validate_incremental_mv_analyzed_types(&shape, &resolved).unwrap_or_else(|err| {
+                panic!("COUNT(DISTINCT) key type {data_type:?} should be supported, got {err}")
+            });
+        }
+    }
+
+    #[test]
+    fn aggregate_mv_analyzed_types_rejects_count_distinct_unsupported_keys() {
+        let shape = count_distinct_shape();
+        let list_type = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
+        let struct_type = DataType::Struct(arrow::datatypes::Fields::from(vec![Arc::new(
+            Field::new("item", DataType::Int64, true),
+        )]));
+        for data_type in [
+            DataType::Binary,
+            DataType::LargeBinary,
+            list_type,
+            struct_type,
+        ] {
+            let resolved = resolved_count_distinct_query(data_type.clone());
+            let err = validate_incremental_mv_analyzed_types(&shape, &resolved)
+                .expect_err("unsupported COUNT(DISTINCT) key type should be rejected");
+            assert!(
+                err.contains("COUNT(DISTINCT) state key type is unsupported"),
+                "err={err}"
+            );
             assert!(err.contains(&format!("{data_type:?}")), "err={err}");
         }
     }
