@@ -84,7 +84,7 @@ pub(crate) struct IcebergMvRewriteContext {
 
     // ---- MV definition (post schema-contract rebind) ----
     pub mv_definition: Arc<StoredMvDefinition>,
-    pub canonical_select_query: Arc<ParsedSelectQuery>,
+    pub canonical_select_query: Arc<sqlparser::ast::Query>,
 
     // ---- Base table inputs ----
     pub base_refs: Arc<[IcebergTableRef]>,
@@ -172,7 +172,7 @@ impl IcebergMvRefreshContext {
         current_catalog: Option<&str>,
         current_database: &str,
         mv_definition: Arc<StoredMvDefinition>,
-        canonical_select_query: Arc<ParsedSelectQuery>,
+        canonical_select_query: Arc<sqlparser::ast::Query>,
         base_refs: Arc<[IcebergTableRef]>,
         pin: Arc<RefreshSnapshotPin>,
         target_entry: Arc<IcebergCatalogEntry>,
