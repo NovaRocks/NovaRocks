@@ -14,6 +14,7 @@ mod tests {
     use arrow::buffer::NullBuffer;
     use arrow::datatypes::{DataType, Field, Fields};
 
+    use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
     use crate::exec::expr::agg::functions::AggStatePtr;
     use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
 
@@ -130,7 +131,11 @@ mod tests {
         let input_type = signed_input_type(DataType::Int64);
         let input = signed_i64_input(
             vec![Some(5), Some(5), Some(3)],
-            vec![Some(0), Some(1), Some(0)],
+            vec![
+                Some(CHANGE_OP_INSERT),
+                Some(CHANGE_OP_DELETE),
+                Some(CHANGE_OP_INSERT),
+            ],
         );
 
         let count_distinct = state_bytes("count_distinct_state_signed", &input_type, input.clone());

@@ -6,6 +6,7 @@ use arrow::array::{Array, ArrayRef, BinaryArray, BinaryBuilder, Int8Array, Struc
 use arrow::datatypes::DataType;
 
 use crate::connector::starrocks::managed::state_codec::{decode_count_state, encode_count_state};
+use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
 use crate::exec::node::aggregate::AggFunction;
 
 use super::super::{AggInputView, AggKind, AggSpec, AggStatePtr, AggregateFunction};
@@ -328,8 +329,8 @@ fn update_count_state_signed(
             0
         } else {
             match op_arr.value(row) {
-                0 => 1,
-                1 => -1,
+                CHANGE_OP_INSERT => 1,
+                CHANGE_OP_DELETE => -1,
                 other => {
                     return Err(format!("unknown count_state_signed change_op: {other}"));
                 }
@@ -385,6 +386,7 @@ mod tests {
     use crate::connector::starrocks::managed::state_codec::{
         decode_count_state, encode_count_state,
     };
+    use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
     use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
 
     use super::super::super::{AggKind, AggSpec, AggStatePtr, AggregateFunction};
@@ -559,7 +561,11 @@ mod tests {
         let mut cell = StateCell::new(spec);
         let input = signed_input(
             vec![Some(1), Some(2), Some(3)],
-            vec![Some(0), Some(1), Some(0)],
+            vec![
+                Some(CHANGE_OP_INSERT),
+                Some(CHANGE_OP_DELETE),
+                Some(CHANGE_OP_INSERT),
+            ],
         );
         let input_slot = Some(input);
         let view = super::super::super::build_input_view(&cell.spec, &input_slot).unwrap();
@@ -577,7 +583,10 @@ mod tests {
         ]));
         let spec = build_signed_spec(&input_type);
         let mut cell = StateCell::new(spec);
-        let input = signed_input(vec![Some(1), None, Some(3)], vec![Some(0), Some(0), None]);
+        let input = signed_input(
+            vec![Some(1), None, Some(3)],
+            vec![Some(CHANGE_OP_INSERT), Some(CHANGE_OP_INSERT), None],
+        );
         let input_slot = Some(input);
         let view = super::super::super::build_input_view(&cell.spec, &input_slot).unwrap();
 

@@ -11,6 +11,7 @@ use arrow::datatypes::DataType;
 use crate::connector::starrocks::managed::state_codec::{
     decode_sum_decimal128, decode_sum_int64, encode_sum_decimal128, encode_sum_int64,
 };
+use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
 use crate::exec::node::aggregate::AggFunction;
 
 use super::super::{AggInputView, AggKind, AggSpec, AggStatePtr, AggregateFunction};
@@ -588,8 +589,8 @@ fn signed_delta(name: &str, op_arr: &Int8Array, row: usize) -> Result<Option<(i6
         return Ok(None);
     }
     match op_arr.value(row) {
-        0 => Ok(Some((1, 1))),
-        1 => Ok(Some((-1, -1))),
+        CHANGE_OP_INSERT => Ok(Some((1, 1))),
+        CHANGE_OP_DELETE => Ok(Some((-1, -1))),
         other => Err(format!("unknown {name} change_op: {other}")),
     }
 }
@@ -668,6 +669,7 @@ mod tests {
     use crate::connector::starrocks::managed::state_codec::{
         decode_sum_decimal128, decode_sum_int64, encode_sum_decimal128, encode_sum_int64,
     };
+    use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
     use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
 
     use super::super::super::{AggInputView, AggKind, AggSpec, AggStatePtr, AggregateFunction};
@@ -882,7 +884,10 @@ mod tests {
     #[test]
     fn sum_state_signed_int64_handles_delete() {
         let mut cell = StateCell::new(build_signed_spec(&signed_type(DataType::Int64)));
-        let input = signed_int_input(vec![Some(10), Some(5)], vec![Some(0), Some(1)]);
+        let input = signed_int_input(
+            vec![Some(10), Some(5)],
+            vec![Some(CHANGE_OP_INSERT), Some(CHANGE_OP_DELETE)],
+        );
         let input_slot = Some(input);
         let view = super::super::super::build_input_view(&cell.spec, &input_slot).unwrap();
 
@@ -959,7 +964,7 @@ mod tests {
         let mut cell = StateCell::new(build_signed_spec(&signed_type(DataType::Decimal128(18, 6))));
         let input = signed_decimal_input(
             vec![Some(1_000_000_i128), Some(250_000_i128)],
-            vec![Some(0), Some(1)],
+            vec![Some(CHANGE_OP_INSERT), Some(CHANGE_OP_DELETE)],
         );
         let input_slot = Some(input);
         let view = super::super::super::build_input_view(&cell.spec, &input_slot).unwrap();
@@ -974,7 +979,12 @@ mod tests {
         let mut cell = StateCell::new(build_signed_spec(&signed_type(DataType::Int64)));
         let input = signed_int_input_with_struct_nulls(
             vec![Some(10), Some(20), None, Some(7)],
-            vec![Some(0), Some(0), Some(0), None],
+            vec![
+                Some(CHANGE_OP_INSERT),
+                Some(CHANGE_OP_INSERT),
+                Some(CHANGE_OP_INSERT),
+                None,
+            ],
             vec![true, false, true, true],
         );
         let input_slot = Some(input);

@@ -9,6 +9,7 @@ use arrow::datatypes::DataType;
 use crate::connector::starrocks::managed::state_codec::{
     MultisetEntry, decode_multiset_with_key_type, encode_multiset, write_key_at,
 };
+use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
 use crate::exec::node::aggregate::AggFunction;
 
 use super::super::{AggInputView, AggKind, AggSpec, AggStatePtr, AggregateFunction};
@@ -455,8 +456,8 @@ fn signed_delta(name: &str, op_arr: &Int8Array, row: usize) -> Result<Option<i64
         return Ok(None);
     }
     match op_arr.value(row) {
-        0 => Ok(Some(1)),
-        1 => Ok(Some(-1)),
+        CHANGE_OP_INSERT => Ok(Some(1)),
+        CHANGE_OP_DELETE => Ok(Some(-1)),
         other => Err(format!("unknown {name} change_op: {other}")),
     }
 }
@@ -587,6 +588,7 @@ mod tests {
     use crate::connector::starrocks::managed::state_codec::{
         MultisetEntry, decode_multiset_with_key_type, encode_multiset,
     };
+    use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
     use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
 
     use super::super::super::{AggInputView, AggKind, AggSpec, AggStatePtr};
@@ -794,7 +796,7 @@ mod tests {
 
         cell.update(signed_i64_input(
             vec![Some(5), Some(5)],
-            vec![Some(0), Some(1)],
+            vec![Some(CHANGE_OP_INSERT), Some(CHANGE_OP_DELETE)],
             None,
         ));
 
@@ -804,7 +806,11 @@ mod tests {
     #[test]
     fn max_state_signed_same_bytes_as_min_state_signed() {
         let input_type = signed_input_type(DataType::Int64);
-        let input = signed_i64_input(vec![Some(5), Some(7)], vec![Some(0), Some(1)], None);
+        let input = signed_i64_input(
+            vec![Some(5), Some(7)],
+            vec![Some(CHANGE_OP_INSERT), Some(CHANGE_OP_DELETE)],
+            None,
+        );
         let mut min_cell = StateCell::new(build_spec("min_state_signed", &input_type));
         let mut max_cell = StateCell::new(build_spec("max_state_signed", &input_type));
 
@@ -819,7 +825,11 @@ mod tests {
         let input_type = signed_input_type(DataType::Int64);
         let mut cell = StateCell::new(build_spec("min_state_signed", &input_type));
 
-        cell.update(signed_i64_input(vec![Some(5)], vec![Some(1)], None));
+        cell.update(signed_i64_input(
+            vec![Some(5)],
+            vec![Some(CHANGE_OP_DELETE)],
+            None,
+        ));
 
         assert_eq!(
             decode_entries(&cell.final_bytes(), &DataType::Int64),
@@ -833,7 +843,7 @@ mod tests {
     #[test]
     fn max_state_signed_delete_only_matches_min_state_signed_bytes() {
         let input_type = signed_input_type(DataType::Int64);
-        let input = signed_i64_input(vec![Some(5)], vec![Some(1)], None);
+        let input = signed_i64_input(vec![Some(5)], vec![Some(CHANGE_OP_DELETE)], None);
         let mut min_cell = StateCell::new(build_spec("min_state_signed", &input_type));
         let mut max_cell = StateCell::new(build_spec("max_state_signed", &input_type));
 
@@ -857,7 +867,12 @@ mod tests {
 
         cell.update(signed_i64_input(
             vec![Some(1), Some(2), None, Some(4)],
-            vec![Some(0), Some(0), Some(0), None],
+            vec![
+                Some(CHANGE_OP_INSERT),
+                Some(CHANGE_OP_INSERT),
+                Some(CHANGE_OP_INSERT),
+                None,
+            ],
             Some(vec![true, false, true, true]),
         ));
 
@@ -1044,7 +1059,7 @@ mod tests {
         let err = cell
             .try_update(signed_i64_input(
                 vec![Some(1), Some(2)],
-                vec![Some(0), Some(7)],
+                vec![Some(CHANGE_OP_INSERT), Some(7)],
                 None,
             ))
             .unwrap_err();

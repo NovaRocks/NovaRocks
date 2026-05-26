@@ -8,6 +8,7 @@ use arrow::array::{
 use arrow::datatypes::DataType;
 
 use crate::connector::starrocks::managed::state_codec::{decode_bool_state, encode_bool_state};
+use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
 use crate::exec::node::aggregate::AggFunction;
 
 use super::super::{AggInputView, AggKind, AggSpec, AggStatePtr, AggregateFunction};
@@ -363,8 +364,8 @@ fn update_bool_state_signed(
             0
         } else {
             match op_arr.value(row) {
-                0 => 1,
-                1 => -1,
+                CHANGE_OP_INSERT => 1,
+                CHANGE_OP_DELETE => -1,
                 other => return Err(format!("unknown bool_state_signed change_op: {other}")),
             }
         };
@@ -421,6 +422,7 @@ mod tests {
     use arrow_buffer::NullBufferBuilder;
 
     use crate::connector::starrocks::managed::state_codec::{decode_bool_state, encode_bool_state};
+    use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
     use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
 
     use super::super::super::{AggInputView, AggKind, AggSpec, AggStatePtr, AggregateFunction};
@@ -612,7 +614,11 @@ mod tests {
         let mut cell = StateCell::new(spec);
         let input = signed_input(
             vec![Some(true), Some(false), Some(true)],
-            vec![Some(0), Some(0), Some(1)],
+            vec![
+                Some(CHANGE_OP_INSERT),
+                Some(CHANGE_OP_INSERT),
+                Some(CHANGE_OP_DELETE),
+            ],
         );
         let input_slot = Some(input);
         let view = super::super::super::build_input_view(&cell.spec, &input_slot).unwrap();
@@ -626,7 +632,11 @@ mod tests {
     fn bool_and_state_signed_same_bytes_as_bool_or_state_signed() {
         let input = signed_input(
             vec![Some(true), Some(false), Some(true)],
-            vec![Some(0), Some(0), Some(1)],
+            vec![
+                Some(CHANGE_OP_INSERT),
+                Some(CHANGE_OP_INSERT),
+                Some(CHANGE_OP_DELETE),
+            ],
         );
 
         let mut or_cell = StateCell::new(build_signed_spec("bool_or_state_signed"));
@@ -664,7 +674,7 @@ mod tests {
         let mut cell = StateCell::new(spec);
         let input = signed_input(
             vec![Some(true), None, Some(false)],
-            vec![Some(0), Some(0), None],
+            vec![Some(CHANGE_OP_INSERT), Some(CHANGE_OP_INSERT), None],
         );
         let input_slot = Some(input);
         let view = super::super::super::build_input_view(&cell.spec, &input_slot).unwrap();
@@ -680,7 +690,11 @@ mod tests {
         let mut cell = StateCell::new(spec);
         let input = signed_input_with_struct_nulls(
             vec![Some(true), Some(false), Some(true)],
-            vec![Some(0), Some(0), Some(1)],
+            vec![
+                Some(CHANGE_OP_INSERT),
+                Some(CHANGE_OP_INSERT),
+                Some(CHANGE_OP_DELETE),
+            ],
             vec![true, false, true],
         );
         let input_slot = Some(input);

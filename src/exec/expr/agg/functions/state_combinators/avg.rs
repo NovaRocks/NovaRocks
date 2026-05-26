@@ -161,6 +161,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
 
     use crate::connector::starrocks::managed::state_codec::encode_sum_decimal128;
+    use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
     use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
 
     use super::super::super::{AggInputView, AggSpec, AggStatePtr, AggregateFunction};
@@ -314,7 +315,10 @@ mod tests {
 
     #[test]
     fn avg_state_signed_bytes_equal_sum_state_signed_bytes() {
-        let input = signed_int_input(vec![Some(10), Some(5)], vec![Some(0), Some(1)]);
+        let input = signed_int_input(
+            vec![Some(10), Some(5)],
+            vec![Some(CHANGE_OP_INSERT), Some(CHANGE_OP_DELETE)],
+        );
         let input_type = signed_type(DataType::Int64);
         let avg_bytes = bytes_for(
             &AvgStateSignedAgg,
