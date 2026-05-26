@@ -158,6 +158,12 @@ impl IcebergMvRewriteContext {
             }
         }
 
+        // The target schema is the union of visible columns (those listed in
+        // `schema_contract.target.visible_columns`) and the hidden apply-key
+        // column (`schema_contract.target.hidden_apply_key.target_field_id`).
+        // The hidden apply-key field id can coincide with a visible column
+        // (when the apply-key aliases an existing user column) or be a
+        // distinct field (the common case, e.g. `__nova_base_row_id`).
         let schema_field_ids: BTreeSet<i32> = target_schema
             .as_ref()
             .as_struct()
@@ -165,12 +171,13 @@ impl IcebergMvRewriteContext {
             .iter()
             .map(|f| f.id)
             .collect();
-        let contract_field_ids: BTreeSet<i32> = schema_contract
+        let mut contract_field_ids: BTreeSet<i32> = schema_contract
             .target
             .visible_columns
             .iter()
             .map(|c| c.target_field_id)
             .collect();
+        contract_field_ids.insert(schema_contract.target.hidden_apply_key.target_field_id);
         if schema_field_ids != contract_field_ids {
             return Err(err(format!(
                 "target schema/contract field id mismatch: schema has {:?}, contract has {:?}",

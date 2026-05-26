@@ -47,6 +47,7 @@ use crate::engine::mv::lifecycle::{
     MvTarget, RefreshError, RefreshMode, RefreshPlan,
 };
 use crate::engine::mv::rebind::rewrite_select_sql_for_rebind;
+use crate::engine::mv::refresh_context::IcebergMvRefreshContext;
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::mv::{
     BeginIcebergMvRefreshRequest, CreateMvDefinitionRequest, MvRefreshFinalizeRequest,
@@ -1400,6 +1401,24 @@ pub(crate) fn refresh_iceberg_mv(
         ));
     }
 
+    let ctx = IcebergMvRefreshContext::new(
+        target.clone(),
+        mv_definition.mv_id,
+        current_catalog,
+        current_database,
+        Arc::new(mv_definition.clone()),
+        Arc::new(canonical_select_query.clone()),
+        Arc::from(base_refs.clone()),
+        Arc::new(pin.clone()),
+        Arc::new(target_entry.clone()),
+        iceberg_catalog.clone(),
+        target_loaded.table.clone(),
+    )?;
+    tracing::info!(
+        summary = ?ctx.rewrite.summary(),
+        "iceberg MV refresh context constructed"
+    );
+
     match (previous_snapshot_id, current_snapshot_id) {
         // Base table has no snapshot yet — nothing to refresh.
         (None, None) => {
@@ -1424,18 +1443,13 @@ pub(crate) fn refresh_iceberg_mv(
             )?;
             first_refresh_iceberg_mv(
                 state,
-                &target,
-                &target_entry,
-                &iceberg_catalog,
-                expected_main_snapshot_id,
+                &ctx,
                 &staging_branch,
                 refresh_id,
-                current_database,
-                mv_definition,
-                &pinned_full_select_sql,
                 base_ref,
                 cur,
                 &current_table_uuid,
+                &pinned_full_select_sql,
             )
         }
 
@@ -1466,12 +1480,7 @@ pub(crate) fn refresh_iceberg_mv(
         // Incremental: base snapshot has advanced.
         (Some(prev), Some(cur)) => incremental_refresh_iceberg_mv(
             state,
-            &target,
-            &target_entry,
-            &iceberg_catalog,
-            expected_main_snapshot_id,
-            current_database,
-            mv_definition,
+            &ctx,
             base_ref,
             prev,
             cur,
@@ -4051,19 +4060,21 @@ fn drop_iceberg_mv_staging_branch(
 #[allow(clippy::too_many_arguments)]
 fn first_refresh_iceberg_mv(
     state: &Arc<StandaloneState>,
-    target: &IcebergMvTarget,
-    target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    iceberg_catalog: &Arc<dyn iceberg::Catalog>,
-    expected_main_snapshot_id: Option<i64>,
+    ctx: &IcebergMvRefreshContext,
     staging_branch: &str,
     refresh_id: i64,
-    current_database: &str,
-    mv_definition: &StoredMvDefinition,
-    pinned_full_select_sql: &str,
     base_ref: &IcebergTableRef,
     base_snapshot_id: i64,
     current_table_uuid: &str,
+    pinned_full_select_sql: &str,
 ) -> Result<StatementResult, String> {
+    let target = &ctx.rewrite.target;
+    let target_entry = &*ctx.target_entry;
+    let iceberg_catalog = &ctx.iceberg_catalog;
+    let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
+    let current_database = ctx.rewrite.current_database.as_str();
+    let mv_definition = &*ctx.rewrite.mv_definition;
+
     // 1. Run SELECT and collect chunks.
     let physical_sql = iceberg_mv_physical_select_sql(pinned_full_select_sql)?;
     let chunks = match run_mv_full_select_chunks(state, current_database, &physical_sql) {
@@ -6660,12 +6671,7 @@ fn normalize_join_branch_snapshot_tables(
 #[allow(clippy::too_many_arguments)]
 fn incremental_refresh_iceberg_mv(
     state: &Arc<StandaloneState>,
-    target: &IcebergMvTarget,
-    target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    iceberg_catalog: &Arc<dyn iceberg::Catalog>,
-    expected_main_snapshot_id: Option<i64>,
-    current_database: &str,
-    mv_definition: &StoredMvDefinition,
+    ctx: &IcebergMvRefreshContext,
     base_ref: &IcebergTableRef,
     previous_snapshot_id: i64,
     current_snapshot_id: i64,
@@ -6673,6 +6679,12 @@ fn incremental_refresh_iceberg_mv(
     current_table_uuid: &str,
     pinned_full_select_sql: &str,
 ) -> Result<StatementResult, String> {
+    let target = &ctx.rewrite.target;
+    let target_entry = &*ctx.target_entry;
+    let iceberg_catalog = &ctx.iceberg_catalog;
+    let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
+    let current_database = ctx.rewrite.current_database.as_str();
+    let mv_definition = &*ctx.rewrite.mv_definition;
     // 1. Plan the change batch. If the standard Iceberg diff cannot be planned
     // safely, rebuild instead of risking an incorrect incremental result.
     let batch = match plan_changes(
