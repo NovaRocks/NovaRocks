@@ -186,10 +186,9 @@ fn build_sum_state_spec(
     };
     let declared_arg_type = func.types.as_ref().and_then(|t| t.input_arg_type.as_ref());
     let state_kind = if input_is_intermediate {
-        match declared_arg_type {
-            Some(arg_type) => sum_state_kind_from_logical_input(name, arg_type, signed)?,
-            None => SumStateKind::Int64,
-        }
+        let arg_type = declared_arg_type
+            .ok_or_else(|| format!("{name} merge requires original logical input type"))?;
+        sum_state_kind_from_logical_input(name, arg_type, signed)?
     } else {
         let input_type = input_type.ok_or_else(|| format!("{name} input type missing"))?;
         sum_state_kind_from_logical_input(name, input_type, signed)?
@@ -204,16 +203,8 @@ fn build_sum_state_spec(
 
     Ok(AggSpec {
         kind,
-        output_type: func
-            .types
-            .as_ref()
-            .and_then(|t| t.output_type.clone())
-            .unwrap_or(DataType::Binary),
-        intermediate_type: func
-            .types
-            .as_ref()
-            .and_then(|t| t.intermediate_type.clone())
-            .unwrap_or(DataType::Binary),
+        output_type: DataType::Binary,
+        intermediate_type: DataType::Binary,
         input_arg_type: func.types.as_ref().and_then(|t| t.input_arg_type.clone()),
         count_all: false,
     })
@@ -702,6 +693,24 @@ mod tests {
         }
     }
 
+    fn sum_func_with_signature(
+        name: &str,
+        output_type: DataType,
+        intermediate_type: DataType,
+        input_arg_type: Option<DataType>,
+    ) -> AggFunction {
+        AggFunction {
+            name: name.to_string(),
+            inputs: vec![],
+            input_is_intermediate: false,
+            types: Some(AggTypeSignature {
+                intermediate_type: Some(intermediate_type),
+                output_type: Some(output_type),
+                input_arg_type,
+            }),
+        }
+    }
+
     fn build_spec(input_type: &DataType) -> AggSpec {
         SumStateAgg
             .build_spec_from_type(&sum_func("sum_state"), Some(input_type), false)
@@ -1013,6 +1022,38 @@ mod tests {
     }
 
     #[test]
+    fn sum_state_rejects_non_binary_type_signature() {
+        let output_err = crate::exec::expr::agg::spec::build_spec_from_type(
+            &sum_func_with_signature(
+                "sum_state",
+                DataType::Float64,
+                DataType::Binary,
+                Some(DataType::Int64),
+            ),
+            Some(&DataType::Int64),
+            false,
+        )
+        .unwrap_err();
+        assert!(output_err.contains("aggregate output type signature mismatch for sum_state"));
+
+        let intermediate_err = crate::exec::expr::agg::spec::build_spec_from_type(
+            &sum_func_with_signature(
+                "sum_state_signed",
+                DataType::Binary,
+                DataType::Int64,
+                Some(signed_type(DataType::Int64)),
+            ),
+            Some(&signed_type(DataType::Int64)),
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            intermediate_err
+                .contains("aggregate intermediate type signature mismatch for sum_state_signed")
+        );
+    }
+
+    #[test]
     fn sum_state_rejects_float_input() {
         let err = SumStateAgg
             .build_spec_from_type(&sum_func("sum_state"), Some(&DataType::Float64), false)
@@ -1046,5 +1087,45 @@ mod tests {
         cell.merge(input);
 
         assert_eq!(final_decimal_state(&cell.finalize()), (0, 750_000));
+    }
+
+    #[test]
+    fn sum_state_decimal_merge_spec_uses_preserved_logical_type() {
+        let spec = super::super::super::build_spec_from_type(
+            &sum_func_with_arg("sum_state", DataType::Decimal128(18, 6)),
+            Some(&DataType::Binary),
+            true,
+        )
+        .unwrap();
+        assert!(matches!(spec.kind, AggKind::SumStateDecimal128));
+
+        let mut cell = StateCell::new(spec);
+        let left = encode_sum_decimal128(1, 1_000_000);
+        let right = encode_sum_decimal128(1, 2_000_000);
+        let input =
+            Arc::new(BinaryArray::from(vec![Some(&left[..]), Some(&right[..])])) as ArrayRef;
+
+        cell.merge(input);
+
+        assert_eq!(final_decimal_state(&cell.finalize()), (2, 3_000_000));
+    }
+
+    #[test]
+    fn sum_state_merge_spec_requires_preserved_logical_type() {
+        let missing_err = super::super::super::build_spec_from_type(
+            &sum_func("sum_state"),
+            Some(&DataType::Binary),
+            true,
+        )
+        .unwrap_err();
+        assert!(missing_err.contains("sum_state merge requires original logical input type"));
+
+        let binary_err = super::super::super::build_spec_from_type(
+            &sum_func_with_arg("sum_state", DataType::Binary),
+            Some(&DataType::Binary),
+            true,
+        )
+        .unwrap_err();
+        assert!(binary_err.contains("sum_state unsupported input type: Binary"));
     }
 }
