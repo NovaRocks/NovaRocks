@@ -28,6 +28,8 @@ pub(super) enum AggKind {
     CountStateSigned,
     BoolState,
     BoolStateSigned,
+    MinMaxState,
+    MinMaxStateSigned,
     CountDistinct,
     CountIf,
     SumInt,
@@ -183,6 +185,7 @@ use retention::RetentionAgg;
 use state_combinators::avg::{AvgStateAgg, AvgStateSignedAgg};
 use state_combinators::bool_or_and::{BoolStateAgg, BoolStateSignedAgg};
 use state_combinators::count::{CountStateAgg, CountStateSignedAgg};
+use state_combinators::min_max::{MinMaxStateAgg, MinMaxStateSignedAgg};
 use state_combinators::sum::{SumStateAgg, SumStateSignedAgg};
 use sum::SumAgg;
 use sum_map::SumMapAgg;
@@ -244,6 +247,8 @@ static COUNT_STATE: CountStateAgg = CountStateAgg;
 static COUNT_STATE_SIGNED: CountStateSignedAgg = CountStateSignedAgg;
 static BOOL_STATE: BoolStateAgg = BoolStateAgg;
 static BOOL_STATE_SIGNED: BoolStateSignedAgg = BoolStateSignedAgg;
+static MIN_MAX_STATE: MinMaxStateAgg = MinMaxStateAgg;
+static MIN_MAX_STATE_SIGNED: MinMaxStateSignedAgg = MinMaxStateSignedAgg;
 static COUNT_DISTINCT: CountDistinctAgg = CountDistinctAgg;
 static COUNT_IF: CountIfAgg = CountIfAgg;
 static GROUP_CONCAT: GroupConcatAgg = GroupConcatAgg;
@@ -288,6 +293,8 @@ fn resolve_by_func(func: &AggFunction) -> Result<&'static dyn AggregateFunction,
         "count_state_signed" => Ok(&COUNT_STATE_SIGNED),
         "bool_or_state" | "bool_and_state" => Ok(&BOOL_STATE),
         "bool_or_state_signed" | "bool_and_state_signed" => Ok(&BOOL_STATE_SIGNED),
+        "min_state" | "max_state" => Ok(&MIN_MAX_STATE),
+        "min_state_signed" | "max_state_signed" => Ok(&MIN_MAX_STATE_SIGNED),
         "count_distinct" | "multi_distinct_count" => Ok(&COUNT_DISTINCT),
         "count_if" => Ok(&COUNT_IF),
         "group_concat" | "string_agg" => Ok(&GROUP_CONCAT),
@@ -345,6 +352,8 @@ fn resolve_by_kind(kind: &AggKind) -> &'static dyn AggregateFunction {
         AggKind::CountStateSigned => &COUNT_STATE_SIGNED,
         AggKind::BoolState => &BOOL_STATE,
         AggKind::BoolStateSigned => &BOOL_STATE_SIGNED,
+        AggKind::MinMaxState => &MIN_MAX_STATE,
+        AggKind::MinMaxStateSigned => &MIN_MAX_STATE_SIGNED,
         AggKind::CountDistinct => &COUNT_DISTINCT,
         AggKind::CountIf => &COUNT_IF,
         AggKind::GroupConcat { .. } => &GROUP_CONCAT,
