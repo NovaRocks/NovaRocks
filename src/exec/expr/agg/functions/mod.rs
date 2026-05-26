@@ -138,7 +138,7 @@ mod ds_hll;
 mod ds_theta;
 mod group_concat;
 mod histogram;
-mod hll_raw;
+pub(crate) mod hll_raw;
 mod mann_whitney_u_test;
 mod map_agg;
 mod map_value_count;

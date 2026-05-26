@@ -33,6 +33,10 @@ pub(crate) use functions::common::{
     AggScalarValue, build_scalar_array as build_agg_scalar_array,
     compare_scalar_values as compare_agg_scalar_values, scalar_from_array as agg_scalar_from_array,
 };
+pub(crate) use functions::hll_raw::{
+    HLL_REGISTERS_COUNT, estimate_cardinality_from_registers, hash_array_value_for_hll,
+    hash_bytes_for_hll, update_register_from_hash,
+};
 
 use std::sync::Arc;
 

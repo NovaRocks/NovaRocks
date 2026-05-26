@@ -36,7 +36,7 @@ const HLL_DATA_SPARSE: u8 = 2;
 const HLL_DATA_FULL: u8 = 3;
 
 const HLL_COLUMN_PRECISION: usize = 14;
-const HLL_REGISTERS_COUNT: usize = 16 * 1024;
+pub(crate) const HLL_REGISTERS_COUNT: usize = 16 * 1024;
 const HLL_SPARSE_THRESHOLD: usize = 4096;
 
 const MURMUR_PRIME: u64 = 0xc6a4_a793_5bd1_e995;
@@ -105,12 +105,22 @@ fn ensure_registers(state: &mut HllRawState) -> &mut [u8; HLL_REGISTERS_COUNT] {
         .get_or_insert_with(|| Box::new([0u8; HLL_REGISTERS_COUNT]))
 }
 
-fn update_register_from_hash(state: &mut HllRawState, hash_value: u64) {
+fn update_state_register_from_hash(state: &mut HllRawState, hash_value: u64) {
     if hash_value == 0 {
         return;
     }
     state.has_value = true;
     let registers = ensure_registers(state);
+    update_register_from_hash(registers, hash_value);
+}
+
+pub(crate) fn update_register_from_hash(
+    registers: &mut [u8; HLL_REGISTERS_COUNT],
+    hash_value: u64,
+) {
+    if hash_value == 0 {
+        return;
+    }
     let idx = (hash_value % HLL_REGISTERS_COUNT as u64) as usize;
     let mut shifted = hash_value >> HLL_COLUMN_PRECISION;
     shifted |= 1_u64 << (64 - HLL_COLUMN_PRECISION);
@@ -122,7 +132,7 @@ fn update_register_from_hash(state: &mut HllRawState, hash_value: u64) {
 
 fn merge_as_opaque_payload(state: &mut HllRawState, bytes: &[u8]) {
     let hash = murmur_hash64a(bytes, MURMUR_SEED);
-    update_register_from_hash(state, hash);
+    update_state_register_from_hash(state, hash);
 }
 
 fn merge_hll_bytes(state: &mut HllRawState, bytes: &[u8]) -> Result<(), String> {
@@ -151,7 +161,7 @@ fn merge_hll_bytes(state: &mut HllRawState, bytes: &[u8]) -> Result<(), String> 
                         .map_err(|_| "hll_raw decode EXPLICIT hash failed".to_string())?,
                 );
                 pos += 8;
-                update_register_from_hash(state, hash);
+                update_state_register_from_hash(state, hash);
             }
             Ok(())
         }
@@ -290,6 +300,10 @@ fn murmur_hash64a(data: &[u8], seed: u32) -> u64 {
     h
 }
 
+pub(crate) fn hash_bytes_for_hll(bytes: &[u8]) -> u64 {
+    murmur_hash64a(bytes, MURMUR_SEED)
+}
+
 fn canonical_agg_name(name: &str) -> &str {
     name.split_once('|').map(|(base, _)| base).unwrap_or(name)
 }
@@ -302,6 +316,10 @@ fn estimate_cardinality(state: &HllRawState) -> i64 {
         return 0;
     };
 
+    estimate_cardinality_from_registers(registers)
+}
+
+pub(crate) fn estimate_cardinality_from_registers(registers: &[u8; HLL_REGISTERS_COUNT]) -> i64 {
     let num_streams = HLL_REGISTERS_COUNT as f64;
     let alpha = match HLL_REGISTERS_COUNT {
         16 => 0.673,
@@ -336,6 +354,134 @@ fn estimate_cardinality(state: &HllRawState) -> i64 {
     }
 
     estimate.max(0.0).round() as i64
+}
+
+pub(crate) fn hash_array_value_for_hll(
+    array: &ArrayRef,
+    row: usize,
+) -> Result<Option<u64>, String> {
+    if row >= array.len() {
+        return Err(format!(
+            "hll_raw row {row} out of bounds for len {}",
+            array.len()
+        ));
+    }
+    if array.is_null(row) {
+        return Ok(None);
+    }
+
+    macro_rules! hash_primitive_value {
+        ($array_ty:ty, $name:literal) => {{
+            let arr = array
+                .as_any()
+                .downcast_ref::<$array_ty>()
+                .ok_or_else(|| format!("failed to downcast to {}", $name))?;
+            Ok(Some(hash_bytes_for_hll(&arr.value(row).to_le_bytes())))
+        }};
+    }
+
+    match array.data_type() {
+        DataType::Boolean => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| "failed to downcast to BooleanArray".to_string())?;
+            let value = if arr.value(row) { 1u8 } else { 0u8 };
+            Ok(Some(hash_bytes_for_hll(&[value])))
+        }
+        DataType::Int8 => hash_primitive_value!(Int8Array, "Int8Array"),
+        DataType::Int16 => hash_primitive_value!(Int16Array, "Int16Array"),
+        DataType::Int32 => hash_primitive_value!(Int32Array, "Int32Array"),
+        DataType::Int64 => hash_primitive_value!(Int64Array, "Int64Array"),
+        DataType::Float32 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| "failed to downcast to Float32Array".to_string())?;
+            Ok(Some(hash_bytes_for_hll(
+                &canonical_f32_bits_for_hll(arr.value(row)).to_le_bytes(),
+            )))
+        }
+        DataType::Float64 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| "failed to downcast to Float64Array".to_string())?;
+            Ok(Some(hash_bytes_for_hll(
+                &canonical_f64_bits_for_hll(arr.value(row)).to_le_bytes(),
+            )))
+        }
+        DataType::Date32 => hash_primitive_value!(Date32Array, "Date32Array"),
+        DataType::Timestamp(unit, _) => match unit {
+            TimeUnit::Second => hash_primitive_value!(TimestampSecondArray, "TimestampSecondArray"),
+            TimeUnit::Millisecond => {
+                hash_primitive_value!(TimestampMillisecondArray, "TimestampMillisecondArray")
+            }
+            TimeUnit::Microsecond => {
+                hash_primitive_value!(TimestampMicrosecondArray, "TimestampMicrosecondArray")
+            }
+            TimeUnit::Nanosecond => {
+                hash_primitive_value!(TimestampNanosecondArray, "TimestampNanosecondArray")
+            }
+        },
+        DataType::Decimal128(_, _) => hash_primitive_value!(Decimal128Array, "Decimal128Array"),
+        DataType::Utf8 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
+            Ok(Some(hash_bytes_for_hll(arr.value(row).as_bytes())))
+        }
+        DataType::LargeUtf8 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .ok_or_else(|| "failed to downcast to LargeStringArray".to_string())?;
+            Ok(Some(hash_bytes_for_hll(arr.value(row).as_bytes())))
+        }
+        DataType::Binary => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| "failed to downcast to BinaryArray".to_string())?;
+            Ok(Some(hash_bytes_for_hll(arr.value(row))))
+        }
+        DataType::FixedSizeBinary(_) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .ok_or_else(|| "failed to downcast to FixedSizeBinaryArray".to_string())?;
+            Ok(Some(hash_bytes_for_hll(arr.value(row))))
+        }
+        DataType::LargeBinary => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .ok_or_else(|| "failed to downcast to LargeBinaryArray".to_string())?;
+            Ok(Some(hash_bytes_for_hll(arr.value(row))))
+        }
+        other => Err(format!("hll_raw does not support input type {:?}", other)),
+    }
+}
+
+fn canonical_f32_bits_for_hll(value: f32) -> u32 {
+    if value.is_nan() {
+        0x7FC0_0000
+    } else if value == 0.0 {
+        0.0f32.to_bits()
+    } else {
+        value.to_bits()
+    }
+}
+
+fn canonical_f64_bits_for_hll(value: f64) -> u64 {
+    if value.is_nan() {
+        0x7FF8_0000_0000_0000
+    } else if value == 0.0 {
+        0.0f64.to_bits()
+    } else {
+        value.to_bits()
+    }
 }
 
 fn merge_input_array(
@@ -398,162 +544,15 @@ fn hash_update_input_array(
     offset: usize,
     state_ptrs: &[AggStatePtr],
 ) -> Result<(), String> {
-    macro_rules! hash_from_bytes {
-        ($arr:expr, $row:ident => $bytes:expr) => {{
-            for ($row, &base) in state_ptrs.iter().enumerate() {
-                if $arr.is_null($row) {
-                    continue;
-                }
-                let hash = murmur_hash64a($bytes.as_ref(), MURMUR_SEED);
-                let ptr = unsafe { (base as *mut u8).add(offset) };
-                let state = unsafe { get_or_init_state(ptr) };
-                update_register_from_hash(state, hash);
-            }
-            Ok(())
-        }};
+    for (row, &base) in state_ptrs.iter().enumerate() {
+        let Some(hash) = hash_array_value_for_hll(array, row)? else {
+            continue;
+        };
+        let ptr = unsafe { (base as *mut u8).add(offset) };
+        let state = unsafe { get_or_init_state(ptr) };
+        update_state_register_from_hash(state, hash);
     }
-
-    match array.data_type() {
-        DataType::Boolean => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| "failed to downcast to BooleanArray".to_string())?;
-            for (row, &base) in state_ptrs.iter().enumerate() {
-                if arr.is_null(row) {
-                    continue;
-                }
-                let value = if arr.value(row) { 1u8 } else { 0u8 };
-                let hash = murmur_hash64a(&[value], MURMUR_SEED);
-                let ptr = unsafe { (base as *mut u8).add(offset) };
-                let state = unsafe { get_or_init_state(ptr) };
-                update_register_from_hash(state, hash);
-            }
-            Ok(())
-        }
-        DataType::Int8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int8Array>()
-                .ok_or_else(|| "failed to downcast to Int8Array".to_string())?;
-            hash_from_bytes!(arr, row => arr.value(row).to_le_bytes())
-        }
-        DataType::Int16 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int16Array>()
-                .ok_or_else(|| "failed to downcast to Int16Array".to_string())?;
-            hash_from_bytes!(arr, row => arr.value(row).to_le_bytes())
-        }
-        DataType::Int32 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .ok_or_else(|| "failed to downcast to Int32Array".to_string())?;
-            hash_from_bytes!(arr, row => arr.value(row).to_le_bytes())
-        }
-        DataType::Int64 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| "failed to downcast to Int64Array".to_string())?;
-            hash_from_bytes!(arr, row => arr.value(row).to_le_bytes())
-        }
-        DataType::Float32 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| "failed to downcast to Float32Array".to_string())?;
-            hash_from_bytes!(arr, row => arr.value(row).to_le_bytes())
-        }
-        DataType::Float64 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| "failed to downcast to Float64Array".to_string())?;
-            hash_from_bytes!(arr, row => arr.value(row).to_le_bytes())
-        }
-        DataType::Date32 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Date32Array>()
-                .ok_or_else(|| "failed to downcast to Date32Array".to_string())?;
-            hash_from_bytes!(arr, row => arr.value(row).to_le_bytes())
-        }
-        DataType::Timestamp(unit, _) => match unit {
-            TimeUnit::Second => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<TimestampSecondArray>()
-                    .ok_or_else(|| "failed to downcast to TimestampSecondArray".to_string())?;
-                hash_from_bytes!(arr, row => arr.value(row).to_le_bytes())
-            }
-            TimeUnit::Millisecond => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<TimestampMillisecondArray>()
-                    .ok_or_else(|| "failed to downcast to TimestampMillisecondArray".to_string())?;
-                hash_from_bytes!(arr, row => arr.value(row).to_le_bytes())
-            }
-            TimeUnit::Microsecond => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<TimestampMicrosecondArray>()
-                    .ok_or_else(|| "failed to downcast to TimestampMicrosecondArray".to_string())?;
-                hash_from_bytes!(arr, row => arr.value(row).to_le_bytes())
-            }
-            TimeUnit::Nanosecond => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<TimestampNanosecondArray>()
-                    .ok_or_else(|| "failed to downcast to TimestampNanosecondArray".to_string())?;
-                hash_from_bytes!(arr, row => arr.value(row).to_le_bytes())
-            }
-        },
-        DataType::Decimal128(_, _) => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Decimal128Array>()
-                .ok_or_else(|| "failed to downcast to Decimal128Array".to_string())?;
-            hash_from_bytes!(arr, row => arr.value(row).to_le_bytes())
-        }
-        DataType::Utf8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
-            hash_from_bytes!(arr, row => arr.value(row).as_bytes())
-        }
-        DataType::LargeUtf8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .ok_or_else(|| "failed to downcast to LargeStringArray".to_string())?;
-            hash_from_bytes!(arr, row => arr.value(row).as_bytes())
-        }
-        DataType::Binary => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| "failed to downcast to BinaryArray".to_string())?;
-            hash_from_bytes!(arr, row => arr.value(row))
-        }
-        DataType::FixedSizeBinary(_) => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<FixedSizeBinaryArray>()
-                .ok_or_else(|| "failed to downcast to FixedSizeBinaryArray".to_string())?;
-            hash_from_bytes!(arr, row => arr.value(row))
-        }
-        DataType::LargeBinary => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<LargeBinaryArray>()
-                .ok_or_else(|| "failed to downcast to LargeBinaryArray".to_string())?;
-            hash_from_bytes!(arr, row => arr.value(row))
-        }
-        other => Err(format!("hll_raw does not support input type {:?}", other)),
-    }
+    Ok(())
 }
 
 impl AggregateFunction for HllRawAgg {
