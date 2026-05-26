@@ -9,7 +9,7 @@
 //! Constructed once per refresh attempt, after pin capture and schema-contract
 //! rebind. See `docs/superpowers/specs/2026-05-26-iceberg-mv-rewrite-context-design.md`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use iceberg::spec::Schema;
@@ -141,14 +141,14 @@ impl IcebergMvRewriteContext {
             }
         }
 
-        let schema_field_ids: std::collections::BTreeSet<i32> = target_schema
+        let schema_field_ids: BTreeSet<i32> = target_schema
             .as_ref()
             .as_struct()
             .fields()
             .iter()
             .map(|f| f.id)
             .collect();
-        let contract_field_ids: std::collections::BTreeSet<i32> = schema_contract
+        let contract_field_ids: BTreeSet<i32> = schema_contract
             .target
             .visible_columns
             .iter()
@@ -156,9 +156,8 @@ impl IcebergMvRewriteContext {
             .collect();
         if schema_field_ids != contract_field_ids {
             return Err(err(format!(
-                "target schema/contract column count mismatch: schema has {}, contract has {}",
-                schema_field_ids.len(),
-                contract_field_ids.len()
+                "target schema/contract field id mismatch: schema has {:?}, contract has {:?}",
+                schema_field_ids, contract_field_ids
             )));
         }
 
@@ -651,7 +650,42 @@ mod tests {
         )
         .expect_err("schema/contract mismatch must fail");
         assert!(
-            err.contains("target schema/contract column count mismatch"),
+            err.contains("target schema/contract field id mismatch"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn from_parts_rejects_target_schema_contract_field_ids_differ_same_count() {
+        let target = make_target();
+        let mv_def = Arc::new(make_mv_definition());
+        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
+        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
+        let schema = make_target_schema();
+        // Contract has two columns (matching schema count) but one has a wrong
+        // target_field_id (schema has 100/101; contract claims 100/999).
+        let mut contract = make_schema_contract();
+        contract.target.visible_columns[1].target_field_id = 999;
+        let contract = Arc::new(contract);
+
+        let err = IcebergMvRewriteContext::from_parts(
+            target,
+            42,
+            None,
+            "db".to_string(),
+            mv_def,
+            query,
+            base_refs,
+            pin,
+            Some(99),
+            "uuid-tgt".to_string(),
+            schema,
+            Some(contract),
+        )
+        .expect_err("field-id set mismatch must fail even when counts match");
+        assert!(
+            err.contains("target schema/contract field id mismatch"),
             "got: {err}"
         );
     }
