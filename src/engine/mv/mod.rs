@@ -9,4 +9,5 @@ pub(crate) mod iceberg_target_apply;
 pub(crate) mod lifecycle;
 pub(crate) mod partition;
 pub(crate) mod rebind;
+pub(crate) mod refresh_context;
 pub(crate) mod schema_contract;
