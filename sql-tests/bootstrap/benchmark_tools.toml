@@ -1,0 +1,10 @@
+[ssb]
+name = "ssb-dbgen"
+version = "219403ad7d1dd32ae1f97b5553abf92129fccd7f"
+archive_url = "https://github.com/electrum/ssb-dbgen/archive/219403ad7d1dd32ae1f97b5553abf92129fccd7f.zip"
+archive_sha256 = "2653bb57c165bbf9b41ea37d1da6cd2f81c0505a6ed20839111985f53dec2ee6"
+archive_root = "ssb-dbgen-219403ad7d1dd32ae1f97b5553abf92129fccd7f"
+build_command = "make"
+binary = "dbgen"
+default_scale = "1"
+raw_tables = ["customer", "date", "lineorder", "part", "supplier"]
