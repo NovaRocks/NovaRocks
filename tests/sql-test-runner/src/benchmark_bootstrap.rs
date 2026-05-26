@@ -106,7 +106,7 @@ pub fn build_benchmark_bootstrap_command(
         .arg("--mysql-user")
         .arg(mysql_user);
 
-    if let Some(password) = mysql_password {
+    if let Some(password) = mysql_password.filter(|password| !password.is_empty()) {
         command.arg("--mysql-password").arg(password);
     }
     if check {
@@ -417,5 +417,28 @@ mod tests {
 
         assert!(preview.contains("--mysql-password <redacted>"));
         assert!(!preview.contains("very-secret-password"));
+    }
+
+    #[test]
+    fn skips_empty_mysql_password_argument() {
+        let command = build_benchmark_bootstrap_command(
+            Path::new("sql-tests/bootstrap/bootstrap_benchmark_data.sh"),
+            "ssb",
+            "1",
+            "iceberg_cat",
+            "127.0.0.1",
+            "23223",
+            "root",
+            Some(""),
+            true,
+            false,
+        );
+
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(!args.iter().any(|arg| arg == "--mysql-password"));
     }
 }
