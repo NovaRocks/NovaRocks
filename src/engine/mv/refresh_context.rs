@@ -27,6 +27,7 @@ use super::iceberg_refresh::IcebergMvTarget;
 /// Future optimizer rewrite rules consume `Arc<IcebergMvRewriteContext>` and
 /// MUST NOT depend on `iceberg::table::Table`, `iceberg::Catalog`, or
 /// `IcebergCatalogEntry` — those live in `IcebergMvRefreshContext`.
+#[derive(Debug)]
 pub(crate) struct IcebergMvRewriteContext {
     // ---- Identity ----
     pub target: IcebergMvTarget,
@@ -64,6 +65,10 @@ pub(crate) struct IcebergMvRefreshContext {
     pub target_table: iceberg::table::Table,
 }
 
+fn err(msg: impl Into<String>) -> String {
+    format!("IcebergMvRewriteContext::new: {}", msg.into())
+}
+
 impl IcebergMvRewriteContext {
     /// Build the rewrite layer from already-derived primitive inputs.
     ///
@@ -84,10 +89,91 @@ impl IcebergMvRewriteContext {
         target_snapshot_id: Option<i64>,
         target_table_uuid: String,
         target_schema: Arc<Schema>,
-        schema_contract: Arc<MvSchemaContract>,
+        schema_contract: Option<Arc<MvSchemaContract>>,
     ) -> Result<Self, String> {
+        let target_fqn = format!(
+            "{}.{}.{}",
+            target.catalog, target.namespace, target.table
+        );
+        let schema_contract = schema_contract.ok_or_else(|| {
+            err(format!(
+                "missing schema contract on target {target_fqn}; rebuild or recreate the MV"
+            ))
+        })?;
+
+        if base_refs.is_empty() {
+            return Err(err("mv definition has no base table refs"));
+        }
+
+        let pin_count = pin.len();
+        if pin_count != base_refs.len() {
+            return Err(err(format!(
+                "refresh pin covers {} bases but definition has {}",
+                pin_count,
+                base_refs.len()
+            )));
+        }
+
+        for base_ref in base_refs.iter() {
+            if pin.uuid(base_ref).is_none() {
+                return Err(err(format!(
+                    "refresh pin missing uuid for base {}",
+                    base_ref.fqn()
+                )));
+            }
+        }
+
         let previous_snapshot_ids = mv_definition.last_refresh_snapshots.clone();
         let previous_table_uuids = mv_definition.last_refresh_table_uuids.clone();
+
+        for base_ref in base_refs.iter() {
+            let fqn = base_ref.fqn();
+            if let Some(previous_uuid) = previous_table_uuids.get(&fqn) {
+                let current_uuid = pin
+                    .uuid(base_ref)
+                    .expect("uuid presence verified above")
+                    .to_string();
+                if previous_uuid != &current_uuid {
+                    return Err(err(format!(
+                        "base table identity changed for {fqn}; incremental refresh unsafe, rebuild the MV"
+                    )));
+                }
+            }
+        }
+
+        let schema_field_ids: std::collections::BTreeSet<i32> = target_schema
+            .as_ref()
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|f| f.id)
+            .collect();
+        let contract_field_ids: std::collections::BTreeSet<i32> = schema_contract
+            .target
+            .visible_columns
+            .iter()
+            .map(|c| c.target_field_id)
+            .collect();
+        if schema_field_ids != contract_field_ids {
+            return Err(err(format!(
+                "target schema/contract column count mismatch: schema has {}, contract has {}",
+                schema_field_ids.len(),
+                contract_field_ids.len()
+            )));
+        }
+
+        let apply_key_name = &schema_contract.target.hidden_apply_key.column_name;
+        let apply_key_in_schema = target_schema
+            .as_ref()
+            .as_struct()
+            .fields()
+            .iter()
+            .any(|f| &f.name == apply_key_name);
+        if !apply_key_in_schema {
+            return Err(err(format!(
+                "target apply-key column {apply_key_name} not present in target schema"
+            )));
+        }
 
         Ok(Self {
             target,
@@ -130,13 +216,7 @@ impl IcebergMvRefreshContext {
         let target_snapshot_id = metadata.current_snapshot().map(|s| s.snapshot_id());
         let target_table_uuid = metadata.uuid().to_string();
         let target_schema = metadata.current_schema().clone();
-        let schema_contract_opt = mv_definition.schema_contract.clone().map(Arc::new);
-        let schema_contract = schema_contract_opt.ok_or_else(|| {
-            format!(
-                "IcebergMvRewriteContext::new: missing schema contract on target {}.{}.{}; rebuild or recreate the MV",
-                target.catalog, target.namespace, target.table
-            )
-        })?;
+        let schema_contract = mv_definition.schema_contract.clone().map(Arc::new);
 
         let rewrite = IcebergMvRewriteContext::from_parts(
             target,
@@ -337,7 +417,7 @@ mod tests {
             Some(99),
             "uuid-tgt".to_string(),
             schema.clone(),
-            contract.clone(),
+            Some(contract.clone()),
         )
         .expect("constructor should succeed on happy path");
 
@@ -359,5 +439,250 @@ mod tests {
         assert_eq!(ctx.target_table_uuid, "uuid-tgt");
         assert!(Arc::ptr_eq(&ctx.target_schema, &schema));
         assert!(Arc::ptr_eq(&ctx.schema_contract, &contract));
+    }
+
+    #[test]
+    fn from_parts_rejects_missing_schema_contract() {
+        let target = make_target();
+        let mv_def = Arc::new(make_mv_definition());
+        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
+        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
+        let schema = make_target_schema();
+
+        let err_msg = IcebergMvRewriteContext::from_parts(
+            target,
+            42,
+            None,
+            "db".to_string(),
+            mv_def,
+            query,
+            base_refs,
+            pin,
+            Some(99),
+            "uuid-tgt".to_string(),
+            schema,
+            None,
+        )
+        .expect_err("missing schema contract must fail");
+        assert!(
+            err_msg.contains("missing schema contract on target tgt.db.mv"),
+            "got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn from_parts_rejects_empty_base_refs() {
+        let target = make_target();
+        let mv_def = Arc::new(make_mv_definition());
+        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
+        let base_refs: Arc<[IcebergTableRef]> = Arc::from(Vec::<IcebergTableRef>::new());
+        let pin = Arc::new(RefreshSnapshotPin::default());
+        let schema = make_target_schema();
+        let contract = Arc::new(make_schema_contract());
+
+        let err = IcebergMvRewriteContext::from_parts(
+            target,
+            42,
+            None,
+            "db".to_string(),
+            mv_def,
+            query,
+            base_refs,
+            pin,
+            Some(99),
+            "uuid-tgt".to_string(),
+            schema,
+            Some(contract),
+        )
+        .expect_err("empty base_refs must fail");
+        assert!(err.contains("no base table refs"), "got: {err}");
+    }
+
+    #[test]
+    fn from_parts_rejects_pin_coverage_mismatch() {
+        let target = make_target();
+        let mv_def = Arc::new(make_mv_definition());
+        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
+        let base_refs: Arc<[IcebergTableRef]> =
+            Arc::from(vec![make_ref("ice", "db", "b"), make_ref("ice", "db", "c")]);
+        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
+        let schema = make_target_schema();
+        let contract = Arc::new(make_schema_contract());
+
+        let err = IcebergMvRewriteContext::from_parts(
+            target,
+            42,
+            None,
+            "db".to_string(),
+            mv_def,
+            query,
+            base_refs,
+            pin,
+            Some(99),
+            "uuid-tgt".to_string(),
+            schema,
+            Some(contract),
+        )
+        .expect_err("pin coverage mismatch must fail");
+        assert!(err.contains("refresh pin covers"), "got: {err}");
+    }
+
+    #[test]
+    fn from_parts_rejects_pin_missing_uuid() {
+        let target = make_target();
+        let mv_def = Arc::new(make_mv_definition());
+        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
+        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        // Pin has the right count but the entry is for a different fqn.
+        let pin = Arc::new(make_pin(&[("ice.db.OTHER", 22, "uuid-x")]));
+        let schema = make_target_schema();
+        let contract = Arc::new(make_schema_contract());
+
+        let err = IcebergMvRewriteContext::from_parts(
+            target,
+            42,
+            None,
+            "db".to_string(),
+            mv_def,
+            query,
+            base_refs,
+            pin,
+            Some(99),
+            "uuid-tgt".to_string(),
+            schema,
+            Some(contract),
+        )
+        .expect_err("missing pin uuid must fail");
+        assert!(err.contains("refresh pin missing uuid for base"), "got: {err}");
+    }
+
+    #[test]
+    fn from_parts_rejects_base_identity_drift() {
+        let target = make_target();
+        let mut def = make_mv_definition();
+        def.last_refresh_table_uuids
+            .insert("ice.db.b".to_string(), "uuid-OLD".to_string());
+        let mv_def = Arc::new(def);
+        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
+        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-NEW")]));
+        let schema = make_target_schema();
+        let contract = Arc::new(make_schema_contract());
+
+        let err = IcebergMvRewriteContext::from_parts(
+            target,
+            42,
+            None,
+            "db".to_string(),
+            mv_def,
+            query,
+            base_refs,
+            pin,
+            Some(99),
+            "uuid-tgt".to_string(),
+            schema,
+            Some(contract),
+        )
+        .expect_err("identity drift must fail");
+        assert!(
+            err.contains("base table identity changed"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn from_parts_first_refresh_passes_with_empty_previous() {
+        let target = make_target();
+        let mut def = make_mv_definition();
+        def.last_refresh_snapshots.clear();
+        def.last_refresh_table_uuids.clear();
+        let mv_def = Arc::new(def);
+        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
+        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
+        let schema = make_target_schema();
+        let contract = Arc::new(make_schema_contract());
+
+        let ctx = IcebergMvRewriteContext::from_parts(
+            target,
+            42,
+            None,
+            "db".to_string(),
+            mv_def,
+            query,
+            base_refs,
+            pin,
+            Some(99),
+            "uuid-tgt".to_string(),
+            schema,
+            Some(contract),
+        )
+        .expect("first refresh must succeed");
+        assert!(ctx.previous_snapshot_ids.is_empty());
+        assert!(ctx.previous_table_uuids.is_empty());
+    }
+
+    #[test]
+    fn from_parts_rejects_target_schema_contract_field_mismatch() {
+        let target = make_target();
+        let mv_def = Arc::new(make_mv_definition());
+        let query = Arc::new(parse_query("SELECT k FROM ice.db.b"));
+        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
+        let schema = make_target_schema();
+        let mut contract = make_schema_contract();
+        contract.target.visible_columns.pop();
+        let contract = Arc::new(contract);
+
+        let err = IcebergMvRewriteContext::from_parts(
+            target,
+            42,
+            None,
+            "db".to_string(),
+            mv_def,
+            query,
+            base_refs,
+            pin,
+            Some(99),
+            "uuid-tgt".to_string(),
+            schema,
+            Some(contract),
+        )
+        .expect_err("schema/contract mismatch must fail");
+        assert!(
+            err.contains("target schema/contract column count mismatch"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn from_parts_rejects_apply_key_not_in_target_schema() {
+        let target = make_target();
+        let mv_def = Arc::new(make_mv_definition());
+        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
+        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
+        let schema = make_target_schema();
+        let mut contract = make_schema_contract();
+        contract.target.hidden_apply_key.column_name = "nonexistent".to_string();
+        let contract = Arc::new(contract);
+
+        let err = IcebergMvRewriteContext::from_parts(
+            target,
+            42,
+            None,
+            "db".to_string(),
+            mv_def,
+            query,
+            base_refs,
+            pin,
+            Some(99),
+            "uuid-tgt".to_string(),
+            schema,
+            Some(contract),
+        )
+        .expect_err("apply-key absence must fail");
+        assert!(err.contains("apply-key column"), "got: {err}");
     }
 }
