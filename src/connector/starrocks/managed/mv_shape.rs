@@ -611,13 +611,33 @@ fn classify_aggregate_call(
     let sqlparser::ast::FunctionArguments::List(args) = &function.args else {
         return Err(aggregate_error());
     };
-    if args.duplicate_treatment.is_some() || !args.clauses.is_empty() {
+    if !args.clauses.is_empty() {
         return Err(aggregate_error());
     }
 
     let function_name = function.name.to_string().to_ascii_lowercase();
+    if function_name == "count" {
+        if let Some(duplicate_treatment) = &args.duplicate_treatment {
+            return match duplicate_treatment {
+                sqlparser::ast::DuplicateTreatment::Distinct => {
+                    classify_count_distinct_from_distinct_syntax(&args.args, output_name)
+                }
+                sqlparser::ast::DuplicateTreatment::All => Err(aggregate_error()),
+            };
+        }
+    }
+    if args.duplicate_treatment.is_some() {
+        return Err(format!(
+            "incremental aggregate MV DISTINCT modifier is not supported on `{function_name}`; only count(DISTINCT col) is supported"
+        ));
+    }
+
     let (function, input) = match function_name.as_str() {
         "count" => classify_count_input(&args.args)?,
+        "count_distinct" | "multi_distinct_count" => (
+            AggregateFunctionKind::CountDistinct,
+            classify_count_distinct_input(&args.args)?,
+        ),
         "sum" => (AggregateFunctionKind::Sum, classify_sum_input(&args.args)?),
         "avg" => (AggregateFunctionKind::Avg, classify_avg_input(&args.args)?),
         "min" => (
@@ -646,6 +666,17 @@ fn classify_aggregate_call(
     })
 }
 
+fn classify_count_distinct_from_distinct_syntax(
+    args: &[sqlparser::ast::FunctionArg],
+    output_name: String,
+) -> Result<AggregateCallShape, String> {
+    Ok(AggregateCallShape {
+        output_name,
+        function: AggregateFunctionKind::CountDistinct,
+        input: classify_count_distinct_input(args)?,
+    })
+}
+
 fn classify_count_input(
     args: &[sqlparser::ast::FunctionArg],
 ) -> Result<(AggregateFunctionKind, AggregateInput), String> {
@@ -665,6 +696,25 @@ fn classify_count_input(
         }
         sqlparser::ast::FunctionArgExpr::QualifiedWildcard(_) => Err(aggregate_error()),
     }
+}
+
+fn classify_count_distinct_input(
+    args: &[sqlparser::ast::FunctionArg],
+) -> Result<AggregateInput, String> {
+    if args.len() > 1 {
+        return Err(format!(
+            "COUNT(DISTINCT) with {} arguments is not supported in incremental materialized views; multi-column DISTINCT cannot be incrementally maintained",
+            args.len()
+        ));
+    }
+    let [arg] = args else {
+        return Err("COUNT(DISTINCT) requires exactly one column expression".to_string());
+    };
+    let sqlparser::ast::FunctionArgExpr::Expr(expr) = simple_aggregate_arg_expr(arg)? else {
+        return Err("COUNT(DISTINCT *) is not supported".to_string());
+    };
+    reject_unsupported_expr(expr).map_err(aggregate_expr_error)?;
+    Ok(AggregateInput::Expr(Box::new(expr.clone())))
 }
 
 fn classify_sum_input(args: &[sqlparser::ast::FunctionArg]) -> Result<AggregateInput, String> {
@@ -1361,7 +1411,7 @@ fn projection_filter_error() -> String {
 }
 
 fn aggregate_error() -> String {
-    "incremental aggregate MV query must be a single-table SELECT with non-empty GROUP BY and only count/sum/avg/min/max aggregate outputs".to_string()
+    "incremental aggregate MV query must be a single-table SELECT with non-empty GROUP BY and only count/sum/avg/min/max/count_distinct aggregate outputs".to_string()
 }
 
 fn aggregate_expr_error(_err: String) -> String {
@@ -1733,13 +1783,76 @@ mod tests {
     #[test]
     fn rejects_unsupported_aggregate_functions() {
         for sql in [
-            "select k1, count(distinct v2) from ice.ns.orders group by k1",
             "select k1, sum(v2) filter (where v2 > 0) from ice.ns.orders group by k1",
             "select k1, sum(v2 order by k1) from ice.ns.orders group by k1",
             "select k1, sum(v2) over (partition by k1) from ice.ns.orders group by k1",
         ] {
             assert_rejects_with(sql, "incremental aggregate MV");
         }
+    }
+
+    #[test]
+    fn classify_count_distinct_function_name() {
+        let shape = classify_sql(
+            "select region, count_distinct(user_id) from ice.ns.events group by region",
+        )
+        .unwrap();
+        let IncrementalMvShape::Aggregate(shape) = shape else {
+            panic!("expected aggregate shape");
+        };
+        assert_eq!(
+            shape.aggregates[0].function,
+            AggregateFunctionKind::CountDistinct
+        );
+    }
+
+    #[test]
+    fn classify_count_distinct_via_distinct_modifier() {
+        let shape = classify_sql(
+            "select region, count(distinct user_id) from ice.ns.events group by region",
+        )
+        .unwrap();
+        let IncrementalMvShape::Aggregate(shape) = shape else {
+            panic!("expected aggregate shape");
+        };
+        assert_eq!(
+            shape.aggregates[0].function,
+            AggregateFunctionKind::CountDistinct
+        );
+    }
+
+    #[test]
+    fn classify_multi_distinct_count() {
+        let shape = classify_sql(
+            "select region, multi_distinct_count(user_id) from ice.ns.events group by region",
+        )
+        .unwrap();
+        let IncrementalMvShape::Aggregate(shape) = shape else {
+            panic!("expected aggregate shape");
+        };
+        assert_eq!(
+            shape.aggregates[0].function,
+            AggregateFunctionKind::CountDistinct
+        );
+    }
+
+    #[test]
+    fn classify_count_distinct_multi_arg_rejected() {
+        let err = classify_sql(
+            "select region, count(distinct user_id, session_id) from ice.ns.events group by region",
+        )
+        .unwrap_err();
+
+        assert!(err.contains("multi-column DISTINCT"), "got: {err}");
+    }
+
+    #[test]
+    fn classify_distinct_on_non_count_rejected() {
+        let err =
+            classify_sql("select region, sum(distinct amount) from ice.ns.events group by region")
+                .unwrap_err();
+
+        assert!(err.contains("DISTINCT"), "got: {err}");
     }
 
     #[test]
