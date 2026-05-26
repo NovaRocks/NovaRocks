@@ -210,27 +210,21 @@ impl IcebergMvRewriteContext {
     }
 
     pub(crate) fn summary(&self) -> CtxSummary<'_> {
-        let base_fqns: Vec<String> = self.base_refs.iter().map(|r| r.fqn()).collect();
-        let pinned_snapshots: Vec<(String, i64)> = self
-            .base_refs
-            .iter()
-            .map(|r| {
-                let snap = self
-                    .pin
-                    .get(r)
-                    .expect("pin coverage verified in constructor");
-                (r.fqn(), snap)
-            })
-            .collect();
-        let previous_snapshots: Vec<(String, Option<i64>)> = self
-            .base_refs
-            .iter()
-            .map(|r| {
-                let fqn = r.fqn();
-                let prev = self.previous_snapshot_ids.get(&fqn).copied();
-                (fqn, prev)
-            })
-            .collect();
+        let n = self.base_refs.len();
+        let mut base_fqns: Vec<String> = Vec::with_capacity(n);
+        let mut pinned_snapshots: Vec<(String, i64)> = Vec::with_capacity(n);
+        let mut previous_snapshots: Vec<(String, Option<i64>)> = Vec::with_capacity(n);
+        for r in self.base_refs.iter() {
+            let fqn = r.fqn();
+            let snap = self
+                .pin
+                .get(r)
+                .expect("pin coverage verified in constructor");
+            let prev = self.previous_snapshot_ids.get(&fqn).copied();
+            pinned_snapshots.push((fqn.clone(), snap));
+            previous_snapshots.push((fqn.clone(), prev));
+            base_fqns.push(fqn);
+        }
 
         CtxSummary {
             target: &self.target,
@@ -779,6 +773,11 @@ mod tests {
         .expect("ctx happy path");
 
         let summary = ctx.summary();
+        assert_eq!(
+            summary.base_fqns,
+            vec!["ice.db.b".to_string(), "ice.db.a".to_string(), "ice.db.c".to_string()],
+            "base_fqns must use base_refs declared order"
+        );
         assert_eq!(
             summary.pinned_snapshots,
             vec![
