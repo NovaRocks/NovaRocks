@@ -196,6 +196,9 @@ fn push_signed_aggregate_state_projection(
                 &state_alias,
             ));
         }
+        AggregateFunctionKind::CountDistinct => {
+            unimplemented!("CountDistinct: see Task 4.x")
+        }
     }
     Ok(())
 }

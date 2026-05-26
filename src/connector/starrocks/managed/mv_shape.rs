@@ -104,6 +104,9 @@ pub(crate) enum AggregateFunctionKind {
     /// `BOOL_AND(col)` / `booland_agg(col)`. Uses `Map<Boolean, Int64>` detail
     /// state, same framework as `MIN/MAX`.
     BoolAnd,
+    /// `count(DISTINCT col)` / `count_distinct(col)` / `multi_distinct_count(col)`.
+    /// Uses shared multiset state encoding; visible counts positive entries.
+    CountDistinct,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

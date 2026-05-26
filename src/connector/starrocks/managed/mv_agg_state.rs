@@ -309,6 +309,9 @@ pub(crate) fn build_aggregate_mv_layout(
                     count_star: false,
                 });
             }
+            AggregateFunctionKind::CountDistinct => {
+                unimplemented!("CountDistinct: see Task 4.x")
+            }
         }
     }
 
@@ -2248,6 +2251,9 @@ fn update_visible_values_from_state(
                     None => None,
                 };
                 row.visible_values[state_column.visible_source_index] = derived;
+            }
+            AggregateFunctionKind::CountDistinct => {
+                unimplemented!("CountDistinct: see Task 4.x")
             }
         }
     }
