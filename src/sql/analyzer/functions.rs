@@ -181,6 +181,10 @@ fn is_mv_state_scalar_function(name: &str) -> bool {
             | "avg_state_visible"
             | "sum_state_union"
             | "sum_state_visible"
+            | "min_state_union"
+            | "min_state_visible"
+            | "max_state_union"
+            | "max_state_visible"
             | "bool_or_state_union"
             | "bool_or_state_visible"
             | "bool_and_state_union"
@@ -194,11 +198,15 @@ fn validate_mv_state_scalar_function(name: &str, arg_types: &[DataType]) -> Resu
         "count_state_union"
         | "avg_state_union"
         | "sum_state_union"
+        | "min_state_union"
+        | "max_state_union"
         | "bool_or_state_union"
         | "bool_and_state_union" => 2,
         "count_state_visible"
         | "avg_state_visible"
         | "sum_state_visible"
+        | "min_state_visible"
+        | "max_state_visible"
         | "bool_or_state_visible"
         | "bool_and_state_visible" => 1,
         _ => return Ok(()),
@@ -923,9 +931,13 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         "bitmap_min" | "bitmap_max" | "bitmap_count" | "hll_cardinality" => DataType::Int64,
         "count_state_union"
         | "sum_state_union"
+        | "min_state_union"
+        | "max_state_union"
         | "bool_or_state_union"
         | "bool_and_state_union" => DataType::Binary,
-        "count_state_visible" | "sum_state_visible" => DataType::Int64,
+        "count_state_visible" | "sum_state_visible" | "min_state_visible" | "max_state_visible" => {
+            DataType::Int64
+        }
         "bool_or_state_visible" | "bool_and_state_visible" => DataType::Boolean,
         "bitmap_to_array" => DataType::List(Arc::new(arrow::datatypes::Field::new(
             "item",
@@ -1648,6 +1660,33 @@ mod tests {
         assert_eq!(
             err,
             "No matching function with signature: avg_state_visible(varbinary, bigint(20))."
+        );
+    }
+
+    #[test]
+    fn min_max_state_scalar_functions_require_binary_inputs() {
+        for name in ["min_state_union", "max_state_union"] {
+            assert_eq!(
+                infer_scalar_return_type(name, &[DataType::Binary, DataType::Binary]),
+                DataType::Binary
+            );
+            validate_scalar_function_call(name, &[DataType::LargeBinary, DataType::Binary])
+                .unwrap();
+        }
+
+        for name in ["min_state_visible", "max_state_visible"] {
+            assert_eq!(
+                infer_scalar_return_type(name, &[DataType::LargeBinary]),
+                DataType::Int64
+            );
+            validate_scalar_function_call(name, &[DataType::Binary]).unwrap();
+        }
+
+        let err = validate_scalar_function_call("min_state_union", &[DataType::Utf8])
+            .expect_err("min_state_union should reject non-binary arity/type");
+        assert_eq!(
+            err,
+            "No matching function with signature: min_state_union(varchar(255))."
         );
     }
 

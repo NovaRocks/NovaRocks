@@ -59,6 +59,10 @@ pub fn eval_mv_state_function(
         "avg_state_visible" => super::avg::eval_avg_state_visible(arena, expr, args, chunk),
         "sum_state_union" => super::sum::eval_sum_state_union(arena, expr, args, chunk),
         "sum_state_visible" => super::sum::eval_sum_state_visible(arena, expr, args, chunk),
+        "min_state_union" => super::min_max::eval_min_state_union(arena, expr, args, chunk),
+        "min_state_visible" => super::min_max::eval_min_state_visible(arena, expr, args, chunk),
+        "max_state_union" => super::min_max::eval_max_state_union(arena, expr, args, chunk),
+        "max_state_visible" => super::min_max::eval_max_state_visible(arena, expr, args, chunk),
         "bool_or_state_union" => {
             super::bool_or_and::eval_bool_or_state_union(arena, expr, args, chunk)
         }
@@ -82,6 +86,10 @@ static MV_STATE_FUNCTIONS: &[(&str, &str)] = &[
     ("avg_state_visible", "avg_state_visible"),
     ("sum_state_union", "sum_state_union"),
     ("sum_state_visible", "sum_state_visible"),
+    ("min_state_union", "min_state_union"),
+    ("min_state_visible", "min_state_visible"),
+    ("max_state_union", "max_state_union"),
+    ("max_state_visible", "max_state_visible"),
     ("bool_or_state_union", "bool_or_state_union"),
     ("bool_or_state_visible", "bool_or_state_visible"),
     ("bool_and_state_union", "bool_and_state_union"),
@@ -116,6 +124,26 @@ static MV_STATE_METADATA: &[FunctionMeta] = &[
     },
     FunctionMeta {
         name: "sum_state_visible",
+        min_args: 1,
+        max_args: 1,
+    },
+    FunctionMeta {
+        name: "min_state_union",
+        min_args: 2,
+        max_args: 2,
+    },
+    FunctionMeta {
+        name: "min_state_visible",
+        min_args: 1,
+        max_args: 1,
+    },
+    FunctionMeta {
+        name: "max_state_union",
+        min_args: 2,
+        max_args: 2,
+    },
+    FunctionMeta {
+        name: "max_state_visible",
         min_args: 1,
         max_args: 1,
     },
