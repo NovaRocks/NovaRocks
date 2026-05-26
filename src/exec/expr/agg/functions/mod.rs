@@ -26,6 +26,8 @@ pub(super) enum AggKind {
     Count,
     CountState,
     CountStateSigned,
+    BoolState,
+    BoolStateSigned,
     CountDistinct,
     CountIf,
     SumInt,
@@ -174,6 +176,7 @@ use multi_distinct_sum::MultiDistinctSumAgg;
 use percentile::PercentileAgg;
 use percentile_placeholder::PercentilePlaceholderAgg;
 use retention::RetentionAgg;
+use state_combinators::bool_or_and::{BoolStateAgg, BoolStateSignedAgg};
 use state_combinators::count::{CountStateAgg, CountStateSignedAgg};
 use sum::SumAgg;
 use sum_map::SumMapAgg;
@@ -233,6 +236,8 @@ pub(super) trait AggregateFunction {
 static COUNT: CountAgg = CountAgg;
 static COUNT_STATE: CountStateAgg = CountStateAgg;
 static COUNT_STATE_SIGNED: CountStateSignedAgg = CountStateSignedAgg;
+static BOOL_STATE: BoolStateAgg = BoolStateAgg;
+static BOOL_STATE_SIGNED: BoolStateSignedAgg = BoolStateSignedAgg;
 static COUNT_DISTINCT: CountDistinctAgg = CountDistinctAgg;
 static COUNT_IF: CountIfAgg = CountIfAgg;
 static GROUP_CONCAT: GroupConcatAgg = GroupConcatAgg;
@@ -271,6 +276,8 @@ fn resolve_by_func(func: &AggFunction) -> Result<&'static dyn AggregateFunction,
         "count" => Ok(&COUNT),
         "count_state" => Ok(&COUNT_STATE),
         "count_state_signed" => Ok(&COUNT_STATE_SIGNED),
+        "bool_or_state" | "bool_and_state" => Ok(&BOOL_STATE),
+        "bool_or_state_signed" | "bool_and_state_signed" => Ok(&BOOL_STATE_SIGNED),
         "count_distinct" | "multi_distinct_count" => Ok(&COUNT_DISTINCT),
         "count_if" => Ok(&COUNT_IF),
         "group_concat" | "string_agg" => Ok(&GROUP_CONCAT),
@@ -322,6 +329,8 @@ fn resolve_by_kind(kind: &AggKind) -> &'static dyn AggregateFunction {
         AggKind::Count => &COUNT,
         AggKind::CountState => &COUNT_STATE,
         AggKind::CountStateSigned => &COUNT_STATE_SIGNED,
+        AggKind::BoolState => &BOOL_STATE,
+        AggKind::BoolStateSigned => &BOOL_STATE_SIGNED,
         AggKind::CountDistinct => &COUNT_DISTINCT,
         AggKind::CountIf => &COUNT_IF,
         AggKind::GroupConcat { .. } => &GROUP_CONCAT,
