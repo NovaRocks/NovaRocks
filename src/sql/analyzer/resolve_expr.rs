@@ -1100,6 +1100,19 @@ impl<'a> super::AnalyzerContext<'a> {
                         "comparison operator `{op_sym}` is not supported for BITMAP/HLL (right operand has type {logical:?})"
                     ));
                 }
+                // Reject comparisons between complex types whose element /
+                // entry / field layouts are fundamentally incompatible.
+                // Cases like `array<int> = [map{...}, null]` would otherwise
+                // fall through to a runtime CAST that produces a confusing
+                // error; surface a clear analyzer-level message instead.
+                if let Some(reason) = incompatible_complex_compare(
+                    &left_typed.data_type,
+                    &right_typed.data_type,
+                ) {
+                    return Err(format!(
+                        "comparison operator `{op_sym}` does not support binary predicate operation between {reason}"
+                    ));
+                }
                 let right_coerced = coerce_literal_for_comparison(&left_typed, right_typed);
                 let left_coerced = coerce_literal_for_comparison(&right_coerced, left_typed);
                 (left_coerced, right_coerced)
@@ -4125,5 +4138,85 @@ fn session_variable_default(name: &str) -> String {
             "utf8".to_string()
         }
         _ => String::new(),
+    }
+}
+
+/// If the two types are both complex (ARRAY/MAP/STRUCT) but their nested
+/// shapes cannot be reconciled, return a short human-readable description of
+/// the incompatibility. Used to short-circuit comparison operators that would
+/// otherwise fall into a CAST kernel and crash at runtime with a less
+/// actionable message.
+///
+/// Returns `None` for any pair the analyzer should still attempt — scalar vs
+/// scalar (handled by literal coercion), compatible container shapes (let
+/// `cast_with_special_rules` widen at runtime), or one-side-only complex
+/// types (rare; let the downstream layer surface its own error).
+fn incompatible_complex_compare(left: &DataType, right: &DataType) -> Option<String> {
+    fn is_complex(dt: &DataType) -> bool {
+        matches!(
+            dt,
+            DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _) | DataType::Struct(_)
+        )
+    }
+    // NULL on either side is always comparable to anything — `x = NULL`
+    // and `x = some_complex_literal` containing NULLs are both valid SQL.
+    if matches!(left, DataType::Null) || matches!(right, DataType::Null) {
+        return None;
+    }
+    // Defer to the existing coercion path when *both* sides are scalar.
+    // When even one side is complex we want to validate the shape — the
+    // mismatch surfaces below via `outer_kind` and the recursive check.
+    if !is_complex(left) && !is_complex(right) {
+        return None;
+    }
+    // Outer-container kind mismatch (e.g. ARRAY = MAP) is always an error.
+    let outer_kind = |dt: &DataType| match dt {
+        DataType::List(_) | DataType::LargeList(_) => "ARRAY",
+        DataType::Map(_, _) => "MAP",
+        DataType::Struct(_) => "STRUCT",
+        _ => "",
+    };
+    if outer_kind(left) != outer_kind(right) {
+        return Some(format!("{:?} and {:?}", left, right));
+    }
+    // Same outer kind — recurse into the element / entry / field types and
+    // report incompatibility when the inner shapes diverge in a way that
+    // can't be widened. We use `is_complex && outer_kind_mismatch` as the
+    // disqualifying signal; pairs of incompatible scalars (e.g. Int32 vs
+    // Utf8) are left to the existing CAST kernel.
+    match (left, right) {
+        (DataType::List(l), DataType::List(r)) | (DataType::LargeList(l), DataType::LargeList(r)) => {
+            incompatible_complex_compare(l.data_type(), r.data_type())
+                .map(|inner| format!("ARRAY of incompatible elements ({inner})"))
+        }
+        (DataType::Map(l, _), DataType::Map(r, _)) => {
+            let (DataType::Struct(lf), DataType::Struct(rf)) = (l.data_type(), r.data_type()) else {
+                return None;
+            };
+            if lf.len() != 2 || rf.len() != 2 {
+                return None;
+            }
+            incompatible_complex_compare(lf[0].data_type(), rf[0].data_type())
+                .or_else(|| incompatible_complex_compare(lf[1].data_type(), rf[1].data_type()))
+                .map(|inner| format!("MAP entries with incompatible shape ({inner})"))
+        }
+        (DataType::Struct(lf), DataType::Struct(rf)) => {
+            if lf.len() != rf.len() {
+                return Some(format!(
+                    "STRUCT with different field counts ({} vs {})",
+                    lf.len(),
+                    rf.len()
+                ));
+            }
+            for (a, b) in lf.iter().zip(rf.iter()) {
+                if let Some(inner) =
+                    incompatible_complex_compare(a.data_type(), b.data_type())
+                {
+                    return Some(format!("STRUCT field `{}` ({inner})", a.name()));
+                }
+            }
+            None
+        }
+        _ => None,
     }
 }

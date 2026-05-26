@@ -642,7 +642,14 @@ pub(super) fn expr_display_name(expr: &sqlast::Expr) -> String {
         sqlast::Expr::BinaryOp { left, op, right } => {
             let left_str = expr_display_name_with_parens(left);
             let right_str = expr_display_name_with_parens(right);
-            format!("{left_str} {op} {right_str}")
+            // StarRocks renders `<>` as `!=` in result-column display names;
+            // sqlparser's `Display` keeps the user's original spelling, so
+            // canonicalise here.
+            let op_str = match op {
+                sqlast::BinaryOperator::NotEq => "!=".to_string(),
+                _ => format!("{op}"),
+            };
+            format!("{left_str} {op_str} {right_str}")
         }
         // Expressions like SUBSTR, EXTRACT are rendered in uppercase by
         // sqlparser's Display. Lowercase leading keyword to match StarRocks FE.
@@ -742,14 +749,20 @@ fn format_cast_type(data_type: &sqlast::DataType) -> String {
         sqlast::DataType::Custom(name, modifiers) => {
             let lower = name.to_string().to_ascii_lowercase();
             match lower.as_str() {
+                // StarRocks renders `MAP<…>` casts in uppercase, with the
+                // *inner* types also uppercased and **without** MySQL-style
+                // width modifiers (so `int(11)` collapses to `INT`,
+                // `array<int(11)>` becomes `ARRAY<INT>`, etc.). The
+                // separator between key and value is a bare comma — no
+                // space. This is asymmetric with the STRUCT renderer,
+                // which keeps everything lowercase + width-bearing.
                 "map" => format!(
-                    "{}<{}>",
-                    lower,
+                    "MAP<{}>",
                     modifiers
                         .iter()
-                        .map(|m| format_cast_type_modifier(m))
+                        .map(|m| format_cast_type_modifier_for_map(m))
                         .collect::<Vec<_>>()
-                        .join(", ")
+                        .join(",")
                 ),
                 "struct" => format!(
                     "{}<{}>",
@@ -818,6 +831,70 @@ fn canonicalize_array_inner_scalar(inner: &str) -> String {
 fn format_cast_type_modifier(modifier: &str) -> String {
     let trimmed = modifier.trim();
     format_cast_type_token(trimmed)
+}
+
+/// MAP variant of `format_cast_type_modifier` — StarRocks uppercases the
+/// inner types in a `MAP<…>` cast and strips MySQL-style width modifiers,
+/// e.g. `int` and `int(11)` both display as `INT`, `array<int>` becomes
+/// `ARRAY<INT>`, and nested `MAP<…>` recurses with the same rules.
+fn format_cast_type_modifier_for_map(modifier: &str) -> String {
+    fn rewrite(token: &str) -> String {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            return String::new();
+        }
+        // Nested collection: `array<…>`, `map<…>`, `struct<…>`. Walk the
+        // outer name and re-render with the MAP-flavored rules.
+        if let Some(open) = trimmed.find('<')
+            && trimmed.ends_with('>')
+        {
+            let head = trimmed[..open].trim();
+            let inner = &trimmed[open + 1..trimmed.len() - 1];
+            let head_upper = head.to_ascii_uppercase();
+            let parts = split_at_top_level_commas(inner);
+            let rendered = parts
+                .iter()
+                .map(|p| rewrite(p.trim()))
+                .collect::<Vec<_>>()
+                .join(",");
+            return format!("{head_upper}<{rendered}>");
+        }
+        // Bare scalar — strip any `(N)` / `(P,S)` width and uppercase.
+        let base = if let Some(paren) = trimmed.find('(') {
+            trimmed[..paren].trim()
+        } else {
+            trimmed
+        };
+        base.to_ascii_uppercase()
+    }
+    rewrite(modifier)
+}
+
+/// Split `inner` (the text between angle brackets) on top-level commas,
+/// respecting nested `<…>` and `(…)`.
+fn split_at_top_level_commas(inner: &str) -> Vec<&str> {
+    let bytes = inner.as_bytes();
+    let mut depth_angle = 0i32;
+    let mut depth_paren = 0i32;
+    let mut start = 0usize;
+    let mut out = Vec::new();
+    for (idx, b) in bytes.iter().enumerate() {
+        match b {
+            b'<' => depth_angle += 1,
+            b'>' => depth_angle -= 1,
+            b'(' => depth_paren += 1,
+            b')' => depth_paren -= 1,
+            b',' if depth_angle == 0 && depth_paren == 0 => {
+                out.push(&inner[start..idx]);
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    if start < inner.len() {
+        out.push(&inner[start..]);
+    }
+    out
 }
 
 /// Render a single `struct<…>` field spec back as `name type`, applying the

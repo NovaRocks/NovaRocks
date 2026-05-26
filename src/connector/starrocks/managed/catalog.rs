@@ -750,8 +750,20 @@ pub(crate) fn arrow_type_from_tablet_column(column: &ColumnPb) -> Result<DataTyp
                     column.name.as_deref().unwrap_or("<unnamed>")
                 )
             })?;
+            // StarRocks-style MAP semantics treat the key as nullable — a
+            // `map{1:10, 2:20, null:30}` literal keeps the `null` key entry
+            // and a GROUP BY on the map sees it as a distinct group. The
+            // Iceberg spec marks map keys as non-nullable, but for the
+            // managed-lake (StarRocks native segment) backend we mirror the
+            // StarRocks semantics here. The tablet column metadata may also
+            // declare an explicit `is_nullable` for the key; honour it but
+            // default to nullable so legacy schemas behave correctly.
             let entries = Fields::from(vec![
-                Field::new("key", arrow_type_from_tablet_column(key_column)?, false),
+                Field::new(
+                    "key",
+                    arrow_type_from_tablet_column(key_column)?,
+                    key_column.is_nullable.unwrap_or(true),
+                ),
                 Field::new(
                     "value",
                     arrow_type_from_tablet_column(value_column)?,

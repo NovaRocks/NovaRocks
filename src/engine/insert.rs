@@ -547,10 +547,15 @@ fn build_local_literal_array(
             let mut flattened_values = Vec::new();
             offsets.push(0_i32);
 
-            // Arrow's Map layout requires `entries.key` to be non-nullable.
-            // Drop map entries whose key literal is NULL so we do not have to
-            // widen the field and produce an array that violates the schema
-            // the catalog advertises.
+            // Arrow's stock Map layout requires `entries.key` to be
+            // non-nullable, but the StarRocks managed-lake backend used by
+            // NovaRocks supports nullable map keys (and downstream tooling
+            // depends on `map{1:a, null:b}` being a distinct group from
+            // `map{1:a}`). Honour the *target schema* the catalog hands us:
+            // when the key field is declared nullable, preserve the NULL
+            // entries; when it isn't, drop them (legacy behaviour, matches
+            // the Arrow-strict path used by some other writers).
+            let drop_null_keys = !entry_fields[0].is_nullable();
             for literal in values {
                 match literal {
                     Literal::Null => {
@@ -559,7 +564,7 @@ fn build_local_literal_array(
                     Literal::Map(items) => {
                         map_nulls.append(true);
                         for (key, value) in items {
-                            if matches!(key, Literal::Null) {
+                            if drop_null_keys && matches!(key, Literal::Null) {
                                 continue;
                             }
                             flattened_keys.push(key.clone());
