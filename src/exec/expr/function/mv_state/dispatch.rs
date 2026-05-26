@@ -61,6 +61,11 @@ pub fn eval_mv_state_function(
         "count_distinct_state_visible" => {
             super::count_distinct::eval_count_distinct_state_visible(arena, expr, args, chunk)
         }
+        "approx_count_distinct_state_union" => {
+            super::approx_count_distinct::eval_approx_count_distinct_state_union(
+                arena, expr, args, chunk,
+            )
+        }
         "avg_state_union" => super::avg::eval_avg_state_union(arena, expr, args, chunk),
         "avg_state_visible" => super::avg::eval_avg_state_visible(arena, expr, args, chunk),
         "sum_state_union" => super::sum::eval_sum_state_union(arena, expr, args, chunk),
@@ -92,6 +97,10 @@ static MV_STATE_FUNCTIONS: &[(&str, &str)] = &[
     (
         "count_distinct_state_visible",
         "count_distinct_state_visible",
+    ),
+    (
+        "approx_count_distinct_state_union",
+        "approx_count_distinct_state_union",
     ),
     ("avg_state_union", "avg_state_union"),
     ("avg_state_visible", "avg_state_visible"),
@@ -127,6 +136,11 @@ static MV_STATE_METADATA: &[FunctionMeta] = &[
         name: "count_distinct_state_visible",
         min_args: 1,
         max_args: 1,
+    },
+    FunctionMeta {
+        name: "approx_count_distinct_state_union",
+        min_args: 2,
+        max_args: 2,
     },
     FunctionMeta {
         name: "avg_state_union",
