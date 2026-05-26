@@ -12,7 +12,7 @@
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int16Array, Int32Array, Int64Array, Int8Array, LargeStringArray, StringArray,
+    Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray,
     TimestampMicrosecondArray,
 };
 use arrow::datatypes::{DataType, TimeUnit};
@@ -26,6 +26,74 @@ const CANONICAL_F64_NAN_BITS: u64 = 0x7FF8_0000_0000_0000;
 pub(crate) fn is_empty_state(bytes: &[u8]) -> bool {
     bytes.is_empty()
 }
+
+pub(crate) fn encode_count_state(count: i64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(9);
+    out.push(STATE_VERSION_V1);
+    out.extend_from_slice(&count.to_le_bytes());
+    out
+}
+
+pub(crate) fn decode_count_state(bytes: &[u8]) -> Result<i64, String> {
+    if is_empty_state(bytes) {
+        return Ok(0);
+    }
+    validate_fixed_state(bytes, 9, "Count")?;
+    Ok(read_i64_at::<1>(bytes))
+}
+
+pub(crate) fn encode_bool_state(count_true: i64, count_false: i64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(17);
+    out.push(STATE_VERSION_V1);
+    out.extend_from_slice(&count_true.to_le_bytes());
+    out.extend_from_slice(&count_false.to_le_bytes());
+    out
+}
+
+pub(crate) fn decode_bool_state(bytes: &[u8]) -> Result<(i64, i64), String> {
+    if is_empty_state(bytes) {
+        return Ok((0, 0));
+    }
+    validate_fixed_state(bytes, 17, "Bool")?;
+    Ok((read_i64_at::<1>(bytes), read_i64_at::<9>(bytes)))
+}
+
+pub(crate) fn encode_sum_int64(row_count: i64, sum: i64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(17);
+    out.push(STATE_VERSION_V1);
+    out.extend_from_slice(&row_count.to_le_bytes());
+    out.extend_from_slice(&sum.to_le_bytes());
+    out
+}
+
+pub(crate) fn decode_sum_int64(bytes: &[u8]) -> Result<(i64, i64), String> {
+    if is_empty_state(bytes) {
+        return Ok((0, 0));
+    }
+    validate_fixed_state(bytes, 17, "Sum(Int64)")?;
+    Ok((read_i64_at::<1>(bytes), read_i64_at::<9>(bytes)))
+}
+
+pub(crate) fn encode_sum_decimal128(row_count: i64, sum: i128) -> Vec<u8> {
+    let mut out = Vec::with_capacity(25);
+    out.push(STATE_VERSION_V1);
+    out.extend_from_slice(&row_count.to_le_bytes());
+    out.extend_from_slice(&sum.to_le_bytes());
+    out
+}
+
+pub(crate) fn decode_sum_decimal128(bytes: &[u8]) -> Result<(i64, i128), String> {
+    if is_empty_state(bytes) {
+        return Ok((0, 0));
+    }
+    validate_fixed_state(bytes, 25, "Sum(Decimal128)")?;
+    Ok((read_i64_at::<1>(bytes), read_i128_at::<9>(bytes)))
+}
+
+pub(crate) use decode_sum_decimal128 as decode_avg_decimal128;
+pub(crate) use decode_sum_int64 as decode_avg_int64;
+pub(crate) use encode_sum_decimal128 as encode_avg_decimal128;
+pub(crate) use encode_sum_int64 as encode_avg_int64;
 
 pub(crate) fn write_uleb128(out: &mut Vec<u8>, mut value: u64) {
     loop {
@@ -308,6 +376,33 @@ fn read_fixed<const N: usize>(cursor: &mut &[u8], name: &str) -> Result<[u8; N],
     Ok(bytes)
 }
 
+fn validate_fixed_state(bytes: &[u8], expected_len: usize, kind: &str) -> Result<(), String> {
+    if bytes.first().copied() != Some(STATE_VERSION_V1) {
+        return Err(format!(
+            "state_codec: {kind} state unsupported version byte"
+        ));
+    }
+    if bytes.len() != expected_len {
+        return Err(format!(
+            "state_codec: {kind} state invalid length {}, expected {expected_len}",
+            bytes.len()
+        ));
+    }
+    Ok(())
+}
+
+fn read_i64_at<const OFFSET: usize>(bytes: &[u8]) -> i64 {
+    let mut value = [0u8; 8];
+    value.copy_from_slice(&bytes[OFFSET..OFFSET + 8]);
+    i64::from_le_bytes(value)
+}
+
+fn read_i128_at<const OFFSET: usize>(bytes: &[u8]) -> i128 {
+    let mut value = [0u8; 16];
+    value.copy_from_slice(&bytes[OFFSET..OFFSET + 16]);
+    i128::from_le_bytes(value)
+}
+
 /// Reads one canonical SLEB128 value emitted by `write_sleb128`.
 ///
 /// Bytes already inspected are consumed even on error.
@@ -428,6 +523,112 @@ mod tests {
             let mut cursor = bytes;
             assert!(read_sleb128(&mut cursor).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod fixed_size_tests {
+    use super::*;
+
+    #[test]
+    fn count_state_encodes_to_9_bytes() {
+        let bytes = encode_count_state(42);
+        assert_eq!(bytes.len(), 9);
+        assert_eq!(bytes[0], STATE_VERSION_V1);
+        assert_eq!(decode_count_state(&bytes).unwrap(), 42);
+    }
+
+    #[test]
+    fn count_state_empty() {
+        assert_eq!(decode_count_state(&[]).unwrap(), 0);
+    }
+
+    #[test]
+    fn bool_or_state_encode_decode() {
+        let bytes = encode_bool_state(3, 5);
+        assert_eq!(bytes.len(), 17);
+        let (ct, cf) = decode_bool_state(&bytes).unwrap();
+        assert_eq!((ct, cf), (3, 5));
+    }
+
+    #[test]
+    fn sum_int64_encode_decode() {
+        let bytes = encode_sum_int64(10, 100);
+        let (rc, sum) = decode_sum_int64(&bytes).unwrap();
+        assert_eq!((rc, sum), (10, 100));
+    }
+
+    #[test]
+    fn sum_decimal128_encode_decode() {
+        let bytes = encode_sum_decimal128(7, 12345i128);
+        let (rc, sum) = decode_sum_decimal128(&bytes).unwrap();
+        assert_eq!((rc, sum), (7, 12345));
+    }
+
+    #[test]
+    fn fixed_size_states_reject_wrong_version() {
+        let mut count = encode_count_state(42);
+        count[0] = 0x02;
+        assert!(decode_count_state(&count).unwrap_err().contains("version"));
+
+        let mut bool_state = encode_bool_state(3, 5);
+        bool_state[0] = 0x02;
+        assert!(
+            decode_bool_state(&bool_state)
+                .unwrap_err()
+                .contains("version")
+        );
+
+        let mut sum_int64 = encode_sum_int64(10, 100);
+        sum_int64[0] = 0x02;
+        assert!(
+            decode_sum_int64(&sum_int64)
+                .unwrap_err()
+                .contains("version")
+        );
+
+        let mut sum_decimal128 = encode_sum_decimal128(7, 12345);
+        sum_decimal128[0] = 0x02;
+        assert!(
+            decode_sum_decimal128(&sum_decimal128)
+                .unwrap_err()
+                .contains("version")
+        );
+    }
+
+    #[test]
+    fn fixed_size_states_reject_wrong_length() {
+        assert!(
+            decode_count_state(&[STATE_VERSION_V1])
+                .unwrap_err()
+                .contains("length")
+        );
+        assert!(
+            decode_bool_state(&[STATE_VERSION_V1])
+                .unwrap_err()
+                .contains("length")
+        );
+        assert!(
+            decode_sum_int64(&[STATE_VERSION_V1])
+                .unwrap_err()
+                .contains("length")
+        );
+        assert!(
+            decode_sum_decimal128(&[STATE_VERSION_V1])
+                .unwrap_err()
+                .contains("length")
+        );
+    }
+
+    #[test]
+    fn avg_aliases_match_sum_helpers() {
+        let int64 = encode_sum_int64(10, 100);
+        assert_eq!(encode_avg_int64(10, 100), int64);
+        assert_eq!(decode_avg_int64(&int64).unwrap(), (10, 100));
+
+        let decimal128 = encode_sum_decimal128(7, 12345);
+        assert_eq!(encode_avg_decimal128(7, 12345), decimal128);
+        assert_eq!(decode_avg_decimal128(&decimal128).unwrap(), (7, 12345));
     }
 }
 
