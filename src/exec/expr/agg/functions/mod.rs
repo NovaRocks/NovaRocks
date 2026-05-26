@@ -180,6 +180,7 @@ use multi_distinct_sum::MultiDistinctSumAgg;
 use percentile::PercentileAgg;
 use percentile_placeholder::PercentilePlaceholderAgg;
 use retention::RetentionAgg;
+use state_combinators::avg::{AvgStateAgg, AvgStateSignedAgg};
 use state_combinators::bool_or_and::{BoolStateAgg, BoolStateSignedAgg};
 use state_combinators::count::{CountStateAgg, CountStateSignedAgg};
 use state_combinators::sum::{SumStateAgg, SumStateSignedAgg};
@@ -252,6 +253,8 @@ static SUM_STATE_SIGNED: SumStateSignedAgg = SumStateSignedAgg;
 static MIN: MinAgg = MinAgg;
 static MAX: MaxAgg = MaxAgg;
 static AVG: AvgAgg = AvgAgg;
+static AVG_STATE: AvgStateAgg = AvgStateAgg;
+static AVG_STATE_SIGNED: AvgStateSignedAgg = AvgStateSignedAgg;
 static ARRAY_AGG: ArrayAggAgg = ArrayAggAgg;
 static VAR_STD: VarStdAgg = VarStdAgg;
 static ANY_VALUE: AnyValueAgg = AnyValueAgg;
@@ -294,6 +297,8 @@ fn resolve_by_func(func: &AggFunction) -> Result<&'static dyn AggregateFunction,
         "min" => Ok(&MIN),
         "max" => Ok(&MAX),
         "avg" => Ok(&AVG),
+        "avg_state" => Ok(&AVG_STATE),
+        "avg_state_signed" => Ok(&AVG_STATE_SIGNED),
         "array_agg" | "array_agg_distinct" | "array_unique_agg" => Ok(&ARRAY_AGG),
         "variance" | "variance_pop" | "var_pop" | "variance_samp" | "var_samp" | "stddev"
         | "stddev_pop" | "stddev_samp" | "std" => Ok(&VAR_STD),
