@@ -24,6 +24,8 @@ use super::{AggInputView, AggSpec, AggStatePtr};
 #[derive(Clone, Debug)]
 pub(super) enum AggKind {
     Count,
+    CountState,
+    CountStateSigned,
     CountDistinct,
     CountIf,
     SumInt,
@@ -172,6 +174,7 @@ use multi_distinct_sum::MultiDistinctSumAgg;
 use percentile::PercentileAgg;
 use percentile_placeholder::PercentilePlaceholderAgg;
 use retention::RetentionAgg;
+use state_combinators::count::{CountStateAgg, CountStateSignedAgg};
 use sum::SumAgg;
 use sum_map::SumMapAgg;
 use variance::VarStdAgg;
@@ -228,6 +231,8 @@ pub(super) trait AggregateFunction {
 }
 
 static COUNT: CountAgg = CountAgg;
+static COUNT_STATE: CountStateAgg = CountStateAgg;
+static COUNT_STATE_SIGNED: CountStateSignedAgg = CountStateSignedAgg;
 static COUNT_DISTINCT: CountDistinctAgg = CountDistinctAgg;
 static COUNT_IF: CountIfAgg = CountIfAgg;
 static GROUP_CONCAT: GroupConcatAgg = GroupConcatAgg;
@@ -264,6 +269,8 @@ static MIN_MAX_N: MinMaxNAgg = MinMaxNAgg;
 fn resolve_by_func(func: &AggFunction) -> Result<&'static dyn AggregateFunction, String> {
     match canonical_agg_name(func.name.as_str()) {
         "count" => Ok(&COUNT),
+        "count_state" => Ok(&COUNT_STATE),
+        "count_state_signed" => Ok(&COUNT_STATE_SIGNED),
         "count_distinct" | "multi_distinct_count" => Ok(&COUNT_DISTINCT),
         "count_if" => Ok(&COUNT_IF),
         "group_concat" | "string_agg" => Ok(&GROUP_CONCAT),
@@ -313,6 +320,8 @@ fn resolve_by_func(func: &AggFunction) -> Result<&'static dyn AggregateFunction,
 fn resolve_by_kind(kind: &AggKind) -> &'static dyn AggregateFunction {
     match kind {
         AggKind::Count => &COUNT,
+        AggKind::CountState => &COUNT_STATE,
+        AggKind::CountStateSigned => &COUNT_STATE_SIGNED,
         AggKind::CountDistinct => &COUNT_DISTINCT,
         AggKind::CountIf => &COUNT_IF,
         AggKind::GroupConcat { .. } => &GROUP_CONCAT,
