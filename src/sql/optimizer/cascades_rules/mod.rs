@@ -1,4 +1,4 @@
-//! Rule registration for the Cascades optimizer.
+//! Memo/Cascades rule registration.
 
 pub(crate) mod equivalence_predicate;
 pub(crate) mod implement;

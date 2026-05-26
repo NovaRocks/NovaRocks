@@ -9,7 +9,7 @@
 -- two unrelated pre-existing optimizer behaviors:
 --   1. DP join reorder drops single-side literal conjuncts from JOIN
 --      conditions (see `collect_join_predicates` in
---      `rbo/rules/join_reorder/reorder.rs`).
+--      `rewrite/rules/join_reorder/reorder.rs`).
 --   2. PushDownPredicate only walks INTO `Filter(Join)`, not into a Join's
 --      own ON-condition conjuncts.
 -- Once either of those is improved, the propagated predicate will surface in

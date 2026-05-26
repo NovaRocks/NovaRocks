@@ -1,4 +1,4 @@
-//! PruneColumns RBO rule — propagates parent column requirements down the
+//! PruneColumns query rewrite rule — propagates parent column requirements down the
 //! plan tree and sets `ScanNode.required_columns` accordingly.
 //!
 //! **Convention exception.** This rule recurses into children internally,
@@ -17,14 +17,14 @@
 
 use std::collections::HashSet;
 
-use crate::sql::optimizer::rbo::utils::{collect_column_refs, merge_needed};
 use crate::sql::optimizer::rewrite::rule::PlanRewriteRule as RewriteRule;
+use crate::sql::optimizer::rewrite::rules::utils::{collect_column_refs, merge_needed};
 use crate::sql::planner::plan::*;
 
 /// Single top-down column-pruning rule.
 ///
-/// Registered once in `all_rbo_rules()`. Apply runs `prune_inner` at the
-/// root level with `None` (no restriction), which recursively walks the
+/// Registered by `column_pruning_rules()`. Apply runs `prune_inner` at the root
+/// level with `None` (no restriction), which recursively walks the
 /// entire tree. The rewrite pipeline's outer tree-level fixed-point will invoke
 /// the rule once at the root; because `apply` returns `None` when nothing
 /// changed (the `required_columns` field is identical before and after),

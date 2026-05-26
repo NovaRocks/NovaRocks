@@ -2375,7 +2375,7 @@ fn replace_grouping_markers_in_typed_expr(
 mod tests {
     use super::*;
     use crate::sql::analysis::{ExprKind, JoinKind, Relation};
-    use crate::sql::catalog::{ColumnDef, TableDef, ScanSource};
+    use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
 
     struct TestCatalog;
     impl crate::sql::catalog::CatalogProvider for TestCatalog {
@@ -2818,7 +2818,7 @@ mod tests {
         // should stay inside the subquery as inner predicates (preventing the
         // inner side from degenerating into a CROSS JOIN). The current rewriter
         // hoists all predicates to the SEMI condition and flattens the FROM
-        // clause as a bare multi-table join. Predicate pushdown in the RBO/CBO
+        // clause as a bare multi-table join. Predicate pushdown in the rewrite/CBO
         // phases later pushes them back down, so the runtime plan is
         // functionally correct (TPC-DS 98/99 pass), but the analyzer output is
         // suboptimal for this specific pattern. This test documents the current

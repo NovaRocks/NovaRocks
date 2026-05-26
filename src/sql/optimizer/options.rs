@@ -7,7 +7,7 @@ use std::time::Duration;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SessionOptimizerSettings {
     pub enable_ukfk_opt: bool,
-    pub enable_rbo_table_prune: bool,
+    pub enable_query_rewrite_table_prune: bool,
     pub enable_cbo_table_prune: bool,
     pub enable_table_prune_on_update: bool,
     pub enable_eliminate_agg: bool,
@@ -44,7 +44,7 @@ pub(crate) fn current_session_optimizer_settings() -> SessionOptimizerSettings {
 pub(crate) struct OptimizerOptions {
     disabled_rules: HashSet<String>,
     /// Hard cap on each logical rewrite stage's tree-level fixed-point loop.
-    pub rbo_max_iterations: usize,
+    pub rewrite_max_iterations: usize,
     /// Hard cap on the CBO Memo group count (existing constant; documented here).
     #[allow(dead_code)]
     pub cbo_max_groups: usize,
@@ -56,7 +56,7 @@ impl OptimizerOptions {
     pub(crate) fn default_settings() -> Self {
         Self {
             disabled_rules: HashSet::new(),
-            rbo_max_iterations: 32,
+            rewrite_max_iterations: 32,
             cbo_max_groups: 5000,
             optimize_timeout: Duration::from_secs(10),
         }
@@ -101,7 +101,7 @@ mod tests {
     #[test]
     fn defaults_match_existing_optimizer_constants() {
         let opts = OptimizerOptions::default_settings();
-        assert_eq!(opts.rbo_max_iterations, 32);
+        assert_eq!(opts.rewrite_max_iterations, 32);
         assert_eq!(opts.cbo_max_groups, 5000);
         assert_eq!(opts.optimize_timeout, Duration::from_secs(10));
     }

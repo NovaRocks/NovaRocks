@@ -694,7 +694,9 @@ async fn execute_statement_text(
     if let Some((name, enabled)) = parse_set_boolean(trimmed) {
         match name.as_str() {
             "enable_ukfk_opt" => shim.optimizer_settings.enable_ukfk_opt = enabled,
-            "enable_rbo_table_prune" => shim.optimizer_settings.enable_rbo_table_prune = enabled,
+            "enable_query_rewrite_table_prune" => {
+                shim.optimizer_settings.enable_query_rewrite_table_prune = enabled
+            }
             "enable_cbo_table_prune" => shim.optimizer_settings.enable_cbo_table_prune = enabled,
             "enable_table_prune_on_update" => {
                 shim.optimizer_settings.enable_table_prune_on_update = enabled
@@ -774,7 +776,11 @@ async fn execute_statement_text(
         crate::sql::parser::set_var_hint::extract_allow_throw_exception(&sql);
     let query_options = crate::internal_service::TQueryOptions {
         group_concat_max_len: Some(shim.group_concat_max_len),
-        allow_throw_exception: if allow_throw_exception { Some(true) } else { None },
+        allow_throw_exception: if allow_throw_exception {
+            Some(true)
+        } else {
+            None
+        },
         ..Default::default()
     };
 

@@ -1,4 +1,4 @@
-//! Shared expression / plan utilities for the RBO rules and any cascades
+//! Shared expression / plan utilities for the query rewrite rules and any cascades
 //! code that needs small AST helpers. Moved from
 //! `src/sql/optimizer/expr_utils.rs` in Phase 4 of the optimizer
 //! unification; contents unchanged.

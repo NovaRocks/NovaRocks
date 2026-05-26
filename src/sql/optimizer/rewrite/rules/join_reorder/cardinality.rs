@@ -406,7 +406,7 @@ fn get_join_key_ndv(
 mod tests {
     use super::*;
     use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn};
-    use crate::sql::catalog::{ColumnDef, S3FileInfo, TableDef, ScanSource};
+    use crate::sql::catalog::{ColumnDef, S3FileInfo, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use arrow::datatypes::DataType;
 

@@ -4,5 +4,6 @@ pub(crate) mod pipeline;
 pub(crate) mod registry;
 pub(crate) mod result;
 pub(crate) mod rule;
+pub(crate) mod rules;
 pub(crate) mod trace;
 pub(crate) mod tree;

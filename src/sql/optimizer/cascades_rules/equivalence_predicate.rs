@@ -264,7 +264,7 @@ fn add_filter_group(memo: &mut Memo, child_group: GroupId, predicates: Vec<Typed
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::catalog::{TableDef, ScanSource};
+    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::optimizer::operator::LogicalScanOp;
     use std::path::PathBuf;
 

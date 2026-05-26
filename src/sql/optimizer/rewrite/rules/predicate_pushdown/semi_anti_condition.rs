@@ -18,11 +18,11 @@
 //! being exposed through the new logical rewrite rule trait.
 
 use crate::sql::analysis::{JoinKind, TypedExpr};
-use crate::sql::optimizer::rbo::utils::{
+use crate::sql::optimizer::rewrite::rule::PlanRewriteRule as RewriteRule;
+use crate::sql::optimizer::rewrite::rules::utils::{
     collect_column_refs, collect_output_columns, collect_qualified_column_refs,
     collect_qualified_output_columns, combine_and, split_and,
 };
-use crate::sql::optimizer::rewrite::rule::PlanRewriteRule as RewriteRule;
 use crate::sql::planner::plan::*;
 
 pub(crate) struct PushSemiAntiRightOnlyCondition;

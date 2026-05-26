@@ -1,4 +1,4 @@
-//! Predicate pushdown RBO rules. Each sub-module is a small bottom-up
+//! Predicate pushdown query rewrite rules. Each sub-module is a small bottom-up
 //! rewrite matching a specific `LogicalFilter(X)` shape (or, for the
 //! SEMI/ANTI case, a `LogicalJoin(...)` with an inner condition that can
 //! be partly pushed into the right child).

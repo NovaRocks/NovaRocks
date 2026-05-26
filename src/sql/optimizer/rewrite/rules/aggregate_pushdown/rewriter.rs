@@ -130,7 +130,7 @@ fn final_fn_name(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::sql::analysis::{BinOp, JoinKind, OutputColumn};
-    use crate::sql::catalog::{TableDef, ScanSource};
+    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::planner::plan::*;
     use arrow::datatypes::DataType;
 

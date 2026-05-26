@@ -1,5 +1,6 @@
 //! Cascades optimizer framework.
 
+pub(crate) mod cascades_rules;
 pub(crate) mod convert;
 pub(crate) mod cost;
 pub(crate) mod cte_rewrite;
@@ -11,10 +12,8 @@ pub(crate) mod operator;
 pub(crate) mod options;
 pub(crate) mod physical_plan;
 pub(crate) mod property;
-pub(crate) mod rbo;
 pub(crate) mod rewrite;
 pub(crate) mod rule;
-pub(crate) mod rules;
 pub(crate) mod runtime_filter_planner;
 pub(crate) mod search;
 pub(crate) mod statistics;
@@ -61,7 +60,7 @@ pub(crate) fn optimize(
     let options = options::OptimizerOptions::from_session(&session_settings);
     let mut rewrite_ctx =
         rewrite::context::RewriteContext::for_query(session_settings.disabled_rules.clone());
-    rewrite_ctx.policy_mut().max_iterations = options.rbo_max_iterations;
+    rewrite_ctx.policy_mut().max_iterations = options.rewrite_max_iterations;
     rewrite_ctx.set_query_table_stats(table_stats.clone());
     rewrite_ctx.set_deadline(deadline);
     let rewritten =
@@ -83,13 +82,13 @@ pub(crate) fn optimize(
     check_deadline(deadline)?;
 
     // 7. Explore: apply transformation rules (logical -> logical).
-    let transform_rules = rules::all_transformation_rules();
+    let transform_rules = cascades_rules::all_transformation_rules();
     explore(&mut memo, &transform_rules, &options, deadline)?;
 
     check_deadline(deadline)?;
 
     // 8. Implement: apply implementation rules (logical -> physical).
-    let impl_rules = rules::all_implementation_rules();
+    let impl_rules = cascades_rules::all_implementation_rules();
     implement(&mut memo, &impl_rules, &options);
 
     // 9. Re-derive statistics for any newly created groups (e.g. from AggSplit).
@@ -116,10 +115,10 @@ pub(crate) fn optimize(
 /// detect typos in rule names so they can be surfaced via `warn!`
 /// without rejecting the SET statement.
 pub(crate) fn is_known_rule_name(name: &str) -> bool {
-    rules::all_transformation_rules()
+    cascades_rules::all_transformation_rules()
         .iter()
         .any(|r| r.name() == name)
-        || rules::all_implementation_rules()
+        || cascades_rules::all_implementation_rules()
             .iter()
             .any(|r| r.name() == name)
         || rewrite::registry::is_known_rewrite_rule_name(name)
@@ -173,8 +172,8 @@ fn explore(
                         continue;
                     }
                     // Skip JoinAssociativity when the memo has grown large
-                    // to prevent combinatorial explosion. RBO join reorder
-                    // already handles join ordering for large join graphs.
+                    // to prevent combinatorial explosion. The query rewrite
+                    // join reorder stage already handles large join graphs.
                     if rule.name() == "JoinAssociativity" && memo.groups.len() > 200 {
                         continue;
                     }
@@ -286,7 +285,7 @@ mod is_known_rule_name_tests {
     fn is_known_rule_name_recognizes_real_rule() {
         // JoinCommutativity is a transformation rule that has been stable
         // for a while; if this assertion fails because the rule was renamed,
-        // pick another known rule name from src/sql/optimizer/rules/.
+        // pick another known rule name from src/sql/optimizer/cascades_rules/.
         assert!(is_known_rule_name("JoinCommutativity"));
     }
 

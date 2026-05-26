@@ -13,10 +13,10 @@
 use std::collections::HashSet;
 
 use crate::sql::analysis::ExprKind;
-use crate::sql::optimizer::rbo::utils::{
+use crate::sql::optimizer::rewrite::rule::PlanRewriteRule as RewriteRule;
+use crate::sql::optimizer::rewrite::rules::utils::{
     collect_column_refs, combine_and, split_and, wrap_remaining_filter,
 };
-use crate::sql::optimizer::rewrite::rule::PlanRewriteRule as RewriteRule;
 use crate::sql::planner::plan::*;
 
 pub(crate) struct PushDownPredicateProject;

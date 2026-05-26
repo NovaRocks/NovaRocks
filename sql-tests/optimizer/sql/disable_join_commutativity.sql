@@ -5,7 +5,7 @@
 --    diff between them is the join order / distribution type.
 -- Design note:
 -- The query is a LEFT OUTER JOIN written as date_dim LEFT, lineorder RIGHT.
--- RBO join-reorder only applies to INNER/CROSS joins, so it leaves outer
+-- query rewrite join-reorder only applies to INNER/CROSS joins, so it leaves outer
 -- joins alone.  The CBO JoinCommutativity rule is the only mechanism that
 -- can swap left/right for outer joins.
 -- With JoinCommutativity: CBO swaps to lineorder LEFT (probe) + date_dim RIGHT

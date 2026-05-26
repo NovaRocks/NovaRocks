@@ -1,4 +1,4 @@
-//! RBO rule registry.
+//! Query logical rewrite rule registry.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,6 +11,7 @@ pub(crate) mod column_pruning;
 pub(crate) mod join_reorder;
 pub(crate) mod predicate_pushdown;
 pub(crate) mod ukfk;
+pub(crate) mod utils;
 
 pub(crate) fn column_pruning_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
     vec![
@@ -28,12 +29,12 @@ pub(crate) fn column_pruning_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
 /// causes the needed-column set to shrink across iterations as
 /// predicates get reshuffled, incorrectly dropping join-key or
 /// select-list columns from scan required_columns.
-pub(crate) fn predicate_pushdown_rbo_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
+pub(crate) fn predicate_pushdown_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
     predicate_pushdown::predicate_pushdown_rules()
 }
 
 /// Join reorder rule only. Called as a SEPARATE pass between two
-/// structural_rbo_rules passes (the "push, reorder, push" pattern).
+/// predicate pushdown passes (the "push, reorder, push" pattern).
 /// Do NOT mix with structural rules in a single fixed-point — pushdown
 /// and reorder oscillate and either time out or produce column-scope errors.
 #[allow(dead_code)]
@@ -45,15 +46,15 @@ pub(crate) fn join_reorder_rules(
     )))]
 }
 
-/// All RBO rules including join reorder. For registry test only;
-/// production code calls predicate_pushdown_rbo_rules(), join_reorder,
+/// All query rewrite rules including join reorder. For registry test only;
+/// production code calls predicate_pushdown_rules(), join_reorder,
 /// and column_pruning_rules() separately per the four-pass pattern.
 #[allow(dead_code)]
-pub(crate) fn all_rbo_rules(
+pub(crate) fn all_query_rewrite_rules(
     table_stats: &HashMap<String, TableStatistics>,
 ) -> Vec<Box<dyn LogicalRewriteRule>> {
     let mut all = Vec::new();
-    all.extend(predicate_pushdown_rbo_rules());
+    all.extend(predicate_pushdown_rules());
     all.extend(column_pruning_rules());
     all.extend(join_reorder_rules(table_stats));
     all.extend(aggregate_pushdown::aggregate_pushdown_rules(table_stats));
@@ -66,7 +67,7 @@ mod tests {
 
     #[test]
     fn registry_contains_expected_rules() {
-        let rules = all_rbo_rules(&HashMap::new());
+        let rules = all_query_rewrite_rules(&HashMap::new());
         assert_eq!(rules.len(), 10);
         let mut names: Vec<&str> = rules.iter().map(|r| r.name()).collect();
         names.sort();

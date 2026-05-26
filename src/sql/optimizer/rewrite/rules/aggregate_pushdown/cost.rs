@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use crate::sql::analysis::ExprKind;
-use crate::sql::optimizer::rbo::rules::join_reorder::cardinality::estimate_statistics;
+use crate::sql::optimizer::rewrite::rules::join_reorder::cardinality::estimate_statistics;
 use crate::sql::optimizer::statistics::TableStatistics;
 
 #[cfg(test)]
@@ -53,7 +53,7 @@ pub(crate) fn should_push(plan: &PushPlan, table_stats: &HashMap<String, TableSt
 mod tests {
     use super::*;
     use crate::sql::analysis::OutputColumn;
-    use crate::sql::catalog::{TableDef, ScanSource};
+    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::statistics::ColumnStatistic;
     use crate::sql::planner::plan::ScanNode;

@@ -6,10 +6,10 @@ use arrow::datatypes::DataType;
 
 use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, ProjectItem, TypedExpr};
 use crate::sql::optimizer::options::current_session_optimizer_settings;
-use crate::sql::optimizer::rbo::utils::{
+use crate::sql::optimizer::rewrite::rule::PlanRewriteRule as RewriteRule;
+use crate::sql::optimizer::rewrite::rules::utils::{
     collect_qualified_column_refs, collect_qualified_output_columns, combine_and,
 };
-use crate::sql::optimizer::rewrite::rule::PlanRewriteRule as RewriteRule;
 use crate::sql::planner::plan::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,7 +42,7 @@ impl RewriteRule for PruneUkFkJoin {
 
     fn apply(&self, plan: LogicalPlan) -> Option<LogicalPlan> {
         let settings = current_session_optimizer_settings();
-        let table_prune_enabled = settings.enable_rbo_table_prune
+        let table_prune_enabled = settings.enable_query_rewrite_table_prune
             || settings.enable_cbo_table_prune
             || settings.enable_table_prune_on_update;
         if !table_prune_enabled && !settings.enable_ukfk_opt {

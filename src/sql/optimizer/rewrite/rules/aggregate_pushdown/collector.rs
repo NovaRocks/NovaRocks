@@ -416,7 +416,7 @@ mod tests {
     }
 
     use crate::sql::analysis::{JoinKind, ProjectItem};
-    use crate::sql::catalog::{TableDef, ScanSource};
+    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::planner::plan::{FilterNode, JoinNode, ProjectNode, ScanNode};
 
     fn dummy_scan_with_cols(cols: &[(&str, DataType)]) -> LogicalPlan {

@@ -30,7 +30,7 @@ INSERT INTO txn VALUES
 ALTER TABLE payment SET ("unique_constraints" = "id");
 ALTER TABLE txn SET ("foreign_key_constraints" = "(payment_id) REFERENCES payment(id)");
 SET enable_ukfk_opt = false;
-SET enable_rbo_table_prune = true;
+SET enable_query_rewrite_table_prune = true;
 SET enable_cbo_table_prune = true;
 SET enable_table_prune_on_update = true;
 EXPLAIN
@@ -55,7 +55,7 @@ INNER JOIN payment
 -- @result_not_contains=TABLE: iceberg_pkfk_db_${uuid0}.payment
 USE iceberg_ddl_cat_${suite_uuid0}.iceberg_pkfk_db_${uuid0};
 SET enable_ukfk_opt = true;
-SET enable_rbo_table_prune = false;
+SET enable_query_rewrite_table_prune = false;
 SET enable_cbo_table_prune = false;
 SET enable_table_prune_on_update = false;
 EXPLAIN

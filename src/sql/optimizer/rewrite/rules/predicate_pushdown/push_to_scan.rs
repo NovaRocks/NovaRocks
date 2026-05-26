@@ -9,8 +9,10 @@
 
 use std::collections::HashSet;
 
-use crate::sql::optimizer::rbo::utils::{collect_column_refs, split_and, wrap_remaining_filter};
 use crate::sql::optimizer::rewrite::rule::PlanRewriteRule as RewriteRule;
+use crate::sql::optimizer::rewrite::rules::utils::{
+    collect_column_refs, split_and, wrap_remaining_filter,
+};
 use crate::sql::planner::plan::*;
 
 pub(crate) struct PushDownPredicateScan;

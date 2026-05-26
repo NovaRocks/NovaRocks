@@ -1,4 +1,4 @@
-//! JoinReorderRule — RBO rule wrapping the DP/Greedy/LeftDeep/Heuristic
+//! JoinReorderRule — query rewrite rule wrapping the DP/Greedy/LeftDeep/Heuristic
 //! join reorder algorithms.
 //!
 //! **Convention exception.** Like PruneColumns, this rule recurses
@@ -15,8 +15,8 @@ use crate::sql::planner::plan::LogicalPlan;
 
 /// Wraps `reorder_joins_cbo` as a RewriteRule.
 ///
-/// Stores `table_stats` internally (set at construction time by
-/// `all_rbo_rules(table_stats)`).
+/// Stores `table_stats` internally, set at construction time by the rewrite
+/// pipeline's `JoinReorder` stage.
 #[allow(dead_code)]
 pub(crate) struct JoinReorderRule {
     table_stats: Arc<HashMap<String, TableStatistics>>,

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
-use crate::sql::optimizer::rbo::rules;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::pipeline::{RewritePipeline, RewriteStage};
+use crate::sql::optimizer::rewrite::rules;
 use crate::sql::optimizer::statistics::TableStatistics;
 
 pub(crate) fn default_rewrite_phases() -> Vec<RewritePhase> {
@@ -21,7 +21,7 @@ pub(crate) fn query_rewrite_pipeline(
         RewriteStage::new(
             "PredicatePushdownPreJoin",
             RewritePhase::StructuralRewrite,
-            rules::predicate_pushdown_rbo_rules(),
+            rules::predicate_pushdown_rules(),
         ),
         RewriteStage::new(
             "JoinReorder",
@@ -31,7 +31,7 @@ pub(crate) fn query_rewrite_pipeline(
         RewriteStage::new(
             "PredicatePushdownPostJoin",
             RewritePhase::StructuralRewrite,
-            rules::predicate_pushdown_rbo_rules(),
+            rules::predicate_pushdown_rules(),
         ),
         RewriteStage::new(
             "AggregatePushdown",
