@@ -177,6 +177,8 @@ fn is_mv_state_scalar_function(name: &str) -> bool {
         name,
         "count_state_union"
             | "count_state_visible"
+            | "avg_state_union"
+            | "avg_state_visible"
             | "sum_state_union"
             | "sum_state_visible"
             | "bool_or_state_union"
@@ -187,22 +189,21 @@ fn is_mv_state_scalar_function(name: &str) -> bool {
 }
 
 fn validate_mv_state_scalar_function(name: &str, arg_types: &[DataType]) -> Result<(), String> {
+    let binary_arg = |ty: &DataType| matches!(ty, DataType::Binary | DataType::LargeBinary);
     let expected = match name {
         "count_state_union"
+        | "avg_state_union"
         | "sum_state_union"
         | "bool_or_state_union"
         | "bool_and_state_union" => 2,
         "count_state_visible"
+        | "avg_state_visible"
         | "sum_state_visible"
         | "bool_or_state_visible"
         | "bool_and_state_visible" => 1,
         _ => return Ok(()),
     };
-    if arg_types.len() != expected
-        || arg_types
-            .iter()
-            .any(|ty| !matches!(ty, DataType::Binary | DataType::LargeBinary))
-    {
+    if arg_types.len() != expected || arg_types.iter().any(|ty| !binary_arg(ty)) {
         return Err(no_matching_signature(name, arg_types));
     }
     Ok(())
@@ -1612,6 +1613,41 @@ mod tests {
         assert_eq!(
             err,
             "No matching function with signature: sum_state_visible(varchar(255))."
+        );
+    }
+
+    #[test]
+    fn avg_state_scalar_functions_require_binary_inputs() {
+        assert_eq!(
+            infer_scalar_return_type("avg_state_union", &[DataType::Binary, DataType::Binary]),
+            DataType::Binary
+        );
+        assert_eq!(
+            infer_scalar_return_type("avg_state_visible", &[DataType::LargeBinary]),
+            DataType::Float64
+        );
+        validate_scalar_function_call(
+            "avg_state_union",
+            &[DataType::LargeBinary, DataType::Binary],
+        )
+        .unwrap();
+        validate_scalar_function_call("avg_state_visible", &[DataType::Binary]).unwrap();
+
+        let err = validate_scalar_function_call("avg_state_visible", &[DataType::Utf8])
+            .expect_err("avg_state_visible should reject non-binary type");
+        assert_eq!(
+            err,
+            "No matching function with signature: avg_state_visible(varchar(255))."
+        );
+
+        let err = validate_scalar_function_call(
+            "avg_state_visible",
+            &[DataType::Binary, DataType::Int64],
+        )
+        .expect_err("avg_state_visible should not expose decimal-scale arg to direct SQL");
+        assert_eq!(
+            err,
+            "No matching function with signature: avg_state_visible(varbinary, bigint(20))."
         );
     }
 

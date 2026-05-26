@@ -93,7 +93,9 @@ pub(crate) fn decode_sum_decimal128(bytes: &[u8]) -> Result<(i64, i128), String>
 
 pub(crate) use decode_sum_decimal128 as decode_avg_decimal128;
 pub(crate) use decode_sum_int64 as decode_avg_int64;
+#[cfg(test)]
 pub(crate) use encode_sum_decimal128 as encode_avg_decimal128;
+#[cfg(test)]
 pub(crate) use encode_sum_int64 as encode_avg_int64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

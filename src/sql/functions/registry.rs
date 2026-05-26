@@ -1142,6 +1142,9 @@ fn register_hll_fns(m: &mut HashMap<String, Vec<Signature>>) {
 // ---------------------------------------------------------------------------
 
 fn register_mv_state_fns(m: &mut HashMap<String, Vec<Signature>>) {
+    // Direct SQL calls see only opaque VARBINARY input, so visible functions
+    // use a default return type here. MV query rewrite must stamp the
+    // original aggregate return type onto the FunctionCall before execution.
     add(
         m,
         "count_state_union",
@@ -1151,6 +1154,16 @@ fn register_mv_state_fns(m: &mut HashMap<String, Vec<Signature>>) {
         m,
         "count_state_visible",
         Signature::new(vec![TypeSpec::Binary], TypeSpec::Int64),
+    );
+    add(
+        m,
+        "avg_state_union",
+        Signature::new(vec![TypeSpec::Binary, TypeSpec::Binary], TypeSpec::Binary),
+    );
+    add(
+        m,
+        "avg_state_visible",
+        Signature::new(vec![TypeSpec::Binary], TypeSpec::Float64),
     );
     add(
         m,
