@@ -1381,11 +1381,6 @@ pub(crate) fn refresh_iceberg_mv(
     let mv_definition = &effective_definition;
     let pinned_full_select_sql =
         rewrite_full_refresh_select_with_pin(&mv_definition.select_sql, &pin, base_ref)?;
-    let expected_main_snapshot_id = target_loaded
-        .table
-        .metadata()
-        .current_snapshot()
-        .map(|s| s.snapshot_id());
     let staging_branch = format!(
         "__nova_mv_refresh_{}_{}",
         mv_definition.mv_id,
@@ -1437,7 +1432,7 @@ pub(crate) fn refresh_iceberg_mv(
                 state,
                 &target,
                 mv_definition.mv_id,
-                expected_main_snapshot_id,
+                ctx.rewrite.target_snapshot_id,
                 pin.to_snapshot_map(),
                 &staging_branch,
             )?;

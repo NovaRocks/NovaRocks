@@ -833,4 +833,62 @@ mod tests {
         .expect_err("apply-key absence must fail");
         assert!(err.contains("apply-key column"), "got: {err}");
     }
+
+    #[test]
+    fn from_parts_succeeds_with_distinct_hidden_apply_key_field() {
+        let target = make_target();
+        let mv_def = Arc::new(make_mv_definition());
+        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
+        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
+
+        // Three-field target schema: 100=k (visible), 101=v (visible),
+        // 999=__nova_apply_key (hidden — present in schema but NOT in
+        // visible_columns).
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(7)
+                .with_fields(vec![
+                    Arc::new(NestedField::required(
+                        100,
+                        "k",
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                    Arc::new(NestedField::optional(
+                        101,
+                        "v",
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                    Arc::new(NestedField::required(
+                        999,
+                        "__nova_apply_key",
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                ])
+                .build()
+                .expect("build schema"),
+        );
+
+        // Contract: visible columns are 100/101; hidden apply key is 999.
+        let mut contract = make_schema_contract();
+        contract.target.hidden_apply_key.column_name = "__nova_apply_key".to_string();
+        contract.target.hidden_apply_key.target_field_id = 999;
+        let contract = Arc::new(contract);
+
+        IcebergMvRewriteContext::from_parts(
+            target,
+            42,
+            None,
+            "db".to_string(),
+            mv_def,
+            query,
+            base_refs,
+            pin,
+            Some(99),
+            "uuid-tgt".to_string(),
+            schema,
+            Some(contract),
+        )
+        .expect("ctx must succeed when apply-key is a distinct hidden schema field");
+    }
 }
