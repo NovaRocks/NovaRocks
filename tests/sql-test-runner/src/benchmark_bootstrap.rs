@@ -107,11 +107,23 @@ pub fn build_benchmark_bootstrap_command(
 }
 
 pub fn command_preview(command: &Command) -> String {
-    std::iter::once(command.get_program())
-        .chain(command.get_args())
-        .map(shell_quote)
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut parts = vec![shell_quote(command.get_program())];
+    let mut redact_next = false;
+
+    for arg in command.get_args() {
+        if redact_next {
+            parts.push("<redacted>".to_string());
+            redact_next = false;
+            continue;
+        }
+
+        parts.push(shell_quote(arg));
+        if arg == "--mysql-password" {
+            redact_next = true;
+        }
+    }
+
+    parts.join(" ")
 }
 
 pub fn run_benchmark_bootstrap_command(command: &mut Command) -> Result<bool> {
@@ -290,5 +302,26 @@ mod tests {
                 "--rebuild",
             ]
         );
+    }
+
+    #[test]
+    fn command_preview_redacts_mysql_password() {
+        let command = build_benchmark_bootstrap_command(
+            Path::new("sql-tests/bootstrap/bootstrap_benchmark_data.sh"),
+            "ssb",
+            "1",
+            "iceberg_cat",
+            "127.0.0.1",
+            "23223",
+            "root",
+            Some("very-secret-password"),
+            true,
+            false,
+        );
+
+        let preview = command_preview(&command);
+
+        assert!(preview.contains("--mysql-password <redacted>"));
+        assert!(!preview.contains("very-secret-password"));
     }
 }
