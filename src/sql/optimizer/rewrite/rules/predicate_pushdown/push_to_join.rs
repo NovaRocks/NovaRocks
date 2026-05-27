@@ -176,6 +176,21 @@ fn push_predicates_through_join(predicate: TypedExpr, join: JoinNode) -> (Logica
                         left_preds.push(conj);
                     } else if is_left_join_variant {
                         remaining.push(conj);
+                    } else if matches!(
+                        join.join_type,
+                        JoinKind::RightOuter | JoinKind::FullOuter
+                    ) {
+                        // For RIGHT OUTER / FULL OUTER, predicates that
+                        // reference both sides cannot be fused into the
+                        // join's `other` condition: unmatched rows on the
+                        // null-extending side still produce a null-padded
+                        // output row through `other`, so a
+                        // `WHERE abs(left.v1 + right.v4) > 5` becomes
+                        // "either match passes the predicate OR emit
+                        // null-extended row" instead of the intended
+                        // post-join filter. Keep these predicates above
+                        // the join.
+                        remaining.push(conj);
                     } else {
                         // For OR predicates, try to extract common equi-join
                         // conditions shared by all OR branches. This handles:
