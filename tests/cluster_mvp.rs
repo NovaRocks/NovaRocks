@@ -1,5 +1,5 @@
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{Shutdown, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, MutexGuard, mpsc};
@@ -17,12 +17,28 @@ fn lock_cluster_mvp() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn alloc_port() -> u16 {
-    std::net::TcpListener::bind(("127.0.0.1", 0))
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("local addr")
-        .port()
+struct ReservedPort {
+    _listener: TcpListener,
+    port: u16,
+}
+
+impl ReservedPort {
+    fn new() -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local addr").port();
+        Self {
+            _listener: listener,
+            port,
+        }
+    }
+
+    fn port(&self) -> u16 {
+        self.port
+    }
+
+    fn release(self) -> u16 {
+        self.port
+    }
 }
 
 fn runtime_dir() -> PathBuf {
@@ -188,11 +204,16 @@ struct ClusterHarness {
 
 impl ClusterHarness {
     fn start(be_debug: &str, fe_extra: &str) -> Self {
-        let be_http = alloc_port();
-        let be_starlet = alloc_port();
-        let fe_mysql = alloc_port();
-        let fe_http = alloc_port();
-        let fe_starlet = alloc_port();
+        let be_http = ReservedPort::new();
+        let be_starlet = ReservedPort::new();
+        let fe_mysql = ReservedPort::new();
+        let fe_http = ReservedPort::new();
+        let fe_starlet = ReservedPort::new();
+        let be_http_port = be_http.port();
+        let be_starlet_port = be_starlet.port();
+        let fe_mysql_port = fe_mysql.port();
+        let fe_http_port = fe_http.port();
+        let fe_starlet_port = fe_starlet.port();
 
         let be_config = write_config(
             "be",
@@ -200,8 +221,8 @@ impl ClusterHarness {
                 r#"
 [server]
 host = "127.0.0.1"
-http_port = {be_http}
-starlet_port = {be_starlet}
+http_port = {be_http_port}
+starlet_port = {be_starlet_port}
 
 [cluster]
 role = "be"
@@ -215,30 +236,35 @@ role = "be"
                 r#"
 [server]
 host = "127.0.0.1"
-http_port = {fe_http}
-starlet_port = {fe_starlet}
+http_port = {fe_http_port}
+starlet_port = {fe_starlet_port}
 
 [standalone_server]
-mysql_port = {fe_mysql}
+mysql_port = {fe_mysql_port}
 
 [cluster]
 role = "fe"
-backends = ["127.0.0.1:{be_starlet}"]
+backends = ["127.0.0.1:{be_starlet_port}"]
 {fe_extra}
 "#
             ),
         );
 
+        let _ = be_http.release();
+        let _ = be_starlet.release();
         let mut be = ProcessGuard::spawn(be_config.path());
         be.wait_for_ready("NOVAROCKS_READY role=be");
 
+        let _ = fe_mysql.release();
+        let _ = fe_http.release();
+        let _ = fe_starlet.release();
         let mut fe = ProcessGuard::spawn(fe_config.path());
         fe.wait_for_ready("NOVAROCKS_READY mysql_port=");
 
         Self {
             be,
             _fe: fe,
-            fe_mysql,
+            fe_mysql: fe_mysql_port,
         }
     }
 }
@@ -354,11 +380,16 @@ fn cross_process_remote_dispatcher_smoke() {
     }
     let _lock = lock_cluster_mvp();
 
-    let be_http = alloc_port();
-    let be_starlet = alloc_port();
-    let fe_mysql = alloc_port();
-    let fe_http = alloc_port();
-    let fe_starlet = alloc_port();
+    let be_http = ReservedPort::new();
+    let be_starlet = ReservedPort::new();
+    let fe_mysql = ReservedPort::new();
+    let fe_http = ReservedPort::new();
+    let fe_starlet = ReservedPort::new();
+    let be_http_port = be_http.port();
+    let be_starlet_port = be_starlet.port();
+    let fe_mysql_port = fe_mysql.port();
+    let fe_http_port = fe_http.port();
+    let fe_starlet_port = fe_starlet.port();
 
     let be_config = write_config(
         "be",
@@ -366,8 +397,8 @@ fn cross_process_remote_dispatcher_smoke() {
             r#"
 [server]
 host = "127.0.0.1"
-http_port = {be_http}
-starlet_port = {be_starlet}
+http_port = {be_http_port}
+starlet_port = {be_starlet_port}
 
 [cluster]
 role = "be"
@@ -382,37 +413,42 @@ role = "be"
             r#"
 [server]
 host = "127.0.0.1"
-http_port = {fe_http}
-starlet_port = {fe_starlet}
+http_port = {fe_http_port}
+starlet_port = {fe_starlet_port}
 
 [standalone_server]
-mysql_port = {fe_mysql}
+mysql_port = {fe_mysql_port}
 
 [cluster]
 role = "fe"
-backends = ["127.0.0.1:{be_starlet}"]
+backends = ["127.0.0.1:{be_starlet_port}"]
 "#
         ),
     );
 
+    let _ = be_http.release();
+    let _ = be_starlet.release();
     let mut be = ProcessGuard::spawn(be_config.path());
     be.wait_for_ready("NOVAROCKS_READY role=be");
 
+    let _ = fe_mysql.release();
+    let _ = fe_http.release();
+    let _ = fe_starlet.release();
     let mut fe = ProcessGuard::spawn(fe_config.path());
     fe.wait_for_ready("NOVAROCKS_READY mysql_port=");
 
     // Spec (PR-4 Critical): role=fe must NOT start a local gRPC/exchange server.
     // All fragments run on BE; FE only runs MySQL + coordinator + RemoteDispatcher.
     // Assert that the FE's http_port is NOT listening.
-    let fe_http_addr: std::net::SocketAddr = format!("127.0.0.1:{fe_http}")
+    let fe_http_addr: std::net::SocketAddr = format!("127.0.0.1:{fe_http_port}")
         .parse()
         .expect("parse fe http addr");
     assert!(
         std::net::TcpStream::connect_timeout(&fe_http_addr, Duration::from_millis(200)).is_err(),
-        "spec violation: role=fe must NOT bind local gRPC exchange server on http_port={fe_http}"
+        "spec violation: role=fe must NOT bind local gRPC exchange server on http_port={fe_http_port}"
     );
 
-    let mut conn = connect_mysql(fe_mysql);
+    let mut conn = connect_mysql(fe_mysql_port);
 
     // Phase 1: run a query that forces a Coordinated (multi-fragment) plan.
     // SELECT + ORDER BY on a non-trivial UNION forces Sort(Distribution(Gather))
@@ -573,4 +609,19 @@ fault_inject_fetch_not_ready_count = 1000
         !err.is_empty(),
         "expected a non-empty FE error after BE crash"
     );
+}
+
+#[test]
+fn reserved_port_blocks_rebinding_until_release() {
+    let port = ReservedPort::new();
+    let addr = ("127.0.0.1", port.port());
+
+    assert!(
+        std::net::TcpListener::bind(addr).is_err(),
+        "reserved port must remain bound until release"
+    );
+
+    let released_port = port.release();
+    let _listener = std::net::TcpListener::bind(("127.0.0.1", released_port))
+        .expect("released port can be rebound");
 }

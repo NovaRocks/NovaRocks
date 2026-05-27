@@ -412,16 +412,9 @@ impl FragmentDispatcher for InProcessDispatcher {
 
             let state = Arc::clone(&self.state);
             std::thread::spawn(move || {
-                let result = run_root_fragment_in_process(params);
-                match result {
-                    Ok(chunks) => slot.set_done(chunks),
-                    Err(msg) => {
-                        // Cancel all exchanges so blocked receivers unblock.
-                        warn!("{}", format_fragment_error(finst_key, &msg));
-                        cancel_all_submitted(&state);
-                        slot.set_error(msg);
-                    }
-                }
+                finish_root_fragment_in_process(finst_key, state, slot, || {
+                    run_root_fragment_in_process(params)
+                });
             });
         } else {
             // Non-root fragment path: execute_plan_fragment_sync in a thread.
@@ -720,6 +713,43 @@ fn run_root_fragment_in_process(
     )?;
 
     Ok(handle.take_chunks())
+}
+
+fn finish_root_fragment_in_process<F>(
+    finst_key: (i64, i64),
+    state: Arc<InProcessState>,
+    slot: Arc<RootSlot>,
+    run: F,
+) where
+    F: FnOnce() -> Result<Vec<Chunk>, String>,
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+        Ok(Ok(chunks)) => slot.set_done(chunks),
+        Ok(Err(msg)) => {
+            warn!("{}", format_fragment_error(finst_key, &msg));
+            cancel_all_submitted(&state);
+            slot.set_error(msg);
+        }
+        Err(payload) => {
+            let msg = format!(
+                "root fragment thread panicked: {}",
+                panic_payload_message(payload.as_ref())
+            );
+            warn!("{}", format_fragment_error(finst_key, &msg));
+            cancel_all_submitted(&state);
+            slot.set_error(msg);
+        }
+    }
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
 }
 
 fn resolve_root_pipeline_dop(params: &internal_service::TExecPlanFragmentParams) -> i32 {
@@ -1152,6 +1182,34 @@ mod tests {
         assert!(
             matches!(outcome, FetchOutcome::Eof),
             "expected Eof for unknown finst_id"
+        );
+    }
+
+    #[test]
+    fn root_fragment_panic_sets_slot_error() {
+        let dispatcher = InProcessDispatcher::default();
+        let finst_key = (33, 44);
+        let slot = RootSlot::new();
+        dispatcher
+            .state
+            .root_slots
+            .lock()
+            .expect("root_slots lock")
+            .insert(finst_key, Arc::clone(&slot));
+
+        finish_root_fragment_in_process(finst_key, Arc::clone(&dispatcher.state), slot, || {
+            panic!("root fragment panic for test")
+        });
+
+        let outcome = dispatcher
+            .fetch_result(make_finst_id(finst_key.0, finst_key.1), 1)
+            .expect("fetch root slot");
+        let FetchOutcome::Err(message) = outcome else {
+            panic!("expected root fragment panic to surface as error");
+        };
+        assert!(
+            message.contains("panicked") && message.contains("root fragment panic for test"),
+            "unexpected panic error message: {message}"
         );
     }
 
