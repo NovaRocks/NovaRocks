@@ -6292,11 +6292,18 @@ fn try_run_imv_rewrite_pipeline(state: &Arc<StandaloneState>, ctx: &IcebergMvRef
         String,
     > {
         let plan = plan_canonical_select_for_imv(state, ctx).map_err(|e| e.message)?;
+        // Thread the active session's disable_optimizer_rules into IMV. When
+        // refresh runs outside a user session (e.g. background scheduler),
+        // the thread-local default is empty, so this is a safe no-op.
+        let disabled_rules =
+            crate::sql::optimizer::options::current_session_optimizer_settings()
+                .disabled_rules
+                .clone();
         crate::sql::optimizer::rewrite::imv::entrypoint::run_imv_rewrite(
             crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteInput {
                 plan,
                 mv_ctx: Arc::clone(&ctx.rewrite),
-                disabled_rules: Vec::new(),
+                disabled_rules,
                 deadline: None,
             },
         )
