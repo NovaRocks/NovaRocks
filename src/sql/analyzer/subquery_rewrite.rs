@@ -1034,8 +1034,13 @@ impl<'a> AnalyzerContext<'a> {
             // null-aware equality so the LEFT ANTI join matches whenever
             // either operand is NULL, matching SQL's
             // "x NOT IN S returns UNKNOWN if x is NULL or S contains NULL"
-            // semantics.
-            let eq = if negated && !inside_or {
+            // semantics — but only when nulls are actually possible. When
+            // both operands are statically non-nullable, the OR-with-IsNull
+            // branches are dead code that prevent the downstream optimizer
+            // from extracting an equi-key and falls back to a NestLoopJoin
+            // (turning a typical `c0 NOT IN (subq)` into a quadratic scan).
+            let either_nullable = lhs_i.nullable || sub_col.nullable;
+            let eq = if negated && !inside_or && either_nullable {
                 null_aware_eq(lhs_i.clone(), rhs_ref)
             } else {
                 TypedExpr {
