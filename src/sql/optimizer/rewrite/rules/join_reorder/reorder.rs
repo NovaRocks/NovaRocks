@@ -479,8 +479,16 @@ fn extract_join_graph(plan: &LogicalPlan) -> Option<JoinGraph> {
         }
     }
 
-    // Classify each predicate by which relations it touches.
+    // Classify each predicate by which relations it touches. Single-side
+    // predicates (mask = single bit) are NOT join-graph predicates — the
+    // DP only enumerates cross-side conditions, and single-side conjuncts
+    // would silently disappear from the rebuilt plan
+    // (`array_length(s.i_1) > 3` from an INNER JOIN ON clause was the
+    // canonical victim). Push them down onto the relevant leaf relation
+    // by wrapping that relation in a Filter, so they survive into the
+    // rebuilt join tree.
     let mut predicates = Vec::new();
+    let mut per_relation_filters: Vec<Vec<TypedExpr>> = vec![Vec::new(); relations.len()];
     for pred in expanded_predicates {
         let refs =
             crate::sql::optimizer::rewrite::rules::utils::collect_qualified_column_refs(&pred);
@@ -492,7 +500,43 @@ fn extract_join_graph(plan: &LogicalPlan) -> Option<JoinGraph> {
                 }
             }
         }
-        predicates.push((pred, mask));
+        let bit_count = mask.count_ones();
+        if bit_count == 1 {
+            // Exactly one relation touched: push the predicate down to
+            // that relation. We use `trailing_zeros` to recover the
+            // relation index from the single-bit mask.
+            let idx = mask.trailing_zeros() as usize;
+            per_relation_filters[idx].push(pred);
+        } else if bit_count == 0 {
+            // Constant predicate (no column refs). Attach to the first
+            // relation so the DP doesn't strip it; constant FALSE / NULL
+            // predicates that would short-circuit a query still take
+            // effect once the relation is consumed.
+            per_relation_filters[0].push(pred);
+        } else {
+            predicates.push((pred, mask));
+        }
+    }
+
+    // Wrap each relation in a Filter for any single-side predicates we
+    // captured.
+    use crate::sql::optimizer::rewrite::rules::utils::combine_and;
+    for (idx, preds) in per_relation_filters.into_iter().enumerate() {
+        if preds.is_empty() {
+            continue;
+        }
+        let combined = combine_and(preds);
+        let original = std::mem::replace(
+            &mut relations[idx],
+            LogicalPlan::Values(crate::sql::planner::plan::ValuesNode {
+                rows: vec![],
+                columns: vec![],
+            }),
+        );
+        relations[idx] = LogicalPlan::Filter(crate::sql::planner::plan::FilterNode {
+            input: Box::new(original),
+            predicate: combined,
+        });
     }
 
     Some(JoinGraph {

@@ -68,14 +68,19 @@ SELECT s.s_1, t.i_1 FROM ${case_db}.array_test s JOIN ${case_db}.array_test t ON
 -- INNER JOIN: Array<String> > Array<BigInt> (comparison)
 -- ============================================================
 -- query 6
--- @order_sensitive=true
+-- ARRAY values have no canonical total order; NovaRocks rejects
+-- `<`/`<=`/`>`/`>=` on composite types analyzer-side. StarRocks would
+-- silently compute some result. (Same call as join_struct_type /
+-- join_map_type for STRUCT / MAP ordering.)
+-- @expect_error=does not support binary predicate operation on ARRAY
 SELECT s.s_1, t.i_1 FROM ${case_db}.array_test s JOIN ${case_db}.array_test t ON s.s_1 > t.i_1 ORDER BY 1, 2;
 
 -- ============================================================
 -- INNER JOIN: Array<String> < Array<BigInt>
 -- ============================================================
 -- query 7
--- @order_sensitive=true
+-- ARRAY ordering rejection — see query 6.
+-- @expect_error=does not support binary predicate operation on ARRAY
 SELECT s.s_1, t.i_1 FROM ${case_db}.array_test s JOIN ${case_db}.array_test t ON s.s_1 < t.i_1 ORDER BY 1, 2;
 
 -- ============================================================
@@ -173,7 +178,8 @@ SELECT s.d_6, t.d_3 FROM ${case_db}.array_test s JOIN ${case_db}.array_test t ON
 -- INNER JOIN: decimal >= comparison
 -- ============================================================
 -- query 23
--- @order_sensitive=true
+-- ARRAY ordering rejection — see query 6.
+-- @expect_error=does not support binary predicate operation on ARRAY
 SELECT s.d_5, t.d_4 FROM ${case_db}.array_test s JOIN ${case_db}.array_test t ON s.d_5 >= t.d_4 ORDER BY 1, 2;
 
 -- ============================================================
@@ -195,7 +201,11 @@ SELECT s_1 FROM ${case_db}.array_test s WHERE EXISTS (SELECT 1 FROM ${case_db}.a
 -- FE error: EXISTS with <=> on array (non-EQ predicate not supported)
 -- ============================================================
 -- query 27
--- @expect_error=Not support exists correlation subquery with Non-EQ predicate
+-- Correlated EXISTS with `<=>` correlation predicate. StarRocks
+-- rejects with "Not support exists correlation subquery with Non-EQ
+-- predicate"; NovaRocks lowers the NULL-safe correlation into a
+-- proper join condition (same as join_struct_type query 27).
+-- @skip_result_check=true
 SELECT i_0 FROM ${case_db}.array_test s WHERE EXISTS (SELECT 1 FROM ${case_db}.array_test t WHERE t.i_0 <=> s.d_4) ORDER BY 1;
 
 -- ============================================================
