@@ -669,6 +669,82 @@ mod tests {
     }
 
     #[test]
+    fn render_cross_process_config_patches_fe_and_be_independently() {
+        let runtime = CrossProcessRuntime {
+            be_http_port: 18080,
+            be_starlet_port: 19070,
+            fe_http_port: 28080,
+            fe_starlet_port: 29070,
+            fe_mysql_port: 29030,
+        };
+        let base = r#"
+[metadata]
+provider = "sqlite"
+path = "tmp/sql-tests.sqlite"
+
+[standalone_server]
+warehouse_uri = "s3://warehouse/sql-tests"
+
+[standalone_server.object_store]
+endpoint = "http://127.0.0.1:9000"
+access_key_id = "admin"
+enable_path_style_access = true
+
+[debug]
+exec_node_output = true
+"#;
+
+        let fe = render_cross_process_config(base, ClusterProcessRole::Fe, &runtime)
+            .expect("render fe config");
+        let be = render_cross_process_config(base, ClusterProcessRole::Be, &runtime)
+            .expect("render be config");
+
+        let fe_value: toml::Value = fe.parse().expect("parse fe toml");
+        let be_value: toml::Value = be.parse().expect("parse be toml");
+
+        assert_eq!(fe_value["metadata"]["path"].as_str(), Some("tmp/sql-tests.sqlite"));
+        assert_eq!(
+            fe_value["standalone_server"]["object_store"]["endpoint"].as_str(),
+            Some("http://127.0.0.1:9000")
+        );
+        assert_eq!(fe_value["debug"]["exec_node_output"].as_bool(), Some(true));
+        assert_eq!(fe_value["server"]["host"].as_str(), Some("127.0.0.1"));
+        assert_eq!(fe_value["server"]["http_port"].as_integer(), Some(28080));
+        assert_eq!(fe_value["server"]["starlet_port"].as_integer(), Some(29070));
+        assert_eq!(
+            fe_value["standalone_server"]["mysql_port"].as_integer(),
+            Some(29030)
+        );
+        assert_eq!(fe_value["cluster"]["role"].as_str(), Some("fe"));
+        assert_eq!(
+            fe_value["cluster"]["backends"]
+                .as_array()
+                .and_then(|items| items.first())
+                .and_then(|value| value.as_str()),
+            Some("127.0.0.1:19070")
+        );
+
+        assert_eq!(be_value["metadata"]["path"].as_str(), Some("tmp/sql-tests.sqlite"));
+        assert_eq!(
+            be_value["standalone_server"]["object_store"]["endpoint"].as_str(),
+            Some("http://127.0.0.1:9000")
+        );
+        assert_eq!(be_value["debug"]["exec_node_output"].as_bool(), Some(true));
+        assert_eq!(be_value["server"]["host"].as_str(), Some("127.0.0.1"));
+        assert_eq!(be_value["server"]["http_port"].as_integer(), Some(18080));
+        assert_eq!(be_value["server"]["starlet_port"].as_integer(), Some(19070));
+        assert!(be_value
+            .get("standalone_server")
+            .and_then(|value| value.get("mysql_port"))
+            .is_none());
+        assert_eq!(be_value["cluster"]["role"].as_str(), Some("be"));
+        assert!(be_value
+            .get("cluster")
+            .and_then(|value| value.get("backends"))
+            .is_none());
+    }
+
+    #[test]
     fn reserved_port_blocks_rebinding_until_release() {
         let reserved = ReservedPort::new().expect("reserve port");
         let port = reserved.port();
