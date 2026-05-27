@@ -307,7 +307,10 @@ impl StandaloneNovaRocks {
     /// global config) and then proceeds with the normal engine-open body.
     /// `opts.config_path` is preserved for resolving relative paths (e.g.
     /// SQLite metadata DB paths) but is **not** re-read from disk.
-    pub fn open_with_config(opts: StandaloneOptions, cfg: novarocks_config::NovaRocksConfig) -> Result<Self, String> {
+    pub fn open_with_config(
+        opts: StandaloneOptions,
+        cfg: novarocks_config::NovaRocksConfig,
+    ) -> Result<Self, String> {
         #[cfg(test)]
         let _test_guard = Some(acquire_standalone_test_guard());
         novarocks_config::install_preloaded_config(cfg);
@@ -319,8 +322,10 @@ impl StandaloneNovaRocks {
 
     /// Common engine-open body.  Called after the process-wide config has
     /// already been installed by the caller.
-    #[cfg(test)]
-    fn open_body(opts: StandaloneOptions, _test_guard: Option<TestSerializationGuard>) -> Result<Self, String> {
+    fn open_body(
+        opts: StandaloneOptions,
+        #[cfg(test)] _test_guard: Option<TestSerializationGuard>,
+    ) -> Result<Self, String> {
         let exchange_port = ensure_standalone_exchange_server()?;
         let metadata_backend = resolve_metadata_backend(&opts)?;
         let metadata_provider = metadata_backend
@@ -340,6 +345,7 @@ impl StandaloneNovaRocks {
             iceberg_catalog_repo: IcebergCatalogMetaRepository,
             job_repo: JobMetaRepository,
             exchange_port,
+            #[cfg(test)]
             _test_guard,
             ..Default::default()
         });
@@ -348,35 +354,7 @@ impl StandaloneNovaRocks {
         if inner.starrocks_table_config.is_some() && inner.metadata_provider.is_some() {
             crate::connector::spawn_starrocks_table_erase_worker(Arc::clone(&inner));
         }
-        Ok(Self { inner })
-    }
-
-    #[cfg(not(test))]
-    fn open_body(opts: StandaloneOptions) -> Result<Self, String> {
-        let exchange_port = ensure_standalone_exchange_server()?;
-        let metadata_backend = resolve_metadata_backend(&opts)?;
-        let metadata_provider = metadata_backend
-            .as_ref()
-            .map(open_metadata_provider)
-            .transpose()?;
-        let managed_lake_config = resolve_managed_lake_config()?;
-        let inner = Arc::new(StandaloneState {
-            managed_lake: RwLock::new(ManagedLakeCatalog::empty(managed_lake_config.clone())),
-            managed_lake_config,
-            metadata_provider,
-            managed_repo: ManagedLakeMetaRepository,
-            managed_txn_repo: ManagedLakeTxnRepository,
-            mv_repo: MvMetaRepository,
-            iceberg_catalog_repo: IcebergCatalogMetaRepository,
-            job_repo: JobMetaRepository,
-            exchange_port,
-            ..Default::default()
-        });
-        register_connector_backends(&inner);
-        restore_metadata_if_needed(&inner)?;
-        if inner.managed_lake_config.is_some() && inner.metadata_provider.is_some() {
-            crate::connector::spawn_managed_erase_worker(Arc::clone(&inner));
-        }
+        #[cfg(not(test))]
         if inner.metadata_provider.is_some() {
             crate::connector::spawn_iceberg_optimize_worker(Arc::clone(&inner));
         }

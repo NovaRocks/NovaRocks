@@ -878,7 +878,10 @@ mod tests {
         let parsed = parse_standalone_server_args(&args)
             .expect("parse args")
             .expect("args");
-        assert_eq!(parsed.role, Some(novarocks::common::app_config::ClusterRole::Fe));
+        assert_eq!(
+            parsed.role,
+            Some(novarocks::common::app_config::ClusterRole::Fe)
+        );
         assert_eq!(parsed.config_path.as_deref(), Some("fe.toml"));
     }
 
@@ -888,7 +891,10 @@ mod tests {
         let parsed = parse_standalone_server_args(&args)
             .expect("parse args")
             .expect("args");
-        assert_eq!(parsed.role, Some(novarocks::common::app_config::ClusterRole::AllInOne));
+        assert_eq!(
+            parsed.role,
+            Some(novarocks::common::app_config::ClusterRole::AllInOne)
+        );
     }
 
     #[test]
@@ -1176,8 +1182,7 @@ role = "all-in-one"
             role: None,
             mysql_port: None,
         };
-        let (_, _, resolved_path) =
-            load_config_and_resolve_role(&cli).expect("load must succeed");
+        let (_, _, resolved_path) = load_config_and_resolve_role(&cli).expect("load must succeed");
         assert!(
             resolved_path.is_some(),
             "resolved_path must be Some when --config was provided"

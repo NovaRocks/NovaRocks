@@ -55,7 +55,9 @@ struct ResolvedStandaloneServerOptions {
 /// Legacy standalone server entrypoint that loads config from disk/env inside
 /// [`StandaloneNovaRocks::open`].  New callers that already hold a validated
 /// config should prefer [`run_standalone_server_with_config`].
-#[deprecated(note = "prefer run_standalone_server_with_config when a validated config is available")]
+#[deprecated(
+    note = "prefer run_standalone_server_with_config when a validated config is available"
+)]
 pub fn run_standalone_server(opts: StandaloneServerOptions) -> Result<(), String> {
     let resolved = resolve_server_options(&opts)?;
     run_with_resolved_options(resolved)
