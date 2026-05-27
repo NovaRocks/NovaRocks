@@ -6870,6 +6870,7 @@ enable_path_style_access = true
 
     #[test]
     fn dispatcher_for_role_fe_no_backend_configured_returns_error() {
+        let _guard = super::acquire_standalone_test_guard();
         use crate::common::app_config::ClusterRole;
         crate::common::app_config::install_default_for_test();
         let result = super::dispatcher_for_role(ClusterRole::Fe, "127.0.0.1", 0);
@@ -6901,6 +6902,7 @@ enable_path_style_access = true
     /// Issue 2: FE role with a valid backend address returns a dispatcher.
     #[test]
     fn dispatcher_for_role_fe_valid_backend_returns_dispatcher() {
+        let _guard = super::acquire_standalone_test_guard();
         use crate::common::app_config::{ClusterRole, NovaRocksConfig};
         let mut cfg = NovaRocksConfig::default();
         cfg.cluster.backends = vec!["127.0.0.1:9070".to_string()];
@@ -6917,6 +6919,7 @@ enable_path_style_access = true
     /// names both the role and the bad address value.
     #[test]
     fn dispatcher_for_role_fe_malformed_backend_returns_error_with_role_and_value() {
+        let _guard = super::acquire_standalone_test_guard();
         use crate::common::app_config::{ClusterRole, NovaRocksConfig};
         let mut cfg = NovaRocksConfig::default();
         cfg.cluster.backends = vec!["not-an-addr".to_string()];
@@ -6936,6 +6939,7 @@ enable_path_style_access = true
     /// backend would be silently accepted.
     #[test]
     fn dispatcher_for_role_fe_multiple_backends_returns_error_with_count() {
+        let _guard = super::acquire_standalone_test_guard();
         use crate::common::app_config::{ClusterRole, NovaRocksConfig};
         let mut cfg = NovaRocksConfig::default();
         cfg.cluster.backends = vec!["127.0.0.1:9070".to_string(), "127.0.0.1:9071".to_string()];
