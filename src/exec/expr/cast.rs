@@ -24,9 +24,9 @@ use arrow::array::{
     Decimal256Array, Float32Array, Float32Builder, Float64Array, Float64Builder, Int8Array,
     Int8Builder, Int16Array, Int16Builder, Int32Array, Int32Builder, Int64Array, Int64Builder,
     LargeBinaryArray, ListArray, MapArray, StringArray, StringBuilder, StructArray,
-    TimestampMicrosecondArray, TimestampMicrosecondBuilder, TimestampMillisecondArray,
-    TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
-    UInt64Array, make_array, new_null_array,
+    Time64MicrosecondArray, TimestampMicrosecondArray, TimestampMicrosecondBuilder,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array, make_array, new_null_array,
 };
 use arrow::compute::{cast, take};
 use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
@@ -865,27 +865,12 @@ fn seconds_from_timestamp(unit: &TimeUnit, value: i64) -> Option<i64> {
     Some((t.hour() as i64) * 3600 + (t.minute() as i64) * 60 + t.second() as i64)
 }
 
-fn seconds_to_target_timestamp_array(
-    seconds: Vec<Option<i64>>,
-    target_type: &DataType,
-) -> Result<ArrayRef, String> {
-    let mut micros = Vec::with_capacity(seconds.len());
-    for value in seconds {
-        let v = value.and_then(|s| s.checked_mul(1_000_000));
-        micros.push(v);
-    }
-    let array = Arc::new(TimestampMicrosecondArray::from(micros)) as ArrayRef;
-    if matches!(target_type, DataType::Timestamp(TimeUnit::Microsecond, _)) {
-        return Ok(array);
-    }
-    cast(&array, target_type).map_err(|e| {
-        format!(
-            "CAST failed: from {:?} to {:?}: {}",
-            array.data_type(),
-            target_type,
-            e
-        )
-    })
+fn seconds_to_time64_micro_array(seconds: Vec<Option<i64>>) -> Result<ArrayRef, String> {
+    let micros: Vec<Option<i64>> = seconds
+        .into_iter()
+        .map(|v| v.and_then(|s| s.checked_mul(1_000_000)))
+        .collect();
+    Ok(Arc::new(Time64MicrosecondArray::from(micros)) as ArrayRef)
 }
 
 fn parse_varchar_to_boolean_starrocks(value: &str) -> Option<bool> {
@@ -3269,9 +3254,9 @@ fn eval_time_internal(
         .data_type(cast_expr)
         .ok_or_else(|| "CAST missing target data type".to_string())?
         .clone();
-    if !matches!(target_type, DataType::Timestamp(_, _)) {
+    if !matches!(target_type, DataType::Time64(TimeUnit::Microsecond)) {
         return Err(format!(
-            "CAST failed: TIME target must be timestamp-compatible, got {:?}",
+            "CAST failed: TIME target must be Time64(Microsecond), got {:?}",
             target_type
         ));
     }
@@ -3516,7 +3501,7 @@ fn eval_time_internal(
         }
     }
 
-    seconds_to_target_timestamp_array(seconds, &target_type)
+    seconds_to_time64_micro_array(seconds)
 }
 
 pub fn eval_time(
@@ -4000,26 +3985,26 @@ mod tests {
         );
         let cast_time = arena.push_typed(
             ExprNode::CastTime(literal),
-            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Time64(TimeUnit::Microsecond),
         );
         let direct = arena.eval(cast_time, &chunk).expect("cast time eval");
         let direct = direct
             .as_any()
-            .downcast_ref::<TimestampMicrosecondArray>()
-            .expect("timestamp output");
+            .downcast_ref::<Time64MicrosecondArray>()
+            .expect("time64 output");
         assert!(direct.is_null(0));
 
         let cast_time_from_dt = arena.push_typed(
             ExprNode::CastTimeFromDatetime(literal),
-            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Time64(TimeUnit::Microsecond),
         );
         let from_dt = arena
             .eval(cast_time_from_dt, &chunk)
             .expect("cast time from datetime eval");
         let from_dt = from_dt
             .as_any()
-            .downcast_ref::<TimestampMicrosecondArray>()
-            .expect("timestamp output");
+            .downcast_ref::<Time64MicrosecondArray>()
+            .expect("time64 output");
         assert!(!from_dt.is_null(0));
         assert_eq!(from_dt.value(0), 3_661_000_000);
     }
@@ -4035,13 +4020,13 @@ mod tests {
         );
         let cast_time = arena.push_typed(
             ExprNode::CastTime(literal),
-            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Time64(TimeUnit::Microsecond),
         );
         let out = arena.eval(cast_time, &chunk).expect("cast time eval");
         let out = out
             .as_any()
-            .downcast_ref::<TimestampMicrosecondArray>()
-            .expect("timestamp output");
+            .downcast_ref::<Time64MicrosecondArray>()
+            .expect("time64 output");
         assert_eq!(out.value(0), 90_000_000_000);
     }
 

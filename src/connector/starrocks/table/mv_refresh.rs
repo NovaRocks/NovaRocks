@@ -4384,10 +4384,10 @@ enable_path_style_access = true
     }
 
     fn aggregate_visible_query_result() -> Result<QueryResult, String> {
-        use arrow::array::LargeBinaryArray;
         use crate::connector::starrocks::table::state_codec::{
             encode_count_state, encode_sum_int64,
         };
+        use arrow::array::LargeBinaryArray;
 
         // Counterpart visible values: c=[3, 4], s=[30, 40], one row per k1.
         // Post-#188 the executor surfaces aggregates as opaque LargeBinary
