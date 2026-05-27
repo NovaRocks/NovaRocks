@@ -570,8 +570,19 @@ pub(crate) fn submit_and_fetch_loop(
     }
 
     let mut chunks = Vec::new();
+    let timeout = std::time::Duration::from_millis(timeout_ms.max(0) as u64);
+    let deadline = std::time::Instant::now() + timeout;
     loop {
-        match dispatcher.fetch_result(root_finst_id.clone(), timeout_ms) {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            dispatcher.cancel_fragments(&submitted);
+            return Err(format!("query timed out after {timeout_ms} ms"));
+        }
+        let remaining_ms = deadline
+            .saturating_duration_since(now)
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        match dispatcher.fetch_result(root_finst_id.clone(), remaining_ms.max(1)) {
             Err(e) => {
                 dispatcher.cancel_fragments(&submitted);
                 return Err(e);
@@ -595,8 +606,8 @@ pub(crate) fn submit_and_fetch_loop(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
     use crate::runtime::dispatcher::{FetchOutcome, FragmentDispatcher};
@@ -659,6 +670,7 @@ mod tests {
     enum FetchBehavior {
         Eof,
         Err(String),
+        NotReady,
     }
 
     struct ControllableDispatcher {
@@ -704,6 +716,16 @@ mod tests {
             })
         }
 
+        fn fetch_returns_not_ready() -> Arc<Self> {
+            Arc::new(Self {
+                submitted: Mutex::new(Vec::new()),
+                cancelled: Mutex::new(Vec::new()),
+                submit_count: AtomicUsize::new(0),
+                fail_on_submit: None,
+                fetch_behavior: FetchBehavior::NotReady,
+            })
+        }
+
         fn submitted_ids(&self) -> Vec<types::TUniqueId> {
             self.submitted.lock().unwrap().clone()
         }
@@ -745,6 +767,7 @@ mod tests {
             match &self.fetch_behavior {
                 FetchBehavior::Eof => Ok(FetchOutcome::Eof),
                 FetchBehavior::Err(msg) => Ok(FetchOutcome::Err(msg.clone())),
+                FetchBehavior::NotReady => Ok(FetchOutcome::NotReady),
             }
         }
 
@@ -757,7 +780,10 @@ mod tests {
     // Helpers
     // -----------------------------------------------------------------------
 
-    fn make_params_with_finst(hi: i64, lo: i64) -> crate::internal_service::TExecPlanFragmentParams {
+    fn make_params_with_finst(
+        hi: i64,
+        lo: i64,
+    ) -> crate::internal_service::TExecPlanFragmentParams {
         use crate::{data_sinks, internal_service, partitions, types};
 
         let noop_sink = data_sinks::TDataSink::new(
@@ -883,7 +909,11 @@ mod tests {
         assert!(result.is_ok(), "expected Ok, got {result:?}");
         let chunks = result.unwrap();
         assert!(chunks.is_empty(), "expected no chunks from Eof dispatcher");
-        assert_eq!(inner.submitted_ids().len(), 2, "both fragments must be submitted");
+        assert_eq!(
+            inner.submitted_ids().len(),
+            2,
+            "both fragments must be submitted"
+        );
     }
 
     /// I2: When the second submit fails, the coordinator cancels the first
@@ -897,11 +927,19 @@ mod tests {
         let result = submit_and_fetch_loop(&dispatcher, params, root_finst_id, 100);
         assert!(result.is_err(), "expected Err on submit failure");
         let submitted = inner.submitted_ids();
-        assert_eq!(submitted.len(), 1, "only the first fragment should be submitted");
+        assert_eq!(
+            submitted.len(),
+            1,
+            "only the first fragment should be submitted"
+        );
         assert_eq!(submitted[0].hi, 2);
         assert_eq!(submitted[0].lo, 10);
         let cancelled = inner.cancelled_ids();
-        assert_eq!(cancelled.len(), 1, "the first submitted fragment must be cancelled");
+        assert_eq!(
+            cancelled.len(),
+            1,
+            "the first submitted fragment must be cancelled"
+        );
         assert_eq!(cancelled[0].hi, 2);
         assert_eq!(cancelled[0].lo, 10);
     }
@@ -922,12 +960,37 @@ mod tests {
             "error message should contain 'boom', got: {err}"
         );
         let submitted = inner.submitted_ids();
-        assert_eq!(submitted.len(), 2, "both fragments must be submitted before fetch");
+        assert_eq!(
+            submitted.len(),
+            2,
+            "both fragments must be submitted before fetch"
+        );
         let cancelled = inner.cancelled_ids();
         assert_eq!(
             cancelled.len(),
             2,
             "all submitted fragments must be cancelled on fetch error"
+        );
+    }
+
+    #[test]
+    fn execute_times_out_and_cancels_when_fetch_stays_not_ready() {
+        let inner = ControllableDispatcher::fetch_returns_not_ready();
+        let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
+        let root_finst_id = types::TUniqueId::new(4, 1);
+        let params = vec![make_params_with_finst(4, 10), make_params_with_finst(4, 1)];
+        let result = submit_and_fetch_loop(&dispatcher, params, root_finst_id, 0);
+        assert!(result.is_err(), "expected timeout error");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("timed out"),
+            "error should explain timeout, got: {err}"
+        );
+        let cancelled = inner.cancelled_ids();
+        assert_eq!(
+            cancelled.len(),
+            2,
+            "all submitted fragments must be cancelled on timeout"
         );
     }
 }

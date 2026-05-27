@@ -36,6 +36,7 @@ use crate::lower::thrift::lower_plan;
 use crate::runtime::query_context::QueryId;
 use crate::runtime::runtime_state::RuntimeState;
 use crate::{data_sinks, types};
+use tracing::warn;
 
 /// Outcome of a single `fetch_result` call.
 pub enum FetchOutcome {
@@ -165,6 +166,27 @@ impl Default for InProcessDispatcher {
     }
 }
 
+fn submitted_ids_snapshot(state: &InProcessState) -> Vec<(i64, i64)> {
+    state
+        .submitted_ids
+        .lock()
+        .expect("submitted_ids lock")
+        .clone()
+}
+
+fn cancel_all_submitted(state: &InProcessState) {
+    for (hi, lo) in submitted_ids_snapshot(state) {
+        crate::runtime::exchange::cancel_fragment(hi, lo);
+    }
+}
+
+fn format_fragment_error(finst_key: (i64, i64), error: &str) -> String {
+    format!(
+        "fragment {}/{} failed during in-process execution: {}",
+        finst_key.0, finst_key.1, error
+    )
+}
+
 /// Returns true if the TExecPlanFragmentParams carries a RESULT_SINK (root
 /// fragment).
 fn is_result_sink(params: &internal_service::TExecPlanFragmentParams) -> bool {
@@ -203,13 +225,6 @@ impl FragmentDispatcher for InProcessDispatcher {
             ids.push(finst_key);
         }
 
-        let all_ids_snapshot: Vec<(i64, i64)> = self
-            .state
-            .submitted_ids
-            .lock()
-            .expect("submitted_ids lock")
-            .clone();
-
         if is_result_sink(&params) {
             // Root fragment path: run with ResultSinkHandle so chunks are
             // available as Arrow data without going through result_buffer
@@ -220,28 +235,28 @@ impl FragmentDispatcher for InProcessDispatcher {
                 slots.insert(finst_key, Arc::clone(&slot));
             }
 
+            let state = Arc::clone(&self.state);
             std::thread::spawn(move || {
                 let result = run_root_fragment_in_process(params);
                 match result {
                     Ok(chunks) => slot.set_done(chunks),
                     Err(msg) => {
                         // Cancel all exchanges so blocked receivers unblock.
-                        for (hi, lo) in &all_ids_snapshot {
-                            crate::runtime::exchange::cancel_fragment(*hi, *lo);
-                        }
+                        warn!("{}", format_fragment_error(finst_key, &msg));
+                        cancel_all_submitted(&state);
                         slot.set_error(msg);
                     }
                 }
             });
         } else {
             // Non-root fragment path: execute_plan_fragment_sync in a thread.
+            let state = Arc::clone(&self.state);
             std::thread::spawn(move || {
                 let result = crate::service::internal_service::execute_plan_fragment_sync(params);
-                if let Err(_e) = result {
+                if let Err(e) = result {
+                    warn!("{}", format_fragment_error(finst_key, &e));
                     // Cancel all exchanges so blocked receivers (including root) unblock.
-                    for (hi, lo) in &all_ids_snapshot {
-                        crate::runtime::exchange::cancel_fragment(*hi, *lo);
-                    }
+                    cancel_all_submitted(&state);
                 }
             });
         }
@@ -260,7 +275,13 @@ impl FragmentDispatcher for InProcessDispatcher {
             match slots.get(&key) {
                 Some(slot) => Arc::clone(slot),
                 // Not a root fragment finst_id: treat as Eof (no data).
-                None => return Ok(FetchOutcome::Eof),
+                None => {
+                    warn!(
+                        "fetch_result called for unknown root finst_id {}/{}",
+                        key.0, key.1
+                    );
+                    return Ok(FetchOutcome::Eof);
+                }
             }
         };
 
@@ -379,7 +400,7 @@ fn run_root_fragment_in_process(
         None, // spill_manager
     ));
 
-    let dop = compute_pipeline_dop();
+    let dop = resolve_root_pipeline_dop(&params);
 
     execute_plan_with_pipeline(
         exec_plan,
@@ -396,6 +417,13 @@ fn run_root_fragment_in_process(
     )?;
 
     Ok(handle.take_chunks())
+}
+
+fn resolve_root_pipeline_dop(params: &internal_service::TExecPlanFragmentParams) -> i32 {
+    params
+        .pipeline_dop
+        .map(crate::runtime::exec_env::calc_pipeline_dop)
+        .unwrap_or_else(compute_pipeline_dop)
 }
 
 // ---------------------------------------------------------------------------
@@ -581,6 +609,52 @@ mod tests {
         assert!(
             is_result_sink(&params),
             "RESULT_SINK should be detected as result sink"
+        );
+    }
+
+    #[test]
+    fn cancel_all_submitted_reads_ids_at_error_time() {
+        let dispatcher = InProcessDispatcher::default();
+        {
+            let mut ids = dispatcher
+                .state
+                .submitted_ids
+                .lock()
+                .expect("submitted_ids lock");
+            ids.push((1, 10));
+        }
+        let stale_snapshot = vec![(1, 10)];
+        {
+            let mut ids = dispatcher
+                .state
+                .submitted_ids
+                .lock()
+                .expect("submitted_ids lock");
+            ids.push((1, 11));
+        }
+
+        let current = submitted_ids_snapshot(&dispatcher.state);
+        assert_ne!(
+            current, stale_snapshot,
+            "helper must read current state, not a submit-time snapshot"
+        );
+        assert_eq!(current, vec![(1, 10), (1, 11)]);
+    }
+
+    #[test]
+    fn root_pipeline_dop_uses_request_value_when_present() {
+        let mut params = make_noop_sink_params(1, 2);
+        params.pipeline_dop = Some(7);
+        assert_eq!(resolve_root_pipeline_dop(&params), 7);
+    }
+
+    #[test]
+    fn fragment_error_message_includes_error_text() {
+        let message = format_fragment_error((9, 99), "lowering failed");
+        assert!(message.contains("9/99"), "message should include finst id");
+        assert!(
+            message.contains("lowering failed"),
+            "message should include original error"
         );
     }
 }

@@ -2711,12 +2711,8 @@ pub(crate) fn dispatcher_for_role(
         ClusterRole::AllInOne => Ok(Arc::new(
             crate::runtime::dispatcher::InProcessDispatcher::new(exchange_host, exchange_port),
         )),
-        ClusterRole::Fe => Err(
-            "role=fe execution not yet implemented (PR-4)".to_string(),
-        ),
-        ClusterRole::Be => {
-            unreachable!("role=be must not enter standalone coordinator")
-        }
+        ClusterRole::Fe => Err("role=fe execution not yet implemented (PR-4)".to_string()),
+        ClusterRole::Be => Err("role=be must not enter standalone coordinator".to_string()),
     }
 }
 
@@ -6862,6 +6858,18 @@ enable_path_style_access = true
         assert!(
             msg.contains("role=fe") && msg.contains("PR-4"),
             "error must mention role=fe and PR-4, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn dispatcher_for_role_be_returns_error_instead_of_panicking() {
+        use crate::common::app_config::ClusterRole;
+        let result = super::dispatcher_for_role(ClusterRole::Be, "127.0.0.1", 0);
+        assert!(result.is_err(), "Be role must return a recoverable error");
+        let msg = result.err().expect("expected error");
+        assert!(
+            msg.contains("role=be") && msg.contains("coordinator"),
+            "error must mention role=be and coordinator, got: {msg}"
         );
     }
 }
