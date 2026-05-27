@@ -402,11 +402,20 @@ pub(crate) fn literal_to_i128_for_integer(
             // 0). Match that lenient behaviour rather than failing fast.
             Ok(Some(v.trunc() as i128))
         }
-        Literal::String(s) => s
-            .trim()
-            .parse::<i128>()
-            .map(Some)
-            .map_err(|_| format!("literal `{s}` is not valid for {type_name}")),
+        Literal::String(s) => {
+            // StarRocks-compat: an empty / whitespace-only string in a slot
+            // that wants an integer (e.g. inside a STRUCT or MAP literal
+            // like `row(null, '')` / `map(1,'abc','',null)`) coerces to NULL
+            // rather than erroring.
+            if s.trim().is_empty() {
+                Ok(None)
+            } else {
+                s.trim()
+                    .parse::<i128>()
+                    .map(Some)
+                    .map_err(|_| format!("literal `{s}` is not valid for {type_name}"))
+            }
+        }
         other => Err(format!("literal {:?} is not valid for {type_name}", other)),
     }
 }
