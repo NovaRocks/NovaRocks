@@ -451,7 +451,7 @@ fn submit_half_failure_cancels_submitted() {
     }
     let _lock = lock_cluster_mvp();
 
-    let cluster = ClusterHarness::start(
+    let mut cluster = ClusterHarness::start(
         r#"
 [debug]
 emit_cancel_marker = true
@@ -474,6 +474,10 @@ fault_inject_submit_fail_after = 1
     assert!(
         err_str.contains("debug submit fault injected"),
         "expected injected submit failure, got: {err_str}"
+    );
+    cluster.be.wait_for_output_contains(
+        "NOVAROCKS_CANCEL count=1 finsts=1 reason=coordinator cancel",
+        Duration::from_secs(3),
     );
 }
 
