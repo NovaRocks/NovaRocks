@@ -6188,21 +6188,27 @@ fn build_iceberg_mv_planning_catalog(
     let mut catalog = crate::engine::catalog::InMemoryCatalog::default();
 
     for base in ctx.rewrite.base_refs.iter() {
-        let snapshot_id = ctx
-            .rewrite
-            .pin
-            .get(base)
-            .ok_or_else(|| format!("imv planning catalog: pin missing snapshot for base {}", base.fqn()))?;
+        let snapshot_id = ctx.rewrite.pin.get(base).ok_or_else(|| {
+            format!(
+                "imv planning catalog: pin missing snapshot for base {}",
+                base.fqn()
+            )
+        })?;
 
         // create_database is idempotent-ish: it errors on duplicate. Two
         // bases sharing a namespace must only create the database once.
-        if !catalog
-            .database_exists(&base.namespace)
-            .map_err(|e| format!("imv planning catalog: database_exists({}): {e}", base.namespace))?
-        {
-            catalog
-                .create_database(&base.namespace)
-                .map_err(|e| format!("imv planning catalog: create_database({}): {e}", base.namespace))?;
+        if !catalog.database_exists(&base.namespace).map_err(|e| {
+            format!(
+                "imv planning catalog: database_exists({}): {e}",
+                base.namespace
+            )
+        })? {
+            catalog.create_database(&base.namespace).map_err(|e| {
+                format!(
+                    "imv planning catalog: create_database({}): {e}",
+                    base.namespace
+                )
+            })?;
         }
 
         let mut table_def = build_iceberg_table_def_for_snapshot_scan(state, base, snapshot_id)?;
@@ -11958,9 +11964,11 @@ mod imv_planning_catalog_tests {
             .expect("planning catalog construction must succeed");
 
         for base in ctx.rewrite.base_refs.iter() {
-            assert!(catalog
-                .database_exists(&base.namespace)
-                .expect("database lookup"));
+            assert!(
+                catalog
+                    .database_exists(&base.namespace)
+                    .expect("database lookup")
+            );
             let table_name = base.table.clone();
             assert!(
                 catalog.get(&base.namespace, &table_name).is_ok(),
@@ -11970,14 +11978,14 @@ mod imv_planning_catalog_tests {
         }
     }
 
-    fn imv_planning_catalog_test_fixture() -> (
-        Arc<crate::engine::StandaloneState>,
-        IcebergMvRefreshContext,
-    ) {
+    fn imv_planning_catalog_test_fixture()
+    -> (Arc<crate::engine::StandaloneState>, IcebergMvRefreshContext) {
         // Building a StandaloneState with two bases registered as real Iceberg
         // catalog entries (needed by build_iceberg_table_def_for_snapshot_scan)
         // requires the full iceberg-rest Docker harness. Deferred to Task 15.
-        todo!("build a fixture with 2 base refs + a StandaloneState that has both bases registered as iceberg tables")
+        todo!(
+            "build a fixture with 2 base refs + a StandaloneState that has both bases registered as iceberg tables"
+        )
     }
 }
 
@@ -11993,6 +12001,8 @@ mod imv_pipeline_wiring_tests {
     #[test]
     #[ignore = "fixture deferred — covered by iceberg-ivm suite (Task 15)"]
     fn projection_filter_refresh_through_imv_pipeline_matches_baseline() {
-        unimplemented!("inline an existing ProjectionFilter refresh fixture and assert row equality")
+        unimplemented!(
+            "inline an existing ProjectionFilter refresh fixture and assert row equality"
+        )
     }
 }

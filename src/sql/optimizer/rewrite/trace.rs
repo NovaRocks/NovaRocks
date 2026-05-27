@@ -225,11 +225,7 @@ mod tests {
         trace.rule_changed(RewritePhase::LogicalNormalize, "RuleA", 0);
         trace.rule_changed(RewritePhase::LogicalNormalize, "RuleA", 0);
         trace.rule_changed(RewritePhase::StructuralRewrite, "RuleB", 0);
-        trace.rule_rejected(
-            RewritePhase::Validation,
-            "RuleC",
-            "rejected: missing input",
-        );
+        trace.rule_rejected(RewritePhase::Validation, "RuleC", "rejected: missing input");
         trace.rule_failed(RewritePhase::Validation, "RuleD", "boom");
 
         assert_eq!(trace.changed_rules_count(), 3);

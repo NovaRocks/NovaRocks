@@ -211,8 +211,7 @@ mod tests {
             })],
         )]);
 
-        let mut ctx_rw =
-            RewriteContext::for_mv_refresh(vec!["DummyImvRule".to_string()]);
+        let mut ctx_rw = RewriteContext::for_mv_refresh(vec!["DummyImvRule".to_string()]);
         ctx_rw.set_extension::<ImvExtension>(ImvExtension {
             mv_ctx: dummy_mv_ctx(),
             annotation: ImvPlanAnnotation::default(),
@@ -220,10 +219,7 @@ mod tests {
 
         let _ = pipeline.rewrite(empty_values_plan(), &mut ctx_rw).unwrap();
 
-        assert_eq!(
-            matches_called.load(std::sync::atomic::Ordering::SeqCst),
-            0
-        );
+        assert_eq!(matches_called.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(ctx_rw.trace().events().iter().any(|e| matches!(
             e,
             RewriteTraceEvent::RuleSkipped { rule, reason, .. }

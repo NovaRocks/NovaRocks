@@ -21,10 +21,6 @@ pub(crate) fn build_imv_pipeline() -> RewritePipeline {
             RewritePhase::SemanticRewrite,
             Vec::new(),
         ),
-        RewriteStage::new(
-            "imv-validation",
-            RewritePhase::Validation,
-            Vec::new(),
-        ),
+        RewriteStage::new("imv-validation", RewritePhase::Validation, Vec::new()),
     ])
 }
