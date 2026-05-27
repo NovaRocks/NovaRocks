@@ -71,14 +71,32 @@ impl<'a> super::AnalyzerContext<'a> {
                                 DataType::Utf8,
                                 true,
                             ));
-                        let left_ref = TypedExpr {
-                            kind: ExprKind::ColumnRef {
-                                column_id: left_id,
-                                qualifier: None,
-                                column: col_name.clone(),
-                            },
-                            data_type: left_dt,
-                            nullable: left_nullable,
+                        // After a previous FULL OUTER USING the left side
+                        // carries a synthetic COALESCE for this column —
+                        // `coalesce(prev_left.id, prev_right.id)` — because
+                        // either side may be NULL-padded. The bare
+                        // `left.id` reference returned by
+                        // `current_scope.resolve` only sees ONE specific
+                        // side's binding, so a row whose id originated on
+                        // the other side compares as `NULL = right.id`
+                        // and never joins. Use the computed column when it
+                        // exists so the chained join matches on the merged
+                        // value (`coalesce(coalesce(t1.id, t2.id), t3.id)`,
+                        // and so on).
+                        let left_ref = if let Some(expr) =
+                            current_scope.computed_column_for(&col_name)
+                        {
+                            expr.clone()
+                        } else {
+                            TypedExpr {
+                                kind: ExprKind::ColumnRef {
+                                    column_id: left_id,
+                                    qualifier: None,
+                                    column: col_name.clone(),
+                                },
+                                data_type: left_dt,
+                                nullable: left_nullable,
+                            }
                         };
                         let right_ref = TypedExpr {
                             kind: ExprKind::ColumnRef {
