@@ -31,7 +31,7 @@ use crate::connector::iceberg::{
 };
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::formats::parquet::ParquetReadCachePolicy;
-use crate::lower::expr::parse_min_max_conjunct;
+use crate::lower::expr::parse_min_max_conjuncts;
 use crate::lower::layout::{
     Layout, chunk_schema_for_layout, col_names_from_layout, find_tuple_descriptor,
     layout_from_slot_ids,
@@ -242,7 +242,7 @@ where
         .iter()
         .find_map(|r| {
             let p = r.path.trim();
-            for scheme in ["oss://", "s3://"] {
+            for scheme in ["oss://", "s3://", "s3a://"] {
                 if let Some(rest) = p.strip_prefix(scheme) {
                     let b = rest.split('/').next()?.trim();
                     if !b.is_empty() {
@@ -1056,7 +1056,7 @@ pub(crate) fn lower_hdfs_scan_node(
             min_max_conjs.len()
         );
         for conj in min_max_conjs {
-            if let Some(pred) = parse_min_max_conjunct(conj, &out_layout)? {
+            for pred in parse_min_max_conjuncts(conj, &out_layout)? {
                 debug!("[Row Group Pruning] parsed predicate: {:?}", pred);
                 min_max_predicates.push(pred);
             }
@@ -1284,10 +1284,14 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::common::ids::SlotId;
+    use crate::connector::FileScanRange;
     use crate::internal_service::TQueryOptions;
     use crate::{exprs, plan_nodes, types};
 
-    use super::{extract_change_op_from_extended_columns, file_cache_flags_from_query_options};
+    use super::{
+        extract_change_op_from_extended_columns, file_cache_flags_from_query_options,
+        resolve_cloud_object_store_config,
+    };
 
     #[test]
     fn file_cache_flags_default_to_disabled_when_query_options_missing() {
@@ -1306,6 +1310,39 @@ mod tests {
         let (meta, page) = file_cache_flags_from_query_options(Some(&query_opts));
         assert!(meta);
         assert!(page);
+    }
+
+    #[test]
+    fn cloud_object_store_config_derives_bucket_from_s3a_scan_path() {
+        let cloud_props = BTreeMap::from([
+            (
+                "aws.s3.endpoint".to_string(),
+                "http://127.0.0.1:9000".to_string(),
+            ),
+            ("aws.s3.access_key".to_string(), "ak".to_string()),
+            ("aws.s3.secret_key".to_string(), "sk".to_string()),
+            (
+                "aws.s3.enable_path_style_access".to_string(),
+                "true".to_string(),
+            ),
+        ]);
+        let ranges = vec![FileScanRange {
+            path: "s3a://novarocks/warehouse/ssb/customer/data/file.parquet".to_string(),
+            file_len: 1,
+            offset: 0,
+            length: 1,
+            scan_range_id: 0,
+            first_row_id: None,
+            data_sequence_number: None,
+            ivm_change_op: None,
+            external_datacache: None,
+            delete_files: vec![],
+        }];
+
+        let config = resolve_cloud_object_store_config(Some(&cloud_props), &ranges)
+            .expect("object store config");
+
+        assert_eq!(config.bucket, "novarocks");
     }
 
     fn int_expr(value: i64) -> exprs::TExpr {

@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::lower::expr::parse_min_max_conjunct;
+use crate::lower::expr::parse_min_max_conjuncts;
 use crate::lower::layout::{
     Layout, chunk_schema_for_layout, chunk_schema_for_tuple, layout_for_row_tuples,
     layout_from_slot_ids,
@@ -155,7 +155,7 @@ pub(crate) fn lower_starrocks_scan_node(
     let mut min_max_predicates = Vec::new();
     if let Some(conjuncts) = node.conjuncts.as_ref() {
         for conj in conjuncts {
-            if let Some(pred) = parse_min_max_conjunct(conj, &out_layout)? {
+            for pred in parse_min_max_conjuncts(conj, &out_layout)? {
                 min_max_predicates.push(pred);
             }
         }

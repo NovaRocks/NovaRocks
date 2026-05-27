@@ -28,32 +28,76 @@ use crate::lower::layout::Layout;
 use crate::lower::type_lowering::{arrow_type_from_desc, primitive_type_from_node};
 use crate::types;
 
-/// Parse a min/max conjunct TExpr into MinMaxPredicate used for row group pruning.
-pub(crate) fn parse_min_max_conjunct(
+/// Parse a min/max conjunct TExpr into MinMaxPredicates used for pruning.
+pub(crate) fn parse_min_max_conjuncts(
     expr: &exprs::TExpr,
     layout: &Layout,
-) -> Result<Option<MinMaxPredicate>, String> {
-    parse_min_max_conjunct_with_column_resolver(expr, |slot_ref| {
+) -> Result<Vec<MinMaxPredicate>, String> {
+    parse_min_max_conjuncts_with_column_resolver(expr, |slot_ref| {
         get_column_name_from_slot(slot_ref, layout)
     })
 }
 
-pub(crate) fn parse_min_max_conjunct_with_column_resolver<F>(
+pub(crate) fn parse_min_max_conjuncts_with_column_resolver<F>(
     expr: &exprs::TExpr,
     mut resolve_column: F,
-) -> Result<Option<MinMaxPredicate>, String>
+) -> Result<Vec<MinMaxPredicate>, String>
 where
     F: FnMut(&exprs::TSlotRef) -> Result<String, String>,
 {
     if expr.nodes.is_empty() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
 
-    let root = &expr.nodes[0];
-    if root.node_type != exprs::TExprNodeType::BINARY_PRED {
-        return Ok(None);
+    let mut predicates = Vec::new();
+    parse_min_max_node(&expr.nodes, 0, &mut resolve_column, &mut predicates)?;
+    Ok(predicates)
+}
+
+fn parse_min_max_node<F>(
+    nodes: &[exprs::TExprNode],
+    idx: usize,
+    resolve_column: &mut F,
+    predicates: &mut Vec<MinMaxPredicate>,
+) -> Result<usize, String>
+where
+    F: FnMut(&exprs::TSlotRef) -> Result<String, String>,
+{
+    let node = nodes
+        .get(idx)
+        .ok_or_else(|| format!("malformed TExpr: missing node at index {idx}"))?;
+
+    if node.node_type == exprs::TExprNodeType::COMPOUND_PRED
+        && node.opcode == Some(crate::opcodes::TExprOpcode::COMPOUND_AND)
+    {
+        let child_count = child_count(node)?;
+        let mut next = idx + 1;
+        for _ in 0..child_count {
+            next = parse_min_max_node(nodes, next, resolve_column, predicates)?;
+        }
+        return Ok(next);
     }
 
+    if node.node_type == exprs::TExprNodeType::BINARY_PRED {
+        if let Some(predicate) = parse_binary_min_max_predicate(nodes, idx, resolve_column)? {
+            predicates.push(predicate);
+        }
+    }
+
+    skip_subtree(nodes, idx)
+}
+
+fn parse_binary_min_max_predicate<F>(
+    nodes: &[exprs::TExprNode],
+    idx: usize,
+    resolve_column: &mut F,
+) -> Result<Option<MinMaxPredicate>, String>
+where
+    F: FnMut(&exprs::TSlotRef) -> Result<String, String>,
+{
+    let root = nodes
+        .get(idx)
+        .ok_or_else(|| format!("malformed TExpr: missing binary predicate at index {idx}"))?;
     let Some(opcode) = root.opcode else {
         return Ok(None);
     };
@@ -72,12 +116,18 @@ where
         return Ok(None);
     };
 
-    if expr.nodes.len() < 3 {
+    if child_count(root)? != 2 {
         return Ok(None);
     }
 
-    let left_node = &expr.nodes[1];
-    let right_node = &expr.nodes[2];
+    let left_idx = idx + 1;
+    let right_idx = skip_subtree(nodes, left_idx)?;
+    let Some(left_node) = nodes.get(left_idx) else {
+        return Ok(None);
+    };
+    let Some(right_node) = nodes.get(right_idx) else {
+        return Ok(None);
+    };
 
     if left_node.node_type != exprs::TExprNodeType::SLOT_REF {
         return Ok(None);
@@ -108,6 +158,26 @@ where
     };
 
     Ok(Some(predicate))
+}
+
+fn child_count(node: &exprs::TExprNode) -> Result<usize, String> {
+    usize::try_from(node.num_children).map_err(|_| {
+        format!(
+            "malformed TExpr: negative child count {}",
+            node.num_children
+        )
+    })
+}
+
+fn skip_subtree(nodes: &[exprs::TExprNode], idx: usize) -> Result<usize, String> {
+    let node = nodes
+        .get(idx)
+        .ok_or_else(|| format!("malformed TExpr: missing node at index {idx}"))?;
+    let mut next = idx + 1;
+    for _ in 0..child_count(node)? {
+        next = skip_subtree(nodes, next)?;
+    }
+    Ok(next)
 }
 
 fn get_column_name_from_slot(
@@ -634,12 +704,17 @@ mod tests {
                     num_children: 1,
                     ..default_t_expr_node()
                 },
+                exprs::TExprNode {
+                    node_type: exprs::TExprNodeType::INT_LITERAL,
+                    int_literal: Some(exprs::TIntLiteral { value: 7 }),
+                    ..default_t_expr_node()
+                },
             ],
         };
 
-        let parsed = parse_min_max_conjunct(&expr, &single_slot_layout()).expect("parse");
+        let parsed = parse_min_max_conjuncts(&expr, &single_slot_layout()).expect("parse");
         assert!(
-            parsed.is_none(),
+            parsed.is_empty(),
             "non-literal rhs should not produce min/max pruning"
         );
     }
@@ -670,13 +745,80 @@ mod tests {
             ],
         };
 
-        let parsed = parse_min_max_conjunct(&expr, &single_slot_layout()).expect("parse");
+        let parsed = parse_min_max_conjuncts(&expr, &single_slot_layout()).expect("parse");
         assert_eq!(
             parsed,
-            Some(MinMaxPredicate::Eq {
+            vec![MinMaxPredicate::Eq {
                 column: "0".to_string(),
                 value: MinMaxPredicateValue::Int64(7),
-            })
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_min_max_conjuncts_expands_compound_and() {
+        let expr = exprs::TExpr {
+            nodes: vec![
+                exprs::TExprNode {
+                    node_type: exprs::TExprNodeType::COMPOUND_PRED,
+                    opcode: Some(crate::opcodes::TExprOpcode::COMPOUND_AND),
+                    num_children: 2,
+                    ..default_t_expr_node()
+                },
+                exprs::TExprNode {
+                    node_type: exprs::TExprNodeType::BINARY_PRED,
+                    opcode: Some(crate::opcodes::TExprOpcode::GE),
+                    num_children: 2,
+                    ..default_t_expr_node()
+                },
+                exprs::TExprNode {
+                    node_type: exprs::TExprNodeType::SLOT_REF,
+                    slot_ref: Some(exprs::TSlotRef {
+                        slot_id: 1,
+                        tuple_id: 1,
+                    }),
+                    ..default_t_expr_node()
+                },
+                exprs::TExprNode {
+                    node_type: exprs::TExprNodeType::INT_LITERAL,
+                    int_literal: Some(exprs::TIntLiteral { value: 1 }),
+                    ..default_t_expr_node()
+                },
+                exprs::TExprNode {
+                    node_type: exprs::TExprNodeType::BINARY_PRED,
+                    opcode: Some(crate::opcodes::TExprOpcode::LE),
+                    num_children: 2,
+                    ..default_t_expr_node()
+                },
+                exprs::TExprNode {
+                    node_type: exprs::TExprNodeType::SLOT_REF,
+                    slot_ref: Some(exprs::TSlotRef {
+                        slot_id: 1,
+                        tuple_id: 1,
+                    }),
+                    ..default_t_expr_node()
+                },
+                exprs::TExprNode {
+                    node_type: exprs::TExprNodeType::INT_LITERAL,
+                    int_literal: Some(exprs::TIntLiteral { value: 3 }),
+                    ..default_t_expr_node()
+                },
+            ],
+        };
+
+        let parsed = parse_min_max_conjuncts(&expr, &single_slot_layout()).expect("parse");
+        assert_eq!(
+            parsed,
+            vec![
+                MinMaxPredicate::Ge {
+                    column: "0".to_string(),
+                    value: MinMaxPredicateValue::Int64(1),
+                },
+                MinMaxPredicate::Le {
+                    column: "0".to_string(),
+                    value: MinMaxPredicateValue::Int64(3),
+                },
+            ]
         );
     }
 }

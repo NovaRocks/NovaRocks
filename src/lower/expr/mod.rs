@@ -70,7 +70,7 @@ use map_expr::lower_map_expr;
 use slot::lower_slot_ref;
 use subfield::lower_subfield_expr;
 
-pub(crate) use min_max::{parse_min_max_conjunct, parse_min_max_conjunct_with_column_resolver};
+pub(crate) use min_max::{parse_min_max_conjuncts, parse_min_max_conjuncts_with_column_resolver};
 
 struct CommonSlotLoweringCtx<'a> {
     /// StarRocks FE may factor out repeated sub-expressions into a `common_slot_map`, and then

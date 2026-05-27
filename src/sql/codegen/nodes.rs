@@ -4,7 +4,7 @@ use crate::common::min_max_predicate::MinMaxPredicate;
 use crate::descriptors;
 use crate::exprs;
 use crate::internal_service;
-use crate::lower::expr::parse_min_max_conjunct_with_column_resolver;
+use crate::lower::expr::parse_min_max_conjuncts_with_column_resolver;
 use crate::partitions;
 use crate::plan_nodes;
 use crate::types;
@@ -658,15 +658,15 @@ pub(crate) fn build_exec_params_multi(
 fn scan_file_min_max_predicates(planned: &PlannedScanTable) -> Vec<MinMaxPredicate> {
     let mut predicates = Vec::new();
     for conjunct in &planned.min_max_conjuncts {
-        let parsed = parse_min_max_conjunct_with_column_resolver(conjunct, |slot_ref| {
+        let parsed = parse_min_max_conjuncts_with_column_resolver(conjunct, |slot_ref| {
             planned
                 .slot_to_column
                 .get(&slot_ref.slot_id)
                 .cloned()
                 .ok_or_else(|| format!("slot_id {} has no scan column", slot_ref.slot_id))
         });
-        if let Ok(Some(predicate)) = parsed {
-            predicates.push(predicate);
+        if let Ok(parsed) = parsed {
+            predicates.extend(parsed);
         }
     }
     predicates

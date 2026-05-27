@@ -31,7 +31,7 @@ use crate::exec::row_position::{
     LakeRowPositionSpec, is_lake_row_id, is_lake_rss_id, is_lake_source_id, is_lake_tablet_id,
 };
 use crate::fs::path::{ScanPathScheme, classify_scan_paths};
-use crate::lower::expr::parse_min_max_conjunct;
+use crate::lower::expr::parse_min_max_conjuncts;
 use crate::lower::layout::{
     Layout, chunk_schema_for_layout, chunk_schema_for_tuple, find_tuple_descriptor,
     layout_for_row_tuples, layout_from_slot_ids, slot_arrow_type_lookup,
@@ -454,7 +454,7 @@ pub(crate) fn lower_lake_scan_node(
     let mut min_max_predicates = Vec::new();
     if let Some(conjuncts) = node.conjuncts.as_ref() {
         for conj in conjuncts {
-            if let Some(pred) = parse_min_max_conjunct(conj, &out_layout)? {
+            for pred in parse_min_max_conjuncts(conj, &out_layout)? {
                 min_max_predicates.push(pred);
             }
         }
