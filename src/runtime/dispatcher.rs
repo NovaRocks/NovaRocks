@@ -491,17 +491,11 @@ impl FragmentDispatcher for InProcessDispatcher {
 
 pub struct RemoteDispatcher {
     backend: SocketAddr,
-    exchange_host: String,
-    exchange_port: u16,
 }
 
 impl RemoteDispatcher {
-    pub fn new(backend: SocketAddr, exchange_host: &str, exchange_port: u16) -> Self {
-        Self {
-            backend,
-            exchange_host: exchange_host.to_string(),
-            exchange_port,
-        }
+    pub fn new(backend: SocketAddr) -> Self {
+        Self { backend }
     }
 
     fn client(&self) -> Result<NovaRocksGrpcRemoteClient, String> {
@@ -511,7 +505,13 @@ impl RemoteDispatcher {
 
 impl FragmentDispatcher for RemoteDispatcher {
     fn exchange_addr(&self) -> types::TNetworkAddress {
-        types::TNetworkAddress::new(self.exchange_host.clone(), self.exchange_port as i32)
+        // All fragments dispatched through RemoteDispatcher run on the BE.
+        // Inter-fragment exchange data must flow through the BE's own gRPC
+        // server (self.backend) so that both the producer and the consumer
+        // share the same local exchange registry on the BE.  Using the FE's
+        // exchange server would send data to the FE's registry while the
+        // consumer reads from the BE's registry, causing a permanent stall.
+        types::TNetworkAddress::new(self.backend.ip().to_string(), self.backend.port() as i32)
     }
 
     fn submit_fragment(
@@ -986,7 +986,7 @@ mod tests {
         let state = Arc::new(MockState::default());
         state.submit_code.store(1, Ordering::SeqCst);
         let addr = spawn_mock_server(Arc::clone(&state));
-        let dispatcher = RemoteDispatcher::new(addr, "127.0.0.1", 8040);
+        let dispatcher = RemoteDispatcher::new(addr);
 
         let err = dispatcher
             .submit_fragment(make_noop_sink_params(1, 2))
@@ -1002,7 +1002,7 @@ mod tests {
             .fetch_status
             .store(FetchStatus::Eof as i32, Ordering::SeqCst);
         let addr = spawn_mock_server(Arc::clone(&state));
-        let dispatcher = RemoteDispatcher::new(addr, "127.0.0.1", 8040);
+        let dispatcher = RemoteDispatcher::new(addr);
 
         let outcome = dispatcher
             .fetch_result(make_finst_id(1, 2), 0)
@@ -1021,7 +1021,7 @@ mod tests {
         *state.fetch_batch.lock().expect("fetch batch lock") =
             thrift_binary_serialize(&batch).expect("serialize result batch");
         let addr = spawn_mock_server(Arc::clone(&state));
-        let dispatcher = RemoteDispatcher::new(addr, "127.0.0.1", 8040);
+        let dispatcher = RemoteDispatcher::new(addr);
 
         let outcome = dispatcher
             .fetch_result(make_finst_id(1, 2), 0)
@@ -1038,7 +1038,7 @@ mod tests {
     fn remote_dispatcher_cancel_is_sent() {
         let state = Arc::new(MockState::default());
         let addr = spawn_mock_server(Arc::clone(&state));
-        let dispatcher = RemoteDispatcher::new(addr, "127.0.0.1", 8040);
+        let dispatcher = RemoteDispatcher::new(addr);
 
         dispatcher.cancel_fragments(&[make_finst_id(1, 2)]);
 

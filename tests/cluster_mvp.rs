@@ -143,7 +143,7 @@ fn connect_mysql(port: u16) -> MysqlConn {
 }
 
 #[test]
-fn cross_process_select_one_smoke() {
+fn cross_process_remote_dispatcher_smoke() {
     let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
     if !binary.exists() {
         return;
@@ -170,6 +170,9 @@ role = "be"
 "#
         ),
     );
+    // FE backends must point to be_http (the NovaRocksGrpc service port that
+    // handles submit_fragment / fetch_result).  be_starlet serves the Starlet
+    // protocol and cannot dispatch query fragments.
     let fe_config = write_config(
         "fe",
         &format!(
@@ -184,7 +187,7 @@ mysql_port = {fe_mysql}
 
 [cluster]
 role = "fe"
-backends = ["127.0.0.1:{be_starlet}"]
+backends = ["127.0.0.1:{be_http}"]
 "#
         ),
     );
@@ -196,6 +199,32 @@ backends = ["127.0.0.1:{be_starlet}"]
     fe.wait_for_ready("NOVAROCKS_READY mysql_port=");
 
     let mut conn = connect_mysql(fe_mysql);
-    let rows: Vec<String> = conn.query("SELECT 1").expect("run SELECT 1");
-    assert_eq!(rows, vec!["1".to_string()]);
+
+    // Phase 1: run a query that forces a Coordinated (multi-fragment) plan.
+    // SELECT + ORDER BY on a non-trivial UNION forces Sort(Distribution(Gather))
+    // which splits into two fragments, routing through RemoteDispatcher to the BE.
+    let rows: Vec<String> = conn
+        .query("SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v")
+        .expect("coordinated query must succeed while BE is running");
+    assert_eq!(
+        rows,
+        vec!["1".to_string(), "2".to_string()],
+        "coordinated query must return sorted results"
+    );
+
+    // Phase 2: kill the BE and prove the same query now fails.
+    // If the query were executing locally (SingleFragment), it would succeed
+    // even without the BE — the failure here is the proof that the BE was
+    // actually involved in Phase 1.
+    drop(be);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let err = conn
+        .query::<String, _>("SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v")
+        .expect_err("coordinated query must fail once BE is down");
+    let err_str = err.to_string();
+    assert!(
+        !err_str.is_empty(),
+        "expected a non-empty error when BE is unreachable, got empty string"
+    );
 }

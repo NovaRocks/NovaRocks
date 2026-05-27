@@ -200,6 +200,17 @@ fn load_config_and_resolve_role(
     Ok((cfg, role, config_path))
 }
 
+/// Returns a human-readable warning string when `--port` is supplied together
+/// with `role=be`.  The BE starts a gRPC server, not a MySQL server, so the
+/// MySQL port override has no effect.
+fn be_role_start_warning(port_override: Option<u16>) -> Option<String> {
+    port_override.map(|p| {
+        format!(
+            "role=be: --port {p} is ignored; the BE role starts a gRPC server, not a MySQL server"
+        )
+    })
+}
+
 fn dispatch_standalone_role(
     role: novarocks::common::app_config::ClusterRole,
     cfg: novarocks::common::app_config::NovaRocksConfig,
@@ -212,9 +223,17 @@ fn dispatch_standalone_role(
     match role {
         novarocks::common::app_config::ClusterRole::AllInOne => run_all_in_one(cfg, port_override),
         novarocks::common::app_config::ClusterRole::Fe => {
-            let backend_str = cfg.cluster.backends.first().ok_or_else(|| {
-                anyhow::anyhow!("role=fe: no backend configured in cluster.backends")
-            })?;
+            let n = cfg.cluster.backends.len();
+            if n != 1 {
+                return Err(anyhow::anyhow!(
+                    "role=fe: expected exactly one backend, got {n} in cluster.backends"
+                ));
+            }
+            let backend_str = cfg
+                .cluster
+                .backends
+                .first()
+                .expect("length already checked above");
             let backend_addr: std::net::SocketAddr = backend_str.parse().map_err(|e| {
                 anyhow::anyhow!("role=fe: invalid backend addr '{backend_str}': {e}")
             })?;
@@ -225,6 +244,9 @@ fn dispatch_standalone_role(
             run_all_in_one(cfg, port_override)
         }
         novarocks::common::app_config::ClusterRole::Be => {
+            if let Some(warn) = be_role_start_warning(port_override) {
+                eprintln!("WARN: {warn}");
+            }
             let host = cfg.server.host.clone();
             let http_port = cfg.server.http_port;
             let starlet_port = cfg.server.starlet_port;
@@ -990,6 +1012,55 @@ mod tests {
         )
         .expect_err("fe with no backend should error");
         assert!(err.to_string().contains("role=fe"));
+    }
+
+    // --- PR-4 spec compliance tests ---
+
+    /// Issue 3: be_role_start_warning emits a message that mentions both
+    /// "role=be" and "--port" when a port override is supplied.
+    #[test]
+    fn dispatch_be_role_with_port_override_warns_message() {
+        let msg = super::be_role_start_warning(Some(9030));
+        assert!(msg.is_some(), "expected warning when port_override is Some");
+        let s = msg.unwrap();
+        assert!(s.contains("role=be"), "must mention role=be: {s}");
+        assert!(s.contains("--port"), "must mention --port: {s}");
+        assert!(s.contains("9030"), "must include port value: {s}");
+    }
+
+    /// Issue 3: no warning is emitted when port_override is None.
+    #[test]
+    fn dispatch_be_role_without_port_override_no_warning() {
+        let msg = super::be_role_start_warning(None);
+        assert!(
+            msg.is_none(),
+            "no warning expected when port_override is None"
+        );
+    }
+
+    /// Issue 4: dispatch_standalone_role returns an error that includes the
+    /// backend count when more than one backend is configured for role=fe.
+    /// Without the exactly-one guard, the first backend would be silently
+    /// accepted even though validation should reject it.
+    #[test]
+    fn dispatch_fe_multiple_backends_returns_error_with_count() {
+        // Open a TCP listener so the first backend IS reachable.  Without the
+        // guard, dispatch_standalone_role would reach run_all_in_one and hit
+        // unreachable!().  With the guard it must fail before the TCP probe.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let mut cfg = novarocks::common::app_config::NovaRocksConfig::default();
+        cfg.cluster.backends = vec![addr.to_string(), "127.0.0.1:19999".to_string()];
+        let err = dispatch_standalone_role(
+            novarocks::common::app_config::ClusterRole::Fe,
+            cfg,
+            None,
+            |_, _| unreachable!("must not reach run_all_in_one with multiple backends"),
+        )
+        .expect_err("fe with multiple backends must error");
+        let msg = err.to_string();
+        assert!(msg.contains("role=fe"), "must mention role=fe: {msg}");
+        assert!(msg.contains('2'), "must include backend count: {msg}");
     }
 
     #[test]
