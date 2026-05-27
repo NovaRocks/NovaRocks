@@ -50,6 +50,10 @@ struct ResolvedStandaloneServerOptions {
     /// Pre-loaded config to pass directly to engine open, bypassing a second
     /// disk read.  `None` falls back to the legacy disk/env load path.
     preloaded_config: Option<NovaRocksConfig>,
+    /// Whether to start the local gRPC/exchange server.
+    /// `true` for all-in-one (exchange runs in-process); `false` for role=fe
+    /// (all fragments execute on the remote BE, no local exchange needed).
+    start_grpc_exchange: bool,
 }
 
 /// Legacy standalone server entrypoint that loads config from disk/env inside
@@ -69,6 +73,9 @@ pub fn run_standalone_server(opts: StandaloneServerOptions) -> Result<(), String
 /// opens — no second disk read occurs.  `config_path` is preserved only for
 /// resolving relative paths (e.g. SQLite metadata DB paths); pass `None` to
 /// use built-in path defaults.
+///
+/// This variant starts the local gRPC/exchange server (all-in-one mode).
+/// For `role=fe` use [`run_standalone_fe_server_with_config`] instead.
 pub fn run_standalone_server_with_config(
     cfg: NovaRocksConfig,
     config_path: Option<PathBuf>,
@@ -78,6 +85,28 @@ pub fn run_standalone_server_with_config(
     let resolved = ResolvedStandaloneServerOptions {
         config_path,
         preloaded_config: Some(cfg),
+        start_grpc_exchange: true,
+        ..resolved
+    };
+    run_with_resolved_options(resolved)
+}
+
+/// Run the standalone server for `role=fe`.
+///
+/// Identical to [`run_standalone_server_with_config`] except the local
+/// gRPC/exchange server is **not** started.  In role=fe all fragments
+/// (including root) run on the remote BE; the FE only runs MySQL, the
+/// optimizer, and the coordinator which uses `RemoteDispatcher`.
+pub fn run_standalone_fe_server_with_config(
+    cfg: NovaRocksConfig,
+    config_path: Option<PathBuf>,
+    port_override: Option<u16>,
+) -> Result<(), String> {
+    let resolved = resolve_server_options_from_config(&cfg, port_override)?;
+    let resolved = ResolvedStandaloneServerOptions {
+        config_path,
+        preloaded_config: Some(cfg),
+        start_grpc_exchange: false,
         ..resolved
     };
     run_with_resolved_options(resolved)
@@ -107,6 +136,7 @@ fn run_with_resolved_options(resolved: ResolvedStandaloneServerOptions) -> Resul
         engine,
         resolved.mysql_port,
         resolved.user.clone(),
+        resolved.start_grpc_exchange,
     ))
 }
 
@@ -124,6 +154,7 @@ fn resolve_server_options(
         user,
         refresh_coordinator,
         preloaded_config: None,
+        start_grpc_exchange: true,
     })
 }
 
@@ -177,6 +208,8 @@ fn resolve_server_options_from_config(
         user,
         refresh_coordinator,
         preloaded_config: None,
+        // Callers override this; default to true (all-in-one exchange server).
+        start_grpc_exchange: true,
     })
 }
 
@@ -193,23 +226,27 @@ async fn serve_forever(
     engine: StandaloneNovaRocks,
     mysql_port: u16,
     user: String,
+    start_grpc_exchange: bool,
 ) -> Result<(), String> {
-    // Start gRPC exchange server for multi-fragment CTE execution.
-    // Uses the configured http_port (default 8040).
-    let grpc_port = crate::common::config::http_port();
-    match crate::service::grpc_server::start_grpc_exchange_server("127.0.0.1", grpc_port) {
-        Ok(()) => {
-            info!(
-                "standalone grpc exchange server started on 127.0.0.1:{}",
-                grpc_port
-            );
-        }
-        Err(e) => {
-            warn!(
-                "failed to start standalone grpc exchange server on port {}: {} \
-                 (multi-fragment CTE queries will not work)",
-                grpc_port, e
-            );
+    // Start gRPC exchange server for multi-fragment CTE execution in all-in-one
+    // mode.  Skipped for role=fe because all fragments run on the remote BE;
+    // the FE does not need a local exchange registry.
+    if start_grpc_exchange {
+        let grpc_port = crate::common::config::http_port();
+        match crate::service::grpc_server::start_grpc_exchange_server("127.0.0.1", grpc_port) {
+            Ok(()) => {
+                info!(
+                    "standalone grpc exchange server started on 127.0.0.1:{}",
+                    grpc_port
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "failed to start standalone grpc exchange server on port {}: {} \
+                     (multi-fragment CTE queries will not work)",
+                    grpc_port, e
+                );
+            }
         }
     }
 

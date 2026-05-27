@@ -170,9 +170,8 @@ role = "be"
 "#
         ),
     );
-    // FE backends must point to be_http (the NovaRocksGrpc service port that
-    // handles submit_fragment / fetch_result).  be_starlet serves the Starlet
-    // protocol and cannot dispatch query fragments.
+    // Spec (PR-4): FE backends must point to be_starlet (the NovaRocksGrpc
+    // service port for SubmitFragment/FetchResult on the standalone BE).
     let fe_config = write_config(
         "fe",
         &format!(
@@ -187,7 +186,7 @@ mysql_port = {fe_mysql}
 
 [cluster]
 role = "fe"
-backends = ["127.0.0.1:{be_http}"]
+backends = ["127.0.0.1:{be_starlet}"]
 "#
         ),
     );
@@ -197,6 +196,17 @@ backends = ["127.0.0.1:{be_http}"]
 
     let mut fe = ProcessGuard::spawn(fe_config.path());
     fe.wait_for_ready("NOVAROCKS_READY mysql_port=");
+
+    // Spec (PR-4 Critical): role=fe must NOT start a local gRPC/exchange server.
+    // All fragments run on BE; FE only runs MySQL + coordinator + RemoteDispatcher.
+    // Assert that the FE's http_port is NOT listening.
+    let fe_http_addr: std::net::SocketAddr = format!("127.0.0.1:{fe_http}")
+        .parse()
+        .expect("parse fe http addr");
+    assert!(
+        std::net::TcpStream::connect_timeout(&fe_http_addr, Duration::from_millis(200)).is_err(),
+        "spec violation: role=fe must NOT bind local gRPC exchange server on http_port={fe_http}"
+    );
 
     let mut conn = connect_mysql(fe_mysql);
 

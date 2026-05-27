@@ -248,25 +248,25 @@ fn dispatch_standalone_role(
                 eprintln!("WARN: {warn}");
             }
             let host = cfg.server.host.clone();
-            let http_port = cfg.server.http_port;
             let starlet_port = cfg.server.starlet_port;
             let pid = std::process::id();
-            let http_addr: std::net::SocketAddr =
-                format!("{host}:{http_port}").parse().map_err(|e| {
-                    anyhow::anyhow!("role=be: invalid grpc/http addr '{host}:{http_port}': {e}")
-                })?;
             let starlet_addr: std::net::SocketAddr =
                 format!("{host}:{starlet_port}").parse().map_err(|e| {
                     anyhow::anyhow!(
-                        "role=be: invalid starlet grpc addr '{host}:{starlet_port}': {e}"
+                        "role=be: invalid novarocks grpc addr '{host}:{starlet_port}': {e}"
                     )
                 })?;
             novarocks::common::app_config::install_preloaded_config(cfg);
-            novarocks::start_grpc_server(&host)
-                .map_err(|e| anyhow::anyhow!("role=be: failed to start gRPC server: {e}"))?;
-            wait_for_tcp_ready(http_addr, Duration::from_secs(5), "novarocks grpc/http")
-                .map_err(|e| anyhow::anyhow!("role=be: {e}"))?;
-            wait_for_tcp_ready(starlet_addr, Duration::from_secs(5), "starlet grpc")
+            // Spec (PR-4): standalone BE exposes NovaRocksGrpc
+            // (SubmitFragment/FetchResult/CancelFragment/Exchange) on starlet_port.
+            // FE cluster.backends must point to this port.
+            novarocks::start_grpc_exchange_server(&host, starlet_port)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "role=be: failed to start NovaRocksGrpc server on {host}:{starlet_port}: {e}"
+                    )
+                })?;
+            wait_for_tcp_ready(starlet_addr, Duration::from_secs(5), "novarocks grpc")
                 .map_err(|e| anyhow::anyhow!("role=be: {e}"))?;
             println!("NOVAROCKS_READY role=be starlet_port={starlet_port} pid={pid}");
             let (_tx, rx) = std::sync::mpsc::channel::<()>();
@@ -282,9 +282,18 @@ fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()>
     // without a second file read.
     let (cfg, role, resolved_config_path) = load_config_and_resolve_role(&cli)?;
 
-    dispatch_standalone_role(role, cfg, cli.mysql_port, |cfg, port| {
-        novarocks::server::run_standalone_server_with_config(cfg, resolved_config_path, port)
-            .map_err(|e| anyhow::anyhow!("{}", e))
+    // Spec (PR-4): role=fe must NOT start a local gRPC/exchange server.
+    // Use a role-specific server entry point so the closure below routes to
+    // the right variant without changing dispatch_standalone_role's signature.
+    let is_fe = role == novarocks::common::app_config::ClusterRole::Fe;
+    dispatch_standalone_role(role, cfg, cli.mysql_port, move |cfg, port| {
+        if is_fe {
+            novarocks::server::run_standalone_fe_server_with_config(cfg, resolved_config_path, port)
+                .map_err(|e| anyhow::anyhow!("{}", e))
+        } else {
+            novarocks::server::run_standalone_server_with_config(cfg, resolved_config_path, port)
+                .map_err(|e| anyhow::anyhow!("{}", e))
+        }
     })
 }
 

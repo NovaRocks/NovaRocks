@@ -326,7 +326,20 @@ impl StandaloneNovaRocks {
         opts: StandaloneOptions,
         #[cfg(test)] _test_guard: Option<TestSerializationGuard>,
     ) -> Result<Self, String> {
-        let exchange_port = ensure_standalone_exchange_server()?;
+        // Spec (PR-4): role=fe dispatches all fragments to the remote BE via
+        // RemoteDispatcher and must NOT start a local gRPC/exchange server.
+        // exchange_port is only used by InProcessDispatcher (AllInOne); for Fe
+        // it is unused by dispatcher_for_role so a non-zero sentinel avoids
+        // the force_single_fragment=true short-circuit in execute_query_inner.
+        let role = crate::novarocks_config::config()
+            .map(|c| c.cluster.role)
+            .unwrap_or(crate::common::app_config::ClusterRole::AllInOne);
+        let exchange_port = if role == crate::common::app_config::ClusterRole::Fe {
+            // Sentinel: non-zero to allow coordinated execution, but no local socket is bound.
+            u16::MAX
+        } else {
+            ensure_standalone_exchange_server()?
+        };
         let metadata_backend = resolve_metadata_backend(&opts)?;
         let metadata_provider = metadata_backend
             .as_ref()
