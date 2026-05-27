@@ -213,12 +213,19 @@ struct CrossProcessServerHandle {
 impl CrossProcessServerHandle {
     fn launch(repo_root: &Path, runner_config: &RunnerConfig) -> Result<Self> {
         let runtime_dir = create_runtime_dir(repo_root)?;
+        let ReservedRuntimePorts {
+            be_http_port,
+            be_starlet_port,
+            fe_http_port,
+            fe_starlet_port,
+            fe_mysql_port,
+        } = ReservedRuntimePorts::new()?;
         let runtime = CrossProcessRuntime {
-            be_http_port: alloc_port()?,
-            be_starlet_port: alloc_port()?,
-            fe_http_port: alloc_port()?,
-            fe_starlet_port: alloc_port()?,
-            fe_mysql_port: alloc_port()?,
+            be_http_port: be_http_port.port(),
+            be_starlet_port: be_starlet_port.port(),
+            fe_http_port: fe_http_port.port(),
+            fe_starlet_port: fe_starlet_port.port(),
+            fe_mysql_port: fe_mysql_port.port(),
         };
 
         let novarocks_bin = discover_novarocks_binary(repo_root)?;
@@ -244,6 +251,8 @@ impl CrossProcessServerHandle {
         )
         .with_context(|| format!("write {}", fe_config_path.display()))?;
 
+        let _ = be_http_port.release();
+        let _ = be_starlet_port.release();
         let be_process = ProcessGuard::spawn(
             &novarocks_bin,
             "be",
@@ -257,6 +266,9 @@ impl CrossProcessServerHandle {
             be_config_path.display()
         );
 
+        let _ = fe_http_port.release();
+        let _ = fe_starlet_port.release();
+        let _ = fe_mysql_port.release();
         let fe_process = ProcessGuard::spawn(
             &novarocks_bin,
             "fe",
@@ -375,9 +387,16 @@ impl ProcessGuard {
         let mut stdout = Vec::new();
         loop {
             if let Some(status) = self.child.try_wait()? {
+                let stderr = self.read_stderr();
                 bail!(
-                    "novarocks exited before readiness marker `{marker}` with status {status}; stdout={stdout:?}; stderr={}",
-                    self.read_stderr()
+                    "{}",
+                    format_startup_failure(
+                        marker,
+                        &format!(
+                            "novarocks exited before readiness marker with status {status}; stdout={stdout:?}; stderr={stderr}"
+                        ),
+                        &stderr,
+                    )
                 );
             }
 
@@ -397,9 +416,16 @@ impl ProcessGuard {
             }
 
             if Instant::now() >= deadline {
+                let stderr = self.read_stderr();
                 bail!(
-                    "timed out waiting for readiness marker `{marker}`; stdout={stdout:?}; stderr={}",
-                    self.read_stderr()
+                    "{}",
+                    format_startup_failure(
+                        marker,
+                        &format!(
+                            "timed out waiting for readiness marker; stdout={stdout:?}; stderr={stderr}"
+                        ),
+                        &stderr,
+                    )
                 );
             }
         }
@@ -410,6 +436,12 @@ impl ProcessGuard {
             .lock()
             .map(|buffer| buffer.clone())
             .unwrap_or_default()
+    }
+}
+
+impl Drop for ProcessGuard {
+    fn drop(&mut self) {
+        let _ = self.stop();
     }
 }
 
@@ -439,12 +471,70 @@ pub(crate) fn startup_timeout_from_env(raw: Option<&str>) -> Duration {
     Duration::from_secs(timeout_secs)
 }
 
-fn alloc_port() -> Result<u16> {
-    Ok(TcpListener::bind(("127.0.0.1", 0))
-        .context("bind ephemeral port")?
-        .local_addr()
-        .context("read ephemeral port")?
-        .port())
+struct ReservedRuntimePorts {
+    be_http_port: ReservedPort,
+    be_starlet_port: ReservedPort,
+    fe_http_port: ReservedPort,
+    fe_starlet_port: ReservedPort,
+    fe_mysql_port: ReservedPort,
+}
+
+impl ReservedRuntimePorts {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            be_http_port: ReservedPort::new()?,
+            be_starlet_port: ReservedPort::new()?,
+            fe_http_port: ReservedPort::new()?,
+            fe_starlet_port: ReservedPort::new()?,
+            fe_mysql_port: ReservedPort::new()?,
+        })
+    }
+}
+
+struct ReservedPort {
+    _listener: TcpListener,
+    port: u16,
+}
+
+impl ReservedPort {
+    fn new() -> Result<Self> {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).context("bind ephemeral port")?;
+        let port = listener
+            .local_addr()
+            .context("read ephemeral port")?
+            .port();
+        Ok(Self {
+            _listener: listener,
+            port,
+        })
+    }
+
+    fn port(&self) -> u16 {
+        self.port
+    }
+
+    fn release(self) -> u16 {
+        self.port
+    }
+}
+
+fn format_startup_failure(marker: &str, message: &str, stderr: &str) -> String {
+    if is_bind_conflict(stderr) {
+        format!(
+            "{message}; probable port bind conflict while starting cross-process mode. Retry the run or inspect processes already using the reserved ports (readiness marker `{marker}`)."
+        )
+    } else {
+        format!("{message} (readiness marker `{marker}`)")
+    }
+}
+
+fn is_bind_conflict(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    stderr.contains("address already in use")
+        || stderr.contains("addrinuse")
+        || stderr.contains("eaddrinuse")
+        || stderr.contains("os error 48")
+        || (stderr.contains("bind") && stderr.contains("in use"))
 }
 
 fn create_runtime_dir(repo_root: &Path) -> Result<PathBuf> {
@@ -472,4 +562,25 @@ fn table_mut<'a>(
         .get_mut(key)
         .and_then(Value::as_table_mut)
         .expect("table inserted")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_guard_declares_drop_cleanup() {
+        assert!(include_str!("cluster.rs").contains("impl Drop for ProcessGuard"));
+    }
+
+    #[test]
+    fn reserved_port_blocks_rebinding_until_release() {
+        let reserved = ReservedPort::new().expect("reserve port");
+        let port = reserved.port();
+        assert!(TcpListener::bind(("127.0.0.1", port)).is_err());
+
+        let port = reserved.release();
+        let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind released port");
+        drop(listener);
+    }
 }

@@ -41,6 +41,17 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+fn resolve_effective_target_port(
+    server_port: Option<u16>,
+    cli_port: Option<&str>,
+    runner_config: &RunnerConfig,
+) -> Result<String> {
+    match server_port {
+        Some(port) => Ok(port.to_string()),
+        None => resolve_target_port(cli_port, runner_config),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Enums
 // ---------------------------------------------------------------------------
@@ -1666,7 +1677,7 @@ fn main() -> Result<()> {
     let runner_config = load_runner_config(config_path.as_deref())?;
     ensure_starrocks_table_prereqs(&runner_config)?;
     ensure_managed_lake_prereqs(&runner_config)?;
-    let _server_handle = launch_server(
+    let server_handle = launch_server(
         if cli.dry_run {
             ClusterMode::AllInOne
         } else {
@@ -1737,14 +1748,15 @@ fn main() -> Result<()> {
     // Resolve global connection params
     let reference_required = cli.mode == Mode::Diff
         || (cli.mode == Mode::Record && cli.record_from == RecordFrom::Reference);
-    let target_port = _server_handle
-        .target_port()
-        .map(|port| port.to_string())
-        .unwrap_or(resolve_target_port(cli.port.as_deref(), &runner_config)?);
+    let target_port = resolve_effective_target_port(
+        server_handle.target_port(),
+        cli.port.as_deref(),
+        &runner_config,
+    )?;
     let reference_port =
         resolve_reference_port(cli.ref_port.as_deref(), &target_port, reference_required)?;
 
-    let target_host = _server_handle
+    let target_host = server_handle
         .target_host()
         .map(ToOwned::to_owned)
         .or_else(|| cli.host.clone())
@@ -2435,6 +2447,14 @@ enable_path_style_access = true
             startup_timeout_from_env(Some("bogus")),
             std::time::Duration::from_secs(120)
         );
+    }
+
+    #[test]
+    fn cross_process_target_port_prefers_server_handle_port() {
+        let runner_config = crate::types::RunnerConfig::default();
+        let port = crate::resolve_effective_target_port(Some(12345), None, &runner_config)
+            .expect("server-provided port should bypass external port resolution");
+        assert_eq!(port, "12345");
     }
 
     #[test]
