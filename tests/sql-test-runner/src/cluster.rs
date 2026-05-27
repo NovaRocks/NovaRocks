@@ -210,9 +210,39 @@ struct CrossProcessServerHandle {
     fe_process: ProcessGuard,
 }
 
+struct RuntimeDirGuard {
+    runtime_dir: Option<PathBuf>,
+}
+
+impl RuntimeDirGuard {
+    fn new(runtime_dir: PathBuf) -> Self {
+        Self {
+            runtime_dir: Some(runtime_dir),
+        }
+    }
+
+    fn path(&self) -> &Path {
+        self.runtime_dir
+            .as_deref()
+            .expect("runtime dir available")
+    }
+
+    fn into_path(mut self) -> PathBuf {
+        self.runtime_dir.take().expect("runtime dir available")
+    }
+}
+
+impl Drop for RuntimeDirGuard {
+    fn drop(&mut self) {
+        if let Some(runtime_dir) = self.runtime_dir.take() {
+            let _ = fs::remove_dir_all(runtime_dir);
+        }
+    }
+}
+
 impl CrossProcessServerHandle {
     fn launch(repo_root: &Path, runner_config: &RunnerConfig) -> Result<Self> {
-        let runtime_dir = create_runtime_dir(repo_root)?;
+        let runtime_dir = RuntimeDirGuard::new(create_runtime_dir(repo_root)?);
         let ReservedRuntimePorts {
             be_http_port,
             be_starlet_port,
@@ -237,14 +267,14 @@ impl CrossProcessServerHandle {
             )
         })?;
 
-        let be_config_path = runtime_dir.join("be.toml");
+        let be_config_path = runtime_dir.path().join("be.toml");
         fs::write(
             &be_config_path,
             render_cross_process_config(&base_config, ClusterProcessRole::Be, &runtime)?,
         )
         .with_context(|| format!("write {}", be_config_path.display()))?;
 
-        let fe_config_path = runtime_dir.join("fe.toml");
+        let fe_config_path = runtime_dir.path().join("fe.toml");
         fs::write(
             &fe_config_path,
             render_cross_process_config(&base_config, ClusterProcessRole::Fe, &runtime)?,
@@ -285,7 +315,7 @@ impl CrossProcessServerHandle {
         Ok(Self {
             target_host: "127.0.0.1".to_string(),
             target_port: runtime.fe_mysql_port,
-            runtime_dir,
+            runtime_dir: runtime_dir.into_path(),
             _be_config_path: be_config_path,
             _fe_config_path: fe_config_path,
             be_process,
@@ -589,6 +619,7 @@ fn table_mut<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn process_guard_declares_drop_cleanup() {
@@ -646,5 +677,36 @@ mod tests {
         let port = reserved.release();
         let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind released port");
         drop(listener);
+    }
+
+    #[test]
+    fn runtime_dir_guard_removes_directory_on_drop_and_keeps_it_when_disarmed() {
+        let repo_root = std::env::current_dir().expect("current dir");
+        let runtime_root = repo_root.join("tests/sql-test-runner/.test-runtime");
+        fs::create_dir_all(&runtime_root).expect("create runtime root");
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before unix epoch")
+            .as_nanos();
+        let dir = runtime_root.join(format!(
+            "runtime_dir_guard_{}_{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&dir).expect("create runtime dir");
+
+        {
+            let guard = RuntimeDirGuard::new(dir.clone());
+            drop(guard);
+        }
+        assert!(!dir.exists(), "runtime dir should be removed on drop");
+
+        fs::create_dir_all(&dir).expect("recreate runtime dir");
+        let guard = RuntimeDirGuard::new(dir.clone());
+        let dir = guard.into_path();
+        assert!(dir.exists(), "disarmed runtime dir should remain for caller cleanup");
+
+        fs::remove_dir_all(&dir).expect("cleanup runtime dir");
     }
 }
