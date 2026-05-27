@@ -930,6 +930,25 @@ impl<'a> AnalyzerContext<'a> {
                 resolved_sub.output_columns.len()
             ));
         }
+        // Per-pair shape check: `x IN (SELECT y …)` is rewritten into an
+        // EQ-join on (x, y). For composite types the two sides must have a
+        // compatible shape — same outer kind, recursively compatible fields
+        // / element types. The downstream `BinaryOp::Eq` we build here
+        // does NOT run through the analyzer's compare-type guard, so we
+        // duplicate the check up front and surface the standard
+        // "does not support binary predicate operation" diagnostic
+        // (matching the bare-`=` rejection path).
+        for (lhs_i, sub_col) in lhs_typed_list.iter().zip(resolved_sub.output_columns.iter()) {
+            if let Some(reason) = super::resolve_expr::incompatible_complex_compare_pub(
+                &lhs_i.data_type,
+                &sub_col.data_type,
+            ) {
+                let op_sym = if negated { "NOT IN" } else { "IN" };
+                return Err(format!(
+                    "comparison operator `{op_sym}` does not support binary predicate operation between {reason}"
+                ));
+            }
+        }
         let lhs_typed = lhs_typed_list[0].clone();
         let sub_output_col = resolved_sub.output_columns[0].clone();
 

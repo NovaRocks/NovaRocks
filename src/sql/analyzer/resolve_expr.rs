@@ -1184,6 +1184,34 @@ impl<'a> super::AnalyzerContext<'a> {
                         "comparison operator `{op_sym}` is not supported for BITMAP/HLL (right operand has type {logical:?})"
                     ));
                 }
+                // Ordering operators (`<`, `<=`, `>`, `>=`) are undefined on
+                // composite types — ARRAY / MAP / STRUCT have no canonical
+                // total order. Same-type `=` / `!=` / `<=>` are still fine
+                // (element-wise equality is well-defined). NovaRocks used to
+                // accept `STRUCT < STRUCT`, run it, and silently return zero
+                // rows; reject up front instead.
+                let is_ordering_op = matches!(
+                    op,
+                    sqlast::BinaryOperator::Lt
+                        | sqlast::BinaryOperator::LtEq
+                        | sqlast::BinaryOperator::Gt
+                        | sqlast::BinaryOperator::GtEq
+                );
+                if is_ordering_op {
+                    let complex_kind = |dt: &DataType| match dt {
+                        DataType::List(_) | DataType::LargeList(_) => Some("ARRAY"),
+                        DataType::Map(_, _) => Some("MAP"),
+                        DataType::Struct(_) => Some("STRUCT"),
+                        _ => None,
+                    };
+                    if let Some(kind) =
+                        complex_kind(&left_typed.data_type).or_else(|| complex_kind(&right_typed.data_type))
+                    {
+                        return Err(format!(
+                            "comparison operator `{op_sym}` does not support binary predicate operation on {kind} values"
+                        ));
+                    }
+                }
                 // Reject comparisons between complex types whose element /
                 // entry / field layouts are fundamentally incompatible.
                 // Cases like `array<int> = [map{...}, null]` would otherwise
@@ -4703,6 +4731,19 @@ fn session_variable_default(name: &str) -> String {
 /// scalar (handled by literal coercion), compatible container shapes (let
 /// `cast_with_special_rules` widen at runtime), or one-side-only complex
 /// types (rare; let the downstream layer surface its own error).
+/// Module-visible wrapper around `incompatible_complex_compare` so the
+/// IN-subquery rewriter (`subquery_rewrite::rewrite_in_subquery`) can
+/// apply the same shape compatibility check before it synthesises an
+/// EQ join condition. Without this, `x IN (SELECT y …)` where `x` and
+/// `y` are STRUCT / MAP / ARRAY of incompatible element types would
+/// silently produce zero rows instead of erroring at analyzer time.
+pub(super) fn incompatible_complex_compare_pub(
+    left: &DataType,
+    right: &DataType,
+) -> Option<String> {
+    incompatible_complex_compare(left, right)
+}
+
 fn incompatible_complex_compare(left: &DataType, right: &DataType) -> Option<String> {
     fn is_complex(dt: &DataType) -> bool {
         matches!(
