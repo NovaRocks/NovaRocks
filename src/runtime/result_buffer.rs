@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::common::types::{FetchResult, UniqueId};
@@ -133,6 +133,7 @@ fn fetch_result_bytes(result: &FetchResult) -> usize {
 
 struct ResultCtx {
     mu: Mutex<HashMap<UniqueId, BufferControlBlock>>,
+    cvar: Condvar,
 }
 
 static CTX: OnceLock<ResultCtx> = OnceLock::new();
@@ -140,6 +141,7 @@ static CTX: OnceLock<ResultCtx> = OnceLock::new();
 fn ctx() -> &'static ResultCtx {
     CTX.get_or_init(|| ResultCtx {
         mu: Mutex::new(HashMap::new()),
+        cvar: Condvar::new(),
     })
 }
 
@@ -149,6 +151,9 @@ unsafe extern "C" {
 }
 
 fn notify_fetch_ready(finst_id: UniqueId) {
+    // Notify any in-process waiters (e.g. wait_fetch).
+    ctx().cvar.notify_all();
+
     #[cfg(all(feature = "compat", not(test)))]
     unsafe {
         novarocks_compat_notify_fetch_ready(finst_id.hi, finst_id.lo);
@@ -248,9 +253,16 @@ pub(crate) enum TryFetchResult {
     Error(FetchError),
 }
 
-pub(crate) fn try_fetch(finst_id: UniqueId) -> TryFetchResult {
-    let c = ctx();
-    let mut guard = c.mu.lock().expect("ctx lock");
+/// Inner fetch logic that works on an already-held HashMap guard.
+///
+/// Separating this from `try_fetch` allows `wait_fetch` to check state
+/// while holding the lock, avoiding the missed-wakeup race that would
+/// arise if the check and the condvar wait were not atomic with respect
+/// to the mutex.
+fn try_fetch_inner(
+    guard: &mut HashMap<UniqueId, BufferControlBlock>,
+    finst_id: UniqueId,
+) -> TryFetchResult {
     let Some(block) = guard.get_mut(&finst_id) else {
         return TryFetchResult::Error(FetchError {
             kind: FetchErrorKind::NotFound,
@@ -292,6 +304,61 @@ pub(crate) fn try_fetch(finst_id: UniqueId) -> TryFetchResult {
         });
     }
     TryFetchResult::NotReady
+}
+
+pub(crate) fn try_fetch(finst_id: UniqueId) -> TryFetchResult {
+    let c = ctx();
+    let mut guard = c.mu.lock().expect("ctx lock");
+    try_fetch_inner(&mut guard, finst_id)
+}
+
+/// Long-poll variant of `try_fetch`.
+///
+/// - If `max_wait_ms <= 0` or the buffer already has a result, behaves like
+///   `try_fetch` (returns immediately).
+/// - Otherwise waits up to `max_wait_ms` milliseconds for a result to become
+///   available, then returns whatever state the buffer is in at that point.
+///
+/// The implementation uses a `Condvar` that is notified by every mutating
+/// operation (`insert`, `close_ok`, `close_error`, `cancel`).  The check and
+/// the wait are performed while holding the mutex, so no wakeup is missed.
+pub(crate) fn wait_fetch(finst_id: UniqueId, max_wait_ms: i64) -> TryFetchResult {
+    let c = ctx();
+    let mut guard = c.mu.lock().expect("ctx lock");
+
+    // Check immediately under the lock before deciding whether to wait.
+    let initial = try_fetch_inner(&mut guard, finst_id);
+    if !matches!(initial, TryFetchResult::NotReady) || max_wait_ms <= 0 {
+        return initial;
+    }
+
+    let timeout = Duration::from_millis(max_wait_ms as u64);
+    let deadline = std::time::Instant::now() + timeout;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return TryFetchResult::NotReady;
+        }
+
+        // Atomically release the lock and sleep until notified or timed out.
+        // The lock is re-acquired before wait_timeout returns.
+        let (mut guard2, _timeout_result) =
+            c.cvar.wait_timeout(guard, remaining).expect("condvar wait");
+
+        // Re-check state while still holding the newly re-acquired lock.
+        let result = try_fetch_inner(&mut guard2, finst_id);
+        if !matches!(result, TryFetchResult::NotReady) {
+            return result;
+        }
+
+        // Prepare for the next iteration; release the lock by re-assigning.
+        guard = guard2;
+
+        if std::time::Instant::now() >= deadline {
+            return TryFetchResult::NotReady;
+        }
+    }
 }
 
 fn fallback_fetch_wait_timeout() -> Duration {
@@ -430,5 +497,43 @@ mod tests {
 
         mgr.unregister_finst(finst_id);
         mgr.finish_fragment(query_id);
+    }
+
+    #[test]
+    fn wait_fetch_with_zero_max_wait_returns_not_ready_immediately() {
+        let finst_id = UniqueId { hi: 601, lo: 602 };
+        create_sender(finst_id);
+        // Empty open buffer with max_wait_ms=0 must return NotReady instantly.
+        assert!(matches!(wait_fetch(finst_id, 0), TryFetchResult::NotReady));
+    }
+
+    #[test]
+    fn wait_fetch_returns_ready_after_delayed_insert() {
+        let finst_id = UniqueId { hi: 603, lo: 604 };
+        create_sender(finst_id);
+
+        // Insert from a background thread after 20 ms.
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            insert(
+                finst_id,
+                FetchResult {
+                    packet_seq: 0,
+                    eos: false,
+                    result_batch: crate::data::TResultBatch::new(
+                        vec![b"wait_data".to_vec()],
+                        false,
+                        0,
+                        None,
+                    ),
+                },
+            );
+        });
+
+        let result = wait_fetch(finst_id, 1000);
+        assert!(
+            matches!(result, TryFetchResult::Ready(_)),
+            "wait_fetch should return Ready after delayed insert; got: {result:?}"
+        );
     }
 }

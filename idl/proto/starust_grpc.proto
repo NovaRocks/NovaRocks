@@ -64,9 +64,8 @@ message FetchResultResponse {
     ERROR = 3;
   }
   Status status = 1;
-  // Thrift-binary-encoded TResultBatch payload; name is kept as chunk_arrow_ipc
-  // for forward compatibility once Arrow encoding is introduced in a later PR.
-  bytes chunk_arrow_ipc = 2;
+  // Thrift-binary-encoded TResultBatch payload.
+  bytes result_batch_thrift = 2;
   string message = 3;
 }
 
