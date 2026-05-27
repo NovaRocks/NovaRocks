@@ -133,6 +133,40 @@ fn resolve_cluster_role(
     role_override.unwrap_or(cfg.cluster.role)
 }
 
+/// Load config from `cli.config_path` (or use defaults when absent), resolve
+/// the effective cluster role (CLI override wins over config), and validate the
+/// loaded cluster section.  Returns the owned config together with the resolved
+/// role so that callers can pass both to `dispatch_standalone_role`.
+fn load_config_and_resolve_role(
+    cli: &StandaloneServerCliArgs,
+) -> anyhow::Result<(
+    novarocks::common::app_config::NovaRocksConfig,
+    novarocks::common::app_config::ClusterRole,
+)> {
+    let cfg = match cli.config_path.as_deref() {
+        Some(p) => novarocks::common::app_config::NovaRocksConfig::load_from_file(
+            std::path::Path::new(p),
+        )
+        .map_err(|e| anyhow::anyhow!("{}", e))?,
+        None => novarocks::common::app_config::NovaRocksConfig::default(),
+    };
+
+    let role_override = cli
+        .role
+        .as_deref()
+        .map(parse_cluster_role)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    let role = resolve_cluster_role(&cfg, role_override);
+
+    cfg.cluster
+        .validate()
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    Ok((cfg, role))
+}
+
 fn dispatch_standalone_role(
     role: novarocks::common::app_config::ClusterRole,
     cfg: novarocks::common::app_config::NovaRocksConfig,
@@ -154,26 +188,16 @@ fn dispatch_standalone_role(
 }
 
 fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()> {
-    let role_override = cli
-        .role
-        .as_deref()
-        .map(parse_cluster_role)
-        .transpose()
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let (cfg, role) = load_config_and_resolve_role(&cli)?;
 
     let opts = novarocks::server::StandaloneServerOptions {
         config_path: cli.config_path.as_deref().map(PathBuf::from),
         mysql_port: cli.mysql_port,
     };
 
-    dispatch_standalone_role(
-        role_override.unwrap_or(novarocks::common::app_config::ClusterRole::AllInOne),
-        novarocks::common::app_config::NovaRocksConfig::default(),
-        cli.mysql_port,
-        |_cfg, _port| {
-            novarocks::server::run_standalone_server(opts).map_err(|e| anyhow::anyhow!("{}", e))
-        },
-    )
+    dispatch_standalone_role(role, cfg, cli.mysql_port, |_cfg, _port| {
+        novarocks::server::run_standalone_server(opts).map_err(|e| anyhow::anyhow!("{}", e))
+    })
 }
 
 fn read_pid_file(pid_file: &str) -> Result<Option<u32>, String> {
@@ -796,8 +820,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        StandaloneServerCliArgs, dispatch_standalone_role, parse_standalone_server_args,
-        resolve_cluster_role,
+        StandaloneServerCliArgs, dispatch_standalone_role, load_config_and_resolve_role,
+        parse_standalone_server_args, resolve_cluster_role,
     };
 
     #[test]
@@ -905,6 +929,103 @@ mod tests {
             |_, _| unreachable!("all-in-one should not be called"),
         )
         .expect_err("be should be placeholder in PR-1");
+        assert!(err.to_string().contains("role=be is not implemented yet"));
+    }
+
+    // --- PR-1 spec compliance gap tests ---
+    // These three tests fail on the current production code and drive the fixes:
+    // 1. Config file role must be used when no CLI --role is given.
+    // 2. ClusterConfig::validate() must run before dispatch.
+    // 3. CLI --role override must still win over the config file role.
+
+    #[cfg(test)]
+    fn write_toml_tempfile(toml: &str) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().expect("create tempfile");
+        f.write_all(toml.as_bytes()).expect("write toml to tempfile");
+        f
+    }
+
+    #[test]
+    fn test_config_file_role_fe_used_when_no_cli_override() {
+        // Config declares role=fe with exactly one backend (valid). No CLI --role.
+        // load_config_and_resolve_role must read the file and return ClusterRole::Fe,
+        // after which dispatch_standalone_role must return the FE placeholder error.
+        let toml = r#"
+[cluster]
+role = "fe"
+backends = ["127.0.0.1:9070"]
+"#;
+        let f = write_toml_tempfile(toml);
+        let cli = StandaloneServerCliArgs {
+            config_path: Some(f.path().to_str().expect("utf-8 path").to_string()),
+            role: None,
+            mysql_port: None,
+        };
+        let (cfg, role) =
+            load_config_and_resolve_role(&cli).expect("load and resolve must succeed for valid fe");
+        assert_eq!(role, novarocks::common::app_config::ClusterRole::Fe);
+        let err = dispatch_standalone_role(
+            role,
+            cfg,
+            None,
+            |_, _| unreachable!("all-in-one must not be called"),
+        )
+        .expect_err("fe must return PR-1 placeholder");
+        assert!(err.to_string().contains("role=fe is not implemented yet"));
+    }
+
+    #[test]
+    fn test_config_file_fe_zero_backends_fails_validation_before_dispatch() {
+        // Config declares role=fe with zero backends — invalid. Startup must fail
+        // with the D1 v1 validation message before any dispatch happens.
+        let toml = r#"
+[cluster]
+role = "fe"
+backends = []
+"#;
+        let f = write_toml_tempfile(toml);
+        let cli = StandaloneServerCliArgs {
+            config_path: Some(f.path().to_str().expect("utf-8 path").to_string()),
+            role: None,
+            mysql_port: None,
+        };
+        let result = load_config_and_resolve_role(&cli);
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("fe with zero backends must fail validation"),
+        };
+        assert!(
+            err.to_string().contains("D1 v1 only supports exactly one backend"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_cli_role_override_be_wins_over_config_all_in_one() {
+        // Config says all-in-one (no backends — valid for both all-in-one and be).
+        // CLI --role be must win: load_config_and_resolve_role returns ClusterRole::Be,
+        // and dispatch_standalone_role returns the BE placeholder, not all-in-one.
+        let toml = r#"
+[cluster]
+role = "all-in-one"
+"#;
+        let f = write_toml_tempfile(toml);
+        let cli = StandaloneServerCliArgs {
+            config_path: Some(f.path().to_str().expect("utf-8 path").to_string()),
+            role: Some("be".to_string()),
+            mysql_port: None,
+        };
+        let (cfg, role) = load_config_and_resolve_role(&cli)
+            .expect("load and resolve must succeed (be with no backends is valid)");
+        assert_eq!(role, novarocks::common::app_config::ClusterRole::Be);
+        let err = dispatch_standalone_role(
+            role,
+            cfg,
+            None,
+            |_, _| unreachable!("all-in-one must not be called when --role be"),
+        )
+        .expect_err("be must return PR-1 placeholder");
         assert!(err.to_string().contains("role=be is not implemented yet"));
     }
 }
