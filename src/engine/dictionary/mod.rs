@@ -305,21 +305,18 @@ impl DictionaryQueryProvider {
         database: &str,
     ) -> Result<Option<DictionaryOwner>, String> {
         match &table.source {
-            ScanSource::StarRocks { .. } => {
-                let catalog = self
-                    .state
-                    .starrocks_table
-                    .read()
-                    .map_err(|e| format!("starrocks table catalog read lock poisoned: {e}"))?;
-                let runtime = match catalog.table(database, &table.name) {
-                    Ok(rt) => rt,
-                    Err(_) => return Ok(None),
-                };
+            // Lock-free: (db_id, table_id) live in the plan node, populated
+            // when the StarRocks table was registered via
+            // `InMemoryCatalog::register_starrocks_table`. We do NOT take
+            // `state.starrocks_table.read()` here — every Scan column of every
+            // SELECT calls this method, and that lock is contended with
+            // INSERT / DROP DATABASE writers under parallel sql-tests.
+            ScanSource::StarRocks { db_id, table_id } => {
                 Ok(Some(DictionaryOwner::StarRocksTable {
                     database: database.to_string(),
                     table: table.name.clone(),
-                    db_id: runtime.table.db_id,
-                    table_id: runtime.table.table_id,
+                    db_id: *db_id,
+                    table_id: *table_id,
                 }))
             }
             ScanSource::IcebergDataFiles { table: info, .. } => {
