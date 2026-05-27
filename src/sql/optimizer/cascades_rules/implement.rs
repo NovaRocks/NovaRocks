@@ -29,6 +29,53 @@ pub(super) fn get_group_column_names(memo: &Memo, group_id: GroupId) -> HashSet<
 }
 
 /// Walk a TypedExpr and return the set of lowercase column names it references.
+/// True if `expr` contains at least one ColumnRef. Used to decide whether a
+/// side of an `Eq` predicate could be a join key (vs. a constant filter).
+pub(super) fn expr_has_column_ref(expr: &TypedExpr) -> bool {
+    let mut found = false;
+    expr_has_column_ref_inner(expr, &mut found);
+    found
+}
+
+fn expr_has_column_ref_inner(expr: &TypedExpr, out: &mut bool) {
+    if *out {
+        return;
+    }
+    match &expr.kind {
+        ExprKind::ColumnRef { .. } => *out = true,
+        ExprKind::BinaryOp { left, right, .. } => {
+            expr_has_column_ref_inner(left, out);
+            expr_has_column_ref_inner(right, out);
+        }
+        ExprKind::UnaryOp { expr: inner, .. } => expr_has_column_ref_inner(inner, out),
+        ExprKind::IsNull { expr: inner, .. } => expr_has_column_ref_inner(inner, out),
+        ExprKind::Cast { expr: inner, .. } => expr_has_column_ref_inner(inner, out),
+        ExprKind::Nested(inner) => expr_has_column_ref_inner(inner, out),
+        ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
+            for a in args {
+                expr_has_column_ref_inner(a, out);
+            }
+        }
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(op) = operand {
+                expr_has_column_ref_inner(op, out);
+            }
+            for (when, then) in when_then {
+                expr_has_column_ref_inner(when, out);
+                expr_has_column_ref_inner(then, out);
+            }
+            if let Some(else_) = else_expr {
+                expr_has_column_ref_inner(else_, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub(super) fn collect_column_refs_lowercase(expr: &TypedExpr) -> HashSet<String> {
     let mut out = HashSet::new();
     walk_column_refs(expr, &mut out);
@@ -265,12 +312,18 @@ fn collect_conjuncts(
             collect_conjuncts(right, eq_pairs, others);
         }
         ExprKind::BinaryOp { left, op, right } if matches!(op, BinOp::Eq | BinOp::EqForNull) => {
-            // Only treat as equi-join key if BOTH sides are column refs.
-            // Expressions like `d_year = 2002` (column = constant) are filters,
-            // not equi-join keys.
-            let left_is_col = matches!(left.kind, ExprKind::ColumnRef { .. });
-            let right_is_col = matches!(right.kind, ExprKind::ColumnRef { .. });
-            if left_is_col && right_is_col {
+            // Treat as equi-join key when BOTH sides reference at least
+            // one column. A side that's purely literal/constant
+            // (`col = 2002`) is a filter, not an equi-key; let it fall
+            // through to `others` so the optimizer pushes it down to a
+            // scan filter. Expression keys (`-tt1.c_int = tt2.c_int`,
+            // `lower(a.x) = b.x`, …) are valid join keys — the
+            // exec-layer hash join hashes the lowered expression, and
+            // `orient_eq_pair` below collects column refs from each
+            // side to determine left/right orientation.
+            let left_has_col = expr_has_column_ref(left);
+            let right_has_col = expr_has_column_ref(right);
+            if left_has_col && right_has_col {
                 eq_pairs.push(PhysicalHashJoinEqCondition {
                     left: *left.clone(),
                     right: *right.clone(),

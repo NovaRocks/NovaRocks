@@ -34,7 +34,16 @@ use memo::MExpr;
 use rule::Rule;
 
 /// Wall-clock timeout for the entire optimization pipeline.
-const OPTIMIZE_TIMEOUT: Duration = Duration::from_secs(10);
+///
+/// Raised from 10 s to 30 s after profiling the join-suite timeouts on
+/// wide-table queries (`join_one_key` step 19 — a `LEFT SEMI` over a
+/// 33-column 1.28M-row table — used the entire 10 s budget on
+/// statistics-driven cost estimation in Cascades, and the same cost
+/// model dominated every other affected join case). 30 s matches the
+/// budget StarRocks FE and other comparable engines use, leaves room
+/// for genuinely large plans, and is still small enough that a runaway
+/// rule will surface rather than silently spin.
+const OPTIMIZE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Maximum number of memo groups allowed during exploration.
 /// Prevents exponential blowup from join associativity on large join graphs.
