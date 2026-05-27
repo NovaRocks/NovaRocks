@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -42,23 +43,20 @@ impl NovaRocksGrpcRemoteClient {
     ///
     /// The underlying HTTP/2 channel is established lazily via the shared
     /// channel cache, so the connect itself is cheap.
-    pub fn connect_blocking(host: &str, port: u16) -> Result<Self, String> {
+    pub fn connect_blocking(addr: SocketAddr) -> Result<Self, String> {
+        let host = addr.ip().to_string();
+        let port = addr.port();
         // Eagerly verify the endpoint can be parsed; actual TCP setup is lazy.
         format!("http://{host}:{port}")
             .parse::<tonic::transport::Endpoint>()
             .map_err(|e| format!("invalid BE endpoint {host}:{port}: {e}"))?;
-        Ok(Self {
-            host: host.to_string(),
-            port,
-        })
+        Ok(Self { host, port })
     }
 
     fn make_client(
         &self,
-    ) -> Result<
-        proto::novarocks::nova_rocks_grpc_client::NovaRocksGrpcClient<Channel>,
-        String,
-    > {
+    ) -> Result<proto::novarocks::nova_rocks_grpc_client::NovaRocksGrpcClient<Channel>, String>
+    {
         let host = self.host.clone();
         let port = self.port;
         let ch = data_block_on(async move { get_or_create_channel(&host, port).await })??;
@@ -157,6 +155,20 @@ async fn get_or_create_channel(host: &str, port: u16) -> Result<Channel, String>
         .expect("channel cache lock")
         .insert(key, ch.clone());
     Ok(ch)
+}
+
+#[cfg(test)]
+mod pr3_tests {
+    use super::*;
+
+    #[test]
+    fn remote_client_connect_accepts_socket_addr() {
+        let addr: SocketAddr = "127.0.0.1:19030".parse().expect("valid addr");
+        let client = NovaRocksGrpcRemoteClient::connect_blocking(addr)
+            .expect("connect wrapper should accept SocketAddr");
+        assert_eq!(client.host, "127.0.0.1");
+        assert_eq!(client.port, 19030);
+    }
 }
 
 /// Synchronous exchange send — blocks until the server acknowledges receipt.
