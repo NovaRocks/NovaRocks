@@ -430,8 +430,11 @@ impl ExecutionCoordinator {
         }
 
         // ---------------------------------------------------------------
-        // 4. Submit non-root fragments, then root fragment
+        // 4. Submit all fragments and collect root results
         // ---------------------------------------------------------------
+        let mut all_params: Vec<crate::internal_service::TExecPlanFragmentParams> =
+            Vec::with_capacity(non_root_fragments.len() + 1);
+
         for (fr, thrift_fragment, exec_params) in non_root_fragments {
             let p = build_exec_plan_fragment_params(
                 &fr,
@@ -440,7 +443,7 @@ impl ExecutionCoordinator {
                 query_options.clone(),
                 pipeline_dop,
             );
-            dispatcher.submit_fragment(p)?;
+            all_params.push(p);
         }
 
         let root_params = build_exec_plan_fragment_params(
@@ -450,11 +453,8 @@ impl ExecutionCoordinator {
             query_options.as_ref().cloned(),
             pipeline_dop,
         );
-        dispatcher.submit_fragment(root_params)?;
+        all_params.push(root_params);
 
-        // ---------------------------------------------------------------
-        // 5. Collect root results via fetch loop
-        // ---------------------------------------------------------------
         let root_finst_id = types::TUniqueId::new(root_instance_id.0, root_instance_id.1);
         let timeout_ms = query_options
             .as_ref()
@@ -462,15 +462,7 @@ impl ExecutionCoordinator {
             .map(|t| t as i64 * 1000)
             .unwrap_or(300_000); // 5 minute default
 
-        let mut chunks = Vec::new();
-        loop {
-            match dispatcher.fetch_result(root_finst_id.clone(), timeout_ms)? {
-                FetchOutcome::Ready(chunk) => chunks.push(chunk),
-                FetchOutcome::NotReady => continue,
-                FetchOutcome::Eof => break,
-                FetchOutcome::Err(e) => return Err(e),
-            }
-        }
+        let chunks = submit_and_fetch_loop(&dispatcher, all_params, root_finst_id, timeout_ms)?;
 
         Ok(QueryResult {
             columns: root_fragment
@@ -548,15 +540,70 @@ fn setup_runtime_filter_params(
 }
 
 // ---------------------------------------------------------------------------
+// Submit-and-fetch orchestration (testable helper)
+// ---------------------------------------------------------------------------
+
+/// Submit all fragment params through the dispatcher in order, track accepted
+/// fragment instance IDs, then poll the root fragment until EOF.
+///
+/// On any submit failure or fetch error, all already-submitted fragments are
+/// cancelled before the error is returned.
+pub(crate) fn submit_and_fetch_loop(
+    dispatcher: &Arc<dyn FragmentDispatcher>,
+    all_params: Vec<crate::internal_service::TExecPlanFragmentParams>,
+    root_finst_id: types::TUniqueId,
+    timeout_ms: i64,
+) -> Result<Vec<crate::exec::chunk::Chunk>, String> {
+    let mut submitted: Vec<types::TUniqueId> = Vec::with_capacity(all_params.len());
+
+    for p in all_params {
+        let finst_id = p
+            .params
+            .as_ref()
+            .map(|ep| types::TUniqueId::new(ep.fragment_instance_id.hi, ep.fragment_instance_id.lo))
+            .unwrap_or_else(|| types::TUniqueId::new(0, 0));
+        if let Err(e) = dispatcher.submit_fragment(p) {
+            dispatcher.cancel_fragments(&submitted);
+            return Err(e);
+        }
+        submitted.push(finst_id);
+    }
+
+    let mut chunks = Vec::new();
+    loop {
+        match dispatcher.fetch_result(root_finst_id.clone(), timeout_ms) {
+            Err(e) => {
+                dispatcher.cancel_fragments(&submitted);
+                return Err(e);
+            }
+            Ok(FetchOutcome::Ready(chunk)) => chunks.push(chunk),
+            Ok(FetchOutcome::NotReady) => continue,
+            Ok(FetchOutcome::Eof) => break,
+            Ok(FetchOutcome::Err(e)) => {
+                dispatcher.cancel_fragments(&submitted);
+                return Err(e);
+            }
+        }
+    }
+
+    Ok(chunks)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     use super::*;
     use crate::runtime::dispatcher::{FetchOutcome, FragmentDispatcher};
+
+    // -----------------------------------------------------------------------
+    // Simple mock (all-success, Eof on fetch)
+    // -----------------------------------------------------------------------
 
     /// Mock dispatcher that records submitted fragment instance IDs and
     /// immediately returns `Eof` for `fetch_result`.
@@ -605,6 +652,203 @@ mod tests {
         fn cancel_fragments(&self, _finst_ids: &[types::TUniqueId]) {}
     }
 
+    // -----------------------------------------------------------------------
+    // Controllable mock for I2 / I3 / I4 scenarios
+    // -----------------------------------------------------------------------
+
+    enum FetchBehavior {
+        Eof,
+        Err(String),
+    }
+
+    struct ControllableDispatcher {
+        /// All submitted finst ids (in order).
+        submitted: Mutex<Vec<types::TUniqueId>>,
+        /// All cancelled finst ids (accumulated across cancel_fragments calls).
+        cancelled: Mutex<Vec<types::TUniqueId>>,
+        /// Number of submits completed so far.
+        submit_count: AtomicUsize,
+        /// Fail when submit_count reaches this value (1-indexed).
+        fail_on_submit: Option<usize>,
+        fetch_behavior: FetchBehavior,
+    }
+
+    impl ControllableDispatcher {
+        fn succeeds_always_eof() -> Arc<Self> {
+            Arc::new(Self {
+                submitted: Mutex::new(Vec::new()),
+                cancelled: Mutex::new(Vec::new()),
+                submit_count: AtomicUsize::new(0),
+                fail_on_submit: None,
+                fetch_behavior: FetchBehavior::Eof,
+            })
+        }
+
+        fn fails_on_submit_n(n: usize) -> Arc<Self> {
+            Arc::new(Self {
+                submitted: Mutex::new(Vec::new()),
+                cancelled: Mutex::new(Vec::new()),
+                submit_count: AtomicUsize::new(0),
+                fail_on_submit: Some(n),
+                fetch_behavior: FetchBehavior::Eof,
+            })
+        }
+
+        fn fetch_returns_err(msg: impl Into<String>) -> Arc<Self> {
+            Arc::new(Self {
+                submitted: Mutex::new(Vec::new()),
+                cancelled: Mutex::new(Vec::new()),
+                submit_count: AtomicUsize::new(0),
+                fail_on_submit: None,
+                fetch_behavior: FetchBehavior::Err(msg.into()),
+            })
+        }
+
+        fn submitted_ids(&self) -> Vec<types::TUniqueId> {
+            self.submitted.lock().unwrap().clone()
+        }
+
+        fn cancelled_ids(&self) -> Vec<types::TUniqueId> {
+            self.cancelled.lock().unwrap().clone()
+        }
+    }
+
+    impl FragmentDispatcher for ControllableDispatcher {
+        fn exchange_addr(&self) -> types::TNetworkAddress {
+            types::TNetworkAddress::new("127.0.0.1".to_string(), 9999)
+        }
+
+        fn submit_fragment(
+            &self,
+            params: crate::internal_service::TExecPlanFragmentParams,
+        ) -> Result<(), String> {
+            let n = self.submit_count.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.fail_on_submit == Some(n) {
+                return Err(format!("mock: submit failed on call {n}"));
+            }
+            let finst_id = params
+                .params
+                .as_ref()
+                .map(|ep| {
+                    types::TUniqueId::new(ep.fragment_instance_id.hi, ep.fragment_instance_id.lo)
+                })
+                .unwrap_or_else(|| types::TUniqueId::new(0, 0));
+            self.submitted.lock().unwrap().push(finst_id);
+            Ok(())
+        }
+
+        fn fetch_result(
+            &self,
+            _finst_id: types::TUniqueId,
+            _max_wait_ms: i64,
+        ) -> Result<FetchOutcome, String> {
+            match &self.fetch_behavior {
+                FetchBehavior::Eof => Ok(FetchOutcome::Eof),
+                FetchBehavior::Err(msg) => Ok(FetchOutcome::Err(msg.clone())),
+            }
+        }
+
+        fn cancel_fragments(&self, finst_ids: &[types::TUniqueId]) {
+            self.cancelled.lock().unwrap().extend_from_slice(finst_ids);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
+
+    fn make_params_with_finst(hi: i64, lo: i64) -> crate::internal_service::TExecPlanFragmentParams {
+        use crate::{data_sinks, internal_service, partitions, types};
+
+        let noop_sink = data_sinks::TDataSink::new(
+            data_sinks::TDataSinkType::NOOP_SINK,
+            None::<data_sinks::TDataStreamSink>,
+            None::<data_sinks::TResultSink>,
+            None::<data_sinks::TMysqlTableSink>,
+            None::<data_sinks::TExportSink>,
+            None::<data_sinks::TOlapTableSink>,
+            None::<data_sinks::TMemoryScratchSink>,
+            None::<data_sinks::TMultiCastDataStreamSink>,
+            None::<data_sinks::TSchemaTableSink>,
+            None::<data_sinks::TIcebergTableSink>,
+            None::<data_sinks::THiveTableSink>,
+            None::<data_sinks::TTableFunctionTableSink>,
+            None::<data_sinks::TDictionaryCacheSink>,
+            None::<Vec<Box<data_sinks::TDataSink>>>,
+            None::<i64>,
+            None::<data_sinks::TSplitDataStreamSink>,
+        );
+        let fragment = crate::planner::TPlanFragment::new(
+            None::<crate::plan_nodes::TPlan>,
+            None::<Vec<crate::exprs::TExpr>>,
+            Some(noop_sink),
+            partitions::TDataPartition::new(
+                partitions::TPartitionType::UNPARTITIONED,
+                None::<Vec<crate::exprs::TExpr>>,
+                None::<Vec<partitions::TRangePartition>>,
+                None::<Vec<partitions::TBucketProperty>>,
+            ),
+            None::<i64>,
+            None::<i64>,
+            None::<Vec<crate::data::TGlobalDict>>,
+            None::<Vec<crate::data::TGlobalDict>>,
+            None::<crate::planner::TCacheParam>,
+            None::<std::collections::BTreeMap<i32, crate::exprs::TExpr>>,
+            None::<crate::planner::TGroupExecutionParam>,
+        );
+        let exec_params = internal_service::TPlanFragmentExecParams {
+            query_id: types::TUniqueId::new(hi, lo),
+            fragment_instance_id: types::TUniqueId::new(hi, lo),
+            per_node_scan_ranges: Default::default(),
+            per_exch_num_senders: Default::default(),
+            destinations: None,
+            sender_id: None,
+            num_senders: None,
+            send_query_statistics_with_every_batch: None,
+            use_vectorized: None,
+            runtime_filter_params: None,
+            instances_number: None,
+            enable_exchange_pass_through: None,
+            node_to_per_driver_seq_scan_ranges: None,
+            enable_exchange_perf: None,
+            pipeline_sink_dop: None,
+            report_when_finish: None,
+            exec_debug_options: None,
+        };
+        internal_service::TExecPlanFragmentParams::new(
+            internal_service::InternalServiceVersion::V1,
+            Some(fragment),
+            None::<crate::descriptors::TDescriptorTable>,
+            Some(exec_params),
+            None::<types::TNetworkAddress>,
+            None::<i32>,
+            None::<internal_service::TQueryGlobals>,
+            None::<internal_service::TQueryOptions>,
+            None::<bool>,
+            None::<types::TResourceInfo>,
+            None::<String>,
+            None::<String>,
+            None::<i64>,
+            None::<internal_service::TLoadErrorHubInfo>,
+            None::<bool>,
+            None::<i32>,
+            None::<std::collections::BTreeMap<types::TPlanNodeId, i32>>,
+            None::<crate::work_group::TWorkGroup>,
+            None::<bool>,
+            None::<i32>,
+            None::<bool>,
+            None::<bool>,
+            None::<internal_service::TAdaptiveDopParam>,
+            None::<i32>,
+            None::<internal_service::TPredicateTreeParams>,
+            None::<Vec<i32>>,
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // Original regression tests
+    // -----------------------------------------------------------------------
+
     /// Verify that `ExecutionCoordinator::new` accepts `Arc<dyn FragmentDispatcher>`
     /// (regression guard against re-introduction of exchange_host/port parameters).
     #[test]
@@ -621,5 +865,69 @@ mod tests {
     fn mock_dispatcher_starts_empty() {
         let d = MockDispatcher::new();
         assert_eq!(d.submitted_count(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // I4: submit_and_fetch_loop orchestration tests
+    // -----------------------------------------------------------------------
+
+    /// I4: submit_and_fetch_loop submits all fragments in order and returns
+    /// empty chunks when the dispatcher returns Eof immediately.
+    #[test]
+    fn execute_submits_all_fragments_and_fetches_to_eof() {
+        let inner = ControllableDispatcher::succeeds_always_eof();
+        let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
+        let root_finst_id = types::TUniqueId::new(1, 1);
+        let params = vec![make_params_with_finst(1, 10), make_params_with_finst(1, 1)];
+        let result = submit_and_fetch_loop(&dispatcher, params, root_finst_id, 100);
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        let chunks = result.unwrap();
+        assert!(chunks.is_empty(), "expected no chunks from Eof dispatcher");
+        assert_eq!(inner.submitted_ids().len(), 2, "both fragments must be submitted");
+    }
+
+    /// I2: When the second submit fails, the coordinator cancels the first
+    /// fragment instance and returns an error.
+    #[test]
+    fn execute_cancels_already_submitted_on_submit_failure() {
+        let inner = ControllableDispatcher::fails_on_submit_n(2);
+        let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
+        let root_finst_id = types::TUniqueId::new(2, 1);
+        let params = vec![make_params_with_finst(2, 10), make_params_with_finst(2, 1)];
+        let result = submit_and_fetch_loop(&dispatcher, params, root_finst_id, 100);
+        assert!(result.is_err(), "expected Err on submit failure");
+        let submitted = inner.submitted_ids();
+        assert_eq!(submitted.len(), 1, "only the first fragment should be submitted");
+        assert_eq!(submitted[0].hi, 2);
+        assert_eq!(submitted[0].lo, 10);
+        let cancelled = inner.cancelled_ids();
+        assert_eq!(cancelled.len(), 1, "the first submitted fragment must be cancelled");
+        assert_eq!(cancelled[0].hi, 2);
+        assert_eq!(cancelled[0].lo, 10);
+    }
+
+    /// I3: When fetch returns FetchOutcome::Err, all submitted fragment
+    /// instances are cancelled before the error propagates.
+    #[test]
+    fn execute_cancels_all_submitted_on_fetch_error() {
+        let inner = ControllableDispatcher::fetch_returns_err("boom");
+        let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
+        let root_finst_id = types::TUniqueId::new(3, 1);
+        let params = vec![make_params_with_finst(3, 10), make_params_with_finst(3, 1)];
+        let result = submit_and_fetch_loop(&dispatcher, params, root_finst_id, 100);
+        assert!(result.is_err(), "expected Err on fetch error");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("boom"),
+            "error message should contain 'boom', got: {err}"
+        );
+        let submitted = inner.submitted_ids();
+        assert_eq!(submitted.len(), 2, "both fragments must be submitted before fetch");
+        let cancelled = inner.cancelled_ids();
+        assert_eq!(
+            cancelled.len(),
+            2,
+            "all submitted fragments must be cancelled on fetch error"
+        );
     }
 }

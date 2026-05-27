@@ -2682,15 +2682,40 @@ pub(crate) fn execute_query_with_options(
                         .to_string(),
                 );
             }
+            let role = crate::novarocks_config::config()
+                .map(|c| c.cluster.role)
+                .unwrap_or(crate::common::app_config::ClusterRole::AllInOne);
+            let dispatcher = dispatcher_for_role(role, "127.0.0.1", exchange_port)?;
             crate::runtime::coordinator::ExecutionCoordinator::new(
                 *build_result,
-                Arc::new(crate::runtime::dispatcher::InProcessDispatcher::new(
-                    "127.0.0.1",
-                    exchange_port,
-                )),
+                dispatcher,
                 query_opts,
             )
             .execute()
+        }
+    }
+}
+
+/// Select a `FragmentDispatcher` implementation based on the effective cluster role.
+///
+/// - `AllInOne`: uses `InProcessDispatcher` bound to the local exchange endpoint.
+/// - `Fe`: SQL-coordinator execution is not yet implemented for distributed FE mode (PR-4).
+/// - `Be`: standalone coordinator must not be entered when the process is a pure BE.
+pub(crate) fn dispatcher_for_role(
+    role: crate::common::app_config::ClusterRole,
+    exchange_host: &str,
+    exchange_port: u16,
+) -> Result<Arc<dyn crate::runtime::dispatcher::FragmentDispatcher>, String> {
+    use crate::common::app_config::ClusterRole;
+    match role {
+        ClusterRole::AllInOne => Ok(Arc::new(
+            crate::runtime::dispatcher::InProcessDispatcher::new(exchange_host, exchange_port),
+        )),
+        ClusterRole::Fe => Err(
+            "role=fe execution not yet implemented (PR-4)".to_string(),
+        ),
+        ClusterRole::Be => {
+            unreachable!("role=be must not enter standalone coordinator")
         }
     }
 }
@@ -6813,5 +6838,30 @@ enable_path_style_access = true
             )
             .expect("in list query");
         assert_eq!(r.row_count(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // I1: dispatcher_for_role role-guard tests
+    // -----------------------------------------------------------------------
+
+    /// AllInOne role produces a dispatcher without error.
+    #[test]
+    fn dispatcher_for_role_all_in_one_ok() {
+        use crate::common::app_config::ClusterRole;
+        let result = super::dispatcher_for_role(ClusterRole::AllInOne, "127.0.0.1", 0);
+        assert!(result.is_ok(), "AllInOne should produce a dispatcher");
+    }
+
+    /// Fe role fails loudly with the expected error message.
+    #[test]
+    fn dispatcher_for_role_fe_fails_loudly() {
+        use crate::common::app_config::ClusterRole;
+        let result = super::dispatcher_for_role(ClusterRole::Fe, "127.0.0.1", 0);
+        assert!(result.is_err(), "Fe role must return an error");
+        let msg = result.err().expect("expected error");
+        assert!(
+            msg.contains("role=fe") && msg.contains("PR-4"),
+            "error must mention role=fe and PR-4, got: {msg}"
+        );
     }
 }
