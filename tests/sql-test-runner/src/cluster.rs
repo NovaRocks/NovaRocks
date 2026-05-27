@@ -417,8 +417,19 @@ impl ProcessGuard {
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    if self.child.try_wait()?.is_none() {
+                        let _ = self.child.kill();
+                        let _ = self.child.wait();
+                    }
+                    self.join_stderr_thread();
+                    let stderr = self.read_stderr();
                     bail!(
-                        "stdout closed before readiness marker `{marker}`; stdout={stdout:?}"
+                        "{}",
+                        format_startup_failure(
+                            marker,
+                            &format!("stdout closed before readiness marker; stdout={stdout:?}"),
+                            &stderr,
+                        )
                     );
                 }
             }
@@ -594,6 +605,35 @@ mod tests {
         assert!(
             source.contains("self.join_stderr_thread();"),
             "wait_for_ready should join stderr thread before reading stderr"
+        );
+    }
+
+    #[test]
+    fn process_guard_disconnected_branch_uses_startup_failure_diagnostics() {
+        let source = include_str!("cluster.rs")
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("source before tests");
+        let disconnected_branch = source
+            .split("Err(mpsc::RecvTimeoutError::Disconnected) => {")
+            .nth(1)
+            .expect("disconnected branch");
+        let disconnected_branch = disconnected_branch
+            .split("if Instant::now() >= deadline {")
+            .next()
+            .expect("disconnected branch body");
+
+        assert!(
+            disconnected_branch.contains("self.join_stderr_thread();"),
+            "disconnected branch should join stderr thread"
+        );
+        assert!(
+            disconnected_branch.contains("format_startup_failure("),
+            "disconnected branch should use startup failure diagnostics"
+        );
+        assert!(
+            disconnected_branch.contains("self.read_stderr()"),
+            "disconnected branch should read stderr before formatting failure"
         );
     }
 
