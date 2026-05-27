@@ -250,12 +250,9 @@ fn dispatch_standalone_role(
             let host = cfg.server.host.clone();
             let starlet_port = cfg.server.starlet_port;
             let pid = std::process::id();
-            let probe_host = be_readiness_probe_host(&host);
             let starlet_addr: std::net::SocketAddr =
-                format!("{probe_host}:{starlet_port}").parse().map_err(|e| {
-                    anyhow::anyhow!(
-                        "role=be: invalid novarocks grpc probe addr '{probe_host}:{starlet_port}': {e}"
-                    )
+                be_readiness_probe_addr(&host, starlet_port).map_err(|e| {
+                    anyhow::anyhow!("role=be: {e}")
                 })?;
             novarocks::common::app_config::install_preloaded_config(cfg);
             // Spec (PR-4): standalone BE exposes NovaRocksGrpc
@@ -373,10 +370,27 @@ fn health_check_host(bind_host: &str) -> String {
     }
 }
 
-/// Returns the host to use for BE readiness probing, mapping wildcard bind
-/// addresses to their loopback equivalents so `wait_for_tcp_ready` succeeds.
-fn be_readiness_probe_host(bind_host: &str) -> String {
-    health_check_host(bind_host)
+/// Builds a `SocketAddr` for the BE readiness probe, correctly handling IPv6
+/// hosts by using `SocketAddr` construction via `IpAddr` rather than string
+/// concatenation, which produces invalid `::1:PORT` for IPv6.
+fn be_readiness_probe_addr(bind_host: &str, port: u16) -> Result<std::net::SocketAddr, String> {
+    let probe_host = health_check_host(bind_host);
+    // Strip brackets so bare IPv6 addresses can be parsed as IpAddr.
+    let stripped = probe_host.trim_matches(|c| c == '[' || c == ']');
+    stripped
+        .parse::<std::net::IpAddr>()
+        .map(|ip| std::net::SocketAddr::new(ip, port))
+        .or_else(|_| {
+            // Hostname fallback: use bracketed form for `format!`-style parsing.
+            let bracketed = if probe_host.contains(':') && !probe_host.starts_with('[') {
+                format!("[{probe_host}]:{port}")
+            } else {
+                format!("{probe_host}:{port}")
+            };
+            bracketed
+                .parse::<std::net::SocketAddr>()
+                .map_err(|e| format!("invalid BE readiness probe addr '{bracketed}': {e}"))
+        })
 }
 
 fn heartbeat_ready(host: &str, port: u16) -> Result<(), String> {
@@ -1333,25 +1347,58 @@ backends = ["127.0.0.1:9070"]
         // `health_check_host` is the shared helper used by both the daemon path
         // and the BE path.  Assert its mapping is correct for every wildcard form.
         assert_eq!(
-            super::be_readiness_probe_host("0.0.0.0"),
+            super::health_check_host("0.0.0.0"),
             "127.0.0.1",
             "IPv4 wildcard must map to IPv4 loopback"
         );
         assert_eq!(
-            super::be_readiness_probe_host("::"),
+            super::health_check_host("::"),
             "::1",
             "IPv6 wildcard :: must map to IPv6 loopback"
         );
         assert_eq!(
-            super::be_readiness_probe_host("[::]"),
+            super::health_check_host("[::]"),
             "::1",
             "IPv6 wildcard [::] must map to IPv6 loopback"
         );
         assert_eq!(
-            super::be_readiness_probe_host("192.168.1.10"),
+            super::health_check_host("192.168.1.10"),
             "192.168.1.10",
             "non-wildcard host must pass through unchanged"
         );
+    }
+
+    // D1b PR-4: BE readiness probe address construction must produce a valid
+    // SocketAddr for all bind host variants, including IPv6.
+    #[test]
+    fn be_readiness_probe_addr_produces_valid_socket_addr() {
+        // IPv4 wildcard -> 127.0.0.1:port
+        let addr = super::be_readiness_probe_addr("0.0.0.0", 9020)
+            .expect("IPv4 wildcard must build valid SocketAddr");
+        assert_eq!(addr.to_string(), "127.0.0.1:9020");
+
+        // IPv6 wildcard :: -> [::1]:port
+        let addr = super::be_readiness_probe_addr("::", 9020)
+            .expect("IPv6 wildcard :: must build valid SocketAddr");
+        assert_eq!(addr.ip(), std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
+        assert_eq!(addr.port(), 9020);
+
+        // IPv6 wildcard [::] -> [::1]:port
+        let addr = super::be_readiness_probe_addr("[::]", 9020)
+            .expect("IPv6 wildcard [::] must build valid SocketAddr");
+        assert_eq!(addr.ip(), std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
+        assert_eq!(addr.port(), 9020);
+
+        // specific IPv4 host -> unchanged
+        let addr = super::be_readiness_probe_addr("192.168.1.10", 9020)
+            .expect("specific IPv4 host must build valid SocketAddr");
+        assert_eq!(addr.to_string(), "192.168.1.10:9020");
+
+        // specific IPv6 host -> valid SocketAddr
+        let addr = super::be_readiness_probe_addr("2001:db8::1", 9020)
+            .expect("specific IPv6 host must build valid SocketAddr");
+        assert_eq!(addr.ip().to_string(), "2001:db8::1");
+        assert_eq!(addr.port(), 9020);
     }
 
     // I1: load_config_and_resolve_role returns the resolved config path so the
