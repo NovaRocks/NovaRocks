@@ -159,12 +159,22 @@ pub(crate) fn render_cross_process_config(
         }
     }
 
-    if matches!(role, ClusterProcessRole::Fe) {
-        let standalone_server = table_mut(root, "standalone_server");
-        standalone_server.insert(
-            "mysql_port".to_string(),
-            Value::Integer(i64::from(runtime.fe_mysql_port)),
-        );
+    match role {
+        ClusterProcessRole::Fe => {
+            let standalone_server = table_mut(root, "standalone_server");
+            standalone_server.insert(
+                "mysql_port".to_string(),
+                Value::Integer(i64::from(runtime.fe_mysql_port)),
+            );
+        }
+        ClusterProcessRole::Be => {
+            if let Some(standalone_server) = root
+                .get_mut("standalone_server")
+                .and_then(Value::as_table_mut)
+            {
+                standalone_server.remove("mysql_port");
+            }
+        }
     }
 
     let cluster = table_mut(root, "cluster");
@@ -683,7 +693,9 @@ provider = "sqlite"
 path = "tmp/sql-tests.sqlite"
 
 [standalone_server]
+mysql_port = 9030
 warehouse_uri = "s3://warehouse/sql-tests"
+user = "root"
 
 [standalone_server.object_store]
 endpoint = "http://127.0.0.1:9000"
@@ -715,6 +727,10 @@ exec_node_output = true
             fe_value["standalone_server"]["mysql_port"].as_integer(),
             Some(29030)
         );
+        assert_eq!(
+            fe_value["standalone_server"]["user"].as_str(),
+            Some("root")
+        );
         assert_eq!(fe_value["cluster"]["role"].as_str(), Some("fe"));
         assert_eq!(
             fe_value["cluster"]["backends"]
@@ -733,6 +749,10 @@ exec_node_output = true
         assert_eq!(be_value["server"]["host"].as_str(), Some("127.0.0.1"));
         assert_eq!(be_value["server"]["http_port"].as_integer(), Some(18080));
         assert_eq!(be_value["server"]["starlet_port"].as_integer(), Some(19070));
+        assert_eq!(
+            be_value["standalone_server"]["user"].as_str(),
+            Some("root")
+        );
         assert!(be_value
             .get("standalone_server")
             .and_then(|value| value.get("mysql_port"))

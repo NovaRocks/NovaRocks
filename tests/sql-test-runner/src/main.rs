@@ -1671,26 +1671,25 @@ fn run_suite(ps: &PreparedSuite, abort: &AtomicBool, stdout_lock: &Mutex<()>) ->
 // ---------------------------------------------------------------------------
 
 fn main() -> Result<()> {
+    let exit_code = run()?;
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
+    Ok(())
+}
+
+fn run() -> Result<i32> {
     let cli = Cli::parse();
     let base_dir = resolve_repo_root()?;
     let config_path = resolve_config_path(cli.config.as_deref(), &base_dir);
     let runner_config = load_runner_config(config_path.as_deref())?;
     ensure_starrocks_table_prereqs(&runner_config)?;
     ensure_managed_lake_prereqs(&runner_config)?;
-    let server_handle = launch_server(
-        if cli.dry_run {
-            ClusterMode::AllInOne
-        } else {
-            cli.cluster_mode
-        },
-        &base_dir,
-        &runner_config,
-    )?;
 
     let suite_configs = build_suite_configs(&base_dir)?;
     if suite_configs.is_empty() {
         println!("❌ ERROR: no suite directories found under sql-tests");
-        std::process::exit(1);
+        return Ok(1);
     }
 
     // Resolve selected suites
@@ -1713,13 +1712,13 @@ fn main() -> Result<()> {
                 name,
                 all_available.join(", ")
             );
-            std::process::exit(1);
+            return Ok(1);
         }
     }
 
     if suite_names.is_empty() {
         println!("❌ ERROR: no suites selected");
-        std::process::exit(1);
+        return Ok(1);
     }
 
     // Validate: per-suite path overrides conflict with multi-suite
@@ -1729,13 +1728,13 @@ fn main() -> Result<()> {
         println!(
             "❌ ERROR: --sql-dir, --result-dir, --sql-glob cannot be used with multiple suites"
         );
-        std::process::exit(1);
+        return Ok(1);
     }
 
     if let Some(eps) = cli.float_epsilon {
         if eps <= 0.0 {
             println!("❌ ERROR: --float-epsilon must be > 0");
-            std::process::exit(1);
+            return Ok(1);
         }
     }
 
@@ -1744,6 +1743,16 @@ fn main() -> Result<()> {
         rebuild: cli.benchmark_bootstrap_rebuild,
         scales: parse_scale_overrides(&cli.benchmark_scale)?,
     };
+
+    let server_handle = launch_server(
+        if cli.dry_run {
+            ClusterMode::AllInOne
+        } else {
+            cli.cluster_mode
+        },
+        &base_dir,
+        &runner_config,
+    )?;
 
     // Resolve global connection params
     let reference_required = cli.mode == Mode::Diff
@@ -1923,7 +1932,7 @@ fn main() -> Result<()> {
                 suite.name,
                 sql_dir.display()
             );
-            std::process::exit(1);
+            return Ok(1);
         }
 
         let sql_files = list_sql_files(&sql_dir, &sql_glob)?;
@@ -1934,7 +1943,7 @@ fn main() -> Result<()> {
                 sql_glob,
                 suite.name,
             );
-            std::process::exit(1);
+            return Ok(1);
         }
 
         let mut cases: Vec<SqlCase> = Vec::new();
@@ -1954,7 +1963,7 @@ fn main() -> Result<()> {
                 }
                 Err(exc) => {
                     println!("❌ ERROR: {}", exc);
-                    std::process::exit(1);
+                    return Ok(1);
                 }
             }
         }
@@ -1986,7 +1995,7 @@ fn main() -> Result<()> {
                 "❌ ERROR: result_dir is required for verify/record mode (suite {})",
                 suite.name
             );
-            std::process::exit(1);
+            return Ok(1);
         }
 
         if cli.mode == Mode::Verify
@@ -2002,7 +2011,7 @@ fn main() -> Result<()> {
                     .map(|p| p.display().to_string())
                     .unwrap_or_default()
             );
-            std::process::exit(1);
+            return Ok(1);
         }
 
         if cli.mode == Mode::Record {
@@ -2140,12 +2149,12 @@ fn main() -> Result<()> {
     }
 
     if cli.dry_run {
-        return Ok(());
+        return Ok(0);
     }
 
     if prepared_suites.is_empty() {
         println!("❌ ERROR: no suites to run");
-        std::process::exit(1);
+        return Ok(1);
     }
 
     // Global abort flag for fail-fast
@@ -2244,10 +2253,10 @@ fn main() -> Result<()> {
     println!("{}", "=".repeat(72));
 
     if grand_failed > 0 || !all_cleanup_errors.is_empty() {
-        std::process::exit(1);
+        return Ok(1);
     }
 
-    Ok(())
+    Ok(0)
 }
 
 #[cfg(test)]
@@ -2340,6 +2349,52 @@ mod tests {
             "cross-process",
         ]);
         assert_eq!(cli.cluster_mode, ClusterMode::CrossProcess);
+    }
+
+    fn production_main_source() -> &'static str {
+        include_str!("main.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production main source")
+    }
+
+    #[test]
+    fn main_defers_process_exit_until_after_run_returns() {
+        let source = production_main_source();
+
+        assert!(
+            source.contains("fn run() -> Result<i32>"),
+            "main.rs should expose run() so std::process::exit happens after locals drop"
+        );
+        assert!(
+            source.contains("let exit_code = run()?;"),
+            "main() should call run() and exit only after it returns"
+        );
+        assert!(
+            source.contains("std::process::exit(exit_code);"),
+            "main() should delegate nonzero exit codes to a thin wrapper after run() returns"
+        );
+        assert_eq!(
+            source.matches("std::process::exit(").count(),
+            1,
+            "production main.rs should have exactly one std::process::exit call"
+        );
+    }
+
+    #[test]
+    fn main_launches_cross_process_server_after_initial_cli_validation() {
+        let source = production_main_source();
+        let launch_server_pos = source
+            .find("let server_handle = launch_server(")
+            .expect("launch_server call");
+        let benchmark_options_pos = source
+            .find("let benchmark_bootstrap_options = BenchmarkBootstrapOptions {")
+            .expect("benchmark bootstrap options");
+
+        assert!(
+            launch_server_pos > benchmark_options_pos,
+            "launch_server should happen after initial validation exits are resolved"
+        );
     }
 
     #[test]
