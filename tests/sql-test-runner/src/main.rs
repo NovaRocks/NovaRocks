@@ -1,4 +1,5 @@
 mod benchmark_bootstrap;
+mod cluster;
 mod config;
 mod parser;
 mod results;
@@ -10,6 +11,7 @@ mod types;
 use crate::benchmark_bootstrap::{
     BenchmarkBootstrapOptions, ensure_benchmark_data, parse_scale_overrides,
 };
+use crate::cluster::{ClusterMode, launch_server};
 use crate::config::{
     build_suite_configs, case_auto_db_name, env_optional, env_or_default, list_sql_files,
     load_runner_config, placeholder_variables, resolve_config_path, resolve_path,
@@ -158,6 +160,9 @@ struct Cli {
     #[arg(long, default_value_t = 3)]
     preview_lines: usize,
 
+    #[arg(long, value_enum, default_value_t = ClusterMode::AllInOne)]
+    cluster_mode: ClusterMode,
+
     #[arg(long, action = ArgAction::SetTrue)]
     dry_run: bool,
 
@@ -241,6 +246,29 @@ fn endpoint_reachable(endpoint: &str) -> bool {
 /// `CREATE TABLE` in a suite would timeout deep inside the standalone server.
 fn ensure_starrocks_table_prereqs(runner_config: &RunnerConfig) -> Result<()> {
     if !runner_config.values.contains_key("starrocks_table_warehouse") {
+        return Ok(());
+    }
+    let endpoint = runner_config
+        .values
+        .get("oss_endpoint")
+        .cloned()
+        .unwrap_or_else(|| env_or_default("AWS_S3_ENDPOINT", "http://127.0.0.1:9000"));
+    if endpoint_reachable(&endpoint) {
+        return Ok(());
+    }
+    bail!(
+        "MinIO at {} is unreachable.\n\
+         hint: start it with:\n  \
+         mkdir -p ~/minio-data && minio server ~/minio-data --console-address :9001 &",
+        endpoint
+    );
+}
+
+/// When the runner config declares a managed-lake warehouse, fail fast if the
+/// object-store endpoint is not reachable. Without this probe, the first
+/// `CREATE TABLE` in a suite would timeout deep inside the standalone server.
+fn ensure_managed_lake_prereqs(runner_config: &RunnerConfig) -> Result<()> {
+    if !runner_config.values.contains_key("managed_lake_warehouse") {
         return Ok(());
     }
     let endpoint = runner_config
@@ -1637,6 +1665,16 @@ fn main() -> Result<()> {
     let config_path = resolve_config_path(cli.config.as_deref(), &base_dir);
     let runner_config = load_runner_config(config_path.as_deref())?;
     ensure_starrocks_table_prereqs(&runner_config)?;
+    ensure_managed_lake_prereqs(&runner_config)?;
+    let _server_handle = launch_server(
+        if cli.dry_run {
+            ClusterMode::AllInOne
+        } else {
+            cli.cluster_mode
+        },
+        &base_dir,
+        &runner_config,
+    )?;
 
     let suite_configs = build_suite_configs(&base_dir)?;
     if suite_configs.is_empty() {
@@ -1699,13 +1737,17 @@ fn main() -> Result<()> {
     // Resolve global connection params
     let reference_required = cli.mode == Mode::Diff
         || (cli.mode == Mode::Record && cli.record_from == RecordFrom::Reference);
-    let target_port = resolve_target_port(cli.port.as_deref(), &runner_config)?;
+    let target_port = _server_handle
+        .target_port()
+        .map(|port| port.to_string())
+        .unwrap_or(resolve_target_port(cli.port.as_deref(), &runner_config)?);
     let reference_port =
         resolve_reference_port(cli.ref_port.as_deref(), &target_port, reference_required)?;
 
-    let target_host = cli
-        .host
-        .clone()
+    let target_host = _server_handle
+        .target_host()
+        .map(ToOwned::to_owned)
+        .or_else(|| cli.host.clone())
         .or_else(|| env_optional("STARUST_TEST_HOST"))
         .or_else(|| runner_config.cluster.get("host").cloned())
         .unwrap_or_else(|| "127.0.0.1".to_string());
@@ -1982,6 +2024,13 @@ fn main() -> Result<()> {
         );
         println!("{}", "=".repeat(72));
         println!("mode={}", mode_name(cli.mode));
+        println!(
+            "cluster_mode={}",
+            match cli.cluster_mode {
+                ClusterMode::AllInOne => "all-in-one",
+                ClusterMode::CrossProcess => "cross-process",
+            }
+        );
         println!("sql_dir={}", sql_dir.display());
         println!("sql_glob={}", sql_glob);
         if let Some(path) = runner_config.path.as_deref() {
@@ -2191,23 +2240,37 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use crate::cluster::{
+        ClusterMode, ClusterProcessRole, CrossProcessRuntime, build_novarocks_command,
+        discover_novarocks_binary_with_override, render_cross_process_config,
+        startup_timeout_from_env,
+    };
     use crate::config::substitute_placeholders;
     use crate::parser::{extract_suite_hook, load_sql_case_from_file};
     use crate::results::{load_expected_results, parse_output, write_result_file};
     use crate::runner::{is_transient_iceberg_commit_error, parse_selector_list};
     use crate::types::ResultSet;
+    use clap::Parser;
     use regex::Regex;
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    fn test_runtime_dir() -> PathBuf {
+        let dir = crate::resolve_repo_root()
+            .expect("repo root")
+            .join("tests/sql-test-runner/.test-runtime");
+        fs::create_dir_all(&dir).expect("create test runtime dir");
+        dir
+    }
+
     fn temp_result_path(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock before unix epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!(
+        test_runtime_dir().join(format!(
             "novarocks_sql_tests_{}_{}_{}.result",
             name,
             std::process::id(),
@@ -2220,7 +2283,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock before unix epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!(
+        test_runtime_dir().join(format!(
             "novarocks_sql_tests_{}_{}_{}.sql",
             name,
             std::process::id(),
@@ -2237,6 +2300,141 @@ mod tests {
         assert!(help.contains("--no-auto-bootstrap-benchmark-data"));
         assert!(help.contains("--benchmark-scale <BENCHMARK_SCALE>"));
         assert!(help.contains("--benchmark-bootstrap-rebuild"));
+    }
+
+    #[test]
+    fn help_includes_cluster_mode_option() {
+        let help = <crate::Cli as clap::CommandFactory>::command()
+            .render_long_help()
+            .to_string();
+
+        assert!(help.contains("--cluster-mode <CLUSTER_MODE>"));
+        assert!(help.contains("cross-process"));
+    }
+
+    #[test]
+    fn cli_cluster_mode_defaults_to_all_in_one() {
+        let cli = crate::Cli::parse_from(["sql-tests", "--suite", "ssb"]);
+        assert_eq!(cli.cluster_mode, ClusterMode::AllInOne);
+    }
+
+    #[test]
+    fn cli_cluster_mode_accepts_cross_process() {
+        let cli = crate::Cli::parse_from([
+            "sql-tests",
+            "--suite",
+            "ssb",
+            "--cluster-mode",
+            "cross-process",
+        ]);
+        assert_eq!(cli.cluster_mode, ClusterMode::CrossProcess);
+    }
+
+    #[test]
+    fn cross_process_configs_preserve_base_sections_and_patch_cluster_ports() {
+        let runtime = CrossProcessRuntime {
+            be_http_port: 18080,
+            be_starlet_port: 19070,
+            fe_http_port: 28080,
+            fe_starlet_port: 29070,
+            fe_mysql_port: 29030,
+        };
+        let base = r#"
+[metadata]
+provider = "sqlite"
+path = "tmp/sql-tests.sqlite"
+
+[standalone_server]
+warehouse_uri = "s3://warehouse/sql-tests"
+
+[standalone_server.object_store]
+endpoint = "http://127.0.0.1:9000"
+access_key_id = "admin"
+enable_path_style_access = true
+"#;
+
+        let fe = render_cross_process_config(base, ClusterProcessRole::Fe, &runtime)
+            .expect("render fe config");
+        let be = render_cross_process_config(base, ClusterProcessRole::Be, &runtime)
+            .expect("render be config");
+
+        let fe_value: toml::Value = fe.parse().expect("parse fe toml");
+        let be_value: toml::Value = be.parse().expect("parse be toml");
+
+        assert_eq!(fe_value["metadata"]["path"].as_str(), Some("tmp/sql-tests.sqlite"));
+        assert_eq!(
+            fe_value["standalone_server"]["object_store"]["endpoint"].as_str(),
+            Some("http://127.0.0.1:9000")
+        );
+        assert_eq!(
+            fe_value["standalone_server"]["mysql_port"].as_integer(),
+            Some(29030)
+        );
+        assert_eq!(fe_value["cluster"]["role"].as_str(), Some("fe"));
+        assert_eq!(
+            fe_value["cluster"]["backends"]
+                .as_array()
+                .and_then(|items| items.first())
+                .and_then(|value| value.as_str()),
+            Some("127.0.0.1:19070")
+        );
+
+        assert_eq!(be_value["cluster"]["role"].as_str(), Some("be"));
+        assert_eq!(
+            be_value["server"]["starlet_port"].as_integer(),
+            Some(19070)
+        );
+        assert!(be_value
+            .get("standalone_server")
+            .and_then(|value| value.get("object_store"))
+            .is_some());
+    }
+
+    #[test]
+    fn discover_novarocks_binary_prefers_env_override() {
+        let repo_root = crate::resolve_repo_root().expect("repo root");
+        let test_root = repo_root.join("tests/sql-test-runner/.test-runtime/discover-bin");
+        fs::create_dir_all(&test_root).expect("create test runtime dir");
+        let fake_bin = test_root.join("novarocks-env");
+        fs::write(&fake_bin, "#!/bin/sh\nexit 0\n").expect("write fake bin");
+
+        let resolved =
+            discover_novarocks_binary_with_override(&repo_root, Some(fake_bin.clone()))
+                .expect("discover binary");
+        assert_eq!(resolved, fake_bin);
+        let _ = fs::remove_file(&fake_bin);
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn cross_process_command_sets_no_proxy() {
+        let command = build_novarocks_command(
+            PathBuf::from("ignored-binary").as_path(),
+            "fe",
+            PathBuf::from("runner.toml").as_path(),
+        );
+        let no_proxy = command
+            .get_envs()
+            .find(|(key, _)| key.to_str() == Some("NO_PROXY"))
+            .and_then(|(_, value)| value)
+            .and_then(|value| value.to_str());
+        assert_eq!(no_proxy, Some("127.0.0.1,localhost"));
+    }
+
+    #[test]
+    fn startup_timeout_defaults_to_120_seconds() {
+        assert_eq!(
+            startup_timeout_from_env(None),
+            std::time::Duration::from_secs(120)
+        );
+        assert_eq!(
+            startup_timeout_from_env(Some("180")),
+            std::time::Duration::from_secs(180)
+        );
+        assert_eq!(
+            startup_timeout_from_env(Some("bogus")),
+            std::time::Duration::from_secs(120)
+        );
     }
 
     #[test]

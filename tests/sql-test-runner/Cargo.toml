@@ -13,3 +13,4 @@ clap = { version = "4.5", features = ["derive"] }
 mysql = "25.0.1"
 rayon = "1.10"
 regex = "1.10"
+toml = "0.8"
