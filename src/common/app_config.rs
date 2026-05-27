@@ -159,6 +159,14 @@ pub fn init_from_env_or_default() -> Result<&'static NovaRocksConfig> {
     Ok(install_config(NovaRocksConfig::default()))
 }
 
+/// Install an already-loaded config as the process-wide active config, replacing
+/// any existing global config.  Use this when the caller has already loaded and
+/// validated a [`NovaRocksConfig`] and wants to guarantee that the engine uses
+/// exactly that instance rather than performing a second disk read.
+pub fn install_preloaded_config(cfg: NovaRocksConfig) -> &'static NovaRocksConfig {
+    install_config(cfg)
+}
+
 /// Force-install the built-in default config, replacing any existing global config.
 /// Intended for test setup where each test must start from a known-clean config.
 #[cfg(test)]

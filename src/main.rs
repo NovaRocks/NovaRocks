@@ -33,7 +33,7 @@ use novarocks::novarocks_logging;
 struct StandaloneServerCliArgs {
     mysql_port: Option<u16>,
     config_path: Option<String>,
-    role: Option<String>,
+    role: Option<novarocks::common::app_config::ClusterRole>,
 }
 
 fn print_main_usage() {
@@ -60,7 +60,7 @@ fn parse_standalone_server_args(
     let mut idx = 0usize;
     let mut mysql_port: Option<u16> = None;
     let mut config_path: Option<String> = None;
-    let mut role: Option<String> = None;
+    let mut role: Option<novarocks::common::app_config::ClusterRole> = None;
 
     while let Some(arg) = args.get(idx) {
         match arg.as_str() {
@@ -88,16 +88,10 @@ fn parse_standalone_server_args(
                 let raw = args
                     .get(idx)
                     .ok_or_else(|| "missing value for --role".to_string())?;
-                match raw.as_str() {
-                    "fe" | "be" | "all-in-one" => {
-                        role = Some(raw.clone());
-                    }
-                    other => {
-                        return Err(format!(
-                            "invalid --role value `{other}`; expected one of: fe, be, all-in-one"
-                        ));
-                    }
-                }
+                role = Some(
+                    parse_cluster_role(raw)
+                        .map_err(|e| format!("invalid --role value `{raw}`; {e}"))?,
+                );
                 idx += 1;
             }
             "--help" | "-h" => return Ok(None),
@@ -158,12 +152,7 @@ fn load_config_and_resolve_role(
         None => novarocks::common::app_config::NovaRocksConfig::default(),
     };
 
-    let role_override = cli
-        .role
-        .as_deref()
-        .map(parse_cluster_role)
-        .transpose()
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let role_override = cli.role;
 
     let role = resolve_cluster_role(&cfg, role_override);
 
@@ -889,7 +878,7 @@ mod tests {
         let parsed = parse_standalone_server_args(&args)
             .expect("parse args")
             .expect("args");
-        assert_eq!(parsed.role.as_deref(), Some("fe"));
+        assert_eq!(parsed.role, Some(novarocks::common::app_config::ClusterRole::Fe));
         assert_eq!(parsed.config_path.as_deref(), Some("fe.toml"));
     }
 
@@ -899,7 +888,7 @@ mod tests {
         let parsed = parse_standalone_server_args(&args)
             .expect("parse args")
             .expect("args");
-        assert_eq!(parsed.role.as_deref(), Some("all-in-one"));
+        assert_eq!(parsed.role, Some(novarocks::common::app_config::ClusterRole::AllInOne));
     }
 
     #[test]
@@ -1027,7 +1016,7 @@ role = "all-in-one"
         let f = write_toml_tempfile(toml);
         let cli = StandaloneServerCliArgs {
             config_path: Some(f.path().to_str().expect("utf-8 path").to_string()),
-            role: Some("be".to_string()),
+            role: Some(novarocks::common::app_config::ClusterRole::Be),
             mysql_port: None,
         };
         let (cfg, role, _) = load_config_and_resolve_role(&cli)
@@ -1053,7 +1042,7 @@ backends = ["127.0.0.1:9070"]
         let f = write_toml_tempfile(toml);
         let cli = StandaloneServerCliArgs {
             config_path: Some(f.path().to_str().expect("utf-8").to_string()),
-            role: Some("be".to_string()),
+            role: Some(novarocks::common::app_config::ClusterRole::Be),
             mysql_port: None,
         };
         let result = load_config_and_resolve_role(&cli);

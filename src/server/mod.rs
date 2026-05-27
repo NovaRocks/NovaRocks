@@ -42,14 +42,20 @@ pub struct StandaloneServerOptions {
     pub mysql_port: Option<u16>,
 }
 
-#[derive(Clone, Debug)]
 struct ResolvedStandaloneServerOptions {
     config_path: Option<PathBuf>,
     mysql_port: u16,
     user: String,
     refresh_coordinator: RefreshCoordinatorConfig,
+    /// Pre-loaded config to pass directly to engine open, bypassing a second
+    /// disk read.  `None` falls back to the legacy disk/env load path.
+    preloaded_config: Option<NovaRocksConfig>,
 }
 
+/// Legacy standalone server entrypoint that loads config from disk/env inside
+/// [`StandaloneNovaRocks::open`].  New callers that already hold a validated
+/// config should prefer [`run_standalone_server_with_config`].
+#[deprecated(note = "prefer run_standalone_server_with_config when a validated config is available")]
 pub fn run_standalone_server(opts: StandaloneServerOptions) -> Result<(), String> {
     let resolved = resolve_server_options(&opts)?;
     run_with_resolved_options(resolved)
@@ -57,30 +63,32 @@ pub fn run_standalone_server(opts: StandaloneServerOptions) -> Result<(), String
 
 /// Run the standalone server using an already-loaded, validated [`NovaRocksConfig`].
 ///
-/// This is the preferred entrypoint when config has already been loaded and
-/// validated upstream (e.g. by `run_standalone_server_cli`), avoiding a second
-/// file load.  `config_path` is forwarded to [`StandaloneNovaRocks::open`] so
-/// the engine can resolve its own storage settings; pass `None` to use
-/// built-in defaults.
+/// `cfg` is installed as the process-wide active config before the engine
+/// opens — no second disk read occurs.  `config_path` is preserved only for
+/// resolving relative paths (e.g. SQLite metadata DB paths); pass `None` to
+/// use built-in path defaults.
 pub fn run_standalone_server_with_config(
     cfg: NovaRocksConfig,
     config_path: Option<PathBuf>,
     port_override: Option<u16>,
 ) -> Result<(), String> {
     let resolved = resolve_server_options_from_config(&cfg, port_override)?;
-    // Thread the resolved config_path so the engine can open managed-lake
-    // storage and connector backends that depend on the TOML file.
     let resolved = ResolvedStandaloneServerOptions {
         config_path,
+        preloaded_config: Some(cfg),
         ..resolved
     };
     run_with_resolved_options(resolved)
 }
 
 fn run_with_resolved_options(resolved: ResolvedStandaloneServerOptions) -> Result<(), String> {
-    let engine = StandaloneNovaRocks::open(StandaloneOptions {
+    let opts = StandaloneOptions {
         config_path: resolved.config_path.clone(),
-    })?;
+    };
+    let engine = match resolved.preloaded_config {
+        Some(cfg) => StandaloneNovaRocks::open_with_config(opts, cfg)?,
+        None => StandaloneNovaRocks::open(opts)?,
+    };
     crate::engine::register_stream_load_engine(engine.clone());
     let _refresh_coordinator = crate::engine::mv_scheduler::start_refresh_coordinator_for_server(
         &engine,
@@ -105,34 +113,15 @@ fn resolve_server_options(
 ) -> Result<ResolvedStandaloneServerOptions, String> {
     let active_config_path = resolve_active_config_path(opts.config_path.as_deref());
     let file_cfg = load_active_config(active_config_path.as_deref())?;
-
-    let mut mysql_port = DEFAULT_MYSQL_PORT;
-    let mut user = ROOT_USER.to_string();
-    let mut refresh_coordinator = RefreshCoordinatorConfig::default();
-
-    if let Some(app_cfg) = file_cfg.as_ref()
-        && let Some(standalone) = app_cfg.standalone_server.as_ref()
-    {
-        mysql_port = standalone.mysql_port;
-        if standalone.user != ROOT_USER {
-            return Err(format!(
-                "standalone server only supports user `{ROOT_USER}`, got `{}`",
-                standalone.user
-            ));
-        }
-        user = standalone.user.clone();
-        refresh_coordinator = RefreshCoordinatorConfig::from_standalone_config(standalone);
-    }
-
-    if let Some(port) = opts.mysql_port {
-        mysql_port = port;
-    }
-
+    let standalone = file_cfg.as_ref().and_then(|c| c.standalone_server.as_ref());
+    let (mysql_port, user, refresh_coordinator) =
+        extract_server_settings(standalone, opts.mysql_port)?;
     Ok(ResolvedStandaloneServerOptions {
         config_path: opts.config_path.clone(),
         mysql_port,
         user,
         refresh_coordinator,
+        preloaded_config: None,
     })
 }
 
@@ -140,34 +129,44 @@ fn resolve_active_config_path(explicit: Option<&Path>) -> Option<PathBuf> {
     crate::common::app_config::resolve_config_path(explicit)
 }
 
-/// Extract server-layer settings (port, user, refresh coordinator) directly
-/// from a pre-loaded [`NovaRocksConfig`], applying `port_override` last.
-/// This avoids a second config file read when the caller already holds a
-/// validated config.
-fn resolve_server_options_from_config(
-    cfg: &NovaRocksConfig,
+/// Extract server-layer settings (port, user, refresh coordinator) from an
+/// optional [`StandaloneServerConfig`], applying `port_override` last.
+/// Shared by both the disk-load path and the pre-loaded-config path to keep
+/// validation logic in one place.
+fn extract_server_settings(
+    standalone: Option<&crate::common::app_config::StandaloneServerConfig>,
     port_override: Option<u16>,
-) -> Result<ResolvedStandaloneServerOptions, String> {
+) -> Result<(u16, String, RefreshCoordinatorConfig), String> {
     let mut mysql_port = DEFAULT_MYSQL_PORT;
     let mut user = ROOT_USER.to_string();
     let mut refresh_coordinator = RefreshCoordinatorConfig::default();
 
-    if let Some(standalone) = cfg.standalone_server.as_ref() {
-        mysql_port = standalone.mysql_port;
-        if standalone.user != ROOT_USER {
+    if let Some(sc) = standalone {
+        mysql_port = sc.mysql_port;
+        if sc.user != ROOT_USER {
             return Err(format!(
                 "standalone server only supports user `{ROOT_USER}`, got `{}`",
-                standalone.user
+                sc.user
             ));
         }
-        user = standalone.user.clone();
-        refresh_coordinator = RefreshCoordinatorConfig::from_standalone_config(standalone);
+        user = sc.user.clone();
+        refresh_coordinator = RefreshCoordinatorConfig::from_standalone_config(sc);
     }
 
     if let Some(port) = port_override {
         mysql_port = port;
     }
 
+    Ok((mysql_port, user, refresh_coordinator))
+}
+
+/// Extract server-layer settings directly from a pre-loaded [`NovaRocksConfig`].
+fn resolve_server_options_from_config(
+    cfg: &NovaRocksConfig,
+    port_override: Option<u16>,
+) -> Result<ResolvedStandaloneServerOptions, String> {
+    let (mysql_port, user, refresh_coordinator) =
+        extract_server_settings(cfg.standalone_server.as_ref(), port_override)?;
     Ok(ResolvedStandaloneServerOptions {
         // config_path is intentionally None here; callers that need the path
         // (e.g. run_standalone_server_with_config) set it after this call.
@@ -175,6 +174,7 @@ fn resolve_server_options_from_config(
         mysql_port,
         user,
         refresh_coordinator,
+        preloaded_config: None,
     })
 }
 

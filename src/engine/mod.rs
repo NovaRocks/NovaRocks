@@ -295,6 +295,32 @@ impl StandaloneNovaRocks {
                 }
             }
         }
+        #[cfg(test)]
+        return Self::open_body(opts, _test_guard);
+        #[cfg(not(test))]
+        Self::open_body(opts)
+    }
+
+    /// Open the engine using an already-loaded, validated config.
+    ///
+    /// Installs `cfg` as the process-wide active config (replacing any prior
+    /// global config) and then proceeds with the normal engine-open body.
+    /// `opts.config_path` is preserved for resolving relative paths (e.g.
+    /// SQLite metadata DB paths) but is **not** re-read from disk.
+    pub fn open_with_config(opts: StandaloneOptions, cfg: novarocks_config::NovaRocksConfig) -> Result<Self, String> {
+        #[cfg(test)]
+        let _test_guard = Some(acquire_standalone_test_guard());
+        novarocks_config::install_preloaded_config(cfg);
+        #[cfg(test)]
+        return Self::open_body(opts, _test_guard);
+        #[cfg(not(test))]
+        Self::open_body(opts)
+    }
+
+    /// Common engine-open body.  Called after the process-wide config has
+    /// already been installed by the caller.
+    #[cfg(test)]
+    fn open_body(opts: StandaloneOptions, _test_guard: Option<TestSerializationGuard>) -> Result<Self, String> {
         let exchange_port = ensure_standalone_exchange_server()?;
         let metadata_backend = resolve_metadata_backend(&opts)?;
         let metadata_provider = metadata_backend
@@ -314,7 +340,6 @@ impl StandaloneNovaRocks {
             iceberg_catalog_repo: IcebergCatalogMetaRepository,
             job_repo: JobMetaRepository,
             exchange_port,
-            #[cfg(test)]
             _test_guard,
             ..Default::default()
         });
@@ -323,7 +348,35 @@ impl StandaloneNovaRocks {
         if inner.starrocks_table_config.is_some() && inner.metadata_provider.is_some() {
             crate::connector::spawn_starrocks_table_erase_worker(Arc::clone(&inner));
         }
-        #[cfg(not(test))]
+        Ok(Self { inner })
+    }
+
+    #[cfg(not(test))]
+    fn open_body(opts: StandaloneOptions) -> Result<Self, String> {
+        let exchange_port = ensure_standalone_exchange_server()?;
+        let metadata_backend = resolve_metadata_backend(&opts)?;
+        let metadata_provider = metadata_backend
+            .as_ref()
+            .map(open_metadata_provider)
+            .transpose()?;
+        let managed_lake_config = resolve_managed_lake_config()?;
+        let inner = Arc::new(StandaloneState {
+            managed_lake: RwLock::new(ManagedLakeCatalog::empty(managed_lake_config.clone())),
+            managed_lake_config,
+            metadata_provider,
+            managed_repo: ManagedLakeMetaRepository,
+            managed_txn_repo: ManagedLakeTxnRepository,
+            mv_repo: MvMetaRepository,
+            iceberg_catalog_repo: IcebergCatalogMetaRepository,
+            job_repo: JobMetaRepository,
+            exchange_port,
+            ..Default::default()
+        });
+        register_connector_backends(&inner);
+        restore_metadata_if_needed(&inner)?;
+        if inner.managed_lake_config.is_some() && inner.metadata_provider.is_some() {
+            crate::connector::spawn_managed_erase_worker(Arc::clone(&inner));
+        }
         if inner.metadata_provider.is_some() {
             crate::connector::spawn_iceberg_optimize_worker(Arc::clone(&inner));
         }
@@ -3689,6 +3742,51 @@ path = "meta/catalog.db"
                 .expect("metadata provider")
                 .provider_name(),
             "sqlite"
+        );
+    }
+
+    // I1: open_with_config must use the supplied NovaRocksConfig instead of
+    // re-reading from disk.  If the file is overwritten with invalid TOML after
+    // load but before open_with_config, the call must still succeed.
+    #[test]
+    fn open_with_config_does_not_reread_config_file() {
+        let _runtime_guard = lock_runtime_test_state();
+        let dir = TempDir::new().expect("create config dir");
+        let config_path = dir.path().join("novarocks.toml");
+
+        // Write a valid config to disk.
+        std::fs::write(
+            &config_path,
+            r#"[standalone_server]
+mysql_port = 47892
+"#,
+        )
+        .expect("write sentinel config");
+
+        // Load the config before corrupting the file.
+        let cfg = crate::novarocks_config::NovaRocksConfig::load_from_file(&config_path)
+            .expect("load sentinel config");
+        assert_eq!(
+            cfg.standalone_server.as_ref().map(|s| s.mysql_port),
+            Some(47892),
+            "preloaded config must contain sentinel port"
+        );
+
+        // Overwrite the file with invalid TOML — a reload from disk would fail.
+        std::fs::write(&config_path, "NOT VALID TOML !!!").expect("corrupt config file");
+
+        // open_with_config must use the preloaded cfg, not re-read the corrupted file.
+        let result = StandaloneNovaRocks::open_with_config(
+            StandaloneOptions {
+                config_path: Some(config_path),
+            },
+            cfg,
+        );
+        assert!(
+            result.is_ok(),
+            "open_with_config must succeed with preloaded config even when the config file is \
+             invalid; got: {:?}",
+            result.err()
         );
     }
 
