@@ -28,13 +28,13 @@ use std::time::{Duration, Instant};
 use novarocks::common::network;
 use novarocks::novarocks_config;
 use novarocks::novarocks_logging;
-use novarocks::server::{StandaloneServerOptions, run_standalone_server};
 use std::eprintln;
 
 #[derive(Debug, PartialEq, Eq)]
 struct StandaloneServerCliArgs {
     mysql_port: Option<u16>,
     config_path: Option<String>,
+    role: Option<String>,
 }
 
 fn print_main_usage() {
@@ -58,6 +58,7 @@ fn parse_standalone_server_args(
     let mut idx = 0usize;
     let mut mysql_port: Option<u16> = None;
     let mut config_path: Option<String> = None;
+    let mut role: Option<String> = None;
 
     while let Some(arg) = args.get(idx) {
         match arg.as_str() {
@@ -80,6 +81,23 @@ fn parse_standalone_server_args(
                 }
                 idx += 1;
             }
+            "--role" => {
+                idx += 1;
+                let raw = args
+                    .get(idx)
+                    .ok_or_else(|| "missing value for --role".to_string())?;
+                match raw.as_str() {
+                    "fe" | "be" | "all-in-one" => {
+                        role = Some(raw.clone());
+                    }
+                    other => {
+                        return Err(format!(
+                            "invalid --role value `{other}`; expected one of: fe, be, all-in-one"
+                        ));
+                    }
+                }
+                idx += 1;
+            }
             "--help" | "-h" => return Ok(None),
             other => {
                 return Err(format!(
@@ -92,14 +110,70 @@ fn parse_standalone_server_args(
     Ok(Some(StandaloneServerCliArgs {
         mysql_port,
         config_path,
+        role,
     }))
 }
 
-fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> Result<(), String> {
-    run_standalone_server(StandaloneServerOptions {
-        config_path: cli.config_path.map(PathBuf::from),
+fn parse_cluster_role(value: &str) -> Result<novarocks::common::app_config::ClusterRole, String> {
+    match value {
+        "fe" => Ok(novarocks::common::app_config::ClusterRole::Fe),
+        "be" => Ok(novarocks::common::app_config::ClusterRole::Be),
+        "all-in-one" => Ok(novarocks::common::app_config::ClusterRole::AllInOne),
+        other => Err(format!(
+            "invalid cluster role '{}'; expected one of: fe, be, all-in-one",
+            other
+        )),
+    }
+}
+
+fn resolve_cluster_role(
+    cfg: &novarocks::common::app_config::NovaRocksConfig,
+    role_override: Option<novarocks::common::app_config::ClusterRole>,
+) -> novarocks::common::app_config::ClusterRole {
+    role_override.unwrap_or(cfg.cluster.role)
+}
+
+fn dispatch_standalone_role(
+    role: novarocks::common::app_config::ClusterRole,
+    cfg: novarocks::common::app_config::NovaRocksConfig,
+    port_override: Option<u16>,
+    run_all_in_one: impl FnOnce(
+        novarocks::common::app_config::NovaRocksConfig,
+        Option<u16>,
+    ) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    match role {
+        novarocks::common::app_config::ClusterRole::AllInOne => run_all_in_one(cfg, port_override),
+        novarocks::common::app_config::ClusterRole::Fe => {
+            anyhow::bail!("role=fe is not implemented yet (D1 PR-1 placeholder)")
+        }
+        novarocks::common::app_config::ClusterRole::Be => {
+            anyhow::bail!("role=be is not implemented yet (D1 PR-1 placeholder)")
+        }
+    }
+}
+
+fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()> {
+    let role_override = cli
+        .role
+        .as_deref()
+        .map(parse_cluster_role)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    let opts = novarocks::server::StandaloneServerOptions {
+        config_path: cli.config_path.as_deref().map(PathBuf::from),
         mysql_port: cli.mysql_port,
-    })
+    };
+
+    dispatch_standalone_role(
+        role_override.unwrap_or(novarocks::common::app_config::ClusterRole::AllInOne),
+        novarocks::common::app_config::NovaRocksConfig::default(),
+        cli.mysql_port,
+        |_cfg, _port| {
+            novarocks::server::run_standalone_server(opts).map_err(|e| anyhow::anyhow!("{}", e))
+        },
+    )
 }
 
 fn read_pid_file(pid_file: &str) -> Result<Option<u32>, String> {
@@ -721,7 +795,10 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{StandaloneServerCliArgs, parse_standalone_server_args};
+    use super::{
+        StandaloneServerCliArgs, dispatch_standalone_role, parse_standalone_server_args,
+        resolve_cluster_role,
+    };
 
     #[test]
     fn parse_standalone_server_args_accepts_port_and_config() {
@@ -739,6 +816,7 @@ mod tests {
             StandaloneServerCliArgs {
                 mysql_port: Some(19030),
                 config_path: Some("/tmp/novarocks.toml".to_string()),
+                role: None,
             }
         );
     }
@@ -753,6 +831,7 @@ mod tests {
             StandaloneServerCliArgs {
                 mysql_port: None,
                 config_path: None,
+                role: None,
             }
         );
     }
@@ -762,5 +841,70 @@ mod tests {
         let args = vec!["--unknown".to_string()];
         let err = parse_standalone_server_args(&args).expect_err("unknown flag must fail");
         assert!(err.contains("unknown standalone-server arg"));
+    }
+
+    #[test]
+    fn test_standalone_server_role_arg_parses_fe() {
+        let args = vec![
+            "--role".to_string(),
+            "fe".to_string(),
+            "--config".to_string(),
+            "/tmp/fe.toml".to_string(),
+        ];
+        let parsed = parse_standalone_server_args(&args)
+            .expect("parse args")
+            .expect("args");
+        assert_eq!(parsed.role.as_deref(), Some("fe"));
+        assert_eq!(parsed.config_path.as_deref(), Some("/tmp/fe.toml"));
+    }
+
+    #[test]
+    fn test_standalone_server_role_arg_parses_all_in_one() {
+        let args = vec!["--role".to_string(), "all-in-one".to_string()];
+        let parsed = parse_standalone_server_args(&args)
+            .expect("parse args")
+            .expect("args");
+        assert_eq!(parsed.role.as_deref(), Some("all-in-one"));
+    }
+
+    #[test]
+    fn test_standalone_server_role_invalid_rejected() {
+        let args = vec!["--role".to_string(), "master".to_string()];
+        let err = parse_standalone_server_args(&args).expect_err("invalid role must fail");
+        assert!(err.contains("invalid --role value"));
+    }
+
+    #[test]
+    fn test_role_override_wins_over_config() {
+        let mut cfg = novarocks::common::app_config::NovaRocksConfig::default();
+        cfg.cluster.role = novarocks::common::app_config::ClusterRole::AllInOne;
+        let role = resolve_cluster_role(&cfg, Some(novarocks::common::app_config::ClusterRole::Fe));
+        assert_eq!(role, novarocks::common::app_config::ClusterRole::Fe);
+    }
+
+    #[test]
+    fn test_dispatch_role_fe_is_unimplemented_placeholder() {
+        let cfg = novarocks::common::app_config::NovaRocksConfig::default();
+        let err = dispatch_standalone_role(
+            novarocks::common::app_config::ClusterRole::Fe,
+            cfg,
+            None,
+            |_, _| unreachable!("all-in-one should not be called"),
+        )
+        .expect_err("fe should be placeholder in PR-1");
+        assert!(err.to_string().contains("role=fe is not implemented yet"));
+    }
+
+    #[test]
+    fn test_dispatch_role_be_is_unimplemented_placeholder() {
+        let cfg = novarocks::common::app_config::NovaRocksConfig::default();
+        let err = dispatch_standalone_role(
+            novarocks::common::app_config::ClusterRole::Be,
+            cfg,
+            None,
+            |_, _| unreachable!("all-in-one should not be called"),
+        )
+        .expect_err("be should be placeholder in PR-1");
+        assert!(err.to_string().contains("role=be is not implemented yet"));
     }
 }

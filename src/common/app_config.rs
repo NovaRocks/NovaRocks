@@ -44,6 +44,58 @@ fn default_sys_log_roll_num() -> usize {
     10
 }
 
+/// Cluster role for distributed deployments.
+/// The default is `AllInOne`, which preserves existing single-process behavior.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClusterRole {
+    Fe,
+    Be,
+    AllInOne,
+}
+
+impl Default for ClusterRole {
+    fn default() -> Self {
+        ClusterRole::AllInOne
+    }
+}
+
+/// Configuration for the `[cluster]` TOML section.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct ClusterConfig {
+    pub role: ClusterRole,
+    pub backends: Vec<String>,
+    pub advertise_host: String,
+    pub advertise_port: u16,
+}
+
+impl ClusterConfig {
+    /// Validate cluster config consistency. Called at startup after parsing.
+    pub fn validate(&self) -> Result<(), String> {
+        match self.role {
+            ClusterRole::Fe => {
+                if self.backends.len() != 1 {
+                    return Err(format!(
+                        "D1 v1 only supports exactly one backend, got {}",
+                        self.backends.len()
+                    ));
+                }
+            }
+            ClusterRole::Be => {
+                if !self.backends.is_empty() {
+                    return Err(format!(
+                        "role=be must not configure [cluster].backends (got {} entries)",
+                        self.backends.len()
+                    ));
+                }
+            }
+            ClusterRole::AllInOne => {}
+        }
+        Ok(())
+    }
+}
+
 pub fn init_from_path(path: impl AsRef<Path>) -> Result<&'static NovaRocksConfig> {
     let path = path.as_ref().to_path_buf();
     let cfg = if !path.exists() {
@@ -136,6 +188,9 @@ pub struct NovaRocksConfig {
 
     #[serde(default)]
     pub starrocks: StarRocksConfig,
+
+    #[serde(default)]
+    pub cluster: ClusterConfig,
 }
 
 impl NovaRocksConfig {
@@ -168,6 +223,7 @@ impl Default for NovaRocksConfig {
             standalone_server: None,
             spill: SpillStorageConfig::default(),
             starrocks: StarRocksConfig::default(),
+            cluster: ClusterConfig::default(),
         }
     }
 }
@@ -1499,5 +1555,74 @@ internal_service_query_rpc_thread_num = 7
         );
         runtime.internal_service_query_rpc_thread_num = 5;
         assert_eq!(runtime.actual_internal_service_query_rpc_threads(), 5);
+    }
+
+    #[test]
+    fn test_cluster_default_is_all_in_one() {
+        let toml = r#"
+[server]
+host = "127.0.0.1"
+"#;
+        let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse default");
+        assert_eq!(cfg.cluster.role, super::ClusterRole::AllInOne);
+        assert!(cfg.cluster.backends.is_empty());
+    }
+
+    #[test]
+    fn test_cluster_role_fe_with_single_backend() {
+        let toml = r#"
+[cluster]
+role = "fe"
+backends = ["127.0.0.1:9070"]
+"#;
+        let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse fe");
+        assert_eq!(cfg.cluster.role, super::ClusterRole::Fe);
+        assert_eq!(cfg.cluster.backends, vec!["127.0.0.1:9070".to_string()]);
+    }
+
+    #[test]
+    fn test_cluster_role_be_rejects_backends() {
+        let toml = r#"
+[cluster]
+role = "be"
+backends = ["127.0.0.1:9070"]
+"#;
+        let parsed: NovaRocksConfig = toml::from_str(toml).expect("parse be with backends");
+        let err = parsed
+            .cluster
+            .validate()
+            .expect_err("be with backends should fail");
+        assert!(err.contains("backends"));
+    }
+
+    #[test]
+    fn test_cluster_role_fe_requires_exactly_one_backend_v1() {
+        let toml_empty = r#"
+[cluster]
+role = "fe"
+backends = []
+"#;
+        let cfg: NovaRocksConfig = toml::from_str(toml_empty).expect("parse");
+        let err = cfg.cluster.validate().expect_err("fe with 0 backends");
+        assert!(err.contains("D1 v1 only supports exactly one backend"));
+
+        let toml_two = r#"
+[cluster]
+role = "fe"
+backends = ["a:1", "b:2"]
+"#;
+        let cfg: NovaRocksConfig = toml::from_str(toml_two).expect("parse");
+        let err = cfg.cluster.validate().expect_err("fe with 2 backends");
+        assert!(err.contains("D1 v1 only supports exactly one backend"));
+    }
+
+    #[test]
+    fn test_cluster_role_invalid_rejected() {
+        let toml = r#"
+[cluster]
+role = "leader"
+"#;
+        let result: Result<NovaRocksConfig, _> = toml::from_str(toml);
+        assert!(result.is_err(), "invalid role string should fail parse");
     }
 }
