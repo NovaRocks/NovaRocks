@@ -1958,23 +1958,93 @@ fn extract_corr_preds_inner(
     }
 }
 
-/// Check if an expression is a reference to a column that exists in the outer scope
-/// but NOT in the inner scope. This identifies true correlation references.
+/// Check if an expression is "outer-only" from the subquery's point of view:
+/// every column reference in the expression resolves in the outer scope and
+/// does NOT resolve in the inner scope, AND the expression itself contains
+/// at least one column reference (i.e. it's not a pure constant).
+///
+/// This is the test used by `extract_correlation_predicates` to decide
+/// which side of a comparison is the outer ("correlation") side. We must
+/// recurse into function calls / arithmetic / nested expressions so a
+/// correlation hidden behind a wrapper like `r.k3 = coalesce(l.k3, 2)`
+/// is still recognised — otherwise the inner query is analysed without
+/// outer-column visibility and the `l.k3` reference fails to resolve.
 fn is_outer_only_ref(
     expr: &TypedExpr,
     inner_scope: &AnalyzerScope,
     outer_scope: &AnalyzerScope,
 ) -> bool {
+    let mut saw_column = false;
+    let mut all_outer_only = true;
+    collect_column_outer_status(expr, inner_scope, outer_scope, &mut saw_column, &mut all_outer_only);
+    saw_column && all_outer_only
+}
+
+fn collect_column_outer_status(
+    expr: &TypedExpr,
+    inner_scope: &AnalyzerScope,
+    outer_scope: &AnalyzerScope,
+    saw_column: &mut bool,
+    all_outer_only: &mut bool,
+) {
     match &expr.kind {
         ExprKind::ColumnRef {
             qualifier, column, ..
         } => {
+            *saw_column = true;
             let in_inner = inner_scope.resolve(qualifier.as_deref(), column).is_ok();
             let in_outer = outer_scope.resolve(qualifier.as_deref(), column).is_ok();
-            // Outer-only: in outer but not in inner
-            !in_inner && in_outer
+            if !(in_outer && !in_inner) {
+                *all_outer_only = false;
+            }
         }
-        _ => false,
+        ExprKind::BinaryOp { left, right, .. } => {
+            collect_column_outer_status(left, inner_scope, outer_scope, saw_column, all_outer_only);
+            collect_column_outer_status(right, inner_scope, outer_scope, saw_column, all_outer_only);
+        }
+        ExprKind::UnaryOp { expr: inner, .. } => {
+            collect_column_outer_status(inner, inner_scope, outer_scope, saw_column, all_outer_only);
+        }
+        ExprKind::IsNull { expr: inner, .. } => {
+            collect_column_outer_status(inner, inner_scope, outer_scope, saw_column, all_outer_only);
+        }
+        ExprKind::Cast { expr: inner, .. } => {
+            collect_column_outer_status(inner, inner_scope, outer_scope, saw_column, all_outer_only);
+        }
+        ExprKind::Nested(inner) => {
+            collect_column_outer_status(inner, inner_scope, outer_scope, saw_column, all_outer_only);
+        }
+        ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
+            for a in args {
+                collect_column_outer_status(a, inner_scope, outer_scope, saw_column, all_outer_only);
+            }
+        }
+        ExprKind::InList { expr: inner, list, .. } => {
+            collect_column_outer_status(inner, inner_scope, outer_scope, saw_column, all_outer_only);
+            for item in list {
+                collect_column_outer_status(item, inner_scope, outer_scope, saw_column, all_outer_only);
+            }
+        }
+        ExprKind::Between { expr: inner, low, high, .. } => {
+            collect_column_outer_status(inner, inner_scope, outer_scope, saw_column, all_outer_only);
+            collect_column_outer_status(low, inner_scope, outer_scope, saw_column, all_outer_only);
+            collect_column_outer_status(high, inner_scope, outer_scope, saw_column, all_outer_only);
+        }
+        ExprKind::Case { operand, when_then, else_expr } => {
+            if let Some(op) = operand {
+                collect_column_outer_status(op, inner_scope, outer_scope, saw_column, all_outer_only);
+            }
+            for (when, then) in when_then {
+                collect_column_outer_status(when, inner_scope, outer_scope, saw_column, all_outer_only);
+                collect_column_outer_status(then, inner_scope, outer_scope, saw_column, all_outer_only);
+            }
+            if let Some(else_) = else_expr {
+                collect_column_outer_status(else_, inner_scope, outer_scope, saw_column, all_outer_only);
+            }
+        }
+        // Literals / placeholders / lambda params: no column refs, leave
+        // saw_column / all_outer_only unchanged.
+        _ => {}
     }
 }
 
