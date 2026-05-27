@@ -139,10 +139,14 @@ fn validate_physical_aggregate_schema(
         // `sql_type_to_arrow_type`-derived expected uses nullable inner key
         // fields. Both are semantically the same shape. Top-level column
         // nullability is still enforced by the `is_nullable` check below.
-        if !crate::engine::sql_expr::arrow_type_equals_ignoring_metadata(
+        let type_matches = crate::engine::sql_expr::arrow_type_equals_ignoring_metadata(
             actual.data_type(),
             &expected_type,
-        ) {
+        ) || matches!(
+            (actual.data_type(), &expected_type),
+            (DataType::LargeBinary, DataType::Binary) | (DataType::Binary, DataType::LargeBinary)
+        );
+        if !type_matches {
             return Err(format!(
                 "{context}: physical aggregate schema column {idx} `{expected_name}` type mismatch: got {:?} expected {:?}",
                 actual.data_type(),
@@ -504,7 +508,7 @@ async fn load_current_aggregate_target_state_async(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Array, ArrayRef, Int8Array, Int64Array, StringArray};
+    use arrow::array::{Array, ArrayRef, Int8Array, Int64Array, LargeBinaryBuilder, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
@@ -514,6 +518,7 @@ mod tests {
         AggregateMvLayout, AggregateStateColumn, AggregateStateRole, AggregateVisibleColumn,
     };
     use crate::connector::starrocks::managed::mv_shape::AggregateFunctionKind;
+    use crate::connector::starrocks::managed::state_codec::encode_count_state;
     use crate::sql::parser::ast::SqlType;
 
     fn chunk(batch: RecordBatch) -> crate::exec::chunk::Chunk {
@@ -542,7 +547,7 @@ mod tests {
             managed_physical_column("c".to_string(), SqlType::BigInt, false, true, false);
         let count_state_column = managed_physical_column(
             "__agg_state_c".to_string(),
-            SqlType::BigInt,
+            SqlType::Binary,
             false,
             false,
             false,
@@ -568,8 +573,8 @@ mod tests {
             ],
             state_columns: vec![AggregateStateColumn {
                 name: "__agg_state_c".to_string(),
-                data_type: DataType::Int64,
-                sql_type: SqlType::BigInt,
+                data_type: DataType::LargeBinary,
+                sql_type: SqlType::Binary,
                 nullable: false,
                 visible_source_index: 1,
                 aggregate_index: 0,
@@ -588,12 +593,16 @@ mod tests {
     }
 
     fn count_physical_batch(rows: &[(&str, &str, i64, i64)]) -> RecordBatch {
+        let mut state_builder = LargeBinaryBuilder::new();
+        for row in rows {
+            state_builder.append_value(encode_count_state(row.3));
+        }
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("__row_id__", DataType::Utf8, false),
                 Field::new("region", DataType::Utf8, true),
                 Field::new("c", DataType::Int64, false),
-                Field::new("__agg_state_c", DataType::Int64, false),
+                Field::new("__agg_state_c", DataType::LargeBinary, false),
             ])),
             vec![
                 Arc::new(StringArray::from(
@@ -605,9 +614,7 @@ mod tests {
                 Arc::new(Int64Array::from(
                     rows.iter().map(|row| row.2).collect::<Vec<_>>(),
                 )) as ArrayRef,
-                Arc::new(Int64Array::from(
-                    rows.iter().map(|row| row.3).collect::<Vec<_>>(),
-                )) as ArrayRef,
+                Arc::new(state_builder.finish()) as ArrayRef,
             ],
         )
         .expect("physical batch")
@@ -640,44 +647,15 @@ mod tests {
         let r1 = encoded_utf8_group_row_id("r1");
         let r2 = encoded_utf8_group_row_id("r2");
         let r3 = encoded_utf8_group_row_id("r3");
-        let old = vec![chunk(
-            RecordBatch::try_new(
-                Arc::new(Schema::new(vec![
-                    Field::new("__row_id__", DataType::Utf8, false),
-                    Field::new("region", DataType::Utf8, true),
-                    Field::new("c", DataType::Int64, false),
-                    Field::new("__agg_state_c", DataType::Int64, false),
-                ])),
-                vec![
-                    Arc::new(StringArray::from(vec![r1.as_str(), r2.as_str()])) as ArrayRef,
-                    Arc::new(StringArray::from(vec!["r1", "r2"])) as ArrayRef,
-                    Arc::new(Int64Array::from(vec![2, 1])) as ArrayRef,
-                    Arc::new(Int64Array::from(vec![2, 1])) as ArrayRef,
-                ],
-            )
-            .expect("old batch"),
-        )];
-        let delta = vec![chunk(
-            RecordBatch::try_new(
-                Arc::new(Schema::new(vec![
-                    Field::new("__row_id__", DataType::Utf8, false),
-                    Field::new("region", DataType::Utf8, true),
-                    Field::new("c", DataType::Int64, false),
-                    Field::new("__agg_state_c", DataType::Int64, false),
-                ])),
-                vec![
-                    Arc::new(StringArray::from(vec![
-                        r1.as_str(),
-                        r2.as_str(),
-                        r3.as_str(),
-                    ])) as ArrayRef,
-                    Arc::new(StringArray::from(vec!["r1", "r2", "r3"])) as ArrayRef,
-                    Arc::new(Int64Array::from(vec![1, -1, 5])) as ArrayRef,
-                    Arc::new(Int64Array::from(vec![1, -1, 5])) as ArrayRef,
-                ],
-            )
-            .expect("delta batch"),
-        )];
+        let old = vec![chunk(count_physical_batch(&[
+            (r1.as_str(), "r1", 2, 2),
+            (r2.as_str(), "r2", 1, 1),
+        ]))];
+        let delta = vec![chunk(count_physical_batch(&[
+            (r1.as_str(), "r1", 1, 1),
+            (r2.as_str(), "r2", -1, -1),
+            (r3.as_str(), "r3", 5, 5),
+        ]))];
 
         let result = merge_aggregate_target_state(&layout, &old, &delta).expect("merge");
 
@@ -738,7 +716,12 @@ mod tests {
         assert_field(fields[0].as_ref(), "__row_id__", &DataType::Utf8, false);
         assert_field(fields[1].as_ref(), "region", &DataType::Utf8, true);
         assert_field(fields[2].as_ref(), "c", &DataType::Int64, false);
-        assert_field(fields[3].as_ref(), "__agg_state_c", &DataType::Int64, false);
+        assert_field(
+            fields[3].as_ref(),
+            "__agg_state_c",
+            &DataType::LargeBinary,
+            false,
+        );
         assert_field(fields[4].as_ref(), "__change_op", &DataType::Int8, false);
         let insert_ops = insert_batch
             .column(4)
@@ -830,7 +813,7 @@ mod tests {
                 Field::new("__row_id__", DataType::Utf8, false),
                 Field::new("c", DataType::Int64, false),
                 Field::new("region", DataType::Utf8, true),
-                Field::new("__agg_state_c", DataType::Int64, false),
+                Field::new("__agg_state_c", DataType::LargeBinary, false),
             ])),
             vec![
                 valid.column(0).clone(),
@@ -974,7 +957,7 @@ mod tests {
                 .expect("create_namespace");
 
             // Schema: __row_id__ (Utf8/String required), region (String optional),
-            //         c (Long required), __agg_state_c (Long required).
+            //         c (Long required), __agg_state_c (Binary required).
             // Field IDs chosen to match the aggregate layout contract.
             let schema = IcebergSchema::builder()
                 .with_fields(vec![
@@ -986,7 +969,7 @@ mod tests {
                     NestedField::required(
                         13,
                         "__agg_state_c",
-                        Type::Primitive(PrimitiveType::Long),
+                        Type::Primitive(PrimitiveType::Binary),
                     )
                     .into(),
                 ])
@@ -1072,7 +1055,7 @@ mod tests {
                     NestedField::required(
                         13,
                         "__agg_state_c",
-                        Type::Primitive(PrimitiveType::Long),
+                        Type::Primitive(PrimitiveType::Binary),
                     )
                     .into(),
                 ])
@@ -1306,7 +1289,7 @@ mod tests {
                 Field::new("__row_id__", DataType::Utf8, false),
                 Field::new("c", DataType::Int64, false),
                 Field::new("region", DataType::Utf8, true),
-                Field::new("__agg_state_c", DataType::Int64, false),
+                Field::new("__agg_state_c", DataType::LargeBinary, false),
             ])),
             vec![
                 valid.column(0).clone(),
@@ -1326,7 +1309,7 @@ mod tests {
                 Field::new("__row_id__", DataType::Utf8, false),
                 Field::new("region", DataType::Utf8, true),
                 Field::new("c", DataType::Int32, false),
-                Field::new("__agg_state_c", DataType::Int64, false),
+                Field::new("__agg_state_c", DataType::LargeBinary, false),
             ])),
             vec![
                 valid.column(0).clone(),
@@ -1345,7 +1328,7 @@ mod tests {
                 Field::new("__row_id__", DataType::Utf8, false),
                 Field::new("region", DataType::Utf8, false),
                 Field::new("c", DataType::Int64, false),
-                Field::new("__agg_state_c", DataType::Int64, false),
+                Field::new("__agg_state_c", DataType::LargeBinary, false),
             ])),
             valid.columns().to_vec(),
         )

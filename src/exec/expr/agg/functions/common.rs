@@ -16,11 +16,12 @@
 // under the License.
 use super::super::*;
 use arrow::array::{
-    BooleanArray, BooleanBuilder, Date32Array, Decimal128Array, Decimal256Array,
-    FixedSizeBinaryArray, Float32Array, Float32Builder, Float64Array, Float64Builder, Int8Array,
-    Int8Builder, Int16Array, Int16Builder, Int32Array, Int32Builder, Int64Array, Int64Builder,
-    ListArray, MapArray, StringArray, StringBuilder, StructArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, new_null_array,
+    BinaryArray, BinaryBuilder, BooleanArray, BooleanBuilder, Date32Array, Decimal128Array,
+    Decimal256Array, FixedSizeBinaryArray, Float32Array, Float32Builder, Float64Array,
+    Float64Builder, Int8Array, Int8Builder, Int16Array, Int16Builder, Int32Array, Int32Builder,
+    Int64Array, Int64Builder, LargeBinaryArray, LargeBinaryBuilder, ListArray, MapArray,
+    StringArray, StringBuilder, StructArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray, new_null_array,
 };
 use arrow::datatypes::{DataType, TimeUnit};
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer, i256};
@@ -190,6 +191,7 @@ pub(crate) enum AggScalarValue {
     Timestamp(i64),
     Decimal128(i128),
     Decimal256(i256),
+    Binary(Vec<u8>),
     Struct(Vec<Option<AggScalarValue>>),
     Map(Vec<(Option<AggScalarValue>, Option<AggScalarValue>)>),
     List(Vec<Option<AggScalarValue>>),
@@ -287,6 +289,28 @@ pub(crate) fn scalar_from_array(
                 Ok(None)
             } else {
                 Ok(Some(AggScalarValue::Utf8(arr.value(row).to_string())))
+            }
+        }
+        DataType::Binary => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| "failed to downcast to BinaryArray".to_string())?;
+            if arr.is_null(row) {
+                Ok(None)
+            } else {
+                Ok(Some(AggScalarValue::Binary(arr.value(row).to_vec())))
+            }
+        }
+        DataType::LargeBinary => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .ok_or_else(|| "failed to downcast to LargeBinaryArray".to_string())?;
+            if arr.is_null(row) {
+                Ok(None)
+            } else {
+                Ok(Some(AggScalarValue::Binary(arr.value(row).to_vec())))
             }
         }
         DataType::Date32 => {
@@ -463,6 +487,7 @@ pub(in crate::exec::expr::agg) fn scalar_to_string(
             DataType::Decimal256(_, scale) => Ok(format_decimal256(*v, *scale)),
             _ => Ok(v.to_string()),
         },
+        AggScalarValue::Binary(v) => Ok(hex::encode(v)),
         AggScalarValue::Struct(items) => {
             let mut rendered = Vec::with_capacity(items.len());
             for item in items {
@@ -629,6 +654,7 @@ pub(crate) fn compare_scalar_values(
         (AggScalarValue::Timestamp(l), AggScalarValue::Timestamp(r)) => Ok(l.cmp(r)),
         (AggScalarValue::Decimal128(l), AggScalarValue::Decimal128(r)) => Ok(l.cmp(r)),
         (AggScalarValue::Decimal256(l), AggScalarValue::Decimal256(r)) => Ok(l.cmp(r)),
+        (AggScalarValue::Binary(l), AggScalarValue::Binary(r)) => Ok(l.cmp(r)),
         (AggScalarValue::Struct(l), AggScalarValue::Struct(r)) => {
             let min_len = l.len().min(r.len());
             for idx in 0..min_len {
@@ -689,9 +715,9 @@ fn compare_optional_scalar_values(
 /// - `Float32`/`Float64` NaN values are normalized to a single canonical bit
 ///   pattern so multiple NaN inputs collapse into one bucket.
 /// - Composite types (`Struct`/`Map`/`List`) are encoded recursively for
-///   safety, even though `map_value_count` rejects them upstream.
+///   safety, even though aggregate callers reject them upstream when needed.
 ///
-/// Shared by `map_agg` and `map_value_count` so the two stay in sync.
+/// Shared by aggregate functions that need stable scalar-key identity.
 pub(in crate::exec::expr::agg) fn key_fingerprint(key: &AggScalarValue) -> Vec<u8> {
     let mut out = Vec::new();
     encode_scalar(&mut out, key);
@@ -743,6 +769,12 @@ fn encode_scalar(out: &mut Vec<u8>, key: &AggScalarValue) {
             let len = text.len() as u32;
             out.extend_from_slice(&len.to_le_bytes());
             out.extend_from_slice(text.as_bytes());
+        }
+        AggScalarValue::Binary(v) => {
+            out.push(12);
+            let len = v.len() as u32;
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(v);
         }
         AggScalarValue::Struct(items) => {
             out.push(8);
@@ -895,6 +927,28 @@ pub(crate) fn build_scalar_array(
                     Some(AggScalarValue::Utf8(v)) => builder.append_value(v),
                     None => builder.append_null(),
                     _ => return Err("scalar output type mismatch for Utf8".to_string()),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Binary => {
+            let mut builder = BinaryBuilder::new();
+            for value in values {
+                match value {
+                    Some(AggScalarValue::Binary(v)) => builder.append_value(v),
+                    None => builder.append_null(),
+                    _ => return Err("scalar output type mismatch for Binary".to_string()),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::LargeBinary => {
+            let mut builder = LargeBinaryBuilder::new();
+            for value in values {
+                match value {
+                    Some(AggScalarValue::Binary(v)) => builder.append_value(v),
+                    None => builder.append_null(),
+                    _ => return Err("scalar output type mismatch for LargeBinary".to_string()),
                 }
             }
             Ok(Arc::new(builder.finish()))

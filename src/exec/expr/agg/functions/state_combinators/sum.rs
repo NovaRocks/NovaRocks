@@ -189,7 +189,7 @@ fn build_sum_state_spec(
     let state_kind = if input_is_intermediate {
         let arg_type = declared_arg_type
             .ok_or_else(|| format!("{name} merge requires original logical input type"))?;
-        sum_state_kind_from_logical_input(name, arg_type, signed)?
+        sum_state_kind_from_merge_input(name, arg_type, signed)?
     } else {
         let input_type = input_type.ok_or_else(|| format!("{name} input type missing"))?;
         sum_state_kind_from_logical_input(name, input_type, signed)?
@@ -229,6 +229,26 @@ fn sum_state_kind_from_logical_input(
                 fields.len()
             ));
         }
+        if fields[1].data_type() != &DataType::Int8 {
+            return Err(format!(
+                "{name} change_op must be Int8, got {:?}",
+                fields[1].data_type()
+            ));
+        }
+        return sum_state_kind_from_value_type(name, fields[0].data_type());
+    }
+    sum_state_kind_from_value_type(name, input_type)
+}
+
+fn sum_state_kind_from_merge_input(
+    name: &str,
+    input_type: &DataType,
+    signed: bool,
+) -> Result<SumStateKind, String> {
+    if signed
+        && let DataType::Struct(fields) = input_type
+        && fields.len() == 2
+    {
         if fields[1].data_type() != &DataType::Int8 {
             return Err(format!(
                 "{name} change_op must be Int8, got {:?}",
@@ -1075,6 +1095,20 @@ mod tests {
         ));
         assert_eq!(signed_spec.output_type, DataType::Binary);
         assert_eq!(signed_spec.intermediate_type, DataType::Binary);
+    }
+
+    #[test]
+    fn sum_state_signed_merge_uses_first_declared_value_arg_type() {
+        let signed_merge_spec = super::super::super::build_spec_from_type(
+            &sum_func_with_arg("sum_state_signed", DataType::Int64),
+            Some(&DataType::Binary),
+            true,
+        )
+        .expect("signed merge spec with first declared value arg");
+        assert!(matches!(
+            signed_merge_spec.kind,
+            AggKind::SumStateSignedInt64
+        ));
     }
 
     #[test]

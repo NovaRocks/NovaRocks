@@ -608,6 +608,7 @@ fn validate_aggregate_mv_input_type(
     args: &[crate::sql::analysis::TypedExpr],
 ) -> Result<(), String> {
     match function {
+        AggregateFunctionKind::Sum => validate_sum_mv_input_type(analyzed_name, output_name, args),
         AggregateFunctionKind::Avg => validate_avg_mv_input_type(analyzed_name, output_name, args),
         AggregateFunctionKind::CountDistinct => {
             validate_count_distinct_mv_input_type(analyzed_name, output_name, args)
@@ -617,6 +618,35 @@ fn validate_aggregate_mv_input_type(
         }
         _ => Ok(()),
     }
+}
+
+fn validate_sum_mv_input_type(
+    analyzed_name: &str,
+    output_name: &str,
+    args: &[crate::sql::analysis::TypedExpr],
+) -> Result<(), String> {
+    if !analyzed_name.eq_ignore_ascii_case("sum") {
+        return Err(format!(
+            "aggregate MV analyzed aggregate mismatch for `{output_name}`: expected SUM, got {analyzed_name}"
+        ));
+    }
+    let input_type = args
+        .first()
+        .map(|arg| &arg.data_type)
+        .ok_or_else(|| "SUM aggregate requires a column expression argument".to_string())?;
+    if matches!(
+        input_type,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Decimal128(_, _)
+    ) {
+        return Ok(());
+    }
+    Err(format!(
+        "SUM state type is unsupported for aggregate `{output_name}` input: {input_type:?}"
+    ))
 }
 
 fn validate_avg_mv_input_type(
@@ -635,11 +665,7 @@ fn validate_avg_mv_input_type(
         .ok_or_else(|| "AVG aggregate requires a column expression argument".to_string())?;
     if matches!(
         input_type,
-        DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::Decimal128(_, _)
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
     ) {
         return Ok(());
     }
@@ -2460,6 +2486,80 @@ mod tests {
             .expect("avg shape")
     }
 
+    fn resolved_sum_query(arg_type: DataType) -> ResolvedQuery {
+        use crate::sql::analysis::{ExprKind, ProjectItem, ResolvedSelect, TypedExpr};
+
+        let group_key = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId::UNSET,
+                qualifier: None,
+                column: "k".to_string(),
+            },
+            data_type: DataType::Int64,
+            nullable: false,
+        };
+        let sum_arg = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId::UNSET,
+                qualifier: None,
+                column: "v".to_string(),
+            },
+            data_type: arg_type.clone(),
+            nullable: true,
+        };
+        let sum_output_type = match arg_type {
+            DataType::Decimal128(_, scale) => DataType::Decimal128(38, scale),
+            DataType::Float32 | DataType::Float64 => DataType::Float64,
+            _ => DataType::Int64,
+        };
+        let sum = TypedExpr {
+            kind: ExprKind::AggregateCall {
+                name: "sum".to_string(),
+                args: vec![sum_arg],
+                distinct: false,
+                order_by: Vec::new(),
+            },
+            data_type: sum_output_type,
+            nullable: true,
+        };
+
+        ResolvedQuery {
+            body: QueryBody::Select(ResolvedSelect {
+                from: None,
+                filter: None,
+                group_by: vec![group_key.clone()],
+                having: None,
+                projection: vec![
+                    ProjectItem {
+                        expr: group_key,
+                        output_name: "k".to_string(),
+                    },
+                    ProjectItem {
+                        expr: sum,
+                        output_name: "s".to_string(),
+                    },
+                ],
+                has_aggregation: true,
+                distinct: false,
+                repeat: None,
+            }),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            output_columns: Vec::new(),
+            local_cte_ids: Vec::new(),
+        }
+    }
+
+    fn sum_shape() -> IncrementalMvShape {
+        let stmt = parse_create_mv(
+            "create materialized view mv1 distributed by hash(k) buckets 2 \
+             as select k, sum(v) as s from ice.ns.orders group by k",
+        );
+        super::super::mv_shape::classify_incremental_mv_query(&stmt.select_query)
+            .expect("sum shape")
+    }
+
     fn resolved_count_distinct_query(arg_type: DataType) -> ResolvedQuery {
         use crate::sql::analysis::{ExprKind, ProjectItem, ResolvedSelect, TypedExpr};
 
@@ -2613,12 +2713,39 @@ mod tests {
     #[test]
     fn aggregate_mv_analyzed_types_rejects_avg_float_and_string_inputs() {
         let shape = avg_shape();
-        for data_type in [DataType::Float64, DataType::Utf8] {
+        for data_type in [
+            DataType::Float64,
+            DataType::Decimal128(18, 2),
+            DataType::Utf8,
+        ] {
             let resolved = resolved_avg_query(data_type.clone());
             let err = validate_incremental_mv_analyzed_types(&shape, &resolved)
                 .expect_err("unsupported AVG input should be rejected");
             assert!(err.contains("AVG state type is unsupported"), "err={err}");
             assert!(err.contains(&format!("{data_type:?}")), "err={err}");
+        }
+    }
+
+    #[test]
+    fn aggregate_mv_analyzed_types_rejects_sum_float_input() {
+        let shape = sum_shape();
+        for data_type in [DataType::Float32, DataType::Float64] {
+            let resolved = resolved_sum_query(data_type.clone());
+            let err = validate_incremental_mv_analyzed_types(&shape, &resolved)
+                .expect_err("unsupported SUM input should be rejected");
+            assert!(err.contains("SUM state type is unsupported"), "err={err}");
+            assert!(err.contains(&format!("{data_type:?}")), "err={err}");
+        }
+    }
+
+    #[test]
+    fn aggregate_mv_analyzed_types_accepts_sum_integer_and_decimal_inputs() {
+        let shape = sum_shape();
+        for data_type in [DataType::Int64, DataType::Decimal128(18, 2)] {
+            let resolved = resolved_sum_query(data_type.clone());
+            validate_incremental_mv_analyzed_types(&shape, &resolved).unwrap_or_else(|err| {
+                panic!("SUM input type {data_type:?} should be supported, got {err}")
+            });
         }
     }
 

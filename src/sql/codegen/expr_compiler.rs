@@ -1751,14 +1751,6 @@ fn semantic_aggregate_type_desc(
             typed_expr_type_desc(&args[1])?,
         );
     }
-    if matches!(name, "map_value_count" | "map_value_count_signed")
-        && let Some(key_arg) = args.first()
-    {
-        return map_type_desc(
-            typed_expr_type_desc(key_arg)?,
-            arrow_type_to_type_desc(&DataType::Int64)?,
-        );
-    }
     if name == "approx_top_k"
         && let Some(item) = args.first()
     {
@@ -2654,6 +2646,9 @@ fn infer_agg_function_types(
 ) -> Result<(DataType, Option<DataType>), String> {
     let first_arg = arg_types.first().cloned().unwrap_or(DataType::Null);
     match name {
+        name if is_state_combinator_aggregate_function(name) => {
+            Ok((DataType::Binary, Some(DataType::Binary)))
+        }
         "count" => Ok((DataType::Int64, Some(DataType::Int64))),
         "sum" => {
             let out = match &first_arg {
@@ -2771,27 +2766,6 @@ fn infer_agg_function_types(
             );
             Ok((map.clone(), Some(map)))
         }
-        "map_value_count" | "map_value_count_signed" => {
-            // Output / intermediate type: Map<input_type_K, Int64>. The first arg's
-            // type drives the key; the second arg (when present) is change_op Int8
-            // and is not part of the output map.
-            let key_type = arg_types.first().cloned().unwrap_or(DataType::Null);
-            let map = DataType::Map(
-                Arc::new(arrow::datatypes::Field::new(
-                    "entries",
-                    DataType::Struct(
-                        vec![
-                            Arc::new(arrow::datatypes::Field::new("key", key_type, false)),
-                            Arc::new(arrow::datatypes::Field::new("value", DataType::Int64, true)),
-                        ]
-                        .into(),
-                    ),
-                    false,
-                )),
-                false,
-            );
-            Ok((map.clone(), Some(map)))
-        }
         "bitmap_agg" | "bitmap_union" => Ok((DataType::Binary, Some(DataType::Binary))),
         "bitmap_union_count" => Ok((DataType::Int64, Some(DataType::Binary))),
         "approx_count_distinct"
@@ -2870,6 +2844,30 @@ fn infer_agg_function_types(
             Ok((out.clone(), Some(out)))
         }
     }
+}
+
+fn is_state_combinator_aggregate_function(name: &str) -> bool {
+    matches!(
+        name,
+        "count_state"
+            | "count_state_signed"
+            | "sum_state"
+            | "sum_state_signed"
+            | "avg_state"
+            | "avg_state_signed"
+            | "min_state"
+            | "min_state_signed"
+            | "max_state"
+            | "max_state_signed"
+            | "bool_or_state"
+            | "bool_or_state_signed"
+            | "bool_and_state"
+            | "bool_and_state_signed"
+            | "count_distinct_state"
+            | "count_distinct_state_signed"
+            | "approx_count_distinct_state"
+            | "approx_count_distinct_state_signed"
+    )
 }
 
 fn aggregate_arg_types_for_signature(agg_name: &str, args: &[TypedExpr]) -> Vec<DataType> {
@@ -3620,6 +3618,36 @@ mod tests {
 
         assert_eq!(output, largeint_type);
         assert_eq!(intermediate, Some(largeint_type));
+    }
+
+    #[test]
+    fn state_combinator_aggregates_use_binary_output_and_intermediate() {
+        for name in [
+            "count_state",
+            "count_state_signed",
+            "sum_state",
+            "sum_state_signed",
+            "avg_state",
+            "avg_state_signed",
+            "min_state",
+            "min_state_signed",
+            "max_state",
+            "max_state_signed",
+            "bool_or_state",
+            "bool_or_state_signed",
+            "bool_and_state",
+            "bool_and_state_signed",
+            "count_distinct_state",
+            "count_distinct_state_signed",
+            "approx_count_distinct_state",
+            "approx_count_distinct_state_signed",
+        ] {
+            let (output, intermediate) =
+                infer_agg_function_types(name, &[DataType::Int64, DataType::Int8], false)
+                    .unwrap_or_else(|err| panic!("{name}: {err}"));
+            assert_eq!(output, DataType::Binary, "{name}");
+            assert_eq!(intermediate, Some(DataType::Binary), "{name}");
+        }
     }
 
     #[test]

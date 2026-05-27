@@ -369,5 +369,10 @@ fn encode_scalar(out: &mut Vec<u8>, value: &AggScalarValue) {
             out.extend_from_slice(&(text.len() as u32).to_le_bytes());
             out.extend_from_slice(text.as_bytes());
         }
+        AggScalarValue::Binary(v) => {
+            out.push(12);
+            out.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            out.extend_from_slice(v);
+        }
     }
 }

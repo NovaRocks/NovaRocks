@@ -1354,8 +1354,6 @@ fn is_aggregate_function(name: &str) -> bool {
             | "array_unique_agg"
             | "sum_map"
             | "map_agg"
-            | "map_value_count"
-            | "map_value_count_signed"
             | "percentile_approx"
             | "percentile_approx_weighted"
             | "percentile_cont"
@@ -1444,18 +1442,7 @@ fn aggregate_expr_error(_err: String) -> String {
     "incremental aggregate MV query contains an unsupported expression".to_string()
 }
 
-/// Rewrite a MV SELECT SQL so that AVG aggregates are replaced by their SUM and COUNT
-/// sub-states, producing a SELECT whose output columns map directly to the layout's state
-/// columns rather than the user-visible aggregate results.
-///
-/// For each `AVG(expr) AS alias` projection item:
-/// - Replace with `SUM(expr) AS __agg_state_<sanitized(alias)>__sum`
-/// - Followed by  `COUNT(expr) AS __agg_state_<sanitized(alias)>__count`
-///
-/// COUNT, SUM, MIN, MAX projections are passed through unchanged (their visible == state).
-/// If the MV does not expose a `COUNT(*)` aggregate, append a hidden `COUNT(*)`
-/// state column so incremental deletes can tell when a group has no remaining rows.
-/// Group keys and WHERE/HAVING clauses are unchanged.
+/// Rewrite a MV SELECT SQL into state-shaped output columns.
 ///
 /// The returned SQL string can be fed directly to the executor to produce a state-shaped
 /// Arrow batch that `materialize_aggregate_result_chunks` can consume.
@@ -1464,28 +1451,6 @@ pub(crate) fn rewrite_select_sql_for_state(
     shape: &AggregateMvShape,
 ) -> Result<String, String> {
     use sqlparser::ast::{SelectItem, SetExpr, Statement};
-
-    let has_avg = shape
-        .aggregates
-        .iter()
-        .any(|agg| agg.function == AggregateFunctionKind::Avg);
-    // IVM-BoolAgg (2026-05-23): BOOL_OR / BOOL_AND join MIN/MAX in the
-    // detail-state rewriter family — same `Map<K, Int64>` state shape,
-    // same `map_value_count(arg)` projection on the insert path.
-    let has_detail_state = shape.aggregates.iter().any(|agg| {
-        matches!(
-            agg.function,
-            AggregateFunctionKind::Min
-                | AggregateFunctionKind::Max
-                | AggregateFunctionKind::BoolOr
-                | AggregateFunctionKind::BoolAnd
-        )
-    });
-    let needs_retraction_count =
-        crate::connector::starrocks::managed::mv_agg_state::aggregate_shape_needs_retraction_count_state(shape);
-    if !has_avg && !has_detail_state && !needs_retraction_count {
-        return Ok(select_sql.to_string());
-    }
 
     let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(select_sql)
         .map_err(|e| format!("rewrite_select_sql_for_state normalize error: {e}"))?;
@@ -1500,56 +1465,32 @@ pub(crate) fn rewrite_select_sql_for_state(
         return Err("rewrite_select_sql_for_state: expected SELECT body".to_string());
     };
 
-    let mut new_projection: Vec<SelectItem> = Vec::with_capacity(select.projection.len() + 4);
-    for item in std::mem::take(&mut select.projection) {
-        if let Some((arg_expr, alias)) = extract_avg_expr_and_alias(&item) {
-            // AVG -> SUM + COUNT pair (existing behavior).
-            let sanitized =
-                crate::connector::starrocks::managed::mv_agg_state::sanitize_state_column_name(
-                    &alias,
-                );
-            let sum_alias = format!("__agg_state_{sanitized}__sum");
-            let count_alias = format!("__agg_state_{sanitized}__count");
-
-            new_projection.push(make_aggregate_select_item(
-                "SUM",
-                arg_expr.clone(),
-                &sum_alias,
-            ));
-            new_projection.push(make_aggregate_select_item("COUNT", arg_expr, &count_alias));
-        } else if let Some((arg_expr, alias)) = extract_detail_state_expr_and_alias(&item) {
-            // IVM-P5: MIN/MAX emits ONLY the detail-state projection
-            // `map_value_count(arg) AS __agg_state_<sanitized>`. The visible
-            // scalar value is NOT projected here; it is derived from the
-            // merged detail map at materialize time by
-            // `update_visible_values_from_state` in `mv_agg_state.rs`. This
-            // matches the signed-delta-path rewriter in
-            // `ivm_delta_aggregate.rs`, keeping insert and signed-delta
-            // paths consistent. Emitting both visible + state would break
-            // the column-count contract in
-            // `materialize_aggregate_result_batch`, which allocates one
-            // batch column per MIN/MAX-Single aggregate (same as
-            // COUNT/SUM, not AVG).
-            //
-            // IVM-BoolAgg (2026-05-23): BOOL_OR / BOOL_AND share the same
-            // detail-state contract; the unified extractor
-            // `extract_detail_state_expr_and_alias` recognizes all four
-            // function names.
-            let sanitized =
-                crate::connector::starrocks::managed::mv_agg_state::sanitize_state_column_name(
-                    &alias,
-                );
-            let state_alias = format!("__agg_state_{sanitized}");
-            new_projection.push(make_aggregate_select_item(
-                "map_value_count",
-                arg_expr,
-                &state_alias,
-            ));
-        } else {
-            new_projection.push(item);
+    let mut new_projection: Vec<SelectItem> =
+        Vec::with_capacity(shape.visible_outputs.len() + shape.aggregates.len() + 1);
+    for output in &shape.visible_outputs {
+        match output {
+            VisibleAggregateOutput::GroupKey(group_key_index) => {
+                let group_key = shape.group_keys.get(*group_key_index).ok_or_else(|| {
+                    format!(
+                        "rewrite_select_sql_for_state: group key index {group_key_index} out of range"
+                    )
+                })?;
+                new_projection.push(SelectItem::ExprWithAlias {
+                    expr: group_key.expr.clone(),
+                    alias: select_alias_ident(&group_key.output_name),
+                });
+            }
+            VisibleAggregateOutput::Aggregate(aggregate_index) => {
+                let aggregate = shape.aggregates.get(*aggregate_index).ok_or_else(|| {
+                    format!(
+                        "rewrite_select_sql_for_state: aggregate index {aggregate_index} out of range"
+                    )
+                })?;
+                new_projection.push(make_state_combinator_select_item(aggregate, false)?);
+            }
         }
     }
-    if needs_retraction_count {
+    if crate::connector::starrocks::managed::mv_agg_state::aggregate_shape_needs_retraction_count_state(shape) {
         new_projection.push(make_count_star_select_item(
             crate::connector::starrocks::managed::mv_agg_state::AGG_RETRACTION_COUNT_STATE_COLUMN,
         ));
@@ -1559,99 +1500,95 @@ pub(crate) fn rewrite_select_sql_for_state(
     Ok(stmt.to_string())
 }
 
-/// Returns `(arg_expr, alias)` if the select item is
-/// `MIN(expr) AS alias` / `MAX(expr) AS alias` (or without alias).
-/// Returns `None` for all other items.
-/// Recognize SELECT items whose aggregate uses the detail-state
-/// (`Map<K, Int64>`) state shape and the `map_value_count` /
-/// `map_value_count_signed` rewriter family. The current member set is
-/// `{ MIN, MAX, BOOL_OR, BOOL_AND }` (with their `*_agg` aliases). Returns
-/// `(arg_expr, alias)` on match, `None` otherwise.
-fn extract_detail_state_expr_and_alias(
-    item: &sqlparser::ast::SelectItem,
-) -> Option<(sqlparser::ast::Expr, String)> {
-    use sqlparser::ast::{Expr, SelectItem};
-
-    let (expr, alias) = match item {
-        SelectItem::ExprWithAlias { expr, alias } => (expr, alias.value.clone()),
-        SelectItem::UnnamedExpr(expr) => (expr, expr.to_string()),
-        _ => return None,
-    };
-
-    let Expr::Function(func) = expr else {
-        return None;
-    };
-
-    let name = func.name.to_string().to_ascii_lowercase();
-    if !matches!(
-        name.as_str(),
-        "min" | "max" | "bool_or" | "boolor_agg" | "bool_and" | "booland_agg"
-    ) {
-        return None;
-    }
-    if func.uses_odbc_syntax
-        || func.null_treatment.is_some()
-        || func.over.is_some()
-        || func.filter.is_some()
-        || !func.within_group.is_empty()
-        || !matches!(func.parameters, sqlparser::ast::FunctionArguments::None)
-    {
-        return None;
-    }
-
-    let arg_expr = extract_single_expr_arg(func)?;
-    Some((arg_expr, alias))
+fn make_state_combinator_select_item(
+    aggregate: &AggregateCallShape,
+    signed: bool,
+) -> Result<sqlparser::ast::SelectItem, String> {
+    Ok(make_aggregate_select_item(
+        state_combinator_name_for_kind(aggregate.function, signed),
+        state_combinator_input_expr(aggregate)?,
+        &aggregate_state_alias(&aggregate.output_name),
+    ))
 }
 
-/// Returns `(arg_expr, alias)` if the select item is `AVG(expr) AS alias` or `AVG(expr)`.
-/// Returns `None` for all other items.
-fn extract_avg_expr_and_alias(
-    item: &sqlparser::ast::SelectItem,
-) -> Option<(sqlparser::ast::Expr, String)> {
-    use sqlparser::ast::{Expr, SelectItem};
-
-    let (expr, alias) = match item {
-        SelectItem::ExprWithAlias { expr, alias } => (expr, alias.value.clone()),
-        SelectItem::UnnamedExpr(expr) => (expr, expr.to_string()),
-        _ => return None,
-    };
-
-    let Expr::Function(func) = expr else {
-        return None;
-    };
-
-    // Check that this is a plain `avg` call (no ODBC syntax, no window, etc.)
-    if !is_plain_avg_function(func) {
-        return None;
+fn state_combinator_input_expr(
+    aggregate: &AggregateCallShape,
+) -> Result<sqlparser::ast::Expr, String> {
+    match &aggregate.input {
+        AggregateInput::Star => {
+            if aggregate.function == AggregateFunctionKind::Count {
+                Ok(sqlparser::ast::Expr::Value(
+                    sqlparser::ast::Value::Number("1".to_string(), false).into(),
+                ))
+            } else {
+                Err(format!(
+                    "rewrite_select_sql_for_state: {} requires an expression input",
+                    aggregate_function_label(aggregate.function)
+                ))
+            }
+        }
+        AggregateInput::Expr(expr) => Ok(expr.as_ref().clone()),
     }
-
-    let arg_expr = extract_single_expr_arg(func)?;
-    Some((arg_expr, alias))
 }
 
-fn is_plain_avg_function(func: &sqlparser::ast::Function) -> bool {
-    let name = func.name.to_string().to_ascii_lowercase();
-    name == "avg"
-        && !func.uses_odbc_syntax
-        && func.null_treatment.is_none()
-        && func.over.is_none()
-        && func.filter.is_none()
-        && func.within_group.is_empty()
-        && matches!(func.parameters, sqlparser::ast::FunctionArguments::None)
+fn aggregate_state_alias(output_name: &str) -> String {
+    let sanitized =
+        crate::connector::starrocks::managed::mv_agg_state::sanitize_state_column_name(output_name);
+    format!("__agg_state_{sanitized}")
 }
 
-fn extract_single_expr_arg(func: &sqlparser::ast::Function) -> Option<sqlparser::ast::Expr> {
-    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
-    let FunctionArguments::List(list) = &func.args else {
-        return None;
-    };
-    let [arg] = list.args.as_slice() else {
-        return None;
-    };
-    match arg {
-        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => Some(expr.clone()),
-        _ => None,
+fn aggregate_function_label(kind: AggregateFunctionKind) -> &'static str {
+    match kind {
+        AggregateFunctionKind::Count => "COUNT",
+        AggregateFunctionKind::Sum => "SUM",
+        AggregateFunctionKind::Avg => "AVG",
+        AggregateFunctionKind::Min => "MIN",
+        AggregateFunctionKind::Max => "MAX",
+        AggregateFunctionKind::BoolOr => "BOOL_OR",
+        AggregateFunctionKind::BoolAnd => "BOOL_AND",
+        AggregateFunctionKind::CountDistinct => "COUNT_DISTINCT",
+        AggregateFunctionKind::ApproxCountDistinct => "APPROX_COUNT_DISTINCT",
     }
+}
+
+fn state_combinator_name_for_kind(kind: AggregateFunctionKind, signed: bool) -> &'static str {
+    match (kind, signed) {
+        (AggregateFunctionKind::Count, false) => "count_state",
+        (AggregateFunctionKind::Count, true) => "count_state_signed",
+        (AggregateFunctionKind::Sum, false) => "sum_state",
+        (AggregateFunctionKind::Sum, true) => "sum_state_signed",
+        (AggregateFunctionKind::Avg, false) => "avg_state",
+        (AggregateFunctionKind::Avg, true) => "avg_state_signed",
+        (AggregateFunctionKind::Min, false) => "min_state",
+        (AggregateFunctionKind::Min, true) => "min_state_signed",
+        (AggregateFunctionKind::Max, false) => "max_state",
+        (AggregateFunctionKind::Max, true) => "max_state_signed",
+        (AggregateFunctionKind::BoolOr, false) => "bool_or_state",
+        (AggregateFunctionKind::BoolOr, true) => "bool_or_state_signed",
+        (AggregateFunctionKind::BoolAnd, false) => "bool_and_state",
+        (AggregateFunctionKind::BoolAnd, true) => "bool_and_state_signed",
+        (AggregateFunctionKind::CountDistinct, false) => "count_distinct_state",
+        (AggregateFunctionKind::CountDistinct, true) => "count_distinct_state_signed",
+        (AggregateFunctionKind::ApproxCountDistinct, false) => "approx_count_distinct_state",
+        (AggregateFunctionKind::ApproxCountDistinct, true) => "approx_count_distinct_state_signed",
+    }
+}
+
+fn select_alias_ident(alias: &str) -> sqlparser::ast::Ident {
+    if is_plain_identifier(alias) {
+        sqlparser::ast::Ident::new(alias)
+    } else {
+        sqlparser::ast::Ident::with_quote('`', alias)
+    }
+}
+
+fn is_plain_identifier(alias: &str) -> bool {
+    let mut chars = alias.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 fn make_aggregate_select_item(
@@ -2331,43 +2268,44 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_select_sql_avg_to_sum_count() {
+    fn rewrite_select_sql_avg_to_avg_state() {
         let original = "SELECT k1, COUNT(*) AS c, AVG(v2) AS a FROM ice.ns.orders GROUP BY k1";
         let shape = as_aggregate_shape(classify_sql(original).expect("classify"));
         let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
-        // Must contain SUM and COUNT for the AVG column; exact spacing is flexible.
+        let upper = rewritten.to_uppercase();
+
         assert!(
-            rewritten.to_uppercase().contains("SUM(V2)"),
+            upper.contains("COUNT_STATE(1) AS __AGG_STATE_C"),
             "got: {rewritten}"
         );
         assert!(
-            rewritten.to_uppercase().contains("COUNT(V2)"),
+            upper.contains("AVG_STATE(V2) AS __AGG_STATE_A"),
             "got: {rewritten}"
         );
-        // Original AVG must be gone.
         assert!(
-            !rewritten.to_uppercase().contains("AVG(V2)"),
-            "got: {rewritten}"
-        );
-        // COUNT(*) for the original COUNT aggregate should be preserved.
-        assert!(
-            rewritten.to_uppercase().contains("COUNT(*)"),
-            "got: {rewritten}"
-        );
-        // State aliases should be present.
-        assert!(rewritten.contains("__agg_state_a__sum"), "got: {rewritten}");
-        assert!(
-            rewritten.contains("__agg_state_a__count"),
+            !upper.contains("AVG(V2)") && !upper.contains("COUNT(*) AS C"),
             "got: {rewritten}"
         );
     }
 
     #[test]
-    fn rewrite_select_sql_count_sum_keeps_original_state_shape() {
+    fn rewrite_select_sql_count_sum_emits_per_kind_state() {
         let original = "SELECT k1, COUNT(*) AS c, SUM(v2) AS s FROM ice.ns.orders GROUP BY k1";
         let shape = as_aggregate_shape(classify_sql(original).expect("classify"));
         let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
-        assert_eq!(rewritten, original, "COUNT already carries row cardinality");
+        let upper = rewritten.to_uppercase();
+        assert!(
+            upper.contains("COUNT_STATE(1) AS __AGG_STATE_C"),
+            "got: {rewritten}"
+        );
+        assert!(
+            upper.contains("SUM_STATE(V2) AS __AGG_STATE_S"),
+            "got: {rewritten}"
+        );
+        assert!(
+            !upper.contains("__AGG_STATE___IVM_ROW_COUNT"),
+            "COUNT(*) aggregate already provides row count state; got: {rewritten}"
+        );
     }
 
     #[test]
@@ -2381,7 +2319,7 @@ mod tests {
             "got: {rewritten}"
         );
         assert!(
-            upper.contains("SUM(V2) AS S") || upper.contains("SUM(v2) AS s"),
+            upper.contains("SUM_STATE(V2) AS __AGG_STATE_S"),
             "got: {rewritten}"
         );
     }
@@ -2391,23 +2329,17 @@ mod tests {
         let original = "SELECT k1, AVG(v2) AS a FROM ice.ns.orders GROUP BY k1";
         let shape = as_aggregate_shape(classify_sql(original).expect("classify"));
         let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
+        let upper = rewritten.to_uppercase();
         assert!(
-            rewritten.to_uppercase().contains("SUM(V2)"),
+            upper.contains("AVG_STATE(V2) AS __AGG_STATE_A"),
             "got: {rewritten}"
         );
         assert!(
-            rewritten.to_uppercase().contains("COUNT(V2)"),
+            upper.contains("COUNT(*) AS __AGG_STATE___IVM_ROW_COUNT"),
             "got: {rewritten}"
         );
-        assert!(
-            !rewritten.to_uppercase().contains("AVG"),
-            "got: {rewritten}"
-        );
-        // Rewritten SQL must re-parse as a valid aggregate query.
-        let re_shape = classify_sql(&rewritten).expect("re-classify rewritten");
-        let IncrementalMvShape::Aggregate(_) = re_shape else {
-            panic!("rewritten SQL should be aggregate shape");
-        };
+        assert!(!upper.contains("AVG(V2)"), "got: {rewritten}");
+        parse_query(&rewritten);
     }
 
     #[test]
@@ -2415,19 +2347,16 @@ mod tests {
         let original = "SELECT k1, AVG(v2) AS a1, AVG(v3) AS a2 FROM ice.ns.orders GROUP BY k1";
         let shape = as_aggregate_shape(classify_sql(original).expect("classify"));
         let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
-        // Both AVGs replaced.
+        let upper = rewritten.to_uppercase();
         assert!(
-            !rewritten.to_uppercase().contains("AVG"),
+            upper.contains("AVG_STATE(V2) AS __AGG_STATE_A1"),
             "got: {rewritten}"
         );
         assert!(
-            rewritten.contains("__agg_state_a1__sum"),
+            upper.contains("AVG_STATE(V3) AS __AGG_STATE_A2"),
             "got: {rewritten}"
         );
-        assert!(
-            rewritten.contains("__agg_state_a2__sum"),
-            "got: {rewritten}"
-        );
+        assert!(!upper.contains("AVG(V2)") && !upper.contains("AVG(V3)"));
     }
 
     #[test]
@@ -2439,19 +2368,11 @@ mod tests {
         };
         let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
         let upper = rewritten.to_uppercase();
-        assert!(upper.contains("SUM(V2)"), "got: {rewritten}");
-        assert!(upper.contains("COUNT(V2)"), "got: {rewritten}");
+        assert!(upper.contains("AVG_STATE(V2)"), "got: {rewritten}");
         assert!(!upper.contains("AVG(V2)"), "got: {rewritten}");
-        // For an unaliased AVG(v2), the alias is derived from expr.to_string() which
-        // sqlparser renders as "AVG(v2)". After sanitize_state_column_name that becomes
-        // "avg_v2_" (parentheses are replaced with underscores, letters lowercased).
         assert!(
-            rewritten.contains("__agg_state_avg_v2___sum"),
-            "state sum alias not found; got: {rewritten}"
-        );
-        assert!(
-            rewritten.contains("__agg_state_avg_v2___count"),
-            "state count alias not found; got: {rewritten}"
+            rewritten.contains("__agg_state_avg_v2_"),
+            "state alias not found; got: {rewritten}"
         );
     }
 
@@ -2464,23 +2385,15 @@ mod tests {
         };
         let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
         let upper = rewritten.to_uppercase();
-        // The complex argument must be preserved inside both SUM and COUNT.
         assert!(
-            upper.contains("SUM(V2 + 1)") || upper.contains("SUM(V2+1)"),
-            "got: {rewritten}"
-        );
-        assert!(
-            upper.contains("COUNT(V2 + 1)") || upper.contains("COUNT(V2+1)"),
+            upper.contains("AVG_STATE(V2 + 1)") || upper.contains("AVG_STATE(V2+1)"),
             "got: {rewritten}"
         );
         assert!(!upper.contains("AVG(V2 + 1)"), "got: {rewritten}");
     }
 
     #[test]
-    fn rewrite_select_sql_for_state_emits_map_value_count_for_bool_or() {
-        // IVM-BoolAgg (2026-05-23): BOOL_OR / BOOL_AND share the detail-state
-        // family with MIN/MAX — the rewriter must replace the visible
-        // BOOL_OR(flag) with map_value_count(flag) projection (state-only).
+    fn rewrite_select_sql_for_state_emits_bool_or_state() {
         let original = "SELECT region, BOOL_OR(flag) AS any_true, COUNT(*) AS c FROM ice.ns.events GROUP BY region";
         let shape = as_aggregate_shape(classify_sql(original).expect("classify"));
         let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
@@ -2490,17 +2403,44 @@ mod tests {
             "BOOL_OR(flag) visible projection must be absent; got: {rewritten}"
         );
         assert!(
-            upper.contains("MAP_VALUE_COUNT(FLAG)"),
-            "must emit map_value_count(flag); got: {rewritten}"
+            upper.contains("BOOL_OR_STATE(FLAG) AS __AGG_STATE_ANY_TRUE"),
+            "must emit bool_or_state(flag); got: {rewritten}"
         );
         assert!(
-            rewritten.contains("__agg_state_any_true"),
-            "missing __agg_state_any_true alias; got: {rewritten}"
+            upper.contains("COUNT_STATE(1) AS __AGG_STATE_C"),
+            "must emit count_state(1); got: {rewritten}"
         );
     }
 
     #[test]
-    fn rewrite_select_sql_for_state_emits_map_value_count_for_bool_and() {
+    fn rewrite_select_sql_for_state_emits_per_kind_state_combinators() {
+        let original = "SELECT region, COUNT(DISTINCT user_id) AS u, \
+                        APPROX_COUNT_DISTINCT(session_id) AS s, BOOL_OR(flag) AS f \
+                        FROM ice.ns.events GROUP BY region";
+        let shape = as_aggregate_shape(classify_sql(original).expect("classify"));
+        let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
+        let upper = rewritten.to_uppercase();
+
+        assert!(
+            upper.contains("COUNT_DISTINCT_STATE(USER_ID) AS __AGG_STATE_U"),
+            "got: {rewritten}"
+        );
+        assert!(
+            upper.contains("APPROX_COUNT_DISTINCT_STATE(SESSION_ID) AS __AGG_STATE_S"),
+            "got: {rewritten}"
+        );
+        assert!(
+            upper.contains("BOOL_OR_STATE(FLAG) AS __AGG_STATE_F"),
+            "got: {rewritten}"
+        );
+        assert!(
+            !upper.contains("MAP_VALUE_COUNT"),
+            "legacy combinator must be replaced; got: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn rewrite_select_sql_for_state_emits_bool_and_state() {
         let original =
             "SELECT region, BOOL_AND(flag) AS all_true FROM ice.ns.events GROUP BY region";
         let shape = as_aggregate_shape(classify_sql(original).expect("classify"));
@@ -2511,61 +2451,43 @@ mod tests {
             "BOOL_AND(flag) visible projection must be absent; got: {rewritten}"
         );
         assert!(
-            upper.contains("MAP_VALUE_COUNT(FLAG)"),
-            "must emit map_value_count(flag); got: {rewritten}"
+            upper.contains("BOOL_AND_STATE(FLAG) AS __AGG_STATE_ALL_TRUE"),
+            "must emit bool_and_state(flag); got: {rewritten}"
         );
     }
 
     #[test]
-    fn rewrite_select_sql_for_state_emits_map_value_count_for_min() {
+    fn rewrite_select_sql_for_state_emits_min_state() {
         let original = "SELECT region, MIN(amount), COUNT(*) FROM ice.ns.tab GROUP BY region";
         let shape = as_aggregate_shape(classify_sql(original).expect("classify"));
         let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
         let upper = rewritten.to_uppercase();
 
-        // IVM-P5: visible MIN(amount) projection is NOT emitted; only the
-        // map_value_count state projection appears. The visible scalar is
-        // derived from the merged detail map by
-        // `update_visible_values_from_state` at materialize time.
         assert!(
             !upper.contains("MIN(AMOUNT)"),
             "visible MIN(amount) projection must be absent; got: {rewritten}"
         );
-        // State projection: map_value_count(amount) AS __agg_state_<sanitized>.
-        // Without an alias, the visible output_name for MIN(amount) is the
-        // expression text "MIN(amount)"; sanitize_state_column_name lowercases
-        // and replaces non-identifier chars with '_'.
         assert!(
-            upper.contains("MAP_VALUE_COUNT(AMOUNT)"),
+            upper.contains("MIN_STATE(AMOUNT) AS __AGG_STATE_MIN_AMOUNT_"),
             "got: {rewritten}"
         );
-        assert!(
-            rewritten.contains("__agg_state_min_amount_"),
-            "missing min state alias; got: {rewritten}"
-        );
-        // COUNT(*) is preserved (no rewrite needed; count_star itself doubles
-        // as visible + state).
-        assert!(upper.contains("COUNT(*)"), "got: {rewritten}");
+        assert!(upper.contains("COUNT_STATE(1)"), "got: {rewritten}");
     }
 
     #[test]
-    fn rewrite_select_sql_for_state_emits_map_value_count_for_max() {
+    fn rewrite_select_sql_for_state_emits_max_state() {
         let original = "SELECT region, MAX(name) FROM ice.ns.tab GROUP BY region";
         let shape = as_aggregate_shape(classify_sql(original).expect("classify"));
         let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
         let upper = rewritten.to_uppercase();
 
-        // IVM-P5: visible MAX(name) projection is NOT emitted; only the
-        // map_value_count state projection appears.
         assert!(
             !upper.contains("MAX(NAME)"),
             "visible MAX(name) projection must be absent; got: {rewritten}"
         );
-        // State projection: map_value_count(name).
-        assert!(upper.contains("MAP_VALUE_COUNT(NAME)"), "got: {rewritten}");
         assert!(
-            rewritten.contains("__agg_state_max_name_"),
-            "missing max state alias; got: {rewritten}"
+            upper.contains("MAX_STATE(NAME) AS __AGG_STATE_MAX_NAME_"),
+            "got: {rewritten}"
         );
     }
 
@@ -2576,20 +2498,13 @@ mod tests {
         let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
         let upper = rewritten.to_uppercase();
 
-        // IVM-P5: visible MIN(amount) AS mn projection is NOT emitted; the
-        // alias is now consumed by the state projection's __agg_state_mn
-        // suffix.
         assert!(
             !upper.contains("MIN(AMOUNT)"),
             "visible MIN(amount) projection must be absent; got: {rewritten}"
         );
         assert!(
-            upper.contains("MAP_VALUE_COUNT(AMOUNT)"),
+            upper.contains("MIN_STATE(AMOUNT) AS __AGG_STATE_MN"),
             "got: {rewritten}"
-        );
-        assert!(
-            rewritten.contains("__agg_state_mn"),
-            "missing mn state alias; got: {rewritten}"
         );
     }
 
@@ -2601,49 +2516,34 @@ mod tests {
         let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
         let upper = rewritten.to_uppercase();
 
-        // MIN/MAX: ONLY the map_value_count state projection appears; the
-        // visible scalar is NOT projected. This matches the signed-delta
-        // rewriter and is required to keep the column count in lockstep
-        // with `compute_batch_col_indexes`, which allocates one batch
-        // column per MIN/MAX-Single aggregate.
         assert!(
             !upper.contains("MIN(V2)"),
             "visible MIN(v2) must be absent; got: {rewritten}"
         );
-        assert!(upper.contains("MAP_VALUE_COUNT(V2)"), "got: {rewritten}");
         assert!(
-            rewritten.contains("__agg_state_mn"),
-            "missing mn state alias; got: {rewritten}"
+            upper.contains("MIN_STATE(V2) AS __AGG_STATE_MN"),
+            "got: {rewritten}"
         );
         assert!(
             !upper.contains("MAX(V3)"),
             "visible MAX(v3) must be absent; got: {rewritten}"
         );
-        assert!(upper.contains("MAP_VALUE_COUNT(V3)"), "got: {rewritten}");
         assert!(
-            rewritten.contains("__agg_state_mx"),
-            "missing mx state alias; got: {rewritten}"
+            upper.contains("MAX_STATE(V3) AS __AGG_STATE_MX"),
+            "got: {rewritten}"
         );
-
-        // SUM(v4): unchanged single projection (still visible+state via scalar).
-        assert!(upper.contains("SUM(V4) AS S"), "got: {rewritten}");
         assert!(
-            !rewritten.contains("__agg_state_s"),
-            "SUM should not get an extra state projection; got: {rewritten}"
+            upper.contains("SUM_STATE(V4) AS __AGG_STATE_S"),
+            "got: {rewritten}"
         );
-
-        // COUNT(*): unchanged single projection.
-        assert!(upper.contains("COUNT(*) AS C"), "got: {rewritten}");
-
-        // AVG(v5): expanded to SUM + COUNT pair (existing behavior).
+        assert!(
+            upper.contains("COUNT_STATE(1) AS __AGG_STATE_C"),
+            "got: {rewritten}"
+        );
         assert!(!upper.contains("AVG(V5)"), "got: {rewritten}");
         assert!(
-            rewritten.contains("__agg_state_a__sum"),
-            "missing avg sum state; got: {rewritten}"
-        );
-        assert!(
-            rewritten.contains("__agg_state_a__count"),
-            "missing avg count state; got: {rewritten}"
+            upper.contains("AVG_STATE(V5) AS __AGG_STATE_A"),
+            "got: {rewritten}"
         );
     }
 }

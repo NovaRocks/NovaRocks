@@ -776,8 +776,7 @@ mod tests {
         use std::sync::Arc;
 
         // Build a runtime MapArray with NO PARQUET:field_id metadata on its
-        // inner key / value fields, mirroring what the aggregate's
-        // map_value_count produces.
+        // inner key / value fields, mirroring execution-produced map arrays.
         let runtime_key_field = Arc::new(Field::new("key", DataType::Int64, false));
         let runtime_value_field = Arc::new(Field::new("value", DataType::Int64, true));
         let runtime_entries_struct_fields: Fields =

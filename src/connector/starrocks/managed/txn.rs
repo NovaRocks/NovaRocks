@@ -1605,6 +1605,7 @@ mod mv_target_tests {
         StoredManagedDatabase, StoredManagedIndex, StoredManagedPartition, StoredManagedSchema,
         StoredManagedTable, StoredManagedTablet, StoredMaterializedView,
     };
+    use crate::connector::starrocks::managed::state_codec::{encode_count_state, encode_sum_int64};
     use crate::connector::starrocks::managed::{
         ManagedLakeCatalog, ManagedLakeConfig, register_managed_tables_in_catalog,
     };
@@ -1621,7 +1622,7 @@ mod mv_target_tests {
     };
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
     use crate::service::grpc_client::proto::starrocks::{ColumnPb, KeysType, TabletSchemaPb};
-    use arrow::array::{Array, Int32Array, Int64Array, StringArray};
+    use arrow::array::{Array, BinaryBuilder, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use prost::Message;
     use std::net::ToSocketAddrs;
@@ -2644,7 +2645,7 @@ mod mv_target_tests {
                 ColumnPb {
                     unique_id: 5,
                     name: Some("__agg_state_c".to_string()),
-                    r#type: "BIGINT".to_string(),
+                    r#type: "VARBINARY".to_string(),
                     is_nullable: Some(false),
                     is_key: Some(false),
                     visible: Some(false),
@@ -2653,8 +2654,8 @@ mod mv_target_tests {
                 ColumnPb {
                     unique_id: 6,
                     name: Some("__agg_state_s".to_string()),
-                    r#type: "BIGINT".to_string(),
-                    is_nullable: Some(true),
+                    r#type: "VARBINARY".to_string(),
+                    is_nullable: Some(false),
                     is_key: Some(false),
                     visible: Some(false),
                     ..Default::default()
@@ -2704,22 +2705,29 @@ mod mv_target_tests {
             &output_columns,
         )
         .expect("layout");
+        let mut count_state_builder = BinaryBuilder::new();
+        let mut sum_state_builder = BinaryBuilder::new();
+        for (&count, &sum) in c.iter().zip(s.iter()) {
+            count_state_builder.append_value(encode_count_state(count));
+            sum_state_builder.append_value(encode_sum_int64(count, sum));
+        }
+
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("k1", DataType::Int64, false),
-                Field::new("c", DataType::Int64, false),
-                Field::new("s", DataType::Int64, true),
+                Field::new("__agg_state_c", DataType::Binary, false),
+                Field::new("__agg_state_s", DataType::Binary, false),
             ])),
             vec![
                 Arc::new(Int64Array::from(k1.to_vec())),
-                Arc::new(Int64Array::from(c.to_vec())),
-                Arc::new(Int64Array::from(s.to_vec())),
+                Arc::new(count_state_builder.finish()),
+                Arc::new(sum_state_builder.finish()),
             ],
         )
-        .expect("visible batch");
+        .expect("state-shaped batch");
         let result = QueryResult {
             columns: Vec::new(),
-            chunks: vec![record_batch_to_chunk(batch).expect("visible chunk")],
+            chunks: vec![record_batch_to_chunk(batch).expect("state-shaped chunk")],
         };
         let chunks =
             crate::connector::starrocks::managed::mv_agg_state::materialize_aggregate_result_chunks(

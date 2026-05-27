@@ -7,10 +7,9 @@ use crate::connector::starrocks::managed::mv_shape::{
     VisibleAggregateOutput,
 };
 use crate::exec::change_op::CHANGE_OP_COLUMN;
-use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
-    BinaryOperator, CaseWhen, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList,
-    FunctionArguments, Ident, ObjectName, ObjectNamePart, SelectItem, SetExpr, Statement, Value,
+    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident,
+    ObjectName, ObjectNamePart, SelectItem, SetExpr, Statement, Value,
 };
 
 pub(crate) fn rewrite_select_sql_for_signed_delta_state(
@@ -109,123 +108,73 @@ fn push_signed_aggregate_state_projection(
     aggregate: &AggregateCallShape,
     change_op: &ChangeOpExpr,
 ) -> Result<(), String> {
-    match aggregate.function {
-        AggregateFunctionKind::Count => match &aggregate.input {
-            AggregateInput::Star => projection.push(make_aggregate_select_item(
-                "SUM",
-                change_op.expr(),
-                &aggregate.output_name,
-            )),
-            AggregateInput::Expr(expr) => projection.push(make_aggregate_select_item(
-                "SUM",
-                count_expr_signed_delta_arg(expr.as_ref().clone(), change_op),
-                &aggregate.output_name,
-            )),
-        },
-        AggregateFunctionKind::Sum => {
-            let AggregateInput::Expr(expr) = &aggregate.input else {
-                return Err(
-                    "rewrite_select_sql_for_signed_delta_state: SUM requires an expression input"
-                        .to_string(),
-                );
-            };
-            projection.push(make_aggregate_select_item(
-                "SUM",
-                signed_value_expr(expr.as_ref().clone(), change_op),
-                &aggregate.output_name,
-            ));
-        }
-        AggregateFunctionKind::Avg => {
-            let AggregateInput::Expr(expr) = &aggregate.input else {
-                return Err(
-                    "rewrite_select_sql_for_signed_delta_state: AVG requires an expression input"
-                        .to_string(),
-                );
-            };
-            let sanitized = sanitize_state_column_name(&aggregate.output_name);
-            let sum_alias = format!("__agg_state_{sanitized}__sum");
-            let count_alias = format!("__agg_state_{sanitized}__count");
-            projection.push(make_aggregate_select_item(
-                "SUM",
-                signed_value_expr(expr.as_ref().clone(), change_op),
-                &sum_alias,
-            ));
-            projection.push(make_aggregate_select_item(
-                "SUM",
-                count_expr_signed_delta_arg(expr.as_ref().clone(), change_op),
-                &count_alias,
-            ));
-        }
-        AggregateFunctionKind::Min
-        | AggregateFunctionKind::Max
-        | AggregateFunctionKind::BoolOr
-        | AggregateFunctionKind::BoolAnd => {
-            // IVM-P5 (Phase 3): MIN/MAX delta state is a per-group
-            // `Map<value, Int64>` detail map. In the signed-delta path the
-            // map values are signed by `__change_op` (+1 for INSERT, -1 for
-            // DELETE), so we emit `map_value_count_signed(arg, change_op)`
-            // as the state-column projection. The visible MIN/MAX value is
-            // never sourced from the delta in this path — Phase 4 will
-            // re-derive it from the merged detail map at write time — so we
-            // do not emit a visible projection here. (Compare with COUNT/
-            // SUM, where the same expression doubles as both visible and
-            // state value.)
-            //
-            // IVM-BoolAgg (2026-05-23): BOOL_OR / BOOL_AND share the exact
-            // same `Map<Boolean, Int64>` detail-state contract; the only
-            // difference vs MIN/MAX is the visible-derivation logic in
-            // `update_visible_values_from_state` (Phase 4 hook).
-            let aggregate_label = match aggregate.function {
-                AggregateFunctionKind::Min | AggregateFunctionKind::Max => "MIN/MAX",
-                AggregateFunctionKind::BoolOr | AggregateFunctionKind::BoolAnd => {
-                    "BOOL_OR/BOOL_AND"
-                }
-                _ => unreachable!(),
-            };
-            let AggregateInput::Expr(expr) = &aggregate.input else {
-                return Err(format!(
-                    "rewrite_select_sql_for_signed_delta_state: {aggregate_label} requires an expression input"
-                ));
-            };
-            let sanitized = sanitize_state_column_name(&aggregate.output_name);
-            let state_alias = format!("__agg_state_{sanitized}");
-            projection.push(make_two_arg_aggregate_select_item(
-                "map_value_count_signed",
-                expr.as_ref().clone(),
-                change_op.expr(),
-                &state_alias,
-            ));
-        }
-        AggregateFunctionKind::CountDistinct => {
-            unimplemented!("CountDistinct: see Task 4.x")
-        }
-        AggregateFunctionKind::ApproxCountDistinct => {
-            unimplemented!("ApproxCountDistinct: see Task 5.x")
-        }
-    }
+    let func_name = combinator_name_for_kind(aggregate.function, true);
+    let state_alias = aggregate_state_alias(&aggregate.output_name);
+    let input = signed_state_input_expr(aggregate)?;
+    projection.push(make_two_arg_aggregate_select_item(
+        func_name,
+        input,
+        change_op.expr(),
+        &state_alias,
+    ));
     Ok(())
 }
 
-fn signed_value_expr(expr: Expr, change_op: &ChangeOpExpr) -> Expr {
-    Expr::BinaryOp {
-        left: Box::new(expr),
-        op: BinaryOperator::Multiply,
-        right: Box::new(change_op.expr()),
+fn signed_state_input_expr(aggregate: &AggregateCallShape) -> Result<Expr, String> {
+    match &aggregate.input {
+        AggregateInput::Star => {
+            if aggregate.function == AggregateFunctionKind::Count {
+                Ok(Expr::Value(Value::Number("1".to_string(), false).into()))
+            } else {
+                Err(format!(
+                    "rewrite_select_sql_for_signed_delta_state: {} requires an expression input",
+                    aggregate_function_label(aggregate.function)
+                ))
+            }
+        }
+        AggregateInput::Expr(expr) => Ok(expr.as_ref().clone()),
     }
 }
 
-fn count_expr_signed_delta_arg(expr: Expr, change_op: &ChangeOpExpr) -> Expr {
-    Expr::Case {
-        case_token: AttachedToken::empty(),
-        end_token: AttachedToken::empty(),
-        operand: None,
-        conditions: vec![CaseWhen {
-            condition: Expr::IsNotNull(Box::new(expr)),
-            result: change_op.expr(),
-        }],
-        else_result: Some(Box::new(Expr::Value(
-            Value::Number("0".to_string(), false).into(),
-        ))),
+fn aggregate_state_alias(output_name: &str) -> String {
+    let sanitized = sanitize_state_column_name(output_name);
+    format!("__agg_state_{sanitized}")
+}
+
+fn aggregate_function_label(kind: AggregateFunctionKind) -> &'static str {
+    match kind {
+        AggregateFunctionKind::Count => "COUNT",
+        AggregateFunctionKind::Sum => "SUM",
+        AggregateFunctionKind::Avg => "AVG",
+        AggregateFunctionKind::Min => "MIN",
+        AggregateFunctionKind::Max => "MAX",
+        AggregateFunctionKind::BoolOr => "BOOL_OR",
+        AggregateFunctionKind::BoolAnd => "BOOL_AND",
+        AggregateFunctionKind::CountDistinct => "COUNT_DISTINCT",
+        AggregateFunctionKind::ApproxCountDistinct => "APPROX_COUNT_DISTINCT",
+    }
+}
+
+fn combinator_name_for_kind(kind: AggregateFunctionKind, signed: bool) -> &'static str {
+    match (kind, signed) {
+        (AggregateFunctionKind::Count, false) => "count_state",
+        (AggregateFunctionKind::Count, true) => "count_state_signed",
+        (AggregateFunctionKind::Sum, false) => "sum_state",
+        (AggregateFunctionKind::Sum, true) => "sum_state_signed",
+        (AggregateFunctionKind::Avg, false) => "avg_state",
+        (AggregateFunctionKind::Avg, true) => "avg_state_signed",
+        (AggregateFunctionKind::Min, false) => "min_state",
+        (AggregateFunctionKind::Min, true) => "min_state_signed",
+        (AggregateFunctionKind::Max, false) => "max_state",
+        (AggregateFunctionKind::Max, true) => "max_state_signed",
+        (AggregateFunctionKind::BoolOr, false) => "bool_or_state",
+        (AggregateFunctionKind::BoolOr, true) => "bool_or_state_signed",
+        (AggregateFunctionKind::BoolAnd, false) => "bool_and_state",
+        (AggregateFunctionKind::BoolAnd, true) => "bool_and_state_signed",
+        (AggregateFunctionKind::CountDistinct, false) => "count_distinct_state",
+        (AggregateFunctionKind::CountDistinct, true) => "count_distinct_state_signed",
+        (AggregateFunctionKind::ApproxCountDistinct, false) => "approx_count_distinct_state",
+        (AggregateFunctionKind::ApproxCountDistinct, true) => "approx_count_distinct_state_signed",
     }
 }
 
@@ -351,12 +300,11 @@ mod tests {
         let upper = rewritten.to_uppercase();
 
         assert!(
-            upper.contains("SUM(F.__CHANGE_OP) AS C"),
+            upper.contains("COUNT_STATE_SIGNED(1, F.__CHANGE_OP) AS __AGG_STATE_C"),
             "got: {rewritten}"
         );
         assert!(
-            upper.contains("SUM(F.AMOUNT * F.__CHANGE_OP)")
-                || upper.contains("SUM((F.AMOUNT * F.__CHANGE_OP))"),
+            upper.contains("SUM_STATE_SIGNED(F.AMOUNT, F.__CHANGE_OP) AS __AGG_STATE_S"),
             "got: {rewritten}"
         );
     }
@@ -370,11 +318,14 @@ mod tests {
                 .expect("rewrite");
         let upper = rewritten.to_uppercase();
 
-        assert!(upper.contains("SUM(__CHANGE_OP) AS C"), "got: {rewritten}");
+        assert!(
+            upper.contains("COUNT_STATE_SIGNED(1, __CHANGE_OP) AS __AGG_STATE_C"),
+            "got: {rewritten}"
+        );
     }
 
     #[test]
-    fn signed_delta_rewrite_turns_sum_into_sum_times_change_op() {
+    fn signed_delta_rewrite_turns_sum_into_sum_state_signed() {
         let sql = "select k1, sum(v2) as s from ice.ns.orders group by k1";
         let shape = parse_aggregate_shape(sql);
         let rewritten =
@@ -383,10 +334,9 @@ mod tests {
 
         assert!(upper.contains("K1 AS K1"), "got: {rewritten}");
         assert!(
-            upper.contains("SUM(V2 * __CHANGE_OP)") || upper.contains("SUM((V2 * __CHANGE_OP))"),
+            upper.contains("SUM_STATE_SIGNED(V2, __CHANGE_OP) AS __AGG_STATE_S"),
             "got: {rewritten}"
         );
-        assert!(upper.contains("AS S"), "got: {rewritten}");
         assert!(
             upper.contains("SUM(__CHANGE_OP) AS __AGG_STATE___IVM_ROW_COUNT"),
             "got: {rewritten}"
@@ -394,20 +344,22 @@ mod tests {
     }
 
     #[test]
-    fn signed_delta_rewrite_turns_count_star_into_sum_change_op() {
+    fn signed_delta_rewrite_turns_count_star_into_count_state_signed() {
         let sql = "select k1, count(*) as c from ice.ns.orders group by k1";
         let shape = parse_aggregate_shape(sql);
         let rewritten =
             rewrite_select_sql_for_signed_delta_state(sql, &shape).expect("rewrite signed delta");
         let upper = rewritten.to_uppercase();
 
-        assert!(upper.contains("SUM(__CHANGE_OP)"), "got: {rewritten}");
-        assert!(upper.contains("AS C"), "got: {rewritten}");
+        assert!(
+            upper.contains("COUNT_STATE_SIGNED(1, __CHANGE_OP) AS __AGG_STATE_C"),
+            "got: {rewritten}"
+        );
         assert!(!upper.contains("COUNT(*)"), "got: {rewritten}");
     }
 
     #[test]
-    fn signed_delta_rewrite_expands_avg_to_signed_sum_and_count() {
+    fn signed_delta_rewrite_turns_avg_into_avg_state_signed() {
         let sql = "select k1, avg(v2) as a from ice.ns.orders group by k1";
         let shape = parse_aggregate_shape(sql);
         let rewritten =
@@ -415,45 +367,36 @@ mod tests {
         let upper = rewritten.to_uppercase();
 
         assert!(
-            upper.contains("SUM(V2 * __CHANGE_OP)") || upper.contains("SUM((V2 * __CHANGE_OP))"),
+            upper.contains("AVG_STATE_SIGNED(V2, __CHANGE_OP) AS __AGG_STATE_A"),
             "got: {rewritten}"
         );
         assert!(
-            upper.contains("CASE WHEN V2 IS NOT NULL THEN __CHANGE_OP ELSE 0 END"),
-            "got: {rewritten}"
-        );
-        assert!(rewritten.contains("__agg_state_a__sum"), "got: {rewritten}");
-        assert!(
-            rewritten.contains("__agg_state_a__count"),
+            upper.contains("SUM(__CHANGE_OP) AS __AGG_STATE___IVM_ROW_COUNT"),
             "got: {rewritten}"
         );
         assert!(!upper.contains("AVG(V2)"), "got: {rewritten}");
     }
 
     #[test]
-    fn signed_delta_rewrite_accepts_min_max_with_map_value_count_signed() {
+    fn signed_delta_rewrite_accepts_min_max_with_state_signed() {
         let sql = "select k1, min(v2) as mn, max(v2) as mx from ice.ns.orders group by k1";
         let shape = parse_aggregate_shape(sql);
         let rewritten =
             rewrite_select_sql_for_signed_delta_state(sql, &shape).expect("rewrite signed delta");
         let upper = rewritten.to_uppercase();
 
-        // MIN/MAX state columns become `map_value_count_signed(arg, __change_op)`.
         assert!(
-            upper.contains("MAP_VALUE_COUNT_SIGNED(V2, __CHANGE_OP)"),
+            upper.contains("MIN_STATE_SIGNED(V2, __CHANGE_OP) AS __AGG_STATE_MN"),
             "got: {rewritten}"
         );
-        // Two state projections, one per MIN/MAX, with sanitized aliases.
         assert!(
-            rewritten.contains("__agg_state_mn"),
-            "missing mn state alias; got: {rewritten}"
+            upper.contains("MAX_STATE_SIGNED(V2, __CHANGE_OP) AS __AGG_STATE_MX"),
+            "got: {rewritten}"
         );
         assert!(
-            rewritten.contains("__agg_state_mx"),
-            "missing mx state alias; got: {rewritten}"
+            !upper.contains("MAP_VALUE_COUNT_SIGNED"),
+            "legacy combinator must be replaced; got: {rewritten}"
         );
-        // Visible MIN/MAX scalars are NOT emitted by the signed-delta rewriter;
-        // Phase 4 will re-derive the visible value from the merged detail map.
         assert!(
             !upper.contains("MIN(V2)") && !upper.contains("MAX(V2)"),
             "signed-delta rewrite should not project visible MIN/MAX; got: {rewritten}"
@@ -466,6 +409,34 @@ mod tests {
     }
 
     #[test]
+    fn signed_delta_projection_emits_per_kind_combinator() {
+        let sql = "select region, count(distinct user_id) as u, \
+                   approx_count_distinct(session_id) as s, bool_or(flag) as f \
+                   from ice.ns.events group by region";
+        let shape = parse_aggregate_shape(sql);
+        let rewritten =
+            rewrite_select_sql_for_signed_delta_state(sql, &shape).expect("rewrite signed delta");
+        let upper = rewritten.to_uppercase();
+
+        assert!(
+            upper.contains("COUNT_DISTINCT_STATE_SIGNED(USER_ID, __CHANGE_OP)"),
+            "got: {rewritten}"
+        );
+        assert!(
+            upper.contains("APPROX_COUNT_DISTINCT_STATE_SIGNED(SESSION_ID, __CHANGE_OP)"),
+            "got: {rewritten}"
+        );
+        assert!(
+            upper.contains("BOOL_OR_STATE_SIGNED(FLAG, __CHANGE_OP)"),
+            "got: {rewritten}"
+        );
+        assert!(
+            !upper.contains("MAP_VALUE_COUNT_SIGNED"),
+            "legacy combinator must be replaced; got: {rewritten}"
+        );
+    }
+
+    #[test]
     fn signed_delta_rewrite_combined_min_max_and_others() {
         let sql = "select k1, count(*) as c, sum(v2) as s, min(v2) as mn, max(v3) as mx \
                    from ice.ns.orders group by k1";
@@ -474,33 +445,26 @@ mod tests {
             rewrite_select_sql_for_signed_delta_state(sql, &shape).expect("rewrite signed delta");
         let upper = rewritten.to_uppercase();
 
-        // COUNT(*) -> SUM(__change_op) AS c
-        assert!(upper.contains("SUM(__CHANGE_OP) AS C"), "got: {rewritten}");
-        // SUM(v2) -> SUM(v2 * __change_op) AS s
         assert!(
-            upper.contains("SUM(V2 * __CHANGE_OP)") || upper.contains("SUM((V2 * __CHANGE_OP))"),
-            "got: {rewritten}"
-        );
-        assert!(upper.contains("AS S"), "got: {rewritten}");
-        // MIN(v2) -> map_value_count_signed(v2, __change_op) AS __agg_state_mn
-        assert!(
-            upper.contains("MAP_VALUE_COUNT_SIGNED(V2, __CHANGE_OP)"),
+            upper.contains("COUNT_STATE_SIGNED(1, __CHANGE_OP) AS __AGG_STATE_C"),
             "got: {rewritten}"
         );
         assert!(
-            rewritten.contains("__agg_state_mn"),
-            "missing mn state alias; got: {rewritten}"
-        );
-        // MAX(v3) -> map_value_count_signed(v3, __change_op) AS __agg_state_mx
-        assert!(
-            upper.contains("MAP_VALUE_COUNT_SIGNED(V3, __CHANGE_OP)"),
+            upper.contains("SUM_STATE_SIGNED(V2, __CHANGE_OP) AS __AGG_STATE_S"),
             "got: {rewritten}"
         );
         assert!(
-            rewritten.contains("__agg_state_mx"),
-            "missing mx state alias; got: {rewritten}"
+            upper.contains("MIN_STATE_SIGNED(V2, __CHANGE_OP) AS __AGG_STATE_MN"),
+            "got: {rewritten}"
         );
-        // No literal MIN(...) / MAX(...) projection in signed-delta path.
+        assert!(
+            upper.contains("MAX_STATE_SIGNED(V3, __CHANGE_OP) AS __AGG_STATE_MX"),
+            "got: {rewritten}"
+        );
+        assert!(
+            !upper.contains("MAP_VALUE_COUNT_SIGNED"),
+            "legacy combinator must be replaced; got: {rewritten}"
+        );
         assert!(
             !upper.contains("MIN(V2)") && !upper.contains("MAX(V3)"),
             "signed-delta rewrite must not project visible MIN/MAX; got: {rewritten}"

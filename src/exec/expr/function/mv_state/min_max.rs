@@ -42,6 +42,20 @@ pub(crate) fn max_state_union(a: &[u8], b: &[u8]) -> Result<Vec<u8>, String> {
     min_max_state_union("max_state_union", a, b)
 }
 
+pub(crate) fn min_state_visible_key_value(
+    state: &[u8],
+    output_type: &DataType,
+) -> Result<Option<KeyValue>, String> {
+    visible_key_value(state, output_type, false)
+}
+
+pub(crate) fn max_state_visible_key_value(
+    state: &[u8],
+    output_type: &DataType,
+) -> Result<Option<KeyValue>, String> {
+    visible_key_value(state, output_type, true)
+}
+
 pub(crate) fn eval_min_state_union(
     arena: &ExprArena,
     _expr: ExprId,

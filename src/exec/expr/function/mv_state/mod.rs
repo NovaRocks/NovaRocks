@@ -35,4 +35,17 @@ pub(super) mod dispatch;
 pub(super) mod min_max;
 pub(super) mod sum;
 
+pub(crate) use approx_count_distinct::{
+    approx_count_distinct_state_union, approx_count_distinct_state_visible,
+};
+pub(crate) use avg::avg_state_union;
+pub(crate) use bool_or_and::{
+    bool_and_state_union, bool_and_state_visible, bool_or_state_union, bool_or_state_visible,
+};
+pub(crate) use count::{count_state_union, count_state_visible};
+pub(crate) use count_distinct::{count_distinct_state_union, count_distinct_state_visible};
 pub use dispatch::{eval_mv_state_function, metadata, register};
+pub(crate) use min_max::{
+    max_state_union, max_state_visible_key_value, min_state_union, min_state_visible_key_value,
+};
+pub(crate) use sum::sum_state_union;

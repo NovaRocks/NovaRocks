@@ -702,11 +702,8 @@ fn refresh_aggregate_mv_incremental(
     let layout =
         super::mv_agg_state::build_aggregate_mv_layout(ctx.shape, &visible_output_columns)?;
 
-    // IVM-P5 (Phase 3): the signed-delta rewriter now handles MIN/MAX via
-    // `map_value_count_signed`, so it no longer returns the historical
-    // "MIN/MAX aggregate outputs are not reversible" rejection that used to
-    // trigger a fall-back to full refresh. Any error from the rewriter is now
-    // a real error.
+    // The signed-delta rewriter emits VARBINARY state combinators for every
+    // aggregate, so any error from the rewriter is now a real error.
     let signed_state_sql = super::ivm_delta_aggregate::rewrite_select_sql_for_signed_delta_state(
         ctx.select_sql,
         ctx.shape,
@@ -4657,27 +4654,28 @@ enable_path_style_access = true
             2,
             "layout must have 2 visible columns (k + a)"
         );
-        // AVG expands to 2 state columns, plus the hidden retraction count state
-        // needed to drop fully retracted groups when the shape has no COUNT(*).
+        // AVG uses one opaque state column, plus the hidden retraction count
+        // state needed to drop fully retracted groups when the shape has no COUNT(*).
         assert_eq!(
             layout.state_columns.len(),
-            3,
-            "AVG must expand to 2 state columns plus hidden retraction count"
-        );
-        assert!(
-            layout.state_columns[0].name.contains("__sum"),
-            "first state column must be the sum sub-state"
-        );
-        assert!(
-            layout.state_columns[1].name.contains("__count"),
-            "second state column must be the count sub-state"
+            2,
+            "AVG must use one VARBINARY state column plus hidden retraction count"
         );
         assert_eq!(
-            layout.state_columns[2].state_role,
+            layout.state_columns[0].name, "__agg_state_a",
+            "first state column must be the AVG opaque state"
+        );
+        assert_eq!(
+            layout.state_columns[0].data_type,
+            DataType::LargeBinary,
+            "AVG state column must be VARBINARY-shaped"
+        );
+        assert_eq!(
+            layout.state_columns[1].state_role,
             AggregateStateRole::RetractionCount
         );
         assert_eq!(
-            layout.state_columns[2].name,
+            layout.state_columns[1].name,
             AGG_RETRACTION_COUNT_STATE_COLUMN
         );
     }

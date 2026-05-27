@@ -2494,6 +2494,12 @@ fn encode_window_approx_top_k_scalar(buf: &mut Vec<u8>, value: &AggScalarValue) 
             buf.extend_from_slice(&len.to_le_bytes());
             buf.extend_from_slice(text.as_bytes());
         }
+        AggScalarValue::Binary(v) => {
+            buf.push(12);
+            let len = u32::try_from(v.len()).unwrap_or(u32::MAX);
+            buf.extend_from_slice(&len.to_le_bytes());
+            buf.extend_from_slice(v);
+        }
         AggScalarValue::Struct(items) => {
             buf.push(8);
             let len = u32::try_from(items.len()).unwrap_or(u32::MAX);

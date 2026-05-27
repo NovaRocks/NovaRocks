@@ -128,6 +128,12 @@ fn encode_scalar_value(value: &AggScalarValue, buf: &mut Vec<u8>) -> Result<(), 
             buf.extend_from_slice(&len.to_le_bytes());
             buf.extend_from_slice(text.as_bytes());
         }
+        AggScalarValue::Binary(v) => {
+            buf.push(12);
+            let len = u32::try_from(v.len()).map_err(|_| "binary too large".to_string())?;
+            buf.extend_from_slice(&len.to_le_bytes());
+            buf.extend_from_slice(v);
+        }
     }
     Ok(())
 }

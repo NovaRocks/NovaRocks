@@ -923,12 +923,6 @@ fn aggregate_state_role_contract(
         crate::connector::starrocks::managed::mv_agg_state::AggregateStateRole::Single => {
             crate::meta::repository::mv_contract::AggregateStateRoleContract::Single
         }
-        crate::connector::starrocks::managed::mv_agg_state::AggregateStateRole::AvgSum => {
-            crate::meta::repository::mv_contract::AggregateStateRoleContract::AvgSum
-        }
-        crate::connector::starrocks::managed::mv_agg_state::AggregateStateRole::AvgCount => {
-            crate::meta::repository::mv_contract::AggregateStateRoleContract::AvgCount
-        }
         crate::connector::starrocks::managed::mv_agg_state::AggregateStateRole::RetractionCount => {
             crate::meta::repository::mv_contract::AggregateStateRoleContract::RetractionCount
         }
@@ -7514,13 +7508,11 @@ mod tests {
         let upper = state_sql.to_uppercase();
 
         assert!(
-            upper.contains("SUM(AMOUNT) AS __AGG_STATE_A__SUM"),
+            upper.contains("AVG_STATE(AMOUNT) AS __AGG_STATE_A"),
             "sql={state_sql}"
         );
-        assert!(
-            upper.contains("COUNT(AMOUNT) AS __AGG_STATE_A__COUNT"),
-            "sql={state_sql}"
-        );
+        assert!(!upper.contains("__AGG_STATE_A__SUM"), "sql={state_sql}");
+        assert!(!upper.contains("__AGG_STATE_A__COUNT"), "sql={state_sql}");
         assert!(!upper.contains("__ROW_ID__"), "sql={state_sql}");
     }
 
@@ -7538,9 +7530,12 @@ mod tests {
             iceberg_aggregate_incremental_delta_select_sql(sql, &shape, None).expect("rewrite");
         let upper = rewritten.to_uppercase();
 
-        assert!(upper.contains("SUM(__CHANGE_OP) AS C"), "sql={rewritten}");
         assert!(
-            upper.contains("SUM(AMOUNT * __CHANGE_OP) AS S"),
+            upper.contains("COUNT_STATE_SIGNED(1, __CHANGE_OP) AS __AGG_STATE_C"),
+            "sql={rewritten}"
+        );
+        assert!(
+            upper.contains("SUM_STATE_SIGNED(AMOUNT, __CHANGE_OP) AS __AGG_STATE_S"),
             "sql={rewritten}"
         );
     }
@@ -7565,10 +7560,13 @@ mod tests {
         let upper = branch_sql.to_uppercase();
 
         assert!(
-            upper.contains("SUM(F.__CHANGE_OP) AS C"),
+            upper.contains("COUNT_STATE_SIGNED(1, F.__CHANGE_OP) AS __AGG_STATE_C"),
             "sql={branch_sql}"
         );
-        assert!(!upper.contains("SUM(__CHANGE_OP) AS C"), "sql={branch_sql}");
+        assert!(
+            upper.contains("SUM_STATE_SIGNED(F.AMOUNT, F.__CHANGE_OP) AS __AGG_STATE_S"),
+            "sql={branch_sql}"
+        );
     }
 
     #[test]
@@ -9008,16 +9006,16 @@ mod tests {
         assert_eq!(aggregate.state_columns.len(), 2);
         assert_eq!(aggregate.state_columns[0].column_name, "__agg_state_c");
         assert_eq!(aggregate.state_columns[0].target_field_id, 5);
-        assert_eq!(aggregate.state_columns[0].type_signature, "long");
-        assert!(aggregate.state_columns[0].nullable);
+        assert_eq!(aggregate.state_columns[0].type_signature, "binary");
+        assert!(!aggregate.state_columns[0].nullable);
         assert_eq!(
             aggregate.state_columns[0].role,
             crate::meta::repository::mv_contract::AggregateStateRoleContract::Single
         );
         assert_eq!(aggregate.state_columns[1].column_name, "__agg_state_s");
         assert_eq!(aggregate.state_columns[1].target_field_id, 6);
-        assert_eq!(aggregate.state_columns[1].type_signature, "long");
-        assert!(aggregate.state_columns[1].nullable);
+        assert_eq!(aggregate.state_columns[1].type_signature, "binary");
+        assert!(!aggregate.state_columns[1].nullable);
         assert_eq!(
             aggregate.state_columns[1].role,
             crate::meta::repository::mv_contract::AggregateStateRoleContract::Single
@@ -9195,17 +9193,19 @@ mod tests {
             .iter()
             .map(|c| (c.column_name.as_str(), c.type_signature.as_str()))
             .collect();
-        // MIN and MAX state columns are Map<key, Int64> — iceberg's Type
-        // display renders Map types as the literal string "map".
-        assert_eq!(by_name.get("__agg_state_min_amount").copied(), Some("map"));
-        assert_eq!(by_name.get("__agg_state_max_amount").copied(), Some("map"));
+        assert_eq!(
+            by_name.get("__agg_state_min_amount").copied(),
+            Some("binary")
+        );
+        assert_eq!(
+            by_name.get("__agg_state_max_amount").copied(),
+            Some("binary")
+        );
     }
 
     #[test]
     fn iceberg_aggregate_mv_with_min_max_combined_with_others_passes_validation() {
-        // IVM-P5 Phase 5: MIN/MAX coexists with SUM/COUNT/AVG aggregates.
-        // Validates that the layout builder handles a mixed-aggregate shape
-        // and produces the expected mix of Map and scalar state columns.
+        // MIN/MAX coexists with SUM/COUNT/AVG aggregate VARBINARY states.
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
         create_aggregate_fact_table(&env.state, "ice", "sales", "fact");
         let stmt = parse_create_mv(
@@ -9230,11 +9230,10 @@ mod tests {
             .schema_contract
             .expect("schema contract");
         let aggregate = contract.aggregate.expect("aggregate contract");
-        // 1 (MIN map) + 1 (MAX map) + 1 (SUM scalar) + 1 (COUNT(*) scalar)
-        // + 2 (AVG: sum + count) = 6 state columns.
+        // One opaque VARBINARY state column per aggregate.
         assert_eq!(
             aggregate.state_columns.len(),
-            6,
+            5,
             "unexpected state column layout: {:?}",
             aggregate
                 .state_columns
@@ -9247,20 +9246,25 @@ mod tests {
             .iter()
             .map(|c| (c.column_name.as_str(), c.type_signature.as_str()))
             .collect();
-        // MIN/MAX state columns are Map<key, Int64> — iceberg's Type display
-        // renders Map types as the literal string "map".
-        assert_eq!(by_name.get("__agg_state_min_amount").copied(), Some("map"));
-        assert_eq!(by_name.get("__agg_state_max_region").copied(), Some("map"));
-        // SUM / COUNT(*) / AVG components are scalar state columns.
-        assert_eq!(by_name.get("__agg_state_sum_amount").copied(), Some("long"));
-        assert_eq!(by_name.get("__agg_state_row_count").copied(), Some("long"));
         assert_eq!(
-            by_name.get("__agg_state_avg_amount__sum").copied(),
-            Some("long")
+            by_name.get("__agg_state_min_amount").copied(),
+            Some("binary")
         );
         assert_eq!(
-            by_name.get("__agg_state_avg_amount__count").copied(),
-            Some("long")
+            by_name.get("__agg_state_max_region").copied(),
+            Some("binary")
+        );
+        assert_eq!(
+            by_name.get("__agg_state_sum_amount").copied(),
+            Some("binary")
+        );
+        assert_eq!(
+            by_name.get("__agg_state_row_count").copied(),
+            Some("binary")
+        );
+        assert_eq!(
+            by_name.get("__agg_state_avg_amount").copied(),
+            Some("binary")
         );
     }
 

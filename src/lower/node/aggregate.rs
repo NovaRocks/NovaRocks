@@ -415,10 +415,6 @@ fn select_aggregate_inputs(
         "map_agg" if is_merge => {
             return select_first_for_merge(args, "map_agg");
         }
-        // Merge map_value_count / map_value_count_signed consumes intermediate map state only.
-        "map_value_count" | "map_value_count_signed" if is_merge => {
-            return select_first_for_merge(args, fn_name);
-        }
         // Merge approx_top_k consumes intermediate binary state only.
         "approx_top_k" if is_merge => {
             return select_first_for_merge(args, "approx_top_k");

@@ -43,6 +43,7 @@ fn json_key_from_scalar(value: &AggScalarValue) -> Result<String, String> {
         AggScalarValue::Timestamp(v) => Ok(v.to_string()),
         AggScalarValue::Decimal128(v) => Ok(v.to_string()),
         AggScalarValue::Decimal256(v) => Ok(v.to_string()),
+        AggScalarValue::Binary(v) => Ok(hex::encode(v)),
         AggScalarValue::Struct(_) | AggScalarValue::Map(_) | AggScalarValue::List(_) => {
             Err("json_object key does not support complex type".to_string())
         }
@@ -124,6 +125,9 @@ fn json_value_from_scalar(value: &AggScalarValue) -> Result<String, String> {
         }
         AggScalarValue::Decimal128(v) => Ok(v.to_string()),
         AggScalarValue::Decimal256(v) => Ok(v.to_string()),
+        AggScalarValue::Binary(v) => {
+            serde_json::to_string(&hex::encode(v)).map_err(|e| e.to_string())
+        }
         AggScalarValue::Struct(v) => {
             serde_json::to_string(&format!("{:?}", v)).map_err(|e| e.to_string())
         }
