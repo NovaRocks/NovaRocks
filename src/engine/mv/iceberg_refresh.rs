@@ -11980,3 +11980,19 @@ mod imv_planning_catalog_tests {
         todo!("build a fixture with 2 base refs + a StandaloneState that has both bases registered as iceberg tables")
     }
 }
+
+#[cfg(test)]
+mod imv_pipeline_wiring_tests {
+    // Lib-level refresh smoke for the IMV pipeline wire-up.
+    //
+    // Reuses the same fixture obstacle as imv_planning_catalog_tests above:
+    // exercising try_run_imv_rewrite_pipeline end-to-end requires a
+    // StandaloneState with real Iceberg catalog entries (driven by the
+    // iceberg-rest Docker harness). Deferred to the iceberg-ivm SQL suite,
+    // which is the canonical end-to-end gate per the PR-α plan.
+    #[test]
+    #[ignore = "fixture deferred — covered by iceberg-ivm suite (Task 15)"]
+    fn projection_filter_refresh_through_imv_pipeline_matches_baseline() {
+        unimplemented!("inline an existing ProjectionFilter refresh fixture and assert row equality")
+    }
+}
