@@ -302,7 +302,7 @@ impl IcebergMvRefreshContext {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests_support {
     use std::sync::Arc;
 
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
@@ -311,14 +311,13 @@ mod tests {
     use crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin;
     use crate::meta::repository::mv::StoredMvDefinition;
     use crate::meta::repository::mv_contract::{
-        AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
         ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, HiddenApplyKeyContract,
         MvSchemaContract, OutputContract, TargetContract, TargetVisibleColumn,
     };
 
     use super::*;
 
-    fn make_ref(c: &str, n: &str, t: &str) -> IcebergTableRef {
+    pub(crate) fn make_ref(c: &str, n: &str, t: &str) -> IcebergTableRef {
         IcebergTableRef {
             catalog: c.to_string(),
             namespace: n.to_string(),
@@ -326,11 +325,11 @@ mod tests {
         }
     }
 
-    fn make_pin(entries: &[(&str, i64, &str)]) -> RefreshSnapshotPin {
+    pub(crate) fn make_pin(entries: &[(&str, i64, &str)]) -> RefreshSnapshotPin {
         RefreshSnapshotPin::from_entries_for_tests(entries)
     }
 
-    fn make_target_schema() -> Arc<Schema> {
+    pub(crate) fn make_target_schema() -> Arc<Schema> {
         Arc::new(
             Schema::builder()
                 .with_schema_id(7)
@@ -351,7 +350,7 @@ mod tests {
         )
     }
 
-    fn make_schema_contract() -> MvSchemaContract {
+    pub(crate) fn make_schema_contract() -> MvSchemaContract {
         MvSchemaContract {
             contract_version: 3,
             base: BaseContract {
@@ -403,7 +402,7 @@ mod tests {
         }
     }
 
-    fn make_mv_definition() -> StoredMvDefinition {
+    pub(crate) fn make_mv_definition() -> StoredMvDefinition {
         StoredMvDefinition {
             mv_id: 42,
             select_sql: "SELECT k, v FROM ice.db.b".to_string(),
@@ -435,7 +434,7 @@ mod tests {
         }
     }
 
-    fn parse_query(sql: &str) -> sqlparser::ast::Query {
+    pub(crate) fn parse_query(sql: &str) -> sqlparser::ast::Query {
         let dialect = sqlparser::dialect::GenericDialect {};
         let statements = sqlparser::parser::Parser::parse_sql(&dialect, sql).expect("parse_sql");
         match statements.into_iter().next().expect("one statement") {
@@ -444,13 +443,60 @@ mod tests {
         }
     }
 
-    fn make_target() -> IcebergMvTarget {
+    pub(crate) fn make_target() -> IcebergMvTarget {
         IcebergMvTarget {
             catalog: "tgt".to_string(),
             namespace: "db".to_string(),
             table: "mv".to_string(),
         }
     }
+
+    /// Returns a minimally-valid `Arc<IcebergMvRewriteContext>` for use in
+    /// unit tests outside this module (e.g. `imv/entrypoint.rs`).
+    pub(crate) fn dummy_rewrite_context() -> Arc<IcebergMvRewriteContext> {
+        let target = make_target();
+        let mv_def = Arc::new(make_mv_definition());
+        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
+        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
+        let schema = make_target_schema();
+        let contract = Arc::new(make_schema_contract());
+
+        Arc::new(
+            IcebergMvRewriteContext::from_parts(
+                target,
+                42,
+                Some("sess_cat".to_string()),
+                "sess_db".to_string(),
+                mv_def,
+                query,
+                base_refs,
+                pin,
+                Some(99),
+                "uuid-tgt".to_string(),
+                schema,
+                Some(contract),
+            )
+            .expect("dummy_rewrite_context: from_parts must succeed on canonical fixture"),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+
+    use crate::connector::starrocks::managed::model::IcebergTableRef;
+    use crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin;
+    use crate::meta::repository::mv_contract::{
+        AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
+        ApplyKeySource,
+    };
+
+    use super::tests_support::*;
+    use super::*;
 
     #[test]
     fn from_parts_happy_path_derives_all_fields() {
