@@ -1794,9 +1794,47 @@ impl<'a> AnalyzerContext<'a> {
                     if let QueryBody::Select(sel) = body
                         && let sqlast::SetExpr::Select(ast_sel) = query.body.as_ref()
                     {
+                        // Bare-identifier ORDER BY (`ORDER BY k1`) must prefer
+                        // the projection's output alias over the SELECT item's
+                        // underlying analyzed expression: the SELECT item may
+                        // analyse to a synthetic expression that's no longer
+                        // valid in the post-Project scope (FULL OUTER USING
+                        // expands `k1` into `coalesce(t1.k1, t2.k1)`, which
+                        // references columns the SORT operator can no longer
+                        // see). Promote the alias-match path to fire first
+                        // for plain identifiers; AST-text matching is still
+                        // useful for `ORDER BY a.c` echoing `SELECT a.c`,
+                        // where preserving qualifiers matters.
+                        let ob_is_bare_ident = matches!(
+                            ob.expr,
+                            sqlast::Expr::Identifier(_)
+                        );
                         for (ast_item, ir_item) in
                             ast_sel.projection.iter().zip(sel.projection.iter())
                         {
+                            if ob_is_bare_ident
+                                && ir_item.output_name.to_lowercase() == ob_text
+                            {
+                                let col_id = match &ir_item.expr.kind {
+                                    ExprKind::ColumnRef { column_id, .. } => *column_id,
+                                    _ => self.alloc_column_id(
+                                        None,
+                                        ir_item.output_name.clone(),
+                                        ir_item.expr.data_type.clone(),
+                                        ir_item.expr.nullable,
+                                    ),
+                                };
+                                matched_alias = Some(TypedExpr {
+                                    kind: ExprKind::ColumnRef {
+                                        column_id: col_id,
+                                        qualifier: None,
+                                        column: ir_item.output_name.clone(),
+                                    },
+                                    data_type: ir_item.expr.data_type.clone(),
+                                    nullable: ir_item.expr.nullable,
+                                });
+                                break;
+                            }
                             let ast_expr_text = match ast_item {
                                 sqlast::SelectItem::ExprWithAlias { expr, .. }
                                 | sqlast::SelectItem::UnnamedExpr(expr) => {
