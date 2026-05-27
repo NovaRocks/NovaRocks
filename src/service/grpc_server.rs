@@ -281,8 +281,15 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
             }
         };
 
+        // wait_fetch uses std::sync::Condvar::wait_timeout, which blocks the OS
+        // thread for up to max_wait_ms. Offload to the blocking thread pool so
+        // tonic worker threads remain free for I/O.
         use crate::runtime::result_buffer::{TryFetchResult, wait_fetch};
-        match wait_fetch(finst_id, req.max_wait_ms) {
+        let max_wait_ms = req.max_wait_ms;
+        let fetch_result = tokio::task::spawn_blocking(move || wait_fetch(finst_id, max_wait_ms))
+            .await
+            .map_err(|e| tonic::Status::internal(format!("fetch_result handler panicked: {e}")))?;
+        match fetch_result {
             TryFetchResult::Ready(result) => {
                 let status = if result.eos {
                     FetchStatus::Eof
@@ -1010,6 +1017,37 @@ mod pr3_tests {
         assert!(
             !body.result_batch_thrift.is_empty(),
             "result_batch_thrift payload must be non-empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_result_buffer_error_returns_error_status() {
+        use crate::common::types::UniqueId;
+        use crate::runtime::result_buffer::{close_error, create_sender};
+
+        let finst_id = UniqueId { hi: 8807, lo: 8808 };
+        create_sender(finst_id);
+        close_error(finst_id, "boom".to_string());
+
+        let svc = GrpcService::default();
+        let req = Request::new(FetchResultRequest {
+            finst_id: Some(PUniqueId {
+                hi: finst_id.hi,
+                lo: finst_id.lo,
+            }),
+            max_wait_ms: 0,
+        });
+        let resp = svc.fetch_result(req).await.expect("RPC level success");
+        let body = resp.into_inner();
+        assert_eq!(
+            body.status,
+            FetchStatus::Error as i32,
+            "close_error buffer must return ERROR status"
+        );
+        assert_eq!(body.message, "boom", "error message must match");
+        assert!(
+            body.result_batch_thrift.is_empty(),
+            "payload must be empty on error"
         );
     }
 

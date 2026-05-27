@@ -228,13 +228,13 @@ message FetchResultRequest {
 
 message FetchResultResponse {
   enum Status {
-    READY = 0;     // chunk_arrow_ipc 有效
+    READY = 0;     // result_batch_thrift 有效
     NOT_READY = 1; // 未等到 chunk，FE 可继续 poll
     EOF = 2;       // fragment 已完成且队列耗尽
     ERROR = 3;     // fragment 执行出错，message 含原因
   }
   Status status = 1;
-  bytes chunk_arrow_ipc = 2; // 仅 READY；Arrow IPC 编码（与现有 exchange wire 一致）
+  bytes result_batch_thrift = 2; // 仅 READY；thrift-binary TResultBatch
   string message = 3;        // 仅 ERROR
 }
 

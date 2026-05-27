@@ -1596,7 +1596,7 @@ message FetchResultResponse {
     ERROR = 3;
   }
   Status status = 1;
-  bytes chunk_arrow_ipc = 2;
+  bytes result_batch_thrift = 2;
   string message = 3;
 }
 
@@ -1722,27 +1722,27 @@ async fn fetch_result(
 
     use crate::runtime::result_buffer::TryFetchResult;
     let resp = match outcome {
-        TryFetchResult::Ready(batch) => {
-            let arrow_ipc = encode_arrow_ipc(&batch);
+        TryFetchResult::Ready(result) => {
+            let batch_bytes = crate::common::thrift::thrift_serialize_result_batch(&result.result_batch);
             FetchResultResponse {
                 status: fetch_result_response::Status::Ready as i32,
-                chunk_arrow_ipc: arrow_ipc,
+                result_batch_thrift: batch_bytes,
                 message: String::new(),
             }
         }
         TryFetchResult::NotReady => FetchResultResponse {
             status: fetch_result_response::Status::NotReady as i32,
-            chunk_arrow_ipc: Vec::new(),
+            result_batch_thrift: Vec::new(),
             message: String::new(),
         },
         TryFetchResult::Eof => FetchResultResponse {
             status: fetch_result_response::Status::Eof as i32,
-            chunk_arrow_ipc: Vec::new(),
+            result_batch_thrift: Vec::new(),
             message: String::new(),
         },
         TryFetchResult::Error(e) => FetchResultResponse {
             status: fetch_result_response::Status::Error as i32,
-            chunk_arrow_ipc: Vec::new(),
+            result_batch_thrift: Vec::new(),
             message: e.to_string(),
         },
     };
@@ -1762,21 +1762,9 @@ async fn cancel_fragment(
     Ok(Response::new(CancelFragmentResponse { status_code: 0 }))
 }
 
-fn encode_arrow_ipc(batch: &crate::runtime::result_buffer::FetchResult) -> Vec<u8> {
-    // 复用现有 exchange.rs 中 chunk wire 格式（详见 exchange.rs:101 附近）。
-    // 这里只是一个 wrapper：把 result_buffer::FetchResult 中的 RecordBatch
-    // 走 Arrow IPC 序列化。
-    let record_batch = batch.to_record_batch();
-    let mut buf = Vec::new();
-    let schema = record_batch.schema();
-    {
-        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buf, &schema)
-            .expect("create IPC writer");
-        writer.write(&record_batch).expect("write batch");
-        writer.finish().expect("finish");
-    }
-    buf
-}
+// Payload serialization uses thrift_serialize_result_batch from
+// crate::common::thrift, which encodes TResultBatch as thrift binary.
+// The receiver (PR-4 RemoteDispatcher) deserializes via thrift_deserialize_result_batch.
 ```
 
 - [ ] **Step 3.2.4：跑测试，确认 pass**
@@ -1984,7 +1972,7 @@ mod remote_dispatcher_tests {
         ) -> Result<tonic::Response<crate::service::FetchResultResponse>, tonic::Status> {
             Ok(tonic::Response::new(crate::service::FetchResultResponse {
                 status: crate::service::fetch_result_response::Status::Eof as i32,
-                chunk_arrow_ipc: Vec::new(),
+                result_batch_thrift: Vec::new(),
                 message: String::new(),
             }))
         }
@@ -2102,7 +2090,7 @@ impl FragmentDispatcher for RemoteDispatcher {
         use crate::service::fetch_result_response::Status as S;
         let outcome = match S::from_i32(resp.status) {
             Some(S::Ready) => {
-                let batch = decode_arrow_ipc(&resp.chunk_arrow_ipc)?;
+                let batch = thrift_deserialize_result_batch(&resp.result_batch_thrift)?;
                 FetchOutcome::Ready(batch)
             }
             Some(S::NotReady) => FetchOutcome::NotReady,
@@ -2141,13 +2129,9 @@ fn serialize_thrift(params: &TExecPlanFragmentParams) -> Result<Vec<u8>, String>
     Ok(transport.write_bytes())
 }
 
-fn decode_arrow_ipc(bytes: &[u8]) -> Result<arrow::array::RecordBatch, String> {
-    let mut reader = arrow::ipc::reader::StreamReader::try_new(bytes, None)
-        .map_err(|e| e.to_string())?;
-    let batch = reader.next()
-        .ok_or("no batch in IPC stream")?
-        .map_err(|e| e.to_string())?;
-    Ok(batch)
+fn thrift_deserialize_result_batch(bytes: &[u8]) -> Result<crate::data::TResultBatch, String> {
+    crate::common::thrift::thrift_deserialize_result_batch(bytes)
+        .map_err(|e| e.to_string())
 }
 ```
 
@@ -2735,7 +2719,7 @@ $SQLT --suite ssb --mode verify --cluster-mode cross-process
 如有 byte-identical 不通过：
 
 1. 用 `--mode diff` 看具体差异
-2. 检查 chunk 顺序是否因为 ResultSink → Arrow IPC → 反序列化 → MySQL encode 路径引入了不一致
+2. 检查 chunk 顺序是否因为 ResultSink → thrift-binary TResultBatch → 反序列化 → MySQL encode 路径引入了不一致
 3. 如果是 schema metadata 差异（如 timezone），在 PR-6 范围内 normalize
 
 ---
