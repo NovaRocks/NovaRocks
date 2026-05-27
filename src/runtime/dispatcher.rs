@@ -174,9 +174,14 @@ fn submitted_ids_snapshot(state: &InProcessState) -> Vec<(i64, i64)> {
         .clone()
 }
 
+fn cancel_fragment_instance(hi: i64, lo: i64) {
+    crate::runtime::result_buffer::cancel(crate::common::types::UniqueId { hi, lo });
+    crate::runtime::exchange::cancel_fragment(hi, lo);
+}
+
 fn cancel_all_submitted(state: &InProcessState) {
     for (hi, lo) in submitted_ids_snapshot(state) {
-        crate::runtime::exchange::cancel_fragment(hi, lo);
+        cancel_fragment_instance(hi, lo);
     }
 }
 
@@ -309,11 +314,7 @@ impl FragmentDispatcher for InProcessDispatcher {
 
     fn cancel_fragments(&self, finst_ids: &[types::TUniqueId]) {
         for fid in finst_ids {
-            crate::runtime::result_buffer::cancel(crate::common::types::UniqueId {
-                hi: fid.hi,
-                lo: fid.lo,
-            });
-            crate::runtime::exchange::cancel_fragment(fid.hi, fid.lo);
+            cancel_fragment_instance(fid.hi, fid.lo);
         }
     }
 }
@@ -613,7 +614,7 @@ mod tests {
     }
 
     #[test]
-    fn cancel_all_submitted_reads_ids_at_error_time() {
+    fn submitted_ids_snapshot_reads_current_ids_at_error_time() {
         let dispatcher = InProcessDispatcher::default();
         {
             let mut ids = dispatcher
@@ -639,6 +640,24 @@ mod tests {
             "helper must read current state, not a submit-time snapshot"
         );
         assert_eq!(current, vec![(1, 10), (1, 11)]);
+    }
+
+    #[test]
+    fn cancel_fragment_instance_cancels_result_buffer_and_exchange() {
+        let finst_id = crate::common::types::UniqueId { hi: 42, lo: 420 };
+        crate::runtime::result_buffer::create_sender(finst_id);
+
+        cancel_fragment_instance(finst_id.hi, finst_id.lo);
+
+        let crate::runtime::result_buffer::TryFetchResult::Error(err) =
+            crate::runtime::result_buffer::try_fetch(finst_id)
+        else {
+            panic!("expected result buffer cancellation to be observable");
+        };
+        assert!(matches!(
+            err.kind,
+            crate::runtime::result_buffer::FetchErrorKind::Cancelled
+        ));
     }
 
     #[test]

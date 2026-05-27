@@ -680,6 +680,8 @@ mod tests {
         cancelled: Mutex<Vec<types::TUniqueId>>,
         /// Number of submits completed so far.
         submit_count: AtomicUsize,
+        /// Number of fetch_result calls completed so far.
+        fetch_count: AtomicUsize,
         /// Fail when submit_count reaches this value (1-indexed).
         fail_on_submit: Option<usize>,
         fetch_behavior: FetchBehavior,
@@ -691,6 +693,7 @@ mod tests {
                 submitted: Mutex::new(Vec::new()),
                 cancelled: Mutex::new(Vec::new()),
                 submit_count: AtomicUsize::new(0),
+                fetch_count: AtomicUsize::new(0),
                 fail_on_submit: None,
                 fetch_behavior: FetchBehavior::Eof,
             })
@@ -701,6 +704,7 @@ mod tests {
                 submitted: Mutex::new(Vec::new()),
                 cancelled: Mutex::new(Vec::new()),
                 submit_count: AtomicUsize::new(0),
+                fetch_count: AtomicUsize::new(0),
                 fail_on_submit: Some(n),
                 fetch_behavior: FetchBehavior::Eof,
             })
@@ -711,6 +715,7 @@ mod tests {
                 submitted: Mutex::new(Vec::new()),
                 cancelled: Mutex::new(Vec::new()),
                 submit_count: AtomicUsize::new(0),
+                fetch_count: AtomicUsize::new(0),
                 fail_on_submit: None,
                 fetch_behavior: FetchBehavior::Err(msg.into()),
             })
@@ -721,6 +726,7 @@ mod tests {
                 submitted: Mutex::new(Vec::new()),
                 cancelled: Mutex::new(Vec::new()),
                 submit_count: AtomicUsize::new(0),
+                fetch_count: AtomicUsize::new(0),
                 fail_on_submit: None,
                 fetch_behavior: FetchBehavior::NotReady,
             })
@@ -732,6 +738,10 @@ mod tests {
 
         fn cancelled_ids(&self) -> Vec<types::TUniqueId> {
             self.cancelled.lock().unwrap().clone()
+        }
+
+        fn fetch_count(&self) -> usize {
+            self.fetch_count.load(Ordering::SeqCst)
         }
     }
 
@@ -764,6 +774,7 @@ mod tests {
             _finst_id: types::TUniqueId,
             _max_wait_ms: i64,
         ) -> Result<FetchOutcome, String> {
+            self.fetch_count.fetch_add(1, Ordering::SeqCst);
             match &self.fetch_behavior {
                 FetchBehavior::Eof => Ok(FetchOutcome::Eof),
                 FetchBehavior::Err(msg) => Ok(FetchOutcome::Err(msg.clone())),
@@ -979,12 +990,16 @@ mod tests {
         let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
         let root_finst_id = types::TUniqueId::new(4, 1);
         let params = vec![make_params_with_finst(4, 10), make_params_with_finst(4, 1)];
-        let result = submit_and_fetch_loop(&dispatcher, params, root_finst_id, 0);
+        let result = submit_and_fetch_loop(&dispatcher, params, root_finst_id, 10);
         assert!(result.is_err(), "expected timeout error");
         let err = result.unwrap_err();
         assert!(
             err.contains("timed out"),
             "error should explain timeout, got: {err}"
+        );
+        assert!(
+            inner.fetch_count() > 0,
+            "positive timeout must exercise the NotReady fetch loop"
         );
         let cancelled = inner.cancelled_ids();
         assert_eq!(
