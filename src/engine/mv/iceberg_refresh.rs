@@ -6215,6 +6215,44 @@ fn register_join_snapshot_side(
         .map_err(|e| format!("register join snapshot table {}: {e}", base.fqn()))
 }
 
+/// Re-plan ctx.rewrite.canonical_select_query into a LogicalPlan suitable
+/// for handing to `run_imv_rewrite`.
+///
+/// Failure here is fail-fast: if the canonical SELECT cannot be analyzed
+/// or planned, the refresh attempt aborts. This deliberately surfaces
+/// canonicalization bugs early rather than tolerating divergence between
+/// today's hand-built refresh path and the IMV pipeline.
+fn plan_canonical_select_for_imv(
+    state: &Arc<StandaloneState>,
+    ctx: &IcebergMvRefreshContext,
+) -> Result<crate::sql::planner::plan::LogicalPlan, RefreshError> {
+    let catalog = build_iceberg_mv_planning_catalog(state, ctx).map_err(|e| {
+        RefreshError::user(format!(
+            "imv plan failed for {}.{}.{}: build planning catalog: {e}",
+            ctx.rewrite.target.catalog, ctx.rewrite.target.namespace, ctx.rewrite.target.table
+        ))
+    })?;
+
+    let (resolved, cte_registry, mut factory) = crate::sql::analyzer::analyze(
+        ctx.rewrite.canonical_select_query.as_ref(),
+        &catalog,
+        &ctx.rewrite.current_database,
+    )
+    .map_err(|e| {
+        RefreshError::user(format!(
+            "imv plan failed for {}.{}.{}: analyze: {e}",
+            ctx.rewrite.target.catalog, ctx.rewrite.target.namespace, ctx.rewrite.target.table
+        ))
+    })?;
+
+    crate::sql::planner::plan_query(resolved, cte_registry, &mut factory).map_err(|e| {
+        RefreshError::user(format!(
+            "imv plan failed for {}.{}.{}: plan_query: {e}",
+            ctx.rewrite.target.catalog, ctx.rewrite.target.namespace, ctx.rewrite.target.table
+        ))
+    })
+}
+
 fn build_iceberg_table_def_for_snapshot_scan(
     state: &Arc<StandaloneState>,
     base: &IcebergTableRef,
