@@ -1168,4 +1168,70 @@ mod tests {
             .clone();
         assert_eq!(runtime_mv.table.kind, StarRocksTableKind::MaterializedView);
     }
+
+    /// Build a minimal-but-valid `StarRocksTableRuntime` parameterised by
+    /// `(db_id, table_id)` so the constructor test can verify identity flows
+    /// from runtime → `ScanSource::StarRocks { db_id, table_id }`. Mirrors
+    /// the shape of the larger fixture above; one INT column is enough for
+    /// `starrocks_table_def` to succeed.
+    fn sample_runtime_with_ids(db_id: i64, table_id: i64) -> StarRocksTableRuntime {
+        StarRocksTableRuntime {
+            database_name: DEFAULT_DATABASE.to_string(),
+            table: StoredStarRocksTable {
+                table_id,
+                db_id,
+                name: "sample_tbl".to_string(),
+                keys_type: "DUP_KEYS".to_string(),
+                bucket_num: 1,
+                current_schema_id: 1,
+                state: StarRocksTableState::Active,
+                kind: StarRocksTableKind::Table,
+            },
+            tablet_schema: TabletSchemaPb {
+                column: vec![ColumnPb {
+                    unique_id: 0,
+                    name: Some("id".to_string()),
+                    r#type: "INT".to_string(),
+                    is_nullable: Some(false),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            columns: vec![StoredStarRocksColumn {
+                schema_id: 1,
+                ordinal: 0,
+                column_name: "id".to_string(),
+                logical_type: "INT".to_string(),
+                nullable: false,
+                visible: true,
+                is_key: false,
+            }],
+            partitions: vec![],
+            indexes: vec![],
+            tablets: vec![],
+        }
+    }
+
+    /// `starrocks_table_def` must populate `ScanSource::StarRocks { db_id, table_id }`
+    /// from the runtime's identity fields. The dict-rewrite hot path
+    /// (`DictionaryQueryProvider::owner_for`) reads these values directly to
+    /// avoid taking `state.starrocks_table.read()` on every Scan column.
+    #[test]
+    fn starrocks_table_def_carries_runtime_ids_in_scan_source() {
+        let runtime = sample_runtime_with_ids(12_345, 67_890);
+
+        let table = super::starrocks_table_def(&runtime)
+            .expect("starrocks_table_def must succeed for the sample runtime");
+
+        match table.source {
+            ScanSource::StarRocks { db_id, table_id } => {
+                assert_eq!(db_id, 12_345, "db_id must come from runtime.table.db_id");
+                assert_eq!(
+                    table_id, 67_890,
+                    "table_id must come from runtime.table.table_id"
+                );
+            }
+            other => panic!("expected ScanSource::StarRocks, got {other:?}"),
+        }
+    }
 }
