@@ -129,6 +129,38 @@ fn resolve_cluster_role(
     role_override.unwrap_or(cfg.cluster.role)
 }
 
+fn wait_for_tcp_ready(
+    addr: std::net::SocketAddr,
+    timeout: Duration,
+    label: &str,
+) -> anyhow::Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut last_error = None;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let attempt_timeout = remaining.min(Duration::from_millis(100));
+        match TcpStream::connect_timeout(&addr, attempt_timeout) {
+            Ok(_) => return Ok(()),
+            Err(e) => last_error = Some(e),
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+
+    match last_error {
+        Some(e) => Err(anyhow::anyhow!(
+            "{label} at {addr} did not become ready within {}ms: {e}",
+            timeout.as_millis()
+        )),
+        None => Err(anyhow::anyhow!(
+            "{label} at {addr} did not become ready within {}ms",
+            timeout.as_millis()
+        )),
+    }
+}
+
 /// Load config from `cli.config_path` (or use defaults when absent), resolve
 /// the effective cluster role (CLI override wins over config), and validate the
 /// loaded cluster section.  Returns the owned config, the resolved role, and
@@ -180,10 +212,44 @@ fn dispatch_standalone_role(
     match role {
         novarocks::common::app_config::ClusterRole::AllInOne => run_all_in_one(cfg, port_override),
         novarocks::common::app_config::ClusterRole::Fe => {
-            anyhow::bail!("role=fe is not implemented yet (D1 PR-1 placeholder)")
+            let backend_str = cfg.cluster.backends.first().ok_or_else(|| {
+                anyhow::anyhow!("role=fe: no backend configured in cluster.backends")
+            })?;
+            let backend_addr: std::net::SocketAddr = backend_str.parse().map_err(|e| {
+                anyhow::anyhow!("role=fe: invalid backend addr '{backend_str}': {e}")
+            })?;
+            std::net::TcpStream::connect_timeout(&backend_addr, std::time::Duration::from_secs(5))
+                .map_err(|e| {
+                    anyhow::anyhow!("role=fe: cannot reach backend {backend_addr}: {e}")
+                })?;
+            run_all_in_one(cfg, port_override)
         }
         novarocks::common::app_config::ClusterRole::Be => {
-            anyhow::bail!("role=be is not implemented yet (D1 PR-1 placeholder)")
+            let host = cfg.server.host.clone();
+            let http_port = cfg.server.http_port;
+            let starlet_port = cfg.server.starlet_port;
+            let pid = std::process::id();
+            let http_addr: std::net::SocketAddr =
+                format!("{host}:{http_port}").parse().map_err(|e| {
+                    anyhow::anyhow!("role=be: invalid grpc/http addr '{host}:{http_port}': {e}")
+                })?;
+            let starlet_addr: std::net::SocketAddr =
+                format!("{host}:{starlet_port}").parse().map_err(|e| {
+                    anyhow::anyhow!(
+                        "role=be: invalid starlet grpc addr '{host}:{starlet_port}': {e}"
+                    )
+                })?;
+            novarocks::common::app_config::install_preloaded_config(cfg);
+            novarocks::start_grpc_server(&host)
+                .map_err(|e| anyhow::anyhow!("role=be: failed to start gRPC server: {e}"))?;
+            wait_for_tcp_ready(http_addr, Duration::from_secs(5), "novarocks grpc/http")
+                .map_err(|e| anyhow::anyhow!("role=be: {e}"))?;
+            wait_for_tcp_ready(starlet_addr, Duration::from_secs(5), "starlet grpc")
+                .map_err(|e| anyhow::anyhow!("role=be: {e}"))?;
+            println!("NOVAROCKS_READY role=be starlet_port={starlet_port} pid={pid}");
+            let (_tx, rx) = std::sync::mpsc::channel::<()>();
+            rx.recv().ok();
+            Ok(())
         }
     }
 }
@@ -821,7 +887,7 @@ fn main() {
 mod tests {
     use super::{
         StandaloneServerCliArgs, dispatch_standalone_role, load_config_and_resolve_role,
-        parse_standalone_server_args, resolve_cluster_role,
+        parse_standalone_server_args, resolve_cluster_role, wait_for_tcp_ready,
     };
 
     #[test]
@@ -913,29 +979,35 @@ mod tests {
     }
 
     #[test]
-    fn test_dispatch_role_fe_is_unimplemented_placeholder() {
-        let cfg = novarocks::common::app_config::NovaRocksConfig::default();
+    fn test_dispatch_role_fe_with_no_backend_errors() {
+        let mut cfg = novarocks::common::app_config::NovaRocksConfig::default();
+        cfg.cluster.backends.clear();
         let err = dispatch_standalone_role(
             novarocks::common::app_config::ClusterRole::Fe,
             cfg,
             None,
             |_, _| unreachable!("all-in-one should not be called"),
         )
-        .expect_err("fe should be placeholder in PR-1");
-        assert!(err.to_string().contains("role=fe is not implemented yet"));
+        .expect_err("fe with no backend should error");
+        assert!(err.to_string().contains("role=fe"));
     }
 
     #[test]
-    fn test_dispatch_role_be_is_unimplemented_placeholder() {
-        let cfg = novarocks::common::app_config::NovaRocksConfig::default();
-        let err = dispatch_standalone_role(
-            novarocks::common::app_config::ClusterRole::Be,
-            cfg,
-            None,
-            |_, _| unreachable!("all-in-one should not be called"),
-        )
-        .expect_err("be should be placeholder in PR-1");
-        assert!(err.to_string().contains("role=be is not implemented yet"));
+    fn test_wait_for_tcp_ready_returns_ok_for_listening_socket() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        wait_for_tcp_ready(addr, std::time::Duration::from_millis(100), "test")
+            .expect("listening socket should be ready");
+    }
+
+    #[test]
+    fn test_wait_for_tcp_ready_errors_for_unbound_socket() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        drop(listener);
+        let err = wait_for_tcp_ready(addr, std::time::Duration::from_millis(10), "test")
+            .expect_err("unbound socket should not be ready");
+        assert!(err.to_string().contains("test"));
     }
 
     // Serialize tests that mutate process-wide state (env vars, CWD) so they
@@ -961,13 +1033,18 @@ mod tests {
     fn test_config_file_role_fe_used_when_no_cli_override() {
         // Config declares role=fe with exactly one backend (valid). No CLI --role.
         // load_config_and_resolve_role must read the file and return ClusterRole::Fe,
-        // after which dispatch_standalone_role must return the FE placeholder error.
-        let toml = r#"
+        // after which dispatch_standalone_role must validate reachability and enter
+        // the standalone coordinator path.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind backend probe");
+        let backend_addr = listener.local_addr().expect("backend probe addr");
+        let toml = format!(
+            r#"
 [cluster]
 role = "fe"
-backends = ["127.0.0.1:9070"]
-"#;
-        let f = write_toml_tempfile(toml);
+backends = ["{backend_addr}"]
+"#
+        );
+        let f = write_toml_tempfile(&toml);
         let cli = StandaloneServerCliArgs {
             config_path: Some(f.path().to_str().expect("utf-8 path").to_string()),
             role: None,
@@ -976,11 +1053,8 @@ backends = ["127.0.0.1:9070"]
         let (cfg, role, _) =
             load_config_and_resolve_role(&cli).expect("load and resolve must succeed for valid fe");
         assert_eq!(role, novarocks::common::app_config::ClusterRole::Fe);
-        let err = dispatch_standalone_role(role, cfg, None, |_, _| {
-            unreachable!("all-in-one must not be called")
-        })
-        .expect_err("fe must return PR-1 placeholder");
-        assert!(err.to_string().contains("role=fe is not implemented yet"));
+        dispatch_standalone_role(role, cfg, None, |_, _| Ok(()))
+            .expect("fe with reachable backend must enter coordinator path");
     }
 
     #[test]
@@ -1013,8 +1087,9 @@ backends = []
     #[test]
     fn test_cli_role_override_be_wins_over_config_all_in_one() {
         // Config says all-in-one (no backends — valid for both all-in-one and be).
-        // CLI --role be must win: load_config_and_resolve_role returns ClusterRole::Be,
-        // and dispatch_standalone_role returns the BE placeholder, not all-in-one.
+        // CLI --role be must win: load_config_and_resolve_role returns ClusterRole::Be.
+        // BE startup binds sockets and blocks, so this unit test stops at role
+        // resolution; the cluster MVP smoke test covers BE startup.
         let toml = r#"
 [cluster]
 role = "all-in-one"
@@ -1028,11 +1103,7 @@ role = "all-in-one"
         let (cfg, role, _) = load_config_and_resolve_role(&cli)
             .expect("load and resolve must succeed (be with no backends is valid)");
         assert_eq!(role, novarocks::common::app_config::ClusterRole::Be);
-        let err = dispatch_standalone_role(role, cfg, None, |_, _| {
-            unreachable!("all-in-one must not be called when --role be")
-        })
-        .expect_err("be must return PR-1 placeholder");
-        assert!(err.to_string().contains("role=be is not implemented yet"));
+        assert!(cfg.cluster.backends.is_empty());
     }
 
     // C1: validate against the *effective* (CLI-overridden) role, not the config-file role.

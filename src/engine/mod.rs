@@ -2699,7 +2699,7 @@ pub(crate) fn execute_query_with_options(
 /// Select a `FragmentDispatcher` implementation based on the effective cluster role.
 ///
 /// - `AllInOne`: uses `InProcessDispatcher` bound to the local exchange endpoint.
-/// - `Fe`: SQL-coordinator execution is not yet implemented for distributed FE mode (PR-4).
+/// - `Fe`: uses `RemoteDispatcher` bound to the first configured backend.
 /// - `Be`: standalone coordinator must not be entered when the process is a pure BE.
 pub(crate) fn dispatcher_for_role(
     role: crate::common::app_config::ClusterRole,
@@ -2711,7 +2711,22 @@ pub(crate) fn dispatcher_for_role(
         ClusterRole::AllInOne => Ok(Arc::new(
             crate::runtime::dispatcher::InProcessDispatcher::new(exchange_host, exchange_port),
         )),
-        ClusterRole::Fe => Err("role=fe execution not yet implemented (PR-4)".to_string()),
+        ClusterRole::Fe => {
+            let cfg = crate::novarocks_config::config()
+                .map_err(|e| format!("role=fe: cannot read config: {e}"))?;
+            let backend_str =
+                cfg.cluster.backends.first().ok_or_else(|| {
+                    "role=fe: no backend configured in cluster.backends".to_string()
+                })?;
+            let backend: std::net::SocketAddr = backend_str
+                .parse()
+                .map_err(|e| format!("role=fe: invalid backend addr '{backend_str}': {e}"))?;
+            Ok(Arc::new(crate::runtime::dispatcher::RemoteDispatcher::new(
+                backend,
+                exchange_host,
+                exchange_port,
+            )))
+        }
         ClusterRole::Be => Err("role=be must not enter standalone coordinator".to_string()),
     }
 }
@@ -6848,16 +6863,19 @@ enable_path_style_access = true
         assert!(result.is_ok(), "AllInOne should produce a dispatcher");
     }
 
-    /// Fe role fails loudly with the expected error message.
     #[test]
-    fn dispatcher_for_role_fe_fails_loudly() {
+    fn dispatcher_for_role_fe_no_backend_configured_returns_error() {
         use crate::common::app_config::ClusterRole;
+        crate::common::app_config::install_default_for_test();
         let result = super::dispatcher_for_role(ClusterRole::Fe, "127.0.0.1", 0);
-        assert!(result.is_err(), "Fe role must return an error");
+        assert!(
+            result.is_err(),
+            "Fe role with no backends must return an error"
+        );
         let msg = result.err().expect("expected error");
         assert!(
-            msg.contains("role=fe") && msg.contains("PR-4"),
-            "error must mention role=fe and PR-4, got: {msg}"
+            msg.contains("role=fe"),
+            "error must mention role=fe, got: {msg}"
         );
     }
 

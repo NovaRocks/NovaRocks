@@ -23,10 +23,20 @@
 //! over gRPC.
 
 use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use arrow::array::{ArrayRef, BinaryBuilder};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use thrift::protocol::{TBinaryOutputProtocol, TSerializable};
+use thrift::transport::{TBufferChannel, TIoChannel};
+
+use crate::common::ids::SlotId;
+use crate::common::thrift::thrift_binary_deserialize;
 use crate::exec::chunk::Chunk;
+use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
 use crate::exec::node::{ExecPlan, push_down_local_runtime_filters};
 use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
 use crate::exec::pipeline::executor::execute_plan_with_pipeline;
@@ -35,6 +45,11 @@ use crate::lower::layout::{build_tuple_slot_order, reorder_tuple_slots};
 use crate::lower::thrift::lower_plan;
 use crate::runtime::query_context::QueryId;
 use crate::runtime::runtime_state::RuntimeState;
+use crate::service::grpc_client::NovaRocksGrpcRemoteClient;
+use crate::service::grpc_proto::novarocks::{
+    CancelFragmentRequest, FetchResultRequest, PUniqueId, SubmitFragmentRequest,
+    fetch_result_response::Status as FetchStatus,
+};
 use crate::{data_sinks, types};
 use tracing::warn;
 
@@ -84,6 +99,153 @@ pub(crate) fn compute_pipeline_dop() -> i32 {
     std::thread::available_parallelism()
         .map(|p| p.get().min(4))
         .unwrap_or(4) as i32
+}
+
+fn serialize_thrift_binary<T: TSerializable>(value: &T) -> Result<Vec<u8>, String> {
+    const INITIAL_CAPACITY: usize = 256;
+    const MAX_CAPACITY: usize = 64 * 1024 * 1024;
+
+    let mut capacity = INITIAL_CAPACITY;
+    loop {
+        let channel = TBufferChannel::with_capacity(0, capacity);
+        let (_, w) = channel.split().map_err(|e| e.to_string())?;
+        let mut protocol = TBinaryOutputProtocol::new(w, true);
+        match value.write_to_out_protocol(&mut protocol) {
+            Ok(()) => return Ok(protocol.transport.write_bytes()),
+            Err(e) => {
+                if capacity >= MAX_CAPACITY {
+                    return Err(e.to_string());
+                }
+                capacity = capacity.saturating_mul(2).min(MAX_CAPACITY);
+            }
+        }
+    }
+}
+
+fn empty_chunk() -> Result<Chunk, String> {
+    Chunk::try_new_with_chunk_schema(
+        RecordBatch::new_empty(Arc::new(Schema::empty())),
+        Arc::new(ChunkSchema::empty()),
+    )
+}
+
+fn read_lenenc_len(row: &[u8], cursor: &mut usize) -> Result<Option<usize>, String> {
+    let marker = *row
+        .get(*cursor)
+        .ok_or_else(|| "lenenc field missing marker byte".to_string())?;
+    *cursor += 1;
+    match marker {
+        0xfb => Ok(None),
+        n if n < 0xfb => Ok(Some(n as usize)),
+        0xfc => {
+            let bytes = row
+                .get(*cursor..*cursor + 2)
+                .ok_or_else(|| "lenenc field truncated reading 2-byte length".to_string())?;
+            *cursor += 2;
+            Ok(Some(u16::from_le_bytes([bytes[0], bytes[1]]) as usize))
+        }
+        0xfd => {
+            let bytes = row
+                .get(*cursor..*cursor + 3)
+                .ok_or_else(|| "lenenc field truncated reading 3-byte length".to_string())?;
+            *cursor += 3;
+            Ok(Some(
+                (bytes[0] as usize) | ((bytes[1] as usize) << 8) | ((bytes[2] as usize) << 16),
+            ))
+        }
+        0xfe => {
+            let bytes = row
+                .get(*cursor..*cursor + 8)
+                .ok_or_else(|| "lenenc field truncated reading 8-byte length".to_string())?;
+            *cursor += 8;
+            let len = u64::from_le_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ]);
+            usize::try_from(len)
+                .map(Some)
+                .map_err(|_| format!("lenenc field length {len} does not fit in usize"))
+        }
+        0xff => Err("invalid lenenc marker 0xff".to_string()),
+        _ => Err(format!("invalid lenenc marker {marker:#x}")),
+    }
+}
+
+fn parse_all_lenenc_fields(row: &[u8]) -> Result<Vec<Option<Vec<u8>>>, String> {
+    let mut fields = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < row.len() {
+        let len = read_lenenc_len(row, &mut cursor)?;
+        let Some(len) = len else {
+            fields.push(None);
+            continue;
+        };
+        let value = row.get(cursor..cursor + len).ok_or_else(|| {
+            format!("lenenc field truncated: need {len} bytes at offset {cursor}")
+        })?;
+        cursor += len;
+        fields.push(Some(value.to_vec()));
+    }
+    Ok(fields)
+}
+
+fn decode_result_batch_to_chunk(bytes: &[u8]) -> Result<Chunk, String> {
+    if bytes.is_empty() {
+        return empty_chunk();
+    }
+
+    let batch: crate::data::TResultBatch = thrift_binary_deserialize(bytes)?;
+    if batch.rows.is_empty() {
+        return empty_chunk();
+    }
+
+    let first = parse_all_lenenc_fields(&batch.rows[0])?;
+    let column_count = first.len();
+    let mut columns = vec![Vec::<Option<Vec<u8>>>::with_capacity(batch.rows.len()); column_count];
+    for (idx, field) in first.into_iter().enumerate() {
+        columns[idx].push(field);
+    }
+
+    for row in batch.rows.iter().skip(1) {
+        let fields = parse_all_lenenc_fields(row)?;
+        if fields.len() != column_count {
+            return Err(format!(
+                "result batch row has {} columns, expected {}",
+                fields.len(),
+                column_count
+            ));
+        }
+        for (idx, field) in fields.into_iter().enumerate() {
+            columns[idx].push(field);
+        }
+    }
+
+    let mut fields = Vec::with_capacity(column_count);
+    let mut slots = Vec::with_capacity(column_count);
+    let mut arrays = Vec::<ArrayRef>::with_capacity(column_count);
+    for (idx, values) in columns.into_iter().enumerate() {
+        let field = Field::new(format!("col_{idx}"), DataType::Binary, true);
+        let mut builder = BinaryBuilder::new();
+        for value in values {
+            match value {
+                Some(bytes) => builder.append_value(bytes),
+                None => builder.append_null(),
+            }
+        }
+        arrays.push(Arc::new(builder.finish()));
+        slots.push(ChunkSlotSchema::new_with_field(
+            SlotId(idx as u32),
+            field.clone(),
+            None,
+            None,
+        ));
+        fields.push(field);
+    }
+
+    let arrow_schema = Arc::new(Schema::new(fields));
+    let record_batch = RecordBatch::try_new(arrow_schema, arrays)
+        .map_err(|e| format!("build remote result record batch failed: {e}"))?;
+    let chunk_schema = Arc::new(ChunkSchema::try_new(slots)?);
+    Chunk::try_new_with_chunk_schema(record_batch, chunk_schema)
 }
 
 // ---------------------------------------------------------------------------
@@ -323,6 +485,109 @@ impl FragmentDispatcher for InProcessDispatcher {
     }
 }
 
+// ---------------------------------------------------------------------------
+// RemoteDispatcher
+// ---------------------------------------------------------------------------
+
+pub struct RemoteDispatcher {
+    backend: SocketAddr,
+    exchange_host: String,
+    exchange_port: u16,
+}
+
+impl RemoteDispatcher {
+    pub fn new(backend: SocketAddr, exchange_host: &str, exchange_port: u16) -> Self {
+        Self {
+            backend,
+            exchange_host: exchange_host.to_string(),
+            exchange_port,
+        }
+    }
+
+    fn client(&self) -> Result<NovaRocksGrpcRemoteClient, String> {
+        NovaRocksGrpcRemoteClient::connect_blocking(self.backend)
+    }
+}
+
+impl FragmentDispatcher for RemoteDispatcher {
+    fn exchange_addr(&self) -> types::TNetworkAddress {
+        types::TNetworkAddress::new(self.exchange_host.clone(), self.exchange_port as i32)
+    }
+
+    fn submit_fragment(
+        &self,
+        params: internal_service::TExecPlanFragmentParams,
+    ) -> Result<(), String> {
+        let payload = serialize_thrift_binary(&params)
+            .map_err(|e| format!("serialize fragment params for remote submit failed: {e}"))?;
+        let resp = self
+            .client()?
+            .blocking_submit_fragment(SubmitFragmentRequest {
+                exec_plan_fragment_params_thrift: payload,
+            })?;
+        if resp.status_code != 0 {
+            return Err(format!(
+                "remote submit_fragment failed on {}: {}",
+                self.backend, resp.message
+            ));
+        }
+        Ok(())
+    }
+
+    fn fetch_result(
+        &self,
+        finst_id: types::TUniqueId,
+        max_wait_ms: i64,
+    ) -> Result<FetchOutcome, String> {
+        let resp = self.client()?.blocking_fetch_result(FetchResultRequest {
+            finst_id: Some(PUniqueId {
+                hi: finst_id.hi,
+                lo: finst_id.lo,
+            }),
+            max_wait_ms,
+        })?;
+        let status = FetchStatus::try_from(resp.status).map_err(|_| {
+            format!(
+                "remote fetch_result returned unknown status {}",
+                resp.status
+            )
+        })?;
+        match status {
+            FetchStatus::Ready => {
+                let chunk = decode_result_batch_to_chunk(&resp.result_batch_thrift)?;
+                Ok(FetchOutcome::Ready(chunk))
+            }
+            FetchStatus::NotReady => Ok(FetchOutcome::NotReady),
+            FetchStatus::Eof => Ok(FetchOutcome::Eof),
+            FetchStatus::Error => Ok(FetchOutcome::Err(resp.message)),
+        }
+    }
+
+    fn cancel_fragments(&self, finst_ids: &[types::TUniqueId]) {
+        let req = CancelFragmentRequest {
+            finst_ids: finst_ids
+                .iter()
+                .map(|id| PUniqueId {
+                    hi: id.hi,
+                    lo: id.lo,
+                })
+                .collect(),
+            reason: "coordinator cancel".to_string(),
+        };
+        match self
+            .client()
+            .and_then(|client| client.blocking_cancel_fragment(req))
+        {
+            Ok(resp) if resp.status_code == 0 => {}
+            Ok(resp) => warn!(
+                "remote cancel_fragment returned nonzero status from {}: {}",
+                self.backend, resp.status_code
+            ),
+            Err(e) => warn!("remote cancel_fragment failed for {}: {}", self.backend, e),
+        }
+    }
+}
+
 /// Run the root (RESULT_SINK) fragment in-process and return result chunks.
 ///
 /// Mirrors the root-fragment execution path from `ExecutionCoordinator` but
@@ -439,6 +704,23 @@ fn resolve_root_pipeline_dop(params: &internal_service::TExecPlanFragmentParams)
 mod tests {
     use super::*;
 
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+
+    use crate::common::thrift::thrift_binary_serialize;
+    use crate::service::grpc_proto as proto;
+    use arrow::array::Array;
+    use proto::novarocks::fetch_result_response::Status as FetchStatus;
+    use proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc;
+    use proto::novarocks::{
+        CancelFragmentRequest, ExchangeRequest, ExchangeResponse, FetchResultRequest,
+        FetchResultResponse, SubmitFragmentRequest, SubmitFragmentResponse,
+    };
+    use proto::starrocks::{
+        PLookUpRequest, PLookUpResponse, PTransmitRuntimeFilterParams, PTransmitRuntimeFilterResult,
+    };
+    use tonic::{Request, Response, Status, Streaming};
+
     fn make_finst_id(hi: i64, lo: i64) -> types::TUniqueId {
         types::TUniqueId::new(hi, lo)
     }
@@ -532,6 +814,235 @@ mod tests {
             None::<internal_service::TPredicateTreeParams>,
             None::<Vec<i32>>,
         )
+    }
+
+    #[test]
+    fn parse_all_lenenc_fields_empty_row() {
+        let fields = parse_all_lenenc_fields(&[]).expect("parse empty row");
+        assert!(fields.is_empty());
+    }
+
+    #[test]
+    fn parse_all_lenenc_fields_single_col_short() {
+        let fields = parse_all_lenenc_fields(b"\x011").expect("parse single field");
+        assert_eq!(fields, vec![Some(b"1".to_vec())]);
+    }
+
+    #[test]
+    fn parse_all_lenenc_fields_null_col() {
+        let fields = parse_all_lenenc_fields(b"\xfb").expect("parse null field");
+        assert_eq!(fields, vec![None]);
+    }
+
+    #[test]
+    fn decode_result_batch_to_chunk_empty_bytes_returns_empty() {
+        let chunk = decode_result_batch_to_chunk(&[]).expect("decode empty bytes");
+        assert_eq!(chunk.columns().len(), 0);
+        assert_eq!(chunk.len(), 0);
+    }
+
+    #[test]
+    fn decode_result_batch_to_chunk_single_row_single_col() {
+        let batch = crate::data::TResultBatch::new(vec![b"\x011".to_vec()], false, 0, None);
+        let bytes = thrift_binary_serialize(&batch).expect("serialize result batch");
+
+        let chunk = decode_result_batch_to_chunk(&bytes).expect("decode chunk");
+
+        assert_eq!(chunk.columns().len(), 1);
+        assert_eq!(chunk.len(), 1);
+        let col = chunk.columns()[0]
+            .as_any()
+            .downcast_ref::<arrow::array::BinaryArray>()
+            .expect("binary column");
+        assert_eq!(col.value(0), b"1");
+    }
+
+    #[derive(Clone)]
+    struct MockGrpc(Arc<MockState>);
+
+    struct MockState {
+        submit_code: AtomicI32,
+        fetch_status: AtomicI32,
+        fetch_batch: Mutex<Vec<u8>>,
+        cancel_count: AtomicUsize,
+    }
+
+    impl Default for MockState {
+        fn default() -> Self {
+            Self {
+                submit_code: AtomicI32::new(0),
+                fetch_status: AtomicI32::new(FetchStatus::Eof as i32),
+                fetch_batch: Mutex::new(Vec::new()),
+                cancel_count: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[tonic::async_trait]
+    impl NovaRocksGrpc for MockGrpc {
+        type ExchangeStream =
+            Pin<Box<dyn tokio_stream::Stream<Item = Result<ExchangeResponse, Status>> + Send>>;
+
+        async fn exchange(
+            &self,
+            _request: Request<Streaming<ExchangeRequest>>,
+        ) -> Result<Response<Self::ExchangeStream>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
+        async fn exchange_unary(
+            &self,
+            _request: Request<ExchangeRequest>,
+        ) -> Result<Response<ExchangeResponse>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
+        async fn transmit_runtime_filter(
+            &self,
+            _request: Request<PTransmitRuntimeFilterParams>,
+        ) -> Result<Response<PTransmitRuntimeFilterResult>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
+        async fn lookup(
+            &self,
+            _request: Request<PLookUpRequest>,
+        ) -> Result<Response<PLookUpResponse>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
+        async fn submit_fragment(
+            &self,
+            _request: Request<SubmitFragmentRequest>,
+        ) -> Result<Response<SubmitFragmentResponse>, Status> {
+            Ok(Response::new(SubmitFragmentResponse {
+                status_code: self.0.submit_code.load(Ordering::SeqCst),
+                message: "submit failed".to_string(),
+            }))
+        }
+
+        async fn fetch_result(
+            &self,
+            _request: Request<FetchResultRequest>,
+        ) -> Result<Response<FetchResultResponse>, Status> {
+            Ok(Response::new(FetchResultResponse {
+                status: self.0.fetch_status.load(Ordering::SeqCst),
+                result_batch_thrift: self.0.fetch_batch.lock().expect("fetch batch lock").clone(),
+                message: "fetch failed".to_string(),
+            }))
+        }
+
+        async fn cancel_fragment(
+            &self,
+            _request: Request<CancelFragmentRequest>,
+        ) -> Result<Response<proto::novarocks::CancelFragmentResponse>, Status> {
+            self.0.cancel_count.fetch_add(1, Ordering::SeqCst);
+            Ok(Response::new(proto::novarocks::CancelFragmentResponse {
+                status_code: 0,
+            }))
+        }
+    }
+
+    fn spawn_mock_server(state: Arc<MockState>) -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let addr = listener.local_addr().expect("mock server local addr");
+        let mock = MockGrpc(Arc::clone(&state));
+        crate::runtime::global_async_runtime::data_block_on(async move {
+            listener
+                .set_nonblocking(true)
+                .expect("set mock server nonblocking");
+            let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
+            let incoming = futures::stream::unfold(listener, |listener| async {
+                let item = listener.accept().await.map(|(stream, _)| stream);
+                Some((item, listener))
+            });
+            tokio::spawn(
+                tonic::transport::Server::builder()
+                    .add_service(
+                        proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(mock),
+                    )
+                    .serve_with_incoming(incoming),
+            );
+        })
+        .expect("spawn mock server");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(50))
+                .is_ok()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "mock grpc server did not become ready at {addr}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        addr
+    }
+
+    #[test]
+    fn remote_dispatcher_submit_nonzero_status_returns_err() {
+        let state = Arc::new(MockState::default());
+        state.submit_code.store(1, Ordering::SeqCst);
+        let addr = spawn_mock_server(Arc::clone(&state));
+        let dispatcher = RemoteDispatcher::new(addr, "127.0.0.1", 8040);
+
+        let err = dispatcher
+            .submit_fragment(make_noop_sink_params(1, 2))
+            .expect_err("nonzero submit status should error");
+
+        assert!(err.contains("submit failed"));
+    }
+
+    #[test]
+    fn remote_dispatcher_fetch_eof_returns_eof() {
+        let state = Arc::new(MockState::default());
+        state
+            .fetch_status
+            .store(FetchStatus::Eof as i32, Ordering::SeqCst);
+        let addr = spawn_mock_server(Arc::clone(&state));
+        let dispatcher = RemoteDispatcher::new(addr, "127.0.0.1", 8040);
+
+        let outcome = dispatcher
+            .fetch_result(make_finst_id(1, 2), 0)
+            .expect("fetch");
+
+        assert!(matches!(outcome, FetchOutcome::Eof));
+    }
+
+    #[test]
+    fn remote_dispatcher_fetch_ready_decodes_batch() {
+        let state = Arc::new(MockState::default());
+        state
+            .fetch_status
+            .store(FetchStatus::Ready as i32, Ordering::SeqCst);
+        let batch = crate::data::TResultBatch::new(vec![b"\x011".to_vec()], false, 0, None);
+        *state.fetch_batch.lock().expect("fetch batch lock") =
+            thrift_binary_serialize(&batch).expect("serialize result batch");
+        let addr = spawn_mock_server(Arc::clone(&state));
+        let dispatcher = RemoteDispatcher::new(addr, "127.0.0.1", 8040);
+
+        let outcome = dispatcher
+            .fetch_result(make_finst_id(1, 2), 0)
+            .expect("fetch");
+
+        let FetchOutcome::Ready(chunk) = outcome else {
+            panic!("expected ready chunk");
+        };
+        assert_eq!(chunk.columns().len(), 1);
+        assert_eq!(chunk.len(), 1);
+    }
+
+    #[test]
+    fn remote_dispatcher_cancel_is_sent() {
+        let state = Arc::new(MockState::default());
+        let addr = spawn_mock_server(Arc::clone(&state));
+        let dispatcher = RemoteDispatcher::new(addr, "127.0.0.1", 8040);
+
+        dispatcher.cancel_fragments(&[make_finst_id(1, 2)]);
+
+        assert!(state.cancel_count.load(Ordering::SeqCst) > 0);
     }
 
     #[test]
