@@ -1,0 +1,11 @@
+-- query 2
+y	v	y	v
+2001	10	2002	20
+
+-- query 3
+y	y	y	v	v	v
+2001	2002	2003	10	20	30
+
+-- query 4
+gy	sv	gy	sv
+2001	10	2002	20

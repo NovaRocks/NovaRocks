@@ -378,15 +378,39 @@ impl<'a> super::AnalyzerContext<'a> {
                     }
 
                     if let Some(&cte_id) = self.ctes.get(&tbl_lower) {
-                        let registry = self.cte_registry.borrow();
-                        let entry = registry
-                            .get(cte_id)
-                            .ok_or_else(|| format!("unknown CTE id: {cte_id}"))?;
+                        let (producer_columns, entry_id) = {
+                            let registry = self.cte_registry.borrow();
+                            let entry = registry
+                                .get(cte_id)
+                                .ok_or_else(|| format!("unknown CTE id: {cte_id}"))?;
+                            (entry.output_columns.clone(), entry.id)
+                        };
                         let alias_name = alias
                             .as_ref()
                             .map(|a| a.name.value.clone())
                             .unwrap_or_else(|| tbl.clone());
-                        let output_columns = entry.output_columns.clone();
+                        // Each CTE consume must mint fresh ColumnIds. The
+                        // producer's ColumnIds are owned by the body of the
+                        // WITH definition; if multiple consumes shared them,
+                        // downstream operators could not tell aliases apart
+                        // (e.g. `cte a, cte b WHERE a.x=1 AND b.x=2`).
+                        let output_columns: Vec<OutputColumn> = producer_columns
+                            .into_iter()
+                            .map(|col| {
+                                let new_id = self.alloc_column_id(
+                                    Some(alias_name.clone()),
+                                    col.name.clone(),
+                                    col.data_type.clone(),
+                                    col.nullable,
+                                );
+                                OutputColumn {
+                                    column_id: new_id,
+                                    name: col.name,
+                                    data_type: col.data_type,
+                                    nullable: col.nullable,
+                                }
+                            })
+                            .collect();
                         let mut scope = self.new_scope();
                         for col in &output_columns {
                             scope.add_column_with_id(
@@ -399,7 +423,7 @@ impl<'a> super::AnalyzerContext<'a> {
                         }
                         return Ok((
                             Relation::CTEConsume {
-                                cte_id: entry.id,
+                                cte_id: entry_id,
                                 alias: alias_name,
                                 output_columns,
                             },
