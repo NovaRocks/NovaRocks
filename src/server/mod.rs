@@ -364,7 +364,10 @@ fn spawn_client_disconnect_watcher(
                         watcher_disconnected.store(true, Ordering::SeqCst);
                         break;
                     }
-                    _ => break,
+                    _ => {
+                        watcher_disconnected.store(true, Ordering::SeqCst);
+                        break;
+                    }
                 },
             }
         }
@@ -1280,6 +1283,17 @@ fn strip_string_quotes(raw: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_disconnect_watcher_treats_unexpected_peek_errors_as_disconnects() {
+        let source = include_str!("mod.rs");
+        assert!(
+            source.contains(
+                "_ => {\n                        watcher_disconnected.store(true, Ordering::SeqCst);\n                        break;\n                    }"
+            ),
+            "unexpected peek errors should conservatively mark the client disconnected"
+        );
+    }
 
     #[test]
     fn parse_set_query_timeout_accepts_common_forms() {
