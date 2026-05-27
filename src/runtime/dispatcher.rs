@@ -584,6 +584,7 @@ impl FragmentDispatcher for RemoteDispatcher {
     }
 
     fn cancel_fragments(&self, finst_ids: &[types::TUniqueId]) {
+        let backend = self.backend;
         let req = CancelFragmentRequest {
             finst_ids: finst_ids
                 .iter()
@@ -594,16 +595,22 @@ impl FragmentDispatcher for RemoteDispatcher {
                 .collect(),
             reason: "coordinator cancel".to_string(),
         };
-        match self
-            .client()
-            .and_then(|client| client.blocking_cancel_fragment(req))
+        if let Err(e) = std::thread::Builder::new()
+            .name("remote-cancel-fragment".to_string())
+            .spawn(move || {
+                match NovaRocksGrpcRemoteClient::connect_blocking(backend)
+                    .and_then(|client| client.blocking_cancel_fragment(req))
+                {
+                    Ok(resp) if resp.status_code == 0 => {}
+                    Ok(resp) => warn!(
+                        "remote cancel_fragment returned nonzero status from {}: {}",
+                        backend, resp.status_code
+                    ),
+                    Err(e) => warn!("remote cancel_fragment failed for {}: {}", backend, e),
+                }
+            })
         {
-            Ok(resp) if resp.status_code == 0 => {}
-            Ok(resp) => warn!(
-                "remote cancel_fragment returned nonzero status from {}: {}",
-                self.backend, resp.status_code
-            ),
-            Err(e) => warn!("remote cancel_fragment failed for {}: {}", self.backend, e),
+            warn!("remote cancel_fragment spawn failed for {}: {}", backend, e);
         }
     }
 }
@@ -725,7 +732,7 @@ mod tests {
     use super::*;
 
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
     use crate::common::thrift::thrift_binary_serialize;
     use crate::service::grpc_proto as proto;
@@ -885,6 +892,7 @@ mod tests {
         fetch_status: AtomicI32,
         fetch_batch: Mutex<Vec<u8>>,
         cancel_count: AtomicUsize,
+        cancel_delay_ms: AtomicU64,
     }
 
     impl Default for MockState {
@@ -894,6 +902,7 @@ mod tests {
                 fetch_status: AtomicI32::new(FetchStatus::Eof as i32),
                 fetch_batch: Mutex::new(Vec::new()),
                 cancel_count: AtomicUsize::new(0),
+                cancel_delay_ms: AtomicU64::new(0),
             }
         }
     }
@@ -956,6 +965,10 @@ mod tests {
             &self,
             _request: Request<CancelFragmentRequest>,
         ) -> Result<Response<proto::novarocks::CancelFragmentResponse>, Status> {
+            let delay_ms = self.0.cancel_delay_ms.load(Ordering::SeqCst);
+            if delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
             self.0.cancel_count.fetch_add(1, Ordering::SeqCst);
             Ok(Response::new(proto::novarocks::CancelFragmentResponse {
                 status_code: 0,
@@ -1062,7 +1075,40 @@ mod tests {
 
         dispatcher.cancel_fragments(&[make_finst_id(1, 2)]);
 
-        assert!(state.cancel_count.load(Ordering::SeqCst) > 0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while state.cancel_count.load(Ordering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cancel rpc was not observed by mock server"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn remote_dispatcher_cancel_returns_promptly_when_rpc_blocks() {
+        let state = Arc::new(MockState::default());
+        state.cancel_delay_ms.store(1_000, Ordering::SeqCst);
+        let addr = spawn_mock_server(Arc::clone(&state));
+        let dispatcher = RemoteDispatcher::new(addr);
+
+        let start = std::time::Instant::now();
+        dispatcher.cancel_fragments(&[make_finst_id(7, 8)]);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "cancel_fragments should return promptly, took {elapsed:?}"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while state.cancel_count.load(Ordering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cancel rpc was not observed by mock server"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[test]
