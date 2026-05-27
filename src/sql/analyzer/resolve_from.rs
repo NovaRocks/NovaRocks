@@ -44,37 +44,60 @@ impl<'a> super::AnalyzerContext<'a> {
                 }
                 Some(sqlast::JoinConstraint::Using(columns)) => {
                     // Convert USING(col1, col2) to ON left.col1 = right.col1 AND ...
-                    let mut merged = AnalyzerScope::new(current_scope.factory().clone());
-                    merged.merge(&current_scope);
-                    merged.merge(&right_scope);
+                    //
+                    // Each USING column resolves to *different* ColumnIds on
+                    // each side of the join (the LEFT child's binding and the
+                    // RIGHT child's binding). We build the BinaryOp with
+                    // distinct left/right ColumnRefs so that downstream
+                    // optimizer passes (in particular `shuffle_join_column_ids`
+                    // and HashPartitioned distribution derivation) see both
+                    // ids as the join key on its respective side. Using the
+                    // same merged id on both sides causes the optimizer to
+                    // produce a distribution spec keyed on only one id, which
+                    // fragment-builder cannot resolve against the other
+                    // child's scope.
                     let mut conds = Vec::new();
                     for col_obj in columns {
                         let col_name = col_obj.to_string();
-                        let (column_id, dt, nullable) = merged.resolve(None, &col_name).unwrap_or(
-                            (crate::sql::column_id::ColumnId::UNSET, DataType::Utf8, true),
-                        );
-                        let col_ref = TypedExpr {
+                        let (left_id, left_dt, left_nullable) = current_scope
+                            .resolve(None, &col_name)
+                            .unwrap_or((
+                                crate::sql::column_id::ColumnId::UNSET,
+                                DataType::Utf8,
+                                true,
+                            ));
+                        let (right_id, right_dt, right_nullable) = right_scope
+                            .resolve(None, &col_name)
+                            .unwrap_or((
+                                crate::sql::column_id::ColumnId::UNSET,
+                                DataType::Utf8,
+                                true,
+                            ));
+                        let left_ref = TypedExpr {
                             kind: ExprKind::ColumnRef {
-                                column_id,
+                                column_id: left_id,
+                                qualifier: None,
+                                column: col_name.clone(),
+                            },
+                            data_type: left_dt,
+                            nullable: left_nullable,
+                        };
+                        let right_ref = TypedExpr {
+                            kind: ExprKind::ColumnRef {
+                                column_id: right_id,
                                 qualifier: None,
                                 column: col_name,
                             },
-                            data_type: dt,
-                            nullable,
+                            data_type: right_dt,
+                            nullable: right_nullable,
                         };
-                        // The eq is intentionally unqualified on both sides.
-                        // The codegen compiles each operand against the
-                        // matching child's scope (left operand → left child,
-                        // right operand → right child), so the resolution
-                        // there produces the cross-side `left.col = right.col`
-                        // physical equality, not a tautology.
                         conds.push(TypedExpr {
                             data_type: DataType::Boolean,
                             nullable: false,
                             kind: ExprKind::BinaryOp {
-                                left: Box::new(col_ref.clone()),
+                                left: Box::new(left_ref),
                                 op: BinOp::Eq,
-                                right: Box::new(col_ref),
+                                right: Box::new(right_ref),
                             },
                         });
                     }

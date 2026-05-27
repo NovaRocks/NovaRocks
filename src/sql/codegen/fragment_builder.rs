@@ -3224,9 +3224,19 @@ impl<'a> PlanFragmentBuilder<'a> {
                 type_desc: None,
                 nullable: col.nullable,
             };
-            scope.add_column(None, col.name.clone(), binding.clone());
-            // Also register with the CTE alias as qualifier
-            scope.add_column(Some(op.alias.clone()), col.name.clone(), binding);
+            // Register the CTE-consumed column under its ColumnId so that
+            // ID-based lookups (e.g. distribution column resolution in
+            // `build_output_partition`) succeed when an outer operator needs
+            // to find the hash partition columns produced by the CTE.
+            scope.add_column_with_id(
+                col.column_id,
+                None,
+                col.name.clone(),
+                binding.clone(),
+            );
+            // Also register the column under the CTE alias as qualifier so
+            // that `alias.col` references in the consuming query resolve.
+            scope.add_qualified_alias(op.alias.clone(), col.name.clone(), binding);
         }
         self.desc_builder.add_tuple(exchange_tuple_id, None);
 

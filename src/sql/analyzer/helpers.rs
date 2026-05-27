@@ -1486,7 +1486,11 @@ fn format_function_arg_display_name(arg: &sqlast::FunctionArg) -> String {
 
 fn format_function_arg_expr_display_name(arg: &sqlast::FunctionArgExpr) -> String {
     match arg {
-        sqlast::FunctionArgExpr::Expr(expr) => expr_display_name(expr),
+        // StarRocks-compatible behavior: a `t.col` reference appearing as a
+        // function argument keeps its qualifier in the displayed header
+        // (`count(t.col)` rather than `count(col)`). Top-level SELECT items
+        // still drop the qualifier — see `expr_display_name` for that path.
+        sqlast::FunctionArgExpr::Expr(expr) => expr_display_name_preserve_path(expr),
         sqlast::FunctionArgExpr::QualifiedWildcard(prefix) => format!("{prefix}.*"),
         sqlast::FunctionArgExpr::Wildcard => "*".to_string(),
     }

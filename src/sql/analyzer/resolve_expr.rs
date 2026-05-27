@@ -1418,6 +1418,42 @@ impl<'a> super::AnalyzerContext<'a> {
         //   * `INTERVAL N UNIT` is split into a numeric value + unit string.
         //   * Bare identifiers `ceil` / `floor` in the boundary slot are
         //     promoted to string literals (StarRocks accepts both unquoted).
+        // `date_add(dt, INTERVAL expr <UNIT>)` / `date_sub(...)` in MySQL
+        // syntax: route to the unit-specific function (`seconds_add`,
+        // `days_add`, etc.) and unwrap the Interval into its plain value
+        // expression so downstream type inference and execution see an
+        // integer arg, not the synthetic INTERVAL-as-string placeholder.
+        let date_add_interval_rewrites: Vec<sqlast::Expr> =
+            if matches!(name.as_str(), "date_add" | "date_sub")
+                && arg_exprs.len() == 2
+                && let sqlast::Expr::Interval(interval) = arg_exprs[1]
+            {
+                let unit = interval
+                    .leading_field
+                    .as_ref()
+                    .map(|f| format!("{f}").to_ascii_lowercase())
+                    .unwrap_or_else(|| "day".to_string());
+                let suffix = if name == "date_sub" { "_sub" } else { "_add" };
+                let new_name = match unit.as_str() {
+                    "year" => Some(format!("years{suffix}")),
+                    "month" => Some(format!("months{suffix}")),
+                    "week" => Some(format!("weeks{suffix}")),
+                    "day" => Some(format!("days{suffix}")),
+                    "hour" => Some(format!("hours{suffix}")),
+                    "minute" => Some(format!("minutes{suffix}")),
+                    "second" => Some(format!("seconds{suffix}")),
+                    _ => None,
+                };
+                if let Some(new_name) = new_name {
+                    name = new_name;
+                    vec![arg_exprs[0].clone(), (*interval.value).clone()]
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+
         let time_slice_rewrites: Vec<sqlast::Expr> =
             if matches!(name.as_str(), "time_slice" | "date_slice") && !arg_exprs.is_empty() {
                 let mut rewritten: Vec<sqlast::Expr> = Vec::with_capacity(arg_exprs.len() + 1);
@@ -1468,10 +1504,13 @@ impl<'a> super::AnalyzerContext<'a> {
             } else {
                 Vec::new()
             };
-        let effective_arg_exprs: Vec<&sqlast::Expr> = if time_slice_rewrites.is_empty() {
-            arg_exprs.clone()
-        } else {
+        let effective_arg_exprs: Vec<&sqlast::Expr> = if !date_add_interval_rewrites.is_empty()
+        {
+            date_add_interval_rewrites.iter().collect()
+        } else if !time_slice_rewrites.is_empty() {
             time_slice_rewrites.iter().collect()
+        } else {
+            arg_exprs.clone()
         };
 
         if let Some(rewritten) =

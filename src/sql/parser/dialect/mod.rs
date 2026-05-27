@@ -309,6 +309,8 @@ pub(crate) fn normalize_for_raw_parse(sql: &str) -> Result<String, String> {
     let sql = rewrite_overwrite_partitions(&sql)?;
     let sql = rewrite_inline_null_treatment(&sql);
     let sql = strip_join_hints(&sql);
+    let sql = rewrite_cross_join_with_on(&sql);
+    let sql = rewrite_interval_value_parens(&sql);
     Ok(rewrite_create_table_nested_generic_closers(&sql))
 }
 
@@ -471,6 +473,535 @@ fn strip_join_hints(sql: &str) -> String {
         idx += 1;
     }
     output
+}
+
+/// Wrap the value expression of `INTERVAL <expr> <UNIT>` in parentheses when
+/// it is not already parenthesised. sqlparser-rs only accepts a primary
+/// expression after `INTERVAL`; compound expressions like
+/// `INTERVAL idx * 37 DAY` fail with `Expected: ), found: day`. By emitting
+/// `INTERVAL (idx * 37) DAY` we let sqlparser absorb the whole expression
+/// while preserving the original semantics. The recognised units mirror the
+/// `DateTimeField` keywords that sqlparser accepts after an INTERVAL value.
+fn rewrite_interval_value_parens(sql: &str) -> String {
+    let lower = sql.to_ascii_lowercase();
+    if !lower.contains("interval") {
+        return sql.to_string();
+    }
+
+    const UNIT_KEYWORDS: &[&str] = &[
+        "microsecond",
+        "millisecond",
+        "second",
+        "minute",
+        "hour",
+        "day",
+        "week",
+        "month",
+        "quarter",
+        "year",
+    ];
+
+    let bytes = sql.as_bytes();
+    let mut output = String::with_capacity(sql.len() + 16);
+    let mut idx = 0usize;
+    let mut single_quote = false;
+    let mut double_quote = false;
+    let mut backtick = false;
+
+    while idx < bytes.len() {
+        let byte = bytes[idx];
+
+        if byte >= 0x80 {
+            let len = utf8_sequence_len(byte);
+            let end = (idx + len).min(bytes.len());
+            output.push_str(&sql[idx..end]);
+            idx = end;
+            continue;
+        }
+
+        if single_quote {
+            if byte == b'\'' && bytes.get(idx.wrapping_sub(1)).copied() != Some(b'\\') {
+                single_quote = false;
+            }
+            output.push(byte as char);
+            idx += 1;
+            continue;
+        }
+        if double_quote {
+            if byte == b'"' && bytes.get(idx.wrapping_sub(1)).copied() != Some(b'\\') {
+                double_quote = false;
+            }
+            output.push(byte as char);
+            idx += 1;
+            continue;
+        }
+        if backtick {
+            if byte == b'`' {
+                backtick = false;
+            }
+            output.push(byte as char);
+            idx += 1;
+            continue;
+        }
+        match byte {
+            b'\'' => {
+                single_quote = true;
+                output.push('\'');
+                idx += 1;
+                continue;
+            }
+            b'"' => {
+                double_quote = true;
+                output.push('"');
+                idx += 1;
+                continue;
+            }
+            b'`' => {
+                backtick = true;
+                output.push('`');
+                idx += 1;
+                continue;
+            }
+            _ => {}
+        }
+        if byte == b'-' && bytes.get(idx + 1) == Some(&b'-') {
+            while idx < bytes.len() && bytes[idx] != b'\n' {
+                if bytes[idx] >= 0x80 {
+                    let len = utf8_sequence_len(bytes[idx]);
+                    let end = (idx + len).min(bytes.len());
+                    output.push_str(&sql[idx..end]);
+                    idx = end;
+                } else {
+                    output.push(bytes[idx] as char);
+                    idx += 1;
+                }
+            }
+            continue;
+        }
+        if byte == b'/' && bytes.get(idx + 1) == Some(&b'*') {
+            output.push_str("/*");
+            idx += 2;
+            while idx + 1 < bytes.len() && !(bytes[idx] == b'*' && bytes[idx + 1] == b'/') {
+                if bytes[idx] >= 0x80 {
+                    let len = utf8_sequence_len(bytes[idx]);
+                    let end = (idx + len).min(bytes.len());
+                    output.push_str(&sql[idx..end]);
+                    idx = end;
+                } else {
+                    output.push(bytes[idx] as char);
+                    idx += 1;
+                }
+            }
+            if idx + 1 < bytes.len() {
+                output.push_str("*/");
+                idx += 2;
+            }
+            continue;
+        }
+
+        // Detect INTERVAL keyword at a word boundary.
+        if starts_with_keyword(bytes, idx, "interval")
+            && !is_identifier_byte(bytes.get(idx.wrapping_sub(1)).copied())
+            && !is_identifier_byte(bytes.get(idx + "interval".len()).copied())
+        {
+            let after_kw = idx + "interval".len();
+            // Emit the keyword and the following whitespace verbatim.
+            let ws_end = skip_ascii_whitespace(bytes, after_kw);
+            output.push_str(&sql[idx..ws_end]);
+            // Already parenthesised: leave the rest untouched.
+            if bytes.get(ws_end) == Some(&b'(') {
+                idx = ws_end;
+                continue;
+            }
+            // Scan forward to find the unit keyword at the same paren depth.
+            let mut p = ws_end;
+            let mut depth: i32 = 0;
+            let mut sq = false;
+            let mut dq = false;
+            let mut bq = false;
+            let mut unit_start: Option<usize> = None;
+            while p < bytes.len() {
+                let b = bytes[p];
+                if b >= 0x80 {
+                    p += utf8_sequence_len(b);
+                    continue;
+                }
+                if sq {
+                    if b == b'\'' && bytes.get(p.wrapping_sub(1)).copied() != Some(b'\\') {
+                        sq = false;
+                    }
+                    p += 1;
+                    continue;
+                }
+                if dq {
+                    if b == b'"' && bytes.get(p.wrapping_sub(1)).copied() != Some(b'\\') {
+                        dq = false;
+                    }
+                    p += 1;
+                    continue;
+                }
+                if bq {
+                    if b == b'`' {
+                        bq = false;
+                    }
+                    p += 1;
+                    continue;
+                }
+                match b {
+                    b'\'' => {
+                        sq = true;
+                        p += 1;
+                        continue;
+                    }
+                    b'"' => {
+                        dq = true;
+                        p += 1;
+                        continue;
+                    }
+                    b'`' => {
+                        bq = true;
+                        p += 1;
+                        continue;
+                    }
+                    b'(' => {
+                        depth += 1;
+                        p += 1;
+                        continue;
+                    }
+                    b')' => {
+                        if depth == 0 {
+                            break;
+                        }
+                        depth -= 1;
+                        p += 1;
+                        continue;
+                    }
+                    b',' | b';' if depth == 0 => break,
+                    _ => {}
+                }
+                if depth == 0 {
+                    let prev_ident = is_identifier_byte(bytes.get(p.wrapping_sub(1)).copied());
+                    if !prev_ident {
+                        for unit in UNIT_KEYWORDS {
+                            if starts_with_keyword(bytes, p, unit)
+                                && !is_identifier_byte(bytes.get(p + unit.len()).copied())
+                            {
+                                unit_start = Some(p);
+                                break;
+                            }
+                        }
+                        if unit_start.is_some() {
+                            break;
+                        }
+                    }
+                }
+                p += 1;
+            }
+            match unit_start {
+                Some(end) if end > ws_end => {
+                    // Trim trailing whitespace from the captured expression
+                    // so the closing `)` sits adjacent to the value.
+                    let expr_end = trim_trailing_ascii_whitespace(sql, end);
+                    output.push('(');
+                    output.push_str(&sql[ws_end..expr_end]);
+                    output.push_str(") ");
+                    idx = end;
+                    continue;
+                }
+                _ => {
+                    // No recognisable unit follows — leave the SQL alone.
+                    idx = ws_end;
+                    continue;
+                }
+            }
+        }
+
+        output.push(byte as char);
+        idx += 1;
+    }
+
+    output
+}
+
+/// Rewrite `CROSS JOIN <relation> ON|USING ...` to `INNER JOIN <relation> ON|USING ...`.
+///
+/// StarRocks's grammar allows CROSS JOIN to carry an ON / USING criterion,
+/// which is semantically equivalent to INNER JOIN with the same criterion (a
+/// cartesian product filtered by the predicate). sqlparser-rs rejects this
+/// syntax with `Expected: ), found: on` because its grammar fixes CROSS JOIN
+/// as criterion-free. We rewrite the leading `CROSS` keyword to `INNER`
+/// before parsing whenever a join criterion appears for the same right-hand
+/// relation. A plain CROSS JOIN without a criterion (the standard cartesian
+/// product form) is left untouched.
+fn rewrite_cross_join_with_on(sql: &str) -> String {
+    // Fast path: skip if no "cross" appears at all (case-insensitive).
+    let lower = sql.to_ascii_lowercase();
+    if !lower.contains("cross") {
+        return sql.to_string();
+    }
+
+    let bytes = sql.as_bytes();
+    let mut output = String::with_capacity(sql.len());
+    let mut idx = 0usize;
+    let mut single_quote = false;
+    let mut double_quote = false;
+    let mut backtick = false;
+
+    while idx < bytes.len() {
+        let byte = bytes[idx];
+
+        // Pass UTF-8 multi-byte sequences through verbatim.
+        if byte >= 0x80 {
+            let len = utf8_sequence_len(byte);
+            let end = (idx + len).min(bytes.len());
+            output.push_str(&sql[idx..end]);
+            idx = end;
+            continue;
+        }
+
+        if single_quote {
+            if byte == b'\'' && bytes.get(idx.wrapping_sub(1)).copied() != Some(b'\\') {
+                single_quote = false;
+            }
+            output.push(byte as char);
+            idx += 1;
+            continue;
+        }
+        if double_quote {
+            if byte == b'"' && bytes.get(idx.wrapping_sub(1)).copied() != Some(b'\\') {
+                double_quote = false;
+            }
+            output.push(byte as char);
+            idx += 1;
+            continue;
+        }
+        if backtick {
+            if byte == b'`' {
+                backtick = false;
+            }
+            output.push(byte as char);
+            idx += 1;
+            continue;
+        }
+        match byte {
+            b'\'' => {
+                single_quote = true;
+                output.push('\'');
+                idx += 1;
+                continue;
+            }
+            b'"' => {
+                double_quote = true;
+                output.push('"');
+                idx += 1;
+                continue;
+            }
+            b'`' => {
+                backtick = true;
+                output.push('`');
+                idx += 1;
+                continue;
+            }
+            _ => {}
+        }
+
+        // Line comment: emit through end of line.
+        if byte == b'-' && bytes.get(idx + 1) == Some(&b'-') {
+            while idx < bytes.len() && bytes[idx] != b'\n' {
+                if bytes[idx] >= 0x80 {
+                    let len = utf8_sequence_len(bytes[idx]);
+                    let end = (idx + len).min(bytes.len());
+                    output.push_str(&sql[idx..end]);
+                    idx = end;
+                } else {
+                    output.push(bytes[idx] as char);
+                    idx += 1;
+                }
+            }
+            continue;
+        }
+        // Block comment.
+        if byte == b'/' && bytes.get(idx + 1) == Some(&b'*') {
+            output.push_str("/*");
+            idx += 2;
+            while idx + 1 < bytes.len() && !(bytes[idx] == b'*' && bytes[idx + 1] == b'/') {
+                if bytes[idx] >= 0x80 {
+                    let len = utf8_sequence_len(bytes[idx]);
+                    let end = (idx + len).min(bytes.len());
+                    output.push_str(&sql[idx..end]);
+                    idx = end;
+                } else {
+                    output.push(bytes[idx] as char);
+                    idx += 1;
+                }
+            }
+            if idx + 1 < bytes.len() {
+                output.push_str("*/");
+                idx += 2;
+            }
+            continue;
+        }
+
+        // Detect `CROSS` followed by `JOIN` and (eventually) `ON`/`USING`.
+        if starts_with_keyword(bytes, idx, "cross")
+            && !is_identifier_byte(bytes.get(idx.wrapping_sub(1)).copied())
+            && !is_identifier_byte(bytes.get(idx + "cross".len()).copied())
+        {
+            let after_cross = idx + "cross".len();
+            let ws_end = skip_ascii_whitespace(bytes, after_cross);
+            if starts_with_keyword(bytes, ws_end, "join")
+                && !is_identifier_byte(bytes.get(ws_end + "join".len()).copied())
+                && has_join_criterion_before_terminator(bytes, ws_end + "join".len())
+            {
+                // Rewrite the leading `CROSS` to `INNER`; the remaining tokens
+                // (whitespace, JOIN, right-hand relation, ON/USING criterion)
+                // are emitted by the main loop unchanged.
+                output.push_str("INNER");
+                idx = after_cross;
+                continue;
+            }
+        }
+
+        output.push(byte as char);
+        idx += 1;
+    }
+
+    output
+}
+
+/// Scan forward from `start` and decide whether an `ON` or `USING` criterion
+/// appears for the join whose right-hand relation begins at `start`. Returns
+/// true if such a criterion is encountered at the same parenthesis depth as
+/// `start`, before any FROM-clause terminator (another join, WHERE, GROUP BY,
+/// ORDER BY, LIMIT, UNION, comma at depth 0, semicolon, or scope exit).
+fn has_join_criterion_before_terminator(bytes: &[u8], start: usize) -> bool {
+    let mut p = start;
+    let mut depth: i32 = 0;
+    let mut single_quote = false;
+    let mut double_quote = false;
+    let mut backtick = false;
+
+    while p < bytes.len() {
+        let byte = bytes[p];
+
+        if byte >= 0x80 {
+            p += utf8_sequence_len(byte);
+            continue;
+        }
+
+        if single_quote {
+            if byte == b'\'' && bytes.get(p.wrapping_sub(1)).copied() != Some(b'\\') {
+                single_quote = false;
+            }
+            p += 1;
+            continue;
+        }
+        if double_quote {
+            if byte == b'"' && bytes.get(p.wrapping_sub(1)).copied() != Some(b'\\') {
+                double_quote = false;
+            }
+            p += 1;
+            continue;
+        }
+        if backtick {
+            if byte == b'`' {
+                backtick = false;
+            }
+            p += 1;
+            continue;
+        }
+        match byte {
+            b'\'' => {
+                single_quote = true;
+                p += 1;
+                continue;
+            }
+            b'"' => {
+                double_quote = true;
+                p += 1;
+                continue;
+            }
+            b'`' => {
+                backtick = true;
+                p += 1;
+                continue;
+            }
+            _ => {}
+        }
+
+        // Skip comments.
+        if byte == b'-' && bytes.get(p + 1) == Some(&b'-') {
+            while p < bytes.len() && bytes[p] != b'\n' {
+                p += 1;
+            }
+            continue;
+        }
+        if byte == b'/' && bytes.get(p + 1) == Some(&b'*') {
+            p += 2;
+            while p + 1 < bytes.len() && !(bytes[p] == b'*' && bytes[p + 1] == b'/') {
+                p += 1;
+            }
+            if p + 1 < bytes.len() {
+                p += 2;
+            }
+            continue;
+        }
+
+        match byte {
+            b'(' => {
+                depth += 1;
+                p += 1;
+                continue;
+            }
+            b')' => {
+                if depth == 0 {
+                    // Exited the enclosing scope without seeing a criterion.
+                    return false;
+                }
+                depth -= 1;
+                p += 1;
+                continue;
+            }
+            b';' if depth == 0 => return false,
+            b',' if depth == 0 => return false,
+            _ => {}
+        }
+
+        if depth == 0 {
+            let prev_ident = is_identifier_byte(bytes.get(p.wrapping_sub(1)).copied());
+            if !prev_ident {
+                if starts_with_keyword(bytes, p, "on")
+                    && !is_identifier_byte(bytes.get(p + 2).copied())
+                {
+                    return true;
+                }
+                if starts_with_keyword(bytes, p, "using")
+                    && !is_identifier_byte(bytes.get(p + 5).copied())
+                {
+                    return true;
+                }
+                // Any keyword that ends the current join's right-hand relation
+                // without an explicit criterion attached.
+                const TERMINATORS: &[&str] = &[
+                    "where", "group", "order", "limit", "having", "union",
+                    "intersect", "except", "into", "for", "lock", "window",
+                    "qualify", "fetch", "offset",
+                    "join", "inner", "left", "right", "full", "cross",
+                ];
+                for kw in TERMINATORS {
+                    if starts_with_keyword(bytes, p, kw)
+                        && !is_identifier_byte(bytes.get(p + kw.len()).copied())
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        p += 1;
+    }
+
+    false
 }
 
 /// Move `IGNORE NULLS` / `RESPECT NULLS` from before a comma to the end of
@@ -2338,6 +2869,65 @@ mod tests {
         let normalized2 = super::normalize_for_raw_parse("SELECT CAST(NULL AS ARRAY<JSON>)")
             .expect("normalize should succeed");
         assert_eq!(normalized2, "SELECT CAST(NULL AS ARRAY<JSON>)");
+    }
+
+    #[test]
+    fn normalize_for_raw_parse_rewrites_cross_join_with_on_criterion() {
+        // CROSS JOIN ... ON is semantically equivalent to INNER JOIN ... ON.
+        // sqlparser-rs rejects the CROSS form, so we rewrite the leading
+        // `CROSS` keyword to `INNER` before parsing.
+        let normalized =
+            super::normalize_for_raw_parse("SELECT * FROM a CROSS JOIN b ON a.k = b.k")
+                .expect("normalize should succeed");
+        assert_eq!(normalized, "SELECT * FROM a INNER JOIN b ON a.k = b.k");
+
+        // USING criterion is also rewritten.
+        let normalized =
+            super::normalize_for_raw_parse("SELECT * FROM a CROSS JOIN b USING(k)")
+                .expect("normalize should succeed");
+        assert_eq!(normalized, "SELECT * FROM a INNER JOIN b USING(k)");
+
+        // Plain CROSS JOIN without a criterion stays as CROSS JOIN.
+        let normalized = super::normalize_for_raw_parse("SELECT * FROM a CROSS JOIN b")
+            .expect("normalize should succeed");
+        assert_eq!(normalized, "SELECT * FROM a CROSS JOIN b");
+
+        let normalized =
+            super::normalize_for_raw_parse("SELECT * FROM a CROSS JOIN b WHERE a.k = b.k")
+                .expect("normalize should succeed");
+        assert_eq!(
+            normalized,
+            "SELECT * FROM a CROSS JOIN b WHERE a.k = b.k"
+        );
+
+        // CROSS JOIN with subquery and ON criterion.
+        let normalized = super::normalize_for_raw_parse(
+            "SELECT * FROM a CROSS JOIN (SELECT * FROM x) z ON z.k = a.k",
+        )
+        .expect("normalize should succeed");
+        assert_eq!(
+            normalized,
+            "SELECT * FROM a INNER JOIN (SELECT * FROM x) z ON z.k = a.k"
+        );
+
+        // Inside a CTE: the failing runtime-filter case reduced to its core
+        // shape.
+        let normalized = super::normalize_for_raw_parse(
+            "WITH cte AS (SELECT t1.c0 FROM cte0 CROSS JOIN db.t0 ON t0.c0 = cte0.c0) SELECT * FROM cte",
+        )
+        .expect("normalize should succeed");
+        assert_eq!(
+            normalized,
+            "WITH cte AS (SELECT t1.c0 FROM cte0 INNER JOIN db.t0 ON t0.c0 = cte0.c0) SELECT * FROM cte"
+        );
+
+        // String literals containing "CROSS JOIN ON" must not be rewritten.
+        let normalized = super::normalize_for_raw_parse(
+            "SELECT 'CROSS JOIN on test' AS s FROM t",
+        )
+        .expect("normalize should succeed");
+        assert!(normalized.contains("'CROSS JOIN on test'"));
+        assert!(!normalized.contains("INNER"));
     }
 
     #[test]

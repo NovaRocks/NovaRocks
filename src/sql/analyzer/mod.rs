@@ -1486,9 +1486,25 @@ impl<'a> AnalyzerContext<'a> {
                         }
                         _ => return Err("unsupported qualified wildcard expression".into()),
                     };
+                    // Tables are registered under their alias (or bare table
+                    // name) in scope, but users can address them with the
+                    // multi-part name they typed (e.g. `db.t0.*`). Fall back
+                    // to the last identifier segment when the full string
+                    // does not match anything, so `<db>.<tbl>.*` finds the
+                    // same columns as `<tbl>.*`.
+                    let fallback_qualifier = qualifier_str
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or(&qualifier_str)
+                        .to_string();
                     let mut found = false;
-                    for (qualifier, col_name, col_id, data_type, nullable) in
-                        scope.iter_qualified_columns(&qualifier_str)
+                    for (qualifier, col_name, col_id, data_type, nullable) in scope
+                        .iter_qualified_columns(&qualifier_str)
+                        .chain(if fallback_qualifier != qualifier_str {
+                            Some(scope.iter_qualified_columns(&fallback_qualifier))
+                        } else {
+                            None
+                        }.into_iter().flatten())
                     {
                         found = true;
                         let typed = TypedExpr {
