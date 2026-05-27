@@ -244,6 +244,67 @@ mod tests {
         assert_eq!(outcome.trace.stage_names().len(), 4);
     }
 
+    // ── Task-5 helpers ──────────────────────────────────────────────────────
+
+    struct FailingDummyRule;
+
+    impl LogicalRewriteRule for FailingDummyRule {
+        fn name(&self) -> &'static str {
+            "FailingDummyRule"
+        }
+
+        fn phase(&self) -> RewritePhase {
+            RewritePhase::LogicalNormalize
+        }
+
+        fn matches(&self, _plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
+            true
+        }
+
+        fn apply(
+            &self,
+            _plan: LogicalPlan,
+            _ctx: &mut RewriteContext,
+        ) -> Result<RewriteResult, String> {
+            Err("synthetic failure".to_string())
+        }
+    }
+
+    #[test]
+    fn failing_imv_rule_does_not_mutate_input_plan() {
+        use crate::sql::optimizer::rewrite::pipeline::{RewritePipeline, RewriteStage};
+        use crate::sql::optimizer::rewrite::trace::RewriteTraceEvent;
+
+        let original = empty_values_plan();
+        let before = format!("{original:?}");
+
+        let pipeline = RewritePipeline::from_stages(vec![RewriteStage::new(
+            "imv-logical-normalize",
+            RewritePhase::LogicalNormalize,
+            vec![Box::new(FailingDummyRule)],
+        )]);
+
+        let mut ctx_rw = RewriteContext::for_mv_refresh(Vec::<String>::new());
+        ctx_rw.set_extension::<ImvExtension>(ImvExtension {
+            mv_ctx: dummy_mv_ctx(),
+            annotation: ImvPlanAnnotation::default(),
+        });
+
+        let plan = empty_values_plan();
+        let err = pipeline.rewrite(plan, &mut ctx_rw).unwrap_err();
+        assert_eq!(err, "synthetic failure");
+
+        // Original plan binding is intact (Rust value semantics guarantee
+        // this; the assert documents the contract for future readers).
+        assert_eq!(format!("{original:?}"), before);
+
+        assert!(ctx_rw.trace().events().iter().any(|e| matches!(
+            e,
+            RewriteTraceEvent::RuleFailed { rule, .. }
+                if *rule == "FailingDummyRule"
+        )));
+    }
+
     // ── Pre-existing tests ──────────────────────────────────────────────────
 
     #[test]
