@@ -17,18 +17,27 @@
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{ArrayRef, BooleanArray};
+use arrow::datatypes::DataType;
 use std::sync::Arc;
 
 // IS NULL predicate for Arrow arrays
 pub fn eval_is_null(arena: &ExprArena, child: ExprId, chunk: &Chunk) -> Result<ArrayRef, String> {
     let array = arena.eval(child, chunk)?;
+    let len = array.len();
+
+    // Arrow's NullArray represents "all elements are NULL" without
+    // materialising a null buffer (the type itself encodes it). Its
+    // `nulls()` returns None, so the generic branch below would
+    // incorrectly classify the elements as non-null. Handle it here.
+    if matches!(array.data_type(), DataType::Null) {
+        return Ok(Arc::new(BooleanArray::from(vec![true; len])));
+    }
 
     // Check if array has null buffer
     if let Some(null_buffer) = array.nulls() {
         // Invert the null buffer: Arrow stores validity (1 = valid, 0 = null),
         // we want is_null (1 = null, 0 = not null)
         let null_count = null_buffer.null_count();
-        let len = array.len();
 
         if null_count == 0 {
             // No nulls, return all false
@@ -43,7 +52,7 @@ pub fn eval_is_null(arena: &ExprArena, child: ExprId, chunk: &Chunk) -> Result<A
         }
     } else {
         // No null buffer means no nulls, return all false
-        Ok(Arc::new(BooleanArray::from(vec![false; array.len()])))
+        Ok(Arc::new(BooleanArray::from(vec![false; len])))
     }
 }
 
@@ -54,13 +63,18 @@ pub fn eval_is_not_null(
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
     let array = arena.eval(child, chunk)?;
+    let len = array.len();
+
+    // See `eval_is_null`: NullArray is implicitly all-null.
+    if matches!(array.data_type(), DataType::Null) {
+        return Ok(Arc::new(BooleanArray::from(vec![false; len])));
+    }
 
     // Check if array has null buffer
     if let Some(null_buffer) = array.nulls() {
         // Arrow stores validity (1 = valid, 0 = null),
         // we want is_not_null (1 = not null, 0 = null)
         let null_count = null_buffer.null_count();
-        let len = array.len();
 
         if null_count == 0 {
             // No nulls, return all true
@@ -75,6 +89,6 @@ pub fn eval_is_not_null(
         }
     } else {
         // No null buffer means no nulls, return all true
-        Ok(Arc::new(BooleanArray::from(vec![true; array.len()])))
+        Ok(Arc::new(BooleanArray::from(vec![true; len])))
     }
 }
