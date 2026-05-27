@@ -847,38 +847,35 @@ impl FragmentDispatcher for InProcessDispatcher {
 
 /// Map result_buffer::TryFetchResult into FetchOutcome.
 /// Note: the existing TryFetchResult is 3-state (Ready/NotReady/Error);
-/// EOF is represented by Ready with empty queue AND close_ok flag.
-/// We add an EOF variant explicitly so callers don't have to inspect
-/// internal flags.
+/// EOF is represented as Ready(result) with result.eos == true.
 fn map_try_fetch_to_outcome(
     r: crate::runtime::result_buffer::TryFetchResult,
 ) -> FetchOutcome {
     use crate::runtime::result_buffer::TryFetchResult;
     match r {
-        TryFetchResult::Ready(batch) => FetchOutcome::Ready(batch.into_record_batch()),
+        TryFetchResult::Ready(result) if result.eos => FetchOutcome::Eof,
+        TryFetchResult::Ready(result) => FetchOutcome::Ready(result.into_record_batch()),
         TryFetchResult::NotReady => FetchOutcome::NotReady,
-        TryFetchResult::Eof => FetchOutcome::Eof,
         TryFetchResult::Error(e) => FetchOutcome::Err(e.to_string()),
     }
 }
 ```
 
-注：`TryFetchResult::Eof` 可能是新增的变体——如果 `src/runtime/result_buffer.rs` 当前没有显式 EOF 变体，需要在该文件新增（让 close_ok + 空队列时显式返回 Eof，而不是 Ready(empty)）。这是 PR-2 范围内的 cleanup。
+注：PR-3 采用的实际约定是 `TryFetchResult` 仍保持 `Ready/NotReady/Error` 三态；`close_ok + 空队列` 通过一次 `Ready(result)` 且 `result.eos == true` 表示 EOF。PR-4 的 `RemoteDispatcher` 应按 `result.eos` 映射到 `FetchOutcome::Eof`。
 
-- [ ] **Step 2.2.3：如果 ResultBuffer 没有 EOF 变体，新增**
+- [ ] **Step 2.2.3：确认 ResultBuffer EOF 约定**
 
-打开 `src/runtime/result_buffer.rs`，找到 `pub enum TryFetchResult`，确认其当前结构。若无 `Eof` 变体，加：
+打开 `src/runtime/result_buffer.rs`，找到 `pub enum TryFetchResult`，确认其当前结构保持三态：
 
 ```rust
 pub enum TryFetchResult {
     Ready(FetchResult),
     NotReady,
-    Eof,  // 新增：close_ok 且队列空
     Error(FetchError),
 }
 ```
 
-在 `try_fetch` 函数内部，把"close_ok 且队列空"的返回从原来的 `Ready(empty)` 或 `Error` 改成 `Eof`。注意：这是一个语义微调，可能需要修改 1-2 个调用点。先用 `cargo build` 找到所有 match 站点，逐个处理 `TryFetchResult::Eof` 分支。
+在 `try_fetch` / `wait_fetch` 中，`close_ok` 且队列空时返回一次 `Ready(FetchResult { eos: true, .. })`。调用方需要检查 `result.eos`，并在 true 时映射为 EOF。
 
 - [ ] **Step 2.2.4：跑 dispatcher 单测**
 
@@ -1724,19 +1721,19 @@ async fn fetch_result(
     let resp = match outcome {
         TryFetchResult::Ready(result) => {
             let batch_bytes = crate::common::thrift::thrift_serialize_result_batch(&result.result_batch);
+            let status = if result.eos {
+                fetch_result_response::Status::Eof
+            } else {
+                fetch_result_response::Status::Ready
+            };
             FetchResultResponse {
-                status: fetch_result_response::Status::Ready as i32,
+                status: status as i32,
                 result_batch_thrift: batch_bytes,
                 message: String::new(),
             }
         }
         TryFetchResult::NotReady => FetchResultResponse {
             status: fetch_result_response::Status::NotReady as i32,
-            result_batch_thrift: Vec::new(),
-            message: String::new(),
-        },
-        TryFetchResult::Eof => FetchResultResponse {
-            status: fetch_result_response::Status::Eof as i32,
             result_batch_thrift: Vec::new(),
             message: String::new(),
         },
@@ -2819,7 +2816,7 @@ EOF
 
 ## 风险与开放问题（执行时关注）
 
-1. **Step 2.2.3** ResultBuffer 是否需要新增 `Eof` 变体——开工时第一时间确认；若现有已显式区分则跳过。
+1. **Step 2.2.3** ResultBuffer EOF 约定——当前 PR-3 实现保持 `TryFetchResult` 三态，并用 `Ready(result)` + `result.eos == true` 表示 EOF；PR-4 应沿用该约定。
 2. **Step 2.4.6** 测试用的 `MultiFragmentBuildResult` builder 可能不存在；若没有，先写一个 `test_helpers::tiny_two_fragment_build_result()` 再写测试。
 3. **Step 3.2.3** `submit_exec_plan_fragment(thrift_bytes)` 是否真的不阻塞？若实测发现它会等 fragment 完成才返回，BE handler 改用 `tokio::task::spawn_blocking`，并在 plan 这里补一句确认 step。
 4. **Step 4.5.4** integration test 需要 `CARGO_BIN_EXE_novarocks` 能找到 binary；若 binary 名不叫 `novarocks`，调整。
