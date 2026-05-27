@@ -4,6 +4,7 @@ use crate::sql::optimizer::rewrite::phase::RewritePhase;
 pub(crate) enum RewriteTraceEvent {
     PhaseStarted {
         phase: RewritePhase,
+        stage: &'static str,
     },
     PhaseEnded {
         phase: RewritePhase,
@@ -49,7 +50,28 @@ impl RewriteTrace {
     }
 
     pub(crate) fn phase_started(&mut self, phase: RewritePhase) {
-        self.events.push(RewriteTraceEvent::PhaseStarted { phase });
+        self.events.push(RewriteTraceEvent::PhaseStarted {
+            stage: phase.as_str(),
+            phase,
+        });
+    }
+
+    pub(crate) fn phase_started_with_stage(&mut self, phase: RewritePhase, stage: &'static str) {
+        self.events
+            .push(RewriteTraceEvent::PhaseStarted { phase, stage });
+    }
+
+    pub(crate) fn stage_names(&self) -> Vec<&'static str> {
+        self.events
+            .iter()
+            .filter_map(|event| {
+                if let RewriteTraceEvent::PhaseStarted { stage, .. } = event {
+                    Some(*stage)
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     pub(crate) fn phase_ended(&mut self, phase: RewritePhase) {
@@ -140,7 +162,8 @@ mod tests {
         assert!(matches!(
             trace.events()[0],
             RewriteTraceEvent::PhaseStarted {
-                phase: RewritePhase::LogicalNormalize
+                phase: RewritePhase::LogicalNormalize,
+                ..
             }
         ));
         assert!(matches!(
@@ -157,5 +180,21 @@ mod tests {
                 phase: RewritePhase::LogicalNormalize
             }
         ));
+    }
+
+    #[test]
+    fn stage_names_returns_unique_labels_in_order() {
+        let mut trace = RewriteTrace::default();
+        trace.phase_started_with_stage(RewritePhase::LogicalNormalize, "stage-one");
+        trace.phase_ended(RewritePhase::LogicalNormalize);
+        trace.phase_started_with_stage(RewritePhase::StructuralRewrite, "stage-two");
+        trace.phase_ended(RewritePhase::StructuralRewrite);
+        trace.phase_started_with_stage(RewritePhase::StructuralRewrite, "stage-three");
+        trace.phase_ended(RewritePhase::StructuralRewrite);
+
+        assert_eq!(
+            trace.stage_names(),
+            vec!["stage-one", "stage-two", "stage-three"]
+        );
     }
 }

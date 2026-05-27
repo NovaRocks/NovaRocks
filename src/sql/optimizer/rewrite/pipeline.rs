@@ -69,7 +69,7 @@ impl RewritePipeline {
         for stage in &self.stages {
             let phase = stage.phase;
             ctx.check_deadline(stage.name)?;
-            ctx.trace_mut().phase_started(phase);
+            ctx.trace_mut().phase_started_with_stage(phase, stage.name);
 
             for iteration in 1..=ctx.policy().max_iterations {
                 ctx.check_deadline(stage.name)?;
@@ -275,6 +275,7 @@ mod tests {
             &[
                 RewriteTraceEvent::PhaseStarted {
                     phase: RewritePhase::LogicalNormalize,
+                    stage: "LogicalNormalize",
                 },
                 RewriteTraceEvent::IterationStarted {
                     phase: RewritePhase::LogicalNormalize,
@@ -285,6 +286,7 @@ mod tests {
                 },
                 RewriteTraceEvent::PhaseStarted {
                     phase: RewritePhase::Validation,
+                    stage: "Validation",
                 },
                 RewriteTraceEvent::IterationStarted {
                     phase: RewritePhase::Validation,
@@ -319,6 +321,7 @@ mod tests {
             &[
                 RewriteTraceEvent::PhaseStarted {
                     phase: RewritePhase::LogicalNormalize,
+                    stage: "LogicalNormalize",
                 },
                 RewriteTraceEvent::IterationStarted {
                     phase: RewritePhase::LogicalNormalize,

@@ -156,6 +156,7 @@ mod tests {
             &[
                 RewriteTraceEvent::PhaseStarted {
                     phase: RewritePhase::LogicalNormalize,
+                    stage: "LogicalNormalize",
                 },
                 RewriteTraceEvent::IterationStarted {
                     phase: RewritePhase::LogicalNormalize,
@@ -166,6 +167,7 @@ mod tests {
                 },
                 RewriteTraceEvent::PhaseStarted {
                     phase: RewritePhase::StructuralRewrite,
+                    stage: "StructuralRewrite",
                 },
                 RewriteTraceEvent::IterationStarted {
                     phase: RewritePhase::StructuralRewrite,
@@ -176,6 +178,7 @@ mod tests {
                 },
                 RewriteTraceEvent::PhaseStarted {
                     phase: RewritePhase::SemanticRewrite,
+                    stage: "SemanticRewrite",
                 },
                 RewriteTraceEvent::IterationStarted {
                     phase: RewritePhase::SemanticRewrite,
@@ -186,6 +189,7 @@ mod tests {
                 },
                 RewriteTraceEvent::PhaseStarted {
                     phase: RewritePhase::Validation,
+                    stage: "Validation",
                 },
                 RewriteTraceEvent::IterationStarted {
                     phase: RewritePhase::Validation,

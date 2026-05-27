@@ -87,4 +87,25 @@ mod tests {
 
         assert_eq!(format!("{:?}", outcome.plan), before);
     }
+
+    #[test]
+    fn empty_pipeline_traces_all_four_stage_names() {
+        let outcome = run_imv_rewrite(ImvRewriteInput {
+            plan: empty_values_plan(),
+            mv_ctx: dummy_mv_ctx(),
+            disabled_rules: Vec::new(),
+            deadline: None,
+        })
+        .expect("no-op IMV pipeline must succeed");
+
+        assert_eq!(
+            outcome.trace.stage_names(),
+            vec![
+                "imv-logical-normalize",
+                "imv-delta-marker",
+                "imv-marker-cleanup",
+                "imv-validation",
+            ]
+        );
+    }
 }
