@@ -573,6 +573,10 @@ pub(crate) fn submit_and_fetch_loop(
     let timeout = std::time::Duration::from_millis(timeout_ms.max(0) as u64);
     let deadline = std::time::Instant::now() + timeout;
     loop {
+        if crate::runtime::query_cancel::client_disconnected() {
+            dispatcher.cancel_fragments(&submitted);
+            return Err("client disconnected".to_string());
+        }
         let now = std::time::Instant::now();
         if now >= deadline {
             dispatcher.cancel_fragments(&submitted);
@@ -606,6 +610,7 @@ pub(crate) fn submit_and_fetch_loop(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -985,7 +990,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_times_out_and_cancels_when_fetch_stays_not_ready() {
+    fn query_timeout_triggers_cancel() {
         let inner = ControllableDispatcher::fetch_returns_not_ready();
         let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
         let root_finst_id = types::TUniqueId::new(4, 1);
@@ -1006,6 +1011,32 @@ mod tests {
             cancelled.len(),
             2,
             "all submitted fragments must be cancelled on timeout"
+        );
+    }
+
+    #[test]
+    fn client_disconnect_triggers_cancel() {
+        let inner = ControllableDispatcher::fetch_returns_not_ready();
+        let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
+        let root_finst_id = types::TUniqueId::new(5, 1);
+        let params = vec![make_params_with_finst(5, 10), make_params_with_finst(5, 1)];
+        let disconnected = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+        let result =
+            crate::runtime::query_cancel::with_client_disconnect_signal(disconnected, || {
+                submit_and_fetch_loop(&dispatcher, params, root_finst_id, 100)
+            });
+
+        let err = result.expect_err("expected client disconnect error");
+        assert!(
+            err.contains("client disconnected"),
+            "disconnect error should be explicit, got: {err}"
+        );
+        let cancelled = inner.cancelled_ids();
+        assert_eq!(
+            cancelled.len(),
+            2,
+            "all submitted fragments must be cancelled on disconnect"
         );
     }
 }

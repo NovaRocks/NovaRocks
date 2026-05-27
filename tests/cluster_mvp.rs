@@ -1,4 +1,5 @@
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{Shutdown, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, MutexGuard, mpsc};
@@ -9,6 +10,12 @@ use mysql::{Conn as MysqlConn, OptsBuilder};
 use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 
 static CLUSTER_MVP_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_cluster_mvp() -> MutexGuard<'static, ()> {
+    CLUSTER_MVP_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn alloc_port() -> u16 {
     std::net::TcpListener::bind(("127.0.0.1", 0))
@@ -113,6 +120,37 @@ impl ProcessGuard {
         }
         stderr
     }
+
+    fn wait_for_output_contains(&mut self, marker: &str, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        let mut stdout = Vec::new();
+        loop {
+            if let Some(status) = self.child.try_wait().expect("poll child") {
+                panic!(
+                    "novarocks exited before marker `{marker}` with status {status}; stdout={stdout:?}; stderr={}",
+                    self.read_stderr()
+                );
+            }
+            match self.stdout_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(line) => {
+                    if line.contains(marker) {
+                        return;
+                    }
+                    stdout.push(line);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("stdout closed before marker `{marker}`; stdout={stdout:?}");
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "timed out waiting for marker `{marker}`; stdout={stdout:?}; stderr={}",
+                    self.read_stderr()
+                );
+            }
+        }
+    }
 }
 
 impl Drop for ProcessGuard {
@@ -142,13 +180,171 @@ fn connect_mysql(port: u16) -> MysqlConn {
     }
 }
 
+struct ClusterHarness {
+    be: ProcessGuard,
+    _fe: ProcessGuard,
+    fe_mysql: u16,
+}
+
+impl ClusterHarness {
+    fn start(be_debug: &str, fe_extra: &str) -> Self {
+        let be_http = alloc_port();
+        let be_starlet = alloc_port();
+        let fe_mysql = alloc_port();
+        let fe_http = alloc_port();
+        let fe_starlet = alloc_port();
+
+        let be_config = write_config(
+            "be",
+            &format!(
+                r#"
+[server]
+host = "127.0.0.1"
+http_port = {be_http}
+starlet_port = {be_starlet}
+
+[cluster]
+role = "be"
+{be_debug}
+"#
+            ),
+        );
+        let fe_config = write_config(
+            "fe",
+            &format!(
+                r#"
+[server]
+host = "127.0.0.1"
+http_port = {fe_http}
+starlet_port = {fe_starlet}
+
+[standalone_server]
+mysql_port = {fe_mysql}
+
+[cluster]
+role = "fe"
+backends = ["127.0.0.1:{be_starlet}"]
+{fe_extra}
+"#
+            ),
+        );
+
+        let mut be = ProcessGuard::spawn(be_config.path());
+        be.wait_for_ready("NOVAROCKS_READY role=be");
+
+        let mut fe = ProcessGuard::spawn(fe_config.path());
+        fe.wait_for_ready("NOVAROCKS_READY mysql_port=");
+
+        Self {
+            be,
+            _fe: fe,
+            fe_mysql,
+        }
+    }
+}
+
+fn coordinated_query_sql() -> &'static str {
+    "SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v"
+}
+
+fn multi_submit_query_sql() -> &'static str {
+    "WITH cte AS (SELECT 1 AS v UNION ALL SELECT 2) \
+     SELECT a.v FROM cte a JOIN cte b ON a.v = b.v ORDER BY a.v"
+}
+
+fn read_packet(stream: &mut TcpStream) -> (u8, Vec<u8>) {
+    let mut header = [0u8; 4];
+    stream
+        .read_exact(&mut header)
+        .expect("read mysql packet header");
+    let len =
+        usize::from(header[0]) | (usize::from(header[1]) << 8) | (usize::from(header[2]) << 16);
+    let mut payload = vec![0u8; len];
+    stream
+        .read_exact(&mut payload)
+        .expect("read mysql packet payload");
+    (header[3], payload)
+}
+
+fn write_packet(stream: &mut TcpStream, seq: u8, payload: &[u8]) {
+    let len = u32::try_from(payload.len()).expect("payload fits u32");
+    assert!(len <= 0x00ff_ffff, "payload too large");
+    let header = [
+        (len & 0xff) as u8,
+        ((len >> 8) & 0xff) as u8,
+        ((len >> 16) & 0xff) as u8,
+        seq,
+    ];
+    stream
+        .write_all(&header)
+        .expect("write mysql packet header");
+    stream
+        .write_all(payload)
+        .expect("write mysql packet payload");
+    stream.flush().expect("flush mysql packet");
+}
+
+fn send_mysql_query_and_disconnect(port: u16, sql: &str) {
+    const CLIENT_LONG_PASSWORD: u32 = 0x0000_0001;
+    const CLIENT_LONG_FLAG: u32 = 0x0000_0004;
+    const CLIENT_PROTOCOL_41: u32 = 0x0000_0200;
+    const CLIENT_TRANSACTIONS: u32 = 0x0000_2000;
+    const CLIENT_SECURE_CONNECTION: u32 = 0x0000_8000;
+    const CLIENT_PLUGIN_AUTH: u32 = 0x0008_0000;
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect raw mysql client");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .expect("set write timeout");
+
+    let (_seq, handshake) = read_packet(&mut stream);
+    assert_eq!(handshake[0], 10, "expected protocol v10 handshake");
+
+    let mut response = Vec::new();
+    let client_flags = CLIENT_LONG_PASSWORD
+        | CLIENT_LONG_FLAG
+        | CLIENT_PROTOCOL_41
+        | CLIENT_TRANSACTIONS
+        | CLIENT_SECURE_CONNECTION
+        | CLIENT_PLUGIN_AUTH;
+    response.extend_from_slice(&client_flags.to_le_bytes());
+    response.extend_from_slice(&(16_u32 * 1024 * 1024).to_le_bytes());
+    response.push(45);
+    response.extend_from_slice(&[0u8; 23]);
+    response.extend_from_slice(b"root");
+    response.push(0);
+    response.push(0);
+    response.extend_from_slice(b"mysql_native_password");
+    response.push(0);
+    write_packet(&mut stream, 1, &response);
+
+    let (_seq, auth_result) = read_packet(&mut stream);
+    assert_ne!(
+        auth_result.first().copied(),
+        Some(0xff),
+        "authentication failed"
+    );
+
+    let mut query_payload = Vec::with_capacity(sql.len() + 1);
+    query_payload.push(0x03);
+    query_payload.extend_from_slice(sql.as_bytes());
+    write_packet(&mut stream, 0, &query_payload);
+
+    stream
+        .shutdown(Shutdown::Both)
+        .expect("shutdown raw mysql client");
+}
+
 #[test]
 fn cross_process_remote_dispatcher_smoke() {
     let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
     if !binary.exists() {
         return;
     }
-    let _lock: MutexGuard<'static, ()> = CLUSTER_MVP_TEST_LOCK.lock().expect("cluster mvp lock");
+    let _lock = lock_cluster_mvp();
 
     let be_http = alloc_port();
     let be_starlet = alloc_port();
@@ -214,7 +410,7 @@ backends = ["127.0.0.1:{be_starlet}"]
     // SELECT + ORDER BY on a non-trivial UNION forces Sort(Distribution(Gather))
     // which splits into two fragments, routing through RemoteDispatcher to the BE.
     let rows: Vec<String> = conn
-        .query("SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v")
+        .query(coordinated_query_sql())
         .expect("coordinated query must succeed while BE is running");
     assert_eq!(
         rows,
@@ -230,11 +426,109 @@ backends = ["127.0.0.1:{be_starlet}"]
     std::thread::sleep(Duration::from_millis(300));
 
     let err = conn
-        .query::<String, _>("SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v")
+        .query::<String, _>(coordinated_query_sql())
         .expect_err("coordinated query must fail once BE is down");
     let err_str = err.to_string();
     assert!(
         !err_str.is_empty(),
         "expected a non-empty error when BE is unreachable, got empty string"
+    );
+}
+
+#[test]
+fn submit_half_failure_cancels_submitted() {
+    let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
+    if !binary.exists() {
+        return;
+    }
+    let _lock = lock_cluster_mvp();
+
+    let cluster = ClusterHarness::start(
+        r#"
+[debug]
+emit_cancel_marker = true
+"#,
+        r#"
+[debug]
+fault_inject_submit_fail_after = 1
+"#,
+    );
+
+    let mut conn = connect_mysql(cluster.fe_mysql);
+    let err = conn
+        .query::<String, _>(multi_submit_query_sql())
+        .expect_err("second fragment submit should fail");
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("submit_fragment") || err_str.contains("submit"),
+        "expected submit failure, got: {err_str}"
+    );
+    assert!(
+        err_str.contains("debug submit fault injected"),
+        "expected injected submit failure, got: {err_str}"
+    );
+}
+
+#[test]
+fn mysql_disconnect_triggers_cancel() {
+    let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
+    if !binary.exists() {
+        return;
+    }
+    let _lock = lock_cluster_mvp();
+
+    let mut cluster = ClusterHarness::start(
+        r#"
+[debug]
+emit_cancel_marker = true
+"#,
+        r#"
+[debug]
+fault_inject_fetch_not_ready_count = 1000
+"#,
+    );
+
+    send_mysql_query_and_disconnect(cluster.fe_mysql, multi_submit_query_sql());
+
+    cluster
+        .be
+        .wait_for_output_contains("NOVAROCKS_CANCEL count=1", Duration::from_secs(5));
+}
+
+#[test]
+fn be_kill9_during_query_fails_cleanly() {
+    let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
+    if !binary.exists() {
+        return;
+    }
+    let _lock = lock_cluster_mvp();
+
+    let cluster = ClusterHarness::start(
+        r#"
+[debug]
+fault_inject_fetch_not_ready_count = 1000
+"#,
+        "",
+    );
+
+    let (tx, rx) = mpsc::channel();
+    let fe_mysql = cluster.fe_mysql;
+    std::thread::spawn(move || {
+        let mut conn = connect_mysql(fe_mysql);
+        let result = conn.query::<String, _>(multi_submit_query_sql());
+        tx.send(result.map_err(|err| err.to_string()))
+            .expect("send query result");
+    });
+
+    std::thread::sleep(Duration::from_millis(300));
+    drop(cluster.be);
+
+    let result = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("query should finish after BE dies");
+    let err = result.expect_err("query should fail once BE is killed");
+    assert!(
+        !err.is_empty(),
+        "expected a non-empty FE error after BE crash"
     );
 }

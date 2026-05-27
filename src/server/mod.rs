@@ -3,8 +3,11 @@ mod encoding;
 use std::collections::BTreeMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use async_trait::async_trait;
 use mysql_common::scramble::scramble_native;
@@ -35,6 +38,20 @@ const DEFAULT_MYSQL_PORT: u16 = 9030;
 const DEFAULT_CATALOG: &str = "default_catalog";
 const ROOT_USER: &str = "root";
 static NEXT_CONNECTION_ID: AtomicU32 = AtomicU32::new(1);
+
+struct ClientDisconnectWatcher {
+    stop: Arc<AtomicBool>,
+    join_handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for ClientDisconnectWatcher {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.join_handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StandaloneServerOptions {
@@ -277,7 +294,15 @@ async fn serve_forever(
         let user = user.clone();
         tokio::spawn(async move {
             let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
-            let shim = NovaRocksMysqlShim::new(engine, user, connection_id);
+            let (client_disconnect_signal, disconnect_watcher) =
+                spawn_client_disconnect_watcher(&stream);
+            let shim = NovaRocksMysqlShim::new(
+                engine,
+                user,
+                connection_id,
+                client_disconnect_signal,
+                disconnect_watcher,
+            );
             let (reader, writer) = stream.into_split();
             if let Err(err) = AsyncMysqlIntermediary::run_on(shim, reader, writer).await {
                 warn!(
@@ -289,10 +314,92 @@ async fn serve_forever(
     }
 }
 
+#[cfg(unix)]
+fn spawn_client_disconnect_watcher(
+    stream: &tokio::net::TcpStream,
+) -> (Arc<AtomicBool>, ClientDisconnectWatcher) {
+    let disconnected = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let fd = unsafe { libc::dup(stream.as_raw_fd()) };
+    if fd < 0 {
+        return (
+            disconnected,
+            ClientDisconnectWatcher {
+                stop,
+                join_handle: None,
+            },
+        );
+    }
+
+    let watcher_disconnected = Arc::clone(&disconnected);
+    let watcher_stop = Arc::clone(&stop);
+    let join_handle = std::thread::spawn(move || {
+        let mut buf = [0u8; 1];
+        loop {
+            if watcher_stop.load(Ordering::SeqCst) || watcher_disconnected.load(Ordering::SeqCst) {
+                break;
+            }
+            let rc = unsafe {
+                libc::recv(
+                    fd,
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                )
+            };
+            if rc == 0 {
+                watcher_disconnected.store(true, Ordering::SeqCst);
+                break;
+            }
+            if rc < 0 {
+                let err = io::Error::last_os_error();
+                match err.kind() {
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => {}
+                    io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::NotConnected => {
+                        watcher_disconnected.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        unsafe {
+            libc::close(fd);
+        }
+    });
+    (
+        disconnected,
+        ClientDisconnectWatcher {
+            stop,
+            join_handle: Some(join_handle),
+        },
+    )
+}
+
+#[cfg(not(unix))]
+fn spawn_client_disconnect_watcher(
+    _stream: &tokio::net::TcpStream,
+) -> (Arc<AtomicBool>, ClientDisconnectWatcher) {
+    let disconnected = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    (
+        disconnected,
+        ClientDisconnectWatcher {
+            stop,
+            join_handle: None,
+        },
+    )
+}
+
 struct NovaRocksMysqlShim {
     engine: StandaloneNovaRocks,
     user: String,
     connection_id: u32,
+    client_disconnect_signal: Arc<AtomicBool>,
+    _disconnect_watcher: ClientDisconnectWatcher,
     current_catalog: Option<String>,
     current_db: String,
     /// Per-session query timeout (in seconds). `None` means no timeout.
@@ -306,11 +413,19 @@ struct NovaRocksMysqlShim {
 }
 
 impl NovaRocksMysqlShim {
-    fn new(engine: StandaloneNovaRocks, user: String, connection_id: u32) -> Self {
+    fn new(
+        engine: StandaloneNovaRocks,
+        user: String,
+        connection_id: u32,
+        client_disconnect_signal: Arc<AtomicBool>,
+        disconnect_watcher: ClientDisconnectWatcher,
+    ) -> Self {
         Self {
             engine,
             user,
             connection_id,
+            client_disconnect_signal,
+            _disconnect_watcher: disconnect_watcher,
             current_catalog: None,
             current_db: DEFAULT_DATABASE.to_string(),
             query_timeout_secs: None,
@@ -876,6 +991,7 @@ async fn execute_sql_in_worker(
         crate::sql::parser::set_var_hint::extract_allow_throw_exception(&sql);
     let query_options = crate::internal_service::TQueryOptions {
         group_concat_max_len: Some(shim.group_concat_max_len),
+        query_timeout: query_timeout.and_then(|secs| i32::try_from(secs).ok()),
         allow_throw_exception: if allow_throw_exception {
             Some(true)
         } else {
@@ -883,32 +999,27 @@ async fn execute_sql_in_worker(
         },
         ..Default::default()
     };
+    let client_disconnect_signal = Arc::clone(&shim.client_disconnect_signal);
 
     let join_handle = task::spawn_blocking(move || {
-        crate::sql::optimizer::options::with_session_optimizer_settings(optimizer_settings, || {
-            session.execute_in_context(
-                &sql,
-                current_catalog.as_deref(),
-                &current_db,
-                Some(query_options),
-            )
-        })
+        crate::runtime::query_cancel::with_client_disconnect_signal(
+            client_disconnect_signal,
+            || {
+                crate::sql::optimizer::options::with_session_optimizer_settings(
+                    optimizer_settings,
+                    || {
+                        session.execute_in_context(
+                            &sql,
+                            current_catalog.as_deref(),
+                            &current_db,
+                            Some(query_options),
+                        )
+                    },
+                )
+            },
+        )
     });
-
-    let result = match query_timeout {
-        Some(secs) => {
-            match tokio::time::timeout(std::time::Duration::from_secs(secs), join_handle).await {
-                Ok(join_result) => join_result,
-                Err(_elapsed) => {
-                    return Err((
-                        ErrorKind::ER_QUERY_INTERRUPTED,
-                        format!("Query exceeded timeout of {secs}s"),
-                    ));
-                }
-            }
-        }
-        None => join_handle.await,
-    };
+    let result = join_handle.await;
 
     match result {
         Ok(Ok(result)) => Ok(result),

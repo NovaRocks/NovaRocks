@@ -16,6 +16,7 @@
 // under the License.
 use std::collections::HashMap;
 use std::net::{SocketAddr, TcpListener};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
@@ -44,6 +45,9 @@ use crate::service::{load_tracking_http, stream_load_http};
 pub use crate::service::grpc_proto as proto;
 
 const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+static SUBMIT_FRAGMENT_CALLS: AtomicUsize = AtomicUsize::new(0);
+static FETCH_RESULT_CALLS: AtomicUsize = AtomicUsize::new(0);
+static CANCEL_FRAGMENT_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Default)]
 struct GrpcServerState {
@@ -233,6 +237,14 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         &self,
         request: tonic::Request<proto::novarocks::SubmitFragmentRequest>,
     ) -> Result<tonic::Response<proto::novarocks::SubmitFragmentResponse>, tonic::Status> {
+        let call_index = SUBMIT_FRAGMENT_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+        if crate::common::config::debug_fault_inject_submit_fail_after()
+            .is_some_and(|successes| call_index > successes)
+        {
+            return Err(tonic::Status::unavailable(format!(
+                "debug submit fault injected on call {call_index}"
+            )));
+        }
         let bytes = request.into_inner().exec_plan_fragment_params_thrift;
         // submit_exec_plan_fragment does thrift deserialization and pipeline setup,
         // which is CPU-bound. Offload to the blocking thread pool so tonic worker
@@ -280,6 +292,18 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
                 ));
             }
         };
+        let call_index = FETCH_RESULT_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+        if crate::common::config::debug_fault_inject_fetch_not_ready_count()
+            .is_some_and(|limit| call_index <= limit)
+        {
+            return Ok(tonic::Response::new(
+                proto::novarocks::FetchResultResponse {
+                    status: FetchStatus::NotReady as i32,
+                    result_batch_thrift: vec![],
+                    message: String::new(),
+                },
+            ));
+        }
 
         // wait_fetch uses std::sync::Condvar::wait_timeout, which blocks the OS
         // thread for up to max_wait_ms. Offload to the blocking thread pool so
@@ -331,11 +355,20 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
     ) -> Result<tonic::Response<proto::novarocks::CancelFragmentResponse>, tonic::Status> {
         let req = request.into_inner();
         for id in &req.finst_ids {
-            crate::runtime::exchange::cancel_fragment(id.hi, id.lo);
-            crate::runtime::result_buffer::cancel(crate::UniqueId {
+            crate::cancel(crate::UniqueId {
                 hi: id.hi,
                 lo: id.lo,
             });
+        }
+        if crate::common::config::debug_emit_cancel_marker() {
+            let count = CANCEL_FRAGMENT_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+            println!(
+                "NOVAROCKS_CANCEL count={} finsts={} reason={}",
+                count,
+                req.finst_ids.len(),
+                req.reason
+            );
+            let _ = std::io::Write::flush(&mut std::io::stdout());
         }
         Ok(tonic::Response::new(
             proto::novarocks::CancelFragmentResponse { status_code: 0 },

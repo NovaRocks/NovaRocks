@@ -1140,6 +1140,12 @@ pub struct DebugConfig {
     /// Dump RPC inputs as "named_json" for `exec_plan_fragment` / `exec_batch_plan_fragments`.
     /// This is config-only (no env var fallback).
     pub exec_batch_plan_json: bool,
+    #[serde(default)]
+    pub fault_inject_submit_fail_after: Option<usize>,
+    #[serde(default)]
+    pub fault_inject_fetch_not_ready_count: Option<usize>,
+    #[serde(default)]
+    pub emit_cancel_marker: bool,
 }
 
 #[derive(Clone, Deserialize)]

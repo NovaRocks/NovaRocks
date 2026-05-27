@@ -24,6 +24,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -52,6 +53,9 @@ use crate::service::grpc_proto::novarocks::{
 };
 use crate::{data_sinks, types};
 use tracing::warn;
+
+static REMOTE_SUBMIT_CALLS: AtomicUsize = AtomicUsize::new(0);
+static REMOTE_FETCH_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 /// Outcome of a single `fetch_result` call.
 pub enum FetchOutcome {
@@ -518,6 +522,14 @@ impl FragmentDispatcher for RemoteDispatcher {
         &self,
         params: internal_service::TExecPlanFragmentParams,
     ) -> Result<(), String> {
+        let call_index = REMOTE_SUBMIT_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+        if crate::common::config::debug_fault_inject_submit_fail_after()
+            .is_some_and(|successes| call_index > successes)
+        {
+            println!("NOVAROCKS_SUBMIT_FAIL call={call_index}");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            return Err(format!("debug submit fault injected on call {call_index}"));
+        }
         let payload = serialize_thrift_binary(&params)
             .map_err(|e| format!("serialize fragment params for remote submit failed: {e}"))?;
         let resp = self
@@ -539,6 +551,14 @@ impl FragmentDispatcher for RemoteDispatcher {
         finst_id: types::TUniqueId,
         max_wait_ms: i64,
     ) -> Result<FetchOutcome, String> {
+        let call_index = REMOTE_FETCH_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+        if crate::common::config::debug_fault_inject_fetch_not_ready_count()
+            .is_some_and(|limit| call_index <= limit)
+        {
+            println!("NOVAROCKS_FETCH_NOT_READY call={call_index}");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            return Ok(FetchOutcome::NotReady);
+        }
         let resp = self.client()?.blocking_fetch_result(FetchResultRequest {
             finst_id: Some(PUniqueId {
                 hi: finst_id.hi,
