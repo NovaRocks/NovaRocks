@@ -1132,20 +1132,113 @@ impl Default for CacheConfig {
     }
 }
 
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Default)]
 pub struct DebugConfig {
-    #[serde(default)]
     pub exec_node_output: bool,
-    #[serde(default)]
     /// Dump RPC inputs as "named_json" for `exec_plan_fragment` / `exec_batch_plan_fragments`.
     /// This is config-only (no env var fallback).
     pub exec_batch_plan_json: bool,
-    #[serde(default)]
+    #[cfg(debug_assertions)]
     pub fault_inject_submit_fail_after: Option<usize>,
-    #[serde(default)]
+    #[cfg(debug_assertions)]
     pub fault_inject_fetch_not_ready_count: Option<usize>,
-    #[serde(default)]
+    #[cfg(debug_assertions)]
     pub emit_cancel_marker: bool,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct DebugConfigToml {
+    exec_node_output: bool,
+    exec_batch_plan_json: bool,
+    fault_inject_submit_fail_after: Option<usize>,
+    fault_inject_fetch_not_ready_count: Option<usize>,
+    emit_cancel_marker: bool,
+}
+
+#[cfg(not(debug_assertions))]
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct DebugConfigToml {
+    exec_node_output: bool,
+    exec_batch_plan_json: bool,
+    fault_inject_submit_fail_after: Option<usize>,
+    fault_inject_fetch_not_ready_count: Option<usize>,
+    emit_cancel_marker: Option<bool>,
+}
+
+impl<'de> Deserialize<'de> for DebugConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = DebugConfigToml::deserialize(deserializer)?;
+        #[cfg(debug_assertions)]
+        {
+            Ok(Self {
+                exec_node_output: raw.exec_node_output,
+                exec_batch_plan_json: raw.exec_batch_plan_json,
+                fault_inject_submit_fail_after: raw.fault_inject_submit_fail_after,
+                fault_inject_fetch_not_ready_count: raw.fault_inject_fetch_not_ready_count,
+                emit_cancel_marker: raw.emit_cancel_marker,
+            })
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            if raw.fault_inject_submit_fail_after.is_some() {
+                return Err(serde::de::Error::custom(
+                    "debug.fault_inject_submit_fail_after is only available in debug builds",
+                ));
+            }
+            if raw.fault_inject_fetch_not_ready_count.is_some() {
+                return Err(serde::de::Error::custom(
+                    "debug.fault_inject_fetch_not_ready_count is only available in debug builds",
+                ));
+            }
+            if raw.emit_cancel_marker.is_some() {
+                return Err(serde::de::Error::custom(
+                    "debug.emit_cancel_marker is only available in debug builds",
+                ));
+            }
+            Ok(Self {
+                exec_node_output: raw.exec_node_output,
+                exec_batch_plan_json: raw.exec_batch_plan_json,
+            })
+        }
+    }
+}
+
+impl DebugConfig {
+    #[cfg(debug_assertions)]
+    pub fn fault_inject_submit_fail_after(&self) -> Option<usize> {
+        self.fault_inject_submit_fail_after
+    }
+
+    #[cfg(not(debug_assertions))]
+    pub fn fault_inject_submit_fail_after(&self) -> Option<usize> {
+        None
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn fault_inject_fetch_not_ready_count(&self) -> Option<usize> {
+        self.fault_inject_fetch_not_ready_count
+    }
+
+    #[cfg(not(debug_assertions))]
+    pub fn fault_inject_fetch_not_ready_count(&self) -> Option<usize> {
+        None
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn emit_cancel_marker(&self) -> bool {
+        self.emit_cancel_marker
+    }
+
+    #[cfg(not(debug_assertions))]
+    pub fn emit_cancel_marker(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -1332,6 +1425,57 @@ enable_path_style_access = true
         );
         assert_eq!(standalone.mysql_port, 9030);
         assert!(standalone.object_store.is_some());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn test_debug_fault_injection_knobs_parse_in_debug_builds() {
+        let cfg: NovaRocksConfig = toml::from_str(
+            r#"
+[debug]
+fault_inject_submit_fail_after = 1
+fault_inject_fetch_not_ready_count = 2
+emit_cancel_marker = true
+"#,
+        )
+        .expect("parse config");
+        assert_eq!(cfg.debug.fault_inject_submit_fail_after, Some(1));
+        assert_eq!(cfg.debug.fault_inject_fetch_not_ready_count, Some(2));
+        assert!(cfg.debug.emit_cancel_marker);
+    }
+
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn test_debug_fault_injection_knobs_are_rejected_in_release_builds() {
+        let err = match toml::from_str::<NovaRocksConfig>(
+            r#"
+[debug]
+fault_inject_submit_fail_after = 1
+"#,
+        ) {
+            Ok(_) => panic!("release config must reject fault injection knobs"),
+            Err(err) => err,
+        };
+        let err = err.to_string();
+        assert!(
+            err.contains("fault_inject_submit_fail_after"),
+            "unexpected parse error: {err}"
+        );
+
+        let err = match toml::from_str::<NovaRocksConfig>(
+            r#"
+[debug]
+emit_cancel_marker = false
+"#,
+        ) {
+            Ok(_) => panic!("release config must reject emit_cancel_marker knob"),
+            Err(err) => err,
+        };
+        let err = err.to_string();
+        assert!(
+            err.contains("emit_cancel_marker"),
+            "unexpected parse error: {err}"
+        );
     }
 
     #[test]

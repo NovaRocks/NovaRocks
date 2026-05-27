@@ -247,6 +247,10 @@ fn coordinated_query_sql() -> &'static str {
     "SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v"
 }
 
+fn coordinated_sleep_query_sql() -> &'static str {
+    "SELECT v FROM (SELECT sleep(2) AS v UNION ALL SELECT sleep(2)) t ORDER BY v"
+}
+
 fn multi_submit_query_sql() -> &'static str {
     "WITH cte AS (SELECT 1 AS v UNION ALL SELECT 2) \
      SELECT a.v FROM cte a JOIN cte b ON a.v = b.v ORDER BY a.v"
@@ -481,14 +485,45 @@ fn mysql_disconnect_triggers_cancel() {
         r#"
 [debug]
 emit_cancel_marker = true
+fault_inject_fetch_not_ready_count = 10000000
 "#,
-        r#"
-[debug]
-fault_inject_fetch_not_ready_count = 1000
-"#,
+        "",
     );
 
     send_mysql_query_and_disconnect(cluster.fe_mysql, multi_submit_query_sql());
+
+    cluster
+        .be
+        .wait_for_output_contains("NOVAROCKS_CANCEL count=1", Duration::from_secs(5));
+}
+
+#[test]
+fn query_timeout_triggers_cancel() {
+    let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
+    if !binary.exists() {
+        return;
+    }
+    let _lock = lock_cluster_mvp();
+
+    let mut cluster = ClusterHarness::start(
+        r#"
+[debug]
+emit_cancel_marker = true
+"#,
+        "",
+    );
+
+    let mut conn = connect_mysql(cluster.fe_mysql);
+    conn.query_drop("SET query_timeout = 1")
+        .expect("set query timeout");
+    let err = conn
+        .query::<String, _>(coordinated_sleep_query_sql())
+        .expect_err("query should time out while BE is still executing");
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("timed out") || err_str.contains("timeout"),
+        "expected timeout error, got: {err_str}"
+    );
 
     cluster
         .be

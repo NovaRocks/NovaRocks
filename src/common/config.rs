@@ -33,19 +33,19 @@ pub(crate) fn debug_exec_batch_plan_json() -> bool {
 pub(crate) fn debug_fault_inject_submit_fail_after() -> Option<usize> {
     novarocks_app_config()
         .ok()
-        .and_then(|c| c.debug.fault_inject_submit_fail_after)
+        .and_then(|c| c.debug.fault_inject_submit_fail_after())
 }
 
 pub(crate) fn debug_fault_inject_fetch_not_ready_count() -> Option<usize> {
     novarocks_app_config()
         .ok()
-        .and_then(|c| c.debug.fault_inject_fetch_not_ready_count)
+        .and_then(|c| c.debug.fault_inject_fetch_not_ready_count())
 }
 
 pub(crate) fn debug_emit_cancel_marker() -> bool {
     novarocks_app_config()
         .ok()
-        .map(|c| c.debug.emit_cancel_marker)
+        .map(|c| c.debug.emit_cancel_marker())
         .unwrap_or(false)
 }
 
