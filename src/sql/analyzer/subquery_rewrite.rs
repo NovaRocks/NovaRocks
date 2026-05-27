@@ -955,11 +955,23 @@ impl<'a> AnalyzerContext<'a> {
         // Check if the IN placeholder is inside an OR expression.
         // If so, SEMI JOIN semantics are wrong — we need LEFT OUTER JOIN
         // + IS [NOT] NULL replacement (matching StarRocks FE approach).
+        //
+        // The same LEFT-OUTER-JOIN-with-match-indicator shape is also the
+        // only sensible rewrite when the IN placeholder lives in a SELECT
+        // projection (`SELECT x IN (SELECT y FROM …) FROM t`): the
+        // expression must evaluate to a boolean column per outer row.
+        // A SEMI JOIN would drop non-matching rows; the indicator form
+        // keeps them with a `FALSE` value.
+        let in_projection = select
+            .projection
+            .iter()
+            .any(|p| expr_contains_placeholder(&p.expr, sq_info.id));
         let inside_or = select
             .filter
             .as_ref()
             .map(|f| is_placeholder_inside_or(f, sq_info.id))
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || in_projection;
 
         // Correlated subquery: if any predicate in the subquery WHERE references
         // an outer-scope column (e.g. `WHERE t.x = outer.y`), the wrapped
@@ -1150,6 +1162,11 @@ impl<'a> AnalyzerContext<'a> {
             };
             Self::replace_placeholder_in_filter(&mut select.filter, sq_info.id, &is_null_expr);
             Self::replace_placeholder_in_filter(&mut select.having, sq_info.id, &is_null_expr);
+            Self::replace_placeholder_in_projection(
+                &mut select.projection,
+                sq_info.id,
+                &is_null_expr,
+            );
         } else {
             // Standard case: SEMI / ANTI JOIN. NULL handling for NOT IN is
             // baked into `eq_cond` above (null-aware equality), so the
