@@ -554,6 +554,7 @@ pub(crate) fn submit_and_fetch_loop(
     root_finst_id: types::TUniqueId,
     timeout_ms: i64,
 ) -> Result<Vec<crate::exec::chunk::Chunk>, String> {
+    const REMOTE_FETCH_POLL_INTERVAL_MS: i64 = 300;
     let mut submitted: Vec<types::TUniqueId> = Vec::with_capacity(all_params.len());
 
     for p in all_params {
@@ -586,7 +587,8 @@ pub(crate) fn submit_and_fetch_loop(
             .saturating_duration_since(now)
             .as_millis()
             .min(i64::MAX as u128) as i64;
-        match dispatcher.fetch_result(root_finst_id.clone(), remaining_ms.max(1)) {
+        let fetch_wait_ms = remaining_ms.clamp(1, REMOTE_FETCH_POLL_INTERVAL_MS);
+        match dispatcher.fetch_result(root_finst_id.clone(), fetch_wait_ms) {
             Err(e) => {
                 dispatcher.cancel_fragments(&submitted);
                 return Err(e);
@@ -750,6 +752,26 @@ mod tests {
         }
     }
 
+    struct RecordingWaitDispatcher {
+        submitted: Mutex<Vec<types::TUniqueId>>,
+        fetch_waits_ms: Mutex<Vec<i64>>,
+        fetch_count: AtomicUsize,
+    }
+
+    impl RecordingWaitDispatcher {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                submitted: Mutex::new(Vec::new()),
+                fetch_waits_ms: Mutex::new(Vec::new()),
+                fetch_count: AtomicUsize::new(0),
+            })
+        }
+
+        fn fetch_waits_ms(&self) -> Vec<i64> {
+            self.fetch_waits_ms.lock().unwrap().clone()
+        }
+    }
+
     impl FragmentDispatcher for ControllableDispatcher {
         fn exchange_addr(&self) -> types::TNetworkAddress {
             types::TNetworkAddress::new("127.0.0.1".to_string(), 9999)
@@ -790,6 +812,43 @@ mod tests {
         fn cancel_fragments(&self, finst_ids: &[types::TUniqueId]) {
             self.cancelled.lock().unwrap().extend_from_slice(finst_ids);
         }
+    }
+
+    impl FragmentDispatcher for RecordingWaitDispatcher {
+        fn exchange_addr(&self) -> types::TNetworkAddress {
+            types::TNetworkAddress::new("127.0.0.1".to_string(), 9999)
+        }
+
+        fn submit_fragment(
+            &self,
+            params: crate::internal_service::TExecPlanFragmentParams,
+        ) -> Result<(), String> {
+            let finst_id = params
+                .params
+                .as_ref()
+                .map(|ep| {
+                    types::TUniqueId::new(ep.fragment_instance_id.hi, ep.fragment_instance_id.lo)
+                })
+                .unwrap_or_else(|| types::TUniqueId::new(0, 0));
+            self.submitted.lock().unwrap().push(finst_id);
+            Ok(())
+        }
+
+        fn fetch_result(
+            &self,
+            _finst_id: types::TUniqueId,
+            max_wait_ms: i64,
+        ) -> Result<FetchOutcome, String> {
+            self.fetch_waits_ms.lock().unwrap().push(max_wait_ms);
+            let call = self.fetch_count.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                Ok(FetchOutcome::NotReady)
+            } else {
+                Ok(FetchOutcome::Eof)
+            }
+        }
+
+        fn cancel_fragments(&self, _finst_ids: &[types::TUniqueId]) {}
     }
 
     // -----------------------------------------------------------------------
@@ -1011,6 +1070,28 @@ mod tests {
             cancelled.len(),
             2,
             "all submitted fragments must be cancelled on timeout"
+        );
+    }
+
+    #[test]
+    fn fetch_loop_caps_remote_waits_below_full_timeout() {
+        let inner = RecordingWaitDispatcher::new();
+        let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
+        let root_finst_id = types::TUniqueId::new(6, 1);
+        let params = vec![make_params_with_finst(6, 10), make_params_with_finst(6, 1)];
+
+        let result = submit_and_fetch_loop(&dispatcher, params, root_finst_id, 300_000);
+
+        assert!(result.is_ok(), "expected fetch loop to finish after Eof");
+        let waits = inner.fetch_waits_ms();
+        assert!(
+            !waits.is_empty(),
+            "expected fetch_result to be called at least once"
+        );
+        assert!(
+            waits[0] <= 500,
+            "expected fetch wait to be capped to a short poll, got {} ms",
+            waits[0]
         );
     }
 

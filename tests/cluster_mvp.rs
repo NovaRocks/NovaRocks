@@ -251,6 +251,10 @@ fn coordinated_sleep_query_sql() -> &'static str {
     "SELECT v FROM (SELECT sleep(2) AS v UNION ALL SELECT sleep(2)) t ORDER BY v"
 }
 
+fn disconnect_blocking_query_sql() -> &'static str {
+    "SELECT v FROM (SELECT sleep(10) AS v UNION ALL SELECT sleep(10)) t ORDER BY v"
+}
+
 fn multi_submit_query_sql() -> &'static str {
     "WITH cte AS (SELECT 1 AS v UNION ALL SELECT 2) \
      SELECT a.v FROM cte a JOIN cte b ON a.v = b.v ORDER BY a.v"
@@ -485,16 +489,15 @@ fn mysql_disconnect_triggers_cancel() {
         r#"
 [debug]
 emit_cancel_marker = true
-fault_inject_fetch_not_ready_count = 10000000
 "#,
         "",
     );
 
-    send_mysql_query_and_disconnect(cluster.fe_mysql, multi_submit_query_sql());
+    send_mysql_query_and_disconnect(cluster.fe_mysql, disconnect_blocking_query_sql());
 
     cluster
         .be
-        .wait_for_output_contains("NOVAROCKS_CANCEL count=1", Duration::from_secs(5));
+        .wait_for_output_contains("NOVAROCKS_CANCEL count=1", Duration::from_secs(3));
 }
 
 #[test]
