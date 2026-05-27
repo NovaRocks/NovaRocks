@@ -165,6 +165,85 @@ mod tests {
         assert!(saw_mv_ctx.load(Ordering::SeqCst));
     }
 
+    // ── Task-4 helpers ──────────────────────────────────────────────────────
+
+    struct CountingRule {
+        name: &'static str,
+        matches_called: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl LogicalRewriteRule for CountingRule {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn phase(&self) -> RewritePhase {
+            RewritePhase::LogicalNormalize
+        }
+
+        fn matches(&self, _plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
+            self.matches_called
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            false
+        }
+
+        fn apply(
+            &self,
+            _plan: LogicalPlan,
+            _ctx: &mut RewriteContext,
+        ) -> Result<RewriteResult, String> {
+            Ok(RewriteResult::Unchanged)
+        }
+    }
+
+    #[test]
+    fn disabled_imv_rule_skipped_with_trace() {
+        use crate::sql::optimizer::rewrite::pipeline::{RewritePipeline, RewriteStage};
+        use crate::sql::optimizer::rewrite::trace::RewriteTraceEvent;
+
+        let matches_called = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pipeline = RewritePipeline::from_stages(vec![RewriteStage::new(
+            "imv-logical-normalize",
+            RewritePhase::LogicalNormalize,
+            vec![Box::new(CountingRule {
+                name: "DummyImvRule",
+                matches_called: Arc::clone(&matches_called),
+            })],
+        )]);
+
+        let mut ctx_rw =
+            RewriteContext::for_mv_refresh(vec!["DummyImvRule".to_string()]);
+        ctx_rw.set_extension::<ImvExtension>(ImvExtension {
+            mv_ctx: dummy_mv_ctx(),
+            annotation: ImvPlanAnnotation::default(),
+        });
+
+        let _ = pipeline.rewrite(empty_values_plan(), &mut ctx_rw).unwrap();
+
+        assert_eq!(
+            matches_called.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert!(ctx_rw.trace().events().iter().any(|e| matches!(
+            e,
+            RewriteTraceEvent::RuleSkipped { rule, reason, .. }
+                if *rule == "DummyImvRule" && reason == "disabled"
+        )));
+    }
+
+    #[test]
+    fn unknown_disabled_rule_name_is_ignored() {
+        let outcome = run_imv_rewrite(ImvRewriteInput {
+            plan: empty_values_plan(),
+            mv_ctx: dummy_mv_ctx(),
+            disabled_rules: vec!["NoSuchRule".to_string()],
+            deadline: None,
+        })
+        .expect("unknown disabled rule must not break the pipeline");
+
+        assert_eq!(outcome.trace.stage_names().len(), 4);
+    }
+
     // ── Pre-existing tests ──────────────────────────────────────────────────
 
     #[test]
