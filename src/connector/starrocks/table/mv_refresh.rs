@@ -4384,10 +4384,10 @@ enable_path_style_access = true
     }
 
     fn aggregate_visible_query_result() -> Result<QueryResult, String> {
-        use arrow::array::LargeBinaryArray;
         use crate::connector::starrocks::table::state_codec::{
             encode_count_state, encode_sum_int64,
         };
+        use arrow::array::LargeBinaryArray;
 
         // Counterpart visible values: c=[3, 4], s=[30, 40], one row per k1.
         // Post-#188 the executor surfaces aggregates as opaque LargeBinary
@@ -4559,7 +4559,10 @@ enable_path_style_access = true
                                 logical_type: None,
                             },
                         ],
-                        source: ScanSource::StarRocks { db_id: 0, table_id: 0 },
+                        source: ScanSource::StarRocks {
+                            db_id: 0,
+                            table_id: 0,
+                        },
                         iceberg_row_lineage_metadata_columns: vec![],
                     },
                 )

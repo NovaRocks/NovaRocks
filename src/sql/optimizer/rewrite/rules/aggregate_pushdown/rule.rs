@@ -58,7 +58,10 @@ mod tests {
                     name: "t".into(),
                     columns: vec![],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::StarRocks { db_id: 0, table_id: 0 },
+                    source: ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 0,
+                    },
                 },
                 alias: None,
                 columns: vec![OutputColumn {
@@ -110,7 +113,10 @@ mod tests {
                     name: name.into(),
                     columns: vec![],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::StarRocks { db_id: 0, table_id: 0 },
+                    source: ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 0,
+                    },
                 },
                 alias: None,
                 columns: cols

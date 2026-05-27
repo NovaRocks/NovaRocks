@@ -204,10 +204,7 @@ pub enum ScanSource {
     /// every Scan column. The two fields must always agree with the
     /// matching `PhysicalTableLayout` entry; `InMemoryCatalog::register_starrocks_table`
     /// enforces this invariant in debug builds.
-    StarRocks {
-        db_id: i64,
-        table_id: i64,
-    },
+    StarRocks { db_id: i64, table_id: i64 },
     IcebergDataFiles {
         table: IcebergTableInfo,
         files: Vec<IcebergDataFileInfo>,

@@ -1099,7 +1099,10 @@ mod tests {
                     name: "t3".to_string(),
                     columns: vec![column.clone()],
                     iceberg_row_lineage_metadata_columns: Vec::new(),
-                    source: ScanSource::StarRocks { db_id: 0, table_id: 0 },
+                    source: ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 0,
+                    },
                 },
                 alias: None,
                 columns: vec![OutputColumn {
@@ -1144,7 +1147,10 @@ mod tests {
                     name: "all_t0".to_string(),
                     columns: vec![column.clone()],
                     iceberg_row_lineage_metadata_columns: Vec::new(),
-                    source: ScanSource::StarRocks { db_id: 0, table_id: 0 },
+                    source: ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 0,
+                    },
                 },
                 alias: None,
                 columns: vec![OutputColumn {
@@ -1185,7 +1191,10 @@ mod tests {
                     name: "t1".to_string(),
                     columns: Vec::new(),
                     iceberg_row_lineage_metadata_columns: Vec::new(),
-                    source: ScanSource::StarRocks { db_id: 0, table_id: 0 },
+                    source: ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 0,
+                    },
                 },
                 alias: None,
                 columns: Vec::new(),
@@ -1262,7 +1271,10 @@ mod tests {
                     name: "t1".to_string(),
                     columns: vec![column.clone()],
                     iceberg_row_lineage_metadata_columns: Vec::new(),
-                    source: ScanSource::StarRocks { db_id: 0, table_id: 0 },
+                    source: ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 0,
+                    },
                 },
                 alias: None,
                 columns: vec![OutputColumn {
@@ -1326,7 +1338,10 @@ mod tests {
                     name: "ice_tbl".to_string(),
                     columns: vec![column.clone()],
                     iceberg_row_lineage_metadata_columns: Vec::new(),
-                    source: ScanSource::StarRocks { db_id: 0, table_id: 0 },
+                    source: ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 0,
+                    },
                 },
                 alias: None,
                 columns: vec![OutputColumn {

@@ -144,7 +144,10 @@ mod tests {
                 logical_type: None,
             }],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::StarRocks { db_id: 0, table_id: 0 },
+            source: ScanSource::StarRocks {
+                db_id: 0,
+                table_id: 0,
+            },
         }
     }
 
@@ -373,7 +376,10 @@ mod tests {
                 logical_type: None,
             }],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::StarRocks { db_id: 0, table_id: 0 },
+            source: ScanSource::StarRocks {
+                db_id: 0,
+                table_id: 0,
+            },
         }
     }
 

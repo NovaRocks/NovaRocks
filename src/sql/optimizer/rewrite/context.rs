@@ -283,7 +283,10 @@ mod tests {
             name: "probe".to_string(),
             columns: vec![],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::StarRocks { db_id: 0, table_id: 0 },
+            source: ScanSource::StarRocks {
+                db_id: 0,
+                table_id: 0,
+            },
         };
         let err = provider
             .load_active_snapshot(&table, "db", "col")

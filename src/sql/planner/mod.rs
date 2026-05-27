@@ -1926,7 +1926,10 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::StarRocks { db_id: 0, table_id: 0 },
+                    source: ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 0,
+                    },
                 }),
                 "maps" => Ok(TableDef {
                     name: "maps".to_string(),
@@ -1959,7 +1962,10 @@ mod tests {
                         logical_type: None,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::StarRocks { db_id: 0, table_id: 0 },
+                    source: ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 0,
+                    },
                 }),
                 other => Err(format!("unknown test table: {other}")),
             }
