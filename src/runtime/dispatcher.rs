@@ -503,7 +503,7 @@ impl RemoteDispatcher {
     }
 
     fn client(&self) -> Result<NovaRocksGrpcRemoteClient, String> {
-        NovaRocksGrpcRemoteClient::connect_blocking(self.backend)
+        NovaRocksGrpcRemoteClient::new(self.backend)
     }
 }
 
@@ -606,7 +606,7 @@ impl FragmentDispatcher for RemoteDispatcher {
             }
         };
         runtime_handle.spawn(async move {
-            match NovaRocksGrpcRemoteClient::connect_blocking(backend) {
+            match NovaRocksGrpcRemoteClient::new(backend) {
                 Ok(client) => match client.cancel_fragment_async(req).await {
                     Ok(resp) if resp.status_code == 0 => {}
                     Ok(resp) => warn!(
@@ -1124,6 +1124,23 @@ mod tests {
         assert!(
             !source.contains(&needle),
             "remote cancel should not use a dedicated native thread"
+        );
+    }
+
+    #[test]
+    fn remote_dispatcher_cancel_async_path_does_not_call_connect_blocking() {
+        let source = include_str!("dispatcher.rs");
+        let impl_source = source
+            .split_once("// Tests")
+            .map(|(before, _)| before)
+            .expect("dispatcher tests section exists");
+        let cancel_start = source
+            .find("fn cancel_fragments(&self, finst_ids: &[types::TUniqueId]) {")
+            .expect("cancel_fragments implementation exists");
+        let cancel_tail = &impl_source[cancel_start..];
+        assert!(
+            !cancel_tail.contains("NovaRocksGrpcRemoteClient::connect_blocking(backend)"),
+            "async remote cancel path must not call connect_blocking"
         );
     }
 

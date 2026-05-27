@@ -41,17 +41,25 @@ pub struct NovaRocksGrpcRemoteClient {
 }
 
 impl NovaRocksGrpcRemoteClient {
-    /// Connect to `addr` and return a ready client.
+    /// Create a client for `addr`.
     ///
     /// The underlying HTTP/2 channel is established lazily via the shared
-    /// channel cache, so the connect itself is cheap.
-    pub fn connect_blocking(addr: SocketAddr) -> Result<Self, String> {
+    /// channel cache, so construction itself is cheap.
+    pub fn new(addr: SocketAddr) -> Result<Self, String> {
         let host = addr.ip().to_string();
         let port = addr.port();
         // Eagerly verify the endpoint can be parsed; actual TCP setup is lazy.
         grpc_endpoint(&host, port)
             .map_err(|e| format!("invalid BE endpoint {host}:{port}: {e}"))?;
         Ok(Self { host, port })
+    }
+
+    /// Connect to `addr` and return a ready client.
+    ///
+    /// The underlying HTTP/2 channel is established lazily via the shared
+    /// channel cache, so the connect itself is cheap.
+    pub fn connect_blocking(addr: SocketAddr) -> Result<Self, String> {
+        Self::new(addr)
     }
 
     fn make_client(
