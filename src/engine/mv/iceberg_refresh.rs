@@ -6159,6 +6159,49 @@ fn build_join_snapshot_catalog(
     Ok(catalog)
 }
 
+/// Build a one-shot InMemoryCatalog for IMV optimizer-pipeline planning.
+///
+/// Registers each base in `ctx.rewrite.base_refs` under its namespace at
+/// the snapshot captured by `ctx.rewrite.pin`. The catalog mirrors what
+/// `canonical_select_query` references after `canonicalize_iceberg_mv_select_query`
+/// rewrites `db.table` to `db.<synthetic>_at_<snapshot_id>`.
+///
+/// Reuses `build_iceberg_table_def_for_snapshot_scan` for per-base
+/// table-def construction, so schemas / partition specs match what the
+/// existing snapshot-scan path already uses.
+fn build_iceberg_mv_planning_catalog(
+    state: &Arc<StandaloneState>,
+    ctx: &IcebergMvRefreshContext,
+) -> Result<crate::engine::catalog::InMemoryCatalog, String> {
+    let mut catalog = crate::engine::catalog::InMemoryCatalog::default();
+
+    for base in ctx.rewrite.base_refs.iter() {
+        let snapshot_id = ctx
+            .rewrite
+            .pin
+            .get(base)
+            .ok_or_else(|| format!("imv planning catalog: pin missing snapshot for base {}", base.fqn()))?;
+
+        // create_database is idempotent-ish: it errors on duplicate. Two
+        // bases sharing a namespace must only create the database once.
+        if !catalog
+            .database_exists(&base.namespace)
+            .map_err(|e| format!("imv planning catalog: database_exists({}): {e}", base.namespace))?
+        {
+            catalog
+                .create_database(&base.namespace)
+                .map_err(|e| format!("imv planning catalog: create_database({}): {e}", base.namespace))?;
+        }
+
+        let table_def = build_iceberg_table_def_for_snapshot_scan(state, base, snapshot_id)?;
+        catalog
+            .register(&base.namespace, table_def)
+            .map_err(|e| format!("imv planning catalog: register {}: {e}", base.fqn()))?;
+    }
+
+    Ok(catalog)
+}
+
 fn register_join_snapshot_side(
     catalog: &mut crate::engine::catalog::InMemoryCatalog,
     state: &Arc<StandaloneState>,
@@ -11776,5 +11819,52 @@ mod tests {
             output.contains("unsupported transform Void"),
             "reason field missing transform context in:\n{output}"
         );
+    }
+}
+
+#[cfg(test)]
+mod imv_planning_catalog_tests {
+    use super::*;
+
+    // The test below exercises the correct API surface for
+    // build_iceberg_mv_planning_catalog. Full execution requires a
+    // StandaloneState with two real Iceberg catalog entries, which depends on
+    // the iceberg-rest Docker harness. Deferred to the iceberg-ivm SQL suite
+    // (Task 15). The #[ignore] keeps the test compilable and discoverable
+    // without requiring the harness in unit-test runs.
+    #[test]
+    #[ignore = "fixture deferred — covered by iceberg-ivm suite (Task 15)"]
+    fn build_iceberg_mv_planning_catalog_registers_each_base() {
+        let (state, ctx) = imv_planning_catalog_test_fixture();
+        let catalog = build_iceberg_mv_planning_catalog(&state, &ctx)
+            .expect("planning catalog construction must succeed");
+
+        for base in ctx.rewrite.base_refs.iter() {
+            assert!(catalog
+                .database_exists(&base.namespace)
+                .expect("database lookup"));
+            let table_name = synthetic_snapshot_table_name(
+                base,
+                ctx.rewrite
+                    .pin
+                    .get(base)
+                    .expect("test fixture: pin has snapshot for base"),
+            );
+            assert!(
+                catalog.get(&base.namespace, &table_name).is_ok(),
+                "expected table {}.{table_name} to be registered",
+                base.namespace
+            );
+        }
+    }
+
+    fn imv_planning_catalog_test_fixture() -> (
+        Arc<crate::engine::StandaloneState>,
+        IcebergMvRefreshContext,
+    ) {
+        // Building a StandaloneState with two bases registered as real Iceberg
+        // catalog entries (needed by build_iceberg_table_def_for_snapshot_scan)
+        // requires the full iceberg-rest Docker harness. Deferred to Task 15.
+        todo!("build a fixture with 2 base refs + a StandaloneState that has both bases registered as iceberg tables")
     }
 }
