@@ -411,4 +411,87 @@ mod tests {
             nullable: false,
         }
     }
+
+    #[test]
+    fn rewrite_visits_all_logical_plan_variants() {
+        use crate::sql::optimizer::rewrite::context::RewriteContext;
+        use crate::sql::optimizer::rewrite::phase::RewritePhase;
+        use crate::sql::optimizer::rewrite::result::RewriteResult;
+        use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
+        use crate::sql::planner::plan::*;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountVisitsRule {
+            count: Arc<AtomicUsize>,
+        }
+
+        impl LogicalRewriteRule for CountVisitsRule {
+            fn name(&self) -> &'static str {
+                "CountVisitsRule"
+            }
+            fn phase(&self) -> RewritePhase {
+                RewritePhase::LogicalNormalize
+            }
+            fn traversal(&self) -> RewriteTraversal {
+                RewriteTraversal::TopDown
+            }
+            fn matches(&self, _plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                false
+            }
+            fn apply(
+                &self,
+                _plan: LogicalPlan,
+                _ctx: &mut RewriteContext,
+            ) -> Result<RewriteResult, String> {
+                Ok(RewriteResult::Unchanged)
+            }
+        }
+
+        let leaf = LogicalPlan::Values(ValuesNode {
+            rows: vec![],
+            columns: vec![],
+        });
+
+        // Exhaustive match on &LogicalPlan. This is the intentional trip-wire:
+        // if a new variant lands in LogicalPlan, this test fails to compile.
+        fn assert_variant_handled(variant: &LogicalPlan) {
+            match variant {
+                LogicalPlan::Scan(_)
+                | LogicalPlan::Filter(_)
+                | LogicalPlan::Project(_)
+                | LogicalPlan::Aggregate(_)
+                | LogicalPlan::Join(_)
+                | LogicalPlan::Sort(_)
+                | LogicalPlan::Limit(_)
+                | LogicalPlan::Union(_)
+                | LogicalPlan::Intersect(_)
+                | LogicalPlan::Except(_)
+                | LogicalPlan::Values(_)
+                | LogicalPlan::GenerateSeries(_)
+                | LogicalPlan::TableFunction(_)
+                | LogicalPlan::Window(_)
+                | LogicalPlan::SubqueryAlias(_)
+                | LogicalPlan::Repeat(_)
+                | LogicalPlan::CTEAnchor(_)
+                | LogicalPlan::CTEProduce(_)
+                | LogicalPlan::CTEConsume(_) => {}
+            }
+        }
+        assert_variant_handled(&leaf);
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
+        let (_, _) = super::rewrite_with_rule(
+            leaf,
+            &CountVisitsRule {
+                count: Arc::clone(&count),
+            },
+            &mut ctx,
+        )
+        .unwrap();
+
+        assert!(count.load(Ordering::SeqCst) >= 1);
+    }
 }
