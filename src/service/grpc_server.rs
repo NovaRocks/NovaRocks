@@ -742,9 +742,38 @@ fn validate_grpc_ports(http_port: u16, starlet_port: u16) -> Result<(), String> 
     Ok(())
 }
 
+/// Parse a gRPC bind address from a host string and port.
+///
+/// Handles bare IPv6 addresses (`::`, `::1`), bracketed IPv6 (`[::]`, `[::1]`),
+/// and IPv4/hostname strings.  Bare and bracketed IPv6 forms are parsed via
+/// `IpAddr` to avoid the `:::PORT` ambiguity that arises from naive
+/// `format!("{host}:{port}")` string concatenation.
+pub(crate) fn parse_grpc_bind_addr(host: &str, port: u16) -> Result<SocketAddr, String> {
+    // Strip brackets from bracketed IPv6 literals, e.g. `[::1]` -> `::1`.
+    let bare = if host.starts_with('[') && host.ends_with(']') {
+        &host[1..host.len() - 1]
+    } else {
+        host
+    };
+
+    // If the bare string is a valid IP literal, build SocketAddr directly.
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return Ok(SocketAddr::new(ip, port));
+    }
+
+    // Fallback for hostnames: use bracketed form for any host containing `:`.
+    let formatted = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    formatted
+        .parse::<SocketAddr>()
+        .map_err(|e| format!("parse gRPC bind addr '{formatted}' failed: {e}"))
+}
+
 fn ensure_bindable(host: &str, port: u16, role: &str) -> Result<(), String> {
-    let addr: SocketAddr = format!("{host}:{port}")
-        .parse()
+    let addr = parse_grpc_bind_addr(host, port)
         .map_err(|e| format!("parse {role} bind addr failed: {e}"))?;
     let listener = TcpListener::bind(addr)
         .map_err(|e| format!("failed to bind {role} listener on {addr}: {e}"))?;
@@ -787,8 +816,7 @@ pub fn start_grpc_exchange_server(host: &str, port: u16) -> Result<(), String> {
             .expect("build standalone grpc server runtime");
 
         rt.block_on(async move {
-            let addr: SocketAddr = format!("{host}:{port}")
-                .parse()
+            let addr = parse_grpc_bind_addr(&host, port)
                 .expect("parse standalone grpc bind addr");
             let mut shutdown = shutdown_rx.clone();
 
@@ -859,8 +887,8 @@ pub fn start_grpc_exchange_server(host: &str, port: u16) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_bindable, validate_grpc_ports};
-    use std::net::TcpListener;
+    use super::{ensure_bindable, parse_grpc_bind_addr, validate_grpc_ports};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener};
 
     #[test]
     fn test_validate_grpc_ports_accept_distinct_ports() {
@@ -881,6 +909,48 @@ mod tests {
             .expect_err("expected bind failure");
         assert!(err.contains("failed to bind"));
         drop(occupied);
+    }
+
+    #[test]
+    fn parse_grpc_bind_addr_bare_ipv6_wildcard() {
+        let addr = parse_grpc_bind_addr("::", 9070).expect("parse :: wildcard");
+        assert_eq!(addr.ip(), IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+        assert_eq!(addr.port(), 9070);
+    }
+
+    #[test]
+    fn parse_grpc_bind_addr_bracketed_ipv6_wildcard() {
+        let addr = parse_grpc_bind_addr("[::]", 9070).expect("parse [::] wildcard");
+        assert_eq!(addr.ip(), IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+        assert_eq!(addr.port(), 9070);
+    }
+
+    #[test]
+    fn parse_grpc_bind_addr_bracketed_ipv6_loopback() {
+        let addr = parse_grpc_bind_addr("[::1]", 9070).expect("parse [::1]");
+        assert_eq!(addr.ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
+        assert_eq!(addr.port(), 9070);
+    }
+
+    #[test]
+    fn parse_grpc_bind_addr_bare_ipv6_loopback() {
+        let addr = parse_grpc_bind_addr("::1", 9070).expect("parse ::1");
+        assert_eq!(addr.ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
+        assert_eq!(addr.port(), 9070);
+    }
+
+    #[test]
+    fn parse_grpc_bind_addr_ipv4() {
+        let addr = parse_grpc_bind_addr("127.0.0.1", 9070).expect("parse 127.0.0.1");
+        assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(addr.port(), 9070);
+    }
+
+    #[test]
+    fn parse_grpc_bind_addr_ipv4_wildcard() {
+        let addr = parse_grpc_bind_addr("0.0.0.0", 9070).expect("parse 0.0.0.0");
+        assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(addr.port(), 9070);
     }
 }
 
