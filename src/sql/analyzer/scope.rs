@@ -352,6 +352,22 @@ impl AnalyzerScope {
             self.canonical_qualifier.insert(name.clone(), qual.clone());
         }
         for (name, expr) in &other.computed_columns {
+            // Inner wins: when merging an outer scope into an inner subquery scope,
+            // the inner subquery's own bindings (or a chained-USING's later coalesce)
+            // must not be shadowed by an outer scope's computed column with the
+            // same name. Additionally, do NOT propagate an outer-scope computed
+            // column whose name collides with a regular column already bound in
+            // the inner scope: `computed_column_for` is consulted BEFORE the
+            // normal `resolve()` path, so a leaked outer COALESCE would shadow
+            // the inner's own real column (e.g. inner subquery `SELECT k1 FROM t1`
+            // must resolve `k1` to `t1.k1`, not to an outer FULL OUTER USING
+            // coalesce expression bound at the enclosing query).
+            if self.computed_columns.contains_key(name) {
+                continue;
+            }
+            if self.unqualified.contains_key(name) {
+                continue;
+            }
             self.computed_columns.insert(name.clone(), expr.clone());
         }
     }
