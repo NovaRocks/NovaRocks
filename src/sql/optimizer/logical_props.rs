@@ -352,7 +352,7 @@ mod tests {
                     name: format!("t{id}"),
                     columns: Vec::new(),
                     iceberg_row_lineage_metadata_columns: Vec::new(),
-                    source: ScanSource::StarRocks,
+                    source: ScanSource::StarRocks { db_id: 0, table_id: 0 },
                 },
                 alias: None,
                 columns: vec![output(id, name)],

@@ -618,7 +618,10 @@ fn starrocks_table_def(runtime: &StarRocksTableRuntime) -> Result<TableDef, Stri
         name: runtime.table.name.clone(),
         columns,
         iceberg_row_lineage_metadata_columns: vec![],
-        source: ScanSource::StarRocks,
+        source: ScanSource::StarRocks {
+            db_id: runtime.table.db_id,
+            table_id: runtime.table.table_id,
+        },
     })
 }
 
@@ -980,7 +983,7 @@ mod tests {
                 },
             ]
         );
-        assert!(matches!(table.source, ScanSource::StarRocks));
+        assert!(matches!(table.source, ScanSource::StarRocks { .. }));
 
         let layout = catalog
             .get_physical_layout(DEFAULT_DATABASE, "starrocks_tbl")

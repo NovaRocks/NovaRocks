@@ -364,7 +364,7 @@ mod tests {
                     name: "t".into(),
                     columns: vec![],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: crate::sql::catalog::ScanSource::StarRocks,
+                    source: crate::sql::catalog::ScanSource::StarRocks { db_id: 0, table_id: 0 },
                 },
                 alias: None,
                 columns: vec![],

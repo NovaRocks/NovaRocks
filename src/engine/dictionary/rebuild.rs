@@ -57,7 +57,7 @@ pub(crate) fn rebuild_for_analyze_full(
     };
 
     let watermark = match &table_def.source {
-        ScanSource::StarRocks => build_starrocks_watermark(state, database, table)?,
+        ScanSource::StarRocks { .. } => build_starrocks_watermark(state, database, table)?,
         ScanSource::IcebergDataFiles { table: info, .. } => DictionaryWatermark::Iceberg {
             snapshot_id: info.current_snapshot_id,
             schema_id: info.schema_id,
@@ -100,7 +100,7 @@ fn build_owner(
     table_def: &TableDef,
 ) -> Result<Option<DictionaryOwner>, String> {
     match &table_def.source {
-        ScanSource::StarRocks => {
+        ScanSource::StarRocks { .. } => {
             let starrocks = state
                 .starrocks_table
                 .read()

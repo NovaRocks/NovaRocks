@@ -1839,7 +1839,7 @@ fn iceberg_table_info(
         crate::sql::catalog::ScanSource::IcebergDataFiles { table, .. }
         | crate::sql::catalog::ScanSource::IcebergMetadataTable { table, .. }
         | crate::sql::catalog::ScanSource::IcebergDeltaTable { table, .. } => Some(table),
-        crate::sql::catalog::ScanSource::StarRocks => None,
+        crate::sql::catalog::ScanSource::StarRocks { .. } => None,
     }
 }
 
@@ -1926,7 +1926,7 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::StarRocks,
+                    source: ScanSource::StarRocks { db_id: 0, table_id: 0 },
                 }),
                 "maps" => Ok(TableDef {
                     name: "maps".to_string(),
@@ -1959,7 +1959,7 @@ mod tests {
                         logical_type: None,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::StarRocks,
+                    source: ScanSource::StarRocks { db_id: 0, table_id: 0 },
                 }),
                 other => Err(format!("unknown test table: {other}")),
             }

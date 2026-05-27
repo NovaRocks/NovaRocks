@@ -197,10 +197,17 @@ pub enum ScanSource {
     /// StarRocks table: data lives in object storage (s3:// or
     /// file://) and metadata lives in a `MetaStoreProvider` (currently
     /// SQLite). The per-table physical layout (tablet/partition/version
-    /// list) is carried separately on `PhysicalTableLayout`, so this
-    /// variant is a marker without payload — the catalog only needs to
-    /// know "this table flows through the StarRocks table scan path".
-    StarRocks,
+    /// list) is carried separately on `PhysicalTableLayout`; the
+    /// `(db_id, table_id)` identity carried here lets plan-time consumers
+    /// (e.g. `DictionaryQueryProvider::owner_for`) resolve the StarRocks
+    /// dictionary owner without taking `state.starrocks_table.read()` on
+    /// every Scan column. The two fields must always agree with the
+    /// matching `PhysicalTableLayout` entry; `InMemoryCatalog::register_starrocks_table`
+    /// enforces this invariant in debug builds.
+    StarRocks {
+        db_id: i64,
+        table_id: i64,
+    },
     IcebergDataFiles {
         table: IcebergTableInfo,
         files: Vec<IcebergDataFileInfo>,

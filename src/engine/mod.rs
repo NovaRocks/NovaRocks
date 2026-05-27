@@ -4067,7 +4067,7 @@ enable_path_style_access = true
                 },
             ],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::StarRocks,
+            source: ScanSource::StarRocks { db_id: 0, table_id: 0 },
         };
         let layout = PhysicalTableLayout {
             db_id: 1,

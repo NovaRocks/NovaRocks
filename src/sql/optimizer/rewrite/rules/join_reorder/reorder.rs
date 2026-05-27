@@ -112,7 +112,7 @@ fn estimate_size(plan: &LogicalPlan) -> u64 {
                 // count source is the analyzed-stats path. As a heuristic
                 // fallback for join-reorder when stats are absent, treat
                 // them as medium-sized until analyzed statistics are present.
-                ScanSource::StarRocks => 1_000_000,
+                ScanSource::StarRocks { .. } => 1_000_000,
             };
             // Apply selectivity for pushed-down predicates on the scan
             let num_predicates = s.predicates.len();

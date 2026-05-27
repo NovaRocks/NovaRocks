@@ -89,7 +89,7 @@ fn iceberg_table_info(
         crate::sql::catalog::ScanSource::IcebergDataFiles { table, .. }
         | crate::sql::catalog::ScanSource::IcebergMetadataTable { table, .. }
         | crate::sql::catalog::ScanSource::IcebergDeltaTable { table, .. } => Some(table),
-        crate::sql::catalog::ScanSource::StarRocks => None,
+        crate::sql::catalog::ScanSource::StarRocks { .. } => None,
     }
 }
 
@@ -4290,7 +4290,7 @@ mod tests {
                         logical_type: None,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::StarRocks,
+                    source: ScanSource::StarRocks { db_id: 0, table_id: 0 },
                 },
                 alias: None,
                 columns: output_columns(),
@@ -5191,7 +5191,7 @@ mod tests {
                         logical_type: None,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::StarRocks,
+                    source: ScanSource::StarRocks { db_id: 0, table_id: 0 },
                 },
                 alias: None,
                 columns: vec![OutputColumn {
@@ -5330,7 +5330,7 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::StarRocks,
+                    source: ScanSource::StarRocks { db_id: 0, table_id: 0 },
                 },
                 alias: None,
                 columns: vec![
@@ -5551,7 +5551,7 @@ mod tests {
                         logical_type: None,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::StarRocks,
+                    source: ScanSource::StarRocks { db_id: 0, table_id: 0 },
                 },
                 alias: None,
                 columns: vec![OutputColumn {

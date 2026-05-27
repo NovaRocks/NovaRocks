@@ -305,7 +305,7 @@ impl DictionaryQueryProvider {
         database: &str,
     ) -> Result<Option<DictionaryOwner>, String> {
         match &table.source {
-            ScanSource::StarRocks => {
+            ScanSource::StarRocks { .. } => {
                 let catalog = self
                     .state
                     .starrocks_table
@@ -473,5 +473,61 @@ mod tests {
             .load_active_snapshot(&state, &snapshot.owner, &snapshot.column_name)
             .expect("load active snapshot");
         assert!(loaded.is_none());
+    }
+
+    /// Lock-free owner-lookup contract: `DictionaryQueryProvider::owner_for`
+    /// must derive `(db_id, table_id)` from `ScanSource::StarRocks` directly,
+    /// without consulting `state.starrocks_table`. This test leaves
+    /// `state.starrocks_table` empty (no runtime registered) but registers a
+    /// snapshot owned by `(db_id=100, table_id=200)`; if the provider still
+    /// tries to look up the runtime in the catalog, it would return `Ok(None)`
+    /// and `load_active_snapshot` would miss the snapshot. After the fix,
+    /// identity flows from the plan node and the snapshot is found.
+    #[test]
+    fn dictionary_provider_owner_for_starrocks_reads_identity_from_plan_node() {
+        use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
+        use arrow::datatypes::DataType;
+        use std::sync::Arc;
+
+        let (_dir, state) = open_state();
+        let state = Arc::new(state);
+
+        // sample_owner() / sample_snapshot() use db_id=100, table_id=200,
+        // database="demo", table="t1", column_name="s".
+        let snapshot = sample_snapshot(1, DictionaryState::Active);
+        state
+            .dictionary_manager
+            .upsert_snapshot(&state, snapshot.clone())
+            .expect("upsert sample snapshot");
+
+        // Construct a Scan-level TableDef carrying the SAME (db_id, table_id)
+        // in ScanSource. Note: state.starrocks_table is empty — no runtime
+        // is registered. The lock-free provider must consult ScanSource
+        // directly to resolve the owner.
+        let table = TableDef {
+            name: "t1".to_string(),
+            columns: vec![ColumnDef {
+                name: "s".to_string(),
+                data_type: DataType::Utf8,
+                nullable: false,
+                write_default: None,
+                logical_type: None,
+            }],
+            iceberg_row_lineage_metadata_columns: vec![],
+            source: ScanSource::StarRocks {
+                db_id: 100,
+                table_id: 200,
+            },
+        };
+
+        let provider = DictionaryQueryProvider::new(state);
+        let loaded = provider
+            .load_active_snapshot(&table, "demo", "s")
+            .expect("load_active_snapshot returns Ok");
+
+        assert!(
+            loaded.is_some(),
+            "lock-free owner_for must resolve identity from ScanSource::StarRocks {{ db_id, table_id }} payload, not from state.starrocks_table",
+        );
     }
 }
