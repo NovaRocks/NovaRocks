@@ -789,7 +789,13 @@ impl<'a> super::AnalyzerContext<'a> {
     }
 
     fn infer_scalar_subquery_data_type(&self, subquery: &sqlast::Query) -> DataType {
-        let saved_collected_len = self.collected_subqueries.borrow().len();
+        // `analyze_query` re-enters `analyze_select` which calls
+        // `rewrite_subqueries` whenever `collected_subqueries` is non-empty.
+        // That rewrite *drains* the shared `collected_subqueries` vec, so any
+        // outer-query subqueries collected before us would be lost. Snapshot
+        // the full vec (not just its length) and restore it afterward so the
+        // outer analyzer can still see and rewrite its own subqueries.
+        let saved_collected: Vec<SubqueryInfo> = self.collected_subqueries.borrow().clone();
         let saved_next_subquery_id = self.next_subquery_id.get();
         let inferred = self
             .analyze_query(subquery)
@@ -801,9 +807,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     .map(|col| col.data_type.clone())
             })
             .unwrap_or(DataType::Null);
-        self.collected_subqueries
-            .borrow_mut()
-            .truncate(saved_collected_len);
+        *self.collected_subqueries.borrow_mut() = saved_collected;
         self.next_subquery_id.set(saved_next_subquery_id);
         inferred
     }
