@@ -228,6 +228,90 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
             request.into_inner(),
         )))
     }
+
+    async fn submit_fragment(
+        &self,
+        request: tonic::Request<proto::novarocks::SubmitFragmentRequest>,
+    ) -> Result<tonic::Response<proto::novarocks::SubmitFragmentResponse>, tonic::Status> {
+        let bytes = request.into_inner().exec_plan_fragment_params_thrift;
+        match crate::submit_exec_plan_fragment(&bytes) {
+            Ok(()) => Ok(tonic::Response::new(proto::novarocks::SubmitFragmentResponse {
+                status_code: 0,
+                message: String::new(),
+            })),
+            Err(e) => Ok(tonic::Response::new(proto::novarocks::SubmitFragmentResponse {
+                status_code: 1,
+                message: e,
+            })),
+        }
+    }
+
+    async fn fetch_result(
+        &self,
+        request: tonic::Request<proto::novarocks::FetchResultRequest>,
+    ) -> Result<tonic::Response<proto::novarocks::FetchResultResponse>, tonic::Status> {
+        use proto::novarocks::fetch_result_response::Status as FetchStatus;
+
+        let req = request.into_inner();
+        let finst_id = match req.finst_id {
+            Some(id) => crate::UniqueId { hi: id.hi, lo: id.lo },
+            None => {
+                return Ok(tonic::Response::new(proto::novarocks::FetchResultResponse {
+                    status: FetchStatus::Error as i32,
+                    chunk_arrow_ipc: vec![],
+                    message: "missing finst_id in FetchResultRequest".to_string(),
+                }));
+            }
+        };
+
+        use crate::runtime::result_buffer::{TryFetchResult, try_fetch};
+        match try_fetch(finst_id) {
+            TryFetchResult::Ready(result) => {
+                let status = if result.eos {
+                    FetchStatus::Eof
+                } else {
+                    FetchStatus::Ready
+                };
+                // Thrift-binary-encode the TResultBatch for transport.
+                // The receiver (PR-4 RemoteDispatcher) deserializes the same bytes.
+                let batch_bytes =
+                    crate::common::thrift::thrift_serialize_result_batch(&result.result_batch);
+                Ok(tonic::Response::new(proto::novarocks::FetchResultResponse {
+                    status: status as i32,
+                    chunk_arrow_ipc: batch_bytes,
+                    message: String::new(),
+                }))
+            }
+            TryFetchResult::NotReady => {
+                Ok(tonic::Response::new(proto::novarocks::FetchResultResponse {
+                    status: FetchStatus::NotReady as i32,
+                    chunk_arrow_ipc: vec![],
+                    message: String::new(),
+                }))
+            }
+            TryFetchResult::Error(err) => {
+                Ok(tonic::Response::new(proto::novarocks::FetchResultResponse {
+                    status: FetchStatus::Error as i32,
+                    chunk_arrow_ipc: vec![],
+                    message: err.message,
+                }))
+            }
+        }
+    }
+
+    async fn cancel_fragment(
+        &self,
+        request: tonic::Request<proto::novarocks::CancelFragmentRequest>,
+    ) -> Result<tonic::Response<proto::novarocks::CancelFragmentResponse>, tonic::Status> {
+        let req = request.into_inner();
+        for id in &req.finst_ids {
+            crate::runtime::exchange::cancel_fragment(id.hi, id.lo);
+            crate::runtime::result_buffer::cancel(crate::UniqueId { hi: id.hi, lo: id.lo });
+        }
+        Ok(tonic::Response::new(
+            proto::novarocks::CancelFragmentResponse { status_code: 0 },
+        ))
+    }
 }
 
 #[derive(Default)]
@@ -768,5 +852,43 @@ mod tests {
             .expect_err("expected bind failure");
         assert!(err.contains("failed to bind"));
         drop(occupied);
+    }
+}
+
+#[cfg(test)]
+mod pr3_tests {
+    use super::proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc as _;
+    use super::proto::novarocks::{CancelFragmentRequest, PUniqueId, SubmitFragmentRequest};
+    use super::GrpcService;
+    use tonic::Request;
+
+    #[tokio::test]
+    async fn submit_fragment_thrift_decode_error_returns_business_error() {
+        let svc = GrpcService::default();
+        let req = Request::new(SubmitFragmentRequest {
+            exec_plan_fragment_params_thrift: vec![0xff, 0xff, 0xff], // illegal thrift
+        });
+        let resp = svc.submit_fragment(req).await.expect("RPC level success");
+        let body = resp.into_inner();
+        assert_ne!(body.status_code, 0, "should return business error for bad thrift");
+        assert!(!body.message.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancel_fragment_is_idempotent() {
+        let svc = GrpcService::default();
+        let req = Request::new(CancelFragmentRequest {
+            finst_ids: vec![PUniqueId { hi: 1, lo: 2 }],
+            reason: "test".to_string(),
+        });
+        let resp = svc.cancel_fragment(req).await.expect("RPC success");
+        assert_eq!(resp.into_inner().status_code, 0);
+
+        let req2 = Request::new(CancelFragmentRequest {
+            finst_ids: vec![PUniqueId { hi: 1, lo: 2 }],
+            reason: "test-2".to_string(),
+        });
+        let resp2 = svc.cancel_fragment(req2).await.expect("RPC success");
+        assert_eq!(resp2.into_inner().status_code, 0);
     }
 }

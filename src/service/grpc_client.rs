@@ -26,6 +26,92 @@ use crate::runtime::global_async_runtime::{data_block_on, data_runtime_handle};
 
 pub use crate::service::grpc_proto as proto;
 
+/// gRPC client for the three D1 distributed-execution RPCs.
+///
+/// Wraps the tonic async client with blocking wrappers so that PR-4's
+/// `RemoteDispatcher` can drive it from a non-async context.  One
+/// `NovaRocksGrpcRemoteClient` per remote BE address; callers are
+/// responsible for caching instances.
+pub struct NovaRocksGrpcRemoteClient {
+    host: String,
+    port: u16,
+}
+
+impl NovaRocksGrpcRemoteClient {
+    /// Connect to `addr` and return a ready client.
+    ///
+    /// The underlying HTTP/2 channel is established lazily via the shared
+    /// channel cache, so the connect itself is cheap.
+    pub fn connect_blocking(host: &str, port: u16) -> Result<Self, String> {
+        // Eagerly verify the endpoint can be parsed; actual TCP setup is lazy.
+        format!("http://{host}:{port}")
+            .parse::<tonic::transport::Endpoint>()
+            .map_err(|e| format!("invalid BE endpoint {host}:{port}: {e}"))?;
+        Ok(Self {
+            host: host.to_string(),
+            port,
+        })
+    }
+
+    fn make_client(
+        &self,
+    ) -> Result<
+        proto::novarocks::nova_rocks_grpc_client::NovaRocksGrpcClient<Channel>,
+        String,
+    > {
+        let host = self.host.clone();
+        let port = self.port;
+        let ch = data_block_on(async move { get_or_create_channel(&host, port).await })??;
+        Ok(
+            proto::novarocks::nova_rocks_grpc_client::NovaRocksGrpcClient::new(ch)
+                .max_encoding_message_size(GRPC_MAX_ENCODING_BYTES)
+                .max_decoding_message_size(GRPC_MAX_DECODING_BYTES),
+        )
+    }
+
+    pub fn blocking_submit_fragment(
+        &self,
+        req: proto::novarocks::SubmitFragmentRequest,
+    ) -> Result<proto::novarocks::SubmitFragmentResponse, String> {
+        let mut cli = self.make_client()?;
+        data_block_on(async move {
+            cli.submit_fragment(req)
+                .await
+                .map(|r| r.into_inner())
+                .map_err(|e| format!("submit_fragment rpc failed: {e}"))
+        })?
+    }
+
+    pub fn blocking_fetch_result(
+        &self,
+        req: proto::novarocks::FetchResultRequest,
+    ) -> Result<proto::novarocks::FetchResultResponse, String> {
+        let mut cli = self.make_client()?;
+        data_block_on(async move {
+            cli.fetch_result(req)
+                .await
+                .map(|r| r.into_inner())
+                .map_err(|e| format!("fetch_result rpc failed: {e}"))
+        })?
+    }
+
+    pub fn blocking_cancel_fragment(
+        &self,
+        req: proto::novarocks::CancelFragmentRequest,
+    ) -> Result<proto::novarocks::CancelFragmentResponse, String> {
+        let mut cli = self.make_client()?;
+        data_block_on(async move {
+            cli.cancel_fragment(req)
+                .await
+                .map(|r| r.into_inner())
+                .map_err(|e| format!("cancel_fragment rpc failed: {e}"))
+        })?
+    }
+}
+
+const GRPC_MAX_ENCODING_BYTES: usize = 64 * 1024 * 1024;
+const GRPC_MAX_DECODING_BYTES: usize = 64 * 1024 * 1024;
+
 #[derive(Default)]
 struct ChannelCache {
     mu: Mutex<HashMap<String, Channel>>,

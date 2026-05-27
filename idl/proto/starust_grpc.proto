@@ -11,6 +11,11 @@ service NovaRocksGrpc {
   rpc TransmitRuntimeFilter(starrocks.PTransmitRuntimeFilterParams)
       returns (starrocks.PTransmitRuntimeFilterResult);
   rpc Lookup(starrocks.PLookUpRequest) returns (starrocks.PLookUpResponse);
+
+  // D1 distributed execution RPCs (PR-3).
+  rpc SubmitFragment(SubmitFragmentRequest) returns (SubmitFragmentResponse);
+  rpc FetchResult(FetchResultRequest) returns (FetchResultResponse);
+  rpc CancelFragment(CancelFragmentRequest) returns (CancelFragmentResponse);
 }
 
 message ExchangeRequest {
@@ -26,4 +31,50 @@ message ExchangeRequest {
 
 message ExchangeResponse {
   int64 ack_sequence = 1;
+}
+
+// D1 distributed execution messages (PR-3).
+
+message SubmitFragmentRequest {
+  bytes exec_plan_fragment_params_thrift = 1;
+}
+
+message SubmitFragmentResponse {
+  int32 status_code = 1;
+  string message = 2;
+}
+
+// Unique identifier for a fragment instance; mirrors starrocks.PUniqueId but
+// lives in the novarocks package to avoid a cross-package name collision.
+message PUniqueId {
+  int64 hi = 1;
+  int64 lo = 2;
+}
+
+message FetchResultRequest {
+  PUniqueId finst_id = 1;
+  int64 max_wait_ms = 2;
+}
+
+message FetchResultResponse {
+  enum Status {
+    READY = 0;
+    NOT_READY = 1;
+    EOF = 2;
+    ERROR = 3;
+  }
+  Status status = 1;
+  // Thrift-binary-encoded TResultBatch payload; name is kept as chunk_arrow_ipc
+  // for forward compatibility once Arrow encoding is introduced in a later PR.
+  bytes chunk_arrow_ipc = 2;
+  string message = 3;
+}
+
+message CancelFragmentRequest {
+  repeated PUniqueId finst_ids = 1;
+  string reason = 2;
+}
+
+message CancelFragmentResponse {
+  int32 status_code = 1;
 }
