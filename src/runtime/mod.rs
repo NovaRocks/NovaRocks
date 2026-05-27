@@ -16,7 +16,7 @@
 // under the License.
 pub mod backend_id;
 pub(crate) mod coordinator;
-pub mod dispatcher;
+pub(crate) mod dispatcher;
 pub mod exchange;
 pub mod exchange_scan;
 pub mod exec_env;

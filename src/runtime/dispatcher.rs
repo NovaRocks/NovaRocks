@@ -179,6 +179,10 @@ fn cancel_fragment_instance(hi: i64, lo: i64) {
     crate::runtime::exchange::cancel_fragment(hi, lo);
 }
 
+/// Idempotent bulk cancellation shared by autonomous fragment failures and the
+/// coordinator-side cleanup path. Multiple overlapping cancel waves may race
+/// across the same finst ids; the underlying result buffer and exchange cancel
+/// operations are intentionally safe to repeat.
 fn cancel_all_submitted(state: &InProcessState) {
     for (hi, lo) in submitted_ids_snapshot(state) {
         cancel_fragment_instance(hi, lo);
