@@ -634,12 +634,9 @@ pub fn start_grpc_server(host: &str) -> Result<(), String> {
             .expect("build grpc server runtime");
 
         rt.block_on(async move {
-            let http_addr: SocketAddr = format!("{host}:{grpc_http_port}")
-                .parse()
-                .expect("parse grpc/http bind addr");
-            let starlet_addr: SocketAddr = format!("{host}:{grpc_starlet_port}")
-                .parse()
-                .expect("parse starlet bind addr");
+            let (http_addr, starlet_addr) =
+                grpc_server_bind_addrs(&host, grpc_http_port, grpc_starlet_port)
+                    .expect("parse grpc server bind addrs");
             let mut http_shutdown = shutdown_rx.clone();
             let mut starlet_shutdown = shutdown_rx.clone();
 
@@ -748,6 +745,23 @@ fn validate_grpc_ports(http_port: u16, starlet_port: u16) -> Result<(), String> 
 /// and IPv4/hostname strings.  Bare and bracketed IPv6 forms are parsed via
 /// `IpAddr` to avoid the `:::PORT` ambiguity that arises from naive
 /// `format!("{host}:{port}")` string concatenation.
+/// Build both gRPC server bind addresses from a single host string and two ports.
+///
+/// Uses [`parse_grpc_bind_addr`] for each port so bare IPv6 addresses like `::` and
+/// `::1` are handled correctly, avoiding the `:::PORT` ambiguity produced by naive
+/// `format!("{host}:{port}")` string concatenation.
+pub(crate) fn grpc_server_bind_addrs(
+    host: &str,
+    http_port: u16,
+    starlet_port: u16,
+) -> Result<(SocketAddr, SocketAddr), String> {
+    let http_addr = parse_grpc_bind_addr(host, http_port)
+        .map_err(|e| format!("parse grpc/http bind addr failed: {e}"))?;
+    let starlet_addr = parse_grpc_bind_addr(host, starlet_port)
+        .map_err(|e| format!("parse starlet bind addr failed: {e}"))?;
+    Ok((http_addr, starlet_addr))
+}
+
 pub(crate) fn parse_grpc_bind_addr(host: &str, port: u16) -> Result<SocketAddr, String> {
     // Strip brackets from bracketed IPv6 literals, e.g. `[::1]` -> `::1`.
     let bare = if host.starts_with('[') && host.ends_with(']') {
@@ -951,6 +965,38 @@ mod tests {
         let addr = parse_grpc_bind_addr("0.0.0.0", 9070).expect("parse 0.0.0.0");
         assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         assert_eq!(addr.port(), 9070);
+    }
+
+    // --- PR-4 regression: grpc_server_bind_addrs must use safe addr construction ---
+
+    #[test]
+    fn grpc_server_bind_addrs_bare_ipv6_wildcard_two_ports() {
+        let (http, starlet) =
+            super::grpc_server_bind_addrs("::", 8040, 9070).expect("bare :: two ports");
+        assert_eq!(http.ip(), IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+        assert_eq!(http.port(), 8040);
+        assert_eq!(starlet.ip(), IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+        assert_eq!(starlet.port(), 9070);
+    }
+
+    #[test]
+    fn grpc_server_bind_addrs_bare_ipv6_loopback_two_ports() {
+        let (http, starlet) =
+            super::grpc_server_bind_addrs("::1", 8040, 9070).expect("bare ::1 two ports");
+        assert_eq!(http.ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
+        assert_eq!(http.port(), 8040);
+        assert_eq!(starlet.ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
+        assert_eq!(starlet.port(), 9070);
+    }
+
+    #[test]
+    fn grpc_server_bind_addrs_ipv4_two_ports() {
+        let (http, starlet) =
+            super::grpc_server_bind_addrs("127.0.0.1", 8040, 9070).expect("ipv4 two ports");
+        assert_eq!(http.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(http.port(), 8040);
+        assert_eq!(starlet.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(starlet.port(), 9070);
     }
 }
 
