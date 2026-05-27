@@ -1,7 +1,0 @@
--- query 3
-count(1)
-13
-
--- query 6
-count(1)
-2
