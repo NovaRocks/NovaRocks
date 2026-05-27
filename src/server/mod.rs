@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 #[cfg(unix)]
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -40,15 +40,13 @@ const ROOT_USER: &str = "root";
 static NEXT_CONNECTION_ID: AtomicU32 = AtomicU32::new(1);
 
 struct ClientDisconnectWatcher {
-    stop: Arc<AtomicBool>,
-    join_handle: Option<std::thread::JoinHandle<()>>,
+    join_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for ClientDisconnectWatcher {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
         if let Some(handle) = self.join_handle.take() {
-            let _ = handle.join();
+            handle.abort();
         }
     }
 }
@@ -296,6 +294,7 @@ async fn serve_forever(
             let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
             let (client_disconnect_signal, disconnect_watcher) =
                 spawn_client_disconnect_watcher(&stream);
+            let connection_disconnect_signal = Arc::clone(&client_disconnect_signal);
             let shim = NovaRocksMysqlShim::new(
                 engine,
                 user,
@@ -304,7 +303,9 @@ async fn serve_forever(
                 disconnect_watcher,
             );
             let (reader, writer) = stream.into_split();
-            if let Err(err) = AsyncMysqlIntermediary::run_on(shim, reader, writer).await {
+            let result = AsyncMysqlIntermediary::run_on(shim, reader, writer).await;
+            connection_disconnect_signal.store(true, Ordering::SeqCst);
+            if let Err(err) = result {
                 warn!(
                     "standalone mysql connection failed: peer={}, connection_id={}, err={}",
                     peer_addr, connection_id, err
@@ -319,41 +320,43 @@ fn spawn_client_disconnect_watcher(
     stream: &tokio::net::TcpStream,
 ) -> (Arc<AtomicBool>, ClientDisconnectWatcher) {
     let disconnected = Arc::new(AtomicBool::new(false));
-    let stop = Arc::new(AtomicBool::new(false));
     let fd = unsafe { libc::dup(stream.as_raw_fd()) };
     if fd < 0 {
-        return (
-            disconnected,
-            ClientDisconnectWatcher {
-                stop,
-                join_handle: None,
-            },
-        );
+        return (disconnected, ClientDisconnectWatcher { join_handle: None });
     }
 
+    let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+    if let Err(err) = std_stream.set_nonblocking(true) {
+        warn!(
+            "failed to configure disconnect monitor fd as nonblocking: {}",
+            err
+        );
+        return (disconnected, ClientDisconnectWatcher { join_handle: None });
+    }
+    let watcher_stream = match tokio::net::TcpStream::from_std(std_stream) {
+        Ok(stream) => stream,
+        Err(err) => {
+            warn!("failed to create async disconnect monitor stream: {}", err);
+            return (disconnected, ClientDisconnectWatcher { join_handle: None });
+        }
+    };
+
     let watcher_disconnected = Arc::clone(&disconnected);
-    let watcher_stop = Arc::clone(&stop);
-    let join_handle = std::thread::spawn(move || {
+    let join_handle = tokio::spawn(async move {
         let mut buf = [0u8; 1];
         loop {
-            if watcher_stop.load(Ordering::SeqCst) || watcher_disconnected.load(Ordering::SeqCst) {
+            if watcher_disconnected.load(Ordering::SeqCst) {
                 break;
             }
-            let rc = unsafe {
-                libc::recv(
-                    fd,
-                    buf.as_mut_ptr().cast(),
-                    buf.len(),
-                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
-                )
-            };
-            if rc == 0 {
-                watcher_disconnected.store(true, Ordering::SeqCst);
-                break;
-            }
-            if rc < 0 {
-                let err = io::Error::last_os_error();
-                match err.kind() {
+            match watcher_stream.peek(&mut buf).await {
+                Ok(0) => {
+                    watcher_disconnected.store(true, Ordering::SeqCst);
+                    break;
+                }
+                Ok(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(err) => match err.kind() {
                     io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => {}
                     io::ErrorKind::ConnectionReset
                     | io::ErrorKind::BrokenPipe
@@ -361,19 +364,14 @@ fn spawn_client_disconnect_watcher(
                         watcher_disconnected.store(true, Ordering::SeqCst);
                         break;
                     }
-                    _ => {}
-                }
+                    _ => break,
+                },
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        unsafe {
-            libc::close(fd);
         }
     });
     (
         disconnected,
         ClientDisconnectWatcher {
-            stop,
             join_handle: Some(join_handle),
         },
     )
@@ -384,14 +382,7 @@ fn spawn_client_disconnect_watcher(
     _stream: &tokio::net::TcpStream,
 ) -> (Arc<AtomicBool>, ClientDisconnectWatcher) {
     let disconnected = Arc::new(AtomicBool::new(false));
-    let stop = Arc::new(AtomicBool::new(false));
-    (
-        disconnected,
-        ClientDisconnectWatcher {
-            stop,
-            join_handle: None,
-        },
-    )
+    (disconnected, ClientDisconnectWatcher { join_handle: None })
 }
 
 struct NovaRocksMysqlShim {
@@ -1621,6 +1612,16 @@ mod tests {
         assert_eq!(
             resolved.mysql_port, DEFAULT_MYSQL_PORT,
             "default port when no [standalone_server] section"
+        );
+    }
+
+    #[test]
+    fn standalone_server_source_has_no_native_disconnect_watcher_thread() {
+        let source = include_str!("mod.rs");
+        let needle = ["std::thread", "::JoinHandle<()>"].concat();
+        assert!(
+            !source.contains(&needle),
+            "standalone server should not keep a native disconnect watcher thread per session"
         );
     }
 }

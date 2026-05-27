@@ -595,23 +595,29 @@ impl FragmentDispatcher for RemoteDispatcher {
                 .collect(),
             reason: "coordinator cancel".to_string(),
         };
-        if let Err(e) = std::thread::Builder::new()
-            .name("remote-cancel-fragment".to_string())
-            .spawn(move || {
-                match NovaRocksGrpcRemoteClient::connect_blocking(backend)
-                    .and_then(|client| client.blocking_cancel_fragment(req))
-                {
+        let runtime_handle = match crate::runtime::global_async_runtime::data_runtime_handle() {
+            Ok(handle) => handle,
+            Err(e) => {
+                warn!(
+                    "remote cancel_fragment runtime unavailable for {}: {}",
+                    backend, e
+                );
+                return;
+            }
+        };
+        runtime_handle.spawn(async move {
+            match NovaRocksGrpcRemoteClient::connect_blocking(backend) {
+                Ok(client) => match client.cancel_fragment_async(req).await {
                     Ok(resp) if resp.status_code == 0 => {}
                     Ok(resp) => warn!(
                         "remote cancel_fragment returned nonzero status from {}: {}",
                         backend, resp.status_code
                     ),
                     Err(e) => warn!("remote cancel_fragment failed for {}: {}", backend, e),
-                }
-            })
-        {
-            warn!("remote cancel_fragment spawn failed for {}: {}", backend, e);
-        }
+                },
+                Err(e) => warn!("remote cancel_fragment failed for {}: {}", backend, e),
+            }
+        });
     }
 }
 
@@ -1109,6 +1115,16 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn remote_dispatcher_source_has_no_native_cancel_thread_spawn() {
+        let source = include_str!("dispatcher.rs");
+        let needle = ["remote", "-cancel", "-fragment"].concat();
+        assert!(
+            !source.contains(&needle),
+            "remote cancel should not use a dedicated native thread"
+        );
     }
 
     #[test]

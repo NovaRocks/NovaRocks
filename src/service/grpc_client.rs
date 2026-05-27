@@ -19,6 +19,7 @@ use std::net::SocketAddr;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+use tonic::Request;
 use tonic::transport::Channel;
 
 use crate::common::network::format_host_for_url;
@@ -60,11 +61,23 @@ impl NovaRocksGrpcRemoteClient {
         let host = self.host.clone();
         let port = self.port;
         let ch = data_block_on(async move { get_or_create_channel(&host, port).await })??;
-        Ok(
-            proto::novarocks::nova_rocks_grpc_client::NovaRocksGrpcClient::new(ch)
-                .max_encoding_message_size(GRPC_MAX_ENCODING_BYTES)
-                .max_decoding_message_size(GRPC_MAX_DECODING_BYTES),
-        )
+        Ok(Self::client_from_channel(ch))
+    }
+
+    async fn make_async_client(
+        &self,
+    ) -> Result<proto::novarocks::nova_rocks_grpc_client::NovaRocksGrpcClient<Channel>, String>
+    {
+        let ch = get_or_create_channel(&self.host, self.port).await?;
+        Ok(Self::client_from_channel(ch))
+    }
+
+    fn client_from_channel(
+        ch: Channel,
+    ) -> proto::novarocks::nova_rocks_grpc_client::NovaRocksGrpcClient<Channel> {
+        proto::novarocks::nova_rocks_grpc_client::NovaRocksGrpcClient::new(ch)
+            .max_encoding_message_size(GRPC_MAX_ENCODING_BYTES)
+            .max_decoding_message_size(GRPC_MAX_DECODING_BYTES)
     }
 
     pub fn blocking_submit_fragment(
@@ -104,6 +117,19 @@ impl NovaRocksGrpcRemoteClient {
                 .map(|r| r.into_inner())
                 .map_err(|e| format!("cancel_fragment rpc failed: {e}"))
         })?
+    }
+
+    pub async fn cancel_fragment_async(
+        &self,
+        req: proto::novarocks::CancelFragmentRequest,
+    ) -> Result<proto::novarocks::CancelFragmentResponse, String> {
+        let mut cli = self.make_async_client().await?;
+        let mut req = Request::new(req);
+        req.set_timeout(Duration::from_secs(3));
+        cli.cancel_fragment(req)
+            .await
+            .map(|r| r.into_inner())
+            .map_err(|e| format!("cancel_fragment rpc failed: {e}"))
     }
 }
 
