@@ -52,6 +52,32 @@ struct ResolvedStandaloneServerOptions {
 
 pub fn run_standalone_server(opts: StandaloneServerOptions) -> Result<(), String> {
     let resolved = resolve_server_options(&opts)?;
+    run_with_resolved_options(resolved)
+}
+
+/// Run the standalone server using an already-loaded, validated [`NovaRocksConfig`].
+///
+/// This is the preferred entrypoint when config has already been loaded and
+/// validated upstream (e.g. by `run_standalone_server_cli`), avoiding a second
+/// file load.  `config_path` is forwarded to [`StandaloneNovaRocks::open`] so
+/// the engine can resolve its own storage settings; pass `None` to use
+/// built-in defaults.
+pub fn run_standalone_server_with_config(
+    cfg: NovaRocksConfig,
+    config_path: Option<PathBuf>,
+    port_override: Option<u16>,
+) -> Result<(), String> {
+    let resolved = resolve_server_options_from_config(&cfg, port_override)?;
+    // Thread the resolved config_path so the engine can open managed-lake
+    // storage and connector backends that depend on the TOML file.
+    let resolved = ResolvedStandaloneServerOptions {
+        config_path,
+        ..resolved
+    };
+    run_with_resolved_options(resolved)
+}
+
+fn run_with_resolved_options(resolved: ResolvedStandaloneServerOptions) -> Result<(), String> {
     let engine = StandaloneNovaRocks::open(StandaloneOptions {
         config_path: resolved.config_path.clone(),
     })?;
@@ -112,6 +138,44 @@ fn resolve_server_options(
 
 fn resolve_active_config_path(explicit: Option<&Path>) -> Option<PathBuf> {
     crate::common::app_config::resolve_config_path(explicit)
+}
+
+/// Extract server-layer settings (port, user, refresh coordinator) directly
+/// from a pre-loaded [`NovaRocksConfig`], applying `port_override` last.
+/// This avoids a second config file read when the caller already holds a
+/// validated config.
+fn resolve_server_options_from_config(
+    cfg: &NovaRocksConfig,
+    port_override: Option<u16>,
+) -> Result<ResolvedStandaloneServerOptions, String> {
+    let mut mysql_port = DEFAULT_MYSQL_PORT;
+    let mut user = ROOT_USER.to_string();
+    let mut refresh_coordinator = RefreshCoordinatorConfig::default();
+
+    if let Some(standalone) = cfg.standalone_server.as_ref() {
+        mysql_port = standalone.mysql_port;
+        if standalone.user != ROOT_USER {
+            return Err(format!(
+                "standalone server only supports user `{ROOT_USER}`, got `{}`",
+                standalone.user
+            ));
+        }
+        user = standalone.user.clone();
+        refresh_coordinator = RefreshCoordinatorConfig::from_standalone_config(standalone);
+    }
+
+    if let Some(port) = port_override {
+        mysql_port = port;
+    }
+
+    Ok(ResolvedStandaloneServerOptions {
+        // config_path is intentionally None here; callers that need the path
+        // (e.g. run_standalone_server_with_config) set it after this call.
+        config_path: None,
+        mysql_port,
+        user,
+        refresh_coordinator,
+    })
 }
 
 fn load_active_config(path: Option<&Path>) -> Result<Option<NovaRocksConfig>, String> {
@@ -1362,5 +1426,51 @@ mod tests {
         assert!(!crate::sql::optimizer::is_known_rule_name(
             "TotallyNotARealRule"
         ));
+    }
+
+    // I1: resolve_server_options_from_config must extract settings from a
+    // pre-loaded NovaRocksConfig without touching the filesystem.
+    #[test]
+    fn resolve_settings_from_cfg_uses_sentinel_mysql_port() {
+        use crate::common::app_config::StandaloneServerConfig;
+        let mut cfg = NovaRocksConfig::default();
+        cfg.standalone_server = Some(StandaloneServerConfig {
+            mysql_port: 12345,
+            ..StandaloneServerConfig::default()
+        });
+        let resolved =
+            resolve_server_options_from_config(&cfg, None).expect("extract settings from cfg");
+        assert_eq!(
+            resolved.mysql_port, 12345,
+            "mysql_port must come from the pre-loaded cfg, not from a fresh file load"
+        );
+    }
+
+    #[test]
+    fn resolve_settings_from_cfg_port_override_wins() {
+        use crate::common::app_config::StandaloneServerConfig;
+        let mut cfg = NovaRocksConfig::default();
+        cfg.standalone_server = Some(StandaloneServerConfig {
+            mysql_port: 12345,
+            ..StandaloneServerConfig::default()
+        });
+        let resolved = resolve_server_options_from_config(&cfg, Some(19030))
+            .expect("extract settings with port override");
+        assert_eq!(
+            resolved.mysql_port, 19030,
+            "explicit port override must win over config"
+        );
+    }
+
+    #[test]
+    fn resolve_settings_from_cfg_defaults_when_no_standalone_section() {
+        // I1: When standalone_server section is absent, DEFAULT_MYSQL_PORT is used.
+        let cfg = NovaRocksConfig::default();
+        let resolved =
+            resolve_server_options_from_config(&cfg, None).expect("defaults from empty cfg");
+        assert_eq!(
+            resolved.mysql_port, DEFAULT_MYSQL_PORT,
+            "default port when no [standalone_server] section"
+        );
     }
 }

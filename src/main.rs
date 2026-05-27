@@ -28,7 +28,6 @@ use std::time::{Duration, Instant};
 use novarocks::common::network;
 use novarocks::novarocks_config;
 use novarocks::novarocks_logging;
-use std::eprintln;
 
 #[derive(Debug, PartialEq, Eq)]
 struct StandaloneServerCliArgs {
@@ -138,21 +137,23 @@ fn resolve_cluster_role(
 
 /// Load config from `cli.config_path` (or use defaults when absent), resolve
 /// the effective cluster role (CLI override wins over config), and validate the
-/// loaded cluster section.  Returns the owned config together with the resolved
-/// role so that callers can pass both to `dispatch_standalone_role`.
+/// loaded cluster section.  Returns the owned config, the resolved role, and
+/// the resolved config file path so callers can thread the pre-loaded config
+/// into the execution path without a second file read (I1 fix).
 fn load_config_and_resolve_role(
     cli: &StandaloneServerCliArgs,
 ) -> anyhow::Result<(
     novarocks::common::app_config::NovaRocksConfig,
     novarocks::common::app_config::ClusterRole,
+    Option<PathBuf>,
 )> {
     // C2: honour NOVAROCKS_CONFIG env var and ./novarocks.toml fallback, not
     // just the explicit --config path.
     let config_path = novarocks::common::app_config::resolve_config_path(
         cli.config_path.as_deref().map(std::path::Path::new),
     );
-    let cfg = match config_path {
-        Some(p) => novarocks::common::app_config::NovaRocksConfig::load_from_file(&p)
+    let cfg = match config_path.as_ref() {
+        Some(p) => novarocks::common::app_config::NovaRocksConfig::load_from_file(p)
             .map_err(|e| anyhow::anyhow!("{}", e))?,
         None => novarocks::common::app_config::NovaRocksConfig::default(),
     };
@@ -175,7 +176,7 @@ fn load_config_and_resolve_role(
         .validate()
         .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    Ok((cfg, role))
+    Ok((cfg, role, config_path))
 }
 
 fn dispatch_standalone_role(
@@ -199,21 +200,14 @@ fn dispatch_standalone_role(
 }
 
 fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()> {
-    let (cfg, role) = load_config_and_resolve_role(&cli)?;
+    // I1: load_config_and_resolve_role returns the resolved path so we thread
+    // it — along with the already-validated cfg — into the execution path
+    // without a second file read.
+    let (cfg, role, resolved_config_path) = load_config_and_resolve_role(&cli)?;
 
-    // Capture the explicit config path for the server (it re-resolves
-    // env/CWD fallbacks the same way load_config_and_resolve_role does).
-    let config_path = cli.config_path.as_deref().map(PathBuf::from);
-
-    dispatch_standalone_role(role, cfg, cli.mysql_port, |_cfg, port| {
-        // I1: use `port` (the closure parameter) instead of the captured
-        // cli.mysql_port so the already-resolved port override is threaded
-        // through rather than read a second time from cli.
-        let opts = novarocks::server::StandaloneServerOptions {
-            config_path: config_path.clone(),
-            mysql_port: port,
-        };
-        novarocks::server::run_standalone_server(opts).map_err(|e| anyhow::anyhow!("{}", e))
+    dispatch_standalone_role(role, cfg, cli.mysql_port, |cfg, port| {
+        novarocks::server::run_standalone_server_with_config(cfg, resolved_config_path, port)
+            .map_err(|e| anyhow::anyhow!("{}", e))
     })
 }
 
@@ -984,7 +978,7 @@ backends = ["127.0.0.1:9070"]
             role: None,
             mysql_port: None,
         };
-        let (cfg, role) =
+        let (cfg, role, _) =
             load_config_and_resolve_role(&cli).expect("load and resolve must succeed for valid fe");
         assert_eq!(role, novarocks::common::app_config::ClusterRole::Fe);
         let err = dispatch_standalone_role(role, cfg, None, |_, _| {
@@ -1036,7 +1030,7 @@ role = "all-in-one"
             role: Some("be".to_string()),
             mysql_port: None,
         };
-        let (cfg, role) = load_config_and_resolve_role(&cli)
+        let (cfg, role, _) = load_config_and_resolve_role(&cli)
             .expect("load and resolve must succeed (be with no backends is valid)");
         assert_eq!(role, novarocks::common::app_config::ClusterRole::Be);
         let err = dispatch_standalone_role(role, cfg, None, |_, _| {
@@ -1101,7 +1095,7 @@ backends = ["127.0.0.1:9070"]
             None => unsafe { std::env::remove_var("NOVAROCKS_CONFIG") },
         }
 
-        let (_, role) = result.expect("NOVAROCKS_CONFIG must be picked up");
+        let (_, role, _) = result.expect("NOVAROCKS_CONFIG must be picked up");
         assert_eq!(role, novarocks::common::app_config::ClusterRole::Fe);
     }
 
@@ -1137,7 +1131,72 @@ backends = ["127.0.0.1:9070"]
             None => unsafe { std::env::remove_var("NOVAROCKS_CONFIG") },
         }
 
-        let (_, role) = result.expect("./novarocks.toml in CWD must be picked up");
+        let (_, role, _) = result.expect("./novarocks.toml in CWD must be picked up");
         assert_eq!(role, novarocks::common::app_config::ClusterRole::Fe);
+    }
+
+    // I1: dispatch_standalone_role must pass the pre-loaded cfg to the
+    // all-in-one closure, not drop it.
+    #[test]
+    fn test_i1_all_in_one_closure_receives_validated_config() {
+        use novarocks::common::app_config::StandaloneServerConfig;
+        let mut cfg = novarocks::common::app_config::NovaRocksConfig::default();
+        // Plant a sentinel mysql_port in the config that can only come from the
+        // pre-loaded instance — it's never the default 9030.
+        cfg.standalone_server = Some(StandaloneServerConfig {
+            mysql_port: 23456,
+            ..StandaloneServerConfig::default()
+        });
+        let captured_port: std::cell::Cell<u16> = std::cell::Cell::new(0);
+        dispatch_standalone_role(
+            novarocks::common::app_config::ClusterRole::AllInOne,
+            cfg,
+            None,
+            |cfg, _port| {
+                // The closure must receive the sentinel config (not a freshly
+                // defaulted one).
+                captured_port.set(
+                    cfg.standalone_server
+                        .as_ref()
+                        .map(|s| s.mysql_port)
+                        .unwrap_or(0),
+                );
+                Ok(())
+            },
+        )
+        .expect("all-in-one dispatch must succeed");
+        assert_eq!(
+            captured_port.get(),
+            23456,
+            "all-in-one runner must receive the pre-loaded cfg with the sentinel mysql_port"
+        );
+    }
+
+    // I1: load_config_and_resolve_role returns the resolved config path so the
+    // caller can pass it to the server without a second resolve call.
+    #[test]
+    fn test_i1_load_config_returns_resolved_path() {
+        let toml = r#"
+[cluster]
+role = "all-in-one"
+"#;
+        let f = write_toml_tempfile(toml);
+        let explicit_path = f.path().to_str().expect("utf-8").to_string();
+        let cli = StandaloneServerCliArgs {
+            config_path: Some(explicit_path.clone()),
+            role: None,
+            mysql_port: None,
+        };
+        let (_, _, resolved_path) =
+            load_config_and_resolve_role(&cli).expect("load must succeed");
+        assert!(
+            resolved_path.is_some(),
+            "resolved_path must be Some when --config was provided"
+        );
+        assert_eq!(
+            resolved_path.unwrap().to_str().unwrap(),
+            explicit_path,
+            "resolved path must match the explicit --config path"
+        );
     }
 }
