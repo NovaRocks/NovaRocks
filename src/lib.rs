@@ -44,8 +44,8 @@ pub use fs::oss as novarocks_fs_oss;
 pub use fs::path as novarocks_fs_path;
 
 pub use common::types::{FetchResult, UniqueId};
-pub use service::grpc_server::start_grpc_server;
 pub use service::grpc_server::start_grpc_exchange_server;
+pub use service::grpc_server::start_grpc_server;
 pub use service::internal_service::{
     cancel, submit_exec_batch_plan_fragments, submit_exec_plan_fragment,
 };

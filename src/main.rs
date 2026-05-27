@@ -251,19 +251,17 @@ fn dispatch_standalone_role(
             let starlet_port = cfg.server.starlet_port;
             let pid = std::process::id();
             let starlet_addr: std::net::SocketAddr =
-                be_readiness_probe_addr(&host, starlet_port).map_err(|e| {
-                    anyhow::anyhow!("role=be: {e}")
-                })?;
+                be_readiness_probe_addr(&host, starlet_port)
+                    .map_err(|e| anyhow::anyhow!("role=be: {e}"))?;
             novarocks::common::app_config::install_preloaded_config(cfg);
             // Spec (PR-4): standalone BE exposes NovaRocksGrpc
             // (SubmitFragment/FetchResult/CancelFragment/Exchange) on starlet_port.
             // FE cluster.backends must point to this port.
-            novarocks::start_grpc_exchange_server(&host, starlet_port)
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "role=be: failed to start NovaRocksGrpc server on {host}:{starlet_port}: {e}"
-                    )
-                })?;
+            novarocks::start_grpc_exchange_server(&host, starlet_port).map_err(|e| {
+                anyhow::anyhow!(
+                    "role=be: failed to start NovaRocksGrpc server on {host}:{starlet_port}: {e}"
+                )
+            })?;
             wait_for_tcp_ready(starlet_addr, Duration::from_secs(5), "novarocks grpc")
                 .map_err(|e| anyhow::anyhow!("role=be: {e}"))?;
             println!("NOVAROCKS_READY role=be starlet_port={starlet_port} pid={pid}");
@@ -1380,13 +1378,19 @@ backends = ["127.0.0.1:9070"]
         // IPv6 wildcard :: -> [::1]:port
         let addr = super::be_readiness_probe_addr("::", 9020)
             .expect("IPv6 wildcard :: must build valid SocketAddr");
-        assert_eq!(addr.ip(), std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
+        assert_eq!(
+            addr.ip(),
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        );
         assert_eq!(addr.port(), 9020);
 
         // IPv6 wildcard [::] -> [::1]:port
         let addr = super::be_readiness_probe_addr("[::]", 9020)
             .expect("IPv6 wildcard [::] must build valid SocketAddr");
-        assert_eq!(addr.ip(), std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
+        assert_eq!(
+            addr.ip(),
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        );
         assert_eq!(addr.port(), 9020);
 
         // specific IPv4 host -> unchanged
