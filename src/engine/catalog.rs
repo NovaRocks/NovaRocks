@@ -109,6 +109,25 @@ impl InMemoryCatalog {
         table: TableDef,
         physical_layout: PhysicalTableLayout,
     ) -> Result<(), String> {
+        // Invariant: TableDef::source for a StarRocks table must carry the
+        // same (db_id, table_id) as the PhysicalTableLayout. The dict provider
+        // resolves identity from ScanSource::StarRocks; the rest of the
+        // execution layer still uses PhysicalTableLayout. If they disagree,
+        // dict snapshots will silently miss. Asserted in debug builds only —
+        // release builds skip to keep the registration path tight.
+        debug_assert!(
+            matches!(
+                &table.source,
+                ScanSource::StarRocks { db_id, table_id }
+                    if *db_id == physical_layout.db_id && *table_id == physical_layout.table_id
+            ),
+            "StarRocks TableDef.source must agree with PhysicalTableLayout on (db_id, table_id); \
+             got source={:?} layout=(db_id={}, table_id={})",
+            table.source,
+            physical_layout.db_id,
+            physical_layout.table_id,
+        );
+
         let db_key = normalize_identifier(database_name)?;
         let db = self
             .databases
@@ -336,7 +355,13 @@ mod tests {
                 logical_type: None,
             }],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::StarRocks { db_id: 0, table_id: 0 },
+            // Must match the PhysicalTableLayout used by tests in this module
+            // (db_id: 10, table_id: 20) so the debug_assert in
+            // register_starrocks_table is satisfied.
+            source: ScanSource::StarRocks {
+                db_id: 10,
+                table_id: 20,
+            },
         }
     }
 

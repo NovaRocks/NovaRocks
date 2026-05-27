@@ -4067,7 +4067,12 @@ enable_path_style_access = true
                 },
             ],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::StarRocks { db_id: 0, table_id: 0 },
+            // Must match the PhysicalTableLayout below so the debug_assert
+            // in InMemoryCatalog::register_starrocks_table is satisfied.
+            source: ScanSource::StarRocks {
+                db_id: 1,
+                table_id: 2,
+            },
         };
         let layout = PhysicalTableLayout {
             db_id: 1,
