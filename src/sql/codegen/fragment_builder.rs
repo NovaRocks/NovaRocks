@@ -3228,12 +3228,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             // ID-based lookups (e.g. distribution column resolution in
             // `build_output_partition`) succeed when an outer operator needs
             // to find the hash partition columns produced by the CTE.
-            scope.add_column_with_id(
-                col.column_id,
-                None,
-                col.name.clone(),
-                binding.clone(),
-            );
+            scope.add_column_with_id(col.column_id, None, col.name.clone(), binding.clone());
             // Also register the column under the CTE alias as qualifier so
             // that `alias.col` references in the consuming query resolve.
             scope.add_qualified_alias(op.alias.clone(), col.name.clone(), binding);

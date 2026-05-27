@@ -983,10 +983,27 @@ fn has_join_criterion_before_terminator(bytes: &[u8], start: usize) -> bool {
                 // Any keyword that ends the current join's right-hand relation
                 // without an explicit criterion attached.
                 const TERMINATORS: &[&str] = &[
-                    "where", "group", "order", "limit", "having", "union",
-                    "intersect", "except", "into", "for", "lock", "window",
-                    "qualify", "fetch", "offset",
-                    "join", "inner", "left", "right", "full", "cross",
+                    "where",
+                    "group",
+                    "order",
+                    "limit",
+                    "having",
+                    "union",
+                    "intersect",
+                    "except",
+                    "into",
+                    "for",
+                    "lock",
+                    "window",
+                    "qualify",
+                    "fetch",
+                    "offset",
+                    "join",
+                    "inner",
+                    "left",
+                    "right",
+                    "full",
+                    "cross",
                 ];
                 for kw in TERMINATORS {
                     if starts_with_keyword(bytes, p, kw)
@@ -2882,9 +2899,8 @@ mod tests {
         assert_eq!(normalized, "SELECT * FROM a INNER JOIN b ON a.k = b.k");
 
         // USING criterion is also rewritten.
-        let normalized =
-            super::normalize_for_raw_parse("SELECT * FROM a CROSS JOIN b USING(k)")
-                .expect("normalize should succeed");
+        let normalized = super::normalize_for_raw_parse("SELECT * FROM a CROSS JOIN b USING(k)")
+            .expect("normalize should succeed");
         assert_eq!(normalized, "SELECT * FROM a INNER JOIN b USING(k)");
 
         // Plain CROSS JOIN without a criterion stays as CROSS JOIN.
@@ -2895,10 +2911,7 @@ mod tests {
         let normalized =
             super::normalize_for_raw_parse("SELECT * FROM a CROSS JOIN b WHERE a.k = b.k")
                 .expect("normalize should succeed");
-        assert_eq!(
-            normalized,
-            "SELECT * FROM a CROSS JOIN b WHERE a.k = b.k"
-        );
+        assert_eq!(normalized, "SELECT * FROM a CROSS JOIN b WHERE a.k = b.k");
 
         // CROSS JOIN with subquery and ON criterion.
         let normalized = super::normalize_for_raw_parse(
@@ -2922,10 +2935,8 @@ mod tests {
         );
 
         // String literals containing "CROSS JOIN ON" must not be rewritten.
-        let normalized = super::normalize_for_raw_parse(
-            "SELECT 'CROSS JOIN on test' AS s FROM t",
-        )
-        .expect("normalize should succeed");
+        let normalized = super::normalize_for_raw_parse("SELECT 'CROSS JOIN on test' AS s FROM t")
+            .expect("normalize should succeed");
         assert!(normalized.contains("'CROSS JOIN on test'"));
         assert!(!normalized.contains("INNER"));
     }

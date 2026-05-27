@@ -1498,13 +1498,16 @@ impl<'a> AnalyzerContext<'a> {
                         .unwrap_or(&qualifier_str)
                         .to_string();
                     let mut found = false;
-                    for (qualifier, col_name, col_id, data_type, nullable) in scope
-                        .iter_qualified_columns(&qualifier_str)
-                        .chain(if fallback_qualifier != qualifier_str {
-                            Some(scope.iter_qualified_columns(&fallback_qualifier))
-                        } else {
-                            None
-                        }.into_iter().flatten())
+                    for (qualifier, col_name, col_id, data_type, nullable) in
+                        scope.iter_qualified_columns(&qualifier_str).chain(
+                            if fallback_qualifier != qualifier_str {
+                                Some(scope.iter_qualified_columns(&fallback_qualifier))
+                            } else {
+                                None
+                            }
+                            .into_iter()
+                            .flatten(),
+                        )
                     {
                         found = true;
                         let typed = TypedExpr {

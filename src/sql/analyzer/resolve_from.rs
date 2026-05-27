@@ -59,16 +59,14 @@ impl<'a> super::AnalyzerContext<'a> {
                     let mut conds = Vec::new();
                     for col_obj in columns {
                         let col_name = col_obj.to_string();
-                        let (left_id, left_dt, left_nullable) = current_scope
-                            .resolve(None, &col_name)
-                            .unwrap_or((
+                        let (left_id, left_dt, left_nullable) =
+                            current_scope.resolve(None, &col_name).unwrap_or((
                                 crate::sql::column_id::ColumnId::UNSET,
                                 DataType::Utf8,
                                 true,
                             ));
-                        let (right_id, right_dt, right_nullable) = right_scope
-                            .resolve(None, &col_name)
-                            .unwrap_or((
+                        let (right_id, right_dt, right_nullable) =
+                            right_scope.resolve(None, &col_name).unwrap_or((
                                 crate::sql::column_id::ColumnId::UNSET,
                                 DataType::Utf8,
                                 true,

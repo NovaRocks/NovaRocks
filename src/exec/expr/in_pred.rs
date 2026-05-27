@@ -759,7 +759,7 @@ mod tests {
         ])) as ArrayRef;
         let scalar = Arc::new(create_test_map_array(&[Some(&[(0, 10), (1, 11)])])) as ArrayRef;
 
-        let result = eq_with_scalar(&array, &scalar).expect("compare map scalar");
+        let result = eq_with_candidate(&array, &scalar, false, true).expect("compare map scalar");
         assert!(result.value(0));
         assert!(!result.value(1));
         assert!(result.is_null(2));
