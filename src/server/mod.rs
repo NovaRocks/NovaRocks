@@ -63,6 +63,7 @@ pub fn run_standalone_server(opts: StandaloneServerOptions) -> Result<(), String
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .thread_stack_size(crate::runtime::global_async_runtime::WORKER_STACK_SIZE_BYTES)
         .build()
         .map_err(|e| format!("build tokio runtime failed: {e}"))?;
 

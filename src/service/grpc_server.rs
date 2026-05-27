@@ -516,6 +516,7 @@ pub fn start_grpc_server(host: &str) -> Result<(), String> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .worker_threads(8)
+            .thread_stack_size(crate::runtime::global_async_runtime::WORKER_STACK_SIZE_BYTES)
             .build()
             .expect("build grpc server runtime");
 
@@ -668,6 +669,7 @@ pub fn start_grpc_exchange_server(host: &str, port: u16) -> Result<(), String> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .worker_threads(8)
+            .thread_stack_size(crate::runtime::global_async_runtime::WORKER_STACK_SIZE_BYTES)
             .build()
             .expect("build standalone grpc server runtime");
 

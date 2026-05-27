@@ -22,6 +22,18 @@ use tokio::runtime::{Handle, Runtime};
 use crate::common::config::{data_runtime_max_blocking_threads, data_runtime_worker_threads};
 use crate::novarocks_logging::info;
 
+/// Worker thread stack size for Tokio runtimes that run SQL workloads.
+///
+/// Tokio defaults to the platform thread stack (≈ 2 MiB), which is not enough
+/// for our deeply-recursive analyzer / planner / fragment-builder walks.
+/// Deeply-nested ASTs blow the stack and abort the whole process (we saw
+/// this on `WITH RECURSIVE ... max_depth=10` Fibonacci and on multi-CTE
+/// TPC-DS reports that nest INTERSECT / UNION ALL several levels deep).
+///
+/// 16 MiB is the value StarRocks BE / DuckDB / other comparable engines
+/// converge on for the same reason.
+pub const WORKER_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
+
 const DATA_RUNTIME_THREAD_NAME: &str = "novarocks-data-runtime";
 static DATA_RUNTIME: OnceLock<Result<Arc<Runtime>, String>> = OnceLock::new();
 
@@ -34,6 +46,7 @@ pub fn data_runtime() -> Result<&'static Arc<Runtime>, String> {
             .worker_threads(worker_threads)
             .max_blocking_threads(max_blocking_threads)
             .thread_name(DATA_RUNTIME_THREAD_NAME)
+            .thread_stack_size(WORKER_STACK_SIZE_BYTES)
             .build()
             .map_err(|e| format!("init data tokio runtime failed: {e}"))?;
         info!(
