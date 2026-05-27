@@ -486,7 +486,8 @@ mod tests {
                 | LogicalPlan::Repeat(_)
                 | LogicalPlan::CTEAnchor(_)
                 | LogicalPlan::CTEProduce(_)
-                | LogicalPlan::CTEConsume(_) => {}
+                | LogicalPlan::CTEConsume(_)
+                | LogicalPlan::Decode(_) => {}
             }
         }
         assert_variant_handled(&leaf);

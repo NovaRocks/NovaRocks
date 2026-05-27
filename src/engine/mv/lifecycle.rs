@@ -285,8 +285,11 @@ mod tests {
             MvStorageEngine::from_sql_str("iceberg").unwrap(),
             MvStorageEngine::Iceberg
         );
+        // Regression assertion: the legacy `"managed"` alias is no longer
+        // accepted after the catalog rename. Do not change to "starrocks"
+        // here — that's a valid value and would make the unwrap_err() panic.
         assert!(
-            MvStorageEngine::from_sql_str("starrocks")
+            MvStorageEngine::from_sql_str("managed")
                 .unwrap_err()
                 .contains("unknown materialized view storage_engine"),
         );

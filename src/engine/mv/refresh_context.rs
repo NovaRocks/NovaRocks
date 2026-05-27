@@ -488,8 +488,8 @@ mod tests {
 
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
-    use crate::connector::starrocks::managed::model::IcebergTableRef;
-    use crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin;
+    use crate::connector::starrocks::table::model::IcebergTableRef;
+    use crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin;
     use crate::meta::repository::mv_contract::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
         ApplyKeySource,

@@ -1877,9 +1877,13 @@ mod tests {
     }
 
     #[test]
-    fn expr_display_name_preserves_compound_field_access_paths() {
+    fn expr_display_name_strips_table_qualifier_for_compound_identifier() {
+        // MySQL / StarRocks convention: `SELECT t.col` displays as `col`.
+        // The qualifier exists for name resolution, not for the result
+        // header. `expr_display_name_preserve_path` is the variant that
+        // keeps the dotted chain when the caller needs the full path.
         let expr = parse_select_expr("SELECT c13.a");
-        assert_eq!(expr_display_name(&expr), "c13.a");
+        assert_eq!(expr_display_name(&expr), "a");
     }
 
     #[test]

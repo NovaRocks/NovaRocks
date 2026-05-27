@@ -4356,6 +4356,11 @@ enable_path_style_access = true
     }
 
     fn aggregate_output_columns() -> Vec<OutputColumn> {
+        // `output_columns` describes the VISIBLE shape (one entry per
+        // `shape.visible_outputs`): types are the post-decode visible types
+        // (`Int64` for COUNT/SUM). The matching chunks themselves carry
+        // opaque LargeBinary state for each aggregate slot — see
+        // `aggregate_visible_query_result`.
         vec![
             OutputColumn {
                 column_id: ColumnId::UNSET,
@@ -4379,19 +4384,35 @@ enable_path_style_access = true
     }
 
     fn aggregate_visible_query_result() -> Result<QueryResult, String> {
+        use arrow::array::LargeBinaryArray;
+        use crate::connector::starrocks::table::state_codec::{
+            encode_count_state, encode_sum_int64,
+        };
+
+        // Counterpart visible values: c=[3, 4], s=[30, 40], one row per k1.
+        // Post-#188 the executor surfaces aggregates as opaque LargeBinary
+        // state slots; the materializer decodes them back into the visible
+        // columns described by `aggregate_output_columns`.
+        let c_states: Vec<Vec<u8>> = vec![encode_count_state(3), encode_count_state(4)];
+        let s_states: Vec<Vec<u8>> = vec![encode_sum_int64(3, 30), encode_sum_int64(4, 40)];
+
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("k1", DataType::Int64, false),
-                Field::new("c", DataType::Int64, false),
-                Field::new("s", DataType::Int64, true),
+                Field::new("__agg_state_c", DataType::LargeBinary, false),
+                Field::new("__agg_state_s", DataType::LargeBinary, true),
             ])),
             vec![
                 Arc::new(Int64Array::from(vec![1_i64, 2])),
-                Arc::new(Int64Array::from(vec![3_i64, 4])),
-                Arc::new(Int64Array::from(vec![30_i64, 40])),
+                Arc::new(LargeBinaryArray::from_iter_values(
+                    c_states.iter().map(|v| v.as_slice()),
+                )),
+                Arc::new(LargeBinaryArray::from_iter_values(
+                    s_states.iter().map(|v| v.as_slice()),
+                )),
             ],
         )
-        .map_err(|e| format!("build aggregate visible batch failed: {e}"))?;
+        .map_err(|e| format!("build aggregate state batch failed: {e}"))?;
         Ok(QueryResult {
             columns: vec![
                 QueryResultColumn {

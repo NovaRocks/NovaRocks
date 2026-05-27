@@ -265,9 +265,20 @@ fn parse_refresh_async_tail(
             return Err("REFRESH ASYNC EVERY requires INTERVAL <n> <unit>".to_string());
         }
         parser.next_token();
+        // The top-level dialect normalizer (`rewrite_interval_value_parens`)
+        // wraps every `INTERVAL <expr> <UNIT>` value in parentheses so that
+        // sqlparser can absorb compound expressions (`idx * 37`) without
+        // tripping over `<UNIT>`. We have to peel that wrapper back off
+        // before we can read the literal int.
+        let saw_lparen = parser.consume_token(&Token::LParen);
         let value = parser
             .parse_literal_uint()
             .map_err(|e| format!("parse REFRESH ASYNC interval failed: {e}"))?;
+        if saw_lparen {
+            parser
+                .expect_token(&Token::RParen)
+                .map_err(|e| format!("parse REFRESH ASYNC interval failed: {e}"))?;
+        }
         let unit = parser.next_token();
         let unit = match &unit.token {
             Token::Word(word) => word.value.as_str(),
