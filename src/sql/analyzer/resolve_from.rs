@@ -344,6 +344,12 @@ impl<'a> super::AnalyzerContext<'a> {
                 let (db, tbl) = match parts.len() {
                     1 => (self.current_database.to_string(), parts[0].clone()),
                     2 => (parts[0].clone(), parts[1].clone()),
+                    // <cat>.<db>.<tbl>: drop catalog component. Mirrors the
+                    // metadata-table branch above and is required by the IMV
+                    // refresh pipeline, whose canonical_select_query carries
+                    // fully-qualified 3-part names produced by
+                    // canonicalize_iceberg_mv_select_query.
+                    3 => (parts[1].clone(), parts[2].clone()),
                     _ => return Err(format!("unsupported table name: {name}")),
                 };
                 let db_lower = db.to_lowercase();

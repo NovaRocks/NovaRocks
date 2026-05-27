@@ -1415,39 +1415,8 @@ pub(crate) fn refresh_iceberg_mv(
         "iceberg MV refresh context constructed"
     );
 
-    // === IMV optimizer pipeline (PR-α: no-op rule set, outcome discarded) ===
-    //
-    // Plan the canonical select query as a LogicalPlan and run it through
-    // the (empty) IMV pipeline so the foundation is exercised on every
-    // refresh attempt. The outcome is discarded in PR-α; PR-β / task 4+
-    // will consume the rewritten plan.
-    let imv_plan = plan_canonical_select_for_imv(state, &ctx).map_err(|e| e.message)?;
-    let imv_outcome = crate::sql::optimizer::rewrite::imv::entrypoint::run_imv_rewrite(
-        crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteInput {
-            plan: imv_plan,
-            mv_ctx: Arc::clone(&ctx.rewrite),
-            disabled_rules: Vec::new(), // PR-α: TODO thread session disabled rules in Task 13
-            deadline: None,
-        },
-    )
-    .map_err(|e| {
-        format!(
-            "imv rewrite failed for {}.{}.{}: {e}",
-            ctx.rewrite.target.catalog,
-            ctx.rewrite.target.namespace,
-            ctx.rewrite.target.table
-        )
-    })?;
-    tracing::info!(
-        mv_target = ?ctx.rewrite.target,
-        mv_id = ctx.rewrite.mv_id,
-        stages = ?imv_outcome.trace.stage_names(),
-        rules_changed = imv_outcome.trace.changed_rules_count(),
-        rules_rejected = imv_outcome.trace.rejected_rules_count(),
-        rules_failed = imv_outcome.trace.failed_rules_count(),
-        "imv rewrite completed",
-    );
-    let _ = imv_outcome; // PR-α: outcome discarded. PR-β / task 4 consume it.
+    // PR-α: exercise the (no-op) IMV optimizer pipeline; outcome discarded.
+    try_run_imv_rewrite_pipeline(state, &ctx);
 
     match (previous_snapshot_id, current_snapshot_id) {
         // Base table has no snapshot yet — nothing to refresh.
@@ -1734,39 +1703,8 @@ fn refresh_single_aggregate_iceberg_mv(
         "iceberg MV refresh context constructed"
     );
 
-    // === IMV optimizer pipeline (PR-α: no-op rule set, outcome discarded) ===
-    //
-    // Plan the canonical select query as a LogicalPlan and run it through
-    // the (empty) IMV pipeline so the foundation is exercised on every
-    // refresh attempt. The outcome is discarded in PR-α; PR-β / task 4+
-    // will consume the rewritten plan.
-    let imv_plan = plan_canonical_select_for_imv(state, &ctx).map_err(|e| e.message)?;
-    let imv_outcome = crate::sql::optimizer::rewrite::imv::entrypoint::run_imv_rewrite(
-        crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteInput {
-            plan: imv_plan,
-            mv_ctx: Arc::clone(&ctx.rewrite),
-            disabled_rules: Vec::new(), // PR-α: TODO thread session disabled rules in Task 13
-            deadline: None,
-        },
-    )
-    .map_err(|e| {
-        format!(
-            "imv rewrite failed for {}.{}.{}: {e}",
-            ctx.rewrite.target.catalog,
-            ctx.rewrite.target.namespace,
-            ctx.rewrite.target.table
-        )
-    })?;
-    tracing::info!(
-        mv_target = ?ctx.rewrite.target,
-        mv_id = ctx.rewrite.mv_id,
-        stages = ?imv_outcome.trace.stage_names(),
-        rules_changed = imv_outcome.trace.changed_rules_count(),
-        rules_rejected = imv_outcome.trace.rejected_rules_count(),
-        rules_failed = imv_outcome.trace.failed_rules_count(),
-        "imv rewrite completed",
-    );
-    let _ = imv_outcome; // PR-α: outcome discarded. PR-β / task 4 consume it.
+    // PR-α: exercise the (no-op) IMV optimizer pipeline; outcome discarded.
+    try_run_imv_rewrite_pipeline(state, &ctx);
 
     match previous {
         None => {
@@ -2515,39 +2453,8 @@ fn refresh_join_aggregate_iceberg_mv(
         "iceberg MV refresh context constructed"
     );
 
-    // === IMV optimizer pipeline (PR-α: no-op rule set, outcome discarded) ===
-    //
-    // Plan the canonical select query as a LogicalPlan and run it through
-    // the (empty) IMV pipeline so the foundation is exercised on every
-    // refresh attempt. The outcome is discarded in PR-α; PR-β / task 4+
-    // will consume the rewritten plan.
-    let imv_plan = plan_canonical_select_for_imv(state, &ctx).map_err(|e| e.message)?;
-    let imv_outcome = crate::sql::optimizer::rewrite::imv::entrypoint::run_imv_rewrite(
-        crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteInput {
-            plan: imv_plan,
-            mv_ctx: Arc::clone(&ctx.rewrite),
-            disabled_rules: Vec::new(), // PR-α: TODO thread session disabled rules in Task 13
-            deadline: None,
-        },
-    )
-    .map_err(|e| {
-        format!(
-            "imv rewrite failed for {}.{}.{}: {e}",
-            ctx.rewrite.target.catalog,
-            ctx.rewrite.target.namespace,
-            ctx.rewrite.target.table
-        )
-    })?;
-    tracing::info!(
-        mv_target = ?ctx.rewrite.target,
-        mv_id = ctx.rewrite.mv_id,
-        stages = ?imv_outcome.trace.stage_names(),
-        rules_changed = imv_outcome.trace.changed_rules_count(),
-        rules_rejected = imv_outcome.trace.rejected_rules_count(),
-        rules_failed = imv_outcome.trace.failed_rules_count(),
-        "imv rewrite completed",
-    );
-    let _ = imv_outcome; // PR-α: outcome discarded. PR-β / task 4 consume it.
+    // PR-α: exercise the (no-op) IMV optimizer pipeline; outcome discarded.
+    try_run_imv_rewrite_pipeline(state, &ctx);
 
     let left_current = pin
         .get(left_ref)
@@ -5574,39 +5481,8 @@ fn refresh_iceberg_join_mv(
         "iceberg MV refresh context constructed"
     );
 
-    // === IMV optimizer pipeline (PR-α: no-op rule set, outcome discarded) ===
-    //
-    // Plan the canonical select query as a LogicalPlan and run it through
-    // the (empty) IMV pipeline so the foundation is exercised on every
-    // refresh attempt. The outcome is discarded in PR-α; PR-β / task 4+
-    // will consume the rewritten plan.
-    let imv_plan = plan_canonical_select_for_imv(state, &ctx).map_err(|e| e.message)?;
-    let imv_outcome = crate::sql::optimizer::rewrite::imv::entrypoint::run_imv_rewrite(
-        crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteInput {
-            plan: imv_plan,
-            mv_ctx: Arc::clone(&ctx.rewrite),
-            disabled_rules: Vec::new(), // PR-α: TODO thread session disabled rules in Task 13
-            deadline: None,
-        },
-    )
-    .map_err(|e| {
-        format!(
-            "imv rewrite failed for {}.{}.{}: {e}",
-            ctx.rewrite.target.catalog,
-            ctx.rewrite.target.namespace,
-            ctx.rewrite.target.table
-        )
-    })?;
-    tracing::info!(
-        mv_target = ?ctx.rewrite.target,
-        mv_id = ctx.rewrite.mv_id,
-        stages = ?imv_outcome.trace.stage_names(),
-        rules_changed = imv_outcome.trace.changed_rules_count(),
-        rules_rejected = imv_outcome.trace.rejected_rules_count(),
-        rules_failed = imv_outcome.trace.failed_rules_count(),
-        "imv rewrite completed",
-    );
-    let _ = imv_outcome; // PR-α: outcome discarded. PR-β / task 4 consume it.
+    // PR-α: exercise the (no-op) IMV optimizer pipeline; outcome discarded.
+    try_run_imv_rewrite_pipeline(state, &ctx);
 
     match (left_previous, right_previous) {
         (None, None) => {
@@ -6329,7 +6205,16 @@ fn build_iceberg_mv_planning_catalog(
                 .map_err(|e| format!("imv planning catalog: create_database({}): {e}", base.namespace))?;
         }
 
-        let table_def = build_iceberg_table_def_for_snapshot_scan(state, base, snapshot_id)?;
+        let mut table_def = build_iceberg_table_def_for_snapshot_scan(state, base, snapshot_id)?;
+        // build_iceberg_table_def_for_snapshot_scan names the table with a
+        // synthetic <table>__at_<snapshot_id> suffix used by the hand-built
+        // join refresh path. The IMV planning catalog instead registers
+        // each base under its ORIGINAL name because
+        // canonicalize_iceberg_mv_select_query only adds a catalog prefix
+        // (it does not rewrite table identifiers to synthetic snapshot
+        // names). The snapshot pin is preserved implicitly via the table
+        // def's data files extracted at snapshot_id.
+        table_def.name = base.table.clone();
         catalog
             .register(&base.namespace, table_def)
             .map_err(|e| format!("imv planning catalog: register {}: {e}", base.fqn()))?;
@@ -6387,6 +6272,58 @@ fn plan_canonical_select_for_imv(
             ctx.rewrite.target.catalog, ctx.rewrite.target.namespace, ctx.rewrite.target.table
         ))
     })
+}
+
+/// Run the (PR-α no-op) IMV optimizer pipeline against `ctx`, discarding the
+/// outcome. Logs a structured summary on success and a warning on failure.
+///
+/// Failures are non-fatal in PR-α: the rewrite outcome is discarded anyway,
+/// so an IMV-pipeline error must not break a base-table refresh. The plan's
+/// original `?`-fail-fast wiring (PR-α tasks 10-12) was tightened to
+/// log-and-continue after the iceberg-ivm suite exposed an A11
+/// schema-evolution case (renamed referenced column) where re-planning the
+/// canonical select against the latest base schema fails by design even
+/// though the hand-built refresh path handles the rename correctly.
+/// Surface the gap as a warn-level log so PR-β consumers can audit it,
+/// without breaking refresh behavior in PR-α.
+fn try_run_imv_rewrite_pipeline(state: &Arc<StandaloneState>, ctx: &IcebergMvRefreshContext) {
+    let result = (|| -> Result<
+        crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteOutcome,
+        String,
+    > {
+        let plan = plan_canonical_select_for_imv(state, ctx).map_err(|e| e.message)?;
+        crate::sql::optimizer::rewrite::imv::entrypoint::run_imv_rewrite(
+            crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteInput {
+                plan,
+                mv_ctx: Arc::clone(&ctx.rewrite),
+                disabled_rules: Vec::new(),
+                deadline: None,
+            },
+        )
+        .map_err(|e| format!("run_imv_rewrite: {e}"))
+    })();
+
+    match result {
+        Ok(outcome) => {
+            tracing::info!(
+                mv_target = ?ctx.rewrite.target,
+                mv_id = ctx.rewrite.mv_id,
+                stages = ?outcome.trace.stage_names(),
+                rules_changed = outcome.trace.changed_rules_count(),
+                rules_rejected = outcome.trace.rejected_rules_count(),
+                rules_failed = outcome.trace.failed_rules_count(),
+                "imv rewrite completed (outcome discarded in PR-α)",
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                mv_target = ?ctx.rewrite.target,
+                mv_id = ctx.rewrite.mv_id,
+                error = %e,
+                "imv rewrite skipped (PR-α: non-fatal, refresh continues)",
+            );
+        }
+    }
 }
 
 fn build_iceberg_table_def_for_snapshot_scan(
@@ -12017,13 +11954,7 @@ mod imv_planning_catalog_tests {
             assert!(catalog
                 .database_exists(&base.namespace)
                 .expect("database lookup"));
-            let table_name = synthetic_snapshot_table_name(
-                base,
-                ctx.rewrite
-                    .pin
-                    .get(base)
-                    .expect("test fixture: pin has snapshot for base"),
-            );
+            let table_name = base.table.clone();
             assert!(
                 catalog.get(&base.namespace, &table_name).is_ok(),
                 "expected table {}.{table_name} to be registered",
