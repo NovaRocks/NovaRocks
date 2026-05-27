@@ -2684,8 +2684,10 @@ pub(crate) fn execute_query_with_options(
             }
             crate::runtime::coordinator::ExecutionCoordinator::new(
                 *build_result,
-                "127.0.0.1".to_string(),
-                exchange_port,
+                Arc::new(crate::runtime::dispatcher::InProcessDispatcher::new(
+                    "127.0.0.1",
+                    exchange_port,
+                )),
                 query_opts,
             )
             .execute()

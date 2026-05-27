@@ -16,9 +16,11 @@
 // under the License.
 pub mod backend_id;
 pub(crate) mod coordinator;
+pub mod dispatcher;
 pub mod exchange;
 pub mod exchange_scan;
 pub mod exec_env;
+pub(crate) mod exec_params;
 pub mod global_async_runtime;
 pub mod io;
 pub mod load_tracking;
