@@ -250,10 +250,11 @@ fn dispatch_standalone_role(
             let host = cfg.server.host.clone();
             let starlet_port = cfg.server.starlet_port;
             let pid = std::process::id();
+            let probe_host = be_readiness_probe_host(&host);
             let starlet_addr: std::net::SocketAddr =
-                format!("{host}:{starlet_port}").parse().map_err(|e| {
+                format!("{probe_host}:{starlet_port}").parse().map_err(|e| {
                     anyhow::anyhow!(
-                        "role=be: invalid novarocks grpc addr '{host}:{starlet_port}': {e}"
+                        "role=be: invalid novarocks grpc probe addr '{probe_host}:{starlet_port}': {e}"
                     )
                 })?;
             novarocks::common::app_config::install_preloaded_config(cfg);
@@ -370,6 +371,12 @@ fn health_check_host(bind_host: &str) -> String {
         "::" | "[::]" => "::1".to_string(),
         other => other.to_string(),
     }
+}
+
+/// Returns the host to use for BE readiness probing, mapping wildcard bind
+/// addresses to their loopback equivalents so `wait_for_tcp_ready` succeeds.
+fn be_readiness_probe_host(bind_host: &str) -> String {
+    health_check_host(bind_host)
 }
 
 fn heartbeat_ready(host: &str, port: u16) -> Result<(), String> {
@@ -1315,6 +1322,35 @@ backends = ["127.0.0.1:9070"]
             captured_port.get(),
             23456,
             "all-in-one runner must receive the pre-loaded cfg with the sentinel mysql_port"
+        );
+    }
+
+    // D1 PR-4: BE readiness probe must use loopback when bind host is a wildcard.
+    // The probe address is built via `health_check_host(bind_host)` so that
+    // `0.0.0.0` / `::` never appear in `wait_for_tcp_ready`.
+    #[test]
+    fn be_readiness_probe_addr_uses_loopback_for_wildcard_bind() {
+        // `health_check_host` is the shared helper used by both the daemon path
+        // and the BE path.  Assert its mapping is correct for every wildcard form.
+        assert_eq!(
+            super::be_readiness_probe_host("0.0.0.0"),
+            "127.0.0.1",
+            "IPv4 wildcard must map to IPv4 loopback"
+        );
+        assert_eq!(
+            super::be_readiness_probe_host("::"),
+            "::1",
+            "IPv6 wildcard :: must map to IPv6 loopback"
+        );
+        assert_eq!(
+            super::be_readiness_probe_host("[::]"),
+            "::1",
+            "IPv6 wildcard [::] must map to IPv6 loopback"
+        );
+        assert_eq!(
+            super::be_readiness_probe_host("192.168.1.10"),
+            "192.168.1.10",
+            "non-wildcard host must pass through unchanged"
         );
     }
 
