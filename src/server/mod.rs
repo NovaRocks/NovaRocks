@@ -111,19 +111,7 @@ fn resolve_server_options(
 }
 
 fn resolve_active_config_path(explicit: Option<&Path>) -> Option<PathBuf> {
-    explicit
-        .map(Path::to_path_buf)
-        .or_else(|| {
-            std::env::var("NOVAROCKS_CONFIG")
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-        })
-        .or_else(|| {
-            let default_path = PathBuf::from("novarocks.toml");
-            default_path.exists().then_some(default_path)
-        })
+    crate::common::app_config::resolve_config_path(explicit)
 }
 
 fn load_active_config(path: Option<&Path>) -> Result<Option<NovaRocksConfig>, String> {

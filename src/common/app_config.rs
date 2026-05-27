@@ -96,6 +96,27 @@ impl ClusterConfig {
     }
 }
 
+/// Resolve the config file path using the standard search order:
+/// 1. `explicit` – a path supplied directly by the caller (e.g. `--config`).
+/// 2. `NOVAROCKS_CONFIG` environment variable.
+/// 3. `./novarocks.toml` in the current working directory (only if the file exists).
+/// 4. `None` – the caller should fall back to built-in defaults.
+pub fn resolve_config_path(explicit: Option<&Path>) -> Option<PathBuf> {
+    explicit
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            std::env::var("NOVAROCKS_CONFIG")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+        })
+        .or_else(|| {
+            let default_path = PathBuf::from("novarocks.toml");
+            default_path.exists().then_some(default_path)
+        })
+}
+
 pub fn init_from_path(path: impl AsRef<Path>) -> Result<&'static NovaRocksConfig> {
     let path = path.as_ref().to_path_buf();
     let cfg = if !path.exists() {

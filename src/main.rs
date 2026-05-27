@@ -47,9 +47,12 @@ fn print_main_usage() {
 }
 
 fn print_standalone_server_usage() {
-    eprintln!("Usage: novarocks standalone-server [--port <port>] [--config <path>]");
+    eprintln!(
+        "Usage: novarocks standalone-server [--port <port>] [--config <path>] [--role <fe|be|all-in-one>]"
+    );
     eprintln!("Example:");
     eprintln!("  novarocks standalone-server --port 9030 --config /etc/novarocks/novarocks.toml");
+    eprintln!("  novarocks standalone-server --role be --config /etc/novarocks/novarocks.toml");
 }
 
 fn parse_standalone_server_args(
@@ -143,11 +146,14 @@ fn load_config_and_resolve_role(
     novarocks::common::app_config::NovaRocksConfig,
     novarocks::common::app_config::ClusterRole,
 )> {
-    let cfg = match cli.config_path.as_deref() {
-        Some(p) => novarocks::common::app_config::NovaRocksConfig::load_from_file(
-            std::path::Path::new(p),
-        )
-        .map_err(|e| anyhow::anyhow!("{}", e))?,
+    // C2: honour NOVAROCKS_CONFIG env var and ./novarocks.toml fallback, not
+    // just the explicit --config path.
+    let config_path = novarocks::common::app_config::resolve_config_path(
+        cli.config_path.as_deref().map(std::path::Path::new),
+    );
+    let cfg = match config_path {
+        Some(p) => novarocks::common::app_config::NovaRocksConfig::load_from_file(&p)
+            .map_err(|e| anyhow::anyhow!("{}", e))?,
         None => novarocks::common::app_config::NovaRocksConfig::default(),
     };
 
@@ -160,7 +166,12 @@ fn load_config_and_resolve_role(
 
     let role = resolve_cluster_role(&cfg, role_override);
 
-    cfg.cluster
+    // C1: validate using the *effective* (CLI-overridden) role, not the
+    // config-file role.  Cloning only the small ClusterConfig struct avoids
+    // mutating the returned cfg.
+    let mut effective_cluster = cfg.cluster.clone();
+    effective_cluster.role = role;
+    effective_cluster
         .validate()
         .map_err(|e| anyhow::anyhow!("{}", e))?;
 
@@ -190,12 +201,18 @@ fn dispatch_standalone_role(
 fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()> {
     let (cfg, role) = load_config_and_resolve_role(&cli)?;
 
-    let opts = novarocks::server::StandaloneServerOptions {
-        config_path: cli.config_path.as_deref().map(PathBuf::from),
-        mysql_port: cli.mysql_port,
-    };
+    // Capture the explicit config path for the server (it re-resolves
+    // env/CWD fallbacks the same way load_config_and_resolve_role does).
+    let config_path = cli.config_path.as_deref().map(PathBuf::from);
 
-    dispatch_standalone_role(role, cfg, cli.mysql_port, |_cfg, _port| {
+    dispatch_standalone_role(role, cfg, cli.mysql_port, |_cfg, port| {
+        // I1: use `port` (the closure parameter) instead of the captured
+        // cli.mysql_port so the already-resolved port override is threaded
+        // through rather than read a second time from cli.
+        let opts = novarocks::server::StandaloneServerOptions {
+            config_path: config_path.clone(),
+            mysql_port: port,
+        };
         novarocks::server::run_standalone_server(opts).map_err(|e| anyhow::anyhow!("{}", e))
     })
 }
@@ -830,7 +847,7 @@ mod tests {
             "--port".to_string(),
             "19030".to_string(),
             "--config".to_string(),
-            "/tmp/novarocks.toml".to_string(),
+            "novarocks.toml".to_string(),
         ];
         let parsed = parse_standalone_server_args(&args)
             .expect("parse standalone-server args")
@@ -839,7 +856,7 @@ mod tests {
             parsed,
             StandaloneServerCliArgs {
                 mysql_port: Some(19030),
-                config_path: Some("/tmp/novarocks.toml".to_string()),
+                config_path: Some("novarocks.toml".to_string()),
                 role: None,
             }
         );
@@ -873,13 +890,13 @@ mod tests {
             "--role".to_string(),
             "fe".to_string(),
             "--config".to_string(),
-            "/tmp/fe.toml".to_string(),
+            "fe.toml".to_string(),
         ];
         let parsed = parse_standalone_server_args(&args)
             .expect("parse args")
             .expect("args");
         assert_eq!(parsed.role.as_deref(), Some("fe"));
-        assert_eq!(parsed.config_path.as_deref(), Some("/tmp/fe.toml"));
+        assert_eq!(parsed.config_path.as_deref(), Some("fe.toml"));
     }
 
     #[test]
@@ -932,17 +949,22 @@ mod tests {
         assert!(err.to_string().contains("role=be is not implemented yet"));
     }
 
+    // Serialize tests that mutate process-wide state (env vars, CWD) so they
+    // don't interfere when the test harness runs tests in parallel threads.
+    static ENV_MUTEX: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
     // --- PR-1 spec compliance gap tests ---
     // These three tests fail on the current production code and drive the fixes:
     // 1. Config file role must be used when no CLI --role is given.
     // 2. ClusterConfig::validate() must run before dispatch.
     // 3. CLI --role override must still win over the config file role.
 
-    #[cfg(test)]
     fn write_toml_tempfile(toml: &str) -> tempfile::NamedTempFile {
         use std::io::Write;
         let mut f = tempfile::NamedTempFile::new().expect("create tempfile");
-        f.write_all(toml.as_bytes()).expect("write toml to tempfile");
+        f.write_all(toml.as_bytes())
+            .expect("write toml to tempfile");
         f
     }
 
@@ -965,12 +987,9 @@ backends = ["127.0.0.1:9070"]
         let (cfg, role) =
             load_config_and_resolve_role(&cli).expect("load and resolve must succeed for valid fe");
         assert_eq!(role, novarocks::common::app_config::ClusterRole::Fe);
-        let err = dispatch_standalone_role(
-            role,
-            cfg,
-            None,
-            |_, _| unreachable!("all-in-one must not be called"),
-        )
+        let err = dispatch_standalone_role(role, cfg, None, |_, _| {
+            unreachable!("all-in-one must not be called")
+        })
         .expect_err("fe must return PR-1 placeholder");
         assert!(err.to_string().contains("role=fe is not implemented yet"));
     }
@@ -996,7 +1015,8 @@ backends = []
             Ok(_) => panic!("fe with zero backends must fail validation"),
         };
         assert!(
-            err.to_string().contains("D1 v1 only supports exactly one backend"),
+            err.to_string()
+                .contains("D1 v1 only supports exactly one backend"),
             "unexpected error: {err}"
         );
     }
@@ -1019,13 +1039,105 @@ role = "all-in-one"
         let (cfg, role) = load_config_and_resolve_role(&cli)
             .expect("load and resolve must succeed (be with no backends is valid)");
         assert_eq!(role, novarocks::common::app_config::ClusterRole::Be);
-        let err = dispatch_standalone_role(
-            role,
-            cfg,
-            None,
-            |_, _| unreachable!("all-in-one must not be called when --role be"),
-        )
+        let err = dispatch_standalone_role(role, cfg, None, |_, _| {
+            unreachable!("all-in-one must not be called when --role be")
+        })
         .expect_err("be must return PR-1 placeholder");
         assert!(err.to_string().contains("role=be is not implemented yet"));
+    }
+
+    // C1: validate against the *effective* (CLI-overridden) role, not the config-file role.
+    #[test]
+    fn test_c1_cli_role_be_rejects_backends_from_config_file() {
+        // Config says role=fe with 1 backend (valid for fe).
+        // CLI says --role be. Effective role is BE, which must reject backends.
+        let toml = r#"
+[cluster]
+role = "fe"
+backends = ["127.0.0.1:9070"]
+"#;
+        let f = write_toml_tempfile(toml);
+        let cli = StandaloneServerCliArgs {
+            config_path: Some(f.path().to_str().expect("utf-8").to_string()),
+            role: Some("be".to_string()),
+            mysql_port: None,
+        };
+        let result = load_config_and_resolve_role(&cli);
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("be with backends must fail validation"),
+        };
+        assert!(
+            err.to_string()
+                .contains("role=be must not configure [cluster].backends"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // C2: NOVAROCKS_CONFIG env var must be honoured when no explicit --config is given.
+    #[test]
+    fn test_c2_novarocks_config_env_var_used_when_no_cli_config() {
+        let toml = r#"
+[cluster]
+role = "fe"
+backends = ["127.0.0.1:9070"]
+"#;
+        let f = write_toml_tempfile(toml);
+        let path = f.path().to_str().expect("utf-8").to_string();
+
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("NOVAROCKS_CONFIG").ok();
+        // SAFETY: single-threaded thanks to ENV_MUTEX held above.
+        unsafe { std::env::set_var("NOVAROCKS_CONFIG", &path) };
+        let cli = StandaloneServerCliArgs {
+            config_path: None,
+            role: None,
+            mysql_port: None,
+        };
+        let result = load_config_and_resolve_role(&cli);
+        match prev {
+            // SAFETY: single-threaded thanks to ENV_MUTEX.
+            Some(v) => unsafe { std::env::set_var("NOVAROCKS_CONFIG", v) },
+            None => unsafe { std::env::remove_var("NOVAROCKS_CONFIG") },
+        }
+
+        let (_, role) = result.expect("NOVAROCKS_CONFIG must be picked up");
+        assert_eq!(role, novarocks::common::app_config::ClusterRole::Fe);
+    }
+
+    // C2: ./novarocks.toml in CWD must be discovered when no --config and no env var.
+    #[test]
+    fn test_c2_default_novarocks_toml_in_cwd_used() {
+        let toml = r#"
+[cluster]
+role = "fe"
+backends = ["127.0.0.1:9070"]
+"#;
+        let dir = tempfile::TempDir::new().expect("create tempdir");
+        std::fs::write(dir.path().join("novarocks.toml"), toml).expect("write novarocks.toml");
+
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let prev_env = std::env::var("NOVAROCKS_CONFIG").ok();
+        let prev_dir = std::env::current_dir().expect("current dir");
+        // SAFETY: single-threaded thanks to ENV_MUTEX.
+        unsafe { std::env::remove_var("NOVAROCKS_CONFIG") };
+        std::env::set_current_dir(dir.path()).expect("change to tempdir");
+
+        let cli = StandaloneServerCliArgs {
+            config_path: None,
+            role: None,
+            mysql_port: None,
+        };
+        let result = load_config_and_resolve_role(&cli);
+
+        std::env::set_current_dir(&prev_dir).expect("restore cwd");
+        match prev_env {
+            // SAFETY: single-threaded thanks to ENV_MUTEX.
+            Some(v) => unsafe { std::env::set_var("NOVAROCKS_CONFIG", v) },
+            None => unsafe { std::env::remove_var("NOVAROCKS_CONFIG") },
+        }
+
+        let (_, role) = result.expect("./novarocks.toml in CWD must be picked up");
+        assert_eq!(role, novarocks::common::app_config::ClusterRole::Fe);
     }
 }
