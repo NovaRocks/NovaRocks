@@ -242,6 +242,15 @@ fn orient_eq_pair(
     if both_exclusively_left || both_exclusively_right {
         return None;
     }
+    // Reject expression-keys that span BOTH children on at least one side:
+    // a hash key must be computable purely from one side's columns. When an
+    // expression references columns from both t0 and t1 (e.g. CROSS JOIN
+    // with `WHERE abs(t0.x + t1.y) = abs(t0.u + t1.v)`), neither hash table
+    // build nor probe can produce a deterministic key — the only correct
+    // execution is a NestLoopJoin with this predicate as the residual.
+    if (!a_in_left && !a_in_right) || (!b_in_left && !b_in_right) {
+        return None;
+    }
     Some(PhysicalHashJoinEqCondition {
         left: a,
         right: b,
@@ -702,14 +711,32 @@ impl Rule for JoinToNestLoop {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalJoin(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
         let Operator::LogicalJoin(op) = &expr.op else {
             return vec![];
         };
-        // NestLoop is used for cross joins or joins without equality conditions.
+        // NestLoop is used for cross joins or joins without equality
+        // conditions. We must check feasibility after `orient_eq_pair`,
+        // not just the raw equality count — a `=` whose two sides each
+        // reference columns from BOTH children (e.g. CROSS JOIN with
+        // `abs(t0.x + t1.y) = abs(t0.u + t1.v)`) cannot be used as a hash
+        // key, so JoinToHashJoin will demote it and bail out with no
+        // physical alternatives. Without this guard, the memo group has no
+        // feasible implementation and the optimizer surfaces "no feasible
+        // plan for group N".
         let (eq_conds, _) = extract_eq_conditions(&op.condition, &op.join_type);
-        if !eq_conds.is_empty() && op.join_type != JoinKind::Cross {
-            // Has equality conditions — JoinToHashJoin should handle this.
+        if !eq_conds.is_empty() && op.join_type != JoinKind::Cross && expr.children.len() == 2 {
+            let left_cols = get_group_column_names(memo, expr.children[0]);
+            let right_cols = get_group_column_names(memo, expr.children[1]);
+            let has_orientable_pair = eq_conds
+                .iter()
+                .any(|p| orient_eq_pair(p.clone(), &left_cols, &right_cols).is_some());
+            if has_orientable_pair {
+                // Has at least one usable equi-key — JoinToHashJoin handles this.
+                return vec![];
+            }
+        } else if !eq_conds.is_empty() && op.join_type != JoinKind::Cross {
+            // 1-child join (shouldn't happen for binary joins) — defer.
             return vec![];
         }
         vec![NewExpr {
