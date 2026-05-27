@@ -317,7 +317,7 @@ struct ProcessGuard {
     stdout_rx: mpsc::Receiver<String>,
     stderr_buffer: Arc<Mutex<String>>,
     _stdout_thread: thread::JoinHandle<()>,
-    _stderr_thread: Option<thread::JoinHandle<()>>,
+    stderr_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl ProcessGuard {
@@ -364,7 +364,7 @@ impl ProcessGuard {
             stdout_rx: rx,
             stderr_buffer,
             _stdout_thread: stdout_thread,
-            _stderr_thread: stderr_thread,
+            stderr_thread,
         };
         process.wait_for_ready(ready_marker)?;
         Ok(process)
@@ -379,7 +379,14 @@ impl ProcessGuard {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
+        self.join_stderr_thread();
         Ok(())
+    }
+
+    fn join_stderr_thread(&mut self) {
+        if let Some(stderr_thread) = self.stderr_thread.take() {
+            let _ = stderr_thread.join();
+        }
     }
 
     fn wait_for_ready(&mut self, marker: &str) -> Result<()> {
@@ -387,6 +394,7 @@ impl ProcessGuard {
         let mut stdout = Vec::new();
         loop {
             if let Some(status) = self.child.try_wait()? {
+                self.join_stderr_thread();
                 let stderr = self.read_stderr();
                 bail!(
                     "{}",
@@ -416,6 +424,9 @@ impl ProcessGuard {
             }
 
             if Instant::now() >= deadline {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                self.join_stderr_thread();
                 let stderr = self.read_stderr();
                 bail!(
                     "{}",
@@ -571,6 +582,19 @@ mod tests {
     #[test]
     fn process_guard_declares_drop_cleanup() {
         assert!(include_str!("cluster.rs").contains("impl Drop for ProcessGuard"));
+    }
+
+    #[test]
+    fn process_guard_declares_stderr_thread_join_helper() {
+        let source = include_str!("cluster.rs")
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("source before tests");
+        assert!(source.contains("fn join_stderr_thread"), "missing stderr join helper");
+        assert!(
+            source.contains("self.join_stderr_thread();"),
+            "wait_for_ready should join stderr thread before reading stderr"
+        );
     }
 
     #[test]
