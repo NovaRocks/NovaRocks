@@ -1062,6 +1062,26 @@ fn parse_string_default(
     use crate::sql::parser::ast::{DefaultLiteral, SqlType};
     match data_type {
         SqlType::String => Ok(DefaultLiteral::String(s.to_string())),
+        // StarRocks-compatible: quoted numeric defaults — `DEFAULT "0"` on
+        // an INT column or `DEFAULT "3.14"` on a DOUBLE column — are
+        // accepted with a string→numeric coercion. The DDL parser delegates
+        // to `parse_numeric_default` which already type-checks and emits
+        // the right `DefaultLiteral::Int / Float / Decimal` variant.
+        SqlType::TinyInt
+        | SqlType::SmallInt
+        | SqlType::Int
+        | SqlType::BigInt
+        | SqlType::Float
+        | SqlType::Double
+        | SqlType::Decimal { .. } => parse_numeric_default(s.trim(), data_type),
+        // Quoted boolean defaults: `DEFAULT "true"` / `DEFAULT "0"`.
+        SqlType::Boolean => match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" => Ok(DefaultLiteral::Bool(true)),
+            "false" | "0" => Ok(DefaultLiteral::Bool(false)),
+            other => Err(format!(
+                "invalid boolean DEFAULT `{other}` (expected true/false/0/1)"
+            )),
+        },
         SqlType::Json => {
             serde_json::from_str::<serde_json::Value>(s)
                 .map_err(|e| format!("invalid JSON DEFAULT literal: {e}"))?;

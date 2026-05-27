@@ -513,24 +513,43 @@ impl<'a> super::AnalyzerContext<'a> {
                 subquery,
                 negated,
             } => {
-                // BITMAP / HLL operands cannot participate in IN subquery
-                // because they have no scalar identity. Reject upfront by
-                // resolving the LHS to detect a logical-type tag; the LHS
-                // is dropped before the subquery is planned so we cannot
-                // wait until later.
-                let in_expr_typed = self.analyze_expr(in_expr, scope)?;
-                if is_json_in_subquery_operand(&in_expr_typed, scope) {
-                    return Err("In predicate of JSON does not support subquery".to_string());
-                }
-                if let Some(logical) = scope
-                    .logical_type_of_expr(&in_expr_typed)
-                    .filter(is_bitmap_or_hll_type)
-                {
-                    let col = column_name_of_expr(&in_expr_typed);
-                    let kw = if *negated { "NOT IN" } else { "IN" };
-                    return Err(format!(
-                        "BITMAP/HLL columns cannot appear in {kw} subquery expressions (operand `{col}` has type {logical:?})"
-                    ));
+                // Multi-column LHS `(a, b) IN (SELECT c, d FROM ...)` arrives
+                // here wrapped as `Expr::Tuple(...)` (or `Expr::Nested(Tuple(...))`).
+                // The whole tuple is not a single scalar expression — the
+                // analyzer's catch-all rejects it as "unsupported expression".
+                // `subquery_rewrite::rewrite_in_subquery` handles the
+                // decomposition (per-column equi-join) downstream, so just
+                // skip the BITMAP / JSON / HLL precheck here: those checks
+                // are per-column and only meaningful for a single-column LHS.
+                let lhs_is_tuple = match in_expr.as_ref() {
+                    sqlast::Expr::Tuple(_) => true,
+                    sqlast::Expr::Nested(inner) => {
+                        matches!(inner.as_ref(), sqlast::Expr::Tuple(_))
+                    }
+                    _ => false,
+                };
+                if !lhs_is_tuple {
+                    // BITMAP / HLL operands cannot participate in IN subquery
+                    // because they have no scalar identity. Reject upfront by
+                    // resolving the LHS to detect a logical-type tag; the LHS
+                    // is dropped before the subquery is planned so we cannot
+                    // wait until later.
+                    let in_expr_typed = self.analyze_expr(in_expr, scope)?;
+                    if is_json_in_subquery_operand(&in_expr_typed, scope) {
+                        return Err(
+                            "In predicate of JSON does not support subquery".to_string(),
+                        );
+                    }
+                    if let Some(logical) = scope
+                        .logical_type_of_expr(&in_expr_typed)
+                        .filter(is_bitmap_or_hll_type)
+                    {
+                        let col = column_name_of_expr(&in_expr_typed);
+                        let kw = if *negated { "NOT IN" } else { "IN" };
+                        return Err(format!(
+                            "BITMAP/HLL columns cannot appear in {kw} subquery expressions (operand `{col}` has type {logical:?})"
+                        ));
+                    }
                 }
                 let id = self.alloc_subquery_id();
                 let kind = SubqueryKind::InSubquery { negated: *negated };

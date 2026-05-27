@@ -2850,15 +2850,17 @@ mod tests {
         .expect_err("not null should fail");
         assert!(not_null.contains("ADD COLUMN NOT NULL is not supported"));
 
-        // String literal as DEFAULT for an INT column must be rejected because
-        // string values are not valid for integer columns.
+        // Quoted DEFAULT values are accepted for numeric columns iff the
+        // string parses as the column's numeric type (StarRocks compat:
+        // `DEFAULT "0"` for INT works). A genuinely non-numeric string —
+        // here `'abc'` — must still be rejected.
         let type_mismatch = super::parse_alter_iceberg_schema_sql(
             "ALTER TABLE ice.db.orders ADD COLUMN discount INT DEFAULT 'abc'",
         )
-        .expect_err("string default for INT should fail");
+        .expect_err("non-numeric string default for INT should fail");
         assert!(
-            type_mismatch.contains("DEFAULT not supported"),
-            "expected 'DEFAULT not supported' but got: {type_mismatch}"
+            type_mismatch.contains("invalid integer DEFAULT"),
+            "expected 'invalid integer DEFAULT' but got: {type_mismatch}"
         );
     }
 

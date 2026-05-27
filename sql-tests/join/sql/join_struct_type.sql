@@ -28,8 +28,10 @@ PROPERTIES ("replication_num" = "1");
 
 -- query 3
 -- @skip_result_check=true
--- FE error: cannot cast row(3,'',null,null) to struct<c0 int, c1 string>
--- @expect_error=Cannot cast
+-- NovaRocks rejects the invalid insert with a field-count specific
+-- diagnostic (4 row literals vs. a 2-field STRUCT column). StarRocks FE
+-- emits a more generic "Cannot cast" message; either is a valid rejection.
+-- @expect_error=does not match STRUCT field count
 INSERT INTO ${case_db}.struct_test (pk, s0) VALUES (7, row(3, '', null, null));
 
 -- query 4
