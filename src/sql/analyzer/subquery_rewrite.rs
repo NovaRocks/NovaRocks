@@ -480,21 +480,27 @@ impl<'a> AnalyzerContext<'a> {
         let sub_col = resolved_sub.output_columns[0].clone();
         let match_col = format!("__match_{}", sq_info.id);
 
-        // Augment the subquery: DISTINCT + match-indicator column equal to
-        // the IN target. After LEFT OUTER JOIN, the match column is NULL
-        // for non-matching outer rows and non-NULL for matches.
+        // Augment the subquery: DISTINCT + match-indicator column. After the
+        // LEFT OUTER JOIN, this column is NULL for non-matching outer rows
+        // and non-NULL for matches.
+        //
+        // Use a constant `1` as the indicator value rather than a ColumnRef
+        // to the user-visible subquery output column. The original output
+        // column may be a derived expression (e.g. `max(v12) - 501`) whose
+        // codegen-side display name lives in the post-Project scope only;
+        // a ColumnRef to that name fails to resolve when the second project
+        // item compiles in the same Project's input scope ("Column
+        // '(max(v12)) - 501' cannot be resolved"). A literal sidesteps the
+        // lookup entirely and produces the same boolean indicator semantics.
         let mut modified_sub = resolved_sub;
+        let indicator_dtype = DataType::Int32;
         if let QueryBody::Select(ref mut sel) = modified_sub.body {
             sel.distinct = true;
             sel.projection.push(ProjectItem {
                 expr: TypedExpr {
-                    kind: ExprKind::ColumnRef {
-                        column_id: sub_col.column_id,
-                        qualifier: None,
-                        column: sub_col.name.clone(),
-                    },
-                    data_type: sub_col.data_type.clone(),
-                    nullable: sub_col.nullable,
+                    kind: ExprKind::Literal(LiteralValue::Int(1)),
+                    data_type: indicator_dtype.clone(),
+                    nullable: false,
                 },
                 output_name: match_col.clone(),
             });
@@ -502,13 +508,13 @@ impl<'a> AnalyzerContext<'a> {
         let match_col_id = self.alloc_column_id(
             Some(sq_alias.clone()),
             match_col.clone(),
-            sub_col.data_type.clone(),
+            indicator_dtype.clone(),
             true,
         );
         modified_sub.output_columns.push(OutputColumn {
             column_id: match_col_id,
             name: match_col.clone(),
-            data_type: sub_col.data_type.clone(),
+            data_type: indicator_dtype.clone(),
             nullable: true,
         });
         let output_columns = modified_sub.output_columns.clone();
@@ -526,7 +532,7 @@ impl<'a> AnalyzerContext<'a> {
             sub_col.data_type.clone(),
             true,
         );
-        scope.add_column(Some(&sq_alias), &match_col, sub_col.data_type.clone(), true);
+        scope.add_column(Some(&sq_alias), &match_col, indicator_dtype.clone(), true);
 
         let eq_cond = TypedExpr {
             data_type: DataType::Boolean,
@@ -561,7 +567,7 @@ impl<'a> AnalyzerContext<'a> {
                         qualifier: Some(sq_alias),
                         column: match_col,
                     },
-                    data_type: sub_col.data_type.clone(),
+                    data_type: indicator_dtype,
                     nullable: true,
                 }),
                 negated: !negated, // IN → IS NOT NULL; NOT IN → IS NULL
