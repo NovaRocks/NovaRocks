@@ -482,28 +482,66 @@ fn prepare_repeat_input(
         collect_repeat_input_refs(having, &mut project_items, &mut seen_refs);
     }
 
-    for (original_name, alias_name) in &grouping_key_aliases {
-        if let Some(source_expr) = select.group_by.iter().find_map(|expr| match &expr.kind {
+    // Materialize each rollup key expression under its alias and prepare
+    // a substitution map. The rule used to only materialize ColumnRef
+    // group_by entries (e.g. `GROUP BY ROLLUP(k1)`); a synthetic non-ref
+    // expression — most commonly the `COALESCE(left.k, right.k)` introduced
+    // by `FULL OUTER JOIN ... USING(k)` — was index-aligned with
+    // `all_rollup_columns` but skipped here, so the Repeat node had no
+    // slot to null out at higher rollup levels and the per-level null
+    // pattern silently devolved into duplicates (see
+    // `join_full_outer_with_using` step 40: 39 vs 23 expected rows).
+    //
+    // Walk index-aligned: `all_rollup_columns[i]` is the AST text of
+    // `select.group_by[i]`, so use the analysed group_by expression at
+    // the same index as the source of the materialised projection item.
+    // Build a substitution table keyed by the original expression's
+    // display name so a later pass can rewrite projection / having
+    // occurrences of the same expression to a ColumnRef on the alias.
+    let mut substitutions: Vec<(String, TypedExpr)> = Vec::new();
+    for (idx, (_, alias_name)) in grouping_key_aliases.iter().enumerate() {
+        let Some(source_expr) = select.group_by.get(idx).cloned() else {
+            continue;
+        };
+        let data_type = source_expr.data_type.clone();
+        let nullable = source_expr.nullable;
+        let original_display = typed_expr_display_name(&source_expr);
+
+        // Substitute downstream references to the original expression with a
+        // ColumnRef on the alias. For the ColumnRef case the existing
+        // `repeat_group_qualifier` form keeps the column name (so
+        // visit_repeat's `add_qualified_alias(__repeat_group, k1, …)`
+        // wiring still resolves). For non-ColumnRef cases we point at the
+        // alias slot directly so the AGGREGATE above REPEAT reads the
+        // per-level nullified value, not the pre-REPEAT input.
+        let replacement = match &source_expr.kind {
             ExprKind::ColumnRef {
-                column_id,
-                qualifier,
-                column,
-            } if column.eq_ignore_ascii_case(original_name) => Some(TypedExpr {
+                column_id, column, ..
+            } => TypedExpr {
                 kind: ExprKind::ColumnRef {
                     column_id: *column_id,
-                    qualifier: qualifier.clone(),
+                    qualifier: Some(repeat_group_qualifier.to_string()),
                     column: column.clone(),
                 },
-                data_type: expr.data_type.clone(),
-                nullable: expr.nullable,
-            }),
-            _ => None,
-        }) {
-            project_items.push(ProjectItem {
-                expr: source_expr,
-                output_name: alias_name.clone(),
-            });
-        }
+                data_type,
+                nullable,
+            },
+            _ => TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: ColumnId::UNSET,
+                    qualifier: None,
+                    column: alias_name.clone(),
+                },
+                data_type,
+                nullable,
+            },
+        };
+        substitutions.push((original_display, replacement));
+
+        project_items.push(ProjectItem {
+            expr: source_expr,
+            output_name: alias_name.clone(),
+        });
     }
 
     *current = LogicalPlan::Project(ProjectNode {
@@ -511,22 +549,17 @@ fn prepare_repeat_input(
         items: project_items,
     });
 
+    // Apply substitutions to group_by, projection, having so that every
+    // place the original rollup-key expression appeared now reads from
+    // the materialized alias slot.
     for gb_expr in &mut select.group_by {
-        if let ExprKind::ColumnRef {
-            column_id: existing_cid,
-            qualifier: _,
-            column,
-        } = &gb_expr.kind
-            && grouping_key_aliases
-                .iter()
-                .any(|(original_name, _)| column.eq_ignore_ascii_case(original_name))
-        {
-            gb_expr.kind = ExprKind::ColumnRef {
-                column_id: *existing_cid,
-                qualifier: Some(repeat_group_qualifier.to_string()),
-                column: column.clone(),
-            };
-        }
+        substitute_expr_in_place(gb_expr, &substitutions);
+    }
+    for item in &mut select.projection {
+        substitute_expr_in_place(&mut item.expr, &substitutions);
+    }
+    if let Some(having_expr) = select.having.as_mut() {
+        substitute_expr_in_place(having_expr, &substitutions);
     }
 
     for non_null_cols in &mut repeat_info.repeat_column_ref_list {
@@ -555,6 +588,74 @@ fn prepare_repeat_input(
     }
 
     grouping_key_aliases
+}
+
+/// In-place substitution: when any sub-expression's `typed_expr_display_name`
+/// matches an entry's first field, replace that sub-expression with the
+/// second field. Walks AggregateCall / FunctionCall / BinaryOp / UnaryOp /
+/// IsNull / Cast / Case / InList / Nested children recursively.
+///
+/// Used after `prepare_repeat_input` to rewrite group-by / projection /
+/// having references to the original rollup-key expression into ColumnRefs
+/// on the materialised alias slot — so the REPEAT operator's per-level
+/// nullification of that slot drives the grouping key, instead of being
+/// recomputed from the pre-REPEAT input.
+fn substitute_expr_in_place(expr: &mut TypedExpr, substitutions: &[(String, TypedExpr)]) {
+    let name = typed_expr_display_name(expr);
+    if let Some((_, replacement)) = substitutions.iter().find(|(n, _)| n == &name) {
+        *expr = replacement.clone();
+        return;
+    }
+    match &mut expr.kind {
+        ExprKind::AggregateCall { args, order_by, .. } => {
+            for a in args {
+                substitute_expr_in_place(a, substitutions);
+            }
+            for s in order_by {
+                substitute_expr_in_place(&mut s.expr, substitutions);
+            }
+        }
+        ExprKind::FunctionCall { args, .. } => {
+            for a in args {
+                substitute_expr_in_place(a, substitutions);
+            }
+        }
+        ExprKind::BinaryOp { left, right, .. } => {
+            substitute_expr_in_place(left, substitutions);
+            substitute_expr_in_place(right, substitutions);
+        }
+        ExprKind::UnaryOp { expr: inner, .. } => substitute_expr_in_place(inner, substitutions),
+        ExprKind::IsNull { expr: inner, .. } => substitute_expr_in_place(inner, substitutions),
+        ExprKind::Cast { expr: inner, .. } => substitute_expr_in_place(inner, substitutions),
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(op) = operand {
+                substitute_expr_in_place(op, substitutions);
+            }
+            for (w, t) in when_then {
+                substitute_expr_in_place(w, substitutions);
+                substitute_expr_in_place(t, substitutions);
+            }
+            if let Some(e) = else_expr {
+                substitute_expr_in_place(e, substitutions);
+            }
+        }
+        ExprKind::InList { expr: inner, list, .. } => {
+            substitute_expr_in_place(inner, substitutions);
+            for v in list {
+                substitute_expr_in_place(v, substitutions);
+            }
+        }
+        ExprKind::Nested(inner) => substitute_expr_in_place(inner, substitutions),
+        // ColumnRef, Literal, LambdaParamRef, SubqueryPlaceholder, etc. —
+        // either leaves with no sub-exprs or contexts where substitution
+        // would change semantics. Top-level match above already handles
+        // any whole-expr replacement.
+        _ => {}
+    }
 }
 
 fn collect_repeat_input_refs(
