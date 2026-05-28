@@ -4,6 +4,7 @@
 use crate::sql::optimizer::rewrite::imv::marker::{
     UnresolvedMarkerCheckRule, WrapRootInImvDeltaRule,
 };
+use crate::sql::optimizer::rewrite::imv::scan_binding::BindIcebergScanRule;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::pipeline::{RewritePipeline, RewriteStage};
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
@@ -19,6 +20,11 @@ pub(crate) fn build_imv_pipeline() -> RewritePipeline {
             "imv-delta-marker",
             RewritePhase::StructuralRewrite,
             vec![Box::new(WrapRootInImvDeltaRule::new()) as Box<dyn LogicalRewriteRule>],
+        ),
+        RewriteStage::new(
+            "imv-scan-binding",
+            RewritePhase::SemanticRewrite,
+            vec![Box::new(BindIcebergScanRule) as Box<dyn LogicalRewriteRule>],
         ),
         RewriteStage::new(
             "imv-marker-cleanup",

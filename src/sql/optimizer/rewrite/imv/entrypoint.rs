@@ -244,7 +244,7 @@ mod tests {
         })
         .expect("unknown disabled rule must not break the pipeline");
 
-        assert_eq!(outcome.trace.stage_names().len(), 4);
+        assert_eq!(outcome.trace.stage_names().len(), 5);
     }
 
     // ── Task-5 helpers ──────────────────────────────────────────────────────
@@ -365,10 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_pipeline_traces_all_four_stage_names() {
-        // Disable WrapRootInImvDelta so the pipeline succeeds and we can
-        // inspect the trace's stage list (the stage names are unchanged from
-        // PR-α; only the rule registrations changed).
+    fn imv_pipeline_traces_scan_binding_stage_name() {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
             mv_ctx: dummy_mv_ctx(),
@@ -382,6 +379,7 @@ mod tests {
             vec![
                 "imv-logical-normalize",
                 "imv-delta-marker",
+                "imv-scan-binding",
                 "imv-marker-cleanup",
                 "imv-validation",
             ]
