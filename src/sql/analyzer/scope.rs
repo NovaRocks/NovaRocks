@@ -335,10 +335,21 @@ impl AnalyzerScope {
     /// Merge another scope into this one (for JOINs).
     pub(super) fn merge(&mut self, other: &AnalyzerScope) {
         for ((qualifier, name), (id, dt, nullable)) in &other.qualified {
-            self.qualified.insert(
-                (qualifier.clone(), name.clone()),
-                (*id, dt.clone(), *nullable),
-            );
+            // Left wins: in `t1 LEFT JOIN t1 AS t2`, the aliased-side scan
+            // also registers its columns under the original table name
+            // (`t1`) for SQL like `SELECT t1.c FROM t1 AS x` that mixes
+            // alias and table-name references. In a self-join the LEFT
+            // scan's `("t1", "k1")` is the true left binding, and the
+            // RIGHT scan's `("t1", "k1")` is the back-compat alias of its
+            // own slot. An unconditional insert here let the right's
+            // secondary registration silently shadow the left's primary,
+            // so a downstream `t1.k1` ColumnRef bound to the right side's
+            // ColumnId — and unmatched-left rows in a LEFT OUTER join
+            // surfaced as all-NULL on the left columns
+            // (`join_range_direct_mapping` step 20).
+            self.qualified
+                .entry((qualifier.clone(), name.clone()))
+                .or_insert_with(|| (*id, dt.clone(), *nullable));
         }
         for (name, (id, dt, nullable)) in &other.unqualified {
             self.unqualified
