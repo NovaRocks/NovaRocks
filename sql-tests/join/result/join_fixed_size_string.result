@@ -44,4 +44,4 @@ count(1)	sum(murmur_hash3_32(t1.c_str8))	sum(murmur_hash3_32(t2.c_str8))
 
 -- query 30
 count(1)	sum(murmur_hash3_32(t1.c_str8))	sum(murmur_hash3_32(t2.c_str8))
-319682	13356360567154	13356360567154
+319682	13358815545515	13358815545515

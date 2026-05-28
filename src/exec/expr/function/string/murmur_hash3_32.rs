@@ -253,3 +253,26 @@ fn murmur_hash3_32(data: &[u8], seed: u32) -> u32 {
     hash ^= hash >> 16;
     hash
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// NovaRocks treats embedded NUL bytes as content, not C-string
+    /// terminators — so an 8-byte all-zero string and an empty string hash
+    /// to different values, and `'\0\0\0\0\0\0\0\0'` round-trips through
+    /// `<=>` joins. The sql-tests case `join_fixed_size_string` step 30
+    /// (join on `c_str8 <=> c_str8` with `'\0'×8` rows in both sides)
+    /// relies on this property. Pin the exact value so a future regression
+    /// (e.g. silently calling `strlen` on the byte slice) is caught
+    /// without needing the 60K-row sql-tests fixture.
+    #[test]
+    fn null_bytes_are_content_not_terminator() {
+        assert_eq!(murmur_hash3_32(b"", MURMUR3_32_SEED), 3329588566);
+        assert_eq!(murmur_hash3_32(b"\0", MURMUR3_32_SEED), 500407381);
+        assert_eq!(
+            murmur_hash3_32(b"\0\0\0\0\0\0\0\0", MURMUR3_32_SEED),
+            1754797035
+        );
+    }
+}
