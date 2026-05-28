@@ -249,7 +249,10 @@ SELECT ai_1 FROM ${case_db}.array_test s WHERE ai_1 NOT IN (SELECT ai_1 FROM ${c
 -- FE error: IN with incompatible array types
 -- ============================================================
 -- query 35
--- @expect_error=in predict are not compatible
+-- NovaRocks rejects scalar pk NOT IN (array column) with a precise
+-- shape-mismatch diagnostic from `incompatible_complex_compare_pub` (vs.
+-- StarRocks's older "in predict are not compatible" message).
+-- @expect_error=does not support binary predicate operation
 SELECT pk FROM ${case_db}.array_test s WHERE pk NOT IN (SELECT i_0 FROM ${case_db}.array_test t) ORDER BY 1;
 
 -- ============================================================

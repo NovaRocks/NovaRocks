@@ -1873,49 +1873,43 @@ pub(super) struct CorrelationPred {
 /// (and thus exclude the outer row) whenever either operand is NULL,
 /// because SQL's NOT IN returns UNKNOWN under those conditions.
 fn null_aware_eq(lhs: TypedExpr, rhs: TypedExpr) -> TypedExpr {
-    let lhs_clone = lhs.clone();
-    let rhs_clone = rhs.clone();
+    // Goal: a Boolean predicate that, when used as the ON condition of a LEFT
+    // ANTI join rewritten from `lhs NOT IN (subq)`, causes the join to drop
+    // every left row whose SQL `NOT IN` result is FALSE *or* UNKNOWN —
+    // matching SQL semantics where:
+    //   • lhs IS NULL                 → NOT IN is UNKNOWN
+    //   • the subquery contains NULL  → NOT IN is UNKNOWN
+    //   • element-level NULL inside a complex-type value makes `lhs = rhs`
+    //     evaluate to NULL (e.g. `[1, NULL] = [1, NULL]` is NULL per ARRAY
+    //     element equality propagation).
+    //
+    // `lhs = rhs` returns NULL in every one of those cases. Wrapping it in
+    // `COALESCE(eq, TRUE)` turns each NULL into TRUE so the ANTI JOIN treats
+    // those pairs as a match and discards the left row. The previous 3-OR
+    // form (`eq OR lhs IS NULL OR rhs IS NULL`) only checked whole-value
+    // IS NULL and therefore missed the element-level NULL case — see
+    // `join_array_not_in_element_null.sql`.
     let eq = TypedExpr {
         data_type: DataType::Boolean,
-        nullable: false,
+        nullable: true,
         kind: ExprKind::BinaryOp {
             left: Box::new(lhs),
             op: BinOp::Eq,
             right: Box::new(rhs),
         },
     };
-    let lhs_is_null = TypedExpr {
+    let true_lit = TypedExpr {
         data_type: DataType::Boolean,
         nullable: false,
-        kind: ExprKind::IsNull {
-            expr: Box::new(lhs_clone),
-            negated: false,
-        },
-    };
-    let rhs_is_null = TypedExpr {
-        data_type: DataType::Boolean,
-        nullable: false,
-        kind: ExprKind::IsNull {
-            expr: Box::new(rhs_clone),
-            negated: false,
-        },
-    };
-    let or1 = TypedExpr {
-        data_type: DataType::Boolean,
-        nullable: false,
-        kind: ExprKind::BinaryOp {
-            left: Box::new(eq),
-            op: BinOp::Or,
-            right: Box::new(lhs_is_null),
-        },
+        kind: ExprKind::Literal(LiteralValue::Bool(true)),
     };
     TypedExpr {
         data_type: DataType::Boolean,
         nullable: false,
-        kind: ExprKind::BinaryOp {
-            left: Box::new(or1),
-            op: BinOp::Or,
-            right: Box::new(rhs_is_null),
+        kind: ExprKind::FunctionCall {
+            name: "coalesce".to_string(),
+            args: vec![eq, true_lit],
+            distinct: false,
         },
     }
 }
