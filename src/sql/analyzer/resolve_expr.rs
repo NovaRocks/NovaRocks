@@ -1049,8 +1049,16 @@ impl<'a> super::AnalyzerContext<'a> {
                 }
             }
             sqlast::Value::SingleQuotedString(s) | sqlast::Value::DoubleQuotedString(s) => {
+                // sqlparser already applied MySQL-style backslash escapes when
+                // tokenising the literal (our dialect enables
+                // `supports_string_literal_backslash_escape`). Don't unescape
+                // again — that double-processed `'e\\f'` from 3 bytes (`e\f`)
+                // down to 2 (`ef`) and is the cause of `join_large_in_predicate`
+                // step 59 silently dropping the backslash row from the IN
+                // result. INSERT VALUES already trusts sqlparser's output
+                // (`sql_expr.rs` clones the string as-is); SELECT now matches.
                 Ok(TypedExpr {
-                    kind: ExprKind::Literal(LiteralValue::String(unescape_sql_string(s))),
+                    kind: ExprKind::Literal(LiteralValue::String(s.clone())),
                     data_type: DataType::Utf8,
                     nullable: false,
                 })
@@ -4080,46 +4088,6 @@ fn is_higher_order_function_with_lambda(name: &str, arg_exprs: &[&sqlast::Expr])
             .first()
             .and_then(|expr| parse_multi_param_lambda(expr))
             .is_some()
-}
-
-/// Apply MySQL-style backslash escapes to a string literal payload. Our
-/// SQL parser hands us the raw text between quotes (with `''` already
-/// collapsed), but does not interpret backslash escapes (`\\`, `\n`, ...).
-/// StarRocks's lexer does, so unescape here to match user expectations.
-fn unescape_sql_string(s: &str) -> String {
-    if !s.contains('\\') {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '\\' {
-            out.push(ch);
-            continue;
-        }
-        match chars.next() {
-            Some('\\') => out.push('\\'),
-            Some('\'') => out.push('\''),
-            Some('"') => out.push('"'),
-            Some('n') => out.push('\n'),
-            Some('t') => out.push('\t'),
-            Some('r') => out.push('\r'),
-            Some('0') => out.push('\0'),
-            Some('b') => out.push('\x08'),
-            Some('Z') => out.push('\x1a'),
-            Some('%') => {
-                out.push('\\');
-                out.push('%');
-            }
-            Some('_') => {
-                out.push('\\');
-                out.push('_');
-            }
-            Some(other) => out.push(other),
-            None => out.push('\\'),
-        }
-    }
-    out
 }
 
 /// Return `true` when `expr` is a constant integer literal (including
