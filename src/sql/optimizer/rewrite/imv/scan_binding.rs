@@ -139,9 +139,10 @@ fn resolve_snapshot_window(
     let to_snapshot_id = mv_ctx.pin.get(base_ref).ok_or_else(|| {
         format!("IMV scan binding refresh pin missing snapshot for base {base_fqn}")
     })?;
-    let pin_uuid = mv_ctx.pin.uuid(base_ref).ok_or_else(|| {
-        format!("IMV scan binding refresh pin missing uuid for base {base_fqn}")
-    })?;
+    let pin_uuid = mv_ctx
+        .pin
+        .uuid(base_ref)
+        .ok_or_else(|| format!("IMV scan binding refresh pin missing uuid for base {base_fqn}"))?;
     if let Some(table_uuid) = table.table_uuid.as_deref()
         && table_uuid != pin_uuid
     {

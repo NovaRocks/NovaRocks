@@ -1445,7 +1445,9 @@ mod tests {
 
     #[test]
     fn iceberg_version_table_reaches_scan_range_guard() {
-        use crate::sql::catalog::{ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
+        use crate::sql::catalog::{
+            ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
+        };
 
         let resolved = ResolvedTable {
             database: "db".to_string(),
