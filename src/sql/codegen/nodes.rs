@@ -1442,6 +1442,56 @@ mod tests {
         assert_eq!(extended_columns.len(), 1);
         assert!(extended_columns.contains_key(&9));
     }
+
+    #[test]
+    fn iceberg_version_table_reaches_scan_range_guard() {
+        use crate::sql::catalog::{ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
+
+        let resolved = ResolvedTable {
+            database: "db".to_string(),
+            table: TableDef {
+                name: "b".to_string(),
+                columns: vec![ColumnDef {
+                    name: "k".to_string(),
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                }],
+                iceberg_row_lineage_metadata_columns: Vec::new(),
+                source: ScanSource::IcebergVersionTable {
+                    table: IcebergTableInfo {
+                        catalog: "ice".to_string(),
+                        namespace: "db".to_string(),
+                        table: "b".to_string(),
+                        table_uuid: Some("uuid-b".to_string()),
+                        current_snapshot_id: Some(22),
+                        schema_id: 7,
+                        location: "file:///tmp/ice/db/b".to_string(),
+                        schema: IcebergSchemaDef { fields: Vec::new() },
+                        serialized_metadata: None,
+                    },
+                    snapshot_id: 11,
+                },
+            },
+            physical_layout: None,
+            alias: None,
+        };
+        let planned = PlannedScanTable {
+            scan_node_id: 9,
+            resolved,
+            min_max_conjuncts: Vec::new(),
+            slot_to_column: std::collections::HashMap::new(),
+            iceberg_metadata_pseudo_column_slots: std::collections::BTreeSet::new(),
+        };
+
+        let err = build_exec_params_multi(&[planned])
+            .expect_err("version table must not be executable in phase 1");
+        assert!(
+            err.contains("IMV version scan ice.db.b at snapshot 11 reached scan-range construction before execution cutover"),
+            "unexpected error: {err}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
