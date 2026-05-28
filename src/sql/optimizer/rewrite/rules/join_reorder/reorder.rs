@@ -211,7 +211,8 @@ pub(crate) fn reorder_joins_heuristic(plan: LogicalPlan) -> LogicalPlan {
                 | JoinKind::LeftSemi
                 | JoinKind::RightSemi
                 | JoinKind::LeftAnti
-                | JoinKind::RightAnti => {}
+                | JoinKind::RightAnti
+                | JoinKind::NullAwareLeftAnti => {}
             }
 
             LogicalPlan::Join(j)

@@ -22,6 +22,12 @@ fn commute_join_kind(kind: JoinKind) -> JoinKind {
         JoinKind::RightSemi => JoinKind::LeftSemi,
         JoinKind::LeftAnti => JoinKind::RightAnti,
         JoinKind::RightAnti => JoinKind::LeftAnti,
+        // NullAwareLeftAnti is asymmetric (the null-key build-side check
+        // tests one specific side) and has no "right" mirror in our exec
+        // layer. Keep it as-is — the `matches()` filter above already
+        // excludes it from this rule's input set, this is just defence in
+        // depth for any future caller.
+        JoinKind::NullAwareLeftAnti => JoinKind::NullAwareLeftAnti,
     }
 }
 

@@ -1029,29 +1029,22 @@ impl<'a> AnalyzerContext<'a> {
                 data_type: sub_col.data_type.clone(),
                 nullable: sub_col.nullable,
             };
-            // For IN (semi), plain equality is correct: NULLs never satisfy
-            // `=` so they're already excluded. For NOT IN (anti) we need
-            // null-aware equality so the LEFT ANTI join matches whenever
-            // either operand is NULL, matching SQL's
-            // "x NOT IN S returns UNKNOWN if x is NULL or S contains NULL"
-            // semantics — but only when nulls are actually possible. When
-            // both operands are statically non-nullable, the OR-with-IsNull
-            // branches are dead code that prevent the downstream optimizer
-            // from extracting an equi-key and falls back to a NestLoopJoin
-            // (turning a typical `c0 NOT IN (subq)` into a quadratic scan).
-            let either_nullable = lhs_i.nullable || sub_col.nullable;
-            let eq = if negated && !inside_or && either_nullable {
-                null_aware_eq(lhs_i.clone(), rhs_ref)
-            } else {
-                TypedExpr {
-                    data_type: DataType::Boolean,
-                    nullable: false,
-                    kind: ExprKind::BinaryOp {
-                        left: Box::new(lhs_i.clone()),
-                        op: BinOp::Eq,
-                        right: Box::new(rhs_ref),
-                    },
-                }
+            // Always emit plain `Eq` as the join condition. For NOT IN, SQL's
+            // "any NULL anywhere → UNKNOWN" semantics is encoded by selecting
+            // `JoinKind::NullAwareLeftAnti` below when either operand could be
+            // NULL, rather than by wrapping the condition in IS-NULL ORs (the
+            // old form). Keeping the condition a bare `Eq` lets the Cascades
+            // implement phase extract it as a real hash-join key — without
+            // that, `c0 NOT IN (subq)` on nullable columns degraded to a
+            // NestLoopJoin and timed out on 60K×40K-scale inputs.
+            let eq = TypedExpr {
+                data_type: DataType::Boolean,
+                nullable: false,
+                kind: ExprKind::BinaryOp {
+                    left: Box::new(lhs_i.clone()),
+                    op: BinOp::Eq,
+                    right: Box::new(rhs_ref),
+                },
             };
             eq_conjuncts.push(eq);
         }
@@ -1173,11 +1166,23 @@ impl<'a> AnalyzerContext<'a> {
                 &is_null_expr,
             );
         } else {
-            // Standard case: SEMI / ANTI JOIN. NULL handling for NOT IN is
-            // baked into `eq_cond` above (null-aware equality), so the
-            // subquery is wrapped as-is.
+            // Standard case: SEMI / ANTI JOIN. For NOT IN, NULL handling now
+            // lives in the JoinKind itself — pick `NullAwareLeftAnti` when
+            // either side could carry NULLs so the exec layer's null-aware
+            // anti-join logic kicks in (drops every probe row if the build
+            // side has any NULL key; drops probe rows whose key is NULL).
+            // For statically non-nullable operands the regular `LeftAnti`
+            // already matches SQL semantics.
+            let either_nullable = lhs_typed_list
+                .iter()
+                .zip(resolved_sub.output_columns.iter())
+                .any(|(lhs_i, sub_col)| lhs_i.nullable || sub_col.nullable);
             let join_type = if negated {
-                JoinKind::LeftAnti
+                if either_nullable {
+                    JoinKind::NullAwareLeftAnti
+                } else {
+                    JoinKind::LeftAnti
+                }
             } else {
                 JoinKind::LeftSemi
             };

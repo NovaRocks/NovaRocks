@@ -398,6 +398,7 @@ pub(crate) fn join_kind_to_op(kind: query_ir::JoinKind) -> plan_nodes::TJoinOp {
         query_ir::JoinKind::RightSemi => plan_nodes::TJoinOp::RIGHT_SEMI_JOIN,
         query_ir::JoinKind::LeftAnti => plan_nodes::TJoinOp::LEFT_ANTI_JOIN,
         query_ir::JoinKind::RightAnti => plan_nodes::TJoinOp::RIGHT_ANTI_JOIN,
+        query_ir::JoinKind::NullAwareLeftAnti => plan_nodes::TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN,
     }
 }
 

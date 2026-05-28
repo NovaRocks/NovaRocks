@@ -209,6 +209,16 @@ pub(crate) enum JoinKind {
     RightSemi,
     LeftAnti,
     RightAnti,
+    /// SQL `lhs NOT IN (SELECT … FROM r)` with nullable operands. Identical
+    /// to LeftAnti in row-pairing, plus two runtime guards required by SQL's
+    /// "any NULL anywhere makes NOT IN return UNKNOWN" semantics:
+    ///   - if any build-side key is NULL → drop every probe row;
+    ///   - any probe-side NULL key is also dropped.
+    /// Emitted only by the analyzer's NOT IN rewrite when either operand is
+    /// nullable; never appears in user SQL directly. Codegen lowers it to
+    /// thrift `TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN` which the exec layer's
+    /// `JoinType::NullAwareLeftAnti` already implements.
+    NullAwareLeftAnti,
 }
 
 // ---------------------------------------------------------------------------
