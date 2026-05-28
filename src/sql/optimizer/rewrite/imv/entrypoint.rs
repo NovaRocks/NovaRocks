@@ -60,11 +60,18 @@ pub(crate) fn run_imv_rewrite(input: ImvRewriteInput) -> Result<ImvRewriteOutcom
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::analysis::OutputColumn;
+    use crate::sql::catalog::{
+        ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
+    };
+    use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::phase::RewritePhase;
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
-    use crate::sql::planner::plan::{LogicalPlan, ValuesNode};
+    use crate::sql::planner::plan::{LogicalPlan, ScanNode, ValuesNode};
+    use arrow::datatypes::DataType;
+    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn dummy_mv_ctx() -> Arc<IcebergMvRewriteContext> {
@@ -75,6 +82,49 @@ mod tests {
         LogicalPlan::Values(ValuesNode {
             rows: vec![],
             columns: vec![],
+        })
+    }
+
+    fn iceberg_scan_plan() -> LogicalPlan {
+        let column = ColumnDef {
+            name: "k".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        };
+        LogicalPlan::Scan(ScanNode {
+            database: "db".to_string(),
+            table: TableDef {
+                name: "b".to_string(),
+                columns: vec![column],
+                iceberg_row_lineage_metadata_columns: Vec::new(),
+                source: ScanSource::IcebergDataFiles {
+                    table: IcebergTableInfo {
+                        catalog: "ice".to_string(),
+                        namespace: "db".to_string(),
+                        table: "b".to_string(),
+                        table_uuid: Some("uuid-b".to_string()),
+                        current_snapshot_id: Some(22),
+                        schema_id: 7,
+                        location: "file:///tmp/ice/db/b".to_string(),
+                        schema: IcebergSchemaDef { fields: Vec::new() },
+                        serialized_metadata: None,
+                    },
+                    files: Vec::new(),
+                    cloud_properties: BTreeMap::new(),
+                },
+            },
+            alias: None,
+            columns: vec![OutputColumn {
+                column_id: ColumnId(1),
+                name: "k".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            }],
+            predicates: Vec::new(),
+            required_columns: None,
+            dict_columns: Vec::new(),
         })
     }
 
@@ -384,5 +434,31 @@ mod tests {
                 "imv-validation",
             ]
         );
+    }
+
+    #[test]
+    fn imv_pipeline_binds_root_delta_scan() {
+        let outcome = run_imv_rewrite(ImvRewriteInput {
+            plan: iceberg_scan_plan(),
+            mv_ctx: dummy_mv_ctx(),
+            disabled_rules: Vec::new(),
+            deadline: None,
+        })
+        .expect("Delta(Scan) must bind and pass validation");
+
+        let LogicalPlan::Scan(scan) = outcome.plan else {
+            panic!("expected scan outcome");
+        };
+        match scan.table.source {
+            ScanSource::IcebergDeltaTable {
+                from_snapshot_id,
+                to_snapshot_id,
+                ..
+            } => {
+                assert_eq!(from_snapshot_id, 11);
+                assert_eq!(to_snapshot_id, 22);
+            }
+            other => panic!("expected IcebergDeltaTable, got {other:?}"),
+        }
     }
 }
