@@ -256,7 +256,10 @@ fn endpoint_reachable(endpoint: &str) -> bool {
 /// object-store endpoint is not reachable. Without this probe, the first
 /// `CREATE TABLE` in a suite would timeout deep inside the standalone server.
 fn ensure_starrocks_table_prereqs(runner_config: &RunnerConfig) -> Result<()> {
-    if !runner_config.values.contains_key("starrocks_table_warehouse") {
+    if !runner_config
+        .values
+        .contains_key("starrocks_table_warehouse")
+    {
         return Ok(());
     }
     let endpoint = runner_config
@@ -2428,7 +2431,10 @@ enable_path_style_access = true
         let fe_value: toml::Value = fe.parse().expect("parse fe toml");
         let be_value: toml::Value = be.parse().expect("parse be toml");
 
-        assert_eq!(fe_value["metadata"]["path"].as_str(), Some("tmp/sql-tests.sqlite"));
+        assert_eq!(
+            fe_value["metadata"]["path"].as_str(),
+            Some("tmp/sql-tests.sqlite")
+        );
         assert_eq!(
             fe_value["standalone_server"]["object_store"]["endpoint"].as_str(),
             Some("http://127.0.0.1:9000")
@@ -2447,14 +2453,13 @@ enable_path_style_access = true
         );
 
         assert_eq!(be_value["cluster"]["role"].as_str(), Some("be"));
-        assert_eq!(
-            be_value["server"]["starlet_port"].as_integer(),
-            Some(19070)
+        assert_eq!(be_value["server"]["starlet_port"].as_integer(), Some(19070));
+        assert!(
+            be_value
+                .get("standalone_server")
+                .and_then(|value| value.get("object_store"))
+                .is_some()
         );
-        assert!(be_value
-            .get("standalone_server")
-            .and_then(|value| value.get("object_store"))
-            .is_some());
     }
 
     #[test]
@@ -2465,9 +2470,8 @@ enable_path_style_access = true
         let fake_bin = test_root.join("novarocks-env");
         fs::write(&fake_bin, "#!/bin/sh\nexit 0\n").expect("write fake bin");
 
-        let resolved =
-            discover_novarocks_binary_with_override(&repo_root, Some(fake_bin.clone()))
-                .expect("discover binary");
+        let resolved = discover_novarocks_binary_with_override(&repo_root, Some(fake_bin.clone()))
+            .expect("discover binary");
         assert_eq!(resolved, fake_bin);
         let _ = fs::remove_file(&fake_bin);
         let _ = fs::remove_dir_all(&test_root);

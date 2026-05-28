@@ -7641,21 +7641,12 @@ mod tests {
 
     #[test]
     fn iceberg_aggregate_target_columns_use_state_layout() {
-        let query = parse_select_query(
+        let (shape, analysis) = analyze_aggregate_fact_query(
             "select region, count(*) as c, sum(amount) as s \
              from ice.ns.fact group by region",
         );
-        let shape = match classify_incremental_mv_query(&query).expect("shape") {
-            IncrementalMvShape::Aggregate(shape) => shape,
-            other => panic!("expected aggregate shape, got {other:?}"),
-        };
-        let output_columns = vec![
-            output_col("region", arrow::datatypes::DataType::Utf8, true),
-            output_col("c", arrow::datatypes::DataType::Int64, false),
-            output_col("s", arrow::datatypes::DataType::Int64, true),
-        ];
 
-        let columns = iceberg_aggregate_target_columns(&shape, &output_columns).expect("columns");
+        let columns = iceberg_aggregate_target_columns(&shape, &analysis).expect("columns");
         let names = columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>();
 
         assert_eq!(
@@ -8212,6 +8203,19 @@ mod tests {
             data_type: ty,
             nullable,
         }
+    }
+
+    fn analyze_aggregate_fact_query(sql: &str) -> (AggregateMvShape, MvAnalysis) {
+        let env = open_test_state_with_iceberg_catalog("ice", "ns");
+        create_aggregate_fact_table(&env.state, "ice", "ns", "fact");
+        let query = parse_select_query(sql);
+        let shape = match classify_incremental_mv_query(&query).expect("shape") {
+            IncrementalMvShape::Aggregate(shape) => shape,
+            other => panic!("expected aggregate shape, got {other:?}"),
+        };
+        let analysis = analyze_mv_select(&env.state, Some("ice"), &env.current_db, &query)
+            .expect("analyze aggregate query");
+        (shape, analysis)
     }
 
     struct IcebergMvTestState {
@@ -9279,21 +9283,12 @@ mod tests {
 
     #[test]
     fn iceberg_aggregate_target_columns_reject_duplicate_physical_names() {
-        let query = parse_select_query(
+        let (shape, analysis) = analyze_aggregate_fact_query(
             "select region, sum(amount) as s, count(*) as __agg_state_s \
              from ice.ns.fact group by region",
         );
-        let shape = match classify_incremental_mv_query(&query).expect("shape") {
-            IncrementalMvShape::Aggregate(shape) => shape,
-            other => panic!("expected aggregate shape, got {other:?}"),
-        };
-        let output_columns = vec![
-            output_col("region", DataType::Utf8, true),
-            output_col("s", DataType::Int64, true),
-            output_col("__agg_state_s", DataType::Int64, false),
-        ];
 
-        let err = iceberg_aggregate_target_columns(&shape, &output_columns)
+        let err = iceberg_aggregate_target_columns(&shape, &analysis)
             .expect_err("duplicate aggregate physical column names should be rejected");
         assert!(
             err.contains("aggregate MV physical column name collision"),

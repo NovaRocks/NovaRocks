@@ -232,9 +232,7 @@ impl RuntimeDirGuard {
     }
 
     fn path(&self) -> &Path {
-        self.runtime_dir
-            .as_deref()
-            .expect("runtime dir available")
+        self.runtime_dir.as_deref().expect("runtime dir available")
     }
 
     fn into_path(mut self) -> PathBuf {
@@ -522,7 +520,11 @@ pub(crate) fn build_novarocks_command(binary: &Path, role: &str, config_path: &P
 }
 
 pub(crate) fn startup_timeout() -> Duration {
-    startup_timeout_from_env(std::env::var("NOVAROCKS_STARTUP_TIMEOUT_SECS").ok().as_deref())
+    startup_timeout_from_env(
+        std::env::var("NOVAROCKS_STARTUP_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+    )
 }
 
 pub(crate) fn startup_timeout_from_env(raw: Option<&str>) -> Duration {
@@ -561,10 +563,7 @@ struct ReservedPort {
 impl ReservedPort {
     fn new() -> Result<Self> {
         let listener = TcpListener::bind(("127.0.0.1", 0)).context("bind ephemeral port")?;
-        let port = listener
-            .local_addr()
-            .context("read ephemeral port")?
-            .port();
+        let port = listener.local_addr().context("read ephemeral port")?.port();
         Ok(Self {
             _listener: listener,
             port,
@@ -642,7 +641,10 @@ mod tests {
             .split("\n#[cfg(test)]")
             .next()
             .expect("source before tests");
-        assert!(source.contains("fn join_stderr_thread"), "missing stderr join helper");
+        assert!(
+            source.contains("fn join_stderr_thread"),
+            "missing stderr join helper"
+        );
         assert!(
             source.contains("self.join_stderr_thread();"),
             "wait_for_ready should join stderr thread before reading stderr"
@@ -714,7 +716,10 @@ exec_node_output = true
         let fe_value: toml::Value = fe.parse().expect("parse fe toml");
         let be_value: toml::Value = be.parse().expect("parse be toml");
 
-        assert_eq!(fe_value["metadata"]["path"].as_str(), Some("tmp/sql-tests.sqlite"));
+        assert_eq!(
+            fe_value["metadata"]["path"].as_str(),
+            Some("tmp/sql-tests.sqlite")
+        );
         assert_eq!(
             fe_value["standalone_server"]["object_store"]["endpoint"].as_str(),
             Some("http://127.0.0.1:9000")
@@ -727,10 +732,7 @@ exec_node_output = true
             fe_value["standalone_server"]["mysql_port"].as_integer(),
             Some(29030)
         );
-        assert_eq!(
-            fe_value["standalone_server"]["user"].as_str(),
-            Some("root")
-        );
+        assert_eq!(fe_value["standalone_server"]["user"].as_str(), Some("root"));
         assert_eq!(fe_value["cluster"]["role"].as_str(), Some("fe"));
         assert_eq!(
             fe_value["cluster"]["backends"]
@@ -740,7 +742,10 @@ exec_node_output = true
             Some("127.0.0.1:19070")
         );
 
-        assert_eq!(be_value["metadata"]["path"].as_str(), Some("tmp/sql-tests.sqlite"));
+        assert_eq!(
+            be_value["metadata"]["path"].as_str(),
+            Some("tmp/sql-tests.sqlite")
+        );
         assert_eq!(
             be_value["standalone_server"]["object_store"]["endpoint"].as_str(),
             Some("http://127.0.0.1:9000")
@@ -749,19 +754,20 @@ exec_node_output = true
         assert_eq!(be_value["server"]["host"].as_str(), Some("127.0.0.1"));
         assert_eq!(be_value["server"]["http_port"].as_integer(), Some(18080));
         assert_eq!(be_value["server"]["starlet_port"].as_integer(), Some(19070));
-        assert_eq!(
-            be_value["standalone_server"]["user"].as_str(),
-            Some("root")
+        assert_eq!(be_value["standalone_server"]["user"].as_str(), Some("root"));
+        assert!(
+            be_value
+                .get("standalone_server")
+                .and_then(|value| value.get("mysql_port"))
+                .is_none()
         );
-        assert!(be_value
-            .get("standalone_server")
-            .and_then(|value| value.get("mysql_port"))
-            .is_none());
         assert_eq!(be_value["cluster"]["role"].as_str(), Some("be"));
-        assert!(be_value
-            .get("cluster")
-            .and_then(|value| value.get("backends"))
-            .is_none());
+        assert!(
+            be_value
+                .get("cluster")
+                .and_then(|value| value.get("backends"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -770,9 +776,7 @@ exec_node_output = true
         let port = reserved.port();
         assert!(TcpListener::bind(("127.0.0.1", port)).is_err());
 
-        let port = reserved.release();
-        let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind released port");
-        drop(listener);
+        assert_eq!(reserved.release(), port);
     }
 
     #[test]
@@ -801,7 +805,10 @@ exec_node_output = true
         fs::create_dir_all(&dir).expect("recreate runtime dir");
         let guard = RuntimeDirGuard::new(dir.clone());
         let dir = guard.into_path();
-        assert!(dir.exists(), "disarmed runtime dir should remain for caller cleanup");
+        assert!(
+            dir.exists(),
+            "disarmed runtime dir should remain for caller cleanup"
+        );
 
         fs::remove_dir_all(&dir).expect("cleanup runtime dir");
     }

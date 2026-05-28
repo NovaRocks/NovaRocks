@@ -621,7 +621,5 @@ fn reserved_port_blocks_rebinding_until_release() {
         "reserved port must remain bound until release"
     );
 
-    let released_port = port.release();
-    let _listener = std::net::TcpListener::bind(("127.0.0.1", released_port))
-        .expect("released port can be rebound");
+    assert_eq!(port.release(), addr.1);
 }

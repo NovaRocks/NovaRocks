@@ -143,6 +143,8 @@ mod tests {
             }],
             cte_id: None,
             cte_exchange_nodes: vec![],
+            query_global_dicts: None,
+            query_global_dict_exprs: None,
         }
     }
 
