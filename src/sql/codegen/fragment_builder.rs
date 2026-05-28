@@ -3282,10 +3282,21 @@ impl<'a> PlanFragmentBuilder<'a> {
                     }
                 }
                 if partition_exprs.is_empty() {
-                    return Err(format!(
-                        "no hash partition columns resolved in child scope from {:?}",
-                        cols
-                    ));
+                    // A `HashPartitioned` requirement whose cols are all
+                    // invisible to the immediate child indicates the
+                    // optimizer asked one side of a join to be partitioned
+                    // by the OTHER side's key — most commonly with a
+                    // chained `FULL OUTER JOIN … USING(k)` whose final
+                    // INNER-join key is `coalesce(coalesce(…), tN.id)`
+                    // (last term resolved against the build side). The
+                    // selected physical plan is a BROADCAST join, so the
+                    // hash partitioning was never going to be used at
+                    // runtime; emitting it as an error blocks an otherwise
+                    // valid plan. Treat it as the no-op UNPARTITIONED
+                    // distribution: the child fragment streams as one
+                    // partition, and the broadcast exchange downstream
+                    // still produces correct output.
+                    return Ok(unpartitioned_stream_partition());
                 }
                 Ok(partitions::TDataPartition::new(
                     partitions::TPartitionType::HASH_PARTITIONED,
