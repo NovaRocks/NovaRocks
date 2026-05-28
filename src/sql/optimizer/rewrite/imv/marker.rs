@@ -37,12 +37,30 @@ pub(crate) struct ImvVersionNode {
     pub version_ref: ImvVersionRef,
 }
 
-/// Snapshot window descriptor used by `ImvVersionNode`. PR-β leaves the
-/// concrete fields to task 4; we only need a constructible placeholder so
-/// the type is reachable from tests.
-#[derive(Clone, Debug, Default)]
+/// Snapshot window descriptor used by `ImvVersionNode`.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ImvVersionRef {
-    _private: (),
+    pub(crate) role: crate::sql::optimizer::rewrite::imv::scan_binding::ImvVersionRole,
+}
+
+impl ImvVersionRef {
+    pub(crate) fn from_snapshot() -> Self {
+        Self {
+            role: crate::sql::optimizer::rewrite::imv::scan_binding::ImvVersionRole::From,
+        }
+    }
+
+    pub(crate) fn to_snapshot() -> Self {
+        Self {
+            role: crate::sql::optimizer::rewrite::imv::scan_binding::ImvVersionRole::To,
+        }
+    }
+}
+
+impl Default for ImvVersionRef {
+    fn default() -> Self {
+        Self::to_snapshot()
+    }
 }
 
 /// Wraps the root of an IMV refresh plan in `ImvDelta { is_root: true }`.

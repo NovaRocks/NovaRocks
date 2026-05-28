@@ -615,6 +615,12 @@ pub(crate) fn build_exec_params_multi(
                     // morsel for the runtime to dispatch on.
                     vec![build_iceberg_metadata_scan_range_params()]
                 }
+                ScanSource::IcebergVersionTable { table, snapshot_id } => {
+                    return Err(format!(
+                        "IMV version scan {}.{}.{} at snapshot {} reached scan-range construction before execution cutover",
+                        table.catalog, table.namespace, table.table, snapshot_id
+                    ));
+                }
                 ScanSource::StarRocks { .. } => {
                     // StarRocks tables reach this builder via the
                     // outer `if let Some(layout)` branch above; falling

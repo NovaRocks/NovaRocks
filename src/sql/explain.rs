@@ -858,7 +858,8 @@ fn scan_supports_decode_hint(
         // hint path does not apply.
         ScanSource::IcebergMetadataTable { .. } => false,
         // IVM delta-scan does not produce stable column-dictionary stats.
-        ScanSource::IcebergDeltaTable { .. } => false,
+        // IMV pinned-version placeholders never produce parquet stats either.
+        ScanSource::IcebergDeltaTable { .. } | ScanSource::IcebergVersionTable { .. } => false,
     }
 }
 
@@ -870,8 +871,11 @@ fn scan_supports_min_max_stats(
         ScanSource::IcebergDataFiles { .. } | ScanSource::StarRocks { .. } => {}
         // Iceberg metadata tables do not produce parquet column statistics.
         ScanSource::IcebergMetadataTable { .. } => return false,
-        // IVM delta-scan is a synthetic placeholder; no parquet stats.
-        ScanSource::IcebergDeltaTable { .. } => return false,
+        // IVM delta-scan and IMV pinned-version placeholders are synthetic;
+        // no parquet stats.
+        ScanSource::IcebergDeltaTable { .. } | ScanSource::IcebergVersionTable { .. } => {
+            return false;
+        }
     }
     required_columns.iter().all(|required| {
         table

@@ -1838,7 +1838,8 @@ fn iceberg_table_info(
     match source {
         crate::sql::catalog::ScanSource::IcebergDataFiles { table, .. }
         | crate::sql::catalog::ScanSource::IcebergMetadataTable { table, .. }
-        | crate::sql::catalog::ScanSource::IcebergDeltaTable { table, .. } => Some(table),
+        | crate::sql::catalog::ScanSource::IcebergDeltaTable { table, .. }
+        | crate::sql::catalog::ScanSource::IcebergVersionTable { table, .. } => Some(table),
         crate::sql::catalog::ScanSource::StarRocks { .. } => None,
     }
 }
