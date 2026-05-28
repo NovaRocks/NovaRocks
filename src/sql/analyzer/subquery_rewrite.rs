@@ -984,11 +984,22 @@ impl<'a> AnalyzerContext<'a> {
         // `Relation::Subquery` would isolate the inner SELECT and the outer
         // reference would no longer resolve. We must lift the subquery's WHERE
         // up into the SEMI/ANTI join's ON condition — same pattern as EXISTS.
+        //
+        // Detect correlation broadly: extract_correlation_predicates only
+        // recognises comparison-shaped predicates (e.g. `outer.x = inner.y`),
+        // but a bare-column WHERE like `WHERE outer.flag` (implicit `!= 0`)
+        // or any expression that references an outer column also has to
+        // route through the correlated path so the outer reference stays
+        // visible at codegen time. Fall back to a generic
+        // "does the subquery filter mention any outer-scope column" check.
         let is_correlated = match resolved_sub.body {
             QueryBody::Select(ref sel) => sel
                 .filter
                 .as_ref()
-                .map(|f| !extract_correlation_predicates(f, &inner_scope, scope).is_empty())
+                .map(|f| {
+                    !extract_correlation_predicates(f, &inner_scope, scope).is_empty()
+                        || expr_references_outer_scope(f, &inner_scope, scope)
+                })
                 .unwrap_or(false),
             _ => false,
         };
@@ -1240,12 +1251,17 @@ impl<'a> AnalyzerContext<'a> {
         let rhs_expr = sub_projection[0].expr.clone();
         let sub_rel = sub_from.ok_or("IN subquery must have a FROM clause".to_string())?;
 
-        // For correlated NOT IN, use null-aware equality so the LEFT ANTI join
-        // matches whenever either side is NULL within the correlation group —
-        // the row is then excluded from the outer result, matching SQL's
-        // "x NOT IN S returns UNKNOWN when x is NULL or S contains NULL"
-        // semantics. For IN (semi), a plain equality is correct: NULLs never
-        // satisfy IN and the row stays out.
+        // For correlated NOT IN, use null-aware equality so the LEFT ANTI
+        // join matches whenever either side is NULL within the correlation
+        // group — matching SQL's "NOT IN returns UNKNOWN when NULL is
+        // present". We deliberately do NOT switch to NullAwareLeftAnti
+        // here (unlike the uncorrelated path): NullAwareLeftAnti is a
+        // global "drop all probe rows if build has any NULL key" check,
+        // but for a correlated subquery the build side varies per outer
+        // row — the correlation predicate filters NULL keys away on a
+        // row-by-row basis. Keep the slower NLJ + null_aware_eq path so
+        // semantics stay correct on cases like
+        // `WHERE l1.k1 NOT IN (SELECT l3.k1 FROM t l3 WHERE l3.k3 = l1.k3)`.
         let key_cond = if negated {
             null_aware_eq(lhs_typed, rhs_expr)
         } else {
@@ -1600,7 +1616,7 @@ impl<'a> AnalyzerContext<'a> {
 
         // --- WHERE clause ---
         let filter = match &select.selection {
-            Some(expr) => Some(self.analyze_expr(expr, &merged_scope)?),
+            Some(expr) => Some(coerce_where_to_bool(self.analyze_expr(expr, &merged_scope)?)),
             None => None,
         };
 
@@ -1883,6 +1899,35 @@ pub(super) struct CorrelationPred {
 /// key condition for null-aware `NOT IN`: the LEFT ANTI JOIN must match
 /// (and thus exclude the outer row) whenever either operand is NULL,
 /// because SQL's NOT IN returns UNKNOWN under those conditions.
+/// Coerce a WHERE / ON / HAVING expression to BOOLEAN when its analysed
+/// type is not already boolean. MySQL/StarRocks accept `WHERE int_col`
+/// (truthy when non-zero, FALSE when zero, NULL when NULL); our analyzer
+/// hands such an expression off to downstream AND-conjuncts that
+/// require boolean operands ("AND right operand must be boolean"). Wrap
+/// non-boolean truthy filters as `expr != 0` (numeric) so the
+/// three-valued logic matches.
+pub(crate) fn coerce_where_to_bool(expr: TypedExpr) -> TypedExpr {
+    use arrow::datatypes::DataType;
+    if matches!(expr.data_type, DataType::Boolean) {
+        return expr;
+    }
+    let nullable = expr.nullable;
+    let zero = TypedExpr {
+        kind: ExprKind::Literal(LiteralValue::Int(0)),
+        data_type: DataType::Int64,
+        nullable: false,
+    };
+    TypedExpr {
+        data_type: DataType::Boolean,
+        nullable,
+        kind: ExprKind::BinaryOp {
+            left: Box::new(expr),
+            op: BinOp::Ne,
+            right: Box::new(zero),
+        },
+    }
+}
+
 fn null_aware_eq(lhs: TypedExpr, rhs: TypedExpr) -> TypedExpr {
     // Goal: a Boolean predicate that, when used as the ON condition of a LEFT
     // ANTI join rewritten from `lhs NOT IN (subq)`, causes the join to drop
@@ -1922,6 +1967,87 @@ fn null_aware_eq(lhs: TypedExpr, rhs: TypedExpr) -> TypedExpr {
             args: vec![eq, true_lit],
             distinct: false,
         },
+    }
+}
+
+/// `true` when `expr` contains at least one column reference that resolves
+/// only in `outer_scope` and not in `inner_scope`. Broader than
+/// `extract_correlation_predicates` (which looks for comparison-shaped
+/// predicates) — needed so a bare WHERE clause like `WHERE outer.flag`
+/// (implicit `!= 0` boolean) still routes the IN/NOT IN rewrite through
+/// the correlated path that lifts the outer reference up into the join
+/// ON condition.
+fn expr_references_outer_scope(
+    expr: &TypedExpr,
+    inner_scope: &AnalyzerScope,
+    outer_scope: &AnalyzerScope,
+) -> bool {
+    let mut saw_outer = false;
+    walk_for_outer_ref(expr, inner_scope, outer_scope, &mut saw_outer);
+    saw_outer
+}
+
+fn walk_for_outer_ref(
+    expr: &TypedExpr,
+    inner_scope: &AnalyzerScope,
+    outer_scope: &AnalyzerScope,
+    saw_outer: &mut bool,
+) {
+    if *saw_outer {
+        return;
+    }
+    match &expr.kind {
+        ExprKind::ColumnRef {
+            qualifier, column, ..
+        } => {
+            let q = qualifier.as_deref();
+            let inner_has = inner_scope.resolve(q, column).is_ok();
+            let outer_has = outer_scope.resolve(q, column).is_ok();
+            if !inner_has && outer_has {
+                *saw_outer = true;
+            }
+        }
+        ExprKind::BinaryOp { left, right, .. } => {
+            walk_for_outer_ref(left, inner_scope, outer_scope, saw_outer);
+            walk_for_outer_ref(right, inner_scope, outer_scope, saw_outer);
+        }
+        ExprKind::UnaryOp { expr: inner, .. }
+        | ExprKind::IsNull { expr: inner, .. }
+        | ExprKind::Cast { expr: inner, .. }
+        | ExprKind::Nested(inner) => {
+            walk_for_outer_ref(inner, inner_scope, outer_scope, saw_outer);
+        }
+        ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
+            for a in args {
+                walk_for_outer_ref(a, inner_scope, outer_scope, saw_outer);
+            }
+        }
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(op) = operand {
+                walk_for_outer_ref(op, inner_scope, outer_scope, saw_outer);
+            }
+            for (w, t) in when_then {
+                walk_for_outer_ref(w, inner_scope, outer_scope, saw_outer);
+                walk_for_outer_ref(t, inner_scope, outer_scope, saw_outer);
+            }
+            if let Some(e) = else_expr {
+                walk_for_outer_ref(e, inner_scope, outer_scope, saw_outer);
+            }
+        }
+        ExprKind::InList { expr: inner, list, .. } => {
+            walk_for_outer_ref(inner, inner_scope, outer_scope, saw_outer);
+            for v in list {
+                walk_for_outer_ref(v, inner_scope, outer_scope, saw_outer);
+            }
+        }
+        // Literal / LambdaParamRef / SubqueryPlaceholder / etc. — no
+        // sub-expressions that could carry outer references in the
+        // contexts this helper covers.
+        _ => {}
     }
 }
 
