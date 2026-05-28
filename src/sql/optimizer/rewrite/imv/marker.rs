@@ -32,8 +32,6 @@ pub(crate) struct ImvDeltaNode {
 #[derive(Clone, Debug)]
 pub(crate) struct ImvVersionNode {
     pub input: Box<LogicalPlan>,
-    // PR-β scaffolding: task 4 will read version_ref when binding scan ranges.
-    #[allow(dead_code)]
     pub version_ref: ImvVersionRef,
 }
 
