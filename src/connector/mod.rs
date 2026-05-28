@@ -18,6 +18,7 @@ pub(crate) mod backend;
 pub mod hdfs;
 pub mod iceberg;
 pub mod jdbc;
+pub(crate) mod scan_planning;
 pub mod schema;
 pub mod starrocks;
 
@@ -43,6 +44,7 @@ pub(crate) use starrocks::table::{
     runtime_registered,
 };
 
+use scan_planning::ConnectorScanPlanner;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -60,6 +62,94 @@ pub use starrocks::{LakeScanSchemaMeta, StarRocksScanConfig, StarRocksScanOp, St
 
 #[cfg(test)]
 mod backend_test;
+
+#[cfg(test)]
+mod scan_planning_registry_tests {
+    use std::sync::Arc;
+
+    use super::ConnectorRegistry;
+    use super::scan_planning::{
+        BeginScanContext, ConnectorScanPlanner, ScanHandle, Split, SplitPlanningContext,
+        TableHandle, ThriftScanContext, ThriftScanPlan,
+    };
+
+    #[derive(Debug)]
+    struct NoopPlanner;
+
+    impl ConnectorScanPlanner for NoopPlanner {
+        fn name(&self) -> &'static str {
+            "noop"
+        }
+
+        fn begin_scan(
+            &self,
+            _table: TableHandle,
+            _ctx: BeginScanContext,
+        ) -> Result<ScanHandle, String> {
+            Err("not used".to_string())
+        }
+
+        fn plan_splits(
+            &self,
+            _scan: &ScanHandle,
+            _ctx: SplitPlanningContext,
+        ) -> Result<Vec<Split>, String> {
+            Err("not used".to_string())
+        }
+
+        fn to_thrift_scan(
+            &self,
+            _scan: &ScanHandle,
+            _splits: &[Split],
+            _ctx: ThriftScanContext,
+        ) -> Result<ThriftScanPlan, String> {
+            Err("not used".to_string())
+        }
+    }
+
+    #[test]
+    fn connector_registry_returns_registered_scan_planner() {
+        let mut registry = ConnectorRegistry::new();
+        registry.register_scan_planner(Arc::new(NoopPlanner));
+
+        let planner = registry.scan_planner("noop").expect("registered planner");
+
+        assert_eq!(planner.name(), "noop");
+    }
+
+    #[test]
+    fn connector_registry_reports_unknown_scan_planner() {
+        let registry = ConnectorRegistry::new();
+
+        let err = registry
+            .scan_planner("missing")
+            .expect_err("unknown planner should fail");
+
+        assert_eq!(err, "unknown scan planner: missing");
+    }
+
+    #[test]
+    fn default_registry_does_not_register_standalone_scan_planners() {
+        let registry = ConnectorRegistry::default();
+
+        let err = registry
+            .scan_planner("starrocks")
+            .expect_err("standalone planners are registered with state, not Default");
+
+        assert_eq!(err, "unknown scan planner: starrocks");
+    }
+
+    #[test]
+    fn default_registry_does_not_register_standalone_iceberg_scan_planner() {
+        let registry = ConnectorRegistry::default();
+
+        let err = registry
+            .scan_planner("iceberg")
+            .expect_err("standalone planners are registered with state, not Default");
+
+        assert_eq!(err, "unknown scan planner: iceberg");
+    }
+}
 
 #[derive(Clone, Debug)]
 pub enum ScanConfig {
@@ -81,6 +171,7 @@ pub struct ConnectorRegistry {
     table_sources: HashMap<&'static str, Arc<dyn TableSource>>,
     table_sinks: HashMap<&'static str, Arc<dyn TableSink>>,
     mv_backends: HashMap<&'static str, Arc<dyn MvBackend>>,
+    scan_planners: HashMap<&'static str, Arc<dyn ConnectorScanPlanner>>,
 }
 
 impl ConnectorRegistry {
@@ -91,6 +182,7 @@ impl ConnectorRegistry {
             table_sources: HashMap::new(),
             table_sinks: HashMap::new(),
             mv_backends: HashMap::new(),
+            scan_planners: HashMap::new(),
         }
     }
 
@@ -151,6 +243,17 @@ impl ConnectorRegistry {
             .collect()
     }
 
+    pub(crate) fn register_scan_planner(&mut self, planner: Arc<dyn ConnectorScanPlanner>) {
+        self.scan_planners.insert(planner.name(), planner);
+    }
+
+    pub(crate) fn scan_planner(&self, name: &str) -> Result<Arc<dyn ConnectorScanPlanner>, String> {
+        self.scan_planners
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("unknown scan planner: {name}"))
+    }
+
     pub fn create_scan_node(
         &self,
         connector_name: &str,
@@ -184,6 +287,10 @@ pub(crate) fn register_standalone_backends(state: &Arc<crate::engine::Standalone
     )));
     connectors.register_table_source(Arc::new(starrocks::table::StarRocksTableSource::new(state)));
     connectors.register_table_sink(Arc::new(starrocks::table::StarRocksTableSink::new(state)));
+    connectors.register_scan_planner(Arc::new(starrocks::table::StarRocksTableScanPlanner::new(
+        state,
+    )));
+    connectors.register_scan_planner(Arc::new(iceberg::IcebergConnectorScanPlanner::new()));
     connectors.register_mv_backend(Arc::new(starrocks::table::StarRocksTableMvBackend::new(
         state,
     )));
@@ -221,12 +328,15 @@ impl std::fmt::Debug for ConnectorRegistry {
         table_sinks.sort();
         let mut mv_backends: Vec<_> = self.mv_backends.keys().copied().collect();
         mv_backends.sort();
+        let mut scan_planners: Vec<_> = self.scan_planners.keys().copied().collect();
+        scan_planners.sort();
         f.debug_struct("ConnectorRegistry")
             .field("scan_connectors", &scan_connectors)
             .field("catalog_backends", &catalog_backends)
             .field("table_sources", &table_sources)
             .field("table_sinks", &table_sinks)
             .field("mv_backends", &mv_backends)
+            .field("scan_planners", &scan_planners)
             .finish()
     }
 }

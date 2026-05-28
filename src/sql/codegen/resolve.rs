@@ -2,16 +2,23 @@ use std::collections::HashMap;
 
 use arrow::datatypes::DataType;
 
-use crate::sql::catalog::{PhysicalTableLayout, TableDef};
+use crate::connector::scan_planning::{ScanHandle, Split};
+use crate::sql::catalog::TableDef;
 use crate::sql::column_id::ColumnId;
 use crate::types;
+
+#[derive(Clone, Debug)]
+pub(crate) struct PlannedConnectorScan {
+    pub(crate) scan: ScanHandle,
+    pub(crate) splits: Vec<Split>,
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedTable {
     #[allow(dead_code)]
     pub database: String,
     pub table: TableDef,
-    pub physical_layout: Option<PhysicalTableLayout>,
+    pub planned_scan: Option<PlannedConnectorScan>,
     #[allow(dead_code)]
     pub alias: Option<String>,
 }
@@ -131,16 +138,29 @@ impl ExprScope {
     }
 
     /// Merge another scope into this one. Used for building JOIN output scopes.
-    /// Qualified lookups are always added; unqualified lookups are added
-    /// only if the column name is not already present (ambiguous columns
-    /// require qualification).
+    /// Both qualified and unqualified lookups use "left wins": entries already
+    /// present in `self` are kept and the corresponding entry in `other` is
+    /// dropped on the floor.
+    ///
+    /// "Left wins" is required for self-join correctness. When a scan is
+    /// aliased (`t1 AS t2`), `visit_scan` registers each column under the
+    /// alias AND the original table name (so `SELECT t1.k FROM t1 AS x`
+    /// referencing the bare table name still works). In a self-join
+    /// `t1 LEFT JOIN t1 t2`, both children therefore have a qualified
+    /// `("t1", "k1")` entry — the left's is the true left binding; the
+    /// right's is a back-compat alias pointing at the *right* side's slot.
+    /// Unconditional insert would let the right's secondary registration
+    /// silently shadow the left's primary, so a downstream `t1.k1`
+    /// ColumnRef resolved to the right side's slot and unmatched-left rows
+    /// in a LEFT OUTER join surfaced as all-NULL on the left columns
+    /// (`join_range_direct_mapping` step 20).
     pub fn merge(&mut self, other: &ExprScope) {
         for ((qualifier, name), binding) in &other.qualified {
             self.qualified
-                .insert((qualifier.clone(), name.clone()), binding.clone());
+                .entry((qualifier.clone(), name.clone()))
+                .or_insert_with(|| binding.clone());
         }
         for (name, binding) in &other.unqualified {
-            // For unqualified: skip if already present to avoid ambiguity
             self.unqualified
                 .entry(name.clone())
                 .or_insert_with(|| binding.clone());
@@ -148,12 +168,15 @@ impl ExprScope {
         for (name, binding) in &other.ordered {
             self.ordered.push((name.clone(), binding.clone()));
         }
-        // G1 id index: copy other's id bindings. Same column id from both
-        // children would mean the column is the same physical entity (e.g.
-        // a USING-shared column or a colocate-passthrough), so overwriting
-        // is correct.
+        // G1 id index: same column id from both children would mean the
+        // column is the same physical entity (e.g. a USING-shared column
+        // or a colocate-passthrough), which is incompatible with self-join
+        // where left and right deliberately mint different ColumnIds. So
+        // also "left wins" here.
         for (column_id, binding) in &other.by_id {
-            self.by_id.insert(*column_id, binding.clone());
+            self.by_id
+                .entry(*column_id)
+                .or_insert_with(|| binding.clone());
         }
     }
 }

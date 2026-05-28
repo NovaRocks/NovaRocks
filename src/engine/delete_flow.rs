@@ -540,9 +540,15 @@ fn execute_starrocks_pk_delete(
         .read()
         .expect("standalone catalog read lock")
         .clone();
+    let connectors_snapshot = state
+        .connectors
+        .read()
+        .expect("standalone connector registry read lock")
+        .clone();
     let query_result = crate::engine::execute_query(
         query.as_ref(),
         &catalog_snapshot,
+        &connectors_snapshot,
         &target.namespace,
         state.exchange_port,
         None,

@@ -388,7 +388,9 @@ pub(crate) fn derive_statistics(
                 }
                 JoinKind::LeftSemi => (left_rows * DEFAULT_FILTER_SELECTIVITY).max(1.0),
                 JoinKind::RightSemi => (right_rows * DEFAULT_FILTER_SELECTIVITY).max(1.0),
-                JoinKind::LeftAnti => (left_rows * ANTI_JOIN_SELECTIVITY).max(1.0),
+                JoinKind::LeftAnti | JoinKind::NullAwareLeftAnti => {
+                    (left_rows * ANTI_JOIN_SELECTIVITY).max(1.0)
+                }
                 JoinKind::RightAnti => (right_rows * ANTI_JOIN_SELECTIVITY).max(1.0),
             };
 
@@ -441,7 +443,9 @@ pub(crate) fn derive_statistics(
                 }
                 JoinKind::LeftSemi => (left_rows * DEFAULT_FILTER_SELECTIVITY).max(1.0),
                 JoinKind::RightSemi => (right_rows * DEFAULT_FILTER_SELECTIVITY).max(1.0),
-                JoinKind::LeftAnti => (left_rows * ANTI_JOIN_SELECTIVITY).max(1.0),
+                JoinKind::LeftAnti | JoinKind::NullAwareLeftAnti => {
+                    (left_rows * ANTI_JOIN_SELECTIVITY).max(1.0)
+                }
                 JoinKind::RightAnti => (right_rows * ANTI_JOIN_SELECTIVITY).max(1.0),
             };
 
@@ -902,7 +906,9 @@ fn derive_join(
                 right_rows
             }
         }
-        JoinKind::LeftAnti => (left_rows * ANTI_JOIN_SELECTIVITY).max(1.0),
+        JoinKind::LeftAnti | JoinKind::NullAwareLeftAnti => {
+            (left_rows * ANTI_JOIN_SELECTIVITY).max(1.0)
+        }
         JoinKind::RightAnti => (right_rows * ANTI_JOIN_SELECTIVITY).max(1.0),
     };
 
@@ -961,7 +967,7 @@ fn widen_for_join_kind(
             out.extend(widen(right_cols));
             out
         }
-        LeftSemi | LeftAnti => left_cols,
+        LeftSemi | LeftAnti | NullAwareLeftAnti => left_cols,
         RightSemi | RightAnti => right_cols,
     }
 }

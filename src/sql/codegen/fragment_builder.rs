@@ -142,7 +142,12 @@ fn add_iceberg_equality_delete_required_columns(
 // ---------------------------------------------------------------------------
 
 pub(crate) struct PlanFragmentBuilder<'a> {
+    // Retained for Stage 5 cleanup that also drops `CatalogProvider::get_physical_layout`.
+    // Codegen no longer reads `self.catalog`; the field stays so the builder can keep
+    // its existing constructor shape during the transition.
+    #[allow(dead_code)]
     catalog: &'a dyn CatalogProvider,
+    connectors: &'a crate::connector::ConnectorRegistry,
     desc_builder: DescriptorTableBuilder,
     scan_tables: Vec<nodes::PlannedScanTable>,
     next_node_id: i32,
@@ -195,10 +200,12 @@ impl<'a> PlanFragmentBuilder<'a> {
     pub(crate) fn build(
         plan: &PhysicalPlanNode,
         catalog: &'a dyn CatalogProvider,
+        connectors: &'a crate::connector::ConnectorRegistry,
         _current_database: &str,
     ) -> Result<MultiFragmentBuildResult, String> {
         let mut builder = PlanFragmentBuilder {
             catalog,
+            connectors,
             desc_builder: DescriptorTableBuilder::new(),
             scan_tables: Vec::new(),
             next_node_id: 1,
@@ -479,17 +486,59 @@ impl<'a> PlanFragmentBuilder<'a> {
             add_iceberg_equality_delete_required_columns(required, &op.table)?;
         }
 
-        let physical_layout = self
-            .catalog
-            .get_physical_layout(&op.database, &op.table.name)?;
-        let scan_table_id = physical_layout
-            .as_ref()
-            .map(|layout| layout.table_id)
-            .or_else(|| {
-                iceberg_table_info(&op.table.source)
-                    .is_some()
-                    .then_some(synthetic_iceberg_table_id(scan_node_id))
-            });
+        let planned_scan = match &op.table.source {
+            crate::sql::catalog::ScanSource::StarRocks { db_id, table_id } => {
+                let planner = self.connectors.scan_planner("starrocks")?;
+                let table_handle =
+                    crate::connector::starrocks::table::StarRocksTableScanPlanner::table_handle_from_source(
+                        &op.database,
+                        &op.table.name,
+                        *db_id,
+                        *table_id,
+                    );
+                let scan = planner.begin_scan(
+                    table_handle,
+                    crate::connector::scan_planning::BeginScanContext::default(),
+                )?;
+                let splits = planner.plan_splits(
+                    &scan,
+                    crate::connector::scan_planning::SplitPlanningContext::default(),
+                )?;
+                Some(crate::sql::codegen::resolve::PlannedConnectorScan { scan, splits })
+            }
+            crate::sql::catalog::ScanSource::IcebergDataFiles {
+                table: iceberg_table,
+                files,
+                ..
+            } => {
+                let planner = self.connectors.scan_planner("iceberg")?;
+                let table_handle =
+                    crate::connector::iceberg::IcebergConnectorScanPlanner::table_handle_from_source(
+                        &iceberg_table.catalog,
+                        &iceberg_table.namespace,
+                        &iceberg_table.table,
+                        iceberg_table.current_snapshot_id,
+                        iceberg_table.clone(),
+                        files.clone(),
+                    );
+                let scan = planner.begin_scan(
+                    table_handle,
+                    crate::connector::scan_planning::BeginScanContext::default(),
+                )?;
+                let splits = planner.plan_splits(
+                    &scan,
+                    crate::connector::scan_planning::SplitPlanningContext::default(),
+                )?;
+                Some(crate::sql::codegen::resolve::PlannedConnectorScan { scan, splits })
+            }
+            _ => None,
+        };
+        let scan_table_id = match &op.table.source {
+            crate::sql::catalog::ScanSource::StarRocks { table_id, .. } => Some(*table_id),
+            _ => iceberg_table_info(&op.table.source)
+                .is_some()
+                .then_some(synthetic_iceberg_table_id(scan_node_id)),
+        };
         if let Some(table_id) = scan_table_id {
             self.desc_builder
                 .add_table_for_scan(table_id, &op.database, &op.table);
@@ -723,7 +772,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         let resolved = ResolvedTable {
             database: op.database.clone(),
             table: op.table.clone(),
-            physical_layout,
+            planned_scan,
             alias: op.alias.clone(),
         };
         self.desc_builder.add_tuple(scan_tuple_id, scan_table_id);
@@ -3283,10 +3332,21 @@ impl<'a> PlanFragmentBuilder<'a> {
                     }
                 }
                 if partition_exprs.is_empty() {
-                    return Err(format!(
-                        "no hash partition columns resolved in child scope from {:?}",
-                        cols
-                    ));
+                    // A `HashPartitioned` requirement whose cols are all
+                    // invisible to the immediate child indicates the
+                    // optimizer asked one side of a join to be partitioned
+                    // by the OTHER side's key — most commonly with a
+                    // chained `FULL OUTER JOIN … USING(k)` whose final
+                    // INNER-join key is `coalesce(coalesce(…), tN.id)`
+                    // (last term resolved against the build side). The
+                    // selected physical plan is a BROADCAST join, so the
+                    // hash partitioning was never going to be used at
+                    // runtime; emitting it as an error blocks an otherwise
+                    // valid plan. Treat it as the no-op UNPARTITIONED
+                    // distribution: the child fragment streams as one
+                    // partition, and the broadcast exchange downstream
+                    // still produces correct output.
+                    return Ok(unpartitioned_stream_partition());
                 }
                 Ok(partitions::TDataPartition::new(
                     partitions::TPartitionType::HASH_PARTITIONED,
@@ -3985,6 +4045,191 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct MockScanPlanner {
+        schema_id: i64,
+        splits: Vec<crate::connector::starrocks::table::StarRocksSplit>,
+    }
+
+    impl crate::connector::scan_planning::ConnectorScanPlanner for MockScanPlanner {
+        fn name(&self) -> &'static str {
+            "starrocks"
+        }
+
+        fn begin_scan(
+            &self,
+            table: crate::connector::scan_planning::TableHandle,
+            _ctx: crate::connector::scan_planning::BeginScanContext,
+        ) -> Result<crate::connector::scan_planning::ScanHandle, String> {
+            let inner = table
+                .downcast_ref::<crate::connector::starrocks::table::StarRocksTableHandle>()
+                .ok_or_else(|| "MockScanPlanner expected StarRocksTableHandle".to_string())?
+                .clone();
+            Ok(crate::connector::scan_planning::ScanHandle::new(
+                "starrocks",
+                crate::connector::starrocks::table::StarRocksScanHandle {
+                    table: inner,
+                    schema_id: self.schema_id,
+                },
+            ))
+        }
+
+        fn plan_splits(
+            &self,
+            _scan: &crate::connector::scan_planning::ScanHandle,
+            _ctx: crate::connector::scan_planning::SplitPlanningContext,
+        ) -> Result<Vec<crate::connector::scan_planning::Split>, String> {
+            Ok(self
+                .splits
+                .iter()
+                .map(|split| {
+                    crate::connector::scan_planning::Split::new("starrocks", split.clone())
+                })
+                .collect())
+        }
+
+        fn to_thrift_scan(
+            &self,
+            _scan: &crate::connector::scan_planning::ScanHandle,
+            _splits: &[crate::connector::scan_planning::Split],
+            _ctx: crate::connector::scan_planning::ThriftScanContext,
+        ) -> Result<crate::connector::scan_planning::ThriftScanPlan, String> {
+            Err("MockScanPlanner::to_thrift_scan is not exercised by tests".to_string())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct ScanPlannerCallCounts {
+        begin_scan: std::sync::atomic::AtomicUsize,
+        plan_splits: std::sync::atomic::AtomicUsize,
+    }
+
+    #[derive(Debug)]
+    struct CountingScanPlanner {
+        inner: MockScanPlanner,
+        counts: std::sync::Arc<ScanPlannerCallCounts>,
+    }
+
+    impl crate::connector::scan_planning::ConnectorScanPlanner for CountingScanPlanner {
+        fn name(&self) -> &'static str {
+            self.inner.name()
+        }
+
+        fn begin_scan(
+            &self,
+            table: crate::connector::scan_planning::TableHandle,
+            ctx: crate::connector::scan_planning::BeginScanContext,
+        ) -> Result<crate::connector::scan_planning::ScanHandle, String> {
+            self.counts
+                .begin_scan
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.begin_scan(table, ctx)
+        }
+
+        fn plan_splits(
+            &self,
+            scan: &crate::connector::scan_planning::ScanHandle,
+            ctx: crate::connector::scan_planning::SplitPlanningContext,
+        ) -> Result<Vec<crate::connector::scan_planning::Split>, String> {
+            self.counts
+                .plan_splits
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.plan_splits(scan, ctx)
+        }
+
+        fn to_thrift_scan(
+            &self,
+            scan: &crate::connector::scan_planning::ScanHandle,
+            splits: &[crate::connector::scan_planning::Split],
+            ctx: crate::connector::scan_planning::ThriftScanContext,
+        ) -> Result<crate::connector::scan_planning::ThriftScanPlan, String> {
+            self.inner.to_thrift_scan(scan, splits, ctx)
+        }
+    }
+
+    #[derive(Debug)]
+    struct CountingIcebergScanPlanner {
+        inner: crate::connector::iceberg::IcebergConnectorScanPlanner,
+        counts: std::sync::Arc<ScanPlannerCallCounts>,
+    }
+
+    impl crate::connector::scan_planning::ConnectorScanPlanner for CountingIcebergScanPlanner {
+        fn name(&self) -> &'static str {
+            crate::connector::scan_planning::ConnectorScanPlanner::name(&self.inner)
+        }
+
+        fn begin_scan(
+            &self,
+            table: crate::connector::scan_planning::TableHandle,
+            ctx: crate::connector::scan_planning::BeginScanContext,
+        ) -> Result<crate::connector::scan_planning::ScanHandle, String> {
+            self.counts
+                .begin_scan
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.begin_scan(table, ctx)
+        }
+
+        fn plan_splits(
+            &self,
+            scan: &crate::connector::scan_planning::ScanHandle,
+            ctx: crate::connector::scan_planning::SplitPlanningContext,
+        ) -> Result<Vec<crate::connector::scan_planning::Split>, String> {
+            self.counts
+                .plan_splits
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.plan_splits(scan, ctx)
+        }
+
+        fn to_thrift_scan(
+            &self,
+            scan: &crate::connector::scan_planning::ScanHandle,
+            splits: &[crate::connector::scan_planning::Split],
+            ctx: crate::connector::scan_planning::ThriftScanContext,
+        ) -> Result<crate::connector::scan_planning::ThriftScanPlan, String> {
+            self.inner.to_thrift_scan(scan, splits, ctx)
+        }
+    }
+
+    fn mock_starrocks_registry(
+        layout: &crate::sql::catalog::PhysicalTableLayout,
+    ) -> crate::connector::ConnectorRegistry {
+        use crate::connector::starrocks::table::StarRocksSplit;
+        let splits = layout
+            .tablets
+            .iter()
+            .map(|tablet| StarRocksSplit {
+                tablet_id: tablet.tablet_id,
+                partition_id: tablet.partition_id,
+                version: tablet.version,
+            })
+            .collect();
+        let planner = std::sync::Arc::new(MockScanPlanner {
+            schema_id: layout.schema_id,
+            splits,
+        });
+        let mut registry = crate::connector::ConnectorRegistry::new();
+        registry.register_scan_planner(planner);
+        registry
+    }
+
+    fn mock_iceberg_registry() -> crate::connector::ConnectorRegistry {
+        let mut registry = crate::connector::ConnectorRegistry::new();
+        registry.register_scan_planner(std::sync::Arc::new(
+            crate::connector::iceberg::IcebergConnectorScanPlanner::new(),
+        ));
+        registry
+    }
+
+    fn mock_starrocks_and_iceberg_registry(
+        layout: &crate::sql::catalog::PhysicalTableLayout,
+    ) -> crate::connector::ConnectorRegistry {
+        let mut registry = mock_starrocks_registry(layout);
+        registry.register_scan_planner(std::sync::Arc::new(
+            crate::connector::iceberg::IcebergConnectorScanPlanner::new(),
+        ));
+        registry
+    }
+
     fn output_columns() -> Vec<OutputColumn> {
         vec![OutputColumn {
             column_id: crate::sql::column_id::ColumnId::UNSET,
@@ -4292,8 +4537,8 @@ mod tests {
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
                     source: ScanSource::StarRocks {
-                        db_id: 0,
-                        table_id: 0,
+                        db_id: 11,
+                        table_id: 22,
                     },
                 },
                 alias: None,
@@ -4484,7 +4729,9 @@ mod tests {
     fn iceberg_scan_predicates_feed_min_max_and_file_stats_pruning() {
         let plan = iceberg_scan_plan_with_file_stats();
 
-        let build = PlanFragmentBuilder::build(&plan, &DummyCatalog, "default").expect("build");
+        let build =
+            PlanFragmentBuilder::build(&plan, &DummyCatalog, &mock_iceberg_registry(), "default")
+                .expect("build");
         let root = build
             .fragment_results
             .iter()
@@ -4527,7 +4774,9 @@ mod tests {
     fn iceberg_identity_partition_values_prune_scan_ranges() {
         let plan = iceberg_scan_plan_with_partition_values();
 
-        let build = PlanFragmentBuilder::build(&plan, &DummyCatalog, "default").expect("build");
+        let build =
+            PlanFragmentBuilder::build(&plan, &DummyCatalog, &mock_iceberg_registry(), "default")
+                .expect("build");
         let root = build
             .fragment_results
             .iter()
@@ -4562,7 +4811,9 @@ mod tests {
     fn iceberg_large_plain_files_are_split_into_parallel_scan_ranges() {
         let plan = iceberg_scan_plan_with_large_file(300 * 1024 * 1024);
 
-        let build = PlanFragmentBuilder::build(&plan, &DummyCatalog, "default").expect("build");
+        let build =
+            PlanFragmentBuilder::build(&plan, &DummyCatalog, &mock_iceberg_registry(), "default")
+                .expect("build");
         let root = build
             .fragment_results
             .iter()
@@ -4597,7 +4848,12 @@ mod tests {
     fn iceberg_delete_apply_cost_rejects_too_many_delete_files() {
         let plan = iceberg_scan_plan_with_many_delete_files(1025);
 
-        let err = match PlanFragmentBuilder::build(&plan, &DummyCatalog, "default") {
+        let err = match PlanFragmentBuilder::build(
+            &plan,
+            &DummyCatalog,
+            &mock_iceberg_registry(),
+            "default",
+        ) {
             Ok(_) => panic!("delete-heavy scan should fail fast"),
             Err(err) => err,
         };
@@ -4666,7 +4922,9 @@ mod tests {
             output_columns: output_columns(),
         };
 
-        let build = PlanFragmentBuilder::build(&plan, &DummyCatalog, "default").expect("build");
+        let build =
+            PlanFragmentBuilder::build(&plan, &DummyCatalog, &mock_iceberg_registry(), "default")
+                .expect("build");
 
         assert_eq!(build.fragment_results.len(), 2);
         assert_eq!(build.edges.len(), 1);
@@ -4721,7 +4979,9 @@ mod tests {
             output_columns: output_columns(),
         };
 
-        let build = PlanFragmentBuilder::build(&plan, &DummyCatalog, "default").expect("build");
+        let build =
+            PlanFragmentBuilder::build(&plan, &DummyCatalog, &mock_iceberg_registry(), "default")
+                .expect("build");
         assert_eq!(build.fragment_results.len(), 3);
         assert_eq!(build.edges.len(), 2);
 
@@ -4759,7 +5019,9 @@ mod tests {
             output_columns: output_columns(),
         };
 
-        let build = PlanFragmentBuilder::build(&plan, &DummyCatalog, "default").expect("build");
+        let build =
+            PlanFragmentBuilder::build(&plan, &DummyCatalog, &mock_iceberg_registry(), "default")
+                .expect("build");
         let edge = build.edges.first().expect("stream edge");
         assert_eq!(
             edge.output_partition.type_,
@@ -4786,7 +5048,8 @@ mod tests {
             output_columns: output_columns(),
         };
 
-        let result = PlanFragmentBuilder::build(&plan, &DummyCatalog, "default");
+        let result =
+            PlanFragmentBuilder::build(&plan, &DummyCatalog, &mock_iceberg_registry(), "default");
         let err = result.err().expect("distribution any must fail");
         assert!(err.contains("PhysicalDistribution(Any)"));
     }
@@ -4803,7 +5066,9 @@ mod tests {
             output_columns: output_columns(),
         };
 
-        let build = PlanFragmentBuilder::build(&plan, &DummyCatalog, "default").expect("build");
+        let build =
+            PlanFragmentBuilder::build(&plan, &DummyCatalog, &mock_iceberg_registry(), "default")
+                .expect("build");
         assert_eq!(build.fragment_results.len(), 1);
         assert!(build.edges.is_empty());
     }
@@ -4831,7 +5096,13 @@ mod tests {
             }],
         };
 
-        let build = PlanFragmentBuilder::build(&plan, &DummyCatalog, "default").expect("build");
+        let build = PlanFragmentBuilder::build(
+            &plan,
+            &DummyCatalog,
+            &crate::connector::ConnectorRegistry::new(),
+            "default",
+        )
+        .expect("build");
         let root = build.fragment_results.first().expect("root fragment");
         assert!(root.exec_params.per_node_scan_ranges.is_empty());
         assert!(
@@ -4895,9 +5166,11 @@ mod tests {
             }],
         };
         let plan = starrocks_scan_plan();
+        let registry = mock_starrocks_registry(&layout);
         let catalog = StarRocksCatalog { layout };
 
-        let build = PlanFragmentBuilder::build(&plan, &catalog, "default").expect("build");
+        let build =
+            PlanFragmentBuilder::build(&plan, &catalog, &registry, "default").expect("build");
         assert_eq!(build.fragment_results.len(), 1);
         let root = build.fragment_results.first().expect("root fragment");
         let scan_node = root
@@ -4955,8 +5228,13 @@ mod tests {
 
     #[test]
     fn iceberg_scan_without_starrocks_layout_uses_synthetic_descriptor_table_id() {
-        let build = PlanFragmentBuilder::build(&iceberg_scan_plan(), &DummyCatalog, "default")
-            .expect("build");
+        let build = PlanFragmentBuilder::build(
+            &iceberg_scan_plan(),
+            &DummyCatalog,
+            &mock_iceberg_registry(),
+            "default",
+        )
+        .expect("build");
         assert_eq!(build.fragment_results.len(), 1);
         let root = build.fragment_results.first().expect("root fragment");
         let scan_node = root
@@ -5000,22 +5278,26 @@ mod tests {
 
     #[test]
     fn mixed_starrocks_and_iceberg_scan_table_ids_do_not_collide() {
-        let catalog = MixedCatalog {
-            starrocks_layout: PhysicalTableLayout {
-                db_id: 11,
-                table_id: 1,
-                schema_id: 33,
-                tablets: vec![StarRocksTabletRef {
-                    tablet_id: 101,
-                    partition_id: 201,
-                    version: 7,
-                }],
-            },
+        let starrocks_layout = PhysicalTableLayout {
+            db_id: 11,
+            table_id: 22,
+            schema_id: 33,
+            tablets: vec![StarRocksTabletRef {
+                tablet_id: 101,
+                partition_id: 201,
+                version: 7,
+            }],
         };
+        let registry = mock_starrocks_and_iceberg_registry(&starrocks_layout);
+        let catalog = MixedCatalog { starrocks_layout };
 
-        let build =
-            PlanFragmentBuilder::build(&mixed_starrocks_iceberg_join_plan(), &catalog, "default")
-                .expect("build");
+        let build = PlanFragmentBuilder::build(
+            &mixed_starrocks_iceberg_join_plan(),
+            &catalog,
+            &registry,
+            "default",
+        )
+        .expect("build");
         let root = build.fragment_results.first().expect("root fragment");
         let tuple_descs = &root.desc_tbl.tuple_descriptors;
         let iceberg_table_id = tuple_descs
@@ -5029,7 +5311,7 @@ mod tests {
             .and_then(|tuple| tuple.table_id)
             .expect("StarRocks tuple table id");
         assert_ne!(iceberg_table_id, starrocks_table_id);
-        assert_eq!(starrocks_table_id, 1);
+        assert_eq!(starrocks_table_id, 22);
 
         let table_descs = root
             .desc_tbl
@@ -5196,8 +5478,8 @@ mod tests {
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
                     source: ScanSource::StarRocks {
-                        db_id: 0,
-                        table_id: 0,
+                        db_id: 11,
+                        table_id: 22,
                     },
                 },
                 alias: None,
@@ -5248,8 +5530,10 @@ mod tests {
             }],
         };
 
+        let registry = mock_starrocks_registry(&layout);
         let catalog = StarRocksCatalog { layout };
-        let build = PlanFragmentBuilder::build(&decode_plan, &catalog, "default").expect("build");
+        let build = PlanFragmentBuilder::build(&decode_plan, &catalog, &registry, "default")
+            .expect("build");
 
         let root = build
             .fragment_results
@@ -5338,8 +5622,8 @@ mod tests {
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
                     source: ScanSource::StarRocks {
-                        db_id: 0,
-                        table_id: 0,
+                        db_id: 11,
+                        table_id: 22,
                     },
                 },
                 alias: None,
@@ -5390,8 +5674,10 @@ mod tests {
             ],
         };
 
+        let registry = mock_starrocks_registry(&layout);
         let catalog = StarRocksCatalog { layout };
-        let build = PlanFragmentBuilder::build(&plan, &catalog, "default").expect("build");
+        let build =
+            PlanFragmentBuilder::build(&plan, &catalog, &registry, "default").expect("build");
 
         let root = build
             .fragment_results
@@ -5562,8 +5848,8 @@ mod tests {
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
                     source: ScanSource::StarRocks {
-                        db_id: 0,
-                        table_id: 0,
+                        db_id: 11,
+                        table_id: 22,
                     },
                 },
                 alias: None,
@@ -5591,8 +5877,10 @@ mod tests {
             }],
         };
 
+        let registry = mock_starrocks_registry(&layout);
         let catalog = StarRocksCatalog { layout };
-        let build = PlanFragmentBuilder::build(&plan, &catalog, "default").expect("build");
+        let build =
+            PlanFragmentBuilder::build(&plan, &catalog, &registry, "default").expect("build");
         let root = build
             .fragment_results
             .iter()
@@ -5747,7 +6035,12 @@ mod tests {
             }
         }
         let catalog = IcebergCatalog;
-        let err = match PlanFragmentBuilder::build(&plan, &catalog, "default") {
+        let err = match PlanFragmentBuilder::build(
+            &plan,
+            &catalog,
+            &mock_iceberg_registry(),
+            "default",
+        ) {
             Ok(_) => panic!("non-StarRocks scan with dict_columns must error"),
             Err(e) => e,
         };
@@ -5755,6 +6048,114 @@ mod tests {
             err.contains("is not a StarRocks lake scan"),
             "error must explain why dict_columns is rejected, got: {}",
             err,
+        );
+    }
+
+    #[test]
+    fn starrocks_fragment_exec_params_are_generated_from_planned_connector_scan() {
+        let layout = starrocks_layout();
+        let plan = starrocks_scan_plan();
+        let registry = mock_starrocks_registry(&layout);
+        let catalog = StarRocksCatalog { layout };
+
+        let build = PlanFragmentBuilder::build(&plan, &catalog, &registry, "default")
+            .expect("build StarRocks fragment");
+        let root = build
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == build.root_fragment_id)
+            .expect("root fragment");
+        let exec_params = &root.exec_params;
+        let per_node = &exec_params.per_node_scan_ranges;
+        let ranges = per_node
+            .values()
+            .next()
+            .expect("one scan node should have ranges");
+
+        assert_eq!(ranges.len(), 1);
+        let tablet_ids = ranges
+            .iter()
+            .map(|range| {
+                range
+                    .scan_range
+                    .internal_scan_range
+                    .as_ref()
+                    .map(|internal| internal.tablet_id)
+                    .expect("internal scan range")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tablet_ids, vec![101]);
+    }
+
+    #[test]
+    fn visit_scan_calls_connector_begin_scan_and_plan_splits_for_starrocks() {
+        use crate::connector::starrocks::table::StarRocksSplit;
+        let layout = starrocks_layout();
+        let plan = starrocks_scan_plan();
+        let catalog = StarRocksCatalog {
+            layout: layout.clone(),
+        };
+
+        let splits: Vec<StarRocksSplit> = layout
+            .tablets
+            .iter()
+            .map(|tablet| StarRocksSplit {
+                tablet_id: tablet.tablet_id,
+                partition_id: tablet.partition_id,
+                version: tablet.version,
+            })
+            .collect();
+        let counts = std::sync::Arc::new(ScanPlannerCallCounts::default());
+        let planner = std::sync::Arc::new(CountingScanPlanner {
+            inner: MockScanPlanner {
+                schema_id: layout.schema_id,
+                splits,
+            },
+            counts: counts.clone(),
+        });
+        let mut registry = crate::connector::ConnectorRegistry::new();
+        registry.register_scan_planner(planner);
+
+        let _ = PlanFragmentBuilder::build(&plan, &catalog, &registry, "default")
+            .expect("build StarRocks fragment");
+
+        assert_eq!(
+            counts.begin_scan.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "begin_scan must be invoked exactly once for the StarRocks scan"
+        );
+        assert_eq!(
+            counts.plan_splits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "plan_splits must be invoked exactly once for the StarRocks scan"
+        );
+    }
+
+    #[test]
+    fn visit_scan_calls_connector_begin_scan_and_plan_splits_for_iceberg() {
+        let plan = iceberg_scan_plan();
+        let catalog = DummyCatalog;
+
+        let counts = std::sync::Arc::new(ScanPlannerCallCounts::default());
+        let planner = std::sync::Arc::new(CountingIcebergScanPlanner {
+            inner: crate::connector::iceberg::IcebergConnectorScanPlanner::new(),
+            counts: counts.clone(),
+        });
+        let mut registry = crate::connector::ConnectorRegistry::new();
+        registry.register_scan_planner(planner);
+
+        let _ = PlanFragmentBuilder::build(&plan, &catalog, &registry, "default")
+            .expect("build Iceberg fragment");
+
+        assert_eq!(
+            counts.begin_scan.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "begin_scan must be invoked exactly once for the Iceberg scan"
+        );
+        assert_eq!(
+            counts.plan_splits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "plan_splits must be invoked exactly once for the Iceberg scan"
         );
     }
 }

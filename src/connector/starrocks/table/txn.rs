@@ -1363,9 +1363,15 @@ fn insert_from_query_into_starrocks_table(
     // target namespace established by `resolve_starrocks_name`.
     let query_result = {
         let catalog = state.catalog.read().expect("standalone catalog read lock");
+        let connectors_snapshot = state
+            .connectors
+            .read()
+            .expect("standalone connector registry read lock")
+            .clone();
         execute_query(
             query,
             &catalog,
+            &connectors_snapshot,
             &resolved.database,
             state.exchange_port,
             None,

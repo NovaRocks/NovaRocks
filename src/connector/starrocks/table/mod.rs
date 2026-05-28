@@ -23,6 +23,7 @@ pub(crate) mod mv_refresh;
 pub(crate) mod mv_refresh_strategy;
 pub(crate) mod mv_shape;
 pub(crate) mod refresh_pin;
+pub(crate) mod scan_planner;
 pub(crate) mod state_codec;
 pub(crate) mod txn;
 
@@ -33,3 +34,6 @@ pub(crate) use catalog::{
     StarRocksTableCatalog, register_starrocks_tables_in_catalog, runtime_registered,
 };
 pub(crate) use config::StarRocksTableConfig;
+pub(crate) use scan_planner::{
+    StarRocksScanHandle, StarRocksSplit, StarRocksTableHandle, StarRocksTableScanPlanner,
+};

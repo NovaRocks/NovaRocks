@@ -788,9 +788,16 @@ impl StandaloneSession {
                     .catalog
                     .read()
                     .expect("standalone catalog read lock");
+                let connectors_snapshot = self
+                    .inner
+                    .connectors
+                    .read()
+                    .expect("standalone connector registry read lock")
+                    .clone();
                 let result = explain_analyze_query(
                     &prepared,
                     &catalog,
+                    &connectors_snapshot,
                     current_database,
                     self.inner.exchange_port,
                     None,
@@ -874,10 +881,17 @@ impl StandaloneSession {
                         .read()
                         .expect("standalone catalog read lock")
                         .clone();
+                    let connectors_snapshot = self
+                        .inner
+                        .connectors
+                        .read()
+                        .expect("standalone connector registry read lock")
+                        .clone();
                     self::statistics::observe_query(&self.inner, &rewritten, current_database)?;
                     let result = execute_query(
                         &rewritten,
                         &catalog_snapshot,
+                        &connectors_snapshot,
                         current_database,
                         self.inner.exchange_port,
                         query_opts.clone(),
@@ -924,10 +938,17 @@ impl StandaloneSession {
                         .read()
                         .expect("standalone catalog read lock")
                         .clone();
+                    let connectors_snapshot = self
+                        .inner
+                        .connectors
+                        .read()
+                        .expect("standalone connector registry read lock")
+                        .clone();
                     self::statistics::observe_query(&self.inner, &rewritten, current_database)?;
                     let result = execute_query(
                         &rewritten,
                         &catalog_snapshot,
+                        &connectors_snapshot,
                         current_database,
                         self.inner.exchange_port,
                         query_opts.clone(),
@@ -944,10 +965,17 @@ impl StandaloneSession {
                     .read()
                     .expect("standalone catalog read lock")
                     .clone();
+                let connectors_snapshot = self
+                    .inner
+                    .connectors
+                    .read()
+                    .expect("standalone connector registry read lock")
+                    .clone();
                 self::statistics::observe_query(&self.inner, query, current_database)?;
                 let result = execute_query(
                     query,
                     &catalog_snapshot,
+                    &connectors_snapshot,
                     current_database,
                     self.inner.exchange_port,
                     query_opts.clone(),
@@ -2553,6 +2581,7 @@ fn prepare_explain_query(
 fn explain_analyze_query(
     query: &sqlparser::ast::Query,
     catalog: &InMemoryCatalog,
+    connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     exchange_port: u16,
     query_opts: Option<crate::internal_service::TQueryOptions>,
@@ -2574,7 +2603,14 @@ fn explain_analyze_query(
     let planning_ms = t_plan.elapsed().as_millis() as u64;
 
     let t_exec = Instant::now();
-    let executed = execute_query(query, catalog, current_database, exchange_port, query_opts)?;
+    let executed = execute_query(
+        query,
+        catalog,
+        connectors,
+        current_database,
+        exchange_port,
+        query_opts,
+    )?;
     let rows: u64 = executed.chunks.iter().map(|c| c.len() as u64).sum();
     let execution_ms = t_exec.elapsed().as_millis() as u64;
 
@@ -2620,6 +2656,7 @@ fn explain_query(
 pub(crate) fn execute_query(
     query: &sqlparser::ast::Query,
     catalog: &InMemoryCatalog,
+    connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     exchange_port: u16,
     query_opts: Option<crate::internal_service::TQueryOptions>,
@@ -2627,6 +2664,7 @@ pub(crate) fn execute_query(
     execute_query_with_options(
         query,
         catalog,
+        connectors,
         current_database,
         exchange_port,
         query_opts,
@@ -2647,6 +2685,7 @@ pub(crate) fn execute_query(
 pub(crate) fn execute_query_with_options(
     query: &sqlparser::ast::Query,
     catalog: &InMemoryCatalog,
+    connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     exchange_port: u16,
     query_opts: Option<crate::internal_service::TQueryOptions>,
@@ -2672,6 +2711,7 @@ pub(crate) fn execute_query_with_options(
     let build_result = crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
         &physical,
         catalog,
+        connectors,
         current_database,
     )?;
 
@@ -4220,8 +4260,10 @@ enable_path_style_access = true
             }],
         };
         catalog
-            .register_starrocks_table("default", table, layout)
+            .register_starrocks_table("default", table, layout.clone())
             .expect("register StarRocks tbl");
+
+        let registry = mock_starrocks_registry_for_engine_test(&layout);
 
         let normalized = normalize_for_raw_parse(sql).expect("normalize sql");
         let mut parser = sqlparser::parser::Parser::new(&StarRocksDialect)
@@ -4240,9 +4282,96 @@ enable_path_style_access = true
         let physical = crate::sql::optimizer::optimize(logical, &table_stats, factory, None)
             .expect("optimize");
         crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
-            &physical, &catalog, "default",
+            &physical, &catalog, &registry, "default",
         )
         .expect("build fragments")
+    }
+
+    /// Build a `ConnectorRegistry` with a mock StarRocks scan planner that
+    /// returns the schema_id and tablet splits from the given layout. Used by
+    /// engine-level tests that call `PlanFragmentBuilder::build` with a
+    /// StarRocks table but do not have a full `StandaloneState` available.
+    fn mock_starrocks_registry_for_engine_test(
+        layout: &crate::sql::catalog::PhysicalTableLayout,
+    ) -> crate::connector::ConnectorRegistry {
+        use crate::connector::scan_planning::{
+            BeginScanContext, ConnectorScanPlanner, SplitPlanningContext, ThriftScanContext,
+            ThriftScanPlan,
+        };
+        use crate::connector::starrocks::table::{
+            StarRocksScanHandle, StarRocksSplit, StarRocksTableHandle,
+        };
+
+        #[derive(Debug)]
+        struct MockPlanner {
+            schema_id: i64,
+            splits: Vec<StarRocksSplit>,
+        }
+
+        impl ConnectorScanPlanner for MockPlanner {
+            fn name(&self) -> &'static str {
+                "starrocks"
+            }
+
+            fn begin_scan(
+                &self,
+                table: crate::connector::scan_planning::TableHandle,
+                _ctx: BeginScanContext,
+            ) -> Result<crate::connector::scan_planning::ScanHandle, String> {
+                let inner = table
+                    .downcast_ref::<StarRocksTableHandle>()
+                    .ok_or_else(|| "MockPlanner expected StarRocksTableHandle".to_string())?
+                    .clone();
+                Ok(crate::connector::scan_planning::ScanHandle::new(
+                    "starrocks",
+                    StarRocksScanHandle {
+                        table: inner,
+                        schema_id: self.schema_id,
+                    },
+                ))
+            }
+
+            fn plan_splits(
+                &self,
+                _scan: &crate::connector::scan_planning::ScanHandle,
+                _ctx: SplitPlanningContext,
+            ) -> Result<Vec<crate::connector::scan_planning::Split>, String> {
+                Ok(self
+                    .splits
+                    .iter()
+                    .map(|s| crate::connector::scan_planning::Split::new("starrocks", s.clone()))
+                    .collect())
+            }
+
+            fn to_thrift_scan(
+                &self,
+                _scan: &crate::connector::scan_planning::ScanHandle,
+                _splits: &[crate::connector::scan_planning::Split],
+                _ctx: ThriftScanContext,
+            ) -> Result<ThriftScanPlan, String> {
+                Err("MockPlanner::to_thrift_scan not used in engine tests".to_string())
+            }
+        }
+
+        let splits = layout
+            .tablets
+            .iter()
+            .map(|t| StarRocksSplit {
+                tablet_id: t.tablet_id,
+                partition_id: t.partition_id,
+                version: t.version,
+            })
+            .collect();
+        let planner = std::sync::Arc::new(MockPlanner {
+            schema_id: layout.schema_id,
+            splits,
+        });
+        let mut registry = crate::connector::ConnectorRegistry::new();
+        registry.register_scan_planner(planner);
+        registry.register_scan_planner(std::sync::Arc::new(
+            crate::connector::iceberg::IcebergConnectorScanPlanner::new(),
+        ));
+        registry
     }
 
     #[test]

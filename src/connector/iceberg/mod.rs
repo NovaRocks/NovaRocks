@@ -29,6 +29,7 @@ pub mod position_delete;
 pub(crate) mod read;
 pub(crate) mod row_lineage_synth;
 pub mod scan_deletes;
+pub(crate) mod scan_planner;
 pub mod schema;
 pub mod sink;
 mod state;
@@ -40,6 +41,9 @@ pub(crate) mod variant_write;
 pub use metadata::{
     IcebergMetadataOutputColumn, IcebergMetadataScanConfig, IcebergMetadataScanOp,
     IcebergMetadataScanRange, IcebergMetadataTableType,
+};
+pub(crate) use scan_planner::{
+    IcebergConnectorScanPlanner, IcebergScanHandle, IcebergSplit, IcebergTableHandle,
 };
 pub use schema::{
     IcebergArrowColumn, apply_field_id_recursive, build_full_output_schema,

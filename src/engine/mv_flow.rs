@@ -764,9 +764,15 @@ pub(crate) fn execute_query_for_mv_refresh(
         .read()
         .expect("standalone catalog read lock")
         .clone();
+    let connectors_snapshot = state
+        .connectors
+        .read()
+        .expect("standalone connector registry read lock")
+        .clone();
     execute_query(
         &executable,
         &catalog_snapshot,
+        &connectors_snapshot,
         current_database,
         state.exchange_port,
         None,

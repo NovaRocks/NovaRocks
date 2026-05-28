@@ -1049,8 +1049,16 @@ impl<'a> super::AnalyzerContext<'a> {
                 }
             }
             sqlast::Value::SingleQuotedString(s) | sqlast::Value::DoubleQuotedString(s) => {
+                // sqlparser already applied MySQL-style backslash escapes when
+                // tokenising the literal (our dialect enables
+                // `supports_string_literal_backslash_escape`). Don't unescape
+                // again — that double-processed `'e\\f'` from 3 bytes (`e\f`)
+                // down to 2 (`ef`) and is the cause of `join_large_in_predicate`
+                // step 59 silently dropping the backslash row from the IN
+                // result. INSERT VALUES already trusts sqlparser's output
+                // (`sql_expr.rs` clones the string as-is); SELECT now matches.
                 Ok(TypedExpr {
-                    kind: ExprKind::Literal(LiteralValue::String(unescape_sql_string(s))),
+                    kind: ExprKind::Literal(LiteralValue::String(s.clone())),
                     data_type: DataType::Utf8,
                     nullable: false,
                 })
@@ -1698,6 +1706,8 @@ impl<'a> super::AnalyzerContext<'a> {
             self.analyze_array_sortby_lambda_arguments(&effective_arg_exprs, scope)?
         } else if is_higher_order_function_with_lambda(&name, &effective_arg_exprs) {
             self.analyze_higher_order_lambda_arguments(&name, &effective_arg_exprs, scope)?
+        } else if is_map_higher_order_function_with_lambda(&name, &effective_arg_exprs) {
+            self.analyze_map_higher_order_lambda_arguments(&name, &effective_arg_exprs, scope)?
         } else {
             let mut args_typed = Vec::with_capacity(effective_arg_exprs.len());
             let mut arg_types = Vec::with_capacity(effective_arg_exprs.len());
@@ -2469,6 +2479,128 @@ impl<'a> super::AnalyzerContext<'a> {
             arg_types.push(arr.data_type.clone());
             args_typed.push(arr);
         }
+        Ok((args_typed, arg_types))
+    }
+
+    /// Analyse `map_apply((k, v) -> body, m)` / `transform_keys((k, v) -> nk, m)` /
+    /// `transform_values((k, v) -> nv, m)`. The 2-parameter lambda binds
+    /// `k` to the map's key Arrow type and `v` to the value type. For
+    /// `map_apply` the body must be a `(new_key, new_value)` tuple (sqlparser
+    /// surfaces it as `Expr::Tuple`); we rewrite it as a `row(...)` call so
+    /// downstream codegen sees a 2-field Struct.
+    fn analyze_map_higher_order_lambda_arguments(
+        &self,
+        name: &str,
+        arg_exprs: &[&sqlast::Expr],
+        scope: &AnalyzerScope,
+    ) -> Result<(Vec<TypedExpr>, Vec<DataType>), String> {
+        let (param_names, body_expr) = parse_multi_param_lambda(arg_exprs[0])
+            .ok_or_else(|| format!("{name} expects a lambda function as its first argument"))?;
+        if param_names.len() != 2 {
+            return Err(format!(
+                "{name} lambda must take exactly 2 parameters (key, value); got {}",
+                param_names.len()
+            ));
+        }
+
+        let map_typed = self.analyze_expr(arg_exprs[1], scope)?;
+        let (key_type, value_type) = match &map_typed.data_type {
+            DataType::Map(field, _) => match field.data_type() {
+                DataType::Struct(fields) if fields.len() == 2 => {
+                    (fields[0].data_type().clone(), fields[1].data_type().clone())
+                }
+                other => {
+                    return Err(format!(
+                        "{name} expects MAP argument with struct<key,value> entries, got {:?}",
+                        other
+                    ));
+                }
+            },
+            DataType::Null => (DataType::Null, DataType::Null),
+            other => return Err(format!("{name} expects a MAP argument, got {:?}", other)),
+        };
+
+        let mut inner_scope = scope.clone();
+        inner_scope.add_column(None, &param_names[0], key_type.clone(), true);
+        inner_scope.add_column(None, &param_names[1], value_type.clone(), true);
+
+        // `map_apply` bodies are a `(new_key, new_value)` tuple. In
+        // StarRocks/NovaRocks this is shorthand for a single-entry MAP
+        // literal `map(new_key, new_value)` — the BE-side `map_apply`
+        // concatenates one such map per (k, v) input pair into the
+        // output map. For `transform_keys` / `transform_values` the body
+        // is a single scalar and the BE wraps it; only the map_apply
+        // shape needs the tuple→map rewrite.
+        let tuple_items: Option<Vec<&sqlast::Expr>> = if name == "map_apply" {
+            match body_expr {
+                sqlast::Expr::Tuple(items) => Some(items.iter().collect()),
+                sqlast::Expr::Nested(inner) => match inner.as_ref() {
+                    sqlast::Expr::Tuple(items) => Some(items.iter().collect()),
+                    _ => None,
+                },
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let body_typed = if let Some(tuple_items) = tuple_items {
+            if tuple_items.len() != 2 {
+                return Err(format!(
+                    "map_apply lambda body must produce (new_key, new_value), got {} items",
+                    tuple_items.len()
+                ));
+            }
+            let mut typed_items = Vec::with_capacity(2);
+            for item in &tuple_items {
+                typed_items.push(self.analyze_expr(item, &inner_scope)?);
+            }
+            let new_key_type = typed_items[0].data_type.clone();
+            let new_value_type = typed_items[1].data_type.clone();
+            let entry_field = std::sync::Arc::new(arrow::datatypes::Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        std::sync::Arc::new(arrow::datatypes::Field::new(
+                            "key",
+                            new_key_type,
+                            false,
+                        )),
+                        std::sync::Arc::new(arrow::datatypes::Field::new(
+                            "value",
+                            new_value_type,
+                            true,
+                        )),
+                    ]
+                    .into(),
+                ),
+                false,
+            ));
+            TypedExpr {
+                kind: ExprKind::FunctionCall {
+                    name: "map".to_string(),
+                    args: typed_items,
+                    distinct: false,
+                },
+                data_type: DataType::Map(entry_field, false),
+                nullable: true,
+            }
+        } else {
+            self.analyze_expr(body_expr, &inner_scope)?
+        };
+        let body_type = body_typed.data_type.clone();
+        let body_nullable = body_typed.nullable;
+
+        let lambda_typed = TypedExpr {
+            kind: ExprKind::Lambda {
+                params: param_names.iter().map(|p| p.to_lowercase()).collect(),
+                body: Box::new(body_typed),
+            },
+            data_type: body_type,
+            nullable: body_nullable,
+        };
+
+        let args_typed = vec![lambda_typed.clone(), map_typed.clone()];
+        let arg_types = vec![lambda_typed.data_type, map_typed.data_type];
         Ok((args_typed, arg_types))
     }
 
@@ -4082,44 +4214,16 @@ fn is_higher_order_function_with_lambda(name: &str, arg_exprs: &[&sqlast::Expr])
             .is_some()
 }
 
-/// Apply MySQL-style backslash escapes to a string literal payload. Our
-/// SQL parser hands us the raw text between quotes (with `''` already
-/// collapsed), but does not interpret backslash escapes (`\\`, `\n`, ...).
-/// StarRocks's lexer does, so unescape here to match user expectations.
-fn unescape_sql_string(s: &str) -> String {
-    if !s.contains('\\') {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '\\' {
-            out.push(ch);
-            continue;
-        }
-        match chars.next() {
-            Some('\\') => out.push('\\'),
-            Some('\'') => out.push('\''),
-            Some('"') => out.push('"'),
-            Some('n') => out.push('\n'),
-            Some('t') => out.push('\t'),
-            Some('r') => out.push('\r'),
-            Some('0') => out.push('\0'),
-            Some('b') => out.push('\x08'),
-            Some('Z') => out.push('\x1a'),
-            Some('%') => {
-                out.push('\\');
-                out.push('%');
-            }
-            Some('_') => {
-                out.push('\\');
-                out.push('_');
-            }
-            Some(other) => out.push(other),
-            None => out.push('\\'),
-        }
-    }
-    out
+/// Map-shaped higher-order functions: `(k, v) -> body` over a MAP argument.
+/// `map_apply` (body returns 2-tuple), `transform_keys` (body returns scalar
+/// new key), `transform_values` (body returns scalar new value).
+fn is_map_higher_order_function_with_lambda(name: &str, arg_exprs: &[&sqlast::Expr]) -> bool {
+    matches!(name, "map_apply" | "transform_keys" | "transform_values")
+        && arg_exprs.len() == 2
+        && arg_exprs
+            .first()
+            .and_then(|expr| parse_multi_param_lambda(expr))
+            .is_some()
 }
 
 /// Return `true` when `expr` is a constant integer literal (including

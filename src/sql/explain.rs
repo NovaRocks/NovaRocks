@@ -130,6 +130,7 @@ fn format_node(plan: &LogicalPlan, level: ExplainLevel, indent: usize, out: &mut
                 JoinKind::RightSemi => "RIGHT SEMI JOIN",
                 JoinKind::LeftAnti => "LEFT ANTI JOIN",
                 JoinKind::RightAnti => "RIGHT ANTI JOIN",
+                JoinKind::NullAwareLeftAnti => "NULL AWARE LEFT ANTI JOIN",
             };
             out.push(format!("{pad}{join_str}"));
             if let Some(ref cond) = node.condition {
@@ -392,6 +393,7 @@ fn format_physical_node(
                 JoinKind::RightSemi => "RIGHT SEMI",
                 JoinKind::LeftAnti => "LEFT ANTI",
                 JoinKind::RightAnti => "RIGHT ANTI",
+                JoinKind::NullAwareLeftAnti => "NULL AWARE LEFT ANTI",
             };
             let eq: Vec<String> = op
                 .eq_conditions
@@ -427,6 +429,7 @@ fn format_physical_node(
                 JoinKind::RightSemi => "RIGHT SEMI",
                 JoinKind::LeftAnti => "LEFT ANTI",
                 JoinKind::RightAnti => "RIGHT ANTI",
+                JoinKind::NullAwareLeftAnti => "NULL AWARE LEFT ANTI",
             };
             out.push(format!(
                 "{pad}NEST LOOP JOIN ({join_str}){costs_suffix}{stats_suffix}"

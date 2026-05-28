@@ -625,7 +625,7 @@ fn starrocks_table_def(runtime: &StarRocksTableRuntime) -> Result<TableDef, Stri
     })
 }
 
-fn starrocks_table_physical_layout(
+pub(crate) fn starrocks_table_physical_layout(
     runtime: &StarRocksTableRuntime,
 ) -> Result<PhysicalTableLayout, String> {
     let active_partition_versions = runtime

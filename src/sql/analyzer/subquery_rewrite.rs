@@ -480,21 +480,27 @@ impl<'a> AnalyzerContext<'a> {
         let sub_col = resolved_sub.output_columns[0].clone();
         let match_col = format!("__match_{}", sq_info.id);
 
-        // Augment the subquery: DISTINCT + match-indicator column equal to
-        // the IN target. After LEFT OUTER JOIN, the match column is NULL
-        // for non-matching outer rows and non-NULL for matches.
+        // Augment the subquery: DISTINCT + match-indicator column. After the
+        // LEFT OUTER JOIN, this column is NULL for non-matching outer rows
+        // and non-NULL for matches.
+        //
+        // Use a constant `1` as the indicator value rather than a ColumnRef
+        // to the user-visible subquery output column. The original output
+        // column may be a derived expression (e.g. `max(v12) - 501`) whose
+        // codegen-side display name lives in the post-Project scope only;
+        // a ColumnRef to that name fails to resolve when the second project
+        // item compiles in the same Project's input scope ("Column
+        // '(max(v12)) - 501' cannot be resolved"). A literal sidesteps the
+        // lookup entirely and produces the same boolean indicator semantics.
         let mut modified_sub = resolved_sub;
+        let indicator_dtype = DataType::Int32;
         if let QueryBody::Select(ref mut sel) = modified_sub.body {
             sel.distinct = true;
             sel.projection.push(ProjectItem {
                 expr: TypedExpr {
-                    kind: ExprKind::ColumnRef {
-                        column_id: sub_col.column_id,
-                        qualifier: None,
-                        column: sub_col.name.clone(),
-                    },
-                    data_type: sub_col.data_type.clone(),
-                    nullable: sub_col.nullable,
+                    kind: ExprKind::Literal(LiteralValue::Int(1)),
+                    data_type: indicator_dtype.clone(),
+                    nullable: false,
                 },
                 output_name: match_col.clone(),
             });
@@ -502,13 +508,13 @@ impl<'a> AnalyzerContext<'a> {
         let match_col_id = self.alloc_column_id(
             Some(sq_alias.clone()),
             match_col.clone(),
-            sub_col.data_type.clone(),
+            indicator_dtype.clone(),
             true,
         );
         modified_sub.output_columns.push(OutputColumn {
             column_id: match_col_id,
             name: match_col.clone(),
-            data_type: sub_col.data_type.clone(),
+            data_type: indicator_dtype.clone(),
             nullable: true,
         });
         let output_columns = modified_sub.output_columns.clone();
@@ -526,7 +532,7 @@ impl<'a> AnalyzerContext<'a> {
             sub_col.data_type.clone(),
             true,
         );
-        scope.add_column(Some(&sq_alias), &match_col, sub_col.data_type.clone(), true);
+        scope.add_column(Some(&sq_alias), &match_col, indicator_dtype.clone(), true);
 
         let eq_cond = TypedExpr {
             data_type: DataType::Boolean,
@@ -561,7 +567,7 @@ impl<'a> AnalyzerContext<'a> {
                         qualifier: Some(sq_alias),
                         column: match_col,
                     },
-                    data_type: sub_col.data_type.clone(),
+                    data_type: indicator_dtype,
                     nullable: true,
                 }),
                 negated: !negated, // IN → IS NOT NULL; NOT IN → IS NULL
@@ -978,11 +984,22 @@ impl<'a> AnalyzerContext<'a> {
         // `Relation::Subquery` would isolate the inner SELECT and the outer
         // reference would no longer resolve. We must lift the subquery's WHERE
         // up into the SEMI/ANTI join's ON condition — same pattern as EXISTS.
+        //
+        // Detect correlation broadly: extract_correlation_predicates only
+        // recognises comparison-shaped predicates (e.g. `outer.x = inner.y`),
+        // but a bare-column WHERE like `WHERE outer.flag` (implicit `!= 0`)
+        // or any expression that references an outer column also has to
+        // route through the correlated path so the outer reference stays
+        // visible at codegen time. Fall back to a generic
+        // "does the subquery filter mention any outer-scope column" check.
         let is_correlated = match resolved_sub.body {
             QueryBody::Select(ref sel) => sel
                 .filter
                 .as_ref()
-                .map(|f| !extract_correlation_predicates(f, &inner_scope, scope).is_empty())
+                .map(|f| {
+                    !extract_correlation_predicates(f, &inner_scope, scope).is_empty()
+                        || expr_references_outer_scope(f, &inner_scope, scope)
+                })
                 .unwrap_or(false),
             _ => false,
         };
@@ -1029,29 +1046,22 @@ impl<'a> AnalyzerContext<'a> {
                 data_type: sub_col.data_type.clone(),
                 nullable: sub_col.nullable,
             };
-            // For IN (semi), plain equality is correct: NULLs never satisfy
-            // `=` so they're already excluded. For NOT IN (anti) we need
-            // null-aware equality so the LEFT ANTI join matches whenever
-            // either operand is NULL, matching SQL's
-            // "x NOT IN S returns UNKNOWN if x is NULL or S contains NULL"
-            // semantics — but only when nulls are actually possible. When
-            // both operands are statically non-nullable, the OR-with-IsNull
-            // branches are dead code that prevent the downstream optimizer
-            // from extracting an equi-key and falls back to a NestLoopJoin
-            // (turning a typical `c0 NOT IN (subq)` into a quadratic scan).
-            let either_nullable = lhs_i.nullable || sub_col.nullable;
-            let eq = if negated && !inside_or && either_nullable {
-                null_aware_eq(lhs_i.clone(), rhs_ref)
-            } else {
-                TypedExpr {
-                    data_type: DataType::Boolean,
-                    nullable: false,
-                    kind: ExprKind::BinaryOp {
-                        left: Box::new(lhs_i.clone()),
-                        op: BinOp::Eq,
-                        right: Box::new(rhs_ref),
-                    },
-                }
+            // Always emit plain `Eq` as the join condition. For NOT IN, SQL's
+            // "any NULL anywhere → UNKNOWN" semantics is encoded by selecting
+            // `JoinKind::NullAwareLeftAnti` below when either operand could be
+            // NULL, rather than by wrapping the condition in IS-NULL ORs (the
+            // old form). Keeping the condition a bare `Eq` lets the Cascades
+            // implement phase extract it as a real hash-join key — without
+            // that, `c0 NOT IN (subq)` on nullable columns degraded to a
+            // NestLoopJoin and timed out on 60K×40K-scale inputs.
+            let eq = TypedExpr {
+                data_type: DataType::Boolean,
+                nullable: false,
+                kind: ExprKind::BinaryOp {
+                    left: Box::new(lhs_i.clone()),
+                    op: BinOp::Eq,
+                    right: Box::new(rhs_ref),
+                },
             };
             eq_conjuncts.push(eq);
         }
@@ -1173,11 +1183,23 @@ impl<'a> AnalyzerContext<'a> {
                 &is_null_expr,
             );
         } else {
-            // Standard case: SEMI / ANTI JOIN. NULL handling for NOT IN is
-            // baked into `eq_cond` above (null-aware equality), so the
-            // subquery is wrapped as-is.
+            // Standard case: SEMI / ANTI JOIN. For NOT IN, NULL handling now
+            // lives in the JoinKind itself — pick `NullAwareLeftAnti` when
+            // either side could carry NULLs so the exec layer's null-aware
+            // anti-join logic kicks in (drops every probe row if the build
+            // side has any NULL key; drops probe rows whose key is NULL).
+            // For statically non-nullable operands the regular `LeftAnti`
+            // already matches SQL semantics.
+            let either_nullable = lhs_typed_list
+                .iter()
+                .zip(resolved_sub.output_columns.iter())
+                .any(|(lhs_i, sub_col)| lhs_i.nullable || sub_col.nullable);
             let join_type = if negated {
-                JoinKind::LeftAnti
+                if either_nullable {
+                    JoinKind::NullAwareLeftAnti
+                } else {
+                    JoinKind::LeftAnti
+                }
             } else {
                 JoinKind::LeftSemi
             };
@@ -1229,12 +1251,17 @@ impl<'a> AnalyzerContext<'a> {
         let rhs_expr = sub_projection[0].expr.clone();
         let sub_rel = sub_from.ok_or("IN subquery must have a FROM clause".to_string())?;
 
-        // For correlated NOT IN, use null-aware equality so the LEFT ANTI join
-        // matches whenever either side is NULL within the correlation group —
-        // the row is then excluded from the outer result, matching SQL's
-        // "x NOT IN S returns UNKNOWN when x is NULL or S contains NULL"
-        // semantics. For IN (semi), a plain equality is correct: NULLs never
-        // satisfy IN and the row stays out.
+        // For correlated NOT IN, use null-aware equality so the LEFT ANTI
+        // join matches whenever either side is NULL within the correlation
+        // group — matching SQL's "NOT IN returns UNKNOWN when NULL is
+        // present". We deliberately do NOT switch to NullAwareLeftAnti
+        // here (unlike the uncorrelated path): NullAwareLeftAnti is a
+        // global "drop all probe rows if build has any NULL key" check,
+        // but for a correlated subquery the build side varies per outer
+        // row — the correlation predicate filters NULL keys away on a
+        // row-by-row basis. Keep the slower NLJ + null_aware_eq path so
+        // semantics stay correct on cases like
+        // `WHERE l1.k1 NOT IN (SELECT l3.k1 FROM t l3 WHERE l3.k3 = l1.k3)`.
         let key_cond = if negated {
             null_aware_eq(lhs_typed, rhs_expr)
         } else {
@@ -1589,7 +1616,7 @@ impl<'a> AnalyzerContext<'a> {
 
         // --- WHERE clause ---
         let filter = match &select.selection {
-            Some(expr) => Some(self.analyze_expr(expr, &merged_scope)?),
+            Some(expr) => Some(coerce_where_to_bool(self.analyze_expr(expr, &merged_scope)?)),
             None => None,
         };
 
@@ -1872,51 +1899,155 @@ pub(super) struct CorrelationPred {
 /// key condition for null-aware `NOT IN`: the LEFT ANTI JOIN must match
 /// (and thus exclude the outer row) whenever either operand is NULL,
 /// because SQL's NOT IN returns UNKNOWN under those conditions.
+/// Coerce a WHERE / ON / HAVING expression to BOOLEAN when its analysed
+/// type is not already boolean. MySQL/StarRocks accept `WHERE int_col`
+/// (truthy when non-zero, FALSE when zero, NULL when NULL); our analyzer
+/// hands such an expression off to downstream AND-conjuncts that
+/// require boolean operands ("AND right operand must be boolean"). Wrap
+/// non-boolean truthy filters as `expr != 0` (numeric) so the
+/// three-valued logic matches.
+pub(crate) fn coerce_where_to_bool(expr: TypedExpr) -> TypedExpr {
+    use arrow::datatypes::DataType;
+    if matches!(expr.data_type, DataType::Boolean) {
+        return expr;
+    }
+    let nullable = expr.nullable;
+    let zero = TypedExpr {
+        kind: ExprKind::Literal(LiteralValue::Int(0)),
+        data_type: DataType::Int64,
+        nullable: false,
+    };
+    TypedExpr {
+        data_type: DataType::Boolean,
+        nullable,
+        kind: ExprKind::BinaryOp {
+            left: Box::new(expr),
+            op: BinOp::Ne,
+            right: Box::new(zero),
+        },
+    }
+}
+
 fn null_aware_eq(lhs: TypedExpr, rhs: TypedExpr) -> TypedExpr {
-    let lhs_clone = lhs.clone();
-    let rhs_clone = rhs.clone();
+    // Goal: a Boolean predicate that, when used as the ON condition of a LEFT
+    // ANTI join rewritten from `lhs NOT IN (subq)`, causes the join to drop
+    // every left row whose SQL `NOT IN` result is FALSE *or* UNKNOWN —
+    // matching SQL semantics where:
+    //   • lhs IS NULL                 → NOT IN is UNKNOWN
+    //   • the subquery contains NULL  → NOT IN is UNKNOWN
+    //   • element-level NULL inside a complex-type value makes `lhs = rhs`
+    //     evaluate to NULL (e.g. `[1, NULL] = [1, NULL]` is NULL per ARRAY
+    //     element equality propagation).
+    //
+    // `lhs = rhs` returns NULL in every one of those cases. Wrapping it in
+    // `COALESCE(eq, TRUE)` turns each NULL into TRUE so the ANTI JOIN treats
+    // those pairs as a match and discards the left row. The previous 3-OR
+    // form (`eq OR lhs IS NULL OR rhs IS NULL`) only checked whole-value
+    // IS NULL and therefore missed the element-level NULL case — see
+    // `join_array_not_in_element_null.sql`.
     let eq = TypedExpr {
         data_type: DataType::Boolean,
-        nullable: false,
+        nullable: true,
         kind: ExprKind::BinaryOp {
             left: Box::new(lhs),
             op: BinOp::Eq,
             right: Box::new(rhs),
         },
     };
-    let lhs_is_null = TypedExpr {
+    let true_lit = TypedExpr {
         data_type: DataType::Boolean,
         nullable: false,
-        kind: ExprKind::IsNull {
-            expr: Box::new(lhs_clone),
-            negated: false,
-        },
-    };
-    let rhs_is_null = TypedExpr {
-        data_type: DataType::Boolean,
-        nullable: false,
-        kind: ExprKind::IsNull {
-            expr: Box::new(rhs_clone),
-            negated: false,
-        },
-    };
-    let or1 = TypedExpr {
-        data_type: DataType::Boolean,
-        nullable: false,
-        kind: ExprKind::BinaryOp {
-            left: Box::new(eq),
-            op: BinOp::Or,
-            right: Box::new(lhs_is_null),
-        },
+        kind: ExprKind::Literal(LiteralValue::Bool(true)),
     };
     TypedExpr {
         data_type: DataType::Boolean,
         nullable: false,
-        kind: ExprKind::BinaryOp {
-            left: Box::new(or1),
-            op: BinOp::Or,
-            right: Box::new(rhs_is_null),
+        kind: ExprKind::FunctionCall {
+            name: "coalesce".to_string(),
+            args: vec![eq, true_lit],
+            distinct: false,
         },
+    }
+}
+
+/// `true` when `expr` contains at least one column reference that resolves
+/// only in `outer_scope` and not in `inner_scope`. Broader than
+/// `extract_correlation_predicates` (which looks for comparison-shaped
+/// predicates) — needed so a bare WHERE clause like `WHERE outer.flag`
+/// (implicit `!= 0` boolean) still routes the IN/NOT IN rewrite through
+/// the correlated path that lifts the outer reference up into the join
+/// ON condition.
+fn expr_references_outer_scope(
+    expr: &TypedExpr,
+    inner_scope: &AnalyzerScope,
+    outer_scope: &AnalyzerScope,
+) -> bool {
+    let mut saw_outer = false;
+    walk_for_outer_ref(expr, inner_scope, outer_scope, &mut saw_outer);
+    saw_outer
+}
+
+fn walk_for_outer_ref(
+    expr: &TypedExpr,
+    inner_scope: &AnalyzerScope,
+    outer_scope: &AnalyzerScope,
+    saw_outer: &mut bool,
+) {
+    if *saw_outer {
+        return;
+    }
+    match &expr.kind {
+        ExprKind::ColumnRef {
+            qualifier, column, ..
+        } => {
+            let q = qualifier.as_deref();
+            let inner_has = inner_scope.resolve(q, column).is_ok();
+            let outer_has = outer_scope.resolve(q, column).is_ok();
+            if !inner_has && outer_has {
+                *saw_outer = true;
+            }
+        }
+        ExprKind::BinaryOp { left, right, .. } => {
+            walk_for_outer_ref(left, inner_scope, outer_scope, saw_outer);
+            walk_for_outer_ref(right, inner_scope, outer_scope, saw_outer);
+        }
+        ExprKind::UnaryOp { expr: inner, .. }
+        | ExprKind::IsNull { expr: inner, .. }
+        | ExprKind::Cast { expr: inner, .. }
+        | ExprKind::Nested(inner) => {
+            walk_for_outer_ref(inner, inner_scope, outer_scope, saw_outer);
+        }
+        ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
+            for a in args {
+                walk_for_outer_ref(a, inner_scope, outer_scope, saw_outer);
+            }
+        }
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(op) = operand {
+                walk_for_outer_ref(op, inner_scope, outer_scope, saw_outer);
+            }
+            for (w, t) in when_then {
+                walk_for_outer_ref(w, inner_scope, outer_scope, saw_outer);
+                walk_for_outer_ref(t, inner_scope, outer_scope, saw_outer);
+            }
+            if let Some(e) = else_expr {
+                walk_for_outer_ref(e, inner_scope, outer_scope, saw_outer);
+            }
+        }
+        ExprKind::InList { expr: inner, list, .. } => {
+            walk_for_outer_ref(inner, inner_scope, outer_scope, saw_outer);
+            for v in list {
+                walk_for_outer_ref(v, inner_scope, outer_scope, saw_outer);
+            }
+        }
+        // Literal / LambdaParamRef / SubqueryPlaceholder / etc. — no
+        // sub-expressions that could carry outer references in the
+        // contexts this helper covers.
+        _ => {}
     }
 }
 

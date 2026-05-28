@@ -269,7 +269,9 @@ fn estimate_join(join: &JoinNode, table_stats: &HashMap<String, TableStatistics>
                 right_rows
             }
         }
-        JoinKind::LeftAnti => (left_rows * ANTI_JOIN_SELECTIVITY).max(1.0),
+        JoinKind::LeftAnti | JoinKind::NullAwareLeftAnti => {
+            (left_rows * ANTI_JOIN_SELECTIVITY).max(1.0)
+        }
         JoinKind::RightAnti => (right_rows * ANTI_JOIN_SELECTIVITY).max(1.0),
     };
 

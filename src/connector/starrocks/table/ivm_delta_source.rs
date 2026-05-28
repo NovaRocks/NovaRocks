@@ -208,9 +208,16 @@ pub(crate) fn execute_delta_source_query(
 
     let mut executable = query.as_ref().clone();
     crate::sql::parser::query_refs::strip_catalog_from_three_part_names(&mut executable);
+    let connectors_snapshot = input
+        .state
+        .connectors
+        .read()
+        .expect("standalone connector registry read lock")
+        .clone();
     execute_query(
         &executable,
         &delta_catalog,
+        &connectors_snapshot,
         input.current_database,
         input.state.exchange_port,
         None,

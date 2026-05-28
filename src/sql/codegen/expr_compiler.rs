@@ -1345,8 +1345,22 @@ impl<'a> ExprCompiler<'a> {
             _ => unreachable!("compile_higher_order_function_call called without lambda first arg"),
         };
         let array_args = &args[1..];
+        let is_map_shape = is_map_higher_order_function(name);
 
-        if lambda_params.len() != array_args.len() {
+        if is_map_shape {
+            if lambda_params.len() != 2 {
+                return Err(format!(
+                    "{name} lambda must take exactly 2 parameters (key, value); got {}",
+                    lambda_params.len()
+                ));
+            }
+            if array_args.len() != 1 {
+                return Err(format!(
+                    "{name} takes exactly one MAP argument; got {}",
+                    array_args.len()
+                ));
+            }
+        } else if lambda_params.len() != array_args.len() {
             return Err(format!(
                 "{name} lambda parameter count ({}) does not match array argument count ({})",
                 lambda_params.len(),
@@ -1354,27 +1368,58 @@ impl<'a> ExprCompiler<'a> {
             ));
         }
 
-        // Determine each lambda parameter's element type from its array arg.
+        // Determine each lambda parameter's element type.
+        // - Array shape: parameter[i] binds to array_args[i]'s element type.
+        // - Map shape: parameter[0] binds to map key type, parameter[1] to value type.
         let mut param_bindings = Vec::with_capacity(lambda_params.len());
-        for (param_name, array_arg) in lambda_params.iter().zip(array_args.iter()) {
-            let (elem_type, elem_nullable) = match &array_arg.data_type {
-                DataType::List(field)
-                | DataType::LargeList(field)
-                | DataType::FixedSizeList(field, _) => (
-                    field.data_type().clone(),
-                    field.is_nullable() || array_arg.nullable,
-                ),
+        if is_map_shape {
+            let (key_type, value_type) = match &array_args[0].data_type {
+                DataType::Map(field, _) => match field.data_type() {
+                    DataType::Struct(fields) if fields.len() == 2 => (
+                        fields[0].data_type().clone(),
+                        fields[1].data_type().clone(),
+                    ),
+                    other => {
+                        return Err(format!(
+                            "{name} expects MAP with struct<key,value> entries, got {:?}",
+                            other
+                        ));
+                    }
+                },
                 other => {
-                    return Err(format!("{name} expects ARRAY arguments, got {:?}", other));
+                    return Err(format!("{name} expects a MAP argument, got {:?}", other));
                 }
             };
-            let slot_id = self.alloc_slot_id();
-            param_bindings.push(LambdaBinding {
-                name: param_name.to_lowercase(),
-                slot_id,
-                data_type: elem_type,
-                nullable: elem_nullable,
-            });
+            for (param_name, ptype) in lambda_params.iter().zip([key_type, value_type].iter()) {
+                let slot_id = self.alloc_slot_id();
+                param_bindings.push(LambdaBinding {
+                    name: param_name.to_lowercase(),
+                    slot_id,
+                    data_type: ptype.clone(),
+                    nullable: true,
+                });
+            }
+        } else {
+            for (param_name, array_arg) in lambda_params.iter().zip(array_args.iter()) {
+                let (elem_type, elem_nullable) = match &array_arg.data_type {
+                    DataType::List(field)
+                    | DataType::LargeList(field)
+                    | DataType::FixedSizeList(field, _) => (
+                        field.data_type().clone(),
+                        field.is_nullable() || array_arg.nullable,
+                    ),
+                    other => {
+                        return Err(format!("{name} expects ARRAY arguments, got {:?}", other));
+                    }
+                };
+                let slot_id = self.alloc_slot_id();
+                param_bindings.push(LambdaBinding {
+                    name: param_name.to_lowercase(),
+                    slot_id,
+                    data_type: elem_type,
+                    nullable: elem_nullable,
+                });
+            }
         }
 
         // Push the parent FUNCTION_CALL placeholder is already at parent_idx.
@@ -1414,8 +1459,15 @@ impl<'a> ExprCompiler<'a> {
             array_arg_types.push(t);
         }
 
-        // Determine return type. Analyzer should already have computed it.
-        let return_type = if *type_hint != DataType::Null {
+        // Determine return type. Analyzer should already have computed it
+        // for array-shape higher-order functions. For the map-shape family
+        // the analyzer's registry signature returns the INPUT map type
+        // (pass-through `Map<K,V> -> Map<K,V>`), but the lambda can
+        // transform K and/or V — so always recompute the new map type from
+        // the body, ignoring `type_hint`.
+        let return_type = if is_map_shape {
+            higher_order_return_type(name, &body_type, &array_arg_types)
+        } else if *type_hint != DataType::Null {
             type_hint.clone()
         } else {
             higher_order_return_type(name, &body_type, &array_arg_types)
@@ -1599,7 +1651,14 @@ pub(crate) fn build_cast_texpr(child: exprs::TExpr, target_type: types::TTypeDes
 
 /// Names of higher-order functions whose first argument is a lambda.
 fn is_higher_order_function(name: &str) -> bool {
-    matches!(name, "array_map" | "transform")
+    matches!(
+        name,
+        "array_map" | "transform" | "map_apply" | "transform_keys" | "transform_values"
+    )
+}
+
+fn is_map_higher_order_function(name: &str) -> bool {
+    matches!(name, "map_apply" | "transform_keys" | "transform_values")
 }
 
 /// Default return type inference for higher-order functions, used only when
@@ -1616,6 +1675,48 @@ fn higher_order_return_type(
             true,
         ))),
         "array_filter" | "filter" => array_arg_types.first().cloned().unwrap_or(DataType::Null),
+        // `map_apply((k,v) -> map(new_k, new_v), m)` lambda body is a
+        // single-entry MAP; the function's output map type is exactly that.
+        "map_apply" => match body_type {
+            DataType::Map(_, _) => body_type.clone(),
+            _ => array_arg_types.first().cloned().unwrap_or(DataType::Null),
+        },
+        // `transform_keys((k,v) -> new_k, m)`: new map<new_k, V>.
+        // `transform_values((k,v) -> new_v, m)`: new map<K, new_v>.
+        "transform_keys" | "transform_values" => {
+            let map_arg = array_arg_types.first().cloned().unwrap_or(DataType::Null);
+            match &map_arg {
+                DataType::Map(entry, sorted) => {
+                    if let DataType::Struct(fields) = entry.data_type() {
+                        if fields.len() == 2 {
+                            let (new_key, new_val) = if name == "transform_keys" {
+                                (body_type.clone(), fields[1].data_type().clone())
+                            } else {
+                                (fields[0].data_type().clone(), body_type.clone())
+                            };
+                            let entry_field = Arc::new(arrow::datatypes::Field::new(
+                                "entries",
+                                DataType::Struct(
+                                    vec![
+                                        Arc::new(arrow::datatypes::Field::new(
+                                            "key", new_key, false,
+                                        )),
+                                        Arc::new(arrow::datatypes::Field::new(
+                                            "value", new_val, true,
+                                        )),
+                                    ]
+                                    .into(),
+                                ),
+                                false,
+                            ));
+                            return DataType::Map(entry_field, *sorted);
+                        }
+                    }
+                    map_arg
+                }
+                _ => map_arg,
+            }
+        }
         _ => DataType::Null,
     }
 }

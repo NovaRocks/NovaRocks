@@ -2708,6 +2708,11 @@ fn execute_join_aggregate_delta_branch(
     )?;
     let signed_query = parse_mv_select_query(&signed_sql)?;
     let branch_catalog = build_join_branch_catalog(state, branch)?;
+    let connectors_snapshot = state
+        .connectors
+        .read()
+        .expect("standalone connector registry read lock")
+        .clone();
     let catalogs_guard = state
         .iceberg_catalogs
         .read()
@@ -2715,6 +2720,7 @@ fn execute_join_aggregate_delta_branch(
     let result = crate::engine::execute_query_with_options(
         &signed_query,
         &branch_catalog,
+        &connectors_snapshot,
         current_database,
         state.exchange_port,
         None,
@@ -4242,9 +4248,15 @@ fn run_mv_full_select_result(
         .read()
         .expect("standalone catalog read lock")
         .clone();
+    let connectors_snapshot = state
+        .connectors
+        .read()
+        .expect("standalone connector registry read lock")
+        .clone();
     crate::engine::execute_query(
         &query,
         &catalog_snapshot,
+        &connectors_snapshot,
         current_database,
         state.exchange_port,
         None,
@@ -5858,6 +5870,11 @@ fn first_refresh_iceberg_join_mv(
         Arc::clone(&coalescer),
     );
     {
+        let connectors_snapshot = state
+            .connectors
+            .read()
+            .expect("standalone connector registry read lock")
+            .clone();
         let catalogs_guard = state
             .iceberg_catalogs
             .read()
@@ -5865,6 +5882,7 @@ fn first_refresh_iceberg_join_mv(
         if let Err(err) = crate::engine::execute_query_with_options(
             &query,
             &branch_catalog,
+            &connectors_snapshot,
             current_database,
             state.exchange_port,
             None,
@@ -6592,6 +6610,11 @@ fn execute_join_delta_branches(
         let sink = crate::engine::mv::iceberg_join_coalesce::IcebergJoinCoalesceSinkFactory::new(
             Arc::clone(&coalescer),
         );
+        let connectors_snapshot = state
+            .connectors
+            .read()
+            .expect("standalone connector registry read lock")
+            .clone();
         let catalogs_guard = state
             .iceberg_catalogs
             .read()
@@ -6599,6 +6622,7 @@ fn execute_join_delta_branches(
         if let Err(err) = crate::engine::execute_query_with_options(
             &branch_query,
             &branch_catalog,
+            &connectors_snapshot,
             current_database,
             state.exchange_port,
             None,
@@ -7221,6 +7245,11 @@ fn incremental_refresh_iceberg_mv(
     // can resolve the IcebergRuntimeHandles for the IcebergDeltaScan
     // operator.
     {
+        let connectors_snapshot = state
+            .connectors
+            .read()
+            .expect("standalone connector registry read lock")
+            .clone();
         let catalogs_guard = state
             .iceberg_catalogs
             .read()
@@ -7228,6 +7257,7 @@ fn incremental_refresh_iceberg_mv(
         if let Err(err) = crate::engine::execute_query_with_options(
             &query,
             &catalog,
+            &connectors_snapshot,
             current_database,
             state.exchange_port,
             None,

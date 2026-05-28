@@ -1080,9 +1080,15 @@ fn collect_column_stats_by_query(
             .read()
             .expect("standalone catalog read lock")
             .clone();
+        let connectors_snapshot = state
+            .connectors
+            .read()
+            .expect("standalone connector registry read lock")
+            .clone();
         let result = crate::engine::execute_query(
             &query,
             &catalog_snapshot,
+            &connectors_snapshot,
             &key.db,
             state.exchange_port,
             None,

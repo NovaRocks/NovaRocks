@@ -363,9 +363,15 @@ pub(crate) fn run_select_to_chunks(
         .read()
         .expect("standalone catalog read lock")
         .clone();
+    let connectors_snapshot = state
+        .connectors
+        .read()
+        .expect("standalone connector registry read lock")
+        .clone();
     let result = crate::engine::execute_query(
         &rewritten,
         &catalog_snapshot,
+        &connectors_snapshot,
         &target.namespace,
         state.exchange_port,
         None,
@@ -413,9 +419,15 @@ pub(crate) fn run_select_to_chunks_and_schema(
         .read()
         .expect("standalone catalog read lock")
         .clone();
+    let connectors_snapshot = state
+        .connectors
+        .read()
+        .expect("standalone connector registry read lock")
+        .clone();
     let result = crate::engine::execute_query(
         &rewritten,
         &catalog_snapshot,
+        &connectors_snapshot,
         &target.namespace,
         state.exchange_port,
         None,

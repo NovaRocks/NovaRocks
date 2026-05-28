@@ -420,7 +420,9 @@ impl<'a> AnalyzerContext<'a> {
 
         // --- WHERE clause ---
         let filter = match &select.selection {
-            Some(expr) => Some(self.analyze_expr(expr, &scope)?),
+            Some(expr) => Some(super::analyzer::subquery_rewrite::coerce_where_to_bool(
+                self.analyze_expr(expr, &scope)?,
+            )),
             None => None,
         };
 
