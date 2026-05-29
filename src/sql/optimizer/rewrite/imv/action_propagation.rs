@@ -5,7 +5,9 @@
 //! schema-passthrough node and requires no work. Join/UnionAll/Aggregate
 //! above a Delta scan are unsupported in Phase 2 and fail-fast.
 
-use crate::sql::analysis::OutputColumn;
+use arrow::datatypes::DataType;
+
+use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
 use crate::sql::catalog::ScanSource;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
@@ -22,8 +24,9 @@ use crate::sql::planner::plan::LogicalPlan;
 /// Returns true iff the plan's effective output schema contains the IMV
 /// action column. Used by `matches()` predicates and validation.
 //
-// Consumed by Task 5 propagation/validation and the unit tests below. Allow
-// dead_code until the Task 5 caller lands so the non-test build stays clean.
+// Called by `PropagateActionColumnRule::matches`, but that rule struct has no
+// non-test constructor until Task 7 registers it in the pipeline, so the call
+// chain is unreachable in non-test builds. Allow dead_code until then.
 #[allow(dead_code)]
 pub(crate) fn output_has_action_column(plan: &LogicalPlan) -> bool {
     match plan {
@@ -42,8 +45,9 @@ pub(crate) fn output_has_action_column(plan: &LogicalPlan) -> bool {
 /// Returns the action column descriptor from the first descendant Scan/Project
 /// in the subtree that exposes one, or `None` if no descendant carries it.
 //
-// Consumed by Task 5 propagation and the unit tests below. Allow dead_code
-// until the Task 5 caller lands so the non-test build stays clean.
+// Called by `PropagateActionColumnRule::apply`, but that rule struct has no
+// non-test constructor until Task 7 registers it in the pipeline, so the call
+// chain is unreachable in non-test builds. Allow dead_code until then.
 #[allow(dead_code)]
 pub(crate) fn find_action_column(plan: &LogicalPlan) -> Option<OutputColumn> {
     match plan {
@@ -60,8 +64,9 @@ pub(crate) fn find_action_column(plan: &LogicalPlan) -> Option<OutputColumn> {
 
 /// Whether any descendant of the plan exposes an action column.
 //
-// Consumed by Task 5 propagation and the unit tests below. Allow dead_code
-// until the Task 5 caller lands so the non-test build stays clean.
+// Called by `PropagateActionColumnRule::matches`, but that rule struct has no
+// non-test constructor until Task 7 registers it in the pipeline, so the call
+// chain is unreachable in non-test builds. Allow dead_code until then.
 #[allow(dead_code)]
 pub(crate) fn subtree_has_action_column(plan: &LogicalPlan) -> bool {
     output_has_action_column(plan)
@@ -116,6 +121,69 @@ impl LogicalRewriteRule for InjectActionColumnRule {
         let column_id = ext.allocate_column_id();
         scan.columns.push(ImvActionColumn::output_column(column_id));
         Ok(RewriteResult::Changed(LogicalPlan::Scan(scan)))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PropagateActionColumnRule
+// ---------------------------------------------------------------------------
+
+// Registered in the IMV rewrite pipeline by Task 7. Until that registration
+// lands the rule has no non-test constructor, so allow dead_code to keep the
+// build clean.
+#[allow(dead_code)]
+pub(crate) struct PropagateActionColumnRule;
+
+impl LogicalRewriteRule for PropagateActionColumnRule {
+    fn name(&self) -> &'static str {
+        "PropagateActionColumn"
+    }
+
+    fn phase(&self) -> RewritePhase {
+        RewritePhase::SemanticRewrite
+    }
+
+    fn traversal(&self) -> RewriteTraversal {
+        RewriteTraversal::BottomUp
+    }
+
+    fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
+        match plan {
+            LogicalPlan::Project(p) => {
+                subtree_has_action_column(&p.input) && !output_has_action_column(plan)
+            }
+            // Filter is a schema-passthrough node: it exposes its child's
+            // schema verbatim, so once the child has the action column the
+            // Filter's effective output also has it. No work needed.
+            LogicalPlan::Filter(_) => false,
+            // Aggregate / Join / Union handled in Task 6 (fail-fast).
+            _ => false,
+        }
+    }
+
+    fn apply(&self, plan: LogicalPlan, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+        match plan {
+            LogicalPlan::Project(mut p) => {
+                let action = find_action_column(&p.input).ok_or_else(|| {
+                    "PropagateActionColumn matched Project but child has no action column"
+                        .to_string()
+                })?;
+                p.items.push(ProjectItem {
+                    expr: TypedExpr {
+                        kind: ExprKind::ColumnRef {
+                            column_id: action.column_id,
+                            qualifier: None,
+                            column: action.name.clone(),
+                        },
+                        data_type: DataType::Int8,
+                        nullable: false,
+                    },
+                    output_name: action.name.clone(),
+                });
+                Ok(RewriteResult::Changed(LogicalPlan::Project(p)))
+            }
+            _ => Ok(RewriteResult::Unchanged),
+        }
     }
 }
 
@@ -253,6 +321,86 @@ mod tests {
         let rule = InjectActionColumnRule;
         let ctx = build_ctx();
         let plan = LogicalPlan::Scan(starrocks_scan());
+        assert!(!rule.matches(&plan, &ctx));
+    }
+
+    use crate::sql::planner::plan::ProjectNode;
+
+    fn project_over(input: LogicalPlan, projected_user_col_id: ColumnId) -> LogicalPlan {
+        LogicalPlan::Project(ProjectNode {
+            input: Box::new(input),
+            items: vec![ProjectItem {
+                expr: TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        column_id: projected_user_col_id,
+                        qualifier: None,
+                        column: "k".to_string(),
+                    },
+                    data_type: DataType::Int64,
+                    nullable: false,
+                },
+                output_name: "k".to_string(),
+            }],
+        })
+    }
+
+    fn delta_scan_with_action(action_id: ColumnId) -> ScanNode {
+        let mut s = delta_scan();
+        s.columns.push(ImvActionColumn::output_column(action_id));
+        s
+    }
+
+    #[test]
+    fn propagate_through_project() {
+        let rule = PropagateActionColumnRule;
+        let mut ctx = build_ctx();
+        let scan = LogicalPlan::Scan(delta_scan_with_action(ColumnId(100)));
+        let plan = project_over(scan, ColumnId(1));
+        assert!(rule.matches(&plan, &ctx));
+        let result = rule.apply(plan, &mut ctx).expect("apply must succeed");
+        let RewriteResult::Changed(LogicalPlan::Project(project)) = result else {
+            panic!("expected Changed(Project)");
+        };
+        assert_eq!(project.items.len(), 2);
+        let last = &project.items[1];
+        assert_eq!(last.output_name, "__change_op");
+        match &last.expr.kind {
+            ExprKind::ColumnRef { column_id, .. } => assert_eq!(*column_id, ColumnId(100)),
+            other => panic!("expected ColumnRef, got {:?}", other),
+        }
+        assert_eq!(last.expr.data_type, DataType::Int8);
+        assert!(!last.expr.nullable);
+    }
+
+    #[test]
+    fn propagate_is_idempotent_on_project_with_action() {
+        let rule = PropagateActionColumnRule;
+        let ctx = build_ctx();
+        let scan = LogicalPlan::Scan(delta_scan_with_action(ColumnId(100)));
+        let mut plan = project_over(scan, ColumnId(1));
+        if let LogicalPlan::Project(p) = &mut plan {
+            p.items.push(ProjectItem {
+                expr: TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        column_id: ColumnId(100),
+                        qualifier: None,
+                        column: "__change_op".to_string(),
+                    },
+                    data_type: DataType::Int8,
+                    nullable: false,
+                },
+                output_name: "__change_op".to_string(),
+            });
+        }
+        assert!(!rule.matches(&plan, &ctx));
+    }
+
+    #[test]
+    fn propagate_skips_bare_scan() {
+        // A bare Scan is not a Project; the rule should not match.
+        let rule = PropagateActionColumnRule;
+        let ctx = build_ctx();
+        let plan = LogicalPlan::Scan(delta_scan_with_action(ColumnId(100)));
         assert!(!rule.matches(&plan, &ctx));
     }
 }
