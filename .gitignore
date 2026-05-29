@@ -16,6 +16,7 @@
 /sql-tests/bootstrap/parquet/
 /sql-tests/.sql_test_catalog
 /tools/target
+/logs/ci-full/
 /tests/sql-test-runner/target
 /vendor/*/target/
 thirdparty/installed

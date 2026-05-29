@@ -1,0 +1,29 @@
+# Stable SQL suites for tools/ci/local-full-ci.sh default daily mode.
+# Benchmark suites are excluded from default daily until benchmark data bootstrap is explicitly part of this runner:
+# ssb
+# tpc-h
+# tpc-ds
+# iceberg-mv-scheduler is excluded until scheduler timing expectations are verified for unattended daily runs.
+aggregate
+analytic
+complex-type
+cte
+decimal
+filter
+function
+iceberg
+iceberg-compatibility
+iceberg-ddl
+iceberg-dml
+iceberg-ivm
+iceberg-rest
+join
+limit
+low-cardinality
+materialized-view
+optimizer
+project
+runtime-filter
+set-op
+sort
+table-function
