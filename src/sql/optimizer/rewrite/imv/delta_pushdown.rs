@@ -52,6 +52,9 @@ impl LogicalRewriteRule for PushDeltaThroughUnaryRule {
         // two-phase structure avoids both (a) moving `delta.input` before we
         // know how to handle the child and (b) rebuilding an identical marker
         // for an unhandled child, which would loop forever under fixpoint.
+        // Fail-fast on unsupported shapes here (structural stage) is the first of
+        // three layers; PropagateActionColumnRule and ActionColumnValidationRule
+        // re-assert the same boundary later with richer diagnostics (base FQN).
         match delta.input.as_ref() {
             LogicalPlan::Project(_) | LogicalPlan::Filter(_) => { /* fall through to push */ }
             LogicalPlan::Aggregate(_) => {
@@ -80,18 +83,21 @@ impl LogicalRewriteRule for PushDeltaThroughUnaryRule {
             _ => return Ok(RewriteResult::Unchanged),
         }
 
-        // `is_root` is preserved on the relocated marker. Nothing reads it
-        // after the delta-marker stage in a way that requires it to remain at
-        // the structural plan root: `WrapRootInImvDeltaRule` only consults it
-        // during the earlier delta-marker stage, validation rejects any marker
-        // regardless of `is_root`, and `BindIcebergScanRule` ignores it.
-        let is_root = delta.is_root;
+        // The relocated marker is no longer at the structural plan root, so it is
+        // is_root: false. WrapRootInImvDelta (the only is_root reader) has already
+        // run in the earlier imv-delta-marker stage and never re-runs.
         let action_column = delta.action_column;
         match *delta.input {
             LogicalPlan::Project(mut p) => {
+                // Commutation Delta(Project(x)) == Project(Delta(x)) holds because
+                // Project items are row-local and the delta only marks each row's
+                // change action (carried through by action-column propagation).
+                // Volatile/non-deterministic projection expressions are out of
+                // scope for Phase 2; window calls cannot appear here (the planner
+                // extracts them into a dedicated WindowNode).
                 let inner = LogicalPlan::ImvDelta(ImvDeltaNode {
                     input: p.input,
-                    is_root,
+                    is_root: false,
                     action_column,
                 });
                 p.input = Box::new(inner);
@@ -100,7 +106,7 @@ impl LogicalRewriteRule for PushDeltaThroughUnaryRule {
             LogicalPlan::Filter(mut f) => {
                 let inner = LogicalPlan::ImvDelta(ImvDeltaNode {
                     input: f.input,
-                    is_root,
+                    is_root: false,
                     action_column,
                 });
                 f.input = Box::new(inner);
@@ -255,7 +261,7 @@ mod tests {
         let LogicalPlan::ImvDelta(delta) = *project.input else {
             panic!("expected ImvDelta under Project");
         };
-        assert!(delta.is_root, "is_root preserved on relocated marker");
+        assert!(!delta.is_root, "relocated marker is no longer the root");
         assert!(matches!(*delta.input, LogicalPlan::Scan(_)));
     }
 
@@ -272,7 +278,7 @@ mod tests {
         let LogicalPlan::ImvDelta(delta) = *filter.input else {
             panic!("expected ImvDelta under Filter");
         };
-        assert!(delta.is_root, "is_root preserved on relocated marker");
+        assert!(!delta.is_root, "relocated marker is no longer the root");
         assert!(matches!(*delta.input, LogicalPlan::Scan(_)));
     }
 
@@ -317,5 +323,68 @@ mod tests {
         assert!(rule.matches(&plan, &ctx));
         let err = rule.apply(plan, &mut ctx).expect_err("Union must fail");
         assert!(err.contains("Phase 6"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn pushes_delta_through_project_then_filter_in_two_steps() {
+        // Delta(Project(Filter(Scan))): one apply pushes through Project,
+        // a second pushes through Filter, reaching Delta(Scan) at the leaf.
+        // This proves the marker fully descends across multiple unary levels
+        // when the rule is driven to fixpoint, one level per apply.
+        let rule = PushDeltaThroughUnaryRule;
+        let mut ctx = ctx();
+        let plan = delta(project_over(filter_over(leaf_scan())));
+
+        // First apply: push through Project.
+        let RewriteResult::Changed(after1) = rule.apply(plan, &mut ctx).expect("apply must succeed")
+        else {
+            panic!("expected Changed after first apply");
+        };
+        let LogicalPlan::Project(p) = after1 else {
+            panic!("expected Project at root");
+        };
+        // The child is now Delta(Filter(Scan)).
+        let LogicalPlan::ImvDelta(_) = p.input.as_ref() else {
+            panic!("expected Delta under Project");
+        };
+
+        // Second apply on the nested Delta(Filter(Scan)): push through Filter.
+        let RewriteResult::Changed(after2) =
+            rule.apply(*p.input, &mut ctx).expect("apply must succeed")
+        else {
+            panic!("expected Changed after second apply");
+        };
+        let LogicalPlan::Filter(f) = after2 else {
+            panic!("expected Filter");
+        };
+        let LogicalPlan::ImvDelta(d) = f.input.as_ref() else {
+            panic!("expected Delta under Filter");
+        };
+        // Leaf marker reached a Scan, and is_root is false (relocated).
+        assert!(matches!(d.input.as_ref(), LogicalPlan::Scan(_)));
+        assert!(!d.is_root, "relocated marker is no longer the root");
+    }
+
+    #[test]
+    fn pushes_through_project_then_fails_fast_at_aggregate() {
+        // Delta(Project(Aggregate(Scan))): one apply pushes through the Project,
+        // yielding Project(Delta(Aggregate(Scan))); a second apply on the nested
+        // Delta(Aggregate(Scan)) must fail-fast with the Phase 4 boundary.
+        let rule = PushDeltaThroughUnaryRule;
+        let mut ctx = ctx();
+        let plan = delta(project_over(aggregate_over(leaf_scan())));
+
+        let RewriteResult::Changed(after1) = rule.apply(plan, &mut ctx).expect("apply must succeed")
+        else {
+            panic!("expected Changed after first apply");
+        };
+        let LogicalPlan::Project(p) = after1 else {
+            panic!("expected Project at root");
+        };
+        // Second apply on Delta(Aggregate(Scan)) must fail-fast.
+        let err = rule
+            .apply(*p.input, &mut ctx)
+            .expect_err("aggregate must fail");
+        assert!(err.contains("Phase 4"), "got: {err}");
     }
 }
