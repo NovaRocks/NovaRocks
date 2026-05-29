@@ -2,14 +2,62 @@
 //! docs/superpowers/specs/2026-05-26-incremental-mv-optimizer-foundation-design.md.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 use std::time::Instant;
 
 use crate::engine::mv::refresh_context::IcebergMvRewriteContext;
+use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::imv::annotation::{ImvExtension, ImvPlanAnnotation};
 use crate::sql::optimizer::rewrite::imv::pipeline::build_imv_pipeline;
 use crate::sql::optimizer::rewrite::trace::RewriteTrace;
 use crate::sql::planner::plan::LogicalPlan;
+
+/// Returns the largest `ColumnId.0` value referenced anywhere in the plan
+/// tree's output columns. Used to seed `ImvExtension::next_column_id` so
+/// IMV rewrite never collides with analyzer-assigned ids. Returns 0 if no
+/// output columns are present.
+fn max_column_id(plan: &LogicalPlan) -> u32 {
+    let mut max = 0u32;
+    visit_output_columns(plan, &mut |id: ColumnId| {
+        if id.0 > max {
+            max = id.0;
+        }
+    });
+    max
+}
+
+fn visit_output_columns(plan: &LogicalPlan, visit: &mut impl FnMut(ColumnId)) {
+    match plan {
+        LogicalPlan::Scan(scan) => {
+            for col in &scan.columns {
+                visit(col.column_id);
+            }
+        }
+        LogicalPlan::Filter(node) => visit_output_columns(&node.input, visit),
+        LogicalPlan::Project(node) => visit_output_columns(&node.input, visit),
+        LogicalPlan::Aggregate(node) => {
+            for col in &node.output_columns {
+                visit(col.column_id);
+            }
+            visit_output_columns(&node.input, visit);
+        }
+        LogicalPlan::Join(node) => {
+            visit_output_columns(&node.left, visit);
+            visit_output_columns(&node.right, visit);
+        }
+        LogicalPlan::Union(node) => {
+            for child in &node.inputs {
+                visit_output_columns(child, visit);
+            }
+        }
+        LogicalPlan::ImvDelta(node) => visit_output_columns(&node.input, visit),
+        LogicalPlan::ImvVersion(node) => visit_output_columns(&node.input, visit),
+        // Other variants reached only after analysis; fall through without
+        // visiting (their schemas are subsumed by the variants above).
+        _ => {}
+    }
+}
 
 pub(crate) struct ImvRewriteInput {
     pub plan: LogicalPlan,
@@ -34,9 +82,11 @@ pub(crate) fn run_imv_rewrite(input: ImvRewriteInput) -> Result<ImvRewriteOutcom
     } = input;
 
     let mut ctx_rw = RewriteContext::for_mv_refresh(disabled_rules);
+    let next_column_id = Arc::new(AtomicU32::new(max_column_id(&plan).saturating_add(1)));
     ctx_rw.set_extension::<ImvExtension>(ImvExtension {
         mv_ctx,
         annotation: ImvPlanAnnotation::default(),
+        next_column_id,
     });
     if let Some(deadline) = deadline {
         ctx_rw.set_deadline(deadline);
@@ -214,6 +264,7 @@ mod tests {
         ctx_rw.set_extension::<ImvExtension>(ImvExtension {
             mv_ctx,
             annotation: ImvPlanAnnotation::default(),
+            next_column_id: Arc::new(AtomicU32::new(1)),
         });
 
         let _ = pipeline.rewrite(empty_values_plan(), &mut ctx_rw).unwrap();
@@ -271,6 +322,7 @@ mod tests {
         ctx_rw.set_extension::<ImvExtension>(ImvExtension {
             mv_ctx: dummy_mv_ctx(),
             annotation: ImvPlanAnnotation::default(),
+            next_column_id: Arc::new(AtomicU32::new(1)),
         });
 
         let _ = pipeline.rewrite(empty_values_plan(), &mut ctx_rw).unwrap();
@@ -343,6 +395,7 @@ mod tests {
         ctx_rw.set_extension::<ImvExtension>(ImvExtension {
             mv_ctx: dummy_mv_ctx(),
             annotation: ImvPlanAnnotation::default(),
+            next_column_id: Arc::new(AtomicU32::new(1)),
         });
 
         let plan = empty_values_plan();
