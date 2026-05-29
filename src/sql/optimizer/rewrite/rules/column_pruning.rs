@@ -85,6 +85,12 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
                         required.insert(col.to_lowercase());
                     }
                 }
+                // Internal columns (e.g. IMV action column) are never pruned.
+                for col in &scan.columns {
+                    if col.is_internal {
+                        required.insert(col.name.to_lowercase());
+                    }
+                }
                 let mut pruned: Vec<String> = scan
                     .columns
                     .iter()
@@ -324,8 +330,26 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
             })
         }
 
-        LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
-            panic!("imv marker leaked into non-IMV plan");
+        LogicalPlan::ImvDelta(node) => {
+            // After IMV scan-binding the marker should be gone; if it survives
+            // to pruning we pass through rather than panic, pruning the child.
+            let input = prune_inner(*node.input, needed);
+            LogicalPlan::ImvDelta(
+                crate::sql::optimizer::rewrite::imv::marker::ImvDeltaNode {
+                    input: Box::new(input),
+                    is_root: node.is_root,
+                    action_column: node.action_column,
+                },
+            )
+        }
+        LogicalPlan::ImvVersion(node) => {
+            let input = prune_inner(*node.input, needed);
+            LogicalPlan::ImvVersion(
+                crate::sql::optimizer::rewrite::imv::marker::ImvVersionNode {
+                    input: Box::new(input),
+                    version_ref: node.version_ref,
+                },
+            )
         }
     }
 }
@@ -561,5 +585,68 @@ mod tests {
         } else {
             panic!("expected Aggregate");
         }
+    }
+
+    fn scan_with_internal_column(table: &TableDef, internal_name: &str) -> ScanNode {
+        let mut scan = scan_node(table);
+        scan.columns.push(OutputColumn {
+            column_id: ColumnId::UNSET,
+            name: internal_name.to_string(),
+            data_type: DataType::Int8,
+            nullable: false,
+            is_internal: true,
+        });
+        scan
+    }
+
+    #[test]
+    fn pruning_preserves_internal_column_when_parent_does_not_request() {
+        let table = three_col_table();
+        let scan = LogicalPlan::Scan(scan_with_internal_column(&table, "__change_op"));
+        let project = LogicalPlan::Project(ProjectNode {
+            input: Box::new(scan),
+            items: vec![ProjectItem {
+                expr: col_ref("a", DataType::Int32),
+                output_name: "a".to_string(),
+            }],
+        });
+        let rule = PruneColumns;
+        let out = rule
+            .apply(project)
+            .expect("rule should fire and set required_columns");
+        if let LogicalPlan::Project(p) = out {
+            if let LogicalPlan::Scan(s) = *p.input {
+                let required = s.required_columns.expect("required_columns must be set");
+                assert!(required.iter().any(|c| c == "a"), "got: {required:?}");
+                assert!(
+                    required.iter().any(|c| c == "__change_op"),
+                    "internal column must be preserved; got: {required:?}"
+                );
+            } else {
+                panic!("expected Scan under Project");
+            }
+        } else {
+            panic!("expected Project");
+        }
+    }
+
+    #[test]
+    fn pruning_passes_through_resolved_imv_delta_marker() {
+        // After the panic→passthrough change, an ImvDelta wrapping a scan must
+        // prune the child without panicking.
+        let table = three_col_table();
+        let scan = LogicalPlan::Scan(scan_node(&table));
+        let delta = LogicalPlan::ImvDelta(
+            crate::sql::optimizer::rewrite::imv::marker::ImvDeltaNode {
+                input: Box::new(scan),
+                is_root: true,
+                action_column: None,
+            },
+        );
+        let rule = PruneColumns;
+        // Must not panic. Pruning at root with None needed leaves the scan's
+        // required_columns as None (no restriction), so apply may return None
+        // (no change). Either way, it must not panic.
+        let _ = rule.apply(delta);
     }
 }
