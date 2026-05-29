@@ -763,6 +763,7 @@ fn build_distinct(
             name: item.output_name.clone(),
             data_type: item.expr.data_type.clone(),
             nullable: item.expr.nullable,
+            is_internal: false,
         });
     }
     LogicalPlan::Aggregate(AggregateNode {
@@ -798,6 +799,7 @@ fn build_window_and_project(
                 name: item.output_name.clone(),
                 data_type: item.expr.data_type.clone(),
                 nullable: item.expr.nullable,
+                is_internal: false,
             });
         }
         // The analytic operator requires input sorted by (partition_by, order_by).
@@ -1298,6 +1300,7 @@ fn split_projection_for_aggregate(
             name: item.output_name.clone(),
             data_type: item.expr.data_type.clone(),
             nullable: item.expr.nullable,
+            is_internal: false,
         });
         project_items.push(ProjectItem {
             expr: rewrite_exact_group_by_expr_ref(&item.expr, group_by),
@@ -1567,6 +1570,7 @@ fn plan_relation_scoped(
                     name: c.name.clone(),
                     data_type: c.data_type.clone(),
                     nullable: c.nullable,
+                    is_internal: false,
                 })
                 .collect();
             Ok(LogicalPlan::Scan(ScanNode {
@@ -1708,6 +1712,7 @@ fn plan_iceberg_metadata_scan(
             name: c.name.clone(),
             data_type: c.data_type.clone(),
             nullable: c.nullable,
+            is_internal: false,
         })
         .collect();
     let table_info = iceberg_table_info(&rel.table.source)
@@ -1890,6 +1895,7 @@ fn plan_iceberg_delta_scan(
             name: c.name.clone(),
             data_type: c.data_type.clone(),
             nullable: c.nullable,
+            is_internal: false,
         })
         .collect();
     for col in &rel.table.iceberg_row_lineage_metadata_columns {
@@ -1898,6 +1904,7 @@ fn plan_iceberg_delta_scan(
             name: col.name.clone(),
             data_type: col.data_type.clone(),
             nullable: col.nullable,
+            is_internal: false,
         });
     }
 
@@ -1990,6 +1997,7 @@ fn plan_values(
                 name,
                 data_type: dt.clone(),
                 nullable: true,
+                is_internal: false,
             }
         })
         .collect();

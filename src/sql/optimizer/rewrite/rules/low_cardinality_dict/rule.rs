@@ -160,6 +160,7 @@ mod tests {
             name: "s".to_string(),
             data_type: DataType::Utf8,
             nullable: false,
+            is_internal: false,
         }
     }
 
@@ -210,6 +211,7 @@ mod tests {
                     name: "cnt".to_string(),
                     data_type: DataType::Int64,
                     nullable: false,
+                    is_internal: false,
                 },
             ],
             already_pushed: false,
@@ -315,6 +317,7 @@ mod tests {
                     name: "cnt".to_string(),
                     data_type: DataType::Int64,
                     nullable: false,
+                    is_internal: false,
                 },
             ],
             already_pushed: false,
@@ -392,6 +395,7 @@ mod tests {
             name: name.to_string(),
             data_type: DataType::Utf8,
             nullable: false,
+            is_internal: false,
         }
     }
 
@@ -1036,6 +1040,7 @@ mod tests {
                 name: "cnt".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
+                is_internal: false,
             }],
             already_pushed: false,
         });
@@ -1098,6 +1103,7 @@ mod tests {
                 name: "m".to_string(),
                 data_type: DataType::Utf8,
                 nullable: false,
+                is_internal: false,
             }],
             already_pushed: false,
         });
@@ -1156,6 +1162,7 @@ mod tests {
                 name: "m".to_string(),
                 data_type: DataType::Utf8,
                 nullable: false,
+                is_internal: false,
             }],
             already_pushed: false,
         });
@@ -1212,6 +1219,7 @@ mod tests {
                 name: "cnt".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
+                is_internal: false,
             }],
             already_pushed: false,
         });

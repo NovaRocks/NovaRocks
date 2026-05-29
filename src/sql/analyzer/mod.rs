@@ -284,6 +284,7 @@ impl<'a> AnalyzerContext<'a> {
                         name: lc.name.clone(),
                         data_type: dt,
                         nullable: lc.nullable || rc.nullable,
+                        is_internal: false,
                     });
                 }
 
@@ -371,6 +372,7 @@ impl<'a> AnalyzerContext<'a> {
                     name,
                     data_type: dt.clone(),
                     nullable: true,
+                    is_internal: false,
                 }
             })
             .collect();
@@ -1404,6 +1406,7 @@ impl<'a> AnalyzerContext<'a> {
                         name: name.clone(),
                         data_type: typed.data_type.clone(),
                         nullable: typed.nullable,
+                        is_internal: false,
                     });
                     projection.push(ProjectItem {
                         expr: typed,
@@ -1429,6 +1432,7 @@ impl<'a> AnalyzerContext<'a> {
                         name: name.clone(),
                         data_type: typed.data_type.clone(),
                         nullable: typed.nullable,
+                        is_internal: false,
                     });
                     // Make the alias visible to later items in the same
                     // projection list, but only if it does not already
@@ -1474,6 +1478,7 @@ impl<'a> AnalyzerContext<'a> {
                             name: col_name.clone(),
                             data_type: data_type.clone(),
                             nullable: *nullable,
+                            is_internal: false,
                         });
                         projection.push(ProjectItem {
                             expr: typed,
@@ -1526,6 +1531,7 @@ impl<'a> AnalyzerContext<'a> {
                             name: col_name.clone(),
                             data_type: data_type.clone(),
                             nullable: *nullable,
+                            is_internal: false,
                         });
                         projection.push(ProjectItem {
                             expr: typed,
@@ -1575,6 +1581,7 @@ impl<'a> AnalyzerContext<'a> {
                             name: col_name.clone(),
                             data_type: data_type.clone(),
                             nullable: *nullable,
+                            is_internal: false,
                         });
                         projection.push(ProjectItem {
                             expr: typed,

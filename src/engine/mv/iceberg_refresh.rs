@@ -8232,6 +8232,7 @@ mod tests {
             name: name.to_string(),
             data_type: ty,
             nullable,
+            is_internal: false,
         }
     }
 

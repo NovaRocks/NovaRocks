@@ -459,6 +459,7 @@ mod tests {
                     name: (*n).into(),
                     data_type: ty.clone(),
                     nullable: false,
+                    is_internal: false,
                 })
                 .collect(),
             predicates: vec![],

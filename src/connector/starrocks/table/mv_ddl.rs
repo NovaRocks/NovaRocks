@@ -1385,6 +1385,7 @@ fn resolved_output_columns_from_body(resolved: &ResolvedQuery) -> Vec<OutputColu
                 name: item.output_name.clone(),
                 data_type: item.expr.data_type.clone(),
                 nullable: item.expr.nullable,
+                is_internal: false,
             })
             .collect(),
         _ => resolved.output_columns.clone(),
@@ -2419,6 +2420,7 @@ mod tests {
             name: "ts".to_string(),
             data_type: DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
             nullable: true,
+            is_internal: false,
         }];
         let fields = vec![IcebergPartitionFieldExpr::Day {
             column: "ts".to_string(),
@@ -2901,18 +2903,21 @@ WHERE amount > 0",
                 name: "id".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
+                is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId::UNSET,
                 name: "customer".to_string(),
                 data_type: DataType::Utf8,
                 nullable: true,
+                is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId::UNSET,
                 name: "amount".to_string(),
                 data_type: DataType::Int64,
                 nullable: true,
+                is_internal: false,
             },
         ];
         let layout = build_mv_storage_layout(
@@ -2965,12 +2970,14 @@ WHERE amount > 0",
                 name: "customer".to_string(),
                 data_type: DataType::Utf8,
                 nullable: true,
+                is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId::UNSET,
                 name: "amount".to_string(),
                 data_type: DataType::Int64,
                 nullable: true,
+                is_internal: false,
             },
         ];
 
@@ -3019,18 +3026,21 @@ GROUP BY k1",
                 name: "k1".to_string(),
                 data_type: DataType::Int32,
                 nullable: false,
+                is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId::UNSET,
                 name: "c".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
+                is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId::UNSET,
                 name: "s".to_string(),
                 data_type: DataType::Int64,
                 nullable: true,
+                is_internal: false,
             },
         ];
         let distribution = stmt.distribution.as_ref().expect("distribution");
@@ -3146,12 +3156,14 @@ GROUP BY k1",
                 name: "__agg_state_c".to_string(),
                 data_type: DataType::Int32,
                 nullable: false,
+                is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId::UNSET,
                 name: "c".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
+                is_internal: false,
             },
         ];
         let err = build_mv_storage_layout(

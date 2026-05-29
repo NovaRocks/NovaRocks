@@ -230,6 +230,7 @@ mod tests {
                 name: "k".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
+                is_internal: false,
             }],
             predicates: Vec::new(),
             required_columns: None,

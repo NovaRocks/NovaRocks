@@ -387,6 +387,7 @@ mod tests {
                     name: c.name.clone(),
                     data_type: c.data_type.clone(),
                     nullable: c.nullable,
+                    is_internal: false,
                 })
                 .collect(),
             predicates: vec![],
@@ -531,12 +532,14 @@ mod tests {
                     name: "b".to_string(),
                     data_type: DataType::Utf8,
                     nullable: true,
+                    is_internal: false,
                 },
                 OutputColumn {
                     column_id: ColumnId::UNSET,
                     name: "sum_c".to_string(),
                     data_type: DataType::Float64,
                     nullable: true,
+                    is_internal: false,
                 },
             ],
             already_pushed: false,

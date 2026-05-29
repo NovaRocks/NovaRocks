@@ -3530,6 +3530,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                         name: name.clone(),
                         data_type: binding.data_type.clone(),
                         nullable: binding.nullable,
+                        is_internal: false,
                     })
                     .collect::<Vec<_>>()
             } else {
@@ -4236,6 +4237,7 @@ mod tests {
             name: "id".to_string(),
             data_type: DataType::Int32,
             nullable: false,
+            is_internal: false,
         }]
     }
 
@@ -5093,6 +5095,7 @@ mod tests {
                 name: "generate_series".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
+                is_internal: false,
             }],
         };
 
@@ -5488,6 +5491,7 @@ mod tests {
                     name: "id".to_string(),
                     data_type: DataType::Utf8,
                     nullable: false,
+                    is_internal: false,
                 }],
                 predicates: vec![],
                 required_columns: None,
@@ -5504,6 +5508,7 @@ mod tests {
                 name: "id".to_string(),
                 data_type: DataType::Utf8,
                 nullable: false,
+                is_internal: false,
             }],
         };
 
@@ -5518,6 +5523,7 @@ mod tests {
                     name: "id".to_string(),
                     data_type: DataType::Utf8,
                     nullable: false,
+                    is_internal: false,
                 }],
             }),
             children: vec![scan],
@@ -5527,6 +5533,7 @@ mod tests {
                 name: "id".to_string(),
                 data_type: DataType::Utf8,
                 nullable: false,
+                is_internal: false,
             }],
         };
 
@@ -5633,12 +5640,14 @@ mod tests {
                         name: "id".to_string(),
                         data_type: DataType::Utf8,
                         nullable: false,
+                        is_internal: false,
                     },
                     OutputColumn {
                         column_id: crate::sql::column_id::ColumnId::UNSET,
                         name: "name".to_string(),
                         data_type: DataType::Utf8,
                         nullable: false,
+                        is_internal: false,
                     },
                 ],
                 predicates: vec![],
@@ -5664,12 +5673,14 @@ mod tests {
                     name: "id".to_string(),
                     data_type: DataType::Utf8,
                     nullable: false,
+                    is_internal: false,
                 },
                 OutputColumn {
                     column_id: crate::sql::column_id::ColumnId::UNSET,
                     name: "name".to_string(),
                     data_type: DataType::Utf8,
                     nullable: false,
+                    is_internal: false,
                 },
             ],
         };
@@ -5858,6 +5869,7 @@ mod tests {
                     name: "__nr_dict_t_s".to_string(),
                     data_type: DataType::Int32,
                     nullable: false,
+                    is_internal: false,
                 }],
                 predicates: vec![],
                 required_columns: Some(vec!["__nr_dict_t_s".to_string()]),
@@ -5874,6 +5886,7 @@ mod tests {
                 name: "__nr_dict_t_s".to_string(),
                 data_type: DataType::Int32,
                 nullable: false,
+                is_internal: false,
             }],
         };
 
@@ -5997,6 +6010,7 @@ mod tests {
                     name: "id".to_string(),
                     data_type: DataType::Utf8,
                     nullable: false,
+                    is_internal: false,
                 }],
                 predicates: vec![],
                 required_columns: None,
@@ -6013,6 +6027,7 @@ mod tests {
                 name: "id".to_string(),
                 data_type: DataType::Utf8,
                 nullable: false,
+                is_internal: false,
             }],
         };
 

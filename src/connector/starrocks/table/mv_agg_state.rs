@@ -1393,18 +1393,21 @@ mod tests {
                 name: "k1".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
+                is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId::UNSET,
                 name: "c".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
+                is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId::UNSET,
                 name: "s".to_string(),
                 data_type: DataType::Int64,
                 nullable: true,
+                is_internal: false,
             },
         ]
     }
@@ -1416,12 +1419,14 @@ mod tests {
                 name: "c".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
+                is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId::UNSET,
                 name: "k1".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
+                is_internal: false,
             },
         ]
     }
@@ -1433,12 +1438,14 @@ mod tests {
                 name: "k1".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
+                is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId::UNSET,
                 name: "c".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
+                is_internal: false,
             },
         ]
     }
@@ -1450,12 +1457,14 @@ mod tests {
                 name: "k1".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
+                is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId::UNSET,
                 name: "s".to_string(),
                 data_type: DataType::Int64,
                 nullable: true,
+                is_internal: false,
             },
         ]
     }
@@ -1853,12 +1862,14 @@ mod tests {
                 name: "k1".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
+                is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId::UNSET,
                 name: "m".to_string(),
                 data_type: value_type,
                 nullable: true,
+                is_internal: false,
             },
         ]
     }
@@ -1913,24 +1924,28 @@ mod tests {
                 name: "k1".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
+                is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId::UNSET,
                 name: "s".to_string(),
                 data_type: DataType::Int64,
                 nullable: true,
+                is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId::UNSET,
                 name: "c".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
+                is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId::UNSET,
                 name: "a".to_string(),
                 data_type: DataType::Int64,
                 nullable: true,
+                is_internal: false,
             },
         ];
         let layout = build_aggregate_mv_layout(&shape, &columns).expect("layout");
@@ -1975,30 +1990,35 @@ mod tests {
                 name: "k1".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
+                is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId::UNSET,
                 name: "mn".to_string(),
                 data_type: DataType::Int64,
                 nullable: true,
+                is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId::UNSET,
                 name: "s".to_string(),
                 data_type: DataType::Int64,
                 nullable: true,
+                is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId::UNSET,
                 name: "c".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
+                is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId::UNSET,
                 name: "mx".to_string(),
                 data_type: DataType::Utf8,
                 nullable: true,
+                is_internal: false,
             },
         ];
         let layout = build_aggregate_mv_layout(&shape, &columns).expect("layout");
@@ -2540,12 +2560,14 @@ mod tests {
                 name: "k".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
+                is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId::UNSET,
                 name: "a".to_string(),
                 data_type: DataType::Decimal128(38, 10),
                 nullable: true,
+                is_internal: false,
             },
         ];
         let err = build_aggregate_mv_layout(&shape, &outputs)
@@ -2572,12 +2594,14 @@ mod tests {
                 name: "k".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
+                is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId::UNSET,
                 name: "a".to_string(),
                 data_type: DataType::Float64,
                 nullable: true,
+                is_internal: false,
             },
         ];
         let float_layout =
@@ -2707,12 +2731,14 @@ mod tests {
                 name: "k1".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
+                is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId::UNSET,
                 name: "a".to_string(),
                 data_type: DataType::Float64,
                 nullable: true,
+                is_internal: false,
             },
         ];
         let layout = build_aggregate_mv_layout(&shape, &output_columns).expect("layout");
@@ -2838,12 +2864,14 @@ mod tests {
                 name: "k1".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
+                is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId::UNSET,
                 name: "a".to_string(),
                 data_type: DataType::Decimal128(38, 10),
                 nullable: true,
+                is_internal: false,
             },
         ];
         let err = build_aggregate_mv_layout(&shape, &output_columns)

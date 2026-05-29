@@ -2724,18 +2724,21 @@ mod mv_target_tests {
                 name: "k1".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
+                is_internal: false,
             },
             crate::sql::analysis::OutputColumn {
                 column_id: crate::sql::column_id::ColumnId::UNSET,
                 name: "c".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
+                is_internal: false,
             },
             crate::sql::analysis::OutputColumn {
                 column_id: crate::sql::column_id::ColumnId::UNSET,
                 name: "s".to_string(),
                 data_type: DataType::Int64,
                 nullable: true,
+                is_internal: false,
             },
         ];
         let layout = crate::connector::starrocks::table::mv_agg_state::build_aggregate_mv_layout(

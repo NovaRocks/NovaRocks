@@ -340,6 +340,7 @@ mod tests {
             name: name.to_string(),
             data_type: DataType::Int64,
             nullable: false,
+            is_internal: false,
         }
     }
 

@@ -326,6 +326,7 @@ mod tests {
                 name: "id".to_string(),
                 data_type: DataType::Int32,
                 nullable: false,
+                is_internal: false,
             }],
             predicates: vec![],
             required_columns: None,
@@ -339,6 +340,7 @@ mod tests {
             name: "id".to_string(),
             data_type: DataType::Int32,
             nullable: false,
+            is_internal: false,
         }]
     }
 

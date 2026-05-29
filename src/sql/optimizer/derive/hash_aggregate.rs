@@ -114,6 +114,7 @@ mod tests {
                 name: "city".into(),
                 data_type: arrow::datatypes::DataType::Utf8,
                 nullable: false,
+                is_internal: false,
             }],
             is_merge: vec![],
         };

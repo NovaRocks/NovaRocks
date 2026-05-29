@@ -1480,6 +1480,7 @@ mod decode_tests {
             name: "string_col".to_string(),
             data_type: DataType::Utf8,
             nullable: true,
+            is_internal: false,
         }];
         let logical_decode = MExpr {
             id: memo.next_expr_id(),
@@ -1648,6 +1649,7 @@ mod join_demotion_tests {
                 name: (*name).into(),
                 data_type: DataType::Int32,
                 nullable: false,
+                is_internal: false,
             })
             .collect();
         let scan_mexpr = MExpr {
@@ -2053,12 +2055,14 @@ mod two_phase_agg_tests {
                         name: "city".into(),
                         data_type: DataType::Int32,
                         nullable: false,
+                        is_internal: false,
                     },
                     OutputColumn {
                         column_id: ColumnId::UNSET,
                         name: "sum(amount)".into(),
                         data_type: DataType::Int64,
                         nullable: true,
+                        is_internal: false,
                     },
                 ],
             }),
@@ -2132,12 +2136,14 @@ mod two_phase_agg_tests {
                         name: "city".into(),
                         data_type: DataType::Int32,
                         nullable: false,
+                        is_internal: false,
                     },
                     OutputColumn {
                         column_id: ColumnId::UNSET,
                         name: "count(distinct id)".into(),
                         data_type: DataType::Int64,
                         nullable: true,
+                        is_internal: false,
                     },
                 ],
             }),
@@ -2187,12 +2193,14 @@ mod two_phase_agg_tests {
                         name: "city % 2".into(),
                         data_type: DataType::Int32,
                         nullable: false,
+                        is_internal: false,
                     },
                     OutputColumn {
                         column_id: ColumnId::UNSET,
                         name: "min(amount)".into(),
                         data_type: DataType::Int32,
                         nullable: true,
+                        is_internal: false,
                     },
                 ],
             }),

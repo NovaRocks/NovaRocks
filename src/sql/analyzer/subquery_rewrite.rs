@@ -516,6 +516,7 @@ impl<'a> AnalyzerContext<'a> {
             name: match_col.clone(),
             data_type: indicator_dtype.clone(),
             nullable: true,
+            is_internal: false,
         });
         let output_columns = modified_sub.output_columns.clone();
         let sub_rel = Relation::Subquery {
@@ -617,6 +618,7 @@ impl<'a> AnalyzerContext<'a> {
             name: match_col.clone(),
             data_type: DataType::Int64,
             nullable: true,
+            is_internal: false,
         }];
         modified_sub.limit = Some(1);
         let output_columns = modified_sub.output_columns.clone();
@@ -1128,6 +1130,7 @@ impl<'a> AnalyzerContext<'a> {
                 name: match_col_name.clone(),
                 data_type: sub_output_col.data_type.clone(),
                 nullable: true,
+                is_internal: false,
             });
             if let QueryBody::Select(ref mut sel) = modified_sub.body {
                 sel.projection.push(ProjectItem {
@@ -1751,6 +1754,7 @@ impl<'a> AnalyzerContext<'a> {
                 name: col_name.clone(),
                 data_type: inner_col.data_type.clone(),
                 nullable: inner_col.nullable,
+                is_internal: false,
             });
             extra_projection.push(ProjectItem {
                 expr: inner_col.clone(),

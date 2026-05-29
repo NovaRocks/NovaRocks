@@ -117,6 +117,7 @@ mod tests {
                 name: "id".into(),
                 data_type: DataType::Int32,
                 nullable: false,
+                is_internal: false,
             }],
             predicates: vec![],
             required_columns: None,
