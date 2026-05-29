@@ -1,58 +1,58 @@
 -- query 8
 array_sortby(x -> x.item, x)
-[{"item":0,"count":640000},{"item":1,"count":640000}]
+[{"item":0,"count":64000},{"item":1,"count":64000}]
 
 -- query 9
 c1	array_sortby(x -> x.item, x)
-0	[{"item":0,"count":128000}]
-1	[{"item":1,"count":128000}]
-2	[{"item":0,"count":128000}]
-3	[{"item":1,"count":128000}]
-4	[{"item":0,"count":128000}]
-5	[{"item":1,"count":128000}]
-6	[{"item":0,"count":128000}]
-7	[{"item":1,"count":128000}]
-8	[{"item":0,"count":128000}]
-9	[{"item":1,"count":128000}]
+0	[{"item":0,"count":12800}]
+1	[{"item":1,"count":12800}]
+2	[{"item":0,"count":12800}]
+3	[{"item":1,"count":12800}]
+4	[{"item":0,"count":12800}]
+5	[{"item":1,"count":12800}]
+6	[{"item":0,"count":12800}]
+7	[{"item":1,"count":12800}]
+8	[{"item":0,"count":12800}]
+9	[{"item":1,"count":12800}]
 
 -- query 11
 array_sortby(x -> x.item, x)
-[{"item":null,"count":1000},{"item":0,"count":640000},{"item":1,"count":640000}]
+[{"item":null,"count":1000},{"item":0,"count":64000},{"item":1,"count":64000}]
 
 -- query 12
 c1	array_sortby(x -> x.item, x)
-0	[{"item":null,"count":100},{"item":0,"count":128000}]
-1	[{"item":null,"count":100},{"item":1,"count":128000}]
-2	[{"item":null,"count":100},{"item":0,"count":128000}]
-3	[{"item":null,"count":100},{"item":1,"count":128000}]
-4	[{"item":null,"count":100},{"item":0,"count":128000}]
-5	[{"item":null,"count":100},{"item":1,"count":128000}]
-6	[{"item":null,"count":100},{"item":0,"count":128000}]
-7	[{"item":null,"count":100},{"item":1,"count":128000}]
-8	[{"item":null,"count":100},{"item":0,"count":128000}]
-9	[{"item":null,"count":100},{"item":1,"count":128000}]
+0	[{"item":null,"count":100},{"item":0,"count":12800}]
+1	[{"item":null,"count":100},{"item":1,"count":12800}]
+2	[{"item":null,"count":100},{"item":0,"count":12800}]
+3	[{"item":null,"count":100},{"item":1,"count":12800}]
+4	[{"item":null,"count":100},{"item":0,"count":12800}]
+5	[{"item":null,"count":100},{"item":1,"count":12800}]
+6	[{"item":null,"count":100},{"item":0,"count":12800}]
+7	[{"item":null,"count":100},{"item":1,"count":12800}]
+8	[{"item":null,"count":100},{"item":0,"count":12800}]
+9	[{"item":null,"count":100},{"item":1,"count":12800}]
 
 -- query 14
 array_sortby(x -> x.item, x)
-[{"item":null,"count":1281000},{"item":0,"count":640000},{"item":1,"count":640000}]
+[{"item":null,"count":129000},{"item":0,"count":64000},{"item":1,"count":64000}]
 
 -- query 15
 c1	array_sortby(x -> x.item, x)
-0	[{"item":null,"count":128100},{"item":0,"count":128000}]
-1	[{"item":null,"count":128100},{"item":1,"count":128000}]
-2	[{"item":null,"count":128100},{"item":0,"count":128000}]
-3	[{"item":null,"count":128100},{"item":1,"count":128000}]
-4	[{"item":null,"count":128100},{"item":0,"count":128000}]
-5	[{"item":null,"count":128100},{"item":1,"count":128000}]
-6	[{"item":null,"count":128100},{"item":0,"count":128000}]
-7	[{"item":null,"count":128100},{"item":1,"count":128000}]
-8	[{"item":null,"count":128100},{"item":0,"count":128000}]
-9	[{"item":null,"count":128100},{"item":1,"count":128000}]
+0	[{"item":null,"count":12900},{"item":0,"count":12800}]
+1	[{"item":null,"count":12900},{"item":1,"count":12800}]
+2	[{"item":null,"count":12900},{"item":0,"count":12800}]
+3	[{"item":null,"count":12900},{"item":1,"count":12800}]
+4	[{"item":null,"count":12900},{"item":0,"count":12800}]
+5	[{"item":null,"count":12900},{"item":1,"count":12800}]
+6	[{"item":null,"count":12900},{"item":0,"count":12800}]
+7	[{"item":null,"count":12900},{"item":1,"count":12800}]
+8	[{"item":null,"count":12900},{"item":0,"count":12800}]
+9	[{"item":null,"count":12900},{"item":1,"count":12800}]
 
 -- query 18
 array_sortby(x -> x.item, x)
-[{"item":null,"count":1280000}]
+[{"item":null,"count":128000}]
 
 -- query 19
 c1	array_sortby(x -> x.item, x)
-NULL	[{"item":null,"count":1280000}]
+NULL	[{"item":null,"count":128000}]

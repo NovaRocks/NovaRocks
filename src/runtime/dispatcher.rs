@@ -262,6 +262,9 @@ enum RootSlotState {
     Error(String),
 }
 
+type QueryKey = (i64, i64);
+type FinstKey = (i64, i64);
+
 struct RootSlot {
     state: Mutex<RootSlotState>,
     notify: Condvar,
@@ -277,15 +280,25 @@ impl RootSlot {
 
     fn set_done(&self, chunks: Vec<Chunk>) {
         let mut guard = self.state.lock().expect("root slot lock");
-        *guard = RootSlotState::Done(VecDeque::from(chunks));
-        self.notify.notify_all();
+        if matches!(*guard, RootSlotState::Running) {
+            *guard = RootSlotState::Done(VecDeque::from(chunks));
+            self.notify.notify_all();
+        }
     }
 
     fn set_error(&self, msg: String) {
         let mut guard = self.state.lock().expect("root slot lock");
-        *guard = RootSlotState::Error(msg);
-        self.notify.notify_all();
+        if matches!(*guard, RootSlotState::Running) {
+            *guard = RootSlotState::Error(msg);
+            self.notify.notify_all();
+        }
     }
+}
+
+#[derive(Clone)]
+struct RootSlotEntry {
+    query_key: QueryKey,
+    slot: Arc<RootSlot>,
 }
 
 // ---------------------------------------------------------------------------
@@ -297,9 +310,13 @@ struct InProcessState {
     exchange_host: String,
     exchange_port: u16,
     /// Root fragment result slots (keyed by finst (hi, lo)).
-    root_slots: Mutex<HashMap<(i64, i64), Arc<RootSlot>>>,
+    root_slots: Mutex<HashMap<FinstKey, RootSlotEntry>>,
     /// All submitted fragment instance IDs, used for bulk cancel.
-    submitted_ids: Mutex<Vec<(i64, i64)>>,
+    submitted_ids: Mutex<Vec<FinstKey>>,
+    /// First non-root fragment error by query. If it happens before the root
+    /// slot is installed, that query's root slot picks it up during root
+    /// submission.
+    fragment_errors: Mutex<HashMap<QueryKey, String>>,
 }
 
 /// Dispatcher that runs all fragments in-process via `std::thread::spawn`.
@@ -321,6 +338,7 @@ impl InProcessDispatcher {
                 exchange_port,
                 root_slots: Mutex::new(HashMap::new()),
                 submitted_ids: Mutex::new(Vec::new()),
+                fragment_errors: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -332,7 +350,7 @@ impl Default for InProcessDispatcher {
     }
 }
 
-fn submitted_ids_snapshot(state: &InProcessState) -> Vec<(i64, i64)> {
+fn submitted_ids_snapshot(state: &InProcessState) -> Vec<FinstKey> {
     state
         .submitted_ids
         .lock()
@@ -353,6 +371,33 @@ fn cancel_all_submitted(state: &InProcessState) {
     for (hi, lo) in submitted_ids_snapshot(state) {
         cancel_fragment_instance(hi, lo);
     }
+}
+
+fn record_fragment_error(state: &InProcessState, query_key: QueryKey, msg: String) {
+    let msg = {
+        let mut guard = state.fragment_errors.lock().expect("fragment_errors lock");
+        guard.entry(query_key).or_insert(msg).clone()
+    };
+    let slots: Vec<Arc<RootSlot>> = state
+        .root_slots
+        .lock()
+        .expect("root_slots lock")
+        .values()
+        .filter(|entry| entry.query_key == query_key)
+        .map(|entry| Arc::clone(&entry.slot))
+        .collect();
+    for slot in slots {
+        slot.set_error(msg.clone());
+    }
+}
+
+fn pending_fragment_error(state: &InProcessState, query_key: QueryKey) -> Option<String> {
+    state
+        .fragment_errors
+        .lock()
+        .expect("fragment_errors lock")
+        .get(&query_key)
+        .cloned()
 }
 
 fn format_fragment_error(finst_key: (i64, i64), error: &str) -> String {
@@ -393,6 +438,7 @@ impl FragmentDispatcher for InProcessDispatcher {
             exec_params.fragment_instance_id.hi,
             exec_params.fragment_instance_id.lo,
         );
+        let query_key = (exec_params.query_id.hi, exec_params.query_id.lo);
 
         // Track this finst_id for bulk cancel.
         {
@@ -407,7 +453,16 @@ impl FragmentDispatcher for InProcessDispatcher {
             let slot = RootSlot::new();
             {
                 let mut slots = self.state.root_slots.lock().expect("root_slots lock");
-                slots.insert(finst_key, Arc::clone(&slot));
+                slots.insert(
+                    finst_key,
+                    RootSlotEntry {
+                        query_key,
+                        slot: Arc::clone(&slot),
+                    },
+                );
+            }
+            if let Some(msg) = pending_fragment_error(&self.state, query_key) {
+                slot.set_error(msg);
             }
 
             let state = Arc::clone(&self.state);
@@ -423,6 +478,7 @@ impl FragmentDispatcher for InProcessDispatcher {
                 let result = crate::service::internal_service::execute_plan_fragment_sync(params);
                 if let Err(e) = result {
                     warn!("{}", format_fragment_error(finst_key, &e));
+                    record_fragment_error(&state, query_key, e);
                     // Cancel all exchanges so blocked receivers (including root) unblock.
                     cancel_all_submitted(&state);
                 }
@@ -441,7 +497,7 @@ impl FragmentDispatcher for InProcessDispatcher {
         let slot = {
             let slots = self.state.root_slots.lock().expect("root_slots lock");
             match slots.get(&key) {
-                Some(slot) => Arc::clone(slot),
+                Some(entry) => Arc::clone(&entry.slot),
                 // Not a root fragment finst_id: treat as Eof (no data).
                 None => {
                     warn!(
@@ -1195,7 +1251,13 @@ mod tests {
             .root_slots
             .lock()
             .expect("root_slots lock")
-            .insert(finst_key, Arc::clone(&slot));
+            .insert(
+                finst_key,
+                RootSlotEntry {
+                    query_key: finst_key,
+                    slot: Arc::clone(&slot),
+                },
+            );
 
         finish_root_fragment_in_process(finst_key, Arc::clone(&dispatcher.state), slot, || {
             panic!("root fragment panic for test")
@@ -1210,6 +1272,62 @@ mod tests {
         assert!(
             message.contains("panicked") && message.contains("root fragment panic for test"),
             "unexpected panic error message: {message}"
+        );
+    }
+
+    #[test]
+    fn root_slot_preserves_first_fragment_error() {
+        let slot = RootSlot::new();
+        slot.set_error("Mem usage has exceed the limit of BE: BE:10004".to_string());
+        slot.set_error("exchange canceled".to_string());
+
+        let guard = slot.state.lock().expect("root slot lock");
+        let RootSlotState::Error(message) = &*guard else {
+            panic!("expected root slot error");
+        };
+        assert!(
+            message.contains("Mem usage has exceed the limit of BE: BE:10004"),
+            "unexpected root slot error: {message}"
+        );
+    }
+
+    #[test]
+    fn fragment_error_is_scoped_to_query() {
+        let dispatcher = InProcessDispatcher::default();
+        let query_a = (10, 1);
+        let query_b = (20, 1);
+        let slot_a = RootSlot::new();
+        let slot_b = RootSlot::new();
+        {
+            let mut slots = dispatcher.state.root_slots.lock().expect("root_slots lock");
+            slots.insert(
+                (10, 2),
+                RootSlotEntry {
+                    query_key: query_a,
+                    slot: Arc::clone(&slot_a),
+                },
+            );
+            slots.insert(
+                (20, 2),
+                RootSlotEntry {
+                    query_key: query_b,
+                    slot: Arc::clone(&slot_b),
+                },
+            );
+        }
+
+        record_fragment_error(&dispatcher.state, query_a, "first query failed".to_string());
+
+        let guard_a = slot_a.state.lock().expect("slot a lock");
+        assert!(
+            matches!(&*guard_a, RootSlotState::Error(message) if message == "first query failed"),
+            "query A root slot should receive its fragment error"
+        );
+        drop(guard_a);
+        let guard_b = slot_b.state.lock().expect("slot b lock");
+        assert!(
+            matches!(&*guard_b, RootSlotState::Running),
+            "query B root slot must not inherit query A's fragment error"
         );
     }
 

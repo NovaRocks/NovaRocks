@@ -2421,6 +2421,15 @@ fn top_level_stream_root_wrapper_child_id(
     if root.plan.nodes.len() != 1 || root.plan.nodes[0].node_type != TPlanNodeType::EXCHANGE_NODE {
         return None;
     }
+    let root_exchange = &root.plan.nodes[0];
+    if root_exchange.limit >= 0 {
+        return None;
+    }
+    if let Some(exchange) = root_exchange.exchange_node.as_ref()
+        && (exchange.sort_info.is_some() || exchange.offset.unwrap_or(0) > 0)
+    {
+        return None;
+    }
     if br
         .edges
         .iter()
@@ -4833,6 +4842,26 @@ enable_path_style_access = true
                 crate::sql::codegen::FragmentEdgeKind::Stream
             )
         }));
+    }
+
+    #[test]
+    fn top_level_wrapper_with_limit_is_not_stripped() {
+        let build = build_fragments_for_query("SELECT id FROM tbl LIMIT 5");
+
+        assert!(
+            super::top_level_stream_root_wrapper_child_id(&build).is_none(),
+            "top-level exchange wrapper carrying LIMIT must stay as the root"
+        );
+    }
+
+    #[test]
+    fn top_level_merging_topn_wrapper_is_not_stripped() {
+        let build = build_fragments_for_query("SELECT id FROM tbl ORDER BY id LIMIT 5");
+
+        assert!(
+            super::top_level_stream_root_wrapper_child_id(&build).is_none(),
+            "top-level exchange wrapper carrying merging TopN semantics must stay as the root"
+        );
     }
 
     #[test]

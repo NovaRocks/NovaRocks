@@ -13,6 +13,7 @@ ci_init_summary_state() {
   CI_STARTED_EPOCH="$(ci_epoch)"
   CI_STAGE_ROWS=""
   CI_SQL_ROWS=""
+  CI_SQL_CASE_ROWS=""
   CI_FAILURE_TAIL=""
   CI_REPO_PATH=""
   CI_BRANCH_NAME=""
@@ -64,13 +65,52 @@ ci_record_stage() {
 
 ci_record_sql_suite() {
   local suite="$1"
-  local status="$2"
+  local suite_status="$2"
   local duration="$3"
   local log_path="$4"
   local rel_log
   rel_log="$(ci_rel_log "$log_path")"
-  CI_SQL_ROWS="${CI_SQL_ROWS}| ${suite} | ${status} | ${duration}s | ${rel_log} |
+  CI_SQL_ROWS="${CI_SQL_ROWS}| ${suite} | ${suite_status} | ${duration}s | ${rel_log} |
 "
+  ci_record_sql_case_timings "$log_path"
+}
+
+ci_record_sql_case_timings() {
+  local log_path="$1"
+  local in_case_timings="false"
+  local line
+  local suite_name
+  local case_id
+  local case_status
+  local elapsed
+
+  [ -f "$log_path" ] || return 0
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ "$line" = "case timings (all):" ]; then
+      in_case_timings="true"
+      continue
+    fi
+
+    if [ "$in_case_timings" != "true" ]; then
+      continue
+    fi
+
+    case "$line" in
+      =*)
+        break
+        ;;
+    esac
+
+    if [[ "$line" =~ ^[[:space:]]+\[([^]]+)\][[:space:]]+([^[:space:]]+)[[:space:]]+([A-Z]+)[[:space:]]+([0-9]+(\.[0-9]+)?)s$ ]]; then
+      suite_name="${BASH_REMATCH[1]}"
+      case_id="${BASH_REMATCH[2]}"
+      case_status="${BASH_REMATCH[3]}"
+      elapsed="${BASH_REMATCH[4]}"
+      CI_SQL_CASE_ROWS="${CI_SQL_CASE_ROWS}| ${suite_name} | ${case_status} | ${case_id} | ${elapsed}s |
+"
+    fi
+  done <"$log_path"
 }
 
 ci_mark_failure_tail() {
@@ -133,6 +173,14 @@ ci_render_summary() {
       printf "%s" "$CI_SQL_ROWS"
     fi
     printf "\n"
+
+    if [ -n "$CI_SQL_CASE_ROWS" ]; then
+      printf "## SQL Case Timings\n\n"
+      printf "| Suite | Status | Case | Duration |\n"
+      printf "| --- | --- | --- | --- |\n"
+      printf "%s" "$CI_SQL_CASE_ROWS"
+      printf "\n"
+    fi
 
     if [ -n "$CI_FAILURE_TAIL" ]; then
       printf "## Failure Tail\n\n"
