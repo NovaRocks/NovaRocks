@@ -1,13 +1,14 @@
 //! IMV rewrite pipeline construction.
 //!
-//! Stages run in order: logical normalize, delta marker, scan binding, action
-//! propagation, marker cleanup, validation. Each stage's name is part of the
-//! trace contract and is asserted in pipeline tests.
+//! Stages run in order: logical normalize, delta marker, delta pushdown, scan
+//! binding, action propagation, marker cleanup, validation. Each stage's name
+//! is part of the trace contract and is asserted in pipeline tests.
 
 use crate::sql::optimizer::rewrite::imv::action_column::ActionColumnValidationRule;
 use crate::sql::optimizer::rewrite::imv::action_propagation::{
     InjectActionColumnRule, PropagateActionColumnRule,
 };
+use crate::sql::optimizer::rewrite::imv::delta_pushdown::PushDeltaThroughUnaryRule;
 use crate::sql::optimizer::rewrite::imv::marker::{
     UnresolvedMarkerCheckRule, WrapRootInImvDeltaRule,
 };
@@ -27,6 +28,11 @@ pub(crate) fn build_imv_pipeline() -> RewritePipeline {
             "imv-delta-marker",
             RewritePhase::StructuralRewrite,
             vec![Box::new(WrapRootInImvDeltaRule::new()) as Box<dyn LogicalRewriteRule>],
+        ),
+        RewriteStage::new(
+            "imv-delta-pushdown",
+            RewritePhase::StructuralRewrite,
+            vec![Box::new(PushDeltaThroughUnaryRule) as Box<dyn LogicalRewriteRule>],
         ),
         RewriteStage::new(
             "imv-scan-binding",

@@ -70,7 +70,7 @@ pub(crate) fn run_imv_rewrite(input: ImvRewriteInput) -> Result<ImvRewriteOutcom
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::OutputColumn;
+    use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
     use crate::sql::catalog::{
         ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
@@ -80,7 +80,7 @@ mod tests {
     use crate::sql::optimizer::rewrite::phase::RewritePhase;
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
-    use crate::sql::planner::plan::{LogicalPlan, ScanNode, ValuesNode};
+    use crate::sql::planner::plan::{LogicalPlan, ProjectNode, ScanNode, ValuesNode};
     use arrow::datatypes::DataType;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -310,7 +310,7 @@ mod tests {
         })
         .expect("unknown disabled rule must not break the pipeline");
 
-        assert_eq!(outcome.trace.stage_names().len(), 6);
+        assert_eq!(outcome.trace.stage_names().len(), 7);
     }
 
     // ── Task-5 helpers ──────────────────────────────────────────────────────
@@ -435,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn imv_pipeline_traces_six_stage_names() {
+    fn imv_pipeline_traces_seven_stage_names() {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
             mv_ctx: dummy_mv_ctx(),
@@ -450,6 +450,7 @@ mod tests {
             vec![
                 "imv-logical-normalize",
                 "imv-delta-marker",
+                "imv-delta-pushdown",
                 "imv-scan-binding",
                 "imv-action-propagation",
                 "imv-marker-cleanup",
@@ -558,5 +559,73 @@ mod tests {
             .expect("action column must be present");
         assert_eq!(action.data_type, arrow::datatypes::DataType::Int8);
         assert!(!action.nullable);
+    }
+
+    #[test]
+    fn imv_pipeline_propagates_action_through_project_end_to_end() {
+        // Build Project(k) over the iceberg scan. The full pipeline must:
+        // wrap → bind (DataFiles→DeltaTable) → inject __change_op on the scan
+        // → propagate it into the Project → pass validation.
+        let scan = iceberg_scan_plan();
+        let project = LogicalPlan::Project(ProjectNode {
+            input: Box::new(scan),
+            items: vec![ProjectItem {
+                expr: TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        column_id: ColumnId(1),
+                        qualifier: None,
+                        column: "k".to_string(),
+                    },
+                    data_type: DataType::Int64,
+                    nullable: false,
+                },
+                output_name: "k".to_string(),
+            }],
+        });
+
+        let outcome = run_imv_rewrite(ImvRewriteInput {
+            plan: project,
+            mv_ctx: dummy_mv_ctx(),
+            disabled_rules: Vec::new(),
+            deadline: None,
+            next_column_id: 100,
+        })
+        .expect("Project over delta scan must rewrite and pass validation");
+
+        // Outcome root is a Project that exposes the propagated action column.
+        let LogicalPlan::Project(project) = outcome.plan else {
+            panic!("expected Project outcome, got {:?}", outcome.plan);
+        };
+        assert!(
+            project
+                .items
+                .iter()
+                .any(|item| item.output_name.eq_ignore_ascii_case("__change_op")),
+            "Project must expose propagated action column; items: {:?}",
+            project
+                .items
+                .iter()
+                .map(|i| &i.output_name)
+                .collect::<Vec<_>>()
+        );
+        // The user column is still present.
+        assert!(
+            project.items.iter().any(|item| item.output_name == "k"),
+            "user column k must remain"
+        );
+        // The child scan is delta-bound and carries the internal action column.
+        let LogicalPlan::Scan(scan) = *project.input else {
+            panic!("expected Scan under Project");
+        };
+        assert!(
+            matches!(scan.table.source, ScanSource::IcebergDeltaTable { .. }),
+            "child scan must be delta-bound"
+        );
+        assert!(
+            scan.columns
+                .iter()
+                .any(|c| c.is_internal && c.name.eq_ignore_ascii_case("__change_op")),
+            "child scan must carry the internal action column"
+        );
     }
 }
