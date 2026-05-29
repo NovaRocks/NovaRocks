@@ -13,8 +13,9 @@ use crate::sql::analysis::OutputColumn;
 use crate::sql::catalog::ScanSource;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
+use crate::sql::optimizer::rewrite::imv::action_propagation::first_delta_base_fqn;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
-use crate::sql::optimizer::rewrite::result::RewriteResult;
+use crate::sql::optimizer::rewrite::result::{RewriteDiagnostic, RewriteResult};
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
 use crate::sql::planner::plan::{LogicalPlan, ScanNode};
 
@@ -84,8 +85,13 @@ impl LogicalRewriteRule for ActionColumnValidationRule {
 
     fn apply(&self, plan: LogicalPlan, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         self.fired.store(true, std::sync::atomic::Ordering::SeqCst);
-        validate(&plan)?;
-        Ok(RewriteResult::Unchanged)
+        match validate(&plan) {
+            Ok(()) => Ok(RewriteResult::Unchanged),
+            Err(message) => Ok(RewriteResult::Rejected(RewriteDiagnostic::rejected(
+                "ActionColumnValidation",
+                message,
+            ))),
+        }
     }
 }
 
@@ -101,39 +107,61 @@ fn validate(plan: &LogicalPlan) -> Result<(), String> {
     Ok(())
 }
 
+// Markers (ImvDelta/ImvVersion) are guaranteed absent here because
+// UnresolvedMarkerCheckRule precedes ActionColumnValidation in the
+// imv-validation stage and rejects any surviving marker.
 fn validate_node(plan: &LogicalPlan) -> Result<(), String> {
     match plan {
         LogicalPlan::Scan(scan) => validate_scan(scan),
         LogicalPlan::Filter(node) => validate_node(&node.input),
         LogicalPlan::Project(node) => {
             validate_node(&node.input)?;
-            // V3: if a delta is below, Project must expose the action column
+            // V3: if a delta is below, Project must expose the action column.
+            // NOTE: this re-walks the subtree per Project node, so validation is
+            // O(depth * subtree) on deep linear plans. Negligible for Phase 2's
+            // single-table shapes; revisit with memoization if plans grow.
             if subtree_has_delta(&node.input) {
                 let has = node
                     .items
                     .iter()
                     .any(|item| item.output_name.eq_ignore_ascii_case(ImvActionColumn::NAME));
                 if !has {
-                    return Err(
-                        "action column dropped at Project above delta-bound scan".to_string(),
-                    );
+                    let fqn = first_delta_base_fqn(&node.input)
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    return Err(format!(
+                        "action column dropped at Project above delta-bound scan {fqn}"
+                    ));
                 }
             }
             Ok(())
         }
-        LogicalPlan::Aggregate(_) if subtree_has_delta(plan) => Err(
-            "Phase 2 does not support Aggregate above delta-bound scans; deferred to Phase 4"
-                .to_string(),
-        ),
-        LogicalPlan::Join(_) if subtree_has_delta(plan) => Err(
-            "Phase 2 does not support Join above delta-bound scans; deferred to Phase 5".to_string(),
-        ),
-        LogicalPlan::Union(_) if subtree_has_delta(plan) => Err(
-            "Phase 2 does not support Union above delta-bound scans; deferred to Phase 6"
-                .to_string(),
-        ),
-        // Other nodes pass through; should be unreachable above a delta in
-        // well-formed Phase 2 plans (propagation rule fails-fast earlier).
+        LogicalPlan::Aggregate(_) if subtree_has_delta(plan) => {
+            let fqn = first_delta_base_fqn(plan).unwrap_or_else(|| "<unknown>".to_string());
+            Err(format!(
+                "Phase 2 does not support Aggregate above delta-bound scan {fqn}; deferred to Phase 4"
+            ))
+        }
+        LogicalPlan::Join(_) if subtree_has_delta(plan) => {
+            let fqn = first_delta_base_fqn(plan).unwrap_or_else(|| "<unknown>".to_string());
+            Err(format!(
+                "Phase 2 does not support Join above delta-bound scan {fqn}; deferred to Phase 5"
+            ))
+        }
+        LogicalPlan::Union(_) if subtree_has_delta(plan) => {
+            let fqn = first_delta_base_fqn(plan).unwrap_or_else(|| "<unknown>".to_string());
+            Err(format!(
+                "Phase 2 does not support Union above delta-bound scan {fqn}; deferred to Phase 6"
+            ))
+        }
+        // Last safety gate: any unhandled node kind (Sort/Limit/Window/etc.)
+        // sitting above a delta subtree is unsupported in Phase 2 and rejected.
+        other if subtree_has_delta(other) => {
+            let fqn = first_delta_base_fqn(other).unwrap_or_else(|| "<unknown>".to_string());
+            Err(format!(
+                "Phase 2 does not support this plan shape above delta-bound scan {fqn}; \
+                 only Scan/Project/Filter are supported"
+            ))
+        }
         _ => Ok(()),
     }
 }
@@ -378,5 +406,73 @@ mod tests {
         });
         let err = validate(&project).expect_err("dropped action must fail");
         assert!(err.contains("dropped at Project"), "got: {err}");
+    }
+
+    fn version_scan_with_action() -> ScanNode {
+        let mut scan = delta_scan_with(Some(ImvActionColumn::output_column(ColumnId(100))));
+        // Re-point the source to a version scan while keeping the (illegal) action column.
+        let table = match &scan.table.source {
+            ScanSource::IcebergDeltaTable { table, .. } => table.clone(),
+            _ => unreachable!(),
+        };
+        scan.table.source = ScanSource::IcebergVersionTable { table, snapshot_id: 22 };
+        scan
+    }
+
+    #[test]
+    fn validation_rejects_action_column_on_version_scan() {
+        let plan = LogicalPlan::Scan(version_scan_with_action());
+        let err = validate(&plan).expect_err("version scan with action must fail");
+        assert!(err.contains("must not carry action column"), "got: {err}");
+        assert!(err.contains("ice.db.b"), "got: {err}");
+    }
+
+    #[test]
+    fn validation_rejects_aggregate_above_delta() {
+        use crate::sql::planner::plan::AggregateNode;
+        let scan = LogicalPlan::Scan(delta_scan_with(Some(
+            ImvActionColumn::output_column(ColumnId(100)),
+        )));
+        let plan = LogicalPlan::Aggregate(AggregateNode {
+            input: Box::new(scan),
+            group_by: Vec::new(),
+            aggregates: Vec::new(),
+            output_columns: Vec::new(),
+            already_pushed: false,
+        });
+        let err = validate(&plan).expect_err("aggregate above delta must fail");
+        assert!(err.contains("Phase 4"), "got: {err}");
+        assert!(err.contains("ice.db.b"), "got: {err}");
+    }
+
+    #[test]
+    fn validation_rejects_join_above_delta() {
+        use crate::sql::analysis::JoinKind;
+        use crate::sql::planner::plan::JoinNode;
+        let left = LogicalPlan::Scan(delta_scan_with(Some(
+            ImvActionColumn::output_column(ColumnId(100)),
+        )));
+        let right = LogicalPlan::Scan(delta_scan_with(None));
+        let plan = LogicalPlan::Join(JoinNode {
+            left: Box::new(left),
+            right: Box::new(right),
+            join_type: JoinKind::Inner,
+            condition: None,
+        });
+        let err = validate(&plan).expect_err("join above delta must fail");
+        assert!(err.contains("Phase 5"), "got: {err}");
+    }
+
+    #[test]
+    fn validation_rejects_union_above_delta() {
+        use crate::sql::planner::plan::UnionNode;
+        let plan = LogicalPlan::Union(UnionNode {
+            inputs: vec![LogicalPlan::Scan(delta_scan_with(Some(
+                ImvActionColumn::output_column(ColumnId(100)),
+            )))],
+            all: true,
+        });
+        let err = validate(&plan).expect_err("union above delta must fail");
+        assert!(err.contains("Phase 6"), "got: {err}");
     }
 }

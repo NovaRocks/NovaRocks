@@ -75,7 +75,7 @@ pub(crate) fn subtree_has_action_column(plan: &LogicalPlan) -> bool {
 /// Recurses through every child-bearing variant (unlike the action-column
 /// helpers, which only need Scan/Filter/Project), because an unsupported
 /// Join/Union/Aggregate node's delta scan can sit under any branch.
-fn first_delta_base_fqn(plan: &LogicalPlan) -> Option<String> {
+pub(crate) fn first_delta_base_fqn(plan: &LogicalPlan) -> Option<String> {
     match plan {
         LogicalPlan::Scan(scan) => match &scan.table.source {
             ScanSource::IcebergDeltaTable { table, .. } => Some(format!(
