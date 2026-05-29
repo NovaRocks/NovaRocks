@@ -331,8 +331,11 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
         }
 
         LogicalPlan::ImvDelta(node) => {
-            // After IMV scan-binding the marker should be gone; if it survives
-            // to pruning we pass through rather than panic, pruning the child.
+            // Defensive totality: PruneColumns is registered only in the
+            // standalone optimizer pipeline, never in build_imv_pipeline(), and
+            // the IMV pipeline rejects unresolved markers before pruning. This
+            // arm is therefore unreachable in production; it exists so the rule
+            // is total over LogicalPlan and never panics on a stray marker.
             let input = prune_inner(*node.input, needed);
             LogicalPlan::ImvDelta(
                 crate::sql::optimizer::rewrite::imv::marker::ImvDeltaNode {
@@ -343,6 +346,7 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
             )
         }
         LogicalPlan::ImvVersion(node) => {
+            // See ImvDelta arm.
             let input = prune_inner(*node.input, needed);
             LogicalPlan::ImvVersion(
                 crate::sql::optimizer::rewrite::imv::marker::ImvVersionNode {
@@ -632,21 +636,33 @@ mod tests {
 
     #[test]
     fn pruning_passes_through_resolved_imv_delta_marker() {
-        // After the panic→passthrough change, an ImvDelta wrapping a scan must
-        // prune the child without panicking.
+        // The passthrough arm must prune the child and re-wrap the marker
+        // without panicking, preserving the marker's fields.
         let table = three_col_table();
         let scan = LogicalPlan::Scan(scan_node(&table));
-        let delta = LogicalPlan::ImvDelta(
-            crate::sql::optimizer::rewrite::imv::marker::ImvDeltaNode {
-                input: Box::new(scan),
-                is_root: true,
-                action_column: None,
-            },
-        );
-        let rule = PruneColumns;
-        // Must not panic. Pruning at root with None needed leaves the scan's
-        // required_columns as None (no restriction), so apply may return None
-        // (no change). Either way, it must not panic.
-        let _ = rule.apply(delta);
+        let delta = LogicalPlan::ImvDelta(crate::sql::optimizer::rewrite::imv::marker::ImvDeltaNode {
+            input: Box::new(scan),
+            is_root: true,
+            action_column: None,
+        });
+        // Drive prune_inner directly with a restriction so the child is pruned
+        // and we can observe the re-wrapped marker structure.
+        let mut needed = std::collections::HashSet::new();
+        needed.insert("a".to_string());
+        let out = prune_inner(delta, Some(&needed));
+        match out {
+            LogicalPlan::ImvDelta(node) => {
+                assert!(node.is_root, "is_root must be preserved");
+                assert!(node.action_column.is_none(), "action_column must be preserved");
+                match *node.input {
+                    LogicalPlan::Scan(s) => {
+                        let req = s.required_columns.expect("child scan should be pruned");
+                        assert!(req.iter().any(|c| c == "a"), "got: {req:?}");
+                    }
+                    other => panic!("expected Scan under ImvDelta, got {other:?}"),
+                }
+            }
+            other => panic!("expected ImvDelta, got {other:?}"),
+        }
     }
 }
