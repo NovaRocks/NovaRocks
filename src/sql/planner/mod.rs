@@ -643,7 +643,9 @@ fn substitute_expr_in_place(expr: &mut TypedExpr, substitutions: &[(String, Type
                 substitute_expr_in_place(e, substitutions);
             }
         }
-        ExprKind::InList { expr: inner, list, .. } => {
+        ExprKind::InList {
+            expr: inner, list, ..
+        } => {
             substitute_expr_in_place(inner, substitutions);
             for v in list {
                 substitute_expr_in_place(v, substitutions);

@@ -235,11 +235,13 @@ mod tests {
     use super::*;
     use crate::engine::mv::refresh_context::tests_support::dummy_rewrite_context;
     use crate::sql::analysis::OutputColumn;
-    use crate::sql::catalog::{ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
+    use crate::sql::analysis::{JoinKind, LiteralValue};
+    use crate::sql::catalog::{
+        ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
+    };
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::imv::annotation::{ImvExtension, ImvPlanAnnotation};
-    use crate::sql::analysis::{JoinKind, LiteralValue};
     use crate::sql::planner::plan::{
         AggregateNode, FilterNode, JoinNode, LogicalPlan, ScanNode, UnionNode,
     };
@@ -352,7 +354,8 @@ mod tests {
         let rule = InjectActionColumnRule;
         let ctx = build_ctx();
         let mut scan = delta_scan();
-        scan.columns.push(ImvActionColumn::output_column(ColumnId(9)));
+        scan.columns
+            .push(ImvActionColumn::output_column(ColumnId(9)));
         let plan = LogicalPlan::Scan(scan);
         assert!(!rule.matches(&plan, &ctx));
     }

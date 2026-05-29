@@ -337,13 +337,11 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
             // arm is therefore unreachable in production; it exists so the rule
             // is total over LogicalPlan and never panics on a stray marker.
             let input = prune_inner(*node.input, needed);
-            LogicalPlan::ImvDelta(
-                crate::sql::optimizer::rewrite::imv::marker::ImvDeltaNode {
-                    input: Box::new(input),
-                    is_root: node.is_root,
-                    action_column: node.action_column,
-                },
-            )
+            LogicalPlan::ImvDelta(crate::sql::optimizer::rewrite::imv::marker::ImvDeltaNode {
+                input: Box::new(input),
+                is_root: node.is_root,
+                action_column: node.action_column,
+            })
         }
         LogicalPlan::ImvVersion(node) => {
             // See ImvDelta arm.
@@ -640,11 +638,12 @@ mod tests {
         // without panicking, preserving the marker's fields.
         let table = three_col_table();
         let scan = LogicalPlan::Scan(scan_node(&table));
-        let delta = LogicalPlan::ImvDelta(crate::sql::optimizer::rewrite::imv::marker::ImvDeltaNode {
-            input: Box::new(scan),
-            is_root: true,
-            action_column: None,
-        });
+        let delta =
+            LogicalPlan::ImvDelta(crate::sql::optimizer::rewrite::imv::marker::ImvDeltaNode {
+                input: Box::new(scan),
+                is_root: true,
+                action_column: None,
+            });
         // Drive prune_inner directly with a restriction so the child is pruned
         // and we can observe the re-wrapped marker structure.
         let mut needed = std::collections::HashSet::new();
@@ -653,7 +652,10 @@ mod tests {
         match out {
             LogicalPlan::ImvDelta(node) => {
                 assert!(node.is_root, "is_root must be preserved");
-                assert!(node.action_column.is_none(), "action_column must be preserved");
+                assert!(
+                    node.action_column.is_none(),
+                    "action_column must be preserved"
+                );
                 match *node.input {
                     LogicalPlan::Scan(s) => {
                         let req = s.required_columns.expect("child scan should be pruned");

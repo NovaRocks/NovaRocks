@@ -193,7 +193,9 @@ fn validate_scan(scan: &ScanNode) -> Result<(), String> {
                 }
                 Ok(())
             }
-            _ => Err(format!("Delta-bound scan {fqn} has duplicate action columns")),
+            _ => Err(format!(
+                "Delta-bound scan {fqn} has duplicate action columns"
+            )),
         },
         ScanSource::IcebergVersionTable { .. } => {
             if !action_columns.is_empty() {
@@ -215,9 +217,7 @@ fn subtree_has_delta(plan: &LogicalPlan) -> bool {
         LogicalPlan::Filter(node) => subtree_has_delta(&node.input),
         LogicalPlan::Project(node) => subtree_has_delta(&node.input),
         LogicalPlan::Aggregate(node) => subtree_has_delta(&node.input),
-        LogicalPlan::Join(node) => {
-            subtree_has_delta(&node.left) || subtree_has_delta(&node.right)
-        }
+        LogicalPlan::Join(node) => subtree_has_delta(&node.left) || subtree_has_delta(&node.right),
         LogicalPlan::Union(node) => node.inputs.iter().any(subtree_has_delta),
         LogicalPlan::ImvDelta(node) => subtree_has_delta(&node.input),
         LogicalPlan::ImvVersion(node) => subtree_has_delta(&node.input),
@@ -378,7 +378,8 @@ mod tests {
     #[test]
     fn validation_rejects_duplicate_action_columns() {
         let mut scan = delta_scan_with(Some(ImvActionColumn::output_column(ColumnId(100))));
-        scan.columns.push(ImvActionColumn::output_column(ColumnId(101)));
+        scan.columns
+            .push(ImvActionColumn::output_column(ColumnId(101)));
         let plan = LogicalPlan::Scan(scan);
         let err = validate(&plan).expect_err("duplicates must fail");
         assert!(err.contains("duplicate"), "got: {err}");
@@ -415,7 +416,10 @@ mod tests {
             ScanSource::IcebergDeltaTable { table, .. } => table.clone(),
             _ => unreachable!(),
         };
-        scan.table.source = ScanSource::IcebergVersionTable { table, snapshot_id: 22 };
+        scan.table.source = ScanSource::IcebergVersionTable {
+            table,
+            snapshot_id: 22,
+        };
         scan
     }
 
@@ -430,9 +434,9 @@ mod tests {
     #[test]
     fn validation_rejects_aggregate_above_delta() {
         use crate::sql::planner::plan::AggregateNode;
-        let scan = LogicalPlan::Scan(delta_scan_with(Some(
-            ImvActionColumn::output_column(ColumnId(100)),
-        )));
+        let scan = LogicalPlan::Scan(delta_scan_with(Some(ImvActionColumn::output_column(
+            ColumnId(100),
+        ))));
         let plan = LogicalPlan::Aggregate(AggregateNode {
             input: Box::new(scan),
             group_by: Vec::new(),
@@ -449,9 +453,9 @@ mod tests {
     fn validation_rejects_join_above_delta() {
         use crate::sql::analysis::JoinKind;
         use crate::sql::planner::plan::JoinNode;
-        let left = LogicalPlan::Scan(delta_scan_with(Some(
-            ImvActionColumn::output_column(ColumnId(100)),
-        )));
+        let left = LogicalPlan::Scan(delta_scan_with(Some(ImvActionColumn::output_column(
+            ColumnId(100),
+        ))));
         let right = LogicalPlan::Scan(delta_scan_with(None));
         let plan = LogicalPlan::Join(JoinNode {
             left: Box::new(left),

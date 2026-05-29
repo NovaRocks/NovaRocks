@@ -6283,12 +6283,13 @@ fn plan_canonical_select_for_imv(
         ))
     })?;
 
-    let plan = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory).map_err(|e| {
-        RefreshError::user(format!(
-            "imv plan failed for {}.{}.{}: plan_query: {e}",
-            ctx.rewrite.target.catalog, ctx.rewrite.target.namespace, ctx.rewrite.target.table
-        ))
-    })?;
+    let plan =
+        crate::sql::planner::plan_query(resolved, cte_registry, &mut factory).map_err(|e| {
+            RefreshError::user(format!(
+                "imv plan failed for {}.{}.{}: plan_query: {e}",
+                ctx.rewrite.target.catalog, ctx.rewrite.target.namespace, ctx.rewrite.target.table
+            ))
+        })?;
     let next_column_id = factory.peek_next_id();
     Ok((plan, next_column_id))
 }
