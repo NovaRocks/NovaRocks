@@ -32,10 +32,18 @@ pub(crate) fn output_has_action_column(plan: &LogicalPlan) -> bool {
     match plan {
         LogicalPlan::Scan(scan) => scan.columns.iter().any(ImvActionColumn::matches),
         LogicalPlan::Filter(node) => output_has_action_column(&node.input),
-        LogicalPlan::Project(node) => node
-            .items
-            .iter()
-            .any(|item| item.output_name.eq_ignore_ascii_case(ImvActionColumn::NAME)),
+        LogicalPlan::Project(node) => {
+            // NOTE: ProjectItem carries no `is_internal` flag (unlike
+            // OutputColumn), so we can only detect the propagated action
+            // column by its reserved name `__change_op`. Phase 2 assumes no
+            // user-visible projection legitimately uses this name; the
+            // analyzer does not yet reject it. Task 8's validation (V4)
+            // backstops by rejecting internal columns leaking to visible
+            // output. Revisit if MV definitions ever expose `__change_op`.
+            node.items
+                .iter()
+                .any(|item| item.output_name.eq_ignore_ascii_case(ImvActionColumn::NAME))
+        }
         LogicalPlan::ImvDelta(node) => output_has_action_column(&node.input),
         LogicalPlan::ImvVersion(node) => output_has_action_column(&node.input),
         _ => false,
@@ -75,6 +83,38 @@ pub(crate) fn subtree_has_action_column(plan: &LogicalPlan) -> bool {
             LogicalPlan::Project(node) => subtree_has_action_column(&node.input),
             _ => false,
         }
+}
+
+/// Returns the fully-qualified name of the first `IcebergDeltaTable`-backed
+/// scan found anywhere in the subtree, for use in fail-fast diagnostics.
+/// Recurses through every child-bearing variant (unlike the action-column
+/// helpers, which only need Scan/Filter/Project), because an unsupported
+/// Join/Union/Aggregate node's delta scan can sit under any branch.
+//
+// Called by `PropagateActionColumnRule::apply`, but that rule struct has no
+// non-test constructor until Task 7 registers it in the pipeline, so the call
+// chain is unreachable in non-test builds. Allow dead_code until then.
+#[allow(dead_code)]
+fn first_delta_base_fqn(plan: &LogicalPlan) -> Option<String> {
+    match plan {
+        LogicalPlan::Scan(scan) => match &scan.table.source {
+            ScanSource::IcebergDeltaTable { table, .. } => Some(format!(
+                "{}.{}.{}",
+                table.catalog, table.namespace, table.table
+            )),
+            _ => None,
+        },
+        LogicalPlan::Filter(node) => first_delta_base_fqn(&node.input),
+        LogicalPlan::Project(node) => first_delta_base_fqn(&node.input),
+        LogicalPlan::Aggregate(node) => first_delta_base_fqn(&node.input),
+        LogicalPlan::Join(node) => {
+            first_delta_base_fqn(&node.left).or_else(|| first_delta_base_fqn(&node.right))
+        }
+        LogicalPlan::Union(node) => node.inputs.iter().find_map(first_delta_base_fqn),
+        LogicalPlan::ImvDelta(node) => first_delta_base_fqn(&node.input),
+        LogicalPlan::ImvVersion(node) => first_delta_base_fqn(&node.input),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -168,6 +208,10 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
     }
 
     fn apply(&self, plan: LogicalPlan, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+        // Diagnostic: the delta base under an unsupported node, if any. Computed
+        // up-front from `&plan` so the fail-fast arms can name the offending
+        // base table; harmless for the Project happy path.
+        let base = first_delta_base_fqn(&plan).unwrap_or_else(|| "<unknown>".to_string());
         match plan {
             LogicalPlan::Project(mut p) => {
                 let action = find_action_column(&p.input).ok_or_else(|| {
@@ -188,21 +232,21 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
                 });
                 Ok(RewriteResult::Changed(LogicalPlan::Project(p)))
             }
-            LogicalPlan::Aggregate(_) => Err(
-                "IMV action column propagation does not support Aggregate in Phase 2; \
-                 aggregate state rewrite is scheduled for Phase 4"
-                    .to_string(),
-            ),
-            LogicalPlan::Join(_) => Err(
-                "IMV action column propagation does not support Join in Phase 2; \
-                 join delta algebra is scheduled for Phase 5"
-                    .to_string(),
-            ),
-            LogicalPlan::Union(_) => Err(
-                "IMV action column propagation does not support UNION in Phase 2; \
-                 union delta rewrite is scheduled for Phase 6"
-                    .to_string(),
-            ),
+            LogicalPlan::Aggregate(_) => Err(format!(
+                "IMV action column propagation does not support Aggregate above \
+                 delta-bound scan {base} in Phase 2; aggregate state rewrite is \
+                 scheduled for Phase 4"
+            )),
+            LogicalPlan::Join(_) => Err(format!(
+                "IMV action column propagation does not support Join above \
+                 delta-bound scan {base} in Phase 2; join delta algebra is \
+                 scheduled for Phase 5"
+            )),
+            LogicalPlan::Union(_) => Err(format!(
+                "IMV action column propagation does not support UNION above \
+                 delta-bound scan {base} in Phase 2; union delta rewrite is \
+                 scheduled for Phase 6"
+            )),
             _ => Ok(RewriteResult::Unchanged),
         }
     }
@@ -222,9 +266,9 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::imv::annotation::{ImvExtension, ImvPlanAnnotation};
-    use crate::sql::analysis::JoinKind;
+    use crate::sql::analysis::{JoinKind, LiteralValue};
     use crate::sql::planner::plan::{
-        AggregateNode, JoinNode, LogicalPlan, ScanNode, UnionNode,
+        AggregateNode, FilterNode, JoinNode, LogicalPlan, ScanNode, UnionNode,
     };
 
     fn build_ctx() -> RewriteContext {
@@ -443,6 +487,7 @@ mod tests {
         assert!(rule.matches(&plan, &ctx));
         let err = rule.apply(plan, &mut ctx).expect_err("Aggregate must fail");
         assert!(err.contains("Phase 4"), "unexpected error: {err}");
+        assert!(err.contains("ice.db.b"), "unexpected error: {err}");
     }
 
     #[test]
@@ -460,6 +505,7 @@ mod tests {
         assert!(rule.matches(&plan, &ctx));
         let err = rule.apply(plan, &mut ctx).expect_err("Join must fail");
         assert!(err.contains("Phase 5"), "unexpected error: {err}");
+        assert!(err.contains("ice.db.b"), "unexpected error: {err}");
     }
 
     #[test]
@@ -473,5 +519,36 @@ mod tests {
         assert!(rule.matches(&plan, &ctx));
         let err = rule.apply(plan, &mut ctx).expect_err("Union must fail");
         assert!(err.contains("Phase 6"), "unexpected error: {err}");
+        assert!(err.contains("ice.db.b"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn propagate_through_project_over_filter_over_scan() {
+        // Filter is schema-passthrough: it should NOT match, but the action
+        // column injected on the Scan must remain findable through the Filter
+        // so the Project above can propagate it.
+        let rule = PropagateActionColumnRule;
+        let mut ctx = build_ctx();
+        let scan = LogicalPlan::Scan(delta_scan_with_action(ColumnId(100)));
+        let filter = LogicalPlan::Filter(FilterNode {
+            input: Box::new(scan),
+            predicate: TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Bool(true)),
+                data_type: DataType::Boolean,
+                nullable: false,
+            },
+        });
+        // Filter itself must not match (schema-passthrough, no work).
+        assert!(!rule.matches(&filter, &ctx));
+        // find_action_column traverses the Filter to the Scan.
+        assert!(find_action_column(&filter).is_some());
+        // Project over the Filter propagates the action column.
+        let project = project_over(filter, ColumnId(1));
+        assert!(rule.matches(&project, &ctx));
+        let result = rule.apply(project, &mut ctx).expect("apply must succeed");
+        let RewriteResult::Changed(LogicalPlan::Project(p)) = result else {
+            panic!("expected Changed(Project)");
+        };
+        assert!(p.items.iter().any(|i| i.output_name == "__change_op"));
     }
 }
