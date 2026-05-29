@@ -336,7 +336,8 @@ mod tests {
         let plan = delta(project_over(filter_over(leaf_scan())));
 
         // First apply: push through Project.
-        let RewriteResult::Changed(after1) = rule.apply(plan, &mut ctx).expect("apply must succeed")
+        let RewriteResult::Changed(after1) =
+            rule.apply(plan, &mut ctx).expect("apply must succeed")
         else {
             panic!("expected Changed after first apply");
         };
@@ -374,7 +375,8 @@ mod tests {
         let mut ctx = ctx();
         let plan = delta(project_over(aggregate_over(leaf_scan())));
 
-        let RewriteResult::Changed(after1) = rule.apply(plan, &mut ctx).expect("apply must succeed")
+        let RewriteResult::Changed(after1) =
+            rule.apply(plan, &mut ctx).expect("apply must succeed")
         else {
             panic!("expected Changed after first apply");
         };
