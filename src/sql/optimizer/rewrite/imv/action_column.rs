@@ -12,13 +12,13 @@ use crate::sql::column_id::ColumnId;
 
 pub(crate) struct ImvActionColumn;
 
-// Consumers land in later phases: `output_column` is called by Task 4's
-// `InjectActionColumnRule`, and `NAME`/`matches` by Task 8's
-// `ActionColumnValidationRule`. Allow dead_code until those callers exist.
-#[allow(dead_code)]
 impl ImvActionColumn {
     pub(crate) const NAME: &'static str = crate::exec::change_op::CHANGE_OP_COLUMN;
+    // consumed by Phase 3 execution cutover
+    #[allow(dead_code)]
     pub(crate) const INSERT_VALUE: i8 = crate::exec::change_op::CHANGE_OP_INSERT;
+    // consumed by Phase 3 execution cutover
+    #[allow(dead_code)]
     pub(crate) const DELETE_VALUE: i8 = crate::exec::change_op::CHANGE_OP_DELETE;
 
     /// Construct an `OutputColumn` for the action column with the given id.

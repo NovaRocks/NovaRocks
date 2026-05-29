@@ -310,7 +310,7 @@ mod tests {
         })
         .expect("unknown disabled rule must not break the pipeline");
 
-        assert_eq!(outcome.trace.stage_names().len(), 5);
+        assert_eq!(outcome.trace.stage_names().len(), 6);
     }
 
     // ── Task-5 helpers ──────────────────────────────────────────────────────
@@ -435,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn imv_pipeline_traces_scan_binding_stage_name() {
+    fn imv_pipeline_traces_six_stage_names() {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
             mv_ctx: dummy_mv_ctx(),
@@ -451,6 +451,7 @@ mod tests {
                 "imv-logical-normalize",
                 "imv-delta-marker",
                 "imv-scan-binding",
+                "imv-action-propagation",
                 "imv-marker-cleanup",
                 "imv-validation",
             ]
@@ -534,5 +535,28 @@ mod tests {
             }
             other => panic!("expected IcebergVersionTable, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn imv_pipeline_injects_action_on_delta_scan() {
+        let outcome = run_imv_rewrite(ImvRewriteInput {
+            plan: iceberg_scan_plan(),
+            mv_ctx: dummy_mv_ctx(),
+            disabled_rules: Vec::new(),
+            deadline: None,
+            next_column_id: 100,
+        })
+        .expect("pipeline must succeed");
+
+        let LogicalPlan::Scan(scan) = outcome.plan else {
+            panic!("expected scan outcome");
+        };
+        let action = scan
+            .columns
+            .iter()
+            .find(|c| c.is_internal && c.name.eq_ignore_ascii_case("__change_op"))
+            .expect("action column must be present");
+        assert_eq!(action.data_type, arrow::datatypes::DataType::Int8);
+        assert!(!action.nullable);
     }
 }

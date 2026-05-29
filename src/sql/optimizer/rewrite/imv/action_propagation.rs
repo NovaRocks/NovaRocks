@@ -23,11 +23,6 @@ use crate::sql::planner::plan::LogicalPlan;
 
 /// Returns true iff the plan's effective output schema contains the IMV
 /// action column. Used by `matches()` predicates and validation.
-//
-// Called by `PropagateActionColumnRule::matches`, but that rule struct has no
-// non-test constructor until Task 7 registers it in the pipeline, so the call
-// chain is unreachable in non-test builds. Allow dead_code until then.
-#[allow(dead_code)]
 pub(crate) fn output_has_action_column(plan: &LogicalPlan) -> bool {
     match plan {
         LogicalPlan::Scan(scan) => scan.columns.iter().any(ImvActionColumn::matches),
@@ -52,11 +47,6 @@ pub(crate) fn output_has_action_column(plan: &LogicalPlan) -> bool {
 
 /// Returns the action column descriptor from the first descendant Scan/Project
 /// in the subtree that exposes one, or `None` if no descendant carries it.
-//
-// Called by `PropagateActionColumnRule::apply`, but that rule struct has no
-// non-test constructor until Task 7 registers it in the pipeline, so the call
-// chain is unreachable in non-test builds. Allow dead_code until then.
-#[allow(dead_code)]
 pub(crate) fn find_action_column(plan: &LogicalPlan) -> Option<OutputColumn> {
     match plan {
         LogicalPlan::Scan(scan) => scan
@@ -71,11 +61,6 @@ pub(crate) fn find_action_column(plan: &LogicalPlan) -> Option<OutputColumn> {
 }
 
 /// Whether any descendant of the plan exposes an action column.
-//
-// Called by `PropagateActionColumnRule::matches`, but that rule struct has no
-// non-test constructor until Task 7 registers it in the pipeline, so the call
-// chain is unreachable in non-test builds. Allow dead_code until then.
-#[allow(dead_code)]
 pub(crate) fn subtree_has_action_column(plan: &LogicalPlan) -> bool {
     output_has_action_column(plan)
         || match plan {
@@ -90,11 +75,6 @@ pub(crate) fn subtree_has_action_column(plan: &LogicalPlan) -> bool {
 /// Recurses through every child-bearing variant (unlike the action-column
 /// helpers, which only need Scan/Filter/Project), because an unsupported
 /// Join/Union/Aggregate node's delta scan can sit under any branch.
-//
-// Called by `PropagateActionColumnRule::apply`, but that rule struct has no
-// non-test constructor until Task 7 registers it in the pipeline, so the call
-// chain is unreachable in non-test builds. Allow dead_code until then.
-#[allow(dead_code)]
 fn first_delta_base_fqn(plan: &LogicalPlan) -> Option<String> {
     match plan {
         LogicalPlan::Scan(scan) => match &scan.table.source {
@@ -121,11 +101,7 @@ fn first_delta_base_fqn(plan: &LogicalPlan) -> Option<String> {
 // InjectActionColumnRule
 // ---------------------------------------------------------------------------
 
-// Registered into the IMV rewrite pipeline by a later phase-2 task. Until that
-// registration lands the rule has no non-test constructor, so allow dead_code
-// to keep the build clean; this also keeps `ImvExtension::allocate_column_id`
-// and its `next_column_id` field from tripping the transitive dead-code chain.
-#[allow(dead_code)]
+// Registered into the IMV rewrite pipeline's `imv-action-propagation` stage.
 pub(crate) struct InjectActionColumnRule;
 
 impl LogicalRewriteRule for InjectActionColumnRule {
@@ -168,10 +144,7 @@ impl LogicalRewriteRule for InjectActionColumnRule {
 // PropagateActionColumnRule
 // ---------------------------------------------------------------------------
 
-// Registered in the IMV rewrite pipeline by Task 7. Until that registration
-// lands the rule has no non-test constructor, so allow dead_code to keep the
-// build clean.
-#[allow(dead_code)]
+// Registered into the IMV rewrite pipeline's `imv-action-propagation` stage.
 pub(crate) struct PropagateActionColumnRule;
 
 impl LogicalRewriteRule for PropagateActionColumnRule {
