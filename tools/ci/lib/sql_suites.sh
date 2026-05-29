@@ -3,14 +3,18 @@
 ci_load_stable_suites() {
   local manifest="$1"
   local line
+  local suite
 
   while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in
+    suite="${line#"${line%%[![:blank:]]*}"}"
+    suite="${suite%"${suite##*[![:blank:]]}"}"
+
+    case "$suite" in
       ""|\#*)
         continue
         ;;
       *)
-        printf "%s\n" "$line"
+        printf "%s\n" "$suite"
         ;;
     esac
   done <"$manifest"
@@ -31,5 +35,12 @@ ci_discover_sql_suites() {
 ci_suite_exists() {
   local repo_root="$1"
   local suite="$2"
+
+  case "$suite" in
+    *[!A-Za-z0-9_.+-]*|"")
+      return 1
+      ;;
+  esac
+
   [ -d "$repo_root/sql-tests/$suite/sql" ]
 }
