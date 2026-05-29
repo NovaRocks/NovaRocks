@@ -18,11 +18,21 @@ Plan: `docs/superpowers/plans/2026-05-28-oq-1-column-pruning-arch-refactor.md`
   **ALL pre-existing** (failed before OQ-1 too): `array_type`, `eliminate_with_constant`
   (proven a pre-existing SplitTopN+BROADCAST exec bug, not pruning), `force_partition_hash`
   (pre-existing 180s NLJ timeout), `full_outer_with_using`. **No NEW failing join CASES from OQ-1.**
-- **Open question (not yet confirmed):** `array_type` (`actual=2 expected=0`) and
-  `full_outer_with_using` (`actual=0 expected=10`) fail with a *different mode* than baseline
-  (baseline: array_type=header mismatch @step36; full_outer_with_using=value mismatch). Could
-  be OQ-1 worsened cosmetic→wrong-result, OR fail-fast stops at a different step. **Must diff
-  the failing step vs baseline to confirm OQ-1 didn't worsen these two.**
+- **Open question — NOW RESOLVED (2026-05-29, autonomous verification): OQ-1 DID worsen
+  these two.** Ran each `--only` and compared the failing STEP to baseline:
+  - `join_array_type`: OQ-1 fails at **step 26** (`actual=2 expected=0`); baseline failed at
+    step 36 (cosmetic header mismatch). Steps 26–35 PASSED in baseline → **OQ-1 introduced a
+    wrong-result regression at step 26.** Step 26 = `SELECT s_1 FROM array_test s WHERE EXISTS
+    (SELECT 1 FROM array_test t WHERE t.s_1 = s.d_1) ORDER BY 1` — a **correlated EXISTS in
+    WHERE** returning extra rows. The EXISTS-indicator fix in `95cc47f7` handled the
+    `cte_in_where_subquery` shape but NOT this correlated-EXISTS-in-WHERE shape.
+  - `join_full_outer_with_using`: OQ-1 fails at **step 37** (`actual=0 expected=10`); baseline
+    at step 48 (value mismatch). Steps 37–47 PASSED in baseline → **OQ-1 introduced a
+    wrong-result regression at step 37** (FOJ-USING shape, returns empty).
+  - **Verdict:** at the CASE level OQ-1 adds no new failing cases, but at the STEP level it
+    introduces **≥2 real column-pruning wrong-result regressions** (correlated EXISTS-in-WHERE;
+    FOJ-USING). These are the next things to fix (or the reason to revert) — both are the same
+    "synthetic/null-aware indicator or FOJ coalesce column dropped/mis-mapped by pruning" class.
 - Suite was manually stopped at join 38/60 (had not reached the heavy wide-table tail:
   `join_one_key`, `join_partition`, etc.) so the 22 remaining cases + the wall_time-vs-1996s
   improvement number are **not yet measured**.
