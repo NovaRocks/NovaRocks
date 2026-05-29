@@ -11,6 +11,7 @@ source "$SCRIPT_DIR/lib/server.sh"
 
 STABLE_SUITES_FILE="$SCRIPT_DIR/suites/stable-sql-suites.txt"
 RUN_MODE="stable"
+ALL_DISCOVERED_REQUESTED="false"
 KEEP_RUNTIME="false"
 SKIP_CARGO_TEST="false"
 REQUESTED_SUITES=()
@@ -35,7 +36,7 @@ parse_args() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --all-discovered)
-        RUN_MODE="all-discovered"
+        ALL_DISCOVERED_REQUESTED="true"
         shift
         ;;
       --suite)
@@ -43,7 +44,6 @@ parse_args() {
           echo "error: --suite requires a suite name" >&2
           exit 2
         fi
-        RUN_MODE="explicit"
         REQUESTED_SUITES+=("$2")
         shift 2
         ;;
@@ -67,9 +67,17 @@ parse_args() {
     esac
   done
 
-  if [ "$RUN_MODE" = "all-discovered" ] && [ "${#REQUESTED_SUITES[@]}" -gt 0 ]; then
+  if [ "$ALL_DISCOVERED_REQUESTED" = "true" ] && [ "${#REQUESTED_SUITES[@]}" -gt 0 ]; then
     echo "error: --all-discovered cannot be combined with --suite" >&2
     exit 2
+  fi
+
+  if [ "$ALL_DISCOVERED_REQUESTED" = "true" ]; then
+    RUN_MODE="all-discovered"
+  elif [ "${#REQUESTED_SUITES[@]}" -gt 0 ]; then
+    RUN_MODE="explicit"
+  else
+    RUN_MODE="stable"
   fi
 }
 
@@ -250,6 +258,7 @@ resolve_suites() {
 
 validate_explicit_suites_early() {
   local suite
+  local log_path
 
   if [ "$RUN_MODE" != "explicit" ]; then
     return 0
@@ -257,7 +266,11 @@ validate_explicit_suites_early() {
 
   for suite in "${REQUESTED_SUITES[@]}"; do
     if ! ci_suite_exists "$REPO_ROOT" "$suite"; then
-      echo "error: SQL suite does not exist: $suite" >&2
+      log_path="$CI_RUN_DIR/validation.log"
+      echo "error: SQL suite does not exist: $suite" | tee "$log_path" >&2
+      ci_record_stage "validate SQL suites" "FAIL" "0" "$log_path"
+      ci_mark_failure_tail "SQL suite validation failed" "$log_path"
+      ci_render_summary "FAIL"
       exit 2
     fi
   done
