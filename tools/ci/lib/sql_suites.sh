@@ -37,7 +37,7 @@ ci_suite_exists() {
   local suite="$2"
 
   case "$suite" in
-    *[!A-Za-z0-9_.+-]*|"")
+    *[!A-Za-z0-9_.+-]*|""|"."|"..")
       return 1
       ;;
   esac
