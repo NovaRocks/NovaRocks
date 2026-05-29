@@ -6,64 +6,21 @@ use std::sync::atomic::AtomicU32;
 use std::time::Instant;
 
 use crate::engine::mv::refresh_context::IcebergMvRewriteContext;
-use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::imv::annotation::{ImvExtension, ImvPlanAnnotation};
 use crate::sql::optimizer::rewrite::imv::pipeline::build_imv_pipeline;
 use crate::sql::optimizer::rewrite::trace::RewriteTrace;
 use crate::sql::planner::plan::LogicalPlan;
 
-/// Returns the largest `ColumnId.0` value referenced anywhere in the plan
-/// tree's output columns. Used to seed `ImvExtension::next_column_id` so
-/// IMV rewrite never collides with analyzer-assigned ids. Returns 0 if no
-/// output columns are present.
-fn max_column_id(plan: &LogicalPlan) -> u32 {
-    let mut max = 0u32;
-    visit_output_columns(plan, &mut |id: ColumnId| {
-        if id.0 > max {
-            max = id.0;
-        }
-    });
-    max
-}
-
-fn visit_output_columns(plan: &LogicalPlan, visit: &mut impl FnMut(ColumnId)) {
-    match plan {
-        LogicalPlan::Scan(scan) => {
-            for col in &scan.columns {
-                visit(col.column_id);
-            }
-        }
-        LogicalPlan::Filter(node) => visit_output_columns(&node.input, visit),
-        LogicalPlan::Project(node) => visit_output_columns(&node.input, visit),
-        LogicalPlan::Aggregate(node) => {
-            for col in &node.output_columns {
-                visit(col.column_id);
-            }
-            visit_output_columns(&node.input, visit);
-        }
-        LogicalPlan::Join(node) => {
-            visit_output_columns(&node.left, visit);
-            visit_output_columns(&node.right, visit);
-        }
-        LogicalPlan::Union(node) => {
-            for child in &node.inputs {
-                visit_output_columns(child, visit);
-            }
-        }
-        LogicalPlan::ImvDelta(node) => visit_output_columns(&node.input, visit),
-        LogicalPlan::ImvVersion(node) => visit_output_columns(&node.input, visit),
-        // Other variants reached only after analysis; fall through without
-        // visiting (their schemas are subsumed by the variants above).
-        _ => {}
-    }
-}
-
 pub(crate) struct ImvRewriteInput {
     pub plan: LogicalPlan,
     pub mv_ctx: Arc<IcebergMvRewriteContext>,
     pub disabled_rules: Vec<String>,
     pub deadline: Option<Instant>,
+    /// Next free `ColumnId` value, taken from the `ColumnRefFactory` that
+    /// produced `plan`. Seeds the IMV rewrite's internal ColumnId allocator
+    /// so new columns (e.g. the action column) never collide with existing ids.
+    pub next_column_id: u32,
 }
 
 #[derive(Debug)]
@@ -79,10 +36,13 @@ pub(crate) fn run_imv_rewrite(input: ImvRewriteInput) -> Result<ImvRewriteOutcom
         mv_ctx,
         disabled_rules,
         deadline,
+        next_column_id,
     } = input;
 
     let mut ctx_rw = RewriteContext::for_mv_refresh(disabled_rules);
-    let next_column_id = Arc::new(AtomicU32::new(max_column_id(&plan).saturating_add(1)));
+    // Seed from the factory's next-free id (passed by the caller), guarding
+    // against a degenerate 0 seed which would alias ColumnId::UNSET.
+    let next_column_id = Arc::new(AtomicU32::new(next_column_id.max(1)));
     ctx_rw.set_extension::<ImvExtension>(ImvExtension {
         mv_ctx,
         annotation: ImvPlanAnnotation::default(),
@@ -234,6 +194,7 @@ mod tests {
             mv_ctx: dummy_mv_ctx(),
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
             deadline: None,
+            next_column_id: 100,
         })
         .unwrap();
         assert_eq!(
@@ -345,6 +306,7 @@ mod tests {
             mv_ctx: dummy_mv_ctx(),
             disabled_rules: vec!["NoSuchRule".to_string(), "WrapRootInImvDelta".to_string()],
             deadline: None,
+            next_column_id: 100,
         })
         .expect("unknown disabled rule must not break the pipeline");
 
@@ -426,6 +388,7 @@ mod tests {
             mv_ctx: dummy_mv_ctx(),
             disabled_rules: Vec::new(),
             deadline: None,
+            next_column_id: 100,
         })
         .expect_err("PR-β pipeline rejects plain plans");
         assert!(err.starts_with("IVM rewrite failed to resolve incremental markers:"));
@@ -444,6 +407,7 @@ mod tests {
             mv_ctx: dummy_mv_ctx(),
             disabled_rules: Vec::new(),
             deadline: None,
+            next_column_id: 100,
         })
         .expect_err("PR-β pipeline must Reject on plain plan");
         assert!(
@@ -462,6 +426,7 @@ mod tests {
             mv_ctx: dummy_mv_ctx(),
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
             deadline: None,
+            next_column_id: 100,
         })
         .expect("disabled wrap rule must let the pipeline succeed");
 
@@ -476,6 +441,7 @@ mod tests {
             mv_ctx: dummy_mv_ctx(),
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
             deadline: None,
+            next_column_id: 100,
         })
         .expect("pipeline must succeed when wrap rule is disabled");
 
@@ -498,6 +464,7 @@ mod tests {
             mv_ctx: dummy_mv_ctx(),
             disabled_rules: Vec::new(),
             deadline: None,
+            next_column_id: 100,
         })
         .expect("Delta(Scan) must bind and pass validation");
 
@@ -528,6 +495,7 @@ mod tests {
             mv_ctx: dummy_mv_ctx(),
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
             deadline: None,
+            next_column_id: 100,
         })
         .expect("Version(Scan, From) must bind and pass validation");
 
@@ -553,6 +521,7 @@ mod tests {
             mv_ctx: dummy_mv_ctx(),
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
             deadline: None,
+            next_column_id: 100,
         })
         .expect("Version(Scan, To) must bind and pass validation");
 
