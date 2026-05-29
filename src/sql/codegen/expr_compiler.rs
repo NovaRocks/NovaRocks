@@ -1375,10 +1375,9 @@ impl<'a> ExprCompiler<'a> {
         if is_map_shape {
             let (key_type, value_type) = match &array_args[0].data_type {
                 DataType::Map(field, _) => match field.data_type() {
-                    DataType::Struct(fields) if fields.len() == 2 => (
-                        fields[0].data_type().clone(),
-                        fields[1].data_type().clone(),
-                    ),
+                    DataType::Struct(fields) if fields.len() == 2 => {
+                        (fields[0].data_type().clone(), fields[1].data_type().clone())
+                    }
                     other => {
                         return Err(format!(
                             "{name} expects MAP with struct<key,value> entries, got {:?}",

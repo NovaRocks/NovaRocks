@@ -83,21 +83,20 @@ impl<'a> super::AnalyzerContext<'a> {
                         // exists so the chained join matches on the merged
                         // value (`coalesce(coalesce(t1.id, t2.id), t3.id)`,
                         // and so on).
-                        let left_ref = if let Some(expr) =
-                            current_scope.computed_column_for(&col_name)
-                        {
-                            expr.clone()
-                        } else {
-                            TypedExpr {
-                                kind: ExprKind::ColumnRef {
-                                    column_id: left_id,
-                                    qualifier: None,
-                                    column: col_name.clone(),
-                                },
-                                data_type: left_dt,
-                                nullable: left_nullable,
-                            }
-                        };
+                        let left_ref =
+                            if let Some(expr) = current_scope.computed_column_for(&col_name) {
+                                expr.clone()
+                            } else {
+                                TypedExpr {
+                                    kind: ExprKind::ColumnRef {
+                                        column_id: left_id,
+                                        qualifier: None,
+                                        column: col_name.clone(),
+                                    },
+                                    data_type: left_dt,
+                                    nullable: left_nullable,
+                                }
+                            };
                         let right_ref = TypedExpr {
                             kind: ExprKind::ColumnRef {
                                 column_id: right_id,

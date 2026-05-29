@@ -536,9 +536,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     // wait until later.
                     let in_expr_typed = self.analyze_expr(in_expr, scope)?;
                     if is_json_in_subquery_operand(&in_expr_typed, scope) {
-                        return Err(
-                            "In predicate of JSON does not support subquery".to_string(),
-                        );
+                        return Err("In predicate of JSON does not support subquery".to_string());
                     }
                     if let Some(logical) = scope
                         .logical_type_of_expr(&in_expr_typed)
@@ -1212,8 +1210,8 @@ impl<'a> super::AnalyzerContext<'a> {
                         DataType::Struct(_) => Some("STRUCT"),
                         _ => None,
                     };
-                    if let Some(kind) =
-                        complex_kind(&left_typed.data_type).or_else(|| complex_kind(&right_typed.data_type))
+                    if let Some(kind) = complex_kind(&left_typed.data_type)
+                        .or_else(|| complex_kind(&right_typed.data_type))
                     {
                         return Err(format!(
                             "comparison operator `{op_sym}` does not support binary predicate operation on {kind} values"

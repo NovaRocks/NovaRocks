@@ -1439,13 +1439,15 @@ mod tests {
         };
         let planned = PlannedScanTable {
             scan_node_id: 9,
+            scan_tuple_id: 4,
             resolved,
             min_max_conjuncts: Vec::new(),
             slot_to_column: std::collections::HashMap::new(),
             iceberg_metadata_pseudo_column_slots: std::collections::BTreeSet::new(),
         };
 
-        let err = build_exec_params_multi(&[planned])
+        let registry = test_connector_registry();
+        let err = build_exec_params_multi(&registry, &[planned])
             .expect_err("version table must not be executable in phase 1");
         assert!(
             err.contains("IMV version scan ice.db.b at snapshot 11 reached scan-range construction before execution cutover"),

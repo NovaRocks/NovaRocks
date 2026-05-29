@@ -944,7 +944,10 @@ impl<'a> AnalyzerContext<'a> {
         // duplicate the check up front and surface the standard
         // "does not support binary predicate operation" diagnostic
         // (matching the bare-`=` rejection path).
-        for (lhs_i, sub_col) in lhs_typed_list.iter().zip(resolved_sub.output_columns.iter()) {
+        for (lhs_i, sub_col) in lhs_typed_list
+            .iter()
+            .zip(resolved_sub.output_columns.iter())
+        {
             if let Some(reason) = super::resolve_expr::incompatible_complex_compare_pub(
                 &lhs_i.data_type,
                 &sub_col.data_type,
@@ -1616,7 +1619,9 @@ impl<'a> AnalyzerContext<'a> {
 
         // --- WHERE clause ---
         let filter = match &select.selection {
-            Some(expr) => Some(coerce_where_to_bool(self.analyze_expr(expr, &merged_scope)?)),
+            Some(expr) => Some(coerce_where_to_bool(
+                self.analyze_expr(expr, &merged_scope)?,
+            )),
             None => None,
         };
 
@@ -2038,7 +2043,9 @@ fn walk_for_outer_ref(
                 walk_for_outer_ref(e, inner_scope, outer_scope, saw_outer);
             }
         }
-        ExprKind::InList { expr: inner, list, .. } => {
+        ExprKind::InList {
+            expr: inner, list, ..
+        } => {
             walk_for_outer_ref(inner, inner_scope, outer_scope, saw_outer);
             for v in list {
                 walk_for_outer_ref(v, inner_scope, outer_scope, saw_outer);
@@ -2129,7 +2136,13 @@ fn is_outer_only_ref(
 ) -> bool {
     let mut saw_column = false;
     let mut all_outer_only = true;
-    collect_column_outer_status(expr, inner_scope, outer_scope, &mut saw_column, &mut all_outer_only);
+    collect_column_outer_status(
+        expr,
+        inner_scope,
+        outer_scope,
+        &mut saw_column,
+        &mut all_outer_only,
+    );
     saw_column && all_outer_only
 }
 
@@ -2153,46 +2166,135 @@ fn collect_column_outer_status(
         }
         ExprKind::BinaryOp { left, right, .. } => {
             collect_column_outer_status(left, inner_scope, outer_scope, saw_column, all_outer_only);
-            collect_column_outer_status(right, inner_scope, outer_scope, saw_column, all_outer_only);
+            collect_column_outer_status(
+                right,
+                inner_scope,
+                outer_scope,
+                saw_column,
+                all_outer_only,
+            );
         }
         ExprKind::UnaryOp { expr: inner, .. } => {
-            collect_column_outer_status(inner, inner_scope, outer_scope, saw_column, all_outer_only);
+            collect_column_outer_status(
+                inner,
+                inner_scope,
+                outer_scope,
+                saw_column,
+                all_outer_only,
+            );
         }
         ExprKind::IsNull { expr: inner, .. } => {
-            collect_column_outer_status(inner, inner_scope, outer_scope, saw_column, all_outer_only);
+            collect_column_outer_status(
+                inner,
+                inner_scope,
+                outer_scope,
+                saw_column,
+                all_outer_only,
+            );
         }
         ExprKind::Cast { expr: inner, .. } => {
-            collect_column_outer_status(inner, inner_scope, outer_scope, saw_column, all_outer_only);
+            collect_column_outer_status(
+                inner,
+                inner_scope,
+                outer_scope,
+                saw_column,
+                all_outer_only,
+            );
         }
         ExprKind::Nested(inner) => {
-            collect_column_outer_status(inner, inner_scope, outer_scope, saw_column, all_outer_only);
+            collect_column_outer_status(
+                inner,
+                inner_scope,
+                outer_scope,
+                saw_column,
+                all_outer_only,
+            );
         }
         ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
             for a in args {
-                collect_column_outer_status(a, inner_scope, outer_scope, saw_column, all_outer_only);
+                collect_column_outer_status(
+                    a,
+                    inner_scope,
+                    outer_scope,
+                    saw_column,
+                    all_outer_only,
+                );
             }
         }
-        ExprKind::InList { expr: inner, list, .. } => {
-            collect_column_outer_status(inner, inner_scope, outer_scope, saw_column, all_outer_only);
+        ExprKind::InList {
+            expr: inner, list, ..
+        } => {
+            collect_column_outer_status(
+                inner,
+                inner_scope,
+                outer_scope,
+                saw_column,
+                all_outer_only,
+            );
             for item in list {
-                collect_column_outer_status(item, inner_scope, outer_scope, saw_column, all_outer_only);
+                collect_column_outer_status(
+                    item,
+                    inner_scope,
+                    outer_scope,
+                    saw_column,
+                    all_outer_only,
+                );
             }
         }
-        ExprKind::Between { expr: inner, low, high, .. } => {
-            collect_column_outer_status(inner, inner_scope, outer_scope, saw_column, all_outer_only);
+        ExprKind::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            collect_column_outer_status(
+                inner,
+                inner_scope,
+                outer_scope,
+                saw_column,
+                all_outer_only,
+            );
             collect_column_outer_status(low, inner_scope, outer_scope, saw_column, all_outer_only);
             collect_column_outer_status(high, inner_scope, outer_scope, saw_column, all_outer_only);
         }
-        ExprKind::Case { operand, when_then, else_expr } => {
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
             if let Some(op) = operand {
-                collect_column_outer_status(op, inner_scope, outer_scope, saw_column, all_outer_only);
+                collect_column_outer_status(
+                    op,
+                    inner_scope,
+                    outer_scope,
+                    saw_column,
+                    all_outer_only,
+                );
             }
             for (when, then) in when_then {
-                collect_column_outer_status(when, inner_scope, outer_scope, saw_column, all_outer_only);
-                collect_column_outer_status(then, inner_scope, outer_scope, saw_column, all_outer_only);
+                collect_column_outer_status(
+                    when,
+                    inner_scope,
+                    outer_scope,
+                    saw_column,
+                    all_outer_only,
+                );
+                collect_column_outer_status(
+                    then,
+                    inner_scope,
+                    outer_scope,
+                    saw_column,
+                    all_outer_only,
+                );
             }
             if let Some(else_) = else_expr {
-                collect_column_outer_status(else_, inner_scope, outer_scope, saw_column, all_outer_only);
+                collect_column_outer_status(
+                    else_,
+                    inner_scope,
+                    outer_scope,
+                    saw_column,
+                    all_outer_only,
+                );
             }
         }
         // Literals / placeholders / lambda params: no column refs, leave

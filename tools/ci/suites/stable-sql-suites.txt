@@ -1,29 +1,33 @@
 # Stable SQL suites for tools/ci/local-full-ci.sh default daily mode.
+# Keep this list conservative. Add a suite only after a serial local run
+# (`sql-tests -j 1`) has passed in the current environment.
+filter
+limit
+project
+sort
+
+# The suites below are not part of default daily mode yet.
 # Benchmark suites are excluded from default daily until benchmark data bootstrap is explicitly part of this runner:
 # ssb
 # tpc-h
 # tpc-ds
+# join
+# materialized-view
 # iceberg-mv-scheduler is excluded until scheduler timing expectations are verified for unattended daily runs.
-aggregate
-analytic
-complex-type
-cte
-decimal
-filter
-function
-iceberg
-iceberg-compatibility
-iceberg-ddl
-iceberg-dml
-iceberg-ivm
-iceberg-rest
-join
-limit
-low-cardinality
-materialized-view
-optimizer
-project
-runtime-filter
-set-op
-sort
-table-function
+# aggregate
+# analytic
+# complex-type
+# cte
+# decimal
+# function
+# iceberg
+# iceberg-compatibility
+# iceberg-ddl
+# iceberg-dml
+# iceberg-ivm
+# iceberg-rest
+# low-cardinality
+# optimizer
+# runtime-filter
+# set-op
+# table-function

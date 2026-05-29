@@ -1807,16 +1807,11 @@ impl<'a> AnalyzerContext<'a> {
                         // for plain identifiers; AST-text matching is still
                         // useful for `ORDER BY a.c` echoing `SELECT a.c`,
                         // where preserving qualifiers matters.
-                        let ob_is_bare_ident = matches!(
-                            ob.expr,
-                            sqlast::Expr::Identifier(_)
-                        );
+                        let ob_is_bare_ident = matches!(ob.expr, sqlast::Expr::Identifier(_));
                         for (ast_item, ir_item) in
                             ast_sel.projection.iter().zip(sel.projection.iter())
                         {
-                            if ob_is_bare_ident
-                                && ir_item.output_name.to_lowercase() == ob_text
-                            {
+                            if ob_is_bare_ident && ir_item.output_name.to_lowercase() == ob_text {
                                 let col_id = match &ir_item.expr.kind {
                                     ExprKind::ColumnRef { column_id, .. } => *column_id,
                                     _ => self.alloc_column_id(

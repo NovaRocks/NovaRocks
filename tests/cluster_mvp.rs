@@ -593,7 +593,7 @@ fault_inject_fetch_not_ready_count = 1000
     let fe_mysql = cluster.fe_mysql;
     std::thread::spawn(move || {
         let mut conn = connect_mysql(fe_mysql);
-        let result = conn.query::<String, _>(multi_submit_query_sql());
+        let result = conn.query::<String, _>(disconnect_blocking_query_sql());
         tx.send(result.map_err(|err| err.to_string()))
             .expect("send query result");
     });

@@ -176,10 +176,7 @@ fn push_predicates_through_join(predicate: TypedExpr, join: JoinNode) -> (Logica
                         left_preds.push(conj);
                     } else if is_left_join_variant {
                         remaining.push(conj);
-                    } else if matches!(
-                        join.join_type,
-                        JoinKind::RightOuter | JoinKind::FullOuter
-                    ) {
+                    } else if matches!(join.join_type, JoinKind::RightOuter | JoinKind::FullOuter) {
                         // For RIGHT OUTER / FULL OUTER, predicates that
                         // reference both sides cannot be fused into the
                         // join's `other` condition: unmatched rows on the
