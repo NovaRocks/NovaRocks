@@ -4,6 +4,7 @@
 //! propagation, marker cleanup, validation. Each stage's name is part of the
 //! trace contract and is asserted in pipeline tests.
 
+use crate::sql::optimizer::rewrite::imv::action_column::ActionColumnValidationRule;
 use crate::sql::optimizer::rewrite::imv::action_propagation::{
     InjectActionColumnRule, PropagateActionColumnRule,
 };
@@ -48,7 +49,10 @@ pub(crate) fn build_imv_pipeline() -> RewritePipeline {
         RewriteStage::new(
             "imv-validation",
             RewritePhase::Validation,
-            vec![Box::new(UnresolvedMarkerCheckRule) as Box<dyn LogicalRewriteRule>],
+            vec![
+                Box::new(UnresolvedMarkerCheckRule) as Box<dyn LogicalRewriteRule>,
+                Box::new(ActionColumnValidationRule::new()),
+            ],
         ),
     ])
 }
