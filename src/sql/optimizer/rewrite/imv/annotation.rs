@@ -32,6 +32,11 @@ pub(crate) struct ImvExtension {
 
 impl ImvExtension {
     /// Allocate a fresh `ColumnId` from the shared counter.
+    //
+    // First caller is `InjectActionColumnRule::apply` (action_propagation.rs),
+    // but that rule is not yet registered in the IMV pipeline, so this method
+    // and the `next_column_id` field it reads are transitively dead until the
+    // registration task lands. Keep a targeted allow until then.
     #[allow(dead_code)]
     pub(crate) fn allocate_column_id(&self) -> ColumnId {
         let raw = self
