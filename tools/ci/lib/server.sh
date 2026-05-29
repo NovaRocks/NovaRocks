@@ -20,6 +20,8 @@ ci_start_standalone_server() {
     fi
 
     if ! kill -0 "$CI_SERVER_PID" 2>/dev/null; then
+      wait "$CI_SERVER_PID" 2>/dev/null || true
+      CI_SERVER_PID=""
       return 1
     fi
 
