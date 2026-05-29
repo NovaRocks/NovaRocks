@@ -156,7 +156,13 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
             // schema verbatim, so once the child has the action column the
             // Filter's effective output also has it. No work needed.
             LogicalPlan::Filter(_) => false,
-            // Aggregate / Join / Union handled in Task 6 (fail-fast).
+            // Aggregate / Join / Union above a delta subtree are unsupported in
+            // Phase 2; match here so `apply` can fail-fast with a clear error.
+            LogicalPlan::Aggregate(a) => subtree_has_action_column(&a.input),
+            LogicalPlan::Join(j) => {
+                subtree_has_action_column(&j.left) || subtree_has_action_column(&j.right)
+            }
+            LogicalPlan::Union(u) => u.inputs.iter().any(subtree_has_action_column),
             _ => false,
         }
     }
@@ -182,6 +188,21 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
                 });
                 Ok(RewriteResult::Changed(LogicalPlan::Project(p)))
             }
+            LogicalPlan::Aggregate(_) => Err(
+                "IMV action column propagation does not support Aggregate in Phase 2; \
+                 aggregate state rewrite is scheduled for Phase 4"
+                    .to_string(),
+            ),
+            LogicalPlan::Join(_) => Err(
+                "IMV action column propagation does not support Join in Phase 2; \
+                 join delta algebra is scheduled for Phase 5"
+                    .to_string(),
+            ),
+            LogicalPlan::Union(_) => Err(
+                "IMV action column propagation does not support UNION in Phase 2; \
+                 union delta rewrite is scheduled for Phase 6"
+                    .to_string(),
+            ),
             _ => Ok(RewriteResult::Unchanged),
         }
     }
@@ -201,7 +222,10 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::imv::annotation::{ImvExtension, ImvPlanAnnotation};
-    use crate::sql::planner::plan::{LogicalPlan, ScanNode};
+    use crate::sql::analysis::JoinKind;
+    use crate::sql::planner::plan::{
+        AggregateNode, JoinNode, LogicalPlan, ScanNode, UnionNode,
+    };
 
     fn build_ctx() -> RewriteContext {
         let mut ctx = RewriteContext::for_mv_refresh(Vec::new());
@@ -402,5 +426,52 @@ mod tests {
         let ctx = build_ctx();
         let plan = LogicalPlan::Scan(delta_scan_with_action(ColumnId(100)));
         assert!(!rule.matches(&plan, &ctx));
+    }
+
+    #[test]
+    fn propagate_rejects_aggregate() {
+        let rule = PropagateActionColumnRule;
+        let mut ctx = build_ctx();
+        let scan = LogicalPlan::Scan(delta_scan_with_action(ColumnId(100)));
+        let plan = LogicalPlan::Aggregate(AggregateNode {
+            input: Box::new(scan),
+            group_by: Vec::new(),
+            aggregates: Vec::new(),
+            output_columns: Vec::new(),
+            already_pushed: false,
+        });
+        assert!(rule.matches(&plan, &ctx));
+        let err = rule.apply(plan, &mut ctx).expect_err("Aggregate must fail");
+        assert!(err.contains("Phase 4"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn propagate_rejects_join() {
+        let rule = PropagateActionColumnRule;
+        let mut ctx = build_ctx();
+        let left = LogicalPlan::Scan(delta_scan_with_action(ColumnId(100)));
+        let right = LogicalPlan::Scan(delta_scan());
+        let plan = LogicalPlan::Join(JoinNode {
+            left: Box::new(left),
+            right: Box::new(right),
+            join_type: JoinKind::Inner,
+            condition: None,
+        });
+        assert!(rule.matches(&plan, &ctx));
+        let err = rule.apply(plan, &mut ctx).expect_err("Join must fail");
+        assert!(err.contains("Phase 5"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn propagate_rejects_union() {
+        let rule = PropagateActionColumnRule;
+        let mut ctx = build_ctx();
+        let plan = LogicalPlan::Union(UnionNode {
+            inputs: vec![LogicalPlan::Scan(delta_scan_with_action(ColumnId(100)))],
+            all: true,
+        });
+        assert!(rule.matches(&plan, &ctx));
+        let err = rule.apply(plan, &mut ctx).expect_err("Union must fail");
+        assert!(err.contains("Phase 6"), "unexpected error: {err}");
     }
 }
