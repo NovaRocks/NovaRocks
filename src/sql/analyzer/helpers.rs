@@ -679,6 +679,19 @@ pub(super) fn expr_display_name(expr: &sqlast::Expr) -> String {
                 items
             )
         }
+        sqlast::Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => {
+            let not = if *negated { " NOT" } else { "" };
+            format!(
+                "{}{} IN ((({})))",
+                expr_display_name_with_parens(expr),
+                not,
+                format_subquery_display_name(subquery)
+            )
+        }
         // Expressions like SUBSTR, EXTRACT are rendered in uppercase by
         // sqlparser's Display. Lowercase leading keyword to match StarRocks FE.
         other => {
@@ -696,6 +709,75 @@ pub(super) fn expr_display_name(expr: &sqlast::Expr) -> String {
                 s
             }
         }
+    }
+}
+
+fn format_subquery_display_name(query: &sqlast::Query) -> String {
+    let mut query = query.clone();
+    mark_query_aliases_explicit(&mut query);
+    format!("{query}")
+}
+
+fn mark_query_aliases_explicit(query: &mut sqlast::Query) {
+    if let Some(with) = &mut query.with {
+        for cte in &mut with.cte_tables {
+            mark_query_aliases_explicit(&mut cte.query);
+        }
+    }
+    mark_set_expr_aliases_explicit(query.body.as_mut());
+}
+
+fn mark_set_expr_aliases_explicit(set_expr: &mut sqlast::SetExpr) {
+    match set_expr {
+        sqlast::SetExpr::Select(select) => {
+            for table_with_joins in &mut select.from {
+                mark_table_with_joins_aliases_explicit(table_with_joins);
+            }
+        }
+        sqlast::SetExpr::Query(query) => mark_query_aliases_explicit(query),
+        sqlast::SetExpr::SetOperation { left, right, .. } => {
+            mark_set_expr_aliases_explicit(left);
+            mark_set_expr_aliases_explicit(right);
+        }
+        _ => {}
+    }
+}
+
+fn mark_table_with_joins_aliases_explicit(table_with_joins: &mut sqlast::TableWithJoins) {
+    mark_table_factor_aliases_explicit(&mut table_with_joins.relation);
+    for join in &mut table_with_joins.joins {
+        mark_table_factor_aliases_explicit(&mut join.relation);
+    }
+}
+
+fn mark_table_factor_aliases_explicit(factor: &mut sqlast::TableFactor) {
+    match factor {
+        sqlast::TableFactor::Table { alias, .. }
+        | sqlast::TableFactor::TableFunction { alias, .. }
+        | sqlast::TableFactor::Function { alias, .. }
+        | sqlast::TableFactor::UNNEST { alias, .. } => {
+            if let Some(alias) = alias {
+                alias.explicit = true;
+            }
+        }
+        sqlast::TableFactor::Derived {
+            subquery, alias, ..
+        } => {
+            if let Some(alias) = alias {
+                alias.explicit = true;
+            }
+            mark_query_aliases_explicit(subquery);
+        }
+        sqlast::TableFactor::NestedJoin {
+            table_with_joins,
+            alias,
+        } => {
+            if let Some(alias) = alias {
+                alias.explicit = true;
+            }
+            mark_table_with_joins_aliases_explicit(table_with_joins);
+        }
+        _ => {}
     }
 }
 
@@ -1867,6 +1949,15 @@ mod tests {
         assert_eq!(
             expr_display_name(&expr),
             "array_agg(DISTINCT name ORDER BY name ASC)"
+        );
+    }
+
+    #[test]
+    fn expr_display_name_formats_in_subquery_like_starrocks() {
+        let expr = parse_select_expr("SELECT ai_1 IN (SELECT ai_1 FROM db.array_test t)");
+        assert_eq!(
+            expr_display_name(&expr),
+            "ai_1 IN (((SELECT ai_1 FROM db.array_test AS t)))"
         );
     }
 

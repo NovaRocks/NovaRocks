@@ -25,6 +25,7 @@ pub(crate) fn run_insert(
     overwrite_mode: OverwriteMode,
     current_catalog: Option<&str>,
     current_database: &str,
+    query_opts: Option<&crate::internal_service::TQueryOptions>,
 ) -> Result<StatementResult, String> {
     let is_overwrite = matches!(
         overwrite_mode,
@@ -149,6 +150,7 @@ pub(crate) fn run_insert(
                     overwrite_mode,
                     current_catalog,
                     current_database,
+                    query_opts,
                 )?;
             }
         }
@@ -159,8 +161,9 @@ pub(crate) fn run_insert(
                     target.backend_name
                 ));
             }
-            let batch =
-                execute_insert_from_query_on_pipeline(state, &target, &resolved, columns, query)?;
+            let batch = execute_insert_from_query_on_pipeline(
+                state, &target, &resolved, columns, query, query_opts,
+            )?;
             if batch.num_rows() > 0 {
                 sink.append_batch(&resolved, batch)?;
             }
@@ -187,6 +190,7 @@ pub(crate) fn execute_insert_from_query_on_pipeline(
     resolved: &ResolvedTable,
     insert_columns: &[String],
     query: &sqlparser::ast::Query,
+    query_opts: Option<&crate::internal_service::TQueryOptions>,
 ) -> Result<RecordBatch, String> {
     // Clone-then-release: pipeline execution must not hold
     // `state.catalog.read()`. See iceberg_writer::run_select_to_chunks for
@@ -207,7 +211,7 @@ pub(crate) fn execute_insert_from_query_on_pipeline(
         &connectors_snapshot,
         &target.namespace,
         state.exchange_port,
-        None,
+        query_opts.cloned(),
     )?;
 
     align_query_result_to_target(&query_result, insert_columns, &resolved.columns)

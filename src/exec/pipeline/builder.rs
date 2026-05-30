@@ -1236,11 +1236,11 @@ fn build_pipeline_for_node(
         ExecNodeKind::Values(ValuesNode { chunk, node_id }) => {
             let source: Box<dyn OperatorFactory> =
                 Box::new(ValuesSourceFactory::new(chunk.clone(), *node_id));
-            let pipeline = new_source_pipeline(ctx, source);
+            let pipeline = new_source_pipeline_with_dop(ctx, source, 1);
             Ok(PipelineBuildResult {
                 pipeline,
                 extra_pipelines: Vec::new(),
-                stream: StreamDesc::any(ctx.pipeline_dop),
+                stream: StreamDesc::any(1),
             })
         }
         ExecNodeKind::ExchangeSource(node) => {

@@ -1,6 +1,7 @@
 use crate::sql::parser::dialect::StarRocksDialect;
 use crate::sql::parser::recursive_cte;
 use sqlparser::parser::Parser;
+use sqlparser::tokenizer::Token;
 
 /// Parse SQL into a raw sqlparser AST without converting to the custom AST.
 /// This is used by the standalone ThriftPlanBuilder which works directly
@@ -18,6 +19,11 @@ pub(crate) fn parse_normalized_sql_raw(sql: &str) -> Result<sqlparser::ast::Stat
     let stmt = parser
         .parse_statement()
         .map_err(|e| normalize_raw_parse_error(sql, &e.to_string()))?;
+    while parser.consume_token(&Token::SemiColon) {}
+    let trailing = parser.peek_token();
+    if trailing.token != Token::EOF {
+        return Err(format!("syntax error: unexpected token {}", trailing.token));
+    }
     let max_depth = recursive_cte::extract_recursive_cte_max_depth(sql)
         .unwrap_or(recursive_cte::DEFAULT_MAX_DEPTH);
     let mut stmt = stmt;

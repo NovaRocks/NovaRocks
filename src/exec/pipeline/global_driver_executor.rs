@@ -32,7 +32,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::common::app_config;
 use crate::runtime::exchange;
@@ -135,6 +135,33 @@ impl FragmentCompletion {
         let mut st = self.mu.lock().expect("fragment completion lock");
         while st.remaining > 0 {
             st = self.cv.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+
+        st.error.clone().map(Err).unwrap_or(Ok(()))
+    }
+
+    pub fn wait_timeout(&self, timeout: Duration, err: String) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        let mut st = self.mu.lock().expect("fragment completion lock");
+        while st.remaining > 0 {
+            let now = Instant::now();
+            if now >= deadline {
+                drop(st);
+                self.abort_from_query(err.clone());
+                return Err(err);
+            }
+
+            let remaining = deadline.saturating_duration_since(now);
+            let (guard, result) = self
+                .cv
+                .wait_timeout(st, remaining)
+                .unwrap_or_else(|e| e.into_inner());
+            st = guard;
+            if result.timed_out() && st.remaining > 0 {
+                drop(st);
+                self.abort_from_query(err.clone());
+                return Err(err);
+            }
         }
 
         st.error.clone().map(Err).unwrap_or(Ok(()))
@@ -441,5 +468,35 @@ fn worker_loop(shared: Arc<ExecutorShared>, poller: BlockedDriverPoller) {
                 task.completion.driver_finished();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exec::pipeline::fragment_context::FragmentContext;
+    use crate::runtime::runtime_state::RuntimeState;
+
+    #[test]
+    fn fragment_completion_wait_timeout_returns_query_timeout_error() {
+        let ctx = Arc::new(FragmentContext::new(
+            None,
+            Arc::new(RuntimeState::default()),
+            None,
+            None,
+            None,
+            None,
+        ));
+        let completion = FragmentCompletion::new(1, ctx);
+
+        let err = completion
+            .wait_timeout(
+                Duration::from_millis(1),
+                "query timed out after 1 ms".to_string(),
+            )
+            .expect_err("incomplete fragment should time out");
+
+        assert_eq!(err, "query timed out after 1 ms");
+        assert!(completion.should_abort());
     }
 }

@@ -24,9 +24,9 @@
 use crate::exec::chunk::Chunk;
 use arrow::array::{
     Array, ArrayRef, Decimal128Array, FixedSizeBinaryArray, Int8Array, ListArray, MapArray,
-    StructArray,
+    StructArray, UInt64Array,
 };
-use arrow::compute::concat_batches;
+use arrow::compute::{SortColumn, SortOptions, concat_batches};
 use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow_buffer::OffsetBuffer;
@@ -233,6 +233,20 @@ pub(crate) fn normalize_sort_key_array(values: &ArrayRef) -> Result<ArrayRef, St
         .with_precision_and_scale(38, 0)
         .map_err(|e| format!("normalize LARGEINT sort key failed: {e}"))?;
     Ok(Arc::new(decimal) as ArrayRef)
+}
+
+pub(crate) fn append_stable_row_index_sort_column(
+    sort_columns: &mut Vec<SortColumn>,
+    num_rows: usize,
+) {
+    let row_ids = UInt64Array::from_iter_values((0..num_rows).map(|idx| idx as u64));
+    sort_columns.push(SortColumn {
+        values: Arc::new(row_ids) as ArrayRef,
+        options: Some(SortOptions {
+            descending: false,
+            nulls_first: true,
+        }),
+    });
 }
 
 pub(crate) use chunks_sorter_full_sort::ChunksSorterFullSort;

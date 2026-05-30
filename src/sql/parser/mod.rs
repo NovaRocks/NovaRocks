@@ -263,6 +263,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_sql_raw_rejects_trailing_tokens_after_statement() {
+        let err = parse_sql_raw("SELECT * FROM t1 JOIN t2 ON t1.c1 => t2.c1")
+            .expect_err("parse should reject trailing tokens");
+        assert!(
+            err.contains("syntax error"),
+            "unexpected parse error: {err}"
+        );
+    }
+
+    #[test]
     fn parse_sql_raw_parses_cast_null_as_map_type() {
         let stmt = parse_sql_raw("SELECT CAST(NULL AS MAP<INT, INT>)").expect("parse should work");
         let sqlparser::ast::Statement::Query(query) = stmt else {

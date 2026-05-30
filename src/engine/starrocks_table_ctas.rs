@@ -108,6 +108,7 @@ pub(crate) fn execute_starrocks_table_ctas(
         OverwriteMode::None,
         current_catalog,
         current_database,
+        None,
     );
     if let Err(err) = insert_result {
         // Rollback: drop the table we just created.

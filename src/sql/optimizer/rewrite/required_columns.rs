@@ -455,9 +455,9 @@ fn tag_cte_consume(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) 
     // returns false after tagging.  When parent_needed is None (no restriction
     // from above), default to keeping all of this node's own output ids, which
     // is the correct "keep-all" signal for the CTE two-walk.
-    node.required_output_columns = Some(parent_needed.unwrap_or_else(|| {
-        node.output_columns.iter().map(|c| c.column_id).collect()
-    }));
+    node.required_output_columns = Some(
+        parent_needed.unwrap_or_else(|| node.output_columns.iter().map(|c| c.column_id).collect()),
+    );
     LogicalPlan::CTEConsume(node)
 }
 
@@ -1291,7 +1291,11 @@ mod tests {
         };
         let req = s.required_output_columns.unwrap();
         // Conservative keep-all: produce body scan keeps all 3 columns.
-        assert_eq!(req.len(), 3, "scan must keep all columns (keep-all for CTE produce body)");
+        assert_eq!(
+            req.len(),
+            3,
+            "scan must keep all columns (keep-all for CTE produce body)"
+        );
         assert!(req.contains(&ColumnId::new_for_test(10)), "a@10 kept");
         assert!(req.contains(&ColumnId::new_for_test(20)), "b@20 kept");
         assert!(req.contains(&ColumnId::new_for_test(30)), "c@30 kept");
@@ -1371,7 +1375,11 @@ mod tests {
         };
         let req = s.required_output_columns.unwrap();
         // Conservative keep-all: produce body scan keeps all 3 columns.
-        assert_eq!(req.len(), 3, "scan must keep all columns (keep-all for CTE produce body)");
+        assert_eq!(
+            req.len(),
+            3,
+            "scan must keep all columns (keep-all for CTE produce body)"
+        );
         assert!(req.contains(&ColumnId::new_for_test(10)), "a@10 kept");
         assert!(req.contains(&ColumnId::new_for_test(20)), "b@20 kept");
         assert!(req.contains(&ColumnId::new_for_test(30)), "c@30 kept");

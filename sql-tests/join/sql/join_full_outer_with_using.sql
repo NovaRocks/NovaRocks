@@ -497,7 +497,7 @@ FROM ${case_db}.t1 FULL OUTER JOIN ${case_db}.t2 USING(k1, k2)
 WHERE EXISTS (
     SELECT 1 FROM ${case_db}.t3 WHERE t3.k1 = k1 AND t3.k2 = k2
 )
-ORDER BY k1, k2;
+ORDER BY k1, k2, COALESCE(v1, v2);
 
 -- query 55
 -- FULL OUTER USING + NOT EXISTS (empty result)

@@ -1596,9 +1596,9 @@ impl StandaloneSession {
         insert: &sqlparser::ast::Insert,
         current_catalog: Option<&str>,
         current_database: &str,
-        _query_opts: Option<&crate::internal_service::TQueryOptions>,
+        query_opts: Option<&crate::internal_service::TQueryOptions>,
     ) -> Result<StatementResult, String> {
-        self.execute_insert_via_custom_parser(insert, current_catalog, current_database)
+        self.execute_insert_via_custom_parser(insert, current_catalog, current_database, query_opts)
     }
 
     /// Convert sqlparser INSERT to our custom InsertStmt and delegate to the
@@ -1608,6 +1608,7 @@ impl StandaloneSession {
         insert: &sqlparser::ast::Insert,
         current_catalog: Option<&str>,
         current_database: &str,
+        query_opts: Option<&crate::internal_service::TQueryOptions>,
     ) -> Result<StatementResult, String> {
         let insert_stmt = convert_sqlparser_insert_to_custom(insert)?;
         execute_insert_statement(
@@ -1618,6 +1619,7 @@ impl StandaloneSession {
             insert_stmt.overwrite_mode,
             current_catalog,
             current_database,
+            query_opts,
         )
     }
 }
@@ -2468,6 +2470,26 @@ fn strip_top_level_stream_root_wrapper(
     };
 
     let old_root_id = build_result.root_fragment_id;
+    let Some(root_fragment) = build_result
+        .fragment_results
+        .iter()
+        .find(|fragment| fragment.fragment_id == old_root_id)
+    else {
+        return build_result;
+    };
+    let root_node = &root_fragment.plan.nodes[0];
+    let root_limit = root_node.limit;
+    let root_offset = root_node
+        .exchange_node
+        .as_ref()
+        .and_then(|exchange| exchange.offset)
+        .unwrap_or(0);
+    if root_offset > 0 {
+        return build_result;
+    }
+    let root_output_sink = root_fragment.output_sink.clone();
+    let root_output_columns = root_fragment.output_columns.clone();
+
     build_result
         .fragment_results
         .retain(|fragment| fragment.fragment_id != old_root_id);
@@ -2477,6 +2499,27 @@ fn strip_top_level_stream_root_wrapper(
             && matches!(edge.edge_kind, FragmentEdgeKind::Stream))
     });
     build_result.root_fragment_id = child_id;
+    if root_limit >= 0
+        && let Some(child) = build_result
+            .fragment_results
+            .iter_mut()
+            .find(|fragment| fragment.fragment_id == child_id)
+        && let Some(child_root) = child.plan.nodes.first_mut()
+    {
+        child_root.limit = if child_root.limit >= 0 {
+            child_root.limit.min(root_limit)
+        } else {
+            root_limit
+        };
+    }
+    if let Some(child) = build_result
+        .fragment_results
+        .iter_mut()
+        .find(|fragment| fragment.fragment_id == child_id)
+    {
+        child.output_sink = root_output_sink;
+        child.output_columns = root_output_columns;
+    }
     build_result
 }
 
@@ -4829,6 +4872,40 @@ enable_path_style_access = true
                 crate::sql::codegen::FragmentEdgeKind::Stream
             )
         }));
+    }
+
+    #[test]
+    fn stripped_top_level_stream_wrapper_preserves_limit() {
+        let build = build_fragments_for_query("SELECT id FROM tbl LIMIT 3");
+        let stripped = super::strip_top_level_stream_root_wrapper(build);
+        let plan = match super::single_fragment_plan(stripped) {
+            Ok(plan) => plan,
+            Err(_) => panic!("expected single fragment after strip"),
+        };
+        let root = plan.plan.nodes.first().expect("root plan node");
+
+        assert_eq!(
+            root.limit, 3,
+            "stripping an exchange-only root wrapper must not drop LIMIT"
+        );
+    }
+
+    #[test]
+    fn stripped_top_level_stream_wrapper_promotes_result_sink() {
+        let build =
+            build_fragments_for_query("SELECT a.id FROM tbl a JOIN tbl b ON a.id = b.id LIMIT 3");
+        let stripped = super::strip_top_level_stream_root_wrapper(build);
+        let root = stripped
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == stripped.root_fragment_id)
+            .expect("root fragment after strip");
+
+        assert_eq!(
+            root.output_sink.type_,
+            crate::data_sinks::TDataSinkType::RESULT_SINK,
+            "stripping an exchange-only result root must promote RESULT_SINK to the new root"
+        );
     }
 
     #[test]

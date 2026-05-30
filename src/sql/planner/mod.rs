@@ -2624,10 +2624,8 @@ mod tests {
         // so collect_extra_sort_items returns o_custkey as an extra.
         // apply_query_modifiers then builds:
         //   outer strip-Project (items: [o_orderkey]) <-- Sort <-- inner Project (items: [o_orderkey__nr_sel_0, o_custkey_extra])
-        let plan = parse_analyze_and_plan(
-            "SELECT o_orderkey FROM orders ORDER BY o_custkey",
-        )
-        .expect("planner should succeed");
+        let plan = parse_analyze_and_plan("SELECT o_orderkey FROM orders ORDER BY o_custkey")
+            .expect("planner should succeed");
 
         // Walk down to find the outer and inner Projects.
         // Shape: outer-Project? <- Sort <- inner-Project <- Scan

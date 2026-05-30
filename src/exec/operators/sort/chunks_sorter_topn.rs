@@ -26,8 +26,8 @@ use crate::exec::chunk::Chunk;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::sort::{SortExpression, SortTopNType};
 use crate::exec::operators::sort::chunks_sorter_heap_sort::sort_chunks_topn_heap;
-use crate::exec::operators::sort::normalize_sort_key_array;
 use crate::exec::operators::sort::{ChunksSorter, concat_sort_chunks};
+use crate::exec::operators::sort::{append_stable_row_index_sort_column, normalize_sort_key_array};
 
 use arrow::array::{ArrayRef, UInt32Array};
 use arrow::compute::{SortColumn, SortOptions, lexsort_to_indices, take};
@@ -284,7 +284,7 @@ fn build_row_converter(
 }
 
 fn build_sort_columns(order_by: &[SortExpression], key_columns: &[ArrayRef]) -> Vec<SortColumn> {
-    key_columns
+    let mut sort_columns: Vec<SortColumn> = key_columns
         .iter()
         .zip(order_by.iter())
         .map(|(values, expr)| SortColumn {
@@ -294,7 +294,11 @@ fn build_sort_columns(order_by: &[SortExpression], key_columns: &[ArrayRef]) -> 
                 nulls_first: expr.nulls_first,
             }),
         })
-        .collect()
+        .collect();
+    if let Some(first) = key_columns.first() {
+        append_stable_row_index_sort_column(&mut sort_columns, first.len());
+    }
+    sort_columns
 }
 
 fn sort_chunks_by_order(

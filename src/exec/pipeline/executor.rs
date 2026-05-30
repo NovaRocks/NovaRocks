@@ -100,7 +100,7 @@ pub(crate) fn execute_plan_with_pipeline(
     let finst_id = runtime_state.fragment_instance_id();
     let ctx = Arc::new(FragmentContext::new(
         profiler,
-        runtime_state,
+        Arc::clone(&runtime_state),
         exchange_finst_id,
         query_id,
         fe_addr,
@@ -177,7 +177,15 @@ pub(crate) fn execute_plan_with_pipeline(
         tasks.push(task);
     }
     global_driver_executor().submit(tasks);
-    let res = completion.wait();
+    let res = runtime_state
+        .query_options()
+        .and_then(|opts| opts.query_timeout)
+        .filter(|secs| *secs > 0)
+        .map(|secs| {
+            let timeout = Duration::from_secs(secs as u64);
+            completion.wait_timeout(timeout, format!("query timed out after {} ms", secs * 1000))
+        })
+        .unwrap_or_else(|| completion.wait());
     if let Some(finst_id) = finst_id {
         query_context_manager().unregister_fragment_completion(finst_id);
     }

@@ -1013,7 +1013,20 @@ async fn execute_sql_in_worker(
             },
         )
     });
-    let result = join_handle.await;
+    let result = if let Some(secs) = query_timeout.filter(|secs| *secs > 0) {
+        match tokio::time::timeout(std::time::Duration::from_secs(secs), join_handle).await {
+            Ok(result) => result,
+            Err(_) => {
+                shim.client_disconnect_signal.store(true, Ordering::SeqCst);
+                return Err((
+                    ErrorKind::ER_UNKNOWN_ERROR,
+                    format!("query timed out after {} ms", secs * 1000),
+                ));
+            }
+        }
+    } else {
+        join_handle.await
+    };
 
     match result {
         Ok(Ok(result)) => Ok(result),

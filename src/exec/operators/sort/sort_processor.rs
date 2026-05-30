@@ -37,7 +37,9 @@ use crate::exec::operators::sort::{
     ChunksSorter, ChunksSorterFullSort, ChunksSorterHeapSort, ChunksSorterTopN,
     SpillableChunksSorter,
 };
-use crate::exec::operators::sort::{concat_sort_chunks, normalize_sort_key_array};
+use crate::exec::operators::sort::{
+    append_stable_row_index_sort_column, concat_sort_chunks, normalize_sort_key_array,
+};
 use crate::exec::spill::spiller::{SpillFile, Spiller};
 use crate::exec::spill::{SpillConfig, SpillMode, SpillProfile};
 
@@ -931,7 +933,7 @@ impl SortProcessorOperator {
     }
 
     fn build_sort_columns(&self, key_columns: &[ArrayRef]) -> Vec<SortColumn> {
-        key_columns
+        let mut sort_columns: Vec<SortColumn> = key_columns
             .iter()
             .zip(self.order_by.iter())
             .map(|(values, sort_expr)| SortColumn {
@@ -941,7 +943,11 @@ impl SortProcessorOperator {
                     nulls_first: sort_expr.nulls_first,
                 }),
             })
-            .collect()
+            .collect();
+        if let Some(first) = key_columns.first() {
+            append_stable_row_index_sort_column(&mut sort_columns, first.len());
+        }
+        sort_columns
     }
 
     fn convert_sort_keys_to_rows(

@@ -2450,7 +2450,7 @@ fn is_bitmap_or_hll_type(sql_type: &crate::sql::SqlType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::{ExprKind, JoinKind, Relation};
+    use crate::sql::analysis::{BinOp, ExprKind, JoinKind, Relation};
     use crate::sql::catalog::{
         ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
@@ -2474,6 +2474,96 @@ mod tests {
     impl crate::sql::catalog::CatalogProvider for TestCatalog {
         fn get_table(&self, _db: &str, table: &str) -> Result<TableDef, String> {
             match table {
+                "t1" | "t2" | "t3" => {
+                    let value_col = match table {
+                        "t1" => "v1",
+                        "t2" => "v2",
+                        _ => "v3",
+                    };
+                    Ok(TableDef {
+                        name: table.to_string(),
+                        columns: vec![
+                            ColumnDef {
+                                name: "k1".to_string(),
+                                data_type: arrow::datatypes::DataType::Int64,
+                                nullable: true,
+                                write_default: None,
+                                logical_type: None,
+                            },
+                            ColumnDef {
+                                name: "k2".to_string(),
+                                data_type: arrow::datatypes::DataType::Int64,
+                                nullable: true,
+                                write_default: None,
+                                logical_type: None,
+                            },
+                            ColumnDef {
+                                name: value_col.to_string(),
+                                data_type: arrow::datatypes::DataType::Utf8,
+                                nullable: true,
+                                write_default: None,
+                                logical_type: None,
+                            },
+                        ],
+                        iceberg_row_lineage_metadata_columns: vec![],
+                        source: ScanSource::StarRocks {
+                            db_id: 0,
+                            table_id: 0,
+                        },
+                    })
+                }
+                "array_test" => Ok(TableDef {
+                    name: "array_test".to_string(),
+                    columns: vec![
+                        ColumnDef {
+                            name: "s_1".to_string(),
+                            data_type: arrow::datatypes::DataType::List(
+                                arrow::datatypes::Field::new(
+                                    "item",
+                                    arrow::datatypes::DataType::Utf8,
+                                    true,
+                                )
+                                .into(),
+                            ),
+                            nullable: true,
+                            write_default: None,
+                            logical_type: None,
+                        },
+                        ColumnDef {
+                            name: "i_1".to_string(),
+                            data_type: arrow::datatypes::DataType::List(
+                                arrow::datatypes::Field::new(
+                                    "item",
+                                    arrow::datatypes::DataType::Int64,
+                                    true,
+                                )
+                                .into(),
+                            ),
+                            nullable: true,
+                            write_default: None,
+                            logical_type: None,
+                        },
+                        ColumnDef {
+                            name: "d_1".to_string(),
+                            data_type: arrow::datatypes::DataType::List(
+                                arrow::datatypes::Field::new(
+                                    "item",
+                                    arrow::datatypes::DataType::Decimal128(26, 2),
+                                    true,
+                                )
+                                .into(),
+                            ),
+                            nullable: true,
+                            write_default: None,
+                            logical_type: None,
+                        },
+                    ],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 0,
+                    },
+                }),
                 "orders" => Ok(TableDef {
                     name: "orders".to_string(),
                     columns: vec![
@@ -2893,6 +2983,187 @@ mod tests {
         }
     }
 
+    fn find_join_kind<'a>(
+        rel: &'a Relation,
+        kind: JoinKind,
+    ) -> Option<&'a crate::sql::analysis::JoinRelation> {
+        match rel {
+            Relation::Join(jr) if jr.join_type == kind => Some(jr),
+            Relation::Join(jr) => {
+                find_join_kind(&jr.left, kind).or_else(|| find_join_kind(&jr.right, kind))
+            }
+            _ => None,
+        }
+    }
+
+    fn expr_has_qualified_column(expr: &TypedExpr, qualifier: &str, column: &str) -> bool {
+        match &expr.kind {
+            ExprKind::ColumnRef {
+                qualifier: Some(q),
+                column: c,
+                ..
+            } => q.eq_ignore_ascii_case(qualifier) && c.eq_ignore_ascii_case(column),
+            ExprKind::BinaryOp { left, right, .. } => {
+                expr_has_qualified_column(left, qualifier, column)
+                    || expr_has_qualified_column(right, qualifier, column)
+            }
+            ExprKind::UnaryOp { expr, .. }
+            | ExprKind::IsNull { expr, .. }
+            | ExprKind::Cast { expr, .. }
+            | ExprKind::Nested(expr) => expr_has_qualified_column(expr, qualifier, column),
+            ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => args
+                .iter()
+                .any(|arg| expr_has_qualified_column(arg, qualifier, column)),
+            ExprKind::Case {
+                operand,
+                when_then,
+                else_expr,
+            } => {
+                operand
+                    .as_ref()
+                    .is_some_and(|expr| expr_has_qualified_column(expr, qualifier, column))
+                    || when_then.iter().any(|(when, then)| {
+                        expr_has_qualified_column(when, qualifier, column)
+                            || expr_has_qualified_column(then, qualifier, column)
+                    })
+                    || else_expr
+                        .as_ref()
+                        .is_some_and(|expr| expr_has_qualified_column(expr, qualifier, column))
+            }
+            ExprKind::InList { expr, list, .. } => {
+                expr_has_qualified_column(expr, qualifier, column)
+                    || list
+                        .iter()
+                        .any(|item| expr_has_qualified_column(item, qualifier, column))
+            }
+            _ => false,
+        }
+    }
+
+    fn expr_has_function_call(expr: &TypedExpr, function_name: &str) -> bool {
+        match &expr.kind {
+            ExprKind::FunctionCall { name, args, .. } => {
+                name.eq_ignore_ascii_case(function_name)
+                    || args
+                        .iter()
+                        .any(|arg| expr_has_function_call(arg, function_name))
+            }
+            ExprKind::BinaryOp { left, right, .. } => {
+                expr_has_function_call(left, function_name)
+                    || expr_has_function_call(right, function_name)
+            }
+            ExprKind::UnaryOp { expr, .. }
+            | ExprKind::IsNull { expr, .. }
+            | ExprKind::Cast { expr, .. }
+            | ExprKind::Nested(expr) => expr_has_function_call(expr, function_name),
+            ExprKind::AggregateCall { args, .. } => args
+                .iter()
+                .any(|arg| expr_has_function_call(arg, function_name)),
+            ExprKind::Case {
+                operand,
+                when_then,
+                else_expr,
+            } => {
+                operand
+                    .as_ref()
+                    .is_some_and(|expr| expr_has_function_call(expr, function_name))
+                    || when_then.iter().any(|(when, then)| {
+                        expr_has_function_call(when, function_name)
+                            || expr_has_function_call(then, function_name)
+                    })
+                    || else_expr
+                        .as_ref()
+                        .is_some_and(|expr| expr_has_function_call(expr, function_name))
+            }
+            ExprKind::InList { expr, list, .. } => {
+                expr_has_function_call(expr, function_name)
+                    || list
+                        .iter()
+                        .any(|item| expr_has_function_call(item, function_name))
+            }
+            _ => false,
+        }
+    }
+
+    fn expr_has_unqualified_column(expr: &TypedExpr, column: &str) -> bool {
+        match &expr.kind {
+            ExprKind::ColumnRef {
+                qualifier: None,
+                column: c,
+                ..
+            } => c.eq_ignore_ascii_case(column),
+            ExprKind::BinaryOp { left, right, .. } => {
+                expr_has_unqualified_column(left, column)
+                    || expr_has_unqualified_column(right, column)
+            }
+            ExprKind::UnaryOp { expr, .. }
+            | ExprKind::IsNull { expr, .. }
+            | ExprKind::Cast { expr, .. }
+            | ExprKind::Nested(expr) => expr_has_unqualified_column(expr, column),
+            ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => args
+                .iter()
+                .any(|arg| expr_has_unqualified_column(arg, column)),
+            ExprKind::Case {
+                operand,
+                when_then,
+                else_expr,
+            } => {
+                operand
+                    .as_ref()
+                    .is_some_and(|expr| expr_has_unqualified_column(expr, column))
+                    || when_then.iter().any(|(when, then)| {
+                        expr_has_unqualified_column(when, column)
+                            || expr_has_unqualified_column(then, column)
+                    })
+                    || else_expr
+                        .as_ref()
+                        .is_some_and(|expr| expr_has_unqualified_column(expr, column))
+            }
+            ExprKind::InList { expr, list, .. } => {
+                expr_has_unqualified_column(expr, column)
+                    || list
+                        .iter()
+                        .any(|item| expr_has_unqualified_column(item, column))
+            }
+            _ => false,
+        }
+    }
+
+    fn expr_has_cast_to(expr: &TypedExpr, target: &arrow::datatypes::DataType) -> bool {
+        match &expr.kind {
+            ExprKind::Cast { expr, target: ty } => ty == target || expr_has_cast_to(expr, target),
+            ExprKind::BinaryOp { left, right, .. } => {
+                expr_has_cast_to(left, target) || expr_has_cast_to(right, target)
+            }
+            ExprKind::UnaryOp { expr, .. }
+            | ExprKind::IsNull { expr, .. }
+            | ExprKind::Nested(expr) => expr_has_cast_to(expr, target),
+            ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
+                args.iter().any(|arg| expr_has_cast_to(arg, target))
+            }
+            ExprKind::Case {
+                operand,
+                when_then,
+                else_expr,
+            } => {
+                operand
+                    .as_ref()
+                    .is_some_and(|expr| expr_has_cast_to(expr, target))
+                    || when_then.iter().any(|(when, then)| {
+                        expr_has_cast_to(when, target) || expr_has_cast_to(then, target)
+                    })
+                    || else_expr
+                        .as_ref()
+                        .is_some_and(|expr| expr_has_cast_to(expr, target))
+            }
+            ExprKind::InList { expr, list, .. } => {
+                expr_has_cast_to(expr, target)
+                    || list.iter().any(|item| expr_has_cast_to(item, target))
+            }
+            _ => false,
+        }
+    }
+
     #[test]
     fn exists_subquery_rewrites_to_left_semi_join() {
         let sql = "SELECT o_orderpriority, count(*) FROM orders \
@@ -2913,6 +3184,40 @@ mod tests {
         } else {
             panic!("expected Select body");
         }
+    }
+
+    #[test]
+    fn correlated_exists_self_join_keeps_outer_qualifier_for_ambiguous_column() {
+        let sql = "SELECT l1.l_orderkey FROM lineitem l1 \
+                   WHERE EXISTS (SELECT 1 FROM lineitem l2 \
+                                 WHERE l2.l_partkey = l1.l_suppkey)";
+        let resolved = parse_and_analyze(sql).expect("analysis should succeed");
+        let QueryBody::Select(sel) = &resolved.body else {
+            panic!("expected Select body");
+        };
+        let semi = find_join_kind(
+            sel.from.as_ref().expect("should have FROM"),
+            JoinKind::LeftSemi,
+        )
+        .expect("EXISTS should rewrite to LEFT SEMI JOIN");
+        let cond = semi.condition.as_ref().expect("semi join condition");
+
+        assert!(
+            expr_has_qualified_column(cond, "l1", "l_suppkey"),
+            "outer self-join column must keep its qualifier in correlated EXISTS condition: {cond:?}"
+        );
+        let ExprKind::BinaryOp { left, op, right } = &cond.kind else {
+            panic!("expected binary correlation condition, got: {cond:?}");
+        };
+        assert_eq!(*op, BinOp::Eq);
+        assert!(
+            expr_has_qualified_column(left, "l1", "l_suppkey"),
+            "outer column must be on the probe/left side of correlated EXISTS condition: {cond:?}"
+        );
+        assert!(
+            expr_has_qualified_column(right, "l2", "l_partkey"),
+            "inner column must be on the build/right side of correlated EXISTS condition: {cond:?}"
+        );
     }
 
     #[test]
@@ -3003,6 +3308,112 @@ mod tests {
         } else {
             panic!("expected Select body");
         }
+    }
+
+    #[test]
+    fn correlated_not_in_nullable_key_rewrites_to_null_aware_left_anti() {
+        let sql = "SELECT l1.l_orderkey FROM lineitem l1 \
+                   WHERE l1.l_shipdate NOT IN ( \
+                       SELECT l2.l_shipdate FROM lineitem l2 \
+                       WHERE l2.l_suppkey = l1.l_suppkey)";
+        let resolved = parse_and_analyze(sql).expect("analysis should succeed");
+        let QueryBody::Select(sel) = &resolved.body else {
+            panic!("expected Select body");
+        };
+
+        assert!(
+            has_join_kind(
+                sel.from.as_ref().expect("should have FROM"),
+                JoinKind::NullAwareLeftAnti,
+            ),
+            "correlated nullable NOT IN should use NullAwareLeftAnti, got: {:?}",
+            sel.from
+        );
+    }
+
+    #[test]
+    fn correlated_not_in_nullable_filter_stays_residual_for_null_aware_anti() {
+        let sql = "SELECT l1.l_orderkey FROM lineitem l1 \
+                   WHERE l1.l_shipdate NOT IN ( \
+                       SELECT l2.l_shipdate FROM lineitem l2 \
+                       WHERE l2.l_receiptdate = l1.l_receiptdate)";
+        let resolved = parse_and_analyze(sql).expect("analysis should succeed");
+        let QueryBody::Select(sel) = &resolved.body else {
+            panic!("expected Select body");
+        };
+        let anti = find_join_kind(
+            sel.from.as_ref().expect("should have FROM"),
+            JoinKind::NullAwareLeftAnti,
+        )
+        .expect("nullable NOT IN should rewrite to NULL AWARE LEFT ANTI JOIN");
+        let cond = anti.condition.as_ref().expect("anti join condition");
+
+        assert!(
+            expr_has_function_call(cond, "coalesce"),
+            "nullable correlated NOT IN filter must stay as residual, got: {cond:?}"
+        );
+    }
+
+    #[test]
+    fn subquery_unqualified_name_prefers_inner_over_outer_using_canonical() {
+        let sql = "SELECT k1, k2, v1, v2 \
+                   FROM t1 FULL OUTER JOIN t2 USING(k1, k2) \
+                   WHERE EXISTS (SELECT 1 FROM t3 WHERE t3.k1 = k1 AND t3.k2 = k2)";
+        let resolved = parse_and_analyze(sql).expect("analysis should succeed");
+        let QueryBody::Select(sel) = &resolved.body else {
+            panic!("expected Select body");
+        };
+        let exists_join = find_join_kind(
+            sel.from.as_ref().expect("should have FROM"),
+            JoinKind::LeftOuter,
+        )
+        .expect("uncorrelated EXISTS should rewrite to LEFT OUTER indicator JOIN");
+        let Relation::Subquery { query, .. } = &exists_join.right else {
+            panic!("EXISTS indicator join should keep the subquery on the right");
+        };
+        let QueryBody::Select(sub_sel) = &query.body else {
+            panic!("expected subquery SELECT body");
+        };
+        let cond = sub_sel.filter.as_ref().expect("subquery filter");
+
+        assert!(
+            !expr_has_qualified_column(cond, "t1", "k1")
+                && !expr_has_qualified_column(cond, "t2", "k1"),
+            "inner subquery k1 must not inherit outer USING canonical qualifier: {cond:?}"
+        );
+        assert!(
+            expr_has_qualified_column(cond, "t3", "k1")
+                && expr_has_qualified_column(cond, "t3", "k2"),
+            "subquery-local names should resolve to t3 columns: {cond:?}"
+        );
+        assert!(
+            !expr_has_unqualified_column(cond, "k1") && !expr_has_unqualified_column(cond, "k2"),
+            "subquery-local shadowing columns must stay qualified for codegen: {cond:?}"
+        );
+    }
+
+    #[test]
+    fn correlated_exists_reoriented_key_preserves_original_left_compare_type() {
+        let sql = "SELECT s.s_1 FROM array_test s \
+                   WHERE EXISTS (SELECT 1 FROM array_test t WHERE t.s_1 = s.d_1)";
+        let resolved = parse_and_analyze(sql).expect("analysis should succeed");
+        let QueryBody::Select(sel) = &resolved.body else {
+            panic!("expected Select body");
+        };
+        let semi = find_join_kind(
+            sel.from.as_ref().expect("should have FROM"),
+            JoinKind::LeftSemi,
+        )
+        .expect("EXISTS should rewrite to LEFT SEMI JOIN");
+        let cond = semi.condition.as_ref().expect("semi join condition");
+        let string_array = arrow::datatypes::DataType::List(
+            arrow::datatypes::Field::new("item", arrow::datatypes::DataType::Utf8, true).into(),
+        );
+
+        assert!(
+            expr_has_cast_to(cond, &string_array),
+            "reoriented correlated EXISTS key should cast outer key to original left type: {cond:?}"
+        );
     }
 
     #[test]

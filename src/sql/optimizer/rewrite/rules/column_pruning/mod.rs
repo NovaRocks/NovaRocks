@@ -111,7 +111,9 @@ mod tests {
 
     use arrow::datatypes::DataType;
 
-    use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
+    use crate::sql::analysis::{
+        BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
+    };
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
@@ -167,7 +169,10 @@ mod tests {
             database: "default".to_string(),
             table,
             alias: None,
-            columns: cols.iter().map(|(id, name)| output_col(*id, name)).collect(),
+            columns: cols
+                .iter()
+                .map(|(id, name)| output_col(*id, name))
+                .collect(),
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
@@ -213,7 +218,9 @@ mod tests {
         // Phase-1 tags all columns when there is no parent restriction; Phase-2
         // PruneScanColumns then writes required_columns with all three names —
         // keeping every column is the correct behavior.
-        let req = s.required_columns.expect("required_columns must be set after pipeline");
+        let req = s
+            .required_columns
+            .expect("required_columns must be set after pipeline");
         let req_set: std::collections::HashSet<&str> = req.iter().map(|s| s.as_str()).collect();
         assert!(req_set.contains("a"), "a must be kept");
         assert!(req_set.contains("b"), "b must be kept");
@@ -303,7 +310,10 @@ mod tests {
             .expect("required_columns must be set");
         let req_set: std::collections::HashSet<&str> = req.iter().map(|s| s.as_str()).collect();
         assert!(req_set.contains("a"), "a must be kept (projected)");
-        assert!(req_set.contains("b"), "b must be kept (predicate reference)");
+        assert!(
+            req_set.contains("b"),
+            "b must be kept (predicate reference)"
+        );
         assert!(!req_set.contains("c"), "c must be pruned");
     }
 
@@ -382,7 +392,13 @@ mod tests {
             .expect("required_columns must be set");
         let req_set: std::collections::HashSet<&str> = req.iter().map(|s| s.as_str()).collect();
         assert!(req_set.contains("b"), "b must be kept (group_by)");
-        assert!(req_set.contains("c"), "c must be kept (agg arg, conservative keep-all)");
-        assert!(!req_set.contains("a"), "a must be pruned (not referenced by group_by or agg args)");
+        assert!(
+            req_set.contains("c"),
+            "c must be kept (agg arg, conservative keep-all)"
+        );
+        assert!(
+            !req_set.contains("a"),
+            "a must be pruned (not referenced by group_by or agg args)"
+        );
     }
 }

@@ -337,6 +337,14 @@ impl AnalyzerScope {
 
     /// Merge another scope into this one (for JOINs).
     pub(super) fn merge(&mut self, other: &AnalyzerScope) {
+        for name in other.unqualified.keys() {
+            if self.unqualified.contains_key(name)
+                && !self.canonical_qualifier.contains_key(name)
+                && let Some(qualifier) = self.unique_qualifier_for_column(name)
+            {
+                self.canonical_qualifier.insert(name.clone(), qualifier);
+            }
+        }
         for ((qualifier, name), (id, dt, nullable)) in &other.qualified {
             // Left wins: in `t1 LEFT JOIN t1 AS t2`, the aliased-side scan
             // also registers its columns under the original table name
@@ -363,7 +371,14 @@ impl AnalyzerScope {
             self.ordered.push(entry.clone());
         }
         for (name, qual) in &other.canonical_qualifier {
-            self.canonical_qualifier.insert(name.clone(), qual.clone());
+            // Do not let an outer USING canonical qualifier rewrite a
+            // subquery-local unqualified column with the same name.
+            if self.unqualified.contains_key(name) {
+                continue;
+            }
+            self.canonical_qualifier
+                .entry(name.clone())
+                .or_insert_with(|| qual.clone());
         }
         for (name, expr) in &other.computed_columns {
             // Inner wins: when merging an outer scope into an inner subquery scope,
@@ -384,6 +399,21 @@ impl AnalyzerScope {
             }
             self.computed_columns.insert(name.clone(), expr.clone());
         }
+    }
+
+    fn unique_qualifier_for_column(&self, name: &str) -> Option<String> {
+        let mut found: Option<String> = None;
+        for (qualifier, column) in self.qualified.keys() {
+            if column != name {
+                continue;
+            }
+            match &found {
+                Some(existing) if existing != qualifier => return None,
+                Some(_) => {}
+                None => found = Some(qualifier.clone()),
+            }
+        }
+        found
     }
 
     /// Iterate columns in declaration order (for SELECT * expansion).

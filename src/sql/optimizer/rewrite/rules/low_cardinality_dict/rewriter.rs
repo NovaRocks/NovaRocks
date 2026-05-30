@@ -1256,7 +1256,7 @@ fn plan_output_columns(plan: &LogicalPlan) -> Vec<OutputColumn> {
             .items
             .iter()
             .map(|item| OutputColumn {
-                column_id: ColumnId::UNSET,
+                column_id: item.output_column_id,
                 name: item.output_name.clone(),
                 data_type: item.expr.data_type.clone(),
                 nullable: item.expr.nullable,

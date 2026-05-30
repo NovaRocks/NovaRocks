@@ -24,7 +24,9 @@ use std::sync::Arc;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::sort::SortExpression;
-use crate::exec::operators::sort::{ChunksSorter, concat_sort_chunks, normalize_sort_key_array};
+use crate::exec::operators::sort::{
+    ChunksSorter, append_stable_row_index_sort_column, concat_sort_chunks, normalize_sort_key_array,
+};
 
 use arrow::compute::{SortColumn, SortOptions, lexsort_to_indices, take};
 
@@ -71,6 +73,7 @@ impl ChunksSorter for ChunksSorterFullSort {
                 }),
             });
         }
+        append_stable_row_index_sort_column(&mut sort_columns, batch.num_rows());
         let indices = lexsort_to_indices(&sort_columns, None).map_err(|e| e.to_string())?;
         let columns = batch
             .columns()

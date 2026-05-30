@@ -1133,17 +1133,8 @@ impl<'a> PlanFragmentBuilder<'a> {
                 nullable,
             });
 
-            // G1: a Project that is itself a pass-through ColumnRef must
-            // expose the upstream ColumnId so the by-id index in the scope
-            // stays continuous across the Project — without this, the
-            // distribution requirement for an Aggregate on top of a
-            // SubqueryAlias-wrapped relation fails to resolve the column.
-            let item_column_id = match &item.expr.kind {
-                ExprKind::ColumnRef { column_id, .. } => *column_id,
-                _ => crate::sql::column_id::ColumnId::UNSET,
-            };
             project_scope.add_column_with_id(
-                item_column_id,
+                item.output_column_id,
                 None,
                 name.clone(),
                 ColumnBinding {
