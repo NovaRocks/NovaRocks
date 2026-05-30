@@ -327,11 +327,11 @@ impl DictionaryQueryProvider {
                     table_uuid: info.table_uuid.clone(),
                 }))
             }
-            // Metadata tables and IVM delta scans never participate in
-            // dictionary rewriting.
-            ScanSource::IcebergMetadataTable { .. } | ScanSource::IcebergDeltaTable { .. } => {
-                Ok(None)
-            }
+            // Metadata tables, IVM delta scans, and IMV pinned-version
+            // placeholders never participate in dictionary rewriting.
+            ScanSource::IcebergMetadataTable { .. }
+            | ScanSource::IcebergDeltaTable { .. }
+            | ScanSource::IcebergVersionTable { .. } => Ok(None),
         }
     }
 }

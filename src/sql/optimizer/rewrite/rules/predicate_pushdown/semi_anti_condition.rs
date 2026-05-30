@@ -194,6 +194,7 @@ mod tests {
                     name: (*n).into(),
                     data_type: DataType::Int64,
                     nullable: true,
+                    is_internal: false,
                 })
                 .collect(),
             predicates: vec![],

@@ -1,8 +1,10 @@
 use std::any::Any;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
-use crate::{internal_service, plan_nodes};
+use crate::common::min_max_predicate::MinMaxPredicate;
+use crate::{exprs, internal_service, plan_nodes, types};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ConnectorId(String);
@@ -132,10 +134,21 @@ pub(crate) struct BeginScanContext;
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SplitPlanningContext;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct ThriftScanContext {
+    // Shared core: every TPlanNode needs these
     pub(crate) database: String,
     pub(crate) table: String,
+    pub(crate) node_id: i32,
+    pub(crate) scan_tuple_id: types::TTupleId,
+    pub(crate) conjuncts: Vec<exprs::TExpr>,
+
+    // Iceberg-specific per-query state (flat for now; will be encapsulated
+    // into a connector-specific payload when a second HDFS-style connector
+    // arrives - see slice spec).
+    pub(crate) min_max_predicates: Vec<MinMaxPredicate>,
+    pub(crate) change_op_slot: Option<types::TSlotId>,
+    pub(crate) cloud_properties: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug)]

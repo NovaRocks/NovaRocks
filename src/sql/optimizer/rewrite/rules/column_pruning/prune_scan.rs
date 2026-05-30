@@ -59,13 +59,21 @@ impl LogicalRewriteRule for PruneScanColumns {
             .map(|name| name.to_lowercase())
             .collect();
 
-        let existing_lower: HashSet<String> =
+        let mut existing_lower: HashSet<String> =
             required_names.iter().map(|n| n.to_lowercase()).collect();
 
         for col in &node.columns {
-            if pred_col_names.contains(&col.name.to_lowercase())
-                && !existing_lower.contains(&col.name.to_lowercase())
-            {
+            let col_lower = col.name.to_lowercase();
+            if pred_col_names.contains(&col_lower) && !existing_lower.contains(&col_lower) {
+                existing_lower.insert(col_lower);
+                required_names.push(col.name.clone());
+            }
+        }
+
+        for col in &node.columns {
+            let col_lower = col.name.to_lowercase();
+            if col.is_internal && !existing_lower.contains(&col_lower) {
+                existing_lower.insert(col_lower);
                 required_names.push(col.name.clone());
             }
         }
@@ -135,6 +143,7 @@ mod tests {
                     name: name.to_string(),
                     data_type: DataType::Int32,
                     nullable: false,
+                    is_internal: false,
                 })
                 .collect(),
             predicates: vec![],
@@ -259,6 +268,49 @@ mod tests {
             "b must be kept (predicate reference)"
         );
         assert!(!req_set.contains("c"), "c not needed");
+    }
+
+    #[test]
+    fn prune_scan_preserves_internal_columns() {
+        let id_a = ColumnId::new_for_test(1);
+        let id_b = ColumnId::new_for_test(2);
+        let id_internal = ColumnId::new_for_test(3);
+
+        let mut scan = make_scan(&[("a", id_a), ("b", id_b), ("__change_op", id_internal)]);
+        scan.columns
+            .iter_mut()
+            .find(|col| col.name == "__change_op")
+            .expect("internal column exists")
+            .is_internal = true;
+
+        let mut needed = HashSet::new();
+        needed.insert(id_a);
+        scan.required_output_columns = Some(needed);
+
+        let rule = PruneScanColumns;
+        let result = rule.apply(LogicalPlan::Scan(scan), &mut ctx()).unwrap();
+
+        let changed = match result {
+            RewriteResult::Changed(p) => p,
+            _ => panic!("expected Changed"),
+        };
+        let LogicalPlan::Scan(pruned) = changed else {
+            panic!("expected Scan");
+        };
+
+        let req = pruned
+            .required_columns
+            .expect("required_columns must be set");
+        let req_set: HashSet<&str> = req.iter().map(|s| s.as_str()).collect();
+        assert!(req_set.contains("a"), "requested column must be kept");
+        assert!(
+            req_set.contains("__change_op"),
+            "internal column must be preserved"
+        );
+        assert!(
+            !req_set.contains("b"),
+            "ordinary unrequested column is pruned"
+        );
     }
 
     #[test]

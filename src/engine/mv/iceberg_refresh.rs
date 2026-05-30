@@ -6263,7 +6263,7 @@ fn register_join_snapshot_side(
 fn plan_canonical_select_for_imv(
     state: &Arc<StandaloneState>,
     ctx: &IcebergMvRefreshContext,
-) -> Result<crate::sql::planner::plan::LogicalPlan, RefreshError> {
+) -> Result<(crate::sql::planner::plan::LogicalPlan, u32), RefreshError> {
     let catalog = build_iceberg_mv_planning_catalog(state, ctx).map_err(|e| {
         RefreshError::user(format!(
             "imv plan failed for {}.{}.{}: build planning catalog: {e}",
@@ -6283,12 +6283,15 @@ fn plan_canonical_select_for_imv(
         ))
     })?;
 
-    crate::sql::planner::plan_query(resolved, cte_registry, &mut factory).map_err(|e| {
-        RefreshError::user(format!(
-            "imv plan failed for {}.{}.{}: plan_query: {e}",
-            ctx.rewrite.target.catalog, ctx.rewrite.target.namespace, ctx.rewrite.target.table
-        ))
-    })
+    let plan =
+        crate::sql::planner::plan_query(resolved, cte_registry, &mut factory).map_err(|e| {
+            RefreshError::user(format!(
+                "imv plan failed for {}.{}.{}: plan_query: {e}",
+                ctx.rewrite.target.catalog, ctx.rewrite.target.namespace, ctx.rewrite.target.table
+            ))
+        })?;
+    let next_column_id = factory.peek_next_id();
+    Ok((plan, next_column_id))
 }
 
 /// Run the IMV optimizer pipeline against `ctx`, discarding the outcome.
@@ -6314,7 +6317,8 @@ fn try_run_imv_rewrite_pipeline(state: &Arc<StandaloneState>, ctx: &IcebergMvRef
         crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteOutcome,
         String,
     > {
-        let plan = plan_canonical_select_for_imv(state, ctx).map_err(|e| e.message)?;
+        let (plan, next_column_id) =
+            plan_canonical_select_for_imv(state, ctx).map_err(|e| e.message)?;
         // Thread the active session's disable_optimizer_rules into IMV. When
         // refresh runs outside a user session (e.g. background scheduler),
         // the thread-local default is empty, so this is a safe no-op.
@@ -6328,6 +6332,7 @@ fn try_run_imv_rewrite_pipeline(state: &Arc<StandaloneState>, ctx: &IcebergMvRef
                 mv_ctx: Arc::clone(&ctx.rewrite),
                 disabled_rules,
                 deadline: None,
+                next_column_id,
             },
         )
         .map_err(|e| format!("run_imv_rewrite: {e}"))
@@ -8232,6 +8237,7 @@ mod tests {
             name: name.to_string(),
             data_type: ty,
             nullable,
+            is_internal: false,
         }
     }
 

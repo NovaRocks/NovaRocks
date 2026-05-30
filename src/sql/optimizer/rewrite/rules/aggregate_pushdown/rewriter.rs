@@ -39,6 +39,7 @@ pub(crate) fn rewrite(original: &AggregateNode, plan: PushPlan) -> LogicalPlan {
             name: format!("{}{}", PARTIAL_OUTPUT_PREFIX, i),
             data_type: call.result_type.clone(),
             nullable: true,
+            is_internal: false,
         })
         .collect();
 
@@ -52,6 +53,7 @@ pub(crate) fn rewrite(original: &AggregateNode, plan: PushPlan) -> LogicalPlan {
                 name: column.clone(),
                 data_type: gb.data_type.clone(),
                 nullable: gb.nullable,
+                is_internal: false,
             }),
             _ => None,
         })
@@ -168,6 +170,7 @@ mod tests {
                     name: (*n).into(),
                     data_type: ty.clone(),
                     nullable: false,
+                    is_internal: false,
                 })
                 .collect(),
             predicates: vec![],
@@ -216,6 +219,7 @@ mod tests {
                 name: "k".into(),
                 data_type: DataType::Int64,
                 nullable: true,
+                is_internal: false,
             }],
             already_pushed: false,
             required_output_columns: None,
@@ -316,12 +320,14 @@ mod tests {
                     name: "k".into(),
                     data_type: DataType::Int64,
                     nullable: true,
+                    is_internal: false,
                 },
                 OutputColumn {
                     column_id: ColumnId::UNSET,
                     name: "total".into(),
                     data_type: DataType::Int64,
                     nullable: true,
+                    is_internal: false,
                 },
             ],
             already_pushed: false,

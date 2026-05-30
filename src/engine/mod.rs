@@ -4388,11 +4388,15 @@ enable_path_style_access = true
 
             fn to_thrift_scan(
                 &self,
-                _scan: &crate::connector::scan_planning::ScanHandle,
-                _splits: &[crate::connector::scan_planning::Split],
-                _ctx: ThriftScanContext,
+                scan: &crate::connector::scan_planning::ScanHandle,
+                splits: &[crate::connector::scan_planning::Split],
+                ctx: ThriftScanContext,
             ) -> Result<ThriftScanPlan, String> {
-                Err("MockPlanner::to_thrift_scan not used in engine tests".to_string())
+                let planner =
+                    crate::connector::starrocks::table::StarRocksTableScanPlanner::stateless_for_codegen();
+                <crate::connector::starrocks::table::StarRocksTableScanPlanner as ConnectorScanPlanner>::to_thrift_scan(
+                    &planner, scan, splits, ctx,
+                )
             }
         }
 

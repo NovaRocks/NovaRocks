@@ -439,6 +439,7 @@ impl<'a> super::AnalyzerContext<'a> {
                                     name: col.name,
                                     data_type: col.data_type,
                                     nullable: col.nullable,
+                                    is_internal: false,
                                 }
                             })
                             .collect();
@@ -662,6 +663,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 name: col_name,
                 data_type,
                 nullable,
+                is_internal: false,
             });
             args.push(typed);
         }
@@ -1017,6 +1019,7 @@ fn derived_table_output_columns(
             name: alias_col.name.value.clone(),
             data_type: col.data_type.clone(),
             nullable: col.nullable,
+            is_internal: false,
         })
         .collect())
 }

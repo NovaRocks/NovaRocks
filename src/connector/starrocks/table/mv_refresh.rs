@@ -1318,6 +1318,7 @@ fn query_result_column_to_output_column(
         name: column.name.clone(),
         data_type: column.data_type.clone(),
         nullable: column.nullable,
+        is_internal: false,
     })
 }
 
@@ -4381,18 +4382,21 @@ enable_path_style_access = true
                 name: "k1".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
+                is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId::UNSET,
                 name: "c".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
+                is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId::UNSET,
                 name: "s".to_string(),
                 data_type: DataType::Int64,
                 nullable: true,
+                is_internal: false,
             },
         ]
     }

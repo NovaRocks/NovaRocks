@@ -145,6 +145,13 @@ impl ColumnRefFactory {
     pub fn len(&self) -> usize {
         self.columns.len()
     }
+
+    /// Returns the next `ColumnId` value that `create` would allocate, without
+    /// allocating it. Used to seed downstream allocators (e.g. IMV rewrite)
+    /// so they never collide with ids this factory has already handed out.
+    pub fn peek_next_id(&self) -> u32 {
+        self.next_id
+    }
 }
 
 impl Default for ColumnRefFactory {

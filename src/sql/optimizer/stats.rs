@@ -991,6 +991,7 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
                 name: item.output_name.clone(),
                 data_type: item.expr.data_type.clone(),
                 nullable: item.expr.nullable,
+                is_internal: false,
             })
             .collect(),
         Operator::LogicalAggregate(a) => a.output_columns.clone(),
@@ -1013,6 +1014,7 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
                 name: g.column_name.clone(),
                 data_type: arrow::datatypes::DataType::Int64,
                 nullable: false,
+                is_internal: false,
             }]
         }
         Operator::LogicalTableFunction(tf) => {
@@ -1087,6 +1089,7 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
                     name: item.output_name.clone(),
                     data_type: item.expr.data_type.clone(),
                     nullable: item.expr.nullable,
+                    is_internal: false,
                 }
             })
             .collect(),
@@ -1105,6 +1108,7 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
                 name: g.column_name.clone(),
                 data_type: arrow::datatypes::DataType::Int64,
                 nullable: false,
+                is_internal: false,
             }]
         }
         Operator::PhysicalTableFunction(tf) => {
@@ -1452,6 +1456,7 @@ mod tests {
                 name: c.to_string(),
                 data_type: DataType::Int32,
                 nullable: false,
+                is_internal: false,
             })
             .collect();
         let col_defs: Vec<ColumnDef> = cols
@@ -1624,6 +1629,7 @@ mod tests {
                 name: "status".to_string(),
                 data_type: DataType::Int32,
                 nullable: false,
+                is_internal: false,
             }],
             already_pushed: false,
             required_output_columns: None,
@@ -1682,6 +1688,7 @@ mod tests {
                 name: "id".to_string(),
                 data_type: DataType::Int32,
                 nullable: false,
+                is_internal: false,
             }],
             required_output_columns: None,
         });
@@ -1693,6 +1700,7 @@ mod tests {
                 name: "id".to_string(),
                 data_type: DataType::Int32,
                 nullable: false,
+                is_internal: false,
             }],
             required_output_columns: None,
         });
@@ -1764,6 +1772,7 @@ mod tests {
                 name: "x".to_string(),
                 data_type: DataType::Int32,
                 nullable: false,
+                is_internal: false,
             }],
             required_output_columns: None,
         });
@@ -1829,6 +1838,7 @@ mod tests {
                 name: "a_str".to_string(),
                 data_type: DataType::Utf8,
                 nullable: false,
+                is_internal: false,
             }],
             required_output_columns: None,
         });
@@ -1859,6 +1869,7 @@ mod join_widening_tests {
             name: name.into(),
             data_type: DataType::Int32,
             nullable,
+            is_internal: false,
         }
     }
 

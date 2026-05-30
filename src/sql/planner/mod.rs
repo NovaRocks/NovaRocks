@@ -840,6 +840,7 @@ fn build_distinct(
             name: item.output_name.clone(),
             data_type: item.expr.data_type.clone(),
             nullable: item.expr.nullable,
+            is_internal: false,
         });
     }
     LogicalPlan::Aggregate(AggregateNode {
@@ -876,6 +877,7 @@ fn build_window_and_project(
                 name: item.output_name.clone(),
                 data_type: item.expr.data_type.clone(),
                 nullable: item.expr.nullable,
+                is_internal: false,
             });
         }
         // The analytic operator requires input sorted by (partition_by, order_by).
@@ -1381,6 +1383,7 @@ fn split_projection_for_aggregate(
             name: item.output_name.clone(),
             data_type: item.expr.data_type.clone(),
             nullable: item.expr.nullable,
+            is_internal: false,
         });
         project_items.push(ProjectItem {
             expr: rewrite_exact_group_by_expr_ref(&item.expr, group_by),
@@ -1651,6 +1654,7 @@ fn plan_relation_scoped(
                     name: c.name.clone(),
                     data_type: c.data_type.clone(),
                     nullable: c.nullable,
+                    is_internal: false,
                 })
                 .collect();
             Ok(LogicalPlan::Scan(ScanNode {
@@ -1806,6 +1810,7 @@ fn plan_iceberg_metadata_scan(
             name: c.name.clone(),
             data_type: c.data_type.clone(),
             nullable: c.nullable,
+            is_internal: false,
         })
         .collect();
     let table_info = iceberg_table_info(&rel.table.source)
@@ -1998,6 +2003,7 @@ fn plan_iceberg_delta_scan(
             name: c.name.clone(),
             data_type: c.data_type.clone(),
             nullable: c.nullable,
+            is_internal: false,
         })
         .collect();
     for (meta_idx, col) in rel
@@ -2014,6 +2020,7 @@ fn plan_iceberg_delta_scan(
             name: col.name.clone(),
             data_type: col.data_type.clone(),
             nullable: col.nullable,
+            is_internal: false,
         });
     }
     let table_info = iceberg_table_info(&rel.table.source)
@@ -2055,7 +2062,8 @@ fn iceberg_table_info(
     match source {
         crate::sql::catalog::ScanSource::IcebergDataFiles { table, .. }
         | crate::sql::catalog::ScanSource::IcebergMetadataTable { table, .. }
-        | crate::sql::catalog::ScanSource::IcebergDeltaTable { table, .. } => Some(table),
+        | crate::sql::catalog::ScanSource::IcebergDeltaTable { table, .. }
+        | crate::sql::catalog::ScanSource::IcebergVersionTable { table, .. } => Some(table),
         crate::sql::catalog::ScanSource::StarRocks { .. } => None,
     }
 }
@@ -2086,6 +2094,7 @@ fn plan_set_operation_scoped(
                 name: lc.name.clone(),
                 data_type: dt,
                 nullable: lc.nullable || rc.nullable,
+                is_internal: lc.is_internal && rc.is_internal,
             }
         })
         .collect();
@@ -2132,6 +2141,7 @@ fn plan_values(
                 name,
                 data_type: dt.clone(),
                 nullable: true,
+                is_internal: false,
             }
         })
         .collect();

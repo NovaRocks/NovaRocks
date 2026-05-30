@@ -94,6 +94,7 @@ mod tests {
                 name: col.into(),
                 data_type: DataType::Int64,
                 nullable: false,
+                is_internal: false,
             }],
             predicates: vec![],
             required_columns: None,

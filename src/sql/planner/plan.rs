@@ -410,6 +410,7 @@ mod plan_tests {
             name: "x".to_string(),
             data_type: DataType::Int32,
             nullable: false,
+            is_internal: false,
         }];
         let node = UnionNode {
             inputs: vec![],
@@ -432,6 +433,7 @@ mod plan_tests {
             name: "y".to_string(),
             data_type: DataType::Utf8,
             nullable: true,
+            is_internal: false,
         }];
         let node = IntersectNode {
             inputs: vec![],
@@ -451,6 +453,7 @@ mod plan_tests {
             name: "z".to_string(),
             data_type: DataType::Boolean,
             nullable: false,
+            is_internal: false,
         }];
         let node = ExceptNode {
             inputs: vec![],

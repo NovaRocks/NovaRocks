@@ -157,6 +157,7 @@ mod tests {
                     name: (*n).into(),
                     data_type: DataType::Int64,
                     nullable: true,
+                    is_internal: false,
                 })
                 .collect(),
             predicates: vec![],
@@ -184,12 +185,14 @@ mod tests {
                     name: "a".into(),
                     data_type: DataType::Int64,
                     nullable: true,
+                    is_internal: false,
                 },
                 OutputColumn {
                     column_id: ColumnId::UNSET,
                     name: "sum_b".into(),
                     data_type: DataType::Int64,
                     nullable: true,
+                    is_internal: false,
                 },
             ],
             already_pushed: false,

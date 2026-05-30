@@ -392,6 +392,7 @@ fn rewrite_aggregate(
                     name: binding.dict_column.clone(),
                     data_type: DataType::Int32,
                     nullable: out.nullable,
+                    is_internal: false,
                 }
             } else {
                 out.clone()
@@ -1260,6 +1261,7 @@ fn plan_output_columns(plan: &LogicalPlan) -> Vec<OutputColumn> {
                 name: item.output_name.clone(),
                 data_type: item.expr.data_type.clone(),
                 nullable: item.expr.nullable,
+                is_internal: false,
             })
             .collect(),
         LogicalPlan::Sort(node) => plan_output_columns(&node.input),
@@ -1291,6 +1293,7 @@ fn plan_output_columns(plan: &LogicalPlan) -> Vec<OutputColumn> {
             name: node.column_name.clone(),
             data_type: DataType::Int64,
             nullable: false,
+            is_internal: false,
         }],
         LogicalPlan::CTEAnchor(node) => plan_output_columns(&node.consumer),
         LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {

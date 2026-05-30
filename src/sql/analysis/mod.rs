@@ -31,6 +31,10 @@ pub(crate) struct OutputColumn {
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
+    /// Internal optimizer-managed column not visible to users. Set true for
+    /// pseudo-columns synthesized by rewrite rules (e.g. IMV action column);
+    /// column pruning treats internal columns as always required.
+    pub is_internal: bool,
 }
 
 #[derive(Clone, Debug)]

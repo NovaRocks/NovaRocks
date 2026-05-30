@@ -352,6 +352,7 @@ mod tests {
             name: "id".to_string(),
             data_type: DataType::Int32,
             nullable: false,
+            is_internal: false,
         }]
     }
 

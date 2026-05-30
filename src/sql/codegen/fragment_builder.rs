@@ -88,7 +88,8 @@ fn iceberg_table_info(
     match source {
         crate::sql::catalog::ScanSource::IcebergDataFiles { table, .. }
         | crate::sql::catalog::ScanSource::IcebergMetadataTable { table, .. }
-        | crate::sql::catalog::ScanSource::IcebergDeltaTable { table, .. } => Some(table),
+        | crate::sql::catalog::ScanSource::IcebergDeltaTable { table, .. }
+        | crate::sql::catalog::ScanSource::IcebergVersionTable { table, .. } => Some(table),
         crate::sql::catalog::ScanSource::StarRocks { .. } => None,
     }
 }
@@ -131,6 +132,31 @@ fn add_iceberg_equality_delete_required_columns(
                 })?;
                 required.insert(column.to_lowercase());
             }
+        }
+    }
+    Ok(())
+}
+
+/// Phase 2 codegen guard: the IMV action column (`__change_op`, internal) must
+/// not reach code generation. Refresh execution does not consume the IMV
+/// rewrite outcome yet (Phase 3 cutover), so an internal action column in a
+/// scan's output schema indicates a logic error. For normal queries no column
+/// is internal, so this is a no-op.
+fn reject_internal_action_column(
+    columns: &[crate::sql::analysis::OutputColumn],
+    database: &str,
+    table_name: &str,
+) -> Result<(), String> {
+    for col in columns {
+        if col.is_internal
+            && col
+                .name
+                .eq_ignore_ascii_case(crate::exec::change_op::CHANGE_OP_COLUMN)
+        {
+            return Err(format!(
+                "IMV action column {} on scan {}.{} reached codegen before execution cutover",
+                col.name, database, table_name
+            ));
         }
     }
     Ok(())
@@ -248,7 +274,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         let desc_tbl =
             std::mem::replace(&mut builder.desc_builder, DescriptorTableBuilder::new()).build();
 
-        let exec_params = nodes::build_exec_params_multi(&builder.scan_tables)?;
+        let exec_params = nodes::build_exec_params_multi(builder.connectors, &builder.scan_tables)?;
 
         let output_columns = plan
             .output_columns
@@ -468,6 +494,8 @@ impl<'a> PlanFragmentBuilder<'a> {
         op: &PhysicalScanOp,
         _node: &PhysicalPlanNode,
     ) -> Result<VisitResult, String> {
+        reject_internal_action_column(&op.columns, &op.database, &op.table.name)?;
+
         let scan_tuple_id = self.alloc_tuple();
         let scan_node_id = self.alloc_node();
 
@@ -511,6 +539,12 @@ impl<'a> PlanFragmentBuilder<'a> {
                 ..
             } => {
                 let planner = self.connectors.scan_planner("iceberg")?;
+                let column_names = op
+                    .table
+                    .columns
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect::<Vec<_>>();
                 let table_handle =
                     crate::connector::iceberg::IcebergConnectorScanPlanner::table_handle_from_source(
                         &iceberg_table.catalog,
@@ -519,6 +553,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                         iceberg_table.current_snapshot_id,
                         iceberg_table.clone(),
                         files.clone(),
+                        column_names,
                     );
                 let scan = planner.begin_scan(
                     table_handle,
@@ -776,12 +811,21 @@ impl<'a> PlanFragmentBuilder<'a> {
         };
         self.desc_builder.add_tuple(scan_tuple_id, scan_table_id);
 
+        let min_max_predicates =
+            nodes::scan_file_min_max_predicates_from_state(&pushed_conjuncts, &slot_to_column);
+        let change_op_slot = nodes::planned_change_op_slot_from_state(
+            &iceberg_metadata_pseudo_column_slots,
+            &slot_to_column,
+        );
         let mut scan_plan_node = nodes::build_scan_node(
+            self.connectors,
             scan_node_id,
             scan_tuple_id,
             &resolved,
             pushed_conjuncts.clone(),
-        );
+            min_max_predicates,
+            change_op_slot,
+        )?;
 
         // Patch the StarRocks lake-scan payload with the dict slot mapping so
         // the BE side reads the column as dict-encoded INT instead of UTF8.
@@ -846,6 +890,7 @@ impl<'a> PlanFragmentBuilder<'a> {
 
         self.scan_tables.push(nodes::PlannedScanTable {
             scan_node_id,
+            scan_tuple_id,
             resolved,
             min_max_conjuncts: pushed_conjuncts,
             slot_to_column,
@@ -1942,7 +1987,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             fragment_id: child_fragment_id,
             plan: plan_nodes::TPlan::new(child_plan_nodes),
             desc_tbl: DescriptorTableBuilder::new().build(),
-            exec_params: nodes::build_exec_params_multi(&[])?,
+            exec_params: nodes::build_exec_params_multi(self.connectors, &[])?,
             output_sink: build_noop_sink(),
             output_columns: node.children[0]
                 .output_columns
@@ -2062,7 +2107,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             fragment_id: child_fragment_id,
             plan: plan_nodes::TPlan::new(child_plan_nodes),
             desc_tbl: DescriptorTableBuilder::new().build(),
-            exec_params: nodes::build_exec_params_multi(&[])?,
+            exec_params: nodes::build_exec_params_multi(self.connectors, &[])?,
             output_sink: build_noop_sink(),
             output_columns: node.children[0]
                 .output_columns
@@ -3388,7 +3433,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             fragment_id: child_fragment_id,
             plan: plan_nodes::TPlan::new(plan_nodes),
             desc_tbl: DescriptorTableBuilder::new().build(),
-            exec_params: nodes::build_exec_params_multi(&[])?,
+            exec_params: nodes::build_exec_params_multi(self.connectors, &[])?,
             output_sink: build_noop_sink(),
             output_columns: node.children[0]
                 .output_columns
@@ -3520,6 +3565,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                         name: name.clone(),
                         data_type: binding.data_type.clone(),
                         nullable: binding.nullable,
+                        is_internal: false,
                     })
                     .collect::<Vec<_>>()
             } else {
@@ -3743,7 +3789,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             fragment_id: cte_fragment_id,
             plan: plan_nodes::TPlan::new(child.plan_nodes),
             desc_tbl: DescriptorTableBuilder::new().build(),
-            exec_params: nodes::build_exec_params_multi(&[])?,
+            exec_params: nodes::build_exec_params_multi(self.connectors, &[])?,
             output_sink: build_noop_sink(),
             output_columns: op
                 .output_columns
@@ -4080,11 +4126,15 @@ mod tests {
 
         fn to_thrift_scan(
             &self,
-            _scan: &crate::connector::scan_planning::ScanHandle,
-            _splits: &[crate::connector::scan_planning::Split],
-            _ctx: crate::connector::scan_planning::ThriftScanContext,
+            scan: &crate::connector::scan_planning::ScanHandle,
+            splits: &[crate::connector::scan_planning::Split],
+            ctx: crate::connector::scan_planning::ThriftScanContext,
         ) -> Result<crate::connector::scan_planning::ThriftScanPlan, String> {
-            Err("MockScanPlanner::to_thrift_scan is not exercised by tests".to_string())
+            let planner =
+                crate::connector::starrocks::table::StarRocksTableScanPlanner::stateless_for_codegen();
+            <crate::connector::starrocks::table::StarRocksTableScanPlanner as crate::connector::scan_planning::ConnectorScanPlanner>::to_thrift_scan(
+                &planner, scan, splits, ctx,
+            )
         }
     }
 
@@ -4092,6 +4142,8 @@ mod tests {
     struct ScanPlannerCallCounts {
         begin_scan: std::sync::atomic::AtomicUsize,
         plan_splits: std::sync::atomic::AtomicUsize,
+        to_thrift_scan: std::sync::atomic::AtomicUsize,
+        thrift_contexts: std::sync::Mutex<Vec<crate::connector::scan_planning::ThriftScanContext>>,
     }
 
     #[derive(Debug)]
@@ -4133,6 +4185,14 @@ mod tests {
             splits: &[crate::connector::scan_planning::Split],
             ctx: crate::connector::scan_planning::ThriftScanContext,
         ) -> Result<crate::connector::scan_planning::ThriftScanPlan, String> {
+            self.counts
+                .to_thrift_scan
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.counts
+                .thrift_contexts
+                .lock()
+                .expect("thrift contexts")
+                .push(ctx.clone());
             self.inner.to_thrift_scan(scan, splits, ctx)
         }
     }
@@ -4176,6 +4236,14 @@ mod tests {
             splits: &[crate::connector::scan_planning::Split],
             ctx: crate::connector::scan_planning::ThriftScanContext,
         ) -> Result<crate::connector::scan_planning::ThriftScanPlan, String> {
+            self.counts
+                .to_thrift_scan
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.counts
+                .thrift_contexts
+                .lock()
+                .expect("thrift contexts")
+                .push(ctx.clone());
             self.inner.to_thrift_scan(scan, splits, ctx)
         }
     }
@@ -4226,6 +4294,7 @@ mod tests {
             name: "id".to_string(),
             data_type: DataType::Int32,
             nullable: false,
+            is_internal: false,
         }]
     }
 
@@ -4255,6 +4324,14 @@ mod tests {
             data_type: DataType::Boolean,
             nullable: false,
         }
+    }
+
+    fn with_id_predicate(mut plan: PhysicalPlanNode, value: i64) -> PhysicalPlanNode {
+        let Operator::PhysicalScan(scan) = &mut plan.op else {
+            panic!("expected scan plan");
+        };
+        scan.predicates = vec![id_eq_literal(value)];
+        plan
     }
 
     fn iceberg_i32_file(path: &str, min: i32, max: i32) -> IcebergDataFileInfo {
@@ -5083,6 +5160,7 @@ mod tests {
                 name: "generate_series".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
+                is_internal: false,
             }],
         };
 
@@ -5478,6 +5556,7 @@ mod tests {
                     name: "id".to_string(),
                     data_type: DataType::Utf8,
                     nullable: false,
+                    is_internal: false,
                 }],
                 predicates: vec![],
                 required_columns: None,
@@ -5494,6 +5573,7 @@ mod tests {
                 name: "id".to_string(),
                 data_type: DataType::Utf8,
                 nullable: false,
+                is_internal: false,
             }],
         };
 
@@ -5508,6 +5588,7 @@ mod tests {
                     name: "id".to_string(),
                     data_type: DataType::Utf8,
                     nullable: false,
+                    is_internal: false,
                 }],
             }),
             children: vec![scan],
@@ -5517,6 +5598,7 @@ mod tests {
                 name: "id".to_string(),
                 data_type: DataType::Utf8,
                 nullable: false,
+                is_internal: false,
             }],
         };
 
@@ -5623,12 +5705,14 @@ mod tests {
                         name: "id".to_string(),
                         data_type: DataType::Utf8,
                         nullable: false,
+                        is_internal: false,
                     },
                     OutputColumn {
                         column_id: crate::sql::column_id::ColumnId::UNSET,
                         name: "name".to_string(),
                         data_type: DataType::Utf8,
                         nullable: false,
+                        is_internal: false,
                     },
                 ],
                 predicates: vec![],
@@ -5654,12 +5738,14 @@ mod tests {
                     name: "id".to_string(),
                     data_type: DataType::Utf8,
                     nullable: false,
+                    is_internal: false,
                 },
                 OutputColumn {
                     column_id: crate::sql::column_id::ColumnId::UNSET,
                     name: "name".to_string(),
                     data_type: DataType::Utf8,
                     nullable: false,
+                    is_internal: false,
                 },
             ],
         };
@@ -5848,6 +5934,7 @@ mod tests {
                     name: "__nr_dict_t_s".to_string(),
                     data_type: DataType::Int32,
                     nullable: false,
+                    is_internal: false,
                 }],
                 predicates: vec![],
                 required_columns: Some(vec!["__nr_dict_t_s".to_string()]),
@@ -5864,6 +5951,7 @@ mod tests {
                 name: "__nr_dict_t_s".to_string(),
                 data_type: DataType::Int32,
                 nullable: false,
+                is_internal: false,
             }],
         };
 
@@ -5987,6 +6075,7 @@ mod tests {
                     name: "id".to_string(),
                     data_type: DataType::Utf8,
                     nullable: false,
+                    is_internal: false,
                 }],
                 predicates: vec![],
                 required_columns: None,
@@ -6003,6 +6092,7 @@ mod tests {
                 name: "id".to_string(),
                 data_type: DataType::Utf8,
                 nullable: false,
+                is_internal: false,
             }],
         };
 
@@ -6081,7 +6171,7 @@ mod tests {
     fn visit_scan_calls_connector_begin_scan_and_plan_splits_for_starrocks() {
         use crate::connector::starrocks::table::StarRocksSplit;
         let layout = starrocks_layout();
-        let plan = starrocks_scan_plan();
+        let plan = with_id_predicate(starrocks_scan_plan(), 7);
         let catalog = StarRocksCatalog {
             layout: layout.clone(),
         };
@@ -6106,7 +6196,7 @@ mod tests {
         let mut registry = crate::connector::ConnectorRegistry::new();
         registry.register_scan_planner(planner);
 
-        let _ = PlanFragmentBuilder::build(&plan, &catalog, &registry, "default")
+        let built = PlanFragmentBuilder::build(&plan, &catalog, &registry, "default")
             .expect("build StarRocks fragment");
 
         assert_eq!(
@@ -6119,11 +6209,46 @@ mod tests {
             1,
             "plan_splits must be invoked exactly once for the StarRocks scan"
         );
+        assert_eq!(
+            counts
+                .to_thrift_scan
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "to_thrift_scan must be invoked for both scan node and scan ranges"
+        );
+        let root = built
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == built.root_fragment_id)
+            .expect("root fragment");
+        let scan = root
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.node_type == plan_nodes::TPlanNodeType::LAKE_SCAN_NODE)
+            .expect("lake scan node");
+        let contexts = counts.thrift_contexts.lock().expect("thrift contexts");
+        assert_eq!(
+            contexts
+                .iter()
+                .map(|ctx| (ctx.node_id, ctx.scan_tuple_id))
+                .collect::<Vec<_>>(),
+            vec![(scan.node_id, scan.row_tuples[0]); 2],
+            "both to_thrift_scan calls must carry the real scan node and tuple ids"
+        );
+        let contexts_with_conjuncts = contexts
+            .iter()
+            .filter(|ctx| !ctx.conjuncts.is_empty())
+            .count();
+        assert_eq!(
+            contexts_with_conjuncts, 1,
+            "exactly one to_thrift_scan call should carry node conjuncts; the range-only call should not"
+        );
     }
 
     #[test]
     fn visit_scan_calls_connector_begin_scan_and_plan_splits_for_iceberg() {
-        let plan = iceberg_scan_plan();
+        let plan = with_id_predicate(iceberg_scan_plan(), 7);
         let catalog = DummyCatalog;
 
         let counts = std::sync::Arc::new(ScanPlannerCallCounts::default());
@@ -6134,7 +6259,7 @@ mod tests {
         let mut registry = crate::connector::ConnectorRegistry::new();
         registry.register_scan_planner(planner);
 
-        let _ = PlanFragmentBuilder::build(&plan, &catalog, &registry, "default")
+        let built = PlanFragmentBuilder::build(&plan, &catalog, &registry, "default")
             .expect("build Iceberg fragment");
 
         assert_eq!(
@@ -6147,5 +6272,84 @@ mod tests {
             1,
             "plan_splits must be invoked exactly once for the Iceberg scan"
         );
+        assert_eq!(
+            counts
+                .to_thrift_scan
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "to_thrift_scan must be invoked for both scan node and scan ranges"
+        );
+        let root = built
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == built.root_fragment_id)
+            .expect("root fragment");
+        let scan = root
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.node_type == plan_nodes::TPlanNodeType::HDFS_SCAN_NODE)
+            .expect("hdfs scan node");
+        let contexts = counts.thrift_contexts.lock().expect("thrift contexts");
+        assert_eq!(
+            contexts
+                .iter()
+                .map(|ctx| (ctx.node_id, ctx.scan_tuple_id))
+                .collect::<Vec<_>>(),
+            vec![(scan.node_id, scan.row_tuples[0]); 2],
+            "both to_thrift_scan calls must carry the real scan node and tuple ids"
+        );
+        let contexts_with_conjuncts = contexts
+            .iter()
+            .filter(|ctx| !ctx.conjuncts.is_empty())
+            .count();
+        assert_eq!(
+            contexts_with_conjuncts, 1,
+            "exactly one to_thrift_scan call should carry node conjuncts; the range-only call should not"
+        );
+    }
+}
+
+#[cfg(test)]
+mod action_column_guard_tests {
+    use super::*;
+    use crate::sql::analysis::OutputColumn;
+    use crate::sql::column_id::ColumnId;
+    use arrow::datatypes::DataType;
+
+    fn col(name: &str, is_internal: bool) -> OutputColumn {
+        OutputColumn {
+            column_id: ColumnId(1),
+            name: name.to_string(),
+            data_type: DataType::Int8,
+            nullable: false,
+            is_internal,
+        }
+    }
+
+    #[test]
+    fn guard_rejects_internal_action_column() {
+        let cols = vec![col("k", false), col("__change_op", true)];
+        let err = reject_internal_action_column(&cols, "db", "b")
+            .expect_err("internal action column must be rejected");
+        assert!(
+            err.contains("IMV action column __change_op on scan db.b reached codegen before execution cutover"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn guard_allows_normal_columns() {
+        let cols = vec![col("k", false), col("v", false)];
+        reject_internal_action_column(&cols, "db", "b").expect("normal columns must pass");
+    }
+
+    #[test]
+    fn guard_ignores_non_internal_column_named_change_op() {
+        // A user column literally named __change_op but NOT internal is not the
+        // action column; the guard keys on is_internal, so it passes.
+        let cols = vec![col("__change_op", false)];
+        reject_internal_action_column(&cols, "db", "b")
+            .expect("non-internal column must not trip the guard");
     }
 }

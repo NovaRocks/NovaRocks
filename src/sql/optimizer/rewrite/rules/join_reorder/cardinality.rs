@@ -460,6 +460,7 @@ mod tests {
                 name: c.to_string(),
                 data_type: DataType::Int32,
                 nullable: false,
+                is_internal: false,
             })
             .collect();
         let col_defs: Vec<ColumnDef> = cols
@@ -730,6 +731,7 @@ mod tests {
                 name: "status".to_string(),
                 data_type: DataType::Int32,
                 nullable: false,
+                is_internal: false,
             }],
             already_pushed: false,
             required_output_columns: None,

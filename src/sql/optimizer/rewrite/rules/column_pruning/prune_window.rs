@@ -80,6 +80,7 @@ mod tests {
             name: name.to_string(),
             data_type: DataType::Int64,
             nullable: true,
+            is_internal: false,
         }
     }
 
@@ -122,6 +123,7 @@ mod tests {
                 name: "x".to_string(),
                 data_type: DataType::Int32,
                 nullable: false,
+                is_internal: false,
             }],
             predicates: vec![],
             required_columns: None,

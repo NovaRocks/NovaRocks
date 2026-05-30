@@ -5,7 +5,11 @@
 //! wrapper, no-op end-to-end behavior. PR-β adds Delta/Version marker
 //! operators on top of this module without changing the public entrypoint.
 
+pub(crate) mod action_column;
+pub(crate) mod action_propagation;
 pub(crate) mod annotation;
+pub(crate) mod delta_pushdown;
 pub(crate) mod entrypoint;
 pub(crate) mod marker;
 pub(crate) mod pipeline;
+pub(crate) mod scan_binding;

@@ -140,6 +140,7 @@ mod tests {
             name: name.to_string(),
             data_type: DataType::Int32,
             nullable: false,
+            is_internal: false,
         }
     }
 
@@ -359,12 +360,14 @@ mod tests {
                     name: "b".to_string(),
                     data_type: DataType::Int32,
                     nullable: false,
+                    is_internal: false,
                 },
                 OutputColumn {
                     column_id: out_sum,
                     name: "sum_c".to_string(),
                     data_type: DataType::Int64,
                     nullable: true,
+                    is_internal: false,
                 },
             ],
             already_pushed: false,

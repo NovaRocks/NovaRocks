@@ -70,6 +70,7 @@ mod tests {
                 name: "v".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
+                is_internal: false,
             }],
             alias: None,
             is_left_join: false,

@@ -91,6 +91,7 @@ mod tests {
             name: name.to_string(),
             data_type: DataType::Int32,
             nullable: false,
+            is_internal: false,
         }
     }
 

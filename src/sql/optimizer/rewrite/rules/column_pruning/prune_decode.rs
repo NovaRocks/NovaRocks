@@ -123,6 +123,7 @@ mod tests {
             name: name.to_string(),
             data_type: DataType::Utf8,
             nullable: true,
+            is_internal: false,
         }
     }
 

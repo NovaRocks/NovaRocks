@@ -69,6 +69,7 @@ mod tests {
                     name: "id".into(),
                     data_type: DataType::Int32,
                     nullable: false,
+                    is_internal: false,
                 }],
                 predicates: vec![],
                 required_columns: None,
@@ -128,6 +129,7 @@ mod tests {
                         name: (*n).into(),
                         data_type: DataType::Int64,
                         nullable: false,
+                        is_internal: false,
                     })
                     .collect(),
                 predicates: vec![],

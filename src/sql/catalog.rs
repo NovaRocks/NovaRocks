@@ -250,6 +250,14 @@ pub enum ScanSource {
         from_snapshot_id: i64,
         to_snapshot_id: i64,
     },
+    /// Refresh-only pinned Iceberg version scan placeholder. Produced by the
+    /// IMV scan-binding rule for `Version(IcebergScan)`. Phase 1 keeps this
+    /// variant non-executable: it is inspectable in rewrite tests and guarded
+    /// at scan-range construction so it cannot silently read current snapshot.
+    IcebergVersionTable {
+        table: IcebergTableInfo,
+        snapshot_id: i64,
+    },
 }
 
 #[derive(Clone, Debug)]
