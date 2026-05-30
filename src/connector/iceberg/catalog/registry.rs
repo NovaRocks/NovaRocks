@@ -231,8 +231,12 @@ pub(crate) fn create_namespace(
     if let Some(s3_config) = &entry.s3_config {
         let op = crate::fs::object_store::build_oss_operator(s3_config)
             .map_err(|e| format!("build S3 operator for namespace create: {e}"))?;
+        let root_marker_key = s3_namespace_root_marker_key(entry, &ns_name)?;
         let marker_key = s3_namespace_marker_key(entry, &ns_name)?;
         block_on_iceberg(async {
+            op.write(&root_marker_key, Vec::<u8>::new())
+                .await
+                .map_err(|e| format!("write namespace root marker {root_marker_key}: {e}"))?;
             op.write(&marker_key, Vec::<u8>::new())
                 .await
                 .map_err(|e| format!("write namespace marker {marker_key}: {e}"))
@@ -265,8 +269,12 @@ pub(crate) fn namespace_exists(
         let op = crate::fs::object_store::build_oss_operator(s3_config)
             .map_err(|e| format!("build S3 operator for namespace check: {e}"))?;
         let ns_prefix = s3_namespace_prefix(entry, &ns_name)?;
+        let root_marker_key = s3_namespace_root_marker_key(entry, &ns_name)?;
         let marker_key = format!("{ns_prefix}{S3_NAMESPACE_MARKER_FILE}");
         block_on_iceberg(async {
+            if op.stat(&root_marker_key).await.is_ok() {
+                return Ok(true);
+            }
             if op.stat(&marker_key).await.is_ok() {
                 return Ok(true);
             }
@@ -324,14 +332,20 @@ pub(crate) fn list_namespaces(entry: &IcebergCatalogEntry) -> Result<Vec<String>
                 .map_err(|e| format!("list warehouse prefix {warehouse_prefix}: {e}"))?;
             let mut names = Vec::new();
             for e in entries {
-                if e.metadata().is_dir() {
-                    let name = e.name().trim_end_matches('/').to_string();
-                    if !name.is_empty() && !name.starts_with('.') {
-                        names.push(name);
-                    }
+                let entry_name = e.name().trim_matches('/');
+                let relative = entry_name
+                    .strip_prefix(warehouse_prefix.trim_matches('/'))
+                    .unwrap_or(entry_name)
+                    .trim_matches('/');
+                let Some(name) = relative.split('/').next() else {
+                    continue;
+                };
+                if !name.is_empty() && !name.starts_with('.') {
+                    names.push(name.to_string());
                 }
             }
             names.sort();
+            names.dedup();
             Ok(names)
         })
         .map_err(|e| format!("list iceberg namespaces runtime failed: {e}"))?
@@ -373,8 +387,18 @@ pub(crate) fn drop_namespace(
     if let Some(s3_config) = &entry.s3_config {
         let op = crate::fs::object_store::build_oss_operator(s3_config)
             .map_err(|e| format!("build S3 operator for namespace drop: {e}"))?;
+        let root_marker_key = s3_namespace_root_marker_key(entry, &ns_name)?;
         let marker_key = s3_namespace_marker_key(entry, &ns_name)?;
         block_on_iceberg(async {
+            match op.delete(&root_marker_key).await {
+                Ok(()) => {}
+                Err(err) if err.kind() == opendal::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(format!(
+                        "delete namespace root marker {root_marker_key}: {err}"
+                    ));
+                }
+            }
             match op.delete(&marker_key).await {
                 Ok(()) => Ok(()),
                 Err(err) if err.kind() == opendal::ErrorKind::NotFound => Ok(()),
@@ -402,6 +426,15 @@ fn s3_namespace_prefix(entry: &IcebergCatalogEntry, ns_name: &str) -> Result<Str
     } else {
         Ok(format!("{root}/{ns_name}/"))
     }
+}
+
+fn s3_namespace_root_marker_key(
+    entry: &IcebergCatalogEntry,
+    ns_name: &str,
+) -> Result<String, String> {
+    Ok(s3_namespace_prefix(entry, ns_name)?
+        .trim_end_matches('/')
+        .to_string())
 }
 
 fn s3_namespace_marker_key(entry: &IcebergCatalogEntry, ns_name: &str) -> Result<String, String> {
@@ -455,14 +488,14 @@ pub(crate) fn list_tables(
                 .map_err(|e| format!("list namespace {ns_name}: {e}"))?;
             let mut tables = Vec::new();
             for e in entries {
-                if e.metadata().is_dir() {
-                    let name = e.name().trim_end_matches('/').to_string();
-                    if !name.is_empty() && !name.starts_with('.') {
-                        tables.push(name);
-                    }
+                let name = e.name().trim_matches('/');
+                let table_name = name.split('/').next().unwrap_or_default();
+                if !table_name.is_empty() && !table_name.starts_with('.') {
+                    tables.push(table_name.to_string());
                 }
             }
             tables.sort();
+            tables.dedup();
             Ok(tables)
         })
         .map_err(|e| format!("list iceberg tables runtime failed: {e}"))?

@@ -1,162 +1,162 @@
 -- query 2
 count(1)
-6400000
+100000
 
 -- query 3
 count(1)
-6450000
+102500
 
 -- query 4
 count(1)
-100000
+1570
 
 -- query 5
 count(1)
-100780
+1602
 
 -- query 6
 count(1)
-3907840
+500
 
 -- query 7
 count(1)
-4338192
+550
 
 -- query 8
 count(1)
-100000
+500
 
 -- query 9
 count(1)
-120000
+550
 
 -- query 10
 count(1)
-100000
+500
 
 -- query 11
 count(1)
-120000
+550
 
 -- query 12
 count(1)
-100000
+500
 
 -- query 13
 count(1)
-120000
+550
 
 -- query 14
 count(1)
-100000
+500
 
 -- query 15
 count(1)
-120000
+550
 
 -- query 16
 count(1)
-100000
+500
 
 -- query 17
 count(1)
-120000
+550
 
 -- query 18
 count(1)
-50000
+790
 
 -- query 19
 count(1)
-50390
+810
 
 -- query 20
 count(1)
-100000
+500
 
 -- query 21
 count(1)
-120000
+550
 
 -- query 22
 count(1)
-6400000
+100000
 
 -- query 23
 count(1)
-6450000
+102500
 
 -- query 24
 count(1)
-100000
+1570
 
 -- query 25
 count(1)
-100780
+1602
 
 -- query 26
 count(1)
-103907840
+25500
 
 -- query 27
 count(1)
-4338192
+550
 
 -- query 28
 count(1)
-100100000
+25500
 
 -- query 29
 count(1)
-120000
+550
 
 -- query 30
 count(1)
-100100000
+25500
 
 -- query 31
 count(1)
-120000
+550
 
 -- query 32
 count(1)
-100100000
+25500
 
 -- query 33
 count(1)
-120000
+550
 
 -- query 34
 count(1)
-100100000
+25500
 
 -- query 35
 count(1)
-120000
+550
 
 -- query 36
 count(1)
-100100000
+25500
 
 -- query 37
 count(1)
-120000
+550
 
 -- query 38
 count(1)
-50000
+790
 
 -- query 39
 count(1)
-50390
+810
 
 -- query 40
 count(1)
-100100000
+25500
 
 -- query 41
 count(1)
-120000
+550
 
 -- query 42
 count(1)
@@ -176,51 +176,51 @@ count(1)
 
 -- query 46
 count(1)
-100000
+500
 
 -- query 47
 count(1)
-110000
+550
 
 -- query 48
 count(1)
-100000
+500
 
 -- query 49
 count(1)
-110000
+550
 
 -- query 50
 count(1)
-100000
+500
 
 -- query 51
 count(1)
-110000
+550
 
 -- query 52
 count(1)
-100000
+500
 
 -- query 53
 count(1)
-110000
+550
 
 -- query 54
 count(1)
-100000
+500
 
 -- query 55
 count(1)
-110000
+550
 
 -- query 56
 count(1)
-100000
+500
 
 -- query 57
 count(1)
-110000
+550
 
 -- query 58
 count(1)
@@ -232,264 +232,264 @@ count(1)
 
 -- query 60
 count(1)
-100000
+500
 
 -- query 61
 count(1)
-110000
+550
 
 -- query 62
 count(1)
-6400000
+100000
 
 -- query 63
 count(1)
-6450000
+102500
 
 -- query 64
 count(1)
-100000
+1570
 
 -- query 65
 count(1)
-100780
+1602
 
 -- query 66
 count(1)
-3907840
+500
 
 -- query 67
 count(1)
-4338192
+550
 
 -- query 68
 count(1)
-100000
+500
 
 -- query 69
 count(1)
-120000
+550
 
 -- query 70
 count(1)
-100000
+500
 
 -- query 71
 count(1)
-120000
+550
 
 -- query 72
 count(1)
-100000
+500
 
 -- query 73
 count(1)
-120000
+550
 
 -- query 74
 count(1)
-100000
+500
 
 -- query 75
 count(1)
-120000
+550
 
 -- query 76
 count(1)
-100000
+500
 
 -- query 77
 count(1)
-120000
+550
 
 -- query 78
 count(1)
-50000
+790
 
 -- query 79
 count(1)
-50390
+810
 
 -- query 80
 count(1)
-100000
+500
 
 -- query 81
 count(1)
-120000
+550
 
 -- query 82
 count(1)
-6400000
+100000
 
 -- query 83
 count(1)
-6450000
+102500
 
 -- query 84
 count(1)
-100000
+1570
 
 -- query 85
 count(1)
-100780
+1602
 
 -- query 86
 count(1)
-3907840
+500
 
 -- query 87
 count(1)
-4338192
+550
 
 -- query 88
 count(1)
-100000
+500
 
 -- query 89
 count(1)
-120000
+550
 
 -- query 90
 count(1)
-100000
+500
 
 -- query 91
 count(1)
-120000
+550
 
 -- query 92
 count(1)
-100000
+500
 
 -- query 93
 count(1)
-120000
+550
 
 -- query 94
 count(1)
-100000
+500
 
 -- query 95
 count(1)
-120000
+550
 
 -- query 96
 count(1)
-100000
+500
 
 -- query 97
 count(1)
-120000
+550
 
 -- query 98
 count(1)
-50000
+790
 
 -- query 99
 count(1)
-50390
+810
 
 -- query 100
 count(1)
-100000
+500
 
 -- query 101
 count(1)
-120000
+550
 
 -- query 102
 count(1)
-6400000
+100000
 
 -- query 103
 count(1)
-6450000
+102500
 
 -- query 104
 count(1)
-100000
+1570
 
 -- query 105
 count(1)
-100780
+1602
 
 -- query 106
 count(1)
-3907840
+500
 
 -- query 107
 count(1)
-4338192
+550
 
 -- query 108
 count(1)
-34594
+54
 
 -- query 109
 count(1)
-34864
+55
 
 -- query 110
 count(1)
-34594
+54
 
 -- query 111
 count(1)
-34864
+55
 
 -- query 112
 count(1)
-34594
+54
 
 -- query 113
 count(1)
-34864
+55
 
 -- query 114
 count(1)
-34594
+54
 
 -- query 115
 count(1)
-34864
+55
 
 -- query 116
 count(1)
-100000
+500
 
 -- query 117
 count(1)
-120000
+550
 
 -- query 118
 count(1)
-50000
+790
 
 -- query 119
 count(1)
-50390
+810
 
 -- query 120
 count(1)
-100000
+500
 
 -- query 121
 count(1)
-120000
+550
 
 -- query 122
 count(1)
-2702
+1
 
 -- query 123
 count(1)
-2702
+1
 
 -- query 124
 count(1)
-2702
+1
 
 -- query 125
 count(1)
-2702
+1

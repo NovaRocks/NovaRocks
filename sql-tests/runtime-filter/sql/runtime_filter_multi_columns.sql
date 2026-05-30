@@ -16,7 +16,7 @@ CREATE TABLE ${case_db}.t0 (
   c3 INT NULL
 ) ENGINE=OLAP
 DUPLICATE KEY(c0, c1)
-DISTRIBUTED BY HASH(c0, c1) BUCKETS 48
+DISTRIBUTED BY HASH(c0, c1) BUCKETS 12
 PROPERTIES (
   "colocate_with" = "rf_mc_cg",
   "replication_num" = "1",
@@ -31,7 +31,7 @@ CREATE TABLE ${case_db}.t1 (
   c3 INT NULL
 ) ENGINE=OLAP
 DUPLICATE KEY(c0, c1)
-DISTRIBUTED BY HASH(c0, c1) BUCKETS 48
+DISTRIBUTED BY HASH(c0, c1) BUCKETS 12
 PROPERTIES (
   "colocate_with" = "rf_mc_cg",
   "replication_num" = "1",
@@ -51,7 +51,7 @@ PROPERTIES ("replication_num" = "1");
 
 CREATE TABLE ${case_db}.empty_t LIKE ${case_db}.t0;
 
-INSERT INTO ${case_db}.t0 SELECT generate_series, generate_series, generate_series, generate_series FROM TABLE(generate_series(1, 40960));
+INSERT INTO ${case_db}.t0 SELECT generate_series, generate_series, generate_series, generate_series FROM TABLE(generate_series(1, 12000));
 INSERT INTO ${case_db}.t0 VALUES (null, null, null, null);
 INSERT INTO ${case_db}.t1 SELECT * FROM ${case_db}.t0;
 INSERT INTO ${case_db}.small_table SELECT generate_series, generate_series, generate_series, generate_series FROM TABLE(generate_series(1, 100));
@@ -124,15 +124,15 @@ select count(l.c0), avg(l.c0), count(l.c1), count(l.c0), count(r.c1) from ${case
 
 -- cross join: in colocate group upper
 -- query 28
-select count(l.c0), avg(l.c0), count(l.c1), count(l.c0), count(r.c1) from ${case_db}.t0 l join [colocate] ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1 join [broadcast] ${case_db}.small_table t3 where r.c3 < 10 and t3.c1 < 3;
+select count(l.c0), avg(l.c0), count(l.c1), count(l.c0), count(r.c1) from ${case_db}.t0 l join [colocate] ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1 join [broadcast] ${case_db}.small_table t3 where r.c3 < 10 and t3.c0 < 3;
 -- cross join: in colocate group lower
 -- query 29
-select count(l.c0), avg(l.c0), count(l.c1), count(l.c0), count(r.c1) from ${case_db}.t0 l join [broadcast] ${case_db}.small_table t3 join [colocate] ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1 where r.c3 < 10 and t3.c1 < 3;
+select count(l.c0), avg(l.c0), count(l.c1), count(l.c0), count(r.c1) from ${case_db}.t0 l join [broadcast] ${case_db}.small_table t3 join [colocate] ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1 where r.c3 < 10 and t3.c0 < 3;
 -- cross join with runtime filter
 -- query 30
-select count(l.c0), avg(l.c0), count(l.c1), count(l.c0), count(r.c1) from ${case_db}.t0 l join [broadcast] ${case_db}.small_table t3 join [colocate] ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1 where r.c3 < 10 and t3.c1 = 3;
+select count(l.c0), avg(l.c0), count(l.c1), count(l.c0), count(r.c1) from ${case_db}.t0 l join [broadcast] ${case_db}.small_table t3 join [colocate] ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1 where r.c3 < 10 and t3.c0 = 3;
 -- query 31
-select count(l.c0), avg(l.c0), count(l.c1), count(l.c0), count(r.c1) from ${case_db}.t0 l join [colocate] ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1 join [broadcast] ${case_db}.small_table t3 where r.c3 < 10 and t3.c1 = 3;
+select count(l.c0), avg(l.c0), count(l.c1), count(l.c0), count(r.c1) from ${case_db}.t0 l join [colocate] ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1 join [broadcast] ${case_db}.small_table t3 where r.c3 < 10 and t3.c0 = 3;
 
 -- CTE
 -- query 32

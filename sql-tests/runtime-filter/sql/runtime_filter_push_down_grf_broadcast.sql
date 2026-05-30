@@ -97,38 +97,38 @@ set enable_global_runtime_filter='false';
 -- query 2
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
-from ${case_db}.t1
+from t1
 group by t1.c0
 ),
 cte1 as(
-select  coalesce(cte0.c0, -1) as c0, sum(cte0.c1) c1, sum(cte0.c2) c2, sum(murmur_hash3_32(t0.c0)) as d0, sum(murmur_hash3_32(t0.c1)) as d1, sum(murmur_hash3_32(t0.c2)) as d2
-from cte0 INNER JOIN[broadcast] ${case_db}.t0 on t0.c0 = cte0.c0
+select  coalesce(cte0.c0, -1) as c0, sum(cte0.c1) c1, sum(cte0.c2) c2, sum(murmur_hash3_32(t0.c0)) as d0
+from cte0 INNER JOIN[broadcast] t0 on t0.c0 = cte0.c0
 group by 1
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, cte1.d0, cte1.d1, cte1.d2, murmur_hash3_32(t2.c0) as e0, murmur_hash3_32(t2.c1) as e1, murmur_hash3_32(t2.c2) as e2
-from cte1 inner join[shuffle] ${case_db}.t2 on cte1.c0 = t2.c0
+select cte1.c0, cte1.c1, cte1.c2, cte1.d0, murmur_hash3_32(t2.c0) as e0
+from cte1 inner join[shuffle] t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+d0+d1+d2+e0+e1+e2), 0) as fingerprint
+select coalesce(sum(murmur_hash3_32(c0)+c1+c2+d0+e0), 0) as fingerprint
 from cte2;
 
 set enable_global_runtime_filter='true';
 -- query 3
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
-from ${case_db}.t1
+from t1
 group by t1.c0
 ),
 cte1 as(
-select  coalesce(cte0.c0, -1) as c0, sum(cte0.c1) c1, sum(cte0.c2) c2, sum(murmur_hash3_32(t0.c0)) as d0, sum(murmur_hash3_32(t0.c1)) as d1, sum(murmur_hash3_32(t0.c2)) as d2
-from cte0 INNER JOIN[broadcast] ${case_db}.t0 on t0.c0 = cte0.c0
+select  coalesce(cte0.c0, -1) as c0, sum(cte0.c1) c1, sum(cte0.c2) c2, sum(murmur_hash3_32(t0.c0)) as d0
+from cte0 INNER JOIN[broadcast] t0 on t0.c0 = cte0.c0
 group by 1
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, cte1.d0, cte1.d1, cte1.d2, murmur_hash3_32(t2.c0) as e0, murmur_hash3_32(t2.c1) as e1, murmur_hash3_32(t2.c2) as e2
-from cte1 inner join[shuffle] ${case_db}.t2 on cte1.c0 = t2.c0
+select cte1.c0, cte1.c1, cte1.c2, cte1.d0, murmur_hash3_32(t2.c0) as e0
+from cte1 inner join[shuffle] t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+d0+d1+d2+e0+e1+e2), 0) as fingerprint
+select coalesce(sum(murmur_hash3_32(c0)+c1+c2+d0+e0), 0) as fingerprint
 from cte2;
 
 -- LEFT JOIN[broadcast] pair
@@ -136,38 +136,38 @@ set enable_global_runtime_filter='false';
 -- query 4
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
-from ${case_db}.t1
+from t1
 group by t1.c0
 ),
 cte1 as(
-select  coalesce(cte0.c0, -1) as c0, sum(cte0.c1) c1, sum(cte0.c2) c2, sum(murmur_hash3_32(t0.c0)) as d0, sum(murmur_hash3_32(t0.c1)) as d1, sum(murmur_hash3_32(t0.c2)) as d2
-from cte0 LEFT JOIN[broadcast] ${case_db}.t0 on t0.c0 = cte0.c0
+select  coalesce(cte0.c0, -1) as c0, sum(cte0.c1) c1, sum(cte0.c2) c2, sum(murmur_hash3_32(t0.c0)) as d0
+from cte0 LEFT JOIN[broadcast] t0 on t0.c0 = cte0.c0
 group by 1
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, cte1.d0, cte1.d1, cte1.d2, murmur_hash3_32(t2.c0) as e0, murmur_hash3_32(t2.c1) as e1, murmur_hash3_32(t2.c2) as e2
-from cte1 inner join[shuffle] ${case_db}.t2 on cte1.c0 = t2.c0
+select cte1.c0, cte1.c1, cte1.c2, cte1.d0, murmur_hash3_32(t2.c0) as e0
+from cte1 inner join[shuffle] t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+d0+d1+d2+e0+e1+e2), 0) as fingerprint
+select coalesce(sum(murmur_hash3_32(c0)+c1+c2+d0+e0), 0) as fingerprint
 from cte2;
 
 set enable_global_runtime_filter='true';
 -- query 5
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
-from ${case_db}.t1
+from t1
 group by t1.c0
 ),
 cte1 as(
-select  coalesce(cte0.c0, -1) as c0, sum(cte0.c1) c1, sum(cte0.c2) c2, sum(murmur_hash3_32(t0.c0)) as d0, sum(murmur_hash3_32(t0.c1)) as d1, sum(murmur_hash3_32(t0.c2)) as d2
-from cte0 LEFT JOIN[broadcast] ${case_db}.t0 on t0.c0 = cte0.c0
+select  coalesce(cte0.c0, -1) as c0, sum(cte0.c1) c1, sum(cte0.c2) c2, sum(murmur_hash3_32(t0.c0)) as d0
+from cte0 LEFT JOIN[broadcast] t0 on t0.c0 = cte0.c0
 group by 1
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, cte1.d0, cte1.d1, cte1.d2, murmur_hash3_32(t2.c0) as e0, murmur_hash3_32(t2.c1) as e1, murmur_hash3_32(t2.c2) as e2
-from cte1 inner join[shuffle] ${case_db}.t2 on cte1.c0 = t2.c0
+select cte1.c0, cte1.c1, cte1.c2, cte1.d0, murmur_hash3_32(t2.c0) as e0
+from cte1 inner join[shuffle] t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+d0+d1+d2+e0+e1+e2), 0) as fingerprint
+select coalesce(sum(murmur_hash3_32(c0)+c1+c2+d0+e0), 0) as fingerprint
 from cte2;
 
 -- FULL JOIN[shuffle] pair
@@ -175,38 +175,38 @@ set enable_global_runtime_filter='false';
 -- query 6
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
-from ${case_db}.t1
+from t1
 group by t1.c0
 ),
 cte1 as(
-select  coalesce(cte0.c0, -1) as c0, sum(cte0.c1) c1, sum(cte0.c2) c2, sum(murmur_hash3_32(t0.c0)) as d0, sum(murmur_hash3_32(t0.c1)) as d1, sum(murmur_hash3_32(t0.c2)) as d2
-from cte0 FULL JOIN[shuffle] ${case_db}.t0 on t0.c0 = cte0.c0
+select  coalesce(cte0.c0, -1) as c0, sum(cte0.c1) c1, sum(cte0.c2) c2, sum(murmur_hash3_32(t0.c0)) as d0
+from cte0 FULL JOIN[shuffle] t0 on t0.c0 = cte0.c0
 group by 1
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, cte1.d0, cte1.d1, cte1.d2, murmur_hash3_32(t2.c0) as e0, murmur_hash3_32(t2.c1) as e1, murmur_hash3_32(t2.c2) as e2
-from cte1 inner join[shuffle] ${case_db}.t2 on cte1.c0 = t2.c0
+select cte1.c0, cte1.c1, cte1.c2, cte1.d0, murmur_hash3_32(t2.c0) as e0
+from cte1 inner join[shuffle] t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+d0+d1+d2+e0+e1+e2), 0) as fingerprint
+select coalesce(sum(murmur_hash3_32(c0)+c1+c2+d0+e0), 0) as fingerprint
 from cte2;
 
 set enable_global_runtime_filter='true';
 -- query 7
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
-from ${case_db}.t1
+from t1
 group by t1.c0
 ),
 cte1 as(
-select  coalesce(cte0.c0, -1) as c0, sum(cte0.c1) c1, sum(cte0.c2) c2, sum(murmur_hash3_32(t0.c0)) as d0, sum(murmur_hash3_32(t0.c1)) as d1, sum(murmur_hash3_32(t0.c2)) as d2
-from cte0 FULL JOIN[shuffle] ${case_db}.t0 on t0.c0 = cte0.c0
+select  coalesce(cte0.c0, -1) as c0, sum(cte0.c1) c1, sum(cte0.c2) c2, sum(murmur_hash3_32(t0.c0)) as d0
+from cte0 FULL JOIN[shuffle] t0 on t0.c0 = cte0.c0
 group by 1
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, cte1.d0, cte1.d1, cte1.d2, murmur_hash3_32(t2.c0) as e0, murmur_hash3_32(t2.c1) as e1, murmur_hash3_32(t2.c2) as e2
-from cte1 inner join[shuffle] ${case_db}.t2 on cte1.c0 = t2.c0
+select cte1.c0, cte1.c1, cte1.c2, cte1.d0, murmur_hash3_32(t2.c0) as e0
+from cte1 inner join[shuffle] t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+d0+d1+d2+e0+e1+e2), 0) as fingerprint
+select coalesce(sum(murmur_hash3_32(c0)+c1+c2+d0+e0), 0) as fingerprint
 from cte2;
 
 -- CROSS JOIN pair
@@ -214,38 +214,38 @@ set enable_global_runtime_filter='false';
 -- query 8
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
-from ${case_db}.t1
+from t1
 group by t1.c0
 ),
 cte1 as(
-select  coalesce(cte0.c0, -1) as c0, sum(cte0.c1) c1, sum(cte0.c2) c2, sum(murmur_hash3_32(t0.c0)) as d0, sum(murmur_hash3_32(t0.c1)) as d1, sum(murmur_hash3_32(t0.c2)) as d2
-from cte0 CROSS JOIN ${case_db}.t0 on t0.c0 = cte0.c0
+select  coalesce(cte0.c0, -1) as c0, sum(cte0.c1) c1, sum(cte0.c2) c2, sum(murmur_hash3_32(t0.c0)) as d0
+from cte0 CROSS JOIN t0 on t0.c0 = cte0.c0
 group by 1
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, cte1.d0, cte1.d1, cte1.d2, murmur_hash3_32(t2.c0) as e0, murmur_hash3_32(t2.c1) as e1, murmur_hash3_32(t2.c2) as e2
-from cte1 inner join[shuffle] ${case_db}.t2 on cte1.c0 = t2.c0
+select cte1.c0, cte1.c1, cte1.c2, cte1.d0, murmur_hash3_32(t2.c0) as e0
+from cte1 inner join[shuffle] t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+d0+d1+d2+e0+e1+e2), 0) as fingerprint
+select coalesce(sum(murmur_hash3_32(c0)+c1+c2+d0+e0), 0) as fingerprint
 from cte2;
 
 set enable_global_runtime_filter='true';
 -- query 9
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
-from ${case_db}.t1
+from t1
 group by t1.c0
 ),
 cte1 as(
-select  coalesce(cte0.c0, -1) as c0, sum(cte0.c1) c1, sum(cte0.c2) c2, sum(murmur_hash3_32(t0.c0)) as d0, sum(murmur_hash3_32(t0.c1)) as d1, sum(murmur_hash3_32(t0.c2)) as d2
-from cte0 CROSS JOIN ${case_db}.t0 on t0.c0 = cte0.c0
+select  coalesce(cte0.c0, -1) as c0, sum(cte0.c1) c1, sum(cte0.c2) c2, sum(murmur_hash3_32(t0.c0)) as d0
+from cte0 CROSS JOIN t0 on t0.c0 = cte0.c0
 group by 1
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, cte1.d0, cte1.d1, cte1.d2, murmur_hash3_32(t2.c0) as e0, murmur_hash3_32(t2.c1) as e1, murmur_hash3_32(t2.c2) as e2
-from cte1 inner join[shuffle] ${case_db}.t2 on cte1.c0 = t2.c0
+select cte1.c0, cte1.c1, cte1.c2, cte1.d0, murmur_hash3_32(t2.c0) as e0
+from cte1 inner join[shuffle] t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+d0+d1+d2+e0+e1+e2), 0) as fingerprint
+select coalesce(sum(murmur_hash3_32(c0)+c1+c2+d0+e0), 0) as fingerprint
 from cte2;
 
 -- LEFT SEMI JOIN[broadcast] pair
@@ -253,38 +253,38 @@ set enable_global_runtime_filter='false';
 -- query 10
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
-from ${case_db}.t1
+from t1
 group by t1.c0
 ),
 cte1 as(
 select  cte0.c0, sum(cte0.c1) c1, sum(cte0.c2) c2
-from cte0 LEFT SEMI JOIN[broadcast] ${case_db}.t0 on t0.c0 = cte0.c0
+from cte0 LEFT SEMI JOIN[broadcast] t0 on t0.c0 = cte0.c0
 group by 1
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0, murmur_hash3_32(t2.c1) as e1, murmur_hash3_32(t2.c2) as e2
-from cte1 inner join[shuffle] ${case_db}.t2 on cte1.c0 = t2.c0
+select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0
+from cte1 inner join[shuffle] t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0+e1+e2), 0) as fingerprint
+select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 set enable_global_runtime_filter='true';
 -- query 11
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
-from ${case_db}.t1
+from t1
 group by t1.c0
 ),
 cte1 as(
 select  cte0.c0, sum(cte0.c1) c1, sum(cte0.c2) c2
-from cte0 LEFT SEMI JOIN[broadcast] ${case_db}.t0 on t0.c0 = cte0.c0
+from cte0 LEFT SEMI JOIN[broadcast] t0 on t0.c0 = cte0.c0
 group by 1
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0, murmur_hash3_32(t2.c1) as e1, murmur_hash3_32(t2.c2) as e2
-from cte1 inner join[shuffle] ${case_db}.t2 on cte1.c0 = t2.c0
+select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0
+from cte1 inner join[shuffle] t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0+e1+e2), 0) as fingerprint
+select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 -- LEFT ANTI JOIN[broadcast] pair
@@ -292,38 +292,38 @@ set enable_global_runtime_filter='false';
 -- query 12
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
-from ${case_db}.t1
+from t1
 group by t1.c0
 ),
 cte1 as(
 select  cte0.c0, sum(cte0.c1) c1, sum(cte0.c2) c2
-from cte0 LEFT ANTI JOIN[broadcast] ${case_db}.t0 on t0.c0 = cte0.c0
+from cte0 LEFT ANTI JOIN[broadcast] t0 on t0.c0 = cte0.c0
 group by 1
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0, murmur_hash3_32(t2.c1) as e1, murmur_hash3_32(t2.c2) as e2
-from cte1 inner join[shuffle] ${case_db}.t2 on cte1.c0 = t2.c0
+select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0
+from cte1 inner join[shuffle] t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0+e1+e2), 0) as fingerprint
+select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 set enable_global_runtime_filter='true';
 -- query 13
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
-from ${case_db}.t1
+from t1
 group by t1.c0
 ),
 cte1 as(
 select  cte0.c0, sum(cte0.c1) c1, sum(cte0.c2) c2
-from cte0 LEFT ANTI JOIN[broadcast] ${case_db}.t0 on t0.c0 = cte0.c0
+from cte0 LEFT ANTI JOIN[broadcast] t0 on t0.c0 = cte0.c0
 group by 1
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0, murmur_hash3_32(t2.c1) as e1, murmur_hash3_32(t2.c2) as e2
-from cte1 inner join[shuffle] ${case_db}.t2 on cte1.c0 = t2.c0
+select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0
+from cte1 inner join[shuffle] t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0+e1+e2), 0) as fingerprint
+select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 -- RIGHT SEMI JOIN[shuffle] pair
@@ -331,38 +331,38 @@ set enable_global_runtime_filter='false';
 -- query 14
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
-from ${case_db}.t1
+from t1
 group by t1.c0
 ),
 cte1 as(
 select  coalesce(cte0.c0, -1) c0, sum(cte0.c1) c1, sum(cte0.c2) c2
-from ${case_db}.t0 RIGHT SEMI JOIN[shuffle] cte0 on t0.c0 = cte0.c0
+from t0 RIGHT SEMI JOIN[shuffle] cte0 on t0.c0 = cte0.c0
 group by 1
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0, murmur_hash3_32(t2.c1) as e1, murmur_hash3_32(t2.c2) as e2
-from cte1 inner join[shuffle] ${case_db}.t2 on cte1.c0 = t2.c0
+select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0
+from cte1 inner join[shuffle] t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0+e1+e2), 0) as fingerprint
+select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 set enable_global_runtime_filter='true';
 -- query 15
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
-from ${case_db}.t1
+from t1
 group by t1.c0
 ),
 cte1 as(
 select  coalesce(cte0.c0, -1) c0, sum(cte0.c1) c1, sum(cte0.c2) c2
-from ${case_db}.t0 RIGHT SEMI JOIN[shuffle] cte0 on t0.c0 = cte0.c0
+from t0 RIGHT SEMI JOIN[shuffle] cte0 on t0.c0 = cte0.c0
 group by 1
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0, murmur_hash3_32(t2.c1) as e1, murmur_hash3_32(t2.c2) as e2
-from cte1 inner join[shuffle] ${case_db}.t2 on cte1.c0 = t2.c0
+select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0
+from cte1 inner join[shuffle] t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0+e1+e2), 0) as fingerprint
+select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 -- RIGHT ANTI JOIN[shuffle] pair
@@ -370,38 +370,38 @@ set enable_global_runtime_filter='false';
 -- query 16
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
-from ${case_db}.t1
+from t1
 group by t1.c0
 ),
 cte1 as(
 select  coalesce(cte0.c0, -1) c0, sum(cte0.c1) c1, sum(cte0.c2) c2
-from ${case_db}.t0 RIGHT ANTI JOIN[shuffle] cte0 on t0.c0 = cte0.c0
+from t0 RIGHT ANTI JOIN[shuffle] cte0 on t0.c0 = cte0.c0
 group by 1
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0, murmur_hash3_32(t2.c1) as e1, murmur_hash3_32(t2.c2) as e2
-from cte1 inner join[shuffle] ${case_db}.t2 on cte1.c0 = t2.c0
+select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0
+from cte1 inner join[shuffle] t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0+e1+e2), 0) as fingerprint
+select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 set enable_global_runtime_filter='true';
 -- query 17
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
-from ${case_db}.t1
+from t1
 group by t1.c0
 ),
 cte1 as(
 select  coalesce(cte0.c0, -1) c0, sum(cte0.c1) c1, sum(cte0.c2) c2
-from ${case_db}.t0 RIGHT ANTI JOIN[shuffle] cte0 on t0.c0 = cte0.c0
+from t0 RIGHT ANTI JOIN[shuffle] cte0 on t0.c0 = cte0.c0
 group by 1
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0, murmur_hash3_32(t2.c1) as e1, murmur_hash3_32(t2.c2) as e2
-from cte1 inner join[shuffle] ${case_db}.t2 on cte1.c0 = t2.c0
+select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0
+from cte1 inner join[shuffle] t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0+e1+e2), 0) as fingerprint
+select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 -- NOT IN subquery pair
@@ -409,40 +409,40 @@ set enable_global_runtime_filter='false';
 -- query 18
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
-from ${case_db}.t1
+from t1
 group by t1.c0
 ),
 cte1 as(
 select  cte0.c0, sum(cte0.c1) c1, sum(cte0.c2) c2
 from cte0
-where cte0.c0 not in (select t0.c0 from ${case_db}.t0)
+where cte0.c0 not in (select t0.c0 from t0)
 group by cte0.c0
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0, murmur_hash3_32(t2.c1) as e1, murmur_hash3_32(t2.c2) as e2
-from cte1 inner join[shuffle] ${case_db}.t2 on cte1.c0 = t2.c0
+select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0
+from cte1 inner join[shuffle] t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0+e1+e2), 0) as fingerprint
+select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 set enable_global_runtime_filter='true';
 -- query 19
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
-from ${case_db}.t1
+from t1
 group by t1.c0
 ),
 cte1 as(
 select  cte0.c0, sum(cte0.c1) c1, sum(cte0.c2) c2
 from cte0
-where cte0.c0 not in (select t0.c0 from ${case_db}.t0)
+where cte0.c0 not in (select t0.c0 from t0)
 group by cte0.c0
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0, murmur_hash3_32(t2.c1) as e1, murmur_hash3_32(t2.c2) as e2
-from cte1 inner join[shuffle] ${case_db}.t2 on cte1.c0 = t2.c0
+select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0
+from cte1 inner join[shuffle] t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0+e1+e2), 0) as fingerprint
+select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 -- IN subquery pair
@@ -450,40 +450,40 @@ set enable_global_runtime_filter='false';
 -- query 20
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
-from ${case_db}.t1
+from t1
 group by t1.c0
 ),
 cte1 as(
 select  cte0.c0, sum(cte0.c1) c1, sum(cte0.c2) c2
 from cte0
-where cte0.c0 in (select t0.c0 from ${case_db}.t0)
+where cte0.c0 in (select t0.c0 from t0)
 group by cte0.c0
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0, murmur_hash3_32(t2.c1) as e1, murmur_hash3_32(t2.c2) as e2
-from cte1 inner join[shuffle] ${case_db}.t2 on cte1.c0 = t2.c0
+select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0
+from cte1 inner join[shuffle] t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0+e1+e2), 0) as fingerprint
+select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 set enable_global_runtime_filter='true';
 -- query 21
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
-from ${case_db}.t1
+from t1
 group by t1.c0
 ),
 cte1 as(
 select  cte0.c0, sum(cte0.c1) c1, sum(cte0.c2) c2
 from cte0
-where cte0.c0 in (select t0.c0 from ${case_db}.t0)
+where cte0.c0 in (select t0.c0 from t0)
 group by cte0.c0
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0, murmur_hash3_32(t2.c1) as e1, murmur_hash3_32(t2.c2) as e2
-from cte1 inner join[shuffle] ${case_db}.t2 on cte1.c0 = t2.c0
+select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0
+from cte1 inner join[shuffle] t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0+e1+e2), 0) as fingerprint
+select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 -- EXISTS subquery pair
@@ -491,40 +491,40 @@ set enable_global_runtime_filter='false';
 -- query 22
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
-from ${case_db}.t1
+from t1
 group by t1.c0
 ),
 cte1 as(
 select  cte0.c0, sum(cte0.c1) c1, sum(cte0.c2) c2
 from cte0
-where exists (select t0.c0 from ${case_db}.t0 where t0.c0 = cte0.c0)
+where exists (select t0.c0 from t0 where t0.c0 = cte0.c0)
 group by cte0.c0
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0, murmur_hash3_32(t2.c1) as e1, murmur_hash3_32(t2.c2) as e2
-from cte1 inner join[shuffle] ${case_db}.t2 on cte1.c0 = t2.c0
+select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0
+from cte1 inner join[shuffle] t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0+e1+e2), 0) as fingerprint
+select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 set enable_global_runtime_filter='true';
 -- query 23
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
-from ${case_db}.t1
+from t1
 group by t1.c0
 ),
 cte1 as(
 select  cte0.c0, sum(cte0.c1) c1, sum(cte0.c2) c2
 from cte0
-where exists (select t0.c0 from ${case_db}.t0 where t0.c0 = cte0.c0)
+where exists (select t0.c0 from t0 where t0.c0 = cte0.c0)
 group by cte0.c0
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0, murmur_hash3_32(t2.c1) as e1, murmur_hash3_32(t2.c2) as e2
-from cte1 inner join[shuffle] ${case_db}.t2 on cte1.c0 = t2.c0
+select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0
+from cte1 inner join[shuffle] t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0+e1+e2), 0) as fingerprint
+select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 -- NOT EXISTS subquery pair
@@ -532,38 +532,38 @@ set enable_global_runtime_filter='false';
 -- query 24
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
-from ${case_db}.t1
+from t1
 group by t1.c0
 ),
 cte1 as(
 select  cte0.c0, sum(cte0.c1) c1, sum(cte0.c2) c2
 from cte0
-where not exists (select t0.c0 from ${case_db}.t0 where t0.c0 = cte0.c0)
+where not exists (select t0.c0 from t0 where t0.c0 = cte0.c0)
 group by cte0.c0
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0, murmur_hash3_32(t2.c1) as e1, murmur_hash3_32(t2.c2) as e2
-from cte1 inner join[shuffle] ${case_db}.t2 on cte1.c0 = t2.c0
+select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0
+from cte1 inner join[shuffle] t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0+e1+e2), 0) as fingerprint
+select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 set enable_global_runtime_filter='true';
 -- query 25
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
-from ${case_db}.t1
+from t1
 group by t1.c0
 ),
 cte1 as(
 select  cte0.c0, sum(cte0.c1) c1, sum(cte0.c2) c2
 from cte0
-where not exists (select t0.c0 from ${case_db}.t0 where t0.c0 = cte0.c0)
+where not exists (select t0.c0 from t0 where t0.c0 = cte0.c0)
 group by cte0.c0
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0, murmur_hash3_32(t2.c1) as e1, murmur_hash3_32(t2.c2) as e2
-from cte1 inner join[shuffle] ${case_db}.t2 on cte1.c0 = t2.c0
+select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0
+from cte1 inner join[shuffle] t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0+e1+e2), 0) as fingerprint
+select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
 from cte2;

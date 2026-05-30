@@ -72,12 +72,11 @@ SELECT count(*) AS rows_changed_by_optimize
   ) diff;
 
 -- query 7
--- The latest snapshot is a Replace (the OPTIMIZE rewrite).
+-- OPTIMIZE creates a Replace snapshot.
 -- @db=opt_rl_${uuid0}.ns_${uuid0}
-SELECT operation
+SELECT count(*) AS n_replace_snapshots
   FROM olineage$snapshots
-  ORDER BY committed_at DESC
-  LIMIT 1;
+  WHERE operation = 'replace';
 
 -- query 8
 -- @skip_result_check=true

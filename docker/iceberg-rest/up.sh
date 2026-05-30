@@ -252,6 +252,7 @@ fi
 
 managed_warehouse="s3://novarocks/$env_id/sql-tests-managed-lake"
 iceberg_warehouse="s3://novarocks/$env_id/iceberg-catalog"
+starrocks_table_warehouse="s3://novarocks/$env_id/sql-tests-starrocks-table"
 rest_warehouse="s3://warehouse/$env_id/rest"
 shared_rest_warehouse="${NOVA_ENV_SHARED_REST_WAREHOUSE_URI:-s3://warehouse/shared/rest}"
 compose_rest_warehouse="$rest_warehouse"
@@ -340,6 +341,7 @@ oss_endpoint = $minio_endpoint
 managed_lake_warehouse = $managed_warehouse
 iceberg_catalog_type = hadoop
 iceberg_catalog_warehouse = $iceberg_warehouse
+starrocks_table_warehouse = $starrocks_table_warehouse
 iceberg_rest_uri = $rest_uri
 iceberg_rest_warehouse = $rest_warehouse
 EOF
@@ -433,6 +435,7 @@ export MINIO_ROOT_USER="$minio_user"
 export MINIO_ROOT_PASSWORD="$minio_password"
 export CATALOG_WAREHOUSE_URI="$iceberg_warehouse"
 export NOVAROCKS_MANAGED_LAKE_WAREHOUSE="$managed_warehouse"
+export NOVAROCKS_STARROCKS_TABLE_WAREHOUSE="$starrocks_table_warehouse"
 export NOVAROCKS_ICEBERG_REST_URI="$rest_uri"
 export NOVA_ENV_SHARED_REST_WAREHOUSE_URI="$shared_rest_warehouse"
 export NOVA_ENV_REST_SERVER_WAREHOUSE_URI="$compose_rest_warehouse"
@@ -494,7 +497,8 @@ cat > "$manifest_file" <<EOF
     "sql_test_config": "$runtime_dir/sql-test.conf",
     "ice_rest_catalog_sql": "$runtime_dir/ice-rest-catalog.sql",
     "managed_lake_warehouse": "$managed_warehouse",
-    "iceberg_catalog_warehouse": "$iceberg_warehouse"
+    "iceberg_catalog_warehouse": "$iceberg_warehouse",
+    "starrocks_table_warehouse": "$starrocks_table_warehouse"
   }
 }
 EOF
@@ -525,6 +529,7 @@ Do not guess ports.
 - Standalone config: \`$runtime_dir/standalone-managed-lake.toml\`
 - Scheduler-enabled standalone config: \`$runtime_dir/standalone-managed-lake-scheduler.toml\`
 - SQL test config: \`$runtime_dir/sql-test.conf\`
+- StarRocks-table test warehouse: \`$starrocks_table_warehouse\`
 - REST catalog SQL: \`$runtime_dir/ice-rest-catalog.sql\`
 - Spark defaults: \`$spark_defaults_file\`
 - Spark v3 smoke SQL: \`$spark_v3_smoke_sql\`

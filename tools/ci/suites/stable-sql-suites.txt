@@ -6,6 +6,17 @@ limit
 project
 sort
 join
+cte
+set-op
+table-function
+runtime-filter
+low-cardinality
+iceberg
+iceberg-compatibility
+iceberg-ddl
+iceberg-dml
+iceberg-ivm
+iceberg-rest
 
 # The suites below are not part of default daily mode yet.
 # Benchmark suites are excluded from default daily until benchmark data bootstrap is explicitly part of this runner:
@@ -17,17 +28,6 @@ join
 # aggregate
 # analytic
 # complex-type
-# cte
 # decimal
 # function
-# iceberg
-# iceberg-compatibility
-# iceberg-ddl
-# iceberg-dml
-# iceberg-ivm
-# iceberg-rest
-# low-cardinality
 # optimizer
-# runtime-filter
-# set-op
-# table-function

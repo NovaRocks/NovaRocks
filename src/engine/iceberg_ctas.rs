@@ -216,11 +216,17 @@ pub(crate) fn execute_iceberg_ctas(
 // ---------------------------------------------------------------------------
 
 /// Check whether a table already exists in the given namespace via the
-/// catalog's table-listing API. Returns `true` if the table is present.
+/// catalog's table loading path. Returns `true` if the table is present.
 fn table_exists(entry: &IcebergCatalogEntry, namespace: &str, table: &str) -> Result<bool, String> {
-    let tables = crate::connector::iceberg::catalog::registry::list_tables(entry, namespace)?;
-    let normalized = crate::engine::catalog::normalize_identifier(table)?;
-    Ok(tables.iter().any(|t| t.eq_ignore_ascii_case(&normalized)))
+    match crate::connector::iceberg::catalog::registry::load_table(entry, namespace, table) {
+        Ok(_) => Ok(true),
+        Err(err) if err.contains("no metadata files") || err.contains("list metadata dir") => {
+            Ok(false)
+        }
+        Err(err) => Err(format!(
+            "CTAS failed: cannot check whether table {namespace}.{table} exists: {err}"
+        )),
+    }
 }
 
 /// Extract the source column name from a partition field expression.

@@ -202,8 +202,27 @@ fn rewrite_table_factor(
                         .expect("iceberg catalog registry read lock");
                     match registry.get(cat) {
                         Ok(entry) => {
-                            let databases =
+                            let mut databases =
                                 crate::connector::iceberg::catalog::list_namespaces(&entry)?;
+                            if let Some(provider) = state.metadata_provider.as_ref() {
+                                let read = provider.begin_read().map_err(|e| {
+                                    format!("read iceberg namespace metadata failed: {e}")
+                                })?;
+                                let records = state
+                                    .iceberg_catalog_repo
+                                    .list_namespaces(read.as_ref())
+                                    .map_err(|e| {
+                                        format!("read iceberg namespace metadata failed: {e}")
+                                    })?;
+                                databases.extend(
+                                    records
+                                        .into_iter()
+                                        .filter(|record| record.catalog.eq_ignore_ascii_case(cat))
+                                        .map(|record| record.namespace),
+                                );
+                                databases.sort();
+                                databases.dedup();
+                            }
                             let schemata_cols =
                                 crate::engine::information_schema::schemata_columns();
                             let batches = crate::engine::information_schema::build_schemata_batch(

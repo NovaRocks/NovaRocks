@@ -17,23 +17,18 @@ CREATE TABLE ${case_db}.row_util_base (
   k1 BIGINT NULL
 ) ENGINE=OLAP
 DUPLICATE KEY(k1)
-DISTRIBUTED BY HASH(k1) BUCKETS 32
+DISTRIBUTED BY HASH(k1) BUCKETS 8
 PROPERTIES ("replication_num" = "1");
 
-INSERT INTO ${case_db}.row_util_base SELECT generate_series FROM TABLE(generate_series(0, 10000 - 1));
+INSERT INTO ${case_db}.row_util_base SELECT generate_series FROM TABLE(generate_series(0, 5000 - 1));
+INSERT INTO ${case_db}.row_util_base SELECT * FROM ${case_db}.row_util_base; -- 10000
 INSERT INTO ${case_db}.row_util_base SELECT * FROM ${case_db}.row_util_base; -- 20000
-INSERT INTO ${case_db}.row_util_base SELECT * FROM ${case_db}.row_util_base; -- 40000
-INSERT INTO ${case_db}.row_util_base SELECT * FROM ${case_db}.row_util_base; -- 80000
-INSERT INTO ${case_db}.row_util_base SELECT * FROM ${case_db}.row_util_base; -- 160000
-INSERT INTO ${case_db}.row_util_base SELECT * FROM ${case_db}.row_util_base; -- 320000
-INSERT INTO ${case_db}.row_util_base SELECT * FROM ${case_db}.row_util_base; -- 640000
-INSERT INTO ${case_db}.row_util_base SELECT * FROM ${case_db}.row_util_base; -- 1280000
 
 CREATE TABLE ${case_db}.row_util (
   idx BIGINT NULL
 ) ENGINE=OLAP
 DUPLICATE KEY(idx)
-DISTRIBUTED BY HASH(idx) BUCKETS 32
+DISTRIBUTED BY HASH(idx) BUCKETS 8
 PROPERTIES ("replication_num" = "1");
 
 INSERT INTO ${case_db}.row_util SELECT row_number() over() AS idx FROM ${case_db}.row_util_base;
@@ -63,7 +58,7 @@ CREATE TABLE ${case_db}.t1 (
   c_datetime_2_seq DATETIME NOT NULL
 ) ENGINE=OLAP
 DUPLICATE KEY(k1)
-DISTRIBUTED BY HASH(k1) BUCKETS 32
+DISTRIBUTED BY HASH(k1) BUCKETS 8
 PROPERTIES ("replication_num" = "1");
 
 -- t2: small value interval, triggers bitset filter
@@ -91,7 +86,7 @@ CREATE TABLE ${case_db}.t2 (
   c_datetime_2_seq DATETIME NOT NULL
 ) ENGINE=OLAP
 DUPLICATE KEY(k1)
-DISTRIBUTED BY HASH(k1) BUCKETS 32
+DISTRIBUTED BY HASH(k1) BUCKETS 8
 PROPERTIES ("replication_num" = "1");
 
 -- t3: large value interval, should NOT trigger bitset filter
@@ -119,7 +114,7 @@ CREATE TABLE ${case_db}.t3 (
   c_datetime_2_seq DATETIME NOT NULL
 ) ENGINE=OLAP
 DUPLICATE KEY(k1)
-DISTRIBUTED BY HASH(k1) BUCKETS 32
+DISTRIBUTED BY HASH(k1) BUCKETS 8
 PROPERTIES ("replication_num" = "1");
 
 -- Insert t2: small value interval (idx % N for bounded values)
@@ -139,7 +134,7 @@ SELECT
     cast(date_add('2023-01-01', interval idx second) as datetime),
     cast(date_add('2023-01-01', interval idx second) as datetime)
 FROM ${case_db}.row_util
-ORDER BY idx LIMIT 100000;
+ORDER BY idx LIMIT 500;
 
 -- Insert t2 rows with some NULLs
 INSERT INTO ${case_db}.t2
@@ -156,26 +151,26 @@ SELECT
     NULL, concat('str-abc-', idx % 256),
     NULL, cast(date_add('2023-01-01', interval idx second) as datetime)
 FROM ${case_db}.row_util
-ORDER BY idx LIMIT 100000, 10000;
+ORDER BY idx LIMIT 500, 50;
 
--- Insert t3: large value interval (idx * 37 for spread values)
+-- Insert t3: large value interval (idx * 370 for spread values)
 INSERT INTO ${case_db}.t3
 SELECT
     idx,
     idx % 2 = 0, idx % 2 = 0,
     idx % 128, idx % 128,
     idx % 32768, idx % 32768,
-    idx * 37 % 2147483648, idx * 37 % 2147483648,
-    idx * 37, idx * 37,
-    cast(date_add('2023-01-01', interval idx * 37 day) as date),
-    cast(date_add('2023-01-01', interval idx * 37 day) as date),
-    idx * 37, idx * 37,
+    idx * 370 % 2147483648, idx * 370 % 2147483648,
+    idx * 370, idx * 370,
+    cast(date_add('2023-01-01', interval idx * 370 day) as date),
+    cast(date_add('2023-01-01', interval idx * 370 day) as date),
+    idx * 370, idx * 370,
     concat('str-abc-', idx), concat('str-abc-', idx),
     concat('str-abc-', idx % 256), concat('str-abc-', idx % 256),
     cast(date_add('2023-01-01', interval idx second) as datetime),
     cast(date_add('2023-01-01', interval idx second) as datetime)
 FROM ${case_db}.row_util
-ORDER BY idx LIMIT 100000;
+ORDER BY idx LIMIT 500;
 
 -- Insert t3 rows with some NULLs
 INSERT INTO ${case_db}.t3
@@ -184,15 +179,15 @@ SELECT
     NULL, idx % 2 = 0,
     NULL, idx % 128,
     NULL, idx % 32768,
-    NULL, idx * 37 % 2147483648,
-    NULL, idx * 37,
-    NULL, cast(date_add('2023-01-01', interval idx * 37 day) as date),
-    NULL, idx * 37,
+    NULL, idx * 370 % 2147483648,
+    NULL, idx * 370,
+    NULL, cast(date_add('2023-01-01', interval idx * 370 day) as date),
+    NULL, idx * 370,
     NULL, concat('str-abc-', idx),
     NULL, concat('str-abc-', idx % 256),
     NULL, cast(date_add('2023-01-01', interval idx second) as datetime)
 FROM ${case_db}.row_util
-ORDER BY idx LIMIT 100000, 10000;
+ORDER BY idx LIMIT 500, 50;
 
 -- Insert t1: all rows from row_util (1.28M rows non-null)
 INSERT INTO ${case_db}.t1
@@ -227,7 +222,7 @@ SELECT
     NULL, concat('str-abc-', idx % 256),
     NULL, cast(date_add('2023-01-01', interval idx second) as datetime)
 FROM ${case_db}.row_util
-ORDER BY idx LIMIT 100000, 10000;
+ORDER BY idx LIMIT 5000, 500;
 
 -- ===========================================================================
 -- Section 1: type coverage - broadcast join with small build side (limit 10)

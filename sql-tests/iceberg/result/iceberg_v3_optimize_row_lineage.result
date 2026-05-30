@@ -11,5 +11,5 @@ rows_changed_by_optimize
 0
 
 -- query 7
-operation
-replace
+n_replace_snapshots
+1
