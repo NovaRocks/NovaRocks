@@ -172,6 +172,23 @@ spark_build_context="$SCRIPT_DIR/spark"
 spark_version="$configured_spark_version"
 iceberg_version="$configured_iceberg_version"
 
+spark_image_dockerfile_sha() {
+  # Content hash of the inputs that determine the built Spark image (Dockerfile
+  # plus the build args). Used to detect when an already-built image tag is
+  # stale relative to the repo, without relying on file mtimes or `find
+  # -newermt` (BSD find cannot reliably parse ISO timestamps with a time part).
+  local hasher
+  if command -v sha256sum >/dev/null 2>&1; then
+    hasher="sha256sum"
+  elif command -v shasum >/dev/null 2>&1; then
+    hasher="shasum -a 256"
+  else
+    return 0
+  fi
+  { cat "$spark_build_context/Dockerfile" 2>/dev/null; printf '%s\n%s\n' "$spark_version" "$iceberg_version"; } \
+    | $hasher | awk '{print $1}'
+}
+
 build_default_spark_image() {
   local image="$1"
   if [[ ! -f "$spark_build_context/Dockerfile" ]]; then
@@ -182,8 +199,23 @@ build_default_spark_image() {
   docker build \
     --build-arg "SPARK_VERSION=$spark_version" \
     --build-arg "ICEBERG_VERSION=$iceberg_version" \
+    --label "novarocks.dockerfile.sha=$(spark_image_dockerfile_sha)" \
     -t "$image" \
     "$spark_build_context"
+}
+
+spark_image_is_stale() {
+  # Rebuild the locally-built default Spark image when its build inputs no longer
+  # match the hash recorded as an image label. up.sh reuses an existing image tag
+  # indefinitely, so without this a Dockerfile change (e.g. an added hadoop-aws
+  # jar) never takes effect on a machine that already built the tag once. Images
+  # built before this label existed have no label and are treated as stale
+  # (rebuilt once). Returns success (0) when the image should be rebuilt.
+  local image="$1" want have
+  want="$(spark_image_dockerfile_sha)"
+  [[ -n "$want" ]] || return 1
+  have="$(docker image inspect -f '{{ index .Config.Labels "novarocks.dockerfile.sha" }}' "$image" 2>/dev/null || true)"
+  [[ "$want" != "$have" ]]
 }
 
 if [[ "$prepare_only" != true ]]; then
@@ -247,6 +279,16 @@ and the Iceberg Spark runtime.
 EOF
       exit 1
     fi
+  fi
+
+  # Self-heal a stale locally-built image: if the tag already existed but its
+  # Dockerfile/build context has since changed, rebuild so the changes apply.
+  # `docker compose up -d` below then recreates the container from the new image.
+  if [[ "$spark_status" -eq 0 ]] \
+    && [[ "$spark_image" == "$default_spark_image" ]] \
+    && spark_image_is_stale "$spark_image"; then
+    echo "Spark image $spark_image build inputs changed (Dockerfile/args); rebuilding to pick up changes..." >&2
+    build_default_spark_image "$spark_image"
   fi
 fi
 
