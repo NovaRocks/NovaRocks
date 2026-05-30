@@ -557,15 +557,30 @@ want to delete its shared MinIO volume.
 
 ### 8.2 Build Mode
 
-- **Debug build (`cargo build`)**: Use by default for bug investigation, functional fix verification,
-  Rust tests, and SQL suite pass/fail checks.
-  Debug builds have fast incremental compilation (~10-20s) but slow query execution (~5-10x slower than release).
-  **Use when**: checking correctness, running targeted queries, or verifying SQL suites for pass/fail status.
-- **Release build (`cargo build --release`)**: Use only when performance matters or the user explicitly asks for it.
-  Release compilation is slow (~3-5 min full, ~30s incremental) but query execution is fast.
-  **Use when**: measuring query latency/throughput, running benchmarks, or investigating performance-sensitive suite behavior.
+Three profiles trade compile time against query speed (numbers are from a 10-core
+machine — treat as relative, not absolute):
 
-**Rule of thumb**: debug by default for tests; release only for performance or explicit user request.
+- **Debug build (`cargo build`, profile `dev`)**: opt-level 0. Fastest incremental
+  rebuild (~18s) but slow query execution (~5-10x slower than release).
+  **Use when**: checking correctness or running targeted queries where runtime does
+  not matter.
+- **Balanced build (`cargo build --profile dev-opt`, artifacts in `target/dev-opt/`)**:
+  opt-level 1, `debug = 1`, `codegen-units = 256`, `incremental = true`, `lto = false`.
+  Incremental rebuild ~32s (vs ~6 min for release on the same one-line lib edit) while
+  query execution matches release. On engine-CPU-bound SQL suites (many small queries)
+  it runs ~1.9x faster than debug; on object-store-I/O-bound bulk scans (SSB/TPC-H over
+  MinIO) the profile barely matters. First (cold) build is ~2x debug because all
+  dependencies are optimized too — a one-time cost.
+  **Use when**: iterating on the SQL/test loop and you want fast rebuilds *and*
+  near-release query speed. Default for running suites during development.
+- **Release build (`cargo build --release`)**: opt-level 3 + thin LTO + `codegen-units = 1`,
+  `incremental` off. Fastest execution, but incremental rebuilds are punishing
+  (~6 min for a one-line lib change), so it is unusable for iteration.
+  **Use when**: measuring query latency/throughput or running benchmarks.
+
+**Rule of thumb**: `dev` for pure correctness iteration; `dev-opt` for the dev/test
+loop when query speed matters (fast rebuilds + release-class runtime); `--release`
+only for performance measurement and benchmarks.
 
 ### 8.3 Code Quality
 

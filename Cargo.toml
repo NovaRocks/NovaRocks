@@ -104,6 +104,19 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 
+# Balanced profile for the dev/test loop: opt-level 1 gives a large runtime
+# speedup over dev (opt-level 0) while keeping compile times far below release.
+# debug = 1 (line tables only) trims debug-info/link cost; codegen-units = 256
+# and lto = false keep codegen highly parallel. Build with `--profile dev-opt`;
+# artifacts land under target/dev-opt/.
+[profile.dev-opt]
+inherits = "dev"
+opt-level = 1
+debug = 1
+incremental = true
+lto = false
+codegen-units = 256
+
 # Vendored iceberg-rust 0.9 with two visibility patches that allow downstream
 # crates to implement custom Transaction actions (TransactionAction trait + the
 # TableCommit::builder().build() method). Required by NovaRocks RowDeltaCommit
