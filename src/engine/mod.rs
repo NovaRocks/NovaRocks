@@ -2423,6 +2423,15 @@ fn top_level_stream_root_wrapper_child_id(
     if root.plan.nodes.len() != 1 || root.plan.nodes[0].node_type != TPlanNodeType::EXCHANGE_NODE {
         return None;
     }
+    let root_exchange = &root.plan.nodes[0];
+    if root_exchange.limit >= 0 {
+        return None;
+    }
+    if let Some(exchange) = root_exchange.exchange_node.as_ref()
+        && (exchange.sort_info.is_some() || exchange.offset.unwrap_or(0) > 0)
+    {
+        return None;
+    }
     if br
         .edges
         .iter()
@@ -4879,36 +4888,22 @@ enable_path_style_access = true
     }
 
     #[test]
-    fn stripped_top_level_stream_wrapper_preserves_limit() {
-        let build = build_fragments_for_query("SELECT id FROM tbl LIMIT 3");
-        let stripped = super::strip_top_level_stream_root_wrapper(build);
-        let plan = match super::single_fragment_plan(stripped) {
-            Ok(plan) => plan,
-            Err(_) => panic!("expected single fragment after strip"),
-        };
-        let root = plan.plan.nodes.first().expect("root plan node");
+    fn top_level_wrapper_with_limit_is_not_stripped() {
+        let build = build_fragments_for_query("SELECT id FROM tbl LIMIT 5");
 
-        assert_eq!(
-            root.limit, 3,
-            "stripping an exchange-only root wrapper must not drop LIMIT"
+        assert!(
+            super::top_level_stream_root_wrapper_child_id(&build).is_none(),
+            "top-level exchange wrapper carrying LIMIT must stay as the root"
         );
     }
 
     #[test]
-    fn stripped_top_level_stream_wrapper_promotes_result_sink() {
-        let build =
-            build_fragments_for_query("SELECT a.id FROM tbl a JOIN tbl b ON a.id = b.id LIMIT 3");
-        let stripped = super::strip_top_level_stream_root_wrapper(build);
-        let root = stripped
-            .fragment_results
-            .iter()
-            .find(|fragment| fragment.fragment_id == stripped.root_fragment_id)
-            .expect("root fragment after strip");
+    fn top_level_merging_topn_wrapper_is_not_stripped() {
+        let build = build_fragments_for_query("SELECT id FROM tbl ORDER BY id LIMIT 5");
 
-        assert_eq!(
-            root.output_sink.type_,
-            crate::data_sinks::TDataSinkType::RESULT_SINK,
-            "stripping an exchange-only result root must promote RESULT_SINK to the new root"
+        assert!(
+            super::top_level_stream_root_wrapper_child_id(&build).is_none(),
+            "top-level exchange wrapper carrying merging TopN semantics must stay as the root"
         );
     }
 

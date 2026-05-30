@@ -343,6 +343,14 @@ struct SuiteOutcome {
     wall_time: Duration,
 }
 
+#[derive(Clone)]
+struct CaseTiming {
+    suite_name: String,
+    case_id: String,
+    status: CaseStatus,
+    elapsed: Duration,
+}
+
 /// Everything needed to run a suite: context + prepared cases + hooks.
 struct PreparedSuite {
     ctx: SuiteRunContext,
@@ -1669,6 +1677,29 @@ fn run_suite(ps: &PreparedSuite, abort: &AtomicBool, stdout_lock: &Mutex<()>) ->
     }
 }
 
+fn case_status_label(status: CaseStatus) -> &'static str {
+    match status {
+        CaseStatus::Pass => "PASS",
+        CaseStatus::Fail => "FAIL",
+        CaseStatus::Skipped => "SKIPPED",
+    }
+}
+
+fn format_case_timings(timings: &[CaseTiming]) -> String {
+    let mut out = String::from("\ncase timings (all):\n");
+    for timing in timings {
+        let _ = writeln!(
+            out,
+            "  [{}] {} {} {:.2}s",
+            timing.suite_name,
+            timing.case_id,
+            case_status_label(timing.status),
+            timing.elapsed.as_secs_f64()
+        );
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -2177,7 +2208,7 @@ fn run() -> Result<i32> {
     let mut grand_passed = 0usize;
     let mut grand_failed = 0usize;
     let mut grand_skipped = 0usize;
-    let mut all_case_times: Vec<(String, String, Duration)> = Vec::new();
+    let mut all_case_timings: Vec<CaseTiming> = Vec::new();
     let mut all_failed_cases: Vec<(String, String)> = Vec::new();
     let mut all_cleanup_errors: Vec<String> = Vec::new();
 
@@ -2192,12 +2223,17 @@ fn run() -> Result<i32> {
                 }
                 CaseStatus::Skipped => grand_skipped += 1,
             }
-            all_case_times.push((so.suite_name.clone(), co.case_id.clone(), co.elapsed));
+            all_case_timings.push(CaseTiming {
+                suite_name: so.suite_name.clone(),
+                case_id: co.case_id.clone(),
+                status: co.status,
+                elapsed: co.elapsed,
+            });
         }
         all_cleanup_errors.extend(so.cleanup_errors.iter().cloned());
     }
 
-    let total_cpu_time: Duration = all_case_times.iter().map(|(_, _, d)| *d).sum();
+    let total_cpu_time: Duration = all_case_timings.iter().map(|timing| timing.elapsed).sum();
 
     // Print summary
     println!("\n{}", "=".repeat(72));
@@ -2235,11 +2271,25 @@ fn run() -> Result<i32> {
         );
     }
 
-    all_case_times.sort_by(|a, b| b.2.cmp(&a.2));
+    let mut slowest_case_timings = all_case_timings.clone();
+    slowest_case_timings.sort_by(|a, b| b.elapsed.cmp(&a.elapsed));
     println!("\nslowest cases (top 5):");
-    for (suite, case_id, elapsed) in all_case_times.iter().take(5) {
-        println!("  [{}] {}: {:.2}s", suite, case_id, elapsed.as_secs_f64());
+    for timing in slowest_case_timings.iter().take(5) {
+        println!(
+            "  [{}] {}: {:.2}s",
+            timing.suite_name,
+            timing.case_id,
+            timing.elapsed.as_secs_f64()
+        );
     }
+
+    all_case_timings.sort_by(|a, b| {
+        a.suite_name
+            .cmp(&b.suite_name)
+            .then_with(|| b.elapsed.cmp(&a.elapsed))
+            .then_with(|| a.case_id.cmp(&b.case_id))
+    });
+    print!("{}", format_case_timings(&all_case_timings));
 
     if !all_failed_cases.is_empty() {
         println!("\nfailed cases:");
@@ -2680,6 +2730,30 @@ enable_path_style_access = true
         let message =
             "ERROR 5904 (42000) at line 10: Warehouse default_warehouse is not available.";
         assert!(!is_transient_iceberg_commit_error(message));
+    }
+
+    #[test]
+    fn format_case_timings_lists_every_case_with_status_and_elapsed() {
+        let timings = vec![
+            crate::CaseTiming {
+                suite_name: "aggregate".to_string(),
+                case_id: "agg_fast".to_string(),
+                status: crate::CaseStatus::Pass,
+                elapsed: std::time::Duration::from_millis(120),
+            },
+            crate::CaseTiming {
+                suite_name: "analytic".to_string(),
+                case_id: "window_slow".to_string(),
+                status: crate::CaseStatus::Fail,
+                elapsed: std::time::Duration::from_millis(1234),
+            },
+        ];
+
+        let rendered = crate::format_case_timings(&timings);
+
+        assert!(rendered.contains("case timings (all):"));
+        assert!(rendered.contains("  [aggregate] agg_fast PASS 0.12s"));
+        assert!(rendered.contains("  [analytic] window_slow FAIL 1.23s"));
     }
 
     #[test]
