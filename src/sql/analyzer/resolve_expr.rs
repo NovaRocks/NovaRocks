@@ -1191,11 +1191,9 @@ impl<'a> super::AnalyzerContext<'a> {
                     ));
                 }
                 // Ordering operators (`<`, `<=`, `>`, `>=`) are undefined on
-                // composite types — ARRAY / MAP / STRUCT have no canonical
-                // total order. Same-type `=` / `!=` / `<=>` are still fine
-                // (element-wise equality is well-defined). NovaRocks used to
-                // accept `STRUCT < STRUCT`, run it, and silently return zero
-                // rows; reject up front instead.
+                // MAP / STRUCT values. ARRAY values follow StarRocks'
+                // lexicographic ordering and are handled by the nested
+                // comparison executor.
                 let is_ordering_op = matches!(
                     op,
                     sqlast::BinaryOperator::Lt
@@ -1204,14 +1202,14 @@ impl<'a> super::AnalyzerContext<'a> {
                         | sqlast::BinaryOperator::GtEq
                 );
                 if is_ordering_op {
-                    let complex_kind = |dt: &DataType| match dt {
-                        DataType::List(_) | DataType::LargeList(_) => Some("ARRAY"),
+                    let unsupported_complex_kind = |dt: &DataType| match dt {
+                        DataType::LargeList(_) => Some("ARRAY"),
                         DataType::Map(_, _) => Some("MAP"),
                         DataType::Struct(_) => Some("STRUCT"),
                         _ => None,
                     };
-                    if let Some(kind) = complex_kind(&left_typed.data_type)
-                        .or_else(|| complex_kind(&right_typed.data_type))
+                    if let Some(kind) = unsupported_complex_kind(&left_typed.data_type)
+                        .or_else(|| unsupported_complex_kind(&right_typed.data_type))
                     {
                         return Err(format!(
                             "comparison operator `{op_sym}` does not support binary predicate operation on {kind} values"
@@ -4241,6 +4239,7 @@ fn is_integer_const_literal(expr: &sqlast::Expr) -> bool {
             op: sqlast::UnaryOperator::Minus | sqlast::UnaryOperator::Plus,
             expr,
         } => is_integer_const_literal(expr),
+        sqlast::Expr::Nested(inner) => is_integer_const_literal(inner),
         _ => false,
     }
 }

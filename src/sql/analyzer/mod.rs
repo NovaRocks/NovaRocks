@@ -3994,6 +3994,26 @@ mod tests {
     }
 
     #[test]
+    fn test_array_ordering_comparison_analyzes() {
+        let resolved = parse_raw_and_analyze("SELECT i_1 > [1, 2] FROM array_test")
+            .expect("array ordering comparison should analyze");
+        assert_eq!(resolved.output_columns.len(), 1);
+        assert!(matches!(
+            resolved.output_columns[0].data_type,
+            arrow::datatypes::DataType::Boolean
+        ));
+    }
+
+    #[test]
+    fn test_time_slice_interval_literal_analyzes() {
+        let resolved = parse_raw_and_analyze(
+            "SELECT time_slice('9999-12-31 23:59:59', interval 5 year, ceil)",
+        )
+        .expect("time_slice interval literal should analyze");
+        assert_eq!(resolved.output_columns.len(), 1);
+    }
+
+    #[test]
     fn test_any_match_lambda_analyzes_as_boolean() {
         let resolved = parse_raw_and_analyze("SELECT any_match(x -> x < 10, [1,2])")
             .expect("any_match should analyze lambda predicate");

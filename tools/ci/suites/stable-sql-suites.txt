@@ -12,7 +12,9 @@ table-function
 runtime-filter
 low-cardinality
 complex-type-native
+complex-type
 function-native
+function
 optimizer
 iceberg
 iceberg-compatibility
@@ -33,12 +35,5 @@ iceberg-rest
 #   -sensitive — excluded until the runner wires the scheduler config for unattended daily runs.
 # aggregate
 # analytic
-# complex-type migrated to Iceberg v3, but two cases fail on PRE-EXISTING storage-independent
-#   engine gaps (complex_test_array: ARRAY `>` comparison unsupported; complex_test_array_sortby:
-#   debug-build query timeout). Excluded until those gaps are fixed. Its Iceberg-invalid null
-#   -map-key cases were split to complex-type-native (above, in the stable set).
 # decimal tests DECIMAL256 (precision 39-76); the standalone Arrow engine caps at Decimal128
 #   (precision 38), so it fails on native too. Excluded until DECIMAL256 is supported.
-# function migrated to Iceberg v3, but function_time_slice fails on a PRE-EXISTING gap
-#   (time_slice requires a constant interval). Excluded until fixed. Its native BITMAP/HLL
-#   aggregate-storage cases were split to function-native (above, in the stable set).

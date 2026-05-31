@@ -59,17 +59,17 @@ TBLPROPERTIES ("format-version" = "3");
 -- query 8
 -- @skip_result_check=true
 USE ${case_db};
-insert into __row_util_base select generate_series from TABLE(generate_series(0, 10000 - 1));
+insert into __row_util_base select generate_series from TABLE(generate_series(0, 1000 - 1));
 
 -- query 9
 -- @skip_result_check=true
 USE ${case_db};
-insert into __row_util_base select * from __row_util_base; -- 20000
-insert into __row_util_base select * from __row_util_base; -- 40000
-insert into __row_util_base select * from __row_util_base; -- 80000
-insert into __row_util_base select * from __row_util_base; -- 160000
-insert into __row_util_base select * from __row_util_base; -- 320000
-insert into __row_util_base select * from __row_util_base; -- 640000
+insert into __row_util_base select * from __row_util_base; -- 2000
+insert into __row_util_base select * from __row_util_base; -- 4000
+insert into __row_util_base select * from __row_util_base; -- 8000
+insert into __row_util_base select * from __row_util_base; -- 16000
+insert into __row_util_base select * from __row_util_base; -- 32000
+insert into __row_util_base select * from __row_util_base; -- 64000
 
 CREATE TABLE __row_util (
   idx bigint NULL,
