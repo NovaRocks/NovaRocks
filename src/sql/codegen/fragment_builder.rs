@@ -162,7 +162,8 @@ fn iceberg_table_info(
         | crate::sql::catalog::ScanSource::IcebergMetadataTable { table, .. }
         | crate::sql::catalog::ScanSource::IcebergDeltaTable { table, .. }
         | crate::sql::catalog::ScanSource::IcebergVersionTable { table, .. } => Some(table),
-        crate::sql::catalog::ScanSource::StarRocks { .. } => None,
+        crate::sql::catalog::ScanSource::StarRocks { .. }
+        | crate::sql::catalog::ScanSource::IcebergMvTargetState { .. } => None,
     }
 }
 

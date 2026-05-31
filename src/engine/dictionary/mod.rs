@@ -327,11 +327,12 @@ impl DictionaryQueryProvider {
                     table_uuid: info.table_uuid.clone(),
                 }))
             }
-            // Metadata tables, IVM delta scans, and IMV pinned-version
-            // placeholders never participate in dictionary rewriting.
+            // Metadata tables, IVM delta scans, IMV pinned-version placeholders,
+            // and IMV target-state scans never participate in dictionary rewriting.
             ScanSource::IcebergMetadataTable { .. }
             | ScanSource::IcebergDeltaTable { .. }
-            | ScanSource::IcebergVersionTable { .. } => Ok(None),
+            | ScanSource::IcebergVersionTable { .. }
+            | ScanSource::IcebergMvTargetState { .. } => Ok(None),
         }
     }
 }

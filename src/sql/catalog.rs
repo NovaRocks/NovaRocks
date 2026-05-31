@@ -130,6 +130,28 @@ pub struct IcebergTableInfo {
     pub serialized_metadata: Option<String>,
 }
 
+/// Metadata for an IMV target-state scan source. This struct carries only
+/// planner-safe metadata for the MV's own target state — catalog identity,
+/// column definitions, and the aggregate/join logical contract. It has no
+/// execution or catalog handles and is designed to be inspectable during
+/// analyzer/optimizer phases without triggering runtime behavior. Future
+/// tasks will implement the optimizer rewrite and execution path.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct IcebergMvTargetStateScan {
+    pub(crate) catalog: String,
+    pub(crate) database: String,
+    pub(crate) table: String,
+    pub(crate) columns: Vec<ColumnDef>,
+    pub(crate) group_key_names: Vec<String>,
+    pub(crate) aggregate_state_names: Vec<String>,
+}
+
+impl IcebergMvTargetStateScan {
+    pub(crate) fn fqn(&self) -> String {
+        format!("{}.{}.{}", self.catalog, self.database, self.table)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct IcebergDataFileInfo {
     pub path: String,
@@ -258,6 +280,13 @@ pub enum ScanSource {
         table: IcebergTableInfo,
         snapshot_id: i64,
     },
+    /// IMV target-state scan placeholder. Produced by the analyzer when
+    /// constructing an IMV refresh plan that reads the MV's own target state.
+    /// This variant carries only metadata-level information (catalog identity,
+    /// columns, and the aggregate/join logical contract) and has no codegen
+    /// or runtime behavior in this task. Future tasks will implement the
+    /// optimizer rewrite and execution path.
+    IcebergMvTargetState(IcebergMvTargetStateScan),
 }
 
 #[derive(Clone, Debug)]
@@ -357,5 +386,48 @@ mod tests {
         assert_eq!(iceberg.location, "file:///tmp/test_table");
         assert_eq!(iceberg.schema.fields[0].field_id, 10);
         assert_eq!(iceberg.schema.fields[0].children[0].field_id, 11);
+    }
+}
+
+#[cfg(test)]
+mod imv_target_state_tests {
+    use super::*;
+
+    fn sample_columns() -> Vec<ColumnDef> {
+        vec![
+            ColumnDef {
+                name: "region".to_string(),
+                data_type: arrow::datatypes::DataType::Utf8,
+                nullable: true,
+                write_default: None,
+                logical_type: None,
+            },
+            ColumnDef {
+                name: "c".to_string(),
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: true,
+                write_default: None,
+                logical_type: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn iceberg_mv_target_state_scan_source_carries_logical_contract() {
+        let source = ScanSource::IcebergMvTargetState(IcebergMvTargetStateScan {
+            catalog: "ice".to_string(),
+            database: "ns".to_string(),
+            table: "mv_sales".to_string(),
+            columns: sample_columns(),
+            group_key_names: vec!["region".to_string()],
+            aggregate_state_names: vec!["c".to_string()],
+        });
+
+        let ScanSource::IcebergMvTargetState(scan) = source else {
+            panic!("expected target-state scan source");
+        };
+        assert_eq!(scan.fqn(), "ice.ns.mv_sales");
+        assert_eq!(scan.group_key_names, vec!["region"]);
+        assert_eq!(scan.aggregate_state_names, vec!["c"]);
     }
 }

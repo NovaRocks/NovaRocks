@@ -639,6 +639,12 @@ pub(crate) fn build_exec_params_multi(
                         table.catalog, table.namespace, table.table, snapshot_id
                     ));
                 }
+                ScanSource::IcebergMvTargetState(scan) => {
+                    return Err(format!(
+                        "IMV target-state scan {} reached scan-range construction without codegen implementation",
+                        scan.fqn()
+                    ));
+                }
                 ScanSource::StarRocks { .. } => unreachable!(
                     "StarRocks scan source is handled by the planned-connector branch above"
                 ),

@@ -105,9 +105,11 @@ fn estimate_size(plan: &LogicalPlan) -> u64 {
                 // change file list is resolved at lower_plan time. Treat
                 // them as small for join-reorder purposes; IVM refresh
                 // plans usually do not involve multi-table joins anyway.
-                // IMV pinned-version placeholders are likewise refresh-only
-                // and carry no plan-time stats.
-                ScanSource::IcebergDeltaTable { .. } | ScanSource::IcebergVersionTable { .. } => 1,
+                // IMV pinned-version placeholders and target-state scans
+                // are likewise refresh-only and carry no plan-time stats.
+                ScanSource::IcebergDeltaTable { .. }
+                | ScanSource::IcebergVersionTable { .. }
+                | ScanSource::IcebergMvTargetState { .. } => 1,
                 // StarRocks tables don't carry per-file size on
                 // `TableDef.source`; tablet/version info lives on
                 // `PhysicalTableLayout` separately, and the proper row-
