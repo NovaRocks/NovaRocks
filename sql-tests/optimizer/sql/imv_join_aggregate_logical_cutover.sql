@@ -74,7 +74,7 @@ INSERT INTO imv_jagg_cut_${uuid0}.ns_${uuid0}.fact VALUES
 -- @explain_contains=IcebergVersionTable
 -- @explain_contains=UNION
 -- @explain_contains=sum_state_signed
-REFRESH MATERIALIZED VIEW join_agg_mv_${uuid0};
+EXPLAIN REFRESH MATERIALIZED VIEW join_agg_mv_${uuid0};
 
 -- query 5
 -- @skip_result_check=true
