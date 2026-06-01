@@ -425,6 +425,164 @@ fn plan_body_scoped(
     }
 }
 
+pub(crate) fn plan_output_columns(plan: &LogicalPlan) -> Result<Vec<OutputColumn>, String> {
+    match plan {
+        LogicalPlan::Scan(node) => Ok(node.columns.clone()),
+        LogicalPlan::Filter(node) => plan_output_columns(&node.input),
+        LogicalPlan::Project(node) => Ok(node
+            .items
+            .iter()
+            .map(|item| OutputColumn {
+                column_id: item.output_column_id,
+                name: item.output_name.clone(),
+                data_type: item.expr.data_type.clone(),
+                nullable: item.expr.nullable,
+                is_internal: false,
+            })
+            .collect()),
+        LogicalPlan::Aggregate(node) => Ok(node.output_columns.clone()),
+        LogicalPlan::Join(node) => {
+            let left = plan_output_columns(&node.left)?;
+            let right = plan_output_columns(&node.right)?;
+            Ok(join_output_columns(node.join_type, left, right))
+        }
+        LogicalPlan::Sort(node) => plan_output_columns(&node.input),
+        LogicalPlan::Limit(node) => plan_output_columns(&node.input),
+        LogicalPlan::Union(node) => Ok(node.output_columns.clone()),
+        LogicalPlan::Intersect(node) => Ok(node.output_columns.clone()),
+        LogicalPlan::Except(node) => Ok(node.output_columns.clone()),
+        LogicalPlan::Values(node) => Ok(node.columns.clone()),
+        LogicalPlan::GenerateSeries(node) => Ok(vec![OutputColumn {
+            column_id: ColumnId::UNSET,
+            name: node.column_name.clone(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        }]),
+        LogicalPlan::TableFunction(node) => {
+            let mut columns = plan_output_columns(&node.input)?;
+            columns.extend(node.output_columns.clone());
+            Ok(columns)
+        }
+        LogicalPlan::Window(node) => Ok(node.output_columns.clone()),
+        LogicalPlan::SubqueryAlias(node) => Ok(node.output_columns.clone()),
+        LogicalPlan::Repeat(node) => plan_output_columns(&node.input),
+        LogicalPlan::CTEAnchor(node) => plan_output_columns(&node.consumer),
+        LogicalPlan::CTEProduce(node) => Ok(node.output_columns.clone()),
+        LogicalPlan::CTEConsume(node) => Ok(node.output_columns.clone()),
+        LogicalPlan::Decode(node) => Ok(node.output_columns.clone()),
+        LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
+            Err("imv marker leaked into non-IMV planner output adaptation".to_string())
+        }
+    }
+}
+
+pub(crate) fn adapt_plan_output(
+    input: LogicalPlan,
+    target_output_columns: &[OutputColumn],
+) -> Result<LogicalPlan, String> {
+    let source_output_columns = plan_output_columns(&input)?;
+    if source_output_columns.len() != target_output_columns.len() {
+        return Err(format!(
+            "output column count mismatch while adapting subquery/CTE output: child has {}, target has {}",
+            source_output_columns.len(),
+            target_output_columns.len()
+        ));
+    }
+
+    if source_output_columns
+        .iter()
+        .zip(target_output_columns.iter())
+        .all(|(source, target)| output_column_metadata_equal(source, target))
+    {
+        return Ok(input);
+    }
+
+    let mut items = Vec::with_capacity(target_output_columns.len());
+    for (source, target) in source_output_columns
+        .iter()
+        .zip(target_output_columns.iter())
+    {
+        if source.data_type != target.data_type {
+            return Err(format!(
+                "output type mismatch while adapting subquery/CTE column '{}': child={:?}, target={:?}",
+                target.name, source.data_type, target.data_type
+            ));
+        }
+        if source.nullable != target.nullable {
+            return Err(format!(
+                "output nullability mismatch while adapting subquery/CTE column '{}': child={}, target={}",
+                target.name, source.nullable, target.nullable
+            ));
+        }
+        items.push(ProjectItem {
+            expr: TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: source.column_id,
+                    qualifier: None,
+                    column: source.name.clone(),
+                },
+                data_type: source.data_type.clone(),
+                nullable: source.nullable,
+            },
+            output_name: target.name.clone(),
+            output_column_id: target.column_id,
+        });
+    }
+
+    Ok(LogicalPlan::Project(ProjectNode {
+        input: Box::new(input),
+        items,
+        required_output_columns: None,
+    }))
+}
+
+fn output_column_metadata_equal(left: &OutputColumn, right: &OutputColumn) -> bool {
+    left.column_id == right.column_id
+        && left.name == right.name
+        && left.data_type == right.data_type
+        && left.nullable == right.nullable
+        && left.is_internal == right.is_internal
+}
+
+fn join_output_columns(
+    join_type: JoinKind,
+    left: Vec<OutputColumn>,
+    right: Vec<OutputColumn>,
+) -> Vec<OutputColumn> {
+    match join_type {
+        JoinKind::LeftSemi | JoinKind::LeftAnti | JoinKind::NullAwareLeftAnti => left,
+        JoinKind::RightSemi | JoinKind::RightAnti => right,
+        JoinKind::LeftOuter => {
+            let mut out = left;
+            out.extend(make_nullable(right));
+            out
+        }
+        JoinKind::RightOuter => {
+            let mut out = make_nullable(left);
+            out.extend(right);
+            out
+        }
+        JoinKind::FullOuter => {
+            let mut out = make_nullable(left);
+            out.extend(make_nullable(right));
+            out
+        }
+        JoinKind::Inner | JoinKind::Cross => {
+            let mut out = left;
+            out.extend(right);
+            out
+        }
+    }
+}
+
+fn make_nullable(mut columns: Vec<OutputColumn>) -> Vec<OutputColumn> {
+    for column in &mut columns {
+        column.nullable = true;
+    }
+    columns
+}
+
 // ---------------------------------------------------------------------------
 // SELECT planning
 // ---------------------------------------------------------------------------
@@ -2318,6 +2476,95 @@ mod tests {
             LogicalPlan::SubqueryAlias(node) => Some(&node.input),
             _ => None,
         }
+    }
+
+    #[test]
+    fn adapt_plan_output_passthrough_when_outputs_match() {
+        let source_id = ColumnId::new_for_test(10);
+        let input = LogicalPlan::Values(ValuesNode {
+            rows: vec![],
+            columns: vec![OutputColumn {
+                column_id: source_id,
+                name: "k".to_string(),
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: false,
+                is_internal: false,
+            }],
+            required_output_columns: None,
+        });
+        let target = vec![OutputColumn {
+            column_id: source_id,
+            name: "k".to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        }];
+
+        let adapted = adapt_plan_output(input, &target).expect("adapter should succeed");
+        assert!(matches!(adapted, LogicalPlan::Values(_)));
+    }
+
+    #[test]
+    fn adapt_plan_output_renames_and_rebinds_with_project() {
+        let source_id = ColumnId::new_for_test(10);
+        let target_id = ColumnId::new_for_test(20);
+        let input = LogicalPlan::Values(ValuesNode {
+            rows: vec![],
+            columns: vec![OutputColumn {
+                column_id: source_id,
+                name: "k".to_string(),
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: false,
+                is_internal: false,
+            }],
+            required_output_columns: None,
+        });
+        let target = vec![OutputColumn {
+            column_id: target_id,
+            name: "alias_k".to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        }];
+
+        let adapted = adapt_plan_output(input, &target).expect("adapter should succeed");
+        let LogicalPlan::Project(project) = adapted else {
+            panic!("expected Project adapter");
+        };
+        assert_eq!(project.items.len(), 1);
+        assert_eq!(project.items[0].output_name, "alias_k");
+        assert_eq!(project.items[0].output_column_id, target_id);
+        let ExprKind::ColumnRef {
+            column_id, column, ..
+        } = &project.items[0].expr.kind
+        else {
+            panic!("expected adapter item to read child column");
+        };
+        assert_eq!(*column_id, source_id);
+        assert_eq!(column, "k");
+    }
+
+    #[test]
+    fn adapt_plan_output_rejects_shape_mismatch() {
+        let input = LogicalPlan::Values(ValuesNode {
+            rows: vec![],
+            columns: vec![],
+            required_output_columns: None,
+        });
+        let target = vec![OutputColumn {
+            column_id: ColumnId::new_for_test(20),
+            name: "alias_k".to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        }];
+
+        let err =
+            adapt_plan_output(input, &target).expect_err("adapter should reject arity mismatch");
+        assert!(
+            err.contains("output column count mismatch"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
