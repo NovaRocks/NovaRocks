@@ -87,6 +87,8 @@ pub(crate) fn extract_best(
         children,
         stats: group_stats.clone(),
         output_columns: output_columns.clone(),
+        build_runtime_filters: Vec::new(),
+        probe_runtime_filters: Vec::new(),
     };
 
     // If the winner has an enforcer, wrap the inner node.
@@ -113,6 +115,8 @@ pub(crate) fn extract_best(
             children: vec![inner_node],
             stats: group_stats,
             output_columns,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
         });
     }
 

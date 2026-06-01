@@ -1185,6 +1185,8 @@ mod tests {
                 column_statistics: HashMap::new(),
             },
             output_columns: Vec::new(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
         };
 
         let lines = explain_physical_plan(&plan, ExplainLevel::Verbose);
@@ -1234,6 +1236,8 @@ mod tests {
                 column_statistics: HashMap::new(),
             },
             output_columns: Vec::new(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
         };
 
         let lines = explain_physical_plan(&plan, ExplainLevel::Costs);
@@ -1273,6 +1277,8 @@ mod tests {
                 column_statistics: HashMap::new(),
             },
             output_columns: Vec::new(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
         };
         let decode = PhysicalPlanNode {
             op: Operator::PhysicalDecode(PhysicalDecodeOp {
@@ -1288,6 +1294,8 @@ mod tests {
                 column_statistics: HashMap::new(),
             },
             output_columns: Vec::new(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
         };
 
         let lines = explain_physical_plan(&decode, ExplainLevel::Normal);
@@ -1310,6 +1318,8 @@ mod tests {
                 column_statistics: HashMap::new(),
             },
             output_columns: Vec::new(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
         };
 
         let mut lines = Vec::new();
@@ -1359,6 +1369,8 @@ mod tests {
                 column_statistics: HashMap::new(),
             },
             output_columns: Vec::new(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
         }
     }
 
@@ -1427,6 +1439,8 @@ mod tests {
                 column_statistics: HashMap::new(),
             },
             output_columns: Vec::new(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
         };
 
         let lines = explain_physical_plan(&plan, ExplainLevel::Verbose);

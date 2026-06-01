@@ -3770,6 +3770,8 @@ path = "{metadata_path}"
                 children: Vec::new(),
                 stats: stats(),
                 output_columns: Vec::new(),
+                build_runtime_filters: Vec::new(),
+                probe_runtime_filters: Vec::new(),
             }
         }
 
@@ -3781,6 +3783,8 @@ path = "{metadata_path}"
                 children: vec![values_node()],
                 stats: stats(),
                 output_columns: Vec::new(),
+                build_runtime_filters: Vec::new(),
+                probe_runtime_filters: Vec::new(),
             }
         }
 
@@ -3794,6 +3798,8 @@ path = "{metadata_path}"
             children: vec![distributed_values_node(), distributed_values_node()],
             stats: stats(),
             output_columns: Vec::new(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
         };
 
         let collapsed = super::collapse_distribution_enforcers_for_single_fragment(plan);

@@ -14,6 +14,7 @@ pub(crate) mod physical_plan;
 pub(crate) mod property;
 pub(crate) mod rewrite;
 pub(crate) mod rule;
+pub(crate) mod runtime_filter_pass;
 pub(crate) mod runtime_filter_planner;
 pub(crate) mod search;
 pub(crate) mod statistics;

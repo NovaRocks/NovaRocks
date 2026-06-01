@@ -4615,6 +4615,8 @@ mod tests {
             children: vec![],
             stats: stats(),
             output_columns: output_columns(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
         }
     }
 
@@ -4646,6 +4648,8 @@ mod tests {
             children: vec![],
             stats: stats(),
             output_columns: output_columns(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
         }
     }
 
@@ -4678,6 +4682,8 @@ mod tests {
             children: vec![],
             stats: stats(),
             output_columns: output_columns(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
         }
     }
 
@@ -4713,6 +4719,8 @@ mod tests {
             children: vec![],
             stats: stats(),
             output_columns: output_columns(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
         }
     }
 
@@ -4748,6 +4756,8 @@ mod tests {
             children: vec![],
             stats: stats(),
             output_columns: output_columns(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
         }
     }
 
@@ -4782,6 +4792,8 @@ mod tests {
             children: vec![],
             stats: stats(),
             output_columns: output_columns(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
         }
     }
 
@@ -4818,6 +4830,8 @@ mod tests {
             children: vec![],
             stats: stats(),
             output_columns: output_columns(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
         }
     }
 
@@ -4991,6 +5005,8 @@ mod tests {
             children: vec![iceberg_scan_plan(), starrocks_scan_plan()],
             stats: stats(),
             output_columns: output_columns(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
         }
     }
 
@@ -5013,9 +5029,13 @@ mod tests {
                 children: vec![scan_plan(file.path().to_path_buf())],
                 stats: stats(),
                 output_columns: output_columns(),
+                build_runtime_filters: Vec::new(),
+                probe_runtime_filters: Vec::new(),
             }],
             stats: stats(),
             output_columns: output_columns(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
         };
 
         let build =
@@ -5088,9 +5108,13 @@ mod tests {
                 children: vec![scan_plan(file.path().to_path_buf())],
                 stats: stats(),
                 output_columns: output_columns(),
+                build_runtime_filters: Vec::new(),
+                probe_runtime_filters: Vec::new(),
             }],
             stats: stats(),
             output_columns: output_columns(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
         };
 
         let build =
@@ -5139,12 +5163,18 @@ mod tests {
                     children: vec![scan_plan(file.path().to_path_buf())],
                     stats: stats(),
                     output_columns: output_columns(),
+                    build_runtime_filters: Vec::new(),
+                    probe_runtime_filters: Vec::new(),
                 }],
                 stats: stats(),
                 output_columns: output_columns(),
+                build_runtime_filters: Vec::new(),
+                probe_runtime_filters: Vec::new(),
             }],
             stats: stats(),
             output_columns: output_columns(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
         };
 
         let build =
@@ -5185,6 +5215,8 @@ mod tests {
             children: vec![scan],
             stats: stats(),
             output_columns: output_columns(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
         };
 
         let build =
@@ -5214,6 +5246,8 @@ mod tests {
             children: vec![scan_plan(file.path().to_path_buf())],
             stats: stats(),
             output_columns: output_columns(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
         };
 
         let result =
@@ -5232,6 +5266,8 @@ mod tests {
             children: vec![scan_plan(file.path().to_path_buf())],
             stats: stats(),
             output_columns: output_columns(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
         };
 
         let build =
@@ -5263,6 +5299,8 @@ mod tests {
                 nullable: false,
                 is_internal: false,
             }],
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
         };
 
         let build = PlanFragmentBuilder::build(
@@ -5676,6 +5714,8 @@ mod tests {
                 nullable: false,
                 is_internal: false,
             }],
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
         };
 
         let decode_plan = PhysicalPlanNode {
@@ -5701,6 +5741,8 @@ mod tests {
                 nullable: false,
                 is_internal: false,
             }],
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
         };
 
         let registry = mock_starrocks_registry(&layout);
@@ -5849,6 +5891,8 @@ mod tests {
                     is_internal: false,
                 },
             ],
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
         };
 
         let registry = mock_starrocks_registry(&layout);
@@ -6054,6 +6098,8 @@ mod tests {
                 nullable: false,
                 is_internal: false,
             }],
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
         };
 
         let registry = mock_starrocks_registry(&layout);
@@ -6196,6 +6242,8 @@ mod tests {
                 nullable: false,
                 is_internal: false,
             }],
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
         };
 
         // Use an iceberg-only catalog (returns None for physical_layout) so
