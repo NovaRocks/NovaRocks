@@ -109,6 +109,30 @@ fn rf_pipeline_dop() -> i32 {
         .unwrap_or(4) as i32
 }
 
+/// Remap a runtime filter's `expr_order` from the join's PRE-demote
+/// `op.eq_conditions` index space to the POST-demote `eq_join_conjuncts`
+/// index space that BE lowering indexes (`src/lower/node/hash_join.rs`).
+///
+/// `surviving_eq_origin[j]` is the original `op.eq_conditions` index of the
+/// `j`-th surviving (non-demoted) `eq_join_conjuncts` entry — built in
+/// `visit_hash_join` as eq conditions are compiled and kept. Demoted
+/// conditions never get an entry, so the vec is the post-demote conjunct list
+/// keyed by its source index.
+///
+/// Returns:
+/// - `Some(j)` when the RF's original conjunct survived demotion, where `j`
+///   is its post-demote index.
+/// - `None` when the RF's conjunct was demoted to `other_join_conjuncts` (it
+///   is no longer an equi-join key at execution) — the caller MUST drop the RF.
+fn remap_rf_expr_order(
+    surviving_eq_origin: &[usize],
+    pre_demote_expr_order: usize,
+) -> Option<usize> {
+    surviving_eq_origin
+        .iter()
+        .position(|&origin| origin == pre_demote_expr_order)
+}
+
 /// Map a join `JoinDistribution` to the thrift RF
 /// `(build_join_mode, local_layout, global_layout)` triple. Copied verbatim
 /// from the v1 post-pass so the wire encoding is identical.
@@ -1376,7 +1400,13 @@ impl<'a> PlanFragmentBuilder<'a> {
         // demote only when neither compiles successfully.
         let mut eq_join_conjuncts = Vec::new();
         let mut demoted_eq_exprs: Vec<crate::sql::analysis::TypedExpr> = Vec::new();
-        for eq in &op.eq_conditions {
+        // Parallel to `eq_join_conjuncts`: `surviving_eq_origin[j]` is the
+        // original `op.eq_conditions` index of the j-th surviving conjunct.
+        // Demoted conditions get no entry, so this lets runtime-filter lowering
+        // remap the physical pass's pre-demote `expr_order` onto the post-demote
+        // conjunct index that BE lowering uses. See `remap_rf_expr_order`.
+        let mut surviving_eq_origin: Vec<usize> = Vec::new();
+        for (eq_index, eq) in op.eq_conditions.iter().enumerate() {
             let expr_a = &eq.left;
             let expr_b = &eq.right;
             // Try natural order: expr_a on left, expr_b on right.
@@ -1413,6 +1443,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                         crate::opcodes::TExprOpcode::EQ
                     }),
                 });
+                surviving_eq_origin.push(eq_index);
             } else {
                 // Both sides belong to the same child — demote to other_condition
                 // compiled with a merged scope.
@@ -1460,8 +1491,11 @@ impl<'a> PlanFragmentBuilder<'a> {
         // attached to this join into thrift `TRuntimeFilterDescription`s and
         // patch them onto the join node. Compiled here while `right.scope`
         // (the build side) is still available — it is moved into the merged
-        // output scope further below.
-        let rf_descs = self.build_rf_descriptors(node, join_node_id, &right.scope)?;
+        // output scope further below. `surviving_eq_origin` remaps each RF's
+        // pre-demote `expr_order` onto the post-demote `eq_join_conjuncts`
+        // index that BE lowering indexes.
+        let rf_descs =
+            self.build_rf_descriptors(node, join_node_id, &right.scope, &surviving_eq_origin)?;
         if !rf_descs.is_empty()
             && let Some(hj) = join_plan_node.hash_join_node.as_mut()
         {
@@ -1544,11 +1578,21 @@ impl<'a> PlanFragmentBuilder<'a> {
     /// from `rf_probe_targets`, populated while visiting the probe descendants
     /// before this join. A descriptor with no recorded probe target is a
     /// build-only RF (empty `plan_node_id_to_target_expr`).
+    ///
+    /// `surviving_eq_origin` is the parallel vec from `visit_hash_join` that
+    /// maps each surviving `eq_join_conjuncts` entry back to its source
+    /// `op.eq_conditions` index. The physical pass records `rf.expr_order` in
+    /// the PRE-demote `op.eq_conditions` space, but BE lowering indexes the
+    /// POST-demote `eq_join_conjuncts` (and the build/probe key + null-safe
+    /// vectors derived from it). We therefore remap every descriptor's
+    /// `expr_order` through `surviving_eq_origin` and DROP any RF whose source
+    /// conjunct was demoted to `other_join_conjuncts` (no longer an equi-key).
     fn build_rf_descriptors(
         &mut self,
         node: &PhysicalPlanNode,
         join_node_id: i32,
         build_scope: &ExprScope,
+        surviving_eq_origin: &[usize],
     ) -> Result<Vec<crate::runtime_filter::TRuntimeFilterDescription>, String> {
         use crate::runtime_filter;
 
@@ -1563,6 +1607,25 @@ impl<'a> PlanFragmentBuilder<'a> {
 
         for rf in &node.build_runtime_filters {
             let filter_id = rf.filter_id;
+
+            // Remap the physical pass's pre-demote `expr_order` onto the
+            // post-demote `eq_join_conjuncts` index that BE lowering indexes.
+            // If the source conjunct was demoted to `other_join_conjuncts`,
+            // it is no longer an equi-join key at execution — drop the RF
+            // entirely rather than emit a descriptor BE cannot align.
+            let Some(post_demote_expr_order) =
+                remap_rf_expr_order(surviving_eq_origin, rf.expr_order)
+            else {
+                continue;
+            };
+            // Defensive: never emit a descriptor whose `expr_order` is out of
+            // range for the join's `eq_join_conjuncts` (BE would Err on it).
+            // `remap_rf_expr_order` returns a position within
+            // `surviving_eq_origin`, whose length equals `eq_join_conjuncts`,
+            // so this can only trip on a future invariant break.
+            if post_demote_expr_order >= surviving_eq_origin.len() {
+                continue;
+            }
 
             // The build key MUST be the equi-join side that binds the build
             // (right) child's scope. The physical pass labels build/probe by
@@ -1624,7 +1687,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             let desc = runtime_filter::TRuntimeFilterDescription::new(
                 filter_id,                                              // filter_id
                 build_texpr,                                            // build_expr
-                rf.expr_order as i32,                                   // expr_order
+                post_demote_expr_order as i32,                          // expr_order
                 target_map,                                 // plan_node_id_to_target_expr
                 has_remote_targets,                         // has_remote_targets
                 None::<i64>,                                // bloom_filter_size
@@ -4274,6 +4337,60 @@ mod tests {
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::statistics::Statistics;
     use crate::sql::planner::plan::WindowExpr;
+
+    /// OQ-5 B1: `remap_rf_expr_order` must translate a runtime filter's
+    /// pre-demote `op.eq_conditions` index into the post-demote
+    /// `eq_join_conjuncts` index that BE lowering uses, and drop (return
+    /// `None`) any RF whose source conjunct was demoted to
+    /// `other_join_conjuncts`.
+    #[test]
+    fn rf_expr_order_remap_handles_demote() {
+        // No demotion: surviving conjuncts cover every source index in order,
+        // so each pre-demote index maps to itself.
+        let identity = [0usize, 1, 2];
+        assert_eq!(remap_rf_expr_order(&identity, 0), Some(0));
+        assert_eq!(remap_rf_expr_order(&identity, 1), Some(1));
+        assert_eq!(remap_rf_expr_order(&identity, 2), Some(2));
+
+        // Earlier conjunct (source index 0) demoted: surviving conjuncts are
+        // source indices [1, 2]. An RF on the demoted index 0 must be dropped;
+        // indices 1 and 2 shift down to post-demote positions 0 and 1.
+        let first_demoted = [1usize, 2];
+        assert_eq!(
+            remap_rf_expr_order(&first_demoted, 0),
+            None,
+            "RF on a demoted conjunct must be dropped"
+        );
+        assert_eq!(remap_rf_expr_order(&first_demoted, 1), Some(0));
+        assert_eq!(remap_rf_expr_order(&first_demoted, 2), Some(1));
+
+        // Middle conjunct (source index 1) demoted: surviving = [0, 2]. The
+        // surviving RF on source index 2 lands at post-demote position 1 —
+        // exactly the index BE uses into build_keys/probe_keys/eq_null_safe.
+        let middle_demoted = [0usize, 2];
+        assert_eq!(remap_rf_expr_order(&middle_demoted, 0), Some(0));
+        assert_eq!(remap_rf_expr_order(&middle_demoted, 1), None);
+        assert_eq!(remap_rf_expr_order(&middle_demoted, 2), Some(1));
+
+        // Every remapped index is in range for the post-demote conjunct list
+        // (whose length equals `surviving_eq_origin.len()`), which is the
+        // invariant the defensive guard in `build_rf_descriptors` relies on.
+        for origin in [&identity[..], &first_demoted[..], &middle_demoted[..]] {
+            for src in 0..3usize {
+                if let Some(j) = remap_rf_expr_order(origin, src) {
+                    assert!(
+                        j < origin.len(),
+                        "post-demote index {j} out of range for {origin:?}"
+                    );
+                }
+            }
+        }
+
+        // An out-of-range source index (no matching surviving conjunct) is
+        // dropped rather than mis-mapped.
+        assert_eq!(remap_rf_expr_order(&identity, 7), None);
+        assert_eq!(remap_rf_expr_order(&[], 0), None);
+    }
 
     fn test_iceberg_table_info_with_schema(fields: Vec<IcebergSchemaFieldDef>) -> IcebergTableInfo {
         IcebergTableInfo {
