@@ -4898,6 +4898,49 @@ enable_path_style_access = true
         assert_eq!(result.row_count(), 1);
     }
 
+    /// OQ-5 Task 6: codegen must lower the runtime-filter annotations the
+    /// physical-tree pass attaches to a hash join into thrift
+    /// `TRuntimeFilterDescription`s on the join node, AND assemble a
+    /// `RuntimeFilterPlanResult`. Exercises the full standalone pipeline
+    /// (analyze -> plan -> optimize[annotate] -> codegen) over the test
+    /// catalog's `tbl(id int, name varchar)`, self-joined on `id`.
+    #[test]
+    fn codegen_emits_build_runtime_filters_from_annotation() {
+        let build =
+            build_fragments_for_query("SELECT count(*) FROM tbl a JOIN tbl b ON a.id = b.id");
+        let has_rf = build.fragment_results.iter().any(|fr| {
+            fr.plan.nodes.iter().any(|n| {
+                n.hash_join_node
+                    .as_ref()
+                    .and_then(|hj| hj.build_runtime_filters.as_ref())
+                    .map(|v| !v.is_empty())
+                    .unwrap_or(false)
+            })
+        });
+        assert!(
+            has_rf,
+            "expected a hash join thrift node with build_runtime_filters"
+        );
+        // The coordinator-facing RF plan must be assembled (all_filters +
+        // build-side mapping populated; probe placed onto the scan target).
+        let rf_plan = build
+            .rf_plan
+            .as_ref()
+            .expect("rf_plan should be Some when a join emits filters");
+        assert!(
+            !rf_plan.all_filters.is_empty(),
+            "all_filters must carry the lowered descriptor"
+        );
+        assert!(
+            rf_plan.build_side_filters.values().any(|v| !v.is_empty()),
+            "build_side_filters must record the join fragment"
+        );
+        assert!(
+            rf_plan.probe_side_filters.values().any(|v| !v.is_empty()),
+            "probe_side_filters must record the probe target"
+        );
+    }
+
     #[test]
     fn embedded_query_builder_splits_non_cte_join_into_multiple_fragments() {
         let build = build_fragments_for_query(

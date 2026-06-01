@@ -23,10 +23,10 @@ use crate::runtime::exec_params::build_exec_plan_fragment_params;
 use crate::runtime_filter;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::codegen::FragmentId;
+use crate::sql::codegen::RuntimeFilterPlanResult;
 use crate::sql::codegen::{
     FragmentBuildResult, FragmentEdge, FragmentEdgeKind, MultiFragmentBuildResult,
 };
-use crate::sql::optimizer::runtime_filter_planner::RuntimeFilterPlanResult;
 use crate::types;
 
 use crate::runtime::query_result::{QueryResult, QueryResultColumn};

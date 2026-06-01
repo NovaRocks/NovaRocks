@@ -86,6 +86,60 @@ pub(crate) struct ScanTupleOwner {
     pub fragment_id: FragmentId,
 }
 
+/// Probe-side target recorded while visiting a node that carries a
+/// `RuntimeFilterProbe` annotation. The build-side hash join (visited AFTER
+/// its probe descendants) looks this up by `filter_id` to wire the RF's
+/// `plan_node_id_to_target_expr` and the probe-side prober params.
+#[derive(Clone, Debug)]
+struct RfProbeTarget {
+    /// Thrift node id of the node that consumes the probe (scan or the
+    /// root thrift node of an intermediate operator's subtree).
+    thrift_node_id: i32,
+    /// Probe key expression compiled against the target node's output scope.
+    probe_texpr: exprs::TExpr,
+    /// Fragment that owns the probe target node.
+    fragment_id: FragmentId,
+}
+
+/// Standalone-mode pipeline DOP used for the RF layout's
+/// `num_drivers_per_instance`. Mirrors the historical post-pass computation.
+fn rf_pipeline_dop() -> i32 {
+    std::thread::available_parallelism()
+        .map(|p| p.get().min(4))
+        .unwrap_or(4) as i32
+}
+
+/// Map a join `JoinDistribution` to the thrift RF
+/// `(build_join_mode, local_layout, global_layout)` triple. Copied verbatim
+/// from the v1 post-pass so the wire encoding is identical.
+fn rf_layout_for_distribution(
+    distribution: &crate::sql::optimizer::operator::JoinDistribution,
+) -> (
+    crate::runtime_filter::TRuntimeFilterBuildJoinMode,
+    crate::runtime_filter::TRuntimeFilterLayoutMode,
+    crate::runtime_filter::TRuntimeFilterLayoutMode,
+) {
+    use crate::runtime_filter::{TRuntimeFilterBuildJoinMode, TRuntimeFilterLayoutMode};
+    use crate::sql::optimizer::operator::JoinDistribution;
+    match distribution {
+        JoinDistribution::Broadcast => (
+            TRuntimeFilterBuildJoinMode::BORADCAST,
+            TRuntimeFilterLayoutMode::SINGLETON,
+            TRuntimeFilterLayoutMode::SINGLETON,
+        ),
+        JoinDistribution::Shuffle => (
+            TRuntimeFilterBuildJoinMode::PARTITIONED,
+            TRuntimeFilterLayoutMode::SINGLETON,
+            TRuntimeFilterLayoutMode::GLOBAL_SHUFFLE_1L,
+        ),
+        JoinDistribution::Colocate => (
+            TRuntimeFilterBuildJoinMode::COLOCATE,
+            TRuntimeFilterLayoutMode::SINGLETON,
+            TRuntimeFilterLayoutMode::GLOBAL_BUCKET_1L,
+        ),
+    }
+}
+
 fn iceberg_table_info(
     source: &crate::sql::catalog::ScanSource,
 ) -> Option<&crate::sql::catalog::IcebergTableInfo> {
@@ -194,6 +248,18 @@ pub(crate) struct PlanFragmentBuilder<'a> {
     /// stays pinned to the scan's slot id and never reaches the slot id
     /// the parent fragment's Decode actually receives.
     slot_to_global_dict: HashMap<i32, crate::data::TGlobalDict>,
+    /// OQ-5 runtime-filter lowering: probe targets recorded as nodes carrying
+    /// `probe_runtime_filters` are visited. Keyed by `filter_id`; consumed by
+    /// `visit_hash_join` to wire each build descriptor to its probe node.
+    /// Probe descendants are always visited before the owning join (children
+    /// first), so the lookup is populated by the time the join needs it.
+    rf_probe_targets: HashMap<i32, RfProbeTarget>,
+    /// Accumulated `filter_id -> TRuntimeFilterDescription` across all joins.
+    rf_all_filters: HashMap<i32, crate::runtime_filter::TRuntimeFilterDescription>,
+    /// Accumulated build-side filter ids per fragment (the join's fragment).
+    rf_build_side_filters: HashMap<FragmentId, Vec<i32>>,
+    /// Accumulated probe-side `(filter_id, probe_target_node_id)` per fragment.
+    rf_probe_side_filters: HashMap<FragmentId, Vec<(i32, i32)>>,
 }
 
 impl<'a> PlanFragmentBuilder<'a> {
@@ -225,6 +291,10 @@ impl<'a> PlanFragmentBuilder<'a> {
             join_distributions: HashMap::new(),
             query_global_dicts_per_fragment: HashMap::new(),
             slot_to_global_dict: HashMap::new(),
+            rf_probe_targets: HashMap::new(),
+            rf_all_filters: HashMap::new(),
+            rf_build_side_filters: HashMap::new(),
+            rf_probe_side_filters: HashMap::new(),
         };
 
         // Elide a root-level Gather: on a single node the top-level gather
@@ -297,22 +367,18 @@ impl<'a> PlanFragmentBuilder<'a> {
         let mut fragment_results = builder.completed_fragments;
         fragment_results.push(root_fragment);
 
-        // Runtime filter planning pass: identify RF opportunities and patch
-        // join nodes with TRuntimeFilterDescription.
-        let pipeline_dop = std::thread::available_parallelism()
-            .map(|p| p.get().min(4))
-            .unwrap_or(4) as i32;
-        let rf_plan = crate::sql::optimizer::runtime_filter_planner::plan_runtime_filters(
-            &mut fragment_results,
-            &builder.scan_tuple_owners,
-            &builder.join_fragment_map,
-            &builder.join_distributions,
-            pipeline_dop,
-        );
-        let rf_plan = if rf_plan.all_filters.is_empty() {
+        // OQ-5: the runtime-filter descriptors were lowered during
+        // `visit_hash_join` (and already patched onto the join thrift nodes).
+        // Assemble the coordinator-facing result from the builder's
+        // accumulators. `None` when no join produced a filter.
+        let rf_plan = if builder.rf_all_filters.is_empty() {
             None
         } else {
-            Some(rf_plan)
+            Some(crate::sql::codegen::RuntimeFilterPlanResult {
+                all_filters: builder.rf_all_filters,
+                build_side_filters: builder.rf_build_side_filters,
+                probe_side_filters: builder.rf_probe_side_filters,
+            })
         };
 
         Ok(MultiFragmentBuildResult {
@@ -410,7 +476,7 @@ impl<'a> PlanFragmentBuilder<'a> {
     // -------------------------------------------------------------------
 
     fn visit(&mut self, node: &PhysicalPlanNode) -> Result<VisitResult, String> {
-        match &node.op {
+        let result = match &node.op {
             Operator::PhysicalScan(op) => self.visit_scan(op, node),
             Operator::PhysicalFilter(op) => self.visit_filter(op, node),
             Operator::PhysicalProject(op) => self.visit_project(op, node),
@@ -435,14 +501,65 @@ impl<'a> PlanFragmentBuilder<'a> {
             Operator::PhysicalExcept(op) => self.visit_except(op, node),
             Operator::PhysicalDecode(op) => self.visit_decode(op, node),
             // Logical operators should never appear in an extracted physical plan
-            other if other.is_logical() => Err(format!(
-                "unexpected logical operator in physical plan: {:?}",
-                other
-            )),
-            other => Err(format!(
-                "unhandled operator in fragment builder: {:?}",
-                other
-            )),
+            other if other.is_logical() => {
+                return Err(format!(
+                    "unexpected logical operator in physical plan: {:?}",
+                    other
+                ));
+            }
+            other => {
+                return Err(format!(
+                    "unhandled operator in fragment builder: {:?}",
+                    other
+                ));
+            }
+        }?;
+
+        // OQ-5: record any probe-side runtime filters that the
+        // physical-tree pass attached to THIS node. The probe target is the
+        // thrift node at the root of this subtree (the node's own thrift node;
+        // for pass-through visitors such as filter this is the underlying
+        // scan node). Probe targets are recorded before the owning hash join
+        // is visited because children are visited first.
+        self.record_probe_targets(node, &result);
+
+        Ok(result)
+    }
+
+    /// Compile each `probe_runtime_filters` entry on `node` against the
+    /// subtree's output scope and stash the resulting probe target so the
+    /// owning hash join can wire it. No-op when the node carries no probe
+    /// filters or produced no thrift node.
+    ///
+    /// A runtime filter is an optimization: if the probe expression cannot be
+    /// compiled against this node's scope (it should always succeed for a
+    /// probe the physical pass placed here by ColumnId, but we stay defensive),
+    /// we simply skip recording the target. The owning join then emits a
+    /// build-only descriptor rather than failing the whole query.
+    fn record_probe_targets(&mut self, node: &PhysicalPlanNode, result: &VisitResult) {
+        if node.probe_runtime_filters.is_empty() {
+            return;
+        }
+        let Some(target_node) = result.plan_nodes.first() else {
+            return;
+        };
+        let thrift_node_id = target_node.node_id;
+        let Ok(fragment_id) = self.current_fragment_id() else {
+            return;
+        };
+        for probe in &node.probe_runtime_filters {
+            let mut compiler = ExprCompiler::new(self.slot_allocator(), &result.scope);
+            let Ok(probe_texpr) = compiler.compile_typed(&probe.probe_expr) else {
+                continue;
+            };
+            self.rf_probe_targets.insert(
+                probe.filter_id,
+                RfProbeTarget {
+                    thrift_node_id,
+                    probe_texpr,
+                    fragment_id,
+                },
+            );
         }
     }
 
@@ -1330,7 +1447,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             }
         }
 
-        let join_plan_node = nodes::build_hash_join_node(
+        let mut join_plan_node = nodes::build_hash_join_node(
             join_node_id,
             &left.tuple_ids,
             &right.tuple_ids,
@@ -1338,6 +1455,18 @@ impl<'a> PlanFragmentBuilder<'a> {
             eq_join_conjuncts,
             other_join_conjuncts,
         );
+
+        // OQ-5: lower the runtime-filter annotations the physical-tree pass
+        // attached to this join into thrift `TRuntimeFilterDescription`s and
+        // patch them onto the join node. Compiled here while `right.scope`
+        // (the build side) is still available — it is moved into the merged
+        // output scope further below.
+        let rf_descs = self.build_rf_descriptors(node, join_node_id, &right.scope)?;
+        if !rf_descs.is_empty()
+            && let Some(hj) = join_plan_node.hash_join_node.as_mut()
+        {
+            hj.build_runtime_filters = Some(rf_descs);
+        }
 
         // Widen nullable flags on the join's null-producing side(s). Note: this
         // is the tuple-level widening needed by the descriptor table and the
@@ -1401,6 +1530,139 @@ impl<'a> PlanFragmentBuilder<'a> {
             cte_exchange_nodes,
             ordering: OrderingSpec::Any,
         })
+    }
+
+    // -------------------------------------------------------------------
+    // Runtime filter lowering (OQ-5)
+    // -------------------------------------------------------------------
+
+    /// Lower the build-side runtime-filter annotations on `node` into thrift
+    /// `TRuntimeFilterDescription`s and accumulate the coordinator-facing RF
+    /// maps. Each build key is compiled fresh against `build_scope` (the join's
+    /// right child scope) to avoid index drift with the eq-conjunct demote
+    /// dance. The probe target (node id + compiled probe expr) is looked up
+    /// from `rf_probe_targets`, populated while visiting the probe descendants
+    /// before this join. A descriptor with no recorded probe target is a
+    /// build-only RF (empty `plan_node_id_to_target_expr`).
+    fn build_rf_descriptors(
+        &mut self,
+        node: &PhysicalPlanNode,
+        join_node_id: i32,
+        build_scope: &ExprScope,
+    ) -> Result<Vec<crate::runtime_filter::TRuntimeFilterDescription>, String> {
+        use crate::runtime_filter;
+
+        if node.build_runtime_filters.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let pipeline_dop = rf_pipeline_dop();
+        let join_fragment = self.current_fragment_id()?;
+        let mut descs: Vec<runtime_filter::TRuntimeFilterDescription> =
+            Vec::with_capacity(node.build_runtime_filters.len());
+
+        for rf in &node.build_runtime_filters {
+            let filter_id = rf.filter_id;
+
+            // The build key MUST be the equi-join side that binds the build
+            // (right) child's scope. The physical pass labels build/probe by
+            // `eq.right`/`eq.left`, but join commutativity can swap children
+            // relative to that labeling (the same try-natural-then-swap
+            // ambiguity `visit_hash_join` resolves for `eq_join_conjuncts`).
+            // We therefore compile `build_expr` against the build scope and,
+            // on failure, fall back to `probe_expr` (the swapped orientation).
+            // Resolution is ColumnId-aware (see `ExprCompiler::compile_typed`),
+            // so this matches the same physical column the join key uses.
+            let build_texpr = match ExprCompiler::new(self.slot_allocator(), build_scope)
+                .compile_typed(&rf.build_expr)
+            {
+                Ok(t) => t,
+                Err(_) => ExprCompiler::new(self.slot_allocator(), build_scope)
+                    .compile_typed(&rf.probe_expr)
+                    .map_err(|e| {
+                        format!(
+                            "runtime filter {filter_id}: neither build nor probe key \
+                             binds the build child scope: {e}"
+                        )
+                    })?,
+            };
+
+            // Probe target recorded while visiting the probe descendants. When
+            // children were swapped relative to the eq labeling, the annotation
+            // pass pushed the probe expr down the wrong child (it could not bind
+            // by ColumnId), so no target was recorded — the descriptor is then
+            // build-only with an empty target map (matches StarRocks "no probe
+            // target").
+            let probe_target = self.rf_probe_targets.get(&filter_id).cloned();
+            let has_remote_targets = probe_target
+                .as_ref()
+                .map(|t| t.fragment_id != join_fragment)
+                .unwrap_or(false);
+
+            let (build_join_mode, local_layout, global_layout) =
+                rf_layout_for_distribution(&rf.distribution);
+
+            let layout = runtime_filter::TRuntimeFilterLayout::new(
+                filter_id,
+                local_layout,
+                global_layout,
+                false,            // pipeline_level_multi_partitioned
+                1_i32,            // num_instances
+                pipeline_dop,     // num_drivers_per_instance
+                None::<Vec<i32>>, // bucketseq_to_instance
+                None::<Vec<i32>>, // bucketseq_to_driverseq
+                None::<Vec<i32>>, // bucketseq_to_partition
+                None::<Vec<crate::partitions::TBucketProperty>>, // bucket_properties
+            );
+
+            // Probe targets: one entry per placed probe; empty for build-only.
+            let mut target_map = BTreeMap::new();
+            if let Some(target) = &probe_target {
+                target_map.insert(target.thrift_node_id, target.probe_texpr.clone());
+            }
+
+            let desc = runtime_filter::TRuntimeFilterDescription::new(
+                filter_id,                                              // filter_id
+                build_texpr,                                            // build_expr
+                rf.expr_order as i32,                                   // expr_order
+                target_map,                                 // plan_node_id_to_target_expr
+                has_remote_targets,                         // has_remote_targets
+                None::<i64>,                                // bloom_filter_size
+                None::<Vec<crate::types::TNetworkAddress>>, // runtime_filter_merge_nodes
+                build_join_mode,                            // build_join_mode
+                None::<crate::types::TUniqueId>,            // sender_finst_id
+                join_node_id,                               // build_plan_node_id
+                None::<Vec<crate::types::TUniqueId>>,       // broadcast_grf_senders
+                None::<Vec<runtime_filter::TRuntimeFilterDestination>>, // broadcast_grf_destinations
+                None::<Vec<i32>>,                                       // bucketseq_to_instance
+                None::<BTreeMap<i32, Vec<exprs::TExpr>>>, // plan_node_id_to_partition_by_exprs
+                runtime_filter::TRuntimeFilterBuildType::JOIN_FILTER, // filter_type
+                layout,                                   // layout
+                None::<bool>,                             // build_from_group_execution
+                None::<bool>,                             // is_broad_cast_join_in_skew
+                None::<i32>,                              // skew_shuffle_filter_id
+                None::<bool>,                             // is_asc
+                None::<bool>,                             // is_nulls_first
+                None::<i64>,                              // limit
+            );
+
+            descs.push(desc.clone());
+
+            // Accumulate coordinator-facing RF maps.
+            self.rf_all_filters.insert(filter_id, desc);
+            self.rf_build_side_filters
+                .entry(join_fragment)
+                .or_default()
+                .push(filter_id);
+            if let Some(target) = &probe_target {
+                self.rf_probe_side_filters
+                    .entry(target.fragment_id)
+                    .or_default()
+                    .push((filter_id, target.thrift_node_id));
+            }
+        }
+
+        Ok(descs)
     }
 
     // -------------------------------------------------------------------

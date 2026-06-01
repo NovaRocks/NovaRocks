@@ -11,19 +11,10 @@ use crate::plan_nodes;
 use crate::runtime_filter;
 use crate::sql::codegen::FragmentBuildResult;
 use crate::sql::codegen::FragmentId;
+use crate::sql::codegen::RuntimeFilterPlanResult;
 use crate::sql::optimizer::operator::JoinDistribution;
 
 use crate::sql::codegen::fragment_builder::ScanTupleOwner;
-
-/// Result of the runtime filter planning pass.
-pub(crate) struct RuntimeFilterPlanResult {
-    /// filter_id -> RF description.
-    pub all_filters: HashMap<i32, runtime_filter::TRuntimeFilterDescription>,
-    /// fragment_id -> build-side filter IDs in that fragment.
-    pub build_side_filters: HashMap<FragmentId, Vec<i32>>,
-    /// fragment_id -> (filter_id, scan_node_id) for probe-side targets.
-    pub probe_side_filters: HashMap<FragmentId, Vec<(i32, i32)>>,
-}
 
 /// Plan runtime filters for all fragments.
 ///

@@ -80,7 +80,23 @@ pub(crate) struct MultiFragmentBuildResult {
     /// Fragment-to-fragment data edges.
     pub edges: Vec<FragmentEdge>,
     /// Runtime filter planning result (populated for standalone mode).
-    pub rf_plan: Option<crate::sql::optimizer::runtime_filter_planner::RuntimeFilterPlanResult>,
+    pub rf_plan: Option<RuntimeFilterPlanResult>,
+}
+
+/// Result of lowering runtime-filter annotations to thrift.
+///
+/// Assembled by [`fragment_builder::PlanFragmentBuilder`] directly from the
+/// `RuntimeFilterDesc` / `RuntimeFilterProbe` annotations attached to the
+/// physical plan by `runtime_filter_pass`. Consumed by the execution
+/// coordinator (`setup_runtime_filter_params`).
+pub(crate) struct RuntimeFilterPlanResult {
+    /// filter_id -> RF description.
+    pub all_filters:
+        std::collections::HashMap<i32, crate::runtime_filter::TRuntimeFilterDescription>,
+    /// fragment_id -> build-side filter IDs in that fragment.
+    pub build_side_filters: std::collections::HashMap<FragmentId, Vec<i32>>,
+    /// fragment_id -> (filter_id, probe_target_node_id) for probe-side targets.
+    pub probe_side_filters: std::collections::HashMap<FragmentId, Vec<(i32, i32)>>,
 }
 
 /// Physical emission result for a single fragment.
