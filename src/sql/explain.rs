@@ -118,6 +118,13 @@ fn format_node(plan: &LogicalPlan, level: ExplainLevel, indent: usize, out: &mut
             {
                 out.push(format!("{pad}     columns: {}", cols.join(", ")));
             }
+            if matches!(
+                level,
+                ExplainLevel::Verbose | ExplainLevel::Costs | ExplainLevel::Analyze
+            ) && let Some(source) = logical_scan_source_label(&node.table.source)
+            {
+                out.push(format!("{pad}     source: {source}"));
+            }
             if !node.predicates.is_empty() {
                 let preds: Vec<String> = node.predicates.iter().map(format_expr).collect();
                 out.push(format!("{pad}     predicates: {}", preds.join(" AND ")));
@@ -327,6 +334,21 @@ fn format_node(plan: &LogicalPlan, level: ExplainLevel, indent: usize, out: &mut
         LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
         }
+    }
+}
+
+fn logical_scan_source_label(source: &ScanSource) -> Option<String> {
+    match source {
+        ScanSource::IcebergVersionTable { snapshot_id, .. } => {
+            Some(format!("IcebergVersionTable snapshot_id={snapshot_id}"))
+        }
+        ScanSource::IcebergMvTargetState(scan) => Some(format!(
+            "IcebergMvTargetState target={} keys=[{}] states=[{}]",
+            scan.fqn(),
+            scan.group_key_names.join(","),
+            scan.aggregate_state_names.join(",")
+        )),
+        _ => None,
     }
 }
 

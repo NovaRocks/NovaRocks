@@ -489,16 +489,20 @@ fn explain_contains_target_body(sql: &str) -> String {
     trimmed.to_string()
 }
 
-/// Cheap leading-keyword sniff: only SELECT or WITH bodies are valid
-/// EXPLAIN targets. (DDL and DML are explicitly rejected for
-/// @explain_contains.)
+/// Cheap leading-keyword sniff: SELECT/WITH and REFRESH MATERIALIZED VIEW
+/// bodies are valid EXPLAIN targets. Other DDL and DML are explicitly
+/// rejected for @explain_contains.
 fn is_select_or_with(body: &str) -> bool {
     let head = body
         .split_whitespace()
         .next()
         .unwrap_or("")
         .to_ascii_lowercase();
-    head == "select" || head == "with"
+    if head == "select" || head == "with" {
+        return true;
+    }
+    let lower = body.trim_start().to_ascii_lowercase();
+    lower.starts_with("refresh materialized view ")
 }
 
 /// Run the `@explain_contains` assertion for a step: issue `EXPLAIN VERBOSE`
@@ -2815,14 +2819,19 @@ enable_path_style_access = true
             crate::explain_contains_target_body("EXPLAIN SELECT 4"),
             "SELECT 4"
         );
+        assert_eq!(
+            crate::explain_contains_target_body("EXPLAIN REFRESH MATERIALIZED VIEW mv1"),
+            "REFRESH MATERIALIZED VIEW mv1"
+        );
     }
 
     #[test]
-    fn is_select_or_with_accepts_select_and_with() {
+    fn is_select_or_with_accepts_select_with_and_refresh() {
         assert!(crate::is_select_or_with("SELECT 1"));
         assert!(crate::is_select_or_with(
             "WITH cte AS (SELECT 1) SELECT * FROM cte"
         ));
+        assert!(crate::is_select_or_with("REFRESH MATERIALIZED VIEW mv1"));
         assert!(!crate::is_select_or_with("CREATE TABLE foo (a INT)"));
         assert!(!crate::is_select_or_with("INSERT INTO foo VALUES (1)"));
     }

@@ -668,6 +668,27 @@ impl StandaloneSession {
                 (normalized.clone(), None)
             };
 
+        if let Some(parsed) = parse_explain_refresh_materialized_view(&normalized) {
+            let (stmt, level, analyze) = parsed?;
+            if analyze {
+                return Err(
+                    "EXPLAIN ANALYZE REFRESH MATERIALIZED VIEW is not supported".to_string()
+                );
+            }
+            let lines =
+                crate::engine::mv::iceberg_refresh::explain_iceberg_mv_refresh_rewrite_plan(
+                    &self.inner,
+                    current_catalog,
+                    current_database,
+                    &stmt,
+                    level,
+                )?;
+            return Ok(StatementResult::Query(build_string_query_result(
+                "Explain String",
+                lines,
+            )?));
+        }
+
         let dialect = StarRocksDialect;
         let mut parser = sqlparser::parser::Parser::new(&dialect)
             .try_with_sql(&parse_sql)
@@ -3592,6 +3613,67 @@ fn split_explain_costs_sql(sql: &str) -> Option<(String, crate::sql::explain::Ex
     } else {
         None
     }
+}
+
+fn parse_explain_refresh_materialized_view(
+    sql: &str,
+) -> Option<
+    Result<
+        (
+            crate::sql::parser::ast::RefreshMaterializedViewStmt,
+            crate::sql::explain::ExplainLevel,
+            bool,
+        ),
+        String,
+    >,
+> {
+    let trimmed = sql.trim_start();
+    let prefixes = [
+        (
+            "EXPLAIN ANALYZE REFRESH ",
+            crate::sql::explain::ExplainLevel::Analyze,
+            true,
+        ),
+        (
+            "EXPLAIN VERBOSE REFRESH ",
+            crate::sql::explain::ExplainLevel::Verbose,
+            false,
+        ),
+        (
+            "EXPLAIN COSTS REFRESH ",
+            crate::sql::explain::ExplainLevel::Costs,
+            false,
+        ),
+        (
+            "EXPLAIN REFRESH ",
+            crate::sql::explain::ExplainLevel::Normal,
+            false,
+        ),
+    ];
+    for (prefix, level, analyze) in prefixes {
+        if trimmed
+            .as_bytes()
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
+        {
+            let body = format!("REFRESH {}", trimmed[prefix.len()..].trim_start());
+            let mut statements = match crate::sql::parser::parse_sql(&body) {
+                Ok(statements) => statements,
+                Err(e) => return Some(Err(e)),
+            };
+            let Some(statement) = statements.pop() else {
+                return Some(Err("EXPLAIN REFRESH parsed no statement".to_string()));
+            };
+            let crate::sql::parser::ast::Statement::RefreshMaterializedView(stmt) = statement
+            else {
+                return Some(Err(
+                    "EXPLAIN REFRESH only supports REFRESH MATERIALIZED VIEW".to_string(),
+                ));
+            };
+            return Some(Ok((stmt, level, analyze)));
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -7451,5 +7533,37 @@ enable_path_style_access = true
         let msg = result.err().expect("expected error");
         assert!(msg.contains("role=fe"), "must mention role=fe: {msg}");
         assert!(msg.contains('2'), "must include count: {msg}");
+    }
+
+    #[test]
+    fn parse_explain_refresh_materialized_view_supports_verbose_and_costs() {
+        let verbose = super::parse_explain_refresh_materialized_view(
+            "EXPLAIN VERBOSE REFRESH MATERIALIZED VIEW mv1",
+        )
+        .expect("recognized")
+        .expect("parsed");
+        assert_eq!(verbose.0.name.parts, vec!["mv1"]);
+        assert_eq!(verbose.1, crate::sql::explain::ExplainLevel::Verbose);
+        assert!(!verbose.2);
+
+        let costs = super::parse_explain_refresh_materialized_view(
+            "EXPLAIN COSTS REFRESH MATERIALIZED VIEW db.mv1",
+        )
+        .expect("recognized")
+        .expect("parsed");
+        assert_eq!(costs.0.name.parts, vec!["db", "mv1"]);
+        assert_eq!(costs.1, crate::sql::explain::ExplainLevel::Costs);
+        assert!(!costs.2);
+    }
+
+    #[test]
+    fn parse_explain_refresh_materialized_view_marks_analyze() {
+        let parsed = super::parse_explain_refresh_materialized_view(
+            "EXPLAIN ANALYZE REFRESH MATERIALIZED VIEW mv1",
+        )
+        .expect("recognized")
+        .expect("parsed");
+        assert_eq!(parsed.1, crate::sql::explain::ExplainLevel::Analyze);
+        assert!(parsed.2);
     }
 }

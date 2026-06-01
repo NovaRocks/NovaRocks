@@ -5943,7 +5943,38 @@ fn plan_canonical_select_for_imv(
             ))
         })?;
     let next_column_id = factory.peek_next_id();
-    Ok((plan, next_column_id))
+    Ok((normalize_imv_rewrite_root_project(plan), next_column_id))
+}
+
+fn normalize_imv_rewrite_root_project(
+    plan: crate::sql::planner::plan::LogicalPlan,
+) -> crate::sql::planner::plan::LogicalPlan {
+    let crate::sql::planner::plan::LogicalPlan::Project(mut project) = plan else {
+        return plan;
+    };
+    let mut aggregate = match *project.input {
+        crate::sql::planner::plan::LogicalPlan::Aggregate(aggregate) => aggregate,
+        other => {
+            project.input = Box::new(other);
+            return crate::sql::planner::plan::LogicalPlan::Project(project);
+        }
+    };
+    if project.items.len() != aggregate.output_columns.len() {
+        project.input = Box::new(crate::sql::planner::plan::LogicalPlan::Aggregate(aggregate));
+        return crate::sql::planner::plan::LogicalPlan::Project(project);
+    }
+    aggregate.output_columns = project
+        .items
+        .iter()
+        .map(|item| crate::sql::analysis::OutputColumn {
+            column_id: item.output_column_id,
+            name: item.output_name.clone(),
+            data_type: item.expr.data_type.clone(),
+            nullable: item.expr.nullable,
+            is_internal: false,
+        })
+        .collect();
+    crate::sql::planner::plan::LogicalPlan::Aggregate(aggregate)
 }
 
 /// Run the IMV optimizer pipeline against `ctx`, discarding the outcome.
@@ -5964,31 +5995,32 @@ fn plan_canonical_select_for_imv(
 /// select against the latest base schema fails by design even though
 /// the hand-built refresh path handles the rename correctly. PR-β
 /// inherits that swallow.
+fn run_imv_rewrite_for_refresh_explain(
+    state: &Arc<StandaloneState>,
+    ctx: &IcebergMvRefreshContext,
+) -> Result<crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteOutcome, String> {
+    let (plan, next_column_id) =
+        plan_canonical_select_for_imv(state, ctx).map_err(|e| e.message)?;
+    // Thread the active session's disable_optimizer_rules into IMV. When
+    // refresh runs outside a user session (e.g. background scheduler),
+    // the thread-local default is empty, so this is a safe no-op.
+    let disabled_rules = crate::sql::optimizer::options::current_session_optimizer_settings()
+        .disabled_rules
+        .clone();
+    crate::sql::optimizer::rewrite::imv::entrypoint::run_imv_rewrite(
+        crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteInput {
+            plan,
+            mv_ctx: Arc::clone(&ctx.rewrite),
+            disabled_rules,
+            deadline: None,
+            next_column_id,
+        },
+    )
+    .map_err(|e| format!("run_imv_rewrite: {e}"))
+}
+
 fn try_run_imv_rewrite_pipeline(state: &Arc<StandaloneState>, ctx: &IcebergMvRefreshContext) {
-    let result = (|| -> Result<
-        crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteOutcome,
-        String,
-    > {
-        let (plan, next_column_id) =
-            plan_canonical_select_for_imv(state, ctx).map_err(|e| e.message)?;
-        // Thread the active session's disable_optimizer_rules into IMV. When
-        // refresh runs outside a user session (e.g. background scheduler),
-        // the thread-local default is empty, so this is a safe no-op.
-        let disabled_rules =
-            crate::sql::optimizer::options::current_session_optimizer_settings()
-                .disabled_rules
-                .clone();
-        crate::sql::optimizer::rewrite::imv::entrypoint::run_imv_rewrite(
-            crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteInput {
-                plan,
-                mv_ctx: Arc::clone(&ctx.rewrite),
-                disabled_rules,
-                deadline: None,
-                next_column_id,
-            },
-        )
-        .map_err(|e| format!("run_imv_rewrite: {e}"))
-    })();
+    let result = run_imv_rewrite_for_refresh_explain(state, ctx);
 
     match result {
         Ok(outcome) => {
@@ -6011,6 +6043,79 @@ fn try_run_imv_rewrite_pipeline(state: &Arc<StandaloneState>, ctx: &IcebergMvRef
             );
         }
     }
+}
+
+pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    stmt: &RefreshMaterializedViewStmt,
+    level: crate::sql::explain::ExplainLevel,
+) -> Result<Vec<String>, String> {
+    if stmt.full {
+        return Err("EXPLAIN REFRESH MATERIALIZED VIEW FULL is not supported".to_string());
+    }
+
+    let target = resolve_refresh_target(current_catalog, current_database, &stmt.name)?;
+    let mv_definition = load_iceberg_mv_definition_by_target(state, &target)?;
+    let (target_entry, iceberg_catalog, target_loaded) = load_iceberg_mv_target(state, &target)?;
+    validate_target_snapshot(&target, &mv_definition, &target_loaded.table)?;
+
+    let base_refs = parse_iceberg_table_refs(&mv_definition.base_table_refs)?;
+    let canonical_select_query = canonicalize_iceberg_mv_select_query(
+        &parse_mv_select_query(&mv_definition.select_sql)?,
+        current_catalog,
+        current_database,
+    );
+    let shape = classify_incremental_mv_query(&canonical_select_query)?;
+    if aggregate_shape_for_layout(&shape).is_some() {
+        validate_aggregate_schema_contract_metadata(&target, &mv_definition)?;
+    }
+
+    let pin = crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin::capture(
+        state, &base_refs,
+    )?;
+    let mut explain_definition = mv_definition;
+    // EXPLAIN REFRESH is read-only and may be used before the first executed
+    // refresh. In that case there is no persisted previous snapshot yet; use
+    // the current pin as a zero-width explain-only window so the IMV rewrite
+    // plan can be inspected without running the refresh pipeline.
+    for base_ref in &base_refs {
+        let fqn = base_ref.fqn();
+        if !explain_definition.last_refresh_snapshots.contains_key(&fqn)
+            && let Some(snapshot_id) = pin.get(base_ref)
+        {
+            explain_definition
+                .last_refresh_snapshots
+                .insert(fqn.clone(), snapshot_id);
+        }
+        if !explain_definition
+            .last_refresh_table_uuids
+            .contains_key(&fqn)
+            && let Some(uuid) = pin.uuid(base_ref)
+        {
+            explain_definition
+                .last_refresh_table_uuids
+                .insert(fqn, uuid.to_string());
+        }
+    }
+    validate_refresh_pin_table_uuids(&explain_definition, &pin, &base_refs)?;
+
+    let ctx = IcebergMvRefreshContext::new(
+        target,
+        explain_definition.mv_id,
+        current_catalog,
+        current_database,
+        Arc::new(explain_definition),
+        Arc::new(canonical_select_query),
+        Arc::from(base_refs),
+        Arc::new(pin),
+        Arc::new(target_entry),
+        iceberg_catalog,
+        target_loaded.table,
+    )?;
+    let outcome = run_imv_rewrite_for_refresh_explain(state, &ctx)?;
+    Ok(crate::sql::explain::explain_plan(&outcome.plan, level))
 }
 
 fn build_iceberg_table_def_for_snapshot_scan(
