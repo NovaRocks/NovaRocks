@@ -1,0 +1,13 @@
+-- query 2
+id	v
+1	10
+2	20
+
+-- query 4
+id	v
+1	10
+2	20
+
+-- query 5
+same_row_ids	changed_row_ids	current_rows	historical_rows
+0	2	2	2
