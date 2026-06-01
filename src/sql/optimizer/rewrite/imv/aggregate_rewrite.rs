@@ -25,6 +25,7 @@ pub(crate) fn signed_state_function(name: &str) -> Result<&'static str, String> 
     match name.to_ascii_lowercase().as_str() {
         "count" => Ok("count_state_signed"),
         "sum" => Ok("sum_state_signed"),
+        "avg" => Ok("avg_state_signed"),
         "min" => Ok("min_state_signed"),
         "max" => Ok("max_state_signed"),
         other => Err(format!("unsupported IMV aggregate function {other}")),
@@ -776,6 +777,7 @@ mod tests {
             "count_state_signed"
         );
         assert_eq!(signed_state_function("sum").unwrap(), "sum_state_signed");
+        assert_eq!(signed_state_function("avg").unwrap(), "avg_state_signed");
         assert_eq!(signed_state_function("min").unwrap(), "min_state_signed");
         assert_eq!(signed_state_function("max").unwrap(), "max_state_signed");
     }
@@ -785,11 +787,6 @@ mod tests {
         let err = signed_state_function("median").expect_err("median must be unsupported");
         assert!(
             err.contains("unsupported IMV aggregate function median"),
-            "{err}"
-        );
-        let err = signed_state_function("avg").expect_err("avg must be unsupported in Task 5");
-        assert!(
-            err.contains("unsupported IMV aggregate function avg"),
             "{err}"
         );
     }

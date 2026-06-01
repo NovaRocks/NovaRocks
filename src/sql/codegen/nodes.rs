@@ -769,11 +769,11 @@ pub(crate) fn projected_target_state_column_names(
     scan: &crate::sql::catalog::IcebergMvTargetStateScan,
 ) -> Vec<String> {
     let mut names = Vec::new();
-    for name in scan
-        .group_key_names
-        .iter()
-        .chain(scan.aggregate_state_names.iter())
-    {
+    for name in scan.columns.iter().map(|column| &column.name).chain(
+        scan.group_key_names
+            .iter()
+            .chain(scan.aggregate_state_names.iter()),
+    ) {
         if !names
             .iter()
             .any(|existing: &String| existing.eq_ignore_ascii_case(name))
@@ -1687,7 +1687,36 @@ mod tests {
             catalog: "ice".to_string(),
             database: "db".to_string(),
             table: "mv_b".to_string(),
-            columns: Vec::new(),
+            columns: vec![
+                ColumnDef {
+                    name: "__row_id__".to_string(),
+                    data_type: DataType::Utf8,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                },
+                ColumnDef {
+                    name: "k".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                },
+                ColumnDef {
+                    name: "visible_sum".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    write_default: None,
+                    logical_type: None,
+                },
+                ColumnDef {
+                    name: "sum_v".to_string(),
+                    data_type: DataType::Binary,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                },
+            ],
             group_key_names: vec!["k".to_string()],
             aggregate_state_names: vec!["sum_v".to_string()],
             row_id_column_name: "__row_id__".to_string(),
@@ -1696,9 +1725,10 @@ mod tests {
         assert_eq!(
             super::projected_target_state_column_names(&scan),
             vec![
+                "__row_id__".to_string(),
                 "k".to_string(),
+                "visible_sum".to_string(),
                 "sum_v".to_string(),
-                "__row_id__".to_string()
             ]
         );
     }

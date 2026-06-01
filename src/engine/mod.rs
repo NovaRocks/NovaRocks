@@ -2779,6 +2779,7 @@ pub(crate) fn execute_query_with_options(
         crate::sql::analyzer::analyze(query, catalog, current_database)?;
     let mut logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
     if let Some(mv_ctx) = mv_refresh_ctx {
+        logical = crate::engine::mv::iceberg_refresh::normalize_imv_rewrite_root_project(logical);
         let outcome = crate::sql::optimizer::rewrite::imv::entrypoint::run_imv_rewrite(
             crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteInput {
                 plan: logical,

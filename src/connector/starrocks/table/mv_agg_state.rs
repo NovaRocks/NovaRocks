@@ -576,7 +576,7 @@ fn validate_state_shaped_input_schema(
             .name()
             .eq_ignore_ascii_case(expected_field.name())
             || actual_field.data_type() != expected_field.data_type()
-            || actual_field.is_nullable() != expected_field.is_nullable()
+            || !state_shaped_nullable_matches(index, actual_field, expected_field, shape)
         {
             return Err(format!(
                 "aggregate MV state-shaped input schema mismatch at column {index}: got {}:{:?}:{} expected {}:{:?}:{}",
@@ -590,6 +590,26 @@ fn validate_state_shaped_input_schema(
         }
     }
     Ok(())
+}
+
+fn state_shaped_nullable_matches(
+    index: usize,
+    actual: &Field,
+    expected: &Field,
+    shape: &AggregateMvShape,
+) -> bool {
+    if actual.is_nullable() == expected.is_nullable() {
+        return true;
+    }
+    actual.is_nullable() && !expected.is_nullable() && state_shaped_field_is_state(index, shape)
+}
+
+fn state_shaped_field_is_state(index: usize, shape: &AggregateMvShape) -> bool {
+    index >= shape.visible_outputs.len()
+        || matches!(
+            shape.visible_outputs.get(index),
+            Some(VisibleAggregateOutput::Aggregate(_))
+        )
 }
 
 fn state_shaped_input_fields(

@@ -1484,6 +1484,13 @@ pub(crate) fn refresh_iceberg_mv(
             &loaded.table,
             &current_table_uuid,
             &pinned_full_select_sql,
+            RewriteMergeRefreshOptions {
+                apply_key_column: ICEBERG_MV_APPLY_KEY_COLUMN,
+                apply_key_value_type:
+                    crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::Int64,
+                allow_full_rebuild_on_policy_full_refresh: true,
+                require_aggregate_rewrite_evidence: false,
+            },
         ),
 
         // Previous snapshot no longer reachable.
@@ -1742,15 +1749,34 @@ fn refresh_single_aggregate_iceberg_mv(
                 pin.to_table_uuid_map(),
             )
         }
-        Some(prev) => incremental_refresh_iceberg_aggregate_mv(
-            state,
-            &ctx,
-            base_ref,
-            prev,
-            current,
-            &loaded,
-            aggregate_shape,
-        ),
+        Some(prev) => {
+            let current_table_uuid = pin
+                .uuid(base_ref)
+                .ok_or_else(|| {
+                    format!(
+                        "refresh pin missing uuid for base {} (this should not happen)",
+                        base_ref.fqn()
+                    )
+                })?
+                .to_string();
+            incremental_refresh_iceberg_mv(
+                state,
+                &ctx,
+                base_ref,
+                prev,
+                current,
+                &loaded.table,
+                &current_table_uuid,
+                &mv_definition.select_sql,
+                RewriteMergeRefreshOptions {
+                    apply_key_column: ICEBERG_MV_GROUP_APPLY_KEY_COLUMN,
+                    apply_key_value_type:
+                        crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::Utf8,
+                    allow_full_rebuild_on_policy_full_refresh: false,
+                    require_aggregate_rewrite_evidence: true,
+                },
+            )
+        }
     }
 }
 
@@ -5946,7 +5972,7 @@ fn plan_canonical_select_for_imv(
     Ok((normalize_imv_rewrite_root_project(plan), next_column_id))
 }
 
-fn normalize_imv_rewrite_root_project(
+pub(crate) fn normalize_imv_rewrite_root_project(
     plan: crate::sql::planner::plan::LogicalPlan,
 ) -> crate::sql::planner::plan::LogicalPlan {
     let crate::sql::planner::plan::LogicalPlan::Project(mut project) = plan else {
@@ -6042,6 +6068,88 @@ fn try_run_imv_rewrite_pipeline(state: &Arc<StandaloneState>, ctx: &IcebergMvRef
                 "imv rewrite skipped (PR-α: non-fatal, refresh continues)",
             );
         }
+    }
+}
+
+fn validate_aggregate_refresh_rewrite_evidence(
+    state: &Arc<StandaloneState>,
+    ctx: &IcebergMvRefreshContext,
+) -> Result<(), String> {
+    let outcome = run_imv_rewrite_for_refresh_explain(state, ctx)?;
+    let aggregate_rewrite_changed = outcome.trace.events().iter().any(|event| {
+        matches!(
+            event,
+            crate::sql::optimizer::rewrite::trace::RewriteTraceEvent::RuleChanged {
+                rule: "RewriteAggregateState",
+                ..
+            }
+        )
+    });
+    if !aggregate_rewrite_changed {
+        return Err(format!(
+            "iceberg aggregate MV {} incremental refresh rewrite did not apply RewriteAggregateState",
+            target_fqn_string(&ctx.rewrite.target)
+        ));
+    }
+    if !logical_plan_contains_aggregate_state_merge(&outcome.plan) {
+        return Err(format!(
+            "iceberg aggregate MV {} incremental refresh rewrite plan does not contain AggregateStateMerge",
+            target_fqn_string(&ctx.rewrite.target)
+        ));
+    }
+    tracing::info!(
+        mv_target = ?ctx.rewrite.target,
+        mv_id = ctx.rewrite.mv_id,
+        stages = ?outcome.trace.stage_names(),
+        "iceberg aggregate MV incremental refresh rewrite evidence validated"
+    );
+    Ok(())
+}
+
+fn logical_plan_contains_aggregate_state_merge(
+    plan: &crate::sql::planner::plan::LogicalPlan,
+) -> bool {
+    use crate::sql::planner::plan::LogicalPlan;
+
+    match plan {
+        LogicalPlan::AggregateStateMerge(_) => true,
+        LogicalPlan::Filter(n) => logical_plan_contains_aggregate_state_merge(&n.input),
+        LogicalPlan::Project(n) => logical_plan_contains_aggregate_state_merge(&n.input),
+        LogicalPlan::Aggregate(n) => logical_plan_contains_aggregate_state_merge(&n.input),
+        LogicalPlan::Sort(n) => logical_plan_contains_aggregate_state_merge(&n.input),
+        LogicalPlan::Limit(n) => logical_plan_contains_aggregate_state_merge(&n.input),
+        LogicalPlan::Window(n) => logical_plan_contains_aggregate_state_merge(&n.input),
+        LogicalPlan::TableFunction(n) => logical_plan_contains_aggregate_state_merge(&n.input),
+        LogicalPlan::CTEAnchor(n) => {
+            logical_plan_contains_aggregate_state_merge(&n.produce)
+                || logical_plan_contains_aggregate_state_merge(&n.consumer)
+        }
+        LogicalPlan::CTEProduce(n) => logical_plan_contains_aggregate_state_merge(&n.input),
+        LogicalPlan::SubqueryAlias(n) => logical_plan_contains_aggregate_state_merge(&n.input),
+        LogicalPlan::Join(n) => {
+            logical_plan_contains_aggregate_state_merge(&n.left)
+                || logical_plan_contains_aggregate_state_merge(&n.right)
+        }
+        LogicalPlan::Union(n) => n
+            .inputs
+            .iter()
+            .any(logical_plan_contains_aggregate_state_merge),
+        LogicalPlan::Intersect(n) => n
+            .inputs
+            .iter()
+            .any(logical_plan_contains_aggregate_state_merge),
+        LogicalPlan::Except(n) => n
+            .inputs
+            .iter()
+            .any(logical_plan_contains_aggregate_state_merge),
+        LogicalPlan::Repeat(n) => logical_plan_contains_aggregate_state_merge(&n.input),
+        LogicalPlan::Decode(n) => logical_plan_contains_aggregate_state_merge(&n.input),
+        LogicalPlan::ImvDelta(n) => logical_plan_contains_aggregate_state_merge(&n.input),
+        LogicalPlan::ImvVersion(n) => logical_plan_contains_aggregate_state_merge(&n.input),
+        LogicalPlan::Scan(_)
+        | LogicalPlan::Values(_)
+        | LogicalPlan::GenerateSeries(_)
+        | LogicalPlan::CTEConsume(_) => false,
     }
 }
 
@@ -6661,6 +6769,14 @@ fn normalize_join_branch_snapshot_tables(
 ///
 /// Metadata-only empty deltas keep the old finalize path because no Iceberg
 /// snapshot is created.
+#[derive(Clone, Copy)]
+struct RewriteMergeRefreshOptions {
+    apply_key_column: &'static str,
+    apply_key_value_type: crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType,
+    allow_full_rebuild_on_policy_full_refresh: bool,
+    require_aggregate_rewrite_evidence: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn incremental_refresh_iceberg_mv(
     state: &Arc<StandaloneState>,
@@ -6671,6 +6787,7 @@ fn incremental_refresh_iceberg_mv(
     base_table: &iceberg::table::Table,
     current_table_uuid: &str,
     pinned_full_select_sql: &str,
+    options: RewriteMergeRefreshOptions,
 ) -> Result<StatementResult, String> {
     let target = &ctx.rewrite.target;
     let target_entry = &*ctx.target_entry;
@@ -6689,6 +6806,12 @@ fn incremental_refresh_iceberg_mv(
         Ok(batch) => batch,
         Err(err) => match policy_signal_from_change_error(&err) {
             IcebergChangePolicySignal::FullRefresh { reason } => {
+                if !options.allow_full_rebuild_on_policy_full_refresh {
+                    return Err(format!(
+                        "iceberg aggregate MV {}.{}.{} cannot refresh incrementally and automatic full rebuild is disabled: {reason}",
+                        target.catalog, target.namespace, target.table
+                    ));
+                }
                 tracing::info!(
                     "iceberg mv {}.{}.{}: incremental planner requested full refresh: {reason}",
                     target.catalog,
@@ -6773,6 +6896,10 @@ fn incremental_refresh_iceberg_mv(
             target_snapshot_id,
         )?;
         return Ok(StatementResult::Ok);
+    }
+
+    if options.require_aggregate_rewrite_evidence {
+        validate_aggregate_refresh_rewrite_evidence(state, ctx)?;
     }
 
     // 3. Begin the staging branch and pre-load the target Iceberg table.
@@ -6929,8 +7056,8 @@ fn incremental_refresh_iceberg_mv(
         target_table: target_table.clone(),
         collector: Arc::clone(&collector),
         locator_state,
-        apply_key_column: ICEBERG_MV_APPLY_KEY_COLUMN.to_string(),
-        apply_key_value_type: crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::Int64,
+        apply_key_column: options.apply_key_column.to_string(),
+        apply_key_value_type: options.apply_key_value_type,
     };
     let merge_sink =
         crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkFactory::new(merge_sink_plan);
