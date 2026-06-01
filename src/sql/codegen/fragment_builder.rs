@@ -221,6 +221,7 @@ pub(crate) struct PlanFragmentBuilder<'a> {
     #[allow(dead_code)]
     catalog: &'a dyn CatalogProvider,
     connectors: &'a crate::connector::ConnectorRegistry,
+    mv_refresh_ctx: Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
     desc_builder: DescriptorTableBuilder,
     scan_tables: Vec<nodes::PlannedScanTable>,
     next_node_id: i32,
@@ -282,9 +283,20 @@ impl<'a> PlanFragmentBuilder<'a> {
         connectors: &'a crate::connector::ConnectorRegistry,
         _current_database: &str,
     ) -> Result<MultiFragmentBuildResult, String> {
+        Self::build_with_mv_refresh_ctx(plan, catalog, connectors, _current_database, None)
+    }
+
+    pub(crate) fn build_with_mv_refresh_ctx(
+        plan: &PhysicalPlanNode,
+        catalog: &'a dyn CatalogProvider,
+        connectors: &'a crate::connector::ConnectorRegistry,
+        _current_database: &str,
+        mv_refresh_ctx: Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+    ) -> Result<MultiFragmentBuildResult, String> {
         let mut builder = PlanFragmentBuilder {
             catalog,
             connectors,
+            mv_refresh_ctx,
             desc_builder: DescriptorTableBuilder::new(),
             scan_tables: Vec::new(),
             next_node_id: 1,
@@ -329,7 +341,11 @@ impl<'a> PlanFragmentBuilder<'a> {
         let desc_tbl =
             std::mem::replace(&mut builder.desc_builder, DescriptorTableBuilder::new()).build();
 
-        let exec_params = nodes::build_exec_params_multi(builder.connectors, &builder.scan_tables)?;
+        let exec_params = nodes::build_exec_params_multi_with_refresh_context(
+            builder.connectors,
+            &builder.scan_tables,
+            builder.mv_refresh_ctx,
+        )?;
 
         let output_columns = plan
             .output_columns
@@ -393,6 +409,63 @@ impl<'a> PlanFragmentBuilder<'a> {
             edges: builder.completed_edges,
             rf_plan,
         })
+    }
+
+    fn refresh_scan_table_for_codegen(
+        &self,
+        table: &crate::sql::catalog::TableDef,
+    ) -> Result<crate::sql::catalog::TableDef, String> {
+        match &table.source {
+            crate::sql::catalog::ScanSource::IcebergVersionTable {
+                table: iceberg_table,
+                snapshot_id,
+            } => {
+                let refresh_ctx = self.mv_refresh_ctx.ok_or_else(|| {
+                    "Iceberg version scan requires MV refresh context".to_string()
+                })?;
+                let mut out = table.clone();
+                out.source = refresh_ctx.version_scan_source(iceberg_table, *snapshot_id)?;
+                Ok(out)
+            }
+            crate::sql::catalog::ScanSource::IcebergMvTargetState(scan) => {
+                let refresh_ctx = self.mv_refresh_ctx.ok_or_else(|| {
+                    "Iceberg target-state scan requires MV refresh context".to_string()
+                })?;
+                let mut out = table.clone();
+                let projected = nodes::projected_target_state_column_names(scan);
+                out.columns.retain(|column| {
+                    projected
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(&column.name))
+                });
+                out.iceberg_row_lineage_metadata_columns.retain(|column| {
+                    projected
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(&column.name))
+                });
+                if projected
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case("_row_id"))
+                    && !out
+                        .columns
+                        .iter()
+                        .chain(out.iceberg_row_lineage_metadata_columns.iter())
+                        .any(|column| column.name.eq_ignore_ascii_case("_row_id"))
+                {
+                    out.iceberg_row_lineage_metadata_columns
+                        .push(crate::sql::catalog::ColumnDef {
+                            name: "_row_id".to_string(),
+                            data_type: DataType::Int64,
+                            nullable: false,
+                            write_default: None,
+                            logical_type: None,
+                        });
+                }
+                out.source = refresh_ctx.target_state_scan_source(scan)?;
+                Ok(out)
+            }
+            _ => Ok(table.clone()),
+        }
     }
 
     // -------------------------------------------------------------------
@@ -597,9 +670,10 @@ impl<'a> PlanFragmentBuilder<'a> {
     ) -> Result<VisitResult, String> {
         let scan_tuple_id = self.alloc_tuple();
         let scan_node_id = self.alloc_node();
+        let table = self.refresh_scan_table_for_codegen(&op.table)?;
 
         let mut scope = ExprScope::new();
-        let qualifier = op.alias.as_deref().or(Some(&op.table.name));
+        let qualifier = op.alias.as_deref().or(Some(&table.name));
         let mut slot_to_column = HashMap::new();
         let mut iceberg_metadata_pseudo_column_slots = BTreeSet::new();
 
@@ -609,16 +683,16 @@ impl<'a> PlanFragmentBuilder<'a> {
             .as_ref()
             .map(|cols| cols.iter().map(|c| c.to_lowercase()).collect());
         if let Some(required) = required.as_mut() {
-            add_iceberg_equality_delete_required_columns(required, &op.table)?;
+            add_iceberg_equality_delete_required_columns(required, &table)?;
         }
 
-        let planned_scan = match &op.table.source {
+        let planned_scan = match &table.source {
             crate::sql::catalog::ScanSource::StarRocks { db_id, table_id } => {
                 let planner = self.connectors.scan_planner("starrocks")?;
                 let table_handle =
                     crate::connector::starrocks::table::StarRocksTableScanPlanner::table_handle_from_source(
                         &op.database,
-                        &op.table.name,
+                        &table.name,
                         *db_id,
                         *table_id,
                     );
@@ -666,15 +740,15 @@ impl<'a> PlanFragmentBuilder<'a> {
             }
             _ => None,
         };
-        let scan_table_id = match &op.table.source {
+        let scan_table_id = match &table.source {
             crate::sql::catalog::ScanSource::StarRocks { table_id, .. } => Some(*table_id),
-            _ => iceberg_table_info(&op.table.source)
+            _ => iceberg_table_info(&table.source)
                 .is_some()
                 .then_some(synthetic_iceberg_table_id(scan_node_id)),
         };
         if let Some(table_id) = scan_table_id {
             self.desc_builder
-                .add_table_for_scan(table_id, &op.database, &op.table);
+                .add_table_for_scan(table_id, &op.database, &table);
         }
 
         // Build a quick lookup so the column registration loop below can
@@ -698,7 +772,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         let mut dict_slot_for_source: std::collections::HashMap<String, i32> =
             std::collections::HashMap::new();
         let mut dict_slot_to_dict: Vec<(i32, &ScanDictionaryColumn)> = Vec::new();
-        for (idx, col) in op.table.columns.iter().enumerate() {
+        for (idx, col) in table.columns.iter().enumerate() {
             // The dict rewriter renames the source string column to the
             // dict column name in `op.columns` / `op.required_columns`,
             // so check membership using BOTH names when a dict mapping
@@ -783,16 +857,12 @@ impl<'a> PlanFragmentBuilder<'a> {
             if op
                 .alias
                 .as_deref()
-                .is_some_and(|a| !a.eq_ignore_ascii_case(&op.table.name))
+                .is_some_and(|a| !a.eq_ignore_ascii_case(&table.name))
             {
-                scope.add_column(
-                    Some(op.table.name.clone()),
-                    col.name.clone(),
-                    binding.clone(),
-                );
+                scope.add_column(Some(table.name.clone()), col.name.clone(), binding.clone());
                 if let Some(dict_col) = dict_target {
                     scope.add_column(
-                        Some(op.table.name.clone()),
+                        Some(table.name.clone()),
                         dict_col.dict_column.clone(),
                         binding.clone(),
                     );
@@ -816,9 +886,8 @@ impl<'a> PlanFragmentBuilder<'a> {
         // pruning rule never adds them to `required_columns`. Always register
         // them regardless of `required`; the lowering layer only synthesises
         // the values for slots that are actually in the tuple descriptor.
-        let meta_col_offset = op.table.columns.len();
-        for (meta_idx, col) in op
-            .table
+        let meta_col_offset = table.columns.len();
+        for (meta_idx, col) in table
             .iceberg_row_lineage_metadata_columns
             .iter()
             .enumerate()
@@ -850,9 +919,9 @@ impl<'a> PlanFragmentBuilder<'a> {
             if op
                 .alias
                 .as_deref()
-                .is_some_and(|a| !a.eq_ignore_ascii_case(&op.table.name))
+                .is_some_and(|a| !a.eq_ignore_ascii_case(&table.name))
             {
-                scope.add_column(Some(op.table.name.clone()), col.name.clone(), binding);
+                scope.add_column(Some(table.name.clone()), col.name.clone(), binding);
             }
         }
 
@@ -887,7 +956,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                 .ok_or_else(|| {
                     format!(
                         "scan `{}.{}` dict_columns references unknown source column `{}`",
-                        op.database, op.table.name, dict_col.source_column
+                        op.database, table.name, dict_col.source_column
                     )
                 })?;
             // Self-map: the BE's `lake_scan.rs` rewrites every dict int
@@ -904,7 +973,7 @@ impl<'a> PlanFragmentBuilder<'a> {
 
         let resolved = ResolvedTable {
             database: op.database.clone(),
-            table: op.table.clone(),
+            table: table.clone(),
             planned_scan,
             alias: op.alias.clone(),
         };

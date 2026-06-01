@@ -2785,12 +2785,14 @@ pub(crate) fn execute_query_with_options(
     if force_single_fragment {
         physical = collapse_distribution_enforcers_for_single_fragment(physical);
     }
-    let build_result = crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
-        &physical,
-        catalog,
-        connectors,
-        current_database,
-    )?;
+    let build_result =
+        crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_with_mv_refresh_ctx(
+            &physical,
+            catalog,
+            connectors,
+            current_database,
+            mv_refresh_ctx,
+        )?;
 
     let execution_plan = choose_standalone_execution(build_result);
 

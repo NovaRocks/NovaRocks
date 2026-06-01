@@ -572,6 +572,14 @@ pub(crate) fn build_exec_params_multi(
     connectors: &crate::connector::ConnectorRegistry,
     scan_tables: &[PlannedScanTable],
 ) -> Result<internal_service::TPlanFragmentExecParams, String> {
+    build_exec_params_multi_with_refresh_context(connectors, scan_tables, None)
+}
+
+pub(crate) fn build_exec_params_multi_with_refresh_context(
+    connectors: &crate::connector::ConnectorRegistry,
+    scan_tables: &[PlannedScanTable],
+    mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+) -> Result<internal_service::TPlanFragmentExecParams, String> {
     let mut per_node_scan_ranges = BTreeMap::new();
 
     for planned in scan_tables {
@@ -634,16 +642,23 @@ pub(crate) fn build_exec_params_multi(
                     vec![build_iceberg_metadata_scan_range_params()]
                 }
                 ScanSource::IcebergVersionTable { table, snapshot_id } => {
-                    return Err(format!(
-                        "IMV version scan {}.{}.{} at snapshot {} reached scan-range construction before execution cutover",
-                        table.catalog, table.namespace, table.table, snapshot_id
-                    ));
+                    let refresh_ctx = mv_refresh_ctx.ok_or_else(|| {
+                        "Iceberg version scan requires MV refresh context".to_string()
+                    })?;
+                    let source = refresh_ctx.version_scan_source(table, *snapshot_id)?;
+                    build_iceberg_scan_ranges_from_source(connectors, planned, &source, None)?
                 }
                 ScanSource::IcebergMvTargetState(scan) => {
-                    return Err(format!(
-                        "IMV target-state scan {} reached scan-range construction without codegen implementation",
-                        scan.fqn()
-                    ));
+                    let refresh_ctx = mv_refresh_ctx.ok_or_else(|| {
+                        "Iceberg target-state scan requires MV refresh context".to_string()
+                    })?;
+                    let source = refresh_ctx.target_state_scan_source(scan)?;
+                    build_iceberg_scan_ranges_from_source(
+                        connectors,
+                        planned,
+                        &source,
+                        Some(projected_target_state_column_names(scan)),
+                    )?
                 }
                 ScanSource::StarRocks { .. } => unreachable!(
                     "StarRocks scan source is handled by the planned-connector branch above"
@@ -672,6 +687,90 @@ pub(crate) fn build_exec_params_multi(
         None::<bool>,
         None::<Vec<internal_service::TExecDebugOption>>,
     ))
+}
+
+fn build_iceberg_scan_ranges_from_source(
+    connectors: &crate::connector::ConnectorRegistry,
+    planned: &PlannedScanTable,
+    source: &ScanSource,
+    column_names: Option<Vec<String>>,
+) -> Result<Vec<internal_service::TScanRangeParams>, String> {
+    let ScanSource::IcebergDataFiles {
+        table,
+        files,
+        cloud_properties,
+    } = source
+    else {
+        return Err("refresh-only scan source did not resolve to Iceberg data files".to_string());
+    };
+    let planner = connectors.scan_planner("iceberg")?;
+    let column_names = column_names.unwrap_or_else(|| {
+        planned
+            .resolved
+            .table
+            .columns
+            .iter()
+            .map(|c| c.name.clone())
+            .collect()
+    });
+    let table_handle =
+        crate::connector::iceberg::IcebergConnectorScanPlanner::table_handle_from_source(
+            &table.catalog,
+            &table.namespace,
+            &table.table,
+            table.current_snapshot_id,
+            table.clone(),
+            files.clone(),
+            column_names,
+        );
+    let scan = planner.begin_scan(
+        table_handle,
+        crate::connector::scan_planning::BeginScanContext::default(),
+    )?;
+    let splits = planner.plan_splits(
+        &scan,
+        crate::connector::scan_planning::SplitPlanningContext::default(),
+    )?;
+    let plan = planner.to_thrift_scan(
+        &scan,
+        &splits,
+        ThriftScanContext {
+            database: planned.resolved.database.clone(),
+            table: planned.resolved.table.name.clone(),
+            node_id: planned.scan_node_id,
+            scan_tuple_id: planned.scan_tuple_id,
+            min_max_predicates: scan_file_min_max_predicates(planned),
+            change_op_slot: planned_change_op_slot(planned),
+            cloud_properties: cloud_properties.clone(),
+            ..ThriftScanContext::default()
+        },
+    )?;
+    Ok(plan.scan_ranges)
+}
+
+pub(crate) fn projected_target_state_column_names(
+    scan: &crate::sql::catalog::IcebergMvTargetStateScan,
+) -> Vec<String> {
+    let mut names = Vec::new();
+    for name in scan
+        .group_key_names
+        .iter()
+        .chain(scan.aggregate_state_names.iter())
+    {
+        if !names
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(name))
+        {
+            names.push(name.clone());
+        }
+    }
+    if !names
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("_row_id"))
+    {
+        names.push("_row_id".to_string());
+    }
+    names
 }
 
 fn scan_file_min_max_predicates(planned: &PlannedScanTable) -> Vec<MinMaxPredicate> {
@@ -1066,11 +1165,15 @@ mod tests {
 
     use arrow::datatypes::DataType;
 
-    use super::{PlannedScanTable, build_exec_params_multi};
+    use super::{
+        PlannedScanTable, build_exec_params_multi, build_exec_params_multi_with_refresh_context,
+    };
     use crate::connector::iceberg::scan_planner::build_hdfs_scan_range_params;
     use crate::connector::scan_planning::ConnectorScanPlanner;
+    use crate::internal_service;
     use crate::sql::catalog::{
-        ColumnDef, IcebergDataFileInfo, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
+        ColumnDef, IcebergDataFileInfo, IcebergMvTargetStateScan, IcebergSchemaDef,
+        IcebergTableInfo, ScanSource, TableDef,
     };
     use crate::sql::codegen::resolve::ResolvedTable;
 
@@ -1407,12 +1510,9 @@ mod tests {
         assert!(extended_columns.contains_key(&9));
     }
 
-    #[test]
-    fn iceberg_version_table_reaches_scan_range_guard() {
-        use crate::sql::catalog::{
-            ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
-        };
-
+    fn build_iceberg_version_scan_node_for_test(
+        mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+    ) -> Result<internal_service::TPlanFragmentExecParams, String> {
         let resolved = ResolvedTable {
             database: "db".to_string(),
             table: TableDef {
@@ -1453,11 +1553,98 @@ mod tests {
         };
 
         let registry = test_connector_registry();
-        let err = build_exec_params_multi(&registry, &[planned])
-            .expect_err("version table must not be executable in phase 1");
+        build_exec_params_multi_with_refresh_context(&registry, &[planned], mv_refresh_ctx)
+    }
+
+    fn build_iceberg_target_state_scan_node_for_test(
+        mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+    ) -> Result<internal_service::TPlanFragmentExecParams, String> {
+        let resolved = ResolvedTable {
+            database: "db".to_string(),
+            table: TableDef {
+                name: "mv_b".to_string(),
+                columns: vec![
+                    ColumnDef {
+                        name: "k".to_string(),
+                        data_type: arrow::datatypes::DataType::Int64,
+                        nullable: false,
+                        write_default: None,
+                        logical_type: None,
+                    },
+                    ColumnDef {
+                        name: "sum_v".to_string(),
+                        data_type: arrow::datatypes::DataType::Int64,
+                        nullable: true,
+                        write_default: None,
+                        logical_type: None,
+                    },
+                ],
+                iceberg_row_lineage_metadata_columns: vec![ColumnDef {
+                    name: "_row_id".to_string(),
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                }],
+                source: ScanSource::IcebergMvTargetState(IcebergMvTargetStateScan {
+                    catalog: "ice".to_string(),
+                    database: "db".to_string(),
+                    table: "mv_b".to_string(),
+                    columns: vec![
+                        ColumnDef {
+                            name: "k".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                            write_default: None,
+                            logical_type: None,
+                        },
+                        ColumnDef {
+                            name: "sum_v".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: true,
+                            write_default: None,
+                            logical_type: None,
+                        },
+                    ],
+                    group_key_names: vec!["k".to_string()],
+                    aggregate_state_names: vec!["sum_v".to_string()],
+                }),
+            },
+            planned_scan: None,
+            alias: None,
+        };
+        let planned = PlannedScanTable {
+            scan_node_id: 10,
+            scan_tuple_id: 5,
+            resolved,
+            min_max_conjuncts: Vec::new(),
+            slot_to_column: std::collections::HashMap::new(),
+            iceberg_metadata_pseudo_column_slots: std::collections::BTreeSet::new(),
+        };
+
+        let registry = test_connector_registry();
+        build_exec_params_multi_with_refresh_context(&registry, &[planned], mv_refresh_ctx)
+    }
+
+    #[test]
+    fn iceberg_version_scan_without_refresh_context_fails_fast() {
+        let err = build_iceberg_version_scan_node_for_test(None)
+            .expect_err("version scan outside MV refresh must fail");
         assert!(
-            err.contains("IMV version scan ice.db.b at snapshot 11 reached scan-range construction before execution cutover"),
-            "unexpected error: {err}"
+            err.to_string()
+                .contains("Iceberg version scan requires MV refresh context"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn iceberg_target_state_scan_without_refresh_context_fails_fast() {
+        let err = build_iceberg_target_state_scan_node_for_test(None)
+            .expect_err("target-state scan outside MV refresh must fail");
+        assert!(
+            err.to_string()
+                .contains("Iceberg target-state scan requires MV refresh context"),
+            "{err}"
         );
     }
 }

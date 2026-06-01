@@ -19,6 +19,10 @@ use crate::connector::starrocks::table::model::IcebergTableRef;
 use crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin;
 use crate::meta::repository::mv::StoredMvDefinition;
 use crate::meta::repository::mv_contract::MvSchemaContract;
+use crate::sql::catalog::{
+    IcebergDataFileInfo, IcebergMvTargetStateScan, IcebergSchemaDef, IcebergSchemaFieldDef,
+    IcebergTableInfo, ScanSource,
+};
 
 use super::iceberg_refresh::IcebergMvTarget;
 
@@ -298,6 +302,182 @@ impl IcebergMvRefreshContext {
             iceberg_catalog,
             target_table,
         })
+    }
+
+    pub(crate) fn version_scan_source(
+        &self,
+        table: &IcebergTableInfo,
+        snapshot_id: i64,
+    ) -> Result<ScanSource, String> {
+        if !table
+            .catalog
+            .eq_ignore_ascii_case(&self.rewrite.target.catalog)
+        {
+            return Err(format!(
+                "Iceberg version scan for {}.{}.{} requires catalog {} in MV refresh context, got {}",
+                table.catalog,
+                table.namespace,
+                table.table,
+                table.catalog,
+                self.rewrite.target.catalog
+            ));
+        }
+        let ident =
+            iceberg::TableIdent::from_strs([table.namespace.as_str(), table.table.as_str()])
+                .map_err(|e| {
+                    format!(
+                        "build iceberg table ident for version scan {}.{}.{}: {e}",
+                        table.catalog, table.namespace, table.table
+                    )
+                })?;
+        let loaded = crate::connector::iceberg::catalog::registry::block_on_iceberg(async {
+            self.iceberg_catalog.load_table(&ident).await
+        })
+        .map_err(|e| format!("load iceberg table for version scan runtime failed: {e}"))?
+        .map_err(|e| {
+            format!(
+                "load iceberg table for version scan {}.{}.{}: {e}",
+                table.catalog, table.namespace, table.table
+            )
+        })?;
+        let files = data_files_at_snapshot(&loaded, snapshot_id)?;
+        Ok(ScanSource::IcebergDataFiles {
+            table: table.clone(),
+            files,
+            cloud_properties: self.target_entry.cloud_properties_map(),
+        })
+    }
+
+    pub(crate) fn target_state_scan_source(
+        &self,
+        scan: &IcebergMvTargetStateScan,
+    ) -> Result<ScanSource, String> {
+        let target = &self.rewrite.target;
+        if !scan.catalog.eq_ignore_ascii_case(&target.catalog)
+            || !scan.database.eq_ignore_ascii_case(&target.namespace)
+            || !scan.table.eq_ignore_ascii_case(&target.table)
+        {
+            return Err(format!(
+                "Iceberg target-state scan {} does not match MV refresh target {}.{}.{}",
+                scan.fqn(),
+                target.catalog,
+                target.namespace,
+                target.table
+            ));
+        }
+
+        let files = match self.rewrite.target_snapshot_id {
+            Some(snapshot_id) => data_files_at_snapshot(&self.target_table, snapshot_id)?,
+            None => Vec::new(),
+        };
+        Ok(ScanSource::IcebergDataFiles {
+            table: target_table_info(self, scan)?,
+            files,
+            cloud_properties: self.target_entry.cloud_properties_map(),
+        })
+    }
+}
+
+fn data_files_at_snapshot(
+    table: &iceberg::table::Table,
+    snapshot_id: i64,
+) -> Result<Vec<IcebergDataFileInfo>, String> {
+    crate::connector::iceberg::catalog::registry::extract_data_files_with_stats_at(
+        table,
+        snapshot_id,
+    )
+    .map(|files| {
+        files
+            .into_iter()
+            .map(data_file_with_stats_to_info)
+            .collect()
+    })
+}
+
+fn data_file_with_stats_to_info(
+    file: crate::connector::iceberg::catalog::registry::DataFileWithStats,
+) -> IcebergDataFileInfo {
+    IcebergDataFileInfo {
+        path: file.path,
+        size: file.size,
+        row_count: file.record_count,
+        column_stats: file.column_stats,
+        partition_spec_id: file.partition_spec_id,
+        partition_key: file.partition_key,
+        first_row_id: file.first_row_id,
+        data_sequence_number: file.data_sequence_number,
+        ivm_change_op: None,
+        delete_files: file.delete_files,
+        manifest_path: file.manifest_path,
+        partition_values: file.partition_field_values,
+    }
+}
+
+fn target_table_info(
+    ctx: &IcebergMvRefreshContext,
+    scan: &IcebergMvTargetStateScan,
+) -> Result<IcebergTableInfo, String> {
+    let metadata = ctx.target_table.metadata();
+    Ok(IcebergTableInfo {
+        catalog: scan.catalog.clone(),
+        namespace: scan.database.clone(),
+        table: scan.table.clone(),
+        table_uuid: Some(metadata.uuid().to_string()),
+        current_snapshot_id: metadata.current_snapshot_id(),
+        schema_id: metadata.current_schema_id(),
+        location: metadata.location().to_string(),
+        schema: iceberg_schema_def(metadata.current_schema()),
+        serialized_metadata: Some(
+            serde_json::to_string(metadata)
+                .map_err(|err| format!("serialize iceberg target table metadata failed: {err}"))?,
+        ),
+    })
+}
+
+fn iceberg_schema_def(schema: &iceberg::spec::Schema) -> IcebergSchemaDef {
+    IcebergSchemaDef {
+        fields: schema
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|field| iceberg_field_def(field.as_ref()))
+            .collect(),
+    }
+}
+
+fn iceberg_field_def(field: &iceberg::spec::NestedField) -> IcebergSchemaFieldDef {
+    let initial_default_json = field.initial_default.as_ref().and_then(|literal| {
+        literal
+            .clone()
+            .try_into_json(field.field_type.as_ref())
+            .ok()
+            .map(|json| json.to_string())
+    });
+    IcebergSchemaFieldDef {
+        field_id: field.id,
+        name: field.name.clone(),
+        initial_default: field.initial_default.clone(),
+        write_default: field.write_default.clone(),
+        initial_default_json,
+        children: iceberg_type_children(field.field_type.as_ref()),
+    }
+}
+
+fn iceberg_type_children(ty: &iceberg::spec::Type) -> Vec<IcebergSchemaFieldDef> {
+    match ty {
+        iceberg::spec::Type::Struct(struct_ty) => struct_ty
+            .fields()
+            .iter()
+            .map(|field| iceberg_field_def(field.as_ref()))
+            .collect(),
+        iceberg::spec::Type::List(list_ty) => {
+            vec![iceberg_field_def(list_ty.element_field.as_ref())]
+        }
+        iceberg::spec::Type::Map(map_ty) => vec![
+            iceberg_field_def(map_ty.key_field.as_ref()),
+            iceberg_field_def(map_ty.value_field.as_ref()),
+        ],
+        iceberg::spec::Type::Primitive(_) => vec![],
     }
 }
 
