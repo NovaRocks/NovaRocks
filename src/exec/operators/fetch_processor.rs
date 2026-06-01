@@ -336,6 +336,7 @@ mod tests {
     use super::FetchProcessor;
     use crate::descriptors;
     use crate::runtime::query_context::QueryId;
+    use crate::service::grpc_proto as internal_proto;
     use crate::service::internal_rpc_client;
 
     #[test]
