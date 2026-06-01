@@ -313,6 +313,17 @@ fn format_node(plan: &LogicalPlan, level: ExplainLevel, indent: usize, out: &mut
             out.push(format!("{pad}DECODE [{}]", pairs.join(", ")));
             format_node(&node.input, level, indent + 1, out);
         }
+        LogicalPlan::AggregateStateMerge(node) => {
+            out.push(format!(
+                "{}AggregateStateMerge keys=[{}] states=[{}] change_op={}",
+                pad,
+                node.group_key_names.join(","),
+                node.aggregate_state_names.join(","),
+                node.change_op_column
+            ));
+            format_node(&node.old_input, level, indent + 1, out);
+            format_node(&node.delta_input, level, indent + 1, out);
+        }
         LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
         }
@@ -727,6 +738,20 @@ fn format_physical_node(
             out.push(format!(
                 "{pad}DECODE [{}]{costs_suffix}{stats_suffix}",
                 pairs.join(", ")
+            ));
+            for child in &node.children {
+                format_physical_node(child, level, indent + 1, out);
+            }
+        }
+        Operator::PhysicalAggregateStateMerge(op) => {
+            out.push(format!(
+                "{}AggregateStateMerge keys=[{}] states=[{}] change_op={}{}{}",
+                pad,
+                op.group_key_names.join(","),
+                op.aggregate_state_names.join(","),
+                op.change_op_column,
+                costs_suffix,
+                stats_suffix
             ));
             for child in &node.children {
                 format_physical_node(child, level, indent + 1, out);
@@ -1171,7 +1196,10 @@ mod tests {
 
     use arrow::datatypes::{DataType, Field, Fields};
 
-    use super::{ExplainLevel, explain_physical_plan, format_physical_node, format_stats_trailer};
+    use super::{
+        ExplainLevel, explain_physical_plan, explain_plan, format_physical_node,
+        format_stats_trailer,
+    };
     use crate::sql::analysis::OutputColumn;
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
@@ -1179,6 +1207,35 @@ mod tests {
     use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::statistics::Statistics;
+    use crate::sql::planner::plan::{AggregateStateMergeNode, LogicalPlan, ValuesNode};
+
+    fn explain_logical_plan_for_test(plan: &LogicalPlan) -> String {
+        explain_plan(plan, ExplainLevel::Normal).join("\n")
+    }
+
+    #[test]
+    fn explain_prints_aggregate_state_merge_evidence() {
+        fn empty_values_for_test() -> LogicalPlan {
+            LogicalPlan::Values(ValuesNode {
+                rows: vec![],
+                columns: vec![],
+                required_output_columns: None,
+            })
+        }
+
+        let plan = LogicalPlan::AggregateStateMerge(AggregateStateMergeNode {
+            old_input: Box::new(empty_values_for_test()),
+            delta_input: Box::new(empty_values_for_test()),
+            group_key_names: vec!["region".to_string()],
+            aggregate_state_names: vec!["c".to_string()],
+            change_op_column: "__change_op".to_string(),
+            output_columns: vec![],
+        });
+        let text = explain_logical_plan_for_test(&plan);
+        assert!(text.contains("AggregateStateMerge"), "{text}");
+        assert!(text.contains("keys=[region]"), "{text}");
+        assert!(text.contains("states=[c]"), "{text}");
+    }
 
     #[test]
     fn starrocks_scan_verbose_explain_reports_min_max_stats_for_supported_required_columns() {

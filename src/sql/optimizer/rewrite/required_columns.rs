@@ -60,11 +60,24 @@ pub(crate) fn tag_required_columns(
         LogicalPlan::Window(_) => tag_window(plan, parent_needed),
         LogicalPlan::Repeat(_) => tag_repeat(plan, parent_needed),
         LogicalPlan::Decode(_) => tag_decode(plan, parent_needed),
+        LogicalPlan::AggregateStateMerge(_) => tag_aggregate_state_merge(plan, parent_needed),
         LogicalPlan::TableFunction(_) => tag_table_function(plan, parent_needed),
         LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
             panic!("imv marker should not appear in non-IMV column pruning")
         }
     }
+}
+
+fn tag_aggregate_state_merge(
+    plan: LogicalPlan,
+    _parent_needed: Option<HashSet<ColumnId>>,
+) -> LogicalPlan {
+    let LogicalPlan::AggregateStateMerge(mut node) = plan else {
+        unreachable!()
+    };
+    node.old_input = Box::new(tag_required_columns(*node.old_input, None));
+    node.delta_input = Box::new(tag_required_columns(*node.delta_input, None));
+    LogicalPlan::AggregateStateMerge(node)
 }
 
 // ---------------------------------------------------------------------------
@@ -537,6 +550,10 @@ fn collect_cte_consumer_needs(plan: &LogicalPlan, target_id: CteId, acc: &mut Ha
         LogicalPlan::TableFunction(t) => collect_cte_consumer_needs(&t.input, target_id, acc),
         LogicalPlan::Repeat(r) => collect_cte_consumer_needs(&r.input, target_id, acc),
         LogicalPlan::Decode(d) => collect_cte_consumer_needs(&d.input, target_id, acc),
+        LogicalPlan::AggregateStateMerge(n) => {
+            collect_cte_consumer_needs(&n.old_input, target_id, acc);
+            collect_cte_consumer_needs(&n.delta_input, target_id, acc);
+        }
         LogicalPlan::CTEProduce(p) => collect_cte_consumer_needs(&p.input, target_id, acc),
         LogicalPlan::CTEAnchor(a) => {
             // Recurse into the consumer side of nested CTEAnchors to find any
@@ -607,6 +624,10 @@ fn walk_consume_position_map(
         LogicalPlan::TableFunction(t) => walk_consume_position_map(&t.input, target_id, map),
         LogicalPlan::Repeat(r) => walk_consume_position_map(&r.input, target_id, map),
         LogicalPlan::Decode(d) => walk_consume_position_map(&d.input, target_id, map),
+        LogicalPlan::AggregateStateMerge(n) => {
+            walk_consume_position_map(&n.old_input, target_id, map);
+            walk_consume_position_map(&n.delta_input, target_id, map);
+        }
         LogicalPlan::CTEProduce(p) => walk_consume_position_map(&p.input, target_id, map),
         LogicalPlan::CTEAnchor(a) => {
             walk_consume_position_map(&a.consumer, target_id, map);
@@ -658,6 +679,7 @@ fn subtree_untagged(plan: &LogicalPlan) -> bool {
         LogicalPlan::CTEAnchor(n) => subtree_untagged(&n.consumer),
         LogicalPlan::CTEProduce(n) => subtree_untagged(&n.input),
         LogicalPlan::Decode(n) => subtree_untagged(&n.input),
+        LogicalPlan::AggregateStateMerge(n) => subtree_untagged(&n.old_input),
         LogicalPlan::TableFunction(n) => subtree_untagged(&n.input),
         LogicalPlan::Union(n) => n
             .inputs

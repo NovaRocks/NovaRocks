@@ -4,9 +4,9 @@ use crate::sql::optimizer::rewrite::context::{RewriteContext, RewriteFailurePoli
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
 use crate::sql::planner::plan::{
-    AggregateNode, CTEAnchorNode, CTEProduceNode, DecodeNode, ExceptNode, FilterNode,
-    IntersectNode, JoinNode, LimitNode, LogicalPlan, ProjectNode, RepeatPlanNode, SortNode,
-    TableFunctionNode, UnionNode, WindowNode,
+    AggregateNode, AggregateStateMergeNode, CTEAnchorNode, CTEProduceNode, DecodeNode, ExceptNode,
+    FilterNode, IntersectNode, JoinNode, LimitNode, LogicalPlan, ProjectNode, RepeatPlanNode,
+    SortNode, TableFunctionNode, UnionNode, WindowNode,
 };
 
 pub(crate) fn rewrite_with_rule(
@@ -252,6 +252,18 @@ fn rewrite_children(
                     ..node
                 }),
                 changed,
+            ))
+        }
+        LogicalPlan::AggregateStateMerge(node) => {
+            let (old_input, old_changed) = rewrite_with_rule(*node.old_input, rule, ctx)?;
+            let (delta_input, delta_changed) = rewrite_with_rule(*node.delta_input, rule, ctx)?;
+            Ok((
+                LogicalPlan::AggregateStateMerge(AggregateStateMergeNode {
+                    old_input: Box::new(old_input),
+                    delta_input: Box::new(delta_input),
+                    ..node
+                }),
+                old_changed || delta_changed,
             ))
         }
         LogicalPlan::ImvDelta(node) => {
@@ -570,6 +582,7 @@ mod tests {
                 | LogicalPlan::CTEProduce(_)
                 | LogicalPlan::CTEConsume(_)
                 | LogicalPlan::Decode(_)
+                | LogicalPlan::AggregateStateMerge(_)
                 | LogicalPlan::ImvDelta(_)
                 | LogicalPlan::ImvVersion(_) => {}
             }

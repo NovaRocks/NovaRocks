@@ -140,6 +140,14 @@ impl LogicalAggregateOp {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct AggregateStateMergeOp {
+    pub(crate) group_key_names: Vec<String>,
+    pub(crate) aggregate_state_names: Vec<String>,
+    pub(crate) change_op_column: String,
+    pub(crate) output_columns: Vec<OutputColumn>,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct LogicalJoinOp {
     pub join_type: JoinKind,
     pub condition: Option<TypedExpr>,
@@ -471,6 +479,7 @@ pub(crate) enum Operator {
     LogicalCTEProduce(LogicalCTEProduceOp),
     LogicalCTEConsume(LogicalCTEConsumeOp),
     LogicalDecode(LogicalDecodeOp),
+    LogicalAggregateStateMerge(AggregateStateMergeOp),
 
     // Physical operators
     PhysicalScan(PhysicalScanOp),
@@ -495,6 +504,7 @@ pub(crate) enum Operator {
     PhysicalGenerateSeries(PhysicalGenerateSeriesOp),
     PhysicalTableFunction(PhysicalTableFunctionOp),
     PhysicalDecode(PhysicalDecodeOp),
+    PhysicalAggregateStateMerge(AggregateStateMergeOp),
 }
 
 impl Operator {
@@ -521,6 +531,7 @@ impl Operator {
                 | Operator::LogicalCTEProduce(_)
                 | Operator::LogicalCTEConsume(_)
                 | Operator::LogicalDecode(_)
+                | Operator::LogicalAggregateStateMerge(_)
         )
     }
 

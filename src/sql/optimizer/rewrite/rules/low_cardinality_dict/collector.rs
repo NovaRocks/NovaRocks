@@ -135,6 +135,10 @@ fn collect_blocklist(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
         LogicalPlan::Repeat(node) => collect_blocklist(&node.input, out),
         LogicalPlan::CTEProduce(node) => collect_blocklist(&node.input, out),
         LogicalPlan::Decode(node) => collect_blocklist(&node.input, out),
+        LogicalPlan::AggregateStateMerge(node) => {
+            collect_blocklist(&node.old_input, out);
+            collect_blocklist(&node.delta_input, out);
+        }
         LogicalPlan::CTEAnchor(node) => {
             collect_blocklist(&node.produce, out);
             collect_blocklist(&node.consumer, out);
@@ -215,6 +219,10 @@ fn walk(
         LogicalPlan::Repeat(node) => walk(&node.input, provider, blocklist, dict_ctx)?,
         LogicalPlan::CTEProduce(node) => walk(&node.input, provider, blocklist, dict_ctx)?,
         LogicalPlan::Decode(node) => walk(&node.input, provider, blocklist, dict_ctx)?,
+        LogicalPlan::AggregateStateMerge(node) => {
+            walk(&node.old_input, provider, blocklist, dict_ctx)?;
+            walk(&node.delta_input, provider, blocklist, dict_ctx)?;
+        }
         LogicalPlan::Join(node) => {
             // TODO(task-8): joins with matching dict snapshots on both
             // sides could keep dict ids through the equi-join; today

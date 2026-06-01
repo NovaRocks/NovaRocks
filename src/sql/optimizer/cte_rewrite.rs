@@ -52,6 +52,10 @@ pub(crate) fn collect_cte_counts(plan: &LogicalPlan) -> CTEContext {
                 *ctx.consume_count.entry(node.cte_id).or_insert(0) += 1;
             }
             LogicalPlan::Decode(node) => visit(&node.input, ctx),
+            LogicalPlan::AggregateStateMerge(node) => {
+                visit(&node.old_input, ctx);
+                visit(&node.delta_input, ctx);
+            }
             LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
                 panic!("imv marker leaked into non-IMV plan");
             }
@@ -197,6 +201,16 @@ pub(crate) fn inline_single_use_ctes(
             output_columns: node.output_columns,
             required_output_columns: node.required_output_columns,
         })),
+        LogicalPlan::AggregateStateMerge(node) => {
+            Ok(LogicalPlan::AggregateStateMerge(AggregateStateMergeNode {
+                old_input: Box::new(inline_single_use_ctes(*node.old_input, ctx)?),
+                delta_input: Box::new(inline_single_use_ctes(*node.delta_input, ctx)?),
+                group_key_names: node.group_key_names,
+                aggregate_state_names: node.aggregate_state_names,
+                change_op_column: node.change_op_column,
+                output_columns: node.output_columns,
+            }))
+        },
         LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
         }
@@ -323,6 +337,16 @@ fn replace_cte_consume(
             output_columns: node.output_columns,
             required_output_columns: node.required_output_columns,
         })),
+        LogicalPlan::AggregateStateMerge(node) => {
+            Ok(LogicalPlan::AggregateStateMerge(AggregateStateMergeNode {
+                old_input: Box::new(replace_cte_consume(*node.old_input, cte_id, replacement)?),
+                delta_input: Box::new(replace_cte_consume(*node.delta_input, cte_id, replacement)?),
+                group_key_names: node.group_key_names,
+                aggregate_state_names: node.aggregate_state_names,
+                change_op_column: node.change_op_column,
+                output_columns: node.output_columns,
+            }))
+        },
         LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
         }

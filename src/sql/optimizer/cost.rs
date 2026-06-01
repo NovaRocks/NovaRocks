@@ -57,7 +57,8 @@ pub(crate) fn compute_cost(
         | Operator::LogicalCTEAnchor(_)
         | Operator::LogicalCTEProduce(_)
         | Operator::LogicalCTEConsume(_)
-        | Operator::LogicalDecode(_) => 0.0,
+        | Operator::LogicalDecode(_)
+        | Operator::LogicalAggregateStateMerge(_) => 0.0,
 
         // ------------------------------------------------------------------
         // Physical operators
@@ -163,7 +164,8 @@ pub(crate) fn compute_cost(
         | Operator::PhysicalTableFunction(_)
         | Operator::PhysicalCTEProduce(_)
         | Operator::PhysicalCTEConsume(_)
-        | Operator::PhysicalDecode(_) => own_stats.output_row_count * 0.01,
+        | Operator::PhysicalDecode(_)
+        | Operator::PhysicalAggregateStateMerge(_) => own_stats.output_row_count * 0.01,
     }
 }
 

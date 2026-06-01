@@ -48,6 +48,9 @@ pub(crate) enum LogicalPlan {
     /// today no optimizer pass produces this variant — Task 5 only adds the
     /// type-system plumbing.
     Decode(DecodeNode),
+    /// Logical IMV aggregate-state reconciliation over old target state and
+    /// delta state. Execution lowering is added by later tasks.
+    AggregateStateMerge(AggregateStateMergeNode),
     /// IMV marker: "compute the incremental of input". Emitted by the
     /// `imv-delta-marker` stage; rejected by `imv-validation` if not
     /// consumed. Must never reach physical lowering. See
@@ -86,6 +89,16 @@ pub(crate) struct DecodeNode {
 pub(crate) struct DecodeMapping {
     pub dict_column: String,
     pub string_column: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AggregateStateMergeNode {
+    pub(crate) old_input: Box<LogicalPlan>,
+    pub(crate) delta_input: Box<LogicalPlan>,
+    pub(crate) group_key_names: Vec<String>,
+    pub(crate) aggregate_state_names: Vec<String>,
+    pub(crate) change_op_column: String,
+    pub(crate) output_columns: Vec<OutputColumn>,
 }
 
 /// Repeat node for ROLLUP/CUBE/GROUPING SETS.
@@ -447,5 +460,50 @@ mod plan_tests {
         };
         assert_eq!(node.output_columns.len(), 1);
         assert_eq!(node.output_columns[0].name, "z");
+    }
+
+    #[test]
+    fn aggregate_state_merge_node_preserves_inputs_and_output_columns() {
+        use crate::sql::analysis::OutputColumn;
+        use crate::sql::column_id::ColumnId;
+
+        fn empty_values_for_test() -> LogicalPlan {
+            LogicalPlan::Values(ValuesNode {
+                rows: vec![],
+                columns: vec![],
+                required_output_columns: None,
+            })
+        }
+
+        let old_input = empty_values_for_test();
+        let delta_input = empty_values_for_test();
+        let node = AggregateStateMergeNode {
+            old_input: Box::new(old_input),
+            delta_input: Box::new(delta_input),
+            group_key_names: vec!["region".to_string()],
+            aggregate_state_names: vec!["c".to_string(), "s".to_string()],
+            change_op_column: "__change_op".to_string(),
+            output_columns: vec![
+                OutputColumn {
+                    column_id: ColumnId::new_for_test(1),
+                    name: "region".to_string(),
+                    data_type: arrow::datatypes::DataType::Utf8,
+                    nullable: true,
+                    is_internal: false,
+                },
+                OutputColumn {
+                    column_id: ColumnId::new_for_test(2),
+                    name: "c".to_string(),
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: true,
+                    is_internal: false,
+                },
+            ],
+        };
+
+        assert_eq!(node.group_key_names, vec!["region"]);
+        assert_eq!(node.aggregate_state_names, vec!["c", "s"]);
+        assert_eq!(node.change_op_column, "__change_op");
+        assert_eq!(node.output_columns.len(), 2);
     }
 }

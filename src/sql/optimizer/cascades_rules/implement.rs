@@ -1309,6 +1309,33 @@ impl Rule for DecodeToPhysical {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 20. AggregateStateMergeToPhysical
+// ---------------------------------------------------------------------------
+
+pub(crate) struct AggregateStateMergeToPhysical;
+
+impl Rule for AggregateStateMergeToPhysical {
+    fn name(&self) -> &str {
+        "AggregateStateMergeToPhysical"
+    }
+    fn rule_type(&self) -> RuleType {
+        RuleType::Implementation
+    }
+    fn matches(&self, op: &Operator) -> bool {
+        matches!(op, Operator::LogicalAggregateStateMerge(_))
+    }
+    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+        let Operator::LogicalAggregateStateMerge(op) = &expr.op else {
+            return vec![];
+        };
+        vec![NewExpr {
+            op: Operator::PhysicalAggregateStateMerge(op.clone()),
+            children: expr.children.clone(),
+        }]
+    }
+}
+
 #[cfg(test)]
 mod decode_tests {
     use super::*;

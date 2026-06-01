@@ -187,6 +187,11 @@ pub(crate) fn collect_output_columns(plan: &LogicalPlan) -> HashSet<String> {
             .iter()
             .map(|c| c.name.to_lowercase())
             .collect(),
+        LogicalPlan::AggregateStateMerge(a) => a
+            .output_columns
+            .iter()
+            .map(|c| c.name.to_lowercase())
+            .collect(),
         LogicalPlan::Sort(s) => collect_output_columns(&s.input),
         LogicalPlan::Limit(l) => collect_output_columns(&l.input),
         LogicalPlan::Window(w) => w
@@ -385,6 +390,9 @@ pub(crate) fn collect_output_ids_ordered(
         LogicalPlan::Intersect(i) => i.output_columns.iter().map(|c| c.column_id).collect(),
         LogicalPlan::Except(e) => e.output_columns.iter().map(|c| c.column_id).collect(),
         LogicalPlan::Decode(d) => d.output_columns.iter().map(|c| c.column_id).collect(),
+        LogicalPlan::AggregateStateMerge(a) => {
+            a.output_columns.iter().map(|c| c.column_id).collect()
+        }
         LogicalPlan::Values(v) => v.columns.iter().map(|c| c.column_id).collect(),
         // GenerateSeries has no ColumnId on its output slot (only a name string).
         LogicalPlan::GenerateSeries(_) => vec![],
@@ -597,6 +605,11 @@ fn collect_qualified_output_columns_inner(plan: &LogicalPlan, out: &mut HashSet<
             collect_qualified_output_columns_inner(&j.right, out);
         }
         LogicalPlan::Aggregate(a) => {
+            for c in &a.output_columns {
+                out.insert((None, c.name.to_lowercase()));
+            }
+        }
+        LogicalPlan::AggregateStateMerge(a) => {
             for c in &a.output_columns {
                 out.insert((None, c.name.to_lowercase()));
             }

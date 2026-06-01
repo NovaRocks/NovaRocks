@@ -68,6 +68,15 @@ pub(crate) fn estimate_statistics(
             column_statistics: HashMap::new(),
         },
         LogicalPlan::Decode(d) => estimate_statistics(&d.input, table_stats),
+        LogicalPlan::AggregateStateMerge(n) => {
+            let old_stats = estimate_statistics(&n.old_input, table_stats);
+            let delta_stats = estimate_statistics(&n.delta_input, table_stats);
+            Statistics {
+                output_row_count: (old_stats.output_row_count + delta_stats.output_row_count)
+                    .max(1.0),
+                column_statistics: HashMap::new(),
+            }
+        }
         LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
         }

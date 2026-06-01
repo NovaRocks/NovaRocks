@@ -176,6 +176,16 @@ pub(crate) fn derive_statistics(
             child_statistics(memo, &expr.children, 0)
         }
 
+        Operator::LogicalAggregateStateMerge(_) => {
+            let old_stats = child_statistics(memo, &expr.children, 0);
+            let delta_stats = child_statistics(memo, &expr.children, 1);
+            Statistics {
+                output_row_count: (old_stats.output_row_count + delta_stats.output_row_count)
+                    .max(1.0),
+                column_statistics: HashMap::new(),
+            }
+        }
+
         // -- Binary / multi-child operators --
         Operator::LogicalJoin(join) => {
             let left_stats = child_statistics(memo, &expr.children, 0);
@@ -594,6 +604,16 @@ pub(crate) fn derive_statistics(
             // Decode preserves row count and column stats.
             child_statistics(memo, &expr.children, 0)
         }
+
+        Operator::PhysicalAggregateStateMerge(_) => {
+            let old_stats = child_statistics(memo, &expr.children, 0);
+            let delta_stats = child_statistics(memo, &expr.children, 1);
+            Statistics {
+                output_row_count: (old_stats.output_row_count + delta_stats.output_row_count)
+                    .max(1.0),
+                column_statistics: HashMap::new(),
+            }
+        }
     }
 }
 
@@ -997,6 +1017,7 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
             })
             .collect(),
         Operator::LogicalAggregate(a) => a.output_columns.clone(),
+        Operator::LogicalAggregateStateMerge(a) => a.output_columns.clone(),
         Operator::LogicalWindow(w) => w.output_columns.clone(),
         Operator::LogicalValues(v) => v.columns.clone(),
         // Decode renames dict->string and therefore breaks the
@@ -1086,6 +1107,7 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
             })
             .collect(),
         Operator::PhysicalHashAggregate(a) => a.output_columns.clone(),
+        Operator::PhysicalAggregateStateMerge(a) => a.output_columns.clone(),
         Operator::PhysicalWindow(w) => w.output_columns.clone(),
         Operator::PhysicalValues(v) => v.columns.clone(),
         // Decode renames dict->string; see the LogicalDecode arm above.

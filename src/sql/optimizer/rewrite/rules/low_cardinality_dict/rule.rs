@@ -58,6 +58,9 @@ fn contains_scan(plan: &LogicalPlan) -> bool {
         LogicalPlan::CTEAnchor(node) => {
             contains_scan(&node.produce) || contains_scan(&node.consumer)
         }
+        LogicalPlan::AggregateStateMerge(node) => {
+            contains_scan(&node.old_input) || contains_scan(&node.delta_input)
+        }
         LogicalPlan::Union(node) => node.inputs.iter().any(contains_scan),
         LogicalPlan::Intersect(node) => node.inputs.iter().any(contains_scan),
         LogicalPlan::Except(node) => node.inputs.iter().any(contains_scan),

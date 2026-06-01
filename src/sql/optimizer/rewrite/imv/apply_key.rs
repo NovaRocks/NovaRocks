@@ -140,6 +140,7 @@ fn plan_kind(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::CTEProduce(_) => "CTEProduce",
         LogicalPlan::CTEConsume(_) => "CTEConsume",
         LogicalPlan::Decode(_) => "Decode",
+        LogicalPlan::AggregateStateMerge(_) => "AggregateStateMerge",
         LogicalPlan::ImvDelta(_) => "ImvDelta",
         LogicalPlan::ImvVersion(_) => "ImvVersion",
     }

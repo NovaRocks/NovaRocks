@@ -124,6 +124,7 @@ fn rewrite_node(
         | LogicalPlan::Window(_)
         | LogicalPlan::TableFunction(_)
         | LogicalPlan::Repeat(_)
+        | LogicalPlan::AggregateStateMerge(_)
         // TODO(post-Task-9): multi-consumer CTEs with matching dict
         // snapshots across every consumer could keep the dict column
         // on the producer output. Doing so requires a fix-up pass over
@@ -1168,6 +1169,13 @@ fn rewrite_children_decoded(
             node.input = Box::new(wrap_with_decode(input, &scope, ctx));
             Ok(LogicalPlan::CTEProduce(node))
         }
+        LogicalPlan::AggregateStateMerge(mut node) => {
+            let (old_input, old_scope) = rewrite_node(*node.old_input, ctx)?;
+            let (delta_input, delta_scope) = rewrite_node(*node.delta_input, ctx)?;
+            node.old_input = Box::new(wrap_with_decode(old_input, &old_scope, ctx));
+            node.delta_input = Box::new(wrap_with_decode(delta_input, &delta_scope, ctx));
+            Ok(LogicalPlan::AggregateStateMerge(node))
+        }
         other => Ok(other),
     }
 }
@@ -1245,6 +1253,7 @@ fn plan_output_columns(plan: &LogicalPlan) -> Vec<OutputColumn> {
         LogicalPlan::CTEProduce(node) => node.output_columns.clone(),
         LogicalPlan::CTEConsume(node) => node.output_columns.clone(),
         LogicalPlan::Decode(node) => node.output_columns.clone(),
+        LogicalPlan::AggregateStateMerge(node) => node.output_columns.clone(),
         LogicalPlan::Filter(node) => plan_output_columns(&node.input),
         LogicalPlan::Project(node) => node
             .items

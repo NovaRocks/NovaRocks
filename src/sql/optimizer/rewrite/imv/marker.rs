@@ -190,6 +190,9 @@ pub(crate) fn plan_contains_imv_marker(plan: &LogicalPlan) -> bool {
         LogicalPlan::Repeat(n) => plan_contains_imv_marker(&n.input),
         LogicalPlan::CTEProduce(n) => plan_contains_imv_marker(&n.input),
         LogicalPlan::Decode(n) => plan_contains_imv_marker(&n.input),
+        LogicalPlan::AggregateStateMerge(n) => {
+            plan_contains_imv_marker(&n.old_input) || plan_contains_imv_marker(&n.delta_input)
+        }
         LogicalPlan::Join(n) => {
             plan_contains_imv_marker(&n.left) || plan_contains_imv_marker(&n.right)
         }
@@ -236,6 +239,10 @@ fn collect_into(plan: &LogicalPlan, found: &mut Vec<&'static str>) {
         LogicalPlan::Repeat(n) => collect_into(&n.input, found),
         LogicalPlan::CTEProduce(n) => collect_into(&n.input, found),
         LogicalPlan::Decode(n) => collect_into(&n.input, found),
+        LogicalPlan::AggregateStateMerge(n) => {
+            collect_into(&n.old_input, found);
+            collect_into(&n.delta_input, found);
+        }
         LogicalPlan::Join(n) => {
             collect_into(&n.left, found);
             collect_into(&n.right, found);

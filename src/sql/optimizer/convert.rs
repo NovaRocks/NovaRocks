@@ -2,10 +2,11 @@
 
 use super::memo::{GroupId, MExpr, Memo};
 use super::operator::{
-    LogicalAggregateOp, LogicalCTEAnchorOp, LogicalCTEConsumeOp, LogicalCTEProduceOp,
-    LogicalDecodeOp, LogicalExceptOp, LogicalFilterOp, LogicalGenerateSeriesOp, LogicalIntersectOp,
-    LogicalJoinOp, LogicalLimitOp, LogicalProjectOp, LogicalRepeatOp, LogicalScanOp, LogicalSortOp,
-    LogicalTableFunctionOp, LogicalUnionOp, LogicalValuesOp, LogicalWindowOp, Operator,
+    AggregateStateMergeOp, LogicalAggregateOp, LogicalCTEAnchorOp, LogicalCTEConsumeOp,
+    LogicalCTEProduceOp, LogicalDecodeOp, LogicalExceptOp, LogicalFilterOp,
+    LogicalGenerateSeriesOp, LogicalIntersectOp, LogicalJoinOp, LogicalLimitOp, LogicalProjectOp,
+    LogicalRepeatOp, LogicalScanOp, LogicalSortOp, LogicalTableFunctionOp, LogicalUnionOp,
+    LogicalValuesOp, LogicalWindowOp, Operator,
 };
 use crate::sql::planner::plan::LogicalPlan;
 
@@ -300,6 +301,23 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
                 id: memo.next_expr_id(),
                 op,
                 children: vec![child],
+            };
+            memo.new_group(expr)
+        }
+
+        LogicalPlan::AggregateStateMerge(node) => {
+            let old_input = logical_plan_to_memo(&node.old_input, memo);
+            let delta_input = logical_plan_to_memo(&node.delta_input, memo);
+            let op = Operator::LogicalAggregateStateMerge(AggregateStateMergeOp {
+                group_key_names: node.group_key_names.clone(),
+                aggregate_state_names: node.aggregate_state_names.clone(),
+                change_op_column: node.change_op_column.clone(),
+                output_columns: node.output_columns.clone(),
+            });
+            let expr = MExpr {
+                id: memo.next_expr_id(),
+                op,
+                children: vec![old_input, delta_input],
             };
             memo.new_group(expr)
         }
