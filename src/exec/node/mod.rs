@@ -86,6 +86,9 @@ pub enum ExecNodeKind {
     Scan(ScanNode),
     IcebergDeltaScan(IcebergDeltaScanNode),
     AggregateStateMerge(crate::exec::operators::aggregate_state_merge::AggregateStateMergePlan),
+    AggregateStatePhysicalize(
+        crate::exec::operators::aggregate_state_merge::AggregateStatePhysicalizePlan,
+    ),
     Fetch(FetchNode),
     LookUp(LookUpNode),
     Aggregate(AggregateNode),
@@ -255,7 +258,7 @@ fn output_slots_for_node(node: &ExecNode) -> Option<HashSet<SlotId>> {
                 .copied()
                 .collect(),
         ),
-        ExecNodeKind::AggregateStateMerge(_) => None,
+        ExecNodeKind::AggregateStateMerge(_) | ExecNodeKind::AggregateStatePhysicalize(_) => None,
         ExecNodeKind::Fetch(fetch) => Some(
             fetch
                 .output_chunk_schema
@@ -438,6 +441,10 @@ fn push_down_local_runtime_filters_inner(
             let delta_filtered = filter_specs_for_child(arena, inherited, &plan.delta_input);
             push_down_local_runtime_filters_inner(&mut plan.old_input, arena, &old_filtered);
             push_down_local_runtime_filters_inner(&mut plan.delta_input, arena, &delta_filtered);
+        }
+        ExecNodeKind::AggregateStatePhysicalize(plan) => {
+            let filtered = filter_specs_for_child(arena, inherited, &plan.input);
+            push_down_local_runtime_filters_inner(&mut plan.input, arena, &filtered);
         }
         ExecNodeKind::Fetch(FetchNode { input, .. }) => {
             let filtered = filter_specs_for_child(arena, inherited, input);

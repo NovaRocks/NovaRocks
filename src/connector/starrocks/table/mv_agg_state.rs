@@ -297,6 +297,14 @@ pub(crate) fn materialize_aggregate_result_chunks(
         .collect()
 }
 
+pub(crate) fn materialize_aggregate_state_chunk(
+    chunk: Chunk,
+    layout: &AggregateMvLayout,
+    shape: &AggregateMvShape,
+) -> Result<Chunk, String> {
+    materialize_aggregate_result_batch(&chunk.batch, layout, shape)
+}
+
 pub(crate) fn load_aggregate_physical_rows(
     chunks: &[Chunk],
     layout: &AggregateMvLayout,

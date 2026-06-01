@@ -98,6 +98,60 @@ fn single_fragment_child_plan(
     }))
 }
 
+fn aggregate_physical_output_columns(
+    layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
+) -> Result<Vec<OutputColumn>, String> {
+    layout
+        .physical_columns
+        .iter()
+        .map(|column| {
+            let data_type = crate::engine::sql_expr::sql_type_to_arrow_type(
+                &column.column.data_type,
+            )
+            .map_err(|e| {
+                format!(
+                    "convert aggregate physical column `{}` type failed: {e}",
+                    column.column.name
+                )
+            })?;
+            Ok(OutputColumn {
+                name: column.column.name.clone(),
+                data_type,
+                nullable: column.column.nullable,
+            })
+        })
+        .collect()
+}
+
+fn validate_aggregate_state_merge_child_output(
+    input_name: &str,
+    actual: &[OutputColumn],
+    expected: &[OutputColumn],
+) -> Result<(), String> {
+    if actual.len() != expected.len()
+        || actual.iter().zip(expected).any(|(actual, expected)| {
+            !actual.name.eq_ignore_ascii_case(&expected.name)
+                || actual.data_type != expected.data_type
+                || actual.nullable != expected.nullable
+        })
+    {
+        return Err(format!(
+            "AggregateStateMerge {input_name} input must output physical aggregate columns: got [{}], expected [{}]",
+            actual
+                .iter()
+                .map(|column| format!("{}:{:?}:{}", column.name, column.data_type, column.nullable))
+                .collect::<Vec<_>>()
+                .join(", "),
+            expected
+                .iter()
+                .map(|column| format!("{}:{:?}:{}", column.name, column.data_type, column.nullable))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Scan/join ownership metadata (used by RF planning)
 // ---------------------------------------------------------------------------
@@ -459,7 +513,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         current_database: &str,
         mv_refresh_ctx: Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
     ) -> Result<MultiFragmentBuildResult, String> {
-        let Operator::PhysicalAggregateStateMerge(op) = &plan.op else {
+        let Operator::PhysicalAggregateStateMerge(_op) = &plan.op else {
             return Err("internal error: expected PhysicalAggregateStateMerge".to_string());
         };
         if plan.children.len() != 2 {
@@ -470,7 +524,39 @@ impl<'a> PlanFragmentBuilder<'a> {
         }
         let refresh_ctx = mv_refresh_ctx
             .ok_or_else(|| "AggregateStateMerge codegen requires MV refresh context".to_string())?;
-        let layout = refresh_ctx.rewrite.aggregate_layout_for_execution()?;
+        let (shape, layout) = refresh_ctx
+            .rewrite
+            .aggregate_shape_and_layout_for_execution()?;
+        Self::build_aggregate_state_merge_direct_with_layout(
+            plan,
+            catalog,
+            connectors,
+            current_database,
+            mv_refresh_ctx,
+            shape,
+            layout,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_aggregate_state_merge_direct_with_layout(
+        plan: &PhysicalPlanNode,
+        catalog: &'a dyn CatalogProvider,
+        connectors: &'a crate::connector::ConnectorRegistry,
+        current_database: &str,
+        mv_refresh_ctx: Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+        shape: crate::connector::starrocks::table::mv_shape::AggregateMvShape,
+        layout: crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
+    ) -> Result<MultiFragmentBuildResult, String> {
+        let Operator::PhysicalAggregateStateMerge(op) = &plan.op else {
+            return Err("internal error: expected PhysicalAggregateStateMerge".to_string());
+        };
+        if plan.children.len() != 2 {
+            return Err(format!(
+                "AggregateStateMerge codegen expects two children, got {}",
+                plan.children.len()
+            ));
+        }
         Self::validate_aggregate_state_merge_layout(op, &layout)?;
 
         let old_input = single_fragment_child_plan(Self::build_with_mv_refresh_ctx(
@@ -480,15 +566,46 @@ impl<'a> PlanFragmentBuilder<'a> {
             current_database,
             mv_refresh_ctx,
         )?)
-        .map_err(|e| format!("AggregateStateMerge old input: {e}"))?;
-        let delta_input = single_fragment_child_plan(Self::build_with_mv_refresh_ctx(
+        .map_err(|e| {
+            format!(
+                "AggregateStateMerge direct execution requires local single-fragment children; old input: {e}"
+            )
+        })?;
+        let delta_state_input = single_fragment_child_plan(Self::build_with_mv_refresh_ctx(
             &plan.children[1],
             catalog,
             connectors,
             current_database,
             mv_refresh_ctx,
         )?)
-        .map_err(|e| format!("AggregateStateMerge delta input: {e}"))?;
+        .map_err(|e| {
+            format!(
+                "AggregateStateMerge direct execution requires local single-fragment children; delta input: {e}"
+            )
+        })?;
+        let physical_columns = aggregate_physical_output_columns(&layout)?;
+        validate_aggregate_state_merge_child_output(
+            "old",
+            &old_input.output_columns,
+            &physical_columns,
+        )?;
+        let delta_input = Box::new(crate::sql::codegen::PlanBuildResult {
+            plan: plan_nodes::TPlan::new(Vec::new()),
+            desc_tbl: DescriptorTableBuilder::new().build(),
+            exec_params: nodes::build_exec_params_multi_with_refresh_context(
+                connectors,
+                &[],
+                mv_refresh_ctx,
+            )?,
+            output_columns: physical_columns.clone(),
+            direct_exec: Some(Box::new(DirectExecPlan::AggregateStatePhysicalize {
+                input: delta_state_input,
+                layout: layout.clone(),
+                shape,
+            })),
+            query_global_dicts: None,
+            query_global_dict_exprs: None,
+        });
 
         let output_columns = op
             .output_columns
@@ -531,6 +648,16 @@ impl<'a> PlanFragmentBuilder<'a> {
         op: &crate::sql::optimizer::operator::AggregateStateMergeOp,
         layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
     ) -> Result<(), String> {
+        if !op
+            .change_op_column
+            .eq_ignore_ascii_case(crate::exec::change_op::CHANGE_OP_COLUMN)
+        {
+            return Err(format!(
+                "AggregateStateMerge change-op column mismatch: got `{}` expected `{}`",
+                op.change_op_column,
+                crate::exec::change_op::CHANGE_OP_COLUMN
+            ));
+        }
         let layout_keys = layout
             .group_key_source_indexes
             .iter()
@@ -563,19 +690,15 @@ impl<'a> PlanFragmentBuilder<'a> {
             .iter()
             .map(|column| column.name.as_str())
             .collect::<Vec<_>>();
-        let missing_state_names = op
-            .aggregate_state_names
-            .iter()
-            .filter(|op_name| {
-                !state_names
-                    .iter()
-                    .any(|layout_name| layout_name.eq_ignore_ascii_case(op_name))
-            })
-            .collect::<Vec<_>>();
-        if !missing_state_names.is_empty() {
+        if state_names.len() != op.aggregate_state_names.len()
+            || state_names
+                .iter()
+                .zip(&op.aggregate_state_names)
+                .any(|(layout_name, op_name)| !layout_name.eq_ignore_ascii_case(op_name))
+        {
             return Err(format!(
-                "AggregateStateMerge state column/layout mismatch: missing plan state columns {:?} from layout {:?}",
-                missing_state_names, state_names
+                "AggregateStateMerge state column/layout mismatch: plan={:?} layout={:?}",
+                op.aggregate_state_names, state_names
             ));
         }
         Ok(())
@@ -4685,6 +4808,87 @@ mod tests {
         }
     }
 
+    fn aggregate_merge_shape_for_test()
+    -> crate::connector::starrocks::table::mv_shape::AggregateMvShape {
+        let dialect = sqlparser::dialect::GenericDialect {};
+        let statements = sqlparser::parser::Parser::parse_sql(
+            &dialect,
+            "select region, count(*) as c, sum(amount) as s from ice.ns.orders group by region",
+        )
+        .expect("parse aggregate shape query");
+        let sqlparser::ast::Statement::Query(query) =
+            statements.into_iter().next().expect("one query")
+        else {
+            panic!("expected query");
+        };
+        let shape =
+            crate::connector::starrocks::table::mv_shape::classify_incremental_mv_query(&query)
+                .expect("classify aggregate shape");
+        let crate::connector::starrocks::table::mv_shape::IncrementalMvShape::Aggregate(shape) =
+            shape
+        else {
+            panic!("expected aggregate shape");
+        };
+        shape
+    }
+
+    fn aggregate_merge_layout_for_test(
+        shape: &crate::connector::starrocks::table::mv_shape::AggregateMvShape,
+    ) -> crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout {
+        crate::connector::starrocks::table::mv_agg_state::build_aggregate_mv_layout(
+            shape,
+            &[
+                output_col_for_test(1, "region", DataType::Utf8, true),
+                output_col_for_test(2, "c", DataType::Int64, false),
+                output_col_for_test(3, "s", DataType::Int64, true),
+            ],
+        )
+        .expect("aggregate layout")
+    }
+
+    fn aggregate_merge_plan_for_test(
+        old_child: PhysicalPlanNode,
+        delta_child: PhysicalPlanNode,
+        aggregate_state_names: Vec<String>,
+    ) -> PhysicalPlanNode {
+        let output_columns = vec![
+            output_col_for_test(1, "region", DataType::Utf8, true),
+            output_col_for_test(2, "c", DataType::Int64, false),
+            output_col_for_test(3, "s", DataType::Int64, true),
+            output_col_for_test(4, "__change_op", DataType::Int8, false),
+        ];
+        PhysicalPlanNode {
+            op: Operator::PhysicalAggregateStateMerge(AggregateStateMergeOp {
+                group_key_names: vec!["region".to_string()],
+                aggregate_state_names,
+                change_op_column: crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
+                output_columns: output_columns.clone(),
+            }),
+            children: vec![old_child, delta_child],
+            stats: stats_for_test(),
+            output_columns,
+        }
+    }
+
+    fn aggregate_physical_columns_for_test() -> Vec<OutputColumn> {
+        vec![
+            output_col_for_test(10, "__row_id__", DataType::Utf8, false),
+            output_col_for_test(11, "region", DataType::Utf8, true),
+            output_col_for_test(12, "c", DataType::Int64, false),
+            output_col_for_test(13, "s", DataType::Int64, true),
+            output_col_for_test(14, "__agg_state_c", DataType::Binary, false),
+            output_col_for_test(15, "__agg_state_s", DataType::Binary, false),
+        ]
+    }
+
+    fn aggregate_delta_state_columns_for_test() -> Vec<OutputColumn> {
+        vec![
+            output_col_for_test(21, "region", DataType::Utf8, true),
+            output_col_for_test(22, "__agg_state_c", DataType::Binary, true),
+            output_col_for_test(23, "__agg_state_s", DataType::Binary, true),
+        ]
+    }
+
     #[test]
     fn aggregate_state_merge_dispatch_requires_refresh_context() {
         let output_columns = vec![
@@ -4736,6 +4940,108 @@ mod tests {
         );
         assert!(
             !err.contains("unhandled operator in fragment builder"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn aggregate_state_merge_direct_codegen_wraps_delta_as_physical_input() {
+        let shape = aggregate_merge_shape_for_test();
+        let layout = aggregate_merge_layout_for_test(&shape);
+        let state_names = layout
+            .state_columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        let plan = aggregate_merge_plan_for_test(
+            values_plan_for_test(aggregate_physical_columns_for_test()),
+            values_plan_for_test(aggregate_delta_state_columns_for_test()),
+            state_names,
+        );
+
+        let build = PlanFragmentBuilder::build_aggregate_state_merge_direct_with_layout(
+            &plan,
+            &DummyCatalog,
+            &crate::connector::ConnectorRegistry::default(),
+            "db",
+            None,
+            shape,
+            layout,
+        )
+        .expect("direct aggregate merge build");
+        let root = build
+            .fragment_results
+            .into_iter()
+            .next()
+            .expect("root fragment");
+        let Some(direct) = root.direct_exec else {
+            panic!("expected direct exec plan");
+        };
+        let DirectExecPlan::AggregateStateMerge { delta_input, .. } = *direct else {
+            panic!("expected aggregate state merge direct plan");
+        };
+        assert_eq!(
+            delta_input
+                .output_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "__row_id__",
+                "region",
+                "c",
+                "s",
+                "__agg_state_c",
+                "__agg_state_s"
+            ]
+        );
+        assert!(matches!(
+            delta_input.direct_exec.as_deref(),
+            Some(DirectExecPlan::AggregateStatePhysicalize { .. })
+        ));
+    }
+
+    #[test]
+    fn aggregate_state_merge_direct_codegen_rejects_multi_fragment_children() {
+        let shape = aggregate_merge_shape_for_test();
+        let layout = aggregate_merge_layout_for_test(&shape);
+        let state_names = layout
+            .state_columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        let distributed_old = PhysicalPlanNode {
+            op: Operator::PhysicalDistribution(PhysicalDistributionOp {
+                spec: DistributionSpec::shuffle_agg([
+                    crate::sql::column_id::ColumnId::new_for_test(11),
+                ]),
+            }),
+            children: vec![values_plan_for_test(aggregate_physical_columns_for_test())],
+            stats: stats_for_test(),
+            output_columns: aggregate_physical_columns_for_test(),
+        };
+        let plan = aggregate_merge_plan_for_test(
+            distributed_old,
+            values_plan_for_test(aggregate_delta_state_columns_for_test()),
+            state_names,
+        );
+
+        let err = match PlanFragmentBuilder::build_aggregate_state_merge_direct_with_layout(
+            &plan,
+            &DummyCatalog,
+            &crate::connector::ConnectorRegistry::default(),
+            "db",
+            None,
+            shape,
+            layout,
+        ) {
+            Ok(_) => panic!("distributed child unexpectedly built"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains(
+                "AggregateStateMerge direct execution requires local single-fragment children"
+            ),
             "{err}"
         );
     }

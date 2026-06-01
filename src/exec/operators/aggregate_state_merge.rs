@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout;
+use crate::connector::starrocks::table::mv_shape::AggregateMvShape;
 use crate::engine::mv::iceberg_aggregate_state::merge_aggregate_state_chunks_for_change_stream;
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
@@ -14,6 +15,13 @@ pub struct AggregateStateMergePlan {
     pub(crate) old_input: Box<crate::exec::node::ExecNode>,
     pub(crate) delta_input: Box<crate::exec::node::ExecNode>,
     pub(crate) layout: AggregateMvLayout,
+}
+
+#[derive(Clone, Debug)]
+pub struct AggregateStatePhysicalizePlan {
+    pub(crate) input: Box<crate::exec::node::ExecNode>,
+    pub(crate) layout: AggregateMvLayout,
+    pub(crate) shape: AggregateMvShape,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -307,6 +315,112 @@ impl ProcessorOperator for AggregateStateMergeSourceOperator {
     }
 }
 
+pub(crate) struct AggregateStatePhysicalizeProcessorFactory {
+    name: String,
+    plan: AggregateStatePhysicalizePlan,
+}
+
+impl AggregateStatePhysicalizeProcessorFactory {
+    pub(crate) fn new(plan: AggregateStatePhysicalizePlan, node_id: i32) -> Self {
+        let name = if node_id >= 0 {
+            format!("AggregateStatePhysicalize (id={node_id})")
+        } else {
+            "AggregateStatePhysicalize".to_string()
+        };
+        Self { name, plan }
+    }
+}
+
+impl OperatorFactory for AggregateStatePhysicalizeProcessorFactory {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
+        Box::new(AggregateStatePhysicalizeProcessor {
+            name: self.name.clone(),
+            layout: self.plan.layout.clone(),
+            shape: self.plan.shape.clone(),
+            pending_output: None,
+            finishing: false,
+            finished: false,
+        })
+    }
+}
+
+struct AggregateStatePhysicalizeProcessor {
+    name: String,
+    layout: AggregateMvLayout,
+    shape: AggregateMvShape,
+    pending_output: Option<Chunk>,
+    finishing: bool,
+    finished: bool,
+}
+
+impl Operator for AggregateStatePhysicalizeProcessor {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+        Some(self)
+    }
+
+    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+        Some(self)
+    }
+}
+
+impl ProcessorOperator for AggregateStatePhysicalizeProcessor {
+    fn need_input(&self) -> bool {
+        !self.finishing && !self.finished && self.pending_output.is_none()
+    }
+
+    fn has_output(&self) -> bool {
+        self.pending_output.is_some()
+    }
+
+    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+        if self.finished {
+            return Ok(());
+        }
+        if self.pending_output.is_some() {
+            return Err(
+                "aggregate state physicalize received input while output buffer is full"
+                    .to_string(),
+            );
+        }
+        self.pending_output = Some(
+            crate::connector::starrocks::table::mv_agg_state::materialize_aggregate_state_chunk(
+                chunk,
+                &self.layout,
+                &self.shape,
+            )?,
+        );
+        Ok(())
+    }
+
+    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+        let out = self.pending_output.take();
+        if self.finishing {
+            self.finished = true;
+        }
+        Ok(out)
+    }
+
+    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        self.finishing = true;
+        if self.pending_output.is_none() {
+            self.finished = true;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -322,11 +436,18 @@ mod tests {
     use crate::connector::starrocks::table::mv_agg_state::{
         AggregateMvLayout, AggregateStateColumn, AggregateStateRole, AggregateVisibleColumn,
     };
-    use crate::connector::starrocks::table::mv_shape::AggregateFunctionKind;
+    use crate::connector::starrocks::table::mv_shape::{
+        AggregateFunctionKind, AggregateMvShape, IncrementalMvShape, classify_incremental_mv_query,
+    };
     use crate::connector::starrocks::table::state_codec::{encode_count_state, encode_sum_int64};
     use crate::engine::record_batch_to_chunk;
     use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
     use crate::exec::chunk::Chunk;
+    use crate::exec::expr::ExprArena;
+    use crate::exec::node::values::ValuesNode;
+    use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
+    use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
+    use crate::exec::pipeline::executor::execute_plan_with_pipeline;
     use crate::exec::pipeline::operator_factory::OperatorFactory;
     use crate::runtime::runtime_state::RuntimeState;
     use crate::sql::parser::ast::SqlType;
@@ -358,6 +479,75 @@ mod tests {
         assert_eq!(int8_value(&output, "__change_op", 0), CHANGE_OP_INSERT);
         assert_eq!(int64_value(&output, "c", 0), 1);
         assert_eq!(int64_value(&output, "s", 0), 80);
+    }
+
+    #[test]
+    fn merge_pipeline_physicalizes_delta_child_before_merging() {
+        let layout = aggregate_layout_for_test();
+        let old = aggregate_state_chunk_for_test(vec![("east", 2_i64, 300_i64)]);
+        let delta_state = state_shaped_delta_chunk_for_test(vec![("east", -1_i64, -100_i64)]);
+        let plan = ExecPlan {
+            arena: ExprArena::default(),
+            root: ExecNode {
+                kind: ExecNodeKind::AggregateStateMerge(AggregateStateMergePlan {
+                    old_input: Box::new(ExecNode {
+                        kind: ExecNodeKind::Values(ValuesNode {
+                            chunk: old,
+                            node_id: 1,
+                        }),
+                    }),
+                    delta_input: Box::new(ExecNode {
+                        kind: ExecNodeKind::AggregateStatePhysicalize(
+                            AggregateStatePhysicalizePlan {
+                                input: Box::new(ExecNode {
+                                    kind: ExecNodeKind::Values(ValuesNode {
+                                        chunk: delta_state,
+                                        node_id: 2,
+                                    }),
+                                }),
+                                layout: layout.clone(),
+                                shape: aggregate_shape_for_test(),
+                            },
+                        ),
+                    }),
+                    layout,
+                }),
+            },
+        };
+
+        let handle = ResultSinkHandle::new();
+        execute_plan_with_pipeline(
+            plan,
+            false,
+            std::time::Duration::from_millis(10),
+            Box::new(ResultSinkFactory::new(handle.clone())),
+            None,
+            None,
+            1,
+            Arc::new(RuntimeState::default()),
+            None,
+            None,
+            None,
+        )
+        .expect("execute aggregate state merge pipeline");
+        let chunks = handle.take_chunks();
+        let schema = chunks.first().expect("pipeline output").batch.schema();
+        let batches = chunks
+            .iter()
+            .map(|chunk| chunk.batch.clone())
+            .collect::<Vec<_>>();
+        let output = record_batch_to_chunk(
+            concat_batches(&schema, batches.iter()).expect("concat pipeline output"),
+        )
+        .expect("output chunk");
+
+        assert_eq!(output.batch.num_rows(), 2);
+        assert_eq!(int8_value(&output, "__change_op", 0), CHANGE_OP_DELETE);
+        assert_eq!(int64_value(&output, "c", 0), 2);
+        assert_eq!(int64_value(&output, "s", 0), 300);
+        assert_eq!(int8_value(&output, "__change_op", 1), CHANGE_OP_INSERT);
+        assert_eq!(int64_value(&output, "c", 1), 1);
+        assert_eq!(int64_value(&output, "s", 1), 200);
     }
 
     fn run_merge_operator_for_test(
@@ -458,6 +648,33 @@ mod tests {
             })
             .collect();
         physical_chunk_for_test(rows, Some(()))
+    }
+
+    fn state_shaped_delta_chunk_for_test(rows: Vec<(&str, i64, i64)>) -> Chunk {
+        let mut count_state = LargeBinaryBuilder::new();
+        let mut sum_state = LargeBinaryBuilder::new();
+        for (_, c, s) in &rows {
+            count_state.append_value(encode_count_state(*c));
+            sum_state.append_value(encode_sum_int64(*c, *s));
+        }
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("region", DataType::Utf8, true),
+                Field::new("__agg_state_c", DataType::LargeBinary, false),
+                Field::new("__agg_state_s", DataType::LargeBinary, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter()
+                        .map(|(region, _, _)| *region)
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(count_state.finish()) as ArrayRef,
+                Arc::new(sum_state.finish()) as ArrayRef,
+            ],
+        )
+        .expect("state-shaped delta batch");
+        record_batch_to_chunk(batch).expect("state-shaped delta chunk")
     }
 
     fn physical_chunk_for_test(rows: Vec<(&str, i64, i64)>, _delta: Option<()>) -> Chunk {
@@ -590,6 +807,25 @@ mod tests {
                 sum_state_column,
             ],
         }
+    }
+
+    fn aggregate_shape_for_test() -> AggregateMvShape {
+        let dialect = sqlparser::dialect::GenericDialect {};
+        let statements = sqlparser::parser::Parser::parse_sql(
+            &dialect,
+            "select region, count(*) as c, sum(amount) as s from ice.ns.orders group by region",
+        )
+        .expect("parse aggregate shape query");
+        let sqlparser::ast::Statement::Query(query) =
+            statements.into_iter().next().expect("one query")
+        else {
+            panic!("expected query");
+        };
+        let shape = classify_incremental_mv_query(&query).expect("classify aggregate shape");
+        let IncrementalMvShape::Aggregate(shape) = shape else {
+            panic!("expected aggregate shape");
+        };
+        shape
     }
 
     fn row_id_for_region(region: &str) -> String {

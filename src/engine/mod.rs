@@ -3195,6 +3195,22 @@ fn lower_plan_build_result(
                     ),
                 );
             }
+            crate::sql::codegen::DirectExecPlan::AggregateStatePhysicalize {
+                input,
+                layout,
+                shape,
+            } => {
+                let input = lower_plan_build_result(*input, arena, query_opts, iceberg_catalogs)?;
+                return Ok(crate::exec::node::ExecNode {
+                    kind: crate::exec::node::ExecNodeKind::AggregateStatePhysicalize(
+                        crate::exec::operators::aggregate_state_merge::AggregateStatePhysicalizePlan {
+                            input: Box::new(input),
+                            layout,
+                            shape,
+                        },
+                    ),
+                });
+            }
         }
     }
 

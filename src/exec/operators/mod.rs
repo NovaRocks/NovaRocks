@@ -64,7 +64,7 @@ pub use aggregate::streaming_source::AggregateStreamingSourceFactory;
 pub(crate) use aggregate::streaming_state::AggregateStreamingState;
 pub(crate) use aggregate_state_merge::{
     AggregateStateMergeInput, AggregateStateMergeSharedState, AggregateStateMergeSinkFactory,
-    AggregateStateMergeSourceFactory,
+    AggregateStateMergeSourceFactory, AggregateStatePhysicalizeProcessorFactory,
 };
 pub use analytic_sink::AnalyticSinkFactory;
 pub use analytic_source::AnalyticSourceFactory;

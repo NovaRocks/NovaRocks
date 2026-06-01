@@ -256,9 +256,15 @@ impl IcebergMvRewriteContext {
         }
     }
 
-    pub(crate) fn aggregate_layout_for_execution(
+    pub(crate) fn aggregate_shape_and_layout_for_execution(
         &self,
-    ) -> Result<crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout, String> {
+    ) -> Result<
+        (
+            crate::connector::starrocks::table::mv_shape::AggregateMvShape,
+            crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
+        ),
+        String,
+    > {
         let shape = crate::connector::starrocks::table::mv_shape::classify_incremental_mv_query(
             self.canonical_select_query.as_ref(),
         )
@@ -303,10 +309,11 @@ impl IcebergMvRewriteContext {
             });
         }
 
-        crate::connector::starrocks::table::mv_agg_state::build_aggregate_mv_layout(
+        let layout = crate::connector::starrocks::table::mv_agg_state::build_aggregate_mv_layout(
             &aggregate_shape,
             &output_columns,
-        )
+        )?;
+        Ok((aggregate_shape, layout))
     }
 }
 

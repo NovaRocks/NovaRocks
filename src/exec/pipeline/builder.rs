@@ -61,14 +61,15 @@ use crate::exec::operators::local_exchanger::{LocalExchangePartitionSpec, LocalE
 use crate::exec::operators::{
     AggregateProcessorFactory, AggregateStateMergeInput, AggregateStateMergeSharedState,
     AggregateStateMergeSinkFactory, AggregateStateMergeSourceFactory,
-    AggregateStreamingSinkFactory, AggregateStreamingSourceFactory, AggregateStreamingState,
-    AnalyticSinkFactory, AnalyticSourceFactory, BroadcastJoinProbeProcessorFactory,
-    ExceptSinkFactory, ExceptSourceFactory, ExchangeSourceFactory, FetchProcessorFactory,
-    FilterProcessorFactory, HashJoinBuildSinkFactory, IntersectSinkFactory, IntersectSourceFactory,
-    LimitProcessorFactory, LocalExchangeSinkFactory, LocalExchangeSourceFactory,
-    LookUpSourceFactory, PartitionedJoinProbeProcessorFactory, ProjectProcessorFactory,
-    RepeatProcessorFactory, ScanSourceFactory, SortProcessorFactory, TableFunctionProcessorFactory,
-    UnionAllSharedState, UnionAllSinkFactory, UnionAllSourceFactory, ValuesSourceFactory,
+    AggregateStatePhysicalizeProcessorFactory, AggregateStreamingSinkFactory,
+    AggregateStreamingSourceFactory, AggregateStreamingState, AnalyticSinkFactory,
+    AnalyticSourceFactory, BroadcastJoinProbeProcessorFactory, ExceptSinkFactory,
+    ExceptSourceFactory, ExchangeSourceFactory, FetchProcessorFactory, FilterProcessorFactory,
+    HashJoinBuildSinkFactory, IntersectSinkFactory, IntersectSourceFactory, LimitProcessorFactory,
+    LocalExchangeSinkFactory, LocalExchangeSourceFactory, LookUpSourceFactory,
+    PartitionedJoinProbeProcessorFactory, ProjectProcessorFactory, RepeatProcessorFactory,
+    ScanSourceFactory, SortProcessorFactory, TableFunctionProcessorFactory, UnionAllSharedState,
+    UnionAllSinkFactory, UnionAllSourceFactory, ValuesSourceFactory,
 };
 use crate::exec::operators::{ExceptSharedState, IntersectSharedState, SetOpStageController};
 use crate::exec::operators::{
@@ -1258,6 +1259,13 @@ fn build_pipeline_for_node(
                 extra_pipelines,
                 stream: StreamDesc::single(),
             })
+        }
+        ExecNodeKind::AggregateStatePhysicalize(plan) => {
+            let mut child_build = build_pipeline_for_node(&plan.input, ctx)?;
+            child_build.pipeline.factories.push(Box::new(
+                AggregateStatePhysicalizeProcessorFactory::new(plan.clone(), 0),
+            ));
+            Ok(child_build)
         }
         ExecNodeKind::IcebergDeltaScan(node) => {
             let source: Box<dyn OperatorFactory> = Box::new(
