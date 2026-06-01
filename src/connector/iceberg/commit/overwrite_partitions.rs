@@ -313,6 +313,7 @@ impl TransactionAction for OverwritePartitionsTxnAction {
                 &self.file_io,
                 &path,
                 &surviving_data,
+                self.row_lineage_first_row_id,
                 self.partition_spec.clone(),
                 m.current_schema().clone(),
                 new_snapshot_id,
@@ -409,15 +410,15 @@ impl TransactionAction for OverwritePartitionsTxnAction {
         }
 
         // 5. Write the manifest list.
-        //    first_row_id = Some(next_row_id) so the manifest list records the
-        //    base row-id for newly added rows; `next_row_id` is advanced by
-        //    `row_lineage_added_rows` via `with_row_range` on the snapshot.
+        //    Surviving data manifests are pre-marked as assigned so they do
+        //    not consume fresh row IDs. Only newly added files advance the
+        //    writer's next_row_id, matching the snapshot row range below.
         let manifest_list_path = format!(
             "{metadata_dir}/snap-{}-{}.avro",
             new_snapshot_id, self.commit_uuid
         );
         self.record_manifest_path(manifest_list_path.clone());
-        write_manifest_list(
+        let manifest_list_next_row_id = write_manifest_list(
             &self.file_io,
             &manifest_list_path,
             new_manifests,
@@ -429,6 +430,21 @@ impl TransactionAction for OverwritePartitionsTxnAction {
         )
         .await
         .map_err(to_iceberg_unexpected)?;
+        if let Some(first_row_id) = self.row_lineage_first_row_id {
+            let expected_next_row_id = first_row_id
+                .checked_add(self.row_lineage_added_rows)
+                .ok_or_else(|| {
+                    to_iceberg_unexpected(format!(
+                        "Row ID overflow when computing overwrite partitions row lineage range: first_row_id={first_row_id}, added_rows={}",
+                        self.row_lineage_added_rows
+                    ))
+                })?;
+            if manifest_list_next_row_id != Some(expected_next_row_id) {
+                return Err(to_iceberg_unexpected(format!(
+                    "Manifest list row lineage mismatch for overwrite partitions: expected next-row-id {expected_next_row_id}, got {manifest_list_next_row_id:?}"
+                )));
+            }
+        }
 
         // 6. Build the snapshot.
         //    operation = Overwrite, summary includes `replace-partitions=true`.
@@ -509,6 +525,7 @@ async fn write_existing_data_manifest(
     file_io: &FileIO,
     out_path: &str,
     surviving: &[(DataFile, i64, i64, Option<i64>, Option<i64>, i32)],
+    assigned_manifest_first_row_id: Option<u64>,
     partition_spec: PartitionSpecRef,
     schema: SchemaRef,
     new_snapshot_id: i64,
@@ -531,15 +548,25 @@ async fn write_existing_data_manifest(
     };
     for (df, snap_id, seq, file_seq, effective_first_row_id, spec_id) in surviving {
         let fseq = file_seq.unwrap_or(*seq);
+        if format_version == FormatVersion::V3 && effective_first_row_id.is_none() {
+            return Err(format!(
+                "missing effective first_row_id for surviving data file {}",
+                df.file_path()
+            ));
+        }
         let data_file = clone_data_file_with_first_row_id(df, *spec_id, *effective_first_row_id)?;
         writer
             .add_existing_file(data_file, *snap_id, *seq, Some(fseq))
             .map_err(|e| format!("ManifestWriter::add_existing_file failed: {e}"))?;
     }
-    writer
+    let mut manifest_file = writer
         .write_manifest_file()
         .await
-        .map_err(|e| format!("ManifestWriter::write_manifest_file failed: {e}"))
+        .map_err(|e| format!("ManifestWriter::write_manifest_file failed: {e}"))?;
+    if format_version == FormatVersion::V3 {
+        manifest_file.first_row_id = assigned_manifest_first_row_id;
+    }
+    Ok(manifest_file)
 }
 
 /// Write a Deletes manifest in which every entry is EXISTING (status=Existing).
@@ -915,6 +942,53 @@ mod tests {
             .metadata()
             .current_snapshot()
             .expect("snapshot after overwrite-partitions");
+        let (snapshot_first_row_id, snapshot_added_rows) = snap
+            .row_range()
+            .expect("v3 overwrite-partitions snapshot should carry row range");
+        assert_eq!(snapshot_added_rows, 50);
+        assert_eq!(
+            reloaded.metadata().next_row_id(),
+            snapshot_first_row_id + snapshot_added_rows,
+            "table next_row_id must advance only by newly added rows",
+        );
+        let manifest_list_bytes = reloaded
+            .file_io()
+            .new_input(snap.manifest_list())
+            .expect("open manifest list")
+            .read()
+            .await
+            .expect("read manifest list");
+        let manifest_list = ManifestList::parse_with_version(
+            &manifest_list_bytes,
+            reloaded.metadata().format_version(),
+        )
+        .expect("parse manifest list");
+        let surviving_manifest = manifest_list
+            .entries()
+            .iter()
+            .find(|mf| {
+                mf.content == ManifestContentType::Data
+                    && mf.existing_files_count.unwrap_or(0) > 0
+                    && mf.added_files_count.unwrap_or(0) == 0
+            })
+            .expect("surviving data manifest should be present");
+        assert_eq!(
+            surviving_manifest.first_row_id,
+            Some(snapshot_first_row_id),
+            "surviving data manifest must be marked assigned without consuming row ids",
+        );
+        let added_manifest = manifest_list
+            .entries()
+            .iter()
+            .find(|mf| {
+                mf.content == ManifestContentType::Data && mf.added_files_count.unwrap_or(0) > 0
+            })
+            .expect("added data manifest should be present");
+        assert_eq!(
+            added_manifest.first_row_id,
+            Some(snapshot_first_row_id),
+            "added data manifest must start at the snapshot row range first_row_id",
+        );
         let p = &snap.summary().additional_properties;
         assert_eq!(
             p.get("replace-partitions").map(String::as_str),

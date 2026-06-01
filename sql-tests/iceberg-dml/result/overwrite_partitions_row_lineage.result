@@ -13,3 +13,7 @@ id	region
 -- query 5
 same_touched_rows	changed_touched_rows	same_untouched_rows	current_us_rows	current_eu_rows
 0	1	2	2	2
+
+-- query 7
+total_rows	distinct_row_ids
+5	5

@@ -58,5 +58,16 @@ ON cur.id = old.id AND cur.region = old.region;
 
 -- query 6
 -- @skip_result_check=true
+INSERT INTO ${case_db}.t_partition_overwrite_lineage VALUES
+  (100, 'ap');
+
+-- query 7
+SELECT
+  COUNT(*) AS total_rows,
+  COUNT(DISTINCT _row_id) AS distinct_row_ids
+FROM ${case_db}.t_partition_overwrite_lineage;
+
+-- query 8
+-- @skip_result_check=true
 ALTER TABLE iceberg_dml_cat_${suite_uuid0}.${case_db}.t_partition_overwrite_lineage DROP TAG before_overwrite;
 DROP TABLE ${case_db}.t_partition_overwrite_lineage FORCE;
