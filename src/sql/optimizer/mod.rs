@@ -91,7 +91,7 @@ pub(crate) fn optimize(
     // 4. CTE cleanup: intentional pre-Memo structural rewrite for CTE shape
     //    cleanup, not a second full logical optimization pass.
     let cte_ctx = cte_rewrite::collect_cte_counts(&rewritten);
-    let rewritten = cte_rewrite::inline_single_use_ctes(rewritten, &cte_ctx);
+    let rewritten = cte_rewrite::inline_single_use_ctes(rewritten, &cte_ctx)?;
 
     // 5. Convert to Memo. Unwrap the factory from Rc<RefCell<...>> — rewrite
     //    is done so the only two references at this call site are the local
