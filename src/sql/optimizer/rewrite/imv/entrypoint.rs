@@ -1,8 +1,8 @@
 //! Entrypoint for the IMV rewrite pipeline. See
 //! docs/superpowers/specs/2026-05-26-incremental-mv-optimizer-foundation-design.md.
 
-use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::engine::mv::refresh_context::IcebergMvRewriteContext;
@@ -312,7 +312,7 @@ mod tests {
         })
         .expect("unknown disabled rule must not break the pipeline");
 
-        assert_eq!(outcome.trace.stage_names().len(), 8);
+        assert_eq!(outcome.trace.stage_names().len(), 10);
     }
 
     // ── Task-5 helpers ──────────────────────────────────────────────────────
@@ -437,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn imv_pipeline_traces_seven_stage_names() {
+    fn imv_pipeline_traces_stage_names() {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
             mv_ctx: dummy_mv_ctx(),
@@ -452,6 +452,8 @@ mod tests {
             vec![
                 "imv-logical-normalize",
                 "imv-delta-marker",
+                "imv-join-delta",
+                "imv-aggregate-state",
                 "imv-delta-pushdown",
                 "imv-scan-binding",
                 "imv-action-propagation",
