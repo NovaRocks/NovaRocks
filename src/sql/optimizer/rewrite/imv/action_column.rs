@@ -2,8 +2,8 @@
 //!
 //! The action column is an optimizer-internal `Int8` non-nullable column
 //! produced by `InjectActionColumnRule` on Delta-bound scans. It carries
-//! `+1` for inserts/upserts and `-1` for deletes at runtime (Phase 3+),
-//! and is never exposed to user-visible output.
+//! `+1` for inserts/upserts and `-1` for deletes at runtime, and is never
+//! exposed to user-visible output.
 
 use std::sync::atomic::AtomicBool;
 
@@ -25,10 +25,10 @@ pub(crate) struct ImvActionColumn;
 
 impl ImvActionColumn {
     pub(crate) const NAME: &'static str = crate::exec::change_op::CHANGE_OP_COLUMN;
-    // consumed by Phase 3 execution cutover
+    // Consumed by IMV refresh execution.
     #[allow(dead_code)]
     pub(crate) const INSERT_VALUE: i8 = crate::exec::change_op::CHANGE_OP_INSERT;
-    // consumed by Phase 3 execution cutover
+    // Consumed by IMV refresh execution.
     #[allow(dead_code)]
     pub(crate) const DELETE_VALUE: i8 = crate::exec::change_op::CHANGE_OP_DELETE;
 
@@ -135,7 +135,7 @@ fn validate_node(plan: &LogicalPlan) -> Result<(), String> {
             validate_node(&node.input)?;
             // V3: if a delta is below, Project must expose the action column.
             // NOTE: this re-walks the subtree per Project node, so validation is
-            // O(depth * subtree) on deep linear plans. Negligible for Phase 2's
+            // O(depth * subtree) on deep linear plans. Negligible for current
             // single-table shapes; revisit with memoization if plans grow.
             if subtree_has_delta(&node.input) {
                 let has = node
@@ -155,28 +155,28 @@ fn validate_node(plan: &LogicalPlan) -> Result<(), String> {
         LogicalPlan::Aggregate(_) if subtree_has_delta(plan) => {
             let fqn = first_delta_base_fqn(plan).unwrap_or_else(|| "<unknown>".to_string());
             Err(format!(
-                "Phase 2 does not support Aggregate above delta-bound scan {fqn}; deferred to Phase 4"
+                "Iceberg IMV rewrite does not support this aggregate shape above delta-bound scan {fqn}"
             ))
         }
         LogicalPlan::Join(_) if subtree_has_delta(plan) => {
             let fqn = first_delta_base_fqn(plan).unwrap_or_else(|| "<unknown>".to_string());
             Err(format!(
-                "Phase 2 does not support Join above delta-bound scan {fqn}; deferred to Phase 5"
+                "Iceberg IMV rewrite does not support this join shape above delta-bound scan {fqn}"
             ))
         }
         LogicalPlan::Union(_) if subtree_has_delta(plan) => {
             let fqn = first_delta_base_fqn(plan).unwrap_or_else(|| "<unknown>".to_string());
             Err(format!(
-                "Phase 2 does not support Union above delta-bound scan {fqn}; deferred to Phase 6"
+                "Iceberg IMV rewrite does not support this union shape above delta-bound scan {fqn}"
             ))
         }
         // Last safety gate: any unhandled node kind (Sort/Limit/Window/etc.)
-        // sitting above a delta subtree is unsupported in Phase 2 and rejected.
+        // sitting above a delta subtree is unsupported and rejected.
         other if subtree_has_delta(other) => {
             let fqn = first_delta_base_fqn(other).unwrap_or_else(|| "<unknown>".to_string());
             Err(format!(
-                "Phase 2 does not support this plan shape above delta-bound scan {fqn}; \
-                 only Scan/Project/Filter are supported"
+                "Iceberg IMV rewrite does not support this plan shape above delta-bound scan {fqn}; \
+                 supported shapes must be consumed before validation"
             ))
         }
         _ => Ok(()),
@@ -690,7 +690,10 @@ mod tests {
             required_output_columns: None,
         });
         let err = validate(&plan).expect_err("aggregate above delta must fail");
-        assert!(err.contains("Phase 4"), "got: {err}");
+        assert!(
+            err.contains("Iceberg IMV rewrite does not support this aggregate shape"),
+            "got: {err}"
+        );
         assert!(err.contains("ice.db.b"), "got: {err}");
     }
 
@@ -710,7 +713,10 @@ mod tests {
             required_output_columns: None,
         });
         let err = validate(&plan).expect_err("join above delta must fail");
-        assert!(err.contains("Phase 5"), "got: {err}");
+        assert!(
+            err.contains("Iceberg IMV rewrite does not support this join shape"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -725,7 +731,10 @@ mod tests {
             required_output_columns: None,
         });
         let err = validate(&plan).expect_err("union above delta must fail");
-        assert!(err.contains("Phase 6"), "got: {err}");
+        assert!(
+            err.contains("Iceberg IMV rewrite does not support this union shape"),
+            "got: {err}"
+        );
     }
 
     // ── V6 / V7 failing tests (RED phase) ───────────────────────────────────

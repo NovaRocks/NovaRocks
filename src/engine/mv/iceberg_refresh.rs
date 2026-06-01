@@ -1688,9 +1688,6 @@ fn refresh_single_aggregate_iceberg_mv(
         "iceberg MV refresh context constructed"
     );
 
-    // PR-β: exercise the IMV optimizer pipeline; Validation rejection is expected and non-fatal, outcome discarded.
-    try_run_imv_rewrite_pipeline(state, &ctx);
-
     match previous {
         None => {
             let staging_branch = format!(
@@ -2457,9 +2454,6 @@ fn refresh_join_aggregate_iceberg_mv(
         summary = ?ctx.rewrite.summary(),
         "iceberg MV refresh context constructed"
     );
-
-    // PR-β: exercise the IMV optimizer pipeline; Validation rejection is expected and non-fatal, outcome discarded.
-    try_run_imv_rewrite_pipeline(state, &ctx);
 
     let left_current = pin
         .get(left_ref)
@@ -5152,9 +5146,6 @@ fn refresh_iceberg_join_mv(
         "iceberg MV refresh context constructed"
     );
 
-    // PR-β: exercise the IMV optimizer pipeline; Validation rejection is expected and non-fatal, outcome discarded.
-    try_run_imv_rewrite_pipeline(state, &ctx);
-
     match (left_previous, right_previous) {
         (None, None) => {
             let staging_branch = format!(
@@ -5992,24 +5983,9 @@ pub(crate) fn normalize_imv_rewrite_root_project(
     crate::sql::planner::plan::LogicalPlan::Aggregate(aggregate)
 }
 
-/// Run the IMV optimizer pipeline against `ctx`, discarding the outcome.
-/// Logs a structured summary on success and a warning on failure.
-///
-/// PR-β state: the pipeline now actively wraps the root in `ImvDelta`
-/// (imv-delta-marker stage) and rejects unresolved markers in
-/// imv-validation. Until task 4+ adds rules that consume the marker,
-/// every refresh attempt produces a `Validation` Reject — that is
-/// expected and non-fatal here. Refresh continues with the hand-built
-/// path; this function only logs the failure as a warning so a future
-/// task can audit IMV-pipeline progress without breaking refresh
-/// behavior.
-///
-/// The original `?`-fail-fast wiring was tightened to log-and-continue
-/// in PR-α after the iceberg-ivm suite exposed an A11 schema-evolution
-/// case (renamed referenced column) where re-planning the canonical
-/// select against the latest base schema fails by design even though
-/// the hand-built refresh path handles the rename correctly. PR-β
-/// inherits that swallow.
+/// Run the IMV optimizer pipeline for EXPLAIN. Refresh execution wires the
+/// pipeline through `execute_query_with_options_and_imv_validator`, where
+/// aggregate and join aggregate rewrite failures remain fatal.
 fn run_imv_rewrite_for_refresh_explain(
     state: &Arc<StandaloneState>,
     ctx: &IcebergMvRefreshContext,
@@ -6034,34 +6010,8 @@ fn run_imv_rewrite_for_refresh_explain(
     .map_err(|e| format!("run_imv_rewrite: {e}"))
 }
 
-fn try_run_imv_rewrite_pipeline(state: &Arc<StandaloneState>, ctx: &IcebergMvRefreshContext) {
-    let result = run_imv_rewrite_for_refresh_explain(state, ctx);
-
-    match result {
-        Ok(outcome) => {
-            tracing::info!(
-                mv_target = ?ctx.rewrite.target,
-                mv_id = ctx.rewrite.mv_id,
-                stages = ?outcome.trace.stage_names(),
-                rules_changed = outcome.trace.changed_rules_count(),
-                rules_rejected = outcome.trace.rejected_rules_count(),
-                rules_failed = outcome.trace.failed_rules_count(),
-                "imv rewrite completed (outcome discarded in PR-α)",
-            );
-        }
-        Err(e) => {
-            tracing::warn!(
-                mv_target = ?ctx.rewrite.target,
-                mv_id = ctx.rewrite.mv_id,
-                error = %e,
-                "imv rewrite skipped (PR-α: non-fatal, refresh continues)",
-            );
-        }
-    }
-}
-
 fn validate_aggregate_refresh_rewrite_outcome(
-    ctx: &IcebergMvRefreshContext,
+    ctx: &crate::engine::mv::refresh_context::IcebergMvRewriteContext,
     outcome: &crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteOutcome,
     evidence: RewriteMergeRefreshEvidence,
 ) -> Result<(), String> {
@@ -6070,7 +6020,7 @@ fn validate_aggregate_refresh_rewrite_outcome(
     {
         return Err(format!(
             "iceberg join aggregate MV {} incremental refresh rewrite did not apply RewriteJoinAggregateDelta",
-            target_fqn_string(&ctx.rewrite.target)
+            target_fqn_string(&ctx.target)
         ));
     }
     if !rewrite_outcome_rule_changed(outcome, "RewriteAggregateState") {
@@ -6080,18 +6030,18 @@ fn validate_aggregate_refresh_rewrite_outcome(
         };
         return Err(format!(
             "iceberg {label} MV {} incremental refresh rewrite did not apply RewriteAggregateState",
-            target_fqn_string(&ctx.rewrite.target)
+            target_fqn_string(&ctx.target)
         ));
     }
     if !logical_plan_contains_aggregate_state_merge(&outcome.plan) {
         return Err(format!(
             "iceberg aggregate MV {} incremental refresh rewrite plan does not contain AggregateStateMerge",
-            target_fqn_string(&ctx.rewrite.target)
+            target_fqn_string(&ctx.target)
         ));
     }
     tracing::info!(
-        mv_target = ?ctx.rewrite.target,
-        mv_id = ctx.rewrite.mv_id,
+        mv_target = ?ctx.target,
+        mv_id = ctx.mv_id,
         stages = ?outcome.trace.stage_names(),
         "iceberg aggregate MV incremental refresh rewrite evidence validated"
     );
@@ -6155,6 +6105,102 @@ fn logical_plan_contains_aggregate_state_merge(
         | LogicalPlan::Values(_)
         | LogicalPlan::GenerateSeries(_)
         | LogicalPlan::CTEConsume(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod aggregate_refresh_rewrite_validation_tests {
+    use super::*;
+
+    use crate::sql::optimizer::rewrite::imv::annotation::ImvPlanAnnotation;
+    use crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteOutcome;
+    use crate::sql::optimizer::rewrite::phase::RewritePhase;
+    use crate::sql::optimizer::rewrite::trace::RewriteTrace;
+    use crate::sql::planner::plan::{AggregateStateMergeNode, LogicalPlan, ValuesNode};
+
+    fn empty_values_plan() -> LogicalPlan {
+        LogicalPlan::Values(ValuesNode {
+            rows: Vec::new(),
+            columns: Vec::new(),
+            required_output_columns: None,
+        })
+    }
+
+    fn aggregate_state_merge_plan() -> LogicalPlan {
+        LogicalPlan::AggregateStateMerge(AggregateStateMergeNode {
+            old_input: Box::new(empty_values_plan()),
+            delta_input: Box::new(empty_values_plan()),
+            group_key_names: Vec::new(),
+            aggregate_state_names: Vec::new(),
+            change_op_column: crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
+            output_columns: Vec::new(),
+        })
+    }
+
+    fn outcome(plan: LogicalPlan, changed_rules: &[&'static str]) -> ImvRewriteOutcome {
+        let mut trace = RewriteTrace::default();
+        for rule in changed_rules {
+            trace.rule_changed(RewritePhase::SemanticRewrite, rule, 0);
+        }
+        ImvRewriteOutcome {
+            plan,
+            trace,
+            annotation: ImvPlanAnnotation::default(),
+        }
+    }
+
+    #[test]
+    fn aggregate_refresh_rejects_unchanged_rewrite_outcome() {
+        let ctx = crate::engine::mv::refresh_context::tests_support::dummy_rewrite_context();
+        let outcome = outcome(empty_values_plan(), &[]);
+
+        let err = validate_aggregate_refresh_rewrite_outcome(
+            &ctx,
+            &outcome,
+            RewriteMergeRefreshEvidence::Aggregate,
+        )
+        .expect_err("aggregate refresh must not continue with unchanged rewrite outcome");
+
+        assert!(
+            err.contains("did not apply RewriteAggregateState"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn aggregate_refresh_rejects_missing_merge_plan_evidence() {
+        let ctx = crate::engine::mv::refresh_context::tests_support::dummy_rewrite_context();
+        let outcome = outcome(empty_values_plan(), &["RewriteAggregateState"]);
+
+        let err = validate_aggregate_refresh_rewrite_outcome(
+            &ctx,
+            &outcome,
+            RewriteMergeRefreshEvidence::Aggregate,
+        )
+        .expect_err("aggregate refresh must require AggregateStateMerge in the rewrite plan");
+
+        assert!(
+            err.contains("does not contain AggregateStateMerge"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn join_aggregate_refresh_rejects_missing_join_rewrite_evidence() {
+        let ctx = crate::engine::mv::refresh_context::tests_support::dummy_rewrite_context();
+        let outcome = outcome(aggregate_state_merge_plan(), &["RewriteAggregateState"]);
+
+        let err = validate_aggregate_refresh_rewrite_outcome(
+            &ctx,
+            &outcome,
+            RewriteMergeRefreshEvidence::JoinAggregate,
+        )
+        .expect_err("join aggregate refresh must require join rewrite evidence");
+
+        assert!(
+            err.contains("did not apply RewriteJoinAggregateDelta"),
+            "got: {err}"
+        );
     }
 }
 
@@ -7178,7 +7224,7 @@ fn incremental_refresh_iceberg_mv_with_changes(
                 aggregate_rewrite_validator =
                     |outcome: &crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteOutcome| {
                         validate_aggregate_refresh_rewrite_outcome(
-                            ctx,
+                            &ctx.rewrite,
                             outcome,
                             options.rewrite_evidence,
                         )
@@ -9147,10 +9193,9 @@ mod tests {
 
     #[test]
     fn iceberg_aggregate_mv_with_min_max_int64_passes_validation() {
-        // IVM-P5 Phase 5: the DDL-time MIN/MAX rejection is removed. With
-        // Phase 1-4 already wiring the detail-map state runtime path,
-        // creating an aggregate MV containing MIN(int64_col) and
-        // MAX(int64_col) succeeds end-to-end.
+        // DDL-time MIN/MAX rejection has been removed. Detail-map state
+        // runtime support allows creating an aggregate MV containing
+        // MIN(int64_col) and MAX(int64_col) end-to-end.
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
         create_aggregate_fact_table(&env.state, "ice", "sales", "fact");
         let stmt = parse_create_mv(
@@ -9163,7 +9208,7 @@ mod tests {
         );
 
         create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect("MIN/MAX on int64 column should be accepted post-Phase-5");
+            .expect("MIN/MAX on int64 column should be accepted");
 
         // Verify the resulting layout has Map<Int64, Int64> state columns
         // for both MIN and MAX (the visible scalar SQL type is BigInt, but
@@ -9273,7 +9318,7 @@ mod tests {
         // `scalar_keys_equal` (NaN == NaN), `sort_map_entries_by_key`
         // (NaN sorts to end), and `derive_visible_from_detail_map` (skips
         // NaN keys — matches SQL standard "ignore NaN in MIN/MAX").
-        // This replaces the previous Phase 5 rejection test.
+        // This replaces the previous MIN/MAX rejection test.
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
         create_aggregate_fact_table_with_float(&env.state, "ice", "sales", "fact_float");
         let stmt = parse_create_mv(
@@ -11835,10 +11880,9 @@ mod imv_pipeline_wiring_tests {
     // Lib-level refresh smoke for the IMV pipeline wire-up.
     //
     // Reuses the same fixture obstacle as imv_planning_catalog_tests above:
-    // exercising try_run_imv_rewrite_pipeline end-to-end requires a
-    // StandaloneState with real Iceberg catalog entries (driven by the
-    // iceberg-rest Docker harness). Deferred to the iceberg-ivm SQL suite,
-    // which is the canonical end-to-end gate per the PR-α plan.
+    // exercising refresh pipeline wiring end-to-end requires a StandaloneState
+    // with real Iceberg catalog entries (driven by the iceberg-rest Docker
+    // harness). Deferred to the iceberg-ivm SQL suite.
     #[test]
     #[ignore = "fixture deferred — covered by iceberg-ivm suite (Task 15)"]
     fn projection_filter_refresh_through_imv_pipeline_matches_baseline() {

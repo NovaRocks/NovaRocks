@@ -4,8 +4,8 @@
 //! Delta commutes with projection and filtering (a row's insert/delete action
 //! is preserved through column projection and row filtering), so
 //! `Delta(Project(x)) == Project(Delta(x))` and `Delta(Filter(x)) == Filter(Delta(x))`.
-//! Delta does NOT commute with Aggregate/Join/Union; those are unsupported in
-//! Phase 2 and fail-fast here (Phase 4/5/6).
+//! Delta does NOT commute with Aggregate/Join/Union; unsupported shapes
+//! fail-fast here unless an earlier aggregate/join rewrite consumed them.
 
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::imv::marker::ImvDeltaNode;
@@ -58,25 +58,13 @@ impl LogicalRewriteRule for PushDeltaThroughUnaryRule {
         match delta.input.as_ref() {
             LogicalPlan::Project(_) | LogicalPlan::Filter(_) => { /* fall through to push */ }
             LogicalPlan::Aggregate(_) => {
-                return Err(
-                    "Iceberg IMV aggregate rewrite did not consume Delta(Aggregate); \
-                     verify RewriteAggregateStateRule ran before PushDeltaThroughUnary"
-                        .to_string(),
-                );
+                return Err("Iceberg IMV rewrite does not support this aggregate shape".to_string());
             }
             LogicalPlan::Join(_) => {
-                return Err(
-                    "Iceberg IMV join delta rewrite did not consume Delta(Join); \
-                     verify RewriteJoinAggregateDeltaRule ran before PushDeltaThroughUnary"
-                        .to_string(),
-                );
+                return Err("Iceberg IMV rewrite does not support this join shape".to_string());
             }
             LogicalPlan::Union(_) => {
-                return Err(
-                    "IMV delta pushdown does not support Union above delta-bound scans \
-                     in Phase 2; union delta rewrite is scheduled for Phase 6"
-                        .to_string(),
-                );
+                return Err("Iceberg IMV rewrite does not support this union shape".to_string());
             }
             // Scan or any other shape: the marker already directly wraps a leaf
             // (or a node we do not push through). Leave it for BindIcebergScan.
@@ -92,9 +80,8 @@ impl LogicalRewriteRule for PushDeltaThroughUnaryRule {
                 // Commutation Delta(Project(x)) == Project(Delta(x)) holds because
                 // Project items are row-local and the delta only marks each row's
                 // change action (carried through by action-column propagation).
-                // Volatile/non-deterministic projection expressions are out of
-                // scope for Phase 2; window calls cannot appear here (the planner
-                // extracts them into a dedicated WindowNode).
+                // Window calls cannot appear here because the planner extracts
+                // them into a dedicated WindowNode.
                 let inner = LogicalPlan::ImvDelta(ImvDeltaNode {
                     input: p.input,
                     is_root: false,
@@ -314,7 +301,7 @@ mod tests {
         assert!(rule.matches(&plan, &ctx));
         let err = rule.apply(plan, &mut ctx).expect_err("Aggregate must fail");
         assert!(
-            err.contains("RewriteAggregateStateRule"),
+            err.contains("Iceberg IMV rewrite does not support this aggregate shape"),
             "unexpected error: {err}"
         );
     }
@@ -327,7 +314,7 @@ mod tests {
         assert!(rule.matches(&plan, &ctx));
         let err = rule.apply(plan, &mut ctx).expect_err("Join must fail");
         assert!(
-            err.contains("RewriteJoinAggregateDeltaRule"),
+            err.contains("Iceberg IMV rewrite does not support this join shape"),
             "unexpected error: {err}"
         );
     }
@@ -339,7 +326,10 @@ mod tests {
         let plan = delta(union_over(vec![leaf_scan()]));
         assert!(rule.matches(&plan, &ctx));
         let err = rule.apply(plan, &mut ctx).expect_err("Union must fail");
-        assert!(err.contains("Phase 6"), "unexpected error: {err}");
+        assert!(
+            err.contains("Iceberg IMV rewrite does not support this union shape"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -387,7 +377,7 @@ mod tests {
     fn pushes_through_project_then_fails_fast_at_aggregate() {
         // Delta(Project(Aggregate(Scan))): one apply pushes through the Project,
         // yielding Project(Delta(Aggregate(Scan))); a second apply on the nested
-        // Delta(Aggregate(Scan)) must fail-fast with the Phase 4 boundary.
+        // Delta(Aggregate(Scan)) must fail-fast at the aggregate boundary.
         let rule = PushDeltaThroughUnaryRule;
         let mut ctx = ctx();
         let plan = delta(project_over(aggregate_over(leaf_scan())));
@@ -404,6 +394,9 @@ mod tests {
         let err = rule
             .apply(*p.input, &mut ctx)
             .expect_err("aggregate must fail");
-        assert!(err.contains("RewriteAggregateStateRule"), "got: {err}");
+        assert!(
+            err.contains("Iceberg IMV rewrite does not support this aggregate shape"),
+            "got: {err}"
+        );
     }
 }
