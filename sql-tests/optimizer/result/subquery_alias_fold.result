@@ -1,0 +1,45 @@
+-- query 4
+Explain String
+GATHER EXCHANGE stats={rows=50000}
+  PROJECT [s.k AS k] stats={rows=50000}
+    PROJECT [k] stats={rows=50000}
+      SCAN db_sqlt_73474ac5ba7b3917.oq6_alias_base stats={rows=50000}
+           TABLE: db_sqlt_73474ac5ba7b3917.oq6_alias_base
+           columns: k, v
+           min-max stats
+           predicates: s.v > 10
+
+-- query 5
+renamed_k
+1
+2
+3
+
+-- query 6
+Explain String
+PROJECT [count() AS count(*)] stats={rows=1}
+  HASH AGGREGATE (GLOBAL) stats={rows=1}
+    aggregations: count()
+    GATHER EXCHANGE stats={rows=1}
+      HASH AGGREGATE (LOCAL) stats={rows=1}
+        aggregations: count()
+        HASH JOIN (BROADCAST, INNER, eq: [b.k = w_alias.k]) stats={rows=405000000}
+          build runtime filters:
+          - filter_id = 0, build_expr = (w_alias.k)
+          SCAN db_sqlt_73474ac5ba7b3917.oq6_alias_base (alias=b) stats={rows=90000}
+               TABLE: db_sqlt_73474ac5ba7b3917.oq6_alias_base
+               columns: k
+               min-max stats
+               predicates: b.k IS NOT NULL
+              probe runtime filters:
+              - filter_id = 0, probe_expr = (b.k)
+          GATHER EXCHANGE stats={rows=45000}
+            FILTER stats={rows=45000}
+              predicate: w_alias.k IS NOT NULL
+              PROJECT [k, v] stats={rows=50000}
+                PROJECT [k, v] stats={rows=50000}
+                  SCAN db_sqlt_73474ac5ba7b3917.oq6_alias_base stats={rows=50000}
+                       TABLE: db_sqlt_73474ac5ba7b3917.oq6_alias_base
+                       columns: k, v
+                       min-max stats
+                       predicates: k < 3
