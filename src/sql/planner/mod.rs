@@ -64,8 +64,8 @@ fn plan_scoped_query(
     // overwrite its output_columns with the fresh ColumnIds that the analyzer
     // allocated for this query's output (stored in `output_columns`).  The
     // planner previously left branch-side ColumnIds in those fields, which
-    // disagreed with the fresh IDs that the parent scope (and any wrapping
-    // SubqueryAliasNode) uses to reference the set-op output.
+    // disagreed with the fresh IDs that the parent scope uses to reference
+    // the set-op output.
     match &mut body_plan {
         LogicalPlan::Union(node) => {
             node.output_columns = output_columns.clone();
@@ -1115,11 +1115,6 @@ fn logical_plan_satisfies_window_ordering(
         LogicalPlan::Sort(sort) => {
             logical_sort_satisfies_window_ordering(sort, required_items, partition_by)
         }
-        // SubqueryAlias only changes qualifier/display metadata and preserves
-        // column ids, so a child ordering remains valid above the alias.
-        LogicalPlan::SubqueryAlias(alias) => {
-            logical_plan_satisfies_window_ordering(&alias.input, required_items, partition_by)
-        }
         _ => false,
     }
 }
@@ -1895,18 +1890,11 @@ fn plan_relation_scoped(
         }
         Relation::Subquery {
             query,
-            alias,
+            alias: _,
             output_columns,
         } => {
             let inner_plan = plan_scoped_query(*query, cte_registry, factory)?;
-            // SubqueryAlias MUST reuse the inner query's ColumnIds.
-            // The output_columns from the analyzer already carry the right ids.
-            Ok(LogicalPlan::SubqueryAlias(SubqueryAliasNode {
-                input: Box::new(inner_plan),
-                alias,
-                output_columns,
-                required_output_columns: None,
-            }))
+            adapt_plan_output(inner_plan, &output_columns)
         }
         Relation::Join(join_rel) => {
             let JoinRelation {
@@ -2473,8 +2461,42 @@ mod tests {
             LogicalPlan::Project(node) => find_subquery_input(&node.input),
             LogicalPlan::Sort(node) => find_subquery_input(&node.input),
             LogicalPlan::Limit(node) => find_subquery_input(&node.input),
-            LogicalPlan::SubqueryAlias(node) => Some(&node.input),
-            _ => None,
+            other => Some(other),
+        }
+    }
+
+    fn unwrap_project_input(plan: &LogicalPlan) -> &LogicalPlan {
+        match plan {
+            LogicalPlan::Project(project) => project.input.as_ref(),
+            other => other,
+        }
+    }
+
+    fn contains_project_adapter(
+        plan: &LogicalPlan,
+        source_column: &str,
+        output_name: &str,
+    ) -> bool {
+        match plan {
+            LogicalPlan::Project(project) => {
+                project.items.iter().any(|item| {
+                    item.output_name == output_name
+                        && matches!(
+                            &item.expr.kind,
+                            ExprKind::ColumnRef { column, .. } if column == source_column
+                        )
+                }) || contains_project_adapter(&project.input, source_column, output_name)
+            }
+            LogicalPlan::Filter(node) => {
+                contains_project_adapter(&node.input, source_column, output_name)
+            }
+            LogicalPlan::Sort(node) => {
+                contains_project_adapter(&node.input, source_column, output_name)
+            }
+            LogicalPlan::Limit(node) => {
+                contains_project_adapter(&node.input, source_column, output_name)
+            }
+            _ => false,
         }
     }
 
@@ -2648,6 +2670,36 @@ mod tests {
     }
 
     #[test]
+    fn derived_table_plans_without_subquery_alias_node() {
+        let plan =
+            parse_analyze_and_plan("SELECT s.o_orderkey FROM (SELECT o_orderkey FROM orders) s")
+                .expect("planner should succeed");
+
+        let debug = format!("{plan:?}");
+        assert!(
+            !debug.contains("SubqueryAlias"),
+            "derived table must not create SubqueryAlias: {debug}"
+        );
+    }
+
+    #[test]
+    fn derived_table_column_alias_uses_project_adapter() {
+        let plan = parse_analyze_and_plan("SELECT s.ok FROM (SELECT o_orderkey FROM orders) s(ok)")
+            .expect("planner should succeed");
+
+        let debug = format!("{plan:?}");
+        assert!(
+            !debug.contains("SubqueryAlias"),
+            "column alias derived table must not create SubqueryAlias: {debug}"
+        );
+
+        assert!(
+            contains_project_adapter(&plan, "o_orderkey", "ok"),
+            "expected Project adapter to expose column alias ok: {plan:?}"
+        );
+    }
+
+    #[test]
     fn test_nested_with_in_derived_table_stays_inside_subquery_scope() {
         let plan = parse_analyze_and_plan(
             "WITH outer_t AS (SELECT o_orderkey AS ok FROM orders) \
@@ -2711,18 +2763,22 @@ mod tests {
 
         let lines =
             crate::sql::explain::explain_plan(&plan, crate::sql::explain::ExplainLevel::Normal);
-        let subquery_idx = lines
+        assert!(
+            !lines.iter().any(|line| line.contains("SUBQUERY ALIAS")),
+            "derived table should not explain as SUBQUERY ALIAS: {lines:?}"
+        );
+        let outer_anchor_idx = lines
             .iter()
-            .position(|line| line.contains("SUBQUERY ALIAS [s]"))
-            .expect("expected subquery alias line");
+            .position(|line| line.contains("CTE_ANCHOR(cte_id=0)"))
+            .expect("expected outer anchor line");
         let inner_anchor_idx = lines
             .iter()
             .position(|line| line.contains("CTE_ANCHOR(cte_id=1)"))
             .expect("expected nested inner anchor line");
 
         assert!(
-            inner_anchor_idx > subquery_idx,
-            "nested inner anchor should appear under subquery: {lines:?}"
+            inner_anchor_idx > outer_anchor_idx,
+            "nested inner anchor should remain inside derived-table subtree: {lines:?}"
         );
     }
 
@@ -2742,6 +2798,10 @@ mod tests {
             .iter()
             .filter(|line| line.contains("SORT BY [o_orderkey ASC NULLS FIRST]"))
             .count();
+        assert!(
+            !lines.iter().any(|line| line.contains("SUBQUERY ALIAS")),
+            "derived table should not explain as SUBQUERY ALIAS: {lines:?}"
+        );
         assert_eq!(
             sort_count, 1,
             "window should reuse the derived table ordering: {lines:?}"
@@ -2799,15 +2859,10 @@ mod tests {
 
     /// Regression test for the ColumnId-correctness bug where UnionNode.output_columns
     /// carried left-branch ColumnIds instead of the fresh set-op output ColumnIds.
-    ///
-    /// After the fix, SubqueryAlias.output_columns (which carries the fresh IDs from
-    /// the analyzer's parent scope) must equal child Union.output_columns position by
-    /// position.  Before the fix these were two disjoint ID spaces.
     #[test]
-    fn union_output_columns_carry_fresh_set_op_ids_matching_subquery_alias() {
-        // Plan a derived table that wraps a UNION ALL.  The subquery alias node
-        // receives the fresh set-op output ColumnIds from the analyzer scope; the
-        // Union node must carry the same IDs (not the left-branch scan IDs).
+    fn output_columns_carry_fresh_set_op_ids() {
+        // Plan a derived table that wraps a UNION ALL. The Union node must carry
+        // the analyzer-visible output IDs directly, without an alias wrapper.
         let plan = parse_analyze_and_plan(
             "SELECT o_orderkey, o_custkey \
              FROM (SELECT o_orderkey, o_custkey FROM orders \
@@ -2816,40 +2871,34 @@ mod tests {
         )
         .expect("planner should succeed");
 
-        // Navigate to SubqueryAlias — it is either the root or directly under a Project.
-        let alias_node = match &plan {
-            LogicalPlan::SubqueryAlias(n) => n,
-            LogicalPlan::Project(p) => match p.input.as_ref() {
-                LogicalPlan::SubqueryAlias(n) => n,
-                other => panic!("expected SubqueryAlias under Project, got {other:?}"),
-            },
-            other => panic!("expected SubqueryAlias or Project root, got {other:?}"),
-        };
-        assert_eq!(alias_node.alias, "sub");
+        let debug = format!("{plan:?}");
+        assert!(
+            !debug.contains("SubqueryAlias"),
+            "set-op derived table must not create SubqueryAlias: {debug}"
+        );
 
-        // The direct child of SubqueryAlias must be the Union node.
-        let union_node = match alias_node.input.as_ref() {
+        let union_node = match unwrap_project_input(&plan) {
             LogicalPlan::Union(n) => n,
-            other => panic!("expected Union as SubqueryAlias child, got {other:?}"),
+            other => panic!("expected Union without SubqueryAlias, got {other:?}"),
         };
+        let visible_columns = plan_output_columns(&plan).expect("plan output should be known");
 
         // Core assertion: fresh IDs must match position-by-position.
         assert_eq!(
-            alias_node.output_columns.len(),
+            visible_columns.len(),
             union_node.output_columns.len(),
-            "SubqueryAlias and Union output_columns length must match"
+            "visible output and Union output_columns length must match"
         );
-        for (i, (alias_col, union_col)) in alias_node
-            .output_columns
+        for (i, (visible_col, union_col)) in visible_columns
             .iter()
             .zip(union_node.output_columns.iter())
             .enumerate()
         {
             assert_eq!(
-                alias_col.column_id, union_col.column_id,
-                "output_columns[{i}]: SubqueryAlias column_id {:?} != Union column_id {:?} \
+                visible_col.column_id, union_col.column_id,
+                "output_columns[{i}]: visible column_id {:?} != Union column_id {:?} \
                  (Union must carry the fresh set-op IDs, not left-branch IDs)",
-                alias_col.column_id, union_col.column_id
+                visible_col.column_id, union_col.column_id
             );
         }
     }
@@ -2865,27 +2914,27 @@ mod tests {
         ] {
             let plan = parse_analyze_and_plan(sql).expect("planner should succeed");
 
-            let alias_node = match &plan {
-                LogicalPlan::SubqueryAlias(n) => n,
-                LogicalPlan::Project(p) => match p.input.as_ref() {
-                    LogicalPlan::SubqueryAlias(n) => n,
-                    other => panic!("expected SubqueryAlias under Project, got {other:?}"),
-                },
-                other => panic!("expected SubqueryAlias or Project root, got {other:?}"),
+            let debug = format!("{plan:?}");
+            assert!(
+                !debug.contains("SubqueryAlias"),
+                "set-op derived table must not create SubqueryAlias: {debug}"
+            );
+
+            let visible_columns = plan_output_columns(&plan).expect("plan output should be known");
+            let set_op_cols = match unwrap_project_input(&plan) {
+                LogicalPlan::Intersect(n) => &n.output_columns,
+                LogicalPlan::Except(n) => &n.output_columns,
+                other => panic!("expected Intersect/Except without SubqueryAlias, got {other:?}"),
             };
 
-            let (alias_cols, set_op_cols) = match alias_node.input.as_ref() {
-                LogicalPlan::Intersect(n) => (&alias_node.output_columns, &n.output_columns),
-                LogicalPlan::Except(n) => (&alias_node.output_columns, &n.output_columns),
-                other => panic!("expected Intersect/Except as child, got {other:?}"),
-            };
-
-            assert_eq!(alias_cols.len(), set_op_cols.len());
-            for (i, (ac, sc)) in alias_cols.iter().zip(set_op_cols.iter()).enumerate() {
+            assert_eq!(visible_columns.len(), set_op_cols.len());
+            for (i, (visible_col, set_op_col)) in
+                visible_columns.iter().zip(set_op_cols.iter()).enumerate()
+            {
                 assert_eq!(
-                    ac.column_id, sc.column_id,
-                    "output_columns[{i}]: SubqueryAlias {:?} != set-op {:?} for SQL: {sql}",
-                    ac.column_id, sc.column_id
+                    visible_col.column_id, set_op_col.column_id,
+                    "output_columns[{i}]: visible {:?} != set-op {:?} for SQL: {sql}",
+                    visible_col.column_id, set_op_col.column_id
                 );
             }
         }
