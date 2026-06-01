@@ -32,10 +32,6 @@ pub(crate) enum LogicalPlan {
     GenerateSeries(GenerateSeriesNode),
     TableFunction(TableFunctionNode),
     Window(WindowNode),
-    /// Wraps a subquery plan with an alias, so that the physical emitter
-    /// can register qualified columns (e.g., `ctr1.ctr_customer_sk` for
-    /// a CTE referenced as `FROM customer_total_return ctr1`).
-    SubqueryAlias(SubqueryAliasNode),
     /// Repeat node for ROLLUP/CUBE/GROUPING SETS.
     /// Replicates each input row N times with different null patterns.
     Repeat(RepeatPlanNode),
@@ -102,17 +98,6 @@ pub(crate) struct RepeatPlanNode {
     pub all_rollup_columns: Vec<String>,
     pub grouping_key_aliases: Vec<(String, String)>,
     pub grouping_fn_args: Vec<(String, Vec<String>)>,
-    /// Set by the Phase-1 column-pruning tagging pass; `None` means all columns required.
-    pub required_output_columns: Option<HashSet<ColumnId>>,
-}
-
-/// Subquery alias node: wraps an inlined subquery (CTE or derived table)
-/// with the alias name and output column metadata.
-#[derive(Clone, Debug)]
-pub(crate) struct SubqueryAliasNode {
-    pub input: Box<LogicalPlan>,
-    pub alias: String,
-    pub output_columns: Vec<OutputColumn>,
     /// Set by the Phase-1 column-pruning tagging pass; `None` means all columns required.
     pub required_output_columns: Option<HashSet<ColumnId>>,
 }

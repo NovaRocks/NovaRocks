@@ -77,9 +77,9 @@ mod tests {
     #[test]
     fn registry_contains_expected_rules() {
         let rules = all_query_rewrite_rules(&HashMap::new());
-        // 18 v2 pruning rules + 2 ukfk + 1 JoinReorder + 1 AggregatePushdown
-        // + 1 LowCardinalityDictionaryRewrite + 5 predicate pushdown rules + 1 DeriveJoinNotNullPredicate = 29
-        assert_eq!(rules.len(), 29);
+        // 17 v2 pruning rules + 2 ukfk + 1 JoinReorder + 1 AggregatePushdown
+        // + 1 LowCardinalityDictionaryRewrite + 5 predicate pushdown rules + 1 DeriveJoinNotNullPredicate = 28
+        assert_eq!(rules.len(), 28);
         let mut names: Vec<&str> = rules.iter().map(|r| r.name()).collect();
         names.sort();
         assert_eq!(
@@ -104,7 +104,6 @@ mod tests {
                 "PruneRepeatColumns",
                 "PruneScanColumns",
                 "PruneSortColumns",
-                "PruneSubqueryAliasColumns",
                 "PruneTableFunctionColumns",
                 "PruneUkFkJoin",
                 "PruneUnionColumns",

@@ -135,7 +135,6 @@ fn plan_kind(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::GenerateSeries(_) => "GenerateSeries",
         LogicalPlan::TableFunction(_) => "TableFunction",
         LogicalPlan::Window(_) => "Window",
-        LogicalPlan::SubqueryAlias(_) => "SubqueryAlias",
         LogicalPlan::Repeat(_) => "Repeat",
         LogicalPlan::CTEAnchor(_) => "CTEAnchor",
         LogicalPlan::CTEProduce(_) => "CTEProduce",

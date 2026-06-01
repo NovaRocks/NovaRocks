@@ -1,7 +1,7 @@
 //! Passthrough operators — operators with a single child whose output mirrors
 //! the child's output. Two flavours:
 //!
-//! 1. **Distribution-blind** (Filter / Project / SubqueryAlias / CTEProduce /
+//! 1. **Distribution-blind** (Filter / Project / CTEProduce /
 //!    Repeat): these operators do not constrain their child's distribution.
 //!    Their `derive_required` therefore returns `Any` for the child slot,
 //!    letting the optimizer freely choose the cheapest distribution for the
@@ -54,7 +54,7 @@ pub(crate) fn passthrough_required_full(
 
 use crate::sql::optimizer::operator::{
     PhysicalCTEProduceOp, PhysicalDecodeOp, PhysicalFilterOp, PhysicalLimitOp, PhysicalProjectOp,
-    PhysicalRepeatOp, PhysicalSubqueryAliasOp, PhysicalTableFunctionOp,
+    PhysicalRepeatOp, PhysicalTableFunctionOp,
 };
 
 use super::{DeriveOutput, DeriveRequired};
@@ -89,7 +89,6 @@ passthrough_distribution_blind_impls!(
     PhysicalFilterOp,
     PhysicalProjectOp,
     PhysicalDecodeOp,
-    PhysicalSubqueryAliasOp,
     PhysicalCTEProduceOp,
     PhysicalRepeatOp,
 );

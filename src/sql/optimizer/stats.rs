@@ -153,11 +153,6 @@ pub(crate) fn derive_statistics(
         }
 
         Operator::LogicalWindow(_) => {
-            // Window preserves row count.
-            child_statistics(memo, &expr.children, 0)
-        }
-
-        Operator::LogicalSubqueryAlias(_) => {
             // Passthrough child stats.
             child_statistics(memo, &expr.children, 0)
         }
@@ -491,7 +486,6 @@ pub(crate) fn derive_statistics(
         }
 
         Operator::PhysicalWindow(_) => child_statistics(memo, &expr.children, 0),
-        Operator::PhysicalSubqueryAlias(_) => child_statistics(memo, &expr.children, 0),
 
         Operator::PhysicalDistribution(_) => {
             // Distribution enforcer preserves row count.
@@ -1005,7 +999,6 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
         Operator::LogicalAggregate(a) => a.output_columns.clone(),
         Operator::LogicalWindow(w) => w.output_columns.clone(),
         Operator::LogicalValues(v) => v.columns.clone(),
-        Operator::LogicalSubqueryAlias(s) => s.output_columns.clone(),
         // Decode renames dict->string and therefore breaks the
         // child-passthrough invariant the rest of the rename-free
         // operators rely on. Return the operator's stored output_columns
@@ -1095,7 +1088,6 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
         Operator::PhysicalHashAggregate(a) => a.output_columns.clone(),
         Operator::PhysicalWindow(w) => w.output_columns.clone(),
         Operator::PhysicalValues(v) => v.columns.clone(),
-        Operator::PhysicalSubqueryAlias(s) => s.output_columns.clone(),
         // Decode renames dict->string; see the LogicalDecode arm above.
         Operator::PhysicalDecode(d) => d.output_columns.clone(),
         Operator::PhysicalCTEAnchor(_) => child_output_columns(memo, &expr.children, 1),

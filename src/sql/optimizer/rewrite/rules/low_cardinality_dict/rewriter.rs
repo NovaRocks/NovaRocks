@@ -45,7 +45,7 @@
 //!   decoded before the union. UNION DISTINCT / INTERSECT / EXCEPT
 //!   always decode (set-distinct semantics hash on the user-facing
 //!   string value, so dict ids would diverge across snapshots).
-//! * `Window` / `TableFunction` / `Repeat` / `SubqueryAlias` /
+//! * `Window` / `TableFunction` / `Repeat` /
 //!   `CTEAnchor` / `CTEProduce`: conservative decode boundary — every
 //!   dict column flowing through is decoded back to its string before
 //!   the node. For multi-consumer CTEs, see the `TODO(task-8-cte)`
@@ -124,7 +124,6 @@ fn rewrite_node(
         | LogicalPlan::Window(_)
         | LogicalPlan::TableFunction(_)
         | LogicalPlan::Repeat(_)
-        | LogicalPlan::SubqueryAlias(_)
         // TODO(post-Task-9): multi-consumer CTEs with matching dict
         // snapshots across every consumer could keep the dict column
         // on the producer output. Doing so requires a fix-up pass over
@@ -1157,11 +1156,6 @@ fn rewrite_children_decoded(
             node.input = Box::new(wrap_with_decode(input, &scope, ctx));
             Ok(LogicalPlan::Repeat(node))
         }
-        LogicalPlan::SubqueryAlias(mut node) => {
-            let (input, scope) = rewrite_node(*node.input, ctx)?;
-            node.input = Box::new(wrap_with_decode(input, &scope, ctx));
-            Ok(LogicalPlan::SubqueryAlias(node))
-        }
         LogicalPlan::CTEAnchor(mut node) => {
             let (produce, produce_scope) = rewrite_node(*node.produce, ctx)?;
             let (consumer, consumer_scope) = rewrite_node(*node.consumer, ctx)?;
@@ -1247,7 +1241,6 @@ fn plan_output_columns(plan: &LogicalPlan) -> Vec<OutputColumn> {
         LogicalPlan::Scan(scan) => scan.columns.clone(),
         LogicalPlan::Aggregate(node) => node.output_columns.clone(),
         LogicalPlan::Window(node) => node.output_columns.clone(),
-        LogicalPlan::SubqueryAlias(node) => node.output_columns.clone(),
         LogicalPlan::TableFunction(node) => node.output_columns.clone(),
         LogicalPlan::CTEProduce(node) => node.output_columns.clone(),
         LogicalPlan::CTEConsume(node) => node.output_columns.clone(),

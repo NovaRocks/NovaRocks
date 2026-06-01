@@ -465,7 +465,6 @@ pub(crate) fn plan_output_columns(plan: &LogicalPlan) -> Result<Vec<OutputColumn
             Ok(columns)
         }
         LogicalPlan::Window(node) => Ok(node.output_columns.clone()),
-        LogicalPlan::SubqueryAlias(node) => Ok(node.output_columns.clone()),
         LogicalPlan::Repeat(node) => plan_output_columns(&node.input),
         LogicalPlan::CTEAnchor(node) => plan_output_columns(&node.consumer),
         LogicalPlan::CTEProduce(node) => Ok(node.output_columns.clone()),
@@ -2683,15 +2682,15 @@ mod tests {
     }
 
     #[test]
-    fn derived_table_plans_without_subquery_alias_node() {
+    fn derived_table_plans_without_alias_operator() {
         let plan =
             parse_analyze_and_plan("SELECT s.o_orderkey FROM (SELECT o_orderkey FROM orders) s")
                 .expect("planner should succeed");
 
         let debug = format!("{plan:?}");
         assert!(
-            !debug.contains("SubqueryAlias"),
-            "derived table must not create SubqueryAlias: {debug}"
+            !debug.contains("alias operator"),
+            "derived table must not create alias operator: {debug}"
         );
     }
 
@@ -2702,8 +2701,8 @@ mod tests {
 
         let debug = format!("{plan:?}");
         assert!(
-            !debug.contains("SubqueryAlias"),
-            "column alias derived table must not create SubqueryAlias: {debug}"
+            !debug.contains("alias operator"),
+            "column alias derived table must not create alias operator: {debug}"
         );
 
         assert!(
@@ -2775,10 +2774,6 @@ mod tests {
 
         let lines =
             crate::sql::explain::explain_plan(&plan, crate::sql::explain::ExplainLevel::Normal);
-        assert!(
-            !lines.iter().any(|line| line.contains("SUBQUERY ALIAS")),
-            "derived table should not explain as SUBQUERY ALIAS: {lines:?}"
-        );
         let outer_anchor_idx = lines
             .iter()
             .position(|line| line.contains("CTE_ANCHOR(cte_id=0)"))
@@ -2795,7 +2790,7 @@ mod tests {
     }
 
     #[test]
-    fn window_reuses_ordering_through_subquery_alias() {
+    fn window_reuses_ordering_through_derived_table() {
         let plan = parse_analyze_and_plan(
             "SELECT sum(o_custkey) OVER \
                     (ORDER BY o_orderkey ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) \
@@ -2810,10 +2805,6 @@ mod tests {
             .iter()
             .filter(|line| line.contains("SORT BY [o_orderkey ASC NULLS FIRST]"))
             .count();
-        assert!(
-            !lines.iter().any(|line| line.contains("SUBQUERY ALIAS")),
-            "derived table should not explain as SUBQUERY ALIAS: {lines:?}"
-        );
         assert_eq!(
             sort_count, 1,
             "window should reuse the derived table ordering: {lines:?}"
@@ -2836,10 +2827,6 @@ mod tests {
             .iter()
             .filter(|line| line.contains("SORT BY ["))
             .collect::<Vec<_>>();
-        assert!(
-            !lines.iter().any(|line| line.contains("SUBQUERY ALIAS")),
-            "derived table should not explain as SUBQUERY ALIAS: {lines:?}"
-        );
         assert_eq!(
             sort_lines.len(),
             1,
@@ -2916,13 +2903,13 @@ mod tests {
 
         let debug = format!("{plan:?}");
         assert!(
-            !debug.contains("SubqueryAlias"),
-            "set-op derived table must not create SubqueryAlias: {debug}"
+            !debug.contains("alias operator"),
+            "set-op derived table must not create alias operator: {debug}"
         );
 
         let union_node = match unwrap_project_input(&plan) {
             LogicalPlan::Union(n) => n,
-            other => panic!("expected Union without SubqueryAlias, got {other:?}"),
+            other => panic!("expected Union below adapter, got {other:?}"),
         };
         let visible_columns = plan_output_columns(&plan).expect("plan output should be known");
 
@@ -2959,15 +2946,15 @@ mod tests {
 
             let debug = format!("{plan:?}");
             assert!(
-                !debug.contains("SubqueryAlias"),
-                "set-op derived table must not create SubqueryAlias: {debug}"
+                !debug.contains("alias operator"),
+                "set-op derived table must not create alias operator: {debug}"
             );
 
             let visible_columns = plan_output_columns(&plan).expect("plan output should be known");
             let set_op_cols = match unwrap_project_input(&plan) {
                 LogicalPlan::Intersect(n) => &n.output_columns,
                 LogicalPlan::Except(n) => &n.output_columns,
-                other => panic!("expected Intersect/Except without SubqueryAlias, got {other:?}"),
+                other => panic!("expected Intersect/Except below adapter, got {other:?}"),
             };
 
             assert_eq!(visible_columns.len(), set_op_cols.len());

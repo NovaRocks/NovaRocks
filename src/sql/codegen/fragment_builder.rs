@@ -41,8 +41,8 @@ use crate::sql::optimizer::operator::{
     PhysicalDistributionOp, PhysicalExceptOp, PhysicalFilterOp, PhysicalGenerateSeriesOp,
     PhysicalHashAggregateOp, PhysicalHashJoinOp, PhysicalIntersectOp, PhysicalLimitOp,
     PhysicalNestLoopJoinOp, PhysicalProjectOp, PhysicalRepeatOp, PhysicalScanOp, PhysicalSortOp,
-    PhysicalSubqueryAliasOp, PhysicalTableFunctionOp, PhysicalTopNOp, PhysicalUnionOp,
-    PhysicalValuesOp, PhysicalWindowOp, ScanDictionaryColumn,
+    PhysicalTableFunctionOp, PhysicalTopNOp, PhysicalUnionOp, PhysicalValuesOp, PhysicalWindowOp,
+    ScanDictionaryColumn,
 };
 use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
 use crate::sql::optimizer::property::{OrderingSpec, window_ordering_spec};
@@ -495,7 +495,6 @@ impl<'a> PlanFragmentBuilder<'a> {
             Operator::PhysicalValues(op) => self.visit_values(op, node),
             Operator::PhysicalGenerateSeries(op) => self.visit_generate_series(op, node),
             Operator::PhysicalTableFunction(op) => self.visit_table_function(op, node),
-            Operator::PhysicalSubqueryAlias(op) => self.visit_subquery_alias(op, node),
             Operator::PhysicalRepeat(op) => self.visit_repeat(op, node),
             Operator::PhysicalDistribution(op) => self.visit_distribution(op, node),
             Operator::PhysicalCTEAnchor(op) => self.visit_cte_anchor(op, node),
@@ -3362,55 +3361,6 @@ impl<'a> PlanFragmentBuilder<'a> {
             cte_exchange_nodes: child.cte_exchange_nodes,
             ordering: OrderingSpec::Any,
         })
-    }
-
-    // -------------------------------------------------------------------
-    // visit_subquery_alias
-    // -------------------------------------------------------------------
-
-    fn visit_subquery_alias(
-        &mut self,
-        op: &PhysicalSubqueryAliasOp,
-        node: &PhysicalPlanNode,
-    ) -> Result<VisitResult, String> {
-        let mut child = self.visit(&node.children[0])?;
-        let child_output_bindings: Vec<_> = child
-            .scope
-            .iter_columns()
-            .map(|(_, binding)| binding.clone())
-            .collect();
-
-        // Register all output columns with the alias as qualifier. Per the
-        // G1 invariant ("SubqueryAlias does not create new ids, only changes
-        // the display name") we also re-index each binding under the alias's
-        // ColumnId so the by-id lookup follows the column through the alias
-        // boundary.
-        for (idx, col) in op.output_columns.iter().enumerate() {
-            let col_name_lower = col.name.to_lowercase();
-            let binding = child
-                .scope
-                .resolve_by_id(col.column_id)
-                .cloned()
-                .or_else(|| child.scope.resolve_column(None, &col_name_lower).cloned().ok())
-                .or_else(|| child_output_bindings.get(idx).cloned())
-                .ok_or_else(|| {
-                    format!(
-                        "subquery alias '{}' exposes column '{}' at position {} but child has only {} columns",
-                        op.alias,
-                        col.name,
-                        idx,
-                        child_output_bindings.len()
-                    )
-                })?;
-            child.scope.add_column_with_id(
-                col.column_id,
-                Some(op.alias.clone()),
-                col.name.clone(),
-                binding,
-            );
-        }
-
-        Ok(child)
     }
 
     // -------------------------------------------------------------------

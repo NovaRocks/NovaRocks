@@ -232,11 +232,6 @@ pub(crate) fn collect_output_columns(plan: &LogicalPlan) -> HashSet<String> {
             .iter()
             .map(|col| col.name.to_lowercase())
             .collect(),
-        LogicalPlan::SubqueryAlias(s) => s
-            .output_columns
-            .iter()
-            .map(|c| c.name.to_lowercase())
-            .collect(),
         LogicalPlan::Repeat(r) => collect_output_columns(&r.input),
         LogicalPlan::CTEConsume(c) => c
             .output_columns
@@ -384,7 +379,6 @@ pub(crate) fn collect_output_ids_ordered(
             .collect(),
         LogicalPlan::Aggregate(a) => a.output_columns.iter().map(|c| c.column_id).collect(),
         LogicalPlan::Window(w) => w.output_columns.iter().map(|c| c.column_id).collect(),
-        LogicalPlan::SubqueryAlias(s) => s.output_columns.iter().map(|c| c.column_id).collect(),
         LogicalPlan::CTEProduce(p) => p.output_columns.iter().map(|c| c.column_id).collect(),
         LogicalPlan::CTEConsume(c) => c.output_columns.iter().map(|c| c.column_id).collect(),
         LogicalPlan::Union(u) => u.output_columns.iter().map(|c| c.column_id).collect(),
@@ -652,14 +646,6 @@ fn collect_qualified_output_columns_inner(plan: &LogicalPlan, out: &mut HashSet<
         LogicalPlan::CTEProduce(p) => {
             for col in &p.output_columns {
                 out.insert((None, col.name.to_lowercase()));
-            }
-        }
-        LogicalPlan::SubqueryAlias(s) => {
-            let alias_lower = s.alias.to_lowercase();
-            for c in &s.output_columns {
-                let col = c.name.to_lowercase();
-                out.insert((Some(alias_lower.clone()), col.clone()));
-                out.insert((None, col));
             }
         }
         LogicalPlan::Repeat(r) => collect_qualified_output_columns_inner(&r.input, out),

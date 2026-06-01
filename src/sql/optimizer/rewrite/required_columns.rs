@@ -51,7 +51,6 @@ pub(crate) fn tag_required_columns(
         LogicalPlan::Limit(_) => tag_limit(plan, parent_needed),
         LogicalPlan::Aggregate(_) => tag_aggregate(plan, parent_needed),
         LogicalPlan::Join(_) => tag_join(plan, parent_needed),
-        LogicalPlan::SubqueryAlias(_) => tag_subquery_alias(plan, parent_needed),
         LogicalPlan::Union(_) => tag_union(plan, parent_needed),
         LogicalPlan::Intersect(_) => tag_intersect(plan, parent_needed),
         LogicalPlan::Except(_) => tag_except(plan, parent_needed),
@@ -220,18 +219,6 @@ fn tag_aggregate(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) ->
 
     node.input = Box::new(tag_required_columns(*node.input, child_needed));
     LogicalPlan::Aggregate(node)
-}
-
-fn tag_subquery_alias(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> LogicalPlan {
-    // SubqueryAlias is transparent: ColumnId space is preserved across the
-    // alias boundary (only the qualifier/name changes, not the id).
-    // Spec §5.8: pass parent_needed unchanged to inner plan.
-    let LogicalPlan::SubqueryAlias(mut node) = plan else {
-        unreachable!()
-    };
-    node.required_output_columns = parent_needed.clone();
-    node.input = Box::new(tag_required_columns(*node.input, parent_needed));
-    LogicalPlan::SubqueryAlias(node)
 }
 
 fn tag_window(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> LogicalPlan {
@@ -547,7 +534,6 @@ fn collect_cte_consumer_needs(plan: &LogicalPlan, target_id: CteId, acc: &mut Ha
                 collect_cte_consumer_needs(child, target_id, acc);
             }
         }
-        LogicalPlan::SubqueryAlias(s) => collect_cte_consumer_needs(&s.input, target_id, acc),
         LogicalPlan::TableFunction(t) => collect_cte_consumer_needs(&t.input, target_id, acc),
         LogicalPlan::Repeat(r) => collect_cte_consumer_needs(&r.input, target_id, acc),
         LogicalPlan::Decode(d) => collect_cte_consumer_needs(&d.input, target_id, acc),
@@ -618,7 +604,6 @@ fn walk_consume_position_map(
                 walk_consume_position_map(child, target_id, map);
             }
         }
-        LogicalPlan::SubqueryAlias(s) => walk_consume_position_map(&s.input, target_id, map),
         LogicalPlan::TableFunction(t) => walk_consume_position_map(&t.input, target_id, map),
         LogicalPlan::Repeat(r) => walk_consume_position_map(&r.input, target_id, map),
         LogicalPlan::Decode(d) => walk_consume_position_map(&d.input, target_id, map),
@@ -669,7 +654,6 @@ fn subtree_untagged(plan: &LogicalPlan) -> bool {
         LogicalPlan::Sort(n) => subtree_untagged(&n.input),
         LogicalPlan::Limit(n) => subtree_untagged(&n.input),
         LogicalPlan::Window(n) => subtree_untagged(&n.input),
-        LogicalPlan::SubqueryAlias(n) => subtree_untagged(&n.input),
         LogicalPlan::Repeat(n) => subtree_untagged(&n.input),
         LogicalPlan::CTEAnchor(n) => subtree_untagged(&n.consumer),
         LogicalPlan::CTEProduce(n) => subtree_untagged(&n.input),
@@ -752,8 +736,8 @@ mod tests {
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::planner::plan::{
         AggregateCall, AggregateNode, CTEAnchorNode, CTEConsumeNode, CTEProduceNode, FilterNode,
-        JoinNode, LimitNode, ProjectNode, ScanNode, SortNode, SubqueryAliasNode, UnionNode,
-        ValuesNode, WindowExpr, WindowNode,
+        JoinNode, LimitNode, ProjectNode, ScanNode, SortNode, UnionNode, ValuesNode, WindowExpr,
+        WindowNode,
     };
     use arrow::datatypes::DataType;
 
@@ -1150,39 +1134,6 @@ mod tests {
         assert_eq!(rreq.len(), 2);
         assert!(rreq.contains(&ColumnId::new_for_test(4)));
         assert!(rreq.contains(&ColumnId::new_for_test(6)));
-    }
-
-    // -----------------------------------------------------------------------
-    // SubqueryAlias test
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn tag_subquery_alias_transparently_propagates_needed() {
-        // SubqueryAlias[t] <- Scan[a@1,b@2,c@3]
-        // parent_needed = {2}
-        // Expected: scan.required_output_columns = {2}
-        let alias = LogicalPlan::SubqueryAlias(SubqueryAliasNode {
-            input: Box::new(scan_with_3_cols()),
-            alias: "t".to_string(),
-            output_columns: vec![
-                make_output_column(ColumnId::new_for_test(1), "a"),
-                make_output_column(ColumnId::new_for_test(2), "b"),
-                make_output_column(ColumnId::new_for_test(3), "c"),
-            ],
-            required_output_columns: None,
-        });
-        let needed = needed_set(&[2]);
-        let tagged = tag_required_columns(alias, Some(needed.clone()));
-        let LogicalPlan::SubqueryAlias(s) = tagged else {
-            panic!()
-        };
-        assert_eq!(s.required_output_columns.unwrap(), needed);
-        let LogicalPlan::Scan(inner) = *s.input else {
-            panic!()
-        };
-        let inner_req = inner.required_output_columns.unwrap();
-        assert!(inner_req.contains(&ColumnId::new_for_test(2)));
-        assert_eq!(inner_req.len(), 1, "only b propagated");
     }
 
     // -----------------------------------------------------------------------

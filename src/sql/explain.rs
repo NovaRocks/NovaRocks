@@ -285,10 +285,6 @@ fn format_node(plan: &LogicalPlan, level: ExplainLevel, indent: usize, out: &mut
             ));
             format_node(&node.input, level, indent + 1, out);
         }
-        LogicalPlan::SubqueryAlias(node) => {
-            out.push(format!("{pad}SUBQUERY ALIAS [{}]", node.alias));
-            format_node(&node.input, level, indent + 1, out);
-        }
         LogicalPlan::Repeat(node) => {
             out.push(format!(
                 "{pad}REPEAT ({} grouping sets)",
@@ -717,15 +713,6 @@ fn format_physical_node(
                 "{pad}TABLE_FUNCTION [{} {}]{costs_suffix}{stats_suffix}",
                 join_type,
                 op.function_name.to_uppercase()
-            ));
-            for child in &node.children {
-                format_physical_node(child, level, indent + 1, out);
-            }
-        }
-        Operator::PhysicalSubqueryAlias(op) => {
-            out.push(format!(
-                "{pad}SUBQUERY ALIAS [{}]{costs_suffix}{stats_suffix}",
-                op.alias
             ));
             for child in &node.children {
                 format_physical_node(child, level, indent + 1, out);

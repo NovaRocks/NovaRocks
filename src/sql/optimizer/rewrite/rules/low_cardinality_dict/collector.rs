@@ -132,7 +132,6 @@ fn collect_blocklist(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
         }
         LogicalPlan::Window(node) => collect_blocklist(&node.input, out),
         LogicalPlan::TableFunction(node) => collect_blocklist(&node.input, out),
-        LogicalPlan::SubqueryAlias(node) => collect_blocklist(&node.input, out),
         LogicalPlan::Repeat(node) => collect_blocklist(&node.input, out),
         LogicalPlan::CTEProduce(node) => collect_blocklist(&node.input, out),
         LogicalPlan::Decode(node) => collect_blocklist(&node.input, out),
@@ -213,7 +212,6 @@ fn walk(
         LogicalPlan::Limit(node) => walk(&node.input, provider, blocklist, dict_ctx)?,
         LogicalPlan::Window(node) => walk(&node.input, provider, blocklist, dict_ctx)?,
         LogicalPlan::TableFunction(node) => walk(&node.input, provider, blocklist, dict_ctx)?,
-        LogicalPlan::SubqueryAlias(node) => walk(&node.input, provider, blocklist, dict_ctx)?,
         LogicalPlan::Repeat(node) => walk(&node.input, provider, blocklist, dict_ctx)?,
         LogicalPlan::CTEProduce(node) => walk(&node.input, provider, blocklist, dict_ctx)?,
         LogicalPlan::Decode(node) => walk(&node.input, provider, blocklist, dict_ctx)?,

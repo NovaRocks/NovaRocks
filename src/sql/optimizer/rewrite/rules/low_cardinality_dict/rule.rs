@@ -51,7 +51,6 @@ fn contains_scan(plan: &LogicalPlan) -> bool {
         LogicalPlan::Limit(node) => contains_scan(&node.input),
         LogicalPlan::Window(node) => contains_scan(&node.input),
         LogicalPlan::TableFunction(node) => contains_scan(&node.input),
-        LogicalPlan::SubqueryAlias(node) => contains_scan(&node.input),
         LogicalPlan::Repeat(node) => contains_scan(&node.input),
         LogicalPlan::CTEProduce(node) => contains_scan(&node.input),
         LogicalPlan::Decode(node) => contains_scan(&node.input),

@@ -221,12 +221,6 @@ pub(crate) struct LogicalTableFunctionOp {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct LogicalSubqueryAliasOp {
-    pub alias: String,
-    pub output_columns: Vec<OutputColumn>,
-}
-
-#[derive(Clone, Debug)]
 pub(crate) struct LogicalRepeatOp {
     pub repeat_column_ref_list: Vec<Vec<String>>,
     pub grouping_ids: Vec<u64>,
@@ -438,12 +432,6 @@ pub(crate) struct PhysicalTableFunctionOp {
     pub is_left_join: bool,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct PhysicalSubqueryAliasOp {
-    pub alias: String,
-    pub output_columns: Vec<OutputColumn>,
-}
-
 /// Physical counterpart of [`LogicalDecodeOp`]. The codegen step (Task 6)
 /// turns this into a dictionary-decode execution node; Task 5 only routes
 /// the operator through the optimizer.
@@ -478,7 +466,6 @@ pub(crate) enum Operator {
     LogicalValues(LogicalValuesOp),
     LogicalGenerateSeries(LogicalGenerateSeriesOp),
     LogicalTableFunction(LogicalTableFunctionOp),
-    LogicalSubqueryAlias(LogicalSubqueryAliasOp),
     LogicalRepeat(LogicalRepeatOp),
     LogicalCTEAnchor(LogicalCTEAnchorOp),
     LogicalCTEProduce(LogicalCTEProduceOp),
@@ -507,7 +494,6 @@ pub(crate) enum Operator {
     PhysicalValues(PhysicalValuesOp),
     PhysicalGenerateSeries(PhysicalGenerateSeriesOp),
     PhysicalTableFunction(PhysicalTableFunctionOp),
-    PhysicalSubqueryAlias(PhysicalSubqueryAliasOp),
     PhysicalDecode(PhysicalDecodeOp),
 }
 
@@ -530,7 +516,6 @@ impl Operator {
                 | Operator::LogicalValues(_)
                 | Operator::LogicalGenerateSeries(_)
                 | Operator::LogicalTableFunction(_)
-                | Operator::LogicalSubqueryAlias(_)
                 | Operator::LogicalRepeat(_)
                 | Operator::LogicalCTEAnchor(_)
                 | Operator::LogicalCTEProduce(_)

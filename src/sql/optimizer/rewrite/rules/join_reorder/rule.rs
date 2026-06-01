@@ -42,7 +42,7 @@ impl RewriteRule for JoinReorderRule {
         // independently, visits *every* node bottom-up.
         //
         // If we returned `true` everywhere the way we used to, every
-        // Project / Filter / SubqueryAlias / Scan / CTEAnchor / ... node
+        // Project / Filter / Scan / CTEAnchor / ... node
         // re-ran the full subtree walk + Debug-format no-op check, even
         // though the framework's recursion has already processed those
         // children. Profiling TPC-DS q14 step 2 showed ~1200 invocations
@@ -130,7 +130,7 @@ mod tests {
     fn matches_rejects_non_join_nodes() {
         // `matches` must skip non-Join nodes so the pipeline's bottom-up
         // traversal doesn't trigger a full `reorder_joins_cbo` walk at
-        // every Project / Filter / Scan / SubqueryAlias / … in the plan.
+        // every Project / Filter / Scan / ... in the plan.
         // The previous "always match + idempotent no-op" design was
         // O(N × subtree) per node visit and burned the entire optimizer
         // budget on plans with deeply-nested CTEs (see TPC-DS q14 step 2).

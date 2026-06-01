@@ -1309,36 +1309,6 @@ impl Rule for DecodeToPhysical {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 20. SubqueryAliasToPhysical
-// ---------------------------------------------------------------------------
-
-pub(crate) struct SubqueryAliasToPhysical;
-
-impl Rule for SubqueryAliasToPhysical {
-    fn name(&self) -> &str {
-        "SubqueryAliasToPhysical"
-    }
-    fn rule_type(&self) -> RuleType {
-        RuleType::Implementation
-    }
-    fn matches(&self, op: &Operator) -> bool {
-        matches!(op, Operator::LogicalSubqueryAlias(_))
-    }
-    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
-        let Operator::LogicalSubqueryAlias(op) = &expr.op else {
-            return vec![];
-        };
-        vec![NewExpr {
-            op: Operator::PhysicalSubqueryAlias(PhysicalSubqueryAliasOp {
-                alias: op.alias.clone(),
-                output_columns: op.output_columns.clone(),
-            }),
-            children: expr.children.clone(),
-        }]
-    }
-}
-
 #[cfg(test)]
 mod decode_tests {
     use super::*;

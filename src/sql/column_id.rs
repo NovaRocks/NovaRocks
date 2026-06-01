@@ -21,10 +21,10 @@ use arrow::datatypes::DataType;
 
 /// A globally unique column identifier within a single query planning session.
 ///
-/// Invariant: `SubqueryAlias`, `Project`, and `Window` operators do **not**
-/// allocate new ids for pass-through columns — they reuse the upstream id and
-/// only change the display name. This ensures distribution / equivalence /
-/// sort specs remain valid across alias boundaries.
+/// Invariant: `Project` and `Window` operators do **not** allocate new ids
+/// for pass-through columns. Derived-table aliases are resolved in the analyzer
+/// and represented through output metadata or ordinary Project adapters before
+/// the optimizer sees the plan.
 #[derive(Clone, Copy, Hash, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct ColumnId(pub u32);
 

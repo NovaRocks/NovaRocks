@@ -5,8 +5,7 @@ use super::operator::{
     LogicalAggregateOp, LogicalCTEAnchorOp, LogicalCTEConsumeOp, LogicalCTEProduceOp,
     LogicalDecodeOp, LogicalExceptOp, LogicalFilterOp, LogicalGenerateSeriesOp, LogicalIntersectOp,
     LogicalJoinOp, LogicalLimitOp, LogicalProjectOp, LogicalRepeatOp, LogicalScanOp, LogicalSortOp,
-    LogicalSubqueryAliasOp, LogicalTableFunctionOp, LogicalUnionOp, LogicalValuesOp,
-    LogicalWindowOp, Operator,
+    LogicalTableFunctionOp, LogicalUnionOp, LogicalValuesOp, LogicalWindowOp, Operator,
 };
 use crate::sql::planner::plan::LogicalPlan;
 
@@ -220,20 +219,6 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
             let child = logical_plan_to_memo(&node.input, memo);
             let op = Operator::LogicalWindow(LogicalWindowOp {
                 window_exprs: node.window_exprs.clone(),
-                output_columns: node.output_columns.clone(),
-            });
-            let expr = MExpr {
-                id: memo.next_expr_id(),
-                op,
-                children: vec![child],
-            };
-            memo.new_group(expr)
-        }
-
-        LogicalPlan::SubqueryAlias(node) => {
-            let child = logical_plan_to_memo(&node.input, memo);
-            let op = Operator::LogicalSubqueryAlias(LogicalSubqueryAliasOp {
-                alias: node.alias.clone(),
                 output_columns: node.output_columns.clone(),
             });
             let expr = MExpr {

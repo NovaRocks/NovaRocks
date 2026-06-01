@@ -2991,7 +2991,6 @@ fn collect_scan_stats(
             collect_scan_stats(&n.consumer, out);
         }
         LogicalPlan::CTEProduce(n) => collect_scan_stats(&n.input, out),
-        LogicalPlan::SubqueryAlias(n) => collect_scan_stats(&n.input, out),
         LogicalPlan::Join(n) => {
             collect_scan_stats(&n.left, out);
             collect_scan_stats(&n.right, out);

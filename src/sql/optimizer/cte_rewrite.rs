@@ -19,7 +19,6 @@ pub(crate) fn collect_cte_counts(plan: &LogicalPlan) -> CTEContext {
             LogicalPlan::Limit(node) => visit(&node.input, ctx),
             LogicalPlan::Window(node) => visit(&node.input, ctx),
             LogicalPlan::TableFunction(node) => visit(&node.input, ctx),
-            LogicalPlan::SubqueryAlias(node) => visit(&node.input, ctx),
             LogicalPlan::Repeat(node) => visit(&node.input, ctx),
             LogicalPlan::Join(node) => {
                 visit(&node.left, ctx);
@@ -153,10 +152,6 @@ pub(crate) fn inline_single_use_ctes(
             output_columns: node.output_columns,
             required_output_columns: node.required_output_columns,
         })),
-        LogicalPlan::SubqueryAlias(node) => {
-            let input = inline_single_use_ctes(*node.input, ctx)?;
-            crate::sql::planner::adapt_plan_output(input, &node.output_columns)
-        }
         LogicalPlan::Repeat(node) => Ok(LogicalPlan::Repeat(RepeatPlanNode {
             input: Box::new(inline_single_use_ctes(*node.input, ctx)?),
             repeat_column_ref_list: node.repeat_column_ref_list,
@@ -301,10 +296,6 @@ fn replace_cte_consume(
             output_columns: node.output_columns,
             required_output_columns: node.required_output_columns,
         })),
-        LogicalPlan::SubqueryAlias(node) => {
-            let input = replace_cte_consume(*node.input, cte_id, replacement)?;
-            crate::sql::planner::adapt_plan_output(input, &node.output_columns)
-        }
         LogicalPlan::Repeat(node) => Ok(LogicalPlan::Repeat(RepeatPlanNode {
             input: Box::new(replace_cte_consume(*node.input, cte_id, replacement)?),
             repeat_column_ref_list: node.repeat_column_ref_list,
@@ -461,10 +452,6 @@ mod tests {
 
         let ctx = collect_cte_counts(&plan);
         let rewritten = inline_single_use_ctes(plan, &ctx).expect("inline should succeed");
-        assert!(
-            !format!("{rewritten:?}").contains("SubqueryAlias"),
-            "single-use CTE inline must not create SubqueryAlias: {rewritten:?}"
-        );
         assert!(matches!(
             rewritten,
             LogicalPlan::Scan(_) | LogicalPlan::Project(_)
@@ -501,10 +488,6 @@ mod tests {
         assert_eq!(output[0].name, consume_output_columns[0].name);
         assert_eq!(output[0].data_type, consume_output_columns[0].data_type);
         assert_eq!(output[0].nullable, consume_output_columns[0].nullable);
-        assert!(
-            !format!("{rewritten:?}").contains("SubqueryAlias"),
-            "inline result must not contain SubqueryAlias: {rewritten:?}"
-        );
         let LogicalPlan::Project(project) = rewritten else {
             panic!("expected Project adapter");
         };
@@ -588,13 +571,7 @@ mod tests {
                 assert_eq!(anchor.cte_id, 2);
                 match *anchor.produce {
                     LogicalPlan::CTEProduce(produce) => match *produce.input {
-                        LogicalPlan::Scan(_) | LogicalPlan::Project(_) => {
-                            assert!(
-                                !format!("{:?}", produce.input).contains("SubqueryAlias"),
-                                "nested inline must not create SubqueryAlias: {:?}",
-                                produce.input
-                            );
-                        }
+                        LogicalPlan::Scan(_) | LogicalPlan::Project(_) => {}
                         other => panic!("expected nested inline replacement, got {other:?}"),
                     },
                     other => panic!("expected CTEProduce for b, got {other:?}"),
@@ -630,13 +607,7 @@ mod tests {
             LogicalPlan::CTEAnchor(anchor) => match *anchor.consumer {
                 LogicalPlan::Union(union) => {
                     match &union.inputs[0] {
-                        LogicalPlan::Scan(_) | LogicalPlan::Project(_) => {
-                            assert!(
-                                !format!("{:?}", union.inputs[0]).contains("SubqueryAlias"),
-                                "targeted replacement must not create SubqueryAlias: {:?}",
-                                union.inputs[0]
-                            );
-                        }
+                        LogicalPlan::Scan(_) | LogicalPlan::Project(_) => {}
                         other => panic!("expected targeted consume to be rewritten, got {other:?}"),
                     }
                     assert!(matches!(union.inputs[1], LogicalPlan::CTEConsume(_)));

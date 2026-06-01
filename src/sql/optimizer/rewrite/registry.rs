@@ -127,7 +127,6 @@ mod tests {
                 "PruneRepeatColumns",
                 "PruneScanColumns",
                 "PruneSortColumns",
-                "PruneSubqueryAliasColumns",
                 "PruneTableFunctionColumns",
                 "PruneUkFkJoin",
                 "PruneUnionColumns",

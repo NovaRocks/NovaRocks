@@ -256,10 +256,6 @@ pub(crate) fn reorder_joins_heuristic(plan: LogicalPlan) -> LogicalPlan {
             e.inputs = e.inputs.into_iter().map(reorder_joins_heuristic).collect();
             LogicalPlan::Except(e)
         }
-        LogicalPlan::SubqueryAlias(mut s) => {
-            s.input = Box::new(reorder_joins_heuristic(*s.input));
-            LogicalPlan::SubqueryAlias(s)
-        }
         LogicalPlan::Repeat(mut r) => {
             r.input = Box::new(reorder_joins_heuristic(*r.input));
             LogicalPlan::Repeat(r)
@@ -418,10 +414,6 @@ pub(crate) fn reorder_joins_cbo(
                 .map(|p| reorder_joins_cbo(p, table_stats))
                 .collect();
             LogicalPlan::Except(e)
-        }
-        LogicalPlan::SubqueryAlias(mut s) => {
-            s.input = Box::new(reorder_joins_cbo(*s.input, table_stats));
-            LogicalPlan::SubqueryAlias(s)
         }
         LogicalPlan::Repeat(mut r) => {
             r.input = Box::new(reorder_joins_cbo(*r.input, table_stats));

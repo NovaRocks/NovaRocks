@@ -107,8 +107,6 @@ pub(crate) fn derive_for_expr(
         }
         Operator::LogicalProject(_)
         | Operator::PhysicalProject(_)
-        | Operator::LogicalSubqueryAlias(_)
-        | Operator::PhysicalSubqueryAlias(_)
         | Operator::LogicalSort(_)
         | Operator::PhysicalSort(_)
         | Operator::LogicalLimit(_)

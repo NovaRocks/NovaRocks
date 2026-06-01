@@ -241,8 +241,8 @@ impl AnalyzerScope {
     }
 
     /// Register a single column with an already-allocated ColumnId.
-    /// Used when constructing SubqueryAlias output from inner query output
-    /// to preserve ColumnId identity across alias boundaries.
+    /// Used when constructing derived-table and CTE-consume output scopes
+    /// from already analyzed query output.
     pub(super) fn add_column_with_id(
         &mut self,
         qualifier: Option<&str>,

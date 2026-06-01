@@ -182,7 +182,6 @@ fn spine_not_null_inner(
         // A post-Project name match can only cause a (safe) skip of a possibly
         // redundant filter — never an incorrectly-omitted one.
         LogicalPlan::Project(p) => spine_not_null_inner(&p.input, ids, names),
-        LogicalPlan::SubqueryAlias(s) => spine_not_null_inner(&s.input, ids, names),
         LogicalPlan::Sort(s) => spine_not_null_inner(&s.input, ids, names),
         LogicalPlan::Limit(l) => spine_not_null_inner(&l.input, ids, names),
         _ => {}

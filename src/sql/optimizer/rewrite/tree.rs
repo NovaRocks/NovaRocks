@@ -6,7 +6,7 @@ use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal}
 use crate::sql::planner::plan::{
     AggregateNode, CTEAnchorNode, CTEProduceNode, DecodeNode, ExceptNode, FilterNode,
     IntersectNode, JoinNode, LimitNode, LogicalPlan, ProjectNode, RepeatPlanNode, SortNode,
-    SubqueryAliasNode, TableFunctionNode, UnionNode, WindowNode,
+    TableFunctionNode, UnionNode, WindowNode,
 };
 
 pub(crate) fn rewrite_with_rule(
@@ -153,16 +153,6 @@ fn rewrite_children(
             let (input, changed) = rewrite_with_rule(*node.input, rule, ctx)?;
             Ok((
                 LogicalPlan::TableFunction(TableFunctionNode {
-                    input: Box::new(input),
-                    ..node
-                }),
-                changed,
-            ))
-        }
-        LogicalPlan::SubqueryAlias(node) => {
-            let (input, changed) = rewrite_with_rule(*node.input, rule, ctx)?;
-            Ok((
-                LogicalPlan::SubqueryAlias(SubqueryAliasNode {
                     input: Box::new(input),
                     ..node
                 }),
@@ -575,7 +565,6 @@ mod tests {
                 | LogicalPlan::GenerateSeries(_)
                 | LogicalPlan::TableFunction(_)
                 | LogicalPlan::Window(_)
-                | LogicalPlan::SubqueryAlias(_)
                 | LogicalPlan::Repeat(_)
                 | LogicalPlan::CTEAnchor(_)
                 | LogicalPlan::CTEProduce(_)
