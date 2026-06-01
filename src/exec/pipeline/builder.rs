@@ -59,15 +59,16 @@ use crate::exec::operators::AssertNumRowsProcessorFactory;
 use crate::exec::operators::analytic_shared::AnalyticSharedState;
 use crate::exec::operators::local_exchanger::{LocalExchangePartitionSpec, LocalExchanger};
 use crate::exec::operators::{
-    AggregateProcessorFactory, AggregateStreamingSinkFactory, AggregateStreamingSourceFactory,
-    AggregateStreamingState, AnalyticSinkFactory, AnalyticSourceFactory,
-    BroadcastJoinProbeProcessorFactory, ExceptSinkFactory, ExceptSourceFactory,
-    ExchangeSourceFactory, FetchProcessorFactory, FilterProcessorFactory, HashJoinBuildSinkFactory,
-    IntersectSinkFactory, IntersectSourceFactory, LimitProcessorFactory, LocalExchangeSinkFactory,
-    LocalExchangeSourceFactory, LookUpSourceFactory, PartitionedJoinProbeProcessorFactory,
-    ProjectProcessorFactory, RepeatProcessorFactory, ScanSourceFactory, SortProcessorFactory,
-    TableFunctionProcessorFactory, UnionAllSharedState, UnionAllSinkFactory, UnionAllSourceFactory,
-    ValuesSourceFactory,
+    AggregateProcessorFactory, AggregateStateMergeInput, AggregateStateMergeSharedState,
+    AggregateStateMergeSinkFactory, AggregateStateMergeSourceFactory,
+    AggregateStreamingSinkFactory, AggregateStreamingSourceFactory, AggregateStreamingState,
+    AnalyticSinkFactory, AnalyticSourceFactory, BroadcastJoinProbeProcessorFactory,
+    ExceptSinkFactory, ExceptSourceFactory, ExchangeSourceFactory, FetchProcessorFactory,
+    FilterProcessorFactory, HashJoinBuildSinkFactory, IntersectSinkFactory, IntersectSourceFactory,
+    LimitProcessorFactory, LocalExchangeSinkFactory, LocalExchangeSourceFactory,
+    LookUpSourceFactory, PartitionedJoinProbeProcessorFactory, ProjectProcessorFactory,
+    RepeatProcessorFactory, ScanSourceFactory, SortProcessorFactory, TableFunctionProcessorFactory,
+    UnionAllSharedState, UnionAllSinkFactory, UnionAllSourceFactory, ValuesSourceFactory,
 };
 use crate::exec::operators::{ExceptSharedState, IntersectSharedState, SetOpStageController};
 use crate::exec::operators::{
@@ -1220,6 +1221,44 @@ fn build_pipeline_for_node(
                 |shared, id| Box::new(ExceptSourceFactory::new(shared, id)),
             ),
         },
+        ExecNodeKind::AggregateStateMerge(plan) => {
+            let mut old_build = build_pipeline_for_node(&plan.old_input, ctx)?;
+            let mut delta_build = build_pipeline_for_node(&plan.delta_input, ctx)?;
+            let state = AggregateStateMergeSharedState::new(
+                old_build.pipeline.dop.max(1) as usize,
+                delta_build.pipeline.dop.max(1) as usize,
+            );
+            let old_sink = Box::new(AggregateStateMergeSinkFactory::new(
+                AggregateStateMergeInput::Old,
+                state.clone(),
+                0,
+            ));
+            let delta_sink = Box::new(AggregateStateMergeSinkFactory::new(
+                AggregateStateMergeInput::Delta,
+                state.clone(),
+                0,
+            ));
+            old_build.pipeline.factories.push(old_sink);
+            old_build.pipeline.needs_sink = false;
+            delta_build.pipeline.factories.push(delta_sink);
+            delta_build.pipeline.needs_sink = false;
+
+            let source = Box::new(AggregateStateMergeSourceFactory::new(
+                plan.clone(),
+                state,
+                0,
+            ));
+            let mut extra_pipelines = Vec::new();
+            extra_pipelines.append(&mut old_build.extra_pipelines);
+            extra_pipelines.append(&mut delta_build.extra_pipelines);
+            extra_pipelines.push(old_build.pipeline);
+            extra_pipelines.push(delta_build.pipeline);
+            Ok(PipelineBuildResult {
+                pipeline: new_source_pipeline_with_dop(ctx, source, 1),
+                extra_pipelines,
+                stream: StreamDesc::single(),
+            })
+        }
         ExecNodeKind::IcebergDeltaScan(node) => {
             let source: Box<dyn OperatorFactory> = Box::new(
                 crate::exec::operators::IcebergDeltaScanFactory::new(node.clone()),

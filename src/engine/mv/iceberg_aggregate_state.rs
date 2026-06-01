@@ -59,6 +59,23 @@ pub(crate) fn merge_aggregate_target_state(
     })
 }
 
+pub(crate) fn merge_aggregate_state_chunks_for_change_stream(
+    old_chunks: &[Chunk],
+    delta_chunks: &[Chunk],
+    layout: &AggregateMvLayout,
+) -> Result<Vec<Chunk>, String> {
+    let old_rows = build_old_state_map(old_chunks, layout)?;
+    let touched_row_ids = delta_row_ids(layout, delta_chunks)?;
+    let merge_result =
+        merge_aggregate_state_batches_with_retractions(&old_rows, delta_chunks, layout)?;
+    build_aggregate_change_stream_chunks(
+        layout,
+        old_chunks,
+        &merge_result.upsert_chunks,
+        &touched_row_ids,
+    )
+}
+
 pub(crate) fn build_aggregate_change_chunks(
     layout: &AggregateMvLayout,
     merge: IcebergAggregateMergeResult,
@@ -99,6 +116,58 @@ pub(crate) fn build_aggregate_change_chunks(
     }
 
     Ok(chunks)
+}
+
+fn build_aggregate_change_stream_chunks(
+    layout: &AggregateMvLayout,
+    old_chunks: &[Chunk],
+    upsert_chunks: &[Chunk],
+    touched_row_ids: &BTreeSet<String>,
+) -> Result<Vec<Chunk>, String> {
+    let mut chunks = Vec::new();
+    let delete_chunks = filter_physical_chunks_by_row_ids(layout, old_chunks, touched_row_ids)?;
+    for delete_chunk in delete_chunks {
+        chunks.push(append_change_op_to_physical_chunk(
+            layout,
+            delete_chunk,
+            ChangeOp::Delete,
+            "aggregate state merge DELETE change chunk",
+        )?);
+    }
+
+    let insert_chunks = filter_physical_chunks_by_row_ids(layout, upsert_chunks, touched_row_ids)?;
+    for insert_chunk in insert_chunks {
+        chunks.push(append_change_op_to_physical_chunk(
+            layout,
+            insert_chunk,
+            ChangeOp::Insert,
+            "aggregate state merge INSERT change chunk",
+        )?);
+    }
+    Ok(chunks)
+}
+
+fn append_change_op_to_physical_chunk(
+    layout: &AggregateMvLayout,
+    chunk: Chunk,
+    op: ChangeOp,
+    context: &str,
+) -> Result<Chunk, String> {
+    let batch = chunk.batch;
+    validate_physical_aggregate_schema(layout, &batch, context)?;
+    let row_count = batch.num_rows();
+    let mut fields = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect::<Vec<_>>();
+    fields.push(change_op_field());
+    let mut columns = batch.columns().to_vec();
+    columns.push(change_op_array(op, row_count));
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map_err(|e| format!("build {context} failed: {e}"))?;
+    record_batch_to_chunk(batch)
 }
 
 fn validate_physical_aggregate_schema(

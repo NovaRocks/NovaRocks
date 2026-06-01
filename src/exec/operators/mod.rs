@@ -25,6 +25,7 @@
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
 mod aggregate;
+pub(crate) mod aggregate_state_merge;
 pub(crate) mod analytic_shared;
 mod analytic_sink;
 mod analytic_source;
@@ -61,6 +62,10 @@ pub use aggregate::AggregateProcessorFactory;
 pub use aggregate::streaming_sink::AggregateStreamingSinkFactory;
 pub use aggregate::streaming_source::AggregateStreamingSourceFactory;
 pub(crate) use aggregate::streaming_state::AggregateStreamingState;
+pub(crate) use aggregate_state_merge::{
+    AggregateStateMergeInput, AggregateStateMergeSharedState, AggregateStateMergeSinkFactory,
+    AggregateStateMergeSourceFactory,
+};
 pub use analytic_sink::AnalyticSinkFactory;
 pub use analytic_source::AnalyticSourceFactory;
 pub use assert_num_rows_processor::AssertNumRowsProcessorFactory;
