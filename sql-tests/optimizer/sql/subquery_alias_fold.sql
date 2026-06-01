@@ -1,4 +1,5 @@
 -- @tags=optimizer,oq6,subquery_alias_fold
+-- @order_sensitive=true
 -- Test Objective:
 -- 1. Derived-table aliases are analysis metadata and do not appear as plan nodes.
 -- 2. Derived-table column aliases still expose the renamed output column.
@@ -12,7 +13,11 @@ SELECT s.k
 FROM (SELECT k, v FROM ${case_db}.oq6_alias_base) s
 WHERE s.v > 10;
 
--- @explain_contains=PROJECT [renamed_k]
+EXPLAIN VERBOSE
+SELECT renamed_k
+FROM (SELECT k FROM ${case_db}.oq6_alias_base) s(renamed_k)
+ORDER BY renamed_k;
+
 SELECT renamed_k
 FROM (SELECT k FROM ${case_db}.oq6_alias_base) s(renamed_k)
 ORDER BY renamed_k;

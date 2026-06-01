@@ -10,12 +10,24 @@ GATHER EXCHANGE stats={rows=50000}
            predicates: s.v > 10
 
 -- query 5
+Explain String
+SORT BY [renamed_k ASC NULLS FIRST] stats={rows=100000}
+  GATHER EXCHANGE stats={rows=100000}
+    PROJECT [renamed_k] stats={rows=100000}
+      PROJECT [k AS renamed_k] stats={rows=100000}
+        PROJECT [k] stats={rows=100000}
+          SCAN db_sqlt_73474ac5ba7b3917.oq6_alias_base stats={rows=100000}
+               TABLE: db_sqlt_73474ac5ba7b3917.oq6_alias_base
+               columns: k
+               min-max stats
+
+-- query 6
 renamed_k
 1
 2
 3
 
--- query 6
+-- query 7
 Explain String
 PROJECT [count() AS count(*)] stats={rows=1}
   HASH AGGREGATE (GLOBAL) stats={rows=1}
