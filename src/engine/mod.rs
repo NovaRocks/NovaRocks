@@ -4631,6 +4631,182 @@ enable_path_style_access = true
         registry
     }
 
+    fn parse_query_for_engine_test(sql: &str) -> sqlparser::ast::Query {
+        let normalized =
+            crate::sql::parser::dialect::normalize_for_raw_parse(sql).expect("normalize sql");
+        let statement = crate::sql::parser::parse_normalized_sql_raw(&normalized)
+            .expect("parse query statement");
+        let sqlparser::ast::Statement::Query(query) = statement else {
+            panic!("expected query statement");
+        };
+        *query
+    }
+
+    fn dummy_mv_refresh_context_for_validator_test()
+    -> crate::engine::mv::refresh_context::IcebergMvRefreshContext {
+        use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+        use iceberg::spec::{
+            FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder,
+            TableMetadataBuilder, Type,
+        };
+        use iceberg::table::Table;
+        use iceberg::{CatalogBuilder, NamespaceIdent, TableIdent};
+
+        let warehouse = format!(
+            "memory://novarocks-imv-validator-test-{}",
+            uuid::Uuid::new_v4()
+        );
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let iceberg_catalog: Arc<dyn iceberg::Catalog> = Arc::new(
+            runtime
+                .block_on(MemoryCatalogBuilder::default().load(
+                    "memory",
+                    std::collections::HashMap::from([(
+                        MEMORY_CATALOG_WAREHOUSE.to_string(),
+                        warehouse.clone(),
+                    )]),
+                ))
+                .expect("memory catalog"),
+        );
+
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "k", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::optional(2, "v", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .expect("schema");
+        let metadata = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec().into_unbound(),
+            SortOrder::unsorted_order(),
+            "memory://validator-target/table".to_string(),
+            FormatVersion::V3,
+            std::collections::HashMap::from([(
+                "write.row-lineage".to_string(),
+                "true".to_string(),
+            )]),
+        )
+        .expect("metadata builder")
+        .build()
+        .expect("metadata")
+        .metadata;
+        let target_table = Table::builder()
+            .file_io(iceberg::io::FileIO::new_with_memory())
+            .metadata(metadata)
+            .identifier(TableIdent::new(
+                NamespaceIdent::new("db".to_string()),
+                "mv".to_string(),
+            ))
+            .build()
+            .expect("target table");
+        let target_entry = Arc::new(
+            crate::connector::iceberg::catalog::registry::build_catalog_entry(
+                "tgt",
+                &[
+                    ("iceberg.catalog.type".to_string(), "memory".to_string()),
+                    ("iceberg.catalog.warehouse".to_string(), warehouse),
+                ],
+            )
+            .expect("catalog entry"),
+        );
+
+        crate::engine::mv::refresh_context::IcebergMvRefreshContext {
+            rewrite: crate::engine::mv::refresh_context::tests_support::dummy_rewrite_context(),
+            target_entry,
+            iceberg_catalog,
+            target_table,
+        }
+    }
+
+    #[test]
+    fn execute_query_with_imv_validator_propagates_validator_error() {
+        let query = parse_query_for_engine_test("select k, v from ice.db.b");
+        let mut catalog = super::InMemoryCatalog::default();
+        catalog.create_database("db").expect("create db");
+        catalog
+            .register(
+                "db",
+                crate::sql::catalog::TableDef {
+                    name: "b".to_string(),
+                    columns: vec![
+                        crate::sql::catalog::ColumnDef {
+                            name: "k".to_string(),
+                            data_type: DataType::Int64,
+                            nullable: false,
+                            write_default: None,
+                            logical_type: None,
+                        },
+                        crate::sql::catalog::ColumnDef {
+                            name: "v".to_string(),
+                            data_type: DataType::Int64,
+                            nullable: true,
+                            write_default: None,
+                            logical_type: None,
+                        },
+                    ],
+                    iceberg_row_lineage_metadata_columns: Vec::new(),
+                    source: crate::sql::catalog::ScanSource::IcebergDataFiles {
+                        table: crate::sql::catalog::IcebergTableInfo {
+                            catalog: "ice".to_string(),
+                            namespace: "db".to_string(),
+                            table: "b".to_string(),
+                            table_uuid: Some("uuid-b".to_string()),
+                            current_snapshot_id: Some(22),
+                            schema_id: 1,
+                            location: "memory://ice/db/b".to_string(),
+                            schema: crate::sql::catalog::IcebergSchemaDef {
+                                fields: vec![
+                                    crate::sql::catalog::IcebergSchemaFieldDef {
+                                        field_id: 1,
+                                        name: "k".to_string(),
+                                        initial_default: None,
+                                        write_default: None,
+                                        initial_default_json: None,
+                                        children: Vec::new(),
+                                    },
+                                    crate::sql::catalog::IcebergSchemaFieldDef {
+                                        field_id: 2,
+                                        name: "v".to_string(),
+                                        initial_default: None,
+                                        write_default: None,
+                                        initial_default_json: None,
+                                        children: Vec::new(),
+                                    },
+                                ],
+                            },
+                            serialized_metadata: None,
+                        },
+                        files: Vec::new(),
+                        cloud_properties: Default::default(),
+                    },
+                },
+            )
+            .expect("register base table");
+        let connectors = crate::connector::ConnectorRegistry::default();
+        let mv_ctx = dummy_mv_refresh_context_for_validator_test();
+        let validator =
+            |_outcome: &crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteOutcome| {
+                Err("sentinel IMV validator error".to_string())
+            };
+
+        let err = super::execute_query_with_options_and_imv_validator(
+            &query,
+            &catalog,
+            &connectors,
+            "default",
+            0,
+            None,
+            None,
+            None,
+            Some(&mv_ctx),
+            Some(&validator),
+        )
+        .expect_err("validator errors must abort refresh query execution");
+
+        assert_eq!(err, "sentinel IMV validator error");
+    }
+
     #[test]
     fn sqlparser_insert_values_preserves_array_literals() {
         use crate::sql::parser::dialect::StarRocksDialect;

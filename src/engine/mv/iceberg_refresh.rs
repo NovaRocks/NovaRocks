@@ -1166,18 +1166,6 @@ fn iceberg_aggregate_first_refresh_select_sql(
     crate::connector::starrocks::table::mv_shape::rewrite_select_sql_for_state(select_sql, shape)
 }
 
-fn iceberg_aggregate_incremental_delta_select_sql(
-    select_sql: &str,
-    shape: &crate::connector::starrocks::table::mv_shape::AggregateMvShape,
-    change_op_qualifier: Option<&str>,
-) -> Result<String, String> {
-    crate::connector::starrocks::table::ivm_delta_aggregate::rewrite_select_sql_for_signed_delta_state_with_change_op_qualifier(
-        select_sql,
-        shape,
-        change_op_qualifier,
-    )
-}
-
 /// Refresh an iceberg-backed materialized view.
 ///
 /// Strategy dispatch:
@@ -1756,170 +1744,6 @@ fn refresh_single_aggregate_iceberg_mv(
             )
         }
     }
-}
-
-fn incremental_refresh_iceberg_aggregate_mv(
-    state: &Arc<StandaloneState>,
-    ctx: &IcebergMvRefreshContext,
-    base_ref: &IcebergTableRef,
-    previous_snapshot_id: i64,
-    current_snapshot_id: i64,
-    loaded_base: &crate::connector::iceberg::catalog::IcebergLoadedTable,
-    aggregate_shape: &AggregateMvShape,
-) -> Result<StatementResult, String> {
-    let target = &ctx.rewrite.target;
-    let target_entry = &*ctx.target_entry;
-    let iceberg_catalog = &ctx.iceberg_catalog;
-    let target_table = &ctx.target_table;
-    let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
-    let current_catalog = ctx.rewrite.current_catalog.as_deref();
-    let current_database = ctx.rewrite.current_database.as_str();
-    let mv_definition = &*ctx.rewrite.mv_definition;
-    let schema_contract = &*ctx.rewrite.schema_contract;
-    let pin = &*ctx.rewrite.pin;
-    let batch = match plan_changes(
-        &loaded_base.table,
-        previous_snapshot_id,
-        Some(current_snapshot_id),
-        &[],
-    ) {
-        Ok(batch) => batch,
-        Err(err) => match policy_signal_from_change_error(&err) {
-            IcebergChangePolicySignal::FullRefresh { reason } => {
-                return Err(format!(
-                    "iceberg aggregate MV {}.{}.{} cannot refresh incrementally and automatic full rebuild is disabled: {reason}",
-                    target.catalog, target.namespace, target.table
-                ));
-            }
-            IcebergChangePolicySignal::Unsupported { reason } => {
-                return Err(format!(
-                    "iceberg aggregate MV {}.{}.{} incremental refresh unsupported: {reason}",
-                    target.catalog, target.namespace, target.table
-                ));
-            }
-            IcebergChangePolicySignal::Incremental => {
-                return Err(format!(
-                    "iceberg aggregate MV {}.{}.{} produced invalid incremental policy from change planner: {err}",
-                    target.catalog, target.namespace, target.table
-                ));
-            }
-        },
-    };
-    if batch.current_snapshot_id != current_snapshot_id {
-        return Err(format!(
-            "iceberg aggregate MV incremental refresh: change batch snapshot mismatch (expected {current_snapshot_id}, got {})",
-            batch.current_snapshot_id,
-        ));
-    }
-
-    let has_delete_changes = iceberg_change_batch_has_row_deletes(&batch);
-    let is_empty_delta = batch.inserts.is_empty() && !has_delete_changes;
-    if is_empty_delta {
-        tracing::info!(
-            "iceberg aggregate mv {}.{}.{}: incremental delta is empty; updating metadata only",
-            target.catalog,
-            target.namespace,
-            target.table
-        );
-        return finalize_iceberg_mv_metadata_only_refresh(
-            state,
-            target,
-            mv_definition,
-            pin.to_snapshot_map(),
-            pin.to_table_uuid_map(),
-        );
-    }
-
-    let source_files =
-        crate::connector::starrocks::table::ivm_delta_source::build_delta_source_files(
-            crate::connector::starrocks::table::ivm_delta_source::IvmDeltaSourceInput {
-                state,
-                current_database,
-                base_ref,
-                loaded: loaded_base,
-            },
-            batch,
-        )?;
-    if source_files.previous_snapshot_id != previous_snapshot_id
-        || source_files.current_snapshot_id != current_snapshot_id
-    {
-        return Err(format!(
-            "iceberg aggregate MV incremental refresh delta source snapshot window mismatch: expected {} -> {}, got {} -> {}",
-            previous_snapshot_id,
-            current_snapshot_id,
-            source_files.previous_snapshot_id,
-            source_files.current_snapshot_id
-        ));
-    }
-    if source_files.files.is_empty() {
-        tracing::info!(
-            "iceberg aggregate mv {}.{}.{}: delta source has no materialized rows; updating metadata only",
-            target.catalog,
-            target.namespace,
-            target.table
-        );
-        return finalize_iceberg_mv_metadata_only_refresh(
-            state,
-            target,
-            mv_definition,
-            pin.to_snapshot_map(),
-            pin.to_table_uuid_map(),
-        );
-    }
-
-    let layout = build_aggregate_layout_for_refresh(
-        state,
-        current_catalog,
-        current_database,
-        mv_definition,
-        aggregate_shape,
-    )?;
-    let signed_sql = iceberg_aggregate_incremental_delta_select_sql(
-        &mv_definition.select_sql,
-        aggregate_shape,
-        None,
-    )?;
-    let delta_result =
-        crate::connector::starrocks::table::ivm_delta_source::execute_delta_source_query(
-            crate::connector::starrocks::table::ivm_delta_source::IvmDeltaSourceInput {
-                state,
-                current_database,
-                base_ref,
-                loaded: loaded_base,
-            },
-            &signed_sql,
-            source_files,
-        )?;
-    let delta_chunks =
-        crate::connector::starrocks::table::mv_agg_state::materialize_aggregate_result_chunks(
-            delta_result,
-            &layout,
-            aggregate_shape,
-        )?;
-    if delta_chunks.iter().all(|chunk| chunk.batch.num_rows() == 0) {
-        return finalize_iceberg_mv_metadata_only_refresh(
-            state,
-            target,
-            mv_definition,
-            pin.to_snapshot_map(),
-            pin.to_table_uuid_map(),
-        );
-    }
-
-    apply_iceberg_aggregate_delta_chunks(
-        state,
-        target,
-        target_entry,
-        iceberg_catalog,
-        target_table,
-        expected_main_snapshot_id,
-        mv_definition,
-        schema_contract,
-        &layout,
-        &delta_chunks,
-        pin.to_snapshot_map(),
-        pin.to_table_uuid_map(),
-    )
 }
 
 fn target_fqn_string(target: &IcebergMvTarget) -> String {
@@ -6034,8 +5858,12 @@ fn validate_aggregate_refresh_rewrite_outcome(
         ));
     }
     if !logical_plan_contains_aggregate_state_merge(&outcome.plan) {
+        let label = match evidence {
+            RewriteMergeRefreshEvidence::JoinAggregate => "join aggregate",
+            _ => "aggregate",
+        };
         return Err(format!(
-            "iceberg aggregate MV {} incremental refresh rewrite plan does not contain AggregateStateMerge",
+            "iceberg {label} MV {} incremental refresh rewrite plan does not contain AggregateStateMerge",
             target_fqn_string(&ctx.target)
         ));
     }
@@ -6201,6 +6029,45 @@ mod aggregate_refresh_rewrite_validation_tests {
             err.contains("did not apply RewriteJoinAggregateDelta"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn join_aggregate_refresh_missing_merge_plan_uses_join_label() {
+        let ctx = crate::engine::mv::refresh_context::tests_support::dummy_rewrite_context();
+        let outcome = outcome(
+            empty_values_plan(),
+            &["RewriteJoinAggregateDelta", "RewriteAggregateState"],
+        );
+
+        let err = validate_aggregate_refresh_rewrite_outcome(
+            &ctx,
+            &outcome,
+            RewriteMergeRefreshEvidence::JoinAggregate,
+        )
+        .expect_err("join aggregate refresh must require AggregateStateMerge in the rewrite plan");
+
+        assert!(
+            err.contains("iceberg join aggregate MV")
+                && err.contains("does not contain AggregateStateMerge"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn aggregate_refresh_source_does_not_use_legacy_sql_delta_path() {
+        let source = std::fs::read_to_string(file!()).expect("read source");
+        let forbidden = [
+            concat!("execute_delta_source_", "query"),
+            concat!("iceberg_aggregate_incremental_", "delta_select_sql"),
+            concat!("incremental_refresh_iceberg_", "aggregate_mv"),
+        ];
+
+        for token in forbidden {
+            assert!(
+                !source.contains(token),
+                "legacy aggregate refresh SQL delta path remains: {token}"
+            );
+        }
     }
 }
 
@@ -7689,30 +7556,6 @@ mod tests {
         assert!(!upper.contains("__AGG_STATE_A__SUM"), "sql={state_sql}");
         assert!(!upper.contains("__AGG_STATE_A__COUNT"), "sql={state_sql}");
         assert!(!upper.contains("__ROW_ID__"), "sql={state_sql}");
-    }
-
-    #[test]
-    fn aggregate_incremental_rewrite_uses_signed_state() {
-        let sql = "select region, count(*) as c, sum(amount) as s \
-                   from ice.ns.fact group by region";
-        let query = parse_select_query(sql);
-        let shape = match classify_incremental_mv_query(&query).expect("shape") {
-            IncrementalMvShape::Aggregate(shape) => shape,
-            other => panic!("expected aggregate shape, got {other:?}"),
-        };
-
-        let rewritten =
-            iceberg_aggregate_incremental_delta_select_sql(sql, &shape, None).expect("rewrite");
-        let upper = rewritten.to_uppercase();
-
-        assert!(
-            upper.contains("COUNT_STATE_SIGNED(1, __CHANGE_OP) AS __AGG_STATE_C"),
-            "sql={rewritten}"
-        );
-        assert!(
-            upper.contains("SUM_STATE_SIGNED(AMOUNT, __CHANGE_OP) AS __AGG_STATE_S"),
-            "sql={rewritten}"
-        );
     }
 
     #[test]
