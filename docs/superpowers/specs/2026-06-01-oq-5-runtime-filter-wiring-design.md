@@ -366,6 +366,7 @@ optimizer 侧不做类型选择。
 ## 14. Correctness 风险
 
 1. **build/probe 朝向**（§5d）：planner 假设右 child = build。Stage 0 必查。
+   - 验证(2026-06-01,Stage 0):确认 children[1]=build 侧,build_expr=eq.right。证据:src/exec/pipeline/builder.rs:934-938（`probe_is_left=true`,`probe_build=left_build`,`build_build=right_build`）及 src/lower/node/hash_join.rs:174-187（`probe_keys←cond.left/left.layout`,`build_keys←cond.right/right.layout`）。
 2. **跨 exchange remap**：probe expr 穿过 Exchange / Project 时必须按子节点输出
    列正确 remap，否则 probe 落错 slot。Stage 3 重点测。
 3. **gating 与执行侧一致**：optimizer 用 estimated cardinality 决定建不建 RF；
