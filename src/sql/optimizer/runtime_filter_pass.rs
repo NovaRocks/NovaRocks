@@ -5,10 +5,12 @@
 //! descendant that can bind the probe column. EXPLAIN renders the annotations;
 //! codegen lowers them to thrift `TRuntimeFilterDescription`.
 
-use crate::sql::analysis::{JoinKind, TypedExpr};
+use crate::sql::analysis::{ExprKind, JoinKind, TypedExpr};
+use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::{JoinDistribution, Operator};
 use crate::sql::optimizer::options::OptimizerOptions;
 use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
+use std::collections::HashSet;
 
 /// The optimizer-layer name used by `SET disable_optimizer_rules`.
 pub(crate) const RUNTIME_FILTER_RULE: &str = "RuntimeFilterPushDown";
@@ -88,6 +90,149 @@ fn join_builds_rf(kind: JoinKind) -> bool {
     )
 }
 
+/// Collect ALL column ids referenced by `expr` into `out`.
+///
+/// This function is exhaustive over every `ExprKind` variant that holds
+/// sub-expressions or column refs. Under-collection would cause `could_bound`
+/// to return `true` when a node does NOT expose a column, placing a probe
+/// incorrectly. Each variant is handled explicitly; only verified leaf variants
+/// (no sub-expressions) use a wildcard arm.
+fn column_ids(expr: &TypedExpr, out: &mut HashSet<ColumnId>) {
+    match &expr.kind {
+        ExprKind::ColumnRef { column_id, .. } => {
+            out.insert(*column_id);
+        }
+        ExprKind::BinaryOp { left, right, .. } => {
+            column_ids(left, out);
+            column_ids(right, out);
+        }
+        ExprKind::UnaryOp { expr, .. } => {
+            column_ids(expr, out);
+        }
+        ExprKind::FunctionCall { args, .. } => {
+            for arg in args {
+                column_ids(arg, out);
+            }
+        }
+        ExprKind::LambdaFunction { body, .. } => {
+            // params are declaration-only; column refs can appear in the body.
+            column_ids(body, out);
+        }
+        ExprKind::AggregateCall { args, order_by, .. } => {
+            for arg in args {
+                column_ids(arg, out);
+            }
+            for item in order_by {
+                column_ids(&item.expr, out);
+            }
+        }
+        ExprKind::Cast { expr, .. } => {
+            column_ids(expr, out);
+        }
+        ExprKind::IsNull { expr, .. } => {
+            column_ids(expr, out);
+        }
+        ExprKind::InList { expr, list, .. } => {
+            column_ids(expr, out);
+            for item in list {
+                column_ids(item, out);
+            }
+        }
+        ExprKind::Between { expr, low, high, .. } => {
+            column_ids(expr, out);
+            column_ids(low, out);
+            column_ids(high, out);
+        }
+        ExprKind::Like { expr, pattern, .. } => {
+            column_ids(expr, out);
+            column_ids(pattern, out);
+        }
+        ExprKind::Case { operand, when_then, else_expr, .. } => {
+            if let Some(op) = operand {
+                column_ids(op, out);
+            }
+            for (when, then) in when_then {
+                column_ids(when, out);
+                column_ids(then, out);
+            }
+            if let Some(el) = else_expr {
+                column_ids(el, out);
+            }
+        }
+        ExprKind::IsTruthValue { expr, .. } => {
+            column_ids(expr, out);
+        }
+        ExprKind::Nested(inner) => {
+            column_ids(inner, out);
+        }
+        ExprKind::WindowCall { args, partition_by, order_by, .. } => {
+            for arg in args {
+                column_ids(arg, out);
+            }
+            for pb in partition_by {
+                column_ids(pb, out);
+            }
+            for item in order_by {
+                column_ids(&item.expr, out);
+            }
+        }
+        ExprKind::Lambda { body, .. } => {
+            // params are parameter names only; the body may reference outer columns.
+            column_ids(body, out);
+        }
+        // Verified leaves — no sub-expressions, no column refs:
+        // - Literal: holds only a LiteralValue (no TypedExpr).
+        // - LambdaParamRef: references a lambda slot by name/id, not a ColumnId.
+        // - SubqueryPlaceholder: consumed before planning; has no TypedExpr children.
+        ExprKind::Literal(_) | ExprKind::LambdaParamRef { .. } | ExprKind::SubqueryPlaceholder { .. } => {}
+    }
+}
+
+/// Returns true if `node` outputs every column id referenced by `probe_expr`.
+///
+/// An empty needed set (e.g. a literal probe expression) cannot be bound — the
+/// probe is always non-trivial for real join keys, but we guard for correctness.
+fn could_bound(node: &PhysicalPlanNode, probe_expr: &TypedExpr) -> bool {
+    let mut needed = HashSet::new();
+    column_ids(probe_expr, &mut needed);
+    if needed.is_empty() {
+        return false;
+    }
+    let have: HashSet<ColumnId> = node.output_columns.iter().map(|c| c.column_id).collect();
+    needed.iter().all(|id| have.contains(id))
+}
+
+/// Stage 1: stop at fragment boundaries (exchange / distribution nodes).
+/// Cross-exchange push-down is a later stage.
+fn is_exchange(node: &PhysicalPlanNode) -> bool {
+    matches!(node.op, Operator::PhysicalDistribution(_))
+}
+
+/// Descend into `node` and attach `probe` at the DEEPEST descendant that can
+/// bind the probe expression. Returns `true` when the probe has been placed.
+///
+/// Rules:
+/// 1. Never cross an exchange (fragment boundary).
+/// 2. If `node` cannot bind the probe, stop (return false) — do not descend.
+/// 3. Try each child recursively; if a child accepts the probe, we are done.
+/// 4. If no child accepted it, place the probe on `node` itself (the deepest
+///    reachable binder).
+fn push_probe_down(node: &mut PhysicalPlanNode, probe: &RuntimeFilterProbe) -> bool {
+    if is_exchange(node) {
+        return false;
+    }
+    if !could_bound(node, &probe.probe_expr) {
+        return false;
+    }
+    for child in &mut node.children {
+        if push_probe_down(child, probe) {
+            return true;
+        }
+    }
+    node.probe_runtime_filters.push(probe.clone());
+    true
+}
+
 /// Recursive tree walk: post-order so that nested joins get distinct filter ids.
 fn annotate_node(node: &mut PhysicalPlanNode, next_filter_id: &mut i32) {
     // Recurse into children first (post-order).
@@ -125,13 +270,13 @@ fn annotate_node(node: &mut PhysicalPlanNode, next_filter_id: &mut i32) {
         });
     }
 
-    // PLACEHOLDER targeting (Task 3 replaces with real column-lineage push-down):
-    // attach probe descriptors to the immediate probe child (children[0]).
+    // Push each probe descriptor down to the deepest binding descendant within
+    // the probe child (children[0]). Stops at exchange (fragment) boundaries.
+    // If no binding node is found the RF is build-only (probe remains unplaced).
     for d in &descs {
-        node.children[0].probe_runtime_filters.push(RuntimeFilterProbe {
-            filter_id: d.filter_id,
-            probe_expr: d.probe_expr.clone(),
-        });
+        let probe = RuntimeFilterProbe { filter_id: d.filter_id, probe_expr: d.probe_expr.clone() };
+        // children[0] = probe side; descend to the deepest binding node.
+        let _ = push_probe_down(&mut node.children[0], &probe);
     }
 
     node.build_runtime_filters = descs;
@@ -215,6 +360,40 @@ pub(crate) mod test_support {
             probe_runtime_filters: vec![],
         }
     }
+
+    pub(crate) fn join_with_project_over_probe_scan() -> PhysicalPlanNode {
+        use crate::sql::optimizer::operator::PhysicalProjectOp;
+        let (loc, lexpr) = col(1, "lc"); // probe column
+        let (roc, rexpr) = col(2, "rc"); // build column
+        // probe side: PhysicalProject(node) over a leaf scan; both expose column 1.
+        let scan = leaf(1_000_000.0, loc.clone());
+        let project = PhysicalPlanNode {
+            op: Operator::PhysicalProject(PhysicalProjectOp { items: vec![] }),
+            children: vec![scan],
+            stats: Statistics { output_row_count: 1_000_000.0, column_statistics: Default::default() },
+            output_columns: vec![loc.clone()], // project passes column 1 through
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+        let build = leaf(10.0, roc.clone());
+        PhysicalPlanNode {
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: lexpr,
+                    right: rexpr,
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+            }),
+            children: vec![project, build],
+            stats: Statistics { output_row_count: 10.0, column_statistics: Default::default() },
+            output_columns: vec![loc, roc],
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        }
+    }
 }
 
 #[cfg(test)]
@@ -237,5 +416,18 @@ mod tests {
         opts.disable(RUNTIME_FILTER_RULE);
         annotate(&mut join, &opts);
         assert!(join.build_runtime_filters.is_empty());
+    }
+
+    #[test]
+    fn probe_pushes_through_project_to_scan() {
+        let mut join = super::test_support::join_with_project_over_probe_scan();
+        annotate(&mut join, &OptimizerOptions::default_settings());
+        // Probe RF must NOT stop at the project (children[0])...
+        assert!(
+            join.children[0].probe_runtime_filters.is_empty(),
+            "probe should not stop at the project node"
+        );
+        // ...it reached the scan beneath the project (children[0].children[0]).
+        assert_eq!(join.children[0].children[0].probe_runtime_filters.len(), 1);
     }
 }
