@@ -7,11 +7,14 @@
 
 pub(crate) mod action_column;
 pub(crate) mod action_propagation;
+pub(crate) mod aggregate_rewrite;
 pub(crate) mod annotation;
 pub(crate) mod apply_key;
 pub(crate) mod delta_pushdown;
 pub(crate) mod entrypoint;
+pub(crate) mod join_delta;
 pub(crate) mod marker;
 pub(crate) mod pipeline;
 pub(crate) mod row_id_column;
 pub(crate) mod scan_binding;
+pub(crate) mod target_state;
