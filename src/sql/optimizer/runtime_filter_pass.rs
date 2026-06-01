@@ -233,6 +233,34 @@ fn push_probe_down(node: &mut PhysicalPlanNode, probe: &RuntimeFilterProbe) -> b
     true
 }
 
+// StarRocks defaults (SessionVariable.java). Bytes; size = rows * avg_row_size.
+const BUILD_MAX_SIZE: f64 = 64.0 * 1024.0 * 1024.0;
+const BUILD_MIN_SIZE: f64 = 128.0 * 1024.0;
+const PROBE_MIN_SIZE: f64 = 100.0 * 1024.0;
+const PROBE_MIN_SELECTIVITY: f64 = 0.5;
+
+/// StarRocks JoinNode.java: only Shuffle/Partitioned gate on build size.
+fn build_gate_passes(distribution: &JoinDistribution, build_size: f64) -> bool {
+    match distribution {
+        JoinDistribution::Shuffle => !(build_size <= 0.0 || build_size > BUILD_MAX_SIZE),
+        _ => true, // Broadcast / Colocate: no build-size gate
+    }
+}
+
+/// StarRocks RuntimeFilterDescription.canProbeUse selectivity gate.
+fn probe_gate_passes(local: bool, build_size: f64, probe_size: f64) -> bool {
+    if local {
+        return true;
+    }
+    if build_size <= BUILD_MIN_SIZE {
+        return true;
+    }
+    if probe_size < PROBE_MIN_SIZE {
+        return false;
+    }
+    (build_size / probe_size.max(1.0)) <= 1.0 - PROBE_MIN_SELECTIVITY
+}
+
 /// Recursive tree walk: post-order so that nested joins get distinct filter ids.
 fn annotate_node(node: &mut PhysicalPlanNode, next_filter_id: &mut i32) {
     // Recurse into children first (post-order).
@@ -251,11 +279,25 @@ fn annotate_node(node: &mut PhysicalPlanNode, next_filter_id: &mut i32) {
     let distribution = join.distribution.clone();
     // Right child is build side (confirmed via pipeline builder + lowering).
     let build_card = node.children[1].stats.output_row_count;
+    let build_size = node.children[1].stats.compute_size();
+    let probe_size = node.children[0].stats.compute_size();
+
+    // Build gate: Shuffle joins are rejected if build side is too large or empty.
+    if !build_gate_passes(&distribution, build_size) {
+        return;
+    }
+
+    // Stage 1: Broadcast/Colocate are local (same fragment); Shuffle is non-local.
+    let local = !matches!(distribution, JoinDistribution::Shuffle);
 
     // Build descriptors for each non-null-safe equi-conjunct.
     let mut descs: Vec<RuntimeFilterDesc> = Vec::new();
     for (expr_order, eq) in eq_conditions.iter().enumerate() {
         if eq.null_safe {
+            continue;
+        }
+        // Probe gate: skip this equi-conjunct if it would not reduce probe rows enough.
+        if !probe_gate_passes(local, build_size, probe_size) {
             continue;
         }
         let filter_id = *next_filter_id;
@@ -361,6 +403,33 @@ pub(crate) mod test_support {
         }
     }
 
+    pub(crate) fn shuffle_join(build_rows: f64, probe_rows: f64) -> PhysicalPlanNode {
+        let (loc, lexpr) = col(1, "lc");
+        let (roc, rexpr) = col(2, "rc");
+        let probe = leaf(probe_rows, loc.clone());
+        let build = leaf(build_rows, roc.clone());
+        PhysicalPlanNode {
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: lexpr,
+                    right: rexpr,
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Shuffle,
+            }),
+            children: vec![probe, build], // children[0]=probe, children[1]=build
+            stats: Statistics {
+                output_row_count: build_rows.min(probe_rows),
+                column_statistics: Default::default(),
+            },
+            output_columns: vec![loc, roc],
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        }
+    }
+
     pub(crate) fn join_with_project_over_probe_scan() -> PhysicalPlanNode {
         use crate::sql::optimizer::operator::PhysicalProjectOp;
         let (loc, lexpr) = col(1, "lc"); // probe column
@@ -416,6 +485,30 @@ mod tests {
         opts.disable(RUNTIME_FILTER_RULE);
         annotate(&mut join, &opts);
         assert!(join.build_runtime_filters.is_empty());
+    }
+
+    #[test]
+    fn skips_rf_when_build_side_too_large_for_shuffle() {
+        // build 50M rows * 8 = 400MB > 64MB build_max -> skip.
+        let mut j = super::test_support::shuffle_join(50_000_000.0, 50_000_000.0);
+        annotate(&mut j, &OptimizerOptions::default_settings());
+        assert!(j.build_runtime_filters.is_empty());
+    }
+
+    #[test]
+    fn keeps_rf_when_build_small_relative_to_probe() {
+        // Broadcast (local), tiny build -> kept.
+        let mut j = super::test_support::inner_join_two_scans();
+        annotate(&mut j, &OptimizerOptions::default_settings());
+        assert_eq!(j.build_runtime_filters.len(), 1);
+    }
+
+    #[test]
+    fn skips_rf_low_selectivity_across_exchange() {
+        // shuffle build 900k*8=7.2MB, probe 1M*8=8MB, ratio 0.9 > 0.5 -> reject.
+        let mut j = super::test_support::shuffle_join(900_000.0, 1_000_000.0);
+        annotate(&mut j, &OptimizerOptions::default_settings());
+        assert!(j.build_runtime_filters.is_empty());
     }
 
     #[test]
