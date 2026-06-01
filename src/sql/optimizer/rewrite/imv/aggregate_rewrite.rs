@@ -101,10 +101,11 @@ impl LogicalRewriteRule for RewriteAggregateStateRule {
             .iter()
             .map(|column| column.column.name.clone())
             .collect::<Vec<_>>();
-        let partition_constraint = if ext.mv_ctx.schema_contract.target.partition.is_some() {
-            IcebergMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired
-        } else {
+        let partition_constraint = if is_unpartitioned_target_contract(&ext.mv_ctx.schema_contract)
+        {
             IcebergMvTargetStatePartitionConstraint::Unpartitioned
+        } else {
+            IcebergMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired
         };
 
         let old_source = build_target_state_scan_source(
@@ -176,6 +177,16 @@ impl LogicalRewriteRule for RewriteAggregateStateRule {
             },
         )))
     }
+}
+
+fn is_unpartitioned_target_contract(
+    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+) -> bool {
+    schema_contract
+        .target
+        .partition
+        .as_ref()
+        .is_none_or(|partition| partition.fields.is_empty())
 }
 
 fn group_key_names(aggregate: &AggregateNode) -> Result<Vec<String>, String> {
@@ -947,7 +958,7 @@ mod tests {
     };
     use crate::meta::repository::mv_contract::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
-        ApplyKeySource,
+        ApplyKeySource, MvPartitionContract,
     };
     use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, TypedExpr};
     use crate::sql::catalog::{
@@ -1012,11 +1023,19 @@ mod tests {
     fn build_ctx_with_state_columns(
         state_columns: Vec<AggregateStateColumnContract>,
     ) -> RewriteContext {
+        build_ctx_with_state_columns_and_target_partition(state_columns, None)
+    }
+
+    fn build_ctx_with_state_columns_and_target_partition(
+        state_columns: Vec<AggregateStateColumnContract>,
+        target_partition: Option<MvPartitionContract>,
+    ) -> RewriteContext {
         let mut mv_def = make_mv_definition();
         let mut contract = make_schema_contract();
         contract.target.hidden_apply_key.column_name = "__row_id__".to_string();
         contract.target.hidden_apply_key.target_field_id = 999;
         contract.target.hidden_apply_key.source = ApplyKeySource::GroupRowId;
+        contract.target.partition = target_partition;
         contract.aggregate = Some(AggregateStateContract {
             state_layout_version: 1,
             row_id_column_name: "__row_id__".to_string(),
@@ -1436,6 +1455,38 @@ mod tests {
             &struct_args[3].kind,
             ExprKind::ColumnRef { column, .. } if column == "__change_op"
         ));
+    }
+
+    #[test]
+    fn rewrite_aggregate_state_treats_empty_target_partition_contract_as_unpartitioned() {
+        let rule = RewriteAggregateStateRule;
+        let mut ctx = build_ctx_with_state_columns_and_target_partition(
+            vec![
+                single_state_column("binary"),
+                retraction_count_state_column(),
+            ],
+            Some(MvPartitionContract {
+                target_spec_id: 0,
+                fields: Vec::new(),
+            }),
+        );
+        let result = rule
+            .apply(delta(aggregate_over(leaf_scan())), &mut ctx)
+            .expect("aggregate rewrite must succeed");
+        let RewriteResult::Changed(LogicalPlan::AggregateStateMerge(merge)) = result else {
+            panic!("expected Changed(AggregateStateMerge)");
+        };
+        let LogicalPlan::Scan(old_scan) = merge.old_input.as_ref() else {
+            panic!("expected target-state scan");
+        };
+        let ScanSource::IcebergMvTargetState(target_state) = &old_scan.table.source else {
+            panic!("expected IcebergMvTargetState source");
+        };
+
+        assert_eq!(
+            target_state.partition_constraint,
+            IcebergMvTargetStatePartitionConstraint::Unpartitioned
+        );
     }
 
     #[test]
