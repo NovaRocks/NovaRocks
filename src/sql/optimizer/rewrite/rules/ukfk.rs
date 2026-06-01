@@ -8,7 +8,8 @@ use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, ProjectItem,
 use crate::sql::optimizer::options::current_session_optimizer_settings;
 use crate::sql::optimizer::rewrite::rule::PlanRewriteRule as RewriteRule;
 use crate::sql::optimizer::rewrite::rules::utils::{
-    collect_qualified_column_refs, collect_qualified_output_columns, combine_and,
+    collect_column_id_refs, collect_output_ids, collect_qualified_column_refs,
+    collect_qualified_output_columns, combine_and,
 };
 use crate::sql::planner::plan::*;
 
@@ -168,25 +169,25 @@ fn project_referenced_side(
     left: &LogicalPlan,
     right: &LogicalPlan,
 ) -> Option<Side> {
+    let left_ids = collect_output_ids(left);
+    let right_ids = collect_output_ids(right);
     let left_cols = collect_qualified_output_columns(left);
     let right_cols = collect_qualified_output_columns(right);
     let mut side = None;
     for item in items {
-        for reference in collect_qualified_column_refs(&item.expr) {
-            let in_left = left_cols.contains(&reference);
-            let in_right = right_cols.contains(&reference);
-            let reference_side = match (in_left, in_right) {
-                (true, false) => Side::Left,
-                (false, true) => Side::Right,
-                _ => return None,
-            };
-            if let Some(existing) = side {
-                if existing != reference_side {
-                    return None;
-                }
-            } else {
-                side = Some(reference_side);
+        if collect_column_id_refs(&item.expr).is_empty()
+            && collect_qualified_column_refs(&item.expr).is_empty()
+        {
+            continue;
+        }
+        let reference_side =
+            referenced_side(&item.expr, &left_ids, &right_ids, &left_cols, &right_cols)?;
+        if let Some(existing) = side {
+            if existing != reference_side {
+                return None;
             }
+        } else {
+            side = Some(reference_side);
         }
     }
     side
@@ -194,15 +195,26 @@ fn project_referenced_side(
 
 fn join_equality_pairs(join: &JoinNode) -> Option<Vec<(String, String)>> {
     let condition = join.condition.as_ref()?;
+    let left_ids = collect_output_ids(&join.left);
+    let right_ids = collect_output_ids(&join.right);
     let left_cols = collect_qualified_output_columns(&join.left);
     let right_cols = collect_qualified_output_columns(&join.right);
     let mut pairs = Vec::new();
-    collect_join_equality_pairs(condition, &left_cols, &right_cols, &mut pairs)?;
+    collect_join_equality_pairs(
+        condition,
+        &left_ids,
+        &right_ids,
+        &left_cols,
+        &right_cols,
+        &mut pairs,
+    )?;
     (!pairs.is_empty()).then_some(pairs)
 }
 
 fn collect_join_equality_pairs(
     expr: &TypedExpr,
+    left_ids: &HashSet<crate::sql::column_id::ColumnId>,
+    right_ids: &HashSet<crate::sql::column_id::ColumnId>,
     left_cols: &HashSet<(Option<String>, String)>,
     right_cols: &HashSet<(Option<String>, String)>,
     pairs: &mut Vec<(String, String)>,
@@ -213,16 +225,16 @@ fn collect_join_equality_pairs(
             op: BinOp::And,
             right,
         } => {
-            collect_join_equality_pairs(left, left_cols, right_cols, pairs)?;
-            collect_join_equality_pairs(right, left_cols, right_cols, pairs)
+            collect_join_equality_pairs(left, left_ids, right_ids, left_cols, right_cols, pairs)?;
+            collect_join_equality_pairs(right, left_ids, right_ids, left_cols, right_cols, pairs)
         }
         ExprKind::BinaryOp {
             left,
             op: BinOp::Eq,
             right,
         } => {
-            let left_ref = classify_column_ref(left, left_cols, right_cols)?;
-            let right_ref = classify_column_ref(right, left_cols, right_cols)?;
+            let left_ref = classify_column_ref(left, left_ids, right_ids, left_cols, right_cols)?;
+            let right_ref = classify_column_ref(right, left_ids, right_ids, left_cols, right_cols)?;
             match (left_ref, right_ref) {
                 ((Side::Left, left_col), (Side::Right, right_col)) => {
                     pairs.push((left_col, right_col));
@@ -239,15 +251,82 @@ fn collect_join_equality_pairs(
     }
 }
 
+fn referenced_side(
+    expr: &TypedExpr,
+    left_ids: &HashSet<crate::sql::column_id::ColumnId>,
+    right_ids: &HashSet<crate::sql::column_id::ColumnId>,
+    left_cols: &HashSet<(Option<String>, String)>,
+    right_cols: &HashSet<(Option<String>, String)>,
+) -> Option<Side> {
+    let id_refs = collect_column_id_refs(expr);
+    let qualified_refs = collect_qualified_column_refs(expr);
+    if !id_refs.is_empty() && id_refs.len() == qualified_refs.len() {
+        let mut side = None;
+        let mut classified_all = true;
+        for id in id_refs {
+            let reference_side = match (left_ids.contains(&id), right_ids.contains(&id)) {
+                (true, false) => Side::Left,
+                (false, true) => Side::Right,
+                _ => {
+                    classified_all = false;
+                    break;
+                }
+            };
+            if let Some(existing) = side {
+                if existing != reference_side {
+                    return None;
+                }
+            } else {
+                side = Some(reference_side);
+            }
+        }
+        if classified_all {
+            return side;
+        }
+    }
+
+    let mut side = None;
+    for reference in qualified_refs {
+        let reference_side = match (
+            left_cols.contains(&reference),
+            right_cols.contains(&reference),
+        ) {
+            (true, false) => Side::Left,
+            (false, true) => Side::Right,
+            _ => return None,
+        };
+        if let Some(existing) = side {
+            if existing != reference_side {
+                return None;
+            }
+        } else {
+            side = Some(reference_side);
+        }
+    }
+    side
+}
+
 fn classify_column_ref(
     expr: &TypedExpr,
+    left_ids: &HashSet<crate::sql::column_id::ColumnId>,
+    right_ids: &HashSet<crate::sql::column_id::ColumnId>,
     left_cols: &HashSet<(Option<String>, String)>,
     right_cols: &HashSet<(Option<String>, String)>,
 ) -> Option<(Side, String)> {
     match &expr.kind {
         ExprKind::ColumnRef {
-            qualifier, column, ..
+            column_id,
+            qualifier,
+            column,
         } => {
+            if *column_id != crate::sql::column_id::ColumnId::UNSET {
+                match (left_ids.contains(column_id), right_ids.contains(column_id)) {
+                    (true, false) => return Some((Side::Left, normalize_identifier(column))),
+                    (false, true) => return Some((Side::Right, normalize_identifier(column))),
+                    _ => {}
+                }
+            }
+
             let reference = (
                 qualifier.as_ref().map(|q| q.to_ascii_lowercase()),
                 column.to_ascii_lowercase(),
@@ -262,7 +341,7 @@ fn classify_column_ref(
             }
         }
         ExprKind::Cast { expr, .. } | ExprKind::Nested(expr) => {
-            classify_column_ref(expr, left_cols, right_cols)
+            classify_column_ref(expr, left_ids, right_ids, left_cols, right_cols)
         }
         _ => None,
     }

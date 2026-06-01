@@ -17,8 +17,9 @@ use std::collections::HashSet;
 use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, TypedExpr};
 use crate::sql::optimizer::rewrite::rule::PlanRewriteRule as RewriteRule;
 use crate::sql::optimizer::rewrite::rules::utils::{
-    collect_column_refs, collect_output_columns, collect_qualified_column_refs,
-    collect_qualified_output_columns, combine_and, split_and, wrap_remaining_filter,
+    collect_column_id_refs, collect_column_refs, collect_output_columns, collect_output_ids,
+    collect_qualified_column_refs, collect_qualified_output_columns, combine_and, split_and,
+    wrap_remaining_filter,
 };
 use crate::sql::planner::plan::*;
 use arrow::datatypes::DataType;
@@ -57,6 +58,8 @@ fn push_predicates_through_join(predicate: TypedExpr, join: JoinNode) -> (Logica
     let conjuncts = split_and(predicate);
     let left_cols = collect_output_columns(&join.left);
     let right_cols = collect_output_columns(&join.right);
+    let left_ids = collect_output_ids(&join.left);
+    let right_ids = collect_output_ids(&join.right);
 
     // Qualified output columns for precise self-join disambiguation.
     let left_qcols = collect_qualified_output_columns(&join.left);
@@ -78,8 +81,15 @@ fn push_predicates_through_join(predicate: TypedExpr, join: JoinNode) -> (Logica
 
     for conj in conjuncts {
         let refs = collect_column_refs(&conj);
-        let in_left = refs.iter().any(|c| left_cols.contains(&c.to_lowercase()));
-        let in_right = refs.iter().any(|c| right_cols.contains(&c.to_lowercase()));
+        let id_sides = classify_sides_by_column_ids(&conj, &left_ids, &right_ids);
+        let (in_left, in_right, classified_by_ids) = match id_sides {
+            Some((in_left, in_right)) => (in_left, in_right, true),
+            None => (
+                refs.iter().any(|c| left_cols.contains(&c.to_lowercase())),
+                refs.iter().any(|c| right_cols.contains(&c.to_lowercase())),
+                false,
+            ),
+        };
 
         match (in_left, in_right) {
             (true, false) => left_preds.push(conj),
@@ -101,6 +111,26 @@ fn push_predicates_through_join(predicate: TypedExpr, join: JoinNode) -> (Logica
                 }
             }
             (true, true) => {
+                if classified_by_ids {
+                    if is_left_join_variant
+                        || matches!(join.join_type, JoinKind::RightOuter | JoinKind::FullOuter)
+                    {
+                        remaining.push(conj);
+                    } else {
+                        let (factored, or_remaining) =
+                            factor_common_eq_from_or(&conj, &left_cols, &right_cols);
+                        if !factored.is_empty() {
+                            join_preds.extend(factored);
+                            if let Some(rem) = or_remaining {
+                                remaining.push(rem);
+                            }
+                        } else {
+                            join_preds.push(conj);
+                        }
+                    }
+                    continue;
+                }
+
                 // Bare-name matching says "both sides". Re-check with qualified
                 // column references to handle self-joins (e.g. nation n1, nation n2)
                 // where both sides share the same bare column names.
@@ -285,6 +315,28 @@ fn push_predicates_through_join(predicate: TypedExpr, join: JoinNode) -> (Logica
     (wrap_remaining_filter(new_join, remaining), pushed_any)
 }
 
+fn classify_sides_by_column_ids(
+    expr: &TypedExpr,
+    left_ids: &HashSet<crate::sql::column_id::ColumnId>,
+    right_ids: &HashSet<crate::sql::column_id::ColumnId>,
+) -> Option<(bool, bool)> {
+    let ids = collect_column_id_refs(expr);
+    if ids.is_empty() || ids.len() != collect_qualified_column_refs(expr).len() {
+        return None;
+    }
+
+    let mut in_left = false;
+    let mut in_right = false;
+    for id in ids {
+        match (left_ids.contains(&id), right_ids.contains(&id)) {
+            (true, false) => in_left = true,
+            (false, true) => in_right = true,
+            _ => return None,
+        }
+    }
+    Some((in_left, in_right))
+}
+
 /// Extract common equi-join conditions from all branches of an OR predicate.
 /// Returns (extracted_join_preds, remaining_or_predicate).
 ///
@@ -457,7 +509,9 @@ fn merge_join_conditions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr};
+    use crate::sql::analysis::{
+        BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
+    };
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use arrow::datatypes::DataType;
@@ -697,5 +751,72 @@ mod tests {
             "left-side predicate must not be pushed below a RIGHT OUTER join; got {:?}",
             out
         );
+    }
+
+    fn col_with_id(qualifier: &str, name: &str, id: u32) -> TypedExpr {
+        TypedExpr {
+            data_type: DataType::Int64,
+            nullable: true,
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId::new_for_test(id),
+                qualifier: Some(qualifier.to_string()),
+                column: name.to_string(),
+            },
+        }
+    }
+
+    fn derived_project_with_output_id(name: &str, source_id: u32, output_id: u32) -> LogicalPlan {
+        LogicalPlan::Project(ProjectNode {
+            input: Box::new(LogicalPlan::Values(ValuesNode {
+                rows: vec![],
+                columns: vec![OutputColumn {
+                    column_id: ColumnId::new_for_test(source_id),
+                    name: format!("{name}_source"),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    is_internal: false,
+                }],
+                required_output_columns: None,
+            })),
+            items: vec![ProjectItem {
+                expr: TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        column_id: ColumnId::new_for_test(source_id),
+                        qualifier: None,
+                        column: format!("{name}_source"),
+                    },
+                    data_type: DataType::Int64,
+                    nullable: true,
+                },
+                output_name: "k".to_string(),
+                output_column_id: ColumnId::new_for_test(output_id),
+            }],
+            required_output_columns: None,
+        })
+    }
+
+    #[test]
+    fn pushes_alias_free_project_join_predicate_by_column_id() {
+        let join = cross_join(
+            derived_project_with_output_id("left", 11, 101),
+            derived_project_with_output_id("right", 22, 202),
+        );
+        let filter = LogicalPlan::Filter(FilterNode {
+            input: Box::new(join),
+            predicate: eq(col_with_id("a", "k", 101), col_with_id("b", "k", 202)),
+            required_output_columns: None,
+        });
+
+        let rule = PushDownPredicateJoin;
+        let out = rule
+            .apply(filter)
+            .expect("cross-side predicate should push");
+        let LogicalPlan::Join(join) = out else {
+            panic!("expected bare Join with no remaining Filter");
+        };
+        assert_eq!(join.join_type, JoinKind::Inner);
+        assert!(join.condition.is_some(), "join condition must be set");
+        assert!(matches!(*join.left, LogicalPlan::Project(_)));
+        assert!(matches!(*join.right, LogicalPlan::Project(_)));
     }
 }

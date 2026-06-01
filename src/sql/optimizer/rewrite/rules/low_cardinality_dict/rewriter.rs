@@ -1265,21 +1265,9 @@ fn plan_output_columns(plan: &LogicalPlan) -> Vec<OutputColumn> {
             out.extend(plan_output_columns(&node.right));
             out
         }
-        LogicalPlan::Union(node) => node
-            .inputs
-            .first()
-            .map(plan_output_columns)
-            .unwrap_or_default(),
-        LogicalPlan::Intersect(node) => node
-            .inputs
-            .first()
-            .map(plan_output_columns)
-            .unwrap_or_default(),
-        LogicalPlan::Except(node) => node
-            .inputs
-            .first()
-            .map(plan_output_columns)
-            .unwrap_or_default(),
+        LogicalPlan::Union(node) => node.output_columns.clone(),
+        LogicalPlan::Intersect(node) => node.output_columns.clone(),
+        LogicalPlan::Except(node) => node.output_columns.clone(),
         LogicalPlan::Values(node) => node.columns.clone(),
         LogicalPlan::GenerateSeries(node) => vec![OutputColumn {
             column_id: ColumnId::UNSET,
@@ -1291,6 +1279,65 @@ fn plan_output_columns(plan: &LogicalPlan) -> Vec<OutputColumn> {
         LogicalPlan::CTEAnchor(node) => plan_output_columns(&node.consumer),
         LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::planner::plan::{ExceptNode, IntersectNode, UnionNode, ValuesNode};
+
+    fn output_col(id: u32, name: &str) -> OutputColumn {
+        OutputColumn {
+            column_id: ColumnId::new_for_test(id),
+            name: name.to_string(),
+            data_type: DataType::Utf8,
+            nullable: true,
+            is_internal: false,
+        }
+    }
+
+    fn values_with_output(id: u32, name: &str) -> LogicalPlan {
+        LogicalPlan::Values(ValuesNode {
+            rows: vec![],
+            columns: vec![output_col(id, name)],
+            required_output_columns: None,
+        })
+    }
+
+    #[test]
+    fn set_op_plan_output_columns_use_explicit_set_op_outputs() {
+        let left = values_with_output(1, "k");
+        let right = values_with_output(2, "k");
+        let output_columns = vec![output_col(100, "set_k")];
+
+        let plans = vec![
+            LogicalPlan::Union(UnionNode {
+                inputs: vec![left.clone(), right.clone()],
+                all: true,
+                output_columns: output_columns.clone(),
+                required_output_columns: None,
+            }),
+            LogicalPlan::Intersect(IntersectNode {
+                inputs: vec![left.clone(), right.clone()],
+                output_columns: output_columns.clone(),
+                required_output_columns: None,
+            }),
+            LogicalPlan::Except(ExceptNode {
+                inputs: vec![left, right],
+                output_columns: output_columns.clone(),
+                required_output_columns: None,
+            }),
+        ];
+
+        for plan in plans {
+            let actual = plan_output_columns(&plan);
+            assert_eq!(actual.len(), output_columns.len());
+            assert_eq!(actual[0].column_id, output_columns[0].column_id);
+            assert_eq!(actual[0].name, output_columns[0].name);
+            assert_eq!(actual[0].data_type, output_columns[0].data_type);
+            assert_eq!(actual[0].nullable, output_columns[0].nullable);
         }
     }
 }
