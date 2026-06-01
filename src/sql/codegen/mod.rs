@@ -28,11 +28,20 @@ pub(crate) type FragmentId = u32;
 // Public types
 // ---------------------------------------------------------------------------
 
+pub(crate) enum DirectExecPlan {
+    AggregateStateMerge {
+        old_input: Box<PlanBuildResult>,
+        delta_input: Box<PlanBuildResult>,
+        layout: crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
+    },
+}
+
 pub(crate) struct PlanBuildResult {
     pub plan: plan_nodes::TPlan,
     pub desc_tbl: thrift_descriptors::TDescriptorTable,
     pub exec_params: internal_service::TPlanFragmentExecParams,
     pub output_columns: Vec<OutputColumn>,
+    pub direct_exec: Option<Box<DirectExecPlan>>,
     /// Per-fragment dictionary payload required by `lower_decode_node` and
     /// `lower_lake_scan_node` to build their `query_global_dict_map`. When
     /// `LowCardinalityDictionaryRewrite` has fired, this carries one
@@ -109,6 +118,7 @@ pub(crate) struct FragmentBuildResult {
     // populated by fragment builder, will be read when standalone multi-fragment execution is wired
     pub output_sink: data_sinks::TDataSink,
     pub output_columns: Vec<OutputColumn>,
+    pub direct_exec: Option<Box<DirectExecPlan>>,
     /// CTE ID if this is a multicast fragment.
     pub cte_id: Option<CteId>,
     /// Exchange node IDs in this fragment that consume from CTE fragments:

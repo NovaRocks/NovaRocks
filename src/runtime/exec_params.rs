@@ -141,6 +141,7 @@ mod tests {
                 data_type: arrow::datatypes::DataType::Int64,
                 nullable: false,
             }],
+            direct_exec: None,
             cte_id: None,
             cte_exchange_nodes: vec![],
             query_global_dicts: None,

@@ -311,6 +311,8 @@ impl ProcessorOperator for AggregateStateMergeSourceOperator {
 mod tests {
     use std::sync::Arc;
 
+    use super::*;
+
     use arrow::array::{Array, ArrayRef, Int8Array, Int64Array, LargeBinaryBuilder, StringArray};
     use arrow::compute::concat_batches;
     use arrow::datatypes::{DataType, Field, Schema};
@@ -325,13 +327,15 @@ mod tests {
     use crate::engine::record_batch_to_chunk;
     use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
     use crate::exec::chunk::Chunk;
+    use crate::exec::pipeline::operator_factory::OperatorFactory;
+    use crate::runtime::runtime_state::RuntimeState;
     use crate::sql::parser::ast::SqlType;
 
     #[test]
     fn merge_operator_emits_delete_for_old_state_and_insert_for_new_state() {
         let old = aggregate_state_chunk_for_test(vec![("east", 2_i64, 300_i64)]);
         let delta = signed_delta_state_chunk_for_test(vec![("east", -1_i8, 1_i64, -100_i64)]);
-        let output = merge_state_chunks_for_test(vec![old], vec![delta]).unwrap();
+        let output = run_merge_operator_for_test(vec![old], vec![delta]).unwrap();
 
         assert_eq!(output.batch.num_rows(), 2);
         assert_eq!(string_value(&output, "region", 0), "east");
@@ -347,7 +351,7 @@ mod tests {
     #[test]
     fn merge_operator_emits_insert_only_for_new_group() {
         let delta = signed_delta_state_chunk_for_test(vec![("west", 1_i8, 1_i64, 80_i64)]);
-        let output = merge_state_chunks_for_test(vec![], vec![delta]).unwrap();
+        let output = run_merge_operator_for_test(vec![], vec![delta]).unwrap();
 
         assert_eq!(output.batch.num_rows(), 1);
         assert_eq!(string_value(&output, "region", 0), "west");
@@ -356,17 +360,74 @@ mod tests {
         assert_eq!(int64_value(&output, "s", 0), 80);
     }
 
-    fn merge_state_chunks_for_test(
+    fn run_merge_operator_for_test(
         old_chunks: Vec<Chunk>,
         delta_chunks: Vec<Chunk>,
     ) -> Result<Chunk, String> {
         let layout = aggregate_layout_for_test();
-        let chunks =
-            crate::engine::mv::iceberg_aggregate_state::merge_aggregate_state_chunks_for_change_stream(
-                &old_chunks,
-                &delta_chunks,
-                &layout,
-            )?;
+        let state = RuntimeState::default();
+        let shared = AggregateStateMergeSharedState::new(1, 1);
+        let old_factory =
+            AggregateStateMergeSinkFactory::new(AggregateStateMergeInput::Old, shared.clone(), 7);
+        let delta_factory =
+            AggregateStateMergeSinkFactory::new(AggregateStateMergeInput::Delta, shared.clone(), 7);
+        let source_factory = AggregateStateMergeSourceFactory::new(
+            AggregateStateMergePlan {
+                old_input: Box::new(crate::exec::node::ExecNode {
+                    kind: crate::exec::node::ExecNodeKind::Values(
+                        crate::exec::node::values::ValuesNode {
+                            chunk: empty_chunk_for_test(),
+                            node_id: -1,
+                        },
+                    ),
+                }),
+                delta_input: Box::new(crate::exec::node::ExecNode {
+                    kind: crate::exec::node::ExecNodeKind::Values(
+                        crate::exec::node::values::ValuesNode {
+                            chunk: empty_chunk_for_test(),
+                            node_id: -1,
+                        },
+                    ),
+                }),
+                layout,
+            },
+            shared,
+            7,
+        );
+        let mut old_sink = old_factory.create(1, 0);
+        let mut delta_sink = delta_factory.create(1, 0);
+        let mut source = source_factory.create(1, 0);
+
+        for chunk in old_chunks {
+            old_sink
+                .as_processor_mut()
+                .expect("old sink processor")
+                .push_chunk(&state, chunk)?;
+        }
+        old_sink
+            .as_processor_mut()
+            .expect("old sink processor")
+            .set_finishing(&state)?;
+        for chunk in delta_chunks {
+            delta_sink
+                .as_processor_mut()
+                .expect("delta sink processor")
+                .push_chunk(&state, chunk)?;
+        }
+        delta_sink
+            .as_processor_mut()
+            .expect("delta sink processor")
+            .set_finishing(&state)?;
+
+        let source = source
+            .as_processor_mut()
+            .expect("aggregate state merge source");
+        let mut chunks = Vec::new();
+        while source.has_output() {
+            if let Some(chunk) = source.pull_chunk(&state)? {
+                chunks.push(chunk);
+            }
+        }
         let schema = chunks
             .first()
             .map(|chunk| chunk.batch.schema())
@@ -378,6 +439,10 @@ mod tests {
         let batch = concat_batches(&schema, batches.iter())
             .map_err(|e| format!("concat change stream for test failed: {e}"))?;
         record_batch_to_chunk(batch)
+    }
+
+    fn empty_chunk_for_test() -> Chunk {
+        physical_chunk_for_test(Vec::new(), None)
     }
 
     fn aggregate_state_chunk_for_test(rows: Vec<(&str, i64, i64)>) -> Chunk {

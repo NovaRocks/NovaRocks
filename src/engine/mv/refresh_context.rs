@@ -255,6 +255,59 @@ impl IcebergMvRewriteContext {
             hidden_apply_key_column: &self.schema_contract.target.hidden_apply_key.column_name,
         }
     }
+
+    pub(crate) fn aggregate_layout_for_execution(
+        &self,
+    ) -> Result<crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout, String> {
+        let shape = crate::connector::starrocks::table::mv_shape::classify_incremental_mv_query(
+            self.canonical_select_query.as_ref(),
+        )
+        .map_err(|e| format!("classify aggregate MV query for execution layout: {e}"))?;
+        let aggregate_shape = match shape {
+            crate::connector::starrocks::table::mv_shape::IncrementalMvShape::Aggregate(shape) => {
+                shape
+            }
+            crate::connector::starrocks::table::mv_shape::IncrementalMvShape::JoinAggregate(
+                shape,
+            ) => shape.as_aggregate_shape_for_layout(),
+            _ => {
+                return Err(
+                    "AggregateStateMerge execution layout requires an aggregate MV shape"
+                        .to_string(),
+                );
+            }
+        };
+
+        let arrow_schema = iceberg::arrow::schema_to_arrow_schema(self.target_schema.as_ref())
+            .map_err(|e| format!("convert target iceberg schema to arrow schema: {e}"))?;
+        let iceberg_fields = self.target_schema.as_ref().as_struct().fields();
+        let mut output_columns =
+            Vec::with_capacity(self.schema_contract.target.visible_columns.len());
+        for visible in &self.schema_contract.target.visible_columns {
+            let field_idx = iceberg_fields
+                .iter()
+                .position(|field| field.id == visible.target_field_id)
+                .ok_or_else(|| {
+                    format!(
+                        "target visible column {} field id {} is missing from target schema",
+                        visible.output_name, visible.target_field_id
+                    )
+                })?;
+            let arrow_field = arrow_schema.field(field_idx);
+            output_columns.push(crate::sql::analysis::OutputColumn {
+                column_id: crate::sql::column_id::ColumnId::UNSET,
+                name: visible.output_name.clone(),
+                data_type: arrow_field.data_type().clone(),
+                nullable: visible.nullable,
+                is_internal: false,
+            });
+        }
+
+        crate::connector::starrocks::table::mv_agg_state::build_aggregate_mv_layout(
+            &aggregate_shape,
+            &output_columns,
+        )
+    }
 }
 
 impl IcebergMvRefreshContext {

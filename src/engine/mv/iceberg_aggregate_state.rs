@@ -31,31 +31,32 @@ pub(crate) struct IcebergAggregateMergeResult {
     pub(crate) new_total_rows: i64,
 }
 
+struct AggregateStateMergeCoreResult {
+    old_row_ids: BTreeSet<String>,
+    touched_row_ids: BTreeSet<String>,
+    upsert_chunks: Vec<Chunk>,
+    new_total_rows: i64,
+}
+
 pub(crate) fn merge_aggregate_target_state(
     layout: &AggregateMvLayout,
     old_chunks: &[Chunk],
     delta_chunks: &[Chunk],
 ) -> Result<IcebergAggregateMergeResult, String> {
-    let old_rows = build_old_state_map(old_chunks, layout)?;
-    let old_row_ids = old_rows.keys().cloned().collect::<BTreeSet<_>>();
-    let touched_row_ids = delta_row_ids(layout, delta_chunks)?;
-    let merge_result =
-        merge_aggregate_state_batches_with_retractions(&old_rows, delta_chunks, layout)?;
-    let merged_rows = load_aggregate_physical_rows(&merge_result.upsert_chunks, layout)?;
+    let core = merge_aggregate_state_chunks_core(old_chunks, delta_chunks, layout)?;
     let insert_chunks =
-        filter_physical_chunks_by_row_ids(layout, &merge_result.upsert_chunks, &touched_row_ids)?;
-    let delete_row_ids = touched_row_ids
+        filter_physical_chunks_by_row_ids(layout, &core.upsert_chunks, &core.touched_row_ids)?;
+    let delete_row_ids = core
+        .touched_row_ids
         .iter()
-        .filter(|row_id| old_row_ids.contains(*row_id))
+        .filter(|row_id| core.old_row_ids.contains(*row_id))
         .cloned()
         .collect();
-    let new_total_rows = i64::try_from(merged_rows.len())
-        .map_err(|_| "iceberg aggregate MV target row count overflow".to_string())?;
 
     Ok(IcebergAggregateMergeResult {
         delete_row_ids,
         insert_chunks,
-        new_total_rows,
+        new_total_rows: core.new_total_rows,
     })
 }
 
@@ -64,16 +65,34 @@ pub(crate) fn merge_aggregate_state_chunks_for_change_stream(
     delta_chunks: &[Chunk],
     layout: &AggregateMvLayout,
 ) -> Result<Vec<Chunk>, String> {
-    let old_rows = build_old_state_map(old_chunks, layout)?;
-    let touched_row_ids = delta_row_ids(layout, delta_chunks)?;
-    let merge_result =
-        merge_aggregate_state_batches_with_retractions(&old_rows, delta_chunks, layout)?;
+    let core = merge_aggregate_state_chunks_core(old_chunks, delta_chunks, layout)?;
     build_aggregate_change_stream_chunks(
         layout,
         old_chunks,
-        &merge_result.upsert_chunks,
-        &touched_row_ids,
+        &core.upsert_chunks,
+        &core.touched_row_ids,
     )
+}
+
+fn merge_aggregate_state_chunks_core(
+    old_chunks: &[Chunk],
+    delta_chunks: &[Chunk],
+    layout: &AggregateMvLayout,
+) -> Result<AggregateStateMergeCoreResult, String> {
+    let old_rows = build_old_state_map(old_chunks, layout)?;
+    let old_row_ids = old_rows.keys().cloned().collect::<BTreeSet<_>>();
+    let touched_row_ids = delta_row_ids(layout, delta_chunks)?;
+    let merge_result =
+        merge_aggregate_state_batches_with_retractions(&old_rows, delta_chunks, layout)?;
+    let merged_rows = load_aggregate_physical_rows(&merge_result.upsert_chunks, layout)?;
+    let new_total_rows = i64::try_from(merged_rows.len())
+        .map_err(|_| "iceberg aggregate MV target row count overflow".to_string())?;
+    Ok(AggregateStateMergeCoreResult {
+        old_row_ids,
+        touched_row_ids,
+        upsert_chunks: merge_result.upsert_chunks,
+        new_total_rows,
+    })
 }
 
 pub(crate) fn build_aggregate_change_chunks(

@@ -32,7 +32,8 @@ use crate::sql::codegen::nodes;
 use crate::sql::codegen::resolve::{ColumnBinding, ExprScope, ResolvedTable};
 use crate::sql::codegen::type_infer;
 use crate::sql::codegen::{
-    FragmentBuildResult, FragmentEdge, FragmentEdgeKind, MultiFragmentBuildResult, OutputColumn,
+    DirectExecPlan, FragmentBuildResult, FragmentEdge, FragmentEdgeKind, MultiFragmentBuildResult,
+    OutputColumn,
 };
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::Operator;
@@ -75,6 +76,31 @@ fn limit_child_can_apply_offset_locally(child: &PhysicalPlanNode) -> bool {
         Operator::PhysicalSort(_) | Operator::PhysicalTopN(_)
     )
 }
+
+fn single_fragment_child_plan(
+    build_result: MultiFragmentBuildResult,
+) -> Result<Box<crate::sql::codegen::PlanBuildResult>, String> {
+    if build_result.fragment_results.len() != 1 {
+        return Err(format!(
+            "expected single-fragment child, got {} fragments",
+            build_result.fragment_results.len()
+        ));
+    }
+    let fragment = build_result.fragment_results.into_iter().next().unwrap();
+    Ok(Box::new(crate::sql::codegen::PlanBuildResult {
+        plan: fragment.plan,
+        desc_tbl: fragment.desc_tbl,
+        exec_params: fragment.exec_params,
+        output_columns: fragment.output_columns,
+        direct_exec: fragment.direct_exec,
+        query_global_dicts: fragment.query_global_dicts,
+        query_global_dict_exprs: fragment.query_global_dict_exprs,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Scan/join ownership metadata (used by RF planning)
+// ---------------------------------------------------------------------------
 
 /// Probe-side target recorded while visiting a node that carries a
 /// `RuntimeFilterProbe` annotation. The build-side hash join (visited AFTER
@@ -335,6 +361,16 @@ impl<'a> PlanFragmentBuilder<'a> {
             _ => plan,
         };
 
+        if matches!(plan.op, Operator::PhysicalAggregateStateMerge(_)) {
+            return Self::build_aggregate_state_merge_direct(
+                plan,
+                catalog,
+                connectors,
+                _current_database,
+                mv_refresh_ctx,
+            );
+        }
+
         let root_fragment_id = builder.alloc_fragment_id();
         builder.fragment_stack.push(root_fragment_id);
         let result = builder.visit(plan)?;
@@ -375,6 +411,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             exec_params: exec_params.clone(),
             output_sink: build_result_sink(),
             output_columns,
+            direct_exec: None,
             cte_id: None,
             cte_exchange_nodes: result.cte_exchange_nodes,
             // Dictionary plumbing: populated when Task 7+ inserts dict slots.
@@ -413,6 +450,135 @@ impl<'a> PlanFragmentBuilder<'a> {
             edges: builder.completed_edges,
             rf_plan,
         })
+    }
+
+    fn build_aggregate_state_merge_direct(
+        plan: &PhysicalPlanNode,
+        catalog: &'a dyn CatalogProvider,
+        connectors: &'a crate::connector::ConnectorRegistry,
+        current_database: &str,
+        mv_refresh_ctx: Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+    ) -> Result<MultiFragmentBuildResult, String> {
+        let Operator::PhysicalAggregateStateMerge(op) = &plan.op else {
+            return Err("internal error: expected PhysicalAggregateStateMerge".to_string());
+        };
+        if plan.children.len() != 2 {
+            return Err(format!(
+                "AggregateStateMerge codegen expects two children, got {}",
+                plan.children.len()
+            ));
+        }
+        let refresh_ctx = mv_refresh_ctx
+            .ok_or_else(|| "AggregateStateMerge codegen requires MV refresh context".to_string())?;
+        let layout = refresh_ctx.rewrite.aggregate_layout_for_execution()?;
+        Self::validate_aggregate_state_merge_layout(op, &layout)?;
+
+        let old_input = single_fragment_child_plan(Self::build_with_mv_refresh_ctx(
+            &plan.children[0],
+            catalog,
+            connectors,
+            current_database,
+            mv_refresh_ctx,
+        )?)
+        .map_err(|e| format!("AggregateStateMerge old input: {e}"))?;
+        let delta_input = single_fragment_child_plan(Self::build_with_mv_refresh_ctx(
+            &plan.children[1],
+            catalog,
+            connectors,
+            current_database,
+            mv_refresh_ctx,
+        )?)
+        .map_err(|e| format!("AggregateStateMerge delta input: {e}"))?;
+
+        let output_columns = op
+            .output_columns
+            .iter()
+            .map(|c| OutputColumn {
+                name: c.name.clone(),
+                data_type: c.data_type.clone(),
+                nullable: c.nullable,
+            })
+            .collect();
+        let exec_params =
+            nodes::build_exec_params_multi_with_refresh_context(connectors, &[], mv_refresh_ctx)?;
+        let fragment = FragmentBuildResult {
+            fragment_id: 0,
+            plan: plan_nodes::TPlan::new(Vec::new()),
+            desc_tbl: DescriptorTableBuilder::new().build(),
+            exec_params,
+            output_sink: build_result_sink(),
+            output_columns,
+            direct_exec: Some(Box::new(DirectExecPlan::AggregateStateMerge {
+                old_input,
+                delta_input,
+                layout,
+            })),
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+            query_global_dicts: None,
+            query_global_dict_exprs: None,
+        };
+
+        Ok(MultiFragmentBuildResult {
+            fragment_results: vec![fragment],
+            root_fragment_id: 0,
+            edges: Vec::new(),
+            rf_plan: None,
+        })
+    }
+
+    fn validate_aggregate_state_merge_layout(
+        op: &crate::sql::optimizer::operator::AggregateStateMergeOp,
+        layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
+    ) -> Result<(), String> {
+        let layout_keys = layout
+            .group_key_source_indexes
+            .iter()
+            .map(|source_index| {
+                layout
+                    .visible_columns
+                    .get(*source_index)
+                    .map(|column| column.name.as_str())
+                    .ok_or_else(|| {
+                        format!(
+                            "AggregateStateMerge layout group key index {source_index} is out of range"
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if layout_keys.len() != op.group_key_names.len()
+            || layout_keys
+                .iter()
+                .zip(&op.group_key_names)
+                .any(|(layout_name, op_name)| !layout_name.eq_ignore_ascii_case(op_name))
+        {
+            return Err(format!(
+                "AggregateStateMerge group key/layout mismatch: plan={:?} layout={:?}",
+                op.group_key_names, layout_keys
+            ));
+        }
+
+        let state_names = layout
+            .state_columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>();
+        let missing_state_names = op
+            .aggregate_state_names
+            .iter()
+            .filter(|op_name| {
+                !state_names
+                    .iter()
+                    .any(|layout_name| layout_name.eq_ignore_ascii_case(op_name))
+            })
+            .collect::<Vec<_>>();
+        if !missing_state_names.is_empty() {
+            return Err(format!(
+                "AggregateStateMerge state column/layout mismatch: missing plan state columns {:?} from layout {:?}",
+                missing_state_names, state_names
+            ));
+        }
+        Ok(())
     }
 
     fn refresh_scan_table_for_codegen(
@@ -2349,6 +2515,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                     nullable: c.nullable,
                 })
                 .collect(),
+            direct_exec: None,
             cte_id: None,
             cte_exchange_nodes,
             query_global_dicts: child_dicts,
@@ -2471,6 +2638,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                     nullable: c.nullable,
                 })
                 .collect(),
+            direct_exec: None,
             cte_id: None,
             cte_exchange_nodes,
             query_global_dicts: child_dicts,
@@ -3764,6 +3932,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                     nullable: c.nullable,
                 })
                 .collect(),
+            direct_exec: None,
             cte_id: None,
             cte_exchange_nodes,
             query_global_dicts: child_dicts,
@@ -4142,6 +4311,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                     nullable: c.nullable,
                 })
                 .collect(),
+            direct_exec: None,
             cte_id: Some(op.cte_id),
             cte_exchange_nodes: child.cte_exchange_nodes,
             query_global_dicts: cte_dicts,
@@ -4333,9 +4503,9 @@ mod tests {
         IcebergTableInfo, PhysicalTableLayout, ScanSource, StarRocksTabletRef, TableDef,
     };
     use crate::sql::optimizer::operator::{
-        JoinDistribution, Operator, PhysicalDistributionOp, PhysicalGenerateSeriesOp,
-        PhysicalHashJoinEqCondition, PhysicalHashJoinOp, PhysicalScanOp, PhysicalSortOp,
-        PhysicalWindowOp, ScanDictionaryColumn,
+        AggregateStateMergeOp, JoinDistribution, Operator, PhysicalDistributionOp,
+        PhysicalGenerateSeriesOp, PhysicalHashJoinEqCondition, PhysicalHashJoinOp, PhysicalScanOp,
+        PhysicalSortOp, PhysicalValuesOp, PhysicalWindowOp, ScanDictionaryColumn,
     };
     use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
     use crate::sql::optimizer::property::DistributionSpec;
@@ -4479,6 +4649,95 @@ mod tests {
                 Ok(None)
             }
         }
+    }
+
+    fn stats_for_test() -> Statistics {
+        Statistics {
+            output_row_count: 0.0,
+            column_statistics: HashMap::new(),
+        }
+    }
+
+    fn output_col_for_test(
+        id: u32,
+        name: &str,
+        data_type: DataType,
+        nullable: bool,
+    ) -> OutputColumn {
+        OutputColumn {
+            column_id: crate::sql::column_id::ColumnId::new_for_test(id),
+            name: name.to_string(),
+            data_type,
+            nullable,
+            is_internal: false,
+        }
+    }
+
+    fn values_plan_for_test(columns: Vec<OutputColumn>) -> PhysicalPlanNode {
+        PhysicalPlanNode {
+            op: Operator::PhysicalValues(PhysicalValuesOp {
+                rows: Vec::new(),
+                columns: columns.clone(),
+            }),
+            children: Vec::new(),
+            stats: stats_for_test(),
+            output_columns: columns,
+        }
+    }
+
+    #[test]
+    fn aggregate_state_merge_dispatch_requires_refresh_context() {
+        let output_columns = vec![
+            output_col_for_test(1, "region", DataType::Utf8, false),
+            output_col_for_test(2, "c", DataType::Int64, false),
+            output_col_for_test(3, "s", DataType::Int64, true),
+            output_col_for_test(4, "__change_op", DataType::Int8, false),
+        ];
+        let state_columns = vec![
+            output_col_for_test(10, "__row_id__", DataType::Utf8, false),
+            output_col_for_test(11, "region", DataType::Utf8, false),
+            output_col_for_test(12, "c", DataType::Int64, false),
+            output_col_for_test(13, "s", DataType::Int64, true),
+            output_col_for_test(14, "__agg_state_c", DataType::LargeBinary, false),
+            output_col_for_test(15, "__agg_state_s", DataType::LargeBinary, false),
+        ];
+        let plan = PhysicalPlanNode {
+            op: Operator::PhysicalAggregateStateMerge(AggregateStateMergeOp {
+                group_key_names: vec!["region".to_string()],
+                aggregate_state_names: vec![
+                    "__agg_state_c".to_string(),
+                    "__agg_state_s".to_string(),
+                ],
+                change_op_column: "__change_op".to_string(),
+                output_columns: output_columns.clone(),
+            }),
+            children: vec![
+                values_plan_for_test(state_columns.clone()),
+                values_plan_for_test(state_columns),
+            ],
+            stats: stats_for_test(),
+            output_columns,
+        };
+
+        let err = match PlanFragmentBuilder::build_with_mv_refresh_ctx(
+            &plan,
+            &DummyCatalog,
+            &crate::connector::ConnectorRegistry::default(),
+            "db",
+            None,
+        ) {
+            Ok(_) => panic!("AggregateStateMerge build unexpectedly succeeded without context"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.contains("AggregateStateMerge codegen requires MV refresh context"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("unhandled operator in fragment builder"),
+            "{err}"
+        );
     }
 
     #[derive(Debug)]

@@ -2548,6 +2548,7 @@ fn single_fragment_plan(
         desc_tbl: fragment.desc_tbl,
         exec_params: fragment.exec_params,
         output_columns: fragment.output_columns,
+        direct_exec: fragment.direct_exec,
         query_global_dicts: fragment.query_global_dicts,
         query_global_dict_exprs: fragment.query_global_dict_exprs,
     }))
@@ -3166,19 +3167,36 @@ fn build_stats_file_io(
     Ok(iceberg::io::FileIOBuilder::new(Arc::new(factory)).build())
 }
 
-fn execute_plan(
+fn lower_plan_build_result(
     result: PlanBuildResult,
-    query_opts: Option<crate::internal_service::TQueryOptions>,
-    terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
+    arena: &mut crate::exec::expr::ExprArena,
+    query_opts: Option<&crate::internal_service::TQueryOptions>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
-) -> Result<QueryResult, String> {
-    use crate::exec::expr::ExprArena;
-    use crate::exec::node::{ExecPlan, push_down_local_runtime_filters};
-    use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
-    use crate::exec::pipeline::executor::execute_plan_with_pipeline;
+) -> Result<crate::exec::node::ExecNode, String> {
     use crate::lower::thrift::layout::{build_tuple_slot_order, reorder_tuple_slots};
     use crate::lower::thrift::lower_plan;
-    use crate::runtime::runtime_state::RuntimeState;
+
+    if let Some(direct) = result.direct_exec {
+        match *direct {
+            crate::sql::codegen::DirectExecPlan::AggregateStateMerge {
+                old_input,
+                delta_input,
+                layout,
+            } => {
+                let old_input =
+                    lower_plan_build_result(*old_input, arena, query_opts, iceberg_catalogs)?;
+                let delta_input =
+                    lower_plan_build_result(*delta_input, arena, query_opts, iceberg_catalogs)?;
+                return Ok(
+                    crate::sql::codegen::nodes::build_aggregate_state_merge_exec_node(
+                        old_input,
+                        delta_input,
+                        layout,
+                    ),
+                );
+            }
+        }
+    }
 
     let desc_tbl = result.desc_tbl;
     let plan = result.plan;
@@ -3190,17 +3208,16 @@ fn execute_plan(
     reorder_tuple_slots(&mut tuple_slots, Some(&desc_tbl));
     let layout_hints = tuple_slots.clone();
 
-    let mut arena = ExprArena::default();
     let connectors = crate::connector::ConnectorRegistry::default();
     let lowered = lower_plan(
         &plan,
-        &mut arena,
+        arena,
         &tuple_slots,
         Some(&desc_tbl),
         query_global_dicts.as_deref(),
         query_global_dict_exprs.as_ref(),
         Some(&exec_params),
-        query_opts.as_ref(),
+        query_opts,
         None,
         &connectors,
         &layout_hints,
@@ -3208,10 +3225,25 @@ fn execute_plan(
         None,
         iceberg_catalogs,
     )?;
-    let mut exec_plan = ExecPlan {
-        arena,
-        root: lowered.node,
-    };
+    Ok(lowered.node)
+}
+
+fn execute_plan(
+    result: PlanBuildResult,
+    query_opts: Option<crate::internal_service::TQueryOptions>,
+    terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
+    iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
+) -> Result<QueryResult, String> {
+    use crate::exec::expr::ExprArena;
+    use crate::exec::node::{ExecPlan, push_down_local_runtime_filters};
+    use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
+    use crate::exec::pipeline::executor::execute_plan_with_pipeline;
+    use crate::runtime::runtime_state::RuntimeState;
+
+    let output_columns = result.output_columns.clone();
+    let mut arena = ExprArena::default();
+    let root = lower_plan_build_result(result, &mut arena, query_opts.as_ref(), iceberg_catalogs)?;
+    let mut exec_plan = ExecPlan { arena, root };
     push_down_local_runtime_filters(&mut exec_plan.root, &exec_plan.arena);
 
     // Default to the result-capturing sink unless the caller supplied a
@@ -3246,8 +3278,7 @@ fn execute_plan(
     )?;
 
     Ok(QueryResult {
-        columns: result
-            .output_columns
+        columns: output_columns
             .iter()
             .map(|c| QueryResultColumn {
                 name: c.name.clone(),
