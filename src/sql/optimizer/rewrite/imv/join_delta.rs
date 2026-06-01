@@ -88,30 +88,19 @@ impl LogicalRewriteRule for RewriteJoinAggregateDeltaRule {
         let output_columns = join_output_columns(join_type, &left, &right)?;
 
         let left_delta_branch = LogicalPlan::Join(JoinNode {
-            left: Box::new(LogicalPlan::ImvDelta(ImvDeltaNode {
-                input: Box::new(left.clone()),
-                is_root: false,
-                action_column: Some(action_column),
-            })),
-            right: Box::new(LogicalPlan::ImvVersion(ImvVersionNode {
-                input: Box::new(right.clone()),
-                version_ref: ImvVersionRef::from_snapshot(),
-            })),
+            left: Box::new(mark_delta_scan(left.clone(), action_column)?),
+            right: Box::new(mark_version_scan(
+                right.clone(),
+                ImvVersionRef::from_snapshot(),
+            )?),
             join_type,
             condition: condition.clone(),
             required_output_columns: required_output_columns.clone(),
         });
 
         let right_delta_branch = LogicalPlan::Join(JoinNode {
-            left: Box::new(LogicalPlan::ImvVersion(ImvVersionNode {
-                input: Box::new(left),
-                version_ref: ImvVersionRef::to_snapshot(),
-            })),
-            right: Box::new(LogicalPlan::ImvDelta(ImvDeltaNode {
-                input: Box::new(right),
-                is_root: false,
-                action_column: Some(action_column),
-            })),
+            left: Box::new(mark_version_scan(left, ImvVersionRef::to_snapshot())?),
+            right: Box::new(mark_delta_scan(right, action_column)?),
             join_type,
             condition,
             required_output_columns: required_output_columns.clone(),
@@ -139,42 +128,92 @@ fn join_output_columns(
     left: &LogicalPlan,
     right: &LogicalPlan,
 ) -> Result<Vec<OutputColumn>, String> {
+    if !join_delta_kind_supported(join_type) {
+        return Err(format!(
+            "Iceberg IMV join aggregate rewrite cannot derive output columns for unsupported join kind {:?}",
+            join_type
+        ));
+    }
     let left_cols = plan_output_columns(left)?;
     let right_cols = plan_output_columns(right)?;
-    Ok(match join_type {
-        JoinKind::Inner | JoinKind::Cross => {
-            let mut out = left_cols;
-            out.extend(right_cols);
-            out
+    let mut out = left_cols;
+    out.extend(right_cols);
+    Ok(out)
+}
+
+fn mark_delta_scan(plan: LogicalPlan, action_column: ColumnId) -> Result<LogicalPlan, String> {
+    mark_scan(plan, MarkerKind::Delta(action_column))
+}
+
+fn mark_version_scan(plan: LogicalPlan, version_ref: ImvVersionRef) -> Result<LogicalPlan, String> {
+    mark_scan(plan, MarkerKind::Version(version_ref))
+}
+
+enum MarkerKind {
+    Delta(ColumnId),
+    Version(ImvVersionRef),
+}
+
+fn mark_scan(plan: LogicalPlan, marker: MarkerKind) -> Result<LogicalPlan, String> {
+    Ok(match plan {
+        LogicalPlan::Scan(_) => wrap_scan_marker(plan, marker),
+        LogicalPlan::Project(mut project) => {
+            project.input = Box::new(mark_scan(*project.input, marker)?);
+            LogicalPlan::Project(project)
         }
-        JoinKind::LeftOuter => {
-            let mut out = left_cols;
-            out.extend(widen_nullable(right_cols));
-            out
+        LogicalPlan::Filter(mut filter) => {
+            filter.input = Box::new(mark_scan(*filter.input, marker)?);
+            LogicalPlan::Filter(filter)
         }
-        JoinKind::RightOuter => {
-            let mut out = widen_nullable(left_cols);
-            out.extend(right_cols);
-            out
+        other => {
+            return Err(format!(
+                "Iceberg IMV join aggregate rewrite supports only Scan/Project/Filter join sides, got {}",
+                plan_kind(&other)
+            ));
         }
-        JoinKind::FullOuter => {
-            let mut out = widen_nullable(left_cols);
-            out.extend(widen_nullable(right_cols));
-            out
-        }
-        JoinKind::LeftSemi | JoinKind::LeftAnti | JoinKind::NullAwareLeftAnti => left_cols,
-        JoinKind::RightSemi | JoinKind::RightAnti => right_cols,
     })
 }
 
-fn widen_nullable(columns: Vec<OutputColumn>) -> Vec<OutputColumn> {
-    columns
-        .into_iter()
-        .map(|mut column| {
-            column.nullable = true;
-            column
-        })
-        .collect()
+fn wrap_scan_marker(scan: LogicalPlan, marker: MarkerKind) -> LogicalPlan {
+    match marker {
+        MarkerKind::Delta(action_column) => LogicalPlan::ImvDelta(ImvDeltaNode {
+            input: Box::new(scan),
+            is_root: false,
+            action_column: Some(action_column),
+        }),
+        MarkerKind::Version(version_ref) => LogicalPlan::ImvVersion(ImvVersionNode {
+            input: Box::new(scan),
+            version_ref,
+        }),
+    }
+}
+
+fn plan_kind(plan: &LogicalPlan) -> &'static str {
+    match plan {
+        LogicalPlan::Scan(_) => "Scan",
+        LogicalPlan::Filter(_) => "Filter",
+        LogicalPlan::Project(_) => "Project",
+        LogicalPlan::Aggregate(_) => "Aggregate",
+        LogicalPlan::Join(_) => "Join",
+        LogicalPlan::Sort(_) => "Sort",
+        LogicalPlan::Limit(_) => "Limit",
+        LogicalPlan::Union(_) => "Union",
+        LogicalPlan::Intersect(_) => "Intersect",
+        LogicalPlan::Except(_) => "Except",
+        LogicalPlan::Values(_) => "Values",
+        LogicalPlan::GenerateSeries(_) => "GenerateSeries",
+        LogicalPlan::TableFunction(_) => "TableFunction",
+        LogicalPlan::Window(_) => "Window",
+        LogicalPlan::SubqueryAlias(_) => "SubqueryAlias",
+        LogicalPlan::Repeat(_) => "Repeat",
+        LogicalPlan::CTEAnchor(_) => "CTEAnchor",
+        LogicalPlan::CTEProduce(_) => "CTEProduce",
+        LogicalPlan::CTEConsume(_) => "CTEConsume",
+        LogicalPlan::Decode(_) => "Decode",
+        LogicalPlan::AggregateStateMerge(_) => "AggregateStateMerge",
+        LogicalPlan::ImvDelta(_) => "ImvDelta",
+        LogicalPlan::ImvVersion(_) => "ImvVersion",
+    }
 }
 
 fn plan_output_columns(plan: &LogicalPlan) -> Result<Vec<OutputColumn>, String> {
@@ -510,28 +549,31 @@ mod tests {
     }
 
     fn assert_delta(plan: &LogicalPlan, expected_scan: &str, action_column: ColumnId) {
-        let LogicalPlan::ImvDelta(delta) = plan else {
-            panic!("expected ImvDelta");
-        };
-        assert!(!delta.is_root);
-        assert_eq!(delta.action_column, Some(action_column));
-        assert_project_scan(delta.input.as_ref(), expected_scan);
-    }
-
-    fn assert_version(plan: &LogicalPlan, expected_scan: &str, role: ImvVersionRole) {
-        let LogicalPlan::ImvVersion(version) = plan else {
-            panic!("expected ImvVersion");
-        };
-        assert_eq!(version.version_ref, ImvVersionRef { role });
-        assert_project_scan(version.input.as_ref(), expected_scan);
-    }
-
-    fn assert_project_scan(plan: &LogicalPlan, expected_scan: &str) {
         let LogicalPlan::Project(project) = plan else {
             panic!("expected Project");
         };
-        let LogicalPlan::Scan(scan) = project.input.as_ref() else {
-            panic!("expected Project(Scan)");
+        let LogicalPlan::ImvDelta(delta) = project.input.as_ref() else {
+            panic!("expected Project(ImvDelta(...))");
+        };
+        assert!(!delta.is_root);
+        assert_eq!(delta.action_column, Some(action_column));
+        assert_scan(delta.input.as_ref(), expected_scan);
+    }
+
+    fn assert_version(plan: &LogicalPlan, expected_scan: &str, role: ImvVersionRole) {
+        let LogicalPlan::Project(project) = plan else {
+            panic!("expected Project");
+        };
+        let LogicalPlan::ImvVersion(version) = project.input.as_ref() else {
+            panic!("expected Project(ImvVersion(...))");
+        };
+        assert_eq!(version.version_ref, ImvVersionRef { role });
+        assert_scan(version.input.as_ref(), expected_scan);
+    }
+
+    fn assert_scan(plan: &LogicalPlan, expected_scan: &str) {
+        let LogicalPlan::Scan(scan) = plan else {
+            panic!("expected Scan");
         };
         assert_eq!(scan.table.name, expected_scan);
     }

@@ -7,7 +7,7 @@
 //! Join/UnionAll/Aggregate above a Delta scan are unsupported in Phase 2 and
 //! fail-fast.
 
-use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
+use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn, ProjectItem, TypedExpr};
 use crate::sql::catalog::ScanSource;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
@@ -77,6 +77,10 @@ pub(crate) fn subtree_has_action_column(plan: &LogicalPlan) -> bool {
                 subtree_has_action_column(&node.old_input)
                     || subtree_has_action_column(&node.delta_input)
             }
+            LogicalPlan::Join(node) => {
+                subtree_has_action_column(&node.left) || subtree_has_action_column(&node.right)
+            }
+            LogicalPlan::Union(node) => node.inputs.iter().any(subtree_has_action_column),
             _ => false,
         }
 }
@@ -225,9 +229,12 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
                 subtree_has_action_column(&a.input) && !is_signed_state_aggregate(a)
             }
             LogicalPlan::Join(j) => {
-                subtree_has_action_column(&j.left) || subtree_has_action_column(&j.right)
+                (subtree_has_action_column(&j.left) || subtree_has_action_column(&j.right))
+                    && !is_supported_join_delta_branch(j)
             }
-            LogicalPlan::Union(u) => u.inputs.iter().any(subtree_has_action_column),
+            LogicalPlan::Union(u) => {
+                u.inputs.iter().any(subtree_has_action_column) && !is_supported_join_delta_union(u)
+            }
             _ => false,
         }
     }
@@ -281,6 +288,60 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
             )),
             _ => Ok(RewriteResult::Unchanged),
         }
+    }
+}
+
+fn is_supported_join_delta_union(node: &crate::sql::planner::plan::UnionNode) -> bool {
+    node.all
+        && !node.inputs.is_empty()
+        && node.inputs.iter().all(|input| match input {
+            LogicalPlan::Join(join) => is_supported_join_delta_branch(join),
+            _ => false,
+        })
+}
+
+fn is_supported_join_delta_branch(node: &crate::sql::planner::plan::JoinNode) -> bool {
+    matches!(node.join_type, JoinKind::Inner | JoinKind::Cross)
+        && exactly_one_delta_one_version(&node.left, &node.right)
+}
+
+fn exactly_one_delta_one_version(left: &LogicalPlan, right: &LogicalPlan) -> bool {
+    let left_delta = subtree_has_delta_scan(left);
+    let right_delta = subtree_has_delta_scan(right);
+    let left_version = subtree_has_version_scan(left);
+    let right_version = subtree_has_version_scan(right);
+    ((left_delta && right_version) || (right_delta && left_version))
+        && !(left_delta && right_delta)
+        && !(left_version && right_version)
+}
+
+fn subtree_has_delta_scan(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Scan(scan) => {
+            matches!(scan.table.source, ScanSource::IcebergDeltaTable { .. })
+        }
+        LogicalPlan::Filter(node) => subtree_has_delta_scan(&node.input),
+        LogicalPlan::Project(node) => subtree_has_delta_scan(&node.input),
+        LogicalPlan::Join(node) => {
+            subtree_has_delta_scan(&node.left) || subtree_has_delta_scan(&node.right)
+        }
+        LogicalPlan::Union(node) => node.inputs.iter().any(subtree_has_delta_scan),
+        _ => false,
+    }
+}
+
+fn subtree_has_version_scan(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Scan(scan) => {
+            matches!(scan.table.source, ScanSource::IcebergVersionTable { .. })
+        }
+        LogicalPlan::Filter(node) => subtree_has_version_scan(&node.input),
+        LogicalPlan::Project(node) => subtree_has_version_scan(&node.input),
+        LogicalPlan::Join(node) => {
+            subtree_has_version_scan(&node.left) || subtree_has_version_scan(&node.right)
+        }
+        LogicalPlan::Union(node) => node.inputs.iter().any(subtree_has_version_scan),
+        _ => false,
     }
 }
 

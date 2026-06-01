@@ -10,7 +10,7 @@ use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
 use crate::sql::optimizer::rewrite::imv::annotation::ImvExtension;
-use crate::sql::optimizer::rewrite::imv::marker::ImvDeltaNode;
+use crate::sql::optimizer::rewrite::imv::marker::{ImvDeltaNode, plan_contains_imv_marker};
 use crate::sql::optimizer::rewrite::imv::target_state::build_target_state_scan_source;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
@@ -358,12 +358,17 @@ fn signed_aggregate(
         .iter()
         .map(|call| signed_aggregate_call(call, action_column))
         .collect::<Result<Vec<_>, String>>()?;
-    Ok(LogicalPlan::Aggregate(AggregateNode {
-        input: Box::new(LogicalPlan::ImvDelta(ImvDeltaNode {
+    let input = if plan_contains_imv_marker(&aggregate.input) {
+        aggregate.input
+    } else {
+        Box::new(LogicalPlan::ImvDelta(ImvDeltaNode {
             input: aggregate.input,
             is_root: false,
             action_column: Some(action_column),
-        })),
+        }))
+    };
+    Ok(LogicalPlan::Aggregate(AggregateNode {
+        input,
         group_by: aggregate.group_by,
         aggregates: signed_calls,
         output_columns: aggregate.output_columns,
@@ -471,8 +476,10 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::imv::annotation::{ImvExtension, ImvPlanAnnotation};
-    use crate::sql::optimizer::rewrite::imv::marker::ImvDeltaNode;
-    use crate::sql::planner::plan::{AggregateCall, AggregateNode, ScanNode};
+    use crate::sql::optimizer::rewrite::imv::marker::{
+        ImvDeltaNode, ImvVersionNode, ImvVersionRef,
+    };
+    use crate::sql::planner::plan::{AggregateCall, AggregateNode, ScanNode, UnionNode};
 
     #[test]
     fn signed_state_function_maps_supported_aggregates() {
@@ -754,6 +761,40 @@ mod tests {
         })
     }
 
+    fn join_expanded_input() -> LogicalPlan {
+        LogicalPlan::Union(UnionNode {
+            inputs: vec![
+                LogicalPlan::ImvDelta(ImvDeltaNode {
+                    input: Box::new(leaf_scan()),
+                    is_root: false,
+                    action_column: Some(ColumnId::new_for_test(100)),
+                }),
+                LogicalPlan::ImvVersion(ImvVersionNode {
+                    input: Box::new(leaf_scan()),
+                    version_ref: ImvVersionRef::from_snapshot(),
+                }),
+            ],
+            all: true,
+            output_columns: vec![
+                OutputColumn {
+                    column_id: ColumnId::new_for_test(1),
+                    name: "k".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    is_internal: false,
+                },
+                OutputColumn {
+                    column_id: ColumnId::new_for_test(2),
+                    name: "v".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    is_internal: false,
+                },
+            ],
+            required_output_columns: None,
+        })
+    }
+
     #[test]
     fn rewrite_aggregate_state_matches_only_root_delta_over_aggregate() {
         let rule = RewriteAggregateStateRule;
@@ -866,6 +907,26 @@ mod tests {
             &struct_args[3].kind,
             ExprKind::ColumnRef { column, .. } if column == "__change_op"
         ));
+    }
+
+    #[test]
+    fn rewrite_aggregate_state_preserves_pre_expanded_join_delta_input() {
+        let rule = RewriteAggregateStateRule;
+        let mut ctx = build_ctx();
+        let result = rule
+            .apply(delta(aggregate_over(join_expanded_input())), &mut ctx)
+            .expect("aggregate rewrite must succeed");
+        let RewriteResult::Changed(LogicalPlan::AggregateStateMerge(merge)) = result else {
+            panic!("expected Changed(AggregateStateMerge)");
+        };
+
+        let LogicalPlan::Aggregate(signed_aggregate) = merge.delta_input.as_ref() else {
+            panic!("expected signed aggregate delta input");
+        };
+        assert!(
+            matches!(signed_aggregate.input.as_ref(), LogicalPlan::Union(_)),
+            "pre-expanded join delta input must not be wrapped as ImvDelta(Union)"
+        );
     }
 
     #[test]

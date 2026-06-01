@@ -10,7 +10,7 @@ use std::sync::atomic::AtomicBool;
 use arrow::datatypes::DataType;
 
 use crate::engine::mv::iceberg_target_apply::ICEBERG_MV_APPLY_KEY_COLUMN;
-use crate::sql::analysis::OutputColumn;
+use crate::sql::analysis::{JoinKind, OutputColumn};
 use crate::sql::catalog::ScanSource;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
@@ -186,7 +186,7 @@ fn validate_node(plan: &LogicalPlan) -> Result<(), String> {
 fn validate_state_merge_delta_input(plan: &LogicalPlan) -> Result<(), String> {
     match plan {
         LogicalPlan::Aggregate(node) if is_signed_state_aggregate(node) => {
-            validate_node(&node.input)
+            validate_signed_delta_input(&node.input)
         }
         _ => validate_node(plan),
     }
@@ -198,6 +198,86 @@ fn is_signed_state_aggregate(node: &crate::sql::planner::plan::AggregateNode) ->
             .aggregates
             .iter()
             .all(|call| call.name.ends_with("_state_signed"))
+}
+
+fn validate_signed_delta_input(plan: &LogicalPlan) -> Result<(), String> {
+    match plan {
+        LogicalPlan::Scan(scan) => validate_scan(scan),
+        LogicalPlan::Filter(node) => validate_signed_delta_input(&node.input),
+        LogicalPlan::Project(node) => {
+            validate_signed_delta_input(&node.input)?;
+            if subtree_has_delta(&node.input) {
+                let has = node
+                    .items
+                    .iter()
+                    .any(|item| item.output_name.eq_ignore_ascii_case(ImvActionColumn::NAME));
+                if !has {
+                    let fqn = first_delta_base_fqn(&node.input)
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    return Err(format!(
+                        "action column dropped at Project above delta-bound scan {fqn}"
+                    ));
+                }
+            }
+            Ok(())
+        }
+        LogicalPlan::Join(node) if is_supported_join_delta_branch(node) => {
+            validate_signed_delta_input(&node.left)?;
+            validate_signed_delta_input(&node.right)
+        }
+        LogicalPlan::Union(node) if is_supported_join_delta_union(node) => {
+            for input in &node.inputs {
+                validate_signed_delta_input(input)?;
+            }
+            Ok(())
+        }
+        _ => validate_node(plan),
+    }
+}
+
+fn is_supported_join_delta_union(node: &crate::sql::planner::plan::UnionNode) -> bool {
+    node.all
+        && !node.inputs.is_empty()
+        && node.inputs.iter().all(|input| match input {
+            LogicalPlan::Join(join) => is_supported_join_delta_branch(join),
+            _ => false,
+        })
+}
+
+fn is_supported_join_delta_branch(node: &crate::sql::planner::plan::JoinNode) -> bool {
+    matches!(node.join_type, JoinKind::Inner | JoinKind::Cross)
+        && exactly_one_delta_one_version(&node.left, &node.right)
+}
+
+fn exactly_one_delta_one_version(left: &LogicalPlan, right: &LogicalPlan) -> bool {
+    let left_delta = subtree_has_delta(left);
+    let right_delta = subtree_has_delta(right);
+    let left_version = subtree_has_version(left);
+    let right_version = subtree_has_version(right);
+    ((left_delta && right_version) || (right_delta && left_version))
+        && !(left_delta && right_delta)
+        && !(left_version && right_version)
+}
+
+fn subtree_has_version(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Scan(scan) => {
+            matches!(scan.table.source, ScanSource::IcebergVersionTable { .. })
+        }
+        LogicalPlan::Filter(node) => subtree_has_version(&node.input),
+        LogicalPlan::Project(node) => subtree_has_version(&node.input),
+        LogicalPlan::Aggregate(node) => subtree_has_version(&node.input),
+        LogicalPlan::AggregateStateMerge(node) => {
+            subtree_has_version(&node.old_input) || subtree_has_version(&node.delta_input)
+        }
+        LogicalPlan::Join(node) => {
+            subtree_has_version(&node.left) || subtree_has_version(&node.right)
+        }
+        LogicalPlan::Union(node) => node.inputs.iter().any(subtree_has_version),
+        LogicalPlan::ImvDelta(node) => subtree_has_version(&node.input),
+        LogicalPlan::ImvVersion(node) => subtree_has_version(&node.input),
+        _ => false,
+    }
 }
 
 fn validate_scan(scan: &ScanNode) -> Result<(), String> {
