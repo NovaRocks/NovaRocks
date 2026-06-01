@@ -247,7 +247,7 @@ fn normalize_branch_output(input: LogicalPlan, output_columns: &[OutputColumn]) 
     })
 }
 
-fn plan_output_columns(plan: &LogicalPlan) -> Result<Vec<OutputColumn>, String> {
+pub(crate) fn plan_output_columns(plan: &LogicalPlan) -> Result<Vec<OutputColumn>, String> {
     Ok(match plan {
         LogicalPlan::Scan(scan) => scan.columns.clone(),
         LogicalPlan::Project(project) => project

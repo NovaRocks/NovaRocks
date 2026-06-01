@@ -4,12 +4,53 @@ east	2	300
 south	1	70
 west	1	50
 
--- query 5
+-- query 4
+region	c	s
+east	2	14
+south	1	13
+west	1	11
+
+-- query 8
 region	c	s
 north	2	350
 west	2	130
 
--- query 6
+-- query 9
 region	c	s
 north	2	350
 west	2	130
+
+-- query 10
+region	c	s
+north	2	14
+west	2	22
+
+-- query 11
+region	c	s
+north	2	14
+west	2	22
+
+-- query 15
+region	c	s
+north	2	350
+west	3	150
+
+-- query 16
+region	c	s
+north	2	14
+west	3	33
+
+-- query 20
+region	c	s
+coast	3	150
+north	2	350
+
+-- query 21
+region	c	s
+coast	3	51
+north	2	14
+
+-- query 22
+region	c	s
+coast	3	51
+north	2	14

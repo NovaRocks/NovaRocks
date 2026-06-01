@@ -356,4 +356,37 @@ mod tests {
             other => panic!("expected IcebergVersionTable, got {other:?}"),
         }
     }
+
+    #[test]
+    fn bind_version_scan_strips_refresh_action_column() {
+        let ctx = dummy_rewrite_context();
+        let mut scan = iceberg_scan(Some("uuid-b"));
+        scan.columns
+            .push(ImvActionColumn::output_column(ColumnId::new_for_test(99)));
+        scan.table
+            .iceberg_row_lineage_metadata_columns
+            .push(ColumnDef {
+                name: ImvActionColumn::NAME.to_string(),
+                data_type: DataType::Int8,
+                nullable: false,
+                write_default: None,
+                logical_type: None,
+            });
+
+        let bound =
+            bind_version_scan(scan, &ctx, ImvVersionRole::To).expect("version scan should bind");
+
+        assert!(
+            !bound.columns.iter().any(ImvActionColumn::matches),
+            "version scan must not project refresh action column"
+        );
+        assert!(
+            !bound
+                .table
+                .iceberg_row_lineage_metadata_columns
+                .iter()
+                .any(|column| column.name.eq_ignore_ascii_case(ImvActionColumn::NAME)),
+            "version scan table metadata must not advertise refresh action column"
+        );
+    }
 }

@@ -1178,26 +1178,6 @@ fn iceberg_aggregate_incremental_delta_select_sql(
     )
 }
 
-fn iceberg_join_aggregate_branch_delta_sql(
-    select_sql: &str,
-    shape: &JoinAggregateMvShape,
-    delta_side: crate::engine::mv::iceberg_join_branch::BranchDeltaSide,
-) -> Result<String, String> {
-    let delta_alias = match delta_side {
-        crate::engine::mv::iceberg_join_branch::BranchDeltaSide::Left => {
-            shape.join.left_alias.as_str()
-        }
-        crate::engine::mv::iceberg_join_branch::BranchDeltaSide::Right => {
-            shape.join.right_alias.as_str()
-        }
-    };
-    iceberg_aggregate_incremental_delta_select_sql(
-        select_sql,
-        &shape.as_aggregate_shape_for_layout(),
-        Some(delta_alias),
-    )
-}
-
 /// Refresh an iceberg-backed materialized view.
 ///
 /// Strategy dispatch:
@@ -1411,10 +1391,9 @@ pub(crate) fn refresh_iceberg_mv(
         "iceberg MV refresh context constructed"
     );
 
-    // Single-table projection/filter MVs are cut over to the IMV rewrite
-    // pipeline (invoked inline by `execute_query_with_options` once the
-    // incremental path passes `Some(&ctx)`); aggregate/join paths still
-    // probe `try_run_imv_rewrite_pipeline` for telemetry.
+    // Incremental refreshes that use the IMV rewrite pipeline pass `ctx` into
+    // execution so the optimizer can bind version/delta scans against the
+    // refresh pin and fail fast when required rewrite evidence is missing.
 
     match (previous_snapshot_id, current_snapshot_id) {
         // Base table has no snapshot yet — nothing to refresh.
@@ -2583,223 +2562,6 @@ fn refresh_join_aggregate_iceberg_mv(
             target.catalog, target.namespace, target.table
         )),
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn incremental_refresh_iceberg_join_aggregate_mv(
-    state: &Arc<StandaloneState>,
-    ctx: &IcebergMvRefreshContext,
-    left_ref: &IcebergTableRef,
-    right_ref: &IcebergTableRef,
-    left_previous_snapshot_id: i64,
-    right_previous_snapshot_id: i64,
-    left_current_snapshot_id: i64,
-    right_current_snapshot_id: i64,
-    left_loaded: &crate::connector::iceberg::catalog::IcebergLoadedTable,
-    right_loaded: &crate::connector::iceberg::catalog::IcebergLoadedTable,
-    join_aggregate_shape: &JoinAggregateMvShape,
-    aggregate_shape: &AggregateMvShape,
-) -> Result<StatementResult, String> {
-    let target = &ctx.rewrite.target;
-    let target_entry = &*ctx.target_entry;
-    let iceberg_catalog = &ctx.iceberg_catalog;
-    let target_table = &ctx.target_table;
-    let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
-    let current_catalog = ctx.rewrite.current_catalog.as_deref();
-    let current_database = ctx.rewrite.current_database.as_str();
-    let mv_definition = &*ctx.rewrite.mv_definition;
-    let schema_contract = &*ctx.rewrite.schema_contract;
-    let pin = &*ctx.rewrite.pin;
-    let left_batch = plan_join_aggregate_side_changes(
-        target,
-        "left",
-        left_loaded,
-        left_previous_snapshot_id,
-        left_current_snapshot_id,
-    )?;
-    let right_batch = plan_join_aggregate_side_changes(
-        target,
-        "right",
-        right_loaded,
-        right_previous_snapshot_id,
-        right_current_snapshot_id,
-    )?;
-    let left_has_changes =
-        !left_batch.inserts.is_empty() || iceberg_change_batch_has_row_deletes(&left_batch);
-    let right_has_changes =
-        !right_batch.inserts.is_empty() || iceberg_change_batch_has_row_deletes(&right_batch);
-    let branches = crate::engine::mv::iceberg_join_branch::plan_join_delta_branches(
-        left_ref,
-        right_ref,
-        crate::engine::mv::iceberg_join_branch::SnapshotWindow {
-            from: left_previous_snapshot_id,
-            to: left_current_snapshot_id,
-        },
-        crate::engine::mv::iceberg_join_branch::SnapshotWindow {
-            from: right_previous_snapshot_id,
-            to: right_current_snapshot_id,
-        },
-        left_has_changes,
-        right_has_changes,
-    );
-    if branches.is_empty() {
-        tracing::info!(
-            "iceberg join aggregate mv {}.{}.{}: incremental delta is empty; updating metadata only",
-            target.catalog,
-            target.namespace,
-            target.table
-        );
-        return finalize_iceberg_mv_metadata_only_refresh(
-            state,
-            target,
-            mv_definition,
-            pin.to_snapshot_map(),
-            pin.to_table_uuid_map(),
-        );
-    }
-
-    let layout = build_aggregate_layout_for_refresh(
-        state,
-        current_catalog,
-        current_database,
-        mv_definition,
-        aggregate_shape,
-    )?;
-    let base_query = parse_mv_select_query(&mv_definition.select_sql)?;
-    let mut delta_chunks = Vec::new();
-    for branch in branches {
-        let branch_chunks = execute_join_aggregate_delta_branch(
-            state,
-            current_database,
-            &base_query,
-            &branch,
-            join_aggregate_shape,
-            aggregate_shape,
-            &layout,
-        )?;
-        delta_chunks.extend(branch_chunks);
-    }
-    if delta_chunks.iter().all(|chunk| chunk.batch.num_rows() == 0) {
-        return finalize_iceberg_mv_metadata_only_refresh(
-            state,
-            target,
-            mv_definition,
-            pin.to_snapshot_map(),
-            pin.to_table_uuid_map(),
-        );
-    }
-
-    apply_iceberg_aggregate_delta_chunks(
-        state,
-        target,
-        target_entry,
-        iceberg_catalog,
-        target_table,
-        expected_main_snapshot_id,
-        mv_definition,
-        schema_contract,
-        &layout,
-        &delta_chunks,
-        pin.to_snapshot_map(),
-        pin.to_table_uuid_map(),
-    )
-}
-
-fn plan_join_aggregate_side_changes(
-    target: &IcebergMvTarget,
-    side: &str,
-    loaded_base: &crate::connector::iceberg::catalog::IcebergLoadedTable,
-    previous_snapshot_id: i64,
-    current_snapshot_id: i64,
-) -> Result<crate::connector::iceberg::changes::IcebergChangeBatch, String> {
-    let batch = match plan_changes(
-        &loaded_base.table,
-        previous_snapshot_id,
-        Some(current_snapshot_id),
-        &[],
-    ) {
-        Ok(batch) => batch,
-        Err(err) => match policy_signal_from_change_error(&err) {
-            IcebergChangePolicySignal::FullRefresh { reason } => {
-                return Err(format!(
-                    "iceberg join aggregate MV {}.{}.{} cannot refresh {side} side incrementally and automatic full rebuild is disabled: {reason}",
-                    target.catalog, target.namespace, target.table
-                ));
-            }
-            IcebergChangePolicySignal::Unsupported { reason } => {
-                return Err(format!(
-                    "iceberg join aggregate MV {}.{}.{} {side} side incremental refresh unsupported: {reason}",
-                    target.catalog, target.namespace, target.table
-                ));
-            }
-            IcebergChangePolicySignal::Incremental => {
-                return Err(format!(
-                    "iceberg join aggregate MV {}.{}.{} produced invalid {side} side incremental policy from change planner: {err}",
-                    target.catalog, target.namespace, target.table
-                ));
-            }
-        },
-    };
-    if batch.current_snapshot_id != current_snapshot_id {
-        return Err(format!(
-            "iceberg join aggregate MV {side} side change batch snapshot mismatch: expected {current_snapshot_id}, got {}",
-            batch.current_snapshot_id
-        ));
-    }
-    Ok(batch)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn execute_join_aggregate_delta_branch(
-    state: &Arc<StandaloneState>,
-    current_database: &str,
-    base_query: &sqlparser::ast::Query,
-    branch: &crate::engine::mv::iceberg_join_branch::JoinDeltaBranchPlan,
-    join_aggregate_shape: &JoinAggregateMvShape,
-    aggregate_shape: &AggregateMvShape,
-    layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
-) -> Result<Vec<crate::exec::chunk::Chunk>, String> {
-    let mut branch_query = crate::engine::mv::iceberg_join_branch::rewrite_join_branch_query(
-        base_query,
-        branch,
-        &join_aggregate_shape.join.left_alias,
-        &join_aggregate_shape.join.right_alias,
-    )?;
-    normalize_join_branch_snapshot_tables(&mut branch_query, branch)?;
-    let signed_sql = iceberg_join_aggregate_branch_delta_sql(
-        &branch_query.to_string(),
-        join_aggregate_shape,
-        branch.delta_side()?,
-    )?;
-    let signed_query = parse_mv_select_query(&signed_sql)?;
-    let branch_catalog = build_join_branch_catalog(state, branch)?;
-    let connectors_snapshot = state
-        .connectors
-        .read()
-        .expect("standalone connector registry read lock")
-        .clone();
-    let catalogs_guard = state
-        .iceberg_catalogs
-        .read()
-        .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-    let result = crate::engine::execute_query_with_options(
-        &signed_query,
-        &branch_catalog,
-        &connectors_snapshot,
-        current_database,
-        state.exchange_port,
-        None,
-        None,
-        Some(&*catalogs_guard),
-        None,
-    );
-    drop(catalogs_guard);
-    let result = result?;
-    crate::connector::starrocks::table::mv_agg_state::materialize_aggregate_result_chunks(
-        result,
-        layout,
-        aggregate_shape,
-    )
 }
 
 // Previous implementation of REFRESH FULL — `refresh_full_iceberg_mv` —
@@ -4642,11 +4404,7 @@ fn alias_aggregate_refresh_group_key_projection(
                     ));
                 }
             }
-            crate::connector::starrocks::table::mv_shape::VisibleAggregateOutput::Aggregate(_) => {
-                if let Some(item) = select.projection.get_mut(projection_index) {
-                    unqualify_aggregate_projection_inputs(item)?;
-                }
-            }
+            crate::connector::starrocks::table::mv_shape::VisibleAggregateOutput::Aggregate(_) => {}
         }
     }
     Ok(())
@@ -4688,79 +4446,6 @@ fn aggregate_refresh_alias_ident(alias: &str) -> sqlparser::ast::Ident {
         sqlparser::ast::Ident::new(alias)
     } else {
         sqlparser::ast::Ident::with_quote('`', alias)
-    }
-}
-
-fn unqualify_aggregate_projection_inputs(
-    item: &mut sqlparser::ast::SelectItem,
-) -> Result<(), String> {
-    use sqlparser::ast::SelectItem;
-
-    match item {
-        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-            unqualify_aggregate_expr_inputs(expr);
-            Ok(())
-        }
-        SelectItem::QualifiedWildcard(_, _) | SelectItem::Wildcard(_) => {
-            Err("aggregate MV aggregate projection cannot be a wildcard".to_string())
-        }
-    }
-}
-
-fn unqualify_aggregate_expr_inputs(expr: &mut sqlparser::ast::Expr) {
-    use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
-
-    let Expr::Function(function) = expr else {
-        return;
-    };
-    let FunctionArguments::List(args) = &mut function.args else {
-        return;
-    };
-    for arg in &mut args.args {
-        let FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr)) = arg else {
-            continue;
-        };
-        unqualify_compound_column_refs(arg_expr);
-    }
-}
-
-fn unqualify_compound_column_refs(expr: &mut sqlparser::ast::Expr) {
-    use sqlparser::ast::Expr;
-
-    match expr {
-        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
-            if let Some(last) = parts.last().cloned() {
-                *expr = Expr::Identifier(last);
-            }
-        }
-        Expr::Nested(inner) => unqualify_compound_column_refs(inner),
-        Expr::UnaryOp { expr, .. } => unqualify_compound_column_refs(expr),
-        Expr::BinaryOp { left, right, .. } => {
-            unqualify_compound_column_refs(left);
-            unqualify_compound_column_refs(right);
-        }
-        Expr::Cast { expr, .. } => unqualify_compound_column_refs(expr),
-        Expr::Function(function) => {
-            if let sqlparser::ast::FunctionArguments::List(args) = &mut function.args {
-                for arg in &mut args.args {
-                    match arg {
-                        sqlparser::ast::FunctionArg::Unnamed(
-                            sqlparser::ast::FunctionArgExpr::Expr(arg_expr),
-                        )
-                        | sqlparser::ast::FunctionArg::Named {
-                            arg: sqlparser::ast::FunctionArgExpr::Expr(arg_expr),
-                            ..
-                        }
-                        | sqlparser::ast::FunctionArg::ExprNamed {
-                            arg: sqlparser::ast::FunctionArgExpr::Expr(arg_expr),
-                            ..
-                        } => unqualify_compound_column_refs(arg_expr),
-                        _ => {}
-                    }
-                }
-            }
-        }
-        _ => {}
     }
 }
 
@@ -6972,14 +6657,13 @@ fn execute_join_delta_branches(
     Ok(StatementResult::Ok)
 }
 
-/// Build a one-shot `InMemoryCatalog` for the single-table projection/filter
-/// IMV incremental refresh path.
+/// Build a one-shot `InMemoryCatalog` for IMV incremental refresh execution.
 ///
 /// The catalog registers the base table as a *normal* Iceberg table whose
 /// `ScanSource` is `IcebergDataFiles` and whose `IcebergTableInfo` carries
 /// the same catalog/namespace/table identity as `ctx.rewrite.base_refs`, so
-/// the analyzer plans a normal Iceberg scan that the IMV rewrite pipeline
-/// can then rebind into `IcebergDeltaTable` via `BindIcebergScanRule`
+/// the analyzer plans normal Iceberg scans that the IMV rewrite pipeline
+/// can then rebind into delta/version scans via `BindIcebergScanRule`
 /// (`find_base_ref` matches by case-insensitive catalog/namespace/table).
 /// `build_iceberg_table_def_for_delta_scan` is the right factory here even
 /// though the source it publishes is `IcebergDataFiles`: the file list is
@@ -7982,35 +7666,6 @@ mod tests {
         assert!(
             upper.contains("SUM_STATE_SIGNED(AMOUNT, __CHANGE_OP) AS __AGG_STATE_S"),
             "sql={rewritten}"
-        );
-    }
-
-    #[test]
-    fn join_aggregate_branch_rewrite_uses_delta_side_change_op() {
-        let sql = "select d.region, count(*) as c, sum(f.amount) as s \
-                   from ice.ns.fact f join ice.ns.dim d on f.dim_id = d.id \
-                   group by d.region";
-        let query = parse_select_query(sql);
-        let shape = match classify_incremental_mv_query(&query).expect("shape") {
-            IncrementalMvShape::JoinAggregate(shape) => shape,
-            other => panic!("expected join aggregate shape, got {other:?}"),
-        };
-
-        let branch_sql = iceberg_join_aggregate_branch_delta_sql(
-            sql,
-            &shape,
-            crate::engine::mv::iceberg_join_branch::BranchDeltaSide::Left,
-        )
-        .expect("branch rewrite");
-        let upper = branch_sql.to_uppercase();
-
-        assert!(
-            upper.contains("COUNT_STATE_SIGNED(1, F.__CHANGE_OP) AS __AGG_STATE_C"),
-            "sql={branch_sql}"
-        );
-        assert!(
-            upper.contains("SUM_STATE_SIGNED(F.AMOUNT, F.__CHANGE_OP) AS __AGG_STATE_S"),
-            "sql={branch_sql}"
         );
     }
 

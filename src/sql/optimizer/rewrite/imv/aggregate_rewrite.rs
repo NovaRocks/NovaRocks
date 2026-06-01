@@ -10,6 +10,7 @@ use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
 use crate::sql::optimizer::rewrite::imv::annotation::ImvExtension;
+use crate::sql::optimizer::rewrite::imv::join_delta::plan_output_columns;
 use crate::sql::optimizer::rewrite::imv::marker::{ImvDeltaNode, plan_contains_imv_marker};
 use crate::sql::optimizer::rewrite::imv::target_state::build_target_state_scan_source;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
@@ -435,10 +436,14 @@ fn signed_aggregate(
     shape: &crate::connector::starrocks::table::mv_shape::AggregateMvShape,
     layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
 ) -> Result<LogicalPlan, String> {
+    let input_columns = plan_output_columns(&aggregate.input)?;
     let mut signed_calls = aggregate
         .aggregates
         .iter()
-        .map(|call| signed_aggregate_call(call, action_column))
+        .map(|call| {
+            let call = align_aggregate_call_inputs_to_child(call, &input_columns)?;
+            signed_aggregate_call(&call, action_column)
+        })
         .collect::<Result<Vec<_>, String>>()?;
     let hidden_retraction_call = layout.state_columns.iter().any(|column| {
         column.state_role
@@ -472,6 +477,164 @@ fn signed_aggregate(
         items: project_items,
         required_output_columns: None,
     }))
+}
+
+fn align_aggregate_call_inputs_to_child(
+    call: &AggregateCall,
+    input_columns: &[crate::sql::analysis::OutputColumn],
+) -> Result<AggregateCall, String> {
+    let mut call = call.clone();
+    for arg in &mut call.args {
+        align_expr_column_refs_to_child(arg, input_columns)?;
+    }
+    for sort in &mut call.order_by {
+        align_expr_column_refs_to_child(&mut sort.expr, input_columns)?;
+    }
+    Ok(call)
+}
+
+fn align_expr_column_refs_to_child(
+    expr: &mut TypedExpr,
+    input_columns: &[crate::sql::analysis::OutputColumn],
+) -> Result<(), String> {
+    match &mut expr.kind {
+        ExprKind::ColumnRef {
+            column_id,
+            qualifier,
+            column,
+        } => {
+            if let Some(input) = unique_input_column_by_id(input_columns, *column_id)? {
+                *qualifier = None;
+                *column = input.name.clone();
+                expr.data_type = input.data_type.clone();
+                expr.nullable = input.nullable;
+                return Ok(());
+            }
+            if qualifier.is_some() {
+                let input = unique_input_column_by_name(input_columns, column)?;
+                *column_id = input.column_id;
+                *qualifier = None;
+                *column = input.name.clone();
+                expr.data_type = input.data_type.clone();
+                expr.nullable = input.nullable;
+            }
+            Ok(())
+        }
+        ExprKind::BinaryOp { left, right, .. } => {
+            align_expr_column_refs_to_child(left, input_columns)?;
+            align_expr_column_refs_to_child(right, input_columns)
+        }
+        ExprKind::UnaryOp { expr, .. }
+        | ExprKind::Cast { expr, .. }
+        | ExprKind::IsNull { expr, .. }
+        | ExprKind::Nested(expr)
+        | ExprKind::IsTruthValue { expr, .. } => {
+            align_expr_column_refs_to_child(expr, input_columns)
+        }
+        ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
+            for arg in args {
+                align_expr_column_refs_to_child(arg, input_columns)?;
+            }
+            Ok(())
+        }
+        ExprKind::InList { expr, list, .. } => {
+            align_expr_column_refs_to_child(expr, input_columns)?;
+            for item in list {
+                align_expr_column_refs_to_child(item, input_columns)?;
+            }
+            Ok(())
+        }
+        ExprKind::Between {
+            expr, low, high, ..
+        } => {
+            align_expr_column_refs_to_child(expr, input_columns)?;
+            align_expr_column_refs_to_child(low, input_columns)?;
+            align_expr_column_refs_to_child(high, input_columns)
+        }
+        ExprKind::Like { expr, pattern, .. } => {
+            align_expr_column_refs_to_child(expr, input_columns)?;
+            align_expr_column_refs_to_child(pattern, input_columns)
+        }
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(operand) = operand {
+                align_expr_column_refs_to_child(operand, input_columns)?;
+            }
+            for (when, then) in when_then {
+                align_expr_column_refs_to_child(when, input_columns)?;
+                align_expr_column_refs_to_child(then, input_columns)?;
+            }
+            if let Some(else_expr) = else_expr {
+                align_expr_column_refs_to_child(else_expr, input_columns)?;
+            }
+            Ok(())
+        }
+        ExprKind::WindowCall {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for arg in args {
+                align_expr_column_refs_to_child(arg, input_columns)?;
+            }
+            for item in partition_by {
+                align_expr_column_refs_to_child(item, input_columns)?;
+            }
+            for sort in order_by {
+                align_expr_column_refs_to_child(&mut sort.expr, input_columns)?;
+            }
+            Ok(())
+        }
+        ExprKind::LambdaFunction { body, .. } | ExprKind::Lambda { body, .. } => {
+            align_expr_column_refs_to_child(body, input_columns)
+        }
+        ExprKind::LambdaParamRef { .. }
+        | ExprKind::Literal(_)
+        | ExprKind::SubqueryPlaceholder { .. } => Ok(()),
+    }
+}
+
+fn unique_input_column_by_id(
+    input_columns: &[crate::sql::analysis::OutputColumn],
+    column_id: ColumnId,
+) -> Result<Option<&crate::sql::analysis::OutputColumn>, String> {
+    if column_id == ColumnId::UNSET {
+        return Ok(None);
+    }
+    let matches = input_columns
+        .iter()
+        .filter(|column| column.column_id == column_id)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [column] => Ok(Some(*column)),
+        _ => Err(format!(
+            "Iceberg IMV aggregate rewrite found ambiguous child output column id {column_id:?}"
+        )),
+    }
+}
+
+fn unique_input_column_by_name<'a>(
+    input_columns: &'a [crate::sql::analysis::OutputColumn],
+    name: &str,
+) -> Result<&'a crate::sql::analysis::OutputColumn, String> {
+    let matches = input_columns
+        .iter()
+        .filter(|column| column.name.eq_ignore_ascii_case(name))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [column] => Ok(*column),
+        [] => Err(format!(
+            "Iceberg IMV aggregate rewrite cannot map qualified aggregate input {name} to child output"
+        )),
+        _ => Err(format!(
+            "Iceberg IMV aggregate rewrite found ambiguous child output column name {name}"
+        )),
+    }
 }
 
 fn signed_aggregate_output_columns(
