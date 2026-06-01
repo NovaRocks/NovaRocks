@@ -306,6 +306,7 @@ pub(crate) fn normalize_for_raw_parse(sql: &str) -> Result<String, String> {
     let sql = normalize_function_syntax(&sql)?;
     let sql = rewrite_version_as_of_string(&sql)?;
     let sql = rewrite_iceberg_metadata_suffix(&sql)?;
+    let sql = rewrite_starrocks_meta_table_suffix(&sql);
     let sql = rewrite_overwrite_partitions(&sql)?;
     let sql = rewrite_inline_null_treatment(&sql);
     let sql = strip_join_hints(&sql);
@@ -1371,6 +1372,146 @@ fn rewrite_iceberg_metadata_suffix(sql: &str) -> Result<String, String> {
         idx += 1;
     }
     Ok(output)
+}
+
+/// Strip StarRocks aggregate meta-scan table suffixes written as
+/// `<table>[_META_]`.
+///
+/// In StarRocks this suffix is an internal relation marker produced by the
+/// simple-aggregate meta-scan rewrite. Standalone NovaRocks does not expose a
+/// separate FE tablet-metadata relation, so the migrated aggregate coverage
+/// verifies the same logical result through the base table scan.
+fn rewrite_starrocks_meta_table_suffix(sql: &str) -> String {
+    if !sql.to_ascii_lowercase().contains("[_meta_]") {
+        return sql.to_string();
+    }
+
+    let bytes = sql.as_bytes();
+    let mut output = String::with_capacity(sql.len());
+    let mut idx = 0usize;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut in_backtick = false;
+
+    while idx < bytes.len() {
+        let byte = bytes[idx];
+
+        if in_single_quote {
+            if byte == b'\'' && bytes.get(idx.wrapping_sub(1)).copied() != Some(b'\\') {
+                in_single_quote = false;
+            }
+            idx = push_original_char(&mut output, sql, idx);
+            continue;
+        }
+        if in_double_quote {
+            if byte == b'"' && bytes.get(idx.wrapping_sub(1)).copied() != Some(b'\\') {
+                in_double_quote = false;
+            }
+            idx = push_original_char(&mut output, sql, idx);
+            continue;
+        }
+        if in_backtick {
+            if byte == b'`' {
+                in_backtick = false;
+            }
+            idx = push_original_char(&mut output, sql, idx);
+            continue;
+        }
+
+        match byte {
+            b'\'' => {
+                in_single_quote = true;
+                output.push('\'');
+                idx += 1;
+                continue;
+            }
+            b'"' => {
+                in_double_quote = true;
+                output.push('"');
+                idx += 1;
+                continue;
+            }
+            b'`' => {
+                in_backtick = true;
+                output.push('`');
+                idx += 1;
+                continue;
+            }
+            b'-' if bytes.get(idx + 1) == Some(&b'-') => {
+                while idx < bytes.len() && bytes[idx] != b'\n' {
+                    idx = push_original_char(&mut output, sql, idx);
+                }
+                continue;
+            }
+            b'/' if bytes.get(idx + 1) == Some(&b'*') => {
+                output.push_str("/*");
+                idx += 2;
+                while idx + 1 < bytes.len() && !(bytes[idx] == b'*' && bytes[idx + 1] == b'/') {
+                    idx = push_original_char(&mut output, sql, idx);
+                }
+                if idx + 1 < bytes.len() {
+                    output.push_str("*/");
+                    idx += 2;
+                }
+                continue;
+            }
+            b'[' if is_starrocks_meta_suffix(bytes, idx)
+                && is_starrocks_meta_table_suffix_context(bytes, idx) =>
+            {
+                idx += "[_META_]".len();
+                continue;
+            }
+            _ => {}
+        }
+
+        idx = push_original_char(&mut output, sql, idx);
+    }
+
+    output
+}
+
+fn is_starrocks_meta_suffix(bytes: &[u8], idx: usize) -> bool {
+    const SUFFIX: &[u8] = b"[_META_]";
+    bytes
+        .get(idx..idx + SUFFIX.len())
+        .is_some_and(|slice| slice.eq_ignore_ascii_case(SUFFIX))
+}
+
+fn is_starrocks_meta_table_suffix_context(bytes: &[u8], idx: usize) -> bool {
+    if idx == 0 || !(is_identifier_byte(bytes.get(idx - 1).copied()) || bytes[idx - 1] == b'`') {
+        return false;
+    }
+
+    let mut object_start = idx;
+    while object_start > 0 {
+        let prev = bytes[object_start - 1];
+        if prev == b'.' || prev == b'`' || is_identifier_byte(Some(prev)) {
+            object_start -= 1;
+        } else {
+            break;
+        }
+    }
+
+    let keyword_end = skip_ascii_whitespace_back(bytes, object_start);
+    if keyword_end == 0 || !is_identifier_byte(bytes.get(keyword_end - 1).copied()) {
+        return false;
+    }
+    let mut keyword_start = keyword_end;
+    while keyword_start > 0 && is_identifier_byte(bytes.get(keyword_start - 1).copied()) {
+        keyword_start -= 1;
+    }
+    matches_relation_intro_keyword(&bytes[keyword_start..keyword_end])
+}
+
+fn skip_ascii_whitespace_back(bytes: &[u8], mut idx: usize) -> usize {
+    while idx > 0 && bytes[idx - 1].is_ascii_whitespace() {
+        idx -= 1;
+    }
+    idx
+}
+
+fn matches_relation_intro_keyword(bytes: &[u8]) -> bool {
+    bytes.eq_ignore_ascii_case(b"from") || bytes.eq_ignore_ascii_case(b"join")
 }
 
 /// Rewrite `FOR VERSION AS OF '<ref_name>'` → `FOR SYSTEM_TIME AS OF '__nr_ref:<ref_name>'`
@@ -3048,6 +3189,39 @@ mod tests {
         let input = "SELECT * FROM t$snapshots AS s";
         let got = super::normalize_for_raw_parse(input).expect("normalize");
         assert_eq!(got, "SELECT * FROM t.__nr_meta_snapshots__ AS s");
+    }
+
+    #[test]
+    fn starrocks_meta_table_suffix_is_stripped() {
+        let cases = [
+            ("SELECT count(*) FROM t0[_META_]", "SELECT count(*) FROM t0"),
+            (
+                "SELECT count(*) FROM db.t0[_META_] AS m",
+                "SELECT count(*) FROM db.t0 AS m",
+            ),
+            (
+                "SELECT count(*) FROM ice.db.t0[_meta_]",
+                "SELECT count(*) FROM ice.db.t0",
+            ),
+        ];
+        for (input, expected) in cases {
+            let got = super::normalize_for_raw_parse(input).expect("normalize");
+            assert_eq!(got, expected, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn starrocks_meta_table_suffix_inside_string_literal_is_left_alone() {
+        let input = "SELECT 't0[_META_]' FROM t0";
+        let got = super::normalize_for_raw_parse(input).expect("normalize");
+        assert_eq!(got, input);
+    }
+
+    #[test]
+    fn starrocks_meta_table_suffix_in_expression_is_left_alone() {
+        let input = "SELECT c[_META_] FROM t0";
+        let got = super::normalize_for_raw_parse(input).expect("normalize");
+        assert_eq!(got, input);
     }
 
     // ----- rewrite_overwrite_partitions tests -----
