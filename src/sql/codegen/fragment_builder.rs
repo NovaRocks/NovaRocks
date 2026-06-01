@@ -152,6 +152,84 @@ fn validate_aggregate_state_merge_child_output(
     Ok(())
 }
 
+fn aggregate_state_shaped_output_columns(
+    layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
+    shape: &crate::connector::starrocks::table::mv_shape::AggregateMvShape,
+) -> Result<Vec<OutputColumn>, String> {
+    use crate::connector::starrocks::table::mv_agg_state::AggregateStateRole;
+    use crate::connector::starrocks::table::mv_shape::VisibleAggregateOutput;
+
+    let mut output = Vec::with_capacity(shape.visible_outputs.len() + layout.state_columns.len());
+    for visible_output in &shape.visible_outputs {
+        match visible_output {
+            VisibleAggregateOutput::GroupKey(group_key_index) => {
+                let visible_source_index = *layout
+                    .group_key_source_indexes
+                    .get(*group_key_index)
+                    .ok_or_else(|| {
+                        format!(
+                            "AggregateStateMerge delta state-shaped output group key index {group_key_index} out of range"
+                        )
+                    })?;
+                let visible = layout.visible_columns.get(visible_source_index).ok_or_else(|| {
+                    format!(
+                        "AggregateStateMerge delta state-shaped output visible source index {visible_source_index} out of range"
+                    )
+                })?;
+                output.push(OutputColumn {
+                    name: visible.name.clone(),
+                    data_type: visible.data_type.clone(),
+                    nullable: visible.nullable,
+                });
+            }
+            VisibleAggregateOutput::Aggregate(aggregate_index) => {
+                let state_column = layout
+                    .state_columns
+                    .iter()
+                    .find(|column| {
+                        column.state_role == AggregateStateRole::Single
+                            && column.aggregate_index == *aggregate_index
+                    })
+                    .ok_or_else(|| {
+                        format!(
+                            "AggregateStateMerge delta state-shaped output missing state column for aggregate index {aggregate_index}"
+                        )
+                    })?;
+                output.push(OutputColumn {
+                    name: state_column.name.clone(),
+                    data_type: aggregate_state_shaped_data_type(state_column),
+                    nullable: false,
+                });
+            }
+        }
+    }
+    for state_column in layout
+        .state_columns
+        .iter()
+        .filter(|column| column.state_role == AggregateStateRole::RetractionCount)
+    {
+        output.push(OutputColumn {
+            name: state_column.name.clone(),
+            data_type: aggregate_state_shaped_data_type(state_column),
+            nullable: false,
+        });
+    }
+    Ok(output)
+}
+
+fn aggregate_state_shaped_data_type(
+    state_column: &crate::connector::starrocks::table::mv_agg_state::AggregateStateColumn,
+) -> DataType {
+    match state_column.state_role {
+        crate::connector::starrocks::table::mv_agg_state::AggregateStateRole::Single => {
+            DataType::Binary
+        }
+        crate::connector::starrocks::table::mv_agg_state::AggregateStateRole::RetractionCount => {
+            state_column.data_type.clone()
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Scan/join ownership metadata (used by RF planning)
 // ---------------------------------------------------------------------------
@@ -588,6 +666,12 @@ impl<'a> PlanFragmentBuilder<'a> {
             "old",
             &old_input.output_columns,
             &physical_columns,
+        )?;
+        let delta_state_columns = aggregate_state_shaped_output_columns(&layout, &shape)?;
+        validate_aggregate_state_merge_child_output(
+            "delta state-shaped",
+            &delta_state_input.output_columns,
+            &delta_state_columns,
         )?;
         let delta_input = Box::new(crate::sql::codegen::PlanBuildResult {
             plan: plan_nodes::TPlan::new(Vec::new()),
@@ -4810,12 +4894,24 @@ mod tests {
 
     fn aggregate_merge_shape_for_test()
     -> crate::connector::starrocks::table::mv_shape::AggregateMvShape {
-        let dialect = sqlparser::dialect::GenericDialect {};
-        let statements = sqlparser::parser::Parser::parse_sql(
-            &dialect,
+        aggregate_merge_shape_for_sql(
             "select region, count(*) as c, sum(amount) as s from ice.ns.orders group by region",
         )
-        .expect("parse aggregate shape query");
+    }
+
+    fn aggregate_sum_only_merge_shape_for_test()
+    -> crate::connector::starrocks::table::mv_shape::AggregateMvShape {
+        aggregate_merge_shape_for_sql(
+            "select region, sum(amount) as s from ice.ns.orders group by region",
+        )
+    }
+
+    fn aggregate_merge_shape_for_sql(
+        sql: &str,
+    ) -> crate::connector::starrocks::table::mv_shape::AggregateMvShape {
+        let dialect = sqlparser::dialect::GenericDialect {};
+        let statements = sqlparser::parser::Parser::parse_sql(&dialect, sql)
+            .expect("parse aggregate shape query");
         let sqlparser::ast::Statement::Query(query) =
             statements.into_iter().next().expect("one query")
         else {
@@ -4846,6 +4942,19 @@ mod tests {
         .expect("aggregate layout")
     }
 
+    fn aggregate_sum_only_merge_layout_for_test(
+        shape: &crate::connector::starrocks::table::mv_shape::AggregateMvShape,
+    ) -> crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout {
+        crate::connector::starrocks::table::mv_agg_state::build_aggregate_mv_layout(
+            shape,
+            &[
+                output_col_for_test(1, "region", DataType::Utf8, true),
+                output_col_for_test(2, "s", DataType::Int64, true),
+            ],
+        )
+        .expect("sum-only aggregate layout")
+    }
+
     fn aggregate_merge_plan_for_test(
         old_child: PhysicalPlanNode,
         delta_child: PhysicalPlanNode,
@@ -4856,6 +4965,29 @@ mod tests {
             output_col_for_test(2, "c", DataType::Int64, false),
             output_col_for_test(3, "s", DataType::Int64, true),
             output_col_for_test(4, "__change_op", DataType::Int8, false),
+        ];
+        PhysicalPlanNode {
+            op: Operator::PhysicalAggregateStateMerge(AggregateStateMergeOp {
+                group_key_names: vec!["region".to_string()],
+                aggregate_state_names,
+                change_op_column: crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
+                output_columns: output_columns.clone(),
+            }),
+            children: vec![old_child, delta_child],
+            stats: stats_for_test(),
+            output_columns,
+        }
+    }
+
+    fn aggregate_sum_only_merge_plan_for_test(
+        old_child: PhysicalPlanNode,
+        delta_child: PhysicalPlanNode,
+        aggregate_state_names: Vec<String>,
+    ) -> PhysicalPlanNode {
+        let output_columns = vec![
+            output_col_for_test(1, "region", DataType::Utf8, true),
+            output_col_for_test(2, "s", DataType::Int64, true),
+            output_col_for_test(3, "__change_op", DataType::Int8, false),
         ];
         PhysicalPlanNode {
             op: Operator::PhysicalAggregateStateMerge(AggregateStateMergeOp {
@@ -4884,8 +5016,26 @@ mod tests {
     fn aggregate_delta_state_columns_for_test() -> Vec<OutputColumn> {
         vec![
             output_col_for_test(21, "region", DataType::Utf8, true),
-            output_col_for_test(22, "__agg_state_c", DataType::Binary, true),
-            output_col_for_test(23, "__agg_state_s", DataType::Binary, true),
+            output_col_for_test(22, "__agg_state_c", DataType::Binary, false),
+            output_col_for_test(23, "__agg_state_s", DataType::Binary, false),
+        ]
+    }
+
+    fn aggregate_sum_only_physical_columns_for_test() -> Vec<OutputColumn> {
+        vec![
+            output_col_for_test(10, "__row_id__", DataType::Utf8, false),
+            output_col_for_test(11, "region", DataType::Utf8, true),
+            output_col_for_test(12, "s", DataType::Int64, true),
+            output_col_for_test(13, "__agg_state_s", DataType::Binary, false),
+            output_col_for_test(14, "__agg_state___ivm_row_count", DataType::Int64, false),
+        ]
+    }
+
+    fn aggregate_sum_only_delta_state_columns_for_test() -> Vec<OutputColumn> {
+        vec![
+            output_col_for_test(21, "region", DataType::Utf8, true),
+            output_col_for_test(22, "__agg_state_s", DataType::Binary, false),
+            output_col_for_test(23, "__agg_state___ivm_row_count", DataType::Int64, false),
         ]
     }
 
@@ -4999,6 +5149,71 @@ mod tests {
             delta_input.direct_exec.as_deref(),
             Some(DirectExecPlan::AggregateStatePhysicalize { .. })
         ));
+    }
+
+    #[test]
+    fn aggregate_state_merge_direct_codegen_keeps_sum_only_hidden_retraction_state() {
+        let shape = aggregate_sum_only_merge_shape_for_test();
+        let layout = aggregate_sum_only_merge_layout_for_test(&shape);
+        let state_names = layout
+            .state_columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        let plan = aggregate_sum_only_merge_plan_for_test(
+            values_plan_for_test(aggregate_sum_only_physical_columns_for_test()),
+            values_plan_for_test(aggregate_sum_only_delta_state_columns_for_test()),
+            state_names,
+        );
+
+        let build = PlanFragmentBuilder::build_aggregate_state_merge_direct_with_layout(
+            &plan,
+            &DummyCatalog,
+            &crate::connector::ConnectorRegistry::default(),
+            "db",
+            None,
+            shape,
+            layout,
+        )
+        .expect("direct sum-only aggregate merge build");
+        let root = build
+            .fragment_results
+            .into_iter()
+            .next()
+            .expect("root fragment");
+        let Some(direct) = root.direct_exec else {
+            panic!("expected direct exec plan");
+        };
+        let DirectExecPlan::AggregateStateMerge { delta_input, .. } = *direct else {
+            panic!("expected aggregate state merge direct plan");
+        };
+        assert_eq!(
+            delta_input
+                .output_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "__row_id__",
+                "region",
+                "s",
+                "__agg_state_s",
+                "__agg_state___ivm_row_count"
+            ]
+        );
+        let Some(DirectExecPlan::AggregateStatePhysicalize { input, .. }) =
+            delta_input.direct_exec.as_deref()
+        else {
+            panic!("expected aggregate state physicalize direct plan");
+        };
+        assert_eq!(
+            input
+                .output_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["region", "__agg_state_s", "__agg_state___ivm_row_count"]
+        );
     }
 
     #[test]

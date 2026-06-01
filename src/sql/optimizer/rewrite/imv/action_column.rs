@@ -10,7 +10,7 @@ use std::sync::atomic::AtomicBool;
 use arrow::datatypes::DataType;
 
 use crate::engine::mv::iceberg_target_apply::ICEBERG_MV_APPLY_KEY_COLUMN;
-use crate::sql::analysis::{JoinKind, OutputColumn};
+use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn};
 use crate::sql::catalog::ScanSource;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
@@ -188,6 +188,17 @@ fn validate_state_merge_delta_input(plan: &LogicalPlan) -> Result<(), String> {
         LogicalPlan::Aggregate(node) if is_signed_state_aggregate(node) => {
             validate_signed_delta_input(&node.input)
         }
+        LogicalPlan::Project(project)
+            if matches!(
+                project.input.as_ref(),
+                LogicalPlan::Aggregate(node) if is_signed_state_aggregate(node)
+            ) =>
+        {
+            let LogicalPlan::Aggregate(node) = project.input.as_ref() else {
+                unreachable!();
+            };
+            validate_signed_delta_input(&node.input)
+        }
         _ => validate_node(plan),
     }
 }
@@ -197,7 +208,19 @@ fn is_signed_state_aggregate(node: &crate::sql::planner::plan::AggregateNode) ->
         && node
             .aggregates
             .iter()
-            .all(|call| call.name.ends_with("_state_signed"))
+            .any(|call| call.name.ends_with("_state_signed"))
+        && node.aggregates.iter().all(|call| {
+            call.name.ends_with("_state_signed") || is_hidden_retraction_count_call(call)
+        })
+}
+
+fn is_hidden_retraction_count_call(call: &crate::sql::planner::plan::AggregateCall) -> bool {
+    call.name.eq_ignore_ascii_case("sum")
+        && call.args.len() == 1
+        && matches!(
+            &call.args[0].kind,
+            ExprKind::ColumnRef { column, .. } if column.eq_ignore_ascii_case(ImvActionColumn::NAME)
+        )
 }
 
 fn validate_signed_delta_input(plan: &LogicalPlan) -> Result<(), String> {

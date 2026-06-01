@@ -134,8 +134,9 @@ pub struct IcebergTableInfo {
 /// planner-safe metadata for the MV's own target state — catalog identity,
 /// column definitions, and the aggregate/join logical contract. It has no
 /// execution or catalog handles and is designed to be inspectable during
-/// analyzer/optimizer phases without triggering runtime behavior. Future
-/// tasks will implement the optimizer rewrite and execution path.
+/// analyzer/optimizer phases without triggering runtime behavior. The
+/// standalone refresh codegen lowers this source into the local target-state
+/// scan used by aggregate-state merge execution.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct IcebergMvTargetStateScan {
     pub(crate) catalog: String,

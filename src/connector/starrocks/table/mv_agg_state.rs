@@ -477,6 +477,7 @@ fn materialize_aggregate_result_batch(
     layout: &AggregateMvLayout,
     shape: &AggregateMvShape,
 ) -> Result<Chunk, String> {
+    validate_state_shaped_input_schema(batch, layout, shape)?;
     let (group_key_batch_cols, state_col_batch_cols) = compute_batch_col_indexes(shape, layout);
 
     let expected = shape.group_keys.len() + layout.state_columns.len();
@@ -557,6 +558,107 @@ fn materialize_aggregate_result_batch(
     let physical_batch = RecordBatch::try_new(Arc::new(physical_schema(layout)), arrays)
         .map_err(|e| format!("build aggregate MV physical batch failed: {e}"))?;
     record_batch_to_chunk(physical_batch)
+}
+
+fn validate_state_shaped_input_schema(
+    batch: &RecordBatch,
+    layout: &AggregateMvLayout,
+    shape: &AggregateMvShape,
+) -> Result<(), String> {
+    let expected = state_shaped_input_fields(layout, shape)?;
+    if batch.num_columns() != expected.len() {
+        return Ok(());
+    }
+    let actual = batch.schema();
+    for (index, expected_field) in expected.iter().enumerate() {
+        let actual_field = actual.field(index);
+        if !actual_field
+            .name()
+            .eq_ignore_ascii_case(expected_field.name())
+            || actual_field.data_type() != expected_field.data_type()
+            || actual_field.is_nullable() != expected_field.is_nullable()
+        {
+            return Err(format!(
+                "aggregate MV state-shaped input schema mismatch at column {index}: got {}:{:?}:{} expected {}:{:?}:{}",
+                actual_field.name(),
+                actual_field.data_type(),
+                actual_field.is_nullable(),
+                expected_field.name(),
+                expected_field.data_type(),
+                expected_field.is_nullable()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn state_shaped_input_fields(
+    layout: &AggregateMvLayout,
+    shape: &AggregateMvShape,
+) -> Result<Vec<Field>, String> {
+    let mut fields = Vec::with_capacity(shape.visible_outputs.len() + layout.state_columns.len());
+    for output in &shape.visible_outputs {
+        match output {
+            VisibleAggregateOutput::GroupKey(group_key_index) => {
+                let visible_source_index = *layout
+                    .group_key_source_indexes
+                    .get(*group_key_index)
+                    .ok_or_else(|| {
+                        format!(
+                            "aggregate MV state-shaped schema group key index {group_key_index} out of range"
+                        )
+                    })?;
+                let visible = layout.visible_columns.get(visible_source_index).ok_or_else(|| {
+                    format!(
+                        "aggregate MV state-shaped schema visible source index {visible_source_index} out of range"
+                    )
+                })?;
+                fields.push(Field::new(
+                    &visible.name,
+                    visible.data_type.clone(),
+                    visible.nullable,
+                ));
+            }
+            VisibleAggregateOutput::Aggregate(aggregate_index) => {
+                let state_column = layout
+                    .state_columns
+                    .iter()
+                    .find(|column| {
+                        column.state_role == AggregateStateRole::Single
+                            && column.aggregate_index == *aggregate_index
+                    })
+                    .ok_or_else(|| {
+                        format!(
+                            "aggregate MV state-shaped schema missing state column for aggregate index {aggregate_index}"
+                        )
+                    })?;
+                fields.push(Field::new(
+                    &state_column.name,
+                    state_shaped_state_data_type(state_column),
+                    false,
+                ));
+            }
+        }
+    }
+    for state_column in layout
+        .state_columns
+        .iter()
+        .filter(|column| column.state_role == AggregateStateRole::RetractionCount)
+    {
+        fields.push(Field::new(
+            &state_column.name,
+            state_shaped_state_data_type(state_column),
+            false,
+        ));
+    }
+    Ok(fields)
+}
+
+fn state_shaped_state_data_type(state_column: &AggregateStateColumn) -> DataType {
+    match state_column.state_role {
+        AggregateStateRole::Single => DataType::Binary,
+        AggregateStateRole::RetractionCount => state_column.data_type.clone(),
+    }
 }
 
 /// Compute the batch column indexes for group keys and state columns in a state-shaped
@@ -2811,6 +2913,48 @@ mod tests {
         assert_eq!(
             decode_avg_int64(state.value(0)).expect("decode avg state"),
             (4, 30)
+        );
+    }
+
+    #[test]
+    fn materialize_aggregate_result_rejects_state_shaped_order_mismatch() {
+        let shape = sum_only_shape();
+        let output_columns = vec![
+            OutputColumn {
+                column_id: ColumnId::UNSET,
+                name: "k1".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                is_internal: false,
+            },
+            OutputColumn {
+                column_id: ColumnId::UNSET,
+                name: "s".to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+                is_internal: false,
+            },
+        ];
+        let layout = build_aggregate_mv_layout(&shape, &output_columns).expect("layout");
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("k1", DataType::Int64, false),
+                Field::new(AGG_RETRACTION_COUNT_STATE_COLUMN, DataType::Int64, false),
+                Field::new("__agg_state_s", DataType::Binary, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1_i64])) as ArrayRef,
+                binary_state_array(vec![Some(encode_sum_int64(1, 10))]),
+            ],
+        )
+        .expect("state-shaped batch");
+
+        let err = materialize_aggregate_result_batch(&batch, &layout, &shape)
+            .expect_err("state-shaped order mismatch must fail");
+        assert!(
+            err.contains("aggregate MV state-shaped input schema mismatch"),
+            "{err}"
         );
     }
 

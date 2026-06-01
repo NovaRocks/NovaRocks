@@ -166,13 +166,22 @@ mod tests {
         contract.aggregate = Some(AggregateStateContract {
             state_layout_version: 1,
             row_id_column_name: "__row_id__".to_string(),
-            state_columns: vec![AggregateStateColumnContract {
-                column_name: "__agg_state_s".to_string(),
-                target_field_id: 200,
-                type_signature: "binary".to_string(),
-                nullable: true,
-                role: AggregateStateRoleContract::Single,
-            }],
+            state_columns: vec![
+                AggregateStateColumnContract {
+                    column_name: "__agg_state_s".to_string(),
+                    target_field_id: 200,
+                    type_signature: "binary".to_string(),
+                    nullable: true,
+                    role: AggregateStateRoleContract::Single,
+                },
+                AggregateStateColumnContract {
+                    column_name: "__agg_state___ivm_row_count".to_string(),
+                    target_field_id: 201,
+                    type_signature: "long".to_string(),
+                    nullable: false,
+                    role: AggregateStateRoleContract::RetractionCount,
+                },
+            ],
         });
         mv_def.schema_contract = Some(contract.clone());
         let target_schema = Arc::new(
@@ -198,6 +207,11 @@ mod tests {
                         200,
                         "__agg_state_s",
                         Type::Primitive(PrimitiveType::Binary),
+                    )),
+                    Arc::new(NestedField::required(
+                        201,
+                        "__agg_state___ivm_row_count",
+                        Type::Primitive(PrimitiveType::Long),
                     )),
                 ])
                 .build()
@@ -346,13 +360,22 @@ mod tests {
         contract.aggregate = Some(AggregateStateContract {
             state_layout_version: 1,
             row_id_column_name: "__row_id__".to_string(),
-            state_columns: vec![AggregateStateColumnContract {
-                column_name: "__agg_state_s".to_string(),
-                target_field_id: 200,
-                type_signature: "binary".to_string(),
-                nullable: true,
-                role: AggregateStateRoleContract::Single,
-            }],
+            state_columns: vec![
+                AggregateStateColumnContract {
+                    column_name: "__agg_state_s".to_string(),
+                    target_field_id: 200,
+                    type_signature: "binary".to_string(),
+                    nullable: true,
+                    role: AggregateStateRoleContract::Single,
+                },
+                AggregateStateColumnContract {
+                    column_name: "__agg_state___ivm_row_count".to_string(),
+                    target_field_id: 201,
+                    type_signature: "long".to_string(),
+                    nullable: false,
+                    role: AggregateStateRoleContract::RetractionCount,
+                },
+            ],
         });
         mv_def.schema_contract = Some(contract.clone());
         let target_schema = Arc::new(
@@ -378,6 +401,11 @@ mod tests {
                         200,
                         "__agg_state_s",
                         Type::Primitive(PrimitiveType::Binary),
+                    )),
+                    Arc::new(NestedField::required(
+                        201,
+                        "__agg_state___ivm_row_count",
+                        Type::Primitive(PrimitiveType::Long),
                     )),
                 ])
                 .build()
@@ -1071,8 +1099,11 @@ mod tests {
         else {
             panic!("expected AggregateStateMerge");
         };
-        let LogicalPlan::Aggregate(delta_aggregate) = delta_input.as_ref() else {
-            panic!("expected signed aggregate delta input");
+        let LogicalPlan::Project(delta_project) = delta_input.as_ref() else {
+            panic!("expected signed aggregate projection delta input");
+        };
+        let LogicalPlan::Aggregate(delta_aggregate) = delta_project.input.as_ref() else {
+            panic!("expected signed aggregate under projection");
         };
         assert_eq!(delta_aggregate.aggregates[0].name, "sum_state_signed");
         let LogicalPlan::Scan(scan) = delta_aggregate.input.as_ref() else {
@@ -1127,8 +1158,11 @@ mod tests {
             !plan_contains_imv_marker(&delta_input),
             "final delta input must not contain unresolved IMV markers"
         );
-        let LogicalPlan::Aggregate(delta_aggregate) = delta_input.as_ref() else {
-            panic!("expected signed aggregate delta input");
+        let LogicalPlan::Project(delta_project) = delta_input.as_ref() else {
+            panic!("expected signed aggregate projection delta input");
+        };
+        let LogicalPlan::Aggregate(delta_aggregate) = delta_project.input.as_ref() else {
+            panic!("expected signed aggregate under projection");
         };
         assert_eq!(delta_aggregate.aggregates[0].name, "sum_state_signed");
         let signed_action_id = signed_action_column_id(delta_aggregate);
@@ -1161,8 +1195,11 @@ mod tests {
         else {
             panic!("expected AggregateStateMerge after query rewrite");
         };
-        let LogicalPlan::Aggregate(delta_aggregate) = delta_input.as_ref() else {
-            panic!("expected signed aggregate delta input");
+        let LogicalPlan::Project(delta_project) = delta_input.as_ref() else {
+            panic!("expected signed aggregate projection delta input");
+        };
+        let LogicalPlan::Aggregate(delta_aggregate) = delta_project.input.as_ref() else {
+            panic!("expected signed aggregate under projection");
         };
         let signed_action_id = signed_action_column_id(delta_aggregate);
 

@@ -550,6 +550,74 @@ mod tests {
         assert_eq!(int64_value(&output, "s", 1), 200);
     }
 
+    #[test]
+    fn merge_pipeline_physicalizes_sum_only_delta_with_hidden_retraction_count() {
+        let layout = aggregate_sum_only_layout_for_test();
+        let old = aggregate_sum_only_physical_chunk_for_test(vec![("east", 2_i64, 300_i64)]);
+        let delta_state =
+            sum_only_state_shaped_delta_chunk_for_test(vec![("east", -1_i64, -100_i64)]);
+        let plan = ExecPlan {
+            arena: ExprArena::default(),
+            root: ExecNode {
+                kind: ExecNodeKind::AggregateStateMerge(AggregateStateMergePlan {
+                    old_input: Box::new(ExecNode {
+                        kind: ExecNodeKind::Values(ValuesNode {
+                            chunk: old,
+                            node_id: 1,
+                        }),
+                    }),
+                    delta_input: Box::new(ExecNode {
+                        kind: ExecNodeKind::AggregateStatePhysicalize(
+                            AggregateStatePhysicalizePlan {
+                                input: Box::new(ExecNode {
+                                    kind: ExecNodeKind::Values(ValuesNode {
+                                        chunk: delta_state,
+                                        node_id: 2,
+                                    }),
+                                }),
+                                layout: layout.clone(),
+                                shape: aggregate_sum_only_shape_for_test(),
+                            },
+                        ),
+                    }),
+                    layout,
+                }),
+            },
+        };
+
+        let handle = ResultSinkHandle::new();
+        execute_plan_with_pipeline(
+            plan,
+            false,
+            std::time::Duration::from_millis(10),
+            Box::new(ResultSinkFactory::new(handle.clone())),
+            None,
+            None,
+            1,
+            Arc::new(RuntimeState::default()),
+            None,
+            None,
+            None,
+        )
+        .expect("execute sum-only aggregate state merge pipeline");
+        let chunks = handle.take_chunks();
+        let schema = chunks.first().expect("pipeline output").batch.schema();
+        let batches = chunks
+            .iter()
+            .map(|chunk| chunk.batch.clone())
+            .collect::<Vec<_>>();
+        let output = record_batch_to_chunk(
+            concat_batches(&schema, batches.iter()).expect("concat pipeline output"),
+        )
+        .expect("output chunk");
+
+        assert_eq!(output.batch.num_rows(), 2);
+        assert_eq!(int8_value(&output, "__change_op", 0), CHANGE_OP_DELETE);
+        assert_eq!(int64_value(&output, "s", 0), 300);
+        assert_eq!(int8_value(&output, "__change_op", 1), CHANGE_OP_INSERT);
+        assert_eq!(int64_value(&output, "s", 1), 200);
+    }
+
     fn run_merge_operator_for_test(
         old_chunks: Vec<Chunk>,
         delta_chunks: Vec<Chunk>,
@@ -651,8 +719,8 @@ mod tests {
     }
 
     fn state_shaped_delta_chunk_for_test(rows: Vec<(&str, i64, i64)>) -> Chunk {
-        let mut count_state = LargeBinaryBuilder::new();
-        let mut sum_state = LargeBinaryBuilder::new();
+        let mut count_state = arrow::array::BinaryBuilder::new();
+        let mut sum_state = arrow::array::BinaryBuilder::new();
         for (_, c, s) in &rows {
             count_state.append_value(encode_count_state(*c));
             sum_state.append_value(encode_sum_int64(*c, *s));
@@ -660,8 +728,8 @@ mod tests {
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("region", DataType::Utf8, true),
-                Field::new("__agg_state_c", DataType::LargeBinary, false),
-                Field::new("__agg_state_s", DataType::LargeBinary, false),
+                Field::new("__agg_state_c", DataType::Binary, false),
+                Field::new("__agg_state_s", DataType::Binary, false),
             ])),
             vec![
                 Arc::new(StringArray::from(
@@ -675,6 +743,70 @@ mod tests {
         )
         .expect("state-shaped delta batch");
         record_batch_to_chunk(batch).expect("state-shaped delta chunk")
+    }
+
+    fn sum_only_state_shaped_delta_chunk_for_test(rows: Vec<(&str, i64, i64)>) -> Chunk {
+        let mut sum_state = arrow::array::BinaryBuilder::new();
+        for (_, c, s) in &rows {
+            sum_state.append_value(encode_sum_int64(*c, *s));
+        }
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("region", DataType::Utf8, true),
+                Field::new("__agg_state_s", DataType::Binary, false),
+                Field::new("__agg_state___ivm_row_count", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter()
+                        .map(|(region, _, _)| *region)
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(sum_state.finish()) as ArrayRef,
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(_, c, _)| *c).collect::<Vec<_>>(),
+                )) as ArrayRef,
+            ],
+        )
+        .expect("sum-only state-shaped delta batch");
+        record_batch_to_chunk(batch).expect("sum-only state-shaped delta chunk")
+    }
+
+    fn aggregate_sum_only_physical_chunk_for_test(rows: Vec<(&str, i64, i64)>) -> Chunk {
+        let mut sum_state = LargeBinaryBuilder::new();
+        for (_, c, s) in &rows {
+            sum_state.append_value(encode_sum_int64(*c, *s));
+        }
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("__row_id__", DataType::Utf8, false),
+                Field::new("region", DataType::Utf8, true),
+                Field::new("s", DataType::Int64, true),
+                Field::new("__agg_state_s", DataType::LargeBinary, false),
+                Field::new("__agg_state___ivm_row_count", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter()
+                        .map(|(region, _, _)| row_id_for_region(region))
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(StringArray::from(
+                    rows.iter()
+                        .map(|(region, _, _)| *region)
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(_, _, s)| *s).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(sum_state.finish()) as ArrayRef,
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(_, c, _)| *c).collect::<Vec<_>>(),
+                )) as ArrayRef,
+            ],
+        )
+        .expect("sum-only physical batch");
+        record_batch_to_chunk(batch).expect("sum-only physical chunk")
     }
 
     fn physical_chunk_for_test(rows: Vec<(&str, i64, i64)>, _delta: Option<()>) -> Chunk {
@@ -809,13 +941,98 @@ mod tests {
         }
     }
 
+    fn aggregate_sum_only_layout_for_test() -> AggregateMvLayout {
+        let visible_columns = vec![
+            AggregateVisibleColumn {
+                name: "region".to_string(),
+                data_type: DataType::Utf8,
+                sql_type: SqlType::String,
+                nullable: true,
+                source_index: 0,
+            },
+            AggregateVisibleColumn {
+                name: "s".to_string(),
+                data_type: DataType::Int64,
+                sql_type: SqlType::BigInt,
+                nullable: true,
+                source_index: 1,
+            },
+        ];
+        let state_columns = vec![
+            AggregateStateColumn {
+                name: "__agg_state_s".to_string(),
+                data_type: DataType::LargeBinary,
+                sql_type: SqlType::Binary,
+                nullable: false,
+                visible_source_index: 1,
+                aggregate_index: 0,
+                function: AggregateFunctionKind::Sum,
+                state_role: AggregateStateRole::Single,
+                count_star: false,
+            },
+            AggregateStateColumn {
+                name: "__agg_state___ivm_row_count".to_string(),
+                data_type: DataType::Int64,
+                sql_type: SqlType::BigInt,
+                nullable: false,
+                visible_source_index: 0,
+                aggregate_index: 1,
+                function: AggregateFunctionKind::Count,
+                state_role: AggregateStateRole::RetractionCount,
+                count_star: true,
+            },
+        ];
+        let mut physical_columns = vec![starrocks_physical_column(
+            "__row_id__".to_string(),
+            SqlType::String,
+            false,
+            false,
+            true,
+        )];
+        physical_columns.extend(visible_columns.iter().map(|column| {
+            starrocks_physical_column(
+                column.name.clone(),
+                column.sql_type.clone(),
+                column.nullable,
+                true,
+                false,
+            )
+        }));
+        physical_columns.extend(state_columns.iter().map(|column| {
+            starrocks_physical_column(
+                column.name.clone(),
+                column.sql_type.clone(),
+                column.nullable,
+                false,
+                false,
+            )
+        }));
+        AggregateMvLayout {
+            row_id_column: physical_columns[0].clone(),
+            visible_columns,
+            state_columns,
+            aggregate_input_types: vec![Some(DataType::Int64)],
+            group_key_source_indexes: vec![0],
+            physical_columns,
+        }
+    }
+
     fn aggregate_shape_for_test() -> AggregateMvShape {
-        let dialect = sqlparser::dialect::GenericDialect {};
-        let statements = sqlparser::parser::Parser::parse_sql(
-            &dialect,
+        aggregate_shape_for_sql(
             "select region, count(*) as c, sum(amount) as s from ice.ns.orders group by region",
         )
-        .expect("parse aggregate shape query");
+    }
+
+    fn aggregate_sum_only_shape_for_test() -> AggregateMvShape {
+        aggregate_shape_for_sql(
+            "select region, sum(amount) as s from ice.ns.orders group by region",
+        )
+    }
+
+    fn aggregate_shape_for_sql(sql: &str) -> AggregateMvShape {
+        let dialect = sqlparser::dialect::GenericDialect {};
+        let statements = sqlparser::parser::Parser::parse_sql(&dialect, sql)
+            .expect("parse aggregate shape query");
         let sqlparser::ast::Statement::Query(query) =
             statements.into_iter().next().expect("one query")
         else {

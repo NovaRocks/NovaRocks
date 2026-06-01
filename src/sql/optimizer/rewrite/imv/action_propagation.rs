@@ -142,7 +142,19 @@ fn is_signed_state_aggregate(node: &AggregateNode) -> bool {
         && node
             .aggregates
             .iter()
-            .all(|call| call.name.ends_with("_state_signed"))
+            .any(|call| call.name.ends_with("_state_signed"))
+        && node.aggregates.iter().all(|call| {
+            call.name.ends_with("_state_signed") || is_hidden_retraction_count_call(call)
+        })
+}
+
+fn is_hidden_retraction_count_call(call: &crate::sql::planner::plan::AggregateCall) -> bool {
+    call.name.eq_ignore_ascii_case("sum")
+        && call.args.len() == 1
+        && matches!(
+            &call.args[0].kind,
+            ExprKind::ColumnRef { column, .. } if column.eq_ignore_ascii_case(ImvActionColumn::NAME)
+        )
 }
 
 // ---------------------------------------------------------------------------
