@@ -45,6 +45,7 @@ use crate::sql::optimizer::operator::{
     PhysicalValuesOp, PhysicalWindowOp, ScanDictionaryColumn,
 };
 use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
+use crate::sql::optimizer::property::{OrderingSpec, window_ordering_spec};
 
 use crate::sql::analysis::{ExprKind, JoinKind, LiteralValue, TypedExpr};
 use crate::sql::planner::plan::AggregateCall;
@@ -63,6 +64,9 @@ struct VisitResult {
     /// Exchange nodes in this fragment that consume from CTE fragments:
     /// `(cte_id, exchange_node_id)`.
     cte_exchange_nodes: Vec<(CteId, i32)>,
+    /// Physical ordering currently provided by this subtree, if it can be
+    /// represented by column ids.
+    ordering: OrderingSpec,
 }
 
 fn limit_child_can_apply_offset_locally(child: &PhysicalPlanNode) -> bool {
@@ -890,6 +894,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             scope,
             tuple_ids: vec![scan_tuple_id],
             cte_exchange_nodes: Vec::new(),
+            ordering: OrderingSpec::Any,
         })
     }
 
@@ -1109,6 +1114,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             scope: decode_scope,
             tuple_ids: vec![decode_tuple_id],
             cte_exchange_nodes: child.cte_exchange_nodes,
+            ordering: OrderingSpec::Any,
         })
     }
 
@@ -1218,6 +1224,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             scope: project_scope,
             tuple_ids: vec![project_tuple_id],
             cte_exchange_nodes: child.cte_exchange_nodes,
+            ordering: OrderingSpec::Any,
         })
     }
 
@@ -1392,6 +1399,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             scope: merged_scope,
             tuple_ids: merged_tuple_ids,
             cte_exchange_nodes,
+            ordering: OrderingSpec::Any,
         })
     }
 
@@ -1482,6 +1490,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             scope: merged_scope,
             tuple_ids: merged_tuple_ids,
             cte_exchange_nodes,
+            ordering: OrderingSpec::Any,
         })
     }
 
@@ -1701,6 +1710,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             scope: agg_scope,
             tuple_ids: vec![agg_tuple_id],
             cte_exchange_nodes: child.cte_exchange_nodes,
+            ordering: OrderingSpec::Any,
         })
     }
 
@@ -1805,6 +1815,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             scope: child.scope,
             tuple_ids: child.tuple_ids,
             cte_exchange_nodes: child.cte_exchange_nodes,
+            ordering: OrderingSpec::from_sort_items(&op.items),
         })
     }
 
@@ -1903,6 +1914,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             scope: child.scope,
             tuple_ids: child.tuple_ids,
             cte_exchange_nodes: child.cte_exchange_nodes,
+            ordering: OrderingSpec::from_sort_items(&op.items),
         })
     }
 
@@ -1927,6 +1939,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             scope: child_scope,
             tuple_ids: child_tuple_ids,
             cte_exchange_nodes,
+            ordering: _,
         } = child;
 
         // PARTIAL should have emitted a SORT_NODE at the head.
@@ -2006,6 +2019,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             scope: child_scope,
             tuple_ids: child_tuple_ids,
             cte_exchange_nodes: Vec::new(),
+            ordering: OrderingSpec::from_sort_items(&op.items),
         })
     }
 
@@ -2068,6 +2082,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             scope: child_scope,
             tuple_ids: child_tuple_ids,
             cte_exchange_nodes,
+            ordering: _,
         } = child;
 
         let gather_spec = crate::sql::optimizer::property::DistributionSpec::Gather;
@@ -2125,6 +2140,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             scope: child_scope,
             tuple_ids: child_tuple_ids,
             cte_exchange_nodes: Vec::new(),
+            ordering: OrderingSpec::Any,
         })
     }
 
@@ -2317,6 +2333,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             scope: output_scope,
             tuple_ids: child.tuple_ids,
             cte_exchange_nodes: child.cte_exchange_nodes,
+            ordering: child.ordering,
         })
     }
 
@@ -2343,25 +2360,31 @@ impl<'a> PlanFragmentBuilder<'a> {
                 .map(|&i| op.window_exprs[i].clone())
                 .collect();
             let first_win = &group_exprs[0];
+            let required_ordering =
+                window_ordering_spec(&first_win.partition_by, &first_win.order_by);
+            let has_sort_keys =
+                !first_win.partition_by.is_empty() || !first_win.order_by.is_empty();
+            let ordering_is_representable = !matches!(required_ordering, OrderingSpec::Any);
+            let needs_sort = has_sort_keys
+                && (!ordering_is_representable || !current.ordering.satisfies(&required_ordering));
 
             // Build Sort node for this group's partition+order
             let mut sort_ordering = Vec::new();
             let mut sort_is_asc = Vec::new();
             let mut sort_nulls_first_list = Vec::new();
-            for expr in &first_win.partition_by {
-                let mut compiler = ExprCompiler::new(self.slot_allocator(), &current.scope);
-                sort_ordering.push(compiler.compile_typed(expr)?);
-                sort_is_asc.push(true);
-                sort_nulls_first_list.push(true);
-            }
-            for item in &first_win.order_by {
-                let mut compiler = ExprCompiler::new(self.slot_allocator(), &current.scope);
-                sort_ordering.push(compiler.compile_typed(&item.expr)?);
-                sort_is_asc.push(item.asc);
-                sort_nulls_first_list.push(item.nulls_first);
-            }
-
-            if !sort_ordering.is_empty() {
+            if needs_sort {
+                for expr in &first_win.partition_by {
+                    let mut compiler = ExprCompiler::new(self.slot_allocator(), &current.scope);
+                    sort_ordering.push(compiler.compile_typed(expr)?);
+                    sort_is_asc.push(true);
+                    sort_nulls_first_list.push(true);
+                }
+                for item in &first_win.order_by {
+                    let mut compiler = ExprCompiler::new(self.slot_allocator(), &current.scope);
+                    sort_ordering.push(compiler.compile_typed(&item.expr)?);
+                    sort_is_asc.push(item.asc);
+                    sort_nulls_first_list.push(item.nulls_first);
+                }
                 let sort_node_id = self.alloc_node();
                 let sort_plan = nodes::build_sort_node_raw(
                     sort_node_id,
@@ -2375,6 +2398,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                 let mut pnodes = vec![sort_plan];
                 pnodes.extend(current.plan_nodes);
                 current.plan_nodes = pnodes;
+                current.ordering = required_ordering.clone();
             }
 
             // Build Analytic node for this group
@@ -2528,11 +2552,13 @@ impl<'a> PlanFragmentBuilder<'a> {
             let mut pnodes = vec![plan_node];
             pnodes.extend(current.plan_nodes);
             let cte_exchange_nodes = current.cte_exchange_nodes.clone();
+            let ordering = current.ordering.clone();
             current = VisitResult {
                 plan_nodes: pnodes,
                 scope: output_scope,
                 tuple_ids: new_tuple_ids,
                 cte_exchange_nodes,
+                ordering,
             };
         }
 
@@ -2615,6 +2641,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             scope,
             tuple_ids: vec![output_tuple_id],
             cte_exchange_nodes: Vec::new(),
+            ordering: OrderingSpec::Any,
         })
     }
 
@@ -2769,6 +2796,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             scope,
             tuple_ids: vec![output_tuple_id],
             cte_exchange_nodes: Vec::new(),
+            ordering: OrderingSpec::Any,
         })
     }
 
@@ -3042,6 +3070,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             scope: output_scope,
             tuple_ids: vec![output_tuple_id],
             cte_exchange_nodes: child.cte_exchange_nodes,
+            ordering: OrderingSpec::Any,
         })
     }
 
@@ -3281,6 +3310,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             scope: output_scope,
             tuple_ids: output_tuple_ids,
             cte_exchange_nodes: child.cte_exchange_nodes,
+            ordering: OrderingSpec::Any,
         })
     }
 
@@ -3398,6 +3428,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             scope,
             tuple_ids,
             cte_exchange_nodes,
+            ordering: _,
         } = child;
 
         let output_partition =
@@ -3449,6 +3480,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             scope,
             tuple_ids,
             cte_exchange_nodes: Vec::new(),
+            ordering: OrderingSpec::Any,
         })
     }
 
@@ -3650,6 +3682,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             scope: output_scope,
             tuple_ids: vec![output_tuple_id],
             cte_exchange_nodes,
+            ordering: OrderingSpec::Any,
         })
     }
 
@@ -3723,6 +3756,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             scope: agg_scope,
             tuple_ids: vec![agg_tuple_id],
             cte_exchange_nodes: child.cte_exchange_nodes,
+            ordering: OrderingSpec::Any,
         })
     }
 
@@ -3793,6 +3827,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             scope: child.scope,
             tuple_ids: child.tuple_ids,
             cte_exchange_nodes: Vec::new(),
+            ordering: OrderingSpec::Any,
         })
     }
 
@@ -3867,6 +3902,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             scope,
             tuple_ids: vec![exchange_tuple_id],
             cte_exchange_nodes: vec![(op.cte_id, exchange_node_id)],
+            ordering: OrderingSpec::Any,
         })
     }
 }
@@ -3958,7 +3994,8 @@ mod tests {
     use super::*;
     use crate::plan_nodes;
     use crate::sql::analysis::{
-        BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, SortItem, TypedExpr,
+        BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, SortItem, TypedExpr, WindowBound,
+        WindowFrame, WindowFrameType,
     };
     use crate::sql::catalog::{
         CatalogProvider, ColumnDef, IcebergColumnStats, IcebergDataFileInfo,
@@ -3969,11 +4006,12 @@ mod tests {
     use crate::sql::optimizer::operator::{
         JoinDistribution, Operator, PhysicalDistributionOp, PhysicalGenerateSeriesOp,
         PhysicalHashJoinEqCondition, PhysicalHashJoinOp, PhysicalScanOp, PhysicalSortOp,
-        ScanDictionaryColumn,
+        PhysicalWindowOp, ScanDictionaryColumn,
     };
     use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::statistics::Statistics;
+    use crate::sql::planner::plan::WindowExpr;
 
     fn test_iceberg_table_info_with_schema(fields: Vec<IcebergSchemaFieldDef>) -> IcebergTableInfo {
         IcebergTableInfo {
@@ -4281,6 +4319,18 @@ mod tests {
         TypedExpr {
             kind: ExprKind::ColumnRef {
                 column_id: crate::sql::column_id::ColumnId::UNSET,
+                qualifier: None,
+                column: "id".to_string(),
+            },
+            data_type: DataType::Int32,
+            nullable: false,
+        }
+    }
+
+    fn id_expr_with_column_id(column_id: crate::sql::column_id::ColumnId) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id,
                 qualifier: None,
                 column: "id".to_string(),
             },
@@ -4989,6 +5039,78 @@ mod tests {
                 .nodes
                 .iter()
                 .any(|node| { node.node_type == plan_nodes::TPlanNodeType::EXCHANGE_NODE })
+        );
+    }
+
+    #[test]
+    fn multi_group_window_reuses_child_ordering_without_redundant_sorts() {
+        let file = NamedTempFile::new().expect("temp parquet path");
+        let id = id_expr_with_column_id(crate::sql::column_id::ColumnId(1));
+        let order_by = vec![SortItem {
+            expr: id.clone(),
+            asc: true,
+            nulls_first: true,
+        }];
+        let win_rows = WindowExpr {
+            name: "sum".to_string(),
+            args: vec![id.clone()],
+            distinct: false,
+            partition_by: vec![],
+            order_by: order_by.clone(),
+            window_frame: Some(WindowFrame {
+                frame_type: WindowFrameType::Rows,
+                start: WindowBound::UnboundedPreceding,
+                end: WindowBound::CurrentRow,
+            }),
+            result_type: DataType::Int64,
+            output_name: "sum_rows".to_string(),
+            ignore_nulls: false,
+        };
+        let win_range = WindowExpr {
+            window_frame: Some(WindowFrame {
+                frame_type: WindowFrameType::Range,
+                start: WindowBound::UnboundedPreceding,
+                end: WindowBound::CurrentRow,
+            }),
+            output_name: "sum_range".to_string(),
+            ..win_rows.clone()
+        };
+        let plan = PhysicalPlanNode {
+            op: Operator::PhysicalWindow(PhysicalWindowOp {
+                window_exprs: vec![win_rows, win_range],
+                output_columns: vec![],
+            }),
+            children: vec![PhysicalPlanNode {
+                op: Operator::PhysicalSort(PhysicalSortOp {
+                    items: order_by,
+                    analytic_partition_exprs: Vec::new(),
+                }),
+                children: vec![scan_plan(file.path().to_path_buf())],
+                stats: stats(),
+                output_columns: output_columns(),
+            }],
+            stats: stats(),
+            output_columns: output_columns(),
+        };
+
+        let build =
+            PlanFragmentBuilder::build(&plan, &DummyCatalog, &mock_iceberg_registry(), "default")
+                .expect("build");
+        let root = build
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == build.root_fragment_id)
+            .expect("root fragment");
+        let sort_count = root
+            .plan
+            .nodes
+            .iter()
+            .filter(|node| node.node_type == plan_nodes::TPlanNodeType::SORT_NODE)
+            .count();
+
+        assert_eq!(
+            sort_count, 1,
+            "child ordering already satisfies both window groups"
         );
     }
 

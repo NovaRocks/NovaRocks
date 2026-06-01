@@ -1,5 +1,6 @@
 //! Physical properties for Cascades optimizer.
 
+use crate::sql::analysis::{ExprKind, SortItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Hash)]
@@ -293,6 +294,25 @@ pub(crate) enum OrderingSpec {
 }
 
 impl OrderingSpec {
+    pub(crate) fn from_sort_items(items: &[SortItem]) -> Self {
+        let mut keys = Vec::with_capacity(items.len());
+        for item in items {
+            let Some(column) = typed_expr_to_column_id(&item.expr) else {
+                return OrderingSpec::Any;
+            };
+            keys.push(SortKey {
+                column,
+                asc: item.asc,
+                nulls_first: item.nulls_first,
+            });
+        }
+        if keys.is_empty() {
+            OrderingSpec::Any
+        } else {
+            OrderingSpec::Required(keys)
+        }
+    }
+
     pub fn satisfies(&self, required: &OrderingSpec) -> bool {
         match required {
             OrderingSpec::Any => true,
@@ -307,6 +327,44 @@ impl OrderingSpec {
             }
         }
     }
+}
+
+pub(crate) fn typed_expr_to_column_id(expr: &TypedExpr) -> Option<ColumnId> {
+    match &expr.kind {
+        ExprKind::ColumnRef { column_id, .. } if *column_id != ColumnId::UNSET => Some(*column_id),
+        _ => None,
+    }
+}
+
+pub(crate) fn typed_exprs_to_column_ids(exprs: &[TypedExpr]) -> Option<Vec<ColumnId>> {
+    let mut out = Vec::with_capacity(exprs.len());
+    for expr in exprs {
+        out.push(typed_expr_to_column_id(expr)?);
+    }
+    Some(out)
+}
+
+pub(crate) fn window_sort_items(
+    partition_by: &[TypedExpr],
+    order_by: &[SortItem],
+) -> Vec<SortItem> {
+    let mut items = Vec::with_capacity(partition_by.len() + order_by.len());
+    for expr in partition_by {
+        items.push(SortItem {
+            expr: expr.clone(),
+            asc: true,
+            nulls_first: true,
+        });
+    }
+    items.extend(order_by.iter().cloned());
+    items
+}
+
+pub(crate) fn window_ordering_spec(
+    partition_by: &[TypedExpr],
+    order_by: &[SortItem],
+) -> OrderingSpec {
+    OrderingSpec::from_sort_items(&window_sort_items(partition_by, order_by))
 }
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
@@ -436,6 +494,98 @@ mod tests {
         ] {
             assert!(provided.satisfies(&DistributionSpec::Any));
         }
+    }
+
+    #[test]
+    fn ordering_prefix_satisfies_shorter_required_ordering() {
+        let provided = OrderingSpec::Required(vec![
+            SortKey {
+                column: ColumnId(1),
+                asc: true,
+                nulls_first: true,
+            },
+            SortKey {
+                column: ColumnId(2),
+                asc: false,
+                nulls_first: false,
+            },
+        ]);
+        let required = OrderingSpec::Required(vec![SortKey {
+            column: ColumnId(1),
+            asc: true,
+            nulls_first: true,
+        }]);
+
+        assert!(provided.satisfies(&required));
+    }
+
+    #[test]
+    fn ordering_rejects_direction_or_nulls_mismatch() {
+        let provided = OrderingSpec::Required(vec![SortKey {
+            column: ColumnId(1),
+            asc: true,
+            nulls_first: true,
+        }]);
+        let desc_required = OrderingSpec::Required(vec![SortKey {
+            column: ColumnId(1),
+            asc: false,
+            nulls_first: true,
+        }]);
+        let nulls_last_required = OrderingSpec::Required(vec![SortKey {
+            column: ColumnId(1),
+            asc: true,
+            nulls_first: false,
+        }]);
+
+        assert!(!provided.satisfies(&desc_required));
+        assert!(!provided.satisfies(&nulls_last_required));
+    }
+
+    #[test]
+    fn window_ordering_places_partition_keys_before_order_keys() {
+        let partition = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId(10),
+                qualifier: None,
+                column: "k".to_string(),
+            },
+            data_type: arrow::datatypes::DataType::Int32,
+            nullable: false,
+        };
+        let order = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId(20),
+                qualifier: None,
+                column: "ts".to_string(),
+            },
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+        };
+
+        let spec = window_ordering_spec(
+            &[partition],
+            &[SortItem {
+                expr: order,
+                asc: false,
+                nulls_first: false,
+            }],
+        );
+
+        assert_eq!(
+            spec,
+            OrderingSpec::Required(vec![
+                SortKey {
+                    column: ColumnId(10),
+                    asc: true,
+                    nulls_first: true,
+                },
+                SortKey {
+                    column: ColumnId(20),
+                    asc: false,
+                    nulls_first: false,
+                },
+            ])
+        );
     }
 
     #[test]

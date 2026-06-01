@@ -11,6 +11,7 @@ use crate::sql::analysis::*;
 use crate::sql::catalog::{IcebergDataFileInfo, IcebergDeleteFileContent};
 use crate::sql::codegen::helpers::typed_expr_display_name;
 use crate::sql::column_id::{ColumnId, ColumnRefFactory};
+use crate::sql::optimizer::property::OrderingSpec;
 use plan::*;
 
 /// Extract ColumnId from a TypedExpr, or allocate a new one from the factory.
@@ -912,7 +913,9 @@ fn build_window_and_project(
         // partition. This mirrors StarRocks's
         // `TSortNode.analytic_partition_exprs` mechanism.
         let analytic_partition_by = first_win.partition_by.clone();
-        let sorted_input = if sort_items.is_empty() {
+        let input_already_ordered =
+            logical_plan_satisfies_window_ordering(&input, &sort_items, &analytic_partition_by);
+        let sorted_input = if sort_items.is_empty() || input_already_ordered {
             input
         } else {
             LogicalPlan::Sort(SortNode {
@@ -943,6 +946,61 @@ fn build_window_and_project(
     } else {
         Ok(input)
     }
+}
+
+fn logical_plan_satisfies_window_ordering(
+    input: &LogicalPlan,
+    required_items: &[SortItem],
+    partition_by: &[TypedExpr],
+) -> bool {
+    match input {
+        LogicalPlan::Sort(sort) => {
+            logical_sort_satisfies_window_ordering(sort, required_items, partition_by)
+        }
+        // SubqueryAlias only changes qualifier/display metadata and preserves
+        // column ids, so a child ordering remains valid above the alias.
+        LogicalPlan::SubqueryAlias(alias) => {
+            logical_plan_satisfies_window_ordering(&alias.input, required_items, partition_by)
+        }
+        _ => false,
+    }
+}
+
+fn logical_sort_satisfies_window_ordering(
+    sort: &SortNode,
+    required_items: &[SortItem],
+    partition_by: &[TypedExpr],
+) -> bool {
+    let required = OrderingSpec::from_sort_items(required_items);
+    let provided = OrderingSpec::from_sort_items(&sort.items);
+    if matches!(required, OrderingSpec::Any) || !provided.satisfies(&required) {
+        return false;
+    }
+    // A regular ORDER BY Sort gathers globally. That is enough only for
+    // non-partitioned windows; partitioned windows need the analytic-partition
+    // tag unless the child Sort already has an equivalent tag.
+    partition_by.is_empty()
+        || OrderingSpec::from_sort_items(
+            &sort
+                .analytic_partition_by
+                .iter()
+                .map(|expr| SortItem {
+                    expr: expr.clone(),
+                    asc: true,
+                    nulls_first: true,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .satisfies(&OrderingSpec::from_sort_items(
+            &partition_by
+                .iter()
+                .map(|expr| SortItem {
+                    expr: expr.clone(),
+                    asc: true,
+                    nulls_first: true,
+                })
+                .collect::<Vec<_>>(),
+        ))
 }
 
 fn has_window_call(expr: &TypedExpr) -> bool {
@@ -2418,6 +2476,28 @@ mod tests {
         assert!(
             inner_anchor_idx > subquery_idx,
             "nested inner anchor should appear under subquery: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn window_reuses_ordering_through_subquery_alias() {
+        let plan = parse_analyze_and_plan(
+            "SELECT sum(o_custkey) OVER \
+                    (ORDER BY o_orderkey ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) \
+                    AS running_sum \
+             FROM (SELECT o_orderkey, o_custkey FROM orders ORDER BY o_orderkey) s",
+        )
+        .expect("planner should succeed");
+
+        let lines =
+            crate::sql::explain::explain_plan(&plan, crate::sql::explain::ExplainLevel::Verbose);
+        let sort_count = lines
+            .iter()
+            .filter(|line| line.contains("SORT BY [o_orderkey ASC NULLS FIRST]"))
+            .count();
+        assert_eq!(
+            sort_count, 1,
+            "window should reuse the derived table ordering: {lines:?}"
         );
     }
 
