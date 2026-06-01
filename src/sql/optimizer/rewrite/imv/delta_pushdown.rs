@@ -59,8 +59,8 @@ impl LogicalRewriteRule for PushDeltaThroughUnaryRule {
             LogicalPlan::Project(_) | LogicalPlan::Filter(_) => { /* fall through to push */ }
             LogicalPlan::Aggregate(_) => {
                 return Err(
-                    "IMV delta pushdown does not support Aggregate above delta-bound scans \
-                     in Phase 2; aggregate state rewrite is scheduled for Phase 4"
+                    "Iceberg IMV aggregate rewrite did not consume Delta(Aggregate); \
+                     verify RewriteAggregateStateRule ran before PushDeltaThroughUnary"
                         .to_string(),
                 );
             }
@@ -313,7 +313,10 @@ mod tests {
         let plan = delta(aggregate_over(leaf_scan()));
         assert!(rule.matches(&plan, &ctx));
         let err = rule.apply(plan, &mut ctx).expect_err("Aggregate must fail");
-        assert!(err.contains("Phase 4"), "unexpected error: {err}");
+        assert!(
+            err.contains("RewriteAggregateStateRule"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -398,6 +401,6 @@ mod tests {
         let err = rule
             .apply(*p.input, &mut ctx)
             .expect_err("aggregate must fail");
-        assert!(err.contains("Phase 4"), "got: {err}");
+        assert!(err.contains("RewriteAggregateStateRule"), "got: {err}");
     }
 }
