@@ -130,6 +130,18 @@ pub fn build_projected_output_schema(
 fn build_reserved_row_lineage_projected_field(
     column: &IcebergArrowColumn,
 ) -> Result<Option<Field>, String> {
+    if column
+        .name
+        .eq_ignore_ascii_case(crate::exec::change_op::CHANGE_OP_COLUMN)
+    {
+        if !matches!(column.data_type, DataType::Int8) {
+            return Err(format!(
+                "iceberg change-op column {} expects Int8, got {:?}",
+                column.name, column.data_type
+            ));
+        }
+        return Ok(Some(crate::exec::change_op::change_op_field()));
+    }
     let field_id = if column.name.eq_ignore_ascii_case(ICEBERG_ROW_ID_COL) {
         ICEBERG_RESERVED_FIELD_ID_ROW_ID
     } else if column

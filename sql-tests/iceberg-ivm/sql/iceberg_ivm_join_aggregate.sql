@@ -69,6 +69,9 @@ UPDATE ice_ivm_join_agg_${uuid0}.ns_${uuid0}.fact SET amount = 150 WHERE id = 1;
 UPDATE ice_ivm_join_agg_${uuid0}.ns_${uuid0}.dim SET region = 'north' WHERE id = 10;
 DELETE FROM ice_ivm_join_agg_${uuid0}.ns_${uuid0}.fact WHERE id = 4;
 DELETE FROM ice_ivm_join_agg_${uuid0}.ns_${uuid0}.dim WHERE id = 30;
+-- @explain_contains=AggregateStateMerge
+-- @explain_contains=IcebergVersionTable
+-- @explain_contains=IcebergMvTargetState
 REFRESH MATERIALIZED VIEW join_agg_mv_${uuid0};
 
 -- query 5

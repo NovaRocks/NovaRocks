@@ -114,6 +114,11 @@ fn bind_version_scan(
         ImvVersionRole::To => window.to_snapshot_id,
     };
     scan.table.source = ScanSource::IcebergVersionTable { table, snapshot_id };
+    scan.columns
+        .retain(|column| !ImvActionColumn::matches(column));
+    scan.table
+        .iceberg_row_lineage_metadata_columns
+        .retain(|column| !column.name.eq_ignore_ascii_case(ImvActionColumn::NAME));
     Ok(scan)
 }
 

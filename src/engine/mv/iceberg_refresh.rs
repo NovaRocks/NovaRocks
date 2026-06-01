@@ -1489,7 +1489,7 @@ pub(crate) fn refresh_iceberg_mv(
                 apply_key_value_type:
                     crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::Int64,
                 allow_full_rebuild_on_policy_full_refresh: true,
-                require_aggregate_rewrite_evidence: false,
+                rewrite_evidence: RewriteMergeRefreshEvidence::None,
                 preload_locator_for_change_stream_deletes: false,
             },
         ),
@@ -1774,7 +1774,7 @@ fn refresh_single_aggregate_iceberg_mv(
                     apply_key_value_type:
                         crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::Utf8,
                     allow_full_rebuild_on_policy_full_refresh: false,
-                    require_aggregate_rewrite_evidence: true,
+                    rewrite_evidence: RewriteMergeRefreshEvidence::Aggregate,
                     preload_locator_for_change_stream_deletes: true,
                 },
             )
@@ -2529,20 +2529,55 @@ fn refresh_join_aggregate_iceberg_mv(
                 pin.to_table_uuid_map(),
             )
         }
-        (Some(left_prev), Some(right_prev)) => incremental_refresh_iceberg_join_aggregate_mv(
-            state,
-            &ctx,
-            left_ref,
-            right_ref,
-            left_prev,
-            right_prev,
-            left_current,
-            right_current,
-            &left_loaded,
-            &right_loaded,
-            join_aggregate_shape,
-            aggregate_shape,
-        ),
+        (Some(left_prev), Some(right_prev)) => {
+            let left_table_uuid = pin
+                .uuid(left_ref)
+                .ok_or_else(|| {
+                    format!(
+                        "refresh pin missing uuid for base {} (this should not happen)",
+                        left_ref.fqn()
+                    )
+                })?
+                .to_string();
+            let right_table_uuid = pin
+                .uuid(right_ref)
+                .ok_or_else(|| {
+                    format!(
+                        "refresh pin missing uuid for base {} (this should not happen)",
+                        right_ref.fqn()
+                    )
+                })?
+                .to_string();
+            incremental_refresh_iceberg_mv_with_changes(
+                state,
+                &ctx,
+                &[
+                    RewriteMergeBaseChange {
+                        base_ref: left_ref,
+                        previous_snapshot_id: left_prev,
+                        current_snapshot_id: left_current,
+                        base_table: &left_loaded.table,
+                        current_table_uuid: &left_table_uuid,
+                    },
+                    RewriteMergeBaseChange {
+                        base_ref: right_ref,
+                        previous_snapshot_id: right_prev,
+                        current_snapshot_id: right_current,
+                        base_table: &right_loaded.table,
+                        current_table_uuid: &right_table_uuid,
+                    },
+                ],
+                None,
+                RewriteMergeRefreshOptions {
+                    apply_key_column: ICEBERG_MV_GROUP_APPLY_KEY_COLUMN,
+                    apply_key_value_type:
+                        crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::Utf8,
+                    allow_full_rebuild_on_policy_full_refresh: false,
+                    rewrite_evidence: RewriteMergeRefreshEvidence::JoinAggregate,
+                    preload_locator_for_change_stream_deletes: true,
+                },
+            )
+        }
         _ => Err(format!(
             "iceberg join aggregate MV {}.{}.{} has partial previous refresh snapshots; recreate the MV",
             target.catalog, target.namespace, target.table
@@ -4455,11 +4490,278 @@ fn prepare_aggregate_first_refresh_chunks(
         aggregate_shape,
     )?;
     let result = run_mv_full_select_result(state, current_catalog, current_database, state_query)?;
+    let result = normalize_aggregate_state_result_column_names(result, &layout, aggregate_shape)?;
     crate::connector::starrocks::table::mv_agg_state::materialize_aggregate_result_chunks(
         result,
         &layout,
         aggregate_shape,
     )
+}
+
+fn normalize_aggregate_state_result_column_names(
+    mut result: crate::runtime::query_result::QueryResult,
+    layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
+    shape: &AggregateMvShape,
+) -> Result<crate::runtime::query_result::QueryResult, String> {
+    let expected_names = aggregate_state_result_column_names(layout, shape)?;
+    if result.columns.len() != expected_names.len() {
+        return Ok(result);
+    }
+    for (column, expected_name) in result.columns.iter_mut().zip(expected_names.iter()) {
+        column.name.clone_from(expected_name);
+    }
+    result.chunks = result
+        .chunks
+        .into_iter()
+        .map(|chunk| rename_chunk_columns(chunk, &expected_names))
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(result)
+}
+
+fn aggregate_state_result_column_names(
+    layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
+    shape: &AggregateMvShape,
+) -> Result<Vec<String>, String> {
+    let mut names = Vec::with_capacity(shape.visible_outputs.len() + layout.state_columns.len());
+    for output in &shape.visible_outputs {
+        match output {
+            crate::connector::starrocks::table::mv_shape::VisibleAggregateOutput::GroupKey(
+                group_key_index,
+            ) => {
+                let visible_source_index = layout
+                    .group_key_source_indexes
+                    .get(*group_key_index)
+                    .ok_or_else(|| {
+                        format!(
+                            "aggregate MV state result group key index {group_key_index} out of range"
+                        )
+                    })?;
+                let visible = layout
+                    .visible_columns
+                    .get(*visible_source_index)
+                    .ok_or_else(|| {
+                        format!(
+                            "aggregate MV state result visible source index {visible_source_index} out of range"
+                        )
+                    })?;
+                names.push(visible.name.clone());
+            }
+            crate::connector::starrocks::table::mv_shape::VisibleAggregateOutput::Aggregate(
+                aggregate_index,
+            ) => {
+                let state_column = layout
+                    .state_columns
+                    .iter()
+                    .find(|column| {
+                        column.state_role
+                            == crate::connector::starrocks::table::mv_agg_state::AggregateStateRole::Single
+                            && column.aggregate_index == *aggregate_index
+                    })
+                    .ok_or_else(|| {
+                        format!(
+                            "aggregate MV state result missing state column for aggregate index {aggregate_index}"
+                        )
+                    })?;
+                names.push(state_column.name.clone());
+            }
+        }
+    }
+    for state_column in layout.state_columns.iter().filter(|column| {
+        column.state_role
+            == crate::connector::starrocks::table::mv_agg_state::AggregateStateRole::RetractionCount
+    }) {
+        names.push(state_column.name.clone());
+    }
+    Ok(names)
+}
+
+fn rename_chunk_columns(
+    chunk: crate::exec::chunk::Chunk,
+    names: &[String],
+) -> Result<crate::exec::chunk::Chunk, String> {
+    if chunk.batch.num_columns() != names.len() {
+        return Ok(chunk);
+    }
+    let fields = chunk
+        .batch
+        .schema()
+        .fields()
+        .iter()
+        .zip(names.iter())
+        .map(|(field, name)| std::sync::Arc::new(field.as_ref().clone().with_name(name.clone())))
+        .collect::<Vec<_>>();
+    let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(fields));
+    let batch = arrow::record_batch::RecordBatch::try_new(schema, chunk.batch.columns().to_vec())
+        .map_err(|e| format!("rename aggregate MV state result columns failed: {e}"))?;
+    crate::engine::record_batch_to_chunk(batch)
+}
+
+fn alias_aggregate_refresh_group_key_projection(
+    query: &mut sqlparser::ast::Query,
+    ctx: &IcebergMvRefreshContext,
+) -> Result<(), String> {
+    let (shape, layout) = ctx.rewrite.aggregate_shape_and_layout_for_execution()?;
+    let sqlparser::ast::SetExpr::Select(select) = query.body.as_mut() else {
+        return Err("aggregate MV incremental refresh SELECT body is required".to_string());
+    };
+    for (projection_index, output) in shape.visible_outputs.iter().enumerate() {
+        match output {
+            crate::connector::starrocks::table::mv_shape::VisibleAggregateOutput::GroupKey(
+                group_key_index,
+            ) => {
+                let visible_source_index = layout
+                    .group_key_source_indexes
+                    .get(*group_key_index)
+                    .ok_or_else(|| {
+                        format!(
+                            "aggregate MV group key projection index {group_key_index} out of range"
+                        )
+                    })?;
+                let expected_name = layout
+                    .visible_columns
+                    .get(*visible_source_index)
+                    .ok_or_else(|| {
+                        format!(
+                            "aggregate MV group key visible source index {visible_source_index} out of range"
+                        )
+                    })?
+                    .name
+                    .clone();
+                let item = select.projection.get_mut(projection_index).ok_or_else(|| {
+                    format!(
+                        "aggregate MV group key projection position {projection_index} is missing"
+                    )
+                })?;
+                alias_select_projection_item(item, &expected_name)?;
+                if let sqlparser::ast::GroupByExpr::Expressions(expressions, _) =
+                    &mut select.group_by
+                    && let Some(group_expr) = expressions.get_mut(*group_key_index)
+                {
+                    *group_expr = sqlparser::ast::Expr::Identifier(aggregate_refresh_alias_ident(
+                        &expected_name,
+                    ));
+                }
+            }
+            crate::connector::starrocks::table::mv_shape::VisibleAggregateOutput::Aggregate(_) => {
+                if let Some(item) = select.projection.get_mut(projection_index) {
+                    unqualify_aggregate_projection_inputs(item)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn alias_select_projection_item(
+    item: &mut sqlparser::ast::SelectItem,
+    alias: &str,
+) -> Result<(), String> {
+    use sqlparser::ast::SelectItem;
+
+    let alias = aggregate_refresh_alias_ident(alias);
+    match item {
+        SelectItem::UnnamedExpr(expr) => {
+            let expr = expr.clone();
+            *item = SelectItem::ExprWithAlias { expr, alias };
+            Ok(())
+        }
+        SelectItem::ExprWithAlias {
+            alias: existing, ..
+        } => {
+            *existing = alias;
+            Ok(())
+        }
+        SelectItem::QualifiedWildcard(_, _) | SelectItem::Wildcard(_) => {
+            Err("aggregate MV group key projection cannot be a wildcard".to_string())
+        }
+    }
+}
+
+fn aggregate_refresh_alias_ident(alias: &str) -> sqlparser::ast::Ident {
+    let mut chars = alias.chars();
+    let is_plain = chars
+        .next()
+        .map(|first| first.is_ascii_alphabetic() || first == '_')
+        .unwrap_or(false)
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+    if is_plain {
+        sqlparser::ast::Ident::new(alias)
+    } else {
+        sqlparser::ast::Ident::with_quote('`', alias)
+    }
+}
+
+fn unqualify_aggregate_projection_inputs(
+    item: &mut sqlparser::ast::SelectItem,
+) -> Result<(), String> {
+    use sqlparser::ast::SelectItem;
+
+    match item {
+        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+            unqualify_aggregate_expr_inputs(expr);
+            Ok(())
+        }
+        SelectItem::QualifiedWildcard(_, _) | SelectItem::Wildcard(_) => {
+            Err("aggregate MV aggregate projection cannot be a wildcard".to_string())
+        }
+    }
+}
+
+fn unqualify_aggregate_expr_inputs(expr: &mut sqlparser::ast::Expr) {
+    use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
+
+    let Expr::Function(function) = expr else {
+        return;
+    };
+    let FunctionArguments::List(args) = &mut function.args else {
+        return;
+    };
+    for arg in &mut args.args {
+        let FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr)) = arg else {
+            continue;
+        };
+        unqualify_compound_column_refs(arg_expr);
+    }
+}
+
+fn unqualify_compound_column_refs(expr: &mut sqlparser::ast::Expr) {
+    use sqlparser::ast::Expr;
+
+    match expr {
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            if let Some(last) = parts.last().cloned() {
+                *expr = Expr::Identifier(last);
+            }
+        }
+        Expr::Nested(inner) => unqualify_compound_column_refs(inner),
+        Expr::UnaryOp { expr, .. } => unqualify_compound_column_refs(expr),
+        Expr::BinaryOp { left, right, .. } => {
+            unqualify_compound_column_refs(left);
+            unqualify_compound_column_refs(right);
+        }
+        Expr::Cast { expr, .. } => unqualify_compound_column_refs(expr),
+        Expr::Function(function) => {
+            if let sqlparser::ast::FunctionArguments::List(args) = &mut function.args {
+                for arg in &mut args.args {
+                    match arg {
+                        sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(arg_expr),
+                        )
+                        | sqlparser::ast::FunctionArg::Named {
+                            arg: sqlparser::ast::FunctionArgExpr::Expr(arg_expr),
+                            ..
+                        }
+                        | sqlparser::ast::FunctionArg::ExprNamed {
+                            arg: sqlparser::ast::FunctionArgExpr::Expr(arg_expr),
+                            ..
+                        } => unqualify_compound_column_refs(arg_expr),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn build_aggregate_layout_for_refresh(
@@ -6076,19 +6378,23 @@ fn try_run_imv_rewrite_pipeline(state: &Arc<StandaloneState>, ctx: &IcebergMvRef
 fn validate_aggregate_refresh_rewrite_outcome(
     ctx: &IcebergMvRefreshContext,
     outcome: &crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteOutcome,
+    evidence: RewriteMergeRefreshEvidence,
 ) -> Result<(), String> {
-    let aggregate_rewrite_changed = outcome.trace.events().iter().any(|event| {
-        matches!(
-            event,
-            crate::sql::optimizer::rewrite::trace::RewriteTraceEvent::RuleChanged {
-                rule: "RewriteAggregateState",
-                ..
-            }
-        )
-    });
-    if !aggregate_rewrite_changed {
+    if evidence == RewriteMergeRefreshEvidence::JoinAggregate
+        && !rewrite_outcome_rule_changed(outcome, "RewriteJoinAggregateDelta")
+    {
         return Err(format!(
-            "iceberg aggregate MV {} incremental refresh rewrite did not apply RewriteAggregateState",
+            "iceberg join aggregate MV {} incremental refresh rewrite did not apply RewriteJoinAggregateDelta",
+            target_fqn_string(&ctx.rewrite.target)
+        ));
+    }
+    if !rewrite_outcome_rule_changed(outcome, "RewriteAggregateState") {
+        let label = match evidence {
+            RewriteMergeRefreshEvidence::JoinAggregate => "join aggregate",
+            _ => "aggregate",
+        };
+        return Err(format!(
+            "iceberg {label} MV {} incremental refresh rewrite did not apply RewriteAggregateState",
             target_fqn_string(&ctx.rewrite.target)
         ));
     }
@@ -6105,6 +6411,19 @@ fn validate_aggregate_refresh_rewrite_outcome(
         "iceberg aggregate MV incremental refresh rewrite evidence validated"
     );
     Ok(())
+}
+
+fn rewrite_outcome_rule_changed(
+    outcome: &crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteOutcome,
+    rule_name: &str,
+) -> bool {
+    outcome.trace.events().iter().any(|event| {
+        matches!(
+            event,
+            crate::sql::optimizer::rewrite::trace::RewriteTraceEvent::RuleChanged { rule, .. }
+                if *rule == rule_name
+        )
+    })
 }
 
 fn logical_plan_contains_aggregate_state_merge(
@@ -6670,21 +6989,23 @@ fn execute_join_delta_branches(
 /// (`_row_id`, `__change_op`, ...) it advertises are what gives codegen the
 /// slot bindings the IMV rewrite rules (`InjectRowIdRule`,
 /// `InjectActionColumnRule`) reference by name.
-fn build_pf_refresh_catalog(
+fn build_imv_refresh_catalog(
     state: &Arc<StandaloneState>,
-    base_ref: &IcebergTableRef,
+    base_refs: &[&IcebergTableRef],
 ) -> Result<crate::engine::catalog::InMemoryCatalog, String> {
-    let table_def = crate::engine::query_prep::build_iceberg_table_def_for_delta_scan(
-        state,
-        &base_ref.catalog,
-        &base_ref.namespace,
-        &base_ref.table,
-    )?;
     let mut catalog = crate::engine::catalog::InMemoryCatalog::default();
-    catalog.create_database(&base_ref.namespace)?;
-    catalog
-        .register(&base_ref.namespace, table_def)
-        .map_err(|e| format!("register PF base table {}: {e}", base_ref.fqn()))?;
+    for base_ref in base_refs {
+        let table_def = crate::engine::query_prep::build_iceberg_table_def_for_delta_scan(
+            state,
+            &base_ref.catalog,
+            &base_ref.namespace,
+            &base_ref.table,
+        )?;
+        catalog.create_database(&base_ref.namespace)?;
+        catalog
+            .register(&base_ref.namespace, table_def)
+            .map_err(|e| format!("register IMV refresh base table {}: {e}", base_ref.fqn()))?;
+    }
     Ok(catalog)
 }
 
@@ -6775,8 +7096,39 @@ struct RewriteMergeRefreshOptions {
     apply_key_column: &'static str,
     apply_key_value_type: crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType,
     allow_full_rebuild_on_policy_full_refresh: bool,
-    require_aggregate_rewrite_evidence: bool,
+    rewrite_evidence: RewriteMergeRefreshEvidence,
     preload_locator_for_change_stream_deletes: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RewriteMergeRefreshEvidence {
+    None,
+    Aggregate,
+    JoinAggregate,
+}
+
+struct RewriteMergeBaseChange<'a> {
+    base_ref: &'a IcebergTableRef,
+    previous_snapshot_id: i64,
+    current_snapshot_id: i64,
+    base_table: &'a iceberg::table::Table,
+    current_table_uuid: &'a str,
+}
+
+fn rewrite_refresh_snapshot_map(changes: &[RewriteMergeBaseChange<'_>]) -> BTreeMap<String, i64> {
+    changes
+        .iter()
+        .map(|change| (change.base_ref.fqn(), change.current_snapshot_id))
+        .collect()
+}
+
+fn rewrite_refresh_table_uuid_map(
+    changes: &[RewriteMergeBaseChange<'_>],
+) -> BTreeMap<String, String> {
+    changes
+        .iter()
+        .map(|change| (change.base_ref.fqn(), change.current_table_uuid.to_string()))
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6791,101 +7143,147 @@ fn incremental_refresh_iceberg_mv(
     pinned_full_select_sql: &str,
     options: RewriteMergeRefreshOptions,
 ) -> Result<StatementResult, String> {
+    let change = RewriteMergeBaseChange {
+        base_ref,
+        previous_snapshot_id,
+        current_snapshot_id,
+        base_table,
+        current_table_uuid,
+    };
+    incremental_refresh_iceberg_mv_with_changes(
+        state,
+        ctx,
+        &[change],
+        Some(pinned_full_select_sql),
+        options,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn incremental_refresh_iceberg_mv_with_changes(
+    state: &Arc<StandaloneState>,
+    ctx: &IcebergMvRefreshContext,
+    changes: &[RewriteMergeBaseChange<'_>],
+    pinned_full_select_sql: Option<&str>,
+    options: RewriteMergeRefreshOptions,
+) -> Result<StatementResult, String> {
     let target = &ctx.rewrite.target;
     let target_entry = &*ctx.target_entry;
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
     let current_database = ctx.rewrite.current_database.as_str();
     let mv_definition = &*ctx.rewrite.mv_definition;
+    if changes.is_empty() {
+        return Err("iceberg MV incremental refresh requires at least one base change".to_string());
+    }
+    let snapshots = rewrite_refresh_snapshot_map(changes);
+    let table_uuids = rewrite_refresh_table_uuid_map(changes);
     // 1. Plan the change batch. If the standard Iceberg diff cannot be planned
     // safely, rebuild instead of risking an incorrect incremental result.
-    let batch = match plan_changes(
-        base_table,
-        previous_snapshot_id,
-        Some(current_snapshot_id),
-        &[],
-    ) {
-        Ok(batch) => batch,
-        Err(err) => match policy_signal_from_change_error(&err) {
-            IcebergChangePolicySignal::FullRefresh { reason } => {
-                if !options.allow_full_rebuild_on_policy_full_refresh {
+    let mut has_insert_changes = false;
+    let mut has_delete_changes = false;
+    for change in changes {
+        let batch = match plan_changes(
+            change.base_table,
+            change.previous_snapshot_id,
+            Some(change.current_snapshot_id),
+            &[],
+        ) {
+            Ok(batch) => batch,
+            Err(err) => match policy_signal_from_change_error(&err) {
+                IcebergChangePolicySignal::FullRefresh { reason } => {
+                    if !options.allow_full_rebuild_on_policy_full_refresh {
+                        return Err(format!(
+                            "iceberg aggregate MV {}.{}.{} cannot refresh incrementally and automatic full rebuild is disabled: {reason}",
+                            target.catalog, target.namespace, target.table
+                        ));
+                    }
+                    let [change] = changes else {
+                        return Err(format!(
+                            "iceberg MV {}.{}.{} cannot fall back to full rebuild for multi-base incremental refresh: {reason}",
+                            target.catalog, target.namespace, target.table
+                        ));
+                    };
+                    let pinned_full_select_sql = pinned_full_select_sql.ok_or_else(|| {
+                        format!(
+                            "iceberg MV {}.{}.{} full rebuild fallback requires pinned full SELECT",
+                            target.catalog, target.namespace, target.table
+                        )
+                    })?;
+                    tracing::info!(
+                        "iceberg mv {}.{}.{}: incremental planner requested full refresh: {reason}",
+                        target.catalog,
+                        target.namespace,
+                        target.table
+                    );
+                    let staging_branch = format!(
+                        "__nova_mv_refresh_{}_{}",
+                        mv_definition.mv_id,
+                        uuid::Uuid::new_v4().simple()
+                    );
+                    let refresh_id = begin_staged_iceberg_mv_refresh_intent(
+                        state,
+                        target,
+                        mv_definition.mv_id,
+                        expected_main_snapshot_id,
+                        snapshots.clone(),
+                        &staging_branch,
+                    )?;
+                    return rebuild_iceberg_mv(
+                        state,
+                        target,
+                        target_entry,
+                        iceberg_catalog,
+                        expected_main_snapshot_id,
+                        &staging_branch,
+                        refresh_id,
+                        current_database,
+                        mv_definition,
+                        pinned_full_select_sql,
+                        change.base_ref,
+                        Some(change.current_snapshot_id),
+                        change.current_table_uuid,
+                    );
+                }
+                IcebergChangePolicySignal::Unsupported { reason } => {
                     return Err(format!(
-                        "iceberg aggregate MV {}.{}.{} cannot refresh incrementally and automatic full rebuild is disabled: {reason}",
-                        target.catalog, target.namespace, target.table
+                        "iceberg-stored materialized view refresh unsupported: {reason}"
                     ));
                 }
-                tracing::info!(
-                    "iceberg mv {}.{}.{}: incremental planner requested full refresh: {reason}",
-                    target.catalog,
-                    target.namespace,
-                    target.table
-                );
-                let staging_branch = format!(
-                    "__nova_mv_refresh_{}_{}",
-                    mv_definition.mv_id,
-                    uuid::Uuid::new_v4().simple()
-                );
-                let refresh_id = begin_staged_iceberg_mv_refresh_intent(
-                    state,
-                    target,
-                    mv_definition.mv_id,
-                    expected_main_snapshot_id,
-                    single_snapshot_map(base_ref, current_snapshot_id),
-                    &staging_branch,
-                )?;
-                return rebuild_iceberg_mv(
-                    state,
-                    target,
-                    target_entry,
-                    iceberg_catalog,
-                    expected_main_snapshot_id,
-                    &staging_branch,
-                    refresh_id,
-                    current_database,
-                    mv_definition,
-                    pinned_full_select_sql,
-                    base_ref,
-                    Some(current_snapshot_id),
-                    current_table_uuid,
-                );
-            }
-            IcebergChangePolicySignal::Unsupported { reason } => {
-                return Err(format!(
-                    "iceberg-stored materialized view refresh unsupported: {reason}"
-                ));
-            }
-            IcebergChangePolicySignal::Incremental => {
-                return Err(
-                    "iceberg-stored materialized view refresh produced invalid incremental policy from change planner"
-                        .to_string(),
-                );
-            }
-        },
-    };
-    if batch.current_snapshot_id != current_snapshot_id {
-        return Err(format!(
-            "iceberg mv incremental refresh: change batch snapshot mismatch (expected {current_snapshot_id}, got {})",
-            batch.current_snapshot_id,
-        ));
+                IcebergChangePolicySignal::Incremental => {
+                    return Err(
+                        "iceberg-stored materialized view refresh produced invalid incremental policy from change planner"
+                            .to_string(),
+                    );
+                }
+            },
+        };
+        if batch.current_snapshot_id != change.current_snapshot_id {
+            return Err(format!(
+                "iceberg mv incremental refresh: change batch snapshot mismatch for {} (expected {}, got {})",
+                change.base_ref.fqn(),
+                change.current_snapshot_id,
+                batch.current_snapshot_id,
+            ));
+        }
+        has_insert_changes |= !batch.inserts.is_empty();
+        has_delete_changes |= !batch.deletes.is_empty()
+            || !batch.equality_deletes.is_empty()
+            || !batch.deleted_data_files.is_empty();
     }
-
-    let has_delete_changes = !batch.deletes.is_empty()
-        || !batch.equality_deletes.is_empty()
-        || !batch.deleted_data_files.is_empty();
-    let is_empty_delta = batch.inserts.is_empty() && !has_delete_changes;
+    let is_empty_delta = !has_insert_changes && !has_delete_changes;
 
     // 2. Empty delta: advance lineage without committing an empty Iceberg
     // snapshot. This must run before any staging-branch work.
     if is_empty_delta {
         tracing::info!(
+            snapshots = ?snapshots,
             "iceberg mv {}.{}.{}: incremental refresh delta has 0 rows; \
-             advancing lineage to base snapshot {current_snapshot_id} without new iceberg snapshot",
+             advancing lineage without new iceberg snapshot",
             target.catalog,
             target.namespace,
             target.table
         );
-        let snapshots = single_snapshot_map(base_ref, current_snapshot_id);
-        let table_uuids = single_table_uuid_map(base_ref, current_table_uuid);
         let target_snapshot_id = recorded_target_snapshot_id(target, mv_definition)?;
         let refresh_id =
             begin_iceberg_mv_refresh_intent(state, mv_definition.mv_id, snapshots.clone())?;
@@ -6911,7 +7309,7 @@ fn incremental_refresh_iceberg_mv(
         target,
         mv_definition.mv_id,
         expected_main_snapshot_id,
-        single_snapshot_map(base_ref, current_snapshot_id),
+        snapshots.clone(),
         &staging_branch,
     )?;
     let ident = iceberg_mv_table_ident(target)?;
@@ -6951,7 +7349,11 @@ fn incremental_refresh_iceberg_mv(
     // `IcebergTableInfo` we publish here. `data_files = vec![]` is
     // intentional: the runtime `IcebergDeltaScan` operator obtains its
     // per-snapshot file list from the catalog at execution time.
-    let catalog = match build_pf_refresh_catalog(state, base_ref) {
+    let refresh_base_refs = changes
+        .iter()
+        .map(|change| change.base_ref)
+        .collect::<Vec<_>>();
+    let catalog = match build_imv_refresh_catalog(state, &refresh_base_refs) {
         Ok(c) => c,
         Err(err) => {
             return Err(handle_iceberg_mv_commit_error(
@@ -7007,6 +7409,18 @@ fn incremental_refresh_iceberg_mv(
         ));
     };
     let mut query = *query_box;
+    if options.rewrite_evidence != RewriteMergeRefreshEvidence::None {
+        alias_aggregate_refresh_group_key_projection(&mut query, ctx).map_err(|err| {
+            handle_iceberg_mv_commit_error(
+                state,
+                target,
+                target_entry,
+                &staging_branch,
+                refresh_id,
+                err,
+            )
+        })?;
+    }
     // The analyzer view exposes <db>.<table>, not <cat>.<db>.<table>; strip
     // any catalog qualifier before binding.
     crate::sql::parser::query_refs::strip_catalog_from_three_part_names(&mut query);
@@ -7076,10 +7490,14 @@ fn incremental_refresh_iceberg_mv(
             .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
         let aggregate_rewrite_validator;
         let imv_rewrite_validator: Option<&crate::engine::ImvRewriteValidator<'_>> =
-            if options.require_aggregate_rewrite_evidence {
+            if options.rewrite_evidence != RewriteMergeRefreshEvidence::None {
                 aggregate_rewrite_validator =
                     |outcome: &crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteOutcome| {
-                        validate_aggregate_refresh_rewrite_outcome(ctx, outcome)
+                        validate_aggregate_refresh_rewrite_outcome(
+                            ctx,
+                            outcome,
+                            options.rewrite_evidence,
+                        )
                     };
                 Some(&aggregate_rewrite_validator)
             } else {
@@ -7133,17 +7551,15 @@ fn incremental_refresh_iceberg_mv(
     // Iceberg snapshot.
     if added_rows == 0 && deleted_rows == 0 {
         tracing::info!(
+            snapshots = ?snapshots,
             "iceberg mv {}.{}.{}: incremental refresh produced 0 effective rows after SELECT \
-             evaluation; advancing lineage to base snapshot {current_snapshot_id} without new \
-             iceberg snapshot",
+             evaluation; advancing lineage without new iceberg snapshot",
             target.catalog,
             target.namespace,
             target.table
         );
         drop_iceberg_mv_staging_branch(state, target, target_entry, &staging_branch)?;
         abort_iceberg_mv_refresh(state, refresh_id)?;
-        let snapshots = single_snapshot_map(base_ref, current_snapshot_id);
-        let table_uuids = single_table_uuid_map(base_ref, current_table_uuid);
         let target_snapshot_id = recorded_target_snapshot_id(target, mv_definition)?;
         let metadata_refresh_id =
             begin_iceberg_mv_refresh_intent(state, mv_definition.mv_id, snapshots.clone())?;
@@ -7192,8 +7608,6 @@ fn incremental_refresh_iceberg_mv(
                 mv_definition.last_refresh_rows
             )
         })?;
-    let snapshots = single_snapshot_map(base_ref, current_snapshot_id);
-    let table_uuids = single_table_uuid_map(base_ref, current_table_uuid);
     record_iceberg_mv_staging_commit(
         state,
         refresh_id,
