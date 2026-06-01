@@ -113,4 +113,3 @@ IVM 对 overwrite snapshot 的输入统一是 delete+insert：
 3. 覆盖范围外的数据文件和 row lineage 保持不变。
 4. 相关 unit tests、SQL fixtures、`cargo fmt`、目标 Rust tests 通过。
 5. 设计不引入私有 cross-engine 不兼容假设。
-
