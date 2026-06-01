@@ -66,8 +66,8 @@ impl LogicalRewriteRule for PushDeltaThroughUnaryRule {
             }
             LogicalPlan::Join(_) => {
                 return Err(
-                    "IMV delta pushdown does not support Join above delta-bound scans \
-                     in Phase 2; join delta algebra is scheduled for Phase 5"
+                    "Iceberg IMV join delta rewrite did not consume Delta(Join); \
+                     verify RewriteJoinAggregateDeltaRule ran before PushDeltaThroughUnary"
                         .to_string(),
                 );
             }
@@ -326,7 +326,10 @@ mod tests {
         let plan = delta(join_over(leaf_scan(), leaf_scan()));
         assert!(rule.matches(&plan, &ctx));
         let err = rule.apply(plan, &mut ctx).expect_err("Join must fail");
-        assert!(err.contains("Phase 5"), "unexpected error: {err}");
+        assert!(
+            err.contains("RewriteJoinAggregateDeltaRule"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
