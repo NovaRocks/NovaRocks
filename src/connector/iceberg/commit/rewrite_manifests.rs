@@ -36,12 +36,12 @@ use std::sync::Arc;
 
 use iceberg::io::FileIO;
 use iceberg::spec::{
-    DataFile, DataFileBuilder, FormatVersion, ManifestContentType, ManifestEntry, ManifestFile,
-    ManifestStatus, ManifestWriterBuilder, Operation, SnapshotReference, SnapshotRetention,
-    Summary,
+    FormatVersion, ManifestContentType, ManifestEntry, ManifestFile, ManifestStatus,
+    ManifestWriterBuilder, Operation, SnapshotReference, SnapshotRetention, Summary,
 };
 use iceberg::{Catalog, TableCommit, TableIdent, TableRequirement, TableUpdate};
 
+use super::data_file::clone_data_file_with_first_row_id;
 use super::helpers::{generate_snapshot_id, metadata_dir, now_ms, write_manifest_list};
 use super::retry::commit_with_retry;
 
@@ -288,57 +288,6 @@ pub(crate) fn group_manifests_by_spec_and_content(
     groups
 }
 
-/// Clone a `DataFile`, overriding `first_row_id` with the given value.
-///
-/// Copies every field from `src` via `DataFileBuilder` using only public
-/// accessor methods. `partition_spec_id` is accepted as a parameter because
-/// `DataFile::partition_spec_id` is `pub(crate)` in the vendored iceberg crate
-/// and not accessible from NovaRocks — callers must supply it (the group's
-/// `spec_id` is known at merge time).
-///
-/// Used during manifest merge to stamp an explicit per-file `first_row_id`
-/// so that the read-path invariant `df.first_row_id().or(manifest_fallback)`
-/// returns the correct original value after the merged manifest's manifest-
-/// level `first_row_id` is reassigned by the `ManifestListWriter`.
-fn clone_data_file_with_first_row_id(
-    src: &DataFile,
-    partition_spec_id: i32,
-    first_row_id: Option<i64>,
-) -> Result<DataFile, iceberg::Error> {
-    let mut builder = DataFileBuilder::default();
-    builder
-        .content(src.content_type())
-        .file_path(src.file_path().to_string())
-        .file_format(src.file_format())
-        .partition(src.partition().clone())
-        .partition_spec_id(partition_spec_id)
-        .record_count(src.record_count())
-        .file_size_in_bytes(src.file_size_in_bytes())
-        .column_sizes(src.column_sizes().clone())
-        .value_counts(src.value_counts().clone())
-        .null_value_counts(src.null_value_counts().clone())
-        .nan_value_counts(src.nan_value_counts().clone())
-        .lower_bounds(src.lower_bounds().clone())
-        .upper_bounds(src.upper_bounds().clone())
-        .key_metadata(src.key_metadata().map(|b| b.to_vec()))
-        .split_offsets(src.split_offsets().map(|s| s.to_vec()))
-        .equality_ids(src.equality_ids())
-        .first_row_id(first_row_id)
-        .referenced_data_file(src.referenced_data_file())
-        .content_offset(src.content_offset())
-        .content_size_in_bytes(src.content_size_in_bytes());
-    // sort_order_id uses setter(strip_option) — pass the bare i32 only if Some.
-    if let Some(id) = src.sort_order_id() {
-        builder.sort_order_id(id);
-    }
-    builder.build().map_err(|e| {
-        iceberg::Error::new(
-            iceberg::ErrorKind::DataInvalid,
-            format!("clone_data_file_with_first_row_id: DataFileBuilder::build failed: {e}"),
-        )
-    })
-}
-
 /// Merge all entries from a group of manifest files into one new manifest.
 /// Drops DELETED entries (spec §5.2 Step 3). Sets remaining entries' status
 /// to EXISTING (round-tripping snapshot_id, sequence_number, file_sequence_number
@@ -455,7 +404,8 @@ async fn merge_manifest_group(
             cumulative_offset += record_count;
 
             let data_file =
-                clone_data_file_with_first_row_id(orig_df, spec_id, stamped_first_row_id)?;
+                clone_data_file_with_first_row_id(orig_df, spec_id, stamped_first_row_id)
+                    .map_err(|e| iceberg::Error::new(iceberg::ErrorKind::DataInvalid, e))?;
             writer
                 .add_existing_file(data_file, snap_id, seq, file_seq)
                 .map_err(|e| {

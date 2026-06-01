@@ -37,8 +37,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use iceberg::io::FileIO;
 use iceberg::spec::{
-    DataContentType, DataFile, FormatVersion, ManifestList, ManifestWriterBuilder, Operation,
-    PartitionSpecRef, SchemaRef, Snapshot, SnapshotReference, SnapshotRetention, Struct, Summary,
+    DataContentType, DataFile, FormatVersion, ManifestContentType, ManifestList,
+    ManifestWriterBuilder, Operation, PartitionSpecRef, SchemaRef, Snapshot, SnapshotReference,
+    SnapshotRetention, Struct, Summary,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ActionCommit, ApplyTransactionAction, Transaction, TransactionAction};
@@ -47,6 +48,7 @@ use uuid::Uuid;
 
 use super::abort::AbortLog;
 use super::action::{CommitCtx, IcebergCommitAction};
+use super::data_file::clone_data_file_with_first_row_id;
 use super::fast_append::register_puffin_stats;
 use super::helpers::{
     effective_next_row_id, generate_snapshot_id, metadata_dir, now_ms, write_manifest_list,
@@ -161,6 +163,16 @@ struct OverwritePartitionsTxnAction {
     target_ref: String,
 }
 
+#[derive(Clone)]
+struct LiveFileWithSpec {
+    data_file: DataFile,
+    snapshot_id: i64,
+    sequence_number: i64,
+    file_sequence_number: Option<i64>,
+    manifest_spec_id: i32,
+    effective_first_row_id: Option<i64>,
+}
+
 impl OverwritePartitionsTxnAction {
     fn record_manifest_path(&self, path: String) {
         self.abort_handle.record_manifest(path.clone());
@@ -227,38 +239,61 @@ impl TransactionAction for OverwritePartitionsTxnAction {
             .await
             .map_err(to_iceberg_unexpected)?;
 
-        // `(DataFile, snap_id, seq, file_seq)` tuples split by fate.
+        // `(DataFile, seq, file_seq)` tuples split by fate.
         let mut deleted_data: Vec<(DataFile, i64, Option<i64>)> = Vec::new();
         let mut deleted_deletes: Vec<(DataFile, i64, Option<i64>)> = Vec::new();
-        // `(DataFile, snap_id, seq, file_seq)` for surviving entries.
-        let mut surviving_data: Vec<(DataFile, i64, i64, Option<i64>)> = Vec::new();
+        // `(DataFile, snap_id, seq, file_seq, effective_first_row_id, spec_id)`.
+        let mut surviving_data: Vec<(DataFile, i64, i64, Option<i64>, Option<i64>, i32)> =
+            Vec::new();
         let mut surviving_deletes: Vec<(DataFile, i64, i64, Option<i64>)> = Vec::new();
-        for (df, snap_id, seq, file_seq, base_spec_id) in &existing {
+        for live in &existing {
+            let df = &live.data_file;
             match partition_match_in_touched(
                 df.partition(),
-                *base_spec_id,
+                live.manifest_spec_id,
                 current_spec_id,
                 &touched,
             ) {
                 PartitionMatch::InSet => {
                     if df.content_type() == DataContentType::Data {
-                        deleted_data.push((df.clone(), *seq, *file_seq));
+                        deleted_data.push((
+                            df.clone(),
+                            live.sequence_number,
+                            live.file_sequence_number,
+                        ));
                     } else {
-                        deleted_deletes.push((df.clone(), *seq, *file_seq));
+                        deleted_deletes.push((
+                            df.clone(),
+                            live.sequence_number,
+                            live.file_sequence_number,
+                        ));
                     }
                 }
                 PartitionMatch::NotInSet => {
                     if df.content_type() == DataContentType::Data {
-                        surviving_data.push((df.clone(), *snap_id, *seq, *file_seq));
+                        surviving_data.push((
+                            df.clone(),
+                            live.snapshot_id,
+                            live.sequence_number,
+                            live.file_sequence_number,
+                            live.effective_first_row_id,
+                            live.manifest_spec_id,
+                        ));
                     } else {
-                        surviving_deletes.push((df.clone(), *snap_id, *seq, *file_seq));
+                        surviving_deletes.push((
+                            df.clone(),
+                            live.snapshot_id,
+                            live.sequence_number,
+                            live.file_sequence_number,
+                        ));
                     }
                 }
                 PartitionMatch::DifferentSpec => {
                     return Err(to_iceberg_unexpected(format!(
                         "OVERWRITE PARTITIONS: base file under historical partition spec \
                          {base_spec_id} cannot be matched against current spec \
-                         {current_spec_id}; run OPTIMIZE TABLE to consolidate first"
+                         {current_spec_id}; run OPTIMIZE TABLE to consolidate first",
+                        base_spec_id = live.manifest_spec_id,
                     )));
                 }
             }
@@ -473,7 +508,7 @@ impl TransactionAction for OverwritePartitionsTxnAction {
 async fn write_existing_data_manifest(
     file_io: &FileIO,
     out_path: &str,
-    surviving: &[(DataFile, i64, i64, Option<i64>)],
+    surviving: &[(DataFile, i64, i64, Option<i64>, Option<i64>, i32)],
     partition_spec: PartitionSpecRef,
     schema: SchemaRef,
     new_snapshot_id: i64,
@@ -494,10 +529,11 @@ async fn write_existing_data_manifest(
         FormatVersion::V3 => builder.build_v3_data(),
         FormatVersion::V1 => return Err("phase 1 does not support V1 tables".to_string()),
     };
-    for (df, snap_id, seq, file_seq) in surviving {
+    for (df, snap_id, seq, file_seq, effective_first_row_id, spec_id) in surviving {
         let fseq = file_seq.unwrap_or(*seq);
+        let data_file = clone_data_file_with_first_row_id(df, *spec_id, *effective_first_row_id)?;
         writer
-            .add_existing_file(df.clone(), *snap_id, *seq, Some(fseq))
+            .add_existing_file(data_file, *snap_id, *seq, Some(fseq))
             .map_err(|e| format!("ManifestWriter::add_existing_file failed: {e}"))?;
     }
     writer
@@ -548,7 +584,7 @@ async fn write_existing_deletes_manifest(
 
 /// Walk every manifest in the base snapshot's manifest list (Data and
 /// Deletes alike) and collect every live entry's
-/// `(DataFile, snapshot_id, sequence_number, file_sequence_number, manifest_spec_id)`.
+/// data file, inherited sequence fields, source spec id, and effective row id.
 ///
 /// - `snapshot_id`: the snapshot that originally wrote this entry (needed by
 ///   `add_existing_file` to preserve lineage faithfully).
@@ -557,7 +593,7 @@ async fn write_existing_deletes_manifest(
 async fn enumerate_live_all_files_with_spec(
     table: &Table,
     file_io: &FileIO,
-) -> Result<Vec<(DataFile, i64, i64, Option<i64>, i32)>, String> {
+) -> Result<Vec<LiveFileWithSpec>, String> {
     let m = table.metadata();
     let snap = match m.current_snapshot() {
         Some(s) => s,
@@ -576,6 +612,17 @@ async fn enumerate_live_all_files_with_spec(
     for entry in list.entries() {
         let spec_id = entry.partition_spec_id;
         let manifest_snap_id = entry.added_snapshot_id;
+        let is_data_manifest = entry.content == ManifestContentType::Data;
+        let mut next_manifest_first_row_id = if is_data_manifest {
+            entry
+                .first_row_id
+                .map(|v| {
+                    i64::try_from(v).map_err(|_| format!("manifest first_row_id too large: {v}"))
+                })
+                .transpose()?
+        } else {
+            None
+        };
         let manifest = entry
             .load_manifest(file_io)
             .await
@@ -586,7 +633,30 @@ async fn enumerate_live_all_files_with_spec(
                 let seq = me.sequence_number().unwrap_or(entry.sequence_number);
                 let file_seq = me.file_sequence_number;
                 let snap_id = me.snapshot_id().unwrap_or(manifest_snap_id);
-                out.push((data_file, snap_id, seq, file_seq, spec_id));
+                let effective_first_row_id = if is_data_manifest
+                    && data_file.content_type() == DataContentType::Data
+                {
+                    let record_count = i64::try_from(data_file.record_count()).map_err(|_| {
+                        format!("record_count too large for {}", data_file.file_path())
+                    })?;
+                    let first_row_id = data_file.first_row_id().or(next_manifest_first_row_id);
+                    if let Some(next) = next_manifest_first_row_id.as_mut() {
+                        *next = next.checked_add(record_count).ok_or_else(|| {
+                            format!("first_row_id overflow for manifest {}", entry.manifest_path)
+                        })?;
+                    }
+                    first_row_id
+                } else {
+                    None
+                };
+                out.push(LiveFileWithSpec {
+                    data_file,
+                    snapshot_id: snap_id,
+                    sequence_number: seq,
+                    file_sequence_number: file_seq,
+                    manifest_spec_id: spec_id,
+                    effective_first_row_id,
+                });
             }
         }
     }
@@ -739,6 +809,15 @@ mod tests {
             .await
             .expect("enumerate pre-overwrite");
         assert_eq!(pre.len(), 3, "fixture should expose 3 live files");
+        let pre_with_lineage =
+            enumerate_live_all_files_with_spec(&fixture.table, &fixture.table.file_io().clone())
+                .await
+                .expect("enumerate pre-overwrite with lineage");
+        let pre_eu_first_row_id = pre_with_lineage
+            .iter()
+            .find(|live| live.data_file.file_path().ends_with("eu-0.parquet"))
+            .and_then(|live| live.effective_first_row_id)
+            .expect("pre-overwrite eu file should have an effective first_row_id");
 
         let table_location = fixture.table.metadata().location().to_string();
         let partition_spec_id = fixture.table.metadata().default_partition_spec().spec_id();
@@ -783,6 +862,10 @@ mod tests {
         let post = enumerate_live_all_files(&reloaded, &reloaded.file_io().clone())
             .await
             .expect("enumerate post-overwrite");
+        let post_with_lineage =
+            enumerate_live_all_files_with_spec(&reloaded, &reloaded.file_io().clone())
+                .await
+                .expect("enumerate post-overwrite with lineage");
 
         // region=us: 2 old replaced by 1 new → 1 file
         // region=eu: 1 preserved
@@ -811,6 +894,20 @@ mod tests {
         assert!(
             paths.iter().any(|p| p.ends_with("eu-0.parquet")),
             "eu file should be preserved, got {paths:?}",
+        );
+        let post_eu = post_with_lineage
+            .iter()
+            .find(|live| live.data_file.file_path().ends_with("eu-0.parquet"))
+            .expect("post-overwrite eu file should remain live");
+        assert_eq!(
+            post_eu.effective_first_row_id,
+            Some(pre_eu_first_row_id),
+            "surviving partition data file must preserve effective first_row_id",
+        );
+        assert_eq!(
+            post_eu.data_file.first_row_id(),
+            Some(pre_eu_first_row_id),
+            "surviving partition data file must carry explicit first_row_id after rewrite",
         );
 
         // Snapshot summary sanity.
