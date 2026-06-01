@@ -5,5 +5,10 @@ west	1	0	NULL	NULL
 
 -- query 6
 region	c	c_amount	s	a
+east	3	3	60	20
+west	1	0	NULL	NULL
+
+-- query 9
+region	c	c_amount	s	a
 east	3	3	90	30
 north	1	1	5	5

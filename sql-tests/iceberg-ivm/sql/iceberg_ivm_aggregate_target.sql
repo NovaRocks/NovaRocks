@@ -50,9 +50,7 @@ ORDER BY region;
 
 -- query 4
 -- @skip_result_check=true
-INSERT INTO ice_ivm_agg_${uuid0}.ns_${uuid0}.orders VALUES ('east', 30), ('north', 5);
-DELETE FROM ice_ivm_agg_${uuid0}.ns_${uuid0}.orders WHERE region = 'west';
-UPDATE ice_ivm_agg_${uuid0}.ns_${uuid0}.orders SET amount = 40 WHERE region = 'east' AND amount = 10;
+INSERT INTO ice_ivm_agg_${uuid0}.ns_${uuid0}.orders VALUES ('east', 30);
 
 -- query 5
 -- @skip_result_check=true
@@ -67,14 +65,29 @@ FROM agg_mv_${uuid0}
 ORDER BY region;
 
 -- query 7
+-- @skip_result_check=true
+INSERT INTO ice_ivm_agg_${uuid0}.ns_${uuid0}.orders VALUES ('north', 5);
+DELETE FROM ice_ivm_agg_${uuid0}.ns_${uuid0}.orders WHERE region = 'west';
+UPDATE ice_ivm_agg_${uuid0}.ns_${uuid0}.orders SET amount = 40 WHERE region = 'east' AND amount = 10;
+
+-- query 8
+-- @skip_result_check=true
+REFRESH MATERIALIZED VIEW agg_mv_${uuid0};
+
+-- query 9
+SELECT region, c, c_amount, s, a
+FROM agg_mv_${uuid0}
+ORDER BY region;
+
+-- query 10
 -- @expect_error=Column '__row_id__' cannot be resolved
 SELECT __row_id__ FROM agg_mv_${uuid0};
 
--- query 8
+-- query 11
 -- @expect_error=Column '__agg_state_c' cannot be resolved
 SELECT __agg_state_c FROM agg_mv_${uuid0};
 
--- query 9
+-- query 12
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW agg_mv_${uuid0};
 DROP TABLE ice_ivm_agg_${uuid0}.ns_${uuid0}.orders FORCE;

@@ -2764,6 +2764,9 @@ pub(crate) fn execute_query(
 /// `mv_refresh_ctx = Some(ctx)` runs the IMV rewrite pipeline on the
 /// logical plan before optimization. Callers that do not need IMV rewriting
 /// pass `None` (dormant until Task 9 flips the PF refresh caller).
+pub(crate) type ImvRewriteValidator<'a> = dyn Fn(&crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteOutcome) -> Result<(), String>
+    + 'a;
+
 pub(crate) fn execute_query_with_options(
     query: &sqlparser::ast::Query,
     catalog: &InMemoryCatalog,
@@ -2774,6 +2777,33 @@ pub(crate) fn execute_query_with_options(
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+) -> Result<QueryResult, String> {
+    execute_query_with_options_and_imv_validator(
+        query,
+        catalog,
+        connectors,
+        current_database,
+        exchange_port,
+        query_opts,
+        terminal_sink,
+        iceberg_catalogs,
+        mv_refresh_ctx,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_query_with_options_and_imv_validator(
+    query: &sqlparser::ast::Query,
+    catalog: &InMemoryCatalog,
+    connectors: &crate::connector::ConnectorRegistry,
+    current_database: &str,
+    exchange_port: u16,
+    query_opts: Option<crate::internal_service::TQueryOptions>,
+    terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
+    iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
+    mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+    imv_rewrite_validator: Option<&ImvRewriteValidator<'_>>,
 ) -> Result<QueryResult, String> {
     let (resolved, cte_registry, mut factory) =
         crate::sql::analyzer::analyze(query, catalog, current_database)?;
@@ -2793,7 +2823,12 @@ pub(crate) fn execute_query_with_options(
             },
         )
         .map_err(|e| format!("imv rewrite: {e}"))?;
+        if let Some(validator) = imv_rewrite_validator {
+            validator(&outcome)?;
+        }
         logical = outcome.plan;
+    } else if imv_rewrite_validator.is_some() {
+        return Err("IMV rewrite validator requires MV refresh context".to_string());
     }
     let table_stats = build_table_stats_from_plan(&logical);
     // dictionary_provider intentionally None; installed via TLS by execute_in_context.

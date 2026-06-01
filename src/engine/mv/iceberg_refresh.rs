@@ -1490,6 +1490,7 @@ pub(crate) fn refresh_iceberg_mv(
                     crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::Int64,
                 allow_full_rebuild_on_policy_full_refresh: true,
                 require_aggregate_rewrite_evidence: false,
+                preload_locator_for_change_stream_deletes: false,
             },
         ),
 
@@ -1774,6 +1775,7 @@ fn refresh_single_aggregate_iceberg_mv(
                         crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::Utf8,
                     allow_full_rebuild_on_policy_full_refresh: false,
                     require_aggregate_rewrite_evidence: true,
+                    preload_locator_for_change_stream_deletes: true,
                 },
             )
         }
@@ -6071,11 +6073,10 @@ fn try_run_imv_rewrite_pipeline(state: &Arc<StandaloneState>, ctx: &IcebergMvRef
     }
 }
 
-fn validate_aggregate_refresh_rewrite_evidence(
-    state: &Arc<StandaloneState>,
+fn validate_aggregate_refresh_rewrite_outcome(
     ctx: &IcebergMvRefreshContext,
+    outcome: &crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteOutcome,
 ) -> Result<(), String> {
-    let outcome = run_imv_rewrite_for_refresh_explain(state, ctx)?;
     let aggregate_rewrite_changed = outcome.trace.events().iter().any(|event| {
         matches!(
             event,
@@ -6775,6 +6776,7 @@ struct RewriteMergeRefreshOptions {
     apply_key_value_type: crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType,
     allow_full_rebuild_on_policy_full_refresh: bool,
     require_aggregate_rewrite_evidence: bool,
+    preload_locator_for_change_stream_deletes: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6898,10 +6900,6 @@ fn incremental_refresh_iceberg_mv(
         return Ok(StatementResult::Ok);
     }
 
-    if options.require_aggregate_rewrite_evidence {
-        validate_aggregate_refresh_rewrite_evidence(state, ctx)?;
-    }
-
     // 3. Begin the staging branch and pre-load the target Iceberg table.
     let staging_branch = format!(
         "__nova_mv_refresh_{}_{}",
@@ -7013,12 +7011,12 @@ fn incremental_refresh_iceberg_mv(
     // any catalog qualifier before binding.
     crate::sql::parser::query_refs::strip_catalog_from_three_part_names(&mut query);
 
-    // 6. Pre-load the A9 target locator inputs only when the change batch
-    // carries DELETE-side rows. The merge sink consumes these when it sees
-    // a DELETE chunk; for insert-only batches we leave them None so the
-    // sink rejects an unexpected DELETE arrival rather than silently
-    // failing.
-    let locator_state = if has_delete_changes {
+    // 6. Pre-load the A9 target locator inputs when the base change batch
+    // carries DELETE-side rows or the IMV rewrite can emit change-stream
+    // DELETE rows while applying existing target groups.
+    let needs_locator_state =
+        has_delete_changes || options.preload_locator_for_change_stream_deletes;
+    let locator_state = if needs_locator_state {
         let inputs = match load_target_apply_locator_inputs(target_entry, &target_table) {
             Ok(v) => v,
             Err(err) => {
@@ -7045,7 +7043,7 @@ fn incremental_refresh_iceberg_mv(
     // injects WrittenFile / PositionDeleteGroup descriptors into the
     // collector during pipeline execution; the commit driver below
     // consumes the populated collector.
-    let op_kind = if has_delete_changes {
+    let op_kind = if needs_locator_state {
         CommitOpKind::RowDeltaDv
     } else {
         CommitOpKind::FastAppend
@@ -7076,7 +7074,18 @@ fn incremental_refresh_iceberg_mv(
             .iceberg_catalogs
             .read()
             .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        if let Err(err) = crate::engine::execute_query_with_options(
+        let aggregate_rewrite_validator;
+        let imv_rewrite_validator: Option<&crate::engine::ImvRewriteValidator<'_>> =
+            if options.require_aggregate_rewrite_evidence {
+                aggregate_rewrite_validator =
+                    |outcome: &crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteOutcome| {
+                        validate_aggregate_refresh_rewrite_outcome(ctx, outcome)
+                    };
+                Some(&aggregate_rewrite_validator)
+            } else {
+                None
+            };
+        if let Err(err) = crate::engine::execute_query_with_options_and_imv_validator(
             &query,
             &catalog,
             &connectors_snapshot,
@@ -7086,6 +7095,7 @@ fn incremental_refresh_iceberg_mv(
             Some(Box::new(merge_sink)),
             Some(&*catalogs_guard),
             Some(&ctx),
+            imv_rewrite_validator,
         ) {
             drop(catalogs_guard);
             return Err(handle_iceberg_mv_commit_error(
