@@ -1,0 +1,15 @@
+-- query 2
+region	n
+eu	2
+us	2
+
+-- query 4
+id	region
+1	us
+3	eu
+4	eu
+99	us
+
+-- query 5
+same_touched_rows	changed_touched_rows	same_untouched_rows	current_us_rows	current_eu_rows
+0	1	2	2	2
