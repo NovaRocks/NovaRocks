@@ -653,6 +653,7 @@ pub(crate) fn build_exec_params_multi_with_refresh_context(
                         "Iceberg target-state scan requires MV refresh context".to_string()
                     })?;
                     let source = refresh_ctx.target_state_scan_source(scan)?;
+                    reject_target_state_equality_deletes(&source)?;
                     build_iceberg_scan_ranges_from_source(
                         connectors,
                         planned,
@@ -771,6 +772,21 @@ pub(crate) fn projected_target_state_column_names(
         names.push("_row_id".to_string());
     }
     names
+}
+
+pub(crate) fn reject_target_state_equality_deletes(source: &ScanSource) -> Result<(), String> {
+    let ScanSource::IcebergDataFiles { files, .. } = source else {
+        return Ok(());
+    };
+    let has_equality_delete = files.iter().any(|file| {
+        file.delete_files.iter().any(|delete_file| {
+            delete_file.file_content == crate::sql::catalog::IcebergDeleteFileContent::Equality
+        })
+    });
+    if has_equality_delete {
+        return Err("Iceberg target-state scan does not support equality deletes yet".to_string());
+    }
+    Ok(())
 }
 
 fn scan_file_min_max_predicates(planned: &PlannedScanTable) -> Vec<MinMaxPredicate> {

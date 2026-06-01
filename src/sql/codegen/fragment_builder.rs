@@ -210,6 +210,10 @@ fn add_iceberg_equality_delete_required_columns(
     Ok(())
 }
 
+fn effective_iceberg_scan_column_names(table: &crate::sql::catalog::TableDef) -> Vec<String> {
+    table.columns.iter().map(|c| c.name.clone()).collect()
+}
+
 // ---------------------------------------------------------------------------
 // PlanFragmentBuilder
 // ---------------------------------------------------------------------------
@@ -462,6 +466,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                         });
                 }
                 out.source = refresh_ctx.target_state_scan_source(scan)?;
+                nodes::reject_target_state_equality_deletes(&out.source)?;
                 Ok(out)
             }
             _ => Ok(table.clone()),
@@ -712,12 +717,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                 ..
             } => {
                 let planner = self.connectors.scan_planner("iceberg")?;
-                let column_names = op
-                    .table
-                    .columns
-                    .iter()
-                    .map(|c| c.name.clone())
-                    .collect::<Vec<_>>();
+                let column_names = effective_iceberg_scan_column_names(&table);
                 let table_handle =
                     crate::connector::iceberg::IcebergConnectorScanPlanner::table_handle_from_source(
                         &iceberg_table.catalog,
@@ -4954,6 +4954,73 @@ mod tests {
             .expect_err("unknown field id");
 
         assert!(err.contains("unknown field id 99"), "{err}");
+    }
+
+    #[test]
+    fn effective_iceberg_scan_columns_use_converted_table_projection() {
+        let table = TableDef {
+            name: "mv_target".to_string(),
+            columns: vec![
+                ColumnDef {
+                    name: "region".to_string(),
+                    data_type: DataType::Utf8,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                },
+                ColumnDef {
+                    name: "sum_v".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    write_default: None,
+                    logical_type: None,
+                },
+            ],
+            iceberg_row_lineage_metadata_columns: vec![],
+            source: ScanSource::IcebergDataFiles {
+                table: test_iceberg_table_info(),
+                files: vec![],
+                cloud_properties: BTreeMap::new(),
+            },
+        };
+
+        assert_eq!(
+            effective_iceberg_scan_column_names(&table),
+            vec!["region".to_string(), "sum_v".to_string()]
+        );
+    }
+
+    #[test]
+    fn target_state_scan_rejects_equality_delete_files() {
+        let source = ScanSource::IcebergDataFiles {
+            table: test_iceberg_table_info_with_id_schema(),
+            files: vec![IcebergDataFileInfo {
+                path: "s3://bucket/data.parquet".to_string(),
+                size: 1,
+                row_count: Some(1),
+                column_stats: None,
+                partition_spec_id: Some(0),
+                partition_key: None,
+                first_row_id: None,
+                data_sequence_number: Some(1),
+                ivm_change_op: None,
+                delete_files: vec![equality_delete_file(
+                    vec!["category".to_string()],
+                    Vec::new(),
+                )],
+                manifest_path: None,
+                partition_values: vec![],
+            }],
+            cloud_properties: BTreeMap::new(),
+        };
+
+        let err = nodes::reject_target_state_equality_deletes(&source)
+            .expect_err("target-state scan must reject equality deletes");
+
+        assert!(
+            err.contains("Iceberg target-state scan does not support equality deletes yet"),
+            "{err}"
+        );
     }
 
     fn scan_plan(path: PathBuf) -> PhysicalPlanNode {
