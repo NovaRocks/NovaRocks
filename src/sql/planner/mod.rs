@@ -508,7 +508,7 @@ pub(crate) fn adapt_plan_output(
                 target.name, source.data_type, target.data_type
             ));
         }
-        if source.nullable != target.nullable {
+        if source.nullable && !target.nullable {
             return Err(format!(
                 "output nullability mismatch while adapting subquery/CTE column '{}': child={}, target={}",
                 target.name, source.nullable, target.nullable
@@ -522,7 +522,7 @@ pub(crate) fn adapt_plan_output(
                     column: source.name.clone(),
                 },
                 data_type: source.data_type.clone(),
-                nullable: source.nullable,
+                nullable: target.nullable,
             },
             output_name: target.name.clone(),
             output_column_id: target.column_id,
@@ -2576,6 +2576,67 @@ mod tests {
         };
         assert_eq!(*column_id, source_id);
         assert_eq!(column, "k");
+    }
+
+    #[test]
+    fn adapt_plan_output_allows_nullable_widening() {
+        let source_id = ColumnId::new_for_test(10);
+        let target_id = ColumnId::new_for_test(20);
+        let input = LogicalPlan::Values(ValuesNode {
+            rows: vec![],
+            columns: vec![OutputColumn {
+                column_id: source_id,
+                name: "k".to_string(),
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: false,
+                is_internal: false,
+            }],
+            required_output_columns: None,
+        });
+        let target = vec![OutputColumn {
+            column_id: target_id,
+            name: "nullable_k".to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: true,
+            is_internal: false,
+        }];
+
+        let adapted = adapt_plan_output(input, &target).expect("adapter should widen nullability");
+        let LogicalPlan::Project(project) = adapted else {
+            panic!("expected Project adapter");
+        };
+        assert_eq!(project.items.len(), 1);
+        assert!(project.items[0].expr.nullable);
+        assert_eq!(project.items[0].output_column_id, target_id);
+    }
+
+    #[test]
+    fn adapt_plan_output_rejects_nullable_narrowing() {
+        let input = LogicalPlan::Values(ValuesNode {
+            rows: vec![],
+            columns: vec![OutputColumn {
+                column_id: ColumnId::new_for_test(10),
+                name: "k".to_string(),
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: true,
+                is_internal: false,
+            }],
+            required_output_columns: None,
+        });
+        let target = vec![OutputColumn {
+            column_id: ColumnId::new_for_test(20),
+            name: "not_null_k".to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        }];
+
+        let err = adapt_plan_output(input, &target)
+            .expect_err("adapter should reject nullable narrowing");
+        assert!(
+            err.contains("output nullability mismatch"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
