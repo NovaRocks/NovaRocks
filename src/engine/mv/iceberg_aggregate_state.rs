@@ -6,8 +6,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::connector::starrocks::table::mv_agg_state::{
-    AggregateMvLayout, build_old_state_map, load_aggregate_physical_rows,
-    merge_aggregate_state_batches_with_retractions,
+    AggregateMvLayout, build_old_state_map, merge_aggregate_state_batches_with_retractions,
 };
 use crate::engine::record_batch_to_chunk;
 use crate::exec::change_op::{ChangeOp, change_op_array, change_op_field};
@@ -79,18 +78,34 @@ fn merge_aggregate_state_chunks_core(
     delta_chunks: &[Chunk],
     layout: &AggregateMvLayout,
 ) -> Result<AggregateStateMergeCoreResult, String> {
-    let old_rows = build_old_state_map(old_chunks, layout)?;
-    let old_row_ids = old_rows.keys().cloned().collect::<BTreeSet<_>>();
     let touched_row_ids = delta_row_ids(layout, delta_chunks)?;
+    let old_row_ids = physical_row_ids(layout, old_chunks)?;
+    let touched_old_chunks =
+        filter_physical_chunks_by_row_ids(layout, old_chunks, &touched_row_ids)?;
+    let old_rows = build_old_state_map(&touched_old_chunks, layout)?;
     let merge_result =
         merge_aggregate_state_batches_with_retractions(&old_rows, delta_chunks, layout)?;
-    let merged_rows = load_aggregate_physical_rows(&merge_result.upsert_chunks, layout)?;
-    let new_total_rows = i64::try_from(merged_rows.len())
+    let upsert_chunks =
+        filter_physical_chunks_by_row_ids(layout, &merge_result.upsert_chunks, &touched_row_ids)?;
+    let replaced_old_count = touched_row_ids
+        .iter()
+        .filter(|row_id| old_row_ids.contains(*row_id))
+        .count();
+    let insert_row_count = upsert_chunks
+        .iter()
+        .map(|chunk| chunk.batch.num_rows())
+        .sum::<usize>();
+    let new_total_rows = old_row_ids
+        .len()
+        .checked_sub(replaced_old_count)
+        .and_then(|count| count.checked_add(insert_row_count))
+        .ok_or_else(|| "iceberg aggregate MV target row count overflow".to_string())?;
+    let new_total_rows = i64::try_from(new_total_rows)
         .map_err(|_| "iceberg aggregate MV target row count overflow".to_string())?;
     Ok(AggregateStateMergeCoreResult {
         old_row_ids,
         touched_row_ids,
-        upsert_chunks: merge_result.upsert_chunks,
+        upsert_chunks,
         new_total_rows,
     })
 }
@@ -493,6 +508,37 @@ fn delta_row_ids(
     Ok(row_ids)
 }
 
+fn physical_row_ids(
+    layout: &AggregateMvLayout,
+    chunks: &[Chunk],
+) -> Result<BTreeSet<String>, String> {
+    let mut row_ids = BTreeSet::new();
+    let row_id_column = &layout.row_id_column.column.name;
+    for chunk in chunks {
+        let schema = chunk.batch.schema();
+        let row_id_index = schema.index_of(row_id_column).map_err(|e| {
+            format!("iceberg aggregate physical chunk missing row id column `{row_id_column}`: {e}")
+        })?;
+        let row_id_array = chunk
+            .batch
+            .column(row_id_index)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| {
+                format!("iceberg aggregate physical row id column `{row_id_column}` must be Utf8")
+            })?;
+        for row in 0..row_id_array.len() {
+            if row_id_array.is_null(row) {
+                return Err(format!(
+                    "iceberg aggregate physical row id column `{row_id_column}` cannot be NULL"
+                ));
+            }
+            row_ids.insert(row_id_array.value(row).to_string());
+        }
+    }
+    Ok(row_ids)
+}
+
 fn filter_physical_chunks_by_row_ids(
     layout: &AggregateMvLayout,
     chunks: &[Chunk],
@@ -709,6 +755,34 @@ mod tests {
         .expect("physical batch")
     }
 
+    fn count_physical_batch_with_raw_state(rows: &[(&str, &str, i64, &[u8])]) -> RecordBatch {
+        let mut state_builder = LargeBinaryBuilder::new();
+        for row in rows {
+            state_builder.append_value(row.3);
+        }
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("__row_id__", DataType::Utf8, false),
+                Field::new("region", DataType::Utf8, true),
+                Field::new("c", DataType::Int64, false),
+                Field::new("__agg_state_c", DataType::LargeBinary, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(StringArray::from(
+                    rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(state_builder.finish()) as ArrayRef,
+            ],
+        )
+        .expect("physical batch")
+    }
+
     fn assert_field(field: &Field, name: &str, data_type: &DataType, nullable: bool) {
         assert_eq!(field.name(), name);
         assert_eq!(field.data_type(), data_type);
@@ -890,6 +964,37 @@ mod tests {
         assert_eq!(result.new_total_rows, 3);
         assert_eq!(result.delete_row_ids, vec![r1.clone()]);
         assert_eq!(row_ids_from_chunks(&result.insert_chunks), vec![r1, r3]);
+    }
+
+    #[test]
+    fn merge_filters_old_state_by_delta_row_ids_before_decoding_state_bytes() {
+        let layout = test_count_layout();
+        let touched = encoded_utf8_group_row_id("touched");
+        let untouched = encoded_utf8_group_row_id("untouched");
+        let valid_state = encode_count_state(2);
+        let invalid_state = b"not-a-valid-count-state";
+        let old = vec![chunk(count_physical_batch_with_raw_state(&[
+            (touched.as_str(), "touched", 2, valid_state.as_slice()),
+            (
+                untouched.as_str(),
+                "untouched",
+                99,
+                invalid_state.as_slice(),
+            ),
+        ]))];
+        let delta = vec![chunk(count_physical_batch(&[(
+            touched.as_str(),
+            "touched",
+            1,
+            1,
+        )]))];
+
+        let result = merge_aggregate_target_state(&layout, &old, &delta)
+            .expect("untouched invalid old state must not be decoded");
+
+        assert_eq!(result.delete_row_ids, vec![touched.clone()]);
+        assert_eq!(row_ids_from_chunks(&result.insert_chunks), vec![touched]);
+        assert_eq!(result.new_total_rows, 2);
     }
 
     #[test]

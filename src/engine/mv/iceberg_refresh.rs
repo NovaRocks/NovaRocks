@@ -1361,19 +1361,26 @@ pub(crate) fn refresh_iceberg_mv(
         ));
     }
 
-    let ctx = IcebergMvRefreshContext::new(
-        target.clone(),
-        mv_definition.mv_id,
-        current_catalog,
-        current_database,
-        Arc::new(mv_definition.clone()),
-        Arc::new(canonical_select_query.clone()),
-        Arc::from(base_refs.clone()),
-        Arc::new(pin.clone()),
-        Arc::new(target_entry.clone()),
-        iceberg_catalog.clone(),
-        target_loaded.table.clone(),
-    )?;
+    let ctx = {
+        let iceberg_catalog_guard = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+        IcebergMvRefreshContext::new(
+            target.clone(),
+            mv_definition.mv_id,
+            current_catalog,
+            current_database,
+            Arc::new(mv_definition.clone()),
+            Arc::new(canonical_select_query.clone()),
+            Arc::from(base_refs.clone()),
+            Arc::new(pin.clone()),
+            &iceberg_catalog_guard,
+            Arc::new(target_entry.clone()),
+            iceberg_catalog.clone(),
+            target_loaded.table.clone(),
+        )?
+    };
     tracing::info!(
         summary = ?ctx.rewrite.summary(),
         "iceberg MV refresh context constructed"
@@ -1658,19 +1665,26 @@ fn refresh_single_aggregate_iceberg_mv(
         aggregate_shape.clone()
     };
     let aggregate_shape = &reclassified_aggregate_shape;
-    let ctx = IcebergMvRefreshContext::new(
-        target.clone(),
-        mv_definition.mv_id,
-        current_catalog,
-        current_database,
-        Arc::new(mv_definition.clone()),
-        Arc::new(canonical_select_query),
-        Arc::from(base_refs.to_vec()),
-        Arc::new(pin.clone()),
-        Arc::new(target_entry.clone()),
-        iceberg_catalog.clone(),
-        target_table.clone(),
-    )?;
+    let ctx = {
+        let iceberg_catalog_guard = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+        IcebergMvRefreshContext::new(
+            target.clone(),
+            mv_definition.mv_id,
+            current_catalog,
+            current_database,
+            Arc::new(mv_definition.clone()),
+            Arc::new(canonical_select_query),
+            Arc::from(base_refs.to_vec()),
+            Arc::new(pin.clone()),
+            &iceberg_catalog_guard,
+            Arc::new(target_entry.clone()),
+            iceberg_catalog.clone(),
+            target_table.clone(),
+        )?
+    };
     tracing::info!(
         summary = ?ctx.rewrite.summary(),
         "iceberg MV refresh context constructed"
@@ -2261,19 +2275,26 @@ fn refresh_join_aggregate_iceberg_mv(
         aggregate_shape.clone()
     };
     let aggregate_shape = &reclassified_aggregate_shape;
-    let ctx = IcebergMvRefreshContext::new(
-        target.clone(),
-        mv_definition.mv_id,
-        current_catalog,
-        current_database,
-        Arc::new(mv_definition.clone()),
-        Arc::new(canonical_select_query),
-        Arc::from(base_refs.to_vec()),
-        Arc::new(pin.clone()),
-        Arc::new(target_entry.clone()),
-        iceberg_catalog.clone(),
-        target_table.clone(),
-    )?;
+    let ctx = {
+        let iceberg_catalog_guard = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+        IcebergMvRefreshContext::new(
+            target.clone(),
+            mv_definition.mv_id,
+            current_catalog,
+            current_database,
+            Arc::new(mv_definition.clone()),
+            Arc::new(canonical_select_query),
+            Arc::from(base_refs.to_vec()),
+            Arc::new(pin.clone()),
+            &iceberg_catalog_guard,
+            Arc::new(target_entry.clone()),
+            iceberg_catalog.clone(),
+            target_table.clone(),
+        )?
+    };
     tracing::info!(
         summary = ?ctx.rewrite.summary(),
         "iceberg MV refresh context constructed"
@@ -4952,19 +4973,26 @@ fn refresh_iceberg_join_mv(
         current_catalog,
         current_database,
     );
-    let ctx = IcebergMvRefreshContext::new(
-        target.clone(),
-        mv_definition.mv_id,
-        current_catalog,
-        current_database,
-        Arc::new(mv_definition.clone()),
-        Arc::new(canonical_select_query),
-        Arc::from(base_refs.to_vec()),
-        Arc::new(pin.clone()),
-        Arc::new(target_entry.clone()),
-        iceberg_catalog.clone(),
-        target_table.clone(),
-    )?;
+    let ctx = {
+        let iceberg_catalog_guard = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+        IcebergMvRefreshContext::new(
+            target.clone(),
+            mv_definition.mv_id,
+            current_catalog,
+            current_database,
+            Arc::new(mv_definition.clone()),
+            Arc::new(canonical_select_query),
+            Arc::from(base_refs.to_vec()),
+            Arc::new(pin.clone()),
+            &iceberg_catalog_guard,
+            Arc::new(target_entry.clone()),
+            iceberg_catalog.clone(),
+            target_table.clone(),
+        )?
+    };
     tracing::info!(
         summary = ?ctx.rewrite.summary(),
         "iceberg MV refresh context constructed"
@@ -6103,19 +6131,26 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan(
     )?;
     validate_refresh_pin_table_uuids(&mv_definition, &pin, &base_refs)?;
 
-    let ctx = IcebergMvRefreshContext::new(
-        target,
-        mv_definition.mv_id,
-        current_catalog,
-        current_database,
-        Arc::new(mv_definition),
-        Arc::new(canonical_select_query),
-        Arc::from(base_refs),
-        Arc::new(pin),
-        Arc::new(target_entry),
-        iceberg_catalog,
-        target_loaded.table,
-    )?;
+    let ctx = {
+        let iceberg_catalog_guard = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+        IcebergMvRefreshContext::new(
+            target,
+            mv_definition.mv_id,
+            current_catalog,
+            current_database,
+            Arc::new(mv_definition),
+            Arc::new(canonical_select_query),
+            Arc::from(base_refs),
+            Arc::new(pin),
+            &iceberg_catalog_guard,
+            Arc::new(target_entry),
+            iceberg_catalog,
+            target_loaded.table,
+        )?
+    };
     let outcome = run_imv_rewrite_for_refresh_explain(state, &ctx)?;
     Ok(crate::sql::explain::explain_plan(&outcome.plan, level))
 }

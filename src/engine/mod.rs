@@ -4714,6 +4714,7 @@ enable_path_style_access = true
         crate::engine::mv::refresh_context::IcebergMvRefreshContext {
             rewrite: crate::engine::mv::refresh_context::tests_support::dummy_rewrite_context(),
             target_entry,
+            base_catalog_entries: std::collections::BTreeMap::new(),
             iceberg_catalog,
             target_table,
         }

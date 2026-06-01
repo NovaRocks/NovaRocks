@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use iceberg::spec::Schema;
 
-use crate::connector::iceberg::catalog::registry::IcebergCatalogEntry;
+use crate::connector::iceberg::catalog::registry::{IcebergCatalogEntry, IcebergCatalogRegistry};
 use crate::connector::starrocks::table::model::IcebergTableRef;
 use crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin;
 use crate::meta::repository::mv::StoredMvDefinition;
@@ -65,6 +65,7 @@ pub(crate) struct IcebergMvRewriteContext {
 pub(crate) struct IcebergMvRefreshContext {
     pub rewrite: Arc<IcebergMvRewriteContext>,
     pub target_entry: Arc<IcebergCatalogEntry>,
+    pub base_catalog_entries: BTreeMap<String, IcebergCatalogEntry>,
     pub iceberg_catalog: Arc<dyn iceberg::Catalog>,
     pub target_table: iceberg::table::Table,
 }
@@ -331,6 +332,7 @@ impl IcebergMvRefreshContext {
         canonical_select_query: Arc<sqlparser::ast::Query>,
         base_refs: Arc<[IcebergTableRef]>,
         pin: Arc<RefreshSnapshotPin>,
+        iceberg_catalogs: &IcebergCatalogRegistry,
         target_entry: Arc<IcebergCatalogEntry>,
         iceberg_catalog: Arc<dyn iceberg::Catalog>,
         target_table: iceberg::table::Table,
@@ -348,17 +350,19 @@ impl IcebergMvRefreshContext {
             current_database.to_string(),
             mv_definition,
             canonical_select_query,
-            base_refs,
+            base_refs.clone(),
             pin,
             target_snapshot_id,
             target_table_uuid,
             target_schema,
             schema_contract,
         )?;
+        let base_catalog_entries = collect_base_catalog_entries(iceberg_catalogs, &base_refs)?;
 
         Ok(Self {
             rewrite: Arc::new(rewrite),
             target_entry,
+            base_catalog_entries,
             iceberg_catalog,
             target_table,
         })
@@ -369,19 +373,7 @@ impl IcebergMvRefreshContext {
         table: &IcebergTableInfo,
         snapshot_id: i64,
     ) -> Result<ScanSource, String> {
-        if !table
-            .catalog
-            .eq_ignore_ascii_case(&self.rewrite.target.catalog)
-        {
-            return Err(format!(
-                "Iceberg version scan for {}.{}.{} requires catalog {} in MV refresh context, got {}",
-                table.catalog,
-                table.namespace,
-                table.table,
-                table.catalog,
-                self.rewrite.target.catalog
-            ));
-        }
+        let entry = self.base_catalog_entry_for_version_scan(&table.catalog)?;
         let ident =
             iceberg::TableIdent::from_strs([table.namespace.as_str(), table.table.as_str()])
                 .map_err(|e| {
@@ -390,8 +382,15 @@ impl IcebergMvRefreshContext {
                         table.catalog, table.namespace, table.table
                     )
                 })?;
+        let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(entry)
+            .map_err(|e| {
+                format!(
+                    "build iceberg catalog for version scan {}.{}.{}: {e}",
+                    table.catalog, table.namespace, table.table
+                )
+            })?;
         let loaded = crate::connector::iceberg::catalog::registry::block_on_iceberg(async {
-            self.iceberg_catalog.load_table(&ident).await
+            catalog.load_table(&ident).await
         })
         .map_err(|e| format!("load iceberg table for version scan runtime failed: {e}"))?
         .map_err(|e| {
@@ -404,7 +403,17 @@ impl IcebergMvRefreshContext {
         Ok(ScanSource::IcebergDataFiles {
             table: table.clone(),
             files,
-            cloud_properties: self.target_entry.cloud_properties_map(),
+            cloud_properties: entry.cloud_properties_map(),
+        })
+    }
+
+    fn base_catalog_entry_for_version_scan(
+        &self,
+        catalog: &str,
+    ) -> Result<&IcebergCatalogEntry, String> {
+        let key = crate::engine::catalog::normalize_identifier(catalog)?;
+        self.base_catalog_entries.get(&key).ok_or_else(|| {
+            format!("Iceberg version scan requires base catalog {catalog} in MV refresh context")
         })
     }
 
@@ -423,6 +432,79 @@ impl IcebergMvRefreshContext {
                 target.catalog,
                 target.namespace,
                 target.table
+            ));
+        }
+        if scan.target_table_uuid != self.rewrite.target_table_uuid {
+            return Err(format!(
+                "Iceberg target-state scan {} target uuid mismatch: scan={} context={}",
+                scan.fqn(),
+                scan.target_table_uuid,
+                self.rewrite.target_table_uuid
+            ));
+        }
+        if scan.target_snapshot_id != self.rewrite.target_snapshot_id {
+            return Err(format!(
+                "Iceberg target-state scan {} target snapshot mismatch: scan={:?} context={:?}",
+                scan.fqn(),
+                scan.target_snapshot_id,
+                self.rewrite.target_snapshot_id
+            ));
+        }
+        if matches!(
+            scan.partition_constraint,
+            crate::sql::catalog::IcebergMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired
+        ) {
+            return Err(format!(
+                "Iceberg target-state scan {} requires an affected partition allow-list before scanning target files",
+                scan.fqn()
+            ));
+        }
+        let aggregate_contract =
+            self.rewrite
+                .schema_contract
+                .aggregate
+                .as_ref()
+                .ok_or_else(|| {
+                    format!(
+                        "Iceberg target-state scan {} requires aggregate state contract",
+                        scan.fqn()
+                    )
+                })?;
+        if scan.aggregate_state_layout_version != aggregate_contract.state_layout_version {
+            return Err(format!(
+                "Iceberg target-state scan {} aggregate layout version mismatch: scan={} contract={}",
+                scan.fqn(),
+                scan.aggregate_state_layout_version,
+                aggregate_contract.state_layout_version
+            ));
+        }
+        match &scan.row_filter {
+            crate::sql::catalog::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+                row_id_column_name,
+            } if row_id_column_name.eq_ignore_ascii_case(&scan.row_id_column_name) => {}
+            crate::sql::catalog::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+                row_id_column_name,
+            } => {
+                return Err(format!(
+                    "Iceberg target-state scan {} row filter column mismatch: filter={} scan={}",
+                    scan.fqn(),
+                    row_id_column_name,
+                    scan.row_id_column_name
+                ));
+            }
+        }
+        let (_, layout) = self.rewrite.aggregate_shape_and_layout_for_execution()?;
+        let expected_physical_columns = layout
+            .physical_columns
+            .iter()
+            .map(|column| column.column.name.clone())
+            .collect::<Vec<_>>();
+        if scan.physical_column_names != expected_physical_columns {
+            return Err(format!(
+                "Iceberg target-state scan {} physical column mismatch: scan={:?} expected={:?}",
+                scan.fqn(),
+                scan.physical_column_names,
+                expected_physical_columns
             ));
         }
 
@@ -452,6 +534,28 @@ fn data_files_at_snapshot(
             .map(data_file_with_stats_to_info)
             .collect()
     })
+}
+
+fn collect_base_catalog_entries(
+    iceberg_catalogs: &IcebergCatalogRegistry,
+    base_refs: &[IcebergTableRef],
+) -> Result<BTreeMap<String, IcebergCatalogEntry>, String> {
+    let mut entries = BTreeMap::new();
+    for base_ref in base_refs {
+        let key = crate::engine::catalog::normalize_identifier(&base_ref.catalog)?;
+        if entries.contains_key(&key) {
+            continue;
+        }
+        let entry = iceberg_catalogs.get(&base_ref.catalog).map_err(|e| {
+            format!(
+                "collect iceberg MV refresh base catalog {} for {}: {e}",
+                base_ref.catalog,
+                base_ref.fqn()
+            )
+        })?;
+        entries.insert(key, entry);
+    }
+    Ok(entries)
 }
 
 fn data_file_with_stats_to_info(
@@ -1288,5 +1392,253 @@ mod tests {
             Some(contract),
         )
         .expect("ctx must accept aggregate state columns in target schema");
+    }
+
+    #[test]
+    fn version_scan_source_does_not_reject_base_catalog_that_differs_from_target() {
+        use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+        use iceberg::{CatalogBuilder, NamespaceIdent, TableIdent};
+
+        let warehouse = format!(
+            "memory://novarocks-version-scan-base-catalog-test-{}",
+            uuid::Uuid::new_v4()
+        );
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let iceberg_catalog: Arc<dyn iceberg::Catalog> = Arc::new(
+            runtime
+                .block_on(MemoryCatalogBuilder::default().load(
+                    "memory",
+                    std::collections::HashMap::from([(
+                        MEMORY_CATALOG_WAREHOUSE.to_string(),
+                        warehouse.clone(),
+                    )]),
+                ))
+                .expect("memory catalog"),
+        );
+
+        let target_entry = Arc::new(
+            crate::connector::iceberg::catalog::registry::build_catalog_entry(
+                "tgt",
+                &[
+                    ("iceberg.catalog.type".to_string(), "memory".to_string()),
+                    ("iceberg.catalog.warehouse".to_string(), warehouse),
+                ],
+            )
+            .expect("catalog entry"),
+        );
+        let base_warehouse = std::env::temp_dir()
+            .join(format!(
+                "novarocks-version-scan-base-catalog-test-{}",
+                uuid::Uuid::new_v4()
+            ))
+            .to_string_lossy()
+            .into_owned();
+        let base_entry = crate::connector::iceberg::catalog::registry::build_catalog_entry(
+            "ice",
+            &[
+                ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                ("iceberg.catalog.warehouse".to_string(), base_warehouse),
+            ],
+        )
+        .expect("base catalog entry");
+        let base_catalog_entries = [("ice".to_string(), base_entry)].into_iter().collect();
+        let schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::required(
+                    100,
+                    "k",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+                Arc::new(NestedField::optional(
+                    101,
+                    "v",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+            ])
+            .build()
+            .expect("schema");
+        let metadata = iceberg::spec::TableMetadataBuilder::new(
+            schema,
+            iceberg::spec::PartitionSpec::unpartition_spec().into_unbound(),
+            iceberg::spec::SortOrder::unsorted_order(),
+            "memory://target/table".to_string(),
+            iceberg::spec::FormatVersion::V3,
+            std::collections::HashMap::new(),
+        )
+        .expect("metadata builder")
+        .build()
+        .expect("metadata")
+        .metadata;
+        let target_table = iceberg::table::Table::builder()
+            .file_io(iceberg::io::FileIO::new_with_memory())
+            .metadata(metadata)
+            .identifier(TableIdent::new(
+                NamespaceIdent::new("db".to_string()),
+                "mv".to_string(),
+            ))
+            .build()
+            .expect("target table");
+        let ctx = IcebergMvRefreshContext {
+            rewrite: dummy_rewrite_context(),
+            target_entry,
+            base_catalog_entries,
+            iceberg_catalog,
+            target_table,
+        };
+        let table = IcebergTableInfo {
+            catalog: "ice".to_string(),
+            namespace: "db".to_string(),
+            table: "missing_base".to_string(),
+            table_uuid: None,
+            current_snapshot_id: None,
+            schema_id: 0,
+            location: String::new(),
+            schema: IcebergSchemaDef { fields: Vec::new() },
+            serialized_metadata: None,
+        };
+
+        let err = ctx
+            .version_scan_source(&table, 123)
+            .expect_err("missing base table should fail after catalog resolution");
+        assert!(
+            !err.contains("requires catalog ice in MV refresh context, got tgt"),
+            "version scan must resolve by base catalog, got: {err}"
+        );
+    }
+
+    #[test]
+    fn collect_base_catalog_entries_preserves_base_catalog_cloud_properties() {
+        let mut registry = IcebergCatalogRegistry::default();
+        let target_warehouse = std::env::temp_dir()
+            .join(format!(
+                "novarocks-version-scan-target-catalog-test-{}",
+                uuid::Uuid::new_v4()
+            ))
+            .to_string_lossy()
+            .into_owned();
+        let base_warehouse = std::env::temp_dir()
+            .join(format!(
+                "novarocks-version-scan-base-entry-test-{}",
+                uuid::Uuid::new_v4()
+            ))
+            .to_string_lossy()
+            .into_owned();
+        registry
+            .create_catalog(
+                "tgt",
+                &[
+                    ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                    ("iceberg.catalog.warehouse".to_string(), target_warehouse),
+                    ("aws.s3.endpoint".to_string(), "target-endpoint".to_string()),
+                ],
+            )
+            .expect("target catalog");
+        registry
+            .create_catalog(
+                "ice",
+                &[
+                    ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                    ("iceberg.catalog.warehouse".to_string(), base_warehouse),
+                    ("aws.s3.endpoint".to_string(), "base-endpoint".to_string()),
+                ],
+            )
+            .expect("base catalog");
+        let base_refs = vec![make_ref("ice", "db", "b")];
+
+        let entries = collect_base_catalog_entries(&registry, &base_refs).expect("entries");
+        let cloud = entries
+            .get("ice")
+            .expect("base entry")
+            .cloud_properties_map();
+
+        assert_eq!(
+            cloud.get("aws.s3.endpoint").map(String::as_str),
+            Some("base-endpoint")
+        );
+    }
+
+    #[test]
+    fn target_state_scan_fails_fast_when_partition_allow_list_is_required() {
+        use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+        use iceberg::{CatalogBuilder, NamespaceIdent, TableIdent};
+
+        let warehouse = format!(
+            "memory://novarocks-target-state-partition-contract-test-{}",
+            uuid::Uuid::new_v4()
+        );
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let iceberg_catalog: Arc<dyn iceberg::Catalog> = Arc::new(
+            runtime
+                .block_on(MemoryCatalogBuilder::default().load(
+                    "memory",
+                    std::collections::HashMap::from([(
+                        MEMORY_CATALOG_WAREHOUSE.to_string(),
+                        warehouse.clone(),
+                    )]),
+                ))
+                .expect("memory catalog"),
+        );
+        let target_entry = Arc::new(
+            crate::connector::iceberg::catalog::registry::build_catalog_entry(
+                "tgt",
+                &[
+                    ("iceberg.catalog.type".to_string(), "memory".to_string()),
+                    ("iceberg.catalog.warehouse".to_string(), warehouse),
+                ],
+            )
+            .expect("target entry"),
+        );
+        let schema = make_target_schema();
+        let metadata = iceberg::spec::TableMetadataBuilder::new(
+            schema.as_ref().clone(),
+            iceberg::spec::PartitionSpec::unpartition_spec().into_unbound(),
+            iceberg::spec::SortOrder::unsorted_order(),
+            "memory://target/table".to_string(),
+            iceberg::spec::FormatVersion::V3,
+            std::collections::HashMap::new(),
+        )
+        .expect("metadata builder")
+        .build()
+        .expect("metadata")
+        .metadata;
+        let target_table = iceberg::table::Table::builder()
+            .file_io(iceberg::io::FileIO::new_with_memory())
+            .metadata(metadata)
+            .identifier(TableIdent::new(
+                NamespaceIdent::new("db".to_string()),
+                "mv".to_string(),
+            ))
+            .build()
+            .expect("target table");
+        let ctx = IcebergMvRefreshContext {
+            rewrite: dummy_rewrite_context(),
+            target_entry,
+            base_catalog_entries: BTreeMap::new(),
+            iceberg_catalog,
+            target_table,
+        };
+        let scan = IcebergMvTargetStateScan {
+            catalog: "tgt".to_string(),
+            database: "db".to_string(),
+            table: "mv".to_string(),
+            target_table_uuid: "uuid-tgt".to_string(),
+            target_snapshot_id: Some(99),
+            aggregate_state_layout_version: 1,
+            columns: Vec::new(),
+            group_key_names: Vec::new(),
+            aggregate_state_names: Vec::new(),
+            physical_column_names: Vec::new(),
+            row_id_column_name: "__row_id__".to_string(),
+            row_filter: crate::sql::catalog::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+                row_id_column_name: "__row_id__".to_string(),
+            },
+            partition_constraint:
+                crate::sql::catalog::IcebergMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired,
+        };
+
+        let err = ctx
+            .target_state_scan_source(&scan)
+            .expect_err("partitioned target-state scan must fail before file planning");
+        assert!(err.contains("affected partition allow-list"), "{err}");
     }
 }

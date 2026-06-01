@@ -1622,6 +1622,9 @@ mod tests {
                     catalog: "ice".to_string(),
                     database: "db".to_string(),
                     table: "mv_b".to_string(),
+                    target_table_uuid: "target-uuid".to_string(),
+                    target_snapshot_id: Some(123),
+                    aggregate_state_layout_version: 1,
                     columns: vec![
                         ColumnDef {
                             name: "k".to_string(),
@@ -1640,7 +1643,14 @@ mod tests {
                     ],
                     group_key_names: vec!["k".to_string()],
                     aggregate_state_names: vec!["sum_v".to_string()],
+                    physical_column_names: vec!["k".to_string(), "sum_v".to_string()],
                     row_id_column_name: "_row_id".to_string(),
+                    row_filter:
+                        crate::sql::catalog::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+                            row_id_column_name: "_row_id".to_string(),
+                        },
+                    partition_constraint:
+                        crate::sql::catalog::IcebergMvTargetStatePartitionConstraint::Unpartitioned,
                 }),
             },
             planned_scan: None,
@@ -1687,6 +1697,9 @@ mod tests {
             catalog: "ice".to_string(),
             database: "db".to_string(),
             table: "mv_b".to_string(),
+            target_table_uuid: "target-uuid".to_string(),
+            target_snapshot_id: Some(123),
+            aggregate_state_layout_version: 1,
             columns: vec![
                 ColumnDef {
                     name: "__row_id__".to_string(),
@@ -1719,7 +1732,18 @@ mod tests {
             ],
             group_key_names: vec!["k".to_string()],
             aggregate_state_names: vec!["sum_v".to_string()],
+            physical_column_names: vec![
+                "__row_id__".to_string(),
+                "k".to_string(),
+                "visible_sum".to_string(),
+                "sum_v".to_string(),
+            ],
             row_id_column_name: "__row_id__".to_string(),
+            row_filter: crate::sql::catalog::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+                row_id_column_name: "__row_id__".to_string(),
+            },
+            partition_constraint:
+                crate::sql::catalog::IcebergMvTargetStatePartitionConstraint::Unpartitioned,
         };
 
         assert_eq!(

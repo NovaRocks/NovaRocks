@@ -343,10 +343,11 @@ fn logical_scan_source_label(source: &ScanSource) -> Option<String> {
             Some(format!("IcebergVersionTable snapshot_id={snapshot_id}"))
         }
         ScanSource::IcebergMvTargetState(scan) => Some(format!(
-            "IcebergMvTargetState target={} keys=[{}] states=[{}]",
+            "IcebergMvTargetState target={} keys=[{}] states=[{}] {}",
             scan.fqn(),
             scan.group_key_names.join(","),
-            scan.aggregate_state_names.join(",")
+            scan.aggregate_state_names.join(","),
+            scan.constraint_summary()
         )),
         _ => None,
     }

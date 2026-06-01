@@ -4,7 +4,9 @@ use arrow::datatypes::{DataType, Field, TimeUnit};
 use iceberg::spec::{NestedField, PrimitiveType, Type};
 
 use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
-use crate::sql::catalog::{ColumnDef, TableDef};
+use crate::sql::catalog::{
+    ColumnDef, IcebergMvTargetStatePartitionConstraint, IcebergMvTargetStateRowFilter, TableDef,
+};
 use crate::sql::codegen::helpers::{agg_call_display_name, typed_expr_display_name};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
@@ -86,15 +88,41 @@ impl LogicalRewriteRule for RewriteAggregateStateRule {
         let row_id_column_name = aggregate_row_id_column_name(ext)?;
         let target_columns = target_columns(ext)?;
         let target = &ext.mv_ctx.target;
+        let aggregate_contract =
+            ext.mv_ctx
+                .schema_contract
+                .aggregate
+                .as_ref()
+                .ok_or_else(|| {
+                    "Iceberg IMV aggregate rewrite requires aggregate state contract".to_string()
+                })?;
+        let physical_column_names = aggregate_layout
+            .physical_columns
+            .iter()
+            .map(|column| column.column.name.clone())
+            .collect::<Vec<_>>();
+        let partition_constraint = if ext.mv_ctx.schema_contract.target.partition.is_some() {
+            IcebergMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired
+        } else {
+            IcebergMvTargetStatePartitionConstraint::Unpartitioned
+        };
 
         let old_source = build_target_state_scan_source(
             target.catalog.clone(),
             target.namespace.clone(),
             target.table.clone(),
+            ext.mv_ctx.target_table_uuid.clone(),
+            ext.mv_ctx.target_snapshot_id,
+            aggregate_contract.state_layout_version,
             target_columns.clone(),
             group_key_names.clone(),
             aggregate_state_names.clone(),
+            physical_column_names,
             row_id_column_name.clone(),
+            IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+                row_id_column_name: row_id_column_name.clone(),
+            },
+            partition_constraint,
         );
         let old_columns = target_columns
             .iter()
