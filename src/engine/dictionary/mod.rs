@@ -346,11 +346,10 @@ impl QueryDictionaryProvider for DictionaryQueryProvider {
         let Some(owner) = self.owner_for(table, database)? else {
             return Ok(None);
         };
-        let Some(snapshot) = self.state.dictionary_manager.load_active_snapshot(
-            &self.state,
-            &owner,
-            column_name,
-        )?
+        let Some(snapshot) =
+            self.state
+                .dictionary_manager
+                .load_active_snapshot(&self.state, &owner, column_name)?
         else {
             return Ok(None);
         };

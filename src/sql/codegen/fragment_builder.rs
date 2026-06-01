@@ -76,7 +76,6 @@ fn limit_child_can_apply_offset_locally(child: &PhysicalPlanNode) -> bool {
     )
 }
 
-
 /// Probe-side target recorded while visiting a node that carries a
 /// `RuntimeFilterProbe` annotation. The build-side hash join (visited AFTER
 /// its probe descendants) looks this up by `filter_id` to wire the RF's

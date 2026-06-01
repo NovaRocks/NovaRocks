@@ -27,20 +27,25 @@ mod rf_field_tests {
         let mut node = PhysicalPlanNode {
             op: make_test_op(),
             children: vec![],
-            stats: Statistics { output_row_count: 1.0, column_statistics: Default::default() },
+            stats: Statistics {
+                output_row_count: 1.0,
+                column_statistics: Default::default(),
+            },
             output_columns: vec![],
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
         assert!(node.build_runtime_filters.is_empty());
-        node.build_runtime_filters.push(RuntimeFilterDesc::placeholder(0));
-        node.probe_runtime_filters.push(RuntimeFilterProbe::placeholder(0));
+        node.build_runtime_filters
+            .push(RuntimeFilterDesc::placeholder(0));
+        node.probe_runtime_filters
+            .push(RuntimeFilterProbe::placeholder(0));
         assert_eq!(node.build_runtime_filters.len(), 1);
         assert_eq!(node.probe_runtime_filters.len(), 1);
     }
 
     fn make_test_op() -> Operator {
-        use crate::sql::optimizer::operator::{PhysicalValuesOp};
+        use crate::sql::optimizer::operator::PhysicalValuesOp;
         Operator::PhysicalValues(PhysicalValuesOp {
             rows: vec![],
             columns: vec![],

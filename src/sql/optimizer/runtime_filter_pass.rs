@@ -28,8 +28,6 @@ pub(crate) struct RuntimeFilterDesc {
     pub expr_order: usize,
     /// Join distribution; drives thrift build_join_mode + layout.
     pub distribution: JoinDistribution,
-    /// Estimated build-side row count (for thrift build_cardinality / debug).
-    pub build_cardinality: f64,
 }
 
 /// Probe-side runtime filter consumed by a node (scan or intermediate).
@@ -49,7 +47,6 @@ impl RuntimeFilterDesc {
             probe_expr: test_null_expr(),
             expr_order: 0,
             distribution: JoinDistribution::Broadcast,
-            build_cardinality: 0.0,
         }
     }
 }
@@ -57,7 +54,10 @@ impl RuntimeFilterDesc {
 #[cfg(test)]
 impl RuntimeFilterProbe {
     pub(crate) fn placeholder(filter_id: i32) -> Self {
-        Self { filter_id, probe_expr: test_null_expr() }
+        Self {
+            filter_id,
+            probe_expr: test_null_expr(),
+        }
     }
 }
 
@@ -138,7 +138,9 @@ fn column_ids(expr: &TypedExpr, out: &mut HashSet<ColumnId>) {
                 column_ids(item, out);
             }
         }
-        ExprKind::Between { expr, low, high, .. } => {
+        ExprKind::Between {
+            expr, low, high, ..
+        } => {
             column_ids(expr, out);
             column_ids(low, out);
             column_ids(high, out);
@@ -147,7 +149,12 @@ fn column_ids(expr: &TypedExpr, out: &mut HashSet<ColumnId>) {
             column_ids(expr, out);
             column_ids(pattern, out);
         }
-        ExprKind::Case { operand, when_then, else_expr, .. } => {
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+            ..
+        } => {
             if let Some(op) = operand {
                 column_ids(op, out);
             }
@@ -165,7 +172,12 @@ fn column_ids(expr: &TypedExpr, out: &mut HashSet<ColumnId>) {
         ExprKind::Nested(inner) => {
             column_ids(inner, out);
         }
-        ExprKind::WindowCall { args, partition_by, order_by, .. } => {
+        ExprKind::WindowCall {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
             for arg in args {
                 column_ids(arg, out);
             }
@@ -184,7 +196,9 @@ fn column_ids(expr: &TypedExpr, out: &mut HashSet<ColumnId>) {
         // - Literal: holds only a LiteralValue (no TypedExpr).
         // - LambdaParamRef: references a lambda slot by name/id, not a ColumnId.
         // - SubqueryPlaceholder: consumed before planning; has no TypedExpr children.
-        ExprKind::Literal(_) | ExprKind::LambdaParamRef { .. } | ExprKind::SubqueryPlaceholder { .. } => {}
+        ExprKind::Literal(_)
+        | ExprKind::LambdaParamRef { .. }
+        | ExprKind::SubqueryPlaceholder { .. } => {}
     }
 }
 
@@ -278,7 +292,6 @@ fn annotate_node(node: &mut PhysicalPlanNode, next_filter_id: &mut i32) {
     let eq_conditions = join.eq_conditions.clone();
     let distribution = join.distribution.clone();
     // Right child is build side (confirmed via pipeline builder + lowering).
-    let build_card = node.children[1].stats.output_row_count;
     let build_size = node.children[1].stats.compute_size();
     let probe_size = node.children[0].stats.compute_size();
 
@@ -308,7 +321,6 @@ fn annotate_node(node: &mut PhysicalPlanNode, next_filter_id: &mut i32) {
             probe_expr: eq.left.clone(),
             expr_order,
             distribution: distribution.clone(),
-            build_cardinality: build_card,
         });
     }
 
@@ -316,7 +328,10 @@ fn annotate_node(node: &mut PhysicalPlanNode, next_filter_id: &mut i32) {
     // the probe child (children[0]). Stops at exchange (fragment) boundaries.
     // If no binding node is found the RF is build-only (probe remains unplaced).
     for d in &descs {
-        let probe = RuntimeFilterProbe { filter_id: d.filter_id, probe_expr: d.probe_expr.clone() };
+        let probe = RuntimeFilterProbe {
+            filter_id: d.filter_id,
+            probe_expr: d.probe_expr.clone(),
+        };
         // children[0] = probe side; descend to the deepest binding node.
         let _ = push_probe_down(&mut node.children[0], &probe);
     }
@@ -370,9 +385,15 @@ pub(crate) mod test_support {
 
     fn leaf(rows: f64, oc: OutputColumn) -> PhysicalPlanNode {
         PhysicalPlanNode {
-            op: Operator::PhysicalValues(PhysicalValuesOp { rows: vec![], columns: vec![] }),
+            op: Operator::PhysicalValues(PhysicalValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
             children: vec![],
-            stats: Statistics { output_row_count: rows, column_statistics: Default::default() },
+            stats: Statistics {
+                output_row_count: rows,
+                column_statistics: Default::default(),
+            },
             output_columns: vec![oc],
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
@@ -396,7 +417,10 @@ pub(crate) mod test_support {
                 distribution: JoinDistribution::Broadcast,
             }),
             children: vec![left, right],
-            stats: Statistics { output_row_count: 10.0, column_statistics: Default::default() },
+            stats: Statistics {
+                output_row_count: 10.0,
+                column_statistics: Default::default(),
+            },
             output_columns: vec![loc, roc],
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
@@ -439,7 +463,10 @@ pub(crate) mod test_support {
         let project = PhysicalPlanNode {
             op: Operator::PhysicalProject(PhysicalProjectOp { items: vec![] }),
             children: vec![scan],
-            stats: Statistics { output_row_count: 1_000_000.0, column_statistics: Default::default() },
+            stats: Statistics {
+                output_row_count: 1_000_000.0,
+                column_statistics: Default::default(),
+            },
             output_columns: vec![loc.clone()], // project passes column 1 through
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
@@ -457,7 +484,10 @@ pub(crate) mod test_support {
                 distribution: JoinDistribution::Broadcast,
             }),
             children: vec![project, build],
-            stats: Statistics { output_row_count: 10.0, column_statistics: Default::default() },
+            stats: Statistics {
+                output_row_count: 10.0,
+                column_statistics: Default::default(),
+            },
             output_columns: vec![loc, roc],
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
