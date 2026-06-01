@@ -1112,11 +1112,23 @@ fn logical_plan_satisfies_window_ordering(
     partition_by: &[TypedExpr],
 ) -> bool {
     match input {
+        LogicalPlan::Project(project) if project_preserves_column_identity(project) => {
+            logical_plan_satisfies_window_ordering(&project.input, required_items, partition_by)
+        }
         LogicalPlan::Sort(sort) => {
             logical_sort_satisfies_window_ordering(sort, required_items, partition_by)
         }
         _ => false,
     }
+}
+
+fn project_preserves_column_identity(project: &ProjectNode) -> bool {
+    project.items.iter().all(|item| {
+        matches!(
+            &item.expr.kind,
+            ExprKind::ColumnRef { column_id, .. } if item.output_column_id == *column_id
+        )
+    })
 }
 
 fn logical_sort_satisfies_window_ordering(
@@ -2456,12 +2468,12 @@ mod tests {
         plan_query(resolved, cte_registry, &mut factory)
     }
 
-    fn find_subquery_input(plan: &LogicalPlan) -> Option<&LogicalPlan> {
+    fn strip_project_sort_limit(plan: &LogicalPlan) -> &LogicalPlan {
         match plan {
-            LogicalPlan::Project(node) => find_subquery_input(&node.input),
-            LogicalPlan::Sort(node) => find_subquery_input(&node.input),
-            LogicalPlan::Limit(node) => find_subquery_input(&node.input),
-            other => Some(other),
+            LogicalPlan::Project(node) => strip_project_sort_limit(&node.input),
+            LogicalPlan::Sort(node) => strip_project_sort_limit(&node.input),
+            LogicalPlan::Limit(node) => strip_project_sort_limit(&node.input),
+            other => other,
         }
     }
 
@@ -2472,7 +2484,7 @@ mod tests {
         }
     }
 
-    fn contains_project_adapter(
+    fn contains_identity_project_adapter(
         plan: &LogicalPlan,
         source_column: &str,
         output_name: &str,
@@ -2483,18 +2495,19 @@ mod tests {
                     item.output_name == output_name
                         && matches!(
                             &item.expr.kind,
-                            ExprKind::ColumnRef { column, .. } if column == source_column
+                            ExprKind::ColumnRef { column_id, column, .. }
+                                if column == source_column && item.output_column_id == *column_id
                         )
-                }) || contains_project_adapter(&project.input, source_column, output_name)
+                }) || contains_identity_project_adapter(&project.input, source_column, output_name)
             }
             LogicalPlan::Filter(node) => {
-                contains_project_adapter(&node.input, source_column, output_name)
+                contains_identity_project_adapter(&node.input, source_column, output_name)
             }
             LogicalPlan::Sort(node) => {
-                contains_project_adapter(&node.input, source_column, output_name)
+                contains_identity_project_adapter(&node.input, source_column, output_name)
             }
             LogicalPlan::Limit(node) => {
-                contains_project_adapter(&node.input, source_column, output_name)
+                contains_identity_project_adapter(&node.input, source_column, output_name)
             }
             _ => false,
         }
@@ -2694,8 +2707,8 @@ mod tests {
         );
 
         assert!(
-            contains_project_adapter(&plan, "o_orderkey", "ok"),
-            "expected Project adapter to expose column alias ok: {plan:?}"
+            contains_identity_project_adapter(&plan, "o_orderkey", "ok"),
+            "expected identity Project adapter to expose column alias ok: {plan:?}"
         );
     }
 
@@ -2711,8 +2724,7 @@ mod tests {
         match plan {
             LogicalPlan::CTEAnchor(outer_anchor) => {
                 assert_eq!(outer_anchor.cte_id, 0);
-                let subquery_input = find_subquery_input(&outer_anchor.consumer)
-                    .expect("expected derived subquery under outer consumer");
+                let subquery_input = strip_project_sort_limit(&outer_anchor.consumer);
                 match subquery_input {
                     LogicalPlan::CTEAnchor(inner_anchor) => {
                         assert_eq!(inner_anchor.cte_id, 1);
@@ -2805,6 +2817,37 @@ mod tests {
         assert_eq!(
             sort_count, 1,
             "window should reuse the derived table ordering: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn window_reuses_ordering_through_derived_table_column_alias_project() {
+        let plan = parse_analyze_and_plan(
+            "SELECT sum(ok) OVER \
+                    (ORDER BY ok ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) \
+                    AS running_sum \
+             FROM (SELECT o_orderkey FROM orders ORDER BY o_orderkey) s(ok)",
+        )
+        .expect("planner should succeed");
+
+        let lines =
+            crate::sql::explain::explain_plan(&plan, crate::sql::explain::ExplainLevel::Verbose);
+        let sort_lines = lines
+            .iter()
+            .filter(|line| line.contains("SORT BY ["))
+            .collect::<Vec<_>>();
+        assert!(
+            !lines.iter().any(|line| line.contains("SUBQUERY ALIAS")),
+            "derived table should not explain as SUBQUERY ALIAS: {lines:?}"
+        );
+        assert_eq!(
+            sort_lines.len(),
+            1,
+            "window should reuse derived table ordering through identity Project: {lines:?}"
+        );
+        assert!(
+            sort_lines[0].contains("SORT BY [o_orderkey ASC NULLS FIRST]"),
+            "expected the preserved derived-table ordering, got {sort_lines:?}"
         );
     }
 
