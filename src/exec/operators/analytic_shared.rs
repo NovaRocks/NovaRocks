@@ -229,20 +229,14 @@ impl AnalyticSharedState {
         }
 
         let partitions = compute_partitions(&partition_keys, total_rows)?;
+        let window_ctx =
+            PartitionWindowContext::new(&partitions, &order_keys, self.window.as_ref())?;
 
         let mut func_outputs: Vec<ArrayRef> = Vec::with_capacity(self.functions.len());
         for (func_idx, func) in self.functions.iter().enumerate() {
             let arrays = self.eval_exprs(&ordered_chunk, &func.args)?;
-            let out = compute_window_function(
-                &self.arena,
-                func,
-                &arrays,
-                &partitions,
-                &order_keys,
-                self.window.as_ref(),
-                total_rows,
-            )
-            .map_err(|e| format!("window function #{}: {}", func_idx, e))?;
+            let out = compute_window_function(&self.arena, func, &arrays, &window_ctx, total_rows)
+                .map_err(|e| format!("window function #{}: {}", func_idx, e))?;
             func_outputs.push(out);
         }
 
@@ -298,10 +292,7 @@ impl AnalyticSharedState {
             output_chunk_schema
         };
 
-        Ok(VecDeque::from(vec![
-            Chunk::try_new_with_columns(effective_schema, columns)
-                .map_err(|e| format!("build analytic output batch: {}", e))?,
-        ]))
+        split_analytic_output_chunks(effective_schema, &columns, input)
     }
 
     fn eval_exprs(&self, chunk: &Chunk, exprs: &[ExprId]) -> Result<Vec<ArrayRef>, String> {
@@ -339,6 +330,78 @@ fn compute_partitions(keys: &[ArrayRef], rows: usize) -> Result<Vec<(usize, usiz
     }
     parts.push((start, rows));
     Ok(parts)
+}
+
+struct PartitionWindowContext {
+    partitions: Vec<(usize, usize)>,
+    peer_groups_by_partition: Vec<Vec<(usize, usize)>>,
+    frames_by_partition: Vec<Vec<(usize, usize)>>,
+}
+
+impl PartitionWindowContext {
+    fn new(
+        partitions: &[(usize, usize)],
+        order_keys: &[ArrayRef],
+        window: Option<&WindowFrame>,
+    ) -> Result<Self, String> {
+        let mut peer_groups_by_partition = Vec::with_capacity(partitions.len());
+        let mut frames_by_partition = Vec::with_capacity(partitions.len());
+        for (part_start, part_end) in partitions {
+            let peer_groups = compute_peer_groups(order_keys, *part_start, *part_end)?;
+            let frames =
+                compute_frames_for_partition(*part_start, *part_end, &peer_groups, window)?;
+            peer_groups_by_partition.push(peer_groups);
+            frames_by_partition.push(frames);
+        }
+        Ok(Self {
+            partitions: partitions.to_vec(),
+            peer_groups_by_partition,
+            frames_by_partition,
+        })
+    }
+
+    fn partitions(&self) -> &[(usize, usize)] {
+        &self.partitions
+    }
+
+    fn peer_groups(&self, part_idx: usize) -> Result<&[(usize, usize)], String> {
+        self.peer_groups_by_partition
+            .get(part_idx)
+            .map(Vec::as_slice)
+            .ok_or_else(|| format!("window partition index out of range: {}", part_idx))
+    }
+
+    fn frames(&self, part_idx: usize) -> Result<&[(usize, usize)], String> {
+        self.frames_by_partition
+            .get(part_idx)
+            .map(Vec::as_slice)
+            .ok_or_else(|| format!("window partition index out of range: {}", part_idx))
+    }
+}
+
+fn split_analytic_output_chunks(
+    output_chunk_schema: ChunkSchemaRef,
+    columns: &[ArrayRef],
+    input: &[Chunk],
+) -> Result<VecDeque<Chunk>, String> {
+    let mut out = VecDeque::new();
+    let mut offset = 0usize;
+    for chunk in input {
+        let len = chunk.len();
+        if len == 0 {
+            continue;
+        }
+        let sliced_columns = columns
+            .iter()
+            .map(|column| column.slice(offset, len))
+            .collect::<Vec<_>>();
+        out.push_back(
+            Chunk::try_new_with_columns(Arc::clone(&output_chunk_schema), sliced_columns)
+                .map_err(|e| format!("build analytic output batch: {}", e))?,
+        );
+        offset += len;
+    }
+    Ok(out)
 }
 
 fn should_reorder_window_input(
@@ -604,57 +667,37 @@ fn compute_window_function(
     arena: &ExprArena,
     func: &WindowFunctionSpec,
     args: &[ArrayRef],
-    partitions: &[(usize, usize)],
-    order_keys: &[ArrayRef],
-    window: Option<&WindowFrame>,
+    window_ctx: &PartitionWindowContext,
     total_rows: usize,
 ) -> Result<ArrayRef, String> {
     match &func.kind {
-        WindowFunctionKind::RowNumber => compute_row_number(partitions, total_rows),
-        WindowFunctionKind::Rank => compute_rank(partitions, order_keys, total_rows),
-        WindowFunctionKind::DenseRank => compute_dense_rank(partitions, order_keys, total_rows),
-        WindowFunctionKind::CumeDist => compute_cume_dist(partitions, order_keys, total_rows),
-        WindowFunctionKind::PercentRank => compute_percent_rank(partitions, order_keys, total_rows),
-        WindowFunctionKind::Ntile => compute_ntile(arena, func, args, partitions, total_rows),
-        WindowFunctionKind::FirstValue { ignore_nulls } => compute_first_last_value(
-            args,
-            partitions,
-            order_keys,
-            window,
-            *ignore_nulls,
-            true,
-            total_rows,
-        ),
+        WindowFunctionKind::RowNumber => compute_row_number(window_ctx.partitions(), total_rows),
+        WindowFunctionKind::Rank => compute_rank(window_ctx, total_rows),
+        WindowFunctionKind::DenseRank => compute_dense_rank(window_ctx, total_rows),
+        WindowFunctionKind::CumeDist => compute_cume_dist(window_ctx, total_rows),
+        WindowFunctionKind::PercentRank => compute_percent_rank(window_ctx, total_rows),
+        WindowFunctionKind::Ntile => {
+            compute_ntile(arena, func, args, window_ctx.partitions(), total_rows)
+        }
+        WindowFunctionKind::FirstValue { ignore_nulls } => {
+            compute_first_last_value(args, window_ctx, *ignore_nulls, true, total_rows)
+        }
         WindowFunctionKind::FirstValueRewrite { ignore_nulls } => {
             let pad_rows = if func.args.len() > 1 {
                 parse_int64_literal(arena, func.args[1])?
             } else {
                 -1
             };
-            compute_first_value_rewrite(
-                args,
-                partitions,
-                order_keys,
-                window,
-                *ignore_nulls,
-                pad_rows,
-                total_rows,
-            )
+            compute_first_value_rewrite(args, window_ctx, *ignore_nulls, pad_rows, total_rows)
         }
-        WindowFunctionKind::LastValue { ignore_nulls } => compute_first_last_value(
-            args,
-            partitions,
-            order_keys,
-            window,
-            *ignore_nulls,
-            false,
-            total_rows,
-        ),
+        WindowFunctionKind::LastValue { ignore_nulls } => {
+            compute_first_last_value(args, window_ctx, *ignore_nulls, false, total_rows)
+        }
         WindowFunctionKind::Lead { ignore_nulls } => compute_lead_lag(
             arena,
             func,
             args,
-            partitions,
+            window_ctx.partitions(),
             *ignore_nulls,
             false,
             total_rows,
@@ -663,151 +706,91 @@ fn compute_window_function(
             arena,
             func,
             args,
-            partitions,
+            window_ctx.partitions(),
             *ignore_nulls,
             true,
             total_rows,
         ),
         WindowFunctionKind::SessionNumber => {
-            compute_session_number(arena, func, args, partitions, total_rows)
+            compute_session_number(arena, func, args, window_ctx.partitions(), total_rows)
         }
-        WindowFunctionKind::Count => {
-            compute_count(args, partitions, order_keys, window, total_rows)
+        WindowFunctionKind::Count => compute_count(args, window_ctx, total_rows),
+        WindowFunctionKind::Sum => compute_sum(args, window_ctx, &func.return_type, total_rows),
+        WindowFunctionKind::Avg => compute_avg(args, window_ctx, &func.return_type, total_rows),
+        WindowFunctionKind::Min => {
+            compute_min_max(args, window_ctx, true, &func.return_type, total_rows)
         }
-        WindowFunctionKind::Sum => compute_sum(
-            args,
-            partitions,
-            order_keys,
-            window,
-            &func.return_type,
-            total_rows,
-        ),
-        WindowFunctionKind::Avg => compute_avg(
-            args,
-            partitions,
-            order_keys,
-            window,
-            &func.return_type,
-            total_rows,
-        ),
-        WindowFunctionKind::Min => compute_min_max(
-            args,
-            partitions,
-            order_keys,
-            window,
-            true,
-            &func.return_type,
-            total_rows,
-        ),
-        WindowFunctionKind::Max => compute_min_max(
-            args,
-            partitions,
-            order_keys,
-            window,
-            false,
-            &func.return_type,
-            total_rows,
-        ),
+        WindowFunctionKind::Max => {
+            compute_min_max(args, window_ctx, false, &func.return_type, total_rows)
+        }
         WindowFunctionKind::BitmapUnion => compute_window_custom_aggregate(
             "bitmap_union",
             args,
-            partitions,
-            order_keys,
-            window,
+            window_ctx,
             &func.return_type,
             total_rows,
         ),
         WindowFunctionKind::BitmapUnionCount => compute_window_custom_aggregate(
             "bitmap_union_count",
             args,
-            partitions,
-            order_keys,
-            window,
+            window_ctx,
             &func.return_type,
             total_rows,
         ),
         WindowFunctionKind::MaxBy => compute_window_custom_aggregate(
             "max_by",
             args,
-            partitions,
-            order_keys,
-            window,
+            window_ctx,
             &func.return_type,
             total_rows,
         ),
         WindowFunctionKind::MaxByV2 => compute_window_custom_aggregate(
             "max_by_v2",
             args,
-            partitions,
-            order_keys,
-            window,
+            window_ctx,
             &func.return_type,
             total_rows,
         ),
         WindowFunctionKind::MinBy => compute_window_custom_aggregate(
             "min_by",
             args,
-            partitions,
-            order_keys,
-            window,
+            window_ctx,
             &func.return_type,
             total_rows,
         ),
         WindowFunctionKind::MinByV2 => compute_window_custom_aggregate(
             "min_by_v2",
             args,
-            partitions,
-            order_keys,
-            window,
+            window_ctx,
             &func.return_type,
             total_rows,
         ),
-        WindowFunctionKind::VarianceSamp => {
-            compute_variance_samp(args, partitions, order_keys, window, total_rows)
+        WindowFunctionKind::VarianceSamp => compute_variance_samp(args, window_ctx, total_rows),
+        WindowFunctionKind::StddevSamp => compute_stddev_samp(args, window_ctx, total_rows),
+        WindowFunctionKind::BoolOr => compute_bool_or(args, window_ctx, total_rows),
+        WindowFunctionKind::CovarPop => {
+            compute_covar_corr(args, window_ctx, total_rows, "covar_pop")
         }
-        WindowFunctionKind::StddevSamp => {
-            compute_stddev_samp(args, partitions, order_keys, window, total_rows)
+        WindowFunctionKind::CovarSamp => {
+            compute_covar_corr(args, window_ctx, total_rows, "covar_samp")
         }
-        WindowFunctionKind::BoolOr => {
-            compute_bool_or(args, partitions, order_keys, window, total_rows)
-        }
-        WindowFunctionKind::CovarPop => compute_covar_corr(
-            args,
-            partitions,
-            order_keys,
-            window,
-            total_rows,
-            "covar_pop",
-        ),
-        WindowFunctionKind::CovarSamp => compute_covar_corr(
-            args,
-            partitions,
-            order_keys,
-            window,
-            total_rows,
-            "covar_samp",
-        ),
-        WindowFunctionKind::Corr => {
-            compute_covar_corr(args, partitions, order_keys, window, total_rows, "corr")
-        }
+        WindowFunctionKind::Corr => compute_covar_corr(args, window_ctx, total_rows, "corr"),
         WindowFunctionKind::ArrayAgg {
             is_distinct,
             is_asc_order,
             nulls_first,
         } => compute_window_array_agg(
             args,
-            partitions,
-            order_keys,
-            window,
+            window_ctx,
             total_rows,
             &func.return_type,
             *is_distinct,
             is_asc_order.as_slice(),
             nulls_first.as_slice(),
         ),
-        WindowFunctionKind::ApproxTopK => compute_window_approx_top_k(
-            arena, func, args, partitions, order_keys, window, total_rows,
-        ),
+        WindowFunctionKind::ApproxTopK => {
+            compute_window_approx_top_k(arena, func, args, window_ctx, total_rows)
+        }
     }
 }
 
@@ -825,15 +808,14 @@ fn compute_row_number(
 }
 
 fn compute_rank(
-    partitions: &[(usize, usize)],
-    order_keys: &[ArrayRef],
+    window_ctx: &PartitionWindowContext,
     total_rows: usize,
 ) -> Result<ArrayRef, String> {
     let mut b = Int64Builder::with_capacity(total_rows);
-    for (p_start, p_end) in partitions {
-        let peer_groups = compute_peer_groups(order_keys, *p_start, *p_end)?;
+    for (part_idx, (_p_start, _p_end)) in window_ctx.partitions().iter().enumerate() {
+        let peer_groups = window_ctx.peer_groups(part_idx)?;
         let mut rank = 1i64;
-        for (g_start, g_end) in peer_groups {
+        for (g_start, g_end) in peer_groups.iter().copied() {
             let size = (g_end - g_start) as i64;
             for _ in g_start..g_end {
                 b.append_value(rank);
@@ -845,15 +827,14 @@ fn compute_rank(
 }
 
 fn compute_dense_rank(
-    partitions: &[(usize, usize)],
-    order_keys: &[ArrayRef],
+    window_ctx: &PartitionWindowContext,
     total_rows: usize,
 ) -> Result<ArrayRef, String> {
     let mut b = Int64Builder::with_capacity(total_rows);
-    for (p_start, p_end) in partitions {
-        let peer_groups = compute_peer_groups(order_keys, *p_start, *p_end)?;
+    for (part_idx, (_p_start, _p_end)) in window_ctx.partitions().iter().enumerate() {
+        let peer_groups = window_ctx.peer_groups(part_idx)?;
         let mut rank = 1i64;
-        for (g_start, g_end) in peer_groups {
+        for (g_start, g_end) in peer_groups.iter().copied() {
             for _ in g_start..g_end {
                 b.append_value(rank);
             }
@@ -864,18 +845,17 @@ fn compute_dense_rank(
 }
 
 fn compute_cume_dist(
-    partitions: &[(usize, usize)],
-    order_keys: &[ArrayRef],
+    window_ctx: &PartitionWindowContext,
     total_rows: usize,
 ) -> Result<ArrayRef, String> {
     let mut b = Float64Builder::with_capacity(total_rows);
-    for (p_start, p_end) in partitions {
-        let peer_groups = compute_peer_groups(order_keys, *p_start, *p_end)?;
+    for (part_idx, (p_start, p_end)) in window_ctx.partitions().iter().enumerate() {
+        let peer_groups = window_ctx.peer_groups(part_idx)?;
         let partition_size = (*p_end - *p_start) as f64;
-        for (_g_start, g_end) in peer_groups {
+        for (g_start, g_end) in peer_groups.iter().copied() {
             let rank = (g_end - *p_start) as f64;
             let v = rank / partition_size;
-            let group_size = g_end - _g_start;
+            let group_size = g_end - g_start;
             for _ in 0..group_size {
                 b.append_value(v);
             }
@@ -885,13 +865,12 @@ fn compute_cume_dist(
 }
 
 fn compute_percent_rank(
-    partitions: &[(usize, usize)],
-    order_keys: &[ArrayRef],
+    window_ctx: &PartitionWindowContext,
     total_rows: usize,
 ) -> Result<ArrayRef, String> {
     let mut b = Float64Builder::with_capacity(total_rows);
-    for (p_start, p_end) in partitions {
-        let peer_groups = compute_peer_groups(order_keys, *p_start, *p_end)?;
+    for (part_idx, (p_start, p_end)) in window_ctx.partitions().iter().enumerate() {
+        let peer_groups = window_ctx.peer_groups(part_idx)?;
         let partition_size = (*p_end - *p_start) as f64;
         let denom = if partition_size > 1.0 {
             partition_size - 1.0
@@ -899,7 +878,7 @@ fn compute_percent_rank(
             1.0
         };
         let mut rank = 1f64;
-        for (g_start, g_end) in peer_groups {
+        for (g_start, g_end) in peer_groups.iter().copied() {
             let v = if partition_size > 1.0 {
                 (rank - 1.0) / denom
             } else {
@@ -955,9 +934,7 @@ fn compute_ntile(
 fn compute_window_custom_aggregate(
     func_name: &str,
     args: &[ArrayRef],
-    partitions: &[(usize, usize)],
-    order_keys: &[ArrayRef],
-    window: Option<&WindowFrame>,
+    window_ctx: &PartitionWindowContext,
     return_type: &DataType,
     total_rows: usize,
 ) -> Result<ArrayRef, String> {
@@ -992,19 +969,12 @@ fn compute_window_custom_aggregate(
         .first()
         .ok_or_else(|| format!("missing aggregate kernel for {}", func_name))?;
 
-    let peer_groups_by_partition: Vec<Vec<(usize, usize)>> = partitions
-        .iter()
-        .map(|(s, e)| compute_peer_groups(order_keys, *s, *e))
-        .collect::<Result<_, _>>()?;
-
     let mut out_arrays: Vec<ArrayRef> = Vec::with_capacity(total_rows);
     let mut state_ptrs = Vec::new();
     let mut state_arena = AggStateArena::new(8 * 1024);
 
-    for (part_idx, (p_start, p_end)) in partitions.iter().enumerate() {
-        let peer_groups = &peer_groups_by_partition[part_idx];
-        let frames = compute_frames_for_partition(*p_start, *p_end, peer_groups, window)?;
-        for (frame_start, frame_end) in frames.into_iter() {
+    for (part_idx, (_p_start, _p_end)) in window_ctx.partitions().iter().enumerate() {
+        for (frame_start, frame_end) in window_ctx.frames(part_idx)?.iter().copied() {
             let state_ptr = state_arena.alloc(kernels.layout.total_size, kernel.state_align());
             kernel.init_state(state_ptr);
 
@@ -1044,9 +1014,7 @@ fn compute_window_custom_aggregate(
 
 fn compute_first_last_value(
     args: &[ArrayRef],
-    partitions: &[(usize, usize)],
-    order_keys: &[ArrayRef],
-    window: Option<&WindowFrame>,
+    window_ctx: &PartitionWindowContext,
     ignore_nulls: bool,
     is_first: bool,
     total_rows: usize,
@@ -1055,16 +1023,10 @@ fn compute_first_last_value(
         .first()
         .ok_or_else(|| "first_value/last_value missing value argument".to_string())?;
 
-    let peer_groups_by_partition: Vec<Vec<(usize, usize)>> = partitions
-        .iter()
-        .map(|(s, e)| compute_peer_groups(order_keys, *s, *e))
-        .collect::<Result<_, _>>()?;
-
     let mut indices = UInt32Builder::with_capacity(total_rows);
 
-    for (part_idx, (p_start, p_end)) in partitions.iter().enumerate() {
-        let peer_groups = &peer_groups_by_partition[part_idx];
-        let frames = compute_frames_for_partition(*p_start, *p_end, peer_groups, window)?;
+    for (part_idx, (p_start, p_end)) in window_ctx.partitions().iter().enumerate() {
+        let frames = window_ctx.frames(part_idx)?;
         let part_len = *p_end - *p_start;
         let (next_non_null, prev_non_null) = if ignore_nulls {
             let mut next = vec![None; part_len + 1];
@@ -1092,7 +1054,7 @@ fn compute_first_last_value(
             (Vec::new(), Vec::new())
         };
 
-        for (frame_start, frame_end) in frames.into_iter() {
+        for (frame_start, frame_end) in frames.iter().copied() {
             let idx = if frame_start >= frame_end {
                 None
             } else if is_first {
@@ -1122,9 +1084,7 @@ fn compute_first_last_value(
 
 fn compute_first_value_rewrite(
     args: &[ArrayRef],
-    partitions: &[(usize, usize)],
-    order_keys: &[ArrayRef],
-    window: Option<&WindowFrame>,
+    window_ctx: &PartitionWindowContext,
     ignore_nulls: bool,
     pad_rows: i64,
     total_rows: usize,
@@ -1133,17 +1093,11 @@ fn compute_first_value_rewrite(
         .first()
         .ok_or_else(|| "first_value_rewrite missing value argument".to_string())?;
 
-    let peer_groups_by_partition: Vec<Vec<(usize, usize)>> = partitions
-        .iter()
-        .map(|(s, e)| compute_peer_groups(order_keys, *s, *e))
-        .collect::<Result<_, _>>()?;
-
     let pad_rows = if pad_rows < 0 { 0 } else { pad_rows as usize };
 
     let mut indices = UInt32Builder::with_capacity(total_rows);
-    for (part_idx, (p_start, p_end)) in partitions.iter().enumerate() {
-        let peer_groups = &peer_groups_by_partition[part_idx];
-        let frames = compute_frames_for_partition(*p_start, *p_end, peer_groups, window)?;
+    for (part_idx, (p_start, p_end)) in window_ctx.partitions().iter().enumerate() {
+        let frames = window_ctx.frames(part_idx)?;
         let part_len = *p_end - *p_start;
         let (next_non_null, prev_non_null) = if ignore_nulls {
             let mut next = vec![None; part_len + 1];
@@ -1172,7 +1126,7 @@ fn compute_first_value_rewrite(
         };
         let first_non_null_in_partition = if ignore_nulls { next_non_null[0] } else { None };
 
-        for (row_idx, (frame_start, frame_end)) in frames.into_iter().enumerate() {
+        for (row_idx, (frame_start, frame_end)) in frames.iter().copied().enumerate() {
             if row_idx < pad_rows {
                 indices.append_null();
                 continue;
@@ -1374,23 +1328,15 @@ fn compute_session_number(
 
 fn compute_count(
     args: &[ArrayRef],
-    partitions: &[(usize, usize)],
-    order_keys: &[ArrayRef],
-    window: Option<&WindowFrame>,
+    window_ctx: &PartitionWindowContext,
     total_rows: usize,
 ) -> Result<ArrayRef, String> {
     let value = args.first().cloned();
 
-    let peer_groups_by_partition: Vec<Vec<(usize, usize)>> = partitions
-        .iter()
-        .map(|(s, e)| compute_peer_groups(order_keys, *s, *e))
-        .collect::<Result<_, _>>()?;
-
     let mut b = Int64Builder::with_capacity(total_rows);
 
-    for (part_idx, (p_start, p_end)) in partitions.iter().enumerate() {
-        let peer_groups = &peer_groups_by_partition[part_idx];
-        let frames = compute_frames_for_partition(*p_start, *p_end, peer_groups, window)?;
+    for (part_idx, (p_start, p_end)) in window_ctx.partitions().iter().enumerate() {
+        let frames = window_ctx.frames(part_idx)?;
         let mut prefix_non_null: Vec<i64> = Vec::new();
         if let Some(v) = value.as_ref() {
             prefix_non_null = vec![0; (*p_end - *p_start) + 1];
@@ -1398,7 +1344,7 @@ fn compute_count(
                 prefix_non_null[i + 1] = prefix_non_null[i] + if v.is_null(row) { 0 } else { 1 };
             }
         }
-        for (row, (frame_start, frame_end)) in (*p_start..*p_end).zip(frames.into_iter()) {
+        for (row, (frame_start, frame_end)) in (*p_start..*p_end).zip(frames.iter().copied()) {
             let cnt = if value.is_none() {
                 (frame_end as i64) - (frame_start as i64)
             } else {
@@ -1416,26 +1362,19 @@ fn compute_count(
 
 fn compute_sum(
     args: &[ArrayRef],
-    partitions: &[(usize, usize)],
-    order_keys: &[ArrayRef],
-    window: Option<&WindowFrame>,
+    window_ctx: &PartitionWindowContext,
     return_type: &DataType,
     total_rows: usize,
 ) -> Result<ArrayRef, String> {
     let value = args
         .first()
         .ok_or_else(|| "sum missing value argument".to_string())?;
-    let peer_groups_by_partition: Vec<Vec<(usize, usize)>> = partitions
-        .iter()
-        .map(|(s, e)| compute_peer_groups(order_keys, *s, *e))
-        .collect::<Result<_, _>>()?;
 
     match return_type {
         DataType::Int64 => {
             let mut b = Int64Builder::with_capacity(total_rows);
-            for (part_idx, (p_start, p_end)) in partitions.iter().enumerate() {
-                let peer_groups = &peer_groups_by_partition[part_idx];
-                let frames = compute_frames_for_partition(*p_start, *p_end, peer_groups, window)?;
+            for (part_idx, (p_start, p_end)) in window_ctx.partitions().iter().enumerate() {
+                let frames = window_ctx.frames(part_idx)?;
                 let mut prefix_sum = vec![0i128; (*p_end - *p_start) + 1];
                 let mut prefix_cnt = vec![0i64; (*p_end - *p_start) + 1];
                 for (i, row) in (*p_start..*p_end).enumerate() {
@@ -1447,7 +1386,9 @@ fn compute_sum(
                         };
                     prefix_cnt[i + 1] = prefix_cnt[i] + if value.is_null(row) { 0 } else { 1 };
                 }
-                for (row, (frame_start, frame_end)) in (*p_start..*p_end).zip(frames.into_iter()) {
+                for (row, (frame_start, frame_end)) in
+                    (*p_start..*p_end).zip(frames.iter().copied())
+                {
                     let s = frame_start - *p_start;
                     let e = frame_end - *p_start;
                     let cnt = prefix_cnt[e] - prefix_cnt[s];
@@ -1466,9 +1407,8 @@ fn compute_sum(
         }
         DataType::Float64 => {
             let mut b = Float64Builder::with_capacity(total_rows);
-            for (part_idx, (p_start, p_end)) in partitions.iter().enumerate() {
-                let peer_groups = &peer_groups_by_partition[part_idx];
-                let frames = compute_frames_for_partition(*p_start, *p_end, peer_groups, window)?;
+            for (part_idx, (p_start, p_end)) in window_ctx.partitions().iter().enumerate() {
+                let frames = window_ctx.frames(part_idx)?;
                 let mut prefix_sum = vec![0f64; (*p_end - *p_start) + 1];
                 let mut prefix_cnt = vec![0i64; (*p_end - *p_start) + 1];
                 for (i, row) in (*p_start..*p_end).enumerate() {
@@ -1480,7 +1420,9 @@ fn compute_sum(
                         };
                     prefix_cnt[i + 1] = prefix_cnt[i] + if value.is_null(row) { 0 } else { 1 };
                 }
-                for (row, (frame_start, frame_end)) in (*p_start..*p_end).zip(frames.into_iter()) {
+                for (row, (frame_start, frame_end)) in
+                    (*p_start..*p_end).zip(frames.iter().copied())
+                {
                     let s = frame_start - *p_start;
                     let e = frame_end - *p_start;
                     let cnt = prefix_cnt[e] - prefix_cnt[s];
@@ -1505,9 +1447,8 @@ fn compute_sum(
             };
 
             let mut out = Vec::with_capacity(total_rows);
-            for (part_idx, (p_start, p_end)) in partitions.iter().enumerate() {
-                let peer_groups = &peer_groups_by_partition[part_idx];
-                let frames = compute_frames_for_partition(*p_start, *p_end, peer_groups, window)?;
+            for (part_idx, (p_start, p_end)) in window_ctx.partitions().iter().enumerate() {
+                let frames = window_ctx.frames(part_idx)?;
                 let mut prefix_sum = vec![0i128; (*p_end - *p_start) + 1];
                 let mut prefix_cnt = vec![0i64; (*p_end - *p_start) + 1];
                 for (i, row) in (*p_start..*p_end).enumerate() {
@@ -1519,7 +1460,7 @@ fn compute_sum(
                         };
                     prefix_cnt[i + 1] = prefix_cnt[i] + if value.is_null(row) { 0 } else { 1 };
                 }
-                for (frame_start, frame_end) in frames.into_iter() {
+                for (frame_start, frame_end) in frames.iter().copied() {
                     let s = frame_start - *p_start;
                     let e = frame_end - *p_start;
                     let cnt = prefix_cnt[e] - prefix_cnt[s];
@@ -1556,9 +1497,8 @@ fn compute_sum(
             };
 
             let mut out = Vec::with_capacity(total_rows);
-            for (part_idx, (p_start, p_end)) in partitions.iter().enumerate() {
-                let peer_groups = &peer_groups_by_partition[part_idx];
-                let frames = compute_frames_for_partition(*p_start, *p_end, peer_groups, window)?;
+            for (part_idx, (p_start, p_end)) in window_ctx.partitions().iter().enumerate() {
+                let frames = window_ctx.frames(part_idx)?;
                 let mut prefix_sum = vec![i256::ZERO; (*p_end - *p_start) + 1];
                 let mut prefix_cnt = vec![0i64; (*p_end - *p_start) + 1];
                 let mut prefix_valid = true;
@@ -1614,7 +1554,7 @@ fn compute_sum(
                 }
 
                 // Fallback to per-frame accumulation when prefix accumulation overflows.
-                for (frame_start, frame_end) in frames.into_iter() {
+                for (frame_start, frame_end) in frames.iter().copied() {
                     let mut cnt = 0i64;
                     let mut sum = i256::ZERO;
                     let mut overflowed = false;
@@ -1664,26 +1604,19 @@ fn compute_sum(
 
 fn compute_avg(
     args: &[ArrayRef],
-    partitions: &[(usize, usize)],
-    order_keys: &[ArrayRef],
-    window: Option<&WindowFrame>,
+    window_ctx: &PartitionWindowContext,
     return_type: &DataType,
     total_rows: usize,
 ) -> Result<ArrayRef, String> {
     let value = args
         .first()
         .ok_or_else(|| "avg missing value argument".to_string())?;
-    let peer_groups_by_partition: Vec<Vec<(usize, usize)>> = partitions
-        .iter()
-        .map(|(s, e)| compute_peer_groups(order_keys, *s, *e))
-        .collect::<Result<_, _>>()?;
 
     match return_type {
         DataType::Float64 => {
             let mut b = Float64Builder::with_capacity(total_rows);
-            for (part_idx, (p_start, p_end)) in partitions.iter().enumerate() {
-                let peer_groups = &peer_groups_by_partition[part_idx];
-                let frames = compute_frames_for_partition(*p_start, *p_end, peer_groups, window)?;
+            for (part_idx, (p_start, p_end)) in window_ctx.partitions().iter().enumerate() {
+                let frames = window_ctx.frames(part_idx)?;
                 let mut prefix_sum = vec![0f64; (*p_end - *p_start) + 1];
                 let mut prefix_cnt = vec![0i64; (*p_end - *p_start) + 1];
                 for (i, row) in (*p_start..*p_end).enumerate() {
@@ -1695,7 +1628,7 @@ fn compute_avg(
                         };
                     prefix_cnt[i + 1] = prefix_cnt[i] + if value.is_null(row) { 0 } else { 1 };
                 }
-                for (frame_start, frame_end) in frames.into_iter() {
+                for (frame_start, frame_end) in frames.iter().copied() {
                     let s = frame_start - *p_start;
                     let e = frame_end - *p_start;
                     let cnt = prefix_cnt[e] - prefix_cnt[s];
@@ -1719,9 +1652,8 @@ fn compute_avg(
             };
 
             let mut out = Vec::with_capacity(total_rows);
-            for (part_idx, (p_start, p_end)) in partitions.iter().enumerate() {
-                let peer_groups = &peer_groups_by_partition[part_idx];
-                let frames = compute_frames_for_partition(*p_start, *p_end, peer_groups, window)?;
+            for (part_idx, (p_start, p_end)) in window_ctx.partitions().iter().enumerate() {
+                let frames = window_ctx.frames(part_idx)?;
                 let mut prefix_sum = vec![0i128; (*p_end - *p_start) + 1];
                 let mut prefix_cnt = vec![0i64; (*p_end - *p_start) + 1];
                 for (i, row) in (*p_start..*p_end).enumerate() {
@@ -1733,7 +1665,7 @@ fn compute_avg(
                         };
                     prefix_cnt[i + 1] = prefix_cnt[i] + if value.is_null(row) { 0 } else { 1 };
                 }
-                for (frame_start, frame_end) in frames.into_iter() {
+                for (frame_start, frame_end) in frames.iter().copied() {
                     let s = frame_start - *p_start;
                     let e = frame_end - *p_start;
                     let cnt = prefix_cnt[e] - prefix_cnt[s];
@@ -1771,9 +1703,8 @@ fn compute_avg(
             };
 
             let mut out = Vec::with_capacity(total_rows);
-            for (part_idx, (p_start, p_end)) in partitions.iter().enumerate() {
-                let peer_groups = &peer_groups_by_partition[part_idx];
-                let frames = compute_frames_for_partition(*p_start, *p_end, peer_groups, window)?;
+            for (part_idx, (p_start, p_end)) in window_ctx.partitions().iter().enumerate() {
+                let frames = window_ctx.frames(part_idx)?;
                 let mut prefix_sum = vec![i256::ZERO; (*p_end - *p_start) + 1];
                 let mut prefix_cnt = vec![0i64; (*p_end - *p_start) + 1];
                 let mut prefix_valid = true;
@@ -1829,7 +1760,7 @@ fn compute_avg(
                 }
 
                 // Fallback to per-frame accumulation when prefix accumulation overflows.
-                for (frame_start, frame_end) in frames.into_iter() {
+                for (frame_start, frame_end) in frames.iter().copied() {
                     let mut cnt = 0i64;
                     let mut sum = i256::ZERO;
                     let mut overflowed = false;
@@ -1882,24 +1813,16 @@ fn compute_avg(
 
 fn compute_variance_samp(
     args: &[ArrayRef],
-    partitions: &[(usize, usize)],
-    order_keys: &[ArrayRef],
-    window: Option<&WindowFrame>,
+    window_ctx: &PartitionWindowContext,
     total_rows: usize,
 ) -> Result<ArrayRef, String> {
     let value = args
         .first()
         .ok_or_else(|| "variance_samp missing value argument".to_string())?;
-    let peer_groups_by_partition: Vec<Vec<(usize, usize)>> = partitions
-        .iter()
-        .map(|(s, e)| compute_peer_groups(order_keys, *s, *e))
-        .collect::<Result<_, _>>()?;
 
     let mut b = Float64Builder::with_capacity(total_rows);
-    for (part_idx, (p_start, p_end)) in partitions.iter().enumerate() {
-        let peer_groups = &peer_groups_by_partition[part_idx];
-        let frames = compute_frames_for_partition(*p_start, *p_end, peer_groups, window)?;
-        for (frame_start, frame_end) in frames {
+    for (part_idx, (_p_start, _p_end)) in window_ctx.partitions().iter().enumerate() {
+        for (frame_start, frame_end) in window_ctx.frames(part_idx)?.iter().copied() {
             let mut n = 0f64;
             let mut mean = 0f64;
             let mut m2 = 0f64;
@@ -1925,12 +1848,10 @@ fn compute_variance_samp(
 
 fn compute_stddev_samp(
     args: &[ArrayRef],
-    partitions: &[(usize, usize)],
-    order_keys: &[ArrayRef],
-    window: Option<&WindowFrame>,
+    window_ctx: &PartitionWindowContext,
     total_rows: usize,
 ) -> Result<ArrayRef, String> {
-    let variance = compute_variance_samp(args, partitions, order_keys, window, total_rows)?;
+    let variance = compute_variance_samp(args, window_ctx, total_rows)?;
     let variance = variance
         .as_any()
         .downcast_ref::<arrow::array::Float64Array>()
@@ -1948,9 +1869,7 @@ fn compute_stddev_samp(
 
 fn compute_bool_or(
     args: &[ArrayRef],
-    partitions: &[(usize, usize)],
-    order_keys: &[ArrayRef],
-    window: Option<&WindowFrame>,
+    window_ctx: &PartitionWindowContext,
     total_rows: usize,
 ) -> Result<ArrayRef, String> {
     let value = args
@@ -1961,16 +1880,9 @@ fn compute_bool_or(
         .downcast_ref::<arrow::array::BooleanArray>()
         .ok_or_else(|| "bool_or expects boolean input".to_string())?;
 
-    let peer_groups_by_partition: Vec<Vec<(usize, usize)>> = partitions
-        .iter()
-        .map(|(s, e)| compute_peer_groups(order_keys, *s, *e))
-        .collect::<Result<_, _>>()?;
-
     let mut b = BooleanBuilder::with_capacity(total_rows);
-    for (part_idx, (p_start, p_end)) in partitions.iter().enumerate() {
-        let peer_groups = &peer_groups_by_partition[part_idx];
-        let frames = compute_frames_for_partition(*p_start, *p_end, peer_groups, window)?;
-        for (frame_start, frame_end) in frames {
+    for (part_idx, (_p_start, _p_end)) in window_ctx.partitions().iter().enumerate() {
+        for (frame_start, frame_end) in window_ctx.frames(part_idx)?.iter().copied() {
             let mut out = false;
             for row in frame_start..frame_end {
                 if !value.is_null(row) && value.value(row) {
@@ -1986,9 +1898,7 @@ fn compute_bool_or(
 
 fn compute_covar_corr(
     args: &[ArrayRef],
-    partitions: &[(usize, usize)],
-    order_keys: &[ArrayRef],
-    window: Option<&WindowFrame>,
+    window_ctx: &PartitionWindowContext,
     total_rows: usize,
     kind: &str,
 ) -> Result<ArrayRef, String> {
@@ -1999,16 +1909,9 @@ fn compute_covar_corr(
         .get(1)
         .ok_or_else(|| format!("{} missing second argument", kind))?;
 
-    let peer_groups_by_partition: Vec<Vec<(usize, usize)>> = partitions
-        .iter()
-        .map(|(s, e)| compute_peer_groups(order_keys, *s, *e))
-        .collect::<Result<_, _>>()?;
-
     let mut b = Float64Builder::with_capacity(total_rows);
-    for (part_idx, (p_start, p_end)) in partitions.iter().enumerate() {
-        let peer_groups = &peer_groups_by_partition[part_idx];
-        let frames = compute_frames_for_partition(*p_start, *p_end, peer_groups, window)?;
-        for (frame_start, frame_end) in frames {
+    for (part_idx, (_p_start, _p_end)) in window_ctx.partitions().iter().enumerate() {
+        for (frame_start, frame_end) in window_ctx.frames(part_idx)?.iter().copied() {
             let mut n = 0f64;
             let mut mean_x = 0f64;
             let mut mean_y = 0f64;
@@ -2073,9 +1976,7 @@ fn compute_covar_corr(
 
 fn compute_window_array_agg(
     args: &[ArrayRef],
-    partitions: &[(usize, usize)],
-    order_keys: &[ArrayRef],
-    window: Option<&WindowFrame>,
+    window_ctx: &PartitionWindowContext,
     total_rows: usize,
     return_type: &DataType,
     is_distinct: bool,
@@ -2099,20 +2000,13 @@ fn compute_window_array_agg(
         ));
     };
 
-    let peer_groups_by_partition: Vec<Vec<(usize, usize)>> = partitions
-        .iter()
-        .map(|(s, e)| compute_peer_groups(order_keys, *s, *e))
-        .collect::<Result<_, _>>()?;
-
     let mut offsets: Vec<i32> = Vec::with_capacity(total_rows + 1);
     offsets.push(0);
     let mut current_total: i64 = 0;
     let mut flat_values: Vec<Option<AggScalarValue>> = Vec::new();
 
-    for (part_idx, (p_start, p_end)) in partitions.iter().enumerate() {
-        let peer_groups = &peer_groups_by_partition[part_idx];
-        let frames = compute_frames_for_partition(*p_start, *p_end, peer_groups, window)?;
-        for (frame_start, frame_end) in frames {
+    for (part_idx, (_p_start, _p_end)) in window_ctx.partitions().iter().enumerate() {
+        for (frame_start, frame_end) in window_ctx.frames(part_idx)?.iter().copied() {
             let mut rows: Vec<(Option<AggScalarValue>, Vec<Option<AggScalarValue>>)> =
                 Vec::with_capacity(frame_end.saturating_sub(frame_start));
             for row_idx in frame_start..frame_end {
@@ -2277,9 +2171,7 @@ fn compute_window_approx_top_k(
     _arena: &ExprArena,
     func: &WindowFunctionSpec,
     args: &[ArrayRef],
-    partitions: &[(usize, usize)],
-    order_keys: &[ArrayRef],
-    window: Option<&WindowFrame>,
+    window_ctx: &PartitionWindowContext,
     total_rows: usize,
 ) -> Result<ArrayRef, String> {
     let value = args
@@ -2304,11 +2196,6 @@ fn compute_window_approx_top_k(
         return Err("approx_top_k window output struct must have at least 2 fields".to_string());
     }
 
-    let peer_groups_by_partition: Vec<Vec<(usize, usize)>> = partitions
-        .iter()
-        .map(|(s, e)| compute_peer_groups(order_keys, *s, *e))
-        .collect::<Result<_, _>>()?;
-
     let mut offsets: Vec<i32> = Vec::with_capacity(total_rows + 1);
     offsets.push(0);
     let mut current_total: i64 = 0;
@@ -2317,10 +2204,10 @@ fn compute_window_approx_top_k(
     let mut extras: Vec<Vec<Option<AggScalarValue>>> =
         (2..struct_fields.len()).map(|_| Vec::new()).collect();
 
-    for (part_idx, (p_start, p_end)) in partitions.iter().enumerate() {
-        let peer_groups = &peer_groups_by_partition[part_idx];
-        let frames = compute_frames_for_partition(*p_start, *p_end, peer_groups, window)?;
-        for (row, (frame_start, frame_end)) in (*p_start..*p_end).zip(frames.into_iter()) {
+    for (part_idx, (p_start, p_end)) in window_ctx.partitions().iter().enumerate() {
+        for (row, (frame_start, frame_end)) in
+            (*p_start..*p_end).zip(window_ctx.frames(part_idx)?.iter().copied())
+        {
             let mut k = WINDOW_APPROX_TOP_K_DEFAULT_K;
             if let Some(k_arr) = k_array {
                 let parsed = window_approx_top_k_scalar_to_i64(&agg_scalar_from_array(k_arr, row)?)
@@ -2563,9 +2450,7 @@ fn decimal_input_scale(input_type: &DataType) -> Result<i8, String> {
 
 fn compute_min_max(
     args: &[ArrayRef],
-    partitions: &[(usize, usize)],
-    order_keys: &[ArrayRef],
-    window: Option<&WindowFrame>,
+    window_ctx: &PartitionWindowContext,
     is_min: bool,
     return_type: &DataType,
     total_rows: usize,
@@ -2586,17 +2471,16 @@ fn compute_min_max(
         })?
     };
 
-    let peer_groups_by_partition: Vec<Vec<(usize, usize)>> = partitions
-        .iter()
-        .map(|(s, e)| compute_peer_groups(order_keys, *s, *e))
-        .collect::<Result<_, _>>()?;
-
     let mut indices = UInt32Builder::with_capacity(total_rows);
 
-    for (part_idx, (p_start, p_end)) in partitions.iter().enumerate() {
-        let peer_groups = &peer_groups_by_partition[part_idx];
-        let frames = compute_frames_for_partition(*p_start, *p_end, peer_groups, window)?;
-        let idxs = compute_min_max_indices(value.as_ref(), *p_start, *p_end, &frames, is_min)?;
+    for (part_idx, (p_start, p_end)) in window_ctx.partitions().iter().enumerate() {
+        let idxs = compute_min_max_indices(
+            value.as_ref(),
+            *p_start,
+            *p_end,
+            window_ctx.frames(part_idx)?,
+            is_min,
+        )?;
         for i in idxs {
             if let Some(v) = i {
                 indices.append_value(v as u32);
@@ -3034,7 +2918,76 @@ fn scalar_f64(array: &dyn Array, row: usize) -> Result<f64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::ids::SlotId;
+    use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
     use arrow::array::Int32Array;
+
+    fn int32_chunk_schema() -> ChunkSchemaRef {
+        Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                SlotId::new(1),
+                Field::new("v", DataType::Int32, true),
+                None,
+                None,
+            )])
+            .unwrap(),
+        )
+    }
+
+    fn int32_chunk(values: Vec<Option<i32>>) -> Chunk {
+        Chunk::try_new_with_columns(
+            int32_chunk_schema(),
+            vec![Arc::new(Int32Array::from(values)) as ArrayRef],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn analytic_output_preserves_input_chunk_boundaries() {
+        let input = vec![
+            int32_chunk(vec![Some(1), Some(2)]),
+            int32_chunk(vec![Some(3), Some(4), Some(5)]),
+        ];
+        let state = AnalyticSharedState::new(
+            Arc::new(ExprArena::default()),
+            vec![],
+            vec![],
+            vec![],
+            None,
+            vec![AnalyticOutputColumn::InputSlotId(SlotId::new(1))],
+            int32_chunk_schema(),
+            1,
+        );
+
+        let out = state.compute_outputs(&input).unwrap();
+        let lengths: Vec<usize> = out.iter().map(|chunk| chunk.len()).collect();
+        assert_eq!(lengths, vec![2, 3]);
+    }
+
+    #[test]
+    fn partition_window_context_reuses_rows_frames_across_partitions() {
+        let order = Arc::new(Int32Array::from(vec![1, 2, 1, 2, 3])) as ArrayRef;
+        let partitions = vec![(0usize, 2usize), (2usize, 5usize)];
+        let window = WindowFrame {
+            window_type: WindowType::Rows,
+            start: Some(WindowBoundary::Preceding(1)),
+            end: Some(WindowBoundary::CurrentRow),
+        };
+        let ctx = PartitionWindowContext::new(&partitions, &[order], Some(&window)).unwrap();
+
+        assert_eq!(ctx.partitions(), partitions.as_slice());
+        assert_eq!(ctx.frames(0).unwrap(), &[(0, 1), (0, 2)]);
+        assert_eq!(ctx.frames(1).unwrap(), &[(2, 3), (2, 4), (3, 5)]);
+
+        let empty_window = WindowFrame {
+            window_type: WindowType::Rows,
+            start: Some(WindowBoundary::Following(2)),
+            end: Some(WindowBoundary::Following(1)),
+        };
+        let empty_ctx = PartitionWindowContext::new(&partitions, &[], Some(&empty_window)).unwrap();
+        assert_eq!(empty_ctx.frames(0).unwrap(), &[(2, 2), (2, 2)]);
+        assert_eq!(empty_ctx.frames(1).unwrap(), &[(4, 4), (5, 5), (5, 5)]);
+    }
 
     #[test]
     fn first_value_rewrite_fills_initial_rows() {
@@ -3048,16 +3001,9 @@ mod tests {
             end: Some(WindowBoundary::Preceding(2)),
         };
 
-        let out = compute_first_value_rewrite(
-            std::slice::from_ref(&values),
-            &partitions,
-            &[order],
-            Some(&window),
-            false,
-            -1,
-            4,
-        )
-        .unwrap();
+        let ctx = PartitionWindowContext::new(&partitions, &[order], Some(&window)).unwrap();
+        let out =
+            compute_first_value_rewrite(std::slice::from_ref(&values), &ctx, false, -1, 4).unwrap();
         let out_arr = out.as_any().downcast_ref::<Int32Array>().unwrap();
         let actual: Vec<i32> = (0..out_arr.len()).map(|i| out_arr.value(i)).collect();
         assert_eq!(actual, vec![10, 10, 10, 20]);
@@ -3084,16 +3030,9 @@ mod tests {
 
         let partitions = vec![(0usize, 6usize)];
         // window = None -> SQL default: RANGE UNBOUNDED PRECEDING ~ CURRENT ROW
-        let out = compute_first_last_value(
-            std::slice::from_ref(&values),
-            &partitions,
-            &[order],
-            None,
-            true,
-            true,
-            6,
-        )
-        .unwrap();
+        let ctx = PartitionWindowContext::new(&partitions, &[order], None).unwrap();
+        let out =
+            compute_first_last_value(std::slice::from_ref(&values), &ctx, true, true, 6).unwrap();
         let out_arr = out.as_any().downcast_ref::<Int32Array>().unwrap();
         let actual: Vec<Option<i32>> = (0..out_arr.len())
             .map(|i| {
@@ -3121,16 +3060,9 @@ mod tests {
         let order = Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef;
         let partitions = vec![(0usize, 3usize)];
 
-        let out = compute_first_last_value(
-            std::slice::from_ref(&values),
-            &partitions,
-            &[order],
-            None,
-            false,
-            false,
-            3,
-        )
-        .unwrap();
+        let ctx = PartitionWindowContext::new(&partitions, &[order], None).unwrap();
+        let out =
+            compute_first_last_value(std::slice::from_ref(&values), &ctx, false, false, 3).unwrap();
         let out_arr = out.as_any().downcast_ref::<Int32Array>().unwrap();
         let actual: Vec<i32> = (0..out_arr.len()).map(|i| out_arr.value(i)).collect();
         assert_eq!(actual, vec![10, 20, 30]);
@@ -3145,16 +3077,9 @@ mod tests {
         let order_keys: Vec<ArrayRef> = Vec::new();
         let partitions = vec![(0usize, 3usize)];
 
-        let out = compute_first_last_value(
-            std::slice::from_ref(&values),
-            &partitions,
-            &order_keys,
-            None,
-            false,
-            true,
-            3,
-        )
-        .unwrap();
+        let ctx = PartitionWindowContext::new(&partitions, &order_keys, None).unwrap();
+        let out =
+            compute_first_last_value(std::slice::from_ref(&values), &ctx, false, true, 3).unwrap();
         let out_arr = out.as_any().downcast_ref::<Int32Array>().unwrap();
         let actual: Vec<i32> = (0..out_arr.len()).map(|i| out_arr.value(i)).collect();
         assert_eq!(actual, vec![10, 10, 10]);
