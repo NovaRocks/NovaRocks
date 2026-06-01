@@ -144,6 +144,7 @@ pub(crate) struct IcebergMvTargetStateScan {
     pub(crate) columns: Vec<ColumnDef>,
     pub(crate) group_key_names: Vec<String>,
     pub(crate) aggregate_state_names: Vec<String>,
+    pub(crate) row_id_column_name: String,
 }
 
 impl IcebergMvTargetStateScan {
@@ -421,6 +422,7 @@ mod imv_target_state_tests {
             columns: sample_columns(),
             group_key_names: vec!["region".to_string()],
             aggregate_state_names: vec!["c".to_string()],
+            row_id_column_name: "__row_id__".to_string(),
         });
 
         let ScanSource::IcebergMvTargetState(scan) = source else {
@@ -429,5 +431,6 @@ mod imv_target_state_tests {
         assert_eq!(scan.fqn(), "ice.ns.mv_sales");
         assert_eq!(scan.group_key_names, vec!["region"]);
         assert_eq!(scan.aggregate_state_names, vec!["c"]);
+        assert_eq!(scan.row_id_column_name, "__row_id__");
     }
 }

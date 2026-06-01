@@ -767,9 +767,9 @@ pub(crate) fn projected_target_state_column_names(
     }
     if !names
         .iter()
-        .any(|name| name.eq_ignore_ascii_case("_row_id"))
+        .any(|name| name.eq_ignore_ascii_case(&scan.row_id_column_name))
     {
-        names.push("_row_id".to_string());
+        names.push(scan.row_id_column_name.clone());
     }
     names
 }
@@ -1624,6 +1624,7 @@ mod tests {
                     ],
                     group_key_names: vec!["k".to_string()],
                     aggregate_state_names: vec!["sum_v".to_string()],
+                    row_id_column_name: "_row_id".to_string(),
                 }),
             },
             planned_scan: None,
@@ -1661,6 +1662,28 @@ mod tests {
             err.to_string()
                 .contains("Iceberg target-state scan requires MV refresh context"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn projected_target_state_uses_contract_row_id_column_name() {
+        let scan = IcebergMvTargetStateScan {
+            catalog: "ice".to_string(),
+            database: "db".to_string(),
+            table: "mv_b".to_string(),
+            columns: Vec::new(),
+            group_key_names: vec!["k".to_string()],
+            aggregate_state_names: vec!["sum_v".to_string()],
+            row_id_column_name: "__row_id__".to_string(),
+        };
+
+        assert_eq!(
+            super::projected_target_state_column_names(&scan),
+            vec![
+                "k".to_string(),
+                "sum_v".to_string(),
+                "__row_id__".to_string()
+            ]
         );
     }
 }

@@ -107,7 +107,10 @@ fn validate(plan: &LogicalPlan) -> Result<(), String> {
         );
     }
     // V6: if a delta subtree exists, root output must carry the apply key.
-    if subtree_has_delta(plan) && !output_has_apply_key(plan) {
+    if !matches!(plan, LogicalPlan::AggregateStateMerge(_))
+        && subtree_has_delta(plan)
+        && !output_has_apply_key(plan)
+    {
         let fqn = first_delta_base_fqn(plan).unwrap_or_else(|| "<unknown>".to_string());
         return Err(format!(
             "plan above delta-bound scan {fqn} is missing apply key column \
@@ -124,6 +127,10 @@ fn validate_node(plan: &LogicalPlan) -> Result<(), String> {
     match plan {
         LogicalPlan::Scan(scan) => validate_scan(scan),
         LogicalPlan::Filter(node) => validate_node(&node.input),
+        LogicalPlan::AggregateStateMerge(node) => {
+            validate_node(&node.old_input)?;
+            validate_state_merge_delta_input(&node.delta_input)
+        }
         LogicalPlan::Project(node) => {
             validate_node(&node.input)?;
             // V3: if a delta is below, Project must expose the action column.
@@ -174,6 +181,23 @@ fn validate_node(plan: &LogicalPlan) -> Result<(), String> {
         }
         _ => Ok(()),
     }
+}
+
+fn validate_state_merge_delta_input(plan: &LogicalPlan) -> Result<(), String> {
+    match plan {
+        LogicalPlan::Aggregate(node) if is_signed_state_aggregate(node) => {
+            validate_node(&node.input)
+        }
+        _ => validate_node(plan),
+    }
+}
+
+fn is_signed_state_aggregate(node: &crate::sql::planner::plan::AggregateNode) -> bool {
+    !node.aggregates.is_empty()
+        && node
+            .aggregates
+            .iter()
+            .all(|call| call.name.ends_with("_state_signed"))
 }
 
 fn validate_scan(scan: &ScanNode) -> Result<(), String> {
@@ -242,6 +266,9 @@ fn subtree_has_delta(plan: &LogicalPlan) -> bool {
         LogicalPlan::Filter(node) => subtree_has_delta(&node.input),
         LogicalPlan::Project(node) => subtree_has_delta(&node.input),
         LogicalPlan::Aggregate(node) => subtree_has_delta(&node.input),
+        LogicalPlan::AggregateStateMerge(node) => {
+            subtree_has_delta(&node.old_input) || subtree_has_delta(&node.delta_input)
+        }
         LogicalPlan::Join(node) => subtree_has_delta(&node.left) || subtree_has_delta(&node.right),
         LogicalPlan::Union(node) => node.inputs.iter().any(subtree_has_delta),
         LogicalPlan::ImvDelta(node) => subtree_has_delta(&node.input),
@@ -262,6 +289,9 @@ fn has_visible_output(plan: &LogicalPlan) -> bool {
                     .eq_ignore_ascii_case(ICEBERG_MV_APPLY_KEY_COLUMN)
         }),
         LogicalPlan::Aggregate(node) => node.output_columns.iter().any(|c| !c.is_internal),
+        LogicalPlan::AggregateStateMerge(node) => {
+            node.output_columns.iter().any(|c| !c.is_internal)
+        }
         LogicalPlan::Join(node) => {
             has_visible_output(&node.left) || has_visible_output(&node.right)
         }
@@ -276,7 +306,9 @@ mod tests {
     use crate::sql::analysis::{ExprKind, ProjectItem, TypedExpr};
     use crate::sql::catalog::{ColumnDef, IcebergSchemaDef, IcebergTableInfo, TableDef};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::planner::plan::ProjectNode;
+    use crate::sql::planner::plan::{
+        AggregateCall, AggregateNode, AggregateStateMergeNode, ProjectNode, ValuesNode,
+    };
 
     #[test]
     fn output_column_has_expected_shape() {
@@ -649,5 +681,77 @@ mod tests {
         ))));
         let err = validate(&plan).expect_err("missing _row_id must fail");
         assert!(err.contains("_row_id"), "got: {err}");
+    }
+
+    fn signed_aggregate_state_merge(action: Option<OutputColumn>) -> LogicalPlan {
+        let mut scan = delta_scan_with(action);
+        scan.columns
+            .push(ImvRowIdColumn::output_column(ColumnId(101)));
+        LogicalPlan::AggregateStateMerge(AggregateStateMergeNode {
+            old_input: Box::new(LogicalPlan::Values(ValuesNode {
+                rows: Vec::new(),
+                columns: Vec::new(),
+                required_output_columns: None,
+            })),
+            delta_input: Box::new(LogicalPlan::Aggregate(AggregateNode {
+                input: Box::new(LogicalPlan::Scan(scan)),
+                group_by: Vec::new(),
+                aggregates: vec![AggregateCall {
+                    name: "sum_state_signed".to_string(),
+                    args: Vec::new(),
+                    distinct: false,
+                    result_type: DataType::Binary,
+                    order_by: Vec::new(),
+                }],
+                output_columns: vec![OutputColumn {
+                    column_id: ColumnId(10),
+                    name: "s".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    is_internal: false,
+                }],
+                already_pushed: false,
+                required_output_columns: None,
+            })),
+            group_key_names: vec!["k".to_string()],
+            aggregate_state_names: vec!["__agg_state_s".to_string()],
+            change_op_column: "__change_op".to_string(),
+            output_columns: vec![OutputColumn {
+                column_id: ColumnId(10),
+                name: "s".to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+                is_internal: false,
+            }],
+        })
+    }
+
+    #[test]
+    fn validation_accepts_signed_aggregate_inside_state_merge() {
+        let plan =
+            signed_aggregate_state_merge(Some(ImvActionColumn::output_column(ColumnId(100))));
+
+        validate(&plan).expect("signed aggregate inside AggregateStateMerge must validate");
+    }
+
+    #[test]
+    fn validation_traverses_state_merge_delta_input_for_missing_action_column() {
+        let plan = signed_aggregate_state_merge(None);
+
+        let err = validate(&plan).expect_err("missing action inside state merge must fail");
+        assert!(err.contains("missing action column"), "got: {err}");
+    }
+
+    #[test]
+    fn validation_uses_state_merge_output_for_visible_output_check() {
+        let mut plan =
+            signed_aggregate_state_merge(Some(ImvActionColumn::output_column(ColumnId(100))));
+        let LogicalPlan::AggregateStateMerge(node) = &mut plan else {
+            unreachable!();
+        };
+        node.output_columns = vec![ImvActionColumn::output_column(ColumnId(200))];
+
+        let err = validate(&plan).expect_err("internal-only state merge output must fail");
+        assert!(err.contains("no user-visible output"), "got: {err}");
     }
 }

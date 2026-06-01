@@ -15,7 +15,7 @@ use crate::sql::optimizer::rewrite::imv::annotation::ImvExtension;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
-use crate::sql::planner::plan::LogicalPlan;
+use crate::sql::planner::plan::{AggregateNode, LogicalPlan};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -41,6 +41,9 @@ pub(crate) fn output_has_action_column(plan: &LogicalPlan) -> bool {
         }
         LogicalPlan::ImvDelta(node) => output_has_action_column(&node.input),
         LogicalPlan::ImvVersion(node) => output_has_action_column(&node.input),
+        LogicalPlan::AggregateStateMerge(node) => {
+            output_has_action_column(&node.old_input) || output_has_action_column(&node.delta_input)
+        }
         _ => false,
     }
 }
@@ -56,6 +59,9 @@ pub(crate) fn find_action_column(plan: &LogicalPlan) -> Option<OutputColumn> {
             .cloned(),
         LogicalPlan::Filter(node) => find_action_column(&node.input),
         LogicalPlan::Project(node) => find_action_column(&node.input),
+        LogicalPlan::AggregateStateMerge(node) => {
+            find_action_column(&node.old_input).or_else(|| find_action_column(&node.delta_input))
+        }
         _ => None,
     }
 }
@@ -66,6 +72,11 @@ pub(crate) fn subtree_has_action_column(plan: &LogicalPlan) -> bool {
         || match plan {
             LogicalPlan::Filter(node) => subtree_has_action_column(&node.input),
             LogicalPlan::Project(node) => subtree_has_action_column(&node.input),
+            LogicalPlan::Aggregate(node) => subtree_has_action_column(&node.input),
+            LogicalPlan::AggregateStateMerge(node) => {
+                subtree_has_action_column(&node.old_input)
+                    || subtree_has_action_column(&node.delta_input)
+            }
             _ => false,
         }
 }
@@ -87,6 +98,8 @@ pub(crate) fn first_delta_base_fqn(plan: &LogicalPlan) -> Option<String> {
         LogicalPlan::Filter(node) => first_delta_base_fqn(&node.input),
         LogicalPlan::Project(node) => first_delta_base_fqn(&node.input),
         LogicalPlan::Aggregate(node) => first_delta_base_fqn(&node.input),
+        LogicalPlan::AggregateStateMerge(node) => first_delta_base_fqn(&node.old_input)
+            .or_else(|| first_delta_base_fqn(&node.delta_input)),
         LogicalPlan::Join(node) => {
             first_delta_base_fqn(&node.left).or_else(|| first_delta_base_fqn(&node.right))
         }
@@ -111,8 +124,21 @@ pub(crate) fn descendant_internal_columns(plan: &LogicalPlan) -> Vec<OutputColum
             .collect(),
         LogicalPlan::Filter(node) => descendant_internal_columns(&node.input),
         LogicalPlan::Project(node) => descendant_internal_columns(&node.input),
+        LogicalPlan::AggregateStateMerge(node) => {
+            let mut columns = descendant_internal_columns(&node.old_input);
+            columns.extend(descendant_internal_columns(&node.delta_input));
+            columns
+        }
         _ => Vec::new(),
     }
+}
+
+fn is_signed_state_aggregate(node: &AggregateNode) -> bool {
+    !node.aggregates.is_empty()
+        && node
+            .aggregates
+            .iter()
+            .all(|call| call.name.ends_with("_state_signed"))
 }
 
 // ---------------------------------------------------------------------------
@@ -195,7 +221,9 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
             LogicalPlan::Filter(_) => false,
             // Aggregate / Join / Union above a delta subtree are unsupported in
             // Phase 2; match here so `apply` can fail-fast with a clear error.
-            LogicalPlan::Aggregate(a) => subtree_has_action_column(&a.input),
+            LogicalPlan::Aggregate(a) => {
+                subtree_has_action_column(&a.input) && !is_signed_state_aggregate(a)
+            }
             LogicalPlan::Join(j) => {
                 subtree_has_action_column(&j.left) || subtree_has_action_column(&j.right)
             }

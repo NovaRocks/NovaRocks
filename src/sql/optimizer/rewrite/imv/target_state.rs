@@ -7,6 +7,7 @@ pub(crate) fn build_target_state_scan_source(
     columns: Vec<ColumnDef>,
     group_key_names: Vec<String>,
     aggregate_state_names: Vec<String>,
+    row_id_column_name: String,
 ) -> ScanSource {
     ScanSource::IcebergMvTargetState(IcebergMvTargetStateScan {
         catalog,
@@ -15,6 +16,7 @@ pub(crate) fn build_target_state_scan_source(
         columns,
         group_key_names,
         aggregate_state_names,
+        row_id_column_name,
     })
 }
 
@@ -40,6 +42,7 @@ mod tests {
             columns.clone(),
             vec!["k".to_string()],
             vec!["sum_v_state".to_string()],
+            "__row_id__".to_string(),
         );
 
         let ScanSource::IcebergMvTargetState(scan) = source else {
@@ -50,5 +53,6 @@ mod tests {
         assert_eq!(scan.columns, columns);
         assert_eq!(scan.group_key_names, vec!["k"]);
         assert_eq!(scan.aggregate_state_names, vec!["sum_v_state"]);
+        assert_eq!(scan.row_id_column_name, "__row_id__");
     }
 }

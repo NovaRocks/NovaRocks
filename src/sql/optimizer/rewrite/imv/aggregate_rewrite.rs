@@ -5,6 +5,7 @@ use iceberg::spec::{NestedField, PrimitiveType, Type};
 
 use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
 use crate::sql::catalog::{ColumnDef, TableDef};
+use crate::sql::codegen::helpers::typed_expr_display_name;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
@@ -24,13 +25,8 @@ pub(crate) fn signed_state_function(name: &str) -> Result<&'static str, String> 
     match name.to_ascii_lowercase().as_str() {
         "count" => Ok("count_state_signed"),
         "sum" => Ok("sum_state_signed"),
-        "avg" => Ok("avg_state_signed"),
         "min" => Ok("min_state_signed"),
         "max" => Ok("max_state_signed"),
-        "bool_or" => Ok("bool_or_state_signed"),
-        "bool_and" => Ok("bool_and_state_signed"),
-        "count_distinct" => Ok("count_distinct_state_signed"),
-        "approx_count_distinct" => Ok("approx_count_distinct_state_signed"),
         other => Err(format!("unsupported IMV aggregate function {other}")),
     }
 }
@@ -82,7 +78,8 @@ impl LogicalRewriteRule for RewriteAggregateStateRule {
             "RewriteAggregateState requires ImvExtension in RewriteContext".to_string()
         })?;
         let group_key_names = group_key_names(&aggregate)?;
-        let aggregate_state_names = aggregate_state_names(ext)?;
+        let aggregate_state_names = aggregate_state_names(ext, &aggregate)?;
+        let row_id_column_name = aggregate_row_id_column_name(ext)?;
         let target_columns = target_columns(ext)?;
         let target = &ext.mv_ctx.target;
 
@@ -93,6 +90,7 @@ impl LogicalRewriteRule for RewriteAggregateStateRule {
             target_columns.clone(),
             group_key_names.clone(),
             aggregate_state_names.clone(),
+            row_id_column_name.clone(),
         );
         let old_columns = target_columns
             .iter()
@@ -104,13 +102,7 @@ impl LogicalRewriteRule for RewriteAggregateStateRule {
                 is_internal: aggregate_state_names
                     .iter()
                     .any(|name| name.eq_ignore_ascii_case(&column.name))
-                    || column.name.eq_ignore_ascii_case(
-                        &ext.mv_ctx
-                            .schema_contract
-                            .target
-                            .hidden_apply_key
-                            .column_name,
-                    ),
+                    || column.name.eq_ignore_ascii_case(&row_id_column_name),
             })
             .collect();
         let old_input = LogicalPlan::Scan(ScanNode {
@@ -149,22 +141,53 @@ impl LogicalRewriteRule for RewriteAggregateStateRule {
 }
 
 fn group_key_names(aggregate: &AggregateNode) -> Result<Vec<String>, String> {
-    if aggregate.output_columns.len() < aggregate.group_by.len() {
-        return Err(format!(
-            "Iceberg IMV aggregate rewrite cannot derive {} GROUP BY output names from {} output columns",
-            aggregate.group_by.len(),
-            aggregate.output_columns.len()
-        ));
-    }
-    Ok(aggregate
-        .output_columns
+    aggregate
+        .group_by
         .iter()
-        .take(aggregate.group_by.len())
-        .map(|column| column.name.clone())
-        .collect())
+        .map(|expr| group_key_output_name(expr, &aggregate.output_columns))
+        .collect()
 }
 
-fn aggregate_state_names(ext: &ImvExtension) -> Result<Vec<String>, String> {
+fn group_key_output_name(
+    expr: &TypedExpr,
+    output_columns: &[crate::sql::analysis::OutputColumn],
+) -> Result<String, String> {
+    if let ExprKind::ColumnRef { column_id, .. } = &expr.kind {
+        let matches = output_columns
+            .iter()
+            .filter(|column| column.column_id == *column_id)
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [column] => return Ok(column.name.clone()),
+            [] => {}
+            _ => {
+                return Err(format!(
+                    "Iceberg IMV aggregate rewrite found ambiguous GROUP BY output column id {column_id:?}"
+                ));
+            }
+        }
+    }
+
+    let display_name = typed_expr_display_name(expr);
+    let matches = output_columns
+        .iter()
+        .filter(|column| column.name.eq_ignore_ascii_case(&display_name))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [column] => Ok(column.name.clone()),
+        [] => Err(format!(
+            "Iceberg IMV aggregate rewrite cannot map GROUP BY expression {display_name} to aggregate output column"
+        )),
+        _ => Err(format!(
+            "Iceberg IMV aggregate rewrite found ambiguous GROUP BY output column name {display_name}"
+        )),
+    }
+}
+
+fn aggregate_state_names(
+    ext: &ImvExtension,
+    aggregate_node: &AggregateNode,
+) -> Result<Vec<String>, String> {
     let aggregate = ext
         .mv_ctx
         .schema_contract
@@ -179,11 +202,44 @@ fn aggregate_state_names(ext: &ImvExtension) -> Result<Vec<String>, String> {
                 .to_string(),
         );
     }
+    if aggregate.state_columns.len() != aggregate_node.aggregates.len() {
+        return Err(format!(
+            "Iceberg IMV aggregate rewrite aggregate state column count {} does not match aggregate call count {}",
+            aggregate.state_columns.len(),
+            aggregate_node.aggregates.len()
+        ));
+    }
+    for column in &aggregate.state_columns {
+        if !column.type_signature.eq_ignore_ascii_case("binary") {
+            return Err(format!(
+                "Iceberg IMV aggregate rewrite aggregate state column {} must have binary type signature, got {}",
+                column.column_name, column.type_signature
+            ));
+        }
+    }
     Ok(aggregate
         .state_columns
         .iter()
         .map(|column| column.column_name.clone())
         .collect())
+}
+
+fn aggregate_row_id_column_name(ext: &ImvExtension) -> Result<String, String> {
+    let aggregate = ext
+        .mv_ctx
+        .schema_contract
+        .aggregate
+        .as_ref()
+        .ok_or_else(|| {
+            "Iceberg IMV aggregate rewrite requires aggregate schema contract".to_string()
+        })?;
+    if aggregate.row_id_column_name.trim().is_empty() {
+        return Err(
+            "Iceberg IMV aggregate rewrite requires aggregate row-id column in schema contract"
+                .to_string(),
+        );
+    }
+    Ok(aggregate.row_id_column_name.clone())
 }
 
 fn target_columns(ext: &ImvExtension) -> Result<Vec<ColumnDef>, String> {
@@ -425,25 +481,8 @@ mod tests {
             "count_state_signed"
         );
         assert_eq!(signed_state_function("sum").unwrap(), "sum_state_signed");
-        assert_eq!(signed_state_function("avg").unwrap(), "avg_state_signed");
         assert_eq!(signed_state_function("min").unwrap(), "min_state_signed");
         assert_eq!(signed_state_function("max").unwrap(), "max_state_signed");
-        assert_eq!(
-            signed_state_function("bool_or").unwrap(),
-            "bool_or_state_signed"
-        );
-        assert_eq!(
-            signed_state_function("bool_and").unwrap(),
-            "bool_and_state_signed"
-        );
-        assert_eq!(
-            signed_state_function("count_distinct").unwrap(),
-            "count_distinct_state_signed"
-        );
-        assert_eq!(
-            signed_state_function("approx_count_distinct").unwrap(),
-            "approx_count_distinct_state_signed"
-        );
     }
 
     #[test]
@@ -453,9 +492,30 @@ mod tests {
             err.contains("unsupported IMV aggregate function median"),
             "{err}"
         );
+        let err = signed_state_function("avg").expect_err("avg must be unsupported in Task 5");
+        assert!(
+            err.contains("unsupported IMV aggregate function avg"),
+            "{err}"
+        );
+    }
+
+    fn state_column(type_signature: &str) -> AggregateStateColumnContract {
+        AggregateStateColumnContract {
+            column_name: "__agg_state_s".to_string(),
+            target_field_id: 200,
+            type_signature: type_signature.to_string(),
+            nullable: true,
+            role: AggregateStateRoleContract::Single,
+        }
     }
 
     fn build_ctx() -> RewriteContext {
+        build_ctx_with_state_columns(vec![state_column("binary")])
+    }
+
+    fn build_ctx_with_state_columns(
+        state_columns: Vec<AggregateStateColumnContract>,
+    ) -> RewriteContext {
         let mut mv_def = make_mv_definition();
         let mut contract = make_schema_contract();
         contract.target.hidden_apply_key.column_name = "__row_id__".to_string();
@@ -464,13 +524,7 @@ mod tests {
         contract.aggregate = Some(AggregateStateContract {
             state_layout_version: 1,
             row_id_column_name: "__row_id__".to_string(),
-            state_columns: vec![AggregateStateColumnContract {
-                column_name: "__agg_state_s".to_string(),
-                target_field_id: 200,
-                type_signature: "binary".to_string(),
-                nullable: true,
-                role: AggregateStateRoleContract::Single,
-            }],
+            state_columns,
         });
         mv_def.schema_contract = Some(contract.clone());
 
@@ -638,6 +692,60 @@ mod tests {
         })
     }
 
+    fn aggregate_first_output_over(input: LogicalPlan) -> LogicalPlan {
+        LogicalPlan::Aggregate(AggregateNode {
+            input: Box::new(input),
+            group_by: vec![col_expr(1, "k")],
+            aggregates: vec![AggregateCall {
+                name: "sum".to_string(),
+                args: vec![col_expr(2, "v")],
+                distinct: false,
+                result_type: DataType::Int64,
+                order_by: Vec::new(),
+            }],
+            output_columns: vec![
+                OutputColumn {
+                    column_id: ColumnId::new_for_test(3),
+                    name: "s".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    is_internal: false,
+                },
+                OutputColumn {
+                    column_id: ColumnId::new_for_test(1),
+                    name: "k".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    is_internal: false,
+                },
+            ],
+            already_pushed: false,
+            required_output_columns: None,
+        })
+    }
+
+    fn aggregate_with_two_calls(input: LogicalPlan) -> LogicalPlan {
+        let mut plan = match aggregate_over(input) {
+            LogicalPlan::Aggregate(node) => node,
+            _ => unreachable!(),
+        };
+        plan.aggregates.push(AggregateCall {
+            name: "count".to_string(),
+            args: Vec::new(),
+            distinct: false,
+            result_type: DataType::Int64,
+            order_by: Vec::new(),
+        });
+        plan.output_columns.push(OutputColumn {
+            column_id: ColumnId::new_for_test(4),
+            name: "c".to_string(),
+            data_type: DataType::Int64,
+            nullable: true,
+            is_internal: false,
+        });
+        LogicalPlan::Aggregate(plan)
+    }
+
     fn delta(input: LogicalPlan) -> LogicalPlan {
         LogicalPlan::ImvDelta(ImvDeltaNode {
             input: Box::new(input),
@@ -758,5 +866,45 @@ mod tests {
             &struct_args[3].kind,
             ExprKind::ColumnRef { column, .. } if column == "__change_op"
         ));
+    }
+
+    #[test]
+    fn rewrite_aggregate_state_maps_group_key_by_column_id_when_output_is_aggregate_first() {
+        let rule = RewriteAggregateStateRule;
+        let mut ctx = build_ctx();
+        let result = rule
+            .apply(delta(aggregate_first_output_over(leaf_scan())), &mut ctx)
+            .expect("aggregate rewrite must succeed");
+        let RewriteResult::Changed(LogicalPlan::AggregateStateMerge(merge)) = result else {
+            panic!("expected Changed(AggregateStateMerge)");
+        };
+
+        assert_eq!(merge.group_key_names, vec!["k"]);
+    }
+
+    #[test]
+    fn rewrite_aggregate_state_rejects_state_column_count_mismatch() {
+        let rule = RewriteAggregateStateRule;
+        let mut ctx = build_ctx();
+        let err = rule
+            .apply(delta(aggregate_with_two_calls(leaf_scan())), &mut ctx)
+            .expect_err("state column count mismatch must fail");
+        assert!(
+            err.contains("aggregate state column count"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rewrite_aggregate_state_rejects_non_binary_state_column() {
+        let rule = RewriteAggregateStateRule;
+        let mut ctx = build_ctx_with_state_columns(vec![state_column("string")]);
+        let err = rule
+            .apply(delta(aggregate_over(leaf_scan())), &mut ctx)
+            .expect_err("non-binary state column must fail");
+        assert!(
+            err.contains("must have binary type signature"),
+            "unexpected error: {err}"
+        );
     }
 }

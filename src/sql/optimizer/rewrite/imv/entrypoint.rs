@@ -1,8 +1,8 @@
 //! Entrypoint for the IMV rewrite pipeline. See
 //! docs/superpowers/specs/2026-05-26-incremental-mv-optimizer-foundation-design.md.
 
-use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 use std::time::Instant;
 
 use crate::engine::mv::refresh_context::IcebergMvRewriteContext;
@@ -70,18 +70,30 @@ pub(crate) fn run_imv_rewrite(input: ImvRewriteInput) -> Result<ImvRewriteOutcom
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::mv::refresh_context::tests_support::{
+        make_mv_definition, make_pin, make_ref, make_schema_contract, make_target, parse_query,
+    };
+    use crate::meta::repository::mv_contract::{
+        AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
+        ApplyKeySource,
+    };
     use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
     use crate::sql::catalog::{
         ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
+    use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
     use crate::sql::optimizer::rewrite::imv::marker::{ImvVersionNode, ImvVersionRef};
     use crate::sql::optimizer::rewrite::phase::RewritePhase;
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
-    use crate::sql::planner::plan::{LogicalPlan, ProjectNode, ScanNode, ValuesNode};
+    use crate::sql::planner::plan::{
+        AggregateCall, AggregateNode, AggregateStateMergeNode, LogicalPlan, ProjectNode, ScanNode,
+        ValuesNode,
+    };
     use arrow::datatypes::DataType;
+    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -138,6 +150,173 @@ mod tests {
             predicates: Vec::new(),
             required_columns: None,
             dict_columns: Vec::new(),
+            required_output_columns: None,
+        })
+    }
+
+    fn aggregate_mv_ctx() -> Arc<IcebergMvRewriteContext> {
+        let mut mv_def = make_mv_definition();
+        let mut contract = make_schema_contract();
+        contract.target.hidden_apply_key.column_name = "__row_id__".to_string();
+        contract.target.hidden_apply_key.target_field_id = 999;
+        contract.target.hidden_apply_key.source = ApplyKeySource::GroupRowId;
+        contract.aggregate = Some(AggregateStateContract {
+            state_layout_version: 1,
+            row_id_column_name: "__row_id__".to_string(),
+            state_columns: vec![AggregateStateColumnContract {
+                column_name: "__agg_state_s".to_string(),
+                target_field_id: 200,
+                type_signature: "binary".to_string(),
+                nullable: true,
+                role: AggregateStateRoleContract::Single,
+            }],
+        });
+        mv_def.schema_contract = Some(contract.clone());
+        let target_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(7)
+                .with_fields(vec![
+                    Arc::new(NestedField::required(
+                        100,
+                        "k",
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                    Arc::new(NestedField::optional(
+                        101,
+                        "s",
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                    Arc::new(NestedField::required(
+                        999,
+                        "__row_id__",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                    Arc::new(NestedField::optional(
+                        200,
+                        "__agg_state_s",
+                        Type::Primitive(PrimitiveType::Binary),
+                    )),
+                ])
+                .build()
+                .expect("build target schema"),
+        );
+        Arc::new(
+            IcebergMvRewriteContext::from_parts(
+                make_target(),
+                42,
+                Some("sess_cat".to_string()),
+                "sess_db".to_string(),
+                Arc::new(mv_def),
+                Arc::new(parse_query(
+                    "SELECT k, sum(v) AS s FROM ice.db.b GROUP BY k",
+                )),
+                Arc::from(vec![make_ref("ice", "db", "b")]),
+                Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")])),
+                Some(99),
+                "uuid-tgt".to_string(),
+                target_schema,
+                Some(Arc::new(contract)),
+            )
+            .expect("aggregate mv context must build"),
+        )
+    }
+
+    fn aggregate_scan_plan() -> LogicalPlan {
+        let columns = vec![
+            ColumnDef {
+                name: "k".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                write_default: None,
+                logical_type: None,
+            },
+            ColumnDef {
+                name: "v".to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+                write_default: None,
+                logical_type: None,
+            },
+        ];
+        LogicalPlan::Scan(ScanNode {
+            database: "db".to_string(),
+            table: TableDef {
+                name: "b".to_string(),
+                columns,
+                iceberg_row_lineage_metadata_columns: Vec::new(),
+                source: match iceberg_scan_plan() {
+                    LogicalPlan::Scan(scan) => scan.table.source,
+                    _ => unreachable!(),
+                },
+            },
+            alias: None,
+            columns: vec![
+                OutputColumn {
+                    column_id: ColumnId(1),
+                    name: "k".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    is_internal: false,
+                },
+                OutputColumn {
+                    column_id: ColumnId(2),
+                    name: "v".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    is_internal: false,
+                },
+            ],
+            predicates: Vec::new(),
+            required_columns: None,
+            dict_columns: Vec::new(),
+            required_output_columns: None,
+        })
+    }
+
+    fn aggregate_plan() -> LogicalPlan {
+        LogicalPlan::Aggregate(AggregateNode {
+            input: Box::new(aggregate_scan_plan()),
+            group_by: vec![TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: ColumnId(1),
+                    qualifier: None,
+                    column: "k".to_string(),
+                },
+                data_type: DataType::Int64,
+                nullable: false,
+            }],
+            aggregates: vec![AggregateCall {
+                name: "sum".to_string(),
+                args: vec![TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        column_id: ColumnId(2),
+                        qualifier: None,
+                        column: "v".to_string(),
+                    },
+                    data_type: DataType::Int64,
+                    nullable: true,
+                }],
+                distinct: false,
+                result_type: DataType::Int64,
+                order_by: Vec::new(),
+            }],
+            output_columns: vec![
+                OutputColumn {
+                    column_id: ColumnId(1),
+                    name: "k".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    is_internal: false,
+                },
+                OutputColumn {
+                    column_id: ColumnId(3),
+                    name: "s".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    is_internal: false,
+                },
+            ],
+            already_pushed: false,
             required_output_columns: None,
         })
     }
@@ -645,6 +824,58 @@ mod tests {
                 .iter()
                 .any(|c| c.is_internal && c.name.eq_ignore_ascii_case("__change_op")),
             "child scan must carry the internal action column"
+        );
+    }
+
+    #[test]
+    fn imv_pipeline_rewrites_aggregate_refresh_to_state_merge() {
+        let outcome = run_imv_rewrite(ImvRewriteInput {
+            plan: aggregate_plan(),
+            mv_ctx: aggregate_mv_ctx(),
+            disabled_rules: Vec::new(),
+            deadline: None,
+            next_column_id: 100,
+        })
+        .expect("aggregate IMV pipeline must rewrite and validate");
+
+        let LogicalPlan::AggregateStateMerge(AggregateStateMergeNode { delta_input, .. }) =
+            outcome.plan
+        else {
+            panic!("expected AggregateStateMerge");
+        };
+        let LogicalPlan::Aggregate(delta_aggregate) = delta_input.as_ref() else {
+            panic!("expected signed aggregate delta input");
+        };
+        assert_eq!(delta_aggregate.aggregates[0].name, "sum_state_signed");
+        let LogicalPlan::Scan(scan) = delta_aggregate.input.as_ref() else {
+            panic!("expected bound delta scan under signed aggregate");
+        };
+        assert!(
+            matches!(scan.table.source, ScanSource::IcebergDeltaTable { .. }),
+            "signed aggregate input must be delta-bound"
+        );
+        assert!(
+            scan.columns
+                .iter()
+                .any(|column| column.name.eq_ignore_ascii_case("__change_op")),
+            "delta scan must carry action column"
+        );
+        let action_id = scan
+            .columns
+            .iter()
+            .find(|column| ImvActionColumn::matches(column))
+            .expect("delta scan must carry action column")
+            .column_id;
+        let signed_input = &delta_aggregate.aggregates[0].args[0];
+        let ExprKind::FunctionCall { args, .. } = &signed_input.kind else {
+            panic!("expected signed state named_struct input");
+        };
+        let ExprKind::ColumnRef { column_id, .. } = &args[3].kind else {
+            panic!("expected signed state input to reference action column");
+        };
+        assert_eq!(
+            *column_id, action_id,
+            "signed state input and delta scan must share the action ColumnId"
         );
     }
 }
