@@ -20,8 +20,8 @@
 use crate::sql::analysis::{JoinKind, TypedExpr};
 use crate::sql::optimizer::rewrite::rule::PlanRewriteRule as RewriteRule;
 use crate::sql::optimizer::rewrite::rules::utils::{
-    collect_column_refs, collect_output_columns, collect_qualified_column_refs,
-    collect_qualified_output_columns, combine_and, split_and,
+    collect_column_id_refs, collect_column_refs, collect_output_columns, collect_output_ids,
+    collect_qualified_column_refs, collect_qualified_output_columns, combine_and, split_and,
 };
 use crate::sql::planner::plan::*;
 
@@ -52,6 +52,8 @@ impl RewriteRule for PushSemiAntiRightOnlyCondition {
         let conjuncts = split_and(condition.clone());
         let right_cols = collect_output_columns(&join.right);
         let left_cols = collect_output_columns(&join.left);
+        let right_ids = collect_output_ids(&join.right);
+        let left_ids = collect_output_ids(&join.left);
         let right_qcols = collect_qualified_output_columns(&join.right);
 
         let mut keep_in_condition: Vec<TypedExpr> = Vec::new();
@@ -60,25 +62,29 @@ impl RewriteRule for PushSemiAntiRightOnlyCondition {
         for conj in conjuncts {
             let refs = collect_column_refs(&conj);
             let qrefs = collect_qualified_column_refs(&conj);
+            let id_right_only = classify_right_only_by_column_ids(&conj, &left_ids, &right_ids);
 
             // Use qualified refs when available to handle self-joins
             // (e.g., catalog_sales cs1, catalog_sales cs2 — same bare names).
             // But also check bare refs to avoid pushing cross-side predicates
             // where one side is qualified and the other isn't.
-            let is_right_only = if !qrefs.is_empty() {
-                // All qualified refs must be in right's qualified columns,
-                // AND all bare refs must be right-only (not also in left).
-                let q_all_right = qrefs.iter().all(|r| right_qcols.contains(r));
-                let bare_any_left = refs.iter().any(|c| left_cols.contains(&c.to_lowercase()));
-                q_all_right && !bare_any_left
-            } else if !refs.is_empty() {
-                // Fallback: all bare refs in right but NOT all in left
-                // (avoids pushing cross-side predicates for self-joins)
-                let all_in_right = refs.iter().all(|c| right_cols.contains(&c.to_lowercase()));
-                let any_in_left = refs.iter().any(|c| left_cols.contains(&c.to_lowercase()));
-                all_in_right && !any_in_left
-            } else {
-                false
+            let is_right_only = match id_right_only {
+                Some(right_only) => right_only,
+                None if !qrefs.is_empty() => {
+                    // All qualified refs must be in right's qualified columns,
+                    // AND all bare refs must be right-only (not also in left).
+                    let q_all_right = qrefs.iter().all(|r| right_qcols.contains(r));
+                    let bare_any_left = refs.iter().any(|c| left_cols.contains(&c.to_lowercase()));
+                    q_all_right && !bare_any_left
+                }
+                None if !refs.is_empty() => {
+                    // Fallback: all bare refs in right but NOT all in left
+                    // (avoids pushing cross-side predicates for self-joins)
+                    let all_in_right = refs.iter().all(|c| right_cols.contains(&c.to_lowercase()));
+                    let any_in_left = refs.iter().any(|c| left_cols.contains(&c.to_lowercase()));
+                    all_in_right && !any_in_left
+                }
+                None => false,
             };
 
             if is_right_only {
@@ -113,10 +119,34 @@ impl RewriteRule for PushSemiAntiRightOnlyCondition {
     }
 }
 
+fn classify_right_only_by_column_ids(
+    expr: &TypedExpr,
+    left_ids: &std::collections::HashSet<crate::sql::column_id::ColumnId>,
+    right_ids: &std::collections::HashSet<crate::sql::column_id::ColumnId>,
+) -> Option<bool> {
+    let ids = collect_column_id_refs(expr);
+    if ids.is_empty() {
+        return None;
+    }
+    if ids.len() != collect_qualified_column_refs(expr).len() {
+        return Some(false);
+    }
+
+    for id in ids {
+        match (left_ids.contains(&id), right_ids.contains(&id)) {
+            (false, true) => {}
+            _ => return Some(false),
+        }
+    }
+    Some(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr};
+    use crate::sql::analysis::{
+        BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
+    };
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use arrow::datatypes::DataType;
@@ -148,6 +178,18 @@ mod tests {
             kind: ExprKind::BinaryOp {
                 left: Box::new(a),
                 op: BinOp::Eq,
+                right: Box::new(b),
+            },
+        }
+    }
+
+    fn gt(a: TypedExpr, b: TypedExpr) -> TypedExpr {
+        TypedExpr {
+            data_type: DataType::Boolean,
+            nullable: false,
+            kind: ExprKind::BinaryOp {
+                left: Box::new(a),
+                op: BinOp::Gt,
                 right: Box::new(b),
             },
         }
@@ -230,6 +272,91 @@ mod tests {
             condition,
             required_output_columns: None,
         })
+    }
+
+    fn col_with_id(qualifier: &str, name: &str, id: u32) -> TypedExpr {
+        TypedExpr {
+            data_type: DataType::Int64,
+            nullable: true,
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId::new_for_test(id),
+                qualifier: Some(qualifier.to_string()),
+                column: name.to_string(),
+            },
+        }
+    }
+
+    fn values_with_output(name: &str, id: u32) -> LogicalPlan {
+        LogicalPlan::Values(ValuesNode {
+            rows: vec![],
+            columns: vec![OutputColumn {
+                column_id: ColumnId::new_for_test(id),
+                name: name.to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+                is_internal: false,
+            }],
+            required_output_columns: None,
+        })
+    }
+
+    fn derived_project_with_output_id(source_id: u32, output_id: u32) -> LogicalPlan {
+        LogicalPlan::Project(ProjectNode {
+            input: Box::new(values_with_output("right_source", source_id)),
+            items: vec![ProjectItem {
+                expr: TypedExpr {
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    kind: ExprKind::ColumnRef {
+                        column_id: ColumnId::new_for_test(source_id),
+                        qualifier: None,
+                        column: "right_source".to_string(),
+                    },
+                },
+                output_name: "k".to_string(),
+                output_column_id: ColumnId::new_for_test(output_id),
+            }],
+            required_output_columns: None,
+        })
+    }
+
+    #[test]
+    fn pushes_right_only_alias_free_project_conjunct_by_column_id() {
+        let left = values_with_output("k", 101);
+        let right = derived_project_with_output_id(22, 202);
+        let join_pred = eq(col_with_id("l", "k", 101), col_with_id("r", "k", 202));
+        let right_pred = gt(col_with_id("r", "k", 202), int_lit(10));
+        let join = semi_join(left, right, Some(and(join_pred, right_pred)));
+
+        let rule = PushSemiAntiRightOnlyCondition;
+        let out = rule
+            .apply(join)
+            .expect("right-only derived output predicate should push");
+
+        let LogicalPlan::Join(j) = out else {
+            panic!("expected Join");
+        };
+        assert_eq!(j.join_type, JoinKind::LeftSemi);
+        assert!(matches!(
+            j.condition.as_ref().map(|expr| &expr.kind),
+            Some(ExprKind::BinaryOp { op: BinOp::Eq, .. })
+        ));
+        let LogicalPlan::Filter(filter) = *j.right else {
+            panic!("expected Filter on right child");
+        };
+        assert!(matches!(
+            &filter.predicate.kind,
+            ExprKind::BinaryOp {
+                op: BinOp::Gt,
+                left,
+                ..
+            } if matches!(
+                &left.kind,
+                ExprKind::ColumnRef { column_id, qualifier: Some(q), column }
+                    if *column_id == ColumnId::new_for_test(202) && q == "r" && column == "k"
+            )
+        ));
+        assert!(matches!(*filter.input, LogicalPlan::Project(_)));
     }
 
     // Test 1: LEFT SEMI ON (ss_sold_date_sk=d_date_sk AND corr AND d_year=2002)
