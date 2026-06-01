@@ -76,15 +76,6 @@ fn limit_child_can_apply_offset_locally(child: &PhysicalPlanNode) -> bool {
     )
 }
 
-// ---------------------------------------------------------------------------
-// Scan/join ownership metadata (used by RF planning)
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Debug)]
-pub(crate) struct ScanTupleOwner {
-    pub scan_node_id: i32,
-    pub fragment_id: FragmentId,
-}
 
 /// Probe-side target recorded while visiting a node that carries a
 /// `RuntimeFilterProbe` annotation. The build-side hash join (visited AFTER
@@ -249,12 +240,6 @@ pub(crate) struct PlanFragmentBuilder<'a> {
     completed_edges: Vec<FragmentEdge>,
     /// CTE ID -> index in `completed_fragments`.
     cte_fragments: HashMap<CteId, usize>,
-    /// tuple_id -> owning scan node and fragment (for RF target identification).
-    pub(crate) scan_tuple_owners: HashMap<i32, ScanTupleOwner>,
-    /// hash join node_id -> fragment_id for RF eligibility.
-    pub(crate) join_fragment_map: HashMap<i32, FragmentId>,
-    /// hash join node_id -> JoinDistribution for RF join mode mapping.
-    pub(crate) join_distributions: HashMap<i32, crate::sql::optimizer::operator::JoinDistribution>,
     /// Per-fragment accumulator of `TGlobalDict` entries emitted by scans
     /// with non-empty `dict_columns`. Drained into
     /// `FragmentBuildResult.query_global_dicts` when each fragment is
@@ -310,9 +295,6 @@ impl<'a> PlanFragmentBuilder<'a> {
             completed_fragments: Vec::new(),
             completed_edges: Vec::new(),
             cte_fragments: HashMap::new(),
-            scan_tuple_owners: HashMap::new(),
-            join_fragment_map: HashMap::new(),
-            join_distributions: HashMap::new(),
             query_global_dicts_per_fragment: HashMap::new(),
             slot_to_global_dict: HashMap::new(),
             rf_probe_targets: HashMap::new(),
@@ -1021,15 +1003,6 @@ impl<'a> PlanFragmentBuilder<'a> {
             iceberg_metadata_pseudo_column_slots,
         });
 
-        // Track tuple -> scan node ownership for runtime filter planning.
-        self.scan_tuple_owners.insert(
-            scan_tuple_id,
-            ScanTupleOwner {
-                scan_node_id,
-                fragment_id: current_frag,
-            },
-        );
-
         Ok(VisitResult {
             plan_nodes: vec![scan_plan_node],
             scope,
@@ -1383,13 +1356,6 @@ impl<'a> PlanFragmentBuilder<'a> {
 
         let join_op = join_kind_to_op(op.join_type);
         let join_node_id = self.alloc_node();
-
-        // Track join node -> fragment for runtime filter planning.
-        if let Ok(frag_id) = self.current_fragment_id() {
-            self.join_fragment_map.insert(join_node_id, frag_id);
-        }
-        self.join_distributions
-            .insert(join_node_id, op.distribution.clone());
 
         // Compile eq conditions.  Pairs are pre-oriented by JoinToHashJoin so
         // that pair.0 references the left child and pair.1 references the right
