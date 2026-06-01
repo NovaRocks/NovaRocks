@@ -1066,18 +1066,9 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
             widen_for_join_kind(j.join_type, left_cols, right_cols)
         }
 
-        // Union/Intersect/Except: use first child's output columns.
-        Operator::LogicalUnion(_) | Operator::LogicalIntersect(_) | Operator::LogicalExcept(_) => {
-            if let Some(&child_id) = expr.children.first() {
-                memo.groups[child_id]
-                    .logical_props
-                    .as_ref()
-                    .map(|p| p.output_columns.clone())
-                    .unwrap_or_default()
-            } else {
-                vec![]
-            }
-        }
+        Operator::LogicalUnion(op) => op.output_columns.clone(),
+        Operator::LogicalIntersect(op) => op.output_columns.clone(),
+        Operator::LogicalExcept(op) => op.output_columns.clone(),
 
         // Physical operator counterparts.
         Operator::PhysicalScan(s) => s.columns.clone(),
@@ -1170,19 +1161,9 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
                 .unwrap_or_default();
             widen_for_join_kind(j.join_type, left_cols, right_cols)
         }
-        Operator::PhysicalUnion(_)
-        | Operator::PhysicalIntersect(_)
-        | Operator::PhysicalExcept(_) => {
-            if let Some(&child_id) = expr.children.first() {
-                memo.groups[child_id]
-                    .logical_props
-                    .as_ref()
-                    .map(|p| p.output_columns.clone())
-                    .unwrap_or_default()
-            } else {
-                vec![]
-            }
-        }
+        Operator::PhysicalUnion(op) => op.output_columns.clone(),
+        Operator::PhysicalIntersect(op) => op.output_columns.clone(),
+        Operator::PhysicalExcept(op) => op.output_columns.clone(),
     }
 }
 

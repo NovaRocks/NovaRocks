@@ -183,13 +183,18 @@ pub(crate) struct LogicalWindowOp {
 #[derive(Clone, Debug)]
 pub(crate) struct LogicalUnionOp {
     pub all: bool,
+    pub output_columns: Vec<OutputColumn>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct LogicalIntersectOp;
+pub(crate) struct LogicalIntersectOp {
+    pub output_columns: Vec<OutputColumn>,
+}
 
 #[derive(Clone, Debug)]
-pub(crate) struct LogicalExceptOp;
+pub(crate) struct LogicalExceptOp {
+    pub output_columns: Vec<OutputColumn>,
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct LogicalValuesOp {
@@ -396,13 +401,18 @@ pub(crate) struct PhysicalRepeatOp {
 #[derive(Clone, Debug)]
 pub(crate) struct PhysicalUnionOp {
     pub all: bool,
+    pub output_columns: Vec<OutputColumn>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct PhysicalIntersectOp;
+pub(crate) struct PhysicalIntersectOp {
+    pub output_columns: Vec<OutputColumn>,
+}
 
 #[derive(Clone, Debug)]
-pub(crate) struct PhysicalExceptOp;
+pub(crate) struct PhysicalExceptOp {
+    pub output_columns: Vec<OutputColumn>,
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct PhysicalValuesOp {
