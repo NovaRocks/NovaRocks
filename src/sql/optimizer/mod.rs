@@ -143,7 +143,12 @@ pub(crate) fn optimize(
     check_deadline(deadline)?;
 
     // 11. Extract best plan.
-    extract::extract_best(&memo, root_group, &root_required, &ctx.winners)
+    let mut physical = extract::extract_best(&memo, root_group, &root_required, &ctx.winners)?;
+
+    // 12. Annotate physical plan with runtime filter descriptors.
+    runtime_filter_pass::annotate(&mut physical, &options);
+
+    Ok(physical)
 }
 
 /// Resolve which dictionary provider should drive the
@@ -175,6 +180,7 @@ pub(crate) fn is_known_rule_name(name: &str) -> bool {
             .iter()
             .any(|r| r.name() == name)
         || rewrite::registry::is_known_rewrite_rule_name(name)
+        || name == runtime_filter_pass::RUNTIME_FILTER_RULE
 }
 
 fn check_deadline(deadline: Instant) -> Result<(), String> {
@@ -352,6 +358,11 @@ mod is_known_rule_name_tests {
     fn is_known_rule_name_rejects_typos() {
         assert!(!is_known_rule_name("TotallyNotARealRule"));
         assert!(!is_known_rule_name(""));
+    }
+
+    #[test]
+    fn is_known_rule_name_recognizes_runtime_filter() {
+        assert!(is_known_rule_name("RuntimeFilterPushDown"));
     }
 
     // --- Item 4 (Important): provider precedence tests for optimize() ---
