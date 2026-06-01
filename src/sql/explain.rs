@@ -401,10 +401,12 @@ fn format_physical_node(
                 let preds: Vec<String> = op.predicates.iter().map(format_expr).collect();
                 out.push(format!("{pad}     predicates: {}", preds.join(" AND ")));
             }
+            push_probe_rf_lines(node, level, &pad, out);
         }
         Operator::PhysicalFilter(op) => {
             out.push(format!("{pad}FILTER{costs_suffix}{stats_suffix}"));
             out.push(format!("{pad}  predicate: {}", format_expr(&op.predicate)));
+            push_probe_rf_lines(node, level, &pad, out);
             for child in &node.children {
                 format_physical_node(child, level, indent + 1, out);
             }
@@ -426,6 +428,7 @@ fn format_physical_node(
                 "{pad}PROJECT [{}]{costs_suffix}{stats_suffix}",
                 items.join(", ")
             ));
+            push_probe_rf_lines(node, level, &pad, out);
             for child in &node.children {
                 format_physical_node(child, level, indent + 1, out);
             }
@@ -466,6 +469,17 @@ fn format_physical_node(
             ));
             if let Some(ref other) = op.other_condition {
                 out.push(format!("{pad}  other: {}", format_expr(other)));
+            }
+            if matches!(level, ExplainLevel::Verbose | ExplainLevel::Costs | ExplainLevel::Analyze)
+                && !node.build_runtime_filters.is_empty()
+            {
+                out.push(format!("{pad}  build runtime filters:"));
+                for rf in &node.build_runtime_filters {
+                    out.push(format!(
+                        "{pad}  - filter_id = {}, build_expr = ({})",
+                        rf.filter_id, format_expr(&rf.build_expr),
+                    ));
+                }
             }
             for child in &node.children {
                 format_physical_node(child, level, indent + 1, out);
@@ -521,6 +535,7 @@ fn format_physical_node(
             if !aggs.is_empty() {
                 out.push(format!("{pad}  aggregations: {}", aggs.join(", ")));
             }
+            push_probe_rf_lines(node, level, &pad, out);
             for child in &node.children {
                 format_physical_node(child, level, indent + 1, out);
             }
@@ -685,6 +700,7 @@ fn format_physical_node(
                 "{pad}VALUES ({} rows){costs_suffix}{stats_suffix}",
                 op.rows.len()
             ));
+            push_probe_rf_lines(node, level, &pad, out);
         }
         Operator::PhysicalGenerateSeries(op) => {
             out.push(format!(
@@ -732,6 +748,21 @@ fn format_physical_node(
                 "{pad}<logical operator>{costs_suffix}{stats_suffix}"
             ));
         }
+    }
+}
+
+fn push_probe_rf_lines(node: &PhysicalPlanNode, level: ExplainLevel, pad: &str, out: &mut Vec<String>) {
+    if !matches!(level, ExplainLevel::Verbose | ExplainLevel::Costs | ExplainLevel::Analyze)
+        || node.probe_runtime_filters.is_empty()
+    {
+        return;
+    }
+    out.push(format!("{pad}    probe runtime filters:"));
+    for rf in &node.probe_runtime_filters {
+        out.push(format!(
+            "{pad}    - filter_id = {}, probe_expr = ({})",
+            rf.filter_id, format_expr(&rf.probe_expr),
+        ));
     }
 }
 
@@ -1584,5 +1615,30 @@ mod costs_level_tests {
             s.contains("ndv=?"),
             "expected ndv=? for infinite NDV, got: {s}"
         );
+    }
+}
+
+#[cfg(test)]
+mod rf_explain_tests {
+    use super::*;
+    use crate::sql::optimizer::options::OptimizerOptions;
+    use crate::sql::optimizer::runtime_filter_pass::{self, test_support};
+
+    #[test]
+    fn explain_shows_build_and_probe_rf() {
+        let mut join = test_support::inner_join_two_scans();
+        runtime_filter_pass::annotate(&mut join, &OptimizerOptions::default_settings());
+        let lines = explain_physical_plan(&join, ExplainLevel::Verbose).join("\n");
+        assert!(lines.contains("build runtime filters:"), "missing build RF; got:\n{lines}");
+        assert!(lines.contains("filter_id = 0"), "missing filter_id; got:\n{lines}");
+        assert!(lines.contains("probe runtime filters:"), "missing probe RF; got:\n{lines}");
+    }
+
+    #[test]
+    fn explain_normal_level_hides_rf() {
+        let mut join = test_support::inner_join_two_scans();
+        runtime_filter_pass::annotate(&mut join, &OptimizerOptions::default_settings());
+        let lines = explain_physical_plan(&join, ExplainLevel::Normal).join("\n");
+        assert!(!lines.contains("runtime filters:"), "RF must be hidden at Normal level");
     }
 }
