@@ -6075,38 +6075,14 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan(
     let pin = crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin::capture(
         state, &base_refs,
     )?;
-    let mut explain_definition = mv_definition;
-    // EXPLAIN REFRESH is read-only and may be used before the first executed
-    // refresh. In that case there is no persisted previous snapshot yet; use
-    // the current pin as a zero-width explain-only window so the IMV rewrite
-    // plan can be inspected without running the refresh pipeline.
-    for base_ref in &base_refs {
-        let fqn = base_ref.fqn();
-        if !explain_definition.last_refresh_snapshots.contains_key(&fqn)
-            && let Some(snapshot_id) = pin.get(base_ref)
-        {
-            explain_definition
-                .last_refresh_snapshots
-                .insert(fqn.clone(), snapshot_id);
-        }
-        if !explain_definition
-            .last_refresh_table_uuids
-            .contains_key(&fqn)
-            && let Some(uuid) = pin.uuid(base_ref)
-        {
-            explain_definition
-                .last_refresh_table_uuids
-                .insert(fqn, uuid.to_string());
-        }
-    }
-    validate_refresh_pin_table_uuids(&explain_definition, &pin, &base_refs)?;
+    validate_refresh_pin_table_uuids(&mv_definition, &pin, &base_refs)?;
 
     let ctx = IcebergMvRefreshContext::new(
         target,
-        explain_definition.mv_id,
+        mv_definition.mv_id,
         current_catalog,
         current_database,
-        Arc::new(explain_definition),
+        Arc::new(mv_definition),
         Arc::new(canonical_select_query),
         Arc::from(base_refs),
         Arc::new(pin),
