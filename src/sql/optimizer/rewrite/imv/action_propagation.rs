@@ -294,10 +294,27 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
 fn is_supported_join_delta_union(node: &crate::sql::planner::plan::UnionNode) -> bool {
     node.all
         && !node.inputs.is_empty()
-        && node.inputs.iter().all(|input| match input {
-            LogicalPlan::Join(join) => is_supported_join_delta_branch(join),
-            _ => false,
-        })
+        && node
+            .inputs
+            .iter()
+            .all(is_supported_normalized_join_delta_branch)
+}
+
+fn is_supported_normalized_join_delta_branch(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Project(project) => {
+            project
+                .items
+                .iter()
+                .any(|item| item.output_name.eq_ignore_ascii_case(ImvActionColumn::NAME))
+                && matches!(
+                    project.input.as_ref(),
+                    LogicalPlan::Join(join) if is_supported_join_delta_branch(join)
+                )
+        }
+        LogicalPlan::Join(join) => is_supported_join_delta_branch(join),
+        _ => false,
+    }
 }
 
 fn is_supported_join_delta_branch(node: &crate::sql::planner::plan::JoinNode) -> bool {

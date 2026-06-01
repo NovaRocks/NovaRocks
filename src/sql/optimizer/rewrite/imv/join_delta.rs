@@ -3,12 +3,13 @@ use arrow::datatypes::DataType;
 use crate::sql::analysis::{JoinKind, OutputColumn, ProjectItem};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
+use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
 use crate::sql::optimizer::rewrite::imv::annotation::ImvExtension;
 use crate::sql::optimizer::rewrite::imv::marker::{ImvDeltaNode, ImvVersionNode, ImvVersionRef};
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
-use crate::sql::planner::plan::{JoinNode, LogicalPlan, UnionNode};
+use crate::sql::planner::plan::{JoinNode, LogicalPlan, ProjectNode, UnionNode};
 
 pub(crate) struct RewriteJoinAggregateDeltaRule;
 
@@ -85,26 +86,33 @@ impl LogicalRewriteRule for RewriteJoinAggregateDeltaRule {
         } = join;
         let left = *left;
         let right = *right;
-        let output_columns = join_output_columns(join_type, &left, &right)?;
+        let mut output_columns = join_output_columns(join_type, &left, &right)?;
+        output_columns.push(ImvActionColumn::output_column(action_column));
 
-        let left_delta_branch = LogicalPlan::Join(JoinNode {
-            left: Box::new(mark_delta_scan(left.clone(), action_column)?),
-            right: Box::new(mark_version_scan(
-                right.clone(),
-                ImvVersionRef::from_snapshot(),
-            )?),
-            join_type,
-            condition: condition.clone(),
-            required_output_columns: required_output_columns.clone(),
-        });
+        let left_delta_branch = normalize_branch_output(
+            LogicalPlan::Join(JoinNode {
+                left: Box::new(mark_delta_scan(left.clone(), action_column)?),
+                right: Box::new(mark_version_scan(
+                    right.clone(),
+                    ImvVersionRef::from_snapshot(),
+                )?),
+                join_type,
+                condition: condition.clone(),
+                required_output_columns: required_output_columns.clone(),
+            }),
+            &output_columns,
+        );
 
-        let right_delta_branch = LogicalPlan::Join(JoinNode {
-            left: Box::new(mark_version_scan(left, ImvVersionRef::to_snapshot())?),
-            right: Box::new(mark_delta_scan(right, action_column)?),
-            join_type,
-            condition,
-            required_output_columns: required_output_columns.clone(),
-        });
+        let right_delta_branch = normalize_branch_output(
+            LogicalPlan::Join(JoinNode {
+                left: Box::new(mark_version_scan(left, ImvVersionRef::to_snapshot())?),
+                right: Box::new(mark_delta_scan(right, action_column)?),
+                join_type,
+                condition,
+                required_output_columns: required_output_columns.clone(),
+            }),
+            &output_columns,
+        );
 
         aggregate.input = Box::new(LogicalPlan::Union(UnionNode {
             inputs: vec![left_delta_branch, right_delta_branch],
@@ -214,6 +222,29 @@ fn plan_kind(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::ImvDelta(_) => "ImvDelta",
         LogicalPlan::ImvVersion(_) => "ImvVersion",
     }
+}
+
+fn normalize_branch_output(input: LogicalPlan, output_columns: &[OutputColumn]) -> LogicalPlan {
+    LogicalPlan::Project(ProjectNode {
+        input: Box::new(input),
+        items: output_columns
+            .iter()
+            .map(|column| ProjectItem {
+                expr: crate::sql::analysis::TypedExpr {
+                    kind: crate::sql::analysis::ExprKind::ColumnRef {
+                        column_id: column.column_id,
+                        qualifier: None,
+                        column: column.name.clone(),
+                    },
+                    data_type: column.data_type.clone(),
+                    nullable: column.nullable,
+                },
+                output_name: column.name.clone(),
+                output_column_id: column.column_id,
+            })
+            .collect(),
+        required_output_columns: None,
+    })
 }
 
 fn plan_output_columns(plan: &LogicalPlan) -> Result<Vec<OutputColumn>, String> {
@@ -362,12 +393,16 @@ mod tests {
                 .iter()
                 .map(|column| column.column_id)
                 .collect::<Vec<_>>(),
-            vec![ColumnId(1), ColumnId(2), ColumnId(10), ColumnId(11)]
+            vec![
+                ColumnId(1),
+                ColumnId(2),
+                ColumnId(10),
+                ColumnId(11),
+                ColumnId(100)
+            ]
         );
 
-        let LogicalPlan::Join(left_delta_branch) = &union.inputs[0] else {
-            panic!("expected first branch Join");
-        };
+        let left_delta_branch = assert_normalized_branch(&union.inputs[0], action_column);
         assert_eq!(left_delta_branch.join_type, join_type);
         assert_condition_refs(left_delta_branch.condition.as_ref());
         assert_delta(left_delta_branch.left.as_ref(), "left", action_column);
@@ -377,13 +412,43 @@ mod tests {
             ImvVersionRole::From,
         );
 
-        let LogicalPlan::Join(right_delta_branch) = &union.inputs[1] else {
-            panic!("expected second branch Join");
-        };
+        let right_delta_branch = assert_normalized_branch(&union.inputs[1], action_column);
         assert_eq!(right_delta_branch.join_type, join_type);
         assert_condition_refs(right_delta_branch.condition.as_ref());
         assert_version(right_delta_branch.left.as_ref(), "left", ImvVersionRole::To);
         assert_delta(right_delta_branch.right.as_ref(), "right", action_column);
+    }
+
+    fn assert_normalized_branch(plan: &LogicalPlan, action_column: ColumnId) -> &JoinNode {
+        let LogicalPlan::Project(project) = plan else {
+            panic!("expected normalized branch Project");
+        };
+        assert_eq!(
+            project
+                .items
+                .iter()
+                .map(|item| item.output_column_id)
+                .collect::<Vec<_>>(),
+            vec![
+                ColumnId(1),
+                ColumnId(2),
+                ColumnId(10),
+                ColumnId(11),
+                action_column
+            ]
+        );
+        assert!(
+            project
+                .items
+                .iter()
+                .any(|item| item.output_name.eq_ignore_ascii_case("__change_op")
+                    && item.output_column_id == action_column),
+            "normalized branch Project must expose shared action column"
+        );
+        let LogicalPlan::Join(join) = project.input.as_ref() else {
+            panic!("expected Project(Join)");
+        };
+        join
     }
 
     fn build_ctx() -> RewriteContext {

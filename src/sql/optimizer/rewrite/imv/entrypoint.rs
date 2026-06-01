@@ -88,6 +88,7 @@ mod tests {
         ImvVersionNode, ImvVersionRef, plan_contains_imv_marker,
     };
     use crate::sql::optimizer::rewrite::phase::RewritePhase;
+    use crate::sql::optimizer::rewrite::registry::query_rewrite_pipeline;
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
     use crate::sql::planner::plan::{
@@ -96,7 +97,7 @@ mod tests {
     };
     use arrow::datatypes::DataType;
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn dummy_mv_ctx() -> Arc<IcebergMvRewriteContext> {
@@ -1135,24 +1136,144 @@ mod tests {
         let LogicalPlan::Union(union) = delta_aggregate.input.as_ref() else {
             panic!("expected join delta UnionAll under signed aggregate");
         };
+        assert_join_delta_union_shape(union, signed_action_id);
+    }
+
+    #[test]
+    fn query_rewrite_preserves_join_aggregate_action_column() {
+        let outcome = run_imv_rewrite(ImvRewriteInput {
+            plan: join_aggregate_plan(),
+            mv_ctx: join_aggregate_mv_ctx(),
+            disabled_rules: Vec::new(),
+            deadline: None,
+            next_column_id: 100,
+        })
+        .expect("join aggregate IMV pipeline must rewrite and validate");
+
+        let pipeline = query_rewrite_pipeline(&HashMap::new());
+        let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        let rewritten = pipeline
+            .rewrite(outcome.plan, &mut ctx)
+            .expect("query rewrite must preserve join aggregate delta action");
+
+        let LogicalPlan::AggregateStateMerge(AggregateStateMergeNode { delta_input, .. }) =
+            rewritten
+        else {
+            panic!("expected AggregateStateMerge after query rewrite");
+        };
+        let LogicalPlan::Aggregate(delta_aggregate) = delta_input.as_ref() else {
+            panic!("expected signed aggregate delta input");
+        };
+        let signed_action_id = signed_action_column_id(delta_aggregate);
+
+        let LogicalPlan::Union(union) = delta_aggregate.input.as_ref() else {
+            panic!("expected join delta UnionAll under signed aggregate");
+        };
+        assert!(
+            union
+                .output_columns
+                .iter()
+                .any(|column| column.column_id == signed_action_id
+                    && column.name.eq_ignore_ascii_case("__change_op")),
+            "Union output schema must retain action column after pruning"
+        );
+        assert_join_delta_union_shape(union, signed_action_id);
+    }
+
+    fn assert_join_delta_union_shape(
+        union: &crate::sql::planner::plan::UnionNode,
+        signed_action_id: ColumnId,
+    ) {
         assert!(union.all);
         assert_eq!(union.inputs.len(), 2);
+        assert!(
+            union
+                .output_columns
+                .iter()
+                .any(|column| column.column_id == signed_action_id
+                    && column.name.eq_ignore_ascii_case("__change_op")),
+            "Union output schema must include shared action column"
+        );
 
-        let LogicalPlan::Join(left_delta_branch) = &union.inputs[0] else {
-            panic!("expected first union branch Join");
-        };
-        let left_delta_action =
-            assert_delta_project_scan(left_delta_branch.left.as_ref(), "l", 11, 22);
-        assert_eq!(left_delta_action, signed_action_id);
-        assert_version_project_scan(left_delta_branch.right.as_ref(), "r", 33);
+        let mut delta_windows = Vec::new();
+        let mut version_snapshots = Vec::new();
+        for input in &union.inputs {
+            let join = assert_normalized_branch(input, signed_action_id);
+            collect_branch_binding(
+                join.left.as_ref(),
+                signed_action_id,
+                &mut delta_windows,
+                &mut version_snapshots,
+            );
+            collect_branch_binding(
+                join.right.as_ref(),
+                signed_action_id,
+                &mut delta_windows,
+                &mut version_snapshots,
+            );
+        }
+        delta_windows.sort();
+        version_snapshots.sort();
+        assert_eq!(
+            delta_windows,
+            vec![("l".to_string(), 11, 22), ("r".to_string(), 33, 44)]
+        );
+        assert_eq!(
+            version_snapshots,
+            vec![("l".to_string(), 22), ("r".to_string(), 33)]
+        );
+    }
 
-        let LogicalPlan::Join(right_delta_branch) = &union.inputs[1] else {
-            panic!("expected second union branch Join");
+    fn assert_normalized_branch(plan: &LogicalPlan, signed_action_id: ColumnId) -> &JoinNode {
+        let LogicalPlan::Project(project) = plan else {
+            panic!("expected normalized branch Project");
         };
-        assert_version_project_scan(right_delta_branch.left.as_ref(), "l", 22);
-        let right_delta_action =
-            assert_delta_project_scan(right_delta_branch.right.as_ref(), "r", 33, 44);
-        assert_eq!(right_delta_action, signed_action_id);
+        assert!(
+            project
+                .items
+                .iter()
+                .any(|item| item.output_column_id == signed_action_id
+                    && item.output_name.eq_ignore_ascii_case("__change_op")),
+            "normalized branch Project must retain action column"
+        );
+
+        let LogicalPlan::Join(join) = project.input.as_ref() else {
+            panic!("expected Project(Join)");
+        };
+        join
+    }
+
+    fn collect_branch_binding(
+        plan: &LogicalPlan,
+        signed_action_id: ColumnId,
+        delta_windows: &mut Vec<(String, i64, i64)>,
+        version_snapshots: &mut Vec<(String, i64)>,
+    ) {
+        let scan = assert_project_scan_any_table(plan);
+        match &scan.table.source {
+            ScanSource::IcebergDeltaTable {
+                table,
+                from_snapshot_id,
+                to_snapshot_id,
+            } => {
+                let action = scan
+                    .columns
+                    .iter()
+                    .find(|column| ImvActionColumn::matches(column))
+                    .expect("delta scan must carry action column")
+                    .column_id;
+                assert_eq!(action, signed_action_id);
+                delta_windows.push((table.table.clone(), *from_snapshot_id, *to_snapshot_id));
+            }
+            ScanSource::IcebergVersionTable { table, snapshot_id } => {
+                assert!(
+                    !scan.columns.iter().any(ImvActionColumn::matches),
+                    "version scan must not carry action column"
+                );
+                version_snapshots.push((table.table.clone(), *snapshot_id));
+            }
+            other => panic!("expected delta/version scan source, got {other:?}"),
+        }
     }
 
     fn signed_action_column_id(aggregate: &AggregateNode) -> ColumnId {
@@ -1166,57 +1287,13 @@ mod tests {
         *column_id
     }
 
-    fn assert_delta_project_scan(
-        plan: &LogicalPlan,
-        expected_table: &str,
-        expected_from: i64,
-        expected_to: i64,
-    ) -> ColumnId {
-        let scan = assert_project_scan(plan, expected_table);
-        match &scan.table.source {
-            ScanSource::IcebergDeltaTable {
-                from_snapshot_id,
-                to_snapshot_id,
-                ..
-            } => {
-                assert_eq!(*from_snapshot_id, expected_from);
-                assert_eq!(*to_snapshot_id, expected_to);
-            }
-            other => panic!("expected IcebergDeltaTable, got {other:?}"),
-        }
-        scan.columns
-            .iter()
-            .find(|column| ImvActionColumn::matches(column))
-            .expect("delta scan must carry action column")
-            .column_id
-    }
-
-    fn assert_version_project_scan(
-        plan: &LogicalPlan,
-        expected_table: &str,
-        expected_snapshot: i64,
-    ) {
-        let scan = assert_project_scan(plan, expected_table);
-        match &scan.table.source {
-            ScanSource::IcebergVersionTable { snapshot_id, .. } => {
-                assert_eq!(*snapshot_id, expected_snapshot);
-            }
-            other => panic!("expected IcebergVersionTable, got {other:?}"),
-        }
-        assert!(
-            !scan.columns.iter().any(ImvActionColumn::matches),
-            "version scan must not carry action column"
-        );
-    }
-
-    fn assert_project_scan<'a>(plan: &'a LogicalPlan, expected_table: &str) -> &'a ScanNode {
+    fn assert_project_scan_any_table(plan: &LogicalPlan) -> &ScanNode {
         let LogicalPlan::Project(project) = plan else {
             panic!("expected Project");
         };
         let LogicalPlan::Scan(scan) = project.input.as_ref() else {
             panic!("expected Project(Scan)");
         };
-        assert_eq!(scan.table.name, expected_table);
         scan
     }
 }
