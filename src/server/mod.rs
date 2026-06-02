@@ -943,17 +943,20 @@ async fn execute_statement_text(
         }
     }
 
-    if let Some(v) = parse_set_non_negative_integer(trimmed, "global_runtime_filter_build_max_size") {
+    if let Some(v) = parse_set_non_negative_integer(trimmed, "global_runtime_filter_build_max_size")
+    {
         shim.optimizer_settings.rf_build_max_bytes = Some(v);
         return Ok(StatementResult::Ok);
     }
 
-    if let Some(v) = parse_set_non_negative_integer(trimmed, "global_runtime_filter_build_min_size") {
+    if let Some(v) = parse_set_non_negative_integer(trimmed, "global_runtime_filter_build_min_size")
+    {
         shim.optimizer_settings.rf_build_min_bytes = Some(v);
         return Ok(StatementResult::Ok);
     }
 
-    if let Some(v) = parse_set_non_negative_integer(trimmed, "global_runtime_filter_probe_min_size") {
+    if let Some(v) = parse_set_non_negative_integer(trimmed, "global_runtime_filter_probe_min_size")
+    {
         shim.optimizer_settings.rf_probe_min_bytes = Some(v);
         return Ok(StatementResult::Ok);
     }
