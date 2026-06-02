@@ -216,22 +216,46 @@ fn could_bound(node: &PhysicalPlanNode, probe_expr: &TypedExpr) -> bool {
     needed.iter().all(|id| have.contains(id))
 }
 
-/// Stage 1: stop at fragment boundaries (exchange / distribution nodes).
-/// Cross-exchange push-down is a later stage.
+/// Returns true for non-crossable exchange boundaries (Gather / Any distribution).
+/// These remain hard fragment boundaries that probe runtime filters cannot cross.
 fn is_exchange(node: &PhysicalPlanNode) -> bool {
     matches!(node.op, Operator::PhysicalDistribution(_))
+}
+
+/// A `PhysicalDistribution` whose spec is a shuffle/hash partition can be
+/// crossed by a probe runtime filter (StarRocks canPushAcrossExchangeNode for
+/// PARTITIONED). Gather / Any remain hard fragment boundaries in this stage.
+fn distribution_is_crossable(node: &PhysicalPlanNode) -> bool {
+    use crate::sql::optimizer::property::DistributionSpec;
+    matches!(
+        &node.op,
+        Operator::PhysicalDistribution(op)
+            if matches!(op.spec, DistributionSpec::HashPartitioned { .. })
+    )
 }
 
 /// Descend into `node` and attach `probe` at the DEEPEST descendant that can
 /// bind the probe expression. Returns `true` when the probe has been placed.
 ///
 /// Rules:
-/// 1. Never cross an exchange (fragment boundary).
-/// 2. If `node` cannot bind the probe, stop (return false) — do not descend.
-/// 3. Try each child recursively; if a child accepts the probe, we are done.
-/// 4. If no child accepted it, place the probe on `node` itself (the deepest
+/// 1. Crossable exchange (HashPartitioned/shuffle): descend transparently into
+///    its single child without binding-checking the exchange itself, since a
+///    shuffle exchange preserves column ids and carries no projection.
+/// 2. Non-crossable exchange (Gather/Any): hard fragment boundary — stop.
+/// 3. If `node` cannot bind the probe, stop (return false) — do not descend.
+/// 4. Try each child recursively; if a child accepts the probe, we are done.
+/// 5. If no child accepted it, place the probe on `node` itself (the deepest
 ///    reachable binder).
 fn push_probe_down(node: &mut PhysicalPlanNode, probe: &RuntimeFilterProbe) -> bool {
+    // Crossable exchange (shuffle): descend into its single child without
+    // binding-checking the exchange itself (it preserves the child's columns).
+    if distribution_is_crossable(node) {
+        if let Some(child) = node.children.first_mut() {
+            return push_probe_down(child, probe);
+        }
+        return false;
+    }
+    // Non-crossable exchange (Gather/Any): hard boundary.
     if is_exchange(node) {
         return false;
     }
@@ -465,6 +489,57 @@ pub(crate) mod test_support {
         }
     }
 
+    /// Shuffle join where the probe child is a `PhysicalDistribution(HashPartitioned)`
+    /// over a leaf scan. Tests that probe RFs cross the shuffle exchange to reach the
+    /// underlying scan rather than stopping at the exchange boundary.
+    pub(crate) fn shuffle_join_with_probe_exchange() -> PhysicalPlanNode {
+        use crate::sql::optimizer::operator::PhysicalDistributionOp;
+        use crate::sql::optimizer::property::{DistributionSpec, HashSource};
+        let (loc, lexpr) = col(1, "lc"); // probe column
+        let (roc, rexpr) = col(2, "rc"); // build column
+        // probe side: PhysicalDistribution(HashPartitioned on col 1) over a leaf scan.
+        let scan = leaf(1_000_000.0, loc.clone());
+        let exch = PhysicalPlanNode {
+            op: Operator::PhysicalDistribution(PhysicalDistributionOp {
+                spec: DistributionSpec::HashPartitioned {
+                    cols: vec![loc.column_id],
+                    source: HashSource::ShuffleJoin,
+                },
+            }),
+            children: vec![scan],
+            stats: Statistics {
+                output_row_count: 1_000_000.0,
+                column_statistics: Default::default(),
+            },
+            output_columns: vec![loc.clone()], // exchange preserves column 1
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+        // build side SMALL so the build gate and probe gate both pass
+        // (build_size = 100 * 8 = 800 bytes, well below BUILD_MIN 128KB).
+        let build = leaf(100.0, roc.clone());
+        PhysicalPlanNode {
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: lexpr,
+                    right: rexpr,
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Shuffle,
+            }),
+            children: vec![exch, build], // children[0]=probe-exchange, children[1]=build
+            stats: Statistics {
+                output_row_count: 100.0,
+                column_statistics: Default::default(),
+            },
+            output_columns: vec![loc, roc],
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        }
+    }
+
     pub(crate) fn join_with_project_over_probe_scan() -> PhysicalPlanNode {
         use crate::sql::optimizer::operator::PhysicalProjectOp;
         let (loc, lexpr) = col(1, "lc"); // probe column
@@ -566,6 +641,23 @@ mod tests {
         );
         // ...it reached the scan beneath the project (children[0].children[0]).
         assert_eq!(join.children[0].children[0].probe_runtime_filters.len(), 1);
+    }
+
+    #[test]
+    fn probe_crosses_exchange_to_scan() {
+        let mut j = super::test_support::shuffle_join_with_probe_exchange();
+        annotate(&mut j, &OptimizerOptions::default_settings());
+        assert_eq!(j.build_runtime_filters.len(), 1, "build RF expected");
+        let exch = &j.children[0];
+        assert!(
+            exch.probe_runtime_filters.is_empty(),
+            "probe must not stop at the exchange"
+        );
+        assert_eq!(
+            exch.children[0].probe_runtime_filters.len(),
+            1,
+            "probe should reach the scan below the exchange"
+        );
     }
 
     #[test]
