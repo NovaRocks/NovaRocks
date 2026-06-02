@@ -210,7 +210,7 @@ pub(crate) fn inline_single_use_ctes(
                 change_op_column: node.change_op_column,
                 output_columns: node.output_columns,
             }))
-        },
+        }
         LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
         }
@@ -346,7 +346,7 @@ fn replace_cte_consume(
                 change_op_column: node.change_op_column,
                 output_columns: node.output_columns,
             }))
-        },
+        }
         LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
         }

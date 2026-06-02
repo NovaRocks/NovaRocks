@@ -89,8 +89,8 @@ impl SchemaCache {
 mod tests {
     use super::*;
     use crate::engine::catalog_mgr::metadata::{TableBinding, TableIdentity, TableMetadata};
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn meta(id: &TableIdentity, ncols: usize) -> TableMetadata {
         TableMetadata {

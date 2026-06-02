@@ -69,8 +69,8 @@ mod tests {
     };
     use crate::sql::parser::ast::AlterIcebergPartitionSpecStmt;
     use arrow::datatypes::DataType;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct MockBackend {
         loads: Arc<AtomicUsize>,
