@@ -673,6 +673,28 @@ fn parse_set_non_negative_integer(query: &str, keyword: &str) -> Option<u64> {
     value_str.parse::<u64>().ok()
 }
 
+/// Parse `SET <keyword> = <float>`. Uses the same keyword-exact-match logic as
+/// `parse_set_non_negative_integer`: the keyword must be followed by whitespace
+/// or `=`, so `..._min_size` cannot match `..._min_selectivity` and vice versa.
+fn parse_set_f64(query: &str, keyword: &str) -> Option<f64> {
+    let normalized = query.replace('=', " = ");
+    let mut parts = normalized.split_whitespace();
+    let head = parts.next()?;
+    if !head.eq_ignore_ascii_case("set") {
+        return None;
+    }
+    let actual_keyword = parts.next()?;
+    if !actual_keyword.eq_ignore_ascii_case(keyword) {
+        return None;
+    }
+    let next = parts.next()?;
+    let value_str = if next == "=" { parts.next()? } else { next };
+    if parts.next().is_some() {
+        return None;
+    }
+    value_str.parse::<f64>().ok()
+}
+
 /// Parse `SET query_timeout = N` and `SET query_timeout=N`. Returns the
 /// integer seconds value if the statement matches that shape. The optional
 /// `=` separator may have spaces around it or be glued to the keyword/value.
@@ -919,6 +941,26 @@ async fn execute_statement_text(
             shim.optimizer_settings.disabled_rules = rules;
             return Ok(StatementResult::Ok);
         }
+    }
+
+    if let Some(v) = parse_set_non_negative_integer(trimmed, "global_runtime_filter_build_max_size") {
+        shim.optimizer_settings.rf_build_max_bytes = Some(v);
+        return Ok(StatementResult::Ok);
+    }
+
+    if let Some(v) = parse_set_non_negative_integer(trimmed, "global_runtime_filter_build_min_size") {
+        shim.optimizer_settings.rf_build_min_bytes = Some(v);
+        return Ok(StatementResult::Ok);
+    }
+
+    if let Some(v) = parse_set_non_negative_integer(trimmed, "global_runtime_filter_probe_min_size") {
+        shim.optimizer_settings.rf_probe_min_bytes = Some(v);
+        return Ok(StatementResult::Ok);
+    }
+
+    if let Some(v) = parse_set_f64(trimmed, "global_runtime_filter_probe_min_selectivity") {
+        shim.optimizer_settings.rf_probe_min_selectivity = Some(v);
+        return Ok(StatementResult::Ok);
     }
 
     if let Some((name, value)) = parse_set_user_variable_query(trimmed) {
@@ -1639,6 +1681,37 @@ mod tests {
         assert_eq!(
             resolved.mysql_port, DEFAULT_MYSQL_PORT,
             "default port when no [standalone_server] section"
+        );
+    }
+
+    #[test]
+    fn parse_rf_build_max_size_var() {
+        assert_eq!(
+            parse_set_non_negative_integer(
+                "SET global_runtime_filter_build_max_size = 1048576",
+                "global_runtime_filter_build_max_size"
+            ),
+            Some(1048576)
+        );
+    }
+
+    #[test]
+    fn parse_rf_probe_min_selectivity_float() {
+        let v = parse_set_f64(
+            "SET global_runtime_filter_probe_min_selectivity = 0.9",
+            "global_runtime_filter_probe_min_selectivity",
+        );
+        assert!((v.unwrap() - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_set_f64_rejects_non_matching_keyword() {
+        assert_eq!(
+            parse_set_f64(
+                "SET something_else = 0.5",
+                "global_runtime_filter_probe_min_selectivity"
+            ),
+            None
         );
     }
 
