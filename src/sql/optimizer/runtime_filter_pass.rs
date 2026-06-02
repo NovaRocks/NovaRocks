@@ -225,6 +225,22 @@ fn is_exchange(node: &PhysicalPlanNode) -> bool {
 /// A `PhysicalDistribution` whose spec is a shuffle/hash partition can be
 /// crossed by a probe runtime filter (StarRocks canPushAcrossExchangeNode for
 /// PARTITIONED). Gather / Any remain hard fragment boundaries in this stage.
+///
+/// CORRECTNESS INVARIANT (load-bearing): placing a probe below a shuffle
+/// exchange is only correct when the build side produces the *complete* key
+/// set, so the probe scan (which reads its fragment's full, not-yet-shuffled
+/// input) is filtered by all build keys. This holds today because standalone
+/// runs exactly one instance per fragment and gathers inter-fragment data
+/// all-to-one (`coordinator.rs` assigns a single instance per fragment;
+/// `runtime_filter_builder_number` is 1). If a build fragment is ever fanned
+/// out to N>1 instances (multi-BE distributed execution), each instance would
+/// build a *partial* RF over its key partition; applying that partial filter to
+/// an unshuffled probe scan would drop valid rows. Before enabling N-instance
+/// build fragments, the merge path must reflect the real instance count
+/// (`builder_number` / `build_be_number`), or remote probe placement here must
+/// fall back to build-only. This gate also omits StarRocks' multi-column
+/// `canCrossExchangeNode` restriction, which is sound only under the same
+/// complete-RF assumption.
 fn distribution_is_crossable(node: &PhysicalPlanNode) -> bool {
     use crate::sql::optimizer::property::DistributionSpec;
     matches!(

@@ -301,6 +301,12 @@ StarRocks（FE 不管类型，BE 按行数选，默认阈值 1024）一致。OQ-
 
 optimizer 侧不做类型选择。
 
+> 核对结论(2026-06-02,Stage 4):`MAX_RUNTIME_IN_FILTER_CONDITIONS == 1024`
+> (`src/exec/runtime_filter/merger.rs:123`)= StarRocks 默认 ✅。join build sink
+> 生成 **IN(≤1024 行)+ membership(bloom/bitset)**,与 StarRocks 主路径
+> (bloom + in-list)一致;**min/max 不为 join 生成**(它服务 TopN/Agg,见
+> 2026-04-08 spec),这同样符合 StarRocks。结论:filter 类型选择已对齐,无需改动。
+
 ---
 
 ## 10. 分阶段 PR 计划
@@ -368,12 +374,25 @@ optimizer 侧不做类型选择。
 1. **build/probe 朝向**（§5d）：planner 假设右 child = build。Stage 0 必查。
    - 验证(2026-06-01,Stage 0):确认 children[1]=build 侧,build_expr=eq.right。证据:src/exec/pipeline/builder.rs:934-938（`probe_is_left=true`,`probe_build=left_build`,`build_build=right_build`）及 src/lower/node/hash_join.rs:174-187（`probe_keys←cond.left/left.layout`,`build_keys←cond.right/right.layout`）。
 2. **跨 exchange remap**：probe expr 穿过 Exchange / Project 时必须按子节点输出
-   列正确 remap，否则 probe 落错 slot。Stage 3 重点测。
+   列正确 remap，否则 probe 落错 slot。
+   - 结论(2026-06-02,Stage 3):`PhysicalDistribution { spec }` 是纯数据搬运、
+     无投影 → **跨 exchange 列 column_id 不变,无需 remap**;`could_bound` 在
+     exchange 之下仍按 column_id 正确判定。仅穿越 `HashPartitioned`,Gather/Any
+     仍为硬边界。
 3. **gating 与执行侧一致**：optimizer 用 estimated cardinality 决定建不建 RF；
    BE 用 actual build_row_count 选类型。二者阈值需协调（optimizer 的
    build-min/probe-min 与 BE 的 `MAX_RUNTIME_IN_FILTER_CONDITIONS` 不冲突）。
-4. **单实例简化边界**：跨 BE（Distributed Execution D2 已落地）时 `builder_number=1`
-   / merge-node=self 的 v1 简化是否仍成立，Stage 3 验证。
+4. **单实例简化边界 / 多 BE 隐患**：
+   - 结论(2026-06-02,Stage 3 review):standalone 每 fragment **恰好 1 实例**,
+     且 fragment 间数据 **all-to-one UNPARTITIONED**(codegen 的 HashPartitioned
+     output_partition 协调器不读)→ build 侧拿全量 → **RF 完整** → 跨 exchange
+     应用到未分区 probe scan **正确**。本地 DOP partial 在远程发送前已 merge。
+   - **多 BE 潜在 wrong-results(当前不可达,已显式文档化)**:`builder_number`
+     硬编码为 1(coordinator.rs)、`build_be_number=0`。若 build fragment 未来被
+     fan-out 成 N>1 实例,每实例只产部分 RF,应用到未分区 probe scan 会误删行。
+     Stage 3 让 remote probe 放置成为可能,使该隐患 load-bearing —— 启用 N 实例前
+     必须先让 merge 路径反映真实实例数,或把 remote 放置回退为 build-only。守门
+     注释见 `runtime_filter_pass.rs::distribution_is_crossable`。
 
 ---
 
