@@ -4889,6 +4889,8 @@ mod tests {
             children: Vec::new(),
             stats: stats_for_test(),
             output_columns: columns,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
         }
     }
 
@@ -4976,6 +4978,8 @@ mod tests {
             children: vec![old_child, delta_child],
             stats: stats_for_test(),
             output_columns,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
         }
     }
 
@@ -4999,6 +5003,8 @@ mod tests {
             children: vec![old_child, delta_child],
             stats: stats_for_test(),
             output_columns,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
         }
     }
 
@@ -5071,6 +5077,8 @@ mod tests {
             ],
             stats: stats_for_test(),
             output_columns,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
         };
 
         let err = match PlanFragmentBuilder::build_with_mv_refresh_ctx(
@@ -5234,6 +5242,8 @@ mod tests {
             children: vec![values_plan_for_test(aggregate_physical_columns_for_test())],
             stats: stats_for_test(),
             output_columns: aggregate_physical_columns_for_test(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
         };
         let plan = aggregate_merge_plan_for_test(
             distributed_old,

@@ -5936,7 +5936,6 @@ fn logical_plan_contains_aggregate_state_merge(
                 || logical_plan_contains_aggregate_state_merge(&n.consumer)
         }
         LogicalPlan::CTEProduce(n) => logical_plan_contains_aggregate_state_merge(&n.input),
-        LogicalPlan::SubqueryAlias(n) => logical_plan_contains_aggregate_state_merge(&n.input),
         LogicalPlan::Join(n) => {
             logical_plan_contains_aggregate_state_merge(&n.left)
                 || logical_plan_contains_aggregate_state_merge(&n.right)

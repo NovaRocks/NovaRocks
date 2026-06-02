@@ -470,6 +470,7 @@ pub(crate) fn plan_output_columns(plan: &LogicalPlan) -> Result<Vec<OutputColumn
         LogicalPlan::CTEProduce(node) => Ok(node.output_columns.clone()),
         LogicalPlan::CTEConsume(node) => Ok(node.output_columns.clone()),
         LogicalPlan::Decode(node) => Ok(node.output_columns.clone()),
+        LogicalPlan::AggregateStateMerge(node) => Ok(node.output_columns.clone()),
         LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
             Err("imv marker leaked into non-IMV planner output adaptation".to_string())
         }

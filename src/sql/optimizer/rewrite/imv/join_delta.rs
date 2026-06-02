@@ -212,7 +212,6 @@ fn plan_kind(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::GenerateSeries(_) => "GenerateSeries",
         LogicalPlan::TableFunction(_) => "TableFunction",
         LogicalPlan::Window(_) => "Window",
-        LogicalPlan::SubqueryAlias(_) => "SubqueryAlias",
         LogicalPlan::Repeat(_) => "Repeat",
         LogicalPlan::CTEAnchor(_) => "CTEAnchor",
         LogicalPlan::CTEProduce(_) => "CTEProduce",
@@ -278,7 +277,6 @@ pub(crate) fn plan_output_columns(plan: &LogicalPlan) -> Result<Vec<OutputColumn
             out
         }
         LogicalPlan::Window(window) => window.output_columns.clone(),
-        LogicalPlan::SubqueryAlias(alias) => alias.output_columns.clone(),
         LogicalPlan::Repeat(repeat) => plan_output_columns(&repeat.input)?,
         LogicalPlan::CTEAnchor(anchor) => plan_output_columns(&anchor.consumer)?,
         LogicalPlan::CTEProduce(produce) => produce.output_columns.clone(),

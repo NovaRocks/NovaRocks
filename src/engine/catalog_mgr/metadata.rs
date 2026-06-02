@@ -64,7 +64,8 @@ impl TableMetadata {
             }
             ScanSource::IcebergMetadataTable { .. }
             | ScanSource::IcebergDeltaTable { .. }
-            | ScanSource::IcebergVersionTable { .. } => {
+            | ScanSource::IcebergVersionTable { .. }
+            | ScanSource::IcebergMvTargetState { .. } => {
                 return Err(format!(
                     "synthetic plan-time scan source is not a catalog base table: {}.{}.{}",
                     identity.catalog, identity.namespace, identity.table
