@@ -72,7 +72,7 @@ pub(crate) fn annotate(root: &mut PhysicalPlanNode, options: &OptimizerOptions) 
         return;
     }
     let mut next_filter_id: i32 = 0;
-    annotate_node(root, &mut next_filter_id);
+    annotate_node(root, &mut next_filter_id, options);
 }
 
 /// True if a hash join of this kind should produce runtime filters on its
@@ -247,39 +247,44 @@ fn push_probe_down(node: &mut PhysicalPlanNode, probe: &RuntimeFilterProbe) -> b
     true
 }
 
-// StarRocks defaults (SessionVariable.java). Bytes; size = rows * avg_row_size.
-const BUILD_MAX_SIZE: f64 = 64.0 * 1024.0 * 1024.0;
-const BUILD_MIN_SIZE: f64 = 128.0 * 1024.0;
-const PROBE_MIN_SIZE: f64 = 100.0 * 1024.0;
-const PROBE_MIN_SELECTIVITY: f64 = 0.5;
-
 /// StarRocks JoinNode.java: only Shuffle/Partitioned gate on build size.
-fn build_gate_passes(distribution: &JoinDistribution, build_size: f64) -> bool {
+fn build_gate_passes(distribution: &JoinDistribution, build_size: f64, build_max: f64) -> bool {
     match distribution {
-        JoinDistribution::Shuffle => !(build_size <= 0.0 || build_size > BUILD_MAX_SIZE),
+        JoinDistribution::Shuffle => !(build_size <= 0.0 || build_size > build_max),
         _ => true, // Broadcast / Colocate: no build-size gate
     }
 }
 
 /// StarRocks RuntimeFilterDescription.canProbeUse selectivity gate.
-fn probe_gate_passes(local: bool, build_size: f64, probe_size: f64) -> bool {
+fn probe_gate_passes(
+    local: bool,
+    build_size: f64,
+    probe_size: f64,
+    build_min: f64,
+    probe_min: f64,
+    min_sel: f64,
+) -> bool {
     if local {
         return true;
     }
-    if build_size <= BUILD_MIN_SIZE {
+    if build_size <= build_min {
         return true;
     }
-    if probe_size < PROBE_MIN_SIZE {
+    if probe_size < probe_min {
         return false;
     }
-    (build_size / probe_size.max(1.0)) <= 1.0 - PROBE_MIN_SELECTIVITY
+    (build_size / probe_size.max(1.0)) <= 1.0 - min_sel
 }
 
 /// Recursive tree walk: post-order so that nested joins get distinct filter ids.
-fn annotate_node(node: &mut PhysicalPlanNode, next_filter_id: &mut i32) {
+fn annotate_node(
+    node: &mut PhysicalPlanNode,
+    next_filter_id: &mut i32,
+    options: &OptimizerOptions,
+) {
     // Recurse into children first (post-order).
     for child in &mut node.children {
-        annotate_node(child, next_filter_id);
+        annotate_node(child, next_filter_id, options);
     }
 
     // Clone the data we need from the join before borrowing children mutably.
@@ -295,8 +300,14 @@ fn annotate_node(node: &mut PhysicalPlanNode, next_filter_id: &mut i32) {
     let build_size = node.children[1].stats.compute_size();
     let probe_size = node.children[0].stats.compute_size();
 
+    // Cast session thresholds (u64 bytes) to f64 for size comparisons.
+    let build_max = options.rf_build_max_bytes as f64;
+    let build_min = options.rf_build_min_bytes as f64;
+    let probe_min = options.rf_probe_min_bytes as f64;
+    let min_sel = options.rf_probe_min_selectivity;
+
     // Build gate: Shuffle joins are rejected if build side is too large or empty.
-    if !build_gate_passes(&distribution, build_size) {
+    if !build_gate_passes(&distribution, build_size, build_max) {
         return;
     }
 
@@ -310,7 +321,7 @@ fn annotate_node(node: &mut PhysicalPlanNode, next_filter_id: &mut i32) {
             continue;
         }
         // Probe gate: skip this equi-conjunct if it would not reduce probe rows enough.
-        if !probe_gate_passes(local, build_size, probe_size) {
+        if !probe_gate_passes(local, build_size, probe_size, build_min, probe_min, min_sel) {
             continue;
         }
         let filter_id = *next_filter_id;
@@ -555,5 +566,16 @@ mod tests {
         );
         // ...it reached the scan beneath the project (children[0].children[0]).
         assert_eq!(join.children[0].children[0].probe_runtime_filters.len(), 1);
+    }
+
+    #[test]
+    fn session_build_max_can_skip_rf() {
+        // build_rows=1000, avg_row_size=8 bytes -> build_size=8KB.
+        // With rf_build_max_bytes=1, build gate rejects even a tiny build.
+        let mut j = super::test_support::shuffle_join(1000.0, 1_000_000.0);
+        let mut opts = OptimizerOptions::default_settings();
+        opts.rf_build_max_bytes = 1; // 1 byte -> build gate rejects
+        annotate(&mut j, &opts);
+        assert!(j.build_runtime_filters.is_empty());
     }
 }
