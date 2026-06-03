@@ -1426,4 +1426,16 @@ git commit -m "style(iceberg-write): fmt touched IW-1/IW-2 files" || echo "nothi
 
 **Placeholder scan:** every code step contains complete code; "likely fixes if red" notes are debugging aids, not deferred work. The only intentional placeholder is the `_AsyncMutex` shim, which B1 Step 3 instructs to remove if clippy flags it.
 
-**Decisions deferred to implementation (low-risk):** exact `PipelineDriver::new` arg types (copy from the existing test); whether to keep the `AsyncMutex` import. Neither changes the contract.
+**Decisions deferred to implementation (low-risk):** exact `PipelineDriver::new` arg types (copy from the existing test). Does not change the contract.
+
+---
+
+## Contract correction (discovered during B5)
+
+B5's driver-level test revealed that the B1 sink contract did not surface `DriverState::PendingFinish` to the driver — the IW-2 acceptance requires it. The driver enters `PendingFinish` only when the sink reports `is_finished()==true` **and** `pending_finish()==true` in the same tick (`driver.rs:443` checks `self.is_finished()` = the sink's `is_finished()`; `finish_with_state` at `driver.rs:687-696` upgrades `Finished`→`PendingFinish` when `has_pending_finish()`). The original B1 design coupled both to `shared.finished`, making them mutually exclusive, so the driver only ever yielded via `Blocked(OutputFull)` during the async tail and jumped straight to `Finished`.
+
+**Fix (StarRocks-style semantics):**
+- `is_finished()` = `self.finishing || self.shared.finished` — "no more input needed" (true once `set_finishing` ran, or on background completion/error/cancel). This is what lets the driver decide to finish.
+- `pending_finish()` = `self.finishing && !self.shared.finished` — "async drain/finish still running" (unchanged). True *together with* `is_finished()` during the async tail → driver enters `PendingFinish`; clears when the background completes → driver reaches `Finished`.
+
+**Consequence for tests:** a test's notion of "fully complete" is now `is_finished() && !pending_finish()` (not `is_finished()` alone). B1 (`drains_all_chunks_with_backpressure`) and B2 (`need_input_goes_false...`, `pending_finish_true_while_finishing_then_clears`) poll/assert lines are updated accordingly; the mid-finish `assert!(!op.is_finished())` in B2 becomes `assert!(op.take_output().is_none())`. B3 (error) and B4 (cancel) are unaffected (their `is_finished()` becomes true via `shared.finished`). The driver fully finishes (and closes) only when `is_finished() && !has_pending_finish()`, i.e. after `shared.finished` — so output/commit is still gated on real background completion.
