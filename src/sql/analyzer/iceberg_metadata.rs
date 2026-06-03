@@ -153,12 +153,14 @@ pub fn metadata_table_schema(ty: IcebergMetadataTableType) -> Vec<MetadataColumn
             ),
         ],
         T::LogicalIcebergMetadata => {
+            // `first_row_id` is intentionally NOT prepended here: it is a file
+            // property already provided by `files_columns()`. Listing it twice
+            // would produce two same-named columns (invalid RecordBatch).
             let mut cols = vec![
                 MetadataColumn::new("status", DataType::Int32, false),
                 MetadataColumn::new("snapshot_id", DataType::Int64, true),
                 MetadataColumn::new("sequence_number", DataType::Int64, true),
                 MetadataColumn::new("file_sequence_number", DataType::Int64, true),
-                MetadataColumn::new("first_row_id", DataType::Int64, true),
             ];
             cols.extend(files_columns());
             cols

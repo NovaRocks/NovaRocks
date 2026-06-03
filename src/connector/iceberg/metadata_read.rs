@@ -184,12 +184,14 @@ pub async fn read_metadata_table_rows(
                         ManifestStatus::Added => 1,
                         ManifestStatus::Deleted => 2,
                     };
+                    // `first_row_id` is omitted here on purpose: the `base`
+                    // object produced by `file_row` already carries it as a
+                    // file property. Emitting it again would duplicate the key.
                     let entry_cols = json!({
                         "status": status,
                         "snapshot_id": entry.snapshot_id(),
                         "sequence_number": entry.sequence_number(),
                         "file_sequence_number": entry.file_sequence_number,
-                        "first_row_id": df.first_row_id(),
                     });
                     rows.push(file_row(df, mf.partition_spec_id, Some(entry_cols))?);
                 }
