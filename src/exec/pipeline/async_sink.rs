@@ -277,9 +277,11 @@ mod tests {
         let data: Vec<i32> = (0..rows as i32).collect();
         let array = Arc::new(Int32Array::from(data)) as _;
         let batch = RecordBatch::try_new(schema, vec![array]).expect("record batch");
-        let chunk_schema =
-            ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &[SlotId::new(1)])
-                .expect("chunk schema");
+        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(1)],
+        )
+        .expect("chunk schema");
         Chunk::new_with_chunk_schema(batch, chunk_schema)
     }
 
@@ -391,7 +393,10 @@ mod tests {
             op.push_chunk(&state, make_chunk(1)).expect("push");
             pushed += 1;
         }
-        assert!(!op.need_input(), "sink should report backpressure when full");
+        assert!(
+            !op.need_input(),
+            "sink should report backpressure when full"
+        );
 
         // Release the gate; background drains; need_input must recover.
         gate.add_permits(100);
@@ -430,7 +435,43 @@ mod tests {
             poll_until(|| op.is_finished(), Duration::from_secs(5)),
             "sink did not finish"
         );
-        assert!(!op.pending_finish(), "pending_finish must clear after finish");
+        assert!(
+            !op.pending_finish(),
+            "pending_finish must clear after finish"
+        );
         assert_eq!(op.take_output(), Some(2));
+    }
+
+    #[test]
+    fn background_failure_sets_query_error_and_does_not_hang() {
+        let state = RuntimeState::default();
+        let (mut backend, _rows, _chunks) = TestAsyncSink::new(1_000);
+        backend.fail_at = Some(1); // second chunk fails
+        let mut op = AsyncSinkOperator::new("err_sink", backend, 4);
+        op.bind_runtime_state(&state).expect("bind");
+
+        // Push a few chunks; one of them triggers the failure in the bg task.
+        for _ in 0..3 {
+            if op.need_input() {
+                let _ = op.push_chunk(&state, make_chunk(1));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // The error must surface through the runtime error channel within bounded time.
+        assert!(
+            poll_until(|| state.error().is_some(), Duration::from_secs(5)),
+            "background failure did not set runtime error"
+        );
+        // And the operator must converge (no hang): errored ⇒ finished, need_input false.
+        assert!(
+            poll_until(|| op.is_finished(), Duration::from_secs(5)),
+            "errored sink did not converge to finished"
+        );
+        assert!(!op.need_input(), "errored sink must stop accepting input");
+        assert!(
+            state.error().unwrap().contains("forced failure"),
+            "unexpected error text"
+        );
     }
 }
