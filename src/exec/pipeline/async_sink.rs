@@ -374,4 +374,63 @@ mod tests {
         assert_eq!(rows.load(Ordering::Acquire), 15);
         assert_eq!(op.take_output(), Some(15));
     }
+
+    #[test]
+    fn need_input_goes_false_when_queue_full_then_recovers() {
+        let state = RuntimeState::default();
+        // gate starts closed (0 permits): background blocks on the first write.
+        let (backend, _rows, _chunks) = TestAsyncSink::new(0);
+        let gate = Arc::clone(&backend.gate);
+        let mut op = AsyncSinkOperator::new("bp_sink", backend, 2);
+        op.bind_runtime_state(&state).expect("bind");
+
+        // Fill the queue: capacity=2, plus 1 in-flight pulled by the bg task.
+        // Push until need_input() reports full.
+        let mut pushed = 0;
+        while op.need_input() && pushed < 8 {
+            op.push_chunk(&state, make_chunk(1)).expect("push");
+            pushed += 1;
+        }
+        assert!(!op.need_input(), "sink should report backpressure when full");
+
+        // Release the gate; background drains; need_input must recover.
+        gate.add_permits(100);
+        assert!(
+            poll_until(|| op.need_input(), Duration::from_secs(5)),
+            "need_input did not recover after drain"
+        );
+
+        op.set_finishing(&state).expect("finish");
+        assert!(
+            poll_until(|| op.is_finished(), Duration::from_secs(5)),
+            "sink did not finish"
+        );
+    }
+
+    #[test]
+    fn pending_finish_true_while_finishing_then_clears() {
+        let state = RuntimeState::default();
+        let (mut backend, _rows, _chunks) = TestAsyncSink::new(1_000);
+        backend.finish_delay = Duration::from_millis(200);
+        let mut op = AsyncSinkOperator::new("finish_sink", backend, 4);
+        op.bind_runtime_state(&state).expect("bind");
+
+        op.push_chunk(&state, make_chunk(2)).expect("push");
+        op.set_finishing(&state).expect("finish");
+
+        // While finish() sleeps, pending_finish must be true and is_finished false.
+        assert!(
+            poll_until(|| op.pending_finish(), Duration::from_secs(1)),
+            "expected pending_finish during async finish"
+        );
+        assert!(!op.is_finished(), "must not be finished mid-finish");
+
+        // After finish completes, pending_finish clears and is_finished is true.
+        assert!(
+            poll_until(|| op.is_finished(), Duration::from_secs(5)),
+            "sink did not finish"
+        );
+        assert!(!op.pending_finish(), "pending_finish must clear after finish");
+        assert_eq!(op.take_output(), Some(2));
+    }
 }
