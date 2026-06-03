@@ -66,6 +66,10 @@ impl IcebergMetadataTableType {
         }
     }
 
+    // Retained for diagnostics and unit-test assertions; the production reject
+    // path that previously consumed it was removed once all metadata flavors
+    // gained native builders.
+    #[allow(dead_code)]
     fn as_uppercase_str(&self) -> &'static str {
         match self {
             Self::Files => "FILES",
@@ -114,28 +118,11 @@ pub struct IcebergMetadataScanOp {
 
 impl IcebergMetadataScanOp {
     pub fn new(cfg: IcebergMetadataScanConfig) -> Result<Self, String> {
-        // Reject metadata-table flavors that the native-Rust path cannot
-        // produce. Snapshots / History / Refs read directly off
-        // `TableMetadata`; Files / Manifests / Partitions / Logical require
-        // walking the manifest list (data-file scan). The earlier embedded
-        // JVM bridge handled all of these by delegating to the Iceberg Java
-        // SDK, but that path has been removed in favor of iceberg-rust.
-        match cfg.metadata_table_type {
-            IcebergMetadataTableType::Snapshots
-            | IcebergMetadataTableType::History
-            | IcebergMetadataTableType::Refs
-            | IcebergMetadataTableType::Partitions => {}
-            IcebergMetadataTableType::Files
-            | IcebergMetadataTableType::Manifests
-            | IcebergMetadataTableType::LogicalIcebergMetadata => {
-                return Err(format!(
-                    "Iceberg metadata table `{}` is not yet implemented in the \
-                     native-Rust scan path; only Snapshots / History / Refs / Partitions are \
-                     currently supported",
-                    cfg.metadata_table_type.as_uppercase_str()
-                ));
-            }
-        }
+        // All metadata-table flavors are now produced natively. Snapshots /
+        // History / Refs read directly off `TableMetadata`; Partitions /
+        // Files / Manifests / Entries (LogicalIcebergMetadata) are fed by the
+        // resolution-time manifest walk (`metadata_read.rs`) via the
+        // `{version,rows}` payload on `serialized_predicate`.
         let fields = cfg
             .output_columns
             .iter()
@@ -239,16 +226,35 @@ impl ScanOp for IcebergMetadataScanOp {
             .get(index)
             .ok_or_else(|| format!("iceberg metadata range index out of bounds: {index}"))?;
         let chunks = match self.cfg.metadata_table_type {
-            IcebergMetadataTableType::Files
-            | IcebergMetadataTableType::Manifests
-            | IcebergMetadataTableType::LogicalIcebergMetadata => {
-                // Constructor (`IcebergMetadataScanOp::new`) already rejects
-                // these flavors; reaching here means construction was bypassed.
-                return Err(format!(
-                    "iceberg metadata scan reached execution for unsupported \
-                     flavor `{}`",
-                    self.cfg.metadata_table_type.as_uppercase_str()
-                ));
+            IcebergMetadataTableType::Files => {
+                let rows = load_files_rows(&self.cfg)?;
+                build_files_chunks(
+                    &rows,
+                    &self.cfg.output_columns,
+                    &self.output_schema,
+                    &self.output_chunk_schema,
+                    self.cfg.batch_size,
+                )?
+            }
+            IcebergMetadataTableType::Manifests => {
+                let rows = load_manifests_rows(&self.cfg)?;
+                build_manifests_chunks(
+                    &rows,
+                    &self.cfg.output_columns,
+                    &self.output_schema,
+                    &self.output_chunk_schema,
+                    self.cfg.batch_size,
+                )?
+            }
+            IcebergMetadataTableType::LogicalIcebergMetadata => {
+                let rows = load_entries_rows(&self.cfg)?;
+                build_entries_chunks(
+                    &rows,
+                    &self.cfg.output_columns,
+                    &self.output_schema,
+                    &self.output_chunk_schema,
+                    self.cfg.batch_size,
+                )?
             }
             IcebergMetadataTableType::Snapshots => {
                 let rows = load_snapshot_rows(&self.cfg)?;
@@ -492,6 +498,11 @@ fn build_snapshot_array(
     }
 }
 
+// Reference implementation for the `Map`-typed metadata columns; the
+// `$files`/`$entries` int-keyed map builders mirror its `MapFieldNames` usage.
+// Currently unused in production (the `summary` column is surfaced as Utf8),
+// but kept as the canonical pattern.
+#[allow(dead_code)]
 fn build_string_string_map_array<'a, I>(rows: I) -> Result<ArrayRef, String>
 where
     I: IntoIterator<Item = Option<&'a Vec<(String, String)>>>,
@@ -811,6 +822,473 @@ fn build_partition_array(
     }
 }
 
+/// `{version,rows}` envelope shared by the `$files` / `$manifests` /
+/// `$entries` metadata tables. The resolution-time manifest walk
+/// (`metadata_read.rs`) produces this exact shape; here we decode the row
+/// objects back out so the per-table builders can materialise Arrow columns.
+#[derive(Clone, Debug, serde::Deserialize)]
+struct JsonRowsPayload {
+    version: i32,
+    rows: Vec<serde_json::Value>,
+}
+
+/// Decode the `{version,rows}` payload carried on
+/// `IcebergMetadataScanConfig::serialized_predicate` into its row objects.
+/// `label` names the metadata table for error messages.
+fn load_json_rows(
+    cfg: &IcebergMetadataScanConfig,
+    label: &str,
+) -> Result<Vec<serde_json::Value>, String> {
+    if cfg.serialized_predicate.trim().is_empty() {
+        return Err(format!("iceberg {label} metadata scan missing payload"));
+    }
+    let payload: JsonRowsPayload = serde_json::from_str(&cfg.serialized_predicate)
+        .map_err(|e| format!("parse iceberg {label} metadata payload failed: {e}"))?;
+    if payload.version != 1 {
+        return Err(format!(
+            "unsupported iceberg {label} metadata payload version {}",
+            payload.version
+        ));
+    }
+    Ok(payload.rows)
+}
+
+fn load_files_rows(cfg: &IcebergMetadataScanConfig) -> Result<Vec<serde_json::Value>, String> {
+    load_json_rows(cfg, "files")
+}
+
+fn load_manifests_rows(cfg: &IcebergMetadataScanConfig) -> Result<Vec<serde_json::Value>, String> {
+    load_json_rows(cfg, "manifests")
+}
+
+fn load_entries_rows(cfg: &IcebergMetadataScanConfig) -> Result<Vec<serde_json::Value>, String> {
+    load_json_rows(cfg, "entries")
+}
+
+/// Convert a JSON array of small non-negative integers into a `Vec<u8>`,
+/// rejecting any element that is not an in-range byte. Used for `key_metadata`
+/// and the `lower_bounds`/`upper_bounds` map values (the walk serialises bytes
+/// as a JSON array of `u8`).
+fn json_u8_array(items: &[serde_json::Value]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(items.len());
+    for it in items {
+        let v = it
+            .as_u64()
+            .ok_or_else(|| "expected byte value in JSON array".to_string())?;
+        if v > u8::MAX as u64 {
+            return Err(format!("byte value out of range: {v}"));
+        }
+        out.push(v as u8);
+    }
+    Ok(out)
+}
+
+/// Build a `Map<Int32, Int64>` column from rows whose `name` field is a JSON
+/// array of `[key, value]` pairs. Map field names mirror
+/// `build_string_string_map_array` (via `iceberg_map_field_names`) so the
+/// produced type matches the analyzer's `map_int_to(Int64)` declaration.
+fn build_int_int_map_array(rows: &[serde_json::Value], name: &str) -> Result<ArrayRef, String> {
+    use arrow::array::{Int32Builder, Int64Builder};
+    let mut builder = MapBuilder::new(
+        Some(iceberg_map_field_names()),
+        Int32Builder::new(),
+        Int64Builder::new(),
+    );
+    for row in rows {
+        match row.get(name).and_then(|v| v.as_array()) {
+            Some(pairs) => {
+                for pair in pairs {
+                    let entry = pair
+                        .as_array()
+                        .ok_or_else(|| format!("{name} entry must be a [key,value] array"))?;
+                    let key = entry
+                        .first()
+                        .and_then(|v| v.as_i64())
+                        .ok_or_else(|| format!("{name} key must be an integer"))?;
+                    let value = entry
+                        .get(1)
+                        .and_then(|v| v.as_i64())
+                        .ok_or_else(|| format!("{name} value must be an integer"))?;
+                    builder.keys().append_value(key as i32);
+                    builder.values().append_value(value);
+                }
+                builder
+                    .append(true)
+                    .map_err(|e| format!("append {name} map row failed: {e}"))?;
+            }
+            None => {
+                builder
+                    .append(false)
+                    .map_err(|e| format!("append null {name} map row failed: {e}"))?;
+            }
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+/// Build a `Map<Int32, Binary>` column from rows whose `name` field is a JSON
+/// array of `[key, [bytes...]]` pairs. Map field names mirror
+/// `build_string_string_map_array` so the produced type matches the analyzer's
+/// `map_int_to(Binary)` declaration.
+fn build_int_binary_map_array(rows: &[serde_json::Value], name: &str) -> Result<ArrayRef, String> {
+    use arrow::array::{BinaryBuilder, Int32Builder};
+    let mut builder = MapBuilder::new(
+        Some(iceberg_map_field_names()),
+        Int32Builder::new(),
+        BinaryBuilder::new(),
+    );
+    for row in rows {
+        match row.get(name).and_then(|v| v.as_array()) {
+            Some(pairs) => {
+                for pair in pairs {
+                    let entry = pair
+                        .as_array()
+                        .ok_or_else(|| format!("{name} entry must be a [key,value] array"))?;
+                    let key = entry
+                        .first()
+                        .and_then(|v| v.as_i64())
+                        .ok_or_else(|| format!("{name} key must be an integer"))?;
+                    let bytes = entry
+                        .get(1)
+                        .and_then(|v| v.as_array())
+                        .ok_or_else(|| format!("{name} value must be a byte array"))?;
+                    builder.keys().append_value(key as i32);
+                    builder.values().append_value(json_u8_array(bytes)?);
+                }
+                builder
+                    .append(true)
+                    .map_err(|e| format!("append {name} map row failed: {e}"))?;
+            }
+            None => {
+                builder
+                    .append(false)
+                    .map_err(|e| format!("append null {name} map row failed: {e}"))?;
+            }
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+/// Build the Arrow array for a single `$files` column from the JSON rows. The
+/// produced array type EXACTLY matches the analyzer's `files_columns()`
+/// declaration for that column (scalars, field-id maps, lists). Non-nullable
+/// columns (`content`, `file_path`, `file_format`, `spec_id`, `record_count`,
+/// `file_size_in_bytes`) always receive a value; the rest use `append_option`.
+fn build_files_array(
+    column: &IcebergMetadataOutputColumn,
+    rows: &[serde_json::Value],
+) -> Result<ArrayRef, String> {
+    use arrow::array::{BinaryBuilder, Int32Builder, Int64Builder, ListBuilder, StringBuilder};
+    match column.name.as_str() {
+        // Non-nullable Int32 scalar.
+        "content" | "spec_id" => {
+            let mut b = Int32Builder::new();
+            for r in rows {
+                b.append_value(r.get(&column.name).and_then(|v| v.as_i64()).unwrap_or(0) as i32);
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        // Nullable Int32 scalar.
+        "sort_order_id" => {
+            let mut b = Int32Builder::new();
+            for r in rows {
+                b.append_option(
+                    r.get(&column.name)
+                        .and_then(|v| v.as_i64())
+                        .map(|v| v as i32),
+                );
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        // Non-nullable Int64 scalar.
+        "record_count" | "file_size_in_bytes" => {
+            let mut b = Int64Builder::new();
+            for r in rows {
+                b.append_value(r.get(&column.name).and_then(|v| v.as_i64()).unwrap_or(0));
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        // Nullable Int64 scalar.
+        "first_row_id" => {
+            let mut b = Int64Builder::new();
+            for r in rows {
+                b.append_option(r.get(&column.name).and_then(|v| v.as_i64()));
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        // Non-nullable Utf8 scalar.
+        "file_path" | "file_format" => {
+            let mut b = StringBuilder::new();
+            for r in rows {
+                b.append_value(r.get(&column.name).and_then(|v| v.as_str()).unwrap_or(""));
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        // Nullable Utf8 scalar.
+        "partition" => {
+            let mut b = StringBuilder::new();
+            for r in rows {
+                b.append_option(r.get(&column.name).and_then(|v| v.as_str()));
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        // Nullable Binary scalar.
+        "key_metadata" => {
+            let mut b = BinaryBuilder::new();
+            for r in rows {
+                match r.get("key_metadata").and_then(|v| v.as_array()) {
+                    Some(bytes) => b.append_value(json_u8_array(bytes)?),
+                    None => b.append_null(),
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        "column_sizes" | "value_counts" | "null_value_counts" | "nan_value_counts" => {
+            build_int_int_map_array(rows, &column.name)
+        }
+        "lower_bounds" | "upper_bounds" => build_int_binary_map_array(rows, &column.name),
+        "split_offsets" => {
+            let mut b = ListBuilder::new(Int64Builder::new());
+            for r in rows {
+                match r.get("split_offsets").and_then(|v| v.as_array()) {
+                    Some(items) => {
+                        for it in items {
+                            b.values().append_option(it.as_i64());
+                        }
+                        b.append(true);
+                    }
+                    None => b.append(false),
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        "equality_ids" => {
+            let mut b = ListBuilder::new(Int32Builder::new());
+            for r in rows {
+                match r.get("equality_ids").and_then(|v| v.as_array()) {
+                    Some(items) => {
+                        for it in items {
+                            b.values().append_option(it.as_i64().map(|x| x as i32));
+                        }
+                        b.append(true);
+                    }
+                    None => b.append(false),
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        other => Err(format!(
+            "unsupported iceberg files metadata column: {other}"
+        )),
+    }
+}
+
+fn build_files_chunks(
+    rows: &[serde_json::Value],
+    output_columns: &[IcebergMetadataOutputColumn],
+    output_schema: &SchemaRef,
+    output_chunk_schema: &Arc<ChunkSchema>,
+    batch_size: usize,
+) -> Result<Vec<Chunk>, String> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let arrays = output_columns
+        .iter()
+        .map(|column| build_files_array(column, rows))
+        .collect::<Result<Vec<_>, _>>()?;
+    build_chunks(
+        output_schema,
+        output_chunk_schema,
+        arrays,
+        rows.len(),
+        batch_size,
+    )
+}
+
+/// Build the Arrow array for a single `$manifests` column. Scalars follow the
+/// `$files` pattern; the non-nullable count columns coerce a missing/null
+/// source value to `0` (they are declared NON-nullable but the walk emits
+/// `null` when the underlying `Option` is absent); `partition_summaries` is a
+/// `List<Struct<...>>` whose struct field order/names are derived from the
+/// analyzer-declared `column.data_type` so the produced type matches exactly.
+fn build_manifests_array(
+    column: &IcebergMetadataOutputColumn,
+    rows: &[serde_json::Value],
+) -> Result<ArrayRef, String> {
+    use arrow::array::{
+        BooleanBuilder, Int32Builder, Int64Builder, ListBuilder, StringBuilder, StructBuilder,
+    };
+    match column.name.as_str() {
+        // Non-nullable Int32 scalar.
+        "content" | "partition_spec_id" => {
+            let mut b = Int32Builder::new();
+            for r in rows {
+                b.append_value(r.get(&column.name).and_then(|v| v.as_i64()).unwrap_or(0) as i32);
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        // Non-nullable Int32 counts: coerce missing/null to 0.
+        "added_data_files_count" | "existing_data_files_count" | "deleted_data_files_count" => {
+            let mut b = Int32Builder::new();
+            for r in rows {
+                b.append_value(r.get(&column.name).and_then(|v| v.as_i64()).unwrap_or(0) as i32);
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        // Non-nullable Int64 scalar.
+        "length" => {
+            let mut b = Int64Builder::new();
+            for r in rows {
+                b.append_value(r.get("length").and_then(|v| v.as_i64()).unwrap_or(0));
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        // Non-nullable Int64 counts: coerce missing/null to 0.
+        "added_rows_count" | "existing_rows_count" | "deleted_rows_count" => {
+            let mut b = Int64Builder::new();
+            for r in rows {
+                b.append_value(r.get(&column.name).and_then(|v| v.as_i64()).unwrap_or(0));
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        // Nullable Int64 scalar.
+        "added_snapshot_id" => {
+            let mut b = Int64Builder::new();
+            for r in rows {
+                b.append_option(r.get("added_snapshot_id").and_then(|v| v.as_i64()));
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        // Non-nullable Utf8 scalar.
+        "path" => {
+            let mut b = StringBuilder::new();
+            for r in rows {
+                b.append_value(r.get("path").and_then(|v| v.as_str()).unwrap_or(""));
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        "partition_summaries" => {
+            // Derive the struct fields from the analyzer-declared List<Struct>
+            // type so names/nullability match exactly at RecordBatch::try_new.
+            let fields = match &column.data_type {
+                DataType::List(f) => match f.data_type() {
+                    DataType::Struct(fs) => fs.clone(),
+                    _ => return Err("partition_summaries inner type is not a struct".into()),
+                },
+                _ => return Err("partition_summaries type is not a list".into()),
+            };
+            let mut b = ListBuilder::new(StructBuilder::from_fields(fields.clone(), 0));
+            for r in rows {
+                match r.get("partition_summaries").and_then(|v| v.as_array()) {
+                    Some(items) => {
+                        for it in items {
+                            let sb = b.values();
+                            sb.field_builder::<BooleanBuilder>(0)
+                                .ok_or("partition_summaries field 0 builder")?
+                                .append_option(it.get("contains_null").and_then(|v| v.as_bool()));
+                            sb.field_builder::<BooleanBuilder>(1)
+                                .ok_or("partition_summaries field 1 builder")?
+                                .append_option(it.get("contains_nan").and_then(|v| v.as_bool()));
+                            sb.field_builder::<StringBuilder>(2)
+                                .ok_or("partition_summaries field 2 builder")?
+                                .append_option(it.get("lower_bound").and_then(|v| v.as_str()));
+                            sb.field_builder::<StringBuilder>(3)
+                                .ok_or("partition_summaries field 3 builder")?
+                                .append_option(it.get("upper_bound").and_then(|v| v.as_str()));
+                            sb.append(true);
+                        }
+                        b.append(true);
+                    }
+                    None => b.append(false),
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        other => Err(format!(
+            "unsupported iceberg manifests metadata column: {other}"
+        )),
+    }
+}
+
+fn build_manifests_chunks(
+    rows: &[serde_json::Value],
+    output_columns: &[IcebergMetadataOutputColumn],
+    output_schema: &SchemaRef,
+    output_chunk_schema: &Arc<ChunkSchema>,
+    batch_size: usize,
+) -> Result<Vec<Chunk>, String> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let arrays = output_columns
+        .iter()
+        .map(|column| build_manifests_array(column, rows))
+        .collect::<Result<Vec<_>, _>>()?;
+    build_chunks(
+        output_schema,
+        output_chunk_schema,
+        arrays,
+        rows.len(),
+        batch_size,
+    )
+}
+
+/// Build the Arrow array for a single `$entries` column. The entry-level
+/// columns (`status` non-nullable Int32; `snapshot_id` / `sequence_number` /
+/// `file_sequence_number` nullable Int64) are built here; every other column
+/// (including `first_row_id`) is a file property and delegates to
+/// `build_files_array`, since the JSON row carries them under identical names.
+fn build_entries_array(
+    column: &IcebergMetadataOutputColumn,
+    rows: &[serde_json::Value],
+) -> Result<ArrayRef, String> {
+    use arrow::array::{Int32Builder, Int64Builder};
+    match column.name.as_str() {
+        // Non-nullable Int32 scalar.
+        "status" => {
+            let mut b = Int32Builder::new();
+            for r in rows {
+                b.append_value(r.get("status").and_then(|v| v.as_i64()).unwrap_or(0) as i32);
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        // Nullable Int64 entry scalars.
+        "snapshot_id" | "sequence_number" | "file_sequence_number" => {
+            let mut b = Int64Builder::new();
+            for r in rows {
+                b.append_option(r.get(&column.name).and_then(|v| v.as_i64()));
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        // `first_row_id` + every $files column reuse the files builder.
+        _ => build_files_array(column, rows),
+    }
+}
+
+fn build_entries_chunks(
+    rows: &[serde_json::Value],
+    output_columns: &[IcebergMetadataOutputColumn],
+    output_schema: &SchemaRef,
+    output_chunk_schema: &Arc<ChunkSchema>,
+    batch_size: usize,
+) -> Result<Vec<Chunk>, String> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let arrays = output_columns
+        .iter()
+        .map(|column| build_entries_array(column, rows))
+        .collect::<Result<Vec<_>, _>>()?;
+    build_chunks(
+        output_schema,
+        output_chunk_schema,
+        arrays,
+        rows.len(),
+        batch_size,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -847,40 +1325,6 @@ mod tests {
         };
         assert!(!fields[0].is_nullable());
         assert!(fields[1].is_nullable());
-    }
-
-    #[test]
-    fn test_metadata_scan_rejects_unimplemented_flavors() {
-        // Files / Manifests / LogicalIcebergMetadata require a
-        // manifest-walk that the native-Rust path does not yet implement.
-        // The constructor must fail-fast with a clear error so callers
-        // surface a usable message instead of hanging in the pipeline.
-        for ty in [
-            IcebergMetadataTableType::Files,
-            IcebergMetadataTableType::Manifests,
-            IcebergMetadataTableType::LogicalIcebergMetadata,
-        ] {
-            let err = IcebergMetadataScanOp::new(IcebergMetadataScanConfig {
-                metadata_table_type: ty.clone(),
-                serialized_table: String::new(),
-                serialized_predicate: String::new(),
-                load_column_stats: false,
-                ranges: Vec::new(),
-                batch_size: 1,
-                output_columns: vec![super::IcebergMetadataOutputColumn {
-                    name: "x".to_string(),
-                    slot_id: SlotId::new(1),
-                    data_type: DataType::Int32,
-                    nullable: false,
-                }],
-                profile_label: None,
-            })
-            .expect_err("native-Rust path should reject unimplemented metadata flavor");
-            assert!(
-                err.contains("not yet implemented in the native-Rust scan path"),
-                "{ty:?}: unexpected error: {err}"
-            );
-        }
     }
 
     #[test]
@@ -928,46 +1372,6 @@ mod tests {
             let arr = super::build_snapshot_array(&col, &rows).unwrap();
             assert_eq!(arr.len(), 1);
         }
-    }
-
-    #[test]
-    fn test_build_snapshot_summary_map_uses_iceberg_field_names() {
-        use super::SnapshotMetadataRow;
-        let rows = vec![SnapshotMetadataRow {
-            committed_at_micros: 0,
-            snapshot_id: 1,
-            parent_id: None,
-            operation: None,
-            manifest_list: "x".into(),
-            summary: Some(vec![("added-records".into(), "10".into())]),
-        }];
-        // The Map type passed in matches what FE will declare for the summary column.
-        let map_type = DataType::Map(
-            Arc::new(Field::new(
-                "entries",
-                DataType::Struct(
-                    vec![
-                        Arc::new(Field::new("key", DataType::Utf8, false)),
-                        Arc::new(Field::new("value", DataType::Utf8, true)),
-                    ]
-                    .into(),
-                ),
-                false,
-            )),
-            false,
-        );
-        let col = super::IcebergMetadataOutputColumn {
-            name: "summary".into(),
-            slot_id: SlotId::new(1),
-            data_type: map_type,
-            nullable: true,
-        };
-        let arr = super::build_snapshot_array(&col, &rows).unwrap();
-        let map = arr.as_any().downcast_ref::<MapArray>().expect("MapArray");
-        assert_eq!(map.len(), 1);
-        let (key_field, value_field) = map.entries_fields();
-        assert_eq!(key_field.name(), "key");
-        assert_eq!(value_field.name(), "value");
     }
 
     #[test]
@@ -1136,4 +1540,403 @@ mod tests {
 
     // Partition metadata payload parsing is exercised by the SQL suite; unit
     // tests above keep the Arrow array contract pinned.
+
+    // ---------------------------------------------------------------------
+    // $files / $manifests / $entries builders (IV3-8).
+    // ---------------------------------------------------------------------
+
+    use super::{
+        IcebergMetadataOutputColumn, build_entries_array, build_entries_chunks, build_files_array,
+        build_files_chunks, build_manifests_array, build_manifests_chunks,
+    };
+    use crate::sql::analyzer::iceberg_metadata::metadata_table_schema;
+    use arrow::array::{BinaryArray, BooleanArray, Int32Array, Int64Array, ListArray, StructArray};
+
+    /// Build the real analyzer-declared output columns for a metadata table,
+    /// assigning sequential SlotIds. This exercises the REAL declared Arrow
+    /// types so the builders' output must match exactly.
+    fn output_columns_for(ty: IcebergMetadataTableType) -> Vec<IcebergMetadataOutputColumn> {
+        metadata_table_schema(ty)
+            .into_iter()
+            .enumerate()
+            .map(|(i, c)| IcebergMetadataOutputColumn {
+                name: c.name,
+                slot_id: SlotId::new((i + 1) as u32),
+                data_type: c.data_type,
+                nullable: c.nullable,
+            })
+            .collect()
+    }
+
+    fn column_named<'a>(
+        cols: &'a [IcebergMetadataOutputColumn],
+        name: &str,
+    ) -> &'a IcebergMetadataOutputColumn {
+        cols.iter()
+            .find(|c| c.name == name)
+            .unwrap_or_else(|| panic!("missing column {name}"))
+    }
+
+    /// Build the normalized output schema + chunk schema exactly the way
+    /// `IcebergMetadataScanOp::new` does, so `build_*_chunks` validates the
+    /// produced arrays against the real declared (normalized) types.
+    fn schemas_for(
+        cols: &[IcebergMetadataOutputColumn],
+    ) -> (super::SchemaRef, Arc<super::ChunkSchema>) {
+        use super::{ChunkSchema, ChunkSlotSchema};
+        let fields = cols
+            .iter()
+            .map(|col| {
+                Arc::new(Field::new(
+                    &col.name,
+                    normalize_metadata_output_type(&col.data_type),
+                    col.nullable,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let chunk_schema = Arc::new(
+            ChunkSchema::try_new(
+                cols.iter()
+                    .zip(fields.iter())
+                    .map(|(col, field)| {
+                        ChunkSlotSchema::new_with_field(
+                            col.slot_id,
+                            field.as_ref().clone(),
+                            None,
+                            None,
+                        )
+                    })
+                    .collect(),
+            )
+            .expect("chunk schema"),
+        );
+        (Arc::new(super::Schema::new(fields)), chunk_schema)
+    }
+
+    /// One representative data-file row (content=0) carrying every column the
+    /// `$files` table exposes, using the same JSON shapes the resolution walk
+    /// emits (`[[k,v],...]` for maps, `[k,[bytes...]]` for binary maps).
+    fn sample_data_file_row() -> serde_json::Value {
+        serde_json::json!({
+            "content": 0,
+            "file_path": "s3://bucket/data/f0.parquet",
+            "file_format": "PARQUET",
+            "spec_id": 0,
+            "record_count": 3,
+            "file_size_in_bytes": 1024,
+            "column_sizes": [[1, 100]],
+            "value_counts": [[1, 3]],
+            "null_value_counts": [[1, 0]],
+            "nan_value_counts": [[1, 0]],
+            "lower_bounds": [[1, [1, 2, 3]]],
+            "upper_bounds": [[1, [4, 5, 6]]],
+            "split_offsets": [0, 128],
+            "equality_ids": [],
+            "sort_order_id": 0,
+            "key_metadata": serde_json::Value::Null,
+            "first_row_id": serde_json::Value::Null,
+            "partition": "Struct([])"
+        })
+    }
+
+    #[test]
+    fn build_files_array_scalar_columns() {
+        let rows = vec![sample_data_file_row()];
+        let cols = output_columns_for(IcebergMetadataTableType::Files);
+
+        let content = build_files_array(column_named(&cols, "content"), &rows).unwrap();
+        let content = content.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(content.value(0), 0);
+
+        let rec = build_files_array(column_named(&cols, "record_count"), &rows).unwrap();
+        let rec = rec.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(rec.value(0), 3);
+
+        let path = build_files_array(column_named(&cols, "file_path"), &rows).unwrap();
+        let path = path
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(path.value(0), "s3://bucket/data/f0.parquet");
+
+        let part = build_files_array(column_named(&cols, "partition"), &rows).unwrap();
+        let part = part
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(part.value(0), "Struct([])");
+
+        // Nullable scalars surfaced as null.
+        let frid = build_files_array(column_named(&cols, "first_row_id"), &rows).unwrap();
+        assert!(frid.is_null(0));
+        let km = build_files_array(column_named(&cols, "key_metadata"), &rows).unwrap();
+        assert!(
+            km.as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap()
+                .is_null(0)
+        );
+    }
+
+    #[test]
+    fn build_files_array_int_int_map_column() {
+        let rows = vec![sample_data_file_row()];
+        let cols = output_columns_for(IcebergMetadataTableType::Files);
+        let arr = build_files_array(column_named(&cols, "column_sizes"), &rows).unwrap();
+        let map = arr.as_any().downcast_ref::<MapArray>().expect("MapArray");
+        assert_eq!(map.len(), 1);
+        let entries = map.value(0);
+        let keys = entries
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let vals = entries
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(keys.value(0), 1);
+        assert_eq!(vals.value(0), 100);
+    }
+
+    #[test]
+    fn build_files_array_int_binary_map_column() {
+        let rows = vec![sample_data_file_row()];
+        let cols = output_columns_for(IcebergMetadataTableType::Files);
+        let arr = build_files_array(column_named(&cols, "lower_bounds"), &rows).unwrap();
+        let map = arr.as_any().downcast_ref::<MapArray>().expect("MapArray");
+        let entries = map.value(0);
+        let keys = entries
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let vals = entries
+            .column(1)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        assert_eq!(keys.value(0), 1);
+        assert_eq!(vals.value(0), &[1u8, 2, 3]);
+    }
+
+    #[test]
+    fn build_files_array_list_columns() {
+        let rows = vec![sample_data_file_row()];
+        let cols = output_columns_for(IcebergMetadataTableType::Files);
+
+        let so = build_files_array(column_named(&cols, "split_offsets"), &rows).unwrap();
+        let so = so.as_any().downcast_ref::<ListArray>().expect("ListArray");
+        let inner = so.value(0);
+        let inner = inner.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(inner.values(), &[0i64, 128]);
+
+        // equality_ids: present-but-empty array -> non-null empty list.
+        let eq = build_files_array(column_named(&cols, "equality_ids"), &rows).unwrap();
+        let eq = eq.as_any().downcast_ref::<ListArray>().expect("ListArray");
+        assert!(!eq.is_null(0));
+        assert_eq!(eq.value(0).len(), 0);
+    }
+
+    #[test]
+    fn build_files_chunks_matches_declared_schema() {
+        let rows = vec![sample_data_file_row()];
+        let cols = output_columns_for(IcebergMetadataTableType::Files);
+        let (schema, chunk_schema) = schemas_for(&cols);
+        // A successful build proves every produced array's type equals the
+        // analyzer-declared (normalized) type — RecordBatch::try_new errors
+        // otherwise.
+        let chunks = build_files_chunks(&rows, &cols, &schema, &chunk_schema, 1024)
+            .expect("build_files_chunks must match declared schema");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), 1);
+    }
+
+    #[test]
+    fn build_manifests_array_counts_and_summaries() {
+        // A manifest row with one partition summary and a NULL count for
+        // existing_data_files_count: the non-nullable count must come out 0.
+        let rows = vec![serde_json::json!({
+            "content": 0,
+            "path": "s3://bucket/m0.avro",
+            "length": 4096,
+            "partition_spec_id": 0,
+            "added_snapshot_id": serde_json::Value::Null,
+            "added_data_files_count": 1,
+            "existing_data_files_count": serde_json::Value::Null,
+            "deleted_data_files_count": 0,
+            "added_rows_count": 3,
+            "existing_rows_count": serde_json::Value::Null,
+            "deleted_rows_count": 0,
+            "partition_summaries": [{
+                "contains_null": false,
+                "contains_nan": false,
+                "lower_bound": "a",
+                "upper_bound": "z"
+            }]
+        })];
+        let cols = output_columns_for(IcebergMetadataTableType::Manifests);
+
+        // Non-nullable count with a null source coerces to 0 (not null).
+        let existing =
+            build_manifests_array(column_named(&cols, "existing_data_files_count"), &rows).unwrap();
+        let existing = existing.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert!(!existing.is_null(0));
+        assert_eq!(existing.value(0), 0);
+
+        let existing_rows =
+            build_manifests_array(column_named(&cols, "existing_rows_count"), &rows).unwrap();
+        let existing_rows = existing_rows.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert!(!existing_rows.is_null(0));
+        assert_eq!(existing_rows.value(0), 0);
+
+        // added_snapshot_id IS nullable -> stays null.
+        let added_snap =
+            build_manifests_array(column_named(&cols, "added_snapshot_id"), &rows).unwrap();
+        assert!(added_snap.is_null(0));
+
+        // partition_summaries: List<Struct> with exactly one element.
+        let ps = build_manifests_array(column_named(&cols, "partition_summaries"), &rows).unwrap();
+        let ps = ps.as_any().downcast_ref::<ListArray>().expect("ListArray");
+        assert_eq!(ps.len(), 1);
+        let elem = ps.value(0);
+        assert_eq!(elem.len(), 1);
+        let st = elem.as_any().downcast_ref::<StructArray>().expect("Struct");
+        let cn = st
+            .column_by_name("contains_null")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert!(!cn.value(0));
+        let lb = st
+            .column_by_name("lower_bound")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(lb.value(0), "a");
+    }
+
+    #[test]
+    fn build_manifests_chunks_matches_declared_schema() {
+        let rows = vec![serde_json::json!({
+            "content": 0,
+            "path": "s3://bucket/m0.avro",
+            "length": 4096,
+            "partition_spec_id": 0,
+            "added_snapshot_id": 123,
+            "added_data_files_count": 1,
+            "existing_data_files_count": 0,
+            "deleted_data_files_count": 0,
+            "added_rows_count": 3,
+            "existing_rows_count": 0,
+            "deleted_rows_count": 0,
+            "partition_summaries": [{
+                "contains_null": false,
+                "contains_nan": false,
+                "lower_bound": "a",
+                "upper_bound": "z"
+            }]
+        })];
+        let cols = output_columns_for(IcebergMetadataTableType::Manifests);
+        let (schema, chunk_schema) = schemas_for(&cols);
+        let chunks = build_manifests_chunks(&rows, &cols, &schema, &chunk_schema, 1024)
+            .expect("build_manifests_chunks must match declared schema");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), 1);
+    }
+
+    #[test]
+    fn build_entries_array_status_and_file_columns() {
+        // One added (status=1) data-file entry + one deleted (status=2)
+        // position-delete entry. File columns ride alongside the entry columns.
+        let mut added = sample_data_file_row();
+        added.as_object_mut().unwrap().extend(
+            serde_json::json!({
+                "status": 1,
+                "snapshot_id": 100,
+                "sequence_number": 5,
+                "file_sequence_number": 5
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        let deleted = serde_json::json!({
+            "status": 2,
+            "snapshot_id": 100,
+            "sequence_number": 6,
+            "file_sequence_number": serde_json::Value::Null,
+            "content": 1,
+            "file_path": "s3://bucket/delete/d0.parquet",
+            "file_format": "PARQUET",
+            "spec_id": 0,
+            "record_count": 1,
+            "file_size_in_bytes": 64,
+            "column_sizes": [],
+            "value_counts": [],
+            "null_value_counts": [],
+            "nan_value_counts": [],
+            "lower_bounds": [],
+            "upper_bounds": [],
+            "split_offsets": [],
+            "equality_ids": [],
+            "sort_order_id": serde_json::Value::Null,
+            "key_metadata": serde_json::Value::Null,
+            "first_row_id": serde_json::Value::Null,
+            "partition": "Struct([])"
+        });
+        let rows = vec![added, deleted];
+        let cols = output_columns_for(IcebergMetadataTableType::LogicalIcebergMetadata);
+
+        let status = build_entries_array(column_named(&cols, "status"), &rows).unwrap();
+        let status = status.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(status.value(0), 1);
+        assert_eq!(status.value(1), 2);
+
+        // file_sequence_number nullable: present on row 0, null on row 1.
+        let fsn = build_entries_array(column_named(&cols, "file_sequence_number"), &rows).unwrap();
+        let fsn = fsn.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(fsn.value(0), 5);
+        assert!(fsn.is_null(1));
+
+        // File columns are populated (delegated to build_files_array).
+        let fp = build_entries_array(column_named(&cols, "file_path"), &rows).unwrap();
+        let fp = fp
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(fp.value(0), "s3://bucket/data/f0.parquet");
+        assert_eq!(fp.value(1), "s3://bucket/delete/d0.parquet");
+
+        let rec = build_entries_array(column_named(&cols, "record_count"), &rows).unwrap();
+        let rec = rec.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(rec.value(0), 3);
+        assert_eq!(rec.value(1), 1);
+    }
+
+    #[test]
+    fn build_entries_chunks_matches_declared_schema() {
+        let mut added = sample_data_file_row();
+        added.as_object_mut().unwrap().extend(
+            serde_json::json!({
+                "status": 1,
+                "snapshot_id": 100,
+                "sequence_number": 5,
+                "file_sequence_number": 5
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        let rows = vec![added];
+        let cols = output_columns_for(IcebergMetadataTableType::LogicalIcebergMetadata);
+        let (schema, chunk_schema) = schemas_for(&cols);
+        let chunks = build_entries_chunks(&rows, &cols, &schema, &chunk_schema, 1024)
+            .expect("build_entries_chunks must match declared schema");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), 1);
+    }
 }

@@ -42,11 +42,17 @@ impl MetadataColumn {
 
 /// Build an Arrow `Map<Int32, value>` matching the metadata-scan MapBuilder
 /// output (keys non-nullable).
+///
+/// Field names (`entries` / `key` / `value`) MUST mirror
+/// `metadata.rs::iceberg_map_field_names()` exactly: the scan-op builders
+/// produce their `Map` columns through that `MapFieldNames`, and
+/// `RecordBatch::try_new` compares `Field` names structurally, so any
+/// divergence here would fail the column-type check.
 fn map_int_to(value: DataType) -> DataType {
     let entries = DataType::Struct(
         vec![
-            Arc::new(Field::new("keys", DataType::Int32, false)),
-            Arc::new(Field::new("values", value, true)),
+            Arc::new(Field::new("key", DataType::Int32, false)),
+            Arc::new(Field::new("value", value, true)),
         ]
         .into(),
     );
