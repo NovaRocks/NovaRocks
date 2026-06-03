@@ -584,6 +584,8 @@ pub struct RuntimeConfig {
     pub cache: CacheConfig,
     #[serde(default)]
     pub path_rewrite: PathRewriteConfig,
+    #[serde(default)]
+    pub execution_services: ExecutionServicesConfig,
 }
 
 #[derive(Clone, Deserialize)]
@@ -932,6 +934,7 @@ impl Default for RuntimeConfig {
             object_storage: ObjectStorageConfig::default(),
             cache: CacheConfig::default(),
             path_rewrite: PathRewriteConfig::default(),
+            execution_services: ExecutionServicesConfig::default(),
         }
     }
 }
@@ -958,6 +961,61 @@ pub struct PathRewriteConfig {
     pub from_prefix: String,
     #[serde(default)]
     pub to_prefix: String,
+}
+
+/// Execution-service resource boundaries (IW-1).
+///
+/// These knobs size the dedicated `sink_io` runtime and the async-sink queue.
+/// Defaults add only a few (mostly idle) threads and do not change all-in-one
+/// behavior. `metadata_io` / `commit` / `scan_io` currently alias `data_runtime`
+/// and therefore have no size knobs yet.
+#[derive(Clone, Deserialize)]
+pub struct ExecutionServicesConfig {
+    /// Worker threads for the dedicated sink I/O runtime. 0 = min(4, cores).
+    #[serde(default = "default_sink_io_worker_threads")]
+    pub sink_io_worker_threads: usize,
+    /// Max blocking threads for the dedicated sink I/O runtime.
+    #[serde(default = "default_sink_io_max_blocking_threads")]
+    pub sink_io_max_blocking_threads: usize,
+    /// Bounded queue capacity (chunks) for `AsyncSinkOperator` backpressure.
+    #[serde(default = "default_async_sink_queue_capacity")]
+    pub async_sink_queue_capacity: usize,
+}
+
+fn default_sink_io_worker_threads() -> usize {
+    0
+}
+
+fn default_sink_io_max_blocking_threads() -> usize {
+    16
+}
+
+fn default_async_sink_queue_capacity() -> usize {
+    8
+}
+
+impl Default for ExecutionServicesConfig {
+    fn default() -> Self {
+        Self {
+            sink_io_worker_threads: default_sink_io_worker_threads(),
+            sink_io_max_blocking_threads: default_sink_io_max_blocking_threads(),
+            async_sink_queue_capacity: default_async_sink_queue_capacity(),
+        }
+    }
+}
+
+impl ExecutionServicesConfig {
+    /// Resolve sink I/O worker threads; 0 means min(4, cores).
+    pub fn actual_sink_io_worker_threads(&self) -> usize {
+        if self.sink_io_worker_threads > 0 {
+            self.sink_io_worker_threads
+        } else {
+            let cores = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1);
+            cores.min(4).max(1)
+        }
+    }
 }
 
 impl RuntimeConfig {
@@ -1909,5 +1967,15 @@ backends = ["127.0.0.1:9070", "127.0.0.1:9071"]
         );
         // Error message should contain the count.
         assert!(err.contains('2'), "expected count 2 in error: {err}");
+    }
+
+    #[test]
+    fn execution_services_defaults_are_sane() {
+        let cfg = RuntimeConfig::default();
+        assert_eq!(cfg.execution_services.sink_io_max_blocking_threads, 16);
+        assert_eq!(cfg.execution_services.async_sink_queue_capacity, 8);
+        // 0 means "derive from cores"; resolved value must be >= 1.
+        assert!(cfg.execution_services.actual_sink_io_worker_threads() >= 1);
+        assert!(cfg.execution_services.actual_sink_io_worker_threads() <= 4);
     }
 }

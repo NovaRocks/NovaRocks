@@ -285,6 +285,42 @@ pub(crate) fn data_runtime_max_blocking_threads() -> usize {
         .unwrap_or(64)
 }
 
+pub(crate) fn sink_io_worker_threads() -> usize {
+    novarocks_app_config()
+        .ok()
+        .map(|c| c.runtime.execution_services.actual_sink_io_worker_threads())
+        .unwrap_or_else(|| {
+            let cores = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1);
+            cores.min(4).max(1)
+        })
+}
+
+pub(crate) fn sink_io_max_blocking_threads() -> usize {
+    novarocks_app_config()
+        .ok()
+        .map(|c| {
+            c.runtime
+                .execution_services
+                .sink_io_max_blocking_threads
+                .max(1)
+        })
+        .unwrap_or(16)
+}
+
+pub(crate) fn async_sink_queue_capacity() -> usize {
+    novarocks_app_config()
+        .ok()
+        .map(|c| {
+            c.runtime
+                .execution_services
+                .async_sink_queue_capacity
+                .max(1)
+        })
+        .unwrap_or(8)
+}
+
 pub(crate) fn connector_io_tasks_per_scan_operator_default() -> i32 {
     novarocks_app_config()
         .ok()
