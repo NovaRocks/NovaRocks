@@ -61,8 +61,8 @@ use super::abort::AbortLog;
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
 use super::fast_append::{carry_forward_puffin_stats, register_puffin_stats};
 use super::helpers::{
-    current_snapshot_total_records, effective_next_row_id, generate_snapshot_id, metadata_dir,
-    now_ms, write_manifest_list,
+    current_snapshot_total_records, effective_next_row_id, finalize_snapshot_summary,
+    generate_snapshot_id, metadata_dir, now_ms, write_manifest_list,
 };
 use super::position_delete_writer::PositionDeleteGroup;
 use super::puffin_dv::{
@@ -393,15 +393,22 @@ impl TransactionAction for RowDeltaDvTxnAction {
         )
         .map_err(to_iceberg_unexpected)?;
 
+        let mut dv_props = dv_summary(
+            &written_dvs,
+            &self.written,
+            total_records,
+            newly_deleted_records,
+            index.replaced_delete_files,
+            index.replaced_delete_records,
+        );
+        if index.replaced_delete_files_size > 0 {
+            dv_props.insert(
+                "removed-files-size".to_string(),
+                index.replaced_delete_files_size.to_string(),
+            );
+        }
         let summary_props = merge_snapshot_summary_properties(
-            dv_summary(
-                &written_dvs,
-                &self.written,
-                total_records,
-                newly_deleted_records,
-                index.replaced_delete_files,
-                index.replaced_delete_records,
-            ),
+            finalize_snapshot_summary(dv_props, m.current_snapshot().map(|s| s.summary()), false),
             &self.snapshot_properties,
         )
         .map_err(to_iceberg_unexpected)?;
@@ -472,6 +479,8 @@ struct SnapshotIndex {
     replaced_delete_files: usize,
     /// Position deletes already represented by removed DV files.
     replaced_delete_records: u64,
+    /// Total file_size_in_bytes of replaced DV files.
+    replaced_delete_files_size: u64,
 }
 
 async fn build_snapshot_index(
@@ -485,6 +494,7 @@ async fn build_snapshot_index(
     let mut untouched_manifests = Vec::new();
     let mut touched_delete_existing = Vec::new();
     let mut replaced_delete_files = 0usize;
+    let mut replaced_delete_files_size = 0u64;
     let mut replaced_delete_vectors: HashMap<String, DeletionVector> = HashMap::new();
     let m = table.metadata();
     // For branch-targeted deletes, read the manifest list from the branch head
@@ -578,6 +588,7 @@ async fn build_snapshot_index(
                                     )
                                 })?;
                         replaced_delete_files += 1;
+                        replaced_delete_files_size += file.file_size_in_bytes();
                         replaced_delete_vectors
                             .entry(referenced.clone())
                             .or_default()
@@ -617,6 +628,7 @@ async fn build_snapshot_index(
         touched_delete_existing,
         replaced_delete_files,
         replaced_delete_records,
+        replaced_delete_files_size,
     })
 }
 
@@ -992,6 +1004,28 @@ mod tests {
         assert_eq!(grouped.keys().copied().collect::<Vec<_>>(), vec![1, 2]);
         assert_eq!(grouped[&1][0].referenced_data_file, "file:///x/old.parquet");
         assert_eq!(grouped[&2][0].referenced_data_file, "file:///x/new.parquet");
+    }
+
+    #[test]
+    fn dv_summary_finalized_carries_total_fields_and_engine_name() {
+        use super::super::helpers::finalize_snapshot_summary;
+        let dvs = vec![test_written_dv_with_cardinality(
+            "file:///x/dv-new.puffin",
+            "file:///x/data.parquet",
+            3,
+        )];
+        let total_records = dv_total_records(Some(20), 3, 0).unwrap();
+        let props = dv_summary(&dvs, &[], total_records, 3, 0, 0);
+        let finalized = finalize_snapshot_summary(props, None, false);
+        // First snapshot: total-delete-files = added-delete-files = 1
+        assert_eq!(
+            finalized.get("total-delete-files").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            finalized.get("engine-name").map(String::as_str),
+            Some("novarocks")
+        );
     }
 
     #[test]
