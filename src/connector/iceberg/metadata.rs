@@ -460,7 +460,30 @@ fn build_snapshot_array(
                 .map(|r| Some(r.manifest_list.as_str()))
                 .collect::<Vec<_>>(),
         ))),
-        "summary" => build_string_string_map_array(rows.iter().map(|r| r.summary.as_ref())),
+        // Serialize as a JSON object string so that the column matches the
+        // Utf8 type the analyzer advertises, enabling LIKE / string operations.
+        // Example: {"added-data-files":"1","engine-name":"novarocks",...}
+        "summary" => Ok(Arc::new(StringArray::from(
+            rows.iter()
+                .map(|r| {
+                    r.summary.as_ref().map(|pairs| {
+                        let mut s = String::from("{");
+                        for (i, (k, v)) in pairs.iter().enumerate() {
+                            if i > 0 {
+                                s.push(',');
+                            }
+                            s.push('"');
+                            s.push_str(k);
+                            s.push_str("\":\"");
+                            s.push_str(v);
+                            s.push('"');
+                        }
+                        s.push('}');
+                        s
+                    })
+                })
+                .collect::<Vec<_>>(),
+        ))),
         other => Err(format!(
             "unsupported iceberg snapshots metadata column: {}",
             other

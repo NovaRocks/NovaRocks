@@ -1,0 +1,7 @@
+-- query 5
+has_total_data_files	has_total_records	has_total_files_size	has_engine_name
+1	1	1	1
+
+-- query 7
+has_total_records	has_engine_name
+1	1
