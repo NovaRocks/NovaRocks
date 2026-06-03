@@ -139,6 +139,19 @@ pub fn ensure_no_variant_in_sort_order(table: &Table) -> Result<(), String> {
     Ok(())
 }
 
+/// Fail-fast guard: the new schema's `last-column-id` high-watermark must not
+/// regress below the table's current value. Iceberg requires this id be
+/// monotonically increasing; a regression would corrupt field-id assignment.
+pub fn ensure_column_id_not_regressed(current: i32, next: i32) -> Result<(), String> {
+    if next < current {
+        return Err(format!(
+            "iceberg schema evolution would regress last-column-id from {current} to {next}; \
+             column ids must be monotonically increasing"
+        ));
+    }
+    Ok(())
+}
+
 pub fn classify_sql_delete_strategy(table: &Table) -> Result<IcebergSqlDeleteStrategy, String> {
     let write_mode = ensure_iceberg_write_supported(table)?;
     Ok(sql_delete_strategy_from_write_mode(write_mode))
@@ -338,6 +351,14 @@ fn arrow_iceberg_types_compatible(
 mod tests {
     use super::super::types::NOVAROCKS_UPDATE_MODE_MOR;
     use super::*;
+
+    #[test]
+    fn column_id_monotonic_ok_and_regression_fails() {
+        assert!(super::ensure_column_id_not_regressed(10, 12).is_ok());
+        assert!(super::ensure_column_id_not_regressed(10, 10).is_ok());
+        let err = super::ensure_column_id_not_regressed(10, 9).unwrap_err();
+        assert!(err.contains("last-column-id"), "got: {err}");
+    }
 
     #[test]
     fn row_lineage_property_parser_accepts_true_case_insensitive() {

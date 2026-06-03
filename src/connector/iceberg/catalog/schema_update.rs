@@ -3673,6 +3673,11 @@ impl TransactionAction for SchemaUpdateTxnAction {
         // table_metadata_builder.rs::add_schema.
         let next_last_column_id =
             std::cmp::max(metadata.last_column_id(), new_schema.highest_field_id());
+        crate::connector::iceberg::commit::ensure_column_id_not_regressed(
+            metadata.last_column_id(),
+            next_last_column_id,
+        )
+        .map_err(|e| iceberg::Error::new(iceberg::ErrorKind::DataInvalid, e))?;
         let mut updates = vec![
             TableUpdate::AddSchema {
                 schema: new_schema,
