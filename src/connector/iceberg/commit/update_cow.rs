@@ -39,7 +39,9 @@ use uuid::Uuid;
 use super::abort::AbortLog;
 use super::action::{CommitCtx, IcebergCommitAction};
 use super::fast_append::register_puffin_stats;
-use super::helpers::{generate_snapshot_id, metadata_dir, now_ms, write_manifest_list};
+use super::helpers::{
+    finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms, write_manifest_list,
+};
 use super::overwrite::{write_added_data_manifest, write_overwrite_deletes_manifest};
 use super::types::{CommitOutcome, WrittenFile};
 use crate::connector::iceberg::stats_assembler::CommitType;
@@ -206,6 +208,20 @@ impl TransactionAction for CowUpdateTxnAction {
                 target_ref,
             )));
         }
+        // Capture deleted-file metrics before index.touched_live is consumed by
+        // the partition-spec grouping below. These feed the snapshot summary.
+        let deleted_file_count = index.touched_live.len();
+        let deleted_record_count: u64 = index
+            .touched_live
+            .iter()
+            .map(|f| f.data_file.record_count())
+            .sum();
+        let removed_files_size: u64 = index
+            .touched_live
+            .iter()
+            .map(|f| f.data_file.file_size_in_bytes())
+            .sum();
+
         let touched_delete_groups = group_live_files_by_partition_spec(&index.touched_live);
 
         let mut new_manifests: Vec<ManifestFile> = index.untouched_manifests;
@@ -330,9 +346,48 @@ impl TransactionAction for CowUpdateTxnAction {
             )));
         }
 
+        // Build canonical COW UPDATE summary: added keys from the rewritten
+        // replacement files, deleted keys from the old touched data files.
+        let mut summary_props = HashMap::new();
+        summary_props.insert(
+            "added-data-files".to_string(),
+            self.written.len().to_string(),
+        );
+        summary_props.insert(
+            "added-records".to_string(),
+            self.written
+                .iter()
+                .map(|f| f.record_count)
+                .sum::<u64>()
+                .to_string(),
+        );
+        summary_props.insert(
+            "added-files-size".to_string(),
+            self.written
+                .iter()
+                .map(|f| f.file_size_in_bytes)
+                .sum::<u64>()
+                .to_string(),
+        );
+        summary_props.insert(
+            "deleted-data-files".to_string(),
+            deleted_file_count.to_string(),
+        );
+        summary_props.insert(
+            "deleted-records".to_string(),
+            deleted_record_count.to_string(),
+        );
+        summary_props.insert(
+            "removed-files-size".to_string(),
+            removed_files_size.to_string(),
+        );
         let summary = Summary {
             operation: Operation::Overwrite,
-            additional_properties: HashMap::new(),
+            additional_properties: finalize_snapshot_summary(
+                summary_props,
+                m.current_snapshot().map(|s| s.summary()),
+                false,
+            ),
         };
         let snapshot = Snapshot::builder()
             .with_snapshot_id(new_snapshot_id)
@@ -727,7 +782,7 @@ fn to_iceberg_data_invalid(s: String) -> iceberg::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iceberg::spec::{DataFileFormat, Struct};
+    use iceberg::spec::{DataFileFormat, Operation, Struct};
 
     #[test]
     fn type_compiles() {
@@ -791,6 +846,157 @@ mod tests {
 
         validate_cow_update_inputs(&rewrite, &written, Some(7), "table-uuid")
             .expect("rewritten row ids may include unchanged rows");
+    }
+
+    // -----------------------------------------------------------------------
+    // Summary-building tests (IV3-2 fix: COW UPDATE must not leave an empty
+    // summary that poisons the carry-chain for subsequent commits).
+    // -----------------------------------------------------------------------
+
+    /// Build a `Summary` representing a prior append snapshot with known
+    /// `total-*` values to use as the `previous` argument.
+    fn prior_summary(total_data_files: u64, total_records: u64, total_files_size: u64) -> Summary {
+        let mut props = HashMap::new();
+        props.insert("total-data-files".to_string(), total_data_files.to_string());
+        props.insert("total-records".to_string(), total_records.to_string());
+        props.insert("total-files-size".to_string(), total_files_size.to_string());
+        props.insert("total-delete-files".to_string(), "0".to_string());
+        props.insert("total-position-deletes".to_string(), "0".to_string());
+        props.insert("total-equality-deletes".to_string(), "0".to_string());
+        Summary {
+            operation: Operation::Append,
+            additional_properties: props,
+        }
+    }
+
+    /// Verifies that building a COW UPDATE summary from a set of new and old
+    /// files produces `engine-name = "novarocks"` and both `total-records` and
+    /// `total-data-files` in the result.
+    #[test]
+    fn cow_update_summary_has_engine_name_and_totals() {
+        // Simulate: 1 old file with 5 rows, replaced by 1 new file with 4 rows.
+        let new_files = vec![written_file("new.parquet")]; // record_count=1, file_size=128
+        let old_record_count: u64 = 5;
+        let old_file_size: u64 = 256;
+
+        let mut props = HashMap::new();
+        props.insert("added-data-files".to_string(), new_files.len().to_string());
+        props.insert(
+            "added-records".to_string(),
+            new_files
+                .iter()
+                .map(|f| f.record_count)
+                .sum::<u64>()
+                .to_string(),
+        );
+        props.insert(
+            "added-files-size".to_string(),
+            new_files
+                .iter()
+                .map(|f| f.file_size_in_bytes)
+                .sum::<u64>()
+                .to_string(),
+        );
+        props.insert("deleted-data-files".to_string(), "1".to_string());
+        props.insert("deleted-records".to_string(), old_record_count.to_string());
+        props.insert("removed-files-size".to_string(), old_file_size.to_string());
+
+        // No prior snapshot → first snapshot baseline.
+        let result = finalize_snapshot_summary(props.clone(), None, false);
+
+        assert_eq!(
+            result.get("engine-name").map(String::as_str),
+            Some("novarocks"),
+            "engine-name must be stamped"
+        );
+        assert!(
+            result.contains_key("total-records"),
+            "total-records must be present"
+        );
+        assert!(
+            result.contains_key("total-data-files"),
+            "total-data-files must be present"
+        );
+    }
+
+    /// Regression: a COW UPDATE after a prior append must NOT omit `total-*`
+    /// fields — an empty summary poisons the carry-chain so that every
+    /// subsequent commit also loses its totals.
+    ///
+    /// Before the fix, `CowUpdateCommit` produced
+    /// `Summary { additional_properties: {} }`, which caused
+    /// `finalize_snapshot_summary` on the NEXT snapshot to return early
+    /// (missing previous total), omitting all `total-*` fields forever.
+    ///
+    /// This test simulates the carry-chain:
+    ///   snapshot-1 (append)  → prior with known totals
+    ///   snapshot-2 (COW upd) → summary built via finalize_snapshot_summary
+    ///   snapshot-3 (append)  → must still carry forward totals from snapshot-2
+    #[test]
+    fn cow_update_summary_carry_chain_not_poisoned() {
+        // Step 1: prior snapshot after an append with known totals.
+        let prior = prior_summary(
+            /*total_data_files=*/ 2, /*total_records=*/ 20,
+            /*total_files_size=*/ 2048,
+        );
+
+        // Step 2: build the COW UPDATE summary — deletes 1 old file (10 rows)
+        // and adds 1 new file (8 rows).
+        let mut cow_props = HashMap::new();
+        cow_props.insert("added-data-files".to_string(), "1".to_string());
+        cow_props.insert("added-records".to_string(), "8".to_string());
+        cow_props.insert("added-files-size".to_string(), "512".to_string());
+        cow_props.insert("deleted-data-files".to_string(), "1".to_string());
+        cow_props.insert("deleted-records".to_string(), "10".to_string());
+        cow_props.insert("removed-files-size".to_string(), "1024".to_string());
+
+        let cow_summary_props = finalize_snapshot_summary(cow_props, Some(&prior), false);
+
+        // Verify the COW UPDATE snapshot itself carries totals.
+        assert_eq!(
+            cow_summary_props
+                .get("total-data-files")
+                .map(String::as_str),
+            Some("2"), // 2 - 1 + 1 = 2
+            "COW UPDATE total-data-files must be carried forward"
+        );
+        assert_eq!(
+            cow_summary_props.get("total-records").map(String::as_str),
+            Some("18"), // 20 - 10 + 8 = 18
+            "COW UPDATE total-records must be carried forward"
+        );
+        assert_eq!(
+            cow_summary_props.get("engine-name").map(String::as_str),
+            Some("novarocks"),
+            "engine-name must be stamped on COW UPDATE snapshot"
+        );
+
+        // Step 3: simulate a next append (adding 5 new rows / 1 file).
+        // This is the chain-poison regression: if cow_summary_props were empty,
+        // finalize_snapshot_summary here would return early and omit totals.
+        let cow_summary = Summary {
+            operation: Operation::Overwrite,
+            additional_properties: cow_summary_props,
+        };
+        let mut next_props = HashMap::new();
+        next_props.insert("added-data-files".to_string(), "1".to_string());
+        next_props.insert("added-records".to_string(), "5".to_string());
+        next_props.insert("added-files-size".to_string(), "256".to_string());
+
+        let next_summary_props = finalize_snapshot_summary(next_props, Some(&cow_summary), false);
+
+        assert_eq!(
+            next_summary_props
+                .get("total-data-files")
+                .map(String::as_str),
+            Some("3"), // 2 + 1 = 3
+            "post-COW-update append total-data-files must be present (chain NOT poisoned)"
+        );
+        assert_eq!(
+            next_summary_props.get("total-records").map(String::as_str),
+            Some("23"), // 18 + 5 = 23
+            "post-COW-update append total-records must be present (chain NOT poisoned)"
+        );
     }
 
     fn cow_rewrite() -> CowUpdateRewriteSet {
