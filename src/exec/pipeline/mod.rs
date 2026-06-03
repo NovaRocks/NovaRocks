@@ -24,6 +24,7 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+pub mod async_sink;
 pub mod blocked_driver_poller;
 pub mod builder;
 pub mod chunk_buffer_memory_manager;
