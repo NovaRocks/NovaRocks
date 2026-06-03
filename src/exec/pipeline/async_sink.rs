@@ -190,7 +190,11 @@ impl<B: AsyncSinkBackend> Operator for AsyncSinkOperator<B> {
     }
 
     fn is_finished(&self) -> bool {
-        self.shared.finished.load(Ordering::Acquire)
+        // "No more input needed": true once finishing was requested, or once the
+        // background fully completed / errored / was canceled. Together with
+        // pending_finish() this lets the driver enter DriverState::PendingFinish
+        // during the async tail and reach Finished only after it clears.
+        self.finishing || self.shared.finished.load(Ordering::Acquire)
     }
 
     fn pending_finish(&self) -> bool {
@@ -369,7 +373,10 @@ mod tests {
         op.set_finishing(&state).expect("finish");
 
         assert!(
-            poll_until(|| op.is_finished(), Duration::from_secs(5)),
+            poll_until(
+                || op.is_finished() && !op.pending_finish(),
+                Duration::from_secs(5)
+            ),
             "sink did not finish"
         );
         assert_eq!(chunks.load(Ordering::Acquire), 5);
@@ -407,7 +414,10 @@ mod tests {
 
         op.set_finishing(&state).expect("finish");
         assert!(
-            poll_until(|| op.is_finished(), Duration::from_secs(5)),
+            poll_until(
+                || op.is_finished() && !op.pending_finish(),
+                Duration::from_secs(5)
+            ),
             "sink did not finish"
         );
     }
@@ -428,11 +438,17 @@ mod tests {
             poll_until(|| op.pending_finish(), Duration::from_secs(1)),
             "expected pending_finish during async finish"
         );
-        assert!(!op.is_finished(), "must not be finished mid-finish");
+        assert!(
+            op.take_output().is_none(),
+            "output must not be ready mid-finish"
+        );
 
         // After finish completes, pending_finish clears and is_finished is true.
         assert!(
-            poll_until(|| op.is_finished(), Duration::from_secs(5)),
+            poll_until(
+                || op.is_finished() && !op.pending_finish(),
+                Duration::from_secs(5)
+            ),
             "sink did not finish"
         );
         assert!(
