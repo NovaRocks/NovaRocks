@@ -51,7 +51,8 @@ use super::action::{CommitCtx, IcebergCommitAction};
 use super::data_file::clone_data_file_with_first_row_id;
 use super::fast_append::register_puffin_stats;
 use super::helpers::{
-    effective_next_row_id, generate_snapshot_id, metadata_dir, now_ms, write_manifest_list,
+    effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms,
+    write_manifest_list,
 };
 use super::overwrite::{
     write_added_data_manifest, write_overwrite_deletes_manifest, write_truncate_deletes_manifest,
@@ -453,10 +454,10 @@ impl TransactionAction for OverwritePartitionsTxnAction {
         //    first-row-id for V3).
         let summary = Summary {
             operation: Operation::Overwrite,
-            additional_properties: overwrite_partitions_summary(
-                &self.written,
-                &deleted_data,
-                &deleted_deletes,
+            additional_properties: finalize_snapshot_summary(
+                overwrite_partitions_summary(&self.written, &deleted_data, &deleted_deletes),
+                m.current_snapshot().map(|s| s.summary()),
+                false,
             ),
         };
         let snapshot = if let Some(first_row_id) = self.row_lineage_first_row_id {
@@ -715,13 +716,24 @@ fn overwrite_partitions_summary(
         .filter(|(df, _, _)| df.content_type() == DataContentType::EqualityDeletes)
         .count();
 
+    let removed_position_deletes: u64 = deleted_deletes
+        .iter()
+        .filter(|(df, _, _)| df.content_type() == DataContentType::PositionDeletes)
+        .map(|(df, _, _)| df.record_count())
+        .sum();
+    let removed_equality_deletes: u64 = deleted_deletes
+        .iter()
+        .filter(|(df, _, _)| df.content_type() == DataContentType::EqualityDeletes)
+        .map(|(df, _, _)| df.record_count())
+        .sum();
+
     let mut p = HashMap::new();
     p.insert("replace-partitions".to_string(), "true".to_string());
     p.insert("added-data-files".to_string(), written.len().to_string());
     p.insert("added-records".to_string(), added_records.to_string());
     p.insert("added-files-size".to_string(), added_files_size.to_string());
     p.insert(
-        "removed-data-files".to_string(),
+        "deleted-data-files".to_string(),
         deleted_data.len().to_string(),
     );
     p.insert("deleted-records".to_string(), deleted_records.to_string());
@@ -736,6 +748,18 @@ fn overwrite_partitions_summary(
     p.insert(
         "removed-equality-delete-files".to_string(),
         removed_equality_delete_files.to_string(),
+    );
+    p.insert(
+        "removed-delete-files".to_string(),
+        deleted_deletes.len().to_string(),
+    );
+    p.insert(
+        "removed-position-deletes".to_string(),
+        removed_position_deletes.to_string(),
+    );
+    p.insert(
+        "removed-equality-deletes".to_string(),
+        removed_equality_deletes.to_string(),
     );
     p
 }
@@ -805,7 +829,11 @@ mod tests {
         );
         assert_eq!(p.get("added-data-files").map(String::as_str), Some("0"));
         assert_eq!(p.get("added-records").map(String::as_str), Some("0"));
-        assert_eq!(p.get("removed-data-files").map(String::as_str), Some("0"));
+        assert_eq!(p.get("deleted-data-files").map(String::as_str), Some("0"));
+        assert!(
+            p.get("removed-data-files").is_none(),
+            "removed-data-files must be absent; use deleted-data-files instead"
+        );
         assert_eq!(p.get("deleted-records").map(String::as_str), Some("0"));
     }
 
@@ -995,7 +1023,16 @@ mod tests {
             Some("true")
         );
         assert_eq!(p.get("added-data-files").map(String::as_str), Some("1"));
-        assert_eq!(p.get("removed-data-files").map(String::as_str), Some("2"));
+        assert_eq!(p.get("deleted-data-files").map(String::as_str), Some("2"));
+        assert!(
+            p.get("removed-data-files").is_none(),
+            "removed-data-files must be absent; use deleted-data-files instead"
+        );
+        assert_eq!(
+            p.get("engine-name").map(String::as_str),
+            Some("novarocks"),
+            "engine-name must be stamped by finalize_snapshot_summary"
+        );
     }
 
     /// A base file under a historical partition spec (spec_id != current)
