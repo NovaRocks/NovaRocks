@@ -274,6 +274,8 @@ mod tests {
 
     use crate::common::ids::SlotId;
     use crate::exec::chunk::ChunkSchema;
+    use crate::exec::pipeline::driver::{DriverState, PipelineDriver};
+    use crate::exec::pipeline::operator::BlockedReason;
     use crate::runtime::runtime_state::RuntimeState;
 
     fn make_chunk(rows: usize) -> Chunk {
@@ -530,5 +532,124 @@ mod tests {
             0,
             "aborted in-flight write must not have completed"
         );
+    }
+
+    /// Source operator that emits `remaining` chunks then finishes.
+    struct TestSource {
+        remaining: usize,
+        finished: bool,
+    }
+
+    impl TestSource {
+        fn new(n: usize) -> Self {
+            Self {
+                remaining: n,
+                finished: false,
+            }
+        }
+    }
+
+    impl Operator for TestSource {
+        fn name(&self) -> &str {
+            "test_source"
+        }
+        fn is_finished(&self) -> bool {
+            self.finished
+        }
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for TestSource {
+        fn need_input(&self) -> bool {
+            false
+        }
+        fn has_output(&self) -> bool {
+            self.remaining > 0
+        }
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+            Err("source does not accept input".to_string())
+        }
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            if self.remaining == 0 {
+                self.finished = true;
+                return Ok(None);
+            }
+            self.remaining -= 1;
+            if self.remaining == 0 {
+                self.finished = true;
+            }
+            Ok(Some(make_chunk(1)))
+        }
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            self.finished = true;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn driver_parks_on_output_full_and_pending_finish_then_finishes() {
+        let runtime_state = Arc::new(RuntimeState::default());
+
+        // gate starts closed so the sink saturates and the driver must block.
+        let (mut backend, _rows, _chunks) = TestAsyncSink::new(0);
+        backend.finish_delay = Duration::from_millis(150);
+        let gate = Arc::clone(&backend.gate);
+        let mut sink = AsyncSinkOperator::new("driver_sink", backend, 2);
+        // A directly-constructed PipelineDriver does NOT call bind_runtime_state
+        // (only the pipeline builder does). Bind here — with the SAME RuntimeState
+        // the driver uses — so the sink's drain task spawns; otherwise the queue
+        // never drains and the driver would hang on OutputFull forever.
+        sink.bind_runtime_state(&runtime_state).expect("bind sink");
+
+        let driver_state = Arc::clone(&runtime_state);
+        let mut driver = PipelineDriver::new(
+            1,
+            vec![Box::new(TestSource::new(6)), Box::new(sink)],
+            None,
+            Vec::new(),
+            driver_state,
+            None,
+        );
+
+        // Drive until the sink reports OutputFull (queue saturated, gate closed).
+        let mut saw_output_full = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let st = driver.process(Duration::from_millis(10));
+            if matches!(st, DriverState::Blocked(BlockedReason::OutputFull)) {
+                saw_output_full = true;
+                break;
+            }
+            if matches!(st, DriverState::Failed(_) | DriverState::Finished) {
+                break;
+            }
+        }
+        assert!(saw_output_full, "driver never parked on OutputFull");
+
+        // Release the gate; keep driving. We must observe PendingFinish then Finished.
+        gate.add_permits(1_000);
+        let mut saw_pending_finish = false;
+        let mut finished = false;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            let st = driver.process(Duration::from_millis(10));
+            match st {
+                DriverState::PendingFinish => saw_pending_finish = true,
+                DriverState::Finished => {
+                    finished = true;
+                    break;
+                }
+                DriverState::Failed(e) => panic!("driver failed: {e}"),
+                _ => {}
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(saw_pending_finish, "driver never entered PendingFinish");
+        assert!(finished, "driver did not reach Finished");
     }
 }
