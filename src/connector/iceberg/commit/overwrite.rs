@@ -55,7 +55,8 @@ use super::abort::AbortLog;
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
 use super::fast_append::register_puffin_stats;
 use super::helpers::{
-    effective_next_row_id, generate_snapshot_id, metadata_dir, now_ms, write_manifest_list,
+    effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms,
+    write_manifest_list,
 };
 use super::types::{CommitOutcome, IcebergWriteMode, WrittenFile};
 use crate::connector::iceberg::stats_assembler::CommitType;
@@ -196,7 +197,11 @@ impl TransactionAction for OverwriteTxnAction {
         }
 
         let additional_properties = merge_snapshot_summary_properties(
-            overwrite_summary(&self.written, &existing),
+            finalize_snapshot_summary(
+                overwrite_summary(&self.written, &existing),
+                m.current_snapshot().map(|s| s.summary()),
+                false,
+            ),
             &self.snapshot_properties,
         )
         .map_err(to_iceberg_unexpected)?;
@@ -636,6 +641,14 @@ fn overwrite_summary(
             .sum::<u64>()
             .to_string(),
     );
+    p.insert(
+        "removed-files-size".to_string(),
+        deleted
+            .iter()
+            .map(|(df, _, _)| df.file_size_in_bytes())
+            .sum::<u64>()
+            .to_string(),
+    );
     p
 }
 
@@ -695,6 +708,45 @@ mod enumerate_tests {
             .identifier(ident)
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn overwrite_summary_includes_removed_files_size_and_finalizes_totals() {
+        use super::super::helpers::finalize_snapshot_summary;
+        use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct};
+
+        let mut builder = DataFileBuilder::default();
+        builder
+            .content(DataContentType::Data)
+            .file_path("s3://bucket/old.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .record_count(10u64)
+            .file_size_in_bytes(512u64);
+        let df = builder.build().unwrap();
+        let deleted = vec![(df, 1i64, None)];
+
+        let raw = overwrite_summary(&[], &deleted);
+        assert_eq!(
+            raw.get("removed-files-size").map(String::as_str),
+            Some("512")
+        );
+
+        // First snapshot: no previous summary.
+        let finalized = finalize_snapshot_summary(raw, None, false);
+        assert_eq!(
+            finalized.get("total-data-files").map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            finalized.get("total-records").map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            finalized.get("engine-name").map(String::as_str),
+            Some("novarocks")
+        );
     }
 
     #[tokio::test]
