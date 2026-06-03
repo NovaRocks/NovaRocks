@@ -87,5 +87,6 @@ pub use validation::{
     ensure_column_id_not_regressed, ensure_equality_delete_single_partition_spec,
     ensure_iceberg_write_supported, ensure_no_equality_deletes,
     ensure_no_variant_columns_for_row_level_mutation, ensure_overwrite_single_partition_spec,
-    ensure_single_partition_spec, match_select_schema_to_table, select_iceberg_update_mode,
+    ensure_partition_id_not_regressed, ensure_single_partition_spec,
+    match_select_schema_to_table, select_iceberg_update_mode,
 };

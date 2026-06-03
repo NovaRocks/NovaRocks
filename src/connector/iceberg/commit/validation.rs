@@ -139,6 +139,20 @@ pub fn ensure_no_variant_in_sort_order(table: &Table) -> Result<(), String> {
     Ok(())
 }
 
+/// Fail-fast guard: after a partition-spec evolution commit, the reloaded
+/// table's `last-partition-id` must not have regressed. iceberg-rust assigns
+/// partition field ids during `AddSpec`; this asserts the committed result
+/// preserved monotonicity (catalog round-trip sanity).
+pub fn ensure_partition_id_not_regressed(previous: i32, reloaded: i32) -> Result<(), String> {
+    if reloaded < previous {
+        return Err(format!(
+            "iceberg partition-spec evolution regressed last-partition-id from {previous} to \
+             {reloaded}; partition field ids must be monotonically increasing"
+        ));
+    }
+    Ok(())
+}
+
 /// Fail-fast guard: the new schema's `last-column-id` high-watermark must not
 /// regress below the table's current value. Iceberg requires this id be
 /// monotonically increasing; a regression would corrupt field-id assignment.
@@ -351,6 +365,14 @@ fn arrow_iceberg_types_compatible(
 mod tests {
     use super::super::types::NOVAROCKS_UPDATE_MODE_MOR;
     use super::*;
+
+    #[test]
+    fn partition_id_monotonic_ok_and_regression_fails() {
+        assert!(super::ensure_partition_id_not_regressed(1000, 1001).is_ok());
+        assert!(super::ensure_partition_id_not_regressed(1000, 1000).is_ok());
+        let err = super::ensure_partition_id_not_regressed(1001, 1000).unwrap_err();
+        assert!(err.contains("last-partition-id"), "got: {err}");
+    }
 
     #[test]
     fn column_id_monotonic_ok_and_regression_fails() {

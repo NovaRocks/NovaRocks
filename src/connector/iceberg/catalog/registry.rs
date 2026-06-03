@@ -595,6 +595,7 @@ pub(crate) fn alter_partition_spec(
         .map_err(|e| format!("load iceberg table {ident}: {e}"))?;
     let metadata = table.metadata();
     let base_default_spec_id = metadata.default_partition_spec_id();
+    let prev_last_partition_id = metadata.last_partition_id();
     let schema = metadata.current_schema();
     let current = metadata.default_partition_spec();
     let change = match &stmt {
@@ -623,9 +624,13 @@ pub(crate) fn alter_partition_spec(
             TableUpdate::SetDefaultSpec { spec_id: -1 },
         ])
         .build();
-    block_on_iceberg(async { catalog.update_table(commit).await })
+    let updated = block_on_iceberg(async { catalog.update_table(commit).await })
         .map_err(|e| format!("alter iceberg partition spec runtime failed: {e}"))?
         .map_err(|e| format!("alter iceberg partition spec failed: {e}"))?;
+    crate::connector::iceberg::commit::ensure_partition_id_not_regressed(
+        prev_last_partition_id,
+        updated.metadata().last_partition_id(),
+    )?;
     entry.invalidate_table_cache(namespace_name, &table_name);
     Ok(())
 }
