@@ -2135,7 +2135,24 @@ fn build_iceberg_metadata_payload(
             };
             build_iceberg_partitions_payload(files).map(Some)
         }
-        _ => Ok(None),
+        IcebergMetadataTableType::Files
+        | IcebergMetadataTableType::Manifests
+        | IcebergMetadataTableType::LogicalIcebergMetadata => {
+            let table_info = iceberg_table_info(storage).ok_or_else(|| {
+                "iceberg files/manifests/entries metadata table requires iceberg table identity"
+                    .to_string()
+            })?;
+            table_info
+                .serialized_metadata_rows
+                .clone()
+                .map(Some)
+                .ok_or_else(|| {
+                    "iceberg metadata rows were not resolved at catalog lookup time".to_string()
+                })
+        }
+        IcebergMetadataTableType::Snapshots
+        | IcebergMetadataTableType::History
+        | IcebergMetadataTableType::Refs => Ok(None),
     }
 }
 
