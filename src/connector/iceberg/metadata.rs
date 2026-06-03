@@ -470,23 +470,17 @@ fn build_snapshot_array(
         // Serialize as a JSON object string so that the column matches the
         // Utf8 type the analyzer advertises, enabling LIKE / string operations.
         // Example: {"added-data-files":"1","engine-name":"novarocks",...}
+        // Keys/values are escaped via serde_json to handle embedded quotes or
+        // backslashes in arbitrary summary values.
         "summary" => Ok(Arc::new(StringArray::from(
             rows.iter()
                 .map(|r| {
                     r.summary.as_ref().map(|pairs| {
-                        let mut s = String::from("{");
-                        for (i, (k, v)) in pairs.iter().enumerate() {
-                            if i > 0 {
-                                s.push(',');
-                            }
-                            s.push('"');
-                            s.push_str(k);
-                            s.push_str("\":\"");
-                            s.push_str(v);
-                            s.push('"');
-                        }
-                        s.push('}');
-                        s
+                        let map: serde_json::Map<String, serde_json::Value> = pairs
+                            .iter()
+                            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                            .collect();
+                        serde_json::Value::Object(map).to_string()
                     })
                 })
                 .collect::<Vec<_>>(),
