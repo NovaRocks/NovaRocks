@@ -54,7 +54,9 @@ use uuid::Uuid;
 
 use super::abort::AbortLog;
 use super::action::{CommitCtx, IcebergCommitAction};
-use super::helpers::{generate_snapshot_id, metadata_dir, now_ms, write_manifest_list};
+use super::helpers::{
+    finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms, write_manifest_list,
+};
 use super::overwrite::{
     enumerate_live_all_files, write_overwrite_deletes_manifest, write_truncate_deletes_manifest,
 };
@@ -242,7 +244,11 @@ impl TransactionAction for TruncateTxnAction {
         //    "no new row ids consumed" while still satisfying the validator.
         let summary = Summary {
             operation: Operation::Delete,
-            additional_properties: truncate_summary(&data_entries, &delete_entries),
+            additional_properties: finalize_snapshot_summary(
+                truncate_summary(&data_entries, &delete_entries),
+                m.current_snapshot().map(|s| s.summary()),
+                true,
+            ),
         };
         let snapshot_builder = Snapshot::builder()
             .with_snapshot_id(new_snapshot_id)
@@ -358,8 +364,6 @@ fn truncate_summary(
         "removed-files-size".to_string(),
         removed_files_size.to_string(),
     );
-    // After TRUNCATE every row is gone, so total-records is 0.
-    p.insert("total-records".to_string(), "0".to_string());
     p
 }
 
@@ -419,7 +423,11 @@ mod tests {
         assert_eq!(s["removed-delete-files"], "0");
         assert_eq!(s["removed-position-delete-files"], "0");
         assert_eq!(s["removed-equality-delete-files"], "0");
-        assert_eq!(s["total-records"], "0");
+        // total-records is now set by finalize_snapshot_summary (truncate_full_table=true), not here.
+        assert!(
+            !s.contains_key("total-records"),
+            "truncate_summary must not emit total-records; finalize_snapshot_summary owns it"
+        );
     }
 
     #[test]
@@ -447,7 +455,8 @@ mod tests {
         assert_eq!(s["removed-files-size"], "450");
         // Pinned even on non-empty input — TRUNCATE never adds anything.
         assert_eq!(s["added-data-files"], "0");
-        assert_eq!(s["total-records"], "0");
+        // total-records is now set by finalize_snapshot_summary (truncate_full_table=true), not here.
+        assert!(!s.contains_key("total-records"));
     }
 
     fn test_entry(
@@ -609,6 +618,22 @@ mod tests {
             p.get("deleted-records").map(String::as_str),
             Some("30"),
             "deleted-records should equal sum of record_count across data entries"
+        );
+        // finalize_snapshot_summary with truncate_full_table=true must reset all total-* to 0.
+        assert_eq!(
+            p.get("total-records").map(String::as_str),
+            Some("0"),
+            "total-records must be reset to 0 by finalize_snapshot_summary on truncate"
+        );
+        assert_eq!(
+            p.get("total-data-files").map(String::as_str),
+            Some("0"),
+            "total-data-files must be reset to 0 on truncate"
+        );
+        assert_eq!(
+            p.get("engine-name").map(String::as_str),
+            Some("novarocks"),
+            "engine-name must be stamped by finalize_snapshot_summary"
         );
 
         // Re-enumerate the post-truncate snapshot and confirm zero live files.
