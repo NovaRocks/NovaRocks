@@ -1301,7 +1301,13 @@ Add to the `tests` module:
         let (mut backend, _rows, _chunks) = TestAsyncSink::new(0);
         backend.finish_delay = Duration::from_millis(150);
         let gate = Arc::clone(&backend.gate);
-        let sink = AsyncSinkOperator::new("driver_sink", backend, 2);
+        let mut sink = AsyncSinkOperator::new("driver_sink", backend, 2);
+        // NOTE: a directly-constructed PipelineDriver does NOT call
+        // bind_runtime_state on its operators (only the pipeline builder does,
+        // pipeline.rs:116). Bind the sink here — with the SAME RuntimeState the
+        // driver uses — so its background drain task spawns. Without this the
+        // queue never drains and the driver would hang on OutputFull forever.
+        sink.bind_runtime_state(&runtime_state).expect("bind sink");
 
         let driver_state = Arc::clone(&runtime_state);
         let mut driver = PipelineDriver::new(
