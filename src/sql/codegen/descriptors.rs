@@ -316,6 +316,7 @@ mod tests {
             location: "file:///warehouse/orders".to_string(),
             schema,
             serialized_metadata: None,
+            serialized_metadata_rows: None,
         }
     }
 

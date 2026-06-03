@@ -222,6 +222,7 @@ mod tests {
             location: "file:///tmp/ice/db/b".to_string(),
             schema: IcebergSchemaDef { fields: Vec::new() },
             serialized_metadata: None,
+            serialized_metadata_rows: None,
         }
     }
 

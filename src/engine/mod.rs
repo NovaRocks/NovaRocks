@@ -4045,6 +4045,7 @@ path = "{metadata_path}"
                     location: "memory://ice/db/parted".to_string(),
                     schema: crate::sql::catalog::IcebergSchemaDef { fields: vec![] },
                     serialized_metadata: None,
+                    serialized_metadata_rows: None,
                 };
                 Ok(crate::sql::catalog::TableDef {
                     name: table.table.clone(),
@@ -4958,6 +4959,7 @@ enable_path_style_access = true
                                 ],
                             },
                             serialized_metadata: None,
+                            serialized_metadata_rows: None,
                         },
                         files: Vec::new(),
                         cloud_properties: Default::default(),

@@ -4844,6 +4844,7 @@ mod tests {
             location: "file:///tmp/test_table".to_string(),
             schema: IcebergSchemaDef { fields },
             serialized_metadata: None,
+            serialized_metadata_rows: None,
         }
     }
 
@@ -7656,6 +7657,7 @@ mod tests {
             location: "s3://b/t".to_string(),
             schema: IcebergSchemaDef { fields: vec![] },
             serialized_metadata: None,
+            serialized_metadata_rows: None,
         };
         let plan = PhysicalPlanNode {
             op: Operator::PhysicalScan(PhysicalScanOp {

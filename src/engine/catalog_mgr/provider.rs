@@ -175,6 +175,7 @@ mod tests {
             location: "s3://warehouse/db/orders".to_string(),
             schema: IcebergSchemaDef { fields: vec![] },
             serialized_metadata: None,
+            serialized_metadata_rows: None,
         }
     }
 

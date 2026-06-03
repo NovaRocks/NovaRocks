@@ -537,6 +537,7 @@ mod tests {
                         location: format!("file:///tmp/ice/db/{name}"),
                         schema: IcebergSchemaDef { fields: Vec::new() },
                         serialized_metadata: None,
+                        serialized_metadata_rows: None,
                     },
                     files: Vec::new(),
                     cloud_properties: BTreeMap::new(),

@@ -168,6 +168,7 @@ mod tests {
                         location: "s3://w/t".to_string(),
                         schema: IcebergSchemaDef { fields: vec![] },
                         serialized_metadata: None,
+                        serialized_metadata_rows: None,
                     },
                     files: vec![],
                     cloud_properties: Default::default(),

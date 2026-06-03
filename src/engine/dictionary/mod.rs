@@ -616,6 +616,7 @@ mod tests {
             location: "file:///tmp/test_table".to_string(),
             schema: IcebergSchemaDef { fields: vec![] },
             serialized_metadata: None,
+            serialized_metadata_rows: None,
         };
         let table = TableDef {
             name: "test_table".to_string(),
@@ -704,6 +705,7 @@ mod tests {
             location: "file:///tmp/test_table".to_string(),
             schema: IcebergSchemaDef { fields: vec![] },
             serialized_metadata: None,
+            serialized_metadata_rows: None,
         };
         let table = TableDef {
             name: "test_table".to_string(),

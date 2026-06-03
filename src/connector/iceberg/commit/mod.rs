@@ -45,7 +45,7 @@ mod row_delta_dv;
 mod run;
 pub mod snapshot_lifecycle_helpers;
 #[cfg(test)]
-mod test_helpers;
+pub(crate) mod test_helpers;
 mod truncate;
 mod types;
 mod update_cow;

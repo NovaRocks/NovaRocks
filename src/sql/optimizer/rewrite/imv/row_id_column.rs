@@ -132,6 +132,7 @@ mod tests {
                         location: "file:///tmp/ice/db/b".to_string(),
                         schema: IcebergSchemaDef { fields: Vec::new() },
                         serialized_metadata: None,
+                        serialized_metadata_rows: None,
                     },
                     from_snapshot_id: 11,
                     to_snapshot_id: 22,

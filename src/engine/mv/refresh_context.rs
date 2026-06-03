@@ -2039,6 +2039,7 @@ mod tests {
             location: String::new(),
             schema: IcebergSchemaDef { fields: Vec::new() },
             serialized_metadata: None,
+            serialized_metadata_rows: None,
         };
 
         let err = ctx

@@ -188,6 +188,7 @@ mod scan_planning_registry_tests {
                     location: "s3://bucket/t".to_string(),
                     schema: crate::sql::catalog::IcebergSchemaDef { fields: vec![] },
                     serialized_metadata: None,
+                    serialized_metadata_rows: None,
                 },
                 vec!["id".to_string()],
             );

@@ -147,6 +147,7 @@ mod tests {
             location: "s3://w/t".to_string(),
             schema: IcebergSchemaDef { fields: vec![] },
             serialized_metadata: Some("{\"format-version\":2}".to_string()),
+            serialized_metadata_rows: None,
         }
     }
 
