@@ -309,6 +309,8 @@ pub(crate) fn sink_io_max_blocking_threads() -> usize {
         .unwrap_or(16)
 }
 
+// Consumed when the async sink operator is constructed in production (IW-3 cutover).
+#[allow(dead_code)]
 pub(crate) fn async_sink_queue_capacity() -> usize {
     novarocks_app_config()
         .ok()
