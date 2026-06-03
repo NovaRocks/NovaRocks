@@ -1200,6 +1200,7 @@ pub(crate) fn analyze_mv_select(
     current_database: &str,
     query: &sqlparser::ast::Query,
 ) -> Result<MvAnalysis, String> {
+    validate_mv_select_raw_query_clauses(query)?;
     let resolved_refs = collect_table_refs_from_query(query, current_catalog, current_database);
     let mut analyzed_query = query.clone();
     register_iceberg_tables_for_mv_analysis(state, &resolved_refs)?;
@@ -1221,6 +1222,202 @@ pub(crate) fn analyze_mv_select(
         output_columns,
         resolved_query: resolved,
     })
+}
+
+fn validate_mv_select_raw_query_clauses(query: &sqlparser::ast::Query) -> Result<(), String> {
+    if query.with.is_some() {
+        return Err(unsupported_mv_query_clause("WITH"));
+    }
+    if query.order_by.is_some() {
+        return Err(unsupported_mv_query_clause("ORDER BY"));
+    }
+    if query.limit_clause.is_some() {
+        return Err(unsupported_mv_query_clause("LIMIT or OFFSET"));
+    }
+    if query.fetch.is_some() {
+        return Err(unsupported_mv_query_clause("FETCH"));
+    }
+    if !query.locks.is_empty() {
+        return Err(unsupported_mv_query_clause("locking clauses"));
+    }
+    if query.for_clause.is_some() {
+        return Err(unsupported_mv_query_clause("FOR clauses"));
+    }
+    if query.settings.is_some() {
+        return Err(unsupported_mv_query_clause("SETTINGS"));
+    }
+    if query.format_clause.is_some() {
+        return Err(unsupported_mv_query_clause("FORMAT"));
+    }
+    if !query.pipe_operators.is_empty() {
+        return Err(unsupported_mv_query_clause("pipe operators"));
+    }
+    validate_mv_select_raw_clauses_in_set_expr(query.body.as_ref())
+}
+
+fn validate_mv_select_raw_clauses_in_set_expr(
+    expr: &sqlparser::ast::SetExpr,
+) -> Result<(), String> {
+    match expr {
+        sqlparser::ast::SetExpr::Select(select) => {
+            validate_mv_select_raw_select_clauses(select)?;
+            for from in &select.from {
+                validate_mv_select_raw_clauses_in_table_with_joins(from)?;
+            }
+            Ok(())
+        }
+        sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
+            validate_mv_select_raw_clauses_in_set_expr(left.as_ref())?;
+            validate_mv_select_raw_clauses_in_set_expr(right.as_ref())
+        }
+        sqlparser::ast::SetExpr::Query(query) => validate_mv_select_raw_query_clauses(query),
+        sqlparser::ast::SetExpr::Values(_)
+        | sqlparser::ast::SetExpr::Insert(_)
+        | sqlparser::ast::SetExpr::Update(_)
+        | sqlparser::ast::SetExpr::Delete(_)
+        | sqlparser::ast::SetExpr::Merge(_)
+        | sqlparser::ast::SetExpr::Table(_) => Ok(()),
+    }
+}
+
+fn validate_mv_select_raw_select_clauses(select: &sqlparser::ast::Select) -> Result<(), String> {
+    if select.select_modifiers.is_some() {
+        return Err(unsupported_mv_select_clause("SELECT modifiers"));
+    }
+    if select.top.is_some() {
+        return Err(unsupported_mv_select_clause("TOP"));
+    }
+    if select.exclude.is_some() {
+        return Err(unsupported_mv_select_clause("EXCLUDE"));
+    }
+    if select.into.is_some() {
+        return Err(unsupported_mv_select_clause("SELECT INTO"));
+    }
+    if !select.lateral_views.is_empty() {
+        return Err(unsupported_mv_select_clause("LATERAL VIEW"));
+    }
+    if select.prewhere.is_some() {
+        return Err(unsupported_mv_select_clause("PREWHERE"));
+    }
+    if !select.connect_by.is_empty() {
+        return Err(unsupported_mv_select_clause("CONNECT BY"));
+    }
+    if !select.cluster_by.is_empty() {
+        return Err(unsupported_mv_select_clause("CLUSTER BY"));
+    }
+    if !select.distribute_by.is_empty() {
+        return Err(unsupported_mv_select_clause("DISTRIBUTE BY"));
+    }
+    if !select.sort_by.is_empty() {
+        return Err(unsupported_mv_select_clause("SORT BY"));
+    }
+    if !select.named_window.is_empty() {
+        return Err(unsupported_mv_select_clause("named WINDOW clauses"));
+    }
+    if select.qualify.is_some() {
+        return Err(unsupported_mv_select_clause("QUALIFY"));
+    }
+    if select.value_table_mode.is_some() {
+        return Err(unsupported_mv_select_clause("SELECT AS VALUE or STRUCT"));
+    }
+    Ok(())
+}
+
+fn validate_mv_select_raw_clauses_in_table_with_joins(
+    table: &sqlparser::ast::TableWithJoins,
+) -> Result<(), String> {
+    validate_mv_select_raw_clauses_in_factor(&table.relation)?;
+    for join in &table.joins {
+        validate_mv_select_raw_clauses_in_factor(&join.relation)?;
+    }
+    Ok(())
+}
+
+fn validate_mv_select_raw_clauses_in_factor(
+    factor: &sqlparser::ast::TableFactor,
+) -> Result<(), String> {
+    match factor {
+        sqlparser::ast::TableFactor::Table {
+            args,
+            with_hints,
+            version,
+            with_ordinality,
+            partitions,
+            json_path,
+            sample,
+            index_hints,
+            ..
+        } => {
+            if args.is_some() {
+                return Err(unsupported_mv_from_clause("table function arguments"));
+            }
+            if !with_hints.is_empty() {
+                return Err(unsupported_mv_from_clause("table hints"));
+            }
+            if version.is_some() {
+                return Err(unsupported_mv_from_clause("table version qualifiers"));
+            }
+            if *with_ordinality {
+                return Err(unsupported_mv_from_clause("WITH ORDINALITY"));
+            }
+            if !partitions.is_empty() {
+                return Err(unsupported_mv_from_clause("partition selection"));
+            }
+            if json_path.is_some() {
+                return Err(unsupported_mv_from_clause("JSON path table access"));
+            }
+            if sample.is_some() {
+                return Err(unsupported_mv_from_clause("TABLESAMPLE"));
+            }
+            if !index_hints.is_empty() {
+                return Err(unsupported_mv_from_clause("index hints"));
+            }
+            Ok(())
+        }
+        sqlparser::ast::TableFactor::Derived {
+            lateral,
+            subquery,
+            sample,
+            ..
+        } => {
+            if *lateral {
+                return Err(unsupported_mv_from_clause("LATERAL derived tables"));
+            }
+            if sample.is_some() {
+                return Err(unsupported_mv_from_clause("TABLESAMPLE"));
+            }
+            validate_mv_select_raw_query_clauses(subquery)
+        }
+        sqlparser::ast::TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => validate_mv_select_raw_clauses_in_table_with_joins(table_with_joins),
+        sqlparser::ast::TableFactor::Pivot { table, .. }
+        | sqlparser::ast::TableFactor::Unpivot { table, .. }
+        | sqlparser::ast::TableFactor::MatchRecognize { table, .. } => {
+            validate_mv_select_raw_clauses_in_factor(table)
+        }
+        sqlparser::ast::TableFactor::TableFunction { .. }
+        | sqlparser::ast::TableFactor::Function { .. }
+        | sqlparser::ast::TableFactor::UNNEST { .. }
+        | sqlparser::ast::TableFactor::JsonTable { .. }
+        | sqlparser::ast::TableFactor::OpenJsonTable { .. }
+        | sqlparser::ast::TableFactor::XmlTable { .. }
+        | sqlparser::ast::TableFactor::SemanticView { .. } => {
+            Err(unsupported_mv_from_clause("table functions"))
+        }
+    }
+}
+
+fn unsupported_mv_query_clause(clause: &str) -> String {
+    format!("materialized view SELECT does not support {clause}")
+}
+
+fn unsupported_mv_select_clause(clause: &str) -> String {
+    format!("materialized view SELECT does not support {clause}")
+}
+
+fn unsupported_mv_from_clause(clause: &str) -> String {
+    format!("materialized view SELECT does not support {clause} in FROM")
 }
 
 pub(crate) fn canonicalize_iceberg_mv_select_query(
@@ -1980,6 +2177,92 @@ mod tests {
             panic!("not create mv");
         };
         stmt
+    }
+
+    fn parse_raw_query(sql: &str) -> sqlparser::ast::Query {
+        let stmt = crate::sql::parser::parse_sql_raw(sql).expect("parse raw query");
+        let sqlparser::ast::Statement::Query(query) = stmt else {
+            panic!("not a raw SELECT query");
+        };
+        *query
+    }
+
+    #[test]
+    fn mv_select_scan_clause_validation_rejects_table_version() {
+        let query = parse_raw_query("SELECT id FROM fact_east FOR VERSION AS OF 'main'");
+
+        let err = validate_mv_select_raw_query_clauses(&query)
+            .expect_err("MV analysis must reject table version qualifiers before analyzer");
+
+        assert!(
+            err.contains("table version qualifiers"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn mv_select_raw_clause_validation_rejects_query_fetch() {
+        let query = parse_raw_query("SELECT id FROM fact_east FETCH FIRST 1 ROWS ONLY");
+
+        let err = validate_mv_select_raw_query_clauses(&query)
+            .expect_err("MV analysis must reject query FETCH before analyzer");
+
+        assert!(err.contains("FETCH"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn mv_select_raw_clause_validation_rejects_prewhere() {
+        let mut query = parse_raw_query("SELECT id FROM fact_east");
+        let sqlparser::ast::SetExpr::Select(select) = query.body.as_mut() else {
+            panic!("expected SELECT");
+        };
+        select.prewhere = Some(sqlparser::ast::Expr::Identifier(
+            sqlparser::ast::Ident::new("id"),
+        ));
+
+        let err = validate_mv_select_raw_query_clauses(&query)
+            .expect_err("MV analysis must reject PREWHERE before analyzer");
+
+        assert!(err.contains("PREWHERE"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn mv_select_raw_clause_validation_rejects_named_window() {
+        let query = parse_raw_query(
+            "SELECT sum(id) OVER w AS s FROM fact_east WINDOW w AS (PARTITION BY region)",
+        );
+
+        let err = validate_mv_select_raw_query_clauses(&query)
+            .expect_err("MV analysis must reject named WINDOW before analyzer");
+
+        assert!(err.contains("WINDOW"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn mv_select_raw_clause_validation_rejects_table_args() {
+        let query = parse_raw_query("SELECT id FROM fact_east(1)");
+
+        let err = validate_mv_select_raw_query_clauses(&query)
+            .expect_err("MV analysis must reject table arguments before analyzer");
+
+        assert!(
+            err.contains("table function arguments"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn mv_select_raw_clause_validation_rejects_nested_table_version() {
+        let query =
+            parse_raw_query("SELECT id FROM (SELECT id FROM fact_east FOR VERSION AS OF 'main') d");
+
+        let err = validate_mv_select_raw_query_clauses(&query)
+            .expect_err("MV analysis must reject nested table version qualifiers before analyzer");
+
+        assert!(
+            err.contains("table version qualifiers"),
+            "unexpected error: {err}"
+        );
     }
 
     fn open_state_with_sqlite_store() -> (Arc<StandaloneState>, TempDir) {

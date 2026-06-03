@@ -10,4 +10,5 @@ pub(crate) mod lifecycle;
 pub(crate) mod partition;
 pub(crate) mod rebind;
 pub(crate) mod refresh_context;
+pub(crate) mod refresh_contract;
 pub(crate) mod schema_contract;
