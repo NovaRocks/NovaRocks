@@ -2502,10 +2502,16 @@ mod tests {
     }
 
     fn unwrap_project_input(plan: &LogicalPlan) -> &LogicalPlan {
-        match plan {
-            LogicalPlan::Project(project) => project.input.as_ref(),
-            other => other,
+        // Peel any chain of Project adapters to reach the underlying logical
+        // node. Besides the outer identity adapter, a subquery alias is now
+        // represented as a Project carrying `output_qualifier` (added by the
+        // predicate-pushdown work), so more than one Project layer may sit
+        // above the set-op.
+        let mut current = plan;
+        while let LogicalPlan::Project(project) = current {
+            current = project.input.as_ref();
         }
+        current
     }
 
     fn contains_identity_project_adapter(

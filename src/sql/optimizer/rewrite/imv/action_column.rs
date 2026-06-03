@@ -811,6 +811,7 @@ mod tests {
                     row_id,
                 ),
             ],
+            output_qualifier: None,
             required_output_columns: None,
         })
     }
@@ -835,6 +836,7 @@ mod tests {
                     row_id,
                 ),
             ],
+            output_qualifier: None,
             required_output_columns: None,
         })
     }
@@ -891,6 +893,7 @@ mod tests {
                     ColumnId(102),
                 ),
             ],
+            output_qualifier: None,
             required_output_columns: None,
         })
     }

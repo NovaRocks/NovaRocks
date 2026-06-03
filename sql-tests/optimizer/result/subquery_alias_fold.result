@@ -3,11 +3,12 @@ Explain String
 GATHER EXCHANGE stats={rows=50000}
   PROJECT [s.k AS k] stats={rows=50000}
     PROJECT [k] stats={rows=50000}
-      SCAN db_sqlt_73474ac5ba7b3917.oq6_alias_base stats={rows=50000}
-           TABLE: db_sqlt_73474ac5ba7b3917.oq6_alias_base
-           columns: k, v
-           min-max stats
-           predicates: s.v > 10
+      PROJECT [k] stats={rows=50000}
+        SCAN db_sqlt_73474ac5ba7b3917.oq6_alias_base stats={rows=50000}
+             TABLE: db_sqlt_73474ac5ba7b3917.oq6_alias_base
+             columns: k, v
+             min-max stats
+             predicates: v > 10
 
 -- query 5
 Explain String
@@ -48,7 +49,7 @@ PROJECT [count() AS count(*)] stats={rows=1}
           GATHER EXCHANGE stats={rows=45000}
             FILTER stats={rows=45000}
               predicate: w_alias.k IS NOT NULL
-              PROJECT [w_alias.k AS k, w_alias.v AS v] stats={rows=50000}
+              PROJECT [k, v] stats={rows=50000}
                 PROJECT [k, v] stats={rows=50000}
                   SCAN db_sqlt_73474ac5ba7b3917.oq6_alias_base stats={rows=50000}
                        TABLE: db_sqlt_73474ac5ba7b3917.oq6_alias_base

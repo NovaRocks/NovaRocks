@@ -1,9 +1,10 @@
 -- @tags=optimizer,oq6,subquery_alias_fold
 -- @order_sensitive=true
 -- Test Objective:
--- 1. Derived-table aliases are analysis metadata and do not appear as plan nodes.
+-- 1. Derived-table aliases are carried as an identity Project's output_qualifier
+--    (predicate-pushdown rework), not as a dedicated alias plan operator.
 -- 2. Derived-table column aliases still expose the renamed output column.
--- 3. Single-use CTE inline keeps a real join plan without an alias wrapper.
+-- 3. Single-use CTE inline keeps a real join plan (no dedicated alias operator).
 DROP TABLE IF EXISTS ${case_db}.oq6_alias_base;
 CREATE TABLE ${case_db}.oq6_alias_base (k INT, v INT);
 INSERT INTO ${case_db}.oq6_alias_base VALUES (1, 10), (2, 20), (3, 30);

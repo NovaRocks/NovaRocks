@@ -152,6 +152,7 @@ impl LogicalRewriteRule for InjectApplyKeyProjectRule {
                     crate::sql::planner::plan::ProjectNode {
                         input: Box::new(LogicalPlan::Union(u)),
                         items,
+                        output_qualifier: None,
                         required_output_columns: None,
                     },
                 )))

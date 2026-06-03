@@ -283,6 +283,7 @@ fn normalize_top_level_union_branch_output(
     LogicalPlan::Project(ProjectNode {
         input: Box::new(input),
         items,
+        output_qualifier: None,
         required_output_columns: None,
     })
 }
@@ -583,6 +584,7 @@ mod tests {
                     output_column_id: ColumnId(first_id + 1),
                 },
             ],
+            output_qualifier: None,
             required_output_columns: None,
         })
     }
