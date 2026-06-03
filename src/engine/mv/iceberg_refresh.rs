@@ -100,6 +100,16 @@ pub(crate) fn create_iceberg_mv(
         current_database,
         &canonical_select_query,
     )?;
+    let refresh_contract =
+        crate::engine::mv::refresh_contract::derive_imv_refresh_contract(&analysis)?;
+    if refresh_contract.strategy
+        == crate::engine::mv::refresh_contract::RefreshStrategy::UnsupportedBranchUnionAggregate
+    {
+        return Err(
+            "Iceberg MV UNION ALL of aggregate branches is recognized but refresh execution is not supported in this build"
+                .to_string(),
+        );
+    }
     validate_mv_partition_columns(stmt.partition_by.as_deref(), &analysis.output_columns)?;
     let created_at_ms = now_ms();
     let resolved_dependencies = crate::engine::mv::dependency::resolve_create_mv_dependencies(
@@ -9714,6 +9724,29 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    #[test]
+    fn create_b_family_union_aggregate_reports_refresh_contract_unsupported() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_aggregate_fact_table(&env.state, "ice", "sales", "t1");
+        create_aggregate_fact_table(&env.state, "ice", "sales", "t2");
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_union_agg
+             DISTRIBUTED BY HASH(region) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT region, count(*) AS c FROM ice.sales.t1 GROUP BY region
+                UNION ALL
+                SELECT region, count(*) AS c FROM ice.sales.t2 GROUP BY region",
+        );
+
+        let err = create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect_err("B-family is contract-recognized but execution-unsupported");
+
+        assert!(
+            err.contains("UNION ALL of aggregate branches"),
+            "unexpected error: {err}"
+        );
+    }
+
     // Target/acceptance test for B-family UNION ALL of aggregate branches.
     // Execution is intentionally NOT wired yet: per the 2026-06-03 IMV-v2 RFC
     // (docs/superpowers/specs/2026-06-03-iceberg-imv-v2-unified-delta-apply-engine-design.md)
@@ -11583,36 +11616,103 @@ mod tests {
     }
 
     #[test]
-    fn create_iceberg_union_all_aggregate_mv_persists_branch_contract() {
+    fn build_iceberg_union_all_aggregate_schema_contract_includes_branch_contract() {
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
         create_aggregate_fact_table(&env.state, "ice", "sales", "fact_east");
         create_aggregate_fact_table(&env.state, "ice", "sales", "fact_west");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_union_fact_region
-             DISTRIBUTED BY HASH(region) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT region, count(*) AS c, sum(amount) AS s
-                FROM ice.sales.fact_east
-                GROUP BY region
-                UNION ALL
-                SELECT region, count(*) AS c, sum(amount) AS s
-                FROM ice.sales.fact_west
-                GROUP BY region",
+        let query = parse_select_query(
+            "SELECT region, count(*) AS c, sum(amount) AS s
+             FROM ice.sales.fact_east
+             GROUP BY region
+             UNION ALL
+             SELECT region, count(*) AS c, sum(amount) AS s
+             FROM ice.sales.fact_west
+             GROUP BY region",
         );
-
-        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect("create aggregate UNION ALL iceberg mv");
-
+        let analysis = analyze_mv_select(&env.state, Some("ice"), &env.current_db, &query)
+            .expect("analyze UNION ALL aggregate query");
+        let shape = classify_incremental_mv_query(&query).expect("classify shape");
+        let IncrementalMvShape::UnionAll(union_shape) = &shape else {
+            panic!("expected UNION ALL shape, got {shape:?}");
+        };
+        let resolved_dependencies = crate::engine::mv::dependency::resolve_create_mv_dependencies(
+            &env.state,
+            &analysis.resolved_refs,
+            now_ms(),
+        )
+        .expect("resolve dependencies");
+        let loaded_bases = resolved_dependencies
+            .base_refs
+            .iter()
+            .map(|base_ref| {
+                let loaded = load_current_iceberg_base_table(&env.state, base_ref)
+                    .expect("load current base table");
+                (base_ref.clone(), loaded)
+            })
+            .collect::<Vec<_>>();
+        let first_aggregate_branch =
+            first_union_aggregate_branch(union_shape).expect("first aggregate branch");
+        let target = IcebergMvTarget {
+            catalog: "ice".to_string(),
+            namespace: "analytics".to_string(),
+            table: "mv_union_fact_region_contract".to_string(),
+        };
+        let mut columns = iceberg_aggregate_target_columns_from_resolved_query(
+            first_aggregate_branch,
+            &analysis.output_columns,
+            first_union_branch_resolved_query(&analysis.resolved_query)
+                .expect("first branch resolved query"),
+        )
+        .expect("target columns");
+        columns.push(branch_id_table_column());
         let entry = {
             let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
             catalogs.get("ice").expect("catalog")
         };
+        crate::connector::iceberg::catalog::registry::create_table(
+            &entry,
+            &target.namespace,
+            &target.table,
+            &columns,
+            None,
+            &[],
+            &[
+                ("format-version".to_string(), "3".to_string()),
+                ("write.row-lineage".to_string(), "true".to_string()),
+                (
+                    ICEBERG_MV_PROP_APPLY_KEY_COLUMN.to_string(),
+                    ICEBERG_MV_GROUP_APPLY_KEY_COLUMN.to_string(),
+                ),
+                (
+                    ICEBERG_MV_PROP_APPLY_KEY_SOURCE.to_string(),
+                    ICEBERG_MV_APPLY_KEY_SOURCE_GROUP_ROW_ID.to_string(),
+                ),
+                (
+                    ICEBERG_MV_PROP_HIDDEN_COLUMNS.to_string(),
+                    "__agg_state_c,__agg_state_s".to_string(),
+                ),
+            ],
+        )
+        .expect("create contract target table");
         let loaded = crate::connector::iceberg::catalog::load_table(
             &entry,
-            "analytics",
-            "mv_union_fact_region",
+            &target.namespace,
+            &target.table,
         )
         .expect("load union aggregate target table");
+        let actual_apply_key_field_id =
+            find_apply_key_field_id_by_column(&loaded.table, ICEBERG_MV_GROUP_APPLY_KEY_COLUMN)
+                .expect("apply-key field");
+
+        let contract = build_iceberg_mv_schema_contract(
+            &shape,
+            &analysis,
+            &loaded_bases,
+            &target,
+            &loaded,
+            actual_apply_key_field_id,
+        )
+        .expect("schema contract");
         assert_eq!(
             loaded
                 .table
@@ -11649,11 +11749,6 @@ mod tests {
             ]
         );
 
-        let contract =
-            find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_union_fact_region")
-                .expect("mv definition")
-                .schema_contract
-                .expect("schema contract");
         assert_eq!(
             contract.target.hidden_apply_key.source,
             crate::meta::repository::mv_contract::ApplyKeySource::GroupRowId
