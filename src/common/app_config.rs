@@ -1013,7 +1013,7 @@ impl ExecutionServicesConfig {
             let cores = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(1);
-            cores.min(4).max(1)
+            cores.clamp(1, 4)
         }
     }
 }
