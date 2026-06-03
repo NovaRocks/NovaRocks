@@ -1,3 +1,5 @@
+use crate::engine::StatementResult;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BaseSnapshotPolicy {
     SingleBase,
@@ -33,6 +35,25 @@ pub(crate) enum RefreshDecision {
     MetadataOnly,
     Incremental,
     FailFast { reason: String },
+}
+
+pub(crate) struct IcebergMvRefreshLifecycle;
+
+impl IcebergMvRefreshLifecycle {
+    pub(crate) fn run(
+        decision: RefreshDecision,
+        first_refresh: impl FnOnce() -> Result<StatementResult, String>,
+        metadata_only: impl FnOnce() -> Result<StatementResult, String>,
+        incremental: impl FnOnce() -> Result<StatementResult, String>,
+    ) -> Result<StatementResult, String> {
+        match decision {
+            RefreshDecision::SkipEmpty => Ok(StatementResult::Ok),
+            RefreshDecision::FirstRefresh => first_refresh(),
+            RefreshDecision::MetadataOnly => metadata_only(),
+            RefreshDecision::Incremental => incremental(),
+            RefreshDecision::FailFast { reason } => Err(reason),
+        }
+    }
 }
 
 pub(crate) fn decide_refresh(
@@ -204,6 +225,7 @@ fn fail_fast(reason: String) -> RefreshDecision {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
 
     #[test]
     fn single_base_empty_skips() {
@@ -412,5 +434,107 @@ mod tests {
         );
 
         assert_eq!(decision, RefreshDecision::Incremental);
+    }
+
+    #[test]
+    fn lifecycle_dispatches_first_refresh_closure() {
+        let calls = RefCell::new(Vec::new());
+
+        let result = IcebergMvRefreshLifecycle::run(
+            RefreshDecision::FirstRefresh,
+            || {
+                calls.borrow_mut().push("first");
+                Ok(crate::engine::StatementResult::Ok)
+            },
+            || {
+                calls.borrow_mut().push("metadata");
+                Ok(crate::engine::StatementResult::Ok)
+            },
+            || {
+                calls.borrow_mut().push("incremental");
+                Ok(crate::engine::StatementResult::Ok)
+            },
+        )
+        .expect("first refresh closure should succeed");
+
+        assert!(matches!(result, crate::engine::StatementResult::Ok));
+        assert_eq!(*calls.borrow(), vec!["first"]);
+    }
+
+    #[test]
+    fn lifecycle_dispatches_metadata_only_closure() {
+        let calls = RefCell::new(Vec::new());
+
+        let result = IcebergMvRefreshLifecycle::run(
+            RefreshDecision::MetadataOnly,
+            || {
+                calls.borrow_mut().push("first");
+                Ok(crate::engine::StatementResult::Ok)
+            },
+            || {
+                calls.borrow_mut().push("metadata");
+                Ok(crate::engine::StatementResult::Ok)
+            },
+            || {
+                calls.borrow_mut().push("incremental");
+                Ok(crate::engine::StatementResult::Ok)
+            },
+        )
+        .expect("metadata-only closure should succeed");
+
+        assert!(matches!(result, crate::engine::StatementResult::Ok));
+        assert_eq!(*calls.borrow(), vec!["metadata"]);
+    }
+
+    #[test]
+    fn lifecycle_dispatches_incremental_closure() {
+        let calls = RefCell::new(Vec::new());
+
+        let result = IcebergMvRefreshLifecycle::run(
+            RefreshDecision::Incremental,
+            || {
+                calls.borrow_mut().push("first");
+                Ok(crate::engine::StatementResult::Ok)
+            },
+            || {
+                calls.borrow_mut().push("metadata");
+                Ok(crate::engine::StatementResult::Ok)
+            },
+            || {
+                calls.borrow_mut().push("incremental");
+                Ok(crate::engine::StatementResult::Ok)
+            },
+        )
+        .expect("incremental closure should succeed");
+
+        assert!(matches!(result, crate::engine::StatementResult::Ok));
+        assert_eq!(*calls.borrow(), vec!["incremental"]);
+    }
+
+    #[test]
+    fn lifecycle_skip_empty_returns_ok_without_calling_closures() {
+        let result = IcebergMvRefreshLifecycle::run(
+            RefreshDecision::SkipEmpty,
+            || panic!("first refresh closure must not run"),
+            || panic!("metadata-only closure must not run"),
+            || panic!("incremental closure must not run"),
+        )
+        .expect("skip-empty should succeed");
+
+        assert!(matches!(result, crate::engine::StatementResult::Ok));
+    }
+
+    #[test]
+    fn lifecycle_fail_fast_returns_reason_without_calling_closures() {
+        let result = IcebergMvRefreshLifecycle::run(
+            RefreshDecision::FailFast {
+                reason: "missing snapshot".to_string(),
+            },
+            || panic!("first refresh closure must not run"),
+            || panic!("metadata-only closure must not run"),
+            || panic!("incremental closure must not run"),
+        );
+
+        assert_eq!(result.unwrap_err(), "missing snapshot");
     }
 }

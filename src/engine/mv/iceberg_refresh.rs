@@ -51,6 +51,7 @@ use crate::engine::mv::lifecycle::{
 use crate::engine::mv::rebind::rewrite_select_sql_for_rebind;
 use crate::engine::mv::refresh_context::IcebergMvRefreshContext;
 use crate::engine::mv::refresh_contract::{ApplyKeyContract, RewriteEvidence};
+use crate::engine::mv::refresh_driver::{IcebergMvRefreshLifecycle, RefreshDecision};
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::mv::{
     BeginIcebergMvRefreshRequest, CreateMvDefinitionRequest, MvRefreshFinalizeRequest,
@@ -2212,20 +2213,26 @@ fn refresh_iceberg_mv_with_planned_partitions(
     // execution so the optimizer can bind version/delta scans against the
     // refresh pin and fail fast when required rewrite evidence is missing.
 
-    match (previous_snapshot_id, current_snapshot_id) {
-        // Base table has no snapshot yet — nothing to refresh.
-        (None, None) => {
-            tracing::info!(
-                "iceberg mv {}.{}.{}: base table has no snapshot; skipping refresh",
-                target.catalog,
-                target.namespace,
-                target.table
-            );
-            Ok(StatementResult::Ok)
-        }
+    let refresh_decision = match (previous_snapshot_id, current_snapshot_id) {
+        (None, None) => RefreshDecision::SkipEmpty,
+        (None, Some(_)) => RefreshDecision::FirstRefresh,
+        (Some(prev), Some(cur)) if prev == cur => RefreshDecision::MetadataOnly,
+        (Some(_), Some(_)) => RefreshDecision::Incremental,
+        (Some(prev), None) => RefreshDecision::FailFast {
+            reason: format!(
+                "cannot refresh iceberg materialized view {}.{}.{}: \
+                 previously-refreshed base snapshot {prev} is no longer reachable",
+                target.catalog, target.namespace, target.table
+            ),
+        },
+    };
 
-        // First refresh: base table now has a snapshot but we haven't run yet.
-        (None, Some(cur)) => {
+    IcebergMvRefreshLifecycle::run(
+        refresh_decision,
+        || {
+            let Some(cur) = current_snapshot_id else {
+                return Err("invalid projection/filter MV first-refresh decision".to_string());
+            };
             let refresh_id = begin_staged_iceberg_mv_refresh_intent(
                 state,
                 &target,
@@ -2244,10 +2251,11 @@ fn refresh_iceberg_mv_with_planned_partitions(
                 &current_table_uuid,
                 &pinned_full_select_sql,
             )
-        }
-
-        // No-op: base table snapshot has not advanced.
-        (Some(prev), Some(cur)) if prev == cur => {
+        },
+        || {
+            let Some(cur) = current_snapshot_id else {
+                return Err("invalid projection/filter MV metadata-only decision".to_string());
+            };
             tracing::info!(
                 "iceberg mv {}.{}.{}: base snapshot {cur} unchanged; updating metadata only",
                 target.catalog,
@@ -2268,30 +2276,26 @@ fn refresh_iceberg_mv_with_planned_partitions(
                 target_snapshot_id,
             )?;
             Ok(StatementResult::Ok)
-        }
-
-        // Incremental: base snapshot has advanced.
-        (Some(prev), Some(cur)) => incremental_refresh_iceberg_mv(
-            state,
-            &ctx,
-            base_ref,
-            prev,
-            cur,
-            &loaded.table,
-            &current_table_uuid,
-            &pinned_full_select_sql,
-            RewriteMergeRefreshOptions {
-                apply_key: refresh_contract.apply_key,
-            },
-        ),
-
-        // Previous snapshot no longer reachable.
-        (Some(prev), None) => Err(format!(
-            "cannot refresh iceberg materialized view {}.{}.{}: \
-             previously-refreshed base snapshot {prev} is no longer reachable",
-            target.catalog, target.namespace, target.table
-        )),
-    }
+        },
+        || {
+            let (Some(prev), Some(cur)) = (previous_snapshot_id, current_snapshot_id) else {
+                return Err("invalid projection/filter MV incremental decision".to_string());
+            };
+            incremental_refresh_iceberg_mv(
+                state,
+                &ctx,
+                base_ref,
+                prev,
+                cur,
+                &loaded.table,
+                &current_table_uuid,
+                &pinned_full_select_sql,
+                RewriteMergeRefreshOptions {
+                    apply_key: refresh_contract.apply_key,
+                },
+            )
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2489,91 +2493,100 @@ fn refresh_iceberg_union_projection_mv(
         "iceberg UNION ALL projection/filter MV refresh context constructed"
     );
 
-    if !has_previous {
-        let full_select_sql = rewrite_union_projection_full_refresh_select_with_pin(
-            &ctx.rewrite.mv_definition.select_sql,
-            &pin,
-            union_shape,
-            current_catalog,
-            current_database,
-        )?;
-        let staging_branch = format!(
-            "__nova_mv_refresh_{}_{}",
-            mv_definition.mv_id,
-            uuid::Uuid::new_v4().simple()
-        );
-        let refresh_id = begin_staged_iceberg_mv_refresh_intent(
-            state,
-            target,
-            mv_definition.mv_id,
-            target_snapshot_id,
-            pin.to_snapshot_map(),
-            &staging_branch,
-        )?;
-        return first_refresh_iceberg_mv_with_physical_sql(
-            state,
-            &ctx,
-            &staging_branch,
-            refresh_id,
-            pin.to_snapshot_map(),
-            pin.to_table_uuid_map(),
-            &full_select_sql,
-        );
-    }
-
     let all_unchanged = loaded_bases.iter().all(|(base_ref, _, current, _)| {
         previous_snapshots.get(&base_ref.fqn()).copied() == Some(*current)
     });
-    if all_unchanged {
-        tracing::info!(
-            "iceberg mv {}.{}.{}: UNION ALL branch base snapshots unchanged; updating metadata only",
-            target.catalog,
-            target.namespace,
-            target.table
-        );
-        let snapshots = pin.to_snapshot_map();
-        let table_uuids = pin.to_table_uuid_map();
-        let recorded_target_snapshot_id = recorded_target_snapshot_id(target, mv_definition)?;
-        let refresh_id =
-            begin_iceberg_mv_refresh_intent(state, mv_definition.mv_id, snapshots.clone())?;
-        finalize_iceberg_mv_refresh(
-            state,
-            refresh_id,
-            mv_definition.last_refresh_rows.unwrap_or(0),
-            snapshots,
-            table_uuids,
-            recorded_target_snapshot_id,
-        )?;
-        return Ok(StatementResult::Ok);
-    }
+    let refresh_decision = if !has_previous {
+        RefreshDecision::FirstRefresh
+    } else if all_unchanged {
+        RefreshDecision::MetadataOnly
+    } else {
+        RefreshDecision::Incremental
+    };
 
-    let changes = loaded_bases
-        .iter()
-        .map(|(base_ref, loaded, current_snapshot_id, current_table_uuid)| {
-            let previous_snapshot_id = previous_snapshots
-                .get(&base_ref.fqn())
-                .copied()
-                .ok_or_else(|| {
-                    format!(
-                        "iceberg UNION ALL projection/filter MV {}.{}.{} has partial previous refresh metadata; recreate the MV",
-                        target.catalog, target.namespace, target.table
-                    )
-                })?;
-            Ok(RewriteMergeBaseChange {
-                base_ref,
-                previous_snapshot_id,
-                current_snapshot_id: *current_snapshot_id,
-                base_table: &loaded.table,
-                current_table_uuid,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    incremental_refresh_iceberg_mv_with_changes(
-        state,
-        &ctx,
-        &changes,
-        None,
-        RewriteMergeRefreshOptions { apply_key },
+    IcebergMvRefreshLifecycle::run(
+        refresh_decision,
+        || {
+            let full_select_sql = rewrite_union_projection_full_refresh_select_with_pin(
+                &ctx.rewrite.mv_definition.select_sql,
+                &pin,
+                union_shape,
+                current_catalog,
+                current_database,
+            )?;
+            let staging_branch = format!(
+                "__nova_mv_refresh_{}_{}",
+                mv_definition.mv_id,
+                uuid::Uuid::new_v4().simple()
+            );
+            let refresh_id = begin_staged_iceberg_mv_refresh_intent(
+                state,
+                target,
+                mv_definition.mv_id,
+                target_snapshot_id,
+                pin.to_snapshot_map(),
+                &staging_branch,
+            )?;
+            first_refresh_iceberg_mv_with_physical_sql(
+                state,
+                &ctx,
+                &staging_branch,
+                refresh_id,
+                pin.to_snapshot_map(),
+                pin.to_table_uuid_map(),
+                &full_select_sql,
+            )
+        },
+        || {
+            tracing::info!(
+                "iceberg mv {}.{}.{}: UNION ALL branch base snapshots unchanged; updating metadata only",
+                target.catalog,
+                target.namespace,
+                target.table
+            );
+            let snapshots = pin.to_snapshot_map();
+            let table_uuids = pin.to_table_uuid_map();
+            let recorded_target_snapshot_id = recorded_target_snapshot_id(target, mv_definition)?;
+            let refresh_id =
+                begin_iceberg_mv_refresh_intent(state, mv_definition.mv_id, snapshots.clone())?;
+            finalize_iceberg_mv_refresh(
+                state,
+                refresh_id,
+                mv_definition.last_refresh_rows.unwrap_or(0),
+                snapshots,
+                table_uuids,
+                recorded_target_snapshot_id,
+            )?;
+            Ok(StatementResult::Ok)
+        },
+        || {
+            let changes = loaded_bases
+                .iter()
+                .map(|(base_ref, loaded, current_snapshot_id, current_table_uuid)| {
+                    let previous_snapshot_id =
+                        previous_snapshots.get(&base_ref.fqn()).copied().ok_or_else(|| {
+                            format!(
+                                "iceberg UNION ALL projection/filter MV {}.{}.{} has partial previous refresh metadata; recreate the MV",
+                                target.catalog, target.namespace, target.table
+                            )
+                        })?;
+                    Ok(RewriteMergeBaseChange {
+                        base_ref,
+                        previous_snapshot_id,
+                        current_snapshot_id: *current_snapshot_id,
+                        base_table: &loaded.table,
+                        current_table_uuid,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            incremental_refresh_iceberg_mv_with_changes(
+                state,
+                &ctx,
+                &changes,
+                None,
+                RewriteMergeRefreshOptions { apply_key },
+            )
+        },
     )
 }
 
@@ -2819,8 +2832,15 @@ fn refresh_single_aggregate_iceberg_mv(
         "iceberg MV refresh context constructed"
     );
 
-    match previous {
-        None => {
+    let refresh_decision = match previous {
+        None => RefreshDecision::FirstRefresh,
+        Some(prev) if prev == current => RefreshDecision::MetadataOnly,
+        Some(_) => RefreshDecision::Incremental,
+    };
+
+    IcebergMvRefreshLifecycle::run(
+        refresh_decision,
+        || {
             let staging_branch = format!(
                 "__nova_mv_refresh_{}_{}",
                 mv_definition.mv_id,
@@ -2841,8 +2861,8 @@ fn refresh_single_aggregate_iceberg_mv(
                 refresh_id,
                 aggregate_shape,
             )
-        }
-        Some(prev) if prev == current => {
+        },
+        || {
             tracing::info!(
                 "iceberg aggregate mv {}.{}.{}: base snapshot {current} unchanged; updating metadata only",
                 target.catalog,
@@ -2856,8 +2876,11 @@ fn refresh_single_aggregate_iceberg_mv(
                 pin.to_snapshot_map(),
                 pin.to_table_uuid_map(),
             )
-        }
-        Some(prev) => {
+        },
+        || {
+            let Some(prev) = previous else {
+                return Err("invalid aggregate MV incremental decision".to_string());
+            };
             let current_table_uuid = pin
                 .uuid(base_ref)
                 .ok_or_else(|| {
@@ -2878,8 +2901,8 @@ fn refresh_single_aggregate_iceberg_mv(
                 &mv_definition.select_sql,
                 RewriteMergeRefreshOptions { apply_key },
             )
-        }
-    }
+        },
+    )
 }
 
 /// A-family `Aggregate(UNION ALL(b1..bn))` refresh execution (fan-in over
@@ -3086,73 +3109,84 @@ fn refresh_fan_in_aggregate_iceberg_mv(
         "iceberg aggregate-over-UNION-ALL MV refresh context constructed"
     );
 
-    if !has_previous {
-        let staging_branch = format!(
-            "__nova_mv_refresh_{}_{}",
-            mv_definition.mv_id,
-            uuid::Uuid::new_v4().simple()
-        );
-        let refresh_id = begin_staged_iceberg_mv_refresh_intent(
-            state,
-            target,
-            mv_definition.mv_id,
-            expected_main_snapshot_id,
-            pin.to_snapshot_map(),
-            &staging_branch,
-        )?;
-        return first_refresh_iceberg_aggregate_mv(
-            state,
-            &ctx,
-            &staging_branch,
-            refresh_id,
-            aggregate_shape,
-        );
-    }
-
     let all_unchanged = loaded_bases.iter().all(|(base_ref, _, current, _)| {
         previous_snapshots.get(&base_ref.fqn()).copied() == Some(*current)
     });
-    if all_unchanged {
-        tracing::info!(
-            "iceberg aggregate-over-UNION-ALL mv {}.{}.{}: fan-in base snapshots unchanged; updating metadata only",
-            target.catalog,
-            target.namespace,
-            target.table
-        );
-        return finalize_iceberg_mv_metadata_only_refresh(
-            state,
-            target,
-            mv_definition,
-            pin.to_snapshot_map(),
-            pin.to_table_uuid_map(),
-        );
-    }
+    let refresh_decision = if !has_previous {
+        RefreshDecision::FirstRefresh
+    } else if all_unchanged {
+        RefreshDecision::MetadataOnly
+    } else {
+        RefreshDecision::Incremental
+    };
 
-    let changes = loaded_bases
-        .iter()
-        .map(|(base_ref, loaded, current_snapshot_id, current_table_uuid)| {
-            let previous_snapshot_id =
-                previous_snapshots.get(&base_ref.fqn()).copied().ok_or_else(|| {
-                    format!(
-                        "iceberg aggregate-over-UNION-ALL MV {}.{}.{} has partial previous refresh snapshots; recreate the MV",
-                        target.catalog, target.namespace, target.table
-                    )
-                })?;
-            Ok(RewriteMergeBaseChange {
-                base_ref,
-                previous_snapshot_id,
-                current_snapshot_id: *current_snapshot_id,
-                base_table: &loaded.table,
-                current_table_uuid,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    incremental_refresh_iceberg_mv_with_changes(
-        state,
-        &ctx,
-        &changes,
-        None,
-        RewriteMergeRefreshOptions { apply_key },
+    IcebergMvRefreshLifecycle::run(
+        refresh_decision,
+        || {
+            let staging_branch = format!(
+                "__nova_mv_refresh_{}_{}",
+                mv_definition.mv_id,
+                uuid::Uuid::new_v4().simple()
+            );
+            let refresh_id = begin_staged_iceberg_mv_refresh_intent(
+                state,
+                target,
+                mv_definition.mv_id,
+                expected_main_snapshot_id,
+                pin.to_snapshot_map(),
+                &staging_branch,
+            )?;
+            first_refresh_iceberg_aggregate_mv(
+                state,
+                &ctx,
+                &staging_branch,
+                refresh_id,
+                aggregate_shape,
+            )
+        },
+        || {
+            tracing::info!(
+                "iceberg aggregate-over-UNION-ALL mv {}.{}.{}: fan-in base snapshots unchanged; updating metadata only",
+                target.catalog,
+                target.namespace,
+                target.table
+            );
+            finalize_iceberg_mv_metadata_only_refresh(
+                state,
+                target,
+                mv_definition,
+                pin.to_snapshot_map(),
+                pin.to_table_uuid_map(),
+            )
+        },
+        || {
+            let changes = loaded_bases
+                .iter()
+                .map(|(base_ref, loaded, current_snapshot_id, current_table_uuid)| {
+                    let previous_snapshot_id =
+                        previous_snapshots.get(&base_ref.fqn()).copied().ok_or_else(|| {
+                            format!(
+                                "iceberg aggregate-over-UNION-ALL MV {}.{}.{} has partial previous refresh snapshots; recreate the MV",
+                                target.catalog, target.namespace, target.table
+                            )
+                        })?;
+                    Ok(RewriteMergeBaseChange {
+                        base_ref,
+                        previous_snapshot_id,
+                        current_snapshot_id: *current_snapshot_id,
+                        base_table: &loaded.table,
+                        current_table_uuid,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            incremental_refresh_iceberg_mv_with_changes(
+                state,
+                &ctx,
+                &changes,
+                None,
+                RewriteMergeRefreshOptions { apply_key },
+            )
+        },
     )
 }
 
@@ -3706,8 +3740,25 @@ fn refresh_join_aggregate_iceberg_mv(
         .get(right_ref)
         .ok_or_else(|| format!("missing refresh pin for {}", right_ref.fqn()))?;
 
-    match (left_previous, right_previous) {
-        (None, None) => {
+    let refresh_decision = match (left_previous, right_previous) {
+        (None, None) => RefreshDecision::FirstRefresh,
+        (Some(left_prev), Some(right_prev))
+            if left_prev == left_current && right_prev == right_current =>
+        {
+            RefreshDecision::MetadataOnly
+        }
+        (Some(_), Some(_)) => RefreshDecision::Incremental,
+        _ => RefreshDecision::FailFast {
+            reason: format!(
+                "iceberg join aggregate MV {}.{}.{} has partial previous refresh snapshots; recreate the MV",
+                target.catalog, target.namespace, target.table
+            ),
+        },
+    };
+
+    IcebergMvRefreshLifecycle::run(
+        refresh_decision,
+        || {
             let staging_branch = format!(
                 "__nova_mv_refresh_{}_{}",
                 mv_definition.mv_id,
@@ -3728,10 +3779,8 @@ fn refresh_join_aggregate_iceberg_mv(
                 refresh_id,
                 aggregate_shape,
             )
-        }
-        (Some(left_prev), Some(right_prev))
-            if left_prev == left_current && right_prev == right_current =>
-        {
+        },
+        || {
             tracing::info!(
                 "iceberg join aggregate mv {}.{}.{}: base snapshots unchanged; updating metadata only",
                 target.catalog,
@@ -3745,8 +3794,11 @@ fn refresh_join_aggregate_iceberg_mv(
                 pin.to_snapshot_map(),
                 pin.to_table_uuid_map(),
             )
-        }
-        (Some(left_prev), Some(right_prev)) => {
+        },
+        || {
+            let (Some(left_prev), Some(right_prev)) = (left_previous, right_previous) else {
+                return Err("invalid join aggregate MV incremental decision".to_string());
+            };
             let left_table_uuid = pin
                 .uuid(left_ref)
                 .ok_or_else(|| {
@@ -3787,12 +3839,8 @@ fn refresh_join_aggregate_iceberg_mv(
                 None,
                 RewriteMergeRefreshOptions { apply_key },
             )
-        }
-        _ => Err(format!(
-            "iceberg join aggregate MV {}.{}.{} has partial previous refresh snapshots; recreate the MV",
-            target.catalog, target.namespace, target.table
-        )),
-    }
+        },
+    )
 }
 
 // Previous implementation of REFRESH FULL — `refresh_full_iceberg_mv` —
@@ -6884,8 +6932,25 @@ fn refresh_iceberg_join_mv(
         "iceberg MV refresh context constructed"
     );
 
-    match (left_previous, right_previous) {
-        (None, None) => {
+    let refresh_decision = match (left_previous, right_previous) {
+        (None, None) => RefreshDecision::FirstRefresh,
+        (Some(left_prev), Some(right_prev))
+            if left_prev == left_current && right_prev == right_current =>
+        {
+            RefreshDecision::MetadataOnly
+        }
+        (Some(_), Some(_)) => RefreshDecision::Incremental,
+        _ => RefreshDecision::FailFast {
+            reason: format!(
+                "iceberg join MV {}.{}.{} has partial previous refresh snapshots; recreate the MV",
+                target.catalog, target.namespace, target.table
+            ),
+        },
+    };
+
+    IcebergMvRefreshLifecycle::run(
+        refresh_decision,
+        || {
             let staging_branch = format!(
                 "__nova_mv_refresh_{}_{}",
                 mv_definition.mv_id,
@@ -6908,10 +6973,8 @@ fn refresh_iceberg_join_mv(
                 left_ref,
                 right_ref,
             )
-        }
-        (Some(left_prev), Some(right_prev))
-            if left_prev == left_current && right_prev == right_current =>
-        {
+        },
+        || {
             tracing::info!(
                 "iceberg join mv {}.{}.{}: base snapshots unchanged; updating metadata only",
                 target.catalog,
@@ -6925,18 +6988,16 @@ fn refresh_iceberg_join_mv(
                 pin.to_snapshot_map(),
                 pin.to_table_uuid_map(),
             )
-        }
-        (Some(_), Some(_)) => incremental_refresh_iceberg_join_mv(
-            state,
-            &ctx,
-            &[left_ref.clone(), right_ref.clone()],
-            shape,
-        ),
-        _ => Err(format!(
-            "iceberg join MV {}.{}.{} has partial previous refresh snapshots; recreate the MV",
-            target.catalog, target.namespace, target.table
-        )),
-    }
+        },
+        || {
+            incremental_refresh_iceberg_join_mv(
+                state,
+                &ctx,
+                &[left_ref.clone(), right_ref.clone()],
+                shape,
+            )
+        },
+    )
 }
 
 fn join_base_refs_for_shape<'a>(
