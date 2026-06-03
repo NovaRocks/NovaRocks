@@ -42,7 +42,9 @@ use iceberg::spec::{
 use iceberg::{Catalog, TableCommit, TableIdent, TableRequirement, TableUpdate};
 
 use super::data_file::clone_data_file_with_first_row_id;
-use super::helpers::{generate_snapshot_id, metadata_dir, now_ms, write_manifest_list};
+use super::helpers::{
+    finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms, write_manifest_list,
+};
 use super::retry::commit_with_retry;
 
 /// Top-level entry called from `engine::iceberg_rewrite_manifests`.
@@ -181,15 +183,19 @@ async fn run_rewrite_manifests_one_attempt(
     let added_count: usize = groups.values().filter(|g| g.len() > 1).count();
     let summary = Summary {
         operation: Operation::Replace,
-        additional_properties: [
-            (
-                "replaced-manifests-count".to_string(),
-                replaced_count.to_string(),
-            ),
-            ("added-manifests-count".to_string(), added_count.to_string()),
-        ]
-        .into_iter()
-        .collect(),
+        additional_properties: finalize_snapshot_summary(
+            [
+                (
+                    "replaced-manifests-count".to_string(),
+                    replaced_count.to_string(),
+                ),
+                ("added-manifests-count".to_string(), added_count.to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            metadata.current_snapshot().map(|s| s.summary()),
+            false,
+        ),
     };
 
     let snapshot_builder = iceberg::spec::Snapshot::builder()
@@ -623,6 +629,17 @@ mod tests {
             new_current.summary().operation,
             Operation::Replace,
             "new snapshot must have operation=replace"
+        );
+        let p = &new_current.summary().additional_properties;
+        assert_eq!(
+            p.get("engine-name").map(String::as_str),
+            Some("novarocks"),
+            "engine-name must be stamped by finalize_snapshot_summary"
+        );
+        // Data unchanged: total-data-files and total-records must carry from previous snapshot.
+        assert!(
+            p.get("total-data-files").is_some(),
+            "total-data-files must be present after REWRITE MANIFESTS"
         );
 
         // replace snapshot gets a new sequence_number (last_sequence_number + 1).
