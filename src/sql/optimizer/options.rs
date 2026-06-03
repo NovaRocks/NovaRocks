@@ -78,6 +78,16 @@ pub(crate) struct OptimizerOptions {
     /// The RF is emitted only when `build/probe <= 1 - min_selectivity`.
     /// Default: 0.5 (StarRocks RuntimeFilterDescription.MIN_RUNTIME_FILTER_SELECTIVITY).
     pub rf_probe_min_selectivity: f64,
+    /// Whether probe runtime filters may be pushed across shuffle exchanges
+    /// (cross-fragment placement). Currently always `false` (flag-off):
+    /// cross-exchange placement has correctness bugs under multi-BE (a partial
+    /// RF over a fanned-out build is applied to an unshuffled probe scan) and
+    /// standalone (crossing an OUTER join drops null-key rows the outer side
+    /// must keep). The flag and the placement code are retained so a future
+    /// stage can re-enable it once those are fixed; until then probe RFs stay
+    /// within-fragment. See `runtime_filter_pass::distribution_is_crossable`
+    /// and `push_probe_down`.
+    pub allow_cross_exchange_rf: bool,
 }
 
 impl OptimizerOptions {
@@ -91,6 +101,10 @@ impl OptimizerOptions {
             rf_build_min_bytes: 128 * 1024,
             rf_probe_min_bytes: 100 * 1024,
             rf_probe_min_selectivity: 0.5,
+            // Cross-exchange RF placement is disabled (flag-off) because it has
+            // correctness bugs in both multi-BE and standalone; probe RFs stay
+            // within-fragment. Kept as a flag so a future stage can re-enable it.
+            allow_cross_exchange_rf: false,
         }
     }
 
@@ -119,6 +133,8 @@ impl OptimizerOptions {
         if let Some(v) = settings.rf_probe_min_selectivity {
             opts.rf_probe_min_selectivity = v;
         }
+        // `allow_cross_exchange_rf` intentionally inherits the default (false);
+        // cross-exchange placement stays disabled until its correctness is fixed.
         opts
     }
 }

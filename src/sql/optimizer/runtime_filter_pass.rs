@@ -222,25 +222,24 @@ fn is_exchange(node: &PhysicalPlanNode) -> bool {
     matches!(node.op, Operator::PhysicalDistribution(_))
 }
 
-/// A `PhysicalDistribution` whose spec is a shuffle/hash partition can be
-/// crossed by a probe runtime filter (StarRocks canPushAcrossExchangeNode for
-/// PARTITIONED). Gather / Any remain hard fragment boundaries in this stage.
+/// A `PhysicalDistribution` whose spec is a shuffle/hash partition is the kind
+/// of boundary a probe runtime filter *may* cross (StarRocks
+/// canPushAcrossExchangeNode for PARTITIONED). Gather / Any are never crossable.
 ///
-/// CORRECTNESS INVARIANT (load-bearing): placing a probe below a shuffle
-/// exchange is only correct when the build side produces the *complete* key
-/// set, so the probe scan (which reads its fragment's full, not-yet-shuffled
-/// input) is filtered by all build keys. This holds today because standalone
-/// runs exactly one instance per fragment and gathers inter-fragment data
-/// all-to-one (`coordinator.rs` assigns a single instance per fragment;
-/// `runtime_filter_builder_number` is 1). If a build fragment is ever fanned
-/// out to N>1 instances (multi-BE distributed execution), each instance would
-/// build a *partial* RF over its key partition; applying that partial filter to
-/// an unshuffled probe scan would drop valid rows. Before enabling N-instance
-/// build fragments, the merge path must reflect the real instance count
-/// (`builder_number` / `build_be_number`), or remote probe placement here must
-/// fall back to build-only. This gate also omits StarRocks' multi-column
-/// `canCrossExchangeNode` restriction, which is sound only under the same
-/// complete-RF assumption.
+/// CORRECTNESS: crossing a shuffle exchange to place a probe RF deeper is only
+/// safe when the build side produces the *complete* key set AND no
+/// semantic-changing node (e.g. an OUTER join) sits between the exchange and
+/// the target scan. Two known violations make it currently unsafe, so the
+/// caller keeps it gated OFF — `push_probe_down` consults this predicate only
+/// when `OptimizerOptions::allow_cross_exchange_rf` is set, which is always
+/// false today (see its doc):
+///   1. multi-BE — a build fragment fans out to N>1 instances, each producing a
+///      *partial* RF; applying it to an unshuffled probe scan drops valid rows.
+///   2. standalone — crossing an OUTER join pushes the RF onto the outer side's
+///      scan and drops null-key rows the join/predicate must keep.
+/// The predicate and the placement code are retained for a future stage that
+/// fixes both. It only classifies the distribution type; it deliberately omits
+/// StarRocks' multi-column `canCrossExchangeNode` restriction.
 fn distribution_is_crossable(node: &PhysicalPlanNode) -> bool {
     use crate::sql::optimizer::property::DistributionSpec;
     matches!(
@@ -262,16 +261,24 @@ fn distribution_is_crossable(node: &PhysicalPlanNode) -> bool {
 /// 4. Try each child recursively; if a child accepts the probe, we are done.
 /// 5. If no child accepted it, place the probe on `node` itself (the deepest
 ///    reachable binder).
-fn push_probe_down(node: &mut PhysicalPlanNode, probe: &RuntimeFilterProbe) -> bool {
+fn push_probe_down(
+    node: &mut PhysicalPlanNode,
+    probe: &RuntimeFilterProbe,
+    allow_cross_exchange: bool,
+) -> bool {
     // Crossable exchange (shuffle): descend into its single child without
     // binding-checking the exchange itself (it preserves the child's columns).
-    if distribution_is_crossable(node) {
+    // Gated by `allow_cross_exchange`: under multi-BE the build side produces
+    // only a partial RF, so crossing the exchange is unsound (see
+    // `distribution_is_crossable`) — fall through to the hard boundary below.
+    if allow_cross_exchange && distribution_is_crossable(node) {
         if let Some(child) = node.children.first_mut() {
-            return push_probe_down(child, probe);
+            return push_probe_down(child, probe, allow_cross_exchange);
         }
         return false;
     }
-    // Non-crossable exchange (Gather/Any): hard boundary.
+    // Non-crossable exchange (Gather/Any), or cross-exchange disabled: a hard
+    // fragment boundary. The probe stays above it (build-only fallback).
     if is_exchange(node) {
         return false;
     }
@@ -279,7 +286,7 @@ fn push_probe_down(node: &mut PhysicalPlanNode, probe: &RuntimeFilterProbe) -> b
         return false;
     }
     for child in &mut node.children {
-        if push_probe_down(child, probe) {
+        if push_probe_down(child, probe, allow_cross_exchange) {
             return true;
         }
     }
@@ -384,7 +391,11 @@ fn annotate_node(
             probe_expr: d.probe_expr.clone(),
         };
         // children[0] = probe side; descend to the deepest binding node.
-        let _ = push_probe_down(&mut node.children[0], &probe);
+        let _ = push_probe_down(
+            &mut node.children[0],
+            &probe,
+            options.allow_cross_exchange_rf,
+        );
     }
 
     node.build_runtime_filters = descs;
@@ -660,9 +671,15 @@ mod tests {
     }
 
     #[test]
-    fn probe_crosses_exchange_to_scan() {
+    fn probe_crosses_exchange_when_flag_enabled() {
+        // Flag-on behavior (disabled by default): with cross-exchange RF
+        // explicitly enabled, the probe descends past the shuffle exchange to
+        // the base scan. Guards the retained placement code for a future stage
+        // that re-enables it once the correctness bugs are fixed.
         let mut j = super::test_support::shuffle_join_with_probe_exchange();
-        annotate(&mut j, &OptimizerOptions::default_settings());
+        let mut opts = OptimizerOptions::default_settings();
+        opts.allow_cross_exchange_rf = true;
+        annotate(&mut j, &opts);
         assert_eq!(j.build_runtime_filters.len(), 1, "build RF expected");
         let exch = &j.children[0];
         assert!(
@@ -673,6 +690,27 @@ mod tests {
             exch.children[0].probe_runtime_filters.len(),
             1,
             "probe should reach the scan below the exchange"
+        );
+    }
+
+    #[test]
+    fn probe_stays_within_fragment_by_default() {
+        // Default (flag-off): cross-exchange placement is disabled, so the probe
+        // RF must not cross the shuffle exchange. It falls back to build-only —
+        // the probe stays unplaced above the exchange. This avoids the multi-BE
+        // (partial RF over a fanned-out build) and standalone (crossing an OUTER
+        // join drops null-key rows) correctness bugs.
+        let mut j = super::test_support::shuffle_join_with_probe_exchange();
+        annotate(&mut j, &OptimizerOptions::default_settings());
+        assert_eq!(j.build_runtime_filters.len(), 1, "build RF still expected");
+        let exch = &j.children[0];
+        assert!(
+            exch.probe_runtime_filters.is_empty(),
+            "probe must not be placed on the exchange"
+        );
+        assert!(
+            exch.children[0].probe_runtime_filters.is_empty(),
+            "probe must NOT cross the exchange by default (within-fragment fallback)"
         );
     }
 

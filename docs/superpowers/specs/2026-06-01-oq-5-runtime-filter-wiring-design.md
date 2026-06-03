@@ -387,12 +387,18 @@ optimizer 侧不做类型选择。
      且 fragment 间数据 **all-to-one UNPARTITIONED**(codegen 的 HashPartitioned
      output_partition 协调器不读)→ build 侧拿全量 → **RF 完整** → 跨 exchange
      应用到未分区 probe scan **正确**。本地 DOP partial 在远程发送前已 merge。
-   - **多 BE 潜在 wrong-results(当前不可达,已显式文档化)**:`builder_number`
-     硬编码为 1(coordinator.rs)、`build_be_number=0`。若 build fragment 未来被
-     fan-out 成 N>1 实例,每实例只产部分 RF,应用到未分区 probe scan 会误删行。
-     Stage 3 让 remote probe 放置成为可能,使该隐患 load-bearing —— 启用 N 实例前
-     必须先让 merge 路径反映真实实例数,或把 remote 放置回退为 build-only。守门
-     注释见 `runtime_filter_pass.rs::distribution_is_crossable`。
+   - **已全局禁用 cross-exchange(2026-06-03,rebase 到 D2 multi-BE #209 后)**:
+     rebase 后发现 cross-exchange placement 在两种场景都有正确性 bug —— (1) **multi-BE**:
+     build fragment fan-out 成 N>1 实例,每实例只产部分 RF,跨 exchange 应用到未分区
+     probe scan 误删行,实测触发 exchange wire-meta 错误(`cross_process_two_be_multi_fragment`);
+     (2) **standalone**:RF 跨 exchange 推过 OUTER join 到 outer 侧 scan,误删 OUTER /
+     `OR ... IS NULL` 应保留的 null-key 行(`join_full_outer_with_using` query 64,
+     semi-join 的 RF 越过 FULL OUTER 删掉了 `(NULL,NULL)` 行)。修复:
+     `OptimizerOptions::allow_cross_exchange_rf` 默认 **false**(flag-off),
+     `push_probe_down` 始终不跨 exchange → probe RF 回退 within-fragment(= main 安全
+     行为,两个回归 case 均恢复 PASS)。Stage 3 的 placement 代码与 flag 保留,待后续
+     stage 修正确性(probe 不跨 OUTER、multi-BE RF merge 反映真实实例数)后再开启。
+     守门见 `runtime_filter_pass.rs::distribution_is_crossable` 与 `push_probe_down`。
 
 ---
 
