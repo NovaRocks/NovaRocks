@@ -40,7 +40,9 @@ use uuid::Uuid;
 use super::abort::AbortLog;
 use super::action::{CommitCtx, IcebergCommitAction};
 use super::fast_append::carry_forward_puffin_stats;
-use super::helpers::{generate_snapshot_id, metadata_dir, now_ms, write_manifest_list};
+use super::helpers::{
+    finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms, write_manifest_list,
+};
 use super::overwrite::write_added_data_manifest;
 use super::types::{CommitOutcome, IcebergWriteMode, WrittenFile};
 
@@ -324,7 +326,11 @@ impl TransactionAction for RewriteDataFilesTxnAction {
 
         let summary = Summary {
             operation: Operation::Replace,
-            additional_properties: rewrite_summary(&self.written, &live),
+            additional_properties: finalize_snapshot_summary(
+                rewrite_summary(&self.written, &live),
+                m.current_snapshot().map(|s| s.summary()),
+                false,
+            ),
         };
         let snapshot = if let Some(first_row_id) = self.row_lineage_first_row_id {
             Snapshot::builder()
@@ -562,7 +568,23 @@ fn rewrite_summary(added: &[WrittenFile], live: &LiveFiles) -> HashMap<String, S
     );
     p.insert("added-records".to_string(), added_records.to_string());
     p.insert("deleted-records".to_string(), deleted_records.to_string());
-    p.insert("total-records".to_string(), added_records.to_string());
+    p.insert(
+        "added-files-size".to_string(),
+        added
+            .iter()
+            .map(|f| f.file_size_in_bytes)
+            .sum::<u64>()
+            .to_string(),
+    );
+    p.insert(
+        "removed-files-size".to_string(),
+        live.data_files
+            .iter()
+            .chain(live.delete_files.iter())
+            .map(|e| e.data_file.file_size_in_bytes())
+            .sum::<u64>()
+            .to_string(),
+    );
     p.insert(
         "removed-delete-files".to_string(),
         live.delete_files.len().to_string(),
@@ -629,7 +651,15 @@ mod tests {
         assert_eq!(summary["deleted-data-files"], "1");
         assert_eq!(summary["added-records"], "18");
         assert_eq!(summary["deleted-records"], "23");
-        assert_eq!(summary["total-records"], "18");
+        // total-records is now computed by finalize_snapshot_summary, not rewrite_summary.
+        assert!(
+            !summary.contains_key("total-records"),
+            "rewrite_summary must not emit total-records; finalize_snapshot_summary owns it"
+        );
+        // 2 files * 1024 each
+        assert_eq!(summary["added-files-size"], "2048");
+        // old data (1024) + position-delete (1024) + equality-delete (1024)
+        assert_eq!(summary["removed-files-size"], "3072");
         assert_eq!(summary["removed-delete-files"], "2");
         assert_eq!(summary["removed-position-delete-files"], "1");
         assert_eq!(summary["removed-equality-delete-files"], "1");
