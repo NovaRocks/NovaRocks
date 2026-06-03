@@ -355,6 +355,17 @@ impl RuntimeState {
         std::sync::Arc::clone(&self.error_state)
     }
 
+    /// Handle to the dedicated sink I/O execution service (IW-1).
+    ///
+    /// Operators reach this via `&RuntimeState` in `bind_runtime_state` /
+    /// `push_chunk` so they never grab the shared `data_runtime` directly.
+    pub fn sink_io_executor(
+        &self,
+    ) -> Result<crate::runtime::execution_services::IoExecutor, String> {
+        crate::runtime::execution_services::execution_services()
+            .map(|services| services.sink_io().clone())
+    }
+
     pub fn error(&self) -> Option<String> {
         self.error_state.error()
     }
@@ -403,4 +414,26 @@ fn monotonic_now_ns() -> i64 {
     static START: OnceLock<Instant> = OnceLock::new();
     let start = START.get_or_init(Instant::now);
     clamp_u128_to_i64(start.elapsed().as_nanos())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sink_io_executor_from_default_state_runs_on_sink_runtime() {
+        let state = RuntimeState::default();
+        let exec = state.sink_io_executor().expect("sink_io executor");
+        let handle = exec.spawn(async {
+            std::thread::current()
+                .name()
+                .map(|s| s.to_string())
+                .unwrap_or_default()
+        });
+        let name = futures::executor::block_on(handle).expect("join");
+        assert!(
+            name.contains("novarocks-sink-io"),
+            "sink_io task ran on unexpected thread: {name}"
+        );
+    }
 }
