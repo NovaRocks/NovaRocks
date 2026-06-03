@@ -58,6 +58,7 @@ fn classify_iceberg_write_mode_from_metadata(
 /// Returns the write mode selected from Iceberg table metadata after rejecting
 /// table schemas that the current writer cannot encode.
 pub fn ensure_iceberg_write_supported(table: &Table) -> Result<IcebergWriteMode, String> {
+    ensure_default_sort_order_resolvable(table)?;
     ensure_no_variant_in_partition_spec(table)?;
     ensure_no_variant_in_sort_order(table)?;
     Ok(classify_iceberg_write_mode(table))
@@ -135,6 +136,20 @@ pub fn ensure_no_variant_in_sort_order(table: &Table) -> Result<(), String> {
                 name = source.name,
             ));
         }
+    }
+    Ok(())
+}
+
+/// Fail-fast guard: the table's `default-sort-order-id` must reference an
+/// existing sort order. iceberg-rust's `TableMetadata::default_sort_order()`
+/// panics if the id is dangling; this surfaces a clean error instead.
+pub fn ensure_default_sort_order_resolvable(table: &Table) -> Result<(), String> {
+    let metadata = table.metadata();
+    let id = metadata.default_sort_order_id();
+    if metadata.sort_order_by_id(id).is_none() {
+        return Err(format!(
+            "iceberg table default-sort-order-id {id} does not reference any existing sort order"
+        ));
     }
     Ok(())
 }
@@ -365,6 +380,17 @@ fn arrow_iceberg_types_compatible(
 mod tests {
     use super::super::types::NOVAROCKS_UPDATE_MODE_MOR;
     use super::*;
+
+    #[test]
+    fn default_sort_order_resolvable_ok_for_unsorted_table() {
+        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        let table = make_table_with(
+            vec![NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into()],
+            vec![],
+            vec![],
+        );
+        assert!(super::ensure_default_sort_order_resolvable(&table).is_ok());
+    }
 
     #[test]
     fn partition_id_monotonic_ok_and_regression_fails() {
