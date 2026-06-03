@@ -478,19 +478,41 @@ mod tests {
     #[test]
     fn cancel_mid_flight_aborts_without_hang() {
         let state = RuntimeState::default();
-        // gate closed: bg task is parked inside write_chunk when we cancel.
-        let (backend, _rows, _chunks) = TestAsyncSink::new(0);
+        // gate closed: bg task is parked inside write_chunk (before it counts the
+        // chunk) when we cancel, so this exercises cancel of an in-flight write.
+        let (backend, _rows, chunks) = TestAsyncSink::new(0);
         let mut op = AsyncSinkOperator::new("cancel_sink", backend, 4);
         op.bind_runtime_state(&state).expect("bind");
 
         op.push_chunk(&state, make_chunk(1)).expect("push");
-        op.cancel();
+        // Give the bg task a moment to dequeue the chunk and park at the closed gate.
+        assert!(
+            poll_until(
+                || chunks.load(Ordering::Acquire) == 0,
+                Duration::from_millis(200)
+            ),
+            "precondition: bg write must be parked at the closed gate"
+        );
 
-        // Cancel is non-blocking and converges the operator.
+        // cancel() must be non-blocking; bound the call itself.
+        let started = Instant::now();
+        op.cancel();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "cancel() must not block on the background task"
+        );
+
+        // Cancel converges the operator without hang.
         assert!(
             poll_until(|| op.is_finished(), Duration::from_secs(5)),
             "cancel did not converge sink"
         );
         assert!(!op.need_input(), "canceled sink must not accept input");
+        // The parked write never completed → it was genuinely in-flight when canceled.
+        assert_eq!(
+            chunks.load(Ordering::Acquire),
+            0,
+            "aborted in-flight write must not have completed"
+        );
     }
 }
