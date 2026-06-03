@@ -37,8 +37,8 @@ use uuid::Uuid;
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
 use super::data_file::written_file_to_iceberg_data_file;
 use super::helpers::{
-    current_snapshot_total_records, effective_next_row_id, generate_snapshot_id, metadata_dir,
-    now_ms, read_base_manifest_list, write_manifest_list,
+    current_snapshot_total_records, effective_next_row_id, finalize_snapshot_summary,
+    generate_snapshot_id, metadata_dir, now_ms, read_base_manifest_list, write_manifest_list,
 };
 use super::overwrite::write_added_data_manifest;
 use super::types::{CommitOutcome, IcebergWriteMode, WrittenFile};
@@ -360,7 +360,11 @@ impl TransactionAction for FastAppendV3TxnAction {
         )
         .map_err(to_iceberg_unexpected)?;
         let additional_properties = merge_snapshot_summary_properties(
-            append_summary(&self.written, total_records),
+            finalize_snapshot_summary(
+                append_summary(&self.written, total_records),
+                m.current_snapshot().map(|s| s.summary()),
+                false,
+            ),
             &self.snapshot_properties,
         )
         .map_err(to_iceberg_unexpected)?;
@@ -545,6 +549,27 @@ mod tests {
 
         assert_eq!(summary["added-records"], "18");
         assert_eq!(summary["total-records"], "18");
+
+        // finalize_snapshot_summary carries total-* from a first snapshot (no previous).
+        use super::helpers::finalize_snapshot_summary;
+        let finalized = finalize_snapshot_summary(summary, None, false);
+        // 2 files, 18 records, 2 * 1024 = 2048 bytes.
+        assert_eq!(
+            finalized.get("total-data-files").map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            finalized.get("total-records").map(String::as_str),
+            Some("18")
+        );
+        assert_eq!(
+            finalized.get("total-files-size").map(String::as_str),
+            Some("2048")
+        );
+        assert_eq!(
+            finalized.get("engine-name").map(String::as_str),
+            Some("novarocks")
+        );
     }
 
     #[test]
