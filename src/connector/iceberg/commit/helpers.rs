@@ -19,7 +19,8 @@
 //! (`RowDeltaCommit` and `OverwriteCommit`).
 
 use iceberg::io::FileIO;
-use iceberg::spec::{FormatVersion, ManifestFile, ManifestListWriter};
+use iceberg::spec::{FormatVersion, ManifestFile, ManifestListWriter, Summary};
+use std::collections::HashMap;
 
 /// Generate an Iceberg-spec-compliant random positive snapshot id.
 pub fn generate_snapshot_id() -> i64 {
@@ -152,4 +153,264 @@ pub async fn read_base_manifest_list(
     let list = iceberg::spec::ManifestList::parse_with_version(&bytes, m.format_version())
         .map_err(|e| format!("parse manifest_list failed: {e}"))?;
     Ok(list.entries().to_vec())
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot-summary `total-*` carry-forward (IV3-2).
+//
+// Canonical Iceberg summary key names. Mirrors the constants in
+// `vendor/iceberg-0.9.0/src/spec/snapshot_summary.rs`.
+// ---------------------------------------------------------------------------
+const TOTAL_DATA_FILES: &str = "total-data-files";
+const TOTAL_DELETE_FILES: &str = "total-delete-files";
+const TOTAL_RECORDS: &str = "total-records";
+const TOTAL_FILE_SIZE: &str = "total-files-size";
+const TOTAL_POSITION_DELETES: &str = "total-position-deletes";
+const TOTAL_EQUALITY_DELETES: &str = "total-equality-deletes";
+
+const ADDED_DATA_FILES: &str = "added-data-files";
+const DELETED_DATA_FILES: &str = "deleted-data-files";
+const ADDED_DELETE_FILES: &str = "added-delete-files";
+const REMOVED_DELETE_FILES: &str = "removed-delete-files";
+const ADDED_RECORDS: &str = "added-records";
+const DELETED_RECORDS: &str = "deleted-records";
+const ADDED_FILE_SIZE: &str = "added-files-size";
+const REMOVED_FILE_SIZE: &str = "removed-files-size";
+const ADDED_POSITION_DELETES: &str = "added-position-deletes";
+const REMOVED_POSITION_DELETES: &str = "removed-position-deletes";
+const ADDED_EQUALITY_DELETES: &str = "added-equality-deletes";
+const REMOVED_EQUALITY_DELETES: &str = "removed-equality-deletes";
+
+const ENGINE_NAME_KEY: &str = "engine-name";
+const ENGINE_VERSION_KEY: &str = "engine-version";
+const ENGINE_NAME_VALUE: &str = "novarocks";
+
+/// Carry forward the six Iceberg `total-*` summary fields and stamp NovaRocks
+/// engine identity, returning the finalized snapshot-summary property map.
+///
+/// For each category, `total = previous_total + added - removed`, reading the
+/// canonical `added-*` / `removed-*` / `deleted-*` keys the caller already
+/// populated. Semantics mirror Iceberg-Java `SnapshotSummary` (and therefore
+/// Spark), the cross-engine reference:
+///
+/// * First snapshot (`previous == None`): base 0, so `total == added`.
+/// * `previous` present but missing a given `total-*` (legacy / foreign
+///   writer): that total is OMITTED — we never fabricate a total we cannot
+///   resume. (This intentionally differs from iceberg-rust 0.9.0
+///   `update_totals`, which treats a missing previous total as 0.)
+/// * `truncate_full_table`: every `total-*` resets to 0.
+///
+/// Engine identity (`engine-name`/`engine-version`) is always stamped.
+pub(super) fn finalize_snapshot_summary(
+    mut props: HashMap<String, String>,
+    previous: Option<&Summary>,
+    truncate_full_table: bool,
+) -> HashMap<String, String> {
+    if truncate_full_table {
+        for key in [
+            TOTAL_DATA_FILES,
+            TOTAL_DELETE_FILES,
+            TOTAL_RECORDS,
+            TOTAL_FILE_SIZE,
+            TOTAL_POSITION_DELETES,
+            TOTAL_EQUALITY_DELETES,
+        ] {
+            props.insert(key.to_string(), "0".to_string());
+        }
+    } else {
+        carry_total(
+            &mut props,
+            previous,
+            TOTAL_DATA_FILES,
+            ADDED_DATA_FILES,
+            DELETED_DATA_FILES,
+        );
+        carry_total(
+            &mut props,
+            previous,
+            TOTAL_DELETE_FILES,
+            ADDED_DELETE_FILES,
+            REMOVED_DELETE_FILES,
+        );
+        carry_total(
+            &mut props,
+            previous,
+            TOTAL_RECORDS,
+            ADDED_RECORDS,
+            DELETED_RECORDS,
+        );
+        carry_total(
+            &mut props,
+            previous,
+            TOTAL_FILE_SIZE,
+            ADDED_FILE_SIZE,
+            REMOVED_FILE_SIZE,
+        );
+        carry_total(
+            &mut props,
+            previous,
+            TOTAL_POSITION_DELETES,
+            ADDED_POSITION_DELETES,
+            REMOVED_POSITION_DELETES,
+        );
+        carry_total(
+            &mut props,
+            previous,
+            TOTAL_EQUALITY_DELETES,
+            ADDED_EQUALITY_DELETES,
+            REMOVED_EQUALITY_DELETES,
+        );
+    }
+    props.insert(ENGINE_NAME_KEY.to_string(), ENGINE_NAME_VALUE.to_string());
+    props.insert(
+        ENGINE_VERSION_KEY.to_string(),
+        crate::version::short_version().to_string(),
+    );
+    props
+}
+
+fn parse_u64_prop(props: &HashMap<String, String>, key: &str) -> u64 {
+    props
+        .get(key)
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+fn carry_total(
+    props: &mut HashMap<String, String>,
+    previous: Option<&Summary>,
+    total_key: &str,
+    added_key: &str,
+    removed_key: &str,
+) {
+    let base = match previous {
+        None => 0u64,
+        Some(prev) => match prev.additional_properties.get(total_key) {
+            Some(value) => match value.parse::<u64>() {
+                Ok(parsed) => parsed,
+                Err(_) => return,
+            },
+            None => return,
+        },
+    };
+    let added = parse_u64_prop(props, added_key);
+    let removed = parse_u64_prop(props, removed_key);
+    let total = base.saturating_add(added).saturating_sub(removed);
+    props.insert(total_key.to_string(), total.to_string());
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+    use iceberg::spec::{Operation, Summary};
+    use std::collections::HashMap;
+
+    fn prev(props: &[(&str, &str)]) -> Summary {
+        Summary {
+            operation: Operation::Append,
+            additional_properties: props
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    fn props(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn first_snapshot_establishes_totals_from_added() {
+        let out = finalize_snapshot_summary(
+            props(&[
+                ("added-data-files", "3"),
+                ("added-records", "30"),
+                ("added-files-size", "300"),
+            ]),
+            None,
+            false,
+        );
+        assert_eq!(out.get("total-data-files").unwrap(), "3");
+        assert_eq!(out.get("total-records").unwrap(), "30");
+        assert_eq!(out.get("total-files-size").unwrap(), "300");
+        assert_eq!(out.get("total-delete-files").unwrap(), "0");
+        assert_eq!(out.get("total-position-deletes").unwrap(), "0");
+        assert_eq!(out.get("total-equality-deletes").unwrap(), "0");
+        assert_eq!(out.get("engine-name").unwrap(), "novarocks");
+        assert!(out.get("engine-version").unwrap().starts_with("novarocks-"));
+    }
+
+    #[test]
+    fn carry_forward_adds_and_subtracts() {
+        let previous = prev(&[
+            ("total-data-files", "10"),
+            ("total-records", "100"),
+            ("total-files-size", "1000"),
+            ("total-delete-files", "0"),
+            ("total-position-deletes", "0"),
+            ("total-equality-deletes", "0"),
+        ]);
+        let out = finalize_snapshot_summary(
+            props(&[
+                ("added-data-files", "2"),
+                ("deleted-data-files", "1"),
+                ("added-records", "20"),
+                ("deleted-records", "5"),
+                ("added-files-size", "200"),
+                ("removed-files-size", "100"),
+            ]),
+            Some(&previous),
+            false,
+        );
+        assert_eq!(out.get("total-data-files").unwrap(), "11");
+        assert_eq!(out.get("total-records").unwrap(), "115");
+        assert_eq!(out.get("total-files-size").unwrap(), "1100");
+    }
+
+    #[test]
+    fn legacy_missing_total_is_omitted_not_fabricated() {
+        let previous = prev(&[("total-records", "100")]);
+        let out = finalize_snapshot_summary(
+            props(&[("added-data-files", "2"), ("added-records", "20")]),
+            Some(&previous),
+            false,
+        );
+        assert!(!out.contains_key("total-data-files"));
+        assert_eq!(out.get("total-records").unwrap(), "120");
+    }
+
+    #[test]
+    fn truncate_resets_all_totals_to_zero() {
+        let previous = prev(&[
+            ("total-data-files", "10"),
+            ("total-records", "100"),
+            ("total-files-size", "1000"),
+        ]);
+        let out = finalize_snapshot_summary(
+            props(&[("deleted-data-files", "10"), ("deleted-records", "100")]),
+            Some(&previous),
+            true,
+        );
+        for k in [
+            "total-data-files",
+            "total-delete-files",
+            "total-records",
+            "total-files-size",
+            "total-position-deletes",
+            "total-equality-deletes",
+        ] {
+            assert_eq!(out.get(k).map(String::as_str), Some("0"), "{k} must be 0");
+        }
+    }
+
+    #[test]
+    fn removed_below_zero_saturates() {
+        let previous = prev(&[("total-records", "5")]);
+        let out =
+            finalize_snapshot_summary(props(&[("deleted-records", "9")]), Some(&previous), false);
+        assert_eq!(out.get("total-records").unwrap(), "0");
+    }
 }
