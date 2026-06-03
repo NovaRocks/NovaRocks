@@ -42,4 +42,18 @@ SELECT COUNT(*) AS history_count
 FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.spark_v3_meta_${uuid0}$history;
 
 -- query 4
+SELECT count(*) AS n_data_files
+FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.spark_v3_meta_${uuid0}$files
+WHERE content = 0;
+
+-- query 5
+SELECT count(*) > 0 AS has_manifests
+FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.spark_v3_meta_${uuid0}$manifests;
+
+-- query 6
+SELECT count(*) > 0 AS has_added_entries
+FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.spark_v3_meta_${uuid0}$entries
+WHERE status = 1 AND sequence_number IS NOT NULL;
+
+-- query 7
 DROP TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.spark_v3_meta_${uuid0} FORCE;

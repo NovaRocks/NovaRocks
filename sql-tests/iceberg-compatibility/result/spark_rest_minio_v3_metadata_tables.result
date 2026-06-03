@@ -5,3 +5,15 @@ snapshot_count
 -- query 3
 history_count
 2
+
+-- query 4
+n_data_files
+3
+
+-- query 5
+has_manifests
+1
+
+-- query 6
+has_added_entries
+1
