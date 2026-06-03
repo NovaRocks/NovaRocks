@@ -52,8 +52,8 @@ use super::abort::AbortLog;
 use super::action::{CommitCtx, IcebergCommitAction};
 use super::fast_append::carry_forward_puffin_stats;
 use super::helpers::{
-    effective_next_row_id, generate_snapshot_id, metadata_dir, now_ms, read_base_manifest_list,
-    write_manifest_list,
+    effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms,
+    read_base_manifest_list, write_manifest_list,
 };
 use super::types::{CommitOutcome, WrittenFile};
 
@@ -250,7 +250,11 @@ impl TransactionAction for RowDeltaTxnAction {
         // 4. Construct the new Snapshot.
         let snapshot_summary = Summary {
             operation: Operation::Delete,
-            additional_properties: row_delta_summary(&self.written),
+            additional_properties: finalize_snapshot_summary(
+                row_delta_summary(&self.written),
+                m.current_snapshot().map(|s| s.summary()),
+                false,
+            ),
         };
         let snapshot = if let Some(first_row_id) = row_lineage_first_row_id {
             Snapshot::builder()
@@ -462,10 +466,6 @@ fn row_delta_summary(written: &[WrittenFile]) -> HashMap<String, String> {
             "added-equality-deletes".to_string(),
             equality_records.to_string(),
         );
-        p.insert(
-            "total-equality-deletes".to_string(),
-            equality_records.to_string(),
-        );
     }
     p.insert("added-delete-files".to_string(), written.len().to_string());
     p.insert("added-files-size".to_string(), total_size.to_string());
@@ -543,6 +543,47 @@ mod tests {
 
         assert_eq!(df.content_type(), DataContentType::EqualityDeletes);
         assert_eq!(df.equality_ids(), Some(vec![1, 2]));
+    }
+
+    #[test]
+    fn row_delta_summary_no_longer_emits_total_equality_deletes_directly() {
+        // The total-equality-deletes key must now come from finalize_snapshot_summary,
+        // not from row_delta_summary itself. Verify the helper emits it correctly.
+        use super::super::helpers::finalize_snapshot_summary;
+        let file = WrittenFile {
+            path: "s3://bucket/table/data/eq-delete.parquet".to_string(),
+            format: iceberg::spec::DataFileFormat::Parquet,
+            content: DataContentType::EqualityDeletes,
+            partition_values: iceberg::spec::Struct::empty(),
+            partition_spec_id: 0,
+            record_count: 5,
+            file_size_in_bytes: 128,
+            split_offsets: Vec::new(),
+            column_sizes: HashMap::new(),
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::new(),
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            key_metadata: None,
+            referenced_data_file: None,
+            equality_ids: Some(vec![1]),
+            first_row_id: None,
+        };
+
+        let raw = row_delta_summary(&[file]);
+        // The helper must NOT emit total-equality-deletes; finalize_snapshot_summary does it.
+        assert!(!raw.contains_key("total-equality-deletes"));
+
+        // After finalize (first snapshot, no previous), totals are computed from added-*.
+        let finalized = finalize_snapshot_summary(raw, None, false);
+        assert_eq!(
+            finalized.get("total-equality-deletes").map(String::as_str),
+            Some("5")
+        );
+        assert_eq!(
+            finalized.get("engine-name").map(String::as_str),
+            Some("novarocks")
+        );
     }
 
     #[test]
