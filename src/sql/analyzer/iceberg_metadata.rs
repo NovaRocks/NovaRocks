@@ -3,7 +3,8 @@
 //!
 //! Mirrors `iceberg_ref::split_ref_suffix` for branch/tag.
 
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Field};
+use std::sync::Arc;
 
 use crate::connector::iceberg::IcebergMetadataTableType;
 
@@ -37,6 +38,46 @@ impl MetadataColumn {
             nullable,
         }
     }
+}
+
+/// Build an Arrow `Map<Int32, value>` matching the metadata-scan MapBuilder
+/// output (keys non-nullable).
+fn map_int_to(value: DataType) -> DataType {
+    let entries = DataType::Struct(
+        vec![
+            Arc::new(Field::new("keys", DataType::Int32, false)),
+            Arc::new(Field::new("values", value, true)),
+        ]
+        .into(),
+    );
+    DataType::Map(Arc::new(Field::new("entries", entries, false)), false)
+}
+
+fn list_of(value: DataType) -> DataType {
+    DataType::List(Arc::new(Field::new("item", value, true)))
+}
+
+fn files_columns() -> Vec<MetadataColumn> {
+    vec![
+        MetadataColumn::new("content", DataType::Int32, false),
+        MetadataColumn::new("file_path", DataType::Utf8, false),
+        MetadataColumn::new("file_format", DataType::Utf8, false),
+        MetadataColumn::new("spec_id", DataType::Int32, false),
+        MetadataColumn::new("record_count", DataType::Int64, false),
+        MetadataColumn::new("file_size_in_bytes", DataType::Int64, false),
+        MetadataColumn::new("column_sizes", map_int_to(DataType::Int64), true),
+        MetadataColumn::new("value_counts", map_int_to(DataType::Int64), true),
+        MetadataColumn::new("null_value_counts", map_int_to(DataType::Int64), true),
+        MetadataColumn::new("nan_value_counts", map_int_to(DataType::Int64), true),
+        MetadataColumn::new("lower_bounds", map_int_to(DataType::Binary), true),
+        MetadataColumn::new("upper_bounds", map_int_to(DataType::Binary), true),
+        MetadataColumn::new("split_offsets", list_of(DataType::Int64), true),
+        MetadataColumn::new("equality_ids", list_of(DataType::Int32), true),
+        MetadataColumn::new("sort_order_id", DataType::Int32, true),
+        MetadataColumn::new("key_metadata", DataType::Binary, true),
+        MetadataColumn::new("first_row_id", DataType::Int64, true),
+        MetadataColumn::new("partition", DataType::Utf8, true),
+    ]
 }
 
 /// Fixed analyzer-level column schema for each Iceberg metadata table.
@@ -84,12 +125,43 @@ pub fn metadata_table_schema(ty: IcebergMetadataTableType) -> Vec<MetadataColumn
             MetadataColumn::new("position_delete_file_count", DataType::Int64, true),
             MetadataColumn::new("equality_delete_file_count", DataType::Int64, true),
         ],
-        T::Files | T::Manifests | T::LogicalIcebergMetadata => {
-            // Out of scope for this PR (D6). Returning an empty vec causes
-            // resolve_from to surface a "no such column" error if the user
-            // tries to use these (defense in depth — the parser-level
-            // whitelist already rejects them).
-            Vec::new()
+        T::Files => files_columns(),
+        T::Manifests => vec![
+            MetadataColumn::new("content", DataType::Int32, false),
+            MetadataColumn::new("path", DataType::Utf8, false),
+            MetadataColumn::new("length", DataType::Int64, false),
+            MetadataColumn::new("partition_spec_id", DataType::Int32, false),
+            MetadataColumn::new("added_snapshot_id", DataType::Int64, true),
+            MetadataColumn::new("added_data_files_count", DataType::Int32, false),
+            MetadataColumn::new("existing_data_files_count", DataType::Int32, false),
+            MetadataColumn::new("deleted_data_files_count", DataType::Int32, false),
+            MetadataColumn::new("added_rows_count", DataType::Int64, false),
+            MetadataColumn::new("existing_rows_count", DataType::Int64, false),
+            MetadataColumn::new("deleted_rows_count", DataType::Int64, false),
+            MetadataColumn::new(
+                "partition_summaries",
+                list_of(DataType::Struct(
+                    vec![
+                        Arc::new(Field::new("contains_null", DataType::Boolean, true)),
+                        Arc::new(Field::new("contains_nan", DataType::Boolean, true)),
+                        Arc::new(Field::new("lower_bound", DataType::Utf8, true)),
+                        Arc::new(Field::new("upper_bound", DataType::Utf8, true)),
+                    ]
+                    .into(),
+                )),
+                true,
+            ),
+        ],
+        T::LogicalIcebergMetadata => {
+            let mut cols = vec![
+                MetadataColumn::new("status", DataType::Int32, false),
+                MetadataColumn::new("snapshot_id", DataType::Int64, true),
+                MetadataColumn::new("sequence_number", DataType::Int64, true),
+                MetadataColumn::new("file_sequence_number", DataType::Int64, true),
+                MetadataColumn::new("first_row_id", DataType::Int64, true),
+            ];
+            cols.extend(files_columns());
+            cols
         }
     }
 }
@@ -217,16 +289,53 @@ mod tests {
     }
 
     #[test]
-    fn out_of_scope_metatypes_produce_empty_schema() {
-        for ty in [
-            IcebergMetadataTableType::Files,
-            IcebergMetadataTableType::Manifests,
-            IcebergMetadataTableType::LogicalIcebergMetadata,
+    fn files_schema_has_expected_columns() {
+        let names: Vec<String> = metadata_table_schema(IcebergMetadataTableType::Files)
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        for col in [
+            "content",
+            "file_path",
+            "file_format",
+            "spec_id",
+            "record_count",
+            "file_size_in_bytes",
+            "column_sizes",
+            "lower_bounds",
+            "split_offsets",
+            "equality_ids",
+            "first_row_id",
+            "partition",
         ] {
-            assert!(
-                metadata_table_schema(ty.clone()).is_empty(),
-                "{ty:?} schema must be empty"
-            );
+            assert!(names.contains(&col.to_string()), "missing {col}");
+        }
+    }
+    #[test]
+    fn manifests_schema_has_partition_summaries() {
+        let names: Vec<String> = metadata_table_schema(IcebergMetadataTableType::Manifests)
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        assert!(names.contains(&"partition_summaries".to_string()));
+        assert!(names.contains(&"added_snapshot_id".to_string()));
+    }
+    #[test]
+    fn entries_schema_superset_of_files() {
+        let names: Vec<String> =
+            metadata_table_schema(IcebergMetadataTableType::LogicalIcebergMetadata)
+                .iter()
+                .map(|c| c.name.clone())
+                .collect();
+        for col in [
+            "status",
+            "snapshot_id",
+            "sequence_number",
+            "file_sequence_number",
+            "file_path",
+            "record_count",
+        ] {
+            assert!(names.contains(&col.to_string()), "missing {col}");
         }
     }
 }
