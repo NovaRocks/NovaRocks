@@ -61,6 +61,7 @@ impl IcebergMetadataTableType {
             "HISTORY" => Ok(Self::History),
             "REFS" => Ok(Self::Refs),
             "PARTITIONS" => Ok(Self::Partitions),
+            "ENTRIES" => Ok(Self::LogicalIcebergMetadata),
             other => Err(format!("unsupported iceberg metadata table type: {other}")),
         }
     }
@@ -1114,6 +1115,22 @@ mod tests {
         assert_eq!(
             IcebergMetadataTableType::Partitions.as_uppercase_str(),
             "PARTITIONS"
+        );
+    }
+
+    #[test]
+    fn parse_accepts_entries_files_manifests() {
+        assert_eq!(
+            IcebergMetadataTableType::parse("entries").unwrap(),
+            IcebergMetadataTableType::LogicalIcebergMetadata
+        );
+        assert_eq!(
+            IcebergMetadataTableType::parse("files").unwrap(),
+            IcebergMetadataTableType::Files
+        );
+        assert_eq!(
+            IcebergMetadataTableType::parse("manifests").unwrap(),
+            IcebergMetadataTableType::Manifests
         );
     }
 

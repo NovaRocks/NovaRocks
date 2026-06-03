@@ -1350,13 +1350,14 @@ fn rewrite_iceberg_metadata_suffix(sql: &str) -> Result<String, String> {
             }
             let metatype_raw = &sql[idx + 1..end];
             let metatype = metatype_raw.to_ascii_lowercase();
-            // Whitelist the four scope types.
+            // Whitelist the supported metadata table types.
             match metatype.as_str() {
-                "snapshots" | "history" | "refs" | "partitions" => {}
+                "snapshots" | "history" | "refs" | "partitions" | "files" | "manifests"
+                | "entries" => {}
                 other => {
                     return Err(format!(
                         "unsupported iceberg metadata table type: {other}; \
-                         expected one of snapshots/history/refs/partitions"
+                         expected one of snapshots/history/refs/partitions/files/manifests/entries"
                     ));
                 }
             }
