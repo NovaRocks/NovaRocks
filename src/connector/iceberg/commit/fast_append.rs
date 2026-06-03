@@ -551,8 +551,8 @@ mod tests {
         assert_eq!(summary["total-records"], "18");
 
         // finalize_snapshot_summary carries total-* from a first snapshot (no previous).
-        use super::helpers::finalize_snapshot_summary;
-        let finalized = finalize_snapshot_summary(summary, None, false);
+        // super::finalize_snapshot_summary is imported in the parent module via use super::helpers.
+        let finalized = super::finalize_snapshot_summary(summary, None, false);
         // 2 files, 18 records, 2 * 1024 = 2048 bytes.
         assert_eq!(
             finalized.get("total-data-files").map(String::as_str),
