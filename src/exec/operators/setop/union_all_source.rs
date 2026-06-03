@@ -58,11 +58,13 @@ impl OperatorFactory for UnionAllSourceFactory {
         &self.name
     }
 
-    fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
+    fn create(&self, _dop: i32, driver_id: i32) -> Box<dyn Operator> {
+        // UNION ALL fan-in owns a single-consumer shared queue: only the
+        // pipeline-local driver 0 drains it.
         Box::new(UnionAllSourceOperator {
             name: self.name.clone(),
             state: self.state.clone(),
-            finished: false,
+            finished: driver_id != 0,
         })
     }
 
@@ -135,5 +137,68 @@ impl ProcessorOperator for UnionAllSourceOperator {
             return None;
         }
         Some(self.state.observable())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Int32Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    use super::*;
+    use crate::common::ids::SlotId;
+    use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
+
+    fn one_row_chunk() -> Chunk {
+        let field = Field::new("v", DataType::Int32, false);
+        let schema = Arc::new(Schema::new(vec![field.clone()]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![1])) as ArrayRef],
+        )
+        .expect("record batch");
+        let chunk_schema = Arc::new(
+            ChunkSchema::try_new(vec![
+                ChunkSlotSchema::from_field(SlotId(1), &field, None).expect("chunk slot"),
+            ])
+            .expect("chunk schema"),
+        );
+        Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk")
+    }
+
+    #[test]
+    fn non_zero_source_driver_does_not_drain_shared_queue() {
+        let state = RuntimeState::default();
+        let shared = UnionAllSharedState::new(1, 7);
+        shared.push_chunk(&state, one_row_chunk());
+
+        let factory = UnionAllSourceFactory::new(shared.clone(), 7);
+        let mut inactive = factory.create(2, 1);
+        let inactive_source = inactive
+            .as_processor_mut()
+            .expect("inactive source processor");
+        assert!(!inactive_source.has_output());
+        assert!(
+            inactive_source
+                .pull_chunk(&state)
+                .expect("inactive source pull")
+                .is_none()
+        );
+
+        let mut active = factory.create(2, 0);
+        let active_source = active.as_processor_mut().expect("active source processor");
+        assert!(active_source.has_output());
+        assert_eq!(
+            active_source
+                .pull_chunk(&state)
+                .expect("active source pull")
+                .expect("active source chunk")
+                .batch
+                .num_rows(),
+            1
+        );
     }
 }

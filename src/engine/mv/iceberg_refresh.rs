@@ -50,6 +50,7 @@ use crate::engine::mv::lifecycle::{
 };
 use crate::engine::mv::rebind::rewrite_select_sql_for_rebind;
 use crate::engine::mv::refresh_context::IcebergMvRefreshContext;
+use crate::engine::mv::refresh_contract::{ApplyKeyContract, RewriteEvidence};
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::mv::{
     BeginIcebergMvRefreshRequest, CreateMvDefinitionRequest, MvRefreshFinalizeRequest,
@@ -2009,6 +2010,7 @@ fn refresh_iceberg_mv_with_planned_partitions(
                 &base_refs,
                 &shape,
                 &aggregate_shape,
+                refresh_contract.apply_key,
                 planned_affected_partitions,
             );
         }
@@ -2033,6 +2035,7 @@ fn refresh_iceberg_mv_with_planned_partitions(
                 &mv_definition,
                 &base_refs,
                 join_shape,
+                refresh_contract.apply_key,
             );
         }
         crate::engine::mv::refresh_contract::RefreshStrategy::UnionProjectionFilter => {
@@ -2064,6 +2067,7 @@ fn refresh_iceberg_mv_with_planned_partitions(
                 &base_refs,
                 &canonical_select_query,
                 union_shape,
+                refresh_contract.apply_key,
             );
         }
         crate::engine::mv::refresh_contract::RefreshStrategy::UnsupportedBranchUnionAggregate => {
@@ -2277,12 +2281,7 @@ fn refresh_iceberg_mv_with_planned_partitions(
             &current_table_uuid,
             &pinned_full_select_sql,
             RewriteMergeRefreshOptions {
-                apply_key_column: ICEBERG_MV_APPLY_KEY_COLUMN,
-                apply_key_value_type:
-                    crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::Int64,
-                allow_full_rebuild_on_policy_full_refresh: true,
-                rewrite_evidence: RewriteMergeRefreshEvidence::None,
-                preload_locator_for_change_stream_deletes: false,
+                apply_key: refresh_contract.apply_key,
             },
         ),
 
@@ -2309,6 +2308,7 @@ fn refresh_iceberg_union_projection_mv(
     base_refs: &[IcebergTableRef],
     canonical_select_query: &sqlparser::ast::Query,
     union_shape: &crate::connector::starrocks::table::mv_shape::UnionAllMvShape,
+    apply_key: ApplyKeyContract,
 ) -> Result<StatementResult, String> {
     validate_union_projection_shape_base_refs(union_shape, base_refs)?;
     let schema_contract = mv_definition.schema_contract.as_ref().ok_or_else(|| {
@@ -2573,14 +2573,7 @@ fn refresh_iceberg_union_projection_mv(
         &ctx,
         &changes,
         None,
-        RewriteMergeRefreshOptions {
-            apply_key_column: ICEBERG_MV_APPLY_KEY_COLUMN,
-            apply_key_value_type:
-                crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::BranchInt64,
-            allow_full_rebuild_on_policy_full_refresh: false,
-            rewrite_evidence: RewriteMergeRefreshEvidence::None,
-            preload_locator_for_change_stream_deletes: false,
-        },
+        RewriteMergeRefreshOptions { apply_key },
     )
 }
 
@@ -2598,6 +2591,7 @@ fn refresh_iceberg_aggregate_mv(
     base_refs: &[IcebergTableRef],
     shape: &IncrementalMvShape,
     aggregate_shape: &AggregateMvShape,
+    apply_key: ApplyKeyContract,
     planned_affected_partitions: &crate::engine::mv::partition::AffectedMvPartitions,
 ) -> Result<StatementResult, String> {
     let schema_contract = validate_aggregate_schema_contract_metadata(target, mv_definition)?;
@@ -2618,6 +2612,7 @@ fn refresh_iceberg_aggregate_mv(
                 base_refs,
                 schema_contract,
                 aggregate_shape,
+                apply_key,
                 planned_affected_partitions,
             )
         }
@@ -2634,6 +2629,7 @@ fn refresh_iceberg_aggregate_mv(
             base_refs,
             schema_contract,
             aggregate_shape,
+            apply_key,
             planned_affected_partitions,
         ),
         IncrementalMvShape::JoinAggregate(join_aggregate_shape) => {
@@ -2651,6 +2647,7 @@ fn refresh_iceberg_aggregate_mv(
                 schema_contract,
                 join_aggregate_shape,
                 aggregate_shape,
+                apply_key,
                 planned_affected_partitions,
             )
         }
@@ -2700,6 +2697,7 @@ fn refresh_single_aggregate_iceberg_mv(
     base_refs: &[IcebergTableRef],
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
     aggregate_shape: &AggregateMvShape,
+    apply_key: ApplyKeyContract,
     planned_affected_partitions: &crate::engine::mv::partition::AffectedMvPartitions,
 ) -> Result<StatementResult, String> {
     let [base_ref] = base_refs else {
@@ -2878,14 +2876,7 @@ fn refresh_single_aggregate_iceberg_mv(
                 &loaded.table,
                 &current_table_uuid,
                 &mv_definition.select_sql,
-                RewriteMergeRefreshOptions {
-                    apply_key_column: ICEBERG_MV_GROUP_APPLY_KEY_COLUMN,
-                    apply_key_value_type:
-                        crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::Utf8,
-                    allow_full_rebuild_on_policy_full_refresh: false,
-                    rewrite_evidence: RewriteMergeRefreshEvidence::Aggregate,
-                    preload_locator_for_change_stream_deletes: true,
-                },
+                RewriteMergeRefreshOptions { apply_key },
             )
         }
     }
@@ -2925,6 +2916,7 @@ fn refresh_fan_in_aggregate_iceberg_mv(
     base_refs: &[IcebergTableRef],
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
     aggregate_shape: &AggregateMvShape,
+    apply_key: ApplyKeyContract,
     planned_affected_partitions: &crate::engine::mv::partition::AffectedMvPartitions,
 ) -> Result<StatementResult, String> {
     validate_aggregate_fan_in_base_refs(aggregate_shape, base_refs)?;
@@ -3160,13 +3152,7 @@ fn refresh_fan_in_aggregate_iceberg_mv(
         &ctx,
         &changes,
         None,
-        RewriteMergeRefreshOptions {
-            apply_key_column: ICEBERG_MV_GROUP_APPLY_KEY_COLUMN,
-            apply_key_value_type: crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::Utf8,
-            allow_full_rebuild_on_policy_full_refresh: false,
-            rewrite_evidence: RewriteMergeRefreshEvidence::Aggregate,
-            preload_locator_for_change_stream_deletes: true,
-        },
+        RewriteMergeRefreshOptions { apply_key },
     )
 }
 
@@ -3560,6 +3546,7 @@ fn refresh_join_aggregate_iceberg_mv(
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
     join_aggregate_shape: &JoinAggregateMvShape,
     aggregate_shape: &AggregateMvShape,
+    apply_key: ApplyKeyContract,
     planned_affected_partitions: &crate::engine::mv::partition::AffectedMvPartitions,
 ) -> Result<StatementResult, String> {
     if base_refs.len() != 2 {
@@ -3798,14 +3785,7 @@ fn refresh_join_aggregate_iceberg_mv(
                     },
                 ],
                 None,
-                RewriteMergeRefreshOptions {
-                    apply_key_column: ICEBERG_MV_GROUP_APPLY_KEY_COLUMN,
-                    apply_key_value_type:
-                        crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::Utf8,
-                    allow_full_rebuild_on_policy_full_refresh: false,
-                    rewrite_evidence: RewriteMergeRefreshEvidence::JoinAggregate,
-                    preload_locator_for_change_stream_deletes: true,
-                },
+                RewriteMergeRefreshOptions { apply_key },
             )
         }
         _ => Err(format!(
@@ -6754,9 +6734,16 @@ fn refresh_iceberg_join_mv(
     mv_definition: &StoredMvDefinition,
     base_refs: &[IcebergTableRef],
     shape: &crate::connector::starrocks::table::mv_shape::JoinProjectionFilterMvShape,
+    apply_key: ApplyKeyContract,
 ) -> Result<StatementResult, String> {
     if base_refs.len() != 2 {
         return Err("iceberg join MV refresh requires exactly two base tables".to_string());
+    }
+    if apply_key != ApplyKeyContract::join_projection_filter() {
+        return Err(
+            "iceberg join MV refresh contract did not match join projection/filter apply key"
+                .to_string(),
+        );
     }
     validate_join_shape_base_refs(shape, base_refs)?;
     let schema_contract = mv_definition.schema_contract.as_ref().ok_or_else(|| {
@@ -8623,11 +8610,7 @@ fn normalize_join_branch_snapshot_tables(
 /// snapshot is created.
 #[derive(Clone, Copy)]
 struct RewriteMergeRefreshOptions {
-    apply_key_column: &'static str,
-    apply_key_value_type: crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType,
-    allow_full_rebuild_on_policy_full_refresh: bool,
-    rewrite_evidence: RewriteMergeRefreshEvidence,
-    preload_locator_for_change_stream_deletes: bool,
+    apply_key: ApplyKeyContract,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -8635,6 +8618,14 @@ enum RewriteMergeRefreshEvidence {
     None,
     Aggregate,
     JoinAggregate,
+}
+
+fn rewrite_merge_refresh_evidence(evidence: RewriteEvidence) -> RewriteMergeRefreshEvidence {
+    match evidence {
+        RewriteEvidence::None => RewriteMergeRefreshEvidence::None,
+        RewriteEvidence::Aggregate => RewriteMergeRefreshEvidence::Aggregate,
+        RewriteEvidence::JoinAggregate => RewriteMergeRefreshEvidence::JoinAggregate,
+    }
 }
 
 struct RewriteMergeBaseChange<'a> {
@@ -8703,6 +8694,8 @@ fn incremental_refresh_iceberg_mv_with_changes(
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
     let current_database = ctx.rewrite.current_database.as_str();
     let mv_definition = &*ctx.rewrite.mv_definition;
+    let apply_key = options.apply_key;
+    let rewrite_evidence = rewrite_merge_refresh_evidence(apply_key.rewrite_evidence);
     if changes.is_empty() {
         return Err("iceberg MV incremental refresh requires at least one base change".to_string());
     }
@@ -8722,7 +8715,7 @@ fn incremental_refresh_iceberg_mv_with_changes(
             Ok(batch) => batch,
             Err(err) => match policy_signal_from_change_error(&err) {
                 IcebergChangePolicySignal::FullRefresh { reason } => {
-                    if !options.allow_full_rebuild_on_policy_full_refresh {
+                    if !apply_key.allow_full_rebuild_on_policy_full_refresh {
                         return Err(format!(
                             "iceberg aggregate MV {}.{}.{} cannot refresh incrementally and automatic full rebuild is disabled: {reason}",
                             target.catalog, target.namespace, target.table
@@ -8939,7 +8932,7 @@ fn incremental_refresh_iceberg_mv_with_changes(
         ));
     };
     let mut query = *query_box;
-    if options.rewrite_evidence != RewriteMergeRefreshEvidence::None {
+    if rewrite_evidence != RewriteMergeRefreshEvidence::None {
         alias_aggregate_refresh_group_key_projection(&mut query, ctx).map_err(|err| {
             handle_iceberg_mv_commit_error(
                 state,
@@ -8959,7 +8952,7 @@ fn incremental_refresh_iceberg_mv_with_changes(
     // carries DELETE-side rows or the IMV rewrite can emit change-stream
     // DELETE rows while applying existing target groups.
     let needs_locator_state =
-        has_delete_changes || options.preload_locator_for_change_stream_deletes;
+        has_delete_changes || apply_key.preload_locator_for_change_stream_deletes;
     let locator_state = if needs_locator_state {
         let inputs = match load_target_apply_locator_inputs(target_entry, &target_table) {
             Ok(v) => v,
@@ -8998,8 +8991,8 @@ fn incremental_refresh_iceberg_mv_with_changes(
         target_table: target_table.clone(),
         collector: Arc::clone(&collector),
         locator_state,
-        apply_key_column: options.apply_key_column.to_string(),
-        apply_key_value_type: options.apply_key_value_type,
+        apply_key_column: apply_key.column_name.to_string(),
+        apply_key_value_type: apply_key.value_type,
     };
     let merge_sink =
         crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkFactory::new(merge_sink_plan);
@@ -9020,13 +9013,13 @@ fn incremental_refresh_iceberg_mv_with_changes(
             .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
         let aggregate_rewrite_validator;
         let imv_rewrite_validator: Option<&crate::engine::ImvRewriteValidator<'_>> =
-            if options.rewrite_evidence != RewriteMergeRefreshEvidence::None {
+            if rewrite_evidence != RewriteMergeRefreshEvidence::None {
                 aggregate_rewrite_validator =
                     |outcome: &crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteOutcome| {
                         validate_aggregate_refresh_rewrite_outcome(
                             &ctx.rewrite,
                             outcome,
-                            options.rewrite_evidence,
+                            rewrite_evidence,
                         )
                     };
                 Some(&aggregate_rewrite_validator)
@@ -11650,27 +11643,28 @@ mod tests {
 
     #[test]
     fn refresh_iceberg_union_all_projection_mv_refreshes_branch_aware_rows() {
-        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
-        create_base_table_with_rows(&env.state, "ice", "sales", "orders", &[(10, "same")]);
-        create_base_table_with_rows(&env.state, "ice", "sales", "returns", &[(10, "same")]);
-        let stmt = parse_create_mv(
+        let catalog = "ice_union_projection_rows";
+        let env = open_test_state_with_hadoop_iceberg_catalog(catalog, "analytics");
+        create_base_table_with_rows(&env.state, catalog, "sales", "orders", &[(10, "same")]);
+        create_base_table_with_rows(&env.state, catalog, "sales", "returns", &[(10, "same")]);
+        let stmt = parse_create_mv(&format!(
             "CREATE MATERIALIZED VIEW mv_union_orders
              DISTRIBUTED BY HASH(id) BUCKETS 1
              PROPERTIES('storage_engine'='iceberg')
-             AS SELECT id, name FROM ice.sales.orders
+             AS SELECT id, name FROM {catalog}.sales.orders
                 UNION ALL
-                SELECT id, name FROM ice.sales.returns",
-        );
-        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+                SELECT id, name FROM {catalog}.sales.returns"
+        ));
+        create_iceberg_mv(&env.state, Some(catalog), &env.current_db, &stmt)
             .expect("create projection/filter UNION ALL iceberg mv");
 
         let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_union_orders");
-        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+        refresh_iceberg_mv(&env.state, Some(catalog), &env.current_db, &refresh)
             .expect("first projection/filter UNION ALL refresh");
 
         let first_rows = union_projection_rows_with_hidden(
             &env.state,
-            "ice",
+            catalog,
             &env.current_db,
             "mv_union_orders",
         );
@@ -11686,7 +11680,7 @@ mod tests {
             "test requires colliding base row ids across UNION ALL branches"
         );
 
-        let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_union_orders")
+        let mv = find_iceberg_mv_definition(&env.state, catalog, "analytics", "mv_union_orders")
             .expect("mv definition after first UNION ALL refresh");
         assert_eq!(mv.last_refresh_rows, Some(2));
         assert_eq!(mv.last_refresh_snapshots.len(), 2);
@@ -11694,26 +11688,26 @@ mod tests {
 
         execute_iceberg_sql(
             &env.state,
-            Some("ice"),
+            Some(catalog),
             &env.current_db,
-            "DELETE FROM ice.sales.orders WHERE id = 10",
+            &format!("DELETE FROM {catalog}.sales.orders WHERE id = 10"),
         );
         let target = crate::engine::mv::lifecycle::MvTarget {
-            catalog: Some("ice".to_string()),
+            catalog: Some(catalog.to_string()),
             database: "analytics".to_string(),
             name: "mv_union_orders".to_string(),
         };
         let plan =
-            plan_iceberg_mv_refresh(&env.state, Some("ice"), &env.current_db, &refresh, target)
+            plan_iceberg_mv_refresh(&env.state, Some(catalog), &env.current_db, &refresh, target)
                 .expect("projection/filter UNION ALL incremental plan");
         assert_eq!(plan.mode, RefreshMode::Incremental);
 
-        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+        refresh_iceberg_mv(&env.state, Some(catalog), &env.current_db, &refresh)
             .expect("incremental projection/filter UNION ALL refresh");
 
         let second_rows = union_projection_rows_with_hidden(
             &env.state,
-            "ice",
+            catalog,
             &env.current_db,
             "mv_union_orders",
         );
