@@ -85,7 +85,7 @@ FROM measurements_mv
 ORDER BY k;
 
 -- query 8
--- @expect_error=AVG aggregate requires a column expression argument
+-- @expect_error=Iceberg IMV refresh contract requires exactly one argument for aggregate function `avg`
 CREATE MATERIALIZED VIEW bad_avg_star
 DISTRIBUTED BY HASH(k) BUCKETS 2
 PROPERTIES ('storage_engine' = 'iceberg')
@@ -99,7 +99,7 @@ PROPERTIES ('storage_engine' = 'iceberg')
 AS SELECT k, AVG(s) FROM measurements GROUP BY k;
 
 -- query 10
--- @expect_error=MIN/MAX aggregate requires a column expression argument
+-- @expect_error=Iceberg IMV refresh contract requires exactly one argument for aggregate function `min`
 CREATE MATERIALIZED VIEW bad_min_star
 DISTRIBUTED BY HASH(k) BUCKETS 2
 PROPERTIES ('storage_engine' = 'iceberg')

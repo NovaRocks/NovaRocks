@@ -43,7 +43,7 @@ SET CATALOG ice_ivm_join_reject_${uuid0};
 USE ns_${uuid0};
 
 -- query 2
--- @expect_error=incremental join MV supports only two-table inner equi-join
+-- @expect_error=Iceberg IMV refresh contract supports only two-table inner equi-join shapes
 CREATE MATERIALIZED VIEW reject_outer_${uuid0}
 DISTRIBUTED BY HASH(id) BUCKETS 1
 PROPERTIES ('storage_engine' = 'iceberg')
@@ -52,7 +52,7 @@ FROM ice_ivm_join_reject_${uuid0}.ns_${uuid0}.reject_left_${uuid0} AS l
 LEFT JOIN ice_ivm_join_reject_${uuid0}.ns_${uuid0}.reject_right_${uuid0} AS r ON l.rid = r.rid;
 
 -- query 3
--- @expect_error=incremental join MV supports only AND-combined equi-join predicates
+-- @expect_error=Iceberg IMV refresh contract supports only AND-combined equi-join predicates
 CREATE MATERIALIZED VIEW reject_nonequi_${uuid0}
 DISTRIBUTED BY HASH(id) BUCKETS 1
 PROPERTIES ('storage_engine' = 'iceberg')
@@ -61,7 +61,7 @@ FROM ice_ivm_join_reject_${uuid0}.ns_${uuid0}.reject_left_${uuid0} AS l
 JOIN ice_ivm_join_reject_${uuid0}.ns_${uuid0}.reject_right_${uuid0} AS r ON l.rid > r.rid;
 
 -- query 4
--- @expect_error=incremental join MV requires exactly two Iceberg base tables
+-- @expect_error=Iceberg IMV refresh contract supports join keys only over direct scan inputs
 CREATE MATERIALIZED VIEW reject_three_${uuid0}
 DISTRIBUTED BY HASH(id) BUCKETS 1
 PROPERTIES ('storage_engine' = 'iceberg')
