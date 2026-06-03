@@ -108,6 +108,19 @@ pub(crate) trait TableSource: Send + Sync {
         self.build_table_def(table)
     }
 
+    /// Build a schema-only `TableDef` that additionally carries the resolved
+    /// `$files` / `$manifests` / `$entries` metadata rows. The default
+    /// preserves existing connector behavior (no metadata-row materialisation);
+    /// iceberg overrides this to walk the current snapshot's manifests.
+    fn build_metadata_rows_table_def(
+        &self,
+        resolved: &ResolvedTable,
+        metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType,
+    ) -> Result<crate::sql::catalog::TableDef, String> {
+        let _ = metadata_table_type;
+        self.build_schema_table_def(resolved)
+    }
+
     /// Phase-1 entry point for time-travel-aware table-def construction.
     /// Default impl ignores the snapshot pin and delegates to `build_table_def`,
     /// which is correct for connectors that do not have time-travel semantics.

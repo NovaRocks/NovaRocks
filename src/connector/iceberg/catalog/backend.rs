@@ -158,6 +158,40 @@ impl TableSource for IcebergTableSource {
         )
     }
 
+    fn build_metadata_rows_table_def(
+        &self,
+        resolved: &ResolvedTable,
+        metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType,
+    ) -> Result<TableDef, String> {
+        let guard = self.registry.read().expect("iceberg catalog read lock");
+        let entry = guard.get(&resolved.catalog)?;
+        let loaded = reg_load_table(&entry, &resolved.namespace, &resolved.table)?;
+        // The iceberg-rust `Table` is `Clone`; capture it (and its `FileIO`)
+        // before `build_iceberg_schema_table_def` consumes `loaded`.
+        let iceberg_table = loaded.table.clone();
+        let file_io = iceberg_table.file_io().clone();
+        let mut def = build_iceberg_schema_table_def(
+            &entry,
+            &resolved.catalog,
+            &resolved.namespace,
+            &resolved.table,
+            loaded,
+        )?;
+        drop(guard);
+        let rows = super::registry::block_on_iceberg(async {
+            crate::connector::iceberg::metadata_read::read_metadata_table_rows(
+                &iceberg_table,
+                &file_io,
+                metadata_table_type,
+            )
+            .await
+        })??;
+        if let crate::sql::catalog::ScanSource::IcebergDataFiles { table, .. } = &mut def.source {
+            table.serialized_metadata_rows = Some(rows);
+        }
+        Ok(def)
+    }
+
     fn build_table_def_at(
         &self,
         table: &ResolvedTable,

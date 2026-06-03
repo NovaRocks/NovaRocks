@@ -60,6 +60,20 @@ impl<'a> CatalogMgrProvider<'a> {
                 let resolved = backend.load_table(catalog, database, table)?;
                 source.build_table_def(&resolved)
             }
+            TableLookupMode::IcebergMetadata {
+                metadata_table_type,
+            } if matches!(
+                metadata_table_type,
+                crate::connector::iceberg::IcebergMetadataTableType::Files
+                    | crate::connector::iceberg::IcebergMetadataTableType::Manifests
+                    | crate::connector::iceberg::IcebergMetadataTableType::LogicalIcebergMetadata
+            ) =>
+            {
+                let backend = self.connectors.catalog_backend("iceberg")?;
+                let source = self.connectors.table_source("iceberg")?;
+                let resolved = backend.load_table(catalog, database, table)?;
+                source.build_metadata_rows_table_def(&resolved, metadata_table_type.clone())
+            }
             TableLookupMode::IcebergMetadata { .. } => {
                 let backend = self.connectors.catalog_backend("iceberg")?;
                 let source = self.connectors.table_source("iceberg")?;
