@@ -128,6 +128,10 @@ pub struct IcebergTableInfo {
     /// paths that do not have access to the iceberg `TableMetadata`
     /// (e.g. synthetic test fixtures).
     pub serialized_metadata: Option<String>,
+    /// JSON-serialized per-row payload for the `$files` / `$manifests` /
+    /// `$entries` metadata tables, produced by the resolution-time manifest
+    /// walk. `None` for all other tables.
+    pub serialized_metadata_rows: Option<String>,
 }
 
 /// Metadata for an IMV target-state scan source. This struct carries only
@@ -426,6 +430,7 @@ mod tests {
             location: "file:///tmp/test_table".to_string(),
             schema,
             serialized_metadata: None,
+            serialized_metadata_rows: None,
         }
     }
 
