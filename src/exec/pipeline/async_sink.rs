@@ -116,7 +116,10 @@ impl<B: AsyncSinkBackend> AsyncSinkOperator<B> {
     }
 
     /// Take the finish output (available once `is_finished()` is true after a
-    /// clean finish). Returns None if errored or not finished.
+    /// clean finish). Returns None if errored or not finished. On the error path
+    /// the output is never populated, so a consumer (e.g. the IW-4 commit
+    /// coordinator) must distinguish "clean finish" from "errored" via
+    /// `RuntimeState`/`RuntimeErrorState`, not via this returning None.
     pub fn take_output(&self) -> Option<B::Output> {
         self.shared.result.lock().expect("sink result lock").take()
     }
@@ -183,6 +186,8 @@ impl<B: AsyncSinkBackend> Operator for AsyncSinkOperator<B> {
             .ok_or_else(|| "async sink receiver already bound".to_string())?;
         let shared = Arc::clone(&self.shared);
         let join = sink_io.spawn(async move {
+            // drain_loop reports any failure via RuntimeErrorState before returning;
+            // its Err is informational only, so discarding it here loses no error.
             let _ = drain_loop(backend, rx, shared, error_state).await;
         });
         self.join = Some(join);
