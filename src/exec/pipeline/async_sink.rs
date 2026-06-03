@@ -474,4 +474,23 @@ mod tests {
             "unexpected error text"
         );
     }
+
+    #[test]
+    fn cancel_mid_flight_aborts_without_hang() {
+        let state = RuntimeState::default();
+        // gate closed: bg task is parked inside write_chunk when we cancel.
+        let (backend, _rows, _chunks) = TestAsyncSink::new(0);
+        let mut op = AsyncSinkOperator::new("cancel_sink", backend, 4);
+        op.bind_runtime_state(&state).expect("bind");
+
+        op.push_chunk(&state, make_chunk(1)).expect("push");
+        op.cancel();
+
+        // Cancel is non-blocking and converges the operator.
+        assert!(
+            poll_until(|| op.is_finished(), Duration::from_secs(5)),
+            "cancel did not converge sink"
+        );
+        assert!(!op.need_input(), "canceled sink must not accept input");
+    }
 }
