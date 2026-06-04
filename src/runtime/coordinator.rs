@@ -772,6 +772,8 @@ fn wait_for_write_commit_ready(
             Ok(commit) => return Ok(commit),
             Err(e) => e,
         };
+        #[cfg(test)]
+        notify_write_commit_wait_observer(&commit_error);
 
         let now = std::time::Instant::now();
         if now >= deadline {
@@ -795,6 +797,62 @@ fn wait_for_write_commit_ready(
     }
 }
 
+#[cfg(test)]
+struct WriteCommitWaitObserverGuard;
+
+#[cfg(test)]
+struct WriteCommitWaitObserver {
+    expected_error_substring: String,
+    tx: std::sync::mpsc::Sender<String>,
+}
+
+#[cfg(test)]
+impl Drop for WriteCommitWaitObserverGuard {
+    fn drop(&mut self) {
+        *write_commit_wait_observer()
+            .lock()
+            .expect("write commit wait observer lock") = None;
+    }
+}
+
+#[cfg(test)]
+fn write_commit_wait_observer() -> &'static Mutex<Option<WriteCommitWaitObserver>> {
+    static OBSERVER: std::sync::OnceLock<Mutex<Option<WriteCommitWaitObserver>>> =
+        std::sync::OnceLock::new();
+    OBSERVER.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn set_write_commit_wait_observer(
+    expected_error_substring: impl Into<String>,
+    tx: std::sync::mpsc::Sender<String>,
+) -> WriteCommitWaitObserverGuard {
+    let mut observer = write_commit_wait_observer()
+        .lock()
+        .expect("write commit wait observer lock");
+    assert!(
+        observer.is_none(),
+        "write commit wait observer already registered"
+    );
+    *observer = Some(WriteCommitWaitObserver {
+        expected_error_substring: expected_error_substring.into(),
+        tx,
+    });
+    WriteCommitWaitObserverGuard
+}
+
+#[cfg(test)]
+fn notify_write_commit_wait_observer(commit_error: &str) {
+    let observer = write_commit_wait_observer()
+        .lock()
+        .expect("write commit wait observer lock");
+    if let Some(observer) = observer.as_ref()
+        && commit_error.contains(&observer.expected_error_substring)
+    {
+        let _ = observer.tx.send(commit_error.to_string());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -808,8 +866,7 @@ mod tests {
     use super::*;
     use crate::runtime::dispatcher::{FetchOutcome, FragmentDispatcher};
     use crate::runtime::write_coordinator::{
-        FragmentExecStatusReport, WriteCoordinator, WriterKey, register_query, test_clear_registry,
-        unregister_query,
+        FragmentExecStatusReport, WriteCoordinator, WriterKey, write_registry_test_guard,
     };
     use crate::{status, status_code};
 
@@ -956,6 +1013,7 @@ mod tests {
 
     struct EofSignalDispatcher {
         submitted: Mutex<Vec<types::TUniqueId>>,
+        cancelled: Mutex<Vec<types::TUniqueId>>,
         eof_tx: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     }
 
@@ -977,8 +1035,13 @@ mod tests {
         fn new(eof_tx: std::sync::mpsc::Sender<()>) -> Arc<Self> {
             Arc::new(Self {
                 submitted: Mutex::new(Vec::new()),
+                cancelled: Mutex::new(Vec::new()),
                 eof_tx: Mutex::new(Some(eof_tx)),
             })
+        }
+
+        fn cancelled_ids(&self) -> Vec<types::TUniqueId> {
+            self.cancelled.lock().unwrap().clone()
         }
     }
 
@@ -1094,7 +1157,9 @@ mod tests {
             Ok(FetchOutcome::Eof)
         }
 
-        fn cancel_fragments(&self, _backend_idx: usize, _finst_ids: &[types::TUniqueId]) {}
+        fn cancel_fragments(&self, _backend_idx: usize, finst_ids: &[types::TUniqueId]) {
+            self.cancelled.lock().unwrap().extend_from_slice(finst_ids);
+        }
 
         fn backend_count(&self) -> usize {
             1
@@ -1215,24 +1280,6 @@ mod tests {
 
     fn is_write_sink_for_test(params: &crate::internal_service::TExecPlanFragmentParams) -> bool {
         super::is_write_sink(params)
-    }
-
-    #[allow(dead_code)]
-    struct WriteRegistryTestGuard(std::sync::MutexGuard<'static, ()>);
-
-    impl Drop for WriteRegistryTestGuard {
-        fn drop(&mut self) {
-            test_clear_registry();
-        }
-    }
-
-    fn write_registry_test_guard() -> WriteRegistryTestGuard {
-        static REGISTRY_TEST_LOCK: Mutex<()> = Mutex::new(());
-        let guard = REGISTRY_TEST_LOCK
-            .lock()
-            .expect("coordinator write registry test lock");
-        test_clear_registry();
-        WriteRegistryTestGuard(guard)
     }
 
     fn id(hi: i64, lo: i64) -> types::TUniqueId {
@@ -1448,11 +1495,12 @@ mod tests {
 
     #[test]
     fn write_failure_seen_by_coordinator_cancels_inflight_fragments() {
-        let _guard = write_registry_test_guard();
+        let mut guard = write_registry_test_guard();
         let query_id = id(710, 711);
         let writer = writer_key(710, 711, 712, 713, 0);
-        let write =
-            register_query(query_id.clone(), vec![writer.clone()]).expect("register writer");
+        let write = guard
+            .register_query(query_id.clone(), vec![writer.clone()])
+            .expect("register writer");
 
         write
             .lock()
@@ -1479,8 +1527,6 @@ mod tests {
             .commit_input()
             .expect_err("failed writer must block commit");
         assert!(commit_err.contains("writer failed"), "{commit_err}");
-
-        unregister_query(&query_id);
     }
 
     #[test]
@@ -1537,7 +1583,6 @@ mod tests {
         let writer_for_report = writer.clone();
         let report_thread = std::thread::spawn(move || {
             eof_rx.recv().expect("root EOF signal");
-            std::thread::sleep(std::time::Duration::from_millis(50));
             write_for_report
                 .lock()
                 .expect("write coordinator lock")
@@ -1574,6 +1619,82 @@ mod tests {
         let output = result.expect("delayed final report succeeds");
         assert!(output.chunks.is_empty());
         assert!(output.write_commit.is_some());
+    }
+
+    #[test]
+    fn write_failure_during_post_eof_wait_cancels_submitted_fragments() {
+        let query_id = id(760, 761);
+        let writer = writer_key(760, 761, 762, 763, 0);
+        let write = Arc::new(Mutex::new(
+            WriteCoordinator::new(query_id.clone(), vec![writer.clone()])
+                .expect("write coordinator"),
+        ));
+        let (eof_tx, _eof_rx) = std::sync::mpsc::channel();
+        let inner = EofSignalDispatcher::new(eof_tx);
+        let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
+        let (wait_tx, wait_rx) = std::sync::mpsc::channel();
+        let _wait_observer = set_write_commit_wait_observer(
+            format!("query={}/{}", query_id.hi, query_id.lo),
+            wait_tx,
+        );
+        let write_for_report = Arc::clone(&write);
+        let writer_for_report = writer.clone();
+        let report_thread = std::thread::spawn(move || {
+            let wait_error = wait_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("post-EOF write wait signal");
+            assert!(
+                wait_error.contains("missing writer final report"),
+                "{wait_error}"
+            );
+            write_for_report
+                .lock()
+                .expect("write coordinator lock")
+                .apply_report(write_report(
+                    &writer_for_report,
+                    true,
+                    err_status("delayed writer failure"),
+                    "",
+                ))
+                .expect("delayed writer failure report");
+        });
+
+        let root_finst_id = types::TUniqueId::new(760, 1);
+        let params = single_backend(vec![
+            make_params_with_finst(760, 10),
+            make_params_with_finst(760, 1),
+        ]);
+        let mut tracker = InFlightTracker::default();
+        let err = submit_and_fetch_loop(
+            &dispatcher,
+            &mut tracker,
+            params,
+            0,
+            root_finst_id,
+            1_000,
+            Some(&write),
+        )
+        .expect_err("writer failure during post-EOF wait must fail query");
+
+        report_thread.join().expect("delayed report thread");
+        assert!(err.contains("delayed writer failure"), "{err}");
+        assert_eq!(
+            inner.cancelled_ids(),
+            vec![
+                types::TUniqueId::new(760, 10),
+                types::TUniqueId::new(760, 1)
+            ],
+            "post-EOF writer failure must cancel all submitted fragments"
+        );
+        let commit_err = write
+            .lock()
+            .expect("write coordinator lock")
+            .commit_input()
+            .expect_err("failed writer must block commit");
+        assert!(
+            commit_err.contains("delayed writer failure"),
+            "{commit_err}"
+        );
     }
 
     #[test]

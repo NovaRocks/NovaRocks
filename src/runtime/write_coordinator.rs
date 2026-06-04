@@ -453,17 +453,55 @@ pub(crate) fn test_clear_registry() {
 }
 
 #[cfg(test)]
+pub(crate) struct WriteRegistryTestGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    registered_queries: Vec<types::TUniqueId>,
+}
+
+#[cfg(test)]
+impl WriteRegistryTestGuard {
+    pub(crate) fn register_query(
+        &mut self,
+        query_id: types::TUniqueId,
+        writers: Vec<WriterKey>,
+    ) -> Result<Arc<Mutex<WriteCoordinator>>, String> {
+        let coord = register_query(query_id.clone(), writers)?;
+        self.registered_queries.push(query_id);
+        Ok(coord)
+    }
+
+    pub(crate) fn unregister_query(&mut self, query_id: &types::TUniqueId) {
+        unregister_query(query_id);
+        self.registered_queries.retain(|id| id != query_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for WriteRegistryTestGuard {
+    fn drop(&mut self) {
+        for query_id in self.registered_queries.iter().rev() {
+            unregister_query(query_id);
+        }
+        test_clear_registry();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn write_registry_test_guard() -> WriteRegistryTestGuard {
+    static REGISTRY_TEST_LOCK: Mutex<()> = Mutex::new(());
+    let lock = REGISTRY_TEST_LOCK
+        .lock()
+        .expect("write coordinator registry test lock");
+    test_clear_registry();
+    WriteRegistryTestGuard {
+        _lock: lock,
+        registered_queries: Vec::new(),
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-
-    fn registry_test_guard() -> std::sync::MutexGuard<'static, ()> {
-        static REGISTRY_TEST_LOCK: Mutex<()> = Mutex::new(());
-        let guard = REGISTRY_TEST_LOCK
-            .lock()
-            .expect("write coordinator registry test lock");
-        test_clear_registry();
-        guard
-    }
 
     fn id(hi: i64, lo: i64) -> types::TUniqueId {
         types::TUniqueId::new(hi, lo)
@@ -601,6 +639,13 @@ mod tests {
                 .as_ref()
                 .and_then(|f| f.path.as_deref()),
             Some("s3://w/a.parquet")
+        );
+        assert_eq!(
+            input.writers[1].sink_commit_infos[0]
+                .iceberg_data_file
+                .as_ref()
+                .and_then(|f| f.path.as_deref()),
+            Some("s3://w/b.parquet")
         );
     }
 
@@ -868,10 +913,11 @@ mod tests {
 
     #[test]
     fn registry_registers_handles_reports_unregisters_and_rejects_unknown_query() {
-        let _guard = registry_test_guard();
+        let mut guard = write_registry_test_guard();
         let query_id = id(19, 29);
         let writer = key(19, 29, 121, 221, 0);
-        let coord = register_query(query_id.clone(), vec![writer.clone()])
+        let coord = guard
+            .register_query(query_id.clone(), vec![writer.clone()])
             .expect("register write coordinator");
 
         assert_eq!(
@@ -891,7 +937,7 @@ mod tests {
             .expect("commit input");
         assert_eq!(commit.write_id, query_id);
 
-        unregister_query(&query_id);
+        guard.unregister_query(&query_id);
         let err = handle_report_exec_status(thrift_params(report(
             &writer,
             true,
@@ -903,15 +949,74 @@ mod tests {
     }
 
     #[test]
+    fn registry_handles_two_writer_reports_and_builds_commit_input() {
+        let mut guard = write_registry_test_guard();
+        let query_id = id(24, 34);
+        let writer_a = key(24, 34, 124, 224, 0);
+        let writer_b = key(24, 34, 125, 225, 1);
+        let coord = guard
+            .register_query(query_id.clone(), vec![writer_a.clone(), writer_b.clone()])
+            .expect("register two writer coordinator");
+
+        assert_eq!(
+            handle_report_exec_status(thrift_params(report(
+                &writer_a,
+                true,
+                ok_status(),
+                "s3://w/registry-a.parquet"
+            )))
+            .expect("handle writer a report"),
+            ReportOutcome::Accepted
+        );
+        assert_eq!(
+            handle_report_exec_status(thrift_params(report(
+                &writer_b,
+                true,
+                ok_status(),
+                "s3://w/registry-b.parquet"
+            )))
+            .expect("handle writer b report"),
+            ReportOutcome::CommitReady
+        );
+
+        let commit = coord
+            .lock()
+            .expect("write coordinator lock")
+            .commit_input()
+            .expect("commit input");
+        assert_eq!(commit.write_id, query_id);
+        assert_eq!(commit.writers.len(), 2);
+        assert_eq!(commit.writers[0].writer_id, 0);
+        assert_eq!(commit.writers[1].writer_id, 1);
+        assert_eq!(commit.writers[0].writer_key, writer_a);
+        assert_eq!(commit.writers[1].writer_key, writer_b);
+        assert_eq!(
+            commit.writers[0].sink_commit_infos[0]
+                .iceberg_data_file
+                .as_ref()
+                .and_then(|f| f.path.as_deref()),
+            Some("s3://w/registry-a.parquet")
+        );
+        assert_eq!(
+            commit.writers[1].sink_commit_infos[0]
+                .iceberg_data_file
+                .as_ref()
+                .and_then(|f| f.path.as_deref()),
+            Some("s3://w/registry-b.parquet")
+        );
+    }
+
+    #[test]
     fn registry_rejects_duplicate_query_registration() {
-        let _guard = registry_test_guard();
+        let mut guard = write_registry_test_guard();
         let query_id = id(20, 30);
         let writer = key(20, 30, 122, 222, 0);
-        register_query(query_id.clone(), vec![writer.clone()]).expect("first registration");
+        guard
+            .register_query(query_id.clone(), vec![writer.clone()])
+            .expect("first registration");
         let err = register_query(query_id.clone(), vec![writer])
             .expect_err("duplicate query registration must fail");
         assert!(err.contains("already registered"), "{err}");
-        unregister_query(&query_id);
     }
 
     #[test]
