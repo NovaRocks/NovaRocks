@@ -181,18 +181,29 @@ fn validate_transform(
         .field_by_id(source_id)
         .ok_or_else(|| format!("partition source field id {source_id} is missing"))?;
     let source_type = field.field_type.as_ref();
+    let col = field.name.as_str();
     match expr {
         IcebergPartitionFieldExpr::Year { .. }
         | IcebergPartitionFieldExpr::Month { .. }
         | IcebergPartitionFieldExpr::Day { .. } => {
+            // Fail-fast for nanosecond timestamps: partition derivation assumes
+            // microsecond epoch ticks; nanosecond columns would silently produce
+            // wrong partition values (IV3-7.1 tracks full ns transform support).
+            if matches!(
+                source_type,
+                Type::Primitive(PrimitiveType::TimestampNs | PrimitiveType::TimestamptzNs)
+            ) {
+                let transform = to_transform(expr);
+                return Err(format!(
+                    "partition transform `{transform}` on nanosecond timestamp column `{col}` is not supported yet (IV3-7.1); use a microsecond timestamp column or omit the time-based partition transform"
+                ));
+            }
             if !matches!(
                 source_type,
                 Type::Primitive(
                     PrimitiveType::Date
                         | PrimitiveType::Timestamp
                         | PrimitiveType::Timestamptz
-                        | PrimitiveType::TimestampNs
-                        | PrimitiveType::TimestamptzNs
                 )
             ) {
                 return Err(format!(
@@ -201,14 +212,19 @@ fn validate_transform(
             }
         }
         IcebergPartitionFieldExpr::Hour { .. } => {
+            // Fail-fast for nanosecond timestamps (same reason as year/month/day).
+            if matches!(
+                source_type,
+                Type::Primitive(PrimitiveType::TimestampNs | PrimitiveType::TimestamptzNs)
+            ) {
+                let transform = to_transform(expr);
+                return Err(format!(
+                    "partition transform `{transform}` on nanosecond timestamp column `{col}` is not supported yet (IV3-7.1); use a microsecond timestamp column or omit the time-based partition transform"
+                ));
+            }
             if !matches!(
                 source_type,
-                Type::Primitive(
-                    PrimitiveType::Timestamp
-                        | PrimitiveType::Timestamptz
-                        | PrimitiveType::TimestampNs
-                        | PrimitiveType::TimestamptzNs
-                )
+                Type::Primitive(PrimitiveType::Timestamp | PrimitiveType::Timestamptz)
             ) {
                 return Err(format!(
                     "temporal partition transform requires timestamp source, got {source_type}"
@@ -341,6 +357,104 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("date/timestamp"), "{err}");
+    }
+
+    fn schema_with_ns_timestamp() -> Schema {
+        Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "ts_ns",
+                    Type::Primitive(PrimitiveType::TimestampNs),
+                )),
+                Arc::new(NestedField::optional(
+                    3,
+                    "tstz_ns",
+                    Type::Primitive(PrimitiveType::TimestamptzNs),
+                )),
+            ])
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn time_transform_on_ns_timestamp_is_rejected() {
+        let schema = schema_with_ns_timestamp();
+        // All four time transforms must fail for TimestampNs.
+        for expr in [
+            IcebergPartitionFieldExpr::Year {
+                column: "ts_ns".to_string(),
+            },
+            IcebergPartitionFieldExpr::Month {
+                column: "ts_ns".to_string(),
+            },
+            IcebergPartitionFieldExpr::Day {
+                column: "ts_ns".to_string(),
+            },
+            IcebergPartitionFieldExpr::Hour {
+                column: "ts_ns".to_string(),
+            },
+        ] {
+            let err = build_initial_partition_spec(&schema, &[expr]).unwrap_err();
+            assert!(
+                err.contains("nanosecond"),
+                "expected nanosecond in error, got: {err}"
+            );
+            assert!(
+                err.contains("IV3-7.1"),
+                "expected IV3-7.1 reference in error, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn time_transform_on_ns_timestamptz_is_rejected() {
+        let schema = schema_with_ns_timestamp();
+        for expr in [
+            IcebergPartitionFieldExpr::Year {
+                column: "tstz_ns".to_string(),
+            },
+            IcebergPartitionFieldExpr::Month {
+                column: "tstz_ns".to_string(),
+            },
+            IcebergPartitionFieldExpr::Day {
+                column: "tstz_ns".to_string(),
+            },
+            IcebergPartitionFieldExpr::Hour {
+                column: "tstz_ns".to_string(),
+            },
+        ] {
+            let err = build_initial_partition_spec(&schema, &[expr]).unwrap_err();
+            assert!(
+                err.contains("nanosecond"),
+                "expected nanosecond in error, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_time_transforms_on_ns_timestamp_are_allowed() {
+        let schema = schema_with_ns_timestamp();
+        // Bucket and truncate do not depend on the tick base; they should be
+        // permitted even for nanosecond columns.
+        let result = build_initial_partition_spec(
+            &schema,
+            &[
+                IcebergPartitionFieldExpr::Identity {
+                    column: "ts_ns".to_string(),
+                },
+                IcebergPartitionFieldExpr::Bucket {
+                    column: "id".to_string(),
+                    num_buckets: 4,
+                },
+            ],
+        );
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
     }
 }
 

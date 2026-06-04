@@ -57,9 +57,19 @@ SELECT id, CAST(CAST(ts AS DATETIME) AS STRING) AS micros
   ORDER BY id;
 
 -- query 7
+-- Fail-fast guard: a time-based partition transform on a nanosecond timestamp
+-- column must error rather than silently mis-derive partitions (IV3-7.1).
+-- @expect_error=nanosecond
+CREATE TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_tsns_db_${uuid0}.t_tsns_part_${uuid0} (
+  id BIGINT,
+  ts TIMESTAMP_NS
+) PARTITION BY (day(ts))
+TBLPROPERTIES ("format-version" = "3");
+
+-- query 8
 -- @skip_result_check=true
 DROP TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_tsns_db_${uuid0}.t_tsns_${uuid0};
 
--- query 8
+-- query 9
 -- @skip_result_check=true
 DROP DATABASE iceberg_rest_${suite_uuid0}.iceberg_rest_tsns_db_${uuid0};
