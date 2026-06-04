@@ -74,6 +74,7 @@ pub(crate) fn build_exec_plan_fragment_params(
         None::<i32>,                               // group_execution_scan_dop
         None::<internal_service::TPredicateTreeParams>, // pred_tree_params
         None::<Vec<i32>>,                          // exec_stats_node_ids
+        None::<i32>,                               // arrow_flight_sql_version
         novarocks_report_addr,
     )
 }
@@ -363,6 +364,32 @@ mod tests {
         assert_eq!(
             params.coord, None,
             "StarRocks FE coord must remain separate"
+        );
+    }
+
+    #[test]
+    fn novarocks_report_addr_uses_private_thrift_field_id() {
+        let idl = include_str!("../../idl/thrift/InternalService.thrift");
+        let struct_body = idl
+            .split("struct TExecPlanFragmentParams {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("TExecPlanFragmentParams struct must exist in InternalService.thrift");
+
+        assert!(
+            struct_body.contains("62: optional i32 arrow_flight_sql_version;"),
+            "field 62 must stay aligned with the StarRocks FE-compatible wire contract"
+        );
+        assert!(
+            !struct_body
+                .lines()
+                .any(|line| line.trim_start().starts_with("62:")
+                    && line.contains("novarocks_report_addr")),
+            "novarocks_report_addr must not occupy field 62"
+        );
+        assert!(
+            struct_body.contains("10001: optional Types.TNetworkAddress novarocks_report_addr;"),
+            "novarocks_report_addr must use a NovaRocks-private high field id"
         );
     }
 }

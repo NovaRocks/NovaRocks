@@ -524,9 +524,11 @@ struct TExecPlanFragmentParams {
 
   61: optional list<i32> exec_stats_node_ids;
 
-  // NovaRocks standalone coordinator report endpoint. When present, BE sends
-  // TReportExecStatusParams through NovaRocksGrpc instead of StarRocks FE thrift.
-  62: optional Types.TNetworkAddress novarocks_report_addr;
+  62: optional i32 arrow_flight_sql_version;
+
+  // NovaRocks-only standalone coordinator report endpoint. Task 6 wires the
+  // coordinator-provided value.
+  10001: optional Types.TNetworkAddress novarocks_report_addr;
 }
 
 struct TExecPlanFragmentResult {
