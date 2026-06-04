@@ -824,6 +824,7 @@ fn is_supported_embedded_statement(query: &str) -> bool {
         || head.eq_ignore_ascii_case("truncate")
         || head.eq_ignore_ascii_case("alter")
         || head.eq_ignore_ascii_case("analyze")
+        || head.eq_ignore_ascii_case("call")
         || head.eq_ignore_ascii_case("admin")
 }
 
@@ -1465,6 +1466,12 @@ mod tests {
             !is_session_noop(sql),
             "DELETE must reach the embedded engine so Iceberg row deletes are committed"
         );
+        assert!(is_supported_embedded_statement(sql));
+    }
+
+    #[test]
+    fn call_is_dispatched_to_embedded_engine() {
+        let sql = "CALL ice.system.rewrite_manifests(table => 'ns.orders')";
         assert!(is_supported_embedded_statement(sql));
     }
 
