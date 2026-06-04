@@ -403,18 +403,45 @@ struct LiveFiles {
     delete_files: Vec<LiveManifestEntry>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct LiveFileMetrics {
+    pub(crate) data_files: i64,
+    pub(crate) delete_files: i64,
+    pub(crate) data_bytes: i64,
+    pub(crate) delete_bytes: i64,
+}
+
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) async fn count_current_live_files(
     table: &Table,
     file_io: &FileIO,
 ) -> Result<(i64, i64), String> {
+    let metrics = current_live_file_metrics(table, file_io).await?;
+    Ok((metrics.data_files, metrics.delete_files))
+}
+
+pub(crate) async fn current_live_file_metrics(
+    table: &Table,
+    file_io: &FileIO,
+) -> Result<LiveFileMetrics, String> {
     let live = enumerate_live_files(table, file_io).await?;
-    Ok((
-        i64::try_from(live.data_files.len())
+    Ok(LiveFileMetrics {
+        data_files: i64::try_from(live.data_files.len())
             .map_err(|_| "live data file count overflow".to_string())?,
-        i64::try_from(live.delete_files.len())
+        delete_files: i64::try_from(live.delete_files.len())
             .map_err(|_| "live delete file count overflow".to_string())?,
-    ))
+        data_bytes: live_file_bytes(&live.data_files, "data")?,
+        delete_bytes: live_file_bytes(&live.delete_files, "delete")?,
+    })
+}
+
+fn live_file_bytes(files: &[LiveManifestEntry], label: &str) -> Result<i64, String> {
+    files.iter().try_fold(0_i64, |sum, entry| {
+        let bytes = i64::try_from(entry.data_file.file_size_in_bytes())
+            .map_err(|_| format!("live {label} file size overflow"))?;
+        sum.checked_add(bytes)
+            .ok_or_else(|| format!("live {label} file bytes overflow"))
+    })
 }
 
 async fn enumerate_live_files(table: &Table, file_io: &FileIO) -> Result<LiveFiles, String> {

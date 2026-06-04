@@ -11,12 +11,16 @@ use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_hadoo
 use crate::connector::iceberg::commit::expire_snapshots::{ExpireParams, run_expire_snapshots};
 use crate::connector::iceberg::commit::remove_orphan_files::run_remove_orphan_files;
 use crate::connector::iceberg::commit::rewrite_manifests::run_rewrite_manifests;
+use crate::connector::iceberg::compact::{
+    WholeTableRewriteTarget, execute_whole_table_rewrite_with_metrics_for_target,
+};
 use crate::engine::catalog::normalize_identifier;
 use crate::engine::procedure::{CallProcedureStmt, ProcedureArgMode, ProcedureArgValue};
 use crate::engine::{
     QueryResult, QueryResultColumn, StandaloneState, StatementResult, record_batch_to_chunk,
 };
 use crate::fs::object_store::ObjectStoreConfig;
+use crate::meta::repository::job::CreateIcebergOptimizeJobRequest;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum MaintenanceActionSource {
@@ -268,10 +272,78 @@ fn run_remove_orphan_files_action(
 }
 
 fn run_rewrite_data_files_action(
-    _state: &Arc<StandaloneState>,
-    _request: &MaintenanceActionRequest,
+    state: &Arc<StandaloneState>,
+    request: &MaintenanceActionRequest,
 ) -> Result<MaintenanceActionOutcome, String> {
-    Err("rewrite_data_files execution is not implemented in this task".to_string())
+    validate_rewrite_data_files_request(request)?;
+    let (catalog, table_ident, _) = build_action_catalog(state, request)?;
+    let table =
+        block_on_iceberg(async { catalog.load_table(&table_ident).await })?.map_err(|e| {
+            format!(
+                "load iceberg table {} for rewrite_data_files failed: {e}",
+                action_target(request)
+            )
+        })?;
+    let base_snapshot_id = table
+        .metadata()
+        .current_snapshot()
+        .map(|snapshot| snapshot.snapshot_id())
+        .ok_or_else(|| {
+            format!(
+                "rewrite_data_files requires iceberg table {} to have a current snapshot",
+                action_target(request)
+            )
+        })?;
+
+    let rewrite_target = WholeTableRewriteTarget {
+        catalog: request.catalog.clone(),
+        namespace: request.namespace.clone(),
+        table: request.table.clone(),
+        base_snapshot_id,
+        job_id: None,
+    };
+    let rewrite_result =
+        execute_whole_table_rewrite_with_metrics_for_target(state, &rewrite_target).map_err(
+            |e| {
+                format!(
+                    "REWRITE DATA FILES failed for {}: {e}",
+                    action_target(request)
+                )
+            },
+        )?;
+    let before_metrics = rewrite_result.before_metrics;
+    let after_metrics = rewrite_result.after_metrics;
+    let removed_delete_files = before_metrics
+        .delete_files
+        .saturating_sub(after_metrics.delete_files);
+
+    tracing::info!(
+        catalog = %request.catalog,
+        namespace = %request.namespace,
+        table = %request.table,
+        target_snapshot_id = ?rewrite_result.optimize_outcome.target_snapshot_id,
+        rewritten_data_files_count = before_metrics.data_files,
+        added_data_files_count = after_metrics.data_files,
+        removed_delete_files_count = removed_delete_files,
+        "rewrite_data_files: completed"
+    );
+
+    Ok(MaintenanceActionOutcome::RewriteDataFiles {
+        rewritten_data_files_count: checked_i32_metric(
+            before_metrics.data_files,
+            "rewritten_data_files_count",
+        )?,
+        added_data_files_count: checked_i32_metric(
+            after_metrics.data_files,
+            "added_data_files_count",
+        )?,
+        rewritten_bytes_count: before_metrics.data_bytes,
+        failed_data_files_count: 0,
+        removed_delete_files_count: checked_i32_metric(
+            removed_delete_files,
+            "removed_delete_files_count",
+        )?,
+    })
 }
 
 fn run_rewrite_position_delete_files_action(
@@ -282,13 +354,81 @@ fn run_rewrite_position_delete_files_action(
 }
 
 fn create_legacy_optimize_job(
-    _state: &Arc<StandaloneState>,
-    _request: &MaintenanceActionRequest,
+    state: &Arc<StandaloneState>,
+    request: &MaintenanceActionRequest,
 ) -> Result<StatementResult, String> {
-    Err(
-        "ALTER TABLE OPTIMIZE routing through maintenance actions is not implemented in this task"
-            .to_string(),
-    )
+    let Some(provider) = state.metadata_provider.as_ref() else {
+        return Err("ALTER TABLE OPTIMIZE requires metadata provider".to_string());
+    };
+    let entry = {
+        let registry = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+        registry.get(&request.catalog)?
+    };
+    entry.invalidate_table_cache(&request.namespace, &request.table);
+    let loaded =
+        crate::connector::iceberg::catalog::load_table(&entry, &request.namespace, &request.table)?;
+    let base_snapshot_id = loaded
+        .table
+        .metadata()
+        .current_snapshot()
+        .map(|snapshot| snapshot.snapshot_id())
+        .ok_or_else(|| {
+            format!(
+                "ALTER TABLE OPTIMIZE requires iceberg table {} to have a current snapshot",
+                action_target(request)
+            )
+        })?;
+    let mut txn = provider
+        .begin_write("create iceberg optimize job")
+        .map_err(|e| format!("open iceberg optimize job transaction failed: {e}"))?;
+    state
+        .job_repo
+        .create_iceberg_optimize_job(
+            txn.as_mut(),
+            CreateIcebergOptimizeJobRequest {
+                catalog: request.catalog.clone(),
+                namespace: request.namespace.clone(),
+                table: request.table.clone(),
+                base_snapshot_id,
+                now_ms: maintenance_now_ms(),
+            },
+        )
+        .map_err(|e| format!("create iceberg optimize job failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit iceberg optimize job failed: {e}"))?;
+    Ok(StatementResult::Ok)
+}
+
+fn validate_rewrite_data_files_request(request: &MaintenanceActionRequest) -> Result<(), String> {
+    if request.where_clause.is_some() {
+        return Err("rewrite_data_files where is not supported in NovaRocks yet".to_string());
+    }
+    if request.branch.is_some() {
+        return Err("rewrite_data_files branch is not supported in NovaRocks yet".to_string());
+    }
+    for key in request.options.values.keys() {
+        match key.as_str() {
+            "rewrite-all" | "min-input-files" | "target-file-size-bytes" => {}
+            other => return Err(format!("unsupported rewrite_data_files option `{other}`")),
+        }
+    }
+    Ok(())
+}
+
+fn checked_i32_metric(value: i64, name: &str) -> Result<i32, String> {
+    i32::try_from(value).map_err(|_| format!("rewrite_data_files metric `{name}` overflow"))
+}
+
+fn maintenance_now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn build_action_catalog(
@@ -447,6 +587,7 @@ fn validate_current_task_args<'a>(
 
 fn validate_call_request_semantics(request: &MaintenanceActionRequest) -> Result<(), String> {
     match request.kind {
+        MaintenanceActionKind::RewriteDataFiles => validate_rewrite_data_files_request(request)?,
         MaintenanceActionKind::ExpireSnapshots => {
             if request.older_than_ms.is_none() && request.retain_last.is_none() {
                 return Err("expire_snapshots requires `older_than` or `retain_last`".to_string());
@@ -789,6 +930,23 @@ mod tests {
     use super::*;
     use crate::engine::procedure::parse_call_procedure_sql;
 
+    fn test_request(kind: MaintenanceActionKind) -> MaintenanceActionRequest {
+        MaintenanceActionRequest {
+            source: MaintenanceActionSource::SparkProcedure,
+            kind,
+            catalog: "ice".to_string(),
+            namespace: "db".to_string(),
+            table: "t".to_string(),
+            options: MaintenanceActionOptions::default(),
+            older_than_ms: None,
+            retain_last: None,
+            use_caching: None,
+            spec_id: None,
+            branch: None,
+            where_clause: None,
+        }
+    }
+
     fn request_from_call(sql: &str) -> Result<MaintenanceActionRequest, String> {
         let stmt = parse_call_procedure_sql(sql).unwrap();
         MaintenanceActionRequest::from_call(&stmt, "db")
@@ -808,6 +966,44 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("not implemented"));
+    }
+
+    #[test]
+    fn rewrite_data_files_schema_matches_spark_40() {
+        let outcome = MaintenanceActionOutcome::RewriteDataFiles {
+            rewritten_data_files_count: 2,
+            added_data_files_count: 1,
+            rewritten_bytes_count: 4096,
+            failed_data_files_count: 0,
+            removed_delete_files_count: 3,
+        };
+        let result = outcome.to_spark_query_result().unwrap();
+        let names = result
+            .columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "rewritten_data_files_count",
+                "added_data_files_count",
+                "rewritten_bytes_count",
+                "failed_data_files_count",
+                "removed_delete_files_count"
+            ]
+        );
+    }
+
+    #[test]
+    fn rewrite_data_files_rejects_sort_strategy_for_first_version() {
+        let mut request = test_request(MaintenanceActionKind::RewriteDataFiles);
+        request
+            .options
+            .values
+            .insert("unsupported-key".to_string(), "true".to_string());
+        let err = validate_rewrite_data_files_request(&request).unwrap_err();
+        assert!(err.contains("unsupported rewrite_data_files option"));
     }
 
     #[test]
