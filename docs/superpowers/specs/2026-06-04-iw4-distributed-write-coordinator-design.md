@@ -454,6 +454,18 @@ IW-4 v1 的最小可交付范围是：
 - standalone report adapter 能把 final `TReportExecStatusParams` 发回 coordinator。
 - coordinator-side `WriteCoordinator` 能消费 report 并生成 commit/abort input。
 - `ExecutionCoordinator` 能在 writer failure 时触发现有 cancel fan-out。
-- 单元测试和 1FE+2BE 集成测试覆盖 roadmap 验收。
+- 单元测试和 service/protocol regression 覆盖 writer registry、report transport、failure propagation、lost-final-report handling、duplicate/conflict/missing report 行为。
 
 后续 implementation plan 应按 TDD 拆分，不在 spec 阶段直接实现。
+
+## 14. Implementation Status (2026-06-04)
+
+IW-4 v1 已落地到 coordinator/report 协议层：
+
+- standalone distributed write report 与 FE-compatible `reportExecStatus` 使用同一 `TReportExecStatusParams` payload 和 shared report builder。
+- FE-compatible 保持 brpc/thrift-compatible report path；NovaRocks standalone distributed mode 通过 `NovaRocksGrpc` report RPC 把同一 thrift-binary payload 回传 coordinator。
+- `role=fe` 启动 report-only NovaRocks gRPC endpoint，允许 remote BE 上报 final writer status，但仍拒绝本地 fragment execution RPC。
+- `WriteCoordinator` 维护 expected writers，处理 OK/error final reports、duplicate/conflict/missing reports，并生成 `WriteCommitInput` / `WriteAbortInput`。
+- `ExecutionCoordinator` 在 dispatch 前注册 expected writers，root EOF 后等待 final writer reports，writer failure 或 final report lost 时 fail query 并 cancel submitted peer fragments。
+
+边界保持不变：IW-4 只生成 commit/abort input，不调用 Iceberg/Hive/managed-lake metadata commit，也不执行 staging cleanup strategy。metadata commit 接入属于 IW-5，cancel/recovery cleanup 语义属于 IW-6，用户级 INSERT pipeline cutover 和稳定 1FE+2BE SQL write smoke 属于 IW-7/IW-10。
