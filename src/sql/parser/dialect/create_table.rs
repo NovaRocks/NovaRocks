@@ -1095,6 +1095,10 @@ fn parse_string_default(
             let micros = crate::engine::parquet::parse_datetime_string_to_micros(s)?;
             Ok(DefaultLiteral::DateTime(micros))
         }
+        SqlType::DateTimeNs => {
+            let nanos = crate::engine::parquet::parse_datetime_string_to_nanos(s)?;
+            Ok(DefaultLiteral::DateTime(nanos))
+        }
         // Binary: interpret the SQL string literal as raw UTF-8 bytes.
         SqlType::Binary | SqlType::Bitmap | SqlType::Hll => {
             Ok(DefaultLiteral::Binary(s.as_bytes().to_vec()))

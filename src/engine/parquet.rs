@@ -132,6 +132,36 @@ pub(crate) fn parse_datetime_string_to_micros(s: &str) -> Result<i64, String> {
     Err(format!("invalid datetime literal `{s}`"))
 }
 
+/// Parse a `YYYY-MM-DD HH:MM:SS[.fffffffff]` literal into nanoseconds since the
+/// Unix epoch. Mirrors `parse_datetime_string_to_micros` but keeps nanosecond
+/// precision for Iceberg v3 `timestamp_ns` columns. Errors if the value is
+/// outside the nanosecond-representable range (~1677-09-21 .. 2262-04-11).
+pub(crate) fn parse_datetime_string_to_nanos(s: &str) -> Result<i64, String> {
+    use chrono::NaiveDateTime;
+    let s = s.trim();
+    // Try datetime first, then date-only
+    if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        return dt
+            .and_utc()
+            .timestamp_nanos_opt()
+            .ok_or_else(|| format!("DATETIME literal '{s}' out of nanosecond representable range"));
+    }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
+        return dt
+            .and_utc()
+            .timestamp_nanos_opt()
+            .ok_or_else(|| format!("DATETIME literal '{s}' out of nanosecond representable range"));
+    }
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        let dt = d.and_hms_opt(0, 0, 0).expect("midnight");
+        return dt
+            .and_utc()
+            .timestamp_nanos_opt()
+            .ok_or_else(|| format!("DATETIME literal '{s}' out of nanosecond representable range"));
+    }
+    Err(format!("invalid datetime literal `{s}`"))
+}
+
 /// Cast a RecordBatch to match a target schema (column-by-column cast).
 pub(crate) fn cast_batch_to_schema(
     batch: &RecordBatch,
@@ -356,6 +386,25 @@ fn normalize_local_parquet_batch(batch: &RecordBatch) -> Result<RecordBatch, Str
     }
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .map_err(|e| format!("build local parquet storage batch failed: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_datetime_string_to_nanos_keeps_nanoseconds() {
+        let nanos = parse_datetime_string_to_nanos("2024-01-02 03:04:05.123456789").unwrap();
+        assert_eq!(nanos % 1_000, 789); // last 3 nanosecond digits survive
+    }
+
+    #[test]
+    fn parse_datetime_string_to_nanos_handles_no_fraction() {
+        let a = parse_datetime_string_to_nanos("2024-01-02 03:04:05").unwrap();
+        let b = parse_datetime_string_to_nanos("2024-01-02").unwrap();
+        assert_eq!(a % 1_000_000_000, 0);
+        assert_eq!(b % 1_000_000_000, 0);
+    }
 }
 
 /// Write a RecordBatch to a parquet file at the given path.

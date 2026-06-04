@@ -15,6 +15,7 @@ use arrow::record_batch::RecordBatch;
 use super::catalog::{ColumnDef, normalize_identifier};
 use super::parquet::{
     normalize_map_entries_nullability, parse_date_string_to_days, parse_datetime_string_to_micros,
+    parse_datetime_string_to_nanos,
 };
 use super::sql_expr::{latin1_string_to_bytes, literal_to_i128_for_integer};
 use crate::sql::parser::ast::Literal;
@@ -118,6 +119,7 @@ fn arrow_data_type_to_sql_type(
         },
         DataType::Utf8 => SqlType::String,
         DataType::Date32 => SqlType::Date,
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => SqlType::DateTimeNs,
         DataType::Timestamp(TimeUnit::Microsecond, _) => SqlType::DateTime,
         DataType::Binary | DataType::LargeBinary => SqlType::Binary,
         DataType::List(element_field) => {
@@ -421,6 +423,21 @@ fn build_local_literal_array(
                         Literal::Null => Ok(None),
                         Literal::String(v) | Literal::Date(v) => {
                             parse_datetime_string_to_micros(v).map(Some)
+                        }
+                        _ if nullable => Ok(None),
+                        other => Err(format!("literal {:?} is not valid for DATETIME", other)),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )))
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            Ok(Arc::new(TimestampNanosecondArray::from(
+                values
+                    .iter()
+                    .map(|literal| match literal {
+                        Literal::Null => Ok(None),
+                        Literal::String(v) | Literal::Date(v) => {
+                            parse_datetime_string_to_nanos(v).map(Some)
                         }
                         _ if nullable => Ok(None),
                         other => Err(format!("literal {:?} is not valid for DATETIME", other)),
