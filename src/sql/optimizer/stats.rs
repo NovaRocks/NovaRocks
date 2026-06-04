@@ -7,7 +7,9 @@
 use std::collections::HashMap;
 
 use super::estimate::join_condition::estimate_join_condition;
-use super::estimate::ndv::{agg_group_rows, cap_ndv_at_rows, get_expr_ndv};
+use super::estimate::ndv::{
+    agg_group_rows, cap_ndv_at_rows, get_expr_ndv, get_join_key_ndv_with_confidence,
+};
 use super::estimate::selectivity::apply_filter;
 pub(crate) use super::estimate::selectivity::{estimate_selectivity, extract_column_name};
 use super::memo::{MExpr, Memo};
@@ -20,6 +22,7 @@ use crate::sql::optimizer::estimate::cardinality::{
     union_distinct_rows,
 };
 use crate::sql::optimizer::statistics::*;
+use crate::sql::planner::plan::LogicalPlan;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -134,13 +137,19 @@ pub(crate) fn derive_statistics(
                 .map(|gb_expr| get_expr_ndv(gb_expr, &child_stats.column_statistics))
                 .collect();
             let output_rows = agg_group_rows(&group_key_ndvs, child_stats.output_row_count);
+            let column_statistics = aggregate_group_column_statistics(
+                &agg.group_by,
+                &agg.output_columns,
+                &child_stats,
+                output_rows,
+            );
             Statistics {
                 output_row_count: output_rows,
                 row_count_confidence: Confidence::derive(
                     &[child_stats.row_count_confidence],
                     false,
                 ),
-                column_statistics: HashMap::new(),
+                column_statistics,
             }
         }
 
@@ -309,13 +318,19 @@ pub(crate) fn derive_statistics(
                 .map(|gb_expr| get_expr_ndv(gb_expr, &child_stats.column_statistics))
                 .collect();
             let output_rows = agg_group_rows(&group_key_ndvs, child_stats.output_row_count);
+            let column_statistics = aggregate_group_column_statistics(
+                &agg.group_by,
+                &agg.output_columns,
+                &child_stats,
+                output_rows,
+            );
             Statistics {
                 output_row_count: output_rows,
                 row_count_confidence: Confidence::derive(
                     &[child_stats.row_count_confidence],
                     false,
                 ),
-                column_statistics: HashMap::new(),
+                column_statistics,
             }
         }
 
@@ -333,11 +348,21 @@ pub(crate) fn derive_statistics(
                     ) {
                         eq_key_pairs.push((left.to_lowercase(), right.to_lowercase()));
                     }
-                    let left_ndv = get_expr_ndv(&eq.left, &left_stats.column_statistics)
-                        .max(get_expr_ndv(&eq.left, &right_stats.column_statistics));
-                    let right_ndv = get_expr_ndv(&eq.right, &left_stats.column_statistics)
-                        .max(get_expr_ndv(&eq.right, &right_stats.column_statistics));
-                    (left_ndv, right_ndv, Confidence::Estimated)
+                    let (left_ndv, left_confidence) = best_join_key_ndv(
+                        &eq.left,
+                        &left_stats.column_statistics,
+                        &right_stats.column_statistics,
+                    );
+                    let (right_ndv, right_confidence) = best_join_key_ndv(
+                        &eq.right,
+                        &right_stats.column_statistics,
+                        &left_stats.column_statistics,
+                    );
+                    (
+                        left_ndv,
+                        right_ndv,
+                        left_confidence.combine(right_confidence),
+                    )
                 })
                 .collect();
 
@@ -536,6 +561,71 @@ pub(crate) fn derive_statistics(
             }
         }
     }
+}
+
+pub(crate) fn derive_logical_plan_statistics(
+    plan: &LogicalPlan,
+    table_stats: &HashMap<String, TableStatistics>,
+) -> Statistics {
+    let mut memo = Memo::new();
+    let root_group = super::convert::logical_plan_to_memo(plan, &mut memo);
+    derive_group_statistics(&mut memo, table_stats);
+    memo.groups
+        .get(root_group)
+        .and_then(|group| group.logical_props.as_ref())
+        .map(|props| Statistics {
+            output_row_count: props.row_count,
+            row_count_confidence: props.row_count_confidence,
+            column_statistics: props.column_statistics.clone(),
+        })
+        .unwrap_or_else(|| Statistics {
+            output_row_count: 1.0,
+            row_count_confidence: Confidence::Fallback,
+            column_statistics: HashMap::new(),
+        })
+}
+
+fn best_join_key_ndv(
+    expr: &TypedExpr,
+    primary_stats: &HashMap<String, ColumnStatistic>,
+    secondary_stats: &HashMap<String, ColumnStatistic>,
+) -> (f64, Confidence) {
+    let primary = get_join_key_ndv_with_confidence(expr, primary_stats);
+    let secondary = get_join_key_ndv_with_confidence(expr, secondary_stats);
+    match (
+        primary.1 == Confidence::Fallback,
+        secondary.1 == Confidence::Fallback,
+    ) {
+        (false, true) => primary,
+        (true, false) => secondary,
+        _ if secondary.0 > primary.0 => secondary,
+        _ => primary,
+    }
+}
+
+fn aggregate_group_column_statistics(
+    group_by: &[TypedExpr],
+    output_columns: &[OutputColumn],
+    child_stats: &Statistics,
+    output_rows: f64,
+) -> HashMap<String, ColumnStatistic> {
+    group_by
+        .iter()
+        .zip(output_columns.iter())
+        .map(|(expr, output)| {
+            let mut stat = extract_column_name(expr)
+                .and_then(|name| child_stats.column_statistics.get(&name.to_lowercase()))
+                .cloned()
+                .unwrap_or_else(|| {
+                    let mut fallback = ColumnStatistic::unknown();
+                    fallback.distinct_values_count =
+                        get_expr_ndv(expr, &child_stats.column_statistics);
+                    fallback
+                });
+            stat.distinct_values_count = cap_ndv_at_rows(stat.distinct_values_count, output_rows);
+            (output.name.to_lowercase(), stat)
+        })
+        .collect()
 }
 
 /// Derive statistics for all groups in the Memo, bottom-up.
@@ -2214,6 +2304,48 @@ mod tests {
         let fallback_stats = derive_statistics(&fallback_agg, &memo, &HashMap::new());
         assert_row_count_close(fallback_stats.output_row_count, expected);
         assert_eq!(fallback_stats.row_count_confidence, Confidence::Fallback);
+    }
+
+    #[test]
+    fn grouped_aggregate_preserves_group_key_column_statistics() {
+        use crate::sql::optimizer::operator::{
+            AggMode, LogicalAggregateOp, Operator, PhysicalHashAggregateOp,
+        };
+
+        let expected = aggregate_expected_three_key_rows();
+        let mut memo = Memo::new();
+        let child = aggregate_ndv_child_group(&mut memo, 1_000_000.0, Confidence::Fallback);
+
+        let logical = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+                aggregate_group_keys(),
+                vec![],
+                aggregate_output_columns(),
+            )),
+            children: vec![child],
+        };
+        let physical = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+                mode: AggMode::Single,
+                group_by: aggregate_group_keys(),
+                aggregates: vec![],
+                output_columns: aggregate_output_columns(),
+                is_merge: vec![],
+            }),
+            children: vec![child],
+        };
+
+        for stats in [
+            derive_statistics(&logical, &memo, &HashMap::new()),
+            derive_statistics(&physical, &memo, &HashMap::new()),
+        ] {
+            assert_row_count_close(stats.output_row_count, expected);
+            assert_eq!(stats.column_statistics["k1"].distinct_values_count, 100.0);
+            assert_eq!(stats.column_statistics["k2"].distinct_values_count, 100.0);
+            assert_eq!(stats.column_statistics["k3"].distinct_values_count, 100.0);
+        }
     }
 
     #[test]

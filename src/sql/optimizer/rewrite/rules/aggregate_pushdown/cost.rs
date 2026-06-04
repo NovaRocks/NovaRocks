@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 
 use crate::sql::analysis::ExprKind;
-use crate::sql::optimizer::rewrite::rules::join_reorder::cardinality::estimate_statistics;
 use crate::sql::optimizer::statistics::{Confidence, TableStatistics};
+use crate::sql::optimizer::stats::derive_logical_plan_statistics;
 
 #[cfg(test)]
 use crate::sql::analysis::TypedExpr;
@@ -20,7 +20,7 @@ const UNKNOWN_NDV_ROW_THRESHOLD: f64 = 10_000.0;
 
 /// True iff pushing the partial aggregate is expected to reduce rows.
 pub(crate) fn should_push(plan: &PushPlan, table_stats: &HashMap<String, TableStatistics>) -> bool {
-    let stats = estimate_statistics(&plan.target_subtree, table_stats);
+    let stats = derive_logical_plan_statistics(&plan.target_subtree, table_stats);
     let row_count = stats.output_row_count;
     if row_count <= 1.0 {
         // Trivially small subtree; partial buys nothing.
@@ -34,10 +34,15 @@ pub(crate) fn should_push(plan: &PushPlan, table_stats: &HashMap<String, TableSt
             ExprKind::ColumnRef { column, .. } => {
                 stats.column_statistics.get(column).and_then(|cs| {
                     let ndv = cs.distinct_values_count;
-                    if cs.confidence != Confidence::Fallback && ndv.is_finite() && ndv > 0.0 {
-                        Some(ndv)
-                    } else {
-                        None
+                    if !ndv.is_finite() || ndv <= 0.0 {
+                        return None;
+                    }
+                    match cs.confidence {
+                        Confidence::Exact => Some(ndv),
+                        Confidence::Estimated if ndv < row_count * MIN_PARTIAL_BENEFIT_RATIO => {
+                            Some(ndv)
+                        }
+                        Confidence::Estimated | Confidence::Fallback => None,
                     }
                 })
             }
@@ -47,7 +52,7 @@ pub(crate) fn should_push(plan: &PushPlan, table_stats: &HashMap<String, TableSt
 
     if ndvs.iter().any(|n| n.is_none()) {
         // Fallback: push only if the target is "big enough".
-        return row_count > UNKNOWN_NDV_ROW_THRESHOLD;
+        return row_count >= UNKNOWN_NDV_ROW_THRESHOLD;
     }
 
     let joint_ndv: f64 = ndvs.iter().flatten().product::<f64>().min(row_count);
@@ -57,7 +62,7 @@ pub(crate) fn should_push(plan: &PushPlan, table_stats: &HashMap<String, TableSt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::OutputColumn;
+    use crate::sql::analysis::{BinOp, LiteralValue, OutputColumn};
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence};
@@ -135,6 +140,27 @@ mod tests {
         (scan, table_stats)
     }
 
+    fn scan_without_stats_with_predicate() -> LogicalPlan {
+        let (LogicalPlan::Scan(mut scan), _) = scan_with_stats("unknown_table", 1, "k", f64::NAN)
+        else {
+            unreachable!("scan_with_stats returns a scan");
+        };
+        scan.predicates = vec![TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(col_ref("k")),
+                op: BinOp::Eq,
+                right: Box::new(TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::Int(7)),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                }),
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        }];
+        LogicalPlan::Scan(scan)
+    }
+
     #[test]
     fn low_cardinality_pushes() {
         let (scan, stats) = scan_with_stats("t", 10_000, "k", 10.0);
@@ -160,8 +186,39 @@ mod tests {
     }
 
     #[test]
+    fn estimated_upper_bound_ndv_falls_back_to_row_threshold() {
+        let (scan, mut stats) = scan_with_stats("t", 90_000, "k", 90_000.0);
+        stats
+            .get_mut("t")
+            .unwrap()
+            .column_stats
+            .get_mut("k")
+            .unwrap()
+            .confidence = Confidence::Estimated;
+        let plan = PushPlan {
+            side: super::super::context::Side::Left,
+            target_subtree: scan,
+            partial_groupby: vec![col_ref("k")],
+            partial_aggregates: vec![],
+        };
+        assert!(should_push(&plan, &stats));
+    }
+
+    #[test]
     fn unknown_ndv_pushes_above_threshold() {
         let (scan, stats) = scan_with_stats("t", 20_000, "k", f64::NAN);
+        let plan = PushPlan {
+            side: super::super::context::Side::Left,
+            target_subtree: scan,
+            partial_groupby: vec![col_ref("k")],
+            partial_aggregates: vec![],
+        };
+        assert!(should_push(&plan, &stats));
+    }
+
+    #[test]
+    fn unknown_ndv_pushes_at_threshold() {
+        let (scan, stats) = scan_with_stats("t", 10_000, "k", f64::NAN);
         let plan = PushPlan {
             side: super::super::context::Side::Left,
             target_subtree: scan,
@@ -181,5 +238,16 @@ mod tests {
             partial_aggregates: vec![],
         };
         assert!(!should_push(&plan, &stats));
+    }
+
+    #[test]
+    fn fallback_scan_with_predicate_uses_main_optimizer_row_estimate() {
+        let plan = PushPlan {
+            side: super::super::context::Side::Left,
+            target_subtree: scan_without_stats_with_predicate(),
+            partial_groupby: vec![col_ref("k")],
+            partial_aggregates: vec![],
+        };
+        assert!(should_push(&plan, &HashMap::new()));
     }
 }

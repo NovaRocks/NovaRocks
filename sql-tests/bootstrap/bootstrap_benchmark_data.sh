@@ -243,7 +243,11 @@ resolve_paths() {
   source_dir="$cache_dir/$archive_root"
   warehouse_uri="${CATALOG_WAREHOUSE_URI%/}"
   raw_uri="$warehouse_uri/_benchmark_raw/$suite/$scale_slug"
-  manifest_uri="$warehouse_uri/_bootstrap_manifest/$suite/$scale_slug"
+  local manifest_version="$scale_slug"
+  if [[ "$suite" == "tpc-ds" ]]; then
+    manifest_version="$scale_slug/latin1-v1"
+  fi
+  manifest_uri="$warehouse_uri/_bootstrap_manifest/$suite/$manifest_version"
   spark_loader="$WORKSPACE_ROOT/sql-tests/bootstrap/spark/write_standard_benchmark.py"
 
   schema_ddl_file=""
@@ -322,13 +326,26 @@ EOF
 check_manifest() {
   local path
   path="$(s3_to_mc_path "$manifest_uri")"
+  local required_encoding=""
+  if [[ "$suite" == "tpc-ds" ]]; then
+    required_encoding='"raw_text_encoding": "ISO-8859-1"'
+  fi
   "${compose_args[@]}" run --rm -T \
     -e "MINIO_ROOT_USER=$AWS_S3_ACCESS_KEY_ID" \
     -e "MINIO_ROOT_PASSWORD=$AWS_S3_SECRET_ACCESS_KEY" \
     --entrypoint /bin/sh mc -c "
     set -eu
     /usr/bin/mc alias set minio http://minio:9000 \"\$MINIO_ROOT_USER\" \"\$MINIO_ROOT_PASSWORD\" >/dev/null
-    /usr/bin/mc ls '$path' >/dev/null
+    /usr/bin/mc stat '$path/_SUCCESS' >/dev/null
+    if [ -n '$required_encoding' ]; then
+      manifest_file=\$(/usr/bin/mc find '$path' --name 'part-*' | head -n 1)
+      [ -n \"\$manifest_file\" ]
+      manifest_json=\$(/usr/bin/mc cat \"\$manifest_file\")
+      case \"\$manifest_json\" in
+        *'$required_encoding'*) ;;
+        *) exit 1 ;;
+      esac
+    fi
   "
 }
 

@@ -201,6 +201,12 @@ PARQUET_HADOOP_PROPERTIES = {
     "parquet.page.row.count.limit": str(1_048_576),
 }
 
+RAW_TEXT_ENCODINGS = {
+    "ssb": "UTF-8",
+    "tpc-h": "UTF-8",
+    "tpc-ds": "ISO-8859-1",
+}
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -335,13 +341,14 @@ def suite_schemas(args):
     raise ValueError(f"unsupported suite: {args.suite}")
 
 
-def read_pipe_table(spark, path, columns):
+def read_pipe_table(spark, path, columns, encoding):
     raw_schema = StructType(
         [StructField(f"c{idx}", StringType(), True) for idx in range(len(columns) + 1)]
     )
     df = (
         spark.read.option("delimiter", "|")
         .option("header", "false")
+        .option("encoding", encoding)
         .schema(raw_schema)
         .csv(path)
     )
@@ -418,10 +425,11 @@ def main():
 
         row_counts = []
         raw_base_uri = spark_s3_uri(args.raw_base_uri).rstrip("/")
+        raw_text_encoding = RAW_TEXT_ENCODINGS[args.suite]
         for table, raw_name in raw_names.items():
             columns = schemas[table]
             raw_path = f"{raw_base_uri}/{raw_name}"
-            df = read_pipe_table(spark, raw_path, columns)
+            df = read_pipe_table(spark, raw_path, columns, raw_text_encoding)
             row_count = df.count()
             df, layout = apply_table_layout(args.suite, table, df)
             target = qualified_name(args.catalog, args.database, table)
@@ -461,6 +469,7 @@ def main():
             "generator": args.generator,
             "generator_version": args.generator_version,
             "schema_version": "2026-05-26",
+            "raw_text_encoding": raw_text_encoding,
             "warehouse": args.warehouse,
             "parquet_write_properties": PARQUET_WRITE_PROPERTIES,
             "tables": row_counts,

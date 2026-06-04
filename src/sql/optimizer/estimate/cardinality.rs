@@ -1,7 +1,8 @@
 use crate::sql::analysis::JoinKind;
 use crate::sql::optimizer::estimate::arith::{MAX_ROW_COUNT, damped_conjunction, sat_add, sat_mul};
 use crate::sql::optimizer::statistics::{
-    ANTI_JOIN_SELECTIVITY, Confidence, SEMI_JOIN_SELECTIVITY, UNKNOWN_GROUP_BY_CORRELATION,
+    ANTI_JOIN_SELECTIVITY, Confidence, PREDICATE_UNKNOWN_FILTER, SEMI_JOIN_SELECTIVITY,
+    UNKNOWN_GROUP_BY_CORRELATION,
 };
 
 pub struct JoinCardInput {
@@ -160,11 +161,22 @@ fn inner_rows(
     } else {
         let mut selectivities = Vec::with_capacity(input.eq_key_ndvs.len());
         let mut used_default_or_invalid = false;
+        let mut fallback_key_count = 0;
         for &(left_ndv, right_ndv, confidence) in &input.eq_key_ndvs {
             confidence_inputs.push(confidence);
             let (denominator, invalid_ndv) = ndv_denominator(left_ndv, right_ndv);
             used_default_or_invalid |= invalid_ndv;
-            selectivities.push(1.0 / denominator);
+            let selectivity = if confidence == Confidence::Fallback {
+                fallback_key_count += 1;
+                if fallback_key_count > 1 {
+                    PREDICATE_UNKNOWN_FILTER
+                } else {
+                    1.0 / denominator
+                }
+            } else {
+                1.0 / denominator
+            };
+            selectivities.push(selectivity);
         }
         return inner_rows_with_key_selectivity(
             left_rows,
@@ -244,9 +256,11 @@ fn semi_selectivity(
     let mut selectivities = Vec::new();
     let mut key_selectivities = Vec::with_capacity(input.eq_key_ndvs.len());
     let mut used_default_or_invalid = false;
+    let mut used_fallback_key_ndv = false;
 
     for &(left_ndv, right_ndv, confidence) in &input.eq_key_ndvs {
         confidence_inputs.push(confidence);
+        used_fallback_key_ndv |= confidence == Confidence::Fallback;
         let (denominator, invalid_ndv) = ndv_denominator(left_ndv, right_ndv);
         used_default_or_invalid |= invalid_ndv;
         key_selectivities.push(1.0 / denominator);
@@ -256,7 +270,13 @@ fn semi_selectivity(
         let key_selectivity = damped_conjunction(&key_selectivities);
         let (match_probability, saturated) = sat_mul(matching_side_rows, key_selectivity);
         used_default_or_invalid |= saturated;
-        selectivities.push(match_probability.clamp(0.0, 1.0));
+        let upper_bound = if used_fallback_key_ndv {
+            used_default_or_invalid = true;
+            PREDICATE_UNKNOWN_FILTER
+        } else {
+            1.0
+        };
+        selectivities.push(match_probability.clamp(0.0, upper_bound));
     }
 
     if let Some((selectivity, confidence)) = input.non_equi_selectivity {
@@ -345,6 +365,23 @@ mod tests {
             "multikey should reduce below single-key but not collapse: {rows}"
         );
         assert!((rows - 1000.0).abs() < 50.0, "got {rows}");
+    }
+
+    #[test]
+    fn multikey_inner_softens_additional_fallback_keys() {
+        let input = JoinCardInput {
+            left: (81_000.0, Confidence::Estimated),
+            right: (81_000.0, Confidence::Estimated),
+            kind: JoinKind::Inner,
+            eq_key_ndvs: vec![
+                (40.0, 40.0, Confidence::Fallback),
+                (40.0, 40.0, Confidence::Fallback),
+            ],
+            non_equi_selectivity: None,
+        };
+        let (rows, conf) = estimate_join_cardinality(&input);
+        assert_eq!(conf, Confidence::Fallback);
+        assert!((rows - 82_012_500.0).abs() < 1.0, "got {rows}");
     }
 
     #[test]

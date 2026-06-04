@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 
-use crate::sql::analysis::{BinOp, ExprKind, TypedExpr};
-use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence};
+use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
+use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence, PREDICATE_UNKNOWN_FILTER};
 
 use super::arith::damped_conjunction;
-use super::ndv::get_expr_ndv;
+use super::ndv::get_join_key_ndv_with_confidence;
 use super::selectivity::{estimate_selectivity, extract_column_name};
+
+const UNKNOWN_JOIN_RESIDUAL_EQ_FILTER: f64 = 0.5;
 
 #[derive(Default)]
 pub(crate) struct JoinConditionEstimate {
@@ -37,7 +39,7 @@ pub(crate) fn estimate_join_condition(
         let combined_stats = combined_column_statistics(left_stats, right_stats);
         let selectivities: Vec<_> = residuals
             .iter()
-            .map(|expr| estimate_selectivity(expr, &combined_stats))
+            .map(|expr| estimate_join_residual_selectivity(expr, &combined_stats))
             .collect();
         estimate.residual_selectivity =
             Some((damped_conjunction(&selectivities), Confidence::Estimated));
@@ -101,10 +103,13 @@ fn try_collect_equi_key(
         (true, false) => (left.as_ref(), right.as_ref(), left_name, right_name),
         (false, true) => (right.as_ref(), left.as_ref(), right_name, left_name),
         (true, true) if left_name == right_name => {
+            let (left_ndv, left_confidence) = get_join_key_ndv_with_confidence(left, left_stats);
+            let (right_ndv, right_confidence) =
+                get_join_key_ndv_with_confidence(right, right_stats);
             estimate.eq_key_ndvs.push((
-                get_expr_ndv(left, left_stats),
-                get_expr_ndv(right, right_stats),
-                Confidence::Estimated,
+                left_ndv,
+                right_ndv,
+                left_confidence.combine(right_confidence),
             ));
             return true;
         }
@@ -112,12 +117,66 @@ fn try_collect_equi_key(
     };
 
     estimate.eq_key_pairs.push((left_key, right_key));
+    let (left_ndv, left_confidence) = get_join_key_ndv_with_confidence(left_expr, left_stats);
+    let (right_ndv, right_confidence) = get_join_key_ndv_with_confidence(right_expr, right_stats);
     estimate.eq_key_ndvs.push((
-        get_expr_ndv(left_expr, left_stats),
-        get_expr_ndv(right_expr, right_stats),
-        Confidence::Estimated,
+        left_ndv,
+        right_ndv,
+        left_confidence.combine(right_confidence),
     ));
     true
+}
+
+fn estimate_join_residual_selectivity(
+    expr: &TypedExpr,
+    column_stats: &HashMap<String, ColumnStatistic>,
+) -> f64 {
+    let selectivity = estimate_selectivity(expr, column_stats);
+    if (selectivity - PREDICATE_UNKNOWN_FILTER).abs() < f64::EPSILON
+        && is_unknown_column_literal_eq(expr, column_stats)
+    {
+        UNKNOWN_JOIN_RESIDUAL_EQ_FILTER
+    } else {
+        selectivity
+    }
+}
+
+fn is_unknown_column_literal_eq(
+    expr: &TypedExpr,
+    column_stats: &HashMap<String, ColumnStatistic>,
+) -> bool {
+    let ExprKind::BinaryOp {
+        left,
+        op: BinOp::Eq | BinOp::EqForNull,
+        right,
+    } = &expr.kind
+    else {
+        return false;
+    };
+
+    let Some(column_name) = extract_column_name(left).or_else(|| extract_column_name(right)) else {
+        return false;
+    };
+    if !(is_literal_like(left) || is_literal_like(right)) {
+        return false;
+    }
+    column_stats
+        .get(&column_name.to_lowercase())
+        .map_or(true, |cs| cs.distinct_values_count <= 1.0)
+}
+
+fn is_literal_like(expr: &TypedExpr) -> bool {
+    match &expr.kind {
+        ExprKind::Literal(LiteralValue::Null)
+        | ExprKind::Literal(LiteralValue::Bool(_))
+        | ExprKind::Literal(LiteralValue::Int(_))
+        | ExprKind::Literal(LiteralValue::LargeInt(_))
+        | ExprKind::Literal(LiteralValue::Float(_))
+        | ExprKind::Literal(LiteralValue::Decimal(_))
+        | ExprKind::Literal(LiteralValue::String(_)) => true,
+        ExprKind::Cast { expr, .. } | ExprKind::Nested(expr) => is_literal_like(expr),
+        _ => false,
+    }
 }
 
 fn lower_column_name(expr: &TypedExpr) -> Option<String> {

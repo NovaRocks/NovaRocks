@@ -5,16 +5,15 @@
 
 use std::collections::HashMap;
 
-use crate::sql::analysis::*;
 use crate::sql::optimizer::estimate::cardinality::{
     JoinCardInput, estimate_join_cardinality, except_rows, intersect_rows, union_all_rows,
     union_distinct_rows,
 };
 use crate::sql::optimizer::estimate::join_condition::estimate_join_condition;
-use crate::sql::optimizer::estimate::ndv::{agg_group_rows, cap_ndv_at_rows};
+use crate::sql::optimizer::estimate::ndv::{agg_group_rows, cap_ndv_at_rows, get_expr_ndv};
 use crate::sql::optimizer::estimate::selectivity::apply_filter;
 use crate::sql::optimizer::statistics::*;
-use crate::sql::optimizer::stats::{estimate_selectivity, extract_column_name};
+use crate::sql::optimizer::stats::estimate_selectivity;
 use crate::sql::planner::plan::*;
 
 /// Estimate output statistics for a logical plan node recursively.
@@ -381,25 +380,6 @@ fn cap_column_ndvs(column_statistics: &mut HashMap<String, ColumnStatistic>, out
     }
 }
 
-/// Get the NDV (number of distinct values) for an expression, looking up
-/// column stats if the expression is a simple column reference.
-fn get_expr_ndv(expr: &TypedExpr, column_stats: &HashMap<String, ColumnStatistic>) -> f64 {
-    // Only treat a column as informative when it has a real NDV (> 1).
-    // ColumnStatistic::unknown() (no-stats / managed-lake tables) reports
-    // distinct_values_count = 1.0; using that as a true NDV would let
-    // join-key estimation divide left*right by ~1 and explode joins to near
-    // cross-products. Guard `> 1.0` (mirroring estimate_eq_selectivity) so
-    // unknown/degenerate columns fall back to the default NDV below.
-    if let Some(name) = extract_column_name(expr)
-        && let Some(cs) = column_stats.get(&name.to_lowercase())
-        && cs.distinct_values_count > 1.0
-    {
-        return cs.distinct_values_count;
-    }
-    // Default NDV for unknown expressions.
-    10.0
-}
-
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -407,7 +387,7 @@ fn get_expr_ndv(expr: &TypedExpr, column_stats: &HashMap<String, ColumnStatistic
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn};
+    use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, TypedExpr};
     use crate::sql::catalog::{
         ColumnDef, IcebergDataFileInfo, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
