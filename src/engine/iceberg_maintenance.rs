@@ -11,6 +11,9 @@ use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_hadoo
 use crate::connector::iceberg::commit::expire_snapshots::{ExpireParams, run_expire_snapshots};
 use crate::connector::iceberg::commit::remove_orphan_files::run_remove_orphan_files;
 use crate::connector::iceberg::commit::rewrite_manifests::run_rewrite_manifests;
+use crate::connector::iceberg::commit::rewrite_position_delete_files::{
+    RewritePositionDeleteOptions, run_rewrite_position_delete_files,
+};
 use crate::connector::iceberg::compact::{
     WholeTableRewriteResult, WholeTableRewriteTarget,
     execute_whole_table_rewrite_with_metrics_for_target,
@@ -349,10 +352,43 @@ fn rewrite_data_files_outcome_from_result(
 }
 
 fn run_rewrite_position_delete_files_action(
-    _state: &Arc<StandaloneState>,
-    _request: &MaintenanceActionRequest,
+    state: &Arc<StandaloneState>,
+    request: &MaintenanceActionRequest,
 ) -> Result<MaintenanceActionOutcome, String> {
-    Err("rewrite_position_delete_files execution is not implemented in this task".to_string())
+    if request.where_clause.is_some() {
+        return Err(
+            "rewrite_position_delete_files where is not supported in NovaRocks".to_string(),
+        );
+    }
+    let options = RewritePositionDeleteOptions::from_map(&request.options.values)?;
+    let (catalog, table_ident, _) = build_action_catalog(state, request)?;
+    let outcome = block_on_iceberg(async move {
+        run_rewrite_position_delete_files(catalog, table_ident, options).await
+    })?
+    .map_err(|e| {
+        format!(
+            "rewrite_position_delete_files failed for {}: {e}",
+            action_target(request)
+        )
+    })?;
+
+    tracing::info!(
+        catalog = %request.catalog,
+        namespace = %request.namespace,
+        table = %request.table,
+        rewritten_delete_files_count = outcome.rewritten_delete_files_count,
+        added_delete_files_count = outcome.added_delete_files_count,
+        rewritten_bytes_count = outcome.rewritten_bytes_count,
+        added_bytes_count = outcome.added_bytes_count,
+        "rewrite_position_delete_files: completed"
+    );
+
+    Ok(MaintenanceActionOutcome::RewritePositionDeleteFiles {
+        rewritten_delete_files_count: outcome.rewritten_delete_files_count,
+        added_delete_files_count: outcome.added_delete_files_count,
+        rewritten_bytes_count: outcome.rewritten_bytes_count,
+        added_bytes_count: outcome.added_bytes_count,
+    })
 }
 
 fn create_legacy_optimize_job(

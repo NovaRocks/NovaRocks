@@ -40,6 +40,7 @@ pub mod remove_orphan_files;
 pub mod retry;
 mod rewrite_data_files;
 pub mod rewrite_manifests;
+pub mod rewrite_position_delete_files;
 mod row_delta;
 mod row_delta_dv;
 mod run;
