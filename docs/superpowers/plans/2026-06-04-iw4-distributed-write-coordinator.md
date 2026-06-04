@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build IW-4 v1 so NovaRocks standalone distributed writes collect all writer final reports through the same `TReportExecStatusParams` payload used by FE-compatible mode, then produce coordinator-owned commit/abort inputs and cancel peer fragments on writer failure.
+**Goal:** Build IW-4 v1 so NovaRocks standalone distributed write-sink fragments can report final writer status through the same `TReportExecStatusParams` payload used by FE-compatible mode, then produce coordinator-owned commit/abort inputs and cancel peer fragments on writer failure.
 
 **Architecture:** Keep `TReportExecStatusParams` as the single report payload. FE-compatible sends it through the existing FE report worker, while standalone BE sends thrift-binary report payloads back to the NovaRocks coordinator over `NovaRocksGrpc`. A new `WriteCoordinator` state machine consumes transport-neutral report events and stays separate from fragment submit/fetch/cancel orchestration.
 
@@ -12,7 +12,7 @@
 
 ## Scope Check
 
-The spec covers one cohesive subsystem: distributed write final status collection. It touches protocol, report construction, coordinator state, and integration wiring because all are needed to make one working vertical slice. The plan keeps concrete metadata commit and staging cleanup executors outside IW-4.
+The spec covers one cohesive subsystem: distributed write final status collection. It touches protocol, report construction, coordinator state, and integration wiring because all are needed to make the coordinator/report vertical slice work. The plan keeps concrete metadata commit, staging cleanup executors, and user-level Iceberg INSERT pipeline cutover outside IW-4.
 
 ## File Structure
 
@@ -2273,7 +2273,7 @@ rg "1FE|2BE|cluster.backends|role=fe|role=be|NOVAROCKS_READY" tests docker -n
 If `tests/cluster_mvp.rs` already starts FE and BE processes, add a case that:
 
 1. Starts FE with two BE addresses.
-2. Runs one distributed Iceberg write statement.
+2. Runs one distributed write-sink report scenario. If user-level Iceberg INSERT has not yet been cut over to multi-fragment `ICEBERG_TABLE_SINK`, use the coordinator/report harness instead of claiming SQL write end-to-end coverage.
 3. Asserts FE logs contain `distributed write commit input ready`.
 4. Asserts logs contain `writers=2`.
 

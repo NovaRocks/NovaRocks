@@ -201,13 +201,19 @@ fn send_once(task: &StandaloneExecStateReportTask) -> Result<(), String> {
     let resp = client.blocking_report_exec_status(proto::novarocks::ReportExecStatusRequest {
         report_exec_status_params_thrift: bytes,
     })?;
-    if resp.status_code == 0 {
-        Ok(())
-    } else {
-        Err(format!(
+    interpret_report_exec_status_response(resp)
+}
+
+fn interpret_report_exec_status_response(
+    resp: proto::novarocks::ReportExecStatusResponse,
+) -> Result<(), String> {
+    match resp.status_code {
+        crate::service::grpc_server::REPORT_EXEC_STATUS_OK
+        | crate::service::grpc_server::REPORT_EXEC_STATUS_QUERY_GONE => Ok(()),
+        _ => Err(format!(
             "standalone reportExecStatus returned status_code={}: {}",
             resp.status_code, resp.message
-        ))
+        )),
     }
 }
 
@@ -365,6 +371,17 @@ mod tests {
             *sleeps.lock().expect("sleep record"),
             vec![Duration::from_millis(100)]
         );
+    }
+
+    #[test]
+    fn query_gone_report_response_is_terminal_success() {
+        let response = proto::novarocks::ReportExecStatusResponse {
+            status_code: crate::service::grpc_server::REPORT_EXEC_STATUS_QUERY_GONE,
+            message: "write coordinator not found for query 1/2".to_string(),
+        };
+
+        interpret_report_exec_status_response(response)
+            .expect("query-gone report response is terminal success");
     }
 
     #[test]

@@ -177,7 +177,7 @@ impl ExecutionCoordinator {
         // 4. Translate every placement into a fragment params and submit.
         // ---------------------------------------------------------------
         let pipeline_dop = crate::runtime::dispatcher::compute_pipeline_dop();
-        let novarocks_report_addr = local_coordinator_report_addr().ok();
+        let mut novarocks_report_addr: Option<types::TNetworkAddress> = None;
 
         // Snapshot the per-consumer-fragment instance destinations for CTE
         // multicast sub-sinks (each consumer fans out to all of its instances).
@@ -310,6 +310,15 @@ impl ExecutionCoordinator {
                     (output_sink, unpartitioned_partition(), None)
                 };
 
+                let write_report_addr = if data_sink_requires_write_report(&output_sink) {
+                    if novarocks_report_addr.is_none() {
+                        novarocks_report_addr = Some(local_coordinator_report_addr()?);
+                    }
+                    novarocks_report_addr.clone()
+                } else {
+                    None
+                };
+
                 let thrift_fragment = planner::TPlanFragment::new(
                     Some(fr.plan.clone()),
                     None::<Vec<crate::exprs::TExpr>>,
@@ -345,7 +354,7 @@ impl ExecutionCoordinator {
                     query_options.clone(),
                     pipeline_dop,
                     Some(placement.instance_index as i32),
-                    novarocks_report_addr.clone(),
+                    write_report_addr,
                 );
 
                 if is_write_sink(&params) {
@@ -488,16 +497,18 @@ fn is_write_sink(params: &crate::internal_service::TExecPlanFragmentParams) -> b
         .fragment
         .as_ref()
         .and_then(|fragment| fragment.output_sink.as_ref())
-        .map(|sink| {
-            matches!(
-                sink.type_,
-                data_sinks::TDataSinkType::ICEBERG_TABLE_SINK
-                    | data_sinks::TDataSinkType::ICEBERG_DELETE_SINK
-                    | data_sinks::TDataSinkType::HIVE_TABLE_SINK
-                    | data_sinks::TDataSinkType::OLAP_TABLE_SINK
-            )
-        })
+        .map(data_sink_requires_write_report)
         .unwrap_or(false)
+}
+
+fn data_sink_requires_write_report(sink: &data_sinks::TDataSink) -> bool {
+    matches!(
+        sink.type_,
+        data_sinks::TDataSinkType::ICEBERG_TABLE_SINK
+            | data_sinks::TDataSinkType::ICEBERG_DELETE_SINK
+            | data_sinks::TDataSinkType::HIVE_TABLE_SINK
+            | data_sinks::TDataSinkType::OLAP_TABLE_SINK
+    )
 }
 
 struct RegisteredWriteCoordinator {
@@ -1702,7 +1713,7 @@ mod tests {
         let query_id = id(750, 751);
         let writer = writer_key(750, 751, 752, 753, 0);
         let write = Arc::new(Mutex::new(
-            WriteCoordinator::new(query_id, vec![writer]).expect("write coordinator"),
+            WriteCoordinator::new(query_id, vec![writer.clone()]).expect("write coordinator"),
         ));
         let inner = ControllableDispatcher::succeeds_always_eof();
         let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
@@ -1732,6 +1743,14 @@ mod tests {
             2,
             "missing final report timeout must cancel all submitted fragments"
         );
+        let abort = write
+            .lock()
+            .expect("write coordinator lock")
+            .abort_input()
+            .expect("missing final report timeout must create abort input");
+        assert!(abort.reason.contains("timed out"), "{}", abort.reason);
+        assert_eq!(abort.completed_writer_outputs.len(), 0);
+        assert_eq!(abort.incomplete_writers, vec![writer]);
     }
 
     // -----------------------------------------------------------------------

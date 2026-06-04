@@ -135,10 +135,11 @@ impl WriteCoordinator {
             fragment_instance_id: report.fragment_instance_id.clone(),
             backend_num: report.backend_num,
         };
-        let slot = self
-            .writers
-            .get_mut(&key)
-            .ok_or_else(|| format!("unknown writer report: {}", format_writer_key(&key)))?;
+        let Some(slot) = self.writers.get_mut(&key) else {
+            let reason = format!("unknown writer report: {}", format_writer_key(&key));
+            self.latch_failed_reason(reason.clone());
+            return Err(reason);
+        };
 
         if !report.done {
             match &mut slot.state {
@@ -246,6 +247,7 @@ impl WriteCoordinator {
     }
 
     pub(crate) fn mark_canceled_except_finished(&mut self, reason: String) {
+        self.latch_failed_reason(reason.clone());
         for slot in self.writers.values_mut() {
             if matches!(
                 slot.state,
@@ -829,6 +831,79 @@ mod tests {
             .commit_input()
             .expect_err("missing writer must block commit");
         assert!(err.contains("missing writer"), "{err}");
+    }
+
+    #[test]
+    fn unknown_writer_report_latches_failed_state_and_blocks_later_commit() {
+        let query_id = id(25, 35);
+        let expected = key(25, 35, 125, 225, 0);
+        let unknown = key(25, 35, 126, 226, 1);
+        let mut coord = coord(query_id.clone(), vec![expected.clone()]);
+
+        let err = coord
+            .apply_report(report(
+                &unknown,
+                true,
+                ok_status(),
+                "s3://w/unknown.parquet",
+            ))
+            .expect_err("unknown writer must be a protocol error");
+        assert!(err.contains("unknown writer report"), "{err}");
+        assert!(coord.has_failed());
+
+        let outcome = coord
+            .apply_report(report(
+                &expected,
+                true,
+                ok_status(),
+                "s3://w/expected.parquet",
+            ))
+            .expect("expected writer report after unknown writer");
+        assert_eq!(outcome, ReportOutcome::Failed);
+        let commit_err = coord
+            .commit_input()
+            .expect_err("unknown writer must permanently block commit");
+        assert!(commit_err.contains("unknown writer report"), "{commit_err}");
+        let abort = coord
+            .abort_input()
+            .expect("unknown writer failure must create abort input");
+        assert_eq!(abort.write_id, query_id);
+        assert!(abort.reason.contains("unknown writer report"));
+        assert_eq!(abort.completed_writer_outputs.len(), 1);
+        assert!(abort.incomplete_writers.is_empty());
+    }
+
+    #[test]
+    fn canceled_missing_writers_build_abort_input() {
+        let query_id = id(26, 36);
+        let writer_a = key(26, 36, 127, 227, 0);
+        let writer_b = key(26, 36, 128, 228, 1);
+        let mut coord = coord(query_id.clone(), vec![writer_a.clone(), writer_b.clone()]);
+        coord
+            .apply_report(report(
+                &writer_a,
+                true,
+                ok_status(),
+                "s3://w/done-before-timeout.parquet",
+            ))
+            .expect("writer a report");
+
+        coord.mark_canceled_except_finished("missing final report timeout".to_string());
+
+        let commit_err = coord
+            .commit_input()
+            .expect_err("canceled write must not commit");
+        assert!(
+            commit_err.contains("missing final report timeout"),
+            "{commit_err}"
+        );
+        let abort = coord
+            .abort_input()
+            .expect("canceled missing writers must create abort input");
+        assert_eq!(abort.write_id, query_id);
+        assert!(abort.reason.contains("missing final report timeout"));
+        assert_eq!(abort.completed_writer_outputs.len(), 1);
+        assert_eq!(abort.incomplete_writers, vec![writer_b]);
     }
 
     #[test]

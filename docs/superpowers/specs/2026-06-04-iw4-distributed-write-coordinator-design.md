@@ -29,7 +29,7 @@ IW-4 v1 只生成统一的 `WriteCommitInput` / `WriteAbortInput`，不执行具
 5. 从 final OK report 中收集 `sink_commit_infos`、tablet commit/fail infos、load counters、loaded rows/bytes 等现有字段。
 6. 任一 final error report 触发 write failed，并通过现有 `dispatcher.cancel_fragments` 取消其它 fragment。
 7. duplicate final report 幂等；内容冲突 fail fast。
-8. 1FE+2BE standalone distributed write 能收集两个 BE 的 staged file metadata。
+8. 在构造出的 multi-BE write-sink fragment plan 中，coordinator 能收集两个 BE writer 的 staged file metadata。
 9. coordinator 日志能观察 writer Pending/Running/Finished/Failed/Canceled lifecycle。
 
 ### 2.2 非目标
@@ -406,7 +406,7 @@ gRPC handler 只做薄包装：decode thrift payload、调用 coordinator report
 ### 9.4 Integration tests
 
 - all-in-one 路径验证 local report 仍能驱动 coordinator。
-- 1FE+2BE standalone cluster 验证两个 BE 的 staged file metadata 都被 coordinator 收集。
+- 1FE+2BE standalone cluster 或等价的 coordinator/report harness 验证两个 BE writer 的 staged file metadata 都被 coordinator 收集。
 - fault injection：一个 writer 返回 error，另一个 writer 被 cancel，最终 query failed 且不生成 `WriteCommitInput`。
 - FE-compatible existing behavior regression：`sink_commit_infos` 仍通过 `TReportExecStatusParams` 发给 FE。
 
@@ -428,7 +428,7 @@ Coordinator 日志必须包含：
 
 ## 11. Acceptance Criteria
 
-1. 1FE+2BE standalone distributed write 能收集两个 BE 的 staged file metadata。
+1. Multi-BE write-sink coordinator/report harness 能收集两个 BE writer 的 staged file metadata。
 2. 任一 writer failure 会 fail query，并 cancel 其它未完成 fragments。
 3. duplicate report 幂等。
 4. conflicting duplicate report fail fast。
@@ -467,5 +467,7 @@ IW-4 v1 已落地到 coordinator/report 协议层：
 - `role=fe` 启动 report-only NovaRocks gRPC endpoint，允许 remote BE 上报 final writer status，但仍拒绝本地 fragment execution RPC。
 - `WriteCoordinator` 维护 expected writers，处理 OK/error final reports、duplicate/conflict/missing reports，并生成 `WriteCommitInput` / `WriteAbortInput`。
 - `ExecutionCoordinator` 在 dispatch 前注册 expected writers，root EOF 后等待 final writer reports，writer failure 或 final report lost 时 fail query 并 cancel submitted peer fragments。
+
+当前真实 standalone Iceberg `INSERT ... SELECT` 仍通过 `engine::iceberg_writer` 在 coordinator 侧收集 SELECT chunks 后本地写 data files；IW-4 尚未把该用户级 INSERT 路径切到 multi-fragment `ICEBERG_TABLE_SINK`。
 
 边界保持不变：IW-4 只生成 commit/abort input，不调用 Iceberg/Hive/managed-lake metadata commit，也不执行 staging cleanup strategy。metadata commit 接入属于 IW-5，cancel/recovery cleanup 语义属于 IW-6，用户级 INSERT pipeline cutover 和稳定 1FE+2BE SQL write smoke 属于 IW-7/IW-10。

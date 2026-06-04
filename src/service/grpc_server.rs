@@ -45,6 +45,9 @@ use crate::service::{load_tracking_http, stream_load_http};
 pub use crate::service::grpc_proto as proto;
 
 const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const REPORT_EXEC_STATUS_OK: i32 = 0;
+pub(crate) const REPORT_EXEC_STATUS_ERROR: i32 = 1;
+pub(crate) const REPORT_EXEC_STATUS_QUERY_GONE: i32 = 2;
 static SUBMIT_FRAGMENT_CALLS: AtomicUsize = AtomicUsize::new(0);
 static FETCH_RESULT_CALLS: AtomicUsize = AtomicUsize::new(0);
 static CANCEL_FRAGMENT_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -435,13 +438,13 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         match result {
             Ok(()) => Ok(tonic::Response::new(
                 proto::novarocks::ReportExecStatusResponse {
-                    status_code: 0,
+                    status_code: REPORT_EXEC_STATUS_OK,
                     message: String::new(),
                 },
             )),
             Err(e) => Ok(tonic::Response::new(
                 proto::novarocks::ReportExecStatusResponse {
-                    status_code: 1,
+                    status_code: report_exec_status_error_code(&e),
                     message: e,
                 },
             )),
@@ -472,17 +475,25 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         match result {
             Ok(()) => Ok(tonic::Response::new(
                 proto::novarocks::BatchReportExecStatusResponse {
-                    status_code: 0,
+                    status_code: REPORT_EXEC_STATUS_OK,
                     message: String::new(),
                 },
             )),
             Err(e) => Ok(tonic::Response::new(
                 proto::novarocks::BatchReportExecStatusResponse {
-                    status_code: 1,
+                    status_code: report_exec_status_error_code(&e),
                     message: e,
                 },
             )),
         }
+    }
+}
+
+fn report_exec_status_error_code(message: &str) -> i32 {
+    if message.contains("write coordinator not found for query") {
+        REPORT_EXEC_STATUS_QUERY_GONE
+    } else {
+        REPORT_EXEC_STATUS_ERROR
     }
 }
 
@@ -1333,6 +1344,33 @@ mod pr3_tests {
         let body = resp.into_inner();
         assert_eq!(body.status_code, 0, "{}", body.message);
         crate::runtime::write_coordinator::unregister_query(&query);
+    }
+
+    #[tokio::test]
+    async fn report_exec_status_query_gone_returns_terminal_code() {
+        crate::runtime::write_coordinator::test_clear_registry();
+        let query = types::TUniqueId::new(801, 901);
+        let finst = types::TUniqueId::new(802, 902);
+        let bytes = thrift_binary_serialize(&ok_report_params(query, finst))
+            .expect("serialize report params");
+        let svc = GrpcService::default();
+        let req = Request::new(ReportExecStatusRequest {
+            report_exec_status_params_thrift: bytes,
+        });
+
+        let resp = svc
+            .report_exec_status(req)
+            .await
+            .expect("RPC level success");
+        let body = resp.into_inner();
+
+        assert_eq!(
+            body.status_code,
+            crate::service::grpc_server::REPORT_EXEC_STATUS_QUERY_GONE,
+            "{}",
+            body.message
+        );
+        assert!(body.message.contains("not found"), "{}", body.message);
     }
 
     #[tokio::test]
