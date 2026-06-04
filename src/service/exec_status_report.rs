@@ -18,6 +18,7 @@
 use std::collections::BTreeMap;
 
 use crate::common::types::UniqueId;
+use crate::novarocks_logging::debug;
 use crate::runtime::query_context::QueryId;
 use crate::runtime::sink_commit;
 use crate::{data_cache, frontend_service, runtime_profile, status, types};
@@ -64,6 +65,8 @@ pub(crate) fn build_report_params(
         }
     }
 
+    // FE derives loaded rows from these LoadEtlTask-recognized counters.
+    // Missing or mismatched keys make FE see loadedRows=0.
     let load_counters = if normal_rows > 0 || loaded_bytes > 0 || filtered_rows > 0 {
         let mut counters = BTreeMap::new();
         counters.insert("dpp.norm.ALL".to_string(), normal_rows.to_string());
@@ -75,6 +78,18 @@ pub(crate) fn build_report_params(
     } else {
         None
     };
+
+    debug!(
+        target: "novarocks::sink_commit",
+        finst_id = %input.finst_id,
+        backend_num = input.backend_num,
+        query_id = %input.query_id,
+        tablet_commit_info_len = tablet_commit_infos.len(),
+        tablet_fail_info_len = tablet_fail_infos.len(),
+        commit_info_len = sink_commit_infos.len(),
+        done = input.done,
+        "reportExecStatus sink/tablet commit infos"
+    );
 
     let tablet_commit_infos = if tablet_commit_infos.is_empty() {
         None
@@ -207,6 +222,53 @@ mod tests {
                 .and_then(|c| c.get("loaded.bytes")),
             Some(&"120".to_string())
         );
+        sink_commit::unregister(finst_id);
+    }
+
+    #[test]
+    fn builder_collects_tablet_commit_and_fail_infos() {
+        let finst_id = UniqueId { hi: 95, lo: 96 };
+        sink_commit::register(finst_id);
+        sink_commit::add_tablet_commit_info(
+            finst_id,
+            types::TTabletCommitInfo::new(
+                1001,
+                2002,
+                Option::<Vec<String>>::None,
+                Some(vec!["tablet-rowset".to_string()]),
+                Option::<Vec<i64>>::None,
+            ),
+        );
+        sink_commit::add_tablet_fail_info(
+            finst_id,
+            types::TTabletFailInfo::new(Some(3003), Some(4004)),
+        );
+
+        let params = build_report_params(ExecStatusReportInput {
+            finst_id,
+            query_id: QueryId { hi: 85, lo: 86 },
+            backend_num: 9,
+            status: ok_status(),
+            done: true,
+            profile: None,
+            tracking_url: None,
+            load_channel_profile: None,
+            load_datacache_metrics: None,
+        });
+
+        let tablet_commit_infos = params.commit_infos.as_ref().expect("tablet commit infos");
+        assert_eq!(tablet_commit_infos.len(), 1);
+        assert_eq!(tablet_commit_infos[0].tablet_id, 1001);
+        assert_eq!(tablet_commit_infos[0].backend_id, 2002);
+        assert_eq!(
+            tablet_commit_infos[0].valid_dict_cache_columns.as_ref(),
+            Some(&vec!["tablet-rowset".to_string()])
+        );
+
+        let tablet_fail_infos = params.fail_infos.as_ref().expect("tablet fail infos");
+        assert_eq!(tablet_fail_infos.len(), 1);
+        assert_eq!(tablet_fail_infos[0].tablet_id, Some(3003));
+        assert_eq!(tablet_fail_infos[0].backend_id, Some(4004));
         sink_commit::unregister(finst_id);
     }
 

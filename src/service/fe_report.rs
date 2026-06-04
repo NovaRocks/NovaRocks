@@ -166,7 +166,7 @@ pub(crate) fn report_fragment_done(finst_id: UniqueId, error: Option<String>) {
         load_channel_profile: None,
         load_datacache_metrics,
     });
-    exec_state_reporter::enqueue_final(ExecStateReportTask {
+    enqueue_final_report(ExecStateReportTask {
         finst_id,
         query_id: instance.query_id,
         coord: instance.coord.clone(),
@@ -254,6 +254,15 @@ pub(crate) fn fetch_query_profile(
         .and_then(|mut v| v.drain(..).next())
         .unwrap_or_default();
     Ok(payload)
+}
+
+fn enqueue_final_report(task: ExecStateReportTask) {
+    #[cfg(test)]
+    if test_capture_final_report(&task) {
+        return;
+    }
+
+    exec_state_reporter::enqueue_final(task);
 }
 
 fn build_tracking_url(query_id: QueryId) -> Option<String> {
@@ -539,12 +548,44 @@ pub(crate) fn test_report_registry_lock() -> &'static Mutex<()> {
 }
 
 #[cfg(test)]
+type FinalReportHook = Box<dyn Fn(&ExecStateReportTask) + Send + Sync + 'static>;
+
+#[cfg(test)]
+fn test_final_report_hook() -> &'static Mutex<Option<FinalReportHook>> {
+    static HOOK: OnceLock<Mutex<Option<FinalReportHook>>> = OnceLock::new();
+    HOOK.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn test_set_final_report_hook(hook: Option<FinalReportHook>) {
+    *test_final_report_hook()
+        .lock()
+        .expect("final report hook lock") = hook;
+}
+
+#[cfg(test)]
+fn test_capture_final_report(task: &ExecStateReportTask) -> bool {
+    let guard = test_final_report_hook()
+        .lock()
+        .expect("final report hook lock");
+    let Some(hook) = guard.as_ref() else {
+        return false;
+    };
+    hook(task);
+    true
+}
+
+#[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::{
         is_query_gone_status, mark_fe_query_gone, report_fragment_done,
         test_insert_report_instance, test_reset_report_registry,
     };
     use crate::common::types::UniqueId;
+    use crate::frontend_service;
+    use crate::runtime::load_tracking;
     use crate::runtime::query_context::QueryId;
     use crate::service::exec_state_reporter;
     use crate::{status, status_code};
@@ -583,6 +624,53 @@ mod tests {
 
         assert_eq!(exec_state_reporter::test_priority_queue_len(), 0);
         assert!(super::list_report_instances().is_empty());
+        test_reset_report_registry();
+    }
+
+    struct FinalReportHookGuard;
+
+    impl Drop for FinalReportHookGuard {
+        fn drop(&mut self) {
+            super::test_set_final_report_hook(None);
+        }
+    }
+
+    fn capture_final_report(
+        captured: Arc<Mutex<Option<frontend_service::TReportExecStatusParams>>>,
+    ) -> FinalReportHookGuard {
+        super::test_set_final_report_hook(Some(Box::new(move |task| {
+            *captured.lock().expect("capture final report params") = Some(task.params.clone());
+        })));
+        FinalReportHookGuard
+    }
+
+    #[test]
+    fn fragment_done_passes_tracking_url_to_enqueued_report() {
+        let _guard = super::test_report_registry_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let finst_id = UniqueId { hi: 51, lo: 52 };
+        let query_id = QueryId { hi: 61, lo: 62 };
+        let captured = Arc::new(Mutex::new(None));
+        let _hook = capture_final_report(Arc::clone(&captured));
+
+        crate::novarocks_config::install_default_for_test();
+        test_reset_report_registry();
+        exec_state_reporter::test_clear_shared_queues();
+        test_insert_report_instance(finst_id, query_id);
+        load_tracking::append_logs(query_id, ["rejected row".to_string()]);
+
+        report_fragment_done(finst_id, None);
+
+        let params = captured
+            .lock()
+            .expect("inspect captured final report params")
+            .clone()
+            .expect("final report params were captured");
+        assert_eq!(
+            params.tracking_url.as_deref(),
+            Some("http://127.0.0.1:8040/api/_load_tracking/61/62")
+        );
         test_reset_report_registry();
     }
 }
