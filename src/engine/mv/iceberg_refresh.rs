@@ -50,7 +50,9 @@ use crate::engine::mv::lifecycle::{
 };
 use crate::engine::mv::rebind::rewrite_select_sql_for_rebind;
 use crate::engine::mv::refresh_context::IcebergMvRefreshContext;
-use crate::engine::mv::refresh_contract::{ApplyKeyContract, RefreshStrategy, RewriteEvidence};
+use crate::engine::mv::refresh_contract::{
+    ApplyKeyContract, ImvRefreshContract, RefreshStrategy, RewriteEvidence,
+};
 use crate::engine::mv::refresh_driver::{
     BaseSnapshotPolicy, BaseSnapshotStatus, IcebergMvRefreshLifecycle, RefreshDecision,
     decide_refresh,
@@ -147,85 +149,9 @@ pub(crate) fn create_iceberg_mv(
     })?;
     let base_refs = resolved_dependencies.base_refs;
     let shape = classify_incremental_mv_query(&canonical_select_query)?;
-    let aggregate_shape = aggregate_shape_for_layout(&shape);
-    let loaded_bases = match &shape {
-        IncrementalMvShape::ProjectionFilter(_) => {
-            let [base_ref] = base_refs.as_slice() else {
-                return Err(
-                    "iceberg-backed projection/filter materialized views require exactly one iceberg base table"
-                        .to_string(),
-                );
-            };
-            let loaded_base = load_current_iceberg_base_table(state, base_ref)?;
-            ensure_base_row_lineage_contract(&loaded_base.table, &base_ref.fqn())?;
-            vec![(base_ref.clone(), loaded_base)]
-        }
-        IncrementalMvShape::JoinProjectionFilter(join_shape) => {
-            if base_refs.len() != 2 {
-                return Err(
-                    "iceberg-backed join materialized views require exactly two iceberg base tables"
-                        .to_string(),
-                );
-            }
-            validate_join_shape_base_refs(join_shape, &base_refs)?;
-            base_refs
-                .iter()
-                .map(|base_ref| {
-                    let loaded_base = load_current_iceberg_base_table(state, base_ref)?;
-                    ensure_base_row_lineage_contract(&loaded_base.table, &base_ref.fqn())?;
-                    Ok((base_ref.clone(), loaded_base))
-                })
-                .collect::<Result<Vec<_>, String>>()?
-        }
-        IncrementalMvShape::Aggregate(aggregate_shape) => {
-            if aggregate_shape.fan_in_bases.is_empty() {
-                let [base_ref] = base_refs.as_slice() else {
-                    return Err(
-                        "iceberg-backed aggregate materialized views require exactly one iceberg base table"
-                            .to_string(),
-                    );
-                };
-                let loaded_base = load_current_iceberg_base_table(state, base_ref)?;
-                ensure_base_row_lineage_contract(&loaded_base.table, &base_ref.fqn())?;
-                vec![(base_ref.clone(), loaded_base)]
-            } else {
-                validate_aggregate_fan_in_base_refs(aggregate_shape, &base_refs)?;
-                base_refs
-                    .iter()
-                    .map(|base_ref| {
-                        let loaded_base = load_current_iceberg_base_table(state, base_ref)?;
-                        ensure_base_row_lineage_contract(&loaded_base.table, &base_ref.fqn())?;
-                        Ok((base_ref.clone(), loaded_base))
-                    })
-                    .collect::<Result<Vec<_>, String>>()?
-            }
-        }
-        IncrementalMvShape::UnionAll(_) => base_refs
-            .iter()
-            .map(|base_ref| {
-                let loaded_base = load_current_iceberg_base_table(state, base_ref)?;
-                ensure_base_row_lineage_contract(&loaded_base.table, &base_ref.fqn())?;
-                Ok((base_ref.clone(), loaded_base))
-            })
-            .collect::<Result<Vec<_>, String>>()?,
-        IncrementalMvShape::JoinAggregate(join_shape) => {
-            if base_refs.len() != 2 {
-                return Err(
-                    "iceberg-backed join aggregate materialized views require exactly two iceberg base tables"
-                        .to_string(),
-                );
-            }
-            validate_join_shape_base_refs(&join_shape.join, &base_refs)?;
-            base_refs
-                .iter()
-                .map(|base_ref| {
-                    let loaded_base = load_current_iceberg_base_table(state, base_ref)?;
-                    ensure_base_row_lineage_contract(&loaded_base.table, &base_ref.fqn())?;
-                    Ok((base_ref.clone(), loaded_base))
-                })
-                .collect::<Result<Vec<_>, String>>()?
-        }
-    };
+    validate_refresh_contract_matches_legacy_shape(&refresh_contract, &shape)?;
+    let loaded_bases =
+        load_bases_for_refresh_contract(state, &refresh_contract, &shape, &base_refs)?;
 
     // IVM Phase-2 PRIMARY KEY validation. Only runs when the user opted in
     // by writing `PRIMARY KEY (...)` in the DDL; otherwise behavior is
@@ -287,31 +213,8 @@ pub(crate) fn create_iceberg_mv(
             "Iceberg MV output column name {ICEBERG_MV_BRANCH_ID_COLUMN} is reserved for internal branch id"
         ));
     }
-    let mut columns = if let IncrementalMvShape::UnionAll(union_shape) = &shape {
-        match union_shape.branch_kind {
-            UnionBranchKind::Aggregate => {
-                let first_aggregate_branch = first_union_aggregate_branch(union_shape)?;
-                iceberg_aggregate_target_columns_from_resolved_query(
-                    first_aggregate_branch,
-                    &analysis.output_columns,
-                    first_union_branch_resolved_query(&analysis.resolved_query)?,
-                )?
-            }
-            UnionBranchKind::ProjectionFilter => analysis
-                .output_columns
-                .iter()
-                .map(output_column_to_table_column)
-                .collect::<Result<Vec<_>, _>>()?,
-        }
-    } else if let Some(aggregate_shape) = aggregate_shape.as_ref() {
-        iceberg_aggregate_target_columns(aggregate_shape, &analysis)?
-    } else {
-        analysis
-            .output_columns
-            .iter()
-            .map(output_column_to_table_column)
-            .collect::<Result<Vec<_>, _>>()?
-    };
+    let mut columns =
+        create_target_columns_from_refresh_contract(&refresh_contract, &shape, &analysis)?;
     if create_strategy_needs_physical_apply_key_column(refresh_contract.strategy) {
         columns.push(create_apply_key_table_column(&refresh_contract.apply_key)?);
     }
@@ -328,32 +231,8 @@ pub(crate) fn create_iceberg_mv(
             )
         })?;
     let partition_fields = stmt.partition_by.as_deref().unwrap_or(&[]);
-    let aggregate_state_hidden_columns = if let IncrementalMvShape::UnionAll(union_shape) = &shape {
-        if union_shape.branch_kind == UnionBranchKind::Aggregate {
-            let first_aggregate_branch = first_union_aggregate_branch(union_shape)?;
-            let layout = build_aggregate_layout_from_resolved_query(
-                first_aggregate_branch,
-                &analysis.output_columns,
-                first_union_branch_resolved_query(&analysis.resolved_query)?,
-            )?;
-            layout
-                .state_columns
-                .iter()
-                .map(|column| column.name.clone())
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        }
-    } else if let Some(aggregate_shape) = aggregate_shape.as_ref() {
-        let layout = build_aggregate_layout_from_analysis(aggregate_shape, &analysis)?;
-        layout
-            .state_columns
-            .iter()
-            .map(|column| column.name.clone())
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
+    let aggregate_state_hidden_columns =
+        aggregate_state_hidden_columns_from_refresh_contract(&refresh_contract, &shape, &analysis)?;
     let mut target_properties = vec![
         ("format-version".to_string(), "3".to_string()),
         ("write.row-lineage".to_string(), "true".to_string()),
@@ -402,13 +281,13 @@ pub(crate) fn create_iceberg_mv(
 
         // 3. Build A11 lineage from the resolved query and the base Iceberg schema.
         let schema_contract = build_iceberg_mv_schema_contract(
+            &refresh_contract,
             &shape,
             &analysis,
             &loaded_bases,
             &target,
             &target_loaded,
             actual_apply_key_field_id,
-            refresh_contract.apply_key,
         )?;
 
         // 4. Persist MV metadata in the repository.
@@ -810,6 +689,382 @@ pub(crate) fn union_branch_inner_apply_key(
     }
 }
 
+fn validate_refresh_contract_matches_legacy_shape(
+    refresh_contract: &ImvRefreshContract,
+    shape: &IncrementalMvShape,
+) -> Result<(), String> {
+    match refresh_contract.strategy {
+        RefreshStrategy::ProjectionFilter => match shape {
+            IncrementalMvShape::ProjectionFilter(_) => Ok(()),
+            _ => Err(refresh_contract_legacy_shape_mismatch_error(
+                refresh_contract.strategy,
+                shape,
+            )),
+        },
+        RefreshStrategy::JoinProjectionFilter => match shape {
+            IncrementalMvShape::JoinProjectionFilter(join_shape) => {
+                validate_join_contract_counts(refresh_contract, join_shape.join_keys.len())
+            }
+            _ => Err(refresh_contract_legacy_shape_mismatch_error(
+                refresh_contract.strategy,
+                shape,
+            )),
+        },
+        RefreshStrategy::UnionProjectionFilter => match shape {
+            IncrementalMvShape::UnionAll(union_shape)
+                if union_shape.branch_kind == UnionBranchKind::ProjectionFilter =>
+            {
+                validate_branch_contract_counts(refresh_contract, union_shape.branches.len())
+            }
+            _ => Err(refresh_contract_legacy_shape_mismatch_error(
+                refresh_contract.strategy,
+                shape,
+            )),
+        },
+        RefreshStrategy::SingleAggregate => match shape {
+            IncrementalMvShape::Aggregate(aggregate_shape)
+                if aggregate_shape.fan_in_bases.is_empty() =>
+            {
+                validate_aggregate_contract_counts(
+                    refresh_contract,
+                    aggregate_shape.group_keys.len(),
+                    aggregate_shape.aggregates.len(),
+                )
+            }
+            _ => Err(refresh_contract_legacy_shape_mismatch_error(
+                refresh_contract.strategy,
+                shape,
+            )),
+        },
+        RefreshStrategy::FanInAggregate => match shape {
+            IncrementalMvShape::Aggregate(aggregate_shape)
+                if !aggregate_shape.fan_in_bases.is_empty() =>
+            {
+                validate_branch_contract_counts(
+                    refresh_contract,
+                    aggregate_shape.fan_in_bases.len(),
+                )?;
+                validate_aggregate_contract_counts(
+                    refresh_contract,
+                    aggregate_shape.group_keys.len(),
+                    aggregate_shape.aggregates.len(),
+                )
+            }
+            _ => Err(refresh_contract_legacy_shape_mismatch_error(
+                refresh_contract.strategy,
+                shape,
+            )),
+        },
+        RefreshStrategy::JoinAggregate => match shape {
+            IncrementalMvShape::JoinAggregate(join_shape) => {
+                validate_join_contract_counts(refresh_contract, join_shape.join.join_keys.len())?;
+                validate_aggregate_contract_counts(
+                    refresh_contract,
+                    join_shape.group_keys.len(),
+                    join_shape.aggregates.len(),
+                )
+            }
+            _ => Err(refresh_contract_legacy_shape_mismatch_error(
+                refresh_contract.strategy,
+                shape,
+            )),
+        },
+        RefreshStrategy::UnsupportedBranchUnionAggregate => match shape {
+            IncrementalMvShape::UnionAll(union_shape)
+                if union_shape.branch_kind == UnionBranchKind::Aggregate =>
+            {
+                validate_branch_contract_counts(refresh_contract, union_shape.branches.len())?;
+                let first = first_union_aggregate_branch(union_shape)?;
+                validate_aggregate_contract_counts(
+                    refresh_contract,
+                    first.group_keys.len(),
+                    first.aggregates.len(),
+                )
+            }
+            _ => Err(refresh_contract_legacy_shape_mismatch_error(
+                refresh_contract.strategy,
+                shape,
+            )),
+        },
+    }
+}
+
+fn validate_aggregate_contract_counts(
+    refresh_contract: &ImvRefreshContract,
+    group_key_count: usize,
+    aggregate_count: usize,
+) -> Result<(), String> {
+    let Some(aggregate) = refresh_contract.aggregate else {
+        return Err(format!(
+            "Iceberg IMV refresh contract {:?} is missing aggregate metadata",
+            refresh_contract.strategy
+        ));
+    };
+    if aggregate.group_key_count != group_key_count || aggregate.aggregate_count != aggregate_count
+    {
+        return Err(format!(
+            "Iceberg IMV refresh contract {:?} aggregate metadata does not match legacy shape: contract group_keys={}, aggregates={}; shape group_keys={}, aggregates={}",
+            refresh_contract.strategy,
+            aggregate.group_key_count,
+            aggregate.aggregate_count,
+            group_key_count,
+            aggregate_count
+        ));
+    }
+    Ok(())
+}
+
+fn validate_join_contract_counts(
+    refresh_contract: &ImvRefreshContract,
+    join_key_count: usize,
+) -> Result<(), String> {
+    let Some(join) = refresh_contract.join else {
+        return Err(format!(
+            "Iceberg IMV refresh contract {:?} is missing join metadata",
+            refresh_contract.strategy
+        ));
+    };
+    if join.join_key_count != join_key_count {
+        return Err(format!(
+            "Iceberg IMV refresh contract {:?} join metadata does not match legacy shape: contract join_keys={}, shape join_keys={}",
+            refresh_contract.strategy, join.join_key_count, join_key_count
+        ));
+    }
+    Ok(())
+}
+
+fn validate_branch_contract_counts(
+    refresh_contract: &ImvRefreshContract,
+    branch_count: usize,
+) -> Result<(), String> {
+    let Some(branch) = refresh_contract.branch else {
+        return Err(format!(
+            "Iceberg IMV refresh contract {:?} is missing branch metadata",
+            refresh_contract.strategy
+        ));
+    };
+    if branch.branch_count != branch_count {
+        return Err(format!(
+            "Iceberg IMV refresh contract {:?} branch metadata does not match legacy shape: contract branches={}, shape branches={}",
+            refresh_contract.strategy, branch.branch_count, branch_count
+        ));
+    }
+    Ok(())
+}
+
+fn refresh_contract_legacy_shape_mismatch_error(
+    strategy: RefreshStrategy,
+    shape: &IncrementalMvShape,
+) -> String {
+    format!(
+        "Iceberg IMV refresh contract strategy {strategy:?} does not match legacy MV shape {shape:?}"
+    )
+}
+
+fn create_target_columns_from_refresh_contract(
+    refresh_contract: &ImvRefreshContract,
+    shape: &IncrementalMvShape,
+    analysis: &MvAnalysis,
+) -> Result<Vec<crate::sql::parser::ast::TableColumnDef>, String> {
+    validate_refresh_contract_matches_legacy_shape(refresh_contract, shape)?;
+    match refresh_contract.strategy {
+        RefreshStrategy::ProjectionFilter
+        | RefreshStrategy::JoinProjectionFilter
+        | RefreshStrategy::UnionProjectionFilter => analysis
+            .output_columns
+            .iter()
+            .map(output_column_to_table_column)
+            .collect::<Result<Vec<_>, _>>(),
+        RefreshStrategy::SingleAggregate | RefreshStrategy::FanInAggregate => {
+            let IncrementalMvShape::Aggregate(aggregate_shape) = shape else {
+                return Err(refresh_contract_legacy_shape_mismatch_error(
+                    refresh_contract.strategy,
+                    shape,
+                ));
+            };
+            iceberg_aggregate_target_columns(aggregate_shape, analysis)
+        }
+        RefreshStrategy::JoinAggregate => {
+            let IncrementalMvShape::JoinAggregate(join_shape) = shape else {
+                return Err(refresh_contract_legacy_shape_mismatch_error(
+                    refresh_contract.strategy,
+                    shape,
+                ));
+            };
+            let aggregate_shape = join_shape.as_aggregate_shape_for_layout();
+            iceberg_aggregate_target_columns(&aggregate_shape, analysis)
+        }
+        RefreshStrategy::UnsupportedBranchUnionAggregate => {
+            let IncrementalMvShape::UnionAll(union_shape) = shape else {
+                return Err(refresh_contract_legacy_shape_mismatch_error(
+                    refresh_contract.strategy,
+                    shape,
+                ));
+            };
+            let first_aggregate_branch = first_union_aggregate_branch(union_shape)?;
+            iceberg_aggregate_target_columns_from_resolved_query(
+                first_aggregate_branch,
+                &analysis.output_columns,
+                first_union_branch_resolved_query(&analysis.resolved_query)?,
+            )
+        }
+    }
+}
+
+fn aggregate_state_hidden_columns_from_refresh_contract(
+    refresh_contract: &ImvRefreshContract,
+    shape: &IncrementalMvShape,
+    analysis: &MvAnalysis,
+) -> Result<Vec<String>, String> {
+    validate_refresh_contract_matches_legacy_shape(refresh_contract, shape)?;
+    let layout = match refresh_contract.strategy {
+        RefreshStrategy::ProjectionFilter
+        | RefreshStrategy::JoinProjectionFilter
+        | RefreshStrategy::UnionProjectionFilter => return Ok(Vec::new()),
+        RefreshStrategy::SingleAggregate | RefreshStrategy::FanInAggregate => {
+            let IncrementalMvShape::Aggregate(aggregate_shape) = shape else {
+                return Err(refresh_contract_legacy_shape_mismatch_error(
+                    refresh_contract.strategy,
+                    shape,
+                ));
+            };
+            build_aggregate_layout_from_analysis(aggregate_shape, analysis)?
+        }
+        RefreshStrategy::JoinAggregate => {
+            let IncrementalMvShape::JoinAggregate(join_shape) = shape else {
+                return Err(refresh_contract_legacy_shape_mismatch_error(
+                    refresh_contract.strategy,
+                    shape,
+                ));
+            };
+            let aggregate_shape = join_shape.as_aggregate_shape_for_layout();
+            build_aggregate_layout_from_analysis(&aggregate_shape, analysis)?
+        }
+        RefreshStrategy::UnsupportedBranchUnionAggregate => {
+            let IncrementalMvShape::UnionAll(union_shape) = shape else {
+                return Err(refresh_contract_legacy_shape_mismatch_error(
+                    refresh_contract.strategy,
+                    shape,
+                ));
+            };
+            let first_aggregate_branch = first_union_aggregate_branch(union_shape)?;
+            build_aggregate_layout_from_resolved_query(
+                first_aggregate_branch,
+                &analysis.output_columns,
+                first_union_branch_resolved_query(&analysis.resolved_query)?,
+            )?
+        }
+    };
+    Ok(layout
+        .state_columns
+        .iter()
+        .map(|column| column.name.clone())
+        .collect())
+}
+
+fn load_bases_for_refresh_contract(
+    state: &Arc<StandaloneState>,
+    refresh_contract: &ImvRefreshContract,
+    shape: &IncrementalMvShape,
+    base_refs: &[IcebergTableRef],
+) -> Result<
+    Vec<(
+        IcebergTableRef,
+        crate::connector::iceberg::catalog::IcebergLoadedTable,
+    )>,
+    String,
+> {
+    validate_refresh_contract_matches_legacy_shape(refresh_contract, shape)?;
+    match refresh_contract.strategy {
+        RefreshStrategy::ProjectionFilter | RefreshStrategy::SingleAggregate => {
+            let [base_ref] = base_refs else {
+                return Err(format!(
+                    "iceberg-backed {:?} materialized views require exactly one iceberg base table",
+                    refresh_contract.strategy
+                ));
+            };
+            load_base_with_row_lineage(state, base_ref).map(|loaded| vec![loaded])
+        }
+        RefreshStrategy::JoinProjectionFilter => {
+            let IncrementalMvShape::JoinProjectionFilter(join_shape) = shape else {
+                return Err(refresh_contract_legacy_shape_mismatch_error(
+                    refresh_contract.strategy,
+                    shape,
+                ));
+            };
+            if base_refs.len() != 2 {
+                return Err(
+                    "iceberg-backed join materialized views require exactly two iceberg base tables"
+                        .to_string(),
+                );
+            }
+            validate_join_shape_base_refs(join_shape, base_refs)?;
+            load_all_bases_with_row_lineage(state, base_refs)
+        }
+        RefreshStrategy::UnionProjectionFilter
+        | RefreshStrategy::UnsupportedBranchUnionAggregate => {
+            load_all_bases_with_row_lineage(state, base_refs)
+        }
+        RefreshStrategy::FanInAggregate => {
+            let IncrementalMvShape::Aggregate(aggregate_shape) = shape else {
+                return Err(refresh_contract_legacy_shape_mismatch_error(
+                    refresh_contract.strategy,
+                    shape,
+                ));
+            };
+            validate_aggregate_fan_in_base_refs(aggregate_shape, base_refs)?;
+            load_all_bases_with_row_lineage(state, base_refs)
+        }
+        RefreshStrategy::JoinAggregate => {
+            let IncrementalMvShape::JoinAggregate(join_shape) = shape else {
+                return Err(refresh_contract_legacy_shape_mismatch_error(
+                    refresh_contract.strategy,
+                    shape,
+                ));
+            };
+            if base_refs.len() != 2 {
+                return Err(
+                    "iceberg-backed join aggregate materialized views require exactly two iceberg base tables"
+                        .to_string(),
+                );
+            }
+            validate_join_shape_base_refs(&join_shape.join, base_refs)?;
+            load_all_bases_with_row_lineage(state, base_refs)
+        }
+    }
+}
+
+fn load_all_bases_with_row_lineage(
+    state: &Arc<StandaloneState>,
+    base_refs: &[IcebergTableRef],
+) -> Result<
+    Vec<(
+        IcebergTableRef,
+        crate::connector::iceberg::catalog::IcebergLoadedTable,
+    )>,
+    String,
+> {
+    base_refs
+        .iter()
+        .map(|base_ref| load_base_with_row_lineage(state, base_ref))
+        .collect()
+}
+
+fn load_base_with_row_lineage(
+    state: &Arc<StandaloneState>,
+    base_ref: &IcebergTableRef,
+) -> Result<
+    (
+        IcebergTableRef,
+        crate::connector::iceberg::catalog::IcebergLoadedTable,
+    ),
+    String,
+> {
+    let loaded_base = load_current_iceberg_base_table(state, base_ref)?;
+    ensure_base_row_lineage_contract(&loaded_base.table, &base_ref.fqn())?;
+    Ok((base_ref.clone(), loaded_base))
+}
+
 fn create_apply_key_source_property(apply_key: &ApplyKeyContract) -> &'static str {
     match apply_key.column_name {
         ICEBERG_MV_APPLY_KEY_COLUMN => ICEBERG_MV_APPLY_KEY_SOURCE_BASE_ROW_ID,
@@ -968,6 +1223,7 @@ fn first_union_branch_resolved_query(
 }
 
 fn build_iceberg_mv_schema_contract(
+    refresh_contract: &ImvRefreshContract,
     shape: &IncrementalMvShape,
     analysis: &crate::connector::starrocks::table::mv_ddl::MvAnalysis,
     loaded_bases: &[(
@@ -977,12 +1233,12 @@ fn build_iceberg_mv_schema_contract(
     target: &IcebergMvTarget,
     target_loaded: &crate::connector::iceberg::catalog::IcebergLoadedTable,
     actual_apply_key_field_id: i32,
-    apply_key: ApplyKeyContract,
 ) -> Result<crate::meta::repository::mv_contract::MvSchemaContract, String> {
-    let target_apply_key_column = apply_key.column_name;
-    let target_apply_key_source = create_apply_key_contract_source(&apply_key);
-    let contract = match shape {
-        IncrementalMvShape::ProjectionFilter(_) => {
+    validate_refresh_contract_matches_legacy_shape(refresh_contract, shape)?;
+    let target_apply_key_column = refresh_contract.apply_key.column_name;
+    let target_apply_key_source = create_apply_key_contract_source(&refresh_contract.apply_key);
+    let contract = match refresh_contract.strategy {
+        RefreshStrategy::ProjectionFilter => {
             let [(base_ref, loaded_base)] = loaded_bases else {
                 return Err(
                     "projection/filter iceberg MV schema contract requires one loaded base"
@@ -1014,7 +1270,13 @@ fn build_iceberg_mv_schema_contract(
                 )?,
             }
         }
-        IncrementalMvShape::JoinProjectionFilter(join_shape) => {
+        RefreshStrategy::JoinProjectionFilter => {
+            let IncrementalMvShape::JoinProjectionFilter(join_shape) = shape else {
+                return Err(refresh_contract_legacy_shape_mismatch_error(
+                    refresh_contract.strategy,
+                    shape,
+                ));
+            };
             let (left_ref, left_loaded) =
                 loaded_base_for_shape_table(loaded_bases, &join_shape.left_table)?;
             let (right_ref, right_loaded) =
@@ -1074,9 +1336,15 @@ fn build_iceberg_mv_schema_contract(
                 )?,
             }
         }
-        IncrementalMvShape::Aggregate(aggregate_shape) => {
+        RefreshStrategy::SingleAggregate | RefreshStrategy::FanInAggregate => {
+            let IncrementalMvShape::Aggregate(aggregate_shape) = shape else {
+                return Err(refresh_contract_legacy_shape_mismatch_error(
+                    refresh_contract.strategy,
+                    shape,
+                ));
+            };
             let layout = build_aggregate_layout_from_analysis(aggregate_shape, analysis)?;
-            if aggregate_shape.fan_in_bases.is_empty() {
+            if refresh_contract.strategy == RefreshStrategy::SingleAggregate {
                 let [(base_ref, loaded_base)] = loaded_bases else {
                     return Err(
                         "aggregate iceberg MV schema contract requires one loaded base".to_string(),
@@ -1167,7 +1435,13 @@ fn build_iceberg_mv_schema_contract(
                 }
             }
         }
-        IncrementalMvShape::JoinAggregate(join_aggregate_shape) => {
+        RefreshStrategy::JoinAggregate => {
+            let IncrementalMvShape::JoinAggregate(join_aggregate_shape) = shape else {
+                return Err(refresh_contract_legacy_shape_mismatch_error(
+                    refresh_contract.strategy,
+                    shape,
+                ));
+            };
             let join_shape = &join_aggregate_shape.join;
             let (left_ref, left_loaded) =
                 loaded_base_for_shape_table(loaded_bases, &join_shape.left_table)?;
@@ -1230,7 +1504,14 @@ fn build_iceberg_mv_schema_contract(
                 )?,
             }
         }
-        IncrementalMvShape::UnionAll(union_shape) => {
+        RefreshStrategy::UnionProjectionFilter
+        | RefreshStrategy::UnsupportedBranchUnionAggregate => {
+            let IncrementalMvShape::UnionAll(union_shape) = shape else {
+                return Err(refresh_contract_legacy_shape_mismatch_error(
+                    refresh_contract.strategy,
+                    shape,
+                ));
+            };
             let first_branch_resolved =
                 first_union_branch_resolved_query(&analysis.resolved_query)?;
             let branch_id_field_id =
@@ -3922,6 +4203,32 @@ fn unknown_union_all_affected_partitions() -> crate::engine::mv::partition::Affe
     )
 }
 
+fn plan_refresh_mode_from_decision(decision: RefreshDecision) -> Result<RefreshMode, RefreshError> {
+    match decision {
+        RefreshDecision::SkipEmpty | RefreshDecision::MetadataOnly => Ok(RefreshMode::Noop),
+        RefreshDecision::FirstRefresh => Ok(RefreshMode::Full),
+        RefreshDecision::Incremental => Ok(RefreshMode::Incremental),
+        RefreshDecision::FailFast { reason } => Err(RefreshError::user(reason)),
+    }
+}
+
+fn base_snapshot_statuses_for_plan(
+    base_refs: &[IcebergTableRef],
+    previous_snapshots: &BTreeMap<String, i64>,
+    current_snapshots: &BTreeMap<String, Option<i64>>,
+) -> Vec<BaseSnapshotStatus> {
+    base_refs
+        .iter()
+        .map(|base_ref| {
+            base_snapshot_status_for_refresh(
+                base_ref,
+                previous_snapshots.get(&base_ref.fqn()).copied(),
+                current_snapshots.get(&base_ref.fqn()).copied().flatten(),
+            )
+        })
+        .collect()
+}
+
 fn noop_affected_partitions(
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
 ) -> crate::engine::mv::partition::AffectedMvPartitions {
@@ -4010,6 +4317,84 @@ fn log_planned_iceberg_mv_affected_partitions(
     );
 }
 
+fn stored_refresh_strategy_for_plan(
+    iceberg_target: &IcebergMvTarget,
+    mv_definition: &StoredMvDefinition,
+    shape: &IncrementalMvShape,
+) -> Result<RefreshStrategy, RefreshError> {
+    let schema_contract = mv_definition.schema_contract.as_ref().ok_or_else(|| {
+        RefreshError::user(format!(
+            "iceberg MV target {}.{}.{} is missing A11 schema contract; rebuild or recreate the MV",
+            iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+        ))
+    })?;
+    let strategy = match (
+        schema_contract.join.is_some(),
+        schema_contract.aggregate.is_some(),
+        schema_contract.branch.is_some(),
+    ) {
+        (false, false, false) => RefreshStrategy::ProjectionFilter,
+        (true, false, false) => RefreshStrategy::JoinProjectionFilter,
+        (false, false, true) => RefreshStrategy::UnionProjectionFilter,
+        (false, true, false) => match shape {
+            IncrementalMvShape::Aggregate(aggregate_shape)
+                if aggregate_shape.fan_in_bases.is_empty() =>
+            {
+                RefreshStrategy::SingleAggregate
+            }
+            IncrementalMvShape::Aggregate(_) => RefreshStrategy::FanInAggregate,
+            _ => {
+                return Err(RefreshError::user(format!(
+                    "iceberg aggregate MV {}.{}.{} refresh contract did not match legacy aggregate shape",
+                    iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+                )));
+            }
+        },
+        (true, true, false) => RefreshStrategy::JoinAggregate,
+        (false, true, true) => RefreshStrategy::UnsupportedBranchUnionAggregate,
+        _ => {
+            return Err(RefreshError::user(format!(
+                "iceberg MV target {}.{}.{} has unsupported schema contract shape",
+                iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+            )));
+        }
+    };
+    if !stored_strategy_matches_legacy_shape(strategy, shape) {
+        return Err(RefreshError::user(format!(
+            "iceberg MV target {}.{}.{} refresh contract strategy {strategy:?} did not match legacy shape {shape:?}",
+            iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+        )));
+    }
+    Ok(strategy)
+}
+
+fn stored_strategy_matches_legacy_shape(
+    strategy: RefreshStrategy,
+    shape: &IncrementalMvShape,
+) -> bool {
+    match (strategy, shape) {
+        (RefreshStrategy::ProjectionFilter, IncrementalMvShape::ProjectionFilter(_)) => true,
+        (RefreshStrategy::JoinProjectionFilter, IncrementalMvShape::JoinProjectionFilter(_)) => {
+            true
+        }
+        (RefreshStrategy::UnionProjectionFilter, IncrementalMvShape::UnionAll(union_shape)) => {
+            union_shape.branch_kind == UnionBranchKind::ProjectionFilter
+        }
+        (RefreshStrategy::SingleAggregate, IncrementalMvShape::Aggregate(aggregate_shape)) => {
+            aggregate_shape.fan_in_bases.is_empty()
+        }
+        (RefreshStrategy::FanInAggregate, IncrementalMvShape::Aggregate(aggregate_shape)) => {
+            !aggregate_shape.fan_in_bases.is_empty()
+        }
+        (RefreshStrategy::JoinAggregate, IncrementalMvShape::JoinAggregate(_)) => true,
+        (
+            RefreshStrategy::UnsupportedBranchUnionAggregate,
+            IncrementalMvShape::UnionAll(union_shape),
+        ) => union_shape.branch_kind == UnionBranchKind::Aggregate,
+        _ => false,
+    }
+}
+
 pub(crate) fn plan_iceberg_mv_refresh(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
@@ -4046,8 +4431,15 @@ pub(crate) fn plan_iceberg_mv_refresh(
     );
     let shape =
         classify_incremental_mv_query(&canonical_select_query).map_err(RefreshError::user)?;
-    if let IncrementalMvShape::UnionAll(union_shape) = &shape {
-        if union_shape.branch_kind == UnionBranchKind::ProjectionFilter {
+    let refresh_strategy =
+        stored_refresh_strategy_for_plan(&iceberg_target, &mv_definition, &shape)?;
+    match refresh_strategy {
+        RefreshStrategy::UnionProjectionFilter => {
+            let IncrementalMvShape::UnionAll(union_shape) = &shape else {
+                return Err(RefreshError::user(
+                    "iceberg UNION ALL projection/filter refresh contract did not match legacy union shape",
+                ));
+            };
             return plan_iceberg_union_projection_mv_refresh(
                 state,
                 &iceberg_target,
@@ -4061,25 +4453,36 @@ pub(crate) fn plan_iceberg_mv_refresh(
                 union_shape,
             );
         }
-        return Err(RefreshError::user(
-            "top-level aggregate UNION ALL MV refresh is not supported in this build",
-        ));
+        RefreshStrategy::UnsupportedBranchUnionAggregate => {
+            return Err(RefreshError::user(
+                "top-level aggregate UNION ALL MV refresh is not supported in this build",
+            ));
+        }
+        RefreshStrategy::SingleAggregate
+        | RefreshStrategy::FanInAggregate
+        | RefreshStrategy::JoinAggregate => {
+            return plan_iceberg_aggregate_mv_refresh(
+                state,
+                &iceberg_target,
+                &target_loaded.table,
+                target,
+                stmt,
+                current_catalog,
+                current_database,
+                &mv_definition,
+                &base_refs,
+                &shape,
+            );
+        }
+        RefreshStrategy::JoinProjectionFilter => {}
+        RefreshStrategy::ProjectionFilter => {}
     }
-    if aggregate_shape_for_layout(&shape).is_some() {
-        return plan_iceberg_aggregate_mv_refresh(
-            state,
-            &iceberg_target,
-            &target_loaded.table,
-            target,
-            stmt,
-            current_catalog,
-            current_database,
-            &mv_definition,
-            &base_refs,
-            &shape,
-        );
-    }
-    if let IncrementalMvShape::JoinProjectionFilter(join_shape) = &shape {
+    if refresh_strategy == RefreshStrategy::JoinProjectionFilter {
+        let IncrementalMvShape::JoinProjectionFilter(join_shape) = &shape else {
+            return Err(RefreshError::user(
+                "iceberg join projection/filter refresh contract did not match legacy join shape",
+            ));
+        };
         if base_refs.len() != 2 {
             return Err(RefreshError::user(
                 "iceberg join materialized view refresh requires exactly two base table references",
@@ -4134,19 +4537,20 @@ pub(crate) fn plan_iceberg_mv_refresh(
         current_snapshots.insert(left_ref.fqn(), left_current);
         current_snapshots.insert(right_ref.fqn(), right_current);
         let previous_snapshots = &mv_definition.last_refresh_snapshots;
+        let refresh_label = format!(
+            "iceberg join MV {}.{}.{}",
+            iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+        );
+        let refresh_statuses =
+            base_snapshot_statuses_for_plan(&base_refs, previous_snapshots, &current_snapshots);
+        let mode = plan_refresh_mode_from_decision(decide_refresh(
+            BaseSnapshotPolicy::JoinPairPartialInitialSkip,
+            &refresh_statuses,
+            &refresh_label,
+        ))?;
         let has_previous = base_refs
             .iter()
             .any(|base_ref| previous_snapshots.contains_key(&base_ref.fqn()));
-        let all_previous = base_refs
-            .iter()
-            .all(|base_ref| previous_snapshots.contains_key(&base_ref.fqn()));
-        let all_current = current_snapshots.values().all(Option::is_some);
-        if has_previous && !all_previous {
-            return Err(RefreshError::user(format!(
-                "iceberg join MV {}.{}.{} has partial previous refresh snapshots; recreate the MV",
-                iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
-            )));
-        }
         if has_previous {
             for base_ref in &base_refs {
                 let fqn = base_ref.fqn();
@@ -4192,18 +4596,6 @@ pub(crate) fn plan_iceberg_mv_refresh(
                 })?;
             }
         }
-        let mode = if !has_previous && !all_current {
-            RefreshMode::Noop
-        } else if !has_previous {
-            RefreshMode::Full
-        } else if base_refs.iter().all(|base_ref| {
-            let fqn = base_ref.fqn();
-            previous_snapshots.get(&fqn).copied() == current_snapshots.get(&fqn).copied().flatten()
-        }) {
-            RefreshMode::Noop
-        } else {
-            RefreshMode::Incremental
-        };
         let affected_partitions = unknown_join_affected_partitions();
         log_planned_iceberg_mv_affected_partitions(&iceberg_target, &affected_partitions);
         return Ok(RefreshPlan {
@@ -4256,38 +4648,55 @@ pub(crate) fn plan_iceberg_mv_refresh(
         .last_refresh_snapshots
         .get(&base_ref.fqn())
         .copied();
-    let is_empty_base_noop =
-        previous_snapshot_id.is_none() && current_snapshot_id_before_pin.is_none();
-    if is_empty_base_noop {
-        ensure_schema_contract_compatible_for_refresh(
-            schema_contract,
-            &pre_pin_loaded.table,
-            &target_loaded.table,
-        )
-        .map_err(RefreshError::user)?;
-        let mut snapshot_pins = BTreeMap::new();
-        snapshot_pins.insert(base_ref.fqn(), None);
-        let affected_partitions = noop_affected_partitions(schema_contract);
-        log_planned_iceberg_mv_affected_partitions(&iceberg_target, &affected_partitions);
-        return Ok(RefreshPlan {
-            mv_id: Some(mv_definition.mv_id),
-            target,
-            storage_engine: MvStorageEngine::Iceberg,
-            mode: RefreshMode::Noop,
-            base_refs: vec![MvBaseRef {
-                catalog: base_ref.catalog.clone(),
-                namespace: base_ref.namespace.clone(),
-                table: base_ref.table.clone(),
-            }],
-            snapshot_pins,
-            affected_partitions: affected_partitions.clone(),
-            backend_plan: BackendRefreshPlan::Iceberg(IcebergRefreshPlan {
-                stmt: stmt.clone(),
-                current_catalog: current_catalog.map(str::to_string),
-                current_database: current_database.to_string(),
+    let refresh_label = format!(
+        "iceberg materialized view {}.{}.{}",
+        iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+    );
+    let pre_pin_decision = decide_refresh(
+        BaseSnapshotPolicy::SingleBase,
+        &[base_snapshot_status_for_refresh(
+            base_ref,
+            previous_snapshot_id,
+            current_snapshot_id_before_pin,
+        )],
+        &refresh_label,
+    );
+    match pre_pin_decision {
+        RefreshDecision::SkipEmpty => {
+            ensure_schema_contract_compatible_for_refresh(
+                schema_contract,
+                &pre_pin_loaded.table,
+                &target_loaded.table,
+            )
+            .map_err(RefreshError::user)?;
+            let mut snapshot_pins = BTreeMap::new();
+            snapshot_pins.insert(base_ref.fqn(), None);
+            let affected_partitions = noop_affected_partitions(schema_contract);
+            log_planned_iceberg_mv_affected_partitions(&iceberg_target, &affected_partitions);
+            return Ok(RefreshPlan {
+                mv_id: Some(mv_definition.mv_id),
+                target,
+                storage_engine: MvStorageEngine::Iceberg,
+                mode: RefreshMode::Noop,
+                base_refs: vec![MvBaseRef {
+                    catalog: base_ref.catalog.clone(),
+                    namespace: base_ref.namespace.clone(),
+                    table: base_ref.table.clone(),
+                }],
+                snapshot_pins,
                 affected_partitions: affected_partitions.clone(),
-            }),
-        });
+                backend_plan: BackendRefreshPlan::Iceberg(IcebergRefreshPlan {
+                    stmt: stmt.clone(),
+                    current_catalog: current_catalog.map(str::to_string),
+                    current_database: current_database.to_string(),
+                    affected_partitions: affected_partitions.clone(),
+                }),
+            });
+        }
+        RefreshDecision::FailFast { reason } => return Err(RefreshError::user(reason)),
+        RefreshDecision::FirstRefresh
+        | RefreshDecision::MetadataOnly
+        | RefreshDecision::Incremental => {}
     }
 
     let pin = crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin::capture(
@@ -4310,11 +4719,17 @@ pub(crate) fn plan_iceberg_mv_refresh(
         | crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe => {}
     }
 
-    let mode = match (previous_snapshot_id, current_snapshot_id) {
-        (None, None) => RefreshMode::Noop,
-        (None, Some(_)) => RefreshMode::Full,
-        (Some(prev), Some(cur)) if prev == cur => RefreshMode::Noop,
-        (Some(prev), Some(cur)) => {
+    let refresh_decision = decide_refresh(
+        BaseSnapshotPolicy::SingleBase,
+        &[base_snapshot_status_for_refresh(
+            base_ref,
+            previous_snapshot_id,
+            current_snapshot_id,
+        )],
+        &refresh_label,
+    );
+    if matches!(refresh_decision, RefreshDecision::Incremental) {
+        if let (Some(prev), Some(cur)) = (previous_snapshot_id, current_snapshot_id) {
             crate::connector::iceberg::changes::classify_lineage(
                 loaded.table.metadata(),
                 prev,
@@ -4329,15 +4744,9 @@ pub(crate) fn plan_iceberg_mv_refresh(
                     base_ref.fqn()
                 ))
             })?;
-            RefreshMode::Incremental
         }
-        (Some(prev), None) => {
-            return Err(RefreshError::user(format!(
-                "cannot refresh iceberg materialized view {}.{}.{}: previously-refreshed base snapshot {prev} is no longer reachable",
-                iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
-            )));
-        }
-    };
+    }
+    let mode = plan_refresh_mode_from_decision(refresh_decision)?;
     let mut snapshot_pins = BTreeMap::new();
     snapshot_pins.insert(base_ref.fqn(), current_snapshot_id);
     let affected_partitions = match mode {
@@ -4461,8 +4870,6 @@ fn plan_iceberg_union_projection_mv_refresh(
     let all_previous_table_uuids = base_refs
         .iter()
         .all(|base_ref| previous_table_uuids.contains_key(&base_ref.fqn()));
-    let all_current = current_snapshots.values().all(Option::is_some);
-    let any_current = current_snapshots.values().any(Option::is_some);
 
     if has_previous && (!all_previous_snapshots || !all_previous_table_uuids) {
         return Err(RefreshError::user(format!(
@@ -4470,12 +4877,19 @@ fn plan_iceberg_union_projection_mv_refresh(
             iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
         )));
     }
-    if !has_previous && any_current && !all_current {
-        return Err(RefreshError::user(format!(
-            "iceberg UNION ALL projection/filter MV {}.{}.{} cannot run first refresh because only some branch bases have current snapshots; load all branch bases or recreate the MV",
-            iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
-        )));
-    }
+    let refresh_label = format!(
+        "iceberg UNION ALL projection/filter MV {}.{}.{}",
+        iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+    );
+    let refresh_statuses =
+        base_snapshot_statuses_for_plan(base_refs, previous_snapshots, &current_snapshots);
+    let refresh_decision = decide_refresh(
+        BaseSnapshotPolicy::AllBasesRequired,
+        &refresh_statuses,
+        &refresh_label,
+    );
+    let skip_empty = matches!(refresh_decision, RefreshDecision::SkipEmpty);
+    let mode = plan_refresh_mode_from_decision(refresh_decision)?;
     if has_previous {
         for base_ref in base_refs {
             let fqn = base_ref.fqn();
@@ -4527,22 +4941,8 @@ fn plan_iceberg_union_projection_mv_refresh(
         }
     }
 
-    let mode = if !has_previous && !any_current {
-        RefreshMode::Noop
-    } else if !has_previous {
-        RefreshMode::Full
-    } else if base_refs.iter().all(|base_ref| {
-        let fqn = base_ref.fqn();
-        previous_snapshots.get(&fqn).copied() == current_snapshots.get(&fqn).copied().flatten()
-    }) {
-        RefreshMode::Noop
-    } else {
-        RefreshMode::Incremental
-    };
     let affected_partitions = match mode {
-        RefreshMode::Noop if !has_previous && !any_current => {
-            noop_affected_partitions(schema_contract)
-        }
+        RefreshMode::Noop if skip_empty => noop_affected_partitions(schema_contract),
         _ => unknown_union_all_affected_partitions(),
     };
     log_planned_iceberg_mv_affected_partitions(iceberg_target, &affected_partitions);
@@ -4611,19 +5011,25 @@ fn plan_iceberg_aggregate_mv_refresh(
                     loaded_bases.insert(fqn, loaded);
                 }
                 let previous_snapshots = &mv_definition.last_refresh_snapshots;
+                let refresh_label = format!(
+                    "iceberg aggregate-over-UNION-ALL MV {}.{}.{}",
+                    iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+                );
+                let refresh_statuses = base_snapshot_statuses_for_plan(
+                    base_refs,
+                    previous_snapshots,
+                    &current_snapshots,
+                );
+                let refresh_decision = decide_refresh(
+                    BaseSnapshotPolicy::AllBasesRequired,
+                    &refresh_statuses,
+                    &refresh_label,
+                );
+                let skip_empty = matches!(refresh_decision, RefreshDecision::SkipEmpty);
+                let mode = plan_refresh_mode_from_decision(refresh_decision)?;
                 let has_previous = base_refs
                     .iter()
                     .any(|base_ref| previous_snapshots.contains_key(&base_ref.fqn()));
-                let all_previous = base_refs
-                    .iter()
-                    .all(|base_ref| previous_snapshots.contains_key(&base_ref.fqn()));
-                let any_current = current_snapshots.values().any(Option::is_some);
-                if has_previous && !all_previous {
-                    return Err(RefreshError::user(format!(
-                        "iceberg aggregate-over-UNION-ALL MV {}.{}.{} has partial previous refresh snapshots; recreate the MV",
-                        iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
-                    )));
-                }
                 if has_previous {
                     for base_ref in base_refs {
                         let fqn = base_ref.fqn();
@@ -4668,23 +5074,8 @@ fn plan_iceberg_aggregate_mv_refresh(
                         }
                     }
                 }
-                let mode = if !has_previous && !any_current {
-                    RefreshMode::Noop
-                } else if !has_previous {
-                    RefreshMode::Full
-                } else if base_refs.iter().all(|base_ref| {
-                    let fqn = base_ref.fqn();
-                    previous_snapshots.get(&fqn).copied()
-                        == current_snapshots.get(&fqn).copied().flatten()
-                }) {
-                    RefreshMode::Noop
-                } else {
-                    RefreshMode::Incremental
-                };
                 let affected_partitions = match mode {
-                    RefreshMode::Noop if !has_previous && !any_current => {
-                        noop_affected_partitions(schema_contract)
-                    }
+                    RefreshMode::Noop if skip_empty => noop_affected_partitions(schema_contract),
                     _ => unknown_union_all_affected_partitions(),
                 };
                 log_planned_iceberg_mv_affected_partitions(iceberg_target, &affected_partitions);
@@ -4725,11 +5116,19 @@ fn plan_iceberg_aggregate_mv_refresh(
                 .last_refresh_snapshots
                 .get(&base_ref.fqn())
                 .copied();
-            let mode = match (previous, current) {
-                (None, None) => RefreshMode::Noop,
-                (None, Some(_)) => RefreshMode::Full,
-                (Some(prev), Some(cur)) if prev == cur => RefreshMode::Noop,
-                (Some(prev), Some(cur)) => {
+            let refresh_label = format!(
+                "iceberg aggregate materialized view {}.{}.{}",
+                iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+            );
+            let refresh_decision = decide_refresh(
+                BaseSnapshotPolicy::SingleBase,
+                &[base_snapshot_status_for_refresh(
+                    base_ref, previous, current,
+                )],
+                &refresh_label,
+            );
+            if matches!(refresh_decision, RefreshDecision::Incremental) {
+                if let (Some(prev), Some(cur)) = (previous, current) {
                     crate::connector::iceberg::changes::classify_lineage(
                         loaded.table.metadata(),
                         prev,
@@ -4744,15 +5143,9 @@ fn plan_iceberg_aggregate_mv_refresh(
                             base_ref.fqn()
                         ))
                     })?;
-                    RefreshMode::Incremental
                 }
-                (Some(prev), None) => {
-                    return Err(RefreshError::user(format!(
-                        "cannot refresh iceberg aggregate materialized view {}.{}.{}: previously-refreshed base snapshot {prev} is no longer reachable",
-                        iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
-                    )));
-                }
-            };
+            }
+            let mode = plan_refresh_mode_from_decision(refresh_decision)?;
             let mut snapshot_pins = BTreeMap::new();
             snapshot_pins.insert(base_ref.fqn(), current);
             let affected_partitions = plan_aggregate_mv_affected_partitions(
@@ -4821,19 +5214,20 @@ fn plan_iceberg_aggregate_mv_refresh(
                 );
             }
             let previous_snapshots = &mv_definition.last_refresh_snapshots;
+            let refresh_label = format!(
+                "iceberg join aggregate MV {}.{}.{}",
+                iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+            );
+            let refresh_statuses =
+                base_snapshot_statuses_for_plan(base_refs, previous_snapshots, &current_snapshots);
+            let mode = plan_refresh_mode_from_decision(decide_refresh(
+                BaseSnapshotPolicy::JoinPairPartialInitialSkip,
+                &refresh_statuses,
+                &refresh_label,
+            ))?;
             let has_previous = base_refs
                 .iter()
                 .any(|base_ref| previous_snapshots.contains_key(&base_ref.fqn()));
-            let all_previous = base_refs
-                .iter()
-                .all(|base_ref| previous_snapshots.contains_key(&base_ref.fqn()));
-            let all_current = current_snapshots.values().all(Option::is_some);
-            if has_previous && !all_previous {
-                return Err(RefreshError::user(format!(
-                    "iceberg join aggregate MV {}.{}.{} has partial previous refresh snapshots; recreate the MV",
-                    iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
-                )));
-            }
             if has_previous {
                 for base_ref in base_refs {
                     let fqn = base_ref.fqn();
@@ -4875,19 +5269,6 @@ fn plan_iceberg_aggregate_mv_refresh(
                     })?;
                 }
             }
-            let mode = if !has_previous && !all_current {
-                RefreshMode::Noop
-            } else if !has_previous {
-                RefreshMode::Full
-            } else if base_refs.iter().all(|base_ref| {
-                let fqn = base_ref.fqn();
-                previous_snapshots.get(&fqn).copied()
-                    == current_snapshots.get(&fqn).copied().flatten()
-            }) {
-                RefreshMode::Noop
-            } else {
-                RefreshMode::Incremental
-            };
             let affected_partitions = unknown_join_affected_partitions();
             log_planned_iceberg_mv_affected_partitions(iceberg_target, &affected_partitions);
             Ok(build_iceberg_refresh_plan(
@@ -9579,6 +9960,59 @@ mod tests {
     }
 
     #[test]
+    fn create_contract_rejects_legacy_shape_mismatch() {
+        use crate::engine::mv::refresh_contract::{
+            AggregateRefreshContract, ApplyKeyContract, ImvRefreshContract, RefreshStrategy,
+        };
+
+        let query = parse_select_query("SELECT id FROM ice.sales.orders");
+        let shape = classify_incremental_mv_query(&query).expect("projection shape");
+        let refresh_contract = ImvRefreshContract {
+            strategy: RefreshStrategy::SingleAggregate,
+            base_refs: Vec::new(),
+            apply_key: ApplyKeyContract::aggregate_group_row(),
+            aggregate: Some(AggregateRefreshContract {
+                group_key_count: 1,
+                aggregate_count: 1,
+            }),
+            join: None,
+            branch: None,
+        };
+
+        let err = validate_refresh_contract_matches_legacy_shape(&refresh_contract, &shape)
+            .expect_err("contract/shape mismatch should fail fast");
+
+        assert!(err.contains("SingleAggregate"), "err={err}");
+        assert!(err.contains("legacy MV shape"), "err={err}");
+    }
+
+    #[test]
+    fn plan_refresh_mode_is_derived_from_refresh_decision() {
+        assert_eq!(
+            plan_refresh_mode_from_decision(RefreshDecision::SkipEmpty).expect("skip"),
+            RefreshMode::Noop
+        );
+        assert_eq!(
+            plan_refresh_mode_from_decision(RefreshDecision::MetadataOnly).expect("metadata"),
+            RefreshMode::Noop
+        );
+        assert_eq!(
+            plan_refresh_mode_from_decision(RefreshDecision::FirstRefresh).expect("first"),
+            RefreshMode::Full
+        );
+        assert_eq!(
+            plan_refresh_mode_from_decision(RefreshDecision::Incremental).expect("incremental"),
+            RefreshMode::Incremental
+        );
+        assert!(
+            plan_refresh_mode_from_decision(RefreshDecision::FailFast {
+                reason: "blocked".to_string()
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
     fn refresh_status_uses_base_ref_fqn() {
         let base_ref = IcebergTableRef {
             catalog: "ice".to_string(),
@@ -12105,14 +12539,17 @@ mod tests {
             find_apply_key_field_id_by_column(&loaded.table, ICEBERG_MV_GROUP_APPLY_KEY_COLUMN)
                 .expect("apply-key field");
 
+        let refresh_contract =
+            crate::engine::mv::refresh_contract::derive_imv_refresh_contract(&analysis)
+                .expect("refresh contract");
         let contract = build_iceberg_mv_schema_contract(
+            &refresh_contract,
             &shape,
             &analysis,
             &loaded_bases,
             &target,
             &loaded,
             actual_apply_key_field_id,
-            ApplyKeyContract::aggregate_group_row(),
         )
         .expect("schema contract");
         assert_eq!(
