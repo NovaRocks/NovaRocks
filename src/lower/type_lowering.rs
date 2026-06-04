@@ -154,6 +154,10 @@ pub(crate) fn arrow_type_from_nodes(
                         None => TimeUnit::Microsecond,
                         Some(c) if c == THRIFT_TIME_UNIT_MICROS => TimeUnit::Microsecond,
                         Some(c) if c == THRIFT_TIME_UNIT_NANOS => TimeUnit::Nanosecond,
+                        // Effectively unreachable: codegen only emits None/micros/nanos,
+                        // and FE never sets time_unit. The encode side
+                        // (thrift_time_unit_for_arrow) already returns an explicit error
+                        // for any other unit, so this arm cannot be reached in practice.
                         Some(_) => return None,
                     };
                     DataType::Timestamp(unit, None)

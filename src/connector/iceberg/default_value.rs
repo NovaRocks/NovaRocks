@@ -262,9 +262,10 @@ use std::sync::Arc;
 use arrow::array::{
     ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
     Int32Array, Int64Array, LargeBinaryArray, ListArray, StringArray, TimestampMicrosecondArray,
+    TimestampNanosecondArray,
 };
 use arrow::buffer::OffsetBuffer;
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, TimeUnit};
 
 /// Build an Arrow constant array of length `row_count` whose every element is
 /// the value encoded by `literal`. The literal's runtime type must agree with
@@ -364,7 +365,10 @@ pub(crate) fn literal_to_constant_array(
         (PrimitiveLiteral::Int(v), DataType::Date32) => {
             Arc::new(Date32Array::from(vec![*v; row_count])) as ArrayRef
         }
-        (PrimitiveLiteral::Long(v), DataType::Timestamp(_, _)) => {
+        (PrimitiveLiteral::Long(v), DataType::Timestamp(TimeUnit::Nanosecond, _)) => {
+            Arc::new(TimestampNanosecondArray::from(vec![*v; row_count])) as ArrayRef
+        }
+        (PrimitiveLiteral::Long(v), DataType::Timestamp(TimeUnit::Microsecond, _)) => {
             Arc::new(TimestampMicrosecondArray::from(vec![*v; row_count])) as ArrayRef
         }
         (PrimitiveLiteral::Binary(b), DataType::Binary) => {
@@ -727,6 +731,38 @@ mod tests {
             let row = list_arr.value(i);
             assert_eq!(row.len(), 0, "row {i} should be an empty list");
         }
+    }
+
+    #[test]
+    fn long_default_for_nanosecond_target_builds_nanosecond_array() {
+        use arrow::array::TimestampNanosecondArray;
+        use arrow::datatypes::TimeUnit;
+        let lit = IcebergLiteral::Primitive(PrimitiveLiteral::Long(1_704_164_645_123_456_789));
+        let arr =
+            literal_to_constant_array(&lit, &DataType::Timestamp(TimeUnit::Nanosecond, None), 2)
+                .expect("nanosecond array");
+        let a = arr
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .expect("expected TimestampNanosecondArray, got a different type");
+        assert_eq!(a.value(0), 1_704_164_645_123_456_789);
+        assert_eq!(a.len(), 2);
+    }
+
+    #[test]
+    fn long_default_for_microsecond_target_builds_microsecond_array() {
+        use arrow::array::TimestampMicrosecondArray;
+        use arrow::datatypes::TimeUnit;
+        let lit = IcebergLiteral::Primitive(PrimitiveLiteral::Long(1_704_110_400_000_000));
+        let arr =
+            literal_to_constant_array(&lit, &DataType::Timestamp(TimeUnit::Microsecond, None), 2)
+                .expect("microsecond array");
+        let a = arr
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("expected TimestampMicrosecondArray, got a different type");
+        assert_eq!(a.value(0), 1_704_110_400_000_000);
+        assert_eq!(a.len(), 2);
     }
 
     #[test]
