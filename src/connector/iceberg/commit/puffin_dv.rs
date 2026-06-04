@@ -490,6 +490,52 @@ mod tests {
         );
     }
 
+    async fn read_puffin_footer_metadata(
+        file_io: &FileIO,
+        path: &str,
+    ) -> Result<serde_json::Value> {
+        let input = file_io
+            .new_input(path)
+            .with_context(|| format!("failed to create Puffin test input: {path}"))?;
+        let metadata = input
+            .metadata()
+            .await
+            .with_context(|| format!("failed to read Puffin test metadata: {path}"))?;
+        let reader = input
+            .reader()
+            .await
+            .with_context(|| format!("failed to open Puffin test reader: {path}"))?;
+        let file = reader
+            .read(0..metadata.size)
+            .await
+            .with_context(|| format!("failed to read Puffin test file: {path}"))?;
+        let file = file.as_ref();
+        let footer_json_len_offset = file
+            .len()
+            .checked_sub(PUFFIN_MAGIC.len() + size_of::<u32>() + 4)
+            .context("Puffin test file is too short for footer trailer")?;
+        ensure!(
+            &file[file.len() - PUFFIN_MAGIC.len()..] == PUFFIN_MAGIC,
+            "Puffin test file has invalid trailing magic"
+        );
+        let footer_json_len = read_le_u32_from(&mut Cursor::new(
+            &file[footer_json_len_offset..footer_json_len_offset + size_of::<u32>()],
+        ))? as usize;
+        let footer_json_start = footer_json_len_offset
+            .checked_sub(footer_json_len)
+            .context("Puffin test footer length exceeds file size")?;
+        let footer_magic_start = footer_json_start
+            .checked_sub(PUFFIN_MAGIC.len())
+            .context("Puffin test file is missing footer magic")?;
+        ensure!(
+            &file[footer_magic_start..footer_json_start] == PUFFIN_MAGIC,
+            "Puffin test file has invalid footer magic"
+        );
+
+        serde_json::from_slice(&file[footer_json_start..footer_json_len_offset])
+            .context("failed to parse Puffin test footer metadata")
+    }
+
     #[tokio::test]
     async fn single_blob_puffin_round_trips_metadata_and_payload() {
         let dir = tempfile::tempdir().unwrap();
@@ -593,6 +639,32 @@ mod tests {
             .unwrap(),
             second
         );
+
+        let metadata = file_io.new_input(&path).unwrap().metadata().await.unwrap();
+        assert_eq!(written[0].file_size_in_bytes, metadata.size);
+        assert_eq!(written[1].file_size_in_bytes, metadata.size);
+
+        let footer = read_puffin_footer_metadata(&file_io, &path).await.unwrap();
+        let blobs = footer["blobs"].as_array().unwrap();
+        assert_eq!(blobs.len(), 2);
+        for (blob, written_dv) in blobs.iter().zip(&written) {
+            assert_eq!(blob["type"].as_str().unwrap(), "deletion-vector-v1");
+            assert_eq!(blob["snapshot-id"].as_i64().unwrap(), 10);
+            assert_eq!(blob["sequence-number"].as_i64().unwrap(), 20);
+            assert_eq!(blob["offset"].as_i64().unwrap(), written_dv.content_offset);
+            assert_eq!(
+                blob["length"].as_i64().unwrap(),
+                written_dv.content_size_in_bytes
+            );
+            assert_eq!(
+                blob["properties"]["referenced-data-file"].as_str().unwrap(),
+                written_dv.referenced_data_file
+            );
+            assert_eq!(
+                blob["properties"]["cardinality"].as_str().unwrap(),
+                written_dv.cardinality.to_string()
+            );
+        }
     }
 
     #[tokio::test]
