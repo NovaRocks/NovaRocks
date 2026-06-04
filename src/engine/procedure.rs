@@ -214,13 +214,7 @@ fn parse_arg_value(parser: &mut Parser<'_>) -> Result<ProcedureArgValue, String>
 
     let token = parser.next_token();
     match token.token {
-        Token::SingleQuotedString(value) => {
-            if let Some(timestamp_ms) = parse_quoted_timestamp_millis(&value)? {
-                Ok(ProcedureArgValue::TimestampMillis(timestamp_ms))
-            } else {
-                Ok(ProcedureArgValue::String(value))
-            }
-        }
+        Token::SingleQuotedString(value) => Ok(ProcedureArgValue::String(value)),
         Token::Number(value, _) => value
             .parse::<i64>()
             .map(ProcedureArgValue::Integer)
@@ -276,19 +270,6 @@ fn parse_single_quoted_string(parser: &mut Parser<'_>, context: &str) -> Result<
             "CALL procedure {context} expects a single quoted string, got {other}"
         )),
     }
-}
-
-fn parse_quoted_timestamp_millis(value: &str) -> Result<Option<i64>, String> {
-    if let Ok(timestamp_ms) = parse_rfc3339_millis(value) {
-        return Ok(Some(timestamp_ms));
-    }
-    if value.chars().all(|ch| ch.is_ascii_digit()) && !value.is_empty() {
-        return value
-            .parse::<i64>()
-            .map(Some)
-            .map_err(|e| format!("invalid quoted epoch-ms timestamp '{value}': {e}"));
-    }
-    Ok(None)
 }
 
 fn parse_timestamp_millis(value: &str) -> Result<i64, String> {
@@ -370,6 +351,29 @@ mod tests {
                 .get("rewrite-all")
                 .map(String::as_str),
             Some("true")
+        );
+    }
+
+    #[test]
+    fn plain_string_epoch_millis_stays_string() {
+        let stmt =
+            parse_call_procedure_sql("CALL ice.system.rewrite_manifests(table => '1700000000000')")
+                .unwrap();
+        assert_eq!(
+            stmt.arg("table").unwrap(),
+            &ProcedureArgValue::String("1700000000000".to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_timestamp_literal_parses_timestamp_millis() {
+        let stmt = parse_call_procedure_sql(
+            "CALL ice.system.expire_snapshots(table => 'db.t', older_than => TIMESTAMP '2026-01-01 00:00:00')",
+        )
+        .unwrap();
+        assert_eq!(
+            stmt.arg("older_than").unwrap(),
+            &ProcedureArgValue::TimestampMillis(1767225600000)
         );
     }
 
