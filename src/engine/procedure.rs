@@ -77,21 +77,13 @@ impl CallProcedureStmt {
 }
 
 pub(crate) fn looks_like_call_procedure(sql: &str) -> bool {
-    let Ok(mut parser) = Parser::new(&StarRocksDialect).try_with_sql(sql) else {
+    let Ok(normalized) = crate::sql::parser::dialect::normalize_for_raw_parse(sql) else {
         return false;
     };
-    if !parser.parse_keyword(Keyword::CALL) {
-        return false;
-    }
-    let Ok(parts) = parser
-        .parse_object_name(false)
-        .map_err(|_| ())
-        .and_then(|name| normalize_object_name(name).map_err(|_| ()))
-    else {
+    let Ok(mut parser) = Parser::new(&StarRocksDialect).try_with_sql(&normalized) else {
         return false;
     };
-    matches!(parts.as_slice(), [_, namespace, _] if namespace == "system")
-        && parser.peek_token_ref().token == Token::LParen
+    parser.parse_keyword(Keyword::CALL)
 }
 
 pub(crate) fn parse_call_procedure_sql(sql: &str) -> Result<CallProcedureStmt, String> {
@@ -328,6 +320,9 @@ mod tests {
         assert!(looks_like_call_procedure(
             "CALL ice.system.rewrite_manifests(table => 'db.t')"
         ));
+        assert!(looks_like_call_procedure(
+            "CALL ice.admin.rewrite_manifests(table => 'db.t')"
+        ));
         assert!(!looks_like_call_procedure("SELECT 1"));
     }
 
@@ -403,5 +398,14 @@ mod tests {
         let err = parse_call_procedure_sql("CALL ice.admin.rewrite_manifests(table => 'db.t')")
             .unwrap_err();
         assert!(err.contains("Iceberg procedures must use system namespace"));
+    }
+
+    #[test]
+    fn rejects_duplicate_named_arguments_after_normalization() {
+        let err = parse_call_procedure_sql(
+            "CALL ice.system.rewrite_manifests(table => 'db.t', TABLE => 'db.u')",
+        )
+        .unwrap_err();
+        assert!(err.contains("duplicate CALL procedure argument 'table'"));
     }
 }
