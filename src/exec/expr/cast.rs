@@ -3827,7 +3827,7 @@ mod tests {
             },
             types::TTypeNode::new(
                 types::TTypeNodeType::SCALAR,
-                types::TScalarType::new(types::TPrimitiveType::JSON, None, None, None),
+                types::TScalarType::new(types::TPrimitiveType::JSON, None, None, None, None),
                 None,
                 None,
             ),

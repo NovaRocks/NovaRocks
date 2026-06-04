@@ -123,6 +123,11 @@ struct TScalarType {
     // Only set for DECIMAL
     3: optional i32 precision
     4: optional i32 scale
+
+    // NovaRocks-only: time unit code for DATETIME (THRIFT_TIME_UNIT_* in
+    // src/lower/type_lowering.rs). Absent = microsecond (FE-compat default);
+    // only nanosecond is additionally produced by the standalone codegen.
+    5: optional i32 time_unit
 }
 
 // Represents a field in a STRUCT type.

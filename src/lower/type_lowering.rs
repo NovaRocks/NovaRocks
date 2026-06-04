@@ -19,6 +19,30 @@ use crate::types;
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use std::sync::Arc;
 
+/// Thrift `TScalarType.time_unit` codes for DATETIME descriptors. Absent
+/// (`None`) means microsecond so FE-compat descriptors stay byte-identical;
+/// only nanosecond is additionally produced by the standalone codegen.
+#[allow(dead_code)]
+pub(crate) const THRIFT_TIME_UNIT_MICROS: i32 = 2;
+pub(crate) const THRIFT_TIME_UNIT_NANOS: i32 = 3;
+
+/// Map an Arrow `TimeUnit` to the thrift descriptor code. Microsecond maps to
+/// `None` to preserve FE-compat byte-identical descriptors. Only Microsecond
+/// and Nanosecond are supported; other units are an explicit error.
+#[allow(dead_code)]
+pub(crate) fn thrift_time_unit_for_arrow(
+    unit: arrow::datatypes::TimeUnit,
+) -> Result<Option<i32>, String> {
+    use arrow::datatypes::TimeUnit;
+    match unit {
+        TimeUnit::Microsecond => Ok(None),
+        TimeUnit::Nanosecond => Ok(Some(THRIFT_TIME_UNIT_NANOS)),
+        other => Err(format!(
+            "unsupported timestamp unit {other:?} for thrift descriptor; only Microsecond/Nanosecond supported"
+        )),
+    }
+}
+
 /// Extract primitive type from TExprNode.
 pub(crate) fn primitive_type_from_node(
     node: &crate::exprs::TExprNode,
@@ -45,7 +69,7 @@ pub(crate) fn primitive_type_from_desc(desc: &types::TTypeDesc) -> Option<types:
 pub(crate) fn scalar_type_desc(primitive: types::TPrimitiveType) -> types::TTypeDesc {
     types::TTypeDesc::new(vec![types::TTypeNode::new(
         types::TTypeNodeType::SCALAR,
-        types::TScalarType::new(primitive, None, None, None),
+        types::TScalarType::new(primitive, None, None, None, None),
         None,
         None,
     )])
@@ -283,6 +307,7 @@ mod tests {
                     len: None,
                     precision: Some(9),
                     scale: Some(0),
+                    time_unit: None,
                 }),
                 is_named: None,
                 struct_fields: None,

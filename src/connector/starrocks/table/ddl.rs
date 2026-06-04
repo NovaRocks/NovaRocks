@@ -1306,6 +1306,7 @@ fn append_sql_type_nodes(
                     len: scalar.len,
                     precision: scalar.precision,
                     scale: scalar.scale,
+                    time_unit: None,
                 }),
                 is_named: None,
                 struct_fields: None,

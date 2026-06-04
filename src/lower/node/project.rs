@@ -330,7 +330,7 @@ mod tests {
     fn scalar_type_desc(ty: TPrimitiveType) -> TTypeDesc {
         TTypeDesc::new(vec![TTypeNode {
             type_: TTypeNodeType::SCALAR,
-            scalar_type: Some(TScalarType::new(ty, None, None, None)),
+            scalar_type: Some(TScalarType::new(ty, None, None, None, None)),
             struct_fields: None,
             is_named: None,
         }])

@@ -91,6 +91,7 @@ fn append_arrow_type_nodes(
                 None::<i32>,
                 Some(i32::from(*p)),
                 Some(i32::from(*s)),
+                None,
             );
             nodes.push(types::TTypeNode::new(
                 types::TTypeNodeType::SCALAR,
@@ -106,6 +107,7 @@ fn append_arrow_type_nodes(
                 None::<i32>,
                 Some(i32::from(*p)),
                 Some(i32::from(*s)),
+                None,
             );
             nodes.push(types::TTypeNode::new(
                 types::TTypeNodeType::SCALAR,
