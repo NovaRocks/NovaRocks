@@ -23,6 +23,7 @@
 //! rewrite.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use iceberg::io::FileIO;
@@ -39,7 +40,7 @@ use super::puffin_dv::{
     DeletionVector, DeletionVectorBlobInput, WrittenPuffinDv, read_deletion_vector_puffin,
     write_multi_deletion_vector_puffin,
 };
-use super::retry::commit_with_retry;
+use super::retry::{commit_with_retry, is_retryable_commit_conflict};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RewritePositionDeleteOptions {
@@ -141,140 +142,169 @@ async fn run_one_attempt(
     let meta_dir = metadata_dir(&table);
     let created = RewriteArtifacts::default();
 
-    let mut new_manifests = plan.untouched_manifests.clone();
-    for (idx, (spec_id, entries)) in group_entries_by_partition_spec(&plan.existing_entries)
-        .into_iter()
-        .enumerate()
-    {
-        let path = format!("{meta_dir}/{commit_uuid}-rewrite-pos-delete-existing-{idx}.avro");
-        created.record_manifest(path.clone());
-        let manifest = write_existing_delete_manifest(
+    let attempt_result: Result<RewritePositionDeleteOutcome, AttemptFailure> = async {
+        let mut new_manifests = plan.untouched_manifests.clone();
+        for (idx, (spec_id, entries)) in group_entries_by_partition_spec(&plan.existing_entries)
+            .into_iter()
+            .enumerate()
+        {
+            let path = format!("{meta_dir}/{commit_uuid}-rewrite-pos-delete-existing-{idx}.avro");
+            created.record_manifest(path.clone());
+            let manifest = write_existing_delete_manifest(
+                file_io,
+                &path,
+                entries,
+                partition_spec_by_id(metadata, spec_id).map_err(AttemptFailure::cleanup)?,
+                metadata.current_schema().clone(),
+                new_snapshot_id,
+            )
+            .await
+            .map_err(|e| AttemptFailure::cleanup(to_iceberg_unexpected(e)))?;
+            new_manifests.push(manifest);
+        }
+
+        for (idx, (spec_id, entries)) in group_entries_by_partition_spec(&plan.rewritten_entries)
+            .into_iter()
+            .enumerate()
+        {
+            let path = format!("{meta_dir}/{commit_uuid}-rewrite-pos-delete-deleted-{idx}.avro");
+            created.record_manifest(path.clone());
+            let manifest = write_deleted_delete_manifest(
+                file_io,
+                &path,
+                entries,
+                partition_spec_by_id(metadata, spec_id).map_err(AttemptFailure::cleanup)?,
+                metadata.current_schema().clone(),
+                new_snapshot_id,
+            )
+            .await
+            .map_err(|e| AttemptFailure::cleanup(to_iceberg_unexpected(e)))?;
+            new_manifests.push(manifest);
+        }
+
+        let written_dvs = write_repacked_dvs(
             file_io,
-            &path,
-            entries,
-            partition_spec_by_id(metadata, spec_id)?,
-            metadata.current_schema().clone(),
-            new_snapshot_id,
+            metadata.location(),
+            &commit_uuid,
+            &plan.candidate_groups,
+            &created,
         )
         .await
-        .map_err(to_iceberg_unexpected)?;
-        new_manifests.push(manifest);
-    }
+        .map_err(|e| AttemptFailure::cleanup(to_iceberg_unexpected(e)))?;
 
-    for (idx, (spec_id, entries)) in group_entries_by_partition_spec(&plan.rewritten_entries)
-        .into_iter()
-        .enumerate()
-    {
-        let path = format!("{meta_dir}/{commit_uuid}-rewrite-pos-delete-deleted-{idx}.avro");
-        created.record_manifest(path.clone());
-        let manifest = write_deleted_delete_manifest(
+        for (idx, (spec_id, dvs)) in group_written_dvs_by_partition_spec(&written_dvs)
+            .into_iter()
+            .enumerate()
+        {
+            let path = format!("{meta_dir}/{commit_uuid}-rewrite-pos-delete-added-{idx}.avro");
+            created.record_manifest(path.clone());
+            let manifest = write_added_dv_manifest(
+                file_io,
+                &path,
+                &dvs,
+                partition_spec_by_id(metadata, spec_id).map_err(AttemptFailure::cleanup)?,
+                metadata.current_schema().clone(),
+                new_snapshot_id,
+            )
+            .await
+            .map_err(|e| AttemptFailure::cleanup(to_iceberg_unexpected(e)))?;
+            new_manifests.push(manifest);
+        }
+
+        let manifest_list_path = format!("{meta_dir}/snap-{new_snapshot_id}-{commit_uuid}.avro");
+        created.record_manifest(manifest_list_path.clone());
+        let manifest_list_next_row_id = write_manifest_list(
             file_io,
-            &path,
-            entries,
-            partition_spec_by_id(metadata, spec_id)?,
-            metadata.current_schema().clone(),
+            &manifest_list_path,
+            new_manifests,
             new_snapshot_id,
+            parent_snapshot_id,
+            new_seq,
+            metadata.format_version(),
+            Some(metadata.next_row_id()),
         )
         .await
-        .map_err(to_iceberg_unexpected)?;
-        new_manifests.push(manifest);
-    }
+        .map_err(|e| AttemptFailure::cleanup(to_iceberg_unexpected(e)))?;
+        if manifest_list_next_row_id != Some(metadata.next_row_id()) {
+            return Err(AttemptFailure::cleanup(to_iceberg_unexpected(format!(
+                "rewrite_position_delete_files must not allocate row IDs: expected next-row-id {}, got {manifest_list_next_row_id:?}",
+                metadata.next_row_id()
+            ))));
+        }
 
-    let written_dvs = write_repacked_dvs(
-        file_io,
-        metadata.location(),
-        &commit_uuid,
-        &plan.candidate_groups,
-        &created,
-    )
-    .await
-    .map_err(to_iceberg_unexpected)?;
-
-    for (idx, (spec_id, dvs)) in group_written_dvs_by_partition_spec(&written_dvs)
-        .into_iter()
-        .enumerate()
-    {
-        let path = format!("{meta_dir}/{commit_uuid}-rewrite-pos-delete-added-{idx}.avro");
-        created.record_manifest(path.clone());
-        let manifest = write_added_dv_manifest(
-            file_io,
-            &path,
-            &dvs,
-            partition_spec_by_id(metadata, spec_id)?,
-            metadata.current_schema().clone(),
-            new_snapshot_id,
-        )
-        .await
-        .map_err(to_iceberg_unexpected)?;
-        new_manifests.push(manifest);
-    }
-
-    let manifest_list_path = format!("{meta_dir}/snap-{new_snapshot_id}-{commit_uuid}.avro");
-    created.record_manifest(manifest_list_path.clone());
-    let manifest_list_next_row_id = write_manifest_list(
-        file_io,
-        &manifest_list_path,
-        new_manifests,
-        new_snapshot_id,
-        parent_snapshot_id,
-        new_seq,
-        metadata.format_version(),
-        Some(metadata.next_row_id()),
-    )
-    .await
-    .map_err(to_iceberg_unexpected)?;
-    if manifest_list_next_row_id != Some(metadata.next_row_id()) {
-        return Err(to_iceberg_unexpected(format!(
-            "rewrite_position_delete_files must not allocate row IDs: expected next-row-id {}, got {manifest_list_next_row_id:?}",
-            metadata.next_row_id()
-        )));
-    }
-
-    let outcome = rewrite_outcome(&plan, &written_dvs).map_err(to_iceberg_unexpected)?;
-    let snapshot = Snapshot::builder()
-        .with_snapshot_id(new_snapshot_id)
-        .with_parent_snapshot_id(parent_snapshot_id)
-        .with_sequence_number(new_seq)
-        .with_timestamp_ms(now_ms())
-        .with_manifest_list(manifest_list_path)
-        .with_summary(Summary {
-            operation: Operation::Replace,
-            additional_properties: rewrite_summary(&outcome),
-        })
-        .with_schema_id(metadata.current_schema_id())
-        .with_row_range(metadata.next_row_id(), 0)
-        .build();
-    let commit = TableCommit::builder()
-        .ident(table_ident)
-        .updates(vec![
-            TableUpdate::AddSnapshot { snapshot },
-            TableUpdate::SetSnapshotRef {
-                ref_name: "main".to_string(),
-                reference: SnapshotReference {
-                    snapshot_id: new_snapshot_id,
-                    retention: SnapshotRetention::Branch {
-                        min_snapshots_to_keep: None,
-                        max_snapshot_age_ms: None,
-                        max_ref_age_ms: None,
+        let outcome =
+            rewrite_outcome(&plan, &written_dvs).map_err(|e| AttemptFailure::cleanup(to_iceberg_unexpected(e)))?;
+        let snapshot = Snapshot::builder()
+            .with_snapshot_id(new_snapshot_id)
+            .with_parent_snapshot_id(parent_snapshot_id)
+            .with_sequence_number(new_seq)
+            .with_timestamp_ms(now_ms())
+            .with_manifest_list(manifest_list_path)
+            .with_summary(Summary {
+                operation: Operation::Replace,
+                additional_properties: rewrite_summary(&outcome),
+            })
+            .with_schema_id(metadata.current_schema_id())
+            .with_row_range(metadata.next_row_id(), 0)
+            .build();
+        let commit = TableCommit::builder()
+            .ident(table_ident.clone())
+            .updates(vec![
+                TableUpdate::AddSnapshot { snapshot },
+                TableUpdate::SetSnapshotRef {
+                    ref_name: "main".to_string(),
+                    reference: SnapshotReference {
+                        snapshot_id: new_snapshot_id,
+                        retention: SnapshotRetention::Branch {
+                            min_snapshots_to_keep: None,
+                            max_snapshot_age_ms: None,
+                            max_ref_age_ms: None,
+                        },
                     },
                 },
-            },
-        ])
-        .requirements(vec![
-            TableRequirement::CurrentSchemaIdMatch {
-                current_schema_id: metadata.current_schema_id(),
-            },
-            TableRequirement::DefaultSpecIdMatch {
-                default_spec_id: metadata.default_partition_spec_id(),
-            },
-            TableRequirement::RefSnapshotIdMatch {
-                r#ref: "main".to_string(),
-                snapshot_id: parent_snapshot_id,
-            },
-        ])
-        .build();
-    catalog.update_table(commit).await?;
-    Ok(outcome)
+            ])
+            .requirements(vec![
+                TableRequirement::CurrentSchemaIdMatch {
+                    current_schema_id: metadata.current_schema_id(),
+                },
+                TableRequirement::DefaultSpecIdMatch {
+                    default_spec_id: metadata.default_partition_spec_id(),
+                },
+                TableRequirement::RefSnapshotIdMatch {
+                    r#ref: "main".to_string(),
+                    snapshot_id: parent_snapshot_id,
+                },
+            ])
+            .build();
+        catalog
+            .update_table(commit)
+            .await
+            .map_err(AttemptFailure::from_catalog_commit_error)?;
+        Ok(outcome)
+    }
+    .await;
+
+    match attempt_result {
+        Ok(outcome) => Ok(outcome),
+        Err(failure) => {
+            if failure.cleanup_artifacts {
+                let cleanup_errors = created.cleanup(file_io).await;
+                for err in cleanup_errors {
+                    tracing::warn!(
+                        path = %err.path,
+                        source = ?err.source,
+                        "rewrite_position_delete_files artifact cleanup error"
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    table = %table_ident,
+                    "rewrite_position_delete_files catalog commit result is unknown; preserving staged artifacts"
+                );
+            }
+            Err(failure.error)
+        }
+    }
 }
 
 async fn plan_rewrite(
@@ -284,7 +314,6 @@ async fn plan_rewrite(
 ) -> Result<RewritePlan, String> {
     let mut data_manifests = Vec::new();
     let mut delete_manifests = Vec::new();
-    let mut groups: BTreeMap<String, Vec<LiveDeleteEntry>> = BTreeMap::new();
     let mut live_data_files = HashMap::new();
 
     for mf in manifests {
@@ -306,21 +335,7 @@ async fn plan_rewrite(
                             data_file.file_path()
                         ));
                     }
-                    let path = data_file.file_path().to_string();
-                    if live_data_files
-                        .insert(
-                            path.clone(),
-                            LiveDataEntry {
-                                data_file,
-                                partition_spec_id: mf.partition_spec_id,
-                            },
-                        )
-                        .is_some()
-                    {
-                        return Err(format!(
-                            "rewrite_position_delete_files found duplicate live data file `{path}` in the current snapshot"
-                        ));
-                    }
+                    record_live_data_file(&mut live_data_files, data_file, mf.partition_spec_id)?;
                 }
                 data_manifests.push(mf.clone());
             }
@@ -343,18 +358,33 @@ async fn plan_rewrite(
                         file_sequence_number: entry.file_sequence_number,
                         rewrite_ref,
                     };
-                    if let Some(puffin_ref) = &live.rewrite_ref {
-                        groups
-                            .entry(puffin_ref.referenced_data_file.clone())
-                            .or_default()
-                            .push(live.clone());
-                    }
                     entries.push(live);
                 }
                 delete_manifests.push(ScannedDeleteManifest {
                     manifest: mf.clone(),
                     entries,
                 });
+            }
+        }
+    }
+
+    build_rewrite_plan_from_scanned(data_manifests, delete_manifests, live_data_files, options)
+}
+
+fn build_rewrite_plan_from_scanned(
+    data_manifests: Vec<ManifestFile>,
+    delete_manifests: Vec<ScannedDeleteManifest>,
+    live_data_files: HashMap<String, LiveDataEntry>,
+    options: &RewritePositionDeleteOptions,
+) -> Result<RewritePlan, String> {
+    let mut groups: BTreeMap<String, Vec<LiveDeleteEntry>> = BTreeMap::new();
+    for scanned in &delete_manifests {
+        for entry in &scanned.entries {
+            if let Some(puffin_ref) = &entry.rewrite_ref {
+                groups
+                    .entry(puffin_ref.referenced_data_file.clone())
+                    .or_default()
+                    .push(entry.clone());
             }
         }
     }
@@ -403,6 +433,29 @@ async fn plan_rewrite(
         rewritten_entries,
         candidate_groups,
     })
+}
+
+fn record_live_data_file(
+    live_data_files: &mut HashMap<String, LiveDataEntry>,
+    data_file: DataFile,
+    partition_spec_id: i32,
+) -> Result<(), String> {
+    let path = data_file.file_path().to_string();
+    if live_data_files
+        .insert(
+            path.clone(),
+            LiveDataEntry {
+                data_file,
+                partition_spec_id,
+            },
+        )
+        .is_some()
+    {
+        return Err(format!(
+            "rewrite_position_delete_files found duplicate live data file `{path}` in the current snapshot"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -533,6 +586,34 @@ struct WrittenCandidateDv {
 struct RewriteArtifacts {
     puffin_paths: Mutex<Vec<String>>,
     manifest_paths: Mutex<Vec<String>>,
+    cleared: AtomicBool,
+}
+
+struct AttemptFailure {
+    error: iceberg::Error,
+    cleanup_artifacts: bool,
+}
+
+impl AttemptFailure {
+    fn cleanup(error: iceberg::Error) -> Self {
+        Self {
+            error,
+            cleanup_artifacts: true,
+        }
+    }
+
+    fn from_catalog_commit_error(error: iceberg::Error) -> Self {
+        Self {
+            cleanup_artifacts: should_cleanup_catalog_commit_error(&error),
+            error,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RewriteArtifactCleanupError {
+    path: String,
+    source: iceberg::Error,
 }
 
 impl RewriteArtifacts {
@@ -549,6 +630,83 @@ impl RewriteArtifacts {
             .expect("rewrite artifact manifest_paths mutex poisoned")
             .push(path);
     }
+
+    fn drain_puffin_paths(&self) -> Vec<String> {
+        std::mem::take(
+            &mut *self
+                .puffin_paths
+                .lock()
+                .expect("rewrite artifact puffin_paths mutex poisoned"),
+        )
+    }
+
+    fn drain_manifest_paths(&self) -> Vec<String> {
+        std::mem::take(
+            &mut *self
+                .manifest_paths
+                .lock()
+                .expect("rewrite artifact manifest_paths mutex poisoned"),
+        )
+    }
+
+    async fn cleanup(&self, file_io: &FileIO) -> Vec<RewriteArtifactCleanupError> {
+        if self.cleared.swap(true, Ordering::SeqCst) {
+            return Vec::new();
+        }
+
+        let mut errors = Vec::new();
+        for path in self
+            .drain_puffin_paths()
+            .into_iter()
+            .chain(self.drain_manifest_paths())
+        {
+            if let Err(source) = file_io.delete(&path).await {
+                errors.push(RewriteArtifactCleanupError { path, source });
+            }
+        }
+        errors
+    }
+
+    #[cfg(test)]
+    fn puffin_paths(&self) -> Vec<String> {
+        self.puffin_paths
+            .lock()
+            .expect("rewrite artifact puffin_paths mutex poisoned")
+            .clone()
+    }
+
+    #[cfg(test)]
+    fn manifest_paths(&self) -> Vec<String> {
+        self.manifest_paths
+            .lock()
+            .expect("rewrite artifact manifest_paths mutex poisoned")
+            .clone()
+    }
+}
+
+fn should_cleanup_catalog_commit_error(err: &iceberg::Error) -> bool {
+    if is_retryable_commit_conflict(err) || err.kind() != iceberg::ErrorKind::Unexpected {
+        return true;
+    }
+
+    let lower = format!("{err}").to_ascii_lowercase();
+    let definite_signals = [
+        "conflict",
+        "assertrefsnapshotid",
+        "ref_snapshot_id_match",
+        "assertcurrentschemaidmatch",
+        "schema id mismatch",
+        "schemaidmatch",
+        "spec id mismatch",
+        "specidmatch",
+        "data invalid",
+        "datainvalid",
+        "precondition failed",
+        "preconditionfailed",
+        "catalog commit conflict",
+        "catalogcommitconflict",
+    ];
+    definite_signals.iter().any(|signal| lower.contains(signal))
 }
 
 fn classify_delete_file_for_rewrite(file: &DataFile) -> Result<Option<PuffinDeleteRef>, String> {
@@ -894,6 +1052,8 @@ fn to_iceberg_unexpected(s: String) -> iceberg::Error {
 mod tests {
     use super::*;
     use std::collections::{BTreeMap, HashMap};
+    use std::fs;
+    use std::path::Path;
 
     #[test]
     fn options_default_min_input_files_is_two() {
@@ -992,6 +1152,278 @@ mod tests {
         assert!(err.contains(referenced));
     }
 
+    #[test]
+    fn candidate_group_rejects_incompatible_sequence_spec_and_partition() {
+        let referenced = "file:///tmp/data.parquet";
+        let base = test_live_delete_entry_with(
+            "file:///tmp/delete-a.puffin",
+            referenced,
+            DataContentType::PositionDeletes,
+            DataFileFormat::Puffin,
+            0,
+            iceberg::spec::Struct::empty(),
+            10,
+            Some(20),
+        );
+
+        let sequence_err = CandidateGroup::new(
+            referenced.to_string(),
+            vec![
+                base.clone(),
+                test_live_delete_entry_with(
+                    "file:///tmp/delete-b.puffin",
+                    referenced,
+                    DataContentType::PositionDeletes,
+                    DataFileFormat::Puffin,
+                    0,
+                    iceberg::spec::Struct::empty(),
+                    11,
+                    Some(21),
+                ),
+            ],
+        )
+        .unwrap_err();
+        assert!(sequence_err.contains("different data sequence numbers"));
+
+        let spec_err = CandidateGroup::new(
+            referenced.to_string(),
+            vec![
+                base.clone(),
+                test_live_delete_entry_with(
+                    "file:///tmp/delete-c.puffin",
+                    referenced,
+                    DataContentType::PositionDeletes,
+                    DataFileFormat::Puffin,
+                    1,
+                    iceberg::spec::Struct::empty(),
+                    10,
+                    Some(22),
+                ),
+            ],
+        )
+        .unwrap_err();
+        assert!(spec_err.contains("partition spec ids"));
+
+        let partition_err = CandidateGroup::new(
+            referenced.to_string(),
+            vec![
+                base,
+                test_live_delete_entry_with(
+                    "file:///tmp/delete-d.puffin",
+                    referenced,
+                    DataContentType::PositionDeletes,
+                    DataFileFormat::Puffin,
+                    0,
+                    test_partition(7),
+                    10,
+                    Some(23),
+                ),
+            ],
+        )
+        .unwrap_err();
+        assert!(partition_err.contains("different partition tuples"));
+    }
+
+    #[test]
+    fn build_rewrite_plan_splits_mixed_touched_manifest_and_preserves_sequences() {
+        let data_a = "file:///tmp/data-a.parquet";
+        let data_b = "file:///tmp/data-b.parquet";
+        let data_c = "file:///tmp/data-c.parquet";
+        let touched_manifest = fake_manifest(
+            "file:///tmp/delete-touched.avro",
+            0,
+            ManifestContentType::Deletes,
+        );
+        let untouched_manifest = fake_manifest(
+            "file:///tmp/delete-untouched.avro",
+            0,
+            ManifestContentType::Deletes,
+        );
+        let data_manifest = fake_manifest("file:///tmp/data.avro", 0, ManifestContentType::Data);
+        let touched_entries = vec![
+            test_live_delete_entry_with(
+                "file:///tmp/delete-a-1.puffin",
+                data_a,
+                DataContentType::PositionDeletes,
+                DataFileFormat::Puffin,
+                0,
+                iceberg::spec::Struct::empty(),
+                31,
+                Some(41),
+            ),
+            test_live_delete_entry_with(
+                "file:///tmp/delete-a-2.puffin",
+                data_a,
+                DataContentType::PositionDeletes,
+                DataFileFormat::Puffin,
+                0,
+                iceberg::spec::Struct::empty(),
+                31,
+                Some(42),
+            ),
+            test_live_delete_entry_with(
+                "file:///tmp/delete-b-1.puffin",
+                data_b,
+                DataContentType::PositionDeletes,
+                DataFileFormat::Puffin,
+                0,
+                iceberg::spec::Struct::empty(),
+                51,
+                Some(61),
+            ),
+            test_live_delete_entry_with(
+                "file:///tmp/delete-eq.parquet",
+                data_a,
+                DataContentType::EqualityDeletes,
+                DataFileFormat::Parquet,
+                0,
+                iceberg::spec::Struct::empty(),
+                71,
+                Some(81),
+            ),
+        ];
+        let untouched_entries = vec![test_live_delete_entry_with(
+            "file:///tmp/delete-c-1.puffin",
+            data_c,
+            DataContentType::PositionDeletes,
+            DataFileFormat::Puffin,
+            0,
+            iceberg::spec::Struct::empty(),
+            91,
+            Some(101),
+        )];
+        let live_data = HashMap::from([
+            (
+                data_a.to_string(),
+                test_live_data_entry(data_a, 0, iceberg::spec::Struct::empty()),
+            ),
+            (
+                data_b.to_string(),
+                test_live_data_entry(data_b, 0, iceberg::spec::Struct::empty()),
+            ),
+        ]);
+
+        let plan = build_rewrite_plan_from_scanned(
+            vec![data_manifest.clone()],
+            vec![
+                ScannedDeleteManifest {
+                    manifest: touched_manifest,
+                    entries: touched_entries,
+                },
+                ScannedDeleteManifest {
+                    manifest: untouched_manifest.clone(),
+                    entries: untouched_entries,
+                },
+            ],
+            live_data,
+            &RewritePositionDeleteOptions {
+                rewrite_all: false,
+                min_input_files: 2,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(plan.candidate_groups.len(), 1);
+        assert!(plan.candidate_groups.contains_key(data_a));
+        assert_eq!(plan.rewritten_entries.len(), 2);
+        assert_eq!(
+            plan.rewritten_entries
+                .iter()
+                .map(|entry| (entry.sequence_number, entry.file_sequence_number))
+                .collect::<Vec<_>>(),
+            vec![(31, Some(41)), (31, Some(42))]
+        );
+        assert_eq!(plan.existing_entries.len(), 2);
+        assert!(plan.existing_entries.iter().any(|entry| {
+            entry.data_file.file_path() == "file:///tmp/delete-b-1.puffin"
+                && entry.sequence_number == 51
+                && entry.file_sequence_number == Some(61)
+        }));
+        assert!(plan.existing_entries.iter().any(|entry| {
+            entry.data_file.content_type() == DataContentType::EqualityDeletes
+                && entry.sequence_number == 71
+                && entry.file_sequence_number == Some(81)
+        }));
+        assert_eq!(plan.untouched_manifests.len(), 2);
+        assert!(
+            plan.untouched_manifests
+                .iter()
+                .any(|mf| mf.manifest_path == data_manifest.manifest_path)
+        );
+        assert!(
+            plan.untouched_manifests
+                .iter()
+                .any(|mf| mf.manifest_path == untouched_manifest.manifest_path)
+        );
+    }
+
+    #[test]
+    fn build_rewrite_plan_rejects_duplicate_live_data_files() {
+        let data = "file:///tmp/data.parquet";
+        let mut live_data = HashMap::new();
+        record_live_data_file(
+            &mut live_data,
+            test_live_data_entry(data, 0, iceberg::spec::Struct::empty()).data_file,
+            0,
+        )
+        .unwrap();
+        let err = record_live_data_file(
+            &mut live_data,
+            test_live_data_entry(data, 0, iceberg::spec::Struct::empty()).data_file,
+            0,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("duplicate live data file"));
+        assert!(err.contains(data));
+    }
+
+    #[tokio::test]
+    async fn rewrite_artifacts_cleanup_deletes_recorded_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let puffin = dir.path().join("staged.puffin");
+        let manifest = dir.path().join("manifest.avro");
+        fs::write(&puffin, b"dv").unwrap();
+        fs::write(&manifest, b"manifest").unwrap();
+        let file_io = FileIO::new_with_fs();
+
+        let artifacts = RewriteArtifacts::default();
+        artifacts.record_puffin(path_string(&puffin));
+        artifacts.record_manifest(path_string(&manifest));
+
+        let cleanup_errors = artifacts.cleanup(&file_io).await;
+
+        assert!(
+            cleanup_errors.is_empty(),
+            "cleanup errors: {cleanup_errors:?}"
+        );
+        assert!(!puffin.exists());
+        assert!(!manifest.exists());
+        assert!(artifacts.puffin_paths().is_empty());
+        assert!(artifacts.manifest_paths().is_empty());
+    }
+
+    #[test]
+    fn catalog_commit_error_cleanup_policy_preserves_only_unknown_results() {
+        let conflict = iceberg::Error::new(
+            iceberg::ErrorKind::PreconditionFailed,
+            "Requirement failed: AssertRefSnapshotIdMatch",
+        );
+        assert!(should_cleanup_catalog_commit_error(&conflict));
+
+        let invalid = iceberg::Error::new(iceberg::ErrorKind::DataInvalid, "bad metadata");
+        assert!(should_cleanup_catalog_commit_error(&invalid));
+
+        let wrapped_conflict = iceberg::Error::new(
+            iceberg::ErrorKind::Unexpected,
+            "catalog commit conflict on AssertRefSnapshotIdMatch",
+        );
+        assert!(should_cleanup_catalog_commit_error(&wrapped_conflict));
+
+        let unknown = iceberg::Error::new(iceberg::ErrorKind::Unexpected, "connection reset");
+        assert!(!should_cleanup_catalog_commit_error(&unknown));
+    }
+
     fn test_candidate_group(
         referenced_data_file: &str,
         partition_spec_id: i32,
@@ -1013,17 +1445,49 @@ mod tests {
         partition_spec_id: i32,
         partition: iceberg::spec::Struct,
     ) -> LiveDeleteEntry {
+        test_live_delete_entry_with(
+            &format!("file:///tmp/delete-{partition_spec_id}.puffin"),
+            referenced_data_file,
+            DataContentType::PositionDeletes,
+            DataFileFormat::Puffin,
+            partition_spec_id,
+            partition,
+            11,
+            Some(12),
+        )
+    }
+
+    fn test_live_delete_entry_with(
+        delete_file_path: &str,
+        referenced_data_file: &str,
+        content: DataContentType,
+        format: DataFileFormat,
+        partition_spec_id: i32,
+        partition: iceberg::spec::Struct,
+        sequence_number: i64,
+        file_sequence_number: Option<i64>,
+    ) -> LiveDeleteEntry {
         let data_file = iceberg::spec::DataFileBuilder::default()
-            .content(iceberg::spec::DataContentType::PositionDeletes)
-            .file_path(format!("file:///tmp/delete-{partition_spec_id}.puffin"))
-            .file_format(iceberg::spec::DataFileFormat::Puffin)
+            .content(content)
+            .file_path(delete_file_path.to_string())
+            .file_format(format)
             .partition(partition)
             .partition_spec_id(partition_spec_id)
             .record_count(1)
             .file_size_in_bytes(64)
-            .referenced_data_file(Some(referenced_data_file.to_string()))
-            .content_offset(Some(4))
-            .content_size_in_bytes(Some(32))
+            .pipe(|builder| {
+                if content == DataContentType::PositionDeletes && format == DataFileFormat::Puffin {
+                    builder
+                        .referenced_data_file(Some(referenced_data_file.to_string()))
+                        .content_offset(Some(4))
+                        .content_size_in_bytes(Some(32))
+                } else if content == DataContentType::EqualityDeletes {
+                    builder.equality_ids(Some(vec![1]));
+                    builder
+                } else {
+                    builder
+                }
+            })
             .build()
             .unwrap();
         let rewrite_ref = classify_delete_file_for_rewrite(&data_file).unwrap();
@@ -1031,8 +1495,8 @@ mod tests {
             data_file,
             partition_spec_id,
             snapshot_id: 10,
-            sequence_number: 11,
-            file_sequence_number: Some(12),
+            sequence_number,
+            file_sequence_number,
             rewrite_ref,
         }
     }
@@ -1061,4 +1525,37 @@ mod tests {
     fn test_partition(value: i32) -> iceberg::spec::Struct {
         iceberg::spec::Struct::from_iter([Some(iceberg::spec::Literal::int(value))])
     }
+
+    fn fake_manifest(path: &str, spec_id: i32, content: ManifestContentType) -> ManifestFile {
+        ManifestFile {
+            manifest_path: path.to_string(),
+            manifest_length: 100,
+            partition_spec_id: spec_id,
+            content,
+            sequence_number: 0,
+            min_sequence_number: 0,
+            added_snapshot_id: 1,
+            added_files_count: Some(1),
+            existing_files_count: Some(0),
+            deleted_files_count: Some(0),
+            added_rows_count: Some(1),
+            existing_rows_count: Some(0),
+            deleted_rows_count: Some(0),
+            partitions: None,
+            key_metadata: None,
+            first_row_id: None,
+        }
+    }
+
+    fn path_string(path: &Path) -> String {
+        path.to_str().unwrap().to_string()
+    }
+
+    trait Pipe: Sized {
+        fn pipe<R>(self, f: impl FnOnce(Self) -> R) -> R {
+            f(self)
+        }
+    }
+
+    impl<T> Pipe for T {}
 }
