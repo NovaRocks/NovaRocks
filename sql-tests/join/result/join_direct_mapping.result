@@ -1,22 +1,22 @@
 -- query 12
 count(1)	count(t1.c_bool_null)	count(t2.c_bool_null)
-39998	39998	39998
+9996	9996	9996
 
 -- query 13
 count(1)	count(t1.c_bool_null)	count(t2.c_bool_null)
-74284	39998	39998
+18568	9996	9996
 
 -- query 14
 count(1)	count(t1.c_bool_null)
-5714	5714
+1428	1428
 
 -- query 15
 count(1)	count(t1.c_bool_null)
-34286	0
+8572	0
 
 -- query 16
 count(1)	count(t1.c_bool_null)	count(t2.c_bool_null)
-40083	39998	39998
+10081	9996	9996
 
 -- query 17
 count(1)	count(t2.c_bool_null)
@@ -28,27 +28,27 @@ count(1)	count(t2.c_bool_null)
 
 -- query 19
 count(1)	count(t1.c_bool_null)	count(t2.c_bool_null)
-74369	39998	39998
+18653	9996	9996
 
 -- query 20
 count(1)	count(t1.c_bool_null)	count(t2.c_bool_null)
-19999	19999	19999
+4998	4998	4998
 
 -- query 21
 count(1)	count(t1.c_bool_null)	count(t2.c_bool_null)
-57142	22856	19999
+14284	5712	4998
 
 -- query 22
 count(1)	count(t1.c_bool_null)
-2857	2857
+714	714
 
 -- query 23
 count(1)	count(t1.c_bool_null)
-37143	2857
+9286	714
 
 -- query 24
 count(1)	count(t1.c_bool_null)	count(t2.c_bool_null)
-19999	19999	19999
+4998	4998	4998
 
 -- query 25
 count(1)	count(t2.c_bool_null)
@@ -60,7 +60,7 @@ count(1)	count(t2.c_bool_null)
 
 -- query 27
 count(1)	count(t1.c_bool_null)	count(t2.c_bool_null)
-57142	22856	19999
+14284	5712	4998
 
 -- query 28
 count(1)	count(t1.c_bool_null)	count(t2.c_bool_null)
@@ -68,7 +68,7 @@ count(1)	count(t1.c_bool_null)	count(t2.c_bool_null)
 
 -- query 29
 count(1)	count(t1.c_bool_null)	count(t2.c_bool_null)
-40000	5714	0
+10000	1428	0
 
 -- query 30
 count(1)	count(t1.c_bool_null)
@@ -76,7 +76,7 @@ count(1)	count(t1.c_bool_null)
 
 -- query 31
 count(1)	count(t1.c_bool_null)
-40000	5714
+10000	1428
 
 -- query 32
 count(1)	count(t1.c_bool_null)	count(t2.c_bool_null)
@@ -92,27 +92,27 @@ count(1)	count(t2.c_bool_null)
 
 -- query 35
 count(1)	count(t1.c_bool_null)	count(t2.c_bool_null)
-40000	5714	0
+10000	1428	0
 
 -- query 36
 count(1)	count(t1.c_bool_null)	count(t2.c_bool_null)
-2857	2857	2857
+714	714	714
 
 -- query 37
 count(1)	count(t1.c_bool_null)	count(t2.c_bool_null)
-2857	2857	2857
+714	714	714
 
 -- query 38
 count(1)	count(t1.c_bool_null)
-2857	2857
+714	714
 
 -- query 39
 count(1)	count(t1.c_bool_null)
-37143	2857
+9286	714
 
 -- query 40
 count(1)	count(t1.c_bool_null)	count(t2.c_bool_null)
-2865	2857	2857
+722	714	714
 
 -- query 41
 count(1)	count(t2.c_bool_null)
@@ -124,27 +124,27 @@ count(1)	count(t2.c_bool_null)
 
 -- query 43
 count(1)	count(t1.c_bool_null)	count(t2.c_bool_null)
-2857	2857	2857
+714	714	714
 
 -- query 44
 count(1)	count(t1.c_tinyint_null)	count(t2.c_tinyint_null)
-2501	2501	2501
+625	625	625
 
 -- query 45
 count(1)	count(t1.c_tinyint_null)	count(t2.c_tinyint_null)
-40000	3333	2501
+10000	833	625
 
 -- query 46
 count(1)	count(t1.c_tinyint_null)
-2501	2501
+625	625
 
 -- query 47
 count(1)	count(t1.c_tinyint_null)
-37499	832
+9375	208
 
 -- query 48
 count(1)	count(t1.c_tinyint_null)	count(t2.c_tinyint_null)
-2501	2501	2501
+625	625	625
 
 -- query 49
 count(1)	count(t2.c_tinyint_null)
@@ -156,7 +156,7 @@ count(1)	count(t2.c_tinyint_null)
 
 -- query 51
 count(1)	count(t1.c_tinyint_null)	count(t2.c_tinyint_null)
-40000	3333	2501
+10000	833	625
 
 -- query 52
 count(1)	count(t1.c_tinyint_null)	count(t2.c_tinyint_null)
@@ -164,7 +164,7 @@ count(1)	count(t1.c_tinyint_null)	count(t2.c_tinyint_null)
 
 -- query 53
 count(1)	count(t1.c_tinyint_null)	count(t2.c_tinyint_null)
-40000	3333	0
+10000	833	0
 
 -- query 54
 count(1)	count(t1.c_tinyint_null)
@@ -172,7 +172,7 @@ count(1)	count(t1.c_tinyint_null)
 
 -- query 55
 count(1)	count(t1.c_tinyint_null)
-40000	3333
+10000	833
 
 -- query 56
 count(1)	count(t1.c_tinyint_null)	count(t2.c_tinyint_null)
@@ -188,7 +188,7 @@ count(1)	count(t2.c_tinyint_null)
 
 -- query 59
 count(1)	count(t1.c_tinyint_null)	count(t2.c_tinyint_null)
-40000	3333	0
+10000	833	0
 
 -- query 60
 count(1)	count(t1.c_tinyint_null)	count(t2.c_tinyint_null)
@@ -204,7 +204,7 @@ count(1)	count(t1.c_tinyint_null)
 
 -- query 63
 count(1)	count(t1.c_tinyint_null)
-40000	3333
+10000	833
 
 -- query 64
 count(1)	count(t1.c_tinyint_null)	count(t2.c_tinyint_null)
@@ -228,7 +228,7 @@ count(1)	count(t1.c_smallint_null)	count(t2.c_smallint_null)
 
 -- query 69
 count(1)	count(t1.c_smallint_null)	count(t2.c_smallint_null)
-40000	3076	11
+10000	769	11
 
 -- query 70
 count(1)	count(t1.c_smallint_null)
@@ -236,7 +236,7 @@ count(1)	count(t1.c_smallint_null)
 
 -- query 71
 count(1)	count(t1.c_smallint_null)
-39989	3065
+9989	758
 
 -- query 72
 count(1)	count(t1.c_smallint_null)	count(t2.c_smallint_null)
@@ -252,7 +252,7 @@ count(1)	count(t2.c_smallint_null)
 
 -- query 75
 count(1)	count(t1.c_smallint_null)	count(t2.c_smallint_null)
-40000	3076	11
+10000	769	11
 
 -- query 76
 count(1)	count(t1.c_smallint_null)	count(t2.c_smallint_null)
@@ -260,7 +260,7 @@ count(1)	count(t1.c_smallint_null)	count(t2.c_smallint_null)
 
 -- query 77
 count(1)	count(t1.c_smallint_null)	count(t2.c_smallint_null)
-40000	3076	0
+10000	769	0
 
 -- query 78
 count(1)	count(t1.c_smallint_null)
@@ -268,7 +268,7 @@ count(1)	count(t1.c_smallint_null)
 
 -- query 79
 count(1)	count(t1.c_smallint_null)
-40000	3076
+10000	769
 
 -- query 80
 count(1)	count(t1.c_smallint_null)	count(t2.c_smallint_null)
@@ -284,7 +284,7 @@ count(1)	count(t2.c_smallint_null)
 
 -- query 83
 count(1)	count(t1.c_smallint_null)	count(t2.c_smallint_null)
-40000	3076	0
+10000	769	0
 
 -- query 84
 count(1)	count(t1.c_smallint_null)	count(t2.c_smallint_null)
@@ -300,7 +300,7 @@ count(1)	count(t1.c_smallint_null)
 
 -- query 87
 count(1)	count(t1.c_smallint_null)
-40000	3076
+10000	769
 
 -- query 88
 count(1)	count(t1.c_smallint_null)	count(t2.c_smallint_null)

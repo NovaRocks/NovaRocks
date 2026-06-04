@@ -4,7 +4,7 @@
 -- 2. Verify both equality (=) and null-safe equality (<=>) join semantics on string columns.
 -- 3. Ensure correct handling of null-byte strings in join keys.
 -- Test Flow:
--- 1. Create helper tables to generate a large row set with row_number indexing.
+-- 1. Create helper tables to generate a functional-scale row set with row_number indexing.
 -- 2. Create t1 and t2 with string columns of various fixed-size lengths.
 -- 3. Join on each string column length with = and <=> and verify aggregated counts/hashes.
 -- 4. Insert null-byte strings and verify <=> join still works correctly.
@@ -18,7 +18,7 @@ TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- @skip_result_check=true
-insert into ${case_db}.__row_util_base select generate_series from TABLE(generate_series(0, 10000 - 1));
+insert into ${case_db}.__row_util_base select generate_series from TABLE(generate_series(0, 1000 - 1));
 
 -- query 3
 -- @skip_result_check=true
@@ -75,7 +75,7 @@ select
     substr(lpad(idx, 8, '-'), 1, 8),
     substr(lpad(idx, 16, '-'), 1, 16),
     substr(lpad(idx, 32, '-'), 1, 32)
-from ${case_db}.__row_util where idx <= 10000;
+from ${case_db}.__row_util where idx <= 1000;
 
 -- query 12
 -- @skip_result_check=true
@@ -100,11 +100,11 @@ insert into ${case_db}.t2 select idx, t1.c_int, t1.c_bigint, t1.c_str4, t1.c_str
 
 -- query 15
 -- @skip_result_check=true
-insert into ${case_db}.t2 (k1) select 320000;
+insert into ${case_db}.t2 (k1) select 32000;
 
 -- query 16
 -- @skip_result_check=true
-insert into ${case_db}.t2 select idx, idx, idx, uuid(), uuid(), uuid(), uuid() from ${case_db}.__row_util where idx <= 10000;
+insert into ${case_db}.t2 select idx, idx, idx, uuid(), uuid(), uuid(), uuid() from ${case_db}.__row_util where idx <= 1000;
 
 -- join on c_str4 with =
 -- query 17

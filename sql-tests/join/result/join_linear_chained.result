@@ -1,54 +1,54 @@
 -- query 11
 count(tt1.k1)	count(tt2.k1)
-40000	40000
+10000	10000
 
 -- query 12
 count(tt1.k1)	count(tt2.k1)
-20000	20000
+5000	5000
 
 -- query 13
 count(tt1.k1)	count(tt2.k1)
-40000	40000
+10000	10000
 
 -- query 14
 count(tt1.k1)	count(tt2.k1)
-40000	40000
+10000	10000
 
 -- query 15
 count(tt1.k1)	count(tt2.k1)
-20000	20000
+5000	5000
 
 -- query 16
 count(tt1.k1)	count(tt2.k1)
-400	400
+100	100
 
 -- query 17
 count(tt1.k1)	count(tt2.k1)
-40000	40000
+10000	10000
 
 -- query 18
 count(tt1.k1)	count(tt2.k1)
-20000	20000
+5000	5000
 
 -- query 19
 count(tt1.k1)	count(tt2.k1)
-400	400
+100	100
 
 -- query 20
 count(tt1.c_string)
-40000
+10000
 
 -- query 21
 count(tt1.c_string)
-20000
+5000
 
 -- query 22
 count(tt1.c_string)
-400
+100
 
 -- query 23
 count(tt1.k1)	count(tt2.k1)
-40000	40000
+10000	10000
 
 -- query 24
 count(tt1.k1)	count(tt2.k1)
@@ -56,59 +56,59 @@ count(tt1.k1)	count(tt2.k1)
 
 -- query 25
 count(tt1.k1)	count(tt2.k1)
-40000	40000
+10000	10000
 
 -- query 26
 count(tt1.k1)
-40000
+10000
 
 -- query 27
 count(tt1.k1)
-20000
+5000
 
 -- query 28
 count(tt1.k1)
-40000
+10000
 
 -- query 29
 count(tt1.k1)
-40000
+10000
 
 -- query 30
 count(tt1.k1)
-20000
+5000
 
 -- query 31
 count(tt1.k1)
-400
+100
 
 -- query 32
 count(tt1.k1)
-40000
+10000
 
 -- query 33
 count(tt1.k1)
-20000
+5000
 
 -- query 34
 count(tt1.k1)
-400
+100
 
 -- query 35
 count(tt1.c_string)
-40000
+10000
 
 -- query 36
 count(tt1.c_string)
-20000
+5000
 
 -- query 37
 count(tt1.c_string)
-400
+100
 
 -- query 38
 count(tt1.k1)
-40000
+10000
 
 -- query 39
 count(tt1.k1)
@@ -116,64 +116,64 @@ count(tt1.k1)
 
 -- query 40
 count(tt1.k1)
-40000
+10000
 
 -- query 41
 count(tt1.k1)	count(tt2.k1)
-40000	40000
+10000	10000
 
 -- query 42
 count(tt1.k1)	count(tt2.k1)
-20000	20000
+5000	5000
 
 -- query 43
 count(tt1.k1)	count(tt2.k1)
-40000	40000
+10000	10000
 
 -- query 44
 count(tt1.k1)	count(tt2.k1)
-40000	40000
+10000	10000
 
 -- query 45
 count(tt1.k1)	count(tt2.k1)
-20000	20000
+5000	5000
 
 -- query 46
 count(tt1.k1)	count(tt2.k1)
-400	400
+100	100
 
 -- query 47
 count(tt1.k1)	count(tt2.k1)
-40000	40000
+10000	10000
 
 -- query 48
 count(tt1.k1)	count(tt2.k1)
-20000	20000
+5000	5000
 
 -- query 49
 count(tt1.k1)	count(tt2.k1)
-400	400
+100	100
 
 -- query 50
 count(tt1.c_string)
-40000
+10000
 
 -- query 51
 count(tt1.c_string)
-20000
+5000
 
 -- query 52
 count(tt1.c_string)
-400
+100
 
 -- query 53
 count(tt1.k1)	count(tt2.k1)
-40000	40000
+10000	10000
 
 -- query 54
 count(tt1.k1)	count(tt2.k1)
-40000	0
+10000	0
 
 -- query 55
 count(tt1.k1)	count(tt2.k1)
-40000	40000
+10000	10000

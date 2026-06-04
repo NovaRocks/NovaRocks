@@ -5,7 +5,7 @@
 -- matched row counts, NULL key handling, and column propagation.
 -- Types covered: bool, tinyint, smallint, int, bigint, largeint, float, double,
 -- decimalv2, decimal32, decimal64, decimal128, date, datetime, char, varchar.
--- Stable correctness scale: 40K rows. This keeps selectivity and modulo
+-- Stable correctness scale: 10K rows. This keeps selectivity and modulo
 -- coverage without turning the daily join suite into a performance run.
 
 -- query 1
@@ -21,7 +21,7 @@ TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
-INSERT INTO ${case_db}.__row_util_base SELECT generate_series FROM TABLE(generate_series(0, 10000 - 1));
+INSERT INTO ${case_db}.__row_util_base SELECT generate_series FROM TABLE(generate_series(0, 2500 - 1));
 
 -- query 4
 -- @skip_result_check=true

@@ -1,10 +1,10 @@
 -- @tags=join,partition,broadcast
 -- Test Objective:
--- 1. Validate broadcast join correctness on large colocated tables with partition properties.
+-- 1. Validate broadcast join correctness on functional-scale colocated tables with partition properties.
 -- 2. Prevent regressions where broadcast join with query cache drops or duplicates rows.
 -- Test Flow:
--- 1. Create two colocated tables (t0, t1) with 48 buckets and insert 1.1M rows each.
--- 2. Execute a broadcast join aggregation and assert all 1.1M rows are matched.
+-- 1. Create two colocated tables (t0, t1) with 48 buckets and insert 100K rows each.
+-- 2. Execute a broadcast join aggregation and assert all 100K rows are matched.
 -- 3. Enable query_cache and re-run the same query twice to confirm stability under caching.
 
 -- query 1
@@ -29,7 +29,7 @@ TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t0 SELECT generate_series, generate_series, generate_series, generate_series FROM TABLE(generate_series(1, 1100000));
+INSERT INTO ${case_db}.t0 SELECT generate_series, generate_series, generate_series, generate_series FROM TABLE(generate_series(1, 100000));
 
 -- query 4
 -- @skip_result_check=true

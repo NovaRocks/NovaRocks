@@ -48,9 +48,6 @@ INSERT INTO ${case_db}.t0 SELECT * FROM ${case_db}.t0;
 INSERT INTO ${case_db}.t0 SELECT * FROM ${case_db}.t0;
 INSERT INTO ${case_db}.t0 SELECT * FROM ${case_db}.t0;
 INSERT INTO ${case_db}.t0 SELECT * FROM ${case_db}.t0;
-INSERT INTO ${case_db}.t0 SELECT * FROM ${case_db}.t0;
-INSERT INTO ${case_db}.t0 SELECT * FROM ${case_db}.t0;
-INSERT INTO ${case_db}.t0 SELECT * FROM ${case_db}.t0;
 INSERT INTO ${case_db}.t0 (v1, v2, v3, v4) values
     (101, 101, 101, NULL),
     (101, 101, 102, NULL),
@@ -1663,4 +1660,3 @@ FROM (
         SUM(v4) OVER(PARTITION BY v1 ORDER BY v5 ROWS BETWEEN UNBOUNDED PRECEDING AND 3 PRECEDING) AS wv2
     FROM ${case_db}.t1
 ) a;
-

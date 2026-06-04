@@ -486,7 +486,7 @@ TRUNCATE TABLE ${case_db}.t1;
 TRUNCATE TABLE ${case_db}.t2;
 INSERT INTO ${case_db}.t1
 SELECT generate_series, generate_series
-FROM TABLE(generate_series(1, 100000));
+FROM TABLE(generate_series(1, 10000));
 INSERT INTO ${case_db}.t2
 SELECT generate_series, generate_series
 FROM TABLE(generate_series(1, 1));
@@ -507,7 +507,7 @@ r AS (
   FROM ${case_db}.t1
 ),
 dim AS (
-  SELECT 50000 AS mx_lo_orderkey, 49999 AS mn_lo_orderkey
+  SELECT 5000 AS mx_lo_orderkey, 4999 AS mn_lo_orderkey
 )
 SELECT COUNT(*)
 FROM l

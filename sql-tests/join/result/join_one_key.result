@@ -1,26 +1,26 @@
 -- query 12
 count(1)	count(t1.k1)	count(t1.c_bool_null)
-39998	39998	39998
+9996	9996	9996
 
 -- query 13
 count(1)	count(t1.k1)	count(t1.c_bool_null)
-74369	74284	39998
+18653	18568	9996
 
 -- query 14
 count(1)	count(t1.k1)	count(t1.c_bool_null)
-5714	5714	5714
+1428	1428	1428
 
 -- query 15
 count(1)	count(t1.k1)	count(t1.c_tinyint_null)
-837	837	837
+209	209	209
 
 -- query 16
 count(1)	count(t1.k1)	count(t1.c_tinyint_null)
-40091	40000	3333
+10091	10000	833
 
 -- query 17
 count(1)	count(t1.k1)	count(t1.c_tinyint_null)
-837	837	837
+209	209	209
 
 -- query 18
 count(1)	count(t1.k1)	count(t1.c_smallint_null)
@@ -28,7 +28,7 @@ count(1)	count(t1.k1)	count(t1.c_smallint_null)
 
 -- query 19
 count(1)	count(t1.k1)	count(t1.c_smallint_null)
-49230	40000	3076
+19230	10000	769
 
 -- query 20
 count(1)	count(t1.k1)	count(t1.c_smallint_null)
@@ -36,312 +36,312 @@ count(1)	count(t1.k1)	count(t1.c_smallint_null)
 
 -- query 21
 count(1)	count(t1.k1)	count(t1.c_int)
-79998	79998	79998
+19998	19998	19998
 
 -- query 22
 count(1)	count(t1.k1)	count(t1.c_int)
-79998	79998	79998
+19998	19998	19998
 
 -- query 23
 count(1)	count(t1.k1)	count(t1.c_int)
-40000	40000	40000
+10000	10000	10000
 
 -- query 24
 count(1)	count(t1.k1)	count(t1.c_int_null)
-2857	2857	2857
+714	714	714
 
 -- query 25
 count(1)	count(t1.k1)	count(t1.c_int_null)
-77143	40000	2857
+19286	10000	714
 
 -- query 26
 count(1)	count(t1.k1)	count(t1.c_int_null)
-2857	2857	2857
+714	714	714
 
 -- query 27
 count(1)	count(t1.k1)	count(t1.c_bigint)
-79998	79998	79998
+19998	19998	19998
 
 -- query 28
 count(1)	count(t1.k1)	count(t1.c_bigint)
-79998	79998	79998
+19998	19998	19998
 
 -- query 29
 count(1)	count(t1.k1)	count(t1.c_bigint)
-40000	40000	40000
+10000	10000	10000
 
 -- query 30
 count(1)	count(t1.k1)	count(t1.c_bigint_null)
-2666	2666	2666
+666	666	666
 
 -- query 31
 count(1)	count(t1.k1)	count(t1.c_bigint_null)
-77334	40000	2666
+19334	10000	666
 
 -- query 32
 count(1)	count(t1.k1)	count(t1.c_bigint_null)
-2666	2666	2666
+666	666	666
 
 -- query 33
 count(1)	count(t1.k1)	count(t1.c_largeint)
-79998	79998	79998
+19998	19998	19998
 
 -- query 34
 count(1)	count(t1.k1)	count(t1.c_largeint)
-79998	79998	79998
+19998	19998	19998
 
 -- query 35
 count(1)	count(t1.k1)	count(t1.c_largeint)
-40000	40000	40000
+10000	10000	10000
 
 -- query 36
 count(1)	count(t1.k1)	count(t1.c_largeint_null)
-2500	2500	2500
+625	625	625
 
 -- query 37
 count(1)	count(t1.k1)	count(t1.c_largeint_null)
-77500	40000	2500
+19375	10000	625
 
 -- query 38
 count(1)	count(t1.k1)	count(t1.c_largeint_null)
-2500	2500	2500
+625	625	625
 
 -- query 39
 count(1)	count(t1.k1)	count(t1.c_float)
-40000	40000	40000
+10000	10000	10000
 
 -- query 40
 count(1)	count(t1.k1)	count(t1.c_float)
-40000	40000	40000
+10000	10000	10000
 
 -- query 41
 count(1)	count(t1.k1)	count(t1.c_float)
-40000	40000	40000
+10000	10000	10000
 
 -- query 42
 count(1)	count(t1.k1)	count(t1.c_float_null)
-2352	2352	2352
+588	588	588
 
 -- query 43
 count(1)	count(t1.k1)	count(t1.c_float_null)
-77648	40000	2352
+19412	10000	588
 
 -- query 44
 count(1)	count(t1.k1)	count(t1.c_float_null)
-2352	2352	2352
+588	588	588
 
 -- query 45
 count(1)	count(t1.k1)	count(t1.c_double)
-40000	40000	40000
+10000	10000	10000
 
 -- query 46
 count(1)	count(t1.k1)	count(t1.c_double)
-40000	40000	40000
+10000	10000	10000
 
 -- query 47
 count(1)	count(t1.k1)	count(t1.c_double)
-40000	40000	40000
+10000	10000	10000
 
 -- query 48
 count(1)	count(t1.k1)	count(t1.c_double_null)
-2222	2222	2222
+555	555	555
 
 -- query 49
 count(1)	count(t1.k1)	count(t1.c_double_null)
-77778	40000	2222
+19445	10000	555
 
 -- query 50
 count(1)	count(t1.k1)	count(t1.c_double_null)
-2222	2222	2222
+555	555	555
 
 -- query 51
 count(1)	count(t1.k1)	count(t1.c_decimalv2)
-80000	80000	80000
+20000	20000	20000
 
 -- query 52
 count(1)	count(t1.k1)	count(t1.c_decimalv2)
-80000	80000	80000
+20000	20000	20000
 
 -- query 53
 count(1)	count(t1.k1)	count(t1.c_decimalv2)
-40000	40000	40000
+10000	10000	10000
 
 -- query 54
 count(1)	count(t1.k1)	count(t1.c_decimalv2_null)
-1739	1739	1739
+434	434	434
 
 -- query 55
 count(1)	count(t1.k1)	count(t1.c_decimalv2_null)
-78261	40000	1739
+19566	10000	434
 
 -- query 56
 count(1)	count(t1.k1)	count(t1.c_decimalv2_null)
-1739	1739	1739
+434	434	434
 
 -- query 57
 count(1)	count(t1.k1)	count(t1.c_decimal32)
-80000	80000	80000
+20000	20000	20000
 
 -- query 58
 count(1)	count(t1.k1)	count(t1.c_decimal32)
-80000	80000	80000
+20000	20000	20000
 
 -- query 59
 count(1)	count(t1.k1)	count(t1.c_decimal32)
-40000	40000	40000
+10000	10000	10000
 
 -- query 60
 count(1)	count(t1.k1)	count(t1.c_decimal32_null)
-1666	1666	1666
+416	416	416
 
 -- query 61
 count(1)	count(t1.k1)	count(t1.c_decimal32_null)
-78334	40000	1666
+19584	10000	416
 
 -- query 62
 count(1)	count(t1.k1)	count(t1.c_decimal32_null)
-1666	1666	1666
+416	416	416
 
 -- query 63
 count(1)	count(t1.k1)	count(t1.c_decimal64)
-80000	80000	80000
+20000	20000	20000
 
 -- query 64
 count(1)	count(t1.k1)	count(t1.c_decimal64)
-80000	80000	80000
+20000	20000	20000
 
 -- query 65
 count(1)	count(t1.k1)	count(t1.c_decimal64)
-40000	40000	40000
+10000	10000	10000
 
 -- query 66
 count(1)	count(t1.k1)	count(t1.c_decimal64_null)
-1600	1600	1600
+400	400	400
 
 -- query 67
 count(1)	count(t1.k1)	count(t1.c_decimal64_null)
-78400	40000	1600
+19600	10000	400
 
 -- query 68
 count(1)	count(t1.k1)	count(t1.c_decimal64_null)
-1600	1600	1600
+400	400	400
 
 -- query 69
 count(1)	count(t1.k1)	count(t1.c_decimal128)
-80000	80000	80000
+20000	20000	20000
 
 -- query 70
 count(1)	count(t1.k1)	count(t1.c_decimal128)
-80000	80000	80000
+20000	20000	20000
 
 -- query 71
 count(1)	count(t1.k1)	count(t1.c_decimal128)
-40000	40000	40000
+10000	10000	10000
 
 -- query 72
 count(1)	count(t1.k1)	count(t1.c_decimal128_null)
-1538	1538	1538
+384	384	384
 
 -- query 73
 count(1)	count(t1.k1)	count(t1.c_decimal128_null)
-78462	40000	1538
+19616	10000	384
 
 -- query 74
 count(1)	count(t1.k1)	count(t1.c_decimal128_null)
-1538	1538	1538
+384	384	384
 
 -- query 75
 count(1)	count(t1.k1)	count(t1.c_date)
-79998	79998	79998
+19998	19998	19998
 
 -- query 76
 count(1)	count(t1.k1)	count(t1.c_date)
-79998	79998	79998
+19998	19998	19998
 
 -- query 77
 count(1)	count(t1.k1)	count(t1.c_date)
-40000	40000	40000
+10000	10000	10000
 
 -- query 78
 count(1)	count(t1.k1)	count(t1.c_date_null)
-2105	2105	2105
+526	526	526
 
 -- query 79
 count(1)	count(t1.k1)	count(t1.c_date_null)
-77895	40000	2105
+19474	10000	526
 
 -- query 80
 count(1)	count(t1.k1)	count(t1.c_date_null)
-2105	2105	2105
+526	526	526
 
 -- query 81
 count(1)	count(t1.k1)	count(t1.c_datetime)
-79998	79998	79998
+19998	19998	19998
 
 -- query 82
 count(1)	count(t1.k1)	count(t1.c_datetime)
-79998	79998	79998
+19998	19998	19998
 
 -- query 83
 count(1)	count(t1.k1)	count(t1.c_datetime)
-40000	40000	40000
+10000	10000	10000
 
 -- query 84
 count(1)	count(t1.k1)	count(t1.c_datetime_null)
-2000	2000	2000
+500	500	500
 
 -- query 85
 count(1)	count(t1.k1)	count(t1.c_datetime_null)
-78000	40000	2000
+19500	10000	500
 
 -- query 86
 count(1)	count(t1.k1)	count(t1.c_datetime_null)
-2000	2000	2000
+500	500	500
 
 -- query 87
 count(1)	count(t1.k1)	count(t1.c_char)
-40000	40000	40000
+10000	10000	10000
 
 -- query 88
 count(1)	count(t1.k1)	count(t1.c_char)
-40000	40000	40000
+10000	10000	10000
 
 -- query 89
 count(1)	count(t1.k1)	count(t1.c_char)
-40000	40000	40000
+10000	10000	10000
 
 -- query 90
 count(1)	count(t1.k1)	count(t1.c_char_null)
-1904	1904	1904
+476	476	476
 
 -- query 91
 count(1)	count(t1.k1)	count(t1.c_char_null)
-78096	40000	1904
+19524	10000	476
 
 -- query 92
 count(1)	count(t1.k1)	count(t1.c_char_null)
-1904	1904	1904
+476	476	476
 
 -- query 93
 count(1)	count(t1.k1)	count(t1.c_varchar)
-40000	40000	40000
+10000	10000	10000
 
 -- query 94
 count(1)	count(t1.k1)	count(t1.c_varchar)
-40000	40000	40000
+10000	10000	10000
 
 -- query 95
 count(1)	count(t1.k1)	count(t1.c_varchar)
-40000	40000	40000
+10000	10000	10000
 
 -- query 96
 count(1)	count(t1.k1)	count(t1.c_varchar_null)
-1818	1818	1818
+454	454	454
 
 -- query 97
 count(1)	count(t1.k1)	count(t1.c_varchar_null)
-78182	40000	1818
+19546	10000	454
 
 -- query 98
 count(1)	count(t1.k1)	count(t1.c_varchar_null)
-1818	1818	1818
+454	454	454
