@@ -489,6 +489,27 @@ fn cast_numeric_to_timestamp_array(
     array: &ArrayRef,
     target_type: &DataType,
 ) -> Result<ArrayRef, String> {
+    // For nanosecond targets, build directly from nanoseconds to avoid losing sub-microsecond
+    // precision when the numeric literal encodes fractional seconds.
+    if matches!(target_type, DataType::Timestamp(TimeUnit::Nanosecond, _)) {
+        let mut nanos = Vec::with_capacity(array.len());
+        for row in 0..array.len() {
+            let value = numeric_datetime_literal_at(array, row)?;
+            let nanos_value = value
+                .and_then(datetime_literal_to_naive_datetime)
+                .map(|dt| {
+                    dt.and_utc().timestamp_nanos_opt().ok_or_else(|| {
+                        format!(
+                            "CAST failed: numeric datetime literal is out of nanosecond i64 range"
+                        )
+                    })
+                })
+                .transpose()?;
+            nanos.push(nanos_value);
+        }
+        return Ok(Arc::new(TimestampNanosecondArray::from(nanos)) as ArrayRef);
+    }
+
     let mut micros = Vec::with_capacity(array.len());
     for row in 0..array.len() {
         let value = numeric_datetime_literal_at(array, row)?;
@@ -802,6 +823,31 @@ fn cast_utf8_to_timestamp_array(
     arr: &StringArray,
     target_type: &DataType,
 ) -> Result<ArrayRef, String> {
+    // For nanosecond targets, parse directly to nanoseconds to preserve sub-microsecond
+    // precision. Going through a microsecond intermediate would silently truncate
+    // the last 3 significant digits (e.g. '...05.000000001' → '...05.000000').
+    if matches!(target_type, DataType::Timestamp(TimeUnit::Nanosecond, _)) {
+        let nanos_vec: Vec<Option<i64>> = (0..arr.len())
+            .map(|row| {
+                if arr.is_null(row) {
+                    Ok(None)
+                } else {
+                    let dt = parse_string_to_naive_datetime(arr.value(row));
+                    match dt {
+                        None => Ok(None),
+                        Some(dt) => dt.and_utc().timestamp_nanos_opt().ok_or_else(|| {
+                            format!(
+                                "CAST failed: timestamp value '{}' is out of nanosecond range",
+                                arr.value(row)
+                            )
+                        }).map(Some),
+                    }
+                }
+            })
+            .collect::<Result<_, String>>()?;
+        return Ok(Arc::new(TimestampNanosecondArray::from(nanos_vec)) as ArrayRef);
+    }
+
     let micros = (0..arr.len())
         .map(|row| {
             if arr.is_null(row) {
@@ -2013,6 +2059,34 @@ fn cast_with_special_rules_with_field_schema(
         }
         (DataType::Map(_, _), DataType::Map(target_entries, ordered)) => {
             cast_map_to_map(array, target_entries, *ordered)
+        }
+        // Explicit timestamp→timestamp handling.
+        // Narrowing (nanosecond→microsecond or same-unit): defer to Arrow, which truncates
+        // toward zero — the correct behavior for narrowing casts.
+        // Widening (microsecond→nanosecond): validate that ×1000 does not overflow i64
+        // before delegating to Arrow, so callers get a deterministic error rather than
+        // silent NULL-ification or silent wraparound.
+        (
+            DataType::Timestamp(TimeUnit::Microsecond, _),
+            DataType::Timestamp(TimeUnit::Nanosecond, _),
+        ) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .ok_or_else(|| "failed to downcast to TimestampMicrosecondArray".to_string())?;
+            for i in 0..arr.len() {
+                if arr.is_null(i) {
+                    continue;
+                }
+                arr.value(i).checked_mul(1_000).ok_or_else(|| {
+                    format!(
+                        "CAST timestamp microsecond->nanosecond overflow: value {} cannot be \
+                         represented as nanoseconds in i64",
+                        arr.value(i)
+                    )
+                })?;
+            }
+            cast(array.as_ref(), target_type).map_err(|e| e.to_string())
         }
         _ => cast(array.as_ref(), target_type).map_err(|e| e.to_string()),
     }
@@ -4428,5 +4502,59 @@ mod tests {
         assert_eq!(a.value(1), -9_i64);
         assert_eq!(b.value(0), 1_i64);
         assert_eq!(b.value(1), -1_i64);
+    }
+
+    // IV3-7 Task 12: nanosecond timestamp cast semantics
+
+    #[test]
+    fn cast_nanos_to_micros_truncates() {
+        // 1_000_000_789 ns = 1_000_789 us + 789 ns sub-microsecond remainder.
+        // Truncation toward zero: 1_000_000_789 / 1000 = 1_000_000 us (integer division).
+        let src =
+            Arc::new(TimestampNanosecondArray::from(vec![Some(1_000_000_789_i64)])) as ArrayRef;
+        let out = cast_with_special_rules(&src, &DataType::Timestamp(TimeUnit::Microsecond, None))
+            .unwrap();
+        let a = out
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(a.value(0), 1_000_000);
+    }
+
+    #[test]
+    fn cast_micros_to_nanos_widens_in_range() {
+        let src =
+            Arc::new(TimestampMicrosecondArray::from(vec![Some(1_000_i64)])) as ArrayRef;
+        let out = cast_with_special_rules(&src, &DataType::Timestamp(TimeUnit::Nanosecond, None))
+            .unwrap();
+        let a = out
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .unwrap();
+        assert_eq!(a.value(0), 1_000_000);
+    }
+
+    #[test]
+    fn cast_micros_to_nanos_overflow_errors() {
+        // i64::MAX / 2 microseconds * 1000 overflows i64.
+        let src =
+            Arc::new(TimestampMicrosecondArray::from(vec![Some(i64::MAX / 2)])) as ArrayRef;
+        let r = cast_with_special_rules(&src, &DataType::Timestamp(TimeUnit::Nanosecond, None));
+        assert!(r.is_err(), "expected overflow error but got {:?}", r);
+    }
+
+    #[test]
+    fn cast_utf8_to_nanos_keeps_nanoseconds() {
+        // The string has 9 fractional digits; sub-microsecond digits must survive.
+        let src =
+            Arc::new(StringArray::from(vec![Some("2024-01-02 03:04:05.123456789")])) as ArrayRef;
+        let out = cast_with_special_rules(&src, &DataType::Timestamp(TimeUnit::Nanosecond, None))
+            .unwrap();
+        let a = out
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .unwrap();
+        // The last 3 digits (789) are the sub-microsecond part.
+        assert_eq!(a.value(0) % 1_000, 789);
     }
 }
