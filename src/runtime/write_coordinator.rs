@@ -228,7 +228,9 @@ impl WriteCoordinator {
             }
             WriterState::Pending | WriterState::Running { .. } => {
                 slot.state = WriterState::Finished(output);
-                if self.all_finished() {
+                if self.failed_reason.is_some() {
+                    Ok(ReportOutcome::Failed)
+                } else if self.all_finished() {
                     Ok(ReportOutcome::CommitReady)
                 } else {
                     Ok(ReportOutcome::Accepted)
@@ -676,6 +678,44 @@ mod tests {
         let abort = coord.abort_input().expect("conflict creates abort input");
         assert_eq!(abort.write_id, query_id);
         assert!(abort.reason.contains("conflicting final report"));
+    }
+
+    #[test]
+    fn latched_conflict_prevents_later_commit_ready_outcome() {
+        let query_id = id(23, 33);
+        let writer_a = key(23, 33, 123, 223, 0);
+        let writer_b = key(23, 33, 124, 224, 1);
+        let mut coord = coord(query_id, vec![writer_a.clone(), writer_b.clone()]);
+        coord
+            .apply_report(report(
+                &writer_a,
+                true,
+                ok_status(),
+                "s3://w/original.parquet",
+            ))
+            .expect("writer a report");
+        coord
+            .apply_report(report(
+                &writer_a,
+                true,
+                ok_status(),
+                "s3://w/conflict.parquet",
+            ))
+            .expect_err("conflicting duplicate must fail");
+
+        let outcome = coord
+            .apply_report(report(&writer_b, true, ok_status(), "s3://w/b.parquet"))
+            .expect("writer b report after conflict");
+        assert_ne!(outcome, ReportOutcome::CommitReady);
+        assert_eq!(outcome, ReportOutcome::Failed);
+        let commit_err = coord
+            .commit_input()
+            .expect_err("latched conflict blocks commit");
+        assert!(
+            commit_err.contains("conflicting final report"),
+            "{commit_err}"
+        );
+        assert!(coord.abort_input().is_some());
     }
 
     #[test]
