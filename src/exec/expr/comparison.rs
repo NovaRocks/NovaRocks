@@ -2087,4 +2087,56 @@ mod tests {
         assert!(out.value(1));
         assert!(!out.value(2));
     }
+
+    // IV3-7 Task 12: UTF-8 literal coercion against nanosecond timestamp columns must
+    // preserve sub-microsecond precision, so that '...05.000000001' is not silently
+    // truncated to '...05.000000' before comparison.
+    #[test]
+    fn normalize_utf8_vs_nanosecond_preserves_sub_microsecond() {
+        use arrow::array::TimestampNanosecondArray;
+        use arrow::datatypes::TimeUnit;
+
+        // Build a nanosecond timestamp column value: 2024-01-02 03:04:05.000000001
+        // 1704164645_000000001 ns from epoch
+        let ts_val = chrono::NaiveDateTime::parse_from_str(
+            "2024-01-02 03:04:05.000000001",
+            "%Y-%m-%d %H:%M:%S%.f",
+        )
+        .unwrap()
+        .and_utc()
+        .timestamp_nanos_opt()
+        .unwrap();
+
+        let ns_array =
+            Arc::new(TimestampNanosecondArray::from(vec![Some(ts_val)])) as ArrayRef;
+        // The literal is the same timestamp as a string.
+        let lit_array = Arc::new(StringArray::from(vec![Some("2024-01-02 03:04:05.000000001")]))
+            as ArrayRef;
+
+        // normalize_comparison_types should coerce the string to nanoseconds.
+        let (left, right) = normalize_comparison_types(ns_array, lit_array).unwrap();
+        assert_eq!(
+            left.data_type(),
+            right.data_type(),
+            "types must match after normalization"
+        );
+        let right_ns = right
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .expect("right must be TimestampNanosecondArray after coercion");
+        // The coerced literal must equal the original nanosecond value exactly,
+        // including the sub-microsecond digit '1'. If truncated to microseconds,
+        // right_ns.value(0) % 1000 == 0 and this assertion fails.
+        assert_eq!(
+            right_ns.value(0) % 1_000,
+            1,
+            "sub-microsecond digit lost in coercion: got ns_value={}",
+            right_ns.value(0)
+        );
+        assert_eq!(
+            right_ns.value(0),
+            ts_val,
+            "coerced literal does not equal the expected nanosecond value"
+        );
+    }
 }
