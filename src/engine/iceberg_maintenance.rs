@@ -12,7 +12,8 @@ use crate::connector::iceberg::commit::expire_snapshots::{ExpireParams, run_expi
 use crate::connector::iceberg::commit::remove_orphan_files::run_remove_orphan_files;
 use crate::connector::iceberg::commit::rewrite_manifests::run_rewrite_manifests;
 use crate::connector::iceberg::compact::{
-    WholeTableRewriteTarget, execute_whole_table_rewrite_with_metrics_for_target,
+    WholeTableRewriteResult, WholeTableRewriteTarget,
+    execute_whole_table_rewrite_with_metrics_for_target,
 };
 use crate::engine::catalog::normalize_identifier;
 use crate::engine::procedure::{CallProcedureStmt, ProcedureArgMode, ProcedureArgValue};
@@ -311,36 +312,37 @@ fn run_rewrite_data_files_action(
                 )
             },
         )?;
-    let before_metrics = rewrite_result.before_metrics;
-    let after_metrics = rewrite_result.after_metrics;
-    let removed_delete_files = before_metrics
-        .delete_files
-        .saturating_sub(after_metrics.delete_files);
 
     tracing::info!(
         catalog = %request.catalog,
         namespace = %request.namespace,
         table = %request.table,
         target_snapshot_id = ?rewrite_result.optimize_outcome.target_snapshot_id,
-        rewritten_data_files_count = before_metrics.data_files,
-        added_data_files_count = after_metrics.data_files,
-        removed_delete_files_count = removed_delete_files,
+        rewritten_data_files_count = rewrite_result.optimize_outcome.rewritten_data_files,
+        added_data_files_count = rewrite_result.optimize_outcome.added_data_files,
+        removed_delete_files_count = rewrite_result.optimize_outcome.deleted_data_files,
         "rewrite_data_files: completed"
     );
 
+    rewrite_data_files_outcome_from_result(&rewrite_result)
+}
+
+fn rewrite_data_files_outcome_from_result(
+    result: &WholeTableRewriteResult,
+) -> Result<MaintenanceActionOutcome, String> {
     Ok(MaintenanceActionOutcome::RewriteDataFiles {
         rewritten_data_files_count: checked_i32_metric(
-            before_metrics.data_files,
+            result.optimize_outcome.rewritten_data_files,
             "rewritten_data_files_count",
         )?,
         added_data_files_count: checked_i32_metric(
-            after_metrics.data_files,
+            result.optimize_outcome.added_data_files,
             "added_data_files_count",
         )?,
-        rewritten_bytes_count: before_metrics.data_bytes,
+        rewritten_bytes_count: result.before_metrics.data_bytes,
         failed_data_files_count: 0,
         removed_delete_files_count: checked_i32_metric(
-            removed_delete_files,
+            result.optimize_outcome.deleted_data_files,
             "removed_delete_files_count",
         )?,
     })
@@ -409,9 +411,15 @@ fn validate_rewrite_data_files_request(request: &MaintenanceActionRequest) -> Re
     if request.branch.is_some() {
         return Err("rewrite_data_files branch is not supported in NovaRocks yet".to_string());
     }
-    for key in request.options.values.keys() {
+    for (key, value) in &request.options.values {
         match key.as_str() {
-            "rewrite-all" | "min-input-files" | "target-file-size-bytes" => {}
+            "rewrite-all" if value.eq_ignore_ascii_case("true") => {}
+            "rewrite-all" => {
+                return Err("rewrite_data_files option `rewrite-all` must be `true`".to_string());
+            }
+            "min-input-files" | "target-file-size-bytes" => {
+                return Err(format!("unsupported rewrite_data_files option `{key}`"));
+            }
             other => return Err(format!("unsupported rewrite_data_files option `{other}`")),
         }
     }
@@ -928,6 +936,7 @@ fn column(name: &str, data_type: DataType, nullable: bool) -> QueryResultColumn 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connector::iceberg::commit::LiveFileMetrics;
     use crate::engine::procedure::parse_call_procedure_sql;
 
     fn test_request(kind: MaintenanceActionKind) -> MaintenanceActionRequest {
@@ -993,17 +1002,88 @@ mod tests {
                 "removed_delete_files_count"
             ]
         );
+        let types = result
+            .columns
+            .iter()
+            .map(|c| c.data_type.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            types,
+            vec![
+                DataType::Int32,
+                DataType::Int32,
+                DataType::Int64,
+                DataType::Int32,
+                DataType::Int32
+            ]
+        );
+        assert!(result.columns.iter().all(|c| !c.nullable));
     }
 
     #[test]
-    fn rewrite_data_files_rejects_sort_strategy_for_first_version() {
+    fn rewrite_data_files_rejects_ignored_options() {
         let mut request = test_request(MaintenanceActionKind::RewriteDataFiles);
         request
             .options
             .values
-            .insert("unsupported-key".to_string(), "true".to_string());
+            .insert("min-input-files".to_string(), "2".to_string());
         let err = validate_rewrite_data_files_request(&request).unwrap_err();
         assert!(err.contains("unsupported rewrite_data_files option"));
+
+        let mut request = test_request(MaintenanceActionKind::RewriteDataFiles);
+        request
+            .options
+            .values
+            .insert("target-file-size-bytes".to_string(), "1024".to_string());
+        let err = validate_rewrite_data_files_request(&request).unwrap_err();
+        assert!(err.contains("unsupported rewrite_data_files option"));
+
+        let mut request = test_request(MaintenanceActionKind::RewriteDataFiles);
+        request
+            .options
+            .values
+            .insert("rewrite-all".to_string(), "false".to_string());
+        let err = validate_rewrite_data_files_request(&request).unwrap_err();
+        assert!(err.contains("must be `true`"));
+
+        let mut request = test_request(MaintenanceActionKind::RewriteDataFiles);
+        request
+            .options
+            .values
+            .insert("rewrite-all".to_string(), "TRUE".to_string());
+        validate_rewrite_data_files_request(&request).expect("rewrite-all true is accepted");
+    }
+
+    #[test]
+    fn rewrite_data_files_outcome_uses_command_local_metrics() {
+        let result = WholeTableRewriteResult {
+            optimize_outcome: crate::meta::repository::job::IcebergOptimizeJobOutcome {
+                target_snapshot_id: Some(42),
+                rewritten_data_files: 2,
+                deleted_data_files: 3,
+                added_data_files: 1,
+                output_record_count: 7,
+            },
+            before_metrics: LiveFileMetrics {
+                data_files: 2,
+                delete_files: 3,
+                data_bytes: 4096,
+                delete_bytes: 128,
+            },
+        };
+
+        let outcome = rewrite_data_files_outcome_from_result(&result).unwrap();
+
+        assert_eq!(
+            outcome,
+            MaintenanceActionOutcome::RewriteDataFiles {
+                rewritten_data_files_count: 2,
+                added_data_files_count: 1,
+                rewritten_bytes_count: 4096,
+                failed_data_files_count: 0,
+                removed_delete_files_count: 3,
+            }
+        );
     }
 
     #[test]

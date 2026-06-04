@@ -22,9 +22,7 @@ use std::sync::{Arc, Weak};
 use std::thread;
 use std::time::Duration;
 
-use iceberg::io::FileIO;
-use iceberg::spec::{DataFile, ManifestContentType};
-use iceberg::table::Table;
+use iceberg::spec::DataFile;
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 use sqlparser::ast::Statement;
 
@@ -33,8 +31,8 @@ use crate::connector::iceberg::catalog::IcebergCatalogEntry;
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_hadoop_catalog};
 use crate::connector::iceberg::catalog::row_lineage_enabled;
 use crate::connector::iceberg::commit::{
-    AbortLog, CommitOpKind, IcebergCommitCollector, RunInput, count_current_live_files,
-    run_iceberg_commit,
+    AbortLog, CommitOpKind, IcebergCommitCollector, LiveFileMetrics, RunInput,
+    current_live_file_metrics, run_iceberg_commit,
 };
 use crate::connector::iceberg::data_writer::{
     RowLineageColumns, RowLineageWriteBatch, write_row_lineage_batches_as_data_files,
@@ -62,19 +60,10 @@ pub(crate) struct WholeTableRewriteTarget {
     pub(crate) job_id: Option<i64>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct WholeTableRewriteLiveMetrics {
-    pub(crate) data_files: i64,
-    pub(crate) delete_files: i64,
-    pub(crate) data_bytes: i64,
-    pub(crate) delete_bytes: i64,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WholeTableRewriteResult {
     pub(crate) optimize_outcome: IcebergOptimizeJobOutcome,
-    pub(crate) before_metrics: WholeTableRewriteLiveMetrics,
-    pub(crate) after_metrics: WholeTableRewriteLiveMetrics,
+    pub(crate) before_metrics: LiveFileMetrics,
 }
 
 impl WholeTableRewriteTarget {
@@ -389,11 +378,7 @@ pub(crate) fn execute_whole_table_rewrite_with_metrics_for_target(
     let table = load_current_table(catalog.as_ref(), &table_ident, rewrite_target)?;
     validate_base_snapshot(&table, rewrite_target)?;
 
-    let initial_metrics = block_on_iceberg(current_rewrite_live_metrics(&table, table.file_io()))??;
-    debug_assert_eq!(
-        block_on_iceberg(count_current_live_files(&table, table.file_io()))??,
-        (initial_metrics.data_files, initial_metrics.delete_files)
-    );
+    let initial_metrics = block_on_iceberg(current_live_file_metrics(&table, table.file_io()))??;
     if initial_metrics.data_files == 0 && initial_metrics.delete_files == 0 {
         tracing::info!(
             job_id = ?rewrite_target.job_id,
@@ -413,7 +398,6 @@ pub(crate) fn execute_whole_table_rewrite_with_metrics_for_target(
         return Ok(WholeTableRewriteResult {
             optimize_outcome,
             before_metrics: initial_metrics,
-            after_metrics: initial_metrics,
         });
     }
 
@@ -460,8 +444,7 @@ pub(crate) fn execute_whole_table_rewrite_with_metrics_for_target(
     let post_write = (|| {
         let table = load_current_table(catalog.as_ref(), &table_ident, rewrite_target)?;
         validate_base_snapshot(&table, rewrite_target)?;
-        let input_metrics =
-            block_on_iceberg(current_rewrite_live_metrics(&table, table.file_io()))??;
+        let input_metrics = block_on_iceberg(current_live_file_metrics(&table, table.file_io()))??;
         Ok::<_, String>((table, input_metrics))
     })();
     let (table, input_metrics) = match post_write {
@@ -514,8 +497,6 @@ pub(crate) fn execute_whole_table_rewrite_with_metrics_for_target(
     }))??;
 
     invalidate_iceberg_caches(state, &target)?;
-    let table = load_current_table(catalog.as_ref(), &table_ident, rewrite_target)?;
-    let after_metrics = block_on_iceberg(current_rewrite_live_metrics(&table, table.file_io()))??;
 
     tracing::info!(
         job_id = ?rewrite_target.job_id,
@@ -542,7 +523,6 @@ pub(crate) fn execute_whole_table_rewrite_with_metrics_for_target(
     Ok(WholeTableRewriteResult {
         optimize_outcome,
         before_metrics: input_metrics,
-        after_metrics,
     })
 }
 
@@ -592,58 +572,6 @@ fn validate_base_snapshot(
         ));
     }
     Ok(())
-}
-
-async fn current_rewrite_live_metrics(
-    table: &Table,
-    file_io: &FileIO,
-) -> Result<WholeTableRewriteLiveMetrics, String> {
-    let mut metrics = WholeTableRewriteLiveMetrics::default();
-    let metadata = table.metadata();
-    let Some(snapshot) = metadata.current_snapshot() else {
-        return Ok(metrics);
-    };
-    let manifest_list = snapshot
-        .load_manifest_list(file_io, metadata)
-        .await
-        .map_err(|e| format!("load manifest list failed: {e}"))?;
-
-    for manifest_file in manifest_list.entries() {
-        let manifest = manifest_file
-            .load_manifest(file_io)
-            .await
-            .map_err(|e| format!("load manifest {} failed: {e}", manifest_file.manifest_path))?;
-        for entry in manifest.entries() {
-            if !entry.is_alive() {
-                continue;
-            }
-            let file_size = i64::try_from(entry.data_file().file_size_in_bytes())
-                .map_err(|_| "live rewrite file size overflow".to_string())?;
-            match manifest_file.content {
-                ManifestContentType::Data => {
-                    metrics.data_files = metrics
-                        .data_files
-                        .checked_add(1)
-                        .ok_or_else(|| "live rewrite data file count overflow".to_string())?;
-                    metrics.data_bytes = metrics
-                        .data_bytes
-                        .checked_add(file_size)
-                        .ok_or_else(|| "live rewrite data file bytes overflow".to_string())?;
-                }
-                ManifestContentType::Deletes => {
-                    metrics.delete_files = metrics
-                        .delete_files
-                        .checked_add(1)
-                        .ok_or_else(|| "live rewrite delete file count overflow".to_string())?;
-                    metrics.delete_bytes = metrics
-                        .delete_bytes
-                        .checked_add(file_size)
-                        .ok_or_else(|| "live rewrite delete file bytes overflow".to_string())?;
-                }
-            }
-        }
-    }
-    Ok(metrics)
 }
 
 fn chunk_row_count(chunks: &[crate::exec::chunk::Chunk]) -> Result<i64, String> {
