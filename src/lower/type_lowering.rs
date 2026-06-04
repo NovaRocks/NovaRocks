@@ -323,4 +323,28 @@ mod tests {
             Some(DataType::Decimal128(27, 9))
         );
     }
+
+    #[test]
+    fn datetime_desc_without_time_unit_defaults_to_microsecond() {
+        use arrow::datatypes::TimeUnit;
+        // An FE-style descriptor never sets time_unit; it must stay microsecond.
+        let desc = TTypeDesc {
+            types: Some(vec![TTypeNode {
+                type_: TTypeNodeType::SCALAR,
+                scalar_type: Some(TScalarType {
+                    type_: TPrimitiveType::DATETIME,
+                    len: None,
+                    precision: None,
+                    scale: None,
+                    time_unit: None,
+                }),
+                is_named: None,
+                struct_fields: None,
+            }]),
+        };
+        assert_eq!(
+            arrow_type_from_desc(&desc),
+            Some(DataType::Timestamp(TimeUnit::Microsecond, None))
+        );
+    }
 }
