@@ -37,6 +37,7 @@ pub(crate) mod backend_resolver;
 pub(crate) mod catalog;
 pub(crate) mod dictionary;
 pub(crate) mod iceberg_ctas;
+pub(crate) mod iceberg_maintenance;
 pub(crate) mod iceberg_ref_flow;
 pub(crate) mod information_schema;
 pub(crate) mod insert;
