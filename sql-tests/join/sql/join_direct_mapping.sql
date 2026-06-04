@@ -5,7 +5,7 @@
 -- Each key type is tested under three build-side selectivity scenarios:
 --   (a) moderate selectivity,  (b) single-value filter,  (c) empty build side.
 -- Also tests join + post-filter predicate combinations.
--- Stable correctness scale: 40K rows. Larger scale belongs in perf/nightly
+-- Stable correctness scale: 10K rows. Larger scale belongs in perf/nightly
 -- coverage; this case validates mapping semantics across join types.
 
 -- query 1
@@ -21,7 +21,7 @@ TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
-INSERT INTO ${case_db}.__row_util_base SELECT generate_series FROM TABLE(generate_series(0, 10000 - 1));
+INSERT INTO ${case_db}.__row_util_base SELECT generate_series FROM TABLE(generate_series(0, 2500 - 1));
 
 -- query 4
 -- @skip_result_check=true

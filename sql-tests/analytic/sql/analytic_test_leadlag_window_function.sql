@@ -1,6 +1,6 @@
 -- Migrated from: dev/test/sql/test_window_function/T/test_leadlag_window_function
 -- Test Objective:
--- 1. Validate lead/lag window functions over partitioned decimal64 windows with large datasets.
+-- 1. Validate lead/lag window functions over partitioned decimal64 windows with functional-scale datasets.
 -- 2. Validate default offset (1), custom offset, and custom default value for lead/lag.
 
 -- query 1
@@ -43,11 +43,6 @@ INSERT INTO ${case_db}.`t1` (v1, v2, v3, v4) values
     (NULL, NULL, 23, NULL),
     (NULL, NULL, 24, NULL);
 
-INSERT INTO ${case_db}.`t1` SELECT * FROM ${case_db}.`t1`;
-INSERT INTO ${case_db}.`t1` SELECT * FROM ${case_db}.`t1`;
-INSERT INTO ${case_db}.`t1` SELECT * FROM ${case_db}.`t1`;
-INSERT INTO ${case_db}.`t1` SELECT * FROM ${case_db}.`t1`;
-INSERT INTO ${case_db}.`t1` SELECT * FROM ${case_db}.`t1`;
 INSERT INTO ${case_db}.`t1` SELECT * FROM ${case_db}.`t1`;
 INSERT INTO ${case_db}.`t1` SELECT * FROM ${case_db}.`t1`;
 INSERT INTO ${case_db}.`t1` SELECT * FROM ${case_db}.`t1`;

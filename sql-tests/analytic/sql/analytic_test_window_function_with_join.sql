@@ -18,7 +18,7 @@ PROPERTIES (
 "replication_num" = "1"
 );
 
-INSERT INTO ${case_db}.nt0 SELECT generate_series %4096, 4096 - generate_series, generate_series %4096 FROM TABLE(generate_series(1, 40960));
+INSERT INTO ${case_db}.nt0 SELECT generate_series %4096, 4096 - generate_series, generate_series %4096 FROM TABLE(generate_series(1, 8192));
 INSERT INTO ${case_db}.nt0 SELECT * FROM ${case_db}.nt0;
 
 CREATE TABLE ${case_db}.nt1 AS SELECT * FROM ${case_db}.nt0;

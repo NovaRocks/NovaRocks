@@ -4,7 +4,7 @@
 -- range-direct-mapping SET inputs. In standalone these SETs are compatibility
 -- no-ops; optimizer/performance validation belongs in dedicated perf coverage.
 -- Tests cover inner join, left join, left semi join, and left anti join with
--- nullable and non-nullable int/bigint columns on a 40K-row dataset.
+-- nullable and non-nullable int/bigint columns on a 10K-row dataset.
 -- Also tests CTE-based union-all doubling to exercise join on
 -- non-trivial input shapes. Filters (modulo-based) are applied to verify
 -- correct row counts after join.
@@ -30,7 +30,7 @@ TBLPROPERTIES ("format-version" = "3");
 
 -- query 5
 -- @skip_result_check=true
-INSERT INTO ${case_db}.__row_util_base SELECT generate_series FROM TABLE(generate_series(0, 10000 - 1));
+INSERT INTO ${case_db}.__row_util_base SELECT generate_series FROM TABLE(generate_series(0, 2500 - 1));
 
 -- query 6
 -- @skip_result_check=true

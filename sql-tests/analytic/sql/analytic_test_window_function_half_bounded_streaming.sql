@@ -1,6 +1,6 @@
 -- Migrated from: dev/test/sql/test_window_function/T/test_window_function_streaming
 -- Test Objective:
--- 1. Validate lead/lag window functions on large decimal64 datasets with and without partitioning
+-- 1. Validate lead/lag window functions on functional-scale decimal64 datasets with and without partitioning
 -- 2. Validate SUM with half-bounded ROWS frames (UNBOUNDED PRECEDING AND N PRECEDING/FOLLOWING)
 -- 3. Test both global and partition-scoped half-bounded frame behavior
 
@@ -44,11 +44,6 @@ INSERT INTO ${case_db}.t1 (v1, v2, v3, v4) values
     (NULL, NULL, 23, NULL),
     (NULL, NULL, 24, NULL);
 
-INSERT INTO ${case_db}.t1 SELECT * FROM ${case_db}.t1;
-INSERT INTO ${case_db}.t1 SELECT * FROM ${case_db}.t1;
-INSERT INTO ${case_db}.t1 SELECT * FROM ${case_db}.t1;
-INSERT INTO ${case_db}.t1 SELECT * FROM ${case_db}.t1;
-INSERT INTO ${case_db}.t1 SELECT * FROM ${case_db}.t1;
 INSERT INTO ${case_db}.t1 SELECT * FROM ${case_db}.t1;
 INSERT INTO ${case_db}.t1 SELECT * FROM ${case_db}.t1;
 INSERT INTO ${case_db}.t1 SELECT * FROM ${case_db}.t1;

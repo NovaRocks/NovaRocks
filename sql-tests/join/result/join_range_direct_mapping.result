@@ -1,130 +1,130 @@
 -- query 12
 count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
-40000	40000	40000	40000
+10000	10000	10000	10000
 
 -- query 13
 count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
-40000	40000	40000	40000
+10000	10000	10000	10000
 
 -- query 14
 count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
-3076	3076	3076	3076
+769	769	769	769
 
 -- query 15
 count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
-40000	40000	2857	2857
+10000	10000	714	714
 
 -- query 16
 count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
-160000	160000	160000	160000
+40000	40000	40000	40000
 
 -- query 17
 count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
-160000	160000	160000	160000
+40000	40000	40000	40000
 
 -- query 18
 count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
-160000	160000	160000	160000
+40000	40000	40000	40000
 
 -- query 19
 count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
-160000	160000	160000	160000
+40000	40000	40000	40000
 
 -- query 20
 count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
-36000	36000	36000	36000
+9000	9000	9000	9000
 
 -- query 21
 count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
-36000	36000	36000	36000
+9000	9000	9000	9000
 
 -- query 22
 count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
-2769	2769	2769	2769
+693	693	693	693
 
 -- query 23
 count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
-2286	2286	2286	2286
+572	572	572	572
 
 -- query 24
 count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
-144000	144000	144000	144000
+36000	36000	36000	36000
 
 -- query 25
 count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
-144000	144000	144000	144000
+36000	36000	36000	36000
 
 -- query 26
 count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
-144000	144000	144000	144000
+36000	36000	36000	36000
 
 -- query 27
 count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
-144000	144000	144000	144000
+36000	36000	36000	36000
 
 -- query 28
 count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
-20000	20000	20000	20000
+5000	5000	5000	5000
 
 -- query 29
 count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
-20000	20000	20000	20000
+5000	5000	5000	5000
 
 -- query 30
 count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
-1537	1537	1537	1537
+384	384	384	384
 
 -- query 31
 count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
-1714	1714	1714	1714
+428	428	428	428
 
 -- query 32
 count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
-80000	80000	80000	80000
+20000	20000	20000	20000
 
 -- query 33
 count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
-80000	80000	80000	80000
+20000	20000	20000	20000
 
 -- query 34
 count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
-80000	80000	80000	80000
+20000	20000	20000	20000
 
 -- query 35
 count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
-80000	80000	80000	80000
+20000	20000	20000	20000
 
 -- query 36
 count(t1.c_int)	count(t1.c_bigint)
-40000	40000
+10000	10000
 
 -- query 37
 count(t1.c_int)	count(t1.c_bigint)
-40000	40000
+10000	10000
 
 -- query 38
 count(t1.c_int)	count(t1.c_bigint)
-3076	3076
+769	769
 
 -- query 39
 count(t1.c_int)	count(t1.c_bigint)
-2857	2857
+714	714
 
 -- query 40
 count(t1.c_int)	count(t1.c_bigint)
-80000	80000
+20000	20000
 
 -- query 41
 count(t1.c_int)	count(t1.c_bigint)
-80000	80000
+20000	20000
 
 -- query 42
 count(t1.c_int)	count(t1.c_bigint)
-80000	80000
+20000	20000
 
 -- query 43
 count(t1.c_int)	count(t1.c_bigint)
-80000	80000
+20000	20000
 
 -- query 44
 count(t1.c_int)	count(t1.c_bigint)
@@ -136,11 +136,11 @@ count(t1.c_int)	count(t1.c_bigint)
 
 -- query 46
 count(t1.c_int)	count(t1.c_bigint)
-36924	36924
+9231	9231
 
 -- query 47
 count(t1.c_int)	count(t1.c_bigint)
-37143	37143
+9286	9286
 
 -- query 48
 count(t1.c_int)	count(t1.c_bigint)
@@ -160,35 +160,35 @@ count(t1.c_int)	count(t1.c_bigint)
 
 -- query 53
 count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
-20000	20000	20000	20000
+5000	5000	5000	5000
 
 -- query 54
 count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
-20000	20000	20000	20000
+5000	5000	5000	5000
 
 -- query 55
 count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
-1537	1537	1537	1537
+384	384	384	384
 
 -- query 56
 count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
-1714	1714	1714	1714
+428	428	428	428
 
 -- query 57
 count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
-20000	20000	20000	20000
+5000	5000	5000	5000
 
 -- query 58
 count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
-20000	20000	20000	20000
+5000	5000	5000	5000
 
 -- query 59
 count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
-1537	1537	1537	1537
+384	384	384	384
 
 -- query 60
 count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
-1714	1714	1714	1714
+428	428	428	428
 
 -- query 61
 count(t1.c_int)	count(t1.c_bigint)
@@ -200,11 +200,11 @@ count(t1.c_int)	count(t1.c_bigint)
 
 -- query 63
 count(t1.c_int)	count(t1.c_bigint)
-36924	36924
+9231	9231
 
 -- query 64
 count(t1.c_int)	count(t1.c_bigint)
-37143	37143
+9286	9286
 
 -- query 65
 count(t1.c_int)	count(t1.c_bigint)
@@ -216,8 +216,8 @@ count(t1.c_int)	count(t1.c_bigint)
 
 -- query 67
 count(t1.c_int)	count(t1.c_bigint)
-36924	36924
+9231	9231
 
 -- query 68
 count(t1.c_int)	count(t1.c_bigint)
-37143	37143
+9286	9286

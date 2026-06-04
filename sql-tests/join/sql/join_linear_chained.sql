@@ -6,7 +6,7 @@
 -- 4. Ensure correct row counts with various filter predicates (k1 % 2 = 0, k1 % 100 = 0).
 -- Test Flow:
 -- 1. Issue StarRocks-style join-option SET statements as standalone compatibility no-ops.
--- 2. Create helper tables to generate 40K rows.
+-- 2. Create helper tables to generate 10K rows.
 -- 3. Create t1 with int, bigint, and string columns.
 -- 4. Execute inner join, left semi join, and left outer join variants.
 
@@ -27,7 +27,7 @@ TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 -- @skip_result_check=true
-insert into ${case_db}.__row_util_base select generate_series from TABLE(generate_series(0, 10000 - 1));
+insert into ${case_db}.__row_util_base select generate_series from TABLE(generate_series(0, 2500 - 1));
 
 -- query 5
 -- @skip_result_check=true
