@@ -45,10 +45,6 @@ use super::retry::commit_with_retry;
 pub struct RewritePositionDeleteOptions {
     pub rewrite_all: bool,
     pub min_input_files: usize,
-    /// Parsed for Spark compatibility. The first implementation records this
-    /// option but does not split Puffin output by target size; each candidate
-    /// referenced-data-file group is written as one merged DV.
-    pub target_file_size_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -64,15 +60,15 @@ impl RewritePositionDeleteOptions {
         let mut out = Self {
             rewrite_all: false,
             min_input_files: 2,
-            target_file_size_bytes: None,
         };
         for (key, value) in values {
             match key.as_str() {
                 "rewrite-all" => out.rewrite_all = parse_bool_option(key, value)?,
                 "min-input-files" => out.min_input_files = parse_usize_option(key, value)?,
-                "target-file-size-bytes" => {
-                    out.target_file_size_bytes = Some(parse_u64_option(key, value)?)
-                }
+                "target-file-size-bytes" => return Err(
+                    "rewrite_position_delete_files option `target-file-size-bytes` is not implemented in NovaRocks yet"
+                        .to_string(),
+                ),
                 other => {
                     return Err(format!(
                         "unsupported rewrite_position_delete_files option `{other}`"
@@ -289,10 +285,45 @@ async fn plan_rewrite(
     let mut data_manifests = Vec::new();
     let mut delete_manifests = Vec::new();
     let mut groups: BTreeMap<String, Vec<LiveDeleteEntry>> = BTreeMap::new();
+    let mut live_data_files = HashMap::new();
 
     for mf in manifests {
         match mf.content {
-            ManifestContentType::Data => data_manifests.push(mf.clone()),
+            ManifestContentType::Data => {
+                let manifest = mf
+                    .load_manifest(file_io)
+                    .await
+                    .map_err(|e| format!("load data manifest {} failed: {e}", mf.manifest_path))?;
+                for entry in manifest.entries() {
+                    if !entry.is_alive() {
+                        continue;
+                    }
+                    let data_file = entry.data_file().clone();
+                    if data_file.content_type() != DataContentType::Data {
+                        return Err(format!(
+                            "rewrite_position_delete_files found {:?} file {} inside a data manifest",
+                            data_file.content_type(),
+                            data_file.file_path()
+                        ));
+                    }
+                    let path = data_file.file_path().to_string();
+                    if live_data_files
+                        .insert(
+                            path.clone(),
+                            LiveDataEntry {
+                                data_file,
+                                partition_spec_id: mf.partition_spec_id,
+                            },
+                        )
+                        .is_some()
+                    {
+                        return Err(format!(
+                            "rewrite_position_delete_files found duplicate live data file `{path}` in the current snapshot"
+                        ));
+                    }
+                }
+                data_manifests.push(mf.clone());
+            }
             ManifestContentType::Deletes => {
                 let manifest = mf.load_manifest(file_io).await.map_err(|e| {
                     format!("load delete manifest {} failed: {e}", mf.manifest_path)
@@ -337,6 +368,7 @@ async fn plan_rewrite(
             candidate_groups.insert(group.referenced_data_file.clone(), group);
         }
     }
+    validate_candidate_groups_against_live_data(&candidate_groups, &live_data_files)?;
 
     let mut untouched_manifests = data_manifests;
     let mut existing_entries = Vec::new();
@@ -388,6 +420,12 @@ struct LiveDeleteEntry {
     sequence_number: i64,
     file_sequence_number: Option<i64>,
     rewrite_ref: Option<PuffinDeleteRef>,
+}
+
+#[derive(Clone, Debug)]
+struct LiveDataEntry {
+    data_file: DataFile,
+    partition_spec_id: i32,
 }
 
 #[derive(Debug)]
@@ -450,6 +488,37 @@ impl CandidateGroup {
             sequence_number,
         })
     }
+}
+
+fn validate_candidate_groups_against_live_data(
+    groups: &BTreeMap<String, CandidateGroup>,
+    live_data_files: &HashMap<String, LiveDataEntry>,
+) -> Result<(), String> {
+    for group in groups.values() {
+        let live = live_data_files
+            .get(&group.referenced_data_file)
+            .ok_or_else(|| {
+                format!(
+                    "rewrite_position_delete_files candidate Puffin DV group references non-live data file `{}`",
+                    group.referenced_data_file
+                )
+            })?;
+        if group.partition_spec_id != live.partition_spec_id {
+            return Err(format!(
+                "rewrite_position_delete_files candidate Puffin DV group for `{}` has partition spec id {}, but live data file uses partition spec id {}",
+                group.referenced_data_file, group.partition_spec_id, live.partition_spec_id
+            ));
+        }
+        if group.partition != *live.data_file.partition() {
+            return Err(format!(
+                "rewrite_position_delete_files candidate Puffin DV group for `{}` has partition tuple {:?}, but live data file uses partition tuple {:?}",
+                group.referenced_data_file,
+                group.partition,
+                live.data_file.partition()
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -817,18 +886,6 @@ fn parse_usize_option(key: &str, value: &str) -> Result<usize, String> {
     Ok(parsed)
 }
 
-fn parse_u64_option(key: &str, value: &str) -> Result<u64, String> {
-    let parsed = value.parse::<u64>().map_err(|_| {
-        format!("rewrite_position_delete_files option `{key}` must be a positive integer")
-    })?;
-    if parsed == 0 {
-        return Err(format!(
-            "rewrite_position_delete_files option `{key}` must be >= 1"
-        ));
-    }
-    Ok(parsed)
-}
-
 fn to_iceberg_unexpected(s: String) -> iceberg::Error {
     iceberg::Error::new(iceberg::ErrorKind::Unexpected, s)
 }
@@ -836,6 +893,7 @@ fn to_iceberg_unexpected(s: String) -> iceberg::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeMap, HashMap};
 
     #[test]
     fn options_default_min_input_files_is_two() {
@@ -843,6 +901,17 @@ mod tests {
             RewritePositionDeleteOptions::from_map(&std::collections::BTreeMap::new()).unwrap();
         assert!(!options.rewrite_all);
         assert_eq!(options.min_input_files, 2);
+    }
+
+    #[test]
+    fn options_reject_target_file_size_bytes_until_splitting_is_implemented() {
+        let options = BTreeMap::from([(
+            "target-file-size-bytes".to_string(),
+            "134217728".to_string(),
+        )]);
+        let err = RewritePositionDeleteOptions::from_map(&options).unwrap_err();
+        assert!(err.contains("target-file-size-bytes"));
+        assert!(err.contains("not implemented"));
     }
 
     #[test]
@@ -868,5 +937,128 @@ mod tests {
             .unwrap();
         let err = classify_delete_file_for_rewrite(&file).unwrap_err();
         assert!(err.contains("V2 Parquet position delete rewrite is not supported"));
+    }
+
+    #[test]
+    fn candidate_metadata_validation_rejects_dangling_referenced_data_file() {
+        let referenced = "file:///tmp/data.parquet";
+        let groups = BTreeMap::from([(
+            referenced.to_string(),
+            test_candidate_group(referenced, 0, iceberg::spec::Struct::empty()),
+        )]);
+
+        let err = validate_candidate_groups_against_live_data(&groups, &HashMap::new())
+            .expect_err("dangling referenced data file must be rejected");
+
+        assert!(err.contains("references non-live data file"));
+        assert!(err.contains(referenced));
+    }
+
+    #[test]
+    fn candidate_metadata_validation_rejects_partition_spec_mismatch() {
+        let referenced = "file:///tmp/data.parquet";
+        let groups = BTreeMap::from([(
+            referenced.to_string(),
+            test_candidate_group(referenced, 0, iceberg::spec::Struct::empty()),
+        )]);
+        let live = HashMap::from([(
+            referenced.to_string(),
+            test_live_data_entry(referenced, 7, iceberg::spec::Struct::empty()),
+        )]);
+
+        let err = validate_candidate_groups_against_live_data(&groups, &live)
+            .expect_err("partition spec mismatch must be rejected");
+
+        assert!(err.contains("partition spec"));
+        assert!(err.contains(referenced));
+    }
+
+    #[test]
+    fn candidate_metadata_validation_rejects_partition_tuple_mismatch() {
+        let referenced = "file:///tmp/data.parquet";
+        let groups = BTreeMap::from([(
+            referenced.to_string(),
+            test_candidate_group(referenced, 0, test_partition(1)),
+        )]);
+        let live = HashMap::from([(
+            referenced.to_string(),
+            test_live_data_entry(referenced, 0, test_partition(2)),
+        )]);
+
+        let err = validate_candidate_groups_against_live_data(&groups, &live)
+            .expect_err("partition tuple mismatch must be rejected");
+
+        assert!(err.contains("partition tuple"));
+        assert!(err.contains(referenced));
+    }
+
+    fn test_candidate_group(
+        referenced_data_file: &str,
+        partition_spec_id: i32,
+        partition: iceberg::spec::Struct,
+    ) -> CandidateGroup {
+        CandidateGroup::new(
+            referenced_data_file.to_string(),
+            vec![test_live_delete_entry(
+                referenced_data_file,
+                partition_spec_id,
+                partition,
+            )],
+        )
+        .unwrap()
+    }
+
+    fn test_live_delete_entry(
+        referenced_data_file: &str,
+        partition_spec_id: i32,
+        partition: iceberg::spec::Struct,
+    ) -> LiveDeleteEntry {
+        let data_file = iceberg::spec::DataFileBuilder::default()
+            .content(iceberg::spec::DataContentType::PositionDeletes)
+            .file_path(format!("file:///tmp/delete-{partition_spec_id}.puffin"))
+            .file_format(iceberg::spec::DataFileFormat::Puffin)
+            .partition(partition)
+            .partition_spec_id(partition_spec_id)
+            .record_count(1)
+            .file_size_in_bytes(64)
+            .referenced_data_file(Some(referenced_data_file.to_string()))
+            .content_offset(Some(4))
+            .content_size_in_bytes(Some(32))
+            .build()
+            .unwrap();
+        let rewrite_ref = classify_delete_file_for_rewrite(&data_file).unwrap();
+        LiveDeleteEntry {
+            data_file,
+            partition_spec_id,
+            snapshot_id: 10,
+            sequence_number: 11,
+            file_sequence_number: Some(12),
+            rewrite_ref,
+        }
+    }
+
+    fn test_live_data_entry(
+        path: &str,
+        partition_spec_id: i32,
+        partition: iceberg::spec::Struct,
+    ) -> LiveDataEntry {
+        let data_file = iceberg::spec::DataFileBuilder::default()
+            .content(iceberg::spec::DataContentType::Data)
+            .file_path(path.to_string())
+            .file_format(iceberg::spec::DataFileFormat::Parquet)
+            .partition(partition)
+            .partition_spec_id(partition_spec_id)
+            .record_count(1)
+            .file_size_in_bytes(128)
+            .build()
+            .unwrap();
+        LiveDataEntry {
+            data_file,
+            partition_spec_id,
+        }
+    }
+
+    fn test_partition(value: i32) -> iceberg::spec::Struct {
+        iceberg::spec::Struct::from_iter([Some(iceberg::spec::Literal::int(value))])
     }
 }
