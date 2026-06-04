@@ -38,9 +38,19 @@ SELECT id, CAST(ts AS STRING) AS s
   ORDER BY id;
 
 -- query 5
+-- Nanosecond range predicate pushdown: count rows where ts > '2024-01-02 03:04:05.000000001'.
+-- Row 1 has ts = .123456789 (passes), row 2 has ts = .000000001 (boundary, excluded by >),
+-- row 3 is epoch (excluded). Correct nanosecond semantics yield COUNT=1.
+-- If the predicate bound were rounded to microseconds (.000000), rows 1 and 2 would
+-- both pass (COUNT=2), proving the nanosecond path is exercised.
+SELECT COUNT(*) AS cnt
+  FROM iceberg_rest_${suite_uuid0}.iceberg_rest_tsns_db_${uuid0}.t_tsns_${uuid0}
+  WHERE ts > '2024-01-02 03:04:05.000000001';
+
+-- query 6
 -- @skip_result_check=true
 DROP TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_tsns_db_${uuid0}.t_tsns_${uuid0};
 
--- query 6
+-- query 7
 -- @skip_result_check=true
 DROP DATABASE iceberg_rest_${suite_uuid0}.iceberg_rest_tsns_db_${uuid0};
