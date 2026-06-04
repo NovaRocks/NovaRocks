@@ -499,9 +499,8 @@ fn cast_numeric_to_timestamp_array(
                 .and_then(datetime_literal_to_naive_datetime)
                 .map(|dt| {
                     dt.and_utc().timestamp_nanos_opt().ok_or_else(|| {
-                        format!(
-                            "CAST failed: numeric datetime literal is out of nanosecond i64 range"
-                        )
+                        "CAST failed: numeric datetime literal is out of nanosecond i64 range"
+                            .to_string()
                     })
                 })
                 .transpose()?;
@@ -827,13 +826,14 @@ fn cast_utf8_to_timestamp_array(
     // precision. Going through a microsecond intermediate would silently truncate
     // the last 3 significant digits (e.g. '...05.000000001' → '...05.000000').
     if matches!(target_type, DataType::Timestamp(TimeUnit::Nanosecond, _)) {
-        let nanos_vec: Vec<Option<i64>> = (0..arr.len())
-            .map(|row| {
-                if arr.is_null(row) {
-                    Ok(None)
-                } else {
-                    let dt = parse_string_to_naive_datetime(arr.value(row));
-                    match dt {
+        let nanos_vec: Vec<Option<i64>> =
+            (0..arr.len())
+                .map(|row| {
+                    if arr.is_null(row) {
+                        Ok(None)
+                    } else {
+                        let dt = parse_string_to_naive_datetime(arr.value(row));
+                        match dt {
                         None => Ok(None),
                         Some(dt) => dt.and_utc().timestamp_nanos_opt().ok_or_else(|| {
                             format!(
@@ -842,9 +842,9 @@ fn cast_utf8_to_timestamp_array(
                             )
                         }).map(Some),
                     }
-                }
-            })
-            .collect::<Result<_, String>>()?;
+                    }
+                })
+                .collect::<Result<_, String>>()?;
         return Ok(Arc::new(TimestampNanosecondArray::from(nanos_vec)) as ArrayRef);
     }
 
@@ -4510,8 +4510,9 @@ mod tests {
     fn cast_nanos_to_micros_truncates() {
         // 1_000_000_789 ns = 1_000_789 us + 789 ns sub-microsecond remainder.
         // Truncation toward zero: 1_000_000_789 / 1000 = 1_000_000 us (integer division).
-        let src =
-            Arc::new(TimestampNanosecondArray::from(vec![Some(1_000_000_789_i64)])) as ArrayRef;
+        let src = Arc::new(TimestampNanosecondArray::from(vec![Some(
+            1_000_000_789_i64,
+        )])) as ArrayRef;
         let out = cast_with_special_rules(&src, &DataType::Timestamp(TimeUnit::Microsecond, None))
             .unwrap();
         let a = out
@@ -4523,8 +4524,7 @@ mod tests {
 
     #[test]
     fn cast_micros_to_nanos_widens_in_range() {
-        let src =
-            Arc::new(TimestampMicrosecondArray::from(vec![Some(1_000_i64)])) as ArrayRef;
+        let src = Arc::new(TimestampMicrosecondArray::from(vec![Some(1_000_i64)])) as ArrayRef;
         let out = cast_with_special_rules(&src, &DataType::Timestamp(TimeUnit::Nanosecond, None))
             .unwrap();
         let a = out
@@ -4537,8 +4537,7 @@ mod tests {
     #[test]
     fn cast_micros_to_nanos_overflow_errors() {
         // i64::MAX / 2 microseconds * 1000 overflows i64.
-        let src =
-            Arc::new(TimestampMicrosecondArray::from(vec![Some(i64::MAX / 2)])) as ArrayRef;
+        let src = Arc::new(TimestampMicrosecondArray::from(vec![Some(i64::MAX / 2)])) as ArrayRef;
         let r = cast_with_special_rules(&src, &DataType::Timestamp(TimeUnit::Nanosecond, None));
         assert!(r.is_err(), "expected overflow error but got {:?}", r);
     }
@@ -4546,8 +4545,9 @@ mod tests {
     #[test]
     fn cast_utf8_to_nanos_keeps_nanoseconds() {
         // The string has 9 fractional digits; sub-microsecond digits must survive.
-        let src =
-            Arc::new(StringArray::from(vec![Some("2024-01-02 03:04:05.123456789")])) as ArrayRef;
+        let src = Arc::new(StringArray::from(vec![Some(
+            "2024-01-02 03:04:05.123456789",
+        )])) as ArrayRef;
         let out = cast_with_special_rules(&src, &DataType::Timestamp(TimeUnit::Nanosecond, None))
             .unwrap();
         let a = out

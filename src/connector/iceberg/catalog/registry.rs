@@ -2132,9 +2132,7 @@ fn build_literal_array(
                     .iter()
                     .map(|literal| match literal {
                         Literal::Null => Ok(None),
-                        Literal::String(value) => {
-                            parse_datetime_string_to_nanos(value).map(Some)
-                        }
+                        Literal::String(value) => parse_datetime_string_to_nanos(value).map(Some),
                         Literal::Date(value) => parse_datetime_string_to_nanos(value).map(Some),
                         other => Err(format!("literal {:?} is not valid for TIMESTAMP_NS", other)),
                     })

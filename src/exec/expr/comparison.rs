@@ -2107,11 +2107,11 @@ mod tests {
         .timestamp_nanos_opt()
         .unwrap();
 
-        let ns_array =
-            Arc::new(TimestampNanosecondArray::from(vec![Some(ts_val)])) as ArrayRef;
+        let ns_array = Arc::new(TimestampNanosecondArray::from(vec![Some(ts_val)])) as ArrayRef;
         // The literal is the same timestamp as a string.
-        let lit_array = Arc::new(StringArray::from(vec![Some("2024-01-02 03:04:05.000000001")]))
-            as ArrayRef;
+        let lit_array = Arc::new(StringArray::from(vec![Some(
+            "2024-01-02 03:04:05.000000001",
+        )])) as ArrayRef;
 
         // normalize_comparison_types should coerce the string to nanoseconds.
         let (left, right) = normalize_comparison_types(ns_array, lit_array).unwrap();

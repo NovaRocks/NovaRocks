@@ -201,9 +201,7 @@ fn validate_transform(
             if !matches!(
                 source_type,
                 Type::Primitive(
-                    PrimitiveType::Date
-                        | PrimitiveType::Timestamp
-                        | PrimitiveType::Timestamptz
+                    PrimitiveType::Date | PrimitiveType::Timestamp | PrimitiveType::Timestamptz
                 )
             ) {
                 return Err(format!(

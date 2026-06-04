@@ -3299,14 +3299,20 @@ mod tests {
     fn timestamp_ns_type_name_parses_to_datetimens() {
         use super::parse_modifier_to_sql_type;
         use crate::sql::parser::ast::SqlType;
-        assert_eq!(parse_modifier_to_sql_type("timestamp_ns"), Ok(SqlType::DateTimeNs));
-        assert_eq!(parse_modifier_to_sql_type("timestamptz_ns"), Ok(SqlType::DateTimeNs));
+        assert_eq!(
+            parse_modifier_to_sql_type("timestamp_ns"),
+            Ok(SqlType::DateTimeNs)
+        );
+        assert_eq!(
+            parse_modifier_to_sql_type("timestamptz_ns"),
+            Ok(SqlType::DateTimeNs)
+        );
     }
 
     #[test]
     fn datetimens_maps_to_nanosecond_arrow() {
-        use arrow::datatypes::{DataType, TimeUnit};
         use crate::sql::parser::ast::SqlType;
+        use arrow::datatypes::{DataType, TimeUnit};
         assert_eq!(
             crate::engine::sql_expr::sql_type_to_arrow_type(&SqlType::DateTimeNs),
             Ok(DataType::Timestamp(TimeUnit::Nanosecond, None))

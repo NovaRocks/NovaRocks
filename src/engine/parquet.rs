@@ -141,23 +141,20 @@ pub(crate) fn parse_datetime_string_to_nanos(s: &str) -> Result<i64, String> {
     let s = s.trim();
     // Try datetime first, then date-only
     if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
-        return dt
-            .and_utc()
-            .timestamp_nanos_opt()
-            .ok_or_else(|| format!("DATETIME literal '{s}' out of nanosecond representable range"));
+        return dt.and_utc().timestamp_nanos_opt().ok_or_else(|| {
+            format!("DATETIME literal '{s}' out of nanosecond representable range")
+        });
     }
     if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
-        return dt
-            .and_utc()
-            .timestamp_nanos_opt()
-            .ok_or_else(|| format!("DATETIME literal '{s}' out of nanosecond representable range"));
+        return dt.and_utc().timestamp_nanos_opt().ok_or_else(|| {
+            format!("DATETIME literal '{s}' out of nanosecond representable range")
+        });
     }
     if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
         let dt = d.and_hms_opt(0, 0, 0).expect("midnight");
-        return dt
-            .and_utc()
-            .timestamp_nanos_opt()
-            .ok_or_else(|| format!("DATETIME literal '{s}' out of nanosecond representable range"));
+        return dt.and_utc().timestamp_nanos_opt().ok_or_else(|| {
+            format!("DATETIME literal '{s}' out of nanosecond representable range")
+        });
     }
     Err(format!("invalid datetime literal `{s}`"))
 }

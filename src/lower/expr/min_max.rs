@@ -26,8 +26,8 @@ use crate::lower::expr::literals::{
 };
 use crate::lower::layout::Layout;
 use crate::lower::type_lowering::{
-    arrow_type_from_desc, arrow_type_from_primitive, primitive_type_from_node,
-    THRIFT_TIME_UNIT_NANOS,
+    THRIFT_TIME_UNIT_NANOS, arrow_type_from_desc, arrow_type_from_primitive,
+    primitive_type_from_node,
 };
 use crate::types;
 

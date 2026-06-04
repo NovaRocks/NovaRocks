@@ -193,8 +193,8 @@ mod tests {
 
     #[test]
     fn timestamp_unit_roundtrips_through_thrift_desc() {
-        use arrow::datatypes::{DataType, TimeUnit};
         use crate::lower::type_lowering::arrow_type_from_desc;
+        use arrow::datatypes::{DataType, TimeUnit};
 
         // microsecond stays microsecond (FE-compat default)
         let micro = DataType::Timestamp(TimeUnit::Microsecond, None);

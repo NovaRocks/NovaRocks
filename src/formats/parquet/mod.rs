@@ -2950,9 +2950,8 @@ mod tests {
     fn nanosecond_timestamp_maps_to_iceberg_timestamp_ns() {
         use arrow::datatypes::{DataType, TimeUnit};
         use iceberg::spec::{PrimitiveType, Type};
-        let t =
-            super::arrow_type_to_iceberg_type(&DataType::Timestamp(TimeUnit::Nanosecond, None))
-                .unwrap();
+        let t = super::arrow_type_to_iceberg_type(&DataType::Timestamp(TimeUnit::Nanosecond, None))
+            .unwrap();
         assert!(matches!(t, Type::Primitive(PrimitiveType::TimestampNs)));
     }
 }
