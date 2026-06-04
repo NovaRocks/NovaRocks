@@ -127,6 +127,32 @@ impl NovaRocksGrpcRemoteClient {
         })?
     }
 
+    pub fn blocking_report_exec_status(
+        &self,
+        req: proto::novarocks::ReportExecStatusRequest,
+    ) -> Result<proto::novarocks::ReportExecStatusResponse, String> {
+        let mut cli = self.make_client()?;
+        data_block_on(async move {
+            cli.report_exec_status(req)
+                .await
+                .map(|r| r.into_inner())
+                .map_err(|e| format!("report_exec_status rpc failed: {e}"))
+        })?
+    }
+
+    pub fn blocking_batch_report_exec_status(
+        &self,
+        req: proto::novarocks::BatchReportExecStatusRequest,
+    ) -> Result<proto::novarocks::BatchReportExecStatusResponse, String> {
+        let mut cli = self.make_client()?;
+        data_block_on(async move {
+            cli.batch_report_exec_status(req)
+                .await
+                .map(|r| r.into_inner())
+                .map_err(|e| format!("batch_report_exec_status rpc failed: {e}"))
+        })?
+    }
+
     pub async fn cancel_fragment_async(
         &self,
         req: proto::novarocks::CancelFragmentRequest,

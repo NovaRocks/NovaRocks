@@ -374,6 +374,77 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
             proto::novarocks::CancelFragmentResponse { status_code: 0 },
         ))
     }
+
+    async fn report_exec_status(
+        &self,
+        request: tonic::Request<proto::novarocks::ReportExecStatusRequest>,
+    ) -> Result<tonic::Response<proto::novarocks::ReportExecStatusResponse>, tonic::Status> {
+        let bytes = request.into_inner().report_exec_status_params_thrift;
+        let result = tokio::task::spawn_blocking(move || {
+            let params: crate::frontend_service::TReportExecStatusParams =
+                crate::common::thrift::thrift_binary_deserialize(&bytes).map_err(|e| {
+                    format!("failed to deserialize TReportExecStatusParams thrift: {e}")
+                })?;
+            crate::runtime::write_coordinator::handle_report_exec_status(params)?;
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|e| {
+            tonic::Status::internal(format!("report_exec_status handler panicked: {e}"))
+        })?;
+
+        match result {
+            Ok(()) => Ok(tonic::Response::new(
+                proto::novarocks::ReportExecStatusResponse {
+                    status_code: 0,
+                    message: String::new(),
+                },
+            )),
+            Err(e) => Ok(tonic::Response::new(
+                proto::novarocks::ReportExecStatusResponse {
+                    status_code: 1,
+                    message: e,
+                },
+            )),
+        }
+    }
+
+    async fn batch_report_exec_status(
+        &self,
+        request: tonic::Request<proto::novarocks::BatchReportExecStatusRequest>,
+    ) -> Result<tonic::Response<proto::novarocks::BatchReportExecStatusResponse>, tonic::Status>
+    {
+        let payloads = request.into_inner().report_exec_status_params_thrift;
+        let result = tokio::task::spawn_blocking(move || {
+            for bytes in payloads {
+                let params: crate::frontend_service::TReportExecStatusParams =
+                    crate::common::thrift::thrift_binary_deserialize(&bytes).map_err(|e| {
+                        format!("failed to deserialize TReportExecStatusParams thrift: {e}")
+                    })?;
+                crate::runtime::write_coordinator::handle_report_exec_status(params)?;
+            }
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|e| {
+            tonic::Status::internal(format!("batch_report_exec_status handler panicked: {e}"))
+        })?;
+
+        match result {
+            Ok(()) => Ok(tonic::Response::new(
+                proto::novarocks::BatchReportExecStatusResponse {
+                    status_code: 0,
+                    message: String::new(),
+                },
+            )),
+            Err(e) => Ok(tonic::Response::new(
+                proto::novarocks::BatchReportExecStatusResponse {
+                    status_code: 1,
+                    message: e,
+                },
+            )),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1039,9 +1110,47 @@ mod pr3_tests {
     use super::proto::novarocks::fetch_result_response::Status as FetchStatus;
     use super::proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc as _;
     use super::proto::novarocks::{
-        CancelFragmentRequest, FetchResultRequest, PUniqueId, SubmitFragmentRequest,
+        CancelFragmentRequest, FetchResultRequest, PUniqueId, ReportExecStatusRequest,
+        SubmitFragmentRequest,
     };
+    use crate::common::thrift::thrift_binary_serialize;
+    use crate::{frontend_service, status, status_code, types};
     use tonic::Request;
+
+    fn ok_report_params(
+        query: types::TUniqueId,
+        finst: types::TUniqueId,
+    ) -> frontend_service::TReportExecStatusParams {
+        frontend_service::TReportExecStatusParams::new(
+            frontend_service::FrontendServiceVersion::V1,
+            Some(query),
+            Some(0),
+            Some(finst),
+            Some(status::TStatus::new(status_code::TStatusCode::OK, None)),
+            Some(true),
+            None,
+            Option::<Vec<String>>::None,
+            Option::<Vec<String>>::None,
+            None,
+            None,
+            Option::<Vec<String>>::None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
 
     #[tokio::test]
     async fn submit_fragment_thrift_decode_error_returns_business_error() {
@@ -1074,6 +1183,50 @@ mod pr3_tests {
         });
         let resp2 = svc.cancel_fragment(req2).await.expect("RPC success");
         assert_eq!(resp2.into_inner().status_code, 0);
+    }
+
+    #[tokio::test]
+    async fn report_exec_status_bad_thrift_returns_business_error() {
+        let svc = GrpcService::default();
+        let req = Request::new(ReportExecStatusRequest {
+            report_exec_status_params_thrift: vec![0xff, 0xff, 0xff],
+        });
+        let resp = svc
+            .report_exec_status(req)
+            .await
+            .expect("RPC level success");
+        let body = resp.into_inner();
+        assert_ne!(body.status_code, 0);
+        assert!(body.message.contains("deserialize") || body.message.contains("thrift"));
+    }
+
+    #[tokio::test]
+    async fn report_exec_status_updates_registered_write_coordinator() {
+        crate::runtime::write_coordinator::test_clear_registry();
+        let query = types::TUniqueId::new(701, 801);
+        let finst = types::TUniqueId::new(702, 802);
+        crate::runtime::write_coordinator::register_query(
+            query.clone(),
+            vec![crate::runtime::write_coordinator::WriterKey {
+                query_id: query.clone(),
+                fragment_instance_id: finst.clone(),
+                backend_num: 0,
+            }],
+        )
+        .expect("register write coordinator");
+        let bytes = thrift_binary_serialize(&ok_report_params(query.clone(), finst))
+            .expect("serialize report params");
+        let svc = GrpcService::default();
+        let req = Request::new(ReportExecStatusRequest {
+            report_exec_status_params_thrift: bytes,
+        });
+        let resp = svc
+            .report_exec_status(req)
+            .await
+            .expect("RPC level success");
+        let body = resp.into_inner();
+        assert_eq!(body.status_code, 0, "{}", body.message);
+        crate::runtime::write_coordinator::unregister_query(&query);
     }
 
     #[tokio::test]

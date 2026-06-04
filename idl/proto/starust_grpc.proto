@@ -16,6 +16,12 @@ service NovaRocksGrpc {
   rpc SubmitFragment(SubmitFragmentRequest) returns (SubmitFragmentResponse);
   rpc FetchResult(FetchResultRequest) returns (FetchResultResponse);
   rpc CancelFragment(CancelFragmentRequest) returns (CancelFragmentResponse);
+
+  // IW-4 distributed write coordinator report RPCs.
+  rpc ReportExecStatus(ReportExecStatusRequest)
+      returns (ReportExecStatusResponse);
+  rpc BatchReportExecStatus(BatchReportExecStatusRequest)
+      returns (BatchReportExecStatusResponse);
 }
 
 message ExchangeRequest {
@@ -76,4 +82,22 @@ message CancelFragmentRequest {
 
 message CancelFragmentResponse {
   int32 status_code = 1;
+}
+
+message ReportExecStatusRequest {
+  bytes report_exec_status_params_thrift = 1;
+}
+
+message ReportExecStatusResponse {
+  int32 status_code = 1;
+  string message = 2;
+}
+
+message BatchReportExecStatusRequest {
+  repeated bytes report_exec_status_params_thrift = 1;
+}
+
+message BatchReportExecStatusResponse {
+  int32 status_code = 1;
+  string message = 2;
 }

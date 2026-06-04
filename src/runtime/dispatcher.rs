@@ -889,8 +889,10 @@ mod tests {
     use proto::novarocks::fetch_result_response::Status as FetchStatus;
     use proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc;
     use proto::novarocks::{
-        CancelFragmentRequest, ExchangeRequest, ExchangeResponse, FetchResultRequest,
-        FetchResultResponse, SubmitFragmentRequest, SubmitFragmentResponse,
+        BatchReportExecStatusRequest, BatchReportExecStatusResponse, CancelFragmentRequest,
+        ExchangeRequest, ExchangeResponse, FetchResultRequest, FetchResultResponse,
+        ReportExecStatusRequest, ReportExecStatusResponse, SubmitFragmentRequest,
+        SubmitFragmentResponse,
     };
     use proto::starrocks::{
         PLookUpRequest, PLookUpResponse, PTransmitRuntimeFilterParams, PTransmitRuntimeFilterResult,
@@ -1042,6 +1044,8 @@ mod tests {
         fetch_batch: Mutex<Vec<u8>>,
         cancel_count: AtomicUsize,
         cancel_delay_ms: AtomicU64,
+        report_status_code: AtomicI32,
+        report_message: Mutex<String>,
     }
 
     impl Default for MockState {
@@ -1052,6 +1056,8 @@ mod tests {
                 fetch_batch: Mutex::new(Vec::new()),
                 cancel_count: AtomicUsize::new(0),
                 cancel_delay_ms: AtomicU64::new(0),
+                report_status_code: AtomicI32::new(0),
+                report_message: Mutex::new(String::new()),
             }
         }
     }
@@ -1123,6 +1129,36 @@ mod tests {
                 status_code: 0,
             }))
         }
+
+        async fn report_exec_status(
+            &self,
+            _request: Request<ReportExecStatusRequest>,
+        ) -> Result<Response<ReportExecStatusResponse>, Status> {
+            Ok(Response::new(ReportExecStatusResponse {
+                status_code: self.0.report_status_code.load(Ordering::SeqCst),
+                message: self
+                    .0
+                    .report_message
+                    .lock()
+                    .expect("report message lock")
+                    .clone(),
+            }))
+        }
+
+        async fn batch_report_exec_status(
+            &self,
+            _request: Request<BatchReportExecStatusRequest>,
+        ) -> Result<Response<BatchReportExecStatusResponse>, Status> {
+            Ok(Response::new(BatchReportExecStatusResponse {
+                status_code: self.0.report_status_code.load(Ordering::SeqCst),
+                message: self
+                    .0
+                    .report_message
+                    .lock()
+                    .expect("report message lock")
+                    .clone(),
+            }))
+        }
     }
 
     fn spawn_mock_server(state: Arc<MockState>) -> std::net::SocketAddr {
@@ -1175,6 +1211,25 @@ mod tests {
             .expect_err("nonzero submit status should error");
 
         assert!(err.contains("submit failed"));
+    }
+
+    #[test]
+    fn grpc_client_report_exec_status_preserves_business_error() {
+        let state = Arc::new(MockState::default());
+        state.report_status_code.store(7, Ordering::SeqCst);
+        *state.report_message.lock().expect("report message lock") = "report failed".to_string();
+        let addr = spawn_mock_server(Arc::clone(&state));
+        let client =
+            NovaRocksGrpcRemoteClient::connect_blocking(addr).expect("construct grpc client");
+
+        let resp = client
+            .blocking_report_exec_status(ReportExecStatusRequest {
+                report_exec_status_params_thrift: vec![0xff],
+            })
+            .expect("RPC level success");
+
+        assert_ne!(resp.status_code, 0);
+        assert!(!resp.message.is_empty());
     }
 
     #[test]
