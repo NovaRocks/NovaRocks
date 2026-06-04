@@ -1188,6 +1188,10 @@ pub fn submit_exec_batch_plan_fragments(thrift_bytes: &[u8]) -> Result<usize, St
             .coord
             .as_ref()
             .or_else(|| common.and_then(|c| c.coord.as_ref()));
+        let novarocks_report_addr = one
+            .novarocks_report_addr
+            .clone()
+            .or_else(|| common.and_then(|c| c.novarocks_report_addr.clone()));
         let backend_num = one
             .backend_num
             .or_else(|| common.and_then(|c| c.backend_num));
@@ -1281,7 +1285,19 @@ pub fn submit_exec_batch_plan_fragments(thrift_bytes: &[u8]) -> Result<usize, St
         } else {
             None
         };
-        if let (Some(coord), Some(backend_num)) = (coord.cloned(), backend_num) {
+        if let (Some(report_addr), Some(backend_num)) = (novarocks_report_addr, backend_num) {
+            fe_report::register_novarocks_instance(
+                finst_id,
+                query_id,
+                report_addr,
+                backend_num,
+                enable_profile,
+                profiler.clone(),
+                Some(Arc::clone(&fragment_mem_tracker)),
+                Some(Arc::clone(&query_mem_tracker)),
+                report_interval_ns,
+            );
+        } else if let (Some(coord), Some(backend_num)) = (coord.cloned(), backend_num) {
             fe_report::register_instance(
                 finst_id,
                 query_id,
@@ -1297,7 +1313,7 @@ pub fn submit_exec_batch_plan_fragments(thrift_bytes: &[u8]) -> Result<usize, St
             warn!(
                 target: "novarocks::report",
                 finst_id = %finst_id,
-                "missing coord/backend_num for reportExecStatus"
+                "missing report destination/backend_num for reportExecStatus"
             );
         }
         mgr.with_context_mut(query_id, |ctx| {
@@ -1377,6 +1393,7 @@ pub fn submit_exec_plan_fragment(thrift_bytes: &[u8]) -> Result<(), String> {
     }
     let fragment = one.fragment.as_ref().expect("checked above");
     let coord = one.coord.as_ref();
+    let novarocks_report_addr = one.novarocks_report_addr.clone();
     let backend_num = one.backend_num;
     let finst_id = UniqueId {
         hi: params.fragment_instance_id.hi,
@@ -1436,7 +1453,19 @@ pub fn submit_exec_plan_fragment(thrift_bytes: &[u8]) -> Result<(), String> {
     } else {
         None
     };
-    if let (Some(coord), Some(backend_num)) = (coord.cloned(), backend_num) {
+    if let (Some(report_addr), Some(backend_num)) = (novarocks_report_addr, backend_num) {
+        fe_report::register_novarocks_instance(
+            finst_id,
+            query_id,
+            report_addr,
+            backend_num,
+            enable_profile,
+            profiler.clone(),
+            Some(Arc::clone(&fragment_mem_tracker)),
+            Some(Arc::clone(&query_mem_tracker)),
+            report_interval_ns,
+        );
+    } else if let (Some(coord), Some(backend_num)) = (coord.cloned(), backend_num) {
         fe_report::register_instance(
             finst_id,
             query_id,
@@ -1452,7 +1481,7 @@ pub fn submit_exec_plan_fragment(thrift_bytes: &[u8]) -> Result<(), String> {
         warn!(
             target: "novarocks::report",
             finst_id = %finst_id,
-            "missing coord/backend_num for reportExecStatus"
+            "missing report destination/backend_num for reportExecStatus"
         );
     }
 

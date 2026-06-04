@@ -37,11 +37,18 @@ use crate::service::exec_state_reporter::{self, ExecStateReportTask};
 use crate::service::exec_status_report::{self, ExecStatusReportInput};
 use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
 use crate::service::report_worker;
+use crate::service::standalone_exec_state_reporter::{self, StandaloneExecStateReportTask};
 use crate::{data_cache, frontend_service, metrics, runtime_profile, status, status_code, types};
 
 #[derive(Clone, Debug)]
+enum ReportDestination {
+    StarRocksFrontend(types::TNetworkAddress),
+    NovaRocksCoordinator(types::TNetworkAddress),
+}
+
+#[derive(Clone, Debug)]
 struct ReportInstance {
-    coord: types::TNetworkAddress,
+    destination: ReportDestination,
     backend_num: i32,
     query_id: QueryId,
     enable_profile: bool,
@@ -69,13 +76,66 @@ pub(crate) fn register_instance(
     query_mem_tracker: Option<Arc<MemTracker>>,
     report_interval_ns: Option<i64>,
 ) {
+    register_instance_with_destination(
+        finst_id,
+        query_id,
+        ReportDestination::StarRocksFrontend(coord),
+        backend_num,
+        enable_profile,
+        profiler,
+        mem_tracker,
+        query_mem_tracker,
+        report_interval_ns,
+    );
+}
+
+pub(crate) fn register_novarocks_instance(
+    finst_id: UniqueId,
+    query_id: QueryId,
+    coord: types::TNetworkAddress,
+    backend_num: i32,
+    enable_profile: bool,
+    profiler: Option<Profiler>,
+    mem_tracker: Option<Arc<MemTracker>>,
+    query_mem_tracker: Option<Arc<MemTracker>>,
+    report_interval_ns: Option<i64>,
+) {
+    register_instance_with_destination(
+        finst_id,
+        query_id,
+        ReportDestination::NovaRocksCoordinator(coord),
+        backend_num,
+        enable_profile,
+        profiler,
+        mem_tracker,
+        query_mem_tracker,
+        report_interval_ns,
+    );
+}
+
+fn register_instance_with_destination(
+    finst_id: UniqueId,
+    query_id: QueryId,
+    destination: ReportDestination,
+    backend_num: i32,
+    enable_profile: bool,
+    profiler: Option<Profiler>,
+    mem_tracker: Option<Arc<MemTracker>>,
+    query_mem_tracker: Option<Arc<MemTracker>>,
+    report_interval_ns: Option<i64>,
+) {
     report_worker::ensure_started();
-    exec_state_reporter::ensure_started();
+    match &destination {
+        ReportDestination::StarRocksFrontend(_) => exec_state_reporter::ensure_started(),
+        ReportDestination::NovaRocksCoordinator(_) => {
+            standalone_exec_state_reporter::ensure_started()
+        }
+    }
     let mut guard = registry().lock().expect("report registry lock");
     guard.insert(
         finst_id,
         ReportInstance {
-            coord,
+            destination,
             backend_num,
             query_id,
             enable_profile,
@@ -113,6 +173,10 @@ pub(crate) fn list_report_instances() -> Vec<(UniqueId, ReportInstanceSnapshot)>
 pub(crate) fn mark_fe_query_gone(finst_id: UniqueId) {
     if let Ok(mut guard) = registry().lock()
         && let Some(instance) = guard.get_mut(&finst_id)
+        && matches!(
+            instance.destination,
+            ReportDestination::StarRocksFrontend(_)
+        )
     {
         instance.fe_query_gone = true;
     }
@@ -166,12 +230,24 @@ pub(crate) fn report_fragment_done(finst_id: UniqueId, error: Option<String>) {
         load_channel_profile: None,
         load_datacache_metrics,
     });
-    enqueue_final_report(ExecStateReportTask {
-        finst_id,
-        query_id: instance.query_id,
-        coord: instance.coord.clone(),
-        params,
-    });
+    match instance.destination {
+        ReportDestination::StarRocksFrontend(coord) => {
+            enqueue_final_report(ExecStateReportTask {
+                finst_id,
+                query_id: instance.query_id,
+                coord,
+                params,
+            });
+        }
+        ReportDestination::NovaRocksCoordinator(coord) => {
+            enqueue_standalone_final_report(StandaloneExecStateReportTask {
+                finst_id,
+                query_id: instance.query_id,
+                coord,
+                params,
+            });
+        }
+    }
     sink_commit::unregister(finst_id);
 }
 
@@ -216,12 +292,25 @@ pub(crate) fn report_exec_state(finst_id: UniqueId) {
         load_channel_profile: None,
         load_datacache_metrics,
     });
-    if let Err(e) = exec_state_reporter::enqueue_non_final(ExecStateReportTask {
-        finst_id,
-        query_id: instance.query_id,
-        coord: instance.coord.clone(),
-        params,
-    }) {
+    let enqueue_result = match instance.destination {
+        ReportDestination::StarRocksFrontend(coord) => {
+            enqueue_non_final_report(ExecStateReportTask {
+                finst_id,
+                query_id: instance.query_id,
+                coord,
+                params,
+            })
+        }
+        ReportDestination::NovaRocksCoordinator(coord) => {
+            enqueue_standalone_non_final_report(StandaloneExecStateReportTask {
+                finst_id,
+                query_id: instance.query_id,
+                coord,
+                params,
+            })
+        }
+    };
+    if let Err(e) = enqueue_result {
         warn!(
             target: "novarocks::report",
             finst_id = %finst_id,
@@ -263,6 +352,33 @@ fn enqueue_final_report(task: ExecStateReportTask) {
     }
 
     exec_state_reporter::enqueue_final(task);
+}
+
+fn enqueue_non_final_report(task: ExecStateReportTask) -> Result<(), String> {
+    #[cfg(test)]
+    if test_capture_non_final_report(&task) {
+        return Ok(());
+    }
+
+    exec_state_reporter::enqueue_non_final(task)
+}
+
+fn enqueue_standalone_final_report(task: StandaloneExecStateReportTask) {
+    #[cfg(test)]
+    if test_capture_standalone_final_report(&task) {
+        return;
+    }
+
+    standalone_exec_state_reporter::enqueue_final(task);
+}
+
+fn enqueue_standalone_non_final_report(task: StandaloneExecStateReportTask) -> Result<(), String> {
+    #[cfg(test)]
+    if test_capture_standalone_non_final_report(&task) {
+        return Ok(());
+    }
+
+    standalone_exec_state_reporter::enqueue_non_final(task)
 }
 
 fn build_tracking_url(query_id: QueryId) -> Option<String> {
@@ -512,7 +628,10 @@ pub(crate) fn test_insert_report_instance(finst_id: UniqueId, query_id: QueryId)
     guard.insert(
         finst_id,
         ReportInstance {
-            coord: types::TNetworkAddress::new("127.0.0.1".to_string(), 0),
+            destination: ReportDestination::StarRocksFrontend(types::TNetworkAddress::new(
+                "127.0.0.1".to_string(),
+                0,
+            )),
             backend_num: 1,
             query_id,
             enable_profile: false,
@@ -549,6 +668,14 @@ pub(crate) fn test_report_registry_lock() -> &'static Mutex<()> {
 
 #[cfg(test)]
 type FinalReportHook = Box<dyn Fn(&ExecStateReportTask) + Send + Sync + 'static>;
+#[cfg(test)]
+type NonFinalReportHook = Box<dyn Fn(&ExecStateReportTask) + Send + Sync + 'static>;
+#[cfg(test)]
+type StandaloneFinalReportHook =
+    Box<dyn Fn(&StandaloneExecStateReportTask) + Send + Sync + 'static>;
+#[cfg(test)]
+type StandaloneNonFinalReportHook =
+    Box<dyn Fn(&StandaloneExecStateReportTask) + Send + Sync + 'static>;
 
 #[cfg(test)]
 fn test_final_report_hook() -> &'static Mutex<Option<FinalReportHook>> {
@@ -557,10 +684,49 @@ fn test_final_report_hook() -> &'static Mutex<Option<FinalReportHook>> {
 }
 
 #[cfg(test)]
+fn test_non_final_report_hook() -> &'static Mutex<Option<NonFinalReportHook>> {
+    static HOOK: OnceLock<Mutex<Option<NonFinalReportHook>>> = OnceLock::new();
+    HOOK.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn test_standalone_final_report_hook() -> &'static Mutex<Option<StandaloneFinalReportHook>> {
+    static HOOK: OnceLock<Mutex<Option<StandaloneFinalReportHook>>> = OnceLock::new();
+    HOOK.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn test_standalone_non_final_report_hook() -> &'static Mutex<Option<StandaloneNonFinalReportHook>> {
+    static HOOK: OnceLock<Mutex<Option<StandaloneNonFinalReportHook>>> = OnceLock::new();
+    HOOK.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
 fn test_set_final_report_hook(hook: Option<FinalReportHook>) {
     *test_final_report_hook()
         .lock()
         .expect("final report hook lock") = hook;
+}
+
+#[cfg(test)]
+fn test_set_non_final_report_hook(hook: Option<NonFinalReportHook>) {
+    *test_non_final_report_hook()
+        .lock()
+        .expect("non-final report hook lock") = hook;
+}
+
+#[cfg(test)]
+fn test_set_standalone_final_report_hook(hook: Option<StandaloneFinalReportHook>) {
+    *test_standalone_final_report_hook()
+        .lock()
+        .expect("standalone final report hook lock") = hook;
+}
+
+#[cfg(test)]
+fn test_set_standalone_non_final_report_hook(hook: Option<StandaloneNonFinalReportHook>) {
+    *test_standalone_non_final_report_hook()
+        .lock()
+        .expect("standalone non-final report hook lock") = hook;
 }
 
 #[cfg(test)]
@@ -576,19 +742,55 @@ fn test_capture_final_report(task: &ExecStateReportTask) -> bool {
 }
 
 #[cfg(test)]
+fn test_capture_non_final_report(task: &ExecStateReportTask) -> bool {
+    let guard = test_non_final_report_hook()
+        .lock()
+        .expect("non-final report hook lock");
+    let Some(hook) = guard.as_ref() else {
+        return false;
+    };
+    hook(task);
+    true
+}
+
+#[cfg(test)]
+fn test_capture_standalone_final_report(task: &StandaloneExecStateReportTask) -> bool {
+    let guard = test_standalone_final_report_hook()
+        .lock()
+        .expect("standalone final report hook lock");
+    let Some(hook) = guard.as_ref() else {
+        return false;
+    };
+    hook(task);
+    true
+}
+
+#[cfg(test)]
+fn test_capture_standalone_non_final_report(task: &StandaloneExecStateReportTask) -> bool {
+    let guard = test_standalone_non_final_report_hook()
+        .lock()
+        .expect("standalone non-final report hook lock");
+    let Some(hook) = guard.as_ref() else {
+        return false;
+    };
+    hook(task);
+    true
+}
+
+#[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{
-        is_query_gone_status, mark_fe_query_gone, report_fragment_done,
-        test_insert_report_instance, test_reset_report_registry,
+        is_query_gone_status, mark_fe_query_gone, register_novarocks_instance, report_exec_state,
+        report_fragment_done, test_insert_report_instance, test_reset_report_registry,
     };
     use crate::common::types::UniqueId;
     use crate::frontend_service;
     use crate::runtime::load_tracking;
     use crate::runtime::query_context::QueryId;
     use crate::service::exec_state_reporter;
-    use crate::{status, status_code};
+    use crate::{status, status_code, types};
 
     #[test]
     fn query_gone_status_is_treated_as_benign() {
@@ -627,21 +829,58 @@ mod tests {
         test_reset_report_registry();
     }
 
-    struct FinalReportHookGuard;
+    struct ReportHookGuard;
 
-    impl Drop for FinalReportHookGuard {
+    impl Drop for ReportHookGuard {
         fn drop(&mut self) {
             super::test_set_final_report_hook(None);
+            super::test_set_non_final_report_hook(None);
+            super::test_set_standalone_final_report_hook(None);
+            super::test_set_standalone_non_final_report_hook(None);
         }
     }
 
     fn capture_final_report(
         captured: Arc<Mutex<Option<frontend_service::TReportExecStatusParams>>>,
-    ) -> FinalReportHookGuard {
+    ) -> ReportHookGuard {
         super::test_set_final_report_hook(Some(Box::new(move |task| {
             *captured.lock().expect("capture final report params") = Some(task.params.clone());
         })));
-        FinalReportHookGuard
+        super::test_set_standalone_final_report_hook(Some(Box::new(|_| {
+            panic!("standalone final reporter should not receive FE report");
+        })));
+        ReportHookGuard
+    }
+
+    type CapturedReport = Option<(
+        types::TNetworkAddress,
+        frontend_service::TReportExecStatusParams,
+    )>;
+
+    fn capture_standalone_final_report(captured: Arc<Mutex<CapturedReport>>) -> ReportHookGuard {
+        super::test_set_final_report_hook(Some(Box::new(|_| {
+            panic!("FE final reporter should not receive standalone report");
+        })));
+        super::test_set_standalone_final_report_hook(Some(Box::new(move |task| {
+            *captured.lock().expect("capture standalone final report") =
+                Some((task.coord.clone(), task.params.clone()));
+        })));
+        ReportHookGuard
+    }
+
+    fn capture_standalone_non_final_report(
+        captured: Arc<Mutex<CapturedReport>>,
+    ) -> ReportHookGuard {
+        super::test_set_non_final_report_hook(Some(Box::new(|_| {
+            panic!("FE non-final reporter should not receive standalone report");
+        })));
+        super::test_set_standalone_non_final_report_hook(Some(Box::new(move |task| {
+            *captured
+                .lock()
+                .expect("capture standalone non-final report") =
+                Some((task.coord.clone(), task.params.clone()));
+        })));
+        ReportHookGuard
     }
 
     #[test]
@@ -670,6 +909,88 @@ mod tests {
         assert_eq!(
             params.tracking_url.as_deref(),
             Some("http://127.0.0.1:8040/api/_load_tracking/61/62")
+        );
+        test_reset_report_registry();
+    }
+
+    #[test]
+    fn standalone_fragment_done_routes_final_report_to_standalone_reporter() {
+        let _guard = super::test_report_registry_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let finst_id = UniqueId { hi: 71, lo: 72 };
+        let query_id = QueryId { hi: 81, lo: 82 };
+        let report_addr = types::TNetworkAddress::new("127.0.0.1".to_string(), 18040);
+        let captured = Arc::new(Mutex::new(None));
+        let _hook = capture_standalone_final_report(Arc::clone(&captured));
+
+        test_reset_report_registry();
+        register_novarocks_instance(
+            finst_id,
+            query_id,
+            report_addr.clone(),
+            3,
+            false,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        report_fragment_done(finst_id, None);
+
+        let (coord, params) = captured
+            .lock()
+            .expect("inspect standalone final report")
+            .clone()
+            .expect("standalone final report was captured");
+        assert_eq!(coord, report_addr);
+        assert_eq!(params.done, Some(true));
+        assert_eq!(params.backend_num, Some(3));
+        assert_eq!(
+            params.fragment_instance_id,
+            Some(types::TUniqueId::new(71, 72))
+        );
+        test_reset_report_registry();
+    }
+
+    #[test]
+    fn standalone_report_exec_state_routes_non_final_report_to_standalone_reporter() {
+        let _guard = super::test_report_registry_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let finst_id = UniqueId { hi: 73, lo: 74 };
+        let query_id = QueryId { hi: 83, lo: 84 };
+        let report_addr = types::TNetworkAddress::new("127.0.0.1".to_string(), 18041);
+        let captured = Arc::new(Mutex::new(None));
+        let _hook = capture_standalone_non_final_report(Arc::clone(&captured));
+
+        test_reset_report_registry();
+        register_novarocks_instance(
+            finst_id,
+            query_id,
+            report_addr.clone(),
+            4,
+            false,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        report_exec_state(finst_id);
+
+        let (coord, params) = captured
+            .lock()
+            .expect("inspect standalone non-final report")
+            .clone()
+            .expect("standalone non-final report was captured");
+        assert_eq!(coord, report_addr);
+        assert_eq!(params.done, Some(false));
+        assert_eq!(params.backend_num, Some(4));
+        assert_eq!(
+            params.fragment_instance_id,
+            Some(types::TUniqueId::new(73, 74))
         );
         test_reset_report_registry();
     }
