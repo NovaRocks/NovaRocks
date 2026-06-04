@@ -1640,18 +1640,65 @@ pub fn cancel(finst_id: UniqueId) {
     }
 }
 
+pub(crate) fn mark_query_failed_from_report(query_id: QueryId, finst_id: UniqueId, error: String) {
+    let mgr = query_context_manager();
+    let mut finsts = mgr.cancel_query(query_id, error.clone());
+    if !finsts.contains(&finst_id) {
+        finsts.push(finst_id);
+    }
+    for id in finsts {
+        result_buffer::close_error(id, error.clone());
+        exchange::cancel_fragment(id.hi, id.lo);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::validate_internal_addresses;
+    use super::{mark_query_failed_from_report, validate_internal_addresses};
     use crate::{
+        common::types::UniqueId,
         data_sinks, descriptors, exprs, internal_service, partitions, plan_nodes, planner,
+        runtime::{
+            query_context::{QueryId, query_context_manager},
+            result_buffer::{self, FetchErrorKind, TryFetchResult},
+        },
         runtime_filter, types,
     };
 
     fn unique_id(hi: i64, lo: i64) -> types::TUniqueId {
         types::TUniqueId::new(hi, lo)
+    }
+
+    #[test]
+    fn report_failure_closes_unregistered_finst_buffer() {
+        let query_id = QueryId { hi: 7001, lo: 7002 };
+        let finst_id = UniqueId { hi: 7003, lo: 7004 };
+        let error = "standalone final reportExecStatus failed: coordinator unreachable".to_string();
+
+        result_buffer::create_sender(finst_id);
+        let mgr = query_context_manager();
+        mgr.register_finst(finst_id, query_id);
+        mgr.unregister_finst(finst_id);
+
+        mark_query_failed_from_report(query_id, finst_id, error);
+
+        let TryFetchResult::Error(err) = result_buffer::try_fetch(finst_id) else {
+            panic!("final report failure must be observable through result_buffer");
+        };
+        assert!(matches!(err.kind, FetchErrorKind::Failed));
+        assert!(
+            err.message
+                .contains("standalone final reportExecStatus failed"),
+            "{}",
+            err.message
+        );
+        assert!(
+            err.message.contains("coordinator unreachable"),
+            "{}",
+            err.message
+        );
     }
 
     fn address(host: &str, port: i32) -> types::TNetworkAddress {

@@ -185,12 +185,10 @@ fn run_priority_worker(reporter: &'static StandaloneExecStateReporter) {
             send_once,
             std::thread::sleep,
         ) {
-            error!(
-                target: "novarocks::report",
-                finst_id = %task.finst_id,
-                query_id = %task.query_id,
-                error = %err,
-                "standalone final reportExecStatus exhausted retries"
+            handle_final_report_exhaustion_with(
+                task,
+                err,
+                crate::service::internal_service::mark_query_failed_from_report,
             );
         }
     }
@@ -287,6 +285,27 @@ where
     Err(last_error)
 }
 
+fn handle_final_report_exhaustion_with<F>(
+    task: StandaloneExecStateReportTask,
+    err: String,
+    mark_failed: F,
+) where
+    F: FnOnce(QueryId, UniqueId, String),
+{
+    error!(
+        target: "novarocks::report",
+        finst_id = %task.finst_id,
+        query_id = %task.query_id,
+        error = %err,
+        "standalone final reportExecStatus exhausted retries"
+    );
+    mark_failed(
+        task.query_id,
+        task.finst_id,
+        format!("standalone final reportExecStatus failed: {err}"),
+    );
+}
+
 fn backoff_for_attempt(attempt: usize) -> Duration {
     let shift = attempt.saturating_sub(1).min(10);
     Duration::from_millis(100 * (1u64 << shift))
@@ -346,6 +365,32 @@ mod tests {
             *sleeps.lock().expect("sleep record"),
             vec![Duration::from_millis(100)]
         );
+    }
+
+    #[test]
+    fn final_report_failure_records_fragment_error() {
+        let task = test_task();
+        let expected_query_id = task.query_id;
+        let expected_finst_id = task.finst_id;
+        let mut captured = None;
+
+        handle_final_report_exhaustion_with(
+            task,
+            "coordinator unreachable".to_string(),
+            |query_id, finst_id, error| {
+                captured = Some((query_id, finst_id, error));
+            },
+        );
+
+        let (query_id, finst_id, error) =
+            captured.expect("final report failure must mark query failed");
+        assert_eq!(query_id, expected_query_id);
+        assert_eq!(finst_id, expected_finst_id);
+        assert!(
+            error.contains("standalone final reportExecStatus failed"),
+            "{error}"
+        );
+        assert!(error.contains("coordinator unreachable"), "{error}");
     }
 
     #[test]
