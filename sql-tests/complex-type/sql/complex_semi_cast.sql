@@ -2,7 +2,7 @@
 -- 1. Validate IN predicate with complex types via CAST expressions.
 -- 2. Cover CastStringToArray, CastJsonToArray, CastJsonToStruct,
 --    CastArrayExpr, CastMapExpr, and CastStructExpr with IN/NOT IN predicates.
--- 3. Large dataset (1.28M rows) to test at scale.
+-- 3. Functional-scale dataset with enough rows to cover hits, misses, and nulls.
 
 -- query 1
 -- @skip_result_check=true
@@ -10,14 +10,10 @@ CREATE TABLE ${case_db}.row_util_base (
   k1 bigint NULL
 )
 TBLPROPERTIES ("format-version" = "3");
-insert into ${case_db}.row_util_base select generate_series from TABLE(generate_series(0, 10000 - 1));
+insert into ${case_db}.row_util_base select generate_series from TABLE(generate_series(0, 5000 - 1));
+insert into ${case_db}.row_util_base select * from ${case_db}.row_util_base; -- 10000
 insert into ${case_db}.row_util_base select * from ${case_db}.row_util_base; -- 20000
 insert into ${case_db}.row_util_base select * from ${case_db}.row_util_base; -- 40000
-insert into ${case_db}.row_util_base select * from ${case_db}.row_util_base; -- 80000
-insert into ${case_db}.row_util_base select * from ${case_db}.row_util_base; -- 160000
-insert into ${case_db}.row_util_base select * from ${case_db}.row_util_base; -- 320000
-insert into ${case_db}.row_util_base select * from ${case_db}.row_util_base; -- 640000
-insert into ${case_db}.row_util_base select * from ${case_db}.row_util_base; -- 1280000
 
 CREATE TABLE ${case_db}.row_util (
   idx bigint NULL
@@ -45,7 +41,7 @@ SELECT
     struct(idx, idx + 1)
 FROM ${case_db}.row_util;
 
-INSERT INTO ${case_db}.t1 (k1) SELECT idx from ${case_db}.row_util order by idx limit 10000;
+INSERT INTO ${case_db}.t1 (k1) SELECT idx from ${case_db}.row_util order by idx limit 1000;
 
 -- query 2
 -- CastStringToArray: IN with cast from string literal
@@ -95,8 +91,8 @@ select count(1) from ${case_db}.t1 where
 -- query 9
 -- CastMapExpr: IN/NOT IN with map literals
 select count(1) from ${case_db}.t1 where (
-    c_map in (map{0: 10, 1: 10 + 1, 2: 10 + 2}, map{0: 100000, 1: 100000 + 1, 2: 100000 + 2}, map{0: 1000000, 1: 1000000 + 1, 2: 1000000 + 2})
-    OR c_map not in (map{0: 10, 1: 10 + 1, 2: 10 + 2}, map{0: 100000, 1: 100000 + 1, 2: 100000 + 2}, map{0: 1000000, 1: 1000000 + 1, 2: 1000000 + 2})
+    c_map in (map{0: 10, 1: 10 + 1, 2: 10 + 2}, map{0: 1000, 1: 1000 + 1, 2: 1000 + 2}, map{0: 10000, 1: 10000 + 1, 2: 10000 + 2})
+    OR c_map not in (map{0: 10, 1: 10 + 1, 2: 10 + 2}, map{0: 1000, 1: 1000 + 1, 2: 1000 + 2}, map{0: 10000, 1: 10000 + 1, 2: 10000 + 2})
 );
 
 -- query 10

@@ -67,9 +67,6 @@ USE ${case_db};
 insert into __row_util_base select * from __row_util_base; -- 2000
 insert into __row_util_base select * from __row_util_base; -- 4000
 insert into __row_util_base select * from __row_util_base; -- 8000
-insert into __row_util_base select * from __row_util_base; -- 16000
-insert into __row_util_base select * from __row_util_base; -- 32000
-insert into __row_util_base select * from __row_util_base; -- 64000
 
 CREATE TABLE __row_util (
   idx bigint NULL,

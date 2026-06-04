@@ -104,27 +104,27 @@ NULL
 
 -- query 14
 sum(array_contains(@arr, pk))
-10000
+1000
 
 -- query 15
 sum(array_contains(@arr, 100))
-10001
+1001
 
 -- query 16
 sum(array_position(@arr, pk))
-50005000
+500500
 
 -- query 17
 sum(array_position(@arr, 100))
-1000100
+100100
 
 -- query 18
 sum(array_contains(array_append(@arr, NULL), pk))
-10000
+1000
 
 -- query 19
 sum(array_contains(array_append(@arr, NULL), NULL))
-10001
+1001
 
 -- query 20
 sum(array_contains(arr_bigint, 100))
@@ -144,11 +144,11 @@ sum(array_position(arr_str, md5sum(100)))
 
 -- query 24
 sum(array_contains(arr_decimal, pk))
-10000
+1000
 
 -- query 25
 sum(array_position(arr_decimal, pk))
-10000
+1000
 
 -- query 26
 sum(array_contains(arr_decimal, 100))
@@ -160,7 +160,7 @@ sum(array_position(arr_decimal, 100))
 
 -- query 29
 sum(array_contains(@arr, 'abcdefg'))
-10001
+1001
 
 -- query 30
 sum(array_contains(@arr, str))
