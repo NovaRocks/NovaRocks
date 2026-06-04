@@ -1,0 +1,13 @@
+-- query 2
+id	user_id	amount
+1	10	100
+3	30	300
+
+-- query 3
+rewritten_delete_files_count	added_delete_files_count	rewritten_bytes_count	added_bytes_count
+1	1	510	510
+
+-- query 4
+id	user_id	amount
+1	10	100
+3	30	300

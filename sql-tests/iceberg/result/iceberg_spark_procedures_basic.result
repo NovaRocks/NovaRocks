@@ -1,0 +1,7 @@
+-- query 2
+rewritten_manifests_count	added_manifests_count
+0	0
+
+-- query 3
+rewritten_delete_files_count	added_delete_files_count	rewritten_bytes_count	added_bytes_count
+0	0	0	0
