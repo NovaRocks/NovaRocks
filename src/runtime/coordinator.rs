@@ -174,6 +174,7 @@ impl ExecutionCoordinator {
         // 4. Translate every placement into a fragment params and submit.
         // ---------------------------------------------------------------
         let pipeline_dop = crate::runtime::dispatcher::compute_pipeline_dop();
+        let novarocks_report_addr = local_coordinator_report_addr().ok();
 
         // Snapshot the per-consumer-fragment instance destinations for CTE
         // multicast sub-sinks (each consumer fans out to all of its instances).
@@ -340,7 +341,7 @@ impl ExecutionCoordinator {
                     query_options.clone(),
                     pipeline_dop,
                     Some(placement.instance_index as i32),
-                    None::<types::TNetworkAddress>,
+                    novarocks_report_addr.clone(),
                 );
 
                 if is_root {
@@ -460,6 +461,16 @@ fn backend_to_network_addr(
     Ok(types::TNetworkAddress::new(
         addr.ip().to_string(),
         addr.port() as i32,
+    ))
+}
+
+fn local_coordinator_report_addr() -> Result<types::TNetworkAddress, String> {
+    let cfg = crate::novarocks_config::config()
+        .map_err(|e| format!("cannot read coordinator config: {e}"))?;
+    let host = crate::common::network::advertise_host().unwrap_or_else(|_| cfg.server.host.clone());
+    Ok(types::TNetworkAddress::new(
+        host,
+        cfg.server.http_port as i32,
     ))
 }
 

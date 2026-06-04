@@ -302,7 +302,8 @@ fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()>
     novarocks::common::app_config::install_preloaded_config(cfg.clone());
     novarocks_logging::init_with_level(&resolve_log_filter(&cfg));
 
-    // Spec (PR-4): role=fe must NOT start a local gRPC/exchange server.
+    // Spec (IW-4): role=fe must not execute local fragments, but it still
+    // exposes the coordinator report-capable NovaRocksGrpc endpoint.
     // Use a role-specific server entry point so the closure below routes to
     // the right variant without changing dispatch_standalone_role's signature.
     let is_fe = role == novarocks::common::app_config::ClusterRole::Fe;
