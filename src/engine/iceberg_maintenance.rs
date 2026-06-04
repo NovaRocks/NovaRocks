@@ -90,6 +90,7 @@ impl MaintenanceActionRequest {
         }
         validate_supported_args(stmt.procedure.as_str(), named.keys())?;
         validate_current_task_args(stmt.procedure.as_str(), named.keys())?;
+        validate_call_request_semantics(&req)?;
         Ok(req)
     }
 }
@@ -427,14 +428,7 @@ fn validate_current_task_args<'a>(
     keys: impl IntoIterator<Item = &'a String>,
 ) -> Result<(), String> {
     let implemented = match procedure {
-        "rewrite_data_files" => &[
-            "table",
-            "strategy",
-            "sort_order",
-            "options",
-            "where",
-            "branch",
-        ][..],
+        "rewrite_data_files" => &["table", "options", "where", "branch"][..],
         "rewrite_manifests" => &["table", "use_caching", "spec_id"],
         "expire_snapshots" => &["table", "older_than", "retain_last"],
         "remove_orphan_files" => &["table", "older_than"],
@@ -447,6 +441,24 @@ fn validate_current_task_args<'a>(
                 "argument `{key}` for Iceberg system procedure `{procedure}` is not implemented in NovaRocks yet"
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_call_request_semantics(request: &MaintenanceActionRequest) -> Result<(), String> {
+    match request.kind {
+        MaintenanceActionKind::ExpireSnapshots => {
+            if request.older_than_ms.is_none() && request.retain_last.is_none() {
+                return Err("expire_snapshots requires `older_than` or `retain_last`".to_string());
+            }
+        }
+        MaintenanceActionKind::RemoveOrphanFiles => {
+            return Err(
+                "remove_orphan_files Spark procedure cannot return precise orphan file locations yet"
+                    .to_string(),
+            );
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -775,6 +787,37 @@ fn column(name: &str, data_type: DataType, nullable: bool) -> QueryResultColumn 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::procedure::parse_call_procedure_sql;
+
+    fn request_from_call(sql: &str) -> Result<MaintenanceActionRequest, String> {
+        let stmt = parse_call_procedure_sql(sql).unwrap();
+        MaintenanceActionRequest::from_call(&stmt, "db")
+    }
+
+    #[test]
+    fn expire_snapshots_requires_retention_boundary() {
+        let err =
+            request_from_call("CALL ice.system.expire_snapshots(table => 'db.t')").unwrap_err();
+        assert!(err.contains("requires `older_than` or `retain_last`"));
+    }
+
+    #[test]
+    fn rewrite_data_files_rejects_unimplemented_strategy_arg() {
+        let err = request_from_call(
+            "CALL ice.system.rewrite_data_files(table => 'db.t', strategy => 'binpack')",
+        )
+        .unwrap_err();
+        assert!(err.contains("not implemented"));
+    }
+
+    #[test]
+    fn remove_orphan_files_spark_call_rejected_until_locations_available() {
+        let err = request_from_call(
+            "CALL ice.system.remove_orphan_files(table => 'db.t', older_than => TIMESTAMP '2026-01-01 00:00:00')",
+        )
+        .unwrap_err();
+        assert!(err.contains("orphan file locations"));
+    }
 
     #[test]
     fn rewrite_position_delete_files_schema_matches_spark() {
