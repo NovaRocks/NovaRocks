@@ -1,7 +1,7 @@
 -- @sequential=true
 -- @order_sensitive=true
 -- @tags=iceberg,procedures,rewrite_position_delete_files,v3,dv
--- Repack multiple V3 Puffin deletion vectors through Spark-style CALL and
+-- Repack a V3 Puffin deletion vector through Spark-style CALL and
 -- verify the visible row set is unchanged.
 
 -- query 1

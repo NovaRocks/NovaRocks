@@ -1472,6 +1472,7 @@ mod tests {
     #[test]
     fn call_is_dispatched_to_embedded_engine() {
         let sql = "CALL ice.system.rewrite_manifests(table => 'ns.orders')";
+        assert!(!is_session_noop(sql));
         assert!(is_supported_embedded_statement(sql));
     }
 
