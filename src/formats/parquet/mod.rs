@@ -1738,6 +1738,15 @@ fn arrow_type_to_iceberg_type(
         DataType::Timestamp(TimeUnit::Microsecond, None) => {
             Type::Primitive(PrimitiveType::Timestamp)
         }
+        DataType::Timestamp(TimeUnit::Microsecond, Some(_)) => {
+            Type::Primitive(PrimitiveType::Timestamptz)
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, None) => {
+            Type::Primitive(PrimitiveType::TimestampNs)
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, Some(_)) => {
+            Type::Primitive(PrimitiveType::TimestamptzNs)
+        }
         DataType::Binary | DataType::LargeBinary => Type::Primitive(PrimitiveType::Binary),
         // List type: construct a ListType with the element type inferred from the Arrow field.
         // Field id is a placeholder (used only during empty-default JSON round-trip).
@@ -2935,5 +2944,15 @@ mod tests {
             .expect("Int32Array");
         assert_eq!(b.value(0), 99);
         assert_eq!(b.value(1), 99);
+    }
+
+    #[test]
+    fn nanosecond_timestamp_maps_to_iceberg_timestamp_ns() {
+        use arrow::datatypes::{DataType, TimeUnit};
+        use iceberg::spec::{PrimitiveType, Type};
+        let t =
+            super::arrow_type_to_iceberg_type(&DataType::Timestamp(TimeUnit::Nanosecond, None))
+                .unwrap();
+        assert!(matches!(t, Type::Primitive(PrimitiveType::TimestampNs)));
     }
 }
