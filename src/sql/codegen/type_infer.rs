@@ -117,6 +117,28 @@ fn append_arrow_type_nodes(
             ));
             Ok(())
         }
+        DataType::Timestamp(unit, _tz) => {
+            // Carry the time unit so the unitless thrift DATETIME descriptor does
+            // not collapse nanosecond to microsecond. tz is intentionally not
+            // carried (DATETIME descriptors are tz-less); the nanosecond value is
+            // preserved regardless. Microsecond keeps time_unit absent so
+            // FE-compat descriptors stay byte-identical.
+            let time_unit = crate::lower::type_lowering::thrift_time_unit_for_arrow(*unit)?;
+            let scalar = types::TScalarType::new(
+                types::TPrimitiveType::DATETIME,
+                None::<i32>,
+                None::<i32>,
+                None::<i32>,
+                time_unit,
+            );
+            nodes.push(types::TTypeNode::new(
+                types::TTypeNodeType::SCALAR,
+                scalar,
+                None,
+                None,
+            ));
+            Ok(())
+        }
         _ => {
             let primitive = arrow_type_to_primitive(data_type)?;
             nodes.extend(scalar_type_desc(primitive).types.unwrap_or_default());
@@ -164,3 +186,34 @@ pub(crate) fn arrow_type_to_primitive(
 }
 
 pub(crate) use crate::sql::types::{arithmetic_result_type_with_op, wider_type};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timestamp_unit_roundtrips_through_thrift_desc() {
+        use arrow::datatypes::{DataType, TimeUnit};
+        use crate::lower::type_lowering::arrow_type_from_desc;
+
+        // microsecond stays microsecond (FE-compat default)
+        let micro = DataType::Timestamp(TimeUnit::Microsecond, None);
+        let desc = arrow_type_to_type_desc(&micro).unwrap();
+        assert_eq!(arrow_type_from_desc(&desc), Some(micro));
+
+        // nanosecond must survive the round-trip (the bug this task fixes)
+        let nano = DataType::Timestamp(TimeUnit::Nanosecond, None);
+        let desc = arrow_type_to_type_desc(&nano).unwrap();
+        assert_eq!(
+            arrow_type_from_desc(&desc),
+            Some(DataType::Timestamp(TimeUnit::Nanosecond, None))
+        );
+    }
+
+    #[test]
+    fn unsupported_timestamp_unit_is_rejected() {
+        use arrow::datatypes::{DataType, TimeUnit};
+        let sec = DataType::Timestamp(TimeUnit::Second, None);
+        assert!(arrow_type_to_type_desc(&sec).is_err());
+    }
+}

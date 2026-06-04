@@ -22,14 +22,12 @@ use std::sync::Arc;
 /// Thrift `TScalarType.time_unit` codes for DATETIME descriptors. Absent
 /// (`None`) means microsecond so FE-compat descriptors stay byte-identical;
 /// only nanosecond is additionally produced by the standalone codegen.
-#[allow(dead_code)]
 pub(crate) const THRIFT_TIME_UNIT_MICROS: i32 = 2;
 pub(crate) const THRIFT_TIME_UNIT_NANOS: i32 = 3;
 
 /// Map an Arrow `TimeUnit` to the thrift descriptor code. Microsecond maps to
 /// `None` to preserve FE-compat byte-identical descriptors. Only Microsecond
 /// and Nanosecond are supported; other units are an explicit error.
-#[allow(dead_code)]
 pub(crate) fn thrift_time_unit_for_arrow(
     unit: arrow::datatypes::TimeUnit,
 ) -> Result<Option<i32>, String> {
@@ -152,7 +150,13 @@ pub(crate) fn arrow_type_from_nodes(
                 t if t == types::TPrimitiveType::DOUBLE => DataType::Float64,
                 t if t == types::TPrimitiveType::DATE => DataType::Date32,
                 t if t == types::TPrimitiveType::DATETIME => {
-                    DataType::Timestamp(TimeUnit::Microsecond, None)
+                    let unit = match scalar.time_unit {
+                        None => TimeUnit::Microsecond,
+                        Some(c) if c == THRIFT_TIME_UNIT_MICROS => TimeUnit::Microsecond,
+                        Some(c) if c == THRIFT_TIME_UNIT_NANOS => TimeUnit::Nanosecond,
+                        Some(_) => return None,
+                    };
+                    DataType::Timestamp(unit, None)
                 }
                 t if t == types::TPrimitiveType::TIME => DataType::Time64(TimeUnit::Microsecond),
                 t if t == types::TPrimitiveType::DECIMALV2 => {
