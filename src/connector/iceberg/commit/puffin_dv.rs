@@ -42,6 +42,14 @@ pub struct WrittenPuffinDv {
     pub file_size_in_bytes: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct DeletionVectorBlobInput {
+    pub referenced_data_file: String,
+    pub deletion_vector: DeletionVector,
+    pub snapshot_id: i64,
+    pub sequence_number: i64,
+}
+
 impl DeletionVector {
     pub fn new() -> Self {
         Self::default()
@@ -273,6 +281,109 @@ pub async fn write_single_deletion_vector_puffin(
     })
 }
 
+pub async fn write_multi_deletion_vector_puffin(
+    file_io: &iceberg::io::FileIO,
+    path: &str,
+    inputs: &[DeletionVectorBlobInput],
+) -> Result<Vec<WrittenPuffinDv>> {
+    ensure!(
+        !inputs.is_empty(),
+        "write_multi_deletion_vector_puffin requires at least one deletion vector"
+    );
+
+    let mut payloads = Vec::with_capacity(inputs.len());
+    let mut next_content_offset =
+        i64::try_from(PUFFIN_MAGIC.len()).context("puffin header is too large")?;
+    for input in inputs {
+        let payload = input.deletion_vector.to_iceberg_payload()?;
+        let content_size_in_bytes =
+            i64::try_from(payload.len()).context("deletion vector payload is too large")?;
+        let content_offset = next_content_offset;
+        next_content_offset = next_content_offset
+            .checked_add(content_size_in_bytes)
+            .context("Puffin deletion vector payload offsets overflow i64")?;
+        payloads.push((payload, content_offset, content_size_in_bytes));
+    }
+
+    let blobs: Vec<_> = inputs
+        .iter()
+        .zip(&payloads)
+        .map(|(input, (_, content_offset, content_size_in_bytes))| {
+            json!({
+                "type": "deletion-vector-v1",
+                "fields": [],
+                "snapshot-id": input.snapshot_id,
+                "sequence-number": input.sequence_number,
+                "offset": *content_offset,
+                "length": *content_size_in_bytes,
+                "properties": {
+                    "referenced-data-file": input.referenced_data_file,
+                    "cardinality": input.deletion_vector.cardinality().to_string(),
+                }
+            })
+        })
+        .collect();
+    let footer = json!({
+        "blobs": blobs,
+        "properties": {
+            "created-by": "NovaRocks",
+        }
+    });
+    let footer_json =
+        serde_json::to_vec(&footer).context("failed to serialize Puffin footer metadata")?;
+    let footer_json_len =
+        u32::try_from(footer_json.len()).context("Puffin footer metadata is too large")?;
+
+    let payload_size = payloads.iter().try_fold(0usize, |acc, (payload, _, _)| {
+        acc.checked_add(payload.len())
+            .context("Puffin deletion vector payloads are too large")
+    })?;
+    let file_size_in_bytes = PUFFIN_MAGIC
+        .len()
+        .checked_add(payload_size)
+        .and_then(|size| size.checked_add(PUFFIN_MAGIC.len()))
+        .and_then(|size| size.checked_add(footer_json.len()))
+        .and_then(|size| size.checked_add(size_of::<u32>()))
+        .and_then(|size| size.checked_add(4))
+        .and_then(|size| size.checked_add(PUFFIN_MAGIC.len()))
+        .context("Puffin deletion vector file is too large")?;
+    let mut file = Vec::with_capacity(file_size_in_bytes);
+    file.extend_from_slice(PUFFIN_MAGIC);
+    for (payload, _, _) in &payloads {
+        file.extend_from_slice(payload);
+    }
+    file.extend_from_slice(PUFFIN_MAGIC);
+    file.extend_from_slice(&footer_json);
+    file.extend_from_slice(&footer_json_len.to_le_bytes());
+    file.extend_from_slice(&[0u8; 4]);
+    file.extend_from_slice(PUFFIN_MAGIC);
+
+    let output = file_io
+        .new_output(path)
+        .with_context(|| format!("failed to create Puffin output file: {path}"))?;
+    output
+        .write(Bytes::from(file))
+        .await
+        .with_context(|| format!("failed to write Puffin deletion vector file: {path}"))?;
+
+    let file_size_in_bytes =
+        u64::try_from(file_size_in_bytes).context("Puffin file size does not fit in u64")?;
+    Ok(inputs
+        .iter()
+        .zip(payloads)
+        .map(
+            |(input, (_, content_offset, content_size_in_bytes))| WrittenPuffinDv {
+                path: path.to_string(),
+                referenced_data_file: input.referenced_data_file.clone(),
+                cardinality: input.deletion_vector.cardinality(),
+                content_offset,
+                content_size_in_bytes,
+                file_size_in_bytes,
+            },
+        )
+        .collect())
+}
+
 pub async fn read_deletion_vector_puffin(
     file_io: &iceberg::io::FileIO,
     path: &str,
@@ -419,6 +530,83 @@ mod tests {
         .unwrap();
 
         assert_eq!(decoded, dv);
+    }
+
+    #[tokio::test]
+    async fn multi_blob_puffin_round_trips_two_dvs() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_io = iceberg::io::FileIOBuilder::new_fs_io()
+            .with_root(dir.path().to_str().unwrap())
+            .build();
+        let path = format!("{}/multi-dv.puffin", dir.path().to_str().unwrap());
+        let mut first = DeletionVector::new();
+        first.insert(1).unwrap();
+        first.insert(9).unwrap();
+        let mut second = DeletionVector::new();
+        second.insert(3).unwrap();
+        second.insert(11).unwrap();
+
+        let written = write_multi_deletion_vector_puffin(
+            &file_io,
+            &path,
+            &[
+                DeletionVectorBlobInput {
+                    referenced_data_file: "file:///warehouse/t/data/a.parquet".to_string(),
+                    deletion_vector: first.clone(),
+                    snapshot_id: 10,
+                    sequence_number: 20,
+                },
+                DeletionVectorBlobInput {
+                    referenced_data_file: "file:///warehouse/t/data/b.parquet".to_string(),
+                    deletion_vector: second.clone(),
+                    snapshot_id: 10,
+                    sequence_number: 20,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(written.len(), 2);
+        assert_eq!(written[0].path, path);
+        assert_eq!(written[1].path, path);
+        assert_ne!(written[0].content_offset, written[1].content_offset);
+        assert_eq!(
+            read_deletion_vector_puffin(
+                &file_io,
+                &path,
+                written[0].content_offset,
+                written[0].content_size_in_bytes
+            )
+            .await
+            .unwrap(),
+            first
+        );
+        assert_eq!(
+            read_deletion_vector_puffin(
+                &file_io,
+                &path,
+                written[1].content_offset,
+                written[1].content_size_in_bytes
+            )
+            .await
+            .unwrap(),
+            second
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_blob_puffin_rejects_empty_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_io = iceberg::io::FileIOBuilder::new_fs_io()
+            .with_root(dir.path().to_str().unwrap())
+            .build();
+        let path = format!("{}/empty.puffin", dir.path().to_str().unwrap());
+        let err = write_multi_deletion_vector_puffin(&file_io, &path, &[])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("requires at least one deletion vector"));
     }
 
     #[test]
