@@ -196,6 +196,25 @@ fn connect_mysql(port: u16) -> MysqlConn {
     }
 }
 
+fn assert_fe_report_only_endpoint_rejects_local_submit(port: u16) {
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}")
+        .parse()
+        .expect("parse fe report endpoint addr");
+    let client = novarocks::service::grpc_client::NovaRocksGrpcRemoteClient::new(addr)
+        .expect("create grpc client for fe report endpoint");
+    let err = client
+        .blocking_submit_fragment(
+            novarocks::service::grpc_client::proto::novarocks::SubmitFragmentRequest {
+                exec_plan_fragment_params_thrift: vec![0xff, 0xff, 0xff],
+            },
+        )
+        .expect_err("role=fe report-only endpoint must reject local fragment submission");
+    assert!(
+        err.contains("FailedPrecondition") && err.contains("report-only"),
+        "role=fe endpoint must reject local execution RPCs as report-only: {err}"
+    );
+}
+
 struct ClusterHarness {
     be: ProcessGuard,
     _fe: ProcessGuard,
@@ -558,16 +577,9 @@ backends = ["127.0.0.1:{be_starlet_port}"]
     let mut fe = ProcessGuard::spawn(fe_config.path());
     fe.wait_for_ready("NOVAROCKS_READY mysql_port=");
 
-    // Spec (PR-4 Critical): role=fe must NOT start a local gRPC/exchange server.
-    // All fragments run on BE; FE only runs MySQL + coordinator + RemoteDispatcher.
-    // Assert that the FE's http_port is NOT listening.
-    let fe_http_addr: std::net::SocketAddr = format!("127.0.0.1:{fe_http_port}")
-        .parse()
-        .expect("parse fe http addr");
-    assert!(
-        std::net::TcpStream::connect_timeout(&fe_http_addr, Duration::from_millis(200)).is_err(),
-        "spec violation: role=fe must NOT bind local gRPC exchange server on http_port={fe_http_port}"
-    );
+    // IW-4: role=fe exposes a report-capable NovaRocksGrpc endpoint, but it
+    // must remain report-only. Local fragments still run on BE, not FE.
+    assert_fe_report_only_endpoint_rejects_local_submit(fe_http_port);
 
     let mut conn = connect_mysql(fe_mysql_port);
 
