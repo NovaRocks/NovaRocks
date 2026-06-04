@@ -22,6 +22,7 @@ pub mod disk_report;
 pub mod engine_ffi;
 pub mod exchange_sender;
 pub(crate) mod exec_state_reporter;
+pub(crate) mod exec_status_report;
 pub mod fe_report;
 pub mod frontend_rpc;
 pub mod grpc_client;

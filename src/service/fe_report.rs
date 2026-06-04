@@ -20,7 +20,7 @@
 //! pushed by BE via reportExecStatus. novarocks therefore does not expose a trigger entry point
 //! and keeps this module focused on BE-initiated reports.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::cache::DataCacheManager;
@@ -34,12 +34,10 @@ use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::QueryId;
 use crate::runtime::sink_commit;
 use crate::service::exec_state_reporter::{self, ExecStateReportTask};
+use crate::service::exec_status_report::{self, ExecStatusReportInput};
 use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
 use crate::service::report_worker;
-use crate::{
-    data_cache, frontend_service, internal_service, metrics, runtime_profile, status, status_code,
-    types,
-};
+use crate::{data_cache, frontend_service, metrics, runtime_profile, status, status_code, types};
 
 #[derive(Clone, Debug)]
 struct ReportInstance {
@@ -157,15 +155,17 @@ pub(crate) fn report_fragment_done(finst_id: UniqueId, error: Option<String>) {
         instance.query_mem_tracker.as_ref(),
     );
     let load_datacache_metrics = build_load_datacache_metrics(profile.as_ref());
-    let params = build_report_params(
-        &instance,
+    let params = exec_status_report::build_report_params(ExecStatusReportInput {
         finst_id,
+        query_id: instance.query_id,
+        backend_num: instance.backend_num,
         status,
-        true,
         profile,
-        None,
+        done: true,
+        tracking_url: build_tracking_url(instance.query_id),
+        load_channel_profile: None,
         load_datacache_metrics,
-    );
+    });
     exec_state_reporter::enqueue_final(ExecStateReportTask {
         finst_id,
         query_id: instance.query_id,
@@ -205,15 +205,17 @@ pub(crate) fn report_exec_state(finst_id: UniqueId) {
         instance.query_mem_tracker.as_ref(),
     );
     let load_datacache_metrics = build_load_datacache_metrics(profile.as_ref());
-    let params = build_report_params(
-        &instance,
+    let params = exec_status_report::build_report_params(ExecStatusReportInput {
         finst_id,
+        query_id: instance.query_id,
+        backend_num: instance.backend_num,
         status,
-        false,
         profile,
-        None,
+        done: false,
+        tracking_url: build_tracking_url(instance.query_id),
+        load_channel_profile: None,
         load_datacache_metrics,
-    );
+    });
     if let Err(e) = exec_state_reporter::enqueue_non_final(ExecStateReportTask {
         finst_id,
         query_id: instance.query_id,
@@ -252,120 +254,6 @@ pub(crate) fn fetch_query_profile(
         .and_then(|mut v| v.drain(..).next())
         .unwrap_or_default();
     Ok(payload)
-}
-
-fn build_report_params(
-    instance: &ReportInstance,
-    finst_id: UniqueId,
-    status: status::TStatus,
-    done: bool,
-    profile: Option<runtime_profile::TRuntimeProfileTree>,
-    load_channel_profile: Option<runtime_profile::TRuntimeProfileTree>,
-    load_datacache_metrics: Option<data_cache::TLoadDataCacheMetrics>,
-) -> frontend_service::TReportExecStatusParams {
-    let sink_commit_infos = sink_commit::list(finst_id);
-    let tablet_commit_infos = sink_commit::list_tablet_commit_infos(finst_id);
-    let tablet_fail_infos = sink_commit::list_tablet_fail_infos(finst_id);
-    // NOTE: FE derives loadedRows from load_counters (dpp.norm.ALL). If we only
-    // report sink/tablet commit infos without load_counters, FE may treat the
-    // insert as "no rows" and skip first-load statistics collection.
-    let state_stats = sink_commit::get_load_stats(finst_id);
-    let mut normal_rows: i64 = state_stats.loaded_rows.max(0);
-    let mut loaded_bytes: i64 = state_stats.loaded_bytes.max(0);
-    let filtered_rows: i64 = state_stats.filtered_rows.max(0);
-    for info in &sink_commit_infos {
-        if let Some(file) = info.iceberg_data_file.as_ref() {
-            if let Some(rows) = file.record_count {
-                normal_rows = normal_rows.saturating_add(rows);
-            }
-            if let Some(bytes) = file.file_size_in_bytes {
-                loaded_bytes = loaded_bytes.saturating_add(bytes);
-            }
-        }
-        if let Some(file) = info.hive_file_info.as_ref() {
-            if let Some(rows) = file.record_count {
-                normal_rows = normal_rows.saturating_add(rows);
-            }
-            if let Some(bytes) = file.file_size_in_bytes {
-                loaded_bytes = loaded_bytes.saturating_add(bytes);
-            }
-        }
-    }
-    // NOTE: Use the same counter keys FE expects (LoadEtlTask.DPP_NORMAL_ALL / DPP_ABNORMAL_ALL).
-    // Missing or mismatched keys will make FE see loadedRows=0.
-    let load_counters = if normal_rows > 0 || loaded_bytes > 0 || filtered_rows > 0 {
-        let mut counters = BTreeMap::new();
-        counters.insert("dpp.norm.ALL".to_string(), normal_rows.to_string());
-        counters.insert("dpp.abnorm.ALL".to_string(), filtered_rows.to_string());
-        if loaded_bytes > 0 {
-            counters.insert("loaded.bytes".to_string(), loaded_bytes.to_string());
-        }
-        Some(counters)
-    } else {
-        None
-    };
-    let tracking_url = build_tracking_url(instance.query_id);
-    debug!(
-        target: "novarocks::sink_commit",
-        finst_id = %finst_id,
-        backend_num = instance.backend_num,
-        query_id = %instance.query_id,
-        tablet_commit_info_len = tablet_commit_infos.len(),
-        tablet_fail_info_len = tablet_fail_infos.len(),
-        commit_info_len = sink_commit_infos.len(),
-        done = done,
-        "reportExecStatus sink/tablet commit infos"
-    );
-    let tablet_commit_infos = if tablet_commit_infos.is_empty() {
-        None
-    } else {
-        Some(tablet_commit_infos)
-    };
-    let sink_commit_infos = if sink_commit_infos.is_empty() {
-        None
-    } else {
-        Some(sink_commit_infos)
-    };
-    let tablet_fail_infos = if tablet_fail_infos.is_empty() {
-        None
-    } else {
-        Some(tablet_fail_infos)
-    };
-    frontend_service::TReportExecStatusParams::new(
-        frontend_service::FrontendServiceVersion::V1,
-        Some(types::TUniqueId {
-            hi: instance.query_id.hi,
-            lo: instance.query_id.lo,
-        }),
-        Some(instance.backend_num),
-        Some(types::TUniqueId {
-            hi: finst_id.hi,
-            lo: finst_id.lo,
-        }),
-        Some(status),
-        Some(done),
-        profile,
-        Option::<Vec<String>>::None,
-        Option::<Vec<String>>::None,
-        load_counters,
-        tracking_url,
-        Option::<Vec<String>>::None,
-        tablet_commit_infos,
-        (normal_rows > 0).then_some(normal_rows),
-        Option::<i64>::None,
-        (loaded_bytes > 0).then_some(loaded_bytes),
-        Option::<i64>::None,
-        Option::<i64>::None,
-        Option::<internal_service::TLoadJobType>::None,
-        tablet_fail_infos,
-        (filtered_rows > 0).then_some(filtered_rows),
-        Option::<i64>::None,
-        Option::<i64>::None,
-        sink_commit_infos,
-        Option::<String>::None,
-        load_channel_profile,
-        load_datacache_metrics,
-    )
 }
 
 fn build_tracking_url(query_id: QueryId) -> Option<String> {
