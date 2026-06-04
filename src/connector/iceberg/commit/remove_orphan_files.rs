@@ -55,6 +55,9 @@ pub struct RemoveOrphanOutcome {
     pub deleted_count: usize,
     /// Total files scanned across data/ and metadata/ (for informational logging).
     pub scanned_count: usize,
+    /// Physical file locations successfully deleted, sorted for deterministic
+    /// Spark procedure output.
+    pub deleted_file_locations: Vec<String>,
 }
 
 /// Top-level entry point called from `engine::iceberg_remove_orphan_files`.
@@ -164,9 +167,13 @@ pub async fn run_remove_orphan_files(
 
     // Step 5: best-effort physical delete.
     let mut deleted_count = 0;
+    let mut deleted_file_locations = Vec::new();
     for path in &candidates {
         match file_io.delete(path).await {
-            Ok(()) => deleted_count += 1,
+            Ok(()) => {
+                deleted_count += 1;
+                deleted_file_locations.push(path.clone());
+            }
             Err(e) => {
                 tracing::warn!(
                     path = %path,
@@ -176,10 +183,12 @@ pub async fn run_remove_orphan_files(
             }
         }
     }
+    deleted_file_locations.sort();
 
     Ok(RemoveOrphanOutcome {
         deleted_count,
         scanned_count,
+        deleted_file_locations,
     })
 }
 

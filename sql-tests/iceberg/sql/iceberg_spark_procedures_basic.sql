@@ -1,8 +1,8 @@
 -- @sequential=true
 -- @order_sensitive=true
 -- @tags=iceberg,procedures,spark
--- Test Spark-style Iceberg procedure CALL routing for manifest rewrite and
--- no-candidate position-delete rewrite.
+-- Test Spark-style Iceberg procedure CALL routing for supported maintenance
+-- procedures and no-candidate position-delete rewrite.
 
 -- query 1
 -- @skip_result_check=true
@@ -24,7 +24,8 @@ CREATE TABLE proc_ice_${uuid0}.ns_${uuid0}.orders (
   "format-version" = "3",
   "write.row-lineage" = "true"
 );
-INSERT INTO proc_ice_${uuid0}.ns_${uuid0}.orders VALUES (1, 10), (2, 20);
+INSERT INTO proc_ice_${uuid0}.ns_${uuid0}.orders VALUES (1, 10);
+INSERT INTO proc_ice_${uuid0}.ns_${uuid0}.orders VALUES (2, 20);
 
 -- query 2
 -- @db=proc_ice_${uuid0}.ns_${uuid0}
@@ -35,6 +36,19 @@ CALL proc_ice_${uuid0}.system.rewrite_manifests(table => 'ns_${uuid0}.orders');
 CALL proc_ice_${uuid0}.system.rewrite_position_delete_files(table => 'ns_${uuid0}.orders');
 
 -- query 4
+-- @db=proc_ice_${uuid0}.ns_${uuid0}
+CALL proc_ice_${uuid0}.system.remove_orphan_files(table => 'ns_${uuid0}.orders', older_than => TIMESTAMP '2099-01-01 00:00:00');
+
+-- query 5
+-- @db=proc_ice_${uuid0}.ns_${uuid0}
+CALL proc_ice_${uuid0}.system.expire_snapshots(table => 'ns_${uuid0}.orders', retain_last => 1);
+
+-- query 6
+-- @db=proc_ice_${uuid0}.ns_${uuid0}
+-- @skip_result_check=true
+CALL proc_ice_${uuid0}.system.rewrite_data_files(table => 'ns_${uuid0}.orders', options => map('rewrite-all', 'true'));
+
+-- query 7
 -- @skip_result_check=true
 DROP TABLE proc_ice_${uuid0}.ns_${uuid0}.orders FORCE;
 DROP DATABASE proc_ice_${uuid0}.ns_${uuid0};

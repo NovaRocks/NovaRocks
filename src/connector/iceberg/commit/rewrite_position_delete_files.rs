@@ -763,8 +763,13 @@ async fn write_repacked_dvs(
     groups: &BTreeMap<String, CandidateGroup>,
     created: &RewriteArtifacts,
 ) -> Result<Vec<WrittenCandidateDv>, String> {
-    let mut out = Vec::with_capacity(groups.len());
-    for (idx, group) in groups.values().enumerate() {
+    if groups.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut inputs = Vec::with_capacity(groups.len());
+    let mut metadata = Vec::with_capacity(groups.len());
+    for group in groups.values() {
         let mut merged = DeletionVector::new();
         for entry in &group.entries {
             let Some(puffin_ref) = &entry.rewrite_ref else {
@@ -789,28 +794,43 @@ async fn write_repacked_dvs(
             })?;
             merged.merge(&old);
         }
-        let path = format!(
-            "{table_location}/data/_staging/{commit_uuid}/rewrite-position-delete-dv-{idx}.puffin"
-        );
-        created.record_puffin(path.clone());
-        let input = DeletionVectorBlobInput {
+        inputs.push(DeletionVectorBlobInput {
             referenced_data_file: group.referenced_data_file.clone(),
             deletion_vector: merged,
-        };
-        let mut written = write_multi_deletion_vector_puffin(file_io, &path, &[input])
-            .await
-            .map_err(|e| format!("write repacked Puffin DV {path} failed: {e}"))?;
-        let written = written.pop().ok_or_else(|| {
-            format!("write repacked Puffin DV {path} returned no deletion vector")
-        })?;
-        out.push(WrittenCandidateDv {
-            written,
-            partition_spec_id: group.partition_spec_id,
-            partition: group.partition.clone(),
-            sequence_number: group.sequence_number,
         });
+        metadata.push((
+            group.partition_spec_id,
+            group.partition.clone(),
+            group.sequence_number,
+        ));
     }
-    Ok(out)
+
+    let path =
+        format!("{table_location}/data/_staging/{commit_uuid}/rewrite-position-delete-dvs.puffin");
+    created.record_puffin(path.clone());
+    let written = write_multi_deletion_vector_puffin(file_io, &path, &inputs)
+        .await
+        .map_err(|e| format!("write repacked Puffin DVs {path} failed: {e}"))?;
+    if written.len() != metadata.len() {
+        return Err(format!(
+            "write repacked Puffin DVs {path} returned {} deletion vectors for {} inputs",
+            written.len(),
+            metadata.len()
+        ));
+    }
+
+    Ok(written
+        .into_iter()
+        .zip(metadata)
+        .map(
+            |(written, (partition_spec_id, partition, sequence_number))| WrittenCandidateDv {
+                written,
+                partition_spec_id,
+                partition,
+                sequence_number,
+            },
+        )
+        .collect())
 }
 
 async fn write_existing_delete_manifest(
@@ -1023,7 +1043,11 @@ fn checked_i32(value: usize, name: &str) -> Result<i32, String> {
 }
 
 fn sum_rewritten_bytes(entries: &[LiveDeleteEntry]) -> Result<i64, String> {
+    let mut seen_paths = HashSet::new();
     entries.iter().try_fold(0_i64, |sum, entry| {
+        if !seen_paths.insert(entry.data_file.file_path()) {
+            return Ok(sum);
+        }
         let bytes = i64::try_from(entry.data_file.file_size_in_bytes())
             .map_err(|_| "rewritten delete file size overflow".to_string())?;
         sum.checked_add(bytes)
@@ -1032,7 +1056,11 @@ fn sum_rewritten_bytes(entries: &[LiveDeleteEntry]) -> Result<i64, String> {
 }
 
 fn sum_added_bytes(dvs: &[WrittenCandidateDv]) -> Result<i64, String> {
+    let mut seen_paths = HashSet::new();
     dvs.iter().try_fold(0_i64, |sum, dv| {
+        if !seen_paths.insert(dv.written.path.as_str()) {
+            return Ok(sum);
+        }
         let bytes = i64::try_from(dv.written.file_size_in_bytes)
             .map_err(|_| "added delete file size overflow".to_string())?;
         sum.checked_add(bytes)
@@ -1071,7 +1099,8 @@ fn to_iceberg_unexpected(s: String) -> iceberg::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{BTreeMap, HashMap};
+    use crate::connector::iceberg::commit::puffin_dv::write_single_deletion_vector_puffin;
+    use std::collections::{BTreeMap, HashMap, HashSet};
     use std::fs;
     use std::path::Path;
 
@@ -1423,6 +1452,166 @@ mod tests {
         assert!(artifacts.manifest_paths().is_empty());
     }
 
+    #[tokio::test]
+    async fn write_repacked_dvs_packs_multiple_candidates_into_one_puffin() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let table_location = path_string(dir.path());
+        let commit_uuid = Uuid::new_v4();
+        fs::create_dir_all(
+            dir.path()
+                .join("data")
+                .join("_staging")
+                .join(commit_uuid.to_string()),
+        )
+        .unwrap();
+
+        let data_a = path_string(&dir.path().join("data-a.parquet"));
+        let data_b = path_string(&dir.path().join("data-b.parquet"));
+        let old_a_path = path_string(&dir.path().join("old-a.puffin"));
+        let old_b_path = path_string(&dir.path().join("old-b.puffin"));
+
+        let mut old_a = DeletionVector::new();
+        old_a.insert(1).unwrap();
+        old_a.insert(9).unwrap();
+        let written_a = write_single_deletion_vector_puffin(&file_io, &old_a_path, &data_a, &old_a)
+            .await
+            .unwrap();
+
+        let mut old_b = DeletionVector::new();
+        old_b.insert(2).unwrap();
+        old_b.insert(10).unwrap();
+        let written_b = write_single_deletion_vector_puffin(&file_io, &old_b_path, &data_b, &old_b)
+            .await
+            .unwrap();
+
+        let groups = BTreeMap::from([
+            (
+                data_a.clone(),
+                CandidateGroup::new(
+                    data_a.clone(),
+                    vec![test_live_delete_entry_from_written_dv(
+                        &written_a,
+                        0,
+                        iceberg::spec::Struct::empty(),
+                        11,
+                        Some(21),
+                    )],
+                )
+                .unwrap(),
+            ),
+            (
+                data_b.clone(),
+                CandidateGroup::new(
+                    data_b.clone(),
+                    vec![test_live_delete_entry_from_written_dv(
+                        &written_b,
+                        0,
+                        iceberg::spec::Struct::empty(),
+                        12,
+                        Some(22),
+                    )],
+                )
+                .unwrap(),
+            ),
+        ]);
+        let artifacts = RewriteArtifacts::default();
+
+        let written =
+            write_repacked_dvs(&file_io, &table_location, &commit_uuid, &groups, &artifacts)
+                .await
+                .unwrap();
+
+        assert_eq!(written.len(), 2);
+        let unique_paths = written
+            .iter()
+            .map(|dv| dv.written.path.clone())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            unique_paths.len(),
+            1,
+            "multiple candidate groups should share one multi-blob Puffin"
+        );
+        assert_eq!(artifacts.puffin_paths().len(), 1);
+        assert_ne!(
+            written[0].written.content_offset,
+            written[1].written.content_offset
+        );
+        assert_eq!(
+            sum_added_bytes(&written).unwrap(),
+            i64::try_from(written[0].written.file_size_in_bytes).unwrap()
+        );
+
+        let repacked_a = written
+            .iter()
+            .find(|dv| dv.written.referenced_data_file == data_a)
+            .unwrap();
+        let read_a = read_deletion_vector_puffin(
+            &file_io,
+            &repacked_a.written.path,
+            repacked_a.written.content_offset,
+            repacked_a.written.content_size_in_bytes,
+        )
+        .await
+        .unwrap();
+        assert!(read_a.contains(1));
+        assert!(read_a.contains(9));
+
+        let repacked_b = written
+            .iter()
+            .find(|dv| dv.written.referenced_data_file == data_b)
+            .unwrap();
+        let read_b = read_deletion_vector_puffin(
+            &file_io,
+            &repacked_b.written.path,
+            repacked_b.written.content_offset,
+            repacked_b.written.content_size_in_bytes,
+        )
+        .await
+        .unwrap();
+        assert!(read_b.contains(2));
+        assert!(read_b.contains(10));
+    }
+
+    #[test]
+    fn sum_rewritten_bytes_counts_shared_input_puffin_once() {
+        let shared_path = "memory://warehouse/table/data/shared-input.puffin".to_string();
+        let written_a = WrittenPuffinDv {
+            path: shared_path.clone(),
+            referenced_data_file: "memory://warehouse/table/data/a.parquet".to_string(),
+            cardinality: 2,
+            content_offset: 4,
+            content_size_in_bytes: 32,
+            file_size_in_bytes: 512,
+        };
+        let written_b = WrittenPuffinDv {
+            path: shared_path,
+            referenced_data_file: "memory://warehouse/table/data/b.parquet".to_string(),
+            cardinality: 2,
+            content_offset: 64,
+            content_size_in_bytes: 32,
+            file_size_in_bytes: 512,
+        };
+        let entries = vec![
+            test_live_delete_entry_from_written_dv(
+                &written_a,
+                0,
+                iceberg::spec::Struct::empty(),
+                11,
+                Some(21),
+            ),
+            test_live_delete_entry_from_written_dv(
+                &written_b,
+                0,
+                iceberg::spec::Struct::empty(),
+                12,
+                Some(22),
+            ),
+        ];
+
+        assert_eq!(sum_rewritten_bytes(&entries).unwrap(), 512);
+    }
+
     #[test]
     fn catalog_commit_error_cleanup_policy_preserves_only_unknown_results() {
         let conflict = iceberg::Error::new(
@@ -1536,6 +1725,37 @@ mod tests {
                     builder
                 }
             })
+            .build()
+            .unwrap();
+        let rewrite_ref = classify_delete_file_for_rewrite(&data_file).unwrap();
+        LiveDeleteEntry {
+            data_file,
+            partition_spec_id,
+            snapshot_id: 10,
+            sequence_number,
+            file_sequence_number,
+            rewrite_ref,
+        }
+    }
+
+    fn test_live_delete_entry_from_written_dv(
+        written: &WrittenPuffinDv,
+        partition_spec_id: i32,
+        partition: iceberg::spec::Struct,
+        sequence_number: i64,
+        file_sequence_number: Option<i64>,
+    ) -> LiveDeleteEntry {
+        let data_file = iceberg::spec::DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path(written.path.clone())
+            .file_format(DataFileFormat::Puffin)
+            .partition(partition)
+            .partition_spec_id(partition_spec_id)
+            .record_count(written.cardinality)
+            .file_size_in_bytes(written.file_size_in_bytes)
+            .referenced_data_file(Some(written.referenced_data_file.clone()))
+            .content_offset(Some(written.content_offset))
+            .content_size_in_bytes(Some(written.content_size_in_bytes))
             .build()
             .unwrap();
         let rewrite_ref = classify_delete_file_for_rewrite(&data_file).unwrap();

@@ -7,7 +7,7 @@ use arrow::record_batch::RecordBatch;
 use iceberg::Catalog;
 use iceberg::{NamespaceIdent, TableIdent};
 
-use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_hadoop_catalog};
+use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
 use crate::connector::iceberg::commit::expire_snapshots::{ExpireParams, run_expire_snapshots};
 use crate::connector::iceberg::commit::remove_orphan_files::run_remove_orphan_files;
 use crate::connector::iceberg::commit::rewrite_manifests::run_rewrite_manifests;
@@ -184,18 +184,18 @@ fn run_rewrite_manifests_action(
         return Err("rewrite_manifests `spec_id` is not implemented in NovaRocks yet".to_string());
     }
     let (catalog, table_ident, _) = build_action_catalog(state, request)?;
-    block_on_iceberg(async move { run_rewrite_manifests(catalog, table_ident).await })?.map_err(
-        |e| {
-            format!(
-                "REWRITE MANIFESTS failed for {}: {e}",
-                action_target(request)
-            )
-        },
-    )?;
+    let outcome =
+        block_on_iceberg(async move { run_rewrite_manifests(catalog, table_ident).await })?
+            .map_err(|e| {
+                format!(
+                    "REWRITE MANIFESTS failed for {}: {e}",
+                    action_target(request)
+                )
+            })?;
 
     Ok(MaintenanceActionOutcome::RewriteManifests {
-        rewritten_manifests_count: 0,
-        added_manifests_count: 0,
+        rewritten_manifests_count: outcome.rewritten_manifests_count,
+        added_manifests_count: outcome.added_manifests_count,
     })
 }
 
@@ -271,7 +271,7 @@ fn run_remove_orphan_files_action(
     );
 
     Ok(MaintenanceActionOutcome::RemoveOrphanFiles {
-        orphan_file_locations: Vec::new(),
+        orphan_file_locations: outcome.deleted_file_locations,
     })
 }
 
@@ -488,8 +488,7 @@ fn build_action_catalog(
     };
     entry.invalidate_table_cache(&request.namespace, &request.table);
     let object_store_config = entry.object_store_config().cloned();
-    let hadoop_catalog = build_hadoop_catalog(&entry)?;
-    let catalog: Arc<dyn Catalog> = Arc::new(hadoop_catalog);
+    let catalog: Arc<dyn Catalog> = build_iceberg_catalog(&entry)?;
     let table_ident = TableIdent::new(
         NamespaceIdent::new(request.namespace.clone()),
         request.table.clone(),
@@ -636,12 +635,6 @@ fn validate_call_request_semantics(request: &MaintenanceActionRequest) -> Result
             if request.older_than_ms.is_none() && request.retain_last.is_none() {
                 return Err("expire_snapshots requires `older_than` or `retain_last`".to_string());
             }
-        }
-        MaintenanceActionKind::RemoveOrphanFiles => {
-            return Err(
-                "remove_orphan_files Spark procedure cannot return precise orphan file locations yet"
-                    .to_string(),
-            );
         }
         _ => {}
     }
@@ -1123,12 +1116,13 @@ mod tests {
     }
 
     #[test]
-    fn remove_orphan_files_spark_call_rejected_until_locations_available() {
-        let err = request_from_call(
+    fn remove_orphan_files_spark_call_is_supported() {
+        let request = request_from_call(
             "CALL ice.system.remove_orphan_files(table => 'db.t', older_than => TIMESTAMP '2026-01-01 00:00:00')",
         )
-        .unwrap_err();
-        assert!(err.contains("orphan file locations"));
+        .unwrap();
+        assert_eq!(request.kind, MaintenanceActionKind::RemoveOrphanFiles);
+        assert!(request.older_than_ms.is_some());
     }
 
     #[test]

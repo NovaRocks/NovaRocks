@@ -1,7 +1,14 @@
 -- query 2
 rewritten_manifests_count	added_manifests_count
-0	0
+2	1
 
 -- query 3
 rewritten_delete_files_count	added_delete_files_count	rewritten_bytes_count	added_bytes_count
 0	0	0	0
+
+-- query 4
+orphan_file_location
+
+-- query 5
+deleted_data_files_count	deleted_position_delete_files_count	deleted_equality_delete_files_count	deleted_manifest_files_count	deleted_manifest_lists_count	deleted_statistics_files_count
+NULL	NULL	NULL	NULL	NULL	NULL

@@ -183,7 +183,7 @@ pub(crate) enum ChangePartitionValue {
     Null,
     /// Primitive partition value rendered as a stable string for planner use.
     Primitive(String),
-    /// Value exists, but this PR2 metadata path cannot represent it safely.
+    /// Value exists, but this change-planning metadata path cannot represent it safely.
     Unsupported(String),
 }
 
@@ -2833,6 +2833,34 @@ mod tests {
             } => {
                 assert_eq!(snapshot_id, 2);
                 assert!(reason.contains("added-data-files"), "{reason}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_replace_delete_file_only_rejects_malformed_deleted_data_file_counts() {
+        let parent = snap(1, None, Operation::Append, &[("total-records", "100")], 0);
+        let s = snap(
+            2,
+            Some(1),
+            Operation::Replace,
+            &[
+                ("total-records", "100"),
+                ("added-data-files", "0"),
+                ("deleted-data-files", "not-a-number"),
+            ],
+            0,
+        );
+
+        let err = validate_replace_snapshot(&s, &parent).expect_err("err");
+        match err {
+            ChangeError::ReplaceValidationFailed {
+                snapshot_id,
+                reason,
+            } => {
+                assert_eq!(snapshot_id, 2);
+                assert!(reason.contains("deleted-data-files"), "{reason}");
             }
             other => panic!("unexpected: {other:?}"),
         }

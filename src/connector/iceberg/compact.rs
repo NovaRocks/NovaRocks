@@ -28,7 +28,7 @@ use sqlparser::ast::Statement;
 
 use crate::common::types::UniqueId;
 use crate::connector::iceberg::catalog::IcebergCatalogEntry;
-use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_hadoop_catalog};
+use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
 use crate::connector::iceberg::catalog::row_lineage_enabled;
 use crate::connector::iceberg::commit::{
     AbortLog, CommitOpKind, IcebergCommitCollector, LiveFileMetrics, RunInput,
@@ -369,8 +369,7 @@ pub(crate) fn execute_whole_table_rewrite_with_metrics_for_target(
     };
     entry.invalidate_table_cache(&rewrite_target.namespace, &rewrite_target.table);
 
-    let hadoop_catalog = build_hadoop_catalog(&entry)?;
-    let catalog: Arc<dyn Catalog> = Arc::new(hadoop_catalog);
+    let catalog: Arc<dyn Catalog> = build_iceberg_catalog(&entry)?;
     let table_ident = TableIdent::new(
         NamespaceIdent::new(rewrite_target.namespace.clone()),
         rewrite_target.table.clone(),

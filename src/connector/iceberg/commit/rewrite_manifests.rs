@@ -32,7 +32,7 @@
 //! * ADDED + EXISTING entries become EXISTING in the merged manifest
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use iceberg::io::FileIO;
 use iceberg::spec::{
@@ -45,6 +45,12 @@ use iceberg::{Catalog, TableCommit, TableIdent, TableRequirement, TableUpdate};
 use super::helpers::{generate_snapshot_id, metadata_dir, now_ms, write_manifest_list};
 use super::retry::commit_with_retry;
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RewriteManifestsOutcome {
+    pub rewritten_manifests_count: i32,
+    pub added_manifests_count: i32,
+}
+
 /// Top-level entry called from `engine::iceberg_rewrite_manifests`.
 /// Loads the table, groups manifests, merges, and commits.
 ///
@@ -55,32 +61,46 @@ use super::retry::commit_with_retry;
 pub async fn run_rewrite_manifests(
     catalog: Arc<dyn Catalog>,
     table_ident: TableIdent,
-) -> Result<(), String> {
+) -> Result<RewriteManifestsOutcome, String> {
+    let outcome: Arc<Mutex<Option<RewriteManifestsOutcome>>> = Arc::new(Mutex::new(None));
+    let outcome_out = outcome.clone();
     commit_with_retry(|_attempt| {
         let catalog = catalog.clone();
         let table_ident = table_ident.clone();
-        async move { run_rewrite_manifests_one_attempt(catalog, table_ident).await }
+        let outcome_out = outcome_out.clone();
+        async move {
+            let next = run_rewrite_manifests_one_attempt(catalog, table_ident).await?;
+            *outcome_out
+                .lock()
+                .expect("rewrite manifests outcome mutex poisoned") = Some(next);
+            Ok(())
+        }
     })
-    .await
+    .await?;
+    outcome
+        .lock()
+        .expect("rewrite manifests outcome mutex poisoned")
+        .clone()
+        .ok_or_else(|| "rewrite_manifests finished without an outcome".to_string())
 }
 
 async fn run_rewrite_manifests_one_attempt(
     catalog: Arc<dyn Catalog>,
     table_ident: TableIdent,
-) -> Result<(), iceberg::Error> {
+) -> Result<RewriteManifestsOutcome, iceberg::Error> {
     let table = catalog.load_table(&table_ident).await?;
     let metadata = table.metadata();
     let file_io = table.file_io();
 
     // Step 1: load current snapshot; noop if empty.
     let Some(current) = metadata.current_snapshot() else {
-        return Ok(());
+        return Ok(RewriteManifestsOutcome::default());
     };
     let manifest_list = current.load_manifest_list(file_io, metadata).await?;
     let manifest_files: Vec<ManifestFile> = manifest_list.entries().to_vec();
     if manifest_files.len() <= 1 {
         // Single (or zero) manifest: nothing to merge.
-        return Ok(());
+        return Ok(RewriteManifestsOutcome::default());
     }
 
     // Step 2: group by (partition_spec_id, content_type).
@@ -88,7 +108,7 @@ async fn run_rewrite_manifests_one_attempt(
 
     // Step 3 early-exit: all groups singleton → no merge needed.
     if groups.values().all(|g| g.len() <= 1) {
-        return Ok(());
+        return Ok(RewriteManifestsOutcome::default());
     }
 
     let format_version = metadata.format_version();
@@ -179,6 +199,10 @@ async fn run_rewrite_manifests_one_attempt(
         .map(|g| g.len())
         .sum();
     let added_count: usize = groups.values().filter(|g| g.len() > 1).count();
+    let outcome = RewriteManifestsOutcome {
+        rewritten_manifests_count: checked_i32_metric(replaced_count, "rewritten_manifests_count")?,
+        added_manifests_count: checked_i32_metric(added_count, "added_manifests_count")?,
+    };
     let summary = Summary {
         operation: Operation::Replace,
         additional_properties: [
@@ -243,23 +267,16 @@ async fn run_rewrite_manifests_one_attempt(
         .build();
     catalog.update_table(commit).await?;
 
-    // Step 6 (best-effort): physically delete merged-away old manifest files.
-    // Only delete manifests from groups that were actually merged (groups with >1 entry).
-    // Failure is non-fatal; log a warning and continue.
-    for group in groups.values() {
-        if group.len() > 1 {
-            for mf in group {
-                if let Err(e) = file_io.delete(&mf.manifest_path).await {
-                    tracing::warn!(
-                        path = %mf.manifest_path,
-                        "REWRITE MANIFESTS: failed to physically delete merged manifest (best-effort): {e}"
-                    );
-                }
-            }
-        }
-    }
+    Ok(outcome)
+}
 
-    Ok(())
+fn checked_i32_metric(value: usize, name: &str) -> Result<i32, iceberg::Error> {
+    i32::try_from(value).map_err(|_| {
+        iceberg::Error::new(
+            iceberg::ErrorKind::Unexpected,
+            format!("rewrite_manifests metric `{name}` overflow"),
+        )
+    })
 }
 
 /// Stable byte encoding for `ManifestContentType` used as `BTreeMap` key.
@@ -646,11 +663,20 @@ mod tests {
             return;
         }
 
-        let result =
+        let outcome =
             run_rewrite_manifests(fixture.catalog.clone(), fixture.table_ident.clone()).await;
         assert!(
-            result.is_ok(),
-            "multi-manifest REWRITE MANIFESTS should be Ok: {result:?}"
+            outcome.is_ok(),
+            "multi-manifest REWRITE MANIFESTS should be Ok: {outcome:?}"
+        );
+        let outcome = outcome.unwrap();
+        assert!(
+            outcome.rewritten_manifests_count > 0,
+            "multi-manifest rewrite should report rewritten manifests"
+        );
+        assert!(
+            outcome.added_manifests_count > 0,
+            "multi-manifest rewrite should report added manifests"
         );
 
         let table_after = fixture
@@ -696,6 +722,61 @@ mod tests {
             manifests_before.len(),
             manifests_after.len()
         );
+    }
+
+    #[tokio::test]
+    async fn rewrite_manifests_keeps_historical_snapshot_manifests_readable() {
+        let fixture = v3_table_with_multi_batch_appends(&[1, 1, 1]).await;
+        let metadata_before = fixture.table.metadata().clone();
+        let manifests_before: Vec<_> = metadata_before
+            .current_snapshot()
+            .unwrap()
+            .load_manifest_list(fixture.table.file_io(), &metadata_before)
+            .await
+            .unwrap()
+            .entries()
+            .to_vec();
+        if manifests_before.len() <= 1 {
+            return;
+        }
+
+        run_rewrite_manifests(fixture.catalog.clone(), fixture.table_ident.clone())
+            .await
+            .expect("rewrite_manifests");
+
+        let table_after = fixture
+            .catalog
+            .load_table(&fixture.table_ident)
+            .await
+            .unwrap();
+        let metadata_after = table_after.metadata();
+        if metadata_after.snapshots().count() <= metadata_before.snapshots().count() {
+            return;
+        }
+
+        for snapshot in metadata_after.snapshots() {
+            let manifest_list = snapshot
+                .load_manifest_list(table_after.file_io(), metadata_after)
+                .await
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "snapshot {} manifest list should remain readable: {err}",
+                        snapshot.snapshot_id()
+                    )
+                });
+            for manifest_file in manifest_list.entries() {
+                manifest_file
+                    .load_manifest(table_after.file_io())
+                    .await
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "snapshot {} manifest {} should remain readable: {err}",
+                            snapshot.snapshot_id(),
+                            manifest_file.manifest_path
+                        )
+                    });
+            }
+        }
     }
 
     // ---- sequence_number monotonicity test ----
@@ -754,7 +835,7 @@ mod tests {
         match result {
             Err(e) if e.contains("noop") || e.contains("single") => return, // noop is fine
             Err(e) => panic!("REWRITE MANIFESTS failed: {e}"),
-            Ok(()) => {}
+            Ok(_) => {}
         }
 
         let table_after = fixture
