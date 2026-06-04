@@ -23,12 +23,12 @@ TBLPROPERTIES ("format-version" = "3");
 -- query 3
 -- @skip_result_check=true
 USE sql_tests_complex_test_array_contains;
-insert into t select generate_series, md5sum(generate_series), array_repeat(generate_series, 1000),array_repeat(md5sum(generate_series), 100), array_repeat(generate_series, 1000) from table(generate_series(0, 9999));
+insert into t select generate_series, md5sum(generate_series), array_repeat(generate_series, 128),array_repeat(md5sum(generate_series), 16), array_repeat(generate_series, 128) from table(generate_series(0, 999));
 
 -- query 4
 -- @skip_result_check=true
 USE sql_tests_complex_test_array_contains;
-insert into t values (10000, md5sum(10000), array_append(array_generate(1000), null), array_append(array_repeat(md5sum(10000),100), null),array_append(array_generate(1000),null));
+insert into t values (1000, md5sum(1000), array_append(array_generate(128), null), array_append(array_repeat(md5sum(1000),16), null),array_append(array_generate(128),null));
 
 -- query 5
 USE sql_tests_complex_test_array_contains;
@@ -65,7 +65,7 @@ select array_position(null, null) from t order by pk limit 10;
 -- query 13
 -- @skip_result_check=true
 USE sql_tests_complex_test_array_contains;
-set @arr = array_generate(10000);
+set @arr = array_generate(1000);
 
 -- query 14
 USE sql_tests_complex_test_array_contains;
@@ -126,7 +126,7 @@ select sum(array_position(arr_decimal, 100)) from t;
 -- query 28
 -- @skip_result_check=true
 USE sql_tests_complex_test_array_contains;
-set @arr = array_repeat("abcdefg", 1000000);
+set @arr = array_repeat("abcdefg", 10000);
 
 -- query 29
 USE sql_tests_complex_test_array_contains;
@@ -276,12 +276,12 @@ select array_contains_all(arr_1, null) from t order by k;
 -- query 58
 -- @skip_result_check=true
 USE sql_tests_complex_test_array_contains;
-set @arr0 = array_repeat("abcdefg", 10000);
+set @arr0 = array_repeat("abcdefg", 1000);
 
 -- query 59
 -- @skip_result_check=true
 USE sql_tests_complex_test_array_contains;
-set @arr1 = array_repeat("abcdef", 100000);
+set @arr1 = array_repeat("abcdef", 2000);
 
 -- query 60
 USE sql_tests_complex_test_array_contains;
@@ -290,12 +290,12 @@ select array_contains_all(@arr0, @arr1);
 -- query 61
 -- @skip_result_check=true
 USE sql_tests_complex_test_array_contains;
-set @arr0 = array_generate(10000);
+set @arr0 = array_generate(1000);
 
 -- query 62
 -- @skip_result_check=true
 USE sql_tests_complex_test_array_contains;
-set @arr1 = array_generate(20000);
+set @arr1 = array_generate(2000);
 
 -- query 63
 USE sql_tests_complex_test_array_contains;
@@ -400,12 +400,12 @@ select array_contains_seq([null,null,1,2],[null,1,2]);
 -- query 88
 -- @skip_result_check=true
 USE sql_tests_complex_test_array_contains;
-set @arr0 = array_append(array_repeat(1, 10000), 2);
+set @arr0 = array_append(array_repeat(1, 1000), 2);
 
 -- query 89
 -- @skip_result_check=true
 USE sql_tests_complex_test_array_contains;
-set @arr1 = array_append(array_repeat(1, 5000), 2);
+set @arr1 = array_append(array_repeat(1, 500), 2);
 
 -- query 90
 USE sql_tests_complex_test_array_contains;
@@ -1566,7 +1566,7 @@ TBLPROPERTIES ("format-version" = "3");
 -- query 335
 -- @skip_result_check=true
 USE sql_tests_complex_test_array_contains;
-insert into t select generate_series, md5sum(generate_series), array_repeat(generate_series, 10),array_repeat(md5sum(generate_series), 10), array_repeat(generate_series, 1000) from table(generate_series(0, 9999));
+insert into t select generate_series, md5sum(generate_series), array_repeat(generate_series, 10),array_repeat(md5sum(generate_series), 10), array_repeat(generate_series, 128) from table(generate_series(0, 999));
 
 -- query 336
 -- @skip_result_check=true

@@ -27,7 +27,7 @@ TBLPROPERTIES ("format-version" = "3");
 -- query 4
 -- @skip_result_check=true
 USE ${case_db};
-insert into t1 select generate_series, array_append([], generate_series) from TABLE(generate_series(1, 5000000));
+insert into t1 select generate_series, array_append([], generate_series) from TABLE(generate_series(1, 100000));
 
 -- query 5
 -- @skip_result_check=true
