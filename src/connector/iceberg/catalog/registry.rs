@@ -7,7 +7,7 @@ use std::sync::Arc;
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
     Int32Array, Int64Array, ListArray, NullBufferBuilder, StringArray, StructArray,
-    Time64MicrosecondArray, TimestampMicrosecondArray,
+    Time64MicrosecondArray, TimestampMicrosecondArray, TimestampNanosecondArray,
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
@@ -31,6 +31,7 @@ use crate::connector::iceberg::commit::{
 };
 use crate::connector::iceberg::data_writer::write_record_batches_as_data_files;
 use crate::engine::catalog::{ColumnDef, normalize_identifier};
+use crate::engine::parquet::parse_datetime_string_to_nanos;
 use crate::engine::sql_expr::literal_to_i128_for_integer;
 use crate::sql::{ColumnAggregation, Literal, SqlType, TableColumnDef, TableKeyDesc, TableKeyKind};
 
@@ -2121,6 +2122,21 @@ fn build_literal_array(
                         Literal::Date(value) => parse_timestamp_literal_to_micros(value).map(Some),
                         Literal::Int(value) => Ok(parse_numeric_timestamp_literal(*value).ok()),
                         other => Err(format!("literal {:?} is not valid for DATETIME", other)),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )))
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            Ok(Arc::new(TimestampNanosecondArray::from(
+                values
+                    .iter()
+                    .map(|literal| match literal {
+                        Literal::Null => Ok(None),
+                        Literal::String(value) => {
+                            parse_datetime_string_to_nanos(value).map(Some)
+                        }
+                        Literal::Date(value) => parse_datetime_string_to_nanos(value).map(Some),
+                        other => Err(format!("literal {:?} is not valid for TIMESTAMP_NS", other)),
                     })
                     .collect::<Result<Vec<_>, _>>()?,
             )))
