@@ -33,6 +33,10 @@ pub enum MinMaxPredicateValue {
     FixedLenByteArray(Vec<u8>),
     Date32(i32),
     DateTimeMicros(i64),
+    /// Nanosecond-precision DATETIME bound for Iceberg v3 `timestamp_ns`
+    /// columns. Distinct from `DateTimeMicros` because parquet row-group
+    /// statistics for nanosecond columns are i64 nanoseconds.
+    DateTimeNanos(i64),
     LargeInt(i128),
     Decimal128 {
         value: i128,
@@ -122,6 +126,7 @@ impl MinMaxPredicateValue {
             MinMaxPredicateValue::Int64(v) => Some(*v),
             MinMaxPredicateValue::Date32(v) => Some(i64::from(*v)),
             MinMaxPredicateValue::DateTimeMicros(v) => Some(*v),
+            MinMaxPredicateValue::DateTimeNanos(v) => Some(*v),
             MinMaxPredicateValue::LargeInt(v) => i64::try_from(*v).ok(),
             _ => None,
         }

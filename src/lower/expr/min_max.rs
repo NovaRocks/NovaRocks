@@ -27,6 +27,7 @@ use crate::lower::expr::literals::{
 use crate::lower::layout::Layout;
 use crate::lower::type_lowering::{
     arrow_type_from_desc, arrow_type_from_primitive, primitive_type_from_node,
+    THRIFT_TIME_UNIT_NANOS,
 };
 use crate::types;
 
@@ -403,7 +404,11 @@ fn extract_int_literal(
             Ok(MinMaxPredicateValue::Date32(v))
         }
         Some(t) if t == types::TPrimitiveType::DATETIME || t == types::TPrimitiveType::TIME => {
-            Ok(MinMaxPredicateValue::DateTimeMicros(value))
+            if time_unit_from_node(node) == Some(THRIFT_TIME_UNIT_NANOS) {
+                Ok(MinMaxPredicateValue::DateTimeNanos(value))
+            } else {
+                Ok(MinMaxPredicateValue::DateTimeMicros(value))
+            }
         }
         Some(t) if is_decimal_type(&t) => {
             let (precision, scale) = decimal_params_from_node(node)?;
@@ -467,7 +472,11 @@ fn extract_large_int_literal(
         Some(t) if t == types::TPrimitiveType::DATETIME || t == types::TPrimitiveType::TIME => {
             let v = i64::try_from(value)
                 .map_err(|_| format!("LARGE_INT_LITERAL out of range for DATETIME: {}", value))?;
-            Ok(MinMaxPredicateValue::DateTimeMicros(v))
+            if time_unit_from_node(node) == Some(THRIFT_TIME_UNIT_NANOS) {
+                Ok(MinMaxPredicateValue::DateTimeNanos(v))
+            } else {
+                Ok(MinMaxPredicateValue::DateTimeMicros(v))
+            }
         }
         Some(t) if is_decimal_type(&t) => {
             let (precision, scale) = decimal_params_from_node(node)?;
@@ -522,9 +531,17 @@ fn extract_string_literal(
         Some(t) if t == types::TPrimitiveType::DATE => {
             Ok(MinMaxPredicateValue::Date32(parse_date_literal(value)?))
         }
-        Some(t) if t == types::TPrimitiveType::DATETIME || t == types::TPrimitiveType::TIME => Ok(
-            MinMaxPredicateValue::DateTimeMicros(parse_datetime_literal_micros(value)?),
-        ),
+        Some(t) if t == types::TPrimitiveType::DATETIME || t == types::TPrimitiveType::TIME => {
+            if time_unit_from_node(node) == Some(THRIFT_TIME_UNIT_NANOS) {
+                Ok(MinMaxPredicateValue::DateTimeNanos(
+                    parse_datetime_literal_nanos(value)?,
+                ))
+            } else {
+                Ok(MinMaxPredicateValue::DateTimeMicros(
+                    parse_datetime_literal_micros(value)?,
+                ))
+            }
+        }
         Some(t) if t == types::TPrimitiveType::BOOLEAN => parse_bool_literal(value)
             .map(MinMaxPredicateValue::Boolean)
             .ok_or_else(|| {
@@ -597,6 +614,10 @@ fn extract_date_literal(
         {
             if t == types::TPrimitiveType::DATE {
                 Ok(MinMaxPredicateValue::Date32(parse_date_literal(value)?))
+            } else if time_unit_from_node(node) == Some(THRIFT_TIME_UNIT_NANOS) {
+                Ok(MinMaxPredicateValue::DateTimeNanos(
+                    parse_datetime_literal_nanos(value)?,
+                ))
             } else {
                 Ok(MinMaxPredicateValue::DateTimeMicros(
                     parse_datetime_literal_micros(value)?,
@@ -638,6 +659,47 @@ fn parse_datetime_literal_micros(value: &str) -> Result<i64, String> {
             .and_hms_opt(0, 0, 0)
             .ok_or_else(|| format!("invalid DATETIME literal '{}'", value))?;
         return Ok(dt.and_utc().timestamp_micros());
+    }
+    Err(format!("invalid DATETIME literal '{}'", value))
+}
+
+/// Read the DATETIME time-unit code from an expression node's scalar type, if
+/// present. `None` means microsecond (default).
+fn time_unit_from_node(node: &exprs::TExprNode) -> Option<i32> {
+    node.type_
+        .types
+        .as_ref()?
+        .first()?
+        .scalar_type
+        .as_ref()?
+        .time_unit
+}
+
+fn parse_datetime_literal_nanos(value: &str) -> Result<i64, String> {
+    let text = value.trim();
+    if text.is_empty() {
+        return Err("empty DATETIME literal".to_string());
+    }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f") {
+        return dt
+            .and_utc()
+            .timestamp_nanos_opt()
+            .ok_or_else(|| format!("DATETIME literal '{value}' out of nanosecond range"));
+    }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S") {
+        return dt
+            .and_utc()
+            .timestamp_nanos_opt()
+            .ok_or_else(|| format!("DATETIME literal '{value}' out of nanosecond range"));
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(text, "%Y-%m-%d") {
+        let dt = date
+            .and_hms_opt(0, 0, 0)
+            .ok_or_else(|| format!("invalid DATETIME literal '{}'", value))?;
+        return dt
+            .and_utc()
+            .timestamp_nanos_opt()
+            .ok_or_else(|| format!("DATETIME literal '{value}' out of nanosecond range"));
     }
     Err(format!("invalid DATETIME literal '{}'", value))
 }
@@ -689,8 +751,52 @@ fn fits_decimal_precision(value: i128, precision: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lower::type_lowering::THRIFT_TIME_UNIT_NANOS;
     use crate::sql::codegen::type_infer::arrow_type_to_type_desc;
     use std::collections::HashMap;
+
+    fn datetime_node_with_time_unit(time_unit: Option<i32>) -> exprs::TExprNode {
+        exprs::TExprNode {
+            node_type: exprs::TExprNodeType::STRING_LITERAL,
+            type_: types::TTypeDesc {
+                types: Some(vec![types::TTypeNode {
+                    type_: types::TTypeNodeType::SCALAR,
+                    scalar_type: Some(types::TScalarType {
+                        type_: types::TPrimitiveType::DATETIME,
+                        len: None,
+                        precision: None,
+                        scale: None,
+                        time_unit,
+                    }),
+                    struct_fields: None,
+                    is_named: None,
+                }]),
+            },
+            ..default_t_expr_node()
+        }
+    }
+
+    #[test]
+    fn string_literal_on_nanosecond_column_produces_datetime_nanos() {
+        let node = datetime_node_with_time_unit(Some(THRIFT_TIME_UNIT_NANOS));
+        let v = extract_string_literal(&node, "2024-01-02 03:04:05.123456789").unwrap();
+        let expected_nanos = chrono::NaiveDateTime::parse_from_str(
+            "2024-01-02 03:04:05.123456789",
+            "%Y-%m-%d %H:%M:%S%.f",
+        )
+        .unwrap()
+        .and_utc()
+        .timestamp_nanos_opt()
+        .unwrap();
+        assert_eq!(v, MinMaxPredicateValue::DateTimeNanos(expected_nanos));
+    }
+
+    #[test]
+    fn string_literal_on_microsecond_column_still_micros() {
+        let node = datetime_node_with_time_unit(None);
+        let v = extract_string_literal(&node, "2024-01-02 03:04:05.123456").unwrap();
+        assert!(matches!(v, MinMaxPredicateValue::DateTimeMicros(_)));
+    }
 
     fn create_dummy_type() -> types::TTypeDesc {
         types::TTypeDesc {
