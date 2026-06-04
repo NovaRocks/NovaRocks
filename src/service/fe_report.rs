@@ -645,6 +645,30 @@ pub(crate) fn test_insert_report_instance(finst_id: UniqueId, query_id: QueryId)
 }
 
 #[cfg(test)]
+pub(crate) fn test_insert_standalone_report_instance(
+    finst_id: UniqueId,
+    query_id: QueryId,
+    coord: types::TNetworkAddress,
+    backend_num: i32,
+) {
+    let mut guard = registry().lock().expect("report registry lock");
+    guard.insert(
+        finst_id,
+        ReportInstance {
+            destination: ReportDestination::NovaRocksCoordinator(coord),
+            backend_num,
+            query_id,
+            enable_profile: false,
+            profiler: None,
+            mem_tracker: None,
+            query_mem_tracker: None,
+            report_interval_ns: None,
+            fe_query_gone: false,
+        },
+    );
+}
+
+#[cfg(test)]
 pub(crate) fn test_reset_report_registry() {
     if let Ok(mut guard) = registry().lock() {
         guard.clear();
@@ -782,8 +806,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{
-        is_query_gone_status, mark_fe_query_gone, register_novarocks_instance, report_exec_state,
-        report_fragment_done, test_insert_report_instance, test_reset_report_registry,
+        is_query_gone_status, mark_fe_query_gone, report_exec_state, report_fragment_done,
+        test_insert_report_instance, test_insert_standalone_report_instance,
+        test_reset_report_registry,
     };
     use crate::common::types::UniqueId;
     use crate::frontend_service;
@@ -925,17 +950,7 @@ mod tests {
         let _hook = capture_standalone_final_report(Arc::clone(&captured));
 
         test_reset_report_registry();
-        register_novarocks_instance(
-            finst_id,
-            query_id,
-            report_addr.clone(),
-            3,
-            false,
-            None,
-            None,
-            None,
-            None,
-        );
+        test_insert_standalone_report_instance(finst_id, query_id, report_addr.clone(), 3);
 
         report_fragment_done(finst_id, None);
 
@@ -966,17 +981,7 @@ mod tests {
         let _hook = capture_standalone_non_final_report(Arc::clone(&captured));
 
         test_reset_report_registry();
-        register_novarocks_instance(
-            finst_id,
-            query_id,
-            report_addr.clone(),
-            4,
-            false,
-            None,
-            None,
-            None,
-            None,
-        );
+        test_insert_standalone_report_instance(finst_id, query_id, report_addr.clone(), 4);
 
         report_exec_state(finst_id);
 
@@ -992,6 +997,34 @@ mod tests {
             params.fragment_instance_id,
             Some(types::TUniqueId::new(73, 74))
         );
+        test_reset_report_registry();
+    }
+
+    #[test]
+    fn mark_fe_query_gone_does_not_suppress_standalone_destination() {
+        let _guard = super::test_report_registry_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let finst_id = UniqueId { hi: 75, lo: 76 };
+        let query_id = QueryId { hi: 85, lo: 86 };
+        let report_addr = types::TNetworkAddress::new("127.0.0.1".to_string(), 18042);
+        let captured = Arc::new(Mutex::new(None));
+        let _hook = capture_standalone_final_report(Arc::clone(&captured));
+
+        test_reset_report_registry();
+        test_insert_standalone_report_instance(finst_id, query_id, report_addr.clone(), 5);
+        mark_fe_query_gone(finst_id);
+
+        report_fragment_done(finst_id, None);
+
+        let (coord, params) = captured
+            .lock()
+            .expect("inspect standalone final report")
+            .clone()
+            .expect("standalone final report was captured");
+        assert_eq!(coord, report_addr);
+        assert_eq!(params.done, Some(true));
+        assert_eq!(params.backend_num, Some(5));
         test_reset_report_registry();
     }
 }

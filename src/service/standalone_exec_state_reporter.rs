@@ -16,7 +16,7 @@
 // under the License.
 
 use std::collections::VecDeque;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -197,16 +197,7 @@ fn run_priority_worker(reporter: &'static StandaloneExecStateReporter) {
 }
 
 fn send_once(task: &StandaloneExecStateReportTask) -> Result<(), String> {
-    let addr = SocketAddr::new(
-        task.coord.hostname.parse().map_err(|e| {
-            format!(
-                "invalid standalone report host '{}': {e}",
-                task.coord.hostname
-            )
-        })?,
-        u16::try_from(task.coord.port)
-            .map_err(|_| format!("invalid standalone report port {}", task.coord.port))?,
-    );
+    let addr = standalone_report_socket_addr(&task.coord)?;
     let bytes = thrift_binary_serialize(&task.params)?;
     let client = NovaRocksGrpcRemoteClient::connect_blocking(addr)?;
     let resp = client.blocking_report_exec_status(proto::novarocks::ReportExecStatusRequest {
@@ -219,6 +210,46 @@ fn send_once(task: &StandaloneExecStateReportTask) -> Result<(), String> {
             "standalone reportExecStatus returned status_code={}: {}",
             resp.status_code, resp.message
         ))
+    }
+}
+
+fn standalone_report_socket_addr(addr: &types::TNetworkAddress) -> Result<SocketAddr, String> {
+    let port = if (1..=i32::from(u16::MAX)).contains(&addr.port) {
+        addr.port as u16
+    } else {
+        return Err(format!(
+            "invalid standalone report port {}: must be in 1..={}",
+            addr.port,
+            u16::MAX
+        ));
+    };
+
+    let host = addr.hostname.trim();
+    if host.is_empty() {
+        return Err("invalid standalone report host '': empty host".to_string());
+    }
+
+    let endpoint = socket_lookup_endpoint(host, port);
+    endpoint
+        .to_socket_addrs()
+        .map_err(|e| format!("invalid standalone report host '{}': {e}", addr.hostname))?
+        .next()
+        .ok_or_else(|| {
+            format!(
+                "invalid standalone report host '{}': no socket addresses resolved",
+                addr.hostname
+            )
+        })
+}
+
+fn socket_lookup_endpoint(host: &str, port: u16) -> String {
+    if let Some(inner) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        return format!("[{inner}]:{port}");
+    }
+
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V6(_)) => format!("[{host}]:{port}"),
+        Ok(IpAddr::V4(_)) | Err(_) => format!("{host}:{port}"),
     }
 }
 
@@ -291,6 +322,33 @@ mod tests {
     }
 
     #[test]
+    fn final_report_succeeds_after_retry() {
+        let attempts = AtomicUsize::new(0);
+        let sleeps = Mutex::new(Vec::new());
+
+        let result = send_final_report_with(
+            test_task(),
+            3,
+            |_| {
+                let attempt = attempts.fetch_add(1, Ordering::AcqRel) + 1;
+                if attempt < 2 {
+                    Err("temporary outage".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+            |duration| sleeps.lock().expect("sleep record").push(duration),
+        );
+
+        result.expect("retry should eventually succeed");
+        assert_eq!(attempts.load(Ordering::Acquire), 2);
+        assert_eq!(
+            *sleeps.lock().expect("sleep record"),
+            vec![Duration::from_millis(100)]
+        );
+    }
+
+    #[test]
     fn non_final_enqueue_is_best_effort_queue_insert() {
         let reporter = StandaloneExecStateReporter::new();
 
@@ -307,6 +365,70 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn report_socket_addr_accepts_ipv4_literal() {
+        let addr =
+            standalone_report_socket_addr(&network_addr("127.0.0.1", 18040)).expect("ipv4 literal");
+
+        assert_eq!(addr.to_string(), "127.0.0.1:18040");
+    }
+
+    #[test]
+    fn report_socket_addr_accepts_bare_ipv6_literal() {
+        let addr =
+            standalone_report_socket_addr(&network_addr("::1", 18040)).expect("bare ipv6 literal");
+
+        assert_eq!(addr.to_string(), "[::1]:18040");
+    }
+
+    #[test]
+    fn report_socket_addr_accepts_bracketed_ipv6_literal() {
+        let addr = standalone_report_socket_addr(&network_addr("[::1]", 18040))
+            .expect("bracketed ipv6 literal");
+
+        assert_eq!(addr.to_string(), "[::1]:18040");
+    }
+
+    #[test]
+    fn report_socket_addr_accepts_localhost_hostname() {
+        let addr =
+            standalone_report_socket_addr(&network_addr("localhost", 18040)).expect("localhost");
+
+        assert_eq!(addr.port(), 18040);
+        assert!(addr.ip().is_loopback(), "{addr}");
+    }
+
+    #[test]
+    fn report_socket_addr_rejects_invalid_host() {
+        let err = standalone_report_socket_addr(&network_addr("bad host with spaces", 18040))
+            .expect_err("invalid host must fail");
+
+        assert!(err.contains("invalid standalone report host"), "{err}");
+    }
+
+    #[test]
+    fn report_socket_addr_rejects_zero_port() {
+        let err = standalone_report_socket_addr(&network_addr("127.0.0.1", 0))
+            .expect_err("port 0 must fail");
+
+        assert!(err.contains("invalid standalone report port 0"), "{err}");
+    }
+
+    #[test]
+    fn report_socket_addr_rejects_too_large_port() {
+        let err = standalone_report_socket_addr(&network_addr("127.0.0.1", 70_000))
+            .expect_err("too-large port must fail");
+
+        assert!(
+            err.contains("invalid standalone report port 70000"),
+            "{err}"
+        );
+    }
+
+    fn network_addr(host: &str, port: i32) -> types::TNetworkAddress {
+        types::TNetworkAddress::new(host.to_string(), port)
     }
 
     fn test_task() -> StandaloneExecStateReportTask {
