@@ -35,7 +35,9 @@ use iceberg::spec::{
 use iceberg::{Catalog, TableCommit, TableIdent, TableRequirement, TableUpdate};
 use uuid::Uuid;
 
-use super::helpers::{generate_snapshot_id, metadata_dir, now_ms, write_manifest_list};
+use super::helpers::{
+    current_snapshot_total_records, generate_snapshot_id, metadata_dir, now_ms, write_manifest_list,
+};
 use super::puffin_dv::{
     DeletionVector, DeletionVectorBlobInput, WrittenPuffinDv, read_deletion_vector_puffin,
     write_multi_deletion_vector_puffin,
@@ -134,6 +136,11 @@ async fn run_one_attempt(
             "rewrite_position_delete_files requires an Iceberg v3 table for Puffin deletion vector rewrite",
         ));
     }
+    let total_records = rewrite_total_records(
+        current_snapshot_total_records(metadata)
+            .map_err(|e| iceberg::Error::new(iceberg::ErrorKind::DataInvalid, e))?,
+    )
+    .map_err(|e| iceberg::Error::new(iceberg::ErrorKind::DataInvalid, e))?;
 
     let new_seq = metadata.last_sequence_number() + 1;
     let new_snapshot_id = generate_snapshot_id();
@@ -242,7 +249,7 @@ async fn run_one_attempt(
             .with_manifest_list(manifest_list_path)
             .with_summary(Summary {
                 operation: Operation::Replace,
-                additional_properties: rewrite_summary(&outcome),
+                additional_properties: rewrite_summary(&outcome, total_records),
             })
             .with_schema_id(metadata.current_schema_id())
             .with_row_range(metadata.next_row_id(), 0)
@@ -976,7 +983,17 @@ fn rewrite_outcome(
     })
 }
 
-fn rewrite_summary(outcome: &RewritePositionDeleteOutcome) -> HashMap<String, String> {
+fn rewrite_total_records(parent_total_records: Option<u64>) -> Result<u64, String> {
+    parent_total_records.ok_or_else(|| {
+        "rewrite_position_delete_files requires current snapshot summary `total-records`; cannot prove the delete-file-only Replace has no data-file effect"
+            .to_string()
+    })
+}
+
+fn rewrite_summary(
+    outcome: &RewritePositionDeleteOutcome,
+    total_records: u64,
+) -> HashMap<String, String> {
     HashMap::from([
         (
             "rewritten-delete-files".to_string(),
@@ -994,6 +1011,9 @@ fn rewrite_summary(outcome: &RewritePositionDeleteOutcome) -> HashMap<String, St
             "added-bytes".to_string(),
             outcome.added_bytes_count.to_string(),
         ),
+        ("added-data-files".to_string(), "0".to_string()),
+        ("deleted-data-files".to_string(), "0".to_string()),
+        ("total-records".to_string(), total_records.to_string()),
     ])
 }
 
@@ -1422,6 +1442,34 @@ mod tests {
 
         let unknown = iceberg::Error::new(iceberg::ErrorKind::Unexpected, "connection reset");
         assert!(!should_cleanup_catalog_commit_error(&unknown));
+    }
+
+    #[test]
+    fn rewrite_summary_marks_replace_as_data_file_noop() {
+        let summary = rewrite_summary(
+            &RewritePositionDeleteOutcome {
+                rewritten_delete_files_count: 2,
+                added_delete_files_count: 1,
+                rewritten_bytes_count: 128,
+                added_bytes_count: 64,
+            },
+            42,
+        );
+
+        assert_eq!(summary.get("rewritten-delete-files").unwrap(), "2");
+        assert_eq!(summary.get("added-delete-files").unwrap(), "1");
+        assert_eq!(summary.get("rewritten-bytes").unwrap(), "128");
+        assert_eq!(summary.get("added-bytes").unwrap(), "64");
+        assert_eq!(summary.get("added-data-files").unwrap(), "0");
+        assert_eq!(summary.get("deleted-data-files").unwrap(), "0");
+        assert_eq!(summary.get("total-records").unwrap(), "42");
+    }
+
+    #[test]
+    fn rewrite_total_records_rejects_unknown_parent_total_records() {
+        let err = rewrite_total_records(None).unwrap_err();
+        assert!(err.contains("total-records"));
+        assert!(err.contains("cannot prove"));
     }
 
     fn test_candidate_group(

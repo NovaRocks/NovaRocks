@@ -482,10 +482,12 @@ fn classify_snapshot(
     }
 }
 
-/// Validate that a `Replace` snapshot is a compaction (file rewrite that
-/// preserves logical content). A passing REPLACE leaves `total-records`
-/// unchanged, contributes both `added-data-files` and `deleted-data-files`
-/// counters, and does not change the schema. Anything else is rejected.
+/// Validate that a `Replace` snapshot preserves logical data content.
+///
+/// Data-file compaction must report positive `added-data-files` and
+/// `deleted-data-files` counters. Delete-file-only rewrites must report
+/// explicit `0/0` data-file counters. Both forms must leave `total-records`
+/// unchanged and keep the same schema id. Anything else is rejected.
 fn validate_replace_snapshot(
     snapshot: &iceberg::spec::Snapshot,
     parent: &iceberg::spec::Snapshot,
@@ -517,22 +519,20 @@ fn validate_replace_snapshot(
         }
     }
 
-    let added = snap_props
-        .get("added-data-files")
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(0);
-    let removed = snap_props
-        .get("deleted-data-files")
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(0);
+    let added = required_replace_summary_i64(snapshot, "added-data-files")?;
+    let removed = required_replace_summary_i64(snapshot, "deleted-data-files")?;
+    let data_file_compaction = added > 0 && removed > 0;
+    let delete_file_only_rewrite = added == 0 && removed == 0;
     let zero_row_rewrite =
         matches!((snap_records, parent_records), (Some(0), Some(0))) && added == 0 && removed > 0;
-    if !zero_row_rewrite && (added <= 0 || removed <= 0) {
+    if !data_file_compaction && !delete_file_only_rewrite && !zero_row_rewrite {
         return Err(ChangeError::ReplaceValidationFailed {
             snapshot_id: snapshot.snapshot_id(),
             reason: format!(
-                "REPLACE snapshot must report both added-data-files (>0) and \
-                 deleted-data-files (>0); got added={added}, deleted={removed}"
+                "REPLACE snapshot must report added-data-files/deleted-data-files as \
+                 data-file compaction counts (>0/>0), delete-file-only no-op counts (0/0), \
+                 or zero-row rewrite counts (0/>0); \
+                 got added={added}, deleted={removed}"
             ),
         });
     }
@@ -549,6 +549,28 @@ fn validate_replace_snapshot(
         });
     }
     Ok(())
+}
+
+fn required_replace_summary_i64(
+    snapshot: &iceberg::spec::Snapshot,
+    key: &'static str,
+) -> Result<i64, ChangeError> {
+    let value = snapshot
+        .summary()
+        .additional_properties
+        .get(key)
+        .ok_or_else(|| ChangeError::ReplaceValidationFailed {
+            snapshot_id: snapshot.snapshot_id(),
+            reason: format!(
+                "REPLACE snapshot summary is missing `{key}`; cannot prove compaction or delete-file-only no-op"
+            ),
+        })?;
+    value
+        .parse::<i64>()
+        .map_err(|e| ChangeError::ReplaceValidationFailed {
+            snapshot_id: snapshot.snapshot_id(),
+            reason: format!("REPLACE snapshot summary `{key}` is invalid `{value}`: {e}"),
+        })
 }
 
 /// Walk the explicit lineage range from `previous_snapshot_id` (exclusive) to
@@ -2741,6 +2763,99 @@ mod tests {
 
         let action = classify_snapshot(&s, Some(&parent)).expect("ok");
         assert_eq!(action, None);
+    }
+
+    #[test]
+    fn classify_lineage_skips_delete_file_only_replace_noop() {
+        let parent = snap(1, None, Operation::Append, &[("total-records", "100")], 0);
+        let mut owned = replace_props(100, 0, 0);
+        owned.extend([
+            ("rewritten-delete-files", "2".to_string()),
+            ("added-delete-files", "1".to_string()),
+            ("rewritten-bytes", "128".to_string()),
+            ("added-bytes", "64".to_string()),
+        ]);
+        let props: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let s = snap(2, Some(1), Operation::Replace, &props, 0);
+
+        let action = classify_snapshot(&s, Some(&parent)).expect("ok");
+        assert_eq!(action, None);
+    }
+
+    #[test]
+    fn validate_replace_delete_file_only_requires_explicit_data_file_counts() {
+        let parent = snap(1, None, Operation::Append, &[("total-records", "100")], 0);
+        let s = snap(
+            2,
+            Some(1),
+            Operation::Replace,
+            &[
+                ("total-records", "100"),
+                ("rewritten-delete-files", "2"),
+                ("added-delete-files", "1"),
+            ],
+            0,
+        );
+
+        let err = validate_replace_snapshot(&s, &parent).expect_err("err");
+        match err {
+            ChangeError::ReplaceValidationFailed {
+                snapshot_id,
+                reason,
+            } => {
+                assert_eq!(snapshot_id, 2);
+                assert!(reason.contains("added-data-files"), "{reason}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_replace_delete_file_only_rejects_malformed_data_file_counts() {
+        let parent = snap(1, None, Operation::Append, &[("total-records", "100")], 0);
+        let s = snap(
+            2,
+            Some(1),
+            Operation::Replace,
+            &[
+                ("total-records", "100"),
+                ("added-data-files", "not-a-number"),
+                ("deleted-data-files", "0"),
+            ],
+            0,
+        );
+
+        let err = validate_replace_snapshot(&s, &parent).expect_err("err");
+        match err {
+            ChangeError::ReplaceValidationFailed {
+                snapshot_id,
+                reason,
+            } => {
+                assert_eq!(snapshot_id, 2);
+                assert!(reason.contains("added-data-files"), "{reason}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_replace_delete_file_only_schema_id_change_is_rejected() {
+        let parent = snap(1, None, Operation::Append, &[("total-records", "100")], 0);
+        let owned = replace_props(100, 0, 0);
+        let props: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let s = snap(2, Some(1), Operation::Replace, &props, 7);
+
+        let err = validate_replace_snapshot(&s, &parent).expect_err("err");
+        match err {
+            ChangeError::ReplaceValidationFailed {
+                snapshot_id,
+                reason,
+            } => {
+                assert_eq!(snapshot_id, 2);
+                assert!(reason.contains("schema"), "{reason}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]
