@@ -46,8 +46,6 @@ pub struct WrittenPuffinDv {
 pub struct DeletionVectorBlobInput {
     pub referenced_data_file: String,
     pub deletion_vector: DeletionVector,
-    pub snapshot_id: i64,
-    pub sequence_number: i64,
 }
 
 impl DeletionVector {
@@ -312,8 +310,8 @@ pub async fn write_multi_deletion_vector_puffin(
             json!({
                 "type": "deletion-vector-v1",
                 "fields": [],
-                "snapshot-id": input.snapshot_id,
-                "sequence-number": input.sequence_number,
+                "snapshot-id": -1,
+                "sequence-number": -1,
                 "offset": *content_offset,
                 "length": *content_size_in_bytes,
                 "properties": {
@@ -493,7 +491,7 @@ mod tests {
     async fn read_puffin_footer_metadata(
         file_io: &FileIO,
         path: &str,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<(serde_json::Value, [u8; 4])> {
         let input = file_io
             .new_input(path)
             .with_context(|| format!("failed to create Puffin test input: {path}"))?;
@@ -521,6 +519,10 @@ mod tests {
         let footer_json_len = read_le_u32_from(&mut Cursor::new(
             &file[footer_json_len_offset..footer_json_len_offset + size_of::<u32>()],
         ))? as usize;
+        let flags: [u8; 4] = file[footer_json_len_offset + size_of::<u32>()
+            ..footer_json_len_offset + size_of::<u32>() + 4]
+            .try_into()
+            .context("Puffin test file has invalid footer flags length")?;
         let footer_json_start = footer_json_len_offset
             .checked_sub(footer_json_len)
             .context("Puffin test footer length exceeds file size")?;
@@ -532,8 +534,9 @@ mod tests {
             "Puffin test file has invalid footer magic"
         );
 
-        serde_json::from_slice(&file[footer_json_start..footer_json_len_offset])
-            .context("failed to parse Puffin test footer metadata")
+        let metadata = serde_json::from_slice(&file[footer_json_start..footer_json_len_offset])
+            .context("failed to parse Puffin test footer metadata")?;
+        Ok((metadata, flags))
     }
 
     #[tokio::test]
@@ -599,14 +602,10 @@ mod tests {
                 DeletionVectorBlobInput {
                     referenced_data_file: "file:///warehouse/t/data/a.parquet".to_string(),
                     deletion_vector: first.clone(),
-                    snapshot_id: 10,
-                    sequence_number: 20,
                 },
                 DeletionVectorBlobInput {
                     referenced_data_file: "file:///warehouse/t/data/b.parquet".to_string(),
                     deletion_vector: second.clone(),
-                    snapshot_id: 10,
-                    sequence_number: 20,
                 },
             ],
         )
@@ -644,13 +643,15 @@ mod tests {
         assert_eq!(written[0].file_size_in_bytes, metadata.size);
         assert_eq!(written[1].file_size_in_bytes, metadata.size);
 
-        let footer = read_puffin_footer_metadata(&file_io, &path).await.unwrap();
+        let (footer, flags) = read_puffin_footer_metadata(&file_io, &path).await.unwrap();
+        assert_eq!(flags, [0, 0, 0, 0]);
         let blobs = footer["blobs"].as_array().unwrap();
         assert_eq!(blobs.len(), 2);
         for (blob, written_dv) in blobs.iter().zip(&written) {
             assert_eq!(blob["type"].as_str().unwrap(), "deletion-vector-v1");
-            assert_eq!(blob["snapshot-id"].as_i64().unwrap(), 10);
-            assert_eq!(blob["sequence-number"].as_i64().unwrap(), 20);
+            assert!(blob["fields"].as_array().unwrap().is_empty());
+            assert_eq!(blob["snapshot-id"].as_i64().unwrap(), -1);
+            assert_eq!(blob["sequence-number"].as_i64().unwrap(), -1);
             assert_eq!(blob["offset"].as_i64().unwrap(), written_dv.content_offset);
             assert_eq!(
                 blob["length"].as_i64().unwrap(),
