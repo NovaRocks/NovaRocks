@@ -1894,6 +1894,7 @@ pub(crate) fn arrow_data_type_to_sql_type(data_type: &DataType) -> Result<SqlTyp
         DataType::Utf8 => Ok(SqlType::String),
         DataType::Binary => Ok(SqlType::Binary),
         DataType::Date32 => Ok(SqlType::Date),
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, _) => Ok(SqlType::DateTimeNs),
         DataType::Timestamp(_, _) => Ok(SqlType::DateTime),
         DataType::Time64(_) => Ok(SqlType::Time),
         DataType::FixedSizeBinary(width)

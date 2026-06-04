@@ -1810,9 +1810,9 @@ fn build_iceberg_create_table_ddl(
             Type::Primitive(PrimitiveType::Date) => "DATE".to_string(),
             Type::Primitive(PrimitiveType::Time) => "TIME".to_string(),
             Type::Primitive(PrimitiveType::Timestamp)
-            | Type::Primitive(PrimitiveType::Timestamptz)
-            | Type::Primitive(PrimitiveType::TimestampNs)
-            | Type::Primitive(PrimitiveType::TimestamptzNs) => "DATETIME".to_string(),
+            | Type::Primitive(PrimitiveType::Timestamptz) => "DATETIME".to_string(),
+            Type::Primitive(PrimitiveType::TimestampNs)
+            | Type::Primitive(PrimitiveType::TimestamptzNs) => "TIMESTAMP_NS".to_string(),
             Type::Primitive(PrimitiveType::String) => "STRING".to_string(),
             Type::Primitive(PrimitiveType::Uuid) => "STRING".to_string(),
             Type::Primitive(PrimitiveType::Fixed(n)) => format!("BINARY({n})"),

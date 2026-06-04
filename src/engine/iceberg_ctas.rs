@@ -328,6 +328,7 @@ pub(crate) fn arrow_data_type_to_sql_type(dt: &DataType) -> Result<SqlType, Stri
             SqlType::LargeInt
         }
         DataType::Date32 => SqlType::Date,
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => SqlType::DateTimeNs,
         DataType::Timestamp(_, _) => SqlType::DateTime,
         DataType::Time64(TimeUnit::Microsecond | TimeUnit::Nanosecond) => SqlType::Time,
         DataType::List(elem) => {
@@ -416,7 +417,7 @@ mod tests {
 
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 
-    use super::arrow_schema_to_table_column_defs;
+    use super::{arrow_data_type_to_sql_type, arrow_schema_to_table_column_defs};
     use crate::sql::parser::ast::SqlType;
 
     // ---------- basic scalar types ----------
@@ -509,6 +510,18 @@ mod tests {
         assert!(matches!(cols[11].data_type, SqlType::Date));
         assert!(matches!(cols[12].data_type, SqlType::DateTime));
         assert!(matches!(cols[13].data_type, SqlType::Time));
+    }
+
+    #[test]
+    fn nanosecond_arrow_timestamp_maps_to_datetimens() {
+        assert_eq!(
+            arrow_data_type_to_sql_type(&DataType::Timestamp(TimeUnit::Nanosecond, None)).unwrap(),
+            SqlType::DateTimeNs
+        );
+        assert_eq!(
+            arrow_data_type_to_sql_type(&DataType::Timestamp(TimeUnit::Microsecond, None)).unwrap(),
+            SqlType::DateTime
+        );
     }
 
     // ---------- unsupported types ----------
