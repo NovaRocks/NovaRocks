@@ -340,6 +340,7 @@ impl ExecutionCoordinator {
                     query_options.clone(),
                     pipeline_dop,
                     Some(placement.instance_index as i32),
+                    None::<types::TNetworkAddress>,
                 );
 
                 if is_root {
@@ -959,6 +960,7 @@ mod tests {
             None::<i32>,
             None::<internal_service::TPredicateTreeParams>,
             None::<Vec<i32>>,
+            None::<types::TNetworkAddress>,
         )
     }
 

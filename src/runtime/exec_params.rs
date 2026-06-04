@@ -45,6 +45,7 @@ pub(crate) fn build_exec_plan_fragment_params(
     query_options: Option<internal_service::TQueryOptions>,
     pipeline_dop: i32,
     backend_num: Option<i32>,
+    novarocks_report_addr: Option<types::TNetworkAddress>,
 ) -> internal_service::TExecPlanFragmentParams {
     internal_service::TExecPlanFragmentParams::new(
         internal_service::InternalServiceVersion::V1,
@@ -73,6 +74,7 @@ pub(crate) fn build_exec_plan_fragment_params(
         None::<i32>,                               // group_execution_scan_dop
         None::<internal_service::TPredicateTreeParams>, // pred_tree_params
         None::<Vec<i32>>,                          // exec_stats_node_ids
+        novarocks_report_addr,
     )
 }
 
@@ -211,6 +213,7 @@ mod tests {
             None,
             4,
             None,
+            None::<types::TNetworkAddress>,
         );
 
         let params = result.params.expect("params must be present");
@@ -235,6 +238,7 @@ mod tests {
             None,
             4,
             None,
+            None::<types::TNetworkAddress>,
         );
 
         let params = result.params.expect("params must be present");
@@ -264,6 +268,7 @@ mod tests {
             None,
             4,
             None,
+            None::<types::TNetworkAddress>,
         );
 
         let params = result.params.expect("params must be present");
@@ -287,6 +292,7 @@ mod tests {
             None,
             4,
             None,
+            None::<types::TNetworkAddress>,
         );
 
         assert!(result.desc_tbl.is_some(), "desc_tbl should be embedded");
@@ -306,6 +312,7 @@ mod tests {
             None,
             8,
             None,
+            None::<types::TNetworkAddress>,
         );
 
         assert_eq!(result.pipeline_dop, Some(8));
@@ -325,12 +332,37 @@ mod tests {
             None,
             4,
             Some(2),
+            None::<types::TNetworkAddress>,
         );
 
         assert_eq!(
             result.backend_num,
             Some(2),
             "backend_num must reflect the FE-assigned instance index"
+        );
+    }
+
+    #[test]
+    fn build_exec_params_preserves_novarocks_report_addr() {
+        let fr = empty_fragment_build_result(1, 2);
+        let thrift_fragment = noop_thrift_fragment();
+        let exec_params = fr.exec_params.clone();
+        let report_addr = types::TNetworkAddress::new("127.0.0.1".to_string(), 18040);
+
+        let params = build_exec_plan_fragment_params(
+            &fr,
+            thrift_fragment,
+            exec_params,
+            None,
+            1,
+            Some(3),
+            Some(report_addr.clone()),
+        );
+
+        assert_eq!(params.novarocks_report_addr, Some(report_addr));
+        assert_eq!(
+            params.coord, None,
+            "StarRocks FE coord must remain separate"
         );
     }
 }

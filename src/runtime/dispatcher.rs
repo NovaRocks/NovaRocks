@@ -991,6 +991,7 @@ mod tests {
             None::<i32>,
             None::<internal_service::TPredicateTreeParams>,
             None::<Vec<i32>>,
+            None::<types::TNetworkAddress>,
         )
     }
 

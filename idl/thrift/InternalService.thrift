@@ -523,6 +523,10 @@ struct TExecPlanFragmentParams {
   60: optional TPredicateTreeParams pred_tree_params
 
   61: optional list<i32> exec_stats_node_ids;
+
+  // NovaRocks standalone coordinator report endpoint. When present, BE sends
+  // TReportExecStatusParams through NovaRocksGrpc instead of StarRocks FE thrift.
+  62: optional Types.TNetworkAddress novarocks_report_addr;
 }
 
 struct TExecPlanFragmentResult {
