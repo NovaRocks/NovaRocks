@@ -84,6 +84,7 @@ use self::statement::{
 use self::stream_load::{
     parse_csv_stream_load_rows, parse_json_stream_load_rows, parse_stream_load_columns,
 };
+use crate::engine::procedure::{looks_like_call_procedure, parse_call_procedure_sql};
 use crate::engine::query_prep::{has_time_travel_refs, rewrite_time_travel_refs};
 use crate::sql::parser::query_refs::{
     extract_three_part_table_refs, strip_catalog_from_three_part_names,
@@ -585,6 +586,17 @@ impl StandaloneSession {
                 source,
                 current_catalog,
                 current_database,
+            );
+        }
+        if looks_like_call_procedure(&normalized) {
+            let stmt = parse_call_procedure_sql(&normalized)?;
+            let request = crate::engine::iceberg_maintenance::MaintenanceActionRequest::from_call(
+                &stmt,
+                current_database,
+            )?;
+            return crate::engine::iceberg_maintenance::execute_maintenance_action(
+                &self.inner,
+                request,
             );
         }
         if looks_like_show_alter_table_optimize(&normalized) {

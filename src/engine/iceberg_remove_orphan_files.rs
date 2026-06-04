@@ -26,12 +26,11 @@
 
 use std::sync::Arc;
 
-use iceberg::Catalog;
-use iceberg::{NamespaceIdent, TableIdent};
-
-use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_hadoop_catalog};
-use crate::connector::iceberg::commit::remove_orphan_files::run_remove_orphan_files;
 use crate::engine::backend_resolver::TargetBackend;
+use crate::engine::iceberg_maintenance::{
+    MaintenanceActionKind, MaintenanceActionOptions, MaintenanceActionRequest,
+    MaintenanceActionSource, execute_maintenance_action,
+};
 use crate::engine::statement::AlterTableRemoveOrphanFilesStmt;
 use crate::engine::{StandaloneState, StatementResult};
 
@@ -53,55 +52,21 @@ pub(crate) fn execute_iceberg_remove_orphan_files(
         "execute_iceberg_remove_orphan_files called with non-iceberg backend"
     );
 
-    // 1. Resolve catalog entry + build iceberg-rust Catalog handle.
-    let entry = {
-        let registry = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        registry.get(&target.catalog)?
-    };
-    // Invalidate any cached table state so we always see the latest metadata.
-    entry.invalidate_table_cache(&target.namespace, &target.table);
-
-    let hadoop_catalog = build_hadoop_catalog(&entry)?;
-    let catalog: Arc<dyn Catalog> = Arc::new(hadoop_catalog);
-    let table_ident = TableIdent::new(
-        NamespaceIdent::new(target.namespace.clone()),
-        target.table.clone(),
-    );
-
-    let older_than_ms = stmt.older_than_ms;
-
-    // Retrieve the object-store config (Some for S3/OSS catalogs, None for local).
-    let object_store_config = entry.object_store_config().cloned();
-
-    // 2. Execute asynchronously inside the iceberg tokio runtime.
-    let outcome = block_on_iceberg(async move {
-        run_remove_orphan_files(
-            catalog,
-            table_ident,
-            older_than_ms,
-            object_store_config.as_ref(),
-        )
-        .await
-    })?
-    .map_err(|e| {
-        format!(
-            "REMOVE ORPHAN FILES failed for {}.{}.{}: {e}",
-            target.catalog, target.namespace, target.table
-        )
-    })?;
-
-    tracing::info!(
-        deleted_count = outcome.deleted_count,
-        scanned_count = outcome.scanned_count,
-        catalog = %target.catalog,
-        namespace = %target.namespace,
-        table = %target.table,
-        older_than_ms = older_than_ms,
-        "remove_orphan_files: completed"
-    );
-
-    Ok(StatementResult::Ok)
+    execute_maintenance_action(
+        state,
+        MaintenanceActionRequest {
+            source: MaintenanceActionSource::LegacyAlter,
+            kind: MaintenanceActionKind::RemoveOrphanFiles,
+            catalog: target.catalog.clone(),
+            namespace: target.namespace.clone(),
+            table: target.table.clone(),
+            options: MaintenanceActionOptions::default(),
+            older_than_ms: Some(stmt.older_than_ms),
+            retain_last: None,
+            use_caching: None,
+            spec_id: None,
+            branch: None,
+            where_clause: None,
+        },
+    )
 }

@@ -25,11 +25,11 @@
 
 use std::sync::Arc;
 
-use iceberg::Catalog;
-use iceberg::{NamespaceIdent, TableIdent};
-
-use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_hadoop_catalog};
 use crate::engine::backend_resolver::TargetBackend;
+use crate::engine::iceberg_maintenance::{
+    MaintenanceActionKind, MaintenanceActionOptions, MaintenanceActionRequest,
+    MaintenanceActionSource, execute_maintenance_action,
+};
 use crate::engine::{StandaloneState, StatementResult};
 
 pub(crate) fn execute_iceberg_rewrite_manifests(
@@ -38,38 +38,21 @@ pub(crate) fn execute_iceberg_rewrite_manifests(
 ) -> Result<StatementResult, String> {
     debug_assert_eq!(target.backend_name, "iceberg");
 
-    // 1. Resolve catalog entry + build iceberg-rust Catalog handle.
-    let entry = {
-        let registry = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        registry.get(&target.catalog)?
-    };
-    // Invalidate any cached table state so we always see the latest metadata.
-    entry.invalidate_table_cache(&target.namespace, &target.table);
-
-    let hadoop_catalog = build_hadoop_catalog(&entry)?;
-    let catalog: Arc<dyn Catalog> = Arc::new(hadoop_catalog);
-    let table_ident = TableIdent::new(
-        NamespaceIdent::new(target.namespace.clone()),
-        target.table.clone(),
-    );
-
-    // 2. Execute asynchronously inside the iceberg tokio runtime.
-    block_on_iceberg(async move {
-        crate::connector::iceberg::commit::rewrite_manifests::run_rewrite_manifests(
-            catalog,
-            table_ident,
-        )
-        .await
-    })?
-    .map_err(|e| {
-        format!(
-            "REWRITE MANIFESTS failed for {}.{}.{}: {e}",
-            target.catalog, target.namespace, target.table
-        )
-    })?;
-
-    Ok(StatementResult::Ok)
+    execute_maintenance_action(
+        state,
+        MaintenanceActionRequest {
+            source: MaintenanceActionSource::LegacyAlter,
+            kind: MaintenanceActionKind::RewriteManifests,
+            catalog: target.catalog.clone(),
+            namespace: target.namespace.clone(),
+            table: target.table.clone(),
+            options: MaintenanceActionOptions::default(),
+            older_than_ms: None,
+            retain_last: None,
+            use_caching: None,
+            spec_id: None,
+            branch: None,
+            where_clause: None,
+        },
+    )
 }

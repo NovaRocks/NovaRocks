@@ -25,12 +25,11 @@
 
 use std::sync::Arc;
 
-use iceberg::Catalog;
-use iceberg::{NamespaceIdent, TableIdent};
-
-use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_hadoop_catalog};
-use crate::connector::iceberg::commit::expire_snapshots::{ExpireParams, run_expire_snapshots};
 use crate::engine::backend_resolver::TargetBackend;
+use crate::engine::iceberg_maintenance::{
+    MaintenanceActionKind, MaintenanceActionOptions, MaintenanceActionRequest,
+    MaintenanceActionSource, execute_maintenance_action,
+};
 use crate::engine::statement::AlterTableExpireSnapshotsStmt;
 use crate::engine::{StandaloneState, StatementResult};
 
@@ -52,47 +51,21 @@ pub(crate) fn execute_iceberg_expire_snapshots(
         "execute_iceberg_expire_snapshots called with non-iceberg backend"
     );
 
-    // 1. Resolve catalog entry + build iceberg-rust Catalog handle.
-    let entry = {
-        let registry = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        registry.get(&target.catalog)?
-    };
-    // Invalidate any cached table state so we always see the latest metadata.
-    entry.invalidate_table_cache(&target.namespace, &target.table);
-
-    let hadoop_catalog = build_hadoop_catalog(&entry)?;
-    let catalog: Arc<dyn Catalog> = Arc::new(hadoop_catalog);
-    let table_ident = TableIdent::new(
-        NamespaceIdent::new(target.namespace.clone()),
-        target.table.clone(),
-    );
-
-    let params = ExpireParams {
-        older_than_ms: stmt.older_than_ms,
-        retain_last: stmt.retain_last,
-    };
-
-    // 2. Execute asynchronously inside the iceberg tokio runtime.
-    let outcome =
-        block_on_iceberg(async move { run_expire_snapshots(catalog, table_ident, params).await })?
-            .map_err(|e| {
-                format!(
-                    "EXPIRE SNAPSHOTS failed for {}.{}.{}: {e}",
-                    target.catalog, target.namespace, target.table
-                )
-            })?;
-
-    tracing::info!(
-        expired_snapshot_count = outcome.expired_snapshot_count,
-        deleted_file_count = outcome.deleted_file_count,
-        catalog = %target.catalog,
-        namespace = %target.namespace,
-        table = %target.table,
-        "expire_snapshots: completed"
-    );
-
-    Ok(StatementResult::Ok)
+    execute_maintenance_action(
+        state,
+        MaintenanceActionRequest {
+            source: MaintenanceActionSource::LegacyAlter,
+            kind: MaintenanceActionKind::ExpireSnapshots,
+            catalog: target.catalog.clone(),
+            namespace: target.namespace.clone(),
+            table: target.table.clone(),
+            options: MaintenanceActionOptions::default(),
+            older_than_ms: stmt.older_than_ms,
+            retain_last: stmt.retain_last,
+            use_caching: None,
+            spec_id: None,
+            branch: None,
+            where_clause: None,
+        },
+    )
 }

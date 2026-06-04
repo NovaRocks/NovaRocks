@@ -385,6 +385,54 @@ mod tests {
     }
 
     #[test]
+    fn named_rewrite_manifests_to_action_request() {
+        let stmt =
+            parse_call_procedure_sql("CALL ice.system.rewrite_manifests(table => 'db.t')").unwrap();
+        let req =
+            crate::engine::iceberg_maintenance::MaintenanceActionRequest::from_call(&stmt, "db")
+                .unwrap();
+        assert_eq!(req.catalog, "ice");
+        assert_eq!(req.namespace, "db");
+        assert_eq!(req.table, "t");
+        assert_eq!(
+            req.kind,
+            crate::engine::iceberg_maintenance::MaintenanceActionKind::RewriteManifests
+        );
+    }
+
+    #[test]
+    fn positional_rewrite_manifests_to_action_request() {
+        let stmt =
+            parse_call_procedure_sql("CALL ice.system.rewrite_manifests('db.t', false)").unwrap();
+        let req =
+            crate::engine::iceberg_maintenance::MaintenanceActionRequest::from_call(&stmt, "db")
+                .unwrap();
+        assert_eq!(req.use_caching, Some(false));
+    }
+
+    #[test]
+    fn unknown_procedure_rejected() {
+        let stmt =
+            parse_call_procedure_sql("CALL ice.system.unknown_proc(table => 'db.t')").unwrap();
+        let err =
+            crate::engine::iceberg_maintenance::MaintenanceActionRequest::from_call(&stmt, "db")
+                .unwrap_err();
+        assert!(err.contains("unsupported Iceberg system procedure"));
+    }
+
+    #[test]
+    fn remove_orphan_dry_run_rejected_until_supported() {
+        let stmt = parse_call_procedure_sql(
+            "CALL ice.system.remove_orphan_files(table => 'db.t', older_than => TIMESTAMP '2026-01-01 00:00:00', dry_run => true)",
+        )
+        .unwrap();
+        let err =
+            crate::engine::iceberg_maintenance::MaintenanceActionRequest::from_call(&stmt, "db")
+                .unwrap_err();
+        assert!(err.contains("not implemented"));
+    }
+
+    #[test]
     fn rejects_mixed_named_and_positional_arguments() {
         let err = parse_call_procedure_sql(
             "CALL ice.system.rewrite_manifests('db.t', use_caching => false)",
