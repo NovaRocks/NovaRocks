@@ -376,6 +376,11 @@ pub enum SqlType {
     Boolean,
     Date,
     DateTime,
+    /// Iceberg v3 nanosecond timestamp (`timestamp_ns`). Default DATETIME stays
+    /// microsecond; this is a distinct variant so existing DATETIME behavior is
+    /// untouched. Time zone (`timestamptz_ns`) is carried at the Arrow level on
+    /// read/insert; native CREATE of the tz variant is out of scope.
+    DateTimeNs,
     Time,
     Array(Box<SqlType>),
     Map(Box<SqlType>, Box<SqlType>),

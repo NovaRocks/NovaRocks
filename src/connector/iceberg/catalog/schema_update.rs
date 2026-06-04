@@ -3459,6 +3459,9 @@ fn widen_type(current: &Type, new_type: &SqlType) -> Result<Type, String> {
         (Type::Primitive(PrimitiveType::Date), SqlType::DateTime) => {
             Ok(Type::Primitive(PrimitiveType::Timestamp))
         }
+        (Type::Primitive(PrimitiveType::Date), SqlType::DateTimeNs) => {
+            Ok(Type::Primitive(PrimitiveType::TimestampNs))
+        }
         _ => Err(format!(
             "unsupported Iceberg type evolution: {current:?} -> {new_type:?}"
         )),

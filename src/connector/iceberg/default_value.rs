@@ -102,6 +102,7 @@ pub(crate) fn default_literal_to_iceberg(
         }
         (DefaultLiteral::Date(d), SqlType::Date) => PrimitiveLiteral::Int(*d),
         (DefaultLiteral::DateTime(t), SqlType::DateTime) => PrimitiveLiteral::Long(*t),
+        (DefaultLiteral::DateTime(t), SqlType::DateTimeNs) => PrimitiveLiteral::Long(*t),
         (DefaultLiteral::Binary(b), SqlType::Binary | SqlType::Bitmap | SqlType::Hll) => {
             PrimitiveLiteral::Binary(b.clone())
         }
@@ -194,6 +195,15 @@ pub(crate) fn iceberg_literal_to_ast(
             })?;
             Ok(AstLiteral::String(
                 dt.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string(),
+            ))
+        }
+        (IcebergLiteral::Primitive(PrimitiveLiteral::Long(nanos)), SqlType::DateTimeNs) => {
+            // Convert nanoseconds-since-epoch back to "YYYY-MM-DD HH:MM:SS.nnnnnnnnn" string.
+            // build_local_literal_array handles Literal::String for Timestamp columns.
+            use chrono::DateTime as ChronoDateTime;
+            let dt = ChronoDateTime::from_timestamp_nanos(*nanos);
+            Ok(AstLiteral::String(
+                dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.9f").to_string(),
             ))
         }
         (

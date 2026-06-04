@@ -173,6 +173,7 @@ pub(crate) fn convert_sql_type(data_type: sqlast::DataType) -> Result<SqlType, S
                 "bitmap" => Ok(SqlType::Bitmap),
                 "hll" => Ok(SqlType::Hll),
                 "variant" => Ok(SqlType::Variant),
+                "timestamp_ns" | "timestamptz_ns" | "datetime_ns" => Ok(SqlType::DateTimeNs),
                 "decimal32" | "decimal64" | "decimal128" => {
                     let (precision, scale) = parse_custom_decimal_modifiers(&modifiers);
                     Ok(SqlType::Decimal { precision, scale })
@@ -221,6 +222,7 @@ fn parse_modifier_to_sql_type(s: &str) -> Result<SqlType, String> {
         "string" | "varchar" | "text" => Ok(SqlType::String),
         "date" => Ok(SqlType::Date),
         "datetime" | "timestamp" => Ok(SqlType::DateTime),
+        "timestamp_ns" | "timestamptz_ns" | "datetime_ns" => Ok(SqlType::DateTimeNs),
         "decimal" => Ok(SqlType::Decimal {
             precision: 38,
             scale: 0,
@@ -3291,5 +3293,23 @@ mod tests {
     fn rewrite_overwrite_partitions_does_not_rewrite_in_double_quoted_literal() {
         let sql = r#"SELECT "INSERT OVERWRITE PARTITIONS t" AS s"#;
         assert_eq!(super::rewrite_overwrite_partitions(sql).unwrap(), sql);
+    }
+
+    #[test]
+    fn timestamp_ns_type_name_parses_to_datetimens() {
+        use super::parse_modifier_to_sql_type;
+        use crate::sql::parser::ast::SqlType;
+        assert_eq!(parse_modifier_to_sql_type("timestamp_ns"), Ok(SqlType::DateTimeNs));
+        assert_eq!(parse_modifier_to_sql_type("timestamptz_ns"), Ok(SqlType::DateTimeNs));
+    }
+
+    #[test]
+    fn datetimens_maps_to_nanosecond_arrow() {
+        use arrow::datatypes::{DataType, TimeUnit};
+        use crate::sql::parser::ast::SqlType;
+        assert_eq!(
+            crate::engine::sql_expr::sql_type_to_arrow_type(&SqlType::DateTimeNs),
+            Ok(DataType::Timestamp(TimeUnit::Nanosecond, None))
+        );
     }
 }

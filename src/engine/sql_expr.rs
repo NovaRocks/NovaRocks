@@ -1223,6 +1223,7 @@ pub(crate) fn sql_type_to_arrow_type(sql_type: &SqlType) -> Result<DataType, Str
         SqlType::Boolean => Ok(DataType::Boolean),
         SqlType::Date => Ok(DataType::Date32),
         SqlType::DateTime => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
+        SqlType::DateTimeNs => Ok(DataType::Timestamp(TimeUnit::Nanosecond, None)),
         SqlType::Time => Ok(DataType::Time64(TimeUnit::Microsecond)),
         SqlType::Decimal { precision, scale } => Ok(DataType::Decimal128(*precision, *scale)),
         SqlType::Array(inner) => {

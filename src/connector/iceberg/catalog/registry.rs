@@ -1889,6 +1889,7 @@ pub(crate) fn iceberg_type_for_sql_type(
         SqlType::Boolean => Type::Primitive(PrimitiveType::Boolean),
         SqlType::Date => Type::Primitive(PrimitiveType::Date),
         SqlType::DateTime => Type::Primitive(PrimitiveType::Timestamp),
+        SqlType::DateTimeNs => Type::Primitive(PrimitiveType::TimestampNs),
         SqlType::Time => Type::Primitive(PrimitiveType::Time),
         SqlType::Variant => Type::Primitive(PrimitiveType::Variant),
         SqlType::Array(inner) => {
