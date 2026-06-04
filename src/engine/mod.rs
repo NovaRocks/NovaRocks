@@ -47,6 +47,7 @@ pub(crate) mod mv_flow;
 pub(crate) mod mv_scheduler;
 pub(crate) mod name_resolve;
 pub(crate) mod parquet;
+pub(crate) mod procedure;
 pub(crate) mod query_prep;
 pub(crate) mod sql_expr;
 pub(crate) mod starrocks_table_ctas;
