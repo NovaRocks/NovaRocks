@@ -80,6 +80,7 @@ fn may_push_left(join_type: JoinKind) -> bool {
             | JoinKind::LeftOuter
             | JoinKind::LeftSemi
             | JoinKind::LeftAnti
+            | JoinKind::NullAwareLeftAnti
     )
 }
 
@@ -194,5 +195,73 @@ mod tests {
         );
 
         assert_eq!(placement.remain_above_join.len(), 2);
+    }
+
+    #[test]
+    fn null_aware_left_anti_pushes_left_filter_to_probe_side() {
+        let placement = classify_predicate_groups(
+            JoinKind::NullAwareLeftAnti,
+            &ids(&[1]),
+            &ids(&[2]),
+            vec![group(eq(col("a", 1), int_lit(10)))],
+        );
+
+        assert_eq!(placement.left_pushdown.len(), 1);
+        assert!(placement.remain_above_join.is_empty());
+    }
+
+    #[test]
+    fn constants_follow_left_pushdown_guard() {
+        let inner = classify_predicate_groups(
+            JoinKind::Inner,
+            &ids(&[1]),
+            &ids(&[2]),
+            vec![group(eq(int_lit(1), int_lit(1)))],
+        );
+        assert_eq!(inner.left_pushdown.len(), 1);
+        assert!(inner.remain_above_join.is_empty());
+
+        let left_outer = classify_predicate_groups(
+            JoinKind::LeftOuter,
+            &ids(&[1]),
+            &ids(&[2]),
+            vec![group(eq(int_lit(1), int_lit(1)))],
+        );
+        assert_eq!(left_outer.left_pushdown.len(), 1);
+        assert!(left_outer.remain_above_join.is_empty());
+
+        let full_outer = classify_predicate_groups(
+            JoinKind::FullOuter,
+            &ids(&[1]),
+            &ids(&[2]),
+            vec![group(eq(int_lit(1), int_lit(1)))],
+        );
+        assert!(full_outer.left_pushdown.is_empty());
+        assert_eq!(full_outer.remain_above_join.len(), 1);
+    }
+
+    #[test]
+    fn unknown_and_overlapping_column_ids_remain_above_join() {
+        let unknown = classify_predicate_groups(
+            JoinKind::Inner,
+            &ids(&[1]),
+            &ids(&[2]),
+            vec![group(eq(col("c", 3), int_lit(30)))],
+        );
+        assert_eq!(unknown.remain_above_join.len(), 1);
+        assert!(unknown.left_pushdown.is_empty());
+        assert!(unknown.right_pushdown.is_empty());
+        assert!(unknown.join_residual.is_empty());
+
+        let overlapping = classify_predicate_groups(
+            JoinKind::Inner,
+            &ids(&[1]),
+            &ids(&[1]),
+            vec![group(eq(col("a", 1), int_lit(10)))],
+        );
+        assert_eq!(overlapping.remain_above_join.len(), 1);
+        assert!(overlapping.left_pushdown.is_empty());
+        assert!(overlapping.right_pushdown.is_empty());
+        assert!(overlapping.join_residual.is_empty());
     }
 }
