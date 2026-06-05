@@ -340,6 +340,9 @@ impl IcebergOperationRepository {
             RepositoryError::not_found(format!("iceberg operation {operation_id} not found"))
         })?;
         validate_operation_transition(versioned.value.state, to_state)?;
+        if versioned.value.state == to_state {
+            return Ok(());
+        }
         versioned.value.state = to_state;
         versioned.value.updated_at_ms = now_ms;
         if to_state.is_finished() {

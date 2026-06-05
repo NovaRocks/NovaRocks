@@ -6,8 +6,10 @@ use novarocks::meta::repository::iceberg_catalog::{
     IcebergCatalogMetaRepository, IcebergCatalogProperties, IcebergNamespaceRecord,
 };
 use novarocks::meta::repository::iceberg_operation::{
-    CreateIcebergOperationRequest, IcebergOperationKind, IcebergOperationRepository,
-    IcebergOperationState, IcebergOperationTarget, StoredIcebergOperation,
+    CreateIcebergOperationRequest, IcebergCleanupOutcomeRecord, IcebergCommitOutcomeRecord,
+    IcebergOperationFailureKind, IcebergOperationFailureRecord, IcebergOperationKind,
+    IcebergOperationNextAction, IcebergOperationRepository, IcebergOperationState,
+    IcebergOperationTarget, IcebergRecoveryEvidenceRecord, StoredIcebergOperation,
 };
 use novarocks::meta::repository::job::{
     CreateEraseJobRequest, CreateIcebergOptimizeJobRequest, IcebergOptimizeJobOutcome,
@@ -385,10 +387,30 @@ fn repository_avro_payload_round_trips_iceberg_operation_payload()
         base_snapshot_map: BTreeMap::from([("ice.sales.orders".to_string(), 3)]),
         staged_artifacts: vec!["s3://warehouse/mv/_staging/a.parquet".to_string()],
         commit_request: Some("commit-request-json".to_string()),
-        commit_outcome: None,
-        cleanup_outcome: None,
-        recovery_evidence: None,
-        failure: None,
+        commit_outcome: Some(IcebergCommitOutcomeRecord {
+            snapshot_id: 1001,
+            written_manifest_paths: vec![
+                "s3://warehouse/mv/metadata/manifest-a.avro".to_string(),
+                "s3://warehouse/mv/metadata/manifest-b.avro".to_string(),
+            ],
+        }),
+        cleanup_outcome: Some(IcebergCleanupOutcomeRecord {
+            attempted: true,
+            error_count: 1,
+            error_paths: vec!["s3://warehouse/mv/_staging/orphan.parquet".to_string()],
+        }),
+        recovery_evidence: Some(IcebergRecoveryEvidenceRecord {
+            table_ident: "ice.analytics.mv_sales".to_string(),
+            commit_op_kind: "fast_append".to_string(),
+            base_snapshot_id: Some(7),
+            base_sequence_number: Some(11),
+            staging_dir: "s3://warehouse/mv/_staging/attempt-1".to_string(),
+        }),
+        failure: Some(IcebergOperationFailureRecord {
+            kind: IcebergOperationFailureKind::Unknown,
+            message: "commit status is unknown".to_string(),
+            next_action: IcebergOperationNextAction::ManualInspect,
+        }),
         created_at_ms: 1000,
         updated_at_ms: 1200,
         finished_at_ms: None,
@@ -400,6 +422,38 @@ fn repository_avro_payload_round_trips_iceberg_operation_payload()
     assert_eq!(payload.schema_fingerprint.len(), 16);
 
     let decoded: StoredIcebergOperation = decode_payload_for_kind("iceberg.operation", &payload)?;
+    assert_eq!(
+        decoded
+            .commit_outcome
+            .as_ref()
+            .expect("commit outcome should round-trip")
+            .snapshot_id,
+        1001
+    );
+    assert_eq!(
+        decoded
+            .cleanup_outcome
+            .as_ref()
+            .expect("cleanup outcome should round-trip")
+            .error_paths[0],
+        "s3://warehouse/mv/_staging/orphan.parquet"
+    );
+    assert_eq!(
+        decoded
+            .recovery_evidence
+            .as_ref()
+            .expect("recovery evidence should round-trip")
+            .base_sequence_number,
+        Some(11)
+    );
+    assert_eq!(
+        decoded
+            .failure
+            .as_ref()
+            .expect("failure should round-trip")
+            .next_action,
+        IcebergOperationNextAction::ManualInspect
+    );
     assert_eq!(decoded, value);
     Ok(())
 }
@@ -543,6 +597,17 @@ fn iceberg_operation_repository_finished_operations_are_not_unfinished()
             operation_id,
             IcebergOperationState::Finalized,
             1300,
+        )?;
+        txn.commit()?;
+    }
+
+    {
+        let mut txn = provider.begin_write("replay finalized iceberg operation")?;
+        repository.transition_operation(
+            txn.as_mut(),
+            operation_id,
+            IcebergOperationState::Finalized,
+            1400,
         )?;
         txn.commit()?;
     }
