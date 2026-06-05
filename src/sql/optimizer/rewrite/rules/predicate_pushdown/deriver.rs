@@ -23,7 +23,7 @@ pub(crate) fn derive_inner_join_predicates(
     }
 
     let mut equality_pairs = Vec::new();
-    for group in join_groups {
+    for group in join_groups.iter().chain(filter_groups.iter()) {
         for conjunct in split_and_refs(&group.expr) {
             if let Some(pair) = extract_column_pair_equality(conjunct) {
                 equality_pairs.push(pair);
@@ -214,38 +214,62 @@ fn derive_or_branch_side_filters(
         }
 
         let mut by_column: HashMap<String, Vec<ColumnConstraint>> = HashMap::new();
+        let mut by_side: HashMap<Side, Vec<ColumnConstraint>> = HashMap::new();
         for candidate in candidates {
-            if column_side(&candidate.column, left_ids, right_ids).is_some() {
+            if let Some(side) = column_side(&candidate.column, left_ids, right_ids) {
                 by_column
                     .entry(column_key(&candidate.column))
                     .or_default()
-                    .push(candidate);
+                    .push(candidate.clone());
+                by_side.entry(side).or_default().push(candidate);
             }
         }
         if by_column.is_empty() {
             return Vec::new();
         }
-        per_branch.push(by_column);
+        per_branch.push(BranchCandidates { by_column, by_side });
     }
 
     let mut derived = Vec::new();
-    let first_columns: Vec<String> = per_branch[0].keys().cloned().collect();
+    let mut specialized_sides = HashSet::new();
+    let first_columns: Vec<String> = per_branch[0].by_column.keys().cloned().collect();
     for column_key in first_columns {
         if !per_branch
             .iter()
-            .all(|branch| branch.contains_key(&column_key))
+            .all(|branch| branch.by_column.contains_key(&column_key))
         {
             continue;
         }
 
         if let Some(group) = derive_or_in_list(&column_key, &per_branch) {
+            if let Some(side) = single_column_side(&group.expr, left_ids, right_ids) {
+                specialized_sides.insert(side);
+            }
             derived.push(group);
         } else if let Some(group) = derive_or_range_envelope(&column_key, &per_branch) {
+            if let Some(side) = single_column_side(&group.expr, left_ids, right_ids) {
+                specialized_sides.insert(side);
+            }
+            derived.push(group);
+        }
+    }
+
+    for side in [Side::Left, Side::Right] {
+        if specialized_sides.contains(&side) {
+            continue;
+        }
+        if let Some(group) = derive_or_side_fallback(side, &per_branch) {
             derived.push(group);
         }
     }
 
     dedupe_groups(derived)
+}
+
+#[derive(Clone, Debug)]
+struct BranchCandidates {
+    by_column: HashMap<String, Vec<ColumnConstraint>>,
+    by_side: HashMap<Side, Vec<ColumnConstraint>>,
 }
 
 #[derive(Clone, Debug)]
@@ -263,7 +287,7 @@ enum ConstraintKind {
     Between { low: TypedExpr, high: TypedExpr },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Side {
     Left,
     Right,
@@ -303,14 +327,16 @@ fn derived_kind_for_constraint(kind: &ConstraintKind) -> PredicateDerivedKind {
     }
 }
 
-fn derive_or_in_list(
-    column_key: &str,
-    per_branch: &[HashMap<String, Vec<ColumnConstraint>>],
-) -> Option<PredicateGroup> {
-    let first = per_branch[0].get(column_key)?.first()?.column.clone();
+fn derive_or_in_list(column_key: &str, per_branch: &[BranchCandidates]) -> Option<PredicateGroup> {
+    let first = per_branch[0]
+        .by_column
+        .get(column_key)?
+        .first()?
+        .column
+        .clone();
     let mut values = Vec::new();
     for branch in per_branch {
-        let constraints = branch.get(column_key)?;
+        let constraints = branch.by_column.get(column_key)?;
         let eq = constraints
             .iter()
             .find_map(|constraint| match &constraint.kind {
@@ -332,14 +358,19 @@ fn derive_or_in_list(
 
 fn derive_or_range_envelope(
     column_key: &str,
-    per_branch: &[HashMap<String, Vec<ColumnConstraint>>],
+    per_branch: &[BranchCandidates],
 ) -> Option<PredicateGroup> {
-    let first = per_branch[0].get(column_key)?.first()?.column.clone();
+    let first = per_branch[0]
+        .by_column
+        .get(column_key)?
+        .first()?
+        .column
+        .clone();
     let mut low: Option<TypedExpr> = None;
     let mut high: Option<TypedExpr> = None;
 
     for branch in per_branch {
-        let constraints = branch.get(column_key)?;
+        let constraints = branch.by_column.get(column_key)?;
         let (branch_low, branch_high) = branch_range(constraints)?;
         low = Some(match low {
             Some(current)
@@ -428,6 +459,25 @@ fn is_cross_side_pair(
     )
 }
 
+fn derive_or_side_fallback(side: Side, per_branch: &[BranchCandidates]) -> Option<PredicateGroup> {
+    let mut branch_exprs = Vec::new();
+    for branch in per_branch {
+        let constraints = branch.by_side.get(&side)?;
+        if constraints.is_empty() {
+            return None;
+        }
+        let exprs: Option<Vec<TypedExpr>> = constraints.iter().map(constraint_to_expr).collect();
+        branch_exprs.push(combine_bool_exprs(exprs?, BinOp::And)?);
+    }
+
+    let expr = combine_bool_exprs(branch_exprs, BinOp::Or)?;
+    Some(PredicateGroup::new(
+        expr,
+        PredicateOrigin::Derived,
+        PredicateDerivedKind::OrSideFilter,
+    ))
+}
+
 fn column_side(
     expr: &TypedExpr,
     left_ids: &HashSet<ColumnId>,
@@ -441,6 +491,26 @@ fn column_side(
         (false, true) => Some(Side::Right),
         _ => None,
     }
+}
+
+fn single_column_side(
+    expr: &TypedExpr,
+    left_ids: &HashSet<ColumnId>,
+    right_ids: &HashSet<ColumnId>,
+) -> Option<Side> {
+    let mut side = None;
+    for id in crate::sql::optimizer::rewrite::rules::utils::collect_column_id_refs(expr) {
+        let current = match (left_ids.contains(&id), right_ids.contains(&id)) {
+            (true, false) => Side::Left,
+            (false, true) => Side::Right,
+            _ => return None,
+        };
+        if side.is_some_and(|existing| existing != current) {
+            return None;
+        }
+        side = Some(current);
+    }
+    side
 }
 
 fn same_column(left: &TypedExpr, right: &TypedExpr) -> bool {
@@ -469,6 +539,34 @@ fn binary_bool(left: TypedExpr, op: BinOp, right: TypedExpr) -> TypedExpr {
             right: Box::new(right),
         },
     }
+}
+
+fn constraint_to_expr(constraint: &ColumnConstraint) -> Option<TypedExpr> {
+    substitute_constraint_column(
+        constraint,
+        &constraint.column,
+        PredicateDerivedKind::OrSideFilter,
+    )
+    .map(|group| group.expr)
+}
+
+fn combine_bool_exprs(mut exprs: Vec<TypedExpr>, op: BinOp) -> Option<TypedExpr> {
+    if exprs.is_empty() {
+        return None;
+    }
+    let mut result = exprs.pop()?;
+    while let Some(left) = exprs.pop() {
+        result = TypedExpr {
+            data_type: DataType::Boolean,
+            nullable: left.nullable || result.nullable,
+            kind: ExprKind::BinaryOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(result),
+            },
+        };
+    }
+    Some(result)
 }
 
 #[cfg(test)]
@@ -536,6 +634,19 @@ mod tests {
     }
 
     #[test]
+    fn derives_equality_from_filter_group_join_key() {
+        let filter_eq = group(bool_expr(col("l", "a", 1), BinOp::Eq, col("r", "b", 2)));
+        let left_filter = group(bool_expr(col("l", "a", 1), BinOp::Eq, int_lit(7)));
+
+        let derived =
+            derive_inner_join_predicates(&ids(&[1]), &ids(&[2]), &[], &[filter_eq, left_filter]);
+
+        let rendered = format!("{:?}", derived);
+        assert!(rendered.contains("\"b\""));
+        assert!(rendered.contains("Int(7)"));
+    }
+
+    #[test]
     fn derives_or_side_filter_from_branch_equalities() {
         let or_pred = bool_expr(
             bool_expr(
@@ -558,6 +669,33 @@ mod tests {
         assert!(rendered.contains("InList") || rendered.contains("Or"));
         assert!(rendered.contains("Int(1)"));
         assert!(rendered.contains("Int(2)"));
+    }
+
+    #[test]
+    fn derives_or_side_filter_for_different_columns_on_same_side() {
+        let or_pred = bool_expr(
+            bool_expr(
+                bool_expr(col("l", "a", 1), BinOp::Eq, col("r", "b", 2)),
+                BinOp::And,
+                bool_expr(col("l", "a", 1), BinOp::Eq, int_lit(1)),
+            ),
+            BinOp::Or,
+            bool_expr(
+                bool_expr(col("l", "c", 3), BinOp::Eq, col("r", "d", 4)),
+                BinOp::And,
+                bool_expr(col("l", "c", 3), BinOp::Eq, int_lit(2)),
+            ),
+        );
+
+        let derived =
+            derive_inner_join_predicates(&ids(&[1, 3]), &ids(&[2, 4]), &[], &[group(or_pred)]);
+
+        let rendered = format!("{:?}", derived);
+        assert!(rendered.contains("\"b\""));
+        assert!(rendered.contains("\"d\""));
+        assert!(rendered.contains("Int(1)"));
+        assert!(rendered.contains("Int(2)"));
+        assert!(rendered.contains("Or"));
     }
 
     #[test]

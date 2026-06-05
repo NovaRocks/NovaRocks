@@ -1342,6 +1342,34 @@ mod tests {
     }
 
     #[test]
+    fn filter_join_derives_right_filter_from_filter_join_key_constant() {
+        let predicate = combine_and(vec![
+            eq(col_with_id("l", "a", 1), col_with_id("r", "b", 2)),
+            eq(col_with_id("l", "a", 1), int_lit(7)),
+        ]);
+
+        let (plan, changed) =
+            push_filter_predicates_through_join(predicate, join_with_ids(JoinKind::Inner, None));
+
+        assert!(changed);
+        let LogicalPlan::Join(join) = plan else {
+            panic!("expected bare Join");
+        };
+        match join.right.as_ref() {
+            LogicalPlan::Filter(filter) => {
+                let rendered = format!("{:?}", filter.predicate.kind);
+                assert!(rendered.contains("\"b\""));
+                assert!(rendered.contains("Int(7)"));
+            }
+            other => panic!("expected right Filter, got {:?}", other),
+        }
+        let condition = join.condition.expect("join condition");
+        let rendered = format!("{:?}", condition.kind);
+        assert!(rendered.contains("\"a\""));
+        assert!(rendered.contains("\"b\""));
+    }
+
+    #[test]
     fn join_condition_pushes_single_side_terms_below_inner_join() {
         let condition = combine_and(vec![
             eq(col_with_id("l", "a", 1), int_lit(10)),
