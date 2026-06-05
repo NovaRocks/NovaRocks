@@ -15,6 +15,11 @@
 use std::collections::HashSet;
 
 use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, TypedExpr};
+use crate::sql::column_id::ColumnId;
+use crate::sql::optimizer::rewrite::rules::predicate_pushdown::deriver::derive_inner_join_predicates;
+use crate::sql::optimizer::rewrite::rules::predicate_pushdown::predicate_group::{
+    PredicateGroup, PredicateOrigin,
+};
 use crate::sql::optimizer::rewrite::rules::utils::{
     collect_column_id_refs, collect_column_refs, collect_output_columns, collect_output_ids,
     collect_qualified_column_refs, collect_qualified_output_columns, combine_and, split_and,
@@ -62,11 +67,22 @@ pub(crate) fn push_filter_predicates_through_join(
     predicate: TypedExpr,
     join: JoinNode,
 ) -> (LogicalPlan, bool) {
-    let conjuncts = split_and(predicate);
     let left_cols = collect_output_columns(&join.left);
     let right_cols = collect_output_columns(&join.right);
     let left_ids = collect_output_ids(&join.left);
     let right_ids = collect_output_ids(&join.right);
+    let filter_groups = PredicateGroup::from_predicate(predicate.clone(), PredicateOrigin::Filter);
+    let join_groups = join
+        .condition
+        .clone()
+        .map(|condition| PredicateGroup::from_predicate(condition, PredicateOrigin::JoinCondition))
+        .unwrap_or_default();
+    let mut conjuncts = split_and(predicate);
+    if matches!(join.join_type, JoinKind::Inner | JoinKind::Cross) {
+        let derived =
+            derive_inner_join_predicates(&left_ids, &right_ids, &join_groups, &filter_groups);
+        append_new_derived_conjuncts(&mut conjuncts, derived, &join, &left_ids, &right_ids);
+    }
 
     // Qualified output columns for precise self-join disambiguation.
     let left_qcols = collect_qualified_output_columns(&join.left);
@@ -349,17 +365,23 @@ pub(crate) fn push_join_condition_predicates(join: JoinNode) -> Option<LogicalPl
         return None;
     }
 
-    let condition = join.condition?;
+    let condition = join.condition.clone()?;
     let left_ids = collect_output_ids(&join.left);
     let right_ids = collect_output_ids(&join.right);
     let left_cols = collect_output_columns(&join.left);
     let right_cols = collect_output_columns(&join.right);
+    let condition_groups =
+        PredicateGroup::from_predicate(condition.clone(), PredicateOrigin::JoinCondition);
+    let mut conjuncts = split_and(condition);
+    let derived =
+        derive_inner_join_predicates(&left_ids, &right_ids, &condition_groups, &condition_groups);
+    append_new_derived_conjuncts(&mut conjuncts, derived, &join, &left_ids, &right_ids);
 
     let mut left_preds = Vec::new();
     let mut right_preds = Vec::new();
     let mut residual_preds = Vec::new();
 
-    for conj in split_and(condition) {
+    for conj in conjuncts {
         let refs = collect_column_refs(&conj);
         let (in_left, in_right) = classify_sides_by_column_ids(&conj, &left_ids, &right_ids)
             .unwrap_or_else(|| {
@@ -424,10 +446,47 @@ pub(crate) fn push_join_condition_predicates(join: JoinNode) -> Option<LogicalPl
     }))
 }
 
+fn append_new_derived_conjuncts(
+    conjuncts: &mut Vec<TypedExpr>,
+    derived: Vec<PredicateGroup>,
+    join: &JoinNode,
+    left_ids: &HashSet<ColumnId>,
+    right_ids: &HashSet<ColumnId>,
+) {
+    let mut seen: HashSet<String> = conjuncts.iter().map(predicate_key).collect();
+    for group in derived {
+        if derived_exists_below_child(&group.expr, join, left_ids, right_ids) {
+            continue;
+        }
+        if seen.insert(predicate_key(&group.expr)) {
+            conjuncts.push(group.expr);
+        }
+    }
+}
+
+fn derived_exists_below_child(
+    expr: &TypedExpr,
+    join: &JoinNode,
+    left_ids: &HashSet<ColumnId>,
+    right_ids: &HashSet<ColumnId>,
+) -> bool {
+    let ids = collect_column_id_refs(expr);
+    if ids.is_empty() {
+        return false;
+    }
+    if ids.iter().all(|id| left_ids.contains(id)) {
+        return subtree_has_predicate(&join.left, expr);
+    }
+    if ids.iter().all(|id| right_ids.contains(id)) {
+        return subtree_has_predicate(&join.right, expr);
+    }
+    false
+}
+
 fn classify_sides_by_column_ids(
     expr: &TypedExpr,
-    left_ids: &HashSet<crate::sql::column_id::ColumnId>,
-    right_ids: &HashSet<crate::sql::column_id::ColumnId>,
+    left_ids: &HashSet<ColumnId>,
+    right_ids: &HashSet<ColumnId>,
 ) -> Option<(bool, bool)> {
     let ids = collect_column_id_refs(expr);
     if ids.is_empty() || ids.len() != collect_qualified_column_refs(expr).len() {
@@ -1301,6 +1360,42 @@ mod tests {
         assert!(rendered.contains("\"v\""));
         assert!(rendered.contains("\"w\""));
         assert!(!rendered.contains("Int(10)"));
+    }
+
+    #[test]
+    fn join_condition_derives_right_filter_from_left_key_constant() {
+        let condition = combine_and(vec![
+            eq(col_with_id("l", "a", 1), col_with_id("r", "b", 2)),
+            eq(col_with_id("l", "a", 1), int_lit(7)),
+        ]);
+
+        let plan = push_join_condition_predicates(join_with_ids(JoinKind::Inner, Some(condition)))
+            .expect("join condition should derive side filters");
+
+        let LogicalPlan::Join(join) = plan else {
+            panic!("expected Join");
+        };
+        match join.left.as_ref() {
+            LogicalPlan::Filter(filter) => {
+                let rendered = format!("{:?}", filter.predicate.kind);
+                assert!(rendered.contains("\"a\""));
+                assert!(rendered.contains("Int(7)"));
+            }
+            other => panic!("expected left Filter, got {:?}", other),
+        }
+        match join.right.as_ref() {
+            LogicalPlan::Filter(filter) => {
+                let rendered = format!("{:?}", filter.predicate.kind);
+                assert!(rendered.contains("\"b\""));
+                assert!(rendered.contains("Int(7)"));
+            }
+            other => panic!("expected right Filter, got {:?}", other),
+        }
+        let condition = join.condition.expect("residual condition");
+        let rendered = format!("{:?}", condition.kind);
+        assert!(rendered.contains("\"a\""));
+        assert!(rendered.contains("\"b\""));
+        assert!(!rendered.contains("Int(7)"));
     }
 
     #[test]
