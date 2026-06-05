@@ -4,7 +4,7 @@ use arrow::datatypes::DataType;
 
 use crate::sql::analysis::{BinOp, ExprKind, TypedExpr};
 use crate::sql::column_id::ColumnId;
-use crate::sql::optimizer::rewrite::rules::utils::{collect_column_id_refs, split_and};
+use crate::sql::optimizer::rewrite::rules::utils::collect_column_id_refs;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct PredicateKey(String);
@@ -62,7 +62,7 @@ impl PredicateGroup {
     }
 
     pub(crate) fn from_predicate(expr: TypedExpr, origin: PredicateOrigin) -> Vec<Self> {
-        split_and(expr)
+        split_and_owned(expr)
             .into_iter()
             .map(|expr| Self::new(expr, origin, PredicateDerivedKind::None))
             .collect()
@@ -137,6 +137,22 @@ pub(crate) fn split_and_refs(expr: &TypedExpr) -> Vec<&TypedExpr> {
     }
 }
 
+fn split_and_owned(expr: TypedExpr) -> Vec<TypedExpr> {
+    match expr.kind {
+        ExprKind::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } => {
+            let mut out = split_and_owned(*left);
+            out.extend(split_and_owned(*right));
+            out
+        }
+        ExprKind::Nested(inner) => split_and_owned(*inner),
+        _ => vec![expr],
+    }
+}
+
 pub(crate) fn contains_non_deterministic_function(expr: &TypedExpr) -> bool {
     match &expr.kind {
         ExprKind::FunctionCall { name, args, .. } => {
@@ -149,7 +165,13 @@ pub(crate) fn contains_non_deterministic_function(expr: &TypedExpr) -> bool {
                     | "now"
                     | "current_timestamp"
                     | "current_date"
+                    | "curdate"
                     | "current_time"
+                    | "curtime"
+                    | "localtime"
+                    | "localtimestamp"
+                    | "utc_timestamp"
+                    | "utc_time"
             ) || args.iter().any(contains_non_deterministic_function)
         }
         ExprKind::AggregateCall { args, order_by, .. } => {
@@ -258,6 +280,18 @@ mod tests {
         }
     }
 
+    fn func(name: &str, args: Vec<TypedExpr>) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::FunctionCall {
+                name: name.to_string(),
+                args,
+                distinct: false,
+            },
+            data_type: DataType::Int64,
+            nullable: true,
+        }
+    }
+
     #[test]
     fn top_level_and_is_split_but_or_stays_atomic() {
         let expr = bool_expr(
@@ -287,6 +321,23 @@ mod tests {
             groups[1].expr.kind,
             ExprKind::BinaryOp { op: BinOp::Or, .. }
         ));
+    }
+
+    #[test]
+    fn nested_top_level_and_is_split_into_groups() {
+        let expr = TypedExpr {
+            kind: ExprKind::Nested(Box::new(bool_expr(
+                bool_expr(col("a", 1), BinOp::Eq, int_lit(1)),
+                BinOp::And,
+                bool_expr(col("b", 2), BinOp::Eq, int_lit(2)),
+            ))),
+            data_type: DataType::Boolean,
+            nullable: true,
+        };
+
+        let groups = PredicateGroup::from_predicate(expr, PredicateOrigin::Filter);
+
+        assert_eq!(groups.len(), 2);
     }
 
     #[test]
@@ -324,6 +375,25 @@ mod tests {
     }
 
     #[test]
+    fn combine_or_round_trips_to_left_to_right_or_branches() {
+        let expr = combine_or(vec![
+            bool_expr(col("a", 1), BinOp::Eq, int_lit(1)),
+            bool_expr(col("a", 1), BinOp::Eq, int_lit(2)),
+            bool_expr(col("a", 1), BinOp::Eq, int_lit(3)),
+        ]);
+
+        let branch_debugs: Vec<String> = split_or_refs(&expr)
+            .into_iter()
+            .map(|branch| format!("{:?}", branch.kind))
+            .collect();
+
+        assert_eq!(branch_debugs.len(), 3);
+        assert!(branch_debugs[0].contains("Int(1)"));
+        assert!(branch_debugs[1].contains("Int(2)"));
+        assert!(branch_debugs[2].contains("Int(3)"));
+    }
+
+    #[test]
     fn non_deterministic_function_is_detected() {
         let expr = TypedExpr {
             kind: ExprKind::FunctionCall {
@@ -334,6 +404,21 @@ mod tests {
             data_type: DataType::Float64,
             nullable: false,
         };
+
+        assert!(contains_non_deterministic_function(&expr));
+    }
+
+    #[test]
+    fn curdate_is_detected_as_non_deterministic() {
+        assert!(contains_non_deterministic_function(&func(
+            "curdate",
+            vec![]
+        )));
+    }
+
+    #[test]
+    fn nested_scalar_function_argument_is_checked_for_non_determinism() {
+        let expr = func("if", vec![col("a", 1), func("curdate", vec![]), int_lit(1)]);
 
         assert!(contains_non_deterministic_function(&expr));
     }
