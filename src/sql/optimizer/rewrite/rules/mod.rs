@@ -28,10 +28,9 @@ pub(crate) fn column_pruning_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
     rules
 }
 
-/// Predicate pushdown rules only (no column pruning). Used in the
-/// push → reorder → push pattern. Column pruning runs as a separate
-/// final pass AFTER all pushdown and reorder passes are complete —
-/// matching the legacy pipeline where prune_columns was always last.
+/// Reusable predicate pushdown rules only (no column pruning). Query rewrite
+/// stages decide where to run these rules; column pruning stays in its own pass
+/// after predicate placement has stabilized.
 /// Mixing PruneColumns with PushDownPredicate in a fixed-point loop
 /// causes the needed-column set to shrink across iterations as
 /// predicates get reshuffled, incorrectly dropping join-key or

@@ -109,7 +109,7 @@ mod tests {
     }
 
     #[test]
-    fn query_pipeline_contains_migrated_query_rules() {
+    fn query_pipeline_uses_expected_stage_order_and_rules() {
         let table_stats = HashMap::new();
         let pipeline = query_rewrite_pipeline(&table_stats);
 
