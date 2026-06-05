@@ -277,6 +277,17 @@ pub struct CreateIcebergOperationRequest {
     pub created_at_ms: i64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IcebergOperationFactUpdate {
+    pub operation_id: i64,
+    pub state: IcebergOperationState,
+    pub commit_outcome: Option<IcebergCommitOutcomeRecord>,
+    pub cleanup_outcome: Option<IcebergCleanupOutcomeRecord>,
+    pub recovery_evidence: Option<IcebergRecoveryEvidenceRecord>,
+    pub failure: Option<IcebergOperationFailureRecord>,
+    pub now_ms: i64,
+}
+
 impl IcebergOperationRepository {
     pub fn create_operation(
         &self,
@@ -354,6 +365,52 @@ impl IcebergOperationRepository {
             ExpectedRevision::Exact(versioned.record_revision),
         )
     }
+
+    pub fn record_operation_fact(
+        &self,
+        txn: &mut dyn MetaWriteTxn,
+        req: IcebergOperationFactUpdate,
+    ) -> RepositoryResult<()> {
+        let mut versioned = load_versioned_operation(txn, req.operation_id)?.ok_or_else(|| {
+            RepositoryError::not_found(format!("iceberg operation {} not found", req.operation_id))
+        })?;
+        validate_operation_transition(versioned.value.state, req.state)?;
+        if versioned.value.state == req.state {
+            if operation_fact_fields_match(&versioned.value, &req) {
+                return Ok(());
+            }
+            return Err(RepositoryError::conflict(format!(
+                "conflicting Iceberg operation fact replay for operation {} in state {}",
+                req.operation_id,
+                req.state.as_str()
+            )));
+        }
+
+        versioned.value.state = req.state;
+        versioned.value.commit_outcome = req.commit_outcome;
+        versioned.value.cleanup_outcome = req.cleanup_outcome;
+        versioned.value.recovery_evidence = req.recovery_evidence;
+        versioned.value.failure = req.failure;
+        versioned.value.updated_at_ms = req.now_ms;
+        if req.state.is_finished() {
+            versioned.value.finished_at_ms = Some(req.now_ms);
+        }
+        put_operation(
+            txn,
+            &versioned.value,
+            ExpectedRevision::Exact(versioned.record_revision),
+        )
+    }
+}
+
+fn operation_fact_fields_match(
+    operation: &StoredIcebergOperation,
+    req: &IcebergOperationFactUpdate,
+) -> bool {
+    operation.commit_outcome.as_ref() == req.commit_outcome.as_ref()
+        && operation.cleanup_outcome.as_ref() == req.cleanup_outcome.as_ref()
+        && operation.recovery_evidence.as_ref() == req.recovery_evidence.as_ref()
+        && operation.failure.as_ref() == req.failure.as_ref()
 }
 
 fn load_versioned_operation(
