@@ -40,6 +40,16 @@ pub(crate) fn query_rewrite_pipeline(
             },
         ),
         RewriteStage::new(
+            "PredicateMoveAround",
+            RewritePhase::StructuralRewrite,
+            rules::predicate_move_around_rules(),
+        ),
+        RewriteStage::new(
+            "PredicatePushdownAfterMoveAround",
+            RewritePhase::StructuralRewrite,
+            rules::predicate_pushdown_rules(),
+        ),
+        RewriteStage::new(
             "AggregatePushdown",
             RewritePhase::StructuralRewrite,
             rules::aggregate_pushdown::aggregate_pushdown_rules(table_stats),
@@ -111,6 +121,7 @@ mod tests {
                 "AggregatePushdown",
                 "DeriveJoinNotNullPredicate",
                 "EliminateUniqueAggregate",
+                "JoinPredicateMoveAround",
                 "JoinReorder",
                 "LowCardinalityDictionaryRewrite",
                 "PruneAggregateColumns",
@@ -133,12 +144,17 @@ mod tests {
                 "PruneWindowColumns",
                 "PushDownPredicateAggregate",
                 "PushDownPredicateAggregate",
+                "PushDownPredicateAggregate",
+                "PushDownPredicateJoin",
                 "PushDownPredicateJoin",
                 "PushDownPredicateJoin",
                 "PushDownPredicateProject",
                 "PushDownPredicateProject",
+                "PushDownPredicateProject",
                 "PushDownPredicateScan",
                 "PushDownPredicateScan",
+                "PushDownPredicateScan",
+                "PushSemiAntiRightOnlyCondition",
                 "PushSemiAntiRightOnlyCondition",
                 "PushSemiAntiRightOnlyCondition",
                 "TagRequiredColumns",
@@ -181,6 +197,7 @@ mod tests {
         assert!(is_known_rewrite_rule_name("TagRequiredColumns"));
         assert!(!is_known_rewrite_rule_name("PushFilterThroughProject"));
         assert!(is_known_rewrite_rule_name("DeriveJoinNotNullPredicate"));
+        assert!(is_known_rewrite_rule_name("JoinPredicateMoveAround"));
     }
 
     fn assert_default_phase_trace(ctx: &RewriteContext) {

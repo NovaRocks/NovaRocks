@@ -40,6 +40,10 @@ pub(crate) fn predicate_pushdown_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
     predicate_pushdown::predicate_pushdown_rules()
 }
 
+pub(crate) fn predicate_move_around_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
+    predicate_pushdown::predicate_move_around_rules()
+}
+
 /// Join reorder rule only. Called as a SEPARATE pass between two
 /// predicate pushdown passes (the "push, reorder, push" pattern).
 /// Do NOT mix with structural rules in a single fixed-point — pushdown
@@ -62,6 +66,7 @@ pub(crate) fn all_query_rewrite_rules(
 ) -> Vec<Box<dyn LogicalRewriteRule>> {
     let mut all = Vec::new();
     all.extend(predicate_pushdown_rules());
+    all.extend(predicate_move_around_rules());
     all.extend(column_pruning_rules());
     all.extend(join_reorder_rules(table_stats));
     all.extend(aggregate_pushdown::aggregate_pushdown_rules(table_stats));
@@ -78,8 +83,9 @@ mod tests {
     fn registry_contains_expected_rules() {
         let rules = all_query_rewrite_rules(&HashMap::new());
         // 17 v2 pruning rules + 2 ukfk + 1 JoinReorder + 1 AggregatePushdown
-        // + 1 LowCardinalityDictionaryRewrite + 5 predicate pushdown rules + 1 DeriveJoinNotNullPredicate = 28
-        assert_eq!(rules.len(), 28);
+        // + 1 LowCardinalityDictionaryRewrite + 5 predicate pushdown rules
+        // + 1 predicate move-around rule + 1 DeriveJoinNotNullPredicate = 29
+        assert_eq!(rules.len(), 29);
         let mut names: Vec<&str> = rules.iter().map(|r| r.name()).collect();
         names.sort();
         assert_eq!(
@@ -88,6 +94,7 @@ mod tests {
                 "AggregatePushdown",
                 "DeriveJoinNotNullPredicate",
                 "EliminateUniqueAggregate",
+                "JoinPredicateMoveAround",
                 "JoinReorder",
                 "LowCardinalityDictionaryRewrite",
                 "PruneAggregateColumns",
