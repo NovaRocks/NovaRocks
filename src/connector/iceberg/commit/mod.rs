@@ -44,6 +44,7 @@ pub mod rewrite_position_delete_files;
 mod row_delta;
 mod row_delta_dv;
 mod run;
+mod service;
 pub mod snapshot_lifecycle_helpers;
 #[cfg(test)]
 pub(crate) mod test_helpers;
