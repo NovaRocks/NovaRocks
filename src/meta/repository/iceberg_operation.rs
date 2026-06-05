@@ -16,179 +16,19 @@
 // under the License.
 
 use std::collections::BTreeMap;
-use std::io::Cursor;
-use std::sync::LazyLock;
 
-use apache_avro::rabin::Rabin;
-use apache_avro::{Schema, from_avro_datum, from_value, to_avro_datum, to_value};
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::meta::keys::NS_ICEBERG_OPERATION;
-use crate::meta::repository::{RepositoryError, RepositoryResult, id_scopes};
+use crate::meta::repository::{
+    RepositoryError, RepositoryResult, decode_payload_for_kind, encode_record_payload, id_scopes,
+};
 use crate::meta::{
-    ExpectedRevision, MetaKey, MetaKeyPrefix, MetaPayload, MetaPayloadEncoding, MetaReadTxn,
-    MetaRecord, MetaRecordKind, MetaRecordPut, MetaRevision, MetaWriteTxn,
+    ExpectedRevision, MetaKey, MetaKeyPrefix, MetaReadTxn, MetaRecord, MetaRecordKind,
+    MetaRecordPut, MetaRevision, MetaWriteTxn,
 };
 
 const ICEBERG_OPERATION_KIND: &str = "iceberg.operation";
-const ICEBERG_OPERATION_SCHEMA_ID: i32 = 1;
-const ICEBERG_OPERATION_SCHEMA_RAW: &str = r#"
-{
-  "type": "record",
-  "name": "StoredIcebergOperation",
-  "namespace": "novarocks.meta.iceberg_operation",
-  "fields": [
-    { "name": "operation_id", "type": "long" },
-    {
-      "name": "operation_kind",
-      "type": {
-        "type": "enum",
-        "name": "IcebergOperationKind",
-        "symbols": [
-          "INSERT_APPEND",
-          "INSERT_OVERWRITE",
-          "ROW_DELTA",
-          "MV_REFRESH",
-          "MAINTENANCE"
-        ]
-      }
-    },
-    {
-      "name": "target",
-      "type": {
-        "type": "record",
-        "name": "IcebergOperationTarget",
-        "fields": [
-          { "name": "catalog", "type": "string" },
-          { "name": "namespace", "type": "string" },
-          { "name": "table", "type": "string" },
-          { "name": "ref_name", "type": ["null", "string"], "default": null }
-        ]
-      }
-    },
-    {
-      "name": "state",
-      "type": {
-        "type": "enum",
-        "name": "IcebergOperationState",
-        "symbols": [
-          "PREPARING",
-          "WRITING",
-          "COLLECTING",
-          "COMMITTING",
-          "COMMITTED",
-          "COMMIT_UNKNOWN",
-          "FINALIZING",
-          "FINALIZED",
-          "ABORTING",
-          "ABORTED",
-          "FAILED_KNOWN_UNCOMMITTED",
-          "FINALIZE_FAILED_KNOWN_COMMITTED"
-        ]
-      }
-    },
-    { "name": "attempt_id", "type": "string" },
-    { "name": "base_snapshot_id", "type": ["null", "long"], "default": null },
-    { "name": "base_snapshot_map", "type": { "type": "map", "values": "long" } },
-    { "name": "staged_artifacts", "type": { "type": "array", "items": "string" } },
-    { "name": "commit_request", "type": ["null", "string"], "default": null },
-    {
-      "name": "commit_outcome",
-      "type": [
-        "null",
-        {
-          "type": "record",
-          "name": "IcebergCommitOutcomeRecord",
-          "fields": [
-            { "name": "snapshot_id", "type": "long" },
-            {
-              "name": "written_manifest_paths",
-              "type": { "type": "array", "items": "string" }
-            }
-          ]
-        }
-      ],
-      "default": null
-    },
-    {
-      "name": "cleanup_outcome",
-      "type": [
-        "null",
-        {
-          "type": "record",
-          "name": "IcebergCleanupOutcomeRecord",
-          "fields": [
-            { "name": "attempted", "type": "boolean" },
-            { "name": "error_count", "type": "long" },
-            { "name": "error_paths", "type": { "type": "array", "items": "string" } }
-          ]
-        }
-      ],
-      "default": null
-    },
-    {
-      "name": "recovery_evidence",
-      "type": [
-        "null",
-        {
-          "type": "record",
-          "name": "IcebergRecoveryEvidenceRecord",
-          "fields": [
-            { "name": "table_ident", "type": "string" },
-            { "name": "commit_op_kind", "type": "string" },
-            { "name": "base_snapshot_id", "type": ["null", "long"], "default": null },
-            {
-              "name": "base_sequence_number",
-              "type": ["null", "long"],
-              "default": null
-            },
-            { "name": "staging_dir", "type": "string" }
-          ]
-        }
-      ],
-      "default": null
-    },
-    {
-      "name": "failure",
-      "type": [
-        "null",
-        {
-          "type": "record",
-          "name": "IcebergOperationFailureRecord",
-          "fields": [
-            {
-              "name": "kind",
-              "type": {
-                "type": "enum",
-                "name": "IcebergOperationFailureKind",
-                "symbols": ["KNOWN_UNCOMMITTED", "UNKNOWN", "FINALIZE_KNOWN_COMMITTED"]
-              }
-            },
-            { "name": "message", "type": "string" },
-            {
-              "name": "next_action",
-              "type": {
-                "type": "enum",
-                "name": "IcebergOperationNextAction",
-                "symbols": ["NONE", "RETRY_ABORT", "RETRY_FINALIZE", "MANUAL_INSPECT"]
-              }
-            }
-          ]
-        }
-      ],
-      "default": null
-    },
-    { "name": "created_at_ms", "type": "long" },
-    { "name": "updated_at_ms", "type": "long" },
-    { "name": "finished_at_ms", "type": ["null", "long"], "default": null }
-  ]
-}
-"#;
-
-static ICEBERG_OPERATION_SCHEMA: LazyLock<Result<Schema, String>> = LazyLock::new(|| {
-    Schema::parse_str(ICEBERG_OPERATION_SCHEMA_RAW).map_err(|err| err.to_string())
-});
 
 #[derive(Default)]
 pub struct IcebergOperationRepository;
@@ -530,7 +370,13 @@ fn decode_operation_record(record: MetaRecord) -> RepositoryResult<VersionedIceb
             record.kind.as_str()
         )));
     }
-    let value = decode_operation_payload(&record.payload, &record.key.canonical_path())?;
+    let value =
+        decode_payload_for_kind(ICEBERG_OPERATION_KIND, &record.payload).map_err(|err| {
+            RepositoryError::provider(format!(
+                "failed to decode metadata record {} as {ICEBERG_OPERATION_KIND}: {err}",
+                record.key.canonical_path()
+            ))
+        })?;
     Ok(VersionedIcebergOperation {
         record_revision: record.revision,
         value,
@@ -546,97 +392,9 @@ fn put_operation(
         key_operation(operation.operation_id)?,
         record_kind(ICEBERG_OPERATION_KIND)?,
         expected,
-        encode_operation_payload(operation)?,
+        encode_record_payload(ICEBERG_OPERATION_KIND, operation)?,
     ))?;
     Ok(())
-}
-
-fn encode_operation_payload(operation: &StoredIcebergOperation) -> RepositoryResult<MetaPayload> {
-    let schema = operation_schema()?;
-    let value = to_value(operation).map_err(|err| {
-        RepositoryError::invalid(format!(
-            "failed to convert Iceberg operation to Avro: {err}"
-        ))
-    })?;
-    let bytes = to_avro_datum(schema, value).map_err(|err| {
-        RepositoryError::invalid(format!(
-            "failed to encode Avro payload for subject `{ICEBERG_OPERATION_KIND}` schema id {ICEBERG_OPERATION_SCHEMA_ID}: {err}"
-        ))
-    })?;
-    Ok(MetaPayload::avro(
-        ICEBERG_OPERATION_SCHEMA_ID,
-        operation_schema_fingerprint()?,
-        Bytes::from(bytes),
-    ))
-}
-
-fn decode_operation_payload(
-    payload: &MetaPayload,
-    record_path: &str,
-) -> RepositoryResult<StoredIcebergOperation> {
-    if payload.encoding != MetaPayloadEncoding::Avro {
-        return Err(RepositoryError::invalid(format!(
-            "expected Avro payload, got {:?}",
-            payload.encoding
-        )));
-    }
-    if payload.schema_id != ICEBERG_OPERATION_SCHEMA_ID {
-        return Err(RepositoryError::provider(format!(
-            "unknown Avro schema entry for subject `{ICEBERG_OPERATION_KIND}` id {}",
-            payload.schema_id
-        )));
-    }
-    let expected_fingerprint = operation_schema_fingerprint()?;
-    if payload.schema_fingerprint != expected_fingerprint {
-        return Err(RepositoryError::provider(format!(
-            "Avro schema fingerprint mismatch for subject `{ICEBERG_OPERATION_KIND}` schema id {}: payload={}, catalog={expected_fingerprint}",
-            payload.schema_id, payload.schema_fingerprint
-        )));
-    }
-
-    let schema = operation_schema()?;
-    let mut cursor = Cursor::new(payload.bytes.as_ref());
-    let value = from_avro_datum(schema, &mut cursor, Some(schema)).map_err(|err| {
-        RepositoryError::invalid(format!(
-            "failed to decode metadata record {record_path} as {ICEBERG_OPERATION_KIND}: {err}"
-        ))
-    })?;
-    if cursor.position() != payload.bytes.len() as u64 {
-        return Err(RepositoryError::invalid(format!(
-            "failed to decode metadata record {record_path} as {ICEBERG_OPERATION_KIND}: trailing bytes after datum"
-        )));
-    }
-    from_value::<StoredIcebergOperation>(&value).map_err(|err| {
-        RepositoryError::invalid(format!(
-            "failed to materialize metadata record {record_path} as {ICEBERG_OPERATION_KIND}: {err}"
-        ))
-    })
-}
-
-fn operation_schema() -> RepositoryResult<&'static Schema> {
-    match &*ICEBERG_OPERATION_SCHEMA {
-        Ok(schema) => Ok(schema),
-        Err(err) => Err(RepositoryError::provider(format!(
-            "failed to parse Avro schema {ICEBERG_OPERATION_KIND} v{ICEBERG_OPERATION_SCHEMA_ID}: {err}"
-        ))),
-    }
-}
-
-fn operation_schema_fingerprint() -> RepositoryResult<String> {
-    Ok(operation_schema()?.fingerprint::<Rabin>().to_string())
-}
-
-#[cfg(test)]
-pub(crate) fn encode_seed_operation_payload(
-    payload: &serde_json::Value,
-) -> RepositoryResult<MetaPayload> {
-    let value =
-        serde_json::from_value::<StoredIcebergOperation>(payload.clone()).map_err(|err| {
-            RepositoryError::invalid(format!(
-                "failed to materialize test seed payload for `{ICEBERG_OPERATION_KIND}`: {err}"
-            ))
-        })?;
-    encode_operation_payload(&value)
 }
 
 fn key_operation(operation_id: i64) -> RepositoryResult<MetaKey> {

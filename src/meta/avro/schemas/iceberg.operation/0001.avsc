@@ -1,0 +1,150 @@
+{
+  "type": "record",
+  "name": "StoredIcebergOperation",
+  "namespace": "novarocks.meta.iceberg_operation",
+  "fields": [
+    { "name": "operation_id", "type": "long" },
+    {
+      "name": "operation_kind",
+      "type": {
+        "type": "enum",
+        "name": "IcebergOperationKind",
+        "symbols": [
+          "INSERT_APPEND",
+          "INSERT_OVERWRITE",
+          "ROW_DELTA",
+          "MV_REFRESH",
+          "MAINTENANCE"
+        ]
+      }
+    },
+    {
+      "name": "target",
+      "type": {
+        "type": "record",
+        "name": "IcebergOperationTarget",
+        "fields": [
+          { "name": "catalog", "type": "string" },
+          { "name": "namespace", "type": "string" },
+          { "name": "table", "type": "string" },
+          { "name": "ref_name", "type": ["null", "string"], "default": null }
+        ]
+      }
+    },
+    {
+      "name": "state",
+      "type": {
+        "type": "enum",
+        "name": "IcebergOperationState",
+        "symbols": [
+          "PREPARING",
+          "WRITING",
+          "COLLECTING",
+          "COMMITTING",
+          "COMMITTED",
+          "COMMIT_UNKNOWN",
+          "FINALIZING",
+          "FINALIZED",
+          "ABORTING",
+          "ABORTED",
+          "FAILED_KNOWN_UNCOMMITTED",
+          "FINALIZE_FAILED_KNOWN_COMMITTED"
+        ]
+      }
+    },
+    { "name": "attempt_id", "type": "string" },
+    { "name": "base_snapshot_id", "type": ["null", "long"], "default": null },
+    { "name": "base_snapshot_map", "type": { "type": "map", "values": "long" } },
+    { "name": "staged_artifacts", "type": { "type": "array", "items": "string" } },
+    { "name": "commit_request", "type": ["null", "string"], "default": null },
+    {
+      "name": "commit_outcome",
+      "type": [
+        "null",
+        {
+          "type": "record",
+          "name": "IcebergCommitOutcomeRecord",
+          "fields": [
+            { "name": "snapshot_id", "type": "long" },
+            {
+              "name": "written_manifest_paths",
+              "type": { "type": "array", "items": "string" }
+            }
+          ]
+        }
+      ],
+      "default": null
+    },
+    {
+      "name": "cleanup_outcome",
+      "type": [
+        "null",
+        {
+          "type": "record",
+          "name": "IcebergCleanupOutcomeRecord",
+          "fields": [
+            { "name": "attempted", "type": "boolean" },
+            { "name": "error_count", "type": "long" },
+            { "name": "error_paths", "type": { "type": "array", "items": "string" } }
+          ]
+        }
+      ],
+      "default": null
+    },
+    {
+      "name": "recovery_evidence",
+      "type": [
+        "null",
+        {
+          "type": "record",
+          "name": "IcebergRecoveryEvidenceRecord",
+          "fields": [
+            { "name": "table_ident", "type": "string" },
+            { "name": "commit_op_kind", "type": "string" },
+            { "name": "base_snapshot_id", "type": ["null", "long"], "default": null },
+            {
+              "name": "base_sequence_number",
+              "type": ["null", "long"],
+              "default": null
+            },
+            { "name": "staging_dir", "type": "string" }
+          ]
+        }
+      ],
+      "default": null
+    },
+    {
+      "name": "failure",
+      "type": [
+        "null",
+        {
+          "type": "record",
+          "name": "IcebergOperationFailureRecord",
+          "fields": [
+            {
+              "name": "kind",
+              "type": {
+                "type": "enum",
+                "name": "IcebergOperationFailureKind",
+                "symbols": ["KNOWN_UNCOMMITTED", "UNKNOWN", "FINALIZE_KNOWN_COMMITTED"]
+              }
+            },
+            { "name": "message", "type": "string" },
+            {
+              "name": "next_action",
+              "type": {
+                "type": "enum",
+                "name": "IcebergOperationNextAction",
+                "symbols": ["NONE", "RETRY_ABORT", "RETRY_FINALIZE", "MANUAL_INSPECT"]
+              }
+            }
+          ]
+        }
+      ],
+      "default": null
+    },
+    { "name": "created_at_ms", "type": "long" },
+    { "name": "updated_at_ms", "type": "long" },
+    { "name": "finished_at_ms", "type": ["null", "long"], "default": null }
+  ]
+}

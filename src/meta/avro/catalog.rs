@@ -193,6 +193,11 @@ fn schema_sources() -> &'static [SchemaSource] {
             raw_schema: include_str!("schemas/iceberg.table_registration/0001.avsc"),
         },
         SchemaSource {
+            subject: "iceberg.operation",
+            id: 1,
+            raw_schema: include_str!("schemas/iceberg.operation/0001.avsc"),
+        },
+        SchemaSource {
             subject: "job.erase",
             id: 1,
             raw_schema: include_str!("schemas/job.erase/0001.avsc"),

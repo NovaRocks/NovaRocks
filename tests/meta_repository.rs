@@ -7,7 +7,7 @@ use novarocks::meta::repository::iceberg_catalog::{
 };
 use novarocks::meta::repository::iceberg_operation::{
     CreateIcebergOperationRequest, IcebergOperationKind, IcebergOperationRepository,
-    IcebergOperationState, IcebergOperationTarget,
+    IcebergOperationState, IcebergOperationTarget, StoredIcebergOperation,
 };
 use novarocks::meta::repository::job::{
     CreateEraseJobRequest, CreateIcebergOptimizeJobRequest, IcebergOptimizeJobOutcome,
@@ -363,6 +363,43 @@ fn repository_avro_payload_round_trips_sample_payload() -> Result<(), Box<dyn st
     assert_eq!(payload.schema_fingerprint.len(), 16);
 
     let decoded: TestEvolution = decode_payload_for_kind("test.evolution", &payload)?;
+    assert_eq!(decoded, value);
+    Ok(())
+}
+
+#[test]
+fn repository_avro_payload_round_trips_iceberg_operation_payload()
+-> Result<(), Box<dyn std::error::Error>> {
+    let value = StoredIcebergOperation {
+        operation_id: 42,
+        operation_kind: IcebergOperationKind::MvRefresh,
+        target: IcebergOperationTarget {
+            catalog: "ice".to_string(),
+            namespace: "analytics".to_string(),
+            table: "mv_sales".to_string(),
+            ref_name: Some("main".to_string()),
+        },
+        state: IcebergOperationState::CommitUnknown,
+        attempt_id: "attempt-1".to_string(),
+        base_snapshot_id: Some(7),
+        base_snapshot_map: BTreeMap::from([("ice.sales.orders".to_string(), 3)]),
+        staged_artifacts: vec!["s3://warehouse/mv/_staging/a.parquet".to_string()],
+        commit_request: Some("commit-request-json".to_string()),
+        commit_outcome: None,
+        cleanup_outcome: None,
+        recovery_evidence: None,
+        failure: None,
+        created_at_ms: 1000,
+        updated_at_ms: 1200,
+        finished_at_ms: None,
+    };
+
+    let payload = encode_record_payload("iceberg.operation", &value)?;
+    assert_eq!(payload.encoding, novarocks::meta::MetaPayloadEncoding::Avro);
+    assert_eq!(payload.schema_id, 1);
+    assert_eq!(payload.schema_fingerprint.len(), 16);
+
+    let decoded: StoredIcebergOperation = decode_payload_for_kind("iceberg.operation", &payload)?;
     assert_eq!(decoded, value);
     Ok(())
 }
