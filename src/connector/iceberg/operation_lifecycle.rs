@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::connector::iceberg::commit::{CleanupAttempt, CommitOutcome, CommitServiceError};
+use crate::connector::iceberg::commit::{
+    CleanupAttempt, CommitOpKind, CommitOutcome, CommitServiceError,
+};
 use crate::meta::repository::iceberg_operation::{
     IcebergCleanupOutcomeRecord, IcebergCommitOutcomeRecord, IcebergOperationFailureKind,
     IcebergOperationFailureRecord, IcebergOperationNextAction, IcebergOperationState,
@@ -53,11 +55,7 @@ pub fn operation_fact_from_commit_result(
             failure: Some(IcebergOperationFailureRecord {
                 kind: IcebergOperationFailureKind::KnownUncommitted,
                 message: message.clone(),
-                next_action: if cleanup.attempted {
-                    IcebergOperationNextAction::None
-                } else {
-                    IcebergOperationNextAction::RetryAbort
-                },
+                next_action: cleanup_next_action(cleanup),
             }),
         },
         Err(CommitServiceError::Unknown { message, evidence }) => IcebergOperationFact {
@@ -66,7 +64,7 @@ pub fn operation_fact_from_commit_result(
             cleanup_outcome: None,
             recovery_evidence: Some(IcebergRecoveryEvidenceRecord {
                 table_ident: evidence.table_ident.clone(),
-                commit_op_kind: format!("{:?}", evidence.op_kind),
+                commit_op_kind: commit_op_kind_record_name(evidence.op_kind).to_string(),
                 base_snapshot_id: evidence.base_snapshot_id,
                 base_sequence_number: Some(evidence.base_sequence_number),
                 staging_dir: evidence.staging_dir.clone(),
@@ -91,6 +89,28 @@ pub fn operation_fact_from_finalize_failure(message: String) -> IcebergOperation
             message,
             next_action: IcebergOperationNextAction::RetryFinalize,
         }),
+    }
+}
+
+fn cleanup_next_action(cleanup: &CleanupAttempt) -> IcebergOperationNextAction {
+    if cleanup.attempted && cleanup.error_count == 0 {
+        IcebergOperationNextAction::None
+    } else {
+        IcebergOperationNextAction::RetryAbort
+    }
+}
+
+fn commit_op_kind_record_name(kind: CommitOpKind) -> &'static str {
+    match kind {
+        CommitOpKind::FastAppend => "fast_append",
+        CommitOpKind::Overwrite => "overwrite",
+        CommitOpKind::RowDelta => "row_delta",
+        CommitOpKind::RowDeltaDv => "row_delta_dv",
+        CommitOpKind::RewriteDataFiles => "rewrite_data_files",
+        CommitOpKind::CowUpdate => "cow_update",
+        CommitOpKind::Truncate => "truncate",
+        CommitOpKind::OverwritePartitions => "overwrite_partitions",
+        CommitOpKind::RewriteManifests => "rewrite_manifests",
     }
 }
 
@@ -128,7 +148,61 @@ mod tests {
     }
 
     #[test]
-    fn known_uncommitted_error_maps_cleanup_and_failure() {
+    fn known_uncommitted_without_cleanup_attempt_requests_retry_abort() {
+        let error = CommitServiceError::known_uncommitted(
+            "catalog commit conflict".to_string(),
+            CleanupAttempt::not_attempted(),
+        );
+        let fact = operation_fact_from_commit_result(Err(&error));
+        assert_eq!(fact.state, IcebergOperationState::FailedKnownUncommitted);
+        assert_eq!(
+            fact.failure.as_ref().expect("failure").kind,
+            IcebergOperationFailureKind::KnownUncommitted
+        );
+        assert_eq!(
+            fact.failure.as_ref().expect("failure").next_action,
+            IcebergOperationNextAction::RetryAbort
+        );
+        assert_eq!(
+            fact.cleanup_outcome.as_ref().expect("cleanup").attempted,
+            false
+        );
+        assert_eq!(
+            fact.cleanup_outcome.as_ref().expect("cleanup").error_count,
+            0
+        );
+        assert_eq!(fact.recovery_evidence, None);
+    }
+
+    #[test]
+    fn known_uncommitted_with_clean_cleanup_needs_no_next_action() {
+        let error = CommitServiceError::known_uncommitted(
+            "catalog commit conflict".to_string(),
+            CleanupAttempt::completed(Vec::new()),
+        );
+        let fact = operation_fact_from_commit_result(Err(&error));
+        assert_eq!(fact.state, IcebergOperationState::FailedKnownUncommitted);
+        assert_eq!(
+            fact.failure.as_ref().expect("failure").kind,
+            IcebergOperationFailureKind::KnownUncommitted
+        );
+        assert_eq!(
+            fact.failure.as_ref().expect("failure").next_action,
+            IcebergOperationNextAction::None
+        );
+        assert_eq!(
+            fact.cleanup_outcome.as_ref().expect("cleanup").attempted,
+            true
+        );
+        assert_eq!(
+            fact.cleanup_outcome.as_ref().expect("cleanup").error_count,
+            0
+        );
+        assert_eq!(fact.recovery_evidence, None);
+    }
+
+    #[test]
+    fn known_uncommitted_with_cleanup_errors_requests_retry_abort() {
         let error = CommitServiceError::known_uncommitted(
             "catalog commit conflict".to_string(),
             CleanupAttempt::completed(vec!["s3://warehouse/data/a.parquet".to_string()]),
@@ -141,7 +215,7 @@ mod tests {
         );
         assert_eq!(
             fact.failure.as_ref().expect("failure").next_action,
-            IcebergOperationNextAction::None
+            IcebergOperationNextAction::RetryAbort
         );
         assert_eq!(
             fact.cleanup_outcome.as_ref().expect("cleanup").attempted,
@@ -176,14 +250,56 @@ mod tests {
             fact.failure.as_ref().expect("failure").next_action,
             IcebergOperationNextAction::ManualInspect
         );
+        let evidence = fact.recovery_evidence.as_ref().expect("evidence");
+        assert_eq!(evidence.table_ident, "ice.sales.orders");
+        assert_eq!(evidence.commit_op_kind, "fast_append");
+        assert_eq!(evidence.base_snapshot_id, Some(42));
+        assert_eq!(evidence.base_sequence_number, Some(7));
         assert_eq!(
-            fact.recovery_evidence
-                .as_ref()
-                .expect("evidence")
-                .staging_dir,
+            evidence.staging_dir,
             "s3://warehouse/orders/_staging/attempt-1"
         );
         assert_eq!(fact.cleanup_outcome, None);
+    }
+
+    #[test]
+    fn commit_op_kind_record_names_are_stable() {
+        assert_eq!(
+            commit_op_kind_record_name(CommitOpKind::FastAppend),
+            "fast_append"
+        );
+        assert_eq!(
+            commit_op_kind_record_name(CommitOpKind::Overwrite),
+            "overwrite"
+        );
+        assert_eq!(
+            commit_op_kind_record_name(CommitOpKind::RowDelta),
+            "row_delta"
+        );
+        assert_eq!(
+            commit_op_kind_record_name(CommitOpKind::RowDeltaDv),
+            "row_delta_dv"
+        );
+        assert_eq!(
+            commit_op_kind_record_name(CommitOpKind::RewriteDataFiles),
+            "rewrite_data_files"
+        );
+        assert_eq!(
+            commit_op_kind_record_name(CommitOpKind::CowUpdate),
+            "cow_update"
+        );
+        assert_eq!(
+            commit_op_kind_record_name(CommitOpKind::Truncate),
+            "truncate"
+        );
+        assert_eq!(
+            commit_op_kind_record_name(CommitOpKind::OverwritePartitions),
+            "overwrite_partitions"
+        );
+        assert_eq!(
+            commit_op_kind_record_name(CommitOpKind::RewriteManifests),
+            "rewrite_manifests"
+        );
     }
 
     #[test]
