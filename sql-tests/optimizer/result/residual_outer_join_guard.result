@@ -1,0 +1,15 @@
+Explain String
+GATHER EXCHANGE stats={rows=100000}
+  PROJECT [l.k AS k, r.k AS k] stats={rows=100000}
+    HASH JOIN (PARTITIONED, RIGHT OUTER, eq: [r.k = l.k]) stats={rows=100000}
+      other: l.flag = 1
+      HASH EXCHANGE (source: ShuffleJoin, hash: [c4]) stats={rows=100000}
+        SCAN db_sqlt_bff9997550cead6c.residual_outer_r (alias=r) stats={rows=100000}
+             TABLE: db_sqlt_bff9997550cead6c.residual_outer_r
+             columns: k
+             min-max stats
+      HASH EXCHANGE (source: ShuffleJoin, hash: [c1]) stats={rows=100000}
+        SCAN db_sqlt_bff9997550cead6c.residual_outer_l (alias=l) stats={rows=100000}
+             TABLE: db_sqlt_bff9997550cead6c.residual_outer_l
+             columns: k, flag
+             min-max stats
