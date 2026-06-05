@@ -172,14 +172,12 @@ fn collect_existing_child_predicate_keys(plan: &LogicalPlan, out: &mut HashSet<P
         LogicalPlan::Project(project) => collect_existing_child_predicate_keys(&project.input, out),
         LogicalPlan::Sort(sort) => collect_existing_child_predicate_keys(&sort.input, out),
         LogicalPlan::Limit(limit) => collect_existing_child_predicate_keys(&limit.input, out),
-        LogicalPlan::Join(join) => {
+        LogicalPlan::Join(join) if matches!(join.join_type, JoinKind::Inner | JoinKind::Cross) => {
             if let Some(condition) = &join.condition {
                 collect_top_level_conjunct_keys(condition, out);
             }
-            if matches!(join.join_type, JoinKind::Inner | JoinKind::Cross) {
-                collect_existing_child_predicate_keys(&join.left, out);
-                collect_existing_child_predicate_keys(&join.right, out);
-            }
+            collect_existing_child_predicate_keys(&join.left, out);
+            collect_existing_child_predicate_keys(&join.right, out);
         }
         _ => {}
     }
@@ -284,6 +282,41 @@ mod tests {
             data_type: DataType::Boolean,
             nullable: true,
         }
+    }
+
+    fn assert_filter_eq_literal(
+        plan: &LogicalPlan,
+        alias: &str,
+        column: &str,
+        id: u32,
+        value: i64,
+    ) {
+        let LogicalPlan::Filter(filter) = plan else {
+            panic!("expected Filter");
+        };
+        let ExprKind::BinaryOp {
+            left,
+            op: BinOp::Eq,
+            right,
+        } = &filter.predicate.kind
+        else {
+            panic!("expected equality predicate, got {:?}", filter.predicate);
+        };
+        let ExprKind::ColumnRef {
+            column_id,
+            qualifier,
+            column: actual_column,
+        } = &left.kind
+        else {
+            panic!("expected left column ref, got {left:?}");
+        };
+        assert_eq!(*column_id, ColumnId::new_for_test(id));
+        assert_eq!(qualifier.as_deref(), Some(alias));
+        assert_eq!(actual_column, column);
+        assert!(matches!(
+            &right.kind,
+            ExprKind::Literal(LiteralValue::Int(actual)) if *actual == value
+        ));
     }
 
     #[test]
@@ -405,6 +438,38 @@ mod tests {
         let LogicalPlan::Join(join) = out else {
             panic!("expected Join");
         };
-        assert!(matches!(*join.right, LogicalPlan::Filter(_)));
+        assert_filter_eq_literal(&join.right, "c", "k", 3, 7);
+    }
+
+    #[test]
+    fn outer_child_join_condition_does_not_hide_fresh_parent_filter() {
+        let left_child = LogicalPlan::Join(JoinNode {
+            left: Box::new(scan("a", &[("k", 1)])),
+            right: Box::new(scan("b", &[("k", 2)])),
+            join_type: JoinKind::LeftOuter,
+            condition: Some(and(
+                eq(col("a", "k", 1), col("b", "k", 2)),
+                eq(col("b", "k", 2), int_lit(7)),
+            )),
+            required_output_columns: None,
+        });
+        let plan = LogicalPlan::Join(JoinNode {
+            left: Box::new(left_child),
+            right: Box::new(scan("c", &[("k", 3)])),
+            join_type: JoinKind::Inner,
+            condition: Some(and(
+                eq(col("b", "k", 2), col("c", "k", 3)),
+                eq(col("c", "k", 3), int_lit(7)),
+            )),
+            required_output_columns: None,
+        });
+
+        let out = JoinPredicateMoveAround
+            .apply(plan)
+            .expect("outer child ON condition must not suppress a fresh parent filter");
+        let LogicalPlan::Join(join) = out else {
+            panic!("expected Join");
+        };
+        assert_filter_eq_literal(&join.left, "b", "k", 2, 7);
     }
 }
