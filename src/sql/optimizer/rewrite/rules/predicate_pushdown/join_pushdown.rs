@@ -18,7 +18,7 @@ use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::rewrite::rules::predicate_pushdown::deriver::derive_inner_join_predicates;
 use crate::sql::optimizer::rewrite::rules::predicate_pushdown::predicate_group::{
-    PredicateGroup, PredicateOrigin,
+    PredicateGroup, PredicateOrigin, predicate_key as canonical_predicate_key,
 };
 use crate::sql::optimizer::rewrite::rules::utils::{
     collect_column_id_refs, collect_column_refs, collect_output_columns, collect_output_ids,
@@ -698,7 +698,7 @@ fn predicate_has_conjunct_key(expr: &TypedExpr, key: &str) -> bool {
 }
 
 fn predicate_key(expr: &TypedExpr) -> String {
-    format!("{:?}", expr.kind)
+    canonical_predicate_key(expr).as_str().to_string()
 }
 
 /// Extract common equi-join conditions from all branches of an OR predicate.
@@ -1069,6 +1069,24 @@ mod tests {
         };
         let condition = join.condition.expect("join condition");
         assert_eq!(split_and_refs(&condition).len(), 1);
+    }
+
+    #[test]
+    fn merge_join_conditions_deduplicates_reassociated_or_condition() {
+        let a = eq(col_with_id("l", "a", 1), int_lit(1));
+        let b = eq(col_with_id("r", "b", 2), int_lit(2));
+        let c = eq(col_with_id("l", "v", 3), int_lit(3));
+        let existing = or(or(a.clone(), b.clone()), c.clone());
+        let reassociated = or(a, or(b, c));
+
+        let merged =
+            merge_join_conditions(Some(existing), vec![reassociated]).expect("merged condition");
+
+        assert_eq!(
+            split_and_refs(&merged).len(),
+            1,
+            "semantically identical OR residuals must not be duplicated"
+        );
     }
 
     // Test 1: t1 INNER t2 WHERE t1.x = 1

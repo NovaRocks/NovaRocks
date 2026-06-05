@@ -70,7 +70,180 @@ impl PredicateGroup {
 }
 
 pub(crate) fn predicate_key(expr: &TypedExpr) -> PredicateKey {
-    PredicateKey(format!("{:?}", expr.kind))
+    PredicateKey(canonical_expr_key(expr))
+}
+
+fn canonical_expr_key(expr: &TypedExpr) -> String {
+    match &expr.kind {
+        ExprKind::Nested(inner) => canonical_expr_key(inner),
+        ExprKind::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } => canonical_bool_key("AND", left, right),
+        ExprKind::BinaryOp {
+            left,
+            op: BinOp::Or,
+            right,
+        } => canonical_bool_key("OR", left, right),
+        ExprKind::BinaryOp { left, op, right } => {
+            format!(
+                "BinaryOp({op:?},{},{})",
+                canonical_expr_key(left),
+                canonical_expr_key(right)
+            )
+        }
+        ExprKind::UnaryOp { op, expr } => {
+            format!("UnaryOp({op:?},{})", canonical_expr_key(expr))
+        }
+        ExprKind::FunctionCall {
+            name,
+            args,
+            distinct,
+        } => format!(
+            "FunctionCall({name},{distinct},{})",
+            canonical_expr_list_key(args)
+        ),
+        ExprKind::LambdaFunction { params, body } => {
+            format!("LambdaFunction({params:?},{})", canonical_expr_key(body))
+        }
+        ExprKind::AggregateCall {
+            name,
+            args,
+            distinct,
+            order_by,
+        } => format!(
+            "AggregateCall({name},{distinct},{},{order_by:?})",
+            canonical_expr_list_key(args)
+        ),
+        ExprKind::Cast { expr, target } => {
+            format!("Cast({},{target:?})", canonical_expr_key(expr))
+        }
+        ExprKind::IsNull { expr, negated } => {
+            format!("IsNull({},{negated})", canonical_expr_key(expr))
+        }
+        ExprKind::InList {
+            expr,
+            list,
+            negated,
+        } => format!(
+            "InList({},{},{negated})",
+            canonical_expr_key(expr),
+            canonical_expr_list_key(list)
+        ),
+        ExprKind::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => format!(
+            "Between({},{},{},{negated})",
+            canonical_expr_key(expr),
+            canonical_expr_key(low),
+            canonical_expr_key(high)
+        ),
+        ExprKind::Like {
+            expr,
+            pattern,
+            negated,
+        } => format!(
+            "Like({},{},{negated})",
+            canonical_expr_key(expr),
+            canonical_expr_key(pattern)
+        ),
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            let operand_key = operand
+                .as_ref()
+                .map(|expr| canonical_expr_key(expr))
+                .unwrap_or_else(|| "None".to_string());
+            let when_then_key = when_then
+                .iter()
+                .map(|(when, then)| {
+                    format!("{}=>{}", canonical_expr_key(when), canonical_expr_key(then))
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let else_key = else_expr
+                .as_ref()
+                .map(|expr| canonical_expr_key(expr))
+                .unwrap_or_else(|| "None".to_string());
+            format!("Case({operand_key},{when_then_key},{else_key})")
+        }
+        ExprKind::IsTruthValue {
+            expr,
+            value,
+            negated,
+        } => format!(
+            "IsTruthValue({},{value},{negated})",
+            canonical_expr_key(expr)
+        ),
+        ExprKind::WindowCall {
+            name,
+            args,
+            distinct,
+            partition_by,
+            order_by,
+            window_frame,
+            ignore_nulls,
+        } => format!(
+            "WindowCall({name},{distinct},{},{},{order_by:?},{window_frame:?},{ignore_nulls})",
+            canonical_expr_list_key(args),
+            canonical_expr_list_key(partition_by)
+        ),
+        ExprKind::Lambda { params, body } => {
+            format!("Lambda({params:?},{})", canonical_expr_key(body))
+        }
+        ExprKind::ColumnRef { .. }
+        | ExprKind::LambdaParamRef { .. }
+        | ExprKind::Literal(_)
+        | ExprKind::SubqueryPlaceholder { .. } => format!("{:?}", expr.kind),
+    }
+}
+
+fn canonical_bool_key(op_name: &str, left: &TypedExpr, right: &TypedExpr) -> String {
+    let mut terms = Vec::new();
+    collect_bool_terms(left, op_name, &mut terms);
+    collect_bool_terms(right, op_name, &mut terms);
+    terms.sort();
+    format!("{op_name}({})", terms.join(","))
+}
+
+fn collect_bool_terms(expr: &TypedExpr, op_name: &str, out: &mut Vec<String>) {
+    match (&expr.kind, op_name) {
+        (
+            ExprKind::BinaryOp {
+                left,
+                op: BinOp::And,
+                right,
+            },
+            "AND",
+        )
+        | (
+            ExprKind::BinaryOp {
+                left,
+                op: BinOp::Or,
+                right,
+            },
+            "OR",
+        ) => {
+            collect_bool_terms(left, op_name, out);
+            collect_bool_terms(right, op_name, out);
+        }
+        (ExprKind::Nested(inner), _) => collect_bool_terms(inner, op_name, out),
+        _ => out.push(canonical_expr_key(expr)),
+    }
+}
+
+fn canonical_expr_list_key(exprs: &[TypedExpr]) -> String {
+    exprs
+        .iter()
+        .map(canonical_expr_key)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 pub(crate) fn dedupe_groups(groups: Vec<PredicateGroup>) -> Vec<PredicateGroup> {

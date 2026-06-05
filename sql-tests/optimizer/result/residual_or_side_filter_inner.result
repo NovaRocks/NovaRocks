@@ -1,16 +1,19 @@
 Explain String
-GATHER EXCHANGE stats={rows=90000}
-  PROJECT [l.payload AS payload, r.payload AS payload] stats={rows=90000}
-    HASH JOIN (PARTITIONED, INNER, eq: [l.k = r.k]) stats={rows=90000}
-      HASH EXCHANGE (source: ShuffleJoin, hash: [c1]) stats={rows=39375}
-        SCAN db_sqlt_14d0f72fc69bf306.residual_or_l (alias=l) stats={rows=39375}
+GATHER EXCHANGE stats={rows=221484375}
+  PROJECT [l.payload AS payload, r.payload AS payload] stats={rows=221484375}
+    HASH JOIN (BROADCAST, INNER, eq: [r.k = l.k]) stats={rows=221484375}
+      build runtime filters:
+      - filter_id = 0, build_expr = (l.k)
+      SCAN db_sqlt_14d0f72fc69bf306.residual_or_r (alias=r) stats={rows=45000}
+           TABLE: db_sqlt_14d0f72fc69bf306.residual_or_r
+           columns: k, payload
+           min-max stats
+           predicates: r.k IS NOT NULL AND r.k IN (1, 2)
+          probe runtime filters:
+          - filter_id = 0, probe_expr = (r.k)
+      BROADCAST EXCHANGE stats={rows=19688}
+        SCAN db_sqlt_14d0f72fc69bf306.residual_or_l (alias=l) stats={rows=19688}
              TABLE: db_sqlt_14d0f72fc69bf306.residual_or_l
              columns: k, payload
              min-max stats
              predicates: l.k = 1 OR l.k = 2 AND l.k IN (1, 2) AND l.k IS NOT NULL
-      HASH EXCHANGE (source: ShuffleJoin, hash: [c3]) stats={rows=90000}
-        SCAN db_sqlt_14d0f72fc69bf306.residual_or_r (alias=r) stats={rows=90000}
-             TABLE: db_sqlt_14d0f72fc69bf306.residual_or_r
-             columns: k, payload
-             min-max stats
-             predicates: r.k IS NOT NULL AND r.k IN (1, 2)

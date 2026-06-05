@@ -5,6 +5,8 @@ use crate::sql::optimizer::statistics::{
     UNKNOWN_GROUP_BY_CORRELATION,
 };
 
+const INEXACT_KEY_FACT_DIM_SCALE_THRESHOLD: f64 = 32.0;
+
 pub struct JoinCardInput {
     pub left: (f64, Confidence),
     pub right: (f64, Confidence),
@@ -215,15 +217,23 @@ fn inner_rows_with_inexact_key_statistics(
     let max_rows = left_rows.max(right_rows);
     let min_rows = left_rows.min(right_rows).max(1.0);
     let scale_factor = max_rows / min_rows;
-    let base_rows = if scale_factor >= 10_000_000.0 {
-        let key_count = input.eq_key_ndvs.len().max(1) as i32;
-        max_rows * PREDICATE_UNKNOWN_FILTER.powi(key_count)
+
+    let key_count = input.eq_key_ndvs.len().max(1) as i32;
+    let (base_rows, base_saturated) = if scale_factor >= INEXACT_KEY_FACT_DIM_SCALE_THRESHOLD {
+        (max_rows, false)
     } else {
-        max_rows
+        let (product, product_saturated) = sat_mul(left_rows, right_rows);
+        let (rows, selectivity_saturated) =
+            sat_mul(product, PREDICATE_UNKNOWN_FILTER.powi(key_count));
+        (
+            rows.max(max_rows),
+            product_saturated || selectivity_saturated,
+        )
     };
+
     let non_equi = non_equi_selectivity(input, confidence_inputs);
     let (rows, saturated) = sat_mul(base_rows, non_equi.0);
-    (rows.max(1.0), saturated, true)
+    (rows.max(1.0), base_saturated || saturated, true)
 }
 
 fn inner_rows_with_key_selectivity(
@@ -406,7 +416,7 @@ mod tests {
     }
 
     #[test]
-    fn multikey_inner_softens_additional_fallback_keys() {
+    fn multikey_inner_same_scale_fallback_keys_keep_many_to_many_risk() {
         let input = JoinCardInput {
             left: (81_000.0, Confidence::Estimated),
             right: (81_000.0, Confidence::Estimated),
@@ -419,7 +429,30 @@ mod tests {
         };
         let (rows, conf) = estimate_join_cardinality(&input);
         assert_eq!(conf, Confidence::Fallback);
-        assert!((rows - 81_000.0).abs() < 1.0, "got {rows}");
+        let expected = 81_000.0 * 81_000.0 * PREDICATE_UNKNOWN_FILTER.powi(2);
+        assert!((rows - expected).abs() < 1.0, "got {rows}");
+    }
+
+    #[test]
+    fn fallback_inner_same_scale_self_join_does_not_collapse_to_input_scale() {
+        let input = JoinCardInput {
+            left: (350_066.0, Confidence::Fallback),
+            right: (115_549.0, Confidence::Fallback),
+            kind: JoinKind::Inner,
+            eq_key_ndvs: vec![
+                (40.0, 40.0, Confidence::Fallback),
+                (40.0, 40.0, Confidence::Fallback),
+            ],
+            non_equi_selectivity: None,
+        };
+
+        let (rows, conf) = estimate_join_cardinality(&input);
+
+        assert_eq!(conf, Confidence::Fallback);
+        assert!(
+            rows > 1_000_000_000.0,
+            "same-scale fallback-key join should keep many-to-many risk, got {rows}"
+        );
     }
 
     #[test]

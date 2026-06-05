@@ -12,13 +12,16 @@ use crate::sql::optimizer::statistics::Statistics;
 
 /// Network transfer multiplier applied to data that crosses node boundaries.
 const NETWORK_COST: f64 = 1.5;
+/// Fixed startup cost for distribution/exchange operators. Keep aligned with
+/// `derive::estimate_enforcer_cost`.
+const DISTRIBUTION_STARTUP_COST: f64 = 16.0 * 1024.0 * 1024.0;
 
 /// Penalty multiplier for cross joins (matches StarRocks `CROSS_JOIN_COST_PENALTY`).
 const CROSS_JOIN_COST_PENALTY: f64 = 10.0;
 
 /// Penalty multiplier for non-equi hash joins (has `other_condition`).
-/// Matches StarRocks `HashJoinNode.EXECUTE_COST_PENALTY = 100`.
-const NON_EQUI_JOIN_COST_PENALTY: f64 = 100.0;
+/// Matches StarRocks optimizer's execute-cost penalty coefficient.
+const NON_EQUI_JOIN_COST_PENALTY: f64 = 2.0;
 
 /// Penalty multiplier for nest-loop join execution cost.
 /// NLJ is O(N*M) and should be heavily penalized relative to hash join.
@@ -151,7 +154,9 @@ pub(crate) fn compute_cost(
             input_rows * k.log2().max(1.0)
         }
 
-        Operator::PhysicalDistribution(_) => own_stats.compute_size() * NETWORK_COST,
+        Operator::PhysicalDistribution(_) => {
+            DISTRIBUTION_STARTUP_COST + own_stats.compute_size() * NETWORK_COST
+        }
 
         Operator::PhysicalLimit(_) => 0.01,
 
@@ -440,6 +445,43 @@ mod tests {
     }
 
     #[test]
+    fn non_equi_hash_join_uses_optimizer_execute_cost_penalty() {
+        let probe = stats(100_000.0, 100.0);
+        let build = stats(10_000.0, 100.0);
+        let own = stats(100_000.0, 200.0);
+        let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![],
+            other_condition: Some(crate::sql::analysis::TypedExpr {
+                kind: crate::sql::analysis::ExprKind::Literal(
+                    crate::sql::analysis::LiteralValue::Bool(true),
+                ),
+                data_type: arrow::datatypes::DataType::Boolean,
+                nullable: false,
+            }),
+            distribution: JoinDistribution::Unknown,
+        });
+        let child_stats = [&probe, &build];
+        let child_outputs = [PhysicalPropertySet::any(), PhysicalPropertySet::broadcast()];
+        let child_output_refs = [&child_outputs[0], &child_outputs[1]];
+        let options = CostOptions::default();
+
+        let cost = compute_cost_with_properties(
+            &op,
+            &own,
+            &child_stats,
+            &child_output_refs,
+            &PropertyAlternativeKind::BroadcastJoin,
+            &options,
+        );
+
+        let base = probe.compute_size()
+            + build.compute_size() * options.network_cost * options.backend_factor
+            + build.compute_size() * options.memory_cost_weight * options.backend_factor;
+        assert!((cost - base * 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn local_agg_cheaper_than_single() {
         let input = stats(100_000.0, 50.0);
         let own = stats(100.0, 50.0);
@@ -562,8 +604,9 @@ mod tests {
             spec: crate::sql::optimizer::property::DistributionSpec::Any,
         });
         let cost = compute_cost(&op, &s, &[]);
-        // 1000 * 100 * 1.5 = 150_000
-        assert!((cost - 150_000.0).abs() < 1.0);
+        // 16 MiB + 1000 * 100 * 1.5 = 16_927_216
+        let expected = DISTRIBUTION_STARTUP_COST + 150_000.0;
+        assert!((cost - expected).abs() < 1.0);
     }
 
     #[test]

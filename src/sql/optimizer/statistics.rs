@@ -173,8 +173,11 @@ pub fn build_table_statistics_with_columns(
 ///
 /// Priority for `distinct_values_count`:
 ///   1. Puffin NDV when present for the column.
-///   2. Manifest `value_counts` (as an upper bound).
-///   3. `sqrt(non_null) * 10` heuristic.
+///   2. `sqrt(non_null) * 10` heuristic.
+///
+/// Iceberg manifest `value_counts` is a non-null value count, not an NDV. Using
+/// it as distinct-count metadata makes equality predicates on low-cardinality
+/// string columns look almost unique, which causes severe join-order mistakes.
 pub fn build_table_statistics_with_ndv(
     files: &[crate::sql::catalog::IcebergDataFileInfo],
     columns: &[crate::sql::catalog::ColumnDef],
@@ -200,7 +203,6 @@ pub fn build_table_statistics_with_ndv(
 
     // Aggregate per-column stats across files.
     let mut col_null_total: HashMap<String, i64> = HashMap::new();
-    let mut col_value_total: HashMap<String, i64> = HashMap::new();
     let mut col_size_total: HashMap<String, i64> = HashMap::new();
     let mut col_count: HashMap<String, u64> = HashMap::new();
     let mut col_min: HashMap<String, f64> = HashMap::new();
@@ -212,9 +214,6 @@ pub fn build_table_statistics_with_ndv(
                 *col_count.entry(col_name.clone()).or_default() += 1;
                 if let Some(nc) = stats.null_count {
                     *col_null_total.entry(col_name.clone()).or_default() += nc;
-                }
-                if let Some(vc) = stats.value_count {
-                    *col_value_total.entry(col_name.clone()).or_default() += vc;
                 }
                 if let Some(sz) = stats.column_size {
                     *col_size_total.entry(col_name.clone()).or_default() += sz;
@@ -262,19 +261,15 @@ pub fn build_table_statistics_with_ndv(
         };
         let min_value = col_min.get(col_name).copied().unwrap_or(f64::NEG_INFINITY);
         let max_value = col_max.get(col_name).copied().unwrap_or(f64::INFINITY);
-        let value_count = col_value_total.get(col_name).copied();
         let non_null = (total_rows as f64 * (1.0 - nulls_fraction)).max(1.0);
         let key = col_name.to_lowercase();
         let (distinct_values_count, confidence) = if let Some(&ndv) = ndv_by_name.get(&key) {
             (ndv.min(non_null).max(1.0), Confidence::Exact)
         } else {
-            match value_count {
-                Some(vc) if vc > 0 => ((vc as f64).min(non_null).max(1.0), Confidence::Estimated),
-                _ => (
-                    (non_null.sqrt() * 10.0).min(non_null).max(1.0),
-                    Confidence::Fallback,
-                ),
-            }
+            (
+                (non_null.sqrt() * 10.0).min(non_null).max(1.0),
+                Confidence::Fallback,
+            )
         };
         column_stats.insert(
             col_name.clone(),
@@ -289,10 +284,7 @@ pub fn build_table_statistics_with_ndv(
                 },
                 // NDV priority:
                 //   1. Iceberg Puffin theta sketch when present.
-                //   2. Manifest value_counts as an upper bound.
-                //   3. sqrt(non_null) * 10 heuristic.
-                // value_count is total rows including nulls, so cap by
-                // non_null rows.
+                //   2. sqrt(non_null) * 10 heuristic.
                 distinct_values_count,
                 confidence,
             },
@@ -598,7 +590,7 @@ mod tests {
     }
 
     #[test]
-    fn build_table_statistics_decodes_int_min_max() {
+    fn build_table_statistics_decodes_int_min_max_without_using_value_count_as_ndv() {
         use crate::sql::catalog::{ColumnDef, IcebergColumnStats, IcebergDataFileInfo};
 
         let file = IcebergDataFileInfo {
@@ -635,9 +627,10 @@ mod tests {
         let col = ts.column_stats.get("a").expect("col stats present");
         assert!((col.min_value - 10.0).abs() < f64::EPSILON);
         assert!((col.max_value - 100.0).abs() < f64::EPSILON);
-        // value_count=60 should drive NDV
-        assert!((col.distinct_values_count - 60.0).abs() < f64::EPSILON);
-        assert_eq!(col.confidence, Confidence::Estimated);
+        // Iceberg value_count is a non-null row count, not a distinct-value
+        // count. Without Puffin NDV, use the heuristic instead.
+        assert!((col.distinct_values_count - 100.0).abs() < f64::EPSILON);
+        assert_eq!(col.confidence, Confidence::Fallback);
     }
 
     #[test]

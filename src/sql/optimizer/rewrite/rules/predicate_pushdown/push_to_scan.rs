@@ -11,6 +11,7 @@ use std::collections::HashSet;
 
 use crate::sql::analysis::TypedExpr;
 use crate::sql::optimizer::rewrite::rule::PlanRewriteRule as RewriteRule;
+use crate::sql::optimizer::rewrite::rules::predicate_pushdown::predicate_group::predicate_key as canonical_predicate_key;
 use crate::sql::optimizer::rewrite::rules::utils::{
     collect_column_refs, split_and, wrap_remaining_filter,
 };
@@ -43,9 +44,7 @@ impl RewriteRule for PushDownPredicateScan {
             scan.columns.iter().map(|c| c.name.to_lowercase()).collect();
 
         // Canonical keys of predicates already on the scan, so we never append a
-        // structurally-identical duplicate (`P AND P == P`). `TypedExpr` does not
-        // implement `PartialEq`, so we key on the `Debug` rendering of `ExprKind`
-        // — the same canonicalization the sibling `push_to_join` rule uses.
+        // structurally-identical duplicate (`P AND P == P`).
         // This keeps the scan's predicate list clean even when an upstream rule
         // (e.g. OQ-2 `DeriveJoinNotNullPredicate`) re-derives the same
         // `IS NOT NULL` across stacked joins on a shared key every fixed-point
@@ -84,11 +83,10 @@ impl RewriteRule for PushDownPredicateScan {
 }
 
 /// Canonical key for structural predicate equality. `TypedExpr` does not derive
-/// `PartialEq`, so we render `ExprKind` via `Debug` — identical for
-/// structurally-identical predicates and distinct otherwise. This mirrors the
-/// `expr_eq` helper in the sibling `push_to_join` rule.
+/// `PartialEq`, so this delegates to the shared predicate-group key used by the
+/// join pushdown rules.
 fn predicate_key(expr: &TypedExpr) -> String {
-    format!("{:?}", expr.kind)
+    canonical_predicate_key(expr).as_str().to_string()
 }
 
 #[cfg(test)]

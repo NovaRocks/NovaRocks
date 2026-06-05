@@ -196,11 +196,17 @@ pub(crate) fn needed_enforcers(
 
 /// Network cost multiplier — must stay in sync with `cost.rs`.
 const NETWORK_COST: f64 = 1.5;
+/// Fixed startup cost for a distribution enforcer. Exchange setup and sender
+/// synchronization are visible for tiny joins, especially in debug builds, so
+/// a pure byte cost makes small shuffles look unrealistically cheap.
+const DISTRIBUTION_STARTUP_COST: f64 = 16.0 * 1024.0 * 1024.0;
 
 /// Estimate the cost of an enforcer given group statistics.
 pub(crate) fn estimate_enforcer_cost(enforcer: &EnforcerKind, stats: &Statistics) -> Cost {
     match enforcer {
-        EnforcerKind::Distribution(_) => stats.compute_size() * NETWORK_COST,
+        EnforcerKind::Distribution(_) => {
+            DISTRIBUTION_STARTUP_COST + stats.compute_size() * NETWORK_COST
+        }
         EnforcerKind::Sort(_) => {
             let n = stats.output_row_count.max(1.0);
             n * n.log2()
@@ -257,6 +263,25 @@ mod tests {
         assert_eq!(alternatives.len(), 1);
         assert_eq!(alternatives[0].kind, PropertyAlternativeKind::Default);
         assert_eq!(alternatives[0].child_props, legacy);
+    }
+
+    #[test]
+    fn distribution_enforcer_cost_includes_startup_overhead() {
+        let stats = Statistics {
+            output_row_count: 1.0,
+            column_statistics: Default::default(),
+            ..Default::default()
+        };
+
+        let cost = estimate_enforcer_cost(
+            &EnforcerKind::Distribution(DistributionSpec::Broadcast),
+            &stats,
+        );
+
+        assert!(
+            cost > stats.compute_size() * NETWORK_COST,
+            "distribution enforcers must model startup overhead for tiny exchanges"
+        );
     }
 
     #[test]

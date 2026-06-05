@@ -1,7 +1,4 @@
 //! HashJoin: Shuffle / Broadcast / Colocate.
-//! Refactor-phase: Broadcast / Colocate output is Any (today's behaviour).
-//! Tasks 16–18 replace those branches with preserves-left output and
-//! Task 19 adds required pushdown.
 
 use crate::sql::analysis::TypedExpr;
 use crate::sql::column_id::ColumnId;
@@ -261,8 +258,29 @@ impl PhysicalHashJoinOp {
         }
     }
 
-    fn derive_broadcast_output(&self, _children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
-        PhysicalPropertySet::any()
+    fn derive_broadcast_output(&self, children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
+        if preserves_left(&self.join_type) {
+            let left = children
+                .first()
+                .copied()
+                .cloned()
+                .unwrap_or_else(PhysicalPropertySet::any);
+            let distribution = match left.distribution {
+                DistributionSpec::HashPartitioned { cols, source } => {
+                    DistributionSpec::hash_partitioned(
+                        expand_with_eq_equivalents(&cols, &self.eq_conditions),
+                        source,
+                    )
+                }
+                other => other,
+            };
+            PhysicalPropertySet {
+                distribution,
+                ordering: OrderingSpec::Any,
+            }
+        } else {
+            PhysicalPropertySet::any()
+        }
     }
 
     fn derive_colocate_output(&self, children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
@@ -433,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn hash_join_broadcast_inner_returns_any_distribution() {
+    fn hash_join_broadcast_inner_preserves_left_distribution() {
         let op = broadcast_inner(10, 20);
         let left_out = PhysicalPropertySet {
             distribution: DistributionSpec::shuffle_agg([ColumnId(10)]),
@@ -441,7 +459,10 @@ mod tests {
         };
         let right_out = PhysicalPropertySet::gather();
         let out = op.derive_output(&[&left_out, &right_out]);
-        assert_eq!(out.distribution, DistributionSpec::Any);
+        assert_eq!(
+            out.distribution,
+            DistributionSpec::shuffle_agg([ColumnId(10), ColumnId(20)])
+        );
         assert_eq!(out.ordering, OrderingSpec::Any);
     }
 
@@ -880,7 +901,7 @@ mod tests {
         }
     }
 
-    // ── Task 17: Broadcast non-preserves-left → output stays Any ─────────────
+    // ── Broadcast non-preserves-left → output stays Any ─────────────────────
 
     fn broadcast_with_type(jk: crate::sql::analysis::JoinKind) -> PhysicalHashJoinOp {
         PhysicalHashJoinOp {
@@ -1009,9 +1030,10 @@ mod tests {
     // CBO swapped the children (or when the parent's required col is the
     // RIGHT side of the eq under ambiguous orient_eq_pair), the enforcer
     // ended up over a child whose logical scope did not contain X.
-    // derive_output's eq-equivalence enrichment lets the join's output
-    // satisfy the parent natively; if not, the enforcer is placed on the
-    // join's output (where every column the parent named is in scope).
+    // derive_output's preserves-left eq-equivalence enrichment lets the
+    // join's output satisfy the parent natively; if not, the enforcer is
+    // placed on the join's output (where every column the parent named is
+    // in scope).
 
     #[test]
     fn hash_join_broadcast_required_never_pushes_hash_to_left() {
@@ -1071,9 +1093,7 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_output_left_hash_returns_any_distribution() {
-        // Broadcast join does not preserve the probe side's partitioning as an
-        // output property: matched rows may be duplicated/dropped by the join.
+    fn broadcast_output_left_hash_preserves_eq_enriched_distribution() {
         let op = broadcast_inner(10, 20);
         let left_out = PhysicalPropertySet {
             distribution: DistributionSpec::shuffle_agg([ColumnId(10), ColumnId(20)]),
@@ -1081,14 +1101,14 @@ mod tests {
         };
         let right_out = PhysicalPropertySet::gather();
         let out = op.derive_output(&[&left_out, &right_out]);
-        assert_eq!(out.distribution, DistributionSpec::Any);
+        assert_eq!(
+            out.distribution,
+            DistributionSpec::shuffle_agg([ColumnId(10), ColumnId(20)])
+        );
     }
 
     #[test]
-    fn broadcast_output_right_eq_hash_returns_any_distribution() {
-        // Even if the probe child is partitioned on an equivalent join-key id,
-        // the broadcast join output itself should not satisfy a parent hash
-        // distribution requirement without an explicit enforcer.
+    fn broadcast_output_right_eq_hash_preserves_eq_enriched_distribution() {
         let op = broadcast_inner(10, 20);
         let left_out = PhysicalPropertySet {
             distribution: DistributionSpec::shuffle_agg([ColumnId(20)]),
@@ -1096,7 +1116,10 @@ mod tests {
         };
         let right_out = PhysicalPropertySet::gather();
         let out = op.derive_output(&[&left_out, &right_out]);
-        assert_eq!(out.distribution, DistributionSpec::Any);
+        assert_eq!(
+            out.distribution,
+            DistributionSpec::shuffle_agg([ColumnId(20), ColumnId(10)])
+        );
     }
 
     #[test]

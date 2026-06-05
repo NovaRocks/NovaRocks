@@ -1,23 +1,27 @@
 -- query 8
 Explain String
-GATHER EXCHANGE stats={rows=22500}
-  PROJECT [a.payload AS payload, b.payload AS payload, c.payload AS payload] stats={rows=22500}
-    HASH JOIN (PARTITIONED, INNER, eq: [b.k = c.k]) stats={rows=22500}
-      HASH EXCHANGE (source: ShuffleJoin, hash: [c3]) stats={rows=22500}
-        HASH JOIN (PARTITIONED, INNER, eq: [a.k = b.k]) stats={rows=22500}
-          HASH EXCHANGE (source: ShuffleJoin, hash: [c1]) stats={rows=22500}
-            SCAN db_sqlt_ae6738d71862e6e7.residual_mad_a (alias=a) stats={rows=22500}
-                 TABLE: db_sqlt_ae6738d71862e6e7.residual_mad_a
-                 columns: k, payload
-                 min-max stats
-                 predicates: a.k = 7 AND a.k IS NOT NULL
-          HASH EXCHANGE (source: ShuffleJoin, hash: [c3]) stats={rows=22500}
-            SCAN db_sqlt_ae6738d71862e6e7.residual_mad_b (alias=b) stats={rows=22500}
-                 TABLE: db_sqlt_ae6738d71862e6e7.residual_mad_b
-                 columns: k, payload
-                 min-max stats
-                 predicates: b.k = 7 AND b.k IS NOT NULL
-      HASH EXCHANGE (source: ShuffleJoin, hash: [c5]) stats={rows=22500}
+GATHER EXCHANGE stats={rows=126562500}
+  PROJECT [a.payload AS payload, b.payload AS payload, c.payload AS payload] stats={rows=126562500}
+    HASH JOIN (BROADCAST, INNER, eq: [b.k = c.k]) stats={rows=126562500}
+      build runtime filters:
+      - filter_id = 1, build_expr = (c.k)
+      HASH JOIN (BROADCAST, INNER, eq: [a.k = b.k]) stats={rows=126562500}
+        build runtime filters:
+        - filter_id = 0, build_expr = (b.k)
+        SCAN db_sqlt_ae6738d71862e6e7.residual_mad_a (alias=a) stats={rows=22500}
+             TABLE: db_sqlt_ae6738d71862e6e7.residual_mad_a
+             columns: k, payload
+             min-max stats
+             predicates: a.k = 7 AND a.k IS NOT NULL
+            probe runtime filters:
+            - filter_id = 0, probe_expr = (a.k)
+        BROADCAST EXCHANGE stats={rows=22500}
+          SCAN db_sqlt_ae6738d71862e6e7.residual_mad_b (alias=b) stats={rows=22500}
+               TABLE: db_sqlt_ae6738d71862e6e7.residual_mad_b
+               columns: k, payload
+               min-max stats
+               predicates: b.k = 7 AND b.k IS NOT NULL
+      BROADCAST EXCHANGE stats={rows=22500}
         SCAN db_sqlt_ae6738d71862e6e7.residual_mad_c (alias=c) stats={rows=22500}
              TABLE: db_sqlt_ae6738d71862e6e7.residual_mad_c
              columns: k, payload
@@ -26,24 +30,28 @@ GATHER EXCHANGE stats={rows=22500}
 
 -- query 10
 Explain String
-GATHER EXCHANGE stats={rows=90000}
-  PROJECT [a.payload AS payload, b.payload AS payload, c.payload AS payload] stats={rows=90000}
-    HASH JOIN (PARTITIONED, INNER, eq: [b.k = c.k]) stats={rows=90000}
-      HASH EXCHANGE (source: ShuffleJoin, hash: [c3]) stats={rows=22500}
-        HASH JOIN (PARTITIONED, INNER, eq: [a.k = b.k]) stats={rows=22500}
-          HASH EXCHANGE (source: ShuffleJoin, hash: [c1]) stats={rows=22500}
-            SCAN db_sqlt_ae6738d71862e6e7.residual_mad_a (alias=a) stats={rows=22500}
-                 TABLE: db_sqlt_ae6738d71862e6e7.residual_mad_a
-                 columns: k, payload
-                 min-max stats
-                 predicates: a.k = 7 AND a.k IS NOT NULL
-          HASH EXCHANGE (source: ShuffleJoin, hash: [c3]) stats={rows=22500}
-            SCAN db_sqlt_ae6738d71862e6e7.residual_mad_b (alias=b) stats={rows=22500}
-                 TABLE: db_sqlt_ae6738d71862e6e7.residual_mad_b
-                 columns: k, payload
-                 min-max stats
-                 predicates: b.k = 7 AND b.k IS NOT NULL
-      HASH EXCHANGE (source: ShuffleJoin, hash: [c5]) stats={rows=90000}
+GATHER EXCHANGE stats={rows=126562500}
+  PROJECT [a.payload AS payload, b.payload AS payload, c.payload AS payload] stats={rows=126562500}
+    HASH JOIN (BROADCAST, INNER, eq: [b.k = c.k]) stats={rows=126562500}
+      build runtime filters:
+      - filter_id = 1, build_expr = (c.k)
+      HASH JOIN (BROADCAST, INNER, eq: [a.k = b.k]) stats={rows=126562500}
+        build runtime filters:
+        - filter_id = 0, build_expr = (b.k)
+        SCAN db_sqlt_ae6738d71862e6e7.residual_mad_a (alias=a) stats={rows=22500}
+             TABLE: db_sqlt_ae6738d71862e6e7.residual_mad_a
+             columns: k, payload
+             min-max stats
+             predicates: a.k = 7 AND a.k IS NOT NULL
+            probe runtime filters:
+            - filter_id = 0, probe_expr = (a.k)
+        BROADCAST EXCHANGE stats={rows=22500}
+          SCAN db_sqlt_ae6738d71862e6e7.residual_mad_b (alias=b) stats={rows=22500}
+               TABLE: db_sqlt_ae6738d71862e6e7.residual_mad_b
+               columns: k, payload
+               min-max stats
+               predicates: b.k = 7 AND b.k IS NOT NULL
+      BROADCAST EXCHANGE stats={rows=90000}
         SCAN db_sqlt_ae6738d71862e6e7.residual_mad_c (alias=c) stats={rows=90000}
              TABLE: db_sqlt_ae6738d71862e6e7.residual_mad_c
              columns: k, payload

@@ -60,10 +60,9 @@ pub(crate) fn estimate_selectivity(
             let col_name = extract_column_name(expr);
             let ndv = col_name
                 .and_then(|name| column_stats.get(&name.to_lowercase()))
-                .map(|cs| cs.distinct_values_count.max(1.0))
-                .unwrap_or(0.0);
+                .and_then(trusted_distinct_values_count);
 
-            let sel = if ndv > 0.0 {
+            let sel = if let Some(ndv) = ndv {
                 (list.len() as f64 / ndv).min(1.0)
             } else {
                 IN_PREDICATE_DEFAULT_FILTER
@@ -156,11 +155,22 @@ fn estimate_eq_selectivity(
 
     if let Some(name) = col_name
         && let Some(cs) = column_stats.get(&name.to_lowercase())
-        && cs.distinct_values_count > 1.0
+        && let Some(ndv) = trusted_distinct_values_count(cs)
     {
-        return 1.0 / cs.distinct_values_count;
+        return 1.0 / ndv;
     }
     PREDICATE_UNKNOWN_FILTER
+}
+
+fn trusted_distinct_values_count(stat: &ColumnStatistic) -> Option<f64> {
+    if stat.confidence > Confidence::Fallback
+        && stat.distinct_values_count.is_finite()
+        && stat.distinct_values_count > 1.0
+    {
+        Some(stat.distinct_values_count)
+    } else {
+        None
+    }
 }
 
 fn estimate_range_selectivity(
@@ -336,6 +346,52 @@ mod tests {
                 "child_rows={child_rows}, selectivity={selectivity}"
             );
         }
+    }
+
+    #[test]
+    fn fallback_ndv_does_not_drive_equality_selectivity() {
+        let mut stats = HashMap::new();
+        stats.insert(
+            "c".to_string(),
+            ColumnStatistic {
+                distinct_values_count: 10_000.0,
+                confidence: Confidence::Fallback,
+                ..ColumnStatistic::unknown()
+            },
+        );
+        let predicate = eq(col("c", 1), int_lit(7));
+
+        assert_eq!(
+            estimate_selectivity(&predicate, &stats),
+            PREDICATE_UNKNOWN_FILTER
+        );
+    }
+
+    #[test]
+    fn fallback_ndv_does_not_drive_in_list_selectivity() {
+        let mut stats = HashMap::new();
+        stats.insert(
+            "c".to_string(),
+            ColumnStatistic {
+                distinct_values_count: 10_000.0,
+                confidence: Confidence::Fallback,
+                ..ColumnStatistic::unknown()
+            },
+        );
+        let predicate = TypedExpr {
+            kind: ExprKind::InList {
+                expr: Box::new(col("c", 1)),
+                list: vec![int_lit(1), int_lit(2), int_lit(3)],
+                negated: false,
+            },
+            data_type: DataType::Boolean,
+            nullable: true,
+        };
+
+        assert_eq!(
+            estimate_selectivity(&predicate, &stats),
+            IN_PREDICATE_DEFAULT_FILTER
+        );
     }
 
     #[test]

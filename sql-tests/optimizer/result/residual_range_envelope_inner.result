@@ -1,16 +1,21 @@
 Explain String
-GATHER EXCHANGE stats={rows=20250}
-  PROJECT [l.payload AS payload, r.payload AS payload] stats={rows=20250}
-    HASH JOIN (PARTITIONED, INNER, eq: [l.k = r.k, l.score = r.score]) stats={rows=20250}
-      HASH EXCHANGE (source: ShuffleJoin, hash: [c1, c2]) stats={rows=8859}
+GATHER EXCHANGE stats={rows=11212646}
+  PROJECT [l.payload AS payload, r.payload AS payload] stats={rows=11212646}
+    HASH JOIN (BROADCAST, INNER, eq: [r.k = l.k, r.score = l.score]) stats={rows=11212646}
+      build runtime filters:
+      - filter_id = 0, build_expr = (l.k)
+      - filter_id = 1, build_expr = (l.score)
+      SCAN db_sqlt_53693317611542f0.residual_rng_r (alias=r) stats={rows=20250}
+           TABLE: db_sqlt_53693317611542f0.residual_rng_r
+           columns: k, score, payload
+           min-max stats
+           predicates: r.score BETWEEN 10 AND 40 AND r.k IS NOT NULL AND r.score IS NOT NULL
+          probe runtime filters:
+          - filter_id = 0, probe_expr = (r.k)
+          - filter_id = 1, probe_expr = (r.score)
+      BROADCAST EXCHANGE stats={rows=8859}
         SCAN db_sqlt_53693317611542f0.residual_rng_l (alias=l) stats={rows=8859}
              TABLE: db_sqlt_53693317611542f0.residual_rng_l
              columns: k, score, payload
              min-max stats
              predicates: l.score BETWEEN 10 AND 20 OR l.score BETWEEN 30 AND 40 AND l.score BETWEEN 10 AND 40 AND l.k IS NOT NULL AND l.score IS NOT NULL
-      HASH EXCHANGE (source: ShuffleJoin, hash: [c4, c5]) stats={rows=20250}
-        SCAN db_sqlt_53693317611542f0.residual_rng_r (alias=r) stats={rows=20250}
-             TABLE: db_sqlt_53693317611542f0.residual_rng_r
-             columns: k, score, payload
-             min-max stats
-             predicates: r.score BETWEEN 10 AND 40 AND r.k IS NOT NULL AND r.score IS NOT NULL
