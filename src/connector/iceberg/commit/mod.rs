@@ -79,7 +79,11 @@ pub(crate) use rewrite_data_files::count_current_live_files;
 pub(crate) use rewrite_data_files::{LiveFileMetrics, current_live_file_metrics};
 pub use row_delta::RowDeltaCommit;
 pub use row_delta_dv::RowDeltaDvCommit;
-pub use run::{CleanupPathMapper, RunInput, run_iceberg_commit};
+pub use run::{CleanupPathMapper, RunInput, run_iceberg_commit, run_iceberg_commit_typed};
+pub use service::{
+    CleanupAttempt, CommitFailureKind, CommitServiceError, CommitServiceOutcome, RecoveryEvidence,
+    classify_commit_error,
+};
 pub use truncate::TruncateCommit;
 pub use types::{
     CommitOpKind, CommitOutcome, IcebergSqlDeleteStrategy, IcebergUpdateMode, IcebergWriteMode,

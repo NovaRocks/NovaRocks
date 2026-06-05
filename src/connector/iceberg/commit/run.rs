@@ -20,11 +20,8 @@
 //! failure decide whether to clean staged files or leave them for human
 //! review (spec §5.4 — "commit unknown").
 //!
-//! The classification of commit failures is informed by spike
-//! `docs/superpowers/spikes/2026-04-28-commit-unknown-classification.md`:
-//! only `iceberg::ErrorKind::Unexpected` is treated as commit-unknown, every
-//! other variant means we know the commit definitively failed and may safely
-//! clean up.
+//! Commit failure classification is delegated to `service.rs`, which preserves
+//! the legacy cleanup decision while exposing typed lifecycle errors.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -42,6 +39,9 @@ use super::overwrite::OverwriteCommit;
 use super::rewrite_data_files::RewriteDataFilesCommit;
 use super::row_delta::RowDeltaCommit;
 use super::row_delta_dv::RowDeltaDvCommit;
+use super::service::{
+    CleanupAttempt, CommitFailureKind, CommitServiceError, RecoveryEvidence, classify_commit_error,
+};
 use super::truncate::TruncateCommit;
 use super::types::{CommitOpKind, CommitOutcome};
 use super::update_cow::CowUpdateCommit;
@@ -63,14 +63,24 @@ pub struct RunInput {
     pub snapshot_properties: BTreeMap<String, String>,
 }
 
-/// Dispatch a commit-action and handle abort/cleanup.
+/// Legacy compatibility wrapper for existing engine paths.
 ///
-/// On error this function calls `AbortLog::cleanup` only when the underlying
-/// failure is "definite" — see [`is_commit_unknown_message`] for the
-/// classifier. For commit-unknown failures (network transport errors that
-/// could leave the catalog in either state) the staged files are left on disk
-/// and surfaced in the error message for manual reconciliation.
+/// New lifecycle-aware callers should use [`run_iceberg_commit_typed`] so they
+/// can branch on `CommitServiceError` without parsing user-facing strings.
 pub async fn run_iceberg_commit(input: RunInput) -> Result<CommitOutcome, String> {
+    run_iceberg_commit_typed(input)
+        .await
+        .map_err(CommitServiceError::into_legacy_string)
+}
+
+/// Dispatch a commit-action and return typed commit outcome/error.
+///
+/// On definite commit failure this function runs best-effort abort cleanup and
+/// returns `KnownUncommitted`. On commit-unknown failure it leaves staged files
+/// untouched and returns `Unknown` with recovery evidence.
+pub async fn run_iceberg_commit_typed(
+    input: RunInput,
+) -> Result<CommitOutcome, CommitServiceError> {
     let RunInput {
         collector,
         catalog,
@@ -90,19 +100,22 @@ pub async fn run_iceberg_commit(input: RunInput) -> Result<CommitOutcome, String
         CommitOpKind::RowDeltaDv => Box::new(RowDeltaDvCommit),
         CommitOpKind::RewriteDataFiles => Box::new(RewriteDataFilesCommit),
         CommitOpKind::CowUpdate => Box::new(CowUpdateCommit {
-            rewrite: cow_update_rewrite
-                .ok_or_else(|| "CowUpdate commit requires a rewrite set".to_string())?,
+            rewrite: cow_update_rewrite.ok_or_else(|| {
+                CommitServiceError::known_uncommitted(
+                    "CowUpdate commit requires a rewrite set".to_string(),
+                    CleanupAttempt::not_attempted(),
+                )
+            })?,
         }),
         CommitOpKind::Truncate => Box::new(TruncateCommit),
         CommitOpKind::OverwritePartitions => {
             Box::new(super::overwrite_partitions::OverwritePartitionsCommit)
         }
         CommitOpKind::RewriteManifests => {
-            return Err(
-                "CommitOpKind::RewriteManifests must be invoked via run_rewrite_manifests \
-                directly, not the collector dispatcher"
-                    .to_string(),
-            );
+            return Err(CommitServiceError::known_uncommitted(
+                "CommitOpKind::RewriteManifests must be invoked via run_rewrite_manifests directly, not the collector dispatcher".to_string(),
+                CleanupAttempt::not_attempted(),
+            ));
         }
     };
 
@@ -122,8 +135,9 @@ pub async fn run_iceberg_commit(input: RunInput) -> Result<CommitOutcome, String
             collector.mark_committed();
             Ok(outcome)
         }
-        Err(commit_err) => {
-            if is_commit_unknown_message(&commit_err) {
+        Err(commit_err) => match classify_commit_error(&commit_err) {
+            CommitFailureKind::Unknown => {
+                let evidence = RecoveryEvidence::from_collector(&collector);
                 tracing::warn!(
                     op_kind = ?collector.op_kind,
                     table = %collector.table_ident,
@@ -131,11 +145,9 @@ pub async fn run_iceberg_commit(input: RunInput) -> Result<CommitOutcome, String
                     staging_dir = collector.staging_dir,
                     "iceberg commit unknown — leaving all staged files for manual review: {commit_err}"
                 );
-                Err(format!(
-                    "iceberg commit unknown ({commit_err}); staged files left at {} for manual review",
-                    collector.staging_dir
-                ))
-            } else {
+                Err(CommitServiceError::unknown(commit_err, evidence))
+            }
+            CommitFailureKind::KnownUncommitted => {
                 let cleanup_errors = if let Some(mapper) = cleanup_path_mapper {
                     collector
                         .abort_log
@@ -147,95 +159,46 @@ pub async fn run_iceberg_commit(input: RunInput) -> Result<CommitOutcome, String
                 for e in &cleanup_errors {
                     tracing::warn!(path = %e.path, source = ?e.source, "abort cleanup error");
                 }
-                Err(format!(
-                    "iceberg commit failed: {commit_err}; abort cleanup ran ({} error(s))",
-                    cleanup_errors.len()
+                Err(CommitServiceError::known_uncommitted(
+                    commit_err,
+                    CleanupAttempt::from_cleanup_errors(&cleanup_errors),
                 ))
             }
-        }
+        },
     }
-}
-
-/// Classify a commit-error string into "definite fail" (false) vs
-/// "commit unknown" (true).
-///
-/// Errors flow up from each commit-action as `String`, so this matches on
-/// substrings derived from `iceberg::ErrorKind` `Display`. Per spike
-/// (`docs/superpowers/spikes/2026-04-28-commit-unknown-classification.md`):
-///
-/// * `Unexpected` → commit unknown → leave files alone
-/// * Any other ErrorKind → definite fail → clean up
-///
-/// Pipeline-level cancellation/cleanup signals are also treated as definite
-/// failures because by the time we see them the pipeline never reached the
-/// commit-action's `Catalog::update_table` call.
-fn is_commit_unknown_message(err: &str) -> bool {
-    let lower = err.to_lowercase();
-
-    // Definite-fail signals override any "unexpected" mention they may
-    // contain (e.g. an Unexpected wrapping a known sub-error).
-    let definite_signals = [
-        "conflict",
-        "assertrefsnapshotid",
-        "ref_snapshot_id_match",
-        "schema id mismatch",
-        "schemaidmatch",
-        "spec id mismatch",
-        "specidmatch",
-        "data invalid",
-        "datainvalid",
-        "feature unsupported",
-        "featureunsupported",
-        "table not found",
-        "tablenotfound",
-        "table already exists",
-        "tablealreadyexists",
-        "namespace not found",
-        "namespacenotfound",
-        "namespace already exists",
-        "namespacealreadyexists",
-        "precondition failed",
-        "preconditionfailed",
-        "catalog commit conflict",
-        "catalogcommitconflict",
-        "expected data only",
-        // pipeline-side errors are always definite
-        "pipeline cancelled",
-        "pipeline failed",
-    ];
-    !definite_signals.iter().any(|s| lower.contains(s))
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::service::{CleanupAttempt, CommitServiceError, RecoveryEvidence};
     use super::*;
 
     #[test]
-    fn is_commit_unknown_classifies_definite_failures() {
-        assert!(!is_commit_unknown_message(
-            "RowDelta commit failed: catalog commit conflict on assert-ref-snapshot-id"
-        ));
-        assert!(!is_commit_unknown_message(
-            "FastAppend commit failed: data invalid"
-        ));
-        assert!(!is_commit_unknown_message(
-            "FastAppendCommit received PositionDeletes content; expected Data only"
-        ));
-        assert!(!is_commit_unknown_message("pipeline cancelled mid-write"));
-        assert!(!is_commit_unknown_message(
-            "Overwrite commit failed: TableAlreadyExists"
-        ));
+    fn commit_service_error_legacy_string_preserves_known_failure_format() {
+        let err = CommitServiceError::known_uncommitted(
+            "FastAppend commit failed: data invalid".to_string(),
+            CleanupAttempt::completed(vec!["staged.parquet".to_string()]),
+        );
+        assert_eq!(
+            err.into_legacy_string(),
+            "iceberg commit failed: FastAppend commit failed: data invalid; abort cleanup ran (1 error(s))"
+        );
     }
 
     #[test]
-    fn is_commit_unknown_classifies_unknown_failures() {
-        assert!(is_commit_unknown_message(
-            "RowDelta commit failed: io error reading from socket"
-        ));
-        assert!(is_commit_unknown_message(
-            "FastAppend commit failed: connection reset by peer"
-        ));
-        assert!(is_commit_unknown_message("unexpected error"));
+    fn commit_service_error_legacy_string_preserves_unknown_format() {
+        let evidence = RecoveryEvidence {
+            table_ident: "db.tbl".to_string(),
+            op_kind: CommitOpKind::FastAppend,
+            base_snapshot_id: Some(10),
+            base_sequence_number: 3,
+            staging_dir: "s3://bucket/db/tbl/data/_staging/abc".to_string(),
+        };
+        let err = CommitServiceError::unknown("connection reset by peer".to_string(), evidence);
+        assert_eq!(
+            err.into_legacy_string(),
+            "iceberg commit unknown (connection reset by peer); staged files left at s3://bucket/db/tbl/data/_staging/abc for manual review"
+        );
     }
 
     #[test]
