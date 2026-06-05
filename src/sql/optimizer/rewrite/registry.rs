@@ -112,6 +112,22 @@ mod tests {
     fn query_pipeline_contains_migrated_query_rules() {
         let table_stats = HashMap::new();
         let pipeline = query_rewrite_pipeline(&table_stats);
+
+        assert_eq!(
+            pipeline.stage_names(),
+            vec![
+                "PredicatePushdownPreJoin",
+                "JoinReorder",
+                "PredicatePushdownPostJoin",
+                "PredicateMoveAround",
+                "PredicatePushdownAfterMoveAround",
+                "AggregatePushdown",
+                "TagRequiredColumns",
+                "ColumnPruning",
+                "LowCardinalityDictionaryRewrite",
+            ]
+        );
+
         let mut names = pipeline.rule_names();
         names.sort();
 

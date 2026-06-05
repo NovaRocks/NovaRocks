@@ -57,9 +57,8 @@ pub(crate) fn join_reorder_rules(
     )))]
 }
 
-/// All query rewrite rules including join reorder. For registry test only;
-/// production code calls predicate_pushdown_rules(), join_reorder,
-/// and column_pruning_rules() separately per the four-pass pattern.
+/// All known query rewrite rules for registry and rule-name validation.
+/// Production ordering is defined by query_rewrite_pipeline(), not this set.
 #[allow(dead_code)]
 pub(crate) fn all_query_rewrite_rules(
     table_stats: &HashMap<String, TableStatistics>,
