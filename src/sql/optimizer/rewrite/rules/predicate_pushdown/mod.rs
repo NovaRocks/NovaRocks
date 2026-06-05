@@ -16,6 +16,7 @@
 pub(crate) mod classifier;
 pub(crate) mod deriver;
 pub(crate) mod join_pushdown;
+pub(crate) mod move_around;
 pub(crate) mod predicate_group;
 pub(crate) mod push_through_project;
 pub(crate) mod push_to_aggregate;
@@ -34,4 +35,8 @@ pub(crate) fn predicate_pushdown_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
         Box::new(push_to_join::PushDownPredicateJoin),
         Box::new(semi_anti_condition::PushSemiAntiRightOnlyCondition),
     ]
+}
+
+pub(crate) fn predicate_move_around_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
+    vec![Box::new(move_around::JoinPredicateMoveAround)]
 }
