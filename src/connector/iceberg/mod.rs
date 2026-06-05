@@ -25,6 +25,7 @@ pub(crate) mod default_value;
 pub mod equality_delete;
 pub mod metadata;
 pub(crate) mod metadata_read;
+pub mod operation_lifecycle;
 pub(crate) mod partition_spec;
 pub mod position_delete;
 pub(crate) mod read;
