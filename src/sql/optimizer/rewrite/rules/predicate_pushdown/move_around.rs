@@ -138,6 +138,16 @@ fn collect_child_predicate_groups(plan: &LogicalPlan, out: &mut Vec<PredicateGro
         LogicalPlan::Project(project) => collect_child_predicate_groups(&project.input, out),
         LogicalPlan::Sort(sort) => collect_child_predicate_groups(&sort.input, out),
         LogicalPlan::Limit(limit) => collect_child_predicate_groups(&limit.input, out),
+        LogicalPlan::Join(join) if matches!(join.join_type, JoinKind::Inner | JoinKind::Cross) => {
+            if let Some(condition) = &join.condition {
+                out.extend(PredicateGroup::from_predicate(
+                    condition.clone(),
+                    PredicateOrigin::JoinCondition,
+                ));
+            }
+            collect_child_predicate_groups(&join.left, out);
+            collect_child_predicate_groups(&join.right, out);
+        }
         _ => {}
     }
 }
@@ -165,6 +175,10 @@ fn collect_existing_child_predicate_keys(plan: &LogicalPlan, out: &mut HashSet<P
         LogicalPlan::Join(join) => {
             if let Some(condition) = &join.condition {
                 collect_top_level_conjunct_keys(condition, out);
+            }
+            if matches!(join.join_type, JoinKind::Inner | JoinKind::Cross) {
+                collect_existing_child_predicate_keys(&join.left, out);
+                collect_existing_child_predicate_keys(&join.right, out);
             }
         }
         _ => {}
@@ -361,5 +375,36 @@ mod tests {
         });
 
         assert!(JoinPredicateMoveAround.apply(plan).is_none());
+    }
+
+    #[test]
+    fn derives_from_nested_inner_join_child_filter() {
+        let b_filter = LogicalPlan::Filter(FilterNode {
+            input: Box::new(scan("b", &[("k", 2)])),
+            predicate: eq(col("b", "k", 2), int_lit(7)),
+            required_output_columns: None,
+        });
+        let left_child = LogicalPlan::Join(JoinNode {
+            left: Box::new(scan("a", &[("k", 1)])),
+            right: Box::new(b_filter),
+            join_type: JoinKind::Inner,
+            condition: Some(eq(col("a", "k", 1), col("b", "k", 2))),
+            required_output_columns: None,
+        });
+        let plan = LogicalPlan::Join(JoinNode {
+            left: Box::new(left_child),
+            right: Box::new(scan("c", &[("k", 3)])),
+            join_type: JoinKind::Inner,
+            condition: Some(eq(col("b", "k", 2), col("c", "k", 3))),
+            required_output_columns: None,
+        });
+
+        let out = JoinPredicateMoveAround
+            .apply(plan)
+            .expect("move-around should derive filter for the parent join sibling");
+        let LogicalPlan::Join(join) = out else {
+            panic!("expected Join");
+        };
+        assert!(matches!(*join.right, LogicalPlan::Filter(_)));
     }
 }
