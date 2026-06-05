@@ -124,6 +124,12 @@ pub fn validate_operation_transition(
             IcebergOperationState::Committing,
             IcebergOperationState::FailedKnownUncommitted
         ) | (
+            IcebergOperationState::CommitUnknown,
+            IcebergOperationState::Committed
+        ) | (
+            IcebergOperationState::CommitUnknown,
+            IcebergOperationState::FailedKnownUncommitted
+        ) | (
             IcebergOperationState::Committed,
             IcebergOperationState::Finalizing
         ) | (
@@ -138,6 +144,9 @@ pub fn validate_operation_transition(
         ) | (
             IcebergOperationState::Finalizing,
             IcebergOperationState::CommitUnknown
+        ) | (
+            IcebergOperationState::FinalizeFailedKnownCommitted,
+            IcebergOperationState::Finalizing
         ) | (
             IcebergOperationState::Aborting,
             IcebergOperationState::Aborted
@@ -178,41 +187,55 @@ mod tests {
 
     #[test]
     fn transition_helper_allows_main_commit_path_and_idempotent_replay() {
-        assert!(validate_operation_transition(
-            IcebergOperationState::Preparing,
-            IcebergOperationState::Writing
-        )
-        .is_ok());
-        assert!(validate_operation_transition(
-            IcebergOperationState::Writing,
-            IcebergOperationState::Collecting
-        )
-        .is_ok());
-        assert!(validate_operation_transition(
-            IcebergOperationState::Collecting,
-            IcebergOperationState::Committing
-        )
-        .is_ok());
-        assert!(validate_operation_transition(
-            IcebergOperationState::Committing,
-            IcebergOperationState::Committed
-        )
-        .is_ok());
-        assert!(validate_operation_transition(
-            IcebergOperationState::Committed,
-            IcebergOperationState::Finalizing
-        )
-        .is_ok());
-        assert!(validate_operation_transition(
-            IcebergOperationState::Finalizing,
-            IcebergOperationState::Finalized
-        )
-        .is_ok());
-        assert!(validate_operation_transition(
-            IcebergOperationState::CommitUnknown,
-            IcebergOperationState::CommitUnknown
-        )
-        .is_ok());
+        assert!(
+            validate_operation_transition(
+                IcebergOperationState::Preparing,
+                IcebergOperationState::Writing
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_operation_transition(
+                IcebergOperationState::Writing,
+                IcebergOperationState::Collecting
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_operation_transition(
+                IcebergOperationState::Collecting,
+                IcebergOperationState::Committing
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_operation_transition(
+                IcebergOperationState::Committing,
+                IcebergOperationState::Committed
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_operation_transition(
+                IcebergOperationState::Committed,
+                IcebergOperationState::Finalizing
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_operation_transition(
+                IcebergOperationState::Finalizing,
+                IcebergOperationState::Finalized
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_operation_transition(
+                IcebergOperationState::CommitUnknown,
+                IcebergOperationState::CommitUnknown
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -228,15 +251,54 @@ mod tests {
     }
 
     #[test]
+    fn transition_helper_allows_commit_unknown_recovery_outcomes() {
+        assert!(
+            validate_operation_transition(
+                IcebergOperationState::CommitUnknown,
+                IcebergOperationState::Committed
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_operation_transition(
+                IcebergOperationState::CommitUnknown,
+                IcebergOperationState::FailedKnownUncommitted
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn transition_helper_routes_finalize_failure_to_known_committed_failure() {
-        assert!(validate_operation_transition(
-            IcebergOperationState::Finalizing,
-            IcebergOperationState::FinalizeFailedKnownCommitted
-        )
-        .is_ok());
+        assert!(
+            validate_operation_transition(
+                IcebergOperationState::Finalizing,
+                IcebergOperationState::FinalizeFailedKnownCommitted
+            )
+            .is_ok()
+        );
         assert!(!IcebergOperationState::FinalizeFailedKnownCommitted.is_finished());
         assert!(IcebergOperationState::Finalized.is_finished());
         assert!(IcebergOperationState::Aborted.is_finished());
         assert!(IcebergOperationState::FailedKnownUncommitted.is_finished());
+    }
+
+    #[test]
+    fn transition_helper_retries_known_committed_finalize_failure_through_finalizing() {
+        assert!(
+            validate_operation_transition(
+                IcebergOperationState::FinalizeFailedKnownCommitted,
+                IcebergOperationState::Finalizing
+            )
+            .is_ok()
+        );
+        let err = validate_operation_transition(
+            IcebergOperationState::FinalizeFailedKnownCommitted,
+            IcebergOperationState::Finalized,
+        )
+        .expect_err("finalize retry must pass through FINALIZING");
+        assert_eq!(err.kind(), RepositoryErrorKind::Conflict);
+        assert!(err.to_string().contains("FINALIZE_FAILED_KNOWN_COMMITTED"));
+        assert!(err.to_string().contains("FINALIZED"));
     }
 }
