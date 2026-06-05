@@ -110,10 +110,16 @@ impl CommitServiceError {
 
     pub fn into_legacy_string(self) -> String {
         match self {
-            Self::KnownUncommitted { message, cleanup } => format!(
-                "iceberg commit failed: {message}; abort cleanup ran ({} error(s))",
-                cleanup.error_count
-            ),
+            Self::KnownUncommitted { message, cleanup } => {
+                if cleanup.attempted {
+                    format!(
+                        "iceberg commit failed: {message}; abort cleanup ran ({} error(s))",
+                        cleanup.error_count
+                    )
+                } else {
+                    message
+                }
+            }
             Self::Unknown { message, evidence } => format!(
                 "iceberg commit unknown ({message}); staged files left at {} for manual review",
                 evidence.staging_dir
@@ -256,6 +262,18 @@ mod tests {
         assert_eq!(
             err.into_legacy_string(),
             "iceberg commit failed: catalog commit conflict; abort cleanup ran (2 error(s))"
+        );
+    }
+
+    #[test]
+    fn known_uncommitted_without_cleanup_preserves_legacy_raw_message() {
+        let err = CommitServiceError::known_uncommitted(
+            "CowUpdate commit requires a rewrite set".to_string(),
+            CleanupAttempt::not_attempted(),
+        );
+        assert_eq!(
+            err.into_legacy_string(),
+            "CowUpdate commit requires a rewrite set"
         );
     }
 }
