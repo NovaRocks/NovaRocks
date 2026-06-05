@@ -17,6 +17,7 @@ pub(crate) mod push_through_project;
 pub(crate) mod push_to_aggregate;
 pub(crate) mod push_to_join;
 pub(crate) mod push_to_scan;
+pub(crate) mod classifier;
 pub(crate) mod predicate_group;
 pub(crate) mod semi_anti_condition;
 
