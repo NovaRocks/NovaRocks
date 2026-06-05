@@ -403,18 +403,7 @@ impl IcebergOperationRepository {
             }
         }
 
-        let mut fields = IcebergOperationFactFields {
-            commit_outcome: req.commit_outcome,
-            cleanup_outcome: req.cleanup_outcome,
-            recovery_evidence: req.recovery_evidence,
-            failure: req.failure,
-        };
-        if fields.commit_outcome.is_none()
-            && should_preserve_known_committed_commit_outcome(from_state, to_state)
-        {
-            fields.commit_outcome = versioned.value.commit_outcome.clone();
-        }
-
+        let fields = merge_operation_fact_fields(&versioned.value, req);
         versioned.value.state = to_state;
         apply_operation_fact_fields(&mut versioned.value, fields);
         versioned.value.updated_at_ms = now_ms;
@@ -436,7 +425,7 @@ fn same_state_fact_refinement(
     if operation_fact_fields_match(operation, req) {
         return Ok(None);
     }
-    if operation.state != IcebergOperationState::FailedKnownUncommitted {
+    if !allows_cleanup_refinement(operation.state) {
         return Err(conflicting_fact_replay_error(
             req.operation_id,
             req.state.as_str(),
@@ -466,8 +455,14 @@ fn same_state_fact_refinement(
             ));
         }
     }
+    if operation.failure.is_none() && req.failure.is_some() {
+        return Err(conflicting_fact_replay_error(
+            req.operation_id,
+            req.state.as_str(),
+        ));
+    }
     if let (Some(current), Some(next)) = (&operation.failure, &req.failure) {
-        if current.kind != next.kind || current.message != next.message {
+        if !allows_failure_refinement(current, next, &req.cleanup_outcome) {
             return Err(conflicting_fact_replay_error(
                 req.operation_id,
                 req.state.as_str(),
@@ -488,6 +483,24 @@ fn same_state_fact_refinement(
         Ok(None)
     } else {
         Ok(Some(fields))
+    }
+}
+
+fn merge_operation_fact_fields(
+    operation: &StoredIcebergOperation,
+    req: IcebergOperationFactUpdate,
+) -> IcebergOperationFactFields {
+    IcebergOperationFactFields {
+        commit_outcome: req
+            .commit_outcome
+            .or_else(|| operation.commit_outcome.clone()),
+        cleanup_outcome: req
+            .cleanup_outcome
+            .or_else(|| operation.cleanup_outcome.clone()),
+        recovery_evidence: req
+            .recovery_evidence
+            .or_else(|| operation.recovery_evidence.clone()),
+        failure: req.failure.or_else(|| operation.failure.clone()),
     }
 }
 
@@ -521,21 +534,31 @@ fn apply_operation_fact_fields(
     operation.failure = fields.failure;
 }
 
-fn should_preserve_known_committed_commit_outcome(
-    from: IcebergOperationState,
-    to: IcebergOperationState,
-) -> bool {
-    is_known_committed_state(from) && is_known_committed_state(to)
-}
-
-fn is_known_committed_state(state: IcebergOperationState) -> bool {
+fn allows_cleanup_refinement(state: IcebergOperationState) -> bool {
     matches!(
         state,
         IcebergOperationState::Committed
-            | IcebergOperationState::Finalizing
-            | IcebergOperationState::Finalized
-            | IcebergOperationState::FinalizeFailedKnownCommitted
+            | IcebergOperationState::CommitUnknown
+            | IcebergOperationState::FailedKnownUncommitted
     )
+}
+
+fn allows_failure_refinement(
+    current: &IcebergOperationFailureRecord,
+    next: &IcebergOperationFailureRecord,
+    cleanup: &Option<IcebergCleanupOutcomeRecord>,
+) -> bool {
+    if current == next {
+        return true;
+    }
+    current.kind == next.kind
+        && current.message == next.message
+        && current.next_action == IcebergOperationNextAction::RetryAbort
+        && next.next_action == IcebergOperationNextAction::None
+        && cleanup
+            .as_ref()
+            .map(|cleanup| cleanup.attempted && cleanup.error_count == 0)
+            .unwrap_or(false)
 }
 
 fn conflicting_fact_replay_error(operation_id: i64, state: &str) -> RepositoryError {
