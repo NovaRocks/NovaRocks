@@ -640,9 +640,10 @@ fn subtree_has_predicate_key(plan: &LogicalPlan, key: &str) -> bool {
         LogicalPlan::Scan(scan) => scan
             .predicates
             .iter()
-            .any(|existing| predicate_key(existing) == key),
+            .any(|existing| predicate_has_conjunct_key(existing, key)),
         LogicalPlan::Filter(filter) => {
-            predicate_key(&filter.predicate) == key || subtree_has_predicate_key(&filter.input, key)
+            predicate_has_conjunct_key(&filter.predicate, key)
+                || subtree_has_predicate_key(&filter.input, key)
         }
         LogicalPlan::Project(project) => subtree_has_predicate_key(&project.input, key),
         LogicalPlan::Aggregate(aggregate) => subtree_has_predicate_key(&aggregate.input, key),
@@ -661,7 +662,7 @@ fn subtree_has_predicate_key(plan: &LogicalPlan, key: &str) -> bool {
         LogicalPlan::Join(join) => {
             join.condition
                 .as_ref()
-                .is_some_and(|condition| predicate_key(condition) == key)
+                .is_some_and(|condition| predicate_has_conjunct_key(condition, key))
                 || subtree_has_predicate_key(&join.left, key)
                 || subtree_has_predicate_key(&join.right, key)
         }
@@ -688,6 +689,12 @@ fn subtree_has_predicate_key(plan: &LogicalPlan, key: &str) -> bool {
         | LogicalPlan::ImvDelta(_)
         | LogicalPlan::ImvVersion(_) => false,
     }
+}
+
+fn predicate_has_conjunct_key(expr: &TypedExpr, key: &str) -> bool {
+    split_and_refs(expr)
+        .into_iter()
+        .any(|conjunct| predicate_key(conjunct) == key)
 }
 
 fn predicate_key(expr: &TypedExpr) -> String {
@@ -1367,6 +1374,45 @@ mod tests {
         let rendered = format!("{:?}", condition.kind);
         assert!(rendered.contains("\"a\""));
         assert!(rendered.contains("\"b\""));
+    }
+
+    #[test]
+    fn derived_predicate_detects_existing_child_filter_conjunct() {
+        let existing_left = LogicalPlan::Filter(FilterNode {
+            input: Box::new(scan_with_ids("l", &[("a", 1), ("v", 3)])),
+            predicate: combine_and(vec![
+                eq(col_with_id("l", "a", 1), int_lit(7)),
+                eq(col_with_id("l", "v", 3), int_lit(3)),
+            ]),
+            required_output_columns: None,
+        });
+        let join = JoinNode {
+            left: Box::new(existing_left),
+            right: Box::new(scan_with_ids("r", &[("b", 2), ("w", 4)])),
+            join_type: JoinKind::Inner,
+            condition: Some(eq(col_with_id("l", "a", 1), col_with_id("r", "b", 2))),
+            required_output_columns: None,
+        };
+
+        let (plan, changed) =
+            push_filter_predicates_through_join(eq(col_with_id("r", "b", 2), int_lit(7)), join);
+
+        assert!(changed);
+        let LogicalPlan::Join(join) = plan else {
+            panic!("expected Join");
+        };
+        match join.left.as_ref() {
+            LogicalPlan::Filter(filter) => {
+                assert!(
+                    !matches!(filter.input.as_ref(), LogicalPlan::Filter(_)),
+                    "must not add duplicate derived left filter over existing conjunct"
+                );
+                let rendered = format!("{:?}", filter.predicate.kind);
+                assert!(rendered.contains("\"a\""));
+                assert!(rendered.contains("\"v\""));
+            }
+            other => panic!("expected existing left Filter, got {:?}", other),
+        }
     }
 
     #[test]

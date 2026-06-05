@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
@@ -135,6 +136,9 @@ fn substitute_constraint_column(
     if !is_column_ref(target_column) {
         return None;
     }
+    if constraint.column.data_type != target_column.data_type {
+        return None;
+    }
     let expr = match &constraint.kind {
         ConstraintKind::Eq(value) => binary_bool(target_column.clone(), BinOp::Eq, value.clone()),
         ConstraintKind::InList(list) => TypedExpr {
@@ -196,11 +200,17 @@ fn derive_or_branch_side_filters(
         for (left, right) in pairs {
             for constraint in &constraints {
                 if same_column(&constraint.column, &left) {
+                    if constraint.column.data_type != right.data_type {
+                        continue;
+                    }
                     candidates.push(ColumnConstraint {
                         column: right.clone(),
                         kind: constraint.kind.clone(),
                     });
                 } else if same_column(&constraint.column, &right) {
+                    if constraint.column.data_type != left.data_type {
+                        continue;
+                    }
                     candidates.push(ColumnConstraint {
                         column: left.clone(),
                         kind: constraint.kind.clone(),
@@ -373,19 +383,13 @@ fn derive_or_range_envelope(
         let constraints = branch.by_column.get(column_key)?;
         let (branch_low, branch_high) = branch_range(constraints)?;
         low = Some(match low {
-            Some(current)
-                if numeric_literal_value(&current)? <= numeric_literal_value(&branch_low)? =>
-            {
+            Some(current) if compare_literals(&current, &branch_low)? != Ordering::Greater => {
                 current
             }
             _ => branch_low,
         });
         high = Some(match high {
-            Some(current)
-                if numeric_literal_value(&current)? >= numeric_literal_value(&branch_high)? =>
-            {
-                current
-            }
+            Some(current) if compare_literals(&current, &branch_high)? != Ordering::Less => current,
             _ => branch_high,
         });
     }
@@ -411,8 +415,8 @@ fn branch_range(constraints: &[ColumnConstraint]) -> Option<(TypedExpr, TypedExp
             _ => None,
         })
     {
-        numeric_literal_value(&low)?;
-        numeric_literal_value(&high)?;
+        ensure_comparable_literal(&low)?;
+        ensure_comparable_literal(&high)?;
         return Some((low, high));
     }
 
@@ -421,11 +425,11 @@ fn branch_range(constraints: &[ColumnConstraint]) -> Option<(TypedExpr, TypedExp
     for constraint in constraints {
         match &constraint.kind {
             ConstraintKind::Lower { value, .. } => {
-                numeric_literal_value(value)?;
+                ensure_comparable_literal(value)?;
                 low = Some(value.clone());
             }
             ConstraintKind::Upper { value, .. } => {
-                numeric_literal_value(value)?;
+                ensure_comparable_literal(value)?;
                 high = Some(value.clone());
             }
             _ => {}
@@ -434,13 +438,127 @@ fn branch_range(constraints: &[ColumnConstraint]) -> Option<(TypedExpr, TypedExp
     Some((low?, high?))
 }
 
-fn numeric_literal_value(expr: &TypedExpr) -> Option<f64> {
-    match &expr.kind {
-        ExprKind::Literal(LiteralValue::Int(value)) => Some(*value as f64),
-        ExprKind::Literal(LiteralValue::LargeInt(value)) => Some(*value as f64),
-        ExprKind::Literal(LiteralValue::Float(value)) => Some(*value),
-        ExprKind::Literal(LiteralValue::Decimal(value)) => value.parse::<f64>().ok(),
+fn ensure_comparable_literal(expr: &TypedExpr) -> Option<()> {
+    compare_literals(expr, expr).map(|_| ())
+}
+
+fn compare_literals(left: &TypedExpr, right: &TypedExpr) -> Option<Ordering> {
+    match (&left.kind, &right.kind) {
+        (
+            ExprKind::Literal(LiteralValue::Int(left)),
+            ExprKind::Literal(LiteralValue::Int(right)),
+        ) => Some(left.cmp(right)),
+        (
+            ExprKind::Literal(LiteralValue::LargeInt(left)),
+            ExprKind::Literal(LiteralValue::LargeInt(right)),
+        ) => Some(left.cmp(right)),
+        (
+            ExprKind::Literal(LiteralValue::Int(left)),
+            ExprKind::Literal(LiteralValue::LargeInt(right)),
+        ) => Some(i128::from(*left).cmp(right)),
+        (
+            ExprKind::Literal(LiteralValue::LargeInt(left)),
+            ExprKind::Literal(LiteralValue::Int(right)),
+        ) => Some(left.cmp(&i128::from(*right))),
+        (
+            ExprKind::Literal(LiteralValue::Float(left)),
+            ExprKind::Literal(LiteralValue::Float(right)),
+        ) if left.is_finite() && right.is_finite() => left.partial_cmp(right),
+        (
+            ExprKind::Literal(LiteralValue::Decimal(left)),
+            ExprKind::Literal(LiteralValue::Decimal(right)),
+        ) => compare_decimal_strings(left, right),
         _ => None,
+    }
+}
+
+fn compare_decimal_strings(left: &str, right: &str) -> Option<Ordering> {
+    let left = DecimalLiteral::parse(left)?;
+    let right = DecimalLiteral::parse(right)?;
+    Some(left.cmp(&right))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DecimalLiteral {
+    negative: bool,
+    int: String,
+    frac: String,
+}
+
+impl DecimalLiteral {
+    fn parse(input: &str) -> Option<Self> {
+        let (negative, unsigned) = match input.as_bytes().first().copied() {
+            Some(b'-') => (true, &input[1..]),
+            Some(b'+') => (false, &input[1..]),
+            _ => (false, input),
+        };
+        if unsigned.is_empty() {
+            return None;
+        }
+        let mut parts = unsigned.split('.');
+        let int_part = parts.next()?;
+        let frac_part = parts.next();
+        if parts.next().is_some() {
+            return None;
+        }
+        let frac_part = frac_part.unwrap_or("");
+        if int_part.is_empty() && frac_part.is_empty() {
+            return None;
+        }
+        if !int_part.bytes().all(|byte| byte.is_ascii_digit())
+            || !frac_part.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return None;
+        }
+
+        let int = int_part.trim_start_matches('0');
+        let frac = frac_part.trim_end_matches('0');
+        let int = if int.is_empty() { "0" } else { int }.to_string();
+        let frac = frac.to_string();
+        let is_zero = int == "0" && frac.is_empty();
+        Some(Self {
+            negative: negative && !is_zero,
+            int,
+            frac,
+        })
+    }
+
+    fn cmp_abs(&self, other: &Self) -> Ordering {
+        match self.int.len().cmp(&other.int.len()) {
+            Ordering::Equal => {}
+            ordering => return ordering,
+        }
+        match self.int.cmp(&other.int) {
+            Ordering::Equal => {}
+            ordering => return ordering,
+        }
+        let max_frac_len = self.frac.len().max(other.frac.len());
+        for idx in 0..max_frac_len {
+            let left = self.frac.as_bytes().get(idx).copied().unwrap_or(b'0');
+            let right = other.frac.as_bytes().get(idx).copied().unwrap_or(b'0');
+            match left.cmp(&right) {
+                Ordering::Equal => {}
+                ordering => return ordering,
+            }
+        }
+        Ordering::Equal
+    }
+}
+
+impl Ord for DecimalLiteral {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self.negative, other.negative) {
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            (false, false) => self.cmp_abs(other),
+            (true, true) => other.cmp_abs(self),
+        }
+    }
+}
+
+impl PartialOrd for DecimalLiteral {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -581,13 +699,17 @@ mod tests {
     use std::collections::HashSet;
 
     fn col(alias: &str, name: &str, id: u32) -> TypedExpr {
+        col_ty(alias, name, id, DataType::Int32)
+    }
+
+    fn col_ty(alias: &str, name: &str, id: u32, data_type: DataType) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
                 column_id: ColumnId::new_for_test(id),
                 qualifier: Some(alias.to_string()),
                 column: name.to_string(),
             },
-            data_type: DataType::Int32,
+            data_type,
             nullable: true,
         }
     }
@@ -596,6 +718,30 @@ mod tests {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(v)),
             data_type: DataType::Int64,
+            nullable: false,
+        }
+    }
+
+    fn large_int_lit(v: i128) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::LargeInt(v)),
+            data_type: DataType::Decimal128(38, 0),
+            nullable: false,
+        }
+    }
+
+    fn decimal_lit(v: &str) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Decimal(v.to_string())),
+            data_type: DataType::Decimal128(38, 2),
+            nullable: false,
+        }
+    }
+
+    fn string_lit(v: &str) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::String(v.to_string())),
+            data_type: DataType::Utf8,
             nullable: false,
         }
     }
@@ -614,6 +760,18 @@ mod tests {
 
     fn group(expr: TypedExpr) -> PredicateGroup {
         PredicateGroup::new(expr, PredicateOrigin::Filter, PredicateDerivedKind::None)
+    }
+
+    fn nondeterministic_group() -> PredicateGroup {
+        group(TypedExpr {
+            kind: ExprKind::FunctionCall {
+                name: "rand".to_string(),
+                args: vec![],
+                distinct: false,
+            },
+            data_type: DataType::Float64,
+            nullable: false,
+        })
     }
 
     fn ids(values: &[u32]) -> HashSet<ColumnId> {
@@ -644,6 +802,29 @@ mod tests {
         let rendered = format!("{:?}", derived);
         assert!(rendered.contains("\"b\""));
         assert!(rendered.contains("Int(7)"));
+    }
+
+    #[test]
+    fn skips_equivalence_derivation_for_incompatible_key_types() {
+        let join_eq = group(bool_expr(
+            col_ty("l", "a", 1, DataType::Int32),
+            BinOp::Eq,
+            col_ty("r", "b", 2, DataType::Utf8),
+        ));
+        let left_filter = group(bool_expr(
+            col_ty("l", "a", 1, DataType::Int32),
+            BinOp::Eq,
+            int_lit(7),
+        ));
+
+        let derived =
+            derive_inner_join_predicates(&ids(&[1]), &ids(&[2]), &[join_eq], &[left_filter]);
+
+        assert!(
+            derived.is_empty(),
+            "incompatible key types must not derive predicates: {:?}",
+            derived
+        );
     }
 
     #[test]
@@ -699,6 +880,41 @@ mod tests {
     }
 
     #[test]
+    fn nondeterministic_group_suppresses_all_derivation() {
+        let join_eq = group(bool_expr(col("l", "a", 1), BinOp::Eq, col("r", "b", 2)));
+        let left_filter = group(bool_expr(col("l", "a", 1), BinOp::Eq, int_lit(7)));
+        let derived = derive_inner_join_predicates(
+            &ids(&[1]),
+            &ids(&[2]),
+            &[join_eq],
+            &[left_filter, nondeterministic_group()],
+        );
+
+        assert!(derived.is_empty());
+    }
+
+    #[test]
+    fn or_branch_missing_same_side_constraint_derives_nothing() {
+        let or_pred = bool_expr(
+            bool_expr(
+                bool_expr(col("l", "a", 1), BinOp::Eq, col("r", "b", 2)),
+                BinOp::And,
+                bool_expr(col("l", "a", 1), BinOp::Eq, int_lit(1)),
+            ),
+            BinOp::Or,
+            bool_expr(col("l", "a", 1), BinOp::Eq, col("r", "b", 2)),
+        );
+
+        let derived = derive_inner_join_predicates(&ids(&[1]), &ids(&[2]), &[], &[group(or_pred)]);
+
+        assert!(
+            derived.is_empty(),
+            "missing branch side constraint must not derive: {:?}",
+            derived
+        );
+    }
+
+    #[test]
     fn derives_range_envelope_from_or_branches() {
         let or_pred = bool_expr(
             TypedExpr {
@@ -730,5 +946,107 @@ mod tests {
         assert!(rendered.contains("\"price\""));
         assert!(rendered.contains("Int(50)"));
         assert!(rendered.contains("Int(200)"));
+    }
+
+    #[test]
+    fn range_envelope_compares_large_int_bounds_exactly() {
+        let or_pred = bool_expr(
+            TypedExpr {
+                kind: ExprKind::Between {
+                    expr: Box::new(col("s", "price", 3)),
+                    low: Box::new(large_int_lit(9_007_199_254_740_993)),
+                    high: Box::new(large_int_lit(9_007_199_254_741_500)),
+                    negated: false,
+                },
+                data_type: DataType::Boolean,
+                nullable: true,
+            },
+            BinOp::Or,
+            TypedExpr {
+                kind: ExprKind::Between {
+                    expr: Box::new(col("s", "price", 3)),
+                    low: Box::new(large_int_lit(9_007_199_254_740_992)),
+                    high: Box::new(large_int_lit(9_007_199_254_741_600)),
+                    negated: false,
+                },
+                data_type: DataType::Boolean,
+                nullable: true,
+            },
+        );
+
+        let derived = derive_inner_join_predicates(&ids(&[1]), &ids(&[3]), &[], &[group(or_pred)]);
+
+        let rendered = format!("{:?}", derived);
+        assert!(rendered.contains("LargeInt(9007199254740992)"));
+        assert!(!rendered.contains("LargeInt(9007199254740993)"));
+    }
+
+    #[test]
+    fn range_envelope_compares_decimal_bounds_exactly() {
+        let or_pred = bool_expr(
+            TypedExpr {
+                kind: ExprKind::Between {
+                    expr: Box::new(col("s", "price", 3)),
+                    low: Box::new(decimal_lit("10.25")),
+                    high: Box::new(decimal_lit("20.00")),
+                    negated: false,
+                },
+                data_type: DataType::Boolean,
+                nullable: true,
+            },
+            BinOp::Or,
+            TypedExpr {
+                kind: ExprKind::Between {
+                    expr: Box::new(col("s", "price", 3)),
+                    low: Box::new(decimal_lit("9.50")),
+                    high: Box::new(decimal_lit("30.00")),
+                    negated: false,
+                },
+                data_type: DataType::Boolean,
+                nullable: true,
+            },
+        );
+
+        let derived = derive_inner_join_predicates(&ids(&[1]), &ids(&[3]), &[], &[group(or_pred)]);
+
+        let rendered = format!("{:?}", derived);
+        assert!(rendered.contains("Decimal(\"9.50\")"));
+    }
+
+    #[test]
+    fn unsupported_range_literal_skips_range_envelope() {
+        let or_pred = bool_expr(
+            TypedExpr {
+                kind: ExprKind::Between {
+                    expr: Box::new(col("s", "price", 3)),
+                    low: Box::new(string_lit("a")),
+                    high: Box::new(string_lit("z")),
+                    negated: false,
+                },
+                data_type: DataType::Boolean,
+                nullable: true,
+            },
+            BinOp::Or,
+            TypedExpr {
+                kind: ExprKind::Between {
+                    expr: Box::new(col("s", "price", 3)),
+                    low: Box::new(string_lit("b")),
+                    high: Box::new(string_lit("y")),
+                    negated: false,
+                },
+                data_type: DataType::Boolean,
+                nullable: true,
+            },
+        );
+
+        let derived = derive_inner_join_predicates(&ids(&[1]), &ids(&[3]), &[], &[group(or_pred)]);
+
+        assert!(
+            derived
+                .iter()
+                .all(|group| group.derived != PredicateDerivedKind::RangeEnvelope),
+            "unsupported literals must not produce range envelope: {:?}",
+            derived
+        );
     }
 }
