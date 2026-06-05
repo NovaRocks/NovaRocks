@@ -23,6 +23,7 @@ pub(crate) mod test_avro_seed {
     use serde::{Deserialize, Serialize};
 
     use crate::meta::MetaPayload;
+    use crate::meta::repository::iceberg_operation::encode_seed_operation_payload;
     use crate::meta::repository::job::{StoredEraseJob, StoredIcebergOptimizeJob};
     use crate::meta::repository::starrocks_table::{
         StoredStarRocksColumn, StoredStarRocksDatabase, StoredStarRocksIndex,
@@ -46,6 +47,7 @@ pub(crate) mod test_avro_seed {
             "starrocks.txn" => encode_from_json::<StoredStarRocksTxn>(kind, payload),
             "job.erase" => encode_from_json::<StoredEraseJob>(kind, payload),
             "job.iceberg_optimize" => encode_from_json::<StoredIcebergOptimizeJob>(kind, payload),
+            "iceberg.operation" => encode_seed_operation_payload(payload),
             _ => Err(RepositoryError::invalid(format!(
                 "unsupported test seed metadata kind `{kind}`"
             ))),

@@ -5,6 +5,10 @@ use novarocks::meta::keys::{NS_JOB, NS_STARROCKS_TXN};
 use novarocks::meta::repository::iceberg_catalog::{
     IcebergCatalogMetaRepository, IcebergCatalogProperties, IcebergNamespaceRecord,
 };
+use novarocks::meta::repository::iceberg_operation::{
+    CreateIcebergOperationRequest, IcebergOperationKind, IcebergOperationRepository,
+    IcebergOperationState, IcebergOperationTarget,
+};
 use novarocks::meta::repository::job::{
     CreateEraseJobRequest, CreateIcebergOptimizeJobRequest, IcebergOptimizeJobOutcome,
     IcebergOptimizeJobState, JobMetaRepository, JobState,
@@ -396,6 +400,130 @@ fn repository_error_display_is_domain_facing() {
         err.to_string(),
         "metadata repository conflict: StarRocks txn state changed"
     );
+}
+
+#[test]
+fn iceberg_operation_repository_create_load_and_list_unfinished()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = IcebergOperationRepository::default();
+
+    let operation_id = {
+        let mut txn = provider.begin_write("create iceberg operation")?;
+        let stored = repository.create_operation(
+            txn.as_mut(),
+            CreateIcebergOperationRequest {
+                operation_kind: IcebergOperationKind::MvRefresh,
+                target: IcebergOperationTarget {
+                    catalog: "ice".to_string(),
+                    namespace: "analytics".to_string(),
+                    table: "mv_sales".to_string(),
+                    ref_name: Some("main".to_string()),
+                },
+                attempt_id: "attempt-1".to_string(),
+                base_snapshot_id: Some(42),
+                base_snapshot_map: BTreeMap::from([("ice.sales.orders".to_string(), 7)]),
+                staged_artifacts: vec!["s3://warehouse/mv/_staging/a.parquet".to_string()],
+                created_at_ms: 1000,
+            },
+        )?;
+        assert_eq!(stored.state, IcebergOperationState::Preparing);
+        assert_eq!(stored.created_at_ms, 1000);
+        assert_eq!(stored.updated_at_ms, 1000);
+        assert_eq!(stored.finished_at_ms, None);
+        txn.commit()?;
+        stored.operation_id
+    };
+
+    let read = provider.begin_read()?;
+    let loaded = repository
+        .load_operation(read.as_ref(), operation_id)?
+        .expect("operation should exist");
+    assert_eq!(loaded.operation_id, operation_id);
+    assert_eq!(loaded.operation_kind, IcebergOperationKind::MvRefresh);
+    assert_eq!(loaded.target.catalog, "ice");
+    assert_eq!(loaded.target.namespace, "analytics");
+    assert_eq!(loaded.target.table, "mv_sales");
+    assert_eq!(loaded.target.ref_name.as_deref(), Some("main"));
+    assert_eq!(loaded.base_snapshot_id, Some(42));
+    assert_eq!(loaded.base_snapshot_map["ice.sales.orders"], 7);
+    assert_eq!(loaded.staged_artifacts.len(), 1);
+
+    let unfinished = repository.list_unfinished_operations(read.as_ref())?;
+    assert_eq!(unfinished.len(), 1);
+    assert_eq!(unfinished[0].operation_id, operation_id);
+
+    Ok(())
+}
+
+#[test]
+fn iceberg_operation_repository_finished_operations_are_not_unfinished()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = IcebergOperationRepository::default();
+
+    let operation_id = {
+        let mut txn = provider.begin_write("create iceberg operation")?;
+        let stored = repository.create_operation(
+            txn.as_mut(),
+            CreateIcebergOperationRequest {
+                operation_kind: IcebergOperationKind::InsertAppend,
+                target: IcebergOperationTarget {
+                    catalog: "ice".to_string(),
+                    namespace: "sales".to_string(),
+                    table: "orders".to_string(),
+                    ref_name: None,
+                },
+                attempt_id: "attempt-1".to_string(),
+                base_snapshot_id: None,
+                base_snapshot_map: BTreeMap::new(),
+                staged_artifacts: Vec::new(),
+                created_at_ms: 1000,
+            },
+        )?;
+        txn.commit()?;
+        stored.operation_id
+    };
+
+    {
+        let mut txn = provider.begin_write("transition iceberg operation")?;
+        repository.transition_operation(
+            txn.as_mut(),
+            operation_id,
+            IcebergOperationState::Committing,
+            1100,
+        )?;
+        repository.transition_operation(
+            txn.as_mut(),
+            operation_id,
+            IcebergOperationState::Committed,
+            1200,
+        )?;
+        repository.transition_operation(
+            txn.as_mut(),
+            operation_id,
+            IcebergOperationState::Finalized,
+            1300,
+        )?;
+        txn.commit()?;
+    }
+
+    let read = provider.begin_read()?;
+    let loaded = repository
+        .load_operation(read.as_ref(), operation_id)?
+        .expect("operation should exist");
+    assert_eq!(loaded.state, IcebergOperationState::Finalized);
+    assert_eq!(loaded.updated_at_ms, 1300);
+    assert_eq!(loaded.finished_at_ms, Some(1300));
+    assert!(
+        repository
+            .list_unfinished_operations(read.as_ref())?
+            .is_empty()
+    );
+
+    Ok(())
 }
 
 #[test]
