@@ -4,6 +4,7 @@ use crate::meta::{MetaError, MetaErrorKind};
 
 pub mod dictionary;
 pub mod iceberg_catalog;
+pub mod iceberg_operation;
 pub mod id_scopes;
 pub mod job;
 pub mod mv;

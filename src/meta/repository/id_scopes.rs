@@ -40,6 +40,10 @@ pub fn iceberg_optimize_job() -> IdScope {
     stable("job.iceberg_optimize")
 }
 
+pub fn iceberg_operation() -> IdScope {
+    stable("iceberg.operation")
+}
+
 pub fn dictionary_snapshot() -> IdScope {
     stable("dictionary.snapshot")
 }
