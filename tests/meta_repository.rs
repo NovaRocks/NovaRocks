@@ -696,16 +696,16 @@ fn iceberg_operation_repository_records_known_uncommitted_cleanup_and_finishes()
 }
 
 #[test]
-fn iceberg_operation_repository_records_same_state_fact_replay_is_idempotent()
+fn iceberg_operation_repository_records_same_state_fact_replay_and_cleanup_refinement()
 -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
     let repository = IcebergOperationRepository::default();
     let operation_id = create_committing_iceberg_operation(&provider, &repository)?;
     let cleanup = IcebergCleanupOutcomeRecord {
-        attempted: true,
-        error_count: 1,
-        error_paths: vec!["s3://warehouse/orders/_staging/a.parquet".to_string()],
+        attempted: false,
+        error_count: 0,
+        error_paths: Vec::new(),
     };
     let failure = IcebergOperationFailureRecord {
         kind: IcebergOperationFailureKind::KnownUncommitted,
@@ -748,7 +748,43 @@ fn iceberg_operation_repository_records_same_state_fact_replay_is_idempotent()
     }
 
     {
-        let mut txn = provider.begin_write("replay conflicting known uncommitted fact")?;
+        let read = provider.begin_read()?;
+        let loaded = repository
+            .load_operation(read.as_ref(), operation_id)?
+            .expect("operation should exist");
+        assert_eq!(loaded.updated_at_ms, 1200);
+        assert_eq!(loaded.finished_at_ms, Some(1200));
+    }
+
+    let refined_cleanup = IcebergCleanupOutcomeRecord {
+        attempted: true,
+        error_count: 0,
+        error_paths: Vec::new(),
+    };
+    let refined_failure = IcebergOperationFailureRecord {
+        next_action: IcebergOperationNextAction::None,
+        ..failure.clone()
+    };
+
+    {
+        let mut txn = provider.begin_write("refine known uncommitted cleanup fact")?;
+        repository.record_operation_fact(
+            txn.as_mut(),
+            IcebergOperationFactUpdate {
+                operation_id,
+                state: IcebergOperationState::FailedKnownUncommitted,
+                commit_outcome: None,
+                cleanup_outcome: Some(refined_cleanup.clone()),
+                recovery_evidence: None,
+                failure: Some(refined_failure.clone()),
+                now_ms: 1400,
+            },
+        )?;
+        txn.commit()?;
+    }
+
+    {
+        let mut txn = provider.begin_write("reject conflicting known uncommitted failure fact")?;
         let err = repository
             .record_operation_fact(
                 txn.as_mut(),
@@ -756,16 +792,16 @@ fn iceberg_operation_repository_records_same_state_fact_replay_is_idempotent()
                     operation_id,
                     state: IcebergOperationState::FailedKnownUncommitted,
                     commit_outcome: None,
-                    cleanup_outcome: Some(cleanup.clone()),
+                    cleanup_outcome: Some(refined_cleanup.clone()),
                     recovery_evidence: None,
                     failure: Some(IcebergOperationFailureRecord {
-                        message: "different failure".to_string(),
-                        ..failure.clone()
+                        message: "different primary failure".to_string(),
+                        ..refined_failure.clone()
                     }),
-                    now_ms: 1400,
+                    now_ms: 1500,
                 },
             )
-            .expect_err("same-state replay with different facts should conflict");
+            .expect_err("same-state refinement must not replace the primary failure");
         assert_eq!(err.kind(), RepositoryErrorKind::Conflict);
         assert!(
             err.to_string()
@@ -779,10 +815,90 @@ fn iceberg_operation_repository_records_same_state_fact_replay_is_idempotent()
         .load_operation(read.as_ref(), operation_id)?
         .expect("operation should exist");
     assert_eq!(loaded.state, IcebergOperationState::FailedKnownUncommitted);
-    assert_eq!(loaded.cleanup_outcome, Some(cleanup));
-    assert_eq!(loaded.failure, Some(failure));
-    assert_eq!(loaded.updated_at_ms, 1200);
+    assert_eq!(loaded.cleanup_outcome, Some(refined_cleanup));
+    assert_eq!(loaded.failure, Some(refined_failure));
+    assert_eq!(loaded.updated_at_ms, 1400);
     assert_eq!(loaded.finished_at_ms, Some(1200));
+
+    Ok(())
+}
+
+#[test]
+fn iceberg_operation_repository_preserves_commit_outcome_on_finalize_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = IcebergOperationRepository::default();
+    let operation_id = create_committing_iceberg_operation(&provider, &repository)?;
+    let commit_outcome = IcebergCommitOutcomeRecord {
+        snapshot_id: 55,
+        written_manifest_paths: vec!["s3://warehouse/orders/metadata/m0.avro".to_string()],
+    };
+
+    {
+        let mut txn = provider.begin_write("record committed iceberg operation fact")?;
+        repository.record_operation_fact(
+            txn.as_mut(),
+            IcebergOperationFactUpdate {
+                operation_id,
+                state: IcebergOperationState::Committed,
+                commit_outcome: Some(commit_outcome.clone()),
+                cleanup_outcome: None,
+                recovery_evidence: None,
+                failure: None,
+                now_ms: 1200,
+            },
+        )?;
+        txn.commit()?;
+    }
+
+    {
+        let mut txn = provider.begin_write("transition iceberg operation to finalizing")?;
+        repository.transition_operation(
+            txn.as_mut(),
+            operation_id,
+            IcebergOperationState::Finalizing,
+            1300,
+        )?;
+        txn.commit()?;
+    }
+
+    let finalize_failure = IcebergOperationFailureRecord {
+        kind: IcebergOperationFailureKind::FinalizeKnownCommitted,
+        message: "mv metadata update failed".to_string(),
+        next_action: IcebergOperationNextAction::RetryFinalize,
+    };
+
+    {
+        let mut txn = provider.begin_write("record finalize failure iceberg operation fact")?;
+        repository.record_operation_fact(
+            txn.as_mut(),
+            IcebergOperationFactUpdate {
+                operation_id,
+                state: IcebergOperationState::FinalizeFailedKnownCommitted,
+                commit_outcome: None,
+                cleanup_outcome: None,
+                recovery_evidence: None,
+                failure: Some(finalize_failure.clone()),
+                now_ms: 1400,
+            },
+        )?;
+        txn.commit()?;
+    }
+
+    let read = provider.begin_read()?;
+    let loaded = repository
+        .load_operation(read.as_ref(), operation_id)?
+        .expect("operation should exist");
+    assert_eq!(
+        loaded.state,
+        IcebergOperationState::FinalizeFailedKnownCommitted
+    );
+    assert_eq!(loaded.commit_outcome, Some(commit_outcome));
+    assert_eq!(loaded.cleanup_outcome, None);
+    assert_eq!(loaded.failure, Some(finalize_failure));
+    assert_eq!(loaded.updated_at_ms, 1400);
+    assert_eq!(loaded.finished_at_ms, None);
 
     Ok(())
 }
