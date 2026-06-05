@@ -13,12 +13,13 @@
 //! lands as close to the Scan as safely possible, respecting
 //! SEMI/ANTI/OUTER null-preservation constraints.
 
+pub(crate) mod classifier;
+pub(crate) mod join_pushdown;
+pub(crate) mod predicate_group;
 pub(crate) mod push_through_project;
 pub(crate) mod push_to_aggregate;
 pub(crate) mod push_to_join;
 pub(crate) mod push_to_scan;
-pub(crate) mod classifier;
-pub(crate) mod predicate_group;
 pub(crate) mod semi_anti_condition;
 
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
