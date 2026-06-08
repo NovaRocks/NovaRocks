@@ -317,6 +317,8 @@ pub struct RefreshCommitMarker {
 pub struct StoredMvRefresh {
     pub refresh_id: i64,
     pub mv_id: i64,
+    #[serde(default)]
+    pub operation_id: Option<i64>,
     pub state: MvRefreshState,
     #[serde(default)]
     pub target_catalog: Option<String>,
@@ -374,6 +376,7 @@ impl MvRefreshState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BeginIcebergMvRefreshRequest {
     pub mv_id: i64,
+    pub operation_id: Option<i64>,
     pub target_catalog: String,
     pub target_namespace: String,
     pub target_table: String,
@@ -701,6 +704,7 @@ impl MvMetaRepository {
         let refresh = StoredMvRefresh {
             refresh_id,
             mv_id,
+            operation_id: None,
             state: MvRefreshState::IntentCreated,
             target_catalog: None,
             target_namespace: None,
@@ -752,6 +756,7 @@ impl MvMetaRepository {
         let refresh = StoredMvRefresh {
             refresh_id,
             mv_id: req.mv_id,
+            operation_id: req.operation_id,
             state: MvRefreshState::IntentCreated,
             target_catalog: Some(req.target_catalog),
             target_namespace: Some(req.target_namespace),

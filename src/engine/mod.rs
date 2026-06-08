@@ -24,6 +24,7 @@ use crate::connector::{
 use crate::meta::repository::iceberg_catalog::{
     IcebergCatalogMetaRepository, IcebergCatalogProperties,
 };
+use crate::meta::repository::iceberg_operation::IcebergOperationRepository;
 use crate::meta::repository::job::{
     IcebergOptimizeJobState, JobMetaRepository, StoredIcebergOptimizeJob,
 };
@@ -224,6 +225,7 @@ pub(crate) struct StandaloneState {
     pub(crate) starrocks_txn_repo: StarRocksTxnRepository,
     pub(crate) mv_repo: MvMetaRepository,
     pub(crate) iceberg_catalog_repo: IcebergCatalogMetaRepository,
+    pub(crate) iceberg_operation_repo: IcebergOperationRepository,
     pub(crate) job_repo: JobMetaRepository,
     pub(crate) dictionary_manager: dictionary::DictionaryManager,
     pub(crate) exchange_port: u16,
@@ -263,6 +265,7 @@ impl Default for StandaloneState {
             starrocks_txn_repo: StarRocksTxnRepository,
             mv_repo: MvMetaRepository,
             iceberg_catalog_repo: IcebergCatalogMetaRepository,
+            iceberg_operation_repo: IcebergOperationRepository,
             job_repo: JobMetaRepository,
             dictionary_manager: dictionary::DictionaryManager::default(),
             exchange_port: 0,

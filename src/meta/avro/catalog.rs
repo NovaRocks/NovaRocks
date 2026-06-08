@@ -273,6 +273,11 @@ fn schema_sources() -> &'static [SchemaSource] {
             raw_schema: include_str!("schemas/mv.refresh/0001.avsc"),
         },
         SchemaSource {
+            subject: "mv.refresh",
+            id: 2,
+            raw_schema: include_str!("schemas/mv.refresh/0002.avsc"),
+        },
+        SchemaSource {
             subject: "mv.dependency",
             id: 1,
             raw_schema: include_str!("schemas/mv.dependency/0001.avsc"),

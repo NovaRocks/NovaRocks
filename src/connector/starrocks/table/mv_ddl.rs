@@ -2616,6 +2616,7 @@ mod tests {
                 txn.as_mut(),
                 BeginIcebergMvRefreshRequest {
                     mv_id,
+                    operation_id: None,
                     target_catalog: "ice".to_string(),
                     target_namespace: "analytics".to_string(),
                     target_table: "mv_orders".to_string(),

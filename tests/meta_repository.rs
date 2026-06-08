@@ -2927,6 +2927,7 @@ fn mv_repository_branch_staged_refresh_lifecycle() -> Result<(), Box<dyn std::er
             txn.as_mut(),
             BeginIcebergMvRefreshRequest {
                 mv_id,
+                operation_id: None,
                 target_catalog: "ice".to_string(),
                 target_namespace: "analytics".to_string(),
                 target_table: "orders_mv".to_string(),
@@ -3032,6 +3033,7 @@ fn mv_repository_lists_unfinished_refreshes() -> Result<(), Box<dyn std::error::
         txn.as_mut(),
         BeginIcebergMvRefreshRequest {
             mv_id,
+            operation_id: None,
             target_catalog: "ice".to_string(),
             target_namespace: "analytics".to_string(),
             target_table: "orders_mv".to_string(),
@@ -3047,6 +3049,43 @@ fn mv_repository_lists_unfinished_refreshes() -> Result<(), Box<dyn std::error::
     let unfinished = repository.list_unfinished_refreshes(read.as_ref())?;
     assert_eq!(unfinished.len(), 1);
     assert_eq!(unfinished[0].refresh_id, refresh.refresh_id);
+    Ok(())
+}
+
+#[test]
+fn mv_repository_branch_staged_refresh_persists_operation_id()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = MvMetaRepository::default();
+    let mv_id = create_test_iceberg_mv(&provider, &repository)?;
+
+    let refresh_id = {
+        let mut txn = provider.begin_write("begin branch-staged refresh")?;
+        let refresh = repository.begin_iceberg_refresh_intent(
+            txn.as_mut(),
+            BeginIcebergMvRefreshRequest {
+                mv_id,
+                target_catalog: "ice".to_string(),
+                target_namespace: "analytics".to_string(),
+                target_table: "orders_mv".to_string(),
+                staging_branch: "__nova_mv_refresh_1_1001".to_string(),
+                expected_main_snapshot_id: Some(10),
+                base_snapshots: BTreeMap::new(),
+                marker_token: "marker".to_string(),
+                operation_id: Some(99),
+            },
+        )?;
+        assert_eq!(refresh.operation_id, Some(99));
+        txn.commit()?;
+        refresh.refresh_id
+    };
+
+    let read = provider.begin_read()?;
+    let loaded = repository
+        .load_refresh(read.as_ref(), refresh_id)?
+        .expect("refresh should persist");
+    assert_eq!(loaded.operation_id, Some(99));
     Ok(())
 }
 
@@ -3207,6 +3246,7 @@ fn begin_named_test_branch_staged_refresh(
         txn.as_mut(),
         BeginIcebergMvRefreshRequest {
             mv_id,
+            operation_id: None,
             target_catalog: "ice".to_string(),
             target_namespace: "analytics".to_string(),
             target_table: target_table.to_string(),

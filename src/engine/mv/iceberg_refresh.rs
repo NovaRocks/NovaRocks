@@ -57,6 +57,12 @@ use crate::engine::mv::refresh_property::{
     derive_fragment_property,
 };
 use crate::engine::{StandaloneState, StatementResult};
+use crate::meta::repository::iceberg_operation::{
+    CreateIcebergOperationRequest, IcebergCommitOutcomeRecord, IcebergOperationFactUpdate,
+    IcebergOperationFailureKind, IcebergOperationFailureRecord, IcebergOperationKind,
+    IcebergOperationNextAction, IcebergOperationState, IcebergOperationTarget,
+    IcebergRecoveryEvidenceRecord,
+};
 use crate::meta::repository::mv::{
     BeginIcebergMvRefreshRequest, CreateMvDefinitionRequest, MvRefreshFinalizeRequest,
     MvRefreshState, RecordPublishCommitRequest, RecordStagingCommitRequest, RefreshExternalOutcome,
@@ -5886,12 +5892,33 @@ fn begin_staged_iceberg_mv_refresh_intent(
     let mut txn = provider
         .begin_write("begin staged iceberg materialized view refresh")
         .map_err(|e| format!("open staged iceberg mv refresh intent transaction failed: {e}"))?;
+    let operation = state
+        .iceberg_operation_repo
+        .create_operation(
+            txn.as_mut(),
+            CreateIcebergOperationRequest {
+                operation_kind: IcebergOperationKind::MvRefresh,
+                target: IcebergOperationTarget {
+                    catalog: target.catalog.clone(),
+                    namespace: target.namespace.clone(),
+                    table: target.table.clone(),
+                    ref_name: Some(staging_branch.to_string()),
+                },
+                attempt_id: format!("mv-refresh-{mv_id}-{staging_branch}"),
+                base_snapshot_id: expected_main_snapshot_id,
+                base_snapshot_map: base_snapshots.clone(),
+                staged_artifacts: vec![format!("branch:{staging_branch}")],
+                created_at_ms: now_ms(),
+            },
+        )
+        .map_err(|e| format!("create iceberg mv refresh operation failed: {e}"))?;
     let refresh = state
         .mv_repo
         .begin_iceberg_refresh_intent(
             txn.as_mut(),
             BeginIcebergMvRefreshRequest {
                 mv_id,
+                operation_id: Some(operation.operation_id),
                 target_catalog: target.catalog.clone(),
                 target_namespace: target.namespace.clone(),
                 target_table: target.table.clone(),
@@ -5920,10 +5947,19 @@ fn abort_iceberg_mv_refresh(state: &Arc<StandaloneState>, refresh_id: i64) -> Re
         .load_refresh(txn.as_ref(), refresh_id)
         .map_err(|e| format!("load iceberg mv refresh for abort failed: {e}"))?
         .ok_or_else(|| format!("mv refresh {refresh_id} not found"))?;
+    let operation_id = refresh.operation_id;
     state
         .mv_repo
         .clear_refresh_progress(txn.as_mut(), refresh.mv_id)
         .map_err(|e| format!("abort iceberg mv refresh failed: {e}"))?;
+    if let Some(operation_id) = operation_id {
+        record_iceberg_mv_operation_abort(
+            state,
+            txn.as_mut(),
+            operation_id,
+            format!("iceberg MV refresh {refresh_id} aborted before publish"),
+        )?;
+    }
     txn.commit()
         .map_err(|e| format!("commit iceberg mv refresh abort failed: {e}"))?;
     Ok(())
@@ -5948,6 +5984,12 @@ fn mark_iceberg_mv_refresh_commit_unknown(
         .mv_repo
         .mark_refresh_commit_unknown(txn.as_mut(), refresh_id)
         .map_err(|e| format!("mark iceberg mv refresh commit unknown failed: {e}"))?;
+    record_iceberg_mv_operation_commit_unknown(
+        state,
+        txn.as_mut(),
+        refresh_id,
+        "iceberg MV refresh commit result is unknown".to_string(),
+    )?;
     txn.commit()
         .map_err(|e| format!("commit iceberg mv commit-unknown marker failed: {e}"))?;
     Ok(())
@@ -5958,6 +6000,264 @@ fn mark_iceberg_mv_refresh_aborted(
     refresh_id: i64,
 ) -> Result<(), String> {
     abort_iceberg_mv_refresh(state, refresh_id)
+}
+
+fn load_iceberg_mv_refresh_operation_id(
+    state: &Arc<StandaloneState>,
+    txn: &dyn crate::meta::MetaReadTxn,
+    refresh_id: i64,
+) -> Result<Option<i64>, String> {
+    let refresh = state
+        .mv_repo
+        .load_refresh(txn, refresh_id)
+        .map_err(|e| format!("load iceberg mv refresh operation id failed: {e}"))?
+        .ok_or_else(|| format!("mv refresh {refresh_id} not found"))?;
+    Ok(refresh.operation_id)
+}
+
+fn transition_iceberg_mv_operation_to_committing(
+    state: &Arc<StandaloneState>,
+    txn: &mut dyn crate::meta::MetaWriteTxn,
+    operation_id: i64,
+    now_ms: i64,
+) -> Result<(), String> {
+    let operation = state
+        .iceberg_operation_repo
+        .load_operation(txn, operation_id)
+        .map_err(|e| format!("load iceberg mv refresh operation failed: {e}"))?
+        .ok_or_else(|| format!("iceberg operation {operation_id} not found"))?;
+    match operation.state {
+        IcebergOperationState::Preparing => state
+            .iceberg_operation_repo
+            .transition_operation(txn, operation_id, IcebergOperationState::Committing, now_ms)
+            .map_err(|e| format!("mark iceberg mv refresh operation committing failed: {e}")),
+        IcebergOperationState::Committing
+        | IcebergOperationState::Committed
+        | IcebergOperationState::Finalizing
+        | IcebergOperationState::Finalized
+        | IcebergOperationState::CommitUnknown => Ok(()),
+        IcebergOperationState::Writing
+        | IcebergOperationState::Collecting
+        | IcebergOperationState::Aborting
+        | IcebergOperationState::Aborted
+        | IcebergOperationState::FailedKnownUncommitted
+        | IcebergOperationState::FinalizeFailedKnownCommitted => Err(format!(
+            "iceberg operation {operation_id} is {}, cannot mark MV refresh committing",
+            operation.state.as_str()
+        )),
+    }
+}
+
+fn record_iceberg_mv_operation_committing(
+    state: &Arc<StandaloneState>,
+    txn: &mut dyn crate::meta::MetaWriteTxn,
+    refresh_id: i64,
+) -> Result<(), String> {
+    let Some(operation_id) = load_iceberg_mv_refresh_operation_id(state, txn, refresh_id)? else {
+        return Ok(());
+    };
+    transition_iceberg_mv_operation_to_committing(state, txn, operation_id, now_ms())
+}
+
+fn record_iceberg_mv_operation_committed(
+    state: &Arc<StandaloneState>,
+    txn: &mut dyn crate::meta::MetaWriteTxn,
+    refresh_id: i64,
+    snapshot_id: i64,
+) -> Result<(), String> {
+    let Some(operation_id) = load_iceberg_mv_refresh_operation_id(state, txn, refresh_id)? else {
+        return Ok(());
+    };
+    let now_ms = now_ms();
+    transition_iceberg_mv_operation_to_committing(state, txn, operation_id, now_ms)?;
+    state
+        .iceberg_operation_repo
+        .record_operation_fact(
+            txn,
+            IcebergOperationFactUpdate {
+                operation_id,
+                state: IcebergOperationState::Committed,
+                commit_outcome: Some(IcebergCommitOutcomeRecord {
+                    snapshot_id,
+                    written_manifest_paths: Vec::new(),
+                }),
+                cleanup_outcome: None,
+                recovery_evidence: None,
+                failure: None,
+                now_ms,
+            },
+        )
+        .map_err(|e| format!("record iceberg mv refresh operation commit fact failed: {e}"))
+}
+
+fn record_iceberg_mv_operation_commit_unknown(
+    state: &Arc<StandaloneState>,
+    txn: &mut dyn crate::meta::MetaWriteTxn,
+    refresh_id: i64,
+    message: String,
+) -> Result<(), String> {
+    let refresh = state
+        .mv_repo
+        .load_refresh(txn, refresh_id)
+        .map_err(|e| format!("load iceberg mv refresh for operation commit unknown failed: {e}"))?
+        .ok_or_else(|| format!("mv refresh {refresh_id} not found"))?;
+    let Some(operation_id) = refresh.operation_id else {
+        return Ok(());
+    };
+    let now_ms = now_ms();
+    transition_iceberg_mv_operation_to_committing(state, txn, operation_id, now_ms)?;
+    let table_ident = match (
+        refresh.target_catalog.as_deref(),
+        refresh.target_namespace.as_deref(),
+        refresh.target_table.as_deref(),
+    ) {
+        (Some(catalog), Some(namespace), Some(table)) => {
+            format!("{catalog}.{namespace}.{table}")
+        }
+        _ => format!("mv-refresh-{refresh_id}"),
+    };
+    state
+        .iceberg_operation_repo
+        .record_operation_fact(
+            txn,
+            IcebergOperationFactUpdate {
+                operation_id,
+                state: IcebergOperationState::CommitUnknown,
+                commit_outcome: None,
+                cleanup_outcome: None,
+                recovery_evidence: Some(IcebergRecoveryEvidenceRecord {
+                    table_ident,
+                    commit_op_kind: "mv_refresh".to_string(),
+                    base_snapshot_id: refresh.expected_main_snapshot_id,
+                    base_sequence_number: None,
+                    staging_dir: refresh.staging_branch.unwrap_or_default(),
+                }),
+                failure: Some(IcebergOperationFailureRecord {
+                    kind: IcebergOperationFailureKind::Unknown,
+                    message,
+                    next_action: IcebergOperationNextAction::ManualInspect,
+                }),
+                now_ms,
+            },
+        )
+        .map_err(|e| format!("record iceberg mv refresh operation commit unknown failed: {e}"))
+}
+
+fn record_iceberg_mv_operation_abort(
+    state: &Arc<StandaloneState>,
+    txn: &mut dyn crate::meta::MetaWriteTxn,
+    operation_id: i64,
+    message: String,
+) -> Result<(), String> {
+    let operation = state
+        .iceberg_operation_repo
+        .load_operation(txn, operation_id)
+        .map_err(|e| format!("load iceberg mv operation for abort failed: {e}"))?
+        .ok_or_else(|| format!("iceberg operation {operation_id} not found"))?;
+    let now_ms = now_ms();
+    match operation.state {
+        IcebergOperationState::Preparing
+        | IcebergOperationState::Writing
+        | IcebergOperationState::Collecting => {
+            state
+                .iceberg_operation_repo
+                .transition_operation(txn, operation_id, IcebergOperationState::Aborting, now_ms)
+                .map_err(|e| format!("mark iceberg mv operation aborting failed: {e}"))?;
+            state
+                .iceberg_operation_repo
+                .transition_operation(txn, operation_id, IcebergOperationState::Aborted, now_ms)
+                .map_err(|e| format!("mark iceberg mv operation aborted failed: {e}"))
+        }
+        IcebergOperationState::Committing => state
+            .iceberg_operation_repo
+            .record_operation_fact(
+                txn,
+                IcebergOperationFactUpdate {
+                    operation_id,
+                    state: IcebergOperationState::FailedKnownUncommitted,
+                    commit_outcome: None,
+                    cleanup_outcome: None,
+                    recovery_evidence: None,
+                    failure: Some(IcebergOperationFailureRecord {
+                        kind: IcebergOperationFailureKind::KnownUncommitted,
+                        message,
+                        next_action: IcebergOperationNextAction::RetryAbort,
+                    }),
+                    now_ms,
+                },
+            )
+            .map_err(|e| {
+                format!("record iceberg mv operation known-uncommitted abort failed: {e}")
+            }),
+        IcebergOperationState::Aborting => state
+            .iceberg_operation_repo
+            .transition_operation(txn, operation_id, IcebergOperationState::Aborted, now_ms)
+            .map_err(|e| format!("mark iceberg mv operation aborted failed: {e}")),
+        IcebergOperationState::Aborted | IcebergOperationState::FailedKnownUncommitted => Ok(()),
+        IcebergOperationState::CommitUnknown
+        | IcebergOperationState::Committed
+        | IcebergOperationState::Finalizing
+        | IcebergOperationState::Finalized
+        | IcebergOperationState::FinalizeFailedKnownCommitted => Ok(()),
+    }
+}
+
+fn record_iceberg_mv_operation_finalize_failure(
+    state: &Arc<StandaloneState>,
+    operation_id: i64,
+    message: String,
+) -> Result<(), String> {
+    let provider = state
+        .metadata_provider
+        .as_ref()
+        .ok_or_else(|| "metadata provider required for iceberg mv refresh".to_string())?;
+    let mut txn = provider
+        .begin_write("record iceberg materialized view operation finalize failure")
+        .map_err(|e| {
+            format!("open iceberg mv operation finalize failure transaction failed: {e}")
+        })?;
+    let now_ms = now_ms();
+    let operation = state
+        .iceberg_operation_repo
+        .load_operation(txn.as_ref(), operation_id)
+        .map_err(|e| format!("load iceberg mv operation for finalize failure failed: {e}"))?
+        .ok_or_else(|| format!("iceberg operation {operation_id} not found"))?;
+    if matches!(
+        operation.state,
+        IcebergOperationState::Committed | IcebergOperationState::FinalizeFailedKnownCommitted
+    ) {
+        state
+            .iceberg_operation_repo
+            .transition_operation(
+                txn.as_mut(),
+                operation_id,
+                IcebergOperationState::Finalizing,
+                now_ms,
+            )
+            .map_err(|e| format!("mark iceberg mv operation finalizing failed: {e}"))?;
+    }
+    state
+        .iceberg_operation_repo
+        .record_operation_fact(
+            txn.as_mut(),
+            IcebergOperationFactUpdate {
+                operation_id,
+                state: IcebergOperationState::FinalizeFailedKnownCommitted,
+                commit_outcome: None,
+                cleanup_outcome: None,
+                recovery_evidence: None,
+                failure: Some(IcebergOperationFailureRecord {
+                    kind: IcebergOperationFailureKind::FinalizeKnownCommitted,
+                    message,
+                    next_action: IcebergOperationNextAction::RetryFinalize,
+                }),
+                now_ms,
+            },
+        )
+        .map_err(|e| format!("record iceberg mv operation finalize failure failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit iceberg mv operation finalize failure failed: {e}"))?;
+    Ok(())
 }
 
 fn reconcile_iceberg_mv_refresh(
@@ -6254,6 +6554,7 @@ fn record_iceberg_mv_staging_commit(
             },
         )
         .map_err(|e| format!("record iceberg mv staging commit failed: {e}"))?;
+    record_iceberg_mv_operation_committing(state, txn.as_mut(), refresh_id)?;
     txn.commit()
         .map_err(|e| format!("commit iceberg mv staging commit failed: {e}"))?;
     Ok(())
@@ -6281,6 +6582,7 @@ fn record_iceberg_mv_publish_commit(
             },
         )
         .map_err(|e| format!("record iceberg mv publish commit failed: {e}"))?;
+    record_iceberg_mv_operation_committed(state, txn.as_mut(), refresh_id, published_snapshot_id)?;
     txn.commit()
         .map_err(|e| format!("commit iceberg mv publish commit failed: {e}"))?;
     Ok(())
@@ -6348,7 +6650,27 @@ fn finalize_iceberg_mv_refresh(
     let mut txn = provider
         .begin_write("finalize iceberg materialized view refresh")
         .map_err(|e| format!("open iceberg mv refresh finalize transaction failed: {e}"))?;
-    state
+    let operation_id = load_iceberg_mv_refresh_operation_id(state, txn.as_ref(), refresh_id)?;
+    let operation_id_for_failure = operation_id;
+    if let Some(operation_id) = operation_id {
+        let operation = state
+            .iceberg_operation_repo
+            .load_operation(txn.as_ref(), operation_id)
+            .map_err(|e| format!("load iceberg mv operation for finalize failed: {e}"))?
+            .ok_or_else(|| format!("iceberg operation {operation_id} not found"))?;
+        if operation.state != IcebergOperationState::Finalized {
+            state
+                .iceberg_operation_repo
+                .transition_operation(
+                    txn.as_mut(),
+                    operation_id,
+                    IcebergOperationState::Finalizing,
+                    now_ms(),
+                )
+                .map_err(|e| format!("mark iceberg mv operation finalizing failed: {e}"))?;
+        }
+    }
+    let finalize_result = state
         .mv_repo
         .finalize_refresh(
             txn.as_mut(),
@@ -6360,7 +6682,29 @@ fn finalize_iceberg_mv_refresh(
                 target_snapshot_id: Some(target_snapshot_id),
             },
         )
-        .map_err(|e| format!("finalize iceberg mv refresh failed: {e}"))?;
+        .map_err(|e| format!("finalize iceberg mv refresh failed: {e}"));
+    if let Err(err) = finalize_result {
+        if let Some(operation_id) = operation_id_for_failure
+            && let Err(mark_err) =
+                record_iceberg_mv_operation_finalize_failure(state, operation_id, err.clone())
+        {
+            return Err(format!(
+                "{err}; additionally failed to record iceberg mv operation finalize failure: {mark_err}"
+            ));
+        }
+        return Err(err);
+    }
+    if let Some(operation_id) = operation_id {
+        state
+            .iceberg_operation_repo
+            .transition_operation(
+                txn.as_mut(),
+                operation_id,
+                IcebergOperationState::Finalized,
+                now_ms(),
+            )
+            .map_err(|e| format!("mark iceberg mv operation finalized failed: {e}"))?;
+    }
     txn.commit()
         .map_err(|e| format!("commit iceberg mv refresh finalize failed: {e}"))?;
     Ok(())
@@ -11869,6 +12213,25 @@ mod tests {
             .expect("lookup mv definition")
     }
 
+    fn load_test_operation_for_refresh(
+        state: &Arc<StandaloneState>,
+        refresh_id: i64,
+    ) -> crate::meta::repository::iceberg_operation::StoredIcebergOperation {
+        let provider = state.metadata_provider.as_ref().expect("metadata provider");
+        let read = provider.begin_read().expect("open read txn");
+        let refresh = state
+            .mv_repo
+            .load_refresh(read.as_ref(), refresh_id)
+            .expect("load refresh")
+            .expect("refresh");
+        let operation_id = refresh.operation_id.expect("operation id");
+        state
+            .iceberg_operation_repo
+            .load_operation(read.as_ref(), operation_id)
+            .expect("load operation")
+            .expect("operation")
+    }
+
     fn seed_union_projection_uuid_only_refresh_metadata(
         state: &Arc<StandaloneState>,
         catalog: &str,
@@ -14511,6 +14874,294 @@ mod tests {
             .expect("mv definition after second refresh");
         assert_eq!(mv.last_refreshed_iceberg_snapshot_id, Some(second_snapshot));
         assert_eq!(mv.last_refresh_rows, Some(2));
+    }
+
+    #[test]
+    fn staged_iceberg_mv_refresh_creates_operation_record() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        create_mv_only(&env.state, Some("ice"), &env.current_db, "mv_orders");
+        let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
+            .expect("mv definition");
+        let target = IcebergMvTarget {
+            catalog: "ice".to_string(),
+            namespace: "analytics".to_string(),
+            table: "mv_orders".to_string(),
+        };
+
+        let refresh_id = begin_staged_iceberg_mv_refresh_intent(
+            &env.state,
+            &target,
+            mv.mv_id,
+            Some(10),
+            BTreeMap::from([("ice.sales.orders".to_string(), 20)]),
+            "__nova_mv_refresh_operation",
+        )
+        .expect("begin staged refresh");
+
+        let provider = env.state.metadata_provider.as_ref().expect("provider");
+        let read = provider.begin_read().expect("read");
+        let refresh = env
+            .state
+            .mv_repo
+            .load_refresh(read.as_ref(), refresh_id)
+            .expect("load refresh")
+            .expect("refresh");
+        let operation_id = refresh.operation_id.expect("operation id");
+        let operation = env
+            .state
+            .iceberg_operation_repo
+            .load_operation(read.as_ref(), operation_id)
+            .expect("load operation")
+            .expect("operation");
+        assert_eq!(
+            operation.operation_kind,
+            crate::meta::repository::iceberg_operation::IcebergOperationKind::MvRefresh
+        );
+        assert_eq!(operation.target.catalog, "ice");
+        assert_eq!(operation.target.namespace, "analytics");
+        assert_eq!(operation.target.table, "mv_orders");
+        assert_eq!(operation.base_snapshot_id, Some(10));
+        assert_eq!(operation.base_snapshot_map["ice.sales.orders"], 20);
+        assert_eq!(
+            operation.staged_artifacts,
+            vec!["branch:__nova_mv_refresh_operation".to_string()]
+        );
+    }
+
+    #[test]
+    fn staged_iceberg_mv_refresh_operation_reaches_finalized() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        create_mv_only(&env.state, Some("ice"), &env.current_db, "mv_orders");
+        let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
+            .expect("mv definition");
+        let target = IcebergMvTarget {
+            catalog: "ice".to_string(),
+            namespace: "analytics".to_string(),
+            table: "mv_orders".to_string(),
+        };
+        let base_snapshots = BTreeMap::from([("ice.sales.orders".to_string(), 20)]);
+        let base_table_uuids =
+            BTreeMap::from([("ice.sales.orders".to_string(), "uuid-orders".to_string())]);
+        let refresh_id = begin_staged_iceberg_mv_refresh_intent(
+            &env.state,
+            &target,
+            mv.mv_id,
+            Some(10),
+            base_snapshots.clone(),
+            "__nova_mv_refresh_operation_finalized",
+        )
+        .expect("begin staged refresh");
+
+        record_iceberg_mv_staging_commit(&env.state, refresh_id, 30, 3, base_table_uuids.clone())
+            .expect("record staging");
+        assert_eq!(
+            load_test_operation_for_refresh(&env.state, refresh_id).state,
+            crate::meta::repository::iceberg_operation::IcebergOperationState::Committing
+        );
+
+        record_iceberg_mv_publish_commit(&env.state, refresh_id, 40).expect("record publish");
+        let committed = load_test_operation_for_refresh(&env.state, refresh_id);
+        assert_eq!(
+            committed.state,
+            crate::meta::repository::iceberg_operation::IcebergOperationState::Committed
+        );
+        assert_eq!(
+            committed
+                .commit_outcome
+                .expect("commit outcome")
+                .snapshot_id,
+            40
+        );
+
+        finalize_iceberg_mv_refresh(
+            &env.state,
+            refresh_id,
+            3,
+            base_snapshots,
+            base_table_uuids,
+            40,
+        )
+        .expect("finalize");
+        assert_eq!(
+            load_test_operation_for_refresh(&env.state, refresh_id).state,
+            crate::meta::repository::iceberg_operation::IcebergOperationState::Finalized
+        );
+    }
+
+    #[test]
+    fn staged_iceberg_mv_refresh_operation_records_commit_unknown() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        create_mv_only(&env.state, Some("ice"), &env.current_db, "mv_orders");
+        let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
+            .expect("mv definition");
+        let target = IcebergMvTarget {
+            catalog: "ice".to_string(),
+            namespace: "analytics".to_string(),
+            table: "mv_orders".to_string(),
+        };
+        let refresh_id = begin_staged_iceberg_mv_refresh_intent(
+            &env.state,
+            &target,
+            mv.mv_id,
+            Some(10),
+            BTreeMap::from([("ice.sales.orders".to_string(), 20)]),
+            "__nova_mv_refresh_operation_unknown",
+        )
+        .expect("begin staged refresh");
+
+        mark_iceberg_mv_refresh_commit_unknown(&env.state, refresh_id)
+            .expect("mark commit unknown");
+
+        let provider = env.state.metadata_provider.as_ref().expect("provider");
+        let read = provider.begin_read().expect("read");
+        let refresh = env
+            .state
+            .mv_repo
+            .load_refresh(read.as_ref(), refresh_id)
+            .expect("load refresh")
+            .expect("refresh");
+        assert_eq!(refresh.state, MvRefreshState::CommitUnknown);
+        let mv_definition = env
+            .state
+            .mv_repo
+            .load_by_id(read.as_ref(), mv.mv_id)
+            .expect("load mv")
+            .expect("mv");
+        assert_eq!(mv_definition.active_refresh_id, Some(refresh_id));
+
+        let operation = load_test_operation_for_refresh(&env.state, refresh_id);
+        assert_eq!(
+            operation.state,
+            crate::meta::repository::iceberg_operation::IcebergOperationState::CommitUnknown
+        );
+        assert!(operation.recovery_evidence.is_some());
+        assert!(!operation.state.is_finished());
+    }
+
+    #[test]
+    fn staged_iceberg_mv_refresh_operation_records_precommit_abort() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        create_mv_only(&env.state, Some("ice"), &env.current_db, "mv_orders");
+        let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
+            .expect("mv definition");
+        let target = IcebergMvTarget {
+            catalog: "ice".to_string(),
+            namespace: "analytics".to_string(),
+            table: "mv_orders".to_string(),
+        };
+        let refresh_id = begin_staged_iceberg_mv_refresh_intent(
+            &env.state,
+            &target,
+            mv.mv_id,
+            Some(10),
+            BTreeMap::from([("ice.sales.orders".to_string(), 20)]),
+            "__nova_mv_refresh_operation_abort",
+        )
+        .expect("begin staged refresh");
+
+        abort_iceberg_mv_refresh(&env.state, refresh_id).expect("abort refresh");
+
+        let operation = load_test_operation_for_refresh(&env.state, refresh_id);
+        assert_eq!(
+            operation.state,
+            crate::meta::repository::iceberg_operation::IcebergOperationState::Aborted
+        );
+        assert!(operation.state.is_finished());
+    }
+
+    #[test]
+    fn staged_iceberg_mv_refresh_operation_updates_finalize_failure_on_retry() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        create_mv_only(&env.state, Some("ice"), &env.current_db, "mv_orders");
+        let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
+            .expect("mv definition");
+        let target = IcebergMvTarget {
+            catalog: "ice".to_string(),
+            namespace: "analytics".to_string(),
+            table: "mv_orders".to_string(),
+        };
+        let base_table_uuids =
+            BTreeMap::from([("ice.sales.orders".to_string(), "uuid-orders".to_string())]);
+        let refresh_id = begin_staged_iceberg_mv_refresh_intent(
+            &env.state,
+            &target,
+            mv.mv_id,
+            Some(10),
+            BTreeMap::from([("ice.sales.orders".to_string(), 20)]),
+            "__nova_mv_refresh_operation_finalize_retry",
+        )
+        .expect("begin staged refresh");
+        record_iceberg_mv_staging_commit(&env.state, refresh_id, 30, 3, base_table_uuids)
+            .expect("record staging");
+        record_iceberg_mv_publish_commit(&env.state, refresh_id, 40).expect("record publish");
+
+        let committed = load_test_operation_for_refresh(&env.state, refresh_id);
+        record_iceberg_mv_operation_finalize_failure(
+            &env.state,
+            committed.operation_id,
+            "first finalize failure".to_string(),
+        )
+        .expect("record first finalize failure");
+        record_iceberg_mv_operation_finalize_failure(
+            &env.state,
+            committed.operation_id,
+            "second finalize failure".to_string(),
+        )
+        .expect("record second finalize failure");
+
+        let operation = load_test_operation_for_refresh(&env.state, refresh_id);
+        assert_eq!(
+            operation.state,
+            crate::meta::repository::iceberg_operation::IcebergOperationState::FinalizeFailedKnownCommitted
+        );
+        assert_eq!(
+            operation.failure.expect("failure").message,
+            "second finalize failure"
+        );
+    }
+
+    #[test]
+    fn staged_iceberg_mv_refresh_operation_rejects_staging_after_abort() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        create_mv_only(&env.state, Some("ice"), &env.current_db, "mv_orders");
+        let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
+            .expect("mv definition");
+        let target = IcebergMvTarget {
+            catalog: "ice".to_string(),
+            namespace: "analytics".to_string(),
+            table: "mv_orders".to_string(),
+        };
+        let refresh_id = begin_staged_iceberg_mv_refresh_intent(
+            &env.state,
+            &target,
+            mv.mv_id,
+            Some(10),
+            BTreeMap::from([("ice.sales.orders".to_string(), 20)]),
+            "__nova_mv_refresh_operation_abort_then_stage",
+        )
+        .expect("begin staged refresh");
+
+        abort_iceberg_mv_refresh(&env.state, refresh_id).expect("abort refresh");
+
+        let err = record_iceberg_mv_staging_commit(
+            &env.state,
+            refresh_id,
+            30,
+            3,
+            BTreeMap::from([("ice.sales.orders".to_string(), "uuid-orders".to_string())]),
+        )
+        .expect_err("staging after abort should fail");
+        assert!(err.contains("expected INTENT_CREATED"));
+        assert_eq!(
+            load_test_operation_for_refresh(&env.state, refresh_id).state,
+            crate::meta::repository::iceberg_operation::IcebergOperationState::Aborted
+        );
     }
 
     #[test]

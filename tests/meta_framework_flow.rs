@@ -33,6 +33,7 @@ fn refresh_transaction_can_recover_after_external_commit_before_finalize()
         &mut *txn,
         BeginIcebergMvRefreshRequest {
             mv_id: mv.mv_id,
+            operation_id: None,
             target_catalog: "ice".to_string(),
             target_namespace: "ns".to_string(),
             target_table: "orders_mv".to_string(),
