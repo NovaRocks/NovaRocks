@@ -27,14 +27,14 @@
 //! 4. Build a [`TableScan`] with `_file`, `_pos`, and the primitive columns
 //!    referenced by the WHERE expression.
 //! 5. Drain the resulting Arrow stream, apply existing delete visibility,
-//!    group `(file_path, pos)` pairs by `file_path`, and write one v2
-//!    position-delete Parquet file per group via
-//!    [`write_position_delete_files`].
-//! 6. Inject the resulting [`WrittenFile`]s into [`IcebergCommitCollector`]
-//!    and dispatch to [`run_iceberg_commit`] (`op_kind = RowDelta`).
+//!    and group `(file_path, pos)` pairs by `file_path`.
+//! 6. Route the grouped delete plan through the Iceberg write transaction
+//!    runner, which writes position-delete files or deletion vectors and
+//!    drives commit/finalization lifecycle.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use arrow::array::{
     Array, BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray,
@@ -50,12 +50,21 @@ use sqlparser::ast as sqlast;
 
 use crate::connector::iceberg::catalog::registry::{self, block_on_iceberg, build_iceberg_catalog};
 use crate::connector::iceberg::commit::{
-    CommitOpKind, IcebergCommitCollector, IcebergSqlDeleteStrategy, PositionDeleteGroup, RunInput,
-    classify_sql_delete_strategy, ensure_no_variant_columns_for_row_level_mutation,
-    run_iceberg_commit, write_position_delete_files,
+    CommitOpKind, CommitOutcome, CommitServiceError, IcebergCommitCollector,
+    IcebergSqlDeleteStrategy, PositionDeleteGroup, classify_sql_delete_strategy,
+    ensure_no_variant_columns_for_row_level_mutation, write_position_delete_files,
 };
 use crate::engine::backend_resolver::resolve_existing_table_target;
+use crate::engine::write_transaction::{
+    IcebergWriteCommitExecutor, IcebergWriteCommitPolicy, IcebergWriteSource,
+    IcebergWriteTransactionExecutor, IcebergWriteTransactionRunner, IcebergWriteTransactionSpec,
+    IcebergWriteValidationPolicy, synthetic_write_commit_input,
+};
 use crate::engine::{StandaloneState, StatementResult};
+use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOperationTarget};
+use crate::runtime::coordinator::CoordinatedQueryResult;
+use crate::runtime::query_result::QueryResult;
+use crate::runtime::write_coordinator::WriteCommitInput;
 use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
 use crate::sql::parser::ast::{DeleteStmt, ObjectName};
 
@@ -179,8 +188,6 @@ pub(crate) fn execute_delete_statement(
         metadata.location(),
         uuid::Uuid::new_v4()
     );
-    let file_io = table.file_io().clone();
-
     // Determine the base snapshot for the commit. For branch DML, use the
     // branch head; for main/default, use the current snapshot.
     let base_snapshot_id = if target_ref != "main" {
@@ -191,12 +198,6 @@ pub(crate) fn execute_delete_statement(
 
     match delete_strategy {
         IcebergSqlDeleteStrategy::PositionDeleteFiles => {
-            // 6. Write v2 Parquet position-delete files into staging.
-            let written = block_on_iceberg(async {
-                write_position_delete_files(&file_io, &staging_dir, groups).await
-            })??;
-
-            // 7. Build collector + inject written files + commit via RowDeltaCommit.
             let collector = Arc::new(IcebergCommitCollector::new(
                 CommitOpKind::RowDelta,
                 table_ident,
@@ -207,30 +208,20 @@ pub(crate) fn execute_delete_statement(
                 staging_dir.clone(),
                 crate::common::types::UniqueId { hi: 0, lo: 0 },
             ));
-            for wf in written {
-                collector.inject_written_file(wf);
-            }
-
-            let abort_cleanup =
-                crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
-            let _outcome = block_on_iceberg(async {
-                run_iceberg_commit(RunInput {
-                    collector: collector.clone(),
-                    catalog: catalog.clone(),
-                    table,
-                    fs: abort_cleanup.fs,
-                    file_io,
-                    cleanup_path_mapper: abort_cleanup.path_mapper,
-                    cow_update_rewrite: None,
-                    target_ref: target_ref.clone(),
-                    snapshot_properties: BTreeMap::new(),
-                })
-                .await
-            })??;
+            run_delete_write_transaction(
+                state,
+                &target,
+                catalog,
+                table,
+                collector,
+                entry,
+                CommitOpKind::RowDelta,
+                base_snapshot_id,
+                &target_ref,
+                DeleteWritePlan::PositionDeleteFiles { groups },
+            )?;
         }
         IcebergSqlDeleteStrategy::DeletionVectors => {
-            // 6/7. Inject the grouped DELETE positions and let RowDeltaDvCommit
-            //      build the merged Puffin deletion vectors at commit time.
             let collector = Arc::new(IcebergCommitCollector::new(
                 CommitOpKind::RowDeltaDv,
                 table_ident,
@@ -241,34 +232,147 @@ pub(crate) fn execute_delete_statement(
                 staging_dir.clone(),
                 crate::common::types::UniqueId { hi: 0, lo: 0 },
             ));
-            for group in groups {
-                collector.inject_delete_group(group);
-            }
-
-            let abort_cleanup =
-                crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
-            let _outcome = block_on_iceberg(async {
-                run_iceberg_commit(RunInput {
-                    collector: collector.clone(),
-                    catalog: catalog.clone(),
-                    table,
-                    fs: abort_cleanup.fs,
-                    file_io,
-                    cleanup_path_mapper: abort_cleanup.path_mapper,
-                    cow_update_rewrite: None,
-                    target_ref: target_ref.clone(),
-                    snapshot_properties: BTreeMap::new(),
-                })
-                .await
-            })??;
+            run_delete_write_transaction(
+                state,
+                &target,
+                catalog,
+                table,
+                collector,
+                entry,
+                CommitOpKind::RowDeltaDv,
+                base_snapshot_id,
+                &target_ref,
+                DeleteWritePlan::DeletionVectors { groups },
+            )?;
         }
     }
 
-    // Invalidate caches so subsequent SELECTs see the new snapshot.
-    crate::engine::iceberg_writer::invalidate_iceberg_caches(state, &target)?;
-    crate::engine::dictionary::maintenance::mark_target_stale(state, &target)?;
-
     Ok(StatementResult::Ok)
+}
+
+enum DeleteWritePlan {
+    PositionDeleteFiles { groups: Vec<PositionDeleteGroup> },
+    DeletionVectors { groups: Vec<PositionDeleteGroup> },
+}
+
+struct DeleteWriteExecutor {
+    commit_executor: IcebergWriteCommitExecutor,
+    table: iceberg::table::Table,
+    collector: Arc<IcebergCommitCollector>,
+    plan: Mutex<Option<DeleteWritePlan>>,
+}
+
+impl IcebergWriteTransactionExecutor for DeleteWriteExecutor {
+    fn run_coordinated_write(
+        &self,
+        _spec: &IcebergWriteTransactionSpec,
+    ) -> Result<CoordinatedQueryResult, String> {
+        let plan = self
+            .plan
+            .lock()
+            .expect("delete write plan lock poisoned")
+            .take()
+            .ok_or_else(|| "DELETE write plan was already consumed".to_string())?;
+        match plan {
+            DeleteWritePlan::PositionDeleteFiles { groups } => {
+                let file_io = self.table.file_io().clone();
+                let written = block_on_iceberg(async {
+                    write_position_delete_files(&file_io, &self.collector.staging_dir, groups).await
+                })??;
+                for wf in written {
+                    self.collector.inject_written_file(wf);
+                }
+            }
+            DeleteWritePlan::DeletionVectors { groups } => {
+                for group in groups {
+                    self.collector.inject_delete_group(group);
+                }
+            }
+        }
+        Ok(CoordinatedQueryResult {
+            query_result: QueryResult::empty(),
+            write_commit: Some(synthetic_write_commit_input()),
+            write_abort: None,
+        })
+    }
+
+    fn commit(
+        &self,
+        _spec: &IcebergWriteTransactionSpec,
+        write_commit: &WriteCommitInput,
+    ) -> Result<CommitOutcome, CommitServiceError> {
+        self.commit_executor.commit_write_input(write_commit)
+    }
+
+    fn finalize(&self, _spec: &IcebergWriteTransactionSpec) -> Result<(), String> {
+        self.commit_executor.finalize()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_delete_write_transaction(
+    state: &Arc<StandaloneState>,
+    target: &crate::engine::backend_resolver::TargetBackend,
+    catalog: Arc<dyn iceberg::Catalog>,
+    table: iceberg::table::Table,
+    collector: Arc<IcebergCommitCollector>,
+    entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    commit_op_kind: CommitOpKind,
+    base_snapshot_id: Option<i64>,
+    target_ref: &str,
+    plan: DeleteWritePlan,
+) -> Result<(), String> {
+    let abort_cleanup =
+        crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
+    let collector_for_executor = Arc::clone(&collector);
+    let commit_executor = IcebergWriteCommitExecutor {
+        state: Arc::clone(state),
+        target: target.clone(),
+        catalog,
+        table: table.clone(),
+        collector: Arc::clone(&collector),
+        fs: abort_cleanup.fs,
+        cleanup_path_mapper: abort_cleanup.path_mapper,
+        cow_update_rewrite: None,
+        target_ref: target_ref.to_string(),
+        snapshot_properties: BTreeMap::new(),
+    };
+    let spec = IcebergWriteTransactionSpec {
+        target: IcebergOperationTarget {
+            catalog: target.catalog.clone(),
+            namespace: target.namespace.clone(),
+            table: target.table.clone(),
+            ref_name: (target_ref != "main").then(|| target_ref.to_string()),
+        },
+        operation_kind: IcebergOperationKind::RowDelta,
+        attempt_id: format!(
+            "{}.{}.{}:delete:{}",
+            target.catalog,
+            target.namespace,
+            target.table,
+            uuid::Uuid::new_v4()
+        ),
+        commit: IcebergWriteCommitPolicy {
+            commit_op_kind,
+            base_snapshot_id,
+            base_snapshot_map: BTreeMap::new(),
+            target_ref: target_ref.to_string(),
+            snapshot_properties: BTreeMap::new(),
+        },
+        validation: IcebergWriteValidationPolicy {
+            require_v3_for_branch: target_ref != "main",
+        },
+        source: IcebergWriteSource::CoordinatedPlan,
+    };
+    let executor = DeleteWriteExecutor {
+        commit_executor,
+        table,
+        collector: collector_for_executor,
+        plan: Mutex::new(Some(plan)),
+    };
+    let runner = IcebergWriteTransactionRunner::new(Arc::clone(state), &executor);
+    let _outcome = runner.run(spec)?;
+    Ok(())
 }
 
 /// Translate a `sqlparser::ast::Expr` into an [`iceberg::expr::Predicate`].

@@ -17,6 +17,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use arrow::array::{
     ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int32Array,
@@ -29,14 +30,23 @@ use iceberg::spec::{FormatVersion, PrimitiveType, Type};
 
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
 use crate::connector::iceberg::commit::{
-    CommitOpKind, EqualityDeleteColumn, IcebergCommitCollector, RunInput,
+    CommitOpKind, CommitOutcome, CommitServiceError, EqualityDeleteColumn, IcebergCommitCollector,
     ensure_equality_delete_single_partition_spec, ensure_no_variant_columns_for_row_level_mutation,
-    run_iceberg_commit, write_equality_delete_file,
+    write_equality_delete_file,
 };
 use crate::engine::backend_resolver::resolve_existing_table_target;
 use crate::engine::parquet::{parse_date_string_to_days, parse_datetime_string_to_micros};
 use crate::engine::statement::AddEqualityDeleteStmt;
+use crate::engine::write_transaction::{
+    IcebergWriteCommitExecutor, IcebergWriteCommitPolicy, IcebergWriteSource,
+    IcebergWriteTransactionExecutor, IcebergWriteTransactionRunner, IcebergWriteTransactionSpec,
+    IcebergWriteValidationPolicy, synthetic_write_commit_input,
+};
 use crate::engine::{StandaloneState, StatementResult};
+use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOperationTarget};
+use crate::runtime::coordinator::CoordinatedQueryResult;
+use crate::runtime::query_result::QueryResult;
+use crate::runtime::write_coordinator::WriteCommitInput;
 use crate::sql::parser::ast::Literal;
 
 pub(crate) fn execute_add_equality_delete_statement(
@@ -96,26 +106,11 @@ pub(crate) fn execute_add_equality_delete_statement(
         metadata.location(),
         uuid::Uuid::new_v4()
     );
-    let file_io = table.file_io().clone();
     let default_spec_id = metadata.default_partition_spec_id();
     let current_snapshot_id = metadata.current_snapshot().map(|s| s.snapshot_id());
     let last_sequence_number = metadata.last_sequence_number();
     let current_schema = metadata.current_schema().clone();
     let default_partition_spec = metadata.default_partition_spec().clone();
-
-    let Some(written) = block_on_iceberg(async {
-        write_equality_delete_file(
-            &file_io,
-            &staging_dir,
-            default_spec_id,
-            delete_columns,
-            batch,
-        )
-        .await
-    })??
-    else {
-        return Ok(StatementResult::Ok);
-    };
 
     let collector = Arc::new(IcebergCommitCollector::new(
         CommitOpKind::RowDelta,
@@ -127,27 +122,115 @@ pub(crate) fn execute_add_equality_delete_statement(
         staging_dir,
         crate::common::types::UniqueId { hi: 0, lo: 0 },
     ));
-    collector.inject_written_file(written);
-
     let abort_cleanup =
         crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
-    let _outcome = block_on_iceberg(async {
-        run_iceberg_commit(RunInput {
-            collector: collector.clone(),
-            catalog: catalog.clone(),
-            table,
-            fs: abort_cleanup.fs,
-            file_io,
-            cleanup_path_mapper: abort_cleanup.path_mapper,
-            cow_update_rewrite: None,
+    let commit_executor = IcebergWriteCommitExecutor {
+        state: Arc::clone(state),
+        target: target.clone(),
+        catalog,
+        table: table.clone(),
+        collector: Arc::clone(&collector),
+        fs: abort_cleanup.fs,
+        cleanup_path_mapper: abort_cleanup.path_mapper,
+        cow_update_rewrite: None,
+        target_ref: "main".to_string(),
+        snapshot_properties: BTreeMap::new(),
+    };
+    let executor = EqualityDeleteWriteExecutor {
+        commit_executor,
+        table,
+        collector,
+        default_spec_id,
+        plan: Mutex::new(Some((delete_columns, batch))),
+    };
+    let spec = IcebergWriteTransactionSpec {
+        target: IcebergOperationTarget {
+            catalog: target.catalog.clone(),
+            namespace: target.namespace.clone(),
+            table: target.table.clone(),
+            ref_name: None,
+        },
+        operation_kind: IcebergOperationKind::RowDelta,
+        attempt_id: format!(
+            "{}.{}.{}:equality-delete:{}",
+            target.catalog,
+            target.namespace,
+            target.table,
+            uuid::Uuid::new_v4()
+        ),
+        commit: IcebergWriteCommitPolicy {
+            commit_op_kind: CommitOpKind::RowDelta,
+            base_snapshot_id: current_snapshot_id,
+            base_snapshot_map: BTreeMap::new(),
             target_ref: "main".to_string(),
             snapshot_properties: BTreeMap::new(),
-        })
-        .await
-    })??;
-
-    crate::engine::iceberg_writer::invalidate_iceberg_caches(state, &target)?;
+        },
+        validation: IcebergWriteValidationPolicy {
+            require_v3_for_branch: false,
+        },
+        source: IcebergWriteSource::CoordinatedPlan,
+    };
+    let runner = IcebergWriteTransactionRunner::new(Arc::clone(state), &executor);
+    let _outcome = runner.run(spec)?;
     Ok(StatementResult::Ok)
+}
+
+struct EqualityDeleteWriteExecutor {
+    commit_executor: IcebergWriteCommitExecutor,
+    table: iceberg::table::Table,
+    collector: Arc<IcebergCommitCollector>,
+    default_spec_id: i32,
+    plan: Mutex<Option<(Vec<EqualityDeleteColumn>, RecordBatch)>>,
+}
+
+impl IcebergWriteTransactionExecutor for EqualityDeleteWriteExecutor {
+    fn run_coordinated_write(
+        &self,
+        _spec: &IcebergWriteTransactionSpec,
+    ) -> Result<CoordinatedQueryResult, String> {
+        let (delete_columns, batch) = self
+            .plan
+            .lock()
+            .expect("equality-delete write plan lock poisoned")
+            .take()
+            .ok_or_else(|| "ADD EQUALITY DELETE write plan was already consumed".to_string())?;
+        let file_io = self.table.file_io().clone();
+        let Some(written) = block_on_iceberg(async {
+            write_equality_delete_file(
+                &file_io,
+                &self.collector.staging_dir,
+                self.default_spec_id,
+                delete_columns,
+                batch,
+            )
+            .await
+        })??
+        else {
+            return Ok(CoordinatedQueryResult {
+                query_result: QueryResult::empty(),
+                write_commit: None,
+                write_abort: None,
+            });
+        };
+        self.collector.inject_written_file(written);
+        Ok(CoordinatedQueryResult {
+            query_result: QueryResult::empty(),
+            write_commit: Some(synthetic_write_commit_input()),
+            write_abort: None,
+        })
+    }
+
+    fn commit(
+        &self,
+        _spec: &IcebergWriteTransactionSpec,
+        write_commit: &WriteCommitInput,
+    ) -> Result<CommitOutcome, CommitServiceError> {
+        self.commit_executor.commit_write_input(write_commit)
+    }
+
+    fn finalize(&self, _spec: &IcebergWriteTransactionSpec) -> Result<(), String> {
+        self.commit_executor.finalize()
+    }
 }
 
 fn build_equality_delete_batch(

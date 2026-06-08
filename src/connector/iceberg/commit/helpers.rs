@@ -19,7 +19,7 @@
 //! (`RowDeltaCommit` and `OverwriteCommit`).
 
 use iceberg::io::FileIO;
-use iceberg::spec::{FormatVersion, ManifestFile, ManifestListWriter, Summary};
+use iceberg::spec::{FormatVersion, ManifestFile, ManifestListWriter, Summary, TableMetadata};
 use std::collections::HashMap;
 
 /// Generate an Iceberg-spec-compliant random positive snapshot id.
@@ -52,14 +52,57 @@ pub fn metadata_dir(table: &iceberg::table::Table) -> String {
 pub fn current_snapshot_total_records(
     metadata: &iceberg::spec::TableMetadata,
 ) -> Result<Option<u64>, String> {
-    let Some(snapshot) = metadata.current_snapshot() else {
+    snapshot_total_records(
+        metadata,
+        metadata.current_snapshot().map(|s| s.snapshot_id()),
+    )
+}
+
+pub(super) fn target_ref_snapshot_id(metadata: &TableMetadata, target_ref: &str) -> Option<i64> {
+    metadata
+        .refs()
+        .get(target_ref)
+        .map(|r| r.snapshot_id)
+        .or_else(|| {
+            if target_ref == "main" {
+                metadata.current_snapshot().map(|s| s.snapshot_id())
+            } else {
+                None
+            }
+        })
+}
+
+pub(super) fn required_target_ref_snapshot_id(
+    metadata: &TableMetadata,
+    target_ref: &str,
+    operation: &str,
+) -> Result<i64, String> {
+    target_ref_snapshot_id(metadata, target_ref).ok_or_else(|| {
+        format!("{operation} committed but target ref '{target_ref}' is not visible")
+    })
+}
+
+pub(super) fn snapshot_summary(
+    metadata: &TableMetadata,
+    snapshot_id: Option<i64>,
+) -> Result<Option<&Summary>, String> {
+    let Some(snapshot_id) = snapshot_id else {
         return Ok(None);
     };
-    let Some(value) = snapshot
-        .summary()
-        .additional_properties
-        .get("total-records")
-    else {
+    metadata
+        .snapshot_by_id(snapshot_id)
+        .map(|snapshot| Some(snapshot.summary()))
+        .ok_or_else(|| format!("snapshot {snapshot_id} not found in table metadata"))
+}
+
+pub(super) fn snapshot_total_records(
+    metadata: &TableMetadata,
+    snapshot_id: Option<i64>,
+) -> Result<Option<u64>, String> {
+    let Some(snapshot) = snapshot_summary(metadata, snapshot_id)? else {
+        return Ok(None);
+    };
+    let Some(value) = snapshot.additional_properties.get("total-records") else {
         return Ok(None);
     };
     value
@@ -140,17 +183,28 @@ pub async fn read_base_manifest_list(
     file_io: &FileIO,
 ) -> Result<Vec<ManifestFile>, String> {
     let m = table.metadata();
-    let snap = match m.current_snapshot() {
-        Some(s) => s,
-        None => return Ok(Vec::new()),
+    let snapshot_id = m.current_snapshot().map(|s| s.snapshot_id());
+    read_snapshot_manifest_list(m, file_io, snapshot_id).await
+}
+
+pub(super) async fn read_snapshot_manifest_list(
+    metadata: &TableMetadata,
+    file_io: &FileIO,
+    snapshot_id: Option<i64>,
+) -> Result<Vec<ManifestFile>, String> {
+    let Some(snapshot_id) = snapshot_id else {
+        return Ok(Vec::new());
     };
+    let snap = metadata
+        .snapshot_by_id(snapshot_id)
+        .ok_or_else(|| format!("snapshot {snapshot_id} not found in table metadata"))?;
     let bytes = file_io
         .new_input(snap.manifest_list())
         .map_err(|e| format!("FileIO::new_input({}) failed: {e}", snap.manifest_list()))?
         .read()
         .await
         .map_err(|e| format!("read manifest_list failed: {e}"))?;
-    let list = iceberg::spec::ManifestList::parse_with_version(&bytes, m.format_version())
+    let list = iceberg::spec::ManifestList::parse_with_version(&bytes, metadata.format_version())
         .map_err(|e| format!("parse manifest_list failed: {e}"))?;
     Ok(list.entries().to_vec())
 }

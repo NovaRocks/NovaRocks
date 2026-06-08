@@ -6443,11 +6443,28 @@ enable_path_style_access = true
     // (Plan Tasks 15-17 — IT-INS-1..4 / IT-OW-1..3 / IT-DEL-1..4 / NEG-*)
     // -----------------------------------------------------------------------
 
+    fn open_test_engine_with_metadata(warehouse: &TempDir) -> StandaloneNovaRocks {
+        let config_path = warehouse.path().join("novarocks.toml");
+        std::fs::create_dir_all(warehouse.path().join("meta")).expect("create metadata dir");
+        std::fs::write(
+            &config_path,
+            r#"[metadata]
+provider = "sqlite"
+path = "meta/operations.sqlite"
+"#,
+        )
+        .expect("write metadata config");
+        StandaloneNovaRocks::open(StandaloneOptions {
+            config_path: Some(config_path),
+        })
+        .expect("open engine")
+    }
+
     fn open_iceberg_session_with_table(
         warehouse: &TempDir,
         format_version: &str,
     ) -> (StandaloneNovaRocks, StandaloneSession) {
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
+        let engine = open_test_engine_with_metadata(warehouse);
         let session = engine.session();
         let create_catalog_sql = format!(
             r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="memory","iceberg.catalog.warehouse"="{}")"#,
@@ -6480,7 +6497,7 @@ enable_path_style_access = true
     ) -> (StandaloneNovaRocks, StandaloneSession) {
         use iceberg::Catalog;
 
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
+        let engine = open_test_engine_with_metadata(warehouse);
         let session = engine.session();
         let create_catalog_sql = format!(
             r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="memory","iceberg.catalog.warehouse"="{}")"#,
@@ -6633,6 +6650,109 @@ enable_path_style_access = true
         assert_ne!(
             snap_before, snap_after,
             "INSERT INTO ... SELECT must advance the iceberg snapshot id"
+        );
+        assert_iceberg_operation_finalized(
+            &engine,
+            2,
+            crate::meta::repository::iceberg_operation::IcebergOperationKind::InsertAppend,
+            snap_after,
+        );
+    }
+
+    #[test]
+    fn iceberg_branch_writes_record_branch_head_base_snapshot() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (engine, session) = open_iceberg_session_with_table(&warehouse, "3");
+        session
+            .execute_in_database("insert into ice.db1.t values (1, 'main-1')", "default")
+            .expect("seed main");
+        let branch_base =
+            current_iceberg_snapshot_id(&engine, "ice", "db1", "t").expect("seed snapshot");
+        session
+            .execute_in_database("alter table ice.db1.t create branch dev", "default")
+            .expect("create branch");
+        session
+            .execute_in_database("insert into ice.db1.t values (2, 'main-2')", "default")
+            .expect("advance main after branch creation");
+        let main_after_branch = current_iceberg_snapshot_id(&engine, "ice", "db1", "t")
+            .expect("main advanced snapshot");
+        assert_ne!(
+            branch_base, main_after_branch,
+            "main must advance after the branch was created"
+        );
+
+        session
+            .execute_in_database(
+                "insert into ice.db1.t.branch_dev values (3, 'dev-3')",
+                "default",
+            )
+            .expect("branch insert");
+        let dev_after = iceberg_ref_snapshot_id(&engine, "ice", "db1", "t", "dev")
+            .expect("dev branch snapshot");
+        assert_ne!(
+            branch_base, dev_after,
+            "branch insert must advance the branch head"
+        );
+
+        let operation = load_iceberg_operation(&engine, 3);
+        assert_eq!(
+            operation.operation_kind,
+            crate::meta::repository::iceberg_operation::IcebergOperationKind::InsertAppend
+        );
+        assert_eq!(operation.target.ref_name.as_deref(), Some("dev"));
+        assert_eq!(
+            operation.base_snapshot_id,
+            Some(branch_base),
+            "branch write operation must record the branch head before commit, not main"
+        );
+        assert_eq!(
+            operation
+                .commit_outcome
+                .as_ref()
+                .map(|outcome| outcome.snapshot_id),
+            Some(dev_after)
+        );
+        assert_eq!(
+            current_iceberg_snapshot_id(&engine, "ice", "db1", "t"),
+            Some(main_after_branch),
+            "branch insert must not advance main"
+        );
+
+        session
+            .execute_in_database(
+                "insert overwrite ice.db1.t.branch_dev values (4, 'dev-4')",
+                "default",
+            )
+            .expect("branch overwrite");
+        let dev_after_overwrite = iceberg_ref_snapshot_id(&engine, "ice", "db1", "t", "dev")
+            .expect("dev branch snapshot after overwrite");
+        assert_ne!(
+            dev_after, dev_after_overwrite,
+            "branch overwrite must advance the branch head"
+        );
+
+        let operation = load_iceberg_operation(&engine, 4);
+        assert_eq!(
+            operation.operation_kind,
+            crate::meta::repository::iceberg_operation::IcebergOperationKind::InsertOverwrite
+        );
+        assert_eq!(operation.target.ref_name.as_deref(), Some("dev"));
+        assert_eq!(
+            operation.base_snapshot_id,
+            Some(dev_after),
+            "branch overwrite operation must record the branch head before commit, not main"
+        );
+        assert_eq!(
+            operation
+                .commit_outcome
+                .as_ref()
+                .map(|outcome| outcome.snapshot_id),
+            Some(dev_after_overwrite)
+        );
+        assert_eq!(
+            current_iceberg_snapshot_id(&engine, "ice", "db1", "t"),
+            Some(main_after_branch),
+            "branch overwrite must not advance main"
         );
     }
 
@@ -6812,6 +6932,81 @@ enable_path_style_access = true
             .metadata()
             .current_snapshot()
             .map(|s| s.snapshot_id())
+    }
+
+    fn iceberg_ref_snapshot_id(
+        engine: &StandaloneNovaRocks,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        ref_name: &str,
+    ) -> Option<i64> {
+        let registry = engine.inner.iceberg_catalogs.read().expect("registry");
+        let entry = registry.get(catalog).expect("entry");
+        entry.invalidate_table_cache(namespace, table);
+        let loaded =
+            crate::connector::iceberg::catalog::load_table(&entry, namespace, table).expect("load");
+        loaded
+            .table
+            .metadata()
+            .refs()
+            .get(ref_name)
+            .map(|r| r.snapshot_id)
+    }
+
+    fn load_iceberg_operation(
+        engine: &StandaloneNovaRocks,
+        operation_id: i64,
+    ) -> crate::meta::repository::iceberg_operation::StoredIcebergOperation {
+        let provider = engine
+            .inner
+            .metadata_provider
+            .as_ref()
+            .expect("metadata provider");
+        let read = provider.begin_read().expect("read operation metadata");
+        engine
+            .inner
+            .iceberg_operation_repo
+            .load_operation(read.as_ref(), operation_id)
+            .expect("load iceberg operation")
+            .expect("iceberg operation present")
+    }
+
+    fn assert_iceberg_operation_finalized(
+        engine: &StandaloneNovaRocks,
+        operation_id: i64,
+        expected_kind: crate::meta::repository::iceberg_operation::IcebergOperationKind,
+        expected_snapshot_id: Option<i64>,
+    ) {
+        let operation = load_iceberg_operation(engine, operation_id);
+        assert_eq!(operation.operation_kind, expected_kind);
+        assert_eq!(
+            operation.state,
+            crate::meta::repository::iceberg_operation::IcebergOperationState::Finalized
+        );
+        assert_eq!(
+            operation.commit_outcome.as_ref().map(|c| c.snapshot_id),
+            expected_snapshot_id
+        );
+    }
+
+    fn assert_iceberg_operation_finalized_any_snapshot(
+        engine: &StandaloneNovaRocks,
+        operation_id: i64,
+        expected_kind: crate::meta::repository::iceberg_operation::IcebergOperationKind,
+    ) -> Option<i64> {
+        let operation = load_iceberg_operation(engine, operation_id);
+        assert_eq!(operation.operation_kind, expected_kind);
+        assert_eq!(
+            operation.state,
+            crate::meta::repository::iceberg_operation::IcebergOperationState::Finalized
+        );
+        let snapshot_id = operation.commit_outcome.as_ref().map(|c| c.snapshot_id);
+        assert!(
+            snapshot_id.is_some(),
+            "finalized write operation must record committed snapshot id"
+        );
+        snapshot_id
     }
 
     fn current_iceberg_default_spec_fields(
@@ -7005,6 +7200,12 @@ enable_path_style_access = true
         assert_ne!(
             snap_before, snap_after,
             "DELETE WHERE id = 2 must advance the iceberg snapshot id"
+        );
+        assert_iceberg_operation_finalized(
+            &engine,
+            2,
+            crate::meta::repository::iceberg_operation::IcebergOperationKind::RowDelta,
+            snap_after,
         );
         // DELETE with IN list still advances the snapshot.
         session
@@ -7310,6 +7511,38 @@ enable_path_style_access = true
             live_dv_cardinality, 2,
             "merged DV must record both deleted rows (got {live_dv_cardinality})"
         );
+        let snap_after = current_iceberg_snapshot_id(&engine, "ice", "db1", "t");
+        assert_iceberg_operation_finalized(
+            &engine,
+            3,
+            crate::meta::repository::iceberg_operation::IcebergOperationKind::RowDelta,
+            snap_after,
+        );
+    }
+
+    #[test]
+    fn iceberg_add_equality_delete_drives_operation_lifecycle() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (engine, session) = open_iceberg_session_with_table(&warehouse, "2");
+        session
+            .execute_in_database(
+                "insert into ice.db1.t values (1, 'a'), (2, 'b'), (3, 'b')",
+                "default",
+            )
+            .expect("seed");
+        session
+            .execute_in_database(
+                "alter table ice.db1.t add equality delete (v) values ('b')",
+                "default",
+            )
+            .expect("add equality delete");
+        let snap_after = current_iceberg_snapshot_id(&engine, "ice", "db1", "t");
+        assert_iceberg_operation_finalized(
+            &engine,
+            2,
+            crate::meta::repository::iceberg_operation::IcebergOperationKind::RowDelta,
+            snap_after,
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -7391,6 +7624,13 @@ enable_path_style_access = true
                 "default",
             )
             .expect("update");
+        let snap_after = current_iceberg_snapshot_id(&engine, "ice", "db1", "t");
+        assert_iceberg_operation_finalized(
+            &engine,
+            2,
+            crate::meta::repository::iceberg_operation::IcebergOperationKind::RowDelta,
+            snap_after,
+        );
         let after = collect_id_rowid_seq(
             &session,
             "select id, _row_id, _last_updated_sequence_number from ice.db1.t order by id",
@@ -7439,7 +7679,7 @@ enable_path_style_access = true
     #[test]
     fn iceberg_v3_mor_update_preserves_row_id() {
         let warehouse = TempDir::new().expect("warehouse");
-        let (_engine, session) = open_row_lineage_iceberg_session_with_table_extra_props(
+        let (engine, session) = open_row_lineage_iceberg_session_with_table_extra_props(
             &warehouse,
             &[("novarocks.update.mode", "merge-on-read")],
         );
@@ -7456,6 +7696,13 @@ enable_path_style_access = true
                 "default",
             )
             .expect("mor update");
+        let snap_after = current_iceberg_snapshot_id(&engine, "ice", "db1", "t");
+        assert_iceberg_operation_finalized(
+            &engine,
+            2,
+            crate::meta::repository::iceberg_operation::IcebergOperationKind::RowDelta,
+            snap_after,
+        );
         let after = collect_id_rowid_seq(
             &session,
             "select id, _row_id, _last_updated_sequence_number from ice.db1.t order by id",
@@ -7508,6 +7755,56 @@ enable_path_style_access = true
             .expect("update from source");
         let rows = collect_id_v(&session, "select id, v from ice.db1.t order by id");
         assert_eq!(rows, vec![(1, "a".to_string()), (2, "bb".to_string())]);
+    }
+
+    #[test]
+    fn iceberg_v3_merge_upsert_drives_operation_lifecycle() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (engine, session) = open_row_lineage_iceberg_session_with_table(&warehouse);
+        session
+            .execute_in_database(
+                r#"create table ice.db1.src (id int, new_v string) tblproperties("format-version"="3","write.row-lineage"="true")"#,
+                "default",
+            )
+            .expect("create source iceberg table");
+        session
+            .execute_in_database("insert into ice.db1.t values (1, 'a'), (2, 'b')", "default")
+            .expect("insert target");
+        session
+            .execute_in_database(
+                "insert into ice.db1.src values (2, 'bb'), (3, 'c')",
+                "default",
+            )
+            .expect("insert source");
+        session
+            .execute_in_database(
+                "merge into ice.db1.t as t using ice.db1.src as s on t.id = s.id \
+                 when matched then update set v = s.new_v \
+                 when not matched then insert (id, v) values (s.id, s.new_v)",
+                "default",
+            )
+            .expect("merge upsert");
+        let rows = collect_id_v(&session, "select id, v from ice.db1.t order by id");
+        assert_eq!(
+            rows,
+            vec![
+                (1, "a".to_string()),
+                (2, "bb".to_string()),
+                (3, "c".to_string())
+            ]
+        );
+        assert_iceberg_operation_finalized_any_snapshot(
+            &engine,
+            3,
+            crate::meta::repository::iceberg_operation::IcebergOperationKind::RowDelta,
+        );
+        let snap_after = current_iceberg_snapshot_id(&engine, "ice", "db1", "t");
+        assert_iceberg_operation_finalized(
+            &engine,
+            4,
+            crate::meta::repository::iceberg_operation::IcebergOperationKind::InsertAppend,
+            snap_after,
+        );
     }
 
     #[test]

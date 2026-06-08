@@ -17,18 +17,25 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome, CommitServiceError};
+use opendal::Operator;
+
+use crate::connector::iceberg::catalog::registry::block_on_iceberg;
+use crate::connector::iceberg::commit::{
+    AbortLog, CleanupAttempt, CleanupPathMapper, CommitOpKind, CommitOutcome, CommitServiceError,
+    CowUpdateRewriteSet, IcebergCommitCollector, RunInput, WrittenFile, run_iceberg_commit_typed,
+};
 use crate::connector::iceberg::operation_lifecycle::{
     IcebergOperationFact, operation_fact_from_commit_result, operation_fact_from_finalize_failure,
 };
 use crate::engine::StandaloneState;
+use crate::engine::backend_resolver::TargetBackend;
 use crate::meta::repository::iceberg_operation::{
     CreateIcebergOperationRequest, IcebergOperationFactUpdate, IcebergOperationKind,
     IcebergOperationState, IcebergOperationTarget,
 };
 use crate::runtime::coordinator::CoordinatedQueryResult;
 use crate::runtime::query_result::QueryResult;
-use crate::runtime::write_coordinator::WriteCommitInput;
+use crate::runtime::write_coordinator::{WriteCommitInput, WriterCommitInput, WriterKey};
 
 /// How the runner should commit the collected writer output.
 pub(crate) struct IcebergWriteCommitPolicy {
@@ -95,12 +102,133 @@ pub(crate) trait IcebergWriteTransactionExecutor {
     fn finalize(&self, spec: &IcebergWriteTransactionSpec) -> Result<(), String>;
 }
 
+/// Reusable Iceberg commit/finalize context for coordinated writer output.
+///
+/// SQL routing is intentionally kept outside this type; callers supply a
+/// collected [`WriteCommitInput`] after the coordinated write has completed.
+pub(crate) struct IcebergWriteCommitExecutor {
+    pub(crate) state: Arc<StandaloneState>,
+    pub(crate) target: TargetBackend,
+    pub(crate) catalog: Arc<dyn iceberg::Catalog>,
+    pub(crate) table: iceberg::table::Table,
+    pub(crate) collector: Arc<IcebergCommitCollector>,
+    pub(crate) fs: Operator,
+    pub(crate) cleanup_path_mapper: Option<CleanupPathMapper>,
+    pub(crate) cow_update_rewrite: Option<CowUpdateRewriteSet>,
+    pub(crate) target_ref: String,
+    pub(crate) snapshot_properties: BTreeMap<String, String>,
+}
+
+impl IcebergWriteCommitExecutor {
+    pub(crate) fn commit_write_input(
+        &self,
+        write_commit: &WriteCommitInput,
+    ) -> Result<CommitOutcome, CommitServiceError> {
+        let mut writer_files = Vec::new();
+        for writer in &write_commit.writers {
+            for info in &writer.sink_commit_infos {
+                match self.collector.convert_sink_commit_info(info.clone()) {
+                    Ok(file) => writer_files.push(file),
+                    Err(message) => {
+                        let cleanup = self.cleanup_converted_writer_files(&writer_files);
+                        return Err(CommitServiceError::known_uncommitted(message, cleanup));
+                    }
+                }
+            }
+        }
+        self.collector.inject_written_files(writer_files);
+
+        let file_io = self.table.file_io().clone();
+        let input = RunInput {
+            collector: Arc::clone(&self.collector),
+            catalog: Arc::clone(&self.catalog),
+            table: self.table.clone(),
+            fs: self.fs.clone(),
+            file_io,
+            cleanup_path_mapper: self.cleanup_path_mapper.clone(),
+            cow_update_rewrite: self.cow_update_rewrite.clone(),
+            target_ref: self.target_ref.clone(),
+            snapshot_properties: self.snapshot_properties.clone(),
+        };
+
+        match block_on_iceberg(async { run_iceberg_commit_typed(input).await }) {
+            Ok(result) => result,
+            Err(message) => Err(CommitServiceError::known_uncommitted(
+                message,
+                CleanupAttempt::not_attempted(),
+            )),
+        }
+    }
+
+    fn cleanup_converted_writer_files(&self, files: &[WrittenFile]) -> CleanupAttempt {
+        let abort_log = AbortLog::new();
+        for file in files {
+            abort_log.record_data_file(file.path.clone());
+        }
+        let fs = self.fs.clone();
+        let cleanup_path_mapper = self.cleanup_path_mapper.clone();
+        match block_on_iceberg(async move {
+            if let Some(mapper) = cleanup_path_mapper {
+                abort_log
+                    .cleanup_with_path_mapper(&fs, |path| mapper(path))
+                    .await
+            } else {
+                abort_log.cleanup(&fs).await
+            }
+        }) {
+            Ok(cleanup_errors) => CleanupAttempt::from_cleanup_errors(&cleanup_errors),
+            Err(message) => {
+                CleanupAttempt::completed(vec![format!("abort cleanup runtime failed: {message}")])
+            }
+        }
+    }
+
+    pub(crate) fn finalize(&self) -> Result<(), String> {
+        crate::engine::iceberg_writer::invalidate_iceberg_caches(&self.state, &self.target)?;
+        crate::engine::dictionary::maintenance::mark_target_stale(&self.state, &self.target)
+    }
+}
+
 /// Current time in unix milliseconds for operation-record timestamps.
 pub(crate) fn current_unix_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// Synthetic writer outcome for local standalone write executors that already
+/// injected full-fidelity file metadata into their commit collector.
+pub(crate) fn synthetic_write_commit_input() -> WriteCommitInput {
+    let write_id = synthetic_unique_id();
+    let writer_key = WriterKey {
+        query_id: write_id.clone(),
+        fragment_instance_id: write_id.clone(),
+        backend_num: 0,
+    };
+    WriteCommitInput {
+        write_id,
+        writers: vec![WriterCommitInput {
+            writer_id: 0,
+            writer_key,
+            sink_commit_infos: Vec::new(),
+            tablet_commit_infos: Vec::new(),
+            tablet_fail_infos: Vec::new(),
+            load_counters: BTreeMap::new(),
+            loaded_rows: 0,
+            loaded_bytes: 0,
+            filtered_rows: 0,
+        }],
+    }
+}
+
+fn synthetic_unique_id() -> crate::types::TUniqueId {
+    let uuid = uuid::Uuid::new_v4();
+    let bytes = uuid.as_bytes();
+    crate::types::TUniqueId::new(
+        i64::from_be_bytes(bytes[0..8].try_into().expect("uuid hi bytes")),
+        i64::from_be_bytes(bytes[8..16].try_into().expect("uuid lo bytes")),
+    )
 }
 
 /// Drives one Iceberg write transaction through the operation state machine.
@@ -120,7 +248,17 @@ impl<'a, E: IcebergWriteTransactionExecutor> IcebergWriteTransactionRunner<'a, E
     ) -> Result<IcebergWriteTransactionOutcome, String> {
         let operation_id = self.create_preparing(&spec)?;
 
-        let written = self.executor.run_coordinated_write(&spec)?;
+        let written = match self.executor.run_coordinated_write(&spec) {
+            Ok(written) => written,
+            Err(message) => {
+                let err = CommitServiceError::known_uncommitted(
+                    message.clone(),
+                    CleanupAttempt::not_attempted(),
+                );
+                self.record_fact(operation_id, operation_fact_from_commit_result(Err(&err)))?;
+                return Err(message);
+            }
+        };
 
         if let Some(abort) = &written.write_abort {
             crate::engine::write_operation_lifecycle::record_writer_abort_fact(
@@ -420,6 +558,36 @@ mod tests {
             .expect("load")
             .expect("present");
         assert_eq!(stored.state, IcebergOperationState::FailedKnownUncommitted);
+    }
+
+    #[test]
+    fn coordinated_write_failure_records_failed_known_uncommitted() {
+        let env = test_env();
+        let exec = FakeExecutor {
+            write: RefCell::new(Some(Err("coordinated write failed".to_string()))),
+            commit: RefCell::new(None),
+            finalize: Ok(()),
+        };
+        let runner = IcebergWriteTransactionRunner::new(Arc::clone(&env.state), &exec);
+        let err = runner
+            .run(sample_spec())
+            .expect_err("write failure surfaces");
+        assert!(
+            err.contains("coordinated write failed"),
+            "original message should be preserved, got: {err}"
+        );
+        let read = env.provider.begin_read().expect("read txn");
+        let stored = env
+            .state
+            .iceberg_operation_repo
+            .load_operation(read.as_ref(), 1)
+            .expect("load")
+            .expect("present");
+        assert_eq!(stored.state, IcebergOperationState::FailedKnownUncommitted);
+        assert_eq!(
+            stored.failure.as_ref().map(|f| f.message.as_str()),
+            Some("coordinated write failed")
+        );
     }
 
     #[test]

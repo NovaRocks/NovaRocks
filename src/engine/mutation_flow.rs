@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, StringArray};
 use arrow::compute::{cast, concat_batches, filter_record_batch};
@@ -11,12 +12,21 @@ use iceberg::arrow::{ArrowReaderBuilder, schema_to_arrow_schema};
 
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
 use crate::connector::iceberg::commit::{
-    CommitOpKind, CowUpdateRewriteSet, CowUpdateTouchedFile, IcebergCommitCollector,
-    IcebergUpdateMode, RunInput, ensure_no_variant_columns_for_row_level_mutation,
-    run_iceberg_commit, select_iceberg_update_mode,
+    CommitOpKind, CommitOutcome, CommitServiceError, CowUpdateRewriteSet, CowUpdateTouchedFile,
+    IcebergCommitCollector, IcebergUpdateMode, ensure_no_variant_columns_for_row_level_mutation,
+    select_iceberg_update_mode,
 };
 use crate::connector::iceberg::data_writer::{RowLineageColumns, RowLineageWriteBatch};
+use crate::engine::write_transaction::{
+    IcebergWriteCommitExecutor, IcebergWriteCommitPolicy, IcebergWriteSource,
+    IcebergWriteTransactionExecutor, IcebergWriteTransactionRunner, IcebergWriteTransactionSpec,
+    IcebergWriteValidationPolicy, synthetic_write_commit_input,
+};
 use crate::engine::{StandaloneState, StatementResult};
+use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOperationTarget};
+use crate::runtime::coordinator::CoordinatedQueryResult;
+use crate::runtime::query_result::QueryResult;
+use crate::runtime::write_coordinator::WriteCommitInput;
 use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
 use crate::sql::parser::ast::{
     MergeMatchedAction, MergeNotMatchedAction, MergeStmt, ObjectName, UpdateStmt,
@@ -112,7 +122,7 @@ pub(crate) fn execute_update_statement(
             catalog,
             table_ident,
             table,
-            &matched,
+            matched,
             entry,
             &target_ref,
         ),
@@ -122,7 +132,7 @@ pub(crate) fn execute_update_statement(
             catalog,
             table_ident,
             table,
-            &matched,
+            matched,
             entry,
             &target_ref,
         ),
@@ -226,65 +236,25 @@ fn execute_mor_update(
     catalog: Arc<dyn Catalog>,
     table_ident: iceberg::TableIdent,
     table: iceberg::table::Table,
-    matched: &MatchedUpdateBatch,
+    matched: MatchedUpdateBatch,
     entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
     target_ref: &str,
 ) -> Result<StatementResult, String> {
+    if matched.row_ids.is_empty() {
+        return Ok(StatementResult::Ok);
+    }
     // For branch DML, read partition metadata at the branch head snapshot.
     let read_snapshot_id: Option<i64> = if target_ref != "main" {
         crate::engine::delete_flow::resolve_branch_head_snapshot_id(table.metadata(), target_ref)?
     } else {
         table.metadata().current_snapshot().map(|s| s.snapshot_id())
     };
-    let referenced_partitions =
-        crate::engine::delete_flow::load_referenced_data_file_partitions_at(
-            &table,
-            read_snapshot_id,
-        )?;
-    let delete_groups = build_position_delete_groups_from_matched(matched, &referenced_partitions)?;
-
     let metadata = table.metadata();
-    let new_sequence_number = metadata.last_sequence_number() + 1;
-    let runs = build_mor_update_runs(matched, new_sequence_number)?;
-
-    let mut written_files: Vec<crate::connector::iceberg::commit::WrittenFile> = Vec::new();
-    for run in &runs {
-        let data_files = block_on_iceberg(async {
-            crate::connector::iceberg::data_writer::write_row_lineage_batches_as_data_files(
-                &table,
-                std::slice::from_ref(&run.batch),
-            )
-            .await
-        })??;
-        if data_files.is_empty() {
-            return Err(
-                "MOR UPDATE produced no replacement data files for matched rows".to_string(),
-            );
-        }
-        // Within each contiguous-row-id run we wrote rows in ascending row_id
-        // order, so position 0 of the file maps to `run.first_row_id`. Stamp
-        // `first_row_id` on the resulting WrittenFile so the manifest entry
-        // records the correct lineage origin.
-        let mut cursor = run.first_row_id;
-        for df in data_files {
-            let mut wf = crate::engine::iceberg_writer::data_file_to_written_file(
-                &df,
-                metadata.default_partition_spec_id(),
-            )?;
-            wf.first_row_id = Some(cursor);
-            cursor = cursor.checked_add(wf.record_count as i64).ok_or_else(|| {
-                "MOR UPDATE first_row_id cursor overflow when chaining rolling files".to_string()
-            })?;
-            written_files.push(wf);
-        }
-    }
-
     let staging_dir = format!(
         "{}/data/_staging/{}",
         metadata.location(),
         uuid::Uuid::new_v4()
     );
-    let file_io = table.file_io().clone();
     let collector = Arc::new(IcebergCommitCollector::new(
         CommitOpKind::RowDeltaDv,
         table_ident,
@@ -295,32 +265,19 @@ fn execute_mor_update(
         staging_dir,
         crate::common::types::UniqueId { hi: 0, lo: 0 },
     ));
-    for group in delete_groups {
-        collector.inject_delete_group(group);
-    }
-    for wf in written_files {
-        collector.inject_written_file(wf);
-    }
-
-    let abort_cleanup =
-        crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
-    let _outcome = block_on_iceberg(async {
-        run_iceberg_commit(RunInput {
-            collector: collector.clone(),
-            catalog: catalog.clone(),
-            table,
-            fs: abort_cleanup.fs,
-            file_io,
-            cleanup_path_mapper: abort_cleanup.path_mapper,
-            cow_update_rewrite: None,
-            target_ref: target_ref.to_string(),
-            snapshot_properties: BTreeMap::new(),
-        })
-        .await
-    })??;
-
-    crate::engine::iceberg_writer::invalidate_iceberg_caches(state, target)?;
-    crate::engine::dictionary::maintenance::mark_target_stale(state, target)?;
+    run_mutation_write_transaction(
+        state,
+        target,
+        catalog,
+        table,
+        collector,
+        entry,
+        CommitOpKind::RowDeltaDv,
+        IcebergOperationKind::RowDelta,
+        read_snapshot_id,
+        target_ref,
+        MutationWritePlan::MorUpdate { matched },
+    )?;
     Ok(StatementResult::Ok)
 }
 
@@ -450,40 +407,325 @@ fn build_position_delete_groups_from_matched(
     Ok(out)
 }
 
+enum MutationWritePlan {
+    MorUpdate {
+        matched: MatchedUpdateBatch,
+    },
+    CowUpdate {
+        matched: MatchedUpdateBatch,
+        entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
+        target_ref: String,
+    },
+    MergeMatchedDelete {
+        matched: MatchedUpdateBatch,
+    },
+    MergeUnmatchedInsert {
+        insert_batch: RecordBatch,
+    },
+}
+
+impl MutationWritePlan {
+    fn attempt_name(&self) -> &'static str {
+        match self {
+            Self::MorUpdate { .. } => "mor-update",
+            Self::CowUpdate { .. } => "cow-update",
+            Self::MergeMatchedDelete { .. } => "merge-delete",
+            Self::MergeUnmatchedInsert { .. } => "merge-insert",
+        }
+    }
+}
+
+struct MutationWriteExecutor {
+    commit_executor: IcebergWriteCommitExecutor,
+    table: iceberg::table::Table,
+    collector: Arc<IcebergCommitCollector>,
+    plan: Mutex<Option<MutationWritePlan>>,
+    cow_update_rewrite: Mutex<Option<CowUpdateRewriteSet>>,
+}
+
+impl IcebergWriteTransactionExecutor for MutationWriteExecutor {
+    fn run_coordinated_write(
+        &self,
+        spec: &IcebergWriteTransactionSpec,
+    ) -> Result<CoordinatedQueryResult, String> {
+        let plan = self
+            .plan
+            .lock()
+            .expect("mutation write plan lock poisoned")
+            .take()
+            .ok_or_else(|| "mutation write plan was already consumed".to_string())?;
+        match plan {
+            MutationWritePlan::MorUpdate { matched } => {
+                self.run_mor_update_write(matched, spec.commit.base_snapshot_id)?;
+            }
+            MutationWritePlan::CowUpdate {
+                matched,
+                entry,
+                target_ref,
+            } => {
+                let Some(rewrite) = self.run_cow_update_write(matched, entry, &target_ref)? else {
+                    return Ok(no_mutation_write_result());
+                };
+                *self
+                    .cow_update_rewrite
+                    .lock()
+                    .expect("COW UPDATE rewrite lock poisoned") = Some(rewrite);
+            }
+            MutationWritePlan::MergeMatchedDelete { matched } => {
+                if matched.row_ids.is_empty() {
+                    return Ok(no_mutation_write_result());
+                }
+                let referenced_partitions =
+                    crate::engine::delete_flow::load_referenced_data_file_partitions(&self.table)?;
+                let delete_groups =
+                    build_position_delete_groups_from_matched(&matched, &referenced_partitions)?;
+                for group in delete_groups {
+                    self.collector.inject_delete_group(group);
+                }
+            }
+            MutationWritePlan::MergeUnmatchedInsert { insert_batch } => {
+                if insert_batch.num_rows() == 0 {
+                    return Ok(no_mutation_write_result());
+                }
+                let data_files = block_on_iceberg(async {
+                    crate::connector::iceberg::data_writer::write_record_batches_as_data_files(
+                        &self.table,
+                        std::iter::once(insert_batch),
+                    )
+                    .await
+                })??;
+                if data_files.is_empty() {
+                    return Ok(no_mutation_write_result());
+                }
+                let default_spec_id = self.table.metadata().default_partition_spec_id();
+                for df in data_files {
+                    let wf = crate::engine::iceberg_writer::data_file_to_written_file(
+                        &df,
+                        default_spec_id,
+                    )?;
+                    self.collector.inject_written_file(wf);
+                }
+            }
+        }
+        Ok(mutation_write_result())
+    }
+
+    fn commit(
+        &self,
+        _spec: &IcebergWriteTransactionSpec,
+        write_commit: &WriteCommitInput,
+    ) -> Result<CommitOutcome, CommitServiceError> {
+        let commit_executor = IcebergWriteCommitExecutor {
+            state: Arc::clone(&self.commit_executor.state),
+            target: self.commit_executor.target.clone(),
+            catalog: Arc::clone(&self.commit_executor.catalog),
+            table: self.commit_executor.table.clone(),
+            collector: Arc::clone(&self.commit_executor.collector),
+            fs: self.commit_executor.fs.clone(),
+            cleanup_path_mapper: self.commit_executor.cleanup_path_mapper.clone(),
+            cow_update_rewrite: self
+                .cow_update_rewrite
+                .lock()
+                .expect("COW UPDATE rewrite lock poisoned")
+                .clone(),
+            target_ref: self.commit_executor.target_ref.clone(),
+            snapshot_properties: self.commit_executor.snapshot_properties.clone(),
+        };
+        commit_executor.commit_write_input(write_commit)
+    }
+
+    fn finalize(&self, _spec: &IcebergWriteTransactionSpec) -> Result<(), String> {
+        self.commit_executor.finalize()
+    }
+}
+
+impl MutationWriteExecutor {
+    fn run_mor_update_write(
+        &self,
+        matched: MatchedUpdateBatch,
+        base_snapshot_id: Option<i64>,
+    ) -> Result<(), String> {
+        if matched.row_ids.is_empty() {
+            return Ok(());
+        }
+        let referenced_partitions =
+            crate::engine::delete_flow::load_referenced_data_file_partitions_at(
+                &self.table,
+                base_snapshot_id,
+            )?;
+        let delete_groups =
+            build_position_delete_groups_from_matched(&matched, &referenced_partitions)?;
+        let new_sequence_number = self.table.metadata().last_sequence_number() + 1;
+        let default_spec_id = self.table.metadata().default_partition_spec_id();
+        let runs = build_mor_update_runs(&matched, new_sequence_number)?;
+        for run in &runs {
+            let data_files = block_on_iceberg(async {
+                crate::connector::iceberg::data_writer::write_row_lineage_batches_as_data_files(
+                    &self.table,
+                    std::slice::from_ref(&run.batch),
+                )
+                .await
+            })??;
+            if data_files.is_empty() {
+                return Err(
+                    "MOR UPDATE produced no replacement data files for matched rows".to_string(),
+                );
+            }
+            let mut cursor = run.first_row_id;
+            for df in data_files {
+                let mut wf =
+                    crate::engine::iceberg_writer::data_file_to_written_file(&df, default_spec_id)?;
+                wf.first_row_id = Some(cursor);
+                cursor = cursor.checked_add(wf.record_count as i64).ok_or_else(|| {
+                    "MOR UPDATE first_row_id cursor overflow when chaining rolling files"
+                        .to_string()
+                })?;
+                self.collector.inject_written_file(wf);
+            }
+        }
+        for group in delete_groups {
+            self.collector.inject_delete_group(group);
+        }
+        Ok(())
+    }
+
+    fn run_cow_update_write(
+        &self,
+        matched: MatchedUpdateBatch,
+        entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
+        target_ref: &str,
+    ) -> Result<Option<CowUpdateRewriteSet>, String> {
+        if matched.row_ids.is_empty() {
+            return Ok(None);
+        }
+        let existing_deletes_by_file =
+            crate::engine::delete_flow::load_existing_delete_visibility_by_data_file(
+                &self.table,
+                entry.object_store_config(),
+            )?;
+        let lineage_by_file = load_data_file_lineage(&self.table)?;
+        let (data_files, rewrite) = block_on_iceberg(async {
+            write_cow_update_files(
+                &self.table,
+                &matched,
+                existing_deletes_by_file,
+                lineage_by_file,
+                target_ref,
+            )
+            .await
+        })??;
+        if data_files.is_empty() {
+            return Ok(None);
+        }
+        let default_spec_id = self.table.metadata().default_partition_spec_id();
+        for df in data_files {
+            let wf =
+                crate::engine::iceberg_writer::data_file_to_written_file(&df, default_spec_id)?;
+            self.collector.inject_written_file(wf);
+        }
+        Ok(Some(rewrite))
+    }
+}
+
+fn no_mutation_write_result() -> CoordinatedQueryResult {
+    CoordinatedQueryResult {
+        query_result: QueryResult::empty(),
+        write_commit: None,
+        write_abort: None,
+    }
+}
+
+fn mutation_write_result() -> CoordinatedQueryResult {
+    CoordinatedQueryResult {
+        query_result: QueryResult::empty(),
+        write_commit: Some(synthetic_write_commit_input()),
+        write_abort: None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_mutation_write_transaction(
+    state: &Arc<StandaloneState>,
+    target: &crate::engine::backend_resolver::TargetBackend,
+    catalog: Arc<dyn Catalog>,
+    table: iceberg::table::Table,
+    collector: Arc<IcebergCommitCollector>,
+    entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    commit_op_kind: CommitOpKind,
+    operation_kind: IcebergOperationKind,
+    base_snapshot_id: Option<i64>,
+    target_ref: &str,
+    plan: MutationWritePlan,
+) -> Result<(), String> {
+    let attempt_name = plan.attempt_name();
+    let abort_cleanup =
+        crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
+    let collector_for_executor = Arc::clone(&collector);
+    let commit_executor = IcebergWriteCommitExecutor {
+        state: Arc::clone(state),
+        target: target.clone(),
+        catalog,
+        table: table.clone(),
+        collector,
+        fs: abort_cleanup.fs,
+        cleanup_path_mapper: abort_cleanup.path_mapper,
+        cow_update_rewrite: None,
+        target_ref: target_ref.to_string(),
+        snapshot_properties: BTreeMap::new(),
+    };
+    let spec = IcebergWriteTransactionSpec {
+        target: IcebergOperationTarget {
+            catalog: target.catalog.clone(),
+            namespace: target.namespace.clone(),
+            table: target.table.clone(),
+            ref_name: (target_ref != "main").then(|| target_ref.to_string()),
+        },
+        operation_kind,
+        attempt_id: format!(
+            "{}.{}.{}:{}:{}",
+            target.catalog,
+            target.namespace,
+            target.table,
+            attempt_name,
+            uuid::Uuid::new_v4()
+        ),
+        commit: IcebergWriteCommitPolicy {
+            commit_op_kind,
+            base_snapshot_id,
+            base_snapshot_map: BTreeMap::new(),
+            target_ref: target_ref.to_string(),
+            snapshot_properties: BTreeMap::new(),
+        },
+        validation: IcebergWriteValidationPolicy {
+            require_v3_for_branch: target_ref != "main",
+        },
+        source: IcebergWriteSource::CoordinatedPlan,
+    };
+    let executor = MutationWriteExecutor {
+        commit_executor,
+        table,
+        collector: collector_for_executor,
+        plan: Mutex::new(Some(plan)),
+        cow_update_rewrite: Mutex::new(None),
+    };
+    let runner = IcebergWriteTransactionRunner::new(Arc::clone(state), &executor);
+    let _outcome = runner.run(spec)?;
+    Ok(())
+}
+
 fn execute_cow_update(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
     catalog: Arc<dyn Catalog>,
     table_ident: iceberg::TableIdent,
     table: iceberg::table::Table,
-    matched: &MatchedUpdateBatch,
+    matched: MatchedUpdateBatch,
     entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
     target_ref: &str,
 ) -> Result<StatementResult, String> {
     if matched.row_ids.is_empty() {
         return Ok(StatementResult::Ok);
     }
-    let existing_deletes_by_file =
-        crate::engine::delete_flow::load_existing_delete_visibility_by_data_file(
-            &table,
-            entry.object_store_config(),
-        )?;
-    let lineage_by_file = load_data_file_lineage(&table)?;
-    let (data_files, rewrite) = block_on_iceberg(async {
-        write_cow_update_files(
-            &table,
-            matched,
-            existing_deletes_by_file,
-            lineage_by_file,
-            target_ref,
-        )
-        .await
-    })??;
-
-    if data_files.is_empty() {
-        return Ok(StatementResult::Ok);
-    }
-
     let metadata = table.metadata();
     // For branch DML, commit against the branch head snapshot.
     let base_snapshot_id: Option<i64> = if target_ref != "main" {
@@ -496,7 +738,6 @@ fn execute_cow_update(
         metadata.location(),
         uuid::Uuid::new_v4()
     );
-    let file_io = table.file_io().clone();
     let collector = Arc::new(IcebergCommitCollector::new(
         CommitOpKind::CowUpdate,
         table_ident,
@@ -507,32 +748,23 @@ fn execute_cow_update(
         staging_dir,
         crate::common::types::UniqueId { hi: 0, lo: 0 },
     ));
-    for df in data_files {
-        collector.inject_written_file(crate::engine::iceberg_writer::data_file_to_written_file(
-            &df,
-            metadata.default_partition_spec_id(),
-        )?);
-    }
-
-    let abort_cleanup =
-        crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
-    let _outcome = block_on_iceberg(async {
-        run_iceberg_commit(RunInput {
-            collector: collector.clone(),
-            catalog: catalog.clone(),
-            table,
-            fs: abort_cleanup.fs,
-            file_io,
-            cleanup_path_mapper: abort_cleanup.path_mapper,
-            cow_update_rewrite: Some(rewrite),
+    run_mutation_write_transaction(
+        state,
+        target,
+        catalog,
+        table,
+        collector,
+        entry.clone(),
+        CommitOpKind::CowUpdate,
+        IcebergOperationKind::RowDelta,
+        base_snapshot_id,
+        target_ref,
+        MutationWritePlan::CowUpdate {
+            matched,
+            entry,
             target_ref: target_ref.to_string(),
-            snapshot_properties: BTreeMap::new(),
-        })
-        .await
-    })??;
-
-    crate::engine::iceberg_writer::invalidate_iceberg_caches(state, target)?;
-    crate::engine::dictionary::maintenance::mark_target_stale(state, target)?;
+        },
+    )?;
     Ok(StatementResult::Ok)
 }
 
@@ -1284,7 +1516,7 @@ pub(crate) fn execute_merge_statement(
                             catalog.clone(),
                             table_ident.clone(),
                             table_for_op,
-                            &matched,
+                            matched,
                             entry.clone(),
                             "main",
                         )?,
@@ -1294,7 +1526,7 @@ pub(crate) fn execute_merge_statement(
                             catalog.clone(),
                             table_ident.clone(),
                             table_for_op,
-                            &matched,
+                            matched,
                             entry.clone(),
                             "main",
                         )?,
@@ -1311,7 +1543,7 @@ pub(crate) fn execute_merge_statement(
                         catalog.clone(),
                         table_ident.clone(),
                         table_for_op,
-                        &matched,
+                        matched,
                         entry.clone(),
                     )?;
                     applied_change = true;
@@ -1735,53 +1967,39 @@ fn execute_merge_matched_delete(
     catalog: Arc<dyn Catalog>,
     table_ident: iceberg::TableIdent,
     table: iceberg::table::Table,
-    matched: &MatchedUpdateBatch,
+    matched: MatchedUpdateBatch,
     entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
 ) -> Result<StatementResult, String> {
-    let referenced_partitions =
-        crate::engine::delete_flow::load_referenced_data_file_partitions(&table)?;
-    let delete_groups = build_position_delete_groups_from_matched(matched, &referenced_partitions)?;
-
     let metadata = table.metadata();
+    let current_snapshot_id = metadata.current_snapshot().map(|s| s.snapshot_id());
     let staging_dir = format!(
         "{}/data/_staging/{}",
         metadata.location(),
         uuid::Uuid::new_v4()
     );
-    let file_io = table.file_io().clone();
     let collector = Arc::new(IcebergCommitCollector::new(
         CommitOpKind::RowDeltaDv,
         table_ident,
-        metadata.current_snapshot().map(|s| s.snapshot_id()),
+        current_snapshot_id,
         metadata.last_sequence_number(),
         metadata.current_schema().clone(),
         metadata.default_partition_spec().clone(),
         staging_dir,
         crate::common::types::UniqueId { hi: 0, lo: 0 },
     ));
-    for group in delete_groups {
-        collector.inject_delete_group(group);
-    }
-
-    let abort_cleanup =
-        crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
-    let _outcome = block_on_iceberg(async {
-        run_iceberg_commit(RunInput {
-            collector: collector.clone(),
-            catalog: catalog.clone(),
-            table,
-            fs: abort_cleanup.fs,
-            file_io,
-            cleanup_path_mapper: abort_cleanup.path_mapper,
-            cow_update_rewrite: None,
-            target_ref: "main".to_string(),
-            snapshot_properties: BTreeMap::new(),
-        })
-        .await
-    })??;
-
-    crate::engine::iceberg_writer::invalidate_iceberg_caches(state, target)?;
-    crate::engine::dictionary::maintenance::mark_target_stale(state, target)?;
+    run_mutation_write_transaction(
+        state,
+        target,
+        catalog,
+        table,
+        collector,
+        entry,
+        CommitOpKind::RowDeltaDv,
+        IcebergOperationKind::RowDelta,
+        current_snapshot_id,
+        "main",
+        MutationWritePlan::MergeMatchedDelete { matched },
+    )?;
     Ok(StatementResult::Ok)
 }
 
@@ -1794,56 +2012,36 @@ fn execute_merge_unmatched_insert(
     insert_batch: RecordBatch,
     entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
 ) -> Result<StatementResult, String> {
-    let data_files = block_on_iceberg(async {
-        crate::connector::iceberg::data_writer::write_record_batches_as_data_files(
-            &table,
-            std::iter::once(insert_batch),
-        )
-        .await
-    })??;
-
     let metadata = table.metadata();
+    let current_snapshot_id = metadata.current_snapshot().map(|s| s.snapshot_id());
     let staging_dir = format!(
         "{}/data/_staging/{}",
         metadata.location(),
         uuid::Uuid::new_v4()
     );
-    let file_io = table.file_io().clone();
     let collector = Arc::new(IcebergCommitCollector::new(
         CommitOpKind::FastAppend,
         table_ident,
-        metadata.current_snapshot().map(|s| s.snapshot_id()),
+        current_snapshot_id,
         metadata.last_sequence_number(),
         metadata.current_schema().clone(),
         metadata.default_partition_spec().clone(),
         staging_dir,
         crate::common::types::UniqueId { hi: 0, lo: 0 },
     ));
-    let default_spec_id = metadata.default_partition_spec_id();
-    for df in data_files {
-        let wf = crate::engine::iceberg_writer::data_file_to_written_file(&df, default_spec_id)?;
-        collector.inject_written_file(wf);
-    }
-
-    let abort_cleanup =
-        crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
-    let _outcome = block_on_iceberg(async {
-        run_iceberg_commit(RunInput {
-            collector: collector.clone(),
-            catalog: catalog.clone(),
-            table,
-            fs: abort_cleanup.fs,
-            file_io,
-            cleanup_path_mapper: abort_cleanup.path_mapper,
-            cow_update_rewrite: None,
-            target_ref: "main".to_string(),
-            snapshot_properties: BTreeMap::new(),
-        })
-        .await
-    })??;
-
-    crate::engine::iceberg_writer::invalidate_iceberg_caches(state, target)?;
-    crate::engine::dictionary::maintenance::mark_target_stale(state, target)?;
+    run_mutation_write_transaction(
+        state,
+        target,
+        catalog,
+        table,
+        collector,
+        entry,
+        CommitOpKind::FastAppend,
+        IcebergOperationKind::InsertAppend,
+        current_snapshot_id,
+        "main",
+        MutationWritePlan::MergeUnmatchedInsert { insert_batch },
+    )?;
     Ok(StatementResult::Ok)
 }
 

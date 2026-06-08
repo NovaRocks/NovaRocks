@@ -52,7 +52,7 @@ use super::data_file::clone_data_file_with_first_row_id;
 use super::fast_append::register_puffin_stats;
 use super::helpers::{
     effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms,
-    write_manifest_list,
+    required_target_ref_snapshot_id, snapshot_summary, target_ref_snapshot_id, write_manifest_list,
 };
 use super::overwrite::{
     write_added_data_manifest, write_overwrite_deletes_manifest, write_truncate_deletes_manifest,
@@ -107,11 +107,7 @@ impl IcebergCommitAction for OverwritePartitionsCommit {
         };
 
         let sketch_sets = ctx.collector.take_sketch_sets();
-        let prev_snapshot_id = ctx
-            .table
-            .metadata()
-            .current_snapshot()
-            .map(|s| s.snapshot_id());
+        let prev_snapshot_id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref);
 
         let tx = Transaction::new(ctx.table);
         let tx = action
@@ -121,11 +117,15 @@ impl IcebergCommitAction for OverwritePartitionsCommit {
             .commit(ctx.catalog)
             .await
             .map_err(|e| format!("OverwritePartitions commit failed: {e}"))?;
-        let new_snapshot_id = table_after
-            .metadata()
-            .current_snapshot()
-            .map(|s| s.snapshot_id())
-            .unwrap_or(0);
+        let new_snapshot_id = match required_target_ref_snapshot_id(
+            table_after.metadata(),
+            ctx.target_ref,
+            "OverwritePartitions",
+        ) {
+            Ok(snapshot_id) => snapshot_id,
+            Err(err) if prev_snapshot_id.is_none() => 0,
+            Err(err) => return Err(err),
+        };
         let new_sequence_number = table_after.metadata().last_sequence_number();
         register_puffin_stats(
             &table_after,
@@ -199,17 +199,7 @@ impl TransactionAction for OverwritePartitionsTxnAction {
         let new_seq = m.last_sequence_number() + 1;
         let new_snapshot_id = generate_snapshot_id();
         let target_ref = &self.target_ref;
-        let parent_snapshot_id = m
-            .refs()
-            .get(target_ref.as_str())
-            .map(|r| r.snapshot_id)
-            .or_else(|| {
-                if target_ref == "main" {
-                    m.current_snapshot().map(|s| s.snapshot_id())
-                } else {
-                    None
-                }
-            });
+        let parent_snapshot_id = target_ref_snapshot_id(m, target_ref);
         let metadata_dir = metadata_dir(table);
 
         // 1. Compute the set of touched partitions from written files.
@@ -236,9 +226,13 @@ impl TransactionAction for OverwritePartitionsTxnAction {
         //    • surviving files → new EXISTING manifest
         //    • touched files   → new DELETED manifest
         //    • new files       → new ADDED manifest
-        let existing = enumerate_live_all_files_with_spec(table, &self.file_io)
-            .await
-            .map_err(to_iceberg_unexpected)?;
+        let existing = enumerate_live_all_files_with_spec_at_snapshot(
+            table,
+            &self.file_io,
+            parent_snapshot_id,
+        )
+        .await
+        .map_err(to_iceberg_unexpected)?;
 
         // `(DataFile, seq, file_seq)` tuples split by fate.
         let mut deleted_data: Vec<(DataFile, i64, Option<i64>)> = Vec::new();
@@ -452,11 +446,13 @@ impl TransactionAction for OverwritePartitionsTxnAction {
         //    Row-range advances next_row_id by added_rows_count (even if zero
         //    when written is empty — the validator still requires a non-null
         //    first-row-id for V3).
+        let parent_summary =
+            snapshot_summary(m, parent_snapshot_id).map_err(to_iceberg_unexpected)?;
         let summary = Summary {
             operation: Operation::Overwrite,
             additional_properties: finalize_snapshot_summary(
                 overwrite_partitions_summary(&self.written, &deleted_data, &deleted_deletes),
-                m.current_snapshot().map(|s| s.summary()),
+                parent_summary,
                 false,
             ),
         };
@@ -622,11 +618,22 @@ async fn enumerate_live_all_files_with_spec(
     table: &Table,
     file_io: &FileIO,
 ) -> Result<Vec<LiveFileWithSpec>, String> {
+    let snapshot_id = table.metadata().current_snapshot().map(|s| s.snapshot_id());
+    enumerate_live_all_files_with_spec_at_snapshot(table, file_io, snapshot_id).await
+}
+
+async fn enumerate_live_all_files_with_spec_at_snapshot(
+    table: &Table,
+    file_io: &FileIO,
+    snapshot_id: Option<i64>,
+) -> Result<Vec<LiveFileWithSpec>, String> {
     let m = table.metadata();
-    let snap = match m.current_snapshot() {
-        Some(s) => s,
-        None => return Ok(Vec::new()),
+    let Some(snapshot_id) = snapshot_id else {
+        return Ok(Vec::new());
     };
+    let snap = m
+        .snapshot_by_id(snapshot_id)
+        .ok_or_else(|| format!("snapshot {snapshot_id} not found in table metadata"))?;
     let bytes = file_io
         .new_input(snap.manifest_list())
         .map_err(|e| format!("FileIO::new_input({}) failed: {e}", snap.manifest_list()))?

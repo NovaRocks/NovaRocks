@@ -40,7 +40,8 @@ use super::abort::AbortLog;
 use super::action::{CommitCtx, IcebergCommitAction};
 use super::fast_append::register_puffin_stats;
 use super::helpers::{
-    finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms, write_manifest_list,
+    finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms,
+    required_target_ref_snapshot_id, snapshot_summary, target_ref_snapshot_id, write_manifest_list,
 };
 use super::overwrite::{write_added_data_manifest, write_overwrite_deletes_manifest};
 use super::types::{CommitOutcome, WrittenFile};
@@ -81,12 +82,7 @@ impl IcebergCommitAction for CowUpdateCommit {
             && self.rewrite.touched_data_files.is_empty()
             && self.rewrite.updated_row_ids.is_empty()
         {
-            let id = ctx
-                .table
-                .metadata()
-                .current_snapshot()
-                .map(|s| s.snapshot_id())
-                .unwrap_or(0);
+            let id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref).unwrap_or(0);
             return Ok(CommitOutcome {
                 new_snapshot_id: id,
                 written_manifest_paths: vec![],
@@ -105,11 +101,7 @@ impl IcebergCommitAction for CowUpdateCommit {
         };
 
         let sketch_sets = ctx.collector.take_sketch_sets();
-        let prev_snapshot_id = ctx
-            .table
-            .metadata()
-            .current_snapshot()
-            .map(|s| s.snapshot_id());
+        let prev_snapshot_id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref);
 
         let tx = Transaction::new(ctx.table);
         let tx = action
@@ -119,11 +111,8 @@ impl IcebergCommitAction for CowUpdateCommit {
             .commit(ctx.catalog)
             .await
             .map_err(|e| format!("CowUpdate commit failed: {e}"))?;
-        let new_snapshot_id = table_after
-            .metadata()
-            .current_snapshot()
-            .map(|s| s.snapshot_id())
-            .ok_or_else(|| "CowUpdate committed but new snapshot is not visible".to_string())?;
+        let new_snapshot_id =
+            required_target_ref_snapshot_id(table_after.metadata(), ctx.target_ref, "CowUpdate")?;
         let new_sequence_number = table_after.metadata().last_sequence_number();
         // CowUpdate replaces touched data files with rewritten ones; the
         // un-touched files remain live. Treat as Append so the new NDV is
@@ -175,17 +164,7 @@ impl TransactionAction for CowUpdateTxnAction {
         let new_seq = m.last_sequence_number() + 1;
         let new_snapshot_id = generate_snapshot_id();
         let target_ref = &self.target_ref;
-        let parent_snapshot_id = m
-            .refs()
-            .get(target_ref.as_str())
-            .map(|r| r.snapshot_id)
-            .or_else(|| {
-                if target_ref == "main" {
-                    m.current_snapshot().map(|s| s.snapshot_id())
-                } else {
-                    None
-                }
-            });
+        let parent_snapshot_id = target_ref_snapshot_id(m, target_ref);
         let metadata_dir = metadata_dir(table);
         let row_lineage_first_row_id = m.next_row_id();
 
@@ -381,13 +360,11 @@ impl TransactionAction for CowUpdateTxnAction {
             "removed-files-size".to_string(),
             removed_files_size.to_string(),
         );
+        let parent_summary =
+            snapshot_summary(m, parent_snapshot_id).map_err(to_iceberg_unexpected)?;
         let summary = Summary {
             operation: Operation::Overwrite,
-            additional_properties: finalize_snapshot_summary(
-                summary_props,
-                m.current_snapshot().map(|s| s.summary()),
-                false,
-            ),
+            additional_properties: finalize_snapshot_summary(summary_props, parent_summary, false),
         };
         let snapshot = Snapshot::builder()
             .with_snapshot_id(new_snapshot_id)

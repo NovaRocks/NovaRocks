@@ -61,8 +61,9 @@ use super::abort::AbortLog;
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
 use super::fast_append::{carry_forward_puffin_stats, register_puffin_stats};
 use super::helpers::{
-    current_snapshot_total_records, effective_next_row_id, finalize_snapshot_summary,
-    generate_snapshot_id, metadata_dir, now_ms, write_manifest_list,
+    effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms,
+    required_target_ref_snapshot_id, snapshot_summary, snapshot_total_records,
+    target_ref_snapshot_id, write_manifest_list,
 };
 use super::position_delete_writer::PositionDeleteGroup;
 use super::puffin_dv::{
@@ -88,12 +89,7 @@ impl IcebergCommitAction for RowDeltaDvCommit {
             }
         }
         if groups.iter().all(|g| g.positions.is_empty()) && written.is_empty() {
-            let id = ctx
-                .table
-                .metadata()
-                .current_snapshot()
-                .map(|s| s.snapshot_id())
-                .unwrap_or(0);
+            let id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref).unwrap_or(0);
             return Ok(CommitOutcome {
                 new_snapshot_id: id,
                 written_manifest_paths: vec![],
@@ -116,11 +112,7 @@ impl IcebergCommitAction for RowDeltaDvCommit {
         };
 
         let sketch_sets = ctx.collector.take_sketch_sets();
-        let prev_snapshot_id = ctx
-            .table
-            .metadata()
-            .current_snapshot()
-            .map(|s| s.snapshot_id());
+        let prev_snapshot_id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref);
         let has_new_data_files = !sketch_sets.is_empty();
 
         let tx = Transaction::new(ctx.table);
@@ -131,11 +123,8 @@ impl IcebergCommitAction for RowDeltaDvCommit {
             .commit(ctx.catalog)
             .await
             .map_err(|e| format!("RowDeltaDv commit failed: {e}"))?;
-        let new_snapshot_id = table_after
-            .metadata()
-            .current_snapshot()
-            .map(|s| s.snapshot_id())
-            .ok_or_else(|| "RowDeltaDv committed but new snapshot is not visible".to_string())?;
+        let new_snapshot_id =
+            required_target_ref_snapshot_id(table_after.metadata(), ctx.target_ref, "RowDeltaDv")?;
         let new_sequence_number = table_after.metadata().last_sequence_number();
         // MOR UPDATE writes new data files alongside the DV; treat as Append
         // so the new NDV reflects both the carried-forward sketches and the
@@ -201,17 +190,7 @@ impl TransactionAction for RowDeltaDvTxnAction {
         let new_seq = m.last_sequence_number() + 1;
         let new_snapshot_id = generate_snapshot_id();
         let target_ref = &self.target_ref;
-        let parent_snapshot_id = m
-            .refs()
-            .get(target_ref.as_str())
-            .map(|r| r.snapshot_id)
-            .or_else(|| {
-                if target_ref == "main" {
-                    m.current_snapshot().map(|s| s.snapshot_id())
-                } else {
-                    None
-                }
-            });
+        let parent_snapshot_id = target_ref_snapshot_id(m, target_ref);
         let metadata_dir = metadata_dir(table);
 
         let mut vectors = groups_to_vectors(&self.groups).map_err(to_iceberg_unexpected)?;
@@ -387,7 +366,7 @@ impl TransactionAction for RowDeltaDvTxnAction {
             })
         })?;
         let total_records = dv_total_records(
-            current_snapshot_total_records(m).map_err(to_iceberg_unexpected)?,
+            snapshot_total_records(m, parent_snapshot_id).map_err(to_iceberg_unexpected)?,
             newly_deleted_records,
             added_data_records,
         )
@@ -407,8 +386,10 @@ impl TransactionAction for RowDeltaDvTxnAction {
                 index.replaced_delete_files_size.to_string(),
             );
         }
+        let parent_summary =
+            snapshot_summary(m, parent_snapshot_id).map_err(to_iceberg_unexpected)?;
         let summary_props = merge_snapshot_summary_properties(
-            finalize_snapshot_summary(dv_props, m.current_snapshot().map(|s| s.summary()), false),
+            finalize_snapshot_summary(dv_props, parent_summary, false),
             &self.snapshot_properties,
         )
         .map_err(to_iceberg_unexpected)?;

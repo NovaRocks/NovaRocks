@@ -108,12 +108,11 @@ pub(crate) fn run_insert(
         ));
     }
 
-    // Iceberg + (OVERWRITE or FromQuery or branch-qualified) routes through the new
-    // commit-action pipeline (execute_iceberg_insert_or_overwrite). Iceberg + literal-row
-    // INSERT INTO without a branch target continues to use the existing fast-append path
-    // via sink.append_rows for backwards compatibility.
-    let needs_iceberg_pipeline = target.backend_name == "iceberg"
-        && (is_overwrite || matches!(source, InsertSource::FromQuery(_)) || target_ref != "main");
+    // Iceberg user writes route through the write-transaction runner. Keep
+    // UNION ALL split here so each part is validated and recorded as its own
+    // operation, preserving the existing recursive behavior.
+    let needs_iceberg_pipeline =
+        target.backend_name == "iceberg" && !matches!(source, InsertSource::UnionAll(_));
     if needs_iceberg_pipeline {
         return crate::engine::iceberg_writer::execute_iceberg_insert_or_overwrite(
             state,

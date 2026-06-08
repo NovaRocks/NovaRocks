@@ -17,16 +17,15 @@
 
 //! Standalone-mode iceberg INSERT INTO / INSERT OVERWRITE entry point.
 //!
-//! Routes from `insert_flow::run_insert` for any iceberg target whose source
-//! is `FromQuery`, plus all iceberg targets when `overwrite = true`.
+//! Routes from `insert_flow::run_insert` for iceberg targets whose source is
+//! handled as one transaction. `UnionAll` remains split by `insert_flow` so
+//! each part gets its own operation record.
 //!
 //! Phase 1 scope (per spec §0.4):
 //! * `INSERT INTO iceberg ... SELECT ...` — handled here.
 //! * `INSERT OVERWRITE iceberg ... SELECT ...` — handled here.
-//! * `INSERT INTO iceberg VALUES (...)` — keeps using the existing fast-append
-//!   helper at `connector::iceberg::catalog::registry::insert_rows`.
-//! * `INSERT OVERWRITE iceberg VALUES (...)` — rejected with a clear error;
-//!   future Phase 1.x can lift this if the use case arises.
+//! * `INSERT INTO iceberg VALUES (...)` — handled here.
+//! * `INSERT OVERWRITE iceberg VALUES (...)` — handled here.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -39,16 +38,24 @@ use iceberg::{NamespaceIdent, TableIdent};
 use crate::connector::backend::ResolvedTable;
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
 use crate::connector::iceberg::commit::{
-    CleanupPathMapper, CommitOpKind, IcebergCommitCollector, RunInput, WrittenFile,
-    ensure_iceberg_write_supported, ensure_no_equality_deletes,
+    CleanupPathMapper, CommitOpKind, CommitOutcome, CommitServiceError, IcebergCommitCollector,
+    WrittenFile, ensure_iceberg_write_supported, ensure_no_equality_deletes,
     ensure_no_variant_columns_for_row_level_mutation, ensure_overwrite_single_partition_spec,
-    run_iceberg_commit,
 };
 use crate::connector::iceberg::data_writer::write_record_batches_as_data_files;
 use crate::connector::starrocks::table::mv_refresh::query_result_to_chunks;
 use crate::engine::backend_resolver::TargetBackend;
+use crate::engine::write_transaction::{
+    IcebergWriteCommitExecutor, IcebergWriteCommitPolicy, IcebergWriteSource,
+    IcebergWriteTransactionExecutor, IcebergWriteTransactionRunner, IcebergWriteTransactionSpec,
+    IcebergWriteValidationPolicy, synthetic_write_commit_input,
+};
 use crate::engine::{StandaloneState, StatementResult};
 use crate::exec::chunk::Chunk;
+use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOperationTarget};
+use crate::runtime::coordinator::CoordinatedQueryResult;
+use crate::runtime::query_result::QueryResult;
+use crate::runtime::write_coordinator::WriteCommitInput;
 use crate::sql::parser::ast::InsertSource;
 
 pub(crate) fn execute_iceberg_insert_or_overwrite(
@@ -164,47 +171,173 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
         align_chunks_to_target_schema(chunks, insert_columns, &resolved.columns)?
     };
 
-    // 4. Write data files. Empty input → no-op for INSERT INTO; for OVERWRITE
-    //    an empty SELECT means "clear the table" so we still go through
-    //    OverwriteCommit which handles the empty-written + non-empty-base case.
-    let data_files: Vec<DataFile> = if chunks.iter().all(|c| c.batch.num_rows() == 0) {
-        Vec::new()
-    } else {
-        let write_table = table.clone();
-        let write_chunks = chunks.clone();
-        run_data_file_write_phase_on_sink_io(write_chunks_as_iceberg_data_files_owned(
-            write_table,
-            write_chunks,
-        ))?
-    };
-
-    // 5. Build the collector and inject every written file.
+    // 4. Build the collector. The runner creates the operation record before
+    //    the executor writes data files, then the executor injects files into
+    //    this collector before commit.
     let metadata = table.metadata();
+    let commit_op_kind = commit_op_kind_for_overwrite_mode(overwrite_mode);
+    let base_snapshot_id = write_base_snapshot_id(metadata, target_ref)?;
+    let base_sequence_number = metadata.last_sequence_number();
+    let current_schema = metadata.current_schema().clone();
+    let default_partition_spec = metadata.default_partition_spec().clone();
+    let default_spec_id = metadata.default_partition_spec_id();
     let staging_dir = format!(
         "{}/data/_staging/{}",
         metadata.location(),
         uuid::Uuid::new_v4()
     );
     let collector = Arc::new(IcebergCommitCollector::new(
-        match overwrite_mode {
-            OverwriteMode::DynamicPartitions => CommitOpKind::OverwritePartitions,
-            OverwriteMode::FullTable => CommitOpKind::Overwrite,
-            OverwriteMode::None => CommitOpKind::FastAppend,
-        },
-        table_ident,
-        metadata.current_snapshot().map(|s| s.snapshot_id()),
-        metadata.last_sequence_number(),
-        metadata.current_schema().clone(),
-        metadata.default_partition_spec().clone(),
+        commit_op_kind,
+        table_ident.clone(),
+        base_snapshot_id,
+        base_sequence_number,
+        current_schema,
+        default_partition_spec,
         staging_dir,
         crate::common::types::UniqueId { hi: 0, lo: 0 },
     ));
-    let default_spec_id = metadata.default_partition_spec_id();
-    for df in data_files {
-        let wf = data_file_to_written_file(&df, default_spec_id)?;
-        collector.inject_written_file(wf);
+
+    // 5. Build the OpenDAL Operator and transaction runner.
+    let abort_cleanup = build_abort_cleanup_for_catalog_entry(&entry)?;
+    let commit_executor = IcebergWriteCommitExecutor {
+        state: Arc::clone(state),
+        target: target.clone(),
+        catalog: Arc::clone(&catalog),
+        table: table.clone(),
+        collector: Arc::clone(&collector),
+        fs: abort_cleanup.fs,
+        cleanup_path_mapper: abort_cleanup.path_mapper,
+        cow_update_rewrite: None,
+        target_ref: target_ref.to_string(),
+        snapshot_properties: BTreeMap::new(),
+    };
+    let executor = InsertOrOverwriteWriteExecutor {
+        commit_executor,
+        table,
+        chunks,
+        collector,
+        default_spec_id,
+        should_commit_empty_input: !matches!(overwrite_mode, OverwriteMode::None),
+    };
+    let spec = IcebergWriteTransactionSpec {
+        target: IcebergOperationTarget {
+            catalog: target.catalog.clone(),
+            namespace: target.namespace.clone(),
+            table: target.table.clone(),
+            ref_name: (target_ref != "main").then(|| target_ref.to_string()),
+        },
+        operation_kind: operation_kind_for_commit_op_kind(commit_op_kind),
+        attempt_id: format!("{}:{}", target_string(target), uuid::Uuid::new_v4()),
+        commit: IcebergWriteCommitPolicy {
+            commit_op_kind,
+            base_snapshot_id,
+            base_snapshot_map: BTreeMap::new(),
+            target_ref: target_ref.to_string(),
+            snapshot_properties: BTreeMap::new(),
+        },
+        validation: IcebergWriteValidationPolicy {
+            require_v3_for_branch: target_ref != "main",
+        },
+        source: IcebergWriteSource::CoordinatedPlan,
+    };
+    let runner = IcebergWriteTransactionRunner::new(Arc::clone(state), &executor);
+    let _outcome = runner.run(spec)?;
+
+    Ok(StatementResult::Ok)
+}
+
+struct InsertOrOverwriteWriteExecutor {
+    commit_executor: IcebergWriteCommitExecutor,
+    table: iceberg::table::Table,
+    chunks: Vec<Chunk>,
+    collector: Arc<IcebergCommitCollector>,
+    default_spec_id: i32,
+    should_commit_empty_input: bool,
+}
+
+impl IcebergWriteTransactionExecutor for InsertOrOverwriteWriteExecutor {
+    fn run_coordinated_write(
+        &self,
+        _spec: &IcebergWriteTransactionSpec,
+    ) -> Result<CoordinatedQueryResult, String> {
+        let has_rows = self.chunks.iter().any(|c| c.batch.num_rows() > 0);
+        if !has_rows && !self.should_commit_empty_input {
+            return Ok(CoordinatedQueryResult {
+                query_result: QueryResult::empty(),
+                write_commit: None,
+                write_abort: None,
+            });
+        }
+
+        if has_rows {
+            let write_table = self.table.clone();
+            let write_chunks = self.chunks.clone();
+            let data_files = run_data_file_write_phase_on_sink_io(
+                write_chunks_as_iceberg_data_files_owned(write_table, write_chunks),
+            )?;
+            for df in data_files {
+                let wf = data_file_to_written_file(&df, self.default_spec_id)?;
+                self.collector.inject_written_file(wf);
+            }
+            inject_theta_sketches(&self.collector, &self.chunks);
+        }
+
+        Ok(CoordinatedQueryResult {
+            query_result: QueryResult::empty(),
+            write_commit: Some(synthetic_write_commit_input()),
+            write_abort: None,
+        })
     }
 
+    fn commit(
+        &self,
+        _spec: &IcebergWriteTransactionSpec,
+        write_commit: &WriteCommitInput,
+    ) -> Result<CommitOutcome, CommitServiceError> {
+        self.commit_executor.commit_write_input(write_commit)
+    }
+
+    fn finalize(&self, _spec: &IcebergWriteTransactionSpec) -> Result<(), String> {
+        self.commit_executor.finalize()
+    }
+}
+
+fn commit_op_kind_for_overwrite_mode(
+    overwrite_mode: crate::sql::parser::ast::OverwriteMode,
+) -> CommitOpKind {
+    use crate::sql::parser::ast::OverwriteMode;
+    match overwrite_mode {
+        OverwriteMode::DynamicPartitions => CommitOpKind::OverwritePartitions,
+        OverwriteMode::FullTable => CommitOpKind::Overwrite,
+        OverwriteMode::None => CommitOpKind::FastAppend,
+    }
+}
+
+fn operation_kind_for_commit_op_kind(kind: CommitOpKind) -> IcebergOperationKind {
+    match kind {
+        CommitOpKind::FastAppend => IcebergOperationKind::InsertAppend,
+        CommitOpKind::Overwrite | CommitOpKind::OverwritePartitions => {
+            IcebergOperationKind::InsertOverwrite
+        }
+        _ => IcebergOperationKind::Maintenance,
+    }
+}
+
+fn write_base_snapshot_id(
+    metadata: &iceberg::spec::TableMetadata,
+    target_ref: &str,
+) -> Result<Option<i64>, String> {
+    if target_ref == "main" {
+        return Ok(metadata.current_snapshot().map(|s| s.snapshot_id()));
+    }
+    metadata
+        .refs()
+        .get(target_ref)
+        .map(|snapshot_ref| Some(snapshot_ref.snapshot_id))
+        .ok_or_else(|| format!("iceberg ref: branch '{target_ref}' not found in table metadata"))
+}
+
+fn inject_theta_sketches(collector: &IcebergCommitCollector, chunks: &[Chunk]) {
     // Compute Theta sketches from the source chunks and push them through the
     // collector so the commit action can register Puffin NDV statistics. We
     // emit one sketch set per chunk; StatsAssembler unions sketches across
@@ -225,33 +358,6 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
             );
         }
     }
-
-    // 6. Build the OpenDAL Operator + FileIO.
-    let abort_cleanup = build_abort_cleanup_for_catalog_entry(&entry)?;
-    let file_io = table.file_io().clone();
-
-    // 7. Drive commit + abort cleanup on failure.
-    let _outcome = block_on_iceberg(async {
-        run_iceberg_commit(RunInput {
-            collector: collector.clone(),
-            catalog: catalog.clone(),
-            table,
-            fs: abort_cleanup.fs,
-            file_io,
-            cleanup_path_mapper: abort_cleanup.path_mapper,
-            cow_update_rewrite: None,
-            target_ref: target_ref.to_string(),
-            snapshot_properties: BTreeMap::new(),
-        })
-        .await
-    })??;
-
-    // 8. Invalidate the iceberg entry and CatalogMgr table caches so
-    //    subsequent SELECTs see the new snapshot.
-    invalidate_iceberg_caches(state, target)?;
-    crate::engine::dictionary::maintenance::mark_target_stale(state, target)?;
-
-    Ok(StatementResult::Ok)
 }
 
 pub(crate) fn invalidate_iceberg_caches(

@@ -205,11 +205,59 @@ impl IcebergCommitCollector {
     /// directly (no IcebergSink in the loop). Each path is recorded in the
     /// [`AbortLog`] so abort cleanup still works.
     pub fn inject_written_file(&self, wf: WrittenFile) {
-        self.abort_log.record_data_file(wf.path.clone());
-        self.injected
+        self.inject_written_files(vec![wf]);
+    }
+
+    /// Pre-load written files into the collector after they have all been
+    /// validated. Each path is recorded in the [`AbortLog`] so abort cleanup
+    /// still works.
+    pub(crate) fn inject_written_files(&self, files: Vec<WrittenFile>) {
+        let mut guard = self
+            .injected
             .lock()
-            .expect("collector injected lock poisoned")
-            .push(wf);
+            .expect("collector injected lock poisoned");
+        for wf in files {
+            self.abort_log.record_data_file(wf.path.clone());
+            guard.push(wf);
+        }
+    }
+
+    /// Convert one writer-reported sink commit payload without mutating the
+    /// collector. This lets callers validate all writer payloads before any file
+    /// becomes visible to the commit-action or abort log.
+    pub(crate) fn convert_sink_commit_info(
+        &self,
+        info: crate::types::TSinkCommitInfo,
+    ) -> Result<WrittenFile, String> {
+        let df = info
+            .iceberg_data_file
+            .ok_or_else(|| "sink_commit_info missing iceberg_data_file".to_string())?;
+        self.convert(df)
+    }
+
+    /// Pre-load one writer-reported sink commit payload without consulting the
+    /// process-global `runtime::sink_commit` table. Used by coordinated writes
+    /// where the engine already collected all writer reports.
+    pub(crate) fn inject_sink_commit_info(
+        &self,
+        info: crate::types::TSinkCommitInfo,
+    ) -> Result<(), String> {
+        self.inject_sink_commit_infos([info])
+    }
+
+    /// Pre-load a batch of writer-reported sink commit payloads atomically:
+    /// either every payload converts and becomes visible, or the collector and
+    /// abort log remain unchanged.
+    pub(crate) fn inject_sink_commit_infos<I>(&self, infos: I) -> Result<(), String>
+    where
+        I: IntoIterator<Item = crate::types::TSinkCommitInfo>,
+    {
+        let files = infos
+            .into_iter()
+            .map(|info| self.convert_sink_commit_info(info))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.inject_written_files(files);
+        Ok(())
     }
 
     /// Returns the [`WrittenFile`] set produced by this query.
@@ -558,6 +606,112 @@ mod parity_tests {
         let actual = collector.convert(thrift).expect("convert");
 
         assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn inject_sink_commit_info_converts_and_drains_written_file() {
+        let mut b = DataFileBuilder::default();
+        b.content(DataContentType::Data)
+            .file_path("file:///t/data-from-sink.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .record_count(7)
+            .file_size_in_bytes(128);
+        let df = b.build().expect("data file");
+
+        let thrift = crate::connector::iceberg::data_writer::data_file_to_iceberg_thrift(
+            &df,
+            String::new(),
+            String::new(),
+            "PARQUET".to_string(),
+            crate::types::TIcebergFileContent::DATA,
+        )
+        .expect("thrift");
+
+        let collector = unpartitioned_collector(int_schema());
+        collector
+            .inject_sink_commit_info(crate::types::TSinkCommitInfo {
+                iceberg_data_file: Some(thrift),
+                ..Default::default()
+            })
+            .expect("inject sink commit info");
+
+        let files = collector.take_written_files().expect("take written files");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "file:///t/data-from-sink.parquet");
+        assert_eq!(files[0].record_count, 7);
+        assert!(
+            collector
+                .take_written_files()
+                .expect("second take")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn inject_sink_commit_info_rejects_missing_data_file() {
+        let collector = unpartitioned_collector(int_schema());
+        let err = collector
+            .inject_sink_commit_info(crate::types::TSinkCommitInfo {
+                iceberg_data_file: None,
+                ..Default::default()
+            })
+            .expect_err("missing data file should fail");
+        assert!(
+            err.contains("sink_commit_info missing iceberg_data_file"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn inject_sink_commit_infos_is_all_or_nothing() {
+        let mut b = DataFileBuilder::default();
+        b.content(DataContentType::Data)
+            .file_path("file:///t/atomic-data.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .record_count(7)
+            .file_size_in_bytes(128);
+        let df = b.build().expect("data file");
+        let thrift = crate::connector::iceberg::data_writer::data_file_to_iceberg_thrift(
+            &df,
+            String::new(),
+            String::new(),
+            "PARQUET".to_string(),
+            crate::types::TIcebergFileContent::DATA,
+        )
+        .expect("thrift");
+
+        let collector = unpartitioned_collector(int_schema());
+        let err = collector
+            .inject_sink_commit_infos([
+                crate::types::TSinkCommitInfo {
+                    iceberg_data_file: Some(thrift),
+                    ..Default::default()
+                },
+                crate::types::TSinkCommitInfo {
+                    iceberg_data_file: None,
+                    ..Default::default()
+                },
+            ])
+            .expect_err("batch with invalid sink payload must fail");
+        assert!(
+            err.contains("sink_commit_info missing iceberg_data_file"),
+            "got: {err}"
+        );
+        assert!(
+            collector
+                .take_written_files()
+                .expect("take written files")
+                .is_empty(),
+            "failed batch must not inject partially converted files"
+        );
+        assert!(
+            collector.abort_log.drain_data_files().is_empty(),
+            "failed batch must not partially populate abort log"
+        );
     }
 
     #[test]

@@ -56,7 +56,7 @@ use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_prope
 use super::fast_append::register_puffin_stats;
 use super::helpers::{
     effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms,
-    write_manifest_list,
+    required_target_ref_snapshot_id, snapshot_summary, target_ref_snapshot_id, write_manifest_list,
 };
 use super::types::{CommitOutcome, IcebergWriteMode, WrittenFile};
 use crate::connector::iceberg::stats_assembler::CommitType;
@@ -103,11 +103,7 @@ impl IcebergCommitAction for OverwriteCommit {
         };
 
         let sketch_sets = ctx.collector.take_sketch_sets();
-        let prev_snapshot_id = ctx
-            .table
-            .metadata()
-            .current_snapshot()
-            .map(|s| s.snapshot_id());
+        let prev_snapshot_id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref);
 
         let tx = Transaction::new(ctx.table);
         let tx = action
@@ -117,14 +113,15 @@ impl IcebergCommitAction for OverwriteCommit {
             .commit(ctx.catalog)
             .await
             .map_err(|e| format!("Overwrite commit failed: {e}"))?;
-        let new_snapshot_id = table_after
-            .metadata()
-            .current_snapshot()
-            .map(|s| s.snapshot_id())
-            // No-op overwrite (empty written + empty base) returns the
-            // pre-existing snapshot id, which may also be None if the table
-            // was empty to begin with. Treat that as snapshot_id = 0.
-            .unwrap_or(0);
+        let new_snapshot_id = match required_target_ref_snapshot_id(
+            table_after.metadata(),
+            ctx.target_ref,
+            "Overwrite",
+        ) {
+            Ok(snapshot_id) => snapshot_id,
+            Err(err) if prev_snapshot_id.is_none() => 0,
+            Err(err) => return Err(err),
+        };
         let new_sequence_number = table_after.metadata().last_sequence_number();
         register_puffin_stats(
             &table_after,
@@ -170,23 +167,14 @@ impl TransactionAction for OverwriteTxnAction {
         let new_seq = m.last_sequence_number() + 1;
         let new_snapshot_id = generate_snapshot_id();
         let target_ref = &self.target_ref;
-        let parent_snapshot_id = m
-            .refs()
-            .get(target_ref.as_str())
-            .map(|r| r.snapshot_id)
-            .or_else(|| {
-                if target_ref == "main" {
-                    m.current_snapshot().map(|s| s.snapshot_id())
-                } else {
-                    None
-                }
-            });
+        let parent_snapshot_id = target_ref_snapshot_id(m, target_ref);
         let metadata_dir = metadata_dir(table);
 
         // 1. Enumerate live data files in the base snapshot.
-        let existing = enumerate_live_data_files(table, &self.file_io)
-            .await
-            .map_err(to_iceberg_unexpected)?;
+        let existing =
+            enumerate_live_data_files_at_snapshot(table, &self.file_io, parent_snapshot_id)
+                .await
+                .map_err(to_iceberg_unexpected)?;
 
         // No-op short circuit: empty input + empty base table → return existing
         // updates/requirements set as a degenerate ActionCommit. iceberg-rust's
@@ -196,10 +184,12 @@ impl TransactionAction for OverwriteTxnAction {
             return Ok(ActionCommit::new(vec![], vec![]));
         }
 
+        let parent_summary =
+            snapshot_summary(m, parent_snapshot_id).map_err(to_iceberg_unexpected)?;
         let additional_properties = merge_snapshot_summary_properties(
             finalize_snapshot_summary(
                 overwrite_summary(&self.written, &existing),
-                m.current_snapshot().map(|s| s.summary()),
+                parent_summary,
                 false,
             ),
             &self.snapshot_properties,
@@ -367,7 +357,19 @@ pub(super) async fn enumerate_live_data_files(
     table: &Table,
     file_io: &FileIO,
 ) -> Result<Vec<(DataFile, i64, Option<i64>)>, String> {
-    enumerate_live_files_filtered(table, file_io, |entry| {
+    let snapshot_id = table.metadata().current_snapshot().map(|s| s.snapshot_id());
+    enumerate_live_files_filtered_at_snapshot(table, file_io, snapshot_id, |entry| {
+        entry.content == ManifestContentType::Data
+    })
+    .await
+}
+
+async fn enumerate_live_data_files_at_snapshot(
+    table: &Table,
+    file_io: &FileIO,
+    snapshot_id: Option<i64>,
+) -> Result<Vec<(DataFile, i64, Option<i64>)>, String> {
+    enumerate_live_files_filtered_at_snapshot(table, file_io, snapshot_id, |entry| {
         entry.content == ManifestContentType::Data
     })
     .await
@@ -386,26 +388,30 @@ pub(super) async fn enumerate_live_all_files(
     table: &Table,
     file_io: &FileIO,
 ) -> Result<Vec<(DataFile, i64, Option<i64>)>, String> {
-    enumerate_live_files_filtered(table, file_io, |_entry| true).await
+    let snapshot_id = table.metadata().current_snapshot().map(|s| s.snapshot_id());
+    enumerate_live_files_filtered_at_snapshot(table, file_io, snapshot_id, |_entry| true).await
 }
 
 /// Shared body for `enumerate_live_data_files` and `enumerate_live_all_files`.
 /// Walks the base snapshot's manifest list, applying `manifest_filter` to
 /// each manifest entry — only manifests for which the filter returns `true`
 /// are loaded and inspected.
-async fn enumerate_live_files_filtered<F>(
+async fn enumerate_live_files_filtered_at_snapshot<F>(
     table: &Table,
     file_io: &FileIO,
+    snapshot_id: Option<i64>,
     manifest_filter: F,
 ) -> Result<Vec<(DataFile, i64, Option<i64>)>, String>
 where
     F: Fn(&ManifestFile) -> bool,
 {
     let m = table.metadata();
-    let snap = match m.current_snapshot() {
-        Some(s) => s,
-        None => return Ok(Vec::new()),
+    let Some(snapshot_id) = snapshot_id else {
+        return Ok(Vec::new());
     };
+    let snap = m
+        .snapshot_by_id(snapshot_id)
+        .ok_or_else(|| format!("snapshot {snapshot_id} not found in table metadata"))?;
     let bytes = file_io
         .new_input(snap.manifest_list())
         .map_err(|e| format!("FileIO::new_input({}) failed: {e}", snap.manifest_list()))?

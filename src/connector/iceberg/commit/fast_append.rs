@@ -37,8 +37,9 @@ use uuid::Uuid;
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
 use super::data_file::written_file_to_iceberg_data_file;
 use super::helpers::{
-    current_snapshot_total_records, effective_next_row_id, finalize_snapshot_summary,
-    generate_snapshot_id, metadata_dir, now_ms, read_base_manifest_list, write_manifest_list,
+    effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms,
+    read_snapshot_manifest_list, required_target_ref_snapshot_id, snapshot_summary,
+    snapshot_total_records, target_ref_snapshot_id, write_manifest_list,
 };
 use super::overwrite::write_added_data_manifest;
 use super::types::{CommitOutcome, IcebergWriteMode, WrittenFile};
@@ -54,12 +55,7 @@ impl IcebergCommitAction for FastAppendCommit {
         // Spec §4.1: empty input is a no-op — return the existing snapshot id
         // (or 0 for an empty table) and skip the catalog round-trip.
         if written.is_empty() {
-            let id = ctx
-                .table
-                .metadata()
-                .current_snapshot()
-                .map(|s| s.snapshot_id())
-                .unwrap_or(0);
+            let id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref).unwrap_or(0);
             return Ok(CommitOutcome {
                 new_snapshot_id: id,
                 written_manifest_paths: vec![],
@@ -97,11 +93,7 @@ impl IcebergCommitAction for FastAppendCommit {
             .collect::<Result<Vec<_>, _>>()?;
 
         let sketch_sets = ctx.collector.take_sketch_sets();
-        let prev_snapshot_id = ctx
-            .table
-            .metadata()
-            .current_snapshot()
-            .map(|s| s.snapshot_id());
+        let prev_snapshot_id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref);
 
         let tx = Transaction::new(ctx.table);
         let action = tx
@@ -293,11 +285,8 @@ async fn commit_v3_row_lineage_append(
         .commit(ctx.catalog)
         .await
         .map_err(|e| format!("fast_append v3 commit failed: {e}"))?;
-    let new_snapshot_id = table_after
-        .metadata()
-        .current_snapshot()
-        .map(|s| s.snapshot_id())
-        .ok_or_else(|| "fast_append v3 committed but new snapshot not visible".to_string())?;
+    let new_snapshot_id =
+        required_target_ref_snapshot_id(table_after.metadata(), ctx.target_ref, "fast_append v3")?;
     let new_sequence_number = table_after.metadata().last_sequence_number();
     register_puffin_stats(
         &table_after,
@@ -342,27 +331,19 @@ impl TransactionAction for FastAppendV3TxnAction {
         let new_seq = m.last_sequence_number() + 1;
         let new_snapshot_id = generate_snapshot_id();
         let target_ref = &self.target_ref;
-        let parent_snapshot_id = m
-            .refs()
-            .get(target_ref.as_str())
-            .map(|r| r.snapshot_id)
-            .or_else(|| {
-                if target_ref == "main" {
-                    m.current_snapshot().map(|s| s.snapshot_id())
-                } else {
-                    None
-                }
-            });
+        let parent_snapshot_id = target_ref_snapshot_id(m, target_ref);
         let total_records = append_total_records(
             &self.written,
-            current_snapshot_total_records(m).map_err(to_iceberg_unexpected)?,
+            snapshot_total_records(m, parent_snapshot_id).map_err(to_iceberg_unexpected)?,
             parent_snapshot_id.is_some(),
         )
         .map_err(to_iceberg_unexpected)?;
+        let parent_summary =
+            snapshot_summary(m, parent_snapshot_id).map_err(to_iceberg_unexpected)?;
         let additional_properties = merge_snapshot_summary_properties(
             finalize_snapshot_summary(
                 append_summary(&self.written, total_records),
-                m.current_snapshot().map(|s| s.summary()),
+                parent_summary,
                 false,
             ),
             &self.snapshot_properties,
@@ -374,9 +355,10 @@ impl TransactionAction for FastAppendV3TxnAction {
         };
         let metadata_dir = metadata_dir(table);
 
-        let mut manifests: Vec<ManifestFile> = read_base_manifest_list(table, &self.file_io)
-            .await
-            .map_err(to_iceberg_unexpected)?;
+        let mut manifests: Vec<ManifestFile> =
+            read_snapshot_manifest_list(m, &self.file_io, parent_snapshot_id)
+                .await
+                .map_err(to_iceberg_unexpected)?;
 
         let data_manifest_path = format!("{metadata_dir}/{}-append-data-0.avro", self.commit_uuid);
         self.abort_handle

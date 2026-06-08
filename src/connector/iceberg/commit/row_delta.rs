@@ -53,7 +53,8 @@ use super::action::{CommitCtx, IcebergCommitAction};
 use super::fast_append::carry_forward_puffin_stats;
 use super::helpers::{
     effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms,
-    read_base_manifest_list, write_manifest_list,
+    read_snapshot_manifest_list, required_target_ref_snapshot_id, snapshot_summary,
+    target_ref_snapshot_id, write_manifest_list,
 };
 use super::types::{CommitOutcome, WrittenFile};
 
@@ -66,12 +67,7 @@ impl IcebergCommitAction for RowDeltaCommit {
 
         // Spec §4.1: empty input → no-op.
         if written.is_empty() {
-            let id = ctx
-                .table
-                .metadata()
-                .current_snapshot()
-                .map(|s| s.snapshot_id())
-                .unwrap_or(0);
+            let id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref).unwrap_or(0);
             return Ok(CommitOutcome {
                 new_snapshot_id: id,
                 written_manifest_paths: vec![],
@@ -107,11 +103,7 @@ impl IcebergCommitAction for RowDeltaCommit {
             target_ref: ctx.target_ref.to_string(),
         };
 
-        let prev_snapshot_id = ctx
-            .table
-            .metadata()
-            .current_snapshot()
-            .map(|s| s.snapshot_id());
+        let prev_snapshot_id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref);
 
         let tx = Transaction::new(ctx.table);
         let tx = action
@@ -121,11 +113,8 @@ impl IcebergCommitAction for RowDeltaCommit {
             .commit(ctx.catalog)
             .await
             .map_err(|e| format!("RowDelta commit failed: {e}"))?;
-        let new_snapshot_id = table_after
-            .metadata()
-            .current_snapshot()
-            .map(|s| s.snapshot_id())
-            .ok_or_else(|| "RowDelta committed but new snapshot is not visible".to_string())?;
+        let new_snapshot_id =
+            required_target_ref_snapshot_id(table_after.metadata(), ctx.target_ref, "RowDelta")?;
         // DELETE preserves NDV upper-bound semantics — carry forward the
         // previous snapshot's Puffin entry to the new snapshot id.
         if let Some(prev) = prev_snapshot_id {
@@ -163,17 +152,7 @@ impl TransactionAction for RowDeltaTxnAction {
         let new_seq = m.last_sequence_number() + 1;
         let new_snapshot_id = generate_snapshot_id();
         let target_ref = &self.target_ref;
-        let parent_snapshot_id = m
-            .refs()
-            .get(target_ref.as_str())
-            .map(|r| r.snapshot_id)
-            .or_else(|| {
-                if target_ref == "main" {
-                    m.current_snapshot().map(|s| s.snapshot_id())
-                } else {
-                    None
-                }
-            });
+        let parent_snapshot_id = target_ref_snapshot_id(m, target_ref);
         let metadata_dir = metadata_dir(table);
 
         // 1. Write one new delete manifest per referenced partition spec.
@@ -213,7 +192,7 @@ impl TransactionAction for RowDeltaTxnAction {
         }
 
         // 2. Inherit every entry from the base manifest list.
-        let mut entries = read_base_manifest_list(table, &self.file_io)
+        let mut entries = read_snapshot_manifest_list(m, &self.file_io, parent_snapshot_id)
             .await
             .map_err(to_iceberg_unexpected)?;
         entries.extend(new_delete_manifests);
@@ -248,11 +227,13 @@ impl TransactionAction for RowDeltaTxnAction {
         .map_err(to_iceberg_unexpected)?;
 
         // 4. Construct the new Snapshot.
+        let parent_summary =
+            snapshot_summary(m, parent_snapshot_id).map_err(to_iceberg_unexpected)?;
         let snapshot_summary = Summary {
             operation: Operation::Delete,
             additional_properties: finalize_snapshot_summary(
                 row_delta_summary(&self.written),
-                m.current_snapshot().map(|s| s.summary()),
+                parent_summary,
                 false,
             ),
         };

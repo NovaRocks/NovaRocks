@@ -42,9 +42,9 @@ use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 
 /// Result of a coordinated execution, exposing the writer-side outcome to the
 /// engine layer. `write_commit` is set when writers reported a commit input on
-/// the success path. `write_abort` is reserved for the failure path that PR-2
-/// wires when SQL write routing moves onto the coordinator; on the current
-/// success path it is `None`.
+/// the success path. `write_abort` is set when writer-side coordination fails
+/// after the root result has been produced and the write coordinator can build
+/// an abort input for the engine layer.
 #[derive(Debug)]
 pub(crate) struct CoordinatedQueryResult {
     pub(crate) query_result: QueryResult,
@@ -449,7 +449,7 @@ impl ExecutionCoordinator {
         Ok(CoordinatedQueryResult {
             query_result,
             write_commit: fetch_result.write_commit,
-            write_abort: None,
+            write_abort: fetch_result.write_abort,
         })
     }
 
@@ -458,8 +458,17 @@ impl ExecutionCoordinator {
     /// callers that do not participate in the Iceberg write lifecycle use this.
     pub(crate) fn execute(self) -> Result<QueryResult, String> {
         self.execute_with_write_outcome()
-            .map(|outcome| outcome.query_result)
+            .and_then(query_result_or_write_abort_error)
     }
+}
+
+fn query_result_or_write_abort_error(
+    outcome: CoordinatedQueryResult,
+) -> Result<QueryResult, String> {
+    if let Some(abort) = outcome.write_abort {
+        return Err(abort.reason);
+    }
+    Ok(outcome.query_result)
 }
 
 /// An `UNPARTITIONED` data partition (the common default).
@@ -699,6 +708,7 @@ pub(crate) fn poll_write_failure_and_cancel(
 pub(crate) struct SubmitAndFetchResult {
     pub(crate) chunks: Vec<crate::exec::chunk::Chunk>,
     pub(crate) write_commit: Option<WriteCommitInput>,
+    pub(crate) write_abort: Option<WriteAbortInput>,
 }
 
 // ---------------------------------------------------------------------------
@@ -739,7 +749,17 @@ pub(crate) fn submit_and_fetch_loop(
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if let Some(write) = write_coordinator {
-            poll_write_failure_and_cancel(write, tracker, dispatcher.as_ref())?;
+            if let Err(e) = poll_write_failure_and_cancel(write, tracker, dispatcher.as_ref()) {
+                let abort = write.lock().expect("write coordinator lock").abort_input();
+                let Some(abort) = abort else {
+                    return Err(e);
+                };
+                return Ok(SubmitAndFetchResult {
+                    chunks,
+                    write_commit: None,
+                    write_abort: Some(abort),
+                });
+            }
         }
         if crate::runtime::query_cancel::client_disconnected() {
             tracker.cancel_all(dispatcher.as_ref());
@@ -770,21 +790,26 @@ pub(crate) fn submit_and_fetch_loop(
         }
     }
 
-    let write_commit = if let Some(write) = write_coordinator {
-        Some(wait_for_write_commit_ready(
-            write,
-            tracker,
-            dispatcher.as_ref(),
-            deadline,
-            timeout_ms,
-        )?)
+    let (write_commit, write_abort) = if let Some(write) = write_coordinator {
+        match wait_for_write_commit_ready(write, tracker, dispatcher.as_ref(), deadline, timeout_ms)
+        {
+            Ok(commit) => (Some(commit), None),
+            Err(e) => {
+                let abort = write.lock().expect("write coordinator lock").abort_input();
+                let Some(abort) = abort else {
+                    return Err(e);
+                };
+                (None, Some(abort))
+            }
+        }
     } else {
-        None
+        (None, None)
     };
 
     Ok(SubmitAndFetchResult {
         chunks,
         write_commit,
+        write_abort,
     })
 }
 
@@ -1656,10 +1681,11 @@ mod tests {
         let output = result.expect("delayed final report succeeds");
         assert!(output.chunks.is_empty());
         assert!(output.write_commit.is_some());
+        assert!(output.write_abort.is_none());
     }
 
     #[test]
-    fn write_failure_during_post_eof_wait_cancels_submitted_fragments() {
+    fn write_failure_during_post_eof_wait_surfaces_abort_and_cancels_submitted_fragments() {
         let query_id = id(760, 761);
         let writer = writer_key(760, 761, 762, 763, 0);
         let write = Arc::new(Mutex::new(
@@ -1702,7 +1728,7 @@ mod tests {
             make_params_with_finst(760, 1),
         ]);
         let mut tracker = InFlightTracker::default();
-        let err = submit_and_fetch_loop(
+        let result = submit_and_fetch_loop(
             &dispatcher,
             &mut tracker,
             params,
@@ -1711,10 +1737,19 @@ mod tests {
             1_000,
             Some(&write),
         )
-        .expect_err("writer failure during post-EOF wait must fail query");
+        .expect("writer failure during post-EOF wait must surface write abort");
 
         report_thread.join().expect("delayed report thread");
-        assert!(err.contains("delayed writer failure"), "{err}");
+        assert!(result.write_commit.is_none());
+        let abort = result
+            .write_abort
+            .expect("writer failure must surface write abort");
+        assert!(
+            abort.reason.contains("delayed writer failure"),
+            "{}",
+            abort.reason
+        );
+        assert_eq!(abort.incomplete_writers, vec![writer]);
         assert_eq!(
             inner.cancelled_ids(),
             vec![
@@ -1735,6 +1770,89 @@ mod tests {
     }
 
     #[test]
+    fn write_failure_before_root_eof_surfaces_abort_with_completed_writer_outputs() {
+        let query_id = id(780, 781);
+        let writer_ok = writer_key(780, 781, 782, 783, 0);
+        let writer_failed = writer_key(780, 781, 784, 785, 0);
+        let write = Arc::new(Mutex::new(
+            WriteCoordinator::new(query_id, vec![writer_ok.clone(), writer_failed.clone()])
+                .expect("write coordinator"),
+        ));
+        write
+            .lock()
+            .expect("write coordinator lock")
+            .apply_report(write_report(
+                &writer_ok,
+                true,
+                ok_status(),
+                "s3://warehouse/pre-eof-ok.parquet",
+            ))
+            .expect("finished writer report");
+        write
+            .lock()
+            .expect("write coordinator lock")
+            .apply_report(write_report(
+                &writer_failed,
+                true,
+                err_status("pre-EOF writer failure"),
+                "",
+            ))
+            .expect("failed writer report");
+
+        let inner = ControllableDispatcher::fetch_returns_not_ready();
+        let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
+        let root_finst_id = types::TUniqueId::new(780, 1);
+        let params = single_backend(vec![
+            make_params_with_finst(780, 10),
+            make_params_with_finst(780, 1),
+        ]);
+        let mut tracker = InFlightTracker::default();
+
+        let result = submit_and_fetch_loop(
+            &dispatcher,
+            &mut tracker,
+            params,
+            0,
+            root_finst_id,
+            1_000,
+            Some(&write),
+        )
+        .expect("pre-EOF writer failure must surface write abort");
+
+        assert!(result.write_commit.is_none());
+        let abort = result
+            .write_abort
+            .expect("pre-EOF writer failure must return abort input");
+        assert!(
+            abort.reason.contains("pre-EOF writer failure"),
+            "{}",
+            abort.reason
+        );
+        assert_eq!(abort.completed_writer_outputs.len(), 1);
+        assert_eq!(
+            abort.completed_writer_outputs[0].sink_commit_infos[0]
+                .iceberg_data_file
+                .as_ref()
+                .and_then(|file| file.path.as_deref()),
+            Some("s3://warehouse/pre-eof-ok.parquet")
+        );
+        assert_eq!(abort.incomplete_writers, vec![writer_failed]);
+        assert_eq!(
+            inner.cancelled_ids(),
+            vec![
+                types::TUniqueId::new(780, 10),
+                types::TUniqueId::new(780, 1)
+            ],
+            "pre-EOF writer failure must cancel submitted fragments"
+        );
+        assert_eq!(
+            inner.fetch_count(),
+            0,
+            "write failure should be observed before the next root fetch"
+        );
+    }
+
+    #[test]
     fn missing_write_final_report_after_root_eof_times_out_and_cancels() {
         let query_id = id(750, 751);
         let writer = writer_key(750, 751, 752, 753, 0);
@@ -1750,7 +1868,7 @@ mod tests {
         ]);
         let mut tracker = InFlightTracker::default();
 
-        let err = submit_and_fetch_loop(
+        let result = submit_and_fetch_loop(
             &dispatcher,
             &mut tracker,
             params,
@@ -1759,24 +1877,47 @@ mod tests {
             25,
             Some(&write),
         )
-        .expect_err("missing writer final report after EOF must time out");
+        .expect("missing writer final report after EOF must surface write abort");
 
-        assert!(err.contains("timed out"), "{err}");
-        assert!(err.contains("missing writer final report"), "{err}");
+        assert!(result.write_commit.is_none());
+        let abort = result
+            .write_abort
+            .expect("missing final report timeout must create abort input");
+        assert!(abort.reason.contains("timed out"), "{}", abort.reason);
+        assert!(
+            abort.reason.contains("missing writer final report"),
+            "{}",
+            abort.reason
+        );
         let cancelled = inner.cancelled_ids();
         assert_eq!(
             cancelled.len(),
             2,
             "missing final report timeout must cancel all submitted fragments"
         );
-        let abort = write
-            .lock()
-            .expect("write coordinator lock")
-            .abort_input()
-            .expect("missing final report timeout must create abort input");
-        assert!(abort.reason.contains("timed out"), "{}", abort.reason);
         assert_eq!(abort.completed_writer_outputs.len(), 0);
         assert_eq!(abort.incomplete_writers, vec![writer]);
+    }
+
+    #[test]
+    fn legacy_query_result_wrapper_returns_write_abort_reason_as_error() {
+        let query_result = QueryResult {
+            columns: Vec::new(),
+            chunks: Vec::new(),
+        };
+        let err = query_result_or_write_abort_error(CoordinatedQueryResult {
+            query_result,
+            write_commit: None,
+            write_abort: Some(WriteAbortInput {
+                write_id: id(770, 771),
+                reason: "write abort reason".to_string(),
+                completed_writer_outputs: Vec::new(),
+                incomplete_writers: Vec::new(),
+            }),
+        })
+        .expect_err("legacy query-result wrapper must not hide write aborts");
+
+        assert_eq!(err, "write abort reason");
     }
 
     // -----------------------------------------------------------------------
@@ -1813,6 +1954,10 @@ mod tests {
         assert!(
             output.write_commit.is_none(),
             "non-write query should not produce write commit input"
+        );
+        assert!(
+            output.write_abort.is_none(),
+            "non-write query should not produce write abort input"
         );
         assert_eq!(
             inner.submitted_ids().len(),
