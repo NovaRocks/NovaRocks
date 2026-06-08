@@ -6790,13 +6790,14 @@ mod tests {
     }
 
     fn mixed_starrocks_iceberg_join_plan() -> PhysicalPlanNode {
+        let id_col = crate::sql::column_id::ColumnId::new_for_test(1);
         PhysicalPlanNode {
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
                 eq_conditions: vec![PhysicalHashJoinEqCondition {
                     left: TypedExpr {
                         kind: ExprKind::ColumnRef {
-                            column_id: crate::sql::column_id::ColumnId::UNSET,
+                            column_id: id_col,
                             qualifier: Some("ice_t".to_string()),
                             column: "id".to_string(),
                         },
@@ -6805,7 +6806,7 @@ mod tests {
                     },
                     right: TypedExpr {
                         kind: ExprKind::ColumnRef {
-                            column_id: crate::sql::column_id::ColumnId::UNSET,
+                            column_id: id_col,
                             qualifier: Some("starrocks_t".to_string()),
                             column: "id".to_string(),
                         },
@@ -7095,7 +7096,7 @@ mod tests {
             }),
             result_type: DataType::Int64,
             output_name: "sum_rows".to_string(),
-            output_column_id: crate::sql::column_id::ColumnId::UNSET,
+            output_column_id: crate::sql::column_id::ColumnId::new_for_test(7101),
             ignore_nulls: false,
         };
         let win_range = WindowExpr {
@@ -8051,20 +8052,8 @@ mod tests {
                 },
                 alias: None,
                 columns: vec![
-                    OutputColumn {
-                        column_id: crate::sql::column_id::ColumnId::UNSET,
-                        name: "id".to_string(),
-                        data_type: DataType::Utf8,
-                        nullable: false,
-                        is_internal: false,
-                    },
-                    OutputColumn {
-                        column_id: crate::sql::column_id::ColumnId::UNSET,
-                        name: "name".to_string(),
-                        data_type: DataType::Utf8,
-                        nullable: false,
-                        is_internal: false,
-                    },
+                    output_col_for_test(8101, "id", DataType::Utf8, false),
+                    output_col_for_test(8102, "name", DataType::Utf8, false),
                 ],
                 predicates: vec![],
                 required_columns: None,
@@ -8084,20 +8073,8 @@ mod tests {
             children: vec![],
             stats: stats(),
             output_columns: vec![
-                OutputColumn {
-                    column_id: crate::sql::column_id::ColumnId::UNSET,
-                    name: "id".to_string(),
-                    data_type: DataType::Utf8,
-                    nullable: false,
-                    is_internal: false,
-                },
-                OutputColumn {
-                    column_id: crate::sql::column_id::ColumnId::UNSET,
-                    name: "name".to_string(),
-                    data_type: DataType::Utf8,
-                    nullable: false,
-                    is_internal: false,
-                },
+                output_col_for_test(8101, "id", DataType::Utf8, false),
+                output_col_for_test(8102, "name", DataType::Utf8, false),
             ],
             execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
@@ -8283,13 +8260,12 @@ mod tests {
                     },
                 },
                 alias: None,
-                columns: vec![OutputColumn {
-                    column_id: crate::sql::column_id::ColumnId::UNSET,
-                    name: "__nr_dict_t_s".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
-                    is_internal: false,
-                }],
+                columns: vec![output_col_for_test(
+                    8301,
+                    "__nr_dict_t_s",
+                    DataType::Int32,
+                    false,
+                )],
                 predicates: vec![],
                 required_columns: Some(vec!["__nr_dict_t_s".to_string()]),
                 dict_columns: vec![ScanDictionaryColumn {
@@ -8300,13 +8276,12 @@ mod tests {
             }),
             children: vec![],
             stats: stats(),
-            output_columns: vec![OutputColumn {
-                column_id: crate::sql::column_id::ColumnId::UNSET,
-                name: "__nr_dict_t_s".to_string(),
-                data_type: DataType::Int32,
-                nullable: false,
-                is_internal: false,
-            }],
+            output_columns: vec![output_col_for_test(
+                8301,
+                "__nr_dict_t_s",
+                DataType::Int32,
+                false,
+            )],
             execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
@@ -8430,13 +8405,7 @@ mod tests {
                     },
                 },
                 alias: None,
-                columns: vec![OutputColumn {
-                    column_id: crate::sql::column_id::ColumnId::UNSET,
-                    name: "id".to_string(),
-                    data_type: DataType::Utf8,
-                    nullable: false,
-                    is_internal: false,
-                }],
+                columns: vec![output_col_for_test(8401, "id", DataType::Utf8, false)],
                 predicates: vec![],
                 required_columns: None,
                 dict_columns: vec![ScanDictionaryColumn {
@@ -8447,13 +8416,7 @@ mod tests {
             }),
             children: vec![],
             stats: stats(),
-            output_columns: vec![OutputColumn {
-                column_id: crate::sql::column_id::ColumnId::UNSET,
-                name: "id".to_string(),
-                data_type: DataType::Utf8,
-                nullable: false,
-                is_internal: false,
-            }],
+            output_columns: vec![output_col_for_test(8401, "id", DataType::Utf8, false)],
             execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),

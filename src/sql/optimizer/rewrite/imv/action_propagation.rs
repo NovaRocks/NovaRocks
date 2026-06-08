@@ -47,6 +47,7 @@ pub(crate) fn output_has_action_column(plan: &LogicalPlan) -> bool {
         }
         LogicalPlan::ImvDelta(node) => output_has_action_column(&node.input),
         LogicalPlan::ImvVersion(node) => output_has_action_column(&node.input),
+        LogicalPlan::Union(node) => node.output_columns.iter().any(ImvActionColumn::matches),
         LogicalPlan::AggregateStateMerge(node) => {
             output_has_action_column(&node.old_input) || output_has_action_column(&node.delta_input)
         }
@@ -65,6 +66,11 @@ pub(crate) fn find_action_column(plan: &LogicalPlan) -> Option<OutputColumn> {
             .cloned(),
         LogicalPlan::Filter(node) => find_action_column(&node.input),
         LogicalPlan::Project(node) => find_action_column(&node.input),
+        LogicalPlan::Union(node) => node
+            .output_columns
+            .iter()
+            .find(|c| ImvActionColumn::matches(c))
+            .cloned(),
         LogicalPlan::AggregateStateMerge(node) => {
             find_action_column(&node.old_input).or_else(|| find_action_column(&node.delta_input))
         }
@@ -134,6 +140,12 @@ pub(crate) fn descendant_internal_columns(plan: &LogicalPlan) -> Vec<OutputColum
             .collect(),
         LogicalPlan::Filter(node) => descendant_internal_columns(&node.input),
         LogicalPlan::Project(node) => descendant_internal_columns(&node.input),
+        LogicalPlan::Union(node) => node
+            .output_columns
+            .iter()
+            .filter(|c| c.is_internal)
+            .cloned()
+            .collect(),
         LogicalPlan::AggregateStateMerge(node) => {
             let mut columns = descendant_internal_columns(&node.old_input);
             columns.extend(descendant_internal_columns(&node.delta_input));
@@ -201,6 +213,8 @@ impl LogicalRewriteRule for InjectActionColumnRule {
             "InjectActionColumn requires ImvExtension in RewriteContext".to_string()
         })?;
         let column_id = ext.allocate_column_id();
+        scan.columns
+            .retain(|column| !is_action_column_name(&column.name));
         scan.columns.push(ImvActionColumn::output_column(column_id));
         Ok(RewriteResult::Changed(LogicalPlan::Scan(scan)))
     }
@@ -386,13 +400,10 @@ pub(crate) fn is_supported_fan_in_delta_union(node: &crate::sql::planner::plan::
     if !node.all || node.inputs.is_empty() {
         return false;
     }
-    let Some(action_column_id) = branch_output_action_column_id(&node.inputs[0]) else {
-        return false;
-    };
     node.inputs.iter().all(|branch| {
         subtree_has_delta_scan(branch)
             && !subtree_has_version_scan(branch)
-            && branch_output_action_column_id(branch) == Some(action_column_id)
+            && branch_output_action_column_id(branch).is_some()
     })
 }
 
@@ -456,6 +467,10 @@ fn branch_output_action_column_id(plan: &LogicalPlan) -> Option<crate::sql::colu
         LogicalPlan::ImvVersion(node) => branch_output_action_column_id(&node.input),
         _ => None,
     }
+}
+
+fn is_action_column_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case(ImvActionColumn::NAME)
 }
 
 fn subtree_has_delta_scan(plan: &LogicalPlan) -> bool {
@@ -610,6 +625,36 @@ mod tests {
         assert!(!action.nullable);
         assert!(action.is_internal);
         assert_eq!(action.column_id, ColumnId(100));
+    }
+
+    #[test]
+    fn inject_replaces_preexisting_non_internal_action_column() {
+        let rule = InjectActionColumnRule;
+        let mut ctx = build_ctx();
+        let mut scan = delta_scan();
+        scan.columns.push(output_column(
+            9,
+            ImvActionColumn::NAME,
+            DataType::Int8,
+            false,
+            false,
+        ));
+        let plan = LogicalPlan::Scan(scan);
+
+        assert!(rule.matches(&plan, &ctx));
+        let RewriteResult::Changed(LogicalPlan::Scan(scan)) =
+            rule.apply(plan, &mut ctx).expect("apply")
+        else {
+            panic!("expected Changed(Scan)");
+        };
+        let action_columns = scan
+            .columns
+            .iter()
+            .filter(|column| column.name.eq_ignore_ascii_case(ImvActionColumn::NAME))
+            .collect::<Vec<_>>();
+        assert_eq!(action_columns.len(), 1);
+        assert_eq!(action_columns[0].column_id, ColumnId(100));
+        assert!(action_columns[0].is_internal);
     }
 
     #[test]
@@ -1275,9 +1320,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_fan_in_delta_union_with_mismatched_action_column_ids() {
+    fn accepts_fan_in_delta_union_with_mismatched_branch_action_column_ids() {
         let rule = PropagateActionColumnRule;
-        let mut ctx = build_ctx();
+        let ctx = build_ctx();
         let union = LogicalPlan::Union(UnionNode {
             inputs: vec![
                 normalized_delta_project(ColumnId(100), ColumnId(1)),
@@ -1288,10 +1333,7 @@ mod tests {
             required_output_columns: None,
         });
 
-        assert!(rule.matches(&union, &ctx));
-        let err = rule.apply(union, &mut ctx).expect_err("Union must fail");
-        assert!(err.contains("Phase 6"), "unexpected error: {err}");
-        assert!(err.contains("ice.db.b"), "unexpected error: {err}");
+        assert!(!rule.matches(&union, &ctx));
     }
 
     #[test]

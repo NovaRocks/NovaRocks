@@ -7,7 +7,7 @@ use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, ProjectI
 use crate::sql::catalog::{
     ColumnDef, IcebergMvTargetStatePartitionConstraint, IcebergMvTargetStateRowFilter, TableDef,
 };
-use crate::sql::codegen::helpers::{agg_call_display_name, typed_expr_display_name};
+use crate::sql::codegen::helpers::typed_expr_display_name;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
@@ -150,7 +150,11 @@ pub(crate) fn build_aggregate_state_merge(
     );
     let old_input = branch_scoped_old_input(old_scan, branch_scope, &aggregate_layout)?;
 
-    let action_column = action_column.unwrap_or_else(|| ext.allocate_column_id());
+    let action_column = match action_column {
+        Some(action_column) => action_column,
+        None => existing_delta_action_column(&aggregate.input)?
+            .unwrap_or_else(|| ext.allocate_column_id()),
+    };
     let output_columns = aggregate.output_columns.clone();
     let signed_aggregate = signed_aggregate(
         aggregate,
@@ -610,7 +614,7 @@ fn signed_aggregate(
         signed_calls.push(retraction_count_aggregate_call(action_column));
     }
     let input = if plan_contains_imv_marker(&aggregate.input) {
-        aggregate.input
+        Box::new(thread_delta_action_column(*aggregate.input, action_column)?)
     } else {
         Box::new(LogicalPlan::ImvDelta(ImvDeltaNode {
             input: aggregate.input,
@@ -626,8 +630,14 @@ fn signed_aggregate(
         ext,
         &mut signed_calls,
     )?;
-    let project_items =
-        signed_aggregate_project_items(&aggregate.group_by, shape, layout, ext, &signed_calls)?;
+    let project_items = signed_aggregate_project_items(
+        &aggregate.group_by,
+        shape,
+        layout,
+        ext,
+        &aggregate_output_columns,
+        &signed_calls,
+    )?;
     Ok(LogicalPlan::Project(ProjectNode {
         input: Box::new(LogicalPlan::Aggregate(AggregateNode {
             input,
@@ -641,6 +651,192 @@ fn signed_aggregate(
         output_qualifier: None,
         required_output_columns: None,
     }))
+}
+
+fn existing_delta_action_column(plan: &LogicalPlan) -> Result<Option<ColumnId>, String> {
+    fn merge_action(found: &mut Option<ColumnId>, action: Option<ColumnId>) -> Result<(), String> {
+        let Some(action) = action else {
+            return Ok(());
+        };
+        match found {
+            Some(existing) if *existing != action => Err(format!(
+                "Iceberg IMV aggregate rewrite found conflicting delta action columns: {existing:?} and {action:?}"
+            )),
+            Some(_) => Ok(()),
+            None => {
+                *found = Some(action);
+                Ok(())
+            }
+        }
+    }
+
+    fn visit(plan: &LogicalPlan, found: &mut Option<ColumnId>) -> Result<(), String> {
+        match plan {
+            LogicalPlan::ImvDelta(node) => {
+                merge_action(found, node.action_column)?;
+                visit(&node.input, found)
+            }
+            LogicalPlan::ImvVersion(node) => visit(&node.input, found),
+            LogicalPlan::Scan(_)
+            | LogicalPlan::Values(_)
+            | LogicalPlan::GenerateSeries(_)
+            | LogicalPlan::CTEConsume(_) => Ok(()),
+            LogicalPlan::Filter(node) => visit(&node.input, found),
+            LogicalPlan::Project(node) => visit(&node.input, found),
+            LogicalPlan::Aggregate(node) => visit(&node.input, found),
+            LogicalPlan::Sort(node) => visit(&node.input, found),
+            LogicalPlan::Limit(node) => visit(&node.input, found),
+            LogicalPlan::Window(node) => visit(&node.input, found),
+            LogicalPlan::TableFunction(node) => visit(&node.input, found),
+            LogicalPlan::Repeat(node) => visit(&node.input, found),
+            LogicalPlan::CTEProduce(node) => visit(&node.input, found),
+            LogicalPlan::Decode(node) => visit(&node.input, found),
+            LogicalPlan::AggregateStateMerge(node) => {
+                visit(&node.old_input, found)?;
+                visit(&node.delta_input, found)
+            }
+            LogicalPlan::Join(node) => {
+                visit(&node.left, found)?;
+                visit(&node.right, found)
+            }
+            LogicalPlan::CTEAnchor(node) => {
+                visit(&node.produce, found)?;
+                visit(&node.consumer, found)
+            }
+            LogicalPlan::Union(node) => {
+                for input in &node.inputs {
+                    visit(input, found)?;
+                }
+                Ok(())
+            }
+            LogicalPlan::Intersect(node) => {
+                for input in &node.inputs {
+                    visit(input, found)?;
+                }
+                Ok(())
+            }
+            LogicalPlan::Except(node) => {
+                for input in &node.inputs {
+                    visit(input, found)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    let mut found = None;
+    visit(plan, &mut found)?;
+    Ok(found)
+}
+
+fn thread_delta_action_column(
+    plan: LogicalPlan,
+    action_column: ColumnId,
+) -> Result<LogicalPlan, String> {
+    Ok(match plan {
+        LogicalPlan::ImvDelta(mut node) => {
+            if let Some(existing) = node.action_column
+                && existing != action_column
+            {
+                return Err(format!(
+                    "Iceberg IMV aggregate rewrite found delta action column {existing:?}, expected {action_column:?}"
+                ));
+            }
+            node.action_column = Some(action_column);
+            node.input = Box::new(thread_delta_action_column(*node.input, action_column)?);
+            LogicalPlan::ImvDelta(node)
+        }
+        LogicalPlan::ImvVersion(mut node) => {
+            node.input = Box::new(thread_delta_action_column(*node.input, action_column)?);
+            LogicalPlan::ImvVersion(node)
+        }
+        leaf @ (LogicalPlan::Scan(_)
+        | LogicalPlan::Values(_)
+        | LogicalPlan::GenerateSeries(_)
+        | LogicalPlan::CTEConsume(_)) => leaf,
+        LogicalPlan::Filter(mut node) => {
+            node.input = Box::new(thread_delta_action_column(*node.input, action_column)?);
+            LogicalPlan::Filter(node)
+        }
+        LogicalPlan::Project(mut node) => {
+            node.input = Box::new(thread_delta_action_column(*node.input, action_column)?);
+            LogicalPlan::Project(node)
+        }
+        LogicalPlan::Aggregate(mut node) => {
+            node.input = Box::new(thread_delta_action_column(*node.input, action_column)?);
+            LogicalPlan::Aggregate(node)
+        }
+        LogicalPlan::Sort(mut node) => {
+            node.input = Box::new(thread_delta_action_column(*node.input, action_column)?);
+            LogicalPlan::Sort(node)
+        }
+        LogicalPlan::Limit(mut node) => {
+            node.input = Box::new(thread_delta_action_column(*node.input, action_column)?);
+            LogicalPlan::Limit(node)
+        }
+        LogicalPlan::Window(mut node) => {
+            node.input = Box::new(thread_delta_action_column(*node.input, action_column)?);
+            LogicalPlan::Window(node)
+        }
+        LogicalPlan::TableFunction(mut node) => {
+            node.input = Box::new(thread_delta_action_column(*node.input, action_column)?);
+            LogicalPlan::TableFunction(node)
+        }
+        LogicalPlan::Repeat(mut node) => {
+            node.input = Box::new(thread_delta_action_column(*node.input, action_column)?);
+            LogicalPlan::Repeat(node)
+        }
+        LogicalPlan::CTEProduce(mut node) => {
+            node.input = Box::new(thread_delta_action_column(*node.input, action_column)?);
+            LogicalPlan::CTEProduce(node)
+        }
+        LogicalPlan::Decode(mut node) => {
+            node.input = Box::new(thread_delta_action_column(*node.input, action_column)?);
+            LogicalPlan::Decode(node)
+        }
+        LogicalPlan::AggregateStateMerge(mut node) => {
+            node.old_input = Box::new(thread_delta_action_column(*node.old_input, action_column)?);
+            node.delta_input = Box::new(thread_delta_action_column(
+                *node.delta_input,
+                action_column,
+            )?);
+            LogicalPlan::AggregateStateMerge(node)
+        }
+        LogicalPlan::Join(mut node) => {
+            node.left = Box::new(thread_delta_action_column(*node.left, action_column)?);
+            node.right = Box::new(thread_delta_action_column(*node.right, action_column)?);
+            LogicalPlan::Join(node)
+        }
+        LogicalPlan::CTEAnchor(mut node) => {
+            node.produce = Box::new(thread_delta_action_column(*node.produce, action_column)?);
+            node.consumer = Box::new(thread_delta_action_column(*node.consumer, action_column)?);
+            LogicalPlan::CTEAnchor(node)
+        }
+        LogicalPlan::Union(mut node) => {
+            node.inputs = node
+                .inputs
+                .into_iter()
+                .map(|input| thread_delta_action_column(input, action_column))
+                .collect::<Result<Vec<_>, _>>()?;
+            LogicalPlan::Union(node)
+        }
+        LogicalPlan::Intersect(mut node) => {
+            node.inputs = node
+                .inputs
+                .into_iter()
+                .map(|input| thread_delta_action_column(input, action_column))
+                .collect::<Result<Vec<_>, _>>()?;
+            LogicalPlan::Intersect(node)
+        }
+        LogicalPlan::Except(mut node) => {
+            node.inputs = node
+                .inputs
+                .into_iter()
+                .map(|input| thread_delta_action_column(input, action_column))
+                .collect::<Result<Vec<_>, _>>()?;
+            LogicalPlan::Except(node)
+        }
+    })
 }
 
 fn align_aggregate_call_inputs_to_child(
@@ -860,6 +1056,7 @@ fn signed_aggregate_project_items(
     shape: &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls,
     layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
     ext: &ImvExtension,
+    aggregate_output_columns: &[OutputColumn],
     signed_calls: &[AggregateCall],
 ) -> Result<Vec<crate::sql::analysis::ProjectItem>, String> {
     use crate::connector::starrocks::table::mv_shape::VisibleAggregateOutput;
@@ -868,7 +1065,7 @@ fn signed_aggregate_project_items(
     for output in &shape.visible_outputs {
         match output {
             VisibleAggregateOutput::GroupKey(group_key_index) => {
-                let group_expr = group_by.get(*group_key_index).ok_or_else(|| {
+                let _group_expr = group_by.get(*group_key_index).ok_or_else(|| {
                     format!(
                         "Iceberg IMV aggregate rewrite group key index {group_key_index} out of range"
                     )
@@ -886,15 +1083,20 @@ fn signed_aggregate_project_items(
                         "Iceberg IMV aggregate rewrite group key visible source index {visible_source_index} out of range"
                     )
                 })?;
+                let child_output =
+                    aggregate_output_columns
+                        .get(*group_key_index)
+                        .ok_or_else(|| {
+                            format!(
+                                "Iceberg IMV aggregate rewrite missing signed aggregate group output at index {group_key_index}"
+                            )
+                        })?;
                 items.push(crate::sql::analysis::ProjectItem {
                     expr: TypedExpr {
                         kind: ExprKind::ColumnRef {
-                            column_id: match &group_expr.kind {
-                                ExprKind::ColumnRef { column_id, .. } => *column_id,
-                                _ => ColumnId::UNSET,
-                            },
+                            column_id: child_output.column_id,
                             qualifier: None,
-                            column: typed_expr_display_name(group_expr),
+                            column: child_output.name.clone(),
                         },
                         data_type: visible.data_type.clone(),
                         nullable: visible.nullable,
@@ -923,12 +1125,14 @@ fn signed_aggregate_project_items(
                         state_column.aggregate_index
                     )
                 })?;
+                let child_output =
+                    signed_aggregate_child_output(aggregate_output_columns, state_column)?;
                 items.push(crate::sql::analysis::ProjectItem {
                     expr: TypedExpr {
                         kind: ExprKind::ColumnRef {
-                            column_id: ColumnId::UNSET,
+                            column_id: call.output_column_id,
                             qualifier: None,
-                            column: agg_call_display_name(call),
+                            column: child_output.name.clone(),
                         },
                         data_type: state_shaped_state_data_type(state_column),
                         nullable: false,
@@ -949,12 +1153,13 @@ fn signed_aggregate_project_items(
                 state_column.name
             )
         })?;
+        let child_output = signed_aggregate_child_output(aggregate_output_columns, state_column)?;
         items.push(crate::sql::analysis::ProjectItem {
             expr: TypedExpr {
                 kind: ExprKind::ColumnRef {
-                    column_id: ColumnId::UNSET,
+                    column_id: call.output_column_id,
                     qualifier: None,
-                    column: agg_call_display_name(call),
+                    column: child_output.name.clone(),
                 },
                 data_type: state_shaped_state_data_type(state_column),
                 nullable: false,
@@ -964,6 +1169,21 @@ fn signed_aggregate_project_items(
         });
     }
     Ok(items)
+}
+
+fn signed_aggregate_child_output<'a>(
+    aggregate_output_columns: &'a [OutputColumn],
+    state_column: &crate::connector::starrocks::table::mv_agg_state::AggregateStateColumn,
+) -> Result<&'a OutputColumn, String> {
+    aggregate_output_columns
+        .iter()
+        .find(|output| output.name.eq_ignore_ascii_case(&state_column.name))
+        .ok_or_else(|| {
+            format!(
+                "Iceberg IMV aggregate rewrite missing signed aggregate output column {}",
+                state_column.name
+            )
+        })
 }
 
 fn state_shaped_state_data_type(
@@ -1618,6 +1838,22 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["sum_state_signed", "sum"]
         );
+        for item in &project.items {
+            let ExprKind::ColumnRef {
+                column_id, column, ..
+            } = &item.expr.kind
+            else {
+                panic!("expected signed aggregate Project item to reference child output");
+            };
+            assert_ne!(*column_id, ColumnId::UNSET);
+            assert!(
+                signed_aggregate.output_columns.iter().any(|output| {
+                    output.column_id == *column_id && output.name.eq_ignore_ascii_case(column)
+                }),
+                "Project item {} must reference a signed aggregate child output by id",
+                item.output_name
+            );
+        }
         assert_eq!(signed_aggregate.output_columns[1].name, "__agg_state_s");
         assert_eq!(
             signed_aggregate.output_columns[1].data_type,
@@ -1798,6 +2034,74 @@ mod tests {
             matches!(signed_aggregate.input.as_ref(), LogicalPlan::Union(_)),
             "pre-expanded join delta input must not be wrapped as ImvDelta(Union)"
         );
+    }
+
+    #[test]
+    fn rewrite_aggregate_state_threads_allocated_action_column_into_existing_delta_marker() {
+        assert_existing_delta_action_threads(None);
+    }
+
+    #[test]
+    fn rewrite_aggregate_state_reuses_existing_delta_action_column() {
+        assert_existing_delta_action_threads(Some(ColumnId::new_for_test(901)));
+    }
+
+    fn assert_existing_delta_action_threads(existing_action: Option<ColumnId>) {
+        let rule = RewriteAggregateStateRule;
+        let mut ctx = build_ctx();
+        let input = LogicalPlan::ImvDelta(ImvDeltaNode {
+            input: Box::new(leaf_scan()),
+            is_root: false,
+            action_column: existing_action,
+            branch_scope: None,
+        });
+        let result = rule
+            .apply(delta(aggregate_over(input)), &mut ctx)
+            .expect("aggregate rewrite must succeed");
+        let RewriteResult::Changed(LogicalPlan::AggregateStateMerge(merge)) = result else {
+            panic!("expected Changed(AggregateStateMerge)");
+        };
+        let LogicalPlan::Project(project) = merge.delta_input.as_ref() else {
+            panic!("expected signed aggregate projection delta input");
+        };
+        let LogicalPlan::Aggregate(signed_aggregate) = project.input.as_ref() else {
+            panic!("expected signed aggregate under projection");
+        };
+        let LogicalPlan::ImvDelta(delta_input) = signed_aggregate.input.as_ref() else {
+            panic!("expected signed aggregate to reuse existing delta marker");
+        };
+        let action_column = delta_input
+            .action_column
+            .expect("existing delta marker must receive an action column");
+        if let Some(existing_action) = existing_action {
+            assert_eq!(action_column, existing_action);
+        }
+
+        let signed_arg = &signed_aggregate.aggregates[0].args[0];
+        let ExprKind::FunctionCall {
+            args: struct_args, ..
+        } = &signed_arg.kind
+        else {
+            panic!("expected signed aggregate named_struct input");
+        };
+        let ExprKind::ColumnRef {
+            column_id, column, ..
+        } = &struct_args[3].kind
+        else {
+            panic!("expected signed aggregate change_op column ref");
+        };
+        assert_eq!(column, ImvActionColumn::NAME);
+        assert_eq!(*column_id, action_column);
+
+        let retraction_arg = &signed_aggregate.aggregates[1].args[0];
+        let ExprKind::ColumnRef {
+            column_id, column, ..
+        } = &retraction_arg.kind
+        else {
+            panic!("expected retraction-count change_op column ref");
+        };
+        assert_eq!(column, ImvActionColumn::NAME);
+        assert_eq!(*column_id, action_column);
     }
 
     #[test]

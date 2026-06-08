@@ -110,6 +110,39 @@ impl AnalyzerScope {
         self.canonical_qualifier.get(&name.to_lowercase()).cloned()
     }
 
+    /// Return the primary qualifier that exposes `name` with `column_id`.
+    ///
+    /// `ordered` keeps the relation's visible primary bindings in a stable
+    /// left-to-right order, so prefer it over the secondary qualified map
+    /// entries that aliases may add for compatibility.
+    pub(super) fn qualifier_for_binding(&self, name: &str, column_id: ColumnId) -> Option<String> {
+        let name_lower = name.to_lowercase();
+        for (qualifier, col_name, id, _, _) in &self.ordered {
+            if col_name.to_lowercase() == name_lower && *id == column_id {
+                return qualifier.clone();
+            }
+        }
+
+        let mut qualifiers: Vec<String> = self
+            .qualified
+            .iter()
+            .filter_map(|((qualifier, col_name), (id, _, _))| {
+                if col_name == &name_lower && *id == column_id {
+                    Some(qualifier.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        qualifiers.sort();
+        qualifiers.dedup();
+        if qualifiers.len() == 1 {
+            qualifiers.pop()
+        } else {
+            None
+        }
+    }
+
     /// Return a synthetic expression for an unqualified column name, if any.
     /// FULL OUTER USING columns register a `COALESCE(left.col, right.col)`
     /// expression here so the analyzer rewrites unqualified references to

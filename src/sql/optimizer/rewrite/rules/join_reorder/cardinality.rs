@@ -729,6 +729,7 @@ mod tests {
                     nulls_fraction: 0.0,
                     average_row_size: 4.0,
                     distinct_values_count: 100.0,
+                    confidence: Confidence::Exact,
                     ..Default::default()
                 },
             ),
@@ -740,6 +741,7 @@ mod tests {
                     nulls_fraction: 0.0,
                     average_row_size: 4.0,
                     distinct_values_count: 50.0,
+                    confidence: Confidence::Exact,
                     ..Default::default()
                 },
             ),

@@ -73,6 +73,8 @@ impl LogicalRewriteRule for InjectRowIdRule {
             .extension::<ImvExtension>()
             .ok_or_else(|| "InjectRowId requires ImvExtension in RewriteContext".to_string())?;
         let column_id = ext.allocate_column_id();
+        scan.columns
+            .retain(|column| !column.name.eq_ignore_ascii_case(ImvRowIdColumn::NAME));
         scan.columns.push(ImvRowIdColumn::output_column(column_id));
         Ok(RewriteResult::Changed(LogicalPlan::Scan(scan)))
     }
@@ -174,6 +176,36 @@ mod tests {
             panic!("expected Changed(Scan)");
         };
         assert!(scan.columns.iter().any(ImvRowIdColumn::matches));
+    }
+
+    #[test]
+    fn inject_row_id_replaces_preexisting_non_internal_row_id_column() {
+        let rule = InjectRowIdRule;
+        let mut ctx = build_ctx();
+        let mut scan = delta_scan();
+        scan.columns.push(OutputColumn {
+            column_id: ColumnId(9),
+            name: ImvRowIdColumn::NAME.to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        });
+        let plan = LogicalPlan::Scan(scan);
+
+        assert!(rule.matches(&plan, &ctx));
+        let RewriteResult::Changed(LogicalPlan::Scan(scan)) =
+            rule.apply(plan, &mut ctx).expect("apply")
+        else {
+            panic!("expected Changed(Scan)");
+        };
+        let row_id_columns = scan
+            .columns
+            .iter()
+            .filter(|column| column.name.eq_ignore_ascii_case(ImvRowIdColumn::NAME))
+            .collect::<Vec<_>>();
+        assert_eq!(row_id_columns.len(), 1);
+        assert_eq!(row_id_columns[0].column_id, ColumnId(100));
+        assert!(row_id_columns[0].is_internal);
     }
 
     #[test]

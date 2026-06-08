@@ -243,6 +243,35 @@ impl DeriveRequired for PhysicalHashJoinOp {
 }
 
 impl PhysicalHashJoinOp {
+    fn preserve_left_output_distribution(
+        &self,
+        children: &[&PhysicalPropertySet],
+    ) -> PhysicalPropertySet {
+        let left = children
+            .first()
+            .copied()
+            .cloned()
+            .unwrap_or_else(PhysicalPropertySet::any);
+        let distribution = match left.distribution {
+            DistributionSpec::HashPartitioned {
+                cols,
+                source: HashSource::ShuffleAgg,
+            } => DistributionSpec::hash_partitioned(
+                expand_with_eq_equivalents(&cols, &self.eq_conditions),
+                HashSource::ShuffleAgg,
+            ),
+            DistributionSpec::HashPartitioned {
+                source: HashSource::ShuffleJoin,
+                ..
+            } => DistributionSpec::Any,
+            other => other,
+        };
+        PhysicalPropertySet {
+            distribution,
+            ordering: OrderingSpec::Any,
+        }
+    }
+
     fn derive_shuffle_output(&self) -> PhysicalPropertySet {
         // Symmetric over both sides of each eq pair: a shuffle join partitions
         // both inputs on their respective eq columns, so its output key is an
@@ -260,24 +289,7 @@ impl PhysicalHashJoinOp {
 
     fn derive_broadcast_output(&self, children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
         if preserves_left(&self.join_type) {
-            let left = children
-                .first()
-                .copied()
-                .cloned()
-                .unwrap_or_else(PhysicalPropertySet::any);
-            let distribution = match left.distribution {
-                DistributionSpec::HashPartitioned { cols, source } => {
-                    DistributionSpec::hash_partitioned(
-                        expand_with_eq_equivalents(&cols, &self.eq_conditions),
-                        source,
-                    )
-                }
-                other => other,
-            };
-            PhysicalPropertySet {
-                distribution,
-                ordering: OrderingSpec::Any,
-            }
+            self.preserve_left_output_distribution(children)
         } else {
             PhysicalPropertySet::any()
         }
@@ -285,24 +297,7 @@ impl PhysicalHashJoinOp {
 
     fn derive_colocate_output(&self, children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
         if preserves_left(&self.join_type) {
-            let left = children
-                .first()
-                .copied()
-                .cloned()
-                .unwrap_or_else(PhysicalPropertySet::any);
-            let distribution = match left.distribution {
-                DistributionSpec::HashPartitioned { cols, source } => {
-                    DistributionSpec::hash_partitioned(
-                        expand_with_eq_equivalents(&cols, &self.eq_conditions),
-                        source,
-                    )
-                }
-                other => other,
-            };
-            PhysicalPropertySet {
-                distribution,
-                ordering: OrderingSpec::Any,
-            }
+            self.preserve_left_output_distribution(children)
         } else {
             PhysicalPropertySet::any()
         }
@@ -463,6 +458,19 @@ mod tests {
             out.distribution,
             DistributionSpec::shuffle_agg([ColumnId(10), ColumnId(20)])
         );
+        assert_eq!(out.ordering, OrderingSpec::Any);
+    }
+
+    #[test]
+    fn hash_join_broadcast_inner_does_not_advertise_shuffle_join_distribution() {
+        let op = broadcast_inner(10, 20);
+        let left_out = PhysicalPropertySet {
+            distribution: DistributionSpec::shuffle_join([ColumnId(10)]),
+            ordering: OrderingSpec::Any,
+        };
+        let right_out = PhysicalPropertySet::gather();
+        let out = op.derive_output(&[&left_out, &right_out]);
+        assert_eq!(out.distribution, DistributionSpec::Any);
         assert_eq!(out.ordering, OrderingSpec::Any);
     }
 

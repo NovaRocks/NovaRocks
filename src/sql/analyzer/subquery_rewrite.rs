@@ -1849,8 +1849,10 @@ impl<'a> AnalyzerContext<'a> {
 
         // --- WHERE clause ---
         let filter = match &select.selection {
-            Some(expr) => Some(coerce_where_to_bool(
-                self.analyze_expr(expr, &merged_scope)?,
+            Some(expr) => Some(qualify_inner_shadowing_column_refs(
+                coerce_where_to_bool(self.analyze_expr(expr, &merged_scope)?),
+                &inner_scope,
+                outer_scope,
             )),
             None => None,
         };
@@ -1860,11 +1862,15 @@ impl<'a> AnalyzerContext<'a> {
         // the subquery's own columns, not outer scope columns) but use
         // merged_scope for column/expression resolution so that correlated
         // references can resolve against the outer scope.
-        let (projection, output_columns) = self.analyze_projection_with_wildcard_scope(
+        let (mut projection, output_columns) = self.analyze_projection_with_wildcard_scope(
             &select.projection,
             &merged_scope,
             &inner_scope,
         )?;
+        for item in &mut projection {
+            item.expr =
+                qualify_inner_shadowing_column_refs(item.expr.clone(), &inner_scope, outer_scope);
+        }
 
         // --- GROUP BY ---
         let group_by_exprs = match &select.group_by {
@@ -1876,7 +1882,11 @@ impl<'a> AnalyzerContext<'a> {
         let mut group_by = Vec::with_capacity(group_by_exprs.len());
         for gb_expr in &group_by_exprs {
             match self.analyze_expr(gb_expr, &merged_scope) {
-                Ok(typed) => group_by.push(typed),
+                Ok(typed) => group_by.push(qualify_inner_shadowing_column_refs(
+                    typed,
+                    &inner_scope,
+                    outer_scope,
+                )),
                 Err(_) => {
                     let mut alias_scope = merged_scope.clone();
                     for item in &projection {
@@ -1889,7 +1899,11 @@ impl<'a> AnalyzerContext<'a> {
                         );
                     }
                     let typed = self.analyze_expr(gb_expr, &alias_scope)?;
-                    group_by.push(self.substitute_select_aliases(typed, &projection));
+                    group_by.push(qualify_inner_shadowing_column_refs(
+                        self.substitute_select_aliases(typed, &projection),
+                        &inner_scope,
+                        outer_scope,
+                    ));
                 }
             }
         }
@@ -1903,7 +1917,11 @@ impl<'a> AnalyzerContext<'a> {
             Some(expr) => {
                 let analyzed = self.analyze_expr(expr, &merged_scope);
                 match analyzed {
-                    Ok(h) => Some(h),
+                    Ok(h) => Some(qualify_inner_shadowing_column_refs(
+                        h,
+                        &inner_scope,
+                        outer_scope,
+                    )),
                     Err(_) => {
                         let mut alias_scope = merged_scope.clone();
                         for item in &projection {
@@ -1916,7 +1934,11 @@ impl<'a> AnalyzerContext<'a> {
                             );
                         }
                         let h = self.analyze_expr(expr, &alias_scope)?;
-                        Some(self.substitute_select_aliases(h, &projection))
+                        Some(qualify_inner_shadowing_column_refs(
+                            self.substitute_select_aliases(h, &projection),
+                            &inner_scope,
+                            outer_scope,
+                        ))
                     }
                 }
             }
@@ -2161,6 +2183,332 @@ pub(crate) fn coerce_where_to_bool(expr: TypedExpr) -> TypedExpr {
             right: Box::new(zero),
         },
     }
+}
+
+fn qualify_inner_shadowing_column_refs(
+    expr: TypedExpr,
+    inner_scope: &AnalyzerScope,
+    outer_scope: &AnalyzerScope,
+) -> TypedExpr {
+    let data_type = expr.data_type.clone();
+    let nullable = expr.nullable;
+    match expr.kind {
+        ExprKind::ColumnRef {
+            column_id,
+            qualifier: None,
+            column,
+        } => {
+            let qualifier = inner_scope
+                .resolve(None, &column)
+                .ok()
+                .filter(|(inner_id, _, _)| *inner_id == column_id)
+                .filter(|_| outer_scope.resolve(None, &column).is_ok())
+                .and_then(|_| inner_scope.qualifier_for_binding(&column, column_id));
+            TypedExpr {
+                data_type,
+                nullable,
+                kind: ExprKind::ColumnRef {
+                    column_id,
+                    qualifier,
+                    column,
+                },
+            }
+        }
+        ExprKind::BinaryOp { left, op, right } => TypedExpr {
+            data_type,
+            nullable,
+            kind: ExprKind::BinaryOp {
+                left: Box::new(qualify_inner_shadowing_column_refs(
+                    *left,
+                    inner_scope,
+                    outer_scope,
+                )),
+                op,
+                right: Box::new(qualify_inner_shadowing_column_refs(
+                    *right,
+                    inner_scope,
+                    outer_scope,
+                )),
+            },
+        },
+        ExprKind::UnaryOp { op, expr: inner } => TypedExpr {
+            data_type,
+            nullable,
+            kind: ExprKind::UnaryOp {
+                op,
+                expr: Box::new(qualify_inner_shadowing_column_refs(
+                    *inner,
+                    inner_scope,
+                    outer_scope,
+                )),
+            },
+        },
+        ExprKind::FunctionCall {
+            name,
+            args,
+            distinct,
+        } => TypedExpr {
+            data_type,
+            nullable,
+            kind: ExprKind::FunctionCall {
+                name,
+                args: args
+                    .into_iter()
+                    .map(|arg| qualify_inner_shadowing_column_refs(arg, inner_scope, outer_scope))
+                    .collect(),
+                distinct,
+            },
+        },
+        ExprKind::LambdaFunction { params, body } => TypedExpr {
+            data_type,
+            nullable,
+            kind: ExprKind::LambdaFunction {
+                params,
+                body: Box::new(qualify_inner_shadowing_column_refs(
+                    *body,
+                    inner_scope,
+                    outer_scope,
+                )),
+            },
+        },
+        ExprKind::AggregateCall {
+            name,
+            args,
+            distinct,
+            order_by,
+        } => TypedExpr {
+            data_type,
+            nullable,
+            kind: ExprKind::AggregateCall {
+                name,
+                args: args
+                    .into_iter()
+                    .map(|arg| qualify_inner_shadowing_column_refs(arg, inner_scope, outer_scope))
+                    .collect(),
+                distinct,
+                order_by: qualify_inner_shadowing_sort_items(order_by, inner_scope, outer_scope),
+            },
+        },
+        ExprKind::Cast {
+            expr: inner,
+            target,
+        } => TypedExpr {
+            data_type,
+            nullable,
+            kind: ExprKind::Cast {
+                expr: Box::new(qualify_inner_shadowing_column_refs(
+                    *inner,
+                    inner_scope,
+                    outer_scope,
+                )),
+                target,
+            },
+        },
+        ExprKind::IsNull {
+            expr: inner,
+            negated,
+        } => TypedExpr {
+            data_type,
+            nullable,
+            kind: ExprKind::IsNull {
+                expr: Box::new(qualify_inner_shadowing_column_refs(
+                    *inner,
+                    inner_scope,
+                    outer_scope,
+                )),
+                negated,
+            },
+        },
+        ExprKind::InList {
+            expr: inner,
+            list,
+            negated,
+        } => TypedExpr {
+            data_type,
+            nullable,
+            kind: ExprKind::InList {
+                expr: Box::new(qualify_inner_shadowing_column_refs(
+                    *inner,
+                    inner_scope,
+                    outer_scope,
+                )),
+                list: list
+                    .into_iter()
+                    .map(|item| qualify_inner_shadowing_column_refs(item, inner_scope, outer_scope))
+                    .collect(),
+                negated,
+            },
+        },
+        ExprKind::Between {
+            expr: inner,
+            low,
+            high,
+            negated,
+        } => TypedExpr {
+            data_type,
+            nullable,
+            kind: ExprKind::Between {
+                expr: Box::new(qualify_inner_shadowing_column_refs(
+                    *inner,
+                    inner_scope,
+                    outer_scope,
+                )),
+                low: Box::new(qualify_inner_shadowing_column_refs(
+                    *low,
+                    inner_scope,
+                    outer_scope,
+                )),
+                high: Box::new(qualify_inner_shadowing_column_refs(
+                    *high,
+                    inner_scope,
+                    outer_scope,
+                )),
+                negated,
+            },
+        },
+        ExprKind::Like {
+            expr: inner,
+            pattern,
+            negated,
+        } => TypedExpr {
+            data_type,
+            nullable,
+            kind: ExprKind::Like {
+                expr: Box::new(qualify_inner_shadowing_column_refs(
+                    *inner,
+                    inner_scope,
+                    outer_scope,
+                )),
+                pattern: Box::new(qualify_inner_shadowing_column_refs(
+                    *pattern,
+                    inner_scope,
+                    outer_scope,
+                )),
+                negated,
+            },
+        },
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => TypedExpr {
+            data_type,
+            nullable,
+            kind: ExprKind::Case {
+                operand: operand.map(|operand| {
+                    Box::new(qualify_inner_shadowing_column_refs(
+                        *operand,
+                        inner_scope,
+                        outer_scope,
+                    ))
+                }),
+                when_then: when_then
+                    .into_iter()
+                    .map(|(when, then)| {
+                        (
+                            qualify_inner_shadowing_column_refs(when, inner_scope, outer_scope),
+                            qualify_inner_shadowing_column_refs(then, inner_scope, outer_scope),
+                        )
+                    })
+                    .collect(),
+                else_expr: else_expr.map(|else_expr| {
+                    Box::new(qualify_inner_shadowing_column_refs(
+                        *else_expr,
+                        inner_scope,
+                        outer_scope,
+                    ))
+                }),
+            },
+        },
+        ExprKind::IsTruthValue {
+            expr: inner,
+            value,
+            negated,
+        } => TypedExpr {
+            data_type,
+            nullable,
+            kind: ExprKind::IsTruthValue {
+                expr: Box::new(qualify_inner_shadowing_column_refs(
+                    *inner,
+                    inner_scope,
+                    outer_scope,
+                )),
+                value,
+                negated,
+            },
+        },
+        ExprKind::Nested(inner) => TypedExpr {
+            data_type,
+            nullable,
+            kind: ExprKind::Nested(Box::new(qualify_inner_shadowing_column_refs(
+                *inner,
+                inner_scope,
+                outer_scope,
+            ))),
+        },
+        ExprKind::WindowCall {
+            name,
+            args,
+            distinct,
+            partition_by,
+            order_by,
+            window_frame,
+            ignore_nulls,
+        } => TypedExpr {
+            data_type,
+            nullable,
+            kind: ExprKind::WindowCall {
+                name,
+                args: args
+                    .into_iter()
+                    .map(|arg| qualify_inner_shadowing_column_refs(arg, inner_scope, outer_scope))
+                    .collect(),
+                distinct,
+                partition_by: partition_by
+                    .into_iter()
+                    .map(|item| qualify_inner_shadowing_column_refs(item, inner_scope, outer_scope))
+                    .collect(),
+                order_by: qualify_inner_shadowing_sort_items(order_by, inner_scope, outer_scope),
+                window_frame,
+                ignore_nulls,
+            },
+        },
+        ExprKind::Lambda { params, body } => TypedExpr {
+            data_type,
+            nullable,
+            kind: ExprKind::Lambda {
+                params,
+                body: Box::new(qualify_inner_shadowing_column_refs(
+                    *body,
+                    inner_scope,
+                    outer_scope,
+                )),
+            },
+        },
+        kind @ (ExprKind::ColumnRef { .. }
+        | ExprKind::LambdaParamRef { .. }
+        | ExprKind::Literal(_)
+        | ExprKind::SubqueryPlaceholder { .. }) => TypedExpr {
+            data_type,
+            nullable,
+            kind,
+        },
+    }
+}
+
+fn qualify_inner_shadowing_sort_items(
+    items: Vec<SortItem>,
+    inner_scope: &AnalyzerScope,
+    outer_scope: &AnalyzerScope,
+) -> Vec<SortItem> {
+    items
+        .into_iter()
+        .map(|item| SortItem {
+            expr: qualify_inner_shadowing_column_refs(item.expr, inner_scope, outer_scope),
+            asc: item.asc,
+            nulls_first: item.nulls_first,
+        })
+        .collect()
 }
 
 /// `true` when `expr` contains at least one column reference that resolves

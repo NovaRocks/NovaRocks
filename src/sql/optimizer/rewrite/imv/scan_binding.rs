@@ -67,9 +67,10 @@ impl LogicalRewriteRule for BindIcebergScanRule {
                     return Ok(RewriteResult::Unchanged);
                 };
                 let mut bound = bind_delta_scan(scan, &ext.mv_ctx)?;
-                if let Some(column_id) = node.action_column
-                    && !bound.columns.iter().any(ImvActionColumn::matches)
-                {
+                if let Some(column_id) = node.action_column {
+                    bound
+                        .columns
+                        .retain(|column| !is_action_column_name(&column.name));
                     bound
                         .columns
                         .push(ImvActionColumn::output_column(column_id));
@@ -115,11 +116,15 @@ fn bind_version_scan(
     };
     scan.table.source = ScanSource::IcebergVersionTable { table, snapshot_id };
     scan.columns
-        .retain(|column| !ImvActionColumn::matches(column));
+        .retain(|column| !is_action_column_name(&column.name));
     scan.table
         .iceberg_row_lineage_metadata_columns
-        .retain(|column| !column.name.eq_ignore_ascii_case(ImvActionColumn::NAME));
+        .retain(|column| !is_action_column_name(&column.name));
     Ok(scan)
+}
+
+fn is_action_column_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case(ImvActionColumn::NAME)
 }
 
 fn iceberg_table_info_from_source(source: &ScanSource) -> Result<&IcebergTableInfo, String> {
@@ -332,6 +337,44 @@ mod tests {
             !inject.matches(&LogicalPlan::Scan(bound), &ctx),
             "inject action must skip a scan that already carries the marker action id"
         );
+    }
+
+    #[test]
+    fn bind_delta_marker_rebinds_preexisting_action_column_to_marker_id() {
+        let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
+        ctx.set_extension::<ImvExtension>(ImvExtension {
+            mv_ctx: dummy_rewrite_context(),
+            annotation: ImvPlanAnnotation::default(),
+            next_column_id: Arc::new(AtomicU32::new(1000)),
+        });
+        let mut scan = iceberg_scan(Some("uuid-b"));
+        scan.columns.push(OutputColumn {
+            column_id: ColumnId::new_for_test(9),
+            name: ImvActionColumn::NAME.to_string(),
+            data_type: DataType::Int8,
+            nullable: false,
+            is_internal: false,
+        });
+        let plan = LogicalPlan::ImvDelta(ImvDeltaNode {
+            input: Box::new(LogicalPlan::Scan(scan)),
+            is_root: false,
+            action_column: Some(ColumnId::new_for_test(77)),
+            branch_scope: None,
+        });
+
+        let bind = BindIcebergScanRule;
+        let RewriteResult::Changed(LogicalPlan::Scan(bound)) =
+            bind.apply(plan, &mut ctx).expect("bind must succeed")
+        else {
+            panic!("expected changed scan");
+        };
+        let actions = bound
+            .columns
+            .iter()
+            .filter(|column| ImvActionColumn::matches(column))
+            .collect::<Vec<_>>();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].column_id, ColumnId::new_for_test(77));
     }
 
     #[test]

@@ -124,8 +124,12 @@ fn join_output_columns(
     }
     let left_cols = plan_output_columns(left)?;
     let right_cols = plan_output_columns(right)?;
-    let mut out = left_cols;
+    let mut out = left_cols
+        .into_iter()
+        .filter(|column| !column.name.eq_ignore_ascii_case(ImvActionColumn::NAME))
+        .collect::<Vec<_>>();
     out.extend(right_cols);
+    out.retain(|column| !column.name.eq_ignore_ascii_case(ImvActionColumn::NAME));
     Ok(out)
 }
 
@@ -389,6 +393,48 @@ mod tests {
     }
 
     #[test]
+    fn pure_join_delta_drops_preexisting_action_metadata_outputs() {
+        let rule = RewriteJoinDeltaRule;
+        let mut ctx = build_ctx();
+        let plan = LogicalPlan::ImvDelta(ImvDeltaNode {
+            input: Box::new(join_of(
+                project_over(scan_with_action_metadata("left", 1, 8)),
+                project_over(scan_with_action_metadata("right", 10, 15)),
+            )),
+            is_root: false,
+            action_column: Some(ColumnId(100)),
+            branch_scope: None,
+        });
+
+        let RewriteResult::Changed(LogicalPlan::Union(union)) =
+            rule.apply(plan, &mut ctx).expect("expand")
+        else {
+            panic!("pure join-delta must expand into a Union");
+        };
+
+        let action_outputs = union
+            .output_columns
+            .iter()
+            .filter(|column| column.name.eq_ignore_ascii_case(ImvActionColumn::NAME))
+            .collect::<Vec<_>>();
+        assert_eq!(action_outputs.len(), 1);
+        assert_eq!(action_outputs[0].column_id, ColumnId(100));
+        assert!(action_outputs[0].is_internal);
+        for input in &union.inputs {
+            let LogicalPlan::Project(project) = input else {
+                panic!("expected normalized branch Project");
+            };
+            let action_items = project
+                .items
+                .iter()
+                .filter(|item| item.output_name.eq_ignore_ascii_case(ImvActionColumn::NAME))
+                .collect::<Vec<_>>();
+            assert_eq!(action_items.len(), 1);
+            assert_eq!(action_items[0].output_column_id, ColumnId(100));
+        }
+    }
+
+    #[test]
     fn pure_join_delta_rejects_outer_join() {
         let rule = RewriteJoinDeltaRule;
         let mut ctx = build_ctx();
@@ -632,6 +678,21 @@ mod tests {
             dict_columns: Vec::new(),
             required_output_columns: None,
         })
+    }
+
+    fn scan_with_action_metadata(name: &str, first_id: u32, action_id: u32) -> LogicalPlan {
+        let mut plan = scan(name, first_id);
+        let LogicalPlan::Scan(scan) = &mut plan else {
+            unreachable!();
+        };
+        scan.columns.push(OutputColumn {
+            column_id: ColumnId(action_id),
+            name: ImvActionColumn::NAME.to_string(),
+            data_type: DataType::Int8,
+            nullable: false,
+            is_internal: false,
+        });
+        plan
     }
 
     fn column_def(name: &str) -> ColumnDef {
