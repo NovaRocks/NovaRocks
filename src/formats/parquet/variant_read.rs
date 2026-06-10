@@ -21,11 +21,12 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, LargeBinaryBuilder, StructArray};
+use arrow::array::{Array, ArrayRef, LargeBinaryBuilder, RecordBatch, StructArray};
 use arrow::datatypes::DataType;
 use parquet::variant::{VariantArray, unshred_variant};
 
 use crate::exec::variant::VariantValue;
+use crate::types;
 
 fn is_binary_like(dt: &DataType) -> bool {
     matches!(
@@ -160,10 +161,87 @@ pub(crate) fn collapse_variant_struct_to_largebinary(
     Ok(Arc::new(builder.finish()))
 }
 
+/// Replace every VARIANT-typed slot whose column arrived as a parquet
+/// variant struct with the engine-internal LargeBinary form. Non-variant
+/// slots and already-LargeBinary variant slots pass through untouched.
+pub(crate) fn convert_variant_columns(
+    slot_types: &[types::TPrimitiveType],
+    batch: RecordBatch,
+) -> Result<RecordBatch, String> {
+    if slot_types.is_empty() {
+        return Ok(batch);
+    }
+    if !slot_types
+        .iter()
+        .any(|t| *t == types::TPrimitiveType::VARIANT)
+    {
+        return Ok(batch);
+    }
+
+    if batch.num_columns() != slot_types.len() {
+        return Err(format!(
+            "parquet scan slot_types mismatch: columns={} slot_types={}",
+            batch.num_columns(),
+            slot_types.len()
+        ));
+    }
+
+    let schema = batch.schema();
+    let mut new_fields = Vec::with_capacity(schema.fields().len());
+    let mut new_columns = Vec::with_capacity(batch.num_columns());
+
+    for (idx, field) in schema.fields().iter().enumerate() {
+        let col = batch.column(idx);
+        if slot_types[idx] != types::TPrimitiveType::VARIANT {
+            new_fields.push(field.clone());
+            new_columns.push(col.clone());
+            continue;
+        }
+
+        match col.data_type() {
+            DataType::LargeBinary => {
+                new_fields.push(field.clone());
+                new_columns.push(col.clone());
+            }
+            DataType::Struct(_) => {
+                if !is_variant_struct_data_type(col.data_type()) {
+                    return Err(format!(
+                        "VARIANT column `{}` has unsupported struct layout: {:?}",
+                        field.name(),
+                        col.data_type()
+                    ));
+                }
+                let collapsed = collapse_variant_struct_to_largebinary(col, field.name())?;
+                let meta = field.metadata().clone();
+                let new_field = Arc::new(
+                    arrow::datatypes::Field::new(
+                        field.name(),
+                        DataType::LargeBinary,
+                        field.is_nullable(),
+                    )
+                    .with_metadata(meta),
+                );
+                new_fields.push(new_field);
+                new_columns.push(collapsed);
+            }
+            other => {
+                return Err(format!("VARIANT column has unsupported type: {:?}", other));
+            }
+        }
+    }
+
+    let new_schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(
+        new_fields,
+        schema.metadata().clone(),
+    ));
+    RecordBatch::try_new(new_schema, new_columns)
+        .map_err(|e: arrow::error::ArrowError| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::{Field, Fields};
+    use arrow::datatypes::{Field, Fields, Schema};
 
     fn struct_of(fields: Vec<Field>) -> DataType {
         DataType::Struct(Fields::from(fields))
@@ -372,5 +450,39 @@ mod tests {
             err.contains("missing metadata/value"),
             "error says what is wrong: {err}"
         );
+    }
+
+    fn batch_with_variant_struct(shredded: bool) -> RecordBatch {
+        let col = test_variant_struct(shredded);
+        let field = Field::new("v", col.data_type().clone(), true);
+        RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![col]).expect("batch")
+    }
+
+    #[test]
+    fn convert_variant_columns_handles_shredded_struct() {
+        let batch = batch_with_variant_struct(true);
+        let out = convert_variant_columns(&[types::TPrimitiveType::VARIANT], batch)
+            .expect("convert");
+        assert_eq!(out.column(0).data_type(), &DataType::LargeBinary);
+        let col = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        assert_eq!(get_a_int(col.value(0)), Some(1));
+        assert_eq!(get_a_int(col.value(1)), Some(99));
+        assert!(col.is_null(4));
+    }
+
+    #[test]
+    fn convert_variant_columns_passes_through_non_variant() {
+        use arrow::array::Int64Array;
+        let col: ArrayRef = Arc::new(Int64Array::from(vec![1i64, 2]));
+        let field = Field::new("x", DataType::Int64, false);
+        let batch =
+            RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![col]).expect("batch");
+        let out = convert_variant_columns(&[types::TPrimitiveType::BIGINT], batch.clone())
+            .expect("convert");
+        assert_eq!(out.column(0).as_ref(), batch.column(0).as_ref());
     }
 }

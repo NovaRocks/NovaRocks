@@ -29,10 +29,7 @@ pub use cache::{
 };
 
 use anyhow::Result;
-use arrow::array::{
-    Array, ArrayRef, BinaryArray, LargeBinaryArray, LargeBinaryBuilder, RecordBatch, StructArray,
-    new_null_array,
-};
+use arrow::array::{Array, ArrayRef, RecordBatch, StructArray, new_null_array};
 #[cfg(test)]
 use arrow::array::{
     Date32Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
@@ -54,7 +51,6 @@ use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::expr::cast_with_special_rules;
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::RuntimeFilterContext;
-use crate::exec::variant::VariantValue;
 use crate::fs::coalesce_policy::AdaptiveCoalesceController;
 use crate::fs::opendal::OpendalRangeReaderFactory;
 use crate::fs::range_plan::PlannedIoRanges;
@@ -66,7 +62,9 @@ use crate::types;
 use page_selection::build_row_selection_for_row_groups;
 pub(crate) use reader::ParquetCachedReader;
 use row_group_selector::select_row_groups_for_range;
-use variant_read::is_variant_struct_data_type;
+use variant_read::{
+    collapse_variant_struct_to_largebinary, convert_variant_columns, is_variant_struct_data_type,
+};
 
 static PARQUET_COALESCE_CONTROLLER: AdaptiveCoalesceController = AdaptiveCoalesceController::new();
 const IO_TASK_EXEC_TIME_COUNTER: &str = "IOTaskExecTime";
@@ -1014,7 +1012,7 @@ impl Iterator for ParquetScanIter {
                         continue;
                     }
                     let batch = match reorder_batch(&self.cfg, batch)
-                        .and_then(|b| convert_variant_columns(&self.cfg, b))
+                        .and_then(|b| convert_variant_columns(&self.cfg.slot_types, b))
                         .and_then(|b| {
                             normalize_batch_to_chunk_schema(b, &self.scan_read_chunk_schema)
                         })
@@ -1609,7 +1607,7 @@ fn align_iceberg_array_to_field(
     if matches!(target_field.data_type(), DataType::LargeBinary)
         && is_variant_struct_data_type(source_field.data_type())
     {
-        return collapse_variant_struct_to_largebinary(&source_array, target_field);
+        return collapse_variant_struct_to_largebinary(&source_array, target_field.name());
     }
     match (source_field.data_type(), target_field.data_type()) {
         (DataType::Struct(source_children), DataType::Struct(target_children)) => {
@@ -1929,165 +1927,6 @@ fn validate_batch_slot_count(
     Ok(batch)
 }
 
-
-/// Collapse a variant `Struct{metadata, value}` array into the NovaRocks
-/// internal `LargeBinary` form (`VariantValue::serialize`). Mirrors the
-/// per-row logic of `convert_variant_columns`, but works on a single
-/// pre-aligned column from `align_iceberg_array_to_field`.
-fn collapse_variant_struct_to_largebinary(
-    source_array: &ArrayRef,
-    target_field: &Field,
-) -> Result<ArrayRef, String> {
-    let struct_arr = source_array
-        .as_any()
-        .downcast_ref::<StructArray>()
-        .ok_or_else(|| {
-            format!(
-                "expected StructArray for variant column `{}`",
-                target_field.name()
-            )
-        })?;
-    let metadata_col = struct_arr.column(0).clone();
-    let value_col = struct_arr.column(1).clone();
-    let mut builder = LargeBinaryBuilder::new();
-    for row in 0..struct_arr.len() {
-        if struct_arr.is_null(row) {
-            builder.append_null();
-            continue;
-        }
-        let metadata = binary_value_at(&metadata_col, row);
-        let value = binary_value_at(&value_col, row);
-        let serialized = match (metadata, value) {
-            (Ok(Some(m)), Ok(Some(v))) => VariantValue::create(m, v)
-                .unwrap_or_else(|_| VariantValue::null_value())
-                .serialize(),
-            _ => VariantValue::null_value().serialize(),
-        };
-        builder.append_value(serialized.as_slice());
-    }
-    Ok(Arc::new(builder.finish()))
-}
-
-fn convert_variant_columns(
-    cfg: &ParquetScanConfig,
-    batch: RecordBatch,
-) -> Result<RecordBatch, String> {
-    if cfg.slot_types.is_empty() {
-        return Ok(batch);
-    }
-    let mut has_variant = false;
-    for t in &cfg.slot_types {
-        if *t == types::TPrimitiveType::VARIANT {
-            has_variant = true;
-            break;
-        }
-    }
-    if !has_variant {
-        return Ok(batch);
-    }
-
-    if batch.num_columns() != cfg.slot_types.len() {
-        return Err(format!(
-            "parquet scan slot_types mismatch: columns={} slot_types={}",
-            batch.num_columns(),
-            cfg.slot_types.len()
-        ));
-    }
-
-    let schema = batch.schema();
-    let mut new_fields = Vec::with_capacity(schema.fields().len());
-    let mut new_columns = Vec::with_capacity(batch.num_columns());
-
-    for (idx, field) in schema.fields().iter().enumerate() {
-        let col = batch.column(idx);
-        if cfg.slot_types[idx] != types::TPrimitiveType::VARIANT {
-            new_fields.push(field.clone());
-            new_columns.push(col.clone());
-            continue;
-        }
-
-        match col.data_type() {
-            DataType::LargeBinary => {
-                new_fields.push(field.clone());
-                new_columns.push(col.clone());
-            }
-            DataType::Struct(_) => {
-                let struct_arr = col
-                    .as_any()
-                    .downcast_ref::<StructArray>()
-                    .ok_or_else(|| "failed to downcast to StructArray".to_string())?;
-                let mut metadata_idx = None;
-                let mut value_idx = None;
-                for (i, f) in struct_arr.fields().iter().enumerate() {
-                    if f.name() == "metadata" {
-                        metadata_idx = Some(i);
-                    } else if f.name() == "value" {
-                        value_idx = Some(i);
-                    }
-                }
-                let metadata_idx = metadata_idx
-                    .ok_or_else(|| "VARIANT struct missing metadata field".to_string())?;
-                let value_idx =
-                    value_idx.ok_or_else(|| "VARIANT struct missing value field".to_string())?;
-
-                let metadata_col = struct_arr.column(metadata_idx).clone();
-                let value_col = struct_arr.column(value_idx).clone();
-
-                let mut builder = LargeBinaryBuilder::new();
-                for row in 0..batch.num_rows() {
-                    if struct_arr.is_null(row) {
-                        builder.append_null();
-                        continue;
-                    }
-                    let metadata = binary_value_at(&metadata_col, row);
-                    let value = binary_value_at(&value_col, row);
-                    let serialized = match (metadata, value) {
-                        (Ok(Some(m)), Ok(Some(v))) => VariantValue::create(m, v)
-                            .unwrap_or_else(|_| VariantValue::null_value())
-                            .serialize(),
-                        _ => VariantValue::null_value().serialize(),
-                    };
-                    builder.append_value(serialized.as_slice());
-                }
-
-                let meta = field.metadata().clone();
-                let new_field = Arc::new(
-                    arrow::datatypes::Field::new(
-                        field.name(),
-                        DataType::LargeBinary,
-                        field.is_nullable(),
-                    )
-                    .with_metadata(meta),
-                );
-                new_fields.push(new_field);
-                new_columns.push(Arc::new(builder.finish()) as ArrayRef);
-            }
-            other => {
-                return Err(format!("VARIANT column has unsupported type: {:?}", other));
-            }
-        }
-    }
-
-    let new_schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(
-        new_fields,
-        schema.metadata().clone(),
-    ));
-    RecordBatch::try_new(new_schema, new_columns)
-        .map_err(|e: arrow::error::ArrowError| e.to_string())
-}
-
-fn binary_value_at(array: &ArrayRef, row: usize) -> Result<Option<&[u8]>, String> {
-    if array.is_null(row) {
-        return Ok(None);
-    }
-    if let Some(arr) = array.as_any().downcast_ref::<BinaryArray>() {
-        return Ok(Some(arr.value(row)));
-    }
-    if let Some(arr) = array.as_any().downcast_ref::<LargeBinaryArray>() {
-        return Ok(Some(arr.value(row)));
-    }
-    Err("expected binary array".to_string())
-}
 
 fn collect_parquet_coalesce_io_ranges(
     metadata: &ParquetMetaData,
