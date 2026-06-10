@@ -18,6 +18,7 @@ mod cache;
 mod page_selection;
 mod reader;
 mod row_group_selector;
+mod variant_read;
 
 pub use crate::common::min_max_predicate::{
     MinMaxPredicate, MinMaxPredicateOp, MinMaxPredicateValue,
@@ -65,6 +66,7 @@ use crate::types;
 use page_selection::build_row_selection_for_row_groups;
 pub(crate) use reader::ParquetCachedReader;
 use row_group_selector::select_row_groups_for_range;
+use variant_read::is_variant_struct_data_type;
 
 static PARQUET_COALESCE_CONTROLLER: AdaptiveCoalesceController = AdaptiveCoalesceController::new();
 const IO_TASK_EXEC_TIME_COUNTER: &str = "IOTaskExecTime";
@@ -1927,23 +1929,6 @@ fn validate_batch_slot_count(
     Ok(batch)
 }
 
-/// Returns `true` when `data_type` is the canonical Iceberg V3 variant
-/// physical layout: `Struct { metadata: Binary, value: Binary }`. This
-/// matches both required and nullable variants of either child Field.
-fn is_variant_struct_data_type(data_type: &DataType) -> bool {
-    let DataType::Struct(fields) = data_type else {
-        return false;
-    };
-    if fields.len() != 2 {
-        return false;
-    }
-    let m = &fields[0];
-    let v = &fields[1];
-    m.name() == "metadata"
-        && matches!(m.data_type(), DataType::Binary)
-        && v.name() == "value"
-        && matches!(v.data_type(), DataType::Binary)
-}
 
 /// Collapse a variant `Struct{metadata, value}` array into the NovaRocks
 /// internal `LargeBinary` form (`VariantValue::serialize`). Mirrors the
