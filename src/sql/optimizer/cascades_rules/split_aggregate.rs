@@ -77,12 +77,8 @@ fn is_eligible(agg: &LogicalAggregateOp) -> bool {
 }
 
 fn is_splittable_aggregate(call: &AggregateCall) -> bool {
-    !call.distinct
-        && call.order_by.is_empty()
-        && matches!(
-            call.name.to_ascii_lowercase().as_str(),
-            "sum" | "min" | "max" | "count"
-        )
+    use crate::sql::agg_mergeability::{AggMergeability, aggregate_mergeability};
+    aggregate_mergeability(call) == AggMergeability::TwoPhase
 }
 
 fn local_output_columns(agg: &LogicalAggregateOp) -> Vec<OutputColumn> {
@@ -366,6 +362,39 @@ mod tests {
         assert_eq!(local.stage, AggStage::Local);
         assert!(local.group_by.is_empty());
         assert_eq!(local.output_columns[0].column_id, ColumnId::new_for_test(3));
+    }
+
+    fn avg_call() -> AggregateCall {
+        AggregateCall {
+            name: "avg".to_string(),
+            args: vec![col_ref(2, "v")],
+            distinct: false,
+            result_type: arrow::datatypes::DataType::Float64,
+            order_by: vec![],
+            output_column_id: ColumnId::UNSET,
+        }
+    }
+
+    #[test]
+    fn splits_grouped_avg_aggregate() {
+        let mut memo = Memo::new();
+        let child = values_group(&mut memo);
+        let expr = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+                vec![nullable_col_ref(1, "k", true)],
+                vec![avg_call()],
+                vec![output_column(1, "k"), output_column(3, "avg(v)")],
+            )),
+            children: vec![child],
+        };
+        let out = SplitAggregateRule.apply(&expr, &mut memo);
+        assert_eq!(out.len(), 1, "avg must now produce a split alternative");
+        let Operator::LogicalAggregate(global) = &out[0].op else {
+            panic!("expected global aggregate");
+        };
+        assert_eq!(global.stage, AggStage::Global);
+        assert_eq!(global.is_merge, vec![true]);
     }
 
     #[test]

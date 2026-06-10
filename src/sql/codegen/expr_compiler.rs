@@ -2717,7 +2717,7 @@ fn infer_map_constructor_return_type(arg_types: &[DataType]) -> DataType {
 
 /// Returns (output_type, intermediate_type) for aggregate functions.
 /// `None` as intermediate_type means the execution layer should use its default.
-fn infer_agg_function_types(
+pub(crate) fn infer_agg_function_types(
     name: &str,
     arg_types: &[DataType],
     _is_distinct: bool,

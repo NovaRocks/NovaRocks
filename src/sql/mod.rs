@@ -1,3 +1,4 @@
+pub(crate) mod agg_mergeability;
 pub(crate) mod analysis;
 pub(crate) mod catalog;
 pub(crate) mod column_id;
