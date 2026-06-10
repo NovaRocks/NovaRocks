@@ -175,6 +175,36 @@ impl VariantMetadata {
     }
 }
 
+/// Split the engine-internal serialized variant form
+/// `[size:u32 LE | metadata | value]` into zero-copy `(metadata, value)`
+/// slices. Validation mirrors the original `VariantValue::from_serialized` logic.
+pub fn split_serialized(data: &[u8]) -> Result<(&[u8], &[u8]), String> {
+    if data.len() < 4 {
+        return Err("Invalid variant slice: too small to contain size header".to_string());
+    }
+    let size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    if size > VARIANT_MAX_SIZE {
+        return Err(format!(
+            "Variant size exceeds maximum limit: {} > {}",
+            size, VARIANT_MAX_SIZE
+        ));
+    }
+    if size > data.len().saturating_sub(4) {
+        return Err(format!(
+            "Invalid variant size: {} exceeds available data: {}",
+            size,
+            data.len().saturating_sub(4)
+        ));
+    }
+    let payload = &data[4..4 + size];
+    let metadata = load_metadata(payload)?;
+    if metadata.len() > payload.len() {
+        return Err("Metadata size exceeds variant size".to_string());
+    }
+    let metadata_len = metadata.len();
+    Ok((&payload[..metadata_len], &payload[metadata_len..]))
+}
+
 #[derive(Clone, Debug)]
 pub struct VariantValue {
     metadata: VariantMetadata,
@@ -201,31 +231,8 @@ impl VariantValue {
     }
 
     pub fn from_serialized(data: &[u8]) -> Result<Self, String> {
-        if data.len() < 4 {
-            return Err("Invalid variant slice: too small to contain size header".to_string());
-        }
-        let size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-        if size > VARIANT_MAX_SIZE {
-            return Err(format!(
-                "Variant size exceeds maximum limit: {} > {}",
-                size, VARIANT_MAX_SIZE
-            ));
-        }
-        if size > data.len().saturating_sub(4) {
-            return Err(format!(
-                "Invalid variant size: {} exceeds available data: {}",
-                size,
-                data.len().saturating_sub(4)
-            ));
-        }
-        let payload = &data[4..4 + size];
-        let metadata = load_metadata(payload)?;
-        if metadata.len() > payload.len() {
-            return Err("Metadata size exceeds variant size".to_string());
-        }
-        let metadata_bytes = metadata.to_vec();
-        let value_bytes = payload[metadata.len()..].to_vec();
-        Self::create(&metadata_bytes, &value_bytes)
+        let (metadata, value) = split_serialized(data)?;
+        Self::create(metadata, value)
     }
 
     pub fn null_value() -> Self {
@@ -1424,4 +1431,27 @@ fn format_fraction_trim(value: u32, width: usize) -> String {
 
 fn format_fraction_fixed(value: u32, width: usize) -> String {
     format!("{:0width$}", value, width = width)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_serialized_round_trips_create_inputs() {
+        let metadata = VariantMetadata::empty();
+        let value = vec![6u8 << 2, 123, 0, 0, 0, 0, 0, 0, 0]; // int64 primitive 123
+        let v = VariantValue::create(metadata.raw(), &value).expect("create");
+        let serialized = v.serialize();
+        let (m, val) = split_serialized(&serialized).expect("split");
+        assert_eq!(m, metadata.raw());
+        assert_eq!(val, value.as_slice());
+    }
+
+    #[test]
+    fn split_serialized_rejects_truncated_input() {
+        assert!(split_serialized(&[0u8, 0, 0]).is_err());
+        // size header claims more bytes than present
+        assert!(split_serialized(&[200u8, 0, 0, 0, 1]).is_err());
+    }
 }
