@@ -485,4 +485,62 @@ mod tests {
             .expect("convert");
         assert_eq!(out.column(0).as_ref(), batch.column(0).as_ref());
     }
+
+    #[test]
+    fn shredded_parquet_file_round_trips_to_engine_form() {
+        use parquet::arrow::ArrowWriter;
+        use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
+        use std::collections::HashMap;
+        use std::fs::File;
+
+        let inner = test_variant_struct(true);
+        let mut md = HashMap::new();
+        md.insert(
+            "ARROW:extension:name".to_string(),
+            "arrow.parquet.variant".to_string(),
+        );
+        md.insert("ARROW:extension:metadata".to_string(), String::new());
+        md.insert("PARQUET:field_id".to_string(), "2".to_string());
+        let field = Field::new("v", inner.data_type().clone(), true).with_metadata(md);
+        let schema = Arc::new(Schema::new(vec![field]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![inner]).expect("batch");
+
+        let dir = std::env::temp_dir().join(format!(
+            "nova_variant_read_test_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("t").len()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("shredded.parquet");
+        {
+            let f = File::create(&path).expect("create");
+            let mut w = ArrowWriter::try_new(f, schema, None).expect("writer");
+            w.write(&batch).expect("write");
+            w.close().expect("close");
+        }
+
+        let opts = ArrowReaderOptions::new().with_skip_arrow_metadata(true);
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new_with_options(File::open(&path).expect("open"), opts)
+                .expect("builder");
+        let mut reader = builder.build().expect("build");
+        let read_batch = reader.next().expect("one batch").expect("batch ok");
+
+        // The file's variant column comes back as the shredded struct; the
+        // engine conversion must reconstruct full variant rows from it.
+        let out = convert_variant_columns(&[types::TPrimitiveType::VARIANT], read_batch)
+            .expect("convert from file");
+        let col = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        assert_eq!(col.len(), 5);
+        assert_eq!(get_a_int(col.value(0)), Some(1));
+        assert_eq!(get_a_int(col.value(1)), Some(99));
+        assert_eq!(get_a_int(col.value(2)), None);
+        assert!(col.is_null(4));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
