@@ -11,6 +11,7 @@
 //! `docs/superpowers/specs/2026-05-21-g3-output-properties-visitor-design.md`
 //! §1 for the explanation.
 
+use super::cost::{DISTRIBUTION_STARTUP_COST, NETWORK_COST};
 use super::memo::Cost;
 use super::operator::*;
 use super::property::*;
@@ -194,12 +195,8 @@ pub(crate) fn needed_enforcers(
     enforcers
 }
 
-/// Network cost multiplier — must stay in sync with `cost.rs`.
-const NETWORK_COST: f64 = 1.5;
-/// Fixed startup cost for a distribution enforcer. Exchange setup and sender
-/// synchronization are visible for tiny joins, especially in debug builds, so
-/// a pure byte cost makes small shuffles look unrealistically cheap.
-const DISTRIBUTION_STARTUP_COST: f64 = 16.0 * 1024.0 * 1024.0;
+// `NETWORK_COST` and `DISTRIBUTION_STARTUP_COST` are the single source of truth
+// in `cost`; imported at the top of this module to avoid drift.
 
 /// Estimate the cost of an enforcer given group statistics.
 pub(crate) fn estimate_enforcer_cost(enforcer: &EnforcerKind, stats: &Statistics) -> Cost {

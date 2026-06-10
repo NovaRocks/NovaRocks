@@ -11,10 +11,14 @@ use crate::sql::optimizer::derive::PropertyAlternativeKind;
 use crate::sql::optimizer::statistics::Statistics;
 
 /// Network transfer multiplier applied to data that crosses node boundaries.
-const NETWORK_COST: f64 = 1.5;
-/// Fixed startup cost for distribution/exchange operators. Keep aligned with
-/// `derive::estimate_enforcer_cost`.
-const DISTRIBUTION_STARTUP_COST: f64 = 16.0 * 1024.0 * 1024.0;
+/// Single source of truth: `derive` imports this constant.
+pub(crate) const NETWORK_COST: f64 = 1.5;
+/// Fixed startup cost for distribution/exchange operators and enforcers.
+/// Exchange setup and sender synchronization are visible for tiny joins,
+/// especially in debug builds, so a pure byte cost makes small shuffles look
+/// unrealistically cheap. Single source of truth: `derive::estimate_enforcer_cost`
+/// imports this constant (and waives it for ShuffleAgg pre-aggregation shuffles).
+pub(crate) const DISTRIBUTION_STARTUP_COST: f64 = 16.0 * 1024.0 * 1024.0;
 
 /// Penalty multiplier for cross joins (matches StarRocks `CROSS_JOIN_COST_PENALTY`).
 const CROSS_JOIN_COST_PENALTY: f64 = 10.0;
