@@ -22,6 +22,7 @@ mod dispatch;
 mod get_variant;
 mod json_keys;
 mod parse_json;
+mod variant_get;
 mod variant_typeof;
 
 pub use dispatch::{eval_variant_function, metadata, register};
@@ -32,4 +33,5 @@ pub use get_variant::{
 };
 pub use json_keys::eval_json_keys;
 pub use parse_json::eval_parse_json;
+pub use variant_get::{eval_try_variant_get, eval_variant_get, variant_get_target_type};
 pub use variant_typeof::eval_variant_typeof;
