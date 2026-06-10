@@ -32,8 +32,20 @@ capability-driven(PR #257 / #258),refresh 接入 shared operation lifecycle
 - 两个平行结果类型:`AffectedMvPartitions`(Unpartitioned / Known{new,old} / Unknown,
   planner 路径)与 `AffectedAggregateTargetPartitions`(Unpartitioned / Known,
   aggregate 路径)。
-- partition derivation 只存在于 apply helper 中(`build_aggregate_target_partition_filter`),
-  logical rewrite 层无 partition 信息;`ImvPlanAnnotation` 仍是空壳占位
+- **生产 aggregate 剪枝路径(merge-sink cutover 后)**:plan 时
+  `plan_aggregate_mv_affected_partitions`(manifest 路径,与 PF 共用
+  `planner::plan_affected_partitions`)→ `RefreshPlan.affected_partitions` →
+  codegen 时 `refresh_context::target_state_partition_allow_list` 对
+  `IcebergMvTargetState` scan 做文件级剪枝;row 级精确过滤由
+  `IcebergMvTargetStateRowFilter::DeltaInputRowIds` 运行时 row-filter 承担;
+  locator 输入由 `load_target_apply_locator_inputs` 预载。
+- **delta-chunk 推导链是死代码**(2026-06-10 核实):
+  `apply_iceberg_aggregate_delta_chunks` / `build_aggregate_target_partition_filter` /
+  `derive_from_aggregate_delta` 的 delta-chunk 求值 /
+  `load_touched/current_aggregate_target_state` 在 PR #231 merge-sink cutover 后
+  无生产调用方,仅单元测试引用;`iceberg_aggregate_mv.apply` 13 字段事件也只从
+  死路径发出。其中 delta-chunk 求值逻辑是 P2+ 需要的资产,需先提取再删除死壳。
+- logical rewrite 层无 partition 信息;`ImvPlanAnnotation` 仍是空壳占位
   (`src/sql/optimizer/rewrite/imv/annotation.rs`)。
 - `IcebergMvTargetStateScan.partition_constraint`(Unpartitioned /
   AffectedPartitionAllowListRequired)已经为 derivation 留好消费接口,allow-list 在
@@ -42,7 +54,11 @@ capability-driven(PR #257 / #258),refresh 接入 shared operation lifecycle
   `Unknown("... not implemented")`,无剪枝。
 - target 行 locator(`locate_target_rows_by_*`,`src/engine/mv/iceberg_target_apply.rs`)
   已投影 `_file` / `_pos` 元列,但**不接受 partition filter**,扫全表后按 apply key 过滤。
-- partitioned aggregate MV 的 derivation 失败 → 整个 refresh fail-fast(PR #231 约束)。
+- partitioned aggregate MV 的 affected partitions 为 `Unknown` 时,现状是
+  `tracing::warn` + target-state 全表 scan(`refresh_context.rs::target_state_partition_allow_list`)
+  ——静默性能回退,正确性不受影响;**没有** derivation 失败即 fail refresh 的行为。
+  contract drift / transform 不匹配的 fail-fast 发生在
+  `filter_target_state_files_by_partition` 的 mapping 校验,与 derivation 是两回事。
 - 阈值 / fallback / per-partition state / REPARTITION 均不存在。
 
 ## 2. 决策记录(本设计前置澄清)
@@ -57,6 +73,13 @@ capability-driven(PR #257 / #258),refresh 接入 shared operation lifecycle
 - **D4 per-partition state v1 边界**:观测优先。refresh 保持 staging branch 原子 commit;
   partition state 是 commit 成功后的派生元数据 + 失败诊断,不引入 partition-scoped
   commit,不做 partition 级局部 retry(留作后续 phase)。
+- **D5 架构基线修正 + policy 后置(2026-06-10,写 P1 计划时核实)**:本 spec 初稿的
+  §5 叙述部分基于 PR #231 之前的 apply 路径;实际生产路径见 §1 修正。由此:
+  (a) P1 的「aggregate 迁移」对象改为真实的 plan-time planner / annotation /
+  constraint 接线,并删除死的 pre-cutover apply 路径(先提取 delta-chunk 求值器);
+  (b) v1 所有 shape 的 `PartitionPruningPolicy` 一律 `BestEffort`(保持现状的
+  warn + 全扫回退),`Required` 枚举值落地但暂不启用,收紧到 Required 的决定
+  推迟到 P2/P3(届时 NotDerivable 场景更少、证据更全)。
 
 ## 3. 方案对比
 
@@ -89,9 +112,12 @@ pub(crate) struct PartitionDerivationSpec {
 
 pub(crate) struct PartitionDerivationField {
     pub partition_field_name: String,
-    pub delta_output_column: ColumnId,        // 已解析到 delta plan 输出列
+    pub source_target_field_id: i32,          // contract 级稳定标识
+    pub output_index: usize,                  // 在 target.visible_columns 中的位置
     pub transform: iceberg::spec::Transform,  // 已验证支持(Void 拒绝)
 }
+// D5 修正:不用 plan ColumnId——求值发生在 chunk 上,绑定经由 layout/schema 名
+// (apply 侧 binder);P2 join 路径再评估是否需要 plan 级绑定。
 ```
 
 - `AffectedTargetPartitions` 替代并统一 `AffectedMvPartitions` 与
@@ -143,16 +169,16 @@ pub(crate) enum PartitionPruningPolicy {
 
 | shape | v1 policy | 依据 |
 |---|---|---|
-| partitioned aggregate / join aggregate(非 union) | `Required` | 保持 PR #231 现状(`AffectedPartitionAllowListRequired`),不引入静默退化 |
-| 单 base projection/filter(manifest 路径) | `BestEffort` | 现状即如此(Unknown → 不剪枝) |
-| join projection/filter、UNION ALL families | `BestEffort` | 新能力,首版不把剪枝变成正确性门槛 |
+| 全部 shape(D5 修正) | `BestEffort` | 现状即如此:Unknown/NotDerivable → warn + 不剪枝,正确性不变 |
 
-优先级规则:**contract 含 branch(union families)时一律 `BestEffort`**,即使带
-aggregate state(A-family / B-family)——union 的 partition 剪枝是本设计新增能力,
-不继承 aggregate 的 Required 约束。
+`Required` 作为枚举值落地但 v1 不启用;是否把 partitioned aggregate 收紧到
+`Required`(NotDerivable ⇒ fail refresh,属于语义收紧而非保持现状)推迟到 P2/P3
+再决定。优先级规则(届时生效):**contract 含 branch(union families)时一律
+`BestEffort`**,即使带 aggregate state(A-family / B-family)。
 
 执行点:rewrite 本身从不 fail(§4.2);policy 在 refresh dispatch 消费 annotation 时
-执行——`Required` + `NotDerivable` ⇒ 在 apply 开始前 fail-fast,错误信息带 reason。
+执行——`Required` + `NotDerivable` ⇒ 在 apply 开始前 fail-fast,错误信息带 reason;
+`BestEffort` + `NotDerivable` ⇒ 不剪枝 + tracing(现状的 warn 升级为结构化事件)。
 
 **概念边界**:policy 管「语义上能否证明」;阈值 fallback(§5.4)管「可推导但量太大」,
 是纯性能策略,两者正交,fallback 不违反 `Required`。
@@ -169,7 +195,8 @@ plan_iceberg_mv_refresh
         ▼
   evaluate_partition_spec(spec, delta_chunks) ──► AffectedTargetPartitions::Known
         │
-        ├─► TargetPartitionFilter::AllowList ──► state read 剪枝(现有,保留)
+        ├─► TargetPartitionFilter::AllowList ──► target-state 剪枝(P2 起接 live 路径;
+        │      P1 的 live 剪枝输入仍是 plan-time manifest 推导,行为不变)
         └─► locator 剪枝(新):locate_target_rows_by_* 增加 partition filter 参数
 ```
 
@@ -180,18 +207,30 @@ plan_iceberg_mv_refresh
 
 ## 5. §2 shape 接入 + 性能层(任务 12 / 17 / 15 / 16)
 
-### 5.1 Aggregate / join aggregate:迁移,不改行为
+### 5.1 Aggregate / join aggregate:接入真实路径,不改行为(D5 修正)
 
-- resolution 段(lineage 验证、transform 映射、layout 列解析)上移进
-  `DerivePartitionSpecRule`;transformation + partitioning 段成为通用求值器。
-- `build_aggregate_target_partition_filter` 改为:从 annotation 取 spec → 求值器 →
-  `TargetPartitionFilter`;`touched_row_ids` 提取逻辑不动。
+- **求值器提取**:`derive_from_aggregate_delta` 的三段拆为
+  `resolve_partition_derivation_spec(contract)`(contract 级,steps 1-2 + transform)
+  + `bind_spec_to_aggregate_layout(spec, layout)`(steps 3-4,layout 依赖留在
+  apply 侧 binder)+ `evaluate_partition_spec(bound, chunks)`(机械求值)。
+  注:`PartitionDerivationField` 用 `source_target_field_id` + `output_index`
+  标识列,不用 §4.1 初稿写的 plan `ColumnId`——求值发生在 chunk 上,绑定经由
+  layout/schema 名,plan ColumnId 在 P1 没有消费方(P2 join 路径再评估)。
+- **死代码删除**:提取完成后删除 pre-cutover apply 壳
+  (`apply_iceberg_aggregate_delta_chunks`、`build_aggregate_target_partition_filter`、
+  `load_touched/current_aggregate_target_state`、只为死路径服务的
+  `iceberg_aggregate_mv.apply` 事件发射器);每个符号删除前必须核实无生产调用方。
+- **annotation 接线**:`DerivePartitionSpecRule` 在 rewrite 时从 contract 解析 spec
+  写入 annotation;P1 中 annotation 的消费方是观测(trace/log)与测试断言,
+  live 剪枝输入仍是 plan-time manifest 路径(行为不变);P2 起 annotation spec
+  成为 join PF / sink 侧剪枝的求值输入。
 - `AffectedPartitionError` 全部 variant 保留,按时机分层:
-  - plan 时报:`ContractMissing` / `TransformUnsupported` / `OutputLineageNotPureColumn`;
+  - plan 时报(进 annotation `NotDerivable`):`ContractMissing` /
+    `TransformUnsupported` / `OutputLineageNotPureColumn`;
   - 运行时报(依赖实际 chunk):`GroupKeyColumnMissing` / `GroupKeyTypeMismatch` /
     `TransformFailed`。
-- 验收:现有 `iceberg-ivm` partitioned aggregate SQL golden 全部不变;tracing 多出
-  rewrite 阶段 `partition_spec_resolved` 事件。
+- 验收:现有 `iceberg-ivm` partitioned aggregate SQL golden 全部不变;rewrite 阶段
+  新增 `iceberg_mv.partition_derivation` tracing 事件。
 
 ### 5.2 Join projection/filter(任务 17)
 
@@ -227,32 +266,36 @@ mv_refresh_max_affected_partitions = 4096   # allow-list 剪枝上限
 
 两阈值正交,组合为退化矩阵(全部 correctness 等价):
 
+落点是 live merge-sink 路径(D5 修正):partition 剪枝 = target-state scan 的
+allow-list 文件绑定(`target_state_partition_allow_list`);row-id 精确过滤 =
+`DeltaInputRowIds` 运行时 row-filter。
+
 | touched groups | affected partitions | 行为 | fallback_reason |
 |---|---|---|---|
-| ≤限 | ≤限 | 正常:partition 剪枝 + row-id 过滤 | — |
-| 超限 | ≤限 | **A**:保留 partition 剪枝,放弃 row-id 过滤(touched partitions 全行读 + merge 后 filter) | `threshold_touched_groups` |
-| ≤限 | 超限 | 放弃 partition 剪枝,保留 row-id 过滤 | `threshold_partitions` |
-| 超限 | 超限 | **B**:full-load(`load_current_aggregate_target_state`,PR #145 前已知正确路径) | 两者并记 |
+| ≤限 | ≤限 | 正常:allow-list 文件剪枝 + row-id 运行时过滤 | — |
+| 超限 | ≤限 | **A**:保留 allow-list 剪枝,放弃 row-id 过滤 | `threshold_touched_groups` |
+| ≤限 | 超限 | 放弃 allow-list 剪枝,保留 row-id 过滤 | `threshold_partitions` |
+| 超限 | 超限 | **B**:全量 target-state scan(即现状 Unknown 回退路径,已知正确) | 两者并记 |
 
-- 默认值保守,实现期参照任务 14 perf baseline 校准;`load_current_aggregate_target_state`
-  保留不删(B 路径依赖)。
+- 默认值保守,实现期参照任务 14 perf baseline 校准。
 - fallback 不掩盖真正的 fail-fast 错误(contract drift / transform unsupported 照常报错)。
 
 ### 5.5 File/position 精确 state read(任务 16)
 
-- 现状:locator 已投影 `_file` / `_pos`(`iceberg_target_apply.rs:719`),输出
-  (file, pos, apply_key);state read 另扫 touched partitions 全行再按 row-id 过滤——
-  这是 `O(touched partitions target rows)` 与终态 `O(touched groups)` 的差距。
-- 设计:**locator 提前到 merge 前运行一次,输出双用**:
-  - (a) 喂 state read fast path
-    `load_touched_aggregate_target_state_by_positions(positions_by_file, ...)`;
-  - (b) 继续供 delete 阶段 `PositionDeleteGroup`。
-  两者共享一次 `plan_files`,消除重复扫描。
+- 现状(live 路径,D5 修正):locator 输入预载(`load_target_apply_locator_inputs`)
+  与 apply-key locator 扫描已投影 `_file` / `_pos`(`iceberg_target_apply.rs:719`),
+  输出 (file, pos, apply_key);target-state scan 则按 allow-list 文件粒度绑定后
+  整文件读、由 `DeltaInputRowIds` row-filter 在行级过滤——这是
+  `O(touched partitions target rows)` 与终态 `O(touched groups)` 的差距。
+- 设计方向:**locator 输出双用**——(a) 把 (file, pos) 集合转化为 target-state
+  scan 的 position 级绑定 / 过滤,(b) 继续供 delete 阶段 `PositionDeleteGroup`;
+  两者共享一次 `plan_files`。在 merge-sink 架构下的具体绑定形态(codegen 时
+  文件绑定 vs 运行时 position 注入)是 P4 的首要 verify item。
 - 过滤深度:`_file` 在 `FileScanTask` 粒度筛(等价 manifest 级);`_pos` 谓词能否进
   row-group 级是实现期 verify item(vendored iceberg-0.9.0),进不去则 batch 层过滤,
   仍优于读整 file。
-- fallback 链:positions 路径失败 / 为空 → partition + row-id 路径(§5.4 矩阵)→
-  full-load;每层 correctness 等价,tracing 记录实际层。
+- fallback 链:positions 路径失败 / 为空 → allow-list + row-id 路径(§5.4 矩阵)→
+  全量 target-state scan;每层 correctness 等价,tracing 记录实际层。
 - 语义守护:locator 输出(touched 旧行)与 state read 输入是同一批行;若未来 locator
   范围扩展,必须拆开(继承任务文档风险 2)。
 
@@ -327,7 +370,7 @@ mv_refresh_max_affected_partitions = 4096   # allow-list 剪枝上限
 
 | Phase | 内容 | 任务 | 预估 PR 数 | 依赖 |
 |---|---|---|---|---|
-| P1 | 统一类型 + 求值器抽取 + `DerivePartitionSpecRule`(aggregate 迁移,行为不变)+ annotation / policy | 12 | 2-3 | — |
+| P1 | 统一类型 + 求值器抽取 + 死代码删除(pre-cutover apply 路径)+ `DerivePartitionSpecRule` + annotation / policy(全 BestEffort,行为不变) | 12 | 3 | — |
 | P2 | locator partition filter 贯通 + join PF derivation + union 并集 | 12+17 | 2-3 | P1 |
 | P3 | thresholds config + 退化矩阵 | 15 | 1-2 | P2 |
 | P4 | locator 前移双用 + positions state read + perf 验证 | 16 | 2 | P2(与 P3 并行) |
