@@ -104,9 +104,8 @@ pub(crate) fn collapse_variant_struct_to_largebinary(
     // Holds the unshredded form alive for the borrow below.
     let unshredded_holder;
     let (metadata_col, value_col): (ArrayRef, ArrayRef) = if has_typed_value {
-        let variant = VariantArray::try_new(source_array.as_ref()).map_err(|e| {
-            format!("variant column `{column_name}`: invalid shredded layout: {e}")
-        })?;
+        let variant = VariantArray::try_new(source_array.as_ref())
+            .map_err(|e| format!("variant column `{column_name}`: invalid shredded layout: {e}"))?;
         unshredded_holder = unshred_variant(&variant)
             .map_err(|e| format!("variant column `{column_name}`: unshred failed: {e}"))?;
         let value = unshredded_holder.value_field().ok_or_else(|| {
@@ -126,9 +125,8 @@ pub(crate) fn collapse_variant_struct_to_largebinary(
         let metadata_idx = metadata_idx.ok_or_else(|| {
             format!("variant column `{column_name}`: struct missing metadata field")
         })?;
-        let value_idx = value_idx.ok_or_else(|| {
-            format!("variant column `{column_name}`: struct missing value field")
-        })?;
+        let value_idx = value_idx
+            .ok_or_else(|| format!("variant column `{column_name}`: struct missing value field"))?;
         (
             struct_arr.column(metadata_idx).clone(),
             struct_arr.column(value_idx).clone(),
@@ -171,10 +169,7 @@ pub(crate) fn convert_variant_columns(
     if slot_types.is_empty() {
         return Ok(batch);
     }
-    if !slot_types
-        .iter()
-        .any(|t| *t == types::TPrimitiveType::VARIANT)
-    {
+    if !slot_types.contains(&types::TPrimitiveType::VARIANT) {
         return Ok(batch);
     }
 
@@ -324,7 +319,9 @@ mod tests {
     use arrow::array::{LargeBinaryArray, StringArray};
     use parquet::variant::{ShreddedSchemaBuilder, json_to_variant, shred_variant};
 
-    use crate::exec::variant::{parse_variant_path, variant_query, variant_to_i64, variant_to_string};
+    use crate::exec::variant::{
+        parse_variant_path, variant_query, variant_to_i64, variant_to_string,
+    };
 
     /// Build the canonical 5-row test column from JSON, optionally shredded
     /// on path `a` as Int64. Rows: shredded int, shredded int, missing `a`,
@@ -378,7 +375,10 @@ mod tests {
         assert_eq!(get_a_int(out.value(0)), Some(1));
         assert_eq!(get_a_int(out.value(1)), Some(99));
         assert_eq!(get_a_int(out.value(2)), None); // `a` missing
-        assert!(!out.is_null(3), "row 3 (wrong-typed a) round-trips without error");
+        assert!(
+            !out.is_null(3),
+            "row 3 (wrong-typed a) round-trips without error"
+        );
         assert!(out.is_null(4)); // SQL NULL preserved
     }
 
@@ -394,7 +394,11 @@ mod tests {
             .unwrap();
         let plain = plain.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
         for row in 0..5 {
-            assert_eq!(shredded.is_null(row), plain.is_null(row), "row {row} nullness");
+            assert_eq!(
+                shredded.is_null(row),
+                plain.is_null(row),
+                "row {row} nullness"
+            );
             if shredded.is_null(row) {
                 continue;
             }
@@ -443,8 +447,8 @@ mod tests {
             vec![metadata, value],
             None::<NullBuffer>,
         ));
-        let err = collapse_variant_struct_to_largebinary(&struct_arr, "v")
-            .expect_err("must fail fast");
+        let err =
+            collapse_variant_struct_to_largebinary(&struct_arr, "v").expect_err("must fail fast");
         assert!(err.contains("v"), "error names the column: {err}");
         assert!(
             err.contains("missing metadata/value"),
@@ -461,8 +465,8 @@ mod tests {
     #[test]
     fn convert_variant_columns_handles_shredded_struct() {
         let batch = batch_with_variant_struct(true);
-        let out = convert_variant_columns(&[types::TPrimitiveType::VARIANT], batch)
-            .expect("convert");
+        let out =
+            convert_variant_columns(&[types::TPrimitiveType::VARIANT], batch).expect("convert");
         assert_eq!(out.column(0).data_type(), &DataType::LargeBinary);
         let col = out
             .column(0)
@@ -520,9 +524,11 @@ mod tests {
         }
 
         let opts = ArrowReaderOptions::new().with_skip_arrow_metadata(true);
-        let builder =
-            ParquetRecordBatchReaderBuilder::try_new_with_options(File::open(&path).expect("open"), opts)
-                .expect("builder");
+        let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(
+            File::open(&path).expect("open"),
+            opts,
+        )
+        .expect("builder");
         let mut reader = builder.build().expect("build");
         let read_batch = reader.next().expect("one batch").expect("batch ok");
 

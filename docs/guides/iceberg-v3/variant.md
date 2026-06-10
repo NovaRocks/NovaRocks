@@ -9,7 +9,8 @@
 | `INSERT INTO ... VALUES (parse_json(...))` 写 variant 列 | ✅ | PR #87；单 partition spec、无 shredding |
 | `INSERT INTO ... SELECT` 写 variant 列 | ✅ | PR #87 |
 | `INSERT OVERWRITE` / `DELETE` / `UPDATE` / `MERGE INTO` / `ADD EQUALITY DELETE` 在 variant-bearing 表 | ❌ | PR #87 fail-fast，给出可执行错误信息 |
-| Variant *shredding*（`typed_value` 子树） | ❌ | spec optional，本次未做 |
+| Variant *shredding* 读（`typed_value` 子树） | ✅ | IV3-6 PR-1；`unshred_variant` 内核重建 |
+| Variant *shredding* 写 | ❌ | IV3-6 PR-6 计划内 |
 | Variant default value（`initial-default` / `write-default`） | ❌ | |
 | Variant 在 partition spec / sort order / equality_ids | ❌ | spec 禁止；NovaRocks reject |
 | Variant predicate pushdown 到 parquet | ❌ | |
@@ -73,9 +74,14 @@ ALTER TABLE t ADD EQUALITY DELETE ...;    -- ERROR: variant column not supported
 
 Spec 禁止；NovaRocks 在 CREATE TABLE / ALTER PARTITION 阶段 reject，错误信息明确说明。
 
-## ❌ Variant shredding（typed_value）
+## 🟡 Variant shredding（typed_value）
 
-Spec optional 能力：在 parquet 物理结构里把"已知 schema 部分"提到 `typed_value` 子树以加速点查 / pushdown。NovaRocks 当前不写 shredded variant，读端遇到 cross-engine 写出的 shredded variant 退化按 metadata + value 解码。
+Spec optional 能力：在 parquet 物理结构里把"已知 schema 部分"提到 `typed_value` 子树以加速点查 / pushdown。
+
+- **读：✅ 已支持。** 读端检测 `typed_value` 子树后经上游 `unshred_variant` 内核重建完整
+  variant（`src/formats/parquet/variant_read.rs`），shredded 与非 shredded 文件给出逐行一致的
+  查询结果。损坏行（非空行缺 metadata/value 字节）显式报错，不再静默置 null。
+- **写：❌ 未支持**（IV3-6 PR-6 计划内，显式表属性 `write.parquet.variant-shredding.<col>`）。
 
 ## ❌ Variant default value
 
@@ -89,4 +95,4 @@ Spec：variant 字段 path 提取（`payload:user.id > 1000`）应该可以下�
 
 ## 路线图
 
-按 [完成度清单](reference/support-matrix.md#43-v3-新类型) 的优先级，剩余 variant 工作（OVERWRITE / DELETE / UPDATE / MERGE 写、shredding、predicate pushdown、partition / sort 中使用）排在 P3（"v3 类型 tail"），优先级低于 catalog 生态、cross-engine 互通、MV 自动改写。
+按 [完成度清单](reference/support-matrix.md#43-v3-新类型) 的优先级，剩余 variant 工作（OVERWRITE / DELETE / UPDATE / MERGE 写、shredding 写、predicate pushdown、partition / sort 中使用）排在 P3（"v3 类型 tail"），优先级低于 catalog 生态、cross-engine 互通、MV 自动改写。

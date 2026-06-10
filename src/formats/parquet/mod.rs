@@ -1927,7 +1927,6 @@ fn validate_batch_slot_count(
     Ok(batch)
 }
 
-
 fn collect_parquet_coalesce_io_ranges(
     metadata: &ParquetMetaData,
     row_groups: &[usize],
