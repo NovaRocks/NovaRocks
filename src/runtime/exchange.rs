@@ -20,8 +20,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use arrow::array::{ArrayRef, Int8Array};
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::array::{Array, ArrayRef, Decimal128Array, Decimal256Array, Int8Array, make_array};
+use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
@@ -216,11 +216,19 @@ fn exchange_field_from_array(
     Arc::new(
         arrow::datatypes::Field::new(
             field.name(),
-            array.data_type().clone(),
+            exchange_transport_data_type(array.data_type()),
             field.is_nullable() || array.null_count() > 0,
         )
         .with_metadata(field.metadata().clone()),
     )
+}
+
+fn exchange_transport_data_type(data_type: &DataType) -> DataType {
+    match data_type {
+        DataType::Decimal128(_, scale) => DataType::Decimal128(38, *scale),
+        DataType::Decimal256(_, scale) => DataType::Decimal256(76, *scale),
+        _ => data_type.clone(),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1115,6 +1123,110 @@ fn merged_exchange_schema(chunks: &[Chunk]) -> Result<SchemaRef, String> {
     Ok(Arc::new(Schema::new(fields)))
 }
 
+fn retag_decimal128_array_for_exchange(
+    array: &Decimal128Array,
+    target_precision: u8,
+    target_scale: i8,
+) -> Result<ArrayRef, String> {
+    let data = array
+        .to_data()
+        .into_builder()
+        .data_type(DataType::Decimal128(target_precision, target_scale))
+        .build()
+        .map_err(|e| e.to_string())?;
+    Ok(make_array(data))
+}
+
+fn retag_decimal256_array_for_exchange(
+    array: &Decimal256Array,
+    target_precision: u8,
+    target_scale: i8,
+) -> Result<ArrayRef, String> {
+    let data = array
+        .to_data()
+        .into_builder()
+        .data_type(DataType::Decimal256(target_precision, target_scale))
+        .build()
+        .map_err(|e| e.to_string())?;
+    Ok(make_array(data))
+}
+
+fn normalize_exchange_array_for_field(
+    array: &ArrayRef,
+    field: &arrow::datatypes::Field,
+) -> Result<ArrayRef, String> {
+    if array.data_type() == field.data_type() {
+        return Ok(array.clone());
+    }
+
+    match (array.data_type(), field.data_type()) {
+        (
+            DataType::Decimal128(_, source_scale),
+            DataType::Decimal128(target_precision, target_scale),
+        ) if source_scale == target_scale => {
+            let decimal = array
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(|| {
+                    format!(
+                        "exchange decimal128 array downcast failed: array_type={:?}",
+                        array.data_type()
+                    )
+                })?;
+            retag_decimal128_array_for_exchange(decimal, *target_precision, *target_scale)
+        }
+        (
+            DataType::Decimal256(_, source_scale),
+            DataType::Decimal256(target_precision, target_scale),
+        ) if source_scale == target_scale => {
+            let decimal = array
+                .as_any()
+                .downcast_ref::<Decimal256Array>()
+                .ok_or_else(|| {
+                    format!(
+                        "exchange decimal256 array downcast failed: array_type={:?}",
+                        array.data_type()
+                    )
+                })?;
+            retag_decimal256_array_for_exchange(decimal, *target_precision, *target_scale)
+        }
+        _ => Err(format!(
+            "exchange array type mismatch for field {}: array={:?} field={:?}",
+            field.name(),
+            array.data_type(),
+            field.data_type()
+        )),
+    }
+}
+
+fn normalize_exchange_batch_for_schema(
+    chunk: &Chunk,
+    schema: &SchemaRef,
+    chunk_index: usize,
+) -> Result<RecordBatch, String> {
+    if chunk.batch.num_columns() != schema.fields().len() {
+        return Err(format!(
+            "exchange chunk column count mismatch at index {}: batch_columns={} schema_fields={}",
+            chunk_index,
+            chunk.batch.num_columns(),
+            schema.fields().len()
+        ));
+    }
+    let columns = chunk
+        .batch
+        .columns()
+        .iter()
+        .zip(schema.fields().iter())
+        .map(|(array, field)| normalize_exchange_array_for_field(array, field.as_ref()))
+        .collect::<Result<Vec<_>, _>>()?;
+    RecordBatch::try_new(Arc::clone(schema), columns).map_err(|e| {
+        format!(
+            "failed to normalize exchange chunk schema at index {}: {e}",
+            chunk_index
+        )
+    })
+}
+
 fn encode_arrow_ipc_chunks(chunks: &[Chunk]) -> Result<Vec<u8>, String> {
     if chunks.is_empty() {
         return Ok(vec![]);
@@ -1133,20 +1245,7 @@ fn encode_arrow_ipc_chunks(chunks: &[Chunk]) -> Result<Vec<u8>, String> {
             .unwrap_or_else(|| Arc::new(Schema::empty()))
     } else {
         for (i, chunk) in chunks.iter().enumerate() {
-            if chunk.schema().as_ref() == schema.as_ref() {
-                batches.push(chunk.batch.clone());
-                continue;
-            }
-            let normalized =
-                RecordBatch::try_new(Arc::clone(&schema), chunk.batch.columns().to_vec()).map_err(
-                    |e| {
-                        format!(
-                            "failed to normalize exchange chunk schema at index {}: {e}",
-                            i
-                        )
-                    },
-                )?;
-            batches.push(normalized);
+            batches.push(normalize_exchange_batch_for_schema(chunk, &schema, i)?);
         }
         schema
     };
@@ -1429,7 +1528,7 @@ pub fn decode_chunks_for_sender(
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::{ArrayRef, Int32Array, StringArray};
+    use arrow::array::{Array, ArrayRef, Decimal128Array, Int32Array, StringArray, make_array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use arrow::record_batch::RecordBatchOptions;
@@ -1492,6 +1591,31 @@ mod tests {
         let batch = RecordBatch::try_new_with_options(Arc::new(Schema::empty()), vec![], &options)
             .expect("empty batch");
         Chunk::new_with_chunk_schema(batch, Arc::new(crate::exec::chunk::ChunkSchema::empty()))
+    }
+
+    fn decimal128_chunk_with_over_precision_value(value: i128) -> Chunk {
+        let wide = Decimal128Array::from(vec![Some(value)])
+            .with_precision_and_scale(38, 2)
+            .expect("wide decimal");
+        let data = wide
+            .to_data()
+            .into_builder()
+            .data_type(DataType::Decimal128(20, 2))
+            .build()
+            .expect("decimal20 array data");
+        let array = make_array(data);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "price",
+            DataType::Decimal128(20, 2),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![array]).expect("record batch");
+        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(55)],
+        )
+        .expect("chunk schema");
+        Chunk::new_with_chunk_schema(batch, chunk_schema)
     }
 
     #[test]
@@ -1558,6 +1682,26 @@ mod tests {
         assert!(decoded[1].schema().field(3).is_nullable());
 
         cancel_exchange_key(key);
+    }
+
+    #[test]
+    fn encode_chunks_preserves_decimal128_values_exceeding_declared_precision() {
+        let value = 100_000_000_000_000_000_000_i128;
+        let chunk = decimal128_chunk_with_over_precision_value(value);
+
+        let bytes = encode_chunks(&[chunk], true).expect("encode");
+        let decoded = decode_chunks(&bytes).expect("decode");
+
+        assert_eq!(decoded.len(), 1);
+        let array = decoded[0]
+            .batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("decimal128 array");
+        assert_eq!(array.data_type(), &DataType::Decimal128(38, 2));
+        assert!(!array.is_null(0));
+        assert_eq!(array.value(0), value);
     }
 
     #[test]

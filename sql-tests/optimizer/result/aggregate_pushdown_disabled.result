@@ -3,13 +3,45 @@ Explain String
 GATHER EXCHANGE stats={rows=68}
   PROJECT [a.k AS k, sum(a.v)] stats={rows=68}
     PROJECT [a.k, sum(sum(a.v)) AS sum(a.v)] stats={rows=68}
-      HASH AGGREGATE (SINGLE, group by: [a.k]) stats={rows=68}
+      HASH AGGREGATE (GLOBAL, group by: [a.k]) stats={rows=68}
         aggregations: sum(sum(a.v))
-        HASH JOIN (PARTITIONED, INNER, eq: [a.k = b.k]) stats={rows=90}
-          build runtime filters:
-          - filter_id = 0, build_expr = (b.k)
-          HASH AGGREGATE (SINGLE, group by: [a.k]) stats={rows=100}
-            aggregations: sum(a.v)
+        HASH EXCHANGE (source: ShuffleAgg, hash: [c1]) stats={rows=68}
+          HASH AGGREGATE (LOCAL, group by: [a.k]) stats={rows=68}
+            aggregations: sum(sum(a.v))
+            HASH JOIN (PARTITIONED, INNER, eq: [a.k = b.k]) stats={rows=90}
+              build runtime filters:
+              - filter_id = 0, build_expr = (b.k)
+              HASH AGGREGATE (GLOBAL, group by: [a.k]) stats={rows=100}
+                aggregations: sum(a.v)
+                  probe runtime filters:
+                  - filter_id = 0, probe_expr = (a.k)
+                HASH EXCHANGE (source: ShuffleAgg, hash: [c1]) stats={rows=100}
+                  HASH AGGREGATE (LOCAL, group by: [a.k]) stats={rows=100}
+                    aggregations: sum(a.v)
+                    SCAN db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_a (alias=a) stats={rows=18000}
+                         TABLE: db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_a
+                         columns: k, v
+                         min-max stats
+                         predicates: a.k IS NOT NULL
+              HASH EXCHANGE (source: ShuffleJoin, hash: [c3]) stats={rows=90}
+                SCAN db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_b (alias=b) stats={rows=90}
+                     TABLE: db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_b
+                     columns: k
+                     min-max stats
+                     predicates: b.k IS NOT NULL
+
+-- query 11
+Explain String
+GATHER EXCHANGE stats={rows=90}
+  PROJECT [a.k AS k, sum(a.v)] stats={rows=90}
+    HASH AGGREGATE (GLOBAL, group by: [a.k]) stats={rows=90}
+      aggregations: sum(a.v)
+      HASH EXCHANGE (source: ShuffleAgg, hash: [c1]) stats={rows=90}
+        HASH AGGREGATE (LOCAL, group by: [a.k]) stats={rows=90}
+          aggregations: sum(a.v)
+          HASH JOIN (BROADCAST, INNER, eq: [a.k = b.k]) stats={rows=16200}
+            build runtime filters:
+            - filter_id = 0, build_expr = (b.k)
             SCAN db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_a (alias=a) stats={rows=18000}
                  TABLE: db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_a
                  columns: k, v
@@ -17,32 +49,9 @@ GATHER EXCHANGE stats={rows=68}
                  predicates: a.k IS NOT NULL
                 probe runtime filters:
                 - filter_id = 0, probe_expr = (a.k)
-          HASH EXCHANGE (source: ShuffleJoin, hash: [c3]) stats={rows=90}
-            SCAN db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_b (alias=b) stats={rows=90}
-                 TABLE: db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_b
-                 columns: k
-                 min-max stats
-                 predicates: b.k IS NOT NULL
-
--- query 11
-Explain String
-GATHER EXCHANGE stats={rows=90}
-  PROJECT [a.k AS k, sum(a.v)] stats={rows=90}
-    HASH AGGREGATE (SINGLE, group by: [a.k]) stats={rows=90}
-      aggregations: sum(a.v)
-      HASH JOIN (BROADCAST, INNER, eq: [a.k = b.k]) stats={rows=16200}
-        build runtime filters:
-        - filter_id = 0, build_expr = (b.k)
-        SCAN db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_a (alias=a) stats={rows=18000}
-             TABLE: db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_a
-             columns: k, v
-             min-max stats
-             predicates: a.k IS NOT NULL
-            probe runtime filters:
-            - filter_id = 0, probe_expr = (a.k)
-        BROADCAST EXCHANGE stats={rows=90}
-          SCAN db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_b (alias=b) stats={rows=90}
-               TABLE: db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_b
-               columns: k
-               min-max stats
-               predicates: b.k IS NOT NULL
+            BROADCAST EXCHANGE stats={rows=90}
+              SCAN db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_b (alias=b) stats={rows=90}
+                   TABLE: db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_b
+                   columns: k
+                   min-max stats
+                   predicates: b.k IS NOT NULL

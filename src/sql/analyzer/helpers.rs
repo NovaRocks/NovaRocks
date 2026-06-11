@@ -92,6 +92,10 @@ pub(super) fn sql_type_to_arrow(sql_type: &sqlast::DataType) -> Result<DataType,
                 )),
                 "json" | "jsonb" => Ok(DataType::Utf8),
                 "varbinary" | "binary" => Ok(DataType::Binary),
+                "datetime_ns" | "timestamp_ns" | "timestamptz_ns" => Ok(DataType::Timestamp(
+                    arrow::datatypes::TimeUnit::Nanosecond,
+                    None,
+                )),
                 "array" => custom_array_type_to_arrow(sql_type),
                 "map" => custom_map_type_to_arrow(sql_type),
                 "struct" => custom_struct_type_to_arrow(sql_type),
@@ -1863,9 +1867,10 @@ pub(super) fn eval_const_i64(expr: &sqlast::Expr) -> Result<i64, String> {
 
 #[cfg(test)]
 mod tests {
+    use arrow::datatypes::{DataType, TimeUnit};
     use sqlparser::ast as sqlast;
 
-    use super::expr_display_name;
+    use super::{expr_display_name, sql_type_to_arrow};
     use crate::sql::parser::dialect::StarRocksDialect;
 
     fn parse_select_expr(sql: &str) -> sqlast::Expr {
@@ -1902,6 +1907,19 @@ mod tests {
     fn expr_display_name_preserves_array_unique_agg_name() {
         let expr = parse_select_expr("SELECT ARRAY_UNIQUE_AGG(s_1)");
         assert_eq!(expr_display_name(&expr), "array_unique_agg(s_1)");
+    }
+
+    #[test]
+    fn sql_type_to_arrow_accepts_datetime_ns_alias() {
+        let expr = parse_select_expr("SELECT CAST(NULL AS DATETIME_NS)");
+        let sqlast::Expr::Cast { data_type, .. } = expr else {
+            panic!("expected cast expression");
+        };
+
+        assert_eq!(
+            sql_type_to_arrow(&data_type).expect("type"),
+            DataType::Timestamp(TimeUnit::Nanosecond, None)
+        );
     }
 
     #[test]

@@ -4,6 +4,7 @@ v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 3
 v1	array1	array2	array3	map1	map2	map3	st1
+1	[11,null,31,41]	[{11:110},{101:101}]	[{"a":11,"b":12},{"a":12,"b":13}]	{14:41,null:11,12:31}	{101:[1,10,11,23]}	{101:{"c":null,"b":12}}	{"s1":1,"s2":[1,10,11],"s3":{101:111,null:null},"s4":{"e":111,"f":110}}
 
 -- query 4
 v1	array1	array2	array3	map1	map2	map3	st1
@@ -12,12 +13,15 @@ v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 7
 v1	array1	array2	array3	map1	map2	map3	st1
+2	[12,22,32,42]	[{22:220},{null:201}]	[{"a":21,"b":22},null]	NULL	{202:[2,20,null,23]}	{202:{"c":21,"b":22}}	{"s1":2,"s2":null,"s3":{202:null},"s4":{"e":222,"f":220}}
 
 -- query 8
 v1	array1	array2	array3	map1	map2	map3	st1
+2	[12,22,32,42]	[{22:220},{null:201}]	[{"a":21,"b":22},null]	NULL	{202:[2,20,null,23]}	{202:{"c":21,"b":22}}	{"s1":2,"s2":null,"s3":{202:null},"s4":{"e":222,"f":220}}
 
 -- query 9
 v1	array1	array2	array3	map1	map2	map3	st1
+5	[15,25,35,45]	[{null:550},{505:501}]	[{"a":51,"b":52},{"a":null,"b":53}]	{54:45,56:15,null:null}	{null:null}	{505:{"c":null,"b":52}}	{"s1":5,"s2":[5,50,51],"s3":null,"s4":{"e":null,"f":550}}
 
 -- query 10
 v1	array1	array2	array3	map1	map2	map3	st1
@@ -29,6 +33,7 @@ v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 12
 v1	array1	array2	array3	map1	map2	map3	st1
+1	[11,null,31,41]	[{11:110},{101:101}]	[{"a":11,"b":12},{"a":12,"b":13}]	{14:41,null:11,12:31}	{101:[1,10,11,23]}	{101:{"c":null,"b":12}}	{"s1":1,"s2":[1,10,11],"s3":{101:111,null:null},"s4":{"e":111,"f":110}}
 
 -- query 13
 v1	array1	array2	array3	map1	map2	map3	st1
@@ -37,6 +42,7 @@ v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 14
 v1	array1	array2	array3	map1	map2	map3	st1
+3	NULL	[{33:null},{303:301}]	[{"a":31,"b":32},{"a":null,"b":33}]	{34:43,36:13,32:null}	{303:null}	{303:{"c":31,"b":32}}	NULL
 
 -- query 15
 v1	array1	array2	array3	map1	map2	map3	st1
@@ -51,9 +57,11 @@ CAST((map{1:NULL}) AS MAP<INT,ARRAY<INT>>)
 
 -- query 19
 v1	array1	array2	array3	map1	map2	map3	st1
+5	[15,25,35,45]	[{null:550},{505:501}]	[{"a":51,"b":52},{"a":null,"b":53}]	{54:45,56:15,null:null}	{null:null}	{505:{"c":null,"b":52}}	{"s1":5,"s2":[5,50,51],"s3":null,"s4":{"e":null,"f":550}}
 
 -- query 20
 v1	array1	array2	array3	map1	map2	map3	st1
+4	[14,24,null,44]	[{44:440},{404:401}]	[{"a":41,"b":42},{"a":42,"b":43}]	{44:44,46:14,42:34}	{null:[4,null,41,23]}	{404:{"c":41,"b":42}}	{"s1":null,"s2":[4,null,41],"s3":{null:444},"s4":null}
 
 -- query 21
 v1	array1	array2	array3	map1	map2	map3	st1
@@ -71,12 +79,15 @@ v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 25
 v1	array1	array2	array3	map1	map2	map3	st1
+5	[15,25,35,45]	[{null:550},{505:501}]	[{"a":51,"b":52},{"a":null,"b":53}]	{54:45,56:15,null:null}	{null:null}	{505:{"c":null,"b":52}}	{"s1":5,"s2":[5,50,51],"s3":null,"s4":{"e":null,"f":550}}
 
 -- query 26
 v1	array1	array2	array3	map1	map2	map3	st1
+2	[12,22,32,42]	[{22:220},{null:201}]	[{"a":21,"b":22},null]	NULL	{202:[2,20,null,23]}	{202:{"c":21,"b":22}}	{"s1":2,"s2":null,"s3":{202:null},"s4":{"e":222,"f":220}}
 
 -- query 27
 v1	array1	array2	array3	map1	map2	map3	st1
+5	[15,25,35,45]	[{null:550},{505:501}]	[{"a":51,"b":52},{"a":null,"b":53}]	{54:45,56:15,null:null}	{null:null}	{505:{"c":null,"b":52}}	{"s1":5,"s2":[5,50,51],"s3":null,"s4":{"e":null,"f":550}}
 
 -- query 28
 v1	array1	array2	array3	map1	map2	map3	st1
@@ -86,7 +97,7 @@ v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 30
 array1 = ([11, NULL, 31, 41])
-NULL
+1
 NULL
 0
 0
@@ -114,7 +125,7 @@ NULL
 array3 = ([named_struct('a', 21, 'b', 22), NULL])
 0
 0
-NULL
+1
 NULL
 0
 0
@@ -127,7 +138,7 @@ NULL
 array3 = ([row(21, 22), NULL])
 0
 0
-NULL
+1
 NULL
 0
 0
@@ -146,7 +157,7 @@ array2 = ([map{NULL:550}, map{505:501}])
 0
 0
 0
-NULL
+1
 NULL
 
 -- query 35
@@ -177,7 +188,7 @@ NULL
 
 -- query 37
 map1 = (map{14:41,NULL:11,12:31})
-NULL
+1
 NULL
 NULL
 0
@@ -207,7 +218,7 @@ map1 = (map{34:43,36:13,32:NULL})
 0
 NULL
 NULL
-NULL
+1
 NULL
 0
 0
@@ -237,7 +248,7 @@ NULL
 NULL
 NULL
 NULL
-NULL
+1
 NULL
 
 -- query 42
@@ -248,7 +259,7 @@ map2 = (map{NULL:[4, NULL, 41, 23]})
 0
 NULL
 NULL
-NULL
+1
 NULL
 NULL
 0
@@ -315,14 +326,14 @@ map3 = (map{505:row(NULL, 52)})
 0
 0
 0
-NULL
+1
 NULL
 
 -- query 48
 st1 = (row(2, NULL, map{202:NULL}, row(222, 220)))
 0
 0
-NULL
+1
 NULL
 NULL
 0
@@ -341,7 +352,7 @@ NULL
 0
 0
 0
-NULL
+1
 NULL
 
 -- query 50
@@ -718,7 +729,7 @@ st1 <=> NULL
 
 -- query 90
 array1 != ([11, NULL, 31, 41])
-NULL
+0
 NULL
 1
 1
@@ -746,7 +757,7 @@ NULL
 array3 != ([named_struct('a', 21, 'b', 22), NULL])
 1
 1
-NULL
+0
 NULL
 1
 1
@@ -759,7 +770,7 @@ NULL
 array3 != ([row(21, 22), NULL])
 1
 1
-NULL
+0
 NULL
 1
 1
@@ -778,7 +789,7 @@ array2 != ([map{NULL:550}, map{505:501}])
 1
 1
 1
-NULL
+0
 NULL
 
 -- query 95
@@ -809,7 +820,7 @@ NULL
 
 -- query 97
 map1 != (map{14:41,NULL:11,12:31})
-NULL
+0
 NULL
 NULL
 1
@@ -839,7 +850,7 @@ map1 != (map{34:43,36:13,32:NULL})
 1
 NULL
 NULL
-NULL
+0
 NULL
 1
 1
@@ -869,7 +880,7 @@ NULL
 NULL
 NULL
 NULL
-NULL
+0
 NULL
 
 -- query 102
@@ -880,7 +891,7 @@ map2 != (map{NULL:[4, NULL, 41, 23]})
 1
 NULL
 NULL
-NULL
+0
 NULL
 NULL
 1
@@ -947,14 +958,14 @@ map3 != (map{505:row(NULL, 52)})
 1
 1
 1
-NULL
+0
 NULL
 
 -- query 108
 st1 != (row(2, NULL, map{202:NULL}, row(222, 220)))
 1
 1
-NULL
+0
 NULL
 NULL
 1
@@ -973,7 +984,7 @@ NULL
 1
 1
 1
-NULL
+0
 NULL
 
 -- query 110

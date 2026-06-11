@@ -1,17 +1,16 @@
 Explain String
-GATHER EXCHANGE stats={rows=3}
-  PROJECT [running_sum] stats={rows=3}
-    WINDOW [sum(v)] stats={rows=3}
-      PROJECT [id, v] stats={rows=3}
-        SORT BY [id ASC NULLS FIRST] stats={rows=3}
-          GATHER EXCHANGE stats={rows=3}
+PROJECT [running_sum] stats={rows=3}
+  WINDOW [sum(v)] stats={rows=3}
+    PROJECT [id, v] stats={rows=3}
+      SORT BY [id ASC NULLS FIRST] stats={rows=3}
+        GATHER EXCHANGE stats={rows=3}
+          PROJECT [id, v] stats={rows=3}
             PROJECT [id, v] stats={rows=3}
-              PROJECT [id, v] stats={rows=3}
-                UNION ALL stats={rows=3}
-                  UNION ALL stats={rows=2}
-                    PROJECT [2 AS id, 20 AS v] stats={rows=1}
-                      VALUES (1 rows) stats={rows=1}
-                    PROJECT [1 AS id, 10 AS v] stats={rows=1}
-                      VALUES (1 rows) stats={rows=1}
-                  PROJECT [3 AS id, 30 AS v] stats={rows=1}
+              UNION ALL stats={rows=3}
+                UNION ALL stats={rows=2}
+                  PROJECT [2 AS id, 20 AS v] stats={rows=1}
                     VALUES (1 rows) stats={rows=1}
+                  PROJECT [1 AS id, 10 AS v] stats={rows=1}
+                    VALUES (1 rows) stats={rows=1}
+                PROJECT [3 AS id, 30 AS v] stats={rows=1}
+                  VALUES (1 rows) stats={rows=1}

@@ -161,8 +161,7 @@ pub fn eval_array_expr(
     let data_storage: Vec<arrow_data::ArrayData> =
         element_arrays.iter().map(|arr| arr.to_data()).collect();
     let data_refs: Vec<&arrow_data::ArrayData> = data_storage.iter().collect();
-    let mut mutable =
-        MutableArrayData::new(data_refs, false, num_rows.saturating_mul(num_elements));
+    let mut mutable = MutableArrayData::new(data_refs, true, num_rows.saturating_mul(num_elements));
     for row in 0..num_rows {
         for idx in 0..element_arrays.len() {
             mutable.extend(idx, row, row + 1);
@@ -172,4 +171,56 @@ pub fn eval_array_expr(
 
     let list = ListArray::new(field, OffsetBuffer::new(offsets.into()), values, None);
     Ok(Arc::new(list))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::ids::SlotId;
+    use crate::exec::chunk::{Chunk, ChunkSchema};
+    use crate::exec::expr::{ExprNode, LiteralValue};
+    use arrow::array::{Array, Int32Array};
+    use arrow::datatypes::{Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    fn one_row_chunk() -> Chunk {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, true)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1]))]).expect("batch");
+        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(1)],
+        )
+        .expect("chunk schema");
+        Chunk::new_with_chunk_schema(batch, chunk_schema)
+    }
+
+    #[test]
+    fn array_expr_preserves_null_elements() {
+        let mut arena = ExprArena::default();
+        let value = arena.push_typed(ExprNode::Literal(LiteralValue::Int32(11)), DataType::Int32);
+        let null = arena.push_typed(ExprNode::Literal(LiteralValue::Null), DataType::Int32);
+        let array = arena.push_typed(
+            ExprNode::ArrayExpr {
+                elements: vec![value, null],
+            },
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+        );
+
+        let result = arena.eval(array, &one_row_chunk()).expect("array expr");
+        let list = result
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("list array");
+        let values = list
+            .values()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int values");
+
+        assert_eq!(list.len(), 1);
+        assert_eq!(values.len(), 2);
+        assert_eq!(values.value(0), 11);
+        assert!(values.is_null(1));
+    }
 }

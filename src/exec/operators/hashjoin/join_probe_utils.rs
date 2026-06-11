@@ -42,8 +42,18 @@ use crate::exec::hash_table::key_builder::{
     build_one_number_hashes,
 };
 use crate::exec::hash_table::key_strategy::GroupKeyStrategy;
+use crate::exec::schema_compat::align_schema_to_arrays;
 
 const MAX_JOIN_OUTPUT_ROWS_PER_BATCH: usize = 16 * 1024;
+
+fn build_output_record_batch(
+    output_schema: &SchemaRef,
+    columns: Vec<ArrayRef>,
+    context: &str,
+) -> Result<RecordBatch, String> {
+    let output_schema = align_schema_to_arrays(output_schema, &columns, context)?;
+    RecordBatch::try_new(output_schema, columns).map_err(|e| e.to_string())
+}
 
 /// Produce cross-join output rows by combining each left row with all right rows.
 pub(crate) fn cross_join_chunk(
@@ -366,7 +376,7 @@ pub(crate) fn build_join_batch(
         columns.push(taken);
     }
 
-    let batch = RecordBatch::try_new(output_schema.clone(), columns).map_err(|e| e.to_string())?;
+    let batch = build_output_record_batch(output_schema, columns, "join output")?;
     Ok(Some(batch))
 }
 
@@ -429,7 +439,7 @@ pub(crate) fn build_left_with_null_right(
         columns.push(new_null_array(field.data_type(), len));
     }
 
-    let batch = RecordBatch::try_new(output_schema.clone(), columns).map_err(|e| e.to_string())?;
+    let batch = build_output_record_batch(output_schema, columns, "join left outer output")?;
     Ok(Some(batch))
 }
 
@@ -456,7 +466,7 @@ pub(crate) fn build_null_left_with_right(
         columns.push(taken);
     }
 
-    let batch = RecordBatch::try_new(output_schema.clone(), columns).map_err(|e| e.to_string())?;
+    let batch = build_output_record_batch(output_schema, columns, "join right outer output")?;
     Ok(Some(batch))
 }
 

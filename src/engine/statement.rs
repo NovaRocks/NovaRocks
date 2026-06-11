@@ -3829,6 +3829,18 @@ mod insert_overwrite_partitions_parser_tests {
     }
 
     #[test]
+    fn convert_insert_values_preserves_escaped_backslash_before_f() {
+        let stmt = parse_insert_overwrite(r"INSERT INTO t VALUES (13, 'e\\f')");
+        let crate::sql::parser::ast::InsertSource::Values(rows) = stmt.source else {
+            panic!("expected VALUES source");
+        };
+        assert_eq!(
+            rows[0][1],
+            crate::sql::parser::ast::Literal::String(r"e\f".to_string())
+        );
+    }
+
+    #[test]
     fn parse_insert_overwrite_partitions_with_branch() {
         // Branch resolution happens later in run_insert via split_ref_suffix;
         // here we just verify the overwrite mode and that the branch segment

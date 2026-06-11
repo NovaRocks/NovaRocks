@@ -336,6 +336,7 @@ fn build_insert_write_sink_spec(
         target_columns: resolved.columns.clone(),
         table_location,
         data_location,
+        target_partition_spec_id: metadata.default_partition_spec_id(),
         cloud_configuration,
         file_format: "parquet".to_string(),
         compression: crate::types::TCompressionType::SNAPPY,
@@ -460,19 +461,19 @@ fn insert_column_index_by_target_name(
 
 fn omitted_column_expr_sql(column: &ColumnDef) -> Result<String, String> {
     let Some(write_default) = &column.write_default else {
-        return Ok(format!(
-            "CAST(NULL AS {})",
-            arrow_data_type_to_sql_type_name(&column.data_type)?
-        ));
+        return Ok("NULL".to_string());
     };
     let sql_type = arrow_data_type_to_sql_type(&column.data_type)?;
     let literal =
         crate::connector::iceberg::default_value::iceberg_literal_to_ast(write_default, &sql_type)?;
-    literal_to_sql(&literal)
+    literal_to_sql_for_arrow_type(&literal, &column.data_type)
 }
 
 fn target_literal_expr_sql(literal: &Literal, column: &ColumnDef) -> Result<String, String> {
-    target_cast_expr_sql(&literal_to_sql(literal)?, column)
+    target_cast_expr_sql(
+        &literal_to_sql_for_arrow_type(literal, &column.data_type)?,
+        column,
+    )
 }
 
 fn target_cast_expr_sql(expr_sql: &str, column: &ColumnDef) -> Result<String, String> {
@@ -540,8 +541,63 @@ fn literal_to_sql(literal: &Literal) -> Result<String, String> {
     })
 }
 
+fn literal_to_sql_for_arrow_type(
+    literal: &Literal,
+    data_type: &arrow::datatypes::DataType,
+) -> Result<String, String> {
+    use arrow::datatypes::DataType;
+
+    match (literal, data_type) {
+        (
+            Literal::String(value) | Literal::Date(value),
+            DataType::Binary | DataType::LargeBinary,
+        ) => {
+            let bytes = crate::engine::sql_expr::latin1_string_to_bytes(value)?;
+            Ok(format!("X'{}'", hex::encode_upper(bytes)))
+        }
+        (Literal::Array(items), DataType::List(item_field)) => {
+            let values = items
+                .iter()
+                .map(|item| literal_to_sql_for_arrow_type(item, item_field.data_type()))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(format!("[{}]", values.join(", ")))
+        }
+        (Literal::Map(entries), DataType::Map(entries_field, _)) => {
+            let DataType::Struct(fields) = entries_field.data_type() else {
+                return literal_to_sql(literal);
+            };
+            if fields.len() != 2 {
+                return literal_to_sql(literal);
+            }
+            let mut args = Vec::with_capacity(entries.len() * 2);
+            for (key, value) in entries {
+                args.push(literal_to_sql_for_arrow_type(key, fields[0].data_type())?);
+                args.push(literal_to_sql_for_arrow_type(value, fields[1].data_type())?);
+            }
+            Ok(format!("map({})", args.join(", ")))
+        }
+        (Literal::Struct(values), DataType::Struct(fields)) if values.len() == fields.len() => {
+            let values = values
+                .iter()
+                .zip(fields.iter())
+                .map(|(value, field)| literal_to_sql_for_arrow_type(value, field.data_type()))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(format!("row({})", values.join(", ")))
+        }
+        _ => literal_to_sql(literal),
+    }
+}
+
 fn single_quoted_sql(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
+    let mut escaped = String::with_capacity(value.len() + 2);
+    for ch in value.chars() {
+        match ch {
+            '\'' => escaped.push_str("''"),
+            '\\' => escaped.push_str(r"\\"),
+            _ => escaped.push(ch),
+        }
+    }
+    format!("'{escaped}'")
 }
 
 fn arrow_data_type_to_sql_type(dt: &arrow::datatypes::DataType) -> Result<SqlType, String> {
@@ -562,6 +618,7 @@ fn arrow_data_type_to_sql_type(dt: &arrow::datatypes::DataType) -> Result<SqlTyp
         DataType::Date32 => SqlType::Date,
         DataType::Timestamp(TimeUnit::Nanosecond, _) => SqlType::DateTimeNs,
         DataType::Timestamp(TimeUnit::Microsecond, _) => SqlType::DateTime,
+        DataType::Time64(TimeUnit::Microsecond | TimeUnit::Nanosecond) => SqlType::Time,
         DataType::Binary | DataType::LargeBinary => SqlType::Binary,
         DataType::List(element_field) => SqlType::Array(Box::new(arrow_data_type_to_sql_type(
             element_field.data_type(),
@@ -825,7 +882,7 @@ pub(crate) fn build_abort_cleanup_for_catalog_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::DataType;
+    use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
     use sqlparser::ast as sqlast;
 
     fn test_column(
@@ -848,6 +905,37 @@ mod tests {
             panic!("expected query statement");
         };
         *query
+    }
+
+    fn test_map_type(key: DataType, value: DataType) -> DataType {
+        DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(Fields::from(vec![
+                    Arc::new(Field::new("key", key, false)),
+                    Arc::new(Field::new("value", value, true)),
+                ])),
+                false,
+            )),
+            false,
+        )
+    }
+
+    fn test_struct_type(fields: Vec<(&str, DataType)>) -> DataType {
+        DataType::Struct(Fields::from(
+            fields
+                .into_iter()
+                .map(|(name, data_type)| Arc::new(Field::new(name, data_type, true)))
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    #[test]
+    fn arrow_data_type_to_sql_type_accepts_time64_for_insert_defaults() {
+        assert_eq!(
+            arrow_data_type_to_sql_type(&DataType::Time64(TimeUnit::Microsecond)).expect("type"),
+            crate::sql::parser::ast::SqlType::Time
+        );
     }
 
     #[test]
@@ -983,6 +1071,56 @@ mod tests {
     }
 
     #[test]
+    fn append_source_to_query_values_preserves_backslash_string_literals() {
+        let target_columns = vec![test_column("region", DataType::Utf8, None)];
+        let source = InsertSource::Values(vec![vec![crate::sql::parser::ast::Literal::String(
+            r"e\f".to_string(),
+        )]]);
+
+        let query =
+            append_source_to_query(&source, &[], &target_columns).expect("append source query");
+
+        let sqlast::SetExpr::Values(values) = query.body.as_ref() else {
+            panic!("expected VALUES query, got: {query}");
+        };
+        let sqlast::Expr::Cast { expr, .. } = &values.rows[0][0] else {
+            panic!("expected CAST expression");
+        };
+        let sqlast::Expr::Value(value) = expr.as_ref() else {
+            panic!("expected string literal inside CAST");
+        };
+        let sqlast::Value::SingleQuotedString(s) = &value.value else {
+            panic!("expected single-quoted string");
+        };
+        assert_eq!(s, r"e\f");
+    }
+
+    #[test]
+    fn append_source_to_query_values_renders_binary_literals_as_hex() {
+        let target_columns = vec![test_column("payload", DataType::Binary, None)];
+        let packed = crate::engine::sql_expr::bytes_to_latin1_string(&[0xab, 0x01]);
+        let source =
+            InsertSource::Values(vec![vec![crate::sql::parser::ast::Literal::String(packed)]]);
+
+        let query =
+            append_source_to_query(&source, &[], &target_columns).expect("append source query");
+
+        let sqlast::SetExpr::Values(values) = query.body.as_ref() else {
+            panic!("expected VALUES query, got: {query}");
+        };
+        let sqlast::Expr::Cast { expr, .. } = &values.rows[0][0] else {
+            panic!("expected CAST expression");
+        };
+        let sqlast::Expr::Value(value) = expr.as_ref() else {
+            panic!("expected hex literal inside CAST");
+        };
+        let sqlast::Value::HexStringLiteral(s) = &value.value else {
+            panic!("expected hex literal");
+        };
+        assert_eq!(s, "AB01");
+    }
+
+    #[test]
     fn append_source_to_query_values_rejects_column_list_width_mismatch() {
         let target_columns = vec![
             test_column("a", DataType::Int32, None),
@@ -1033,6 +1171,43 @@ mod tests {
                 "SELECT CAST(`__nr_insert_src`.`a` AS INT) AS `a`, CAST(7 AS INT) AS `b`, CAST(`__nr_insert_src`.`c` AS INT) AS `c`"
             ),
             "projection should target table column order, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn append_source_to_query_from_query_omitted_complex_columns_parse() {
+        let target_columns = vec![
+            test_column("k1", DataType::Int64, None),
+            test_column(
+                "c_map",
+                test_map_type(DataType::Int32, DataType::Int32),
+                None,
+            ),
+            test_column(
+                "c_struct",
+                test_struct_type(vec![("k1", DataType::Int32), ("k2", DataType::Int32)]),
+                None,
+            ),
+        ];
+        let source = InsertSource::FromQuery(Box::new(parse_query(
+            "SELECT idx FROM row_util ORDER BY idx LIMIT 1000",
+        )));
+
+        let query = append_source_to_query(&source, &["k1".to_string()], &target_columns)
+            .expect("append source query");
+        let rendered = query.to_string();
+
+        assert!(
+            rendered.contains("CAST(NULL AS MAP"),
+            "omitted map column should be cast from NULL once, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("CAST(NULL AS STRUCT"),
+            "omitted struct column should be cast from NULL once, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("CAST(CAST(NULL"),
+            "omitted complex columns must not produce nested casts, got: {rendered}"
         );
     }
 }

@@ -331,13 +331,6 @@ pub(crate) fn lower_lake_scan_node(
             node.node_id
         ));
     }
-    if ranges.is_empty() {
-        return Err(format!(
-            "LAKE_SCAN_NODE node_id={} has no effective scan ranges",
-            node.node_id
-        ));
-    }
-
     let tuple_desc = find_tuple_descriptor(desc_tbl, tuple_id)?;
     let table_id_from_tuple = tuple_desc
         .table_id
@@ -422,8 +415,10 @@ pub(crate) fn lower_lake_scan_node(
         hi: exec_params.query_id.hi,
         lo: exec_params.query_id.lo,
     });
-    let tablet_path_map = resolve_tablet_paths_for_lake_scan(query_id, fe_addr, &table_identity, &refs)
-        .map_err(|e| {
+    let tablet_path_map = if refs.is_empty() {
+        HashMap::new()
+    } else {
+        resolve_tablet_paths_for_lake_scan(query_id, fe_addr, &table_identity, &refs).map_err(|e| {
             format!(
                 "LAKE_SCAN_NODE resolve tablet paths failed for catalog={} db_name={} table_name={} db_id={} table_id={} schema_id={}: {}",
                 table_identity.catalog,
@@ -434,8 +429,13 @@ pub(crate) fn lower_lake_scan_node(
                 table_identity.schema_id,
                 e
             )
-        })?;
-    let mut properties = build_lake_properties(&tablet_path_map)?;
+        })?
+    };
+    let mut properties = if tablet_path_map.is_empty() {
+        BTreeMap::new()
+    } else {
+        build_lake_properties(&tablet_path_map)?
+    };
     let partition_storage_paths = build_partition_storage_paths(&ranges, &tablet_path_map)?;
     properties.remove("tablet_root_paths");
     properties.insert(
@@ -567,6 +567,7 @@ pub(crate) fn lower_lake_scan_node(
         .with_output_chunk_schema(scan_output_chunk_schema.clone())
         .with_limit(limit)
         .with_connector_io_tasks_per_scan_operator(connector_io_tasks_per_scan_operator)
+        .with_accept_empty_scan_ranges(true)
         .with_local_rf_waiting_set(local_rf_waiting_set(node))
         .with_lake_row_position(lake_row_position_spec)
         .with_lake_glm_info(lake_glm_info);
@@ -825,9 +826,15 @@ fn normalize_partition_storage_path(path: &str, tablet_id: i64) -> Result<String
 
 #[cfg(test)]
 mod tests {
-    use super::build_partition_storage_paths;
+    use super::{build_partition_storage_paths, lower_lake_scan_node};
     use crate::connector::starrocks::StarRocksScanRange;
-    use std::collections::HashMap;
+    use crate::exec::expr::ExprArena;
+    use crate::exec::node::ExecNodeKind;
+    use crate::internal_service;
+    use crate::sql::codegen::descriptors::DescriptorTableBuilder;
+    use crate::{descriptors, plan_nodes, types};
+    use arrow::datatypes::DataType;
+    use std::collections::{BTreeMap, HashMap};
 
     #[test]
     fn build_partition_storage_paths_collapses_tablet_suffix() {
@@ -865,5 +872,128 @@ mod tests {
             paths.get("8").map(String::as_str),
             Some("s3://bucket/root/8")
         );
+    }
+
+    fn empty_scan_exec_params(node_id: i32) -> internal_service::TPlanFragmentExecParams {
+        let mut per_node_scan_ranges = BTreeMap::new();
+        per_node_scan_ranges.insert(node_id, vec![]);
+        internal_service::TPlanFragmentExecParams {
+            query_id: types::TUniqueId::new(0, 1),
+            fragment_instance_id: types::TUniqueId::new(0, 1),
+            per_node_scan_ranges,
+            per_exch_num_senders: BTreeMap::new(),
+            destinations: None,
+            sender_id: None,
+            num_senders: None,
+            send_query_statistics_with_every_batch: None,
+            use_vectorized: None,
+            runtime_filter_params: None,
+            instances_number: None,
+            enable_exchange_pass_through: None,
+            node_to_per_driver_seq_scan_ranges: None,
+            enable_exchange_perf: None,
+            pipeline_sink_dop: None,
+            report_when_finish: None,
+            exec_debug_options: None,
+        }
+    }
+
+    fn single_int_lake_desc_table(
+        tuple_id: i32,
+        slot_id: i32,
+        table_id: i64,
+    ) -> descriptors::TDescriptorTable {
+        let mut builder = DescriptorTableBuilder::new();
+        builder.add_table(table_id, "db", "tbl", 1);
+        builder.add_tuple(tuple_id, Some(table_id));
+        builder.add_slot(slot_id, tuple_id, "v", &DataType::Int32, true, 0);
+        builder.build()
+    }
+
+    fn lake_plan_node(
+        node_id: i32,
+        tuple_id: i32,
+        db_id: i64,
+        table_id: i64,
+    ) -> plan_nodes::TPlanNode {
+        let mut node = crate::lower::node::test_plan_node(
+            node_id,
+            plan_nodes::TPlanNodeType::LAKE_SCAN_NODE,
+            0,
+        );
+        node.row_tuples = vec![tuple_id];
+        node.lake_scan_node = Some(plan_nodes::TLakeScanNode {
+            tuple_id,
+            key_column_name: vec![],
+            key_column_type: vec![],
+            is_preaggregation: false,
+            sort_column: None,
+            rollup_name: None,
+            sql_predicates: None,
+            enable_column_expr_predicate: None,
+            dict_string_id_to_int_ids: None,
+            unused_output_column_name: None,
+            sort_key_column_names: None,
+            bucket_exprs: None,
+            column_access_paths: None,
+            sorted_by_keys_per_tablet: None,
+            output_chunk_by_bucket: None,
+            output_asc_hint: None,
+            partition_order_hint: None,
+            enable_topn_filter_back_pressure: None,
+            back_pressure_max_rounds: None,
+            back_pressure_throttle_time: None,
+            back_pressure_throttle_time_upper_bound: None,
+            back_pressure_num_rows: None,
+            schema_key: Some(descriptors::TTableSchemaKey::new(
+                Some(db_id),
+                Some(table_id),
+                Some(1),
+            )),
+            enable_prune_column_after_index_filter: None,
+            enable_gin_filter: None,
+            next_uniq_id: None,
+            enable_global_late_materialization: None,
+        });
+        node
+    }
+
+    #[test]
+    fn lake_scan_accepts_empty_scan_range_instance() {
+        let node_id = 11;
+        let tuple_id = 1;
+        let slot_id = 2;
+        let db_id = 100;
+        let table_id = 200;
+        let node = lake_plan_node(node_id, tuple_id, db_id, table_id);
+        let desc_tbl = single_int_lake_desc_table(tuple_id, slot_id, table_id);
+        let tuple_slots = HashMap::from([(tuple_id, vec![slot_id])]);
+        let exec_params = empty_scan_exec_params(node_id);
+        let mut arena = ExprArena::default();
+        let connectors = crate::connector::ConnectorRegistry::default();
+        let query_global_dict_map = HashMap::new();
+
+        let lowered = lower_lake_scan_node(
+            &node,
+            Some(&desc_tbl),
+            &tuple_slots,
+            &HashMap::new(),
+            Some(&exec_params),
+            None,
+            &mut arena,
+            &connectors,
+            &query_global_dict_map,
+            None,
+            None,
+        )
+        .expect("empty lake scan ranges should lower to a zero-row producer");
+
+        let ExecNodeKind::Scan(scan) = lowered.node.kind else {
+            panic!("expected scan node");
+        };
+        assert!(scan.accept_empty_scan_ranges());
+        let morsels = scan.build_morsels().expect("build empty morsels");
+        assert!(morsels.morsels.is_empty());
+        assert!(!morsels.has_more);
     }
 }

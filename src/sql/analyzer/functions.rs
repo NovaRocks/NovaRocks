@@ -926,8 +926,8 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         "__iceberg_transform_year"
         | "__iceberg_transform_month"
         | "__iceberg_transform_day"
-        | "__iceberg_transform_hour"
-        | "__iceberg_transform_bucket" => DataType::Int32,
+        | "__iceberg_transform_hour" => DataType::Int64,
+        "__iceberg_transform_bucket" => DataType::Int32,
         "__iceberg_transform_truncate" => arg_types.first().cloned().unwrap_or(DataType::Null),
         // Bitwise functions return the same integer width as the first
         // argument; mirror codegen so the lowering layer's integer-only

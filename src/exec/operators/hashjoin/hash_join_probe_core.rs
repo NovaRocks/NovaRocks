@@ -46,6 +46,20 @@ use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::join::JoinType;
 use crate::exec::runtime_filter::LocalRuntimeFilterSet;
+use crate::exec::schema_compat::{align_schema_to_batches, normalize_batch_to_schema};
+
+fn concat_compatible_batches(
+    schema: &SchemaRef,
+    batches: &[RecordBatch],
+    context: &str,
+) -> Result<RecordBatch, String> {
+    let schema = align_schema_to_batches(schema, batches, context)?;
+    let batches = batches
+        .iter()
+        .map(|batch| normalize_batch_to_schema(&schema, batch, context))
+        .collect::<Result<Vec<_>, _>>()?;
+    concat_batches(&schema, &batches).map_err(|e| e.to_string())
+}
 
 /// Core hash-join probing engine that performs key lookup and join-type specific row assembly.
 pub(crate) struct HashJoinProbeCore {
@@ -294,9 +308,8 @@ impl HashJoinProbeCore {
             ChunkSchema::try_new(adjusted_slots)
                 .map_err(|e| format!("extend_with_null_build_columns schema: {e}"))?,
         );
-        let batch = RecordBatch::try_new(chunk_schema.arrow_schema_ref(), columns)
-            .map_err(|e| format!("extend_with_null_build_columns: {e}"))?;
-        Chunk::try_new_with_chunk_schema(batch, chunk_schema)
+        Chunk::try_new_with_columns(chunk_schema, columns)
+            .map_err(|e| format!("extend_with_null_build_columns: {e}"))
     }
 
     /// Extend a build-only batch with NULL-filled probe-side columns.
@@ -331,9 +344,8 @@ impl HashJoinProbeCore {
             ChunkSchema::try_new(adjusted_slots)
                 .map_err(|e| format!("extend_with_null_probe_columns schema: {e}"))?,
         );
-        let batch = RecordBatch::try_new(chunk_schema.arrow_schema_ref(), columns)
-            .map_err(|e| format!("extend_with_null_probe_columns: {e}"))?;
-        Chunk::try_new_with_chunk_schema(batch, chunk_schema)
+        Chunk::try_new_with_columns(chunk_schema, columns)
+            .map_err(|e| format!("extend_with_null_probe_columns: {e}"))
     }
 
     pub(crate) fn join_probe_chunks(
@@ -421,7 +433,7 @@ impl HashJoinProbeCore {
         if batches.len() == 1 {
             return Ok(Some(batches.remove(0)));
         }
-        let batch = concat_batches(&output_schema, &batches).map_err(|e| e.to_string())?;
+        let batch = concat_compatible_batches(&output_schema, &batches, "full outer join concat")?;
         Ok(Some(batch))
     }
 
@@ -462,7 +474,7 @@ impl HashJoinProbeCore {
         if batches.len() == 1 {
             return Ok(Some(batches.remove(0)));
         }
-        let batch = concat_batches(&output_schema, &batches).map_err(|e| e.to_string())?;
+        let batch = concat_compatible_batches(&output_schema, &batches, "right semi join concat")?;
         Ok(Some(batch))
     }
 
@@ -538,7 +550,8 @@ impl HashJoinProbeCore {
         if batches.len() == 1 {
             return Ok(Some(batches.remove(0)));
         }
-        let batch = concat_batches(&output_schema, &batches).map_err(|e| e.to_string())?;
+        let batch =
+            concat_compatible_batches(&output_schema, &batches, "right semi anti join concat")?;
         Ok(Some(batch))
     }
 
@@ -574,7 +587,7 @@ impl HashJoinProbeCore {
                 }
                 let batches = vec![left_chunk.batch, right_batch];
                 let batch =
-                    concat_batches(&self.join_scope_schema, &batches).map_err(|e| e.to_string())?;
+                    concat_compatible_batches(&self.join_scope_schema, &batches, "join merge")?;
                 Ok(Some(Chunk::try_new_with_chunk_schema(
                     batch,
                     Arc::clone(&self.join_scope_chunk_schema),
@@ -861,7 +874,8 @@ impl HashJoinProbeCore {
                 Arc::clone(&self.join_scope_chunk_schema),
             )?));
         }
-        let batch = concat_batches(&output_schema, &output_batches).map_err(|e| e.to_string())?;
+        let batch =
+            concat_compatible_batches(&output_schema, &output_batches, "inner join concat")?;
         Ok(Some(Chunk::try_new_with_chunk_schema(
             batch,
             Arc::clone(&self.join_scope_chunk_schema),
@@ -899,7 +913,7 @@ impl HashJoinProbeCore {
                 let probe_batch = if batches.len() == 1 {
                     batches.into_iter().next().expect("one batch")
                 } else {
-                    concat_batches(&output_schema, &batches).map_err(|e| e.to_string())?
+                    concat_compatible_batches(&output_schema, &batches, "anti join concat")?
                 };
                 return Ok(Some(self.extend_with_null_build_columns(probe_batch)?));
             }
@@ -916,7 +930,7 @@ impl HashJoinProbeCore {
                 let probe_batch = if batches.len() == 1 {
                     batches.into_iter().next().expect("one batch")
                 } else {
-                    concat_batches(&output_schema, &batches).map_err(|e| e.to_string())?
+                    concat_compatible_batches(&output_schema, &batches, "anti join concat")?
                 };
                 return Ok(Some(self.extend_with_null_build_columns(probe_batch)?));
             }
@@ -1006,7 +1020,7 @@ impl HashJoinProbeCore {
         let probe_batch = if output_batches.len() == 1 {
             output_batches.remove(0)
         } else {
-            concat_batches(&output_schema, &output_batches).map_err(|e| e.to_string())?
+            concat_compatible_batches(&output_schema, &output_batches, "semi anti join concat")?
         };
         Ok(Some(self.extend_with_null_build_columns(probe_batch)?))
     }
@@ -1029,7 +1043,7 @@ impl HashJoinProbeCore {
             let probe_batch = if batches.len() == 1 {
                 batches.into_iter().next().expect("one batch")
             } else {
-                concat_batches(&output_schema, &batches).map_err(|e| e.to_string())?
+                concat_compatible_batches(&output_schema, &batches, "null aware anti join concat")?
             };
             return Ok(Some(self.extend_with_null_build_columns(probe_batch)?));
         }
@@ -1179,7 +1193,11 @@ impl HashJoinProbeCore {
         let probe_batch = if output_batches.len() == 1 {
             output_batches.remove(0)
         } else {
-            concat_batches(&output_schema, &output_batches).map_err(|e| e.to_string())?
+            concat_compatible_batches(
+                &output_schema,
+                &output_batches,
+                "null aware anti join output concat",
+            )?
         };
         Ok(Some(self.extend_with_null_build_columns(probe_batch)?))
     }

@@ -2,27 +2,31 @@
 
 CI_SERVER_PID=""
 
+ci_novarocks_binary_path() {
+  local cargo_profile="${1:-dev-opt}"
+
+  case "$cargo_profile" in
+    dev)
+      echo "target/debug/novarocks"
+      ;;
+    release)
+      echo "target/release/novarocks"
+      ;;
+    *)
+      echo "target/$cargo_profile/novarocks"
+      ;;
+  esac
+}
+
 ci_start_standalone_server() {
   local config_path="$1"
   local log_path="$2"
   local timeout_seconds="$3"
   local cargo_profile="${4:-dev-opt}"
-  local binary_dir
   local binary_path
   local i
 
-  case "$cargo_profile" in
-    dev)
-      binary_dir="target/debug"
-      ;;
-    release)
-      binary_dir="target/release"
-      ;;
-    *)
-      binary_dir="target/$cargo_profile"
-      ;;
-  esac
-  binary_path="$binary_dir/novarocks"
+  binary_path="$(ci_novarocks_binary_path "$cargo_profile")"
 
   {
     printf "+ NO_PROXY=127.0.0.1,localhost %q standalone-server --config %q\n" \

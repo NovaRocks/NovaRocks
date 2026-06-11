@@ -24,6 +24,7 @@ pub mod operators;
 pub mod pipeline;
 pub mod row_position;
 pub mod runtime_filter;
+pub(crate) mod schema_compat;
 pub mod spill;
 pub mod variant;
 pub mod variant_encode;

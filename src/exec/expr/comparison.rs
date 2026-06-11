@@ -538,6 +538,21 @@ fn compare_map_rows(
     compare_map_rows_non_null(left, left_row, right, right_row).map(Some)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NestedEq {
+    Equal,
+    NotEqual,
+    Unknown,
+}
+
+fn option_eq_to_nested(value: Option<bool>) -> NestedEq {
+    match value {
+        Some(true) => NestedEq::Equal,
+        Some(false) => NestedEq::NotEqual,
+        None => NestedEq::Unknown,
+    }
+}
+
 fn eq_value_recursive(
     left: &ArrayRef,
     left_idx: usize,
@@ -592,6 +607,72 @@ fn eq_value_recursive(
     ))
 }
 
+fn eq_value_recursive_nested(
+    left: &ArrayRef,
+    left_idx: usize,
+    right: &ArrayRef,
+    right_idx: usize,
+) -> Result<NestedEq, String> {
+    if left.data_type() != right.data_type() {
+        return Err(format!(
+            "nested eq type mismatch: {:?} vs {:?}",
+            left.data_type(),
+            right.data_type()
+        ));
+    }
+    let left_is_null = left.is_null(left_idx);
+    let right_is_null = right.is_null(right_idx);
+    match (left_is_null, right_is_null) {
+        (true, true) => return Ok(NestedEq::Equal),
+        (true, false) | (false, true) => return Ok(NestedEq::Unknown),
+        (false, false) => {}
+    }
+    if matches!(left.data_type(), DataType::List(_)) {
+        let l = left
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .ok_or_else(|| "failed to downcast left to ListArray".to_string())?;
+        let r = right
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .ok_or_else(|| "failed to downcast right to ListArray".to_string())?;
+        return Ok(option_eq_to_nested(eq_list_rows(
+            l, left_idx, r, right_idx,
+        )?));
+    }
+    if matches!(left.data_type(), DataType::Struct(_)) {
+        let l = left
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| "failed to downcast left to StructArray".to_string())?;
+        let r = right
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| "failed to downcast right to StructArray".to_string())?;
+        return Ok(option_eq_to_nested(eq_struct_rows(
+            l, left_idx, r, right_idx,
+        )?));
+    }
+    if matches!(left.data_type(), DataType::Map(_, _)) {
+        let l = left
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .ok_or_else(|| "failed to downcast left to MapArray".to_string())?;
+        let r = right
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .ok_or_else(|| "failed to downcast right to MapArray".to_string())?;
+        return Ok(option_eq_to_nested(eq_map_rows(l, left_idx, r, right_idx)?));
+    }
+    Ok(
+        if compare_scalar_non_null(left, left_idx, right, right_idx)? == Ordering::Equal {
+            NestedEq::Equal
+        } else {
+            NestedEq::NotEqual
+        },
+    )
+}
+
 fn eq_list_rows(
     left: &ListArray,
     left_row: usize,
@@ -620,18 +701,14 @@ fn eq_list_rows(
     for idx in 0..left_len {
         let l_idx = left_start + idx;
         let r_idx = right_start + idx;
-        match eq_value_recursive(left_values, l_idx, right_values, r_idx)? {
-            Some(true) => {}
-            Some(false) => return Ok(Some(false)),
-            None => has_unknown = true,
+        match eq_value_recursive_nested(left_values, l_idx, right_values, r_idx)? {
+            NestedEq::Equal => {}
+            NestedEq::NotEqual => return Ok(Some(false)),
+            NestedEq::Unknown => has_unknown = true,
         }
     }
 
-    if has_unknown {
-        Ok(None)
-    } else {
-        Ok(Some(true))
-    }
+    Ok(if has_unknown { None } else { Some(true) })
 }
 
 fn eq_struct_rows(
@@ -653,18 +730,14 @@ fn eq_struct_rows(
 
     let mut has_unknown = false;
     for (left_col, right_col) in left.columns().iter().zip(right.columns()) {
-        match eq_value_recursive(left_col, left_row, right_col, right_row)? {
-            Some(true) => {}
-            Some(false) => return Ok(Some(false)),
-            None => has_unknown = true,
+        match eq_value_recursive_nested(left_col, left_row, right_col, right_row)? {
+            NestedEq::Equal => {}
+            NestedEq::NotEqual => return Ok(Some(false)),
+            NestedEq::Unknown => has_unknown = true,
         }
     }
 
-    if has_unknown {
-        Ok(None)
-    } else {
-        Ok(Some(true))
-    }
+    Ok(if has_unknown { None } else { Some(true) })
 }
 
 fn eq_map_rows(
@@ -697,23 +770,19 @@ fn eq_map_rows(
     for idx in 0..left_len {
         let left_idx = left_start + idx;
         let right_idx = right_start + idx;
-        match eq_value_recursive(left_keys, left_idx, right_keys, right_idx)? {
-            Some(true) => {}
-            Some(false) => return Ok(Some(false)),
-            None => has_unknown = true,
+        match eq_value_recursive_nested(left_keys, left_idx, right_keys, right_idx)? {
+            NestedEq::Equal => {}
+            NestedEq::NotEqual => return Ok(Some(false)),
+            NestedEq::Unknown => has_unknown = true,
         }
-        match eq_value_recursive(left_values, left_idx, right_values, right_idx)? {
-            Some(true) => {}
-            Some(false) => return Ok(Some(false)),
-            None => has_unknown = true,
+        match eq_value_recursive_nested(left_values, left_idx, right_values, right_idx)? {
+            NestedEq::Equal => {}
+            NestedEq::NotEqual => return Ok(Some(false)),
+            NestedEq::Unknown => has_unknown = true,
         }
     }
 
-    if has_unknown {
-        Ok(None)
-    } else {
-        Ok(Some(true))
-    }
+    Ok(if has_unknown { None } else { Some(true) })
 }
 
 fn eq_value_recursive_null_safe(
@@ -1620,6 +1689,34 @@ mod tests {
         builder.finish()
     }
 
+    fn create_test_map_array_nullable_values(rows: &[Option<&[(i32, Option<i64>)]>]) -> MapArray {
+        let mut builder = MapBuilder::new(
+            Some(MapFieldNames {
+                entry: "entries".to_string(),
+                key: "key".to_string(),
+                value: "value".to_string(),
+            }),
+            Int32Builder::new(),
+            Int64Builder::new(),
+        );
+        for row in rows {
+            match row {
+                Some(entries) => {
+                    for (key, value) in *entries {
+                        builder.keys().append_value(*key);
+                        match value {
+                            Some(value) => builder.values().append_value(*value),
+                            None => builder.values().append_null(),
+                        }
+                    }
+                    builder.append(true).unwrap();
+                }
+                None => builder.append(false).unwrap(),
+            }
+        }
+        builder.finish()
+    }
+
     fn create_test_chunk_map_i32_i64(left: MapArray, right: MapArray, map_type: DataType) -> Chunk {
         let left = Arc::new(left) as ArrayRef;
         let right = Arc::new(right) as ArrayRef;
@@ -1909,7 +2006,7 @@ mod tests {
         let expr = arena.push_typed(ExprNode::Eq(l, r), DataType::Boolean);
         let out = arena.eval(expr, &chunk).unwrap();
         let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert!(out.is_null(0));
+        assert!(out.value(0));
         assert!(!out.value(1));
         assert!(out.is_null(2));
     }
@@ -1967,7 +2064,7 @@ mod tests {
         let expr = arena.push_typed(ExprNode::Ne(l, r), DataType::Boolean);
         let out = arena.eval(expr, &chunk).unwrap();
         let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert!(out.is_null(0));
+        assert!(!out.value(0));
         assert!(out.value(1));
         assert!(out.is_null(2));
     }
@@ -2007,16 +2104,40 @@ mod tests {
         let left = StructArray::new(
             fields.clone(),
             vec![
-                Arc::new(Int32Array::from(vec![Some(1), Some(2), Some(3)])) as ArrayRef,
-                Arc::new(Int32Array::from(vec![Some(1), Some(1), Some(1)])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![
+                    Some(1),
+                    Some(2),
+                    Some(3),
+                    None,
+                    None,
+                ])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![
+                    Some(1),
+                    Some(1),
+                    Some(1),
+                    Some(4),
+                    Some(5),
+                ])) as ArrayRef,
             ],
             None,
         );
         let right = StructArray::new(
             fields,
             vec![
-                Arc::new(Int32Array::from(vec![Some(1), Some(2), Some(3)])) as ArrayRef,
-                Arc::new(Int32Array::from(vec![Some(1), Some(2), Some(1)])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![
+                    Some(1),
+                    Some(2),
+                    Some(3),
+                    None,
+                    Some(5),
+                ])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![
+                    Some(1),
+                    Some(2),
+                    Some(1),
+                    Some(4),
+                    Some(5),
+                ])) as ArrayRef,
             ],
             None,
         );
@@ -2030,6 +2151,8 @@ mod tests {
         assert!(out.value(0));
         assert!(!out.value(1));
         assert!(out.value(2));
+        assert!(out.value(3));
+        assert!(out.is_null(4));
     }
 
     #[test]
@@ -2057,6 +2180,40 @@ mod tests {
         let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
         assert!(out.value(0));
         assert!(!out.value(1));
+        assert!(out.is_null(2));
+    }
+
+    #[test]
+    fn test_eq_map_arrays_with_nested_null_values() {
+        let mut arena = ExprArena::default();
+        let entries_field = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                Field::new("key", DataType::Int32, false),
+                Field::new("value", DataType::Int64, true),
+            ])),
+            false,
+        ));
+        let map_type = DataType::Map(entries_field, false);
+        let left = create_test_map_array_nullable_values(&[
+            Some(&[(0, Some(10)), (1, None)]),
+            Some(&[(0, Some(10)), (1, None)]),
+            Some(&[(0, Some(10)), (1, None)]),
+        ]);
+        let right = create_test_map_array_nullable_values(&[
+            Some(&[(0, Some(10)), (1, None)]),
+            Some(&[(0, Some(10)), (1, Some(11))]),
+            Some(&[(0, Some(10)), (1, Some(12))]),
+        ]);
+        let chunk = create_test_chunk_map_i32_i64(left, right, map_type.clone());
+
+        let l = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), map_type.clone());
+        let r = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), map_type);
+        let expr = arena.push_typed(ExprNode::Eq(l, r), DataType::Boolean);
+        let out = arena.eval(expr, &chunk).unwrap();
+        let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(out.value(0));
+        assert!(out.is_null(1));
         assert!(out.is_null(2));
     }
 

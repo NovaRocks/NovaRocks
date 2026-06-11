@@ -16,6 +16,7 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::schema_compat::{align_fields_to_arrays, is_execution_data_type_compatible};
 use arrow::array::{ArrayRef, StructArray, new_null_array};
 use arrow::datatypes::DataType;
 use std::sync::Arc;
@@ -66,7 +67,7 @@ fn eval_new_struct(
         if array.data_type() == &DataType::Null && expected_type != &DataType::Null {
             array = new_null_array(expected_type, num_rows);
         }
-        if array.data_type() != expected_type {
+        if !is_execution_data_type_compatible(expected_type, array.data_type()) {
             return Err(format!(
                 "{} field type mismatch at {}: expected {:?}, got {:?}",
                 fn_name,
@@ -77,6 +78,7 @@ fn eval_new_struct(
         }
         arrays.push(array);
     }
+    let struct_fields = align_fields_to_arrays(&struct_fields, &arrays, fn_name)?;
     Ok(Arc::new(StructArray::new(struct_fields, arrays, None)) as ArrayRef)
 }
 

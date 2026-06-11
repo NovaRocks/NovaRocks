@@ -27,6 +27,7 @@ use crate::lower::expr::lower_t_expr;
 use crate::lower::layout::{Layout, chunk_schema_for_layout};
 use crate::lower::node::Lowered;
 use crate::novarocks_logging::warn;
+use crate::sql::types::wider_type;
 
 use crate::{descriptors, plan_nodes, runtime_filter, types};
 
@@ -98,7 +99,7 @@ fn common_join_key_type(left: &DataType, right: &DataType) -> Result<Option<Data
                 left_field.is_nullable() || right_field.is_nullable(),
             )))))
         }
-        _ => Ok(None),
+        _ => Ok(Some(wider_type(left, right))),
     }
 }
 
@@ -426,4 +427,17 @@ pub(crate) fn lower_hash_join_node(
         },
         layout: output_layout,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn common_join_key_type_promotes_mixed_integers() {
+        assert_eq!(
+            common_join_key_type(&DataType::Int32, &DataType::Int64).unwrap(),
+            Some(DataType::Int64)
+        );
+    }
 }

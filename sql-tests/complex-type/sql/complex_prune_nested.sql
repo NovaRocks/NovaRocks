@@ -116,17 +116,6 @@ insert into ${case_db}.scs3 values (8, "hh", [8,2,3],[row(1,13),row(2,23),row(3,
 insert into ${case_db}.scs3 values (9, "ii", [9,2,3],[row(1,13),row(2,23),row(3,33)], map{1:13, 2:23}, map{1:row(13, [113, 223, 333]), 2:row(22, [223, 223, 333])}, row(1, [row(1,3), row(2,3)], map{1:13, 2:23}, row(1,3)));
 insert into ${case_db}.scs3 values (10, "kk" ,[10,2,3],[row(1,13),row(2,23),row(3,33)], map{1:13, 2:23}, map{1:row(13, [113, 223, 333]), 2:row(22, [223, 223, 333])}, row(1, [row(1,3), row(2,3)], map{1:13, 2:23}, row(1,3)));
 insert into ${case_db}.scs3 select * from ${case_db}.scs3;
-insert into ${case_db}.scs3 select * from ${case_db}.scs3;
-insert into ${case_db}.scs3 select * from ${case_db}.scs3;
-insert into ${case_db}.scs3 select * from ${case_db}.scs3;
-insert into ${case_db}.scs3 select * from ${case_db}.scs3;
-insert into ${case_db}.scs3 select * from ${case_db}.scs3;
-insert into ${case_db}.scs3 select * from ${case_db}.scs3;
-insert into ${case_db}.scs3 select * from ${case_db}.scs3;
-insert into ${case_db}.scs3 select * from ${case_db}.scs3;
-insert into ${case_db}.scs3 select * from ${case_db}.scs3;
-insert into ${case_db}.scs3 select * from ${case_db}.scs3;
-insert into ${case_db}.scs3 select * from ${case_db}.scs3;
 
 -- query 27
 select a1, v1 from ${case_db}.scs3 where str = "aa" order by v1 limit 2;

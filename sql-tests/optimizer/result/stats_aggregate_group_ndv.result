@@ -1,9 +1,12 @@
 Explain String
 GATHER EXCHANGE stats={rows=63}
   PROJECT [a, b, sum(v) AS total_v] stats={rows=63}
-    HASH AGGREGATE (SINGLE, group by: [a, b]) stats={rows=63}
+    HASH AGGREGATE (GLOBAL, group by: [a, b]) stats={rows=63}
       aggregations: sum(v)
-      SCAN db_sqlt_61285ef79214c2ad.oq12_stats_group stats={rows=1000}
-           TABLE: db_sqlt_61285ef79214c2ad.oq12_stats_group
-           columns: a, b, v
-           min-max stats
+      HASH EXCHANGE (source: ShuffleAgg, hash: [c1, c2]) stats={rows=63}
+        HASH AGGREGATE (LOCAL, group by: [a, b]) stats={rows=63}
+          aggregations: sum(v)
+          SCAN db_sqlt_61285ef79214c2ad.oq12_stats_group stats={rows=1000}
+               TABLE: db_sqlt_61285ef79214c2ad.oq12_stats_group
+               columns: a, b, v
+               min-max stats

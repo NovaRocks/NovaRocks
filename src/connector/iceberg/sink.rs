@@ -98,6 +98,7 @@ struct IcebergSinkPlan {
     mode: IcebergSinkMode,
     table_location: String,
     data_location: String,
+    target_partition_spec_id: i32,
     object_store_s3: Option<S3StoreConfig>,
     file_format: String,
     compression: types::TCompressionType,
@@ -194,6 +195,7 @@ impl IcebergTableSinkFactory {
             .clone()
             .ok_or_else(|| "iceberg sink missing table location".to_string())?;
         let data_location = resolve_data_location(&sink)?;
+        let target_partition_spec_id = sink.target_partition_spec_id.unwrap_or(0);
         let object_store_s3 = resolve_sink_s3_config(&sink, &data_location)?;
         let file_format = sink
             .file_format
@@ -210,6 +212,7 @@ impl IcebergTableSinkFactory {
             mode,
             table_location,
             data_location,
+            target_partition_spec_id,
             object_store_s3,
             file_format,
             compression: sink
@@ -271,7 +274,13 @@ impl IcebergSinkPlan {
         );
         let file_io = build_staged_file_io(&self.data_location, self.object_store_s3.as_ref())?;
 
-        StagedWriteContext::from_parts(metadata, file_io, writer_schema, annotated_schema)
+        StagedWriteContext::from_parts_with_partition_spec_id(
+            metadata,
+            file_io,
+            writer_schema,
+            annotated_schema,
+            self.target_partition_spec_id,
+        )
     }
 }
 
@@ -698,7 +707,9 @@ fn align_arrays_to_schema(
                 )
             })?;
 
-            if casted.null_count() > array.null_count() {
+            if !matches!(array.data_type(), DataType::Null)
+                && casted.null_count() > array.null_count()
+            {
                 return Err(format!(
                     "iceberg sink cast introduced nulls at column index {} name={} from {:?} to {:?}",
                     idx,
@@ -1993,6 +2004,7 @@ mod tests {
                 mode: IcebergSinkMode::Data,
                 table_location: "file:///tmp/novarocks-iceberg-sink-test".to_string(),
                 data_location: "file:///tmp/novarocks-iceberg-sink-test/data".to_string(),
+                target_partition_spec_id: 0,
                 object_store_s3: None,
                 file_format: "parquet".to_string(),
                 compression: crate::types::TCompressionType::SNAPPY,
@@ -2027,6 +2039,7 @@ mod tests {
             mode: IcebergSinkMode::Data,
             table_location: table_location.clone(),
             data_location: data_location.clone(),
+            target_partition_spec_id: 0,
             object_store_s3: None,
             file_format: "parquet".to_string(),
             compression: crate::types::TCompressionType::SNAPPY,
@@ -2041,6 +2054,11 @@ mod tests {
         let ctx = plan.build_staged_write_context().expect("staged context");
 
         assert_eq!(ctx.schema().as_struct().fields()[0].id, 42);
+        assert_eq!(
+            ctx.partition_spec_id(),
+            0,
+            "staged sink metadata must preserve the target default partition spec id"
+        );
         assert_eq!(ctx.partition_spec().fields().len(), 1);
         assert_eq!(ctx.partition_spec().fields()[0].source_id, 42);
         assert_eq!(ctx.partition_spec().fields()[0].name, "id_part");
@@ -2079,6 +2097,7 @@ mod tests {
             mode: IcebergSinkMode::Data,
             table_location,
             data_location: data_location.clone(),
+            target_partition_spec_id: 0,
             object_store_s3: None,
             file_format: "parquet".to_string(),
             compression: crate::types::TCompressionType::SNAPPY,
@@ -2134,6 +2153,11 @@ mod tests {
             "DATA sink should use staged writer kernel file naming under FE data_location, got {path}"
         );
         assert_eq!(data_file.partition_path.as_deref(), Some("id_part=7"));
+        assert_eq!(
+            data_file.partition_spec_id,
+            Some(0),
+            "writer report must carry the target default partition spec id"
+        );
         assert_eq!(data_file.record_count, Some(2));
         assert_eq!(
             data_file.file_content,
@@ -2165,6 +2189,7 @@ mod tests {
             mode: IcebergSinkMode::PositionDeletes,
             table_location,
             data_location: data_location.clone(),
+            target_partition_spec_id: 0,
             object_store_s3: None,
             file_format: "parquet".to_string(),
             compression: crate::types::TCompressionType::SNAPPY,
@@ -2252,6 +2277,18 @@ mod tests {
         assert_eq!(out.value(0), 1);
         assert!(out.is_null(1));
         assert_eq!(out.value(2), 2);
+    }
+
+    #[test]
+    fn test_align_arrays_to_schema_casts_null_array_to_target_type() {
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+        let arrays: Vec<ArrayRef> = vec![Arc::new(arrow::array::NullArray::new(3))];
+
+        let aligned = align_arrays_to_schema(arrays, &schema).expect("align null array");
+        assert_eq!(aligned.len(), 1);
+        assert_eq!(aligned[0].data_type(), &DataType::Int64);
+        assert_eq!(aligned[0].len(), 3);
+        assert_eq!(aligned[0].null_count(), 3);
     }
 
     #[test]

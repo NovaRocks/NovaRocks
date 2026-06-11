@@ -4,16 +4,15 @@ GATHER EXCHANGE stats={rows=2}
     WINDOW [row_number()] stats={rows=2}
       SORT BY [a.k ASC NULLS FIRST, a.v ASC NULLS FIRST] stats={rows=2}
         HASH EXCHANGE (source: ShuffleAgg, hash: [c1]) stats={rows=2}
-          HASH JOIN (BROADCAST, RIGHT OUTER, eq: [a.k = b.k]) stats={rows=2}
+          HASH JOIN (PARTITIONED, RIGHT OUTER, eq: [a.k = b.k]) stats={rows=2}
             build runtime filters:
             - filter_id = 0, build_expr = (b.k)
-            SCAN db_sqlt_570a7facce59396a.g3_ro_left (alias=a) stats={rows=2}
-                 TABLE: db_sqlt_570a7facce59396a.g3_ro_left
-                 columns: k, v
-                 min-max stats
-                probe runtime filters:
-                - filter_id = 0, probe_expr = (a.k)
-            BROADCAST EXCHANGE stats={rows=2}
+            HASH EXCHANGE (source: ShuffleJoin, hash: [c1]) stats={rows=2}
+              SCAN db_sqlt_570a7facce59396a.g3_ro_left (alias=a) stats={rows=2}
+                   TABLE: db_sqlt_570a7facce59396a.g3_ro_left
+                   columns: k, v
+                   min-max stats
+            HASH EXCHANGE (source: ShuffleJoin, hash: [c3]) stats={rows=2}
               SCAN db_sqlt_570a7facce59396a.date_dim (alias=b) stats={rows=2}
                    TABLE: db_sqlt_570a7facce59396a.date_dim
                    columns: k, w

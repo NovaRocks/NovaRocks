@@ -1651,6 +1651,7 @@ pub fn cancel(finst_id: UniqueId) {
 }
 
 pub(crate) fn mark_query_failed_from_report(query_id: QueryId, finst_id: UniqueId, error: String) {
+    crate::runtime::coordinator::record_standalone_query_failure(query_id, error.clone());
     let mgr = query_context_manager();
     let mut finsts = mgr.cancel_query(query_id, error.clone());
     if !finsts.contains(&finst_id) {

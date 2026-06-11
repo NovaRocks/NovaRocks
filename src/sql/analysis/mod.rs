@@ -473,6 +473,7 @@ pub(crate) enum LiteralValue {
     /// Precision and scale are inferred from the text: `100.00` → precision=5, scale=2.
     Decimal(String),
     String(String),
+    Binary(Vec<u8>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -99,6 +99,12 @@ pub trait FragmentDispatcher: Send + Sync + 'static {
 
     /// Number of backends this dispatcher can route to.
     fn backend_count(&self) -> usize;
+
+    /// Whether non-write fragments need final status reports back to the
+    /// standalone coordinator.
+    fn needs_fragment_status_report(&self) -> bool {
+        false
+    }
 }
 
 /// Return a reasonable pipeline DOP for standalone execution.
@@ -794,6 +800,10 @@ impl FragmentDispatcher for RemoteDispatcher {
 
     fn backend_count(&self) -> usize {
         self.clients.len()
+    }
+
+    fn needs_fragment_status_report(&self) -> bool {
+        true
     }
 }
 

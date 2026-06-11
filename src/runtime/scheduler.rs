@@ -54,7 +54,10 @@ use crate::data_sinks::TPlanFragmentDestination;
 use crate::internal_service::TScanRangeParams;
 use crate::partitions::TPartitionType;
 use crate::runtime_filter::TRuntimeFilterProberParams;
-use crate::sql::codegen::{FragmentBuildResult, FragmentEdge, FragmentId, RuntimeFilterPlanResult};
+use crate::sql::codegen::{
+    FragmentBuildResult, FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind,
+    RuntimeFilterPlanResult,
+};
 use crate::types::{TNetworkAddress, TUniqueId};
 
 type LiveBackend = (usize, SocketAddr);
@@ -155,13 +158,21 @@ impl FragmentScheduler {
             fragments.iter().map(|fr| (fr.fragment_id, fr)).collect();
 
         // Step 3: compute instance counts in topo order.
-        // Incoming edges: target -> [(source, partition_type)]
-        let mut incoming: BTreeMap<FragmentId, Vec<(FragmentId, TPartitionType)>> = BTreeMap::new();
+        // Incoming edges: target -> [(source, partition_type, stream_kind)].
+        let mut incoming: BTreeMap<
+            FragmentId,
+            Vec<(FragmentId, TPartitionType, FragmentStreamKind)>,
+        > = BTreeMap::new();
         for e in edges {
-            incoming
-                .entry(e.target_fragment_id)
-                .or_default()
-                .push((e.source_fragment_id, e.output_partition.type_));
+            let stream_kind = match e.edge_kind {
+                FragmentEdgeKind::Stream => e.stream_kind,
+                FragmentEdgeKind::CteMulticast { .. } => FragmentStreamKind::Broadcast,
+            };
+            incoming.entry(e.target_fragment_id).or_default().push((
+                e.source_fragment_id,
+                e.output_partition.type_,
+                stream_kind,
+            ));
         }
 
         let mut instance_counts: BTreeMap<FragmentId, usize> = BTreeMap::new();
@@ -170,7 +181,17 @@ impl FragmentScheduler {
                 .get(&fid)
                 .ok_or_else(|| format!("fragment {fid} missing from fragment list"))?;
 
-            let count = if !find_scan_plan_nodes(&fr.plan).is_empty() {
+            let has_gather_input = incoming
+                .get(&fid)
+                .map(|ins| {
+                    ins.iter()
+                        .any(|(_, _, stream_kind)| *stream_kind == FragmentStreamKind::Gather)
+                })
+                .unwrap_or(false);
+
+            let count = if has_gather_input {
+                1
+            } else if !find_scan_plan_nodes(&fr.plan).is_empty() {
                 // Scan fragment: one instance per backend.
                 n
             } else {
@@ -179,7 +200,7 @@ impl FragmentScheduler {
                     .get(&fid)
                     .map(|ins| {
                         ins.iter()
-                            .filter_map(|(src_id, ptype)| {
+                            .filter_map(|(src_id, ptype, _)| {
                                 if *ptype == TPartitionType::HASH_PARTITIONED
                                     || *ptype == TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED
                                 {
@@ -538,7 +559,9 @@ mod tests {
     use crate::partitions;
     use crate::plan_nodes;
     use crate::sql::codegen::RuntimeFilterPlanResult;
-    use crate::sql::codegen::{FragmentBuildResult, FragmentEdge, FragmentEdgeKind, OutputColumn};
+    use crate::sql::codegen::{
+        FragmentBuildResult, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
+    };
     use crate::types;
 
     // -----------------------------------------------------------------------
@@ -699,6 +722,34 @@ mod tests {
         ptype: partitions::TPartitionType,
         exch_node_id: i32,
     ) -> FragmentEdge {
+        let stream_kind = match ptype {
+            partitions::TPartitionType::HASH_PARTITIONED
+            | partitions::TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED => {
+                FragmentStreamKind::Partitioned
+            }
+            partitions::TPartitionType::UNPARTITIONED => FragmentStreamKind::Gather,
+            _ => FragmentStreamKind::Other,
+        };
+        fake_stream_edge(src, tgt, ptype, exch_node_id, stream_kind)
+    }
+
+    fn fake_broadcast_edge(src: FragmentId, tgt: FragmentId, exch_node_id: i32) -> FragmentEdge {
+        fake_stream_edge(
+            src,
+            tgt,
+            partitions::TPartitionType::UNPARTITIONED,
+            exch_node_id,
+            FragmentStreamKind::Broadcast,
+        )
+    }
+
+    fn fake_stream_edge(
+        src: FragmentId,
+        tgt: FragmentId,
+        ptype: partitions::TPartitionType,
+        exch_node_id: i32,
+        stream_kind: FragmentStreamKind,
+    ) -> FragmentEdge {
         FragmentEdge {
             source_fragment_id: src,
             target_fragment_id: tgt,
@@ -709,6 +760,7 @@ mod tests {
                 None::<Vec<partitions::TRangePartition>>,
                 None::<Vec<partitions::TBucketProperty>>,
             ),
+            stream_kind,
             edge_kind: FragmentEdgeKind::Stream,
         }
     }
@@ -870,9 +922,9 @@ mod tests {
     fn mixed_partition_edges_hash_wins_over_unpartitioned() {
         // Topology:
         //   F0(scan, N=2) -> HASH_PARTITIONED     -> F2(consumer, non-root)
-        //   F1(non-scan)  -> UNPARTITIONED         -> F2
+        //   F1(non-scan)  -> BROADCAST             -> F2
         //   F2            -> UNPARTITIONED         -> F3(root)
-        // F2 should get N=2 instances (HASH edge determines count; UNPARTITIONED is ignored).
+        // F2 should get N=2 instances (HASH edge determines count; broadcast is ignored).
         let backends = two_backends();
         let scheduler = FragmentScheduler::new(backends);
         let fragments = vec![
@@ -883,7 +935,7 @@ mod tests {
         ];
         let edges = vec![
             fake_edge(0, 2, partitions::TPartitionType::HASH_PARTITIONED, 10),
-            fake_edge(1, 2, partitions::TPartitionType::UNPARTITIONED, 20),
+            fake_broadcast_edge(1, 2, 20),
             fake_edge(2, 3, partitions::TPartitionType::UNPARTITIONED, 30),
         ];
         let plan = scheduler
@@ -924,6 +976,29 @@ mod tests {
             plan.by_fragment[&1].len(),
             1,
             "unpartitioned gather -> 1 instance"
+        );
+    }
+
+    #[test]
+    fn incoming_gather_forces_scan_consumer_to_one_instance() {
+        let backends = three_backends();
+        let scheduler = FragmentScheduler::new(backends);
+        let fragments = vec![
+            fake_fragment(0, None, 0),    // gathered producer
+            fake_fragment(1, Some(7), 6), // consumer also owns a scan
+            fake_fragment(2, None, 0),    // root
+        ];
+        let edges = vec![
+            fake_edge(0, 1, partitions::TPartitionType::UNPARTITIONED, 10),
+            fake_edge(1, 2, partitions::TPartitionType::HASH_PARTITIONED, 20),
+        ];
+        let plan = scheduler
+            .assign(&fragments, &edges, make_query_id(1, 7))
+            .expect("assign");
+        assert_eq!(
+            plan.by_fragment[&1].len(),
+            1,
+            "a true Gather input must not be consumed by every scan instance"
         );
     }
 

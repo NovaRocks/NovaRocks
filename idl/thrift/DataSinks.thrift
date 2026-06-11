@@ -256,6 +256,7 @@ struct TIcebergTableSink {
     7: optional i64 target_max_file_size
     8: optional i32 tuple_id
     9: optional string data_location
+    10: optional i32 target_partition_spec_id
 }
 
 struct THiveTableSink {

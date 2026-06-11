@@ -277,6 +277,10 @@ fn orient_rf_key(
     }
 }
 
+fn rf_key_types_match(eq: &PhysicalHashJoinEqCondition) -> bool {
+    eq.left.data_type == eq.right.data_type
+}
+
 /// Returns true if `node` outputs every column id referenced by `probe_expr`.
 ///
 /// An empty needed set (e.g. a literal probe expression) cannot be bound — the
@@ -470,6 +474,9 @@ fn annotate_node(
     let mut descs: Vec<RuntimeFilterDesc> = Vec::new();
     for (expr_order, eq) in eq_conditions.iter().enumerate() {
         if eq.null_safe {
+            continue;
+        }
+        if !rf_key_types_match(eq) {
             continue;
         }
         // Probe gate: skip this equi-conjunct if it would not reduce probe rows enough.
@@ -960,6 +967,24 @@ mod tests {
         let mut j = super::test_support::inner_join_two_scans();
         annotate(&mut j, &OptimizerOptions::default_settings());
         assert_eq!(j.build_runtime_filters.len(), 1);
+    }
+
+    #[test]
+    fn skips_rf_for_mixed_type_join_keys() {
+        let mut join = super::test_support::inner_join_two_scans();
+        let Operator::PhysicalHashJoin(op) = &mut join.op else {
+            panic!("expected hash join");
+        };
+        op.eq_conditions[0].left.data_type = arrow::datatypes::DataType::Utf8;
+        op.eq_conditions[0].right.data_type = arrow::datatypes::DataType::Int32;
+
+        annotate(&mut join, &OptimizerOptions::default_settings());
+
+        assert!(
+            join.build_runtime_filters.is_empty(),
+            "mixed-type RF descriptors would not carry the join-key cast semantics"
+        );
+        assert_eq!(probe_runtime_filter_count(&join), 0);
     }
 
     #[test]

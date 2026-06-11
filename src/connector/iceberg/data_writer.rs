@@ -91,6 +91,9 @@ pub(crate) struct StagedWriteContext {
     file_io: iceberg::io::FileIO,
     writer_schema: SchemaRef,
     annotated_schema: arrow::datatypes::SchemaRef,
+    /// Target table partition spec id reported in sink commit metadata. The
+    /// staged writer may use synthetic metadata for schema/partition binding,
+    /// but the coordinator must commit files under the real target spec id.
     partition_spec_id: i32,
 }
 
@@ -123,8 +126,24 @@ impl StagedWriteContext {
         writer_schema: SchemaRef,
         annotated_schema: arrow::datatypes::SchemaRef,
     ) -> Result<Self, String> {
-        let metadata = Arc::new(metadata);
         let partition_spec_id = metadata.default_partition_spec_id();
+        Self::from_parts_with_partition_spec_id(
+            metadata,
+            file_io,
+            writer_schema,
+            annotated_schema,
+            partition_spec_id,
+        )
+    }
+
+    pub(crate) fn from_parts_with_partition_spec_id(
+        metadata: iceberg::spec::TableMetadata,
+        file_io: iceberg::io::FileIO,
+        writer_schema: SchemaRef,
+        annotated_schema: arrow::datatypes::SchemaRef,
+        partition_spec_id: i32,
+    ) -> Result<Self, String> {
+        let metadata = Arc::new(metadata);
         Ok(Self {
             metadata,
             file_io,

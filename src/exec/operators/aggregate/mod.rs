@@ -50,6 +50,7 @@ use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
 use crate::exec::hash_table::key_builder::{GroupKeyArrayView, build_group_key_views};
 use crate::exec::hash_table::key_column::build_output_schema_from_kernels;
 use crate::exec::hash_table::key_strategy::GroupKeyStrategy;
+use crate::exec::schema_compat::is_execution_data_type_compatible;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::RuntimeState;
 
@@ -117,36 +118,7 @@ pub(super) fn align_schema_with_arrays(
 }
 
 pub(super) fn is_compatible_aggregate_data_type(expected: &DataType, actual: &DataType) -> bool {
-    if expected == actual {
-        return true;
-    }
-    match (expected, actual) {
-        (DataType::List(expected_item), DataType::List(actual_item)) => {
-            is_compatible_aggregate_data_type(expected_item.data_type(), actual_item.data_type())
-        }
-        (
-            DataType::Map(expected_entries, expected_ordered),
-            DataType::Map(actual_entries, actual_ordered),
-        ) => {
-            expected_ordered == actual_ordered
-                && is_compatible_aggregate_data_type(
-                    expected_entries.data_type(),
-                    actual_entries.data_type(),
-                )
-        }
-        (DataType::Struct(expected_fields), DataType::Struct(actual_fields)) => {
-            expected_fields.len() == actual_fields.len()
-                && expected_fields.iter().zip(actual_fields.iter()).all(
-                    |(expected_field, actual_field)| {
-                        is_compatible_aggregate_data_type(
-                            expected_field.data_type(),
-                            actual_field.data_type(),
-                        )
-                    },
-                )
-        }
-        _ => false,
-    }
+    is_execution_data_type_compatible(expected, actual)
 }
 
 /// Factory that constructs aggregate processors backed by group-key hash tables and aggregate kernels.
@@ -1079,7 +1051,7 @@ impl AggregateProcessorOperator {
         }
         for (idx, (expected_type, array)) in expected.iter().zip(arrays.iter()).enumerate() {
             let actual_type = array.data_type();
-            if expected_type != actual_type {
+            if !is_compatible_aggregate_data_type(expected_type, actual_type) {
                 return Err(format!(
                     "group by type mismatch at {}: expected {:?}, got {:?}",
                     idx, expected_type, actual_type
@@ -1141,7 +1113,7 @@ impl AggregateProcessorOperator {
             let array = array_opt
                 .as_ref()
                 .ok_or_else(|| "aggregate input missing".to_string())?;
-            if expected_type != array.data_type() {
+            if !is_compatible_aggregate_data_type(expected_type, array.data_type()) {
                 return Err(format!(
                     "aggregate input type mismatch at {}: expected {:?}, got {:?}",
                     idx,
@@ -1207,5 +1179,24 @@ impl AggregateProcessorOperator {
 impl Drop for AggregateProcessorOperator {
     fn drop(&mut self) {
         self.drop_group_states();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow::datatypes::DataType;
+
+    use super::is_compatible_aggregate_data_type;
+
+    #[test]
+    fn aggregate_accepts_decimal_precision_widening_with_same_scale() {
+        assert!(is_compatible_aggregate_data_type(
+            &DataType::Decimal128(10, 2),
+            &DataType::Decimal128(38, 2)
+        ));
+        assert!(!is_compatible_aggregate_data_type(
+            &DataType::Decimal128(10, 2),
+            &DataType::Decimal128(38, 3)
+        ));
     }
 }

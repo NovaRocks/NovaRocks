@@ -1140,6 +1140,19 @@ impl<'a> ExprCompiler<'a> {
                 self.last_nullable = false;
                 Ok(DataType::Utf8)
             }
+            LiteralValue::Binary(bytes) => {
+                let type_desc = scalar_type_desc(types::TPrimitiveType::VARBINARY);
+                self.nodes.push(exprs::TExprNode {
+                    node_type: exprs::TExprNodeType::BINARY_LITERAL,
+                    type_: type_desc,
+                    num_children: 0,
+                    binary_literal: Some(exprs::TBinaryLiteral::new(bytes.clone())),
+                    ..default_expr_node()
+                });
+                self.last_type = DataType::Binary;
+                self.last_nullable = false;
+                Ok(DataType::Binary)
+            }
         }
     }
 
@@ -2330,8 +2343,8 @@ fn infer_scalar_function_return_type(
         "__iceberg_transform_year"
         | "__iceberg_transform_month"
         | "__iceberg_transform_day"
-        | "__iceberg_transform_hour"
-        | "__iceberg_transform_bucket" => Ok(DataType::Int32),
+        | "__iceberg_transform_hour" => Ok(DataType::Int64),
+        "__iceberg_transform_bucket" => Ok(DataType::Int32),
         "__iceberg_transform_truncate" => Ok(arg_types.first().cloned().unwrap_or(DataType::Null)),
         "to_datetime_ntz" => Ok(DataType::Timestamp(
             arrow::datatypes::TimeUnit::Microsecond,
@@ -3080,7 +3093,7 @@ mod tests {
     use std::rc::Rc;
     use std::sync::Arc;
 
-    use crate::sql::analysis::{ExprKind, TypedExpr};
+    use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
     use crate::sql::codegen::resolve::{ColumnBinding, ExprScope};
     use crate::sql::column_id::ColumnId;
 
@@ -3200,6 +3213,31 @@ mod tests {
         assert_eq!(
             slot_ref.slot_ref.as_ref().expect("slot_ref node").slot_id,
             11
+        );
+    }
+
+    #[test]
+    fn binary_literal_compiles_to_binary_expr_node() {
+        let expr = TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Binary(vec![0xab, 0x01])),
+            data_type: DataType::Binary,
+            nullable: false,
+        };
+        let scope = ExprScope::new();
+        let slot_alloc = Rc::new(RefCell::new(100));
+        let mut compiler = ExprCompiler::new(slot_alloc, &scope);
+
+        let compiled = compiler
+            .compile_typed(&expr)
+            .expect("binary literal should compile");
+        let node = compiled.nodes.first().expect("literal node");
+        assert_eq!(node.node_type, crate::exprs::TExprNodeType::BINARY_LITERAL);
+        assert_eq!(
+            node.binary_literal
+                .as_ref()
+                .expect("binary literal payload")
+                .value,
+            vec![0xab, 0x01]
         );
     }
 

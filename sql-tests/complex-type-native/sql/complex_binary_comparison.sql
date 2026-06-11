@@ -33,7 +33,7 @@ insert into ${case_db}.sc2 values (5, [15,25,35,45], [map{3: 550}, map{505: 501}
 select * from ${case_db}.sc2 where array1 is null order by v1;
 
 -- query 3
--- array with NULL elements: = returns NULL (not equal), so empty result
+-- Paired internal NULL elements compare equal; outer NULL still follows SQL NULL semantics.
 select * from ${case_db}.sc2 where array1 = [11,null,31,41] order by v1;
 
 -- query 4

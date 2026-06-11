@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::collections::{HashMap, HashSet};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
@@ -116,6 +117,182 @@ pub(crate) fn register_stream_load_engine(engine: StandaloneNovaRocks) {
 
 pub(crate) fn current_stream_load_engine() -> Option<StandaloneNovaRocks> {
     stream_load_engine_cell().get().cloned()
+}
+
+pub(crate) fn recover_starrocks_tablet_paths_from_current_engine(
+    table: &crate::connector::starrocks::fe_v2_meta::LakeTableIdentity,
+    tablet_ids: &[i64],
+) -> Result<HashMap<i64, String>, String> {
+    let Some(engine) = current_stream_load_engine() else {
+        return recover_starrocks_tablet_paths_from_installed_config(table, tablet_ids);
+    };
+    recover_starrocks_tablet_paths_from_state(&engine.inner, table, tablet_ids)
+}
+
+pub(crate) fn recover_starrocks_tablet_paths_from_installed_config(
+    table: &crate::connector::starrocks::fe_v2_meta::LakeTableIdentity,
+    tablet_ids: &[i64],
+) -> Result<HashMap<i64, String>, String> {
+    if tablet_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let cfg = match novarocks_config::config() {
+        Ok(cfg) => cfg,
+        Err(_) => return Ok(HashMap::new()),
+    };
+    let Some(metadata) = cfg.metadata.as_ref() else {
+        return Ok(HashMap::new());
+    };
+    let Some(standalone) = cfg.standalone_server.as_ref() else {
+        return Ok(HashMap::new());
+    };
+    let Some(app_cfg) = standalone.starrocks_table_config()? else {
+        return Ok(HashMap::new());
+    };
+    let starrocks_table_config = StarRocksTableConfig::from_app_config(app_cfg)?;
+    let provider = open_metadata_provider(&ResolvedMetadataBackend {
+        provider: metadata.provider,
+        path: metadata.path.clone(),
+    })?;
+    let read = provider.begin_read().map_err(|e| {
+        format!("open StarRocks table metadata recovery read transaction failed: {e}")
+    })?;
+    let snapshot = StarRocksTableMetaRepository
+        .load_snapshot(read.as_ref())
+        .map_err(|e| {
+            format!("load StarRocks table metadata during tablet path recovery failed: {e}")
+        })?;
+    let rebuilt = StarRocksTableCatalog::rebuild_from_repository(
+        Some(starrocks_table_config.clone()),
+        snapshot,
+    )?;
+    let paths = select_starrocks_tablet_paths_from_catalog(&rebuilt, table, tablet_ids)?;
+    register_starrocks_shard_infos(&starrocks_table_config.s3, &paths);
+    Ok(paths)
+}
+
+pub(crate) fn recover_starrocks_tablet_paths_from_state(
+    state: &Arc<StandaloneState>,
+    table: &crate::connector::starrocks::fe_v2_meta::LakeTableIdentity,
+    tablet_ids: &[i64],
+) -> Result<HashMap<i64, String>, String> {
+    if tablet_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut paths = {
+        let catalog = state
+            .starrocks_table
+            .read()
+            .expect("standalone StarRocks table read lock");
+        select_starrocks_tablet_paths_from_catalog(&catalog, table, tablet_ids)?
+    };
+    if starrocks_tablet_paths_cover(tablet_ids, &paths) {
+        register_starrocks_shard_infos_from_paths(state, &paths);
+        return Ok(paths);
+    }
+
+    let Some(provider) = state.metadata_provider.as_ref() else {
+        register_starrocks_shard_infos_from_paths(state, &paths);
+        return Ok(paths);
+    };
+
+    let read = provider.begin_read().map_err(|e| {
+        format!("open StarRocks table metadata recovery read transaction failed: {e}")
+    })?;
+    let snapshot = state
+        .starrocks_table_repo
+        .load_snapshot(read.as_ref())
+        .map_err(|e| {
+            format!("load StarRocks table metadata during tablet path recovery failed: {e}")
+        })?;
+    let rebuilt = StarRocksTableCatalog::rebuild_from_repository(
+        state.starrocks_table_config.clone(),
+        snapshot.clone(),
+    )?;
+    let recovered = select_starrocks_tablet_paths_from_catalog(&rebuilt, table, tablet_ids)?;
+    if !recovered.is_empty() {
+        register_starrocks_shard_infos_from_paths(state, &recovered);
+        paths.extend(recovered);
+    }
+
+    {
+        let mut catalog = state
+            .catalog
+            .write()
+            .expect("standalone catalog write lock");
+        for database in &snapshot.databases {
+            catalog.create_database(&database.name)?;
+        }
+        register_starrocks_tables_in_catalog(&mut catalog, &rebuilt)?;
+    }
+    let mut guard = state
+        .starrocks_table
+        .write()
+        .expect("standalone StarRocks table write lock");
+    *guard = rebuilt;
+
+    Ok(paths)
+}
+
+fn select_starrocks_tablet_paths_from_catalog(
+    catalog: &StarRocksTableCatalog,
+    table: &crate::connector::starrocks::fe_v2_meta::LakeTableIdentity,
+    tablet_ids: &[i64],
+) -> Result<HashMap<i64, String>, String> {
+    let requested = tablet_ids.iter().copied().collect::<HashSet<_>>();
+    let Some(runtime) = catalog
+        .runtime_by_table_id(table.table_id)
+        .or_else(|| catalog.table(&table.db_name, &table.table_name).ok())
+    else {
+        return Ok(HashMap::new());
+    };
+    let mut paths = HashMap::with_capacity(requested.len());
+    for tablet in &runtime.tablets {
+        if requested.contains(&tablet.tablet_id) {
+            paths.insert(tablet.tablet_id, tablet.tablet_root_path.clone());
+        }
+    }
+    Ok(paths)
+}
+
+fn starrocks_tablet_paths_cover(tablet_ids: &[i64], paths: &HashMap<i64, String>) -> bool {
+    tablet_ids.iter().all(|tablet_id| {
+        paths
+            .get(tablet_id)
+            .is_some_and(|path| !path.trim().is_empty())
+    })
+}
+
+fn register_starrocks_shard_infos_from_paths(
+    state: &StandaloneState,
+    paths: &HashMap<i64, String>,
+) -> usize {
+    let Some(config) = state.starrocks_table_config.as_ref() else {
+        return 0;
+    };
+    register_starrocks_shard_infos(&config.s3, paths)
+}
+
+fn register_starrocks_shard_infos(
+    s3: &crate::runtime::starlet_shard_registry::S3StoreConfig,
+    paths: &HashMap<i64, String>,
+) -> usize {
+    if paths.is_empty() {
+        return 0;
+    }
+    crate::runtime::starlet_shard_registry::upsert_many_infos(paths.iter().map(
+        |(tablet_id, full_path)| {
+            (
+                *tablet_id,
+                crate::runtime::starlet_shard_registry::StarletShardInfo {
+                    full_path: full_path.clone(),
+                    s3: Some(s3.clone()),
+                },
+            )
+        },
+    ))
 }
 
 pub(crate) fn catalog_mgr_snapshot(state: &Arc<StandaloneState>) -> catalog_mgr::CatalogMgr {
@@ -4224,9 +4401,12 @@ mod build_iceberg_create_table_ddl_tests {
 mod tests {
     use super::{
         QueryResult, StandaloneNovaRocks, StandaloneOptions, StandaloneSession, StandaloneState,
-        StatementResult, dispatch_statement, register_connector_backends,
+        StatementResult, dispatch_statement, recover_starrocks_tablet_paths_from_installed_config,
+        recover_starrocks_tablet_paths_from_state, register_connector_backends,
     };
+    use crate::connector::starrocks::fe_v2_meta::LakeTableIdentity;
     use crate::connector::starrocks::lake::context::lock_runtime_test_state;
+    use crate::connector::starrocks::table::config::StarRocksTableConfig;
     use crate::meta::MetaStoreProvider;
     use arrow::array::{
         Array, FixedSizeBinaryArray, Int32Array, Int64Array, ListArray, StringArray,
@@ -4274,6 +4454,192 @@ path = "{metadata_path}"
         )
         .expect("write metadata config");
         config_path
+    }
+
+    fn test_starrocks_table_config() -> StarRocksTableConfig {
+        StarRocksTableConfig {
+            warehouse_uri: "s3://test/warehouse".to_string(),
+            s3: crate::runtime::starlet_shard_registry::S3StoreConfig {
+                endpoint: "http://127.0.0.1:9000".to_string(),
+                bucket: "test".to_string(),
+                access_key_id: "ak".to_string(),
+                access_key_secret: "sk".to_string(),
+                region: None,
+                enable_path_style_access: Some(true),
+            },
+            mv_default_storage_engine: "starrocks".to_string(),
+        }
+    }
+
+    #[test]
+    fn recovers_starrocks_tablet_paths_from_metadata_after_be_startup() {
+        let _runtime_guard = lock_runtime_test_state();
+        use crate::meta::repository::starrocks_table::{
+            CreateStarRocksTableLayoutRequest, StarRocksTableKind, StarRocksTableMetaRepository,
+        };
+        use crate::service::grpc_client::proto::starrocks::TabletSchemaPb;
+        use prost::Message;
+
+        let dir = TempDir::new().expect("tempdir");
+        let provider =
+            crate::meta::SqliteMetaStoreProvider::open(dir.path().join("standalone.sqlite"))
+                .expect("open provider");
+        let (db_id, table_id, schema_id, tablet_id, expected_path) = {
+            let mut txn = provider
+                .begin_write("seed starrocks table")
+                .expect("write txn");
+            let repo = StarRocksTableMetaRepository::default();
+            let database = repo
+                .get_or_create_database(txn.as_mut(), "analytics")
+                .expect("create database");
+            let created = repo
+                .create_table_layout(
+                    txn.as_mut(),
+                    CreateStarRocksTableLayoutRequest {
+                        db_id: database.db_id,
+                        table_name: "orders".to_string(),
+                        keys_type: "DUP_KEYS".to_string(),
+                        bucket_num: 1,
+                        kind: StarRocksTableKind::Table,
+                        schema_version: 0,
+                        tablet_schema_pb: TabletSchemaPb::default().encode_to_vec(),
+                        columns: Vec::new(),
+                        partition_name: "p0".to_string(),
+                        warehouse_uri: "s3://test/warehouse".to_string(),
+                    },
+                )
+                .expect("create table layout");
+            txn.commit().expect("commit seed");
+            (
+                database.db_id,
+                created.table.table_id,
+                created.schema.schema_id,
+                created.tablets[0].tablet_id,
+                created.tablets[0].tablet_root_path.clone(),
+            )
+        };
+        let state = Arc::new(StandaloneState {
+            starrocks_table_config: Some(test_starrocks_table_config()),
+            metadata_provider: Some(Arc::new(provider)),
+            ..StandaloneState::default()
+        });
+        let table = LakeTableIdentity {
+            catalog: "default_catalog".to_string(),
+            db_name: "analytics".to_string(),
+            table_name: "orders".to_string(),
+            db_id,
+            table_id,
+            schema_id,
+        };
+
+        let paths = recover_starrocks_tablet_paths_from_state(&state, &table, &[tablet_id])
+            .expect("recover tablet paths");
+
+        assert_eq!(
+            paths.get(&tablet_id).map(String::as_str),
+            Some(expected_path.as_str())
+        );
+        let shard = crate::runtime::starlet_shard_registry::select_infos(&[tablet_id]);
+        let info = shard.get(&tablet_id).expect("shard info registered");
+        assert_eq!(info.full_path, expected_path);
+        assert_eq!(
+            info.s3.as_ref().map(|s3| s3.endpoint.as_str()),
+            Some("http://127.0.0.1:9000")
+        );
+    }
+
+    #[test]
+    fn recovers_starrocks_tablet_paths_from_installed_config_without_engine_state() {
+        let _guard = super::acquire_standalone_test_guard();
+        let _runtime_guard = lock_runtime_test_state();
+        use crate::common::app_config::{
+            MetadataConfig, MetadataProviderConfig, NovaRocksConfig, StandaloneObjectStoreConfig,
+            StandaloneServerConfig,
+        };
+        use crate::meta::repository::starrocks_table::{
+            CreateStarRocksTableLayoutRequest, StarRocksTableKind, StarRocksTableMetaRepository,
+        };
+        use crate::service::grpc_client::proto::starrocks::TabletSchemaPb;
+        use prost::Message;
+
+        let dir = TempDir::new().expect("tempdir");
+        let metadata_path = dir.path().join("standalone.sqlite");
+        let provider =
+            crate::meta::SqliteMetaStoreProvider::open(&metadata_path).expect("open provider");
+        let (db_id, table_id, schema_id, tablet_id, expected_path) = {
+            let mut txn = provider
+                .begin_write("seed starrocks table")
+                .expect("write txn");
+            let repo = StarRocksTableMetaRepository::default();
+            let database = repo
+                .get_or_create_database(txn.as_mut(), "analytics")
+                .expect("create database");
+            let created = repo
+                .create_table_layout(
+                    txn.as_mut(),
+                    CreateStarRocksTableLayoutRequest {
+                        db_id: database.db_id,
+                        table_name: "orders".to_string(),
+                        keys_type: "DUP_KEYS".to_string(),
+                        bucket_num: 1,
+                        kind: StarRocksTableKind::Table,
+                        schema_version: 0,
+                        tablet_schema_pb: TabletSchemaPb::default().encode_to_vec(),
+                        columns: Vec::new(),
+                        partition_name: "p0".to_string(),
+                        warehouse_uri: "s3://test/warehouse".to_string(),
+                    },
+                )
+                .expect("create table layout");
+            txn.commit().expect("commit seed");
+            (
+                database.db_id,
+                created.table.table_id,
+                created.schema.schema_id,
+                created.tablets[0].tablet_id,
+                created.tablets[0].tablet_root_path.clone(),
+            )
+        };
+        let mut cfg = NovaRocksConfig::default();
+        cfg.metadata = Some(MetadataConfig {
+            provider: MetadataProviderConfig::Sqlite,
+            path: metadata_path,
+        });
+        cfg.standalone_server = Some(StandaloneServerConfig {
+            warehouse_uri: Some("s3://test/warehouse".to_string()),
+            object_store: Some(StandaloneObjectStoreConfig {
+                endpoint: Some("http://127.0.0.1:9000".to_string()),
+                access_key_id: Some("ak".to_string()),
+                access_key_secret: Some("sk".to_string()),
+                region: None,
+                enable_path_style_access: Some(true),
+            }),
+            ..StandaloneServerConfig::default()
+        });
+        crate::novarocks_config::install_preloaded_config(cfg);
+        let table = LakeTableIdentity {
+            catalog: "default_catalog".to_string(),
+            db_name: "analytics".to_string(),
+            table_name: "orders".to_string(),
+            db_id,
+            table_id,
+            schema_id,
+        };
+
+        let paths = recover_starrocks_tablet_paths_from_installed_config(&table, &[tablet_id])
+            .expect("recover tablet paths");
+
+        assert_eq!(
+            paths.get(&tablet_id).map(String::as_str),
+            Some(expected_path.as_str())
+        );
+        let shard = crate::runtime::starlet_shard_registry::select_infos(&[tablet_id]);
+        let info = shard.get(&tablet_id).expect("shard info registered");
+        assert_eq!(info.full_path, expected_path);
+        assert_eq!(
+            info.s3.as_ref().map(|s3| s3.endpoint.as_str()),
+            Some("http://127.0.0.1:9000")
+        );
     }
 
     #[test]

@@ -20,8 +20,10 @@ fn typed_exprs_to_column_ids(exprs: &[TypedExpr]) -> Vec<ColumnId> {
 
 impl DeriveOutput for PhysicalHashAggregateOp {
     fn derive_output(&self, _children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
-        if matches!(self.mode, AggMode::Local | AggMode::DistinctLocal) {
-            return PhysicalPropertySet::any();
+        match self.mode {
+            AggMode::Local | AggMode::DistinctLocal => return PhysicalPropertySet::any(),
+            AggMode::Single => return PhysicalPropertySet::gather(),
+            AggMode::Global | AggMode::DistinctGlobal => {}
         }
 
         // For Single / Global the group_by may contain non-ColumnRef
@@ -57,11 +59,7 @@ impl DeriveRequired for PhysicalHashAggregateOp {
     ) -> Vec<PhysicalPropertySet> {
         match self.mode {
             AggMode::Single => {
-                if self.group_by.is_empty() {
-                    vec![PhysicalPropertySet::gather()]
-                } else {
-                    vec![PhysicalPropertySet::any()]
-                }
+                vec![PhysicalPropertySet::gather()]
             }
             AggMode::Local => vec![PhysicalPropertySet::any()],
             AggMode::Global => {
@@ -99,7 +97,7 @@ mod tests {
     use crate::sql::optimizer::property::HashSource;
 
     #[test]
-    fn output_properties_hash_agg_with_group_by() {
+    fn single_grouped_aggregate_gathers_input_and_output() {
         let col_ref = TypedExpr {
             kind: ExprKind::ColumnRef {
                 column_id: ColumnId(3),
@@ -111,6 +109,38 @@ mod tests {
         };
         let op = PhysicalHashAggregateOp {
             mode: AggMode::Single,
+            group_by: vec![col_ref],
+            aggregates: vec![],
+            output_columns: vec![OutputColumn {
+                column_id: ColumnId(3),
+                name: "city".into(),
+                data_type: arrow::datatypes::DataType::Utf8,
+                nullable: false,
+                is_internal: false,
+            }],
+            is_merge: vec![],
+        };
+        let props = op.derive_output(&[]);
+        assert_eq!(props.distribution, DistributionSpec::Gather);
+
+        let reqs = op.derive_required(&PhysicalPropertySet::any(), 1);
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].distribution, DistributionSpec::Gather);
+    }
+
+    #[test]
+    fn global_grouped_aggregate_outputs_shuffle_by_group_key() {
+        let col_ref = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId(3),
+                qualifier: Some("t".into()),
+                column: "city".into(),
+            },
+            data_type: arrow::datatypes::DataType::Utf8,
+            nullable: false,
+        };
+        let op = PhysicalHashAggregateOp {
+            mode: AggMode::Global,
             group_by: vec![col_ref],
             aggregates: vec![],
             output_columns: vec![OutputColumn {

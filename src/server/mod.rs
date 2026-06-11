@@ -21,7 +21,6 @@ use tokio::task;
 use tracing::{info, warn};
 
 use crate::common::failpoint::{self, FailPointMode};
-use crate::common::util::format_mysql_container_value_with_schema;
 use crate::novarocks_config::NovaRocksConfig;
 use crate::version;
 
@@ -1264,15 +1263,163 @@ fn query_result_to_user_variable_literal(
             .columns()
             .first()
             .ok_or((ErrorKind::ER_UNKNOWN_ERROR, "empty query chunk".to_string()))?;
-        let field_schema = chunk
-            .chunk_schema()
-            .slots()
-            .first()
-            .map(|slot| slot.field_schema());
-        return format_mysql_container_value_with_schema(column, 0, field_schema)
-            .map_err(|err| (ErrorKind::ER_UNKNOWN_ERROR, err));
+        let declared = result.columns.first().ok_or((
+            ErrorKind::ER_UNKNOWN_ERROR,
+            "user variable assignment missing column metadata".to_string(),
+        ))?;
+        return Ok(
+            query_result_cell_to_user_variable_sql(column, &declared.data_type, 0)
+                .map_err(|err| (ErrorKind::ER_UNKNOWN_ERROR, err))?,
+        );
     }
     Ok("null".to_string())
+}
+
+fn query_result_cell_to_user_variable_sql(
+    column: &arrow::array::ArrayRef,
+    declared_type: &arrow::datatypes::DataType,
+    row_idx: usize,
+) -> Result<String, String> {
+    if column.is_null(row_idx) {
+        return Ok("NULL".to_string());
+    }
+    if let Some(text) = arrow_text_cell(column, row_idx) {
+        return user_variable_text_to_sql(&text?, declared_type);
+    }
+    let literal = crate::engine::sql_expr::literal_from_batch(column, row_idx)?;
+    user_variable_literal_to_sql(&literal)
+}
+
+fn arrow_text_cell(
+    column: &arrow::array::ArrayRef,
+    row_idx: usize,
+) -> Option<Result<String, String>> {
+    match column.data_type() {
+        arrow::datatypes::DataType::Utf8 => {
+            let arr = column
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .ok_or_else(|| "failed to downcast user variable value to StringArray".to_string());
+            Some(arr.map(|arr| arr.value(row_idx).to_string()))
+        }
+        arrow::datatypes::DataType::LargeUtf8 => {
+            let arr = column
+                .as_any()
+                .downcast_ref::<arrow::array::LargeStringArray>()
+                .ok_or_else(|| {
+                    "failed to downcast user variable value to LargeStringArray".to_string()
+                });
+            Some(arr.map(|arr| arr.value(row_idx).to_string()))
+        }
+        arrow::datatypes::DataType::Binary => {
+            let arr = column
+                .as_any()
+                .downcast_ref::<arrow::array::BinaryArray>()
+                .ok_or_else(|| "failed to downcast user variable value to BinaryArray".to_string());
+            Some(arr.map(|arr| String::from_utf8_lossy(arr.value(row_idx)).into_owned()))
+        }
+        arrow::datatypes::DataType::LargeBinary => {
+            let arr = column
+                .as_any()
+                .downcast_ref::<arrow::array::LargeBinaryArray>()
+                .ok_or_else(|| {
+                    "failed to downcast user variable value to LargeBinaryArray".to_string()
+                });
+            Some(arr.map(|arr| String::from_utf8_lossy(arr.value(row_idx)).into_owned()))
+        }
+        _ => None,
+    }
+}
+
+fn user_variable_text_to_sql(
+    text: &str,
+    declared_type: &arrow::datatypes::DataType,
+) -> Result<String, String> {
+    use arrow::datatypes::DataType;
+
+    Ok(match declared_type {
+        DataType::Boolean
+        | DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Decimal128(_, _)
+        | DataType::Decimal256(_, _) => text.to_string(),
+        DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _) | DataType::Struct(_) => {
+            text.to_string()
+        }
+        DataType::Null => "NULL".to_string(),
+        _ => single_quoted_user_variable_sql(text),
+    })
+}
+
+fn user_variable_literal_to_sql(
+    literal: &crate::sql::parser::ast::Literal,
+) -> Result<String, String> {
+    use crate::sql::parser::ast::Literal;
+
+    Ok(match literal {
+        Literal::Null => "NULL".to_string(),
+        Literal::Bool(value) => {
+            if *value {
+                "TRUE".to_string()
+            } else {
+                "FALSE".to_string()
+            }
+        }
+        Literal::Int(value) => value.to_string(),
+        Literal::Float(value) => {
+            if !value.is_finite() {
+                return Err(format!(
+                    "non-finite floating literal is not supported: {value}"
+                ));
+            }
+            value.to_string()
+        }
+        Literal::String(value) | Literal::Date(value) => single_quoted_user_variable_sql(value),
+        Literal::Array(items) => format!(
+            "[{}]",
+            items
+                .iter()
+                .map(user_variable_literal_to_sql)
+                .collect::<Result<Vec<_>, _>>()?
+                .join(", ")
+        ),
+        Literal::Map(entries) => {
+            let mut args = Vec::with_capacity(entries.len() * 2);
+            for (key, value) in entries {
+                args.push(user_variable_literal_to_sql(key)?);
+                args.push(user_variable_literal_to_sql(value)?);
+            }
+            format!("map({})", args.join(", "))
+        }
+        Literal::Struct(values) => format!(
+            "row({})",
+            values
+                .iter()
+                .map(user_variable_literal_to_sql)
+                .collect::<Result<Vec<_>, _>>()?
+                .join(", ")
+        ),
+    })
+}
+
+fn single_quoted_user_variable_sql(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len() + 2);
+    for ch in value.chars() {
+        match ch {
+            '\'' => escaped.push_str("''"),
+            '\\' => escaped.push_str(r"\\"),
+            _ => escaped.push(ch),
+        }
+    }
+    format!("'{escaped}'")
 }
 
 fn resolve_catalog_name(
@@ -1570,6 +1717,86 @@ mod tests {
         assert_eq!(
             parse_set_user_variable_query("SET @n = NULL"),
             Some(("@n".to_string(), "NULL".to_string()))
+        );
+    }
+
+    #[test]
+    fn query_result_to_user_variable_literal_preserves_array_expression() {
+        let mut builder = arrow::array::ListBuilder::new(arrow::array::StringBuilder::new());
+        builder.values().append_value("alpha");
+        builder.values().append_value("a'b\\c");
+        builder.append(true);
+        let array = std::sync::Arc::new(builder.finish()) as arrow::array::ArrayRef;
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("arr", array.data_type().clone(), true),
+            ])),
+            vec![array],
+        )
+        .expect("record batch");
+        let chunk = crate::engine::record_batch_to_chunk(batch).expect("chunk");
+        let result = crate::runtime::query_result::QueryResult {
+            columns: vec![crate::runtime::query_result::QueryResultColumn {
+                name: "arr".to_string(),
+                data_type: chunk.columns()[0].data_type().clone(),
+                nullable: true,
+                logical_type: None,
+            }],
+            chunks: vec![chunk],
+        };
+
+        assert_eq!(
+            query_result_to_user_variable_literal(&result).unwrap(),
+            "['alpha', 'a''b\\\\c']"
+        );
+    }
+
+    #[test]
+    fn query_result_to_user_variable_literal_preserves_remote_text_array_expression() {
+        let array = std::sync::Arc::new(arrow::array::BinaryArray::from(vec![Some(
+            br#"["alpha","beta"]"#.as_slice(),
+        )])) as arrow::array::ArrayRef;
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("arr", arrow::datatypes::DataType::Binary, true),
+            ])),
+            vec![array],
+        )
+        .expect("record batch");
+        let chunk = crate::engine::record_batch_to_chunk(batch).expect("chunk");
+        let result = crate::runtime::query_result::QueryResult {
+            columns: vec![crate::runtime::query_result::QueryResultColumn {
+                name: "arr".to_string(),
+                data_type: arrow::datatypes::DataType::List(std::sync::Arc::new(
+                    arrow::datatypes::Field::new("item", arrow::datatypes::DataType::Utf8, true),
+                )),
+                nullable: true,
+                logical_type: None,
+            }],
+            chunks: vec![chunk],
+        };
+
+        assert_eq!(
+            query_result_to_user_variable_literal(&result).unwrap(),
+            r#"["alpha","beta"]"#
+        );
+    }
+
+    #[test]
+    fn user_variable_literal_to_sql_formats_struct_and_map() {
+        use crate::sql::parser::ast::Literal;
+
+        let literal = Literal::Struct(vec![
+            Literal::Int(1),
+            Literal::Map(vec![(
+                Literal::String("k".to_string()),
+                Literal::Bool(true),
+            )]),
+        ]);
+
+        assert_eq!(
+            user_variable_literal_to_sql(&literal).unwrap(),
+            "row(1, map('k', TRUE))"
         );
     }
 

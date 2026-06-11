@@ -454,7 +454,7 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
                 crate::common::thrift::thrift_binary_deserialize(&bytes).map_err(|e| {
                     format!("failed to deserialize TReportExecStatusParams thrift: {e}")
                 })?;
-            crate::runtime::write_coordinator::handle_report_exec_status(params)?;
+            handle_standalone_report_exec_status(params)?;
             Ok::<(), String>(())
         })
         .await
@@ -490,7 +490,7 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
                     crate::common::thrift::thrift_binary_deserialize(&bytes).map_err(|e| {
                         format!("failed to deserialize TReportExecStatusParams thrift: {e}")
                     })?;
-                crate::runtime::write_coordinator::handle_report_exec_status(params)?;
+                handle_standalone_report_exec_status(params)?;
             }
             Ok::<(), String>(())
         })
@@ -522,6 +522,97 @@ fn report_exec_status_error_code(message: &str) -> i32 {
     } else {
         REPORT_EXEC_STATUS_ERROR
     }
+}
+
+fn handle_standalone_report_exec_status(
+    params: crate::frontend_service::TReportExecStatusParams,
+) -> Result<(), String> {
+    let failure = failed_query_from_report(&params)?;
+    match crate::runtime::write_coordinator::lookup_writer_report(&params)? {
+        crate::runtime::write_coordinator::WriterReportLookup::Expected => {
+            let result = crate::runtime::write_coordinator::handle_report_exec_status(params);
+            match result {
+                Ok(_) => Ok(()),
+                Err(err) => {
+                    if let Some(failure) = failure {
+                        mark_failed_query_report(failure);
+                    }
+                    Err(err)
+                }
+            }
+        }
+        crate::runtime::write_coordinator::WriterReportLookup::UnknownWriter { query_id } => {
+            if let Some(failure) = failure {
+                crate::runtime::write_coordinator::mark_query_failed(
+                    &query_id,
+                    failure.error.clone(),
+                );
+                mark_failed_query_report(failure);
+            }
+            Ok(())
+        }
+        crate::runtime::write_coordinator::WriterReportLookup::UnknownQuery { query_id } => {
+            if let Some(failure) = failure {
+                mark_failed_query_report(failure);
+                Ok(())
+            } else {
+                Err(format!(
+                    "write coordinator not found for query {}/{}",
+                    query_id.hi, query_id.lo
+                ))
+            }
+        }
+    }
+}
+
+struct FailedQueryReport {
+    query_id: crate::runtime::query_context::QueryId,
+    finst_id: crate::common::types::UniqueId,
+    error: String,
+}
+
+fn failed_query_from_report(
+    params: &crate::frontend_service::TReportExecStatusParams,
+) -> Result<Option<FailedQueryReport>, String> {
+    let Some(status) = params.status.as_ref() else {
+        return Ok(None);
+    };
+    if status.status_code == crate::status_code::TStatusCode::OK {
+        return Ok(None);
+    }
+    let query = params
+        .query_id
+        .as_ref()
+        .ok_or_else(|| "TReportExecStatusParams missing query_id".to_string())?;
+    let finst = params
+        .fragment_instance_id
+        .as_ref()
+        .ok_or_else(|| "TReportExecStatusParams missing fragment_instance_id".to_string())?;
+    let error = status
+        .error_msgs
+        .as_ref()
+        .filter(|msgs| !msgs.is_empty())
+        .map(|msgs| msgs.join("; "))
+        .unwrap_or_else(|| format!("status={:?}", status.status_code));
+    Ok(Some(FailedQueryReport {
+        query_id: crate::runtime::query_context::QueryId {
+            hi: query.hi,
+            lo: query.lo,
+        },
+        finst_id: crate::common::types::UniqueId {
+            hi: finst.hi,
+            lo: finst.lo,
+        },
+        error,
+    }))
+}
+
+fn mark_failed_query_report(report: FailedQueryReport) {
+    crate::service::internal_service::mark_query_failed_from_report(
+        report.query_id,
+        report.finst_id,
+        report.error,
+    );
 }
 
 #[derive(Default)]
@@ -1312,6 +1403,45 @@ mod pr3_tests {
         )
     }
 
+    fn error_report_params(
+        query: types::TUniqueId,
+        finst: types::TUniqueId,
+        message: &str,
+    ) -> frontend_service::TReportExecStatusParams {
+        frontend_service::TReportExecStatusParams::new(
+            frontend_service::FrontendServiceVersion::V1,
+            Some(query),
+            Some(0),
+            Some(finst),
+            Some(status::TStatus::new(
+                status_code::TStatusCode::INTERNAL_ERROR,
+                Some(vec![message.to_string()]),
+            )),
+            Some(true),
+            None,
+            Option::<Vec<String>>::None,
+            Option::<Vec<String>>::None,
+            None,
+            None,
+            Option::<Vec<String>>::None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
     #[tokio::test]
     async fn submit_fragment_thrift_decode_error_returns_business_error() {
         let svc = GrpcService::default();
@@ -1491,6 +1621,93 @@ mod pr3_tests {
     }
 
     #[tokio::test]
+    async fn report_exec_status_ignores_non_writer_ok_for_registered_write_query() {
+        let mut guard = crate::runtime::write_coordinator::write_registry_test_guard();
+        let query = types::TUniqueId::new(711, 811);
+        let writer_finst = types::TUniqueId::new(712, 812);
+        let ordinary_finst = types::TUniqueId::new(713, 813);
+        let coord = guard
+            .register_query(
+                query.clone(),
+                vec![crate::runtime::write_coordinator::WriterKey {
+                    query_id: query.clone(),
+                    fragment_instance_id: writer_finst.clone(),
+                    backend_num: 0,
+                }],
+            )
+            .expect("register write coordinator");
+        let bytes = thrift_binary_serialize(&ok_report_params(query.clone(), ordinary_finst))
+            .expect("serialize ordinary report params");
+        let svc = GrpcService::default();
+        let req = Request::new(ReportExecStatusRequest {
+            report_exec_status_params_thrift: bytes,
+        });
+        let resp = svc
+            .report_exec_status(req)
+            .await
+            .expect("RPC level success");
+        let body = resp.into_inner();
+        assert_eq!(body.status_code, 0, "{}", body.message);
+        assert!(
+            !coord.lock().expect("write coordinator lock").has_failed(),
+            "ordinary OK fragment reports must not fail the write coordinator"
+        );
+
+        let bytes = thrift_binary_serialize(&ok_report_params(query, writer_finst))
+            .expect("serialize writer report params");
+        let req = Request::new(ReportExecStatusRequest {
+            report_exec_status_params_thrift: bytes,
+        });
+        let resp = svc
+            .report_exec_status(req)
+            .await
+            .expect("RPC level success");
+        assert_eq!(resp.into_inner().status_code, 0);
+        coord
+            .lock()
+            .expect("write coordinator lock")
+            .commit_input()
+            .expect("writer report should still commit");
+    }
+
+    #[tokio::test]
+    async fn report_exec_status_non_writer_error_fails_registered_write_query() {
+        let mut guard = crate::runtime::write_coordinator::write_registry_test_guard();
+        let query = types::TUniqueId::new(721, 821);
+        let writer_finst = types::TUniqueId::new(722, 822);
+        let ordinary_finst = types::TUniqueId::new(723, 823);
+        let coord = guard
+            .register_query(
+                query.clone(),
+                vec![crate::runtime::write_coordinator::WriterKey {
+                    query_id: query.clone(),
+                    fragment_instance_id: writer_finst,
+                    backend_num: 0,
+                }],
+            )
+            .expect("register write coordinator");
+        let message = "remote non-writer fragment failed";
+        let bytes = thrift_binary_serialize(&error_report_params(query, ordinary_finst, message))
+            .expect("serialize ordinary error report params");
+        let svc = GrpcService::default();
+        let req = Request::new(ReportExecStatusRequest {
+            report_exec_status_params_thrift: bytes,
+        });
+        let resp = svc
+            .report_exec_status(req)
+            .await
+            .expect("RPC level success");
+        let body = resp.into_inner();
+        assert_eq!(body.status_code, 0, "{}", body.message);
+        let abort = coord
+            .lock()
+            .expect("write coordinator lock")
+            .abort_input()
+            .expect("non-writer failure should abort the write query");
+        assert!(abort.reason.contains(message), "{}", abort.reason);
+    }
+
+    #[tokio::test]
     async fn report_exec_status_query_gone_returns_terminal_code() {
         let _guard = crate::runtime::write_coordinator::write_registry_test_guard();
         let query = types::TUniqueId::new(801, 901);
@@ -1516,6 +1733,51 @@ mod pr3_tests {
         );
         assert!(body.message.contains("not found"), "{}", body.message);
     }
+
+    #[tokio::test]
+    async fn report_exec_status_error_without_write_coordinator_marks_query_failed() {
+        use crate::common::types::UniqueId;
+        use crate::runtime::query_context::{QueryId, query_context_manager};
+        use crate::runtime::result_buffer::{self, FetchErrorKind, TryFetchResult};
+
+        let _guard = crate::runtime::write_coordinator::write_registry_test_guard();
+        let query = types::TUniqueId::new(811, 911);
+        let finst = types::TUniqueId::new(812, 912);
+        let query_id = QueryId {
+            hi: query.hi,
+            lo: query.lo,
+        };
+        let finst_id = UniqueId {
+            hi: finst.hi,
+            lo: finst.lo,
+        };
+        let message = "remote fragment failed before exchange eos";
+
+        result_buffer::create_sender(finst_id);
+        query_context_manager().register_finst(finst_id, query_id);
+
+        let bytes = thrift_binary_serialize(&error_report_params(query, finst, message))
+            .expect("serialize report params");
+        let svc = GrpcService::default();
+        let req = Request::new(ReportExecStatusRequest {
+            report_exec_status_params_thrift: bytes,
+        });
+        let resp = svc
+            .report_exec_status(req)
+            .await
+            .expect("RPC level success");
+        let body = resp.into_inner();
+        assert_eq!(body.status_code, 0, "{}", body.message);
+
+        let TryFetchResult::Error(err) = result_buffer::try_fetch(finst_id) else {
+            panic!("remote fragment error must close the root result buffer");
+        };
+        assert!(matches!(err.kind, FetchErrorKind::Failed));
+        assert!(err.message.contains(message), "{}", err.message);
+
+        query_context_manager().unregister_finst(finst_id);
+    }
+
     #[tokio::test]
     async fn fetch_result_missing_finst_id_returns_error_status() {
         let svc = GrpcService::default();

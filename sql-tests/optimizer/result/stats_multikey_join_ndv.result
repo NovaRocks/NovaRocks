@@ -1,23 +1,26 @@
 Explain String
 GATHER EXCHANGE stats={rows=220}
   PROJECT [l.k1 AS k1, l.k2 AS k2, count(*) AS match_count] stats={rows=220}
-    HASH AGGREGATE (SINGLE, group by: [l.k1, l.k2]) stats={rows=220}
+    HASH AGGREGATE (GLOBAL, group by: [l.k1, l.k2]) stats={rows=220}
       aggregations: count()
-      HASH JOIN (BROADCAST, INNER, eq: [l.k1 = r.k1, l.k2 = r.k2]) stats={rows=293}
-        build runtime filters:
-        - filter_id = 0, build_expr = (r.k1)
-        - filter_id = 1, build_expr = (r.k2)
-        SCAN db_sqlt_d3f404471e26170d.oq12_stats_mj_l (alias=l) stats={rows=810}
-             TABLE: db_sqlt_d3f404471e26170d.oq12_stats_mj_l
-             columns: k1, k2
-             min-max stats
-             predicates: l.k1 IS NOT NULL AND l.k2 IS NOT NULL
-            probe runtime filters:
-            - filter_id = 0, probe_expr = (l.k1)
-            - filter_id = 1, probe_expr = (l.k2)
-        BROADCAST EXCHANGE stats={rows=81}
-          SCAN db_sqlt_d3f404471e26170d.oq12_stats_mj_r (alias=r) stats={rows=81}
-               TABLE: db_sqlt_d3f404471e26170d.oq12_stats_mj_r
-               columns: k1, k2
-               min-max stats
-               predicates: r.k1 IS NOT NULL AND r.k2 IS NOT NULL
+      HASH EXCHANGE (source: ShuffleAgg, hash: [c1, c2]) stats={rows=220}
+        HASH AGGREGATE (LOCAL, group by: [l.k1, l.k2]) stats={rows=220}
+          aggregations: count()
+          HASH JOIN (BROADCAST, INNER, eq: [l.k1 = r.k1, l.k2 = r.k2]) stats={rows=293}
+            build runtime filters:
+            - filter_id = 0, build_expr = (r.k1)
+            - filter_id = 1, build_expr = (r.k2)
+            SCAN db_sqlt_d3f404471e26170d.oq12_stats_mj_l (alias=l) stats={rows=810}
+                 TABLE: db_sqlt_d3f404471e26170d.oq12_stats_mj_l
+                 columns: k1, k2
+                 min-max stats
+                 predicates: l.k1 IS NOT NULL AND l.k2 IS NOT NULL
+                probe runtime filters:
+                - filter_id = 0, probe_expr = (l.k1)
+                - filter_id = 1, probe_expr = (l.k2)
+            BROADCAST EXCHANGE stats={rows=81}
+              SCAN db_sqlt_d3f404471e26170d.oq12_stats_mj_r (alias=r) stats={rows=81}
+                   TABLE: db_sqlt_d3f404471e26170d.oq12_stats_mj_r
+                   columns: k1, k2
+                   min-max stats
+                   predicates: r.k1 IS NOT NULL AND r.k2 IS NOT NULL

@@ -174,7 +174,8 @@ fn is_literal_like(expr: &TypedExpr) -> bool {
         | ExprKind::Literal(LiteralValue::LargeInt(_))
         | ExprKind::Literal(LiteralValue::Float(_))
         | ExprKind::Literal(LiteralValue::Decimal(_))
-        | ExprKind::Literal(LiteralValue::String(_)) => true,
+        | ExprKind::Literal(LiteralValue::String(_))
+        | ExprKind::Literal(LiteralValue::Binary(_)) => true,
         ExprKind::Cast { expr, .. } | ExprKind::Nested(expr) => is_literal_like(expr),
         _ => false,
     }

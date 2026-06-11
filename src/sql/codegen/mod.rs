@@ -82,6 +82,14 @@ pub(crate) enum FragmentEdgeKind {
     CteMulticast { cte_id: CteId },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FragmentStreamKind {
+    Gather,
+    Broadcast,
+    Partitioned,
+    Other,
+}
+
 pub(crate) struct FragmentEdge {
     pub source_fragment_id: FragmentId,
     pub target_fragment_id: FragmentId,
@@ -89,6 +97,7 @@ pub(crate) struct FragmentEdge {
     #[allow(dead_code)]
     // populated by fragment builder, will be read when partition-aware exchange is enabled
     pub output_partition: partitions::TDataPartition,
+    pub stream_kind: FragmentStreamKind,
     pub edge_kind: FragmentEdgeKind,
 }
 

@@ -1,8 +1,8 @@
 //! Passthrough operators — operators with a single child whose output mirrors
 //! the child's output. Two flavours:
 //!
-//! 1. **Distribution-blind** (Filter / Project / CTEProduce /
-//!    Repeat): these operators do not constrain their child's distribution.
+//! 1. **Distribution-blind** (Filter / Project / CTEProduce): these operators
+//!    do not constrain their child's distribution.
 //!    Their `derive_required` therefore returns `Any` for the child slot,
 //!    letting the optimizer freely choose the cheapest distribution for the
 //!    subtree below. Any mismatch with the parent's required distribution is
@@ -90,8 +90,27 @@ passthrough_distribution_blind_impls!(
     PhysicalProjectOp,
     PhysicalDecodeOp,
     PhysicalCTEProduceOp,
-    PhysicalRepeatOp,
 );
+
+impl DeriveOutput for PhysicalRepeatOp {
+    fn derive_output(&self, _children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
+        // Repeat rewrites grouping-set keys by NULLing inactive rollup columns
+        // and appending grouping-id slots. Any child hash partitioning on the
+        // original keys is no longer valid for the repeated rows; a parent
+        // aggregate must add a fresh exchange on the post-repeat keys.
+        PhysicalPropertySet::any()
+    }
+}
+
+impl DeriveRequired for PhysicalRepeatOp {
+    fn derive_required(
+        &self,
+        _parent_required: &PhysicalPropertySet,
+        _n: usize,
+    ) -> Vec<PhysicalPropertySet> {
+        vec![PhysicalPropertySet::any()]
+    }
+}
 
 /// Full-passthrough operators: `derive_required` forwards `parent_required`.
 macro_rules! passthrough_full_impls {
@@ -227,6 +246,26 @@ mod tests {
     fn passthrough_no_children_falls_back_to_any() {
         let op = bool_filter();
         let out = op.derive_output(&[]);
+        assert_eq!(out, PhysicalPropertySet::any());
+    }
+
+    #[test]
+    fn repeat_output_does_not_inherit_child_hash_distribution() {
+        let op = PhysicalRepeatOp {
+            repeat_column_ref_list: vec![vec!["k".to_string()], vec![]],
+            repeat_column_ref_ids: vec![vec![ColumnId(1)], vec![]],
+            grouping_ids: vec![0, 1],
+            all_rollup_columns: vec!["k".to_string()],
+            all_rollup_column_ids: vec![ColumnId(1)],
+            grouping_key_aliases: vec![],
+            grouping_fn_args: vec![("__grouping_fn_0".to_string(), vec!["k".to_string()])],
+            grouping_fn_arg_ids: vec![vec![ColumnId(1)]],
+            grouping_fn_ids: vec![("__grouping_fn_0".to_string(), ColumnId(2))],
+        };
+        let child = hash_one();
+
+        let out = op.derive_output(&[&child]);
+
         assert_eq!(out, PhysicalPropertySet::any());
     }
 }

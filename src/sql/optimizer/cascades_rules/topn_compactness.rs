@@ -659,11 +659,16 @@ mod tests {
         inputs: Vec<usize>,
         output_columns: Vec<crate::sql::analysis::OutputColumn>,
     ) -> usize {
+        let child_output_columns = inputs
+            .iter()
+            .map(|_| output_columns.clone())
+            .collect::<Vec<_>>();
         memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalUnion(LogicalUnionOp {
                 all,
                 output_columns,
+                child_output_columns,
             }),
             children: inputs,
         })

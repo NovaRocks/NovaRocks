@@ -5,7 +5,7 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -580,17 +580,27 @@ impl ProcessGuard {
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    if self.child.try_wait()?.is_none() {
+                    let status = self.wait_for_exit_after_stdout_disconnect()?;
+                    if status.is_none() {
                         let _ = self.child.kill();
                         let _ = self.child.wait();
                     }
                     self.join_stderr_thread();
                     let stderr = self.read_stderr();
+                    let status_detail = match status {
+                        Some(status) => format!("; child status={status}"),
+                        None => {
+                            "; child was still running after stdout closed and was killed"
+                                .to_string()
+                        }
+                    };
                     bail!(
                         "{}",
                         format_startup_failure(
                             marker,
-                            &format!("stdout closed before readiness marker; stdout={stdout:?}"),
+                            &format!(
+                                "stdout closed before readiness marker{status_detail}; stdout={stdout:?}; stderr={stderr}"
+                            ),
                             &stderr,
                         )
                     );
@@ -621,6 +631,19 @@ impl ProcessGuard {
             .lock()
             .map(|buffer| buffer.clone())
             .unwrap_or_default()
+    }
+
+    fn wait_for_exit_after_stdout_disconnect(&mut self) -> Result<Option<ExitStatus>> {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                return Ok(Some(status));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 
@@ -832,6 +855,14 @@ mod tests {
         assert!(
             disconnected_branch.contains("self.read_stderr()"),
             "disconnected branch should read stderr before formatting failure"
+        );
+        assert!(
+            disconnected_branch.contains("wait_for_exit_after_stdout_disconnect"),
+            "disconnected branch should wait briefly for child exit before killing"
+        );
+        assert!(
+            disconnected_branch.contains("child status="),
+            "disconnected branch should include child exit status when available"
         );
     }
 

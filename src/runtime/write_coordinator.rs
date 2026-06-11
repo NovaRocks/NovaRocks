@@ -246,6 +246,10 @@ impl WriteCoordinator {
         }
     }
 
+    fn contains_writer_key(&self, key: &WriterKey) -> bool {
+        self.writers.contains_key(key)
+    }
+
     pub(crate) fn mark_canceled_except_finished(&mut self, reason: String) {
         self.latch_failed_reason(reason.clone());
         for slot in self.writers.values_mut() {
@@ -467,6 +471,71 @@ pub(crate) fn handle_report_exec_status(
         .lock()
         .expect("write coordinator lock")
         .apply_report(report)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum WriterReportLookup {
+    Expected,
+    UnknownWriter { query_id: types::TUniqueId },
+    UnknownQuery { query_id: types::TUniqueId },
+}
+
+pub(crate) fn lookup_writer_report(
+    params: &frontend_service::TReportExecStatusParams,
+) -> Result<WriterReportLookup, String> {
+    let query_id = params
+        .query_id
+        .as_ref()
+        .ok_or_else(|| "TReportExecStatusParams missing query_id".to_string())?
+        .clone();
+    let fragment_instance_id = params
+        .fragment_instance_id
+        .as_ref()
+        .ok_or_else(|| "TReportExecStatusParams missing fragment_instance_id".to_string())?
+        .clone();
+    let backend_num = params
+        .backend_num
+        .ok_or_else(|| "TReportExecStatusParams missing backend_num".to_string())?;
+    let key = WriterKey {
+        query_id: query_id.clone(),
+        fragment_instance_id,
+        backend_num,
+    };
+    let coord = registry()
+        .queries
+        .lock()
+        .expect("write coordinator registry lock")
+        .get(&query_key(&query_id))
+        .cloned();
+    let Some(coord) = coord else {
+        return Ok(WriterReportLookup::UnknownQuery { query_id });
+    };
+    if coord
+        .lock()
+        .expect("write coordinator lock")
+        .contains_writer_key(&key)
+    {
+        Ok(WriterReportLookup::Expected)
+    } else {
+        Ok(WriterReportLookup::UnknownWriter { query_id })
+    }
+}
+
+pub(crate) fn mark_query_failed(query_id: &types::TUniqueId, reason: String) -> bool {
+    let coord = registry()
+        .queries
+        .lock()
+        .expect("write coordinator registry lock")
+        .get(&query_key(query_id))
+        .cloned();
+    let Some(coord) = coord else {
+        return false;
+    };
+    coord
+        .lock()
+        .expect("write coordinator lock")
+        .mark_canceled_except_finished(reason);
+    true
 }
 
 #[cfg(test)]

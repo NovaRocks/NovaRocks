@@ -18,6 +18,7 @@ use arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
     FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
     Int64Array, LargeBinaryArray, LargeListArray, ListArray, MapArray, StringArray, StructArray,
+    Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
     TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
     TimestampSecondArray,
 };
@@ -157,6 +158,10 @@ pub(crate) fn mysql_text_row_from_arrays_with_primitives(
                 let days = arr.value(row);
                 let date_str = format_date32_for_mysql(days);
                 append_lenenc_string(&mut out, date_str.as_bytes());
+            }
+            DataType::Time32(unit) | DataType::Time64(unit) => {
+                let value = format_time_array(col, *unit, row)?;
+                append_lenenc_string(&mut out, value.as_bytes());
             }
             DataType::Timestamp(unit, tz) => {
                 let tz = tz.as_deref();
@@ -429,6 +434,9 @@ fn append_http_json_value_with_schema(
                 .downcast_ref::<Date32Array>()
                 .ok_or_else(|| "failed to downcast to Date32Array".to_string())?;
             append_http_json_quoted(out, &format_date32_for_mysql(arr.value(row)))?;
+        }
+        DataType::Time32(unit) | DataType::Time64(unit) => {
+            append_http_json_quoted(out, &format_time_array(col, *unit, row)?)?;
         }
         DataType::Timestamp(unit, tz) => {
             let tz = tz.as_deref();
@@ -734,6 +742,7 @@ fn http_json_object_key_with_schema(
                 .ok_or_else(|| "failed to downcast map key to Date32Array".to_string())?;
             Ok(format_date32_for_mysql(arr.value(row)))
         }
+        DataType::Time32(unit) | DataType::Time64(unit) => format_time_array(keys, *unit, row),
         DataType::Decimal128(_, scale) => {
             let arr = keys
                 .as_any()
@@ -909,6 +918,9 @@ pub(crate) fn format_mysql_container_value_with_schema(
             let date_str = format_date32_for_mysql(days);
             Ok(quote_mysql_container_string(&date_str))
         }
+        DataType::Time32(unit) | DataType::Time64(unit) => Ok(quote_mysql_container_string(
+            &format_time_array(col, *unit, row)?,
+        )),
         DataType::Timestamp(unit, tz) => {
             let tz = tz.as_deref();
             let ts = match unit {
@@ -1395,6 +1407,40 @@ fn format_timestamp(unit: TimeUnit, value: i64, tz: Option<&str>) -> String {
     }
 }
 
+fn format_time_array(col: &ArrayRef, unit: TimeUnit, row: usize) -> Result<String, String> {
+    let value = match unit {
+        TimeUnit::Second => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<Time32SecondArray>()
+                .ok_or_else(|| "failed to downcast to Time32SecondArray".to_string())?;
+            i64::from(arr.value(row))
+        }
+        TimeUnit::Millisecond => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<Time32MillisecondArray>()
+                .ok_or_else(|| "failed to downcast to Time32MillisecondArray".to_string())?;
+            i64::from(arr.value(row))
+        }
+        TimeUnit::Microsecond => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<Time64MicrosecondArray>()
+                .ok_or_else(|| "failed to downcast to Time64MicrosecondArray".to_string())?;
+            arr.value(row)
+        }
+        TimeUnit::Nanosecond => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<Time64NanosecondArray>()
+                .ok_or_else(|| "failed to downcast to Time64NanosecondArray".to_string())?;
+            arr.value(row)
+        }
+    };
+    Ok(format_time_duration(unit, value))
+}
+
 fn format_time_duration(unit: TimeUnit, value: i64) -> String {
     let total_micros = match unit {
         TimeUnit::Second => value.saturating_mul(1_000_000),
@@ -1522,8 +1568,11 @@ fn append_lenenc_int(out: &mut Vec<u8>, v: u64) {
 mod tests {
     use std::sync::Arc;
 
-    use super::{format_timestamp, http_json_row_from_arrays_with_primitives};
-    use arrow::array::{ArrayRef, Int32Array, StringArray, StructArray};
+    use super::{
+        format_timestamp, http_json_row_from_arrays_with_primitives,
+        mysql_text_row_from_arrays_with_primitives,
+    };
+    use arrow::array::{ArrayRef, Int32Array, StringArray, StructArray, Time64MicrosecondArray};
     use arrow::datatypes::{DataType, Field, TimeUnit};
 
     use crate::exec::chunk::ChunkFieldSchema;
@@ -1543,6 +1592,21 @@ mod tests {
             format_timestamp(TimeUnit::Microsecond, 1, None),
             "1970-01-01 00:00:00.000001"
         );
+    }
+
+    #[test]
+    fn mysql_text_row_formats_time64_microsecond() {
+        let columns = vec![Arc::new(Time64MicrosecondArray::from(vec![12_345_678])) as ArrayRef];
+        let row = mysql_text_row_from_arrays_with_primitives(
+            &columns,
+            0,
+            Some(&[types::TPrimitiveType::TIME]),
+            None,
+        )
+        .expect("mysql row");
+
+        assert_eq!(row[0] as usize, "00:00:12.345678".len());
+        assert_eq!(&row[1..], b"00:00:12.345678");
     }
 
     #[test]

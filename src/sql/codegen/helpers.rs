@@ -53,6 +53,9 @@ pub(crate) fn typed_expr_display_name(expr: &TypedExpr) -> String {
         ExprKind::Literal(query_ir::LiteralValue::Float(v)) => v.to_string(),
         ExprKind::Literal(query_ir::LiteralValue::Decimal(v)) => v.clone(),
         ExprKind::Literal(query_ir::LiteralValue::String(v)) => format!("'{}'", v),
+        ExprKind::Literal(query_ir::LiteralValue::Binary(v)) => {
+            format!("X'{}'", hex::encode_upper(v))
+        }
         ExprKind::FunctionCall { name, args, .. } if name == "__array_literal" => {
             format!(
                 "[{}]",
@@ -355,6 +358,9 @@ fn typed_expr_array_item_display_name(expr: &TypedExpr) -> String {
         ExprKind::Literal(query_ir::LiteralValue::Float(v)) => v.to_string(),
         ExprKind::Literal(query_ir::LiteralValue::Decimal(v)) => v.clone(),
         ExprKind::Literal(query_ir::LiteralValue::String(v)) => format!("'{}'", v),
+        ExprKind::Literal(query_ir::LiteralValue::Binary(v)) => {
+            format!("X'{}'", hex::encode_upper(v))
+        }
         _ => typed_expr_display_name(expr),
     }
 }

@@ -29,9 +29,12 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use base64::Engine;
+use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime};
 use iceberg::TableIdent;
 use iceberg::spec::{
-    Datum, Literal, PartitionSpecRef, PrimitiveType, SchemaRef, Struct, Transform, Type,
+    Datum, Literal, PartitionSpecRef, PrimitiveLiteral, PrimitiveType, SchemaRef, Struct,
+    Transform, Type,
 };
 use std::collections::{BTreeMap, HashMap};
 
@@ -306,9 +309,8 @@ impl IcebergCommitCollector {
     /// `equality_ids`, and `key_metadata` all round-trip. Three boundaries
     /// are intentional and handled (or deferred) elsewhere:
     ///
-    /// - Partition values are decoded from `partition_path` and currently
-    ///   support identity transforms only; non-identity transforms return an
-    ///   explicit error (see `parse_partition_path`).
+    /// - Partition values are decoded from `partition_path`; transform
+    ///   directory values are converted back to Iceberg partition literals.
     /// - Column-stat bounds for field-ids absent from the table schema (e.g.
     ///   stats left behind for a dropped column) are skipped rather than
     ///   decoded, matching the inject path's tolerance for stale stats.
@@ -440,10 +442,6 @@ fn i64_map_to_u64(
 
 /// Decode an Iceberg v2-style partition path (e.g. `p=1/q=A`) into a
 /// [`Struct`] keyed by the partition spec's field order.
-///
-/// Phase 1 only handles identity-transformed partitions on primitive source
-/// columns. Anything else is rejected with an explicit error so that the
-/// caller can fall back gracefully.
 fn parse_partition_path(
     path: &str,
     spec: &PartitionSpecRef,
@@ -451,6 +449,12 @@ fn parse_partition_path(
     null_fingerprint: Option<&str>,
 ) -> Result<Struct, String> {
     if path.is_empty() {
+        if !spec.fields().is_empty() {
+            return Err(format!(
+                "partition_path is empty but spec expects {} fields",
+                spec.fields().len()
+            ));
+        }
         return Ok(Struct::empty());
     }
     let trimmed = path.trim_matches('/');
@@ -472,25 +476,32 @@ fn parse_partition_path(
             segments.len()
         ));
     }
+    let partition_type = spec
+        .partition_type(schema.as_ref())
+        .map_err(|e| format!("failed to derive iceberg partition type: {e}"))?;
+    let partition_fields = partition_type.fields();
+    if partition_fields.len() != spec.fields().len() {
+        return Err(format!(
+            "partition type has {} fields but spec expects {}",
+            partition_fields.len(),
+            spec.fields().len()
+        ));
+    }
 
     let mut values: Vec<Option<Literal>> = Vec::with_capacity(spec.fields().len());
     for (idx, (seg, field)) in segments.iter().zip(spec.fields().iter()).enumerate() {
-        let (_k, v) = seg
+        let (k, v) = seg
             .split_once('=')
             .ok_or_else(|| format!("partition_path segment `{seg}` is missing `=`"))?;
-        if !matches!(field.transform, Transform::Identity) {
+        if k != field.name {
             return Err(format!(
-                "phase 1 partition transform `{:?}` not yet supported during \
-                 partition_path → Struct decoding",
-                field.transform
+                "partition_path segment `{seg}` does not match partition field `{}`",
+                field.name
             ));
         }
-        let source_field = schema.field_by_id(field.source_id).ok_or_else(|| {
-            format!(
-                "partition source field id {} not present in schema",
-                field.source_id
-            )
-        })?;
+        let partition_field = partition_fields
+            .get(idx)
+            .ok_or_else(|| format!("partition type missing field at index {idx}"))?;
         let is_null = match null_fingerprint.and_then(|fp| fp.as_bytes().get(idx)) {
             Some(b'0') => false,
             Some(b'1') => true,
@@ -506,7 +517,7 @@ fn parse_partition_path(
             None
         } else {
             Some(
-                parse_literal_for_type(v, &source_field.field_type)
+                parse_literal_for_partition_field(v, &field.transform, &partition_field.field_type)
                     .map_err(|e| format!("partition value `{v}` parse failed: {e}"))?,
             )
         };
@@ -515,17 +526,74 @@ fn parse_partition_path(
     Ok(Struct::from_iter(values))
 }
 
+fn parse_literal_for_partition_field(
+    raw: &str,
+    transform: &Transform,
+    ty: &Type,
+) -> Result<Literal, String> {
+    match transform {
+        Transform::Year => parse_year_partition_literal(raw, ty),
+        Transform::Month => parse_month_partition_literal(raw, ty),
+        Transform::Day => parse_literal_for_type(raw, ty),
+        Transform::Hour => parse_hour_partition_literal(raw, ty),
+        _ => parse_literal_for_type(raw, ty),
+    }
+}
+
+fn parse_year_partition_literal(raw: &str, ty: &Type) -> Result<Literal, String> {
+    let decoded = decode_partition_value(raw);
+    let value = decoded.parse::<i64>().map_err(|e| e.to_string())?;
+    if (-999..=999).contains(&value) {
+        return partition_integer_literal(value, ty);
+    }
+    partition_integer_literal(value - 1970, ty)
+}
+
+fn parse_month_partition_literal(raw: &str, ty: &Type) -> Result<Literal, String> {
+    let decoded = decode_partition_value(raw);
+    if let Ok(date) = NaiveDate::parse_from_str(&format!("{decoded}-01"), "%Y-%m-%d") {
+        let months = i64::from(date.year() - 1970) * 12 + i64::from(date.month() - 1);
+        return partition_integer_literal(months, ty);
+    }
+    parse_literal_for_type(raw, ty)
+}
+
+fn parse_hour_partition_literal(raw: &str, ty: &Type) -> Result<Literal, String> {
+    let decoded = decode_partition_value(raw);
+    if let Ok(dt) = NaiveDateTime::parse_from_str(&decoded, "%Y-%m-%d-%H") {
+        let hours = dt.and_utc().timestamp().div_euclid(3_600);
+        return partition_integer_literal(hours, ty);
+    }
+    parse_literal_for_type(raw, ty)
+}
+
+fn partition_integer_literal(value: i64, ty: &Type) -> Result<Literal, String> {
+    match ty {
+        Type::Primitive(PrimitiveType::Int) => i32::try_from(value)
+            .map(Literal::int)
+            .map_err(|_| format!("partition integer {value} is out of INT range")),
+        Type::Primitive(PrimitiveType::Long) => Ok(Literal::long(value)),
+        other => Err(format!(
+            "time transform partition type must be INT or BIGINT, got {other:?}"
+        )),
+    }
+}
+
 /// Reverse the percent-escaping that the IcebergSink applies to string
 /// partition values when building the partition path. The sink uses the
 /// Iceberg-spec subset (`%XX` for filesystem-unsafe characters); decode by
 /// walking the input rather than pulling in the `urlencoding` crate.
 fn decode_partition_value(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
+    String::from_utf8_lossy(&decode_partition_value_bytes(raw)).into_owned()
+}
+
+fn decode_partition_value_bytes(raw: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
     let bytes = raw.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'+' {
-            out.push(' ');
+            out.push(b' ');
             i += 1;
             continue;
         }
@@ -533,11 +601,11 @@ fn decode_partition_value(raw: &str) -> String {
             && i + 2 < bytes.len()
             && let (Some(h), Some(l)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2]))
         {
-            out.push(((h << 4) | l) as char);
+            out.push((h << 4) | l);
             i += 3;
             continue;
         }
-        out.push(bytes[i] as char);
+        out.push(bytes[i]);
         i += 1;
     }
     out
@@ -575,9 +643,108 @@ fn parse_literal_for_type(raw: &str, ty: &Type) -> Result<Literal, String> {
             .parse::<bool>()
             .map(Literal::bool)
             .map_err(|e| e.to_string()),
-        other => Err(format!(
-            "phase 1 partition primitive type {other:?} not yet supported"
-        )),
+        PrimitiveType::Float => raw
+            .parse::<f32>()
+            .map(Literal::float)
+            .map_err(|e| e.to_string()),
+        PrimitiveType::Double => raw
+            .parse::<f64>()
+            .map(Literal::double)
+            .map_err(|e| e.to_string()),
+        PrimitiveType::Decimal { .. } => Literal::decimal_from_str(raw).map_err(|e| e.to_string()),
+        PrimitiveType::Date => parse_date_literal(raw),
+        PrimitiveType::Time => parse_time_literal(raw),
+        PrimitiveType::Timestamp => parse_timestamp_literal(raw, TimestampUnit::Micros, false),
+        PrimitiveType::Timestamptz => parse_timestamp_literal(raw, TimestampUnit::Micros, true),
+        PrimitiveType::TimestampNs => parse_timestamp_literal(raw, TimestampUnit::Nanos, false),
+        PrimitiveType::TimestamptzNs => parse_timestamp_literal(raw, TimestampUnit::Nanos, true),
+        PrimitiveType::Uuid => uuid::Uuid::parse_str(&decode_partition_value(raw))
+            .map(Literal::uuid)
+            .map_err(|e| e.to_string()),
+        PrimitiveType::Fixed(_) | PrimitiveType::Binary => {
+            let encoded = decode_partition_value(raw);
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded.as_bytes())
+                .map(Literal::binary)
+                .map_err(|e| e.to_string())
+        }
+        PrimitiveType::Variant => {
+            Err("variant primitive type cannot be used in partition paths".to_string())
+        }
+    }
+}
+
+fn parse_date_literal(raw: &str) -> Result<Literal, String> {
+    raw.parse::<i32>()
+        .map(Literal::date)
+        .or_else(|_| Literal::date_from_str(decode_partition_value(raw)).map_err(|e| e.to_string()))
+}
+
+fn parse_time_literal(raw: &str) -> Result<Literal, String> {
+    raw.parse::<i64>()
+        .map(Literal::time)
+        .or_else(|_| Literal::time_from_str(decode_partition_value(raw)).map_err(|e| e.to_string()))
+}
+
+#[derive(Clone, Copy)]
+enum TimestampUnit {
+    Micros,
+    Nanos,
+}
+
+fn parse_timestamp_literal(
+    raw: &str,
+    unit: TimestampUnit,
+    with_timezone: bool,
+) -> Result<Literal, String> {
+    if let Ok(value) = raw.parse::<i64>() {
+        return Ok(timestamp_literal_from_units(value, unit, with_timezone));
+    }
+
+    let value = parse_timestamp_string_to_units(&decode_partition_value(raw), unit)?;
+    Ok(timestamp_literal_from_units(value, unit, with_timezone))
+}
+
+fn timestamp_literal_from_units(value: i64, unit: TimestampUnit, with_timezone: bool) -> Literal {
+    match (unit, with_timezone) {
+        (TimestampUnit::Micros, false) => Literal::timestamp(value),
+        (TimestampUnit::Micros, true) => Literal::timestamptz(value),
+        (TimestampUnit::Nanos, _) => Literal::Primitive(PrimitiveLiteral::Long(value)),
+    }
+}
+
+fn parse_timestamp_string_to_units(raw: &str, unit: TimestampUnit) -> Result<i64, String> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
+        return datetime_to_units(dt, unit);
+    }
+    for pattern in ["%Y-%m-%d %H:%M:%S%.f%:z", "%Y-%m-%dT%H:%M:%S%.f%:z"] {
+        if let Ok(dt) = DateTime::parse_from_str(raw, pattern) {
+            return datetime_to_units(dt, unit);
+        }
+    }
+    for pattern in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f"] {
+        if let Ok(dt) = NaiveDateTime::parse_from_str(raw, pattern) {
+            return match unit {
+                TimestampUnit::Micros => Ok(dt.and_utc().timestamp_micros()),
+                TimestampUnit::Nanos => dt
+                    .and_utc()
+                    .timestamp_nanos_opt()
+                    .ok_or_else(|| format!("timestamp `{raw}` is out of nanosecond range")),
+            };
+        }
+    }
+    Err(format!("can't parse timestamp `{raw}`"))
+}
+
+fn datetime_to_units<Tz: chrono::TimeZone>(
+    dt: DateTime<Tz>,
+    unit: TimestampUnit,
+) -> Result<i64, String> {
+    match unit {
+        TimestampUnit::Micros => Ok(dt.timestamp_micros()),
+        TimestampUnit::Nanos => dt
+            .timestamp_nanos_opt()
+            .ok_or_else(|| "timestamp is out of nanosecond range".to_string()),
     }
 }
 
@@ -586,7 +753,7 @@ mod parity_tests {
     use super::*;
     use iceberg::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, Datum, NestedField, PrimitiveType,
-        Schema, Struct, Type,
+        Schema, Struct, Transform, Type,
     };
 
     fn int_schema() -> SchemaRef {
@@ -852,7 +1019,7 @@ mod parity_tests {
     }
 
     #[test]
-    fn convert_rejects_unsupported_transform_partition_paths() {
+    fn convert_accepts_transform_partition_paths() {
         let schema = int_schema();
         let spec = Arc::new(
             iceberg::spec::PartitionSpec::builder(schema.clone())
@@ -872,6 +1039,9 @@ mod parity_tests {
             .record_count(1)
             .file_size_in_bytes(64);
         let df = b.build().expect("data file");
+
+        let expected =
+            crate::engine::iceberg_writer::data_file_to_written_file(&df, 0).expect("expected");
 
         let thrift = crate::connector::iceberg::data_writer::data_file_to_iceberg_thrift(
             &df,
@@ -893,13 +1063,10 @@ mod parity_tests {
             "file:///tmp/staging".to_string(),
             UniqueId { hi: 0, lo: 0 },
         );
-        let err = collector
-            .convert(thrift)
-            .expect_err("transform must be rejected");
-        assert!(
-            err.contains("transform"),
-            "expected an explicit transform-not-supported error, got: {err}"
-        );
+        let actual = collector.convert(thrift).expect("convert");
+
+        assert_eq!(expected.partition_values, actual.partition_values);
+        assert_eq!(expected, actual);
     }
 
     #[test]
@@ -944,7 +1111,7 @@ mod parity_tests {
 mod tests {
     use super::*;
 
-    use iceberg::spec::{NestedField, PartitionSpec, PrimitiveType, Schema, Type};
+    use iceberg::spec::{NestedField, PartitionSpec, PrimitiveType, Schema, Transform, Type};
 
     fn fixture_schema_and_spec() -> (SchemaRef, PartitionSpecRef) {
         let schema: SchemaRef = Arc::new(
@@ -988,9 +1155,31 @@ mod tests {
 
     #[test]
     fn parse_empty_partition_path_returns_empty_struct() {
-        let (schema, spec) = fixture_schema_and_spec();
+        let schema: SchemaRef = Arc::new(
+            Schema::builder()
+                .with_schema_id(0)
+                .with_fields(vec![
+                    NestedField::required(1, "p", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .expect("build schema"),
+        );
+        let spec = Arc::new(
+            PartitionSpec::builder(schema.clone())
+                .with_spec_id(0)
+                .build()
+                .expect("build partition spec"),
+        );
         let s = parse_partition_path("", &spec, &schema, None).expect("parse empty path");
         assert_eq!(s.fields().len(), 0);
+    }
+
+    #[test]
+    fn parse_empty_partition_path_rejects_partitioned_spec() {
+        let (schema, spec) = fixture_schema_and_spec();
+        let err = parse_partition_path("", &spec, &schema, None)
+            .expect_err("partitioned empty path must fail");
+        assert!(err.contains("partition_path is empty but spec expects 1 fields"));
     }
 
     #[test]
@@ -1034,6 +1223,73 @@ mod tests {
         let (schema, spec) = fixture_schema_and_spec();
         let r = parse_partition_path("p1", &spec, &schema, None);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn parse_month_transform_partition_path_to_offset() {
+        let schema: SchemaRef = Arc::new(
+            Schema::builder()
+                .with_schema_id(0)
+                .with_fields(vec![
+                    NestedField::required(1, "ts", Type::Primitive(PrimitiveType::Timestamp))
+                        .into(),
+                ])
+                .build()
+                .expect("build schema"),
+        );
+        let spec = Arc::new(
+            PartitionSpec::builder(schema.clone())
+                .with_spec_id(0)
+                .add_partition_field("ts", "ts_month", Transform::Month)
+                .expect("add partition field")
+                .build()
+                .expect("build partition spec"),
+        );
+
+        let s = parse_partition_path("ts_month=2024-01", &spec, &schema, None)
+            .expect("parse month partition");
+
+        assert_eq!(s.fields().len(), 1);
+        match &s.fields()[0] {
+            Some(Literal::Primitive(PrimitiveLiteral::Int(value))) => {
+                assert_eq!(*value, (2024 - 1970) * 12);
+            }
+            other => panic!("expected int month offset, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_day_transform_partition_path_to_date() {
+        let schema: SchemaRef = Arc::new(
+            Schema::builder()
+                .with_schema_id(0)
+                .with_fields(vec![
+                    NestedField::required(1, "ts", Type::Primitive(PrimitiveType::Timestamp))
+                        .into(),
+                ])
+                .build()
+                .expect("build schema"),
+        );
+        let spec = Arc::new(
+            PartitionSpec::builder(schema.clone())
+                .with_spec_id(0)
+                .add_partition_field("ts", "ts_day", Transform::Day)
+                .expect("add partition field")
+                .build()
+                .expect("build partition spec"),
+        );
+
+        let s = parse_partition_path("ts_day=2024-01-15", &spec, &schema, None)
+            .expect("parse day partition");
+
+        assert_eq!(s.fields().len(), 1);
+        match &s.fields()[0] {
+            Some(Literal::Primitive(PrimitiveLiteral::Int(value))) => {
+                let date = NaiveDate::from_ymd_opt(2024, 1, 15).expect("date");
+                assert_eq!(*value, date.num_days_from_ce() - 719_163);
+            }
+            other => panic!("expected date literal, got {other:?}"),
+        }
     }
 
     #[test]

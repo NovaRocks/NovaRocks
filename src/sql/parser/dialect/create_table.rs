@@ -1205,6 +1205,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_create_table_accepts_nullable_complex_columns() {
+        let sql = r#"
+            CREATE TABLE ice.ns.t1 (
+                k1 bigint NULL,
+                c_json JSON NULL,
+                c_array_int ARRAY<INT> NULL,
+                c_map MAP<INT, INT> NULL,
+                c_struct STRUCT<k1 INT, k2 INT> NULL
+            )
+            TBLPROPERTIES ("format-version" = "3")
+            "#;
+        let normalized =
+            crate::sql::parser::dialect::normalize_for_raw_parse(sql).expect("normalize");
+        parse_create_table_one(&normalized).expect("create table with nullable complex columns");
+    }
+
+    #[test]
     fn parse_create_table_accepts_nested_array_complex_columns() {
         let sql = r#"
             CREATE TABLE t1 (

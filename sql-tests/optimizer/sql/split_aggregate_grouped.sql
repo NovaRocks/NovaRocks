@@ -1,7 +1,6 @@
--- OQ-4: grouped non-DISTINCT aggregate over a small iceberg table. With real
--- stats the optimizer picks a single-phase aggregate; the two-phase
--- (LOCAL/ShuffleAgg/GLOBAL) split triggers at scale and is covered by the
--- ssb/tpc-* benchmark suites. Plan-shape golden.
+-- OQ-4: grouped non-DISTINCT aggregate over an iceberg table. In distributed
+-- execution, grouped aggregates use LOCAL/ShuffleAgg/GLOBAL even for small
+-- inputs so each group is finalized on one node. Plan-shape golden.
 CREATE TABLE ${case_db}.t_split_agg_grouped (k INT, v INT);
 INSERT INTO ${case_db}.t_split_agg_grouped VALUES
     (1, 10), (1, 20), (1, 30),

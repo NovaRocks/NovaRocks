@@ -27,7 +27,10 @@ use crate::exec::expr::ExprArena;
 use crate::exec::node::sort::{SortExpression, SortTopNType};
 use crate::exec::operators::sort::chunks_sorter_heap_sort::sort_chunks_topn_heap;
 use crate::exec::operators::sort::{ChunksSorter, concat_sort_chunks};
-use crate::exec::operators::sort::{append_stable_row_index_sort_column, normalize_sort_key_array};
+use crate::exec::operators::sort::{
+    append_stable_row_index_sort_column, merged_sort_schema_for_chunks,
+    normalize_sort_batch_for_schema, normalize_sort_key_array,
+};
 
 use arrow::array::{ArrayRef, UInt32Array};
 use arrow::compute::{SortColumn, SortOptions, lexsort_to_indices, take};
@@ -358,14 +361,15 @@ fn filter_chunk_by_boundary(
     }
 
     let selection = UInt32Array::from(indices);
-    let columns = chunk
-        .batch
+    let schema = merged_sort_schema_for_chunks(std::slice::from_ref(chunk))?;
+    let batch = normalize_sort_batch_for_schema(chunk, &schema, 0)?;
+    let columns = batch
         .columns()
         .iter()
         .map(|col| take(col.as_ref(), &selection, None))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
-    let filtered = RecordBatch::try_new(chunk.schema(), columns).map_err(|e| e.to_string())?;
+    let filtered = RecordBatch::try_new(schema, columns).map_err(|e| e.to_string())?;
     Chunk::try_new_like(filtered, chunk)
         .map(Some)
         .map_err(|e| e.to_string())

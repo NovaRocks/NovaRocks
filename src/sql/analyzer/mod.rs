@@ -3826,7 +3826,7 @@ fn is_bitmap_or_hll_type(sql_type: &crate::sql::SqlType) -> bool {
 mod tests {
     use super::*;
     use crate::connector::iceberg::IcebergMetadataTableType;
-    use crate::sql::analysis::{BinOp, ExprKind, JoinKind, Relation};
+    use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, Relation};
     use crate::sql::catalog::{
         ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef, TableLookupMode,
     };
@@ -4309,6 +4309,19 @@ mod tests {
         };
         let (resolved, _registry, _factory) = analyze(&query, &TestCatalog, "default")?;
         Ok(resolved)
+    }
+
+    #[test]
+    fn hex_string_literal_analyzes_as_binary() {
+        let resolved = parse_raw_and_analyze("SELECT X'AB01'").expect("analysis should succeed");
+        assert_eq!(resolved.output_columns[0].data_type, DataType::Binary);
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("expected select body");
+        };
+        let ExprKind::Literal(LiteralValue::Binary(bytes)) = &select.projection[0].expr.kind else {
+            panic!("expected binary literal");
+        };
+        assert_eq!(bytes, &[0xab, 0x01]);
     }
 
     #[test]

@@ -1546,6 +1546,10 @@ mod tests {
         let cases = [
             SqlType::Array(Box::new(SqlType::BigInt)),
             SqlType::Map(Box::new(SqlType::String), Box::new(SqlType::Int)),
+            SqlType::Struct(vec![
+                ("k1".to_string(), SqlType::Int),
+                ("k2".to_string(), SqlType::Int),
+            ]),
         ];
 
         for data_type in cases {

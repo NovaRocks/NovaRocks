@@ -1055,6 +1055,15 @@ impl<'a> super::AnalyzerContext<'a> {
                     nullable: false,
                 })
             }
+            sqlast::Value::HexStringLiteral(s) => {
+                let bytes =
+                    hex::decode(s).map_err(|err| format!("invalid hex literal X'{s}': {err}"))?;
+                Ok(TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::Binary(bytes)),
+                    data_type: DataType::Binary,
+                    nullable: false,
+                })
+            }
             sqlast::Value::Boolean(b) => Ok(TypedExpr {
                 kind: ExprKind::Literal(LiteralValue::Bool(*b)),
                 data_type: DataType::Boolean,

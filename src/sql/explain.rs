@@ -1149,6 +1149,7 @@ fn format_expr_kind(kind: &ExprKind) -> String {
             LiteralValue::Float(f) => f.to_string(),
             LiteralValue::Decimal(d) => d.clone(),
             LiteralValue::String(s) => format!("'{s}'"),
+            LiteralValue::Binary(bytes) => format!("X'{}'", hex::encode_upper(bytes)),
         },
         ExprKind::BinaryOp { left, op, right } => {
             let op_str = match op {

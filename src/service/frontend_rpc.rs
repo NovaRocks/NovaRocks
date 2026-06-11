@@ -749,7 +749,10 @@ mod tests {
     use crate::status_code;
     use crate::types;
 
-    use super::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager, FrontendRpcSettings};
+    use super::{
+        FrontendRpcCallOptions, FrontendRpcError, FrontendRpcKind, FrontendRpcManager,
+        FrontendRpcSettings,
+    };
     mod fe_rpc_server {
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -961,13 +964,20 @@ mod tests {
         );
 
         let response = manager
-            .call(FrontendRpcKind::Control, server.addr(), |client| {
-                client.create_partition(request.clone()).map_err(|err| {
-                    FrontendRpcError::from_message_guess(format!(
-                        "createPartition RPC failed: {err}"
-                    ))
-                })
-            })
+            .call_with_options(
+                FrontendRpcKind::Control,
+                server.addr(),
+                FrontendRpcCallOptions {
+                    transport_retries: 3,
+                },
+                |client| {
+                    client.create_partition(request.clone()).map_err(|err| {
+                        FrontendRpcError::from_message_guess(format!(
+                            "createPartition RPC failed: {err}"
+                        ))
+                    })
+                },
+            )
             .expect("request retries after stringified EOF transport error");
 
         assert_eq!(response.status, Some(ok_status()));

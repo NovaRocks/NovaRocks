@@ -1031,7 +1031,6 @@ impl Iterator for ParquetScanIter {
                         Ok(batch) => batch,
                         Err(e) => return Some(Err(e)),
                     };
-
                     let to_take = std::cmp::min(batch.num_rows(), self.remaining);
                     let batch = if to_take < batch.num_rows() {
                         batch.slice(0, to_take)

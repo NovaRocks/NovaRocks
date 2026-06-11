@@ -17,6 +17,8 @@ SKIP_CARGO_TEST="false"
 REQUESTED_SUITES=()
 CI_RUNTIME_PREPARED="false"
 NOVA_CI_CARGO_PROFILE="${NOVA_CI_CARGO_PROFILE:-dev-opt}"
+SQL_CLUSTER_MODE="${SQL_CLUSTER_MODE:-all-in-one}"
+SQL_CLUSTER_SIZE="${SQL_CLUSTER_SIZE:-1}"
 
 usage() {
   cat <<'EOF'
@@ -34,9 +36,39 @@ Options:
   --all-discovered      Run every suite discovered from sql-tests/*/sql.
   --suite <name>        Run only the named SQL suite. May be repeated.
   --skip-cargo-test     Skip cargo test. Intended only for runner debugging.
+  --cluster-mode <mode> SQL runner cluster mode: all-in-one or cross-process.
+  --cluster-size <n>    Number of BE processes for cross-process mode.
   --keep-runtime        Keep this worktree's docker/iceberg-rest runtime entry.
   -h, --help            Show this help text.
 EOF
+}
+
+validate_cluster_args() {
+  case "$SQL_CLUSTER_MODE" in
+    all-in-one|cross-process)
+      ;;
+    *)
+      echo "error: --cluster-mode must be all-in-one or cross-process" >&2
+      exit 2
+      ;;
+  esac
+
+  case "$SQL_CLUSTER_SIZE" in
+    ''|*[!0-9]*)
+      echo "error: --cluster-size must be a positive integer" >&2
+      exit 2
+      ;;
+  esac
+
+  if [ "$SQL_CLUSTER_SIZE" -lt 1 ]; then
+    echo "error: --cluster-size must be >= 1" >&2
+    exit 2
+  fi
+
+  if [ "$SQL_CLUSTER_MODE" = "all-in-one" ] && [ "$SQL_CLUSTER_SIZE" -ne 1 ]; then
+    echo "error: all-in-one mode requires --cluster-size 1" >&2
+    exit 2
+  fi
 }
 
 parse_args() {
@@ -58,6 +90,22 @@ parse_args() {
         SKIP_CARGO_TEST="true"
         shift
         ;;
+      --cluster-mode)
+        if [ "$#" -lt 2 ]; then
+          echo "error: --cluster-mode requires a mode" >&2
+          exit 2
+        fi
+        SQL_CLUSTER_MODE="$2"
+        shift 2
+        ;;
+      --cluster-size)
+        if [ "$#" -lt 2 ]; then
+          echo "error: --cluster-size requires a count" >&2
+          exit 2
+        fi
+        SQL_CLUSTER_SIZE="$2"
+        shift 2
+        ;;
       --keep-runtime)
         KEEP_RUNTIME="true"
         shift
@@ -70,9 +118,11 @@ parse_args() {
         echo "error: unknown option: $1" >&2
         usage >&2
         exit 2
-        ;;
-    esac
+      ;;
+  esac
   done
+
+  validate_cluster_args
 
   if [ "$ALL_DISCOVERED_REQUESTED" = "true" ] && [ "${#REQUESTED_SUITES[@]}" -gt 0 ]; then
     echo "error: --all-discovered cannot be combined with --suite" >&2
@@ -145,10 +195,12 @@ prepare_runtime() {
     . docker/iceberg-rest/runtime/current/env.sh
     require_runtime_var NOVAROCKS_STANDALONE_CONFIG
     require_runtime_var NOVAROCKS_SQL_TEST_CONFIG
+    require_runtime_var NOVA_ENV_RUNTIME_DIR
     require_runtime_var NOVA_ENV_MYSQL_PORT
     require_runtime_var NOVAROCKS_ICEBERG_REST_URI
     echo "NOVAROCKS_STANDALONE_CONFIG=$NOVAROCKS_STANDALONE_CONFIG"
     echo "NOVAROCKS_SQL_TEST_CONFIG=$NOVAROCKS_SQL_TEST_CONFIG"
+    echo "NOVA_ENV_RUNTIME_DIR=$NOVA_ENV_RUNTIME_DIR"
     echo "NOVA_ENV_MYSQL_PORT=$NOVA_ENV_MYSQL_PORT"
     echo "NOVAROCKS_ICEBERG_REST_URI=$NOVAROCKS_ICEBERG_REST_URI"
     echo "NOVAROCKS_SPARK_DEFAULTS=${NOVAROCKS_SPARK_DEFAULTS:-}"
@@ -167,6 +219,34 @@ prepare_runtime() {
   CI_RUNTIME_PREPARED="true"
   ci_set_runtime_context "$NOVAROCKS_STANDALONE_CONFIG" "$NOVAROCKS_SQL_TEST_CONFIG" "$NOVA_ENV_MYSQL_PORT"
   ci_record_stage "prepare runtime" "PASS" "$duration" "$log_path"
+  ci_render_summary "RUNNING"
+}
+
+reset_managed_lake_metadata_stage() {
+  local log_path="$CI_RUN_DIR/metadata-reset.log"
+  local start
+  local code
+  local duration
+  local metadata_db
+
+  metadata_db="$NOVA_ENV_RUNTIME_DIR/standalone-managed-lake.sqlite"
+  start="$(ci_epoch)"
+  {
+    echo "Reset managed-lake metadata before SQL CI."
+    echo "metadata_db=$metadata_db"
+    rm -f "$metadata_db" "$metadata_db-shm" "$metadata_db-wal"
+  } >"$log_path" 2>&1
+  code=$?
+  duration=$(($(ci_epoch) - start))
+
+  if [ "$code" -ne 0 ]; then
+    ci_record_stage "reset metadata" "FAIL" "$duration" "$log_path"
+    ci_mark_failure_tail "reset metadata failed" "$log_path"
+    ci_render_summary "FAIL"
+    exit "$code"
+  fi
+
+  ci_record_stage "reset metadata" "PASS" "$duration" "$log_path"
   ci_render_summary "RUNNING"
 }
 
@@ -293,6 +373,9 @@ run_sql_suites() {
   local duration
   local -a suite_extra_args
   local query_timeout
+  local novarocks_bin
+
+  novarocks_bin="$REPO_ROOT/$(ci_novarocks_binary_path "$NOVA_CI_CARGO_PROFILE")"
 
   resolve_suites
   if [ "${#SUITES[@]}" -eq 0 ]; then
@@ -335,11 +418,14 @@ run_sql_suites() {
     fi
     ci_run_logged "$log_path" \
       env NO_PROXY=127.0.0.1,localhost \
+      NOVAROCKS_BIN="$novarocks_bin" \
       cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests --profile "$NOVA_CI_CARGO_PROFILE" -- \
         --config "$NOVAROCKS_SQL_TEST_CONFIG" \
         --suite "$suite" \
         --mode verify \
         --query-timeout "$query_timeout" \
+        --cluster-mode "$SQL_CLUSTER_MODE" \
+        --cluster-size "$SQL_CLUSTER_SIZE" \
         "${suite_extra_args[@]}" \
         -j 1
     code=$?
@@ -372,7 +458,13 @@ main() {
 
   prepare_runtime
   run_cargo_gates
-  start_server_stage
+  reset_managed_lake_metadata_stage
+  if [ "$SQL_CLUSTER_MODE" = "all-in-one" ]; then
+    start_server_stage
+  else
+    ci_record_stage "standalone-server" "SKIP" "0" ""
+    ci_render_summary "RUNNING"
+  fi
   run_sql_suites
 
   ci_render_summary "PASS"

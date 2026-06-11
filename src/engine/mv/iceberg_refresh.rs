@@ -7426,15 +7426,77 @@ fn normalize_aggregate_state_result_column_names(
     if result.columns.len() != expected_names.len() {
         return Ok(result);
     }
-    for (column, expected_name) in result.columns.iter_mut().zip(expected_names.iter()) {
-        column.name.clone_from(expected_name);
-    }
+    let metadata_permutation =
+        aggregate_state_result_name_permutation(&result.columns, &expected_names)
+            .unwrap_or_else(|| (0..expected_names.len()).collect());
+    let old_columns = std::mem::take(&mut result.columns);
+    result.columns = metadata_permutation
+        .iter()
+        .zip(expected_names.iter())
+        .map(|(old_index, expected_name)| {
+            let mut column = old_columns[*old_index].clone();
+            column.name.clone_from(expected_name);
+            column
+        })
+        .collect();
     result.chunks = result
         .chunks
         .into_iter()
-        .map(|chunk| rename_chunk_columns(chunk, &expected_names))
+        .map(|chunk| {
+            let chunk_permutation =
+                aggregate_state_result_chunk_name_permutation(&chunk, &expected_names)
+                    .unwrap_or_else(|| metadata_permutation.clone());
+            reorder_and_rename_chunk_columns(chunk, &expected_names, &chunk_permutation)
+        })
         .collect::<Result<Vec<_>, String>>()?;
     Ok(result)
+}
+
+fn aggregate_state_result_name_permutation(
+    columns: &[crate::runtime::query_result::QueryResultColumn],
+    expected_names: &[String],
+) -> Option<Vec<usize>> {
+    if columns.len() != expected_names.len() {
+        return None;
+    }
+    let mut used = vec![false; columns.len()];
+    let mut permutation = Vec::with_capacity(expected_names.len());
+    for expected_name in expected_names {
+        let index = columns
+            .iter()
+            .enumerate()
+            .find(|(index, column)| {
+                !used[*index] && column.name.eq_ignore_ascii_case(expected_name)
+            })?
+            .0;
+        used[index] = true;
+        permutation.push(index);
+    }
+    Some(permutation)
+}
+
+fn aggregate_state_result_chunk_name_permutation(
+    chunk: &crate::exec::chunk::Chunk,
+    expected_names: &[String],
+) -> Option<Vec<usize>> {
+    if chunk.batch.num_columns() != expected_names.len() {
+        return None;
+    }
+    let schema = chunk.batch.schema();
+    let mut used = vec![false; chunk.batch.num_columns()];
+    let mut permutation = Vec::with_capacity(expected_names.len());
+    for expected_name in expected_names {
+        let index = (0..chunk.batch.num_columns()).find(|index| {
+            !used[*index]
+                && schema
+                    .field(*index)
+                    .name()
+                    .eq_ignore_ascii_case(expected_name)
+        })?;
+        used[index] = true;
+        permutation.push(index);
+    }
+    Some(permutation)
 }
 
 fn aggregate_state_result_column_names(
@@ -7494,24 +7556,43 @@ fn aggregate_state_result_column_names(
     Ok(names)
 }
 
-fn rename_chunk_columns(
+fn reorder_and_rename_chunk_columns(
     chunk: crate::exec::chunk::Chunk,
     names: &[String],
+    permutation: &[usize],
 ) -> Result<crate::exec::chunk::Chunk, String> {
-    if chunk.batch.num_columns() != names.len() {
+    if chunk.batch.num_columns() != names.len() || permutation.len() != names.len() {
         return Ok(chunk);
     }
-    let fields = chunk
-        .batch
-        .schema()
-        .fields()
+    if permutation
+        .iter()
+        .any(|old_index| *old_index >= chunk.batch.num_columns())
+    {
+        return Err(format!(
+            "aggregate MV state result column permutation out of range: columns={} permutation={permutation:?}",
+            chunk.batch.num_columns()
+        ));
+    }
+    let schema_fields = chunk.batch.schema().fields().clone();
+    let fields = permutation
         .iter()
         .zip(names.iter())
-        .map(|(field, name)| std::sync::Arc::new(field.as_ref().clone().with_name(name.clone())))
+        .map(|(old_index, name)| {
+            std::sync::Arc::new(
+                schema_fields[*old_index]
+                    .as_ref()
+                    .clone()
+                    .with_name(name.clone()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let columns = permutation
+        .iter()
+        .map(|old_index| chunk.batch.column(*old_index).clone())
         .collect::<Vec<_>>();
     let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(fields));
-    let batch = arrow::record_batch::RecordBatch::try_new(schema, chunk.batch.columns().to_vec())
-        .map_err(|e| format!("rename aggregate MV state result columns failed: {e}"))?;
+    let batch = arrow::record_batch::RecordBatch::try_new(schema, columns)
+        .map_err(|e| format!("reorder aggregate MV state result columns failed: {e}"))?;
     crate::engine::record_batch_to_chunk(batch)
 }
 
@@ -11048,7 +11129,7 @@ fn arrow_data_type_to_iceberg_primitive(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int32Array, Int64Array, StringArray};
+    use arrow::array::{BinaryArray, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc as StdArc;
@@ -11264,6 +11345,133 @@ mod tests {
                 "__agg_state_s"
             ]
         );
+    }
+
+    #[test]
+    fn normalize_aggregate_state_result_reorders_named_columns() {
+        let query =
+            parse_select_query("select region, count(*) as c from ice.ns.fact group by region");
+        let calls =
+            crate::connector::starrocks::table::aggregate_sql_calls::extract_aggregate_sql_calls(
+                &query,
+            )
+            .expect("aggregate calls");
+        let layout = aggregate_apply_test_helpers::count_layout("region");
+        let schema = StdArc::new(ArrowSchema::new(vec![
+            Field::new("__agg_state_c", DataType::Binary, false),
+            Field::new("region", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            StdArc::clone(&schema),
+            vec![
+                StdArc::new(BinaryArray::from_vec(vec![b"east-state".as_slice()])),
+                StdArc::new(StringArray::from(vec![Some("east")])),
+            ],
+        )
+        .expect("record batch");
+        let result = crate::runtime::query_result::QueryResult {
+            columns: vec![
+                crate::runtime::query_result::QueryResultColumn {
+                    name: "__agg_state_c".to_string(),
+                    data_type: DataType::Binary,
+                    nullable: false,
+                    logical_type: None,
+                },
+                crate::runtime::query_result::QueryResultColumn {
+                    name: "region".to_string(),
+                    data_type: DataType::Utf8,
+                    nullable: true,
+                    logical_type: None,
+                },
+            ],
+            chunks: vec![crate::engine::record_batch_to_chunk(batch).expect("chunk")],
+        };
+
+        let normalized = normalize_aggregate_state_result_column_names(result, &layout, &calls)
+            .expect("normalize");
+
+        let column_names = normalized
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(column_names, vec!["region", "__agg_state_c"]);
+        assert_eq!(normalized.columns[0].data_type, DataType::Utf8);
+        assert_eq!(normalized.columns[1].data_type, DataType::Binary);
+
+        let chunk = &normalized.chunks[0];
+        assert_eq!(chunk.batch.schema().field(0).name(), "region");
+        assert_eq!(chunk.batch.schema().field(0).data_type(), &DataType::Utf8);
+        assert_eq!(chunk.batch.schema().field(1).name(), "__agg_state_c");
+        assert_eq!(chunk.batch.schema().field(1).data_type(), &DataType::Binary);
+        let region = chunk
+            .batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("region column");
+        assert_eq!(region.value(0), "east");
+        let state = chunk
+            .batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("state column");
+        assert_eq!(state.value(0), b"east-state");
+    }
+
+    #[test]
+    fn normalize_aggregate_state_result_reorders_chunk_columns_when_metadata_is_logical() {
+        let query =
+            parse_select_query("select region, count(*) as c from ice.ns.fact group by region");
+        let calls =
+            crate::connector::starrocks::table::aggregate_sql_calls::extract_aggregate_sql_calls(
+                &query,
+            )
+            .expect("aggregate calls");
+        let layout = aggregate_apply_test_helpers::count_layout("region");
+        let schema = StdArc::new(ArrowSchema::new(vec![
+            Field::new("__agg_state_c", DataType::Binary, false),
+            Field::new("region", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            StdArc::clone(&schema),
+            vec![
+                StdArc::new(BinaryArray::from_vec(vec![b"east-state".as_slice()])),
+                StdArc::new(StringArray::from(vec![Some("east")])),
+            ],
+        )
+        .expect("record batch");
+        let result = crate::runtime::query_result::QueryResult {
+            columns: vec![
+                crate::runtime::query_result::QueryResultColumn {
+                    name: "region".to_string(),
+                    data_type: DataType::Utf8,
+                    nullable: true,
+                    logical_type: None,
+                },
+                crate::runtime::query_result::QueryResultColumn {
+                    name: "__agg_state_c".to_string(),
+                    data_type: DataType::Binary,
+                    nullable: false,
+                    logical_type: None,
+                },
+            ],
+            chunks: vec![crate::engine::record_batch_to_chunk(batch).expect("chunk")],
+        };
+
+        let normalized = normalize_aggregate_state_result_column_names(result, &layout, &calls)
+            .expect("normalize");
+
+        assert_eq!(normalized.columns[0].name, "region");
+        assert_eq!(normalized.columns[0].data_type, DataType::Utf8);
+        assert_eq!(normalized.columns[1].name, "__agg_state_c");
+        assert_eq!(normalized.columns[1].data_type, DataType::Binary);
+        let chunk = &normalized.chunks[0];
+        assert_eq!(chunk.batch.schema().field(0).name(), "region");
+        assert_eq!(chunk.batch.schema().field(0).data_type(), &DataType::Utf8);
+        assert_eq!(chunk.batch.schema().field(1).name(), "__agg_state_c");
+        assert_eq!(chunk.batch.schema().field(1).data_type(), &DataType::Binary);
     }
 
     #[test]

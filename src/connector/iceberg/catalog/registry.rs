@@ -555,8 +555,10 @@ pub(crate) fn create_table(
             format!("{}", format_version as u8),
         ));
     }
+    let catalog = build_iceberg_catalog(entry)?;
+    purge_s3_table_prefix_before_create(entry, catalog.as_ref(), &namespace, &table_name)?;
     let table_creation = TableCreation::builder()
-        .name(table_name)
+        .name(table_name.clone())
         .schema(schema)
         .properties(all_properties)
         .format_version(format_version);
@@ -566,7 +568,6 @@ pub(crate) fn create_table(
         table_creation.build()
     };
 
-    let catalog = build_iceberg_catalog(entry)?;
     // For Hadoop/Memory catalogs, ensure the namespace exists before table creation.
     // REST catalogs manage namespace separately via CREATE DATABASE.
     if !matches!(entry.kind, IcebergCatalogKind::Rest) {
@@ -577,6 +578,33 @@ pub(crate) fn create_table(
         .map_err(|e| format!("create iceberg table runtime failed: {e}"))?
         .map_err(|e| format!("create iceberg table failed: {e}"))?;
     Ok(())
+}
+
+fn purge_s3_table_prefix_before_create(
+    entry: &IcebergCatalogEntry,
+    catalog: &dyn iceberg::Catalog,
+    namespace: &NamespaceIdent,
+    table_name: &str,
+) -> Result<(), String> {
+    if entry.s3_config.is_none() || entry.warehouse_uri.trim().is_empty() {
+        return Ok(());
+    }
+    if matches!(entry.kind, IcebergCatalogKind::Rest) {
+        let existing = block_on_iceberg(async { catalog.list_tables(namespace).await })
+            .map_err(|e| format!("list REST tables before create runtime failed: {e}"))?
+            .map_err(|e| {
+                format!("list REST tables for namespace {namespace} before create: {e}")
+            })?;
+        if existing
+            .iter()
+            .any(|ident| ident.name.eq_ignore_ascii_case(table_name))
+        {
+            return Ok(());
+        }
+    }
+    let ns_name = namespace.to_url_string();
+    drop_s3_table_prefix(entry, &ns_name, table_name)
+        .map_err(|e| format!("purge orphan S3 iceberg table prefix {namespace}.{table_name}: {e}"))
 }
 
 pub(crate) fn alter_partition_spec(
@@ -650,25 +678,18 @@ pub(crate) fn drop_table(
         let ident = TableIdent::from_strs([ns_name.as_str(), tbl_name.as_str()])
             .map_err(|e| format!("build REST table ident: {e}"))?;
         let catalog = block_on_iceberg(async { build_rest_catalog(entry).await })??;
-        return block_on_iceberg(async { catalog.drop_table(&ident).await })
+        block_on_iceberg(async { catalog.drop_table(&ident).await })
             .map_err(|e| format!("drop REST iceberg table runtime failed: {e}"))?
-            .map_err(|e| format!("drop REST iceberg table {ident}: {e}"));
+            .map_err(|e| format!("drop REST iceberg table {ident}: {e}"))?;
+        if entry.s3_config.is_some() && !entry.warehouse_uri.trim().is_empty() {
+            drop_s3_table_prefix(entry, &ns_name, &tbl_name)
+                .map_err(|e| format!("purge REST iceberg table {ident} data prefix: {e}"))?;
+        }
+        return Ok(());
     }
 
-    if let Some(s3_config) = &entry.s3_config {
-        let op = crate::fs::object_store::build_oss_operator(s3_config)
-            .map_err(|e| format!("build S3 operator for table drop: {e}"))?;
-        let table_prefix = s3_table_prefix(entry, &ns_name, &tbl_name)?;
-        if table_prefix.trim_matches('/').is_empty() {
-            return Err(format!(
-                "refuse to drop S3 iceberg table {ns_name}.{tbl_name}: resolved empty table prefix"
-            ));
-        }
-        block_on_iceberg(async {
-            op.remove_all(&table_prefix)
-                .await
-                .map_err(|e| format!("remove S3 table prefix {table_prefix}: {e}"))
-        })?
+    if entry.s3_config.is_some() {
+        drop_s3_table_prefix(entry, &ns_name, &tbl_name)
     } else {
         let table_dir = entry.warehouse_path.join(&ns_name).join(&tbl_name);
         if table_dir.exists() {
@@ -677,6 +698,30 @@ pub(crate) fn drop_table(
         }
         Ok(())
     }
+}
+
+fn drop_s3_table_prefix(
+    entry: &IcebergCatalogEntry,
+    ns_name: &str,
+    tbl_name: &str,
+) -> Result<(), String> {
+    let s3_config = entry
+        .s3_config
+        .as_ref()
+        .ok_or_else(|| "missing S3 config for table prefix drop".to_string())?;
+    let op = crate::fs::object_store::build_oss_operator(s3_config)
+        .map_err(|e| format!("build S3 operator for table drop: {e}"))?;
+    let table_prefix = s3_table_prefix(entry, ns_name, tbl_name)?;
+    if table_prefix.trim_matches('/').is_empty() {
+        return Err(format!(
+            "refuse to drop S3 iceberg table {ns_name}.{tbl_name}: resolved empty table prefix"
+        ));
+    }
+    block_on_iceberg(async {
+        op.remove_all(&table_prefix)
+            .await
+            .map_err(|e| format!("remove S3 table prefix {table_prefix}: {e}"))
+    })?
 }
 
 pub(crate) fn load_table(
@@ -787,15 +832,15 @@ pub(crate) fn load_table(
             // the LargeBinary into the Struct shape right before
             // ParquetWriter::write, so we expose LargeBinary at the
             // ColumnDef level for INSERT-side literal building.
-            let is_variant = matches!(
-                nested.field_type.as_ref(),
-                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Variant)
-            );
             let logical_type_override = logical_types.get(&field_name);
-            let data_type = if is_variant {
-                DataType::LargeBinary
-            } else {
-                apply_logical_type_override(field.data_type(), logical_type_override)
+            let data_type = match nested.field_type.as_ref() {
+                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Variant) => {
+                    DataType::LargeBinary
+                }
+                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Binary) => {
+                    DataType::Binary
+                }
+                _ => apply_logical_type_override(field.data_type(), logical_type_override),
             };
             // Only BITMAP/HLL need to surface as ColumnDef.logical_type: the
             // Arrow data_type collapses both onto Binary, but the analyzer

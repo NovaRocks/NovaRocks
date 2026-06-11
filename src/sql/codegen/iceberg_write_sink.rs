@@ -1,8 +1,13 @@
+use arrow::datatypes::{DataType, TimeUnit};
+use iceberg::spec::{PrimitiveType, Transform, Type};
+
 use crate::cloud_configuration::TCloudConfiguration;
 use crate::data_sinks;
 use crate::descriptors;
 use crate::sql::catalog::{ColumnDef, IcebergTableInfo, TableDef};
 use crate::types;
+
+use super::type_infer::arrow_type_to_type_desc;
 
 #[derive(Clone, Debug)]
 pub(crate) struct IcebergWriteSinkSpec {
@@ -12,6 +17,7 @@ pub(crate) struct IcebergWriteSinkSpec {
     pub target_columns: Vec<ColumnDef>,
     pub table_location: String,
     pub data_location: String,
+    pub target_partition_spec_id: i32,
     pub cloud_configuration: Option<TCloudConfiguration>,
     pub file_format: String,
     pub compression: types::TCompressionType,
@@ -43,6 +49,7 @@ impl IcebergWriteSinkSpec {
                 None::<i64>,
                 Some(tuple_id),
                 Some(self.data_location.clone()),
+                Some(self.target_partition_spec_id),
             )),
             None::<data_sinks::THiveTableSink>,
             None::<data_sinks::TTableFunctionTableSink>,
@@ -76,7 +83,7 @@ pub(crate) fn partition_info_from_metadata(
                 Some(source.name.clone()),
                 Some(field.name.clone()),
                 Some(transform_to_thrift_string(&field.transform)),
-                Some(source_column_slot_ref_placeholder_expr()),
+                Some(partition_expr_from_transform(source, &field.transform)?),
             ))
         })
         .collect()
@@ -101,12 +108,155 @@ pub(crate) fn partition_info_from_serialized_metadata(
     partition_info_from_metadata(&metadata)
 }
 
-fn source_column_slot_ref_placeholder_expr() -> crate::exprs::TExpr {
-    super::expr_compiler::build_slot_ref_texpr(
-        0,
-        0,
-        crate::lower::type_lowering::scalar_type_desc(types::TPrimitiveType::INT),
-    )
+fn partition_expr_from_transform(
+    source: &iceberg::spec::NestedField,
+    transform: &Transform,
+) -> Result<crate::exprs::TExpr, String> {
+    let source_type = iceberg_type_to_arrow_type(source.field_type.as_ref())?;
+    let source_node = source_column_slot_ref_placeholder_node(&source_type)?;
+    let expr = match transform {
+        Transform::Identity => crate::exprs::TExpr::new(vec![source_node]),
+        Transform::Void => transform_call_expr(
+            "__iceberg_transform_void",
+            vec![source_node],
+            &[source_type],
+            DataType::Null,
+        )?,
+        Transform::Year => {
+            time_transform_expr("__iceberg_transform_year", source_node, source_type)?
+        }
+        Transform::Month => {
+            time_transform_expr("__iceberg_transform_month", source_node, source_type)?
+        }
+        Transform::Day => time_transform_expr("__iceberg_transform_day", source_node, source_type)?,
+        Transform::Hour => {
+            time_transform_expr("__iceberg_transform_hour", source_node, source_type)?
+        }
+        Transform::Bucket(width) => transform_call_expr(
+            "__iceberg_transform_bucket",
+            vec![
+                source_node,
+                super::expr_compiler::int_literal_node(i64::from(*width)),
+            ],
+            &[source_type, DataType::Int64],
+            DataType::Int32,
+        )?,
+        Transform::Truncate(width) => transform_call_expr(
+            "__iceberg_transform_truncate",
+            vec![
+                source_node,
+                super::expr_compiler::int_literal_node(i64::from(*width)),
+            ],
+            &[source_type.clone(), DataType::Int64],
+            source_type,
+        )?,
+        other => {
+            return Err(format!(
+                "unsupported iceberg partition transform for write sink: {other:?}"
+            ));
+        }
+    };
+    Ok(expr)
+}
+
+fn time_transform_expr(
+    name: &str,
+    source_node: crate::exprs::TExprNode,
+    source_type: DataType,
+) -> Result<crate::exprs::TExpr, String> {
+    transform_call_expr(name, vec![source_node], &[source_type], DataType::Int64)
+}
+
+fn transform_call_expr(
+    name: &str,
+    children: Vec<crate::exprs::TExprNode>,
+    arg_types: &[DataType],
+    return_type: DataType,
+) -> Result<crate::exprs::TExpr, String> {
+    let ret_type = arrow_type_to_type_desc(&return_type)?;
+    let fn_arg_types = arg_types
+        .iter()
+        .map(arrow_type_to_type_desc)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut nodes = Vec::with_capacity(children.len() + 1);
+    nodes.push(crate::exprs::TExprNode {
+        node_type: crate::exprs::TExprNodeType::FUNCTION_CALL,
+        type_: ret_type.clone(),
+        num_children: children.len() as i32,
+        fn_: Some(types::TFunction {
+            name: types::TFunctionName {
+                db_name: None,
+                function_name: name.to_string(),
+            },
+            binary_type: types::TFunctionBinaryType::BUILTIN,
+            arg_types: fn_arg_types,
+            ret_type,
+            has_var_args: false,
+            comment: None,
+            signature: None,
+            hdfs_location: None,
+            scalar_fn: None,
+            aggregate_fn: None,
+            id: None,
+            checksum: None,
+            agg_state_desc: None,
+            fid: None,
+            table_fn: None,
+            could_apply_dict_optimize: None,
+            ignore_nulls: None,
+            isolated: None,
+            input_type: None,
+            content: None,
+        }),
+        ..super::expr_compiler::default_expr_node()
+    });
+    nodes.extend(children);
+    Ok(crate::exprs::TExpr::new(nodes))
+}
+
+fn source_column_slot_ref_placeholder_node(
+    source_type: &DataType,
+) -> Result<crate::exprs::TExprNode, String> {
+    super::expr_compiler::build_slot_ref_texpr(0, 0, arrow_type_to_type_desc(source_type)?)
+        .nodes
+        .into_iter()
+        .next()
+        .ok_or_else(|| "iceberg partition placeholder slot ref is empty".to_string())
+}
+
+fn iceberg_type_to_arrow_type(ty: &Type) -> Result<DataType, String> {
+    match ty {
+        Type::Primitive(primitive) => Ok(match primitive {
+            PrimitiveType::Boolean => DataType::Boolean,
+            PrimitiveType::Int => DataType::Int32,
+            PrimitiveType::Long => DataType::Int64,
+            PrimitiveType::Float => DataType::Float32,
+            PrimitiveType::Double => DataType::Float64,
+            PrimitiveType::Decimal { precision, scale } => DataType::Decimal128(
+                u8::try_from(*precision)
+                    .map_err(|_| format!("iceberg decimal precision out of range: {precision}"))?,
+                i8::try_from(*scale)
+                    .map_err(|_| format!("iceberg decimal scale out of range: {scale}"))?,
+            ),
+            PrimitiveType::Date => DataType::Date32,
+            PrimitiveType::Time => DataType::Time64(TimeUnit::Microsecond),
+            PrimitiveType::Timestamp | PrimitiveType::Timestamptz => {
+                DataType::Timestamp(TimeUnit::Microsecond, None)
+            }
+            PrimitiveType::TimestampNs | PrimitiveType::TimestamptzNs => {
+                DataType::Timestamp(TimeUnit::Nanosecond, None)
+            }
+            PrimitiveType::String | PrimitiveType::Uuid => DataType::Utf8,
+            PrimitiveType::Fixed(width) => DataType::FixedSizeBinary(
+                i32::try_from(*width)
+                    .map_err(|_| format!("iceberg fixed width out of range: {width}"))?,
+            ),
+            PrimitiveType::Binary | PrimitiveType::Variant => DataType::Binary,
+        }),
+        other => Err(format!(
+            "iceberg partition transform source type must be primitive, got {other:?}"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -169,6 +319,7 @@ pub(crate) mod test_support {
             }],
             table_location: "file:///warehouse/target_orders".to_string(),
             data_location: "file:///warehouse/target_orders/data".to_string(),
+            target_partition_spec_id: 0,
             cloud_configuration: None,
             file_format: "parquet".to_string(),
             compression: types::TCompressionType::SNAPPY,
@@ -224,6 +375,36 @@ mod tests {
             .expect("schema");
         let partition_spec = iceberg::spec::PartitionSpec::builder(schema.clone())
             .add_partition_field("id", "id_bucket", transform)
+            .expect("partition field")
+            .build()
+            .expect("partition spec");
+        let metadata = iceberg::spec::TableMetadataBuilder::new(
+            schema,
+            partition_spec,
+            iceberg::spec::SortOrder::unsorted_order(),
+            "file:///warehouse/orders".to_string(),
+            iceberg::spec::FormatVersion::V3,
+            std::collections::HashMap::new(),
+        )
+        .expect("metadata builder")
+        .build()
+        .expect("metadata");
+        metadata.metadata
+    }
+
+    fn metadata_with_timestamp_partition(
+        transform: iceberg::spec::Transform,
+    ) -> iceberg::spec::TableMetadata {
+        let schema = iceberg::spec::Schema::builder()
+            .with_fields(vec![Arc::new(iceberg::spec::NestedField::required(
+                1,
+                "ts",
+                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Timestamp),
+            ))])
+            .build()
+            .expect("schema");
+        let partition_spec = iceberg::spec::PartitionSpec::builder(schema.clone())
+            .add_partition_field("ts", "ts_month", transform)
             .expect("partition field")
             .build()
             .expect("partition spec");
@@ -299,6 +480,58 @@ mod tests {
         assert_eq!(
             partition_info[0].transform_expr.as_deref(),
             Some("bucket[16]")
+        );
+        let expr = partition_info[0]
+            .partition_expr
+            .as_ref()
+            .expect("partition expr");
+        assert_eq!(expr.nodes.len(), 3);
+        assert_eq!(
+            expr.nodes[0].node_type,
+            crate::exprs::TExprNodeType::FUNCTION_CALL
+        );
+        assert_eq!(
+            expr.nodes[0]
+                .fn_
+                .as_ref()
+                .map(|func| func.name.function_name.as_str()),
+            Some("__iceberg_transform_bucket")
+        );
+        assert_eq!(
+            expr.nodes[1].node_type,
+            crate::exprs::TExprNodeType::SLOT_REF
+        );
+        assert_eq!(
+            expr.nodes[2].int_literal.as_ref().map(|lit| lit.value),
+            Some(16)
+        );
+    }
+
+    #[test]
+    fn partition_info_from_metadata_builds_month_transform_expr() {
+        let metadata = metadata_with_timestamp_partition(iceberg::spec::Transform::Month);
+
+        let partition_info = partition_info_from_metadata(&metadata).expect("partition info");
+
+        let expr = partition_info[0]
+            .partition_expr
+            .as_ref()
+            .expect("partition expr");
+        assert_eq!(expr.nodes.len(), 2);
+        assert_eq!(
+            expr.nodes[0].node_type,
+            crate::exprs::TExprNodeType::FUNCTION_CALL
+        );
+        assert_eq!(
+            expr.nodes[0]
+                .fn_
+                .as_ref()
+                .map(|func| func.name.function_name.as_str()),
+            Some("__iceberg_transform_month")
+        );
+        assert_eq!(
+            expr.nodes[1].node_type,
+            crate::exprs::TExprNodeType::SLOT_REF
         );
     }
 

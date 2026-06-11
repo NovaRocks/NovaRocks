@@ -183,7 +183,7 @@ SELECT t1_c3, t1_c4, t2_c3, t2_c4 FROM ${case_db}.lm_nullable_t1 INNER JOIN [bro
 -- @order_sensitive=true
 -- nullable right outer join, output partial columns
 SELECT t1_c3, t1_c4, t2_c3, t2_c4 FROM ${case_db}.lm_nullable_t1 RIGHT OUTER JOIN [shuffle] ${case_db}.lm_nullable_t2
-  ON t1_c1 = t2_c1 AND t1_c2 > t2_c2 ORDER BY t2_c2;
+  ON t1_c1 = t2_c1 AND t1_c2 > t2_c2 ORDER BY t2_c2, t2_c1;
 
 -- query 27
 -- @skip_result_check=true

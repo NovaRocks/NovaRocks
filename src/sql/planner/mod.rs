@@ -4227,6 +4227,31 @@ mod tests {
     }
 
     #[test]
+    fn p3_cube_without_grouping_survives_optimizer_id_binding() {
+        let sql = "WITH t AS ( \
+                   SELECT 1 AS a, 'x' AS b \
+                   UNION ALL SELECT 1, 'y' \
+                   UNION ALL SELECT 2, 'z' \
+                   ) \
+                   SELECT a, b FROM t GROUP BY CUBE(a, b) ORDER BY a, b";
+        let (resolved, cte_registry, mut factory) =
+            parse_analyze_query(sql).expect("analyzer should succeed");
+        let logical =
+            plan_query(resolved, cte_registry, &mut factory).expect("planner should succeed");
+        let physical = crate::sql::optimizer::optimize(
+            logical,
+            &std::collections::HashMap::new(),
+            factory,
+            None,
+            Vec::new(),
+        )
+        .expect("optimizer should produce a physical plan");
+
+        crate::sql::codegen::id_binding_verifier::verify_id_binding(&physical)
+            .expect("CUBE synthetic grouping output must survive optimizer extraction");
+    }
+
+    #[test]
     fn p1_window_expr_gets_output_column_id() {
         let plan =
             plan_test_query("SELECT a, row_number() OVER (PARTITION BY a ORDER BY b) AS rn FROM t");

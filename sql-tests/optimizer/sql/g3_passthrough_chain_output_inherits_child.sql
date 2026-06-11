@@ -1,7 +1,8 @@
 -- @tags=optimizer,g3
 -- G3 passthrough (Filter/Project report the child distribution) over small
--- iceberg base tables; plan-shape golden. The two-phase ShuffleAgg path
--- triggers at scale and is covered by the benchmark suites.
+-- iceberg base tables. In distributed execution, the grouped aggregate above
+-- the join is split into LOCAL/ShuffleAgg/GLOBAL so each group is finalized
+-- on one node. Plan-shape golden.
 DROP TABLE IF EXISTS ${case_db}.g3_pt_a;
 DROP TABLE IF EXISTS ${case_db}.g3_pt_b;
 CREATE TABLE ${case_db}.g3_pt_a (k INT, v INT);

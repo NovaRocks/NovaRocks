@@ -2,9 +2,12 @@ Explain String
 SORT BY [k ASC NULLS FIRST] stats={rows=4}
   GATHER EXCHANGE stats={rows=4}
     PROJECT [k, sum(v) AS s] stats={rows=4}
-      HASH AGGREGATE (SINGLE, group by: [k]) stats={rows=4}
+      HASH AGGREGATE (GLOBAL, group by: [k]) stats={rows=4}
         aggregations: sum(v)
-        SCAN db_sqlt_ab8d0e3ee9f79339.t_split_agg_grouped stats={rows=12}
-             TABLE: db_sqlt_ab8d0e3ee9f79339.t_split_agg_grouped
-             columns: k, v
-             min-max stats
+        HASH EXCHANGE (source: ShuffleAgg, hash: [c1]) stats={rows=4}
+          HASH AGGREGATE (LOCAL, group by: [k]) stats={rows=4}
+            aggregations: sum(v)
+            SCAN db_sqlt_ab8d0e3ee9f79339.t_split_agg_grouped stats={rows=12}
+                 TABLE: db_sqlt_ab8d0e3ee9f79339.t_split_agg_grouped
+                 columns: k, v
+                 min-max stats

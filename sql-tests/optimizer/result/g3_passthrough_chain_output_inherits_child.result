@@ -1,21 +1,24 @@
 Explain String
 GATHER EXCHANGE stats={rows=1}
   PROJECT [a.k AS k, sum(a.v + b.w) AS s] stats={rows=1}
-    HASH AGGREGATE (SINGLE, group by: [a.k]) stats={rows=1}
+    HASH AGGREGATE (GLOBAL, group by: [a.k]) stats={rows=1}
       aggregations: sum(a.v + b.w)
-      HASH JOIN (BROADCAST, INNER, eq: [b.k = a.k]) stats={rows=2}
-        build runtime filters:
-        - filter_id = 0, build_expr = (a.k)
-        SCAN db_sqlt_0b6aab1d126fd201.g3_pt_b (alias=b) stats={rows=2}
-             TABLE: db_sqlt_0b6aab1d126fd201.g3_pt_b
-             columns: k, w
-             min-max stats
-             predicates: b.k IS NOT NULL
-            probe runtime filters:
-            - filter_id = 0, probe_expr = (b.k)
-        BROADCAST EXCHANGE stats={rows=2}
-          SCAN db_sqlt_0b6aab1d126fd201.g3_pt_a (alias=a) stats={rows=2}
-               TABLE: db_sqlt_0b6aab1d126fd201.g3_pt_a
-               columns: k, v
-               min-max stats
-               predicates: a.v > 0 AND a.k IS NOT NULL
+      HASH EXCHANGE (source: ShuffleAgg, hash: [c1]) stats={rows=1}
+        HASH AGGREGATE (LOCAL, group by: [a.k]) stats={rows=1}
+          aggregations: sum(a.v + b.w)
+          HASH JOIN (BROADCAST, INNER, eq: [b.k = a.k]) stats={rows=2}
+            build runtime filters:
+            - filter_id = 0, build_expr = (a.k)
+            SCAN db_sqlt_0b6aab1d126fd201.g3_pt_b (alias=b) stats={rows=2}
+                 TABLE: db_sqlt_0b6aab1d126fd201.g3_pt_b
+                 columns: k, w
+                 min-max stats
+                 predicates: b.k IS NOT NULL
+                probe runtime filters:
+                - filter_id = 0, probe_expr = (b.k)
+            BROADCAST EXCHANGE stats={rows=2}
+              SCAN db_sqlt_0b6aab1d126fd201.g3_pt_a (alias=a) stats={rows=2}
+                   TABLE: db_sqlt_0b6aab1d126fd201.g3_pt_a
+                   columns: k, v
+                   min-max stats
+                   predicates: a.v > 0 AND a.k IS NOT NULL

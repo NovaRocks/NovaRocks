@@ -240,6 +240,7 @@ fn collect_distinct_values(
 
 fn materialize_dictionary_values(result: &QueryResult) -> Result<Vec<DictionaryValue>, String> {
     let mut values: Vec<DictionaryValue> = Vec::new();
+    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
     let mut next_id: i32 = 1;
     for chunk in &result.chunks {
         let batch = &chunk.batch;
@@ -251,6 +252,9 @@ fn materialize_dictionary_values(result: &QueryResult) -> Result<Vec<DictionaryV
         for entry in bytes_iter {
             match entry {
                 Some(bytes) => {
+                    if !seen.insert(bytes.clone()) {
+                        continue;
+                    }
                     values.push(DictionaryValue { id: next_id, bytes });
                     next_id = next_id.checked_add(1).ok_or_else(|| {
                         "dictionary id overflow while building distinct values".to_string()
@@ -391,6 +395,43 @@ mod tests {
         assert_eq!(values[0].bytes, b"a");
         assert_eq!(values[1].id, 2);
         assert_eq!(values[1].bytes, b"b");
+    }
+
+    #[test]
+    fn materialize_dictionary_values_deduplicates_bytes() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{Field, Schema};
+        use arrow::record_batch::RecordBatch;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+        let array = Arc::new(StringArray::from(vec![
+            Some("a"),
+            Some("b"),
+            Some("a"),
+            Some("b"),
+            Some("c"),
+        ])) as arrow::array::ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![array]).expect("batch");
+        let chunk = crate::engine::record_batch_to_chunk(batch).expect("chunk");
+        let result = QueryResult {
+            columns: vec![crate::runtime::query_result::QueryResultColumn {
+                name: "s".to_string(),
+                data_type: DataType::Utf8,
+                nullable: true,
+                logical_type: None,
+            }],
+            chunks: vec![chunk],
+        };
+
+        let values = materialize_dictionary_values(&result).expect("values");
+
+        assert_eq!(values.len(), 3);
+        assert_eq!(values[0].id, 1);
+        assert_eq!(values[0].bytes, b"a");
+        assert_eq!(values[1].id, 2);
+        assert_eq!(values[1].bytes, b"b");
+        assert_eq!(values[2].id, 3);
+        assert_eq!(values[2].bytes, b"c");
     }
 
     #[test]

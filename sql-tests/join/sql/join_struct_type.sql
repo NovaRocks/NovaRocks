@@ -27,9 +27,9 @@ TBLPROPERTIES ("format-version" = "3");
 -- query 3
 -- @skip_result_check=true
 -- NovaRocks rejects the invalid insert with a field-count specific
--- diagnostic (4 row literals vs. a 2-field STRUCT column). StarRocks FE
--- emits a more generic "Cannot cast" message; either is a valid rejection.
--- @expect_error=does not match STRUCT field count
+-- diagnostic (4 row literals vs. a 2-field STRUCT column). The distributed
+-- Iceberg sink validates this after inserting target CASTs into the write plan.
+-- @expect_error=CAST STRUCT field count mismatch
 INSERT INTO ${case_db}.struct_test (pk, s0) VALUES (7, row(3, '', null, null));
 
 -- query 4

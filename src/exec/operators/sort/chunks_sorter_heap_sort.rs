@@ -25,12 +25,10 @@ use std::sync::Arc;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::sort::SortExpression;
-use crate::exec::operators::sort::{
-    ChunksSorter, concat_sort_chunks, merged_sort_schema_for_chunks, normalize_sort_key_array,
-};
+use crate::exec::operators::sort::{ChunksSorter, concat_sort_chunks, normalize_sort_key_array};
 
 use arrow::array::ArrayRef;
-use arrow::compute::{SortOptions, concat_batches};
+use arrow::compute::SortOptions;
 use arrow::row::{OwnedRow, RowConverter, SortField};
 
 #[derive(Debug)]
@@ -159,16 +157,12 @@ impl TopNHeapKernel {
         selected.sort_unstable();
 
         let source_chunk = selected[0].chunk.clone();
-        let selected_chunks = selected
-            .iter()
-            .map(|entry| entry.chunk.as_ref().clone())
-            .collect::<Vec<_>>();
-        let schema = merged_sort_schema_for_chunks(&selected_chunks)?;
-        let row_batches = selected
+        let row_chunks = selected
             .into_iter()
             .map(|entry| entry.chunk.batch.slice(entry.row_idx, 1))
-            .collect::<Vec<_>>();
-        let batch = concat_batches(&schema, &row_batches).map_err(|e| e.to_string())?;
+            .map(|batch| Chunk::try_new_like(batch, &source_chunk).map_err(|e| e.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let batch = concat_sort_chunks(&row_chunks)?;
         let chunk = Chunk::try_new_like(batch, &source_chunk).map_err(|e| e.to_string())?;
         Ok(Some(chunk))
     }

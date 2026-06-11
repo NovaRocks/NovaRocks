@@ -16,6 +16,7 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::schema_compat::{align_fields_to_arrays, is_execution_data_type_compatible};
 use arrow::array::{ArrayRef, StructArray};
 use arrow::datatypes::DataType;
 use std::sync::Arc;
@@ -63,7 +64,7 @@ pub fn eval_struct_expr(
             .get(idx)
             .map(|f| f.data_type())
             .ok_or_else(|| "struct_expr field missing".to_string())?;
-        if array.data_type() != expected_type {
+        if !is_execution_data_type_compatible(expected_type, array.data_type()) {
             return Err(format!(
                 "struct_expr field type mismatch at {}: expected {:?}, got {:?}",
                 idx,
@@ -74,6 +75,7 @@ pub fn eval_struct_expr(
         arrays.push(array);
     }
 
+    let struct_fields = align_fields_to_arrays(&struct_fields, &arrays, "struct_expr")?;
     let array = StructArray::new(struct_fields, arrays, None);
     Ok(Arc::new(array))
 }

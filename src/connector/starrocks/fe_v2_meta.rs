@@ -205,10 +205,48 @@ fn resolve_tablet_paths_for_refs(
         local_paths.extend(recovered_paths);
     }
 
-    let mut starmgr_recovery_error = None;
+    let mut metadata_recovery_error = None;
     let missing_after_local = collect_missing_tablet_ids(&requested_tablet_ids, &local_paths);
     if !missing_after_local.is_empty() {
-        match recover_missing_paths_from_starmgr(&missing_after_local) {
+        match crate::engine::recover_starrocks_tablet_paths_from_current_engine(
+            table,
+            &missing_after_local,
+        ) {
+            Ok(recovered) => {
+                if !recovered.is_empty() {
+                    let upserted = starlet_shard_registry::upsert_many(
+                        recovered
+                            .iter()
+                            .map(|(tablet_id, path)| (*tablet_id, path.clone())),
+                    );
+                    if upserted > 0 {
+                        tracing::info!(
+                            target: "novarocks::lake",
+                            table = %table.cache_key(),
+                            recovered = upserted,
+                            "recovered tablet root paths from metadata repository because local shard cache was incomplete"
+                        );
+                    }
+                    local_paths.extend(recovered);
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: "novarocks::lake",
+                    table = %table.cache_key(),
+                    tablet_ids = ?missing_after_local,
+                    error = %err,
+                    "failed to recover missing tablet root paths from metadata repository"
+                );
+                metadata_recovery_error = Some(err);
+            }
+        }
+    }
+
+    let mut starmgr_recovery_error = None;
+    let missing_after_metadata = collect_missing_tablet_ids(&requested_tablet_ids, &local_paths);
+    if !missing_after_metadata.is_empty() {
+        match recover_missing_paths_from_starmgr(&missing_after_metadata) {
             Ok(recovered) => {
                 if !recovered.is_empty() {
                     // StarManager already provides the cluster-level S3
@@ -246,7 +284,7 @@ fn resolve_tablet_paths_for_refs(
                 tracing::warn!(
                     target: "novarocks::lake",
                     table = %table.cache_key(),
-                    tablet_ids = ?missing_after_local,
+                    tablet_ids = ?missing_after_metadata,
                     error = %err,
                     "failed to recover missing tablet root paths from StarManager GetShard"
                 );
@@ -257,12 +295,15 @@ fn resolve_tablet_paths_for_refs(
 
     if !paths_cover_refs(&local_paths, refs) {
         let missing = collect_missing_tablet_ids(&requested_tablet_ids, &local_paths);
+        let metadata_context = metadata_recovery_error
+            .map(|err| format!("; metadata_error={err}"))
+            .unwrap_or_default();
         let starmgr_context = starmgr_recovery_error
             .map(|err| format!("; starmgr_error={err}"))
             .unwrap_or_default();
         return Err(format!(
             "missing shard path for tablet_ids={missing:?} after local AddShard cache, \
-            runtime registry, and StarManager GetShard{starmgr_context}"
+            runtime registry, metadata repository, and StarManager GetShard{metadata_context}{starmgr_context}"
         ));
     }
 

@@ -97,7 +97,7 @@ mod tests {
     use crate::exec::chunk::ChunkSchema;
     use crate::exec::expr::ExprNode;
 
-    use arrow::array::{Array, Int32Array};
+    use arrow::array::{Array, Decimal128Array, Int32Array, make_array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
 
@@ -112,6 +112,33 @@ mod tests {
         let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
             batch.schema().as_ref(),
             &[SlotId::new(1)],
+        )
+        .expect("chunk schema");
+        Chunk::new_with_chunk_schema(batch, chunk_schema)
+    }
+
+    fn make_chunk_with_decimal_payload(ids: Vec<i32>, prices: Vec<i128>) -> Chunk {
+        let wide_prices = Decimal128Array::from(prices.into_iter().map(Some).collect::<Vec<_>>())
+            .with_precision_and_scale(38, 2)
+            .expect("wide decimal prices");
+        let price_data = wide_prices
+            .to_data()
+            .into_builder()
+            .data_type(DataType::Decimal128(20, 2))
+            .build()
+            .expect("decimal20 price data");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("price", DataType::Decimal128(20, 2), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(ids)), make_array(price_data)],
+        )
+        .expect("record batch");
+        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(1), SlotId::new(2)],
         )
         .expect("chunk schema");
         Chunk::new_with_chunk_schema(batch, chunk_schema)
@@ -147,5 +174,44 @@ mod tests {
         assert_eq!(col.value(1), 1);
         assert_eq!(col.value(2), 2);
         assert_eq!(col.value(3), 3);
+    }
+
+    #[test]
+    fn full_sort_preserves_decimal_payload_exceeding_declared_precision() {
+        let overflow = 100_000_000_000_000_000_000_i128;
+        let chunks = vec![make_chunk_with_decimal_payload(
+            vec![2, 1],
+            vec![overflow, 12_345_i128],
+        )];
+        let mut arena = ExprArena::default();
+        let expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        let sorter = ChunksSorterFullSort::new(
+            Arc::new(arena),
+            vec![SortExpression {
+                expr,
+                asc: true,
+                nulls_first: true,
+            }],
+        );
+
+        let out = sorter.sort_chunks(&chunks).expect("sort").expect("chunk");
+        let ids = out
+            .batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("id int32");
+        assert_eq!(ids.value(0), 1);
+        assert_eq!(ids.value(1), 2);
+        let prices = out
+            .batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("price decimal");
+        assert_eq!(prices.data_type(), &DataType::Decimal128(38, 2));
+        assert_eq!(prices.value(0), 12_345_i128);
+        assert!(!prices.is_null(1));
+        assert_eq!(prices.value(1), overflow);
     }
 }

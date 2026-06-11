@@ -1910,6 +1910,16 @@ fn cast_with_special_rules_with_field_schema(
             DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64,
             DataType::Decimal128(target_precision, target_scale),
         ) => cast_integral_to_decimal128_relaxed(array, *target_precision, *target_scale),
+        (DataType::FixedSizeBinary(width), DataType::Decimal128(precision, scale))
+            if *width == largeint::LARGEINT_BYTE_WIDTH =>
+        {
+            cast_largeint_binary_to_decimal(array, *precision, *scale)
+        }
+        (DataType::FixedSizeBinary(width), DataType::Decimal256(precision, scale))
+            if *width == largeint::LARGEINT_BYTE_WIDTH =>
+        {
+            cast_largeint_binary_to_decimal256(array, *precision, *scale)
+        }
         (DataType::Boolean, DataType::Decimal128(precision, scale)) => {
             cast_boolean_to_decimal128_array(array, *precision, *scale)
         }
@@ -4322,6 +4332,38 @@ mod tests {
         let out = arena.eval(cast_expr, &chunk).unwrap();
         let out = out.as_any().downcast_ref::<Decimal128Array>().unwrap();
         assert_eq!(out.value(0), 9_223_372_036_854_775_808_i128);
+    }
+
+    #[test]
+    fn test_cast_list_largeint_binary_to_decimal128() {
+        let item_field = Arc::new(Field::new("item", DataType::FixedSizeBinary(16), true));
+        let values =
+            largeint::array_from_i128(&[Some(9_223_372_036_854_775_808_i128), None, Some(-5_i128)])
+                .unwrap();
+        let source = Arc::new(ListArray::new(
+            item_field,
+            OffsetBuffer::new(vec![0_i32, 2, 3].into()),
+            values,
+            None,
+        )) as ArrayRef;
+        let target_type = DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Decimal128(38, 0),
+            true,
+        )));
+
+        let out = cast_with_special_rules(&source, &target_type).unwrap();
+
+        let out = out.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(out.data_type(), &target_type);
+        let values = out
+            .values()
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
+        assert_eq!(values.value(0), 9_223_372_036_854_775_808_i128);
+        assert!(values.is_null(1));
+        assert_eq!(values.value(2), -5_i128);
     }
 
     #[test]

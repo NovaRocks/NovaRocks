@@ -495,7 +495,14 @@ fn declared_node_output_ids(node: &PhysicalPlanNode) -> Result<HashSet<ColumnId>
 fn uses_declared_node_outputs(op: &Operator) -> bool {
     !matches!(
         op,
-        Operator::PhysicalHashAggregate(_) | Operator::PhysicalRepeat(_)
+        Operator::PhysicalFilter(_)
+            | Operator::PhysicalSort(_)
+            | Operator::PhysicalTopN(_)
+            | Operator::PhysicalLimit(_)
+            | Operator::PhysicalDistribution(_)
+            | Operator::PhysicalAssertOneRow(_)
+            | Operator::PhysicalHashAggregate(_)
+            | Operator::PhysicalRepeat(_)
     )
 }
 
@@ -729,5 +736,53 @@ mod tests {
         );
 
         verify_id_binding(&plan).expect("project should bind Repeat grouping output id");
+    }
+
+    #[test]
+    fn p3_distribution_over_repeat_preserves_grouping_ids() {
+        let input_id = ColumnId::new_for_test(1);
+        let grouping_output_id = ColumnId::new_for_test(4);
+        let repeat = repeat_over(
+            values_node(vec![int_col(input_id, "a")]),
+            grouping_output_id,
+        );
+        let distribution = PhysicalPlanNode {
+            op: Operator::PhysicalDistribution(PhysicalDistributionOp {
+                spec: DistributionSpec::Gather,
+            }),
+            children: vec![repeat],
+            stats: Statistics::default(),
+            output_columns: vec![int_col(input_id, "a")],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+        let aggregate = PhysicalPlanNode {
+            op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+                mode: AggMode::Single,
+                group_by: vec![
+                    column_ref(input_id, "a"),
+                    column_ref(grouping_output_id, "__grouping_fn_0"),
+                ],
+                aggregates: vec![],
+                output_columns: vec![
+                    int_col(input_id, "a"),
+                    int_col(grouping_output_id, "__grouping_fn_0"),
+                ],
+                is_merge: vec![],
+            }),
+            children: vec![distribution],
+            stats: Statistics::default(),
+            output_columns: vec![
+                int_col(input_id, "a"),
+                int_col(grouping_output_id, "__grouping_fn_0"),
+            ],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+
+        verify_id_binding(&aggregate)
+            .expect("distribution must preserve Repeat grouping output id for aggregate grouping");
     }
 }

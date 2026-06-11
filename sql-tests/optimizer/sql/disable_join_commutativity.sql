@@ -4,40 +4,43 @@
 -- 2. Two EXPLAIN VERBOSE statements; the .result captures both and the
 --    diff between them is the join order / distribution type.
 -- Design note:
--- The query is a LEFT OUTER JOIN written as date_dim LEFT, lineorder RIGHT.
--- query rewrite join-reorder only applies to INNER/CROSS joins, so it leaves outer
--- joins alone.  The CBO JoinCommutativity rule is the only mechanism that
--- can swap left/right for outer joins.
+-- The query is an INNER JOIN written as date_dim LEFT, lineorder RIGHT.
+-- JoinReorder is disabled for both EXPLAINs so the only remaining mechanism
+-- that can swap the two-table join in Cascades is JoinCommutativity.
 -- With JoinCommutativity: CBO swaps to lineorder LEFT (probe) + date_dim RIGHT
---   (broadcast build), converting LEFT OUTER -> RIGHT OUTER.
---   date_dim (10k rows) fits under the broadcast threshold; lineorder (1M) does not.
--- Without JoinCommutativity: CBO cannot swap, lineorder RIGHT (1M rows) exceeds
---   the broadcast limit, so it falls back to a PARTITIONED LEFT OUTER join.
+--   so the tiny date_dim table is the broadcast build side.
+-- Without JoinCommutativity: CBO cannot swap, so lineorder remains on the
+--   original right side.
 DROP TABLE IF EXISTS ${case_db}.lineorder;
 DROP TABLE IF EXISTS ${case_db}.date_dim;
 CREATE TABLE ${case_db}.lineorder (lo_orderkey INT, lo_datekey INT, lo_revenue INT);
 CREATE TABLE ${case_db}.date_dim (d_datekey INT, d_year INT);
-INSERT INTO ${case_db}.lineorder VALUES (1, 19980101, 100), (2, 19980102, 200);
+INSERT INTO ${case_db}.lineorder
+    SELECT generate_series, 19980101 + (generate_series % 2), generate_series * 10
+    FROM TABLE(generate_series(1, 20000));
 INSERT INTO ${case_db}.date_dim VALUES (19980101, 1998), (19980102, 1998);
 ANALYZE TABLE ${case_db}.lineorder;
 ANALYZE TABLE ${case_db}.date_dim;
 
--- Baseline (no disable): full CBO including JoinCommutativity.
--- Expected: CBO swaps to lineorder LEFT + date_dim RIGHT (BROADCAST, RIGHT OUTER).
+-- Baseline: keep query-rewrite join reorder off, but allow Cascades
+-- JoinCommutativity.
+SET disable_optimizer_rules = 'JoinReorder';
+
+-- Expected: CBO swaps to lineorder LEFT + date_dim RIGHT (BROADCAST, INNER).
 EXPLAIN VERBOSE
 SELECT lo.lo_orderkey, d.d_year
 FROM ${case_db}.date_dim d
-LEFT JOIN ${case_db}.lineorder lo ON d.d_datekey = lo.lo_datekey;
+INNER JOIN ${case_db}.lineorder lo ON d.d_datekey = lo.lo_datekey;
 
 -- Disable JoinCommutativity for the next query.
-SET disable_optimizer_rules = 'JoinCommutativity';
+SET disable_optimizer_rules = 'JoinReorder,JoinCommutativity';
 
--- Without commutativity: cannot swap, lineorder on RIGHT exceeds broadcast limit.
--- Expected: PARTITIONED join, date_dim stays LEFT, join remains LEFT OUTER.
+-- Without commutativity: cannot swap, date_dim stays LEFT and lineorder
+-- remains on the original right side.
 EXPLAIN VERBOSE
 SELECT lo.lo_orderkey, d.d_year
 FROM ${case_db}.date_dim d
-LEFT JOIN ${case_db}.lineorder lo ON d.d_datekey = lo.lo_datekey;
+INNER JOIN ${case_db}.lineorder lo ON d.d_datekey = lo.lo_datekey;
 
 -- Restore.
 SET disable_optimizer_rules = '';

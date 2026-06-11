@@ -159,6 +159,11 @@ pub(crate) fn wider_type(a: &DataType, b: &DataType) -> DataType {
                     .collect::<Vec<_>>(),
             ))
         }
+        // VARCHAR wins before DECIMAL, matching StarRocks TypeManager:
+        // getAssignmentCompatibleType handles string pairs before decimal
+        // pairs, and ARRAY/MAP/STRUCT common types recurse through this rule.
+        (DataType::Utf8, _) | (_, DataType::Utf8) => DataType::Utf8,
+        (DataType::LargeUtf8, _) | (_, DataType::LargeUtf8) => DataType::Utf8,
         // Decimal + Decimal -> wider Decimal
         (DataType::Decimal128(p1, s1), DataType::Decimal128(p2, s2)) => {
             let scale = (*s1).max(*s2);
@@ -195,17 +200,6 @@ pub(crate) fn wider_type(a: &DataType, b: &DataType) -> DataType {
         // for comparison/greatest/least/coalesce with mixed date+datetime input).
         (DataType::Timestamp(u, tz), DataType::Date32)
         | (DataType::Date32, DataType::Timestamp(u, tz)) => DataType::Timestamp(*u, tz.clone()),
-        // VARCHAR vs any other type → VARCHAR (StarRocks fallback when
-        // mixing string with numeric/temporal): every primitive cast-formats
-        // into a string, so the analyzer's `ifnull`/`coalesce`/`case`
-        // unifies a mixed pair to VARCHAR and inserts a cast on the
-        // numeric side. Must precede the numeric arms below — otherwise
-        // `wider_type(Utf8, Int64)` would silently win Int64 first and
-        // disagree with the executor's runtime widening (which produces
-        // VARCHAR), producing a `Map<I32, Int64>` slot descriptor for
-        // a batch the executor actually emits as `Map<I32, Utf8>`.
-        (DataType::Utf8, _) | (_, DataType::Utf8) => DataType::Utf8,
-        (DataType::LargeUtf8, _) | (_, DataType::LargeUtf8) => DataType::Utf8,
         (DataType::Float64, _) | (_, DataType::Float64) => DataType::Float64,
         (DataType::Float32, _) | (_, DataType::Float32) => DataType::Float64,
         (DataType::Int64, _) | (_, DataType::Int64) => DataType::Int64,
@@ -314,6 +308,28 @@ mod tests {
     fn wider_type_float32_vs_decimal_returns_float64() {
         let result = wider_type(&DataType::Float32, &DataType::Decimal128(18, 6));
         assert_eq!(result, DataType::Float64);
+    }
+
+    #[test]
+    fn wider_type_string_vs_decimal_returns_string() {
+        let result = wider_type(&DataType::Utf8, &DataType::Decimal128(26, 2));
+        assert_eq!(result, DataType::Utf8);
+    }
+
+    #[test]
+    fn wider_type_array_string_vs_decimal_returns_array_string() {
+        let left = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+        let right = DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Decimal128(26, 2),
+            true,
+        )));
+
+        let result = wider_type(&left, &right);
+        let DataType::List(item) = result else {
+            panic!("expected array type");
+        };
+        assert_eq!(item.data_type(), &DataType::Utf8);
     }
 
     #[test]

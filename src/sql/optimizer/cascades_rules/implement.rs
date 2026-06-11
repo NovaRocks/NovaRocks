@@ -13,6 +13,7 @@ use crate::sql::optimizer::memo::{GroupId, MExpr, Memo};
 use crate::sql::optimizer::operator::*;
 use crate::sql::optimizer::rewrite::rules::utils::collect_column_id_refs_strict;
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
+use crate::sql::types::wider_type;
 
 pub(super) fn get_group_column_ids(memo: &Memo, group_id: GroupId) -> HashSet<ColumnId> {
     memo.groups
@@ -127,6 +128,73 @@ fn orient_eq_pair(
         });
     }
     None
+}
+
+fn hash_join_key_type_is_supported(data_type: &DataType) -> bool {
+    !matches!(
+        data_type,
+        DataType::Null
+            | DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::FixedSizeList(_, _)
+            | DataType::Struct(_)
+            | DataType::Union(_, _)
+            | DataType::Dictionary(_, _)
+            | DataType::Map(_, _)
+            | DataType::RunEndEncoded(_, _)
+    )
+}
+
+fn hash_join_eq_condition_is_hashable(eq: &PhysicalHashJoinEqCondition) -> bool {
+    if eq.left.data_type == eq.right.data_type {
+        return hash_join_key_type_is_supported(&eq.left.data_type);
+    }
+    let common_type = wider_type(&eq.left.data_type, &eq.right.data_type);
+    hash_join_key_type_is_supported(&common_type)
+}
+
+fn coerce_hash_join_eq_condition(
+    eq: PhysicalHashJoinEqCondition,
+) -> Option<PhysicalHashJoinEqCondition> {
+    if hash_join_eq_condition_is_hashable(&eq) {
+        return Some(eq);
+    }
+    None
+}
+
+fn eq_condition_to_expr(eq: PhysicalHashJoinEqCondition) -> TypedExpr {
+    TypedExpr {
+        data_type: DataType::Boolean,
+        nullable: if eq.null_safe {
+            false
+        } else {
+            eq.left.nullable || eq.right.nullable
+        },
+        kind: ExprKind::BinaryOp {
+            left: Box::new(eq.left),
+            op: if eq.null_safe {
+                BinOp::EqForNull
+            } else {
+                BinOp::Eq
+            },
+            right: Box::new(eq.right),
+        },
+    }
+}
+
+fn append_residual_condition(other: &mut Option<TypedExpr>, residual: TypedExpr) {
+    *other = Some(match other.take() {
+        Some(existing) => TypedExpr {
+            data_type: DataType::Boolean,
+            nullable: false,
+            kind: ExprKind::BinaryOp {
+                left: Box::new(existing),
+                op: BinOp::And,
+                right: Box::new(residual),
+            },
+        },
+        None => residual,
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -509,33 +577,22 @@ impl Rule for JoinToHashJoin {
                 let b = pair.right.clone();
                 let null_safe = pair.null_safe;
                 match orient_eq_pair(pair, &left_ids, &right_ids) {
-                    Some(oriented) => eq_conds.push(oriented),
+                    Some(oriented) => {
+                        if let Some(coerced) = coerce_hash_join_eq_condition(oriented.clone()) {
+                            eq_conds.push(coerced);
+                        } else {
+                            append_residual_condition(&mut other, eq_condition_to_expr(oriented));
+                        }
+                    }
                     None => {
-                        let demoted = TypedExpr {
-                            data_type: DataType::Boolean,
-                            nullable: false,
-                            kind: ExprKind::BinaryOp {
-                                left: Box::new(a),
-                                op: if null_safe {
-                                    BinOp::EqForNull
-                                } else {
-                                    BinOp::Eq
-                                },
-                                right: Box::new(b),
-                            },
-                        };
-                        other = Some(match other {
-                            Some(existing) => TypedExpr {
-                                data_type: DataType::Boolean,
-                                nullable: false,
-                                kind: ExprKind::BinaryOp {
-                                    left: Box::new(existing),
-                                    op: BinOp::And,
-                                    right: Box::new(demoted),
-                                },
-                            },
-                            None => demoted,
-                        });
+                        append_residual_condition(
+                            &mut other,
+                            eq_condition_to_expr(PhysicalHashJoinEqCondition {
+                                left: a,
+                                right: b,
+                                null_safe,
+                            }),
+                        );
                     }
                 }
             }
@@ -594,7 +651,8 @@ impl Rule for JoinToNestLoop {
             let right_ids = get_group_column_ids(memo, expr.children[1]);
             let has_orientable_pair = eq_conds
                 .iter()
-                .any(|p| orient_eq_pair(p.clone(), &left_ids, &right_ids).is_some());
+                .filter_map(|p| orient_eq_pair(p.clone(), &left_ids, &right_ids))
+                .any(|p| coerce_hash_join_eq_condition(p).is_some());
             if has_orientable_pair {
                 // Has at least one usable equi-key — JoinToHashJoin handles this.
                 return vec![];
@@ -1017,6 +1075,7 @@ impl Rule for UnionToPhysical {
             op: Operator::PhysicalUnion(PhysicalUnionOp {
                 all: op.all,
                 output_columns: op.output_columns.clone(),
+                child_output_columns: op.child_output_columns.clone(),
             }),
             children: expr.children.clone(),
         }]
@@ -1046,6 +1105,7 @@ impl Rule for IntersectToPhysical {
         vec![NewExpr {
             op: Operator::PhysicalIntersect(PhysicalIntersectOp {
                 output_columns: op.output_columns.clone(),
+                child_output_columns: op.child_output_columns.clone(),
             }),
             children: expr.children.clone(),
         }]
@@ -1075,6 +1135,7 @@ impl Rule for ExceptToPhysical {
         vec![NewExpr {
             op: Operator::PhysicalExcept(PhysicalExceptOp {
                 output_columns: op.output_columns.clone(),
+                child_output_columns: op.child_output_columns.clone(),
             }),
             children: expr.children.clone(),
         }]
@@ -1504,27 +1565,38 @@ mod join_demotion_tests {
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::{LogicalProperties, MExpr, Memo};
-    use arrow::datatypes::DataType;
+    use arrow::datatypes::{DataType, Field};
+    use std::sync::Arc;
 
     fn test_col_id(name: &str) -> ColumnId {
         match name {
             "a_id" => ColumnId::new_for_test(10),
             "a_name" => ColumnId::new_for_test(11),
+            "a_arr" => ColumnId::new_for_test(12),
             "b_id" => ColumnId::new_for_test(20),
+            "b_arr" => ColumnId::new_for_test(21),
             _ => ColumnId::new_for_test(100),
         }
     }
 
     fn col(name: &str) -> TypedExpr {
+        col_typed(name, DataType::Int32)
+    }
+
+    fn col_typed(name: &str, data_type: DataType) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
                 column_id: test_col_id(name),
                 qualifier: None,
                 column: name.into(),
             },
-            data_type: DataType::Int32,
+            data_type,
             nullable: false,
         }
+    }
+
+    fn list_type(item_type: DataType) -> DataType {
+        DataType::List(Arc::new(Field::new("item", item_type, true)))
     }
 
     /// Create a scan group whose logical_props report the given output columns.
@@ -1706,6 +1778,130 @@ mod join_demotion_tests {
         assert!(
             phys.other_condition.is_none(),
             "<=> should not be left as a residual-only predicate"
+        );
+    }
+
+    #[test]
+    fn mixed_integer_eq_pair_keeps_raw_hash_key_for_distribution() {
+        let mut memo = Memo::new();
+        let left_group = mk_scan_group(&mut memo, &["a_id"]);
+        let right_group = mk_scan_group(&mut memo, &["b_id"]);
+
+        let condition = bin(
+            col_typed("a_id", DataType::Int64),
+            BinOp::Eq,
+            col_typed("b_id", DataType::Int32),
+        );
+        let join_mexpr = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalJoin(LogicalJoinOp {
+                join_type: JoinKind::Inner,
+                condition: Some(condition),
+            }),
+            children: vec![left_group, right_group],
+        };
+
+        let alternatives = JoinToHashJoin.apply(&join_mexpr, &mut memo);
+        assert_eq!(
+            alternatives.len(),
+            1,
+            "mixed integer equality should remain hash-joinable"
+        );
+        let Operator::PhysicalHashJoin(phys) = &alternatives[0].op else {
+            panic!("expected PhysicalHashJoin, got {:?}", alternatives[0].op);
+        };
+        assert_eq!(phys.eq_conditions.len(), 1);
+        assert_eq!(phys.eq_conditions[0].left.data_type, DataType::Int64);
+        assert_eq!(phys.eq_conditions[0].right.data_type, DataType::Int32);
+        assert!(
+            matches!(phys.eq_conditions[0].left.kind, ExprKind::ColumnRef { .. }),
+            "optimizer hash key should keep raw column refs so distribution can enforce both sides"
+        );
+        assert!(
+            matches!(phys.eq_conditions[0].right.kind, ExprKind::ColumnRef { .. }),
+            "optimizer hash key should keep raw column refs so distribution can enforce both sides"
+        );
+        assert!(
+            phys.other_condition.is_none(),
+            "compatible scalar equality should not be demoted"
+        );
+    }
+
+    #[test]
+    fn cross_type_array_pair_has_no_hash_join_alternative() {
+        let mut memo = Memo::new();
+        let left_group = mk_scan_group(&mut memo, &["a_arr"]);
+        let right_group = mk_scan_group(&mut memo, &["b_arr"]);
+        let condition = bin(
+            col_typed("a_arr", list_type(DataType::Utf8)),
+            BinOp::Eq,
+            col_typed("b_arr", list_type(DataType::Int64)),
+        );
+        let join_mexpr = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalJoin(LogicalJoinOp {
+                join_type: JoinKind::Inner,
+                condition: Some(condition),
+            }),
+            children: vec![left_group, right_group],
+        };
+
+        let hash_alternatives = JoinToHashJoin.apply(&join_mexpr, &mut memo);
+        assert!(
+            hash_alternatives.is_empty(),
+            "cross-type complex equality must not become a raw hash key"
+        );
+
+        let nested_alternatives = JoinToNestLoop.apply(&join_mexpr, &mut memo);
+        assert_eq!(
+            nested_alternatives.len(),
+            1,
+            "nested loop must remain available for complex-only equality"
+        );
+        assert!(matches!(
+            nested_alternatives[0].op,
+            Operator::PhysicalNestLoopJoin(_)
+        ));
+    }
+
+    #[test]
+    fn complex_pair_demotes_when_scalar_hash_key_remains() {
+        let mut memo = Memo::new();
+        let left_group = mk_scan_group(&mut memo, &["a_id", "a_arr"]);
+        let right_group = mk_scan_group(&mut memo, &["b_id", "b_arr"]);
+        let scalar_eq = bin(col("a_id"), BinOp::Eq, col("b_id"));
+        let complex_eq = bin(
+            col_typed("a_arr", list_type(DataType::Utf8)),
+            BinOp::Eq,
+            col_typed("b_arr", list_type(DataType::Utf8)),
+        );
+        let condition = bin(scalar_eq, BinOp::And, complex_eq);
+        let join_mexpr = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalJoin(LogicalJoinOp {
+                join_type: JoinKind::Inner,
+                condition: Some(condition),
+            }),
+            children: vec![left_group, right_group],
+        };
+
+        let alternatives = JoinToHashJoin.apply(&join_mexpr, &mut memo);
+        assert_eq!(alternatives.len(), 1);
+        let Operator::PhysicalHashJoin(phys) = &alternatives[0].op else {
+            panic!("expected PhysicalHashJoin, got {:?}", alternatives[0].op);
+        };
+        assert_eq!(
+            phys.eq_conditions.len(),
+            1,
+            "only the scalar equality should remain as a hash key"
+        );
+        match &phys.eq_conditions[0].left.kind {
+            ExprKind::ColumnRef { column, .. } => assert_eq!(column, "a_id"),
+            other => panic!("expected scalar hash key on left, got {:?}", other),
+        }
+        assert!(
+            phys.other_condition.is_some(),
+            "complex equality must survive as a residual predicate"
         );
     }
 

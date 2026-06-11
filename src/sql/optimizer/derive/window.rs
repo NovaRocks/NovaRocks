@@ -1,13 +1,17 @@
-//! Window operator. Output preserves child ordering and carries
-//! Hash(partition_cols) iff all PARTITION BY entries resolve to column refs.
+//! Window operator. Output preserves child ordering. Global window signatures
+//! (empty PARTITION BY) require Gather. Partitioned signatures may use the
+//! common subset of column-ref PARTITION BY keys shared by all window exprs;
+//! disjoint keys or non-column partition expressions fall back to Gather.
 //! Required properties include both partition distribution and the physical
 //! ordering required by the first window signature.
 
+use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::PhysicalWindowOp;
 use crate::sql::optimizer::property::{
     DistributionSpec, OrderingSpec, PhysicalPropertySet, typed_expr_to_column_id,
     window_ordering_spec,
 };
+use crate::sql::planner::plan::WindowExpr;
 
 use super::{DeriveOutput, DeriveRequired};
 
@@ -17,29 +21,10 @@ impl DeriveOutput for PhysicalWindowOp {
             .first()
             .map(|props| props.ordering.clone())
             .unwrap_or(OrderingSpec::Any);
-        let mut partition_cols = Vec::new();
-        let mut all_columns = true;
-        for we in &self.window_exprs {
-            for pbe in &we.partition_by {
-                if let Some(col) = typed_expr_to_column_id(pbe) {
-                    if !partition_cols.contains(&col) {
-                        partition_cols.push(col);
-                    }
-                } else {
-                    all_columns = false;
-                }
-            }
-        }
-        if !all_columns || partition_cols.is_empty() {
-            PhysicalPropertySet {
-                distribution: DistributionSpec::Any,
-                ordering,
-            }
-        } else {
-            PhysicalPropertySet {
-                distribution: DistributionSpec::shuffle_agg(partition_cols),
-                ordering,
-            }
+        let distribution = common_window_partition_distribution(&self.window_exprs);
+        PhysicalPropertySet {
+            distribution,
+            ordering,
         }
     }
 }
@@ -50,37 +35,53 @@ impl DeriveRequired for PhysicalWindowOp {
         _parent: &PhysicalPropertySet,
         _n: usize,
     ) -> Vec<PhysicalPropertySet> {
-        let mut partition_cols = Vec::new();
-        let mut all_partition_columns = true;
-        for we in &self.window_exprs {
-            for pbe in &we.partition_by {
-                match typed_expr_to_column_id(pbe) {
-                    Some(col) => {
-                        if !partition_cols.contains(&col) {
-                            partition_cols.push(col);
-                        }
-                    }
-                    None => all_partition_columns = false,
-                }
-            }
-        }
         let ordering = self
             .window_exprs
             .first()
             .map(|win| window_ordering_spec(&win.partition_by, &win.order_by))
             .unwrap_or(OrderingSpec::Any);
-        if partition_cols.is_empty() || !all_partition_columns {
-            vec![PhysicalPropertySet {
-                distribution: DistributionSpec::Gather,
-                ordering,
-            }]
-        } else {
-            vec![PhysicalPropertySet {
-                distribution: DistributionSpec::shuffle_agg(partition_cols),
-                ordering,
-            }]
+        let distribution = common_window_partition_distribution(&self.window_exprs);
+        vec![PhysicalPropertySet {
+            distribution,
+            ordering,
+        }]
+    }
+}
+
+fn common_window_partition_distribution(window_exprs: &[WindowExpr]) -> DistributionSpec {
+    let Some(cols) = common_window_partition_cols(window_exprs) else {
+        return DistributionSpec::Gather;
+    };
+    DistributionSpec::shuffle_agg(cols)
+}
+
+fn common_window_partition_cols(window_exprs: &[WindowExpr]) -> Option<Vec<ColumnId>> {
+    let mut common: Option<Vec<_>> = None;
+    for win in window_exprs {
+        if win.partition_by.is_empty() {
+            return None;
+        }
+        let mut current = Vec::new();
+        for expr in &win.partition_by {
+            let column = typed_expr_to_column_id(expr)?;
+            if !current.contains(&column) {
+                current.push(column);
+            }
+        }
+        if current.is_empty() {
+            return None;
+        }
+        match &mut common {
+            None => common = Some(current),
+            Some(common_cols) => {
+                common_cols.retain(|column| current.contains(column));
+                if common_cols.is_empty() {
+                    return None;
+                }
+            }
         }
     }
+    common
 }
 
 #[cfg(test)]
@@ -90,6 +91,33 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::property::{HashSource, OrderingSpec};
     use crate::sql::planner::plan::WindowExpr;
+
+    fn test_col(column_id: ColumnId, name: &str) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id,
+                qualifier: None,
+                column: name.into(),
+            },
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+        }
+    }
+
+    fn test_window(output_name: &str, partition_by: Vec<TypedExpr>) -> WindowExpr {
+        WindowExpr {
+            name: "cume_dist".into(),
+            args: vec![],
+            partition_by,
+            order_by: vec![],
+            window_frame: None,
+            ignore_nulls: false,
+            distinct: false,
+            output_name: output_name.into(),
+            output_column_id: ColumnId::UNSET,
+            result_type: arrow::datatypes::DataType::Float64,
+        }
+    }
 
     #[test]
     fn output_properties_window_propagates_partition_distribution() {
@@ -129,7 +157,7 @@ mod tests {
     }
 
     #[test]
-    fn output_properties_window_without_partition_by_is_any() {
+    fn output_properties_window_without_partition_by_is_gather() {
         let window_expr = WindowExpr {
             name: "row_number".into(),
             args: vec![],
@@ -147,7 +175,154 @@ mod tests {
             output_columns: vec![],
         };
         let props = op.derive_output(&[]);
-        assert_eq!(props.distribution, DistributionSpec::Any);
+        assert_eq!(props.distribution, DistributionSpec::Gather);
+    }
+
+    #[test]
+    fn required_properties_disjoint_partition_windows_gather() {
+        let op = PhysicalWindowOp {
+            window_exprs: vec![
+                test_window("by_a", vec![test_col(ColumnId(1), "a")]),
+                test_window("by_b", vec![test_col(ColumnId(2), "b")]),
+            ],
+            output_columns: vec![],
+        };
+
+        let reqs = op.derive_required(&PhysicalPropertySet::any(), 1);
+
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].distribution, DistributionSpec::Gather);
+    }
+
+    #[test]
+    fn output_properties_disjoint_partition_windows_gather() {
+        let op = PhysicalWindowOp {
+            window_exprs: vec![
+                test_window("by_a", vec![test_col(ColumnId(1), "a")]),
+                test_window("by_b", vec![test_col(ColumnId(2), "b")]),
+            ],
+            output_columns: vec![],
+        };
+
+        let props = op.derive_output(&[]);
+
+        assert_eq!(props.distribution, DistributionSpec::Gather);
+    }
+
+    #[test]
+    fn required_properties_nested_partition_windows_use_common_subset() {
+        let op = PhysicalWindowOp {
+            window_exprs: vec![
+                test_window("by_a", vec![test_col(ColumnId(1), "a")]),
+                test_window(
+                    "by_a_b",
+                    vec![test_col(ColumnId(1), "a"), test_col(ColumnId(2), "b")],
+                ),
+            ],
+            output_columns: vec![],
+        };
+
+        let reqs = op.derive_required(&PhysicalPropertySet::any(), 1);
+
+        assert_eq!(reqs.len(), 1);
+        match &reqs[0].distribution {
+            DistributionSpec::HashPartitioned { cols, source } => {
+                assert_eq!(*source, HashSource::ShuffleAgg);
+                assert_eq!(cols.as_slice(), &[ColumnId(1)]);
+            }
+            other => panic!("expected ShuffleAgg([a]), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn required_properties_mixed_partition_and_global_window_gathers() {
+        let partition = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId(2),
+                qualifier: None,
+                column: "k".into(),
+            },
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+        };
+        let partitioned = WindowExpr {
+            name: "cume_dist".into(),
+            args: vec![],
+            partition_by: vec![partition],
+            order_by: vec![],
+            window_frame: None,
+            ignore_nulls: false,
+            distinct: false,
+            output_name: "partitioned".into(),
+            output_column_id: ColumnId::UNSET,
+            result_type: arrow::datatypes::DataType::Float64,
+        };
+        let global = WindowExpr {
+            name: "percent_rank".into(),
+            args: vec![],
+            partition_by: vec![],
+            order_by: vec![],
+            window_frame: None,
+            ignore_nulls: false,
+            distinct: false,
+            output_name: "global".into(),
+            output_column_id: ColumnId::UNSET,
+            result_type: arrow::datatypes::DataType::Float64,
+        };
+        let op = PhysicalWindowOp {
+            window_exprs: vec![partitioned, global],
+            output_columns: vec![],
+        };
+
+        let reqs = op.derive_required(&PhysicalPropertySet::any(), 1);
+
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].distribution, DistributionSpec::Gather);
+    }
+
+    #[test]
+    fn output_properties_mixed_partition_and_global_window_gathers() {
+        let partition = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId(2),
+                qualifier: None,
+                column: "k".into(),
+            },
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+        };
+        let partitioned = WindowExpr {
+            name: "cume_dist".into(),
+            args: vec![],
+            partition_by: vec![partition],
+            order_by: vec![],
+            window_frame: None,
+            ignore_nulls: false,
+            distinct: false,
+            output_name: "partitioned".into(),
+            output_column_id: ColumnId::UNSET,
+            result_type: arrow::datatypes::DataType::Float64,
+        };
+        let global = WindowExpr {
+            name: "percent_rank".into(),
+            args: vec![],
+            partition_by: vec![],
+            order_by: vec![],
+            window_frame: None,
+            ignore_nulls: false,
+            distinct: false,
+            output_name: "global".into(),
+            output_column_id: ColumnId::UNSET,
+            result_type: arrow::datatypes::DataType::Float64,
+        };
+        let op = PhysicalWindowOp {
+            window_exprs: vec![partitioned, global],
+            output_columns: vec![],
+        };
+
+        let props = op.derive_output(&[]);
+
+        assert_eq!(props.distribution, DistributionSpec::Gather);
     }
 
     #[test]

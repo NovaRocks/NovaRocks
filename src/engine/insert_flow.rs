@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, new_null_array};
-use arrow::datatypes::{Field, Schema};
+use arrow::array::{Array, ArrayRef, BinaryArray, StringArray, new_null_array};
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::connector::backend::ResolvedTable;
@@ -252,15 +252,7 @@ fn align_query_result_to_target(
                     if src.data_type() == &target_type {
                         src.clone()
                     } else {
-                        cast_with_special_rules(src, &target_type).map_err(|e| {
-                            format!(
-                                "INSERT SELECT cannot cast column `{}` from {:?} to {:?}: {}",
-                                target_column.name,
-                                src.data_type(),
-                                target_type,
-                                e
-                            )
-                        })?
+                        cast_insert_select_source_array(src, &target_type, &target_column.name)?
                     }
                 }
                 None => new_null_array(&target_type, chunk_rows),
@@ -292,6 +284,54 @@ fn align_query_result_to_target(
 
     RecordBatch::try_new(target_schema, final_columns)
         .map_err(|e| format!("build INSERT SELECT batch failed: {e}"))
+}
+
+fn cast_insert_select_source_array(
+    src: &ArrayRef,
+    target_type: &DataType,
+    target_column_name: &str,
+) -> Result<ArrayRef, String> {
+    let cast_input = remote_binary_text_cast_input(src, target_type, target_column_name)?;
+    if cast_input.data_type() == target_type {
+        return Ok(cast_input);
+    }
+    cast_with_special_rules(&cast_input, target_type).map_err(|e| {
+        format!(
+            "INSERT SELECT cannot cast column `{}` from {:?} to {:?}: {}",
+            target_column_name,
+            src.data_type(),
+            target_type,
+            e
+        )
+    })
+}
+
+fn remote_binary_text_cast_input(
+    src: &ArrayRef,
+    target_type: &DataType,
+    target_column_name: &str,
+) -> Result<ArrayRef, String> {
+    if matches!(target_type, DataType::Binary | DataType::LargeBinary) {
+        return Ok(Arc::clone(src));
+    }
+    let Some(binary) = src.as_any().downcast_ref::<BinaryArray>() else {
+        return Ok(Arc::clone(src));
+    };
+
+    let mut values = Vec::with_capacity(binary.len());
+    for row in 0..binary.len() {
+        if binary.is_null(row) {
+            values.push(None);
+            continue;
+        }
+        let text = std::str::from_utf8(binary.value(row)).map_err(|e| {
+            format!(
+                "INSERT SELECT column `{target_column_name}` contains non-UTF8 remote text: {e}"
+            )
+        })?;
+        values.push(Some(text.to_string()));
+    }
+    Ok(Arc::new(StringArray::from(values)) as ArrayRef)
 }
 
 fn build_target_column_mapping(
@@ -338,4 +378,65 @@ fn build_target_column_mapping(
         ));
     }
     Ok(mapping)
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow::array::{Array, ArrayRef, BinaryArray, Int64Array};
+    use arrow::datatypes::DataType;
+
+    use super::*;
+    use crate::common::ids::SlotId;
+    use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
+    use crate::runtime::query_result::QueryResultColumn;
+
+    #[test]
+    fn insert_select_align_casts_remote_binary_text_to_target_int64() {
+        let source_field = Field::new("col_0", DataType::Binary, true);
+        let source_array =
+            Arc::new(BinaryArray::from(vec![Some(b"42".as_slice()), None])) as ArrayRef;
+        let source_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![source_field.clone()])),
+            vec![source_array],
+        )
+        .expect("source batch");
+        let source_schema = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                SlotId(0),
+                source_field,
+                None,
+                None,
+            )])
+            .expect("source chunk schema"),
+        );
+        let source_chunk =
+            Chunk::try_new_with_chunk_schema(source_batch, source_schema).expect("source chunk");
+        let result = QueryResult {
+            columns: vec![QueryResultColumn {
+                name: "idx".to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+                logical_type: None,
+            }],
+            chunks: vec![source_chunk],
+        };
+        let target_columns = vec![ColumnDef {
+            name: "idx".to_string(),
+            data_type: DataType::Int64,
+            nullable: true,
+            write_default: None,
+            logical_type: None,
+        }];
+
+        let batch = align_query_result_to_target(&result, &[], &target_columns).unwrap();
+
+        assert_eq!(batch.column(0).data_type(), &DataType::Int64);
+        let values = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 output");
+        assert_eq!(values.value(0), 42);
+        assert!(values.is_null(1));
+    }
 }

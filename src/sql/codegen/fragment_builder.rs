@@ -36,8 +36,8 @@ use crate::sql::codegen::nodes;
 use crate::sql::codegen::resolve::{ColumnBinding, ExprScope, ResolvedTable};
 use crate::sql::codegen::type_infer;
 use crate::sql::codegen::{
-    DirectExecPlan, FragmentBuildResult, FragmentEdge, FragmentEdgeKind, MultiFragmentBuildResult,
-    OutputColumn,
+    DirectExecPlan, FragmentBuildResult, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
+    MultiFragmentBuildResult, OutputColumn,
 };
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::Operator;
@@ -783,6 +783,8 @@ impl<'a> PlanFragmentBuilder<'a> {
             builder.mv_refresh_ctx,
         )?;
 
+        let output_exprs =
+            builder.result_output_exprs_for_columns(&result.scope, &plan.output_columns)?;
         let output_columns = plan
             .output_columns
             .iter()
@@ -806,7 +808,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             desc_tbl: desc_tbl.clone(),
             exec_params: exec_params.clone(),
             output_sink: build_result_sink(),
-            output_exprs: None,
+            output_exprs,
             output_columns,
             direct_exec: None,
             cte_id: None,
@@ -3095,6 +3097,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             target_fragment_id: parent_fragment_id,
             target_exchange_node_id: exchange_node_id,
             output_partition,
+            stream_kind: FragmentStreamKind::Gather,
             edge_kind: FragmentEdgeKind::Stream,
         });
 
@@ -3218,6 +3221,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             target_fragment_id: parent_fragment_id,
             target_exchange_node_id: exchange_node_id,
             output_partition,
+            stream_kind: FragmentStreamKind::Gather,
             edge_kind: FragmentEdgeKind::Stream,
         });
 
@@ -3453,7 +3457,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         plan_node.limit = -1;
         let mut row_tuples = child.tuple_ids.clone();
         row_tuples.push(output_tuple_id);
-        plan_node.row_tuples = row_tuples;
+        plan_node.row_tuples = row_tuples.clone();
         plan_node.nullable_tuples = vec![];
         plan_node.analytic_node = Some(analytic_tnode);
 
@@ -3464,7 +3468,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         Ok(VisitResult {
             plan_nodes,
             scope: output_scope,
-            tuple_ids: child.tuple_ids,
+            tuple_ids: row_tuples,
             cte_exchange_nodes: child.cte_exchange_nodes,
             ordering: child.ordering,
         })
@@ -4453,6 +4457,48 @@ impl<'a> PlanFragmentBuilder<'a> {
         }
     }
 
+    fn stream_kind_for_distribution(
+        spec: &crate::sql::optimizer::property::DistributionSpec,
+    ) -> FragmentStreamKind {
+        match spec {
+            crate::sql::optimizer::property::DistributionSpec::Gather => FragmentStreamKind::Gather,
+            crate::sql::optimizer::property::DistributionSpec::Broadcast => {
+                FragmentStreamKind::Broadcast
+            }
+            crate::sql::optimizer::property::DistributionSpec::HashPartitioned { .. } => {
+                FragmentStreamKind::Partitioned
+            }
+            crate::sql::optimizer::property::DistributionSpec::Any => FragmentStreamKind::Other,
+        }
+    }
+
+    fn result_output_exprs_for_columns(
+        &self,
+        scope: &ExprScope,
+        output_columns: &[crate::sql::analysis::OutputColumn],
+    ) -> Result<Option<Vec<exprs::TExpr>>, String> {
+        if output_columns.is_empty() {
+            return Ok(None);
+        }
+
+        let mut exprs = Vec::with_capacity(output_columns.len());
+        for column in output_columns {
+            let binding = scope.resolve_by_id(column.column_id).ok_or_else(|| {
+                format!(
+                    "result sink cannot resolve output column `{}` id={}",
+                    column.name, column.column_id.0
+                )
+            })?;
+            let type_desc = expr_compiler::binding_type_desc(binding)?;
+            exprs.push(expr_compiler::build_slot_ref_texpr(
+                binding.slot_id,
+                binding.tuple_id,
+                type_desc,
+            ));
+        }
+        Ok(Some(exprs))
+    }
+
     fn visit_distribution(
         &mut self,
         op: &PhysicalDistributionOp,
@@ -4522,6 +4568,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             target_fragment_id: parent_fragment_id,
             target_exchange_node_id: exchange_node_id,
             output_partition,
+            stream_kind: Self::stream_kind_for_distribution(&op.spec),
             edge_kind: FragmentEdgeKind::Stream,
         });
 
@@ -4543,19 +4590,57 @@ impl<'a> PlanFragmentBuilder<'a> {
         op: &PhysicalUnionOp,
         node: &PhysicalPlanNode,
     ) -> Result<VisitResult, String> {
-        let result = self.visit_set_op_common(
-            node,
-            &op.output_columns,
-            plan_nodes::TPlanNodeType::UNION_NODE,
-            |plan_node, tnode| {
-                plan_node.union_node = Some(tnode);
-            },
-        )?;
         if op.all {
-            Ok(result)
-        } else {
-            self.emit_distinct_on_top(result, &op.output_columns)
+            return self.visit_set_op_common(
+                node,
+                &op.output_columns,
+                plan_nodes::TPlanNodeType::UNION_NODE,
+                |plan_node, tnode| {
+                    plan_node.union_node = Some(tnode);
+                },
+            );
         }
+
+        // UNION DISTINCT is implemented as UNION ALL followed by a distinct
+        // aggregate. The aggregate is emitted directly by codegen, outside the
+        // optimizer's split-aggregate/property pipeline, so gather the UNION
+        // output first to make deduplication global in cross-process clusters.
+        let output_columns = if node.output_columns.is_empty() {
+            op.output_columns.clone()
+        } else {
+            node.output_columns.clone()
+        };
+        let union_all_node = PhysicalPlanNode {
+            op: Operator::PhysicalUnion(PhysicalUnionOp {
+                all: true,
+                output_columns: op.output_columns.clone(),
+                child_output_columns: op.child_output_columns.clone(),
+            }),
+            children: node.children.clone(),
+            stats: node.stats.clone(),
+            output_columns: output_columns.clone(),
+            execution_props: node.execution_props.clone(),
+            build_runtime_filters: node.build_runtime_filters.clone(),
+            probe_runtime_filters: node.probe_runtime_filters.clone(),
+        };
+        let gathered_union = PhysicalPlanNode {
+            op: Operator::PhysicalDistribution(PhysicalDistributionOp {
+                spec: crate::sql::optimizer::property::DistributionSpec::Gather,
+            }),
+            children: vec![union_all_node],
+            stats: node.stats.clone(),
+            output_columns,
+            execution_props: node.execution_props.clone(),
+            build_runtime_filters: node.build_runtime_filters.clone(),
+            probe_runtime_filters: node.probe_runtime_filters.clone(),
+        };
+        let result = self.visit_distribution(
+            &PhysicalDistributionOp {
+                spec: crate::sql::optimizer::property::DistributionSpec::Gather,
+            },
+            &gathered_union,
+        )?;
+        self.emit_distinct_on_top(result, &op.output_columns)
     }
 
     fn visit_intersect(
@@ -4967,6 +5052,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             target_fragment_id,
             target_exchange_node_id: exchange_node_id,
             output_partition: unpartitioned_stream_partition(),
+            stream_kind: FragmentStreamKind::Broadcast,
             edge_kind: FragmentEdgeKind::CteMulticast { cte_id: op.cte_id },
         });
 
@@ -7184,6 +7270,10 @@ mod tests {
             build.edges[0].edge_kind,
             crate::sql::codegen::FragmentEdgeKind::Stream
         ));
+        assert_eq!(
+            build.edges[0].stream_kind,
+            crate::sql::codegen::FragmentStreamKind::Gather
+        );
 
         let root = build
             .fragment_results
@@ -7222,6 +7312,10 @@ mod tests {
             build.edges[0].edge_kind,
             crate::sql::codegen::FragmentEdgeKind::Stream
         ));
+        assert_eq!(
+            build.edges[0].stream_kind,
+            crate::sql::codegen::FragmentStreamKind::Broadcast
+        );
         assert_eq!(
             build.edges[0].output_partition.type_,
             crate::partitions::TPartitionType::UNPARTITIONED
@@ -7523,6 +7617,113 @@ mod tests {
     }
 
     #[test]
+    fn distribution_over_single_group_window_preserves_window_output_tuple() {
+        let input_col = output_col_for_test(1, "k1", DataType::Int64, true);
+        let window_col = output_col_for_test(2, "idx", DataType::Int64, false);
+        let window_expr = WindowExpr {
+            name: "row_number".to_string(),
+            args: vec![],
+            distinct: false,
+            partition_by: vec![],
+            order_by: vec![],
+            window_frame: None,
+            result_type: DataType::Int64,
+            output_name: "idx".to_string(),
+            output_column_id: window_col.column_id,
+            ignore_nulls: false,
+        };
+        let window_output_columns = vec![input_col.clone(), window_col.clone()];
+        let window_plan = physical_node_for_test(
+            Operator::PhysicalWindow(PhysicalWindowOp {
+                window_exprs: vec![window_expr],
+                output_columns: window_output_columns.clone(),
+            }),
+            vec![values_plan_for_test(vec![input_col])],
+            window_output_columns.clone(),
+        );
+        let distribution_plan = physical_node_for_test(
+            Operator::PhysicalDistribution(PhysicalDistributionOp {
+                spec: DistributionSpec::Gather,
+            }),
+            vec![window_plan],
+            window_output_columns,
+        );
+
+        let connectors = crate::connector::ConnectorRegistry::new();
+        let mut builder = builder_for_scope_test(&connectors);
+        let result = builder
+            .visit(&distribution_plan)
+            .expect("distribution over single window should build");
+
+        assert_eq!(
+            result.tuple_ids.len(),
+            2,
+            "exchange layout must include both child and analytic output tuples"
+        );
+        assert_eq!(builder.completed_fragments.len(), 1);
+        let analytic = builder.completed_fragments[0]
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.node_type == plan_nodes::TPlanNodeType::ANALYTIC_EVAL_NODE)
+            .expect("child fragment should contain analytic node");
+        assert_eq!(
+            result.plan_nodes[0].row_tuples, analytic.row_tuples,
+            "parent exchange row_tuples must match the child analytic output layout"
+        );
+    }
+
+    #[test]
+    fn result_sink_projects_declared_window_output_columns() {
+        let input_col = output_col_for_test(1, "k1", DataType::Int64, true);
+        let window_col = output_col_for_test(2, "idx", DataType::Int64, false);
+        let window_expr = WindowExpr {
+            name: "row_number".to_string(),
+            args: vec![],
+            distinct: false,
+            partition_by: vec![],
+            order_by: vec![],
+            window_frame: None,
+            result_type: DataType::Int64,
+            output_name: "idx".to_string(),
+            output_column_id: window_col.column_id,
+            ignore_nulls: false,
+        };
+        let window_plan = physical_node_for_test(
+            Operator::PhysicalWindow(PhysicalWindowOp {
+                window_exprs: vec![window_expr],
+                output_columns: vec![input_col.clone(), window_col.clone()],
+            }),
+            vec![values_plan_for_test(vec![input_col])],
+            vec![window_col],
+        );
+
+        let build = PlanFragmentBuilder::build(
+            &window_plan,
+            &DummyCatalog,
+            &mock_iceberg_registry(),
+            "default",
+        )
+        .expect("window build");
+        let root = build
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == build.root_fragment_id)
+            .expect("root fragment");
+        let output_exprs = root
+            .output_exprs
+            .as_ref()
+            .expect("result sink must project logical output columns");
+
+        assert_eq!(output_exprs.len(), 1);
+        assert_eq!(output_exprs[0].nodes.len(), 1);
+        assert_eq!(
+            output_exprs[0].nodes[0].node_type,
+            exprs::TExprNodeType::SLOT_REF
+        );
+    }
+
+    #[test]
     fn build_nested_gather_distribution_targets_immediate_parent_fragment() {
         // Wrap the nested gathers inside a Sort so the root is NOT a Gather
         // (root-level Gather is elided).
@@ -7613,6 +7814,10 @@ mod tests {
             PlanFragmentBuilder::build(&plan, &DummyCatalog, &mock_iceberg_registry(), "default")
                 .expect("build");
         let edge = build.edges.first().expect("stream edge");
+        assert_eq!(
+            edge.stream_kind,
+            crate::sql::codegen::FragmentStreamKind::Partitioned
+        );
         assert_eq!(
             edge.output_partition.type_,
             crate::partitions::TPartitionType::HASH_PARTITIONED
@@ -7831,18 +8036,80 @@ mod tests {
         );
 
         let union_output = output_col_for_test(9311, "u", DataType::Int32, true);
+        let union_left = output_col_for_test(9312, "u", DataType::Int32, true);
+        let union_right = output_col_for_test(9313, "u", DataType::Int32, true);
         let union = physical_node_for_test(
             Operator::PhysicalUnion(PhysicalUnionOp {
                 all: true,
                 output_columns: vec![union_output.clone()],
+                child_output_columns: vec![vec![union_left.clone()], vec![union_right.clone()]],
             }),
             vec![
-                values_plan_for_test(vec![output_col_for_test(9312, "u", DataType::Int32, true)]),
-                values_plan_for_test(vec![output_col_for_test(9313, "u", DataType::Int32, true)]),
+                values_plan_for_test(vec![union_left]),
+                values_plan_for_test(vec![union_right]),
             ],
             vec![union_output.clone()],
         );
         assert_scope_has_ids(&visit_scope_for_test(&union), &[union_output.column_id]);
+    }
+
+    #[test]
+    fn union_distinct_gathers_before_codegen_distinct_aggregate() {
+        let union_output = output_col_for_test(9351, "u", DataType::Int32, true);
+        let union_left = output_col_for_test(9352, "u", DataType::Int32, true);
+        let union_right = output_col_for_test(9353, "u", DataType::Int32, true);
+        let plan = physical_node_for_test(
+            Operator::PhysicalUnion(PhysicalUnionOp {
+                all: false,
+                output_columns: vec![union_output.clone()],
+                child_output_columns: vec![vec![union_left.clone()], vec![union_right.clone()]],
+            }),
+            vec![
+                values_plan_for_test(vec![union_left]),
+                values_plan_for_test(vec![union_right]),
+            ],
+            vec![union_output],
+        );
+
+        let build = PlanFragmentBuilder::build(
+            &plan,
+            &DummyCatalog,
+            &crate::connector::ConnectorRegistry::new(),
+            "default",
+        )
+        .expect("build");
+
+        assert_eq!(
+            build.edges.len(),
+            1,
+            "UNION DISTINCT must gather branch output before global dedup"
+        );
+        assert!(matches!(
+            build.edges[0].edge_kind,
+            crate::sql::codegen::FragmentEdgeKind::Stream
+        ));
+        assert_eq!(
+            build.edges[0].output_partition.type_,
+            partitions::TPartitionType::UNPARTITIONED
+        );
+
+        let root = build
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == build.root_fragment_id)
+            .expect("root fragment");
+        assert!(
+            root.plan
+                .nodes
+                .iter()
+                .any(|node| node.node_type == plan_nodes::TPlanNodeType::EXCHANGE_NODE)
+        );
+        assert!(
+            root.plan
+                .nodes
+                .iter()
+                .any(|node| node.node_type == plan_nodes::TPlanNodeType::AGGREGATION_NODE)
+        );
     }
 
     #[test]

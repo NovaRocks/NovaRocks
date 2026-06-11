@@ -528,6 +528,9 @@ fn materialize_aggregate_result_batch(
     layout: &AggregateMvLayout,
 ) -> Result<Chunk, String> {
     let visible_outputs = layout.visible_output_order();
+    let reordered_batch =
+        reorder_state_shaped_input_batch_by_name(batch, layout, &visible_outputs)?;
+    let batch = reordered_batch.as_ref().unwrap_or(batch);
     validate_state_shaped_input_schema(batch, layout, &visible_outputs)?;
     let (group_key_batch_cols, state_col_batch_cols) =
         compute_batch_col_indexes(&visible_outputs, layout);
@@ -613,6 +616,134 @@ fn materialize_aggregate_result_batch(
     record_batch_to_chunk(physical_batch)
 }
 
+fn reorder_state_shaped_input_batch_by_name(
+    batch: &RecordBatch,
+    layout: &AggregateMvLayout,
+    visible_outputs: &[VisibleAggregateOutput],
+) -> Result<Option<RecordBatch>, String> {
+    let expected = state_shaped_input_fields(layout, visible_outputs)?;
+    if batch.num_columns() != expected.len() {
+        return Ok(None);
+    }
+    let Some(permutation) =
+        state_shaped_input_recovery_permutation(batch, &expected, visible_outputs)
+    else {
+        return Ok(None);
+    };
+    let identity = permutation
+        .iter()
+        .enumerate()
+        .all(|(index, old_index)| index == *old_index);
+    let names_already_canonical = expected
+        .iter()
+        .enumerate()
+        .all(|(index, expected_field)| batch.schema().field(index).name() == expected_field.name());
+    if identity && names_already_canonical {
+        return Ok(None);
+    }
+
+    let schema = batch.schema();
+    let fields = permutation
+        .iter()
+        .zip(expected.iter())
+        .map(|(old_index, expected_field)| {
+            Arc::new(
+                schema
+                    .field(*old_index)
+                    .clone()
+                    .with_name(expected_field.name().clone()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let columns = permutation
+        .iter()
+        .map(|old_index| batch.column(*old_index).clone())
+        .collect::<Vec<_>>();
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map(Some)
+        .map_err(|e| format!("reorder aggregate MV state-shaped input batch failed: {e}"))
+}
+
+fn state_shaped_input_recovery_permutation(
+    batch: &RecordBatch,
+    expected: &[Field],
+    visible_outputs: &[VisibleAggregateOutput],
+) -> Option<Vec<usize>> {
+    let schema = batch.schema();
+    let mut used = vec![false; batch.num_columns()];
+    let mut permutation = vec![None; expected.len()];
+
+    for (expected_index, expected_field) in expected.iter().enumerate() {
+        let candidates = (0..batch.num_columns())
+            .filter(|index| {
+                !used[*index]
+                    && schema
+                        .field(*index)
+                        .name()
+                        .eq_ignore_ascii_case(expected_field.name())
+                    && state_shaped_field_matches(
+                        expected_index,
+                        schema.field(*index),
+                        expected_field,
+                        visible_outputs,
+                    )
+            })
+            .collect::<Vec<_>>();
+        if candidates.len() > 1 {
+            return None;
+        }
+        let Some(index) = candidates.first().copied() else {
+            continue;
+        };
+        used[index] = true;
+        permutation[expected_index] = Some(index);
+    }
+
+    loop {
+        let mut progressed = false;
+        for (expected_index, expected_field) in expected.iter().enumerate() {
+            if permutation[expected_index].is_some() {
+                continue;
+            }
+            let candidates = (0..batch.num_columns())
+                .filter(|index| {
+                    !used[*index]
+                        && state_shaped_field_matches(
+                            expected_index,
+                            schema.field(*index),
+                            expected_field,
+                            visible_outputs,
+                        )
+                })
+                .collect::<Vec<_>>();
+            match candidates.as_slice() {
+                [index] => {
+                    used[*index] = true;
+                    permutation[expected_index] = Some(*index);
+                    progressed = true;
+                }
+                [] => return None,
+                _ => {}
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+
+    permutation.into_iter().collect()
+}
+
+fn state_shaped_field_matches(
+    index: usize,
+    actual: &Field,
+    expected: &Field,
+    visible_outputs: &[VisibleAggregateOutput],
+) -> bool {
+    state_shaped_data_type_matches(index, actual, expected, visible_outputs)
+        && state_shaped_nullable_matches(index, actual, expected, visible_outputs)
+}
+
 fn validate_state_shaped_input_schema(
     batch: &RecordBatch,
     layout: &AggregateMvLayout,
@@ -632,17 +763,33 @@ fn validate_state_shaped_input_schema(
             || !state_shaped_nullable_matches(index, actual_field, expected_field, visible_outputs)
         {
             return Err(format!(
-                "aggregate MV state-shaped input schema mismatch at column {index}: got {}:{:?}:{} expected {}:{:?}:{}",
+                "aggregate MV state-shaped input schema mismatch at column {index}: got {}:{:?}:{} expected {}:{:?}:{}; actual=[{}] expected=[{}]",
                 actual_field.name(),
                 actual_field.data_type(),
                 actual_field.is_nullable(),
                 expected_field.name(),
                 expected_field.data_type(),
-                expected_field.is_nullable()
+                expected_field.is_nullable(),
+                format_fields(actual.fields().iter().map(|field| field.as_ref())),
+                format_fields(expected.iter()),
             ));
         }
     }
     Ok(())
+}
+
+fn format_fields<'a>(fields: impl Iterator<Item = &'a Field>) -> String {
+    fields
+        .map(|field| {
+            format!(
+                "{}:{:?}:{}",
+                field.name(),
+                field.data_type(),
+                field.is_nullable()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn state_shaped_data_type_matches(
@@ -2991,7 +3138,7 @@ mod tests {
     }
 
     #[test]
-    fn materialize_aggregate_result_rejects_state_shaped_order_mismatch() {
+    fn materialize_aggregate_result_reorders_state_shaped_named_columns() {
         let shape = sum_only_shape();
         let output_columns = vec![
             OutputColumn {
@@ -3024,12 +3171,30 @@ mod tests {
         )
         .expect("state-shaped batch");
 
-        let err = materialize_aggregate_result_batch(&batch, &layout)
-            .expect_err("state-shaped order mismatch must fail");
-        assert!(
-            err.contains("aggregate MV state-shaped input schema mismatch"),
-            "{err}"
+        let chunk = materialize_aggregate_result_batch(&batch, &layout).expect("materialize");
+        let output_schema = chunk.batch.schema();
+        let names = output_schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                ROW_ID_COLUMN,
+                "k1",
+                "s",
+                "__agg_state_s",
+                AGG_RETRACTION_COUNT_STATE_COLUMN
+            ]
         );
+        let visible_sum = chunk
+            .batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("visible sum");
+        assert_eq!(visible_sum.value(0), 10);
     }
 
     // ---- End-to-end AVG merge test ----

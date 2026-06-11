@@ -2,21 +2,24 @@ Explain String
 SORT BY [l.k ASC NULLS FIRST] stats={rows=2}
   GATHER EXCHANGE stats={rows=2}
     PROJECT [l.k AS k, sum(r.v) AS total_v] stats={rows=2}
-      HASH AGGREGATE (SINGLE, group by: [l.k]) stats={rows=2}
+      HASH AGGREGATE (GLOBAL, group by: [l.k]) stats={rows=2}
         aggregations: sum(r.v)
-        HASH JOIN (BROADCAST, INNER, eq: [l.k = r.k]) stats={rows=3}
-          build runtime filters:
-          - filter_id = 0, build_expr = (r.k)
-          SCAN db_sqlt_755a76a7ba2800ac.oq8_reuse_l (alias=l) stats={rows=3}
-               TABLE: db_sqlt_755a76a7ba2800ac.oq8_reuse_l
-               columns: k
-               min-max stats
-               predicates: l.k IS NOT NULL
-              probe runtime filters:
-              - filter_id = 0, probe_expr = (l.k)
-          BROADCAST EXCHANGE stats={rows=3}
-            SCAN db_sqlt_755a76a7ba2800ac.oq8_reuse_r (alias=r) stats={rows=3}
-                 TABLE: db_sqlt_755a76a7ba2800ac.oq8_reuse_r
-                 columns: k, v
-                 min-max stats
-                 predicates: r.k IS NOT NULL
+        HASH EXCHANGE (source: ShuffleAgg, hash: [c1]) stats={rows=2}
+          HASH AGGREGATE (LOCAL, group by: [l.k]) stats={rows=2}
+            aggregations: sum(r.v)
+            HASH JOIN (BROADCAST, INNER, eq: [l.k = r.k]) stats={rows=3}
+              build runtime filters:
+              - filter_id = 0, build_expr = (r.k)
+              SCAN db_sqlt_755a76a7ba2800ac.oq8_reuse_l (alias=l) stats={rows=3}
+                   TABLE: db_sqlt_755a76a7ba2800ac.oq8_reuse_l
+                   columns: k
+                   min-max stats
+                   predicates: l.k IS NOT NULL
+                  probe runtime filters:
+                  - filter_id = 0, probe_expr = (l.k)
+              BROADCAST EXCHANGE stats={rows=3}
+                SCAN db_sqlt_755a76a7ba2800ac.oq8_reuse_r (alias=r) stats={rows=3}
+                     TABLE: db_sqlt_755a76a7ba2800ac.oq8_reuse_r
+                     columns: k, v
+                     min-max stats
+                     predicates: r.k IS NOT NULL
