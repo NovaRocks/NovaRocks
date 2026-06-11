@@ -341,6 +341,8 @@ pub struct ServerConfig {
     pub brpc_port: u16,
     #[serde(default = "default_http_port")]
     pub http_port: u16,
+    #[serde(default = "default_grpc_port")]
+    pub grpc_port: u16,
     #[serde(default = "default_starlet_port")]
     pub starlet_port: u16,
 }
@@ -360,6 +362,9 @@ fn default_brpc_port() -> u16 {
 fn default_http_port() -> u16 {
     8040
 }
+fn default_grpc_port() -> u16 {
+    9080
+}
 fn default_starlet_port() -> u16 {
     9070
 }
@@ -373,6 +378,7 @@ impl Default for ServerConfig {
             be_port: default_be_port(),
             brpc_port: default_brpc_port(),
             http_port: default_http_port(),
+            grpc_port: default_grpc_port(),
             starlet_port: default_starlet_port(),
         }
     }
@@ -1508,6 +1514,30 @@ starlet_port = 19070
         )
         .expect("parse config");
         assert_eq!(cfg.server.starlet_port, 19070);
+    }
+
+    #[test]
+    fn test_server_grpc_port_default_is_9080() {
+        let cfg: NovaRocksConfig = toml::from_str(
+            r#"
+[server]
+http_port = 8040
+"#,
+        )
+        .expect("parse config");
+        assert_eq!(cfg.server.grpc_port, 9080);
+    }
+
+    #[test]
+    fn test_server_grpc_port_can_be_overridden() {
+        let cfg: NovaRocksConfig = toml::from_str(
+            r#"
+[server]
+grpc_port = 19080
+"#,
+        )
+        .expect("parse config");
+        assert_eq!(cfg.server.grpc_port, 19080);
     }
 
     #[test]

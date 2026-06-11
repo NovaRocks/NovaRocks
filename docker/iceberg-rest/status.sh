@@ -73,6 +73,7 @@ echo "  REST catalog SQL: ${NOVAROCKS_ICE_REST_CATALOG_SQL:-$runtime_dir/ice-res
 echo "  REST warehouse: ${NOVAROCKS_ICEBERG_REST_WAREHOUSE:-unknown}"
 echo "  REST URI: ${NOVAROCKS_ICEBERG_REST_URI:-unknown}"
 echo "  NovaRocks MySQL port: ${NOVA_ENV_MYSQL_PORT:-unknown}"
+echo "  NovaRocks gRPC port: ${NOVA_ENV_GRPC_PORT:-unknown}"
 echo "  Spark defaults: ${NOVAROCKS_SPARK_DEFAULTS:-$runtime_dir/spark-defaults.conf}"
 echo "  Spark v3 smoke SQL: ${NOVAROCKS_SPARK_V3_SMOKE_SQL:-$runtime_dir/spark-iceberg-v3-smoke.sql}"
 echo "  Spark SQL helper: ${NOVAROCKS_SPARK_SQL:-$SCRIPT_DIR/spark-sql.sh}"

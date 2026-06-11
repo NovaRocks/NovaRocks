@@ -319,7 +319,7 @@ async fn serve_forever(
     // Start the shared NovaRocksGrpc endpoint. It handles local exchange in
     // all-in-one mode and standalone write reports in role=fe coordinator mode.
     if start_local_exchange_execution || start_coordinator_report_grpc {
-        let grpc_port = crate::common::config::http_port();
+        let grpc_port = crate::common::config::grpc_port();
         let start_result = if start_local_exchange_execution {
             crate::service::grpc_server::start_grpc_exchange_server(&grpc_bind_host, grpc_port)
         } else {

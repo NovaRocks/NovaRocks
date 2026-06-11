@@ -14,7 +14,7 @@ By default, all worktrees share one Docker Compose project
 (`nr-iceberg-rest`) on the services' conventional local ports: MinIO `9000`,
 MinIO console `9001`, Iceberg REST `8181`, and Spark UI `4040`. Each worktree
 still gets its own generated runtime entry, object-store prefixes, SQL test
-config, and allocated NovaRocks standalone-server port.
+config, and allocated NovaRocks standalone-server MySQL / gRPC ports.
 
 Defaults live in `docker/iceberg-rest/shared.env`. Edit that file, or set
 `NOVA_ENV_CONFIG_FILE=/path/to/file.env`, to override the shared compose
@@ -32,7 +32,7 @@ source docker/iceberg-rest/runtime/current/env.sh
 ```
 
 This is what Codex environment setup does. It records the shared Docker ports
-and the per-worktree NovaRocks server port, but it does not create or start
+and the per-worktree NovaRocks server ports, but it does not create or start
 containers.
 
 ## Start Docker
@@ -184,8 +184,10 @@ designed to be safe to call from CI:
   allocated NovaRocks port if `env.sh` already exists.
 - Docker service ports come from `shared.env` and default to `9000`, `9001`,
   `8181`, and `4040`.
-- The NovaRocks standalone-server port is allocated per worktree from
+- The NovaRocks standalone-server MySQL port is allocated per worktree from
   `NOVA_ENV_MYSQL_PORT_START` / `NOVA_ENV_MYSQL_PORT_RANGE`.
+- The NovaRocks standalone-server gRPC port is allocated per worktree from
+  `NOVA_ENV_GRPC_PORT_START` / `NOVA_ENV_GRPC_PORT_RANGE`.
 - `down.sh --runtime-only --purge` removes only the per-worktree runtime
   directory.
 - The runtime directory (`docker/iceberg-rest/runtime/`) is gitignored.

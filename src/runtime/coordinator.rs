@@ -597,7 +597,7 @@ fn local_coordinator_report_addr() -> Result<types::TNetworkAddress, String> {
         .map_err(|e| format!("cannot read coordinator config: {e}"))?;
     let host = crate::common::network::advertise_host().unwrap_or_else(|_| cfg.server.host.clone());
     let port =
-        crate::service::grpc_server::grpc_server_bound_port().unwrap_or(cfg.server.http_port);
+        crate::service::grpc_server::grpc_server_bound_port().unwrap_or(cfg.server.grpc_port);
     Ok(types::TNetworkAddress::new(host, port as i32))
 }
 

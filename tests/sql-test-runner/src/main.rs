@@ -2581,10 +2581,10 @@ mod tests {
         let runtime = CrossProcessRuntime {
             be: vec![BePorts {
                 http: 18080,
-                starlet: 19070,
+                grpc: 19070,
             }],
             fe_http_port: 28080,
-            fe_starlet_port: 29070,
+            fe_grpc_port: 29070,
             fe_mysql_port: 29030,
         };
         let base = r#"
@@ -2631,7 +2631,7 @@ enable_path_style_access = true
         );
 
         assert_eq!(be_value["cluster"]["role"].as_str(), Some("be"));
-        assert_eq!(be_value["server"]["starlet_port"].as_integer(), Some(19070));
+        assert_eq!(be_value["server"]["grpc_port"].as_integer(), Some(19070));
         assert!(
             be_value
                 .get("standalone_server")

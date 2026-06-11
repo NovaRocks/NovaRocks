@@ -6,17 +6,18 @@ StarRocks 兼容部署用于让 NovaRocks 作为 StarRocks FE 可识别的后端
 
 ## 工作方式
 
-兼容模式启动后，NovaRocks 会提供 StarRocks FE 期望的一组服务：
+兼容模式启动后，NovaRocks 会提供 StarRocks FE 期望的一组服务。一个兼容后端节点默认需要开放 5 个端口：
 
-| 服务 | 配置项 | 用途 |
-| --- | --- | --- |
-| HeartbeatService | `[server].heartbeat_port` | FE 通过该端口识别和管理后端。 |
-| BackendService | `[server].be_port` | StarRocks BE thrift 管理接口。 |
-| brpc gateway | `[server].brpc_port` | FE 下发查询执行请求。 |
-| HTTP service | `[server].http_port` | HTTP 管理和状态端口。 |
-| Starlet / gRPC | `[server].starlet_port` | 内部 exchange、runtime filter、lookup 等 gRPC 通信。 |
+| 服务 | 配置项 | 默认端口 | 用途 |
+| --- | --- | --- | --- |
+| HeartbeatService | `[server].heartbeat_port` | `9050` | StarRocks FE 通过该端口识别和保活后端；`ALTER SYSTEM ADD BACKEND` 使用这个端口。 |
+| BackendService | `[server].be_port` | `9060` | StarRocks BE thrift 管理接口，用于 FE 发起后端管理类 RPC。 |
+| brpc gateway | `[server].brpc_port` | `8060` | C++ brpc shim / PInternalService。FE 下发查询执行请求、BE 间 exchange chunk 传输主要使用该端口。 |
+| HTTP / NovaRocksGrpc service | `[server].http_port` | `8040` | HTTP 管理、`/metrics`、load 相关 HTTP 路由和 NovaRocksGrpc route；也作为 BE 的 HTTP 端口上报给 FE。 |
+| Starlet service | `[server].starlet_port` | `9070` | Starlet gRPC 服务端口，作为 Starlet 端口上报给 FE。 |
 
 该模式不会启动 standalone MySQL 端口；SQL 客户端应连接 StarRocks FE。
+`[server].grpc_port` 只用于 standalone / 分布式部署，不是 compat 模式的对外端口。
 
 ## 前提条件
 
@@ -85,8 +86,10 @@ lake_data_write_format = "native"
 - `host` 是服务绑定地址。
 - `priority_networks` 用于多网卡环境下选择对 FE 上报的地址。
 - `heartbeat_port` 是在 StarRocks FE 中注册 NovaRocks 后端时使用的端口。
-- `brpc_port` 是 FE 发送 fragment 执行请求的端口。
-- `starlet_port` 会作为 gRPC / Starlet 端口上报给 FE。
+- `be_port` 是 FE 管理类 thrift RPC 端口。
+- `brpc_port` 是 FE 发送 fragment 执行请求和兼容后端间 exchange 的端口。
+- `http_port` 用于 HTTP 管理、metrics 和 NovaRocksGrpc route。
+- `starlet_port` 会作为 Starlet 端口上报给 FE。
 
 ## 启动 NovaRocks
 

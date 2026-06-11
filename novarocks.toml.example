@@ -25,7 +25,9 @@ be_port = 9060
 brpc_port = 8060
 # HTTP service port. Default: 8040.
 http_port = 8040
-# Starlet gRPC service port. Default: 9070.
+# Standalone/distributed NovaRocksGrpc service port. Default: 9080.
+grpc_port = 9080
+# StarRocks-compatible Starlet gRPC service port. Default: 9070.
 starlet_port = 9070
 
 [runtime]

@@ -257,19 +257,19 @@ fn dispatch_standalone_role(
                 eprintln!("WARN: {warn}");
             }
             let host = cfg.server.host.clone();
-            let starlet_port = cfg.server.starlet_port;
-            let advertised = network::advertise_endpoint_for_config(&cfg)
+            let grpc_port = cfg.server.grpc_port;
+            let advertised = network::standalone_advertise_endpoint_for_config(&cfg)
                 .map_err(|e| anyhow::anyhow!("role=be: {e}"))?;
             let advertised_addr = advertised_probe_addr(&advertised.host, advertised.port)
                 .map_err(|e| anyhow::anyhow!("role=be: {e}"))?;
             let pid = std::process::id();
             novarocks::common::app_config::install_preloaded_config(cfg);
             // Spec (PR-4): standalone BE exposes NovaRocksGrpc
-            // (SubmitFragment/FetchResult/CancelFragment/Exchange) on starlet_port.
+            // (SubmitFragment/FetchResult/CancelFragment/Exchange) on grpc_port.
             // FE cluster.backends must point to this port.
-            novarocks::start_grpc_exchange_server(&host, starlet_port).map_err(|e| {
+            novarocks::start_grpc_exchange_server(&host, grpc_port).map_err(|e| {
                 anyhow::anyhow!(
-                    "role=be: failed to start NovaRocksGrpc server on {host}:{starlet_port}: {e}"
+                    "role=be: failed to start NovaRocksGrpc server on {host}:{grpc_port}: {e}"
                 )
             })?;
             wait_for_tcp_ready(
@@ -279,8 +279,8 @@ fn dispatch_standalone_role(
             )
             .map_err(|e| anyhow::anyhow!("role=be: failed to reach advertised endpoint: {e}"))?;
             println!(
-                "NOVAROCKS_READY role=be starlet_port={starlet_port} advertise_host={} advertise_port={} pid={pid}",
-                advertised.host, advertised.port
+                "NOVAROCKS_READY role=be grpc_port={grpc_port} advertise_host={} pid={pid}",
+                advertised.host
             );
             let (_tx, rx) = std::sync::mpsc::channel::<()>();
             rx.recv().ok();

@@ -13,7 +13,7 @@ MySQL client
   |
   v
 NovaRocks role=fe
-  |  cluster.backends = ["be-1:9070", "be-2:9070", ...]
+  |  cluster.backends = ["be-1:9080", "be-2:9080", ...]
   v
 NovaRocks role=be  +  NovaRocks role=be  +  ...
 ```
@@ -22,14 +22,15 @@ NovaRocks role=be  +  NovaRocks role=be  +  ...
 
 | 角色 | 作用 | 对外端口 |
 | --- | --- | --- |
-| `fe` | 接收 MySQL 连接，解析 SQL，优化计划，调度 fragment 到后端 | `[standalone_server].mysql_port`；同时使用 `[server].http_port` 提供 coordinator report gRPC |
-| `be` | 执行 FE 下发的 fragment，处理 exchange 和结果回传 | `[server].starlet_port` |
+| `fe` | 接收 MySQL 连接，解析 SQL，优化计划，调度 fragment 到后端 | `[standalone_server].mysql_port`；同时使用 `[server].grpc_port` 提供 coordinator report gRPC |
+| `be` | 执行 FE 下发的 fragment，处理 exchange 和结果回传 | `[server].grpc_port` |
 | `all-in-one` | 默认单进程模式，适合 standalone 单机部署 | `[standalone_server].mysql_port` |
 
 ## 前提条件
 
 - FE 节点和所有 BE 节点使用同一版本的 NovaRocks。
-- FE 节点可以访问每个 BE 的 `starlet_port`。
+- FE 节点可以访问每个 BE 的 `grpc_port`。
+- BE 节点可以访问 FE 的 `grpc_port`，用于向 coordinator 上报执行状态。
 - 所有 BE 节点都能访问相同的数据源、对象存储和 catalog。
 - 如果使用对象存储，所有节点的凭据、endpoint 和 path-style 设置应保持一致。
 
@@ -62,7 +63,7 @@ cargo build
 
 ## 配置 BE 节点
 
-每个 BE 节点需要独立配置 `server.starlet_port`。如果节点有多张网卡，建议显式配置 advertise 地址。
+BE 节点使用 `server.grpc_port` 提供 NovaRocksGrpc 服务，默认端口是 `9080`。不同机器上的 BE 可以都使用默认端口；只有多个 NovaRocks 进程部署在同一台机器并发生端口冲突时，才需要为其中的进程改成其他端口。如果节点有多张网卡，建议显式配置 `advertise_host`，端口统一使用 `server.grpc_port`。
 
 示例 `be-1.toml`：
 
@@ -71,13 +72,11 @@ log_level = "info"
 
 [server]
 host = "0.0.0.0"
-starlet_port = 9071
-http_port = 8041
+grpc_port = 9080
 
 [cluster]
 role = "be"
 advertise_host = "10.0.0.11"
-advertise_port = 9071
 
 [standalone_server.object_store]
 endpoint = "http://10.0.0.20:9000"
@@ -96,14 +95,14 @@ NO_PROXY=127.0.0.1,localhost \
 启动成功后会输出：
 
 ```text
-NOVAROCKS_READY role=be starlet_port=9071 advertise_host=10.0.0.11 advertise_port=9071 pid=<pid>
+NOVAROCKS_READY role=be grpc_port=9080 advertise_host=10.0.0.11 pid=<pid>
 ```
 
 `role=be` 不提供 MySQL 端口，`--port` 参数对 BE 无效。
 
 ## 配置 FE 节点
 
-FE 节点需要在 `[cluster].backends` 中配置所有 BE 的 advertise endpoint。该 endpoint 应指向 BE 的 `starlet_port`。
+FE 节点也会启动 `server.grpc_port`，用于接收 BE 回报执行状态。该配置默认是 `9080`，如果没有端口冲突可以不显式配置。FE 还需要在 `[cluster].backends` 中配置所有 BE 的 advertise endpoint。该 endpoint 应指向 BE 的 `grpc_port`。
 
 示例 `fe.toml`：
 
@@ -116,7 +115,7 @@ path = "meta/fe.sqlite"
 
 [server]
 host = "0.0.0.0"
-http_port = 8040
+grpc_port = 9080
 
 [standalone_server]
 mysql_port = 9030
@@ -132,8 +131,8 @@ enable_path_style_access = true
 [cluster]
 role = "fe"
 backends = [
-  "10.0.0.11:9071",
-  "10.0.0.12:9071",
+  "10.0.0.11:9080",
+  "10.0.0.12:9080",
 ]
 ```
 
@@ -181,15 +180,15 @@ SELECT 1;
 FE 角色支持通过 SQL 动态管理后端：
 
 ```sql
-ADD BACKEND '10.0.0.13:9071';
+ADD BACKEND '10.0.0.13:9080';
 SHOW BACKENDS;
-DROP BACKEND '10.0.0.13:9071';
+DROP BACKEND '10.0.0.13:9080';
 ```
 
 如果需要立即移除后端，可以使用：
 
 ```sql
-DROP BACKEND '10.0.0.13:9071' FORCE;
+DROP BACKEND '10.0.0.13:9080' FORCE;
 ```
 
 普通 `DROP BACKEND` 会让后端停止接收新查询，并等待在途 fragment 结束后移除；`FORCE` 会立即移除，可能导致在途查询失败。
@@ -216,7 +215,7 @@ DROP BACKEND '10.0.0.13:9071' FORCE;
 | 现象 | 处理方式 |
 | --- | --- |
 | `SHOW BACKENDS` 为空 | 检查 `[cluster].backends`，或使用 `ADD BACKEND 'host:port'` 注册后端。 |
-| BE 一直不 Alive | 确认 FE 节点能访问 BE 的 `starlet_port`，并检查 BE 的 `advertise_host` / `advertise_port`。 |
+| BE 一直不 Alive | 确认 FE 节点能访问 BE 的 `grpc_port`，并检查 BE 的 `advertise_host`。 |
 | 查询报 `role=fe: no live backend available` | 当前 FE 没有可调度的 live BE；先恢复或注册 BE。 |
 | BE 启动时配置校验失败 | `role=be` 不能配置 `[cluster].backends`。 |
 | all-in-one 配置校验失败 | `role=all-in-one` 不能配置 `[cluster].backends`。 |

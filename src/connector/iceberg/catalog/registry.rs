@@ -1787,8 +1787,7 @@ mod metadata_filename_tests {
         // Pre-deletion the {version}-{uuid} fallback would return Ok here.
         // NovaRocks has no historical users; the internal naming was never a
         // supported on-disk layout, so it must not be recognized.
-        let files =
-            vec!["00001-9a8b7c6d-1111-2222-3333-444455556666.metadata.json".to_string()];
+        let files = vec!["00001-9a8b7c6d-1111-2222-3333-444455556666.metadata.json".to_string()];
         assert!(choose_latest_metadata_filename(&files).is_err());
     }
 }

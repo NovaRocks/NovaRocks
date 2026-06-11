@@ -3190,7 +3190,7 @@ fn ensure_standalone_exchange_server() -> Result<u16, String> {
         return Ok(*port);
     }
 
-    let default_port = crate::common::config::http_port();
+    let default_port = crate::common::config::grpc_port();
     let started_port =
         match crate::service::grpc_server::start_grpc_exchange_server("127.0.0.1", default_port) {
             Ok(()) => crate::service::grpc_server::grpc_server_bound_port()

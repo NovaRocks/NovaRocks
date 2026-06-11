@@ -60,6 +60,9 @@ NovaRocks 按以下顺序查找配置：
 最小 standalone 配置如下：
 
 ```toml
+[server]
+grpc_port = 9080
+
 [metadata]
 provider = "sqlite"
 path = "meta/standalone.sqlite"
@@ -79,6 +82,7 @@ enable_path_style_access = true
 说明：
 
 - `mysql_port` 是客户端连接 NovaRocks 的端口。
+- `[server].grpc_port` 是 standalone 进程内部 NovaRocksGrpc 端口，用于本地多 fragment exchange、写入状态上报、metrics 和 load 相关 HTTP 路由。默认值为 `9080`。
 - `user` 当前只支持 `root`。
 - `[metadata].path` 用于保存 standalone catalog、managed-lake 和部分管理状态。
 - `warehouse_uri` 是 managed-lake 表和写入数据的默认仓库路径。
@@ -157,6 +161,7 @@ kill <pid>
 | 现象 | 处理方式 |
 | --- | --- |
 | 客户端连不上 `9030` | 确认服务已打印 `NOVAROCKS_READY`，并检查 `--port` 或 `[standalone_server].mysql_port` 是否被改过。 |
+| `9080` 端口冲突 | 修改 `[server].grpc_port`。该端口不影响 MySQL 客户端连接端口。 |
 | 对象存储访问失败 | 检查 endpoint、access key、secret、path-style 设置和 `NO_PROXY`。 |
 | 多个工作区端口冲突 | 使用不同 `mysql_port`，或通过 `docker/iceberg-rest/runtime/current/env.sh` 获取自动分配端口。 |
 | 登录失败 | 当前 standalone server 只支持 `root` 用户，默认空密码。 |

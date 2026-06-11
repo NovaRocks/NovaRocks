@@ -15,8 +15,8 @@ use std::sync::Arc;
 use sqlparser::ast as sqlast;
 
 use crate::connector::backend::ResolvedView;
-use crate::engine::iceberg_view::{resolve_iceberg_view_target_parts, IcebergViewTarget};
 use crate::engine::StandaloneState;
+use crate::engine::iceberg_view::{IcebergViewTarget, resolve_iceberg_view_target_parts};
 
 type ViewKey = (String, String, String);
 

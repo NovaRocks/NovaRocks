@@ -115,6 +115,8 @@ hash4="${hash:0:4}"
 offset=$((16#$hash4 % 1000))
 mysql_port_start="${NOVA_ENV_MYSQL_PORT_START:-9030}"
 mysql_port_range="${NOVA_ENV_MYSQL_PORT_RANGE:-200}"
+grpc_port_start="${NOVA_ENV_GRPC_PORT_START:-9080}"
+grpc_port_range="${NOVA_ENV_GRPC_PORT_RANGE:-200}"
 configured_compose_project="${NOVA_ENV_SHARED_COMPOSE_PROJECT:-nr-iceberg-rest}"
 configured_minio_port="${NOVA_ENV_MINIO_PORT:-9000}"
 configured_minio_console_port="${NOVA_ENV_MINIO_CONSOLE_PORT:-9001}"
@@ -139,6 +141,7 @@ if [[ -f "$exports_file" ]]; then
     spark_ui_port="${NOVA_ENV_SPARK_UI_PORT:-4040}"
   fi
   mysql_port="${NOVA_ENV_MYSQL_PORT}"
+  grpc_port="${NOVA_ENV_GRPC_PORT:-$(choose_port_in_range "$grpc_port_start" "$grpc_port_range" "$offset")}"
 else
   if [[ "$shared_docker" == "true" ]]; then
     minio_port="$configured_minio_port"
@@ -146,12 +149,14 @@ else
     rest_port="$configured_rest_port"
     spark_ui_port="$configured_spark_ui_port"
     mysql_port="$(choose_port_in_range "$mysql_port_start" "$mysql_port_range" "$offset")"
+    grpc_port="$(choose_port_in_range "$grpc_port_start" "$grpc_port_range" "$offset")"
   else
     minio_port="$(choose_port $((19000 + offset)))"
     minio_console_port="$(choose_port $((20000 + offset)))"
     rest_port="$(choose_port $((21000 + offset)))"
     spark_ui_port="$(choose_port $((22000 + offset)))"
     mysql_port="$(choose_port $((23000 + offset)))"
+    grpc_port="$(choose_port $((24000 + offset)))"
   fi
 fi
 shared_docker="${NOVA_ENV_SHARED_DOCKER:-$shared_docker}"
@@ -326,6 +331,7 @@ EOF
 cat > "$runtime_dir/standalone-managed-lake.toml" <<EOF
 [server]
 host = "127.0.0.1"
+grpc_port = $grpc_port
 
 [metadata]
 provider = "sqlite"
@@ -346,6 +352,7 @@ EOF
 cat > "$runtime_dir/standalone-managed-lake-scheduler.toml" <<EOF
 [server]
 host = "127.0.0.1"
+grpc_port = $grpc_port
 
 [metadata]
 provider = "sqlite"
@@ -470,6 +477,7 @@ export NOVA_ENV_MINIO_CONSOLE_PORT="$minio_console_port"
 export NOVA_ENV_REST_PORT="$rest_port"
 export NOVA_ENV_SPARK_UI_PORT="$spark_ui_port"
 export NOVA_ENV_MYSQL_PORT="$mysql_port"
+export NOVA_ENV_GRPC_PORT="$grpc_port"
 export AWS_S3_ENDPOINT="$minio_endpoint"
 export AWS_S3_ACCESS_KEY_ID="$minio_user"
 export AWS_S3_SECRET_ACCESS_KEY="$minio_password"
@@ -534,6 +542,7 @@ cat > "$manifest_file" <<EOF
   },
   "novarocks": {
     "mysql_port": $mysql_port,
+    "grpc_port": $grpc_port,
     "standalone_config": "$runtime_dir/standalone-managed-lake.toml",
     "standalone_scheduler_config": "$runtime_dir/standalone-managed-lake-scheduler.toml",
     "sql_test_config": "$runtime_dir/sql-test.conf",
@@ -566,6 +575,7 @@ Do not guess ports.
 - REST server default warehouse: \`$compose_rest_warehouse\`
 - Spark UI: \`http://127.0.0.1:$spark_ui_port\`
 - NovaRocks MySQL port: \`$mysql_port\`
+- NovaRocks gRPC port: \`$grpc_port\`
 - Manifest: \`$manifest_file\`
 - Env exports: \`$exports_file\`
 - Standalone config: \`$runtime_dir/standalone-managed-lake.toml\`

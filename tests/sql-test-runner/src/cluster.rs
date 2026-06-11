@@ -26,14 +26,14 @@ pub(crate) enum ClusterProcessRole {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BePorts {
     pub(crate) http: u16,
-    pub(crate) starlet: u16,
+    pub(crate) grpc: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CrossProcessRuntime {
     pub(crate) be: Vec<BePorts>,
     pub(crate) fe_http_port: u16,
-    pub(crate) fe_starlet_port: u16,
+    pub(crate) fe_grpc_port: u16,
     pub(crate) fe_mysql_port: u16,
 }
 
@@ -178,17 +178,14 @@ pub(crate) fn render_cross_process_config(
                 Value::Integer(i64::from(runtime.fe_http_port)),
             );
             server.insert(
-                "starlet_port".to_string(),
-                Value::Integer(i64::from(runtime.fe_starlet_port)),
+                "grpc_port".to_string(),
+                Value::Integer(i64::from(runtime.fe_grpc_port)),
             );
         }
         ClusterProcessRole::Be => {
             let be = &runtime.be[be_index];
             server.insert("http_port".to_string(), Value::Integer(i64::from(be.http)));
-            server.insert(
-                "starlet_port".to_string(),
-                Value::Integer(i64::from(be.starlet)),
-            );
+            server.insert("grpc_port".to_string(), Value::Integer(i64::from(be.grpc)));
         }
     }
 
@@ -219,7 +216,7 @@ pub(crate) fn render_cross_process_config(
             let backends: Vec<Value> = runtime
                 .be
                 .iter()
-                .map(|be| Value::String(format!("127.0.0.1:{}", be.starlet)))
+                .map(|be| Value::String(format!("127.0.0.1:{}", be.grpc)))
                 .collect();
             cluster.insert("backends".to_string(), Value::Array(backends));
         }
@@ -294,11 +291,11 @@ impl CrossProcessServerHandle {
                 .iter()
                 .map(|bp| BePorts {
                     http: bp.http.port(),
-                    starlet: bp.starlet.port(),
+                    grpc: bp.grpc.port(),
                 })
                 .collect(),
             fe_http_port: reserved.fe_http_port.port(),
-            fe_starlet_port: reserved.fe_starlet_port.port(),
+            fe_grpc_port: reserved.fe_grpc_port.port(),
             fe_mysql_port: reserved.fe_mysql_port.port(),
         };
 
@@ -339,9 +336,9 @@ impl CrossProcessServerHandle {
             .zip(be_config_paths.iter())
             .enumerate()
         {
-            let starlet_port = reserved_be.starlet.port();
+            let grpc_port = reserved_be.grpc.port();
             let _ = reserved_be.http.release();
-            let _ = reserved_be.starlet.release();
+            let _ = reserved_be.grpc.release();
             let be_process = ProcessGuard::spawn(
                 &novarocks_bin,
                 "be",
@@ -349,9 +346,9 @@ impl CrossProcessServerHandle {
                 "NOVAROCKS_READY role=be",
             )?;
             println!(
-                "started cross-process BE[{i}] pid={} starlet_port={} config={}",
+                "started cross-process BE[{i}] pid={} grpc_port={} config={}",
                 be_process.pid(),
-                starlet_port,
+                grpc_port,
                 be_config_path.display()
             );
             be_processes.push(be_process);
@@ -359,7 +356,7 @@ impl CrossProcessServerHandle {
 
         // Spawn FE.
         let _ = reserved.fe_http_port.release();
-        let _ = reserved.fe_starlet_port.release();
+        let _ = reserved.fe_grpc_port.release();
         let _ = reserved.fe_mysql_port.release();
         let fe_process = ProcessGuard::spawn(
             &novarocks_bin,
@@ -665,13 +662,13 @@ pub(crate) fn startup_timeout_from_env(raw: Option<&str>) -> Duration {
 
 struct ReservedBePorts {
     http: ReservedPort,
-    starlet: ReservedPort,
+    grpc: ReservedPort,
 }
 
 struct ReservedRuntimePorts {
     be_ports: Vec<ReservedBePorts>,
     fe_http_port: ReservedPort,
-    fe_starlet_port: ReservedPort,
+    fe_grpc_port: ReservedPort,
     fe_mysql_port: ReservedPort,
 }
 
@@ -682,13 +679,13 @@ impl ReservedRuntimePorts {
         for _ in 0..cluster_size {
             be_ports.push(ReservedBePorts {
                 http: ReservedPort::new()?,
-                starlet: ReservedPort::new()?,
+                grpc: ReservedPort::new()?,
             });
         }
         Ok(Self {
             be_ports,
             fe_http_port: ReservedPort::new()?,
-            fe_starlet_port: ReservedPort::new()?,
+            fe_grpc_port: ReservedPort::new()?,
             fe_mysql_port: ReservedPort::new()?,
         })
     }
@@ -842,10 +839,10 @@ mod tests {
         CrossProcessRuntime {
             be: vec![BePorts {
                 http: 18080,
-                starlet: 19070,
+                grpc: 19070,
             }],
             fe_http_port: 28080,
-            fe_starlet_port: 29070,
+            fe_grpc_port: 29070,
             fe_mysql_port: 29030,
         }
     }
@@ -855,15 +852,15 @@ mod tests {
             be: vec![
                 BePorts {
                     http: 18080,
-                    starlet: 19070,
+                    grpc: 19070,
                 },
                 BePorts {
                     http: 18081,
-                    starlet: 19071,
+                    grpc: 19071,
                 },
             ],
             fe_http_port: 28080,
-            fe_starlet_port: 29070,
+            fe_grpc_port: 29070,
             fe_mysql_port: 29030,
         }
     }
@@ -910,7 +907,7 @@ exec_node_output = true
         assert_eq!(fe_value["debug"]["exec_node_output"].as_bool(), Some(true));
         assert_eq!(fe_value["server"]["host"].as_str(), Some("127.0.0.1"));
         assert_eq!(fe_value["server"]["http_port"].as_integer(), Some(28080));
-        assert_eq!(fe_value["server"]["starlet_port"].as_integer(), Some(29070));
+        assert_eq!(fe_value["server"]["grpc_port"].as_integer(), Some(29070));
         assert_eq!(
             fe_value["standalone_server"]["mysql_port"].as_integer(),
             Some(29030)
@@ -925,7 +922,7 @@ exec_node_output = true
             fe_value["cluster"]["heartbeat_timeout_retries"].as_integer(),
             Some(2)
         );
-        // 1-BE: FE backends list has exactly one entry pointing at the single BE's starlet port.
+        // 1-BE: FE backends list has exactly one entry pointing at the single BE's grpc port.
         let fe_backends = fe_value["cluster"]["backends"]
             .as_array()
             .expect("fe backends array");
@@ -943,7 +940,7 @@ exec_node_output = true
         assert_eq!(be_value["debug"]["exec_node_output"].as_bool(), Some(true));
         assert_eq!(be_value["server"]["host"].as_str(), Some("127.0.0.1"));
         assert_eq!(be_value["server"]["http_port"].as_integer(), Some(18080));
-        assert_eq!(be_value["server"]["starlet_port"].as_integer(), Some(19070));
+        assert_eq!(be_value["server"]["grpc_port"].as_integer(), Some(19070));
         assert_eq!(be_value["standalone_server"]["user"].as_str(), Some("root"));
         assert!(
             be_value
@@ -1060,10 +1057,7 @@ exec_node_output = true
                 .is_none()
         );
         assert_eq!(be0_value["server"]["http_port"].as_integer(), Some(18080));
-        assert_eq!(
-            be0_value["server"]["starlet_port"].as_integer(),
-            Some(19070)
-        );
+        assert_eq!(be0_value["server"]["grpc_port"].as_integer(), Some(19070));
 
         // BE[1]
         assert_eq!(be1_value["cluster"]["role"].as_str(), Some("be"));
@@ -1074,10 +1068,7 @@ exec_node_output = true
                 .is_none()
         );
         assert_eq!(be1_value["server"]["http_port"].as_integer(), Some(18081));
-        assert_eq!(
-            be1_value["server"]["starlet_port"].as_integer(),
-            Some(19071)
-        );
+        assert_eq!(be1_value["server"]["grpc_port"].as_integer(), Some(19071));
 
         // Ports must differ between the two BEs.
         assert_ne!(
@@ -1085,8 +1076,8 @@ exec_node_output = true
             be1_value["server"]["http_port"].as_integer()
         );
         assert_ne!(
-            be0_value["server"]["starlet_port"].as_integer(),
-            be1_value["server"]["starlet_port"].as_integer()
+            be0_value["server"]["grpc_port"].as_integer(),
+            be1_value["server"]["grpc_port"].as_integer()
         );
     }
 
@@ -1095,11 +1086,11 @@ exec_node_output = true
         let reserved = ReservedRuntimePorts::new(2).expect("reserve 2 BE port pairs");
         assert_eq!(reserved.be_ports.len(), 2);
         let http0 = reserved.be_ports[0].http.port();
-        let starlet0 = reserved.be_ports[0].starlet.port();
+        let grpc0 = reserved.be_ports[0].grpc.port();
         let http1 = reserved.be_ports[1].http.port();
-        let starlet1 = reserved.be_ports[1].starlet.port();
+        let grpc1 = reserved.be_ports[1].grpc.port();
         // All four ports must be distinct.
-        let ports = [http0, starlet0, http1, starlet1];
+        let ports = [http0, grpc0, http1, grpc1];
         for i in 0..ports.len() {
             for j in (i + 1)..ports.len() {
                 assert_ne!(

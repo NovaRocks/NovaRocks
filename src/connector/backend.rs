@@ -132,12 +132,7 @@ pub(crate) trait CatalogBackend: Send + Sync {
 
     /// Whether a view with this name exists. Backends without view support
     /// report `false` so strict DROP-type checks degrade gracefully.
-    fn view_exists(
-        &self,
-        _catalog: &str,
-        _namespace: &str,
-        _view: &str,
-    ) -> Result<bool, String> {
+    fn view_exists(&self, _catalog: &str, _namespace: &str, _view: &str) -> Result<bool, String> {
         Ok(false)
     }
 

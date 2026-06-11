@@ -470,6 +470,13 @@ pub(crate) fn http_port() -> u16 {
         .unwrap_or(8040)
 }
 
+pub(crate) fn grpc_port() -> u16 {
+    novarocks_app_config()
+        .ok()
+        .map(|c| c.server.grpc_port)
+        .unwrap_or(9080)
+}
+
 pub(crate) fn starlet_port() -> u16 {
     novarocks_app_config()
         .ok()
