@@ -74,6 +74,8 @@ pub fn eval_variant_function(
         "get_variant_time" => super::get_variant::eval_get_variant_time(arena, expr, args, chunk),
         "json_keys" => super::json_keys::eval_json_keys(arena, expr, args, chunk),
         "variant_typeof" => super::variant_typeof::eval_variant_typeof(arena, expr, args, chunk),
+        "variant_get" => super::variant_get::eval_variant_get(arena, expr, args, chunk),
+        "try_variant_get" => super::variant_get::eval_try_variant_get(arena, expr, args, chunk),
         other => Err(format!("unsupported variant function: {}", other)),
     }
 }
@@ -98,6 +100,8 @@ static VARIANT_FUNCTIONS: &[(&str, &str)] = &[
     ("get_variant_time", "get_variant_time"),
     ("json_keys", "json_keys"),
     ("variant_typeof", "variant_typeof"),
+    ("variant_get", "variant_get"),
+    ("try_variant_get", "try_variant_get"),
 ];
 
 static VARIANT_METADATA: &[FunctionMeta] = &[
@@ -190,5 +194,15 @@ static VARIANT_METADATA: &[FunctionMeta] = &[
         name: "variant_typeof",
         min_args: 1,
         max_args: 1,
+    },
+    FunctionMeta {
+        name: "variant_get",
+        min_args: 2,
+        max_args: 3,
+    },
+    FunctionMeta {
+        name: "try_variant_get",
+        min_args: 2,
+        max_args: 3,
     },
 ];
