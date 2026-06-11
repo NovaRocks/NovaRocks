@@ -1,5 +1,5 @@
 //! Entrypoint for the IMV rewrite pipeline. See
-//! docs/superpowers/specs/2026-05-26-incremental-mv-optimizer-foundation-design.md.
+//! docs/design/specs/2026-05-26-incremental-mv-optimizer-foundation-design.md.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;

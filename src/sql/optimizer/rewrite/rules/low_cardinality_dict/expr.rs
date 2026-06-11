@@ -16,7 +16,7 @@ use super::context::DictScope;
 /// extending `query_global_dict_exprs`, and threading new state from the
 /// rewriter into codegen. Not exercised by the Task 9 SQL goldens — defer
 /// until a query case actually demands it. See item 4 in the plan
-/// (`docs/superpowers/plans/2026-05-26-low-cardinality-dictionary-rewrite.md`).
+/// (`docs/design/plans/2026-05-26-low-cardinality-dictionary-rewrite.md`).
 #[allow(dead_code)]
 pub(crate) const DERIVED_DICT_FUNCTIONS: &[&str] = &["upper", "lower", "trim", "ltrim", "rtrim"];
 

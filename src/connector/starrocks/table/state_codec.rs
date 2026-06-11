@@ -4,7 +4,7 @@
 //! is a zero-length byte slice (no version byte) and is treated as `is_empty`
 //! by every kind.
 //!
-//! Layout by kind: see docs/superpowers/specs/2026-05-26-ivm-varbinary-state-and-distinct-count-aggregates-design.md §3.
+//! Layout by kind: see docs/design/specs/2026-05-26-ivm-varbinary-state-and-distinct-count-aggregates-design.md §3.
 //!
 //! Serialized key bytes are canonical equality/storage identities only. They
 //! are not SQL value-order-preserving sort keys; callers that need SQL Min/Max

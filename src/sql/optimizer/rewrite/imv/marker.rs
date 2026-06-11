@@ -1,5 +1,5 @@
 //! Logical marker operators for Incremental MV (IMV) rewrite. See
-//! docs/superpowers/specs/2026-05-26-incremental-mv-optimizer-foundation-design.md §8.
+//! docs/design/specs/2026-05-26-incremental-mv-optimizer-foundation-design.md §8.
 //!
 //! These markers must never reach physical lowering. The `imv-delta-marker`
 //! stage of the IMV pipeline wraps the root; the `imv-validation` stage

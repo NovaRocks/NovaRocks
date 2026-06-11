@@ -7,7 +7,7 @@
 //!   execution handles only the current refresh path needs.
 //!
 //! Constructed once per refresh attempt, after pin capture and schema-contract
-//! rebind. See `docs/superpowers/specs/2026-05-26-iceberg-mv-rewrite-context-design.md`.
+//! rebind. See `docs/design/specs/2026-05-26-iceberg-mv-rewrite-context-design.md`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;

@@ -33,7 +33,7 @@
 //!
 //! Physical delete is best-effort: failures are logged at WARN, not propagated.
 //!
-//! Spec: docs/superpowers/specs/2026-05-07-iceberg-snapshot-lifecycle-design.md §4.
+//! Spec: docs/design/specs/2026-05-07-iceberg-snapshot-lifecycle-design.md §4.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

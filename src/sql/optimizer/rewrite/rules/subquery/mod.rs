@@ -2,7 +2,7 @@
 //!
 //! M0 ships only the ApplyException terminal guard. The decorrelation rules
 //! (push-down normalization, ApplyToWindow, *ApplyToJoin) land with M1+; see
-//! docs/superpowers/specs/2026-06-10-apply-correlated-subquery-framework-design.md §6.
+//! docs/design/specs/2026-06-10-apply-correlated-subquery-framework-design.md §6.
 
 mod apply_exception;
 

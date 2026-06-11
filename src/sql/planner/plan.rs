@@ -125,7 +125,7 @@ pub(crate) enum ApplyKind {
 /// ApplyException rule and the optimize() backstop enforce this, and
 /// memo conversion panics on a leaked Apply as defence in depth.
 /// Field semantics mirror StarRocks LogicalApplyOperator; see the design doc
-/// docs/superpowers/specs/2026-06-10-apply-correlated-subquery-framework-design.md §5.1.
+/// docs/design/specs/2026-06-10-apply-correlated-subquery-framework-design.md §5.1.
 /// M1 consumes the remaining fields; remove the allow then.
 #[allow(dead_code)]
 #[derive(Clone, Debug)]

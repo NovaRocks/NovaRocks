@@ -8,7 +8,7 @@
 //!      optimized).
 //!
 //! The asymmetry between (1) and (2) is structural — see the G3 spec
-//! `docs/superpowers/specs/2026-05-21-g3-output-properties-visitor-design.md`
+//! `docs/design/specs/2026-05-21-g3-output-properties-visitor-design.md`
 //! §1 for the explanation.
 
 use super::cost::{DISTRIBUTION_STARTUP_COST, NETWORK_COST};

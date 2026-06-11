@@ -13,7 +13,7 @@
 //! This module does **not** prune anything.  Pruning (removing items /
 //! output_columns entries) is done in Phase-2 `Prune*Columns` rules.
 //!
-//! Spec: `docs/superpowers/specs/2026-05-28-oq-1-column-pruning-arch-refactor-design.md` §5.
+//! Spec: `docs/design/specs/2026-05-28-oq-1-column-pruning-arch-refactor-design.md` §5.
 
 use std::collections::{HashMap, HashSet};
 

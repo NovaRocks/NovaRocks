@@ -19,7 +19,7 @@
 //! content_type) and merge each group into a single manifest, emitting a
 //! single `operation=replace` snapshot.
 //!
-//! Spec: docs/superpowers/specs/2026-05-07-iceberg-snapshot-lifecycle-design.md §5.
+//! Spec: docs/design/specs/2026-05-07-iceberg-snapshot-lifecycle-design.md §5.
 //!
 //! Key properties:
 //! * snapshot.sequence_number = last_sequence_number + 1 (catalog invariant —

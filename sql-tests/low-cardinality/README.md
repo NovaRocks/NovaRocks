@@ -18,7 +18,7 @@ Plan-shape assertions go through `EXPLAIN VERBOSE` + `@result_contains=DECODE`
 never renders the physical plan tree.
 
 Background: this rewrite landed in PR #191; the rewriter and codegen are wired
-together (Tasks 3–8 of `docs/superpowers/plans/2026-05-26-low-cardinality-dictionary-rewrite.md`)
+together (Tasks 3–8 of `docs/design/plans/2026-05-26-low-cardinality-dictionary-rewrite.md`)
 but the runtime integration plus the bulk of regression cases live here so
 they can evolve independently of the optimizer suite.
 
@@ -28,7 +28,7 @@ All cases here run on **Iceberg v3** via `init.sql`'s
 `lowcard_cat_${suite_uuid0}` external catalog — they validate the dictionary
 rewrite + execution end-to-end on Iceberg-backed tables (Option A: iceberg/HDFS
 scan dict-encode execution,
-`docs/superpowers/plans/2026-05-31-iceberg-scan-dict-execution-option-a.md`).
+`docs/design/plans/2026-05-31-iceberg-scan-dict-execution-option-a.md`).
 `ANALYZE FULL` builds the iceberg dictionary; a subsequent write advances the
 table snapshot and the dictionary's snapshot watermark no longer matches, so
 the rewrite is skipped (see `stale`).

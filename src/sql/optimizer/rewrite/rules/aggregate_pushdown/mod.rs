@@ -1,7 +1,7 @@
 //! Aggregate pushdown rule (OPT-1).
 //!
 //! Pushes `LogicalAggregate` past `LogicalJoin` toward leaves when cost-justified.
-//! See docs/superpowers/specs/2026-05-20-opt-1-aggregate-pushdown-design.md.
+//! See docs/design/specs/2026-05-20-opt-1-aggregate-pushdown-design.md.
 
 use std::collections::HashMap;
 use std::sync::Arc;
