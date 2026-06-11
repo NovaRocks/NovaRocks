@@ -41,11 +41,9 @@ Implemented or actively exercised areas include:
 - Standalone SQL stack:
   - StarRocks-oriented SQL parsing and analysis
   - SQL planner/codegen into NovaRocks execution plans
-  - one-shot local Parquet query CLI
   - MySQL-compatible standalone server
   - SQL test runner integration
 - Catalog and connector work:
-  - local Parquet table registration
   - Iceberg catalogs: memory, Hadoop/filesystem, and REST
   - Iceberg SELECT, INSERT, DELETE, UPDATE/MERGE-related mutation flows, schema
     changes, refs, and compaction experiments
@@ -204,10 +202,13 @@ Useful files:
 Standalone mode is configured through `[standalone_server]`:
 
 ```toml
+[metadata]
+provider = "sqlite"
+path = "meta/standalone.sqlite"
+
 [standalone_server]
 mysql_port = 9030
 user = "root"
-metadata_db_path = "meta/standalone.sqlite"
 warehouse_uri = "s3://novarocks/standalone"
 
 [standalone_server.object_store]
@@ -215,16 +216,11 @@ endpoint = "http://127.0.0.1:9000"
 access_key_id = "admin"
 access_key_secret = "admin123"
 enable_path_style_access = true
-
-[[standalone_server.tables]]
-name = "tbl"
-path = "data/tbl.parquet"
 ```
 
-`metadata_db_path` stores standalone catalog/managed-lake metadata in SQLite.
+`[metadata].path` stores standalone catalog/managed-lake metadata in SQLite.
 `warehouse_uri` plus `[standalone_server.object_store]` enables managed-lake
-storage. `[[standalone_server.tables]]` can pre-register local Parquet tables;
-relative paths are resolved relative to the config file directory.
+storage.
 
 ## Run
 
@@ -259,17 +255,6 @@ Built binary:
 ./target/release/novarocks run --config ./novarocks.toml
 ```
 
-### One-Shot Standalone Query
-
-Run a SQL query over one local Parquet file:
-
-```bash
-cargo run -- standalone \
-  --table tbl \
-  --path ./tbl.parquet \
-  --sql "select * from tbl"
-```
-
 ### Standalone MySQL-Compatible Server
 
 Run a local standalone SQL server without StarRocks FE:
@@ -277,15 +262,6 @@ Run a local standalone SQL server without StarRocks FE:
 ```bash
 NO_PROXY=127.0.0.1,localhost \
 cargo run -- standalone-server --port 9030
-```
-
-Register local Parquet tables on the command line:
-
-```bash
-NO_PROXY=127.0.0.1,localhost \
-cargo run -- standalone-server \
-  --port 9030 \
-  --table tbl=/absolute/path/to/tbl.parquet
 ```
 
 Or use a config file:
