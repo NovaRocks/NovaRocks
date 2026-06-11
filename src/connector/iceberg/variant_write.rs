@@ -206,7 +206,34 @@ pub(crate) fn transform_variant_columns_for_write(
         out_columns.push(Arc::new(struct_arr));
     }
 
-    RecordBatch::try_new(annotated_schema.clone(), out_columns)
+    // Build the output schema by keeping the input batch's fields for all
+    // non-variant columns and swapping in the annotated field only for
+    // variant positions. This is necessary because this function runs before
+    // annotate_batch: non-variant columns may still carry widened engine
+    // types (e.g. INSERT SELECT id + 1 produces Int64 for an Int32 column).
+    // Rebuilding against the full annotated_schema would make
+    // RecordBatch::try_new reject such batches. annotate_batch reconciles
+    // non-variant types afterward.
+    let out_fields: Vec<arrow::datatypes::FieldRef> = batch
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(idx, input_field)| {
+            if variant_set.contains(&idx) {
+                // Use the annotated field which carries the extension metadata
+                // required by the parquet writer (ARROW:extension:name etc.).
+                annotated_schema.field(idx).clone().into()
+            } else {
+                input_field.clone()
+            }
+        })
+        .collect();
+    let out_schema = arrow::datatypes::Schema::new_with_metadata(
+        out_fields,
+        batch.schema().metadata().clone(),
+    );
+    RecordBatch::try_new(std::sync::Arc::new(out_schema), out_columns)
         .map_err(|e| format!("variant_write: rebuild RecordBatch: {e}"))
 }
 
@@ -441,6 +468,73 @@ mod tests {
             .downcast_ref::<arrow::array::StructArray>()
             .expect("struct");
         assert_eq!(v.fields().len(), 2);
+    }
+
+    /// Regression: INSERT SELECT that widens a non-variant column (e.g. id + 1
+    /// produces Int64 for an Int32 table column) must not fail. The function
+    /// runs before annotate_batch, so non-variant columns may still carry
+    /// widened engine types. The output schema for those columns must come from
+    /// the INPUT batch, not from annotated_schema.
+    #[test]
+    fn transform_preserves_widened_non_variant_column_type() {
+        use arrow::array::{Int64Array, LargeBinaryArray, RecordBatch};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        use std::sync::Arc;
+
+        // Annotated schema says id is Int32 (the table column type).
+        let iceberg_schema = make_iceberg_schema(vec![
+            NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::optional(2, "v", Type::Primitive(PrimitiveType::Variant)).into(),
+        ]);
+        let annotated = make_annotated_arrow_schema(&iceberg_schema);
+
+        // The engine batch has id as Int64 (widened by id + 1).
+        let raw = build_variant_payload_with_string("x");
+        let input_id_field = Field::new("id", DataType::Int64, true);
+        let input_schema = Arc::new(Schema::new(vec![
+            input_id_field.clone(),
+            Field::new("v", DataType::LargeBinary, true),
+        ]));
+        let id_arr = Int64Array::from(vec![Some(42i64)]);
+        let v_arr = LargeBinaryArray::from_iter_values([raw.as_slice()]);
+        let batch =
+            RecordBatch::try_new(input_schema, vec![Arc::new(id_arr), Arc::new(v_arr)])
+                .expect("batch");
+
+        // Must succeed despite id being Int64 vs annotated Int32.
+        let out = transform_variant_columns_for_write(&batch, &annotated, &[1])
+            .expect("transform must succeed for widened non-variant column");
+
+        // (a) Succeeds (already asserted above).
+        assert_eq!(out.num_columns(), 2);
+
+        // (b) Output column 0 is still Int64 (untouched by this function).
+        assert_eq!(out.schema().field(0).data_type(), &DataType::Int64);
+        out.column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("column 0 must be Int64");
+
+        // (c) Output column 1 is a Struct (variant was transformed).
+        let v = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StructArray>()
+            .expect("column 1 must be StructArray");
+        assert_eq!(v.fields().len(), 2);
+
+        // (d) Output schema: id field equals the INPUT batch field (Int64),
+        //     v field carries the extension metadata from annotated_schema.
+        assert_eq!(out.schema().field(0), &input_id_field);
+        let out_schema = out.schema();
+        let v_schema_field = out_schema.field(1);
+        // The annotated variant field carries the extension metadata.
+        assert_eq!(
+            v_schema_field,
+            annotated.field(1),
+            "variant schema field must come from annotated_schema"
+        );
     }
 
     #[test]
