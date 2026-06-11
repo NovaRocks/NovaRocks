@@ -4,6 +4,8 @@
 
 **Goal:** Add Spark-aligned `variant_get(v, path[, type])` and `try_variant_get(v, path[, type])` scalar functions, kernel-backed via `parquet-variant-compute`, with literal-driven return types — the SQL surface and single-semantics evaluator the later optimizer pushdown (PR-4) rewrites onto.
 
+> **Errata (2026-06-11, cast-semantics decision):** numeric narrowing (e.g. double 1.5 → bigint) follows Spark CAST semantics — it **truncates** in both strict and try modes and is NOT a cast failure; only genuinely unconvertible casts (e.g. non-numeric string → bigint) trigger strict-error / try-NULL. Task 3's original "1.5 → cast failure" test code and Task 5's original query-4 golden predate this decision; the executed code and the updated Task 5 below reflect the decided semantics.
+
 **Architecture:** A new exec module `src/exec/expr/function/variant/variant_get.rs` converts the engine-internal `LargeBinary [size|metadata|value]` rows into an upstream `VariantArray` (zero-copy slicing via a new `split_serialized` helper in `src/exec/variant.rs`), then evaluates the upstream `variant_get` kernel with `GetOptions{path, as_type, cast_options}`. Strictness differs only in `CastOptions.safe`: `variant_get` errors on cast failure, `try_variant_get` yields NULL (Spark semantics). Path and type arguments must be string literals (read from `ExprArena::node`, not evaluated — Spark requires foldable args too). Return-type inference: analyzer base entry `LargeBinary` + a literal-driven post-pass in `resolve_expr.rs` (the `named_struct` precedent); codegen takes the analyzer's `type_hint` (verified: hint overrides at `expr_compiler.rs:1256-1261`), needing only a legacy-table entry so the eager fallback doesn't error on the unknown name.
 
 **Tech Stack:** Rust; `parquet::variant` re-exports (`VariantArray`, `variant_get`, `GetOptions`, `json_to_variant`, `unshred_variant`, `VariantPath`, `VariantPathElement` — all available via the existing `parquet = { version = "58.2.0", features = ["arrow", "variant_experimental"] }`); `arrow::compute::CastOptions`.
@@ -745,17 +747,20 @@ INSERT INTO ${case_db}.t_variant_get VALUES
   (2, parse_json('{"a": 99, "b": "y"}')),
   (3, parse_json('{"b": "no-a"}')),
   (4, parse_json('{"a": 1.5}')),
-  (5, NULL);
+  (5, NULL),
+  (6, parse_json('{"a": "abc"}'));
 
--- query 2 — typed extraction; missing path and SQL NULL row are NULL.
+-- query 2 — typed extraction; missing path / SQL NULL / unconvertible-cast
+-- rows are NULL; numeric narrowing (1.5) truncates per Spark CAST semantics
+-- (IV3-6 cast-semantics decision 2026-06-11).
 SELECT id, try_variant_get(v, '$.a', 'bigint') FROM ${case_db}.t_variant_get ORDER BY id;
 
--- query 3 — strict extraction over clean rows only.
-SELECT id, variant_get(v, '$.a', 'bigint') FROM ${case_db}.t_variant_get WHERE id <= 2 ORDER BY id;
+-- query 3 — strict extraction; row 4 truncates (1.5 -> 1), not an error.
+SELECT id, variant_get(v, '$.a', 'bigint') FROM ${case_db}.t_variant_get WHERE id <= 4 ORDER BY id;
 
--- query 4 — strict extraction over a lossy-cast row must fail.
+-- query 4 — strict extraction over a genuinely unconvertible row must fail.
 -- @expect_error=cast
-SELECT variant_get(v, '$.a', 'bigint') FROM ${case_db}.t_variant_get WHERE id = 4;
+SELECT variant_get(v, '$.a', 'bigint') FROM ${case_db}.t_variant_get WHERE id = 6;
 
 -- query 5 — 2-arg form returns variant; display via variant_typeof.
 SELECT id, variant_typeof(variant_get(v, '$.a')) FROM ${case_db}.t_variant_get WHERE id <= 2 ORDER BY id;
@@ -779,13 +784,16 @@ id	try_variant_get(v, '$.a', 'bigint')
 1	1
 2	99
 3	NULL
-4	NULL
+4	1
 5	NULL
+6	NULL
 
 -- query 3
 id	variant_get(v, '$.a', 'bigint')
 1	1
 2	99
+3	NULL
+4	1
 
 -- query 5
 id	variant_typeof(variant_get(v, '$.a'))
@@ -803,7 +811,7 @@ id	variant_get(v, '$.b', 'string')
 3	no-a
 ```
 
-Note on query 2 row 4: JSON `1.5` decodes as double; `try_` cast double→bigint is lossy → NULL. Note on query 5: `variant_typeof` renders the kernel-rebuilt primitive — if the actual label differs (e.g. `Integer` vs `Int64` depending on how `parse_json`'s INSERT path encodes small ints), record the real output (Step 2) and fix the golden, asserting only that both rows carry the same scalar type label.
+Note on query 2/3 row 4: JSON `1.5` decodes as double; double→bigint **truncates to 1** per the IV3-6 cast-semantics decision (Spark CAST alignment) — identical in strict and try modes. Row 6 (`"abc"`→bigint) is the genuinely unconvertible case: try → NULL, strict → error. Note on query 5: `variant_typeof` renders the kernel-rebuilt primitive — if the actual label differs (e.g. `Integer` vs `Int64` depending on how `parse_json`'s INSERT path encodes small ints), record the real output (Step 2) and fix the golden, asserting only that both rows carry the same scalar type label.
 
 - [ ] **Step 2: Run, reconcile golden, verify**
 

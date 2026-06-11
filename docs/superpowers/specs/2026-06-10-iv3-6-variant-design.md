@@ -116,6 +116,7 @@ v1:`boolean↔Boolean`、`bigint↔Int64`、`double↔Float64`、`string↔Utf8`
 
 - 签名:`variant_get(v, path[, type])`;2 参返回 variant(LargeBinary),3 参返回指定类型。`type` 必须是字符串字面量(否则 analyzer 报错);v1 类型集:`boolean/int/bigint/float/double/string/date/datetime`,经 `parse_modifier_to_sql_type` 映射到引擎 SQL 类型(`int`→Int32、`bigint`→Int64,与 Spark `variant_get` 的类型字面量语义对齐)。其中 datetime 与 int/float 仅函数语义;shred-取数零拷贝白名单见决策 E(`int`↔Int32 精确匹配虽安全,v1 保守不入白名单,实现期可零成本放开)。
 - 语义(Spark 对齐):missing path → NULL;variant null → NULL;cast 失败 → `variant_get` 报错(`CastOptions.safe=false`)、`try_variant_get` → NULL(`safe=true`)。
+- **cast 语义裁定(2026-06-11,实现期决议)**:数值收窄遵循 Spark CAST 语义——`double 1.5 → bigint` 在两种模式下都截断为 `1`,不视为 cast 失败(上游 kernel 与 Spark 行为一致);仅真正不可转换(如非数字字符串 → bigint)才触发 strict 报错 / try NULL。早先文稿把"lossy 数值收窄"误归为失败,以此条为准。
 - 实现:kernel-backed;常量路径快速通道(现有家族逐行重解析路径的已知开销不复制)。
 - 注册必须三表同步:`analyzer/functions.rs`、`codegen/expr_compiler.rs`(对未知名报错)、`lower/expr/function_call.rs` 允许表;exec 侧 `VARIANT_FUNCTIONS` + `VARIANT_METADATA` 双表同步。
 - 裁剪与严格模式的可观察宽松:被裁剪页中本会 cast 报错的行不会报错(Spark 同样行为),文档明记。

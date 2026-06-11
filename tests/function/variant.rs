@@ -238,31 +238,46 @@ fn test_variant_get_two_arg_returns_variant() {
 }
 
 #[test]
-#[ignore = "IV3-6 cast-semantics pending: upstream kernel truncates float->int (1.5->1, matching Spark CAST(1.5 AS BIGINT)=1) in BOTH strict and try modes; design prose expected lossy float->int to error(strict)/NULL(try). Re-enable once the semantics decision lands."]
-fn test_try_variant_get_cast_failure_is_null() {
-    // double 1.5 -> bigint is a lossy cast: strict errors, try yields NULL.
+fn test_variant_get_numeric_narrowing_truncates_like_spark_cast() {
+    // IV3-6 cast-semantics decision: numeric narrowing follows Spark CAST
+    // semantics — double 1.5 -> bigint truncates to 1 in BOTH strict and try
+    // modes (the upstream kernel and Spark agree; this is not a cast failure).
     let variant = variant_primitive_serialized(7, &1.5_f64.to_le_bytes());
-    let (chunk, arg0, mut arena) = make_variant_chunk(variant);
-    let arg1 = utf8_lit(&mut arena, "$");
+    for fn_name in ["variant_get", "try_variant_get"] {
+        let (chunk, arg0, mut arena) = make_variant_chunk(variant.clone());
+        let arg1 = utf8_lit(&mut arena, "$");
+        let arg2 = utf8_lit(&mut arena, "bigint");
+        let expr = common::typed_null(&mut arena, DataType::Int64);
+        let out = eval_variant_function(fn_name, &arena, expr, &[arg0, arg1, arg2], &chunk)
+            .unwrap_or_else(|e| panic!("{fn_name} must truncate, not error: {e}"));
+        let out = out.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(out.value(0), 1, "{fn_name} truncates 1.5 -> 1");
+    }
+}
+
+#[test]
+fn test_try_variant_get_unconvertible_cast_is_null() {
+    // A genuinely unconvertible cast (non-numeric string -> bigint):
+    // try mode yields NULL.
+    let (chunk, arg0, mut arena) = make_json_chunk(r#"{"a": "abc"}"#);
+    let arg1 = utf8_lit(&mut arena, "$.a");
     let arg2 = utf8_lit(&mut arena, "bigint");
     let expr = common::typed_null(&mut arena, DataType::Int64);
-    let out =
-        eval_variant_function("try_variant_get", &arena, expr, &[arg0, arg1, arg2], &chunk)
-            .unwrap();
+    let out = eval_variant_function("try_variant_get", &arena, expr, &[arg0, arg1, arg2], &chunk)
+        .unwrap();
     let out = out.as_any().downcast_ref::<Int64Array>().unwrap();
     assert!(out.is_null(0));
 }
 
 #[test]
-#[ignore = "IV3-6 cast-semantics pending: upstream kernel truncates float->int (1.5->1, matching Spark CAST(1.5 AS BIGINT)=1) in BOTH strict and try modes; design prose expected lossy float->int to error(strict)/NULL(try). Re-enable once the semantics decision lands."]
-fn test_variant_get_strict_cast_failure_errors() {
-    let variant = variant_primitive_serialized(7, &1.5_f64.to_le_bytes());
-    let (chunk, arg0, mut arena) = make_variant_chunk(variant);
-    let arg1 = utf8_lit(&mut arena, "$");
+fn test_variant_get_unconvertible_cast_errors() {
+    // Strict mode errors on a genuinely unconvertible cast.
+    let (chunk, arg0, mut arena) = make_json_chunk(r#"{"a": "abc"}"#);
+    let arg1 = utf8_lit(&mut arena, "$.a");
     let arg2 = utf8_lit(&mut arena, "bigint");
     let expr = common::typed_null(&mut arena, DataType::Int64);
     let err = eval_variant_function("variant_get", &arena, expr, &[arg0, arg1, arg2], &chunk)
-        .expect_err("strict cast failure must error");
+        .expect_err("strict unconvertible cast must error");
     assert!(
         err.to_lowercase().contains("cast"),
         "error mentions the cast: {err}"
