@@ -1477,6 +1477,9 @@ impl<'a> PlanFragmentBuilder<'a> {
             .map(|cols| cols.iter().map(|c| c.to_lowercase()).collect());
         if let Some(required) = required.as_mut() {
             add_iceberg_equality_delete_required_columns(required, &table, planned_scan.as_ref())?;
+            for variant_column in &op.variant_columns {
+                required.insert(variant_column.source_column.to_lowercase());
+            }
         }
         let scan_table_id = match &table.source {
             crate::sql::catalog::ScanSource::StarRocks { table_id, .. } => Some(*table_id),
@@ -1510,6 +1513,8 @@ impl<'a> PlanFragmentBuilder<'a> {
         let mut dict_slot_for_source: std::collections::HashMap<String, i32> =
             std::collections::HashMap::new();
         let mut dict_slot_to_dict: Vec<(i32, &ScanDictionaryColumn)> = Vec::new();
+        let mut physical_slot_by_column: std::collections::HashMap<String, i32> =
+            std::collections::HashMap::new();
         for (idx, col) in table.columns.iter().enumerate() {
             // The dict rewriter renames the source string column to the
             // dict column name in `op.columns` / `op.required_columns`,
@@ -1548,6 +1553,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                 idx as i32,
             );
             slot_to_column.insert(slot_id, col.name.clone());
+            physical_slot_by_column.insert(col.name.to_lowercase(), slot_id);
             let binding = ColumnBinding {
                 tuple_id: scan_tuple_id,
                 slot_id,
@@ -1649,6 +1655,70 @@ impl<'a> PlanFragmentBuilder<'a> {
             );
         }
 
+        let variant_col_offset =
+            table.columns.len() + table.iceberg_row_lineage_metadata_columns.len();
+        let mut variant_path_columns = Vec::with_capacity(op.variant_columns.len());
+        for (variant_idx, variant_column) in op.variant_columns.iter().enumerate() {
+            let source_slot_id = physical_slot_by_column
+                .get(&variant_column.source_column.to_lowercase())
+                .copied()
+                .ok_or_else(|| {
+                    format!(
+                        "scan `{}.{}` variant_columns references unknown source column `{}`",
+                        op.database, table.name, variant_column.source_column
+                    )
+                })?;
+            let output_slot_id = self.alloc_slot();
+            let requested_type = type_infer::arrow_type_to_type_desc(
+                &variant_column.requested_type,
+            )
+            .map_err(|err| {
+                format!(
+                    "scan `{}.{}` variant column `{}` has unsupported requested type {:?}: {err}",
+                    op.database,
+                    table.name,
+                    variant_column.synthetic_column,
+                    variant_column.requested_type
+                )
+            })?;
+            let nullable = op
+                .columns
+                .iter()
+                .find(|column| column.column_id == variant_column.synthetic_column_id)
+                .map(|column| column.nullable)
+                .unwrap_or(true);
+            self.desc_builder.add_slot_with_type_desc(
+                output_slot_id,
+                scan_tuple_id,
+                &variant_column.synthetic_column,
+                requested_type.clone(),
+                nullable,
+                (variant_col_offset + variant_idx) as i32,
+            );
+            let binding = ColumnBinding {
+                tuple_id: scan_tuple_id,
+                slot_id: output_slot_id,
+                data_type: variant_column.requested_type.clone(),
+                type_desc: Some(requested_type.clone()),
+                nullable,
+            };
+            scope.add_column_with_id(
+                variant_column.synthetic_column_id,
+                qualifier.map(|s| s.to_string()),
+                variant_column.synthetic_column.clone(),
+                binding,
+            );
+            variant_path_columns.push(plan_nodes::TVariantPathColumn::new(
+                Some(source_slot_id),
+                Some(output_slot_id),
+                Some(variant_column.source_column.clone()),
+                Some(variant_column.synthetic_column.clone()),
+                Some(variant_column.canonical_path.clone()),
+                Some(requested_type),
+                Some(variant_column.strict),
+            ));
+        }
+
         // Compile predicates pushed down by the optimizer
         let pushed_conjuncts = if op.predicates.is_empty() {
             vec![]
@@ -1718,6 +1788,17 @@ impl<'a> PlanFragmentBuilder<'a> {
             min_max_predicates,
             change_op_slot,
         )?;
+
+        if !variant_path_columns.is_empty() {
+            if let Some(hdfs) = scan_plan_node.hdfs_scan_node.as_mut() {
+                hdfs.variant_path_columns = Some(variant_path_columns);
+            } else {
+                return Err(format!(
+                    "scan `{}.{}` has variant_columns but is not an iceberg/HDFS scan",
+                    op.database, table.name
+                ));
+            }
+        }
 
         // StarRocks lake scans carry the dict slot self-map on the wire via
         // `TLakeScanNode.dict_string_id_to_int_ids`. Iceberg/HDFS scans have no
@@ -5257,7 +5338,7 @@ mod tests {
         PhysicalDistributionOp, PhysicalGenerateSeriesOp, PhysicalHashJoinEqCondition,
         PhysicalHashJoinOp, PhysicalProjectOp, PhysicalRepeatOp, PhysicalScanOp, PhysicalSortOp,
         PhysicalTopNOp, PhysicalUnionOp, PhysicalValuesOp, PhysicalWindowOp, ScanDictionaryColumn,
-        TopNPhase,
+        ScanVariantColumn, TopNPhase,
     };
     use crate::sql::optimizer::physical_plan::{
         JoinExecutionDistribution, PhysicalPlanNode, PlanExecutionProps,
@@ -9487,6 +9568,181 @@ mod tests {
         assert_eq!(
             contexts_with_conjuncts, 1,
             "exactly one to_thrift_scan call should carry node conjuncts; the range-only call should not"
+        );
+    }
+
+    #[test]
+    fn visit_scan_emits_variant_path_columns_for_iceberg() {
+        let source_column_id = ColumnId::new_for_test(9301);
+        let synthetic_column_id = ColumnId::new_for_test(9302);
+        let source_column = OutputColumn {
+            column_id: source_column_id,
+            name: "v".to_string(),
+            data_type: DataType::LargeBinary,
+            nullable: true,
+            is_internal: false,
+        };
+        let synthetic_column = OutputColumn {
+            column_id: synthetic_column_id,
+            name: "__nr_var_v_0".to_string(),
+            data_type: DataType::Int64,
+            nullable: true,
+            is_internal: true,
+        };
+        let plan = PhysicalPlanNode {
+            op: Operator::PhysicalScan(PhysicalScanOp {
+                database: "default".to_string(),
+                table: TableDef {
+                    name: "ice_t".to_string(),
+                    columns: vec![
+                        ColumnDef {
+                            name: "id".to_string(),
+                            data_type: DataType::Int32,
+                            nullable: false,
+                            write_default: None,
+                            logical_type: None,
+                        },
+                        ColumnDef {
+                            name: "v".to_string(),
+                            data_type: DataType::LargeBinary,
+                            nullable: true,
+                            write_default: None,
+                            logical_type: None,
+                        },
+                    ],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: ScanSource::IcebergDataFiles {
+                        table: test_iceberg_table_info_with_schema(vec![
+                            IcebergSchemaFieldDef {
+                                field_id: 1,
+                                name: "id".to_string(),
+                                initial_default: None,
+                                write_default: None,
+                                initial_default_json: None,
+                                children: vec![],
+                            },
+                            IcebergSchemaFieldDef {
+                                field_id: 2,
+                                name: "v".to_string(),
+                                initial_default: None,
+                                write_default: None,
+                                initial_default_json: None,
+                                children: vec![],
+                            },
+                        ]),
+                        files: vec![],
+                        cloud_properties: BTreeMap::new(),
+                        binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+                    },
+                },
+                alias: None,
+                columns: vec![source_column.clone(), synthetic_column.clone()],
+                predicates: vec![],
+                required_columns: Some(vec![synthetic_column.name.clone()]),
+                dict_columns: vec![],
+                variant_columns: vec![ScanVariantColumn {
+                    source_column_id,
+                    source_column: source_column.name.clone(),
+                    synthetic_column_id,
+                    synthetic_column: synthetic_column.name.clone(),
+                    canonical_path: "$.a.b".to_string(),
+                    requested_type: DataType::Int64,
+                    strict: true,
+                }],
+                mv_rewritten_from: None,
+            }),
+            children: vec![],
+            stats: stats(),
+            output_columns: vec![synthetic_column.clone()],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+        };
+        let registry = mock_iceberg_registry();
+        let mut builder = builder_for_scope_test(&registry);
+
+        let visit = builder.visit(&plan).expect("visit Iceberg scan");
+        let slot_allocator = builder.slot_allocator();
+        let desc_tbl = builder.desc_builder.build();
+        let scan = visit
+            .plan_nodes
+            .iter()
+            .find(|node| node.node_type == plan_nodes::TPlanNodeType::HDFS_SCAN_NODE)
+            .expect("hdfs scan node");
+        let hdfs = scan.hdfs_scan_node.as_ref().expect("hdfs scan payload");
+
+        let source_slot_id = slot_id_by_name(&desc_tbl, "v");
+        let synthetic_slot_id = slot_id_by_name(&desc_tbl, &synthetic_column.name);
+        let variant_columns = hdfs
+            .variant_path_columns
+            .as_ref()
+            .expect("variant path columns");
+        assert_eq!(variant_columns.len(), 1);
+        let variant_column = &variant_columns[0];
+        assert_eq!(variant_column.source_slot_id, Some(source_slot_id));
+        assert_eq!(variant_column.output_slot_id, Some(synthetic_slot_id));
+        assert_eq!(variant_column.source_column.as_deref(), Some("v"));
+        assert_eq!(
+            variant_column.output_column.as_deref(),
+            Some(synthetic_column.name.as_str())
+        );
+        assert_eq!(variant_column.canonical_path.as_deref(), Some("$.a.b"));
+        assert_eq!(variant_column.strict, Some(true));
+        assert_eq!(
+            variant_column
+                .requested_type
+                .as_ref()
+                .and_then(|desc| desc.types.as_ref())
+                .and_then(|nodes| nodes.first())
+                .and_then(|node| node.scalar_type.as_ref())
+                .map(|scalar| scalar.type_),
+            Some(types::TPrimitiveType::BIGINT)
+        );
+
+        let synthetic_binding = visit
+            .scope
+            .resolve_by_id(synthetic_column_id)
+            .expect("synthetic ColumnId binding");
+        assert_eq!(synthetic_binding.slot_id, synthetic_slot_id);
+        let source_binding = visit
+            .scope
+            .resolve_by_id(source_column_id)
+            .expect("source ColumnId binding");
+        assert_eq!(source_binding.slot_id, source_slot_id);
+        assert!(
+            visit
+                .scope
+                .iter_columns()
+                .any(|(name, binding)| name == &synthetic_column.name
+                    && binding.slot_id == synthetic_slot_id),
+            "synthetic name must resolve to the synthetic slot"
+        );
+        let synthetic_ref = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: synthetic_column_id,
+                qualifier: None,
+                column: synthetic_column.name.clone(),
+            },
+            data_type: synthetic_column.data_type.clone(),
+            nullable: synthetic_column.nullable,
+        };
+        let mut compiler = ExprCompiler::new(slot_allocator, &visit.scope);
+        let compiled = compiler
+            .compile_typed(&synthetic_ref)
+            .expect("compile synthetic ref");
+        let slot_ref = compiled
+            .nodes
+            .first()
+            .and_then(|node| node.slot_ref.as_ref())
+            .expect("synthetic slot ref");
+        assert_eq!(slot_ref.slot_id, synthetic_slot_id);
+
+        let hive_column_names = hdfs.hive_column_names.as_deref().unwrap_or(&[]);
+        assert!(
+            !hive_column_names
+                .iter()
+                .any(|name| name == &synthetic_column.name),
+            "synthetic column must not be part of physical hive_column_names"
         );
     }
 

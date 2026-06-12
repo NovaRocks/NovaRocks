@@ -1261,6 +1261,16 @@ struct TAssertNumRowsNode {
     3: optional TAssertion assertion;
 }
 
+struct TVariantPathColumn {
+    1: optional Types.TSlotId source_slot_id
+    2: optional Types.TSlotId output_slot_id
+    3: optional string source_column
+    4: optional string output_column
+    5: optional string canonical_path
+    6: optional Types.TTypeDesc requested_type
+    7: optional bool strict
+}
+
 struct THdfsScanNode {
     1: optional Types.TTupleId tuple_id
 
@@ -1334,6 +1344,11 @@ struct THdfsScanNode {
     27: optional i64 scan_node_id
 
     28: optional list<TColumnAccessPath> column_access_paths
+
+    // Synthetic scan outputs derived from a VARIANT source column path. The
+    // physical source slot is still read from hive_column_names; output slots
+    // are not physical file columns.
+    29: optional list<TVariantPathColumn> variant_path_columns
 }
 
 struct TProjectNode {

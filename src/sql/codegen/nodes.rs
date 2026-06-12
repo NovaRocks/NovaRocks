@@ -256,6 +256,7 @@ fn build_hdfs_scan_node(
         None::<bool>,
         None::<i64>,
         None::<Vec<plan_nodes::TColumnAccessPath>>,
+        None::<Vec<plan_nodes::TVariantPathColumn>>,
     ));
 
     node
