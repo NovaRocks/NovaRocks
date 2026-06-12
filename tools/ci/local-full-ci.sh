@@ -467,11 +467,27 @@ ci_case_key_contains() {
   esac
 }
 
+ci_case_key_count() {
+  local keys="$1"
+  local count=0
+  local line
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] || continue
+    count=$((count + 1))
+  done <<<"$keys"
+
+  printf "%s\n" "$count"
+}
+
 ci_classify_sql_log() {
   local suite="$1"
   local log_path="$2"
   local require_known_only="${3:-false}"
   local failed_case_keys
+  local failed_case_count
+  local classified_failed_case_count=0
+  local classified_failed_case_keys=""
   local line
   local current_suite="$suite"
   local current_case=""
@@ -493,6 +509,7 @@ ci_classify_sql_log() {
   # Expected-error PASS lines can include engine_error_code=..., so prefer
   # case timing FAIL rows when the runner emitted them.
   failed_case_keys="$(ci_sql_failed_case_keys "$log_path")"
+  failed_case_count="$(ci_case_key_count "$failed_case_keys")"
 
   while IFS= read -r line || [ -n "$line" ]; do
     if [[ "$line" =~ ^[[:space:]]*\[([^]]+)\][[:space:]]+([^[:space:]]+)[[:space:]]+\(steps= ]]; then
@@ -527,6 +544,11 @@ ci_classify_sql_log() {
       esac
       seen_keys="${seen_keys}${seen_key}
 "
+      if [ -n "$failed_case_keys" ] && ! ci_case_key_contains "$classified_failed_case_keys" "$row_suite" "$row_case"; then
+        classified_failed_case_keys="${classified_failed_case_keys}|${row_suite}|${row_case}|
+"
+        classified_failed_case_count=$((classified_failed_case_count + 1))
+      fi
 
       status_line="$(ci_known_failure_status "$KNOWN_FAILURES_FILE" "$CI_TIER" "$row_suite" "$row_case" "$error_code")"
       IFS='|' read -r status reason expires <<EOF
@@ -541,7 +563,9 @@ EOF
   done <"$log_path"
 
   if [ "$require_known_only" = "true" ]; then
-    [ "$classification_count" -gt 0 ] && [ "$hard_failure" -eq 0 ]
+    [ "$classification_count" -gt 0 ] \
+      && [ "$hard_failure" -eq 0 ] \
+      && [ "$failed_case_count" -eq "$classified_failed_case_count" ]
     return $?
   fi
 
