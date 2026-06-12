@@ -14,6 +14,7 @@ ci_init_summary_state() {
   CI_STAGE_ROWS=""
   CI_SQL_ROWS=""
   CI_SQL_CASE_ROWS=""
+  CI_KNOWN_FAILURE_ROWS=""
   CI_FAILURE_TAIL=""
   CI_REPO_PATH=""
   CI_BRANCH_NAME=""
@@ -113,6 +114,23 @@ ci_record_sql_case_timings() {
   done <"$log_path"
 }
 
+ci_record_sql_classification() {
+  local suite="$1"
+  local case_name="$2"
+  local status="$3"
+  local error_code="$4"
+  local reason="$5"
+
+  suite="${suite//|/\\|}"
+  case_name="${case_name//|/\\|}"
+  status="${status//|/\\|}"
+  error_code="${error_code//|/\\|}"
+  reason="${reason//|/\\|}"
+
+  CI_KNOWN_FAILURE_ROWS="${CI_KNOWN_FAILURE_ROWS}| ${suite} | ${case_name} | ${status} | ${error_code} | ${reason} |
+"
+}
+
 ci_mark_failure_tail() {
   local title="$1"
   local log_path="$2"
@@ -179,6 +197,14 @@ ci_render_summary() {
       printf "| Suite | Status | Case | Duration |\n"
       printf "| --- | --- | --- | --- |\n"
       printf "%s" "$CI_SQL_CASE_ROWS"
+      printf "\n"
+    fi
+
+    if [ -n "$CI_KNOWN_FAILURE_ROWS" ]; then
+      printf "## SQL Failure Classification\n\n"
+      printf "| Suite | Case | Status | Error Code | Reason |\n"
+      printf "| --- | --- | --- | --- | --- |\n"
+      printf "%s" "$CI_KNOWN_FAILURE_ROWS"
       printf "\n"
     fi
 

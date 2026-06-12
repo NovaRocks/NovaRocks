@@ -7,10 +7,14 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 source "$SCRIPT_DIR/lib/logging.sh"
 source "$SCRIPT_DIR/lib/command.sh"
 source "$SCRIPT_DIR/lib/sql_suites.sh"
+source "$SCRIPT_DIR/lib/known_failures.sh"
 source "$SCRIPT_DIR/lib/server.sh"
 
 STABLE_SUITES_FILE="$SCRIPT_DIR/suites/stable-sql-suites.txt"
+KNOWN_FAILURES_FILE="$SCRIPT_DIR/baselines/known-failures.toml"
 RUN_MODE="stable"
+CI_TIER="full"
+CI_FROM_RUN_DIR=""
 ALL_DISCOVERED_REQUESTED="false"
 KEEP_RUNTIME="false"
 SKIP_CARGO_TEST="false"
@@ -35,6 +39,8 @@ baseline.
 Options:
   --all-discovered      Run every suite discovered from sql-tests/*/sql.
   --suite <name>        Run only the named SQL suite. May be repeated.
+  --tier <name>         Stable tier: smoke, targeted, or full. Default: full.
+  --from <run-dir>      Reclassify an existing logs/ci-full run without rerun.
   --skip-cargo-test     Skip cargo test. Intended only for runner debugging.
   --cluster-mode <mode> SQL runner cluster mode: all-in-one or cross-process.
   --cluster-size <n>    Number of BE processes for cross-process mode.
@@ -71,6 +77,17 @@ validate_cluster_args() {
   fi
 }
 
+validate_tier_arg() {
+  case "$CI_TIER" in
+    smoke|targeted|full)
+      ;;
+    *)
+      echo "error: --tier must be smoke, targeted, or full" >&2
+      exit 2
+      ;;
+  esac
+}
+
 parse_args() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -84,6 +101,23 @@ parse_args() {
           exit 2
         fi
         REQUESTED_SUITES+=("$2")
+        shift 2
+        ;;
+      --tier)
+        if [ "$#" -lt 2 ]; then
+          echo "error: --tier requires a tier name" >&2
+          exit 2
+        fi
+        CI_TIER="$2"
+        validate_tier_arg
+        shift 2
+        ;;
+      --from)
+        if [ "$#" -lt 2 ]; then
+          echo "error: --from requires a run directory" >&2
+          exit 2
+        fi
+        CI_FROM_RUN_DIR="$2"
         shift 2
         ;;
       --skip-cargo-test)
@@ -123,6 +157,7 @@ parse_args() {
   done
 
   validate_cluster_args
+  validate_tier_arg
 
   if [ "$ALL_DISCOVERED_REQUESTED" = "true" ] && [ "${#REQUESTED_SUITES[@]}" -gt 0 ]; then
     echo "error: --all-discovered cannot be combined with --suite" >&2
@@ -136,6 +171,36 @@ parse_args() {
   else
     RUN_MODE="stable"
   fi
+}
+
+init_from_run_dir() {
+  local run_dir="$CI_FROM_RUN_DIR"
+
+  case "$run_dir" in
+    /*)
+      ;;
+    *)
+      run_dir="$REPO_ROOT/$run_dir"
+      ;;
+  esac
+
+  if [ ! -d "$run_dir" ]; then
+    echo "error: --from run directory does not exist: $CI_FROM_RUN_DIR" >&2
+    exit 2
+  fi
+
+  if [ ! -d "$run_dir/sql" ]; then
+    echo "error: --from run directory has no sql logs: $CI_FROM_RUN_DIR" >&2
+    exit 2
+  fi
+
+  CI_RUN_DIR="$run_dir"
+  CI_SUMMARY="$CI_RUN_DIR/summary.md"
+  ci_init_summary_state
+  ci_set_repo_context \
+    "$REPO_ROOT" \
+    "$(git -C "$REPO_ROOT" symbolic-ref --short -q HEAD || echo HEAD)" \
+    "$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 }
 
 init_run_dir() {
@@ -313,6 +378,7 @@ start_server_stage() {
 
 resolve_suites() {
   SUITES=()
+  local suites_output
 
   if [ "$RUN_MODE" = "explicit" ]; then
     local suite
@@ -334,14 +400,19 @@ resolve_suites() {
     return 0
   fi
 
+  if ! suites_output="$(ci_tier_suites "$CI_TIER" "$STABLE_SUITES_FILE")"; then
+    echo "error: unknown CI tier: $CI_TIER" >&2
+    exit 2
+  fi
+
   while IFS= read -r suite; do
     [ -n "$suite" ] || continue
     if ! ci_suite_exists "$REPO_ROOT" "$suite"; then
-      echo "error: stable SQL suite does not exist: $suite" >&2
+      echo "error: tier '$CI_TIER' SQL suite does not exist: $suite" >&2
       exit 2
     fi
     SUITES+=("$suite")
-  done < <(ci_load_stable_suites "$STABLE_SUITES_FILE")
+  done <<<"$suites_output"
 }
 
 validate_explicit_suites_early() {
@@ -362,6 +433,151 @@ validate_explicit_suites_early() {
       exit 2
     fi
   done
+}
+
+ci_sql_failed_case_keys() {
+  local log_path="$1"
+  local line
+  local suite_name
+  local case_id
+
+  [ -f "$log_path" ] || return 0
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [[ "$line" =~ ^[[:space:]]+\[([^]]+)\][[:space:]]+([^[:space:]]+)[[:space:]]+FAIL[[:space:]] ]]; then
+      suite_name="${BASH_REMATCH[1]}"
+      case_id="${BASH_REMATCH[2]}"
+      printf "|%s|%s|\n" "$suite_name" "$case_id"
+    fi
+  done <"$log_path"
+}
+
+ci_case_key_contains() {
+  local keys="$1"
+  local suite="$2"
+  local case_name="$3"
+
+  case "$keys" in
+    *"|${suite}|${case_name}|"*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+ci_classify_sql_log() {
+  local suite="$1"
+  local log_path="$2"
+  local require_known_only="${3:-false}"
+  local failed_case_keys
+  local line
+  local current_suite="$suite"
+  local current_case=""
+  local row_suite
+  local row_case
+  local remaining
+  local error_code
+  local status_line
+  local status
+  local reason
+  local expires
+  local classification_count=0
+  local hard_failure=0
+  local seen_keys=""
+  local seen_key
+
+  [ -f "$log_path" ] || return 1
+
+  # Expected-error PASS lines can include engine_error_code=..., so prefer
+  # case timing FAIL rows when the runner emitted them.
+  failed_case_keys="$(ci_sql_failed_case_keys "$log_path")"
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [[ "$line" =~ ^[[:space:]]*\[([^]]+)\][[:space:]]+([^[:space:]]+)[[:space:]]+\(steps= ]]; then
+      current_suite="${BASH_REMATCH[1]}"
+      current_case="${BASH_REMATCH[2]}"
+    elif [[ "$line" =~ (^|[[:space:]])case:[[:space:]]*([A-Za-z0-9_.+-]+) ]]; then
+      current_case="${BASH_REMATCH[2]}"
+    fi
+
+    case "$line" in
+      *PASS*engine_error_code=*)
+        continue
+        ;;
+    esac
+
+    remaining="$line"
+    while [[ "$remaining" =~ engine_error_code=([A-Za-z0-9_]+) ]]; do
+      error_code="${BASH_REMATCH[1]}"
+      remaining="${remaining#*engine_error_code=$error_code}"
+      row_suite="${current_suite:-$suite}"
+      row_case="${current_case:-unknown}"
+
+      if [ -n "$failed_case_keys" ] && ! ci_case_key_contains "$failed_case_keys" "$row_suite" "$row_case"; then
+        continue
+      fi
+
+      seen_key="|${row_suite}|${row_case}|${error_code}|"
+      case "$seen_keys" in
+        *"$seen_key"*)
+          continue
+          ;;
+      esac
+      seen_keys="${seen_keys}${seen_key}
+"
+
+      status_line="$(ci_known_failure_status "$KNOWN_FAILURES_FILE" "$CI_TIER" "$row_suite" "$row_case" "$error_code")"
+      IFS='|' read -r status reason expires <<EOF
+$status_line
+EOF
+      ci_record_sql_classification "$row_suite" "$row_case" "$status" "$error_code" "$reason"
+      classification_count=$((classification_count + 1))
+      if [ "$status" != "KNOWN_FAIL" ]; then
+        hard_failure=1
+      fi
+    done
+  done <"$log_path"
+
+  if [ "$require_known_only" = "true" ]; then
+    [ "$classification_count" -gt 0 ] && [ "$hard_failure" -eq 0 ]
+    return $?
+  fi
+
+  return 0
+}
+
+ci_sql_suite_status_from_log() {
+  local log_path="$1"
+  local line
+
+  [ -f "$log_path" ] || {
+    printf "FAIL\n"
+    return 0
+  }
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [[ "$line" =~ ^(exit_code|exit_status)=([0-9]+)$ ]]; then
+      if [ "${BASH_REMATCH[2]}" -ne 0 ]; then
+        printf "FAIL\n"
+        return 0
+      fi
+    elif [[ "$line" =~ ^fail=([0-9]+)$ ]]; then
+      if [ "${BASH_REMATCH[1]}" -ne 0 ]; then
+        printf "FAIL\n"
+        return 0
+      fi
+    elif [[ "$line" =~ ^[[:space:]]+\[[^]]+\][[:space:]]+[^[:space:]]+[[:space:]]+FAIL[[:space:]] ]]; then
+      printf "FAIL\n"
+      return 0
+    elif [ "$line" = "failed cases:" ]; then
+      printf "FAIL\n"
+      return 0
+    fi
+  done <"$log_path"
+
+  printf "PASS\n"
 }
 
 run_sql_suites() {
@@ -433,6 +649,8 @@ run_sql_suites() {
 
     if [ "$code" -eq 0 ]; then
       ci_record_sql_suite "$suite" "PASS" "$duration" "$log_path"
+    elif ci_classify_sql_log "$suite" "$log_path" "true"; then
+      ci_record_sql_suite "$suite" "KNOWN_FAIL" "$duration" "$log_path"
     else
       failed=1
       ci_record_sql_suite "$suite" "FAIL" "$duration" "$log_path"
@@ -449,9 +667,66 @@ run_sql_suites() {
   fi
 }
 
+reclassify_existing_run() {
+  local failed=0
+  local any_logs=0
+  local log_path
+  local suite
+  local status
+
+  init_from_run_dir
+
+  for log_path in "$CI_RUN_DIR"/sql/*.log; do
+    [ -f "$log_path" ] || continue
+    any_logs=1
+    suite="${log_path##*/}"
+    suite="${suite%.log}"
+    status="$(ci_sql_suite_status_from_log "$log_path")"
+
+    if [ "$status" = "PASS" ]; then
+      ci_record_sql_suite "$suite" "PASS" "0" "$log_path"
+    elif ci_classify_sql_log "$suite" "$log_path" "true"; then
+      ci_record_sql_suite "$suite" "KNOWN_FAIL" "0" "$log_path"
+    else
+      failed=1
+      ci_record_sql_suite "$suite" "FAIL" "0" "$log_path"
+      if [ -z "$CI_FAILURE_TAIL" ]; then
+        ci_mark_failure_tail "SQL suite failed: $suite" "$log_path"
+      fi
+    fi
+  done
+
+  if [ "$any_logs" -eq 0 ]; then
+    failed=1
+    CI_FAILURE_TAIL="$(cat <<EOF
+### reclassification failed
+
+\`\`\`text
+no sql/*.log files found under $CI_RUN_DIR
+\`\`\`
+EOF
+)"
+  fi
+
+  if [ "$failed" -ne 0 ]; then
+    ci_render_summary "FAIL"
+    echo "FAIL: $CI_SUMMARY"
+    exit 1
+  fi
+
+  ci_render_summary "PASS"
+  echo "PASS: $CI_SUMMARY"
+}
+
 main() {
   parse_args "$@"
   cd "$REPO_ROOT" || exit 1
+
+  if [ -n "$CI_FROM_RUN_DIR" ]; then
+    reclassify_existing_run
+    exit 0
+  fi
+
   init_run_dir
   validate_explicit_suites_early
   trap cleanup EXIT

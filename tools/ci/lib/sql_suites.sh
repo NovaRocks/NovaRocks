@@ -20,6 +20,26 @@ ci_load_stable_suites() {
   done <"$manifest"
 }
 
+ci_tier_suites() {
+  local tier="$1"
+  local stable_manifest="$2"
+
+  case "$tier" in
+    smoke)
+      printf "%s\n" filter project optimizer
+      ;;
+    targeted)
+      printf "%s\n" optimizer iceberg-rest aggregate runtime-filter
+      ;;
+    full)
+      ci_load_stable_suites "$stable_manifest"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 ci_discover_sql_suites() {
   local repo_root="$1"
   local dir

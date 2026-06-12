@@ -1,0 +1,11 @@
+# Known SQL failures accepted by local CI tier classification.
+# Every [[failure]] row must include a reason and an expiry date.
+# Expired rows are treated as failures until they are refreshed or removed.
+
+[[failure]]
+tier = "full"
+suite = "tpc-ds"
+case = "q93"
+error_code = "QueryTimeout"
+reason = "Known distributed scheduling backlog outside P8 type/error observability"
+expires = "2026-07-15"
