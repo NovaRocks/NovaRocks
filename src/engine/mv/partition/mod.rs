@@ -13,8 +13,8 @@ pub(crate) use derivation::{
 #[allow(unused_imports)]
 pub(crate) use derivation::{
     AffectedPartitionError, BoundPartitionField, PartitionDerivationField,
-    bind_spec_to_aggregate_layout, bind_spec_to_target_visible_columns,
-    evaluate_partition_spec, evaluate_partition_spec_record_batch,
+    bind_spec_to_aggregate_layout, bind_spec_to_target_visible_columns, evaluate_partition_spec,
+    evaluate_partition_spec_record_batch,
 };
 pub(crate) use key::{
     MvPartitionKey, MvPartitionKeyField, MvPartitionValue, TargetPartitionFilter,

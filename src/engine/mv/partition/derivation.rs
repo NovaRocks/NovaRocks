@@ -1149,14 +1149,17 @@ mod tests {
             .expect("partitioned");
         let bound = bind_spec_to_target_visible_columns(&spec, &contract).expect("bind");
         let batch = arrow::record_batch::RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("region", DataType::Utf8, false)])),
+            Arc::new(Schema::new(vec![Field::new(
+                "region",
+                DataType::Utf8,
+                false,
+            )])),
             vec![Arc::new(StringArray::from(vec!["west", "east", "west"]))],
         )
         .expect("batch");
 
-        let partitions =
-            evaluate_partition_spec_record_batch(spec.target_spec_id, &bound, &batch)
-                .expect("evaluate");
+        let partitions = evaluate_partition_spec_record_batch(spec.target_spec_id, &bound, &batch)
+            .expect("evaluate");
 
         assert_eq!(
             partitions.into_iter().collect::<Vec<_>>(),

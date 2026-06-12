@@ -57,11 +57,20 @@ pub struct IcebergMergeSinkPlan {
     /// `AllowList`, the locator skips target files whose partition key is not
     /// in the set, mirroring the target-state read-side pruning.
     pub partition_filter: crate::engine::mv::partition::TargetPartitionFilter,
+    /// Target-visible partition derivation used when plan-time affected
+    /// partitions are not available, for example join-side row movement.
+    pub(crate) partition_derivation: Option<BoundTargetPartitionDerivation>,
 }
 
 pub struct TargetLocatorState {
     pub existing_deletes_by_file: crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
     pub referenced_data_file_partitions: crate::engine::delete_flow::ReferencedDataFilePartitions,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct BoundTargetPartitionDerivation {
+    pub(crate) target_spec_id: i32,
+    pub(crate) bound_fields: Vec<crate::engine::mv::partition::BoundPartitionField>,
 }
 
 pub struct IcebergMergeSinkFactory {
@@ -204,6 +213,11 @@ impl IcebergMergeSinkOperator {
              load_target_apply_locator_inputs when has_deletes)"
                 .to_string()
         })?;
+        let partition_filter = delete_batch_partition_filter(
+            &self.plan.partition_filter,
+            self.plan.partition_derivation.as_ref(),
+            &batch,
+        )?;
         let groups = match self.plan.apply_key_value_type {
             ApplyKeyValueType::Int64 => {
                 validate_i64_apply_key_column(&self.plan.apply_key_column)?;
@@ -220,7 +234,7 @@ impl IcebergMergeSinkOperator {
                         &apply_keys,
                         &locator_state.existing_deletes_by_file,
                         &locator_state.referenced_data_file_partitions,
-                        &self.plan.partition_filter,
+                        &partition_filter,
                     ),
                 )??
             }
@@ -239,7 +253,7 @@ impl IcebergMergeSinkOperator {
                         &apply_keys,
                         &locator_state.existing_deletes_by_file,
                         &locator_state.referenced_data_file_partitions,
-                        &self.plan.partition_filter,
+                        &partition_filter,
                     ),
                 )??
             }
@@ -254,7 +268,7 @@ impl IcebergMergeSinkOperator {
                         &apply_keys,
                         &locator_state.existing_deletes_by_file,
                         &locator_state.referenced_data_file_partitions,
-                        &self.plan.partition_filter,
+                        &partition_filter,
                     ),
                 )??
             }
@@ -273,7 +287,7 @@ impl IcebergMergeSinkOperator {
                         &apply_keys,
                         &locator_state.existing_deletes_by_file,
                         &locator_state.referenced_data_file_partitions,
-                        &self.plan.partition_filter,
+                        &partition_filter,
                     ),
                 )??
             }
@@ -283,6 +297,29 @@ impl IcebergMergeSinkOperator {
         }
         Ok(())
     }
+}
+
+fn delete_batch_partition_filter(
+    plan_filter: &crate::engine::mv::partition::TargetPartitionFilter,
+    partition_derivation: Option<&BoundTargetPartitionDerivation>,
+    batch: &RecordBatch,
+) -> Result<crate::engine::mv::partition::TargetPartitionFilter, String> {
+    if plan_filter.is_allow_list() {
+        return Ok(plan_filter.clone());
+    }
+
+    let Some(derivation) = partition_derivation else {
+        return Ok(crate::engine::mv::partition::TargetPartitionFilter::None);
+    };
+
+    let partitions = crate::engine::mv::partition::evaluate_partition_spec_record_batch(
+        derivation.target_spec_id,
+        &derivation.bound_fields,
+        batch,
+    )
+    .map_err(|err| format!("merge sink partition derivation: {err}"))?;
+
+    Ok(crate::engine::mv::partition::TargetPartitionFilter::AllowList(partitions))
 }
 
 fn validate_i64_apply_key_column(apply_key_column: &str) -> Result<(), String> {
@@ -576,6 +613,78 @@ mod tests {
             .collect::<Vec<_>>();
         let chunk_schema = crate::exec::chunk::ChunkSchema::try_new(slots).unwrap();
         Chunk::try_new_with_chunk_schema(batch, Arc::new(chunk_schema)).unwrap()
+    }
+
+    fn partition_key(value: &str) -> crate::engine::mv::partition::MvPartitionKey {
+        crate::engine::mv::partition::MvPartitionKey::new(
+            7,
+            vec![crate::engine::mv::partition::MvPartitionKeyField::new(
+                "region".to_string(),
+                crate::engine::mv::partition::MvPartitionValue::String(value.to_string()),
+            )],
+        )
+    }
+
+    fn partition_batch<const N: usize>(values: [&str; N]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "region",
+            DataType::Utf8,
+            false,
+        )]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(values.to_vec())) as ArrayRef],
+        )
+        .unwrap()
+    }
+
+    fn bound_partition_derivation() -> BoundTargetPartitionDerivation {
+        BoundTargetPartitionDerivation {
+            target_spec_id: 7,
+            bound_fields: vec![crate::engine::mv::partition::BoundPartitionField {
+                partition_field_name: "region".to_string(),
+                column_name: "region".to_string(),
+                transform: iceberg::spec::Transform::Identity,
+            }],
+        }
+    }
+
+    #[test]
+    fn delete_batch_partition_filter_prefers_plan_time_allow_list() {
+        let plan_filter = crate::engine::mv::partition::TargetPartitionFilter::AllowList(
+            [partition_key("planned")].into_iter().collect(),
+        );
+        let batch = partition_batch(["batch"]);
+
+        let filter = delete_batch_partition_filter(
+            &plan_filter,
+            Some(&bound_partition_derivation()),
+            &batch,
+        )
+        .expect("filter");
+
+        assert_eq!(filter, plan_filter);
+    }
+
+    #[test]
+    fn delete_batch_partition_filter_derives_batch_allow_list_when_plan_filter_is_none() {
+        let batch = partition_batch(["west", "east", "west"]);
+
+        let filter = delete_batch_partition_filter(
+            &crate::engine::mv::partition::TargetPartitionFilter::None,
+            Some(&bound_partition_derivation()),
+            &batch,
+        )
+        .expect("filter");
+
+        assert_eq!(
+            filter,
+            crate::engine::mv::partition::TargetPartitionFilter::AllowList(
+                [partition_key("east"), partition_key("west")]
+                    .into_iter()
+                    .collect(),
+            )
+        );
     }
 
     #[test]

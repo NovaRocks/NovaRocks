@@ -10042,6 +10042,22 @@ fn rewrite_refresh_table_uuid_map(
         .collect()
 }
 
+fn merge_sink_partition_derivation(
+    contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+) -> Option<crate::engine::mv::iceberg_merge_sink::BoundTargetPartitionDerivation> {
+    let spec = crate::engine::mv::partition::resolve_partition_derivation_spec(contract)
+        .ok()
+        .flatten()?;
+    let bound_fields =
+        crate::engine::mv::partition::bind_spec_to_target_visible_columns(&spec, contract).ok()?;
+    Some(
+        crate::engine::mv::iceberg_merge_sink::BoundTargetPartitionDerivation {
+            target_spec_id: spec.target_spec_id,
+            bound_fields,
+        },
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn incremental_refresh_iceberg_mv(
     state: &Arc<StandaloneState>,
@@ -10389,6 +10405,7 @@ fn incremental_refresh_iceberg_mv_with_changes(
         // allow-list the planner derived for the target-state read side.
         // `Known` => AllowList; join/union/unpartitioned/NotDerived => None.
         partition_filter: ctx.affected_partitions.to_target_partition_filter(),
+        partition_derivation: merge_sink_partition_derivation(&ctx.rewrite.schema_contract),
     };
     let merge_sink =
         crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkFactory::new(merge_sink_plan);
