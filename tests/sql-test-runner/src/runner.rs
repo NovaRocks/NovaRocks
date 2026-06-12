@@ -36,6 +36,10 @@ fn engine_error_message_body(actual: &str) -> &str {
             rest = stripped.trim_start();
             continue;
         }
+        if let Some(stripped) = strip_mysql_error_debug_wrapper(rest) {
+            rest = stripped.trim_start();
+            continue;
+        }
         if let Some(stripped) = strip_mysql_error_prefix(rest) {
             rest = stripped.trim_start();
             continue;
@@ -45,9 +49,24 @@ fn engine_error_message_body(actual: &str) -> &str {
 }
 
 fn strip_runner_error_prefix(message: &str) -> Option<&str> {
-    let rest = message.strip_prefix("ERROR (")?;
-    let close_idx = rest.find("): ")?;
-    Some(&rest[close_idx + "): ".len()..])
+    for prefix in ["ERROR (", "FAIL ("] {
+        let Some(rest) = message.strip_prefix(prefix) else {
+            continue;
+        };
+        let close_idx = rest.find("): ")?;
+        return Some(&rest[close_idx + "): ".len()..]);
+    }
+    None
+}
+
+fn strip_mysql_error_debug_wrapper(message: &str) -> Option<&str> {
+    let rest = message.strip_prefix("MySqlError { ")?;
+    let rest = rest.strip_suffix(" }").unwrap_or(rest);
+    if rest.starts_with("ERROR ") {
+        Some(rest)
+    } else {
+        None
+    }
 }
 
 fn strip_mysql_error_prefix(message: &str) -> Option<&str> {
@@ -137,6 +156,23 @@ mod tests {
             extract_engine_error_code("[CommitUnknown] commit outcome unavailable"),
             Some("CommitUnknown".to_string())
         );
+    }
+
+    #[test]
+    fn extract_engine_error_code_reads_mysql_error_debug_wrapper() {
+        let actual = "FAIL (0.00s): MySqlError { ERROR 1235 (42000): [UnsupportedDistributedDmlShape] ADMIN RAISE ENGINE ERROR: forced P8 SQL runner error-code smoke }";
+
+        assert_eq!(
+            extract_engine_error_code(actual),
+            Some("UnsupportedDistributedDmlShape".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_engine_error_code_rejects_malformed_mysql_error_debug_wrapper() {
+        let actual = "FAIL (0.00s): MySqlError { [CommitUnknown] bare wrapper }";
+
+        assert_eq!(extract_engine_error_code(actual), None);
     }
 
     #[test]
