@@ -116,6 +116,7 @@ fn test_iceberg_connector_module() {
         cache_policy: ParquetReadCachePolicy::with_flags(false, false, None),
         profile_label: Some("connector_smoke".to_string()),
         iceberg_output_schema: None,
+        variant_path_columns: Vec::new(),
         query_global_dicts: Default::default(),
     };
     let config = novarocks::novarocks_connector_iceberg::HdfsScanConfig {

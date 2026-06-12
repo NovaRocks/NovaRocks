@@ -47,6 +47,7 @@ use std::sync::Arc;
 
 use crate::cache::{CachedRangeReader, DataCacheContext};
 use crate::common::config;
+use crate::common::ids::SlotId;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::expr::cast_with_special_rules;
 use crate::exec::node::BoxedExecIter;
@@ -196,6 +197,20 @@ fn runtime_filters_to_min_max_predicates(
 }
 
 #[derive(Clone, Debug)]
+pub struct VariantPathSpec {
+    pub source_slot_id: SlotId,
+    pub source_read_slot_id: SlotId,
+    pub output_slot_id: SlotId,
+    pub source_name: String,
+    pub output_name: String,
+    pub source_field: Field,
+    pub output_field: Field,
+    pub canonical_path: String,
+    pub requested_type: DataType,
+    pub strict: bool,
+}
+
+#[derive(Clone, Debug)]
 pub struct ParquetScanConfig {
     pub columns: Vec<String>,
     pub chunk_schema: ChunkSchemaRef,
@@ -208,6 +223,7 @@ pub struct ParquetScanConfig {
     pub cache_policy: ParquetReadCachePolicy,
     pub profile_label: Option<String>,
     pub iceberg_output_schema: Option<SchemaRef>,
+    pub variant_path_columns: Vec<VariantPathSpec>,
     /// Per-slot global dictionary encode maps. Non-empty only for dict-encoded
     /// scans. When set, the iterator reads the dict columns as Utf8 and maps
     /// them to Int32 dict ids.
@@ -2097,6 +2113,7 @@ mod tests {
             cache_policy: ParquetReadCachePolicy::with_flags(false, false, None),
             profile_label: None,
             iceberg_output_schema: iceberg_output_schema.map(Arc::new),
+            variant_path_columns: Vec::new(),
             query_global_dicts: Default::default(),
         }
     }

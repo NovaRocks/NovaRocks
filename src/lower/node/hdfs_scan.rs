@@ -21,6 +21,7 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::cache::{CacheOptions, DataCacheManager, ExternalDataCacheRangeOptions};
 use crate::common::ids::SlotId;
+use crate::common::min_max_predicate::MinMaxPredicate;
 use crate::connector::iceberg::position_delete::{
     IcebergDeleteFileSpec, convert_scan_range_delete_files,
 };
@@ -30,7 +31,7 @@ use crate::connector::iceberg::{
     lookup_iceberg_table_location, snapshot_iceberg_table_locations,
 };
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::formats::parquet::ParquetReadCachePolicy;
+use crate::formats::parquet::{ParquetReadCachePolicy, VariantPathSpec};
 use crate::lower::expr::parse_min_max_conjuncts;
 use crate::lower::layout::{
     Layout, chunk_schema_for_layout, col_names_from_layout, find_tuple_descriptor,
@@ -45,7 +46,7 @@ use crate::novarocks_connectors::{
     ParquetScanConfig, ScanConfig,
 };
 use crate::novarocks_logging::{debug, warn};
-use crate::{descriptors, internal_service, plan_nodes, types};
+use crate::{descriptors, exprs, internal_service, plan_nodes, types};
 
 /// Cache Iceberg table locations from descriptor table for later use in HDFS scan lowering.
 pub(crate) fn cache_iceberg_table_locations(desc_tbl: Option<&descriptors::TDescriptorTable>) {
@@ -60,7 +61,7 @@ fn next_hidden_slot_id(visible_slot_ids: &[SlotId]) -> Result<SlotId, String> {
         .unwrap_or(0);
     let next = max_slot
         .checked_add(1)
-        .ok_or_else(|| "cannot allocate hidden iceberg row-lineage slot id".to_string())?;
+        .ok_or_else(|| "cannot allocate hidden HDFS scan slot id".to_string())?;
     Ok(SlotId::new(next))
 }
 
@@ -69,7 +70,7 @@ fn advance_hidden_slot_id(slot_id: SlotId) -> Result<SlotId, String> {
         .as_u32()
         .checked_add(1)
         .map(SlotId::new)
-        .ok_or_else(|| "cannot allocate hidden iceberg row-lineage slot id".to_string())
+        .ok_or_else(|| "cannot allocate hidden HDFS scan slot id".to_string())
 }
 
 fn iceberg_reserved_field(name: &str, nullable: bool, field_id: i32) -> Field {
@@ -361,6 +362,349 @@ fn scan_ranges_have_extended_column(
     }))
 }
 
+#[derive(Clone, Debug)]
+struct HdfsSlotInfo {
+    name: String,
+    primitive: types::TPrimitiveType,
+    arrow_type: arrow::datatypes::DataType,
+    nullable: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct HdfsScanReadColumns {
+    columns: Vec<String>,
+    slot_ids: Vec<SlotId>,
+    slot_types: Vec<types::TPrimitiveType>,
+    fields: Vec<Field>,
+    iceberg_projected_columns: Vec<IcebergArrowColumn>,
+}
+
+impl HdfsScanReadColumns {
+    fn push_physical(&mut self, read_slot_id: SlotId, info: &HdfsSlotInfo) {
+        self.columns.push(info.name.clone());
+        self.slot_ids.push(read_slot_id);
+        self.slot_types.push(info.primitive);
+        self.fields.push(Field::new(
+            info.name.clone(),
+            info.arrow_type.clone(),
+            info.nullable,
+        ));
+        self.iceberg_projected_columns.push(IcebergArrowColumn {
+            name: info.name.clone(),
+            data_type: info.arrow_type.clone(),
+            nullable: info.nullable,
+        });
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct HdfsVariantPathPlan {
+    specs: Vec<VariantPathSpec>,
+    output_slot_ids: HashSet<SlotId>,
+}
+
+fn required_variant_path_string(
+    node_id: i32,
+    idx: usize,
+    field_name: &str,
+    value: Option<&String>,
+) -> Result<String, String> {
+    value
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| {
+            format!(
+                "HDFS_SCAN_NODE node_id={node_id} variant_path_columns[{idx}] missing {field_name}"
+            )
+        })
+}
+
+fn validate_variant_path_column_path(
+    node_id: i32,
+    idx: usize,
+    canonical_path: &str,
+) -> Result<(), String> {
+    let parsed = crate::exec::variant::parse_variant_path(canonical_path).map_err(|e| {
+        format!(
+            "HDFS_SCAN_NODE node_id={node_id} variant_path_columns[{idx}] invalid canonical_path={canonical_path:?}: {e}"
+        )
+    })?;
+    if parsed.segments.is_empty() {
+        return Err(format!(
+            "HDFS_SCAN_NODE node_id={node_id} variant_path_columns[{idx}] canonical_path={canonical_path:?} must reference at least one object key"
+        ));
+    }
+    if parsed.segments.iter().any(|segment| {
+        !matches!(
+            segment,
+            crate::exec::variant::VariantPathSegment::ObjectKey(_)
+        )
+    }) {
+        return Err(format!(
+            "HDFS_SCAN_NODE node_id={node_id} variant_path_columns[{idx}] canonical_path={canonical_path:?} only supports object-key path segments"
+        ));
+    }
+    Ok(())
+}
+
+fn is_supported_variant_path_requested_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Boolean | DataType::Int64 | DataType::Float64 | DataType::Utf8 | DataType::Date32
+    )
+}
+
+fn parse_hdfs_scan_variant_path_columns(
+    node_id: i32,
+    variant_path_columns: Option<&[plan_nodes::TVariantPathColumn]>,
+    slot_info_map: &HashMap<SlotId, HdfsSlotInfo>,
+) -> Result<HdfsVariantPathPlan, String> {
+    let Some(variant_path_columns) = variant_path_columns else {
+        return Ok(HdfsVariantPathPlan::default());
+    };
+    let mut plan = HdfsVariantPathPlan::default();
+    for (idx, column) in variant_path_columns.iter().enumerate() {
+        let source_slot_id = column.source_slot_id.ok_or_else(|| {
+            format!(
+                "HDFS_SCAN_NODE node_id={node_id} variant_path_columns[{idx}] missing source_slot_id"
+            )
+        })?;
+        let output_slot_id = column.output_slot_id.ok_or_else(|| {
+            format!(
+                "HDFS_SCAN_NODE node_id={node_id} variant_path_columns[{idx}] missing output_slot_id"
+            )
+        })?;
+        let source_slot_id = SlotId::try_from(source_slot_id).map_err(|e| {
+            format!(
+                "HDFS_SCAN_NODE node_id={node_id} variant_path_columns[{idx}] invalid source_slot_id: {e}"
+            )
+        })?;
+        let output_slot_id = SlotId::try_from(output_slot_id).map_err(|e| {
+            format!(
+                "HDFS_SCAN_NODE node_id={node_id} variant_path_columns[{idx}] invalid output_slot_id: {e}"
+            )
+        })?;
+        if source_slot_id == output_slot_id {
+            return Err(format!(
+                "HDFS_SCAN_NODE node_id={node_id} variant_path_columns[{idx}] source_slot_id must differ from output_slot_id"
+            ));
+        }
+        let source_info = slot_info_map.get(&source_slot_id).ok_or_else(|| {
+            format!(
+                "HDFS_SCAN_NODE node_id={node_id} variant_path_columns[{idx}] source_slot_id={source_slot_id} has no slot descriptor"
+            )
+        })?;
+        let output_info = slot_info_map.get(&output_slot_id).ok_or_else(|| {
+            format!(
+                "HDFS_SCAN_NODE node_id={node_id} variant_path_columns[{idx}] output_slot_id={output_slot_id} has no slot descriptor"
+            )
+        })?;
+        if source_info.primitive != types::TPrimitiveType::VARIANT {
+            return Err(format!(
+                "HDFS_SCAN_NODE node_id={node_id} variant_path_columns[{idx}] source_slot_id={source_slot_id} expects VARIANT, got {:?}",
+                source_info.primitive
+            ));
+        }
+        let source_name = required_variant_path_string(
+            node_id,
+            idx,
+            "source_column",
+            column.source_column.as_ref(),
+        )?;
+        let output_name = required_variant_path_string(
+            node_id,
+            idx,
+            "output_column",
+            column.output_column.as_ref(),
+        )?;
+        let canonical_path = required_variant_path_string(
+            node_id,
+            idx,
+            "canonical_path",
+            column.canonical_path.as_ref(),
+        )?;
+        validate_variant_path_column_path(node_id, idx, &canonical_path)?;
+        if source_name != source_info.name {
+            return Err(format!(
+                "HDFS_SCAN_NODE node_id={node_id} variant_path_columns[{idx}] source_column={source_name:?} does not match source_slot_id={source_slot_id} name {:?}",
+                source_info.name
+            ));
+        }
+        if output_name != output_info.name {
+            return Err(format!(
+                "HDFS_SCAN_NODE node_id={node_id} variant_path_columns[{idx}] output_column={output_name:?} does not match output_slot_id={output_slot_id} name {:?}",
+                output_info.name
+            ));
+        }
+        let requested_type_desc = column.requested_type.as_ref().ok_or_else(|| {
+            format!(
+                "HDFS_SCAN_NODE node_id={node_id} variant_path_columns[{idx}] missing requested_type"
+            )
+        })?;
+        let requested_type = crate::lower::type_lowering::arrow_type_from_desc(requested_type_desc)
+            .ok_or_else(|| {
+                format!(
+                    "HDFS_SCAN_NODE node_id={node_id} variant_path_columns[{idx}] unsupported requested_type for output_slot_id={output_slot_id}"
+                )
+            })?;
+        if !is_supported_variant_path_requested_type(&requested_type) {
+            return Err(format!(
+                "HDFS_SCAN_NODE node_id={node_id} variant_path_columns[{idx}] unsupported requested_type {:?} for variant path output_slot_id={output_slot_id}",
+                requested_type
+            ));
+        }
+        if requested_type != output_info.arrow_type {
+            return Err(format!(
+                "HDFS_SCAN_NODE node_id={node_id} variant_path_columns[{idx}] requested_type {:?} does not match output_slot_id={output_slot_id} type {:?}",
+                requested_type, output_info.arrow_type
+            ));
+        }
+        let strict = column.strict.ok_or_else(|| {
+            format!("HDFS_SCAN_NODE node_id={node_id} variant_path_columns[{idx}] missing strict")
+        })?;
+        if !plan.output_slot_ids.insert(output_slot_id) {
+            return Err(format!(
+                "HDFS_SCAN_NODE node_id={node_id} duplicate variant_path_columns output_slot_id={output_slot_id}"
+            ));
+        }
+        plan.specs.push(VariantPathSpec {
+            source_slot_id,
+            source_read_slot_id: source_slot_id,
+            output_slot_id,
+            source_name,
+            output_name,
+            source_field: Field::new(
+                source_info.name.clone(),
+                source_info.arrow_type.clone(),
+                source_info.nullable,
+            ),
+            output_field: Field::new(
+                output_info.name.clone(),
+                output_info.arrow_type.clone(),
+                output_info.nullable,
+            ),
+            canonical_path,
+            requested_type,
+            strict,
+        });
+    }
+    Ok(plan)
+}
+
+fn variant_path_ensure_source_read_columns(
+    node_id: i32,
+    plan: &mut HdfsVariantPathPlan,
+    read_columns: &mut HdfsScanReadColumns,
+    visible_slot_ids: &[SlotId],
+    slot_info_map: &HashMap<SlotId, HdfsSlotInfo>,
+    physical_hdfs_columns: &HashSet<String>,
+    restrict_to_hive_columns: bool,
+) -> Result<(), String> {
+    if plan.specs.is_empty() {
+        return Ok(());
+    }
+
+    let mut source_read_slots = HashMap::new();
+    for spec in &plan.specs {
+        if read_columns.slot_ids.contains(&spec.source_slot_id) {
+            source_read_slots.insert(spec.source_slot_id, spec.source_slot_id);
+        }
+    }
+
+    let mut reserved_slot_ids = slot_info_map.keys().copied().collect::<Vec<_>>();
+    reserved_slot_ids.extend_from_slice(visible_slot_ids);
+    reserved_slot_ids.extend(read_columns.slot_ids.iter().copied());
+    let mut next_hidden_slot_id = next_hidden_slot_id(&reserved_slot_ids)?;
+
+    for spec in &mut plan.specs {
+        let source_info = slot_info_map.get(&spec.source_slot_id).ok_or_else(|| {
+            format!(
+                "HDFS_SCAN_NODE node_id={node_id} variant source slot_id={} has no slot descriptor",
+                spec.source_slot_id
+            )
+        })?;
+        if restrict_to_hive_columns
+            && !physical_hdfs_columns.contains(&source_info.name.to_ascii_lowercase())
+        {
+            return Err(format!(
+                "HDFS_SCAN_NODE node_id={node_id} variant source column {:?} slot_id={} is not a physical HDFS column",
+                source_info.name, spec.source_slot_id
+            ));
+        }
+        if let Some(read_slot_id) = source_read_slots.get(&spec.source_slot_id).copied() {
+            spec.source_read_slot_id = read_slot_id;
+            continue;
+        }
+
+        while reserved_slot_ids.contains(&next_hidden_slot_id) {
+            next_hidden_slot_id = advance_hidden_slot_id(next_hidden_slot_id)?;
+        }
+        let read_slot_id = next_hidden_slot_id;
+        read_columns.push_physical(read_slot_id, source_info);
+        source_read_slots.insert(spec.source_slot_id, read_slot_id);
+        spec.source_read_slot_id = read_slot_id;
+        reserved_slot_ids.push(read_slot_id);
+        next_hidden_slot_id = advance_hidden_slot_id(next_hidden_slot_id)?;
+    }
+
+    Ok(())
+}
+
+fn min_max_conjunct_references_any_slot(
+    node_id: i32,
+    expr: &exprs::TExpr,
+    skipped_slots: &HashSet<SlotId>,
+) -> Result<bool, String> {
+    if skipped_slots.is_empty() {
+        return Ok(false);
+    }
+    for node in &expr.nodes {
+        if let Some(slot_ref) = node.slot_ref.as_ref() {
+            let slot_id = SlotId::try_from(slot_ref.slot_id).map_err(|e| {
+                format!(
+                    "HDFS_SCAN_NODE node_id={node_id} min_max_conjunct slot_ref has invalid slot_id={}: {e}",
+                    slot_ref.slot_id
+                )
+            })?;
+            if skipped_slots.contains(&slot_id) {
+                return Ok(true);
+            }
+        }
+        if let Some(slot_id) = node.vslot_ref.as_ref().and_then(|v| v.slot_id) {
+            let slot_id = SlotId::try_from(slot_id).map_err(|e| {
+                format!(
+                    "HDFS_SCAN_NODE node_id={node_id} min_max_conjunct vslot_ref has invalid slot_id={slot_id}: {e}"
+                )
+            })?;
+            if skipped_slots.contains(&slot_id) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn parse_hdfs_scan_min_max_conjuncts(
+    node_id: i32,
+    min_max_conjuncts: &[exprs::TExpr],
+    out_layout: &Layout,
+    variant_output_slot_ids: &HashSet<SlotId>,
+) -> Result<Vec<MinMaxPredicate>, String> {
+    let mut predicates = Vec::new();
+    for conjunct in min_max_conjuncts {
+        if min_max_conjunct_references_any_slot(node_id, conjunct, variant_output_slot_ids)? {
+            debug!(
+                "HDFS_SCAN_NODE node_id={} skipping min/max conjunct on variant path synthetic output slot",
+                node_id
+            );
+            continue;
+        }
+        predicates.extend(parse_min_max_conjuncts(conjunct, out_layout)?);
+    }
+    Ok(predicates)
+}
+
 /// Lower a HDFS_SCAN_NODE plan node to a `Lowered` ExecNode.
 pub(crate) fn lower_hdfs_scan_node(
     node: &plan_nodes::TPlanNode,
@@ -430,15 +774,7 @@ pub(crate) fn lower_hdfs_scan_node(
         .slot_descriptors
         .as_ref()
         .ok_or_else(|| "missing slot_descriptors in desc_tbl".to_string())?;
-    let mut slot_info_map: HashMap<
-        SlotId,
-        (
-            String,
-            types::TPrimitiveType,
-            arrow::datatypes::DataType,
-            bool,
-        ),
-    > = HashMap::new();
+    let mut slot_info_map: HashMap<SlotId, HdfsSlotInfo> = HashMap::new();
     for s in slot_descs {
         let (Some(parent), Some(id), Some(slot_type)) = (s.parent, s.id, s.slot_type.as_ref())
         else {
@@ -455,12 +791,17 @@ pub(crate) fn lower_hdfs_scan_node(
         let nullable = s.is_nullable.unwrap_or(true);
         slot_info_map.insert(
             SlotId::try_from(id)?,
-            (name, primitive, arrow_type, nullable),
+            HdfsSlotInfo {
+                name,
+                primitive,
+                arrow_type,
+                nullable,
+            },
         );
     }
-    let has_row_position_marker_slots = slot_info_map.values().any(|(name, _, _, _)| {
-        crate::exec::row_position::is_row_source_id(name)
-            || crate::exec::row_position::is_scan_range_id(name)
+    let has_row_position_marker_slots = slot_info_map.values().any(|info| {
+        crate::exec::row_position::is_row_source_id(&info.name)
+            || crate::exec::row_position::is_scan_range_id(&info.name)
     });
     let physical_hdfs_columns = hive_column_names
         .as_ref()
@@ -481,11 +822,12 @@ pub(crate) fn lower_hdfs_scan_node(
         .ok_or_else(|| format!("missing per_node_scan_ranges for node_id={}", node.node_id))?;
 
     let mut slot_ids = Vec::with_capacity(out_layout.order.len());
-    let mut data_columns = Vec::new();
-    let mut data_slot_ids = Vec::new();
-    let mut data_slot_types = Vec::new();
-    let mut data_fields = Vec::new();
-    let mut iceberg_projected_columns = Vec::new();
+    let mut read_columns = HdfsScanReadColumns::default();
+    let mut variant_path_plan = parse_hdfs_scan_variant_path_columns(
+        node.node_id,
+        hdfs.variant_path_columns.as_deref(),
+        &slot_info_map,
+    )?;
 
     let mut row_source_slot: Option<SlotId> = None;
     let mut scan_range_slot: Option<SlotId> = None;
@@ -506,11 +848,19 @@ pub(crate) fn lower_hdfs_scan_node(
 
     for (tuple_id, slot_id) in &out_layout.order {
         let slot_id = SlotId::try_from(*slot_id)?;
-        let (name, primitive, arrow_type, nullable) = slot_info_map
+        let info = slot_info_map
             .get(&slot_id)
             .ok_or_else(|| format!("missing slot info for tuple_id={tuple_id} slot_id={slot_id}"))?
             .clone();
+        let name = info.name.clone();
+        let primitive = info.primitive;
+        let arrow_type = info.arrow_type.clone();
+        let nullable = info.nullable;
         slot_ids.push(slot_id);
+
+        if variant_path_plan.output_slot_ids.contains(&slot_id) {
+            continue;
+        }
 
         if crate::exec::row_position::is_row_source_id(&name) {
             if primitive != types::TPrimitiveType::INT {
@@ -620,16 +970,18 @@ pub(crate) fn lower_hdfs_scan_node(
             continue;
         }
 
-        data_columns.push(name.clone());
-        data_slot_ids.push(slot_id);
-        data_slot_types.push(primitive);
-        data_fields.push(Field::new(name.clone(), arrow_type.clone(), nullable));
-        iceberg_projected_columns.push(IcebergArrowColumn {
-            name,
-            data_type: arrow_type,
-            nullable,
-        });
+        read_columns.push_physical(slot_id, &info);
     }
+
+    variant_path_ensure_source_read_columns(
+        node.node_id,
+        &mut variant_path_plan,
+        &mut read_columns,
+        &slot_ids,
+        &slot_info_map,
+        &physical_hdfs_columns,
+        hive_column_names.is_some(),
+    )?;
 
     if !slot_ids.is_empty() && slot_ids.len() != columns.len() {
         return Err(format!(
@@ -1084,11 +1436,14 @@ pub(crate) fn lower_hdfs_scan_node(
             "[Row Group Pruning] parsing {} min_max_conjuncts",
             min_max_conjs.len()
         );
-        for conj in min_max_conjs {
-            for pred in parse_min_max_conjuncts(conj, &out_layout)? {
-                debug!("[Row Group Pruning] parsed predicate: {:?}", pred);
-                min_max_predicates.push(pred);
-            }
+        min_max_predicates = parse_hdfs_scan_min_max_conjuncts(
+            node.node_id,
+            min_max_conjs,
+            &out_layout,
+            &variant_path_plan.output_slot_ids,
+        )?;
+        for pred in &min_max_predicates {
+            debug!("[Row Group Pruning] parsed predicate: {:?}", pred);
         }
         if !min_max_predicates.is_empty() {
             debug!(
@@ -1107,7 +1462,7 @@ pub(crate) fn lower_hdfs_scan_node(
     debug!(
         "HDFS_SCAN creating scan with {} ranges, {} columns",
         ranges.len(),
-        data_columns.len()
+        read_columns.columns.len()
     );
     debug!("HDFS_SCAN final out_layout.order: {:?}", out_layout.order);
     debug!("HDFS_SCAN final out_layout.index: {:?}", out_layout.index);
@@ -1128,41 +1483,60 @@ pub(crate) fn lower_hdfs_scan_node(
             node.node_id
         ));
     }
+    if !variant_path_plan.specs.is_empty()
+        && scan_format.is_some()
+        && scan_format != Some(descriptors::THdfsFileFormat::PARQUET)
+    {
+        return Err(format!(
+            "HDFS_SCAN_NODE node_id={} variant_path_columns require PARQUET scan ranges, got {:?}",
+            node.node_id, scan_format
+        ));
+    }
     if iceberg_table.is_some()
         && (iceberg_virtual_row_id_slot.is_some()
             || iceberg_virtual_last_updated_seq_slot.is_some())
     {
-        let mut hidden_slot_id = next_hidden_slot_id(&slot_ids)?;
+        let mut hidden_slot_bases = slot_ids.clone();
+        hidden_slot_bases.extend(read_columns.slot_ids.iter().copied());
+        let mut hidden_slot_id = next_hidden_slot_id(&hidden_slot_bases)?;
         if iceberg_virtual_row_id_slot.is_some() {
-            data_columns.push(crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string());
-            data_slot_ids.push(hidden_slot_id);
-            data_slot_types.push(types::TPrimitiveType::BIGINT);
-            data_fields.push(iceberg_reserved_field(
+            read_columns
+                .columns
+                .push(crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string());
+            read_columns.slot_ids.push(hidden_slot_id);
+            read_columns.slot_types.push(types::TPrimitiveType::BIGINT);
+            read_columns.fields.push(iceberg_reserved_field(
                 crate::exec::row_position::ICEBERG_ROW_ID_COL,
                 true,
                 crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_ROW_ID,
             ));
-            iceberg_projected_columns.push(IcebergArrowColumn {
-                name: crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
-                data_type: DataType::Int64,
-                nullable: true,
-            });
+            read_columns
+                .iceberg_projected_columns
+                .push(IcebergArrowColumn {
+                    name: crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                });
             hidden_slot_id = advance_hidden_slot_id(hidden_slot_id)?;
         }
         if iceberg_virtual_last_updated_seq_slot.is_some() {
-            data_columns.push(crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string());
-            data_slot_ids.push(hidden_slot_id);
-            data_slot_types.push(types::TPrimitiveType::BIGINT);
-            data_fields.push(iceberg_reserved_field(
+            read_columns
+                .columns
+                .push(crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string());
+            read_columns.slot_ids.push(hidden_slot_id);
+            read_columns.slot_types.push(types::TPrimitiveType::BIGINT);
+            read_columns.fields.push(iceberg_reserved_field(
                 crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
                 true,
                 crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
             ));
-            iceberg_projected_columns.push(IcebergArrowColumn {
-                name: crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
-                data_type: DataType::Int64,
-                nullable: true,
-            });
+            read_columns
+                .iceberg_projected_columns
+                .push(IcebergArrowColumn {
+                    name: crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                });
         }
     }
     // Build the per-slot dict encode map up front. iceberg/HDFS dict columns
@@ -1176,11 +1550,13 @@ pub(crate) fn lower_hdfs_scan_node(
     // building `iceberg_output_schema`. `parquet_chunk_schema` below keeps the
     // Int32 output type on purpose — it is the post-encode output layout that
     // `encode_batch_with_query_global_dicts` produces.
-    let query_global_dicts = build_scan_query_global_dicts(&data_slot_ids, query_global_dict_map)?;
+    let query_global_dicts =
+        build_scan_query_global_dicts(&read_columns.slot_ids, query_global_dict_map)?;
     if !query_global_dicts.is_empty() {
-        for (col, slot_id) in iceberg_projected_columns
+        for (col, slot_id) in read_columns
+            .iceberg_projected_columns
             .iter_mut()
-            .zip(data_slot_ids.iter())
+            .zip(read_columns.slot_ids.iter())
         {
             if query_global_dicts.contains_key(slot_id)
                 && let Some(scan_ty) =
@@ -1192,7 +1568,9 @@ pub(crate) fn lower_hdfs_scan_node(
     }
     let iceberg_output_schema = iceberg_table
         .as_ref()
-        .map(|iceberg| build_projected_output_schema(iceberg, &iceberg_projected_columns))
+        .map(|iceberg| {
+            build_projected_output_schema(iceberg, &read_columns.iceberg_projected_columns)
+        })
         .transpose()?
         .flatten();
     let output_chunk_schema = chunk_schema_for_layout(desc_tbl, &out_layout)?;
@@ -1201,13 +1579,13 @@ pub(crate) fn lower_hdfs_scan_node(
     // schema must omit virtual-column slots to keep the column-count check on
     // the parquet side happy.
     let parquet_chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-        &Schema::new(data_fields),
-        &data_slot_ids,
+        &Schema::new(read_columns.fields.clone()),
+        &read_columns.slot_ids,
     )?;
     let parquet_cfg = ParquetScanConfig {
-        columns: data_columns,
+        columns: read_columns.columns,
         chunk_schema: parquet_chunk_schema,
-        slot_types: data_slot_types,
+        slot_types: read_columns.slot_types,
         case_sensitive,
         enable_page_index,
         min_max_predicates,
@@ -1220,6 +1598,7 @@ pub(crate) fn lower_hdfs_scan_node(
         ),
         profile_label: Some(format!("hdfs_scan_node_id={}", node.node_id)),
         iceberg_output_schema,
+        variant_path_columns: variant_path_plan.specs,
         query_global_dicts: Default::default(),
     };
     let orc_cfg = OrcScanConfig {
@@ -1306,30 +1685,22 @@ pub(crate) fn lower_hdfs_scan_node(
 
 fn output_slots_from_layout(
     layout: &Layout,
-    slot_info_map: &HashMap<
-        SlotId,
-        (
-            String,
-            types::TPrimitiveType,
-            arrow::datatypes::DataType,
-            bool,
-        ),
-    >,
+    slot_info_map: &HashMap<SlotId, HdfsSlotInfo>,
 ) -> Result<Vec<IcebergMetadataOutputColumn>, String> {
     layout
         .order
         .iter()
         .map(|(_, slot_id)| {
             let slot_id = SlotId::try_from(*slot_id)?;
-            let (name, _, data_type, nullable) = slot_info_map
+            let info = slot_info_map
                 .get(&slot_id)
                 .ok_or_else(|| format!("missing slot info for slot_id={slot_id}"))?
                 .clone();
             Ok(IcebergMetadataOutputColumn {
-                name,
+                name: info.name,
                 slot_id,
-                data_type,
-                nullable,
+                data_type: info.arrow_type,
+                nullable: info.nullable,
             })
         })
         .collect()
@@ -1337,16 +1708,20 @@ fn output_slots_from_layout(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap, HashSet};
 
     use crate::common::ids::SlotId;
     use crate::connector::FileScanRange;
     use crate::internal_service::TQueryOptions;
+    use crate::lower::layout::layout_from_slot_ids;
     use crate::{exprs, plan_nodes, types};
+    use arrow::datatypes::{DataType, Field};
 
     use super::{
-        extract_change_op_from_extended_columns, file_cache_flags_from_query_options,
-        resolve_cloud_object_store_config, validate_included_positions_full_file_range,
+        HdfsScanReadColumns, HdfsSlotInfo, extract_change_op_from_extended_columns,
+        file_cache_flags_from_query_options, parse_hdfs_scan_min_max_conjuncts,
+        parse_hdfs_scan_variant_path_columns, resolve_cloud_object_store_config,
+        validate_included_positions_full_file_range, variant_path_ensure_source_read_columns,
     };
 
     #[test]
@@ -1447,6 +1822,338 @@ mod tests {
             is_index_only_filter: None,
             is_nondeterministic: None,
         }])
+    }
+
+    fn default_expr_node() -> exprs::TExprNode {
+        exprs::TExprNode {
+            node_type: exprs::TExprNodeType::INT_LITERAL,
+            type_: crate::lower::type_lowering::scalar_type_desc(types::TPrimitiveType::BIGINT),
+            opcode: None,
+            num_children: 0,
+            agg_expr: None,
+            bool_literal: None,
+            case_expr: None,
+            date_literal: None,
+            float_literal: None,
+            int_literal: None,
+            in_predicate: None,
+            is_null_pred: None,
+            like_pred: None,
+            literal_pred: None,
+            slot_ref: None,
+            string_literal: None,
+            tuple_is_null_pred: None,
+            info_func: None,
+            decimal_literal: None,
+            output_scale: 0,
+            fn_call_expr: None,
+            large_int_literal: None,
+            output_column: None,
+            output_type: None,
+            vector_opcode: None,
+            fn_: None,
+            vararg_start_idx: None,
+            child_type: None,
+            vslot_ref: None,
+            used_subfield_names: None,
+            binary_literal: None,
+            copy_flag: None,
+            check_is_out_of_bounds: None,
+            use_vectorized: None,
+            has_nullable_child: None,
+            is_nullable: None,
+            child_type_desc: None,
+            is_monotonic: None,
+            dict_query_expr: None,
+            dictionary_get_expr: None,
+            is_index_only_filter: None,
+            is_nondeterministic: None,
+        }
+    }
+
+    fn slot_eq_int_expr(slot_id: i32, value: i64) -> exprs::TExpr {
+        let type_desc =
+            crate::lower::type_lowering::scalar_type_desc(types::TPrimitiveType::BIGINT);
+        exprs::TExpr::new(vec![
+            exprs::TExprNode {
+                node_type: exprs::TExprNodeType::BINARY_PRED,
+                opcode: Some(crate::opcodes::TExprOpcode::EQ),
+                num_children: 2,
+                child_type_desc: Some(type_desc.clone()),
+                ..default_expr_node()
+            },
+            exprs::TExprNode {
+                node_type: exprs::TExprNodeType::SLOT_REF,
+                type_: type_desc.clone(),
+                slot_ref: Some(exprs::TSlotRef {
+                    slot_id,
+                    tuple_id: 1,
+                }),
+                ..default_expr_node()
+            },
+            exprs::TExprNode {
+                node_type: exprs::TExprNodeType::INT_LITERAL,
+                type_: type_desc,
+                int_literal: Some(exprs::TIntLiteral { value }),
+                ..default_expr_node()
+            },
+        ])
+    }
+
+    fn test_slot_info(
+        name: &str,
+        primitive: types::TPrimitiveType,
+        arrow_type: DataType,
+        nullable: bool,
+    ) -> HdfsSlotInfo {
+        HdfsSlotInfo {
+            name: name.to_string(),
+            primitive,
+            arrow_type,
+            nullable,
+        }
+    }
+
+    fn test_variant_path_column(
+        source_slot_id: Option<i32>,
+        output_slot_id: Option<i32>,
+    ) -> plan_nodes::TVariantPathColumn {
+        plan_nodes::TVariantPathColumn::new(
+            source_slot_id,
+            output_slot_id,
+            Some("payload".to_string()),
+            Some("__nr_var_payload_a".to_string()),
+            Some("$.a".to_string()),
+            Some(crate::lower::type_lowering::scalar_type_desc(
+                types::TPrimitiveType::BIGINT,
+            )),
+            Some(true),
+        )
+    }
+
+    fn test_variant_path_column_with(
+        source_slot_id: Option<i32>,
+        output_slot_id: Option<i32>,
+        canonical_path: Option<&str>,
+        requested_type: types::TPrimitiveType,
+    ) -> plan_nodes::TVariantPathColumn {
+        plan_nodes::TVariantPathColumn::new(
+            source_slot_id,
+            output_slot_id,
+            Some("payload".to_string()),
+            Some("__nr_var_payload_a".to_string()),
+            canonical_path.map(ToString::to_string),
+            Some(crate::lower::type_lowering::scalar_type_desc(
+                requested_type,
+            )),
+            Some(true),
+        )
+    }
+
+    fn variant_slot_info_map() -> HashMap<SlotId, HdfsSlotInfo> {
+        variant_slot_info_map_with_output_type(types::TPrimitiveType::BIGINT, DataType::Int64)
+    }
+
+    fn variant_slot_info_map_with_output_type(
+        output_primitive: types::TPrimitiveType,
+        output_arrow_type: DataType,
+    ) -> HashMap<SlotId, HdfsSlotInfo> {
+        HashMap::from([
+            (
+                SlotId::new(1),
+                test_slot_info(
+                    "payload",
+                    types::TPrimitiveType::VARIANT,
+                    DataType::LargeBinary,
+                    true,
+                ),
+            ),
+            (
+                SlotId::new(2),
+                test_slot_info(
+                    "__nr_var_payload_a",
+                    output_primitive,
+                    output_arrow_type,
+                    true,
+                ),
+            ),
+        ])
+    }
+
+    #[test]
+    fn lower_hdfs_scan_variant_path_valid_spec_parses_runtime_spec() {
+        let variant_columns = vec![test_variant_path_column(Some(1), Some(2))];
+        let slot_info = variant_slot_info_map();
+
+        let plan =
+            parse_hdfs_scan_variant_path_columns(7, Some(variant_columns.as_slice()), &slot_info)
+                .expect("variant path plan");
+
+        assert_eq!(plan.specs.len(), 1);
+        assert!(plan.output_slot_ids.contains(&SlotId::new(2)));
+        let spec = &plan.specs[0];
+        assert_eq!(spec.source_slot_id, SlotId::new(1));
+        assert_eq!(spec.source_read_slot_id, SlotId::new(1));
+        assert_eq!(spec.output_slot_id, SlotId::new(2));
+        assert_eq!(spec.source_name, "payload");
+        assert_eq!(spec.output_name, "__nr_var_payload_a");
+        assert_eq!(spec.canonical_path, "$.a");
+        assert_eq!(spec.requested_type, DataType::Int64);
+        assert!(spec.strict);
+        assert_eq!(
+            spec.source_field,
+            Field::new("payload", DataType::LargeBinary, true)
+        );
+        assert_eq!(
+            spec.output_field,
+            Field::new("__nr_var_payload_a", DataType::Int64, true)
+        );
+    }
+
+    #[test]
+    fn lower_hdfs_scan_variant_path_missing_source_slot_errors_clearly() {
+        let variant_columns = vec![test_variant_path_column(None, Some(2))];
+        let slot_info = variant_slot_info_map();
+
+        let error =
+            parse_hdfs_scan_variant_path_columns(7, Some(variant_columns.as_slice()), &slot_info)
+                .unwrap_err();
+
+        assert!(error.contains("variant_path_columns[0] missing source_slot_id"));
+    }
+
+    #[test]
+    fn lower_hdfs_scan_variant_path_missing_output_slot_errors_clearly() {
+        let variant_columns = vec![test_variant_path_column(Some(1), None)];
+        let slot_info = variant_slot_info_map();
+
+        let error =
+            parse_hdfs_scan_variant_path_columns(7, Some(variant_columns.as_slice()), &slot_info)
+                .unwrap_err();
+
+        assert!(error.contains("variant_path_columns[0] missing output_slot_id"));
+    }
+
+    #[test]
+    fn lower_hdfs_scan_variant_path_rejects_root_empty_and_index_paths() {
+        for path in [Some("$"), Some(""), Some("$[0]"), Some("$.a[0]")] {
+            let variant_columns = vec![test_variant_path_column_with(
+                Some(1),
+                Some(2),
+                path,
+                types::TPrimitiveType::BIGINT,
+            )];
+            let slot_info = variant_slot_info_map();
+
+            let error = parse_hdfs_scan_variant_path_columns(
+                7,
+                Some(variant_columns.as_slice()),
+                &slot_info,
+            )
+            .unwrap_err();
+
+            assert!(
+                error.contains("canonical_path"),
+                "path {path:?} should be rejected with canonical_path context, got {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn lower_hdfs_scan_variant_path_rejects_unsupported_requested_type() {
+        let variant_columns = vec![test_variant_path_column_with(
+            Some(1),
+            Some(2),
+            Some("$.a"),
+            types::TPrimitiveType::INT,
+        )];
+        let slot_info =
+            variant_slot_info_map_with_output_type(types::TPrimitiveType::INT, DataType::Int32);
+
+        let error =
+            parse_hdfs_scan_variant_path_columns(7, Some(variant_columns.as_slice()), &slot_info)
+                .unwrap_err();
+
+        assert!(error.contains("unsupported requested_type"));
+    }
+
+    #[test]
+    fn lower_hdfs_scan_variant_path_rejects_same_source_and_output_slot() {
+        let variant_columns = vec![test_variant_path_column(Some(1), Some(1))];
+        let slot_info = variant_slot_info_map();
+
+        let error =
+            parse_hdfs_scan_variant_path_columns(7, Some(variant_columns.as_slice()), &slot_info)
+                .unwrap_err();
+
+        assert!(error.contains("source_slot_id must differ from output_slot_id"));
+    }
+
+    #[test]
+    fn lower_hdfs_scan_variant_path_min_max_skips_synthetic_output_slot() {
+        let layout = layout_from_slot_ids(1, [2, 3]);
+        let variant_outputs = HashSet::from([SlotId::new(2)]);
+        let conjunct = slot_eq_int_expr(2, 7);
+
+        let predicates =
+            parse_hdfs_scan_min_max_conjuncts(7, &[conjunct], &layout, &variant_outputs)
+                .expect("parse guarded min/max conjuncts");
+
+        assert!(
+            predicates.is_empty(),
+            "synthetic variant output min/max must not be mapped to parquet column 0"
+        );
+    }
+
+    #[test]
+    fn lower_hdfs_scan_variant_path_output_slot_is_not_data_column() {
+        let variant_columns = vec![test_variant_path_column(Some(1), Some(2))];
+        let slot_info = variant_slot_info_map();
+        let plan =
+            parse_hdfs_scan_variant_path_columns(7, Some(variant_columns.as_slice()), &slot_info)
+                .expect("variant path plan");
+        let mut read_columns = HdfsScanReadColumns::default();
+
+        for slot_id in [SlotId::new(1), SlotId::new(2)] {
+            if plan.output_slot_ids.contains(&slot_id) {
+                continue;
+            }
+            let info = slot_info.get(&slot_id).expect("slot info");
+            read_columns.push_physical(slot_id, info);
+        }
+
+        assert_eq!(read_columns.columns, vec!["payload".to_string()]);
+        assert_eq!(read_columns.slot_ids, vec![SlotId::new(1)]);
+        assert_eq!(read_columns.fields.len(), 1);
+        assert_eq!(read_columns.fields[0].name(), "payload");
+    }
+
+    #[test]
+    fn lower_hdfs_scan_variant_path_source_slot_added_as_hidden_read_when_not_output() {
+        let variant_columns = vec![test_variant_path_column(Some(1), Some(2))];
+        let slot_info = variant_slot_info_map();
+        let mut plan =
+            parse_hdfs_scan_variant_path_columns(7, Some(variant_columns.as_slice()), &slot_info)
+                .expect("variant path plan");
+        let mut read_columns = HdfsScanReadColumns::default();
+        let visible_slot_ids = vec![SlotId::new(2)];
+        let physical_hdfs_columns = HashSet::from(["payload".to_string()]);
+
+        variant_path_ensure_source_read_columns(
+            7,
+            &mut plan,
+            &mut read_columns,
+            &visible_slot_ids,
+            &slot_info,
+            &physical_hdfs_columns,
+            true,
+        )
+        .expect("hidden source read column");
+
+        assert_eq!(read_columns.columns, vec!["payload".to_string()]);
+        assert_eq!(read_columns.slot_ids, vec![SlotId::new(3)]);
+        assert_eq!(plan.specs[0].source_slot_id, SlotId::new(1));
+        assert_eq!(plan.specs[0].source_read_slot_id, SlotId::new(3));
     }
 
     #[test]

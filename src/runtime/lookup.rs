@@ -327,6 +327,7 @@ pub(crate) fn execute_lookup_request(
             ),
             profile_label: None,
             iceberg_output_schema: None,
+            variant_path_columns: Vec::new(),
             query_global_dicts: Default::default(),
         };
         let format = match scan_cfg.file_format {
