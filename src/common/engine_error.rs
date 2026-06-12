@@ -109,6 +109,12 @@ pub struct EngineError {
     detail: EngineErrorDetail,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EngineErrorLogFields {
+    pub code: &'static str,
+    pub message: String,
+}
+
 impl EngineError {
     fn new(code: EngineErrorCode, detail: EngineErrorDetail) -> Self {
         Self { code, detail }
@@ -183,6 +189,18 @@ impl EngineError {
         )
     }
 
+    pub fn commit_known_uncommitted(message: impl Into<String>) -> Self {
+        Self::static_message(EngineErrorCode::CommitKnownUncommitted, message)
+    }
+
+    pub fn commit_unknown(message: impl Into<String>) -> Self {
+        Self::static_message(EngineErrorCode::CommitUnknown, message)
+    }
+
+    pub fn iceberg_write_descriptor_mismatch(message: impl Into<String>) -> Self {
+        Self::static_message(EngineErrorCode::IcebergWriteDescriptorMismatch, message)
+    }
+
     pub fn to_user_message(&self) -> String {
         match &self.detail {
             EngineErrorDetail::WriteCoordinatorGone { query_id } => {
@@ -207,6 +225,13 @@ impl EngineError {
 
     pub fn to_bracketed_user_message(&self) -> String {
         format!("[{}] {}", self.code.as_str(), self.to_user_message())
+    }
+
+    pub fn to_log_fields(&self) -> EngineErrorLogFields {
+        EngineErrorLogFields {
+            code: self.code.as_str(),
+            message: self.to_user_message(),
+        }
     }
 
     pub fn to_tstatus_code(&self) -> crate::status_code::TStatusCode {
@@ -335,5 +360,41 @@ mod tests {
             opensrv_mysql::ErrorKind::ER_UNKNOWN_ERROR
         );
         assert_eq!(err.to_report_status_code(), REPORT_EXEC_STATUS_ERROR);
+    }
+
+    #[test]
+    fn named_message_constructors_return_stable_codes() {
+        let known_uncommitted = EngineError::commit_known_uncommitted("commit was aborted");
+        assert_eq!(
+            known_uncommitted.code(),
+            EngineErrorCode::CommitKnownUncommitted
+        );
+        assert!(known_uncommitted
+            .to_user_message()
+            .contains("commit was aborted"));
+
+        let unknown = EngineError::commit_unknown("coordinator did not return a decision");
+        assert_eq!(unknown.code(), EngineErrorCode::CommitUnknown);
+        assert!(unknown
+            .to_user_message()
+            .contains("coordinator did not return a decision"));
+
+        let descriptor =
+            EngineError::iceberg_write_descriptor_mismatch("writer output slot changed");
+        assert_eq!(
+            descriptor.code(),
+            EngineErrorCode::IcebergWriteDescriptorMismatch
+        );
+        assert!(descriptor
+            .to_user_message()
+            .contains("writer output slot changed"));
+    }
+
+    #[test]
+    fn log_fields_include_stable_code_and_readable_message() {
+        let err = EngineError::commit_unknown("commit outcome unavailable");
+        let fields = err.to_log_fields();
+        assert_eq!(fields.code, "CommitUnknown");
+        assert!(fields.message.contains("commit outcome unavailable"));
     }
 }
