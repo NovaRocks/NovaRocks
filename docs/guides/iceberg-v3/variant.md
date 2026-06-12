@@ -32,6 +32,20 @@ SELECT id, variant_get(payload, '$.user.id') AS uid
 - 用 variant 表达式函数提取字段（`$.path.to.field`）
 - variant 字段在投影裁剪 / 列裁剪 / runtime filter 中正常参与
 
+## ✅ variant_get / try_variant_get（Spark 对齐）
+
+- `variant_get/try_variant_get(v, path[, type])`：`path` 与 `type` 必须是字符串字面量。
+  2 参返回 variant；3 参返回指定类型，`type` ∈ {boolean, int, bigint, float, double, string,
+  date, datetime}。
+- 语义：missing path → NULL；variant null → NULL；cast 失败 → `variant_get` 报错、
+  `try_variant_get` 返回 NULL。
+- 求值经由上游 parquet-variant-compute kernel/语义（与 scan 层 shredded 快路径同属
+  parquet-variant-compute，语义保持一致，IV3-6 决策 B）；旧 `get_variant_*` 家族保持原有
+  宽松强转语义不变，不参与下推优化。
+- 第一个参数也接受 JSON 字符串 / VARCHAR（如 `variant_get(s, '$.a', 'bigint')`，其中 `s`
+  是 JSON 文本）；`parse_json(s)` 先转成 variant 后也可作为第一个参数。坏 JSON 在 raw
+  JSON/VARCHAR 与 `parse_json(s)` 模式下都是查询错误。
+
 ## ✅ Variant INSERT happy path（PR #87）
 
 ```sql

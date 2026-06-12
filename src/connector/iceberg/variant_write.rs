@@ -229,10 +229,8 @@ pub(crate) fn transform_variant_columns_for_write(
             }
         })
         .collect();
-    let out_schema = arrow::datatypes::Schema::new_with_metadata(
-        out_fields,
-        batch.schema().metadata().clone(),
-    );
+    let out_schema =
+        arrow::datatypes::Schema::new_with_metadata(out_fields, batch.schema().metadata().clone());
     RecordBatch::try_new(std::sync::Arc::new(out_schema), out_columns)
         .map_err(|e| format!("variant_write: rebuild RecordBatch: {e}"))
 }
@@ -498,9 +496,8 @@ mod tests {
         ]));
         let id_arr = Int64Array::from(vec![Some(42i64)]);
         let v_arr = LargeBinaryArray::from_iter_values([raw.as_slice()]);
-        let batch =
-            RecordBatch::try_new(input_schema, vec![Arc::new(id_arr), Arc::new(v_arr)])
-                .expect("batch");
+        let batch = RecordBatch::try_new(input_schema, vec![Arc::new(id_arr), Arc::new(v_arr)])
+            .expect("batch");
 
         // Must succeed despite id being Int64 vs annotated Int32.
         let out = transform_variant_columns_for_write(&batch, &annotated, &[1])

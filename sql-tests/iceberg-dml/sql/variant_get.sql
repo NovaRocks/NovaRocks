@@ -21,25 +21,31 @@ INSERT INTO ${case_db}.t_variant_get VALUES
   (5, NULL),
   (6, parse_json('{"a": "abc"}'));
 
--- query 2: typed extraction; missing path / SQL NULL / unconvertible-cast
+-- query 2
+-- typed extraction; missing path / SQL NULL / unconvertible-cast
 -- rows are NULL; numeric narrowing (1.5) truncates per Spark CAST semantics
 -- (IV3-6 cast-semantics decision 2026-06-11).
 SELECT id, try_variant_get(v, '$.a', 'bigint') FROM ${case_db}.t_variant_get ORDER BY id;
 
--- query 3: strict extraction; row 4 truncates (1.5 -> 1), not an error.
+-- query 3
+-- strict extraction; row 4 truncates (1.5 -> 1), not an error.
 SELECT id, variant_get(v, '$.a', 'bigint') FROM ${case_db}.t_variant_get WHERE id <= 4 ORDER BY id;
 
--- query 4: strict extraction over a genuinely unconvertible row must fail.
+-- query 4
+-- strict extraction over a genuinely unconvertible row must fail.
 -- @expect_error=cast
 SELECT variant_get(v, '$.a', 'bigint') FROM ${case_db}.t_variant_get WHERE id = 6;
 
--- query 5: 2-arg form returns variant; display via variant_typeof.
+-- query 5
+-- 2-arg form returns variant; display via variant_typeof.
 SELECT id, variant_typeof(variant_get(v, '$.a')) FROM ${case_db}.t_variant_get WHERE id <= 2 ORDER BY id;
 
--- query 6: predicate usage (the PR-4 pushdown target shape).
+-- query 6
+-- predicate usage (the PR-4 pushdown target shape).
 SELECT id FROM ${case_db}.t_variant_get WHERE try_variant_get(v, '$.a', 'bigint') > 5 ORDER BY id;
 
--- query 7: string extraction.
+-- query 7
+-- string extraction.
 SELECT id, variant_get(v, '$.b', 'string') FROM ${case_db}.t_variant_get WHERE id <= 3 ORDER BY id;
 
 -- query 8

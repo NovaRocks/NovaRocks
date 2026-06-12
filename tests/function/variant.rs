@@ -218,8 +218,8 @@ fn test_variant_get_bigint_root() {
     let arg1 = utf8_lit(&mut arena, "$");
     let arg2 = utf8_lit(&mut arena, "bigint");
     let expr = common::typed_null(&mut arena, DataType::Int64);
-    let out = eval_variant_function("variant_get", &arena, expr, &[arg0, arg1, arg2], &chunk)
-        .unwrap();
+    let out =
+        eval_variant_function("variant_get", &arena, expr, &[arg0, arg1, arg2], &chunk).unwrap();
     let out = out.as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(out.value(0), 123);
 }
@@ -287,13 +287,10 @@ fn test_variant_get_unconvertible_cast_errors() {
 fn make_json_chunk(json: &str) -> (Chunk, ExprId, ExprArena) {
     let arr = Arc::new(StringArray::from(vec![Some(json)])) as ArrayRef;
     let field = Field::new("j", DataType::Utf8, true);
-    let batch =
-        RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![arr]).unwrap();
-    let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
-        batch.schema().as_ref(),
-        &[SlotId::new(1)],
-    )
-    .expect("chunk schema");
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![arr]).unwrap();
+    let chunk_schema =
+        ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &[SlotId::new(1)])
+            .expect("chunk schema");
     let chunk = Chunk::new_with_chunk_schema(batch, chunk_schema);
     let mut arena = ExprArena::default();
     let arg0 = slot_id_expr(&mut arena, 1, DataType::Utf8);
@@ -306,8 +303,8 @@ fn test_variant_get_json_string_input() {
     let arg1 = utf8_lit(&mut arena, "$.a");
     let arg2 = utf8_lit(&mut arena, "bigint");
     let expr = common::typed_null(&mut arena, DataType::Int64);
-    let out = eval_variant_function("variant_get", &arena, expr, &[arg0, arg1, arg2], &chunk)
-        .unwrap();
+    let out =
+        eval_variant_function("variant_get", &arena, expr, &[arg0, arg1, arg2], &chunk).unwrap();
     let out = out.as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(out.value(0), 42);
 }
@@ -318,8 +315,8 @@ fn test_variant_get_missing_path_is_null() {
     let arg1 = utf8_lit(&mut arena, "$.b");
     let arg2 = utf8_lit(&mut arena, "bigint");
     let expr = common::typed_null(&mut arena, DataType::Int64);
-    let out = eval_variant_function("variant_get", &arena, expr, &[arg0, arg1, arg2], &chunk)
-        .unwrap();
+    let out =
+        eval_variant_function("variant_get", &arena, expr, &[arg0, arg1, arg2], &chunk).unwrap();
     let out = out.as_any().downcast_ref::<Int64Array>().unwrap();
     assert!(out.is_null(0), "missing path is NULL even in strict mode");
 }
@@ -343,16 +340,24 @@ fn test_variant_get_matches_get_variant_int_on_exact_types() {
     let arg1 = utf8_lit(&mut arena, "$");
     let arg2 = utf8_lit(&mut arena, "bigint");
     let expr = common::typed_null(&mut arena, DataType::Int64);
-    let via_new = eval_variant_function("variant_get", &arena, expr, &[arg0, arg1, arg2], &chunk)
-        .unwrap();
+    let via_new =
+        eval_variant_function("variant_get", &arena, expr, &[arg0, arg1, arg2], &chunk).unwrap();
     let (chunk2, b0, mut arena2) = make_variant_chunk(variant);
     let b1 = utf8_lit(&mut arena2, "$");
     let expr2 = common::typed_null(&mut arena2, DataType::Int64);
     let via_old =
         eval_variant_function("get_variant_int", &arena2, expr2, &[b0, b1], &chunk2).unwrap();
     assert_eq!(
-        via_new.as_any().downcast_ref::<Int64Array>().unwrap().value(0),
-        via_old.as_any().downcast_ref::<Int64Array>().unwrap().value(0)
+        via_new
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        via_old
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0)
     );
 }
 
