@@ -640,14 +640,12 @@ pub(super) fn align_chunk_schema_to_batch(
             .slots()
             .get(idx)
             .ok_or_else(|| format!("missing chunk schema slot at index {}", idx))?;
-        // Allow nullable batch fields to satisfy a non-nullable contract.
-        // Source operators (e.g. FILE_SCAN for CSV) always produce nullable
-        // columns; the actual NOT-NULL constraint is enforced downstream
-        // (e.g. by the sink's row validation or the storage layer).
-        let nullable_ok = field.is_nullable() == expected.nullable() || field.is_nullable();
+        // Arrow field nullability is producer metadata here. A nullable batch
+        // can flow through a non-nullable contract because source-level NOT
+        // NULL enforcement happens downstream, and a non-nullable batch is a
+        // valid runtime instance of a nullable contract.
         if field.name() != expected.name()
             || !is_compatible_chunk_field_type(expected.data_type(), field.data_type())
-            || !nullable_ok
         {
             return Err(format!(
                 "chunk schema field mismatch at index {}: batch=({}, {:?}, {}) contract=({}, {:?}, {})",
@@ -700,7 +698,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::array::{
-        Array, ArrayRef, BinaryArray, Int32Array, Int64Array, MapArray, StructArray,
+        Array, ArrayRef, BinaryArray, Int8Array, Int32Array, Int64Array, MapArray, StructArray,
     };
     use arrow::buffer::OffsetBuffer;
     use arrow::datatypes::{DataType, Field, Fields, Schema};
@@ -763,6 +761,31 @@ mod tests {
         assert_eq!(slot.primitive_type(), Some(TPrimitiveType::HLL));
         assert_eq!(slot.name(), "a");
         assert_eq!(slot.unique_id(), Some(77));
+    }
+
+    #[test]
+    fn align_chunk_schema_accepts_non_nullable_batch_for_nullable_contract() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("c13", DataType::Int8, false)])),
+            vec![Arc::new(Int8Array::from(vec![1_i8, 2, 3])) as ArrayRef],
+        )
+        .expect("record batch");
+        let contract = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                SlotId::new(13),
+                Field::new("c13", DataType::Int8, true),
+                None,
+                None,
+            )])
+            .expect("chunk schema"),
+        );
+
+        let chunk = Chunk::try_new_with_chunk_schema(batch, contract).expect("chunk");
+
+        assert!(
+            !chunk.chunk_schema().slots()[0].nullable(),
+            "aligned chunk schema should keep the actual batch field metadata"
+        );
     }
 
     #[test]

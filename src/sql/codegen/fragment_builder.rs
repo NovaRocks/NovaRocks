@@ -2865,8 +2865,9 @@ impl<'a> PlanFragmentBuilder<'a> {
             ordering_exprs,
             is_asc,
             nulls_first_list,
-            None::<Vec<exprs::TExpr>>,
+            self.slot_ref_exprs_for_columns(&child.scope, &node.output_columns, "Sort")?,
         );
+        let sort_tuple_slot_exprs = sort_info.sort_tuple_slot_exprs.clone();
 
         let mut sort_plan_node = nodes::default_plan_node();
         sort_plan_node.node_id = sort_node_id;
@@ -2884,7 +2885,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             is_asc_order: None,
             is_default_limit: None,
             nulls_first: None,
-            sort_tuple_slot_exprs: None,
+            sort_tuple_slot_exprs,
             has_outer_join_child: None,
             sql_sort_keys: None,
             analytic_partition_exprs,
@@ -2947,7 +2948,6 @@ impl<'a> PlanFragmentBuilder<'a> {
         let child = self.visit(&node.children[0])?;
 
         let sort_node_id = self.alloc_node();
-        let sort_tuple_id = *child.tuple_ids.last().unwrap();
 
         let mut ordering_exprs = Vec::new();
         let mut is_asc = Vec::new();
@@ -2973,7 +2973,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         sort_plan_node.node_type = plan_nodes::TPlanNodeType::SORT_NODE;
         sort_plan_node.num_children = 1;
         sort_plan_node.limit = op.limit.unwrap_or(-1);
-        sort_plan_node.row_tuples = vec![sort_tuple_id];
+        sort_plan_node.row_tuples = child.tuple_ids.clone();
         sort_plan_node.nullable_tuples = vec![];
         sort_plan_node.compact_data = true;
         sort_plan_node.sort_node = Some(plan_nodes::TSortNode {
@@ -4491,6 +4491,15 @@ impl<'a> PlanFragmentBuilder<'a> {
         scope: &ExprScope,
         output_columns: &[crate::sql::analysis::OutputColumn],
     ) -> Result<Option<Vec<exprs::TExpr>>, String> {
+        self.slot_ref_exprs_for_columns(scope, output_columns, "result sink")
+    }
+
+    fn slot_ref_exprs_for_columns(
+        &self,
+        scope: &ExprScope,
+        output_columns: &[crate::sql::analysis::OutputColumn],
+        context: &str,
+    ) -> Result<Option<Vec<exprs::TExpr>>, String> {
         if output_columns.is_empty() {
             return Ok(None);
         }
@@ -4499,8 +4508,8 @@ impl<'a> PlanFragmentBuilder<'a> {
         for column in output_columns {
             let binding = scope.resolve_by_id(column.column_id).ok_or_else(|| {
                 format!(
-                    "result sink cannot resolve output column `{}` id={}",
-                    column.name, column.column_id.0
+                    "{} cannot resolve output column `{}` id={}",
+                    context, column.name, column.column_id.0
                 )
             })?;
             let type_desc = expr_compiler::binding_type_desc(binding)?;
@@ -5247,7 +5256,8 @@ mod tests {
         AggregateStateMergeOp, JoinDistribution, Operator, PhysicalDecodeOp,
         PhysicalDistributionOp, PhysicalGenerateSeriesOp, PhysicalHashJoinEqCondition,
         PhysicalHashJoinOp, PhysicalProjectOp, PhysicalRepeatOp, PhysicalScanOp, PhysicalSortOp,
-        PhysicalUnionOp, PhysicalValuesOp, PhysicalWindowOp, ScanDictionaryColumn,
+        PhysicalTopNOp, PhysicalUnionOp, PhysicalValuesOp, PhysicalWindowOp, ScanDictionaryColumn,
+        TopNPhase,
     };
     use crate::sql::optimizer::physical_plan::{
         JoinExecutionDistribution, PhysicalPlanNode, PlanExecutionProps,
@@ -5509,6 +5519,39 @@ mod tests {
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         }
+    }
+
+    fn two_value_join_for_sort_test() -> (PhysicalPlanNode, Vec<OutputColumn>, SortItem) {
+        let left_col = output_col_for_test(9101, "left_id", DataType::Int32, false);
+        let right_col = output_col_for_test(9102, "right_id", DataType::Int32, false);
+        let left_expr =
+            column_ref_expr_for_test(left_col.column_id, "left_id", DataType::Int32, false);
+        let right_expr =
+            column_ref_expr_for_test(right_col.column_id, "right_id", DataType::Int32, false);
+        let output_columns = vec![left_col.clone(), right_col.clone()];
+        let join = physical_node_for_test(
+            Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: left_expr.clone(),
+                    right: right_expr,
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Colocate,
+            }),
+            vec![
+                values_plan_for_test(vec![left_col]),
+                values_plan_for_test(vec![right_col]),
+            ],
+            output_columns.clone(),
+        );
+        let sort_item = SortItem {
+            expr: left_expr,
+            asc: true,
+            nulls_first: false,
+        };
+        (join, output_columns, sort_item)
     }
 
     fn builder_for_scope_test<'a>(
@@ -7304,6 +7347,85 @@ mod tests {
                 .nodes
                 .iter()
                 .any(|node| { node.node_type == plan_nodes::TPlanNodeType::EXCHANGE_NODE })
+        );
+    }
+
+    #[test]
+    fn sort_over_multi_tuple_child_emits_projection_exprs() {
+        let (join, output_columns, sort_item) = two_value_join_for_sort_test();
+        let plan = physical_node_for_test(
+            Operator::PhysicalSort(PhysicalSortOp {
+                items: vec![sort_item],
+                analytic_partition_exprs: Vec::new(),
+            }),
+            vec![join],
+            output_columns,
+        );
+
+        let build =
+            PlanFragmentBuilder::build(&plan, &DummyCatalog, &mock_iceberg_registry(), "default")
+                .expect("build");
+        let root = build
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == build.root_fragment_id)
+            .expect("root fragment");
+        let sort_node = root
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.node_type == plan_nodes::TPlanNodeType::SORT_NODE)
+            .expect("sort node");
+        let sort = sort_node.sort_node.as_ref().expect("sort payload");
+
+        assert_eq!(sort_node.row_tuples.len(), 2);
+        assert_eq!(
+            sort.sort_info.sort_tuple_slot_exprs.as_ref().map(Vec::len),
+            Some(2),
+            "Sort over a multi-tuple child must describe its visible output projection"
+        );
+    }
+
+    #[test]
+    fn topn_over_multi_tuple_child_preserves_tuple_contract() {
+        let (join, output_columns, sort_item) = two_value_join_for_sort_test();
+        let plan = physical_node_for_test(
+            Operator::PhysicalTopN(PhysicalTopNOp {
+                items: vec![sort_item],
+                limit: Some(10),
+                offset: None,
+                phase: TopNPhase::Final,
+                is_split: false,
+            }),
+            vec![join],
+            output_columns,
+        );
+
+        let build =
+            PlanFragmentBuilder::build(&plan, &DummyCatalog, &mock_iceberg_registry(), "default")
+                .expect("build");
+        let root = build
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == build.root_fragment_id)
+            .expect("root fragment");
+        let sort_node = root
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.node_type == plan_nodes::TPlanNodeType::SORT_NODE)
+            .expect("sort node");
+        let sort = sort_node.sort_node.as_ref().expect("sort payload");
+
+        assert_eq!(
+            sort_node.row_tuples.len(),
+            2,
+            "TopN preserves its child's relational output, including both join tuples"
+        );
+        assert_eq!(
+            sort.sort_info.sort_tuple_slot_exprs.as_ref().map(Vec::len),
+            None,
+            "TopN should preserve child tuple layout directly instead of remapping by plan output ids"
         );
     }
 
