@@ -7,10 +7,10 @@ use arrow::datatypes::DataType;
 use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, TypedExpr, UnOp};
 use crate::sql::catalog::ScanSource;
 use crate::sql::optimizer::estimate::arith::MAX_ROW_COUNT;
-use crate::sql::optimizer::operator::{AggMode, JoinDistribution, Operator};
+use crate::sql::optimizer::operator::{AggMode, JoinDistribution, Operator, PhysicalScanOp};
 use crate::sql::optimizer::physical_plan::{JoinExecutionDistribution, PhysicalPlanNode};
 use crate::sql::optimizer::property::DistributionSpec;
-use crate::sql::planner::plan::{ApplyKind, LogicalPlan};
+use crate::sql::planner::plan::{ApplyKind, LogicalPlan, ScanVariantColumn};
 
 /// Build the per-node `stats={...}` trailer surfaced under
 /// `Verbose | Costs | Analyze` levels. Future PRs (OPT-3 NDV, OPT-4
@@ -480,6 +480,13 @@ fn format_physical_node(
                     }
                 }
             }
+            if matches!(
+                level,
+                ExplainLevel::Verbose | ExplainLevel::Costs | ExplainLevel::Analyze
+            ) && let Some(line) = scan_variant_column_line(op)
+            {
+                out.push(format!("{pad}     {line}"));
+            }
             let local_hints = explain_hints_for_scan(op);
             if matches!(level, ExplainLevel::Costs) && local_hints.has_decode {
                 out.push(format!("{pad}     Decode"));
@@ -922,10 +929,7 @@ fn explain_hints_for_scan(
     }
 }
 
-fn scan_pruned_type_lines(
-    op: &crate::sql::optimizer::operator::PhysicalScanOp,
-    required_columns: &[String],
-) -> Vec<String> {
+fn scan_pruned_type_lines(op: &PhysicalScanOp, required_columns: &[String]) -> Vec<String> {
     required_columns
         .iter()
         .filter_map(|required| {
@@ -941,8 +945,46 @@ fn scan_pruned_type_lines(
         .collect()
 }
 
+fn scan_variant_column_line(op: &PhysicalScanOp) -> Option<String> {
+    if op.variant_columns.is_empty() {
+        return None;
+    }
+    let columns = op
+        .variant_columns
+        .iter()
+        .map(format_scan_variant_column)
+        .collect::<Vec<_>>();
+    Some(format!("variant columns: {}", columns.join(", ")))
+}
+
+fn format_scan_variant_column(col: &ScanVariantColumn) -> String {
+    let function_name = if col.strict {
+        "variant_get"
+    } else {
+        "try_variant_get"
+    };
+    format!(
+        "{} := {function_name}({}, '{}', '{}')",
+        col.synthetic_column,
+        col.source_column,
+        col.canonical_path,
+        format_variant_requested_type(&col.requested_type)
+    )
+}
+
+fn format_variant_requested_type(data_type: &DataType) -> &'static str {
+    match data_type {
+        DataType::Boolean => "boolean",
+        DataType::Int64 => "bigint",
+        DataType::Float64 => "double",
+        DataType::Utf8 => "string",
+        DataType::Date32 => "date",
+        _ => "unsupported",
+    }
+}
+
 fn scan_required_column_type<'a>(
-    op: &'a crate::sql::optimizer::operator::PhysicalScanOp,
+    op: &'a PhysicalScanOp,
     required: &str,
 ) -> Option<(usize, &'a DataType)> {
     let table_pos = op
@@ -1308,7 +1350,9 @@ mod tests {
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::property::PhysicalPropertySet;
     use crate::sql::optimizer::statistics::{Confidence, Statistics};
-    use crate::sql::planner::plan::{AggregateStateMergeNode, LogicalPlan, ValuesNode};
+    use crate::sql::planner::plan::{
+        AggregateStateMergeNode, LogicalPlan, ScanVariantColumn, ValuesNode,
+    };
 
     fn explain_logical_plan_for_test(plan: &LogicalPlan) -> String {
         explain_plan(plan, ExplainLevel::Normal).join("\n")
@@ -1673,6 +1717,43 @@ mod tests {
         assert_eq!(
             verbose, analyze,
             "Analyze should match Verbose when confidence has no visible suffix"
+        );
+    }
+
+    #[test]
+    fn explain_variant_path_columns() {
+        let mut plan = build_minimal_scan_plan_for_explain_test();
+        let Operator::PhysicalScan(op) = &mut plan.op else {
+            panic!("expected scan plan");
+        };
+        op.variant_columns.push(ScanVariantColumn {
+            source_column_id: ColumnId::new_for_test(1),
+            source_column: "v".to_string(),
+            synthetic_column_id: ColumnId::new_for_test(2),
+            synthetic_column: "__nr_var_v_0".to_string(),
+            canonical_path: "$.a".to_string(),
+            requested_type: DataType::Int64,
+            strict: true,
+        });
+
+        let expected = "variant columns: __nr_var_v_0 := variant_get(v, '$.a', 'bigint')";
+
+        for level in [
+            ExplainLevel::Verbose,
+            ExplainLevel::Costs,
+            ExplainLevel::Analyze,
+        ] {
+            let output = explain_physical_plan(&plan, level).join("\n");
+            assert!(
+                output.contains(expected),
+                "{level:?} explain should contain variant path columns, got:\n{output}"
+            );
+        }
+
+        let normal = explain_physical_plan(&plan, ExplainLevel::Normal).join("\n");
+        assert!(
+            !normal.contains("variant columns:"),
+            "Normal explain must hide variant path columns, got:\n{normal}"
         );
     }
 

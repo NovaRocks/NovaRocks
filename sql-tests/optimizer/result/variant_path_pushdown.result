@@ -1,0 +1,19 @@
+-- query 3
+Explain String
+GATHER EXCHANGE stats={rows=25000}
+  PROJECT [id] stats={rows=25000}
+    SCAN db_sqlt_7ab26f5f75909e01.t_variant_path_pushdown stats={rows=25000}
+         TABLE: db_sqlt_7ab26f5f75909e01.t_variant_path_pushdown
+         columns: id, __nr_var_v_0
+         variant columns: __nr_var_v_0 := variant_get(v, '$.a', 'bigint')
+         predicates: __nr_var_v_0 = 1
+
+-- query 5
+Explain String
+GATHER EXCHANGE stats={rows=25000}
+  PROJECT [id] stats={rows=25000}
+    SCAN db_sqlt_7ab26f5f75909e01.t_variant_path_pushdown stats={rows=25000}
+         TABLE: db_sqlt_7ab26f5f75909e01.t_variant_path_pushdown
+         columns: id, v
+         min-max stats
+         predicates: variant_get(v, '$.a', 'bigint') = 1
