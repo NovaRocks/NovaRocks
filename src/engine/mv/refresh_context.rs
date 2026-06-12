@@ -70,6 +70,37 @@ pub(crate) struct IcebergMvRefreshContext {
     pub iceberg_catalog: Arc<dyn iceberg::Catalog>,
     pub target_table: iceberg::table::Table,
     pub affected_partitions: crate::engine::mv::partition::AffectedTargetPartitions,
+    pub pruning_limits: MvRefreshPruningLimits,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MvRefreshPruningLimits {
+    pub max_touched_groups: usize,
+    pub max_affected_partitions: usize,
+}
+
+impl Default for MvRefreshPruningLimits {
+    fn default() -> Self {
+        Self {
+            max_touched_groups: 100_000,
+            max_affected_partitions: 4_096,
+        }
+    }
+}
+
+impl MvRefreshPruningLimits {
+    pub(crate) fn from_standalone_config(
+        config: &crate::common::app_config::StandaloneServerConfig,
+    ) -> Self {
+        Self {
+            max_touched_groups: config.mv_refresh_max_touched_groups,
+            max_affected_partitions: config.mv_refresh_max_affected_partitions,
+        }
+    }
+
+    pub(crate) fn affected_partition_count_exceeds_limit(&self, partition_count: usize) -> bool {
+        partition_count > self.max_affected_partitions
+    }
 }
 
 /// Debug-only view of an `IcebergMvRewriteContext`. No `Display` impl — log
@@ -581,7 +612,40 @@ impl IcebergMvRefreshContext {
         iceberg_catalog: Arc<dyn iceberg::Catalog>,
         target_table: iceberg::table::Table,
     ) -> Result<Self, String> {
-        Self::new_with_affected_partitions(
+        Self::new_with_pruning_limits(
+            target,
+            mv_id,
+            current_catalog,
+            current_database,
+            mv_definition,
+            canonical_select_query,
+            base_refs,
+            pin,
+            iceberg_catalogs,
+            target_entry,
+            iceberg_catalog,
+            target_table,
+            MvRefreshPruningLimits::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_pruning_limits(
+        target: IcebergMvTarget,
+        mv_id: i64,
+        current_catalog: Option<&str>,
+        current_database: &str,
+        mv_definition: Arc<StoredMvDefinition>,
+        canonical_select_query: Arc<sqlparser::ast::Query>,
+        base_refs: Arc<[IcebergTableRef]>,
+        pin: Arc<RefreshSnapshotPin>,
+        iceberg_catalogs: &IcebergCatalogRegistry,
+        target_entry: Arc<IcebergCatalogEntry>,
+        iceberg_catalog: Arc<dyn iceberg::Catalog>,
+        target_table: iceberg::table::Table,
+        pruning_limits: MvRefreshPruningLimits,
+    ) -> Result<Self, String> {
+        Self::new_with_affected_partitions_and_pruning_limits(
             target,
             mv_id,
             current_catalog,
@@ -597,6 +661,7 @@ impl IcebergMvRefreshContext {
             crate::engine::mv::partition::AffectedTargetPartitions::not_derived(
                 "refresh context was constructed without planned affected partitions",
             ),
+            pruning_limits,
         )
     }
 
@@ -615,6 +680,41 @@ impl IcebergMvRefreshContext {
         iceberg_catalog: Arc<dyn iceberg::Catalog>,
         target_table: iceberg::table::Table,
         affected_partitions: crate::engine::mv::partition::AffectedTargetPartitions,
+    ) -> Result<Self, String> {
+        Self::new_with_affected_partitions_and_pruning_limits(
+            target,
+            mv_id,
+            current_catalog,
+            current_database,
+            mv_definition,
+            canonical_select_query,
+            base_refs,
+            pin,
+            iceberg_catalogs,
+            target_entry,
+            iceberg_catalog,
+            target_table,
+            affected_partitions,
+            MvRefreshPruningLimits::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_affected_partitions_and_pruning_limits(
+        target: IcebergMvTarget,
+        mv_id: i64,
+        current_catalog: Option<&str>,
+        current_database: &str,
+        mv_definition: Arc<StoredMvDefinition>,
+        canonical_select_query: Arc<sqlparser::ast::Query>,
+        base_refs: Arc<[IcebergTableRef]>,
+        pin: Arc<RefreshSnapshotPin>,
+        iceberg_catalogs: &IcebergCatalogRegistry,
+        target_entry: Arc<IcebergCatalogEntry>,
+        iceberg_catalog: Arc<dyn iceberg::Catalog>,
+        target_table: iceberg::table::Table,
+        affected_partitions: crate::engine::mv::partition::AffectedTargetPartitions,
+        pruning_limits: MvRefreshPruningLimits,
     ) -> Result<Self, String> {
         let metadata = target_table.metadata();
         let target_snapshot_id = metadata.current_snapshot().map(|s| s.snapshot_id());
@@ -645,7 +745,38 @@ impl IcebergMvRefreshContext {
             iceberg_catalog,
             target_table,
             affected_partitions,
+            pruning_limits,
         })
+    }
+
+    pub(crate) fn affected_partitions_to_target_partition_filter(
+        &self,
+    ) -> crate::engine::mv::partition::TargetPartitionFilter {
+        match &self.affected_partitions {
+            crate::engine::mv::partition::AffectedTargetPartitions::Known { partitions } => {
+                if self
+                    .pruning_limits
+                    .affected_partition_count_exceeds_limit(partitions.len())
+                {
+                    tracing::warn!(
+                        target = ?self.rewrite.target,
+                        affected_partition_count = partitions.len(),
+                        max_affected_partitions = self.pruning_limits.max_affected_partitions,
+                        fallback_reason = "affected_partition_threshold",
+                        "falling back to unpartitioned target scan because affected partition allow-list exceeds configured threshold"
+                    );
+                    crate::engine::mv::partition::TargetPartitionFilter::None
+                } else {
+                    crate::engine::mv::partition::TargetPartitionFilter::AllowList(
+                        partitions.clone(),
+                    )
+                }
+            }
+            crate::engine::mv::partition::AffectedTargetPartitions::Unpartitioned
+            | crate::engine::mv::partition::AffectedTargetPartitions::NotDerived { .. } => {
+                crate::engine::mv::partition::TargetPartitionFilter::None
+            }
+        }
     }
 
     pub(crate) fn version_scan_source(
@@ -826,7 +957,24 @@ impl IcebergMvRefreshContext {
                     }
                     crate::engine::mv::partition::AffectedTargetPartitions::Known {
                         partitions,
-                    } => Ok(Some(partitions.clone())),
+                    } => {
+                        if self
+                            .pruning_limits
+                            .affected_partition_count_exceeds_limit(partitions.len())
+                        {
+                            tracing::warn!(
+                                target = %scan.fqn(),
+                                affected_partition_count = partitions.len(),
+                                max_affected_partitions =
+                                    self.pruning_limits.max_affected_partitions,
+                                fallback_reason = "affected_partition_threshold",
+                                "falling back to full target-state scan because affected partition allow-list exceeds configured threshold"
+                            );
+                            Ok(None)
+                        } else {
+                            Ok(Some(partitions.clone()))
+                        }
+                    }
                     crate::engine::mv::partition::AffectedTargetPartitions::NotDerived {
                         reason,
                     } => {
@@ -2081,6 +2229,7 @@ mod tests {
             target_table,
             affected_partitions:
                 crate::engine::mv::partition::AffectedTargetPartitions::not_derived("test context"),
+            pruning_limits: MvRefreshPruningLimits::default(),
         };
         let table = IcebergTableInfo {
             catalog: "ice".to_string(),
@@ -2216,6 +2365,10 @@ mod tests {
             target_table,
             affected_partitions:
                 crate::engine::mv::partition::AffectedTargetPartitions::not_derived("test context"),
+            pruning_limits: MvRefreshPruningLimits {
+                max_touched_groups: 100_000,
+                max_affected_partitions: 2,
+            },
         };
         let scan = IcebergMvTargetStateScan {
             catalog: "tgt".to_string(),
@@ -2257,5 +2410,19 @@ mod tests {
             .expect("partitioned scan should return an allow-list");
         assert!(allow_list.contains(&new_key));
         assert!(allow_list.contains(&old_key));
+
+        ctx.pruning_limits.max_affected_partitions = 1;
+        let threshold_filter = ctx
+            .target_state_partition_allow_list(&scan)
+            .expect("over-threshold affected partitions should fall back to full target scan");
+        assert!(
+            threshold_filter.is_none(),
+            "over-threshold affected partitions should disable pruning"
+        );
+        assert_eq!(
+            ctx.affected_partitions_to_target_partition_filter(),
+            crate::engine::mv::partition::TargetPartitionFilter::None,
+            "over-threshold affected partitions should disable merge-sink plan-time pruning"
+        );
     }
 }

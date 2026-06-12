@@ -60,6 +60,7 @@ pub struct IcebergMergeSinkPlan {
     /// Target-visible partition derivation used when plan-time affected
     /// partitions are not available, for example join-side row movement.
     pub(crate) partition_derivation: Option<BoundTargetPartitionDerivation>,
+    pub(crate) pruning_limits: crate::engine::mv::refresh_context::MvRefreshPruningLimits,
 }
 
 pub struct TargetLocatorState {
@@ -217,6 +218,7 @@ impl IcebergMergeSinkOperator {
             &self.plan.partition_filter,
             self.plan.partition_derivation.as_ref(),
             &batch,
+            self.plan.pruning_limits,
         )?;
         let groups = match self.plan.apply_key_value_type {
             ApplyKeyValueType::Int64 => {
@@ -303,8 +305,18 @@ fn delete_batch_partition_filter(
     plan_filter: &crate::engine::mv::partition::TargetPartitionFilter,
     partition_derivation: Option<&BoundTargetPartitionDerivation>,
     batch: &RecordBatch,
+    pruning_limits: crate::engine::mv::refresh_context::MvRefreshPruningLimits,
 ) -> Result<crate::engine::mv::partition::TargetPartitionFilter, String> {
-    if plan_filter.is_allow_list() {
+    if let Some(partition_count) = plan_filter.allow_list_len() {
+        if pruning_limits.affected_partition_count_exceeds_limit(partition_count) {
+            tracing::warn!(
+                affected_partition_count = partition_count,
+                max_affected_partitions = pruning_limits.max_affected_partitions,
+                fallback_reason = "affected_partition_threshold",
+                "falling back to unpartitioned merge-sink locator scan because plan-time affected partition allow-list exceeds configured threshold"
+            );
+            return Ok(crate::engine::mv::partition::TargetPartitionFilter::None);
+        }
         return Ok(plan_filter.clone());
     }
 
@@ -318,6 +330,15 @@ fn delete_batch_partition_filter(
         batch,
     )
     .map_err(|err| format!("merge sink partition derivation: {err}"))?;
+    if pruning_limits.affected_partition_count_exceeds_limit(partitions.len()) {
+        tracing::warn!(
+            affected_partition_count = partitions.len(),
+            max_affected_partitions = pruning_limits.max_affected_partitions,
+            fallback_reason = "affected_partition_threshold",
+            "falling back to unpartitioned merge-sink locator scan because batch-derived affected partition allow-list exceeds configured threshold"
+        );
+        return Ok(crate::engine::mv::partition::TargetPartitionFilter::None);
+    }
 
     Ok(crate::engine::mv::partition::TargetPartitionFilter::AllowList(partitions))
 }
@@ -660,6 +681,7 @@ mod tests {
             &plan_filter,
             Some(&bound_partition_derivation()),
             &batch,
+            crate::engine::mv::refresh_context::MvRefreshPruningLimits::default(),
         )
         .expect("filter");
 
@@ -674,6 +696,7 @@ mod tests {
             &crate::engine::mv::partition::TargetPartitionFilter::None,
             Some(&bound_partition_derivation()),
             &batch,
+            crate::engine::mv::refresh_context::MvRefreshPruningLimits::default(),
         )
         .expect("filter");
 
@@ -684,6 +707,27 @@ mod tests {
                     .into_iter()
                     .collect(),
             )
+        );
+    }
+
+    #[test]
+    fn delete_batch_partition_filter_drops_batch_allow_list_over_threshold() {
+        let batch = partition_batch(["west", "east"]);
+
+        let filter = delete_batch_partition_filter(
+            &crate::engine::mv::partition::TargetPartitionFilter::None,
+            Some(&bound_partition_derivation()),
+            &batch,
+            crate::engine::mv::refresh_context::MvRefreshPruningLimits {
+                max_touched_groups: 100_000,
+                max_affected_partitions: 1,
+            },
+        )
+        .expect("filter");
+
+        assert_eq!(
+            filter,
+            crate::engine::mv::partition::TargetPartitionFilter::None
         );
     }
 

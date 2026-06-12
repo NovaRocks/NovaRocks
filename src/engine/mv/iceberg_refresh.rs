@@ -2921,7 +2921,7 @@ fn refresh_iceberg_mv_with_planned_partitions(
             .iceberg_catalogs
             .read()
             .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        IcebergMvRefreshContext::new(
+        IcebergMvRefreshContext::new_with_pruning_limits(
             target.clone(),
             mv_definition.mv_id,
             current_catalog,
@@ -2934,6 +2934,7 @@ fn refresh_iceberg_mv_with_planned_partitions(
             Arc::new(target_entry.clone()),
             iceberg_catalog.clone(),
             target_loaded.table.clone(),
+            state.mv_refresh_pruning_limits,
         )?
     };
     tracing::info!(
@@ -3201,7 +3202,7 @@ fn refresh_iceberg_union_projection_mv(
             .iceberg_catalogs
             .read()
             .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        IcebergMvRefreshContext::new(
+        IcebergMvRefreshContext::new_with_pruning_limits(
             target.clone(),
             mv_definition.mv_id,
             current_catalog,
@@ -3214,6 +3215,7 @@ fn refresh_iceberg_union_projection_mv(
             Arc::new(target_entry.clone()),
             Arc::clone(iceberg_catalog),
             target_table.clone(),
+            state.mv_refresh_pruning_limits,
         )?
     };
     tracing::info!(
@@ -3562,7 +3564,7 @@ fn refresh_single_aggregate_iceberg_mv(
             .iceberg_catalogs
             .read()
             .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        IcebergMvRefreshContext::new_with_affected_partitions(
+        IcebergMvRefreshContext::new_with_affected_partitions_and_pruning_limits(
             target.clone(),
             mv_definition.mv_id,
             current_catalog,
@@ -3576,6 +3578,7 @@ fn refresh_single_aggregate_iceberg_mv(
             iceberg_catalog.clone(),
             target_table.clone(),
             planned_affected_partitions.clone(),
+            state.mv_refresh_pruning_limits,
         )?
     };
     tracing::info!(
@@ -3902,7 +3905,7 @@ fn refresh_fan_in_aggregate_iceberg_mv(
             .iceberg_catalogs
             .read()
             .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        IcebergMvRefreshContext::new_with_affected_partitions(
+        IcebergMvRefreshContext::new_with_affected_partitions_and_pruning_limits(
             target.clone(),
             mv_definition.mv_id,
             current_catalog,
@@ -3916,6 +3919,7 @@ fn refresh_fan_in_aggregate_iceberg_mv(
             iceberg_catalog.clone(),
             target_table.clone(),
             planned_affected_partitions.clone(),
+            state.mv_refresh_pruning_limits,
         )?
     };
     tracing::info!(
@@ -4165,7 +4169,7 @@ fn refresh_join_aggregate_iceberg_mv(
             .iceberg_catalogs
             .read()
             .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        IcebergMvRefreshContext::new_with_affected_partitions(
+        IcebergMvRefreshContext::new_with_affected_partitions_and_pruning_limits(
             target.clone(),
             mv_definition.mv_id,
             current_catalog,
@@ -4179,6 +4183,7 @@ fn refresh_join_aggregate_iceberg_mv(
             iceberg_catalog.clone(),
             target_table.clone(),
             planned_affected_partitions.clone(),
+            state.mv_refresh_pruning_limits,
         )?
     };
     tracing::info!(
@@ -8263,7 +8268,7 @@ fn refresh_iceberg_join_mv(
             .iceberg_catalogs
             .read()
             .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        IcebergMvRefreshContext::new(
+        IcebergMvRefreshContext::new_with_pruning_limits(
             target.clone(),
             mv_definition.mv_id,
             current_catalog,
@@ -8276,6 +8281,7 @@ fn refresh_iceberg_join_mv(
             Arc::new(target_entry.clone()),
             iceberg_catalog.clone(),
             target_table.clone(),
+            state.mv_refresh_pruning_limits,
         )?
     };
     tracing::info!(
@@ -9705,7 +9711,7 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan(
             .iceberg_catalogs
             .read()
             .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        IcebergMvRefreshContext::new(
+        IcebergMvRefreshContext::new_with_pruning_limits(
             target,
             mv_definition.mv_id,
             current_catalog,
@@ -9718,6 +9724,7 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan(
             Arc::new(target_entry),
             iceberg_catalog,
             target_loaded.table,
+            state.mv_refresh_pruning_limits,
         )?
     };
     let outcome = run_imv_rewrite_for_refresh_explain(state, &ctx)?;
@@ -10703,7 +10710,8 @@ fn incremental_refresh_iceberg_mv_with_changes(
         // Prune the delete-side locator to the same affected-partition
         // allow-list the planner derived for the target-state read side.
         // `Known` => AllowList; join/union/unpartitioned/NotDerived => None.
-        partition_filter: ctx.affected_partitions.to_target_partition_filter(),
+        partition_filter: ctx.affected_partitions_to_target_partition_filter(),
+        pruning_limits: ctx.pruning_limits,
         partition_derivation: merge_sink_partition_derivation(&ctx.rewrite.schema_contract),
     };
     let merge_sink =

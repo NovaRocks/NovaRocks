@@ -11,6 +11,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use tokio::runtime::Handle;
 
+use crate::engine::mv::refresh_context::MvRefreshPruningLimits;
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::novarocks_config;
 use crate::plan_nodes::TFileFormatType;
@@ -405,6 +406,7 @@ pub(crate) struct StandaloneState {
     pub(crate) statistics: RwLock<statistics::StandaloneStatistics>,
     pub(crate) connectors: Arc<RwLock<crate::connector::ConnectorRegistry>>,
     pub(crate) starrocks_table_config: Option<StarRocksTableConfig>,
+    pub(crate) mv_refresh_pruning_limits: MvRefreshPruningLimits,
     pub(crate) metadata_provider: Option<Arc<dyn crate::meta::MetaStoreProvider>>,
     pub(crate) backend_repo: BackendMetaRepository,
     pub(crate) starrocks_table_repo: StarRocksTableMetaRepository,
@@ -451,6 +453,7 @@ impl Default for StandaloneState {
             statistics: RwLock::new(statistics::StandaloneStatistics::default()),
             connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
             starrocks_table_config: None,
+            mv_refresh_pruning_limits: MvRefreshPruningLimits::default(),
             metadata_provider: None,
             backend_repo: BackendMetaRepository,
             starrocks_table_repo: StarRocksTableMetaRepository,
@@ -574,6 +577,7 @@ impl StandaloneNovaRocks {
             .map(open_metadata_provider)
             .transpose()?;
         let starrocks_table_config = resolve_starrocks_table_config()?;
+        let mv_refresh_pruning_limits = resolve_mv_refresh_pruning_limits()?;
         let catalog = Arc::new(RwLock::new(InMemoryCatalog::default()));
         let mut catalog_mgr = catalog_mgr::CatalogMgr::new();
         catalog_mgr.register(Arc::new(catalog_mgr::internal::InternalCatalog::new(
@@ -587,6 +591,7 @@ impl StandaloneNovaRocks {
                 starrocks_table_config.clone(),
             )),
             starrocks_table_config,
+            mv_refresh_pruning_limits,
             metadata_provider,
             backend_repo: BackendMetaRepository,
             starrocks_table_repo: StarRocksTableMetaRepository,
@@ -2311,6 +2316,15 @@ fn resolve_starrocks_table_config() -> Result<Option<StarRocksTableConfig>, Stri
     app_cfg
         .map(StarRocksTableConfig::from_app_config)
         .transpose()
+}
+
+fn resolve_mv_refresh_pruning_limits() -> Result<MvRefreshPruningLimits, String> {
+    let cfg = novarocks_config::config().map_err(|e| format!("read config failed: {e}"))?;
+    Ok(cfg
+        .standalone_server
+        .as_ref()
+        .map(MvRefreshPruningLimits::from_standalone_config)
+        .unwrap_or_default())
 }
 
 fn resolve_relative_path(path: &Path, config_path: Option<&Path>) -> Result<PathBuf, String> {
@@ -5697,6 +5711,7 @@ enable_path_style_access = true
                 crate::engine::mv::partition::AffectedTargetPartitions::not_derived(
                     "engine test context",
                 ),
+            pruning_limits: crate::engine::mv::refresh_context::MvRefreshPruningLimits::default(),
         }
     }
 
