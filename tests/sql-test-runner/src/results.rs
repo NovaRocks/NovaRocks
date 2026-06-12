@@ -518,6 +518,7 @@ pub fn normalize_explain_timing_rows(rows: &[Vec<String>]) -> Vec<Vec<String>> {
 
 pub fn step_allows_missing_expected_result(step: &SqlStep) -> bool {
     step.meta.expect_error.is_some()
+        || step.meta.expect_error_code.is_some()
         || step.meta.skip_result_check
         || !step.meta.result_contains.is_empty()
         || !step.meta.result_contains_any.is_empty()
@@ -714,5 +715,38 @@ mod normalize_explain_tests {
             out[0][0],
             "Planning: <MS> ms / Execution: <MS> ms / Rows: 42"
         );
+    }
+}
+
+#[cfg(test)]
+mod expected_error_code_result_classification_tests {
+    use super::*;
+
+    fn step_with_meta(meta: QueryMeta) -> SqlStep {
+        SqlStep {
+            query_number: 1,
+            sql: "SELECT 1".to_string(),
+            meta,
+        }
+    }
+
+    #[test]
+    fn step_allows_missing_expected_result_for_expect_error_code() {
+        let step = step_with_meta(QueryMeta {
+            expect_error_code: Some("CommitUnknown".to_string()),
+            ..QueryMeta::default()
+        });
+
+        assert!(step_allows_missing_expected_result(&step));
+    }
+
+    #[test]
+    fn step_requires_recorded_result_excludes_expect_error_code_steps() {
+        let step = step_with_meta(QueryMeta {
+            expect_error_code: Some("CommitUnknown".to_string()),
+            ..QueryMeta::default()
+        });
+
+        assert!(!step_requires_recorded_result(&step));
     }
 }
