@@ -378,8 +378,10 @@ mod tests {
         let response = proto::novarocks::ReportExecStatusResponse {
             status_code: crate::service::grpc_server::REPORT_EXEC_STATUS_QUERY_GONE,
             message: "write coordinator not found for query 1/2".to_string(),
+            error_code: "WriteCoordinatorGone".to_string(),
         };
 
+        assert_eq!(response.error_code, "WriteCoordinatorGone");
         interpret_report_exec_status_response(response)
             .expect("query-gone report response is terminal success");
     }

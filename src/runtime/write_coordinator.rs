@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, HashMap, hash_map::Entry};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::common::engine_error::EngineError;
 use crate::{frontend_service, status, status_code, types};
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -447,8 +448,8 @@ pub(crate) fn unregister_query(query_id: &types::TUniqueId) {
 
 pub(crate) fn handle_report_exec_status(
     params: frontend_service::TReportExecStatusParams,
-) -> Result<ReportOutcome, String> {
-    let report = report_from_thrift(params)?;
+) -> Result<ReportOutcome, EngineError> {
+    let report = report_from_thrift(params).map_err(EngineError::protocol_decode)?;
     apply_report_to_query_state(&report);
 
     let coord = registry()
@@ -460,10 +461,7 @@ pub(crate) fn handle_report_exec_status(
 
     let Some(coord) = coord else {
         if report_has_write_metadata(&report) {
-            return Err(format!(
-                "write coordinator not found for query {}/{}",
-                report.query_id.hi, report.query_id.lo
-            ));
+            return Err(EngineError::write_coordinator_gone(report.query_id.clone()));
         }
         return Ok(ReportOutcome::Accepted);
     };
@@ -471,6 +469,9 @@ pub(crate) fn handle_report_exec_status(
         .lock()
         .expect("write coordinator lock")
         .apply_report(report)
+        .map_err(|message| {
+            EngineError::distributed_write_output_mismatch("reportExecStatus", message)
+        })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -597,6 +598,7 @@ pub(crate) fn write_registry_test_guard() -> WriteRegistryTestGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::engine_error::EngineErrorCode;
 
     fn id(hi: i64, lo: i64) -> types::TUniqueId {
         types::TUniqueId::new(hi, lo)
@@ -1117,7 +1119,8 @@ mod tests {
             "s3://w/late.parquet",
         )))
         .expect_err("unregistered write-looking report must fail");
-        assert!(err.contains("not found"), "{err}");
+        assert_eq!(err.code(), EngineErrorCode::WriteCoordinatorGone);
+        assert!(err.to_user_message().contains("not found"), "{err}");
     }
 
     #[test]

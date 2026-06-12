@@ -109,6 +109,7 @@ message ReportExecStatusRequest {
 message ReportExecStatusResponse {
   int32 status_code = 1;
   string message = 2;
+  string error_code = 3;
 }
 
 message BatchReportExecStatusRequest {
@@ -118,4 +119,5 @@ message BatchReportExecStatusRequest {
 message BatchReportExecStatusResponse {
   int32 status_code = 1;
   string message = 2;
+  string error_code = 3;
 }

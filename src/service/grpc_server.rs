@@ -35,6 +35,7 @@ use tonic::service::Routes;
 use tonic::transport::Server;
 
 use crate::common::config::{http_port, starlet_port};
+use crate::common::engine_error::EngineError;
 use crate::common::types::format_uuid;
 use crate::connector::starrocks::starmgr;
 use crate::novarocks_logging::{error, info, warn};
@@ -42,12 +43,12 @@ use crate::runtime::starlet_shard_registry;
 use crate::service::internal_rpc;
 use crate::service::{load_tracking_http, metrics_http, stream_load_http};
 
+pub(crate) use crate::common::engine_error::{
+    REPORT_EXEC_STATUS_OK, REPORT_EXEC_STATUS_QUERY_GONE,
+};
 pub use crate::service::grpc_proto as proto;
 
 const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
-pub(crate) const REPORT_EXEC_STATUS_OK: i32 = 0;
-pub(crate) const REPORT_EXEC_STATUS_ERROR: i32 = 1;
-pub(crate) const REPORT_EXEC_STATUS_QUERY_GONE: i32 = 2;
 const CANCEL_FRAGMENT_OK: i32 = 0;
 const CANCEL_FRAGMENT_IGNORED_STALE_EPOCH: i32 = 2;
 static SUBMIT_FRAGMENT_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -501,10 +502,12 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         let result = tokio::task::spawn_blocking(move || {
             let params: crate::frontend_service::TReportExecStatusParams =
                 crate::common::thrift::thrift_binary_deserialize(&bytes).map_err(|e| {
-                    format!("failed to deserialize TReportExecStatusParams thrift: {e}")
+                    EngineError::protocol_decode(format!(
+                        "failed to deserialize TReportExecStatusParams thrift: {e}"
+                    ))
                 })?;
             handle_standalone_report_exec_status(params)?;
-            Ok::<(), String>(())
+            Ok::<(), EngineError>(())
         })
         .await
         .map_err(|e| {
@@ -516,12 +519,14 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
                 proto::novarocks::ReportExecStatusResponse {
                     status_code: REPORT_EXEC_STATUS_OK,
                     message: String::new(),
+                    error_code: String::new(),
                 },
             )),
             Err(e) => Ok(tonic::Response::new(
                 proto::novarocks::ReportExecStatusResponse {
-                    status_code: report_exec_status_error_code(&e),
-                    message: e,
+                    status_code: e.to_report_status_code(),
+                    message: e.to_user_message(),
+                    error_code: e.to_report_error_code().to_string(),
                 },
             )),
         }
@@ -537,11 +542,13 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
             for bytes in payloads {
                 let params: crate::frontend_service::TReportExecStatusParams =
                     crate::common::thrift::thrift_binary_deserialize(&bytes).map_err(|e| {
-                        format!("failed to deserialize TReportExecStatusParams thrift: {e}")
+                        EngineError::protocol_decode(format!(
+                            "failed to deserialize TReportExecStatusParams thrift: {e}"
+                        ))
                     })?;
                 handle_standalone_report_exec_status(params)?;
             }
-            Ok::<(), String>(())
+            Ok::<(), EngineError>(())
         })
         .await
         .map_err(|e| {
@@ -553,31 +560,27 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
                 proto::novarocks::BatchReportExecStatusResponse {
                     status_code: REPORT_EXEC_STATUS_OK,
                     message: String::new(),
+                    error_code: String::new(),
                 },
             )),
             Err(e) => Ok(tonic::Response::new(
                 proto::novarocks::BatchReportExecStatusResponse {
-                    status_code: report_exec_status_error_code(&e),
-                    message: e,
+                    status_code: e.to_report_status_code(),
+                    message: e.to_user_message(),
+                    error_code: e.to_report_error_code().to_string(),
                 },
             )),
         }
     }
 }
 
-fn report_exec_status_error_code(message: &str) -> i32 {
-    if message.contains("write coordinator not found for query") {
-        REPORT_EXEC_STATUS_QUERY_GONE
-    } else {
-        REPORT_EXEC_STATUS_ERROR
-    }
-}
-
 fn handle_standalone_report_exec_status(
     params: crate::frontend_service::TReportExecStatusParams,
-) -> Result<(), String> {
-    let failure = failed_query_from_report(&params)?;
-    match crate::runtime::write_coordinator::lookup_writer_report(&params)? {
+) -> Result<(), EngineError> {
+    let failure = failed_query_from_report(&params).map_err(EngineError::protocol_decode)?;
+    match crate::runtime::write_coordinator::lookup_writer_report(&params)
+        .map_err(EngineError::protocol_decode)?
+    {
         crate::runtime::write_coordinator::WriterReportLookup::Expected => {
             let result = crate::runtime::write_coordinator::handle_report_exec_status(params);
             match result {
@@ -605,10 +608,7 @@ fn handle_standalone_report_exec_status(
                 mark_failed_query_report(failure);
                 Ok(())
             } else {
-                Err(format!(
-                    "write coordinator not found for query {}/{}",
-                    query_id.hi, query_id.lo
-                ))
+                Err(EngineError::write_coordinator_gone(query_id))
             }
         }
     }
@@ -1622,6 +1622,7 @@ mod pr3_tests {
             .expect("RPC level success");
         let body = resp.into_inner();
         assert_ne!(body.status_code, 0);
+        assert_eq!(body.error_code, "ProtocolDecodeError");
         assert!(body.message.contains("deserialize") || body.message.contains("thrift"));
     }
 
@@ -1637,6 +1638,7 @@ mod pr3_tests {
             .expect("report-only endpoint must allow report RPCs");
         let body = resp.into_inner();
         assert_ne!(body.status_code, 0);
+        assert_eq!(body.error_code, "ProtocolDecodeError");
         assert!(body.message.contains("deserialize") || body.message.contains("thrift"));
     }
 
@@ -1667,6 +1669,7 @@ mod pr3_tests {
             .expect("RPC level success");
         let body = resp.into_inner();
         assert_eq!(body.status_code, 0, "{}", body.message);
+        assert_eq!(body.error_code, "");
     }
 
     #[tokio::test]
@@ -1697,6 +1700,7 @@ mod pr3_tests {
             .expect("RPC level success");
         let body = resp.into_inner();
         assert_eq!(body.status_code, 0, "{}", body.message);
+        assert_eq!(body.error_code, "");
         assert!(
             !coord.lock().expect("write coordinator lock").has_failed(),
             "ordinary OK fragment reports must not fail the write coordinator"
@@ -1711,7 +1715,9 @@ mod pr3_tests {
             .report_exec_status(req)
             .await
             .expect("RPC level success");
-        assert_eq!(resp.into_inner().status_code, 0);
+        let body = resp.into_inner();
+        assert_eq!(body.status_code, 0, "{}", body.message);
+        assert_eq!(body.error_code, "");
         coord
             .lock()
             .expect("write coordinator lock")
@@ -1748,6 +1754,7 @@ mod pr3_tests {
             .expect("RPC level success");
         let body = resp.into_inner();
         assert_eq!(body.status_code, 0, "{}", body.message);
+        assert_eq!(body.error_code, "");
         let abort = coord
             .lock()
             .expect("write coordinator lock")
@@ -1780,6 +1787,7 @@ mod pr3_tests {
             "{}",
             body.message
         );
+        assert_eq!(body.error_code, "WriteCoordinatorGone");
         assert!(body.message.contains("not found"), "{}", body.message);
     }
 
@@ -1817,6 +1825,7 @@ mod pr3_tests {
             .expect("RPC level success");
         let body = resp.into_inner();
         assert_eq!(body.status_code, 0, "{}", body.message);
+        assert_eq!(body.error_code, "");
 
         let TryFetchResult::Error(err) = result_buffer::try_fetch(finst_id) else {
             panic!("remote fragment error must close the root result buffer");

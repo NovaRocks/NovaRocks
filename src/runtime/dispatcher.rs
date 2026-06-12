@@ -1280,6 +1280,7 @@ mod tests {
                     .lock()
                     .expect("report message lock")
                     .clone(),
+                error_code: String::new(),
             }))
         }
 
@@ -1295,6 +1296,7 @@ mod tests {
                     .lock()
                     .expect("report message lock")
                     .clone(),
+                error_code: String::new(),
             }))
         }
     }
