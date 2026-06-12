@@ -39,6 +39,7 @@ pub(crate) fn operation_request_from_write_commit(
     let staged_artifacts = staged_artifacts_from_writer_outputs(&commit.writers)?;
     Ok(CreateIcebergOperationRequest {
         operation_kind: ctx.operation_kind,
+        operation_subkind: None,
         target: ctx.target,
         attempt_id: ctx.attempt_id,
         base_snapshot_id: ctx.base_snapshot_id,

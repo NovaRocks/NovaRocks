@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
 use novarocks::meta::keys::{NS_ICEBERG_OPERATION, NS_JOB, NS_STARROCKS_TXN};
@@ -19,9 +19,11 @@ use novarocks::meta::repository::job::{
 use novarocks::meta::repository::mv::{
     BeginIcebergMvRefreshRequest, CreateMvDefinitionRequest, CreateMvDependencyRequest,
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine, MvMetaRepository,
-    MvRefreshFinalizeRequest, MvRefreshState, MvTargetLookup, RecordPublishCommitRequest,
-    RecordStagingCommitRequest, RefreshCommitMarker, RefreshExternalOutcome, StoredMvRefreshPolicy,
-    UpdateMvRefreshMetadataRequest, UpdateStarRocksMvRefreshSummaryRequest,
+    MvPartitionRefreshStatus, MvRefreshFinalizeRequest, MvRefreshState, MvTargetLookup,
+    RecordFailedMvPartitionStatesRequest, RecordPublishCommitRequest, RecordStagingCommitRequest,
+    RefreshCommitMarker, RefreshExternalOutcome, ReplaceMvPartitionStatesRequest,
+    StoredMvRefreshPolicy, UpdateMvPartitionContractRequest, UpdateMvRefreshMetadataRequest,
+    UpdateStarRocksMvRefreshSummaryRequest,
 };
 use novarocks::meta::repository::mv_contract::{
     ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
@@ -375,7 +377,8 @@ fn repository_avro_payload_round_trips_iceberg_operation_payload()
 -> Result<(), Box<dyn std::error::Error>> {
     let value = StoredIcebergOperation {
         operation_id: 42,
-        operation_kind: IcebergOperationKind::MvRefresh,
+        operation_kind: IcebergOperationKind::Maintenance,
+        operation_subkind: Some("MV_REPARTITION".to_string()),
         target: IcebergOperationTarget {
             catalog: "ice".to_string(),
             namespace: "analytics".to_string(),
@@ -419,10 +422,12 @@ fn repository_avro_payload_round_trips_iceberg_operation_payload()
 
     let payload = encode_record_payload("iceberg.operation", &value)?;
     assert_eq!(payload.encoding, novarocks::meta::MetaPayloadEncoding::Avro);
-    assert_eq!(payload.schema_id, 1);
+    assert_eq!(payload.schema_id, 2);
     assert_eq!(payload.schema_fingerprint.len(), 16);
 
     let decoded: StoredIcebergOperation = decode_payload_for_kind("iceberg.operation", &payload)?;
+    assert_eq!(decoded.operation_kind, IcebergOperationKind::Maintenance);
+    assert_eq!(decoded.operation_subkind.as_deref(), Some("MV_REPARTITION"));
     assert_eq!(
         decoded
             .commit_outcome
@@ -506,6 +511,7 @@ fn create_committing_iceberg_operation(
             txn.as_mut(),
             CreateIcebergOperationRequest {
                 operation_kind: IcebergOperationKind::InsertAppend,
+                operation_subkind: None,
                 target: IcebergOperationTarget {
                     catalog: "ice".to_string(),
                     namespace: "sales".to_string(),
@@ -550,6 +556,7 @@ fn iceberg_operation_repository_create_load_and_list_unfinished()
             txn.as_mut(),
             CreateIcebergOperationRequest {
                 operation_kind: IcebergOperationKind::MvRefresh,
+                operation_subkind: None,
                 target: IcebergOperationTarget {
                     catalog: "ice".to_string(),
                     namespace: "analytics".to_string(),
@@ -1139,6 +1146,7 @@ fn iceberg_operation_repository_finished_operations_are_not_unfinished()
             txn.as_mut(),
             CreateIcebergOperationRequest {
                 operation_kind: IcebergOperationKind::InsertAppend,
+                operation_subkind: None,
                 target: IcebergOperationTarget {
                     catalog: "ice".to_string(),
                     namespace: "sales".to_string(),
@@ -2887,6 +2895,243 @@ fn mv_repository_refresh_intent_finalizes_once() -> Result<(), Box<dyn std::erro
     assert_eq!(definition.active_refresh_id, None);
     assert!(definition.refresh_target_snapshots.is_empty());
 
+    Ok(())
+}
+
+#[test]
+fn mv_repository_replaces_and_clears_partition_states() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = MvMetaRepository::default();
+    let mv_id = create_test_iceberg_mv(&provider, &repository)?;
+
+    {
+        let mut txn = provider.begin_write("replace mv partition states")?;
+        let states = repository.replace_partition_states(
+            txn.as_mut(),
+            ReplaceMvPartitionStatesRequest {
+                mv_id,
+                partition_keys: BTreeSet::from([
+                    "spec=7;region=east".to_string(),
+                    "spec=7;region=west/encoded".to_string(),
+                ]),
+                last_refresh_ms: 1_700_000_001_000,
+                base_snapshots: BTreeMap::from([("ice.sales.orders".to_string(), 10)]),
+                target_snapshot_id: Some(20),
+                last_refresh_id: 30,
+                max_entries: 10,
+            },
+        )?;
+        assert_eq!(states.len(), 2);
+        txn.commit()?;
+    }
+
+    {
+        let read = provider.begin_read()?;
+        let states = repository.list_partition_states(read.as_ref(), mv_id)?;
+        assert_eq!(
+            states
+                .iter()
+                .map(|state| state.partition_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["spec=7;region=east", "spec=7;region=west/encoded"]
+        );
+        assert!(states.iter().all(|state| {
+            state.status == MvPartitionRefreshStatus::Fresh
+                && state.last_refresh_id == Some(30)
+                && state.target_snapshot_id == Some(20)
+                && state.failure_message.is_none()
+        }));
+        let definition = repository.load_by_id(read.as_ref(), mv_id)?.unwrap();
+        assert!(definition.partition_state_complete);
+    }
+
+    {
+        let mut txn = provider.begin_write("clear mv partition states")?;
+        assert!(repository.clear_partition_states(txn.as_mut(), mv_id)?);
+        txn.commit()?;
+    }
+
+    let read = provider.begin_read()?;
+    assert!(
+        repository
+            .list_partition_states(read.as_ref(), mv_id)?
+            .is_empty()
+    );
+    let definition = repository.load_by_id(read.as_ref(), mv_id)?.unwrap();
+    assert!(!definition.partition_state_complete);
+    Ok(())
+}
+
+#[test]
+fn mv_repository_partition_state_over_limit_stops_tracking()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = MvMetaRepository::default();
+    let mv_id = create_test_iceberg_mv(&provider, &repository)?;
+
+    {
+        let mut txn = provider.begin_write("seed mv partition states")?;
+        repository.replace_partition_states(
+            txn.as_mut(),
+            ReplaceMvPartitionStatesRequest {
+                mv_id,
+                partition_keys: BTreeSet::from(["spec=7;region=east".to_string()]),
+                last_refresh_ms: 1,
+                base_snapshots: BTreeMap::new(),
+                target_snapshot_id: Some(1),
+                last_refresh_id: 1,
+                max_entries: 10,
+            },
+        )?;
+        txn.commit()?;
+    }
+
+    {
+        let mut txn = provider.begin_write("replace mv partition states over limit")?;
+        let states = repository.replace_partition_states(
+            txn.as_mut(),
+            ReplaceMvPartitionStatesRequest {
+                mv_id,
+                partition_keys: BTreeSet::from([
+                    "spec=7;region=east".to_string(),
+                    "spec=7;region=west".to_string(),
+                ]),
+                last_refresh_ms: 2,
+                base_snapshots: BTreeMap::new(),
+                target_snapshot_id: Some(2),
+                last_refresh_id: 2,
+                max_entries: 1,
+            },
+        )?;
+        assert!(states.is_empty());
+        txn.commit()?;
+    }
+
+    let read = provider.begin_read()?;
+    assert!(
+        repository
+            .list_partition_states(read.as_ref(), mv_id)?
+            .is_empty()
+    );
+    let definition = repository.load_by_id(read.as_ref(), mv_id)?.unwrap();
+    assert!(!definition.partition_state_complete);
+    Ok(())
+}
+
+#[test]
+fn mv_repository_records_failed_partition_states() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = MvMetaRepository::default();
+    let mv_id = create_test_iceberg_mv(&provider, &repository)?;
+
+    {
+        let mut txn = provider.begin_write("record failed mv partition states")?;
+        repository.record_failed_partition_states(
+            txn.as_mut(),
+            RecordFailedMvPartitionStatesRequest {
+                mv_id,
+                partition_keys: BTreeSet::from(["spec=7;region=east".to_string()]),
+                failure_message: "refresh writer failed".to_string(),
+                last_refresh_ms: 1_700_000_002_000,
+                base_snapshots: BTreeMap::from([("ice.sales.orders".to_string(), 11)]),
+                target_snapshot_id: Some(21),
+                last_refresh_id: 31,
+                max_entries: 10,
+            },
+        )?;
+        txn.commit()?;
+    }
+
+    let read = provider.begin_read()?;
+    let states = repository.list_partition_states(read.as_ref(), mv_id)?;
+    assert_eq!(states.len(), 1);
+    assert_eq!(states[0].status, MvPartitionRefreshStatus::Failed);
+    assert_eq!(
+        states[0].failure_message.as_deref(),
+        Some("refresh writer failed")
+    );
+    assert_eq!(states[0].base_snapshots["ice.sales.orders"], 11);
+    let definition = repository.load_by_id(read.as_ref(), mv_id)?.unwrap();
+    assert!(definition.partition_state_complete);
+    Ok(())
+}
+
+#[test]
+fn mv_repository_updates_partition_contract_and_marks_state_incomplete()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = MvMetaRepository::default();
+    let old_partition = sample_mv_partition_contract();
+    let new_partition = MvPartitionContract {
+        target_spec_id: 4,
+        fields: vec![MvPartitionFieldContract {
+            partition_field_id: 1001,
+            partition_field_name: "id".to_string(),
+            source_target_field_id: 10,
+            source_column_name: "id".to_string(),
+            transform: MvPartitionTransformContract::Identity,
+        }],
+    };
+    let mv_id = {
+        let mut txn = provider.begin_write("create mv with partition contract")?;
+        let definition = repository.create_definition(
+            txn.as_mut(),
+            CreateMvDefinitionRequest {
+                select_sql: "SELECT id FROM ice.sales.orders".to_string(),
+                base_table_refs: vec!["ice.sales.orders".to_string()],
+                primary_key_columns: vec![],
+                storage_engine: "iceberg".to_string(),
+                target_catalog: Some("ice".to_string()),
+                target_namespace: Some("analytics".to_string()),
+                target_table: Some("orders_mv".to_string()),
+                schema_contract: Some(sample_mv_schema_contract(old_partition.clone())),
+                partition_spec: Some(old_partition),
+                created_at_ms: 11,
+            },
+        )?;
+        repository.replace_partition_states(
+            txn.as_mut(),
+            ReplaceMvPartitionStatesRequest {
+                mv_id: definition.mv_id,
+                partition_keys: BTreeSet::from(["spec=3;id_bucket_16=i:1".to_string()]),
+                last_refresh_ms: 1,
+                base_snapshots: BTreeMap::new(),
+                target_snapshot_id: Some(10),
+                last_refresh_id: 20,
+                max_entries: 10,
+            },
+        )?;
+        txn.commit()?;
+        definition.mv_id
+    };
+
+    {
+        let mut txn = provider.begin_write("update mv partition contract")?;
+        repository.update_partition_contract(
+            txn.as_mut(),
+            UpdateMvPartitionContractRequest {
+                mv_id,
+                partition_spec: new_partition.clone(),
+            },
+        )?;
+        txn.commit()?;
+    }
+
+    let read = provider.begin_read()?;
+    let definition = repository.load_by_id(read.as_ref(), mv_id)?.unwrap();
+    assert_eq!(definition.partition_spec, Some(new_partition.clone()));
+    assert_eq!(
+        definition
+            .schema_contract
+            .as_ref()
+            .and_then(|contract| contract.target.partition.as_ref()),
+        Some(&new_partition)
+    );
+    assert!(!definition.partition_state_complete);
     Ok(())
 }
 

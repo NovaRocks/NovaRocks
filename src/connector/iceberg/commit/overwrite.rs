@@ -42,9 +42,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use iceberg::io::FileIO;
 use iceberg::spec::{
-    DataContentType, DataFile, FormatVersion, ManifestContentType, ManifestFile, ManifestStatus,
-    ManifestWriterBuilder, Operation, PartitionSpecRef, SchemaRef, Snapshot, SnapshotReference,
-    SnapshotRetention, Summary,
+    DataContentType, DataFile, FormatVersion, ManifestContentType, ManifestFile, ManifestList,
+    ManifestStatus, ManifestWriterBuilder, Operation, PartitionSpecRef, SchemaRef, Snapshot,
+    SnapshotReference, SnapshotRetention, Summary,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ActionCommit, ApplyTransactionAction, Transaction, TransactionAction};
@@ -171,10 +171,11 @@ impl TransactionAction for OverwriteTxnAction {
         let metadata_dir = metadata_dir(table);
 
         // 1. Enumerate live data files in the base snapshot.
-        let existing =
-            enumerate_live_data_files_at_snapshot(table, &self.file_io, parent_snapshot_id)
+        let existing_entries =
+            enumerate_live_data_file_entries_at_snapshot(table, &self.file_io, parent_snapshot_id)
                 .await
                 .map_err(to_iceberg_unexpected)?;
+        let existing = live_data_entries_as_delete_entries(&existing_entries);
 
         // No-op short circuit: empty input + empty base table → return existing
         // updates/requirements set as a degenerate ActionCommit. iceberg-rust's
@@ -200,24 +201,35 @@ impl TransactionAction for OverwriteTxnAction {
             additional_properties,
         };
 
-        let mut new_manifests: Vec<ManifestFile> = Vec::with_capacity(2);
+        let delete_groups = group_live_data_entries_by_partition_spec(&existing_entries);
+        let mut new_manifests: Vec<ManifestFile> =
+            Vec::with_capacity(delete_groups.len() + usize::from(!self.written.is_empty()));
 
-        // 2. Write the deleted-data manifest, if base had any data.
-        if !existing.is_empty() {
+        // 2. Write deleted-data manifests grouped by their original partition
+        // spec. Manifest entries carry partition tuples encoded against the
+        // manifest-level spec, which can differ from the current default spec
+        // after ALTER MATERIALIZED VIEW ... REPARTITION.
+        for (idx, (spec_id, entries)) in delete_groups.into_iter().enumerate() {
             let path = format!(
-                "{metadata_dir}/{}-overwrite-deletes-0.avro",
-                self.commit_uuid
+                "{metadata_dir}/{}-overwrite-deletes-{idx}-spec-{spec_id}.avro",
+                self.commit_uuid,
             );
             self.abort_handle.record_manifest(path.clone());
             self.manifest_paths_out
                 .lock()
                 .expect("manifest_paths_out poisoned")
                 .push(path.clone());
+            let partition_spec = m.partition_spec_by_id(spec_id).cloned().ok_or_else(|| {
+                to_iceberg_unexpected(format!(
+                    "Overwrite delete file references unknown partition spec id {spec_id}"
+                ))
+            })?;
+            let existing = live_data_entries_as_delete_entries(&entries);
             let mf = write_overwrite_deletes_manifest(
                 &self.file_io,
                 &path,
                 &existing,
-                self.partition_spec.clone(),
+                partition_spec,
                 m.current_schema().clone(),
                 new_snapshot_id,
                 format_version,
@@ -345,6 +357,14 @@ impl TransactionAction for OverwriteTxnAction {
     }
 }
 
+#[derive(Clone)]
+struct LiveDataFileEntry {
+    data_file: DataFile,
+    sequence_number: i64,
+    file_sequence_number: Option<i64>,
+    partition_spec_id: i32,
+}
+
 /// Walk every data manifest in the base snapshot's manifest list and collect
 /// each live entry's `(DataFile, sequence_number, file_sequence_number)`. The
 /// sequence numbers are needed verbatim by `add_delete_file` to faithfully
@@ -358,17 +378,15 @@ pub(super) async fn enumerate_live_data_files(
     file_io: &FileIO,
 ) -> Result<Vec<(DataFile, i64, Option<i64>)>, String> {
     let snapshot_id = table.metadata().current_snapshot().map(|s| s.snapshot_id());
-    enumerate_live_files_filtered_at_snapshot(table, file_io, snapshot_id, |entry| {
-        entry.content == ManifestContentType::Data
-    })
-    .await
+    let entries = enumerate_live_data_file_entries_at_snapshot(table, file_io, snapshot_id).await?;
+    Ok(live_data_entries_as_delete_entries(&entries))
 }
 
-async fn enumerate_live_data_files_at_snapshot(
+async fn enumerate_live_data_file_entries_at_snapshot(
     table: &Table,
     file_io: &FileIO,
     snapshot_id: Option<i64>,
-) -> Result<Vec<(DataFile, i64, Option<i64>)>, String> {
+) -> Result<Vec<LiveDataFileEntry>, String> {
     enumerate_live_files_filtered_at_snapshot(table, file_io, snapshot_id, |entry| {
         entry.content == ManifestContentType::Data
     })
@@ -389,7 +407,10 @@ pub(super) async fn enumerate_live_all_files(
     file_io: &FileIO,
 ) -> Result<Vec<(DataFile, i64, Option<i64>)>, String> {
     let snapshot_id = table.metadata().current_snapshot().map(|s| s.snapshot_id());
-    enumerate_live_files_filtered_at_snapshot(table, file_io, snapshot_id, |_entry| true).await
+    let entries =
+        enumerate_live_files_filtered_at_snapshot(table, file_io, snapshot_id, |_entry| true)
+            .await?;
+    Ok(live_data_entries_as_delete_entries(&entries))
 }
 
 /// Shared body for `enumerate_live_data_files` and `enumerate_live_all_files`.
@@ -401,7 +422,7 @@ async fn enumerate_live_files_filtered_at_snapshot<F>(
     file_io: &FileIO,
     snapshot_id: Option<i64>,
     manifest_filter: F,
-) -> Result<Vec<(DataFile, i64, Option<i64>)>, String>
+) -> Result<Vec<LiveDataFileEntry>, String>
 where
     F: Fn(&ManifestFile) -> bool,
 {
@@ -418,7 +439,7 @@ where
         .read()
         .await
         .map_err(|e| format!("read manifest_list failed: {e}"))?;
-    let list = iceberg::spec::ManifestList::parse_with_version(&bytes, m.format_version())
+    let list = ManifestList::parse_with_version(&bytes, m.format_version())
         .map_err(|e| format!("parse manifest_list failed: {e}"))?;
 
     let mut out = Vec::new();
@@ -426,6 +447,7 @@ where
         if !manifest_filter(entry) {
             continue;
         }
+        let partition_spec_id = entry.partition_spec_id;
         let manifest = entry
             .load_manifest(file_io)
             .await
@@ -437,11 +459,44 @@ where
                 // may be None — fall back to the manifest's sequence.
                 let seq = me.sequence_number().unwrap_or(entry.sequence_number);
                 let file_seq = me.file_sequence_number;
-                out.push((data_file, seq, file_seq));
+                out.push(LiveDataFileEntry {
+                    data_file,
+                    sequence_number: seq,
+                    file_sequence_number: file_seq,
+                    partition_spec_id,
+                });
             }
         }
     }
     Ok(out)
+}
+
+fn group_live_data_entries_by_partition_spec(
+    entries: &[LiveDataFileEntry],
+) -> BTreeMap<i32, Vec<LiveDataFileEntry>> {
+    let mut grouped = BTreeMap::new();
+    for entry in entries {
+        grouped
+            .entry(entry.partition_spec_id)
+            .or_insert_with(Vec::new)
+            .push(entry.clone());
+    }
+    grouped
+}
+
+fn live_data_entries_as_delete_entries(
+    entries: &[LiveDataFileEntry],
+) -> Vec<(DataFile, i64, Option<i64>)> {
+    entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.data_file.clone(),
+                entry.sequence_number,
+                entry.file_sequence_number,
+            )
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -203,6 +203,11 @@ fn schema_sources() -> &'static [SchemaSource] {
             raw_schema: include_str!("schemas/iceberg.operation/0001.avsc"),
         },
         SchemaSource {
+            subject: "iceberg.operation",
+            id: 2,
+            raw_schema: include_str!("schemas/iceberg.operation/0002.avsc"),
+        },
+        SchemaSource {
             subject: "job.erase",
             id: 1,
             raw_schema: include_str!("schemas/job.erase/0001.avsc"),
@@ -268,6 +273,11 @@ fn schema_sources() -> &'static [SchemaSource] {
             raw_schema: include_str!("schemas/mv.definition/0001.avsc"),
         },
         SchemaSource {
+            subject: "mv.definition",
+            id: 2,
+            raw_schema: include_str!("schemas/mv.definition/0002.avsc"),
+        },
+        SchemaSource {
             subject: "mv.target_lookup",
             id: 1,
             raw_schema: include_str!("schemas/mv.target_lookup/0001.avsc"),
@@ -281,6 +291,11 @@ fn schema_sources() -> &'static [SchemaSource] {
             subject: "mv.refresh",
             id: 2,
             raw_schema: include_str!("schemas/mv.refresh/0002.avsc"),
+        },
+        SchemaSource {
+            subject: "mv.partition_state",
+            id: 1,
+            raw_schema: include_str!("schemas/mv.partition_state/0001.avsc"),
         },
         SchemaSource {
             subject: "mv.dependency",

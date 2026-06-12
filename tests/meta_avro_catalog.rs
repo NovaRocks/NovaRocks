@@ -41,6 +41,7 @@ struct StoredMvDefinitionAvro {
     target_table: Option<String>,
     schema_contract: Option<String>,
     partition_spec: Option<String>,
+    partition_state_complete: bool,
     last_refresh_ms: Option<i64>,
     last_refresh_rows: Option<i64>,
     last_refresh_snapshots: BTreeMap<String, i64>,
@@ -66,6 +67,26 @@ enum StoredMvRefreshPolicyAvro {
     AsyncInterval,
 }
 
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredMvPartitionStateAvro {
+    mv_id: i64,
+    partition_key: String,
+    status: MvPartitionRefreshStatusAvro,
+    last_refresh_ms: Option<i64>,
+    base_snapshots: BTreeMap<String, i64>,
+    target_snapshot_id: Option<i64>,
+    last_refresh_id: Option<i64>,
+    failure_message: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum MvPartitionRefreshStatusAvro {
+    Fresh,
+    Refreshing,
+    Failed,
+}
+
 #[test]
 fn avro_catalog_has_unique_subject_ids_and_fingerprints() -> TestResult {
     let catalog = schema_catalog()?;
@@ -74,6 +95,9 @@ fn avro_catalog_has_unique_subject_ids_and_fingerprints() -> TestResult {
     assert_eq!(latest.subject(), "test.evolution");
     assert_eq!(latest.id(), 2);
     assert_eq!(latest.fingerprint().len(), 16);
+    assert_eq!(catalog.latest("iceberg.operation")?.id(), 2);
+    assert_eq!(catalog.latest("mv.definition")?.id(), 2);
+    assert_eq!(catalog.latest("mv.partition_state")?.id(), 1);
     Ok(())
 }
 
@@ -172,6 +196,7 @@ fn mv_definition_round_trip_uses_json_string_contract_dto() -> TestResult {
                 .to_string(),
         ),
         partition_spec: Some(r#"{"fields":[{"source":"id","transform":"identity"}]}"#.to_string()),
+        partition_state_complete: true,
         last_refresh_ms: Some(1_771_891_200_000),
         last_refresh_rows: Some(10),
         last_refresh_snapshots: BTreeMap::from([("iceberg.rest.db.orders".to_string(), 101)]),
@@ -193,9 +218,29 @@ fn mv_definition_round_trip_uses_json_string_contract_dto() -> TestResult {
     };
 
     let payload = encode_payload("mv.definition", &expected)?;
-    assert_eq!(payload.schema_id, 1);
+    assert_eq!(payload.schema_id, 2);
     let decoded: StoredMvDefinitionAvro = decode_payload("mv.definition", &payload)?;
 
+    assert_eq!(decoded, expected);
+    Ok(())
+}
+
+#[test]
+fn mv_partition_state_round_trip() -> TestResult {
+    let expected = StoredMvPartitionStateAvro {
+        mv_id: 42,
+        partition_key: "spec=7;region=east".to_string(),
+        status: MvPartitionRefreshStatusAvro::Fresh,
+        last_refresh_ms: Some(1_700_000_000_000),
+        base_snapshots: BTreeMap::from([("ice.sales.orders".to_string(), 10)]),
+        target_snapshot_id: Some(20),
+        last_refresh_id: Some(30),
+        failure_message: None,
+    };
+
+    let payload = encode_payload("mv.partition_state", &expected)?;
+    assert_eq!(payload.schema_id, 1);
+    let decoded: StoredMvPartitionStateAvro = decode_payload("mv.partition_state", &payload)?;
     assert_eq!(decoded, expected);
     Ok(())
 }

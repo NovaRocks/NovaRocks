@@ -15,6 +15,7 @@ use crate::meta::{
 const MV_DEFINITION_KIND: &str = "mv.definition";
 const MV_TARGET_LOOKUP_KIND: &str = "mv.target_lookup";
 const MV_REFRESH_KIND: &str = "mv.refresh";
+const MV_PARTITION_STATE_KIND: &str = "mv.partition_state";
 const MV_DEPENDENCY_KIND: &str = "mv.dependency";
 
 #[derive(Default)]
@@ -34,6 +35,8 @@ pub struct StoredMvDefinition {
     pub schema_contract: Option<MvSchemaContract>,
     #[serde(default)]
     pub partition_spec: Option<MvPartitionContract>,
+    #[serde(default)]
+    pub partition_state_complete: bool,
     pub last_refresh_ms: Option<i64>,
     pub last_refresh_rows: Option<i64>,
     pub last_refresh_snapshots: BTreeMap<String, i64>,
@@ -70,6 +73,8 @@ struct StoredMvDefinitionAvro {
     target_table: Option<String>,
     schema_contract: Option<String>,
     partition_spec: Option<String>,
+    #[serde(default)]
+    partition_state_complete: bool,
     last_refresh_ms: Option<i64>,
     last_refresh_rows: Option<i64>,
     last_refresh_snapshots: BTreeMap<String, i64>,
@@ -120,6 +125,7 @@ impl TryFrom<&StoredMvDefinition> for StoredMvDefinitionAvro {
                         "failed to encode MV partition contract as JSON: {err}"
                     ))
                 })?,
+            partition_state_complete: value.partition_state_complete,
             last_refresh_ms: value.last_refresh_ms,
             last_refresh_rows: value.last_refresh_rows,
             last_refresh_snapshots: value.last_refresh_snapshots.clone(),
@@ -172,6 +178,7 @@ impl TryFrom<StoredMvDefinitionAvro> for StoredMvDefinition {
                         "failed to decode MV partition contract JSON: {err}"
                     ))
                 })?,
+            partition_state_complete: value.partition_state_complete,
             last_refresh_ms: value.last_refresh_ms,
             last_refresh_rows: value.last_refresh_rows,
             last_refresh_snapshots: value.last_refresh_snapshots,
@@ -243,6 +250,49 @@ pub struct UpdateMvRefreshMetadataRequest {
     pub max_staleness_ms: Option<i64>,
     pub last_scheduler_error: Option<String>,
     pub next_refresh_after_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MvPartitionRefreshStatus {
+    Fresh,
+    Refreshing,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredMvPartitionState {
+    pub mv_id: i64,
+    pub partition_key: String,
+    pub status: MvPartitionRefreshStatus,
+    pub last_refresh_ms: Option<i64>,
+    pub base_snapshots: BTreeMap<String, i64>,
+    pub target_snapshot_id: Option<i64>,
+    pub last_refresh_id: Option<i64>,
+    pub failure_message: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplaceMvPartitionStatesRequest {
+    pub mv_id: i64,
+    pub partition_keys: BTreeSet<String>,
+    pub last_refresh_ms: i64,
+    pub base_snapshots: BTreeMap<String, i64>,
+    pub target_snapshot_id: Option<i64>,
+    pub last_refresh_id: i64,
+    pub max_entries: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordFailedMvPartitionStatesRequest {
+    pub mv_id: i64,
+    pub partition_keys: BTreeSet<String>,
+    pub failure_message: String,
+    pub last_refresh_ms: i64,
+    pub base_snapshots: BTreeMap<String, i64>,
+    pub target_snapshot_id: Option<i64>,
+    pub last_refresh_id: i64,
+    pub max_entries: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -418,6 +468,12 @@ pub struct UpdateStarRocksMvRefreshSummaryRequest {
     pub base_table_uuids: BTreeMap<String, String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpdateMvPartitionContractRequest {
+    pub mv_id: i64,
+    pub partition_spec: MvPartitionContract,
+}
+
 impl MvMetaRepository {
     pub fn create_definition(
         &self,
@@ -477,6 +533,7 @@ impl MvMetaRepository {
             target_table: req.target_table,
             schema_contract: req.schema_contract,
             partition_spec: req.partition_spec,
+            partition_state_complete: false,
             last_refresh_ms: None,
             last_refresh_rows: None,
             last_refresh_snapshots: BTreeMap::new(),
@@ -535,6 +592,31 @@ impl MvMetaRepository {
         definition.value.max_staleness_ms = req.max_staleness_ms;
         definition.value.last_scheduler_error = req.last_scheduler_error;
         definition.value.next_refresh_after_ms = req.next_refresh_after_ms;
+        put_definition(
+            txn,
+            &definition,
+            ExpectedRevision::Exact(definition.record_revision.clone()),
+        )?;
+        Ok(definition.value)
+    }
+
+    pub fn update_partition_contract(
+        &self,
+        txn: &mut dyn MetaWriteTxn,
+        req: UpdateMvPartitionContractRequest,
+    ) -> RepositoryResult<StoredMvDefinition> {
+        let mut definition = self.load_versioned_by_id(txn, req.mv_id)?.ok_or_else(|| {
+            RepositoryError::not_found(format!("mv definition {} not found", req.mv_id))
+        })?;
+        let schema_contract = definition.value.schema_contract.as_mut().ok_or_else(|| {
+            RepositoryError::invalid(format!(
+                "mv definition {} is missing schema contract",
+                req.mv_id
+            ))
+        })?;
+        schema_contract.target.partition = Some(req.partition_spec.clone());
+        definition.value.partition_spec = Some(req.partition_spec);
+        definition.value.partition_state_complete = false;
         put_definition(
             txn,
             &definition,
@@ -612,6 +694,7 @@ impl MvMetaRepository {
         }
 
         self.delete_dependencies_for_mv(txn, lookup.mv_id)?;
+        self.delete_partition_states_for_mv(txn, lookup.mv_id)?;
         txn.delete(&target_key, ExpectedRevision::Exact(record.revision))?;
         txn.delete(
             &key_by_id(lookup.mv_id)?,
@@ -641,6 +724,7 @@ impl MvMetaRepository {
             )?;
         }
         self.delete_dependencies_for_mv(txn, mv_id)?;
+        self.delete_partition_states_for_mv(txn, mv_id)?;
         txn.delete(
             &key_by_id(mv_id)?,
             ExpectedRevision::Exact(definition.record_revision),
@@ -1100,6 +1184,143 @@ impl MvMetaRepository {
         Ok(true)
     }
 
+    pub fn replace_partition_states(
+        &self,
+        txn: &mut dyn MetaWriteTxn,
+        req: ReplaceMvPartitionStatesRequest,
+    ) -> RepositoryResult<Vec<StoredMvPartitionState>> {
+        validate_partition_state_limit(req.max_entries)?;
+        let mut definition = self.load_versioned_by_id(txn, req.mv_id)?.ok_or_else(|| {
+            RepositoryError::not_found(format!("mv definition {} not found", req.mv_id))
+        })?;
+        self.delete_partition_states_for_mv(txn, req.mv_id)?;
+        if req.partition_keys.len() > req.max_entries {
+            definition.value.partition_state_complete = false;
+            put_definition(
+                txn,
+                &definition,
+                ExpectedRevision::Exact(definition.record_revision.clone()),
+            )?;
+            return Ok(Vec::new());
+        }
+
+        let mut states = Vec::with_capacity(req.partition_keys.len());
+        for partition_key in req.partition_keys {
+            let state = StoredMvPartitionState {
+                mv_id: req.mv_id,
+                partition_key,
+                status: MvPartitionRefreshStatus::Fresh,
+                last_refresh_ms: Some(req.last_refresh_ms),
+                base_snapshots: req.base_snapshots.clone(),
+                target_snapshot_id: req.target_snapshot_id,
+                last_refresh_id: Some(req.last_refresh_id),
+                failure_message: None,
+            };
+            put_partition_state(txn, &state, ExpectedRevision::NotExists)?;
+            states.push(state);
+        }
+        definition.value.partition_state_complete = true;
+        put_definition(
+            txn,
+            &definition,
+            ExpectedRevision::Exact(definition.record_revision.clone()),
+        )?;
+        Ok(states)
+    }
+
+    pub fn record_failed_partition_states(
+        &self,
+        txn: &mut dyn MetaWriteTxn,
+        req: RecordFailedMvPartitionStatesRequest,
+    ) -> RepositoryResult<Vec<StoredMvPartitionState>> {
+        validate_partition_state_limit(req.max_entries)?;
+        let mut definition = self.load_versioned_by_id(txn, req.mv_id)?.ok_or_else(|| {
+            RepositoryError::not_found(format!("mv definition {} not found", req.mv_id))
+        })?;
+        self.delete_partition_states_for_mv(txn, req.mv_id)?;
+        if req.partition_keys.len() > req.max_entries {
+            definition.value.partition_state_complete = false;
+            put_definition(
+                txn,
+                &definition,
+                ExpectedRevision::Exact(definition.record_revision.clone()),
+            )?;
+            return Ok(Vec::new());
+        }
+
+        let mut states = Vec::with_capacity(req.partition_keys.len());
+        for partition_key in req.partition_keys {
+            let state = StoredMvPartitionState {
+                mv_id: req.mv_id,
+                partition_key,
+                status: MvPartitionRefreshStatus::Failed,
+                last_refresh_ms: Some(req.last_refresh_ms),
+                base_snapshots: req.base_snapshots.clone(),
+                target_snapshot_id: req.target_snapshot_id,
+                last_refresh_id: Some(req.last_refresh_id),
+                failure_message: Some(req.failure_message.clone()),
+            };
+            put_partition_state(txn, &state, ExpectedRevision::NotExists)?;
+            states.push(state);
+        }
+        definition.value.partition_state_complete = true;
+        put_definition(
+            txn,
+            &definition,
+            ExpectedRevision::Exact(definition.record_revision.clone()),
+        )?;
+        Ok(states)
+    }
+
+    pub fn clear_partition_states(
+        &self,
+        txn: &mut dyn MetaWriteTxn,
+        mv_id: i64,
+    ) -> RepositoryResult<bool> {
+        let Some(mut definition) = self.load_versioned_by_id(txn, mv_id)? else {
+            return Ok(false);
+        };
+        self.delete_partition_states_for_mv(txn, mv_id)?;
+        if definition.value.partition_state_complete {
+            definition.value.partition_state_complete = false;
+            put_definition(
+                txn,
+                &definition,
+                ExpectedRevision::Exact(definition.record_revision.clone()),
+            )?;
+        }
+        Ok(true)
+    }
+
+    pub fn list_partition_states(
+        &self,
+        txn: &dyn MetaReadTxn,
+        mv_id: i64,
+    ) -> RepositoryResult<Vec<StoredMvPartitionState>> {
+        let mut states = txn
+            .scan(&key_prefix_partition_state(mv_id)?, None)?
+            .into_iter()
+            .map(decode_partition_state_record)
+            .collect::<RepositoryResult<Vec<_>>>()?;
+        states.sort_by(|left, right| left.partition_key.cmp(&right.partition_key));
+        Ok(states)
+    }
+
+    fn delete_partition_states_for_mv(
+        &self,
+        txn: &mut dyn MetaWriteTxn,
+        mv_id: i64,
+    ) -> RepositoryResult<()> {
+        let existing = self.list_partition_states(txn, mv_id)?;
+        for state in existing {
+            txn.delete(
+                &key_partition_state(state.mv_id, &state.partition_key)?,
+                ExpectedRevision::Any,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Adopt a new target snapshot produced by a pure compaction (OPTIMIZE /
     /// rewrite_data_files) of an iceberg MV's own storage table.
     ///
@@ -1341,6 +1562,24 @@ fn put_refresh(
     Ok(())
 }
 
+fn decode_partition_state_record(record: MetaRecord) -> RepositoryResult<StoredMvPartitionState> {
+    decode_record_payload(&record, MV_PARTITION_STATE_KIND)
+}
+
+fn put_partition_state(
+    txn: &mut dyn MetaWriteTxn,
+    state: &StoredMvPartitionState,
+    expected: ExpectedRevision,
+) -> RepositoryResult<()> {
+    txn.put(MetaRecordPut::new(
+        key_partition_state(state.mv_id, &state.partition_key)?,
+        record_kind(MV_PARTITION_STATE_KIND)?,
+        expected,
+        encode_record_payload(MV_PARTITION_STATE_KIND, state)?,
+    ))?;
+    Ok(())
+}
+
 fn persisted_publish_target_snapshot(refresh: &StoredMvRefresh) -> Option<i64> {
     refresh.published_snapshot_id.or_else(|| {
         refresh
@@ -1432,6 +1671,15 @@ fn validate_refresh_metadata(req: &UpdateMvRefreshMetadataRequest) -> Repository
     Ok(())
 }
 
+fn validate_partition_state_limit(max_entries: usize) -> RepositoryResult<()> {
+    if max_entries == 0 {
+        return Err(RepositoryError::invalid(
+            "mv partition state max_entries must be positive",
+        ));
+    }
+    Ok(())
+}
+
 fn key_by_id(mv_id: i64) -> RepositoryResult<MetaKey> {
     Ok(MetaKey::new(
         NS_MV,
@@ -1464,6 +1712,42 @@ fn key_refresh(refresh_id: i64) -> RepositoryResult<MetaKey> {
         NS_MV,
         ["refresh".to_string(), refresh_id.to_string()],
     )?)
+}
+
+fn key_partition_state(mv_id: i64, partition_key: &str) -> RepositoryResult<MetaKey> {
+    Ok(MetaKey::new(
+        NS_MV,
+        [
+            "partition-state".to_string(),
+            mv_id.to_string(),
+            encode_key_segment(partition_key),
+        ],
+    )?)
+}
+
+fn key_prefix_partition_state(mv_id: i64) -> RepositoryResult<MetaKeyPrefix> {
+    Ok(MetaKeyPrefix::new(
+        NS_MV,
+        ["partition-state".to_string(), mv_id.to_string()],
+    )?)
+}
+
+fn encode_key_segment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => {
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                out.push('%');
+                out.push(HEX[(byte >> 4) as usize] as char);
+                out.push(HEX[(byte & 0x0F) as usize] as char);
+            }
+        }
+    }
+    out
 }
 
 /// Separator used to pack the dependency object identity into a single key

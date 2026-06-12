@@ -1,0 +1,22 @@
+{
+  "type": "record",
+  "name": "StoredMvPartitionState",
+  "namespace": "novarocks.meta.mv",
+  "fields": [
+    { "name": "mv_id", "type": "long" },
+    { "name": "partition_key", "type": "string" },
+    {
+      "name": "status",
+      "type": {
+        "type": "enum",
+        "name": "MvPartitionRefreshStatus",
+        "symbols": ["FRESH", "REFRESHING", "FAILED"]
+      }
+    },
+    { "name": "last_refresh_ms", "type": ["null", "long"], "default": null },
+    { "name": "base_snapshots", "type": { "type": "map", "values": "long" } },
+    { "name": "target_snapshot_id", "type": ["null", "long"], "default": null },
+    { "name": "last_refresh_id", "type": ["null", "long"], "default": null },
+    { "name": "failure_message", "type": ["null", "string"], "default": null }
+  ]
+}

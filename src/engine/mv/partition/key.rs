@@ -10,6 +10,41 @@ impl MvPartitionKey {
     pub(crate) fn new(spec_id: i32, fields: Vec<MvPartitionKeyField>) -> Self {
         Self { spec_id, fields }
     }
+
+    pub(crate) fn canonical_string(&self) -> String {
+        let mut out = format!("spec={}", self.spec_id);
+        for field in &self.fields {
+            out.push(';');
+            out.push_str(&encode_component(&field.field_name));
+            out.push('=');
+            match &field.value {
+                MvPartitionValue::Null => out.push_str("null"),
+                MvPartitionValue::String(value) => {
+                    out.push_str("s:");
+                    out.push_str(&encode_component(value));
+                }
+            }
+        }
+        out
+    }
+}
+
+fn encode_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => {
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                out.push('%');
+                out.push(HEX[(byte >> 4) as usize] as char);
+                out.push(HEX[(byte & 0x0F) as usize] as char);
+            }
+        }
+    }
+    out
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -89,6 +124,24 @@ mod tests {
         let filter = TargetPartitionFilter::None;
         assert!(filter.matches(&key(1, "id", "1")));
         assert_eq!(filter.allow_list_len(), None);
+    }
+
+    #[test]
+    fn mv_partition_key_canonical_string_is_stable_and_escaped() {
+        let key = MvPartitionKey::new(
+            7,
+            vec![
+                MvPartitionKeyField::new(
+                    "region/name".to_string(),
+                    MvPartitionValue::String("east;1".to_string()),
+                ),
+                MvPartitionKeyField::new("bucket".to_string(), MvPartitionValue::Null),
+            ],
+        );
+        assert_eq!(
+            key.canonical_string(),
+            "spec=7;region%2Fname=s:east%3B1;bucket=null"
+        );
     }
 
     #[test]

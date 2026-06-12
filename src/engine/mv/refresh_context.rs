@@ -1491,6 +1491,7 @@ pub(crate) mod tests_support {
             target_table: Some("mv".to_string()),
             schema_contract: Some(make_schema_contract()),
             partition_spec: None,
+            partition_state_complete: false,
             last_refresh_ms: None,
             last_refresh_rows: None,
             last_refresh_snapshots: [("ice.db.b".to_string(), 11i64)].into_iter().collect(),

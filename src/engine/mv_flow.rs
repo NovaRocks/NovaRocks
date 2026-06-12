@@ -496,6 +496,34 @@ pub(crate) fn alter_mv(
     db: &str,
     stmt: &AlterMaterializedViewStmt,
 ) -> Result<StatementResult, String> {
+    if matches!(stmt.action, AlterMaterializedViewAction::Repartition(_)) {
+        let current_catalog = current_catalog.ok_or_else(|| {
+            "ALTER MATERIALIZED VIEW ... REPARTITION requires current Iceberg catalog".to_string()
+        })?;
+        let target = crate::engine::mv::iceberg_refresh::resolve_refresh_target(
+            Some(current_catalog),
+            db,
+            &stmt.name,
+        )?;
+        let engine = existing_mv_storage_engine_by_target(state, &target)?.ok_or_else(|| {
+            format!(
+                "materialized view {}.{}.{} not found",
+                target.catalog, target.namespace, target.table
+            )
+        })?;
+        if engine != MvStorageEngine::Iceberg {
+            return Err(
+                "ALTER MATERIALIZED VIEW ... REPARTITION is only supported for Iceberg-backed materialized views"
+                    .to_string(),
+            );
+        }
+        return crate::engine::mv::iceberg_refresh::repartition_iceberg_mv(
+            state,
+            Some(current_catalog),
+            db,
+            stmt,
+        );
+    }
     let provider = state
         .metadata_provider
         .as_ref()
@@ -527,6 +555,9 @@ pub(crate) fn alter_mv(
             last_scheduler_error: definition.last_scheduler_error.clone(),
             next_refresh_after_ms: definition.next_refresh_after_ms,
         },
+        AlterMaterializedViewAction::Repartition(_) => {
+            unreachable!("repartition is handled before refresh metadata update")
+        }
     };
     state
         .mv_repo

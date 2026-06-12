@@ -97,6 +97,29 @@ pub(crate) fn build_evolved_partition_spec(
     Ok(builder.build())
 }
 
+pub(crate) fn build_replacement_partition_spec(
+    schema: &Schema,
+    fields: &[IcebergPartitionFieldExpr],
+) -> Result<UnboundPartitionSpec, String> {
+    if fields.is_empty() {
+        return Err("REPARTITION BY requires at least one partition field".to_string());
+    }
+    let mut builder = UnboundPartitionSpecBuilder::new();
+    for field in fields {
+        let source_id = source_field_id(schema, field)?;
+        validate_transform(schema, source_id, field)?;
+        builder = builder
+            .add_partition_fields([UnboundPartitionField {
+                source_id,
+                field_id: None,
+                name: stable_field_name(field),
+                transform: to_transform(field),
+            }])
+            .map_err(|e| format!("build replacement iceberg partition spec failed: {e}"))?;
+    }
+    Ok(builder.build())
+}
+
 pub(crate) enum PartitionSpecChange<'a> {
     Add(&'a IcebergPartitionFieldExpr),
     Drop(&'a IcebergPartitionFieldExpr),

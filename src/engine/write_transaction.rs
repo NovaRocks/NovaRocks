@@ -360,6 +360,7 @@ impl<'a, E: IcebergWriteTransactionExecutor> IcebergWriteTransactionRunner<'a, E
         let provider = self.metadata_provider()?;
         let request = CreateIcebergOperationRequest {
             operation_kind: spec.operation_kind,
+            operation_subkind: None,
             target: spec.target.clone(),
             attempt_id: spec.attempt_id.clone(),
             base_snapshot_id: spec.commit.base_snapshot_id,

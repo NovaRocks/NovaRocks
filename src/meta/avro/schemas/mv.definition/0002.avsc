@@ -1,0 +1,40 @@
+{
+  "type": "record",
+  "name": "StoredMvDefinition",
+  "namespace": "novarocks.meta.mv",
+  "fields": [
+    { "name": "mv_id", "type": "long" },
+    { "name": "select_sql", "type": "string" },
+    { "name": "base_table_refs", "type": { "type": "array", "items": "string" } },
+    { "name": "primary_key_columns", "type": { "type": "array", "items": "string" } },
+    { "name": "storage_engine", "type": "string" },
+    { "name": "target_catalog", "type": ["null", "string"], "default": null },
+    { "name": "target_namespace", "type": ["null", "string"], "default": null },
+    { "name": "target_table", "type": ["null", "string"], "default": null },
+    { "name": "schema_contract", "type": ["null", "string"], "default": null },
+    { "name": "partition_spec", "type": ["null", "string"], "default": null },
+    { "name": "partition_state_complete", "type": "boolean", "default": false },
+    { "name": "last_refresh_ms", "type": ["null", "long"], "default": null },
+    { "name": "last_refresh_rows", "type": ["null", "long"], "default": null },
+    { "name": "last_refresh_snapshots", "type": { "type": "map", "values": "long" } },
+    { "name": "last_refresh_table_uuids", "type": { "type": "map", "values": "string" } },
+    { "name": "last_refreshed_iceberg_snapshot_id", "type": ["null", "long"], "default": null },
+    { "name": "refresh_in_progress", "type": "boolean" },
+    { "name": "active_refresh_id", "type": ["null", "long"], "default": null },
+    { "name": "refresh_target_snapshots", "type": { "type": "map", "values": "long" } },
+    {
+      "name": "refresh_policy",
+      "type": {
+        "type": "enum",
+        "name": "StoredMvRefreshPolicy",
+        "symbols": ["MANUAL", "ASYNC_ON_CHANGE", "ASYNC_INTERVAL"]
+      }
+    },
+    { "name": "refresh_paused", "type": "boolean" },
+    { "name": "refresh_interval_ms", "type": ["null", "long"], "default": null },
+    { "name": "max_staleness_ms", "type": ["null", "long"], "default": null },
+    { "name": "last_scheduler_error", "type": ["null", "string"], "default": null },
+    { "name": "next_refresh_after_ms", "type": ["null", "long"], "default": null },
+    { "name": "created_at_ms", "type": "long" }
+  ]
+}

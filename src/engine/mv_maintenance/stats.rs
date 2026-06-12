@@ -136,6 +136,7 @@ mod tests {
             target_table: Some("mv_x".to_string()),
             schema_contract: None,
             partition_spec: None,
+            partition_state_complete: false,
             last_refresh_ms: None,
             last_refresh_rows: None,
             last_refresh_snapshots,

@@ -155,7 +155,12 @@ fn parse_partition_by(
     if !parser.parse_keywords(&[Keyword::PARTITION, Keyword::BY]) {
         return Ok(None);
     }
+    parse_partition_field_list(parser).map(Some)
+}
 
+fn parse_partition_field_list(
+    parser: &mut Parser<'_>,
+) -> Result<Vec<IcebergPartitionFieldExpr>, String> {
     let mut fields = Vec::new();
     if parser.consume_token(&Token::LParen) {
         loop {
@@ -180,7 +185,7 @@ fn parse_partition_by(
     if fields.is_empty() {
         return Err("PARTITION BY requires at least one field".to_string());
     }
-    Ok(Some(fields))
+    Ok(fields)
 }
 
 fn parse_distributed_by(
@@ -431,9 +436,16 @@ pub(crate) fn parse_alter_materialized_view(parser: &mut Parser<'_>) -> Result<S
             .expect_keyword(Keyword::REFRESH)
             .map_err(|e| format!("expected REFRESH after RESUME: {e}"))?;
         AlterMaterializedViewAction::ResumeRefresh
+    } else if peek_word_eq(parser, 0, "REPARTITION") {
+        parser.next_token();
+        parser.expect_keyword(Keyword::BY).map_err(|e| {
+            format!("expected BY after ALTER MATERIALIZED VIEW ... REPARTITION: {e}")
+        })?;
+        let fields = parse_partition_field_list(parser)?;
+        AlterMaterializedViewAction::Repartition(fields)
     } else {
         return Err(
-            "expected SET REFRESH, PAUSE REFRESH, or RESUME REFRESH after ALTER MATERIALIZED VIEW"
+            "expected SET REFRESH, PAUSE REFRESH, RESUME REFRESH, or REPARTITION BY after ALTER MATERIALIZED VIEW"
                 .to_string(),
         );
     };
@@ -852,6 +864,30 @@ mod tests {
             panic!("expected ALTER MATERIALIZED VIEW");
         };
         assert_eq!(resume.action, AlterMaterializedViewAction::ResumeRefresh);
+    }
+
+    #[test]
+    fn parse_alter_mv_repartition_by() {
+        let stmt = parse_one(
+            "ALTER MATERIALIZED VIEW analytics.mv1 REPARTITION BY (bucket(id, 32), truncate(name, 4))",
+        );
+        let Statement::AlterMaterializedView(alter) = stmt else {
+            panic!("expected ALTER MATERIALIZED VIEW");
+        };
+        assert_eq!(alter.name.parts, vec!["analytics", "mv1"]);
+        assert_eq!(
+            alter.action,
+            AlterMaterializedViewAction::Repartition(vec![
+                IcebergPartitionFieldExpr::Bucket {
+                    column: "id".to_string(),
+                    num_buckets: 32,
+                },
+                IcebergPartitionFieldExpr::Truncate {
+                    column: "name".to_string(),
+                    width: 4,
+                },
+            ])
+        );
     }
 
     #[test]

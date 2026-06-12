@@ -686,6 +686,79 @@ pub(crate) fn alter_partition_spec(
     Ok(())
 }
 
+pub(crate) fn replace_default_partition_spec(
+    entry: &IcebergCatalogEntry,
+    namespace_name: &str,
+    table_name: &str,
+    fields: &[crate::sql::parser::ast::IcebergPartitionFieldExpr],
+) -> Result<iceberg::table::Table, String> {
+    use iceberg::{TableCommit, TableRequirement, TableUpdate};
+
+    let namespace = NamespaceIdent::new(normalize_identifier(namespace_name)?);
+    let table_name = normalize_identifier(table_name)?;
+    let catalog = build_iceberg_catalog(entry)?;
+    let ident = TableIdent::new(namespace, table_name.clone());
+    let table = block_on_iceberg(async { catalog.load_table(&ident).await })
+        .map_err(|e| format!("load iceberg table runtime failed: {e}"))?
+        .map_err(|e| format!("load iceberg table {ident}: {e}"))?;
+    let metadata = table.metadata();
+    let base_default_spec_id = metadata.default_partition_spec_id();
+    let prev_last_partition_id = metadata.last_partition_id();
+    let evolved = crate::connector::iceberg::partition_spec::build_replacement_partition_spec(
+        metadata.current_schema().as_ref(),
+        fields,
+    )?;
+
+    let commit = TableCommit::builder()
+        .ident(ident.clone())
+        .requirements(vec![TableRequirement::DefaultSpecIdMatch {
+            default_spec_id: base_default_spec_id,
+        }])
+        .updates(vec![
+            TableUpdate::AddSpec { spec: evolved },
+            TableUpdate::SetDefaultSpec { spec_id: -1 },
+        ])
+        .build();
+    let updated = block_on_iceberg(async { catalog.update_table(commit).await })
+        .map_err(|e| format!("replace iceberg partition spec runtime failed: {e}"))?
+        .map_err(|e| format!("replace iceberg partition spec failed: {e}"))?;
+    crate::connector::iceberg::commit::ensure_partition_id_not_regressed(
+        prev_last_partition_id,
+        updated.metadata().last_partition_id(),
+    )?;
+    entry.invalidate_table_cache(namespace_name, &table_name);
+    Ok(updated)
+}
+
+pub(crate) fn set_default_partition_spec_id(
+    entry: &IcebergCatalogEntry,
+    namespace_name: &str,
+    table_name: &str,
+    expected_default_spec_id: i32,
+    default_spec_id: i32,
+) -> Result<iceberg::table::Table, String> {
+    use iceberg::{TableCommit, TableRequirement, TableUpdate};
+
+    let namespace = NamespaceIdent::new(normalize_identifier(namespace_name)?);
+    let table_name = normalize_identifier(table_name)?;
+    let catalog = build_iceberg_catalog(entry)?;
+    let ident = TableIdent::new(namespace, table_name.clone());
+    let commit = TableCommit::builder()
+        .ident(ident.clone())
+        .requirements(vec![TableRequirement::DefaultSpecIdMatch {
+            default_spec_id: expected_default_spec_id,
+        }])
+        .updates(vec![TableUpdate::SetDefaultSpec {
+            spec_id: default_spec_id,
+        }])
+        .build();
+    let updated = block_on_iceberg(async { catalog.update_table(commit).await })
+        .map_err(|e| format!("set iceberg default partition spec runtime failed: {e}"))?
+        .map_err(|e| format!("set iceberg default partition spec failed: {e}"))?;
+    entry.invalidate_table_cache(namespace_name, &table_name);
+    Ok(updated)
+}
+
 pub(crate) fn drop_table(
     entry: &IcebergCatalogEntry,
     namespace_name: &str,

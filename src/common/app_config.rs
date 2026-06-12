@@ -438,6 +438,8 @@ pub struct StandaloneServerConfig {
     pub mv_refresh_max_touched_groups: usize,
     #[serde(default = "default_standalone_mv_refresh_max_affected_partitions")]
     pub mv_refresh_max_affected_partitions: usize,
+    #[serde(default = "default_standalone_mv_partition_state_max_entries")]
+    pub mv_partition_state_max_entries: usize,
     #[serde(default = "default_standalone_iceberg_maintenance_enabled")]
     pub iceberg_maintenance_enabled: bool,
     #[serde(default = "default_standalone_iceberg_maintenance_tick_interval_ms")]
@@ -484,6 +486,10 @@ fn default_standalone_mv_refresh_max_touched_groups() -> usize {
 
 fn default_standalone_mv_refresh_max_affected_partitions() -> usize {
     4_096
+}
+
+fn default_standalone_mv_partition_state_max_entries() -> usize {
+    10_000
 }
 
 fn default_standalone_iceberg_maintenance_enabled() -> bool {
@@ -533,6 +539,7 @@ impl Default for StandaloneServerConfig {
             mv_refresh_max_touched_groups: default_standalone_mv_refresh_max_touched_groups(),
             mv_refresh_max_affected_partitions:
                 default_standalone_mv_refresh_max_affected_partitions(),
+            mv_partition_state_max_entries: default_standalone_mv_partition_state_max_entries(),
             iceberg_maintenance_enabled: default_standalone_iceberg_maintenance_enabled(),
             iceberg_maintenance_tick_interval_ms:
                 default_standalone_iceberg_maintenance_tick_interval_ms(),
@@ -1578,6 +1585,7 @@ grpc_port = 19080
                 mv_refresh_scheduler_max_failure_backoff_ms: 1_800_000,
                 mv_refresh_max_touched_groups: 100_000,
                 mv_refresh_max_affected_partitions: 4_096,
+                mv_partition_state_max_entries: 10_000,
                 iceberg_maintenance_enabled: true,
                 iceberg_maintenance_tick_interval_ms: 600_000,
                 iceberg_maintenance_max_concurrent: 1,
@@ -1602,6 +1610,7 @@ grpc_port = 19080
         assert_eq!(cfg.iceberg_maintenance_max_consecutive_failures, 4);
         assert_eq!(cfg.mv_refresh_max_touched_groups, 100_000);
         assert_eq!(cfg.mv_refresh_max_affected_partitions, 4_096);
+        assert_eq!(cfg.mv_partition_state_max_entries, 10_000);
         assert_eq!(cfg, StandaloneServerConfig::default());
     }
 
@@ -1611,12 +1620,14 @@ grpc_port = 19080
             r#"
 mv_refresh_max_touched_groups = 7
 mv_refresh_max_affected_partitions = 3
+mv_partition_state_max_entries = 11
 "#,
         )
         .expect("standalone_server pruning thresholds parse");
 
         assert_eq!(cfg.mv_refresh_max_touched_groups, 7);
         assert_eq!(cfg.mv_refresh_max_affected_partitions, 3);
+        assert_eq!(cfg.mv_partition_state_max_entries, 11);
     }
 
     #[test]

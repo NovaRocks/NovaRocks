@@ -239,6 +239,8 @@ pub struct IcebergRecoveryEvidenceRecord {
 pub struct StoredIcebergOperation {
     pub operation_id: i64,
     pub operation_kind: IcebergOperationKind,
+    #[serde(default)]
+    pub operation_subkind: Option<String>,
     pub target: IcebergOperationTarget,
     pub state: IcebergOperationState,
     pub attempt_id: String,
@@ -269,6 +271,7 @@ pub struct VersionedIcebergOperation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateIcebergOperationRequest {
     pub operation_kind: IcebergOperationKind,
+    pub operation_subkind: Option<String>,
     pub target: IcebergOperationTarget,
     pub attempt_id: String,
     pub base_snapshot_id: Option<i64>,
@@ -306,6 +309,7 @@ impl IcebergOperationRepository {
         let stored = StoredIcebergOperation {
             operation_id,
             operation_kind: req.operation_kind,
+            operation_subkind: req.operation_subkind,
             target: req.target,
             state: IcebergOperationState::Preparing,
             attempt_id: req.attempt_id,

@@ -146,6 +146,7 @@ pub(crate) enum AlterMaterializedViewAction {
     SetRefresh(MaterializedViewRefreshPolicy),
     PauseRefresh,
     ResumeRefresh,
+    Repartition(Vec<IcebergPartitionFieldExpr>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
