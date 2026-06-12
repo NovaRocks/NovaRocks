@@ -1,5 +1,9 @@
 use std::fmt;
 
+pub const REPORT_EXEC_STATUS_OK: i32 = 0;
+pub const REPORT_EXEC_STATUS_ERROR: i32 = 1;
+pub const REPORT_EXEC_STATUS_QUERY_GONE: i32 = 2;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum EngineErrorCode {
     TypeMismatch,
@@ -95,7 +99,6 @@ pub enum EngineErrorDetail {
         message: String,
     },
     Message {
-        static_code: EngineErrorCode,
         message: String,
     },
 }
@@ -107,7 +110,7 @@ pub struct EngineError {
 }
 
 impl EngineError {
-    pub fn new(code: EngineErrorCode, detail: EngineErrorDetail) -> Self {
+    fn new(code: EngineErrorCode, detail: EngineErrorDetail) -> Self {
         Self { code, detail }
     }
 
@@ -175,7 +178,6 @@ impl EngineError {
         Self::new(
             code,
             EngineErrorDetail::Message {
-                static_code: code,
                 message: message.into(),
             },
         )
@@ -231,10 +233,8 @@ impl EngineError {
 
     pub fn to_report_status_code(&self) -> i32 {
         match self.code {
-            EngineErrorCode::WriteCoordinatorGone => {
-                crate::service::grpc_server::REPORT_EXEC_STATUS_QUERY_GONE
-            }
-            _ => crate::service::grpc_server::REPORT_EXEC_STATUS_ERROR,
+            EngineErrorCode::WriteCoordinatorGone => REPORT_EXEC_STATUS_QUERY_GONE,
+            _ => REPORT_EXEC_STATUS_ERROR,
         }
     }
 }
@@ -276,10 +276,7 @@ mod tests {
     fn write_coordinator_gone_maps_to_query_gone_report_status() {
         let err = EngineError::write_coordinator_gone(crate::types::TUniqueId { hi: 11, lo: 22 });
         assert_eq!(err.code(), EngineErrorCode::WriteCoordinatorGone);
-        assert_eq!(
-            err.to_report_status_code(),
-            crate::service::grpc_server::REPORT_EXEC_STATUS_QUERY_GONE
-        );
+        assert_eq!(err.to_report_status_code(), REPORT_EXEC_STATUS_QUERY_GONE);
         assert_eq!(
             err.to_tstatus_code(),
             crate::status_code::TStatusCode::INTERNAL_ERROR
@@ -295,5 +292,48 @@ mod tests {
         assert!(err
             .to_user_message()
             .contains("failed to deserialize payload"));
+    }
+
+    #[test]
+    fn unsupported_distributed_dml_shape_maps_to_not_supported() {
+        let err = EngineError::unsupported_distributed_dml_shape("insert", "missing coordinator");
+        assert_eq!(
+            err.to_tstatus_code(),
+            crate::status_code::TStatusCode::NOT_IMPLEMENTED_ERROR
+        );
+        assert_eq!(
+            err.to_mysql_error_kind(),
+            opensrv_mysql::ErrorKind::ER_NOT_SUPPORTED_YET
+        );
+    }
+
+    #[test]
+    fn protocol_decode_error_maps_to_invalid_argument_and_parse_error() {
+        let err = EngineError::protocol_decode("bad report payload");
+        assert_eq!(
+            err.to_tstatus_code(),
+            crate::status_code::TStatusCode::INVALID_ARGUMENT
+        );
+        assert_eq!(
+            err.to_mysql_error_kind(),
+            opensrv_mysql::ErrorKind::ER_PARSE_ERROR
+        );
+    }
+
+    #[test]
+    fn default_engine_error_maps_to_internal_and_unknown() {
+        let err = EngineError::internal_invariant(
+            InternalInvariantCode::UnexpectedReportStatusShape,
+            "missing status",
+        );
+        assert_eq!(
+            err.to_tstatus_code(),
+            crate::status_code::TStatusCode::INTERNAL_ERROR
+        );
+        assert_eq!(
+            err.to_mysql_error_kind(),
+            opensrv_mysql::ErrorKind::ER_UNKNOWN_ERROR
+        );
+        assert_eq!(err.to_report_status_code(), REPORT_EXEC_STATUS_ERROR);
     }
 }
