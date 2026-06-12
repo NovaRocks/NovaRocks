@@ -1,0 +1,30 @@
+-- query 2
+id	try_variant_get(v, '$.a', 'bigint')
+1	1
+2	99
+3	NULL
+4	1
+5	NULL
+6	NULL
+
+-- query 3
+id	variant_get(v, '$.a', 'bigint')
+1	1
+2	99
+3	NULL
+4	1
+
+-- query 5
+id	variant_typeof(variant_get(v, '$.a'))
+1	Int8
+2	Int8
+
+-- query 6
+id
+2
+
+-- query 7
+id	variant_get(v, '$.b', 'string')
+1	x
+2	y
+3	no-a
