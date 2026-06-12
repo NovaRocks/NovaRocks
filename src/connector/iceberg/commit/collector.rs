@@ -406,6 +406,9 @@ impl IcebergCommitCollector {
                     ));
                 }
             };
+            if matches!(prim, PrimitiveType::Variant) {
+                continue;
+            }
             let datum = Datum::try_from_bytes(&bytes, prim)
                 .map_err(|e| format!("decode column stat {field}[{field_id}] failed: {e}"))?;
             out.insert(field_id, datum);
@@ -769,6 +772,26 @@ mod parity_tests {
         )
     }
 
+    fn int_variant_schema() -> SchemaRef {
+        Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    Arc::new(NestedField::required(
+                        1,
+                        "k1",
+                        Type::Primitive(PrimitiveType::Int),
+                    )),
+                    Arc::new(NestedField::optional(
+                        2,
+                        "v",
+                        Type::Primitive(PrimitiveType::Variant),
+                    )),
+                ])
+                .build()
+                .expect("schema"),
+        )
+    }
+
     fn unpartitioned_collector(schema: SchemaRef) -> IcebergCommitCollector {
         IcebergCommitCollector::new(
             CommitOpKind::FastAppend,
@@ -1104,6 +1127,47 @@ mod parity_tests {
             "stale field-id bound should be skipped, got {:?}",
             actual.lower_bounds
         );
+    }
+
+    #[test]
+    fn convert_skips_bounds_for_variant_field_ids() {
+        let thrift = crate::types::TIcebergDataFile {
+            path: Some("file:///t/data-variant.parquet".to_string()),
+            format: Some("PARQUET".to_string()),
+            record_count: Some(1),
+            file_size_in_bytes: Some(10),
+            partition_path: Some(String::new()),
+            column_stats: Some(crate::types::TIcebergColumnStats {
+                column_sizes: Some(BTreeMap::from([(2, 8)])),
+                value_counts: Some(BTreeMap::from([(2, 1)])),
+                null_value_counts: Some(BTreeMap::from([(2, 0)])),
+                nan_value_counts: None,
+                lower_bounds: Some(BTreeMap::from([(2, vec![1, 2, 3])])),
+                upper_bounds: Some(BTreeMap::from([(2, vec![4, 5, 6])])),
+            }),
+            partition_null_fingerprint: Some(String::new()),
+            file_content: Some(crate::types::TIcebergFileContent::DATA),
+            partition_spec_id: Some(0),
+            ..Default::default()
+        };
+
+        let collector = unpartitioned_collector(int_variant_schema());
+        let actual = collector
+            .convert(thrift)
+            .expect("variant bounds should be skipped, not decoded");
+        assert!(
+            actual.lower_bounds.is_empty(),
+            "variant lower bounds should be skipped, got {:?}",
+            actual.lower_bounds
+        );
+        assert!(
+            actual.upper_bounds.is_empty(),
+            "variant upper bounds should be skipped, got {:?}",
+            actual.upper_bounds
+        );
+        assert_eq!(actual.column_sizes.get(&2), Some(&8));
+        assert_eq!(actual.value_counts.get(&2), Some(&1));
+        assert_eq!(actual.null_value_counts.get(&2), Some(&0));
     }
 }
 
