@@ -140,6 +140,10 @@ impl EngineError {
         Self::static_message(EngineErrorCode::CommitUnknown, message)
     }
 
+    pub fn query_timeout(message: impl Into<String>) -> Self {
+        Self::static_message(EngineErrorCode::QueryTimeout, message)
+    }
+
     pub fn iceberg_write_descriptor_mismatch(message: impl Into<String>) -> Self {
         Self::static_message(EngineErrorCode::IcebergWriteDescriptorMismatch, message)
     }
@@ -232,6 +236,7 @@ mod tests {
             EngineErrorCode::WriteCoordinatorGone,
             EngineErrorCode::CommitKnownUncommitted,
             EngineErrorCode::CommitUnknown,
+            EngineErrorCode::QueryTimeout,
             EngineErrorCode::ProtocolDecodeError,
             EngineErrorCode::InternalInvariantViolation,
         ] {
@@ -325,6 +330,13 @@ mod tests {
             unknown
                 .to_user_message()
                 .contains("coordinator did not return a decision")
+        );
+
+        let timeout = EngineError::query_timeout("query timed out after 1000 ms");
+        assert_eq!(timeout.code(), EngineErrorCode::QueryTimeout);
+        assert_eq!(
+            timeout.to_bracketed_user_message(),
+            "[QueryTimeout] query timed out after 1000 ms"
         );
 
         let descriptor =

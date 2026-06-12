@@ -28,5 +28,35 @@ Boundary Schemas:
     slot=2 name=sum(v) arrow=Int64 logical=<none> nullable=true
 
 -- query 2
+Explain String
+Planning: <MS> ms / Execution: <MS> ms / Rows: 1
+GATHER EXCHANGE stats={rows=2 conf=estimated}
+  PROJECT [k, sum(v) AS total_v] stats={rows=2 conf=estimated}
+    HASH AGGREGATE (GLOBAL, group by: [k]) stats={rows=2 conf=estimated}
+      aggregations: sum(v)
+      HASH EXCHANGE (source: ShuffleAgg, hash: [c5]) stats={rows=2 conf=estimated}
+        HASH AGGREGATE (LOCAL, group by: [k]) stats={rows=2 conf=estimated}
+          aggregations: sum(v)
+          PROJECT [k, v] stats={rows=2 conf=estimated}
+            UNION ALL stats={rows=2 conf=estimated}
+              PROJECT [1 AS k, 10 AS v] stats={rows=1 conf=estimated}
+                VALUES (1 rows) stats={rows=1}
+              PROJECT [1 AS k, 20 AS v] stats={rows=1 conf=estimated}
+                VALUES (1 rows) stats={rows=1}
+Boundary Schemas:
+  Fragment 1 RESULT_ROOT node=7:
+    slot=1 name=k arrow=Int64 logical=<none> nullable=false
+    slot=2 name=sum(v) arrow=Int64 logical=<none> nullable=true
+  Fragment 0 RESULT_ROOT node=10:
+    slot=1 name=k arrow=Int64 logical=<none> nullable=false
+    slot=2 name=total_v arrow=Int64 logical=<none> nullable=true
+  Fragment 1 EXCHANGE_SEND node=8:
+    slot=1 name=k arrow=Int64 logical=<none> nullable=false
+    slot=2 name=sum(v) arrow=Int64 logical=<none> nullable=true
+  Fragment 0 EXCHANGE_RECV node=8:
+    slot=1 name=k arrow=Int64 logical=<none> nullable=false
+    slot=2 name=sum(v) arrow=Int64 logical=<none> nullable=true
+
+-- query 3
 k	total_v
 1	30

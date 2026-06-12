@@ -123,6 +123,21 @@ fn evaluate_expected_error_branch(
     })
 }
 
+fn annotate_failure_with_engine_error_code(message: &str, source: &str) -> String {
+    if message.contains("engine_error_code=") {
+        return message.to_string();
+    }
+    extract_engine_error_code(source)
+        .or_else(|| extract_engine_error_code(message))
+        .or_else(|| {
+            message
+                .strip_prefix("target execute failed: ")
+                .and_then(extract_engine_error_code)
+        })
+        .map(|code| format!("engine_error_code={} {}", code, message))
+        .unwrap_or_else(|| message.to_string())
+}
+
 fn expected_engine_error_code_diff_result(
     expected_code: &str,
     target_ok: bool,
@@ -1016,14 +1031,18 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         evaluate_expected_error_branch(&step.meta, ok, &err_msg)
                     {
                         if let Err(reason) = expected_result {
-                            last_failure = reason;
+                            last_failure =
+                                annotate_failure_with_engine_error_code(&reason, &err_msg);
                         } else {
                             matched_expected_error = true;
                             last_failure = err_msg.clone();
                             break;
                         }
                     } else if !ok || execution.is_none() {
-                        last_failure = format!("target execute failed: {}", err_msg);
+                        last_failure = annotate_failure_with_engine_error_code(
+                            &format!("target execute failed: {}", err_msg),
+                            &err_msg,
+                        );
                     } else {
                         let execution = execution.expect("checked above");
                         let (assertions_ok, assertions_reason) =
@@ -1104,7 +1123,11 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         );
                     } else {
                         case_failed = true;
-                        let _ = writeln!(log, "    ❌ {}", last_failure);
+                        let _ = writeln!(
+                            log,
+                            "    ❌ {}",
+                            annotate_failure_with_engine_error_code(&last_failure, &last_failure)
+                        );
                     }
                 } else if let Some(expected_error) = step.meta.expect_error.as_deref() {
                     if matched_expected_error {
@@ -1115,7 +1138,11 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         );
                     } else {
                         case_failed = true;
-                        let _ = writeln!(log, "    ❌ {}", last_failure);
+                        let _ = writeln!(
+                            log,
+                            "    ❌ {}",
+                            annotate_failure_with_engine_error_code(&last_failure, &last_failure)
+                        );
                         let _ = expected_error;
                     }
                 } else if let Some(execution) = passed_execution {
@@ -1191,7 +1218,11 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     }
                 } else {
                     case_failed = true;
-                    let _ = writeln!(log, "    ❌ {}", last_failure);
+                    let _ = writeln!(
+                        log,
+                        "    ❌ {}",
+                        annotate_failure_with_engine_error_code(&last_failure, &last_failure)
+                    );
                     if let (Some(root), Some(expected), Some(execution)) = (
                         ctx.actual_artifact_dir.as_ref(),
                         expected_results
@@ -1524,7 +1555,11 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     };
                     if !ok_t || execution_t.is_none() {
                         case_failed = true;
-                        let _ = writeln!(log, "    ❌ target execute failed: {}", err_t);
+                        let failure = annotate_failure_with_engine_error_code(
+                            &format!("target execute failed: {}", err_t),
+                            &err_t,
+                        );
+                        let _ = writeln!(log, "    ❌ {}", failure);
                     } else {
                         let execution_t = execution_t.expect("checked above");
                         let (ok_r, execution_r, err_r) = if shell::is_shell_step(&step.sql) {
@@ -2555,8 +2590,9 @@ mod tests {
     use crate::runner::{is_transient_iceberg_commit_error, parse_selector_list};
     use crate::types::{QueryMeta, ResultSet, SqlCase, SqlStep};
     use crate::{
-        Cli, evaluate_expected_error_branch, expected_engine_error_code_diff_result,
-        expected_engine_error_code_result, validate_fault_injection_jobs,
+        Cli, annotate_failure_with_engine_error_code, evaluate_expected_error_branch,
+        expected_engine_error_code_diff_result, expected_engine_error_code_result,
+        validate_fault_injection_jobs,
     };
     use clap::Parser;
     use regex::Regex;
@@ -2773,6 +2809,24 @@ mod tests {
             wrong_code.contains("target_code=Some(\"ProtocolDecodeError\")"),
             "unexpected error: {wrong_code}"
         );
+    }
+
+    #[test]
+    fn failure_log_includes_engine_error_code_when_available() {
+        let msg =
+            "target execute failed: FAIL (0.00s): ERROR 1105 (HY000): [QueryTimeout] slow query";
+
+        assert_eq!(
+            annotate_failure_with_engine_error_code(msg, msg),
+            "engine_error_code=QueryTimeout target execute failed: FAIL (0.00s): ERROR 1105 (HY000): [QueryTimeout] slow query"
+        );
+    }
+
+    #[test]
+    fn failure_log_leaves_plain_errors_unclassified() {
+        let msg = "target execute failed: plain execution error";
+
+        assert_eq!(annotate_failure_with_engine_error_code(msg, msg), msg);
     }
 
     #[test]

@@ -1174,10 +1174,9 @@ async fn execute_sql_in_worker(
             Ok(result) => result,
             Err(_) => {
                 shim.client_disconnect_signal.store(true, Ordering::SeqCst);
-                return Err((
-                    ErrorKind::ER_UNKNOWN_ERROR,
+                return Err(format_engine_error_for_mysql(EngineError::query_timeout(
                     format!("query timed out after {} ms", secs * 1000),
-                ));
+                )));
             }
         }
     } else {

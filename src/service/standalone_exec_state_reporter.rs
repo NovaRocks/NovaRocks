@@ -208,8 +208,19 @@ fn interpret_report_exec_status_response(
     resp: proto::novarocks::ReportExecStatusResponse,
 ) -> Result<(), String> {
     match resp.status_code {
-        crate::service::grpc_server::REPORT_EXEC_STATUS_OK
-        | crate::service::grpc_server::REPORT_EXEC_STATUS_QUERY_GONE => Ok(()),
+        crate::service::grpc_server::REPORT_EXEC_STATUS_OK => Ok(()),
+        crate::service::grpc_server::REPORT_EXEC_STATUS_QUERY_GONE => {
+            let expected = crate::common::engine_error_codes::EngineErrorCode::WriteCoordinatorGone;
+            if resp.error_code == expected.as_str() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "standalone reportExecStatus returned QUERY_GONE with error_code={}; expected error_code={}",
+                    resp.error_code,
+                    expected.as_str()
+                ))
+            }
+        }
         _ => Err(format!(
             "standalone reportExecStatus returned status_code={}: {}",
             resp.status_code, resp.message
@@ -384,6 +395,23 @@ mod tests {
         assert_eq!(response.error_code, "WriteCoordinatorGone");
         interpret_report_exec_status_response(response)
             .expect("query-gone report response is terminal success");
+    }
+
+    #[test]
+    fn query_gone_report_response_requires_write_coordinator_error_code() {
+        let response = proto::novarocks::ReportExecStatusResponse {
+            status_code: crate::service::grpc_server::REPORT_EXEC_STATUS_QUERY_GONE,
+            message: "write coordinator not found for query 1/2".to_string(),
+            error_code: String::new(),
+        };
+
+        let err = interpret_report_exec_status_response(response)
+            .expect_err("missing query-gone code should fail");
+
+        assert!(
+            err.contains("expected error_code=WriteCoordinatorGone"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

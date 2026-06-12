@@ -437,17 +437,32 @@ validate_explicit_suites_early() {
 
 ci_sql_failed_case_keys() {
   local log_path="$1"
+  ci_sql_case_keys_by_status "$log_path" "FAIL"
+}
+
+ci_sql_passed_case_keys() {
+  local log_path="$1"
+  ci_sql_case_keys_by_status "$log_path" "PASS"
+}
+
+ci_sql_case_keys_by_status() {
+  local log_path="$1"
+  local want_status="$2"
   local line
   local suite_name
   local case_id
+  local case_status
 
   [ -f "$log_path" ] || return 0
 
   while IFS= read -r line || [ -n "$line" ]; do
-    if [[ "$line" =~ ^[[:space:]]+\[([^]]+)\][[:space:]]+([^[:space:]]+)[[:space:]]+FAIL[[:space:]] ]]; then
+    if [[ "$line" =~ ^[[:space:]]+\[([^]]+)\][[:space:]]+([^[:space:]]+)[[:space:]]+([A-Z]+)[[:space:]] ]]; then
       suite_name="${BASH_REMATCH[1]}"
       case_id="${BASH_REMATCH[2]}"
-      printf "|%s|%s|\n" "$suite_name" "$case_id"
+      case_status="${BASH_REMATCH[3]}"
+      if [ "$case_status" = "$want_status" ]; then
+        printf "|%s|%s|\n" "$suite_name" "$case_id"
+      fi
     fi
   done <"$log_path"
 }
@@ -572,6 +587,33 @@ EOF
   return 0
 }
 
+ci_classify_unexpected_passes() {
+  local suite="$1"
+  local log_path="$2"
+  local passed_case_keys
+  local row
+  local row_case
+  local error_code
+  local reason
+  local expires
+  local unexpected=0
+
+  [ -f "$log_path" ] || return 0
+
+  passed_case_keys="$(ci_sql_passed_case_keys "$log_path")"
+  [ -n "$passed_case_keys" ] || return 0
+
+  while IFS='|' read -r row_case error_code reason expires || [ -n "$row_case" ]; do
+    [ -n "$row_case" ] || continue
+    if ci_case_key_contains "$passed_case_keys" "$suite" "$row_case"; then
+      ci_record_sql_classification "$suite" "$row_case" "UNEXPECTED_PASS" "$error_code" "$reason"
+      unexpected=1
+    fi
+  done < <(ci_known_failure_rows_for_suite "$KNOWN_FAILURES_FILE" "$CI_TIER" "$suite")
+
+  [ "$unexpected" -eq 0 ]
+}
+
 ci_sql_suite_status_from_log() {
   local log_path="$1"
   local line
@@ -671,7 +713,16 @@ run_sql_suites() {
     code=$?
     duration=$(($(ci_epoch) - start))
 
-    if [ "$code" -eq 0 ]; then
+    if ! ci_classify_unexpected_passes "$suite" "$log_path"; then
+      if [ "$code" -ne 0 ]; then
+        ci_classify_sql_log "$suite" "$log_path" "false" >/dev/null || true
+      fi
+      failed=1
+      ci_record_sql_suite "$suite" "UNEXPECTED_PASS" "$duration" "$log_path"
+      if [ -z "$CI_FAILURE_TAIL" ]; then
+        ci_mark_failure_tail "SQL suite has unexpected known-failure passes: $suite" "$log_path"
+      fi
+    elif [ "$code" -eq 0 ]; then
       ci_record_sql_suite "$suite" "PASS" "$duration" "$log_path"
     elif ci_classify_sql_log "$suite" "$log_path" "true"; then
       ci_record_sql_suite "$suite" "KNOWN_FAIL" "$duration" "$log_path"
@@ -707,7 +758,16 @@ reclassify_existing_run() {
     suite="${suite%.log}"
     status="$(ci_sql_suite_status_from_log "$log_path")"
 
-    if [ "$status" = "PASS" ]; then
+    if ! ci_classify_unexpected_passes "$suite" "$log_path"; then
+      if [ "$status" != "PASS" ]; then
+        ci_classify_sql_log "$suite" "$log_path" "false" >/dev/null || true
+      fi
+      failed=1
+      ci_record_sql_suite "$suite" "UNEXPECTED_PASS" "0" "$log_path"
+      if [ -z "$CI_FAILURE_TAIL" ]; then
+        ci_mark_failure_tail "SQL suite has unexpected known-failure passes: $suite" "$log_path"
+      fi
+    elif [ "$status" = "PASS" ]; then
       ci_record_sql_suite "$suite" "PASS" "0" "$log_path"
     elif ci_classify_sql_log "$suite" "$log_path" "true"; then
       ci_record_sql_suite "$suite" "KNOWN_FAIL" "0" "$log_path"
@@ -770,4 +830,6 @@ main() {
   echo "PASS: $CI_SUMMARY"
 }
 
-main "$@"
+if [ "${1:-}" != "--source-only" ]; then
+  main "$@"
+fi

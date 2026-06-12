@@ -29,6 +29,7 @@ pub enum EngineErrorCode {
     WriteCoordinatorGone,
     CommitKnownUncommitted,
     CommitUnknown,
+    QueryTimeout,
     ProtocolDecodeError,
     InternalInvariantViolation,
 }
@@ -46,6 +47,7 @@ impl EngineErrorCode {
             Self::WriteCoordinatorGone => "WriteCoordinatorGone",
             Self::CommitKnownUncommitted => "CommitKnownUncommitted",
             Self::CommitUnknown => "CommitUnknown",
+            Self::QueryTimeout => "QueryTimeout",
             Self::ProtocolDecodeError => "ProtocolDecodeError",
             Self::InternalInvariantViolation => "InternalInvariantViolation",
         }
@@ -63,6 +65,7 @@ impl EngineErrorCode {
             "WriteCoordinatorGone" => Some(Self::WriteCoordinatorGone),
             "CommitKnownUncommitted" => Some(Self::CommitKnownUncommitted),
             "CommitUnknown" => Some(Self::CommitUnknown),
+            "QueryTimeout" => Some(Self::QueryTimeout),
             "ProtocolDecodeError" => Some(Self::ProtocolDecodeError),
             "InternalInvariantViolation" => Some(Self::InternalInvariantViolation),
             _ => None,

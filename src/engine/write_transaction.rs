@@ -19,6 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use opendal::Operator;
 
+use crate::common::engine_error::EngineError;
 use crate::connector::iceberg::catalog::registry::block_on_iceberg;
 use crate::connector::iceberg::commit::{
     AbortLog, CleanupAttempt, CleanupPathMapper, CommitOpKind, CommitOutcome, CommitServiceError,
@@ -344,13 +345,15 @@ impl<'a, E: IcebergWriteTransactionExecutor> IcebergWriteTransactionRunner<'a, E
                 }
             }
             Err(commit_err) => {
-                let message = commit_err.message().to_string();
                 self.record_fact(
                     operation_id,
                     operation_fact_from_commit_result(Err(&commit_err)),
                 )?;
+                let engine_error = EngineError::from(commit_err);
                 Err(format!(
-                    "iceberg write operation {operation_id} commit failed: {message}"
+                    "[{}] iceberg write operation {operation_id} commit failed: {}",
+                    engine_error.code().as_str(),
+                    engine_error.to_user_message()
                 ))
             }
         }
@@ -672,7 +675,10 @@ mod tests {
         let err = runner
             .run(sample_spec())
             .expect_err("commit failure surfaces");
-        assert!(err.contains("commit failed"), "got: {err}");
+        assert!(
+            err.starts_with("[CommitKnownUncommitted] iceberg write operation 1 commit failed:"),
+            "got prefix-extractable engine error: {err}"
+        );
         let read = env.provider.begin_read().expect("read txn");
         let stored = env
             .state
@@ -707,9 +713,13 @@ mod tests {
             preloaded_commit_output: false,
         };
         let runner = IcebergWriteTransactionRunner::new(Arc::clone(&env.state), &exec);
-        let _ = runner
+        let err = runner
             .run(sample_spec())
             .expect_err("commit unknown surfaces");
+        assert!(
+            err.starts_with("[CommitUnknown] iceberg write operation 1 commit failed:"),
+            "got prefix-extractable engine error: {err}"
+        );
         let read = env.provider.begin_read().expect("read txn");
         let stored = env
             .state

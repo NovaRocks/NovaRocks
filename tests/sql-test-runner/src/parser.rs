@@ -6,6 +6,10 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
 
+#[path = "../../../src/common/engine_error_codes.rs"]
+mod engine_error_codes;
+use engine_error_codes::EngineErrorCode;
+
 /// Scan raw SQL content (before placeholder substitution) for `${case_db}` and
 /// `${case_db_N}` references.  Returns the resolved database names in order.
 /// Index 0 is the primary `${case_db}`, index 1 is `${case_db_2}`, etc.
@@ -94,6 +98,9 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
                 meta.expect_error = Some(raw_value);
             }
             "expect_error_code" => {
+                if EngineErrorCode::parse(&raw_value).is_none() {
+                    bail!("unknown expect_error_code: {}", raw_value);
+                }
                 meta.expect_error_code = Some(raw_value);
             }
             "result_contains" => {
@@ -649,6 +656,20 @@ mod opt5_directive_tests {
         assert_eq!(
             meta.expect_error_code,
             Some("IcebergWriteDescriptorMismatch".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_expect_error_code_rejects_unknown_code() {
+        let re = meta_re();
+        let lines = vec!["-- @expect_error_code=NotARealCode".to_string()];
+
+        let err = parse_meta(&lines, &re).expect_err("unknown code should fail");
+
+        assert!(
+            err.to_string()
+                .contains("unknown expect_error_code: NotARealCode"),
+            "unexpected error: {err}"
         );
     }
 
