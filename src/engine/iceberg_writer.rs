@@ -172,10 +172,16 @@ fn execute_iceberg_insert_distributed(
     entry: &IcebergCatalogEntry,
     table_ident: TableIdent,
 ) -> Result<StatementResult, String> {
-    let query = append_source_to_query(source, insert_columns, &resolved.columns)?;
-    let sink_spec = build_insert_write_sink_spec(target, resolved, &table, entry)?;
-
     let metadata = table.metadata();
+    let write_columns = iceberg_insert_columns_from_schema(metadata.current_schema())?;
+    let query = append_source_to_query_for_write(
+        source,
+        insert_columns,
+        &resolved.columns,
+        &write_columns,
+    )?;
+    let sink_spec = build_insert_write_sink_spec(target, resolved, &table, entry, &write_columns)?;
+
     let commit_op_kind = commit_op_kind_for_overwrite_mode(overwrite_mode);
     let base_snapshot_id = write_base_snapshot_id(metadata, target_ref)?;
     let base_sequence_number = metadata.last_sequence_number();
@@ -285,6 +291,7 @@ fn build_insert_write_sink_spec(
     resolved: &ResolvedTable,
     table: &iceberg::table::Table,
     entry: &IcebergCatalogEntry,
+    write_columns: &[ColumnDef],
 ) -> Result<IcebergWriteSinkSpec, String> {
     let metadata = table.metadata();
     let iceberg = IcebergTableInfo {
@@ -305,7 +312,7 @@ fn build_insert_write_sink_spec(
     let cloud_properties = entry.cloud_properties_map();
     let target_table = TableDef {
         name: resolved.table.clone(),
-        columns: resolved.columns.clone(),
+        columns: write_columns.to_vec(),
         iceberg_row_lineage_metadata_columns: Vec::new(),
         source: ScanSource::IcebergDataFiles {
             table: iceberg.clone(),
@@ -333,7 +340,7 @@ fn build_insert_write_sink_spec(
         target_table_id: synthetic_iceberg_write_table_id(),
         target_table,
         iceberg,
-        target_columns: resolved.columns.clone(),
+        target_columns: write_columns.to_vec(),
         table_location,
         data_location,
         target_partition_spec_id: metadata.default_partition_spec_id(),
@@ -348,32 +355,59 @@ fn append_source_to_query(
     insert_columns: &[String],
     target_columns: &[ColumnDef],
 ) -> Result<sqlparser::ast::Query, String> {
+    append_source_to_query_for_write(source, insert_columns, target_columns, target_columns)
+}
+
+fn append_source_to_query_for_write(
+    source: &InsertSource,
+    insert_columns: &[String],
+    source_columns: &[ColumnDef],
+    write_columns: &[ColumnDef],
+) -> Result<sqlparser::ast::Query, String> {
     match source {
-        InsertSource::FromQuery(query) if insert_columns.is_empty() => Ok((**query).clone()),
-        InsertSource::FromQuery(query) => {
-            wrap_insert_query_with_target_projection(query, insert_columns, target_columns)
+        InsertSource::FromQuery(query)
+            if insert_columns.is_empty() && same_column_sequence(source_columns, write_columns) =>
+        {
+            Ok((**query).clone())
         }
-        InsertSource::Values(rows) => {
-            values_append_source_to_query(rows, insert_columns, target_columns)
-        }
-        InsertSource::SelectLiteralRow(row) => {
-            values_append_source_to_query(std::slice::from_ref(row), insert_columns, target_columns)
-        }
+        InsertSource::FromQuery(query) => wrap_insert_query_with_write_projection(
+            query,
+            insert_columns,
+            source_columns,
+            write_columns,
+        ),
+        InsertSource::Values(rows) => values_append_source_to_query_for_write(
+            rows,
+            insert_columns,
+            source_columns,
+            write_columns,
+        ),
+        InsertSource::SelectLiteralRow(row) => values_append_source_to_query_for_write(
+            std::slice::from_ref(row),
+            insert_columns,
+            source_columns,
+            write_columns,
+        ),
         InsertSource::UnionAll(_) => {
             Err("iceberg INSERT append does not support UNION ALL sources on this path".to_string())
         }
     }
 }
 
-fn wrap_insert_query_with_target_projection(
+fn wrap_insert_query_with_write_projection(
     query: &sqlparser::ast::Query,
     insert_columns: &[String],
-    target_columns: &[ColumnDef],
+    source_columns: &[ColumnDef],
+    write_columns: &[ColumnDef],
 ) -> Result<sqlparser::ast::Query, String> {
-    let insert_idx_by_target = insert_column_index_by_target_name(insert_columns, target_columns)?;
+    let insert_idx_by_target = if insert_columns.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        insert_column_index_by_target_name(insert_columns, write_columns)?
+    };
     let source_alias = "__nr_insert_src";
-    let mut projection = Vec::with_capacity(target_columns.len());
-    for column in target_columns {
+    let mut projection = Vec::with_capacity(write_columns.len());
+    for (write_idx, column) in write_columns.iter().enumerate() {
         let target_name = crate::engine::catalog::normalize_identifier(&column.name)?;
         let expr = if let Some(source_idx) = insert_idx_by_target.get(&target_name) {
             let source_expr = format!(
@@ -382,13 +416,37 @@ fn wrap_insert_query_with_target_projection(
                 sql_identifier(&insert_columns[*source_idx])
             );
             target_cast_expr_sql(&source_expr, column)?
+        } else if insert_columns.is_empty() {
+            if let Some(source_idx) =
+                source_index_for_write_column(column, write_idx, source_columns, write_columns)
+            {
+                let source_expr = format!(
+                    "{}.{}",
+                    sql_identifier(source_alias),
+                    sql_identifier(&source_columns[source_idx].name)
+                );
+                target_cast_expr_sql(&source_expr, column)?
+            } else {
+                target_cast_expr_sql(&omitted_column_expr_sql(column)?, column)?
+            }
         } else {
             target_cast_expr_sql(&omitted_column_expr_sql(column)?, column)?
         };
         projection.push(format!("{expr} AS {}", sql_identifier(&column.name)));
     }
-    let alias_columns = insert_columns
-        .iter()
+    let alias_source_columns = if insert_columns.is_empty() {
+        source_columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>()
+    } else {
+        insert_columns
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+    };
+    let alias_columns = alias_source_columns
+        .into_iter()
         .map(|column| sql_identifier(column))
         .collect::<Vec<_>>()
         .join(", ");
@@ -402,32 +460,65 @@ fn wrap_insert_query_with_target_projection(
     parse_generated_query(&sql, "append INSERT SELECT projection")
 }
 
-fn values_append_source_to_query(
+fn values_append_source_to_query_for_write(
     rows: &[Vec<Literal>],
     insert_columns: &[String],
-    target_columns: &[ColumnDef],
+    source_columns: &[ColumnDef],
+    write_columns: &[ColumnDef],
 ) -> Result<sqlparser::ast::Query, String> {
-    let rows = if insert_columns.is_empty() {
-        for row in rows {
-            if row.len() != target_columns.len() {
-                return Err(format!(
-                    "insert column count mismatch: expected {} values, got {}",
-                    target_columns.len(),
-                    row.len()
-                ));
-            }
-        }
-        rows.to_vec()
+    let insert_idx_by_target = if insert_columns.is_empty() {
+        std::collections::HashMap::new()
     } else {
-        crate::engine::insert::reorder_insert_rows(rows, insert_columns, target_columns)?
+        insert_column_index_by_target_name(insert_columns, write_columns)?
     };
     let rendered_rows = rows
         .iter()
         .map(|row| {
-            let values = row
+            if insert_columns.is_empty() {
+                if row.len() != source_columns.len() {
+                    return Err(format!(
+                        "insert column count mismatch: expected {} values, got {}",
+                        source_columns.len(),
+                        row.len()
+                    ));
+                }
+            } else if row.len() != insert_columns.len() {
+                return Err(format!(
+                    "insert column count mismatch: expected {} values for column list, got {}",
+                    insert_columns.len(),
+                    row.len()
+                ));
+            }
+            let values = write_columns
                 .iter()
-                .zip(target_columns.iter())
-                .map(|(literal, column)| target_literal_expr_sql(literal, column))
+                .enumerate()
+                .map(|(write_idx, column)| {
+                    if insert_columns.is_empty() {
+                        if let Some(literal) = source_index_for_write_column(
+                            column,
+                            write_idx,
+                            source_columns,
+                            write_columns,
+                        )
+                        .and_then(|source_idx| row.get(source_idx))
+                        {
+                            target_literal_expr_sql(literal, column)
+                        } else {
+                            target_cast_expr_sql(&omitted_column_expr_sql(column)?, column)
+                        }
+                    } else {
+                        let target_name =
+                            crate::engine::catalog::normalize_identifier(&column.name)?;
+                        if let Some(literal) = insert_idx_by_target
+                            .get(&target_name)
+                            .and_then(|source_idx| row.get(*source_idx))
+                        {
+                            target_literal_expr_sql(literal, column)
+                        } else {
+                            target_cast_expr_sql(&omitted_column_expr_sql(column)?, column)
+                        }
+                    }
+                })
                 .collect::<Result<Vec<_>, _>>()?
                 .join(", ");
             Ok(format!("({values})"))
@@ -435,6 +526,61 @@ fn values_append_source_to_query(
         .collect::<Result<Vec<_>, String>>()?;
     let sql = format!("VALUES {}", rendered_rows.join(", "));
     parse_generated_query(&sql, "append INSERT VALUES")
+}
+
+fn same_column_sequence(left: &[ColumnDef], right: &[ColumnDef]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(l, r)| l.name.eq_ignore_ascii_case(&r.name) && l.data_type == r.data_type)
+}
+
+fn source_index_for_write_column(
+    write_column: &ColumnDef,
+    write_idx: usize,
+    source_columns: &[ColumnDef],
+    write_columns: &[ColumnDef],
+) -> Option<usize> {
+    source_columns
+        .iter()
+        .position(|source| source.name.eq_ignore_ascii_case(&write_column.name))
+        .or_else(|| {
+            (source_columns.len() == write_columns.len() && write_idx < source_columns.len())
+                .then_some(write_idx)
+        })
+}
+
+fn iceberg_insert_columns_from_schema(
+    schema: &iceberg::spec::Schema,
+) -> Result<Vec<ColumnDef>, String> {
+    let arrow_schema = iceberg::arrow::schema_to_arrow_schema(schema)
+        .map_err(|e| format!("convert iceberg insert schema to arrow schema failed: {e}"))?;
+    arrow_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let nested = schema
+                .field_by_name(field.name())
+                .ok_or_else(|| format!("iceberg column `{}` missing from schema", field.name()))?;
+            let data_type = match nested.field_type.as_ref() {
+                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Variant) => {
+                    arrow::datatypes::DataType::LargeBinary
+                }
+                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Binary) => {
+                    arrow::datatypes::DataType::Binary
+                }
+                _ => field.data_type().clone(),
+            };
+            Ok(ColumnDef {
+                name: field.name().clone(),
+                data_type,
+                nullable: field.is_nullable(),
+                write_default: nested.write_default.clone(),
+                logical_type: None,
+            })
+        })
+        .collect()
 }
 
 fn insert_column_index_by_target_name(
@@ -1071,6 +1217,35 @@ mod tests {
     }
 
     #[test]
+    fn append_source_to_query_values_does_not_position_fill_added_middle_column() {
+        let source_columns = vec![
+            test_column("id", DataType::Int32, None),
+            test_column("amount", DataType::Int32, None),
+        ];
+        let write_columns = vec![
+            test_column("id", DataType::Int32, None),
+            test_column("category", DataType::Utf8, None),
+            test_column("amount", DataType::Int32, None),
+        ];
+        let source = InsertSource::Values(vec![vec![
+            crate::sql::parser::ast::Literal::Int(1),
+            crate::sql::parser::ast::Literal::Int(10),
+        ]]);
+
+        let query = append_source_to_query_for_write(&source, &[], &source_columns, &write_columns)
+            .expect("append source query");
+
+        let sqlast::SetExpr::Values(values) = query.body.as_ref() else {
+            panic!("expected VALUES query, got: {query}");
+        };
+        let row: Vec<String> = values.rows[0].iter().map(ToString::to_string).collect();
+        assert_eq!(
+            row,
+            vec!["CAST(1 AS INT)", "CAST(NULL AS STRING)", "CAST(10 AS INT)"]
+        );
+    }
+
+    #[test]
     fn append_source_to_query_values_preserves_backslash_string_literals() {
         let target_columns = vec![test_column("region", DataType::Utf8, None)];
         let source = InsertSource::Values(vec![vec![crate::sql::parser::ast::Literal::String(
@@ -1209,5 +1384,50 @@ mod tests {
             !rendered.contains("CAST(CAST(NULL"),
             "omitted complex columns must not produce nested casts, got: {rendered}"
         );
+    }
+
+    #[test]
+    fn insert_writer_columns_follow_fresh_iceberg_schema_after_external_evolution() {
+        let schema = iceberg::spec::Schema::builder()
+            .with_fields(vec![
+                std::sync::Arc::new(iceberg::spec::NestedField::required(
+                    1,
+                    "amount",
+                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long),
+                )),
+                std::sync::Arc::new(iceberg::spec::NestedField::required(
+                    2,
+                    "id",
+                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
+                )),
+                std::sync::Arc::new(iceberg::spec::NestedField::optional(
+                    3,
+                    "category",
+                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::String),
+                )),
+            ])
+            .build()
+            .expect("schema");
+
+        let columns = iceberg_insert_columns_from_schema(&schema).expect("columns");
+        let names = columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>();
+        let types = columns
+            .iter()
+            .map(|column| column.data_type.clone())
+            .collect::<Vec<_>>();
+        let nullable = columns
+            .iter()
+            .map(|column| column.nullable)
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["amount", "id", "category"]);
+        assert_eq!(
+            types,
+            vec![DataType::Int64, DataType::Int32, DataType::Utf8]
+        );
+        assert_eq!(nullable, vec![false, false, true]);
     }
 }
