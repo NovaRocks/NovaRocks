@@ -1060,6 +1060,7 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         "get_json_bool" | "get_variant_bool" | "json_exists" => DataType::Boolean,
         "get_json_int" | "get_variant_int" => DataType::Int64,
         "get_json_double" | "get_variant_double" => DataType::Float64,
+        "variant_get" | "try_variant_get" => DataType::LargeBinary,
         "json_query" | "json_extract" | "get_json_string" | "get_json_object" | "json_object"
         | "json_array" | "to_json" | "parse_json" | "variant_typeof" => DataType::Utf8,
         "__array_struct_subfield" => DataType::Null,

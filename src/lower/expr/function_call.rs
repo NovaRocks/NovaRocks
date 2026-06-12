@@ -204,6 +204,91 @@ mod tests {
         DataType::List(Arc::new(Field::new("item", inner, true)))
     }
 
+    fn dummy_type_desc() -> types::TTypeDesc {
+        crate::lower::type_lowering::scalar_type_desc(types::TPrimitiveType::INT)
+    }
+
+    fn default_expr_node() -> exprs::TExprNode {
+        exprs::TExprNode {
+            node_type: exprs::TExprNodeType::INT_LITERAL,
+            type_: dummy_type_desc(),
+            opcode: None,
+            num_children: 0,
+            agg_expr: None,
+            bool_literal: None,
+            case_expr: None,
+            date_literal: None,
+            float_literal: None,
+            int_literal: None,
+            in_predicate: None,
+            is_null_pred: None,
+            like_pred: None,
+            literal_pred: None,
+            slot_ref: None,
+            string_literal: None,
+            tuple_is_null_pred: None,
+            info_func: None,
+            decimal_literal: None,
+            output_scale: 0,
+            fn_call_expr: None,
+            large_int_literal: None,
+            output_column: None,
+            output_type: None,
+            vector_opcode: None,
+            fn_: None,
+            vararg_start_idx: None,
+            child_type: None,
+            vslot_ref: None,
+            used_subfield_names: None,
+            binary_literal: None,
+            copy_flag: None,
+            check_is_out_of_bounds: None,
+            use_vectorized: None,
+            has_nullable_child: None,
+            is_nullable: None,
+            child_type_desc: None,
+            is_monotonic: None,
+            dict_query_expr: None,
+            dictionary_get_expr: None,
+            is_index_only_filter: None,
+            is_nondeterministic: None,
+        }
+    }
+
+    fn function_node(name: &str, num_children: i32) -> exprs::TExprNode {
+        exprs::TExprNode {
+            node_type: exprs::TExprNodeType::FUNCTION_CALL,
+            type_: dummy_type_desc(),
+            num_children,
+            fn_: Some(types::TFunction {
+                name: types::TFunctionName {
+                    db_name: None,
+                    function_name: name.to_string(),
+                },
+                binary_type: types::TFunctionBinaryType::BUILTIN,
+                arg_types: vec![],
+                ret_type: dummy_type_desc(),
+                has_var_args: false,
+                comment: None,
+                signature: None,
+                hdfs_location: None,
+                scalar_fn: None,
+                aggregate_fn: None,
+                id: None,
+                checksum: None,
+                agg_state_desc: None,
+                fid: None,
+                table_fn: None,
+                could_apply_dict_optimize: None,
+                ignore_nulls: None,
+                isolated: None,
+                input_type: None,
+                content: None,
+            }),
+            ..default_expr_node()
+        }
+    }
+
     #[test]
     fn nested_array_element_compatible_accepts_decimal_arrays() {
         let expected = array_type(DataType::Decimal128(38, 5));
@@ -273,6 +358,35 @@ mod tests {
             function::lookup_function("sha2"),
             Some(function::FunctionKind::Encryption("sha2"))
         ));
+    }
+
+    #[test]
+    fn variant_get_lowering_rejects_non_variant_or_json_input() {
+        let mut arena = ExprArena::default();
+        let arg0 = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(1)), DataType::Int64);
+        let arg1 = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Utf8("$.a".to_string())),
+            DataType::Utf8,
+        );
+        let arg2 = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Utf8("bigint".to_string())),
+            DataType::Utf8,
+        );
+
+        let err = lower_function_call(
+            &function_node("variant_get", 3),
+            &[arg0, arg1, arg2],
+            &mut arena,
+            DataType::Int64,
+            None,
+            None,
+        )
+        .expect_err("variant_get should reject non-VARIANT/JSON input");
+
+        assert_eq!(
+            err,
+            "variant_get expects VARIANT or JSON/VARCHAR as first argument"
+        );
     }
 }
 
@@ -377,6 +491,31 @@ pub(crate) fn lower_function_call(
             }
             if !matches!(arg1, DataType::Utf8) {
                 return Err("variant functions expect VARCHAR as second argument".to_string());
+            }
+        }
+        if matches!(
+            kind,
+            function::FunctionKind::Variant(name)
+                if matches!(name, "variant_get" | "try_variant_get")
+        ) {
+            let arg0 = arena
+                .data_type(children[0])
+                .ok_or_else(|| "variant_get missing arg0 type".to_string())?;
+            if !matches!(arg0, DataType::LargeBinary | DataType::Utf8) {
+                return Err(
+                    "variant_get expects VARIANT or JSON/VARCHAR as first argument".to_string(),
+                );
+            }
+            for (i, child) in children.iter().enumerate().skip(1) {
+                let t = arena
+                    .data_type(*child)
+                    .ok_or_else(|| format!("variant_get missing arg{i} type"))?;
+                if !matches!(t, DataType::Utf8) {
+                    return Err(format!(
+                        "variant_get expects VARCHAR for argument {}",
+                        i + 1
+                    ));
+                }
             }
         }
         if matches!(kind, function::FunctionKind::Variant("variant_typeof")) {

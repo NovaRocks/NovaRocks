@@ -2108,6 +2108,29 @@ impl<'a> super::AnalyzerContext<'a> {
                 let target = (*d as i8).max(0).min(*s);
                 return_type = DataType::Decimal128(*p, target);
             }
+            // variant_get / try_variant_get: the optional 3rd argument is a
+            // string literal naming the result type (Spark-aligned). Surface
+            // it as the expression's static type; reject non-literal type
+            // arguments up front.
+            if matches!(name.as_str(), "variant_get" | "try_variant_get") {
+                if !(2..=3).contains(&args_typed.len()) {
+                    return Err(format!(
+                        "{name} expects 2 or 3 arguments, got {}",
+                        args_typed.len()
+                    ));
+                }
+                if args_typed.len() == 3 {
+                    match &args_typed[2].kind {
+                        ExprKind::Literal(LiteralValue::String(t)) => {
+                            return_type =
+                                crate::exec::expr::function::variant::variant_get_target_type(t)?;
+                        }
+                        _ => {
+                            return Err(format!("{name} type argument must be a string literal"));
+                        }
+                    }
+                }
+            }
             Ok(TypedExpr {
                 kind: ExprKind::FunctionCall {
                     name,
@@ -4953,5 +4976,72 @@ fn incompatible_complex_compare(left: &DataType, right: &DataType) -> Option<Str
             None
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::analyze;
+    use crate::sql::analysis::QueryBody;
+    use crate::sql::catalog::CatalogProvider;
+    use arrow::datatypes::DataType;
+
+    struct EmptyCatalog;
+
+    impl CatalogProvider for EmptyCatalog {
+        fn get_table(
+            &self,
+            _database: &str,
+            table: &str,
+        ) -> Result<crate::sql::catalog::TableDef, String> {
+            Err(format!("table not found: {table}"))
+        }
+    }
+
+    fn analyze_projection_expr(sql: &str) -> Result<crate::sql::analysis::TypedExpr, String> {
+        let stmt = crate::sql::parser::parse_sql_raw(sql)?;
+        let sqlparser::ast::Statement::Query(query) = stmt else {
+            return Err("expected query".to_string());
+        };
+        let (resolved, _registry, _factory) = analyze(&query, &EmptyCatalog, "default")?;
+        let QueryBody::Select(select) = resolved.body else {
+            return Err("expected select".to_string());
+        };
+        select
+            .projection
+            .into_iter()
+            .next()
+            .map(|item| item.expr)
+            .ok_or_else(|| "expected projection".to_string())
+    }
+
+    #[test]
+    fn variant_get_two_arg_static_type_is_variant_binary() {
+        let expr = analyze_projection_expr("select variant_get(parse_json('{\"a\":1}'), '$.a')")
+            .expect("variant_get should analyze");
+
+        assert_eq!(expr.data_type, DataType::LargeBinary);
+    }
+
+    #[test]
+    fn variant_get_literal_type_argument_sets_static_type() {
+        let expr =
+            analyze_projection_expr("select variant_get(parse_json('{\"a\":1}'), '$.a', 'bigint')")
+                .expect("variant_get should analyze");
+
+        assert_eq!(expr.data_type, DataType::Int64);
+    }
+
+    #[test]
+    fn try_variant_get_rejects_non_literal_type_argument() {
+        let err = analyze_projection_expr(
+            "select try_variant_get(parse_json('{\"a\":1}'), '$.a', concat('big', 'int'))",
+        )
+        .expect_err("type argument should be a string literal");
+
+        assert_eq!(
+            err,
+            "try_variant_get type argument must be a string literal"
+        );
     }
 }

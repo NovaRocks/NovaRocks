@@ -2449,6 +2449,7 @@ fn infer_scalar_function_return_type(
         "get_json_bool" | "get_variant_bool" | "json_exists" => Ok(DataType::Boolean),
         "get_json_int" | "get_variant_int" => Ok(DataType::Int64),
         "get_json_double" | "get_variant_double" => Ok(DataType::Float64),
+        "variant_get" | "try_variant_get" => Ok(DataType::LargeBinary),
         "json_query" | "json_extract" | "get_json_string" | "get_json_object" | "json_object"
         | "json_array" | "to_json" | "parse_json" | "variant_typeof" => Ok(DataType::Utf8),
         "__struct_subfield" | "__array_struct_subfield" => Ok(DataType::Null),
@@ -3970,6 +3971,19 @@ mod tests {
             infer_scalar_function_return_type("get_json_string", &[DataType::Utf8, DataType::Utf8])
                 .expect("get_json_string type inference"),
             DataType::Utf8
+        );
+        assert_eq!(
+            infer_scalar_function_return_type("variant_get", &[DataType::Utf8, DataType::Utf8])
+                .expect("variant_get type inference"),
+            DataType::LargeBinary
+        );
+        assert_eq!(
+            infer_scalar_function_return_type(
+                "try_variant_get",
+                &[DataType::Utf8, DataType::Utf8, DataType::Utf8],
+            )
+            .expect("try_variant_get type inference"),
+            DataType::LargeBinary
         );
     }
 
