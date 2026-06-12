@@ -1,0 +1,29 @@
+-- query 3
+id	region	amount	category
+1	east	10	books
+2	west	20	games
+3	east	30	books
+
+-- query 5
+id	region	amount	category
+2	west	20	games
+3	east	30	books
+5	west	40	toys
+
+-- query 7
+id	region	amount	category
+2	west	20	games
+3	east	30	books
+5	west	40	toys
+
+-- query 9
+id	region	amount	category
+2	west	20	games
+5	west	40	toys
+7	east	70	books
+
+-- query 10
+id	region	amount	category
+2	west	20	games
+5	west	40	toys
+7	east	70	books
