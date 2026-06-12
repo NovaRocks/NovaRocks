@@ -308,6 +308,10 @@ pub(crate) struct ScanNode {
     /// `PhysicalScanOp` by memo conversion and the `ScanToPhysical`
     /// implementation rule.
     pub dict_columns: Vec<ScanDictionaryColumn>,
+    /// Synthetic typed columns materialized from variant paths during scan.
+    /// Populated by `VariantPathPushdownRule` and mirrored onto
+    /// `PhysicalScanOp` by memo conversion and `ScanToPhysical`.
+    pub variant_columns: Vec<ScanVariantColumn>,
     /// Set by the Phase-1 column-pruning tagging pass; `None` means all columns required.
     pub required_output_columns: Option<HashSet<ColumnId>>,
 }
@@ -322,6 +326,17 @@ pub(crate) struct ScanDictionaryColumn {
     pub source_column: String,
     pub dict_column: String,
     pub dictionary: std::sync::Arc<crate::engine::dictionary::model::DictionarySnapshot>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ScanVariantColumn {
+    pub source_column_id: ColumnId,
+    pub source_column: String,
+    pub synthetic_column_id: ColumnId,
+    pub synthetic_column: String,
+    pub canonical_path: String,
+    pub requested_type: DataType,
+    pub strict: bool,
 }
 
 #[derive(Clone, Debug)]

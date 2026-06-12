@@ -76,7 +76,8 @@ pub(crate) fn optimize(
 
     // 1. Query logical rewrite pipeline. The ordered stages preserve the
     //    legacy-safe sequence: pushdown → join reorder → pushdown →
-    //    aggregate pushdown → column pruning → low-cardinality dict rewrite.
+    //    variant path pushdown → aggregate pushdown → column pruning →
+    //    low-cardinality dict rewrite.
     let session_settings = options::current_session_optimizer_settings();
     let options = options::OptimizerOptions::from_session(&session_settings);
     let mut rewrite_ctx =
@@ -647,6 +648,7 @@ mod is_known_rule_name_tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            variant_columns: vec![],
             required_output_columns: None,
         });
         let s_ref = TypedExpr {

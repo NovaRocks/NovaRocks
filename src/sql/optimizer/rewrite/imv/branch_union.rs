@@ -735,6 +735,7 @@ mod tests {
             predicates: Vec::new(),
             required_columns: None,
             dict_columns: Vec::new(),
+            variant_columns: Vec::new(),
             required_output_columns: None,
         })
     }

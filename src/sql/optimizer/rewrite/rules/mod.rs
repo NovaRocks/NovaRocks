@@ -15,6 +15,7 @@ pub(crate) mod predicate_pushdown;
 pub(crate) mod subquery;
 pub(crate) mod ukfk;
 pub(crate) mod utils;
+pub(crate) mod variant_path_pushdown;
 
 pub(crate) fn low_cardinality_dictionary_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
     vec![Box::new(
@@ -44,6 +45,10 @@ pub(crate) fn predicate_move_around_rules() -> Vec<Box<dyn LogicalRewriteRule>> 
     predicate_pushdown::predicate_move_around_rules()
 }
 
+pub(crate) fn variant_path_pushdown_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
+    vec![Box::new(variant_path_pushdown::VariantPathPushdownRule)]
+}
+
 /// Join reorder rule only. Called as a SEPARATE pass between two
 /// predicate pushdown passes (the "push, reorder, push" pattern).
 /// Do NOT mix with structural rules in a single fixed-point — pushdown
@@ -68,6 +73,7 @@ pub(crate) fn all_query_rewrite_rules(
     all.extend(predicate_move_around_rules());
     all.extend(column_pruning_rules());
     all.extend(join_reorder_rules(table_stats));
+    all.extend(variant_path_pushdown_rules());
     all.extend(aggregate_pushdown::aggregate_pushdown_rules(table_stats));
     all.extend(low_cardinality_dictionary_rules());
     all.push(Box::new(derive_join_not_null::DeriveJoinNotNullPredicate));
@@ -81,10 +87,11 @@ mod tests {
     #[test]
     fn registry_contains_expected_rules() {
         let rules = all_query_rewrite_rules(&HashMap::new());
-        // 17 v2 pruning rules + 2 ukfk + 1 JoinReorder + 1 AggregatePushdown
+        // 17 v2 pruning rules + 2 ukfk + 1 JoinReorder + 1 VariantPathPushdown
+        // + 1 AggregatePushdown
         // + 1 LowCardinalityDictionaryRewrite + 5 predicate pushdown rules
-        // + 1 predicate move-around rule + 1 DeriveJoinNotNullPredicate = 29
-        assert_eq!(rules.len(), 29);
+        // + 1 predicate move-around rule + 1 DeriveJoinNotNullPredicate = 30
+        assert_eq!(rules.len(), 30);
         let mut names: Vec<&str> = rules.iter().map(|r| r.name()).collect();
         names.sort();
         assert_eq!(
@@ -119,6 +126,7 @@ mod tests {
                 "PushDownPredicateProject",
                 "PushDownPredicateScan",
                 "PushSemiAntiRightOnlyCondition",
+                "VariantPathPushdown",
             ]
         );
     }

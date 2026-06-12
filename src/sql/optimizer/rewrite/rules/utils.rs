@@ -1059,6 +1059,7 @@ mod column_id_helper_tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            variant_columns: vec![],
             required_output_columns: None,
         })
     }
@@ -1270,6 +1271,7 @@ mod column_id_helper_tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            variant_columns: vec![],
             required_output_columns: None,
         })
     }

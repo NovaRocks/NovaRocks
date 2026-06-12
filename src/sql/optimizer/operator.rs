@@ -10,7 +10,7 @@ use crate::sql::catalog::TableDef;
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::plan::{AggregateCall, DecodeMapping, WindowExpr};
 
-pub(crate) use crate::sql::planner::plan::ScanDictionaryColumn;
+pub(crate) use crate::sql::planner::plan::{ScanDictionaryColumn, ScanVariantColumn};
 
 // ---------------------------------------------------------------------------
 // Physical decision enums
@@ -82,6 +82,10 @@ pub(crate) struct LogicalScanOp {
     /// `LowCardinalityDictionaryRewrite` rule on the logical side and
     /// propagated to `PhysicalScanOp` by `ScanToPhysical`.
     pub dict_columns: Vec<ScanDictionaryColumn>,
+    /// Synthetic typed columns materialized from variant paths during scan.
+    /// Populated by `VariantPathPushdownRule` and propagated to
+    /// `PhysicalScanOp` by `ScanToPhysical`.
+    pub variant_columns: Vec<ScanVariantColumn>,
     /// When this scan was injected by the MvRewrite rule, the source MV name
     /// (shown in EXPLAIN as `rewritten with mv: <name>`). None for all
     /// user-written scans.
@@ -307,6 +311,10 @@ pub(crate) struct PhysicalScanOp {
     /// production paths today.
     #[allow(dead_code)] // Read by codegen when Task 7 populates it.
     pub dict_columns: Vec<ScanDictionaryColumn>,
+    /// Synthetic typed columns materialized from variant paths during scan.
+    /// Codegen/lowering in later IV3-6 PR-4 tasks consumes this carrier.
+    #[allow(dead_code)] // Populated by a later rule in this PR line.
+    pub variant_columns: Vec<ScanVariantColumn>,
     /// When this scan was injected by the MvRewrite rule, the source MV name
     /// (shown in EXPLAIN as `rewritten with mv: <name>`). None for all
     /// user-written scans.

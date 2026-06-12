@@ -108,6 +108,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            variant_columns: vec![],
             required_output_columns: None,
         })
     }

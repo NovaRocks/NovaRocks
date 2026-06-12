@@ -55,6 +55,11 @@ pub(crate) fn query_rewrite_pipeline(
             rules::predicate_pushdown_rules(),
         ),
         RewriteStage::new(
+            "VariantPathPushdown",
+            RewritePhase::StructuralRewrite,
+            rules::variant_path_pushdown_rules(),
+        ),
+        RewriteStage::new(
             "AggregatePushdown",
             RewritePhase::StructuralRewrite,
             rules::aggregate_pushdown::aggregate_pushdown_rules(table_stats),
@@ -127,6 +132,7 @@ mod tests {
                 "PredicatePushdownPostJoin",
                 "PredicateMoveAround",
                 "PredicatePushdownAfterMoveAround",
+                "VariantPathPushdown",
                 "AggregatePushdown",
                 "TagRequiredColumns",
                 "ColumnPruning",
@@ -187,6 +193,7 @@ mod tests {
                 "QuantifiedApplyToJoin",
                 "ScalarApplyToJoin",
                 "TagRequiredColumns",
+                "VariantPathPushdown",
             ]
         );
     }
@@ -224,6 +231,7 @@ mod tests {
             "LowCardinalityDictionaryRewrite"
         ));
         assert!(is_known_rewrite_rule_name("TagRequiredColumns"));
+        assert!(is_known_rewrite_rule_name("VariantPathPushdown"));
         assert!(!is_known_rewrite_rule_name("PushFilterThroughProject"));
         assert!(is_known_rewrite_rule_name("DeriveJoinNotNullPredicate"));
         assert!(is_known_rewrite_rule_name("JoinPredicateMoveAround"));

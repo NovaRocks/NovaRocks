@@ -197,6 +197,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            variant_columns: vec![],
             required_output_columns: None,
         });
         let aggregate = LogicalPlan::Aggregate(AggregateNode {
@@ -269,6 +270,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            variant_columns: vec![],
             required_output_columns: None,
         });
         let sort = LogicalPlan::Sort(SortNode {
@@ -308,6 +310,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            variant_columns: vec![],
             required_output_columns: None,
         });
         let aggregate = LogicalPlan::Aggregate(AggregateNode {
@@ -431,6 +434,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            variant_columns: vec![],
             required_output_columns: None,
         });
         let scan_t2 = LogicalPlan::Scan(ScanNode {
@@ -441,6 +445,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            variant_columns: vec![],
             required_output_columns: None,
         });
         let join = LogicalPlan::Join(crate::sql::planner::plan::JoinNode {
@@ -503,6 +508,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            variant_columns: vec![],
             required_output_columns: None,
         });
         // Project: SELECT s AS t.
@@ -525,6 +531,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            variant_columns: vec![],
             required_output_columns: None,
         });
         let join = LogicalPlan::Join(crate::sql::planner::plan::JoinNode {
@@ -574,6 +581,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            variant_columns: vec![],
             required_output_columns: None,
         });
         let project = LogicalPlan::Project(crate::sql::planner::plan::ProjectNode {
@@ -729,6 +737,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            variant_columns: vec![],
             required_output_columns: None,
         });
         let scan_t2 = LogicalPlan::Scan(ScanNode {
@@ -739,6 +748,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            variant_columns: vec![],
             required_output_columns: None,
         });
         let join = LogicalPlan::Join(JoinNode {
@@ -803,6 +813,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            variant_columns: vec![],
             required_output_columns: None,
         });
         let scan_t2 = LogicalPlan::Scan(ScanNode {
@@ -813,6 +824,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            variant_columns: vec![],
             required_output_columns: None,
         });
         let join = LogicalPlan::Join(JoinNode {
@@ -901,6 +913,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            variant_columns: vec![],
             required_output_columns: None,
         });
         let scan_t2 = LogicalPlan::Scan(ScanNode {
@@ -911,6 +924,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            variant_columns: vec![],
             required_output_columns: None,
         });
         let join = LogicalPlan::Join(JoinNode {
@@ -960,6 +974,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            variant_columns: vec![],
             required_output_columns: None,
         });
         let scan_t2 = LogicalPlan::Scan(ScanNode {
@@ -970,6 +985,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            variant_columns: vec![],
             required_output_columns: None,
         });
         let union = LogicalPlan::Union(UnionNode {
@@ -1016,6 +1032,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            variant_columns: vec![],
             required_output_columns: None,
         });
         let scan_t2 = LogicalPlan::Scan(ScanNode {
@@ -1026,6 +1043,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            variant_columns: vec![],
             required_output_columns: None,
         });
         let union = LogicalPlan::Union(UnionNode {
@@ -1067,6 +1085,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            variant_columns: vec![],
             required_output_columns: None,
         });
         let aggregate = LogicalPlan::Aggregate(AggregateNode {
@@ -1134,6 +1153,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            variant_columns: vec![],
             required_output_columns: None,
         });
         let aggregate = LogicalPlan::Aggregate(AggregateNode {
@@ -1211,6 +1231,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            variant_columns: vec![],
             required_output_columns: None,
         });
         let aggregate = LogicalPlan::Aggregate(AggregateNode {
@@ -1320,6 +1341,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            variant_columns: vec![],
             required_output_columns: None,
         });
         // murmur_hash3_32(s)
@@ -1430,6 +1452,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            variant_columns: vec![],
             required_output_columns: None,
         });
         let aggregate = LogicalPlan::Aggregate(AggregateNode {
@@ -1507,6 +1530,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            variant_columns: vec![],
             required_output_columns: None,
         });
         let cte_id: crate::sql::analysis::cte::CteId = 7;

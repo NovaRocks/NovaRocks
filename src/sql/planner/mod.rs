@@ -2959,6 +2959,7 @@ fn plan_relation_scoped(
                 predicates: vec![],
                 required_columns: None,
                 dict_columns: vec![],
+                variant_columns: vec![],
                 required_output_columns: None,
             }))
         }
@@ -3146,6 +3147,7 @@ fn plan_iceberg_metadata_scan(
         predicates: vec![],
         required_columns: None,
         dict_columns: vec![],
+        variant_columns: vec![],
         required_output_columns: None,
     }))
 }
@@ -3357,6 +3359,7 @@ fn plan_iceberg_delta_scan(
         predicates: vec![],
         required_columns: None,
         dict_columns: vec![],
+        variant_columns: vec![],
         required_output_columns: None,
     }))
 }

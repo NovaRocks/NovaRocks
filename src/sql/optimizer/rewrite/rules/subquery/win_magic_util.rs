@@ -247,6 +247,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            variant_columns: vec![],
             required_output_columns: None,
         })
     }
@@ -304,6 +305,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            variant_columns: vec![],
             required_output_columns: None,
         };
         let id = TableIdentity::from_scan(&scan_node);

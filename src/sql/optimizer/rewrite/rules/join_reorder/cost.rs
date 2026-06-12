@@ -162,6 +162,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            variant_columns: vec![],
             required_output_columns: None,
         });
         let cost = estimate_operator_cost(&scan_plan, &stats, &[]);

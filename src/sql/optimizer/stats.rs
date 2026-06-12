@@ -1637,6 +1637,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            variant_columns: vec![],
             required_output_columns: None,
         })
     }
@@ -1773,6 +1774,7 @@ mod tests {
                 predicates: scan.predicates,
                 required_columns: scan.required_columns,
                 dict_columns: scan.dict_columns,
+                variant_columns: scan.variant_columns,
                 mv_rewritten_from: None,
             }),
             children: vec![],

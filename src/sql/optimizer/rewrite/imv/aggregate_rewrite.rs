@@ -208,6 +208,7 @@ fn target_state_old_scan(
         predicates: Vec::new(),
         required_columns: None,
         dict_columns: Vec::new(),
+        variant_columns: Vec::new(),
         required_output_columns: None,
     })
 }
@@ -1606,6 +1607,7 @@ mod tests {
             predicates: Vec::new(),
             required_columns: None,
             dict_columns: Vec::new(),
+            variant_columns: Vec::new(),
             required_output_columns: None,
         })
     }
