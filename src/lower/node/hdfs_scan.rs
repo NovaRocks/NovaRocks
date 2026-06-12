@@ -327,6 +327,24 @@ pub(crate) fn extract_change_op_from_extended_columns(
     Ok(Some(value))
 }
 
+fn validate_included_positions_full_file_range(
+    node_id: i32,
+    hdfs_range: &plan_nodes::THdfsScanRange,
+    offset: u64,
+    length: u64,
+    file_len: u64,
+) -> Result<(), String> {
+    if hdfs_range.included_positions.is_none() {
+        return Ok(());
+    }
+    if offset == 0 && length == file_len {
+        return Ok(());
+    }
+    Err(format!(
+        "HDFS_SCAN_NODE node_id={node_id} included_positions requires a full-file scan range, got offset={offset} length={length} file_length={file_len}"
+    ))
+}
+
 fn scan_ranges_have_extended_column(
     scan_ranges: &[internal_service::TScanRangeParams],
     slot_id: SlotId,
@@ -905,6 +923,13 @@ pub(crate) fn lower_hdfs_scan_node(
         if length == 0 && file_len > offset {
             length = file_len - offset;
         }
+        validate_included_positions_full_file_range(
+            node.node_id,
+            hdfs_range,
+            offset,
+            length,
+            file_len,
+        )?;
         let scan_range_id = if row_position_spec.is_some() {
             let id = next_scan_range_id;
             next_scan_range_id = next_scan_range_id.saturating_add(1);
@@ -1321,7 +1346,7 @@ mod tests {
 
     use super::{
         extract_change_op_from_extended_columns, file_cache_flags_from_query_options,
-        resolve_cloud_object_store_config,
+        resolve_cloud_object_store_config, validate_included_positions_full_file_range,
     };
 
     #[test]
@@ -1443,6 +1468,27 @@ mod tests {
             extract_change_op_from_extended_columns(7, &range, Some(SlotId::new(9))).unwrap();
 
         assert_eq!(value, None);
+    }
+
+    #[test]
+    fn included_positions_accepts_full_file_range() {
+        let mut range = plan_nodes::THdfsScanRange::default();
+        range.included_positions = Some(vec![1, 3]);
+
+        validate_included_positions_full_file_range(7, &range, 0, 128, 128)
+            .expect("full-file position-bound range");
+    }
+
+    #[test]
+    fn included_positions_rejects_split_range() {
+        let mut range = plan_nodes::THdfsScanRange::default();
+        range.included_positions = Some(vec![1, 3]);
+
+        let error =
+            validate_included_positions_full_file_range(7, &range, 64, 64, 128).unwrap_err();
+
+        assert!(error.contains("included_positions requires a full-file scan range"));
+        assert!(error.contains("offset=64"));
     }
 
     #[test]

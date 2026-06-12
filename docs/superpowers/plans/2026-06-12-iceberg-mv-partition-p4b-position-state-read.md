@@ -81,6 +81,7 @@ Run:
 
 ```bash
 cargo test --lib include_position_filter
+cargo test --lib included_positions
 cargo test --lib position_bound_file_carries_included_positions_without_splitting
 cargo test --lib bind_target_state_file_positions
 cargo test --lib aggregate_state_merge_direct_codegen
