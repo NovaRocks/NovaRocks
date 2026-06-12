@@ -19,6 +19,7 @@ pub mod config;
 pub mod datasketches;
 pub mod decimal;
 pub mod engine_error;
+pub mod engine_error_codes;
 pub mod failpoint;
 pub mod file_identity;
 pub mod ids;

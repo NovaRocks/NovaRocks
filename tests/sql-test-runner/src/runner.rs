@@ -2,6 +2,10 @@ use crate::types::ConnectionConfig;
 use anyhow::{Result, bail};
 use std::collections::HashSet;
 
+#[path = "../../../src/common/engine_error_codes.rs"]
+mod engine_error_codes;
+use engine_error_codes::EngineErrorCode;
+
 pub fn error_message_matches(actual: &str, expected_substring: &str) -> bool {
     if expected_substring.trim().is_empty() {
         return false;
@@ -18,10 +22,7 @@ pub fn extract_engine_error_code(actual: &str) -> Option<String> {
     };
     let close_idx = candidate_start.find(']')?;
     let candidate = &candidate_start[..close_idx];
-    let mut chars = candidate.chars();
-    if matches!(chars.next(), Some(ch) if ch.is_ascii_uppercase())
-        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-    {
+    if EngineErrorCode::parse(candidate).is_some() {
         Some(candidate.to_string())
     } else {
         None
@@ -166,6 +167,14 @@ mod tests {
         );
         assert_eq!(
             extract_engine_error_code("ERROR 1105 (HY000): [Iceberg-Write] bad"),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_engine_error_code_rejects_unknown_code_name() {
+        assert_eq!(
+            extract_engine_error_code("ERROR 1105 (HY000): [NotARealCode] bad"),
             None
         );
     }

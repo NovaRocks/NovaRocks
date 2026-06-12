@@ -4,64 +4,7 @@ pub const REPORT_EXEC_STATUS_OK: i32 = 0;
 pub const REPORT_EXEC_STATUS_ERROR: i32 = 1;
 pub const REPORT_EXEC_STATUS_QUERY_GONE: i32 = 2;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum EngineErrorCode {
-    TypeMismatch,
-    TypeDeterminismViolation,
-    ExchangeDescriptorMismatch,
-    AggregateStateLayoutMismatch,
-    IcebergWriteDescriptorMismatch,
-    UnsupportedDistributedDmlShape,
-    DistributedWriteOutputMismatch,
-    WriteCoordinatorGone,
-    CommitKnownUncommitted,
-    CommitUnknown,
-    ProtocolDecodeError,
-    InternalInvariantViolation,
-}
-
-impl EngineErrorCode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::TypeMismatch => "TypeMismatch",
-            Self::TypeDeterminismViolation => "TypeDeterminismViolation",
-            Self::ExchangeDescriptorMismatch => "ExchangeDescriptorMismatch",
-            Self::AggregateStateLayoutMismatch => "AggregateStateLayoutMismatch",
-            Self::IcebergWriteDescriptorMismatch => "IcebergWriteDescriptorMismatch",
-            Self::UnsupportedDistributedDmlShape => "UnsupportedDistributedDmlShape",
-            Self::DistributedWriteOutputMismatch => "DistributedWriteOutputMismatch",
-            Self::WriteCoordinatorGone => "WriteCoordinatorGone",
-            Self::CommitKnownUncommitted => "CommitKnownUncommitted",
-            Self::CommitUnknown => "CommitUnknown",
-            Self::ProtocolDecodeError => "ProtocolDecodeError",
-            Self::InternalInvariantViolation => "InternalInvariantViolation",
-        }
-    }
-
-    pub fn parse(input: &str) -> Option<Self> {
-        match input {
-            "TypeMismatch" => Some(Self::TypeMismatch),
-            "TypeDeterminismViolation" => Some(Self::TypeDeterminismViolation),
-            "ExchangeDescriptorMismatch" => Some(Self::ExchangeDescriptorMismatch),
-            "AggregateStateLayoutMismatch" => Some(Self::AggregateStateLayoutMismatch),
-            "IcebergWriteDescriptorMismatch" => Some(Self::IcebergWriteDescriptorMismatch),
-            "UnsupportedDistributedDmlShape" => Some(Self::UnsupportedDistributedDmlShape),
-            "DistributedWriteOutputMismatch" => Some(Self::DistributedWriteOutputMismatch),
-            "WriteCoordinatorGone" => Some(Self::WriteCoordinatorGone),
-            "CommitKnownUncommitted" => Some(Self::CommitKnownUncommitted),
-            "CommitUnknown" => Some(Self::CommitUnknown),
-            "ProtocolDecodeError" => Some(Self::ProtocolDecodeError),
-            "InternalInvariantViolation" => Some(Self::InternalInvariantViolation),
-            _ => None,
-        }
-    }
-}
-
-impl fmt::Display for EngineErrorCode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+pub use super::engine_error_codes::EngineErrorCode;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum InternalInvariantCode {
