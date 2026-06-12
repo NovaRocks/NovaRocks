@@ -180,7 +180,7 @@ impl EngineError {
         )
     }
 
-    pub fn static_message(code: EngineErrorCode, message: impl Into<String>) -> Self {
+    fn static_message(code: EngineErrorCode, message: impl Into<String>) -> Self {
         Self::new(
             code,
             EngineErrorDetail::Message {
@@ -314,9 +314,10 @@ mod tests {
         let err = EngineError::protocol_decode("failed to deserialize payload");
         assert_eq!(err.code().as_str(), "ProtocolDecodeError");
         assert_eq!(err.to_report_error_code(), "ProtocolDecodeError");
-        assert!(err
-            .to_user_message()
-            .contains("failed to deserialize payload"));
+        assert!(
+            err.to_user_message()
+                .contains("failed to deserialize payload")
+        );
     }
 
     #[test]
@@ -369,15 +370,19 @@ mod tests {
             known_uncommitted.code(),
             EngineErrorCode::CommitKnownUncommitted
         );
-        assert!(known_uncommitted
-            .to_user_message()
-            .contains("commit was aborted"));
+        assert!(
+            known_uncommitted
+                .to_user_message()
+                .contains("commit was aborted")
+        );
 
         let unknown = EngineError::commit_unknown("coordinator did not return a decision");
         assert_eq!(unknown.code(), EngineErrorCode::CommitUnknown);
-        assert!(unknown
-            .to_user_message()
-            .contains("coordinator did not return a decision"));
+        assert!(
+            unknown
+                .to_user_message()
+                .contains("coordinator did not return a decision")
+        );
 
         let descriptor =
             EngineError::iceberg_write_descriptor_mismatch("writer output slot changed");
@@ -385,9 +390,11 @@ mod tests {
             descriptor.code(),
             EngineErrorCode::IcebergWriteDescriptorMismatch
         );
-        assert!(descriptor
-            .to_user_message()
-            .contains("writer output slot changed"));
+        assert!(
+            descriptor
+                .to_user_message()
+                .contains("writer output slot changed")
+        );
     }
 
     #[test]
