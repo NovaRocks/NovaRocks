@@ -346,11 +346,16 @@ impl IcebergCommitCollector {
         };
 
         let partition_spec_id = df.partition_spec_id.ok_or_else(|| {
-            "IcebergWriteDescriptorMismatch: TIcebergDataFile missing partition_spec_id".to_string()
+            crate::common::engine_error::EngineError::iceberg_write_descriptor_mismatch(
+                "TIcebergDataFile missing partition_spec_id",
+            )
+            .to_bracketed_user_message()
         })?;
         let metadata = self.metadata.as_ref().ok_or_else(|| {
-            "IcebergWriteDescriptorMismatch: IcebergCommitCollector missing table metadata"
-                .to_string()
+            crate::common::engine_error::EngineError::iceberg_write_descriptor_mismatch(
+                "IcebergCommitCollector missing table metadata",
+            )
+            .to_bracketed_user_message()
         })?;
         let partition_values =
             crate::connector::iceberg::write_descriptor::decode_partition_descriptor(
@@ -358,7 +363,9 @@ impl IcebergCommitCollector {
                 partition_spec_id,
                 metadata,
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| {
+                crate::common::engine_error::EngineError::from(e).to_bracketed_user_message()
+            })?;
 
         let stats = df.column_stats.unwrap_or_default();
         let column_sizes = i64_map_to_u64(stats.column_sizes, "column_sizes")?;
@@ -951,7 +958,11 @@ mod parity_tests {
             .convert(thrift)
             .expect_err("missing descriptor should fail");
 
-        assert!(err.contains("IcebergWriteDescriptorMismatch"), "got: {err}");
+        assert!(
+            err.starts_with("[IcebergWriteDescriptorMismatch] "),
+            "got: {err}"
+        );
+        assert!(err.contains("missing partition descriptor"), "got: {err}");
     }
 
     #[test]
@@ -984,7 +995,10 @@ mod parity_tests {
             .convert(thrift)
             .expect_err("missing partition spec id should fail");
 
-        assert!(err.contains("missing partition_spec_id"), "got: {err}");
+        assert_eq!(
+            err,
+            "[IcebergWriteDescriptorMismatch] TIcebergDataFile missing partition_spec_id"
+        );
     }
 
     #[test]
@@ -1027,7 +1041,10 @@ mod parity_tests {
             .convert(thrift)
             .expect_err("missing collector metadata should fail");
 
-        assert!(err.contains("missing table metadata"), "got: {err}");
+        assert_eq!(
+            err,
+            "[IcebergWriteDescriptorMismatch] IcebergCommitCollector missing table metadata"
+        );
     }
 
     #[test]

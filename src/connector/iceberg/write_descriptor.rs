@@ -46,6 +46,14 @@ impl std::fmt::Display for IcebergWriteDescriptorError {
 
 impl std::error::Error for IcebergWriteDescriptorError {}
 
+impl From<IcebergWriteDescriptorError> for crate::common::engine_error::EngineError {
+    fn from(value: IcebergWriteDescriptorError) -> Self {
+        crate::common::engine_error::EngineError::iceberg_write_descriptor_mismatch(
+            value.to_string(),
+        )
+    }
+}
+
 pub(crate) fn encode_partition_descriptor(
     values: &Struct,
     partition_spec_id: i32,

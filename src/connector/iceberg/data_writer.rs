@@ -578,8 +578,12 @@ pub(crate) fn data_file_to_iceberg_thrift(
     partition_spec_id: Option<i32>,
     metadata: &TableMetadata,
 ) -> Result<crate::types::TIcebergDataFile, String> {
-    let partition_spec_id = partition_spec_id
-        .ok_or_else(|| "IcebergWriteDescriptorMismatch: missing partition_spec_id".to_string())?;
+    let partition_spec_id = partition_spec_id.ok_or_else(|| {
+        crate::common::engine_error::EngineError::iceberg_write_descriptor_mismatch(
+            "missing partition_spec_id",
+        )
+        .to_bracketed_user_message()
+    })?;
     data_file_to_iceberg_thrift_with_descriptor_spec(
         df,
         partition_path,
@@ -604,7 +608,9 @@ fn data_file_to_iceberg_thrift_with_descriptor_spec(
 ) -> Result<crate::types::TIcebergDataFile, String> {
     let partition_values_descriptor =
         encode_partition_descriptor(df.partition(), descriptor_partition_spec_id, metadata)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| {
+                crate::common::engine_error::EngineError::from(e).to_bracketed_user_message()
+            })?;
     Ok(crate::types::TIcebergDataFile {
         path: Some(df.file_path().to_string()),
         format: Some(format),
@@ -1372,6 +1378,76 @@ mod tests {
             .partition_values_descriptor
             .expect("partition descriptor must be present");
         assert_eq!(desc.values.expect("values").len(), 1);
+    }
+
+    #[test]
+    fn data_file_to_iceberg_thrift_missing_partition_spec_id_uses_engine_code() {
+        use iceberg::spec::{DataFileBuilder, DataFileFormat};
+
+        let metadata = test_string_partition_metadata(7);
+        let partition = Struct::from_iter([Some(Literal::Primitive(PrimitiveLiteral::String(
+            "west".to_string(),
+        )))]);
+        let mut b = DataFileBuilder::default();
+        b.content(DataContentType::Data)
+            .file_path("file:///warehouse/t/data/a.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .partition(partition)
+            .record_count(1)
+            .file_size_in_bytes(12);
+        let df = b.build().expect("data file");
+
+        let err = data_file_to_iceberg_thrift(
+            &df,
+            "region=west".to_string(),
+            "0".to_string(),
+            "PARQUET".to_string(),
+            crate::types::TIcebergFileContent::DATA,
+            None,
+            &metadata,
+        )
+        .expect_err("missing partition spec id should fail");
+
+        assert_eq!(
+            err,
+            "[IcebergWriteDescriptorMismatch] missing partition_spec_id"
+        );
+    }
+
+    #[test]
+    fn data_file_to_iceberg_thrift_descriptor_failure_uses_engine_code() {
+        use iceberg::spec::{DataFileBuilder, DataFileFormat};
+
+        let metadata = test_string_partition_metadata(7);
+        let partition = Struct::from_iter([Some(Literal::Primitive(PrimitiveLiteral::String(
+            "west".to_string(),
+        )))]);
+        let mut b = DataFileBuilder::default();
+        b.content(DataContentType::Data)
+            .file_path("file:///warehouse/t/data/a.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .partition(partition)
+            .record_count(1)
+            .file_size_in_bytes(12)
+            .partition_spec_id(99);
+        let df = b.build().expect("data file");
+
+        let err = data_file_to_iceberg_thrift(
+            &df,
+            "region=west".to_string(),
+            "0".to_string(),
+            "PARQUET".to_string(),
+            crate::types::TIcebergFileContent::DATA,
+            Some(99),
+            &metadata,
+        )
+        .expect_err("unknown partition spec should fail");
+
+        assert!(
+            err.starts_with("[IcebergWriteDescriptorMismatch] "),
+            "got: {err}"
+        );
+        assert!(err.contains("unknown partition spec id 99"), "got: {err}");
     }
 
     #[test]
