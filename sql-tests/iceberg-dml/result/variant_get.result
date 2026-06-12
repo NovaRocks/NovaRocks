@@ -15,15 +15,23 @@ id	variant_get(v, '$.a', 'bigint')
 4	1
 
 -- query 5
-id	variant_typeof(variant_get(v, '$.a'))
-1	Int8
-2	Int8
-
--- query 6
 id
 2
 
 -- query 7
+id
+2
+
+-- query 9
+id	variant_typeof(variant_get(v, '$.a'))
+1	Int8
+2	Int8
+
+-- query 10
+id
+2
+
+-- query 11
 id	variant_get(v, '$.b', 'string')
 1	x
 2	y

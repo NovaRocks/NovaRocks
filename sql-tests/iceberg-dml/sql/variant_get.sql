@@ -1,7 +1,8 @@
 -- @order_sensitive=true
 -- Test Point: Spark-aligned variant_get / try_variant_get over a v3 iceberg
 -- variant column: typed extraction, 2-arg variant return, try_ cast-failure
--- NULL, strict cast-failure error, missing-path NULL, WHERE usage.
+-- NULL, strict cast-failure error, missing-path NULL, WHERE usage, and
+-- VariantPathPushdown enabled/disabled result equivalence.
 
 -- query 1
 -- @skip_result_check=true
@@ -37,17 +38,34 @@ SELECT id, variant_get(v, '$.a', 'bigint') FROM ${case_db}.t_variant_get WHERE i
 SELECT variant_get(v, '$.a', 'bigint') FROM ${case_db}.t_variant_get WHERE id = 6;
 
 -- query 5
+-- WHERE usage through the PR-4 pushdown target shape.
+-- @explain_contains=variant columns:
+-- @explain_contains=try_variant_get(v, '$.a', 'bigint')
+SELECT id FROM ${case_db}.t_variant_get WHERE try_variant_get(v, '$.a', 'bigint') = 99 ORDER BY id;
+
+-- query 6
+SET disable_optimizer_rules = 'VariantPathPushdown';
+
+-- query 7
+-- Same result with the rewrite disabled.
+-- @explain_not_contains=variant columns:
+SELECT id FROM ${case_db}.t_variant_get WHERE try_variant_get(v, '$.a', 'bigint') = 99 ORDER BY id;
+
+-- query 8
+SET disable_optimizer_rules = '';
+
+-- query 9
 -- 2-arg form returns variant; display via variant_typeof.
 SELECT id, variant_typeof(variant_get(v, '$.a')) FROM ${case_db}.t_variant_get WHERE id <= 2 ORDER BY id;
 
--- query 6
--- predicate usage (the PR-4 pushdown target shape).
+-- query 10
+-- try_ predicate usage across missing-path / NULL rows.
 SELECT id FROM ${case_db}.t_variant_get WHERE try_variant_get(v, '$.a', 'bigint') > 5 ORDER BY id;
 
--- query 7
+-- query 11
 -- string extraction.
 SELECT id, variant_get(v, '$.b', 'string') FROM ${case_db}.t_variant_get WHERE id <= 3 ORDER BY id;
 
--- query 8
+-- query 12
 -- @skip_result_check=true
 DROP TABLE ${case_db}.t_variant_get FORCE;
