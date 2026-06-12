@@ -15,32 +15,31 @@ impl IcebergWriteDescriptorError {
     pub(crate) fn code(&self) -> &'static str {
         "IcebergWriteDescriptorMismatch"
     }
+
+    pub(crate) fn detail_message(&self) -> String {
+        match self {
+            Self::MissingDescriptor => "missing partition descriptor".to_string(),
+            Self::UnknownPartitionSpec { spec_id } => {
+                format!("unknown partition spec id {spec_id}")
+            }
+            Self::FieldCountMismatch { expected, actual } => {
+                format!(
+                    "partition descriptor field count mismatch: expected {expected}, got {actual}"
+                )
+            }
+            Self::MissingPayload { index } => {
+                format!("partition descriptor value {index} is non-null but has no payload")
+            }
+            Self::DecodeFailed { index, message } => {
+                format!("decode partition descriptor value {index} failed: {message}")
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for IcebergWriteDescriptorError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::MissingDescriptor => write!(
-                f,
-                "IcebergWriteDescriptorMismatch: missing partition descriptor"
-            ),
-            Self::UnknownPartitionSpec { spec_id } => write!(
-                f,
-                "IcebergWriteDescriptorMismatch: unknown partition spec id {spec_id}"
-            ),
-            Self::FieldCountMismatch { expected, actual } => write!(
-                f,
-                "IcebergWriteDescriptorMismatch: partition descriptor field count mismatch: expected {expected}, got {actual}"
-            ),
-            Self::MissingPayload { index } => write!(
-                f,
-                "IcebergWriteDescriptorMismatch: partition descriptor value {index} is non-null but has no payload"
-            ),
-            Self::DecodeFailed { index, message } => write!(
-                f,
-                "IcebergWriteDescriptorMismatch: decode partition descriptor value {index} failed: {message}"
-            ),
-        }
+        write!(f, "{}: {}", self.code(), self.detail_message())
     }
 }
 
@@ -49,7 +48,7 @@ impl std::error::Error for IcebergWriteDescriptorError {}
 impl From<IcebergWriteDescriptorError> for crate::common::engine_error::EngineError {
     fn from(value: IcebergWriteDescriptorError) -> Self {
         crate::common::engine_error::EngineError::iceberg_write_descriptor_mismatch(
-            value.to_string(),
+            value.detail_message(),
         )
     }
 }
@@ -1097,6 +1096,24 @@ mod tests {
                 expected: 1,
                 actual: 0,
             }
+        );
+    }
+
+    #[test]
+    fn descriptor_error_converts_to_engine_error_without_double_prefix() {
+        let err = crate::common::engine_error::EngineError::from(
+            IcebergWriteDescriptorError::MissingDescriptor,
+        );
+
+        assert_eq!(
+            err.to_bracketed_user_message(),
+            "[IcebergWriteDescriptorMismatch] missing partition descriptor"
+        );
+        let message = err.to_bracketed_user_message();
+        let payload = message.split_once("] ").expect("bracketed payload").1;
+        assert!(
+            !payload.contains("IcebergWriteDescriptorMismatch:"),
+            "got: {message}"
         );
     }
 }

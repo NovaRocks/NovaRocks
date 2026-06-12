@@ -128,6 +128,18 @@ impl CommitServiceError {
     }
 }
 
+impl From<CommitServiceError> for crate::common::engine_error::EngineError {
+    fn from(value: CommitServiceError) -> Self {
+        let is_unknown = value.is_unknown();
+        let message = value.into_legacy_string();
+        if is_unknown {
+            Self::commit_unknown(message)
+        } else {
+            Self::commit_known_uncommitted(message)
+        }
+    }
+}
+
 pub fn classify_commit_error(err: &str) -> CommitFailureKind {
     let lower = err.to_lowercase();
     let definite_signals = [
@@ -274,6 +286,46 @@ mod tests {
         assert_eq!(
             err.into_legacy_string(),
             "CowUpdate commit requires a rewrite set"
+        );
+    }
+
+    #[test]
+    fn commit_service_error_converts_to_engine_error() {
+        let known = CommitServiceError::known_uncommitted(
+            "catalog commit conflict".to_string(),
+            CleanupAttempt::not_attempted(),
+        );
+        let known = crate::common::engine_error::EngineError::from(known);
+        assert_eq!(
+            known.code(),
+            crate::common::engine_error::EngineErrorCode::CommitKnownUncommitted
+        );
+        assert_eq!(
+            known.to_bracketed_user_message(),
+            "[CommitKnownUncommitted] catalog commit conflict"
+        );
+
+        let unknown = CommitServiceError::unknown(
+            "connection reset by peer".to_string(),
+            RecoveryEvidence {
+                table_ident: "db.t".to_string(),
+                op_kind: CommitOpKind::FastAppend,
+                base_snapshot_id: Some(10),
+                base_sequence_number: 7,
+                staging_dir: "s3://bucket/db/t/_staging/abc".to_string(),
+            },
+        );
+        let unknown = crate::common::engine_error::EngineError::from(unknown);
+        assert_eq!(
+            unknown.code(),
+            crate::common::engine_error::EngineErrorCode::CommitUnknown
+        );
+        assert!(
+            unknown
+                .to_bracketed_user_message()
+                .starts_with("[CommitUnknown] iceberg commit unknown"),
+            "got: {}",
+            unknown.to_bracketed_user_message()
         );
     }
 }

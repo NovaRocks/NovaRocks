@@ -435,7 +435,9 @@ pub(crate) fn written_file_to_sink_commit_info(
         partition_path_from_struct(&file.partition_values, partition_spec)?;
     let partition_values_descriptor =
         encode_partition_descriptor(&file.partition_values, file.partition_spec_id, metadata)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| {
+                crate::common::engine_error::EngineError::from(e).to_bracketed_user_message()
+            })?;
     let data_file = crate::types::TIcebergDataFile {
         path: Some(file.path.clone()),
         format: Some(file.format.to_string()),
@@ -1486,6 +1488,51 @@ mod tests {
             .expect("partition descriptor must be present");
 
         assert_eq!(desc.values.expect("values").len(), 1);
+    }
+
+    #[test]
+    fn written_file_to_sink_commit_info_descriptor_failure_uses_engine_code() {
+        use iceberg::spec::DataFileFormat;
+
+        let metadata = test_string_partition_metadata(7);
+        let spec_id = metadata.default_partition_spec_id();
+        let file = super::super::commit::WrittenFile {
+            path: "file:///warehouse/t/data/a.parquet".to_string(),
+            format: DataFileFormat::Parquet,
+            content: DataContentType::Data,
+            partition_values: Struct::from_iter([Some(Literal::Primitive(PrimitiveLiteral::Int(
+                7,
+            )))]),
+            partition_spec_id: spec_id,
+            record_count: 1,
+            file_size_in_bytes: 12,
+            split_offsets: Vec::new(),
+            column_sizes: Default::default(),
+            value_counts: Default::default(),
+            null_value_counts: Default::default(),
+            lower_bounds: Default::default(),
+            upper_bounds: Default::default(),
+            key_metadata: None,
+            referenced_data_file: None,
+            equality_ids: None,
+            first_row_id: None,
+        };
+
+        let err = written_file_to_sink_commit_info(&file, &metadata)
+            .expect_err("descriptor encode should fail");
+
+        assert!(
+            err.starts_with("[IcebergWriteDescriptorMismatch] "),
+            "got: {err}"
+        );
+        assert!(
+            !err.split_once("] ")
+                .expect("bracketed payload")
+                .1
+                .contains("IcebergWriteDescriptorMismatch:"),
+            "got: {err}"
+        );
+        assert!(err.contains("incompatible with type String"), "got: {err}");
     }
 
     #[test]

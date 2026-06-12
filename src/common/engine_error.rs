@@ -272,18 +272,6 @@ impl fmt::Display for EngineError {
 
 impl std::error::Error for EngineError {}
 
-impl From<crate::connector::iceberg::commit::CommitServiceError> for EngineError {
-    fn from(value: crate::connector::iceberg::commit::CommitServiceError) -> Self {
-        let is_unknown = value.is_unknown();
-        let message = value.into_legacy_string();
-        if is_unknown {
-            Self::commit_unknown(message)
-        } else {
-            Self::commit_known_uncommitted(message)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,59 +430,6 @@ mod tests {
         assert_eq!(
             mismatch.to_bracketed_user_message(),
             "[DistributedWriteOutputMismatch] insert: slot 3 changed type"
-        );
-    }
-
-    #[test]
-    fn iceberg_write_descriptor_error_converts_to_engine_error() {
-        let err = EngineError::from(
-            crate::connector::iceberg::write_descriptor::IcebergWriteDescriptorError::MissingDescriptor,
-        );
-
-        assert_eq!(err.code(), EngineErrorCode::IcebergWriteDescriptorMismatch);
-        assert!(
-            err.to_bracketed_user_message()
-                .starts_with("[IcebergWriteDescriptorMismatch] "),
-            "got: {}",
-            err.to_bracketed_user_message()
-        );
-        assert!(
-            err.to_user_message()
-                .contains("missing partition descriptor")
-        );
-    }
-
-    #[test]
-    fn commit_service_error_converts_to_engine_error() {
-        let known = crate::connector::iceberg::commit::CommitServiceError::known_uncommitted(
-            "catalog commit conflict".to_string(),
-            crate::connector::iceberg::commit::CleanupAttempt::not_attempted(),
-        );
-        let known = EngineError::from(known);
-        assert_eq!(known.code(), EngineErrorCode::CommitKnownUncommitted);
-        assert_eq!(
-            known.to_bracketed_user_message(),
-            "[CommitKnownUncommitted] catalog commit conflict"
-        );
-
-        let unknown = crate::connector::iceberg::commit::CommitServiceError::unknown(
-            "connection reset by peer".to_string(),
-            crate::connector::iceberg::commit::RecoveryEvidence {
-                table_ident: "db.t".to_string(),
-                op_kind: crate::connector::iceberg::commit::CommitOpKind::FastAppend,
-                base_snapshot_id: Some(10),
-                base_sequence_number: 7,
-                staging_dir: "s3://bucket/db/t/_staging/abc".to_string(),
-            },
-        );
-        let unknown = EngineError::from(unknown);
-        assert_eq!(unknown.code(), EngineErrorCode::CommitUnknown);
-        assert!(
-            unknown
-                .to_bracketed_user_message()
-                .starts_with("[CommitUnknown] iceberg commit unknown"),
-            "got: {}",
-            unknown.to_bracketed_user_message()
         );
     }
 
