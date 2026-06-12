@@ -20,6 +20,7 @@ use tokio::net::TcpListener;
 use tokio::task;
 use tracing::{info, warn};
 
+use crate::common::engine_error::{EngineError, EngineErrorCode};
 use crate::common::failpoint::{self, FailPointMode};
 use crate::novarocks_config::NovaRocksConfig;
 use crate::version;
@@ -1077,6 +1078,12 @@ async fn execute_statement_text(
         return Ok(StatementResult::Ok);
     }
 
+    match parse_admin_raise_engine_error_query(trimmed) {
+        Ok(Some(err)) => return Err(format_engine_error_for_mysql(err)),
+        Ok(None) => {}
+        Err(err) => return Err((ErrorKind::ER_PARSE_ERROR, err)),
+    }
+
     if is_session_noop(trimmed)
         && !is_backend_management_statement(trimmed)
         && !is_materialized_view_management_statement(trimmed)
@@ -1551,6 +1558,12 @@ fn classify_query_error(err: &str) -> ErrorKind {
     }
 }
 
+fn format_engine_error_for_mysql(err: EngineError) -> (ErrorKind, String) {
+    let kind = err.to_mysql_error_kind();
+    let message = err.to_bracketed_user_message();
+    (kind, message)
+}
+
 fn parse_admin_failpoint_query(query: &str) -> Result<Option<(String, FailPointMode)>, String> {
     let parts: Vec<&str> = query.split_whitespace().collect();
     if parts.len() < 3
@@ -1579,6 +1592,54 @@ fn parse_admin_failpoint_query(query: &str) -> Result<Option<(String, FailPointM
     }
 
     Ok(Some((name.to_string(), mode)))
+}
+
+fn parse_admin_raise_engine_error_query(query: &str) -> Result<Option<EngineError>, String> {
+    let parts: Vec<&str> = query.split_whitespace().collect();
+    if parts.len() < 4
+        || !parts[0].eq_ignore_ascii_case("admin")
+        || !parts[1].eq_ignore_ascii_case("raise")
+        || !parts[2].eq_ignore_ascii_case("engine")
+        || !parts[3].eq_ignore_ascii_case("error")
+    {
+        return Ok(None);
+    }
+
+    if parts.len() != 5 {
+        return Err("expected ADMIN RAISE ENGINE ERROR '<engine_error_code>'".to_string());
+    }
+
+    let raw_code = strip_string_quotes(parts[4])
+        .ok_or_else(|| "expected ADMIN RAISE ENGINE ERROR '<engine_error_code>'".to_string())?;
+    let code = EngineErrorCode::parse(raw_code)
+        .ok_or_else(|| format!("unknown engine error code: {raw_code}"))?;
+    let err = match code {
+        EngineErrorCode::UnsupportedDistributedDmlShape => {
+            EngineError::unsupported_distributed_dml_shape(
+                "ADMIN RAISE ENGINE ERROR",
+                "forced P8 SQL runner error-code smoke",
+            )
+        }
+        EngineErrorCode::IcebergWriteDescriptorMismatch => {
+            EngineError::iceberg_write_descriptor_mismatch("forced P8 SQL runner error-code smoke")
+        }
+        EngineErrorCode::CommitKnownUncommitted => {
+            EngineError::commit_known_uncommitted("forced P8 SQL runner error-code smoke")
+        }
+        EngineErrorCode::CommitUnknown => {
+            EngineError::commit_unknown("forced P8 SQL runner error-code smoke")
+        }
+        EngineErrorCode::ProtocolDecodeError => {
+            EngineError::protocol_decode("forced P8 SQL runner error-code smoke")
+        }
+        _ => {
+            return Err(format!(
+                "unsupported engine error code for ADMIN RAISE ENGINE ERROR: {raw_code}"
+            ));
+        }
+    };
+
+    Ok(Some(err))
 }
 
 fn strip_string_quotes(raw: &str) -> Option<&str> {
@@ -1895,6 +1956,31 @@ mod tests {
             parse_admin_failpoint_query("admin enable failpoint agg_hash_set_bad_alloc").is_err()
         );
         assert_eq!(parse_admin_failpoint_query("admin show config"), Ok(None));
+    }
+
+    #[test]
+    fn parse_admin_raise_engine_error_accepts_supported_code() {
+        let err = parse_admin_raise_engine_error_query(
+            "ADMIN RAISE ENGINE ERROR 'IcebergWriteDescriptorMismatch'",
+        )
+        .expect("parse ok")
+        .expect("matched");
+
+        assert_eq!(
+            err.to_bracketed_user_message(),
+            "[IcebergWriteDescriptorMismatch] forced P8 SQL runner error-code smoke"
+        );
+    }
+
+    #[test]
+    fn parse_admin_raise_engine_error_rejects_unknown_code() {
+        let err = parse_admin_raise_engine_error_query("ADMIN RAISE ENGINE ERROR 'NotARealCode'")
+            .expect_err("unknown code should fail");
+
+        assert!(
+            err.contains("unknown engine error code"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

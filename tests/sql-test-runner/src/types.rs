@@ -22,6 +22,7 @@ pub struct QueryMeta {
     pub float_epsilon: Option<f64>,
     pub db: Option<String>,
     pub expect_error: Option<String>,
+    pub expect_error_code: Option<String>,
     pub result_contains: Vec<String>,
     pub result_contains_any: Vec<String>,
     pub result_not_contains: Vec<String>,

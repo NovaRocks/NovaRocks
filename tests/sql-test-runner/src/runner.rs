@@ -11,6 +11,25 @@ pub fn error_message_matches(actual: &str, expected_substring: &str) -> bool {
         .contains(&expected_substring.to_ascii_lowercase())
 }
 
+pub fn extract_engine_error_code(actual: &str) -> Option<String> {
+    let mut rest = actual;
+    while let Some(open_idx) = rest.find('[') {
+        let candidate_start = &rest[open_idx + 1..];
+        let Some(close_idx) = candidate_start.find(']') else {
+            return None;
+        };
+        let candidate = &candidate_start[..close_idx];
+        let mut chars = candidate.chars();
+        if matches!(chars.next(), Some(ch) if ch.is_ascii_uppercase())
+            && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        {
+            return Some(candidate.to_string());
+        }
+        rest = &candidate_start[close_idx + 1..];
+    }
+    None
+}
+
 pub fn is_transient_iceberg_commit_error(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("metadata file for version")
@@ -59,4 +78,40 @@ pub fn summarize_connection(label: &str, conn: &ConnectionConfig) -> String {
         "{}: mysql={}, host={}:{}, user={}, catalog={}, db={}",
         label, conn.mysql, conn.host, conn.port, conn.user, catalog, db
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_engine_error_code_reads_bracket_prefix() {
+        let actual =
+            "ERROR 1105 (HY000): [IcebergWriteDescriptorMismatch] missing partition descriptor";
+
+        assert_eq!(
+            extract_engine_error_code(actual),
+            Some("IcebergWriteDescriptorMismatch".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_engine_error_code_returns_none_for_plain_error() {
+        assert_eq!(
+            extract_engine_error_code("ERROR 1105 (HY000): plain error"),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_engine_error_code_rejects_lowercase_and_punctuation() {
+        assert_eq!(
+            extract_engine_error_code("ERROR 1105 (HY000): [icebergWriteDescriptorMismatch] bad"),
+            None
+        );
+        assert_eq!(
+            extract_engine_error_code("ERROR 1105 (HY000): [Iceberg-Write] bad"),
+            None
+        );
+    }
 }

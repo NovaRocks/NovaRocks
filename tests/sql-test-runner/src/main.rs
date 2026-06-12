@@ -25,7 +25,9 @@ use crate::results::{
     step_has_implicit_skip_result, step_requires_recorded_result, step_retry_count,
     step_retry_interval, verify_text_assertions, write_mismatch_artifacts, write_result_file,
 };
-use crate::runner::{error_message_matches, parse_selector_list, summarize_connection};
+use crate::runner::{
+    error_message_matches, extract_engine_error_code, parse_selector_list, summarize_connection,
+};
 use crate::session::{MysqlSession, drop_case_database, execute_suite_hook, reset_case_database};
 use crate::types::*;
 use anyhow::{Context, Result, bail};
@@ -75,6 +77,18 @@ enum CaseStatus {
     Pass,
     Fail,
     Skipped,
+}
+
+fn expected_engine_error_code_result(err_msg: &str, expected_code: &str) -> Result<(), String> {
+    let actual_code = extract_engine_error_code(err_msg);
+    if actual_code.as_deref() == Some(expected_code) {
+        Ok(())
+    } else {
+        Err(format!(
+            "expected engine error code {:?}, got {:?}: {}",
+            expected_code, actual_code, err_msg
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -939,7 +953,22 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     case_elapsed += elapsed;
                     last_execution = execution.clone();
 
-                    if let Some(expected_error) = step.meta.expect_error.as_deref() {
+                    if let Some(expected_code) = step.meta.expect_error_code.as_deref() {
+                        if ok {
+                            last_failure = format!(
+                                "expected engine error code {:?}, but query succeeded",
+                                expected_code
+                            );
+                        } else if let Err(reason) =
+                            expected_engine_error_code_result(&err_msg, expected_code)
+                        {
+                            last_failure = reason;
+                        } else {
+                            matched_expected_error = true;
+                            last_failure = err_msg.clone();
+                            break;
+                        }
+                    } else if let Some(expected_error) = step.meta.expect_error.as_deref() {
                         if ok {
                             last_failure = format!(
                                 "expected error containing {:?}, but query succeeded",
@@ -1028,7 +1057,18 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     }
                 }
 
-                if let Some(expected_error) = step.meta.expect_error.as_deref() {
+                if let Some(expected_code) = step.meta.expect_error_code.as_deref() {
+                    if matched_expected_error {
+                        let _ = writeln!(
+                            log,
+                            "    ✅ PASS (expected error matched): engine_error_code={} {}",
+                            expected_code, last_failure
+                        );
+                    } else {
+                        case_failed = true;
+                        let _ = writeln!(log, "    ❌ {}", last_failure);
+                    }
+                } else if let Some(expected_error) = step.meta.expect_error.as_deref() {
                     if matched_expected_error {
                         let _ = writeln!(
                             log,
@@ -1193,7 +1233,22 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         .unwrap_or_default();
                     case_elapsed += elapsed;
 
-                    if let Some(expected_error) = step.meta.expect_error.as_deref() {
+                    if let Some(expected_code) = step.meta.expect_error_code.as_deref() {
+                        if ok {
+                            last_failure = format!(
+                                "expected engine error code {:?}, but query succeeded",
+                                expected_code
+                            );
+                        } else if let Err(reason) =
+                            expected_engine_error_code_result(&err_msg, expected_code)
+                        {
+                            last_failure = reason;
+                        } else {
+                            matched_expected_error = true;
+                            last_failure = err_msg.clone();
+                            break;
+                        }
+                    } else if let Some(expected_error) = step.meta.expect_error.as_deref() {
                         if ok {
                             last_failure = format!(
                                 "expected error containing {:?}, but query succeeded",
@@ -1236,7 +1291,18 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     }
                 }
 
-                if step.meta.expect_error.is_some() {
+                if let Some(expected_code) = step.meta.expect_error_code.as_deref() {
+                    if matched_expected_error {
+                        let _ = writeln!(
+                            log,
+                            "    ✅ RECORDED EXPECTED ERROR: engine_error_code={} {}",
+                            expected_code, last_failure
+                        );
+                    } else {
+                        case_failed = true;
+                        let _ = writeln!(log, "    ❌ {}", last_failure);
+                    }
+                } else if step.meta.expect_error.is_some() {
                     if matched_expected_error {
                         let _ = writeln!(log, "    ✅ RECORDED EXPECTED ERROR: {}", last_failure);
                     } else {
@@ -1313,7 +1379,67 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                 }
             }
             Mode::Diff => {
-                if let Some(expected_error) = step.meta.expect_error.as_deref() {
+                if let Some(expected_code) = step.meta.expect_error_code.as_deref() {
+                    let (ok_t, execution_t, err_t) = if shell::is_shell_step(&step.sql) {
+                        let cmd = step
+                            .sql
+                            .trim_start()
+                            .strip_prefix("shell:")
+                            .unwrap_or("")
+                            .trim();
+                        let exec = shell::execute_shell_command(cmd);
+                        (true, Some(exec), String::new())
+                    } else {
+                        target_session.execute_query(
+                            ctx.query_timeout,
+                            &step.sql,
+                            step.meta.db.as_deref(),
+                        )
+                    };
+                    let (ok_r, execution_r, err_r) = if shell::is_shell_step(&step.sql) {
+                        let cmd = step
+                            .sql
+                            .trim_start()
+                            .strip_prefix("shell:")
+                            .unwrap_or("")
+                            .trim();
+                        let exec = shell::execute_shell_command(cmd);
+                        (true, Some(exec), String::new())
+                    } else {
+                        reference_session
+                            .as_mut()
+                            .expect("reference session required in diff mode")
+                            .execute_query(ctx.query_timeout, &step.sql, step.meta.db.as_deref())
+                    };
+                    let elapsed = execution_t.as_ref().map(|r| r.elapsed).unwrap_or_default()
+                        + execution_r.as_ref().map(|r| r.elapsed).unwrap_or_default();
+                    case_elapsed += elapsed;
+
+                    let target_matched =
+                        !ok_t && expected_engine_error_code_result(&err_t, expected_code).is_ok();
+                    let reference_matched =
+                        !ok_r && expected_engine_error_code_result(&err_r, expected_code).is_ok();
+                    if target_matched && reference_matched {
+                        let _ = writeln!(
+                            log,
+                            "    ✅ DIFF PASS (both sides matched expected error: engine_error_code={})",
+                            expected_code
+                        );
+                    } else {
+                        case_failed = true;
+                        let _ = writeln!(
+                            log,
+                            "    ❌ DIFF FAILED expected engine error code {:?} (target_ok={}, target_code={:?}, target_err={}, reference_ok={}, reference_code={:?}, reference_err={})",
+                            expected_code,
+                            ok_t,
+                            extract_engine_error_code(&err_t),
+                            err_t,
+                            ok_r,
+                            extract_engine_error_code(&err_r),
+                            err_r
+                        );
+                    }
+                } else if let Some(expected_error) = step.meta.expect_error.as_deref() {
                     let (ok_t, execution_t, err_t) = if shell::is_shell_step(&step.sql) {
                         let cmd = step
                             .sql
@@ -2414,7 +2540,7 @@ mod tests {
     use crate::results::{load_expected_results, parse_output, write_result_file};
     use crate::runner::{is_transient_iceberg_commit_error, parse_selector_list};
     use crate::types::{QueryMeta, ResultSet, SqlCase, SqlStep};
-    use crate::{Cli, validate_fault_injection_jobs};
+    use crate::{Cli, expected_engine_error_code_result, validate_fault_injection_jobs};
     use clap::Parser;
     use regex::Regex;
     use std::collections::BTreeMap;
@@ -2489,6 +2615,29 @@ mod tests {
         validate_fault_injection_jobs(&cases, 1).expect("serial jobs should be accepted");
         validate_fault_injection_jobs(&[test_case_with_meta(QueryMeta::default())], 8)
             .expect("cases without fault directives should allow parallel jobs");
+    }
+
+    #[test]
+    fn expect_error_code_result_accepts_matching_code() {
+        expected_engine_error_code_result(
+            "ERROR (0.01s): ERROR 1105 (HY000): [CommitUnknown] commit outcome unavailable",
+            "CommitUnknown",
+        )
+        .expect("matching code should pass");
+    }
+
+    #[test]
+    fn expect_error_code_result_reports_missing_code() {
+        let err = expected_engine_error_code_result(
+            "ERROR (0.01s): ERROR 1105 (HY000): plain error",
+            "CommitUnknown",
+        )
+        .expect_err("missing code should fail");
+
+        assert!(
+            err.contains("expected engine error code \"CommitUnknown\", got None"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
