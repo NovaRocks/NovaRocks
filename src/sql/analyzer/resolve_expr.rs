@@ -2108,16 +2108,22 @@ impl<'a> super::AnalyzerContext<'a> {
                 let target = (*d as i8).max(0).min(*s);
                 return_type = DataType::Decimal128(*p, target);
             }
-            // variant_get / try_variant_get: the optional 3rd argument is a
-            // string literal naming the result type (Spark-aligned). Surface
-            // it as the expression's static type; reject non-literal type
-            // arguments up front.
+            // variant_get / try_variant_get: the path argument and optional
+            // 3rd result-type argument are string literals (Spark-aligned).
+            // Surface the type argument as the expression's static type;
+            // reject non-literal arguments up front.
             if matches!(name.as_str(), "variant_get" | "try_variant_get") {
                 if !(2..=3).contains(&args_typed.len()) {
                     return Err(format!(
                         "{name} expects 2 or 3 arguments, got {}",
                         args_typed.len()
                     ));
+                }
+                match &args_typed[1].kind {
+                    ExprKind::Literal(LiteralValue::String(_)) => {}
+                    _ => {
+                        return Err(format!("{name} path argument must be a string literal"));
+                    }
                 }
                 if args_typed.len() == 3 {
                     match &args_typed[2].kind {
@@ -5021,6 +5027,16 @@ mod tests {
             .expect("variant_get should analyze");
 
         assert_eq!(expr.data_type, DataType::LargeBinary);
+    }
+
+    #[test]
+    fn variant_get_rejects_non_literal_path_argument() {
+        let err = analyze_projection_expr(
+            "select variant_get(parse_json('{\"a\":1}'), concat('$.', 'a'))",
+        )
+        .expect_err("path argument should be a string literal");
+
+        assert_eq!(err, "variant_get path argument must be a string literal");
     }
 
     #[test]
