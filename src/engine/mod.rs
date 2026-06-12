@@ -2885,6 +2885,230 @@ fn choose_standalone_execution(build_result: MultiFragmentBuildResult) -> Standa
     StandaloneExecutionPlan::Coordinated(Box::new(build_result))
 }
 
+fn aggregate_delta_row_ids_for_position_locator(
+    layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
+    chunks: &[crate::exec::chunk::Chunk],
+) -> Result<Vec<String>, String> {
+    use arrow::array::Array;
+
+    let mut row_ids = std::collections::BTreeSet::new();
+    let row_id_column = &layout.row_id_column.column.name;
+    for chunk in chunks {
+        let schema = chunk.batch.schema();
+        let row_id_index = schema.index_of(row_id_column).map_err(|e| {
+            format!("iceberg aggregate delta missing row id column `{row_id_column}`: {e}")
+        })?;
+        let row_id_array = chunk
+            .batch
+            .column(row_id_index)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .ok_or_else(|| {
+                format!("iceberg aggregate delta row id column `{row_id_column}` must be Utf8")
+            })?;
+        for row in 0..row_id_array.len() {
+            if row_id_array.is_null(row) {
+                return Err(format!(
+                    "iceberg aggregate delta row id column `{row_id_column}` cannot be NULL"
+                ));
+            }
+            row_ids.insert(row_id_array.value(row).to_string());
+        }
+    }
+    Ok(row_ids.into_iter().collect())
+}
+
+fn bind_scan_ranges_to_target_positions(
+    scan_ranges: &mut Vec<crate::internal_service::TScanRangeParams>,
+    positions_by_file: &std::collections::BTreeMap<String, Vec<i64>>,
+    matched_files: &mut std::collections::BTreeSet<String>,
+) {
+    let mut retained_position_files = std::collections::BTreeSet::new();
+    scan_ranges.retain_mut(|params| {
+        let Some(hdfs_range) = params.scan_range.hdfs_scan_range.as_mut() else {
+            return true;
+        };
+        let path = hdfs_range
+            .full_path
+            .as_deref()
+            .or(hdfs_range.relative_path.as_deref());
+        let Some(path) = path else {
+            return true;
+        };
+        let Some(positions) = positions_by_file.get(path) else {
+            return false;
+        };
+        if !retained_position_files.insert(path.to_string()) {
+            return false;
+        }
+        hdfs_range.offset = Some(0);
+        if let Some(file_length) = hdfs_range.file_length {
+            hdfs_range.length = Some(file_length.max(0));
+        }
+        hdfs_range.included_positions = Some(positions.clone());
+        matched_files.insert(path.to_string());
+        true
+    });
+}
+
+fn bind_plan_build_result_hdfs_positions(
+    result: &mut PlanBuildResult,
+    matched_positions: &[crate::engine::mv::iceberg_target_apply::TargetRowPositionSet],
+    target: &str,
+) -> Result<(), String> {
+    let mut positions_by_file = std::collections::BTreeMap::<String, Vec<i64>>::new();
+    for set in matched_positions {
+        if set.positions.is_empty() {
+            continue;
+        }
+        positions_by_file
+            .entry(set.referenced_data_file.clone())
+            .or_default()
+            .extend(set.positions.iter().copied());
+    }
+    for positions in positions_by_file.values_mut() {
+        positions.sort_unstable();
+        positions.dedup();
+    }
+
+    let mut matched_files = std::collections::BTreeSet::new();
+    for scan_ranges in result.exec_params.per_node_scan_ranges.values_mut() {
+        bind_scan_ranges_to_target_positions(scan_ranges, &positions_by_file, &mut matched_files);
+    }
+    if let Some(per_driver) = result
+        .exec_params
+        .node_to_per_driver_seq_scan_ranges
+        .as_mut()
+    {
+        for driver_ranges in per_driver.values_mut() {
+            for scan_ranges in driver_ranges.values_mut() {
+                bind_scan_ranges_to_target_positions(
+                    scan_ranges,
+                    &positions_by_file,
+                    &mut matched_files,
+                );
+            }
+        }
+    }
+
+    let missing = positions_by_file
+        .keys()
+        .filter(|path| !matched_files.contains(*path))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "Iceberg target-state scan {target} locator returned positions for files not present in old-state scan ranges: [{}]",
+            missing.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+fn bind_aggregate_old_input_positions_from_delta_preview(
+    old_input: &mut PlanBuildResult,
+    delta_input: &PlanBuildResult,
+    layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
+    pruning_limits: crate::engine::mv::refresh_context::MvRefreshPruningLimits,
+    locator: &crate::sql::codegen::AggregateStateTargetPositionLocator,
+    query_opts: Option<&crate::internal_service::TQueryOptions>,
+    iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
+) -> Result<(), String> {
+    let target = locator.target_table.identifier().to_string();
+    let delta_preview = match execute_plan(
+        delta_input.clone(),
+        query_opts.cloned(),
+        None,
+        iceberg_catalogs,
+    ) {
+        Ok(preview) => preview,
+        Err(err) => {
+            tracing::warn!(
+                target = %target,
+                error = %err,
+                fallback_reason = "delta_preview",
+                "falling back to unpositioned aggregate old-state scan"
+            );
+            return Ok(());
+        }
+    };
+    let row_ids = match aggregate_delta_row_ids_for_position_locator(layout, &delta_preview.chunks)
+    {
+        Ok(row_ids) => row_ids,
+        Err(err) => {
+            tracing::warn!(
+                target = %target,
+                error = %err,
+                fallback_reason = "delta_row_id",
+                "falling back to unpositioned aggregate old-state scan"
+            );
+            return Ok(());
+        }
+    };
+    if row_ids.is_empty() {
+        return bind_plan_build_result_hdfs_positions(old_input, &[], &target);
+    }
+    if pruning_limits.touched_group_count_exceeds_limit(row_ids.len()) {
+        tracing::warn!(
+            target = %target,
+            touched_group_count = row_ids.len(),
+            max_touched_groups = pruning_limits.max_touched_groups,
+            fallback_reason = "touched_group_threshold",
+            "falling back to full aggregate old-state scan because touched group count exceeds configured threshold"
+        );
+        return Ok(());
+    }
+
+    let (existing_deletes_by_file, referenced_data_file_partitions) =
+        match crate::engine::mv::iceberg_target_apply::load_target_apply_locator_inputs(
+            &locator.target_entry,
+            &locator.target_table,
+        ) {
+            Ok(inputs) => inputs,
+            Err(err) => {
+                tracing::warn!(
+                    target = %target,
+                    error = %err,
+                    fallback_reason = "target_locator_input",
+                    "falling back to unpositioned aggregate old-state scan"
+                );
+                return Ok(());
+            }
+        };
+    let locator_result = match crate::runtime::global_async_runtime::data_block_on(
+        crate::engine::mv::iceberg_target_apply::locate_target_rows_by_string_apply_key_with_matches(
+            &locator.target_table,
+            &locator.apply_key_column,
+            &row_ids,
+            &existing_deletes_by_file,
+            &referenced_data_file_partitions,
+            &locator.partition_filter,
+        ),
+    ) {
+        Ok(Ok(result)) => result,
+        Ok(Err(err)) | Err(err) => {
+            tracing::warn!(
+                target = %target,
+                error = %err,
+                fallback_reason = "target_locator",
+                "falling back to unpositioned aggregate old-state scan"
+            );
+            return Ok(());
+        }
+    };
+    if let Err(err) =
+        bind_plan_build_result_hdfs_positions(old_input, &locator_result.matched_positions, &target)
+    {
+        tracing::warn!(
+            target = %target,
+            error = %err,
+            fallback_reason = "position_binding",
+            "falling back to unpositioned aggregate old-state scan"
+        );
+    }
+    Ok(())
+}
+
 fn collapse_distribution_enforcers_for_single_fragment(
     mut node: crate::sql::optimizer::PhysicalPlanNode,
 ) -> crate::sql::optimizer::PhysicalPlanNode {
@@ -3759,11 +3983,25 @@ fn lower_plan_build_result(
                 layout,
                 branch_id,
                 pruning_limits,
+                target_position_locator,
             } => {
+                let mut old_input = *old_input;
+                let delta_input = *delta_input;
+                if let Some(locator) = target_position_locator.as_ref() {
+                    bind_aggregate_old_input_positions_from_delta_preview(
+                        &mut old_input,
+                        &delta_input,
+                        &layout,
+                        pruning_limits,
+                        locator,
+                        query_opts,
+                        iceberg_catalogs,
+                    )?;
+                }
                 let old_input =
-                    lower_plan_build_result(*old_input, arena, query_opts, iceberg_catalogs)?;
+                    lower_plan_build_result(old_input, arena, query_opts, iceberg_catalogs)?;
                 let delta_input =
-                    lower_plan_build_result(*delta_input, arena, query_opts, iceberg_catalogs)?;
+                    lower_plan_build_result(delta_input, arena, query_opts, iceberg_catalogs)?;
                 return Ok(
                     crate::sql::codegen::nodes::build_aggregate_state_merge_exec_node(
                         old_input,
@@ -4485,6 +4723,64 @@ path = "{metadata_path}"
             },
             mv_default_storage_engine: "starrocks".to_string(),
         }
+    }
+
+    fn hdfs_scan_range_params(
+        full_path: &str,
+        offset: i64,
+        length: i64,
+        file_length: i64,
+    ) -> crate::internal_service::TScanRangeParams {
+        let mut hdfs_range = crate::plan_nodes::THdfsScanRange::default();
+        hdfs_range.full_path = Some(full_path.to_string());
+        hdfs_range.offset = Some(offset);
+        hdfs_range.length = Some(length);
+        hdfs_range.file_length = Some(file_length);
+        crate::internal_service::TScanRangeParams::new(
+            crate::plan_nodes::TScanRange::new(
+                None::<crate::plan_nodes::TInternalScanRange>,
+                None::<Vec<u8>>,
+                None::<crate::plan_nodes::TBrokerScanRange>,
+                None::<crate::plan_nodes::TEsScanRange>,
+                Some(hdfs_range),
+                None::<crate::plan_nodes::TBinlogScanRange>,
+                None::<crate::plan_nodes::TBenchmarkScanRange>,
+            ),
+            None::<i32>,
+            Some(false),
+            Some(false),
+        )
+    }
+
+    #[test]
+    fn bind_scan_ranges_to_target_positions_collapses_split_ranges_for_position_bound_file() {
+        let matched_file = "s3://bucket/table/data-1.parquet";
+        let mut ranges = vec![
+            hdfs_scan_range_params(matched_file, 0, 64, 128),
+            hdfs_scan_range_params(matched_file, 64, 64, 128),
+            hdfs_scan_range_params("s3://bucket/table/data-2.parquet", 0, 128, 128),
+        ];
+        let positions_by_file =
+            std::collections::BTreeMap::from([(matched_file.to_string(), vec![3_i64, 9_i64])]);
+        let mut matched_files = std::collections::BTreeSet::new();
+
+        super::bind_scan_ranges_to_target_positions(
+            &mut ranges,
+            &positions_by_file,
+            &mut matched_files,
+        );
+
+        assert_eq!(ranges.len(), 1);
+        let hdfs_range = ranges[0]
+            .scan_range
+            .hdfs_scan_range
+            .as_ref()
+            .expect("hdfs scan range");
+        assert_eq!(hdfs_range.full_path.as_deref(), Some(matched_file));
+        assert_eq!(hdfs_range.offset, Some(0));
+        assert_eq!(hdfs_range.length, Some(128));
+        assert_eq!(hdfs_range.included_positions, Some(vec![3_i64, 9_i64]));
+        assert!(matched_files.contains(matched_file));
     }
 
     #[test]

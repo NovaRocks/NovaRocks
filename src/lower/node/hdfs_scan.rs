@@ -978,6 +978,7 @@ pub(crate) fn lower_hdfs_scan_node(
                 first_row_id,
                 data_sequence_number,
                 ivm_change_op,
+                included_positions: hdfs_range.included_positions.clone(),
                 external_datacache: external_datacache.clone(),
                 delete_files: iceberg_delete_files.clone(),
             });
@@ -1005,6 +1006,7 @@ pub(crate) fn lower_hdfs_scan_node(
                 first_row_id,
                 data_sequence_number,
                 ivm_change_op,
+                included_positions: hdfs_range.included_positions.clone(),
                 external_datacache,
                 delete_files: iceberg_delete_files,
             });
@@ -1364,6 +1366,7 @@ mod tests {
             first_row_id: None,
             data_sequence_number: None,
             ivm_change_op: None,
+            included_positions: None,
             external_datacache: None,
             delete_files: vec![],
         }];

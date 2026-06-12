@@ -353,6 +353,7 @@ pub(crate) fn build_hdfs_scan_range_params_for_file(
                 file.first_row_id,
                 file.data_sequence_number,
                 file.ivm_change_op,
+                file.included_positions.as_ref(),
                 change_op_slot,
                 &file.delete_files,
             )
@@ -365,6 +366,7 @@ fn plan_hdfs_file_splits(file: &IcebergDataFileInfo) -> Vec<(i64, i64)> {
     if file_len <= ICEBERG_SCAN_SPLIT_TARGET_BYTES
         || file.first_row_id.is_some()
         || !file.delete_files.is_empty()
+        || file.included_positions.is_some()
     {
         return vec![(0, file_len)];
     }
@@ -423,6 +425,7 @@ pub(crate) fn build_hdfs_scan_range_params(
     first_row_id: Option<i64>,
     data_sequence_number: Option<i64>,
     ivm_change_op: Option<i8>,
+    included_positions: Option<&Vec<i64>>,
     change_op_slot: Option<types::TSlotId>,
     delete_files: &[IcebergDeleteFileInfo],
 ) -> Result<internal_service::TScanRangeParams, String> {
@@ -529,6 +532,7 @@ pub(crate) fn build_hdfs_scan_range_params(
         None::<i32>,
         first_row_id,
         data_sequence_number,
+        included_positions.cloned(),
     );
 
     Ok(internal_service::TScanRangeParams::new(
@@ -586,6 +590,7 @@ mod tests {
             first_row_id: None,
             data_sequence_number: None,
             ivm_change_op: None,
+            included_positions: None,
             delete_files: vec![],
             manifest_path: None,
             partition_values: vec![],
@@ -618,6 +623,7 @@ mod tests {
             first_row_id: None,
             data_sequence_number: None,
             ivm_change_op: None,
+            included_positions: None,
             delete_files: vec![],
             manifest_path: None,
             partition_values: vec![],
@@ -736,6 +742,25 @@ mod tests {
             err.contains("Iceberg current-snapshot scan ice.db.t requires a catalog registry"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn position_bound_file_carries_included_positions_without_splitting() {
+        let mut file = dummy_iceberg_file();
+        file.size = ICEBERG_SCAN_SPLIT_TARGET_BYTES + 1;
+        file.included_positions = Some(vec![3, 9, 11]);
+
+        let ranges = build_hdfs_scan_range_params_for_file(&file, None).expect("scan ranges");
+
+        assert_eq!(ranges.len(), 1);
+        let hdfs_range = ranges[0]
+            .scan_range
+            .hdfs_scan_range
+            .as_ref()
+            .expect("hdfs scan range");
+        assert_eq!(hdfs_range.offset, Some(0));
+        assert_eq!(hdfs_range.length, Some(file.size));
+        assert_eq!(hdfs_range.included_positions, Some(vec![3, 9, 11]));
     }
 
     #[test]

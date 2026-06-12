@@ -306,6 +306,7 @@ impl ScanOp for FileLoadScanOp {
                 first_row_id: r.first_row_id,
                 data_sequence_number: r.data_sequence_number,
                 ivm_change_op: r.ivm_change_op,
+                included_positions: r.included_positions.clone(),
                 external_datacache: r.external_datacache.clone(),
                 delete_files: r.delete_files.clone(),
             });
@@ -491,6 +492,7 @@ pub(crate) fn lower_file_scan_node(
                 first_row_id: None,
                 data_sequence_number: None,
                 ivm_change_op: None,
+                included_positions: None,
                 external_datacache: None,
                 delete_files: Vec::new(),
             });

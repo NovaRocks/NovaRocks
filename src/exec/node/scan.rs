@@ -47,6 +47,7 @@ pub enum ScanMorsel {
         /// None for non-row-lineage scans.
         data_sequence_number: Option<i64>,
         ivm_change_op: Option<i8>,
+        included_positions: Option<Vec<i64>>,
         external_datacache: Option<ExternalDataCacheRangeOptions>,
         /// Iceberg v2 position-delete files that apply to this data file.
         /// Empty for append-only tables and for v1 scans.
@@ -79,10 +80,11 @@ impl ScanMorsel {
                 first_row_id,
                 data_sequence_number,
                 ivm_change_op,
+                included_positions,
                 external_datacache,
                 delete_files,
             } => format!(
-                "path={} file_len={} offset={} length={} scan_range_id={} first_row_id={:?} data_sequence_number={:?} ivm_change_op={:?} external_datacache={:?} delete_files={}",
+                "path={} file_len={} offset={} length={} scan_range_id={} first_row_id={:?} data_sequence_number={:?} ivm_change_op={:?} included_positions={} external_datacache={:?} delete_files={}",
                 path,
                 file_len,
                 offset,
@@ -91,6 +93,7 @@ impl ScanMorsel {
                 first_row_id,
                 data_sequence_number,
                 ivm_change_op,
+                included_positions.as_ref().map(|v| v.len()).unwrap_or(0),
                 external_datacache,
                 delete_files.len()
             ),

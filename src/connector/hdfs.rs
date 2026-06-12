@@ -135,6 +135,7 @@ impl ScanOp for HdfsScanOp {
             first_row_id,
             data_sequence_number,
             ivm_change_op,
+            included_positions,
             external_datacache,
             delete_files,
         } = morsel
@@ -150,6 +151,7 @@ impl ScanOp for HdfsScanOp {
             first_row_id,
             data_sequence_number,
             ivm_change_op,
+            included_positions,
             external_datacache: external_datacache.clone(),
             delete_files,
         }];
@@ -199,6 +201,7 @@ impl ScanOp for HdfsScanOp {
                 first_row_id: r.first_row_id,
                 data_sequence_number: r.data_sequence_number,
                 ivm_change_op: r.ivm_change_op,
+                included_positions: r.included_positions.clone(),
                 external_datacache: r.external_datacache.clone(),
                 delete_files: r.delete_files.clone(),
             });
@@ -322,6 +325,7 @@ impl ScanOp for HdfsScanOp {
                 first_row_id,
                 data_sequence_number,
                 ivm_change_op,
+                included_positions: None,
                 external_datacache: build_external_datacache_options(hdfs_range),
                 delete_files,
             });
@@ -372,6 +376,7 @@ impl ScanOp for HdfsScanOp {
             first_row_id: None,
             data_sequence_number: None,
             ivm_change_op: None,
+            included_positions: None,
             external_datacache: None,
             delete_files: Vec::new(),
         });
@@ -385,6 +390,7 @@ impl ScanOp for HdfsScanOp {
                 first_row_id: None,
                 data_sequence_number: None,
                 ivm_change_op: None,
+                included_positions: None,
                 external_datacache: None,
                 delete_files: Vec::new(),
             });
@@ -452,6 +458,7 @@ impl ScanOp for HdfsScanOp {
             first_row_id: None,
             data_sequence_number: None,
             ivm_change_op: None,
+            included_positions: None,
             external_datacache: None,
             delete_files: Vec::new(),
         });
@@ -465,6 +472,7 @@ impl ScanOp for HdfsScanOp {
                 first_row_id: None,
                 data_sequence_number: None,
                 ivm_change_op: None,
+                included_positions: None,
                 external_datacache: None,
                 delete_files: Vec::new(),
             });
@@ -628,6 +636,7 @@ mod tests {
             None::<i32>,
             first_row_id,
             None::<i64>, // data_sequence_number: not set in test helper
+            None::<Vec<i64>>,
         );
         internal_service::TScanRangeParams::new(
             plan_nodes::TScanRange::new(
@@ -758,6 +767,7 @@ mod tests {
                 first_row_id: Some(10),
                 data_sequence_number: None,
                 ivm_change_op: None,
+                included_positions: None,
                 external_datacache: None,
                 delete_files: Vec::new(),
             }],
@@ -878,6 +888,7 @@ mod tests {
                     first_row_id: None,
                     data_sequence_number: None,
                     ivm_change_op: None,
+                    included_positions: None,
                     external_datacache: None,
                     delete_files: Vec::new(),
                 },
@@ -890,6 +901,7 @@ mod tests {
                     first_row_id: None,
                     data_sequence_number: None,
                     ivm_change_op: None,
+                    included_positions: None,
                     external_datacache: None,
                     delete_files: Vec::new(),
                 },
@@ -902,6 +914,7 @@ mod tests {
                     first_row_id: None,
                     data_sequence_number: None,
                     ivm_change_op: None,
+                    included_positions: None,
                     external_datacache: None,
                     delete_files: Vec::new(),
                 },

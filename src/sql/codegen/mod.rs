@@ -31,6 +31,7 @@ pub(crate) type FragmentId = u32;
 // Public types
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub(crate) enum DirectExecPlan {
     AggregateStateMerge {
         old_input: Box<PlanBuildResult>,
@@ -38,6 +39,7 @@ pub(crate) enum DirectExecPlan {
         layout: crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
         branch_id: Option<i32>,
         pruning_limits: crate::engine::mv::refresh_context::MvRefreshPruningLimits,
+        target_position_locator: Option<AggregateStateTargetPositionLocator>,
     },
     AggregateStatePhysicalize {
         input: Box<PlanBuildResult>,
@@ -48,6 +50,16 @@ pub(crate) enum DirectExecPlan {
     },
 }
 
+#[derive(Clone)]
+pub(crate) struct AggregateStateTargetPositionLocator {
+    pub(crate) target_entry:
+        std::sync::Arc<crate::connector::iceberg::catalog::registry::IcebergCatalogEntry>,
+    pub(crate) target_table: iceberg::table::Table,
+    pub(crate) partition_filter: crate::engine::mv::partition::TargetPartitionFilter,
+    pub(crate) apply_key_column: String,
+}
+
+#[derive(Clone)]
 pub(crate) struct PlanBuildResult {
     pub plan: plan_nodes::TPlan,
     pub desc_tbl: thrift_descriptors::TDescriptorTable,

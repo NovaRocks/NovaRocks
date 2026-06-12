@@ -674,6 +674,7 @@ pub(crate) fn data_file_with_stats_to_iceberg_data_file_info(
         first_row_id: file.first_row_id,
         data_sequence_number: file.data_sequence_number,
         ivm_change_op: None,
+        included_positions: None,
         delete_files: file.delete_files,
         manifest_path: file.manifest_path,
         partition_values: file.partition_field_values,

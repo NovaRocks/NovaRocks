@@ -169,6 +169,7 @@ pub(super) struct ScanAsyncRunner {
     lake_row_position_state: Option<LakeRowPositionState>,
     iceberg_virtual_state: Option<IcebergVirtualState>,
     iceberg_delete_filter_state: Option<IcebergDeleteFilterState>,
+    iceberg_include_position_filter_state: Option<IcebergIncludePositionFilterState>,
 }
 
 struct RowPositionState {
@@ -223,6 +224,11 @@ struct IcebergVirtualState {
 struct IcebergDeleteFilterState {
     deleted: RoaringTreemap,
     equality_deletes: Vec<EqualityDeleteSet>,
+    next_row_offset: i64,
+}
+
+struct IcebergIncludePositionFilterState {
+    included: RoaringTreemap,
     next_row_offset: i64,
 }
 
@@ -353,6 +359,7 @@ impl ScanAsyncRunner {
             lake_row_position_state: None,
             iceberg_virtual_state: None,
             iceberg_delete_filter_state: None,
+            iceberg_include_position_filter_state: None,
         }
     }
 
@@ -462,6 +469,7 @@ impl ScanAsyncRunner {
                     self.lake_row_position_state = None;
                     self.iceberg_virtual_state = None;
                     self.iceberg_delete_filter_state = None;
+                    self.iceberg_include_position_filter_state = None;
                     self.last_progress = Instant::now();
                     return Ok(None);
                 };
@@ -471,6 +479,8 @@ impl ScanAsyncRunner {
                 self.iceberg_virtual_state = self.build_iceberg_virtual_state(&morsel)?;
                 self.iceberg_delete_filter_state =
                     self.build_iceberg_delete_filter_state(&morsel)?;
+                self.iceberg_include_position_filter_state =
+                    self.build_iceberg_include_position_filter_state(&morsel);
                 let start = Instant::now();
                 self.morsel_iter = Some(
                     self.scan
@@ -498,6 +508,11 @@ impl ScanAsyncRunner {
                     );
                     let Some((chunk, kept_positions)) =
                         self.apply_iceberg_position_delete_filter(chunk)?
+                    else {
+                        continue;
+                    };
+                    let Some((chunk, kept_positions)) =
+                        self.apply_iceberg_include_position_filter(chunk, kept_positions)?
                     else {
                         continue;
                     };
@@ -552,6 +567,7 @@ impl ScanAsyncRunner {
                     self.lake_row_position_state = None;
                     self.iceberg_virtual_state = None;
                     self.iceberg_delete_filter_state = None;
+                    self.iceberg_include_position_filter_state = None;
                     self.last_progress = Instant::now();
                     continue;
                 }
@@ -676,6 +692,29 @@ impl ScanAsyncRunner {
         }))
     }
 
+    fn build_iceberg_include_position_filter_state(
+        &self,
+        morsel: &ScanMorsel,
+    ) -> Option<IcebergIncludePositionFilterState> {
+        let ScanMorsel::FileRange {
+            included_positions, ..
+        } = morsel
+        else {
+            return None;
+        };
+        let positions = included_positions.as_ref()?;
+        let mut included = RoaringTreemap::new();
+        for pos in positions {
+            if *pos >= 0 {
+                included.insert(*pos as u64);
+            }
+        }
+        Some(IcebergIncludePositionFilterState {
+            included,
+            next_row_offset: 0,
+        })
+    }
+
     /// Apply Iceberg v2 merge-on-read filtering to the materialized chunk.
     ///
     /// Returns:
@@ -749,6 +788,22 @@ impl ScanAsyncRunner {
             Chunk::new_like(filtered_batch, &chunk),
             Some(kept_positions),
         )))
+    }
+
+    fn apply_iceberg_include_position_filter(
+        &mut self,
+        chunk: Chunk,
+        kept_positions: Option<Vec<i64>>,
+    ) -> Result<Option<PositionedChunk>, String> {
+        let Some(state) = self.iceberg_include_position_filter_state.as_mut() else {
+            return Ok(Some((chunk, kept_positions)));
+        };
+        apply_iceberg_include_position_filter(
+            chunk,
+            &state.included,
+            &mut state.next_row_offset,
+            kept_positions.as_deref(),
+        )
     }
 
     fn append_iceberg_virtual_columns(
@@ -1422,6 +1477,62 @@ impl ScanAsyncRunner {
     }
 }
 
+fn apply_iceberg_include_position_filter(
+    chunk: Chunk,
+    included: &RoaringTreemap,
+    next_row_offset: &mut i64,
+    kept_positions: Option<&[i64]>,
+) -> Result<Option<PositionedChunk>, String> {
+    let row_count = chunk.len();
+    if row_count == 0 {
+        return Ok(Some((
+            chunk,
+            kept_positions.map(std::borrow::ToOwned::to_owned),
+        )));
+    }
+
+    let positions = if let Some(positions) = kept_positions {
+        if positions.len() != row_count {
+            return Err(format!(
+                "iceberg include-position filter positions length {} does not match chunk rows {}",
+                positions.len(),
+                row_count
+            ));
+        }
+        positions.to_vec()
+    } else {
+        let start = *next_row_offset;
+        *next_row_offset = next_row_offset.saturating_add(row_count as i64);
+        (0..row_count as i64)
+            .map(|offset| start + offset)
+            .collect::<Vec<_>>()
+    };
+
+    let mut mask_values = Vec::with_capacity(row_count);
+    let mut included_positions = Vec::new();
+    for pos in positions {
+        let keep = pos >= 0 && included.contains(pos as u64);
+        mask_values.push(keep);
+        if keep {
+            included_positions.push(pos);
+        }
+    }
+    if included_positions.is_empty() {
+        return Ok(None);
+    }
+    if included_positions.len() == row_count {
+        return Ok(Some((chunk, Some(included_positions))));
+    }
+
+    let mask = BooleanArray::from(mask_values);
+    let filtered_batch = filter_record_batch(&chunk.batch, &mask)
+        .map_err(|e| format!("iceberg include-position filter failed: {e}"))?;
+    Ok(Some((
+        Chunk::new_like(filtered_batch, &chunk),
+        Some(included_positions),
+    )))
+}
+
 /// Run one scan worker loop that executes dispatched morsels and pushes produced chunks.
 pub(super) fn run_scan_worker(
     state: Arc<ScanAsyncState>,
@@ -1799,6 +1910,7 @@ mod tests {
                     first_row_id: None,
                     data_sequence_number: None,
                     ivm_change_op: self.ivm_change_op,
+                    included_positions: None,
                     external_datacache: None,
                     delete_files: Vec::new(),
                 }],
@@ -1820,6 +1932,69 @@ mod tests {
             .expect("chunk schema");
             Chunk::new_with_chunk_schema(batch, chunk_schema)
         }
+    }
+
+    fn int32_chunk(values: Vec<i32>) -> Chunk {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let array = Arc::new(Int32Array::from(values)) as arrow::array::ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![array]).expect("build test batch");
+        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(1)],
+        )
+        .expect("chunk schema");
+        Chunk::new_with_chunk_schema(batch, chunk_schema)
+    }
+
+    #[test]
+    fn include_position_filter_keeps_requested_positions() {
+        let chunk = int32_chunk(vec![10, 11, 12, 13]);
+        let mut included = RoaringTreemap::new();
+        included.insert(1);
+        included.insert(3);
+        let mut next_row_offset = 0;
+
+        let (filtered, positions) =
+            apply_iceberg_include_position_filter(chunk, &included, &mut next_row_offset, None)
+                .expect("include filter")
+                .expect("some rows survive");
+
+        let values = filtered
+            .batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int32 values");
+        assert_eq!(values.values(), &[11, 13]);
+        assert_eq!(positions, Some(vec![1, 3]));
+        assert_eq!(next_row_offset, 4);
+    }
+
+    #[test]
+    fn include_position_filter_intersects_existing_kept_positions() {
+        let chunk = int32_chunk(vec![10, 11, 12]);
+        let mut included = RoaringTreemap::new();
+        included.insert(8);
+        let mut next_row_offset = 0;
+
+        let (filtered, positions) = apply_iceberg_include_position_filter(
+            chunk,
+            &included,
+            &mut next_row_offset,
+            Some(&[5, 8, 12]),
+        )
+        .expect("include filter")
+        .expect("some rows survive");
+
+        let values = filtered
+            .batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int32 values");
+        assert_eq!(values.values(), &[11]);
+        assert_eq!(positions, Some(vec![8]));
+        assert_eq!(next_row_offset, 0);
     }
 
     #[test]

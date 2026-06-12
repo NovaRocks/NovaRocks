@@ -974,6 +974,15 @@ impl<'a> PlanFragmentBuilder<'a> {
         let pruning_limits = mv_refresh_ctx
             .map(|ctx| ctx.pruning_limits)
             .unwrap_or_default();
+        let target_position_locator =
+            mv_refresh_ctx.map(
+                |ctx| crate::sql::codegen::AggregateStateTargetPositionLocator {
+                    target_entry: std::sync::Arc::clone(&ctx.target_entry),
+                    target_table: ctx.target_table.clone(),
+                    partition_filter: ctx.affected_partitions_to_target_partition_filter(),
+                    apply_key_column: layout.row_id_column.column.name.clone(),
+                },
+            );
         let fragment = FragmentBuildResult {
             fragment_id: 0,
             plan: plan_nodes::TPlan::new(Vec::new()),
@@ -988,6 +997,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                 layout,
                 branch_id,
                 pruning_limits,
+                target_position_locator,
             })),
             cte_id: None,
             cte_exchange_nodes: Vec::new(),
@@ -6417,6 +6427,7 @@ mod tests {
             first_row_id: None,
             data_sequence_number: Some(1),
             ivm_change_op: None,
+            included_positions: None,
             delete_files: vec![],
             manifest_path: None,
             partition_values: vec![],
@@ -6434,6 +6445,7 @@ mod tests {
             first_row_id: None,
             data_sequence_number: Some(1),
             ivm_change_op: None,
+            included_positions: None,
             delete_files: vec![],
             manifest_path: Some(format!("manifest-{id}.avro")),
             partition_values: vec![IcebergPartitionFieldValue {
@@ -6504,6 +6516,7 @@ mod tests {
                     first_row_id: None,
                     data_sequence_number: Some(1),
                     ivm_change_op: None,
+                    included_positions: None,
                     delete_files,
                     manifest_path: None,
                     partition_values: vec![],
@@ -6742,6 +6755,7 @@ mod tests {
                 first_row_id: None,
                 data_sequence_number: Some(1),
                 ivm_change_op: None,
+                included_positions: None,
                 delete_files: vec![equality_delete_file(
                     vec!["category".to_string()],
                     Vec::new(),
@@ -6788,6 +6802,7 @@ mod tests {
                             first_row_id: None,
                             data_sequence_number: None,
                             ivm_change_op: None,
+                            included_positions: None,
                             delete_files: Vec::new(),
                             manifest_path: None,
                             partition_values: Vec::new(),

@@ -34,6 +34,9 @@ pub struct FileScanRange {
     /// None for non-row-lineage scans.
     pub data_sequence_number: Option<i64>,
     pub ivm_change_op: Option<i8>,
+    /// Optional absolute row positions to include from this data-file range.
+    /// Positions use the same `_pos` coordinate as Iceberg position deletes.
+    pub included_positions: Option<Vec<i64>>,
     pub external_datacache: Option<ExternalDataCacheRangeOptions>,
     /// Iceberg delete files attached to this data-file range. Empty for v1 or
     /// append-only scans. Populated by HDFS scan lowering and standalone

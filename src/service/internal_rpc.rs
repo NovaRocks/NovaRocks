@@ -733,6 +733,7 @@ mod tests {
                     first_row_id: Some(0),
                     data_sequence_number: None,
                     ivm_change_op: None,
+                    included_positions: None,
                     external_datacache: None,
                     delete_files: Vec::new(),
                 }],

@@ -2175,6 +2175,7 @@ mod tests {
                 first_row_id: None,
                 data_sequence_number: None,
                 ivm_change_op: None,
+                included_positions: None,
                 external_datacache: None,
                 delete_files: Vec::new(),
             }],

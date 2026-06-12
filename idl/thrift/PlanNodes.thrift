@@ -468,6 +468,11 @@ struct THdfsScanRange {
     // records for a given row.  Populated by the NovaRocks iceberg connector
     // codegen path (standalone SQL); the FE does not set this field.
     38: optional i64 data_sequence_number;
+
+    // Optional absolute Iceberg data-file row positions that this range should
+    // include. Used by standalone MV refresh when target-state locator output
+    // can reduce an old-state read to exact matched positions.
+    39: optional list<i64> included_positions;
 }
 
 struct TBinlogScanRange {

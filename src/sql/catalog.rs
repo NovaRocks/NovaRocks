@@ -241,6 +241,9 @@ pub struct IcebergDataFileInfo {
     pub data_sequence_number: Option<i64>,
     /// IVM delta source tag for this file/range. None for ordinary scans.
     pub ivm_change_op: Option<i8>,
+    /// Optional absolute data-file row positions to include when scanning this
+    /// file. None means scan the whole selected file range.
+    pub included_positions: Option<Vec<i64>>,
     /// Iceberg position-delete / Puffin deletion-vector files that apply to
     /// this data file. Empty for append-only snapshots and non-Iceberg scans.
     pub delete_files: Vec<IcebergDeleteFileInfo>,

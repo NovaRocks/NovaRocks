@@ -531,6 +531,7 @@ mod tests {
                         first_row_id: None,
                         data_sequence_number: None,
                         ivm_change_op: None,
+                        included_positions: None,
                         delete_files: vec![],
                         manifest_path: None,
                         partition_values: vec![],

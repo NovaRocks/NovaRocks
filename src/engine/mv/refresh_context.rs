@@ -995,6 +995,58 @@ impl IcebergMvRefreshContext {
     }
 }
 
+pub(crate) fn bind_target_state_file_positions(
+    mut source: ScanSource,
+    matched_positions: &[crate::engine::mv::iceberg_target_apply::TargetRowPositionSet],
+    target: &str,
+) -> Result<ScanSource, String> {
+    let ScanSource::IcebergDataFiles { files, .. } = &mut source else {
+        return Err(format!(
+            "Iceberg target-state position binding for {target} requires IcebergDataFiles source"
+        ));
+    };
+
+    if matched_positions.is_empty() {
+        files.clear();
+        return Ok(source);
+    }
+
+    let mut by_file = BTreeMap::<String, Vec<i64>>::new();
+    for set in matched_positions {
+        if set.positions.is_empty() {
+            continue;
+        }
+        by_file
+            .entry(set.referenced_data_file.clone())
+            .or_default()
+            .extend(set.positions.iter().copied());
+    }
+    for positions in by_file.values_mut() {
+        positions.sort_unstable();
+        positions.dedup();
+    }
+    if by_file.is_empty() {
+        files.clear();
+        return Ok(source);
+    }
+
+    let mut bound_files = Vec::new();
+    for mut file in std::mem::take(files) {
+        if let Some(positions) = by_file.remove(&file.path) {
+            file.included_positions = Some(positions);
+            bound_files.push(file);
+        }
+    }
+    if !by_file.is_empty() {
+        let missing = by_file.keys().cloned().collect::<Vec<_>>().join(", ");
+        return Err(format!(
+            "Iceberg target-state scan {target} locator returned positions for files not present in scan source: [{missing}]"
+        ));
+    }
+    *files = bound_files;
+    Ok(source)
+}
+
 fn validate_target_state_branch_scope(
     scan: &IcebergMvTargetStateScan,
     scope: Option<&crate::sql::catalog::BranchScope>,
@@ -1225,6 +1277,7 @@ fn data_file_with_stats_to_info(
         first_row_id: file.first_row_id,
         data_sequence_number: file.data_sequence_number,
         ivm_change_op: None,
+        included_positions: None,
         delete_files: file.delete_files,
         manifest_path: file.manifest_path,
         partition_values: file.partition_field_values,
@@ -2306,6 +2359,116 @@ mod tests {
             cloud.get("aws.s3.endpoint").map(String::as_str),
             Some("base-endpoint")
         );
+    }
+
+    fn target_state_source_for_binding_test() -> ScanSource {
+        ScanSource::IcebergDataFiles {
+            table: IcebergTableInfo {
+                catalog: "tgt".to_string(),
+                namespace: "db".to_string(),
+                table: "mv".to_string(),
+                table_uuid: Some("uuid-tgt".to_string()),
+                current_snapshot_id: Some(99),
+                schema_id: 1,
+                location: "s3://bucket/mv".to_string(),
+                schema: IcebergSchemaDef { fields: Vec::new() },
+                serialized_metadata: None,
+                serialized_metadata_rows: None,
+            },
+            files: vec![
+                IcebergDataFileInfo {
+                    path: "s3://bucket/mv/data-a.parquet".to_string(),
+                    size: 10,
+                    row_count: Some(10),
+                    column_stats: None,
+                    partition_spec_id: None,
+                    partition_key: None,
+                    first_row_id: None,
+                    data_sequence_number: None,
+                    ivm_change_op: None,
+                    included_positions: None,
+                    delete_files: Vec::new(),
+                    manifest_path: None,
+                    partition_values: Vec::new(),
+                },
+                IcebergDataFileInfo {
+                    path: "s3://bucket/mv/data-b.parquet".to_string(),
+                    size: 20,
+                    row_count: Some(20),
+                    column_stats: None,
+                    partition_spec_id: None,
+                    partition_key: None,
+                    first_row_id: None,
+                    data_sequence_number: None,
+                    ivm_change_op: None,
+                    included_positions: None,
+                    delete_files: Vec::new(),
+                    manifest_path: None,
+                    partition_values: Vec::new(),
+                },
+            ],
+            cloud_properties: BTreeMap::new(),
+            binding: crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles,
+        }
+    }
+
+    #[test]
+    fn bind_target_state_file_positions_keeps_only_matched_files() {
+        let positions = vec![
+            crate::engine::mv::iceberg_target_apply::TargetRowPositionSet {
+                referenced_data_file: "s3://bucket/mv/data-b.parquet".to_string(),
+                positions: vec![2, 8, 13],
+            },
+        ];
+
+        let source = bind_target_state_file_positions(
+            target_state_source_for_binding_test(),
+            &positions,
+            "tgt.db.mv",
+        )
+        .expect("bind positions");
+
+        let ScanSource::IcebergDataFiles { files, .. } = source else {
+            panic!("expected IcebergDataFiles");
+        };
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "s3://bucket/mv/data-b.parquet");
+        assert_eq!(files[0].included_positions, Some(vec![2, 8, 13]));
+    }
+
+    #[test]
+    fn bind_target_state_file_positions_empty_matches_returns_empty_source() {
+        let source = bind_target_state_file_positions(
+            target_state_source_for_binding_test(),
+            &[],
+            "tgt.db.mv",
+        )
+        .expect("bind empty positions");
+
+        let ScanSource::IcebergDataFiles { files, .. } = source else {
+            panic!("expected IcebergDataFiles");
+        };
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn bind_target_state_file_positions_rejects_missing_files() {
+        let positions = vec![
+            crate::engine::mv::iceberg_target_apply::TargetRowPositionSet {
+                referenced_data_file: "s3://bucket/mv/missing.parquet".to_string(),
+                positions: vec![1],
+            },
+        ];
+
+        let err = bind_target_state_file_positions(
+            target_state_source_for_binding_test(),
+            &positions,
+            "tgt.db.mv",
+        )
+        .expect_err("missing target file should fail");
+
+        assert!(err.contains("locator returned positions for files not present"));
+        assert!(err.contains("s3://bucket/mv/missing.parquet"));
     }
 
     #[test]
