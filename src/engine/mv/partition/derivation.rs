@@ -293,6 +293,35 @@ pub(crate) fn bind_spec_to_aggregate_layout(
     Ok(bound)
 }
 
+/// Bind a resolved spec to target-visible output column names. This is used by
+/// merge-sink consumers, where the signed change batch already has target
+/// output columns rather than an aggregate layout.
+pub(crate) fn bind_spec_to_target_visible_columns(
+    spec: &PartitionDerivationSpec,
+    contract: &MvSchemaContract,
+) -> Result<Vec<BoundPartitionField>, AffectedPartitionError> {
+    let mut bound = Vec::with_capacity(spec.fields.len());
+    for field in &spec.fields {
+        let column = contract
+            .target
+            .visible_columns
+            .get(field.output_index)
+            .ok_or_else(|| AffectedPartitionError::GroupKeyColumnMissing {
+                field: field.partition_field_name.clone(),
+                reason: format!(
+                    "target contract has no visible column for output index {}",
+                    field.output_index
+                ),
+            })?;
+        bound.push(BoundPartitionField {
+            partition_field_name: field.partition_field_name.clone(),
+            column_name: column.output_name.clone(),
+            transform: field.transform,
+        });
+    }
+    Ok(bound)
+}
+
 /// Mechanically evaluate bound partition fields over delta chunks: apply each
 /// field's Iceberg transform to its source column, then build one
 /// `MvPartitionKey` per row, deduplicated into a sorted set. This is the
@@ -306,57 +335,78 @@ pub(crate) fn evaluate_partition_spec(
     let mut partitions: BTreeSet<MvPartitionKey> = BTreeSet::new();
 
     for chunk in delta_chunks {
-        if chunk.batch.num_rows() == 0 {
-            continue;
-        }
-
-        let mut transformed: Vec<arrow::array::ArrayRef> = Vec::with_capacity(bound_fields.len());
-        for field in bound_fields {
-            let col_index = chunk
-                .batch
-                .schema()
-                .index_of(&field.column_name)
-                .map_err(|e| AffectedPartitionError::GroupKeyColumnMissing {
-                    field: field.partition_field_name.clone(),
-                    reason: format!("delta chunk is missing column `{}`: {e}", field.column_name),
-                })?;
-            let array = chunk.batch.column(col_index).clone();
-            let xform =
-                iceberg::transform::create_transform_function(&field.transform).map_err(|e| {
-                    AffectedPartitionError::TransformFailed {
-                        field: field.partition_field_name.clone(),
-                        source: e.to_string(),
-                    }
-                })?;
-            let out =
-                xform
-                    .transform(array)
-                    .map_err(|e| AffectedPartitionError::TransformFailed {
-                        field: field.partition_field_name.clone(),
-                        source: e.to_string(),
-                    })?;
-            transformed.push(out);
-        }
-
-        let row_count = chunk.batch.num_rows();
-        for row in 0..row_count {
-            let mut fields = Vec::with_capacity(bound_fields.len());
-            for (bound_field, array) in bound_fields.iter().zip(transformed.iter()) {
-                let value = arrow_array_row_to_partition_value(
-                    array.as_ref(),
-                    row,
-                    &bound_field.partition_field_name,
-                )?;
-                fields.push(MvPartitionKeyField::new(
-                    bound_field.partition_field_name.clone(),
-                    value,
-                ));
-            }
-            partitions.insert(MvPartitionKey::new(target_spec_id, fields));
-        }
+        evaluate_partition_record_batch_into(
+            target_spec_id,
+            bound_fields,
+            &chunk.batch,
+            &mut partitions,
+        )?;
     }
 
     Ok(partitions)
+}
+
+pub(crate) fn evaluate_partition_spec_record_batch(
+    target_spec_id: i32,
+    bound_fields: &[BoundPartitionField],
+    batch: &arrow::record_batch::RecordBatch,
+) -> Result<BTreeSet<MvPartitionKey>, AffectedPartitionError> {
+    let mut partitions: BTreeSet<MvPartitionKey> = BTreeSet::new();
+    evaluate_partition_record_batch_into(target_spec_id, bound_fields, batch, &mut partitions)?;
+    Ok(partitions)
+}
+
+fn evaluate_partition_record_batch_into(
+    target_spec_id: i32,
+    bound_fields: &[BoundPartitionField],
+    batch: &arrow::record_batch::RecordBatch,
+    partitions: &mut BTreeSet<MvPartitionKey>,
+) -> Result<(), AffectedPartitionError> {
+    if batch.num_rows() == 0 {
+        return Ok(());
+    }
+
+    let mut transformed: Vec<arrow::array::ArrayRef> = Vec::with_capacity(bound_fields.len());
+    for field in bound_fields {
+        let col_index = batch.schema().index_of(&field.column_name).map_err(|e| {
+            AffectedPartitionError::GroupKeyColumnMissing {
+                field: field.partition_field_name.clone(),
+                reason: format!("delta chunk is missing column `{}`: {e}", field.column_name),
+            }
+        })?;
+        let array = batch.column(col_index).clone();
+        let xform =
+            iceberg::transform::create_transform_function(&field.transform).map_err(|e| {
+                AffectedPartitionError::TransformFailed {
+                    field: field.partition_field_name.clone(),
+                    source: e.to_string(),
+                }
+            })?;
+        let out = xform
+            .transform(array)
+            .map_err(|e| AffectedPartitionError::TransformFailed {
+                field: field.partition_field_name.clone(),
+                source: e.to_string(),
+            })?;
+        transformed.push(out);
+    }
+
+    for row in 0..batch.num_rows() {
+        let mut fields = Vec::with_capacity(bound_fields.len());
+        for (bound_field, array) in bound_fields.iter().zip(transformed.iter()) {
+            let value = arrow_array_row_to_partition_value(
+                array.as_ref(),
+                row,
+                &bound_field.partition_field_name,
+            )?;
+            fields.push(MvPartitionKeyField::new(
+                bound_field.partition_field_name.clone(),
+                value,
+            ));
+        }
+        partitions.insert(MvPartitionKey::new(target_spec_id, fields));
+    }
+    Ok(())
 }
 
 fn arrow_array_row_to_partition_value(
@@ -1070,6 +1120,48 @@ mod tests {
             err,
             AffectedPartitionError::OutputLineageNotPureColumn { ref field } if field == "region"
         ));
+    }
+
+    #[test]
+    fn bind_spec_to_target_visible_columns_uses_target_output_names() {
+        let contract =
+            count_contract_with_partition("region", MvPartitionTransformContract::Identity, 11);
+        let spec = resolve_partition_derivation_spec(&contract)
+            .expect("resolve")
+            .expect("partitioned");
+        let bound = bind_spec_to_target_visible_columns(&spec, &contract).expect("bind");
+
+        assert_eq!(bound.len(), 1);
+        assert_eq!(bound[0].partition_field_name, "region");
+        assert_eq!(bound[0].column_name, "region");
+    }
+
+    #[test]
+    fn evaluate_partition_spec_record_batch_dedupes_delete_rows() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let contract =
+            count_contract_with_partition("region", MvPartitionTransformContract::Identity, 11);
+        let spec = resolve_partition_derivation_spec(&contract)
+            .expect("resolve")
+            .expect("partitioned");
+        let bound = bind_spec_to_target_visible_columns(&spec, &contract).expect("bind");
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("region", DataType::Utf8, false)])),
+            vec![Arc::new(StringArray::from(vec!["west", "east", "west"]))],
+        )
+        .expect("batch");
+
+        let partitions =
+            evaluate_partition_spec_record_batch(spec.target_spec_id, &bound, &batch)
+                .expect("evaluate");
+
+        assert_eq!(
+            partitions.into_iter().collect::<Vec<_>>(),
+            vec![key("east"), key("west")]
+        );
     }
 
     // --- End-to-end derivation behavior-lock tests -------------------------
