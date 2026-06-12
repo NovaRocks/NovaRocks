@@ -442,9 +442,105 @@ fn find_or_create_slot(
     factory: &mut ColumnRefFactory,
 ) -> Option<TypedExpr> {
     match plan {
-        LogicalPlan::Scan(scan) => find_or_create_slot_on_scan(scan, request, factory),
-        LogicalPlan::Filter(node) => find_or_create_slot(&mut node.input, request, factory),
+        LogicalPlan::Scan(scan)
+            if !request.strict
+                || scan.predicates.is_empty()
+                || scan
+                    .predicates
+                    .iter()
+                    .any(|predicate| expr_contains_variant_request(predicate, request)) =>
+        {
+            find_or_create_slot_on_scan(scan, request, factory)
+        }
+        LogicalPlan::Filter(node)
+            if !request.strict || expr_contains_variant_request(&node.predicate, request) =>
+        {
+            find_or_create_slot(&mut node.input, request, factory)
+        }
         _ => None,
+    }
+}
+
+fn expr_contains_variant_request(expr: &TypedExpr, request: &VariantRequest) -> bool {
+    if variant_request(expr).is_some_and(|candidate| candidate == *request) {
+        return true;
+    }
+
+    match &expr.kind {
+        ExprKind::BinaryOp { left, right, .. } => {
+            expr_contains_variant_request(left, request)
+                || expr_contains_variant_request(right, request)
+        }
+        ExprKind::UnaryOp { expr, .. }
+        | ExprKind::Cast { expr, .. }
+        | ExprKind::IsNull { expr, .. }
+        | ExprKind::IsTruthValue { expr, .. }
+        | ExprKind::Nested(expr) => expr_contains_variant_request(expr, request),
+        ExprKind::FunctionCall { args, .. } => args
+            .iter()
+            .any(|arg| expr_contains_variant_request(arg, request)),
+        ExprKind::AggregateCall { args, order_by, .. } => {
+            args.iter()
+                .any(|arg| expr_contains_variant_request(arg, request))
+                || order_by
+                    .iter()
+                    .any(|item| expr_contains_variant_request(&item.expr, request))
+        }
+        ExprKind::WindowCall {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            args.iter()
+                .any(|arg| expr_contains_variant_request(arg, request))
+                || partition_by
+                    .iter()
+                    .any(|expr| expr_contains_variant_request(expr, request))
+                || order_by
+                    .iter()
+                    .any(|item| expr_contains_variant_request(&item.expr, request))
+        }
+        ExprKind::LambdaFunction { body, .. } | ExprKind::Lambda { body, .. } => {
+            expr_contains_variant_request(body, request)
+        }
+        ExprKind::InList { expr, list, .. } => {
+            expr_contains_variant_request(expr, request)
+                || list
+                    .iter()
+                    .any(|item| expr_contains_variant_request(item, request))
+        }
+        ExprKind::Between {
+            expr, low, high, ..
+        } => {
+            expr_contains_variant_request(expr, request)
+                || expr_contains_variant_request(low, request)
+                || expr_contains_variant_request(high, request)
+        }
+        ExprKind::Like { expr, pattern, .. } => {
+            expr_contains_variant_request(expr, request)
+                || expr_contains_variant_request(pattern, request)
+        }
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            operand
+                .as_deref()
+                .is_some_and(|expr| expr_contains_variant_request(expr, request))
+                || when_then.iter().any(|(when, then)| {
+                    expr_contains_variant_request(when, request)
+                        || expr_contains_variant_request(then, request)
+                })
+                || else_expr
+                    .as_deref()
+                    .is_some_and(|expr| expr_contains_variant_request(expr, request))
+        }
+        ExprKind::ColumnRef { .. }
+        | ExprKind::LambdaParamRef { .. }
+        | ExprKind::Literal(_)
+        | ExprKind::SubqueryPlaceholder { .. } => false,
     }
 }
 

@@ -138,6 +138,14 @@ mod tests {
         }
     }
 
+    fn bool_literal(value: bool) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Bool(value)),
+            data_type: DataType::Boolean,
+            nullable: false,
+        }
+    }
+
     fn variant_get(name: &str, source_column: &OutputColumn, path: &str, ty: &str) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::FunctionCall {
@@ -291,6 +299,63 @@ mod tests {
             descriptor.synthetic_column_id
         );
         assert_eq!(project.items[0].output_column_id, project_output);
+    }
+
+    #[test]
+    fn strict_project_above_unrelated_filter_is_not_rewritten() {
+        let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
+        let (scan, source_column) =
+            scan_with_source(&factory, iceberg_source(), DataType::LargeBinary);
+        let filter = LogicalPlan::Filter(FilterNode {
+            input: Box::new(scan),
+            predicate: bool_literal(true),
+            required_output_columns: None,
+        });
+        let plan = LogicalPlan::Project(ProjectNode {
+            input: Box::new(filter),
+            items: vec![ProjectItem {
+                expr: variant_get("variant_get", &source_column, "$.a", "bigint"),
+                output_name: "a".to_string(),
+                output_column_id: add_column(&factory, "a", DataType::Int64, true, false).column_id,
+            }],
+            output_qualifier: None,
+            required_output_columns: None,
+        });
+        let before = format!("{plan:?}");
+
+        let (rewritten, changed) = rewrite(plan, Rc::clone(&factory));
+
+        assert!(!changed);
+        assert_eq!(format!("{rewritten:?}"), before);
+        assert!(scan_from_plan(&rewritten).variant_columns.is_empty());
+    }
+
+    #[test]
+    fn strict_project_above_scan_with_unrelated_predicate_is_not_rewritten() {
+        let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
+        let (mut scan, source_column) =
+            scan_with_source(&factory, iceberg_source(), DataType::LargeBinary);
+        let LogicalPlan::Scan(scan_node) = &mut scan else {
+            panic!("expected scan");
+        };
+        scan_node.predicates.push(bool_literal(true));
+        let plan = LogicalPlan::Project(ProjectNode {
+            input: Box::new(scan),
+            items: vec![ProjectItem {
+                expr: variant_get("variant_get", &source_column, "$.a", "bigint"),
+                output_name: "a".to_string(),
+                output_column_id: add_column(&factory, "a", DataType::Int64, true, false).column_id,
+            }],
+            output_qualifier: None,
+            required_output_columns: None,
+        });
+        let before = format!("{plan:?}");
+
+        let (rewritten, changed) = rewrite(plan, Rc::clone(&factory));
+
+        assert!(!changed);
+        assert_eq!(format!("{rewritten:?}"), before);
+        assert!(scan_from_plan(&rewritten).variant_columns.is_empty());
     }
 
     #[test]
