@@ -971,6 +971,9 @@ impl<'a> PlanFragmentBuilder<'a> {
             .collect();
         let exec_params =
             nodes::build_exec_params_multi_with_refresh_context(connectors, &[], mv_refresh_ctx)?;
+        let pruning_limits = mv_refresh_ctx
+            .map(|ctx| ctx.pruning_limits)
+            .unwrap_or_default();
         let fragment = FragmentBuildResult {
             fragment_id: 0,
             plan: plan_nodes::TPlan::new(Vec::new()),
@@ -984,6 +987,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                 delta_input,
                 layout,
                 branch_id,
+                pruning_limits,
             })),
             cte_id: None,
             cte_exchange_nodes: Vec::new(),

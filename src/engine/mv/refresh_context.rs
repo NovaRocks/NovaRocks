@@ -101,6 +101,10 @@ impl MvRefreshPruningLimits {
     pub(crate) fn affected_partition_count_exceeds_limit(&self, partition_count: usize) -> bool {
         partition_count > self.max_affected_partitions
     }
+
+    pub(crate) fn touched_group_count_exceeds_limit(&self, touched_group_count: usize) -> bool {
+        touched_group_count > self.max_touched_groups
+    }
 }
 
 /// Debug-only view of an `IcebergMvRewriteContext`. No `Display` impl — log

@@ -3758,6 +3758,7 @@ fn lower_plan_build_result(
                 delta_input,
                 layout,
                 branch_id,
+                pruning_limits,
             } => {
                 let old_input =
                     lower_plan_build_result(*old_input, arena, query_opts, iceberg_catalogs)?;
@@ -3769,6 +3770,7 @@ fn lower_plan_build_result(
                         delta_input,
                         layout,
                         branch_id,
+                        pruning_limits,
                     ),
                 );
             }

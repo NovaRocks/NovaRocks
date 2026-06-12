@@ -6,7 +6,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout;
-use crate::engine::mv::iceberg_aggregate_state::merge_aggregate_state_chunks_for_change_stream;
+use crate::engine::mv::iceberg_aggregate_state::merge_aggregate_state_chunks_for_change_stream_with_pruning_limits;
+use crate::engine::mv::refresh_context::MvRefreshPruningLimits;
 use crate::engine::record_batch_to_chunk;
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
@@ -20,6 +21,7 @@ pub struct AggregateStateMergePlan {
     pub(crate) delta_input: Box<crate::exec::node::ExecNode>,
     pub(crate) layout: AggregateMvLayout,
     pub(crate) branch_id: Option<i32>,
+    pub(crate) pruning_limits: MvRefreshPruningLimits,
 }
 
 #[derive(Clone, Debug)]
@@ -106,16 +108,18 @@ impl AggregateStateMergeSharedState {
         &self,
         layout: &AggregateMvLayout,
         branch_id: Option<i32>,
+        pruning_limits: MvRefreshPruningLimits,
     ) -> Result<Option<Chunk>, String> {
         let mut guard = self.inner.lock().expect("aggregate state merge lock");
         if guard.output.is_none() {
             if guard.remaining_old_producers != 0 || guard.remaining_delta_producers != 0 {
                 return Ok(None);
             }
-            let mut output = merge_aggregate_state_chunks_for_change_stream(
+            let mut output = merge_aggregate_state_chunks_for_change_stream_with_pruning_limits(
                 &guard.old_chunks,
                 &guard.delta_chunks,
                 layout,
+                pruning_limits,
             )?;
             if let Some(branch_id) = branch_id {
                 output = append_branch_id_to_chunks(output, branch_id)?;
@@ -314,8 +318,11 @@ impl ProcessorOperator for AggregateStateMergeSourceOperator {
     }
 
     fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
-        self.state
-            .pop_output(&self.plan.layout, self.plan.branch_id)
+        self.state.pop_output(
+            &self.plan.layout,
+            self.plan.branch_id,
+            self.plan.pruning_limits,
+        )
     }
 
     fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
@@ -595,6 +602,7 @@ mod tests {
                     }),
                     layout,
                     branch_id: None,
+                    pruning_limits: MvRefreshPruningLimits::default(),
                 }),
             },
         };
@@ -665,6 +673,7 @@ mod tests {
                     }),
                     layout,
                     branch_id: None,
+                    pruning_limits: MvRefreshPruningLimits::default(),
                 }),
             },
         };
@@ -741,6 +750,7 @@ mod tests {
                 }),
                 layout,
                 branch_id,
+                pruning_limits: MvRefreshPruningLimits::default(),
             },
             shared,
             7,

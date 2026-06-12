@@ -37,6 +37,7 @@ pub(crate) enum DirectExecPlan {
         delta_input: Box<PlanBuildResult>,
         layout: crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
         branch_id: Option<i32>,
+        pruning_limits: crate::engine::mv::refresh_context::MvRefreshPruningLimits,
     },
     AggregateStatePhysicalize {
         input: Box<PlanBuildResult>,

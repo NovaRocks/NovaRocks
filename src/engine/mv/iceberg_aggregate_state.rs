@@ -8,6 +8,7 @@ use arrow::record_batch::RecordBatch;
 use crate::connector::starrocks::table::mv_agg_state::{
     AggregateMvLayout, build_old_state_map, merge_aggregate_state_batches_with_retractions,
 };
+use crate::engine::mv::refresh_context::MvRefreshPruningLimits;
 use crate::engine::record_batch_to_chunk;
 use crate::exec::change_op::{ChangeOp, change_op_array, change_op_field};
 use crate::exec::chunk::Chunk;
@@ -30,7 +31,12 @@ pub(crate) fn merge_aggregate_target_state(
     old_chunks: &[Chunk],
     delta_chunks: &[Chunk],
 ) -> Result<IcebergAggregateMergeResult, String> {
-    let core = merge_aggregate_state_chunks_core(old_chunks, delta_chunks, layout)?;
+    let core = merge_aggregate_state_chunks_core(
+        old_chunks,
+        delta_chunks,
+        layout,
+        MvRefreshPruningLimits::default(),
+    )?;
     let insert_chunks =
         filter_physical_chunks_by_row_ids(layout, &core.upsert_chunks, &core.touched_row_ids)?;
     let delete_row_ids = core
@@ -52,7 +58,21 @@ pub(crate) fn merge_aggregate_state_chunks_for_change_stream(
     delta_chunks: &[Chunk],
     layout: &AggregateMvLayout,
 ) -> Result<Vec<Chunk>, String> {
-    let core = merge_aggregate_state_chunks_core(old_chunks, delta_chunks, layout)?;
+    merge_aggregate_state_chunks_for_change_stream_with_pruning_limits(
+        old_chunks,
+        delta_chunks,
+        layout,
+        MvRefreshPruningLimits::default(),
+    )
+}
+
+pub(crate) fn merge_aggregate_state_chunks_for_change_stream_with_pruning_limits(
+    old_chunks: &[Chunk],
+    delta_chunks: &[Chunk],
+    layout: &AggregateMvLayout,
+    pruning_limits: MvRefreshPruningLimits,
+) -> Result<Vec<Chunk>, String> {
+    let core = merge_aggregate_state_chunks_core(old_chunks, delta_chunks, layout, pruning_limits)?;
     build_aggregate_change_stream_chunks(
         layout,
         old_chunks,
@@ -65,11 +85,23 @@ fn merge_aggregate_state_chunks_core(
     old_chunks: &[Chunk],
     delta_chunks: &[Chunk],
     layout: &AggregateMvLayout,
+    pruning_limits: MvRefreshPruningLimits,
 ) -> Result<AggregateStateMergeCoreResult, String> {
     let touched_row_ids = delta_row_ids(layout, delta_chunks)?;
     let old_row_ids = physical_row_ids(layout, old_chunks)?;
-    let touched_old_chunks =
-        filter_physical_chunks_by_row_ids(layout, old_chunks, &touched_row_ids)?;
+    let touched_old_chunks = if pruning_limits
+        .touched_group_count_exceeds_limit(touched_row_ids.len())
+    {
+        tracing::warn!(
+            touched_group_count = touched_row_ids.len(),
+            max_touched_groups = pruning_limits.max_touched_groups,
+            fallback_reason = "touched_group_threshold",
+            "falling back to full aggregate old-state merge because touched group count exceeds configured threshold"
+        );
+        old_chunks.to_vec()
+    } else {
+        filter_physical_chunks_by_row_ids(layout, old_chunks, &touched_row_ids)?
+    };
     let old_rows = build_old_state_map(&touched_old_chunks, layout)?;
     let merge_result =
         merge_aggregate_state_batches_with_retractions(&old_rows, delta_chunks, layout)?;
@@ -726,6 +758,45 @@ mod tests {
         assert_eq!(result.delete_row_ids, vec![touched.clone()]);
         assert_eq!(row_ids_from_chunks(&result.insert_chunks), vec![touched]);
         assert_eq!(result.new_total_rows, 2);
+    }
+
+    #[test]
+    fn merge_over_touched_group_threshold_uses_full_old_state() {
+        let layout = test_count_layout();
+        let touched = encoded_utf8_group_row_id("touched");
+        let another_touched = encoded_utf8_group_row_id("another_touched");
+        let untouched = encoded_utf8_group_row_id("untouched");
+        let valid_state = encode_count_state(2);
+        let invalid_state = b"not-a-valid-count-state";
+        let old = vec![chunk(count_physical_batch_with_raw_state(&[
+            (touched.as_str(), "touched", 2, valid_state.as_slice()),
+            (
+                untouched.as_str(),
+                "untouched",
+                99,
+                invalid_state.as_slice(),
+            ),
+        ]))];
+        let delta = vec![chunk(count_physical_batch(&[
+            (touched.as_str(), "touched", 1, 1),
+            (another_touched.as_str(), "another_touched", 5, 5),
+        ]))];
+
+        let err = merge_aggregate_state_chunks_for_change_stream_with_pruning_limits(
+            &old,
+            &delta,
+            &layout,
+            crate::engine::mv::refresh_context::MvRefreshPruningLimits {
+                max_touched_groups: 1,
+                max_affected_partitions: 4_096,
+            },
+        )
+        .expect_err("over-threshold merge should decode full old state");
+
+        assert!(
+            err.contains("aggregate MV state corruption"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
