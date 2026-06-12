@@ -4,6 +4,7 @@
 //! compiles `TypedExpr` into Thrift `TExpr`, and assembles the Thrift
 //! plan structures expected by the pipeline executor.
 
+pub(crate) mod boundary_schema;
 pub(crate) mod descriptors;
 pub(crate) mod expr_compiler;
 pub(crate) mod fallback_audit;
@@ -66,6 +67,10 @@ pub(crate) struct PlanBuildResult {
     pub exec_params: internal_service::TPlanFragmentExecParams,
     pub output_columns: Vec<OutputColumn>,
     pub direct_exec: Option<Box<DirectExecPlan>>,
+    #[allow(dead_code)]
+    // Carried by single-fragment conversions so EXPLAIN/codegen consumers do
+    // not lose boundary schema reports when a multi-fragment build collapses.
+    pub boundary_schemas: Vec<boundary_schema::BoundarySchemaReport>,
     /// Per-fragment dictionary payload required by `lower_decode_node` and
     /// `lower_lake_scan_node` to build their `query_global_dict_map`. When
     /// `LowCardinalityDictionaryRewrite` has fired, this carries one
@@ -121,6 +126,7 @@ pub(crate) struct MultiFragmentBuildResult {
     pub root_fragment_id: FragmentId,
     /// Fragment-to-fragment data edges.
     pub edges: Vec<FragmentEdge>,
+    pub boundary_schemas: Vec<boundary_schema::BoundarySchemaReport>,
     /// Runtime filter planning result (populated for standalone mode).
     pub rf_plan: Option<RuntimeFilterPlanResult>,
 }
@@ -153,6 +159,7 @@ pub(crate) struct FragmentBuildResult {
     pub output_exprs: Option<Vec<crate::exprs::TExpr>>,
     pub output_columns: Vec<OutputColumn>,
     pub direct_exec: Option<Box<DirectExecPlan>>,
+    pub boundary_schemas: Vec<boundary_schema::BoundarySchemaReport>,
     /// CTE ID if this is a multicast fragment.
     pub cte_id: Option<CteId>,
     /// Exchange node IDs in this fragment that consume from CTE fragments:

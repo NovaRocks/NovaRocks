@@ -157,6 +157,7 @@ mod tests {
                 nullable: false,
             }],
             direct_exec: None,
+            boundary_schemas: vec![],
             cte_id: None,
             cte_exchange_nodes: vec![],
             query_global_dicts: None,

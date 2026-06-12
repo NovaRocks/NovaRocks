@@ -91,6 +91,7 @@ impl ExecutionCoordinator {
             mut fragment_results,
             root_fragment_id,
             edges,
+            boundary_schemas: _,
             rf_plan,
         } = self.build_result;
         let query_options = self.query_options;

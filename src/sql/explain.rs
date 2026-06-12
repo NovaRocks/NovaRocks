@@ -404,6 +404,40 @@ pub(crate) fn explain_physical_plan(plan: &PhysicalPlanNode, level: ExplainLevel
     out
 }
 
+pub(crate) fn format_boundary_schema_reports(
+    reports: &[crate::sql::codegen::boundary_schema::BoundarySchemaReport],
+) -> Vec<String> {
+    if reports.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    out.push("Boundary Schemas:".to_string());
+    for report in reports {
+        let fragment = report
+            .fragment_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "root".to_string());
+        out.push(format!(
+            "  Fragment {} {} node={}:",
+            fragment,
+            report.boundary_kind.label(),
+            report.node_id
+        ));
+        for column in &report.columns {
+            out.push(format!(
+                "    slot={} name={} arrow={:?} logical={} nullable={}",
+                column.slot_id,
+                column.name,
+                column.arrow_type,
+                column.logical_type.as_deref().unwrap_or("<none>"),
+                column.nullable
+            ));
+        }
+    }
+    out
+}
+
 fn join_distribution_label(node: &PhysicalPlanNode, fallback: &JoinDistribution) -> &'static str {
     match node.execution_props.join_distribution {
         Some(JoinExecutionDistribution::Broadcast) => "BROADCAST",
@@ -1334,11 +1368,14 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Fields};
 
     use super::{
-        ExplainLevel, explain_physical_plan, explain_plan, format_physical_node,
-        format_stats_trailer,
+        ExplainLevel, explain_physical_plan, explain_plan, format_boundary_schema_reports,
+        format_physical_node, format_stats_trailer,
     };
     use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn, SortItem, TypedExpr};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
+    use crate::sql::codegen::boundary_schema::{
+        BoundaryKind, BoundarySchemaColumn, BoundarySchemaReport,
+    };
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
         JoinDistribution, Operator, PhysicalDistributionOp, PhysicalHashJoinOp, PhysicalScanOp,
@@ -1356,6 +1393,33 @@ mod tests {
 
     fn explain_logical_plan_for_test(plan: &LogicalPlan) -> String {
         explain_plan(plan, ExplainLevel::Normal).join("\n")
+    }
+
+    #[test]
+    fn format_boundary_schema_reports_includes_root_fragment_and_columns() {
+        let reports = vec![BoundarySchemaReport {
+            fragment_id: None,
+            node_id: -1,
+            boundary_kind: BoundaryKind::ResultRoot,
+            columns: vec![BoundarySchemaColumn {
+                slot_id: 1,
+                name: "k1".to_string(),
+                arrow_type: DataType::Int64,
+                logical_type: None,
+                nullable: false,
+            }],
+        }];
+
+        let lines = format_boundary_schema_reports(&reports);
+
+        assert_eq!(
+            lines,
+            vec![
+                "Boundary Schemas:".to_string(),
+                "  Fragment root RESULT_ROOT node=-1:".to_string(),
+                "    slot=1 name=k1 arrow=Int64 logical=<none> nullable=false".to_string(),
+            ]
+        );
     }
 
     #[test]

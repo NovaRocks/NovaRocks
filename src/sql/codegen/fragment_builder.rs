@@ -23,6 +23,9 @@ use crate::types;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::catalog::CatalogProvider;
 use crate::sql::codegen::FragmentId;
+use crate::sql::codegen::boundary_schema::{
+    BoundaryKind, BoundarySchemaReport, output_columns_to_boundary_columns,
+};
 use crate::sql::codegen::descriptors::DescriptorTableBuilder;
 use crate::sql::codegen::expr_compiler::{self, ExprCompiler};
 use crate::sql::codegen::helpers::{
@@ -97,9 +100,45 @@ fn single_fragment_child_plan(
         exec_params: fragment.exec_params,
         output_columns: fragment.output_columns,
         direct_exec: fragment.direct_exec,
+        boundary_schemas: fragment.boundary_schemas,
         query_global_dicts: fragment.query_global_dicts,
         query_global_dict_exprs: fragment.query_global_dict_exprs,
     }))
+}
+
+fn output_columns_for_boundary(
+    columns: &[crate::sql::analysis::OutputColumn],
+) -> Vec<OutputColumn> {
+    columns
+        .iter()
+        .map(|c| OutputColumn {
+            name: c.name.clone(),
+            data_type: c.data_type.clone(),
+            nullable: c.nullable,
+        })
+        .collect()
+}
+
+fn result_root_boundary_schema_report(
+    fragment_id: FragmentId,
+    root_node_id: i32,
+    output_columns: &[OutputColumn],
+) -> BoundarySchemaReport {
+    BoundarySchemaReport {
+        fragment_id: Some(fragment_id as i32),
+        node_id: root_node_id,
+        boundary_kind: BoundaryKind::ResultRoot,
+        columns: output_columns_to_boundary_columns(output_columns),
+    }
+}
+
+fn direct_plan_boundary_schema_report(output_columns: &[OutputColumn]) -> BoundarySchemaReport {
+    BoundarySchemaReport {
+        fragment_id: None,
+        node_id: -1,
+        boundary_kind: BoundaryKind::ResultRoot,
+        columns: output_columns_to_boundary_columns(output_columns),
+    }
 }
 
 fn aggregate_physical_output_columns(
@@ -600,6 +639,9 @@ pub(crate) struct PlanFragmentBuilder<'a> {
     completed_fragments: Vec<FragmentBuildResult>,
     /// Fragment-to-fragment stream/multicast edges.
     completed_edges: Vec<FragmentEdge>,
+    /// Boundary schema reports for fragment edges. Fragment root reports live
+    /// on each `FragmentBuildResult` and are aggregated after all fragments are built.
+    boundary_schemas: Vec<BoundarySchemaReport>,
     /// CTE ID -> index in `completed_fragments`.
     cte_fragments: HashMap<CteId, usize>,
     /// Per-fragment accumulator of `TGlobalDict` entries emitted by scans
@@ -701,6 +743,39 @@ impl<'a> PlanFragmentBuilder<'a> {
         Ok(build)
     }
 
+    fn record_completed_edge(
+        &mut self,
+        source_fragment_id: FragmentId,
+        target_fragment_id: FragmentId,
+        target_exchange_node_id: i32,
+        output_partition: partitions::TDataPartition,
+        stream_kind: FragmentStreamKind,
+        edge_kind: FragmentEdgeKind,
+        output_columns: &[OutputColumn],
+    ) {
+        self.completed_edges.push(FragmentEdge {
+            source_fragment_id,
+            target_fragment_id,
+            target_exchange_node_id,
+            output_partition,
+            stream_kind,
+            edge_kind,
+        });
+        let columns = output_columns_to_boundary_columns(output_columns);
+        self.boundary_schemas.push(BoundarySchemaReport {
+            fragment_id: Some(source_fragment_id as i32),
+            node_id: target_exchange_node_id,
+            boundary_kind: BoundaryKind::ExchangeSender,
+            columns: columns.clone(),
+        });
+        self.boundary_schemas.push(BoundarySchemaReport {
+            fragment_id: Some(target_fragment_id as i32),
+            node_id: target_exchange_node_id,
+            boundary_kind: BoundaryKind::ExchangeReceiver,
+            columns,
+        });
+    }
+
     pub(crate) fn build_with_mv_refresh_ctx(
         plan: &PhysicalPlanNode,
         catalog: &'a dyn CatalogProvider,
@@ -722,6 +797,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             fragment_stack: Vec::new(),
             completed_fragments: Vec::new(),
             completed_edges: Vec::new(),
+            boundary_schemas: Vec::new(),
             cte_fragments: HashMap::new(),
             query_global_dicts_per_fragment: HashMap::new(),
             slot_to_global_dict: HashMap::new(),
@@ -785,15 +861,17 @@ impl<'a> PlanFragmentBuilder<'a> {
 
         let output_exprs =
             builder.result_output_exprs_for_columns(&result.scope, &plan.output_columns)?;
-        let output_columns = plan
-            .output_columns
-            .iter()
-            .map(|c| OutputColumn {
-                name: c.name.clone(),
-                data_type: c.data_type.clone(),
-                nullable: c.nullable,
-            })
-            .collect();
+        let output_columns = output_columns_for_boundary(&plan.output_columns);
+        let root_node_id = result
+            .plan_nodes
+            .first()
+            .map(|node| node.node_id)
+            .unwrap_or(-1);
+        let boundary_schemas = vec![result_root_boundary_schema_report(
+            root_fragment_id,
+            root_node_id,
+            &output_columns,
+        )];
 
         // Build the root fragment with a result sink. Drain the per-fragment
         // dictionary accumulator into `query_global_dicts` — for Task 6 this
@@ -811,6 +889,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             output_exprs,
             output_columns,
             direct_exec: None,
+            boundary_schemas,
             cte_id: None,
             cte_exchange_nodes: result.cte_exchange_nodes,
             // Dictionary plumbing: populated when Task 7+ inserts dict slots.
@@ -828,6 +907,11 @@ impl<'a> PlanFragmentBuilder<'a> {
         // Assemble all fragments: completed child fragments first, then root.
         let mut fragment_results = builder.completed_fragments;
         fragment_results.push(root_fragment);
+        let mut boundary_schemas = Vec::new();
+        for fragment in &fragment_results {
+            boundary_schemas.extend(fragment.boundary_schemas.clone());
+        }
+        boundary_schemas.extend(builder.boundary_schemas);
 
         // OQ-5: the runtime-filter descriptors were lowered during
         // `visit_hash_join` (and already patched onto the join thrift nodes).
@@ -847,6 +931,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             fragment_results,
             root_fragment_id,
             edges: builder.completed_edges,
+            boundary_schemas,
             rf_plan,
         })
     }
@@ -956,19 +1041,12 @@ impl<'a> PlanFragmentBuilder<'a> {
                 input: delta_state_input,
                 layout: layout.clone(),
             })),
+            boundary_schemas: vec![direct_plan_boundary_schema_report(&physical_columns)],
             query_global_dicts: None,
             query_global_dict_exprs: None,
         });
 
-        let output_columns = op
-            .output_columns
-            .iter()
-            .map(|c| OutputColumn {
-                name: c.name.clone(),
-                data_type: c.data_type.clone(),
-                nullable: c.nullable,
-            })
-            .collect();
+        let output_columns = output_columns_for_boundary(&op.output_columns);
         let exec_params =
             nodes::build_exec_params_multi_with_refresh_context(connectors, &[], mv_refresh_ctx)?;
         let pruning_limits = mv_refresh_ctx
@@ -983,6 +1061,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                     apply_key_column: layout.row_id_column.column.name.clone(),
                 },
             );
+        let boundary_schemas = vec![result_root_boundary_schema_report(0, -1, &output_columns)];
         let fragment = FragmentBuildResult {
             fragment_id: 0,
             plan: plan_nodes::TPlan::new(Vec::new()),
@@ -999,16 +1078,19 @@ impl<'a> PlanFragmentBuilder<'a> {
                 pruning_limits,
                 target_position_locator,
             })),
+            boundary_schemas,
             cte_id: None,
             cte_exchange_nodes: Vec::new(),
             query_global_dicts: None,
             query_global_dict_exprs: None,
         };
 
+        let boundary_schemas = fragment.boundary_schemas.clone();
         Ok(MultiFragmentBuildResult {
             fragment_results: vec![fragment],
             root_fragment_id: 0,
             edges: Vec::new(),
+            boundary_schemas,
             rf_plan: None,
         })
     }
@@ -1065,17 +1147,10 @@ impl<'a> PlanFragmentBuilder<'a> {
             branch_inputs.push(*child);
         }
 
-        let output_columns = union_op
-            .output_columns
-            .iter()
-            .map(|c| OutputColumn {
-                name: c.name.clone(),
-                data_type: c.data_type.clone(),
-                nullable: c.nullable,
-            })
-            .collect();
+        let output_columns = output_columns_for_boundary(&union_op.output_columns);
         let exec_params =
             nodes::build_exec_params_multi_with_refresh_context(connectors, &[], mv_refresh_ctx)?;
+        let boundary_schemas = vec![result_root_boundary_schema_report(0, -1, &output_columns)];
         let fragment = FragmentBuildResult {
             fragment_id: 0,
             plan: plan_nodes::TPlan::new(Vec::new()),
@@ -1087,16 +1162,19 @@ impl<'a> PlanFragmentBuilder<'a> {
             direct_exec: Some(Box::new(DirectExecPlan::UnionAll {
                 inputs: branch_inputs,
             })),
+            boundary_schemas,
             cte_id: None,
             cte_exchange_nodes: Vec::new(),
             query_global_dicts: None,
             query_global_dict_exprs: None,
         };
 
+        let boundary_schemas = fragment.boundary_schemas.clone();
         Ok(Some(MultiFragmentBuildResult {
             fragment_results: vec![fragment],
             root_fragment_id: 0,
             edges: Vec::new(),
+            boundary_schemas,
             rf_plan: None,
         }))
     }
@@ -3152,6 +3230,16 @@ impl<'a> PlanFragmentBuilder<'a> {
             .query_global_dicts_per_fragment
             .remove(&child_fragment_id)
             .filter(|v| !v.is_empty());
+        let child_root_node_id = child_plan_nodes
+            .first()
+            .map(|node| node.node_id)
+            .unwrap_or(-1);
+        let edge_output_columns = output_columns_for_boundary(&node.children[0].output_columns);
+        let boundary_schemas = vec![result_root_boundary_schema_report(
+            child_fragment_id,
+            child_root_node_id,
+            &edge_output_columns,
+        )];
         self.completed_fragments.push(FragmentBuildResult {
             fragment_id: child_fragment_id,
             plan: plan_nodes::TPlan::new(child_plan_nodes),
@@ -3159,16 +3247,9 @@ impl<'a> PlanFragmentBuilder<'a> {
             exec_params: nodes::build_exec_params_multi(self.connectors, &[])?,
             output_sink: build_noop_sink(),
             output_exprs: None,
-            output_columns: node.children[0]
-                .output_columns
-                .iter()
-                .map(|c| OutputColumn {
-                    name: c.name.clone(),
-                    data_type: c.data_type.clone(),
-                    nullable: c.nullable,
-                })
-                .collect(),
+            output_columns: edge_output_columns.clone(),
             direct_exec: None,
+            boundary_schemas,
             cte_id: None,
             cte_exchange_nodes,
             query_global_dicts: child_dicts,
@@ -3185,14 +3266,15 @@ impl<'a> PlanFragmentBuilder<'a> {
             op.offset,
         );
 
-        self.completed_edges.push(FragmentEdge {
-            source_fragment_id: child_fragment_id,
-            target_fragment_id: parent_fragment_id,
-            target_exchange_node_id: exchange_node_id,
+        self.record_completed_edge(
+            child_fragment_id,
+            parent_fragment_id,
+            exchange_node_id,
             output_partition,
-            stream_kind: FragmentStreamKind::Gather,
-            edge_kind: FragmentEdgeKind::Stream,
-        });
+            FragmentStreamKind::Gather,
+            FragmentEdgeKind::Stream,
+            &edge_output_columns,
+        );
 
         Ok(VisitResult {
             plan_nodes: vec![exchange_node],
@@ -3277,6 +3359,16 @@ impl<'a> PlanFragmentBuilder<'a> {
             .query_global_dicts_per_fragment
             .remove(&child_fragment_id)
             .filter(|v| !v.is_empty());
+        let child_root_node_id = child_plan_nodes
+            .first()
+            .map(|node| node.node_id)
+            .unwrap_or(-1);
+        let edge_output_columns = output_columns_for_boundary(&node.children[0].output_columns);
+        let boundary_schemas = vec![result_root_boundary_schema_report(
+            child_fragment_id,
+            child_root_node_id,
+            &edge_output_columns,
+        )];
         self.completed_fragments.push(FragmentBuildResult {
             fragment_id: child_fragment_id,
             plan: plan_nodes::TPlan::new(child_plan_nodes),
@@ -3284,16 +3376,9 @@ impl<'a> PlanFragmentBuilder<'a> {
             exec_params: nodes::build_exec_params_multi(self.connectors, &[])?,
             output_sink: build_noop_sink(),
             output_exprs: None,
-            output_columns: node.children[0]
-                .output_columns
-                .iter()
-                .map(|c| OutputColumn {
-                    name: c.name.clone(),
-                    data_type: c.data_type.clone(),
-                    nullable: c.nullable,
-                })
-                .collect(),
+            output_columns: edge_output_columns.clone(),
             direct_exec: None,
+            boundary_schemas,
             cte_id: None,
             cte_exchange_nodes,
             query_global_dicts: child_dicts,
@@ -3309,14 +3394,15 @@ impl<'a> PlanFragmentBuilder<'a> {
             op.offset,
         );
 
-        self.completed_edges.push(FragmentEdge {
-            source_fragment_id: child_fragment_id,
-            target_fragment_id: parent_fragment_id,
-            target_exchange_node_id: exchange_node_id,
+        self.record_completed_edge(
+            child_fragment_id,
+            parent_fragment_id,
+            exchange_node_id,
             output_partition,
-            stream_kind: FragmentStreamKind::Gather,
-            edge_kind: FragmentEdgeKind::Stream,
-        });
+            FragmentStreamKind::Gather,
+            FragmentEdgeKind::Stream,
+            &edge_output_columns,
+        );
 
         Ok(VisitResult {
             plan_nodes: vec![exchange_node],
@@ -4635,6 +4721,13 @@ impl<'a> PlanFragmentBuilder<'a> {
             .query_global_dicts_per_fragment
             .remove(&child_fragment_id)
             .filter(|v| !v.is_empty());
+        let child_root_node_id = plan_nodes.first().map(|node| node.node_id).unwrap_or(-1);
+        let edge_output_columns = output_columns_for_boundary(&node.children[0].output_columns);
+        let boundary_schemas = vec![result_root_boundary_schema_report(
+            child_fragment_id,
+            child_root_node_id,
+            &edge_output_columns,
+        )];
         self.completed_fragments.push(FragmentBuildResult {
             fragment_id: child_fragment_id,
             plan: plan_nodes::TPlan::new(plan_nodes),
@@ -4642,16 +4735,9 @@ impl<'a> PlanFragmentBuilder<'a> {
             exec_params: nodes::build_exec_params_multi(self.connectors, &[])?,
             output_sink: build_noop_sink(),
             output_exprs: None,
-            output_columns: node.children[0]
-                .output_columns
-                .iter()
-                .map(|c| OutputColumn {
-                    name: c.name.clone(),
-                    data_type: c.data_type.clone(),
-                    nullable: c.nullable,
-                })
-                .collect(),
+            output_columns: edge_output_columns.clone(),
             direct_exec: None,
+            boundary_schemas,
             cte_id: None,
             cte_exchange_nodes,
             query_global_dicts: child_dicts,
@@ -4665,14 +4751,15 @@ impl<'a> PlanFragmentBuilder<'a> {
             exchange_partition_type,
         );
 
-        self.completed_edges.push(FragmentEdge {
-            source_fragment_id: child_fragment_id,
-            target_fragment_id: parent_fragment_id,
-            target_exchange_node_id: exchange_node_id,
+        self.record_completed_edge(
+            child_fragment_id,
+            parent_fragment_id,
+            exchange_node_id,
             output_partition,
-            stream_kind: Self::stream_kind_for_distribution(&op.spec),
-            edge_kind: FragmentEdgeKind::Stream,
-        });
+            Self::stream_kind_for_distribution(&op.spec),
+            FragmentEdgeKind::Stream,
+            &edge_output_columns,
+        );
 
         Ok(VisitResult {
             plan_nodes: vec![exchange_node],
@@ -5054,6 +5141,17 @@ impl<'a> PlanFragmentBuilder<'a> {
             .query_global_dicts_per_fragment
             .remove(&cte_fragment_id)
             .filter(|v| !v.is_empty());
+        let cte_root_node_id = child
+            .plan_nodes
+            .first()
+            .map(|node| node.node_id)
+            .unwrap_or(-1);
+        let output_columns = output_columns_for_boundary(&op.output_columns);
+        let boundary_schemas = vec![result_root_boundary_schema_report(
+            cte_fragment_id,
+            cte_root_node_id,
+            &output_columns,
+        )];
         let cte_fragment = FragmentBuildResult {
             fragment_id: cte_fragment_id,
             plan: plan_nodes::TPlan::new(child.plan_nodes),
@@ -5061,16 +5159,9 @@ impl<'a> PlanFragmentBuilder<'a> {
             exec_params: nodes::build_exec_params_multi(self.connectors, &[])?,
             output_sink: build_noop_sink(),
             output_exprs: None,
-            output_columns: op
-                .output_columns
-                .iter()
-                .map(|c| OutputColumn {
-                    name: c.name.clone(),
-                    data_type: c.data_type.clone(),
-                    nullable: c.nullable,
-                })
-                .collect(),
+            output_columns,
             direct_exec: None,
+            boundary_schemas,
             cte_id: Some(op.cte_id),
             cte_exchange_nodes: child.cte_exchange_nodes,
             query_global_dicts: cte_dicts,
@@ -5149,14 +5240,16 @@ impl<'a> PlanFragmentBuilder<'a> {
 
         // Record the CTE multicast edge so the coordinator can wire sinks.
         let target_fragment_id = self.current_fragment_id()?;
-        self.completed_edges.push(FragmentEdge {
-            source_fragment_id: cte_fragment_id,
+        let edge_output_columns = output_columns_for_boundary(&op.output_columns);
+        self.record_completed_edge(
+            cte_fragment_id,
             target_fragment_id,
-            target_exchange_node_id: exchange_node_id,
-            output_partition: unpartitioned_stream_partition(),
-            stream_kind: FragmentStreamKind::Broadcast,
-            edge_kind: FragmentEdgeKind::CteMulticast { cte_id: op.cte_id },
-        });
+            exchange_node_id,
+            unpartitioned_stream_partition(),
+            FragmentStreamKind::Broadcast,
+            FragmentEdgeKind::CteMulticast { cte_id: op.cte_id },
+            &edge_output_columns,
+        );
 
         Ok(VisitResult {
             plan_nodes: vec![exchange_node],
@@ -5649,6 +5742,7 @@ mod tests {
             fragment_stack: vec![0],
             completed_fragments: Vec::new(),
             completed_edges: Vec::new(),
+            boundary_schemas: Vec::new(),
             cte_fragments: HashMap::new(),
             query_global_dicts_per_fragment: HashMap::new(),
             slot_to_global_dict: HashMap::new(),

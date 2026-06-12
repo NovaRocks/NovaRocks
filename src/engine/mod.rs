@@ -1084,6 +1084,7 @@ impl StandaloneSession {
                     &prepared,
                     &analyzer_provider,
                     &catalog_snapshot,
+                    &connectors_snapshot,
                     current_database,
                     level,
                     Some(&self.inner),
@@ -2713,7 +2714,10 @@ pub(crate) fn record_batch_to_chunk(batch: RecordBatch) -> Result<Chunk, String>
 // Query plan build + execute (delegates to crate::sql::*)
 // ---------------------------------------------------------------------------
 
-use crate::sql::codegen::{FragmentEdgeKind, MultiFragmentBuildResult, PlanBuildResult};
+use crate::sql::codegen::{
+    FragmentEdgeKind, MultiFragmentBuildResult, PlanBuildResult,
+    boundary_schema::{BoundaryKind, BoundarySchemaReport, output_columns_to_boundary_columns},
+};
 
 enum StandaloneExecutionPlan {
     SingleFragment(Box<PlanBuildResult>),
@@ -2844,8 +2848,46 @@ fn strip_top_level_stream_root_wrapper(
         child.output_sink = root_output_sink;
         child.output_exprs = root_output_exprs;
         child.output_columns = root_output_columns;
+        let node_id = child
+            .plan
+            .nodes
+            .first()
+            .map(|node| node.node_id)
+            .unwrap_or(-1);
+        child.boundary_schemas = vec![BoundarySchemaReport {
+            fragment_id: Some(child.fragment_id as i32),
+            node_id,
+            boundary_kind: BoundaryKind::ResultRoot,
+            columns: output_columns_to_boundary_columns(&child.output_columns),
+        }];
     }
+    refresh_boundary_schema_aggregate(&mut build_result);
     build_result
+}
+
+fn refresh_boundary_schema_aggregate(build_result: &mut MultiFragmentBuildResult) {
+    let previous = std::mem::take(&mut build_result.boundary_schemas);
+    for fragment in &build_result.fragment_results {
+        build_result
+            .boundary_schemas
+            .extend(fragment.boundary_schemas.clone());
+    }
+    for report in previous {
+        let keep = match report.boundary_kind {
+            BoundaryKind::ExchangeSender => build_result.edges.iter().any(|edge| {
+                report.fragment_id == Some(edge.source_fragment_id as i32)
+                    && report.node_id == edge.target_exchange_node_id
+            }),
+            BoundaryKind::ExchangeReceiver => build_result.edges.iter().any(|edge| {
+                report.fragment_id == Some(edge.target_fragment_id as i32)
+                    && report.node_id == edge.target_exchange_node_id
+            }),
+            BoundaryKind::RemoteRoot | BoundaryKind::ResultRoot => false,
+        };
+        if keep {
+            build_result.boundary_schemas.push(report);
+        }
+    }
 }
 
 fn single_fragment_plan(
@@ -2861,6 +2903,7 @@ fn single_fragment_plan(
         exec_params: fragment.exec_params,
         output_columns: fragment.output_columns,
         direct_exec: fragment.direct_exec,
+        boundary_schemas: fragment.boundary_schemas,
         query_global_dicts: fragment.query_global_dicts,
         query_global_dict_exprs: fragment.query_global_dict_exprs,
     }))
@@ -3181,7 +3224,10 @@ fn explain_analyze_query(
     query_opts: Option<crate::internal_service::TQueryOptions>,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
-    use crate::sql::explain::{ExplainLevel, explain_physical_plan};
+    use crate::sql::codegen::fragment_builder::PlanFragmentBuilder;
+    use crate::sql::explain::{
+        ExplainLevel, explain_physical_plan, format_boundary_schema_reports,
+    };
 
     // NOTE: planning_ms covers only the outer analyze + plan_query +
     // optimize call below; execute_query re-plans internally and its
@@ -3230,6 +3276,11 @@ fn explain_analyze_query(
         "Planning: {planning_ms} ms / Execution: {execution_ms} ms / Rows: {rows}"
     ));
     lines.extend(explain_physical_plan(&physical, ExplainLevel::Analyze));
+    let build_result =
+        PlanFragmentBuilder::build(&physical, codegen_catalog, connectors, current_database)?;
+    lines.extend(format_boundary_schema_reports(
+        &build_result.boundary_schemas,
+    ));
 
     build_string_query_result("Explain String", lines)
 }
@@ -3238,12 +3289,16 @@ fn explain_analyze_query(
 fn explain_query(
     query: &sqlparser::ast::Query,
     analyzer_catalog: &dyn crate::sql::catalog::CatalogProvider,
-    _codegen_catalog: &InMemoryCatalog,
+    codegen_catalog: &InMemoryCatalog,
+    connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     level: crate::sql::explain::ExplainLevel,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
-    use crate::sql::explain::{ExplainLevel, explain_physical_plan};
+    use crate::sql::codegen::fragment_builder::PlanFragmentBuilder;
+    use crate::sql::explain::{
+        ExplainLevel, explain_physical_plan, format_boundary_schema_reports,
+    };
 
     let (resolved, cte_registry, mut factory) =
         crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
@@ -3276,6 +3331,13 @@ fn explain_query(
         }
     }
     lines.extend(explain_physical_plan(&physical, level));
+    if matches!(level, ExplainLevel::Verbose | ExplainLevel::Analyze) {
+        let build_result =
+            PlanFragmentBuilder::build(&physical, codegen_catalog, connectors, current_database)?;
+        lines.extend(format_boundary_schema_reports(
+            &build_result.boundary_schemas,
+        ));
+    }
 
     build_string_query_result("Explain String", lines)
 }
