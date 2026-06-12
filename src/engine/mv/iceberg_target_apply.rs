@@ -221,6 +221,24 @@ pub(crate) async fn locate_target_rows_by_apply_key(
     referenced_data_file_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
     partition_filter: &TargetPartitionFilter,
 ) -> Result<Vec<crate::connector::iceberg::commit::PositionDeleteGroup>, String> {
+    Ok(locate_target_rows_by_apply_key_with_matches(
+        target_table,
+        base_row_ids,
+        existing_deletes_by_file,
+        referenced_data_file_partitions,
+        partition_filter,
+    )
+    .await?
+    .delete_groups)
+}
+
+pub(crate) async fn locate_target_rows_by_apply_key_with_matches(
+    target_table: &iceberg::table::Table,
+    base_row_ids: &[i64],
+    existing_deletes_by_file: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
+    referenced_data_file_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
+    partition_filter: &TargetPartitionFilter,
+) -> Result<TargetApplyLocatorResult, String> {
     locate_target_rows_by_apply_key_impl(
         target_table,
         ICEBERG_MV_APPLY_KEY_COLUMN,
@@ -240,6 +258,26 @@ pub(crate) async fn locate_target_rows_by_string_apply_key(
     referenced_data_file_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
     partition_filter: &TargetPartitionFilter,
 ) -> Result<Vec<crate::connector::iceberg::commit::PositionDeleteGroup>, String> {
+    Ok(locate_target_rows_by_string_apply_key_with_matches(
+        target_table,
+        apply_key_column,
+        requested_keys,
+        existing_deletes_by_file,
+        referenced_data_file_partitions,
+        partition_filter,
+    )
+    .await?
+    .delete_groups)
+}
+
+pub(crate) async fn locate_target_rows_by_string_apply_key_with_matches(
+    target_table: &iceberg::table::Table,
+    apply_key_column: &str,
+    requested_keys: &[String],
+    existing_deletes_by_file: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
+    referenced_data_file_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
+    partition_filter: &TargetPartitionFilter,
+) -> Result<TargetApplyLocatorResult, String> {
     locate_target_rows_by_apply_key_impl(
         target_table,
         apply_key_column,
@@ -270,6 +308,24 @@ pub(crate) async fn locate_target_rows_by_branch_apply_key(
     referenced_data_file_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
     partition_filter: &TargetPartitionFilter,
 ) -> Result<Vec<crate::connector::iceberg::commit::PositionDeleteGroup>, String> {
+    Ok(locate_target_rows_by_branch_apply_key_with_matches(
+        target_table,
+        requested_keys,
+        existing_deletes_by_file,
+        referenced_data_file_partitions,
+        partition_filter,
+    )
+    .await?
+    .delete_groups)
+}
+
+pub(crate) async fn locate_target_rows_by_branch_apply_key_with_matches(
+    target_table: &iceberg::table::Table,
+    requested_keys: &[BranchApplyKey],
+    existing_deletes_by_file: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
+    referenced_data_file_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
+    partition_filter: &TargetPartitionFilter,
+) -> Result<TargetApplyLocatorResult, String> {
     locate_target_rows_by_apply_key_impl(
         target_table,
         ICEBERG_MV_APPLY_KEY_COLUMN,
@@ -289,6 +345,26 @@ pub(crate) async fn locate_target_rows_by_branch_string_apply_key(
     referenced_data_file_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
     partition_filter: &TargetPartitionFilter,
 ) -> Result<Vec<crate::connector::iceberg::commit::PositionDeleteGroup>, String> {
+    Ok(locate_target_rows_by_branch_string_apply_key_with_matches(
+        target_table,
+        apply_key_column,
+        requested_keys,
+        existing_deletes_by_file,
+        referenced_data_file_partitions,
+        partition_filter,
+    )
+    .await?
+    .delete_groups)
+}
+
+pub(crate) async fn locate_target_rows_by_branch_string_apply_key_with_matches(
+    target_table: &iceberg::table::Table,
+    apply_key_column: &str,
+    requested_keys: &[BranchStringApplyKey],
+    existing_deletes_by_file: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
+    referenced_data_file_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
+    partition_filter: &TargetPartitionFilter,
+) -> Result<TargetApplyLocatorResult, String> {
     locate_target_rows_by_apply_key_impl(
         target_table,
         apply_key_column,
@@ -325,6 +401,17 @@ enum ApplyKeyValue {
     Utf8(String),
     BranchInt64(BranchApplyKey),
     BranchUtf8(BranchStringApplyKey),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TargetRowPositionSet {
+    pub(crate) referenced_data_file: String,
+    pub(crate) positions: Vec<i64>,
+}
+
+pub(crate) struct TargetApplyLocatorResult {
+    pub(crate) delete_groups: Vec<crate::connector::iceberg::commit::PositionDeleteGroup>,
+    pub(crate) matched_positions: Vec<TargetRowPositionSet>,
 }
 
 impl std::fmt::Display for ApplyKeyValue {
@@ -673,30 +760,49 @@ fn build_position_delete_groups_from_apply_key_matches(
     matches: std::collections::HashMap<ApplyKeyValue, (String, i64)>,
     referenced_data_file_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
 ) -> Result<Vec<crate::connector::iceberg::commit::PositionDeleteGroup>, String> {
+    Ok(build_target_apply_locator_result_from_apply_key_matches(
+        matches,
+        referenced_data_file_partitions,
+    )?
+    .delete_groups)
+}
+
+fn build_target_apply_locator_result_from_apply_key_matches(
+    matches: std::collections::HashMap<ApplyKeyValue, (String, i64)>,
+    referenced_data_file_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
+) -> Result<TargetApplyLocatorResult, String> {
     let mut by_file = std::collections::BTreeMap::<String, Vec<i64>>::new();
     for (_key, (file, pos)) in matches {
         by_file.entry(file).or_default().push(pos);
     }
 
-    by_file
-        .into_iter()
-        .map(|(referenced_data_file, mut positions)| {
-            positions.sort_unstable();
-            let partition = referenced_data_file_partitions
-                .get(&referenced_data_file)
-                .ok_or_else(|| {
-                    format!(
-                        "matched iceberg MV target data file `{referenced_data_file}` is missing partition metadata"
-                    )
-                })?;
-            Ok(crate::connector::iceberg::commit::PositionDeleteGroup {
-                referenced_data_file,
-                partition_spec_id: partition.partition_spec_id,
-                partition_values: partition.partition_values.clone(),
-                positions,
-            })
-        })
-        .collect()
+    let mut delete_groups = Vec::with_capacity(by_file.len());
+    let mut matched_positions = Vec::with_capacity(by_file.len());
+    for (referenced_data_file, mut positions) in by_file {
+        positions.sort_unstable();
+        let partition = referenced_data_file_partitions
+            .get(&referenced_data_file)
+            .ok_or_else(|| {
+                format!(
+                    "matched iceberg MV target data file `{referenced_data_file}` is missing partition metadata"
+                )
+            })?;
+        matched_positions.push(TargetRowPositionSet {
+            referenced_data_file: referenced_data_file.clone(),
+            positions: positions.clone(),
+        });
+        delete_groups.push(crate::connector::iceberg::commit::PositionDeleteGroup {
+            referenced_data_file,
+            partition_spec_id: partition.partition_spec_id,
+            partition_values: partition.partition_values.clone(),
+            positions,
+        });
+    }
+
+    Ok(TargetApplyLocatorResult {
+        delete_groups,
+        matched_positions,
+    })
 }
 
 async fn locate_target_rows_by_apply_key_impl(
@@ -706,12 +812,15 @@ async fn locate_target_rows_by_apply_key_impl(
     existing_deletes_by_file: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
     referenced_data_file_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
     partition_filter: &TargetPartitionFilter,
-) -> Result<Vec<crate::connector::iceberg::commit::PositionDeleteGroup>, String> {
+) -> Result<TargetApplyLocatorResult, String> {
     use futures::StreamExt;
     use iceberg::arrow::ArrowReaderBuilder;
 
     if requested_keys.is_empty() {
-        return Ok(Vec::new());
+        return Ok(TargetApplyLocatorResult {
+            delete_groups: Vec::new(),
+            matched_positions: Vec::new(),
+        });
     }
 
     let requested = requested_apply_key_values(requested_keys);
@@ -855,7 +964,10 @@ async fn locate_target_rows_by_apply_key_impl(
     }
 
     ensure_all_requested_apply_keys_matched(&requested, &matches)?;
-    build_position_delete_groups_from_apply_key_matches(matches, referenced_data_file_partitions)
+    build_target_apply_locator_result_from_apply_key_matches(
+        matches,
+        referenced_data_file_partitions,
+    )
 }
 
 pub(crate) async fn locate_target_rows_by_apply_key_string(
@@ -1105,6 +1217,54 @@ mod tests {
         assert_eq!(groups[0].referenced_data_file, "file-a.parquet");
         assert_eq!(groups[0].partition_spec_id, 0);
         assert_eq!(groups[0].positions, vec![7]);
+    }
+
+    #[test]
+    fn locator_result_preserves_sorted_matched_positions() {
+        let mut matches = std::collections::HashMap::new();
+        matches.insert(
+            ApplyKeyValue::Utf8("group-b".to_string()),
+            ("file-b.parquet".to_string(), 9),
+        );
+        matches.insert(
+            ApplyKeyValue::Utf8("group-a2".to_string()),
+            ("file-a.parquet".to_string(), 3),
+        );
+        matches.insert(
+            ApplyKeyValue::Utf8("group-a1".to_string()),
+            ("file-a.parquet".to_string(), 7),
+        );
+
+        let result = build_target_apply_locator_result_from_apply_key_matches(
+            matches,
+            &referenced_partitions(),
+        )
+        .expect("locator result");
+
+        assert_eq!(result.delete_groups.len(), 2);
+        assert_eq!(
+            result.delete_groups[0].referenced_data_file,
+            "file-a.parquet"
+        );
+        assert_eq!(result.delete_groups[0].positions, vec![3, 7]);
+        assert_eq!(
+            result.delete_groups[1].referenced_data_file,
+            "file-b.parquet"
+        );
+        assert_eq!(result.delete_groups[1].positions, vec![9]);
+        assert_eq!(
+            result.matched_positions,
+            vec![
+                TargetRowPositionSet {
+                    referenced_data_file: "file-a.parquet".to_string(),
+                    positions: vec![3, 7],
+                },
+                TargetRowPositionSet {
+                    referenced_data_file: "file-b.parquet".to_string(),
+                    positions: vec![9],
+                },
+            ]
+        );
     }
 
     #[test]
@@ -1590,8 +1750,8 @@ mod tests {
         let existing = std::collections::HashMap::new();
         let join_keys = vec!["key-a".to_string()];
 
-        let groups = rt
-            .block_on(super::locate_target_rows_by_string_apply_key(
+        let result = rt
+            .block_on(super::locate_target_rows_by_string_apply_key_with_matches(
                 &target_table,
                 ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
                 &join_keys,
@@ -1606,19 +1766,26 @@ mod tests {
         // one of the two data files (it will be the region=a one), and it must
         // contain exactly one row at position 0.
         assert_eq!(
-            groups.len(),
+            result.delete_groups.len(),
             1,
             "expected exactly one delete group (region=b must be pruned by AllowList)"
         );
         assert!(
-            file_paths.contains(&groups[0].referenced_data_file),
+            file_paths.contains(&result.delete_groups[0].referenced_data_file),
             "delete group references an unknown file: {}",
-            groups[0].referenced_data_file
+            result.delete_groups[0].referenced_data_file
         );
         assert_eq!(
-            groups[0].positions,
+            result.delete_groups[0].positions,
             vec![0i64],
             "one row at position 0 in the matched data file"
+        );
+        assert_eq!(
+            result.matched_positions,
+            vec![TargetRowPositionSet {
+                referenced_data_file: result.delete_groups[0].referenced_data_file.clone(),
+                positions: vec![0],
+            }],
         );
     }
 }
