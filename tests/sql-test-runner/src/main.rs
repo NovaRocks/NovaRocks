@@ -1432,15 +1432,14 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         + execution_r.as_ref().map(|r| r.elapsed).unwrap_or_default();
                     case_elapsed += elapsed;
 
-                    if expected_engine_error_code_diff_result(
+                    let expected_code_result = expected_engine_error_code_diff_result(
                         expected_code,
                         ok_t,
                         &err_t,
                         ok_r,
                         &err_r,
-                    )
-                    .is_ok()
-                    {
+                    );
+                    if expected_code_result.is_ok() {
                         let _ = writeln!(
                             log,
                             "    ✅ DIFF PASS (both sides matched expected error: engine_error_code={})",
@@ -1451,14 +1450,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         let _ = writeln!(
                             log,
                             "    ❌ DIFF FAILED {}",
-                            expected_engine_error_code_diff_result(
-                                expected_code,
-                                ok_t,
-                                &err_t,
-                                ok_r,
-                                &err_r,
-                            )
-                            .expect_err("checked mismatch above")
+                            expected_code_result.expect_err("checked mismatch above")
                         );
                     }
                 } else if let Some(expected_error) = step.meta.expect_error.as_deref() {

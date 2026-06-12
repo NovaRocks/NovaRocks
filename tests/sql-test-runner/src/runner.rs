@@ -12,22 +12,57 @@ pub fn error_message_matches(actual: &str, expected_substring: &str) -> bool {
 }
 
 pub fn extract_engine_error_code(actual: &str) -> Option<String> {
-    let mut rest = actual;
-    while let Some(open_idx) = rest.find('[') {
-        let candidate_start = &rest[open_idx + 1..];
-        let Some(close_idx) = candidate_start.find(']') else {
-            return None;
-        };
-        let candidate = &candidate_start[..close_idx];
-        let mut chars = candidate.chars();
-        if matches!(chars.next(), Some(ch) if ch.is_ascii_uppercase())
-            && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-        {
-            return Some(candidate.to_string());
-        }
-        rest = &candidate_start[close_idx + 1..];
+    let message = engine_error_message_body(actual);
+    let Some(candidate_start) = message.strip_prefix('[') else {
+        return None;
+    };
+    let close_idx = candidate_start.find(']')?;
+    let candidate = &candidate_start[..close_idx];
+    let mut chars = candidate.chars();
+    if matches!(chars.next(), Some(ch) if ch.is_ascii_uppercase())
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        Some(candidate.to_string())
+    } else {
+        None
     }
-    None
+}
+
+fn engine_error_message_body(actual: &str) -> &str {
+    let mut rest = actual.trim_start();
+    loop {
+        if let Some(stripped) = strip_runner_error_prefix(rest) {
+            rest = stripped.trim_start();
+            continue;
+        }
+        if let Some(stripped) = strip_mysql_error_prefix(rest) {
+            rest = stripped.trim_start();
+            continue;
+        }
+        return rest;
+    }
+}
+
+fn strip_runner_error_prefix(message: &str) -> Option<&str> {
+    let rest = message.strip_prefix("ERROR (")?;
+    let close_idx = rest.find("): ")?;
+    Some(&rest[close_idx + "): ".len()..])
+}
+
+fn strip_mysql_error_prefix(message: &str) -> Option<&str> {
+    let rest = message.strip_prefix("ERROR ")?;
+    let mut rest = rest.strip_prefix(|ch: char| ch.is_ascii_digit())?;
+    while let Some(stripped) = rest.strip_prefix(|ch: char| ch.is_ascii_digit()) {
+        rest = stripped;
+    }
+    let rest = rest.strip_prefix(" (")?;
+    let close_idx = rest.find("): ")?;
+    let sql_state = &rest[..close_idx];
+    if sql_state.len() == 5 && sql_state.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+        Some(&rest[close_idx + "): ".len()..])
+    } else {
+        None
+    }
 }
 
 pub fn is_transient_iceberg_commit_error(message: &str) -> bool {
@@ -92,6 +127,26 @@ mod tests {
         assert_eq!(
             extract_engine_error_code(actual),
             Some("IcebergWriteDescriptorMismatch".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_engine_error_code_reads_plain_bracket_prefix() {
+        assert_eq!(
+            extract_engine_error_code("[CommitUnknown] commit outcome unavailable"),
+            Some("CommitUnknown".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_engine_error_code_rejects_non_prefix_brackets() {
+        assert_eq!(
+            extract_engine_error_code("ERROR 1105 (HY000): validation failed near [CommitUnknown]"),
+            None
+        );
+        assert_eq!(
+            extract_engine_error_code("plain context [CommitUnknown]"),
+            None
         );
     }
 
