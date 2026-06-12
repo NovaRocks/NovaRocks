@@ -1,8 +1,8 @@
 //! `ExistentialApplyToJoin` - EXISTS / NOT EXISTS -> LeftSemi / LeftAnti join.
 //!
 //! Self-contained: reads the inner subquery's WHERE directly (no dependency on
-//! PushDownApplyFilter). Output is plan-isomorphic with the legacy rewrite:
-//! correlated EXISTS -> `outer LEFT SEMI JOIN inner ON <inner WHERE>`;
+//! PushDownApplyFilter). Correlated EXISTS becomes
+//! `outer LEFT SEMI JOIN inner ON <normalized correlation predicate>`;
 //! NOT EXISTS -> LEFT ANTI; uncorrelated -> semi/anti ON true.
 
 use super::predicate_apply_util::{lift_correlated_inner, literal_true};
@@ -265,8 +265,8 @@ mod tests {
             panic!("expected binary condition, got: {condition:?}");
         };
         assert_eq!(*op, BinOp::Eq);
-        assert_column_id(left, INNER_K);
-        assert_column_id(right, OUTER_K);
+        assert_column_id(left, OUTER_K);
+        assert_column_id(right, INNER_K);
     }
 
     fn assert_true_condition(condition: &TypedExpr) {

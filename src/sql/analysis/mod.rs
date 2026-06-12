@@ -73,14 +73,11 @@ pub(crate) struct ResolvedSelect {
     pub distinct: bool,
     /// Repeat metadata for ROLLUP/CUBE/GROUPING SETS expansion.
     pub repeat: Option<RepeatInfo>,
-    /// Scalar subqueries routed to the Apply framework (apply mode only;
-    /// always empty in legacy mode). Consumed by the planner to emit
-    /// `LogicalPlan::Apply`.
+    /// Scalar subqueries routed to the Apply framework. Consumed by the
+    /// planner to emit `LogicalPlan::Apply`.
     pub apply_specs: Vec<ApplyScalarSpec>,
-    /// EXISTS/IN subqueries routed to the Apply framework (apply mode only;
-    /// always empty in legacy mode). Consumed by the planner alongside
-    /// `apply_specs` to emit `LogicalPlan::Apply`.
-    // Read by analyzer collection and planner in Task 2/3.
+    /// EXISTS/IN subqueries routed to the Apply framework. Consumed by the
+    /// planner alongside `apply_specs` to emit `LogicalPlan::Apply`.
     #[allow(dead_code)]
     pub predicate_apply_specs: Vec<ApplyPredicateSpec>,
 }
@@ -442,7 +439,7 @@ pub(crate) enum ApplyClause {
     Projection,
 }
 
-/// A scalar subquery the analyzer routed to the Apply framework (apply mode).
+/// A scalar subquery the analyzer routed to the Apply framework.
 /// The planner consumes these to emit `LogicalPlan::Apply`. The inner query is
 /// left INTACT — correlation predicates remain in its WHERE; M1b's
 /// PushDownApplyFilter rule extracts them into the Apply's correlation_conjuncts.
@@ -481,7 +478,7 @@ pub(crate) struct ApplyScalarSpec {
 }
 
 /// An EXISTS / NOT EXISTS / IN / NOT IN subquery routed to the Apply framework
-/// (apply mode). Parallel to `ApplyScalarSpec`; the planner consumes these to
+/// Parallel to `ApplyScalarSpec`; the planner consumes these to
 /// emit `LogicalPlan::Apply` with `ApplyKind::Exists` / `ApplyKind::In`. The
 /// inner query is left INTACT — its WHERE (correlation + residual) is read by
 /// the M3 to-join rules (`ExistentialApplyToJoin` / `QuantifiedApplyToJoin`).

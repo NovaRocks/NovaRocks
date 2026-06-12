@@ -828,9 +828,8 @@ fn plan_select_scoped(
 ) -> Result<LogicalPlan, String> {
     const REPEAT_GROUP_QUALIFIER: &str = "__repeat_group";
 
-    // Take ownership of all apply specs up-front. The three wrap points below
-    // consume them clause by clause. Legacy mode always delivers an empty vec
-    // here (no behavior change).
+    // Take ownership of all apply specs up-front. The wrap points below consume
+    // them clause by clause.
     let mut apply_specs = std::mem::take(&mut select.apply_specs);
     let mut predicate_apply_specs = std::mem::take(&mut select.predicate_apply_specs);
 
@@ -898,11 +897,17 @@ fn plan_select_scoped(
             // not mistakenly promoted into the GROUP BY list. Those columns are
             // produced by Apply nodes that sit ABOVE the Aggregate, so the
             // Aggregate must not try to pass them through as group keys.
-            let having_apply_col_ids: std::collections::HashSet<ColumnId> = apply_specs
+            let mut having_apply_col_ids: std::collections::HashSet<ColumnId> = apply_specs
                 .iter()
                 .filter(|s| s.clause == ApplyClause::Having)
                 .map(|s| s.output_column.column_id)
                 .collect();
+            having_apply_col_ids.extend(
+                predicate_apply_specs
+                    .iter()
+                    .filter(|s| s.clause == ApplyClause::Having)
+                    .map(|s| s.output_column.column_id),
+            );
             let mut extra_gb = Vec::new();
             collect_non_agg_column_refs(having_expr, &select.group_by, &mut extra_gb);
             for col in extra_gb {
@@ -938,6 +943,13 @@ fn plan_select_scoped(
         current = wrap_scalar_applies(
             current,
             &mut apply_specs,
+            ApplyClause::Having,
+            cte_registry,
+            factory,
+        )?;
+        current = wrap_predicate_applies(
+            current,
+            &mut predicate_apply_specs,
             ApplyClause::Having,
             cte_registry,
             factory,
@@ -3628,17 +3640,10 @@ mod tests {
     fn parse_analyze_query_apply(
         sql: &str,
     ) -> Result<(ResolvedQuery, CTERegistry, ColumnRefFactory), String> {
-        use crate::sql::optimizer::options::{
-            SessionOptimizerSettings, SubqueryUnnestMode, with_session_optimizer_settings,
-        };
-        let settings = SessionOptimizerSettings {
-            subquery_unnest_mode: SubqueryUnnestMode::Apply,
-            ..Default::default()
-        };
-        with_session_optimizer_settings(settings, || parse_analyze_query(sql))
+        parse_analyze_query(sql)
     }
 
-    /// Analyze and plan `sql` with `subquery_unnest_mode = Apply`.
+    /// Analyze and plan `sql` with the Apply subquery framework.
     fn parse_analyze_and_plan_apply(sql: &str) -> Result<LogicalPlan, String> {
         let (resolved, cte_registry, mut factory) = parse_analyze_query_apply(sql)?;
         plan_query(resolved, cte_registry, &mut factory)
@@ -5655,14 +5660,14 @@ mod tests {
         }
     }
 
-    /// WHERE-clause scalar subquery in apply mode: the plan must contain an
+    /// WHERE-clause scalar subquery in Apply framework: the plan must contain an
     /// Apply node between the FROM Scan and the WHERE Filter, and the Apply's
     /// output_column must appear in the plan's output column set.
     #[test]
     fn apply_where_spec_emits_apply_below_where_filter() {
         // t1.k1 = (SELECT max(k2) FROM t2 WHERE t2.k1 = t1.k1)
         let sql = "SELECT k1 FROM t1 WHERE k1 = (SELECT max(k2) FROM t2 WHERE t2.k1 = t1.k1)";
-        let plan = parse_analyze_and_plan_apply(sql).expect("apply-mode plan must succeed");
+        let plan = parse_analyze_and_plan_apply(sql).expect("Apply framework plan must succeed");
 
         // Root shape: Project → Filter(WHERE) → Apply → Scan
         let LogicalPlan::Project(project) = &plan else {
@@ -5696,14 +5701,14 @@ mod tests {
         );
     }
 
-    /// HAVING-clause scalar subquery in apply mode: the Apply must appear
+    /// HAVING-clause scalar subquery in Apply framework: the Apply must appear
     /// between the Aggregate and the HAVING Filter.
     #[test]
     fn apply_having_spec_emits_apply_above_aggregate() {
         let sql = "SELECT k1, max(k2) FROM t1 GROUP BY k1 \
                    HAVING max(k2) > (SELECT max(k2) FROM t2 WHERE t2.k1 = t1.k1)";
-        let plan =
-            parse_analyze_and_plan_apply(sql).expect("apply-mode plan must succeed for HAVING");
+        let plan = parse_analyze_and_plan_apply(sql)
+            .expect("Apply framework plan must succeed for HAVING");
 
         // Walk down: Project → Filter(HAVING) → Apply → Aggregate → ...
         let LogicalPlan::Project(project) = &plan else {
@@ -5737,13 +5742,13 @@ mod tests {
         );
     }
 
-    /// Projection-clause scalar subquery in apply mode: the Apply must appear
+    /// Projection-clause scalar subquery in Apply framework: the Apply must appear
     /// below the Project node (Project is above Apply).
     #[test]
     fn apply_projection_spec_emits_apply_below_project() {
         let sql = "SELECT k1, (SELECT max(k2) FROM t2 WHERE t2.k1 = t1.k1) AS sub FROM t1";
-        let plan =
-            parse_analyze_and_plan_apply(sql).expect("apply-mode plan must succeed for Projection");
+        let plan = parse_analyze_and_plan_apply(sql)
+            .expect("Apply framework plan must succeed for Projection");
 
         // Root must be Project; its input must be Apply.
         let LogicalPlan::Project(project) = &plan else {
@@ -5776,13 +5781,13 @@ mod tests {
         );
     }
 
-    fn plan_apply_mode_with_single_predicate_spec(
+    fn plan_with_single_predicate_apply_spec(
         sql: &str,
     ) -> (LogicalPlan, crate::sql::analysis::ApplyPredicateSpec) {
         use crate::sql::analysis::QueryBody;
 
         let (resolved, cte_registry, mut factory) =
-            parse_analyze_query_apply(sql).expect("apply-mode analyze must succeed");
+            parse_analyze_query_apply(sql).expect("Apply framework analyze must succeed");
         let QueryBody::Select(select) = &resolved.body else {
             panic!("expected SELECT body");
         };
@@ -5844,7 +5849,7 @@ mod tests {
     fn plan_exists_builds_apply_exists() {
         let sql = "SELECT k1 FROM t1 WHERE k1 > 0 \
                    AND EXISTS (SELECT 1 FROM t2 WHERE t2.k1 = t1.k1)";
-        let (plan, spec) = plan_apply_mode_with_single_predicate_spec(sql);
+        let (plan, spec) = plan_with_single_predicate_apply_spec(sql);
         assert!(
             !spec.correlation_column_ids.is_empty(),
             "test query must record a correlated EXISTS predicate spec"
@@ -5878,7 +5883,7 @@ mod tests {
     #[test]
     fn plan_not_in_builds_apply_in_negated() {
         let sql = "SELECT k1 FROM t1 WHERE t1.k1 NOT IN (SELECT t2.k2 FROM t2)";
-        let (plan, spec) = plan_apply_mode_with_single_predicate_spec(sql);
+        let (plan, spec) = plan_with_single_predicate_apply_spec(sql);
         assert!(
             spec.correlation_column_ids.is_empty(),
             "test query must record an uncorrelated NOT IN predicate spec"
@@ -5899,7 +5904,7 @@ mod tests {
     #[test]
     fn plan_exists_subquery_expr_is_boolean_colref() {
         let sql = "SELECT k1 FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.k1 = t1.k1)";
-        let (plan, spec) = plan_apply_mode_with_single_predicate_spec(sql);
+        let (plan, spec) = plan_with_single_predicate_apply_spec(sql);
         let apply = direct_where_apply(&plan);
 
         assert_eq!(

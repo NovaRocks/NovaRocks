@@ -33,8 +33,7 @@ impl LogicalRewriteRule for ApplyException {
 pub(super) fn apply_exception_message(node: &ApplyNode) -> String {
     format!(
         "subquery decorrelation failed: a residual Apply node (kind={:?}, correlated={}) \
-         survived the SubqueryRewrite stage; this subquery shape is not yet supported. \
-         Workaround: SET subquery_unnest_mode = 'legacy'",
+         survived the SubqueryRewrite stage; this subquery shape is not yet supported",
         node.kind,
         !node.correlation_column_ids.is_empty()
     )

@@ -4,30 +4,6 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::time::Duration;
 
-/// How subqueries are unnested. `Legacy` keeps the analyzer-time rewrite;
-/// `Apply` routes white-listed shapes through LogicalApply + the
-/// SubqueryRewrite stage; `ApplyStrict` errors instead of falling back for
-/// unsupported shapes (CI / debugging aid). M0 only plumbs the setting —
-/// analyzer routing consumes it starting with M1.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum SubqueryUnnestMode {
-    #[default]
-    Legacy,
-    Apply,
-    ApplyStrict,
-}
-
-impl SubqueryUnnestMode {
-    pub(crate) fn parse(value: &str) -> Option<Self> {
-        match value.to_ascii_lowercase().as_str() {
-            "legacy" => Some(Self::Legacy),
-            "apply" => Some(Self::Apply),
-            "apply_strict" => Some(Self::ApplyStrict),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct SessionOptimizerSettings {
     pub enable_ukfk_opt: bool,
@@ -36,8 +12,6 @@ pub(crate) struct SessionOptimizerSettings {
     pub enable_table_prune_on_update: bool,
     pub enable_eliminate_agg: bool,
     pub disabled_rules: Vec<String>,
-    /// Subquery unnesting routing mode. Read by M1 analyzer routing.
-    pub subquery_unnest_mode: SubqueryUnnestMode,
     /// Session override for the RF build-side maximum size gate (bytes).
     /// `None` means use the StarRocks default (64 MiB).
     pub rf_build_max_bytes: Option<u64>,
@@ -244,31 +218,6 @@ mod tests {
         let o = OptimizerOptions::from_session(&s);
         assert_eq!(o.rf_build_max_bytes, 1);
         assert!((o.rf_probe_min_selectivity - 0.9).abs() < 1e-9);
-    }
-
-    #[test]
-    fn subquery_unnest_mode_parses_known_values() {
-        assert_eq!(
-            SubqueryUnnestMode::parse("legacy"),
-            Some(SubqueryUnnestMode::Legacy)
-        );
-        assert_eq!(
-            SubqueryUnnestMode::parse("APPLY"),
-            Some(SubqueryUnnestMode::Apply)
-        );
-        assert_eq!(
-            SubqueryUnnestMode::parse("apply_strict"),
-            Some(SubqueryUnnestMode::ApplyStrict)
-        );
-        assert_eq!(SubqueryUnnestMode::parse("bogus"), None);
-    }
-
-    #[test]
-    fn subquery_unnest_mode_defaults_to_legacy() {
-        assert_eq!(
-            SessionOptimizerSettings::default().subquery_unnest_mode,
-            SubqueryUnnestMode::Legacy
-        );
     }
 
     #[test]

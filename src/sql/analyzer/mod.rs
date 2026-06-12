@@ -496,11 +496,19 @@ impl<'a> AnalyzerContext<'a> {
                         "GROUP BY position {pos} cannot reference an aggregate expression"
                     ));
                 }
+                if contains_subquery_placeholder(&projection[pos - 1].expr) {
+                    return Err("subquery is not supported in GROUP BY".to_string());
+                }
                 group_by.push(projection[pos - 1].expr.clone());
                 continue;
             }
             match self.analyze_expr(gb_expr, &scope) {
-                Ok(typed) => group_by.push(typed),
+                Ok(typed) => {
+                    if contains_subquery_placeholder(&typed) {
+                        return Err("subquery is not supported in GROUP BY".to_string());
+                    }
+                    group_by.push(typed);
+                }
                 Err(_) => {
                     // Try SELECT aliases: GROUP BY alias_name
                     let mut alias_scope = scope.clone();
@@ -514,7 +522,11 @@ impl<'a> AnalyzerContext<'a> {
                     }
                     let typed = self.analyze_expr(gb_expr, &alias_scope)?;
                     // Substitute alias ref with original expression
-                    group_by.push(self.substitute_select_aliases(typed, &projection));
+                    let typed = self.substitute_select_aliases(typed, &projection);
+                    if contains_subquery_placeholder(&typed) {
+                        return Err("subquery is not supported in GROUP BY".to_string());
+                    }
+                    group_by.push(typed);
                 }
             }
         }
@@ -1404,6 +1416,16 @@ impl<'a> AnalyzerContext<'a> {
                 emitted_grouping_marker_count,
             );
         }
+        for spec in &mut sel.predicate_apply_specs {
+            if let Some(in_lhs) = spec.in_lhs.as_mut() {
+                *in_lhs = replace_grouping_markers_in_typed_expr(
+                    in_lhs,
+                    &grouping_fn_args,
+                    &grouping_fn_ids,
+                    emitted_grouping_marker_count,
+                );
+            }
+        }
 
         // Attach RepeatInfo to the resolved SELECT.
         sel.repeat = Some(RepeatInfo {
@@ -2063,6 +2085,9 @@ impl<'a> AnalyzerContext<'a> {
                 Some(from_scope) => self.rebind_order_by_agg_args(typed, from_scope, false),
                 None => typed,
             };
+            if contains_subquery_placeholder(&typed) {
+                return Err("subquery is not supported in ORDER BY".to_string());
+            }
 
             let asc = ob.options.asc.unwrap_or(true);
             let nulls_first = ob.options.nulls_first.unwrap_or(asc);
@@ -2277,10 +2302,71 @@ impl<'a> AnalyzerContext<'a> {
     }
 }
 
-/// The active subquery-unnesting mode for this statement. Reads the
-/// thread-local session settings installed by the server before execution.
-pub(super) fn subquery_unnest_mode() -> crate::sql::optimizer::options::SubqueryUnnestMode {
-    crate::sql::optimizer::options::current_session_optimizer_settings().subquery_unnest_mode
+fn contains_subquery_placeholder(expr: &TypedExpr) -> bool {
+    match &expr.kind {
+        ExprKind::SubqueryPlaceholder { .. } => true,
+        ExprKind::BinaryOp { left, right, .. } => {
+            contains_subquery_placeholder(left) || contains_subquery_placeholder(right)
+        }
+        ExprKind::UnaryOp { expr, .. }
+        | ExprKind::Cast { expr, .. }
+        | ExprKind::IsNull { expr, .. }
+        | ExprKind::IsTruthValue { expr, .. } => contains_subquery_placeholder(expr),
+        ExprKind::FunctionCall { args, .. } => args.iter().any(contains_subquery_placeholder),
+        ExprKind::LambdaFunction { body, .. } | ExprKind::Lambda { body, .. } => {
+            contains_subquery_placeholder(body)
+        }
+        ExprKind::AggregateCall { args, order_by, .. } => {
+            args.iter().any(contains_subquery_placeholder)
+                || order_by
+                    .iter()
+                    .any(|item| contains_subquery_placeholder(&item.expr))
+        }
+        ExprKind::InList { expr, list, .. } => {
+            contains_subquery_placeholder(expr) || list.iter().any(contains_subquery_placeholder)
+        }
+        ExprKind::Between {
+            expr, low, high, ..
+        } => {
+            contains_subquery_placeholder(expr)
+                || contains_subquery_placeholder(low)
+                || contains_subquery_placeholder(high)
+        }
+        ExprKind::Like { expr, pattern, .. } => {
+            contains_subquery_placeholder(expr) || contains_subquery_placeholder(pattern)
+        }
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|expr| contains_subquery_placeholder(expr))
+                || when_then.iter().any(|(when, then)| {
+                    contains_subquery_placeholder(when) || contains_subquery_placeholder(then)
+                })
+                || else_expr
+                    .as_ref()
+                    .is_some_and(|expr| contains_subquery_placeholder(expr))
+        }
+        ExprKind::Nested(inner) => contains_subquery_placeholder(inner),
+        ExprKind::WindowCall {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            args.iter().any(contains_subquery_placeholder)
+                || partition_by.iter().any(contains_subquery_placeholder)
+                || order_by
+                    .iter()
+                    .any(|item| contains_subquery_placeholder(&item.expr))
+        }
+        ExprKind::ColumnRef { .. } | ExprKind::LambdaParamRef { .. } | ExprKind::Literal(_) => {
+            false
+        }
+    }
 }
 
 fn select_item_output_column_id(
@@ -3834,7 +3920,10 @@ fn is_bitmap_or_hll_type(sql_type: &crate::sql::SqlType) -> bool {
 mod tests {
     use super::*;
     use crate::connector::iceberg::IcebergMetadataTableType;
-    use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, Relation};
+    use crate::sql::analysis::{
+        ApplyClause, ApplyPredicateSpec, ApplyScalarSpec, BinOp, ExprKind, LiteralValue, Relation,
+        SubqueryKind,
+    };
     use crate::sql::catalog::{
         ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef, TableLookupMode,
     };
@@ -4370,40 +4459,6 @@ mod tests {
         );
     }
 
-    /// Helper to check that a Relation tree contains a JOIN of a given kind.
-    fn has_join_kind(rel: &Relation, kind: JoinKind) -> bool {
-        match rel {
-            Relation::Join(jr) => {
-                jr.join_type == kind
-                    || has_join_kind(&jr.left, kind)
-                    || has_join_kind(&jr.right, kind)
-            }
-            _ => false,
-        }
-    }
-
-    fn find_generate_series_output_id(rel: &Relation) -> Option<ColumnId> {
-        match rel {
-            Relation::GenerateSeries(gs) => Some(gs.output_column_id),
-            Relation::Join(jr) => find_generate_series_output_id(&jr.left)
-                .or_else(|| find_generate_series_output_id(&jr.right)),
-            _ => None,
-        }
-    }
-
-    fn find_join_kind<'a>(
-        rel: &'a Relation,
-        kind: JoinKind,
-    ) -> Option<&'a crate::sql::analysis::JoinRelation> {
-        match rel {
-            Relation::Join(jr) if jr.join_type == kind => Some(jr),
-            Relation::Join(jr) => {
-                find_join_kind(&jr.left, kind).or_else(|| find_join_kind(&jr.right, kind))
-            }
-            _ => None,
-        }
-    }
-
     fn expr_has_qualified_column(expr: &TypedExpr, qualifier: &str, column: &str) -> bool {
         match &expr.kind {
             ExprKind::ColumnRef {
@@ -4443,51 +4498,6 @@ mod tests {
                     || list
                         .iter()
                         .any(|item| expr_has_qualified_column(item, qualifier, column))
-            }
-            _ => false,
-        }
-    }
-
-    fn expr_has_function_call(expr: &TypedExpr, function_name: &str) -> bool {
-        match &expr.kind {
-            ExprKind::FunctionCall { name, args, .. } => {
-                name.eq_ignore_ascii_case(function_name)
-                    || args
-                        .iter()
-                        .any(|arg| expr_has_function_call(arg, function_name))
-            }
-            ExprKind::BinaryOp { left, right, .. } => {
-                expr_has_function_call(left, function_name)
-                    || expr_has_function_call(right, function_name)
-            }
-            ExprKind::UnaryOp { expr, .. }
-            | ExprKind::IsNull { expr, .. }
-            | ExprKind::Cast { expr, .. }
-            | ExprKind::Nested(expr) => expr_has_function_call(expr, function_name),
-            ExprKind::AggregateCall { args, .. } => args
-                .iter()
-                .any(|arg| expr_has_function_call(arg, function_name)),
-            ExprKind::Case {
-                operand,
-                when_then,
-                else_expr,
-            } => {
-                operand
-                    .as_ref()
-                    .is_some_and(|expr| expr_has_function_call(expr, function_name))
-                    || when_then.iter().any(|(when, then)| {
-                        expr_has_function_call(when, function_name)
-                            || expr_has_function_call(then, function_name)
-                    })
-                    || else_expr
-                        .as_ref()
-                        .is_some_and(|expr| expr_has_function_call(expr, function_name))
-            }
-            ExprKind::InList { expr, list, .. } => {
-                expr_has_function_call(expr, function_name)
-                    || list
-                        .iter()
-                        .any(|item| expr_has_function_call(item, function_name))
             }
             _ => false,
         }
@@ -4537,39 +4547,40 @@ mod tests {
         }
     }
 
-    fn expr_has_cast_to(expr: &TypedExpr, target: &arrow::datatypes::DataType) -> bool {
-        match &expr.kind {
-            ExprKind::Cast { expr, target: ty } => ty == target || expr_has_cast_to(expr, target),
-            ExprKind::BinaryOp { left, right, .. } => {
-                expr_has_cast_to(left, target) || expr_has_cast_to(right, target)
-            }
-            ExprKind::UnaryOp { expr, .. }
-            | ExprKind::IsNull { expr, .. }
-            | ExprKind::Nested(expr) => expr_has_cast_to(expr, target),
-            ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
-                args.iter().any(|arg| expr_has_cast_to(arg, target))
-            }
-            ExprKind::Case {
-                operand,
-                when_then,
-                else_expr,
-            } => {
-                operand
-                    .as_ref()
-                    .is_some_and(|expr| expr_has_cast_to(expr, target))
-                    || when_then.iter().any(|(when, then)| {
-                        expr_has_cast_to(when, target) || expr_has_cast_to(then, target)
-                    })
-                    || else_expr
-                        .as_ref()
-                        .is_some_and(|expr| expr_has_cast_to(expr, target))
-            }
-            ExprKind::InList { expr, list, .. } => {
-                expr_has_cast_to(expr, target)
-                    || list.iter().any(|item| expr_has_cast_to(item, target))
-            }
-            _ => false,
-        }
+    fn select_body(resolved: &ResolvedQuery) -> &ResolvedSelect {
+        let QueryBody::Select(sel) = &resolved.body else {
+            panic!("expected Select body");
+        };
+        sel
+    }
+
+    fn only_predicate_spec(sel: &ResolvedSelect) -> &ApplyPredicateSpec {
+        assert_eq!(
+            sel.predicate_apply_specs.len(),
+            1,
+            "expected one predicate Apply spec: {:?}",
+            sel.predicate_apply_specs
+        );
+        &sel.predicate_apply_specs[0]
+    }
+
+    fn only_scalar_spec(sel: &ResolvedSelect) -> &ApplyScalarSpec {
+        assert_eq!(
+            sel.apply_specs.len(),
+            1,
+            "expected one scalar Apply spec: {:?}",
+            sel.apply_specs
+        );
+        &sel.apply_specs[0]
+    }
+
+    fn apply_inner_filter(query: &ResolvedQuery) -> &TypedExpr {
+        let QueryBody::Select(sel) = &query.body else {
+            panic!("expected Select body in Apply inner query");
+        };
+        sel.filter
+            .as_ref()
+            .expect("expected Apply inner query filter")
     }
 
     #[test]
@@ -4578,53 +4589,42 @@ mod tests {
                     WHERE exists (SELECT * FROM lineitem WHERE l_orderkey = o_orderkey) \
                     GROUP BY o_orderpriority";
         let resolved = parse_and_analyze(sql).expect("analysis should succeed");
-        if let QueryBody::Select(sel) = &resolved.body {
-            let from = sel.from.as_ref().expect("should have FROM");
-            assert!(
-                has_join_kind(from, JoinKind::LeftSemi),
-                "EXISTS should be rewritten to LEFT SEMI JOIN, got: {from:?}"
-            );
-            // The placeholder should be removed from the filter
-            assert!(
-                sel.filter.is_none() || !filter_has_placeholder(&sel.filter),
-                "filter should not contain SubqueryPlaceholder"
-            );
-        } else {
-            panic!("expected Select body");
-        }
+        let sel = select_body(&resolved);
+        let spec = only_predicate_spec(sel);
+        assert!(matches!(spec.kind, SubqueryKind::Exists { negated: false }));
+        assert_eq!(spec.clause, ApplyClause::Where);
+        assert!(spec.use_semi_anti);
+        assert!(
+            sel.filter.is_none() || !filter_has_placeholder(&sel.filter),
+            "filter should not contain SubqueryPlaceholder"
+        );
     }
 
     #[test]
-    fn correlated_exists_self_join_keeps_outer_qualifier_for_ambiguous_column() {
+    fn correlated_exists_self_join_apply_inner_keeps_outer_qualifier_for_ambiguous_column() {
         let sql = "SELECT l1.l_orderkey FROM lineitem l1 \
                    WHERE EXISTS (SELECT 1 FROM lineitem l2 \
                                  WHERE l2.l_partkey = l1.l_suppkey)";
         let resolved = parse_and_analyze(sql).expect("analysis should succeed");
-        let QueryBody::Select(sel) = &resolved.body else {
-            panic!("expected Select body");
-        };
-        let semi = find_join_kind(
-            sel.from.as_ref().expect("should have FROM"),
-            JoinKind::LeftSemi,
-        )
-        .expect("EXISTS should rewrite to LEFT SEMI JOIN");
-        let cond = semi.condition.as_ref().expect("semi join condition");
+        let sel = select_body(&resolved);
+        let spec = only_predicate_spec(sel);
+        let cond = apply_inner_filter(&spec.inner);
 
         assert!(
             expr_has_qualified_column(cond, "l1", "l_suppkey"),
-            "outer self-join column must keep its qualifier in correlated EXISTS condition: {cond:?}"
+            "outer self-join column must keep its qualifier in correlated EXISTS filter: {cond:?}"
         );
         let ExprKind::BinaryOp { left, op, right } = &cond.kind else {
             panic!("expected binary correlation condition, got: {cond:?}");
         };
         assert_eq!(*op, BinOp::Eq);
         assert!(
-            expr_has_qualified_column(left, "l1", "l_suppkey"),
-            "outer column must be on the probe/left side of correlated EXISTS condition: {cond:?}"
+            expr_has_qualified_column(left, "l2", "l_partkey"),
+            "inner column should stay on the original SQL left side in Apply inner filter: {cond:?}"
         );
         assert!(
-            expr_has_qualified_column(right, "l2", "l_partkey"),
-            "inner column must be on the build/right side of correlated EXISTS condition: {cond:?}"
+            expr_has_qualified_column(right, "l1", "l_suppkey"),
+            "outer column should stay on the original SQL right side in Apply inner filter: {cond:?}"
         );
     }
 
@@ -4650,24 +4650,13 @@ mod tests {
                                   AND l_suppkey = s_suppkey \
                                   AND s_name = 'test')";
         let resolved = parse_and_analyze(sql).expect("analysis should succeed");
-        if let QueryBody::Select(sel) = &resolved.body {
-            let from = sel.from.as_ref().expect("should have FROM");
-            assert!(
-                has_join_kind(from, JoinKind::LeftSemi),
-                "EXISTS should be rewritten to LEFT SEMI JOIN"
-            );
-            // Verify the SEMI JOIN condition exists (predicates were hoisted here).
-            if let Relation::Join(join_rel) = from {
-                assert!(
-                    join_rel.condition.is_some(),
-                    "SEMI JOIN should have a condition (hoisted predicates)"
-                );
-            } else {
-                panic!("expected Join relation");
-            }
-        } else {
-            panic!("expected Select body");
-        }
+        let sel = select_body(&resolved);
+        let spec = only_predicate_spec(sel);
+        assert!(matches!(spec.kind, SubqueryKind::Exists { negated: false }));
+        assert!(
+            apply_inner_filter(&spec.inner).data_type == arrow::datatypes::DataType::Boolean,
+            "inner EXISTS filter should retain correlation and residual predicates"
+        );
     }
 
     #[test]
@@ -4675,15 +4664,10 @@ mod tests {
         let sql = "SELECT o_orderpriority FROM orders \
                     WHERE not exists (SELECT * FROM lineitem WHERE l_orderkey = o_orderkey)";
         let resolved = parse_and_analyze(sql).expect("analysis should succeed");
-        if let QueryBody::Select(sel) = &resolved.body {
-            let from = sel.from.as_ref().expect("should have FROM");
-            assert!(
-                has_join_kind(from, JoinKind::LeftAnti),
-                "NOT EXISTS should be rewritten to LEFT ANTI JOIN"
-            );
-        } else {
-            panic!("expected Select body");
-        }
+        let sel = select_body(&resolved);
+        let spec = only_predicate_spec(sel);
+        assert!(matches!(spec.kind, SubqueryKind::Exists { negated: true }));
+        assert_eq!(spec.clause, ApplyClause::Where);
     }
 
     #[test]
@@ -4691,15 +4675,13 @@ mod tests {
         let sql = "SELECT o_orderkey FROM orders \
                     WHERE o_orderkey IN (SELECT l_orderkey FROM lineitem)";
         let resolved = parse_and_analyze(sql).expect("analysis should succeed");
-        if let QueryBody::Select(sel) = &resolved.body {
-            let from = sel.from.as_ref().expect("should have FROM");
-            assert!(
-                has_join_kind(from, JoinKind::LeftSemi),
-                "IN should be rewritten to LEFT SEMI JOIN"
-            );
-        } else {
-            panic!("expected Select body");
-        }
+        let sel = select_body(&resolved);
+        let spec = only_predicate_spec(sel);
+        assert!(matches!(
+            spec.kind,
+            SubqueryKind::InSubquery { negated: false }
+        ));
+        assert!(spec.in_lhs.is_some());
     }
 
     #[test]
@@ -4707,15 +4689,13 @@ mod tests {
         let sql = "SELECT s_suppkey FROM supplier \
                     WHERE s_suppkey NOT IN (SELECT ps_suppkey FROM partsupp)";
         let resolved = parse_and_analyze(sql).expect("analysis should succeed");
-        if let QueryBody::Select(sel) = &resolved.body {
-            let from = sel.from.as_ref().expect("should have FROM");
-            assert!(
-                has_join_kind(from, JoinKind::LeftAnti),
-                "NOT IN should be rewritten to LEFT ANTI JOIN"
-            );
-        } else {
-            panic!("expected Select body");
-        }
+        let sel = select_body(&resolved);
+        let spec = only_predicate_spec(sel);
+        assert!(matches!(
+            spec.kind,
+            SubqueryKind::InSubquery { negated: true }
+        ));
+        assert!(spec.in_lhs.is_some());
     }
 
     #[test]
@@ -4725,18 +4705,14 @@ mod tests {
                        SELECT l2.l_shipdate FROM lineitem l2 \
                        WHERE l2.l_suppkey = l1.l_suppkey)";
         let resolved = parse_and_analyze(sql).expect("analysis should succeed");
-        let QueryBody::Select(sel) = &resolved.body else {
-            panic!("expected Select body");
-        };
+        let sel = select_body(&resolved);
+        let spec = only_predicate_spec(sel);
 
         assert!(
-            has_join_kind(
-                sel.from.as_ref().expect("should have FROM"),
-                JoinKind::NullAwareLeftAnti,
-            ),
-            "correlated nullable NOT IN should use NullAwareLeftAnti, got: {:?}",
-            sel.from
+            matches!(spec.kind, SubqueryKind::InSubquery { negated: true }),
+            "correlated nullable NOT IN should be routed as a negated IN Apply spec"
         );
+        assert!(spec.in_lhs.as_ref().is_some_and(|lhs| lhs.nullable));
     }
 
     #[test]
@@ -4746,19 +4722,14 @@ mod tests {
                        SELECT l2.l_shipdate FROM lineitem l2 \
                        WHERE l2.l_receiptdate = l1.l_receiptdate)";
         let resolved = parse_and_analyze(sql).expect("analysis should succeed");
-        let QueryBody::Select(sel) = &resolved.body else {
-            panic!("expected Select body");
-        };
-        let anti = find_join_kind(
-            sel.from.as_ref().expect("should have FROM"),
-            JoinKind::NullAwareLeftAnti,
-        )
-        .expect("nullable NOT IN should rewrite to NULL AWARE LEFT ANTI JOIN");
-        let cond = anti.condition.as_ref().expect("anti join condition");
+        let sel = select_body(&resolved);
+        let spec = only_predicate_spec(sel);
+        let filter = apply_inner_filter(&spec.inner);
 
         assert!(
-            expr_has_function_call(cond, "coalesce"),
-            "nullable correlated NOT IN filter must stay as residual, got: {cond:?}"
+            expr_has_qualified_column(filter, "l1", "l_receiptdate")
+                && expr_has_qualified_column(filter, "l2", "l_receiptdate"),
+            "correlated NOT IN filter should stay in Apply inner query, got: {filter:?}"
         );
     }
 
@@ -4768,21 +4739,9 @@ mod tests {
                    FROM t1 FULL OUTER JOIN t2 USING(k1, k2) \
                    WHERE EXISTS (SELECT 1 FROM t3 WHERE t3.k1 = k1 AND t3.k2 = k2)";
         let resolved = parse_and_analyze(sql).expect("analysis should succeed");
-        let QueryBody::Select(sel) = &resolved.body else {
-            panic!("expected Select body");
-        };
-        let exists_join = find_join_kind(
-            sel.from.as_ref().expect("should have FROM"),
-            JoinKind::LeftOuter,
-        )
-        .expect("uncorrelated EXISTS should rewrite to LEFT OUTER indicator JOIN");
-        let Relation::Subquery { query, .. } = &exists_join.right else {
-            panic!("EXISTS indicator join should keep the subquery on the right");
-        };
-        let QueryBody::Select(sub_sel) = &query.body else {
-            panic!("expected subquery SELECT body");
-        };
-        let cond = sub_sel.filter.as_ref().expect("subquery filter");
+        let sel = select_body(&resolved);
+        let spec = only_predicate_spec(sel);
+        let cond = apply_inner_filter(&spec.inner);
 
         assert!(
             !expr_has_qualified_column(cond, "t1", "k1")
@@ -4801,27 +4760,20 @@ mod tests {
     }
 
     #[test]
-    fn correlated_exists_reoriented_key_preserves_original_left_compare_type() {
+    fn correlated_exists_apply_inner_preserves_original_compare_sides() {
         let sql = "SELECT s.s_1 FROM array_test s \
                    WHERE EXISTS (SELECT 1 FROM array_test t WHERE t.s_1 = s.d_1)";
         let resolved = parse_and_analyze(sql).expect("analysis should succeed");
-        let QueryBody::Select(sel) = &resolved.body else {
-            panic!("expected Select body");
-        };
-        let semi = find_join_kind(
-            sel.from.as_ref().expect("should have FROM"),
-            JoinKind::LeftSemi,
-        )
-        .expect("EXISTS should rewrite to LEFT SEMI JOIN");
-        let cond = semi.condition.as_ref().expect("semi join condition");
-        let string_array = arrow::datatypes::DataType::List(
-            arrow::datatypes::Field::new("item", arrow::datatypes::DataType::Utf8, true).into(),
-        );
+        let sel = select_body(&resolved);
+        let spec = only_predicate_spec(sel);
+        let cond = apply_inner_filter(&spec.inner);
 
-        assert!(
-            expr_has_cast_to(cond, &string_array),
-            "reoriented correlated EXISTS key should cast outer key to original left type: {cond:?}"
-        );
+        let ExprKind::BinaryOp { left, op, right } = &cond.kind else {
+            panic!("expected binary correlation condition, got: {cond:?}");
+        };
+        assert_eq!(*op, BinOp::Eq);
+        assert!(expr_has_qualified_column(left, "t", "s_1"));
+        assert!(expr_has_qualified_column(right, "s", "d_1"));
     }
 
     #[test]
@@ -4829,24 +4781,18 @@ mod tests {
         let sql = "SELECT c_custkey FROM customer \
                     WHERE c_acctbal > (SELECT avg(c_acctbal) FROM customer WHERE c_acctbal > 0)";
         let resolved = parse_and_analyze(sql).expect("analysis should succeed");
-        if let QueryBody::Select(sel) = &resolved.body {
-            let from = sel.from.as_ref().expect("should have FROM");
-            assert!(
-                has_join_kind(from, JoinKind::Cross),
-                "uncorrelated scalar subquery should be rewritten to CROSS JOIN, got: {from:?}"
-            );
-            // The filter should still exist (the comparison) but no placeholder
-            assert!(
-                sel.filter.is_some(),
-                "filter should still contain the comparison"
-            );
-            assert!(
-                !filter_has_placeholder(&sel.filter),
-                "filter should not contain SubqueryPlaceholder"
-            );
-        } else {
-            panic!("expected Select body");
-        }
+        let sel = select_body(&resolved);
+        let spec = only_scalar_spec(sel);
+        assert_eq!(spec.clause, ApplyClause::Where);
+        assert!(spec.correlation_column_ids.is_empty());
+        assert!(
+            sel.filter.is_some(),
+            "filter should still contain the comparison"
+        );
+        assert!(
+            !filter_has_placeholder(&sel.filter),
+            "filter should not contain SubqueryPlaceholder"
+        );
     }
 
     #[test]
@@ -4855,15 +4801,13 @@ mod tests {
                     WHERE p_partkey = l_partkey \
                     AND l_quantity < (SELECT 0.2 * avg(l_quantity) FROM lineitem WHERE l_partkey = p_partkey)";
         let resolved = parse_and_analyze(sql).expect("analysis should succeed");
-        if let QueryBody::Select(sel) = &resolved.body {
-            let from = sel.from.as_ref().expect("should have FROM");
-            assert!(
-                has_join_kind(from, JoinKind::LeftOuter),
-                "correlated scalar subquery should be rewritten to LEFT OUTER JOIN, got: {from:?}"
-            );
-        } else {
-            panic!("expected Select body");
-        }
+        let sel = select_body(&resolved);
+        let spec = only_scalar_spec(sel);
+        assert_eq!(spec.clause, ApplyClause::Where);
+        assert!(
+            !spec.correlation_column_ids.is_empty(),
+            "correlated scalar subquery should record outer correlation columns"
+        );
     }
 
     #[test]
@@ -4872,15 +4816,13 @@ mod tests {
                     GROUP BY ps_partkey \
                     HAVING sum(ps_supplycost) > (SELECT sum(ps_supplycost) * 0.0001 FROM partsupp)";
         let resolved = parse_and_analyze(sql).expect("analysis should succeed");
-        if let QueryBody::Select(sel) = &resolved.body {
-            let from = sel.from.as_ref().expect("should have FROM");
-            assert!(
-                has_join_kind(from, JoinKind::Cross),
-                "scalar subquery in HAVING should be rewritten to CROSS JOIN"
-            );
-        } else {
-            panic!("expected Select body");
-        }
+        let sel = select_body(&resolved);
+        let spec = only_scalar_spec(sel);
+        assert_eq!(spec.clause, ApplyClause::Having);
+        assert!(
+            sel.having.is_some() && !filter_has_placeholder(&sel.having),
+            "HAVING should retain comparison with scalar Apply output and no placeholder"
+        );
     }
 
     #[test]
@@ -4892,26 +4834,24 @@ mod tests {
         let sql = "SELECT COALESCE((SELECT count(*) FROM customer WHERE c_acctbal > 0), 0) AS n_pos, \
              COALESCE((SELECT count(*) FROM customer WHERE c_acctbal < 0), 0) AS n_neg";
         let resolved = parse_and_analyze(sql).expect("analysis should succeed");
-        if let QueryBody::Select(sel) = &resolved.body {
-            let from = sel
-                .from
-                .as_ref()
-                .expect("rewriter should have synthesized a FROM");
-            // Each scalar subquery joins onto the dummy via CROSS JOIN.
-            assert!(
-                has_join_kind(from, JoinKind::Cross),
-                "scalar subquery without outer FROM should produce CROSS JOIN, got: {from:?}"
-            );
-            let dummy_output_id =
-                find_generate_series_output_id(from).expect("dummy GenerateSeries should exist");
-            assert_ne!(
-                dummy_output_id,
-                ColumnId::UNSET,
-                "dummy GenerateSeries must carry a real ColumnId"
-            );
-        } else {
-            panic!("expected Select body");
-        }
+        let sel = select_body(&resolved);
+        assert!(
+            sel.from.is_none(),
+            "analyzer should not synthesize FROM for Apply specs"
+        );
+        assert_eq!(sel.apply_specs.len(), 2);
+        assert!(
+            sel.apply_specs
+                .iter()
+                .all(|spec| spec.clause == ApplyClause::Projection),
+            "projection scalar subqueries should be routed to projection Apply specs"
+        );
+        assert!(
+            sel.projection
+                .iter()
+                .all(|item| !expr_has_placeholder(&item.expr)),
+            "projection should not contain SubqueryPlaceholder"
+        );
     }
 
     #[test]
@@ -4923,23 +4863,24 @@ mod tests {
                     AND exists (SELECT * FROM lineitem l2 WHERE l2.l_orderkey = l1.l_orderkey AND l2.l_suppkey <> l1.l_suppkey) \
                     AND not exists (SELECT * FROM lineitem l3 WHERE l3.l_orderkey = l1.l_orderkey AND l3.l_suppkey <> l1.l_suppkey)";
         let resolved = parse_and_analyze(sql).expect("analysis should succeed");
-        if let QueryBody::Select(sel) = &resolved.body {
-            let from = sel.from.as_ref().expect("should have FROM");
-            assert!(
-                has_join_kind(from, JoinKind::LeftSemi),
-                "EXISTS should produce LEFT SEMI JOIN"
-            );
-            assert!(
-                has_join_kind(from, JoinKind::LeftAnti),
-                "NOT EXISTS should produce LEFT ANTI JOIN"
-            );
-            assert!(
-                !filter_has_placeholder(&sel.filter),
-                "filter should not contain SubqueryPlaceholder"
-            );
-        } else {
-            panic!("expected Select body");
-        }
+        let sel = select_body(&resolved);
+        assert_eq!(sel.predicate_apply_specs.len(), 2);
+        assert!(
+            sel.predicate_apply_specs
+                .iter()
+                .any(|spec| matches!(spec.kind, SubqueryKind::Exists { negated: false })),
+            "EXISTS should produce a predicate Apply spec"
+        );
+        assert!(
+            sel.predicate_apply_specs
+                .iter()
+                .any(|spec| matches!(spec.kind, SubqueryKind::Exists { negated: true })),
+            "NOT EXISTS should produce a predicate Apply spec"
+        );
+        assert!(
+            !filter_has_placeholder(&sel.filter),
+            "filter should not contain SubqueryPlaceholder"
+        );
     }
 
     #[test]
@@ -4960,15 +4901,13 @@ mod tests {
         let sql = "SELECT o_orderkey FROM orders \
                     WHERE o_orderkey IN (SELECT l_orderkey FROM lineitem GROUP BY l_orderkey HAVING sum(l_quantity) > 315)";
         let resolved = parse_and_analyze(sql).expect("analysis should succeed");
-        if let QueryBody::Select(sel) = &resolved.body {
-            let from = sel.from.as_ref().expect("should have FROM");
-            assert!(
-                has_join_kind(from, JoinKind::LeftSemi),
-                "IN subquery should be rewritten to LEFT SEMI JOIN"
-            );
-        } else {
-            panic!("expected Select body");
-        }
+        let sel = select_body(&resolved);
+        let spec = only_predicate_spec(sel);
+        assert!(matches!(
+            spec.kind,
+            SubqueryKind::InSubquery { negated: false }
+        ));
+        assert!(spec.in_lhs.is_some());
     }
 
     fn filter_has_placeholder(filter: &Option<TypedExpr>) -> bool {
@@ -5747,6 +5686,80 @@ mod tests {
         }
     }
 
+    fn expr_contains_column_id(expr: &TypedExpr, target: crate::sql::column_id::ColumnId) -> bool {
+        match &expr.kind {
+            ExprKind::ColumnRef { column_id, .. } => *column_id == target,
+            ExprKind::BinaryOp { left, right, .. } => {
+                expr_contains_column_id(left, target) || expr_contains_column_id(right, target)
+            }
+            ExprKind::UnaryOp { expr, .. }
+            | ExprKind::Cast { expr, .. }
+            | ExprKind::IsNull { expr, .. }
+            | ExprKind::IsTruthValue { expr, .. }
+            | ExprKind::Nested(expr)
+            | ExprKind::LambdaFunction { body: expr, .. }
+            | ExprKind::Lambda { body: expr, .. } => expr_contains_column_id(expr, target),
+            ExprKind::FunctionCall { args, .. } => {
+                args.iter().any(|arg| expr_contains_column_id(arg, target))
+            }
+            ExprKind::AggregateCall { args, order_by, .. } => {
+                args.iter().any(|arg| expr_contains_column_id(arg, target))
+                    || order_by
+                        .iter()
+                        .any(|item| expr_contains_column_id(&item.expr, target))
+            }
+            ExprKind::InList { expr, list, .. } => {
+                expr_contains_column_id(expr, target)
+                    || list
+                        .iter()
+                        .any(|item| expr_contains_column_id(item, target))
+            }
+            ExprKind::Between {
+                expr, low, high, ..
+            } => {
+                expr_contains_column_id(expr, target)
+                    || expr_contains_column_id(low, target)
+                    || expr_contains_column_id(high, target)
+            }
+            ExprKind::Like { expr, pattern, .. } => {
+                expr_contains_column_id(expr, target) || expr_contains_column_id(pattern, target)
+            }
+            ExprKind::Case {
+                operand,
+                when_then,
+                else_expr,
+            } => {
+                operand
+                    .as_ref()
+                    .is_some_and(|expr| expr_contains_column_id(expr, target))
+                    || when_then.iter().any(|(when, then)| {
+                        expr_contains_column_id(when, target)
+                            || expr_contains_column_id(then, target)
+                    })
+                    || else_expr
+                        .as_ref()
+                        .is_some_and(|expr| expr_contains_column_id(expr, target))
+            }
+            ExprKind::WindowCall {
+                args,
+                partition_by,
+                order_by,
+                ..
+            } => {
+                args.iter().any(|arg| expr_contains_column_id(arg, target))
+                    || partition_by
+                        .iter()
+                        .any(|expr| expr_contains_column_id(expr, target))
+                    || order_by
+                        .iter()
+                        .any(|item| expr_contains_column_id(&item.expr, target))
+            }
+            ExprKind::LambdaParamRef { .. }
+            | ExprKind::Literal(_)
+            | ExprKind::SubqueryPlaceholder { .. } => false,
+        }
+    }
+
     fn contains_grouping_marker_literal(expr: &TypedExpr) -> bool {
         match &expr.kind {
             ExprKind::Literal(crate::sql::analysis::LiteralValue::Int(v)) if *v <= -9000 => true,
@@ -5815,30 +5828,6 @@ mod tests {
             | ExprKind::LambdaParamRef { .. }
             | ExprKind::Literal(_)
             | ExprKind::SubqueryPlaceholder { .. } => false,
-        }
-    }
-
-    fn find_grouping_ref_id_in_relation(
-        rel: &Relation,
-        name: &str,
-    ) -> Option<crate::sql::column_id::ColumnId> {
-        match rel {
-            Relation::Join(join) => join
-                .condition
-                .as_ref()
-                .and_then(|expr| find_grouping_ref_id(expr, name))
-                .or_else(|| find_grouping_ref_id_in_relation(&join.left, name))
-                .or_else(|| find_grouping_ref_id_in_relation(&join.right, name)),
-            Relation::Unnest(unnest) => unnest
-                .args
-                .iter()
-                .find_map(|expr| find_grouping_ref_id(expr, name)),
-            Relation::Scan(_)
-            | Relation::IcebergMetadataScan(_)
-            | Relation::IcebergDeltaScan(_)
-            | Relation::Subquery { .. }
-            | Relation::GenerateSeries(_)
-            | Relation::CTEConsume { .. } => None,
         }
     }
 
@@ -6042,13 +6031,15 @@ mod tests {
         let QueryBody::Select(sel) = &resolved.body else {
             panic!("expected Select body");
         };
-        let from = sel.from.as_ref().expect("expected rewritten FROM relation");
+        let spec = only_predicate_spec(sel);
         let gb_id = grouping_fn_group_by_id(sel, "__grouping_fn_0");
-        let join_id = find_grouping_ref_id_in_relation(from, "__grouping_fn_0")
-            .expect("expected rewritten join condition grouping ColumnRef");
-        assert_eq!(
-            join_id, gb_id,
-            "rewritten join condition grouping ref must reuse the group-by key id"
+        let lhs = spec
+            .in_lhs
+            .as_ref()
+            .expect("HAVING IN Apply spec should retain analyzed LHS");
+        assert!(
+            expr_contains_column_id(lhs, gb_id),
+            "Apply IN LHS grouping ref must reuse the group-by key id"
         );
         assert!(
             !outer_select_contains_grouping_marker_literal(sel),
@@ -6820,17 +6811,13 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Task 3 — apply-mode scalar subquery routing tests
+    // Task 3 — Apply framework scalar subquery routing tests
     // ---------------------------------------------------------------------------
 
     const CORRELATED_SCALAR_SQL: &str =
         "SELECT k1 FROM t1 WHERE k1 = (SELECT max(k2) FROM t2 WHERE t2.k1 = t1.k1)";
 
-    fn parse_and_analyze_with_apply_mode(sql: &str) -> Result<ResolvedQuery, String> {
-        use crate::sql::optimizer::options::{
-            SessionOptimizerSettings, SubqueryUnnestMode, with_session_optimizer_settings,
-        };
-
+    fn parse_and_analyze_for_apply_specs(sql: &str) -> Result<ResolvedQuery, String> {
         let dialect = sqlparser::dialect::GenericDialect {};
         let stmts = sqlparser::parser::Parser::parse_sql(&dialect, sql)
             .map_err(|e| format!("parse error: {e}"))?;
@@ -6839,23 +6826,15 @@ mod tests {
             sqlparser::ast::Statement::Query(q) => q,
             _ => return Err("expected a query".into()),
         };
-        let settings = SessionOptimizerSettings {
-            subquery_unnest_mode: SubqueryUnnestMode::Apply,
-            ..Default::default()
-        };
-        let (resolved, _cte, _factory) =
-            with_session_optimizer_settings(settings, || analyze(&query, &TestCatalog, "default"))?;
+        let (resolved, _cte, _factory) = analyze(&query, &TestCatalog, "default")?;
         Ok(resolved)
     }
 
-    /// In apply mode a correlated scalar WHERE subquery must be recorded as an
+    /// In the Apply framework a correlated scalar WHERE subquery must be recorded as an
     /// ApplyScalarSpec instead of being rewritten into a join.
     #[test]
-    fn apply_mode_routes_where_scalar_subquery_to_apply_spec() {
+    fn current_route_records_where_scalar_subquery_apply_spec() {
         use crate::sql::analysis::{ApplyClause, QueryBody};
-        use crate::sql::optimizer::options::{
-            SessionOptimizerSettings, SubqueryUnnestMode, with_session_optimizer_settings,
-        };
 
         let dialect = sqlparser::dialect::GenericDialect {};
         let stmts = sqlparser::parser::Parser::parse_sql(&dialect, CORRELATED_SCALAR_SQL).unwrap();
@@ -6863,13 +6842,8 @@ mod tests {
             sqlparser::ast::Statement::Query(q) => q,
             _ => panic!("expected query"),
         };
-        let settings = SessionOptimizerSettings {
-            subquery_unnest_mode: SubqueryUnnestMode::Apply,
-            ..Default::default()
-        };
         let (resolved, _cte, _factory) =
-            with_session_optimizer_settings(settings, || analyze(&query, &TestCatalog, "default"))
-                .expect("analyze in apply mode");
+            analyze(&query, &TestCatalog, "default").expect("analyze with apply framework");
 
         let QueryBody::Select(select) = &resolved.body else {
             panic!("expected select body");
@@ -6895,11 +6869,11 @@ mod tests {
                 "WHERE filter must not contain a SubqueryPlaceholder after apply routing"
             );
         }
-        // In apply mode the FROM should NOT have grown a join — no legacy rewrite.
+        // In the Apply framework the FROM should NOT have grown a join.
         let from_is_join = matches!(select.from, Some(crate::sql::analysis::Relation::Join(_)));
         assert!(
             !from_is_join,
-            "apply mode must NOT rewrite the scalar subquery into a join"
+            "Apply framework must NOT rewrite the scalar subquery into a join"
         );
     }
 
@@ -6921,42 +6895,14 @@ mod tests {
         }
     }
 
-    /// In legacy mode (the default) the same correlated scalar subquery must
-    /// still be rewritten into a JOIN — no apply_specs recorded.
-    #[test]
-    fn legacy_mode_still_rewrites_scalar_subquery_to_join() {
-        use crate::sql::analysis::QueryBody;
-
-        let dialect = sqlparser::dialect::GenericDialect {};
-        let stmts = sqlparser::parser::Parser::parse_sql(&dialect, CORRELATED_SCALAR_SQL).unwrap();
-        let query = match stmts.into_iter().next().unwrap() {
-            sqlparser::ast::Statement::Query(q) => q,
-            _ => panic!("expected query"),
-        };
-        let (resolved, _cte, _factory) =
-            analyze(&query, &TestCatalog, "default").expect("legacy analyze");
-        let QueryBody::Select(select) = &resolved.body else {
-            panic!("expected select body");
-        };
-        assert!(
-            select.apply_specs.is_empty(),
-            "legacy mode must not record apply specs"
-        );
-        // Legacy rewrites the scalar subquery into a LEFT OUTER JOIN.
-        assert!(
-            matches!(select.from, Some(crate::sql::analysis::Relation::Join(_))),
-            "legacy mode must rewrite scalar subquery into a join"
-        );
-    }
-
     #[test]
     fn exists_correlated_where_records_predicate_spec() {
         use crate::sql::analysis::{QueryBody, SubqueryKind};
 
-        let resolved = parse_and_analyze_with_apply_mode(
+        let resolved = parse_and_analyze_for_apply_specs(
             "SELECT k1 FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.k1 = t1.k1)",
         )
-        .expect("analyze in apply mode");
+        .expect("analyze in Apply framework");
         let QueryBody::Select(select) = &resolved.body else {
             panic!("expected select body");
         };
@@ -6978,10 +6924,10 @@ mod tests {
     fn not_exists_sets_negated() {
         use crate::sql::analysis::{QueryBody, SubqueryKind};
 
-        let resolved = parse_and_analyze_with_apply_mode(
+        let resolved = parse_and_analyze_for_apply_specs(
             "SELECT k1 FROM t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE t2.k1 = t1.k1)",
         )
-        .expect("analyze in apply mode");
+        .expect("analyze in Apply framework");
         let QueryBody::Select(select) = &resolved.body else {
             panic!("expected select body");
         };
@@ -6996,10 +6942,10 @@ mod tests {
     fn in_uncorrelated_records_spec_with_lhs() {
         use crate::sql::analysis::{QueryBody, SubqueryKind};
 
-        let resolved = parse_and_analyze_with_apply_mode(
+        let resolved = parse_and_analyze_for_apply_specs(
             "SELECT k1 FROM t1 WHERE t1.k1 IN (SELECT t2.k2 FROM t2)",
         )
-        .expect("analyze in apply mode");
+        .expect("analyze in Apply framework");
         let QueryBody::Select(select) = &resolved.body else {
             panic!("expected select body");
         };
@@ -7020,10 +6966,10 @@ mod tests {
     fn not_in_sets_negated() {
         use crate::sql::analysis::{QueryBody, SubqueryKind};
 
-        let resolved = parse_and_analyze_with_apply_mode(
+        let resolved = parse_and_analyze_for_apply_specs(
             "SELECT k1 FROM t1 WHERE t1.k1 NOT IN (SELECT t2.k2 FROM t2)",
         )
-        .expect("analyze in apply mode");
+        .expect("analyze in Apply framework");
         let QueryBody::Select(select) = &resolved.body else {
             panic!("expected select body");
         };
@@ -7035,56 +6981,71 @@ mod tests {
     }
 
     #[test]
-    fn exists_inside_or_falls_back_to_legacy() {
+    fn exists_inside_or_uses_explicit_value_form_rewrite() {
         use crate::sql::analysis::QueryBody;
 
-        let resolved = parse_and_analyze_with_apply_mode(
+        let resolved = parse_and_analyze_for_apply_specs(
+            "SELECT k1 FROM t1 WHERE k1 = 1 OR EXISTS (SELECT 1 FROM t2 WHERE t2.k1 = 1)",
+        )
+        .expect("analyze in Apply framework");
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("expected select body");
+        };
+        assert!(select.predicate_apply_specs.is_empty());
+        assert!(
+            matches!(select.from, Some(crate::sql::analysis::Relation::Join(_))),
+            "inside-OR EXISTS should use the explicit value-form rewrite"
+        );
+    }
+
+    #[test]
+    fn correlated_exists_inside_or_is_rejected_without_fallback() {
+        let err = parse_and_analyze_for_apply_specs(
             "SELECT k1 FROM t1 WHERE k1 = 1 OR EXISTS (SELECT 1 FROM t2 WHERE t2.k1 = t1.k1)",
         )
-        .expect("analyze in apply mode");
-        let QueryBody::Select(select) = &resolved.body else {
-            panic!("expected select body");
-        };
-        assert!(select.predicate_apply_specs.is_empty());
+        .expect_err("correlated EXISTS value-form should not fall back");
         assert!(
-            matches!(select.from, Some(crate::sql::analysis::Relation::Join(_))),
-            "inside-OR EXISTS should fall back to the legacy join rewrite"
+            err.contains("correlated EXISTS subquery in value-form expression is not supported"),
+            "unexpected error: {err}"
         );
     }
 
     #[test]
-    fn exists_in_having_falls_back_to_legacy() {
-        use crate::sql::analysis::QueryBody;
+    fn correlated_in_inside_or_is_rejected_without_fallback() {
+        let err = parse_and_analyze_for_apply_specs(
+            "SELECT k1 FROM t1 WHERE k1 = 1 OR k2 IN (SELECT t2.k2 FROM t2 WHERE t2.k1 = t1.k1)",
+        )
+        .expect_err("correlated IN value-form should not fall back");
+        assert!(
+            err.contains("correlated IN subquery in value-form expression is not supported"),
+            "unexpected error: {err}"
+        );
+    }
 
-        let resolved = parse_and_analyze_with_apply_mode(
+    #[test]
+    fn exists_in_having_records_predicate_spec() {
+        use crate::sql::analysis::{ApplyClause, QueryBody};
+
+        let resolved = parse_and_analyze_for_apply_specs(
             "SELECT k1, count(*) FROM t1 GROUP BY k1 HAVING EXISTS (SELECT 1 FROM t2 WHERE t2.k1 = t1.k1)",
         )
-        .expect("analyze in apply mode");
+        .expect("analyze in Apply framework");
         let QueryBody::Select(select) = &resolved.body else {
             panic!("expected select body");
         };
-        assert!(select.predicate_apply_specs.is_empty());
-        assert!(
-            matches!(select.from, Some(crate::sql::analysis::Relation::Join(_))),
-            "HAVING EXISTS should fall back to the legacy join rewrite"
-        );
+        assert_eq!(select.predicate_apply_specs.len(), 1);
+        assert_eq!(select.predicate_apply_specs[0].clause, ApplyClause::Having);
     }
 
     #[test]
-    fn multi_column_in_falls_back_to_legacy() {
-        use crate::sql::analysis::QueryBody;
-
-        let resolved = parse_and_analyze_with_apply_mode(
+    fn multi_column_in_is_rejected_without_fallback() {
+        let err = parse_and_analyze_for_apply_specs(
             "SELECT k1 FROM t1 WHERE (k1, k2) IN (SELECT t2.k1, t2.k2 FROM t2)",
         )
-        .expect("analyze in apply mode");
-        let QueryBody::Select(select) = &resolved.body else {
-            panic!("expected select body");
-        };
-        assert!(select.predicate_apply_specs.is_empty());
+        .expect_err("multi-column IN should not fall back");
         assert!(
-            matches!(select.from, Some(crate::sql::analysis::Relation::Join(_))),
-            "multi-column IN should fall back to the legacy join rewrite"
+            err.contains("multi-column IN subquery is not supported"),
+            "unexpected error: {err}"
         );
     }
 
@@ -7092,10 +7053,10 @@ mod tests {
     fn mixed_eq_and_non_eq_outer_ref_records_exists_spec() {
         use crate::sql::analysis::QueryBody;
 
-        let resolved = parse_and_analyze_with_apply_mode(
+        let resolved = parse_and_analyze_for_apply_specs(
             "SELECT k1 FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.v2 = t1.v1 AND t2.k2 > t1.k2)",
         )
-        .expect("analyze in apply mode");
+        .expect("analyze in Apply framework");
         let QueryBody::Select(select) = &resolved.body else {
             panic!("expected select body");
         };
@@ -7107,95 +7068,92 @@ mod tests {
     }
 
     #[test]
-    fn pure_between_outer_ref_in_inner_filter_falls_back_to_legacy() {
-        use crate::sql::analysis::QueryBody;
-
-        let resolved = parse_and_analyze_with_apply_mode(
+    fn pure_between_outer_ref_in_inner_filter_is_rejected_without_fallback() {
+        let err = parse_and_analyze_for_apply_specs(
             "SELECT k1 FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t1.k1 BETWEEN t2.k1 AND t2.k2)",
         )
-        .expect("analyze in apply mode");
-        let QueryBody::Select(select) = &resolved.body else {
-            panic!("expected select body");
-        };
+        .expect_err("pure non-EQ outer refs should not fall back");
         assert!(
-            select.predicate_apply_specs.is_empty(),
-            "pure non-EQ outer refs in the inner filter must fall back to legacy"
+            err.contains("correlated EXISTS/IN subquery must use equality predicates"),
+            "unexpected error: {err}"
         );
     }
 
     #[test]
-    fn pure_non_eq_outer_ref_falls_back_to_legacy() {
-        use crate::sql::analysis::QueryBody;
-
-        let resolved = parse_and_analyze_with_apply_mode(
+    fn pure_non_eq_outer_ref_is_rejected_without_fallback() {
+        let err = parse_and_analyze_for_apply_specs(
             "SELECT k1 FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.k2 > t1.k2)",
         )
-        .expect("analyze in apply mode");
-        let QueryBody::Select(select) = &resolved.body else {
-            panic!("expected select body");
-        };
+        .expect_err("pure non-EQ outer refs should not fall back");
         assert!(
-            select.predicate_apply_specs.is_empty(),
-            "pure non-EQ outer refs must fall back to legacy"
-        );
-        assert!(
-            matches!(select.from, Some(crate::sql::analysis::Relation::Join(_))),
-            "pure non-EQ EXISTS fallback should use the legacy join rewrite"
+            err.contains("correlated EXISTS/IN subquery must use equality predicates"),
+            "unexpected error: {err}"
         );
     }
 
     #[test]
-    fn in_pure_non_eq_outer_ref_falls_back_to_legacy() {
-        use crate::sql::analysis::QueryBody;
-
-        let resolved = parse_and_analyze_with_apply_mode(
+    fn in_pure_non_eq_outer_ref_is_rejected_without_fallback() {
+        let err = parse_and_analyze_for_apply_specs(
             "SELECT k1 FROM t1 WHERE t1.k1 IN (SELECT t2.k1 FROM t2 WHERE t2.k2 > t1.k2)",
         )
-        .expect("analyze in apply mode");
-        let QueryBody::Select(select) = &resolved.body else {
-            panic!("expected select body");
-        };
+        .expect_err("pure non-EQ IN correlation should not fall back");
         assert!(
-            select.predicate_apply_specs.is_empty(),
-            "pure non-EQ IN correlation must fall back to legacy"
-        );
-        assert!(
-            matches!(select.from, Some(crate::sql::analysis::Relation::Join(_))),
-            "pure non-EQ IN fallback should use the legacy join rewrite"
+            err.contains("correlated EXISTS/IN subquery must use equality predicates"),
+            "unexpected error: {err}"
         );
     }
 
     #[test]
-    fn is_true_outer_ref_in_inner_filter_falls_back_to_legacy() {
-        use crate::sql::analysis::QueryBody;
-
-        let resolved = parse_and_analyze_with_apply_mode(
+    fn is_true_outer_ref_in_inner_filter_is_rejected_without_fallback() {
+        let err = parse_and_analyze_for_apply_specs(
             "SELECT k1 FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE (t1.k1 = 1) IS TRUE)",
         )
-        .expect("analyze in apply mode");
-        let QueryBody::Select(select) = &resolved.body else {
-            panic!("expected select body");
-        };
+        .expect_err("IS TRUE outer refs should not fall back");
         assert!(
-            select.predicate_apply_specs.is_empty(),
-            "IS TRUE outer refs in the inner filter must fall back to legacy"
+            err.contains("correlated EXISTS/IN subquery must use equality predicates"),
+            "unexpected error: {err}"
         );
     }
 
     #[test]
-    fn in_rhs_projection_outer_ref_falls_back_to_legacy() {
-        use crate::sql::analysis::QueryBody;
-
-        let resolved = parse_and_analyze_with_apply_mode(
+    fn in_rhs_projection_outer_ref_is_rejected_without_fallback() {
+        let err = parse_and_analyze_for_apply_specs(
             "SELECT k1 FROM t1 WHERE t1.k1 IN (SELECT t1.k2 FROM t2)",
         )
-        .expect("analyze in apply mode");
-        let QueryBody::Select(select) = &resolved.body else {
-            panic!("expected select body");
-        };
+        .expect_err("outer refs outside the inner filter should not fall back");
         assert!(
-            select.predicate_apply_specs.is_empty(),
-            "outer refs outside the inner filter must fall back to legacy"
+            err.contains("correlated EXISTS/IN subquery must use equality predicates"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn correlated_exists_in_projection_is_rejected_clearly() {
+        let err = parse_and_analyze("SELECT EXISTS (SELECT 1 FROM t2 WHERE t2.k1 = t1.k1) FROM t1")
+            .expect_err("correlated EXISTS in SELECT list should be rejected");
+        assert!(
+            err.contains("correlated EXISTS subquery in SELECT list is not supported"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn group_by_subquery_is_rejected_clearly() {
+        let err = parse_and_analyze("SELECT k1 FROM t1 GROUP BY (SELECT max(k2) FROM t2)")
+            .expect_err("subquery in GROUP BY should be rejected");
+        assert!(
+            err.contains("subquery is not supported in GROUP BY"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn order_by_subquery_is_rejected_clearly() {
+        let err = parse_and_analyze("SELECT k1 FROM t1 ORDER BY (SELECT max(k2) FROM t2)")
+            .expect_err("subquery in ORDER BY should be rejected");
+        assert!(
+            err.contains("subquery is not supported in ORDER BY"),
+            "unexpected error: {err}"
         );
     }
 }

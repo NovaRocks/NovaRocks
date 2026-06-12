@@ -3,9 +3,9 @@
 //! Self-contained. The IN key (`lhs = inner_col`) is ALWAYS a bare `Eq` so the
 //! Cascades implement phase can extract a hash key; NULL-aware NOT IN semantics
 //! live entirely in the JoinKind (NullAwareLeftAnti), never in an IS-NULL-OR
-//! wrapper (legacy lesson: IS-NULL-OR wrapping degraded NOT IN to a NestLoop
+//! wrapper (existing lesson: IS-NULL-OR wrapping degraded NOT IN to a NestLoop
 //! join that timed out). For correlated NOT IN with a nullable lifted inner
-//! WHERE, that lifted predicate is wrapped coalesce(pred, false) (legacy NAAJ).
+//! WHERE, that lifted predicate is wrapped coalesce(pred, false).
 
 use super::predicate_apply_util::{coalesce_false, eq, lift_correlated_inner};
 use crate::sql::analysis::{ExprKind, JoinKind, TypedExpr};
@@ -435,7 +435,7 @@ mod tests {
 
         assert_eq!(conjuncts.len(), 2);
         assert_eq_condition(&conjuncts[0], OUTER_A, INNER_B);
-        assert_eq_condition(&conjuncts[1], INNER_K, OUTER_K);
+        assert_eq_condition(&conjuncts[1], OUTER_K, INNER_K);
         let LogicalPlan::Project(project) = join.right.as_ref() else {
             panic!("expected Project right, got: {:?}", join.right);
         };
@@ -455,7 +455,7 @@ mod tests {
 
         assert_eq!(conjuncts.len(), 2);
         assert_eq_condition(&conjuncts[0], OUTER_A, INNER_B);
-        assert_coalesce_false(&conjuncts[1], INNER_K, OUTER_K);
+        assert_coalesce_false(&conjuncts[1], OUTER_K, INNER_K);
         let LogicalPlan::Project(project) = join.right.as_ref() else {
             panic!("expected Project right, got: {:?}", join.right);
         };

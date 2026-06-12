@@ -1,13 +1,15 @@
-//! Subquery-to-join rewriting pass.
+//! Subquery routing pass.
 //!
 //! After the analyzer produces `SubqueryPlaceholder` nodes in WHERE/HAVING
-//! expressions, this module rewrites them into equivalent JOINs:
+//! expressions, this module routes them through one of the explicit supported
+//! implementations:
 //!
-//! - Scalar subqueries → CROSS JOIN (uncorrelated) or LEFT JOIN (correlated)
-//! - EXISTS / NOT EXISTS → LEFT SEMI / LEFT ANTI JOIN
-//! - IN / NOT IN → LEFT SEMI / LEFT ANTI JOIN
+//! - Scalar subqueries → Apply specs consumed by the planner/rewrite pipeline
+//! - WHERE/HAVING EXISTS / IN predicates → predicate Apply specs
+//! - JOIN-ON and value-form predicates → local marker-join rewrites
 //!
-//! The rewriting happens at the `ResolvedSelect` level before the planner sees it.
+//! Unsupported shapes fail here instead of being sent through an implicit
+//! alternate rewrite path.
 
 use arrow::datatypes::DataType;
 
@@ -52,12 +54,125 @@ fn take_from_or_synthesize_single_row(
     })
 }
 
+fn bool_literal(value: bool) -> TypedExpr {
+    TypedExpr {
+        kind: ExprKind::Literal(LiteralValue::Bool(value)),
+        data_type: DataType::Boolean,
+        nullable: false,
+    }
+}
+
+fn null_bool_literal() -> TypedExpr {
+    TypedExpr {
+        kind: ExprKind::Literal(LiteralValue::Null),
+        data_type: DataType::Boolean,
+        nullable: true,
+    }
+}
+
+fn is_null_expr(expr: TypedExpr, negated: bool) -> TypedExpr {
+    TypedExpr {
+        data_type: DataType::Boolean,
+        nullable: false,
+        kind: ExprKind::IsNull {
+            expr: Box::new(expr),
+            negated,
+        },
+    }
+}
+
+fn value_form_marker_query(
+    source: ResolvedQuery,
+    source_alias: String,
+    marker_col_id: crate::sql::column_id::ColumnId,
+    marker_col_name: String,
+    filter: Option<TypedExpr>,
+) -> ResolvedQuery {
+    let marker_dtype = DataType::Int32;
+    let marker_output = OutputColumn {
+        column_id: marker_col_id,
+        name: marker_col_name.clone(),
+        data_type: marker_dtype.clone(),
+        nullable: false,
+        is_internal: false,
+    };
+    let source_outputs = source.output_columns.clone();
+    ResolvedQuery {
+        body: QueryBody::Select(ResolvedSelect {
+            from: Some(Relation::Subquery {
+                query: Box::new(source),
+                alias: source_alias,
+                output_columns: source_outputs,
+            }),
+            filter,
+            group_by: Vec::new(),
+            having: None,
+            projection: vec![ProjectItem {
+                expr: TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::Int(1)),
+                    data_type: marker_dtype.clone(),
+                    nullable: false,
+                },
+                output_name: marker_col_name.clone(),
+                output_column_id: marker_col_id,
+            }],
+            has_aggregation: false,
+            distinct: false,
+            repeat: None,
+            apply_specs: Vec::new(),
+            predicate_apply_specs: Vec::new(),
+        }),
+        order_by: Vec::new(),
+        limit: Some(1),
+        offset: None,
+        output_columns: vec![marker_output],
+        local_cte_ids: Vec::new(),
+    }
+}
+
+fn value_form_nonempty_marker_query(
+    source: ResolvedQuery,
+    source_alias: String,
+    marker_col_id: crate::sql::column_id::ColumnId,
+    marker_col_name: String,
+) -> ResolvedQuery {
+    value_form_marker_query(source, source_alias, marker_col_id, marker_col_name, None)
+}
+
+fn value_form_null_marker_query(
+    source: ResolvedQuery,
+    source_col: &OutputColumn,
+    source_alias: String,
+    marker_col_id: crate::sql::column_id::ColumnId,
+    marker_col_name: String,
+) -> ResolvedQuery {
+    let filter = is_null_expr(
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: source_col.column_id,
+                qualifier: Some(source_alias.clone()),
+                column: source_col.name.clone(),
+            },
+            data_type: source_col.data_type.clone(),
+            nullable: source_col.nullable,
+        },
+        false,
+    );
+    value_form_marker_query(
+        source,
+        source_alias,
+        marker_col_id,
+        marker_col_name,
+        Some(filter),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 
 impl<'a> AnalyzerContext<'a> {
-    /// Rewrite subquery placeholders in a ResolvedSelect into JOINs.
+    /// Route subquery placeholders in a ResolvedSelect.
     /// This must be called after `analyze_select` has finished and the
     /// subquery placeholders have been collected.
     pub(super) fn rewrite_subqueries(
@@ -71,54 +186,17 @@ impl<'a> AnalyzerContext<'a> {
             return Ok(());
         }
 
-        let mode = super::subquery_unnest_mode();
         for sq_info in subqueries {
-            let apply_enabled = !matches!(
-                mode,
-                crate::sql::optimizer::options::SubqueryUnnestMode::Legacy
-            );
-            if apply_enabled {
-                let routed = match &sq_info.kind {
-                    SubqueryKind::Scalar => self.collect_scalar_apply_spec(select, scope, &sq_info),
-                    SubqueryKind::Exists { .. } | SubqueryKind::InSubquery { .. } => {
-                        self.collect_predicate_apply_spec(select, scope, &sq_info)
-                    }
-                };
-                match routed {
-                    Ok(true) => continue, // spec recorded; placeholder replaced
-                    Ok(false) => {
-                        // Shape not supported by Apply yet — fall through to legacy below.
-                    }
-                    Err(e) => {
-                        if matches!(
-                            mode,
-                            crate::sql::optimizer::options::SubqueryUnnestMode::ApplyStrict
-                        ) {
-                            return Err(e);
-                        }
-                        // apply (non-strict): fall back to legacy for this subquery.
-                    }
-                }
-            }
-
-            // Legacy path (unchanged): JOIN-ON detection then rewrite.
-            //
             // Subqueries can appear in three locations:
-            //   1. WHERE / HAVING (the original path)
-            //   2. JOIN ... ON clauses inside `select.from`
-            //   3. Inside projection items (rare, handled by the scalar
-            //      rewrite which also touches projection)
-            //
-            // The existing rewrite functions (`rewrite_exists` /
-            // `rewrite_in_subquery` / `rewrite_scalar_subquery`) all assume
-            // the placeholder lives in `select.filter` / `select.having`.
-            // For JOIN-ON placeholders we need to do the rewrite locally on
-            // the containing JoinRelation: pre-compute the subquery as a
-            // derived table, attach it as a LEFT OUTER JOIN to the host
-            // join's left input, and replace the placeholder with a
-            // match-indicator expression. We handle the JOIN-ON case
-            // first; if no JOIN-ON match is found, fall through to the
-            // original WHERE/HAVING path.
+            //   1. WHERE / HAVING / projection clauses that can be represented
+            //      as Apply specs.
+            //   2. JOIN ... ON clauses that still require relation-local
+            //      rewriting because the planner has no JoinOn Apply insertion
+            //      point yet.
+            //   3. Predicate value-form contexts (projection and OR operands)
+            //      where SQL three-valued logic needs explicit marker joins.
+            // Every branch below is an explicit supported route. A rejected
+            // Apply collection must become a clear unsupported-shape error.
             let in_filter = select
                 .filter
                 .as_ref()
@@ -140,21 +218,44 @@ impl<'a> AnalyzerContext<'a> {
                     continue;
                 }
             }
-            self.rewrite_single_subquery(select, scope, sq_info)?;
+
+            let routed = match &sq_info.kind {
+                SubqueryKind::Scalar => self.collect_scalar_apply_spec(select, scope, &sq_info),
+                SubqueryKind::Exists { .. } | SubqueryKind::InSubquery { .. } => {
+                    self.collect_predicate_apply_spec(select, scope, &sq_info)
+                }
+            }?;
+            if routed {
+                continue;
+            }
+
+            if matches!(
+                sq_info.kind,
+                SubqueryKind::Exists { .. } | SubqueryKind::InSubquery { .. }
+            ) && predicate_placeholder_is_value_form(select, sq_info.id)
+            {
+                self.rewrite_single_subquery(select, scope, sq_info)?;
+                continue;
+            }
+
+            return Err(format!(
+                "subquery shape is not supported by Apply rewrite: {}",
+                sq_info.subquery
+            ));
         }
 
         Ok(())
     }
 
     // ---------------------------------------------------------------------------
-    // Apply-mode scalar subquery routing
+    // Apply-spec scalar subquery routing
     // ---------------------------------------------------------------------------
 
-    /// Apply-mode handler for a scalar subquery. Returns Ok(true) if an
-    /// ApplyScalarSpec was recorded and the placeholder replaced; Ok(false) if
-    /// the shape should fall back to the legacy rewrite (e.g. placeholder is
-    /// inside a JOIN-ON clause which M1a does not yet place); Err on a hard
-    /// analysis failure.
+    /// Apply-spec handler for a scalar subquery. Returns Ok(true) if an
+    /// ApplyScalarSpec was recorded and the placeholder replaced. Returns
+    /// Ok(false) only when the placeholder is not in a clause represented by
+    /// ApplyScalarSpec; the caller must either dispatch it to an explicit
+    /// non-Apply route or report an unsupported shape.
     fn collect_scalar_apply_spec(
         &self,
         select: &mut ResolvedSelect,
@@ -163,15 +264,14 @@ impl<'a> AnalyzerContext<'a> {
     ) -> Result<bool, String> {
         use crate::sql::analysis::{ApplyScalarSpec, OutputColumn};
 
-        // 1. Determine which clause the placeholder lives in. If it is inside
-        //    a JOIN-ON or nowhere we recognise, fall back to legacy.
+        // 1. Determine which clause the placeholder lives in.
         let clause = match locate_scalar_placeholder_clause(select, sq_info.id) {
             Some(c) => c,
             None => return Ok(false),
         };
 
-        // 2. Analyze the inner subquery with the merged outer scope — the same
-        //    call legacy uses. Outer refs inside it now carry outer ColumnIds.
+        // 2. Analyze the inner subquery with the merged outer scope. Outer refs
+        //    inside it now carry outer ColumnIds.
         let (resolved_sub, inner_scope) =
             self.analyze_query_in_scope_with_inner(&sq_info.subquery, scope)?;
         if resolved_sub.output_columns.len() != 1 {
@@ -228,12 +328,10 @@ impl<'a> AnalyzerContext<'a> {
         Ok(true)
     }
 
-    /// Apply-mode handler for an EXISTS / NOT EXISTS / IN / NOT IN subquery.
+    /// Apply-spec handler for an EXISTS / NOT EXISTS / IN / NOT IN subquery.
     /// Returns Ok(true) if an ApplyPredicateSpec was recorded and the placeholder
-    /// conjunct removed; Ok(false) if the shape should fall back to legacy
-    /// (not a top-level AND of WHERE, HAVING/JOIN-ON/projection position,
-    /// multi-column IN, or a correlated form this milestone does not handle);
-    /// Err on a hard analysis failure.
+    /// conjunct removed. Returns Ok(false) only for explicit value-form routes
+    /// that are handled outside Apply in this module.
     fn collect_predicate_apply_spec(
         &self,
         select: &mut ResolvedSelect,
@@ -247,17 +345,29 @@ impl<'a> AnalyzerContext<'a> {
             .as_ref()
             .map(|f| is_placeholder_top_level_and_conjunct(f, sq_info.id))
             .unwrap_or(false);
-        if !top_level_where_conjunct {
-            return Ok(false);
-        }
         let inside_or = select
             .filter
             .as_ref()
             .map(|f| is_placeholder_inside_or(f, sq_info.id))
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || select
+                .having
+                .as_ref()
+                .map(|f| is_placeholder_inside_or(f, sq_info.id))
+                .unwrap_or(false);
         if inside_or {
             return Ok(false);
         }
+        let top_level_having_conjunct = select
+            .having
+            .as_ref()
+            .map(|f| is_placeholder_top_level_and_conjunct(f, sq_info.id))
+            .unwrap_or(false);
+        let clause = match (top_level_where_conjunct, top_level_having_conjunct) {
+            (true, _) => ApplyClause::Where,
+            (false, true) => ApplyClause::Having,
+            (false, false) => return Ok(false),
+        };
 
         let (resolved_sub, inner_scope) =
             self.analyze_query_in_scope_with_inner(&sq_info.subquery, scope)?;
@@ -275,10 +385,10 @@ impl<'a> AnalyzerContext<'a> {
                             if matches!(inner.as_ref(), sqlparser::ast::Expr::Tuple(_))
                     )
                 {
-                    return Ok(false);
+                    return Err("multi-column IN subquery is not supported".to_string());
                 }
                 if resolved_sub.output_columns.len() != 1 {
-                    return Ok(false);
+                    return Err("IN subquery must produce exactly one output column".to_string());
                 }
                 Some(self.analyze_expr(in_expr, scope)?)
             }
@@ -290,7 +400,10 @@ impl<'a> AnalyzerContext<'a> {
             collect_eq_correlation_column_ids_for_apply(&resolved_sub, &inner_scope, scope);
         let outer_refs = collect_subquery_outer_ref_usage(&resolved_sub, &inner_scope, scope);
         if outer_refs.outside_filter || (outer_refs.filter && corr_ids.is_empty()) {
-            return Ok(false);
+            return Err(
+                "correlated EXISTS/IN subquery must use equality predicates in the subquery filter"
+                    .to_string(),
+            );
         }
 
         let output_name = format!("__pred_sq_{}", sq_info.id);
@@ -303,12 +416,22 @@ impl<'a> AnalyzerContext<'a> {
             is_internal: true,
         };
 
-        Self::remove_placeholder_from_filter(&mut select.filter, sq_info.id);
+        match clause {
+            ApplyClause::Where => {
+                Self::remove_placeholder_from_filter(&mut select.filter, sq_info.id);
+            }
+            ApplyClause::Having => {
+                Self::remove_placeholder_from_filter(&mut select.having, sq_info.id);
+            }
+            ApplyClause::Projection => {
+                return Err("predicate subquery in SELECT list requires value-form rewrite".into());
+            }
+        }
 
         select.predicate_apply_specs.push(ApplyPredicateSpec {
             subquery_id: sq_info.id,
             kind: sq_info.kind.clone(),
-            clause: ApplyClause::Where,
+            clause,
             output_column,
             inner: resolved_sub,
             correlation_column_ids: corr_ids,
@@ -317,6 +440,69 @@ impl<'a> AnalyzerContext<'a> {
             subquery_text: sq_info.subquery.to_string(),
         });
         Ok(true)
+    }
+
+    fn build_value_form_marker_relation(
+        &self,
+        scope: &mut AnalyzerScope,
+        source: ResolvedQuery,
+        relation_alias: String,
+        source_alias: String,
+        marker_col_name: String,
+        null_source_col: Option<&OutputColumn>,
+    ) -> (Relation, TypedExpr) {
+        let marker_col_id = self.alloc_column_id(
+            Some(relation_alias.clone()),
+            marker_col_name.clone(),
+            DataType::Int32,
+            true,
+        );
+        let marker_query = match null_source_col {
+            Some(source_col) => value_form_null_marker_query(
+                source,
+                source_col,
+                source_alias,
+                marker_col_id,
+                marker_col_name.clone(),
+            ),
+            None => value_form_nonempty_marker_query(
+                source,
+                source_alias,
+                marker_col_id,
+                marker_col_name.clone(),
+            ),
+        };
+        scope.add_column_with_id(
+            Some(&relation_alias),
+            &marker_col_name,
+            marker_col_id,
+            DataType::Int32,
+            true,
+        );
+        let exists = is_null_expr(
+            TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: marker_col_id,
+                    qualifier: Some(relation_alias.clone()),
+                    column: marker_col_name.clone(),
+                },
+                data_type: DataType::Int32,
+                nullable: true,
+            },
+            true,
+        );
+        let relation = Relation::Subquery {
+            query: Box::new(marker_query),
+            alias: relation_alias,
+            output_columns: vec![OutputColumn {
+                column_id: marker_col_id,
+                name: marker_col_name,
+                data_type: DataType::Int32,
+                nullable: false,
+                is_internal: false,
+            }],
+        };
+        (relation, exists)
     }
 
     /// Walk a Relation tree looking for a JoinRelation whose `condition`
@@ -365,8 +551,7 @@ impl<'a> AnalyzerContext<'a> {
     /// - For uncorrelated scalar: a CROSS JOIN exposing the scalar as a
     ///   single-row column, plus a ColumnRef replacement.
     ///
-    /// Correlated JOIN-ON subqueries are not yet supported and surface as
-    /// the original "unexpected SubqueryPlaceholder" codegen error.
+    /// Correlated JOIN-ON subqueries use dedicated relation-local rewrite paths.
     fn rewrite_join_on_subquery(
         &self,
         join: &mut JoinRelation,
@@ -706,6 +891,7 @@ impl<'a> AnalyzerContext<'a> {
         }
         let sub_col = resolved_sub.output_columns[0].clone();
         let match_col = format!("__match_{}", sq_info.id);
+        let source_sub = resolved_sub.clone();
 
         // Augment the subquery: DISTINCT + match-indicator column. After the
         // LEFT OUTER JOIN, this column is NULL for non-matching outer rows
@@ -769,6 +955,30 @@ impl<'a> AnalyzerContext<'a> {
             indicator_dtype.clone(),
             true,
         );
+        let null_marker = if sub_col.nullable {
+            Some(self.build_value_form_marker_relation(
+                scope,
+                source_sub.clone(),
+                format!("__sq_on_null_{}", sq_info.id),
+                format!("__sq_on_null_src_{}", sq_info.id),
+                format!("__on_has_null_{}", sq_info.id),
+                Some(&sub_col),
+            ))
+        } else {
+            None
+        };
+        let nonempty_marker = if lhs_typed.nullable {
+            Some(self.build_value_form_marker_relation(
+                scope,
+                source_sub,
+                format!("__sq_on_any_{}", sq_info.id),
+                format!("__sq_on_any_src_{}", sq_info.id),
+                format!("__on_has_row_{}", sq_info.id),
+                None,
+            ))
+        } else {
+            None
+        };
 
         let eq_cond = TypedExpr {
             data_type: DataType::Boolean,
@@ -792,21 +1002,55 @@ impl<'a> AnalyzerContext<'a> {
         // exposes the LHS column(s); otherwise default to LEFT.
         let side = choose_aux_join_side(join, std::slice::from_ref(&lhs_typed));
         attach_aux_join(join, side, sub_rel, Some(eq_cond));
+        if let Some((null_rel, _)) = null_marker.as_ref() {
+            attach_aux_join(join, side, null_rel.clone(), Some(bool_literal(true)));
+        }
+        if let Some((any_rel, _)) = nonempty_marker.as_ref() {
+            attach_aux_join(join, side, any_rel.clone(), Some(bool_literal(true)));
+        }
 
+        let match_exists = is_null_expr(
+            TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: match_col_id,
+                    qualifier: Some(sq_alias),
+                    column: match_col,
+                },
+                data_type: indicator_dtype,
+                nullable: true,
+            },
+            true,
+        );
+        let null_exists = null_marker.map(|(_, null_exists)| null_exists);
+        let nonempty_exists = nonempty_marker.map(|(_, any_exists)| any_exists);
+        let nullable_result = null_exists.is_some() || nonempty_exists.is_some();
+        let mut when_then = Vec::new();
+        when_then.push((match_exists, bool_literal(!negated)));
+        if lhs_typed.nullable {
+            let lhs_null_unknown = match nonempty_exists {
+                Some(any_exists) => TypedExpr {
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                    kind: ExprKind::BinaryOp {
+                        left: Box::new(is_null_expr(lhs_typed.clone(), false)),
+                        op: BinOp::And,
+                        right: Box::new(any_exists),
+                    },
+                },
+                None => is_null_expr(lhs_typed.clone(), false),
+            };
+            when_then.push((lhs_null_unknown, null_bool_literal()));
+        }
+        if let Some(null_exists) = null_exists {
+            when_then.push((null_exists, null_bool_literal()));
+        }
         let replacement = TypedExpr {
             data_type: DataType::Boolean,
-            nullable: false,
-            kind: ExprKind::IsNull {
-                expr: Box::new(TypedExpr {
-                    kind: ExprKind::ColumnRef {
-                        column_id: match_col_id,
-                        qualifier: Some(sq_alias),
-                        column: match_col,
-                    },
-                    data_type: indicator_dtype,
-                    nullable: true,
-                }),
-                negated: !negated, // IN → IS NOT NULL; NOT IN → IS NULL
+            nullable: nullable_result,
+            kind: ExprKind::Case {
+                operand: None,
+                when_then,
+                else_expr: Some(Box::new(bool_literal(negated))),
             },
         };
         if let Some(cond) = join.condition.as_ref() {
@@ -1002,6 +1246,18 @@ impl<'a> AnalyzerContext<'a> {
         };
         if !is_correlated {
             return self.rewrite_uncorrelated_exists(select, scope, resolved, sq_info.id, negated);
+        }
+        if select
+            .projection
+            .iter()
+            .any(|item| expr_contains_placeholder(&item.expr, sq_info.id))
+        {
+            return Err("correlated EXISTS subquery in SELECT list is not supported".to_string());
+        }
+        if predicate_placeholder_is_value_form(select, sq_info.id) {
+            return Err(
+                "correlated EXISTS subquery in value-form expression is not supported".to_string(),
+            );
         }
 
         let join_type = if negated {
@@ -1340,26 +1596,10 @@ impl<'a> AnalyzerContext<'a> {
         let lhs_typed = lhs_typed_list[0].clone();
         let sub_output_col = resolved_sub.output_columns[0].clone();
 
-        // Check if the IN placeholder is inside an OR expression.
-        // If so, SEMI JOIN semantics are wrong — we need LEFT OUTER JOIN
-        // + IS [NOT] NULL replacement (matching StarRocks FE approach).
-        //
-        // The same LEFT-OUTER-JOIN-with-match-indicator shape is also the
-        // only sensible rewrite when the IN placeholder lives in a SELECT
-        // projection (`SELECT x IN (SELECT y FROM …) FROM t`): the
-        // expression must evaluate to a boolean column per outer row.
-        // A SEMI JOIN would drop non-matching rows; the indicator form
-        // keeps them with a `FALSE` value.
-        let in_projection = select
-            .projection
-            .iter()
-            .any(|p| expr_contains_placeholder(&p.expr, sq_info.id));
-        let inside_or = select
-            .filter
-            .as_ref()
-            .map(|f| is_placeholder_inside_or(f, sq_info.id))
-            .unwrap_or(false)
-            || in_projection;
+        // Value-form contexts (OR operands, SELECT projection, nested HAVING)
+        // cannot use SEMI/ANTI joins because they must preserve the outer row
+        // and evaluate to TRUE/FALSE/NULL per row.
+        let value_form = predicate_placeholder_is_value_form(select, sq_info.id);
 
         // Correlated subquery: if any predicate in the subquery WHERE references
         // an outer-scope column (e.g. `WHERE t.x = outer.y`), the wrapped
@@ -1372,8 +1612,8 @@ impl<'a> AnalyzerContext<'a> {
         // but a bare-column WHERE like `WHERE outer.flag` (implicit `!= 0`)
         // or any expression that references an outer column also has to
         // route through the correlated path so the outer reference stays
-        // visible at codegen time. Fall back to a generic
-        // "does the subquery filter mention any outer-scope column" check.
+        // visible at codegen time. Use a generic "does the subquery filter
+        // mention any outer-scope column" check as the broad detector.
         let is_correlated = match resolved_sub.body {
             QueryBody::Select(ref sel) => sel
                 .filter
@@ -1386,7 +1626,13 @@ impl<'a> AnalyzerContext<'a> {
             _ => false,
         };
 
-        if is_correlated && !inside_or {
+        if is_correlated && value_form {
+            return Err(
+                "correlated IN subquery in value-form expression is not supported".to_string(),
+            );
+        }
+
+        if is_correlated {
             return self.rewrite_correlated_in_subquery(
                 select,
                 scope,
@@ -1399,8 +1645,10 @@ impl<'a> AnalyzerContext<'a> {
 
         let sq_alias = format!("__sq_{}", sq_info.id);
 
-        if inside_or && lhs_typed_list.len() > 1 {
-            return Err("multi-column IN subquery inside OR is not yet supported".to_string());
+        if value_form && lhs_typed_list.len() > 1 {
+            return Err(
+                "multi-column IN subquery in value-form expression is not supported".to_string(),
+            );
         }
 
         // Build per-column equality conjuncts. For a single-column IN this
@@ -1480,12 +1728,12 @@ impl<'a> AnalyzerContext<'a> {
 
         let current_from = take_from_or_synthesize_single_row(&mut select.from, scope);
 
-        if inside_or {
-            // IN-inside-OR: use LEFT OUTER JOIN, replace placeholder with
-            // IS [NOT] NULL on the join key column (unqualified, which will
-            // resolve to the right side's column after JOIN scope merge).
-            // We use the right-side column name directly; after the LEFT
-            // OUTER JOIN, non-matching rows have NULL in the right column.
+        if value_form {
+            // IN value-form: use LEFT OUTER JOIN, replace placeholder with
+            // a CASE over the match indicator plus an optional build-NULL
+            // marker. SQL IN/NOT IN value-form preserves three-valued logic:
+            // non-matching rows become UNKNOWN when the build side contains
+            // NULL, even if the probe side is non-NULL.
             let match_col_name = format!("__in_match_{}", sq_info.id);
             let in_match_col_id = self.alloc_column_id(
                 Some(sq_alias.clone()),
@@ -1500,6 +1748,31 @@ impl<'a> AnalyzerContext<'a> {
                 sub_output_col.data_type.clone(),
                 true,
             );
+
+            let null_marker = if sub_output_col.nullable {
+                Some(self.build_value_form_marker_relation(
+                    scope,
+                    resolved_sub.clone(),
+                    format!("__sq_null_{}", sq_info.id),
+                    format!("__sq_null_src_{}", sq_info.id),
+                    format!("__has_null_{}", sq_info.id),
+                    Some(&sub_output_col),
+                ))
+            } else {
+                None
+            };
+            let nonempty_marker = if lhs_typed.nullable {
+                Some(self.build_value_form_marker_relation(
+                    scope,
+                    resolved_sub.clone(),
+                    format!("__sq_any_{}", sq_info.id),
+                    format!("__sq_any_src_{}", sq_info.id),
+                    format!("__has_row_{}", sq_info.id),
+                    None,
+                ))
+            } else {
+                None
+            };
 
             // Wrap the subquery to add a match-indicator column.
             // Also mark as DISTINCT to prevent duplicate matches from
@@ -1538,59 +1811,79 @@ impl<'a> AnalyzerContext<'a> {
                 output_columns,
             };
 
-            select.from = Some(Relation::Join(Box::new(JoinRelation {
+            let match_join = Relation::Join(Box::new(JoinRelation {
                 left: current_from,
                 right: sub_rel,
                 join_type: JoinKind::LeftOuter,
                 condition: Some(eq_cond),
-            })));
-
-            // Replace the SubqueryPlaceholder with `match_col IS [NOT] NULL`.
-            // In projection/OR contexts, SQL IN keeps three-valued logic:
-            // a NULL left operand produces UNKNOWN even when the join
-            // indicator itself would otherwise look like "not matched".
-            let is_null_expr = TypedExpr {
-                data_type: DataType::Boolean,
-                nullable: false,
-                kind: ExprKind::IsNull {
-                    expr: Box::new(TypedExpr {
-                        kind: ExprKind::ColumnRef {
-                            column_id: in_match_col_id,
-                            qualifier: None,
-                            column: match_col_name,
-                        },
-                        data_type: sub_output_col.data_type.clone(),
-                        nullable: true,
-                    }),
-                    negated: !negated, // IN → IS NOT NULL; NOT IN → IS NULL
-                },
+            }));
+            let (joined_from, null_exists) = match null_marker {
+                Some((null_rel, null_exists)) => (
+                    Relation::Join(Box::new(JoinRelation {
+                        left: match_join,
+                        right: null_rel,
+                        join_type: JoinKind::LeftOuter,
+                        condition: Some(bool_literal(true)),
+                    })),
+                    Some(null_exists),
+                ),
+                None => (match_join, None),
             };
-            let replacement = if lhs_typed.nullable {
+            let (joined_from, nonempty_exists) = match nonempty_marker {
+                Some((any_rel, any_exists)) => (
+                    Relation::Join(Box::new(JoinRelation {
+                        left: joined_from,
+                        right: any_rel,
+                        join_type: JoinKind::LeftOuter,
+                        condition: Some(bool_literal(true)),
+                    })),
+                    Some(any_exists),
+                ),
+                None => (joined_from, None),
+            };
+            select.from = Some(joined_from);
+
+            let match_exists = is_null_expr(
                 TypedExpr {
-                    data_type: DataType::Boolean,
-                    nullable: true,
-                    kind: ExprKind::Case {
-                        operand: None,
-                        when_then: vec![(
-                            TypedExpr {
-                                data_type: DataType::Boolean,
-                                nullable: false,
-                                kind: ExprKind::IsNull {
-                                    expr: Box::new(lhs_typed.clone()),
-                                    negated: false,
-                                },
-                            },
-                            TypedExpr {
-                                data_type: DataType::Boolean,
-                                nullable: true,
-                                kind: ExprKind::Literal(LiteralValue::Null),
-                            },
-                        )],
-                        else_expr: Some(Box::new(is_null_expr)),
+                    kind: ExprKind::ColumnRef {
+                        column_id: in_match_col_id,
+                        qualifier: None,
+                        column: match_col_name,
                     },
-                }
-            } else {
-                is_null_expr
+                    data_type: sub_output_col.data_type.clone(),
+                    nullable: true,
+                },
+                true,
+            );
+            let nullable_result = null_exists.is_some() || nonempty_exists.is_some();
+            let mut when_then = Vec::new();
+            when_then.push((match_exists, bool_literal(!negated)));
+            if lhs_typed.nullable {
+                let lhs_null_unknown = match nonempty_exists {
+                    Some(any_exists) => TypedExpr {
+                        data_type: DataType::Boolean,
+                        nullable: false,
+                        kind: ExprKind::BinaryOp {
+                            left: Box::new(is_null_expr(lhs_typed.clone(), false)),
+                            op: BinOp::And,
+                            right: Box::new(any_exists),
+                        },
+                    },
+                    None => is_null_expr(lhs_typed.clone(), false),
+                };
+                when_then.push((lhs_null_unknown, null_bool_literal()));
+            }
+            if let Some(null_exists) = null_exists {
+                when_then.push((null_exists, null_bool_literal()));
+            }
+            let replacement = TypedExpr {
+                data_type: DataType::Boolean,
+                nullable: nullable_result,
+                kind: ExprKind::Case {
+                    operand: None,
+                    when_then,
+                    else_expr: Some(Box::new(bool_literal(negated))),
+                },
             };
             Self::replace_placeholder_in_filter(&mut select.filter, sq_info.id, &replacement);
             Self::replace_placeholder_in_filter(&mut select.having, sq_info.id, &replacement);
@@ -2047,7 +2340,7 @@ impl<'a> AnalyzerContext<'a> {
             (Some(current_rel), current_scope)
         };
 
-        // Merged scope: inner tables first (higher priority), then outer scope for fallback
+        // Merged scope: inner tables first (higher priority), then outer scope lookup.
         let mut merged_scope = inner_scope.clone();
         merged_scope.merge(outer_scope);
 
@@ -3260,7 +3553,8 @@ fn dummy_relation() -> Relation {
 /// For `CTEConsume` and `Subquery` relations the output_columns are
 /// authoritative.  For `Scan`-family relations we pair the first table column
 /// with its analyzer-allocated ColumnId.  For `Join` we recurse left.  If no
-/// column can be determined, return `None` and let the caller fall back.
+/// column can be determined, return `None` so the caller can raise a clear
+/// shape-specific error.
 fn relation_first_output_column(rel: &Relation) -> Option<OutputColumn> {
     match rel {
         Relation::CTEConsume { output_columns, .. } => output_columns.first().cloned(),
@@ -3341,13 +3635,12 @@ fn attach_aux_join(
 }
 
 // ---------------------------------------------------------------------------
-// Apply-mode helper free functions
+// Apply helper free functions
 // ---------------------------------------------------------------------------
 
 /// Determine which clause of the SELECT contains the scalar subquery
 /// placeholder. Checks WHERE first, then HAVING, then the projection list.
-/// Returns None if the placeholder is in a JOIN-ON or any other location M1a
-/// does not yet support (caller falls back to legacy in that case).
+/// Returns None if the placeholder is in JOIN-ON or another non-Apply route.
 fn locate_scalar_placeholder_clause(
     select: &ResolvedSelect,
     placeholder_id: usize,
@@ -3376,6 +3669,29 @@ fn locate_scalar_placeholder_clause(
         return Some(crate::sql::analysis::ApplyClause::Projection);
     }
     None
+}
+
+fn predicate_placeholder_is_value_form(select: &ResolvedSelect, placeholder_id: usize) -> bool {
+    select
+        .projection
+        .iter()
+        .any(|p| expr_contains_placeholder(&p.expr, placeholder_id))
+        || select
+            .filter
+            .as_ref()
+            .map(|f| {
+                expr_contains_placeholder(f, placeholder_id)
+                    && !is_placeholder_top_level_and_conjunct(f, placeholder_id)
+            })
+            .unwrap_or(false)
+        || select
+            .having
+            .as_ref()
+            .map(|f| {
+                expr_contains_placeholder(f, placeholder_id)
+                    && !is_placeholder_top_level_and_conjunct(f, placeholder_id)
+            })
+            .unwrap_or(false)
 }
 
 /// Collect the outer ColumnIds referenced by the correlation predicates of an
@@ -3408,9 +3724,9 @@ fn collect_correlation_column_ids(
 
 /// Collect only equality correlation column ids for predicate Apply routing.
 ///
-/// The legacy rewrite uses non-equality correlation predicates too, but M3's
 /// Apply-to-join rules only treat equality correlations as usable keys. Pure
-/// non-EQ outer references therefore fall back to the legacy path.
+/// non-EQ outer references are rejected rather than routed to a structural
+/// rewrite with different semantics.
 fn collect_eq_correlation_column_ids_for_apply(
     resolved_sub: &crate::sql::analysis::ResolvedQuery,
     inner_scope: &super::scope::AnalyzerScope,

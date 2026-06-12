@@ -247,8 +247,8 @@ pub(crate) struct ApplyNode {
   层级，显式 kind 更直接；`subquery_expr` 仍然保留完整表达式供 to-join 规则展开。
 - **不设 `needOutputRightChildColumns`**：NovaRocks 的 lateral/UNNEST 已有
   `TableFunctionNode` 专用路径，不经 Apply。
-- **不设 MultiIn**：multi-column IN 第一阶段继续走 legacy（§7 路由表）；后续扩展时给
-  `ApplyKind::In` 增加多列形态而不是新 kind。
+- **不设 MultiIn**：multi-column IN 当前显式报错；后续扩展时给 `ApplyKind::In` 增加多列形态
+  而不是新 kind。
 - **correlation 用 `ColumnId` 集合**：NovaRocks 的 `ColumnId` 全局唯一（`ColumnRefFactory` 单一
   铸造），inner plan 中的 outer 引用天然可以表达为普通 `ColumnRef`，无需 StarRocks 式
   ExpressionMapping 桥接。
@@ -263,12 +263,13 @@ pub(crate) struct ApplyNode {
 | empty input → NULL | LEFT OUTER JOIN 补 NULL 行；聚合算子 finalize 已实现「无 GROUP BY 空输入 → 1 行默认值；有 GROUP BY 空输入 → 0 行」（`exec/operators/aggregate/mod.rs:640-682`） | 已存在 |
 | count 空输入 → 0 | `NormalizeCountScalarApply` 规则：被引用的 `count` 输出包 `ifnull(count, 0)`（对应 StarRocks `ScalarApplyNormalizeCountRule`） | `ifnull` 已存在 |
 | NOT IN NULL 语义 | `QuantifiedApplyToJoin` 产 `JoinKind::NullAwareLeftAnti`；保留现有「两侧均不可空时降级 plain `LeftAnti`」优化（NovaRocks 现状即如此，比 StarRocks 的 always-NAAJ 更优） | hash join / NL join 的 NAAJ 执行已存在 |
-| NOT IN value-form（OR / projection 位置）的 build 侧 NULL | 第一阶段不迁移（继续 legacy，缺陷 D2 记录在案）；迁移阶段采用 StarRocks `QuantifiedApply2OuterJoinRule` 的 CTE + count/distinct 双分支 + CASE 形态 | 后续阶段 |
-| 非等值 correlation | apply 模式下显式报错 `non-EQ correlated predicate in correlated subquery is not supported`（对齐 StarRocks），替代 legacy 的静默重复（D6） | 行为收紧，需在迁移说明中标注 |
+| NOT IN value-form（OR / projection 位置）的 build 侧 NULL | M4 通过 marker subquery + CASE 形态显式处理 build NULL、probe NULL、empty build | 已实现 |
+| 非等值 correlation | Apply 路由显式报错，替代旧路径的静默重复（D6） | 行为收紧，需在迁移说明中标注 |
 
 ### 5.3 analyzer 职责变化
 
-analyzer **不再做结构改写**，只做绑定与收集：
+analyzer **不再做隐式整棵子查询改写**，主体只做绑定与收集；M4 保留 JOIN-ON / value-form 的
+局部 marker rewrite 作为明确路由：
 
 1. `resolve_expr.rs` 仍生成 placeholder，但 `SubqueryInfo` 升级为携带**已分析产物**：
 
@@ -297,8 +298,8 @@ analyzer **不再做结构改写**，只做绑定与收集：
 3. 前置校验保留在 analyzer（JSON/BITMAP/HLL 操作数、IN 列数不匹配、scalar 多列输出等现有错误，
    外加 D5 的修复：GROUP BY / ORDER BY 位置的子查询在 analyzer 显式报
    `subquery is not supported in GROUP BY / ORDER BY`，而不是泄漏到 codegen）。
-4. **路由**（迁移期）：`analyze_select` 末尾按 session 变量与形态白名单决定每个
-   `SubqueryInfo` 走新链路（保留给 planner）还是旧链路（调用现有 `rewrite_subqueries`），见 §7。
+4. **路由**：`analyze_select` 末尾按形态把每个 `SubqueryInfo` 派发到 Apply spec、JOIN-ON
+   marker rewrite、value-form marker rewrite，或直接返回不支持错误，见 §7。
 
 ### 5.4 planner 构造 Apply
 
@@ -464,8 +465,9 @@ window 不改变行数、PARTITION BY 列的 distribution property 可被 OQ-8 �
 
 失败分三层，全部英文：
 
-1. **analyzer 路由层**（首选拦截点）：apply 模式白名单外的形态直接走 legacy（迁移期）或报
-   analyzer 错误（终态），用户永远不会因「框架覆盖不全」损失现有能力。
+1. **analyzer 路由层**（首选拦截点）：已支持形态必须进入明确的 Apply spec、JOIN-ON
+   marker rewrite 或 value-form marker rewrite；不支持形态直接报 analyzer 错误，不再存在
+   隐式回退路线。
 2. **规则前置条件**（对齐 StarRocks 措辞）：
    - `Err("non-EQ correlated predicate in correlated subquery is not supported")`
    - `Err("correlated subquery without correlation predicate is not supported")`
@@ -476,11 +478,11 @@ window 不改变行数、PARTITION BY 列的 distribution property 可被 OQ-8 �
 
    ```text
    Err("subquery decorrelation failed: a residual Apply node (kind={kind:?}, correlated={bool})
-        survived the SubqueryRewrite stage; this subquery shape is not yet supported.
-        Workaround: SET subquery_unnest_mode = 'legacy'")
+        survived the SubqueryRewrite stage; this subquery shape is not yet supported")
    ```
 
-   迁移完成、legacy 删除后，workaround 提示一并移除。
+   该错误表示 analyzer 已选择 Apply 路线，但 optimizer 未能消除 Apply；没有 session-level
+   workaround。
 
 运行期语义错误（非失败路径，是修复后的正确行为）：
 
@@ -491,22 +493,21 @@ window 不改变行数、PARTITION BY 列的 distribution property 可被 OQ-8 �
 
 ## 7. 迁移路线
 
-### 7.1 session 开关与路由
+### 7.1 终态路由
 
-新增 session 变量 `subquery_unnest_mode`（`SET subquery_unnest_mode = '...'`）：
+不保留 session-level 双轨开关；迁移期的路由开关在 M4 收尾后已删除。当前路由原则：
 
-| 值 | 行为 |
+| 形态 | 路由 |
 |---|---|
-| `legacy` | 全部走现有 analyzer rewrite（M0-M1 默认） |
-| `apply` | 白名单形态走 Apply 链路，其余自动走 legacy（M2 起默认） |
-| `apply_strict` | 白名单形态走 Apply；白名单外报错而非回退（CI / 调试用，保证覆盖面可见） |
+| scalar（correlated + uncorrelated，WHERE/HAVING/SELECT-list） | Apply scalar spec |
+| EXISTS / NOT EXISTS（WHERE/HAVING 顶层 AND） | predicate Apply spec |
+| IN / NOT IN（WHERE/HAVING 顶层 AND，单列） | predicate Apply spec |
+| EXISTS / IN value-form（OR、projection 位置） | marker-join value-form rewrite；相关 value-form 显式报错 |
+| JOIN-ON 位置子查询 | relation-local marker rewrite |
+| multi-column IN、GROUP BY/ORDER BY 位置、correlated EXISTS in SELECT | analyzer 显式报错 |
 
-规则粒度的开关复用 `disable_optimizer_rules`（如 `SET disable_optimizer_rules =
-'ApplyToWindow'` 验证 to-join fallback 形态）。
-
-按「NovaRocks 没有历史用户，不写兼容性代码」的项目原则：**legacy 路径是迁移期工具，不是长期
-双轨**。每个 kind 在 apply 链路稳定（对应 suite 全绿 + 一个开发周期）后，立即删除
-`subquery_rewrite.rs` 中对应分支；全部迁移完成后删除该文件与 `subquery_unnest_mode` 变量。
+规则粒度的开关仍复用 `disable_optimizer_rules`，只用于验证 optimizer 规则形态，不再承担
+subquery analyzer 路由切换职责。
 
 ### 7.2 形态路由表（哪些先走 Apply）
 
@@ -514,42 +515,42 @@ window 不改变行数、PARTITION BY 列的 distribution property 可被 OQ-8 �
 |---|---|---|
 | scalar（correlated + uncorrelated，WHERE/HAVING/SELECT-list） | **M1** | OQ-13 核心；D1/D6 正确性修复在此；改造收益最大 |
 | correlated scalar agg → window | **M2**（ApplyToWindow） | 依赖 M1 的 Apply 形态与 push-down 归一化 |
-| EXISTS / NOT EXISTS（WHERE/HAVING 顶层 AND） | **M3** | 输出形态与 legacy 同构，迁移以架构统一为目的，风险低但收益也低，故置后 |
-| IN / NOT IN（WHERE/HAVING 顶层 AND，单列） | **M3** | 同上；NAAJ 语义已被 legacy 正确覆盖，重点是不回归 |
+| EXISTS / NOT EXISTS（WHERE/HAVING 顶层 AND） | **M3** | 输出形态与既有 semi/anti join 同构，迁移以架构统一为目的，风险低但收益也低，故置后 |
+| IN / NOT IN（WHERE/HAVING 顶层 AND，单列） | **M3** | 同上；NAAJ 语义已被既有实现正确覆盖，重点是不回归 |
 | EXISTS / IN value-form（OR、projection 位置） | **M4** | 需要 CTE 双分支 + CASE 形态（修复 D2）；依赖 to-join 规则成熟 |
-| JOIN-ON 位置子查询 | **M4** | legacy 路径最脆弱（D3），但用户面小 |
+| JOIN-ON 位置子查询 | **M4** | 原 relation-local marker 路径最脆弱（D3），但用户面小 |
 | multi-column IN、GROUP BY/ORDER BY 位置（D5 报错收口）、correlated EXISTS in SELECT（D4） | **M4+** | 按需推进；D4/D5 的报错收口可以提前单独落 |
 
 ### 7.3 里程碑
 
 **M0 — 基建（不改变任何行为）**
 `ApplyKind` / `ApplyNode` / `AssertOneRowNode` + §5.6 全部 match arm + `SubqueryRewrite` 空
-stage + `ApplyException` + `subquery_unnest_mode`（默认 `legacy`）+ logical EXPLAIN 的
-`APPLY` / `ASSERT ONE ROW` 格式。验收：全部现有 suite 不变；trip-wire test 通过。
+stage + `ApplyException` + logical EXPLAIN 的 `APPLY` / `ASSERT ONE ROW` 格式。验收：全部
+现有 suite 不变；trip-wire test 通过。
 
 **M1 — scalar 链路 + 多行 guard**
 analyzer `SubqueryInfo` 升级与路由、planner Apply 构造（scalar）、PushDownApplyProject/Filter/
 AggFilter/AggProjectFilter、NormalizeCountScalarApply、ScalarApplyToJoin、AssertOneRow 的
-codegen 发射。默认仍 `legacy`；CI 增加 `apply_strict` 模式跑 scalar 相关 case。
-验收：apply 模式下 scalar 子查询结果与 legacy 一致（多行场景除外——legacy 静默错，apply 报
-错，**这是有意的语义修复**，在 PR 描述与 golden 中显式标注）；tpc-h q2/q17 在 apply 模式结果
-正确且 plan 不差于 legacy。
+codegen 发射。验收：scalar 子查询结果与既有正确 case 一致（多行场景除外——旧路径静默错，
+Apply 报错，**这是有意的语义修复**，在 PR 描述与 golden 中显式标注）；tpc-h q2/q17 结果正确
+且 plan 不差于迁移前形态。
 
 **M2 — ApplyToWindow（OQ-13 主交付）**
-WinMagic 规则 + plan golden + 默认切 `apply`（scalar kind）。
+WinMagic 规则 + plan golden + scalar Apply 路由落地。
 验收：q17 EXPLAIN 出现 `ANALYTIC`（或在条件不满足时保持紧凑 agg+join，join 数不回退）；q2 join
 数明显下降或出现 window；`disable_optimizer_rules='ApplyToWindow'` 时回到 M1 形态。
 
 **M3 — EXISTS / IN to-join 迁移**
-Existential/QuantifiedApplyToJoin；join/runtime-filter/tpc 套件在 apply 模式全绿后把 EXISTS/IN
-加入 `apply` 模式的形态白名单（模式默认值在 M2 已是 `apply`，此处扩大的是白名单覆盖面）；删除
-legacy 对应分支。验收重点：NAAJ 全矩阵（`join_null_aware_anti` 等）不回归。
+Existential/QuantifiedApplyToJoin；join/runtime-filter/tpc 套件全绿后把 EXISTS/IN 纳入
+predicate Apply spec 路由；删除迁移期对应分支。验收重点：NAAJ 全矩阵
+（`join_null_aware_anti` 等）不回归。
 
 **M4 — value-form、JOIN-ON、收尾**
-OuterJoin 形态规则（修 D2/D3）、JOIN-ON 子查询、D4/D5 报错收口；删除 `subquery_rewrite.rs` 与
-`subquery_unnest_mode`。
+value-form marker rewrite（修 D2）、JOIN-ON marker rewrite（修 D3）、D4/D5 报错收口；删除
+迁移期 session 开关与所有隐式回退入口。`subquery_rewrite.rs` 目前仍承载 analyzer 级显式路由与
+marker helper，后续若拆分应只做模块命名/结构整理，不能恢复双轨行为。
 
-每个里程碑独立可合并、独立可回退（session 变量 + rule disable 双保险）。
+每个里程碑独立可合并；optimizer 形态验证通过 `disable_optimizer_rules` 完成。
 
 ---
 
@@ -557,9 +558,9 @@ OuterJoin 形态规则（修 D2/D3）、JOIN-ON 子查询、D4/D5 报错收口�
 
 ### 8.1 analyzer / planner unit tests
 
-- 沿用 `src/sql/analyzer/mod.rs` 现有测试风格：apply 模式下断言 `SubqueryInfo` 携带的
-  correlation 列、kind、`use_semi_anti`（WHERE 顶层 AND = true；OR / NOT / projection = false）；
-  legacy 模式现有测试不动，作为迁移期回归锚。
+- 沿用 `src/sql/analyzer/mod.rs` 现有测试风格：断言 `SubqueryInfo` / Apply spec 携带的
+  correlation 列、kind、`use_semi_anti`（WHERE/HAVING 顶层 AND = true；OR / NOT /
+  projection = false）；不支持形态必须断言明确错误。
 - planner 测试：Apply 链 left-deep 堆叠顺序、placeholder 替换为 `output_column`、semi-anti
   conjunct 从 Filter 中删除、`plan_output_columns` 正确。
 
@@ -572,7 +573,8 @@ NAAJ 形态也没有 `@explain_contains` 断言。新增 case 族（每条规则
 - `subquery_scalar_correlated_agg_join`：锁 LEFT OUTER JOIN + vector agg（M1 形态）；
 - `subquery_scalar_correlated_nonagg_guard`：锁 `assert_true` / count+any_value 投影；
 - `subquery_scalar_to_window`：WinMagic 命中，锁 `ANALYTIC` + `@explain_not_contains` 多余
-  join；同 case 第二步 `SET disable_optimizer_rules='ApplyToWindow'` 锁 fallback 形态；
+  join；同 case 第二步 `SET disable_optimizer_rules='ApplyToWindow'` 锁未 window 化的 to-join
+  形态；
 - `subquery_scalar_to_window_rejected_*`：自连接 / 表集不匹配 / 谓词不一致 / 带 limit 等
   逐条否定条件，锁**不**出现 `ANALYTIC`（防误改写——这是「不为 TPC 硬编码」的反向保险）；
 - `subquery_not_in_null_aware_shape`：锁 `NULL AWARE LEFT ANTI`（补上现状缺失的形态断言）；
@@ -583,23 +585,21 @@ NAAJ 形态也没有 `@explain_contains` 断言。新增 case 族（每条规则
 ### 8.3 SQL correctness 与 NULL-sensitive cases
 
 - 复用并扩展 join suite 既有家族（`join_not_in_with_null`、`join_not_in_correlated_conjunct_
-  null_aware`、`join_null_aware_anti`、`join_exists_subquery_semantics` 等）——M3 切默认前在
-  `apply` 模式整体重跑，结果 golden 不得变化。
+  null_aware`、`join_null_aware_anti`、`join_exists_subquery_semantics` 等），结果 golden 不得
+  变化。
 - 新增 correctness case：
   - **scalar 多行**：uncorrelated 与 correlated 非 agg 形态各一，`@expect_error` 断言
-    assert 消息（这两个 case 只能在 apply 模式下落 golden——legacy 模式行为是静默复制行，
-    无法用 `@expect_error` 表达）；
+    assert 消息（旧路径行为是静默复制行，无法用 `@expect_error` 表达）；
   - **empty group**：correlated scalar agg 在无匹配组时输出 NULL；`count` 经
     NormalizeCount 后输出 0（两者分别断言）；
   - **NULL correlation key**：probe 侧 NULL key 行在 scalar / EXISTS / IN 三种形态下的输出；
   - **NOT IN NULL 全矩阵**：build NULL / probe NULL / 两侧 NULL / 空子查询 ×（correlated |
-    uncorrelated），与 legacy 输出逐行一致。
+    uncorrelated），与 SQL 三值逻辑期望逐行一致。
 
-### 8.4 双模式回归与 CI
+### 8.4 单一路由回归与 CI
 
-- M1-M3 期间 CI 对受影响 suite 各跑一遍 `apply_strict`（前置 `SET subquery_unnest_mode`，
-  复用 runner 的 init/step 机制），与默认模式 golden 共用——保证两条链路同结果；
-- 切默认后保留一个里程碑周期的 legacy 回归窗口，然后随 legacy 代码一起删除。
+- 所有受影响 suite 只验证当前单一路由；不再通过 session 变量跑第二条链路。
+- CI 需要覆盖两类负例：不支持形态直接 analyzer 报错；残留 Apply 触发 `ApplyException`。
 
 ### 8.5 TPC 验收（OQ-13 对接）
 
@@ -615,15 +615,15 @@ NAAJ 形态也没有 `@explain_contains` 断言。新增 case 族（每条规则
   top/rank-per-group 的 window 化 rewrite（OQ-13 另一子项）不依赖 Apply 入口，但复用本设计
   建立的 SubqueryRewrite stage、plan golden 与 rule disable 基建。
 - 其余覆盖面：tpc-h q4/q21/q22（EXISTS/NOT EXISTS）、q16/q18/q20（IN/NOT IN）、tpc-ds
-  q1/q6/q30/q32/q81/q92（correlated scalar）在 M3 切默认时作为整体回归面。
+  q1/q6/q30/q32/q81/q92（correlated scalar）作为整体回归面。
 
 ---
 
 ## 9. 风险与未决问题
 
 1. **ApplyToWindow 条件极严**（表同一性、谓词同一性），通用查询命中率低。可接受：未命中时
-   fallback 是 M1 的紧凑 agg+join——与现状形态相同，没有回退风险；命中收益（消除整棵子查询
-   子树的重复扫描）正是 q2/q17 的差距来源。**不放宽条件去凑覆盖率**（放宽 = 误改写风险）。
+   仍使用 M1 的紧凑 agg+join 形态；命中收益（消除整棵子查询子树的重复扫描）正是 q2/q17 的
+   差距来源。**不放宽条件去凑覆盖率**（放宽 = 误改写风险）。
 2. **q2/q17 当前结果正确**，本次迁移在这两条查询上是纯 plan 形态收益。真正的正确性收益在
    D1/D6（多行 guard）——它会把既有「静默错」变成报错，属于行为收紧；需在 M1 的 PR 描述中
    显式公告。
@@ -634,10 +634,9 @@ NAAJ 形态也没有 `@explain_contains` 断言。新增 case 族（每条规则
    M3 验收以 join/runtime-filter suite 与 `join_large_in_predicate` 的执行不回退为门槛。
 5. **`use_semi_anti` 的 clause 追踪**需要 resolve_expr 在表达式下降中维护上下文标志，是
    analyzer 改造里最容易出错的点；用 §8.1 的 unit test 矩阵（AND/OR/NOT/嵌套/HAVING/ON）锁。
-6. **未决：HAVING 中子查询的 correlation 进 aggregate 之上**。legacy 通过把 HAVING 谓词留在
-   aggregate 之上的 Filter 解决；Apply 链路同样把 Apply 插在 aggregate 之上即可，但 correlated
-   HAVING 子查询引用聚合结果列的形态需要在 M1 中先用 `apply_strict` 暴露面，再决定支持或显式
-   报错。
+6. **HAVING 中子查询的 correlation 进 aggregate 之上**。当前路由把 HAVING predicate Apply 插在
+   aggregate 之上，并把 HAVING 的 IN LHS/grouping marker 同步改写；嵌套 value-form 的相关
+   HAVING 子查询仍按不支持形态显式报错。
 7. **未决：`AssertOneRow` 之上的 limit 交互**。`AssertOneRow` 不可与 Limit 交换（`LIMIT 1` 会
    掩盖多行错误）；M0 在节点注释与 rewrite walker 中固定该约束，暂不需要规则强制（没有规则
    会做这种交换），留意后续 TopN 类规则。
@@ -649,9 +648,9 @@ NAAJ 形态也没有 `@explain_contains` 断言。新增 case 族（每条规则
 | 缺陷（§2.3） | 处置 |
 |---|---|
 | D1 scalar 无多行 guard | M1 修复（AssertOneRow / assert_true 形态） |
-| D2 NOT IN value-form build NULL | M4（CTE 双分支 + CASE 形态）；迁移前保持 legacy 行为并在本文档记录 |
+| D2 NOT IN value-form build NULL | M4 marker subquery + CASE 形态修复 |
 | D3 JOIN-ON NOT IN indicator NULL | M4 |
-| D4 correlated EXISTS in SELECT list 泄漏 placeholder | M4 value-form 覆盖；或提前在 analyzer 显式报错 |
-| D5 GROUP BY / ORDER BY 子查询泄漏 placeholder | 可独立提前：analyzer 显式报错（一行检查 + 测试） |
-| D6 非等值 correlated scalar 静默重复 | M1 起 apply 模式显式报 non-EQ 错误；legacy 行为随分支删除而消失 |
+| D4 correlated EXISTS in SELECT list 泄漏 placeholder | analyzer 显式报错 |
+| D5 GROUP BY / ORDER BY 子查询泄漏 placeholder | analyzer 显式报错 |
+| D6 非等值 correlated scalar 静默重复 | Apply 路由显式报错；旧静默重复行为已移除 |
 | D7 scalar correlation 检测无兜底 | 新链路在 merged-scope 分析时即收集 outer 引用，兜底天然存在；检测不到的形态归为 analyzer 错误 |

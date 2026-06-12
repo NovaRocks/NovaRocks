@@ -860,22 +860,15 @@ mod is_known_rule_name_tests {
     }
 
     /// End-to-end proof: the full analyze → plan_query → optimize chain in
-    /// apply mode turns a scalar subquery into a `LogicalPlan::Apply`, which
+    /// the Apply framework turns a scalar subquery into a `LogicalPlan::Apply`, which
     /// M1b's `SubqueryRewrite` decorrelation rules (PushDownApplyAggFilter +
     /// ScalarApplyToJoin) rewrite into a LEFT OUTER JOIN over a vector
     /// aggregate. The optimized physical plan contains a HashJoin (or NestLoop)
     /// and no residual Apply node or "subquery decorrelation failed" error.
-    ///
-    /// Both the analyze and optimize calls run inside the same
-    /// `with_session_optimizer_settings` closure so both read the same
-    /// session-level `subquery_unnest_mode = Apply`.
     #[test]
-    fn apply_mode_scalar_subquery_decorrelates_to_join() {
+    fn scalar_subquery_decorrelates_to_join() {
         use crate::sql::catalog::{CatalogProvider, ColumnDef, ScanSource, TableDef};
         use crate::sql::column_id::ColumnRefFactory;
-        use crate::sql::optimizer::options::{
-            SessionOptimizerSettings, SubqueryUnnestMode, with_session_optimizer_settings,
-        };
 
         // Minimal catalog providing t1(k1, k2) and t2(k1, k2) — the same
         // shape the planner and analyzer test modules use.
@@ -917,40 +910,33 @@ mod is_known_rule_name_tests {
         // LEFT OUTER JOIN over a vector aggregate.
         let sql = "SELECT k1 FROM t1 WHERE k1 = (SELECT max(k2) FROM t2 WHERE t2.k1 = t1.k1)";
 
-        let settings = SessionOptimizerSettings {
-            subquery_unnest_mode: SubqueryUnnestMode::Apply,
-            ..Default::default()
+        // parse → analyze
+        let dialect = crate::sql::parser::dialect::StarRocksDialect;
+        let mut ast = sqlparser::parser::Parser::parse_sql(&dialect, sql)
+            .map_err(|e| e.to_string())
+            .expect("parse must succeed");
+        let stmt = ast.pop().expect("expected a statement");
+        let query = match stmt {
+            sqlparser::ast::Statement::Query(q) => q,
+            _ => panic!("expected a query"),
         };
+        let (resolved, cte_registry, mut factory) =
+            crate::sql::analyzer::analyze(&query, &MinimalCatalog, "default")
+                .expect("analyze with apply framework must succeed");
 
-        let physical = with_session_optimizer_settings(settings, || {
-            // parse → analyze
-            let dialect = crate::sql::parser::dialect::StarRocksDialect;
-            let mut ast = sqlparser::parser::Parser::parse_sql(&dialect, sql)
-                .map_err(|e| e.to_string())
-                .expect("parse must succeed");
-            let stmt = ast.pop().expect("expected a statement");
-            let query = match stmt {
-                sqlparser::ast::Statement::Query(q) => q,
-                _ => panic!("expected a query"),
-            };
-            let (resolved, cte_registry, mut factory) =
-                crate::sql::analyzer::analyze(&query, &MinimalCatalog, "default")
-                    .expect("analyze in apply mode must succeed");
+        // plan_query: turns the ApplyScalarSpec into LogicalPlan::Apply.
+        let plan = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)
+            .expect("plan_query with apply framework must succeed");
 
-            // plan_query: turns the ApplyScalarSpec into LogicalPlan::Apply.
-            let plan = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)
-                .expect("plan_query in apply mode must succeed");
-
-            // optimize: M1b's decorrelation rules must rewrite the Apply to a
-            // join; no ApplyException error, no residual Apply.
-            optimize(
-                plan,
-                &HashMap::new(),
-                ColumnRefFactory::new(),
-                None,
-                Vec::new(),
-            )
-        })
+        // optimize: M1b's decorrelation rules must rewrite the Apply to a
+        // join; no ApplyException error, no residual Apply.
+        let physical = optimize(
+            plan,
+            &HashMap::new(),
+            ColumnRefFactory::new(),
+            None,
+            Vec::new(),
+        )
         .expect("optimize must succeed: M1b decorrelates correlated aggregate scalar subquery");
 
         let physical_debug = format!("{physical:?}");

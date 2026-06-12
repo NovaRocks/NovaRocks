@@ -1041,24 +1041,6 @@ async fn execute_statement_text(
         }
     }
 
-    if let Some(values) = parse_set_string_csv(trimmed, "subquery_unnest_mode") {
-        let mode = match values.as_slice() {
-            [value] => crate::sql::optimizer::options::SubqueryUnnestMode::parse(value),
-            _ => None,
-        };
-        let Some(mode) = mode else {
-            return Err((
-                ErrorKind::ER_WRONG_VALUE,
-                format!(
-                    "invalid subquery_unnest_mode value {values:?}; \
-                     expected 'legacy', 'apply', or 'apply_strict'"
-                ),
-            ));
-        };
-        shim.optimizer_settings.subquery_unnest_mode = mode;
-        return Ok(StatementResult::Ok);
-    }
-
     if let Some(v) = parse_set_non_negative_integer(trimmed, "global_runtime_filter_build_max_size")
     {
         shim.optimizer_settings.rf_build_max_bytes = Some(v);
@@ -2012,21 +1994,6 @@ mod tests {
         assert!(!crate::sql::optimizer::is_known_rule_name(
             "TotallyNotARealRule"
         ));
-    }
-
-    #[test]
-    fn parse_set_string_csv_matches_subquery_unnest_mode() {
-        assert_eq!(
-            parse_set_string_csv("SET subquery_unnest_mode = 'apply'", "subquery_unnest_mode"),
-            Some(vec!["apply".to_string()]),
-        );
-        assert_eq!(
-            parse_set_string_csv(
-                "SET subquery_unnest_mode = 'apply_strict'",
-                "subquery_unnest_mode"
-            ),
-            Some(vec!["apply_strict".to_string()]),
-        );
     }
 
     // I1: resolve_server_options_from_config must extract settings from a
