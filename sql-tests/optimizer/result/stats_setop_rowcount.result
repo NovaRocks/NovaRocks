@@ -17,43 +17,49 @@ GATHER EXCHANGE stats={rows=1600}
 Explain String
 GATHER EXCHANGE stats={rows=1200}
   UNION stats={rows=1200}
-    PROJECT [k] stats={rows=1000}
-      SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l stats={rows=1000}
-           TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l
-           columns: k
-           min-max stats
-    PROJECT [k] stats={rows=600}
-      SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r stats={rows=600}
-           TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r
-           columns: k
-           min-max stats
+    HASH EXCHANGE (source: ShuffleJoin, hash: [c1]) stats={rows=1000}
+      PROJECT [k] stats={rows=1000}
+        SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l stats={rows=1000}
+             TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l
+             columns: k
+             min-max stats
+    HASH EXCHANGE (source: ShuffleJoin, hash: [c2]) stats={rows=600}
+      PROJECT [k] stats={rows=600}
+        SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r stats={rows=600}
+             TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r
+             columns: k
+             min-max stats
 
 -- query 11
 Explain String
 GATHER EXCHANGE stats={rows=300}
   INTERSECT stats={rows=300}
-    PROJECT [k] stats={rows=1000}
-      SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l stats={rows=1000}
-           TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l
-           columns: k
-           min-max stats
-    PROJECT [k] stats={rows=600}
-      SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r stats={rows=600}
-           TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r
-           columns: k
-           min-max stats
+    HASH EXCHANGE (source: ShuffleJoin, hash: [c1]) stats={rows=1000}
+      PROJECT [k] stats={rows=1000}
+        SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l stats={rows=1000}
+             TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l
+             columns: k
+             min-max stats
+    HASH EXCHANGE (source: ShuffleJoin, hash: [c2]) stats={rows=600}
+      PROJECT [k] stats={rows=600}
+        SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r stats={rows=600}
+             TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r
+             columns: k
+             min-max stats
 
 -- query 12
 Explain String
 GATHER EXCHANGE stats={rows=500}
   EXCEPT stats={rows=500}
-    PROJECT [k] stats={rows=1000}
-      SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l stats={rows=1000}
-           TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l
-           columns: k
-           min-max stats
-    PROJECT [k] stats={rows=600}
-      SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r stats={rows=600}
-           TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r
-           columns: k
-           min-max stats
+    HASH EXCHANGE (source: ShuffleJoin, hash: [c1]) stats={rows=1000}
+      PROJECT [k] stats={rows=1000}
+        SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l stats={rows=1000}
+             TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l
+             columns: k
+             min-max stats
+    HASH EXCHANGE (source: ShuffleJoin, hash: [c2]) stats={rows=600}
+      PROJECT [k] stats={rows=600}
+        SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r stats={rows=600}
+             TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r
+             columns: k
+             min-max stats

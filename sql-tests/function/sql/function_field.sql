@@ -92,7 +92,26 @@ SELECT * FROM t1 ORDER BY field(c3, 1.1111, 6 - 1, 6.01, 5 + 0.5);
 -- query 19
 -- Setup views for cross-type field() tests
 -- @skip_result_check=true
+CREATE EXTERNAL CATALOG IF NOT EXISTS `function_view_rest_${suite_uuid0}`
+PROPERTIES (
+    "type"="iceberg",
+    "iceberg.catalog.type"="rest",
+    "uri"="${iceberg_rest_uri}",
+    "warehouse"="${iceberg_rest_warehouse}",
+    "aws.s3.access_key"="${oss_ak}",
+    "aws.s3.secret_key"="${oss_sk}",
+    "aws.s3.endpoint"="${oss_endpoint}",
+    "aws.s3.region"="us-east-1",
+    "aws.s3.enable_path_style_access"="true"
+);
+SET CATALOG function_view_rest_${suite_uuid0};
+CREATE DATABASE IF NOT EXISTS ${case_db};
 USE ${case_db};
+DROP VIEW IF EXISTS vvv;
+DROP VIEW IF EXISTS vv;
+DROP VIEW IF EXISTS v;
+DROP VIEW IF EXISTS dv;
+DROP VIEW IF EXISTS dvv;
 CREATE VIEW vvv AS SELECT cast(1 as double) AS c1;
 
 -- query 20
@@ -149,6 +168,14 @@ SELECT field(dv.c1, vv.c1, dvv.c1) FROM dv, dvv, vv;
 -- query 30
 -- Setup: create t2 for concurrency test with 16 buckets
 -- @skip_result_check=true
+SET CATALOG function_view_rest_${suite_uuid0};
+USE ${case_db};
+DROP VIEW IF EXISTS vvv;
+DROP VIEW IF EXISTS vv;
+DROP VIEW IF EXISTS v;
+DROP VIEW IF EXISTS dv;
+DROP VIEW IF EXISTS dvv;
+SET CATALOG function_cat_${suite_uuid0};
 USE ${case_db};
 CREATE TABLE t2 (c1 int, c2 string)
 TBLPROPERTIES ("format-version" = "3");

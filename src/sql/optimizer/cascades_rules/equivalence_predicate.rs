@@ -1,6 +1,6 @@
 //! Inner join equivalence predicate propagation.
 
-use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, TypedExpr};
+use crate::sql::analysis::{JoinKind, OutputColumn, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::logical_props::{
     collect_column_equalities, collect_literal_equalities, combine_with_and,
@@ -9,14 +9,13 @@ use crate::sql::optimizer::logical_props::{
 use crate::sql::optimizer::memo::{GroupId, LogicalProperties, MExpr, Memo};
 use crate::sql::optimizer::operator::{LogicalFilterOp, LogicalJoinOp, Operator};
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
-use arrow::datatypes::DataType;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub(crate) struct InnerJoinEquivalencePredicateRule;
 
 impl Rule for InnerJoinEquivalencePredicateRule {
     fn name(&self) -> &str {
-        "InnerJoinEquivalencePredicateRule"
+        "JoinPredicateMoveAround"
     }
 
     fn rule_type(&self) -> RuleType {
@@ -168,6 +167,18 @@ fn literal_equalities_from_join(join: &LogicalJoinOp) -> Vec<(ColumnId, TypedExp
 }
 
 fn literal_equalities_from_group(memo: &Memo, group_id: GroupId) -> Vec<(ColumnId, TypedExpr)> {
+    let mut visited = HashSet::new();
+    literal_equalities_from_group_inner(memo, group_id, &mut visited)
+}
+
+fn literal_equalities_from_group_inner(
+    memo: &Memo,
+    group_id: GroupId,
+    visited: &mut HashSet<GroupId>,
+) -> Vec<(ColumnId, TypedExpr)> {
+    if !visited.insert(group_id) {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     let Some(group) = memo.groups.get(group_id) else {
         return out;
@@ -180,6 +191,9 @@ fn literal_equalities_from_group(memo: &Memo, group_id: GroupId) -> Vec<(ColumnI
                         .into_iter()
                         .map(|eq| (eq.column_id, eq.literal)),
                 );
+                for child in &expr.children {
+                    out.extend(literal_equalities_from_group_inner(memo, *child, visited));
+                }
             }
             Operator::LogicalScan(scan) => {
                 for predicate in &scan.predicates {
@@ -188,6 +202,20 @@ fn literal_equalities_from_group(memo: &Memo, group_id: GroupId) -> Vec<(ColumnI
                             .into_iter()
                             .map(|eq| (eq.column_id, eq.literal)),
                     );
+                }
+            }
+            Operator::LogicalJoin(join)
+                if matches!(join.join_type, JoinKind::Inner | JoinKind::Cross) =>
+            {
+                if let Some(condition) = &join.condition {
+                    out.extend(
+                        collect_literal_equalities(condition)
+                            .into_iter()
+                            .map(|eq| (eq.column_id, eq.literal)),
+                    );
+                }
+                for child in &expr.children {
+                    out.extend(literal_equalities_from_group_inner(memo, *child, visited));
                 }
             }
             _ => {}
@@ -227,10 +255,18 @@ fn has_literal_equality_in_side(
     {
         return true;
     }
+    let props = memo
+        .groups
+        .get(group_id)
+        .and_then(|group| group.logical_props.as_ref());
     literal_equalities_from_group(memo, group_id)
         .into_iter()
         .any(|(existing_column, existing_literal)| {
-            existing_column == column_id && literal_signature(&existing_literal) == signature
+            let same_or_equivalent = existing_column == column_id
+                || props
+                    .and_then(|props| props.equivalence_classes.class_containing(column_id))
+                    .is_some_and(|class| class.contains(existing_column));
+            same_or_equivalent && literal_signature(&existing_literal) == signature
         })
 }
 
@@ -267,9 +303,10 @@ fn add_filter_group(memo: &mut Memo, child_group: GroupId, predicates: Vec<Typed
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::analysis::{BinOp, ExprKind, LiteralValue};
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::optimizer::operator::LogicalScanOp;
-    use std::path::PathBuf;
+    use arrow::datatypes::DataType;
 
     fn output(id: u32, name: &str) -> OutputColumn {
         OutputColumn {
@@ -326,6 +363,15 @@ mod tests {
     }
 
     fn scan_group(memo: &mut Memo, id: u32, name: &str) -> GroupId {
+        scan_group_with_predicates(memo, id, name, Vec::new())
+    }
+
+    fn scan_group_with_predicates(
+        memo: &mut Memo,
+        id: u32,
+        name: &str,
+        predicates: Vec<TypedExpr>,
+    ) -> GroupId {
         let group = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalScan(LogicalScanOp {
@@ -341,7 +387,7 @@ mod tests {
                 },
                 alias: None,
                 columns: vec![output(id, name)],
-                predicates: Vec::new(),
+                predicates,
                 required_columns: None,
                 dict_columns: Vec::new(),
                 mv_rewritten_from: None,
@@ -350,6 +396,29 @@ mod tests {
         });
         memo.groups[group].logical_props =
             Some(LogicalProperties::new(vec![output(id, name)], 10.0));
+        group
+    }
+
+    fn inner_join_group(
+        memo: &mut Memo,
+        left: GroupId,
+        right: GroupId,
+        condition: TypedExpr,
+        outputs: Vec<OutputColumn>,
+    ) -> GroupId {
+        let group = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalJoin(LogicalJoinOp {
+                join_type: JoinKind::Inner,
+                condition: Some(condition.clone()),
+            }),
+            children: vec![left, right],
+        });
+        let mut props = LogicalProperties::new(outputs, 10.0);
+        for (left, right) in collect_column_equalities(&condition) {
+            props.equivalence_classes.merge_pair(left, right);
+        }
+        memo.groups[group].logical_props = Some(props);
         group
     }
 
@@ -433,6 +502,35 @@ mod tests {
             }),
             children: vec![left, right_filter],
         };
+        assert!(
+            InnerJoinEquivalencePredicateRule
+                .apply(&join, &mut memo)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn does_not_duplicate_literal_already_present_below_inner_join_side() {
+        let mut memo = Memo::new();
+        let left_a = scan_group_with_predicates(&mut memo, 1, "ak", vec![eq(col(1, "ak"), lit(7))]);
+        let left_b = scan_group_with_predicates(&mut memo, 2, "bk", vec![eq(col(2, "bk"), lit(7))]);
+        let left_join = inner_join_group(
+            &mut memo,
+            left_a,
+            left_b,
+            eq(col(1, "ak"), col(2, "bk")),
+            vec![output(1, "ak"), output(2, "bk")],
+        );
+        let right = scan_group_with_predicates(&mut memo, 3, "ck", vec![eq(col(3, "ck"), lit(7))]);
+        let join = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalJoin(LogicalJoinOp {
+                join_type: JoinKind::Inner,
+                condition: Some(eq(col(2, "bk"), col(3, "ck"))),
+            }),
+            children: vec![left_join, right],
+        };
+
         assert!(
             InnerJoinEquivalencePredicateRule
                 .apply(&join, &mut memo)
