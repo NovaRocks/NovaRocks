@@ -12,6 +12,9 @@ GATHER EXCHANGE stats={rows=1600}
            TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r
            columns: k
            min-max stats
+Boundary Schemas:
+  Fragment 0 RESULT_ROOT node=5:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
 
 -- query 10
 Explain String
@@ -23,12 +26,33 @@ GATHER EXCHANGE stats={rows=1200}
              TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l
              columns: k
              min-max stats
-    HASH EXCHANGE (source: ShuffleJoin, hash: [c2]) stats={rows=600}
+    HASH EXCHANGE (source: ShuffleJoin, hash: [c4]) stats={rows=600}
       PROJECT [k] stats={rows=600}
         SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r stats={rows=600}
              TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r
              columns: k
              min-max stats
+Boundary Schemas:
+  Fragment 2 RESULT_ROOT node=2:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+  Fragment 3 RESULT_ROOT node=5:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+  Fragment 1 RESULT_ROOT node=7:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+  Fragment 0 RESULT_ROOT node=9:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+  Fragment 2 EXCHANGE_SEND node=3:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+  Fragment 1 EXCHANGE_RECV node=3:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+  Fragment 3 EXCHANGE_SEND node=6:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+  Fragment 1 EXCHANGE_RECV node=6:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+  Fragment 1 EXCHANGE_SEND node=8:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+  Fragment 0 EXCHANGE_RECV node=8:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
 
 -- query 11
 Explain String
@@ -40,12 +64,27 @@ GATHER EXCHANGE stats={rows=300}
              TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l
              columns: k
              min-max stats
-    HASH EXCHANGE (source: ShuffleJoin, hash: [c2]) stats={rows=600}
+    HASH EXCHANGE (source: ShuffleJoin, hash: [c4]) stats={rows=600}
       PROJECT [k] stats={rows=600}
         SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r stats={rows=600}
              TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r
              columns: k
              min-max stats
+Boundary Schemas:
+  Fragment 1 RESULT_ROOT node=2:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+  Fragment 2 RESULT_ROOT node=5:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+  Fragment 0 RESULT_ROOT node=7:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+  Fragment 1 EXCHANGE_SEND node=3:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+  Fragment 0 EXCHANGE_RECV node=3:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+  Fragment 2 EXCHANGE_SEND node=6:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+  Fragment 0 EXCHANGE_RECV node=6:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
 
 -- query 12
 Explain String
@@ -57,9 +96,24 @@ GATHER EXCHANGE stats={rows=500}
              TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l
              columns: k
              min-max stats
-    HASH EXCHANGE (source: ShuffleJoin, hash: [c2]) stats={rows=600}
+    HASH EXCHANGE (source: ShuffleJoin, hash: [c4]) stats={rows=600}
       PROJECT [k] stats={rows=600}
         SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r stats={rows=600}
              TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r
              columns: k
              min-max stats
+Boundary Schemas:
+  Fragment 1 RESULT_ROOT node=2:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+  Fragment 2 RESULT_ROOT node=5:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+  Fragment 0 RESULT_ROOT node=7:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+  Fragment 1 EXCHANGE_SEND node=3:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+  Fragment 0 EXCHANGE_RECV node=3:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+  Fragment 2 EXCHANGE_SEND node=6:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+  Fragment 0 EXCHANGE_RECV node=6:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true

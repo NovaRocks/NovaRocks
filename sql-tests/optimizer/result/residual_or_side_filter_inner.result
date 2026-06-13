@@ -17,3 +17,22 @@ GATHER EXCHANGE stats={rows=221484375}
              columns: k, payload
              min-max stats
              predicates: l.k = 1 OR l.k = 2 AND l.k IN (1, 2) AND l.k IS NOT NULL
+Boundary Schemas:
+  Fragment 1 RESULT_ROOT node=2:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=payload arrow=Int32 logical=<none> nullable=true
+    slot=3 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=4 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 0 RESULT_ROOT node=5:
+    slot=1 name=payload arrow=Int32 logical=<none> nullable=true
+    slot=2 name=payload arrow=Int32 logical=<none> nullable=true
+  Fragment 1 EXCHANGE_SEND node=3:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=payload arrow=Int32 logical=<none> nullable=true
+    slot=3 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=4 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 0 EXCHANGE_RECV node=3:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=payload arrow=Int32 logical=<none> nullable=true
+    slot=3 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=4 name=_pos arrow=Int64 logical=<none> nullable=false

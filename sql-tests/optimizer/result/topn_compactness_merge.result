@@ -17,6 +17,19 @@ PROJECT [s.id AS id, s.score AS score] stats={rows=2}
                   VALUES (1 rows) stats={rows=1}
               PROJECT [4 AS id, 5 AS score] stats={rows=1}
                 VALUES (1 rows) stats={rows=1}
+Boundary Schemas:
+  Fragment 1 RESULT_ROOT node=11:
+    slot=1 name=id arrow=Int64 logical=<none> nullable=false
+    slot=2 name=score arrow=Int64 logical=<none> nullable=false
+  Fragment 0 RESULT_ROOT node=17:
+    slot=1 name=id arrow=Int64 logical=<none> nullable=false
+    slot=2 name=score arrow=Int64 logical=<none> nullable=false
+  Fragment 1 EXCHANGE_SEND node=12:
+    slot=1 name=id arrow=Int64 logical=<none> nullable=false
+    slot=2 name=score arrow=Int64 logical=<none> nullable=false
+  Fragment 0 EXCHANGE_RECV node=12:
+    slot=1 name=id arrow=Int64 logical=<none> nullable=false
+    slot=2 name=score arrow=Int64 logical=<none> nullable=false
 
 -- query 4
 Explain String
@@ -38,3 +51,16 @@ TOP-N (limit=2) [s.score DESC NULLS LAST, id ASC NULLS FIRST] stats={rows=2}
                     VALUES (1 rows) stats={rows=1}
                 PROJECT [4 AS id, 5 AS score] stats={rows=1}
                   VALUES (1 rows) stats={rows=1}
+Boundary Schemas:
+  Fragment 1 RESULT_ROOT node=13:
+    slot=1 name=id arrow=Int64 logical=<none> nullable=false
+    slot=2 name=score arrow=Int64 logical=<none> nullable=false
+  Fragment 0 RESULT_ROOT node=18:
+    slot=1 name=id arrow=Int64 logical=<none> nullable=false
+    slot=2 name=score arrow=Int64 logical=<none> nullable=false
+  Fragment 1 EXCHANGE_SEND node=14:
+    slot=1 name=id arrow=Int64 logical=<none> nullable=false
+    slot=2 name=score arrow=Int64 logical=<none> nullable=false
+  Fragment 0 EXCHANGE_RECV node=14:
+    slot=1 name=id arrow=Int64 logical=<none> nullable=false
+    slot=2 name=score arrow=Int64 logical=<none> nullable=false

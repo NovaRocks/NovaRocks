@@ -10,3 +10,12 @@ PROJECT [count(*)] stats={rows=1 conf=estimated}
              TABLE: db_sqlt_c2ef190265c86c9f.t_analyze_header
              columns: k
              min-max stats
+Boundary Schemas:
+  Fragment 1 RESULT_ROOT node=2:
+    slot=1 name=count(*) arrow=Int64 logical=<none> nullable=true
+  Fragment 0 RESULT_ROOT node=5:
+    slot=1 name=count(*) arrow=Int64 logical=<none> nullable=true
+  Fragment 1 EXCHANGE_SEND node=3:
+    slot=1 name=count(*) arrow=Int64 logical=<none> nullable=true
+  Fragment 0 EXCHANGE_RECV node=3:
+    slot=1 name=count(*) arrow=Int64 logical=<none> nullable=true

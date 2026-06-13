@@ -12,6 +12,25 @@ GATHER EXCHANGE stats={rows=8000}
              TABLE: db_sqlt_daa0fb3549863650.oq12_stats_join_r
              columns: k, flag
              min-max stats
+Boundary Schemas:
+  Fragment 1 RESULT_ROOT node=2:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=flag arrow=Int32 logical=<none> nullable=true
+    slot=3 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=4 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 0 RESULT_ROOT node=5:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=flag arrow=Int32 logical=<none> nullable=true
+  Fragment 1 EXCHANGE_SEND node=3:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=flag arrow=Int32 logical=<none> nullable=true
+    slot=3 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=4 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 0 EXCHANGE_RECV node=3:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=flag arrow=Int32 logical=<none> nullable=true
+    slot=3 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=4 name=_pos arrow=Int64 logical=<none> nullable=false
 
 -- query 10
 Explain String
@@ -32,6 +51,24 @@ GATHER EXCHANGE stats={rows=1000}
              columns: k
              min-max stats
              predicates: r.k IS NOT NULL
+Boundary Schemas:
+  Fragment 1 RESULT_ROOT node=2:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=flag arrow=Int32 logical=<none> nullable=true
+    slot=3 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=4 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 0 RESULT_ROOT node=5:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+  Fragment 1 EXCHANGE_SEND node=3:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=flag arrow=Int32 logical=<none> nullable=true
+    slot=3 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=4 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 0 EXCHANGE_RECV node=3:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=flag arrow=Int32 logical=<none> nullable=true
+    slot=3 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=4 name=_pos arrow=Int64 logical=<none> nullable=false
 
 -- query 11
 Explain String
@@ -47,3 +84,21 @@ GATHER EXCHANGE stats={rows=400}
              TABLE: db_sqlt_daa0fb3549863650.oq12_stats_join_r
              columns: k
              min-max stats
+Boundary Schemas:
+  Fragment 1 RESULT_ROOT node=2:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=flag arrow=Int32 logical=<none> nullable=true
+    slot=3 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=4 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 0 RESULT_ROOT node=5:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+  Fragment 1 EXCHANGE_SEND node=3:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=flag arrow=Int32 logical=<none> nullable=true
+    slot=3 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=4 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 0 EXCHANGE_RECV node=3:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=flag arrow=Int32 logical=<none> nullable=true
+    slot=3 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=4 name=_pos arrow=Int64 logical=<none> nullable=false

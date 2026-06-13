@@ -13,3 +13,30 @@ PROJECT [count(*)] stats={rows=1}
              TABLE: db_sqlt_2413581ae9aba85a.oq12_stats_big_b
              columns: k
              min-max stats
+Boundary Schemas:
+  Fragment 1 RESULT_ROOT node=1:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=3 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 2 RESULT_ROOT node=3:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=3 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 0 RESULT_ROOT node=7:
+    slot=1 name=count(*) arrow=Int64 logical=<none> nullable=true
+  Fragment 1 EXCHANGE_SEND node=2:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=3 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 0 EXCHANGE_RECV node=2:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=3 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 2 EXCHANGE_SEND node=4:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=3 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 0 EXCHANGE_RECV node=4:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=3 name=_pos arrow=Int64 logical=<none> nullable=false

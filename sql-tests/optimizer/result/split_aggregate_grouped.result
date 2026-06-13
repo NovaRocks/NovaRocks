@@ -11,3 +11,25 @@ SORT BY [k ASC NULLS FIRST] stats={rows=4}
                  TABLE: db_sqlt_ab8d0e3ee9f79339.t_split_agg_grouped
                  columns: k, v
                  min-max stats
+Boundary Schemas:
+  Fragment 2 RESULT_ROOT node=2:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=sum(v) arrow=Int64 logical=<none> nullable=true
+  Fragment 1 RESULT_ROOT node=5:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=s arrow=Int64 logical=<none> nullable=true
+  Fragment 0 RESULT_ROOT node=7:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=s arrow=Int64 logical=<none> nullable=true
+  Fragment 2 EXCHANGE_SEND node=3:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=sum(v) arrow=Int64 logical=<none> nullable=true
+  Fragment 1 EXCHANGE_RECV node=3:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=sum(v) arrow=Int64 logical=<none> nullable=true
+  Fragment 1 EXCHANGE_SEND node=6:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=s arrow=Int64 logical=<none> nullable=true
+  Fragment 0 EXCHANGE_RECV node=6:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=s arrow=Int64 logical=<none> nullable=true

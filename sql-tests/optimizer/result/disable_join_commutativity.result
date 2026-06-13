@@ -18,6 +18,25 @@ GATHER EXCHANGE stats={rows=16200}
              columns: d_datekey, d_year
              min-max stats
              predicates: d.d_datekey IS NOT NULL
+Boundary Schemas:
+  Fragment 1 RESULT_ROOT node=2:
+    slot=1 name=d_datekey arrow=Int32 logical=<none> nullable=true
+    slot=2 name=d_year arrow=Int32 logical=<none> nullable=true
+    slot=3 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=4 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 0 RESULT_ROOT node=5:
+    slot=1 name=lo_orderkey arrow=Int32 logical=<none> nullable=true
+    slot=2 name=d_year arrow=Int32 logical=<none> nullable=true
+  Fragment 1 EXCHANGE_SEND node=3:
+    slot=1 name=d_datekey arrow=Int32 logical=<none> nullable=true
+    slot=2 name=d_year arrow=Int32 logical=<none> nullable=true
+    slot=3 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=4 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 0 EXCHANGE_RECV node=3:
+    slot=1 name=d_datekey arrow=Int32 logical=<none> nullable=true
+    slot=2 name=d_year arrow=Int32 logical=<none> nullable=true
+    slot=3 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=4 name=_pos arrow=Int64 logical=<none> nullable=false
 
 -- query 12
 Explain String
@@ -39,3 +58,25 @@ GATHER EXCHANGE stats={rows=16200}
              columns: lo_orderkey, lo_datekey
              min-max stats
              predicates: lo.lo_datekey IS NOT NULL
+Boundary Schemas:
+  Fragment 1 RESULT_ROOT node=2:
+    slot=1 name=lo_orderkey arrow=Int32 logical=<none> nullable=true
+    slot=2 name=lo_datekey arrow=Int32 logical=<none> nullable=true
+    slot=3 name=lo_revenue arrow=Int32 logical=<none> nullable=true
+    slot=4 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=5 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 0 RESULT_ROOT node=5:
+    slot=1 name=lo_orderkey arrow=Int32 logical=<none> nullable=true
+    slot=2 name=d_year arrow=Int32 logical=<none> nullable=true
+  Fragment 1 EXCHANGE_SEND node=3:
+    slot=1 name=lo_orderkey arrow=Int32 logical=<none> nullable=true
+    slot=2 name=lo_datekey arrow=Int32 logical=<none> nullable=true
+    slot=3 name=lo_revenue arrow=Int32 logical=<none> nullable=true
+    slot=4 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=5 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 0 EXCHANGE_RECV node=3:
+    slot=1 name=lo_orderkey arrow=Int32 logical=<none> nullable=true
+    slot=2 name=lo_datekey arrow=Int32 logical=<none> nullable=true
+    slot=3 name=lo_revenue arrow=Int32 logical=<none> nullable=true
+    slot=4 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=5 name=_pos arrow=Int64 logical=<none> nullable=false

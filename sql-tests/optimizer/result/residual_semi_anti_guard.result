@@ -2,24 +2,58 @@
 Explain String
 GATHER EXCHANGE stats={rows=17678}
   PROJECT [l.k AS k] stats={rows=17678}
-    HASH JOIN (BROADCAST, LEFT SEMI, eq: [l.k = r.k, l.flag = r.flag]) stats={rows=17678}
+    HASH JOIN (PARTITIONED, LEFT SEMI, eq: [l.k = r.k, l.flag = r.flag]) stats={rows=17678}
       other: l.flag = 1
-      build runtime filters:
-      - filter_id = 0, build_expr = (r.k)
-      - filter_id = 1, build_expr = (r.flag)
-      SCAN db_sqlt_30e12a0be90ceeef.residual_sa_l (alias=l) stats={rows=100000}
-           TABLE: db_sqlt_30e12a0be90ceeef.residual_sa_l
-           columns: k, flag
-           min-max stats
-          probe runtime filters:
-          - filter_id = 0, probe_expr = (l.k)
-          - filter_id = 1, probe_expr = (l.flag)
-      BROADCAST EXCHANGE stats={rows=81000}
+      HASH EXCHANGE (source: ShuffleJoin, hash: [c1, c2]) stats={rows=100000}
+        SCAN db_sqlt_30e12a0be90ceeef.residual_sa_l (alias=l) stats={rows=100000}
+             TABLE: db_sqlt_30e12a0be90ceeef.residual_sa_l
+             columns: k, flag
+             min-max stats
+      HASH EXCHANGE (source: ShuffleJoin, hash: [c6, c7]) stats={rows=81000}
         SCAN db_sqlt_30e12a0be90ceeef.residual_sa_r (alias=r) stats={rows=81000}
              TABLE: db_sqlt_30e12a0be90ceeef.residual_sa_r
              columns: k, flag
              min-max stats
              predicates: r.k IS NOT NULL AND r.flag IS NOT NULL
+Boundary Schemas:
+  Fragment 1 RESULT_ROOT node=1:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=flag arrow=Int32 logical=<none> nullable=true
+    slot=3 name=payload arrow=Int32 logical=<none> nullable=true
+    slot=4 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=5 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 2 RESULT_ROOT node=3:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=flag arrow=Int32 logical=<none> nullable=true
+    slot=3 name=payload arrow=Int32 logical=<none> nullable=true
+    slot=4 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=5 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 0 RESULT_ROOT node=6:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+  Fragment 1 EXCHANGE_SEND node=2:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=flag arrow=Int32 logical=<none> nullable=true
+    slot=3 name=payload arrow=Int32 logical=<none> nullable=true
+    slot=4 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=5 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 0 EXCHANGE_RECV node=2:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=flag arrow=Int32 logical=<none> nullable=true
+    slot=3 name=payload arrow=Int32 logical=<none> nullable=true
+    slot=4 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=5 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 2 EXCHANGE_SEND node=4:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=flag arrow=Int32 logical=<none> nullable=true
+    slot=3 name=payload arrow=Int32 logical=<none> nullable=true
+    slot=4 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=5 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 0 EXCHANGE_RECV node=4:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=flag arrow=Int32 logical=<none> nullable=true
+    slot=3 name=payload arrow=Int32 logical=<none> nullable=true
+    slot=4 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=5 name=_pos arrow=Int64 logical=<none> nullable=false
 
 -- query 6
 Explain String
@@ -32,8 +66,47 @@ GATHER EXCHANGE stats={rows=40000}
              TABLE: db_sqlt_30e12a0be90ceeef.residual_sa_l
              columns: k, flag
              min-max stats
-      HASH EXCHANGE (source: ShuffleJoin, hash: [c4, c5]) stats={rows=100000}
+      HASH EXCHANGE (source: ShuffleJoin, hash: [c6, c7]) stats={rows=100000}
         SCAN db_sqlt_30e12a0be90ceeef.residual_sa_r (alias=r) stats={rows=100000}
              TABLE: db_sqlt_30e12a0be90ceeef.residual_sa_r
              columns: k, flag
              min-max stats
+Boundary Schemas:
+  Fragment 1 RESULT_ROOT node=1:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=flag arrow=Int32 logical=<none> nullable=true
+    slot=3 name=payload arrow=Int32 logical=<none> nullable=true
+    slot=4 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=5 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 2 RESULT_ROOT node=3:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=flag arrow=Int32 logical=<none> nullable=true
+    slot=3 name=payload arrow=Int32 logical=<none> nullable=true
+    slot=4 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=5 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 0 RESULT_ROOT node=6:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+  Fragment 1 EXCHANGE_SEND node=2:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=flag arrow=Int32 logical=<none> nullable=true
+    slot=3 name=payload arrow=Int32 logical=<none> nullable=true
+    slot=4 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=5 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 0 EXCHANGE_RECV node=2:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=flag arrow=Int32 logical=<none> nullable=true
+    slot=3 name=payload arrow=Int32 logical=<none> nullable=true
+    slot=4 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=5 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 2 EXCHANGE_SEND node=4:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=flag arrow=Int32 logical=<none> nullable=true
+    slot=3 name=payload arrow=Int32 logical=<none> nullable=true
+    slot=4 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=5 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 0 EXCHANGE_RECV node=4:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=flag arrow=Int32 logical=<none> nullable=true
+    slot=3 name=payload arrow=Int32 logical=<none> nullable=true
+    slot=4 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=5 name=_pos arrow=Int64 logical=<none> nullable=false

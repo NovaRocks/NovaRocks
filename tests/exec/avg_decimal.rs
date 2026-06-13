@@ -25,10 +25,11 @@ use novarocks::exec::node::aggregate::{AggFunction, AggTypeSignature};
 
 #[test]
 fn test_avg_decimal_round_half_up_positive() {
-    // avg(0.01, 0.02) = 0.015 -> ROUND_HALF_UP => 0.02
+    // avg(0.000000000001, 0.000000000002) = 0.0000000000015
+    // -> ROUND_HALF_UP at scale 12 => 0.000000000002.
     let input = Arc::new(
         Decimal128Array::from(vec![Some(1_i128), Some(2_i128)])
-            .with_precision_and_scale(10, 2)
+            .with_precision_and_scale(18, 12)
             .unwrap(),
     ) as ArrayRef;
 
@@ -38,9 +39,10 @@ fn test_avg_decimal_round_half_up_positive() {
         input_is_intermediate: false,
         types: Some(AggTypeSignature {
             intermediate_type: None,
-            output_type: Some(DataType::Decimal128(10, 2)),
+            output_type: Some(DataType::Decimal128(38, 12)),
             input_arg_type: None,
         }),
+        order: Default::default(),
     };
 
     let arrays = [Some(input.clone())];
@@ -60,16 +62,17 @@ fn test_avg_decimal_round_half_up_positive() {
         .as_any()
         .downcast_ref::<Decimal128Array>()
         .expect("decimal output");
-    assert_eq!(out.data_type(), &DataType::Decimal128(10, 2));
+    assert_eq!(out.data_type(), &DataType::Decimal128(38, 12));
     assert_eq!(out.value(0), 2_i128);
 }
 
 #[test]
 fn test_avg_decimal_round_half_up_negative() {
-    // avg(-0.01, -0.02) = -0.015 -> ROUND_HALF_UP (away from zero) => -0.02
+    // avg(-0.000000000001, -0.000000000002) = -0.0000000000015
+    // -> ROUND_HALF_UP (away from zero) at scale 12 => -0.000000000002.
     let input = Arc::new(
         Decimal128Array::from(vec![Some(-1_i128), Some(-2_i128)])
-            .with_precision_and_scale(10, 2)
+            .with_precision_and_scale(18, 12)
             .unwrap(),
     ) as ArrayRef;
 
@@ -79,9 +82,10 @@ fn test_avg_decimal_round_half_up_negative() {
         input_is_intermediate: false,
         types: Some(AggTypeSignature {
             intermediate_type: None,
-            output_type: Some(DataType::Decimal128(10, 2)),
+            output_type: Some(DataType::Decimal128(38, 12)),
             input_arg_type: None,
         }),
+        order: Default::default(),
     };
 
     let arrays = [Some(input.clone())];
@@ -101,7 +105,7 @@ fn test_avg_decimal_round_half_up_negative() {
         .as_any()
         .downcast_ref::<Decimal128Array>()
         .expect("decimal output");
-    assert_eq!(out.data_type(), &DataType::Decimal128(10, 2));
+    assert_eq!(out.data_type(), &DataType::Decimal128(38, 12));
     assert_eq!(out.value(0), -2_i128);
 }
 
@@ -117,6 +121,7 @@ fn test_avg_intermediate_binary_requires_type_signature() {
             output_type: None,
             input_arg_type: None,
         }),
+        order: Default::default(),
     };
 
     let err = agg::build_kernel_set(&[func], &[Some(DataType::Binary)])
@@ -139,6 +144,7 @@ fn test_avg_intermediate_binary_with_signature_builds() {
             output_type: Some(DataType::Decimal128(10, 2)),
             input_arg_type: Some(DataType::Decimal128(10, 2)),
         }),
+        order: Default::default(),
     };
 
     let kernels = agg::build_kernel_set(&[func], &[Some(DataType::Binary)]).unwrap();

@@ -6,3 +6,6 @@ GATHER EXCHANGE stats={rows=20}
          columns: b, a
          min-max stats
          predicates: a = 1 OR a = 2
+Boundary Schemas:
+  Fragment 0 RESULT_ROOT node=2:
+    slot=1 name=b arrow=Int32 logical=<none> nullable=true

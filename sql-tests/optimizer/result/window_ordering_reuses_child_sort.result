@@ -14,3 +14,15 @@ PROJECT [running_sum] stats={rows=3}
                     VALUES (1 rows) stats={rows=1}
                 PROJECT [3 AS id, 30 AS v] stats={rows=1}
                   VALUES (1 rows) stats={rows=1}
+Boundary Schemas:
+  Fragment 1 RESULT_ROOT node=10:
+    slot=1 name=id arrow=Int64 logical=<none> nullable=false
+    slot=2 name=v arrow=Int64 logical=<none> nullable=false
+  Fragment 0 RESULT_ROOT node=15:
+    slot=1 name=running_sum arrow=Int64 logical=<none> nullable=true
+  Fragment 1 EXCHANGE_SEND node=11:
+    slot=1 name=id arrow=Int64 logical=<none> nullable=false
+    slot=2 name=v arrow=Int64 logical=<none> nullable=false
+  Fragment 0 EXCHANGE_RECV node=11:
+    slot=1 name=id arrow=Int64 logical=<none> nullable=false
+    slot=2 name=v arrow=Int64 logical=<none> nullable=false

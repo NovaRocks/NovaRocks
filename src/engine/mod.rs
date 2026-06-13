@@ -8937,13 +8937,13 @@ path = "meta/operations.sqlite"
         assert_iceberg_operation_finalized_any_snapshot(
             &engine,
             3,
-            crate::meta::repository::iceberg_operation::IcebergOperationKind::RowDelta,
+            crate::meta::repository::iceberg_operation::IcebergOperationKind::InsertAppend,
         );
         let snap_after = current_iceberg_snapshot_id(&engine, "ice", "db1", "t");
         assert_iceberg_operation_finalized(
             &engine,
             4,
-            crate::meta::repository::iceberg_operation::IcebergOperationKind::InsertAppend,
+            crate::meta::repository::iceberg_operation::IcebergOperationKind::RowDelta,
             snap_after,
         );
     }

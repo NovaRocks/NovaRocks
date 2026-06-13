@@ -10,3 +10,20 @@ GATHER EXCHANGE stats={rows=63}
                TABLE: db_sqlt_61285ef79214c2ad.oq12_stats_group
                columns: a, b, v
                min-max stats
+Boundary Schemas:
+  Fragment 1 RESULT_ROOT node=2:
+    slot=1 name=a arrow=Int32 logical=<none> nullable=true
+    slot=2 name=b arrow=Int32 logical=<none> nullable=true
+    slot=3 name=sum(v) arrow=Int64 logical=<none> nullable=true
+  Fragment 0 RESULT_ROOT node=5:
+    slot=1 name=a arrow=Int32 logical=<none> nullable=true
+    slot=2 name=b arrow=Int32 logical=<none> nullable=true
+    slot=3 name=total_v arrow=Int64 logical=<none> nullable=true
+  Fragment 1 EXCHANGE_SEND node=3:
+    slot=1 name=a arrow=Int32 logical=<none> nullable=true
+    slot=2 name=b arrow=Int32 logical=<none> nullable=true
+    slot=3 name=sum(v) arrow=Int64 logical=<none> nullable=true
+  Fragment 0 EXCHANGE_RECV node=3:
+    slot=1 name=a arrow=Int32 logical=<none> nullable=true
+    slot=2 name=b arrow=Int32 logical=<none> nullable=true
+    slot=3 name=sum(v) arrow=Int64 logical=<none> nullable=true

@@ -9,6 +9,25 @@ PROJECT [alias_id, alias_score] stats={rows=2}
                TABLE: db_sqlt_d8fea78b81ecf9eb.topn_compactness_project_src
                columns: id, score
                min-max stats
+Boundary Schemas:
+  Fragment 1 RESULT_ROOT node=2:
+    slot=1 name=id arrow=Int32 logical=<none> nullable=true
+    slot=2 name=score arrow=Int32 logical=<none> nullable=true
+    slot=3 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=4 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 0 RESULT_ROOT node=6:
+    slot=1 name=alias_id arrow=Int32 logical=<none> nullable=true
+    slot=2 name=alias_score arrow=Int32 logical=<none> nullable=true
+  Fragment 1 EXCHANGE_SEND node=3:
+    slot=1 name=id arrow=Int32 logical=<none> nullable=true
+    slot=2 name=score arrow=Int32 logical=<none> nullable=true
+    slot=3 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=4 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 0 EXCHANGE_RECV node=3:
+    slot=1 name=id arrow=Int32 logical=<none> nullable=true
+    slot=2 name=score arrow=Int32 logical=<none> nullable=true
+    slot=3 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=4 name=_pos arrow=Int64 logical=<none> nullable=false
 
 -- query 6
 Explain String
@@ -21,3 +40,16 @@ TOP-N (limit=2) [alias_score DESC NULLS LAST, alias_id ASC NULLS FIRST] stats={r
                TABLE: db_sqlt_d8fea78b81ecf9eb.topn_compactness_project_src
                columns: id, score
                min-max stats
+Boundary Schemas:
+  Fragment 1 RESULT_ROOT node=5:
+    slot=1 name=alias_id arrow=Int32 logical=<none> nullable=true
+    slot=2 name=alias_score arrow=Int32 logical=<none> nullable=true
+  Fragment 0 RESULT_ROOT node=6:
+    slot=1 name=alias_id arrow=Int32 logical=<none> nullable=true
+    slot=2 name=alias_score arrow=Int32 logical=<none> nullable=true
+  Fragment 1 EXCHANGE_SEND node=6:
+    slot=1 name=alias_id arrow=Int32 logical=<none> nullable=true
+    slot=2 name=alias_score arrow=Int32 logical=<none> nullable=true
+  Fragment 0 EXCHANGE_RECV node=6:
+    slot=1 name=alias_id arrow=Int32 logical=<none> nullable=true
+    slot=2 name=alias_score arrow=Int32 logical=<none> nullable=true

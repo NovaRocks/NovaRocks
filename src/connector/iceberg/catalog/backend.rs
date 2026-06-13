@@ -1046,15 +1046,23 @@ mod tests {
     }
 
     fn assert_row_lineage_metadata_columns(table_def: &TableDef) {
+        assert_metadata_column_names(
+            table_def,
+            &["_file", "_pos", "_row_id", "_last_updated_sequence_number"],
+        );
+    }
+
+    fn assert_row_identity_metadata_columns(table_def: &TableDef) {
+        assert_metadata_column_names(table_def, &["_file", "_pos"]);
+    }
+
+    fn assert_metadata_column_names(table_def: &TableDef, expected: &[&str]) {
         let names = table_def
             .iceberg_row_lineage_metadata_columns
             .iter()
             .map(|column| column.name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(
-            names,
-            vec!["_file", "_pos", "_row_id", "_last_updated_sequence_number"]
-        );
+        assert_eq!(names, expected);
     }
 
     #[test]
@@ -1224,12 +1232,12 @@ mod tests {
     }
 
     #[test]
-    fn schema_only_v2_table_def_hides_row_lineage_metadata_columns() {
+    fn schema_only_v2_table_def_keeps_row_identity_metadata_columns() {
         let table_def =
             build_iceberg_schema_table_def(&test_entry(), "ice", "db", "t", loaded_table())
                 .expect("schema-only table def");
 
-        assert!(table_def.iceberg_row_lineage_metadata_columns.is_empty());
+        assert_row_identity_metadata_columns(&table_def);
     }
 
     #[test]
@@ -1254,7 +1262,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_only_v3_row_lineage_false_table_def_hides_metadata_columns() {
+    fn schema_only_v3_row_lineage_false_table_def_keeps_row_identity_metadata_columns() {
         let table_def = build_iceberg_schema_table_def(
             &test_entry(),
             "ice",
@@ -1264,7 +1272,7 @@ mod tests {
         )
         .expect("schema-only table def");
 
-        assert!(table_def.iceberg_row_lineage_metadata_columns.is_empty());
+        assert_row_identity_metadata_columns(&table_def);
     }
 
     #[test]
@@ -1330,7 +1338,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_v3_row_lineage_table_def_hides_metadata_columns() {
+    fn empty_v3_row_lineage_table_def_keeps_row_identity_metadata_columns() {
         let table_def = build_iceberg_table_def_with_data_files(
             &test_entry(),
             "ice",
@@ -1342,7 +1350,7 @@ mod tests {
         )
         .expect("table def");
 
-        assert!(table_def.iceberg_row_lineage_metadata_columns.is_empty());
+        assert_row_identity_metadata_columns(&table_def);
     }
 
     #[test]
@@ -1362,7 +1370,8 @@ mod tests {
     }
 
     #[test]
-    fn non_empty_v3_row_lineage_table_def_hides_metadata_columns_when_file_lacks_first_row_id() {
+    fn non_empty_v3_row_lineage_table_def_keeps_row_identity_columns_when_file_lacks_first_row_id()
+    {
         let table_def = build_iceberg_table_def_with_data_files(
             &test_entry(),
             "ice",
@@ -1374,7 +1383,7 @@ mod tests {
         )
         .expect("table def");
 
-        assert!(table_def.iceberg_row_lineage_metadata_columns.is_empty());
+        assert_row_identity_metadata_columns(&table_def);
     }
 
     #[test]

@@ -7,6 +7,9 @@ GATHER EXCHANGE stats={rows=25000}
          columns: id, __nr_var_v_0
          variant columns: __nr_var_v_0 := variant_get(v, '$.a', 'bigint')
          predicates: __nr_var_v_0 = 1
+Boundary Schemas:
+  Fragment 0 RESULT_ROOT node=2:
+    slot=1 name=id arrow=Int32 logical=<none> nullable=true
 
 -- query 5
 Explain String
@@ -17,3 +20,6 @@ GATHER EXCHANGE stats={rows=25000}
          columns: id, v
          min-max stats
          predicates: variant_get(v, '$.a', 'bigint') = 1
+Boundary Schemas:
+  Fragment 0 RESULT_ROOT node=2:
+    slot=1 name=id arrow=Int32 logical=<none> nullable=true

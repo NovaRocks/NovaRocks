@@ -9,6 +9,9 @@ GATHER EXCHANGE stats={rows=3}
              columns: k, v
              min-max stats
              predicates: v > 10
+Boundary Schemas:
+  Fragment 0 RESULT_ROOT node=4:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
 
 -- query 6
 Explain String
@@ -21,6 +24,15 @@ SORT BY [renamed_k ASC NULLS FIRST] stats={rows=3}
                TABLE: db_sqlt_73474ac5ba7b3917.oq6_alias_base
                columns: k
                min-max stats
+Boundary Schemas:
+  Fragment 1 RESULT_ROOT node=4:
+    slot=1 name=renamed_k arrow=Int32 logical=<none> nullable=true
+  Fragment 0 RESULT_ROOT node=6:
+    slot=1 name=renamed_k arrow=Int32 logical=<none> nullable=true
+  Fragment 1 EXCHANGE_SEND node=5:
+    slot=1 name=renamed_k arrow=Int32 logical=<none> nullable=true
+  Fragment 0 EXCHANGE_RECV node=5:
+    slot=1 name=renamed_k arrow=Int32 logical=<none> nullable=true
 
 -- query 7
 renamed_k
@@ -56,3 +68,21 @@ PROJECT [count(*)] stats={rows=1}
                        columns: k, v
                        min-max stats
                        predicates: k < 3
+Boundary Schemas:
+  Fragment 2 RESULT_ROOT node=4:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=v arrow=Int32 logical=<none> nullable=true
+  Fragment 1 RESULT_ROOT node=7:
+    slot=1 name=count(*) arrow=Int64 logical=<none> nullable=true
+  Fragment 0 RESULT_ROOT node=10:
+    slot=1 name=count(*) arrow=Int64 logical=<none> nullable=true
+  Fragment 2 EXCHANGE_SEND node=5:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=v arrow=Int32 logical=<none> nullable=true
+  Fragment 1 EXCHANGE_RECV node=5:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=v arrow=Int32 logical=<none> nullable=true
+  Fragment 1 EXCHANGE_SEND node=8:
+    slot=1 name=count(*) arrow=Int64 logical=<none> nullable=true
+  Fragment 0 EXCHANGE_RECV node=8:
+    slot=1 name=count(*) arrow=Int64 logical=<none> nullable=true

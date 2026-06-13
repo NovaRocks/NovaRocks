@@ -11,3 +11,18 @@ GATHER EXCHANGE stats={rows=800}
              TABLE: db_sqlt_02c79e7866d27677.t_dnn_ar
              columns: k
              min-max stats
+Boundary Schemas:
+  Fragment 1 RESULT_ROOT node=2:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=3 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 0 RESULT_ROOT node=5:
+    slot=1 name=v arrow=Int32 logical=<none> nullable=true
+  Fragment 1 EXCHANGE_SEND node=3:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=3 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 0 EXCHANGE_RECV node=3:
+    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+    slot=2 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=3 name=_pos arrow=Int64 logical=<none> nullable=false

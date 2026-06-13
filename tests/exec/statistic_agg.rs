@@ -33,6 +33,7 @@ fn run_two_phase_i64(name: &str, part1: Vec<Option<i64>>, part2: Vec<Option<i64>
             output_type: Some(DataType::Float64),
             input_arg_type: None,
         }),
+        order: Default::default(),
     };
 
     // Partial aggregation for each partition.
@@ -149,6 +150,7 @@ fn test_sum_bool_counts_true_as_one() {
             output_type: Some(DataType::Int64),
             input_arg_type: Some(DataType::Boolean),
         }),
+        order: Default::default(),
     };
 
     let input = Arc::new(BooleanArray::from(vec![
@@ -189,6 +191,7 @@ fn test_sum_bool_null_when_all_null() {
             output_type: Some(DataType::Int64),
             input_arg_type: Some(DataType::Boolean),
         }),
+        order: Default::default(),
     };
 
     let input = Arc::new(BooleanArray::from(vec![None, None])) as ArrayRef;

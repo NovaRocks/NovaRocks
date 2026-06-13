@@ -19,6 +19,49 @@ PROJECT [id, score] stats={rows=2}
                      TABLE: db_sqlt_70295c213242fcf5.topn_compactness_right_src
                      columns: id, score
                      min-max stats
+Boundary Schemas:
+  Fragment 2 RESULT_ROOT node=2:
+    slot=1 name=id arrow=Int32 logical=<none> nullable=true
+    slot=2 name=score arrow=Int32 logical=<none> nullable=true
+    slot=3 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=4 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 3 RESULT_ROOT node=6:
+    slot=1 name=id arrow=Int32 logical=<none> nullable=true
+    slot=2 name=score arrow=Int32 logical=<none> nullable=true
+    slot=3 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=4 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 1 RESULT_ROOT node=10:
+    slot=1 name=id arrow=Int32 logical=<none> nullable=true
+    slot=2 name=score arrow=Int32 logical=<none> nullable=true
+  Fragment 0 RESULT_ROOT node=13:
+    slot=1 name=id arrow=Int32 logical=<none> nullable=true
+    slot=2 name=score arrow=Int32 logical=<none> nullable=true
+  Fragment 2 EXCHANGE_SEND node=3:
+    slot=1 name=id arrow=Int32 logical=<none> nullable=true
+    slot=2 name=score arrow=Int32 logical=<none> nullable=true
+    slot=3 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=4 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 1 EXCHANGE_RECV node=3:
+    slot=1 name=id arrow=Int32 logical=<none> nullable=true
+    slot=2 name=score arrow=Int32 logical=<none> nullable=true
+    slot=3 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=4 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 3 EXCHANGE_SEND node=7:
+    slot=1 name=id arrow=Int32 logical=<none> nullable=true
+    slot=2 name=score arrow=Int32 logical=<none> nullable=true
+    slot=3 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=4 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 1 EXCHANGE_RECV node=7:
+    slot=1 name=id arrow=Int32 logical=<none> nullable=true
+    slot=2 name=score arrow=Int32 logical=<none> nullable=true
+    slot=3 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=4 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 1 EXCHANGE_SEND node=11:
+    slot=1 name=id arrow=Int32 logical=<none> nullable=true
+    slot=2 name=score arrow=Int32 logical=<none> nullable=true
+  Fragment 0 EXCHANGE_RECV node=11:
+    slot=1 name=id arrow=Int32 logical=<none> nullable=true
+    slot=2 name=score arrow=Int32 logical=<none> nullable=true
 
 -- query 8
 Explain String
@@ -42,3 +85,25 @@ PROJECT [id, sum(score) AS total_score] stats={rows=1}
                        TABLE: db_sqlt_70295c213242fcf5.topn_compactness_right_src
                        columns: id, score
                        min-max stats
+Boundary Schemas:
+  Fragment 2 RESULT_ROOT node=7:
+    slot=1 name=id arrow=Int32 logical=<none> nullable=true
+    slot=2 name=sum(score) arrow=Int64 logical=<none> nullable=true
+  Fragment 1 RESULT_ROOT node=10:
+    slot=1 name=id arrow=Int32 logical=<none> nullable=true
+    slot=2 name=sum(score) arrow=Int64 logical=<none> nullable=true
+  Fragment 0 RESULT_ROOT node=12:
+    slot=1 name=id arrow=Int32 logical=<none> nullable=true
+    slot=2 name=total_score arrow=Int64 logical=<none> nullable=true
+  Fragment 2 EXCHANGE_SEND node=8:
+    slot=1 name=id arrow=Int32 logical=<none> nullable=true
+    slot=2 name=sum(score) arrow=Int64 logical=<none> nullable=true
+  Fragment 1 EXCHANGE_RECV node=8:
+    slot=1 name=id arrow=Int32 logical=<none> nullable=true
+    slot=2 name=sum(score) arrow=Int64 logical=<none> nullable=true
+  Fragment 1 EXCHANGE_SEND node=11:
+    slot=1 name=id arrow=Int32 logical=<none> nullable=true
+    slot=2 name=sum(score) arrow=Int64 logical=<none> nullable=true
+  Fragment 0 EXCHANGE_RECV node=11:
+    slot=1 name=id arrow=Int32 logical=<none> nullable=true
+    slot=2 name=sum(score) arrow=Int64 logical=<none> nullable=true

@@ -18,6 +18,25 @@ GATHER EXCHANGE stats={rows=126562500}
              columns: rk
              min-max stats
              predicates: r.rk = 10 AND r.rk IS NOT NULL
+Boundary Schemas:
+  Fragment 1 RESULT_ROOT node=2:
+    slot=1 name=rk arrow=Int64 logical=<none> nullable=true
+    slot=2 name=payload arrow=Int64 logical=<none> nullable=true
+    slot=3 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=4 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 0 RESULT_ROOT node=5:
+    slot=1 name=lk arrow=Int64 logical=<none> nullable=true
+    slot=2 name=rk arrow=Int64 logical=<none> nullable=true
+  Fragment 1 EXCHANGE_SEND node=3:
+    slot=1 name=rk arrow=Int64 logical=<none> nullable=true
+    slot=2 name=payload arrow=Int64 logical=<none> nullable=true
+    slot=3 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=4 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 0 EXCHANGE_RECV node=3:
+    slot=1 name=rk arrow=Int64 logical=<none> nullable=true
+    slot=2 name=payload arrow=Int64 logical=<none> nullable=true
+    slot=3 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=4 name=_pos arrow=Int64 logical=<none> nullable=false
 
 -- query 6
 Explain String
@@ -39,3 +58,22 @@ GATHER EXCHANGE stats={rows=126562500}
              columns: rk
              min-max stats
              predicates: r.rk = 20 AND r.rk IS NOT NULL
+Boundary Schemas:
+  Fragment 1 RESULT_ROOT node=2:
+    slot=1 name=rk arrow=Int64 logical=<none> nullable=true
+    slot=2 name=payload arrow=Int64 logical=<none> nullable=true
+    slot=3 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=4 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 0 RESULT_ROOT node=5:
+    slot=1 name=lk arrow=Int64 logical=<none> nullable=true
+    slot=2 name=rk arrow=Int64 logical=<none> nullable=true
+  Fragment 1 EXCHANGE_SEND node=3:
+    slot=1 name=rk arrow=Int64 logical=<none> nullable=true
+    slot=2 name=payload arrow=Int64 logical=<none> nullable=true
+    slot=3 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=4 name=_pos arrow=Int64 logical=<none> nullable=false
+  Fragment 0 EXCHANGE_RECV node=3:
+    slot=1 name=rk arrow=Int64 logical=<none> nullable=true
+    slot=2 name=payload arrow=Int64 logical=<none> nullable=true
+    slot=3 name=_file arrow=Utf8 logical=<none> nullable=false
+    slot=4 name=_pos arrow=Int64 logical=<none> nullable=false
