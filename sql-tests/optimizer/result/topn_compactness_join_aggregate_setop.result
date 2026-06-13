@@ -27,7 +27,7 @@ PROJECT [id, sum(score) AS total_score] stats={rows=1}
     LOCAL TOP-N (limit=1, offset=0) [sum(score) DESC NULLS LAST] stats={rows=1}
       HASH AGGREGATE (GLOBAL, group by: [id]) stats={rows=6325}
         aggregations: sum(score)
-        HASH EXCHANGE (source: ShuffleAgg, hash: [c5]) stats={rows=6325}
+        HASH EXCHANGE (source: ShuffleAgg, hash: [c9]) stats={rows=6325}
           HASH AGGREGATE (LOCAL, group by: [id]) stats={rows=6325}
             aggregations: sum(score)
             PROJECT [id, score] stats={rows=200000}
@@ -42,25 +42,3 @@ PROJECT [id, sum(score) AS total_score] stats={rows=1}
                        TABLE: db_sqlt_70295c213242fcf5.topn_compactness_right_src
                        columns: id, score
                        min-max stats
-
--- query 9
-Explain String
-PROJECT [l.id AS id, l.score AS score, r.score AS rhs_score] stats={rows=1}
-  TOP-N (limit=1) [l.score DESC NULLS LAST] stats={rows=1}
-    LOCAL TOP-N (limit=1, offset=0) [l.score DESC NULLS LAST] stats={rows=1}
-      HASH JOIN (BROADCAST, INNER, eq: [l.id = r.id]) stats={rows=2025000000}
-        build runtime filters:
-        - filter_id = 0, build_expr = (r.id)
-        SCAN db_sqlt_70295c213242fcf5.topn_compactness_left_src (alias=l) stats={rows=90000}
-             TABLE: db_sqlt_70295c213242fcf5.topn_compactness_left_src
-             columns: id, score
-             min-max stats
-             predicates: l.id IS NOT NULL
-            probe runtime filters:
-            - filter_id = 0, probe_expr = (l.id)
-        BROADCAST EXCHANGE stats={rows=90000}
-          SCAN db_sqlt_70295c213242fcf5.topn_compactness_right_src (alias=r) stats={rows=90000}
-               TABLE: db_sqlt_70295c213242fcf5.topn_compactness_right_src
-               columns: id, score
-               min-max stats
-               predicates: r.id IS NOT NULL

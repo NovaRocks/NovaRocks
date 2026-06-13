@@ -272,13 +272,24 @@ impl<'a> AnalyzerContext<'a> {
 
         // 2. Analyze the inner subquery with the merged outer scope. Outer refs
         //    inside it now carry outer ColumnIds.
-        let (resolved_sub, inner_scope) =
+        let (mut resolved_sub, inner_scope) =
             self.analyze_query_in_scope_with_inner(&sq_info.subquery, scope)?;
         if resolved_sub.output_columns.len() != 1 {
             return Err("scalar subquery must produce exactly one output column".to_string());
         }
 
-        // 3. Collect correlation column ids WITHOUT modifying the inner query.
+        if let QueryBody::Select(ref mut sel) = resolved_sub.body
+            && let Some(ref filter) = sel.filter
+        {
+            sel.filter = Some(factor_common_correlation_from_or(
+                filter,
+                &inner_scope,
+                scope,
+            ));
+        }
+
+        // 3. Collect correlation column ids after semantic-preserving filter
+        // normalization.
         let corr_ids = collect_correlation_column_ids(&resolved_sub, &inner_scope, scope);
 
         // 4. Mint an output column representing the subquery's scalar value in
@@ -385,23 +396,41 @@ impl<'a> AnalyzerContext<'a> {
                             if matches!(inner.as_ref(), sqlparser::ast::Expr::Tuple(_))
                     )
                 {
-                    return Err("multi-column IN subquery is not supported".to_string());
+                    let SubqueryKind::InSubquery { negated } = &sq_info.kind else {
+                        unreachable!("tuple LHS only exists for IN subqueries");
+                    };
+                    self.rewrite_in_subquery(select, scope, sq_info.clone(), *negated)?;
+                    return Ok(true);
                 }
                 if resolved_sub.output_columns.len() != 1 {
                     return Err("IN subquery must produce exactly one output column".to_string());
                 }
-                Some(self.analyze_expr(in_expr, scope)?)
+                let lhs = self.analyze_expr(in_expr, scope)?;
+                let inner_col = &resolved_sub.output_columns[0];
+                if let Some(reason) = super::resolve_expr::incompatible_complex_compare_pub(
+                    &lhs.data_type,
+                    &inner_col.data_type,
+                ) {
+                    let op_sym = match &sq_info.kind {
+                        SubqueryKind::InSubquery { negated: true } => "NOT IN",
+                        _ => "IN",
+                    };
+                    return Err(format!(
+                        "comparison operator `{op_sym}` does not support binary predicate operation between {reason}"
+                    ));
+                }
+                Some(lhs)
             }
             SubqueryKind::Exists { .. } => None,
             SubqueryKind::Scalar => return Ok(false),
         };
 
         let corr_ids =
-            collect_eq_correlation_column_ids_for_apply(&resolved_sub, &inner_scope, scope);
+            collect_predicate_correlation_column_ids_for_apply(&resolved_sub, &inner_scope, scope);
         let outer_refs = collect_subquery_outer_ref_usage(&resolved_sub, &inner_scope, scope);
         if outer_refs.outside_filter || (outer_refs.filter && corr_ids.is_empty()) {
             return Err(
-                "correlated EXISTS/IN subquery must use equality predicates in the subquery filter"
+                "correlated EXISTS/IN subquery must use comparison predicates in the subquery filter"
                     .to_string(),
             );
         }
@@ -3027,6 +3056,110 @@ fn expr_references_outer_scope(
     saw_outer
 }
 
+fn collect_outer_ref_column_ids(
+    expr: &TypedExpr,
+    inner_scope: &AnalyzerScope,
+    outer_scope: &AnalyzerScope,
+    out: &mut Vec<crate::sql::column_id::ColumnId>,
+) {
+    match &expr.kind {
+        ExprKind::ColumnRef { column_id, .. } => {
+            let inner_has = inner_scope.contains_column_id(*column_id);
+            let outer_has = outer_scope.contains_column_id(*column_id);
+            if !inner_has && outer_has {
+                out.push(*column_id);
+            }
+        }
+        ExprKind::BinaryOp { left, right, .. } => {
+            collect_outer_ref_column_ids(left, inner_scope, outer_scope, out);
+            collect_outer_ref_column_ids(right, inner_scope, outer_scope, out);
+        }
+        ExprKind::UnaryOp { expr: inner, .. }
+        | ExprKind::IsNull { expr: inner, .. }
+        | ExprKind::IsTruthValue { expr: inner, .. }
+        | ExprKind::Cast { expr: inner, .. }
+        | ExprKind::Nested(inner)
+        | ExprKind::LambdaFunction { body: inner, .. }
+        | ExprKind::Lambda { body: inner, .. } => {
+            collect_outer_ref_column_ids(inner, inner_scope, outer_scope, out);
+        }
+        ExprKind::FunctionCall { args, .. } => {
+            for arg in args {
+                collect_outer_ref_column_ids(arg, inner_scope, outer_scope, out);
+            }
+        }
+        ExprKind::AggregateCall { args, order_by, .. } => {
+            for arg in args {
+                collect_outer_ref_column_ids(arg, inner_scope, outer_scope, out);
+            }
+            for item in order_by {
+                collect_outer_ref_column_ids(&item.expr, inner_scope, outer_scope, out);
+            }
+        }
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(operand) = operand {
+                collect_outer_ref_column_ids(operand, inner_scope, outer_scope, out);
+            }
+            for (when, then) in when_then {
+                collect_outer_ref_column_ids(when, inner_scope, outer_scope, out);
+                collect_outer_ref_column_ids(then, inner_scope, outer_scope, out);
+            }
+            if let Some(else_expr) = else_expr {
+                collect_outer_ref_column_ids(else_expr, inner_scope, outer_scope, out);
+            }
+        }
+        ExprKind::InList {
+            expr: inner, list, ..
+        } => {
+            collect_outer_ref_column_ids(inner, inner_scope, outer_scope, out);
+            for item in list {
+                collect_outer_ref_column_ids(item, inner_scope, outer_scope, out);
+            }
+        }
+        ExprKind::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            collect_outer_ref_column_ids(inner, inner_scope, outer_scope, out);
+            collect_outer_ref_column_ids(low, inner_scope, outer_scope, out);
+            collect_outer_ref_column_ids(high, inner_scope, outer_scope, out);
+        }
+        ExprKind::Like {
+            expr: inner,
+            pattern,
+            ..
+        } => {
+            collect_outer_ref_column_ids(inner, inner_scope, outer_scope, out);
+            collect_outer_ref_column_ids(pattern, inner_scope, outer_scope, out);
+        }
+        ExprKind::WindowCall {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for arg in args {
+                collect_outer_ref_column_ids(arg, inner_scope, outer_scope, out);
+            }
+            for partition in partition_by {
+                collect_outer_ref_column_ids(partition, inner_scope, outer_scope, out);
+            }
+            for item in order_by {
+                collect_outer_ref_column_ids(&item.expr, inner_scope, outer_scope, out);
+            }
+        }
+        ExprKind::Literal(_)
+        | ExprKind::SubqueryPlaceholder { .. }
+        | ExprKind::LambdaParamRef { .. } => {}
+    }
+}
+
 #[derive(Default)]
 struct SubqueryOuterRefUsage {
     filter: bool,
@@ -3172,12 +3305,9 @@ fn walk_for_outer_ref(
         return;
     }
     match &expr.kind {
-        ExprKind::ColumnRef {
-            qualifier, column, ..
-        } => {
-            let q = qualifier.as_deref();
-            let inner_has = inner_scope.resolve(q, column).is_ok();
-            let outer_has = outer_scope.resolve(q, column).is_ok();
+        ExprKind::ColumnRef { column_id, .. } => {
+            let inner_has = inner_scope.contains_column_id(*column_id);
+            let outer_has = outer_scope.contains_column_id(*column_id);
             if !inner_has && outer_has {
                 *saw_outer = true;
             }
@@ -3295,7 +3425,13 @@ fn extract_corr_preds_inner(
                 extract_corr_preds_inner(left, inner_scope, outer_scope, out);
                 extract_corr_preds_inner(right, inner_scope, outer_scope, out);
             }
-            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+            BinOp::Eq
+            | BinOp::EqForNull
+            | BinOp::Ne
+            | BinOp::Lt
+            | BinOp::Le
+            | BinOp::Gt
+            | BinOp::Ge => {
                 let left_outer_only = is_outer_only_ref(left, inner_scope, outer_scope);
                 let right_outer_only = is_outer_only_ref(right, inner_scope, outer_scope);
 
@@ -3309,6 +3445,7 @@ fn extract_corr_preds_inner(
                 } else if !left_outer_only && right_outer_only {
                     let rev_op = match op {
                         BinOp::Eq => BinOp::Eq,
+                        BinOp::EqForNull => BinOp::EqForNull,
                         BinOp::Ne => BinOp::Ne,
                         BinOp::Lt => BinOp::Gt,
                         BinOp::Le => BinOp::Ge,
@@ -3369,12 +3506,10 @@ fn collect_column_outer_status(
     all_outer_only: &mut bool,
 ) {
     match &expr.kind {
-        ExprKind::ColumnRef {
-            qualifier, column, ..
-        } => {
+        ExprKind::ColumnRef { column_id, .. } => {
             *saw_column = true;
-            let in_inner = inner_scope.resolve(qualifier.as_deref(), column).is_ok();
-            let in_outer = outer_scope.resolve(qualifier.as_deref(), column).is_ok();
+            let in_inner = inner_scope.contains_column_id(*column_id);
+            let in_outer = outer_scope.contains_column_id(*column_id);
             if !(in_outer && !in_inner) {
                 *all_outer_only = false;
             }
@@ -3722,12 +3857,13 @@ fn collect_correlation_column_ids(
     ids
 }
 
-/// Collect only equality correlation column ids for predicate Apply routing.
+/// Collect filter outer-reference column ids for predicate Apply routing.
 ///
-/// Apply-to-join rules only treat equality correlations as usable keys. Pure
-/// non-EQ outer references are rejected rather than routed to a structural
-/// rewrite with different semantics.
-fn collect_eq_correlation_column_ids_for_apply(
+/// Predicate Apply-to-join rules lift the whole correlated inner filter into a
+/// join ON predicate, so the correlation anchor may be a comparison, IF/CASE,
+/// BETWEEN, IS TRUE, or another boolean expression. The ids only need to tell
+/// the planner which outer columns are legal while the Apply is alive.
+fn collect_predicate_correlation_column_ids_for_apply(
     resolved_sub: &crate::sql::analysis::ResolvedQuery,
     inner_scope: &super::scope::AnalyzerScope,
     outer_scope: &super::scope::AnalyzerScope,
@@ -3740,11 +3876,8 @@ fn collect_eq_correlation_column_ids_for_apply(
         },
         _ => return Vec::new(),
     };
-    let preds = extract_correlation_predicates(filter, inner_scope, outer_scope);
     let mut ids: Vec<crate::sql::column_id::ColumnId> = Vec::new();
-    for pred in preds.iter().filter(|pred| pred.op == BinOp::Eq) {
-        collect_column_ids_in_expr(&pred.outer_col, &mut ids);
-    }
+    collect_outer_ref_column_ids(filter, inner_scope, outer_scope, &mut ids);
     let mut seen = std::collections::HashSet::new();
     ids.retain(|id| seen.insert(*id));
     ids
@@ -4114,6 +4247,47 @@ fn remove_placeholder_from_expr(expr: &TypedExpr, placeholder_id: usize) -> Type
     }
 }
 
+fn recompute_case_result_type(
+    when_then: &[(TypedExpr, TypedExpr)],
+    else_expr: Option<&TypedExpr>,
+) -> DataType {
+    let mut result_type = DataType::Null;
+    for (_, then_expr) in when_then {
+        if result_type == DataType::Null {
+            result_type = then_expr.data_type.clone();
+        } else {
+            result_type = crate::sql::types::wider_type(&result_type, &then_expr.data_type);
+        }
+    }
+    if let Some(expr) = else_expr {
+        if result_type == DataType::Null {
+            result_type = expr.data_type.clone();
+        } else {
+            result_type = crate::sql::types::wider_type(&result_type, &expr.data_type);
+        }
+    }
+    if result_type == DataType::Null {
+        DataType::Utf8
+    } else {
+        result_type
+    }
+}
+
+fn cast_case_branch_if_needed(expr: TypedExpr, target: &DataType) -> TypedExpr {
+    if &expr.data_type != target && expr.data_type != DataType::Null {
+        TypedExpr {
+            kind: ExprKind::Cast {
+                expr: Box::new(expr),
+                target: target.clone(),
+            },
+            data_type: target.clone(),
+            nullable: true,
+        }
+    } else {
+        expr
+    }
+}
+
 fn replace_placeholder_in_expr(
     expr: &TypedExpr,
     placeholder_id: usize,
@@ -4230,27 +4404,42 @@ fn replace_placeholder_in_expr(
             operand,
             when_then,
             else_expr,
-        } => TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
-            kind: ExprKind::Case {
-                operand: operand
-                    .as_ref()
-                    .map(|o| Box::new(replace_placeholder_in_expr(o, placeholder_id, replacement))),
-                when_then: when_then
-                    .iter()
-                    .map(|(w, t)| {
-                        (
-                            replace_placeholder_in_expr(w, placeholder_id, replacement),
-                            replace_placeholder_in_expr(t, placeholder_id, replacement),
-                        )
-                    })
-                    .collect(),
-                else_expr: else_expr
-                    .as_ref()
-                    .map(|e| Box::new(replace_placeholder_in_expr(e, placeholder_id, replacement))),
-            },
-        },
+        } => {
+            let operand = operand
+                .as_ref()
+                .map(|o| Box::new(replace_placeholder_in_expr(o, placeholder_id, replacement)));
+            let mut rewritten_when_then: Vec<(TypedExpr, TypedExpr)> = when_then
+                .iter()
+                .map(|(w, t)| {
+                    (
+                        replace_placeholder_in_expr(w, placeholder_id, replacement),
+                        replace_placeholder_in_expr(t, placeholder_id, replacement),
+                    )
+                })
+                .collect();
+            let mut else_expr = else_expr
+                .as_ref()
+                .map(|e| Box::new(replace_placeholder_in_expr(e, placeholder_id, replacement)));
+
+            let result_type =
+                recompute_case_result_type(&rewritten_when_then, else_expr.as_deref());
+            for (_, then_expr) in &mut rewritten_when_then {
+                *then_expr = cast_case_branch_if_needed(then_expr.clone(), &result_type);
+            }
+            if let Some(expr) = else_expr.take() {
+                else_expr = Some(Box::new(cast_case_branch_if_needed(*expr, &result_type)));
+            }
+
+            TypedExpr {
+                data_type: result_type,
+                nullable: true,
+                kind: ExprKind::Case {
+                    operand,
+                    when_then: rewritten_when_then,
+                    else_expr,
+                },
+            }
+        }
         ExprKind::Between {
             expr: inner,
             low,

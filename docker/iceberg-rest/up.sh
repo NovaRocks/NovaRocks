@@ -333,6 +333,9 @@ cat > "$runtime_dir/standalone-managed-lake.toml" <<EOF
 host = "127.0.0.1"
 grpc_port = $grpc_port
 
+[runtime]
+exchange_wait_ms = 300000
+
 [metadata]
 provider = "sqlite"
 path = "$runtime_dir/standalone-managed-lake.sqlite"
@@ -353,6 +356,9 @@ cat > "$runtime_dir/standalone-managed-lake-scheduler.toml" <<EOF
 [server]
 host = "127.0.0.1"
 grpc_port = $grpc_port
+
+[runtime]
+exchange_wait_ms = 300000
 
 [metadata]
 provider = "sqlite"

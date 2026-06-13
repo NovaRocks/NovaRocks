@@ -505,7 +505,7 @@ fn written_file_column_stats(
     }))
 }
 
-fn partition_path_from_struct(
+pub(crate) fn partition_path_from_struct(
     values: &Struct,
     partition_spec: &PartitionSpecRef,
 ) -> Result<(String, String), String> {

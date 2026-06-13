@@ -693,7 +693,7 @@ FROM (VALUES (1, 'A'), (2, 'B'), (5, 'E'), (NULL, 'N1')) AS v1(id, val1)
      FULL OUTER JOIN ${case_db}.t2 USING(id)
      FULL OUTER JOIN ${case_db}.t3 USING(id)
 WHERE id > 0 OR val1 IS NOT NULL OR val2 IS NOT NULL
-ORDER BY id
+ORDER BY id, val1 IS NULL, val1, val2 IS NULL, val2
 LIMIT 50;
 
 -- query 57

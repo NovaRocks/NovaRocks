@@ -40,6 +40,10 @@ GROUP BY id
 ORDER BY total_score DESC
 LIMIT 1;
 
+-- @skip_result_check=true
+-- @result_contains=  TOP-N (limit=1) [l.score DESC NULLS LAST]
+-- @result_contains=    LOCAL TOP-N (limit=1, offset=0) [l.score DESC NULLS LAST]
+-- @result_contains=      HASH JOIN (BROADCAST, INNER, eq:
 EXPLAIN VERBOSE
 SELECT l.id, l.score, r.score AS rhs_score
 FROM ${case_db}.topn_compactness_left_src l

@@ -453,7 +453,8 @@ impl<'a> AnalyzerContext<'a> {
         };
 
         // --- SELECT list (before GROUP BY so aliases are available) ---
-        let (projection, output_columns) = self.analyze_projection(&select.projection, &scope)?;
+        let (projection, mut output_columns) =
+            self.analyze_projection(&select.projection, &scope)?;
 
         // --- GROUP BY (with SELECT alias fallback) ---
         let group_by_exprs = match &select.group_by {
@@ -598,6 +599,7 @@ impl<'a> AnalyzerContext<'a> {
         if has_subqueries {
             let mut mutable_scope = scope;
             self.rewrite_subqueries(&mut resolved_select, &mut mutable_scope)?;
+            sync_output_columns_from_projection(&mut output_columns, &resolved_select.projection);
         }
 
         Ok((resolved_select, output_columns))
@@ -3916,6 +3918,16 @@ fn is_bitmap_or_hll_type(sql_type: &crate::sql::SqlType) -> bool {
     )
 }
 
+fn sync_output_columns_from_projection(
+    output_columns: &mut [crate::sql::analysis::OutputColumn],
+    projection: &[crate::sql::analysis::ProjectItem],
+) {
+    for (output, item) in output_columns.iter_mut().zip(projection.iter()) {
+        output.data_type = item.expr.data_type.clone();
+        output.nullable = item.expr.nullable;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5186,9 +5198,19 @@ mod tests {
         let resolved =
             parse_and_analyze(sql).expect("CASE with scalar subqueries in projection should work");
         assert!(!resolved.output_columns.is_empty());
+        assert_eq!(
+            resolved.output_columns[0].data_type,
+            arrow::datatypes::DataType::Float64,
+            "rewritten CASE scalar-subquery projection should expose the final branch type"
+        );
         // Verify that no SubqueryPlaceholder remains in the projection
         if let QueryBody::Select(sel) = &resolved.body {
             for item in &sel.projection {
+                assert_eq!(
+                    item.expr.data_type,
+                    arrow::datatypes::DataType::Float64,
+                    "projection expression type should be recomputed after placeholder replacement"
+                );
                 assert!(
                     !expr_has_placeholder_deep(&item.expr),
                     "projection should not contain SubqueryPlaceholder after rewriting: {:?}",
@@ -5346,6 +5368,18 @@ mod tests {
             .expect_err("array ordering comparison should be rejected");
         assert!(
             err.contains("does not support binary predicate operation on ARRAY"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn in_predicate_apply_rejects_scalar_vs_array_key() {
+        let err = parse_raw_and_analyze(
+            "SELECT 1 FROM array_test s WHERE 1 NOT IN (SELECT i_1 FROM array_test t)",
+        )
+        .expect_err("scalar-vs-array IN subquery should be rejected before planning");
+        assert!(
+            err.contains("does not support binary predicate operation between"),
             "unexpected error: {err}"
         );
     }
@@ -6877,6 +6911,72 @@ mod tests {
         );
     }
 
+    #[test]
+    fn scalar_apply_factors_common_correlation_from_or_filter() {
+        use crate::sql::analysis::QueryBody;
+
+        let resolved = parse_and_analyze_for_apply_specs(
+            "SELECT k1 FROM t1 \
+             WHERE (SELECT count(*) FROM t2 \
+                    WHERE (t2.k1 = t1.k1 AND t2.k2 = 1) \
+                       OR (t2.k1 = t1.k1 AND t2.k2 = 2)) > 0",
+        )
+        .expect("analyze scalar Apply with OR correlation");
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("expected select body");
+        };
+        assert_eq!(select.apply_specs.len(), 1);
+
+        let QueryBody::Select(inner_select) = &select.apply_specs[0].inner.body else {
+            panic!("expected scalar Apply inner select");
+        };
+        let filter = inner_select
+            .filter
+            .as_ref()
+            .expect("expected scalar Apply inner filter");
+        let ExprKind::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } = &filter.kind
+        else {
+            panic!("expected common correlation to be factored into top-level AND: {filter:?}");
+        };
+        assert!(
+            matches!(&left.kind, ExprKind::BinaryOp { op: BinOp::Eq, .. }),
+            "left conjunct should be the common equality correlation: {left:?}"
+        );
+        assert!(
+            matches!(&right.kind, ExprKind::BinaryOp { op: BinOp::Or, .. }),
+            "right conjunct should retain the residual OR predicate: {right:?}"
+        );
+    }
+
+    #[test]
+    fn in_subquery_derived_table_internal_refs_are_not_outer_refs() {
+        use crate::sql::analysis::QueryBody;
+
+        let resolved = parse_and_analyze_for_apply_specs(
+            "SELECT k1 FROM t1 \
+             WHERE k1 IN ( \
+                 SELECT k1 \
+                 FROM (SELECT k1 AS k1, k2 AS ranking FROM t2) tmp1 \
+                 WHERE ranking <= 5 \
+             )",
+        )
+        .expect("derived-table internals should not be treated as correlated outer refs");
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("expected select body");
+        };
+        assert_eq!(select.predicate_apply_specs.len(), 1);
+        assert!(
+            select.predicate_apply_specs[0]
+                .correlation_column_ids
+                .is_empty(),
+            "uncorrelated IN subquery must not record correlation ids"
+        );
+    }
+
     /// Helper: returns true if `expr` or any descendant is a SubqueryPlaceholder.
     fn expr_has_subquery_placeholder(expr: &TypedExpr) -> bool {
         match &expr.kind {
@@ -7038,14 +7138,19 @@ mod tests {
     }
 
     #[test]
-    fn multi_column_in_is_rejected_without_fallback() {
-        let err = parse_and_analyze_for_apply_specs(
+    fn multi_column_in_rewrites_without_apply_spec() {
+        use crate::sql::analysis::QueryBody;
+
+        let resolved = parse_and_analyze_for_apply_specs(
             "SELECT k1 FROM t1 WHERE (k1, k2) IN (SELECT t2.k1, t2.k2 FROM t2)",
         )
-        .expect_err("multi-column IN should not fall back");
+        .expect("multi-column IN should use the local join rewrite");
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("expected select body");
+        };
         assert!(
-            err.contains("multi-column IN subquery is not supported"),
-            "unexpected error: {err}"
+            select.predicate_apply_specs.is_empty(),
+            "multi-column IN is represented by the local join rewrite, not Apply"
         );
     }
 
@@ -7068,50 +7173,74 @@ mod tests {
     }
 
     #[test]
-    fn pure_between_outer_ref_in_inner_filter_is_rejected_without_fallback() {
-        let err = parse_and_analyze_for_apply_specs(
+    fn pure_between_outer_ref_records_exists_spec() {
+        use crate::sql::analysis::QueryBody;
+
+        let resolved = parse_and_analyze_for_apply_specs(
             "SELECT k1 FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t1.k1 BETWEEN t2.k1 AND t2.k2)",
         )
-        .expect_err("pure non-EQ outer refs should not fall back");
-        assert!(
-            err.contains("correlated EXISTS/IN subquery must use equality predicates"),
-            "unexpected error: {err}"
+        .expect("BETWEEN correlation should route through predicate Apply");
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("expected select body");
+        };
+        assert_eq!(
+            select.predicate_apply_specs.len(),
+            1,
+            "BETWEEN correlation should record an EXISTS predicate spec"
         );
     }
 
     #[test]
-    fn pure_non_eq_outer_ref_is_rejected_without_fallback() {
-        let err = parse_and_analyze_for_apply_specs(
+    fn pure_non_eq_outer_ref_records_exists_spec() {
+        use crate::sql::analysis::QueryBody;
+
+        let resolved = parse_and_analyze_for_apply_specs(
             "SELECT k1 FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.k2 > t1.k2)",
         )
-        .expect_err("pure non-EQ outer refs should not fall back");
-        assert!(
-            err.contains("correlated EXISTS/IN subquery must use equality predicates"),
-            "unexpected error: {err}"
+        .expect("analyze pure non-EQ correlation in Apply framework");
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("expected select body");
+        };
+        assert_eq!(
+            select.predicate_apply_specs.len(),
+            1,
+            "pure non-equality correlation should record an EXISTS predicate spec"
         );
     }
 
     #[test]
-    fn in_pure_non_eq_outer_ref_is_rejected_without_fallback() {
-        let err = parse_and_analyze_for_apply_specs(
+    fn in_pure_non_eq_outer_ref_records_predicate_spec() {
+        use crate::sql::analysis::QueryBody;
+
+        let resolved = parse_and_analyze_for_apply_specs(
             "SELECT k1 FROM t1 WHERE t1.k1 IN (SELECT t2.k1 FROM t2 WHERE t2.k2 > t1.k2)",
         )
-        .expect_err("pure non-EQ IN correlation should not fall back");
-        assert!(
-            err.contains("correlated EXISTS/IN subquery must use equality predicates"),
-            "unexpected error: {err}"
+        .expect("analyze pure non-EQ IN correlation in Apply framework");
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("expected select body");
+        };
+        assert_eq!(
+            select.predicate_apply_specs.len(),
+            1,
+            "pure non-equality correlation should record an IN predicate spec"
         );
     }
 
     #[test]
-    fn is_true_outer_ref_in_inner_filter_is_rejected_without_fallback() {
-        let err = parse_and_analyze_for_apply_specs(
+    fn is_true_outer_ref_records_exists_spec() {
+        use crate::sql::analysis::QueryBody;
+
+        let resolved = parse_and_analyze_for_apply_specs(
             "SELECT k1 FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE (t1.k1 = 1) IS TRUE)",
         )
-        .expect_err("IS TRUE outer refs should not fall back");
-        assert!(
-            err.contains("correlated EXISTS/IN subquery must use equality predicates"),
-            "unexpected error: {err}"
+        .expect("IS TRUE outer ref should route through predicate Apply");
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("expected select body");
+        };
+        assert_eq!(
+            select.predicate_apply_specs.len(),
+            1,
+            "IS TRUE correlation should record an EXISTS predicate spec"
         );
     }
 
@@ -7122,7 +7251,7 @@ mod tests {
         )
         .expect_err("outer refs outside the inner filter should not fall back");
         assert!(
-            err.contains("correlated EXISTS/IN subquery must use equality predicates"),
+            err.contains("correlated EXISTS/IN subquery must use comparison predicates"),
             "unexpected error: {err}"
         );
     }

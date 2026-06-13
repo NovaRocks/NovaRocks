@@ -302,6 +302,12 @@ impl AnalyzerScope {
         ));
     }
 
+    pub(super) fn contains_column_id(&self, column_id: ColumnId) -> bool {
+        self.ordered.iter().any(|(_, _, id, _, _)| *id == column_id)
+            || self.qualified.values().any(|(id, _, _)| *id == column_id)
+            || self.unqualified.values().any(|(id, _, _)| *id == column_id)
+    }
+
     pub(super) fn add_lambda_param(&mut self, param: LambdaParam) {
         self.lambda_params.insert(param.name.to_lowercase(), param);
     }

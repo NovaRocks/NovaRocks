@@ -145,7 +145,14 @@ impl DescriptorTableBuilder {
         table: &TableDef,
         iceberg: &crate::sql::catalog::IcebergTableInfo,
     ) {
-        self.add_iceberg_table_with_partition_info(table_id, db_name, table, iceberg, Vec::new());
+        self.add_iceberg_table_with_partition_info(
+            table_id,
+            db_name,
+            table,
+            iceberg,
+            Vec::new(),
+            false,
+        );
     }
 
     pub(crate) fn add_iceberg_target_table(
@@ -162,6 +169,7 @@ impl DescriptorTableBuilder {
             table,
             iceberg,
             partition_info,
+            true,
         );
     }
 
@@ -172,6 +180,7 @@ impl DescriptorTableBuilder {
         table: &TableDef,
         iceberg: &crate::sql::catalog::IcebergTableInfo,
         partition_info: Vec<descriptors::TIcebergPartitionInfo>,
+        include_serialized_metadata: bool,
     ) {
         if !self.table_ids.insert(table_id) {
             return;
@@ -210,6 +219,9 @@ impl DescriptorTableBuilder {
             None::<descriptors::TIcebergSchema>,
             (!partition_info.is_empty()).then_some(partition_info),
             None::<descriptors::TSortOrder>,
+            include_serialized_metadata
+                .then(|| iceberg.serialized_metadata.clone())
+                .flatten(),
         );
         self.tables.push(descriptors::TTableDescriptor::new(
             table_id,

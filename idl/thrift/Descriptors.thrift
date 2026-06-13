@@ -623,6 +623,10 @@ struct TIcebergTable {
 
     // Iceberg sort order, used to sort data before writing to Iceberg
     9: optional TSortOrder sort_order
+
+    // JSON-serialized Iceberg table metadata. Standalone write sinks use this
+    // to preserve historical partition specs for row-level delete files.
+    10: optional string serialized_metadata
 }
 
 struct THudiTable {
