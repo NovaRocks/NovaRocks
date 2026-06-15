@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use iceberg::io::FileIO;
 use iceberg::spec::{
-    DataContentType, DataFileFormat, FormatVersion, Operation, SchemaRef, Snapshot,
+    DataContentType, DataFileFormat, FormatVersion, ManifestFile, Operation, SchemaRef, Snapshot,
     SnapshotReference, SnapshotRetention, Summary,
 };
 use iceberg::table::Table;
@@ -71,15 +71,13 @@ impl IcebergCommitAction for RowDeltaDvFromFilesCommit {
                 written_manifest_paths: vec![],
             });
         }
-        let written_dvs = written
-            .iter()
-            .map(dv_descriptor_from_written)
-            .collect::<Result<Vec<_>, _>>()?;
+        let (written_dvs, written_data) = partition_written_for_dv_from_files(written)?;
         validate_unique_referenced_files(&written_dvs)?;
 
         let manifest_paths_out: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let action = RowDeltaDvFromFilesTxnAction {
             written_dvs,
+            written: written_data,
             commit_uuid: ctx.commit_uuid,
             file_io: ctx.file_io.clone(),
             schema: ctx.table.metadata().current_schema().clone(),
@@ -121,6 +119,12 @@ impl IcebergCommitAction for RowDeltaDvFromFilesCommit {
 
 struct RowDeltaDvFromFilesTxnAction {
     written_dvs: Vec<WrittenDvFile>,
+    /// Replacement data files produced by an MOR UPDATE. Empty for a plain
+    /// metadata-only DELETE. Each file already carries stored row-lineage
+    /// columns, so the snapshot must NOT allocate fresh row IDs for them — the
+    /// added-data manifest is marked with `first_row_id` to suppress
+    /// allocation.
+    written: Vec<WrittenFile>,
     commit_uuid: Uuid,
     file_io: FileIO,
     schema: SchemaRef,
@@ -224,6 +228,38 @@ impl TransactionAction for RowDeltaDvFromFilesTxnAction {
             new_manifests.push(added);
         }
 
+        if !self.written.is_empty() {
+            let data_path = format!(
+                "{metadata_dir}/{}-row-delta-update-data-0.avro",
+                self.commit_uuid
+            );
+            self.abort_handle.record_manifest(data_path.clone());
+            self.manifest_paths_out
+                .lock()
+                .expect("manifest_paths_out poisoned")
+                .push(data_path.clone());
+            let data_manifest = super::overwrite::write_added_data_manifest(
+                &self.file_io,
+                &data_path,
+                &self.written,
+                m.default_partition_spec().clone(),
+                self.schema.clone(),
+                new_seq,
+                new_snapshot_id,
+                format_version,
+            )
+            .await
+            .map_err(to_iceberg_unexpected)?;
+            // The replacement data files reuse the matched rows' `_row_id`s
+            // (stored in the row-lineage columns). Mark the manifest as
+            // already-assigned so the v3 manifest-list writer does NOT
+            // allocate fresh row IDs for them.
+            new_manifests.push(mark_replacement_manifest_row_id_assigned(
+                data_manifest,
+                self.row_lineage_first_row_id,
+            ));
+        }
+
         let manifest_list_path = format!(
             "{metadata_dir}/snap-{}-{}.avro",
             new_snapshot_id, self.commit_uuid
@@ -265,16 +301,21 @@ impl TransactionAction for RowDeltaDvFromFilesTxnAction {
                     index.replaced_delete_records
                 ))
             })?;
+        let added_data_records = self.written.iter().try_fold(0u64, |sum, file| {
+            sum.checked_add(file.record_count).ok_or_else(|| {
+                to_iceberg_unexpected("DV added data record count overflow".to_string())
+            })
+        })?;
         let total_records = dv_total_records(
             snapshot_total_records(m, parent_snapshot_id).map_err(to_iceberg_unexpected)?,
             newly_deleted_records,
-            0,
+            added_data_records,
         )
         .map_err(to_iceberg_unexpected)?;
 
         let mut dv_props = dv_summary(
             &self.written_dvs,
-            &[],
+            &self.written,
             total_records,
             newly_deleted_records,
             index.replaced_delete_files,
@@ -468,6 +509,46 @@ fn validate_unique_referenced_files(dvs: &[WrittenDvFile]) -> Result<(), String>
     Ok(())
 }
 
+/// Partition BE-written files into Puffin DV descriptors and replacement data
+/// files. A MOR UPDATE commits both in one snapshot: the updated rows arrive as
+/// `(Data, *)` files and the old-version deletes arrive as `(PositionDeletes,
+/// Puffin)` DV files. Any other combination — notably a Parquet
+/// position-delete — is a contract violation and is rejected.
+fn partition_written_for_dv_from_files(
+    written: Vec<WrittenFile>,
+) -> Result<(Vec<WrittenDvFile>, Vec<WrittenFile>), String> {
+    let mut dvs = Vec::new();
+    let mut data = Vec::new();
+    for file in written {
+        match (file.content, file.format) {
+            (DataContentType::PositionDeletes, DataFileFormat::Puffin) => {
+                dvs.push(dv_descriptor_from_written(&file)?);
+            }
+            (DataContentType::Data, _) => {
+                data.push(file);
+            }
+            (content, format) => {
+                return Err(format!(
+                    "RowDeltaDvFromFilesCommit received unsupported written file {} with content {:?} and format {:?}; expected Puffin PositionDeletes or Data",
+                    file.path, content, format
+                ));
+            }
+        }
+    }
+    Ok((dvs, data))
+}
+
+fn mark_replacement_manifest_row_id_assigned(
+    mut manifest: ManifestFile,
+    row_lineage_first_row_id: u64,
+) -> ManifestFile {
+    // MOR UPDATE replacement files carry stored row-lineage columns. The
+    // manifest first-row-id is assigned only to prevent the v3 manifest-list
+    // writer from allocating new row IDs for those replacement rows.
+    manifest.first_row_id = Some(row_lineage_first_row_id);
+    manifest
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -599,6 +680,27 @@ mod tests {
         assert!(!source.contains(concat!("write_", "single_deletion_vector_puffin")));
     }
 
+    #[test]
+    fn commit_partitions_data_and_dv_written_files() {
+        let dv = test_written_puffin_dv_file();
+        let data = test_written_data_file("s3://b/data/new.parquet", 5);
+
+        let (dvs, data_files) =
+            partition_written_for_dv_from_files(vec![dv, data]).expect("partition");
+        assert_eq!(dvs.len(), 1);
+        assert_eq!(data_files.len(), 1);
+        assert_eq!(dvs[0].path, "s3://b/data/dv-00000000.puffin");
+        assert_eq!(data_files[0].path, "s3://b/data/new.parquet");
+
+        let mut bad_parquet_position_delete = test_written_data_file("s3://b/data/pd.parquet", 1);
+        bad_parquet_position_delete.content = DataContentType::PositionDeletes;
+        bad_parquet_position_delete.format = DataFileFormat::Parquet;
+        assert!(
+            partition_written_for_dv_from_files(vec![bad_parquet_position_delete]).is_err(),
+            "Parquet PositionDeletes must be rejected"
+        );
+    }
+
     #[tokio::test]
     async fn commit_drains_writer_files_before_rejecting_coordinator_groups() {
         let fixture = empty_v3_iceberg_table().await;
@@ -700,6 +802,31 @@ mod tests {
             content_offset: Some(4),
             content_size_in_bytes: Some(12),
             cardinality: Some(3),
+        }
+    }
+
+    fn test_written_data_file(path: &str, record_count: u64) -> WrittenFile {
+        WrittenFile {
+            path: path.to_string(),
+            format: DataFileFormat::Parquet,
+            content: DataContentType::Data,
+            partition_values: Struct::empty(),
+            partition_spec_id: 0,
+            record_count,
+            file_size_in_bytes: 20,
+            split_offsets: Vec::new(),
+            column_sizes: HashMap::new(),
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::new(),
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            key_metadata: None,
+            referenced_data_file: None,
+            equality_ids: None,
+            first_row_id: Some(0),
+            content_offset: None,
+            content_size_in_bytes: None,
+            cardinality: None,
         }
     }
 
