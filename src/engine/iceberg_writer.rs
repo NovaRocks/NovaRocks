@@ -359,7 +359,9 @@ pub(crate) fn build_iceberg_write_sink_spec(
         IcebergWriteSinkMode::RowLineageData => {
             row_lineage_iceberg_schema_def_for_codegen(metadata.current_schema())
         }
-        IcebergWriteSinkMode::Data | IcebergWriteSinkMode::PositionDeletes => {
+        IcebergWriteSinkMode::Data
+        | IcebergWriteSinkMode::PositionDeletes
+        | IcebergWriteSinkMode::DeletionVectors => {
             iceberg_schema_def_for_codegen(metadata.current_schema())
         }
     };
@@ -466,7 +468,9 @@ fn write_sink_target_descriptor_columns(
     sink_input_columns: &[ColumnDef],
 ) -> Vec<ColumnDef> {
     match mode {
-        IcebergWriteSinkMode::PositionDeletes => resolved_columns.to_vec(),
+        IcebergWriteSinkMode::PositionDeletes | IcebergWriteSinkMode::DeletionVectors => {
+            resolved_columns.to_vec()
+        }
         IcebergWriteSinkMode::Data | IcebergWriteSinkMode::RowLineageData => {
             sink_input_columns.to_vec()
         }

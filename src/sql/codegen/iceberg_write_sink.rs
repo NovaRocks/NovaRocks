@@ -29,6 +29,7 @@ pub(crate) enum IcebergWriteSinkMode {
     Data,
     RowLineageData,
     PositionDeletes,
+    DeletionVectors,
 }
 
 impl IcebergWriteSinkMode {
@@ -36,6 +37,7 @@ impl IcebergWriteSinkMode {
         match self {
             Self::Data | Self::RowLineageData => data_sinks::TDataSinkType::ICEBERG_TABLE_SINK,
             Self::PositionDeletes => data_sinks::TDataSinkType::ICEBERG_DELETE_SINK,
+            Self::DeletionVectors => data_sinks::TDataSinkType::ICEBERG_DV_SINK,
         }
     }
 }
@@ -469,6 +471,14 @@ mod tests {
 
         assert_eq!(sink.type_, data_sinks::TDataSinkType::ICEBERG_DELETE_SINK);
         assert!(sink.iceberg_table_sink.is_some());
+    }
+
+    #[test]
+    fn dv_mode_maps_to_iceberg_dv_sink() {
+        let mut spec = test_support::simple_sink_spec();
+        spec.mode = IcebergWriteSinkMode::DeletionVectors;
+        let sink = spec.build_sink(0);
+        assert_eq!(sink.type_, data_sinks::TDataSinkType::ICEBERG_DV_SINK);
     }
 
     #[test]
