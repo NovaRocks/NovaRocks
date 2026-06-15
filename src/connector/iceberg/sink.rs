@@ -28,7 +28,7 @@
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -63,6 +63,7 @@ use super::data_writer::{
 use super::schema::build_full_output_schema;
 use super::write_descriptor::encode_partition_descriptor;
 use crate::common::config;
+use crate::connector::iceberg::commit::write_single_deletion_vector_puffin;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::pipeline::async_sink::{AsyncSinkBackend, AsyncSinkOperator};
@@ -553,6 +554,7 @@ impl IcebergTableSinkFactory {
                 driver_id,
                 file_seq: 0,
                 runtime_state: None,
+                pending_deletion_vectors: BTreeMap::new(),
             },
             config::async_sink_queue_capacity(),
         )
@@ -565,6 +567,7 @@ struct IcebergTableSinkBackend {
     driver_id: i32,
     file_seq: u64,
     runtime_state: Option<RuntimeState>,
+    pending_deletion_vectors: BTreeMap<String, crate::connector::iceberg::commit::DeletionVector>,
 }
 
 #[async_trait::async_trait]
@@ -587,13 +590,14 @@ impl AsyncSinkBackend for IcebergTableSinkBackend {
         match self.plan.mode {
             IcebergSinkMode::Data => self.push_chunk_data(&state, chunk).await,
             IcebergSinkMode::PositionDeletes => self.push_chunk_position_delete(&state, chunk),
-            IcebergSinkMode::DeletionVectors => {
-                Err("iceberg deletion-vector sink writer is not implemented".to_string())
-            }
+            IcebergSinkMode::DeletionVectors => self.push_chunk_deletion_vector(&state, chunk),
         }
     }
 
     async fn finish(&mut self) -> Result<(), String> {
+        if self.plan.mode == IcebergSinkMode::DeletionVectors {
+            return self.finish_deletion_vectors();
+        }
         Ok(())
     }
 }
@@ -774,6 +778,20 @@ impl IcebergTableSinkBackend {
         Ok(())
     }
 
+    fn build_file_pos_batch(&self, chunk: &Chunk, sink_label: &str) -> Result<RecordBatch, String> {
+        let all_output_arrays = eval_exprs(&self.arena, &self.plan.output_exprs, chunk)?;
+        if all_output_arrays.len() < 2 {
+            return Err(format!(
+                "iceberg {sink_label} sink expected at least 2 output arrays, got {}",
+                all_output_arrays.len()
+            ));
+        }
+        let file_path_pos_arrays = vec![all_output_arrays[0].clone(), all_output_arrays[1].clone()];
+        let delete_arrays = align_arrays_to_schema(file_path_pos_arrays, &self.plan.output_schema)?;
+        RecordBatch::try_new(Arc::clone(&self.plan.output_schema), delete_arrays)
+            .map_err(|e| format!("iceberg {sink_label} sink build batch failed: {e}"))
+    }
+
     fn push_chunk_position_delete(
         &mut self,
         state: &RuntimeState,
@@ -784,17 +802,7 @@ impl IcebergTableSinkBackend {
         // expressions are kept around so that `plan.partition_exprs` (which were
         // rewritten to reference the partition source SLOT_REFs in try_new) can
         // be evaluated against `chunk` on the existing DATA-sink code path.
-        let all_output_arrays = eval_exprs(&self.arena, &self.plan.output_exprs, &chunk)?;
-        if all_output_arrays.len() < 2 {
-            return Err(format!(
-                "iceberg position-delete sink expected at least 2 output arrays, got {}",
-                all_output_arrays.len()
-            ));
-        }
-        let file_path_pos_arrays = vec![all_output_arrays[0].clone(), all_output_arrays[1].clone()];
-        let delete_arrays = align_arrays_to_schema(file_path_pos_arrays, &self.plan.output_schema)?;
-        let batch = RecordBatch::try_new(Arc::clone(&self.plan.output_schema), delete_arrays)
-            .map_err(|e| format!("iceberg position-delete sink build batch failed: {e}"))?;
+        let batch = self.build_file_pos_batch(&chunk, "position-delete")?;
 
         let partition_groups = self.position_delete_partition_group_indices(&batch)?;
         let descriptor_metadata = self
@@ -899,6 +907,227 @@ impl IcebergTableSinkBackend {
         }
 
         Ok(())
+    }
+
+    fn push_chunk_deletion_vector(
+        &mut self,
+        _state: &RuntimeState,
+        chunk: Chunk,
+    ) -> Result<(), String> {
+        let batch = self.build_file_pos_batch(&chunk, "deletion-vector")?;
+        let positions_by_file = group_positions_by_file(&batch, "deletion-vector")?;
+        let vectors = merge_deletion_vectors_by_file(HashMap::new(), &positions_by_file)?;
+        for (referenced_data_file, dv) in vectors {
+            self.pending_deletion_vectors
+                .entry(referenced_data_file)
+                .or_default()
+                .merge(&dv);
+        }
+        Ok(())
+    }
+
+    fn finish_deletion_vectors(&mut self) -> Result<(), String> {
+        if self.pending_deletion_vectors.is_empty() {
+            return Ok(());
+        }
+        let state = self.runtime_state.clone().ok_or_else(|| {
+            "iceberg deletion-vector sink missing runtime state during finish".to_string()
+        })?;
+        let metadata = self
+            .plan
+            .target_table_metadata
+            .as_ref()
+            .ok_or_else(|| {
+                "iceberg deletion-vector sink missing target table metadata".to_string()
+            })?
+            .clone();
+        // Iceberg FileIO opens absolute Iceberg paths; `data_location` only
+        // selects the same storage backend/credentials as staged DV writes.
+        // The existing-delete read factory itself is rooted from table metadata.
+        let file_io =
+            build_staged_file_io(&self.plan.data_location, self.plan.object_store_s3.as_ref())?;
+        let existing = self.read_existing_dv_positions(
+            &metadata,
+            &file_io,
+            self.pending_deletion_vectors.keys().map(String::as_str),
+        )?;
+        let vectors =
+            merge_existing_with_pending_deletion_vectors(existing, &self.pending_deletion_vectors);
+
+        let mut commit_infos = Vec::new();
+        for (referenced_data_file, dv) in vectors {
+            let (partition_path, null_fingerprint, partition_spec_id, partition_values_descriptor) =
+                self.referenced_data_file_partition_report(
+                    &referenced_data_file,
+                    &metadata,
+                    "deletion-vector",
+                )?;
+            let (parquet_path, report_partition_path) =
+                self.build_file_path_with_prefix(&state, &partition_path, "dv")?;
+            let puffin_path = parquet_path
+                .strip_suffix(".parquet")
+                .ok_or_else(|| {
+                    format!(
+                        "iceberg deletion-vector sink generated non-parquet staging path `{parquet_path}`"
+                    )
+                })?
+                .to_string()
+                + ".puffin";
+            let written = data_block_on(write_single_deletion_vector_puffin(
+                &file_io,
+                &puffin_path,
+                &referenced_data_file,
+                &dv,
+            ))
+            .map_err(|e| format!("iceberg deletion-vector sink wait for Puffin write failed: {e}"))?
+            .map_err(|e| format!("iceberg deletion-vector sink write Puffin failed: {e}"))?;
+            let cardinality = i64::try_from(written.cardinality).map_err(|_| {
+                format!(
+                    "iceberg deletion-vector sink cardinality {} overflows i64",
+                    written.cardinality
+                )
+            })?;
+            let file_size_in_bytes = i64::try_from(written.file_size_in_bytes).map_err(|_| {
+                format!(
+                    "iceberg deletion-vector sink Puffin file size {} overflows i64",
+                    written.file_size_in_bytes
+                )
+            })?;
+
+            let data_file = types::TIcebergDataFile {
+                path: Some(written.path),
+                format: Some("puffin".to_string()),
+                record_count: Some(cardinality),
+                file_size_in_bytes: Some(file_size_in_bytes),
+                partition_path: Some(report_partition_path),
+                split_offsets: None,
+                column_stats: None,
+                partition_null_fingerprint: Some(null_fingerprint),
+                file_content: Some(types::TIcebergFileContent::POSITION_DELETES),
+                referenced_data_file: Some(written.referenced_data_file),
+                first_row_id: None,
+                equality_ids: None,
+                key_metadata: None,
+                partition_values_descriptor: Some(partition_values_descriptor),
+                partition_spec_id: Some(partition_spec_id),
+                content_offset: Some(written.content_offset),
+                content_size_in_bytes: Some(written.content_size_in_bytes),
+                cardinality: Some(cardinality),
+            };
+
+            commit_infos.push(types::TSinkCommitInfo {
+                iceberg_data_file: Some(data_file),
+                hive_file_info: None,
+                is_overwrite: None,
+                staging_dir: None,
+                is_rewrite: None,
+            });
+        }
+
+        for commit_info in commit_infos {
+            state.add_sink_commit_info(commit_info);
+        }
+        self.pending_deletion_vectors.clear();
+        Ok(())
+    }
+
+    fn read_existing_dv_positions<'a>(
+        &self,
+        metadata: &iceberg::spec::TableMetadata,
+        file_io: &iceberg::io::FileIO,
+        owned_files: impl IntoIterator<Item = &'a str>,
+    ) -> Result<HashMap<String, crate::connector::iceberg::commit::DeletionVector>, String> {
+        let Some(snapshot_id) = metadata.current_snapshot_id() else {
+            return Ok(HashMap::new());
+        };
+        let object_store_cfg = self
+            .plan
+            .object_store_s3
+            .as_ref()
+            .map(S3StoreConfig::to_object_store_config);
+        let table = iceberg::table::Table::builder()
+            .file_io(file_io.clone())
+            .metadata(Arc::new(metadata.clone()))
+            .identifier(
+                iceberg::TableIdent::from_strs(["novarocks", "sink"])
+                    .map_err(|e| format!("build iceberg deletion-vector sink table ident: {e}"))?,
+            )
+            .build()
+            .map_err(|e| format!("build iceberg deletion-vector sink table: {e}"))?;
+        let factory = crate::connector::iceberg::changes::build_factory_for_table(
+            &table,
+            object_store_cfg.as_ref(),
+        )?;
+        let owned_files: HashSet<&str> = owned_files.into_iter().collect();
+        let existing = crate::connector::iceberg::scan_deletes::previously_deleted_positions_at_snapshot(
+            &table,
+            snapshot_id,
+            &factory,
+            &|path| crate::connector::iceberg::changes::normalize_delete_projection_path(
+                path,
+                object_store_cfg.as_ref(),
+            ),
+            |path| owned_files.contains(path),
+        )
+        .map_err(|e| {
+            format!(
+                "iceberg deletion-vector sink read existing delete positions at snapshot {snapshot_id} failed: {e}"
+            )
+        })?;
+
+        existing
+            .into_iter()
+            .map(|(file, positions)| {
+                let mut dv = crate::connector::iceberg::commit::DeletionVector::new();
+                for pos in positions {
+                    dv.insert(pos).map_err(|e| {
+                        format!(
+                            "iceberg deletion-vector sink convert existing position {pos} for `{file}` failed: {e}"
+                        )
+                    })?;
+                }
+                Ok((file, dv))
+            })
+            .collect()
+    }
+
+    fn referenced_data_file_partition_report(
+        &self,
+        referenced_data_file: &str,
+        metadata: &iceberg::spec::TableMetadata,
+        sink_label: &str,
+    ) -> Result<(String, String, i32, types::TIcebergPartitionDescriptor), String> {
+        let partition = self
+            .plan
+            .position_delete_data_file_partitions
+            .get(referenced_data_file)
+            .ok_or_else(|| {
+                format!(
+                    "iceberg {sink_label} sink missing partition metadata for referenced data file `{referenced_data_file}`"
+                )
+            })?;
+        let partition_spec = metadata
+            .partition_spec_by_id(partition.partition_spec_id)
+            .ok_or_else(|| {
+                format!(
+                    "iceberg {sink_label} sink referenced data file `{referenced_data_file}` uses unknown partition spec id {}",
+                    partition.partition_spec_id
+                )
+            })?;
+        let (partition_path, null_fingerprint) =
+            partition_path_from_struct(&partition.partition_values, partition_spec)?;
+        let partition_values_descriptor = encode_partition_descriptor(
+            &partition.partition_values,
+            partition.partition_spec_id,
+            metadata,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok((
+            partition_path,
+            null_fingerprint,
+            partition.partition_spec_id,
+            partition_values_descriptor,
+        ))
     }
 
     fn position_delete_partition_group_indices(
@@ -1031,6 +1260,73 @@ fn unique_file_path(batch: &RecordBatch) -> Result<Option<String>, String> {
         }
     }
     Ok(Some(first.to_string()))
+}
+
+fn group_positions_by_file(
+    batch: &RecordBatch,
+    sink_label: &str,
+) -> Result<BTreeMap<String, Vec<u64>>, String> {
+    let file_path_col = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| format!("iceberg {sink_label} sink: file_path array expected as Utf8"))?;
+    let pos_col = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| format!("iceberg {sink_label} sink: pos array expected as Int64"))?;
+    if file_path_col.null_count() > 0 || pos_col.null_count() > 0 {
+        return Err(format!(
+            "iceberg {sink_label} sink rejects NULL file_path or pos"
+        ));
+    }
+
+    let mut out: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+    for row in 0..batch.num_rows() {
+        let pos = pos_col.value(row);
+        if pos < 0 {
+            return Err(format!(
+                "iceberg {sink_label} sink pos must be non-negative: {pos}"
+            ));
+        }
+        out.entry(file_path_col.value(row).to_string())
+            .or_default()
+            .push(pos as u64);
+    }
+    Ok(out)
+}
+
+fn merge_deletion_vectors_by_file(
+    mut existing: HashMap<String, crate::connector::iceberg::commit::DeletionVector>,
+    positions_by_file: &BTreeMap<String, Vec<u64>>,
+) -> Result<BTreeMap<String, crate::connector::iceberg::commit::DeletionVector>, String> {
+    let mut out = BTreeMap::new();
+    for (file, positions) in positions_by_file {
+        let mut dv = existing.remove(file).unwrap_or_default();
+        for pos in positions {
+            dv.insert(*pos).map_err(|e| {
+                format!(
+                    "iceberg deletion-vector sink insert position {pos} for `{file}` failed: {e}"
+                )
+            })?;
+        }
+        out.insert(file.clone(), dv);
+    }
+    Ok(out)
+}
+
+fn merge_existing_with_pending_deletion_vectors(
+    mut existing: HashMap<String, crate::connector::iceberg::commit::DeletionVector>,
+    pending: &BTreeMap<String, crate::connector::iceberg::commit::DeletionVector>,
+) -> BTreeMap<String, crate::connector::iceberg::commit::DeletionVector> {
+    let mut out = BTreeMap::new();
+    for (file, pending_dv) in pending {
+        let mut dv = existing.remove(file).unwrap_or_default();
+        dv.merge(pending_dv);
+        out.insert(file.clone(), dv);
+    }
+    out
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
@@ -2555,7 +2851,7 @@ fn format_datetime(dt: chrono::NaiveDateTime) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::Arc;
 
     use arrow::array::{Array, ArrayRef, Int32Array, Int64Array, RecordBatch};
@@ -2577,12 +2873,14 @@ mod tests {
         ICEBERG_ROW_ID_COL, IcebergSinkMode, IcebergSinkPlan, IcebergTableSinkBackend,
         IcebergTableSinkFactory, PositionDeleteDataFilePartition, align_arrays_to_schema,
         build_column_slot_map, build_position_delete_output_schema, collect_theta_sketches_by_name,
-        iceberg_partition_key_for_row, iceberg_schema_from_arrow_schema, row_lineage_row_id_index,
+        iceberg_partition_key_for_row, iceberg_schema_from_arrow_schema,
+        merge_deletion_vectors_by_file, row_lineage_row_id_index,
         schema_has_reserved_row_lineage_columns, unique_file_path, write_parquet_to_bytes,
     };
     use crate::connector::iceberg::data_writer::{StagedWriteOptions, write_record_batches};
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::expr::ExprNode;
+    use crate::exec::pipeline::async_sink::AsyncSinkBackend;
     use crate::lower::layout::Layout;
     use crate::runtime::runtime_state::RuntimeState;
     use crate::{common::ids::SlotId, common::types::UniqueId};
@@ -3028,6 +3326,7 @@ mod tests {
             driver_id: 3,
             file_seq: 0,
             runtime_state: None,
+            pending_deletion_vectors: BTreeMap::new(),
         };
         let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![7, 7]))])
             .expect("record batch");
@@ -3235,6 +3534,7 @@ mod tests {
             driver_id: 5,
             file_seq: 0,
             runtime_state: None,
+            pending_deletion_vectors: BTreeMap::new(),
         };
         let batch = RecordBatch::try_new(
             source_schema,
@@ -3378,6 +3678,7 @@ mod tests {
             driver_id: 9,
             file_seq: 0,
             runtime_state: None,
+            pending_deletion_vectors: BTreeMap::new(),
         };
         let batch = RecordBatch::try_new(
             source_schema,
@@ -3445,6 +3746,314 @@ mod tests {
             )
             .expect("descriptor should decode against the referenced file spec");
         }
+    }
+
+    fn build_deletion_vector_backend_chunk(
+        table_location: String,
+        data_location: String,
+        referenced_data_file: &str,
+        positions: Vec<i64>,
+        finst_id: UniqueId,
+    ) -> (
+        IcebergTableSinkBackend,
+        RuntimeState,
+        Chunk,
+        iceberg::spec::TableMetadata,
+    ) {
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("file_path", DataType::Utf8, false),
+            Field::new("pos", DataType::Int64, false),
+            Field::new("id", DataType::Int32, false),
+        ]));
+        let file_slot = SlotId::new(1);
+        let pos_slot = SlotId::new(2);
+        let id_slot = SlotId::new(3);
+        let mut arena = crate::exec::expr::ExprArena::default();
+        let file_expr = arena.push_typed(ExprNode::SlotId(file_slot), DataType::Utf8);
+        let pos_expr = arena.push_typed(ExprNode::SlotId(pos_slot), DataType::Int64);
+        let id_expr = arena.push_typed(ExprNode::SlotId(id_slot), DataType::Int32);
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "42".to_string(),
+            )])),
+        ]));
+        let target_metadata = test_identity_partition_metadata(
+            &table_location,
+            &data_location,
+            Arc::clone(&target_schema),
+            7,
+        );
+        let mut referenced_partitions = HashMap::new();
+        referenced_partitions.insert(
+            referenced_data_file.to_string(),
+            PositionDeleteDataFilePartition {
+                partition_spec_id: target_metadata.default_partition_spec_id(),
+                partition_values: iceberg::spec::Struct::from_iter([Some(
+                    iceberg::spec::Literal::int(7),
+                )]),
+            },
+        );
+        let plan = Arc::new(IcebergSinkPlan {
+            mode: IcebergSinkMode::DeletionVectors,
+            table_location,
+            data_location,
+            target_partition_spec_id: 7,
+            target_table_metadata: Some(target_metadata.clone()),
+            position_delete_data_file_partitions: referenced_partitions,
+            object_store_s3: None,
+            file_format: "parquet".to_string(),
+            compression: crate::types::TCompressionType::SNAPPY,
+            output_schema: build_position_delete_output_schema(),
+            target_schema,
+            row_lineage_data: false,
+            output_exprs: vec![file_expr, pos_expr, id_expr],
+            partition_exprs: vec![id_expr],
+            partition_source_column_names: vec!["id".to_string()],
+            partition_column_names: vec!["id_part".to_string()],
+            transform_exprs: vec!["identity".to_string()],
+        });
+        let files = vec![referenced_data_file; positions.len()];
+        let ids = vec![7_i32; positions.len()];
+        let batch = RecordBatch::try_new(
+            source_schema,
+            vec![
+                Arc::new(StringArray::from(files)),
+                Arc::new(Int64Array::from(positions)),
+                Arc::new(Int32Array::from(ids)),
+            ],
+        )
+        .expect("record batch");
+        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[file_slot, pos_slot, id_slot],
+        )
+        .expect("chunk schema");
+        let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk");
+        crate::runtime::sink_commit::unregister(finst_id);
+        let state = RuntimeState::new(
+            None,
+            None,
+            None,
+            None,
+            Some(finst_id),
+            None,
+            None,
+            None,
+            None,
+        );
+        let backend = IcebergTableSinkBackend {
+            arena: Arc::new(arena),
+            plan,
+            driver_id: 13,
+            file_seq: 0,
+            runtime_state: None,
+            pending_deletion_vectors: BTreeMap::new(),
+        };
+        (backend, state, chunk, target_metadata)
+    }
+
+    fn build_deletion_vector_chunk(referenced_data_file: &str, positions: Vec<i64>) -> Chunk {
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("file_path", DataType::Utf8, false),
+            Field::new("pos", DataType::Int64, false),
+            Field::new("id", DataType::Int32, false),
+        ]));
+        let file_slot = SlotId::new(1);
+        let pos_slot = SlotId::new(2);
+        let id_slot = SlotId::new(3);
+        let files = vec![referenced_data_file; positions.len()];
+        let ids = vec![7_i32; positions.len()];
+        let batch = RecordBatch::try_new(
+            source_schema,
+            vec![
+                Arc::new(StringArray::from(files)),
+                Arc::new(Int64Array::from(positions)),
+                Arc::new(Int32Array::from(ids)),
+            ],
+        )
+        .expect("record batch");
+        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[file_slot, pos_slot, id_slot],
+        )
+        .expect("chunk schema");
+        Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk")
+    }
+
+    #[test]
+    fn push_chunk_deletion_vector_reports_puffin_descriptor() {
+        let dir = tempfile::Builder::new()
+            .prefix("novarocks-iceberg-dv-write-")
+            .tempdir()
+            .expect("temp dir");
+        let table_location = dir.path().display().to_string();
+        let data_location = dir.path().join("custom-data").display().to_string();
+        let referenced = "f.parquet";
+        let finst_id = UniqueId { hi: 704, lo: 42 };
+        let (mut backend, state, chunk, target_metadata) = build_deletion_vector_backend_chunk(
+            table_location,
+            data_location.clone(),
+            referenced,
+            vec![0, 2],
+            finst_id,
+        );
+
+        backend
+            .push_chunk_deletion_vector(&state, chunk)
+            .expect("buffer deletion vector");
+
+        let infos = crate::runtime::sink_commit::list(finst_id);
+        assert!(
+            infos.is_empty(),
+            "deletion-vector sink should report only during finish"
+        );
+        backend
+            .bind_runtime_state(&state)
+            .expect("bind runtime state");
+        crate::runtime::global_async_runtime::data_block_on(backend.finish())
+            .expect("finish runtime")
+            .expect("finish deletion vectors");
+
+        let infos = crate::runtime::sink_commit::list(finst_id);
+        crate::runtime::sink_commit::unregister(finst_id);
+        assert_eq!(infos.len(), 1);
+        let data_file = infos[0]
+            .iceberg_data_file
+            .as_ref()
+            .expect("iceberg dv data file");
+        assert_eq!(data_file.format.as_deref(), Some("puffin"));
+        assert_eq!(
+            data_file.file_content,
+            Some(crate::types::TIcebergFileContent::POSITION_DELETES)
+        );
+        assert_eq!(data_file.referenced_data_file.as_deref(), Some(referenced));
+        assert_eq!(data_file.cardinality, Some(2));
+        assert_eq!(data_file.record_count, Some(2));
+        assert!(data_file.content_offset.is_some());
+        assert!(data_file.content_size_in_bytes.is_some());
+        assert!(
+            data_file
+                .path
+                .as_deref()
+                .unwrap_or_default()
+                .ends_with(".puffin")
+        );
+        assert_eq!(data_file.partition_path.as_deref(), Some("id_part=7"));
+        let decoded = crate::connector::iceberg::write_descriptor::decode_partition_descriptor(
+            data_file.partition_values_descriptor.clone(),
+            data_file
+                .partition_spec_id
+                .expect("writer report partition spec id"),
+            &target_metadata,
+        )
+        .expect("decode deletion-vector descriptor");
+        assert_eq!(
+            decoded,
+            iceberg::spec::Struct::from_iter([Some(iceberg::spec::Literal::int(7))])
+        );
+    }
+
+    #[test]
+    fn merge_deletion_vector_positions_preserves_existing_positions() {
+        let mut old = crate::connector::iceberg::commit::DeletionVector::new();
+        old.insert(5).expect("old position");
+        let existing = HashMap::from([("f.parquet".to_string(), old)]);
+        let positions = BTreeMap::from([("f.parquet".to_string(), vec![0_u64, 2])]);
+
+        let merged =
+            merge_deletion_vectors_by_file(existing, &positions).expect("merge deletion vectors");
+
+        let dv = merged.get("f.parquet").expect("merged dv");
+        assert_eq!(dv.cardinality(), 3);
+        assert!(dv.contains(0));
+        assert!(dv.contains(2));
+        assert!(dv.contains(5));
+    }
+
+    #[test]
+    fn push_chunk_deletion_vector_merges_same_file_across_chunks_at_finish() {
+        let dir = tempfile::Builder::new()
+            .prefix("novarocks-iceberg-dv-multi-chunk-")
+            .tempdir()
+            .expect("temp dir");
+        let table_location = dir.path().display().to_string();
+        let data_location = dir.path().join("custom-data").display().to_string();
+        let referenced = "f.parquet";
+        let finst_id = UniqueId { hi: 706, lo: 42 };
+        let (mut backend, state, first_chunk, _target_metadata) =
+            build_deletion_vector_backend_chunk(
+                table_location,
+                data_location,
+                referenced,
+                vec![0, 2],
+                finst_id,
+            );
+        let second_chunk = build_deletion_vector_chunk(referenced, vec![5]);
+
+        backend
+            .push_chunk_deletion_vector(&state, first_chunk)
+            .expect("buffer first deletion-vector chunk");
+        backend
+            .push_chunk_deletion_vector(&state, second_chunk)
+            .expect("buffer second deletion-vector chunk");
+        let infos = crate::runtime::sink_commit::list(finst_id);
+        assert!(
+            infos.is_empty(),
+            "deletion-vector sink should report only during finish"
+        );
+        backend
+            .bind_runtime_state(&state)
+            .expect("bind runtime state");
+        crate::runtime::global_async_runtime::data_block_on(backend.finish())
+            .expect("finish runtime")
+            .expect("finish deletion vectors");
+
+        let infos = crate::runtime::sink_commit::list(finst_id);
+        crate::runtime::sink_commit::unregister(finst_id);
+        assert_eq!(
+            infos.len(),
+            1,
+            "same referenced data file should produce one Puffin DV per sink lifecycle"
+        );
+        let data_file = infos[0]
+            .iceberg_data_file
+            .as_ref()
+            .expect("iceberg dv data file");
+        assert_eq!(data_file.referenced_data_file.as_deref(), Some(referenced));
+        assert_eq!(data_file.cardinality, Some(3));
+        assert_eq!(data_file.record_count, Some(3));
+    }
+
+    #[test]
+    fn push_chunk_deletion_vector_rejects_negative_position_without_commit_info() {
+        let dir = tempfile::Builder::new()
+            .prefix("novarocks-iceberg-dv-negative-")
+            .tempdir()
+            .expect("temp dir");
+        let table_location = dir.path().display().to_string();
+        let data_location = dir.path().join("custom-data").display().to_string();
+        let referenced = "f.parquet";
+        let finst_id = UniqueId { hi: 705, lo: 42 };
+        let (mut backend, state, chunk, _target_metadata) = build_deletion_vector_backend_chunk(
+            table_location,
+            data_location,
+            referenced,
+            vec![-1],
+            finst_id,
+        );
+
+        let err = backend
+            .push_chunk_deletion_vector(&state, chunk)
+            .expect_err("negative position should fail");
+
+        assert!(
+            err.contains("pos must be non-negative"),
+            "unexpected error: {err}"
+        );
+        let infos = crate::runtime::sink_commit::list(finst_id);
+        crate::runtime::sink_commit::unregister(finst_id);
+        assert!(infos.is_empty());
     }
 
     #[test]
