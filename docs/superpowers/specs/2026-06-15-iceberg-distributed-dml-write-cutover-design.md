@@ -1,7 +1,7 @@
 # Iceberg 分布式 DML 写入统一 + 移除「进程内本地写后注入」模式 — 设计稿
 
-- 日期：2026-06-15
-- 状态：设计已定稿，待写实现计划（writing-plans）
+- 日期：2026-06-15（2026-06-15 修订：补 MERGE 原子性目标、调整 phase 顺序、MERGE 尊重 `write.update.mode`）
+- 状态：Phase 1 已实现并合入（#323）；其余 phase 待实现计划（writing-plans）
 - 范围：standalone SQL engine 的 Iceberg 写路径（DELETE / UPDATE / MERGE / ADD EQUALITY DELETE）
 - 关联：[Iceberg Distributed Write Pipeline Roadmap]（NovaRocks Roadmap 索引）；上游已完成 IW-1~IW-8（INSERT/OVERWRITE 已分布式）
 
@@ -11,17 +11,26 @@
 
 NovaRocks 的 Iceberg 写当前有两套执行模型：
 
-- **分布式 async-sink（目标模型）**：行在 BE 上产出，经 `ICEBERG_*_SINK` fragment 在各 BE 写 staged 文件，coordinator 收齐 writer 结果后由 **FE 做唯一一次 metadata commit**。今天 `INSERT INTO`、`INSERT OVERWRITE`、v2 position-delete `DELETE`、merge-on-read(MOR) `UPDATE`、`MERGE` 的 unmatched-INSERT 走此路径。
-- **本地「写后注入」（待移除）**：coordinator 进程内自己 scan/compute 并写数据/删除文件，再把文件清单 `local_writer_commit_input(...)` 注入共享的 commit runner。今天仍走此路径的有 4 条：**v3 deletion-vector DELETE**、**copy-on-write(COW) UPDATE（默认 UPDATE 模式）**、**MERGE matched-DELETE**、**ADD EQUALITY DELETE**。
+- **分布式 async-sink（目标模型）**：行在 BE 上产出，经 `ICEBERG_*_SINK` fragment 在各 BE 写 staged 文件，coordinator 收齐 writer 结果后由 **FE 做唯一一次 metadata commit**。今天 `INSERT INTO`、`INSERT OVERWRITE`、v2 position-delete `DELETE`、v3 DV `DELETE`（Phase 1，#323）、merge-on-read(MOR) `UPDATE` 的数据侧、`MERGE` 的 unmatched-INSERT 走此路径。
+- **本地「写后注入」（待移除）**：coordinator 进程内自己 scan/compute 并写数据/删除文件，再把文件清单 `local_writer_commit_input(...)` 注入共享的 commit runner。今天仍走此路径：**copy-on-write(COW) UPDATE**、**MOR UPDATE 的 DV 侧**（FE-inject 中心化写 DV）、**MERGE matched-DELETE / matched-UPDATE**、**ADD EQUALITY DELETE**。
 
 两套模型共享后半段：`IcebergWriteTransactionRunner` → `IcebergWriteCommitExecutor::commit_write_input` → `IcebergCommitCollector` → `run_iceberg_commit_typed`。差异**只在前半段** `IcebergWriteTransactionExecutor::run_coordinated_write`（`src/engine/write_transaction.rs:88-108`）。
 
-本设计把这 4 条全部切到分布式模型，并**彻底删除本地写后注入相关代码**。
+本设计把剩余路径全部切到分布式模型、**彻底删除本地写后注入相关代码**，并**修复 MERGE 的原子性缺陷**（见 §2）。
 
 ### 1.1 参考调研结论（StarRocks）
 
-- StarRocks **不写 v3 Puffin deletion vector**：它写**可叠加的 MOR position-delete Parquet 文件**（读时由引擎并集），按**分区列** shuffle（非按 data-file），FE 仅 `RowDelta` 提交 metadata。因此它没有「合并已有 DV」问题，分布式天然成立；StarRocks 默认建 v2 表，**无 equality-delete 写**，**UPDATE 仅 MOR（无 COW）**。
-- 结论：NovaRocks 的 v3 DV 写、equality-delete 写、COW update 三项**均超出 StarRocks，无参考可抄**。对 v3 表必须写 DV（position-delete Parquet 不符合 v3 spec，且 `RowDeltaDvCommit` 已强制 Puffin-only），所以 StarRocks 的「叠加 position-delete」捷径不适用，需要 NovaRocks 自己解决分布式 DV 写。
+- StarRocks **不写 v3 Puffin deletion vector**：它写**可叠加的 MOR position-delete Parquet 文件**，按**分区列** shuffle，FE 仅 `RowDelta` 提交 metadata；默认建 v2 表，**无 equality-delete 写**，**UPDATE 仅 MOR（无 COW）**，**MERGE 一律 MOR**。
+- 结论：NovaRocks 的 v3 DV 写、equality-delete 写、COW update、以及「MERGE 尊重 `write.update.mode`」**均超出 StarRocks，无参考可抄**。v3 表必须写 DV，故 Phase 1 用 **per-`_file` shuffle**（每个 data file 由唯一 BE 独占、本地读旧 DV+合并+写 Puffin）解决了分布式 DV 写——这是后续 MERGE/UPDATE 复用的基石。
+
+### 1.2 Phase 1 已落地实现要点（as-merged #323，后续复用）
+
+- 新 `IcebergWriteSinkMode::DeletionVectors` → `TDataSinkType::ICEBERG_DV_SINK`；BE sink `push_chunk_deletion_vector` + `finish_deletion_vectors`。
+- BE 读旧 DV 是**自己 walk snapshot**（`read_existing_dv_positions` → `scan_deletes::previously_deleted_positions_at_snapshot`，按 owned-file 过滤），**不**经 thrift 下推描述符。
+- per-`_file` shuffle：`execute_query_as_iceberg_write(..., Some(iceberg_write_shuffle_by_output_index(0)))` → optimizer `optimize_with_root_distribution(DistributionSpec::shuffle_agg([_file 的 ColumnId]))`。
+- thrift `TIcebergDataFile` 已加 `content_offset` / `content_size_in_bytes` / `cardinality`（字段 16/17/18）；`WrittenFile` 同步；`collector.convert` 按 `format` 还原。
+- metadata-only commit：`CommitOpKind::RowDeltaDvFromFiles` → `RowDeltaDvFromFilesCommit`（登记 BE 写好的 Puffin DV，不再中心化构建/合并/写）。
+- executor 模板：`DistributedDvDeleteWriteExecutor` + `run_delete_dv_write_transaction`。
 
 ---
 
@@ -29,17 +38,18 @@ NovaRocks 的 Iceberg 写当前有两套执行模型：
 
 ### 目标
 
-1. `DELETE`（含 v3 DV）、`UPDATE`（含 COW）、`MERGE`（含 matched-delete）、`ADD EQUALITY DELETE` 全部经分布式 async-sink 在 **BE** 写文件。
+1. `DELETE`（v3 DV，已完成）、`UPDATE`（COW + MOR）、`MERGE`、`ADD EQUALITY DELETE` 全部经分布式 async-sink 在 **BE** 写文件。
 2. 删除本地写后注入的全部代码（见 §6 删除面）。
-3. 行为与落盘形态保持等价（byte-identical 结果），仅改变**执行位置**（进程内 → 分布式）。
-4. 在 1FE+NBE 与 all-in-one 下均正确；`all-in-one` 行为/性能不回退。
+3. **逻辑结果等价**（行集相同）；仅改变**执行位置**（进程内 → 分布式）。标准 standalone UPDATE/DELETE 的**落盘形态**也保持等价（按 `write.update.mode`/delete 策略）。
+4. **MERGE 原子性**：一条 `MERGE` 语句 = **一次 Iceberg 提交、一个 snapshot**。修复当前「一条 MERGE 产生最多 2 个独立 snapshot（not-matched-insert 与 matched 分支各自 commit）」的**既有缺陷**——它违反 MERGE 原子语义（非原子可见性、崩溃留半成品、冲突检测错位）。
+5. 在 1FE+NBE 与 all-in-one 下均正确；`all-in-one` 行为/性能不回退。
 
 ### 非目标
 
-- 不重写 INSERT/OVERWRITE/v2-delete/MOR-update（已分布式，仅作模板复用）。
+- 不重写 INSERT/OVERWRITE/v2-delete（已分布式，仅作模板复用）。
 - 不改 CTAS、compaction（它们仍用 `run_select_to_chunks*` 本地写，**不在本范围**，见 §7）。
-- 不在本次迁移 IMV refresh / IV3-4 / IV3-5 到新 DV writer（本次只把基建建出来，迁移留作后续，见 §11）。
-- 不改变 COW vs MOR 的用户语义（保留 `write.update.mode` 双模式）。
+- 不在本次迁移 IMV refresh / IV3-4 / IV3-5 到 BE DV writer（基建已由 Phase 1 建出，迁移留作后续，见 §11）。
+- 不改变 `write.update.mode` 对 **standalone UPDATE/DELETE** 的语义（COW 表仍 COW、MOR 表仍 MOR）。**MERGE 也尊重 `write.update.mode`**（见 §5.3）——不强制 MERGE 一律 MOR。
 
 ---
 
@@ -47,7 +57,7 @@ NovaRocks 的 Iceberg 写当前有两套执行模型：
 
 > **FE 只提交 metadata；所有数据文件、position-delete 文件、deletion vector、equality-delete 文件都由 BE 写。**
 
-这条不变量是本设计一切取舍的根。它直接淘汰了「中心化（FE）写 DV」的方案（Option 3）——因为在 1FE+NBE 下 coordinator = **FE**，让 FE 读旧 DV + 写 Puffin 属于数据面 I/O，跨过了 INSERT/OVERWRITE 坚持的边界。FE 在 commit 时写 manifest/metadata.json（元数据）是固有且允许的；写 delete/DV/数据文件不允许。
+这条不变量是本设计一切取舍的根。在 1FE+NBE 下 coordinator = **FE**，让 FE 写数据/删除文件属于数据面 I/O，跨过了 INSERT/OVERWRITE 坚持的边界。FE 在 commit 时写 manifest/metadata.json（元数据）是固有且允许的；写 data/DV/delete/equality 文件不允许。
 
 ---
 
@@ -59,121 +69,123 @@ NovaRocks 的 Iceberg 写当前有两套执行模型：
 FE: 解析/规划 → 构造写 query + 选择 sink mode → 按需施加分布式 shuffle
   → 派发 fragment 到 BE（RemoteDispatcher；all-in-one 下 InProcessDispatcher）
 BE: 执行 fragment（scan/compute/produce rows）→ 对应 *_SINK 写 staged 文件 → 上报 writer 结果
-FE: ExecutionCoordinator 收齐 writer 结果 → IcebergWriteTransactionRunner
+FE: ExecutionCoordinator 收齐 writer 结果 → 汇入一个 IcebergCommitCollector
   → 唯一一次 metadata commit（run_iceberg_commit_typed）→ finalize（失效缓存等）
 ```
 
-切换点（每条 op 要改的唯一方法）：`IcebergWriteTransactionExecutor::run_coordinated_write`，让它调用 `execute_query_as_iceberg_write(...)`（`src/engine/mod.rs:3403`）并带上正确的 `IcebergWriteSinkSpec`，与 `DistributedInsertWriteExecutor` / `DistributedDeleteWriteExecutor` / `DistributedMorUpdateExecutor` 完全一致。runner / commit executor / collector 不动。
-
-`coordinated_execution_services`（`mod.rs:3670-3716`）按 `ClusterRole` 选 dispatcher：`Fe → RemoteDispatcher`，`AllInOne → InProcessDispatcher`（all-in-one 在进程内跑同一条分布式路径，故删本地模式不破坏单机）。
+**关键机制（已由 Phase 1 调研/实现验证）——写与提交可分离**：分布式写产出的 `TSinkCommitInfo` 经 `collector.inject_written_files` / `inject_delete_group` **纯累加**进 collector，提交只发生在 `run_iceberg_commit_typed`。因此**多个分支的分布式写可以喂入同一个 collector、最后只提交一次**——这是 MERGE 原子提交的基础（§5.3）。
 
 ---
 
 ## 5. 分项设计
 
-### 5.1 v3 DV-delete + MERGE matched-delete（核心，Option 2：per-file shuffle + BE 写 DV）
+> Phase 顺序见 §10。依赖：§5.3 原子 MERGE 依赖 §5.1（DV 写，已完成）与 §5.2（分布式 UPDATE）。
 
-**问题**：写一个 data file 的 v3 DV 需要把「新删除位置」与该 data file「已有 DV」合并；若同一 data file 的删除位置散落在多个 BE fragment 上，谁都无法独立写出正确的合并 DV。
+### 5.1 v3 DV-delete（Phase 1，已完成 #323）
 
-**解法（按 data-file 路径 shuffle，使每个 data file 由唯一 BE 独占）**：
+per-`_file` shuffle + BE 写合并后的 Puffin DV + `RowDeltaDvFromFiles` metadata-only commit。要点见 §1.2。后续 MERGE/UPDATE 的删除侧直接复用这套 DV sink。
 
-1. **FE 规划**：把删除条件表达为分布式 query `SELECT _file, _pos[, <partition cols>] FROM <target> [FOR VERSION AS OF <pinned>] WHERE <pred>`（复用 v2 路径已有的 `build_delete_position_sink_query`，`src/engine/delete_flow.rs:466-487`）。在该 query 与 DV sink 之间**施加按 `_file`（data-file 路径）的 hash-distribution**（新的 distribution 要求），保证一个 data file 的所有删除位置进入同一个 BE/driver。
-   - 对照 StarRocks `IcebergPlannerUtils.createShuffleProperty`（它按分区列）；这里 key 是 `_file`，是 NovaRocks 超出 StarRocks 的部分。
-2. **新 sink mode `DeletionVectors`**：在 `IcebergWriteSinkMode`（`src/sql/codegen/iceberg_write_sink.rs:27-32`）与 `IcebergSinkMode`（`src/connector/iceberg/sink.rs:87-90`）各加一个变体，映射到一个新的 `TDataSinkType`（`ICEBERG_DV_SINK`，或给 `ICEBERG_DELETE_SINK` 加 format 标志，二选一，倾向独立类型以免污染 v2 路径）。
-3. **BE DV writer**（新增 `push_chunk_deletion_vector`，类比 `push_chunk_position_delete` `sink.rs:765-887`）：本 BE 已独占若干 data file 的全部删除位置；对每个 `referenced_data_file`：
-   - 用 pinned base snapshot 经 caching delete loader（`src/connector/iceberg/caching_delete_file_loader.rs`）读该文件**已有 DV**；
-   - 由新位置构建 roaring bitmap，与已有 DV 合并；
-   - 写 Puffin DV blob（`write_single_deletion_vector_puffin`，`src/connector/iceberg/commit/puffin_dv.rs:215-280`）；
-   - 上报 `TIcebergDataFile { file_content = POSITION_DELETES, format = "puffin", referenced_data_file, content_offset, content_size_in_bytes, cardinality, file_size_in_bytes }`。
-4. **Thrift / collector**：`TIcebergDataFile` 需带 `content_offset` / `content_size_in_bytes`（`RowDeltaDvCommit` 已用这些字段，见 `row_delta_dv.rs:789-803`）；`IcebergCommitCollector::convert` / `take_written_files` 需对 Puffin DV 文件做无损往返（当前对 data + Parquet delete 无损，需扩展）。
-5. **FE commit（metadata-only）**：新增「从 BE 写好的 Puffin DV 文件直接登记」的提交路径——FE **不**再构建 bitmap、**不**读旧 DV、**不**写 Puffin（这些已在 BE 完成）。可由现有 `RowDeltaDvCommit` 派生一个 from-files 变体：跳过 `groups_to_vectors` 与中心化合并，直接以 BE 上报的 DV 文件构造 `RowDeltaDv` snapshot，沿用其 carry-forward / 校验（`row_delta_dv.rs:552-630`）中与「写」无关的部分。
-6. **MERGE matched-delete**：matched 行的 `(_file,_pos)` 来自分布式 match query；同样按 `_file` shuffle 进 DV sink。MERGE 的 matched-delete / matched-update / unmatched-insert 三支需在**同一 RowDelta 内原子提交**——采用 op-code 路由的 row-delta sink（NO_OP/DELETE/UPDATE/INSERT，对照 StarRocks `IcebergRowDeltaSink`），matched-delete 行 → DV writer，insert/update 行 → data writer。
+### 5.2 分布式 UPDATE（Phase 2；standalone UPDATE，且是 MERGE 的依赖）
 
-**正确性关键**：base snapshot 在规划期 pin 定，BE 据此读旧 DV，commit 期 `validateFromSnapshot(pinned)` 做冲突检测（对照 StarRocks `commitDeleteOperation`）。per-file 独占保证「一个文件的 DV 合并只发生在一个 BE 上」，无多 fragment 同文件 partial-DV 问题。
+standalone `UPDATE` 按 `write.update.mode` 分两条；本 phase 把两条都做成**分布式 + BE 写 + 一次提交**，并产出 MERGE 复用的两块基建。
 
-### 5.2 equality-delete（新分布式 sink）
+- **COW（`write.update.mode=copy-on-write`）— 分布式整文件重写**：
+  1. 阶段 A（metadata）：分布式 query 算出命中行的 distinct `_file` = 被替换文件集合，收集回 FE。
+  2. 阶段 B（BE 数据面）：对被命中文件**整体扫描**（scope 到 A 的文件集合），命中行套更新、未命中行透传，写新文件（`RowLineageData` sink + row-lineage 保号）。
+  3. FE commit：**Overwrite** 提交（replaced = 被命中文件，added = 新文件），`CowUpdateRewriteSet` 由 A 的文件集合 + B 的产出在 coordinator 侧组装为**元数据**。
+  - 删除现有进程内 `MutationWriteExecutor::run_cow_update_write` + 全部 COW 助手。这是最难、无 StarRocks 参考的一块。
+- **MOR（`write.update.mode=merge-on-read`）— DV 侧移到 BE 写**：数据侧已分布式（`RowLineageData` sink）；当前删除侧仍 **FE-inject 中心化写 DV**（`build_position_delete_groups_from_matched` + `collector.inject_delete_group` → `RowDeltaDvCommit` 在 FE 构建/合并/写 Puffin），**违反硬不变量**。本 phase 把 MOR-update 的旧行删除位置改为走 §5.1 的 `DeletionVectors` sink（BE 写 DV）+ `RowDeltaDvFromFiles`。
 
-当前 `execute_add_equality_delete_statement`（`equality_delete_flow.rs:52-178`）从字面量行在进程内写一个 equality-delete 文件（仅 unpartitioned）。
+**`RowDeltaDvFromFiles` 扩展（本 phase 必做）**：使其除 Puffin DV 文件外，也接受 `content==Data` 的 BE 写数据文件，在同一 snapshot 里 `write_added_data_manifest`（机械移植 `row_delta_dv.rs:290-320`）。这样「新数据 + DV」可在**一次** RowDelta 提交内落地——MOR-update（数据 + DV）与原子 MERGE 都依赖它。
 
-**改造**：把字面量行做成内存 VALUES 源 query → 新增 `EqualityDeletes` sink mode → BE 写 equality-delete 文件 → FE commit 登记。BE 写逻辑复用现有 `build_equality_delete_batch`（`equality_delete_flow.rs:244-310`）+ `write_equality_delete_file` 的核心，迁到 sink operator 内。无 scan、无并行收益，但统一进分布式模型以满足硬不变量并彻底删本地写。
+### 5.3 原子分布式 MERGE（Phase 3）
 
-### 5.3 COW-update（两阶段分布式重写）
+**一条 MERGE = 一次提交、一个 snapshot。** `matched` 子句是 UPDATE **xor** DELETE，外加可选 not-matched INSERT。**MERGE 尊重 `write.update.mode`**（与 standalone UPDATE 一致）。
 
-COW 语义：对每个被命中的 data file，整体重写（保留未命中行 + 应用更新行 → 新文件），旧文件被 overwrite 替换。无 StarRocks 参考。
+**装配方法（基于 §4 的写/提交分离）**：建**一个**共享 `IcebergCommitCollector`；逐分支跑分布式写、把各自 `TSinkCommitInfo` **inject 进同一 collector 而不提交**；最后只调用一次 `run_iceberg_commit_typed`。需要一个新的「多分支 MERGE executor」：其 `run_coordinated_write` 跑齐所有分支并把结果汇入共享 collector，其 `commit` 只做一次提交（runner 当前是 1 写:1 提交，需要这层多分支封装；collector 与各 commit action 不改）。
 
-**两阶段**：
+**两种提交形态（按 `matched` 动作 × update mode）**：
 
-1. **阶段 A（识别被命中文件，metadata）**：分布式 query 算出命中行的 distinct `_file` = 被替换文件集合，收集路径回 FE（仅元数据，符合不变量）。
-2. **阶段 B（BE 重写，数据面在 BE）**：对被命中文件**整体扫描**，对命中行套更新、未命中行透传，写新文件（`RowLineageData` sink，复用 MOR 的 `build_update_mor_data_sink_query` `mutation_flow.rs:344-389` 形态 + row-lineage 保号）。扫描需 scope 到阶段 A 的文件集合。
-3. **FE commit**：overwrite 提交（replaced = 被命中文件，added = 新文件），沿用现有 commit op kind（`CommitOpKind::CowUpdate` 语义），但 `CowUpdateRewriteSet`（旧→新映射）由阶段 A 的命中文件集合 + 阶段 B 的产出在 coordinator 侧组装为**元数据**，不再来自本地写。
+| MERGE 组合 | 提交形态 | 复用 |
+|---|---|---|
+| matched-DELETE + INSERT | **RowDelta**：BE 写 DV（删除位置）+ BE 写 data（插入行） | §5.1 DV sink + §5.2 扩展后的 `RowDeltaDvFromFiles`（带 data） |
+| matched-UPDATE + INSERT（**MOR 表**） | **RowDelta**：BE 写 DV（旧行位置）+ BE 写 data（更新后新行 + 插入行） | §5.2 MOR-update + DV sink |
+| matched-UPDATE + INSERT（**COW 表**） | **Overwrite**：BE 重写命中文件 + 追加（更新后文件 + 插入文件） | §5.2 COW 分布式重写 |
 
-COW 是最复杂、无参考的一块，作为**独立验证阶段**实现（见 §10）。
+- DELETE 侧（matched-DELETE 位置、MOR matched-UPDATE 旧行位置）：分布式 query（target ⋈ source 的命中行投影 `_file,_pos,<partition>`，按 `_file` shuffle）→ DV sink（BE 写）。多 source 命中同一 target 行产生的重复 `(_file,_pos)` 由 BE 的 `DeletionVector` 去重；MERGE cardinality 仍由 orchestrator 既有 `validate_unique_target_row_ids` 在 coordinator 侧校验。
+- DATA 侧（INSERT 行、matched-UPDATE 新行）：分布式 query → data sink（BE 写）。
+- 全部 inject 进**一个** collector → 一次提交。COW 组合走 Overwrite action（命中文件重写 + 追加）。
 
-### 5.4 已是模板（不改，仅复用）
+**单分支 MERGE（只有 matched 或只有 not-matched）今天已是一次提交、本就原子**，本 phase 主要修「matched + not-matched 同时出现」时的 2-commit 缺陷。
 
-- INSERT/OVERWRITE：`DistributedInsertWriteExecutor`（`iceberg_writer.rs:260-294`）+ `ICEBERG_TABLE_SINK`。
-- v2 position-delete DELETE：`DistributedDeleteWriteExecutor` + `build_delete_position_sink_query` + `ICEBERG_DELETE_SINK`。
-- MOR-UPDATE：`DistributedMorUpdateExecutor`（`mutation_flow.rs:619`），数据侧分布式 + 删除侧 coordinator 物化 match 后 inject（match 物化是 query 结果收集，属元数据收集，符合不变量）。
+### 5.4 equality-delete（Phase 4，新分布式 sink）
+
+`execute_add_equality_delete_statement` 当前从字面量行进程内写 equality-delete 文件（仅 unpartitioned）。改造：字面量行 → 内存 VALUES 源 query → 新 `EqualityDeletes` sink mode → BE 写 → FE commit。逻辑复用现有 `build_equality_delete_batch` + `write_equality_delete_file`，迁入 sink。无并行收益，但统一进分布式模型以满足硬不变量、删本地写。
+
+### 5.5 已是模板（不改，仅复用）
+
+- INSERT/OVERWRITE：`DistributedInsertWriteExecutor` + `ICEBERG_TABLE_SINK`。
+- v2 position-delete DELETE：`DistributedDeleteWriteExecutor` + `ICEBERG_DELETE_SINK`。
+- v3 DV-delete（Phase 1）：`DistributedDvDeleteWriteExecutor` + `DeletionVectors` sink + `RowDeltaDvFromFiles`。
+- MERGE match 物化：`materialize_merge_match` 已是分布式 query（产 `_file,_pos,_row_id` + op-code 投影），原子 MERGE 复用其 join 投影构造各分支 query。
 
 ---
 
-## 6. 删除面（移除本地写后注入）
+## 6. 删除面（移除本地写后注入；按 phase 推进）
 
-切换完成后删除（约 600+ 行，集中在 4 个文件）：
-
-- `local_writer_commit_input`（`write_transaction.rs:209-242`）、`new_local_writer_write_id`（`:205-207`）。
-- `InjectedDeleteGroupExecutor`（`delete_flow.rs:302-336`）+ 手写进程内 scan `scan_for_position_deletes_at` / `scan_for_position_deletes`（`delete_flow.rs:1076-1166`）+ 进程内可见性扫描 `load_existing_delete_visibility_by_data_file_at`（DV 路径专用部分）。
-- `MutationWriteExecutor` + 全部 COW 助手：`run_cow_update_write`、`write_cow_update_files`、`build_cow_rewrite_batches`、`CowRewriteFile/Accumulator`、`build_cow_rewrite_set`、`load_data_file_lineage` 等（`mutation_flow.rs:776-905, 1205-1473+`）。
-- `equality_delete_flow.rs` 的本地写路径（`EqualityDeleteWriteExecutor` 等；逻辑迁入 sink）。
-- `has_preloaded_commit_output` trait 方法（`write_transaction.rs:105-107`）及 runner 门控分支（`:302-306`）——所有 override 者删除后即可移除。
+- Phase 1（已完成）：v3-DV 本地 scan/inject（`scan_for_position_deletes_at`、`InjectedDeleteGroupExecutor` 等）已删。
+- Phase 2：`MutationWriteExecutor::run_cow_update_write` + 全部 COW 助手（`write_cow_update_files`/`build_cow_rewrite_batches`/`build_cow_rewrite_set`/`load_data_file_lineage` 等）；MOR-update 的 FE-inject DV 路径。
+- Phase 3：MERGE matched 分支的 `MutationWritePlan::MergeMatchedDelete` 本地 arm 等。
+- Phase 4：`equality_delete_flow.rs` 本地写路径。
+- 收口（Phase 5）：`local_writer_commit_input` / `new_local_writer_write_id`（`write_transaction.rs:205-242`）、`has_preloaded_commit_output` trait 方法（`:105-107`）及 runner 门控分支（`:302-306`）——所有 override 者删完后移除。
 
 ---
 
 ## 7. 明确保留 / 范围外
 
-- **保留**（与 MV/IMV refresh + compaction 共用，禁删）：`IcebergCommitCollector::inject_delete_group` / `inject_written_file`（`collector.rs:142,217`）；`run_select_to_chunks*`（CTAS/compaction 用，`iceberg_writer.rs:1092-1149`）；`data_file_to_written_file`、`written_file_to_sink_commit_info`、`data_writer` 本地写函数（compaction/CTAS 用）。
+- **保留**（与 MV/IMV refresh + compaction 共用，禁删）：`IcebergCommitCollector::inject_delete_group` / `inject_written_file`（注入 API 本身保留；只让 DML executor 停止以**本地**方式调用）；`run_select_to_chunks*`、`data_file_to_written_file`、`data_writer` 本地写函数（CTAS/compaction 用）。
 - **范围外**：CTAS、compaction 仍本地写；IMV refresh 仍中心化 DV apply（其迁移见 §11）。
-- 删除时只让**本 4 条 DML executor** 停止调用 inject_* / 本地写，不动这些共享 API 本身。
+- 注：MOR-update 的 DV 侧此前列为「已分布式」，实为 **FE-inject 中心化写 DV、违反不变量**——本设计已将其纳入 §5.2 Phase 2 修复，不再属范围外。
 
 ---
 
 ## 8. 正确性与错误处理
 
-- **snapshot pin**：base snapshot 规划期冻结；BE 读旧 DV / 重写文件均基于此；commit 期 `validateFromSnapshot` + `validateDataFilesExist` + 冲突过滤（对照 StarRocks `commitDeleteOperation`）。
-- **写时读快照一致性**（Option 2 新引入）：BE 在写 DV 时读旧 DV，必须读 pinned snapshot 视图，不受并发 commit 影响。
-- **timeout / cancel / writer failure / commit unknown**：沿用现有 `IcebergWriteTransactionRunner` 状态机（Preparing→Committing→Finalizing→Finalized + abort/failure 分支），不新增终态。
-- **abort/cleanup**：BE 写出的 staged DV/equality/数据文件在失败时按现有 abort cleanup 清理（`build_abort_cleanup_for_catalog_entry`）。
-- **per-file 独占失效保护**：若 shuffle 未能保证独占（理论上不应发生），commit 期需检测同一 data file 多个 DV 输入并 fail-fast（防止静默错误）。
+- **MERGE 原子性**：一条 MERGE 一个 snapshot；整体对**同一** base snapshot 做 OCC（`RefSnapshotIdMatch`/`SchemaIdMatch`/`SpecIdMatch`）；崩溃不留半成品。`validate_unique_target_row_ids` 仍在 coordinator 侧保证 at-most-one-match。
+- **snapshot pin**：base snapshot 规划期冻结；BE 读旧 DV / 重写文件均基于此；commit 期冲突检测。
+- **写时读快照一致性**：BE 写 DV/重写文件时读旧状态，必须读 pinned snapshot 视图，不受并发 commit 影响。
+- **统一状态机**：timeout / cancel / writer failure / commit unknown 沿用 `IcebergWriteTransactionRunner` 现有终态，不新增。
+- **abort/cleanup**：BE 写出的 staged 文件失败时按 `build_abort_cleanup_for_catalog_entry` 清理。
+- **per-file 独占失效保护**：commit 期检测同一 data file 多个 DV 输入并 fail-fast。
 
 ---
 
-## 9. 测试与验收
+## 9. 测试与验收（每 phase 的合并门）
 
-每条 op 必须满足（作为该 op 阶段的合并门）：
-
-1. **byte-identical 等价**：切换前/后对同一输入产出等价结果（行集 + 落盘 content type/format），覆盖 `sql-tests/iceberg-dml/`（DV delete、cow update、merge matched-delete、equality-delete schema-evolution 等既有用例）。
-2. **多 BE 正确**：`--cluster-mode cross-process --cluster-size 2`（1FE+2BE）下结果与 all-in-one 一致；DV per-file shuffle 在跨 BE 下产出单一正确合并 DV。
-3. **守卫测试**：新增 plan-shape/执行守卫，断言该 op **不再**走本地路径（对照现有 `overwrite_path_uses_distributed_writer_not_local_collect`、`append_executor_does_not_use_synthetic_commit_input`，`iceberg_writer.rs:1252-1300`）。
-4. **跨引擎 compat**：DV/equality 结果可被 Spark / FE 读（`sql-tests/iceberg-compatibility`、`iceberg-rest`）。
-5. **FE 零数据 I/O 断言**：测试/审查确认 FE 角色在这些 op 中不写 DV/数据/删除文件（只写 metadata）。
+1. **逻辑等价**：切换前/后同一输入产出等价行集；standalone UPDATE/DELETE 落盘形态亦等价。覆盖 `sql-tests/iceberg-dml/`。
+2. **多 BE 正确**：`--cluster-mode cross-process --cluster-size 2` 与 all-in-one 一致。
+3. **MERGE 原子性**：一条带 matched + not-matched 的 MERGE 只产生**一个**新 snapshot（断言 commit 后 snapshot 计数 +1）；并新增首个 `WHEN MATCHED THEN DELETE` 用例。
+4. **守卫测试**：源自省/plan-shape 断言该 op 不再走本地路径（对照 `overwrite_path_uses_distributed_writer_not_local_collect`）。
+5. **FE 零数据 I/O**：审查/断言 FE 不写 data/DV/delete/equality 文件。
+6. **跨引擎 compat**：Spark / FE 可读（`iceberg-compatibility`、`iceberg-rest`）。
 
 ---
 
 ## 10. 实施阶段（rollout）
 
-用户选定「big-bang」（最终一份统一交付），但写路径正确性敏感，故**实现按 op 分阶段、每阶段过 §9 验证门**；建议**按阶段合并**而非单个巨型 diff（最终合并策略在 writing-plans 决定）。推荐顺序（难度递增）：
+按 op 分阶段、每阶段过 §9 验证门、**按阶段独立合并**（Phase 1 已如此合入 #323）。顺序（已据「MERGE 尊重 `write.update.mode`」调整——分布式 COW 是 MERGE 的依赖，故 UPDATE 在 MERGE 之前）：
 
-1. **DV sink 基建 + DV-delete**：新 `DeletionVectors` sink mode + per-file shuffle + BE DV writer + thrift/collector 往返 + from-files commit。（核心、最高风险）
-2. **MERGE matched-delete**：复用 DV sink + op-code 路由 row-delta sink 的原子提交。
-3. **equality-delete**：新 sink mode + VALUES 源。
-4. **COW-update**：两阶段分布式重写（独立验证）。
-5. **删除面收口**：移除 §6 全部本地代码 + `has_preloaded_commit_output` + 门控；补守卫测试。
+1. **DV-delete**（DV sink + per-`_file` shuffle + `RowDeltaDvFromFiles`）。✅ 已完成（#323）。
+2. **分布式 UPDATE**：COW 整文件重写分布式化（删本地 COW 写）+ MOR-update 的 DV 侧移到 BE 写 + 扩展 `RowDeltaDvFromFiles` 接受 data 文件。是 standalone UPDATE 与 MERGE 的共同依赖。
+3. **原子分布式 MERGE**：复用 Phase 1 DV + Phase 2 COW/MOR + data sink；多分支汇入一个 collector、一次提交；尊重 `write.update.mode`（两种提交形态）；含 atomicity 与 matched-delete 回归用例。
+4. **equality-delete**：新 `EqualityDeletes` sink + VALUES 源。
+5. **删除面收口**：移除 §6 收口项 + `has_preloaded_commit_output` + 门控；补守卫测试。
 
 ---
 
-## 11. 后续复用（验证 Option 2 的长期价值）
+## 11. 后续复用
 
-本次建出的「按 data-file 分片的 BE 端 DV writer」是让以下三者也满足硬不变量的同一块基建（均后续单独迁移）：
+Phase 1 的「按 data-file 分片的 BE 端 DV writer」+ Phase 2 扩展后的 `RowDeltaDvFromFiles`（带 data）是让以下也满足硬不变量的同一块基建（后续单独迁移）：
 
 - IMV refresh 删除侧 apply（当前中心化写 DV）。
 - IV3-4：v2 position-delete → DV 迁移。
@@ -183,11 +195,12 @@ COW 是最复杂、无参考的一块，作为**独立验证阶段**实现（见
 
 ## 12. 风险与待解问题
 
-1. **DV from-files commit 的 carry-forward 校验**：`RowDeltaDvCommit` 现含「未触及的 live delete 条目 forward 为 Existing」与「拒绝非 Puffin」的逻辑（`row_delta_dv.rs:589-630`）；from-files 变体需保留这些与「写」无关的不变量，仅去掉中心化「构建+合并+写」。需逐行确认拆分边界。
-2. **caching delete loader 上写路径可用性**：当前 `caching_delete_file_loader.rs` 为读侧；BE 写 DV 时复用它读旧 DV 需确认其在 sink operator 上下文可用、且绑定 pinned snapshot。
-3. **MERGE 原子多 sink**：op-code 路由的 row-delta sink（DV + data 两子 sink，一次 RowDelta 提交）是新机制，需确认 collector 能同时收集两类 writer 结果并原子提交。
-4. **COW 阶段 A→B 的文件集合 scope**：阶段 B 扫描需精确 scope 到被命中文件；需确认 scan 能按 `_file ∈ set` 裁剪而不退化为全表扫。
-5. **all-in-one 新依赖**：切到分布式后每条 DML 依赖 `ensure_standalone_exchange_server`（`mod.rs:3411-3415`），本地路径原先不需要——需确认 all-in-one 启动路径已就绪。
+1. **`RowDeltaDvFromFiles` 带 data 扩展**：需把 written 按 `content` 拆成 DV 子集 + data 子集，data 走 `write_added_data_manifest` 并正确计 `added_data_records` / row-lineage 保号（移植自 `RowDeltaDvCommit`）。
+2. **多分支 MERGE executor**：runner/`commit_write_input` 当前 1 写:1 提交；需一层多分支封装把「各分支 inject」与「一次提交」拆开。collector、commit action、`run_iceberg_commit_typed` 不改。
+3. **COW 阶段 A→B 文件集合 scope**：阶段 B 扫描需精确 scope 到命中文件，不退化为全表扫。
+4. **MERGE-update COW 表 = Overwrite，matched-delete = RowDelta**：同一 MERGE 入口需按 `(matched 动作, update mode)` 选对 commit action；二者不在同一条 MERGE 内混用（matched 互斥），但入口分派要清晰。
+5. **写时读旧状态**：BE 读 pinned snapshot 的 DV / 命中文件，需确认 sink operator 上下文可构造 read-view（Phase 1 `read_existing_dv_positions` 已验证可行，COW 重写读侧同理）。
+6. **all-in-one 新依赖**：分布式路径依赖 `ensure_standalone_exchange_server`，确认 all-in-one 启动已就绪（Phase 1 已验证）。
 
 ---
 
@@ -195,9 +208,10 @@ COW 是最复杂、无参考的一块，作为**独立验证阶段**实现（见
 
 每个阶段 PR 开始前：
 
-1. 本 PR 改的是 sink mode / shuffle / BE writer / commit-from-files / 删除面 哪一层？
-2. 是否有任何 BE 直接提交 Iceberg metadata？是否有 **FE 写 DV/数据/删除文件**（违反硬不变量）？
-3. writer 输出是否足够让 FE 唯一 commit（files、referenced_data_file、content_offset/size、stats、snapshot guard）？
-4. byte-identical 等价 + 1FE+2BE + 守卫测试 是否齐？
-5. 是否仅让本 op 停用 inject_*/本地写，而未误删共享 API？
-6. timeout/cancel/writer failure/commit unknown 是否仍由统一状态机覆盖？
+1. 本 PR 改的是 sink mode / shuffle / BE writer / commit-from-files / COW 重写 / MERGE 装配 / 删除面 哪一层？
+2. 是否有任何 BE 直接提交 Iceberg metadata？是否有 **FE 写 data/DV/delete/equality 文件**（违反硬不变量）？
+3. （MERGE）一条带 matched + not-matched 的语句是否只产生**一个** snapshot？
+4. writer 输出是否足够让 FE 唯一 commit（files、referenced_data_file、content_offset/size、stats、snapshot guard）？
+5. 逻辑等价 + 1FE+2BE + 守卫测试 是否齐？
+6. 是否仅让本 op 停用本地写，而未误删共享 inject API / CTAS-compaction 用的本地写函数？
+7. timeout/cancel/writer failure/commit unknown 是否仍由统一状态机覆盖？
