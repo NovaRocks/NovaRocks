@@ -454,6 +454,9 @@ pub(crate) fn written_file_to_sink_commit_info(
         key_metadata: file.key_metadata.clone(),
         partition_values_descriptor: Some(partition_values_descriptor),
         partition_spec_id: Some(file.partition_spec_id),
+        content_offset: None,
+        content_size_in_bytes: None,
+        cardinality: None,
     };
     Ok(crate::types::TSinkCommitInfo {
         iceberg_data_file: Some(data_file),
@@ -629,6 +632,9 @@ fn data_file_to_iceberg_thrift_with_descriptor_spec(
         key_metadata: df.key_metadata().map(|k| k.to_vec()),
         partition_values_descriptor: Some(partition_values_descriptor),
         partition_spec_id: Some(partition_spec_id),
+        content_offset: None,
+        content_size_in_bytes: None,
+        cardinality: None,
     })
 }
 

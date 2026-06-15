@@ -615,6 +615,11 @@ struct TIcebergDataFile {
     13: optional binary key_metadata;
     14: optional i32 partition_spec_id;
     15: optional TIcebergPartitionDescriptor partition_values_descriptor;
+    // Puffin deletion-vector carriage (BE writer -> FE coordinator). Optional =>
+    // backward-compatible for the FE-compatible path and for Parquet files.
+    16: optional i64 content_offset;
+    17: optional i64 content_size_in_bytes;
+    18: optional i64 cardinality;
 }
 
 struct THiveFileInfo {

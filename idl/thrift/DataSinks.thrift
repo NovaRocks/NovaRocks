@@ -60,7 +60,8 @@ enum TDataSinkType {
     MULTI_OLAP_TABLE_SINK,
     SPLIT_DATA_STREAM_SINK,
     NOOP_SINK,
-    ICEBERG_DELETE_SINK
+    ICEBERG_DELETE_SINK,
+    ICEBERG_DV_SINK
 }
 
 enum TResultSinkType {
