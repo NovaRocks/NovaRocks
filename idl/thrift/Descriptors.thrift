@@ -627,6 +627,11 @@ struct TIcebergTable {
     // JSON-serialized Iceberg table metadata. Standalone write sinks use this
     // to preserve historical partition specs for row-level delete files.
     10: optional string serialized_metadata
+
+    // Snapshot id that the descriptor is planned against. For branch-targeted
+    // Iceberg writes this may differ from TableMetadata.current_snapshot_id,
+    // which must remain tied to the main ref in iceberg-rust.
+    11: optional i64 current_snapshot_id
 }
 
 struct THudiTable {

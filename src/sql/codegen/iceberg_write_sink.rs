@@ -47,6 +47,22 @@ pub(crate) fn synthetic_iceberg_write_table_id() -> i64 {
 }
 
 impl IcebergWriteSinkSpec {
+    pub(crate) fn set_planned_snapshot_id(
+        &mut self,
+        planned_snapshot_id: Option<i64>,
+    ) -> Result<(), String> {
+        self.iceberg.current_snapshot_id = planned_snapshot_id;
+        match &mut self.target_table.source {
+            crate::sql::catalog::ScanSource::IcebergDataFiles { table, .. } => {
+                table.current_snapshot_id = planned_snapshot_id;
+                Ok(())
+            }
+            other => Err(format!(
+                "iceberg write sink expected IcebergDataFiles target source, got {other:?}"
+            )),
+        }
+    }
+
     pub(crate) fn build_sink(&self, tuple_id: i32) -> data_sinks::TDataSink {
         data_sinks::TDataSink::new(
             self.mode.data_sink_type(),
@@ -479,6 +495,32 @@ mod tests {
         spec.mode = IcebergWriteSinkMode::DeletionVectors;
         let sink = spec.build_sink(0);
         assert_eq!(sink.type_, data_sinks::TDataSinkType::ICEBERG_DV_SINK);
+    }
+
+    #[test]
+    fn planned_snapshot_id_updates_sink_spec_and_target_source() {
+        let mut spec = test_support::simple_sink_spec();
+
+        spec.set_planned_snapshot_id(Some(42))
+            .expect("set planned snapshot");
+
+        assert_eq!(spec.iceberg.current_snapshot_id, Some(42));
+        let crate::sql::catalog::ScanSource::IcebergDataFiles { table, .. } =
+            &spec.target_table.source
+        else {
+            panic!("expected IcebergDataFiles source");
+        };
+        assert_eq!(table.current_snapshot_id, Some(42));
+
+        spec.set_planned_snapshot_id(None)
+            .expect("clear planned snapshot");
+        assert_eq!(spec.iceberg.current_snapshot_id, None);
+        let crate::sql::catalog::ScanSource::IcebergDataFiles { table, .. } =
+            &spec.target_table.source
+        else {
+            panic!("expected IcebergDataFiles source");
+        };
+        assert_eq!(table.current_snapshot_id, None);
     }
 
     #[test]

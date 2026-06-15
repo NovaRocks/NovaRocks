@@ -109,6 +109,7 @@ struct IcebergSinkPlan {
     data_location: String,
     target_partition_spec_id: i32,
     target_table_metadata: Option<iceberg::spec::TableMetadata>,
+    target_snapshot_id: Option<i64>,
     position_delete_data_file_partitions: HashMap<String, PositionDeleteDataFilePartition>,
     object_store_s3: Option<S3StoreConfig>,
     file_format: String,
@@ -220,10 +221,12 @@ impl IcebergTableSinkFactory {
         let target_partition_spec_id = sink.target_partition_spec_id.unwrap_or(0);
         let object_store_s3 = resolve_sink_s3_config(&sink, &data_location)?;
         let target_table_metadata = parse_position_delete_target_metadata(&iceberg_table, mode)?;
+        let target_snapshot_id = iceberg_table.current_snapshot_id;
         let position_delete_data_file_partitions =
             if let Some(metadata) = target_table_metadata.as_ref() {
                 build_position_delete_data_file_partition_index(
                     metadata,
+                    target_snapshot_id,
                     &table_location,
                     object_store_s3.as_ref(),
                 )?
@@ -247,6 +250,7 @@ impl IcebergTableSinkFactory {
             data_location,
             target_partition_spec_id,
             target_table_metadata,
+            target_snapshot_id,
             position_delete_data_file_partitions,
             object_store_s3,
             file_format,
@@ -358,14 +362,18 @@ fn parse_position_delete_target_metadata(
 
 fn build_position_delete_data_file_partition_index(
     metadata: &iceberg::spec::TableMetadata,
+    target_snapshot_id: Option<i64>,
     table_location: &str,
     s3_config: Option<&S3StoreConfig>,
 ) -> Result<HashMap<String, PositionDeleteDataFilePartition>, String> {
     use iceberg::spec::{DataContentType, ManifestContentType, ManifestStatus};
 
-    let Some(snapshot) = metadata.current_snapshot() else {
+    let Some(snapshot_id) = delete_target_snapshot_id(metadata, target_snapshot_id) else {
         return Ok(HashMap::new());
     };
+    let snapshot = metadata.snapshot_by_id(snapshot_id).ok_or_else(|| {
+        format!("iceberg delete sink target snapshot id {snapshot_id} not found in table metadata")
+    })?;
     let file_io = build_staged_file_io(table_location, s3_config)?;
     data_block_on(async {
         let manifest_list = snapshot
@@ -404,6 +412,13 @@ fn build_position_delete_data_file_partition_index(
         }
         Ok(index)
     })?
+}
+
+fn delete_target_snapshot_id(
+    metadata: &iceberg::spec::TableMetadata,
+    target_snapshot_id: Option<i64>,
+) -> Option<i64> {
+    target_snapshot_id.or_else(|| metadata.current_snapshot_id())
 }
 
 fn insert_position_delete_data_file_partition(
@@ -1037,7 +1052,8 @@ impl IcebergTableSinkBackend {
         file_io: &iceberg::io::FileIO,
         owned_files: impl IntoIterator<Item = &'a str>,
     ) -> Result<HashMap<String, crate::connector::iceberg::commit::DeletionVector>, String> {
-        let Some(snapshot_id) = metadata.current_snapshot_id() else {
+        let Some(snapshot_id) = delete_target_snapshot_id(metadata, self.plan.target_snapshot_id)
+        else {
             return Ok(HashMap::new());
         };
         let object_store_cfg = self
@@ -2981,6 +2997,7 @@ mod tests {
                 data_location: "file:///tmp/novarocks-iceberg-sink-test/data".to_string(),
                 target_partition_spec_id: 0,
                 target_table_metadata: None,
+                target_snapshot_id: None,
                 position_delete_data_file_partitions: HashMap::new(),
                 object_store_s3: None,
                 file_format: "parquet".to_string(),
@@ -3027,6 +3044,20 @@ mod tests {
         table_location: &str,
         metadata: &iceberg::spec::TableMetadata,
     ) -> crate::descriptors::TDescriptorTable {
+        test_partitioned_desc_table_with_metadata_and_snapshot_id(
+            table_id,
+            table_location,
+            metadata,
+            None,
+        )
+    }
+
+    fn test_partitioned_desc_table_with_metadata_and_snapshot_id(
+        table_id: i64,
+        table_location: &str,
+        metadata: &iceberg::spec::TableMetadata,
+        current_snapshot_id: Option<i64>,
+    ) -> crate::descriptors::TDescriptorTable {
         let int_type =
             crate::lower::type_lowering::scalar_type_desc(crate::types::TPrimitiveType::INT);
         let partition_expr =
@@ -3047,6 +3078,7 @@ mod tests {
             )]),
             None::<crate::descriptors::TSortOrder>,
             Some(serde_json::to_string(metadata).expect("serialize metadata")),
+            current_snapshot_id,
         );
         let table = crate::descriptors::TTableDescriptor::new(
             table_id,
@@ -3193,6 +3225,107 @@ mod tests {
         assert!(factory.plan.target_table_metadata.is_some());
     }
 
+    #[test]
+    fn delete_target_snapshot_id_prefers_explicit_descriptor_snapshot() {
+        let table_location = "file:///warehouse/dv-explicit-snapshot";
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "42".to_string(),
+            )])),
+        ]));
+        let metadata =
+            test_identity_partition_metadata(table_location, table_location, target_schema, 7);
+
+        assert_eq!(
+            super::delete_target_snapshot_id(&metadata, Some(101)),
+            Some(101)
+        );
+        assert_eq!(
+            super::delete_target_snapshot_id(&metadata, None),
+            metadata.current_snapshot_id()
+        );
+    }
+
+    #[test]
+    fn delete_like_sinks_wire_explicit_snapshot_selection_into_call_sites() {
+        let source = include_str!("sink.rs");
+        let partition_index = source
+            .split("fn build_position_delete_data_file_partition_index")
+            .nth(1)
+            .expect("partition index helper")
+            .split("fn delete_target_snapshot_id")
+            .next()
+            .expect("partition index helper body");
+        assert!(
+            partition_index.contains("delete_target_snapshot_id(metadata, target_snapshot_id)"),
+            "partition index builder must select the descriptor target snapshot"
+        );
+        assert!(
+            !partition_index.contains("metadata.current_snapshot()"),
+            "partition index builder must not use metadata current snapshot directly"
+        );
+
+        let dv_reader = source
+            .split("fn read_existing_dv_positions")
+            .nth(1)
+            .expect("DV reader")
+            .split("fn referenced_data_file_partition_report")
+            .next()
+            .expect("DV reader body");
+        assert!(
+            dv_reader.contains("delete_target_snapshot_id(metadata, self.plan.target_snapshot_id)"),
+            "DV reader must select the descriptor target snapshot"
+        );
+        assert!(
+            !dv_reader.contains("metadata.current_snapshot_id()"),
+            "DV reader must not use metadata current snapshot id directly"
+        );
+    }
+
+    #[test]
+    fn iceberg_table_sink_factory_carries_descriptor_snapshot_id_into_plan() {
+        let table_id = 101;
+        let table_location = "file:///warehouse/sink-plan-snapshot";
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "42".to_string(),
+            )])),
+        ]));
+        let metadata =
+            test_identity_partition_metadata(table_location, table_location, target_schema, 7);
+        let desc_tbl = test_partitioned_desc_table_with_metadata_and_snapshot_id(
+            table_id,
+            table_location,
+            &metadata,
+            Some(101),
+        );
+        let sink = test_iceberg_table_sink(table_id, table_location);
+        let layout = Layout {
+            order: Vec::new(),
+            index: HashMap::new(),
+        };
+        let int_type =
+            crate::lower::type_lowering::scalar_type_desc(crate::types::TPrimitiveType::INT);
+        let output_exprs = vec![crate::sql::codegen::expr_compiler::build_slot_ref_texpr(
+            3, 1, int_type,
+        )];
+
+        let factory = IcebergTableSinkFactory::try_new(
+            sink,
+            IcebergSinkMode::Data,
+            &output_exprs,
+            &layout,
+            &desc_tbl,
+            None,
+            None,
+        )
+        .expect("iceberg sink factory");
+
+        assert_eq!(factory.plan.target_snapshot_id, Some(101));
+    }
+
     #[tokio::test]
     async fn data_sink_plan_builds_staged_context_with_fe_metadata() {
         let dir = tempfile::Builder::new()
@@ -3213,6 +3346,7 @@ mod tests {
             data_location: data_location.clone(),
             target_partition_spec_id: 7,
             target_table_metadata: None,
+            target_snapshot_id: None,
             position_delete_data_file_partitions: HashMap::new(),
             object_store_s3: None,
             file_format: "parquet".to_string(),
@@ -3307,6 +3441,7 @@ mod tests {
             data_location: data_location.clone(),
             target_partition_spec_id: 0,
             target_table_metadata: None,
+            target_snapshot_id: None,
             position_delete_data_file_partitions: HashMap::new(),
             object_store_s3: None,
             file_format: "parquet".to_string(),
@@ -3390,6 +3525,7 @@ mod tests {
             data_location: data_location.to_string(),
             target_partition_spec_id: partition_spec_id,
             target_table_metadata: None,
+            target_snapshot_id: None,
             position_delete_data_file_partitions: HashMap::new(),
             object_store_s3: None,
             file_format: "parquet".to_string(),
@@ -3515,6 +3651,7 @@ mod tests {
             data_location: data_location.clone(),
             target_partition_spec_id: 7,
             target_table_metadata: Some(target_metadata.clone()),
+            target_snapshot_id: None,
             position_delete_data_file_partitions: referenced_partitions,
             object_store_s3: None,
             file_format: "parquet".to_string(),
@@ -3659,6 +3796,7 @@ mod tests {
             data_location,
             target_partition_spec_id: new_spec_id,
             target_table_metadata: Some(target_metadata.clone()),
+            target_snapshot_id: None,
             position_delete_data_file_partitions: referenced_partitions,
             object_store_s3: None,
             file_format: "parquet".to_string(),
@@ -3800,6 +3938,7 @@ mod tests {
             data_location,
             target_partition_spec_id: 7,
             target_table_metadata: Some(target_metadata.clone()),
+            target_snapshot_id: None,
             position_delete_data_file_partitions: referenced_partitions,
             object_store_s3: None,
             file_format: "parquet".to_string(),

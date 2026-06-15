@@ -222,6 +222,7 @@ impl DescriptorTableBuilder {
             include_serialized_metadata
                 .then(|| iceberg.serialized_metadata.clone())
                 .flatten(),
+            iceberg.current_snapshot_id,
         );
         self.tables.push(descriptors::TTableDescriptor::new(
             table_id,
