@@ -274,6 +274,14 @@ fn build_update_mor_distributed_write(
     // The old-row deletions are written by the BE as deletion vectors. Build a
     // DeletionVectors-mode sink pinned to the base snapshot, mirroring the
     // Phase-1 DV DELETE path.
+    //
+    // This snapshot is derived from this builder's own `load_table` above,
+    // whereas `execute_mor_update` derives the collector/transaction base
+    // snapshot from the caller's already-loaded `table`. Under the single-writer
+    // assumption both loads observe the same current snapshot, so the DV sink's
+    // planned snapshot and the commit base snapshot must agree; if a concurrent
+    // writer ever breaks that, the commit's base-snapshot conflict check fails
+    // fast rather than committing against a stale base.
     let base_snapshot_id = if target_ref != "main" {
         crate::engine::delete_flow::resolve_branch_head_snapshot_id(table.metadata(), target_ref)?
     } else {
@@ -355,6 +363,11 @@ fn build_merge_mor_distributed_write(
     )?;
     // MERGE matched-UPDATE is `main`-only; pin the DV sink to the current
     // snapshot so the BE writes deletion vectors for the matched old rows.
+    // This snapshot is derived from this builder's own `load_table` above;
+    // `execute_mor_update` derives the commit base snapshot from the caller's
+    // loaded `table`. Under the single-writer assumption both observe the same
+    // current snapshot and must agree (the commit's base-snapshot check fails
+    // fast otherwise).
     let base_snapshot_id = table.metadata().current_snapshot().map(|s| s.snapshot_id());
     let mut dv_sink_spec = crate::engine::iceberg_writer::build_position_delete_sink_spec(
         target, &resolved, &table, &entry,
@@ -482,6 +495,16 @@ fn build_merge_mor_dv_sink_query_from_matched(
             "MERGE MOR UPDATE matched identity count mismatch: file_paths={}, row_positions={}, row_ids={}",
             matched.file_paths.len(),
             matched.row_positions.len(),
+            matched.row_ids.len()
+        ));
+    }
+    // Partition source values are read positionally from `old_rows`, so its row
+    // count must match the matched identities (mirrors the data sink's
+    // `new_rows.num_rows()` guard).
+    if matched.old_rows.num_rows() != matched.row_ids.len() {
+        return Err(format!(
+            "MERGE MOR UPDATE matched old-row count mismatch: old_rows={}, row_ids={}",
+            matched.old_rows.num_rows(),
             matched.row_ids.len()
         ));
     }
@@ -842,6 +865,22 @@ impl IcebergWriteTransactionExecutor for DistributedMorUpdateExecutor {
             None,
             Some(crate::engine::iceberg_write_shuffle_by_output_index(0)),
         )?;
+        // The matched set is already known non-empty (the data guard above
+        // enforced it), so a file-less but non-aborted DV result is a real bug:
+        // without it `merge_write_commits` would return the replacement data
+        // files with `write_abort=None` and the transaction would commit the
+        // new rows WITHOUT the old-row deletion vectors (old+new rows both
+        // live). Fail fast instead of silently half-committing.
+        if dv.write_abort.is_none()
+            && dv
+                .write_commit
+                .as_ref()
+                .is_none_or(|commit| !write_commit_has_files(commit))
+        {
+            return Err(
+                "MOR UPDATE distributed DV sink produced no deletion-vector files".to_string(),
+            );
+        }
         // Both sets of sink_commit_infos flow into one collector → one commit:
         // data files committed as content=Data, DV files as Puffin DVs.
         Ok(merge_write_commits(data, dv))
@@ -870,12 +909,28 @@ fn merge_write_commits(
     dv: CoordinatedQueryResult,
 ) -> CoordinatedQueryResult {
     let write_abort = data.write_abort.or(dv.write_abort);
+    // Invariant on the success path: both halves are present. The data-side
+    // guard ("produced no replacement data files") and the DV-side guard
+    // ("produced no deletion-vector files") in `run_coordinated_write` reject
+    // a file-less, non-aborted result before we get here, so `(Some, None)`
+    // (data files but no DV) is unreachable without a `write_abort`. The
+    // residual single-sided arms can therefore only occur on an aborted write
+    // (where `write_abort` is set and the partial commit is discarded by the
+    // transaction runner); keep them explicit so the invariant is documented
+    // rather than silently papered over.
     let write_commit = match (data.write_commit, dv.write_commit) {
         (Some(mut data_commit), Some(dv_commit)) => {
             data_commit.writers.extend(dv_commit.writers);
             Some(data_commit)
         }
-        (Some(commit), None) | (None, Some(commit)) => Some(commit),
+        (Some(commit), None) | (None, Some(commit)) => {
+            debug_assert!(
+                write_abort.is_some(),
+                "merge_write_commits saw a single-sided MOR UPDATE commit without an abort; \
+                 the data/DV produced-no-files guards should make this unreachable on success",
+            );
+            Some(commit)
+        }
         (None, None) => None,
     };
     CoordinatedQueryResult {
@@ -2874,10 +2929,14 @@ mod tests {
             arrow::datatypes::Field::new("id", DataType::Int64, true),
             arrow::datatypes::Field::new("v", DataType::Int64, true),
         ]));
+        // Distinctive partition value (42) so we can assert it flows from
+        // old_rows into the generated VALUES rather than from any other field
+        // (row_ids=7, row_positions=3, file path). `v` is not a partition
+        // source column so its value (55) must not leak into the projection.
         let old_rows = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
-                Arc::new(arrow::array::Int64Array::from(vec![5])) as ArrayRef,
+                Arc::new(arrow::array::Int64Array::from(vec![42])) as ArrayRef,
                 Arc::new(arrow::array::Int64Array::from(vec![55])) as ArrayRef,
             ],
         )
@@ -2902,6 +2961,17 @@ mod tests {
         assert!(sql.contains("AS `_file`"), "{sql}");
         assert!(sql.contains("AS `_pos`"), "{sql}");
         assert!(sql.contains("AS `id`"), "{sql}");
+        // The partition value must come from old_rows: the distinctive literal
+        // 42 appears in the VALUES, while the non-partition `v` value 55 does
+        // not leak into the generated SQL.
+        assert!(
+            sql.contains("42"),
+            "partition value must come from old_rows: {sql}"
+        );
+        assert!(
+            !sql.contains("55"),
+            "non-partition column value must not leak: {sql}"
+        );
         assert!(sql.contains("ORDER BY"), "{sql}");
         assert!(!sql.contains("JOIN"), "{sql}");
         assert!(!sql.contains("ice.db1.t"), "{sql}");
