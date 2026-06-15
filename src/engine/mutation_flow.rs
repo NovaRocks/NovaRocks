@@ -29,7 +29,7 @@ use crate::runtime::coordinator::CoordinatedQueryResult;
 use crate::runtime::query_result::QueryResult;
 use crate::runtime::write_coordinator::WriteCommitInput;
 use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
-use crate::sql::codegen::iceberg_write_sink::IcebergWriteSinkSpec;
+use crate::sql::codegen::iceberg_write_sink::{IcebergWriteSinkMode, IcebergWriteSinkSpec};
 use crate::sql::parser::ast::{
     InsertSource, MergeMatchedAction, MergeNotMatchedAction, MergeStmt, ObjectName, OverwriteMode,
     UpdateStmt,
@@ -271,6 +271,19 @@ fn build_update_mor_distributed_write(
     let data_sink_spec = crate::engine::iceberg_writer::build_row_lineage_data_sink_spec(
         target, &resolved, &table, &entry,
     )?;
+    // The old-row deletions are written by the BE as deletion vectors. Build a
+    // DeletionVectors-mode sink pinned to the base snapshot, mirroring the
+    // Phase-1 DV DELETE path.
+    let base_snapshot_id = if target_ref != "main" {
+        crate::engine::delete_flow::resolve_branch_head_snapshot_id(table.metadata(), target_ref)?
+    } else {
+        table.metadata().current_snapshot().map(|s| s.snapshot_id())
+    };
+    let mut dv_sink_spec = crate::engine::iceberg_writer::build_position_delete_sink_spec(
+        target, &resolved, &table, &entry,
+    )?;
+    dv_sink_spec.mode = IcebergWriteSinkMode::DeletionVectors;
+    dv_sink_spec.set_planned_snapshot_id(base_snapshot_id)?;
     let target_alias = stmt.alias.as_deref().unwrap_or("__nr_t");
     let source_sql = mutation_source_to_sql(state, &stmt.source, current_catalog, target)?;
     let where_sql = stmt.where_clause.as_ref().map(|expr| expr.to_string());
@@ -294,9 +307,21 @@ fn build_update_mor_distributed_write(
         target_ref,
         new_sequence_number,
     )?;
+    // The DV SELECT shares the data query's `[FOR VERSION AS OF] [CROSS JOIN
+    // source] WHERE <pred>` tail, so the matched old rows are identical.
+    let dv_query = build_update_dv_sink_query(
+        target,
+        target_alias,
+        source_sql.as_deref(),
+        where_sql.as_deref(),
+        target_ref,
+        &dv_sink_spec.target_columns,
+    )?;
     Ok(MorUpdateDistributedWrite {
         data_query,
         data_sink_spec,
+        dv_query,
+        dv_sink_spec,
     })
 }
 
@@ -328,15 +353,27 @@ fn build_merge_mor_distributed_write(
     let data_sink_spec = crate::engine::iceberg_writer::build_row_lineage_data_sink_spec(
         target, &resolved, &table, &entry,
     )?;
+    // MERGE matched-UPDATE is `main`-only; pin the DV sink to the current
+    // snapshot so the BE writes deletion vectors for the matched old rows.
+    let base_snapshot_id = table.metadata().current_snapshot().map(|s| s.snapshot_id());
+    let mut dv_sink_spec = crate::engine::iceberg_writer::build_position_delete_sink_spec(
+        target, &resolved, &table, &entry,
+    )?;
+    dv_sink_spec.mode = IcebergWriteSinkMode::DeletionVectors;
+    dv_sink_spec.set_planned_snapshot_id(base_snapshot_id)?;
     let new_sequence_number = table.metadata().last_sequence_number() + 1;
     let data_query = build_merge_mor_data_sink_query_from_matched(
         matched_rows,
         target_columns,
         new_sequence_number,
     )?;
+    let dv_query =
+        build_merge_mor_dv_sink_query_from_matched(matched_rows, &dv_sink_spec.target_columns)?;
     Ok(MorUpdateDistributedWrite {
         data_query,
         data_sink_spec,
+        dv_query,
+        dv_sink_spec,
     })
 }
 
@@ -386,6 +423,151 @@ fn build_update_mor_data_sink_query(
         )),
     );
     parse_generated_query(&sql, "MOR UPDATE data sink")
+}
+
+/// Build the DELETE side of a MOR UPDATE as a SELECT of the position-delete
+/// sink's input columns (`_file`, `_pos`, and partition source columns, with
+/// `_file` first) for the matched old rows. Reuses the same target / version /
+/// CROSS JOIN / WHERE tail as the data sink query so both sinks observe an
+/// identical matched set.
+fn build_update_dv_sink_query(
+    target: &crate::engine::backend_resolver::TargetBackend,
+    target_alias: &str,
+    source_sql: Option<&str>,
+    where_sql: Option<&str>,
+    target_ref: &str,
+    dv_sink_columns: &[crate::engine::catalog::ColumnDef],
+) -> Result<sqlparser::ast::Query, String> {
+    let select_items = dv_sink_columns
+        .iter()
+        .map(|column| {
+            format!(
+                "{} AS {}",
+                qualify_column(target_alias, &column.name),
+                sql_identifier(&column.name)
+            )
+        })
+        .collect::<Vec<_>>();
+    let sql = build_update_distributed_select_sql(
+        target,
+        target_alias,
+        source_sql,
+        where_sql,
+        target_ref,
+        select_items,
+        Some(qualify_column(
+            target_alias,
+            crate::connector::iceberg::catalog::backend::ICEBERG_ROW_IDENTITY_FILE_COLUMN,
+        )),
+    );
+    parse_generated_query(&sql, "MOR UPDATE DV sink")
+}
+
+/// Build the DELETE side of a MERGE matched-UPDATE as a VALUES projection of
+/// the position-delete sink's input columns (`_file`, `_pos`, and partition
+/// source columns). The matched old-row identities and partition values are
+/// taken from the already-materialized `matched` batch; the BE turns them into
+/// deletion-vector files keyed by `_file`.
+fn build_merge_mor_dv_sink_query_from_matched(
+    matched: &MatchedUpdateBatch,
+    dv_sink_columns: &[crate::engine::catalog::ColumnDef],
+) -> Result<sqlparser::ast::Query, String> {
+    if matched.row_ids.is_empty() {
+        return Err("MERGE MOR UPDATE DV sink requires at least one matched row".to_string());
+    }
+    if matched.file_paths.len() != matched.row_ids.len()
+        || matched.row_positions.len() != matched.row_ids.len()
+    {
+        return Err(format!(
+            "MERGE MOR UPDATE matched identity count mismatch: file_paths={}, row_positions={}, row_ids={}",
+            matched.file_paths.len(),
+            matched.row_positions.len(),
+            matched.row_ids.len()
+        ));
+    }
+
+    let alias = "__nr_dv";
+    // The first two sink columns are always the row-identity `_file` / `_pos`;
+    // any remaining columns are partition source columns read from old_rows.
+    let file_col = crate::connector::iceberg::catalog::backend::ICEBERG_ROW_IDENTITY_FILE_COLUMN;
+    let pos_col = crate::connector::iceberg::catalog::backend::ICEBERG_ROW_IDENTITY_POS_COLUMN;
+    let partition_columns = &dv_sink_columns[dv_sink_columns
+        .iter()
+        .position(|column| {
+            !column.name.eq_ignore_ascii_case(file_col)
+                && !column.name.eq_ignore_ascii_case(pos_col)
+        })
+        .unwrap_or(dv_sink_columns.len())..];
+
+    let mut rows = Vec::with_capacity(matched.row_ids.len());
+    for row in 0..matched.row_ids.len() {
+        let mut values = Vec::with_capacity(dv_sink_columns.len());
+        values.push(sql_string_literal(&matched.file_paths[row]));
+        values.push(matched.row_positions[row].to_string());
+        for partition_column in partition_columns {
+            let idx = matched
+                .old_rows
+                .schema()
+                .index_of(&partition_column.name)
+                .map_err(|_| {
+                    format!(
+                        "MERGE MOR UPDATE old-row batch missing partition source column `{}`",
+                        partition_column.name
+                    )
+                })?;
+            let literal =
+                crate::engine::sql_expr::literal_from_batch(matched.old_rows.column(idx), row)?;
+            values.push(
+                crate::engine::iceberg_writer::literal_to_sql_for_arrow_type(
+                    &literal,
+                    &partition_column.data_type,
+                )?,
+            );
+        }
+        rows.push(format!("({})", values.join(", ")));
+    }
+
+    let value_columns = dv_sink_columns
+        .iter()
+        .map(|column| sql_identifier(&column.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let values_sql = format!(
+        "(VALUES {}) AS {}({})",
+        rows.join(", "),
+        sql_identifier(alias),
+        value_columns
+    );
+
+    let mut select_items = Vec::with_capacity(dv_sink_columns.len());
+    select_items.push(format!(
+        "CAST({} AS STRING) AS {}",
+        qualify_column(alias, file_col),
+        sql_identifier(file_col)
+    ));
+    select_items.push(format!(
+        "CAST({} AS BIGINT) AS {}",
+        qualify_column(alias, pos_col),
+        sql_identifier(pos_col)
+    ));
+    for partition_column in partition_columns {
+        select_items.push(format!(
+            "{} AS {}",
+            crate::engine::iceberg_writer::target_cast_expr_sql(
+                &qualify_column(alias, &partition_column.name),
+                partition_column,
+            )?,
+            sql_identifier(&partition_column.name)
+        ));
+    }
+
+    let sql = format!(
+        "SELECT {} FROM {} ORDER BY {}",
+        select_items.join(", "),
+        values_sql,
+        qualify_column(alias, file_col)
+    );
+    parse_generated_query(&sql, "MERGE MOR UPDATE DV sink")
 }
 
 fn build_merge_mor_data_sink_query_from_matched(
@@ -576,9 +758,13 @@ fn execute_mor_update(
         metadata.location(),
         uuid::Uuid::new_v4()
     );
+    // The old-row deletions are written as deletion vectors on the BE and
+    // committed together with the BE-written replacement data files in one
+    // RowDeltaDvFromFiles snapshot. The coordinator no longer materializes
+    // positions or pre-loads referenced-file partitions.
     let collector = Arc::new(
         IcebergCommitCollector::new(
-            CommitOpKind::RowDeltaDv,
+            CommitOpKind::RowDeltaDvFromFiles,
             table_ident,
             read_snapshot_id,
             metadata.last_sequence_number(),
@@ -589,13 +775,6 @@ fn execute_mor_update(
         )
         .with_table_metadata(metadata.clone()),
     );
-    let referenced_partitions =
-        crate::engine::delete_flow::load_referenced_data_file_partitions_at(
-            &table,
-            read_snapshot_id,
-        )?;
-    let delete_groups =
-        build_position_delete_groups_from_matched(&matched, &referenced_partitions)?;
     run_mor_update_distributed_transaction(
         state,
         target,
@@ -606,7 +785,6 @@ fn execute_mor_update(
         read_snapshot_id,
         target_ref,
         write,
-        delete_groups,
     )?;
     Ok(StatementResult::Ok)
 }
@@ -614,6 +792,11 @@ fn execute_mor_update(
 struct MorUpdateDistributedWrite {
     data_query: sqlparser::ast::Query,
     data_sink_spec: IcebergWriteSinkSpec,
+    /// SELECT that projects `[_file, _pos, <partition src>]` for the matched
+    /// old rows. The BE writes a deletion-vector (Puffin) file per data file
+    /// through `dv_sink_spec`; the coordinator never materializes positions.
+    dv_query: sqlparser::ast::Query,
+    dv_sink_spec: IcebergWriteSinkSpec,
 }
 
 struct DistributedMorUpdateExecutor {
@@ -628,6 +811,7 @@ impl IcebergWriteTransactionExecutor for DistributedMorUpdateExecutor {
         &self,
         _spec: &IcebergWriteTransactionSpec,
     ) -> Result<CoordinatedQueryResult, String> {
+        // Write the replacement rows (content=Data) on the BE.
         let data = crate::engine::execute_query_as_iceberg_write(
             &self.state,
             Some(&self.target.catalog),
@@ -647,7 +831,20 @@ impl IcebergWriteTransactionExecutor for DistributedMorUpdateExecutor {
                 "MOR UPDATE distributed data sink produced no replacement data files".to_string(),
             );
         }
-        Ok(data)
+        // Write the old-row deletion vectors (content=PositionDeletes/Puffin)
+        // on the BE, shuffled per `_file` so each data file gets one DV writer.
+        let dv = crate::engine::execute_query_as_iceberg_write(
+            &self.state,
+            Some(&self.target.catalog),
+            &self.target.namespace,
+            &self.write.dv_query,
+            self.write.dv_sink_spec.clone(),
+            None,
+            Some(crate::engine::iceberg_write_shuffle_by_output_index(0)),
+        )?;
+        // Both sets of sink_commit_infos flow into one collector → one commit:
+        // data files committed as content=Data, DV files as Puffin DVs.
+        Ok(merge_write_commits(data, dv))
     }
 
     fn commit(
@@ -663,6 +860,31 @@ impl IcebergWriteTransactionExecutor for DistributedMorUpdateExecutor {
     }
 }
 
+/// Merge the two BE writes of a MOR UPDATE (replacement data files + old-row
+/// deletion vectors) into a single coordinated result. The two writers' commit
+/// inputs are concatenated into one `WriteCommitInput` so a single collector
+/// drives one `RowDeltaDvFromFiles` commit. If either side reported a
+/// `write_abort`, that is propagated so the transaction runner can clean up.
+fn merge_write_commits(
+    data: CoordinatedQueryResult,
+    dv: CoordinatedQueryResult,
+) -> CoordinatedQueryResult {
+    let write_abort = data.write_abort.or(dv.write_abort);
+    let write_commit = match (data.write_commit, dv.write_commit) {
+        (Some(mut data_commit), Some(dv_commit)) => {
+            data_commit.writers.extend(dv_commit.writers);
+            Some(data_commit)
+        }
+        (Some(commit), None) | (None, Some(commit)) => Some(commit),
+        (None, None) => None,
+    };
+    CoordinatedQueryResult {
+        query_result: data.query_result,
+        write_commit,
+        write_abort,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_mor_update_distributed_transaction(
     state: &Arc<StandaloneState>,
@@ -674,13 +896,9 @@ fn run_mor_update_distributed_transaction(
     base_snapshot_id: Option<i64>,
     target_ref: &str,
     write: MorUpdateDistributedWrite,
-    delete_groups: Vec<crate::connector::iceberg::commit::PositionDeleteGroup>,
 ) -> Result<(), String> {
     let abort_cleanup =
         crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
-    for group in delete_groups {
-        collector.inject_delete_group(group);
-    }
     let commit_executor = IcebergWriteCommitExecutor {
         state: Arc::clone(state),
         target: target.clone(),
@@ -709,7 +927,7 @@ fn run_mor_update_distributed_transaction(
             uuid::Uuid::new_v4()
         ),
         commit: IcebergWriteCommitPolicy {
-            commit_op_kind: CommitOpKind::RowDeltaDv,
+            commit_op_kind: CommitOpKind::RowDeltaDvFromFiles,
             base_snapshot_id,
             base_snapshot_map: BTreeMap::new(),
             target_ref: target_ref.to_string(),
@@ -2429,6 +2647,53 @@ mod tests {
     }
 
     #[test]
+    fn mor_update_uses_be_dv_sink_not_coordinator_inject() {
+        let source = include_str!("mutation_flow.rs");
+
+        // The MOR-update entry must no longer materialize the old-row
+        // deletions on the coordinator. Both coordinator-local delete helpers
+        // must be gone from `execute_mor_update`.
+        let execute = source
+            .split("fn execute_mor_update")
+            .nth(1)
+            .expect("execute_mor_update fn")
+            .split("\nstruct MorUpdateDistributedWrite")
+            .next()
+            .expect("execute_mor_update body");
+        assert!(
+            !execute.contains("build_position_delete_groups_from_matched"),
+            "execute_mor_update must not build coordinator-local position-delete groups"
+        );
+        assert!(
+            !execute.contains("inject_delete_group"),
+            "execute_mor_update must not inject coordinator-local delete groups"
+        );
+
+        // The MOR-update transaction must commit BE-written DV files via
+        // RowDeltaDvFromFiles and must not fall back to the coordinator-built
+        // RowDeltaDv path. The trailing space avoids matching RowDeltaDvFromFiles.
+        let transaction = source
+            .split("fn run_mor_update_distributed_transaction")
+            .nth(1)
+            .expect("run_mor_update_distributed_transaction fn")
+            .split("\nfn build_position_delete_groups_from_matched")
+            .next()
+            .expect("run_mor_update_distributed_transaction body");
+        assert!(
+            transaction.contains("RowDeltaDvFromFiles"),
+            "MOR-update transaction must commit BE-written Puffin DV files via RowDeltaDvFromFiles"
+        );
+        assert!(
+            !transaction.contains("CommitOpKind::RowDeltaDv "),
+            "MOR-update transaction must not commit via the coordinator-built RowDeltaDv path"
+        );
+        assert!(
+            !transaction.contains("inject_delete_group"),
+            "MOR-update transaction must not inject coordinator-local delete groups"
+        );
+    }
+
+    #[test]
     fn reject_reserved_update_columns() {
         let err = validate_update_assignments(
             &[crate::sql::parser::ast::UpdateAssignment {
@@ -2531,6 +2796,113 @@ mod tests {
         assert!(sql.contains("VALUES"), "{sql}");
         assert!(sql.contains("AS `_row_id`"), "{sql}");
         assert!(sql.contains("_last_updated_sequence_number"), "{sql}");
+        assert!(!sql.contains("JOIN"), "{sql}");
+        assert!(!sql.contains("ice.db1.t"), "{sql}");
+    }
+
+    fn typed_col(name: &str, data_type: DataType) -> ColumnDef {
+        ColumnDef {
+            name: name.to_string(),
+            data_type,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        }
+    }
+
+    fn dv_sink_columns() -> Vec<ColumnDef> {
+        vec![
+            typed_col(
+                crate::connector::iceberg::catalog::backend::ICEBERG_ROW_IDENTITY_FILE_COLUMN,
+                DataType::Utf8,
+            ),
+            typed_col(
+                crate::connector::iceberg::catalog::backend::ICEBERG_ROW_IDENTITY_POS_COLUMN,
+                DataType::Int64,
+            ),
+            typed_col("id", DataType::Int64),
+        ]
+    }
+
+    #[test]
+    fn update_dv_sink_query_projects_file_pos_and_partition_sources() {
+        let query = build_update_dv_sink_query(
+            &iceberg_target(),
+            "t",
+            Some("staging.s AS s"),
+            Some("t.id = s.id"),
+            "main",
+            &dv_sink_columns(),
+        )
+        .expect("query");
+        let sql = query.to_string();
+
+        // Projects the position-delete identity + partition source columns,
+        // all qualified by the target alias, with the same CROSS JOIN / WHERE
+        // tail as the data sink query and ordered by `_file` for the per-file
+        // DV shuffle.
+        assert!(sql.contains("`t`.`_file` AS `_file`"), "{sql}");
+        assert!(sql.contains("`t`.`_pos` AS `_pos`"), "{sql}");
+        assert!(sql.contains("`t`.`id` AS `id`"), "{sql}");
+        assert!(sql.contains("CROSS JOIN staging.s AS s"), "{sql}");
+        assert!(sql.contains("WHERE t.id = s.id"), "{sql}");
+        assert!(sql.contains("ORDER BY `t`.`_file`"), "{sql}");
+        assert!(!sql.contains("FOR VERSION AS OF"), "{sql}");
+    }
+
+    #[test]
+    fn update_dv_sink_query_pins_branch_read_snapshot() {
+        let query = build_update_dv_sink_query(
+            &iceberg_target(),
+            "t",
+            None,
+            Some("t.id = 1"),
+            "dev",
+            &dv_sink_columns(),
+        )
+        .expect("query");
+        let sql = query.to_string();
+        assert!(
+            sql.contains("FOR SYSTEM_TIME AS OF '__nr_ref:dev'"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn merge_mor_dv_sink_query_uses_materialized_matched_identities() {
+        let schema = Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new("id", DataType::Int64, true),
+            arrow::datatypes::Field::new("v", DataType::Int64, true),
+        ]));
+        let old_rows = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::Int64Array::from(vec![5])) as ArrayRef,
+                Arc::new(arrow::array::Int64Array::from(vec![55])) as ArrayRef,
+            ],
+        )
+        .expect("old rows");
+        let new_rows = RecordBatch::new_empty(schema);
+        let matched = MatchedUpdateBatch {
+            row_ids: vec![7],
+            file_paths: vec!["file.parquet".to_string()],
+            row_positions: vec![3],
+            old_rows,
+            new_rows,
+        };
+
+        let query = build_merge_mor_dv_sink_query_from_matched(&matched, &dv_sink_columns())
+            .expect("query");
+        let sql = query.to_string();
+
+        // VALUES-based DV side: identities come from the matched batch (no
+        // target scan / join), partition source `id` read from old_rows.
+        assert!(sql.contains("VALUES"), "{sql}");
+        assert!(sql.contains("'file.parquet'"), "{sql}");
+        assert!(sql.contains("AS `_file`"), "{sql}");
+        assert!(sql.contains("AS `_pos`"), "{sql}");
+        assert!(sql.contains("AS `id`"), "{sql}");
+        assert!(sql.contains("ORDER BY"), "{sql}");
         assert!(!sql.contains("JOIN"), "{sql}");
         assert!(!sql.contains("ice.db1.t"), "{sql}");
     }
