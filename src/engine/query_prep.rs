@@ -502,6 +502,20 @@ fn register_external_table(
         .map_err(|e| format!("register external table: {e}"))
 }
 
+/// Register a synthetic `TableDef` into the standalone in-memory catalog so a
+/// generated query can reference it by name (e.g. a single-file
+/// `ExplicitFiles`-bound scan used by distributed COW UPDATE rewrites). Mirrors
+/// the time-travel synthetic-table registration. Callers are responsible for
+/// dropping the table via [`drop_registered_external_table`] once the query has
+/// run.
+pub(crate) fn register_external_table_for_query(
+    state: &Arc<StandaloneState>,
+    namespace: &str,
+    table_def: TableDef,
+) -> Result<(), String> {
+    register_external_table(state, namespace, table_def)
+}
+
 pub(crate) fn drop_registered_external_table(
     state: &Arc<StandaloneState>,
     namespace: &str,
