@@ -635,6 +635,7 @@ impl IcebergWriteTransactionExecutor for DistributedMorUpdateExecutor {
             &self.write.data_query,
             self.write.data_sink_spec.clone(),
             None,
+            None,
         )?;
         if data.write_abort.is_none()
             && data

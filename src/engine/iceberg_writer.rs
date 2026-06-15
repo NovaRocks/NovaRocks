@@ -277,6 +277,7 @@ impl IcebergWriteTransactionExecutor for DistributedInsertWriteExecutor {
             &self.query,
             self.sink_spec.clone(),
             None,
+            None,
         )
     }
 

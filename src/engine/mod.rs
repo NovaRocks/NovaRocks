@@ -3399,6 +3399,66 @@ pub(crate) fn execute_query_with_catalog_mgr(
     )
 }
 
+pub(crate) type IcebergWriteRootDistributionResolver = Box<
+    dyn FnOnce(
+        &crate::sql::planner::plan::LogicalPlan,
+    ) -> Result<Option<crate::sql::optimizer::property::DistributionSpec>, String>,
+>;
+
+#[allow(dead_code)]
+pub(crate) fn iceberg_write_shuffle_by_output_name(
+    output_name: impl Into<String>,
+) -> IcebergWriteRootDistributionResolver {
+    let output_name = output_name.into();
+    Box::new(move |logical| {
+        let output_columns = crate::sql::planner::plan_output_columns(logical)?;
+        let mut matches = output_columns
+            .iter()
+            .filter(|column| column.name == output_name);
+        let column = matches.next().ok_or_else(|| {
+            format!(
+                "cannot derive Iceberg write root shuffle: output column '{output_name}' not found"
+            )
+        })?;
+        if matches.next().is_some() {
+            return Err(format!(
+                "cannot derive Iceberg write root shuffle: output column '{output_name}' is ambiguous"
+            ));
+        }
+        iceberg_write_shuffle_for_output_column(column)
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn iceberg_write_shuffle_by_output_index(
+    output_index: usize,
+) -> IcebergWriteRootDistributionResolver {
+    Box::new(move |logical| {
+        let output_columns = crate::sql::planner::plan_output_columns(logical)?;
+        let column = output_columns.get(output_index).ok_or_else(|| {
+            format!(
+                "cannot derive Iceberg write root shuffle: output column index {output_index} out of range ({} columns)",
+                output_columns.len()
+            )
+        })?;
+        iceberg_write_shuffle_for_output_column(column)
+    })
+}
+
+fn iceberg_write_shuffle_for_output_column(
+    column: &crate::sql::analysis::OutputColumn,
+) -> Result<Option<crate::sql::optimizer::property::DistributionSpec>, String> {
+    if column.column_id == crate::sql::column_id::ColumnId::UNSET {
+        return Err(format!(
+            "cannot derive Iceberg write root shuffle: output column '{}' has no ColumnId",
+            column.name
+        ));
+    }
+    Ok(Some(
+        crate::sql::optimizer::property::DistributionSpec::shuffle_agg([column.column_id]),
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_query_as_iceberg_write(
     state: &Arc<StandaloneState>,
@@ -3407,6 +3467,7 @@ pub(crate) fn execute_query_as_iceberg_write(
     query: &sqlparser::ast::Query,
     sink_spec: crate::sql::codegen::iceberg_write_sink::IcebergWriteSinkSpec,
     query_opts: Option<crate::internal_service::TQueryOptions>,
+    root_distribution_resolver: Option<IcebergWriteRootDistributionResolver>,
 ) -> Result<crate::runtime::coordinator::CoordinatedQueryResult, String> {
     let exchange_port = if state.exchange_port == 0 {
         ensure_standalone_exchange_server()?
@@ -3436,8 +3497,19 @@ pub(crate) fn execute_query_as_iceberg_write(
         crate::sql::analyzer::analyze(query, &analyzer_provider, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
     let table_stats = build_table_stats_from_plan(&logical);
-    let physical =
-        crate::sql::optimizer::optimize(logical, &table_stats, factory, None, Vec::new())?;
+    let root_distribution = match root_distribution_resolver {
+        Some(resolve_root_distribution) => resolve_root_distribution(&logical)?,
+        None => None,
+    };
+    let physical = match root_distribution {
+        Some(root_distribution) => crate::sql::optimizer::optimize_with_root_distribution(
+            logical,
+            &table_stats,
+            factory,
+            root_distribution,
+        )?,
+        None => crate::sql::optimizer::optimize(logical, &table_stats, factory, None, Vec::new())?,
+    };
     let build_result =
         crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_with_iceberg_sink(
             &physical,
@@ -9453,13 +9525,100 @@ path = "meta/operations.sqlite"
             crate::sql::codegen::iceberg_write_sink::test_support::single_bucket_partition_metadata_json(),
         );
 
-        let result =
-            super::execute_query_as_iceberg_write(&state, None, "default", &query, sink_spec, None);
+        let result = super::execute_query_as_iceberg_write(
+            &state, None, "default", &query, sink_spec, None, None,
+        );
 
         let err = result.expect_err("default state should fail before executing the sink");
         assert!(
             err.contains("missing_table"),
             "error should come from analyzer/catalog lookup, got: {err}"
+        );
+    }
+
+    #[test]
+    fn iceberg_write_root_shuffle_by_output_name_uses_logical_output_column_id() {
+        use crate::sql::catalog::{CatalogProvider, TableDef};
+        use crate::sql::column_id::ColumnId;
+        use crate::sql::optimizer::property::{DistributionSpec, HashSource};
+
+        struct EmptyCatalog;
+        impl CatalogProvider for EmptyCatalog {
+            fn get_table(&self, _database: &str, table: &str) -> Result<TableDef, String> {
+                Err(format!("table not found: {table}"))
+            }
+        }
+
+        let stmt = crate::sql::parser::parse_sql_raw("SELECT 1 AS payload, 'file-a' AS _file")
+            .expect("parse query");
+        let sqlparser::ast::Statement::Query(query) = stmt else {
+            panic!("expected query statement");
+        };
+        let (resolved, cte_registry, mut factory) =
+            crate::sql::analyzer::analyze(&query, &EmptyCatalog, "default").expect("analyze query");
+        let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)
+            .expect("plan query");
+        let planned_file_col = crate::sql::planner::plan_output_columns(&logical)
+            .expect("planned output columns")
+            .into_iter()
+            .find(|column| column.name == "_file")
+            .expect("planned _file output")
+            .column_id;
+        assert_ne!(planned_file_col, ColumnId::UNSET);
+
+        let distribution = super::iceberg_write_shuffle_by_output_name("_file")(&logical)
+            .expect("resolve root distribution")
+            .expect("root distribution");
+
+        match distribution {
+            DistributionSpec::HashPartitioned { cols, source } => {
+                assert_eq!(cols, vec![planned_file_col]);
+                assert_eq!(source, HashSource::ShuffleAgg);
+            }
+            other => panic!("expected shuffle distribution, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_query_as_iceberg_write_invokes_root_distribution_resolver_after_planning() {
+        let query = parse_query_for_engine_test("SELECT 1 AS payload, 'file-a' AS _file");
+        let mut state = StandaloneState::default();
+        state.exchange_port = 1;
+        let state = Arc::new(state);
+        let mut sink_spec =
+            crate::sql::codegen::iceberg_write_sink::test_support::simple_sink_spec();
+        sink_spec.iceberg.serialized_metadata = Some(
+            crate::sql::codegen::iceberg_write_sink::test_support::single_bucket_partition_metadata_json(),
+        );
+
+        let result = super::execute_query_as_iceberg_write(
+            &state,
+            None,
+            "default",
+            &query,
+            sink_spec,
+            None,
+            Some(Box::new(|logical| {
+                let saw_file_output = crate::sql::planner::plan_output_columns(logical)?
+                    .into_iter()
+                    .any(|column| {
+                        column.name == "_file"
+                            && column.column_id != crate::sql::column_id::ColumnId::UNSET
+                    });
+                if !saw_file_output {
+                    return Err("resolver did not see planned _file output".to_string());
+                }
+                Err("resolver saw planned _file output".to_string())
+            })),
+        );
+
+        let err = match result {
+            Ok(_) => panic!("resolver error should stop write planning before execution"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("resolver saw planned _file output"),
+            "expected resolver error, got: {err}"
         );
     }
 

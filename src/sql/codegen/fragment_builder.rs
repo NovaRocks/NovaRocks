@@ -8953,6 +8953,95 @@ mod tests {
     }
 
     #[test]
+    fn build_with_iceberg_sink_maps_file_hash_distribution_to_partitioned_edge() {
+        let file_col_id = ColumnId::new_for_test(2);
+        let output_columns = vec![
+            output_col_for_test(1, "id", DataType::Int32, false),
+            output_col_for_test(2, "_file", DataType::Utf8, false),
+        ];
+        let values = values_plan_for_test(output_columns.clone());
+        let plan = PhysicalPlanNode {
+            op: Operator::PhysicalDistribution(PhysicalDistributionOp {
+                spec: DistributionSpec::shuffle_agg([file_col_id]),
+            }),
+            children: vec![values],
+            stats: stats_for_test(),
+            output_columns,
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+        };
+
+        let connectors = crate::connector::ConnectorRegistry::new();
+        let mut spec = crate::sql::codegen::iceberg_write_sink::test_support::simple_sink_spec();
+        spec.mode = crate::sql::codegen::iceberg_write_sink::IcebergWriteSinkMode::DeletionVectors;
+        spec.iceberg.serialized_metadata = Some(
+            crate::sql::codegen::iceberg_write_sink::test_support::single_bucket_partition_metadata_json(),
+        );
+        let target_columns = vec![
+            ColumnDef {
+                name: "id".to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+                write_default: None,
+                logical_type: None,
+            },
+            ColumnDef {
+                name: "_file".to_string(),
+                data_type: DataType::Utf8,
+                nullable: false,
+                write_default: None,
+                logical_type: None,
+            },
+        ];
+        spec.target_columns = target_columns.clone();
+        spec.target_table.columns = target_columns;
+
+        let build = PlanFragmentBuilder::build_with_iceberg_sink(
+            &plan,
+            &DummyCatalog,
+            &connectors,
+            "default",
+            None,
+            &spec,
+        )
+        .expect("build with iceberg DV sink");
+
+        let root = build
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == build.root_fragment_id)
+            .expect("root fragment");
+        assert_eq!(
+            root.output_sink.type_,
+            data_sinks::TDataSinkType::ICEBERG_DV_SINK
+        );
+        let file_slot = slot_id_by_name(&root.desc_tbl, "_file");
+        let edge = build.edges.first().expect("hash stream edge");
+        assert_eq!(
+            edge.stream_kind,
+            crate::sql::codegen::FragmentStreamKind::Partitioned
+        );
+        assert_eq!(
+            edge.output_partition.type_,
+            crate::partitions::TPartitionType::HASH_PARTITIONED
+        );
+        let partition_exprs = edge
+            .output_partition
+            .partition_exprs
+            .as_ref()
+            .expect("partition exprs");
+        assert_eq!(partition_exprs.len(), 1);
+        let expr_node = partition_exprs[0]
+            .nodes
+            .first()
+            .expect("partition expr node");
+        assert_eq!(expr_node.node_type, exprs::TExprNodeType::SLOT_REF);
+        let slot_ref = expr_node.slot_ref.as_ref().expect("slot ref");
+        assert_eq!(slot_ref.slot_id, file_slot);
+    }
+
+    #[test]
     fn mixed_starrocks_and_iceberg_scan_table_ids_do_not_collide() {
         let starrocks_layout = PhysicalTableLayout {
             db_id: 11,

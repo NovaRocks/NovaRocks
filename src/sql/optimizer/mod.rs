@@ -24,7 +24,7 @@ pub(crate) mod topn_proof;
 pub(crate) use memo::Memo;
 pub(crate) use operator::Operator;
 pub(crate) use physical_plan::PhysicalPlanNode;
-pub(crate) use property::PhysicalPropertySet;
+pub(crate) use property::{DistributionSpec, OrderingSpec, PhysicalPropertySet};
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -65,6 +65,37 @@ pub(crate) fn optimize(
     factory: ColumnRefFactory,
     dictionary_provider: Option<std::sync::Arc<dyn rewrite::context::QueryDictionaryProvider>>,
     mv_candidates: Vec<cascades_rules::mv_rewrite::MvRewriteCandidate>,
+) -> Result<PhysicalPlanNode, String> {
+    optimize_with_root_property(
+        plan,
+        table_stats,
+        factory,
+        dictionary_provider,
+        mv_candidates,
+        PhysicalPropertySet::gather(),
+    )
+}
+
+pub(crate) fn optimize_with_root_distribution(
+    plan: LogicalPlan,
+    table_stats: &HashMap<String, TableStatistics>,
+    factory: ColumnRefFactory,
+    root_distribution: DistributionSpec,
+) -> Result<PhysicalPlanNode, String> {
+    let root_required = PhysicalPropertySet {
+        distribution: root_distribution,
+        ordering: OrderingSpec::Any,
+    };
+    optimize_with_root_property(plan, table_stats, factory, None, Vec::new(), root_required)
+}
+
+fn optimize_with_root_property(
+    plan: LogicalPlan,
+    table_stats: &HashMap<String, TableStatistics>,
+    factory: ColumnRefFactory,
+    dictionary_provider: Option<std::sync::Arc<dyn rewrite::context::QueryDictionaryProvider>>,
+    mv_candidates: Vec<cascades_rules::mv_rewrite::MvRewriteCandidate>,
+    root_required: PhysicalPropertySet,
 ) -> Result<PhysicalPlanNode, String> {
     let deadline = Instant::now() + OPTIMIZE_TIMEOUT;
 
@@ -154,7 +185,6 @@ pub(crate) fn optimize(
     check_deadline(deadline)?;
 
     // 10. Top-down search with property enforcement.
-    let root_required = PhysicalPropertySet::gather();
     let mut ctx = search::SearchContext::new(table_stats.clone());
     ctx.optimize_group(&memo, root_group, &root_required)?;
 
@@ -859,6 +889,91 @@ mod is_known_rule_name_tests {
             err.contains("subquery decorrelation failed"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn optimize_with_root_distribution_overrides_default_gather_root() {
+        use crate::sql::analysis::ExprKind;
+        use crate::sql::catalog::{CatalogProvider, ColumnDef, ScanSource, TableDef};
+        use crate::sql::column_id::ColumnRefFactory;
+        use crate::sql::optimizer::property::DistributionSpec;
+        use crate::sql::planner::plan::LogicalPlan;
+
+        struct MinimalCatalog;
+        impl CatalogProvider for MinimalCatalog {
+            fn get_table(&self, _db: &str, table: &str) -> Result<TableDef, String> {
+                match table {
+                    "t1" => Ok(TableDef {
+                        name: table.to_string(),
+                        columns: vec![ColumnDef {
+                            name: "k1".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: true,
+                            write_default: None,
+                            logical_type: None,
+                        }],
+                        iceberg_row_lineage_metadata_columns: vec![],
+                        source: ScanSource::StarRocks {
+                            db_id: 0,
+                            table_id: 0,
+                        },
+                    }),
+                    other => Err(format!("table not found: {other}")),
+                }
+            }
+        }
+
+        let sql = "SELECT k1 FROM t1";
+        let dialect = crate::sql::parser::dialect::StarRocksDialect;
+        let mut ast = sqlparser::parser::Parser::parse_sql(&dialect, sql).expect("parse query");
+        let stmt = ast.pop().expect("expected a statement");
+        let query = match stmt {
+            sqlparser::ast::Statement::Query(q) => q,
+            _ => panic!("expected a query"),
+        };
+        let (resolved, cte_registry, mut factory) =
+            crate::sql::analyzer::analyze(&query, &MinimalCatalog, "default").expect("analyze");
+        let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)
+            .expect("plan query");
+        let hash_col = match &logical {
+            LogicalPlan::Project(project) => match &project.items[0].expr.kind {
+                ExprKind::ColumnRef { column_id, .. } => *column_id,
+                other => panic!("expected column projection, got {other:?}"),
+            },
+            other => panic!("expected project root, got {other:?}"),
+        };
+
+        let default_physical = optimize(
+            logical.clone(),
+            &HashMap::new(),
+            ColumnRefFactory::new(),
+            None,
+            Vec::new(),
+        )
+        .expect("default optimize");
+        assert_root_distribution(&default_physical, &DistributionSpec::Gather);
+
+        let root_distribution = DistributionSpec::shuffle_agg([hash_col]);
+        let physical = optimize_with_root_distribution(
+            logical,
+            &HashMap::new(),
+            ColumnRefFactory::new(),
+            root_distribution.clone(),
+        )
+        .expect("optimize with root distribution");
+        assert_root_distribution(&physical, &root_distribution);
+    }
+
+    fn assert_root_distribution(
+        physical: &crate::sql::optimizer::physical_plan::PhysicalPlanNode,
+        expected: &crate::sql::optimizer::property::DistributionSpec,
+    ) {
+        match &physical.op {
+            crate::sql::optimizer::operator::Operator::PhysicalDistribution(op) => {
+                assert_eq!(&op.spec, expected);
+            }
+            other => panic!("expected root PhysicalDistribution, got {other:?}"),
+        }
     }
 
     /// End-to-end proof: the full analyze → plan_query → optimize chain in

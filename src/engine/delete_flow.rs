@@ -275,6 +275,7 @@ impl IcebergWriteTransactionExecutor for DistributedDeleteWriteExecutor {
             &self.delete_query,
             self.sink_spec.clone(),
             None,
+            None,
         )?;
         if result
             .write_commit
