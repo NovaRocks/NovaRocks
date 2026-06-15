@@ -39,6 +39,7 @@ use super::overwrite::OverwriteCommit;
 use super::rewrite_data_files::RewriteDataFilesCommit;
 use super::row_delta::RowDeltaCommit;
 use super::row_delta_dv::RowDeltaDvCommit;
+use super::row_delta_dv_from_files::RowDeltaDvFromFilesCommit;
 use super::service::{
     CleanupAttempt, CommitFailureKind, CommitServiceError, RecoveryEvidence, classify_commit_error,
 };
@@ -98,6 +99,7 @@ pub async fn run_iceberg_commit_typed(
         CommitOpKind::Overwrite => Box::new(OverwriteCommit),
         CommitOpKind::RowDelta => Box::new(RowDeltaCommit),
         CommitOpKind::RowDeltaDv => Box::new(RowDeltaDvCommit),
+        CommitOpKind::RowDeltaDvFromFiles => Box::new(RowDeltaDvFromFilesCommit),
         CommitOpKind::RewriteDataFiles => Box::new(RewriteDataFilesCommit),
         CommitOpKind::CowUpdate => Box::new(CowUpdateCommit {
             rewrite: cow_update_rewrite.ok_or_else(|| {
@@ -206,5 +208,12 @@ mod tests {
         let _ = CommitOpKind::RewriteDataFiles;
         let _ = CommitOpKind::RewriteManifests;
         let _ = std::any::type_name::<crate::connector::iceberg::commit::RewriteDataFilesCommit>();
+    }
+
+    #[test]
+    fn run_dispatch_accepts_row_delta_dv_from_files_variant() {
+        let _ = CommitOpKind::RowDeltaDvFromFiles;
+        let _ =
+            std::any::type_name::<crate::connector::iceberg::commit::RowDeltaDvFromFilesCommit>();
     }
 }

@@ -106,6 +106,7 @@ fn commit_op_kind_record_name(kind: CommitOpKind) -> &'static str {
         CommitOpKind::Overwrite => "overwrite",
         CommitOpKind::RowDelta => "row_delta",
         CommitOpKind::RowDeltaDv => "row_delta_dv",
+        CommitOpKind::RowDeltaDvFromFiles => "row_delta_dv_from_files",
         CommitOpKind::RewriteDataFiles => "rewrite_data_files",
         CommitOpKind::CowUpdate => "cow_update",
         CommitOpKind::Truncate => "truncate",

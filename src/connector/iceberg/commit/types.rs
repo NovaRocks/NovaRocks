@@ -29,6 +29,9 @@ pub enum CommitOpKind {
     /// rewrites touched delete manifests instead of producing v2 Parquet
     /// position-delete files.
     RowDeltaDv,
+    /// Iceberg v3 row-lineage DELETE where BE writers already produced merged
+    /// Puffin deletion-vector files; the FE commit registers metadata only.
+    RowDeltaDvFromFiles,
     /// Iceberg OPTIMIZE whole-table rewrite: replaces all current live data
     /// files with compacted data files and drops all current delete files.
     RewriteDataFiles,
@@ -183,6 +186,7 @@ mod tests {
             CommitOpKind::Overwrite,
             CommitOpKind::RowDelta,
             CommitOpKind::RowDeltaDv,
+            CommitOpKind::RowDeltaDvFromFiles,
             CommitOpKind::RewriteDataFiles,
             CommitOpKind::CowUpdate,
             CommitOpKind::Truncate,

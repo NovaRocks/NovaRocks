@@ -43,6 +43,8 @@ pub mod rewrite_manifests;
 pub mod rewrite_position_delete_files;
 mod row_delta;
 mod row_delta_dv;
+mod row_delta_dv_from_files;
+mod row_delta_dv_metadata;
 mod run;
 mod service;
 pub mod snapshot_lifecycle_helpers;
@@ -80,6 +82,7 @@ pub(crate) use rewrite_data_files::count_current_live_files;
 pub(crate) use rewrite_data_files::{LiveFileMetrics, current_live_file_metrics};
 pub use row_delta::RowDeltaCommit;
 pub use row_delta_dv::RowDeltaDvCommit;
+pub use row_delta_dv_from_files::RowDeltaDvFromFilesCommit;
 pub use run::{CleanupPathMapper, RunInput, run_iceberg_commit, run_iceberg_commit_typed};
 pub use service::{
     CleanupAttempt, CommitFailureKind, CommitServiceError, CommitServiceOutcome, RecoveryEvidence,
