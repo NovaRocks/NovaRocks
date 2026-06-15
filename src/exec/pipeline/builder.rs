@@ -141,6 +141,26 @@ pub(crate) fn build_pipeline_graph_for_exec_plan_with_dop(
     pipeline_dop: i32,
     runtime_filter_hub: Arc<RuntimeFilterHub>,
 ) -> Result<PipelineGraph, String> {
+    build_pipeline_graph_for_exec_plan_with_root_sink_dop(
+        plan,
+        _debug,
+        dep_manager,
+        _exchange_finst_id,
+        pipeline_dop,
+        None,
+        runtime_filter_hub,
+    )
+}
+
+pub(crate) fn build_pipeline_graph_for_exec_plan_with_root_sink_dop(
+    plan: &ExecPlan,
+    _debug: bool,
+    dep_manager: DependencyManager,
+    _exchange_finst_id: Option<(i64, i64)>,
+    pipeline_dop: i32,
+    root_sink_dop: Option<i32>,
+    runtime_filter_hub: Arc<RuntimeFilterHub>,
+) -> Result<PipelineGraph, String> {
     let arena = Arc::new(plan.arena.clone());
     let mut ctx = PipelineBuildContext {
         arena,
@@ -150,6 +170,17 @@ pub(crate) fn build_pipeline_graph_for_exec_plan_with_dop(
         pipeline_dop: pipeline_dop.max(1),
     };
     let mut build = build_pipeline_for_node(&plan.root, &mut ctx)?;
+    if let Some(root_sink_dop) = root_sink_dop {
+        let root_sink_dop = root_sink_dop.max(1);
+        if root_sink_dop == 1 {
+            build = gather_to_one(build, &mut ctx, ROOT_SINK_LOCAL_EXCHANGE_NODE_ID);
+        } else if root_sink_dop != build.pipeline.dop.max(1) {
+            return Err(format!(
+                "root sink dop override {root_sink_dop} is unsupported for upstream dop {}",
+                build.pipeline.dop.max(1)
+            ));
+        }
+    }
     build.pipeline.needs_sink = true;
 
     let root_id = build.pipeline.id;
@@ -158,6 +189,8 @@ pub(crate) fn build_pipeline_graph_for_exec_plan_with_dop(
     pipelines.append(&mut build.extra_pipelines);
     Ok(PipelineGraph { pipelines, root_id })
 }
+
+const ROOT_SINK_LOCAL_EXCHANGE_NODE_ID: i32 = -1;
 
 fn gather_to_one(
     mut build: PipelineBuildResult,
@@ -1383,7 +1416,10 @@ mod tests {
     use crate::exec::pipeline::dependency::DependencyManager;
     use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
 
-    use super::build_pipeline_graph_for_exec_plan_with_dop;
+    use super::{
+        build_pipeline_graph_for_exec_plan_with_dop,
+        build_pipeline_graph_for_exec_plan_with_root_sink_dop,
+    };
 
     fn chunk_schema_of(schema: &Arc<Schema>, slot_ids: &[SlotId]) -> ChunkSchemaRef {
         ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), slot_ids)
@@ -1489,6 +1525,58 @@ mod tests {
             .filter(|f| f.name().starts_with("LOCAL_EXCHANGE_SOURCE"))
             .count();
         assert_eq!(local_exchange_sources, 1);
+    }
+
+    #[test]
+    fn root_sink_dop_override_gathers_multi_driver_root_to_one() {
+        let lookup_input_chunk_schema = chunk_schema_of(
+            &Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)])),
+            &[SlotId::new(1)],
+        );
+        let plan = ExecPlan {
+            arena: ExprArena::default(),
+            root: ExecNode {
+                kind: ExecNodeKind::LookUp(LookUpNode {
+                    node_id: 17,
+                    row_pos_descs: HashMap::new(),
+                    output_chunk_schema: Arc::clone(&lookup_input_chunk_schema),
+                }),
+            },
+        };
+
+        let graph = build_pipeline_graph_for_exec_plan_with_root_sink_dop(
+            &plan,
+            false,
+            DependencyManager::new(),
+            None,
+            4,
+            Some(1),
+            Arc::new(RuntimeFilterHub::new(DependencyManager::new())),
+        )
+        .expect("build pipeline graph");
+
+        let root = graph
+            .pipelines
+            .iter()
+            .find(|pipeline| pipeline.id == graph.root_id)
+            .expect("root pipeline");
+        assert_eq!(
+            root.dop, 1,
+            "root sink DOP override should attach the terminal sink to one local driver"
+        );
+        assert!(root.needs_sink, "new root still needs the terminal sink");
+        let mut has_local_exchange_sink = false;
+        for pipeline in &graph.pipelines {
+            for factory in &pipeline.factories {
+                if factory.name().starts_with("LOCAL_EXCHANGE_SINK") {
+                    has_local_exchange_sink = true;
+                }
+            }
+        }
+        assert!(
+            has_local_exchange_sink,
+            "multi-driver input should be gathered through a local exchange before the sink"
+        );
     }
 
     #[test]

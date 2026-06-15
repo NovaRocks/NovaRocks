@@ -969,7 +969,6 @@ impl IcebergTableSinkBackend {
         let vectors =
             merge_existing_with_pending_deletion_vectors(existing, &self.pending_deletion_vectors);
 
-        let mut commit_infos = Vec::new();
         for (referenced_data_file, dv) in vectors {
             let (partition_path, null_fingerprint, partition_spec_id, partition_values_descriptor) =
                 self.referenced_data_file_partition_report(
@@ -1030,7 +1029,7 @@ impl IcebergTableSinkBackend {
                 cardinality: Some(cardinality),
             };
 
-            commit_infos.push(types::TSinkCommitInfo {
+            state.add_sink_commit_info(types::TSinkCommitInfo {
                 iceberg_data_file: Some(data_file),
                 hive_file_info: None,
                 is_overwrite: None,
@@ -1039,9 +1038,6 @@ impl IcebergTableSinkBackend {
             });
         }
 
-        for commit_info in commit_infos {
-            state.add_sink_commit_info(commit_info);
-        }
         self.pending_deletion_vectors.clear();
         Ok(())
     }

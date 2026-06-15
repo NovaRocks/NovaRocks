@@ -36,7 +36,7 @@ use crate::novarocks_logging::info;
 use crate::runtime::query_context::query_context_manager;
 use crate::runtime::runtime_state::RuntimeState;
 
-use super::builder::build_pipeline_graph_for_exec_plan_with_dop;
+use super::builder::build_pipeline_graph_for_exec_plan_with_root_sink_dop;
 use super::dependency::DependencyManager;
 use super::fragment_context::FragmentContext;
 use super::global_driver_executor::{DriverTask, FragmentCompletion, global_driver_executor};
@@ -58,6 +58,36 @@ pub(crate) fn execute_plan_with_pipeline(
     query_id: Option<crate::runtime::query_context::QueryId>,
     fe_addr: Option<crate::types::TNetworkAddress>,
     backend_num: Option<i32>,
+) -> Result<(), String> {
+    execute_plan_with_pipeline_with_root_sink_dop(
+        plan,
+        debug,
+        time_slice,
+        sink,
+        exchange_finst_id,
+        profiler,
+        pipeline_dop,
+        runtime_state,
+        query_id,
+        fe_addr,
+        backend_num,
+        None,
+    )
+}
+
+pub(crate) fn execute_plan_with_pipeline_with_root_sink_dop(
+    plan: ExecPlan,
+    debug: bool,
+    time_slice: Duration,
+    sink: Box<dyn OperatorFactory>,
+    exchange_finst_id: Option<(i64, i64)>,
+    profiler: Option<Profiler>,
+    pipeline_dop: i32,
+    runtime_state: std::sync::Arc<RuntimeState>,
+    query_id: Option<crate::runtime::query_context::QueryId>,
+    fe_addr: Option<crate::types::TNetworkAddress>,
+    backend_num: Option<i32>,
+    root_sink_dop: Option<i32>,
 ) -> Result<(), String> {
     let dep_manager = DependencyManager::new();
     let runtime_filter_hub = match query_id {
@@ -87,13 +117,15 @@ pub(crate) fn execute_plan_with_pipeline(
         let _ = query_context_manager().get_or_create_runtime_filter_worker(qid);
     }
 
-    // Use the DOP from FE (already calculated by calc_pipeline_dop)
-    let graph = build_pipeline_graph_for_exec_plan_with_dop(
+    // Use the FE-calculated DOP as the base graph DOP. Some terminal sinks can
+    // request a narrower root pipeline when their finalization state must be local.
+    let graph = build_pipeline_graph_for_exec_plan_with_root_sink_dop(
         &plan,
         debug,
         dep_manager.clone(),
         exchange_finst_id,
         pipeline_dop,
+        root_sink_dop,
         Arc::clone(&runtime_filter_hub),
     )?;
 

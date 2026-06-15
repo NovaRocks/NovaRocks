@@ -34,7 +34,9 @@ use crate::exec::operators::{
     DataStreamSinkFactory, IcebergTableSinkFactory, MultiCastDataStreamSinkFactory,
     NoopSinkFactory, OlapTableSinkFactory, ResultBufferSinkFactory, SplitDataStreamSinkFactory,
 };
-use crate::exec::pipeline::executor::execute_plan_with_pipeline;
+use crate::exec::pipeline::executor::{
+    execute_plan_with_pipeline, execute_plan_with_pipeline_with_root_sink_dop,
+};
 use crate::lower::layout::{build_tuple_slot_order, infer_tuple_slot_order, reorder_tuple_slots};
 use crate::lower::thrift::{Lowered, lower_plan};
 use crate::runtime::profile::Profiler;
@@ -543,9 +545,10 @@ pub(crate) fn execute_fragment(
                 let desc_tbl = desc_tbl
                     .ok_or_else(|| format!("{sink_type_name} requires descriptor table"))?;
 
+                let sink_mode = iceberg_sink_mode_for_type(sink.type_);
                 let sink_factory = IcebergTableSinkFactory::try_new(
                     iceberg_sink.clone(),
-                    iceberg_sink_mode_for_type(sink.type_),
+                    sink_mode,
                     output_exprs,
                     &lowered.layout,
                     desc_tbl,
@@ -555,7 +558,10 @@ pub(crate) fn execute_fragment(
                 let _exec_timer = profiler
                     .as_ref()
                     .map(|p| p.scoped_timer("PipelineExecuteTime"));
-                execute_plan_with_pipeline(
+                let root_sink_dop = (sink_mode
+                    == crate::connector::iceberg::sink::IcebergSinkMode::DeletionVectors)
+                    .then_some(1);
+                execute_plan_with_pipeline_with_root_sink_dop(
                     exec_plan,
                     debug_exec_node_output(),
                     Duration::from_millis(50),
@@ -567,6 +573,7 @@ pub(crate) fn execute_fragment(
                     query_id,
                     fe_addr.cloned(),
                     backend_num,
+                    root_sink_dop,
                 )?;
             }
             data_sinks::TDataSinkType::OLAP_TABLE_SINK => {
