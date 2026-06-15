@@ -454,9 +454,12 @@ pub(crate) fn written_file_to_sink_commit_info(
         key_metadata: file.key_metadata.clone(),
         partition_values_descriptor: Some(partition_values_descriptor),
         partition_spec_id: Some(file.partition_spec_id),
-        content_offset: None,
-        content_size_in_bytes: None,
-        cardinality: None,
+        content_offset: file.content_offset,
+        content_size_in_bytes: file.content_size_in_bytes,
+        cardinality: file
+            .cardinality
+            .map(|value| u64_to_i64(value, "cardinality"))
+            .transpose()?,
     };
     Ok(crate::types::TSinkCommitInfo {
         iceberg_data_file: Some(data_file),
@@ -1484,6 +1487,9 @@ mod tests {
             referenced_data_file: None,
             equality_ids: None,
             first_row_id: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            cardinality: None,
         };
 
         let info = written_file_to_sink_commit_info(&file, &metadata).expect("commit info");
@@ -1522,6 +1528,9 @@ mod tests {
             referenced_data_file: None,
             equality_ids: None,
             first_row_id: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            cardinality: None,
         };
 
         let err = written_file_to_sink_commit_info(&file, &metadata)
@@ -1564,6 +1573,9 @@ mod tests {
             referenced_data_file: Some("file:///t/data-1.parquet".to_string()),
             equality_ids: None,
             first_row_id: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            cardinality: None,
         };
 
         let info = written_file_to_sink_commit_info(&file, &metadata).expect("sink commit info");
@@ -1594,6 +1606,81 @@ mod tests {
             .iceberg_data_file
             .expect("iceberg data file");
         assert_eq!(df.partition_path.as_deref(), Some("region=us+west"));
+    }
+
+    #[test]
+    fn written_file_to_sink_commit_info_preserves_puffin_dv_descriptor() {
+        use iceberg::spec::DataFileFormat;
+
+        let metadata = test_unpartitioned_metadata();
+        let file = super::super::commit::WrittenFile {
+            path: "file:///t/dv-00000000.puffin".to_string(),
+            format: DataFileFormat::Puffin,
+            content: DataContentType::PositionDeletes,
+            partition_values: Struct::empty(),
+            partition_spec_id: 0,
+            record_count: 3,
+            file_size_in_bytes: 40,
+            split_offsets: vec![],
+            column_sizes: HashMap::new(),
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::new(),
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            key_metadata: None,
+            referenced_data_file: Some("file:///t/data-1.parquet".to_string()),
+            equality_ids: None,
+            first_row_id: None,
+            content_offset: Some(4),
+            content_size_in_bytes: Some(12),
+            cardinality: Some(3),
+        };
+
+        let info = written_file_to_sink_commit_info(&file, &metadata).expect("sink commit info");
+        let df = info.iceberg_data_file.expect("iceberg data file");
+
+        assert_eq!(df.format.as_deref(), Some("puffin"));
+        assert_eq!(
+            df.file_content,
+            Some(crate::types::TIcebergFileContent::POSITION_DELETES)
+        );
+        assert_eq!(df.content_offset, Some(4));
+        assert_eq!(df.content_size_in_bytes, Some(12));
+        assert_eq!(df.cardinality, Some(3));
+    }
+
+    #[test]
+    fn written_file_to_sink_commit_info_rejects_cardinality_overflow() {
+        use iceberg::spec::DataFileFormat;
+
+        let metadata = test_unpartitioned_metadata();
+        let file = super::super::commit::WrittenFile {
+            path: "file:///t/dv-00000000.puffin".to_string(),
+            format: DataFileFormat::Puffin,
+            content: DataContentType::PositionDeletes,
+            partition_values: Struct::empty(),
+            partition_spec_id: 0,
+            record_count: 3,
+            file_size_in_bytes: 40,
+            split_offsets: vec![],
+            column_sizes: HashMap::new(),
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::new(),
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            key_metadata: None,
+            referenced_data_file: Some("file:///t/data-1.parquet".to_string()),
+            equality_ids: None,
+            first_row_id: None,
+            content_offset: Some(4),
+            content_size_in_bytes: Some(12),
+            cardinality: Some(i64::MAX as u64 + 1),
+        };
+
+        let err = written_file_to_sink_commit_info(&file, &metadata)
+            .expect_err("cardinality overflow should fail");
+
+        assert!(err.contains("cardinality"), "got: {err}");
     }
 
     #[test]

@@ -85,6 +85,9 @@ pub async fn write_equality_delete_file(
         referenced_data_file: None,
         equality_ids: Some(columns.iter().map(|c| c.field_id).collect()),
         first_row_id: None,
+        content_offset: None,
+        content_size_in_bytes: None,
+        cardinality: None,
     }))
 }
 

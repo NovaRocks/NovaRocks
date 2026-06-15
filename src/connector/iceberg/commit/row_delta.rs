@@ -387,6 +387,12 @@ fn written_file_to_iceberg_data_file_minimal(
     if let Some(equality_ids) = &f.equality_ids {
         builder.equality_ids(Some(equality_ids.clone()));
     }
+    if let Some(offset) = f.content_offset {
+        builder.content_offset(Some(offset));
+    }
+    if let Some(size) = f.content_size_in_bytes {
+        builder.content_size_in_bytes(Some(size));
+    }
     if !f.column_sizes.is_empty() {
         builder.column_sizes(f.column_sizes.clone());
     }
@@ -495,6 +501,9 @@ mod tests {
             referenced_data_file: Some("s3://bucket/data.parquet".to_string()),
             equality_ids: None,
             first_row_id: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            cardinality: None,
         }
     }
 
@@ -518,12 +527,53 @@ mod tests {
             referenced_data_file: None,
             equality_ids: Some(vec![1, 2]),
             first_row_id: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            cardinality: None,
         };
 
         let df = written_file_to_iceberg_data_file_minimal(&file).expect("data file");
 
         assert_eq!(df.content_type(), DataContentType::EqualityDeletes);
         assert_eq!(df.equality_ids(), Some(vec![1, 2]));
+    }
+
+    #[test]
+    fn puffin_position_delete_preserves_dv_blob_descriptor() {
+        let file = WrittenFile {
+            path: "s3://bucket/table/data/dv-00000000.puffin".to_string(),
+            format: DataFileFormat::Puffin,
+            content: DataContentType::PositionDeletes,
+            partition_values: Struct::empty(),
+            partition_spec_id: 0,
+            record_count: 3,
+            file_size_in_bytes: 40,
+            split_offsets: Vec::new(),
+            column_sizes: HashMap::new(),
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::new(),
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            key_metadata: None,
+            referenced_data_file: Some("s3://bucket/table/data/f.parquet".to_string()),
+            equality_ids: None,
+            first_row_id: None,
+            content_offset: Some(4),
+            content_size_in_bytes: Some(12),
+            cardinality: Some(3),
+        };
+
+        let df = written_file_to_iceberg_data_file_minimal(&file).expect("data file");
+
+        assert_eq!(df.file_format(), DataFileFormat::Puffin);
+        assert_eq!(df.content_type(), DataContentType::PositionDeletes);
+        assert_eq!(
+            df.referenced_data_file().as_deref(),
+            Some("s3://bucket/table/data/f.parquet")
+        );
+        assert_eq!(df.content_offset(), Some(4));
+        assert_eq!(df.content_size_in_bytes(), Some(12));
+        assert_eq!(df.record_count(), 3);
     }
 
     #[test]
@@ -549,6 +599,9 @@ mod tests {
             referenced_data_file: None,
             equality_ids: Some(vec![1]),
             first_row_id: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            cardinality: None,
         };
 
         let raw = row_delta_summary(&[file]);

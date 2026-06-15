@@ -908,6 +908,9 @@ mod tests {
             referenced_data_file: None,
             equality_ids: None,
             first_row_id: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            cardinality: None,
         };
 
         let outcome = run_overwrite_partitions_commit(fixture.clone(), vec![new_file])

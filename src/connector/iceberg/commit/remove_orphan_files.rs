@@ -603,6 +603,9 @@ mod tests {
                 referenced_data_file: None,
                 equality_ids: None,
                 first_row_id: None,
+                content_offset: None,
+                content_size_in_bytes: None,
+                cardinality: None,
             });
             let file_io = current_table.file_io().clone();
             let abort_handle = collector.abort_log.clone();

@@ -178,6 +178,9 @@ pub(crate) async fn v3_table_with_n_data_files(n: usize) -> IcebergTestFixture {
             referenced_data_file: None,
             equality_ids: None,
             first_row_id: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            cardinality: None,
         });
     }
 
@@ -275,6 +278,9 @@ pub(crate) async fn v3_table_with_multi_batch_appends(batches: &[usize]) -> Iceb
                 referenced_data_file: None,
                 equality_ids: None,
                 first_row_id: None,
+                content_offset: None,
+                content_size_in_bytes: None,
+                cardinality: None,
             });
             global_idx += 1;
         }
@@ -394,6 +400,9 @@ pub(crate) async fn v3_partitioned_table_with_data() -> IcebergTestFixture {
             referenced_data_file: None,
             equality_ids: None,
             first_row_id: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            cardinality: None,
         },
         WrittenFile {
             path: format!("{table_location}/data/us-1.parquet"),
@@ -413,6 +422,9 @@ pub(crate) async fn v3_partitioned_table_with_data() -> IcebergTestFixture {
             referenced_data_file: None,
             equality_ids: None,
             first_row_id: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            cardinality: None,
         },
         WrittenFile {
             path: format!("{table_location}/data/eu-0.parquet"),
@@ -432,6 +444,9 @@ pub(crate) async fn v3_partitioned_table_with_data() -> IcebergTestFixture {
             referenced_data_file: None,
             equality_ids: None,
             first_row_id: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            cardinality: None,
         },
     ];
 

@@ -1086,6 +1086,9 @@ pub(crate) fn data_file_to_written_file(
         referenced_data_file: df.referenced_data_file().map(|s| s.to_string()),
         equality_ids: df.equality_ids(),
         first_row_id: df.first_row_id(),
+        content_offset: None,
+        content_size_in_bytes: None,
+        cardinality: None,
     })
 }
 
