@@ -1026,6 +1026,12 @@ fn build_position_delete_groups_from_matched(
     Ok(out)
 }
 
+// Intentionally a single-variant carrier. The COW and MOR UPDATE write plans are now
+// distributed (see `DistributedCowUpdateExecutor` / `DistributedMorUpdateExecutor`), so
+// the only path still routed through `MutationWriteExecutor` is the MERGE matched-DELETE
+// side, which still injects coordinator-built delete groups. This enum is deliberately
+// retained for Phase 3 (atomic MERGE), which folds every MERGE branch into one collector;
+// do not collapse it as a "dead abstraction" before then.
 enum MutationWritePlan {
     MergeMatchedDelete { matched: MatchedUpdateBatch },
 }
