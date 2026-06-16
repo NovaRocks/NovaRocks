@@ -483,10 +483,6 @@ patch_generator_source() {
 
   local source_file="$source_dir/bm_utils.c"
   [[ -f "$source_file" ]] || die "SSB generator source is missing: $source_file"
-  if grep -q "if (!retcode && S_ISFIFO(fstats.st_mode))" "$source_file"; then
-    return
-  fi
-
   log "Patching SSB generator for modern libc open(O_CREAT) checks..."
   local patched_file="$source_file.tmp"
   awk '
