@@ -162,6 +162,7 @@ fn main() {
     println!("cargo:rerun-if-changed=idl/thrift/Data.thrift");
     println!("cargo:rerun-if-changed=idl/thrift/Planner.thrift");
     println!("cargo:rerun-if-changed=idl/thrift/PlanNodes.thrift");
+    println!("cargo:rerun-if-changed=idl/thrift/DataSinks.thrift");
     println!("cargo:rerun-if-changed=idl/thrift/Exprs.thrift");
     println!("cargo:rerun-if-changed=idl/thrift/Opcodes.thrift");
     println!("cargo:rerun-if-changed=idl/thrift/Status.thrift");
