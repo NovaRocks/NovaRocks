@@ -476,6 +476,39 @@ extract_generator_source() {
   [[ -d "$source_dir" ]] || die "generator archive did not create expected directory: $source_dir"
 }
 
+patch_generator_source() {
+  if [[ "$suite" != "ssb" ]]; then
+    return
+  fi
+
+  local source_file="$source_dir/bm_utils.c"
+  [[ -f "$source_file" ]] || die "SSB generator source is missing: $source_file"
+  if grep -q "if (!retcode && S_ISFIFO(fstats.st_mode))" "$source_file"; then
+    return
+  fi
+
+  log "Patching SSB generator for modern libc open(O_CREAT) checks..."
+  local patched_file="$source_file.tmp"
+  awk '
+    {
+      if ($0 ~ /^[[:space:]]*if .*S_ISFIFO\(fstats\.st_mode\)/) {
+        print "    if (!retcode && S_ISFIFO(fstats.st_mode))"
+        next
+      }
+      if ($0 ~ /open\(fullpath, .*O_CREAT\);/) {
+        sub(/\|O_CREAT\);/, "|O_CREAT, 0644);")
+      }
+      print
+    }
+  ' "$source_file" > "$patched_file"
+  mv "$patched_file" "$source_file"
+
+  grep -q "if (!retcode && S_ISFIFO(fstats.st_mode))" "$source_file" \
+    || die "failed to patch SSB generator FIFO guard"
+  grep -q "O_CREAT, 0644" "$source_file" \
+    || die "failed to patch SSB generator open mode"
+}
+
 cleanup_spark_tmp_dir() {
   local tmp_dir="$1"
   "${compose_args[@]}" exec -T spark /bin/bash -lc "rm -rf '$tmp_dir'" >/dev/null 2>&1 || true
@@ -697,6 +730,7 @@ main() {
   [[ "$check_only" != "1" ]] || die "benchmark data is not ready"
 
   extract_generator_source
+  patch_generator_source
   generate_raw_files
   upload_raw_files
   run_spark_loader
