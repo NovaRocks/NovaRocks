@@ -3069,6 +3069,7 @@ fn bind_aggregate_old_input_positions_from_delta_preview(
         query_opts.cloned(),
         None,
         iceberg_catalogs,
+        None,
     ) {
         Ok(preview) => preview,
         Err(err) => {
@@ -3718,7 +3719,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
 
     match execution_plan {
         StandaloneExecutionPlan::SingleFragment(plan) => {
-            execute_plan(*plan, query_opts, terminal_sink, iceberg_catalogs)
+            execute_plan(*plan, query_opts, terminal_sink, iceberg_catalogs, None)
         }
         StandaloneExecutionPlan::Coordinated(build_result) => {
             if terminal_sink.is_some() {
@@ -4176,6 +4177,7 @@ fn execute_plan(
     query_opts: Option<crate::internal_service::TQueryOptions>,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
+    profiler: Option<crate::runtime::profile::Profiler>,
 ) -> Result<QueryResult, String> {
     use crate::exec::expr::ExprArena;
     use crate::exec::node::{ExecPlan, push_down_local_runtime_filters};
@@ -4210,7 +4212,7 @@ fn execute_plan(
         std::time::Duration::from_millis(10),
         sink,
         None,
-        None,
+        profiler,
         pipeline_dop as _,
         std::sync::Arc::new(RuntimeState::new(
             query_opts, None, None, None, None, None, None, None, None,
