@@ -102,7 +102,7 @@ pub(crate) fn execute_add_equality_delete_statement(
     let values_query = build_equality_delete_sink_query(&delete_columns, &stmt.rows)?;
 
     let current_snapshot_id = metadata.current_snapshot().map(|s| s.snapshot_id());
-    // Route non-empty input through the BE EqualityDeletes sink.
+    // Route non-empty input through the distributed sink transaction.
     run_equality_delete_distributed_transaction(
         state,
         &target,
@@ -735,16 +735,23 @@ mod tests {
 
     use crate::sql::parser::ast::Literal;
 
+    fn function_body<'a>(src: &'a str, name: &str) -> &'a str {
+        let rest = src
+            .split(&format!("fn {name}"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing function {name}"));
+        let end = ["\nfn ", "\nstruct ", "\nimpl ", "\n    fn "]
+            .into_iter()
+            .filter_map(|marker| rest.find(marker))
+            .min()
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
     #[test]
     fn equality_delete_writes_file_on_be_not_coordinator() {
         let src = include_str!("equality_delete_flow.rs");
-        let body = src
-            .split("fn execute_add_equality_delete_statement")
-            .nth(1)
-            .expect("fn")
-            .split("\nfn ")
-            .next()
-            .expect("body");
+        let body = function_body(src, "execute_add_equality_delete_statement");
         assert!(
             !body.contains("write_equality_delete_file"),
             "equality-delete must not write the file on the coordinator"
@@ -754,8 +761,45 @@ mod tests {
             "equality-delete must not wrap a coordinator-written file (FE central write)"
         );
         assert!(
-            body.contains("EqualityDeletes"),
-            "equality-delete must write via the BE EqualityDeletes sink"
+            body.contains("run_equality_delete_distributed_transaction"),
+            "equality-delete must route through the distributed equality-delete transaction"
+        );
+        assert!(
+            !body.contains("EqualityDeletes"),
+            "statement-body guard must not depend on a comment-only EqualityDeletes marker"
+        );
+    }
+
+    #[test]
+    fn equality_delete_distributed_transaction_uses_row_delta_equality_delete_sink() {
+        let src = include_str!("equality_delete_flow.rs");
+        let body = function_body(src, "run_equality_delete_distributed_transaction");
+        assert!(
+            body.contains("IcebergWriteSinkMode::EqualityDeletes"),
+            "distributed equality-delete transaction must set the EqualityDeletes sink mode"
+        );
+        assert!(
+            body.contains("CommitOpKind::RowDelta"),
+            "distributed equality-delete transaction must commit via RowDelta"
+        );
+    }
+
+    #[test]
+    fn equality_delete_distributed_executor_runs_sink_without_root_shuffle() {
+        let src = include_str!("equality_delete_flow.rs");
+        let body = function_body(src, "run_coordinated_write");
+        let compact_body = body.split_whitespace().collect::<String>();
+        assert!(
+            body.contains("execute_query_as_iceberg_write"),
+            "distributed equality-delete executor must write through execute_query_as_iceberg_write"
+        );
+        assert!(
+            compact_body.contains("self.sink_spec.clone(),None,None"),
+            "distributed equality-delete executor must not install a root shuffle resolver"
+        );
+        assert!(
+            !body.contains("iceberg_write_shuffle"),
+            "distributed equality-delete executor must not build a shuffle plan"
         );
     }
 
