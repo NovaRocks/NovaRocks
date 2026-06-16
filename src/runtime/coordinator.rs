@@ -755,6 +755,7 @@ fn data_sink_requires_write_report(sink: &data_sinks::TDataSink) -> bool {
         data_sinks::TDataSinkType::ICEBERG_TABLE_SINK
             | data_sinks::TDataSinkType::ICEBERG_DELETE_SINK
             | data_sinks::TDataSinkType::ICEBERG_DV_SINK
+            | data_sinks::TDataSinkType::ICEBERG_EQUALITY_DELETE_SINK
             | data_sinks::TDataSinkType::HIVE_TABLE_SINK
             | data_sinks::TDataSinkType::OLAP_TABLE_SINK
     )
@@ -2203,6 +2204,7 @@ mod tests {
             data_sinks::TDataSinkType::ICEBERG_TABLE_SINK,
             data_sinks::TDataSinkType::ICEBERG_DELETE_SINK,
             data_sinks::TDataSinkType::ICEBERG_DV_SINK,
+            data_sinks::TDataSinkType::ICEBERG_EQUALITY_DELETE_SINK,
             data_sinks::TDataSinkType::HIVE_TABLE_SINK,
             data_sinks::TDataSinkType::OLAP_TABLE_SINK,
         ] {
