@@ -67,6 +67,14 @@ pub struct IcebergCommitCollector {
     /// because abort cleanup applies regardless of which channel produced
     /// the file.
     injected: Mutex<Vec<WrittenFile>>,
+    /// Net-new data files (content == Data, NO preserved `_row_id`) that a folded
+    /// MERGE not-matched INSERT branch produced. Kept separate from `injected`
+    /// (the reuse channel) so the `RowDeltaDvFromFilesCommit` entry can route
+    /// them into the action's fresh `appended_files` channel — those rows MUST
+    /// draw fresh `_row_id`s, unlike the reuse replacement rows in `injected`.
+    /// Drained via [`take_appended_files`]. Empty for every non-folded path,
+    /// keeping MOR-UPDATE / DELETE byte-identical.
+    appended: Mutex<Vec<WrittenFile>>,
     /// Grouped `(referenced_data_file, positions)` records produced by the
     /// engine-side row-lineage DELETE flow. Only used when
     /// `op_kind == CommitOpKind::RowDeltaDv`. The `RowDeltaDvCommit` action
@@ -111,6 +119,7 @@ impl IcebergCommitCollector {
             finst_id,
             abort_log: Arc::new(AbortLog::new()),
             injected: Mutex::new(Vec::new()),
+            appended: Mutex::new(Vec::new()),
             delete_groups: Mutex::new(Vec::new()),
             sketch_sets: Mutex::new(Vec::new()),
             preserve_row_lineage: AtomicBool::new(false),
@@ -238,6 +247,41 @@ impl IcebergCommitCollector {
             .injected
             .lock()
             .expect("collector injected lock poisoned")
+            .is_empty()
+    }
+
+    /// Pre-load net-new INSERT data files (folded MERGE not-matched branch) into
+    /// the fresh-row-lineage channel. These rows carry NO preserved `_row_id`
+    /// and MUST draw fresh ids at commit time. Kept distinct from
+    /// [`inject_written_files`] (the reuse channel). Each path is recorded in the
+    /// [`AbortLog`] so abort cleanup still works.
+    pub(crate) fn inject_appended_files(&self, files: Vec<WrittenFile>) {
+        let mut guard = self
+            .appended
+            .lock()
+            .expect("collector appended lock poisoned");
+        for wf in files {
+            self.abort_log.record_data_file(wf.path.clone());
+            guard.push(wf);
+        }
+    }
+
+    /// Drain the net-new INSERT data files registered via
+    /// [`inject_appended_files`]. The `RowDeltaDvFromFilesCommit` entry routes
+    /// these into the action's fresh `appended_files` channel.
+    pub(crate) fn take_appended_files(&self) -> Vec<WrittenFile> {
+        let mut guard = self
+            .appended
+            .lock()
+            .expect("collector appended lock poisoned");
+        std::mem::take(&mut *guard)
+    }
+
+    pub(crate) fn has_injected_appended_files(&self) -> bool {
+        !self
+            .appended
+            .lock()
+            .expect("collector appended lock poisoned")
             .is_empty()
     }
 

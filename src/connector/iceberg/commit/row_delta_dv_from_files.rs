@@ -57,6 +57,13 @@ pub struct RowDeltaDvFromFilesCommit;
 impl IcebergCommitAction for RowDeltaDvFromFilesCommit {
     async fn commit(&self, ctx: CommitCtx<'_>) -> Result<CommitOutcome, String> {
         let written = ctx.collector.take_written_files()?;
+        // M3b: net-new INSERT data files from a folded MERGE not-matched branch
+        // arrive on a dedicated collector channel (the reuse `written` channel
+        // above carries only MOR-UPDATE replacement rows that preserve their
+        // `_row_id`s). The executor knows which writers were the INSERT branch
+        // and routed them here; the entry does NOT content-sniff. Empty for a
+        // plain MOR UPDATE / DELETE, keeping those paths byte-identical.
+        let appended_files = ctx.collector.take_appended_files();
         let groups = ctx.collector.take_delete_groups();
         if !groups.is_empty() {
             return Err(
@@ -65,12 +72,23 @@ impl IcebergCommitAction for RowDeltaDvFromFilesCommit {
             );
         }
 
-        if written.is_empty() {
+        if written.is_empty() && appended_files.is_empty() {
             let id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref).unwrap_or(0);
             return Ok(CommitOutcome {
                 new_snapshot_id: id,
                 written_manifest_paths: vec![],
             });
+        }
+        // Every appended file must be net-new INSERT data (content == Data); a
+        // DV/position-delete in this channel is a routing bug. Mirrors the
+        // `(Data, _)` partition guard for the reuse channel below.
+        for file in &appended_files {
+            if file.content != DataContentType::Data {
+                return Err(format!(
+                    "RowDeltaDvFromFilesCommit appended file {} has content {:?}; expected Data (net-new INSERT)",
+                    file.path, file.content
+                ));
+            }
         }
         let (written_dvs, written_data) = partition_written_for_dv_from_files(written)?;
         validate_unique_referenced_files(&written_dvs)?;
@@ -79,12 +97,10 @@ impl IcebergCommitAction for RowDeltaDvFromFilesCommit {
         let action = RowDeltaDvFromFilesTxnAction {
             written_dvs,
             written: written_data,
-            // M3a: net-new INSERT data (folded MERGE not-matched branch) is
-            // routed into this channel by the caller (M3b). The current
-            // entry-point partitions every `(Data, _)` file into the reuse
-            // `written` channel, so this defaults empty and existing callers
-            // (MOR UPDATE / plain DELETE) are byte-identical to before.
-            appended_files: Vec::new(),
+            // Fresh INSERT rows: see the channel comment above. The action leaves
+            // their manifest UNMARKED so the v3 manifest-list writer allocates
+            // fresh `_row_id`s and advances `next_row_id`.
+            appended_files,
             commit_uuid: ctx.commit_uuid,
             file_io: ctx.file_io.clone(),
             schema: ctx.table.metadata().current_schema().clone(),

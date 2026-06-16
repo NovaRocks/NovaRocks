@@ -177,14 +177,8 @@ fn execute_iceberg_insert_distributed(
     table_ident: TableIdent,
 ) -> Result<StatementResult, String> {
     let metadata = table.metadata();
-    let write_columns = iceberg_insert_columns_from_schema(metadata.current_schema())?;
-    let query = append_source_to_query_for_write(
-        source,
-        insert_columns,
-        &resolved.columns,
-        &write_columns,
-    )?;
-    let sink_spec = build_insert_write_sink_spec(target, resolved, &table, entry, &write_columns)?;
+    let (query, sink_spec) =
+        build_insert_write_plan(target, resolved, insert_columns, source, &table, entry)?;
 
     let commit_op_kind = commit_op_kind_for_overwrite_mode(overwrite_mode);
     let base_snapshot_id = write_base_snapshot_id(metadata, target_ref)?;
@@ -292,6 +286,31 @@ impl IcebergWriteTransactionExecutor for DistributedInsertWriteExecutor {
     fn finalize(&self, _spec: &IcebergWriteTransactionSpec) -> Result<(), String> {
         self.commit_executor.finalize()
     }
+}
+
+/// Build the `(query, sink_spec)` pair for an iceberg INSERT/OVERWRITE write
+/// without driving a transaction. The standalone INSERT path runs this through
+/// its own runner; the folded MERGE not-matched INSERT branch runs the same
+/// pair into a shared collector so the INSERT commits in the same snapshot as
+/// the matched branch. Factored out of `execute_iceberg_insert_distributed` so
+/// both callers share one query/sink construction (no semantic drift).
+pub(crate) fn build_insert_write_plan(
+    target: &TargetBackend,
+    resolved: &ResolvedTable,
+    insert_columns: &[String],
+    source: &InsertSource,
+    table: &iceberg::table::Table,
+    entry: &IcebergCatalogEntry,
+) -> Result<(sqlparser::ast::Query, IcebergWriteSinkSpec), String> {
+    let write_columns = iceberg_insert_columns_from_schema(table.metadata().current_schema())?;
+    let query = append_source_to_query_for_write(
+        source,
+        insert_columns,
+        &resolved.columns,
+        &write_columns,
+    )?;
+    let sink_spec = build_insert_write_sink_spec(target, resolved, table, entry, &write_columns)?;
+    Ok((query, sink_spec))
 }
 
 pub(crate) fn build_insert_write_sink_spec(
