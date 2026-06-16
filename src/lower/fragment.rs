@@ -47,6 +47,7 @@ use crate::{data_sinks, descriptors, internal_service, planner, types};
 #[derive(Clone, Debug)]
 pub(crate) struct FragmentOutput {
     pub(crate) profile_json: Option<String>,
+    pub(crate) profiler: Option<Profiler>,
 }
 
 fn merge_row_pos_descs(
@@ -614,7 +615,10 @@ pub(crate) fn execute_fragment(
                 ));
             }
         }
-        return Ok(FragmentOutput { profile_json: None });
+        return Ok(FragmentOutput {
+            profile_json: None,
+            profiler,
+        });
     }
 
     Err("unsupported fragment: missing plan".to_string())
