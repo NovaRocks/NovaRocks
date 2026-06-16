@@ -176,6 +176,7 @@ impl DescriptorTableBuilder {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn add_iceberg_table_with_partition_info(
         &mut self,
         table_id: types::TTableId,
