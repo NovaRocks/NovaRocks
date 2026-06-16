@@ -705,6 +705,17 @@ pub(crate) fn derive_group_statistics(
     table_stats: &HashMap<String, TableStatistics>,
 ) {
     for group_idx in 0..memo.groups.len() {
+        // Memoized derive: a group's logical_props are computed exactly once,
+        // when first needed (StarRocks isStatsDerived semantics). Safe because
+        // the memo is append-only — explore()/implement() only append new exprs
+        // and never rewrite an existing group's logical_exprs.first() in place,
+        // so re-deriving an already-computed group would reproduce the identical
+        // value. INVARIANT: any future rule that mutates an existing group's
+        // first logical expr in place MUST reset that group's logical_props to
+        // None, or this skip will serve stale statistics.
+        if memo.groups[group_idx].logical_props.is_some() {
+            continue;
+        }
         derive_group_statistics_for(memo, group_idx, table_stats);
     }
 }
@@ -716,6 +727,9 @@ pub(crate) fn derive_group_statistics(
 /// newly-created join group immediately, before `implement()` runs — otherwise
 /// a bushy join's children have no column ids and `JoinToHashJoin` degrades the
 /// join to a NestLoop.
+/// Callers rely on the append-only memo invariant: if a rule ever rewrites an
+/// existing group's first expression in place, it must reset that group's
+/// `logical_props` to `None` so a later derive recomputes it.
 pub(crate) fn derive_group_statistics_for(
     memo: &mut Memo,
     group_idx: usize,
@@ -4525,6 +4539,47 @@ mod tests {
         assert!(
             sel > 0.85 && sel < 0.93,
             "not-between selectivity was {sel}"
+        );
+    }
+
+    #[test]
+    fn derive_group_statistics_skips_already_computed_groups() {
+        use crate::sql::optimizer::memo::{LogicalProperties, MExpr, Memo};
+        use crate::sql::optimizer::operator::{LogicalValuesOp, Operator};
+        use std::collections::HashMap;
+
+        let mut memo = Memo::new();
+
+        // Group A: simulates a group computed by an earlier derive pass. The
+        // sentinel row_count 999_999 is a value the real derivation would never
+        // produce for an empty LogicalValues (which derives to 0).
+        let group_a = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalValues(LogicalValuesOp { rows: vec![], columns: vec![] }),
+            children: vec![],
+        });
+        memo.groups[group_a].logical_props = Some(LogicalProperties::new(vec![], 999_999.0));
+
+        // Group B: simulates a fresh group minted by implement() — logical_props=None.
+        let group_b = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalValues(LogicalValuesOp { rows: vec![], columns: vec![] }),
+            children: vec![],
+        });
+        assert!(memo.groups[group_b].logical_props.is_none());
+
+        derive_group_statistics(&mut memo, &HashMap::new());
+
+        // Group A was memoized/skipped — sentinel preserved (NOT recomputed to 0).
+        assert_eq!(
+            memo.groups[group_a].logical_props.as_ref().unwrap().row_count,
+            999_999.0,
+            "already-computed group must be skipped, not recomputed"
+        );
+        // Group B (None) must still be derived.
+        assert!(
+            memo.groups[group_b].logical_props.is_some(),
+            "fresh (None) group must still be derived"
         );
     }
 }
