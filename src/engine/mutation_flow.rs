@@ -1026,12 +1026,14 @@ fn build_position_delete_groups_from_matched(
     Ok(out)
 }
 
-// Intentionally a single-variant carrier. The COW and MOR UPDATE write plans are now
-// distributed (see `DistributedCowUpdateExecutor` / `DistributedMorUpdateExecutor`), so
-// the only path still routed through `MutationWriteExecutor` is the MERGE matched-DELETE
-// side, which still injects coordinator-built delete groups. This enum is deliberately
-// retained for Phase 3 (atomic MERGE), which folds every MERGE branch into one collector;
-// do not collapse it as a "dead abstraction" before then.
+// Now fully orphaned: as of Phase 3 M2, MERGE matched-DELETE writes its deletion vector
+// on the BE (`DistributedMergeMatchedDeleteExecutor`, a `DeletionVectors` sink committed
+// via `RowDeltaDvFromFiles`), so nothing routes through `MutationWriteExecutor` anymore —
+// COW/MOR UPDATE are distributed too (`DistributedCowUpdateExecutor` /
+// `DistributedMorUpdateExecutor`). This enum + `MutationWriteExecutor` +
+// `build_position_delete_groups_from_matched` + `run_mutation_write_transaction` are kept
+// only until Phase 3 M5 deletes the coordinator-local MERGE cluster; do not build new
+// callers on them.
 enum MutationWritePlan {
     MergeMatchedDelete { matched: MatchedUpdateBatch },
 }
