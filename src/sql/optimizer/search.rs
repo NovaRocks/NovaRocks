@@ -125,6 +125,13 @@ impl SearchContext {
         for expr_idx in 0..num_physical {
             let expr = &memo.groups[group_id].physical_exprs[expr_idx];
 
+            // own_stats is the cardinality of THIS physical expr; it does not
+            // depend on the property alternative, so derive it once per expr
+            // instead of once per (expr, alt). Kept per-expr (not the group
+            // cache) because same-group exprs can have different own_stats
+            // (see physical_hash_aggregate_own_stats_are_per_expr_not_per_group).
+            let own_stats = derive_statistics(expr, memo, &self.table_stats);
+
             let alternatives = super::derive::derive_required_alternatives(
                 &expr.op,
                 required,
@@ -165,7 +172,6 @@ impl SearchContext {
                     }
                 }
 
-                let own_stats = derive_statistics(expr, memo, &self.table_stats);
                 let child_stats_vec: Vec<_> = expr
                     .children
                     .iter()
