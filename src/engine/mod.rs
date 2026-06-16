@@ -3728,7 +3728,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         physical = collapse_distribution_enforcers_for_single_fragment(physical);
     }
     let build_result =
-        crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_with_mv_refresh_ctx(
+        crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_via_distributed_plan_with_mv_refresh_ctx(
             &physical,
             codegen_catalog,
             connectors,
