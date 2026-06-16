@@ -21,8 +21,9 @@ mod tests {
         BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, SortItem, TypedExpr,
     };
     use crate::sql::catalog::{
-        CatalogProvider, ColumnDef, IcebergDataFileBinding, IcebergDataFileInfo, IcebergSchemaDef,
-        IcebergTableInfo, ScanSource, TableDef,
+        CatalogProvider, ColumnDef, IcebergDataFileBinding, IcebergDataFileInfo,
+        IcebergMvTargetStatePartitionConstraint, IcebergMvTargetStateRowFilter,
+        IcebergMvTargetStateScan, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
     use crate::sql::codegen::fragment_builder::PlanFragmentBuilder;
     use crate::sql::codegen::{
@@ -501,10 +502,6 @@ mod tests {
     #[test]
     fn aggregate_state_merge_direct_exec_matches_ir_builder() {
         let ctx = aggregate_refresh_context_for_test();
-        // No stable pseudo-scan fixture lives in this harness yet: the local
-        // refresh context has no base catalog entries, and pseudo-scan lowering
-        // needs a loaded refresh catalog/table fixture. This still exercises
-        // mv_refresh_ctx through both direct-exec aggregate refresh paths.
         let plan = aggregate_state_merge_plan_for_context(&ctx);
         let (direct, distributed) = build_both_paths_with_mv_refresh_ctx(
             "aggregate_state_merge_direct_exec",
@@ -518,6 +515,31 @@ mod tests {
             &direct,
             &distributed,
         );
+    }
+
+    #[test]
+    fn mv_target_state_scan_matches_ir_builder() {
+        let ctx = scan_refresh_context_for_test();
+        let plan = target_state_scan_plan_for_context(&ctx);
+        let mut connectors = ConnectorRegistry::new();
+        connectors.register_scan_planner(Arc::new(IcebergConnectorScanPlanner::new()));
+        let (direct, distributed) = build_both_paths_with_mv_refresh_ctx(
+            "mv_target_state_scan",
+            plan,
+            &connectors,
+            Some(&ctx),
+        );
+
+        let root = fragment_by_id(
+            "mv_target_state_scan direct",
+            &direct,
+            direct.root_fragment_id,
+        );
+        assert!(
+            root.direct_exec.is_none(),
+            "target-state scan equivalence must exercise regular fragment build"
+        );
+        assert_multi_fragment_equivalent("mv_target_state_scan", &direct, &distributed);
     }
 
     #[test]
@@ -1202,6 +1224,85 @@ mod tests {
         )
     }
 
+    fn target_state_scan_plan_for_context(
+        ctx: &crate::engine::mv::refresh_context::IcebergMvRefreshContext,
+    ) -> PhysicalPlanNode {
+        let row_id = output_col(110, "__row_id__", DataType::Utf8, false);
+        let region = output_col(111, "region", DataType::Utf8, true);
+        let scan = target_state_scan_for_context(ctx);
+        physical_node(
+            Operator::PhysicalScan(PhysicalScanOp {
+                database: "ns".to_string(),
+                table: target_state_table_def(scan),
+                alias: Some("mv".to_string()),
+                columns: vec![row_id.clone(), region.clone()],
+                predicates: vec![],
+                required_columns: Some(vec!["__row_id__".to_string(), "region".to_string()]),
+                dict_columns: vec![],
+                variant_columns: vec![],
+                mv_rewritten_from: None,
+            }),
+            vec![],
+            vec![row_id, region],
+        )
+    }
+
+    fn target_state_scan_for_context(
+        ctx: &crate::engine::mv::refresh_context::IcebergMvRefreshContext,
+    ) -> IcebergMvTargetStateScan {
+        let (_, layout) = ctx
+            .rewrite
+            .aggregate_shape_and_layout_for_execution()
+            .expect("aggregate target-state layout");
+        IcebergMvTargetStateScan {
+            catalog: ctx.rewrite.target.catalog.clone(),
+            database: ctx.rewrite.target.namespace.clone(),
+            table: ctx.rewrite.target.table.clone(),
+            target_table_uuid: ctx.rewrite.target_table_uuid.clone(),
+            target_snapshot_id: ctx.rewrite.target_snapshot_id,
+            aggregate_state_layout_version: ctx
+                .rewrite
+                .schema_contract
+                .aggregate
+                .as_ref()
+                .expect("aggregate contract")
+                .state_layout_version,
+            columns: vec![
+                column_def("__row_id__", DataType::Utf8, false),
+                column_def("region", DataType::Utf8, true),
+            ],
+            group_key_names: vec!["region".to_string()],
+            aggregate_state_names: layout
+                .state_columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect(),
+            physical_column_names: layout
+                .physical_columns
+                .iter()
+                .map(|column| column.column.name.clone())
+                .collect(),
+            row_id_column_name: "__row_id__".to_string(),
+            row_filter: IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+                row_id_column_name: "__row_id__".to_string(),
+                branch_scope: None,
+            },
+            partition_constraint: IcebergMvTargetStatePartitionConstraint::Unpartitioned,
+        }
+    }
+
+    fn target_state_table_def(scan: IcebergMvTargetStateScan) -> TableDef {
+        TableDef {
+            name: scan.table.clone(),
+            columns: aggregate_physical_columns_for_test()
+                .into_iter()
+                .map(|column| column_def(&column.name, column.data_type, column.nullable))
+                .collect(),
+            iceberg_row_lineage_metadata_columns: vec![],
+            source: ScanSource::IcebergMvTargetState(scan),
+        }
+    }
+
     fn aggregate_merge_plan_for_test(
         old_child: PhysicalPlanNode,
         delta_child: PhysicalPlanNode,
@@ -1300,6 +1401,17 @@ mod tests {
 
     fn aggregate_refresh_context_for_test()
     -> crate::engine::mv::refresh_context::IcebergMvRefreshContext {
+        mv_refresh_context_for_test(Some(99))
+    }
+
+    fn scan_refresh_context_for_test() -> crate::engine::mv::refresh_context::IcebergMvRefreshContext
+    {
+        mv_refresh_context_for_test(None)
+    }
+
+    fn mv_refresh_context_for_test(
+        target_snapshot_id: Option<i64>,
+    ) -> crate::engine::mv::refresh_context::IcebergMvRefreshContext {
         use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
         use iceberg::{CatalogBuilder, NamespaceIdent, TableIdent};
 
@@ -1466,7 +1578,7 @@ mod tests {
             last_refresh_table_uuids: [("ice.ns.orders".to_string(), "uuid-orders".to_string())]
                 .into_iter()
                 .collect(),
-            last_refreshed_iceberg_snapshot_id: Some(99),
+            last_refreshed_iceberg_snapshot_id: target_snapshot_id,
             refresh_in_progress: false,
             active_refresh_id: None,
             refresh_target_snapshots: Default::default(),
@@ -1504,7 +1616,7 @@ mod tests {
                 query,
                 base_refs,
                 pin,
-                Some(99),
+                target_snapshot_id,
                 "uuid-target".to_string(),
                 target_schema.clone(),
                 Some(Arc::new(contract)),
