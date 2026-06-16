@@ -1092,547 +1092,51 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
     ) -> Result<LoweredDistributedNode, String> {
         let mut lowered = match &node.kind {
             super::node::DistributedPlanNodeKind::Scan(scan) => {
-                if !node.children.is_empty() {
-                    return Err(format!(
-                        "DistributedPlan Scan node_id={} expected 0 children, got {}",
-                        node.node_id,
-                        node.children.len()
-                    ));
-                }
-                let scan_tuple_id = first_tuple_id(node, "Scan")?;
-                let op = scan_node_to_physical_op(scan);
-                let (scan_plan_node, scope) = self.lower_scan(node.node_id, scan_tuple_id, &op)?;
-                LoweredDistributedNode {
-                    plan_nodes: vec![scan_plan_node],
-                    scope,
-                    tuple_ids: vec![scan_tuple_id],
-                    output_columns: op.columns.clone(),
-                    ordering: OrderingSpec::Any,
-                }
+                self.lower_scan_node(node, scan.as_ref())?
             }
             super::node::DistributedPlanNodeKind::Project(project) => {
-                if node.children.len() != 1 {
-                    return Err(format!(
-                        "DistributedPlan Project node_id={} expected 1 child, got {}",
-                        node.node_id,
-                        node.children.len()
-                    ));
-                }
-                let child = self.lower_node(&node.children[0])?;
-                let project_tuple_id = first_tuple_id(node, "Project")?;
-                let op = project_node_to_physical_op(project);
-                let (project_plan_node, scope, _output_columns) =
-                    self.lower_project(node.node_id, project_tuple_id, &op, &child.scope)?;
-                let mut plan_nodes = vec![project_plan_node];
-                plan_nodes.extend(child.plan_nodes);
-                LoweredDistributedNode {
-                    plan_nodes,
-                    scope,
-                    tuple_ids: vec![project_tuple_id],
-                    output_columns: project_node_output_columns(project),
-                    ordering: OrderingSpec::Any,
-                }
+                self.lower_project_node(node, project)?
             }
             super::node::DistributedPlanNodeKind::Filter(filter) => {
-                if node.children.len() != 1 {
-                    return Err(format!(
-                        "DistributedPlan Filter node_id={} expected 1 child, got {}",
-                        node.node_id,
-                        node.children.len()
-                    ));
-                }
-                let mut child = self.lower_node(&node.children[0])?;
-                let conjunct_refs = split_and_conjuncts_typed(&filter.predicate);
-                let mut conjuncts = Vec::with_capacity(conjunct_refs.len());
-                let mut compiler = ExprCompiler::new(self.state.slot_allocator(), &child.scope);
-                for conjunct in conjunct_refs {
-                    conjuncts.push(compiler.compile_typed(conjunct)?);
-                }
-
-                if !conjuncts.is_empty() {
-                    if let Some(first_node) = child.plan_nodes.first_mut() {
-                        let node_id = first_node.node_id;
-                        let extra_conjuncts = conjuncts.clone();
-                        first_node
-                            .conjuncts
-                            .get_or_insert_with(Vec::new)
-                            .extend(conjuncts);
-                        nodes::append_hdfs_scan_min_max_conjuncts(first_node, &extra_conjuncts);
-                        if let Some(planned) = self
-                            .state
-                            .scan_tables()
-                            .iter_mut()
-                            .find(|planned| planned.scan_node_id == node_id)
-                        {
-                            planned.min_max_conjuncts.extend(extra_conjuncts);
-                        }
-                    }
-                }
-
-                LoweredDistributedNode {
-                    plan_nodes: child.plan_nodes,
-                    scope: child.scope,
-                    tuple_ids: child.tuple_ids,
-                    output_columns: child.output_columns,
-                    ordering: child.ordering,
-                }
+                self.lower_filter_node(node, filter)?
             }
-            super::node::DistributedPlanNodeKind::Sort(sort) => {
-                if node.children.len() != 1 {
-                    return Err(format!(
-                        "DistributedPlan Sort node_id={} expected 1 child, got {}",
-                        node.node_id,
-                        node.children.len()
-                    ));
-                }
-                let child = self.lower_node(&node.children[0])?;
-                let op = sort_node_to_physical_op(sort);
-                let sort_plan_node = self.lower_sort(
-                    node.node_id,
-                    &op,
-                    &child.scope,
-                    &child.tuple_ids,
-                    &sort.output_columns,
-                    sort.offset,
-                )?;
-                let mut plan_nodes = vec![sort_plan_node];
-                plan_nodes.extend(child.plan_nodes);
-                LoweredDistributedNode {
-                    plan_nodes,
-                    scope: child.scope,
-                    tuple_ids: child.tuple_ids,
-                    output_columns: sort.output_columns.clone(),
-                    ordering: OrderingSpec::from_sort_items(&sort.items),
-                }
-            }
-            super::node::DistributedPlanNodeKind::TopN(topn) => {
-                if node.children.len() != 1 {
-                    return Err(format!(
-                        "DistributedPlan TopN node_id={} expected 1 child, got {}",
-                        node.node_id,
-                        node.children.len()
-                    ));
-                }
-                let child = self.lower_node(&node.children[0])?;
-                let op = top_n_node_to_physical_op(topn);
-                let top_n_plan_node = self.lower_top_n_single_or_partial(
-                    node.node_id,
-                    &op,
-                    &child.scope,
-                    &child.tuple_ids,
-                )?;
-                let mut plan_nodes = vec![top_n_plan_node];
-                plan_nodes.extend(child.plan_nodes);
-                LoweredDistributedNode {
-                    plan_nodes,
-                    scope: child.scope,
-                    tuple_ids: child.tuple_ids,
-                    output_columns: child.output_columns,
-                    ordering: OrderingSpec::from_sort_items(&topn.items),
-                }
-            }
+            super::node::DistributedPlanNodeKind::Sort(sort) => self.lower_sort_node(node, sort)?,
+            super::node::DistributedPlanNodeKind::TopN(topn) => self.lower_topn_node(node, topn)?,
             super::node::DistributedPlanNodeKind::Exchange(exchange) => {
-                if !node.children.is_empty() {
-                    return Err(format!(
-                        "DistributedPlan Exchange node_id={} expected 0 children, got {}",
-                        node.node_id,
-                        node.children.len()
-                    ));
-                }
-                match &exchange.flavor {
-                    super::kind::ExchangeFlavor::Distribution => {
-                        let source = self.lower_stream_exchange_source(node, exchange)?;
-                        LoweredDistributedNode {
-                            plan_nodes: vec![nodes::build_exchange_node(
-                                node.node_id,
-                                source.tuple_ids.clone(),
-                                exchange.partition_type,
-                            )],
-                            scope: source.scope,
-                            tuple_ids: source.tuple_ids,
-                            output_columns: source.output_columns,
-                            ordering: OrderingSpec::Any,
-                        }
-                    }
-                    super::kind::ExchangeFlavor::LimitOffset { limit, offset } => {
-                        let source = self.lower_stream_exchange_source(node, exchange)?;
-                        LoweredDistributedNode {
-                            plan_nodes: vec![nodes::build_limit_exchange_node(
-                                node.node_id,
-                                source.tuple_ids.clone(),
-                                exchange.partition_type,
-                                *limit,
-                                *offset,
-                            )],
-                            scope: source.scope,
-                            tuple_ids: source.tuple_ids,
-                            output_columns: source.output_columns,
-                            ordering: OrderingSpec::Any,
-                        }
-                    }
-                    super::kind::ExchangeFlavor::TopNSplit {
-                        items,
-                        limit,
-                        offset,
-                    } => {
-                        let source = self.lower_stream_exchange_source(node, exchange)?;
-                        let partial_sort_info =
-                            source.root_sort_info.clone().ok_or_else(|| {
-                                let got = source
-                                    .root_node_type
-                                    .map(|node_type| format!("{node_type:?}"))
-                                    .unwrap_or_else(|| "<empty>".to_string());
-                                format!(
-                                    "FINAL+split TopN (node_id={}): expected PARTIAL child's root to be SORT_NODE, got {}",
-                                    source.root_node_id.unwrap_or(-1),
-                                    got
-                                )
-                            })?;
-                        LoweredDistributedNode {
-                            plan_nodes: vec![nodes::build_merging_exchange_node(
-                                node.node_id,
-                                source.tuple_ids.clone(),
-                                exchange.partition_type,
-                                partial_sort_info,
-                                *limit,
-                                *offset,
-                            )],
-                            scope: source.scope,
-                            tuple_ids: source.tuple_ids,
-                            output_columns: source.output_columns,
-                            ordering: OrderingSpec::from_sort_items(items),
-                        }
-                    }
-                    super::kind::ExchangeFlavor::CteMulticast { .. } => {
-                        if self
-                            .state
-                            .lowered_fragment_output(exchange.source_fragment_id)
-                            .is_none()
-                        {
-                            self.state
-                                .ensure_fragment_lowered(exchange.source_fragment_id)?;
-                        }
-                        let exchange_tuple_id = first_tuple_id(node, "Exchange")?;
-                        let (scope, output_columns) = self.lower_cte_multicast_exchange_scope(
-                            exchange_tuple_id,
-                            node.node_id,
-                            exchange,
-                        )?;
-                        LoweredDistributedNode {
-                            plan_nodes: vec![nodes::build_exchange_node(
-                                node.node_id,
-                                vec![exchange_tuple_id],
-                                exchange.partition_type,
-                            )],
-                            scope,
-                            tuple_ids: vec![exchange_tuple_id],
-                            output_columns,
-                            ordering: OrderingSpec::Any,
-                        }
-                    }
-                }
+                self.lower_exchange_node(node, exchange)?
             }
             super::node::DistributedPlanNodeKind::HashAggregate(agg) => {
-                if node.children.len() != 1 {
-                    return Err(format!(
-                        "DistributedPlan HashAggregate node_id={} expected 1 child, got {}",
-                        node.node_id,
-                        node.children.len()
-                    ));
-                }
-                let child = self.lower_node(&node.children[0])?;
-                let agg_tuple_id = first_tuple_id(node, "HashAggregate")?;
-                let op = hash_aggregate_node_to_physical_op(agg);
-                let (agg_plan_node, scope) =
-                    self.lower_hash_aggregate(node.node_id, agg_tuple_id, &op, &child.scope)?;
-                let mut plan_nodes = vec![agg_plan_node];
-                plan_nodes.extend(child.plan_nodes);
-                LoweredDistributedNode {
-                    plan_nodes,
-                    scope,
-                    tuple_ids: vec![agg_tuple_id],
-                    output_columns: agg.output_columns.clone(),
-                    ordering: OrderingSpec::Any,
-                }
+                self.lower_hash_aggregate_node(node, agg.as_ref())?
             }
             super::node::DistributedPlanNodeKind::HashJoin(hash_join) => {
-                let (left_node, right_node) = binary_children(node, "HashJoin")?;
-                let left = self.lower_node(left_node)?;
-                let right = self.lower_node(right_node)?;
-                let LoweredDistributedNode {
-                    plan_nodes: left_plan_nodes,
-                    scope: left_scope,
-                    tuple_ids: left_tuple_ids,
-                    ..
-                } = left;
-                let LoweredDistributedNode {
-                    plan_nodes: right_plan_nodes,
-                    scope: right_scope,
-                    tuple_ids: right_tuple_ids,
-                    ..
-                } = right;
-                let op = hash_join_node_to_physical_op(hash_join);
-                let (join_plan_node, scope, tuple_ids) = self.lower_hash_join(
-                    node.node_id,
-                    &left_tuple_ids,
-                    &right_tuple_ids,
-                    &op,
-                    left_scope,
-                    right_scope,
-                    node.execution_join_distribution,
-                    &node.build_runtime_filters,
-                )?;
-                let mut plan_nodes = vec![join_plan_node];
-                plan_nodes.extend(left_plan_nodes);
-                plan_nodes.extend(right_plan_nodes);
-                LoweredDistributedNode {
-                    plan_nodes,
-                    scope,
-                    tuple_ids,
-                    output_columns: Vec::new(),
-                    ordering: OrderingSpec::Any,
-                }
+                self.lower_hash_join_node(node, hash_join.as_ref())?
             }
             super::node::DistributedPlanNodeKind::NestLoopJoin(nest_loop) => {
-                let (left_node, right_node) = binary_children(node, "NestLoopJoin")?;
-                let left = self.lower_node(left_node)?;
-                let right = self.lower_node(right_node)?;
-                let LoweredDistributedNode {
-                    plan_nodes: left_plan_nodes,
-                    scope: left_scope,
-                    tuple_ids: left_tuple_ids,
-                    ..
-                } = left;
-                let LoweredDistributedNode {
-                    plan_nodes: right_plan_nodes,
-                    scope: right_scope,
-                    tuple_ids: right_tuple_ids,
-                    ..
-                } = right;
-                let op = nest_loop_join_node_to_physical_op(nest_loop);
-                let (join_plan_node, scope, tuple_ids) = self.lower_nest_loop_join(
-                    node.node_id,
-                    &left_tuple_ids,
-                    &right_tuple_ids,
-                    &op,
-                    left_scope,
-                    right_scope,
-                )?;
-                let mut plan_nodes = vec![join_plan_node];
-                plan_nodes.extend(left_plan_nodes);
-                plan_nodes.extend(right_plan_nodes);
-                LoweredDistributedNode {
-                    plan_nodes,
-                    scope,
-                    tuple_ids,
-                    output_columns: Vec::new(),
-                    ordering: OrderingSpec::Any,
-                }
+                self.lower_nest_loop_join_node(node, nest_loop)?
             }
             super::node::DistributedPlanNodeKind::Values(values) => {
-                if !node.children.is_empty() {
-                    return Err(format!(
-                        "DistributedPlan Values node_id={} expected 0 children, got {}",
-                        node.node_id,
-                        node.children.len()
-                    ));
-                }
-                let tuple_id = first_tuple_id(node, "Values")?;
-                let op = values_node_to_physical_op(values);
-                let (plan_node, scope) = self.lower_values(node.node_id, tuple_id, &op)?;
-                LoweredDistributedNode {
-                    plan_nodes: vec![plan_node],
-                    scope,
-                    tuple_ids: vec![tuple_id],
-                    output_columns: values.columns.clone(),
-                    ordering: OrderingSpec::Any,
-                }
+                self.lower_values_node(node, values)?
             }
             super::node::DistributedPlanNodeKind::AssertOneRow(assert_one_row) => {
-                if node.children.len() != 1 {
-                    return Err(format!(
-                        "DistributedPlan AssertOneRow node_id={} expected 1 child, got {}",
-                        node.node_id,
-                        node.children.len()
-                    ));
-                }
-                let child = self.lower_node(&node.children[0])?;
-                let op = assert_one_row_node_to_physical_op(assert_one_row);
-                let plan_node = self.lower_assert_one_row(node.node_id, &op, &child.tuple_ids);
-                let mut plan_nodes = vec![plan_node];
-                plan_nodes.extend(child.plan_nodes);
-                LoweredDistributedNode {
-                    plan_nodes,
-                    scope: child.scope,
-                    tuple_ids: child.tuple_ids,
-                    output_columns: child.output_columns,
-                    ordering: child.ordering,
-                }
+                self.lower_assert_one_row_node(node, assert_one_row)?
             }
             super::node::DistributedPlanNodeKind::Decode(decode) => {
-                if node.children.len() != 1 {
-                    return Err(format!(
-                        "DistributedPlan Decode node_id={} expected 1 child, got {}",
-                        node.node_id,
-                        node.children.len()
-                    ));
-                }
-                let child = self.lower_node(&node.children[0])?;
-                let tuple_id = first_tuple_id(node, "Decode")?;
-                let op = decode_node_to_physical_op(decode);
-                let (plan_node, scope) =
-                    self.lower_decode(node.node_id, tuple_id, &op, &child.scope)?;
-                let mut plan_nodes = vec![plan_node];
-                plan_nodes.extend(child.plan_nodes);
-                LoweredDistributedNode {
-                    plan_nodes,
-                    scope,
-                    tuple_ids: vec![tuple_id],
-                    output_columns: decode.output_columns.clone(),
-                    ordering: OrderingSpec::Any,
-                }
+                self.lower_decode_node(node, decode)?
             }
             super::node::DistributedPlanNodeKind::Repeat(repeat) => {
-                if node.children.len() != 1 {
-                    return Err(format!(
-                        "DistributedPlan Repeat node_id={} expected 1 child, got {}",
-                        node.node_id,
-                        node.children.len()
-                    ));
-                }
-                let child = self.lower_node(&node.children[0])?;
-                let op = repeat_node_to_physical_op(repeat);
-                let (plan_node, scope, tuple_ids, output_columns) = self.lower_repeat(
-                    node.node_id,
-                    repeat.virtual_tuple_id,
-                    &op,
-                    child.scope,
-                    child.tuple_ids,
-                    child.output_columns,
-                )?;
-                let mut plan_nodes = vec![plan_node];
-                plan_nodes.extend(child.plan_nodes);
-                LoweredDistributedNode {
-                    plan_nodes,
-                    scope,
-                    tuple_ids,
-                    output_columns,
-                    ordering: OrderingSpec::Any,
-                }
+                self.lower_repeat_node(node, repeat.as_ref())?
             }
             super::node::DistributedPlanNodeKind::SetOp(set_op) => {
-                if node.children.is_empty() {
-                    return Err("DistributedPlan SetOp has no inputs".to_string());
-                }
-                if !set_op.child_output_columns.is_empty()
-                    && set_op.child_output_columns.len() != node.children.len()
-                {
-                    return Err(format!(
-                        "DistributedPlan SetOp node_id={} child_output_columns has {}, children has {}",
-                        node.node_id,
-                        set_op.child_output_columns.len(),
-                        node.children.len()
-                    ));
-                }
-                let mut children = Vec::with_capacity(node.children.len());
-                for child_node in &node.children {
-                    children.push(self.lower_node(child_node)?);
-                }
-                let tuple_id = first_tuple_id(node, "SetOp")?;
-                let (plan_node, scope) = self.lower_set_op(
-                    node.node_id,
-                    tuple_id,
-                    set_op.kind,
-                    &set_op.output_columns,
-                    &set_op.child_output_columns,
-                    &children,
-                )?;
-                let mut plan_nodes = vec![plan_node];
-                for child in children {
-                    plan_nodes.extend(child.plan_nodes);
-                }
-                LoweredDistributedNode {
-                    plan_nodes,
-                    scope,
-                    tuple_ids: vec![tuple_id],
-                    output_columns: set_op.output_columns.clone(),
-                    ordering: OrderingSpec::Any,
-                }
+                self.lower_set_op_node(node, set_op)?
             }
             super::node::DistributedPlanNodeKind::Window(window) => {
-                if node.children.len() != 1 {
-                    return Err(format!(
-                        "DistributedPlan Window node_id={} expected 1 child, got {}",
-                        node.node_id,
-                        node.children.len()
-                    ));
-                }
-                let child = self.lower_node(&node.children[0])?;
-                let (mut plan_nodes, scope, tuple_ids, ordering) = self.lower_window(
-                    node.node_id,
-                    &node.tuple_ids,
-                    window,
-                    &child.scope,
-                    &child.tuple_ids,
-                    &child.ordering,
-                )?;
-                plan_nodes.extend(child.plan_nodes);
-                LoweredDistributedNode {
-                    plan_nodes,
-                    scope,
-                    tuple_ids,
-                    output_columns: window.output_columns.clone(),
-                    ordering,
-                }
+                self.lower_window_node(node, window.as_ref())?
             }
             super::node::DistributedPlanNodeKind::GenerateSeries(generate_series) => {
-                if !node.children.is_empty() {
-                    return Err(format!(
-                        "DistributedPlan GenerateSeries node_id={} expected 0 children, got {}",
-                        node.node_id,
-                        node.children.len()
-                    ));
-                }
-                let output_tuple_id = first_tuple_id(node, "GenerateSeries")?;
-                let op = generate_series_node_to_physical_op(generate_series);
-                let (plan_nodes, scope) =
-                    self.lower_generate_series(node.node_id, output_tuple_id, &op)?;
-                LoweredDistributedNode {
-                    plan_nodes,
-                    scope,
-                    tuple_ids: vec![output_tuple_id],
-                    output_columns: vec![AnalysisOutputColumn {
-                        column_id: generate_series.output_column_id,
-                        name: generate_series.column_name.clone(),
-                        data_type: DataType::Int64,
-                        nullable: false,
-                        is_internal: false,
-                    }],
-                    ordering: OrderingSpec::Any,
-                }
+                self.lower_generate_series_node(node, generate_series)?
             }
             super::node::DistributedPlanNodeKind::TableFunction(table_function) => {
-                if node.children.len() != 1 {
-                    return Err(format!(
-                        "DistributedPlan TableFunction node_id={} expected 1 child, got {}",
-                        node.node_id,
-                        node.children.len()
-                    ));
-                }
-                let child = self.lower_node(&node.children[0])?;
-                let output_tuple_id = first_tuple_id(node, "TableFunction")?;
-                let op = table_function_node_to_physical_op(table_function);
-                let (table_fn_nodes, scope) =
-                    self.lower_table_function(node.node_id, output_tuple_id, &op, &child.scope)?;
-                let mut plan_nodes = table_fn_nodes;
-                plan_nodes.extend(child.plan_nodes);
-                LoweredDistributedNode {
-                    plan_nodes,
-                    scope,
-                    tuple_ids: vec![output_tuple_id],
-                    output_columns: table_function.output_columns.clone(),
-                    ordering: OrderingSpec::Any,
-                }
+                self.lower_table_function_node(node, table_function.as_ref())?
             }
         };
         if let Some(root) = lowered.plan_nodes.first_mut() {
@@ -1640,6 +1144,627 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         }
         self.record_probe_targets(node, &lowered);
         Ok(lowered)
+    }
+
+    fn lower_scan_node(
+        &mut self,
+        node: &super::node::DistributedPlanNode,
+        scan: &super::kind::DistributedScanNode,
+    ) -> Result<LoweredDistributedNode, String> {
+        if !node.children.is_empty() {
+            return Err(format!(
+                "DistributedPlan Scan node_id={} expected 0 children, got {}",
+                node.node_id,
+                node.children.len()
+            ));
+        }
+        let scan_tuple_id = first_tuple_id(node, "Scan")?;
+        let op = scan_node_to_physical_op(scan);
+        let (scan_plan_node, scope) = self.lower_scan(node.node_id, scan_tuple_id, &op)?;
+        Ok(LoweredDistributedNode {
+            plan_nodes: vec![scan_plan_node],
+            scope,
+            tuple_ids: vec![scan_tuple_id],
+            output_columns: op.columns.clone(),
+            ordering: OrderingSpec::Any,
+        })
+    }
+
+    fn lower_project_node(
+        &mut self,
+        node: &super::node::DistributedPlanNode,
+        project: &super::kind::DistributedProjectNode,
+    ) -> Result<LoweredDistributedNode, String> {
+        if node.children.len() != 1 {
+            return Err(format!(
+                "DistributedPlan Project node_id={} expected 1 child, got {}",
+                node.node_id,
+                node.children.len()
+            ));
+        }
+        let child = self.lower_node(&node.children[0])?;
+        let project_tuple_id = first_tuple_id(node, "Project")?;
+        let op = project_node_to_physical_op(project);
+        let (project_plan_node, scope, _output_columns) =
+            self.lower_project(node.node_id, project_tuple_id, &op, &child.scope)?;
+        let mut plan_nodes = vec![project_plan_node];
+        plan_nodes.extend(child.plan_nodes);
+        Ok(LoweredDistributedNode {
+            plan_nodes,
+            scope,
+            tuple_ids: vec![project_tuple_id],
+            output_columns: project_node_output_columns(project),
+            ordering: OrderingSpec::Any,
+        })
+    }
+
+    fn lower_filter_node(
+        &mut self,
+        node: &super::node::DistributedPlanNode,
+        filter: &super::kind::DistributedFilterNode,
+    ) -> Result<LoweredDistributedNode, String> {
+        if node.children.len() != 1 {
+            return Err(format!(
+                "DistributedPlan Filter node_id={} expected 1 child, got {}",
+                node.node_id,
+                node.children.len()
+            ));
+        }
+        let mut child = self.lower_node(&node.children[0])?;
+        let conjunct_refs = split_and_conjuncts_typed(&filter.predicate);
+        let mut conjuncts = Vec::with_capacity(conjunct_refs.len());
+        let mut compiler = ExprCompiler::new(self.state.slot_allocator(), &child.scope);
+        for conjunct in conjunct_refs {
+            conjuncts.push(compiler.compile_typed(conjunct)?);
+        }
+
+        if !conjuncts.is_empty() {
+            if let Some(first_node) = child.plan_nodes.first_mut() {
+                let node_id = first_node.node_id;
+                let extra_conjuncts = conjuncts.clone();
+                first_node
+                    .conjuncts
+                    .get_or_insert_with(Vec::new)
+                    .extend(conjuncts);
+                nodes::append_hdfs_scan_min_max_conjuncts(first_node, &extra_conjuncts);
+                if let Some(planned) = self
+                    .state
+                    .scan_tables()
+                    .iter_mut()
+                    .find(|planned| planned.scan_node_id == node_id)
+                {
+                    planned.min_max_conjuncts.extend(extra_conjuncts);
+                }
+            }
+        }
+
+        Ok(LoweredDistributedNode {
+            plan_nodes: child.plan_nodes,
+            scope: child.scope,
+            tuple_ids: child.tuple_ids,
+            output_columns: child.output_columns,
+            ordering: child.ordering,
+        })
+    }
+
+    fn lower_sort_node(
+        &mut self,
+        node: &super::node::DistributedPlanNode,
+        sort: &super::kind::DistributedSortNode,
+    ) -> Result<LoweredDistributedNode, String> {
+        if node.children.len() != 1 {
+            return Err(format!(
+                "DistributedPlan Sort node_id={} expected 1 child, got {}",
+                node.node_id,
+                node.children.len()
+            ));
+        }
+        let child = self.lower_node(&node.children[0])?;
+        let op = sort_node_to_physical_op(sort);
+        let sort_plan_node = self.lower_sort(
+            node.node_id,
+            &op,
+            &child.scope,
+            &child.tuple_ids,
+            &sort.output_columns,
+            sort.offset,
+        )?;
+        let mut plan_nodes = vec![sort_plan_node];
+        plan_nodes.extend(child.plan_nodes);
+        Ok(LoweredDistributedNode {
+            plan_nodes,
+            scope: child.scope,
+            tuple_ids: child.tuple_ids,
+            output_columns: sort.output_columns.clone(),
+            ordering: OrderingSpec::from_sort_items(&sort.items),
+        })
+    }
+
+    fn lower_topn_node(
+        &mut self,
+        node: &super::node::DistributedPlanNode,
+        topn: &super::kind::DistributedTopNNode,
+    ) -> Result<LoweredDistributedNode, String> {
+        if node.children.len() != 1 {
+            return Err(format!(
+                "DistributedPlan TopN node_id={} expected 1 child, got {}",
+                node.node_id,
+                node.children.len()
+            ));
+        }
+        let child = self.lower_node(&node.children[0])?;
+        let op = top_n_node_to_physical_op(topn);
+        let top_n_plan_node =
+            self.lower_top_n_single_or_partial(node.node_id, &op, &child.scope, &child.tuple_ids)?;
+        let mut plan_nodes = vec![top_n_plan_node];
+        plan_nodes.extend(child.plan_nodes);
+        Ok(LoweredDistributedNode {
+            plan_nodes,
+            scope: child.scope,
+            tuple_ids: child.tuple_ids,
+            output_columns: child.output_columns,
+            ordering: OrderingSpec::from_sort_items(&topn.items),
+        })
+    }
+
+    fn lower_exchange_node(
+        &mut self,
+        node: &super::node::DistributedPlanNode,
+        exchange: &super::kind::DistributedExchangeNode,
+    ) -> Result<LoweredDistributedNode, String> {
+        if !node.children.is_empty() {
+            return Err(format!(
+                "DistributedPlan Exchange node_id={} expected 0 children, got {}",
+                node.node_id,
+                node.children.len()
+            ));
+        }
+        match &exchange.flavor {
+            super::kind::ExchangeFlavor::Distribution => {
+                let source = self.lower_stream_exchange_source(node, exchange)?;
+                Ok(LoweredDistributedNode {
+                    plan_nodes: vec![nodes::build_exchange_node(
+                        node.node_id,
+                        source.tuple_ids.clone(),
+                        exchange.partition_type,
+                    )],
+                    scope: source.scope,
+                    tuple_ids: source.tuple_ids,
+                    output_columns: source.output_columns,
+                    ordering: OrderingSpec::Any,
+                })
+            }
+            super::kind::ExchangeFlavor::LimitOffset { limit, offset } => {
+                let source = self.lower_stream_exchange_source(node, exchange)?;
+                Ok(LoweredDistributedNode {
+                    plan_nodes: vec![nodes::build_limit_exchange_node(
+                        node.node_id,
+                        source.tuple_ids.clone(),
+                        exchange.partition_type,
+                        *limit,
+                        *offset,
+                    )],
+                    scope: source.scope,
+                    tuple_ids: source.tuple_ids,
+                    output_columns: source.output_columns,
+                    ordering: OrderingSpec::Any,
+                })
+            }
+            super::kind::ExchangeFlavor::TopNSplit {
+                items,
+                limit,
+                offset,
+            } => {
+                let source = self.lower_stream_exchange_source(node, exchange)?;
+                let partial_sort_info = source.root_sort_info.clone().ok_or_else(|| {
+                    let got = source
+                        .root_node_type
+                        .map(|node_type| format!("{node_type:?}"))
+                        .unwrap_or_else(|| "<empty>".to_string());
+                    format!(
+                        "FINAL+split TopN (node_id={}): expected PARTIAL child's root to be SORT_NODE, got {}",
+                        source.root_node_id.unwrap_or(-1),
+                        got
+                    )
+                })?;
+                Ok(LoweredDistributedNode {
+                    plan_nodes: vec![nodes::build_merging_exchange_node(
+                        node.node_id,
+                        source.tuple_ids.clone(),
+                        exchange.partition_type,
+                        partial_sort_info,
+                        *limit,
+                        *offset,
+                    )],
+                    scope: source.scope,
+                    tuple_ids: source.tuple_ids,
+                    output_columns: source.output_columns,
+                    ordering: OrderingSpec::from_sort_items(items),
+                })
+            }
+            super::kind::ExchangeFlavor::CteMulticast { .. } => {
+                if self
+                    .state
+                    .lowered_fragment_output(exchange.source_fragment_id)
+                    .is_none()
+                {
+                    self.state
+                        .ensure_fragment_lowered(exchange.source_fragment_id)?;
+                }
+                let exchange_tuple_id = first_tuple_id(node, "Exchange")?;
+                let (scope, output_columns) = self.lower_cte_multicast_exchange_scope(
+                    exchange_tuple_id,
+                    node.node_id,
+                    exchange,
+                )?;
+                Ok(LoweredDistributedNode {
+                    plan_nodes: vec![nodes::build_exchange_node(
+                        node.node_id,
+                        vec![exchange_tuple_id],
+                        exchange.partition_type,
+                    )],
+                    scope,
+                    tuple_ids: vec![exchange_tuple_id],
+                    output_columns,
+                    ordering: OrderingSpec::Any,
+                })
+            }
+        }
+    }
+
+    fn lower_hash_aggregate_node(
+        &mut self,
+        node: &super::node::DistributedPlanNode,
+        agg: &super::kind::DistributedHashAggregateNode,
+    ) -> Result<LoweredDistributedNode, String> {
+        if node.children.len() != 1 {
+            return Err(format!(
+                "DistributedPlan HashAggregate node_id={} expected 1 child, got {}",
+                node.node_id,
+                node.children.len()
+            ));
+        }
+        let child = self.lower_node(&node.children[0])?;
+        let agg_tuple_id = first_tuple_id(node, "HashAggregate")?;
+        let op = hash_aggregate_node_to_physical_op(agg);
+        let (agg_plan_node, scope) =
+            self.lower_hash_aggregate(node.node_id, agg_tuple_id, &op, &child.scope)?;
+        let mut plan_nodes = vec![agg_plan_node];
+        plan_nodes.extend(child.plan_nodes);
+        Ok(LoweredDistributedNode {
+            plan_nodes,
+            scope,
+            tuple_ids: vec![agg_tuple_id],
+            output_columns: agg.output_columns.clone(),
+            ordering: OrderingSpec::Any,
+        })
+    }
+
+    fn lower_hash_join_node(
+        &mut self,
+        node: &super::node::DistributedPlanNode,
+        hash_join: &super::kind::DistributedHashJoinNode,
+    ) -> Result<LoweredDistributedNode, String> {
+        let (left_node, right_node) = binary_children(node, "HashJoin")?;
+        let left = self.lower_node(left_node)?;
+        let right = self.lower_node(right_node)?;
+        let LoweredDistributedNode {
+            plan_nodes: left_plan_nodes,
+            scope: left_scope,
+            tuple_ids: left_tuple_ids,
+            ..
+        } = left;
+        let LoweredDistributedNode {
+            plan_nodes: right_plan_nodes,
+            scope: right_scope,
+            tuple_ids: right_tuple_ids,
+            ..
+        } = right;
+        let op = hash_join_node_to_physical_op(hash_join);
+        let (join_plan_node, scope, tuple_ids) = self.lower_hash_join(
+            node.node_id,
+            &left_tuple_ids,
+            &right_tuple_ids,
+            &op,
+            left_scope,
+            right_scope,
+            node.execution_join_distribution,
+            &node.build_runtime_filters,
+        )?;
+        let mut plan_nodes = vec![join_plan_node];
+        plan_nodes.extend(left_plan_nodes);
+        plan_nodes.extend(right_plan_nodes);
+        Ok(LoweredDistributedNode {
+            plan_nodes,
+            scope,
+            tuple_ids,
+            output_columns: Vec::new(),
+            ordering: OrderingSpec::Any,
+        })
+    }
+
+    fn lower_nest_loop_join_node(
+        &mut self,
+        node: &super::node::DistributedPlanNode,
+        nest_loop: &super::kind::DistributedNestLoopJoinNode,
+    ) -> Result<LoweredDistributedNode, String> {
+        let (left_node, right_node) = binary_children(node, "NestLoopJoin")?;
+        let left = self.lower_node(left_node)?;
+        let right = self.lower_node(right_node)?;
+        let LoweredDistributedNode {
+            plan_nodes: left_plan_nodes,
+            scope: left_scope,
+            tuple_ids: left_tuple_ids,
+            ..
+        } = left;
+        let LoweredDistributedNode {
+            plan_nodes: right_plan_nodes,
+            scope: right_scope,
+            tuple_ids: right_tuple_ids,
+            ..
+        } = right;
+        let op = nest_loop_join_node_to_physical_op(nest_loop);
+        let (join_plan_node, scope, tuple_ids) = self.lower_nest_loop_join(
+            node.node_id,
+            &left_tuple_ids,
+            &right_tuple_ids,
+            &op,
+            left_scope,
+            right_scope,
+        )?;
+        let mut plan_nodes = vec![join_plan_node];
+        plan_nodes.extend(left_plan_nodes);
+        plan_nodes.extend(right_plan_nodes);
+        Ok(LoweredDistributedNode {
+            plan_nodes,
+            scope,
+            tuple_ids,
+            output_columns: Vec::new(),
+            ordering: OrderingSpec::Any,
+        })
+    }
+
+    fn lower_values_node(
+        &mut self,
+        node: &super::node::DistributedPlanNode,
+        values: &super::kind::DistributedValuesNode,
+    ) -> Result<LoweredDistributedNode, String> {
+        if !node.children.is_empty() {
+            return Err(format!(
+                "DistributedPlan Values node_id={} expected 0 children, got {}",
+                node.node_id,
+                node.children.len()
+            ));
+        }
+        let tuple_id = first_tuple_id(node, "Values")?;
+        let op = values_node_to_physical_op(values);
+        let (plan_node, scope) = self.lower_values(node.node_id, tuple_id, &op)?;
+        Ok(LoweredDistributedNode {
+            plan_nodes: vec![plan_node],
+            scope,
+            tuple_ids: vec![tuple_id],
+            output_columns: values.columns.clone(),
+            ordering: OrderingSpec::Any,
+        })
+    }
+
+    fn lower_assert_one_row_node(
+        &mut self,
+        node: &super::node::DistributedPlanNode,
+        assert_one_row: &super::kind::DistributedAssertOneRowNode,
+    ) -> Result<LoweredDistributedNode, String> {
+        if node.children.len() != 1 {
+            return Err(format!(
+                "DistributedPlan AssertOneRow node_id={} expected 1 child, got {}",
+                node.node_id,
+                node.children.len()
+            ));
+        }
+        let child = self.lower_node(&node.children[0])?;
+        let op = assert_one_row_node_to_physical_op(assert_one_row);
+        let plan_node = self.lower_assert_one_row(node.node_id, &op, &child.tuple_ids);
+        let mut plan_nodes = vec![plan_node];
+        plan_nodes.extend(child.plan_nodes);
+        Ok(LoweredDistributedNode {
+            plan_nodes,
+            scope: child.scope,
+            tuple_ids: child.tuple_ids,
+            output_columns: child.output_columns,
+            ordering: child.ordering,
+        })
+    }
+
+    fn lower_decode_node(
+        &mut self,
+        node: &super::node::DistributedPlanNode,
+        decode: &super::kind::DistributedDecodeNode,
+    ) -> Result<LoweredDistributedNode, String> {
+        if node.children.len() != 1 {
+            return Err(format!(
+                "DistributedPlan Decode node_id={} expected 1 child, got {}",
+                node.node_id,
+                node.children.len()
+            ));
+        }
+        let child = self.lower_node(&node.children[0])?;
+        let tuple_id = first_tuple_id(node, "Decode")?;
+        let op = decode_node_to_physical_op(decode);
+        let (plan_node, scope) = self.lower_decode(node.node_id, tuple_id, &op, &child.scope)?;
+        let mut plan_nodes = vec![plan_node];
+        plan_nodes.extend(child.plan_nodes);
+        Ok(LoweredDistributedNode {
+            plan_nodes,
+            scope,
+            tuple_ids: vec![tuple_id],
+            output_columns: decode.output_columns.clone(),
+            ordering: OrderingSpec::Any,
+        })
+    }
+
+    fn lower_repeat_node(
+        &mut self,
+        node: &super::node::DistributedPlanNode,
+        repeat: &super::kind::DistributedRepeatNode,
+    ) -> Result<LoweredDistributedNode, String> {
+        if node.children.len() != 1 {
+            return Err(format!(
+                "DistributedPlan Repeat node_id={} expected 1 child, got {}",
+                node.node_id,
+                node.children.len()
+            ));
+        }
+        let child = self.lower_node(&node.children[0])?;
+        let op = repeat_node_to_physical_op(repeat);
+        let (plan_node, scope, tuple_ids, output_columns) = self.lower_repeat(
+            node.node_id,
+            repeat.virtual_tuple_id,
+            &op,
+            child.scope,
+            child.tuple_ids,
+            child.output_columns,
+        )?;
+        let mut plan_nodes = vec![plan_node];
+        plan_nodes.extend(child.plan_nodes);
+        Ok(LoweredDistributedNode {
+            plan_nodes,
+            scope,
+            tuple_ids,
+            output_columns,
+            ordering: OrderingSpec::Any,
+        })
+    }
+
+    fn lower_set_op_node(
+        &mut self,
+        node: &super::node::DistributedPlanNode,
+        set_op: &super::kind::DistributedSetOpNode,
+    ) -> Result<LoweredDistributedNode, String> {
+        if node.children.is_empty() {
+            return Err("DistributedPlan SetOp has no inputs".to_string());
+        }
+        if !set_op.child_output_columns.is_empty()
+            && set_op.child_output_columns.len() != node.children.len()
+        {
+            return Err(format!(
+                "DistributedPlan SetOp node_id={} child_output_columns has {}, children has {}",
+                node.node_id,
+                set_op.child_output_columns.len(),
+                node.children.len()
+            ));
+        }
+        let mut children = Vec::with_capacity(node.children.len());
+        for child_node in &node.children {
+            children.push(self.lower_node(child_node)?);
+        }
+        let tuple_id = first_tuple_id(node, "SetOp")?;
+        let (plan_node, scope) = self.lower_set_op(
+            node.node_id,
+            tuple_id,
+            set_op.kind,
+            &set_op.output_columns,
+            &set_op.child_output_columns,
+            &children,
+        )?;
+        let mut plan_nodes = vec![plan_node];
+        for child in children {
+            plan_nodes.extend(child.plan_nodes);
+        }
+        Ok(LoweredDistributedNode {
+            plan_nodes,
+            scope,
+            tuple_ids: vec![tuple_id],
+            output_columns: set_op.output_columns.clone(),
+            ordering: OrderingSpec::Any,
+        })
+    }
+
+    fn lower_window_node(
+        &mut self,
+        node: &super::node::DistributedPlanNode,
+        window: &super::kind::DistributedWindowNode,
+    ) -> Result<LoweredDistributedNode, String> {
+        if node.children.len() != 1 {
+            return Err(format!(
+                "DistributedPlan Window node_id={} expected 1 child, got {}",
+                node.node_id,
+                node.children.len()
+            ));
+        }
+        let child = self.lower_node(&node.children[0])?;
+        let (mut plan_nodes, scope, tuple_ids, ordering) = self.lower_window(
+            node.node_id,
+            &node.tuple_ids,
+            window,
+            &child.scope,
+            &child.tuple_ids,
+            &child.ordering,
+        )?;
+        plan_nodes.extend(child.plan_nodes);
+        Ok(LoweredDistributedNode {
+            plan_nodes,
+            scope,
+            tuple_ids,
+            output_columns: window.output_columns.clone(),
+            ordering,
+        })
+    }
+
+    fn lower_generate_series_node(
+        &mut self,
+        node: &super::node::DistributedPlanNode,
+        generate_series: &super::kind::DistributedGenerateSeriesNode,
+    ) -> Result<LoweredDistributedNode, String> {
+        if !node.children.is_empty() {
+            return Err(format!(
+                "DistributedPlan GenerateSeries node_id={} expected 0 children, got {}",
+                node.node_id,
+                node.children.len()
+            ));
+        }
+        let output_tuple_id = first_tuple_id(node, "GenerateSeries")?;
+        let op = generate_series_node_to_physical_op(generate_series);
+        let (plan_nodes, scope) = self.lower_generate_series(node.node_id, output_tuple_id, &op)?;
+        Ok(LoweredDistributedNode {
+            plan_nodes,
+            scope,
+            tuple_ids: vec![output_tuple_id],
+            output_columns: vec![AnalysisOutputColumn {
+                column_id: generate_series.output_column_id,
+                name: generate_series.column_name.clone(),
+                data_type: DataType::Int64,
+                nullable: false,
+                is_internal: false,
+            }],
+            ordering: OrderingSpec::Any,
+        })
+    }
+
+    fn lower_table_function_node(
+        &mut self,
+        node: &super::node::DistributedPlanNode,
+        table_function: &super::kind::DistributedTableFunctionNode,
+    ) -> Result<LoweredDistributedNode, String> {
+        if node.children.len() != 1 {
+            return Err(format!(
+                "DistributedPlan TableFunction node_id={} expected 1 child, got {}",
+                node.node_id,
+                node.children.len()
+            ));
+        }
+        let child = self.lower_node(&node.children[0])?;
+        let output_tuple_id = first_tuple_id(node, "TableFunction")?;
+        let op = table_function_node_to_physical_op(table_function);
+        let (table_fn_nodes, scope) =
+            self.lower_table_function(node.node_id, output_tuple_id, &op, &child.scope)?;
+        let mut plan_nodes = table_fn_nodes;
+        plan_nodes.extend(child.plan_nodes);
+        Ok(LoweredDistributedNode {
+            plan_nodes,
+            scope,
+            tuple_ids: vec![output_tuple_id],
+            output_columns: table_function.output_columns.clone(),
+            ordering: OrderingSpec::Any,
+        })
     }
 
     fn lower_stream_exchange_source(
