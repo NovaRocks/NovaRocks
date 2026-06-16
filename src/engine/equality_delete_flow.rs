@@ -138,10 +138,11 @@ impl IcebergWriteTransactionExecutor for DistributedEqualityDeleteWriteExecutor 
             None,
             None,
         )?;
-        if result
-            .write_commit
-            .as_ref()
-            .is_none_or(|commit| !write_commit_has_files(commit))
+        if result.write_abort.is_none()
+            && result
+                .write_commit
+                .as_ref()
+                .is_none_or(|commit| !write_commit_has_files(commit))
         {
             return Err(
                 "ADD EQUALITY DELETE produced no equality-delete files for non-empty input"
@@ -800,6 +801,10 @@ mod tests {
         assert!(
             !body.contains("iceberg_write_shuffle"),
             "distributed equality-delete executor must not build a shuffle plan"
+        );
+        assert!(
+            body.contains("result.write_abort.is_none()"),
+            "distributed equality-delete executor must let writer aborts reach the transaction runner"
         );
     }
 
