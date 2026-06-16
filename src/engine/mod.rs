@@ -3274,6 +3274,12 @@ fn explain_analyze_query(
             let mut profiled_query_opts = query_opts.unwrap_or_default();
             profiled_query_opts.enable_profile = Some(true);
             let (dispatcher, scheduler) = coordinated_execution_services(exchange_port)?;
+            if !dispatcher.supports_profile_collection() {
+                return Err(
+                    "EXPLAIN ANALYZE for coordinated plans requires in-process profile collection; remote fragment profiles are not available yet"
+                        .to_string(),
+                );
+            }
             let outcome = crate::runtime::coordinator::ExecutionCoordinator::new(
                 *build_result,
                 dispatcher,
@@ -3287,6 +3293,12 @@ fn explain_analyze_query(
                 .iter()
                 .map(|c| c.len() as u64)
                 .sum();
+            if outcome.profilers.is_empty() {
+                return Err(
+                    "EXPLAIN ANALYZE did not collect any fragment profiles for the coordinated plan"
+                        .to_string(),
+                );
+            }
             (rows, outcome.profilers)
         }
     };

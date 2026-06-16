@@ -16,7 +16,10 @@ GROUP BY k;
 -- @result_contains=EXCHANGE ID:
 -- @result_contains=HASH AGGREGATE (GLOBAL
 -- @result_contains=HASH AGGREGATE (LOCAL
--- @result_contains=act={rows=
+-- @result_contains=PROJECT [k, sum(v) AS total_v] stats={rows=2 conf=estimated} act={rows=1
+-- @result_contains=HASH AGGREGATE (GLOBAL, group by: [k]) stats={rows=2 conf=estimated} act={rows=1
+-- @result_contains=HASH AGGREGATE (LOCAL, group by: [k]) stats={rows=2 conf=estimated} act={rows=2
+-- @result_contains=VALUES (1 rows) stats={rows=1} act={rows=1
 -- @result_not_contains=Boundary Schemas:
 EXPLAIN ANALYZE SELECT k, SUM(v) AS total_v
 FROM (

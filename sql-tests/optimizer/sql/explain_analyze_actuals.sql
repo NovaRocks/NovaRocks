@@ -22,11 +22,11 @@ INSERT INTO ${case_db}.explain_analyze_actuals_r VALUES (1, 100), (2, 200), (4, 
 -- @result_contains=stats={rows=
 -- @result_contains=act={rows=
 -- @result_contains=} act={rows=
--- @result_contains=SCAN ${case_db}.explain_analyze_actuals_l (alias=l)
--- @result_contains=SCAN ${case_db}.explain_analyze_actuals_r (alias=r)
--- @result_contains=act={rows=3
--- @result_contains=HASH JOIN
--- @result_contains=HASH AGGREGATE
+-- @result_contains=PROJECT [count(*)] stats={rows=1 conf=estimated} act={rows=1
+-- @result_contains=HASH AGGREGATE (LOCAL) stats={rows=1 conf=estimated} act={rows=4
+-- @result_contains=INNER, eq: [l.k = r.k]) stats={rows=3 conf=estimated} act={rows=3
+-- @result_contains=SCAN ${case_db}.explain_analyze_actuals_l (alias=l) stats={rows=3 conf=estimated} act={rows=3
+-- @result_contains=SCAN ${case_db}.explain_analyze_actuals_r (alias=r) stats={rows=3 conf=estimated} act={rows=3
 EXPLAIN ANALYZE
 SELECT COUNT(*)
 FROM ${case_db}.explain_analyze_actuals_l l

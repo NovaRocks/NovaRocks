@@ -99,6 +99,10 @@ impl ExecutionCoordinator {
         let query_options = self.query_options;
         let dispatcher = self.dispatcher;
         let scheduler = self.scheduler;
+        let collect_profiles = query_options
+            .as_ref()
+            .and_then(|opts| opts.enable_profile)
+            .unwrap_or(false);
 
         // ---------------------------------------------------------------
         // 1. Allocate query id and run the scheduler.
@@ -464,7 +468,11 @@ impl ExecutionCoordinator {
             expected_root_chunk_schema.as_ref(),
             write_coordinator.as_ref(),
         )?;
-        let profilers = dispatcher.take_profiles();
+        let profilers = if collect_profiles {
+            dispatcher.take_profiles()
+        } else {
+            Vec::new()
+        };
 
         if let Some(commit) = fetch_result.write_commit.as_ref() {
             tracing::info!(

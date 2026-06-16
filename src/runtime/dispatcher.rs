@@ -27,6 +27,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 #[cfg(test)]
@@ -112,6 +113,12 @@ pub trait FragmentDispatcher: Send + Sync + 'static {
     /// Whether non-write fragments need final status reports back to the
     /// standalone coordinator.
     fn needs_fragment_status_report(&self) -> bool {
+        false
+    }
+
+    /// Whether this dispatcher can return per-fragment profilers after a
+    /// coordinated execution. Remote dispatchers do not yet surface profiles.
+    fn supports_profile_collection(&self) -> bool {
         false
     }
 
@@ -343,6 +350,7 @@ struct InProcessState {
     /// submission.
     fragment_errors: Mutex<HashMap<QueryKey, String>>,
     fragment_profilers: Mutex<HashMap<FinstKey, Profiler>>,
+    fragment_threads: Mutex<Vec<JoinHandle<()>>>,
 }
 
 /// Dispatcher that runs all fragments in-process via `std::thread::spawn`.
@@ -368,6 +376,7 @@ impl InProcessDispatcher {
                 submitted_ids: Mutex::new(Vec::new()),
                 fragment_errors: Mutex::new(HashMap::new()),
                 fragment_profilers: Mutex::new(HashMap::new()),
+                fragment_threads: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -478,6 +487,28 @@ fn record_fragment_profiler(
     }
 }
 
+fn record_fragment_thread(state: &InProcessState, handle: JoinHandle<()>) {
+    state
+        .fragment_threads
+        .lock()
+        .expect("fragment_threads lock")
+        .push(handle);
+}
+
+fn wait_for_fragment_threads(state: &InProcessState) {
+    let handles = std::mem::take(
+        &mut *state
+            .fragment_threads
+            .lock()
+            .expect("fragment_threads lock"),
+    );
+    for handle in handles {
+        if handle.join().is_err() {
+            warn!("in-process fragment thread panicked while collecting profiles");
+        }
+    }
+}
+
 fn format_fragment_error(finst_key: (i64, i64), error: &str) -> String {
     format!(
         "fragment {}/{} failed during in-process execution: {}",
@@ -543,15 +574,16 @@ impl FragmentDispatcher for InProcessDispatcher {
             }
 
             let state = Arc::clone(&self.state);
-            std::thread::spawn(move || {
+            let handle = std::thread::spawn(move || {
                 finish_root_fragment_in_process(finst_key, state, slot, || {
                     run_root_fragment_in_process(params)
                 });
             });
+            record_fragment_thread(self.state.as_ref(), handle);
         } else {
             // Non-root fragment path: execute_plan_fragment_sync in a thread.
             let state = Arc::clone(&self.state);
-            std::thread::spawn(move || {
+            let handle = std::thread::spawn(move || {
                 let finst_id = UniqueId {
                     hi: finst_key.0,
                     lo: finst_key.1,
@@ -574,6 +606,7 @@ impl FragmentDispatcher for InProcessDispatcher {
                     cancel_all_submitted(&state);
                 }
             });
+            record_fragment_thread(self.state.as_ref(), handle);
         }
 
         Ok(())
@@ -643,7 +676,12 @@ impl FragmentDispatcher for InProcessDispatcher {
         1
     }
 
+    fn supports_profile_collection(&self) -> bool {
+        true
+    }
+
     fn take_profiles(&self) -> Vec<Profiler> {
+        wait_for_fragment_threads(self.state.as_ref());
         std::mem::take(
             &mut *self
                 .state
