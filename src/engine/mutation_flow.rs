@@ -12,8 +12,8 @@ use iceberg::arrow::schema_to_arrow_schema;
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
 use crate::connector::iceberg::commit::{
     CommitOpKind, CommitOutcome, CommitServiceError, CowUpdateRewriteSet, CowUpdateTouchedFile,
-    IcebergCommitCollector, IcebergUpdateMode, ensure_no_variant_columns_for_row_level_mutation,
-    select_iceberg_update_mode,
+    IcebergCommitCollector, IcebergUpdateMode, ensure_iceberg_write_supported,
+    ensure_no_variant_columns_for_row_level_mutation, select_iceberg_update_mode,
 };
 use crate::engine::write_transaction::{
     IcebergWriteCommitExecutor, IcebergWriteCommitPolicy, IcebergWriteSource,
@@ -2168,6 +2168,14 @@ pub(crate) fn execute_merge_statement(
     ensure_no_variant_columns_for_row_level_mutation(&table)
         .map_err(|e| format!("MERGE INTO: {e}"))?;
 
+    // Validate writability up front (resolvable default-sort-order, no variant
+    // in partition spec / sort order) before any branch write. The folded
+    // not-matched INSERT branch builds its own write plan and bypasses
+    // `execute_iceberg_insert_or_overwrite`, which is where this check used to
+    // run for the INSERT path; running it here keeps MERGE failing fast instead
+    // of deep in codegen. Mirrors the INSERT/UPDATE entry call form.
+    let _write_mode = ensure_iceberg_write_supported(&table)?;
+
     let target_columns = iceberg_table_columns(&table)?;
     let partition_columns = iceberg_partition_source_columns(&table)?;
 
@@ -3149,6 +3157,10 @@ impl IcebergWriteTransactionExecutor for DistributedMergeExecutor {
         &self,
         _spec: &IcebergWriteTransactionSpec,
     ) -> Result<CoordinatedQueryResult, String> {
+        // Matched-branch staged files are recorded in the collector's AbortLog at commit() time
+        // (deferred), consistent with the per-mode distributed executors. A mid-fold error here
+        // returns Err, the runner skips commit(), and nothing is committed — the fold is atomic;
+        // staged files from earlier branches are left for orphan cleanup (no partial snapshot).
         let branches = self
             .branches
             .lock()
@@ -3292,12 +3304,6 @@ impl IcebergWriteTransactionExecutor for DistributedMergeExecutor {
             }
         }
 
-        if commit_parts.is_empty() {
-            // INSERT-only routed via inject_appended_files leaves no flat-channel
-            // parts; the runner still commits because the op kind is not
-            // FastAppend (it gates empty FastAppend writes only).
-            return Ok(no_mutation_write_result());
-        }
         merge_all_write_commits(commit_parts)
     }
 
