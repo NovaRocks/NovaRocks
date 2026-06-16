@@ -57,7 +57,11 @@ fn counter(common: &Profiler, name: &str) -> i64 {
 }
 
 fn parse_plan_node_id(name: &str) -> Option<i32> {
-    let key = "plan_node_id=";
+    let key = if name.contains("plan_node_id=") {
+        "plan_node_id="
+    } else {
+        "(id="
+    };
     let start = name.find(key)? + key.len();
     let rest = &name[start..];
     let end = rest
@@ -126,6 +130,26 @@ mod tests {
                 output_rows: 30,
                 total_time_ns: 5,
                 peak_mem_bytes: 96,
+            })
+        );
+    }
+
+    #[test]
+    fn collects_runtime_operator_id_names_before_fe_normalization() {
+        let profiler = Profiler::new("query");
+        let driver = profiler
+            .child("Pipeline (id=0)")
+            .child("PipelineDriver (id=0)");
+        add_operator_metrics(&driver, "AGGREGATE (id=3)", 1, 12_000, 128);
+
+        let actuals = collect_actuals_by_plan_node_id(&profiler);
+
+        assert_eq!(
+            actuals.get(&3).copied(),
+            Some(ActualMetrics {
+                output_rows: 1,
+                total_time_ns: 12_000,
+                peak_mem_bytes: 128,
             })
         );
     }

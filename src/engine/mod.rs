@@ -3232,8 +3232,9 @@ fn explain_analyze_query(
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
     use crate::runtime::profile::Profiler;
+    use crate::runtime::profile_correlate::collect_actuals_by_plan_node_id;
     use crate::sql::codegen::ir::{
-        build_distributed_plan, explain_distributed_plan, lower_distributed_plan,
+        build_distributed_plan, explain_distributed_plan_analyze, lower_distributed_plan,
     };
     use crate::sql::explain::ExplainLevel;
 
@@ -3283,7 +3284,12 @@ fn explain_analyze_query(
     lines.push(format!(
         "Planning: {planning_ms} ms / Execution: {execution_ms} ms / Rows: {rows}"
     ));
-    lines.extend(explain_distributed_plan(&dp, ExplainLevel::Analyze));
+    let actuals = collect_actuals_by_plan_node_id(&profiler);
+    lines.extend(explain_distributed_plan_analyze(
+        &dp,
+        ExplainLevel::Analyze,
+        &actuals,
+    ));
 
     build_string_query_result("Explain String", lines)
 }
