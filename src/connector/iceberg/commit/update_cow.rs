@@ -308,7 +308,11 @@ impl TransactionAction for CowUpdateTxnAction {
         // `old_file`, so they remove nothing — only an added-data manifest is
         // written. Like the rewrite outputs, the manifest is marked so the v3
         // manifest-list writer does NOT allocate fresh row IDs, keeping the
-        // snapshot's row-lineage range unchanged.
+        // snapshot's row-lineage range unchanged. NOTE: suppressing row-id
+        // allocation here is correct ONLY while these appended rows reuse
+        // existing row-ids (the current M1 callers pass appended_files that do).
+        // Genuinely net-new INSERT rows would need fresh _row_ids — see the
+        // TODO(M3) at the mark-replacement call below.
         if !self.rewrite.appended_files.is_empty() {
             let appended_manifest_path = format!(
                 "{metadata_dir}/{}-cow-update-appended-0.avro",
@@ -332,6 +336,13 @@ impl TransactionAction for CowUpdateTxnAction {
             )
             .await
             .map_err(to_iceberg_unexpected)?;
+            // TODO(M3): net-new appended INSERT rows need FRESH _row_ids. Suppressing
+            // row-id allocation here (reusing row_lineage_first_row_id with row-range 0)
+            // is correct ONLY while appended_files rows reuse existing lineage. Before M3
+            // populates non-empty appended_files with genuinely new rows, relax the
+            // row-range / first_row_id handling for this appended block to allocate fresh
+            // ids. The strict `next_row_id == row_lineage_first_row_id` check does NOT catch
+            // this — it would still pass. See docs/superpowers/plans/2026-06-16-iceberg-atomic-merge-phase3.md (M3).
             new_manifests.push(mark_replacement_manifest_row_id_assigned(
                 appended_manifest,
                 row_lineage_first_row_id,
@@ -366,8 +377,9 @@ impl TransactionAction for CowUpdateTxnAction {
             )));
         }
 
-        // Build canonical COW UPDATE summary: added keys from the rewritten
-        // replacement files, deleted keys from the old touched data files.
+        // Build canonical COW UPDATE summary: added keys from all written data
+        // files (rewrite outputs + appended INSERT files); deleted keys from the
+        // touched old data files.
         let mut summary_props = HashMap::new();
         summary_props.insert(
             "added-data-files".to_string(),
@@ -762,7 +774,7 @@ fn validate_cow_update_inputs(
 
     let written_files: HashSet<String> = written.iter().map(|f| f.path.clone()).collect();
     if written_files.len() != written.len() {
-        return Err("CowUpdateCommit received duplicate replacement data file paths".to_string());
+        return Err("CowUpdateCommit received duplicate written data file paths".to_string());
     }
     for new_file in &rewrite_new_files {
         if !written_files.contains(new_file) {
