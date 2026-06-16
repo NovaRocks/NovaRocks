@@ -2975,16 +2975,6 @@ impl IcebergWriteTransactionExecutor for DistributedMergeExecutor {
     fn finalize(&self, _spec: &IcebergWriteTransactionSpec) -> Result<(), String> {
         self.commit_executor.finalize()
     }
-
-    fn has_preloaded_commit_output(&self) -> bool {
-        // INSERT-only-into-appended and matched-only folds may leave the flat
-        // `WriteCommitInput` empty while still having staged files. The op kind
-        // is never FastAppend in those cases, so the runner's
-        // `!FastAppend` gate already admits them; report injected state too so
-        // an appended-only RowDeltaDvFromFiles fold is never treated as empty.
-        self.commit_executor.collector.has_injected_written_files()
-            || self.commit_executor.collector.has_injected_appended_files()
-    }
 }
 
 #[cfg(test)]

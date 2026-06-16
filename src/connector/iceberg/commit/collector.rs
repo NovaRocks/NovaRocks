@@ -242,14 +242,6 @@ impl IcebergCommitCollector {
         }
     }
 
-    pub(crate) fn has_injected_written_files(&self) -> bool {
-        !self
-            .injected
-            .lock()
-            .expect("collector injected lock poisoned")
-            .is_empty()
-    }
-
     /// Pre-load net-new INSERT data files (folded MERGE not-matched branch) into
     /// the fresh-row-lineage channel. These rows carry NO preserved `_row_id`
     /// and MUST draw fresh ids at commit time. Kept distinct from
@@ -275,14 +267,6 @@ impl IcebergCommitCollector {
             .lock()
             .expect("collector appended lock poisoned");
         std::mem::take(&mut *guard)
-    }
-
-    pub(crate) fn has_injected_appended_files(&self) -> bool {
-        !self
-            .appended
-            .lock()
-            .expect("collector appended lock poisoned")
-            .is_empty()
     }
 
     /// Convert one writer-reported sink commit payload without mutating the
