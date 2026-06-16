@@ -3727,14 +3727,22 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
     if force_single_fragment {
         physical = collapse_distribution_enforcers_for_single_fragment(physical);
     }
-    let build_result =
+    let build_result = if let Some(mv_refresh_ctx) = mv_refresh_ctx {
         crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_via_distributed_plan_with_mv_refresh_ctx(
             &physical,
             codegen_catalog,
             connectors,
             current_database,
-            mv_refresh_ctx,
-        )?;
+            Some(mv_refresh_ctx),
+        )?
+    } else {
+        crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_via_distributed_plan(
+            &physical,
+            codegen_catalog,
+            connectors,
+            current_database,
+        )?
+    };
 
     let execution_plan = choose_standalone_execution(build_result);
 

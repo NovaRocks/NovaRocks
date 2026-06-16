@@ -892,6 +892,7 @@ pub(crate) struct OwnedLoweringState<'a> {
 }
 
 impl<'a> OwnedLoweringState<'a> {
+    #[cfg(test)]
     fn new(
         connectors: &'a crate::connector::ConnectorRegistry,
         mv_refresh_ctx: Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
