@@ -558,9 +558,15 @@ mod tests {
             Some(&ctx),
         );
 
-        assert_root_direct_exec_aggregate_state_merge(
+        let merge = root_aggregate_state_merge_direct_exec(
             "aggregate_state_merge_direct_exec",
             &distributed,
+        );
+        assert_aggregate_state_merge_payload(
+            "aggregate_state_merge_direct_exec",
+            merge,
+            &ctx,
+            None,
         );
         assert_multi_fragment_ir_structure("aggregate_state_merge_direct_exec", &distributed, 1);
     }
@@ -661,7 +667,24 @@ mod tests {
             Some(&ctx),
         );
 
-        assert_root_direct_exec_union_all("branch_union_aggregate_direct_exec", &distributed);
+        let inputs = root_union_all_direct_exec("branch_union_aggregate_direct_exec", &distributed);
+        assert_eq!(
+            inputs.len(),
+            2,
+            "branch_union_aggregate_direct_exec: branch union should keep both direct-exec inputs"
+        );
+        for (idx, (input, expected_branch_id)) in inputs.iter().zip([0, 1]).enumerate() {
+            let merge = plan_result_aggregate_state_merge_direct_exec(
+                &format!("branch_union_aggregate_direct_exec: input {idx}"),
+                input,
+            );
+            assert_aggregate_state_merge_payload(
+                &format!("branch_union_aggregate_direct_exec: input {idx}"),
+                merge,
+                &ctx,
+                Some(expected_branch_id),
+            );
+        }
         assert_multi_fragment_ir_structure("branch_union_aggregate_direct_exec", &distributed, 1);
     }
 
@@ -1178,29 +1201,200 @@ mod tests {
         }
     }
 
-    fn assert_root_direct_exec_aggregate_state_merge(
+    fn root_aggregate_state_merge_direct_exec<'a>(
         case_name: &str,
-        result: &MultiFragmentBuildResult,
-    ) {
+        result: &'a MultiFragmentBuildResult,
+    ) -> &'a DirectExecPlan {
         let root = fragment_by_id(case_name, result, result.root_fragment_id);
-        assert!(
-            matches!(
-                root.direct_exec.as_deref(),
-                Some(DirectExecPlan::AggregateStateMerge { .. })
-            ),
-            "{case_name}: expected root AggregateStateMerge direct_exec"
-        );
+        let direct_exec = root
+            .direct_exec
+            .as_deref()
+            .unwrap_or_else(|| panic!("{case_name}: expected root direct_exec"));
+        assert_aggregate_state_merge_variant(case_name, direct_exec);
+        direct_exec
     }
 
-    fn assert_root_direct_exec_union_all(case_name: &str, result: &MultiFragmentBuildResult) {
+    fn root_union_all_direct_exec<'a>(
+        case_name: &str,
+        result: &'a MultiFragmentBuildResult,
+    ) -> &'a [PlanBuildResult] {
         let root = fragment_by_id(case_name, result, result.root_fragment_id);
         let Some(DirectExecPlan::UnionAll { inputs }) = root.direct_exec.as_deref() else {
             panic!("{case_name}: expected root UnionAll direct_exec");
         };
+        inputs
+    }
+
+    fn plan_result_aggregate_state_merge_direct_exec<'a>(
+        case_name: &str,
+        result: &'a PlanBuildResult,
+    ) -> &'a DirectExecPlan {
+        let direct_exec = result
+            .direct_exec
+            .as_deref()
+            .unwrap_or_else(|| panic!("{case_name}: expected direct_exec"));
+        assert_aggregate_state_merge_variant(case_name, direct_exec);
+        direct_exec
+    }
+
+    fn assert_aggregate_state_merge_variant(case_name: &str, direct_exec: &DirectExecPlan) {
+        assert!(
+            matches!(direct_exec, DirectExecPlan::AggregateStateMerge { .. }),
+            "{case_name}: expected AggregateStateMerge direct_exec"
+        );
+    }
+
+    fn assert_aggregate_state_merge_payload(
+        case_name: &str,
+        direct_exec: &DirectExecPlan,
+        ctx: &crate::engine::mv::refresh_context::IcebergMvRefreshContext,
+        expected_branch_id: Option<i32>,
+    ) {
+        let DirectExecPlan::AggregateStateMerge {
+            layout,
+            branch_id,
+            pruning_limits,
+            target_position_locator,
+            ..
+        } = direct_exec
+        else {
+            panic!("{case_name}: expected AggregateStateMerge direct_exec");
+        };
+
         assert_eq!(
-            inputs.len(),
-            2,
-            "{case_name}: branch union should keep both direct-exec inputs"
+            *branch_id, expected_branch_id,
+            "{case_name}: aggregate merge branch_id"
+        );
+        assert_eq!(
+            *pruning_limits, ctx.pruning_limits,
+            "{case_name}: aggregate merge pruning limits"
+        );
+        if expected_branch_id.is_some() {
+            assert_eq!(
+                *pruning_limits,
+                crate::engine::mv::refresh_context::MvRefreshPruningLimits::default(),
+                "{case_name}: branch aggregate merge must use default pruning limits"
+            );
+        }
+        if ctx.rewrite.target_snapshot_id.is_some() {
+            assert!(
+                target_position_locator.is_some(),
+                "{case_name}: aggregate merge must carry target position locator for pinned target snapshot"
+            );
+        }
+        let locator = target_position_locator
+            .as_ref()
+            .unwrap_or_else(|| panic!("{case_name}: aggregate merge target locator missing"));
+        assert_target_position_locator_matches_ctx(case_name, locator, ctx);
+        assert_aggregate_merge_layout_matches_ctx(case_name, layout, ctx);
+    }
+
+    fn assert_target_position_locator_matches_ctx(
+        case_name: &str,
+        locator: &crate::sql::codegen::AggregateStateTargetPositionLocator,
+        ctx: &crate::engine::mv::refresh_context::IcebergMvRefreshContext,
+    ) {
+        assert_eq!(
+            locator.target_entry.kind, ctx.target_entry.kind,
+            "{case_name}: target locator catalog kind"
+        );
+        assert_eq!(
+            locator.target_entry.properties, ctx.target_entry.properties,
+            "{case_name}: target locator catalog properties"
+        );
+        assert_eq!(
+            locator.target_entry.warehouse_uri, ctx.target_entry.warehouse_uri,
+            "{case_name}: target locator warehouse URI"
+        );
+        assert_eq!(
+            locator.target_entry.rest_uri, ctx.target_entry.rest_uri,
+            "{case_name}: target locator REST URI"
+        );
+        assert_eq!(
+            locator.target_entry.hms_uris, ctx.target_entry.hms_uris,
+            "{case_name}: target locator HMS URIs"
+        );
+        assert_eq!(
+            locator.target_entry.warehouse_path, ctx.target_entry.warehouse_path,
+            "{case_name}: target locator warehouse path"
+        );
+        assert_eq!(
+            locator.target_table.identifier().to_string(),
+            ctx.target_table.identifier().to_string(),
+            "{case_name}: target locator table identifier"
+        );
+        assert_eq!(
+            locator.target_table.metadata().uuid(),
+            ctx.target_table.metadata().uuid(),
+            "{case_name}: target locator table uuid"
+        );
+        assert_eq!(
+            locator.target_table.metadata().current_snapshot_id(),
+            ctx.target_table.metadata().current_snapshot_id(),
+            "{case_name}: target locator table snapshot"
+        );
+        assert_eq!(
+            locator.partition_filter,
+            ctx.affected_partitions_to_target_partition_filter(),
+            "{case_name}: target locator partition filter"
+        );
+        assert_eq!(
+            locator.apply_key_column, "__row_id__",
+            "{case_name}: target locator apply key column"
+        );
+    }
+
+    fn assert_aggregate_merge_layout_matches_ctx(
+        case_name: &str,
+        layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
+        ctx: &crate::engine::mv::refresh_context::IcebergMvRefreshContext,
+    ) {
+        let expected_layout = ctx
+            .rewrite
+            .aggregate_shape_and_layout_for_execution()
+            .expect("aggregate layout")
+            .1;
+        assert_eq!(
+            layout.row_id_column, expected_layout.row_id_column,
+            "{case_name}: aggregate layout row-id column"
+        );
+        assert_eq!(
+            layout.visible_columns, expected_layout.visible_columns,
+            "{case_name}: aggregate layout visible columns"
+        );
+        assert_eq!(
+            layout.state_columns, expected_layout.state_columns,
+            "{case_name}: aggregate layout state columns"
+        );
+        assert_eq!(
+            layout.group_key_source_indexes, expected_layout.group_key_source_indexes,
+            "{case_name}: aggregate layout group-key source indexes"
+        );
+        assert_eq!(
+            layout.aggregate_input_types, expected_layout.aggregate_input_types,
+            "{case_name}: aggregate layout aggregate input types"
+        );
+        assert_eq!(
+            layout.physical_columns, expected_layout.physical_columns,
+            "{case_name}: aggregate layout physical columns"
+        );
+        assert_eq!(
+            layout
+                .visible_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            ["region", "c", "s"],
+            "{case_name}: aggregate layout visible column names"
+        );
+        assert_eq!(
+            layout
+                .state_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            ["__agg_state_c", "__agg_state_s"],
+            "{case_name}: aggregate layout state column names"
         );
     }
 
