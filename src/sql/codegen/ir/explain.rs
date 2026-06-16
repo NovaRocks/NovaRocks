@@ -1,8 +1,9 @@
-use std::fmt::Write;
+use std::{collections::HashMap, fmt::Write};
 
 use arrow::datatypes::DataType;
 
 use crate::partitions;
+use crate::runtime::profile_correlate::ActualMetrics;
 use crate::sql::analysis::{JoinKind, SortItem, TypedExpr};
 use crate::sql::catalog::{ScanSource, TableDef};
 use crate::sql::explain::{ExplainLevel, format_expr};
@@ -24,6 +25,22 @@ use super::kind::{
 use super::node::{DistributedPlanNode, DistributedPlanNodeKind, PlanNodeStats};
 
 pub(crate) fn explain_distributed_plan(dp: &DistributedPlan, level: ExplainLevel) -> Vec<String> {
+    explain_distributed_plan_inner(dp, level, None)
+}
+
+pub(crate) fn explain_distributed_plan_analyze(
+    dp: &DistributedPlan,
+    level: ExplainLevel,
+    actuals: &HashMap<i32, ActualMetrics>,
+) -> Vec<String> {
+    explain_distributed_plan_inner(dp, level, Some(actuals))
+}
+
+fn explain_distributed_plan_inner(
+    dp: &DistributedPlan,
+    level: ExplainLevel,
+    actuals: Option<&HashMap<i32, ActualMetrics>>,
+) -> Vec<String> {
     let mut out = Vec::new();
     let fragments = explain_fragment_order(dp);
     let detailed = is_detailed(level);
@@ -64,7 +81,7 @@ pub(crate) fn explain_distributed_plan(dp: &DistributedPlan, level: ExplainLevel
             }
         }
 
-        format_distributed_node(&fragment.root, level, 0, &mut out);
+        format_distributed_node(&fragment.root, level, 0, actuals, &mut out);
     }
 
     out
@@ -101,11 +118,16 @@ fn format_distributed_node(
     node: &DistributedPlanNode,
     level: ExplainLevel,
     indent: usize,
+    actuals: Option<&HashMap<i32, ActualMetrics>>,
     out: &mut Vec<String>,
 ) {
     let pad = "  ".repeat(indent);
     let costs_suffix = costs_suffix(&node.stats, level);
-    let stats_suffix = stats_suffix(&node.stats, level);
+    let stats_suffix = format!(
+        "{}{}",
+        stats_suffix(&node.stats, level),
+        actual_suffix(node, actuals)
+    );
 
     match &node.kind {
         DistributedPlanNodeKind::Scan(scan) => {
@@ -114,33 +136,33 @@ fn format_distributed_node(
         DistributedPlanNodeKind::Project(project) => {
             format_project_node(node, project, &pad, &costs_suffix, &stats_suffix, out);
             push_probe_rf_lines(&node.probe_runtime_filters, level, &pad, out);
-            format_children(node, level, indent, out);
+            format_children(node, level, indent, actuals, out);
         }
         DistributedPlanNodeKind::Filter(filter) => {
             format_filter_node(node, filter, &pad, &costs_suffix, &stats_suffix, out);
             push_probe_rf_lines(&node.probe_runtime_filters, level, &pad, out);
-            format_children(node, level, indent, out);
+            format_children(node, level, indent, actuals, out);
         }
         DistributedPlanNodeKind::HashJoin(join) => {
             format_hash_join_node(node, join, level, &pad, &costs_suffix, &stats_suffix, out);
-            format_children(node, level, indent, out);
+            format_children(node, level, indent, actuals, out);
         }
         DistributedPlanNodeKind::NestLoopJoin(join) => {
             format_nest_loop_join_node(node, join, &pad, &costs_suffix, &stats_suffix, out);
-            format_children(node, level, indent, out);
+            format_children(node, level, indent, actuals, out);
         }
         DistributedPlanNodeKind::HashAggregate(agg) => {
             format_hash_aggregate_node(node, agg, &pad, &costs_suffix, &stats_suffix, out);
             push_probe_rf_lines(&node.probe_runtime_filters, level, &pad, out);
-            format_children(node, level, indent, out);
+            format_children(node, level, indent, actuals, out);
         }
         DistributedPlanNodeKind::Sort(sort) => {
             format_sort_node(node, sort, &pad, &costs_suffix, &stats_suffix, out);
-            format_children(node, level, indent, out);
+            format_children(node, level, indent, actuals, out);
         }
         DistributedPlanNodeKind::TopN(topn) => {
             format_topn_node(node, topn, &pad, &costs_suffix, &stats_suffix, out);
-            format_children(node, level, indent, out);
+            format_children(node, level, indent, actuals, out);
         }
         DistributedPlanNodeKind::Exchange(exchange) => {
             format_exchange_node(node, exchange, &pad, &costs_suffix, &stats_suffix, out);
@@ -151,23 +173,23 @@ fn format_distributed_node(
         }
         DistributedPlanNodeKind::AssertOneRow(assert) => {
             format_assert_one_row_node(node, assert, &pad, &costs_suffix, &stats_suffix, out);
-            format_children(node, level, indent, out);
+            format_children(node, level, indent, actuals, out);
         }
         DistributedPlanNodeKind::Decode(decode) => {
             format_decode_node(node, decode, &pad, &costs_suffix, &stats_suffix, out);
-            format_children(node, level, indent, out);
+            format_children(node, level, indent, actuals, out);
         }
         DistributedPlanNodeKind::Repeat(repeat) => {
             format_repeat_node(node, repeat, &pad, &costs_suffix, &stats_suffix, out);
-            format_children(node, level, indent, out);
+            format_children(node, level, indent, actuals, out);
         }
         DistributedPlanNodeKind::SetOp(set_op) => {
             format_set_op_node(node, set_op, &pad, &costs_suffix, &stats_suffix, out);
-            format_children(node, level, indent, out);
+            format_children(node, level, indent, actuals, out);
         }
         DistributedPlanNodeKind::Window(window) => {
             format_window_node(node, window, &pad, &costs_suffix, &stats_suffix, out);
-            format_children(node, level, indent, out);
+            format_children(node, level, indent, actuals, out);
         }
         DistributedPlanNodeKind::GenerateSeries(generate) => {
             format_generate_series_node(node, generate, &pad, &costs_suffix, &stats_suffix, out);
@@ -181,7 +203,7 @@ fn format_distributed_node(
                 &stats_suffix,
                 out,
             );
-            format_children(node, level, indent, out);
+            format_children(node, level, indent, actuals, out);
         }
     }
 }
@@ -190,10 +212,11 @@ fn format_children(
     node: &DistributedPlanNode,
     level: ExplainLevel,
     indent: usize,
+    actuals: Option<&HashMap<i32, ActualMetrics>>,
     out: &mut Vec<String>,
 ) {
     for child in &node.children {
-        format_distributed_node(child, level, indent + 1, out);
+        format_distributed_node(child, level, indent + 1, actuals, out);
     }
 }
 
@@ -670,6 +693,52 @@ fn join_distribution_label(
     }
 }
 
+fn actual_suffix(
+    node: &DistributedPlanNode,
+    actuals: Option<&HashMap<i32, ActualMetrics>>,
+) -> String {
+    match actuals.and_then(|actuals| actuals.get(&node.node_id)) {
+        Some(metrics) => format!(
+            " act={{rows={} time={} peak={}}}",
+            metrics.output_rows,
+            fmt_time_ns(metrics.total_time_ns),
+            fmt_bytes(metrics.peak_mem_bytes)
+        ),
+        None => String::new(),
+    }
+}
+
+fn fmt_time_ns(ns: i64) -> String {
+    let abs = ns.checked_abs().unwrap_or(i64::MAX);
+    if abs < 1_000 {
+        format!("{ns}ns")
+    } else if abs < 1_000_000 {
+        let us = ns as f64 / 1_000.0;
+        if ns % 1_000 == 0 {
+            format!("{us:.0}us")
+        } else {
+            format!("{us:.1}us")
+        }
+    } else if abs < 1_000_000_000 {
+        format!("{:.1}ms", ns as f64 / 1_000_000.0)
+    } else {
+        format!("{:.1}s", ns as f64 / 1_000_000_000.0)
+    }
+}
+
+fn fmt_bytes(bytes: i64) -> String {
+    let abs = bytes.checked_abs().unwrap_or(i64::MAX);
+    if abs < 1024 {
+        format!("{bytes}B")
+    } else if abs < 1024 * 1024 {
+        format!("{:.1}KB", bytes as f64 / 1024.0)
+    } else if abs < 1024 * 1024 * 1024 {
+        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.1}GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
 fn is_detailed(level: ExplainLevel) -> bool {
     matches!(
         level,
@@ -1062,12 +1131,17 @@ fn supports_scan_decode_hint(data_type: &DataType) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use arrow::datatypes::DataType;
 
     use crate::exec::node::sort::SortTopNType;
+    use crate::runtime::profile_correlate::ActualMetrics;
     use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
-    use crate::sql::codegen::ir::{build_distributed_plan, explain_distributed_plan};
+    use crate::sql::codegen::ir::{
+        build_distributed_plan, explain_distributed_plan, explain_distributed_plan_analyze,
+    };
     use crate::sql::column_id::ColumnId;
     use crate::sql::explain::ExplainLevel;
     use crate::sql::optimizer::operator::{
@@ -1187,6 +1261,61 @@ mod tests {
         assert!(
             !normal.contains("runtime filters:"),
             "Normal must hide RF lines:\n{normal}"
+        );
+    }
+
+    #[test]
+    fn analyze_renders_actuals_for_nodes_present_in_map_only() {
+        let dp = build_distributed_plan(&aggregate_count_plan(project_plan(scan_plan())))
+            .expect("build DistributedPlan");
+        let mut actuals = HashMap::new();
+        actuals.insert(
+            1,
+            ActualMetrics {
+                output_rows: 11,
+                total_time_ns: 450_000,
+                peak_mem_bytes: 64,
+            },
+        );
+        actuals.insert(
+            3,
+            ActualMetrics {
+                output_rows: 7,
+                total_time_ns: 2_300_000,
+                peak_mem_bytes: 4 * 1024 * 1024,
+            },
+        );
+
+        let text =
+            explain_distributed_plan_analyze(&dp, ExplainLevel::Analyze, &actuals).join("\n");
+
+        assert!(
+            text.contains("3:HASH AGGREGATE (SINGLE, group by: [t.k]) stats={rows=3 conf=fallback} act={rows=7 time=2.3ms peak=4.0MB}"),
+            "expected aggregate actuals after estimate trailer:\n{text}"
+        );
+        assert!(
+            text.contains("1:SCAN test_db.t (alias=t) stats={rows=3 conf=fallback} act={rows=11 time=450us peak=64B}"),
+            "expected scan actuals after estimate trailer:\n{text}"
+        );
+        assert!(
+            text.contains("2:PROJECT [t.k AS k] stats={rows=3 conf=fallback}"),
+            "expected project estimate trailer:\n{text}"
+        );
+        assert!(
+            !text.contains("2:PROJECT [t.k AS k] stats={rows=3 conf=fallback} act="),
+            "nodes absent from the actuals map must not print act=:\n{text}"
+        );
+    }
+
+    #[test]
+    fn analyze_without_actuals_matches_existing_explain() {
+        let dp = build_distributed_plan(&aggregate_count_plan(project_plan(scan_plan())))
+            .expect("build DistributedPlan");
+        let actuals = HashMap::new();
+
+        assert_eq!(
+            explain_distributed_plan(&dp, ExplainLevel::Analyze),
+            explain_distributed_plan_analyze(&dp, ExplainLevel::Analyze, &actuals)
         );
     }
 

@@ -13,7 +13,7 @@ pub(crate) mod node;
 pub(crate) mod equiv;
 
 pub(crate) use build::build_distributed_plan;
-pub(crate) use explain::explain_distributed_plan;
+pub(crate) use explain::{explain_distributed_plan, explain_distributed_plan_analyze};
 pub(crate) use fragment::{DataPartition, DataSink, DistributedPlan, PartitionKind, PlanFragment};
 pub(crate) use lowering::lower_distributed_plan;
 pub(crate) use node::{DistributedPlanNode, DistributedPlanNodeKind, PlanNodeStats};
