@@ -51,17 +51,17 @@ mod tests {
 
     #[test]
     fn scan_builds_ir_fragment_structure() {
-        assert_distributed_plan_ir_structure("scan", scan_plan());
+        assert_distributed_plan_ir_structure("scan", scan_plan(), 1);
     }
 
     #[test]
     fn scan_filter_builds_ir_fragment_structure() {
-        assert_distributed_plan_ir_structure("scan_filter", filter_plan(scan_plan()));
+        assert_distributed_plan_ir_structure("scan_filter", filter_plan(scan_plan()), 1);
     }
 
     #[test]
     fn scan_project_builds_ir_fragment_structure() {
-        assert_distributed_plan_ir_structure("scan_project", project_plan(scan_plan()));
+        assert_distributed_plan_ir_structure("scan_project", project_plan(scan_plan()), 1);
     }
 
     #[test]
@@ -69,6 +69,7 @@ mod tests {
         assert_distributed_plan_ir_structure(
             "scan_filter_project",
             project_plan(filter_plan(scan_plan())),
+            1,
         );
     }
 
@@ -77,12 +78,13 @@ mod tests {
         assert_distributed_plan_ir_structure(
             "root_gather_scan_filter_project",
             root_gather_plan(project_plan(filter_plan(scan_plan()))),
+            1,
         );
     }
 
     #[test]
     fn sort_over_scan_builds_ir_fragment_structure() {
-        assert_distributed_plan_ir_structure("sort_over_scan", sort_plan(scan_plan()));
+        assert_distributed_plan_ir_structure("sort_over_scan", sort_plan(scan_plan()), 1);
     }
 
     #[test]
@@ -90,6 +92,7 @@ mod tests {
         assert_distributed_plan_ir_structure(
             "limit_over_scan",
             limit_plan(scan_plan(), Some(5), None),
+            1,
         );
     }
 
@@ -98,6 +101,7 @@ mod tests {
         assert_distributed_plan_ir_structure(
             "limit_over_sort_with_offset",
             limit_plan(sort_plan(scan_plan()), Some(5), Some(2)),
+            1,
         );
     }
 
@@ -110,6 +114,7 @@ mod tests {
                 Some(5),
                 Some(2),
             ),
+            1,
         );
     }
 
@@ -118,6 +123,7 @@ mod tests {
         assert_distributed_plan_ir_structure(
             "limit_over_aggregate",
             limit_plan(aggregate_count_plan(scan_plan()), Some(3), None),
+            1,
         );
     }
 
@@ -126,6 +132,7 @@ mod tests {
         assert_distributed_plan_ir_structure(
             "limit_over_hash_join",
             limit_plan(inner_hash_join_two_scans_plan(), Some(4), None),
+            1,
         );
     }
 
@@ -134,6 +141,7 @@ mod tests {
         assert_distributed_plan_ir_structure(
             "top_n_final_single_over_scan",
             top_n_plan(scan_plan(), TopNPhase::Final, false, Some(5), Some(1)),
+            1,
         );
     }
 
@@ -142,6 +150,7 @@ mod tests {
         assert_distributed_plan_ir_structure(
             "top_n_partial_over_scan",
             top_n_plan(scan_plan(), TopNPhase::Partial, false, Some(7), Some(0)),
+            1,
         );
     }
 
@@ -151,6 +160,7 @@ mod tests {
         assert_distributed_plan_ir_structure(
             "top_n_split",
             top_n_plan(partial, TopNPhase::Final, true, Some(5), Some(0)),
+            2,
         );
     }
 
@@ -159,6 +169,7 @@ mod tests {
         assert_distributed_plan_ir_structure(
             "limit_offset_exchange",
             limit_plan(scan_plan(), Some(5), Some(1)),
+            2,
         );
     }
 
@@ -170,6 +181,7 @@ mod tests {
                 limit_plan(scan_plan(), Some(5), None),
                 DistributionSpec::Gather,
             )),
+            2,
         );
     }
 
@@ -178,6 +190,7 @@ mod tests {
         assert_distributed_plan_ir_structure(
             "aggregate_single_over_scan",
             aggregate_group_by_plan(scan_plan()),
+            1,
         );
     }
 
@@ -186,6 +199,7 @@ mod tests {
         assert_distributed_plan_ir_structure(
             "aggregate_with_count",
             aggregate_count_plan(scan_plan()),
+            1,
         );
     }
 
@@ -197,6 +211,7 @@ mod tests {
                 scan_plan(),
                 DistributionSpec::shuffle_agg([ColumnId::new_for_test(1)]),
             )),
+            2,
         );
     }
 
@@ -205,12 +220,13 @@ mod tests {
         assert_distributed_plan_ir_structure(
             "nested_gather_exchange",
             sort_plan(distribution_plan(scan_plan(), DistributionSpec::Gather)),
+            2,
         );
     }
 
     #[test]
     fn cte_produce_consume_builds_ir_fragment_structure() {
-        assert_distributed_plan_ir_structure("cte_produce_consume", cte_produce_consume_plan());
+        assert_distributed_plan_ir_structure("cte_produce_consume", cte_produce_consume_plan(), 2);
     }
 
     #[test]
@@ -218,6 +234,7 @@ mod tests {
         assert_distributed_plan_ir_structure(
             "sort_over_project_over_scan",
             sort_plan(project_plan(scan_plan())),
+            1,
         );
     }
 
@@ -226,6 +243,7 @@ mod tests {
         assert_distributed_plan_ir_structure(
             "inner_hash_join_two_scans",
             inner_hash_join_two_scans_plan(),
+            1,
         );
     }
 
@@ -234,6 +252,7 @@ mod tests {
         assert_distributed_plan_ir_structure(
             "broadcast_join_exchange",
             broadcast_join_exchange_plan(),
+            2,
         );
     }
 
@@ -242,6 +261,7 @@ mod tests {
         assert_distributed_plan_ir_structure(
             "two_sided_shuffle_join_exchange",
             two_sided_shuffle_join_exchange_plan(),
+            3,
         );
     }
 
@@ -250,12 +270,17 @@ mod tests {
         assert_distributed_plan_ir_structure(
             "gather_root",
             root_gather_plan(project_plan(filter_plan(scan_plan()))),
+            1,
         );
     }
 
     #[test]
     fn left_outer_hash_join_builds_ir_fragment_structure() {
-        assert_distributed_plan_ir_structure("left_outer_hash_join", left_outer_hash_join_plan());
+        assert_distributed_plan_ir_structure(
+            "left_outer_hash_join",
+            left_outer_hash_join_plan(),
+            1,
+        );
     }
 
     #[test]
@@ -263,6 +288,7 @@ mod tests {
         assert_distributed_plan_ir_structure(
             "hash_join_other_condition",
             hash_join_other_condition_plan(),
+            1,
         );
     }
 
@@ -271,6 +297,7 @@ mod tests {
         assert_distributed_plan_ir_structure(
             "left_semi_hash_join",
             hash_join_surviving_side_plan(JoinKind::LeftSemi),
+            1,
         );
     }
 
@@ -279,6 +306,7 @@ mod tests {
         assert_distributed_plan_ir_structure(
             "right_anti_hash_join",
             hash_join_surviving_side_plan(JoinKind::RightAnti),
+            1,
         );
     }
 
@@ -287,12 +315,17 @@ mod tests {
         assert_distributed_plan_ir_structure(
             "null_aware_left_anti_hash_join",
             hash_join_surviving_side_plan(JoinKind::NullAwareLeftAnti),
+            1,
         );
     }
 
     #[test]
     fn nest_loop_cross_join_builds_ir_fragment_structure() {
-        assert_distributed_plan_ir_structure("nest_loop_cross_join", nest_loop_cross_join_plan());
+        assert_distributed_plan_ir_structure(
+            "nest_loop_cross_join",
+            nest_loop_cross_join_plan(),
+            1,
+        );
     }
 
     #[test]
@@ -300,6 +333,7 @@ mod tests {
         assert_distributed_plan_ir_structure(
             "nest_loop_inner_condition",
             nest_loop_condition_plan(JoinKind::Inner),
+            1,
         );
     }
 
@@ -308,6 +342,7 @@ mod tests {
         assert_distributed_plan_ir_structure(
             "nest_loop_left_outer",
             nest_loop_condition_plan(JoinKind::LeftOuter),
+            1,
         );
     }
 
@@ -316,6 +351,7 @@ mod tests {
         assert_distributed_plan_ir_structure(
             "nest_loop_left_anti",
             nest_loop_surviving_side_plan(JoinKind::LeftAnti),
+            1,
         );
     }
 
@@ -324,6 +360,7 @@ mod tests {
         assert_distributed_plan_ir_structure(
             "nest_loop_null_aware_left_anti",
             nest_loop_surviving_side_plan(JoinKind::NullAwareLeftAnti),
+            1,
         );
     }
 
@@ -336,6 +373,7 @@ mod tests {
                 aliased_scan_plan("l", 1, 2),
                 aliased_scan_plan("r", 3, 4),
             ),
+            1,
         );
     }
 
@@ -348,6 +386,7 @@ mod tests {
                 aliased_scan_plan("l", 1, 2),
                 aliased_scan_plan("r", 3, 4),
             ),
+            2,
         );
     }
 
@@ -356,6 +395,7 @@ mod tests {
         assert_distributed_plan_ir_structure(
             "intersect_two_scans",
             intersect_plan(aliased_scan_plan("l", 1, 2), aliased_scan_plan("r", 3, 4)),
+            1,
         );
     }
 
@@ -364,12 +404,13 @@ mod tests {
         assert_distributed_plan_ir_structure(
             "except_two_scans",
             except_plan(aliased_scan_plan("l", 1, 2), aliased_scan_plan("r", 3, 4)),
+            1,
         );
     }
 
     #[test]
     fn values_rows_builds_ir_fragment_structure() {
-        assert_distributed_plan_ir_structure("values_rows", values_rows_plan());
+        assert_distributed_plan_ir_structure("values_rows", values_rows_plan(), 1);
     }
 
     #[test]
@@ -377,17 +418,22 @@ mod tests {
         assert_distributed_plan_ir_structure(
             "assert_one_row_over_scan",
             assert_one_row_plan(scan_plan()),
+            1,
         );
     }
 
     #[test]
     fn decode_over_scan_builds_ir_fragment_structure() {
-        assert_distributed_plan_ir_structure("decode_over_scan", decode_over_scan_plan());
+        assert_distributed_plan_ir_structure("decode_over_scan", decode_over_scan_plan(), 1);
     }
 
     #[test]
     fn repeat_grouping_sets_builds_ir_fragment_structure() {
-        assert_distributed_plan_ir_structure("repeat_grouping_sets", repeat_grouping_sets_plan());
+        assert_distributed_plan_ir_structure(
+            "repeat_grouping_sets",
+            repeat_grouping_sets_plan(),
+            1,
+        );
     }
 
     #[test]
@@ -395,12 +441,13 @@ mod tests {
         assert_distributed_plan_ir_structure(
             "window_row_number_over_scan",
             window_row_number_over_scan_plan(),
+            1,
         );
     }
 
     #[test]
     fn generate_series_builds_ir_fragment_structure() {
-        assert_distributed_plan_ir_structure("generate_series", generate_series_plan());
+        assert_distributed_plan_ir_structure("generate_series", generate_series_plan(), 1);
     }
 
     #[test]
@@ -408,12 +455,14 @@ mod tests {
         assert_distributed_plan_ir_structure(
             "unnest_table_function_over_scan",
             unnest_table_function_over_scan_plan(),
+            1,
         );
     }
 
     #[test]
     fn decode_output_expr_uses_materialized_string_slot() {
         let build = build_distributed_plan_only("decode_output_expr_slot", decode_over_scan_plan());
+        assert_multi_fragment_ir_structure("decode_output_expr_slot", &build, 1);
         let root = fragment_by_id("decode_output_expr_slot", &build, build.root_fragment_id);
         let decode = root
             .plan
@@ -442,6 +491,7 @@ mod tests {
     fn set_op_uses_declared_child_output_order() {
         let build =
             build_distributed_plan_only("set_op_child_output_order", reordered_union_values_plan());
+        assert_multi_fragment_ir_structure("set_op_child_output_order", &build, 1);
         let root = fragment_by_id("set_op_child_output_order", &build, build.root_fragment_id);
         let union = root.plan.nodes.first().expect("set op root");
         assert_eq!(
@@ -494,7 +544,7 @@ mod tests {
         );
 
         assert_non_empty_scan_ranges("iceberg_data_file_scan_ranges", &distributed);
-        assert_multi_fragment_ir_structure("iceberg_data_file_scan_ranges", &distributed);
+        assert_multi_fragment_ir_structure("iceberg_data_file_scan_ranges", &distributed, 1);
     }
 
     #[test]
@@ -512,7 +562,7 @@ mod tests {
             "aggregate_state_merge_direct_exec",
             &distributed,
         );
-        assert_multi_fragment_ir_structure("aggregate_state_merge_direct_exec", &distributed);
+        assert_multi_fragment_ir_structure("aggregate_state_merge_direct_exec", &distributed, 1);
     }
 
     #[test]
@@ -537,7 +587,7 @@ mod tests {
             root.direct_exec.is_none(),
             "target-state scan must exercise regular fragment build"
         );
-        assert_multi_fragment_ir_structure("mv_target_state_scan", &distributed);
+        assert_multi_fragment_ir_structure("mv_target_state_scan", &distributed, 1);
     }
 
     #[test]
@@ -566,7 +616,7 @@ mod tests {
             root.direct_exec.is_none(),
             "version scan must exercise regular fragment build"
         );
-        assert_multi_fragment_ir_structure("mv_version_scan", &distributed);
+        assert_multi_fragment_ir_structure("mv_version_scan", &distributed, 1);
     }
 
     #[test]
@@ -612,7 +662,7 @@ mod tests {
         );
 
         assert_root_direct_exec_union_all("branch_union_aggregate_direct_exec", &distributed);
-        assert_multi_fragment_ir_structure("branch_union_aggregate_direct_exec", &distributed);
+        assert_multi_fragment_ir_structure("branch_union_aggregate_direct_exec", &distributed, 1);
     }
 
     #[test]
@@ -650,23 +700,30 @@ mod tests {
                 .is_some_and(|exprs| !exprs.is_empty()),
             "iceberg_sink: root output exprs must be present"
         );
-        assert_multi_fragment_ir_structure("iceberg_sink", &distributed);
+        assert_multi_fragment_ir_structure("iceberg_sink", &distributed, 1);
     }
 
-    fn assert_distributed_plan_ir_structure(case_name: &str, plan: PhysicalPlanNode) {
+    fn assert_distributed_plan_ir_structure(
+        case_name: &str,
+        plan: PhysicalPlanNode,
+        expected_fragment_count: usize,
+    ) {
         let connectors = ConnectorRegistry::new();
         let distributed = build_distributed_plan(case_name, plan, &connectors);
-        assert_multi_fragment_ir_structure(case_name, &distributed);
+        assert_multi_fragment_ir_structure(case_name, &distributed, expected_fragment_count);
     }
 
     fn assert_distributed_plan_ir_structure_with_large_stack(
         case_name: &'static str,
         plan: PhysicalPlanNode,
+        expected_fragment_count: usize,
     ) {
         std::thread::Builder::new()
             .name(format!("{case_name}_ir_structure"))
             .stack_size(64 * 1024 * 1024)
-            .spawn(move || assert_distributed_plan_ir_structure(case_name, plan))
+            .spawn(move || {
+                assert_distributed_plan_ir_structure(case_name, plan, expected_fragment_count)
+            })
             .expect("spawn IR structure test thread")
             .join()
             .expect("IR structure test thread panicked");
@@ -731,10 +788,19 @@ mod tests {
         );
     }
 
-    fn assert_multi_fragment_ir_structure(case_name: &str, result: &MultiFragmentBuildResult) {
+    fn assert_multi_fragment_ir_structure(
+        case_name: &str,
+        result: &MultiFragmentBuildResult,
+        expected_fragment_count: usize,
+    ) {
         assert!(
             !result.fragment_results.is_empty(),
             "{case_name}: expected at least one fragment"
+        );
+        assert_eq!(
+            result.fragment_results.len(),
+            expected_fragment_count,
+            "{case_name}: fragment count"
         );
         assert_eq!(
             result
@@ -841,6 +907,7 @@ mod tests {
                 "{case_name}: normal fragment plan must contain nodes"
             );
         }
+        assert_plan_node_ids_follow_preorder(case_name, plan);
         let mut node_ids = BTreeSet::new();
         for node in &plan.nodes {
             assert!(
@@ -850,6 +917,57 @@ mod tests {
             );
         }
         node_ids
+    }
+
+    fn assert_plan_node_ids_follow_preorder(case_name: &str, plan: &crate::plan_nodes::TPlan) {
+        if plan.nodes.is_empty() {
+            return;
+        }
+
+        let consumed = assert_plan_subtree_node_ids_follow_preorder(case_name, &plan.nodes, 0);
+        assert_eq!(
+            consumed,
+            plan.nodes.len(),
+            "{case_name}: TPlan nodes must contain exactly one pre-order tree"
+        );
+    }
+
+    fn assert_plan_subtree_node_ids_follow_preorder(
+        case_name: &str,
+        nodes: &[crate::plan_nodes::TPlanNode],
+        root_idx: usize,
+    ) -> usize {
+        let root = nodes
+            .get(root_idx)
+            .unwrap_or_else(|| panic!("{case_name}: missing TPlan subtree root at {root_idx}"));
+        let mut next_idx = root_idx + 1;
+        let mut previous_child_root_id = None;
+        for child_ordinal in 0..root.num_children {
+            let child = nodes.get(next_idx).unwrap_or_else(|| {
+                panic!(
+                    "{case_name}: node {} declares missing child {}",
+                    root.node_id, child_ordinal
+                )
+            });
+            assert!(
+                root.node_id > child.node_id,
+                "{case_name}: parent node id {} must be greater than child root id {} in TPlan pre-order",
+                root.node_id,
+                child.node_id
+            );
+            if let Some(previous_child_root_id) = previous_child_root_id {
+                assert!(
+                    previous_child_root_id < child.node_id,
+                    "{case_name}: sibling child root node ids must increase, got {} before {} under parent {}",
+                    previous_child_root_id,
+                    child.node_id,
+                    root.node_id
+                );
+            }
+            previous_child_root_id = Some(child.node_id);
+            next_idx = assert_plan_subtree_node_ids_follow_preorder(case_name, nodes, next_idx);
+        }
+        next_idx
     }
 
     fn assert_edges_well_formed(
