@@ -5,9 +5,7 @@
 //! `PhysicalCTEProduce` / `PhysicalCTEConsume` create multicast fragments
 //! whose sinks are wired by the `ExecutionCoordinator` after building.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
 
 use arrow::datatypes::DataType;
 
@@ -26,7 +24,6 @@ use crate::sql::codegen::iceberg_write_sink::{
     IcebergWriteSinkSpec, partition_info_from_serialized_metadata,
 };
 use crate::sql::codegen::nodes;
-use crate::sql::codegen::runtime_filter_lowering::RfProbeTarget;
 use crate::sql::codegen::{
     DirectExecPlan, FragmentBuildResult, MultiFragmentBuildResult, OutputColumn,
 };
@@ -362,66 +359,17 @@ pub(in crate::sql::codegen) fn iceberg_scan_table_handle_for_codegen(
 // PlanFragmentBuilder
 // ---------------------------------------------------------------------------
 
-pub(crate) struct PlanFragmentBuilder<'a> {
-    // Retained for Stage 5 cleanup that also drops `CatalogProvider::get_physical_layout`.
-    // Codegen no longer reads `self.catalog`; the field stays so the builder can keep
-    // its existing constructor shape during the transition.
-    #[allow(dead_code)]
-    catalog: &'a dyn CatalogProvider,
-    pub(in crate::sql::codegen) connectors: &'a crate::connector::ConnectorRegistry,
-    pub(in crate::sql::codegen) mv_refresh_ctx:
-        Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
-    pub(in crate::sql::codegen) desc_builder: DescriptorTableBuilder,
-    pub(in crate::sql::codegen) scan_tables: Vec<nodes::PlannedScanTable>,
-    /// Slot ids are shared with `ExprCompiler` so that lambda-parameter slot
-    /// ids stay unique across the entire query. Wrapped in `Rc<RefCell<_>>`
-    /// to allow handing out an allocator handle without borrowing the whole
-    /// builder.
-    next_slot_id: Rc<RefCell<i32>>,
-    /// Fragment ids for current lowering context. Top is active fragment id.
-    pub(in crate::sql::codegen) fragment_stack: Vec<FragmentId>,
-    /// Per-fragment accumulator of `TGlobalDict` entries emitted by scans
-    /// with non-empty `dict_columns`. Drained into
-    /// `FragmentBuildResult.query_global_dicts` when each fragment is
-    /// finalized. Empty in all production paths until Task 7+.
-    pub(in crate::sql::codegen) query_global_dicts_per_fragment:
-        HashMap<FragmentId, Vec<crate::data::TGlobalDict>>,
-    /// Maps each slot id that currently carries dict-encoded data to the
-    /// (strings, ids, version) of the source dictionary. When a new
-    /// operator allocates a slot whose value flows from a tracked slot
-    /// (Aggregate's group-by passthrough, Project's column-ref item,
-    /// Decode's passthrough, etc.), the operator re-registers the same
-    /// dict against the new slot id so the downstream consumer (the
-    /// `Decode` node above an exchange, in the parent fragment) finds
-    /// its `dict_id_to_string_ids` key in the fragment's
-    /// `query_global_dicts`. Without this map, the dict registration
-    /// stays pinned to the scan's slot id and never reaches the slot id
-    /// the parent fragment's Decode actually receives.
-    pub(in crate::sql::codegen) slot_to_global_dict: HashMap<i32, crate::data::TGlobalDict>,
-    /// OQ-5 runtime-filter lowering: probe targets recorded as nodes carrying
-    /// `probe_runtime_filters` are visited. Keyed by `filter_id`; consumed by
-    /// `visit_hash_join` to wire each build descriptor to its probe node.
-    /// Probe descendants are always visited before the owning join (children
-    /// first), so the lookup is populated by the time the join needs it.
-    pub(in crate::sql::codegen) rf_probe_targets: HashMap<i32, RfProbeTarget>,
-    /// Accumulated `filter_id -> TRuntimeFilterDescription` across all joins.
-    pub(in crate::sql::codegen) rf_all_filters:
-        HashMap<i32, crate::runtime_filter::TRuntimeFilterDescription>,
-    /// Accumulated build-side filter ids per fragment (the join's fragment).
-    pub(in crate::sql::codegen) rf_build_side_filters: HashMap<FragmentId, Vec<i32>>,
-    /// Accumulated probe-side `(filter_id, probe_target_node_id)` per fragment.
-    pub(in crate::sql::codegen) rf_probe_side_filters: HashMap<FragmentId, Vec<(i32, i32)>>,
-}
+pub(crate) struct PlanFragmentBuilder;
 
-impl<'a> PlanFragmentBuilder<'a> {
+impl PlanFragmentBuilder {
     // -------------------------------------------------------------------
     // Public entry
     // -------------------------------------------------------------------
 
     pub(crate) fn build_via_distributed_plan(
         plan: &PhysicalPlanNode,
-        catalog: &'a dyn CatalogProvider,
-        connectors: &'a crate::connector::ConnectorRegistry,
+        catalog: &dyn CatalogProvider,
+        connectors: &crate::connector::ConnectorRegistry,
         _current_database: &str,
     ) -> Result<MultiFragmentBuildResult, String> {
         Self::build_via_distributed_plan_with_mv_refresh_ctx(
@@ -433,7 +381,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         )
     }
 
-    pub(crate) fn build_via_distributed_plan_with_mv_refresh_ctx(
+    pub(crate) fn build_via_distributed_plan_with_mv_refresh_ctx<'a>(
         plan: &PhysicalPlanNode,
         catalog: &'a dyn CatalogProvider,
         connectors: &'a crate::connector::ConnectorRegistry,
@@ -477,7 +425,7 @@ impl<'a> PlanFragmentBuilder<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn build_via_distributed_plan_with_iceberg_sink(
+    pub(crate) fn build_via_distributed_plan_with_iceberg_sink<'a>(
         plan: &PhysicalPlanNode,
         catalog: &'a dyn CatalogProvider,
         connectors: &'a crate::connector::ConnectorRegistry,
@@ -495,7 +443,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         apply_iceberg_sink_to_build(build, current_database, sink_spec)
     }
 
-    fn build_aggregate_state_merge_direct_via_ir(
+    fn build_aggregate_state_merge_direct_via_ir<'a>(
         plan: &PhysicalPlanNode,
         catalog: &'a dyn CatalogProvider,
         connectors: &'a crate::connector::ConnectorRegistry,
@@ -528,7 +476,7 @@ impl<'a> PlanFragmentBuilder<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn build_aggregate_state_merge_direct_with_layout_via_ir(
+    fn build_aggregate_state_merge_direct_with_layout_via_ir<'a>(
         plan: &PhysicalPlanNode,
         catalog: &'a dyn CatalogProvider,
         connectors: &'a crate::connector::ConnectorRegistry,
@@ -656,7 +604,7 @@ impl<'a> PlanFragmentBuilder<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn try_build_branch_union_aggregate_direct_via_ir(
+    fn try_build_branch_union_aggregate_direct_via_ir<'a>(
         plan: &PhysicalPlanNode,
         catalog: &'a dyn CatalogProvider,
         connectors: &'a crate::connector::ConnectorRegistry,
@@ -798,132 +746,6 @@ impl<'a> PlanFragmentBuilder<'a> {
             ));
         }
         Ok(())
-    }
-
-    pub(in crate::sql::codegen) fn refresh_scan_table_for_codegen(
-        &self,
-        table: &crate::sql::catalog::TableDef,
-    ) -> Result<crate::sql::catalog::TableDef, String> {
-        match &table.source {
-            crate::sql::catalog::ScanSource::IcebergVersionTable {
-                table: iceberg_table,
-                snapshot_id,
-            } => {
-                let refresh_ctx = self.mv_refresh_ctx.ok_or_else(|| {
-                    "Iceberg version scan requires MV refresh context".to_string()
-                })?;
-                let mut out = table.clone();
-                out.source = refresh_ctx.version_scan_source(iceberg_table, *snapshot_id)?;
-                Ok(out)
-            }
-            crate::sql::catalog::ScanSource::IcebergMvTargetState(scan) => {
-                let refresh_ctx = self.mv_refresh_ctx.ok_or_else(|| {
-                    "Iceberg target-state scan requires MV refresh context".to_string()
-                })?;
-                let mut out = table.clone();
-                let projected = nodes::projected_target_state_column_names(scan);
-                out.columns.retain(|column| {
-                    projected
-                        .iter()
-                        .any(|name| name.eq_ignore_ascii_case(&column.name))
-                });
-                out.iceberg_row_lineage_metadata_columns.retain(|column| {
-                    projected
-                        .iter()
-                        .any(|name| name.eq_ignore_ascii_case(&column.name))
-                });
-                if projected
-                    .iter()
-                    .any(|name| name.eq_ignore_ascii_case("_row_id"))
-                    && !out
-                        .columns
-                        .iter()
-                        .chain(out.iceberg_row_lineage_metadata_columns.iter())
-                        .any(|column| column.name.eq_ignore_ascii_case("_row_id"))
-                {
-                    out.iceberg_row_lineage_metadata_columns
-                        .push(crate::sql::catalog::ColumnDef {
-                            name: "_row_id".to_string(),
-                            data_type: DataType::Int64,
-                            nullable: false,
-                            write_default: None,
-                            logical_type: None,
-                        });
-                }
-                out.source = refresh_ctx.target_state_scan_source(scan)?;
-                nodes::reject_target_state_equality_deletes(&out.source)?;
-                Ok(out)
-            }
-            _ => Ok(table.clone()),
-        }
-    }
-
-    // -------------------------------------------------------------------
-    // ID allocators
-    // -------------------------------------------------------------------
-
-    pub(in crate::sql::codegen) fn alloc_slot(&mut self) -> i32 {
-        let mut next = self.next_slot_id.borrow_mut();
-        let id = *next;
-        *next += 1;
-        id
-    }
-
-    /// Return a shared handle to the slot id allocator. Hand this to
-    /// `ExprCompiler::new_with_slot_alloc` so lambda parameter slots are
-    /// allocated from the same monotonic counter as physical tuple slots.
-    pub(in crate::sql::codegen) fn slot_allocator(&self) -> expr_compiler::SlotAllocator {
-        Rc::clone(&self.next_slot_id)
-    }
-
-    pub(in crate::sql::codegen) fn current_fragment_id(&self) -> Result<FragmentId, String> {
-        self.fragment_stack
-            .last()
-            .copied()
-            .ok_or_else(|| "no active fragment id in builder".to_string())
-    }
-
-    /// Re-register the source slot's TGlobalDict on a NEW slot id. Used
-    /// when an operator allocates a fresh slot that holds the same dict-
-    /// encoded values as the source (Aggregate group-by passthrough,
-    /// Project column-ref passthrough, Decode passthrough, etc.). The
-    /// dict is also pushed onto every fragment on the current stack so a
-    /// parent-fragment Decode finds it in its own `query_global_dicts`.
-    /// No-op when the source slot has no dict registered.
-    pub(in crate::sql::codegen) fn propagate_dict_to_slot(
-        &mut self,
-        source_slot_id: i32,
-        new_slot_id: i32,
-    ) {
-        if source_slot_id == new_slot_id {
-            return;
-        }
-        let Some(source_dict) = self.slot_to_global_dict.get(&source_slot_id).cloned() else {
-            return;
-        };
-        // Build a new TGlobalDict carrying the new slot's id so the BE's
-        // `query_global_dict_map` is keyed correctly.
-        let new_dict = crate::data::TGlobalDict::new(
-            Some(new_slot_id),
-            source_dict.strings.clone(),
-            source_dict.ids.clone(),
-            source_dict.version,
-        );
-        let fragments: Vec<FragmentId> = if self.fragment_stack.is_empty() {
-            self.current_fragment_id()
-                .ok()
-                .map(|f| vec![f])
-                .unwrap_or_default()
-        } else {
-            self.fragment_stack.clone()
-        };
-        for fragment_id in fragments {
-            self.query_global_dicts_per_fragment
-                .entry(fragment_id)
-                .or_default()
-                .push(new_dict.clone());
-        }
-        self.slot_to_global_dict.insert(new_slot_id, new_dict);
     }
 }
 

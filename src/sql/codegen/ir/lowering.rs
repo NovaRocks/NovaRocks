@@ -18,10 +18,9 @@ use crate::sql::codegen::boundary_schema::{
 use crate::sql::codegen::descriptors::DescriptorTableBuilder;
 use crate::sql::codegen::expr_compiler::{self, ExprCompiler};
 use crate::sql::codegen::fragment_builder::{
-    PlanFragmentBuilder, add_iceberg_equality_delete_required_columns, build_noop_sink,
-    build_result_sink, effective_iceberg_scan_column_names, iceberg_scan_table_handle_for_codegen,
-    iceberg_table_info, output_columns_for_boundary, result_root_boundary_schema_report,
-    synthetic_iceberg_table_id,
+    add_iceberg_equality_delete_required_columns, build_noop_sink, build_result_sink,
+    effective_iceberg_scan_column_names, iceberg_scan_table_handle_for_codegen, iceberg_table_info,
+    output_columns_for_boundary, result_root_boundary_schema_report, synthetic_iceberg_table_id,
 };
 use crate::sql::codegen::helpers::{
     agg_call_display_name, agg_call_display_name_without_qualifiers, group_win_exprs_by_sig,
@@ -793,82 +792,6 @@ pub(in crate::sql::codegen) trait LoweringStateAccess<'a> {
                 .push(new_dict.clone());
         }
         self.slot_to_global_dict_mut().insert(new_slot_id, new_dict);
-    }
-}
-
-impl<'a> LoweringStateAccess<'a> for PlanFragmentBuilder<'a> {
-    fn connectors(&self) -> &'a crate::connector::ConnectorRegistry {
-        self.connectors
-    }
-
-    fn mv_refresh_ctx(
-        &self,
-    ) -> Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext> {
-        self.mv_refresh_ctx
-    }
-
-    fn desc_builder(&mut self) -> &mut DescriptorTableBuilder {
-        &mut self.desc_builder
-    }
-
-    fn scan_tables(&mut self) -> &mut Vec<nodes::PlannedScanTable> {
-        &mut self.scan_tables
-    }
-
-    fn fragment_stack(&self) -> &[FragmentId] {
-        &self.fragment_stack
-    }
-
-    fn query_global_dicts_per_fragment(
-        &mut self,
-    ) -> &mut HashMap<FragmentId, Vec<crate::data::TGlobalDict>> {
-        &mut self.query_global_dicts_per_fragment
-    }
-
-    fn slot_to_global_dict(&self) -> &HashMap<i32, crate::data::TGlobalDict> {
-        &self.slot_to_global_dict
-    }
-
-    fn slot_to_global_dict_mut(&mut self) -> &mut HashMap<i32, crate::data::TGlobalDict> {
-        &mut self.slot_to_global_dict
-    }
-
-    fn rf_probe_targets(&mut self) -> &mut HashMap<i32, RfProbeTarget> {
-        &mut self.rf_probe_targets
-    }
-
-    fn rf_all_filters(
-        &mut self,
-    ) -> &mut HashMap<i32, crate::runtime_filter::TRuntimeFilterDescription> {
-        &mut self.rf_all_filters
-    }
-
-    fn rf_build_side_filters(&mut self) -> &mut HashMap<FragmentId, Vec<i32>> {
-        &mut self.rf_build_side_filters
-    }
-
-    fn rf_probe_side_filters(&mut self) -> &mut HashMap<FragmentId, Vec<(i32, i32)>> {
-        &mut self.rf_probe_side_filters
-    }
-
-    fn alloc_slot(&mut self) -> i32 {
-        PlanFragmentBuilder::alloc_slot(self)
-    }
-
-    fn slot_allocator(&self) -> expr_compiler::SlotAllocator {
-        PlanFragmentBuilder::slot_allocator(self)
-    }
-
-    fn current_fragment_id(&self) -> Result<FragmentId, String> {
-        PlanFragmentBuilder::current_fragment_id(self)
-    }
-
-    fn refresh_scan_table_for_codegen(&self, table: &TableDef) -> Result<TableDef, String> {
-        PlanFragmentBuilder::refresh_scan_table_for_codegen(self, table)
-    }
-
-    fn propagate_dict_to_slot(&mut self, source_slot_id: i32, new_slot_id: i32) {
-        PlanFragmentBuilder::propagate_dict_to_slot(self, source_slot_id, new_slot_id)
     }
 }
 
