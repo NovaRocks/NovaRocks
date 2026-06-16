@@ -78,6 +78,12 @@ impl IcebergCommitAction for RowDeltaDvFromFilesCommit {
         let action = RowDeltaDvFromFilesTxnAction {
             written_dvs,
             written: written_data,
+            // M3a: net-new INSERT data (folded MERGE not-matched branch) is
+            // routed into this channel by the caller (M3b). The current
+            // entry-point partitions every `(Data, _)` file into the reuse
+            // `written` channel, so this defaults empty and existing callers
+            // (MOR UPDATE / plain DELETE) are byte-identical to before.
+            appended_files: Vec::new(),
             commit_uuid: ctx.commit_uuid,
             file_io: ctx.file_io.clone(),
             schema: ctx.table.metadata().current_schema().clone(),
@@ -125,6 +131,13 @@ struct RowDeltaDvFromFilesTxnAction {
     /// added-data manifest is marked with `first_row_id` to suppress
     /// allocation.
     written: Vec<WrittenFile>,
+    /// Net-new INSERT data files (e.g. a folded MERGE not-matched INSERT) that
+    /// are genuinely new rows carrying NO preserved `_row_id`. Unlike `written`,
+    /// these MUST draw FRESH `_row_id`s: their manifest is left UNMARKED so the
+    /// v3 manifest-list writer allocates ids starting at the table's effective
+    /// next-row-id and advances `next_row_id` by their `Σ record_count`. Empty
+    /// for MOR UPDATE / plain DELETE, keeping those paths byte-identical.
+    appended_files: Vec<WrittenFile>,
     commit_uuid: Uuid,
     file_io: FileIO,
     schema: SchemaRef,
@@ -152,6 +165,23 @@ impl TransactionAction for RowDeltaDvFromFilesTxnAction {
         let target_ref = &self.target_ref;
         let parent_snapshot_id = target_ref_snapshot_id(m, target_ref);
         let metadata_dir = metadata_dir(table);
+
+        // FRESH base for net-new appended INSERT rows. `row_lineage_first_row_id`
+        // is the REUSE floor (the MOR-UPDATE replacement / DV path never advances
+        // it). When appended INSERT rows are present they draw fresh ids starting
+        // at the table's effective next-row-id; otherwise this equals the reuse
+        // floor so the row-range shape `(floor, 0)` is unchanged.
+        let appended_rows = self.appended_files.iter().try_fold(0u64, |sum, f| {
+            sum.checked_add(f.record_count)
+                .ok_or_else(|| to_iceberg_unexpected("appended row count overflow".to_string()))
+        })?;
+        let has_appended = !self.appended_files.is_empty();
+        let appended_first_row_id = if has_appended {
+            effective_next_row_id(m).map_err(to_iceberg_unexpected)?
+        } else {
+            self.row_lineage_first_row_id
+        };
+
         let touched_files = self
             .written_dvs
             .iter()
@@ -260,6 +290,38 @@ impl TransactionAction for RowDeltaDvFromFilesTxnAction {
             ));
         }
 
+        // Net-new appended INSERT data (folded MERGE not-matched branch). Unlike
+        // the reuse `written` block above, this manifest is left UNMARKED so the
+        // v3 manifest-list writer assigns it `first_row_id = appended_first_row_id`
+        // and advances `next_row_id` by `Σ appended record_count` — mirroring
+        // `overwrite.rs` / `fast_append.rs`. It is pushed LAST so the preceding
+        // marked data manifest and delete manifests leave the writer's counter at
+        // `appended_first_row_id` when this manifest is assigned.
+        if has_appended {
+            let appended_path = format!(
+                "{metadata_dir}/{}-row-delta-appended-data-0.avro",
+                self.commit_uuid
+            );
+            self.abort_handle.record_manifest(appended_path.clone());
+            self.manifest_paths_out
+                .lock()
+                .expect("manifest_paths_out poisoned")
+                .push(appended_path.clone());
+            let appended_manifest = super::overwrite::write_added_data_manifest(
+                &self.file_io,
+                &appended_path,
+                &self.appended_files,
+                m.default_partition_spec().clone(),
+                self.schema.clone(),
+                new_seq,
+                new_snapshot_id,
+                format_version,
+            )
+            .await
+            .map_err(to_iceberg_unexpected)?;
+            new_manifests.push(appended_manifest);
+        }
+
         let manifest_list_path = format!(
             "{metadata_dir}/snap-{}-{}.avro",
             new_snapshot_id, self.commit_uuid
@@ -270,6 +332,12 @@ impl TransactionAction for RowDeltaDvFromFilesTxnAction {
             .lock()
             .expect("manifest_paths_out poisoned")
             .push(manifest_list_path.clone());
+        // The writer starts at `appended_first_row_id`. The marked reuse data
+        // manifest and the delete manifests are `(Some, Some)` / Deletes and
+        // never move the counter; only the unmarked appended manifest (if any)
+        // draws fresh ids and advances it. With no appended files this equals
+        // `row_lineage_first_row_id`, so the MOR-UPDATE / DELETE path is
+        // byte-identical (final next-row-id == floor, row-range `(floor, 0)`).
         let manifest_list_next_row_id = write_manifest_list(
             &self.file_io,
             &manifest_list_path,
@@ -278,14 +346,18 @@ impl TransactionAction for RowDeltaDvFromFilesTxnAction {
             parent_snapshot_id,
             new_seq,
             format_version,
-            Some(self.row_lineage_first_row_id),
+            Some(appended_first_row_id),
         )
         .await
         .map_err(to_iceberg_unexpected)?;
-        if manifest_list_next_row_id != Some(self.row_lineage_first_row_id) {
+        let expected_next_row_id = appended_first_row_id.checked_add(appended_rows).ok_or_else(|| {
+            to_iceberg_unexpected(format!(
+                "Row ID overflow computing row-delta row lineage range: first_row_id={appended_first_row_id}, appended_rows={appended_rows}"
+            ))
+        })?;
+        if manifest_list_next_row_id != Some(expected_next_row_id) {
             return Err(to_iceberg_unexpected(format!(
-                "row-lineage DELETE must not allocate row IDs: expected next-row-id {}, got {manifest_list_next_row_id:?}",
-                self.row_lineage_first_row_id
+                "row-lineage row-delta row lineage mismatch: expected next-row-id {expected_next_row_id}, got {manifest_list_next_row_id:?}"
             )));
         }
 
@@ -301,7 +373,18 @@ impl TransactionAction for RowDeltaDvFromFilesTxnAction {
                     index.replaced_delete_records
                 ))
             })?;
-        let added_data_records = self.written.iter().try_fold(0u64, |sum, file| {
+        // Summary `added-*` / `total-records` must count BOTH reuse replacement
+        // rows and net-new appended INSERT rows. When `appended_files` is empty
+        // this borrows `self.written` unchanged, keeping the MOR-UPDATE / DELETE
+        // summary byte-identical.
+        let all_added_data: std::borrow::Cow<'_, [WrittenFile]> = if has_appended {
+            let mut v = self.written.clone();
+            v.extend(self.appended_files.iter().cloned());
+            std::borrow::Cow::Owned(v)
+        } else {
+            std::borrow::Cow::Borrowed(&self.written)
+        };
+        let added_data_records = all_added_data.iter().try_fold(0u64, |sum, file| {
             sum.checked_add(file.record_count).ok_or_else(|| {
                 to_iceberg_unexpected("DV added data record count overflow".to_string())
             })
@@ -315,7 +398,7 @@ impl TransactionAction for RowDeltaDvFromFilesTxnAction {
 
         let mut dv_props = dv_summary(
             &self.written_dvs,
-            &self.written,
+            &all_added_data,
             total_records,
             newly_deleted_records,
             index.replaced_delete_files,
@@ -346,7 +429,11 @@ impl TransactionAction for RowDeltaDvFromFilesTxnAction {
                 additional_properties: summary_props,
             })
             .with_schema_id(self.schema_id)
-            .with_row_range(self.row_lineage_first_row_id, 0)
+            // Reuse rows (DV deletes + MOR-UPDATE replacements) contribute 0;
+            // only fresh appended INSERT rows extend the row-range.
+            // `appended_rows == 0` for MOR UPDATE / DELETE, preserving the prior
+            // `(first_row_id, 0)` shape.
+            .with_row_range(appended_first_row_id, appended_rows)
             .build();
 
         Ok(ActionCommit::new(
@@ -565,6 +652,127 @@ mod tests {
     use super::super::types::CommitOpKind;
     use super::*;
     use crate::common::types::UniqueId;
+
+    /// M3a Part B: a RowDeltaDvFromFiles commit may carry, in one snapshot,
+    /// REUSE data (MOR-UPDATE replacement rows that preserve their `_row_id`s,
+    /// the existing E1 `written` channel) PLUS FRESH data (a folded MERGE
+    /// not-matched INSERT, the new `appended_files` channel, no `_row_id`). The
+    /// snapshot's row-range must advance by ONLY the fresh files' Σ record_count;
+    /// the reuse files advance nothing.
+    #[tokio::test]
+    async fn row_delta_appended_insert_files_allocate_fresh_row_ids() {
+        use super::super::test_helpers::v3_table_with_n_data_files;
+
+        // Seed one data file (record_count=10) → existing row-ids 0..10, table
+        // next_row_id == 10. RowDeltaDvFromFiles requires a current snapshot.
+        let fixture = v3_table_with_n_data_files(1).await;
+        let file_io = fixture.table.file_io().clone();
+        let base_next_row_id = effective_next_row_id(fixture.table.metadata()).unwrap();
+        assert_eq!(base_next_row_id, 10, "fixture seeds row-ids 0..10");
+
+        // REUSE: replacement data carrying a preserved _row_id.
+        let reuse = test_written_data_file("file:///x/reuse.parquet", 4);
+        // FRESH: net-new INSERT data, no _row_id.
+        let mut fresh = test_written_data_file("file:///x/fresh.parquet", 9);
+        fresh.first_row_id = None;
+        let fresh_record_count = fresh.record_count;
+
+        let action = RowDeltaDvFromFilesTxnAction {
+            written_dvs: vec![],
+            written: vec![reuse],
+            appended_files: vec![fresh],
+            commit_uuid: Uuid::new_v4(),
+            file_io: file_io.clone(),
+            schema: fixture.table.metadata().current_schema().clone(),
+            schema_id: fixture.table.metadata().current_schema_id(),
+            row_lineage_first_row_id: base_next_row_id,
+            abort_handle: Arc::new(AbortLog::new()),
+            manifest_paths_out: Arc::new(Mutex::new(Vec::new())),
+            target_ref: "main".to_string(),
+            snapshot_properties: BTreeMap::new(),
+        };
+
+        let tx = Transaction::new(&fixture.table);
+        let tx = action.apply(tx).expect("apply RowDeltaDvFromFiles");
+        let table_after = tx
+            .commit(fixture.catalog.as_ref())
+            .await
+            .expect("commit RowDeltaDvFromFiles with reuse + fresh data");
+
+        let snap = table_after
+            .metadata()
+            .current_snapshot()
+            .expect("snapshot after row-delta");
+        let (first_row_id, added_rows) = snap
+            .row_range()
+            .expect("v3 row-delta snapshot must carry a row range");
+        assert_eq!(
+            first_row_id, base_next_row_id,
+            "fresh appended rows must start at the table's pre-commit next_row_id",
+        );
+        assert_eq!(
+            added_rows, fresh_record_count,
+            "row-range must advance by exactly the appended fresh Σ record_count (reuse advances 0)",
+        );
+        assert_eq!(
+            table_after.metadata().next_row_id(),
+            base_next_row_id + fresh_record_count,
+            "table next_row_id must advance by exactly the fresh rows",
+        );
+    }
+
+    /// M3a Part B invariant: a reuse-only commit (MOR-UPDATE replacement data
+    /// with an empty `appended_files` channel) must remain byte-identical to E1 —
+    /// the snapshot row-range stays `(row_lineage_first_row_id, 0)` and the
+    /// table's `next_row_id` does not advance.
+    #[tokio::test]
+    async fn row_delta_reuse_only_does_not_advance_row_ids() {
+        use super::super::test_helpers::v3_table_with_n_data_files;
+
+        let fixture = v3_table_with_n_data_files(1).await;
+        let file_io = fixture.table.file_io().clone();
+        let base_next_row_id = effective_next_row_id(fixture.table.metadata()).unwrap();
+
+        let reuse = test_written_data_file("file:///x/reuse.parquet", 4);
+
+        let action = RowDeltaDvFromFilesTxnAction {
+            written_dvs: vec![],
+            written: vec![reuse],
+            // Reuse-only: no net-new INSERT rows.
+            appended_files: vec![],
+            commit_uuid: Uuid::new_v4(),
+            file_io: file_io.clone(),
+            schema: fixture.table.metadata().current_schema().clone(),
+            schema_id: fixture.table.metadata().current_schema_id(),
+            row_lineage_first_row_id: base_next_row_id,
+            abort_handle: Arc::new(AbortLog::new()),
+            manifest_paths_out: Arc::new(Mutex::new(Vec::new())),
+            target_ref: "main".to_string(),
+            snapshot_properties: BTreeMap::new(),
+        };
+
+        let tx = Transaction::new(&fixture.table);
+        let tx = action.apply(tx).expect("apply RowDeltaDvFromFiles");
+        let table_after = tx
+            .commit(fixture.catalog.as_ref())
+            .await
+            .expect("commit reuse-only RowDeltaDvFromFiles");
+
+        let snap = table_after
+            .metadata()
+            .current_snapshot()
+            .expect("snapshot after row-delta");
+        assert_eq!(
+            snap.row_range(),
+            Some((base_next_row_id, 0)),
+            "reuse-only commit must keep the `(floor, 0)` row-range shape",
+        );
+        assert_eq!(
+            table_after.metadata().next_row_id(),
+            base_next_row_id,
+            "reuse-only commit must not advance the table's next_row_id",
+        );
+    }
 
     #[test]
     fn descriptor_conversion_builds_puffin_dv_data_file() {

@@ -40,7 +40,7 @@ use super::abort::AbortLog;
 use super::action::{CommitCtx, IcebergCommitAction};
 use super::fast_append::register_puffin_stats;
 use super::helpers::{
-    finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms,
+    effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms,
     required_target_ref_snapshot_id, snapshot_summary, target_ref_snapshot_id, write_manifest_list,
 };
 use super::overwrite::{write_added_data_manifest, write_overwrite_deletes_manifest};
@@ -172,7 +172,30 @@ impl TransactionAction for CowUpdateTxnAction {
         let target_ref = &self.target_ref;
         let parent_snapshot_id = target_ref_snapshot_id(m, target_ref);
         let metadata_dir = metadata_dir(table);
-        let row_lineage_first_row_id = m.next_row_id();
+        // REUSE base: rewrite outputs and carried files keep their existing
+        // `_row_id`s, so their manifests are marked already-assigned against this
+        // floor and the writer allocates nothing for them.
+        let reuse_first_row_id = m.next_row_id();
+
+        // FRESH base: net-new appended INSERT rows (a folded MERGE not-matched
+        // INSERT) draw brand-new `_row_id`s, exactly like a standalone INSERT.
+        // They must start at the table's true next-row-id — derived from the max
+        // snapshot row-range end so we never collide with ids a non-echoing
+        // catalog already handed out.
+        let appended_rows = self
+            .rewrite
+            .appended_files
+            .iter()
+            .try_fold(0u64, |sum, f| {
+                sum.checked_add(f.record_count)
+                    .ok_or_else(|| to_iceberg_unexpected("appended row count overflow".to_string()))
+            })?;
+        let has_appended = !self.rewrite.appended_files.is_empty();
+        let appended_first_row_id = if has_appended {
+            effective_next_row_id(m).map_err(to_iceberg_unexpected)?
+        } else {
+            reuse_first_row_id
+        };
 
         validate_cow_update_inputs(
             &self.rewrite,
@@ -306,14 +329,17 @@ impl TransactionAction for CowUpdateTxnAction {
         // Net-new appended data files (e.g. a folded MERGE not-matched INSERT)
         // are added to the same Overwrite snapshot. They are tied to no touched
         // `old_file`, so they remove nothing — only an added-data manifest is
-        // written. Like the rewrite outputs, the manifest is marked so the v3
-        // manifest-list writer does NOT allocate fresh row IDs, keeping the
-        // snapshot's row-lineage range unchanged. NOTE: suppressing row-id
-        // allocation here is correct ONLY while these appended rows reuse
-        // existing row-ids (the current M1 callers pass appended_files that do).
-        // Genuinely net-new INSERT rows would need fresh _row_ids — see the
-        // TODO(M3) at the mark-replacement call below.
-        if !self.rewrite.appended_files.is_empty() {
+        // written. Unlike the rewrite outputs (which preserve their scanned
+        // `_row_id`s and are marked already-assigned), these rows are genuinely
+        // new and MUST draw FRESH `_row_id`s. The manifest is left UNMARKED so
+        // the v3 manifest-list writer allocates ids starting at
+        // `appended_first_row_id` (= the table's effective next-row-id) and
+        // advances `next_row_id` by exactly `Σ appended record_count`, mirroring
+        // the added-data manifest in `overwrite.rs` / `fast_append.rs`. This
+        // manifest is pushed LAST so every preceding (marked) manifest has
+        // already been processed without moving the writer's counter, leaving it
+        // at `appended_first_row_id` when this manifest is assigned.
+        if has_appended {
             let appended_manifest_path = format!(
                 "{metadata_dir}/{}-cow-update-appended-0.avro",
                 self.commit_uuid
@@ -336,17 +362,7 @@ impl TransactionAction for CowUpdateTxnAction {
             )
             .await
             .map_err(to_iceberg_unexpected)?;
-            // TODO(M3): net-new appended INSERT rows need FRESH _row_ids. Suppressing
-            // row-id allocation here (reusing row_lineage_first_row_id with row-range 0)
-            // is correct ONLY while appended_files rows reuse existing lineage. Before M3
-            // populates non-empty appended_files with genuinely new rows, relax the
-            // row-range / first_row_id handling for this appended block to allocate fresh
-            // ids. The strict `next_row_id == row_lineage_first_row_id` check does NOT catch
-            // this — it would still pass. See docs/superpowers/plans/2026-06-16-iceberg-atomic-merge-phase3.md (M3).
-            new_manifests.push(mark_replacement_manifest_row_id_assigned(
-                appended_manifest,
-                row_lineage_first_row_id,
-            ));
+            new_manifests.push(appended_manifest);
         }
 
         let manifest_list_path = format!(
@@ -359,6 +375,12 @@ impl TransactionAction for CowUpdateTxnAction {
             .lock()
             .expect("manifest_paths_out poisoned")
             .push(manifest_list_path.clone());
+        // The writer starts its counter at `appended_first_row_id`. The marked
+        // rewrite/carried manifests are `(Some, Some)` and never move it; only
+        // the unmarked appended manifest (if any) draws fresh ids and advances
+        // the counter. When there are no appended files this equals
+        // `m.next_row_id()`, so the pure-UPDATE / MOR-style reuse path is
+        // byte-identical to before (row-range `(reuse_first_row_id, 0)`).
         let manifest_list_next_row_id = write_manifest_list(
             &self.file_io,
             &manifest_list_path,
@@ -367,13 +389,18 @@ impl TransactionAction for CowUpdateTxnAction {
             parent_snapshot_id,
             new_seq,
             format_version,
-            Some(row_lineage_first_row_id),
+            Some(appended_first_row_id),
         )
         .await
         .map_err(to_iceberg_unexpected)?;
-        if manifest_list_next_row_id != Some(row_lineage_first_row_id) {
+        let expected_next_row_id = appended_first_row_id.checked_add(appended_rows).ok_or_else(|| {
+            to_iceberg_unexpected(format!(
+                "Row ID overflow computing COW UPDATE row lineage range: first_row_id={appended_first_row_id}, appended_rows={appended_rows}"
+            ))
+        })?;
+        if manifest_list_next_row_id != Some(expected_next_row_id) {
             return Err(to_iceberg_unexpected(format!(
-                "COW UPDATE must not allocate row IDs: expected next-row-id {row_lineage_first_row_id}, got {manifest_list_next_row_id:?}"
+                "COW UPDATE row lineage mismatch: expected next-row-id {expected_next_row_id}, got {manifest_list_next_row_id:?}"
             )));
         }
 
@@ -427,7 +454,10 @@ impl TransactionAction for CowUpdateTxnAction {
             .with_manifest_list(manifest_list_path)
             .with_summary(summary)
             .with_schema_id(m.current_schema_id())
-            .with_row_range(row_lineage_first_row_id, 0)
+            // Reuse rows (rewrite outputs) contribute 0; only the fresh appended
+            // INSERT rows extend the snapshot's row-range. `appended_rows == 0`
+            // for a pure UPDATE, preserving the prior `(first_row_id, 0)` shape.
+            .with_row_range(appended_first_row_id, appended_rows)
             .build();
 
         Ok(ActionCommit::new(
@@ -855,6 +885,339 @@ mod tests {
 
         let commit = CowUpdateCommit { rewrite };
         assert_eq!(commit.rewrite.base_snapshot_id, 7);
+    }
+
+    /// M3a Part A: a COW UPDATE that folds a not-matched INSERT carries net-new
+    /// `appended_files`. Those rows are genuinely new and MUST draw fresh
+    /// `_row_id`s: the snapshot's row-range advances by exactly the appended
+    /// files' `Σ record_count`, while the rewrite outputs reuse their preserved
+    /// lineage and advance nothing. This pins the advance at the snapshot level
+    /// (`row_range`) and the table level (`next_row_id`), and checks the
+    /// per-manifest `first_row_id` split (rewrite manifest reuses the base id;
+    /// the appended manifest starts at `effective_next_row_id`).
+    #[tokio::test]
+    async fn cow_update_appended_insert_files_allocate_fresh_row_ids() {
+        use super::super::test_helpers::v3_table_with_n_data_files;
+
+        // Seed a single data file with record_count=10 → fresh row-ids 0..10,
+        // table next_row_id == 10.
+        let fixture = v3_table_with_n_data_files(1).await;
+        let file_io = fixture.table.file_io().clone();
+        let base_next_row_id = effective_next_row_id(fixture.table.metadata()).unwrap();
+        assert_eq!(base_next_row_id, 10, "fixture seeds row-ids 0..10");
+
+        // Discover the seeded live data file's path and its assigned first_row_id.
+        let live = single_live_data_file(&fixture.table, &file_io).await;
+        let touched_first_row_id = live.first_row_id as i64;
+        let touched_path = live.path();
+        // Rewrite output reuses the matched rows' preserved lineage.
+        let rewrite_path = format!("{touched_path}.rewrite.parquet");
+        // Appended INSERT outputs are net-new (no _row_id).
+        let appended_record_count: u64 = 7;
+        let appended_path = format!("{touched_path}.insert.parquet");
+
+        let rewrite = CowUpdateRewriteSet {
+            base_snapshot_id: fixture
+                .table
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .snapshot_id(),
+            target_table_uuid: fixture.table.metadata().uuid().to_string(),
+            // Only row 0 is updated; the rewrite file replays the whole touched file.
+            updated_row_ids: vec![touched_first_row_id],
+            touched_data_files: vec![CowUpdateTouchedFile {
+                old_file: touched_path.clone(),
+                new_files: vec![rewrite_path.clone()],
+                // The touched file covers row-ids touched_first_row_id..+10.
+                row_ids: (touched_first_row_id..touched_first_row_id + 10).collect(),
+            }],
+            appended_files: vec![written_data_file_with(
+                &appended_path,
+                appended_record_count,
+                // FRESH: not-matched INSERT carries NO _row_id.
+                None,
+            )],
+        };
+
+        // BE writes both the rewrite replacement output (carrying preserved
+        // _row_id) and the appended INSERT file (no _row_id).
+        let rewrite_out = written_data_file_with(
+            &rewrite_path,
+            10,
+            // REUSE: rewrite output preserves the touched rows' first_row_id.
+            Some(touched_first_row_id),
+        );
+        let appended_out = written_data_file_with(&appended_path, appended_record_count, None);
+
+        let outcome = run_cow_update_commit(&fixture, rewrite, vec![rewrite_out, appended_out])
+            .await
+            .expect("CowUpdateCommit with appended INSERT files succeeds");
+        assert_ne!(outcome.new_snapshot_id, 0);
+
+        let reloaded = fixture
+            .catalog
+            .load_table(&fixture.table_ident)
+            .await
+            .expect("reload table after CowUpdate");
+        let snap = reloaded
+            .metadata()
+            .current_snapshot()
+            .expect("snapshot after CowUpdate");
+        let (snapshot_first_row_id, snapshot_added_rows) = snap
+            .row_range()
+            .expect("v3 CowUpdate snapshot must carry a row range");
+
+        // The fresh appended rows advance the range by exactly their record_count;
+        // the rewrite outputs reuse their lineage and advance nothing.
+        assert_eq!(
+            snapshot_first_row_id, base_next_row_id,
+            "fresh appended rows must start at the table's pre-commit next_row_id",
+        );
+        assert_eq!(
+            snapshot_added_rows, appended_record_count,
+            "snapshot row-range must advance by exactly the appended Σ record_count",
+        );
+        assert_eq!(
+            reloaded.metadata().next_row_id(),
+            base_next_row_id + appended_record_count,
+            "table next_row_id must advance by exactly the appended fresh rows",
+        );
+
+        // Per-manifest split: the appended manifest starts fresh at base_next_row_id;
+        // the rewrite manifest reuses the touched file's base id and is not fresh.
+        let manifests = read_manifest_list(&reloaded).await;
+        let appended_manifest = manifests
+            .iter()
+            .find(|mf| {
+                mf.content == ManifestContentType::Data
+                    && mf.added_files_count.unwrap_or(0) > 0
+                    && mf.added_rows_count == Some(appended_record_count)
+            })
+            .expect("appended INSERT data manifest must be present");
+        assert_eq!(
+            appended_manifest.first_row_id,
+            Some(base_next_row_id),
+            "appended INSERT manifest must draw fresh ids starting at base_next_row_id",
+        );
+    }
+
+    /// M3a Part A invariant: a pure UPDATE (empty `appended_files`) must remain
+    /// byte-identical to the prior reuse path — the snapshot row-range stays
+    /// `(reuse_first_row_id, 0)` and the table's `next_row_id` does not advance.
+    #[tokio::test]
+    async fn cow_update_pure_update_does_not_advance_row_ids() {
+        use super::super::test_helpers::v3_table_with_n_data_files;
+
+        let fixture = v3_table_with_n_data_files(1).await;
+        let file_io = fixture.table.file_io().clone();
+        let base_next_row_id = effective_next_row_id(fixture.table.metadata()).unwrap();
+        let raw_next_row_id = fixture.table.metadata().next_row_id();
+
+        let live = single_live_data_file(&fixture.table, &file_io).await;
+        let touched_first_row_id = live.first_row_id as i64;
+        let touched_path = live.path();
+        let rewrite_path = format!("{touched_path}.rewrite.parquet");
+
+        let rewrite = CowUpdateRewriteSet {
+            base_snapshot_id: fixture
+                .table
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .snapshot_id(),
+            target_table_uuid: fixture.table.metadata().uuid().to_string(),
+            updated_row_ids: vec![touched_first_row_id],
+            touched_data_files: vec![CowUpdateTouchedFile {
+                old_file: touched_path.clone(),
+                new_files: vec![rewrite_path.clone()],
+                row_ids: (touched_first_row_id..touched_first_row_id + 10).collect(),
+            }],
+            // Pure UPDATE: no net-new INSERT rows.
+            appended_files: vec![],
+        };
+        let rewrite_out = written_data_file_with(&rewrite_path, 10, Some(touched_first_row_id));
+
+        run_cow_update_commit(&fixture, rewrite, vec![rewrite_out])
+            .await
+            .expect("pure CowUpdate succeeds");
+
+        let reloaded = fixture
+            .catalog
+            .load_table(&fixture.table_ident)
+            .await
+            .expect("reload table after pure CowUpdate");
+        let snap = reloaded
+            .metadata()
+            .current_snapshot()
+            .expect("snapshot after pure CowUpdate");
+        let (first_row_id, added_rows) = snap
+            .row_range()
+            .expect("v3 CowUpdate snapshot must carry a row range");
+        assert_eq!(
+            (first_row_id, added_rows),
+            (raw_next_row_id, 0),
+            "pure UPDATE must keep the reuse row-range shape (m.next_row_id(), 0)",
+        );
+        assert_eq!(
+            reloaded.metadata().next_row_id(),
+            base_next_row_id,
+            "pure UPDATE must not advance the table's next_row_id",
+        );
+    }
+
+    /// Read the single live data file from a table's current snapshot. Panics
+    /// unless exactly one live data file is present.
+    async fn single_live_data_file(
+        table: &iceberg::table::Table,
+        file_io: &iceberg::io::FileIO,
+    ) -> LiveDataFile {
+        let index = build_cow_snapshot_index(table, file_io, &HashSet::new(), "main")
+            .await
+            .expect("build_cow_snapshot_index");
+        // With no touched paths, every live data file lands in untouched_manifests;
+        // re-read them to expose the LiveDataFile records.
+        let snapshot = table.metadata().current_snapshot().expect("snapshot");
+        let manifest_list = snapshot
+            .load_manifest_list(file_io, table.metadata())
+            .await
+            .expect("load manifest list");
+        let mut found: Vec<LiveDataFile> = Vec::new();
+        let mut next_first_row_id_base = 0u64;
+        for mf in manifest_list.entries() {
+            if mf.content != ManifestContentType::Data {
+                continue;
+            }
+            let mut next_manifest_first_row_id = mf.first_row_id;
+            let manifest = mf.load_manifest(file_io).await.expect("load data manifest");
+            for entry in manifest.entries() {
+                if !entry.is_alive() {
+                    continue;
+                }
+                let df = entry.data_file();
+                if df.content_type() != DataContentType::Data {
+                    continue;
+                }
+                let first_row_id = df
+                    .first_row_id()
+                    .or(next_manifest_first_row_id.map(|v| v as i64))
+                    .unwrap_or(next_first_row_id_base as i64);
+                if let Some(next) = next_manifest_first_row_id.as_mut() {
+                    *next += df.record_count();
+                }
+                next_first_row_id_base += df.record_count();
+                found.push(LiveDataFile {
+                    data_file: df.clone(),
+                    partition_spec_id: mf.partition_spec_id,
+                    snapshot_id: entry.snapshot_id().unwrap_or(mf.added_snapshot_id),
+                    sequence_number: entry.sequence_number().unwrap_or(mf.sequence_number),
+                    file_sequence_number: entry.file_sequence_number,
+                    first_row_id: first_row_id as u64,
+                });
+            }
+        }
+        let _ = index;
+        assert_eq!(
+            found.len(),
+            1,
+            "fixture must expose exactly one live data file"
+        );
+        found.pop().unwrap()
+    }
+
+    impl LiveDataFile {
+        fn path(&self) -> String {
+            self.data_file.file_path().to_string()
+        }
+    }
+
+    async fn read_manifest_list(table: &iceberg::table::Table) -> Vec<iceberg::spec::ManifestFile> {
+        let snap = table.metadata().current_snapshot().expect("snapshot");
+        let bytes = table
+            .file_io()
+            .new_input(snap.manifest_list())
+            .expect("open manifest list")
+            .read()
+            .await
+            .expect("read manifest list");
+        iceberg::spec::ManifestList::parse_with_version(&bytes, table.metadata().format_version())
+            .expect("parse manifest list")
+            .entries()
+            .to_vec()
+    }
+
+    /// Drive a `CowUpdateCommit` through a minimal collector with the given
+    /// written files injected, mirroring `run_commit_with` but allowing
+    /// pre-seeded `written` files (which the empty-collector helper does not).
+    async fn run_cow_update_commit(
+        fixture: &super::super::test_helpers::IcebergTestFixture,
+        rewrite: CowUpdateRewriteSet,
+        written: Vec<WrittenFile>,
+    ) -> Result<CommitOutcome, String> {
+        use super::super::collector::IcebergCommitCollector;
+        use super::super::types::CommitOpKind;
+
+        let metadata = fixture.table.metadata();
+        let staging_dir = format!("{}/staging", metadata.location());
+        let collector = Arc::new(
+            IcebergCommitCollector::new(
+                CommitOpKind::CowUpdate,
+                fixture.table_ident.clone(),
+                metadata.current_snapshot().map(|s| s.snapshot_id()),
+                metadata.last_sequence_number(),
+                metadata.current_schema().clone(),
+                metadata.default_partition_spec().clone(),
+                staging_dir,
+                crate::common::types::UniqueId { hi: 0, lo: 0 },
+            )
+            .with_table_metadata(metadata.clone()),
+        );
+        for wf in written {
+            collector.inject_written_file(wf);
+        }
+        let file_io = fixture.table.file_io().clone();
+        let abort_handle = collector.abort_log.clone();
+        let snapshot_properties = BTreeMap::new();
+        let ctx = CommitCtx {
+            collector: &collector,
+            table: &fixture.table,
+            catalog: fixture.catalog.as_ref(),
+            file_io: &file_io,
+            commit_uuid: Uuid::new_v4(),
+            abort_handle,
+            target_ref: "main",
+            snapshot_properties: &snapshot_properties,
+        };
+        CowUpdateCommit { rewrite }.commit(ctx).await
+    }
+
+    fn written_data_file_with(
+        path: &str,
+        record_count: u64,
+        first_row_id: Option<i64>,
+    ) -> WrittenFile {
+        WrittenFile {
+            path: path.to_string(),
+            format: DataFileFormat::Parquet,
+            content: DataContentType::Data,
+            partition_values: Struct::empty(),
+            partition_spec_id: 0,
+            record_count,
+            file_size_in_bytes: 128,
+            split_offsets: vec![],
+            column_sizes: HashMap::new(),
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::new(),
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            key_metadata: None,
+            referenced_data_file: None,
+            equality_ids: None,
+            first_row_id,
+            content_offset: None,
+            content_size_in_bytes: None,
+            cardinality: None,
+        }
     }
 
     #[test]
