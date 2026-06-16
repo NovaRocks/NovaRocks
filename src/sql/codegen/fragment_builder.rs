@@ -492,6 +492,22 @@ impl<'a> PlanFragmentBuilder<'a> {
         connectors: &'a crate::connector::ConnectorRegistry,
         _current_database: &str,
     ) -> Result<MultiFragmentBuildResult, String> {
+        Self::build_via_distributed_plan_with_mv_refresh_ctx(
+            plan,
+            catalog,
+            connectors,
+            _current_database,
+            None,
+        )
+    }
+
+    pub(crate) fn build_via_distributed_plan_with_mv_refresh_ctx(
+        plan: &PhysicalPlanNode,
+        catalog: &'a dyn CatalogProvider,
+        connectors: &'a crate::connector::ConnectorRegistry,
+        _current_database: &str,
+        mv_refresh_ctx: Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+    ) -> Result<MultiFragmentBuildResult, String> {
         super::id_binding_verifier::verify_id_binding(plan)?;
         let plan = match &plan.op {
             Operator::PhysicalDistribution(op)
@@ -507,7 +523,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             _ => plan,
         };
         let dp = crate::sql::codegen::ir::build_distributed_plan(plan)?;
-        crate::sql::codegen::ir::lower_distributed_plan(&dp, catalog, connectors)
+        crate::sql::codegen::ir::lower_distributed_plan(&dp, catalog, connectors, mv_refresh_ctx)
     }
 
     #[allow(clippy::too_many_arguments)]

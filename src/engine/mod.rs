@@ -3261,7 +3261,7 @@ fn explain_analyze_query(
         crate::sql::optimizer::optimize(logical, &table_stats, factory, None, mv_candidates)?;
     let physical = collapse_distribution_enforcers_for_single_fragment(physical);
     let dp = build_distributed_plan(&physical)?;
-    let build_result = lower_distributed_plan(&dp, codegen_catalog, connectors)?;
+    let build_result = lower_distributed_plan(&dp, codegen_catalog, connectors, None)?;
     let planning_ms = t_plan.elapsed().as_millis() as u64;
 
     let t_exec = Instant::now();

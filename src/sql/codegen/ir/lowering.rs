@@ -54,13 +54,14 @@ pub(crate) fn lower_distributed_plan(
     dp: &super::fragment::DistributedPlan,
     catalog: &dyn CatalogProvider,
     connectors: &crate::connector::ConnectorRegistry,
+    mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
 ) -> Result<MultiFragmentBuildResult, String> {
     let _ = catalog;
     validate_distributed_plan(dp)?;
 
     let mut state = OwnedLoweringState::new_with_fragments(
         connectors,
-        None,
+        mv_refresh_ctx,
         dp.root_fragment_id,
         &dp.fragments,
     );
@@ -72,8 +73,11 @@ pub(crate) fn lower_distributed_plan(
 
     let desc_tbl =
         std::mem::replace(&mut state.desc_builder, DescriptorTableBuilder::new()).build();
-    let exec_params =
-        nodes::build_exec_params_multi_with_refresh_context(connectors, &state.scan_tables, None)?;
+    let exec_params = nodes::build_exec_params_multi_with_refresh_context(
+        connectors,
+        &state.scan_tables,
+        mv_refresh_ctx,
+    )?;
 
     let mut fragment_results = Vec::with_capacity(lowered_fragments.len());
     for (fragment, lowered) in lowered_fragments {
@@ -4903,7 +4907,7 @@ mod tests {
         let connectors = ConnectorRegistry::new();
         let dp = distributed_values_multi_fragment_plan();
 
-        let result = super::lower_distributed_plan(&dp, &catalog, &connectors)
+        let result = super::lower_distributed_plan(&dp, &catalog, &connectors, None)
             .expect("multi fragment lower");
 
         assert_eq!(result.root_fragment_id, 1);
@@ -4969,7 +4973,7 @@ mod tests {
         let connectors = ConnectorRegistry::new();
         let dp = distributed_values_three_fragment_chain_reverse_input();
 
-        let result = super::lower_distributed_plan(&dp, &catalog, &connectors)
+        let result = super::lower_distributed_plan(&dp, &catalog, &connectors, None)
             .expect("multi fragment lower");
         let order: Vec<u32> = result
             .fragment_results
@@ -5313,7 +5317,7 @@ mod tests {
     fn assert_lowering_err(dp: &DistributedPlan, expected: &str) {
         let catalog = DummyCatalog;
         let connectors = ConnectorRegistry::new();
-        let err = match super::lower_distributed_plan(dp, &catalog, &connectors) {
+        let err = match super::lower_distributed_plan(dp, &catalog, &connectors, None) {
             Ok(_) => panic!("expected lowering error containing `{expected}`"),
             Err(err) => err,
         };
