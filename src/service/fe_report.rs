@@ -512,7 +512,7 @@ fn build_profile_tree(
     Some(tree)
 }
 
-fn merge_pipeline_profiles_for_fe(profiler: &Profiler) -> Profiler {
+pub(crate) fn merge_pipeline_profiles_for_fe(profiler: &Profiler) -> Profiler {
     let merged = Profiler::new(profiler.name());
     merged.set_metadata(profiler.metadata());
     merged.copy_all_info_strings_from(profiler);

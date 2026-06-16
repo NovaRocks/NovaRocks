@@ -30,6 +30,7 @@ pub mod load_tracking;
 pub mod lookup;
 pub mod mem_tracker;
 pub mod profile;
+pub(crate) mod profile_correlate;
 pub(crate) mod query_cancel;
 pub mod query_context;
 pub mod query_result;
