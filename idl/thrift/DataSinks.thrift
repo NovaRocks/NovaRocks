@@ -61,7 +61,8 @@ enum TDataSinkType {
     SPLIT_DATA_STREAM_SINK,
     NOOP_SINK,
     ICEBERG_DELETE_SINK,
-    ICEBERG_DV_SINK
+    ICEBERG_DV_SINK = 18,
+    ICEBERG_EQUALITY_DELETE_SINK = 19
 }
 
 enum TResultSinkType {

@@ -156,6 +156,7 @@ fn iceberg_sink_mode_for_type(
     match t {
         data_sinks::TDataSinkType::ICEBERG_DELETE_SINK => IcebergSinkMode::PositionDeletes,
         data_sinks::TDataSinkType::ICEBERG_DV_SINK => IcebergSinkMode::DeletionVectors,
+        data_sinks::TDataSinkType::ICEBERG_EQUALITY_DELETE_SINK => IcebergSinkMode::EqualityDeletes,
         _ => IcebergSinkMode::Data,
     }
 }
@@ -164,6 +165,7 @@ fn iceberg_sink_type_name(t: data_sinks::TDataSinkType) -> &'static str {
     match t {
         data_sinks::TDataSinkType::ICEBERG_DELETE_SINK => "ICEBERG_DELETE_SINK",
         data_sinks::TDataSinkType::ICEBERG_DV_SINK => "ICEBERG_DV_SINK",
+        data_sinks::TDataSinkType::ICEBERG_EQUALITY_DELETE_SINK => "ICEBERG_EQUALITY_DELETE_SINK",
         _ => "ICEBERG_TABLE_SINK",
     }
 }
@@ -534,7 +536,8 @@ pub(crate) fn execute_fragment(
             }
             data_sinks::TDataSinkType::ICEBERG_TABLE_SINK
             | data_sinks::TDataSinkType::ICEBERG_DELETE_SINK
-            | data_sinks::TDataSinkType::ICEBERG_DV_SINK => {
+            | data_sinks::TDataSinkType::ICEBERG_DV_SINK
+            | data_sinks::TDataSinkType::ICEBERG_EQUALITY_DELETE_SINK => {
                 let sink_type_name = iceberg_sink_type_name(sink.type_);
                 let iceberg_sink = sink.iceberg_table_sink.as_ref().ok_or_else(|| {
                     format!("{sink_type_name} missing iceberg_table_sink payload")
@@ -610,7 +613,7 @@ pub(crate) fn execute_fragment(
             }
             other => {
                 return Err(format!(
-                    "unsupported sink type: {:?}. Only DATA_STREAM_SINK, MULTI_CAST_DATA_STREAM_SINK, SPLIT_DATA_STREAM_SINK, RESULT_SINK, NOOP_SINK, SCHEMA_TABLE_SINK, ICEBERG_TABLE_SINK, ICEBERG_DELETE_SINK, ICEBERG_DV_SINK, and OLAP_TABLE_SINK are supported",
+                    "unsupported sink type: {:?}. Only DATA_STREAM_SINK, MULTI_CAST_DATA_STREAM_SINK, SPLIT_DATA_STREAM_SINK, RESULT_SINK, NOOP_SINK, SCHEMA_TABLE_SINK, ICEBERG_TABLE_SINK, ICEBERG_DELETE_SINK, ICEBERG_DV_SINK, ICEBERG_EQUALITY_DELETE_SINK, and OLAP_TABLE_SINK are supported",
                     other
                 ));
             }
@@ -639,6 +642,18 @@ mod tests {
         assert_eq!(
             super::iceberg_sink_mode_for_type(data_sinks::TDataSinkType::ICEBERG_DELETE_SINK),
             crate::connector::iceberg::sink::IcebergSinkMode::PositionDeletes
+        );
+    }
+
+    #[test]
+    fn iceberg_equality_delete_sink_lowers_to_equality_deletes_mode() {
+        let sink_type = data_sinks::TDataSinkType::ICEBERG_EQUALITY_DELETE_SINK;
+
+        assert_eq!(i32::from(sink_type), 19);
+        assert_eq!(data_sinks::TDataSinkType::from(19), sink_type);
+        assert_eq!(
+            super::iceberg_sink_mode_for_type(sink_type),
+            crate::connector::iceberg::sink::IcebergSinkMode::EqualityDeletes
         );
     }
 }

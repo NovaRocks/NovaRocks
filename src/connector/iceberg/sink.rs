@@ -83,13 +83,15 @@ use crate::{data_sinks, descriptors, exprs, types};
 /// Selects which kind of Iceberg file this sink writes. The caller picks the
 /// mode based on the upstream `TDataSinkType` (`ICEBERG_TABLE_SINK` →
 /// `Data`, `ICEBERG_DELETE_SINK` → `PositionDeletes`, `ICEBERG_DV_SINK` →
-/// `DeletionVectors`), so the sink struct doesn't have to parse anything
-/// extra out of the thrift payload.
+/// `DeletionVectors`, `ICEBERG_EQUALITY_DELETE_SINK` → `EqualityDeletes`),
+/// so the sink struct doesn't have to parse anything extra out of the thrift
+/// payload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IcebergSinkMode {
     Data,
     PositionDeletes,
     DeletionVectors,
+    EqualityDeletes,
 }
 
 #[derive(Clone)]
@@ -149,6 +151,10 @@ impl IcebergTableSinkFactory {
         last_query_id: Option<&str>,
         fe_addr: Option<&types::TNetworkAddress>,
     ) -> Result<Self, String> {
+        if mode == IcebergSinkMode::EqualityDeletes {
+            return Err("iceberg equality delete sink backend is not implemented".to_string());
+        }
+
         let mut arena = ExprArena::default();
         let lowered_output_exprs =
             lower_output_exprs(output_exprs, &mut arena, layout, last_query_id, fe_addr)?;
@@ -190,6 +196,9 @@ impl IcebergTableSinkFactory {
                 }
                 build_position_delete_output_schema()
             }
+            IcebergSinkMode::EqualityDeletes => {
+                return Err("iceberg equality delete sink backend is not implemented".to_string());
+            }
         };
         let output_column_names = match mode {
             IcebergSinkMode::Data => output_schema
@@ -204,6 +213,9 @@ impl IcebergTableSinkFactory {
                 ];
                 names.extend(partition_source_column_names.iter().cloned());
                 names
+            }
+            IcebergSinkMode::EqualityDeletes => {
+                return Err("iceberg equality delete sink backend is not implemented".to_string());
             }
         };
         if !partition_exprs.is_empty() {
@@ -606,6 +618,9 @@ impl AsyncSinkBackend for IcebergTableSinkBackend {
             IcebergSinkMode::Data => self.push_chunk_data(&state, chunk).await,
             IcebergSinkMode::PositionDeletes => self.push_chunk_position_delete(&state, chunk),
             IcebergSinkMode::DeletionVectors => self.push_chunk_deletion_vector(&state, chunk),
+            IcebergSinkMode::EqualityDeletes => {
+                Err("iceberg equality delete sink backend is not implemented".to_string())
+            }
         }
     }
 

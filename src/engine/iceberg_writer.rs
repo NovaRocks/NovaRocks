@@ -374,7 +374,7 @@ pub(crate) fn build_iceberg_write_sink_spec(
 ) -> Result<IcebergWriteSinkSpec, String> {
     let metadata = table.metadata();
     let target_descriptor_columns =
-        write_sink_target_descriptor_columns(mode, &resolved.columns, &target_columns);
+        write_sink_target_descriptor_columns(mode, &resolved.columns, &target_columns)?;
     let iceberg_schema = match mode {
         IcebergWriteSinkMode::RowLineageData => {
             row_lineage_iceberg_schema_def_for_codegen(metadata.current_schema())
@@ -383,6 +383,9 @@ pub(crate) fn build_iceberg_write_sink_spec(
         | IcebergWriteSinkMode::PositionDeletes
         | IcebergWriteSinkMode::DeletionVectors => {
             iceberg_schema_def_for_codegen(metadata.current_schema())
+        }
+        IcebergWriteSinkMode::EqualityDeletes => {
+            return Err("iceberg equality delete sink codegen is not implemented".to_string());
         }
     };
     let iceberg = IcebergTableInfo {
@@ -486,15 +489,18 @@ fn write_sink_target_descriptor_columns(
     mode: IcebergWriteSinkMode,
     resolved_columns: &[ColumnDef],
     sink_input_columns: &[ColumnDef],
-) -> Vec<ColumnDef> {
-    match mode {
+) -> Result<Vec<ColumnDef>, String> {
+    Ok(match mode {
         IcebergWriteSinkMode::PositionDeletes | IcebergWriteSinkMode::DeletionVectors => {
             resolved_columns.to_vec()
         }
         IcebergWriteSinkMode::Data | IcebergWriteSinkMode::RowLineageData => {
             sink_input_columns.to_vec()
         }
-    }
+        IcebergWriteSinkMode::EqualityDeletes => {
+            return Err("iceberg equality delete sink codegen is not implemented".to_string());
+        }
+    })
 }
 
 fn position_delete_sink_input_columns(
@@ -1341,7 +1347,8 @@ mod tests {
             IcebergWriteSinkMode::PositionDeletes,
             &resolved_columns,
             &sink_input_columns,
-        );
+        )
+        .expect("descriptor columns");
 
         assert_eq!(
             descriptor_columns
@@ -1361,7 +1368,8 @@ mod tests {
             IcebergWriteSinkMode::RowLineageData,
             &resolved_columns,
             &sink_input_columns,
-        );
+        )
+        .expect("descriptor columns");
 
         assert_eq!(
             descriptor_columns

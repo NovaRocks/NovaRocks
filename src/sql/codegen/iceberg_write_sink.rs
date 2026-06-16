@@ -30,6 +30,8 @@ pub(crate) enum IcebergWriteSinkMode {
     RowLineageData,
     PositionDeletes,
     DeletionVectors,
+    #[allow(dead_code)]
+    EqualityDeletes,
 }
 
 impl IcebergWriteSinkMode {
@@ -38,6 +40,7 @@ impl IcebergWriteSinkMode {
             Self::Data | Self::RowLineageData => data_sinks::TDataSinkType::ICEBERG_TABLE_SINK,
             Self::PositionDeletes => data_sinks::TDataSinkType::ICEBERG_DELETE_SINK,
             Self::DeletionVectors => data_sinks::TDataSinkType::ICEBERG_DV_SINK,
+            Self::EqualityDeletes => data_sinks::TDataSinkType::ICEBERG_EQUALITY_DELETE_SINK,
         }
     }
 }
@@ -495,6 +498,14 @@ mod tests {
         spec.mode = IcebergWriteSinkMode::DeletionVectors;
         let sink = spec.build_sink(0);
         assert_eq!(sink.type_, data_sinks::TDataSinkType::ICEBERG_DV_SINK);
+    }
+
+    #[test]
+    fn equality_delete_mode_maps_to_iceberg_equality_delete_sink() {
+        assert_eq!(
+            IcebergWriteSinkMode::EqualityDeletes.data_sink_type(),
+            data_sinks::TDataSinkType::ICEBERG_EQUALITY_DELETE_SINK
+        );
     }
 
     #[test]
