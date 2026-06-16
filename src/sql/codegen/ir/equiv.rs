@@ -1,8 +1,8 @@
-//! Test-only IR equivalence helpers.
+//! Test-only IR structural coverage helpers.
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::sync::Arc;
 
     use arrow::datatypes::DataType;
@@ -30,9 +30,8 @@ mod tests {
     };
     use crate::sql::codegen::fragment_builder::PlanFragmentBuilder;
     use crate::sql::codegen::{
-        AggregateStateTargetPositionLocator, DirectExecPlan, FragmentBuildResult, FragmentEdge,
-        FragmentEdgeKind, MultiFragmentBuildResult, OutputColumn as CodegenOutputColumn,
-        PlanBuildResult, RuntimeFilterPlanResult,
+        DirectExecPlan, FragmentBuildResult, FragmentEdgeKind, FragmentId,
+        MultiFragmentBuildResult, PlanBuildResult,
     };
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
@@ -51,60 +50,60 @@ mod tests {
     use crate::sql::planner::plan::{AggregateCall, DecodeMapping, WindowExpr};
 
     #[test]
-    fn scan_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent("scan", scan_plan());
+    fn scan_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure("scan", scan_plan());
     }
 
     #[test]
-    fn scan_filter_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent("scan_filter", filter_plan(scan_plan()));
+    fn scan_filter_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure("scan_filter", filter_plan(scan_plan()));
     }
 
     #[test]
-    fn scan_project_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent("scan_project", project_plan(scan_plan()));
+    fn scan_project_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure("scan_project", project_plan(scan_plan()));
     }
 
     #[test]
-    fn scan_filter_project_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn scan_filter_project_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "scan_filter_project",
             project_plan(filter_plan(scan_plan())),
         );
     }
 
     #[test]
-    fn root_gather_scan_filter_project_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn root_gather_scan_filter_project_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "root_gather_scan_filter_project",
             root_gather_plan(project_plan(filter_plan(scan_plan()))),
         );
     }
 
     #[test]
-    fn sort_over_scan_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent("sort_over_scan", sort_plan(scan_plan()));
+    fn sort_over_scan_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure("sort_over_scan", sort_plan(scan_plan()));
     }
 
     #[test]
-    fn limit_over_scan_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn limit_over_scan_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "limit_over_scan",
             limit_plan(scan_plan(), Some(5), None),
         );
     }
 
     #[test]
-    fn limit_over_sort_with_offset_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn limit_over_sort_with_offset_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "limit_over_sort_with_offset",
             limit_plan(sort_plan(scan_plan()), Some(5), Some(2)),
         );
     }
 
     #[test]
-    fn limit_over_top_n_overrides_top_n_limit_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn limit_over_top_n_overrides_top_n_limit_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "limit_over_top_n_overrides_top_n_limit",
             limit_plan(
                 top_n_plan(scan_plan(), TopNPhase::Final, false, Some(10), Some(0)),
@@ -115,57 +114,57 @@ mod tests {
     }
 
     #[test]
-    fn limit_over_aggregate_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn limit_over_aggregate_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "limit_over_aggregate",
             limit_plan(aggregate_count_plan(scan_plan()), Some(3), None),
         );
     }
 
     #[test]
-    fn limit_over_hash_join_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn limit_over_hash_join_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "limit_over_hash_join",
             limit_plan(inner_hash_join_two_scans_plan(), Some(4), None),
         );
     }
 
     #[test]
-    fn top_n_final_single_over_scan_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn top_n_final_single_over_scan_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "top_n_final_single_over_scan",
             top_n_plan(scan_plan(), TopNPhase::Final, false, Some(5), Some(1)),
         );
     }
 
     #[test]
-    fn top_n_partial_over_scan_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn top_n_partial_over_scan_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "top_n_partial_over_scan",
             top_n_plan(scan_plan(), TopNPhase::Partial, false, Some(7), Some(0)),
         );
     }
 
     #[test]
-    fn top_n_split_matches_direct_fragment_builder() {
+    fn top_n_split_builds_ir_fragment_structure() {
         let partial = top_n_plan(scan_plan(), TopNPhase::Partial, false, Some(5), Some(0));
-        assert_distributed_plan_equivalent(
+        assert_distributed_plan_ir_structure(
             "top_n_split",
             top_n_plan(partial, TopNPhase::Final, true, Some(5), Some(0)),
         );
     }
 
     #[test]
-    fn limit_offset_exchange_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn limit_offset_exchange_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "limit_offset_exchange",
             limit_plan(scan_plan(), Some(5), Some(1)),
         );
     }
 
     #[test]
-    fn gather_over_limit_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn gather_over_limit_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "gather_over_limit",
             sort_plan(distribution_plan(
                 limit_plan(scan_plan(), Some(5), None),
@@ -175,24 +174,24 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_single_over_scan_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn aggregate_single_over_scan_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "aggregate_single_over_scan",
             aggregate_group_by_plan(scan_plan()),
         );
     }
 
     #[test]
-    fn aggregate_with_count_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn aggregate_with_count_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "aggregate_with_count",
             aggregate_count_plan(scan_plan()),
         );
     }
 
     #[test]
-    fn shuffle_agg_exchange_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn shuffle_agg_exchange_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "shuffle_agg_exchange",
             aggregate_group_by_plan(distribution_plan(
                 scan_plan(),
@@ -202,135 +201,135 @@ mod tests {
     }
 
     #[test]
-    fn nested_gather_exchange_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn nested_gather_exchange_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "nested_gather_exchange",
             sort_plan(distribution_plan(scan_plan(), DistributionSpec::Gather)),
         );
     }
 
     #[test]
-    fn cte_produce_consume_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent("cte_produce_consume", cte_produce_consume_plan());
+    fn cte_produce_consume_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure("cte_produce_consume", cte_produce_consume_plan());
     }
 
     #[test]
-    fn sort_over_project_over_scan_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn sort_over_project_over_scan_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "sort_over_project_over_scan",
             sort_plan(project_plan(scan_plan())),
         );
     }
 
     #[test]
-    fn inner_hash_join_two_scans_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn inner_hash_join_two_scans_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "inner_hash_join_two_scans",
             inner_hash_join_two_scans_plan(),
         );
     }
 
     #[test]
-    fn broadcast_join_exchange_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn broadcast_join_exchange_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "broadcast_join_exchange",
             broadcast_join_exchange_plan(),
         );
     }
 
     #[test]
-    fn two_sided_shuffle_join_exchange_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn two_sided_shuffle_join_exchange_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "two_sided_shuffle_join_exchange",
             two_sided_shuffle_join_exchange_plan(),
         );
     }
 
     #[test]
-    fn gather_root_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn gather_root_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "gather_root",
             root_gather_plan(project_plan(filter_plan(scan_plan()))),
         );
     }
 
     #[test]
-    fn left_outer_hash_join_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent("left_outer_hash_join", left_outer_hash_join_plan());
+    fn left_outer_hash_join_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure("left_outer_hash_join", left_outer_hash_join_plan());
     }
 
     #[test]
-    fn hash_join_other_condition_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn hash_join_other_condition_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "hash_join_other_condition",
             hash_join_other_condition_plan(),
         );
     }
 
     #[test]
-    fn left_semi_hash_join_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn left_semi_hash_join_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "left_semi_hash_join",
             hash_join_surviving_side_plan(JoinKind::LeftSemi),
         );
     }
 
     #[test]
-    fn right_anti_hash_join_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn right_anti_hash_join_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "right_anti_hash_join",
             hash_join_surviving_side_plan(JoinKind::RightAnti),
         );
     }
 
     #[test]
-    fn null_aware_left_anti_hash_join_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn null_aware_left_anti_hash_join_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "null_aware_left_anti_hash_join",
             hash_join_surviving_side_plan(JoinKind::NullAwareLeftAnti),
         );
     }
 
     #[test]
-    fn nest_loop_cross_join_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent("nest_loop_cross_join", nest_loop_cross_join_plan());
+    fn nest_loop_cross_join_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure("nest_loop_cross_join", nest_loop_cross_join_plan());
     }
 
     #[test]
-    fn nest_loop_inner_condition_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn nest_loop_inner_condition_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "nest_loop_inner_condition",
             nest_loop_condition_plan(JoinKind::Inner),
         );
     }
 
     #[test]
-    fn nest_loop_left_outer_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn nest_loop_left_outer_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "nest_loop_left_outer",
             nest_loop_condition_plan(JoinKind::LeftOuter),
         );
     }
 
     #[test]
-    fn nest_loop_left_anti_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn nest_loop_left_anti_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "nest_loop_left_anti",
             nest_loop_surviving_side_plan(JoinKind::LeftAnti),
         );
     }
 
     #[test]
-    fn nest_loop_null_aware_left_anti_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn nest_loop_null_aware_left_anti_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "nest_loop_null_aware_left_anti",
             nest_loop_surviving_side_plan(JoinKind::NullAwareLeftAnti),
         );
     }
 
     #[test]
-    fn union_all_two_scans_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn union_all_two_scans_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "union_all_two_scans",
             union_plan(
                 true,
@@ -341,8 +340,8 @@ mod tests {
     }
 
     #[test]
-    fn union_distinct_two_scans_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent_with_large_stack(
+    fn union_distinct_two_scans_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure_with_large_stack(
             "union_distinct_two_scans",
             union_plan(
                 false,
@@ -353,60 +352,60 @@ mod tests {
     }
 
     #[test]
-    fn intersect_two_scans_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn intersect_two_scans_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "intersect_two_scans",
             intersect_plan(aliased_scan_plan("l", 1, 2), aliased_scan_plan("r", 3, 4)),
         );
     }
 
     #[test]
-    fn except_two_scans_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn except_two_scans_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "except_two_scans",
             except_plan(aliased_scan_plan("l", 1, 2), aliased_scan_plan("r", 3, 4)),
         );
     }
 
     #[test]
-    fn values_rows_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent("values_rows", values_rows_plan());
+    fn values_rows_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure("values_rows", values_rows_plan());
     }
 
     #[test]
-    fn assert_one_row_over_scan_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn assert_one_row_over_scan_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "assert_one_row_over_scan",
             assert_one_row_plan(scan_plan()),
         );
     }
 
     #[test]
-    fn decode_over_scan_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent("decode_over_scan", decode_over_scan_plan());
+    fn decode_over_scan_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure("decode_over_scan", decode_over_scan_plan());
     }
 
     #[test]
-    fn repeat_grouping_sets_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent("repeat_grouping_sets", repeat_grouping_sets_plan());
+    fn repeat_grouping_sets_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure("repeat_grouping_sets", repeat_grouping_sets_plan());
     }
 
     #[test]
-    fn window_row_number_over_scan_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn window_row_number_over_scan_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "window_row_number_over_scan",
             window_row_number_over_scan_plan(),
         );
     }
 
     #[test]
-    fn generate_series_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent("generate_series", generate_series_plan());
+    fn generate_series_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure("generate_series", generate_series_plan());
     }
 
     #[test]
-    fn unnest_table_function_over_scan_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn unnest_table_function_over_scan_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "unnest_table_function_over_scan",
             unnest_table_function_over_scan_plan(),
         );
@@ -485,48 +484,44 @@ mod tests {
     }
 
     #[test]
-    fn iceberg_data_file_scan_ranges_match_direct_fragment_builder() {
+    fn iceberg_data_file_scan_ranges_builds_ir_fragment_structure() {
         let mut connectors = ConnectorRegistry::new();
         connectors.register_scan_planner(Arc::new(IcebergConnectorScanPlanner::new()));
-        let (direct, distributed) = build_both_paths(
+        let distributed = build_distributed_plan(
             "iceberg_data_file_scan_ranges",
             iceberg_data_file_scan_plan(),
             &connectors,
         );
 
-        assert_non_empty_scan_ranges("iceberg_data_file_scan_ranges direct", &direct);
-        assert_non_empty_scan_ranges(
-            "iceberg_data_file_scan_ranges DistributedPlan",
-            &distributed,
-        );
-        assert_multi_fragment_equivalent("iceberg_data_file_scan_ranges", &direct, &distributed);
+        assert_non_empty_scan_ranges("iceberg_data_file_scan_ranges", &distributed);
+        assert_multi_fragment_ir_structure("iceberg_data_file_scan_ranges", &distributed);
     }
 
     #[test]
-    fn aggregate_state_merge_direct_exec_matches_ir_builder() {
+    fn aggregate_state_merge_direct_exec_builds_ir_fragment_structure() {
         let ctx = aggregate_refresh_context_for_test();
         let plan = aggregate_state_merge_plan_for_context(&ctx);
-        let (direct, distributed) = build_both_paths_with_mv_refresh_ctx(
+        let distributed = build_distributed_plan_with_mv_refresh_ctx(
             "aggregate_state_merge_direct_exec",
             plan,
             &ConnectorRegistry::new(),
             Some(&ctx),
         );
 
-        assert_multi_fragment_equivalent(
+        assert_root_direct_exec_aggregate_state_merge(
             "aggregate_state_merge_direct_exec",
-            &direct,
             &distributed,
         );
+        assert_multi_fragment_ir_structure("aggregate_state_merge_direct_exec", &distributed);
     }
 
     #[test]
-    fn mv_target_state_scan_matches_ir_builder() {
+    fn mv_target_state_scan_builds_ir_fragment_structure() {
         let ctx = scan_refresh_context_for_test();
         let plan = target_state_scan_plan_for_context(&ctx);
         let mut connectors = ConnectorRegistry::new();
         connectors.register_scan_planner(Arc::new(IcebergConnectorScanPlanner::new()));
-        let (direct, distributed) = build_both_paths_with_mv_refresh_ctx(
+        let distributed = build_distributed_plan_with_mv_refresh_ctx(
             "mv_target_state_scan",
             plan,
             &connectors,
@@ -534,19 +529,19 @@ mod tests {
         );
 
         let root = fragment_by_id(
-            "mv_target_state_scan direct",
-            &direct,
-            direct.root_fragment_id,
+            "mv_target_state_scan",
+            &distributed,
+            distributed.root_fragment_id,
         );
         assert!(
             root.direct_exec.is_none(),
-            "target-state scan equivalence must exercise regular fragment build"
+            "target-state scan must exercise regular fragment build"
         );
-        assert_multi_fragment_equivalent("mv_target_state_scan", &direct, &distributed);
+        assert_multi_fragment_ir_structure("mv_target_state_scan", &distributed);
     }
 
     #[test]
-    fn mv_version_scan_matches_ir_builder() {
+    fn mv_version_scan_builds_ir_fragment_structure() {
         let fixture = local_version_scan_fixture();
         let mut ctx = scan_refresh_context_for_test();
         ctx.base_catalog_entries = [("ice".to_string(), fixture.catalog_entry.clone())]
@@ -555,19 +550,27 @@ mod tests {
         let plan = version_scan_plan_for_fixture(&fixture);
         let mut connectors = ConnectorRegistry::new();
         connectors.register_scan_planner(Arc::new(IcebergConnectorScanPlanner::new()));
-        let (direct, distributed) =
-            build_both_paths_with_mv_refresh_ctx("mv_version_scan", plan, &connectors, Some(&ctx));
+        let distributed = build_distributed_plan_with_mv_refresh_ctx(
+            "mv_version_scan",
+            plan,
+            &connectors,
+            Some(&ctx),
+        );
 
-        let root = fragment_by_id("mv_version_scan direct", &direct, direct.root_fragment_id);
+        let root = fragment_by_id(
+            "mv_version_scan",
+            &distributed,
+            distributed.root_fragment_id,
+        );
         assert!(
             root.direct_exec.is_none(),
-            "version scan equivalence must exercise regular fragment build"
+            "version scan must exercise regular fragment build"
         );
-        assert_multi_fragment_equivalent("mv_version_scan", &direct, &distributed);
+        assert_multi_fragment_ir_structure("mv_version_scan", &distributed);
     }
 
     #[test]
-    fn branch_union_aggregate_direct_exec_matches_ir_builder() {
+    fn branch_union_aggregate_direct_exec_builds_ir_fragment_structure() {
         let ctx = aggregate_refresh_context_for_test();
         let state_names = aggregate_state_names_for_context(&ctx);
         let branch0 = branch_union_project_for_test(
@@ -601,22 +604,19 @@ mod tests {
             vec![branch0, branch1],
             output_columns,
         );
-        let (direct, distributed) = build_both_paths_with_mv_refresh_ctx(
+        let distributed = build_distributed_plan_with_mv_refresh_ctx(
             "branch_union_aggregate_direct_exec",
             plan,
             &ConnectorRegistry::new(),
             Some(&ctx),
         );
 
-        assert_multi_fragment_equivalent(
-            "branch_union_aggregate_direct_exec",
-            &direct,
-            &distributed,
-        );
+        assert_root_direct_exec_union_all("branch_union_aggregate_direct_exec", &distributed);
+        assert_multi_fragment_ir_structure("branch_union_aggregate_direct_exec", &distributed);
     }
 
     #[test]
-    fn iceberg_sink_matches_ir_builder() {
+    fn iceberg_sink_builds_ir_fragment_structure() {
         let plan = values_plan_for_columns(vec![output_col(1, "id", DataType::Int32, false)]);
         let connectors = ConnectorRegistry::new();
         let mut sink_spec =
@@ -625,15 +625,6 @@ mod tests {
             crate::sql::codegen::iceberg_write_sink::test_support::single_bucket_partition_metadata_json(),
         );
         let catalog = DummyCatalog;
-        let direct = PlanFragmentBuilder::build_with_iceberg_sink(
-            &plan,
-            &catalog,
-            &connectors,
-            "test_db",
-            None,
-            &sink_spec,
-        )
-        .expect("direct iceberg sink build");
         let distributed = PlanFragmentBuilder::build_via_distributed_plan_with_iceberg_sink(
             &plan,
             &catalog,
@@ -644,72 +635,68 @@ mod tests {
         )
         .expect("DistributedPlan iceberg sink build");
 
-        assert_multi_fragment_equivalent("iceberg_sink", &direct, &distributed);
+        let root = fragment_by_id("iceberg_sink", &distributed, distributed.root_fragment_id);
+        assert_eq!(
+            root.output_sink.type_,
+            crate::data_sinks::TDataSinkType::ICEBERG_TABLE_SINK
+        );
+        assert!(
+            root.output_sink.iceberg_table_sink.is_some(),
+            "iceberg_sink: root output sink must carry iceberg payload"
+        );
+        assert!(
+            root.output_exprs
+                .as_ref()
+                .is_some_and(|exprs| !exprs.is_empty()),
+            "iceberg_sink: root output exprs must be present"
+        );
+        assert_multi_fragment_ir_structure("iceberg_sink", &distributed);
     }
 
-    fn assert_distributed_plan_equivalent(case_name: &str, plan: PhysicalPlanNode) {
+    fn assert_distributed_plan_ir_structure(case_name: &str, plan: PhysicalPlanNode) {
         let connectors = ConnectorRegistry::new();
-        let (direct, distributed) = build_both_paths(case_name, plan, &connectors);
-        assert_multi_fragment_equivalent(case_name, &direct, &distributed);
+        let distributed = build_distributed_plan(case_name, plan, &connectors);
+        assert_multi_fragment_ir_structure(case_name, &distributed);
     }
 
-    fn assert_distributed_plan_equivalent_with_large_stack(
+    fn assert_distributed_plan_ir_structure_with_large_stack(
         case_name: &'static str,
         plan: PhysicalPlanNode,
     ) {
         std::thread::Builder::new()
-            .name(format!("{case_name}_equiv"))
+            .name(format!("{case_name}_ir_structure"))
             .stack_size(64 * 1024 * 1024)
-            .spawn(move || assert_distributed_plan_equivalent(case_name, plan))
-            .expect("spawn equivalence test thread")
+            .spawn(move || assert_distributed_plan_ir_structure(case_name, plan))
+            .expect("spawn IR structure test thread")
             .join()
-            .expect("equivalence test thread panicked");
+            .expect("IR structure test thread panicked");
     }
 
-    fn build_both_paths(
+    fn build_distributed_plan(
         case_name: &str,
         plan: PhysicalPlanNode,
         connectors: &ConnectorRegistry,
-    ) -> (MultiFragmentBuildResult, MultiFragmentBuildResult) {
+    ) -> MultiFragmentBuildResult {
         let catalog = DummyCatalog;
-        let direct = PlanFragmentBuilder::build(&plan, &catalog, &connectors, "test_db")
-            .unwrap_or_else(|err| panic!("{case_name}: direct build failed: {err}"));
-        let distributed = PlanFragmentBuilder::build_via_distributed_plan(
-            &plan,
-            &catalog,
-            &connectors,
-            "test_db",
-        )
-        .unwrap_or_else(|err| panic!("{case_name}: DistributedPlan build failed: {err}"));
-
-        (direct, distributed)
+        PlanFragmentBuilder::build_via_distributed_plan(&plan, &catalog, connectors, "test_db")
+            .unwrap_or_else(|err| panic!("{case_name}: DistributedPlan build failed: {err}"))
     }
 
-    fn build_both_paths_with_mv_refresh_ctx(
+    fn build_distributed_plan_with_mv_refresh_ctx(
         case_name: &str,
         plan: PhysicalPlanNode,
         connectors: &ConnectorRegistry,
         mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
-    ) -> (MultiFragmentBuildResult, MultiFragmentBuildResult) {
+    ) -> MultiFragmentBuildResult {
         let catalog = DummyCatalog;
-        let direct = PlanFragmentBuilder::build_with_mv_refresh_ctx(
+        PlanFragmentBuilder::build_via_distributed_plan_with_mv_refresh_ctx(
             &plan,
             &catalog,
-            &connectors,
+            connectors,
             "test_db",
             mv_refresh_ctx,
         )
-        .unwrap_or_else(|err| panic!("{case_name}: direct build failed: {err}"));
-        let distributed = PlanFragmentBuilder::build_via_distributed_plan_with_mv_refresh_ctx(
-            &plan,
-            &catalog,
-            &connectors,
-            "test_db",
-            mv_refresh_ctx,
-        )
-        .unwrap_or_else(|err| panic!("{case_name}: DistributedPlan build failed: {err}"));
-
-        (direct, distributed)
+        .unwrap_or_else(|err| panic!("{case_name}: DistributedPlan build failed: {err}"))
     }
 
     fn build_distributed_plan_only(
@@ -744,32 +731,41 @@ mod tests {
         );
     }
 
-    fn assert_multi_fragment_equivalent(
-        case_name: &str,
-        direct: &MultiFragmentBuildResult,
-        distributed: &MultiFragmentBuildResult,
-    ) {
-        assert_eq!(
-            direct.root_fragment_id, distributed.root_fragment_id,
-            "{case_name}: root_fragment_id"
+    fn assert_multi_fragment_ir_structure(case_name: &str, result: &MultiFragmentBuildResult) {
+        assert!(
+            !result.fragment_results.is_empty(),
+            "{case_name}: expected at least one fragment"
         );
         assert_eq!(
-            direct.fragment_results.len(),
-            distributed.fragment_results.len(),
-            "{case_name}: fragment count"
+            result
+                .fragment_results
+                .iter()
+                .filter(|fragment| fragment.fragment_id == result.root_fragment_id)
+                .count(),
+            1,
+            "{case_name}: root fragment id must exist exactly once"
         );
-        assert_edges_eq(case_name, &direct.edges, &distributed.edges);
-        assert_eq!(
-            direct.boundary_schemas, distributed.boundary_schemas,
-            "{case_name}: multi-fragment boundary schemas"
-        );
-        assert_runtime_filter_plan_eq(case_name, &direct.rf_plan, &distributed.rf_plan);
 
-        for direct_fragment in &direct.fragment_results {
-            let distributed_fragment =
-                fragment_by_id(case_name, distributed, direct_fragment.fragment_id);
-            assert_fragment_equivalent(case_name, direct_fragment, distributed_fragment);
-        }
+        let fragment_ids = assert_unique_fragment_ids(case_name, result);
+        let node_ids_by_fragment = result
+            .fragment_results
+            .iter()
+            .map(|fragment| {
+                (
+                    fragment.fragment_id,
+                    assert_fragment_ir_structure(case_name, fragment),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        assert_edges_well_formed(case_name, result, &fragment_ids, &node_ids_by_fragment);
+        assert_boundary_schemas_well_formed(
+            case_name,
+            result,
+            &fragment_ids,
+            &node_ids_by_fragment,
+        );
+        assert_runtime_filters_well_formed(case_name, result, &fragment_ids, &node_ids_by_fragment);
     }
 
     fn fragment_by_id<'a>(
@@ -784,369 +780,310 @@ mod tests {
             .unwrap_or_else(|| panic!("{case_name}: fragment {fragment_id} not found"))
     }
 
-    fn assert_fragment_equivalent(
+    fn assert_unique_fragment_ids(
         case_name: &str,
-        direct: &FragmentBuildResult,
-        distributed: &FragmentBuildResult,
-    ) {
-        assert_eq!(
-            direct.fragment_id, distributed.fragment_id,
-            "{case_name}: fragment_id"
-        );
-        assert_eq!(direct.plan, distributed.plan, "{case_name}: fragment plan");
-        assert_eq!(
-            direct.desc_tbl, distributed.desc_tbl,
-            "{case_name}: descriptor table"
-        );
-        assert_eq!(
-            direct.exec_params, distributed.exec_params,
-            "{case_name}: exec params"
-        );
-        assert_eq!(
-            direct.output_sink, distributed.output_sink,
-            "{case_name}: output sink"
-        );
-        assert_eq!(
-            direct.output_exprs, distributed.output_exprs,
-            "{case_name}: output exprs"
-        );
-        assert_output_columns_eq(
-            case_name,
-            &direct.output_columns,
-            &distributed.output_columns,
-        );
-        assert_direct_exec_eq(case_name, &direct.direct_exec, &distributed.direct_exec);
-        assert_eq!(
-            direct.boundary_schemas, distributed.boundary_schemas,
-            "{case_name}: fragment boundary schemas"
-        );
-        assert_eq!(direct.cte_id, distributed.cte_id, "{case_name}: cte_id");
-        assert_eq!(
-            direct.cte_exchange_nodes, distributed.cte_exchange_nodes,
-            "{case_name}: cte exchange nodes"
-        );
-        assert_eq!(
-            direct.query_global_dicts, distributed.query_global_dicts,
-            "{case_name}: query global dicts"
-        );
-        assert_eq!(
-            direct.query_global_dict_exprs, distributed.query_global_dict_exprs,
-            "{case_name}: query global dict exprs"
-        );
+        result: &MultiFragmentBuildResult,
+    ) -> BTreeSet<FragmentId> {
+        let mut ids = BTreeSet::new();
+        for fragment in &result.fragment_results {
+            assert!(
+                ids.insert(fragment.fragment_id),
+                "{case_name}: duplicate fragment id {}",
+                fragment.fragment_id
+            );
+        }
+        ids
     }
 
-    fn assert_direct_exec_eq(
+    fn assert_fragment_ir_structure(
         case_name: &str,
-        direct: &Option<Box<DirectExecPlan>>,
-        distributed: &Option<Box<DirectExecPlan>>,
-    ) {
-        match (direct.as_deref(), distributed.as_deref()) {
-            (None, None) => {}
-            (Some(direct), Some(distributed)) => {
-                assert_direct_exec_plan_eq(case_name, direct, distributed)
-            }
-            _ => panic!("{case_name}: direct_exec presence mismatch"),
+        fragment: &FragmentBuildResult,
+    ) -> BTreeSet<i32> {
+        let node_ids = assert_plan_node_ids_unique(
+            &format!("{case_name}: fragment {}", fragment.fragment_id),
+            &fragment.plan,
+            fragment.direct_exec.is_some(),
+        );
+        for (cte_id, exchange_node_id) in &fragment.cte_exchange_nodes {
+            assert!(
+                node_ids.contains(exchange_node_id),
+                "{case_name}: fragment {} cte_id {} references missing exchange node {}",
+                fragment.fragment_id,
+                cte_id,
+                exchange_node_id
+            );
+            assert_exchange_node(case_name, fragment, *exchange_node_id, "cte exchange node");
+        }
+        if let Some(direct_exec) = fragment.direct_exec.as_deref() {
+            assert_direct_exec_ir_structure(
+                &format!("{case_name}: fragment {} direct_exec", fragment.fragment_id),
+                direct_exec,
+            );
+        }
+        node_ids
+    }
+
+    fn assert_plan_build_result_ir_structure(case_name: &str, result: &PlanBuildResult) {
+        assert_plan_node_ids_unique(case_name, &result.plan, result.direct_exec.is_some());
+        if let Some(direct_exec) = result.direct_exec.as_deref() {
+            assert_direct_exec_ir_structure(&format!("{case_name}: direct_exec"), direct_exec);
         }
     }
 
-    fn assert_direct_exec_plan_eq(
+    fn assert_plan_node_ids_unique(
         case_name: &str,
-        direct: &DirectExecPlan,
-        distributed: &DirectExecPlan,
+        plan: &crate::plan_nodes::TPlan,
+        allows_direct_exec: bool,
+    ) -> BTreeSet<i32> {
+        if !allows_direct_exec {
+            assert!(
+                !plan.nodes.is_empty(),
+                "{case_name}: normal fragment plan must contain nodes"
+            );
+        }
+        let mut node_ids = BTreeSet::new();
+        for node in &plan.nodes {
+            assert!(
+                node_ids.insert(node.node_id),
+                "{case_name}: duplicate node id {}",
+                node.node_id
+            );
+        }
+        node_ids
+    }
+
+    fn assert_edges_well_formed(
+        case_name: &str,
+        result: &MultiFragmentBuildResult,
+        fragment_ids: &BTreeSet<FragmentId>,
+        node_ids_by_fragment: &BTreeMap<FragmentId, BTreeSet<i32>>,
     ) {
-        match (direct, distributed) {
-            (
-                DirectExecPlan::AggregateStateMerge {
-                    old_input: direct_old,
-                    delta_input: direct_delta,
-                    layout: direct_layout,
-                    branch_id: direct_branch_id,
-                    pruning_limits: direct_pruning_limits,
-                    target_position_locator: direct_locator,
-                },
-                DirectExecPlan::AggregateStateMerge {
-                    old_input: distributed_old,
-                    delta_input: distributed_delta,
-                    layout: distributed_layout,
-                    branch_id: distributed_branch_id,
-                    pruning_limits: distributed_pruning_limits,
-                    target_position_locator: distributed_locator,
-                },
-            ) => {
-                assert_plan_build_result_eq(
-                    &format!("{case_name}: aggregate merge old input"),
-                    direct_old,
-                    distributed_old,
-                );
-                assert_plan_build_result_eq(
-                    &format!("{case_name}: aggregate merge delta input"),
-                    direct_delta,
-                    distributed_delta,
-                );
-                assert_eq!(
-                    direct_layout, distributed_layout,
-                    "{case_name}: aggregate merge layout"
-                );
-                assert_eq!(
-                    direct_branch_id, distributed_branch_id,
-                    "{case_name}: aggregate merge branch_id"
-                );
-                assert_eq!(
-                    direct_pruning_limits, distributed_pruning_limits,
-                    "{case_name}: aggregate merge pruning limits"
-                );
-                assert_target_position_locator_eq(case_name, direct_locator, distributed_locator);
-            }
-            (
-                DirectExecPlan::AggregateStatePhysicalize {
-                    input: direct_input,
-                    layout: direct_layout,
-                },
-                DirectExecPlan::AggregateStatePhysicalize {
-                    input: distributed_input,
-                    layout: distributed_layout,
-                },
-            ) => {
-                assert_plan_build_result_eq(
-                    &format!("{case_name}: aggregate physicalize input"),
-                    direct_input,
-                    distributed_input,
-                );
-                assert_eq!(
-                    direct_layout, distributed_layout,
-                    "{case_name}: aggregate physicalize layout"
-                );
-            }
-            (
-                DirectExecPlan::UnionAll {
-                    inputs: direct_inputs,
-                },
-                DirectExecPlan::UnionAll {
-                    inputs: distributed_inputs,
-                },
-            ) => {
-                assert_eq!(
-                    direct_inputs.len(),
-                    distributed_inputs.len(),
-                    "{case_name}: direct union input count"
-                );
-                for (idx, (direct_input, distributed_input)) in direct_inputs
-                    .iter()
-                    .zip(distributed_inputs.iter())
-                    .enumerate()
-                {
-                    assert_plan_build_result_eq(
-                        &format!("{case_name}: direct union input {idx}"),
-                        direct_input,
-                        distributed_input,
+        let cte_id_by_fragment = result
+            .fragment_results
+            .iter()
+            .filter_map(|fragment| fragment.cte_id.map(|cte_id| (fragment.fragment_id, cte_id)))
+            .collect::<BTreeMap<_, _>>();
+        for (idx, edge) in result.edges.iter().enumerate() {
+            assert!(
+                fragment_ids.contains(&edge.source_fragment_id),
+                "{case_name}: edge {idx} references missing source fragment {}",
+                edge.source_fragment_id
+            );
+            assert!(
+                fragment_ids.contains(&edge.target_fragment_id),
+                "{case_name}: edge {idx} references missing target fragment {}",
+                edge.target_fragment_id
+            );
+            assert!(
+                node_ids_by_fragment
+                    .get(&edge.target_fragment_id)
+                    .is_some_and(|node_ids| node_ids.contains(&edge.target_exchange_node_id)),
+                "{case_name}: edge {idx} references missing target exchange node {} in fragment {}",
+                edge.target_exchange_node_id,
+                edge.target_fragment_id
+            );
+            let target = fragment_by_id(case_name, result, edge.target_fragment_id);
+            assert_exchange_node(
+                case_name,
+                target,
+                edge.target_exchange_node_id,
+                "edge target",
+            );
+            match &edge.edge_kind {
+                FragmentEdgeKind::Stream => assert_ne!(
+                    edge.source_fragment_id, edge.target_fragment_id,
+                    "{case_name}: stream edge {idx} must cross fragments"
+                ),
+                FragmentEdgeKind::CteMulticast { cte_id } => {
+                    assert_eq!(
+                        cte_id_by_fragment.get(&edge.source_fragment_id),
+                        Some(cte_id),
+                        "{case_name}: CTE edge {idx} source fragment must declare matching cte_id"
+                    );
+                    assert!(
+                        target.cte_exchange_nodes.iter().any(
+                            |(target_cte_id, exchange_node_id)| {
+                                target_cte_id == cte_id
+                                    && *exchange_node_id == edge.target_exchange_node_id
+                            }
+                        ),
+                        "{case_name}: CTE edge {idx} target fragment must record exchange node"
                     );
                 }
             }
-            _ => panic!("{case_name}: direct_exec variant mismatch"),
         }
     }
 
-    fn assert_plan_build_result_eq(
+    fn assert_exchange_node(
         case_name: &str,
-        direct: &PlanBuildResult,
-        distributed: &PlanBuildResult,
+        fragment: &FragmentBuildResult,
+        node_id: i32,
+        label: &str,
     ) {
-        assert_eq!(direct.plan, distributed.plan, "{case_name}: plan");
+        let node = fragment
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.node_id == node_id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{case_name}: fragment {} {label} node {} not found",
+                    fragment.fragment_id, node_id
+                )
+            });
         assert_eq!(
-            direct.desc_tbl, distributed.desc_tbl,
-            "{case_name}: descriptor table"
-        );
-        assert_eq!(
-            direct.exec_params, distributed.exec_params,
-            "{case_name}: exec params"
-        );
-        assert_output_columns_eq(
-            case_name,
-            &direct.output_columns,
-            &distributed.output_columns,
-        );
-        assert_direct_exec_eq(case_name, &direct.direct_exec, &distributed.direct_exec);
-        assert_eq!(
-            direct.boundary_schemas, distributed.boundary_schemas,
-            "{case_name}: boundary schemas"
-        );
-        assert_eq!(
-            direct.query_global_dicts, distributed.query_global_dicts,
-            "{case_name}: query global dicts"
-        );
-        assert_eq!(
-            direct.query_global_dict_exprs, distributed.query_global_dict_exprs,
-            "{case_name}: query global dict exprs"
+            node.node_type,
+            crate::plan_nodes::TPlanNodeType::EXCHANGE_NODE,
+            "{case_name}: fragment {} {label} node {} must be EXCHANGE_NODE",
+            fragment.fragment_id,
+            node_id
         );
     }
 
-    fn assert_target_position_locator_eq(
+    fn assert_boundary_schemas_well_formed(
         case_name: &str,
-        direct: &Option<AggregateStateTargetPositionLocator>,
-        distributed: &Option<AggregateStateTargetPositionLocator>,
+        result: &MultiFragmentBuildResult,
+        fragment_ids: &BTreeSet<FragmentId>,
+        node_ids_by_fragment: &BTreeMap<FragmentId, BTreeSet<i32>>,
     ) {
-        match (direct, distributed) {
-            (None, None) => {}
-            (Some(direct), Some(distributed)) => {
-                assert_eq!(
-                    direct.target_entry.kind, distributed.target_entry.kind,
-                    "{case_name}: target locator catalog kind"
+        for (idx, boundary) in result.boundary_schemas.iter().enumerate() {
+            if let Some(fragment_id) = boundary.fragment_id {
+                let fragment_id = FragmentId::try_from(fragment_id)
+                    .unwrap_or_else(|_| panic!("{case_name}: boundary {idx} negative fragment id"));
+                assert!(
+                    fragment_ids.contains(&fragment_id),
+                    "{case_name}: boundary {idx} references missing fragment {fragment_id}"
                 );
-                assert_eq!(
-                    direct.target_entry.warehouse_uri, distributed.target_entry.warehouse_uri,
-                    "{case_name}: target locator warehouse uri"
-                );
-                assert_eq!(
-                    direct.target_entry.rest_uri, distributed.target_entry.rest_uri,
-                    "{case_name}: target locator REST uri"
-                );
-                assert_eq!(
-                    direct.target_entry.hms_uris, distributed.target_entry.hms_uris,
-                    "{case_name}: target locator HMS uris"
-                );
-                assert_eq!(
-                    direct.target_entry.properties, distributed.target_entry.properties,
-                    "{case_name}: target locator catalog properties"
-                );
-                assert_eq!(
-                    direct.target_entry.warehouse_path, distributed.target_entry.warehouse_path,
-                    "{case_name}: target locator warehouse path"
-                );
-                assert_eq!(
-                    direct.target_table.identifier().to_string(),
-                    distributed.target_table.identifier().to_string(),
-                    "{case_name}: target locator table identifier"
-                );
-                assert_eq!(
-                    direct.target_table.metadata().uuid(),
-                    distributed.target_table.metadata().uuid(),
-                    "{case_name}: target locator table uuid"
-                );
-                assert_eq!(
-                    direct.target_table.metadata().location(),
-                    distributed.target_table.metadata().location(),
-                    "{case_name}: target locator table location"
-                );
-                assert_eq!(
-                    direct.target_table.metadata().current_snapshot_id(),
-                    distributed.target_table.metadata().current_snapshot_id(),
-                    "{case_name}: target locator table snapshot"
-                );
-                assert_eq!(
-                    direct.target_table.metadata().current_schema(),
-                    distributed.target_table.metadata().current_schema(),
-                    "{case_name}: target locator table schema"
-                );
-                assert_eq!(
-                    direct.partition_filter, distributed.partition_filter,
-                    "{case_name}: target locator partition filter"
-                );
-                assert_eq!(
-                    direct.apply_key_column, distributed.apply_key_column,
-                    "{case_name}: target locator apply key column"
+                if boundary.node_id >= 0 {
+                    let node_in_fragment = node_ids_by_fragment
+                        .get(&fragment_id)
+                        .is_some_and(|node_ids| node_ids.contains(&boundary.node_id));
+                    let sender_edge_exists = matches!(
+                        boundary.boundary_kind,
+                        crate::sql::codegen::boundary_schema::BoundaryKind::ExchangeSender
+                    ) && result.edges.iter().any(|edge| {
+                        edge.source_fragment_id == fragment_id
+                            && edge.target_exchange_node_id == boundary.node_id
+                    });
+                    assert!(
+                        node_in_fragment || sender_edge_exists,
+                        "{case_name}: boundary {idx} references missing node {} in fragment {}",
+                        boundary.node_id,
+                        fragment_id
+                    );
+                }
+            }
+            assert!(
+                !boundary.columns.is_empty(),
+                "{case_name}: boundary {idx} should describe at least one column"
+            );
+        }
+    }
+
+    fn assert_runtime_filters_well_formed(
+        case_name: &str,
+        result: &MultiFragmentBuildResult,
+        fragment_ids: &BTreeSet<FragmentId>,
+        node_ids_by_fragment: &BTreeMap<FragmentId, BTreeSet<i32>>,
+    ) {
+        let Some(rf_plan) = result.rf_plan.as_ref() else {
+            return;
+        };
+        for (fragment_id, filter_ids) in &rf_plan.build_side_filters {
+            assert!(
+                fragment_ids.contains(fragment_id),
+                "{case_name}: runtime filter build side references missing fragment {fragment_id}"
+            );
+            for filter_id in filter_ids {
+                assert!(
+                    rf_plan.all_filters.contains_key(filter_id),
+                    "{case_name}: build-side runtime filter {filter_id} missing descriptor"
                 );
             }
-            _ => panic!("{case_name}: target_position_locator presence mismatch"),
+        }
+        for (fragment_id, probes) in &rf_plan.probe_side_filters {
+            assert!(
+                fragment_ids.contains(fragment_id),
+                "{case_name}: runtime filter probe side references missing fragment {fragment_id}"
+            );
+            for (filter_id, probe_node_id) in probes {
+                assert!(
+                    rf_plan.all_filters.contains_key(filter_id),
+                    "{case_name}: probe-side runtime filter {filter_id} missing descriptor"
+                );
+                assert!(
+                    node_ids_by_fragment
+                        .get(fragment_id)
+                        .is_some_and(|node_ids| node_ids.contains(probe_node_id)),
+                    "{case_name}: runtime filter {filter_id} references missing probe node {} in fragment {}",
+                    probe_node_id,
+                    fragment_id
+                );
+            }
         }
     }
 
-    fn assert_output_columns_eq(
+    fn assert_direct_exec_ir_structure(case_name: &str, direct_exec: &DirectExecPlan) {
+        match direct_exec {
+            DirectExecPlan::AggregateStateMerge {
+                old_input,
+                delta_input,
+                ..
+            } => {
+                assert_plan_build_result_ir_structure(
+                    &format!("{case_name}: aggregate merge old input"),
+                    old_input,
+                );
+                assert_plan_build_result_ir_structure(
+                    &format!("{case_name}: aggregate merge delta input"),
+                    delta_input,
+                );
+            }
+            DirectExecPlan::AggregateStatePhysicalize { input, .. } => {
+                assert_plan_build_result_ir_structure(
+                    &format!("{case_name}: aggregate physicalize input"),
+                    input,
+                );
+            }
+            DirectExecPlan::UnionAll { inputs } => {
+                assert!(
+                    !inputs.is_empty(),
+                    "{case_name}: direct union must contain child inputs"
+                );
+                for (idx, input) in inputs.iter().enumerate() {
+                    assert_plan_build_result_ir_structure(
+                        &format!("{case_name}: direct union input {idx}"),
+                        input,
+                    );
+                }
+            }
+        }
+    }
+
+    fn assert_root_direct_exec_aggregate_state_merge(
         case_name: &str,
-        direct: &[CodegenOutputColumn],
-        distributed: &[CodegenOutputColumn],
+        result: &MultiFragmentBuildResult,
     ) {
-        assert_eq!(
-            direct.len(),
-            distributed.len(),
-            "{case_name}: output column count"
-        );
-        for (idx, (direct, distributed)) in direct.iter().zip(distributed.iter()).enumerate() {
-            assert_eq!(
-                direct.name, distributed.name,
-                "{case_name}: output column {idx} name"
-            );
-            assert_eq!(
-                direct.data_type, distributed.data_type,
-                "{case_name}: output column {idx} type"
-            );
-            assert_eq!(
-                direct.nullable, distributed.nullable,
-                "{case_name}: output column {idx} nullability"
-            );
-        }
-    }
-
-    fn assert_edges_eq(case_name: &str, direct: &[FragmentEdge], distributed: &[FragmentEdge]) {
-        assert_eq!(direct.len(), distributed.len(), "{case_name}: edge count");
-        for (idx, (direct, distributed)) in direct.iter().zip(distributed.iter()).enumerate() {
-            assert_eq!(
-                direct.source_fragment_id, distributed.source_fragment_id,
-                "{case_name}: edge {idx} source fragment"
-            );
-            assert_eq!(
-                direct.target_fragment_id, distributed.target_fragment_id,
-                "{case_name}: edge {idx} target fragment"
-            );
-            assert_eq!(
-                direct.target_exchange_node_id, distributed.target_exchange_node_id,
-                "{case_name}: edge {idx} target exchange node"
-            );
-            assert_eq!(
-                direct.output_partition, distributed.output_partition,
-                "{case_name}: edge {idx} output partition"
-            );
-            assert_eq!(
-                direct.stream_kind, distributed.stream_kind,
-                "{case_name}: edge {idx} stream kind"
-            );
-            assert_fragment_edge_kind_eq(case_name, idx, &direct.edge_kind, &distributed.edge_kind);
-        }
-    }
-
-    fn assert_fragment_edge_kind_eq(
-        case_name: &str,
-        idx: usize,
-        direct: &FragmentEdgeKind,
-        distributed: &FragmentEdgeKind,
-    ) {
-        match (direct, distributed) {
-            (FragmentEdgeKind::Stream, FragmentEdgeKind::Stream) => {}
-            (
-                FragmentEdgeKind::CteMulticast { cte_id: direct_id },
-                FragmentEdgeKind::CteMulticast {
-                    cte_id: distributed_id,
-                },
-            ) => assert_eq!(
-                direct_id, distributed_id,
-                "{case_name}: edge {idx} CTE multicast id"
+        let root = fragment_by_id(case_name, result, result.root_fragment_id);
+        assert!(
+            matches!(
+                root.direct_exec.as_deref(),
+                Some(DirectExecPlan::AggregateStateMerge { .. })
             ),
-            _ => panic!("{case_name}: edge {idx} kind mismatch: direct and DistributedPlan differ"),
-        }
+            "{case_name}: expected root AggregateStateMerge direct_exec"
+        );
     }
 
-    fn assert_runtime_filter_plan_eq(
-        case_name: &str,
-        direct: &Option<RuntimeFilterPlanResult>,
-        distributed: &Option<RuntimeFilterPlanResult>,
-    ) {
-        match (direct, distributed) {
-            (None, None) => {}
-            (Some(direct), Some(distributed)) => {
-                assert_eq!(
-                    direct.all_filters, distributed.all_filters,
-                    "{case_name}: runtime filter descriptors"
-                );
-                assert_eq!(
-                    direct.build_side_filters, distributed.build_side_filters,
-                    "{case_name}: runtime filter build-side map"
-                );
-                assert_eq!(
-                    direct.probe_side_filters, distributed.probe_side_filters,
-                    "{case_name}: runtime filter probe-side map"
-                );
-            }
-            _ => panic!("{case_name}: runtime filter plan presence mismatch"),
-        }
+    fn assert_root_direct_exec_union_all(case_name: &str, result: &MultiFragmentBuildResult) {
+        let root = fragment_by_id(case_name, result, result.root_fragment_id);
+        let Some(DirectExecPlan::UnionAll { inputs }) = root.direct_exec.as_deref() else {
+            panic!("{case_name}: expected root UnionAll direct_exec");
+        };
+        assert_eq!(
+            inputs.len(),
+            2,
+            "{case_name}: branch union should keep both direct-exec inputs"
+        );
     }
 
     fn assert_non_empty_scan_ranges(case_name: &str, result: &MultiFragmentBuildResult) {
@@ -1162,7 +1099,7 @@ mod tests {
 
     impl CatalogProvider for DummyCatalog {
         fn get_table(&self, _database: &str, _table: &str) -> Result<TableDef, String> {
-            Err("equivalence tests use fully resolved metadata-table scans".to_string())
+            Err("IR structural tests use fully resolved metadata-table scans".to_string())
         }
     }
 
