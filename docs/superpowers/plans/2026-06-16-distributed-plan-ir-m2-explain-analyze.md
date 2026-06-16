@@ -8,7 +8,7 @@
 
 **Scope / non-goals:**
 - **Single-fragment ANALYZE only.** ANALYZE forces single-fragment execution (reuse `collapse_distribution_enforcers_for_single_fragment`), so the whole query runs via `execute_plan` (one profilable fragment) and the displayed plan equals the executed/profiled one. Row counts are fragmentation-independent, so per-operator actuals are accurate for calibration. **Multi-fragment (coordinator) ANALYZE profiling is deferred** — `ExecutionCoordinator` carries no profiler today; surfacing fragment-structured actuals across coordinated fragments is a follow-up. (Consequence: ANALYZE shows the collapsed single-fragment shape, which can differ from VERBOSE's multi-fragment shape — acceptable for M2; flagged below.)
-- Reuse existing counters only (PushRowNum / OperatorTotalTime / OperatorPeakMemoryUsage); no new counter schema.
+- Reuse existing counters only (PullRowNum / OperatorTotalTime / OperatorPeakMemoryUsage); no new counter schema.
 - No execution cutover for normal queries (still the legacy `build`); ANALYZE independently builds + lowers the IR.
 
 **Tech Stack:** Rust, `cargo test`, `sql-tests` runner, a live standalone server for the ANALYZE smoke (per CLAUDE.md §7.3).
@@ -145,7 +145,7 @@ use crate::runtime::profile::Profiler;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ActualMetrics {
-    pub output_rows: i64,        // CommonMetrics.PushRowNum (the node's actual output rows)
+    pub output_rows: i64,        // CommonMetrics.PullRowNum (the node's actual output rows)
     pub total_time_ns: i64,      // CommonMetrics.OperatorTotalTime
     pub peak_mem_bytes: i64,     // CommonMetrics.OperatorPeakMemoryUsage
 }
@@ -163,11 +163,11 @@ fn collect_rec(node: &Profiler, out: &mut HashMap<i32, ActualMetrics>) {
     if let Some(id) = parse_plan_node_id(&node.name()) {
         if let Some(common) = node.get_child("CommonMetrics") {
             let m = out.entry(id).or_default();
-            // Output rows: prefer the operator that pushes to the parent. When several
+            // Output rows: prefer the operator that produces rows. When several
             // operator profiles share a node_id (e.g. join build sink + probe processor),
-            // take the MAX PushRowNum as the node's output (matches StarRocks' use of the
-            // output operator's PushRowNum; refine per-role if needed).
-            m.output_rows = m.output_rows.max(counter(&common, "PushRowNum"));
+            // take the MAX PullRowNum as the node's output (matches StarRocks' use of the
+            // output operator's PullRowNum; refine per-role if needed).
+            m.output_rows = m.output_rows.max(counter(&common, "PullRowNum"));
             m.total_time_ns = m.total_time_ns.max(counter(&common, "OperatorTotalTime"));
             m.peak_mem_bytes = m.peak_mem_bytes.max(counter(&common, "OperatorPeakMemoryUsage"));
         }
@@ -191,7 +191,7 @@ fn parse_plan_node_id(name: &str) -> Option<i32> {
 }
 ```
 - [ ] Make `merge_pipeline_profiles_for_fe` `pub(crate)` (it is private today). Add a `counter_value(&self, name: &str) -> Option<i64>` accessor on `RuntimeProfile` if not present (read `counter_snapshot(name).map(|s| s.value)`).
-- [ ] **Unit test** (`profile_correlate.rs`): build a small `Profiler` by hand with `Pipeline (id=)`→`PipelineDriver (id=)`→`SCAN (plan_node_id=2)`→`CommonMetrics{PushRowNum=10, OperatorTotalTime=5, OperatorPeakMemoryUsage=64}`, run `collect_actuals_by_plan_node_id`, assert `actuals[&2] == {10,5,64}`. Also test two driver instances merge (DOP=2 → counters summed by `merge_isomorphic_profiles`).
+- [ ] **Unit test** (`profile_correlate.rs`): build a small `Profiler` by hand with `Pipeline (id=)`→`PipelineDriver (id=)`→`SCAN (plan_node_id=2)`→`CommonMetrics{PullRowNum=10, OperatorTotalTime=5, OperatorPeakMemoryUsage=64}`, run `collect_actuals_by_plan_node_id`, assert `actuals[&2] == {10,5,64}`. Also test two driver instances merge (DOP=2 → counters summed by `merge_isomorphic_profiles`).
 - [ ] Run `cargo test --lib runtime::profile_correlate`. Expected: PASS.
 - [ ] Commit: `runtime: collect actual per-operator metrics by plan_node_id`.
 
@@ -255,7 +255,7 @@ Thread `actuals: Option<&HashMap<i32, ActualMetrics>>` through `format_distribut
 ## Risks & notes
 
 - **Single-fragment ANALYZE is a deliberate scope choice.** Forcing single-fragment makes displayed == executed == profiled (node_ids align trivially) and gives accurate per-operator row actuals (row counts don't depend on fragmentation). The cost: ANALYZE shows the collapsed shape, which can differ from VERBOSE's multi-fragment shape. **Multi-fragment (coordinator) ANALYZE** — threading a profiler through `ExecutionCoordinator` and gathering per-fragment profiles — is a follow-up (the coordinator carries no profiler today).
-- **Same-`node_id` multiple operators** (join build sink + probe processor both tagged with the join's id): the collector takes MAX PushRowNum as the node's output rows. This matches "the operator that produces the node's output"; if a case mis-attributes, refine by operator role (skip build-sink profiles). Verify against a join in the live smoke.
+- **Same-`node_id` multiple operators** (join build sink + probe processor both tagged with the join's id): the collector takes MAX PullRowNum as the node's output rows. This matches "the operator that produces the node's output"; if a case mis-attributes, refine by operator role (skip build-sink profiles). Verify against a join in the live smoke.
 - **`merge_pipeline_profiles_for_fe` visibility:** make it `pub(crate)` (Task 2.1). It already collapses per-driver DOP instances; reusing it keeps M2's merge consistent with the FE path.
 - **Profiler overhead:** ANALYZE always enables the profiler; normal queries are unaffected (they pass `None`). The driver only allocates counters when a profiler is present (`driver.rs:235`).
 - **`RESULT_SINK (plan_node_id=-1)`** and other negative/`-1` ids are not real plan nodes — `parse_plan_node_id` returns them but no IR node has `node_id=-1`, so they're harmless (no IR node matches).
@@ -267,5 +267,5 @@ Thread `actuals: Option<&HashMap<i32, ActualMetrics>>` through `format_distribut
 - Merge + node_id correlation — Phase 2 (reuse `merge_pipeline_profiles_for_fe`; key by `plan_node_id` == IR `node_id`). ✓
 - Per-node actual-vs-estimate render — Phase 3 (`act={rows,time,peak}` beside `stats={rows}`). ✓
 - Folded/no-profile nodes handled (no `act=n/a`). ✓
-- Multi-fragment coordinator profiling — explicitly deferred (documented). 
+- Multi-fragment coordinator profiling — explicitly deferred (documented).
 - Reuse existing counters only; no schema expansion (spec non-goal honored). ✓

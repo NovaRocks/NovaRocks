@@ -37,7 +37,7 @@ fn collect_rec(node: &Profiler, actuals: &mut HashMap<i32, ActualMetrics>) {
     if let Some(node_id) = parse_plan_node_id(&node.name()) {
         if let Some(common) = node.get_child("CommonMetrics") {
             let metrics = actuals.entry(node_id).or_default();
-            metrics.output_rows = metrics.output_rows.max(counter(&common, "PushRowNum"));
+            metrics.output_rows = metrics.output_rows.max(counter(&common, "PullRowNum"));
             metrics.total_time_ns = metrics
                 .total_time_ns
                 .max(counter(&common, "OperatorTotalTime"));
@@ -84,7 +84,7 @@ mod tests {
         peak_mem_bytes: i64,
     ) {
         let common = parent.child(name).child("CommonMetrics");
-        common.counter_set("PushRowNum", metrics::TUnit::UNIT, output_rows);
+        common.counter_set("PullRowNum", metrics::TUnit::UNIT, output_rows);
         common.counter_set("OperatorTotalTime", metrics::TUnit::TIME_NS, total_time_ns);
         common.counter_set(
             "OperatorPeakMemoryUsage",

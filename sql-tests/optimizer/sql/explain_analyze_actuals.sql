@@ -16,6 +16,7 @@ INSERT INTO ${case_db}.explain_analyze_actuals_r VALUES (1, 100), (2, 200), (4, 
 -- @result_contains=stats={rows=
 -- @result_contains=act={rows=
 -- @result_contains=} act={rows=
+-- @result_contains=SCAN ${case_db}.explain_analyze_actuals_l (alias=l) stats={rows=3 conf=estimated} act={rows=3
 -- @result_contains=HASH JOIN
 -- @result_contains=HASH AGGREGATE
 EXPLAIN ANALYZE
