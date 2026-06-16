@@ -13,7 +13,8 @@ use crate::data_sinks;
 use crate::exprs;
 use crate::plan_nodes;
 
-use crate::sql::catalog::CatalogProvider;
+use crate::sql::analysis::cte::CteId;
+use crate::sql::catalog::{CatalogProvider, IcebergSchemaDef};
 use crate::sql::codegen::FragmentId;
 use crate::sql::codegen::boundary_schema::{
     BoundaryKind, BoundarySchemaReport, output_columns_to_boundary_columns,
@@ -21,7 +22,7 @@ use crate::sql::codegen::boundary_schema::{
 use crate::sql::codegen::descriptors::DescriptorTableBuilder;
 use crate::sql::codegen::expr_compiler;
 use crate::sql::codegen::iceberg_write_sink::{
-    IcebergWriteSinkSpec, partition_info_from_serialized_metadata,
+    IcebergWriteSinkMode, IcebergWriteSinkSpec, partition_info_from_serialized_metadata,
 };
 use crate::sql::codegen::nodes;
 use crate::sql::codegen::{
@@ -780,12 +781,14 @@ fn apply_iceberg_sink_to_build(
     let mut desc_builder =
         DescriptorTableBuilder::from_existing(build.fragment_results[root_index].desc_tbl.clone());
     let partition_info = partition_info_from_serialized_metadata(&sink_spec.iceberg)?;
+    let equality_delete_schema = equality_delete_schema_for_sink(sink_spec)?;
     desc_builder.add_iceberg_target_table(
         sink_spec.target_table_id,
         current_database,
         &sink_spec.target_table,
         &sink_spec.iceberg,
         partition_info,
+        equality_delete_schema.as_ref(),
     );
     let desc_tbl = desc_builder.build();
     for fragment in &mut build.fragment_results {
@@ -793,6 +796,39 @@ fn apply_iceberg_sink_to_build(
     }
 
     Ok(build)
+}
+
+fn equality_delete_schema_for_sink(
+    sink_spec: &IcebergWriteSinkSpec,
+) -> Result<Option<IcebergSchemaDef>, String> {
+    if sink_spec.mode != IcebergWriteSinkMode::EqualityDeletes {
+        return Ok(None);
+    }
+    if sink_spec.target_columns.is_empty() {
+        return Err(
+            "iceberg equality-delete sink requires at least one equality column".to_string(),
+        );
+    }
+
+    let mut fields = Vec::with_capacity(sink_spec.target_columns.len());
+    for column in &sink_spec.target_columns {
+        let field = sink_spec
+            .iceberg
+            .schema
+            .fields
+            .iter()
+            .find(|field| field.name.eq_ignore_ascii_case(&column.name))
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "iceberg equality-delete sink column `{}` missing from iceberg schema",
+                    column.name
+                )
+            })?;
+        fields.push(field);
+    }
+
+    Ok(Some(IcebergSchemaDef { fields }))
 }
 
 fn root_output_tuple_id_for_sink(fragment: &FragmentBuildResult) -> Result<i32, String> {
@@ -4700,8 +4736,56 @@ mod tests {
     }
 
     #[test]
+    fn build_via_distributed_plan_with_iceberg_sink_preserves_equality_delete_schema() {
+        let plan = values_plan_for_test(vec![output_col_for_test(1, "id", DataType::Int32, false)]);
+        let connectors = crate::connector::ConnectorRegistry::new();
+        let mut spec = crate::sql::codegen::iceberg_write_sink::test_support::simple_sink_spec();
+        spec.mode = crate::sql::codegen::iceberg_write_sink::IcebergWriteSinkMode::EqualityDeletes;
+        spec.iceberg.serialized_metadata = Some(
+            crate::sql::codegen::iceberg_write_sink::test_support::unpartitioned_metadata_json(),
+        );
+
+        let build = PlanFragmentBuilder::build_via_distributed_plan_with_iceberg_sink(
+            &plan,
+            &DummyCatalog,
+            &connectors,
+            "default",
+            None,
+            &spec,
+        )
+        .expect("build with iceberg equality-delete sink");
+
+        let root = build
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == build.root_fragment_id)
+            .expect("root fragment");
+        assert_eq!(
+            root.output_sink.type_,
+            data_sinks::TDataSinkType::ICEBERG_EQUALITY_DELETE_SINK
+        );
+        let target_desc = root
+            .desc_tbl
+            .table_descriptors
+            .as_ref()
+            .expect("table descriptors")
+            .iter()
+            .find(|table| table.id == spec.target_table_id)
+            .expect("target iceberg table descriptor");
+        let equality_schema = target_desc
+            .iceberg_table
+            .as_ref()
+            .and_then(|table| table.iceberg_equal_delete_schema.as_ref())
+            .expect("equality-delete schema");
+        let fields = equality_schema.fields.as_ref().expect("schema fields");
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].field_id, Some(1));
+        assert_eq!(fields[0].name.as_deref(), Some("id"));
+    }
+
+    #[test]
     fn build_via_distributed_plan_with_iceberg_sink_maps_file_hash_distribution_to_partitioned_edge()
-     {
+    {
         let file_col_id = ColumnId::new_for_test(2);
         let output_columns = vec![
             output_col_for_test(1, "id", DataType::Int32, false),

@@ -151,6 +151,7 @@ impl DescriptorTableBuilder {
             table,
             iceberg,
             Vec::new(),
+            None,
             false,
         );
     }
@@ -162,6 +163,7 @@ impl DescriptorTableBuilder {
         table: &TableDef,
         iceberg: &crate::sql::catalog::IcebergTableInfo,
         partition_info: Vec<descriptors::TIcebergPartitionInfo>,
+        equality_delete_schema: Option<&crate::sql::catalog::IcebergSchemaDef>,
     ) {
         self.add_iceberg_table_with_partition_info(
             table_id,
@@ -169,6 +171,7 @@ impl DescriptorTableBuilder {
             table,
             iceberg,
             partition_info,
+            equality_delete_schema,
             true,
         );
     }
@@ -180,6 +183,7 @@ impl DescriptorTableBuilder {
         table: &TableDef,
         iceberg: &crate::sql::catalog::IcebergTableInfo,
         partition_info: Vec<descriptors::TIcebergPartitionInfo>,
+        equality_delete_schema: Option<&crate::sql::catalog::IcebergSchemaDef>,
         include_serialized_metadata: bool,
     ) {
         if !self.table_ids.insert(table_id) {
@@ -216,7 +220,7 @@ impl DescriptorTableBuilder {
             None::<Vec<String>>,
             None::<descriptors::TCompressedPartitionMap>,
             None::<std::collections::BTreeMap<i64, descriptors::THdfsPartition>>,
-            None::<descriptors::TIcebergSchema>,
+            equality_delete_schema.map(to_thrift_iceberg_schema),
             (!partition_info.is_empty()).then_some(partition_info),
             None::<descriptors::TSortOrder>,
             include_serialized_metadata
@@ -522,7 +526,7 @@ mod tests {
             None::<crate::exprs::TExpr>,
         )];
 
-        builder.add_iceberg_target_table(99, "db", &table, &iceberg, partition_info);
+        builder.add_iceberg_target_table(99, "db", &table, &iceberg, partition_info, None);
         let desc = builder.build();
         let tables = desc.table_descriptors.expect("table descriptors");
         let iceberg_table = tables[0].iceberg_table.as_ref().expect("iceberg table");

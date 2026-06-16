@@ -394,6 +394,34 @@ pub(crate) mod test_support {
         .expect("metadata");
         serde_json::to_string(&metadata.metadata).expect("serialize metadata")
     }
+
+    pub(crate) fn unpartitioned_metadata_json() -> String {
+        use std::sync::Arc;
+
+        let schema = iceberg::spec::Schema::builder()
+            .with_fields(vec![Arc::new(iceberg::spec::NestedField::required(
+                1,
+                "id",
+                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
+            ))])
+            .build()
+            .expect("schema");
+        let partition_spec = iceberg::spec::PartitionSpec::builder(schema.clone())
+            .build()
+            .expect("partition spec");
+        let metadata = iceberg::spec::TableMetadataBuilder::new(
+            schema,
+            partition_spec,
+            iceberg::spec::SortOrder::unsorted_order(),
+            "file:///warehouse/target_orders".to_string(),
+            iceberg::spec::FormatVersion::V3,
+            std::collections::HashMap::new(),
+        )
+        .expect("metadata builder")
+        .build()
+        .expect("metadata");
+        serde_json::to_string(&metadata.metadata).expect("serialize metadata")
+    }
 }
 
 #[cfg(test)]

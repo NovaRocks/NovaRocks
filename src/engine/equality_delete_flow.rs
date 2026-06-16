@@ -17,7 +17,6 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
-use std::sync::Mutex;
 
 use arrow::array::{
     ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int32Array,
@@ -32,7 +31,6 @@ use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_icebe
 use crate::connector::iceberg::commit::{
     CommitOpKind, CommitOutcome, CommitServiceError, EqualityDeleteColumn, IcebergCommitCollector,
     ensure_equality_delete_single_partition_spec, ensure_no_variant_columns_for_row_level_mutation,
-    write_equality_delete_file,
 };
 use crate::engine::backend_resolver::resolve_existing_table_target;
 use crate::engine::parquet::{parse_date_string_to_days, parse_datetime_string_to_micros};
@@ -40,13 +38,14 @@ use crate::engine::statement::AddEqualityDeleteStmt;
 use crate::engine::write_transaction::{
     IcebergWriteCommitExecutor, IcebergWriteCommitPolicy, IcebergWriteSource,
     IcebergWriteTransactionExecutor, IcebergWriteTransactionRunner, IcebergWriteTransactionSpec,
-    IcebergWriteValidationPolicy, local_writer_commit_input, new_local_writer_write_id,
+    IcebergWriteValidationPolicy, write_commit_has_files,
 };
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOperationTarget};
 use crate::runtime::coordinator::CoordinatedQueryResult;
-use crate::runtime::query_result::QueryResult;
 use crate::runtime::write_coordinator::WriteCommitInput;
+use crate::sql::catalog::ColumnDef;
+use crate::sql::codegen::iceberg_write_sink::{IcebergWriteSinkMode, IcebergWriteSinkSpec};
 use crate::sql::parser::ast::Literal;
 
 pub(crate) fn execute_add_equality_delete_statement(
@@ -100,26 +99,115 @@ pub(crate) fn execute_add_equality_delete_statement(
     if batch.num_rows() == 0 {
         return Ok(StatementResult::Ok);
     }
+    let values_query = build_equality_delete_sink_query(&delete_columns, &stmt.rows)?;
 
+    let current_snapshot_id = metadata.current_snapshot().map(|s| s.snapshot_id());
+    // Route non-empty input through the BE EqualityDeletes sink.
+    run_equality_delete_distributed_transaction(
+        state,
+        &target,
+        catalog,
+        table,
+        entry,
+        current_snapshot_id,
+        &delete_columns,
+        values_query,
+    )?;
+    Ok(StatementResult::Ok)
+}
+
+struct DistributedEqualityDeleteWriteExecutor {
+    state: Arc<StandaloneState>,
+    target: crate::engine::backend_resolver::TargetBackend,
+    delete_query: sqlparser::ast::Query,
+    sink_spec: IcebergWriteSinkSpec,
+    commit_executor: IcebergWriteCommitExecutor,
+}
+
+impl IcebergWriteTransactionExecutor for DistributedEqualityDeleteWriteExecutor {
+    fn run_coordinated_write(
+        &self,
+        _spec: &IcebergWriteTransactionSpec,
+    ) -> Result<CoordinatedQueryResult, String> {
+        let result = crate::engine::execute_query_as_iceberg_write(
+            &self.state,
+            Some(&self.target.catalog),
+            &self.target.namespace,
+            &self.delete_query,
+            self.sink_spec.clone(),
+            None,
+            None,
+        )?;
+        if result
+            .write_commit
+            .as_ref()
+            .is_none_or(|commit| !write_commit_has_files(commit))
+        {
+            return Err(
+                "ADD EQUALITY DELETE produced no equality-delete files for non-empty input"
+                    .to_string(),
+            );
+        }
+        Ok(result)
+    }
+
+    fn commit(
+        &self,
+        _spec: &IcebergWriteTransactionSpec,
+        write_commit: &WriteCommitInput,
+    ) -> Result<CommitOutcome, CommitServiceError> {
+        self.commit_executor.commit_write_input(write_commit)
+    }
+
+    fn finalize(&self, _spec: &IcebergWriteTransactionSpec) -> Result<(), String> {
+        self.commit_executor.finalize()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_equality_delete_distributed_transaction(
+    state: &Arc<StandaloneState>,
+    target: &crate::engine::backend_resolver::TargetBackend,
+    catalog: Arc<dyn Catalog>,
+    table: iceberg::table::Table,
+    entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    current_snapshot_id: Option<i64>,
+    delete_columns: &[EqualityDeleteColumn],
+    values_query: sqlparser::ast::Query,
+) -> Result<(), String> {
+    let resolved = {
+        let registry = state.connectors.read().expect("connector registry read");
+        let backend = registry.catalog_backend("iceberg")?;
+        backend.load_table(&target.catalog, &target.namespace, &target.table)?
+    };
+    let mut sink_spec = crate::engine::iceberg_writer::build_equality_delete_sink_spec(
+        target,
+        &resolved,
+        &table,
+        &entry,
+        delete_columns,
+    )?;
+    sink_spec.mode = IcebergWriteSinkMode::EqualityDeletes;
+    sink_spec.set_planned_snapshot_id(current_snapshot_id)?;
+
+    let metadata = table.metadata();
+    let table_ident = iceberg::TableIdent::new(
+        iceberg::NamespaceIdent::new(target.namespace.clone()),
+        target.table.clone(),
+    );
     let staging_dir = format!(
         "{}/data/_staging/{}",
         metadata.location(),
         uuid::Uuid::new_v4()
     );
-    let default_spec_id = metadata.default_partition_spec_id();
-    let current_snapshot_id = metadata.current_snapshot().map(|s| s.snapshot_id());
-    let last_sequence_number = metadata.last_sequence_number();
-    let current_schema = metadata.current_schema().clone();
-    let default_partition_spec = metadata.default_partition_spec().clone();
-
     let collector = Arc::new(
         IcebergCommitCollector::new(
             CommitOpKind::RowDelta,
             table_ident,
             current_snapshot_id,
-            last_sequence_number,
-            current_schema,
-            default_partition_spec,
+            metadata.last_sequence_number(),
+            metadata.current_schema().clone(),
+            metadata.default_partition_spec().clone(),
             staging_dir,
             crate::common::types::UniqueId { hi: 0, lo: 0 },
         )
@@ -138,12 +226,6 @@ pub(crate) fn execute_add_equality_delete_statement(
         cow_update_rewrite: None,
         target_ref: "main".to_string(),
         snapshot_properties: BTreeMap::new(),
-    };
-    let executor = EqualityDeleteWriteExecutor {
-        commit_executor,
-        table,
-        default_spec_id,
-        plan: Mutex::new(Some((delete_columns, batch))),
     };
     let spec = IcebergWriteTransactionSpec {
         target: IcebergOperationTarget {
@@ -172,75 +254,111 @@ pub(crate) fn execute_add_equality_delete_statement(
         },
         source: IcebergWriteSource::CoordinatedPlan,
     };
+    let executor = DistributedEqualityDeleteWriteExecutor {
+        state: Arc::clone(state),
+        target: target.clone(),
+        delete_query: values_query,
+        sink_spec,
+        commit_executor,
+    };
     let runner = IcebergWriteTransactionRunner::new(Arc::clone(state), &executor);
     let _outcome = runner.run(spec)?;
-    Ok(StatementResult::Ok)
+    Ok(())
 }
 
-struct EqualityDeleteWriteExecutor {
-    commit_executor: IcebergWriteCommitExecutor,
-    table: iceberg::table::Table,
-    default_spec_id: i32,
-    plan: Mutex<Option<(Vec<EqualityDeleteColumn>, RecordBatch)>>,
-}
+fn build_equality_delete_sink_query(
+    delete_columns: &[EqualityDeleteColumn],
+    rows: &[Vec<Literal>],
+) -> Result<sqlparser::ast::Query, String> {
+    if delete_columns.is_empty() {
+        return Err("ADD EQUALITY DELETE requires at least one equality column".to_string());
+    }
+    if rows.is_empty() {
+        return Err("ADD EQUALITY DELETE sink query requires at least one row".to_string());
+    }
+    for row in rows {
+        if row.len() != delete_columns.len() {
+            return Err(format!(
+                "ADD EQUALITY DELETE row has {} values, expected {}",
+                row.len(),
+                delete_columns.len()
+            ));
+        }
+    }
 
-impl IcebergWriteTransactionExecutor for EqualityDeleteWriteExecutor {
-    fn run_coordinated_write(
-        &self,
-        _spec: &IcebergWriteTransactionSpec,
-    ) -> Result<CoordinatedQueryResult, String> {
-        let (delete_columns, batch) = self
-            .plan
-            .lock()
-            .expect("equality-delete write plan lock poisoned")
-            .take()
-            .ok_or_else(|| "ADD EQUALITY DELETE write plan was already consumed".to_string())?;
-        let file_io = self.table.file_io().clone();
-        let Some(written) = block_on_iceberg(async {
-            write_equality_delete_file(
-                &file_io,
-                &self.commit_executor.collector.staging_dir,
-                self.default_spec_id,
-                delete_columns,
-                batch,
-            )
-            .await
-        })??
-        else {
-            return Ok(CoordinatedQueryResult {
-                query_result: QueryResult::empty(),
-                write_commit: None,
-                write_abort: None,
-                profilers: Vec::new(),
-            });
-        };
-        let sink_commit_info =
-            crate::connector::iceberg::data_writer::written_file_to_sink_commit_info(
-                &written,
-                self.table.metadata(),
-            )?;
-        Ok(CoordinatedQueryResult {
-            query_result: QueryResult::empty(),
-            write_commit: Some(local_writer_commit_input(
-                new_local_writer_write_id(),
-                vec![sink_commit_info],
-            )),
-            write_abort: None,
-            profilers: Vec::new(),
+    let target_columns = equality_delete_target_columns(delete_columns);
+    let alias = "__nr_eqdel";
+    let rendered_rows = rows
+        .iter()
+        .map(|row| {
+            let values = row
+                .iter()
+                .zip(target_columns.iter())
+                .map(|(literal, column)| {
+                    crate::engine::iceberg_writer::literal_to_sql_for_arrow_type(
+                        literal,
+                        &column.data_type,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .join(", ");
+            Ok(format!("({values})"))
         })
-    }
+        .collect::<Result<Vec<_>, String>>()?;
+    let value_columns = target_columns
+        .iter()
+        .map(|column| sql_identifier(&column.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let values_sql = format!(
+        "(VALUES {}) AS {}({})",
+        rendered_rows.join(", "),
+        sql_identifier(alias),
+        value_columns
+    );
+    let select_items = target_columns
+        .iter()
+        .map(|column| {
+            Ok(format!(
+                "{} AS {}",
+                crate::engine::iceberg_writer::target_cast_expr_sql(
+                    &qualify_column(alias, &column.name),
+                    column,
+                )?,
+                sql_identifier(&column.name)
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let sql = format!("SELECT {} FROM {}", select_items.join(", "), values_sql);
+    parse_generated_query(&sql, "ADD EQUALITY DELETE sink")
+}
 
-    fn commit(
-        &self,
-        _spec: &IcebergWriteTransactionSpec,
-        write_commit: &WriteCommitInput,
-    ) -> Result<CommitOutcome, CommitServiceError> {
-        self.commit_executor.commit_write_input(write_commit)
-    }
+fn equality_delete_target_columns(delete_columns: &[EqualityDeleteColumn]) -> Vec<ColumnDef> {
+    delete_columns
+        .iter()
+        .map(|column| ColumnDef {
+            name: column.name.clone(),
+            data_type: column.data_type.clone(),
+            nullable: column.nullable,
+            write_default: None,
+            logical_type: None,
+        })
+        .collect()
+}
 
-    fn finalize(&self, _spec: &IcebergWriteTransactionSpec) -> Result<(), String> {
-        self.commit_executor.finalize()
+fn parse_generated_query(sql: &str, context: &str) -> Result<sqlparser::ast::Query, String> {
+    match crate::sql::parser::parse_sql_raw(sql)? {
+        sqlparser::ast::Statement::Query(query) => Ok(*query),
+        other => Err(format!("{context}: generated non-query statement: {other}")),
     }
+}
+
+fn qualify_column(alias: &str, column: &str) -> String {
+    format!("{}.{}", sql_identifier(alias), sql_identifier(column))
+}
+
+fn sql_identifier(name: &str) -> String {
+    format!("`{}`", name.replace('`', "``"))
 }
 
 fn build_equality_delete_batch(
@@ -618,6 +736,30 @@ mod tests {
     use crate::sql::parser::ast::Literal;
 
     #[test]
+    fn equality_delete_writes_file_on_be_not_coordinator() {
+        let src = include_str!("equality_delete_flow.rs");
+        let body = src
+            .split("fn execute_add_equality_delete_statement")
+            .nth(1)
+            .expect("fn")
+            .split("\nfn ")
+            .next()
+            .expect("body");
+        assert!(
+            !body.contains("write_equality_delete_file"),
+            "equality-delete must not write the file on the coordinator"
+        );
+        assert!(
+            !body.contains("local_writer_commit_input"),
+            "equality-delete must not wrap a coordinator-written file (FE central write)"
+        );
+        assert!(
+            body.contains("EqualityDeletes"),
+            "equality-delete must write via the BE EqualityDeletes sink"
+        );
+    }
+
+    #[test]
     fn build_equality_delete_batch_projects_key_columns_with_field_ids() {
         let schema = Schema::builder()
             .with_fields(vec![
@@ -669,5 +811,40 @@ mod tests {
             .expect("category column");
         assert_eq!(categories.value(0), "B");
         assert!(categories.is_null(1));
+    }
+
+    #[test]
+    fn build_equality_delete_sink_query_projects_typed_values() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "category",
+                    Type::Primitive(PrimitiveType::String),
+                )),
+            ])
+            .build()
+            .expect("schema");
+        let columns = vec!["id".to_string(), "category".to_string()];
+        let rows = vec![
+            vec![Literal::Int(2), Literal::String("B".to_string())],
+            vec![Literal::Int(4), Literal::Null],
+        ];
+        let (delete_columns, _) =
+            super::build_equality_delete_batch(&schema, &columns, &rows).expect("batch");
+
+        let query = super::build_equality_delete_sink_query(&delete_columns, &rows).expect("query");
+        let sql = query.to_string();
+
+        assert!(sql.contains("VALUES"));
+        assert!(sql.contains("CAST"));
+        assert!(sql.contains("id"));
+        assert!(sql.contains("category"));
+        assert!(sql.contains("NULL"));
     }
 }
