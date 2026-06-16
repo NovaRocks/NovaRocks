@@ -27,9 +27,17 @@ pub(crate) struct ActualMetrics {
 }
 
 pub(crate) fn collect_actuals_by_plan_node_id(profiler: &Profiler) -> HashMap<i32, ActualMetrics> {
-    let merged = crate::service::fe_report::merge_pipeline_profiles_for_fe(profiler);
+    collect_actuals_by_plan_node_id_multi(std::slice::from_ref(profiler))
+}
+
+pub(crate) fn collect_actuals_by_plan_node_id_multi(
+    profilers: &[Profiler],
+) -> HashMap<i32, ActualMetrics> {
     let mut actuals = HashMap::new();
-    collect_rec(&merged, &mut actuals);
+    for profiler in profilers {
+        let merged = crate::service::fe_report::merge_pipeline_profiles_for_fe(profiler);
+        collect_rec(&merged, &mut actuals);
+    }
     actuals
 }
 
@@ -72,7 +80,9 @@ fn parse_plan_node_id(name: &str) -> Option<i32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ActualMetrics, collect_actuals_by_plan_node_id};
+    use super::{
+        ActualMetrics, collect_actuals_by_plan_node_id, collect_actuals_by_plan_node_id_multi,
+    };
     use crate::metrics;
     use crate::runtime::profile::Profiler;
 
@@ -150,6 +160,40 @@ mod tests {
                 output_rows: 1,
                 total_time_ns: 12_000,
                 peak_mem_bytes: 128,
+            })
+        );
+    }
+
+    #[test]
+    fn merges_profiles_across_fragments() {
+        let scan_fragment = Profiler::new("fragment-0");
+        let scan_driver = scan_fragment
+            .child("Pipeline (id=0)")
+            .child("PipelineDriver (id=0)");
+        add_operator_metrics(&scan_driver, "SCAN (plan_node_id=2)", 100, 20, 256);
+
+        let agg_fragment = Profiler::new("fragment-1");
+        let agg_driver = agg_fragment
+            .child("Pipeline (id=0)")
+            .child("PipelineDriver (id=0)");
+        add_operator_metrics(&agg_driver, "AGGREGATE (plan_node_id=5)", 1, 30, 512);
+
+        let actuals = collect_actuals_by_plan_node_id_multi(&[scan_fragment, agg_fragment]);
+
+        assert_eq!(
+            actuals.get(&2).copied(),
+            Some(ActualMetrics {
+                output_rows: 100,
+                total_time_ns: 20,
+                peak_mem_bytes: 256,
+            })
+        );
+        assert_eq!(
+            actuals.get(&5).copied(),
+            Some(ActualMetrics {
+                output_rows: 1,
+                total_time_ns: 30,
+                peak_mem_bytes: 512,
             })
         );
     }

@@ -3216,10 +3216,9 @@ fn prepare_explain_query(
     Ok(prepared)
 }
 
-/// Execute the collapsed single-fragment DistributedPlan, then produce an
-/// EXPLAIN-style result whose first row is
-/// `Planning: <ms> / Execution: <ms> / Rows: <N>` followed by the profiled
-/// plan body.
+/// Execute the DistributedPlan, then produce an EXPLAIN-style result whose
+/// first row is `Planning: <ms> / Execution: <ms> / Rows: <N>` followed by
+/// the profiled plan body.
 #[allow(clippy::too_many_arguments)]
 fn explain_analyze_query(
     query: &sqlparser::ast::Query,
@@ -3227,12 +3226,12 @@ fn explain_analyze_query(
     codegen_catalog: &InMemoryCatalog,
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
-    _exchange_port: u16,
+    exchange_port: u16,
     query_opts: Option<crate::internal_service::TQueryOptions>,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
     use crate::runtime::profile::Profiler;
-    use crate::runtime::profile_correlate::collect_actuals_by_plan_node_id;
+    use crate::runtime::profile_correlate::collect_actuals_by_plan_node_id_multi;
     use crate::sql::codegen::ir::{
         build_distributed_plan, explain_distributed_plan_analyze, lower_distributed_plan,
     };
@@ -3259,32 +3258,45 @@ fn explain_analyze_query(
     // dictionary_provider intentionally None; installed via TLS by execute_in_context.
     let physical =
         crate::sql::optimizer::optimize(logical, &table_stats, factory, None, mv_candidates)?;
-    let physical = collapse_distribution_enforcers_for_single_fragment(physical);
     let dp = build_distributed_plan(&physical)?;
     let build_result = lower_distributed_plan(&dp, codegen_catalog, connectors, None)?;
     let planning_ms = t_plan.elapsed().as_millis() as u64;
 
     let t_exec = Instant::now();
-    let single = match choose_standalone_execution(build_result) {
-        StandaloneExecutionPlan::SingleFragment(plan) => *plan,
+    let (rows, profilers) = match choose_standalone_execution(build_result) {
+        StandaloneExecutionPlan::SingleFragment(plan) => {
+            let profiler = Profiler::new("explain_analyze");
+            let executed = execute_plan(*plan, query_opts, None, None, Some(profiler.clone()))?;
+            let rows: u64 = executed.chunks.iter().map(|c| c.len() as u64).sum();
+            (rows, vec![profiler])
+        }
         StandaloneExecutionPlan::Coordinated(build_result) => {
-            return Err(format!(
-                "EXPLAIN ANALYZE requires a single-fragment DistributedPlan; lowered plan has {} \
-                 fragments",
-                build_result.fragment_results.len()
-            ));
+            let mut profiled_query_opts = query_opts.unwrap_or_default();
+            profiled_query_opts.enable_profile = Some(true);
+            let (dispatcher, scheduler) = coordinated_execution_services(exchange_port)?;
+            let outcome = crate::runtime::coordinator::ExecutionCoordinator::new(
+                *build_result,
+                dispatcher,
+                scheduler,
+                Some(profiled_query_opts),
+            )
+            .execute_with_write_outcome()?;
+            let rows: u64 = outcome
+                .query_result
+                .chunks
+                .iter()
+                .map(|c| c.len() as u64)
+                .sum();
+            (rows, outcome.profilers)
         }
     };
-    let profiler = Profiler::new("explain_analyze");
-    let executed = execute_plan(single, query_opts, None, None, Some(profiler.clone()))?;
-    let rows: u64 = executed.chunks.iter().map(|c| c.len() as u64).sum();
     let execution_ms = t_exec.elapsed().as_millis() as u64;
 
     let mut lines = Vec::new();
     lines.push(format!(
         "Planning: {planning_ms} ms / Execution: {execution_ms} ms / Rows: {rows}"
     ));
-    let actuals = collect_actuals_by_plan_node_id(&profiler);
+    let actuals = collect_actuals_by_plan_node_id_multi(&profilers);
     lines.extend(explain_distributed_plan_analyze(
         &dp,
         ExplainLevel::Analyze,
