@@ -40,7 +40,8 @@ use super::abort::AbortLog;
 use super::action::{CommitCtx, IcebergCommitAction};
 use super::fast_append::register_puffin_stats;
 use super::helpers::{
-    effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms,
+    debug_assert_single_unmarked_row_bearing_data_manifest, effective_next_row_id,
+    finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms,
     required_target_ref_snapshot_id, snapshot_summary, target_ref_snapshot_id, write_manifest_list,
 };
 use super::overwrite::{write_added_data_manifest, write_overwrite_deletes_manifest};
@@ -172,9 +173,10 @@ impl TransactionAction for CowUpdateTxnAction {
         let target_ref = &self.target_ref;
         let parent_snapshot_id = target_ref_snapshot_id(m, target_ref);
         let metadata_dir = metadata_dir(table);
-        // REUSE base: rewrite outputs and carried files keep their existing
-        // `_row_id`s, so their manifests are marked already-assigned against this
-        // floor and the writer allocates nothing for them.
+        // REUSE base: the writer base / row-range floor used when there are no
+        // appended (fresh) rows. Reuse manifests (rewrite outputs and carried
+        // files) carry their own per-file `first_row_id` and do not draw from it;
+        // they are marked already-assigned so the writer allocates nothing for them.
         let reuse_first_row_id = m.next_row_id();
 
         // FRESH base: net-new appended INSERT rows (a folded MERGE not-matched
@@ -232,6 +234,10 @@ impl TransactionAction for CowUpdateTxnAction {
 
         let touched_delete_groups = group_live_files_by_partition_spec(&index.touched_live);
 
+        // Carried verbatim. Base data manifests written by this engine carry a `first_row_id`;
+        // a foreign/pre-v3 manifest with `first_row_id == None` AND rows > 0 would be treated as
+        // an unmarked advancer and trip the post-write next_row_id assertion below — that
+        // fail-fast is intentional (no silent row-lineage corruption), not a bug.
         let mut new_manifests: Vec<ManifestFile> = index.untouched_manifests;
         for (idx, carried) in index.carried_live.iter().enumerate() {
             let path = format!(
@@ -381,6 +387,7 @@ impl TransactionAction for CowUpdateTxnAction {
         // the counter. When there are no appended files this equals
         // `m.next_row_id()`, so the pure-UPDATE / MOR-style reuse path is
         // byte-identical to before (row-range `(reuse_first_row_id, 0)`).
+        debug_assert_single_unmarked_row_bearing_data_manifest(&new_manifests, has_appended);
         let manifest_list_next_row_id = write_manifest_list(
             &self.file_io,
             &manifest_list_path,

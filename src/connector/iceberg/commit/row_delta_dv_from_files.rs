@@ -39,7 +39,8 @@ use super::abort::AbortLog;
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
 use super::fast_append::carry_forward_puffin_stats;
 use super::helpers::{
-    effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms,
+    debug_assert_single_unmarked_row_bearing_data_manifest, effective_next_row_id,
+    finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms,
     required_target_ref_snapshot_id, snapshot_summary, snapshot_total_records,
     target_ref_snapshot_id, write_manifest_list,
 };
@@ -200,6 +201,10 @@ impl TransactionAction for RowDeltaDvFromFilesTxnAction {
             }
         }
 
+        // Carried verbatim. Base data manifests written by this engine carry a `first_row_id`;
+        // a foreign/pre-v3 manifest with `first_row_id == None` AND rows > 0 would be treated as
+        // an unmarked advancer and trip the post-write next_row_id assertion below — that
+        // fail-fast is intentional (no silent row-lineage corruption), not a bug.
         let mut new_manifests = index.untouched_manifests;
         for (idx, (spec_id, files)) in
             group_live_files_by_partition_spec(index.touched_delete_existing)
@@ -338,6 +343,7 @@ impl TransactionAction for RowDeltaDvFromFilesTxnAction {
         // draws fresh ids and advances it. With no appended files this equals
         // `row_lineage_first_row_id`, so the MOR-UPDATE / DELETE path is
         // byte-identical (final next-row-id == floor, row-range `(floor, 0)`).
+        debug_assert_single_unmarked_row_bearing_data_manifest(&new_manifests, has_appended);
         let manifest_list_next_row_id = write_manifest_list(
             &self.file_io,
             &manifest_list_path,

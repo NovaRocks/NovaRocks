@@ -19,7 +19,9 @@
 //! (`RowDeltaCommit` and `OverwriteCommit`).
 
 use iceberg::io::FileIO;
-use iceberg::spec::{FormatVersion, ManifestFile, ManifestListWriter, Summary, TableMetadata};
+use iceberg::spec::{
+    FormatVersion, ManifestContentType, ManifestFile, ManifestListWriter, Summary, TableMetadata,
+};
 use std::collections::HashMap;
 
 /// Generate an Iceberg-spec-compliant random positive snapshot id.
@@ -133,6 +135,34 @@ pub fn effective_next_row_id(metadata: &iceberg::spec::TableMetadata) -> Result<
         }
     }
     Ok(next_row_id)
+}
+
+/// Debug-only invariant for v3 row-lineage commits that mix REUSE and FRESH data
+/// manifests in one snapshot. The single appended/FRESH data manifest must be the only
+/// *row-bearing* unmarked (`first_row_id == None`) Data manifest: every reuse, carried,
+/// and rewrite Data manifest already carries a `first_row_id`, Deletes never advance, and
+/// zero-row Data manifests (e.g. COW's `content=Data` file-level delete manifest, built via
+/// `build_v3_data` with no rows) are assigned an id but advance `next_row_id` by 0 — so they
+/// are harmless and excluded here. This is the *necessary* condition behind
+/// `with_row_range(appended_first_row_id, ..)`; the global post-write next_row_id assertion
+/// catches violations at commit time, but this makes the invariant explicit and edit-safe
+/// for the M3b branches that will populate the appended channel.
+pub(super) fn debug_assert_single_unmarked_row_bearing_data_manifest(
+    manifests: &[ManifestFile],
+    has_appended: bool,
+) {
+    debug_assert_eq!(
+        manifests
+            .iter()
+            .filter(|m| {
+                m.content == ManifestContentType::Data
+                    && m.first_row_id.is_none()
+                    && (m.added_rows_count.unwrap_or(0) + m.existing_rows_count.unwrap_or(0)) > 0
+            })
+            .count(),
+        usize::from(has_appended),
+        "atomic-fold row-lineage invariant: the appended manifest must be the sole row-bearing unmarked Data manifest"
+    );
 }
 
 /// Write a manifest list (avro) to `out_path` containing the supplied entries.
