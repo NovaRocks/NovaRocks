@@ -211,6 +211,7 @@ impl IcebergWriteTransactionExecutor for EqualityDeleteWriteExecutor {
                 query_result: QueryResult::empty(),
                 write_commit: None,
                 write_abort: None,
+                profilers: Vec::new(),
             });
         };
         let sink_commit_info =
@@ -225,6 +226,7 @@ impl IcebergWriteTransactionExecutor for EqualityDeleteWriteExecutor {
                 vec![sink_commit_info],
             )),
             write_abort: None,
+            profilers: Vec::new(),
         })
     }
 

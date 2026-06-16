@@ -566,6 +566,7 @@ mod tests {
                 query_result: empty_query_result(),
                 write_commit: Some(write_commit_with_one_writer()),
                 write_abort: None,
+                profilers: Vec::new(),
             }))),
             commit: RefCell::new(Some(Ok(CommitOutcome {
                 new_snapshot_id: 1234,
@@ -601,6 +602,7 @@ mod tests {
                 query_result: empty_query_result(),
                 write_commit: None,
                 write_abort: Some(one_writer_abort()),
+                profilers: Vec::new(),
             }))),
             commit: RefCell::new(None),
             finalize: Ok(()),
@@ -659,6 +661,7 @@ mod tests {
                 query_result: empty_query_result(),
                 write_commit: Some(write_commit_with_one_writer()),
                 write_abort: None,
+                profilers: Vec::new(),
             }))),
             commit: RefCell::new(Some(Err(CommitServiceError::KnownUncommitted {
                 message: "conflict".to_string(),
@@ -698,6 +701,7 @@ mod tests {
                 query_result: empty_query_result(),
                 write_commit: Some(write_commit_with_one_writer()),
                 write_abort: None,
+                profilers: Vec::new(),
             }))),
             commit: RefCell::new(Some(Err(CommitServiceError::Unknown {
                 message: "rpc timeout".to_string(),
@@ -739,6 +743,7 @@ mod tests {
                 query_result: empty_query_result(),
                 write_commit: Some(write_commit_with_one_writer()),
                 write_abort: None,
+                profilers: Vec::new(),
             }))),
             commit: RefCell::new(Some(Ok(CommitOutcome {
                 new_snapshot_id: 9,
@@ -796,6 +801,7 @@ mod tests {
                 query_result: empty_query_result(),
                 write_commit: None,
                 write_abort: None,
+                profilers: Vec::new(),
             }))),
             commit: RefCell::new(None),
             finalize: Ok(()),
@@ -823,6 +829,7 @@ mod tests {
                 query_result: empty_query_result(),
                 write_commit: Some(write_commit_with_writer_without_files()),
                 write_abort: None,
+                profilers: Vec::new(),
             }))),
             commit: RefCell::new(None),
             finalize: Ok(()),
@@ -853,6 +860,7 @@ mod tests {
                 query_result: empty_query_result(),
                 write_commit: Some(write_commit_with_writer_without_files()),
                 write_abort: None,
+                profilers: Vec::new(),
             }))),
             commit: RefCell::new(Some(Ok(CommitOutcome {
                 new_snapshot_id: 4321,

@@ -1529,9 +1529,10 @@ pub fn submit_exec_plan_fragment(thrift_bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct SyncExecPlanResult {
     pub(crate) finst_id: UniqueId,
+    pub(crate) profiler: Option<Profiler>,
 }
 
 pub(crate) fn execute_plan_fragment_sync(
@@ -1612,7 +1613,10 @@ pub(crate) fn execute_plan_fragment_sync(
     mgr.finish_fragment(query_id);
 
     match exec_result {
-        Ok(_) => Ok(SyncExecPlanResult { finst_id }),
+        Ok(out) => Ok(SyncExecPlanResult {
+            finst_id,
+            profiler: out.profiler,
+        }),
         Err(err) => {
             crate::runtime::sink_commit::unregister(finst_id);
             Err(err)

@@ -32,6 +32,7 @@ use crate::partitions;
 use crate::planner;
 use crate::runtime::dispatcher::{FetchOutcome, FragmentDispatcher};
 use crate::runtime::exec_params::{ExecPlanFragmentParamOptions, build_exec_plan_fragment_params};
+use crate::runtime::profile::Profiler;
 use crate::runtime::query_state::QueryState;
 use crate::runtime::scheduler::{FragmentScheduler, topological_sort_bottom_up};
 use crate::runtime::write_coordinator::{
@@ -57,6 +58,7 @@ pub(crate) struct CoordinatedQueryResult {
     pub(crate) query_result: QueryResult,
     pub(crate) write_commit: Option<WriteCommitInput>,
     pub(crate) write_abort: Option<WriteAbortInput>,
+    pub(crate) profilers: Vec<Profiler>,
 }
 
 /// Coordinates multi-fragment query execution across one or more backends.
@@ -462,6 +464,7 @@ impl ExecutionCoordinator {
             expected_root_chunk_schema.as_ref(),
             write_coordinator.as_ref(),
         )?;
+        let profilers = dispatcher.take_profiles();
 
         if let Some(commit) = fetch_result.write_commit.as_ref() {
             tracing::info!(
@@ -494,6 +497,7 @@ impl ExecutionCoordinator {
             query_result,
             write_commit: fetch_result.write_commit,
             write_abort: fetch_result.write_abort,
+            profilers,
         })
     }
 
@@ -2680,6 +2684,7 @@ mod tests {
                 completed_writer_outputs: Vec::new(),
                 incomplete_writers: Vec::new(),
             }),
+            profilers: Vec::new(),
         })
         .expect_err("legacy query-result wrapper must not hide write aborts");
 

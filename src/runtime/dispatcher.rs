@@ -53,6 +53,7 @@ use crate::exec::pipeline::executor::execute_plan_with_pipeline;
 use crate::internal_service;
 use crate::lower::layout::{build_tuple_slot_order, reorder_tuple_slots};
 use crate::lower::thrift::lower_plan;
+use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::QueryId;
 use crate::runtime::runtime_state::RuntimeState;
 use crate::service::grpc_client::NovaRocksGrpcRemoteClient;
@@ -112,6 +113,12 @@ pub trait FragmentDispatcher: Send + Sync + 'static {
     /// standalone coordinator.
     fn needs_fragment_status_report(&self) -> bool {
         false
+    }
+
+    /// Drain fragment profilers collected by in-process execution. Remote
+    /// dispatchers do not currently surface profiles through this path.
+    fn take_profiles(&self) -> Vec<Profiler> {
+        Vec::new()
     }
 }
 
@@ -335,6 +342,7 @@ struct InProcessState {
     /// slot is installed, that query's root slot picks it up during root
     /// submission.
     fragment_errors: Mutex<HashMap<QueryKey, String>>,
+    fragment_profilers: Mutex<HashMap<FinstKey, Profiler>>,
 }
 
 /// Dispatcher that runs all fragments in-process via `std::thread::spawn`.
@@ -359,6 +367,7 @@ impl InProcessDispatcher {
                 root_slots: Mutex::new(HashMap::new()),
                 submitted_ids: Mutex::new(Vec::new()),
                 fragment_errors: Mutex::new(HashMap::new()),
+                fragment_profilers: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -455,6 +464,20 @@ fn pending_fragment_error(state: &InProcessState, query_key: QueryKey) -> Option
         .cloned()
 }
 
+fn record_fragment_profiler(
+    state: &InProcessState,
+    finst_key: FinstKey,
+    profiler: Option<Profiler>,
+) {
+    if let Some(profiler) = profiler {
+        state
+            .fragment_profilers
+            .lock()
+            .expect("fragment_profilers lock")
+            .insert(finst_key, profiler);
+    }
+}
+
 fn format_fragment_error(finst_key: (i64, i64), error: &str) -> String {
     format!(
         "fragment {}/{} failed during in-process execution: {}",
@@ -539,6 +562,9 @@ impl FragmentDispatcher for InProcessDispatcher {
                 };
                 register_in_process_report_instance(&params, finst_id, query_id);
                 let result = crate::service::internal_service::execute_plan_fragment_sync(params);
+                if let Ok(result) = result.as_ref() {
+                    record_fragment_profiler(&state, finst_key, result.profiler.clone());
+                }
                 let report_error = result.as_ref().err().cloned();
                 crate::service::fe_report::report_fragment_done(finst_id, report_error.clone());
                 if let Err(e) = result {
@@ -615,6 +641,18 @@ impl FragmentDispatcher for InProcessDispatcher {
 
     fn backend_count(&self) -> usize {
         1
+    }
+
+    fn take_profiles(&self) -> Vec<Profiler> {
+        std::mem::take(
+            &mut *self
+                .state
+                .fragment_profilers
+                .lock()
+                .expect("fragment_profilers lock"),
+        )
+        .into_values()
+        .collect()
     }
 }
 
@@ -842,9 +880,14 @@ impl FragmentDispatcher for RemoteDispatcher {
 /// Mirrors the root-fragment execution path from `ExecutionCoordinator` but
 /// operates on the pre-built `TExecPlanFragmentParams` produced by
 /// `build_exec_plan_fragment_params`.
+struct RootFragmentOutput {
+    chunks: Vec<Chunk>,
+    profiler: Option<Profiler>,
+}
+
 fn run_root_fragment_in_process(
     params: internal_service::TExecPlanFragmentParams,
-) -> Result<Vec<Chunk>, String> {
+) -> Result<RootFragmentOutput, String> {
     use crate::exec::expr::ExprArena;
 
     let fragment = params
@@ -862,6 +905,15 @@ fn run_root_fragment_in_process(
 
     let desc_tbl = params.desc_tbl.as_ref();
     let query_opts = params.query_options.as_ref();
+    let profile_name = plan
+        .nodes
+        .first()
+        .map(|node| format!("execute_fragment (plan_node_id={})", node.node_id))
+        .unwrap_or_else(|| "execute_fragment".to_string());
+    let profiler = query_opts
+        .and_then(|opts| opts.enable_profile)
+        .unwrap_or(false)
+        .then(|| Profiler::new(profile_name));
 
     let mut tuple_slots = build_tuple_slot_order(desc_tbl);
     reorder_tuple_slots(&mut tuple_slots, desc_tbl);
@@ -869,22 +921,25 @@ fn run_root_fragment_in_process(
 
     let mut arena = ExprArena::default();
     let connectors = crate::connector::ConnectorRegistry::default();
-    let lowered = lower_plan(
-        plan,
-        &mut arena,
-        &tuple_slots,
-        desc_tbl,
-        None, // query_global_dicts
-        None, // query_global_dict_exprs
-        Some(exec_p),
-        query_opts,
-        None, // db_name
-        &connectors,
-        &layout_hints,
-        None, // last_query_id
-        None, // fe_addr
-        None, // iceberg_catalogs
-    )?;
+    let lowered = {
+        let _lower_timer = profiler.as_ref().map(|p| p.scoped_timer("LowerPlanTime"));
+        lower_plan(
+            plan,
+            &mut arena,
+            &tuple_slots,
+            desc_tbl,
+            None, // query_global_dicts
+            None, // query_global_dict_exprs
+            Some(exec_p),
+            query_opts,
+            None, // db_name
+            &connectors,
+            &layout_hints,
+            None, // last_query_id
+            None, // fe_addr
+            None, // iceberg_catalogs
+        )?
+    };
 
     let mut exec_plan = ExecPlan {
         arena,
@@ -926,13 +981,16 @@ fn run_root_fragment_in_process(
 
     let dop = resolve_root_pipeline_dop(&params);
 
+    let _exec_timer = profiler
+        .as_ref()
+        .map(|p| p.scoped_timer("PipelineExecuteTime"));
     execute_plan_with_pipeline(
         exec_plan,
         false,
         Duration::from_millis(10),
         Box::new(ResultSinkFactory::new(handle.clone())),
         exchange_finst_id,
-        None, // profiler
+        profiler.clone(),
         dop,
         runtime_state,
         query_id,
@@ -940,7 +998,10 @@ fn run_root_fragment_in_process(
         backend_num,
     )?;
 
-    Ok(handle.take_chunks())
+    Ok(RootFragmentOutput {
+        chunks: handle.take_chunks(),
+        profiler,
+    })
 }
 
 fn finish_root_fragment_in_process<F>(
@@ -949,10 +1010,13 @@ fn finish_root_fragment_in_process<F>(
     slot: Arc<RootSlot>,
     run: F,
 ) where
-    F: FnOnce() -> Result<Vec<Chunk>, String>,
+    F: FnOnce() -> Result<RootFragmentOutput, String>,
 {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
-        Ok(Ok(chunks)) => slot.set_done(chunks),
+        Ok(Ok(output)) => {
+            record_fragment_profiler(&state, finst_key, output.profiler);
+            slot.set_done(output.chunks);
+        }
         Ok(Err(msg)) => {
             warn!("{}", format_fragment_error(finst_key, &msg));
             cancel_all_submitted(&state);
