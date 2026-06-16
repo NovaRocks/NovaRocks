@@ -3469,6 +3469,19 @@ pub(crate) fn execute_query_as_iceberg_write(
     query_opts: Option<crate::internal_service::TQueryOptions>,
     root_distribution_resolver: Option<IcebergWriteRootDistributionResolver>,
 ) -> Result<crate::runtime::coordinator::CoordinatedQueryResult, String> {
+    // Time-travel: a branch DML write's scan carries `FOR VERSION AS OF '<branch>'`
+    // (delete_flow's DV position scan; the MOR-UPDATE branch row scan). Resolve those
+    // version-bearing refs to synthetic per-snapshot tables bound to the BRANCH head
+    // BEFORE snapshotting the catalog, exactly as the read path does. Without this the
+    // analyzer silently drops the version clause and the scan reads the table's current
+    // (main) snapshot, so a branch DELETE/UPDATE finds rows in the wrong data files and
+    // no-ops on the branch. No-op when the query has no version ref (INSERT / main
+    // writes), so those paths are unchanged.
+    let mut prepared = query.clone();
+    if has_time_travel_refs(&prepared) {
+        rewrite_time_travel_refs(state, current_catalog, current_database, &mut prepared)?;
+    }
+
     let exchange_port = if state.exchange_port == 0 {
         ensure_standalone_exchange_server()?
     } else {
@@ -3494,7 +3507,7 @@ pub(crate) fn execute_query_as_iceberg_write(
     );
 
     let (resolved, cte_registry, mut factory) =
-        crate::sql::analyzer::analyze(query, &analyzer_provider, current_database)?;
+        crate::sql::analyzer::analyze(&prepared, &analyzer_provider, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
     let table_stats = build_table_stats_from_plan(&logical);
     let root_distribution = match root_distribution_resolver {
