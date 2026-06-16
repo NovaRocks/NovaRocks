@@ -2,12 +2,21 @@
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::Arc;
 
     use arrow::datatypes::DataType;
+    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
     use crate::connector::iceberg::IcebergMetadataTableType;
     use crate::connector::{ConnectorRegistry, iceberg::IcebergConnectorScanPlanner};
+    use crate::meta::repository::mv::StoredMvDefinition;
+    use crate::meta::repository::mv_contract::{
+        AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
+        ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
+        ExpressionLineage, HiddenApplyKeyContract, MvSchemaContract, OutputColumnLineage,
+        OutputContract, TargetContract, TargetVisibleColumn,
+    };
     use crate::sql::analysis::{
         BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, SortItem, TypedExpr,
     };
@@ -17,18 +26,19 @@ mod tests {
     };
     use crate::sql::codegen::fragment_builder::PlanFragmentBuilder;
     use crate::sql::codegen::{
-        FragmentBuildResult, FragmentEdge, FragmentEdgeKind, MultiFragmentBuildResult,
-        OutputColumn as CodegenOutputColumn, RuntimeFilterPlanResult,
+        AggregateStateTargetPositionLocator, DirectExecPlan, FragmentBuildResult, FragmentEdge,
+        FragmentEdgeKind, MultiFragmentBuildResult, OutputColumn as CodegenOutputColumn,
+        PlanBuildResult, RuntimeFilterPlanResult,
     };
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
-        AggMode, JoinDistribution, Operator, PhysicalAssertOneRowOp, PhysicalCTEAnchorOp,
-        PhysicalCTEConsumeOp, PhysicalCTEProduceOp, PhysicalDecodeOp, PhysicalDistributionOp,
-        PhysicalExceptOp, PhysicalFilterOp, PhysicalGenerateSeriesOp, PhysicalHashAggregateOp,
-        PhysicalHashJoinEqCondition, PhysicalHashJoinOp, PhysicalIntersectOp, PhysicalLimitOp,
-        PhysicalNestLoopJoinOp, PhysicalProjectOp, PhysicalRepeatOp, PhysicalScanOp,
-        PhysicalSortOp, PhysicalTableFunctionOp, PhysicalTopNOp, PhysicalUnionOp, PhysicalValuesOp,
-        PhysicalWindowOp, ScanDictionaryColumn, TopNPhase,
+        AggMode, AggregateStateMergeOp, JoinDistribution, Operator, PhysicalAssertOneRowOp,
+        PhysicalCTEAnchorOp, PhysicalCTEConsumeOp, PhysicalCTEProduceOp, PhysicalDecodeOp,
+        PhysicalDistributionOp, PhysicalExceptOp, PhysicalFilterOp, PhysicalGenerateSeriesOp,
+        PhysicalHashAggregateOp, PhysicalHashJoinEqCondition, PhysicalHashJoinOp,
+        PhysicalIntersectOp, PhysicalLimitOp, PhysicalNestLoopJoinOp, PhysicalProjectOp,
+        PhysicalRepeatOp, PhysicalScanOp, PhysicalSortOp, PhysicalTableFunctionOp, PhysicalTopNOp,
+        PhysicalUnionOp, PhysicalValuesOp, PhysicalWindowOp, ScanDictionaryColumn, TopNPhase,
     };
     use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, PlanExecutionProps};
     use crate::sql::optimizer::property::DistributionSpec;
@@ -488,6 +498,109 @@ mod tests {
         assert_multi_fragment_equivalent("iceberg_data_file_scan_ranges", &direct, &distributed);
     }
 
+    #[test]
+    fn aggregate_state_merge_direct_exec_matches_ir_builder() {
+        let ctx = aggregate_refresh_context_for_test();
+        // No stable pseudo-scan fixture lives in this harness yet: the local
+        // refresh context has no base catalog entries, and pseudo-scan lowering
+        // needs a loaded refresh catalog/table fixture. This still exercises
+        // mv_refresh_ctx through both direct-exec aggregate refresh paths.
+        let plan = aggregate_state_merge_plan_for_context(&ctx);
+        let (direct, distributed) = build_both_paths_with_mv_refresh_ctx(
+            "aggregate_state_merge_direct_exec",
+            plan,
+            &ConnectorRegistry::new(),
+            Some(&ctx),
+        );
+
+        assert_multi_fragment_equivalent(
+            "aggregate_state_merge_direct_exec",
+            &direct,
+            &distributed,
+        );
+    }
+
+    #[test]
+    fn branch_union_aggregate_direct_exec_matches_ir_builder() {
+        let ctx = aggregate_refresh_context_for_test();
+        let state_names = aggregate_state_names_for_context(&ctx);
+        let branch0 = branch_union_project_for_test(
+            aggregate_merge_plan_for_test(
+                values_plan_for_columns(aggregate_physical_columns_for_test()),
+                values_plan_for_columns(aggregate_delta_state_columns_for_test()),
+                state_names.clone(),
+            ),
+            0,
+            1000,
+        );
+        let branch1 = branch_union_project_for_test(
+            aggregate_merge_plan_for_test(
+                values_plan_for_columns(aggregate_physical_columns_for_test()),
+                values_plan_for_columns(aggregate_delta_state_columns_for_test()),
+                state_names,
+            ),
+            1,
+            1100,
+        );
+        let output_columns = branch0.output_columns.clone();
+        let plan = physical_node(
+            Operator::PhysicalUnion(PhysicalUnionOp {
+                all: true,
+                output_columns: output_columns.clone(),
+                child_output_columns: vec![
+                    branch0.output_columns.clone(),
+                    branch1.output_columns.clone(),
+                ],
+            }),
+            vec![branch0, branch1],
+            output_columns,
+        );
+        let (direct, distributed) = build_both_paths_with_mv_refresh_ctx(
+            "branch_union_aggregate_direct_exec",
+            plan,
+            &ConnectorRegistry::new(),
+            Some(&ctx),
+        );
+
+        assert_multi_fragment_equivalent(
+            "branch_union_aggregate_direct_exec",
+            &direct,
+            &distributed,
+        );
+    }
+
+    #[test]
+    fn iceberg_sink_matches_ir_builder() {
+        let plan = values_plan_for_columns(vec![output_col(1, "id", DataType::Int32, false)]);
+        let connectors = ConnectorRegistry::new();
+        let mut sink_spec =
+            crate::sql::codegen::iceberg_write_sink::test_support::simple_sink_spec();
+        sink_spec.iceberg.serialized_metadata = Some(
+            crate::sql::codegen::iceberg_write_sink::test_support::single_bucket_partition_metadata_json(),
+        );
+        let catalog = DummyCatalog;
+        let direct = PlanFragmentBuilder::build_with_iceberg_sink(
+            &plan,
+            &catalog,
+            &connectors,
+            "test_db",
+            None,
+            &sink_spec,
+        )
+        .expect("direct iceberg sink build");
+        let distributed = PlanFragmentBuilder::build_via_distributed_plan_with_iceberg_sink(
+            &plan,
+            &catalog,
+            &connectors,
+            "test_db",
+            None,
+            &sink_spec,
+        )
+        .expect("DistributedPlan iceberg sink build");
+
+        assert_multi_fragment_equivalent("iceberg_sink", &direct, &distributed);
+    }
+
     fn assert_distributed_plan_equivalent(case_name: &str, plan: PhysicalPlanNode) {
         let connectors = ConnectorRegistry::new();
         let (direct, distributed) = build_both_paths(case_name, plan, &connectors);
@@ -520,6 +633,33 @@ mod tests {
             &catalog,
             &connectors,
             "test_db",
+        )
+        .unwrap_or_else(|err| panic!("{case_name}: DistributedPlan build failed: {err}"));
+
+        (direct, distributed)
+    }
+
+    fn build_both_paths_with_mv_refresh_ctx(
+        case_name: &str,
+        plan: PhysicalPlanNode,
+        connectors: &ConnectorRegistry,
+        mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+    ) -> (MultiFragmentBuildResult, MultiFragmentBuildResult) {
+        let catalog = DummyCatalog;
+        let direct = PlanFragmentBuilder::build_with_mv_refresh_ctx(
+            &plan,
+            &catalog,
+            &connectors,
+            "test_db",
+            mv_refresh_ctx,
+        )
+        .unwrap_or_else(|err| panic!("{case_name}: direct build failed: {err}"));
+        let distributed = PlanFragmentBuilder::build_via_distributed_plan_with_mv_refresh_ctx(
+            &plan,
+            &catalog,
+            &connectors,
+            "test_db",
+            mv_refresh_ctx,
         )
         .unwrap_or_else(|err| panic!("{case_name}: DistributedPlan build failed: {err}"));
 
@@ -629,10 +769,7 @@ mod tests {
             &direct.output_columns,
             &distributed.output_columns,
         );
-        assert!(
-            direct.direct_exec.is_none() && distributed.direct_exec.is_none(),
-            "{case_name}: scan/filter/project root fragments should not use direct exec"
-        );
+        assert_direct_exec_eq(case_name, &direct.direct_exec, &distributed.direct_exec);
         assert_eq!(
             direct.boundary_schemas, distributed.boundary_schemas,
             "{case_name}: fragment boundary schemas"
@@ -650,6 +787,221 @@ mod tests {
             direct.query_global_dict_exprs, distributed.query_global_dict_exprs,
             "{case_name}: query global dict exprs"
         );
+    }
+
+    fn assert_direct_exec_eq(
+        case_name: &str,
+        direct: &Option<Box<DirectExecPlan>>,
+        distributed: &Option<Box<DirectExecPlan>>,
+    ) {
+        match (direct.as_deref(), distributed.as_deref()) {
+            (None, None) => {}
+            (Some(direct), Some(distributed)) => {
+                assert_direct_exec_plan_eq(case_name, direct, distributed)
+            }
+            _ => panic!("{case_name}: direct_exec presence mismatch"),
+        }
+    }
+
+    fn assert_direct_exec_plan_eq(
+        case_name: &str,
+        direct: &DirectExecPlan,
+        distributed: &DirectExecPlan,
+    ) {
+        match (direct, distributed) {
+            (
+                DirectExecPlan::AggregateStateMerge {
+                    old_input: direct_old,
+                    delta_input: direct_delta,
+                    layout: direct_layout,
+                    branch_id: direct_branch_id,
+                    pruning_limits: direct_pruning_limits,
+                    target_position_locator: direct_locator,
+                },
+                DirectExecPlan::AggregateStateMerge {
+                    old_input: distributed_old,
+                    delta_input: distributed_delta,
+                    layout: distributed_layout,
+                    branch_id: distributed_branch_id,
+                    pruning_limits: distributed_pruning_limits,
+                    target_position_locator: distributed_locator,
+                },
+            ) => {
+                assert_plan_build_result_eq(
+                    &format!("{case_name}: aggregate merge old input"),
+                    direct_old,
+                    distributed_old,
+                );
+                assert_plan_build_result_eq(
+                    &format!("{case_name}: aggregate merge delta input"),
+                    direct_delta,
+                    distributed_delta,
+                );
+                assert_eq!(
+                    direct_layout, distributed_layout,
+                    "{case_name}: aggregate merge layout"
+                );
+                assert_eq!(
+                    direct_branch_id, distributed_branch_id,
+                    "{case_name}: aggregate merge branch_id"
+                );
+                assert_eq!(
+                    direct_pruning_limits, distributed_pruning_limits,
+                    "{case_name}: aggregate merge pruning limits"
+                );
+                assert_target_position_locator_eq(case_name, direct_locator, distributed_locator);
+            }
+            (
+                DirectExecPlan::AggregateStatePhysicalize {
+                    input: direct_input,
+                    layout: direct_layout,
+                },
+                DirectExecPlan::AggregateStatePhysicalize {
+                    input: distributed_input,
+                    layout: distributed_layout,
+                },
+            ) => {
+                assert_plan_build_result_eq(
+                    &format!("{case_name}: aggregate physicalize input"),
+                    direct_input,
+                    distributed_input,
+                );
+                assert_eq!(
+                    direct_layout, distributed_layout,
+                    "{case_name}: aggregate physicalize layout"
+                );
+            }
+            (
+                DirectExecPlan::UnionAll {
+                    inputs: direct_inputs,
+                },
+                DirectExecPlan::UnionAll {
+                    inputs: distributed_inputs,
+                },
+            ) => {
+                assert_eq!(
+                    direct_inputs.len(),
+                    distributed_inputs.len(),
+                    "{case_name}: direct union input count"
+                );
+                for (idx, (direct_input, distributed_input)) in direct_inputs
+                    .iter()
+                    .zip(distributed_inputs.iter())
+                    .enumerate()
+                {
+                    assert_plan_build_result_eq(
+                        &format!("{case_name}: direct union input {idx}"),
+                        direct_input,
+                        distributed_input,
+                    );
+                }
+            }
+            _ => panic!("{case_name}: direct_exec variant mismatch"),
+        }
+    }
+
+    fn assert_plan_build_result_eq(
+        case_name: &str,
+        direct: &PlanBuildResult,
+        distributed: &PlanBuildResult,
+    ) {
+        assert_eq!(direct.plan, distributed.plan, "{case_name}: plan");
+        assert_eq!(
+            direct.desc_tbl, distributed.desc_tbl,
+            "{case_name}: descriptor table"
+        );
+        assert_eq!(
+            direct.exec_params, distributed.exec_params,
+            "{case_name}: exec params"
+        );
+        assert_output_columns_eq(
+            case_name,
+            &direct.output_columns,
+            &distributed.output_columns,
+        );
+        assert_direct_exec_eq(case_name, &direct.direct_exec, &distributed.direct_exec);
+        assert_eq!(
+            direct.boundary_schemas, distributed.boundary_schemas,
+            "{case_name}: boundary schemas"
+        );
+        assert_eq!(
+            direct.query_global_dicts, distributed.query_global_dicts,
+            "{case_name}: query global dicts"
+        );
+        assert_eq!(
+            direct.query_global_dict_exprs, distributed.query_global_dict_exprs,
+            "{case_name}: query global dict exprs"
+        );
+    }
+
+    fn assert_target_position_locator_eq(
+        case_name: &str,
+        direct: &Option<AggregateStateTargetPositionLocator>,
+        distributed: &Option<AggregateStateTargetPositionLocator>,
+    ) {
+        match (direct, distributed) {
+            (None, None) => {}
+            (Some(direct), Some(distributed)) => {
+                assert_eq!(
+                    direct.target_entry.kind, distributed.target_entry.kind,
+                    "{case_name}: target locator catalog kind"
+                );
+                assert_eq!(
+                    direct.target_entry.warehouse_uri, distributed.target_entry.warehouse_uri,
+                    "{case_name}: target locator warehouse uri"
+                );
+                assert_eq!(
+                    direct.target_entry.rest_uri, distributed.target_entry.rest_uri,
+                    "{case_name}: target locator REST uri"
+                );
+                assert_eq!(
+                    direct.target_entry.hms_uris, distributed.target_entry.hms_uris,
+                    "{case_name}: target locator HMS uris"
+                );
+                assert_eq!(
+                    direct.target_entry.properties, distributed.target_entry.properties,
+                    "{case_name}: target locator catalog properties"
+                );
+                assert_eq!(
+                    direct.target_entry.warehouse_path, distributed.target_entry.warehouse_path,
+                    "{case_name}: target locator warehouse path"
+                );
+                assert_eq!(
+                    direct.target_table.identifier().to_string(),
+                    distributed.target_table.identifier().to_string(),
+                    "{case_name}: target locator table identifier"
+                );
+                assert_eq!(
+                    direct.target_table.metadata().uuid(),
+                    distributed.target_table.metadata().uuid(),
+                    "{case_name}: target locator table uuid"
+                );
+                assert_eq!(
+                    direct.target_table.metadata().location(),
+                    distributed.target_table.metadata().location(),
+                    "{case_name}: target locator table location"
+                );
+                assert_eq!(
+                    direct.target_table.metadata().current_snapshot_id(),
+                    distributed.target_table.metadata().current_snapshot_id(),
+                    "{case_name}: target locator table snapshot"
+                );
+                assert_eq!(
+                    direct.target_table.metadata().current_schema(),
+                    distributed.target_table.metadata().current_schema(),
+                    "{case_name}: target locator table schema"
+                );
+                assert_eq!(
+                    direct.partition_filter, distributed.partition_filter,
+                    "{case_name}: target locator partition filter"
+                );
+                assert_eq!(
+                    direct.apply_key_column, distributed.apply_key_column,
+                    "{case_name}: target locator apply key column"
+                );
+            }
+            _ => panic!("{case_name}: target_position_locator presence mismatch"),
+        }
     }
 
     fn assert_output_columns_eq(
@@ -814,6 +1166,403 @@ mod tests {
             vec![],
             vec![k, v],
         )
+    }
+
+    fn values_plan_for_columns(columns: Vec<OutputColumn>) -> PhysicalPlanNode {
+        physical_node(
+            Operator::PhysicalValues(PhysicalValuesOp {
+                rows: Vec::new(),
+                columns: columns.clone(),
+            }),
+            Vec::new(),
+            columns,
+        )
+    }
+
+    fn aggregate_state_names_for_context(
+        ctx: &crate::engine::mv::refresh_context::IcebergMvRefreshContext,
+    ) -> Vec<String> {
+        ctx.rewrite
+            .aggregate_shape_and_layout_for_execution()
+            .expect("aggregate layout")
+            .1
+            .state_columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect()
+    }
+
+    fn aggregate_state_merge_plan_for_context(
+        ctx: &crate::engine::mv::refresh_context::IcebergMvRefreshContext,
+    ) -> PhysicalPlanNode {
+        aggregate_merge_plan_for_test(
+            values_plan_for_columns(aggregate_physical_columns_for_test()),
+            values_plan_for_columns(aggregate_delta_state_columns_for_test()),
+            aggregate_state_names_for_context(ctx),
+        )
+    }
+
+    fn aggregate_merge_plan_for_test(
+        old_child: PhysicalPlanNode,
+        delta_child: PhysicalPlanNode,
+        aggregate_state_names: Vec<String>,
+    ) -> PhysicalPlanNode {
+        let output_columns = vec![
+            output_col(1, "region", DataType::Utf8, true),
+            output_col(2, "c", DataType::Int64, false),
+            output_col(3, "s", DataType::Int64, true),
+            output_col(4, "__change_op", DataType::Int8, false),
+        ];
+        physical_node(
+            Operator::PhysicalAggregateStateMerge(AggregateStateMergeOp {
+                group_key_names: vec!["region".to_string()],
+                aggregate_state_names,
+                change_op_column: crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
+                output_columns: output_columns.clone(),
+            }),
+            vec![old_child, delta_child],
+            output_columns,
+        )
+    }
+
+    fn aggregate_physical_columns_for_test() -> Vec<OutputColumn> {
+        vec![
+            output_col(10, "__row_id__", DataType::Utf8, false),
+            output_col(11, "region", DataType::Utf8, true),
+            output_col(12, "c", DataType::Int64, false),
+            output_col(13, "s", DataType::Int64, true),
+            output_col(14, "__agg_state_c", DataType::Binary, false),
+            output_col(15, "__agg_state_s", DataType::Binary, false),
+        ]
+    }
+
+    fn aggregate_delta_state_columns_for_test() -> Vec<OutputColumn> {
+        vec![
+            output_col(21, "region", DataType::Utf8, true),
+            output_col(22, "__agg_state_c", DataType::Binary, false),
+            output_col(23, "__agg_state_s", DataType::Binary, false),
+        ]
+    }
+
+    fn branch_union_project_for_test(
+        merge: PhysicalPlanNode,
+        branch_id: i32,
+        output_id_base: u32,
+    ) -> PhysicalPlanNode {
+        let mut items = merge
+            .output_columns
+            .iter()
+            .enumerate()
+            .map(|(idx, column)| ProjectItem {
+                expr: TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        column_id: column.column_id,
+                        qualifier: None,
+                        column: column.name.clone(),
+                    },
+                    data_type: column.data_type.clone(),
+                    nullable: column.nullable,
+                },
+                output_name: column.name.clone(),
+                output_column_id: ColumnId::new_for_test(output_id_base + idx as u32),
+            })
+            .collect::<Vec<_>>();
+        let branch_column_id = ColumnId::new_for_test(output_id_base + items.len() as u32);
+        items.push(ProjectItem {
+            expr: TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Int(branch_id as i64)),
+                data_type: DataType::Int32,
+                nullable: false,
+            },
+            output_name: crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN
+                .to_string(),
+            output_column_id: branch_column_id,
+        });
+        let output_columns = items
+            .iter()
+            .map(|item| OutputColumn {
+                column_id: item.output_column_id,
+                name: item.output_name.clone(),
+                data_type: item.expr.data_type.clone(),
+                nullable: item.expr.nullable,
+                is_internal: false,
+            })
+            .collect::<Vec<_>>();
+        physical_node(
+            Operator::PhysicalProject(PhysicalProjectOp {
+                items,
+                output_qualifier: None,
+            }),
+            vec![merge],
+            output_columns,
+        )
+    }
+
+    fn aggregate_refresh_context_for_test()
+    -> crate::engine::mv::refresh_context::IcebergMvRefreshContext {
+        use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+        use iceberg::{CatalogBuilder, NamespaceIdent, TableIdent};
+
+        let target_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(7)
+                .with_fields(vec![
+                    Arc::new(NestedField::optional(
+                        100,
+                        "region",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                    Arc::new(NestedField::required(
+                        101,
+                        "c",
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                    Arc::new(NestedField::optional(
+                        102,
+                        "s",
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                    Arc::new(NestedField::required(
+                        999,
+                        "__row_id__",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                    Arc::new(NestedField::required(
+                        200,
+                        "__agg_state_c",
+                        Type::Primitive(PrimitiveType::Binary),
+                    )),
+                    Arc::new(NestedField::required(
+                        201,
+                        "__agg_state_s",
+                        Type::Primitive(PrimitiveType::Binary),
+                    )),
+                ])
+                .build()
+                .expect("aggregate target schema"),
+        );
+        let contract = MvSchemaContract {
+            contract_version: 3,
+            base: BaseContract {
+                table_fqn: "ice.ns.orders".to_string(),
+                table_uuid: "uuid-orders".to_string(),
+                alias_at_create: None,
+                schema_id_at_create: 0,
+                schema_at_create: BaseSchemaSnapshot {
+                    fields: vec![
+                        BaseFieldRecord {
+                            field_id: 1,
+                            name_at_create: "region".to_string(),
+                            type_signature: "string".to_string(),
+                            required: false,
+                        },
+                        BaseFieldRecord {
+                            field_id: 2,
+                            name_at_create: "amount".to_string(),
+                            type_signature: "long".to_string(),
+                            required: false,
+                        },
+                    ],
+                },
+            },
+            bases: Vec::new(),
+            output: OutputContract {
+                columns: vec![
+                    OutputColumnLineage {
+                        expression: ExpressionLineage {
+                            kind: ExpressionKind::Column,
+                            referenced_base_field_ids: vec![1],
+                            referenced_base_fields: Vec::new(),
+                        },
+                    },
+                    OutputColumnLineage {
+                        expression: ExpressionLineage {
+                            kind: ExpressionKind::Func,
+                            referenced_base_field_ids: Vec::new(),
+                            referenced_base_fields: Vec::new(),
+                        },
+                    },
+                    OutputColumnLineage {
+                        expression: ExpressionLineage {
+                            kind: ExpressionKind::Func,
+                            referenced_base_field_ids: vec![2],
+                            referenced_base_fields: Vec::new(),
+                        },
+                    },
+                ],
+                filter: None,
+            },
+            join: None,
+            aggregate: Some(AggregateStateContract {
+                state_layout_version: 1,
+                row_id_column_name: "__row_id__".to_string(),
+                state_columns: vec![
+                    AggregateStateColumnContract {
+                        column_name: "__agg_state_c".to_string(),
+                        target_field_id: 200,
+                        type_signature: "binary".to_string(),
+                        nullable: false,
+                        role: AggregateStateRoleContract::Single,
+                    },
+                    AggregateStateColumnContract {
+                        column_name: "__agg_state_s".to_string(),
+                        target_field_id: 201,
+                        type_signature: "binary".to_string(),
+                        nullable: false,
+                        role: AggregateStateRoleContract::Single,
+                    },
+                ],
+            }),
+            branch: None,
+            target: TargetContract {
+                table_fqn: "tgt.ns.orders_mv".to_string(),
+                table_uuid: "uuid-target".to_string(),
+                schema_id_at_create: 7,
+                visible_columns: vec![
+                    TargetVisibleColumn {
+                        output_name: "region".to_string(),
+                        target_field_id: 100,
+                        type_signature: "string".to_string(),
+                        nullable: true,
+                    },
+                    TargetVisibleColumn {
+                        output_name: "c".to_string(),
+                        target_field_id: 101,
+                        type_signature: "long".to_string(),
+                        nullable: false,
+                    },
+                    TargetVisibleColumn {
+                        output_name: "s".to_string(),
+                        target_field_id: 102,
+                        type_signature: "long".to_string(),
+                        nullable: true,
+                    },
+                ],
+                hidden_apply_key: HiddenApplyKeyContract {
+                    column_name: "__row_id__".to_string(),
+                    target_field_id: 999,
+                    source: ApplyKeySource::GroupRowId,
+                },
+                partition: None,
+            },
+        };
+        let mv_definition = StoredMvDefinition {
+            mv_id: 42,
+            select_sql:
+                "select region, count(*) as c, sum(amount) as s from ice.ns.orders group by region"
+                    .to_string(),
+            base_table_refs: vec!["ice.ns.orders".to_string()],
+            primary_key_columns: vec!["__row_id__".to_string()],
+            storage_engine: "iceberg".to_string(),
+            target_catalog: Some("tgt".to_string()),
+            target_namespace: Some("ns".to_string()),
+            target_table: Some("orders_mv".to_string()),
+            schema_contract: Some(contract.clone()),
+            partition_spec: None,
+            partition_state_complete: false,
+            last_refresh_ms: None,
+            last_refresh_rows: None,
+            last_refresh_snapshots: [("ice.ns.orders".to_string(), 11i64)].into_iter().collect(),
+            last_refresh_table_uuids: [("ice.ns.orders".to_string(), "uuid-orders".to_string())]
+                .into_iter()
+                .collect(),
+            last_refreshed_iceberg_snapshot_id: Some(99),
+            refresh_in_progress: false,
+            active_refresh_id: None,
+            refresh_target_snapshots: Default::default(),
+            refresh_policy: Default::default(),
+            refresh_paused: false,
+            refresh_interval_ms: None,
+            max_staleness_ms: None,
+            last_scheduler_error: None,
+            next_refresh_after_ms: None,
+            created_at_ms: 0,
+        };
+        let query = Arc::new(
+            crate::engine::mv::refresh_context::tests_support::parse_query(
+                "select region, count(*) as c, sum(amount) as s from ice.ns.orders group by region",
+            ),
+        );
+        let base_refs: Arc<[crate::connector::starrocks::table::model::IcebergTableRef]> =
+            Arc::from(vec![
+                crate::engine::mv::refresh_context::tests_support::make_ref("ice", "ns", "orders"),
+            ]);
+        let pin = Arc::new(crate::engine::mv::refresh_context::tests_support::make_pin(
+            &[("ice.ns.orders", 22, "uuid-orders")],
+        ));
+        let rewrite = Arc::new(
+            crate::engine::mv::refresh_context::IcebergMvRewriteContext::from_parts(
+                crate::engine::mv::iceberg_refresh::IcebergMvTarget {
+                    catalog: "tgt".to_string(),
+                    namespace: "ns".to_string(),
+                    table: "orders_mv".to_string(),
+                },
+                42,
+                Some("sess_cat".to_string()),
+                "sess_db".to_string(),
+                Arc::new(mv_definition),
+                query,
+                base_refs,
+                pin,
+                Some(99),
+                "uuid-target".to_string(),
+                target_schema.clone(),
+                Some(Arc::new(contract)),
+            )
+            .expect("aggregate rewrite context"),
+        );
+        let warehouse = format!("memory://equiv-{}", uuid::Uuid::new_v4());
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let iceberg_catalog: Arc<dyn iceberg::Catalog> = Arc::new(
+            runtime
+                .block_on(MemoryCatalogBuilder::default().load(
+                    "memory",
+                    HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse.clone())]),
+                ))
+                .expect("memory catalog"),
+        );
+        let target_entry = Arc::new(
+            crate::connector::iceberg::catalog::registry::build_catalog_entry(
+                "tgt",
+                &[
+                    ("iceberg.catalog.type".to_string(), "memory".to_string()),
+                    ("iceberg.catalog.warehouse".to_string(), warehouse),
+                ],
+            )
+            .expect("target entry"),
+        );
+        let metadata = iceberg::spec::TableMetadataBuilder::new(
+            target_schema.as_ref().clone(),
+            iceberg::spec::PartitionSpec::unpartition_spec().into_unbound(),
+            iceberg::spec::SortOrder::unsorted_order(),
+            "memory://target/orders_mv".to_string(),
+            iceberg::spec::FormatVersion::V3,
+            HashMap::new(),
+        )
+        .expect("metadata builder")
+        .build()
+        .expect("metadata")
+        .metadata;
+        let target_table = iceberg::table::Table::builder()
+            .file_io(iceberg::io::FileIO::new_with_memory())
+            .metadata(metadata)
+            .identifier(TableIdent::new(
+                NamespaceIdent::new("ns".to_string()),
+                "orders_mv".to_string(),
+            ))
+            .build()
+            .expect("target table");
+
+        crate::engine::mv::refresh_context::IcebergMvRefreshContext {
+            rewrite,
+            target_entry,
+            base_catalog_entries: BTreeMap::new(),
+            iceberg_catalog,
+            target_table,
+            affected_partitions:
+                crate::engine::mv::partition::AffectedTargetPartitions::not_derived("test context"),
+            pruning_limits: crate::engine::mv::refresh_context::MvRefreshPruningLimits::default(),
+        }
     }
 
     fn filter_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
