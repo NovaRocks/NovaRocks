@@ -1,0 +1,14 @@
+-- query 2
+id	v
+1	a
+2	b
+3	c
+
+-- query 4
+id	v
+1	a
+3	c
+
+-- query 5
+row_ids_unique
+1
