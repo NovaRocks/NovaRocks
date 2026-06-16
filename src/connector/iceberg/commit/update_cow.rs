@@ -47,12 +47,18 @@ use super::overwrite::{write_added_data_manifest, write_overwrite_deletes_manife
 use super::types::{CommitOutcome, WrittenFile};
 use crate::connector::iceberg::stats_assembler::CommitType;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+// `Eq` is intentionally omitted: `appended_files: Vec<WrittenFile>` and
+// `WrittenFile` is `PartialEq`-only (it carries stats fields not suited to `Eq`).
+#[derive(Clone, Debug, PartialEq)]
 pub struct CowUpdateRewriteSet {
     pub base_snapshot_id: i64,
     pub target_table_uuid: String,
     pub updated_row_ids: Vec<i64>,
     pub touched_data_files: Vec<CowUpdateTouchedFile>,
+    /// BE-written data files that are NET-NEW to this commit (e.g. a folded MERGE
+    /// not-matched INSERT), not tied to any rewritten `old_file`. Added to the same
+    /// Overwrite snapshot alongside the rewrite outputs. Empty for a pure UPDATE.
+    pub appended_files: Vec<WrittenFile>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -294,6 +300,41 @@ impl TransactionAction for CowUpdateTxnAction {
             new_manifests.push(mark_replacement_manifest_row_id_assigned(
                 data_manifest,
                 replacement_manifest_first_row_id(rewrite_file).map_err(to_iceberg_data_invalid)?,
+            ));
+        }
+
+        // Net-new appended data files (e.g. a folded MERGE not-matched INSERT)
+        // are added to the same Overwrite snapshot. They are tied to no touched
+        // `old_file`, so they remove nothing — only an added-data manifest is
+        // written. Like the rewrite outputs, the manifest is marked so the v3
+        // manifest-list writer does NOT allocate fresh row IDs, keeping the
+        // snapshot's row-lineage range unchanged.
+        if !self.rewrite.appended_files.is_empty() {
+            let appended_manifest_path = format!(
+                "{metadata_dir}/{}-cow-update-appended-0.avro",
+                self.commit_uuid
+            );
+            self.abort_handle
+                .record_manifest(appended_manifest_path.clone());
+            self.manifest_paths_out
+                .lock()
+                .expect("manifest_paths_out poisoned")
+                .push(appended_manifest_path.clone());
+            let appended_manifest = write_added_data_manifest(
+                &self.file_io,
+                &appended_manifest_path,
+                &self.rewrite.appended_files,
+                m.default_partition_spec().clone(),
+                m.current_schema().clone(),
+                new_seq,
+                new_snapshot_id,
+                format_version,
+            )
+            .await
+            .map_err(to_iceberg_unexpected)?;
+            new_manifests.push(mark_replacement_manifest_row_id_assigned(
+                appended_manifest,
+                row_lineage_first_row_id,
             ));
         }
 
@@ -693,6 +734,32 @@ fn validate_cow_update_inputs(
             "CowUpdateCommit rewrite updated_row_ids contains row id {row_id}, but touched files are missing touched row id {row_id}"
         ));
     }
+    // Appended files are net-new data files (e.g. a folded MERGE not-matched
+    // INSERT) that map to no `old_file`. They must be content==Data and must not
+    // collide with a rewrite replacement path; a file is either a rewrite output
+    // or net-new, never both.
+    let mut appended_paths = HashSet::new();
+    for appended in &rewrite.appended_files {
+        if appended.content != DataContentType::Data {
+            return Err(format!(
+                "CowUpdateCommit appended file {} has {:?} content; expected Data only",
+                appended.path, appended.content
+            ));
+        }
+        if !appended_paths.insert(appended.path.clone()) {
+            return Err(format!(
+                "CowUpdateCommit received duplicate appended data file {}",
+                appended.path
+            ));
+        }
+        if rewrite_new_files.contains(&appended.path) {
+            return Err(format!(
+                "CowUpdateCommit appended data file {} also appears as a rewrite replacement file",
+                appended.path
+            ));
+        }
+    }
+
     let written_files: HashSet<String> = written.iter().map(|f| f.path.clone()).collect();
     if written_files.len() != written.len() {
         return Err("CowUpdateCommit received duplicate replacement data file paths".to_string());
@@ -704,8 +771,17 @@ fn validate_cow_update_inputs(
             ));
         }
     }
+    for appended in &appended_paths {
+        if !written_files.contains(appended) {
+            return Err(format!(
+                "CowUpdateCommit appended data file {appended} was not written"
+            ));
+        }
+    }
+    // Every collected written file must be either a rewrite replacement output
+    // or a declared appended file; reject anything in neither set.
     for written_file in &written_files {
-        if !rewrite_new_files.contains(written_file) {
+        if !rewrite_new_files.contains(written_file) && !appended_paths.contains(written_file) {
             return Err(format!(
                 "CowUpdateCommit written data file {written_file} is missing from rewrite"
             ));
@@ -823,6 +899,73 @@ mod tests {
 
         validate_cow_update_inputs(&rewrite, &written, Some(7), "table-uuid")
             .expect("rewritten row ids may include unchanged rows");
+    }
+
+    /// M1: a COW MERGE folds a not-matched INSERT into the same Overwrite
+    /// snapshot. The rewrite carries one touched file (old → [new_rewrite])
+    /// PLUS one net-new appended INSERT data file that maps to no `old_file`.
+    /// The commit must remove only the touched old file and add BOTH the
+    /// rewritten file and the appended INSERT file. Validation must accept the
+    /// appended file even though it is not the replacement output of any
+    /// touched file.
+    #[test]
+    fn validate_cow_update_inputs_accepts_appended_insert_files() {
+        let mut rewrite = cow_rewrite();
+        rewrite.appended_files = vec![written_file("insert.parquet")];
+        // BE writes both the rewrite replacement output and the appended
+        // INSERT file; both arrive in the collected `written` set.
+        let written = vec![written_file("new.parquet"), written_file("insert.parquet")];
+
+        // Validation tolerates the appended file (written-but-not-a-rewrite-output).
+        validate_cow_update_inputs(&rewrite, &written, Some(7), "table-uuid")
+            .expect("appended INSERT files must be accepted by validation");
+
+        // Removed set = exactly the touched old file (appended files remove nothing).
+        let removed = touched_old_file_paths(&rewrite);
+        assert_eq!(
+            removed,
+            HashSet::from(["old.parquet".to_string()]),
+            "removed set must be exactly the touched old file"
+        );
+
+        // Added set = union(new_files) ∪ appended_files — contains BOTH the
+        // rewritten replacement file and the appended INSERT file.
+        let added: HashSet<String> = rewrite
+            .touched_data_files
+            .iter()
+            .flat_map(|f| f.new_files.iter().cloned())
+            .chain(rewrite.appended_files.iter().map(|f| f.path.clone()))
+            .collect();
+        assert!(
+            added.contains("new.parquet"),
+            "added set must contain the rewritten replacement file"
+        );
+        assert!(
+            added.contains("insert.parquet"),
+            "added set must contain the appended INSERT file"
+        );
+        assert!(
+            !added.contains("old.parquet"),
+            "the touched old file is removed, not added"
+        );
+    }
+
+    /// An appended file declared in `appended_files` but never actually written
+    /// by the BE is a contract violation — validation must reject it.
+    #[test]
+    fn validate_cow_update_inputs_rejects_undeclared_appended_file() {
+        let mut rewrite = cow_rewrite();
+        rewrite.appended_files = vec![written_file("insert.parquet")];
+        // Missing the appended file from the written set.
+        let written = vec![written_file("new.parquet")];
+
+        let err = validate_cow_update_inputs(&rewrite, &written, Some(7), "table-uuid")
+            .expect_err("appended file missing from written set must fail");
+
+        assert!(
+            err.contains("insert.parquet"),
+            "error must name the file: {err}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -986,6 +1129,7 @@ mod tests {
                 new_files: vec!["new.parquet".to_string()],
                 row_ids: vec![1],
             }],
+            appended_files: vec![],
         }
     }
 

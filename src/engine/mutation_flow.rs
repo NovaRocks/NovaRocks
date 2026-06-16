@@ -1597,6 +1597,9 @@ impl IcebergWriteTransactionExecutor for DistributedCowUpdateExecutor {
             target_table_uuid: write.target_table_uuid,
             updated_row_ids: write.updated_row_ids,
             touched_data_files,
+            // Pure UPDATE appends no net-new data files; only a folded MERGE
+            // not-matched INSERT (M3) populates this.
+            appended_files: Vec::new(),
         });
 
         Ok(CoordinatedQueryResult {
