@@ -6,7 +6,10 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::datatypes::DataType;
-    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+    use iceberg::spec::{
+        DataContentType, DataFileFormat, FormatVersion, NestedField, PrimitiveType, Schema, Struct,
+        Type,
+    };
 
     use crate::connector::iceberg::IcebergMetadataTableType;
     use crate::connector::{ConnectorRegistry, iceberg::IcebergConnectorScanPlanner};
@@ -540,6 +543,27 @@ mod tests {
             "target-state scan equivalence must exercise regular fragment build"
         );
         assert_multi_fragment_equivalent("mv_target_state_scan", &direct, &distributed);
+    }
+
+    #[test]
+    fn mv_version_scan_matches_ir_builder() {
+        let fixture = local_version_scan_fixture();
+        let mut ctx = scan_refresh_context_for_test();
+        ctx.base_catalog_entries = [("ice".to_string(), fixture.catalog_entry.clone())]
+            .into_iter()
+            .collect();
+        let plan = version_scan_plan_for_fixture(&fixture);
+        let mut connectors = ConnectorRegistry::new();
+        connectors.register_scan_planner(Arc::new(IcebergConnectorScanPlanner::new()));
+        let (direct, distributed) =
+            build_both_paths_with_mv_refresh_ctx("mv_version_scan", plan, &connectors, Some(&ctx));
+
+        let root = fragment_by_id("mv_version_scan direct", &direct, direct.root_fragment_id);
+        assert!(
+            root.direct_exec.is_none(),
+            "version scan equivalence must exercise regular fragment build"
+        );
+        assert_multi_fragment_equivalent("mv_version_scan", &direct, &distributed);
     }
 
     #[test]
@@ -1301,6 +1325,183 @@ mod tests {
             iceberg_row_lineage_metadata_columns: vec![],
             source: ScanSource::IcebergMvTargetState(scan),
         }
+    }
+
+    struct LocalVersionScanFixture {
+        _tmpdir: tempfile::TempDir,
+        catalog_entry: crate::connector::iceberg::catalog::registry::IcebergCatalogEntry,
+        table_info: IcebergTableInfo,
+        snapshot_id: i64,
+    }
+
+    fn local_version_scan_fixture() -> LocalVersionScanFixture {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            use crate::connector::iceberg::commit::{
+                CommitCtx, CommitOpKind, FastAppendCommit, IcebergCommitAction,
+                IcebergCommitCollector, WrittenFile,
+            };
+            use iceberg::{NamespaceIdent, TableCreation, TableIdent};
+
+            let tmpdir = tempfile::tempdir().expect("tempdir");
+            let warehouse_uri = format!("file://{}", tmpdir.path().display());
+            let file_io = iceberg::io::FileIO::new_with_fs();
+            let catalog: Arc<dyn iceberg::Catalog> = Arc::new(
+                crate::connector::iceberg::catalog::hadoop_catalog::HadoopFileSystemCatalog::new(
+                    file_io,
+                    warehouse_uri.clone(),
+                ),
+            );
+            let namespace = NamespaceIdent::new("ns".to_string());
+            catalog
+                .create_namespace(&namespace, HashMap::new())
+                .await
+                .expect("create namespace");
+            let schema = Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                ))])
+                .build()
+                .expect("base schema");
+            let table_ident = TableIdent::new(namespace.clone(), "version_base".to_string());
+            let mut table = catalog
+                .create_table(
+                    &namespace,
+                    TableCreation::builder()
+                        .name("version_base".to_string())
+                        .schema(schema)
+                        .format_version(FormatVersion::V3)
+                        .build(),
+                )
+                .await
+                .expect("create base table");
+
+            let table_location = table.metadata().location().to_string();
+            let metadata = table.metadata();
+            let collector = Arc::new(
+                IcebergCommitCollector::new(
+                    CommitOpKind::FastAppend,
+                    table_ident.clone(),
+                    metadata
+                        .current_snapshot()
+                        .map(|snapshot| snapshot.snapshot_id()),
+                    metadata.last_sequence_number(),
+                    metadata.current_schema().clone(),
+                    metadata.default_partition_spec().clone(),
+                    format!("{table_location}/staging"),
+                    crate::common::types::UniqueId { hi: 0, lo: 0 },
+                )
+                .with_table_metadata(metadata.clone()),
+            );
+            collector.inject_written_file(WrittenFile {
+                path: format!("{table_location}/data/file-0.parquet"),
+                format: DataFileFormat::Parquet,
+                content: DataContentType::Data,
+                partition_values: Struct::empty(),
+                partition_spec_id: 0,
+                record_count: 10,
+                file_size_in_bytes: 1024,
+                split_offsets: vec![],
+                column_sizes: HashMap::new(),
+                value_counts: HashMap::new(),
+                null_value_counts: HashMap::new(),
+                lower_bounds: HashMap::new(),
+                upper_bounds: HashMap::new(),
+                key_metadata: None,
+                referenced_data_file: None,
+                equality_ids: None,
+                first_row_id: None,
+                content_offset: None,
+                content_size_in_bytes: None,
+                cardinality: None,
+            });
+            let file_io = table.file_io().clone();
+            let abort_handle = collector.abort_log.clone();
+            let snapshot_properties = BTreeMap::new();
+            let ctx = CommitCtx {
+                collector: &collector,
+                table: &table,
+                catalog: catalog.as_ref(),
+                file_io: &file_io,
+                commit_uuid: uuid::Uuid::new_v4(),
+                abort_handle,
+                target_ref: "main",
+                snapshot_properties: &snapshot_properties,
+            };
+            FastAppendCommit
+                .commit(ctx)
+                .await
+                .expect("append synthetic data file");
+            table = catalog
+                .load_table(&table_ident)
+                .await
+                .expect("reload base table");
+            let snapshot_id = table
+                .metadata()
+                .current_snapshot()
+                .expect("current snapshot")
+                .snapshot_id();
+            let catalog_entry = crate::connector::iceberg::catalog::registry::build_catalog_entry(
+                "ice",
+                &[
+                    ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                    (
+                        "iceberg.catalog.warehouse".to_string(),
+                        warehouse_uri.clone(),
+                    ),
+                ],
+            )
+            .expect("base catalog entry");
+            let table_info = IcebergTableInfo {
+                catalog: "ice".to_string(),
+                namespace: "ns".to_string(),
+                table: "version_base".to_string(),
+                table_uuid: Some(table.metadata().uuid().to_string()),
+                current_snapshot_id: Some(snapshot_id),
+                schema_id: table.metadata().current_schema_id(),
+                location: table.metadata().location().to_string(),
+                schema: IcebergSchemaDef { fields: vec![] },
+                serialized_metadata: None,
+                serialized_metadata_rows: None,
+            };
+
+            LocalVersionScanFixture {
+                _tmpdir: tmpdir,
+                catalog_entry,
+                table_info,
+                snapshot_id,
+            }
+        })
+    }
+
+    fn version_scan_plan_for_fixture(fixture: &LocalVersionScanFixture) -> PhysicalPlanNode {
+        let id = output_col(120, "id", DataType::Int64, false);
+        physical_node(
+            Operator::PhysicalScan(PhysicalScanOp {
+                database: "ns".to_string(),
+                table: TableDef {
+                    name: fixture.table_info.table.clone(),
+                    columns: vec![column_def("id", DataType::Int64, false)],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: ScanSource::IcebergVersionTable {
+                        table: fixture.table_info.clone(),
+                        snapshot_id: fixture.snapshot_id,
+                    },
+                },
+                alias: Some("base".to_string()),
+                columns: vec![id.clone()],
+                predicates: vec![],
+                required_columns: Some(vec!["id".to_string()]),
+                dict_columns: vec![],
+                variant_columns: vec![],
+                mv_rewritten_from: None,
+            }),
+            vec![],
+            vec![id],
+        )
     }
 
     fn aggregate_merge_plan_for_test(
