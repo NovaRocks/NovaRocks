@@ -18,8 +18,7 @@ use crate::connector::iceberg::commit::{
 use crate::engine::write_transaction::{
     IcebergWriteCommitExecutor, IcebergWriteCommitPolicy, IcebergWriteSource,
     IcebergWriteTransactionExecutor, IcebergWriteTransactionRunner, IcebergWriteTransactionSpec,
-    IcebergWriteValidationPolicy, local_writer_commit_input, new_local_writer_write_id,
-    write_commit_has_files,
+    IcebergWriteValidationPolicy, write_commit_has_files,
 };
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOperationTarget};
@@ -1019,189 +1018,12 @@ fn run_mor_update_distributed_transaction(
     Ok(())
 }
 
-fn build_position_delete_groups_from_matched(
-    matched: &MatchedUpdateBatch,
-    referenced_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
-) -> Result<Vec<crate::connector::iceberg::commit::PositionDeleteGroup>, String> {
-    let mut by_file: BTreeMap<String, Vec<i64>> = BTreeMap::new();
-    for (path, pos) in matched.file_paths.iter().zip(matched.row_positions.iter()) {
-        by_file.entry(path.clone()).or_default().push(*pos);
-    }
-    let mut out = Vec::with_capacity(by_file.len());
-    for (file, positions) in by_file {
-        let partition = referenced_partitions.get(&file).ok_or_else(|| {
-            format!("matched iceberg data file `{file}` is missing partition metadata")
-        })?;
-        out.push(crate::connector::iceberg::commit::PositionDeleteGroup {
-            referenced_data_file: file,
-            partition_spec_id: partition.partition_spec_id,
-            partition_values: partition.partition_values.clone(),
-            positions,
-        });
-    }
-    Ok(out)
-}
-
-// Now fully orphaned: as of Phase 3 M2, MERGE matched-DELETE writes its deletion vector
-// on the BE (`DistributedMergeMatchedDeleteExecutor`, a `DeletionVectors` sink committed
-// via `RowDeltaDvFromFiles`), so nothing routes through `MutationWriteExecutor` anymore —
-// COW/MOR UPDATE are distributed too (`DistributedCowUpdateExecutor` /
-// `DistributedMorUpdateExecutor`). This enum + `MutationWriteExecutor` +
-// `build_position_delete_groups_from_matched` + `run_mutation_write_transaction` are kept
-// only until Phase 3 M5 deletes the coordinator-local MERGE cluster; do not build new
-// callers on them.
-enum MutationWritePlan {
-    MergeMatchedDelete { matched: MatchedUpdateBatch },
-}
-
-impl MutationWritePlan {
-    fn attempt_name(&self) -> &'static str {
-        match self {
-            Self::MergeMatchedDelete { .. } => "merge-delete",
-        }
-    }
-}
-
-struct MutationWriteExecutor {
-    commit_executor: IcebergWriteCommitExecutor,
-    table: iceberg::table::Table,
-    collector: Arc<IcebergCommitCollector>,
-    plan: Mutex<Option<MutationWritePlan>>,
-}
-
-impl IcebergWriteTransactionExecutor for MutationWriteExecutor {
-    fn run_coordinated_write(
-        &self,
-        _spec: &IcebergWriteTransactionSpec,
-    ) -> Result<CoordinatedQueryResult, String> {
-        let plan = self
-            .plan
-            .lock()
-            .expect("mutation write plan lock poisoned")
-            .take()
-            .ok_or_else(|| "mutation write plan was already consumed".to_string())?;
-        match plan {
-            MutationWritePlan::MergeMatchedDelete { matched } => {
-                if matched.row_ids.is_empty() {
-                    return Ok(no_mutation_write_result());
-                }
-                let referenced_partitions =
-                    crate::engine::delete_flow::load_referenced_data_file_partitions(&self.table)?;
-                let delete_groups =
-                    build_position_delete_groups_from_matched(&matched, &referenced_partitions)?;
-                for group in delete_groups {
-                    self.collector.inject_delete_group(group);
-                }
-            }
-        }
-        Ok(mutation_write_result(Vec::new()))
-    }
-
-    fn commit(
-        &self,
-        _spec: &IcebergWriteTransactionSpec,
-        write_commit: &WriteCommitInput,
-    ) -> Result<CommitOutcome, CommitServiceError> {
-        self.commit_executor.commit_write_input(write_commit)
-    }
-
-    fn finalize(&self, _spec: &IcebergWriteTransactionSpec) -> Result<(), String> {
-        self.commit_executor.finalize()
-    }
-
-    fn has_preloaded_commit_output(&self) -> bool {
-        self.collector.has_injected_written_files()
-    }
-}
-
 fn no_mutation_write_result() -> CoordinatedQueryResult {
     CoordinatedQueryResult {
         query_result: QueryResult::empty(),
         write_commit: None,
         write_abort: None,
     }
-}
-
-fn mutation_write_result(
-    sink_commit_infos: Vec<crate::types::TSinkCommitInfo>,
-) -> CoordinatedQueryResult {
-    CoordinatedQueryResult {
-        query_result: QueryResult::empty(),
-        write_commit: Some(local_writer_commit_input(
-            new_local_writer_write_id(),
-            sink_commit_infos,
-        )),
-        write_abort: None,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_mutation_write_transaction(
-    state: &Arc<StandaloneState>,
-    target: &crate::engine::backend_resolver::TargetBackend,
-    catalog: Arc<dyn Catalog>,
-    table: iceberg::table::Table,
-    collector: Arc<IcebergCommitCollector>,
-    entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    commit_op_kind: CommitOpKind,
-    operation_kind: IcebergOperationKind,
-    base_snapshot_id: Option<i64>,
-    target_ref: &str,
-    plan: MutationWritePlan,
-) -> Result<(), String> {
-    let attempt_name = plan.attempt_name();
-    let abort_cleanup =
-        crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
-    let collector_for_executor = Arc::clone(&collector);
-    let commit_executor = IcebergWriteCommitExecutor {
-        state: Arc::clone(state),
-        target: target.clone(),
-        catalog,
-        table: table.clone(),
-        collector,
-        fs: abort_cleanup.fs,
-        cleanup_path_mapper: abort_cleanup.path_mapper,
-        cow_update_rewrite: None,
-        target_ref: target_ref.to_string(),
-        snapshot_properties: BTreeMap::new(),
-    };
-    let spec = IcebergWriteTransactionSpec {
-        target: IcebergOperationTarget {
-            catalog: target.catalog.clone(),
-            namespace: target.namespace.clone(),
-            table: target.table.clone(),
-            ref_name: (target_ref != "main").then(|| target_ref.to_string()),
-        },
-        operation_kind,
-        attempt_id: format!(
-            "{}.{}.{}:{}:{}",
-            target.catalog,
-            target.namespace,
-            target.table,
-            attempt_name,
-            uuid::Uuid::new_v4()
-        ),
-        commit: IcebergWriteCommitPolicy {
-            commit_op_kind,
-            base_snapshot_id,
-            base_snapshot_map: BTreeMap::new(),
-            target_ref: target_ref.to_string(),
-            snapshot_properties: BTreeMap::new(),
-        },
-        validation: IcebergWriteValidationPolicy {
-            require_v3_for_branch: target_ref != "main",
-        },
-        source: IcebergWriteSource::CoordinatedPlan,
-    };
-    let executor = MutationWriteExecutor {
-        commit_executor,
-        table,
-        collector: collector_for_executor,
-        plan: Mutex::new(Some(plan)),
-    };
-    let runner = IcebergWriteTransactionRunner::new(Arc::clone(state), &executor);
-    let _outcome = runner.run(spec)?;
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2865,202 +2687,17 @@ fn build_merge_unmatched_insert_query(
     parse_generated_query(&sql, "MERGE unmatched INSERT sink")
 }
 
-/// Execute a MERGE `WHEN MATCHED THEN DELETE` by writing the matched old rows'
-/// deletion vectors on the BE (a `DeletionVectors` sink), committed via
-/// `RowDeltaDvFromFiles`. This mirrors the MOR-UPDATE DV side (E2) but with no
-/// data sink: a pure matched-DELETE produces DV files only. The coordinator no
-/// longer materializes position-delete groups or injects them into the commit;
-/// FE commits metadata only. Cardinality (at-most-one-match) is already
-/// enforced by `validate_unique_target_row_ids` in the MERGE orchestrator.
-fn execute_merge_matched_delete(
-    state: &Arc<StandaloneState>,
-    target: &crate::engine::backend_resolver::TargetBackend,
-    catalog: Arc<dyn Catalog>,
-    table_ident: iceberg::TableIdent,
-    table: iceberg::table::Table,
-    matched: MatchedUpdateBatch,
-    entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
-) -> Result<StatementResult, String> {
-    if matched.row_ids.is_empty() {
-        return Ok(StatementResult::Ok);
-    }
-    // MERGE matched-DELETE is `main`-only here. Pin the DV sink to the current
-    // snapshot so the BE writes deletion vectors for the matched old rows, and
-    // commit against that same base snapshot (the commit's base-snapshot check
-    // fails fast under the single-writer assumption if they disagree).
-    let metadata = table.metadata();
-    let base_snapshot_id = metadata.current_snapshot().map(|s| s.snapshot_id());
-    let resolved = {
-        let registry = state.connectors.read().expect("connector registry read");
-        let backend = registry.catalog_backend("iceberg")?;
-        backend.load_table(&target.catalog, &target.namespace, &target.table)?
-    };
-    let mut dv_sink_spec = crate::engine::iceberg_writer::build_position_delete_sink_spec(
-        target, &resolved, &table, &entry,
-    )?;
-    dv_sink_spec.mode = IcebergWriteSinkMode::DeletionVectors;
-    dv_sink_spec.set_planned_snapshot_id(base_snapshot_id)?;
-    let dv_query =
-        build_merge_mor_dv_sink_query_from_matched(&matched, &dv_sink_spec.target_columns)?;
-
-    let staging_dir = format!(
-        "{}/data/_staging/{}",
-        metadata.location(),
-        uuid::Uuid::new_v4()
-    );
-    let collector = Arc::new(
-        IcebergCommitCollector::new(
-            CommitOpKind::RowDeltaDvFromFiles,
-            table_ident,
-            base_snapshot_id,
-            metadata.last_sequence_number(),
-            metadata.current_schema().clone(),
-            metadata.default_partition_spec().clone(),
-            staging_dir,
-            crate::common::types::UniqueId { hi: 0, lo: 0 },
-        )
-        .with_table_metadata(metadata.clone()),
-    );
-    run_merge_matched_delete_distributed_transaction(
-        state,
-        target,
-        catalog,
-        table,
-        collector,
-        entry,
-        base_snapshot_id,
-        MergeMatchedDeleteDistributedWrite {
-            dv_query,
-            dv_sink_spec,
-        },
-    )?;
-    Ok(StatementResult::Ok)
-}
-
+/// The matched-DELETE branch of a folded MERGE: a pure deletion-vector write
+/// (no data files). The BE writes a deletion-vector (Puffin) file per data
+/// file from `dv_query`; `DistributedMergeExecutor` runs this branch and folds
+/// its DV result into the shared single-commit collector. The coordinator never
+/// materializes position-delete groups.
 struct MergeMatchedDeleteDistributedWrite {
     /// SELECT that projects `[_file, _pos, <partition src>]` for the matched
     /// old rows. The BE writes a deletion-vector (Puffin) file per data file
     /// through `dv_sink_spec`; the coordinator never materializes positions.
     dv_query: sqlparser::ast::Query,
     dv_sink_spec: IcebergWriteSinkSpec,
-}
-
-struct DistributedMergeMatchedDeleteExecutor {
-    state: Arc<StandaloneState>,
-    target: crate::engine::backend_resolver::TargetBackend,
-    write: MergeMatchedDeleteDistributedWrite,
-    commit_executor: IcebergWriteCommitExecutor,
-}
-
-impl IcebergWriteTransactionExecutor for DistributedMergeMatchedDeleteExecutor {
-    fn run_coordinated_write(
-        &self,
-        _spec: &IcebergWriteTransactionSpec,
-    ) -> Result<CoordinatedQueryResult, String> {
-        // Write the matched old-row deletion vectors (content=PositionDeletes/
-        // Puffin) on the BE, shuffled per `_file` so each data file gets one DV
-        // writer. A pure matched-DELETE has no data files: DV only.
-        let dv = crate::engine::execute_query_as_iceberg_write(
-            &self.state,
-            Some(&self.target.catalog),
-            &self.target.namespace,
-            &self.write.dv_query,
-            self.write.dv_sink_spec.clone(),
-            None,
-            Some(crate::engine::iceberg_write_shuffle_by_output_index(0)),
-        )?;
-        // The matched set is known non-empty (the caller returns early on an
-        // empty batch), so a file-less but non-aborted DV result is a real bug:
-        // without it the transaction would commit an empty snapshot and the
-        // matched rows would remain live. Fail fast instead of silently
-        // dropping the delete.
-        if dv.write_abort.is_none()
-            && dv
-                .write_commit
-                .as_ref()
-                .is_none_or(|commit| !write_commit_has_files(commit))
-        {
-            return Err(
-                "MERGE matched-DELETE DV sink produced no deletion-vector files".to_string(),
-            );
-        }
-        Ok(dv)
-    }
-
-    fn commit(
-        &self,
-        _spec: &IcebergWriteTransactionSpec,
-        write_commit: &WriteCommitInput,
-    ) -> Result<CommitOutcome, CommitServiceError> {
-        self.commit_executor.commit_write_input(write_commit)
-    }
-
-    fn finalize(&self, _spec: &IcebergWriteTransactionSpec) -> Result<(), String> {
-        self.commit_executor.finalize()
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_merge_matched_delete_distributed_transaction(
-    state: &Arc<StandaloneState>,
-    target: &crate::engine::backend_resolver::TargetBackend,
-    catalog: Arc<dyn Catalog>,
-    table: iceberg::table::Table,
-    collector: Arc<IcebergCommitCollector>,
-    entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    base_snapshot_id: Option<i64>,
-    write: MergeMatchedDeleteDistributedWrite,
-) -> Result<(), String> {
-    let abort_cleanup =
-        crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
-    let commit_executor = IcebergWriteCommitExecutor {
-        state: Arc::clone(state),
-        target: target.clone(),
-        catalog,
-        table,
-        collector,
-        fs: abort_cleanup.fs,
-        cleanup_path_mapper: abort_cleanup.path_mapper,
-        cow_update_rewrite: None,
-        target_ref: "main".to_string(),
-        snapshot_properties: BTreeMap::new(),
-    };
-    let spec = IcebergWriteTransactionSpec {
-        target: IcebergOperationTarget {
-            catalog: target.catalog.clone(),
-            namespace: target.namespace.clone(),
-            table: target.table.clone(),
-            ref_name: None,
-        },
-        operation_kind: IcebergOperationKind::RowDelta,
-        attempt_id: format!(
-            "{}.{}.{}:merge-matched-delete-distributed:{}",
-            target.catalog,
-            target.namespace,
-            target.table,
-            uuid::Uuid::new_v4()
-        ),
-        commit: IcebergWriteCommitPolicy {
-            commit_op_kind: CommitOpKind::RowDeltaDvFromFiles,
-            base_snapshot_id,
-            base_snapshot_map: BTreeMap::new(),
-            target_ref: "main".to_string(),
-            snapshot_properties: BTreeMap::new(),
-        },
-        validation: IcebergWriteValidationPolicy {
-            require_v3_for_branch: false,
-        },
-        source: IcebergWriteSource::CoordinatedPlan,
-    };
-    let executor = DistributedMergeMatchedDeleteExecutor {
-        state: Arc::clone(state),
-        target: target.clone(),
-        write,
-        commit_executor,
-    };
-    let runner = IcebergWriteTransactionRunner::new(Arc::clone(state), &executor);
-    let _outcome = runner.run(spec)?;
-    Ok(())
 }
 
 /// The matched-side write plan of a folded MERGE, by table write mode. `None`
@@ -3401,7 +3038,7 @@ mod tests {
             .split("fn run_mor_update_distributed_transaction")
             .nth(1)
             .expect("run_mor_update_distributed_transaction fn")
-            .split("\nfn build_position_delete_groups_from_matched")
+            .split("\nfn no_mutation_write_result")
             .next()
             .expect("run_mor_update_distributed_transaction body");
         assert!(
@@ -3421,24 +3058,48 @@ mod tests {
     #[test]
     fn merge_matched_delete_writes_dv_on_be_not_coordinator() {
         let src = include_str!("mutation_flow.rs");
-        let body = src
-            .split("fn execute_merge_matched_delete")
+
+        // The folded MERGE matched-DELETE branch (built in `execute_merge_statement`'s
+        // matched-branch dispatch) must configure a BE `DeletionVectors` sink and
+        // must NOT materialize or inject coordinator-local position-delete groups.
+        // Slice the `MergeMatchedAction::Delete` arm up to its terminal
+        // `MergeMatchedBranch::Delete(..)` expression.
+        let branch = src
+            .split("MergeMatchedAction::Delete =>")
             .nth(1)
-            .expect("fn")
-            .split("\nfn ")
+            .expect("matched-DELETE branch arm")
+            .split("MergeMatchedBranch::Delete(MergeMatchedDeleteDistributedWrite")
             .next()
-            .expect("body");
+            .expect("matched-DELETE branch body");
         assert!(
-            !body.contains("build_position_delete_groups_from_matched"),
+            !branch.contains("build_position_delete_groups_from_matched"),
             "matched-DELETE must not materialize position groups on the coordinator"
         );
         assert!(
-            !body.contains("inject_delete_group"),
+            !branch.contains("inject_delete_group"),
             "matched-DELETE must not inject coordinator delete groups (FE central write)"
         );
         assert!(
-            body.contains("DeletionVectors"),
+            branch.contains("IcebergWriteSinkMode::DeletionVectors"),
             "matched-DELETE must write its DV via the BE DeletionVectors sink"
+        );
+
+        // The fold's executor runs that branch on the BE via
+        // `execute_query_as_iceberg_write` (no coordinator-side delete injection).
+        let exec_arm = src
+            .split("MergeMatchedBranch::Delete(write) => {")
+            .nth(1)
+            .expect("fold matched-DELETE executor arm")
+            .split("\n            MergeMatchedBranch::CowUpdate(write) => {")
+            .next()
+            .expect("fold matched-DELETE executor body");
+        assert!(
+            exec_arm.contains("execute_query_as_iceberg_write"),
+            "fold matched-DELETE branch must write its DV on the BE"
+        );
+        assert!(
+            !exec_arm.contains("inject_delete_group"),
+            "fold matched-DELETE branch must not inject coordinator delete groups"
         );
     }
 
