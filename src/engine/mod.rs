@@ -8184,6 +8184,24 @@ path = "meta/operations.sqlite"
         snapshot_id
     }
 
+    fn assert_iceberg_operation_absent(engine: &StandaloneNovaRocks, operation_id: i64) {
+        let provider = engine
+            .inner
+            .metadata_provider
+            .as_ref()
+            .expect("metadata provider");
+        let read = provider.begin_read().expect("read operation metadata");
+        let operation = engine
+            .inner
+            .iceberg_operation_repo
+            .load_operation(read.as_ref(), operation_id)
+            .expect("load iceberg operation");
+        assert!(
+            operation.is_none(),
+            "expected no iceberg operation #{operation_id}, found {operation:?}"
+        );
+    }
+
     fn current_iceberg_default_spec_fields(
         engine: &StandaloneNovaRocks,
         catalog: &str,
@@ -8968,18 +8986,27 @@ path = "meta/operations.sqlite"
                 (3, "c".to_string())
             ]
         );
-        assert_iceberg_operation_finalized_any_snapshot(
-            &engine,
-            3,
-            crate::meta::repository::iceberg_operation::IcebergOperationKind::InsertAppend,
-        );
+        // Phase 3 (commit 6e21eab0) folds all MERGE branches into one
+        // collector + one commit, so an upsert MERGE
+        // (WHEN MATCHED UPDATE / WHEN NOT MATCHED INSERT) now produces a
+        // SINGLE iceberg operation: one folded RowDelta commit. Pre-fold it
+        // produced two operations — a separate InsertAppend (not-matched
+        // INSERT FastAppend) plus a RowDelta (matched UPDATE).
+        //
+        // Here the two preceding inserts take operation ids #1 and #2
+        // (InsertAppend each), so the folded MERGE occupies the single
+        // operation id #3 — the slot the not-matched INSERT branch used to
+        // take — and no operation #4 exists.
         let snap_after = current_iceberg_snapshot_id(&engine, "ice", "db1", "t");
         assert_iceberg_operation_finalized(
             &engine,
-            4,
+            3,
             crate::meta::repository::iceberg_operation::IcebergOperationKind::RowDelta,
             snap_after,
         );
+        // Prove the fold: the MERGE committed exactly one operation, so the
+        // pre-fold second operation (#4) must not exist.
+        assert_iceberg_operation_absent(&engine, 4);
     }
 
     #[test]
