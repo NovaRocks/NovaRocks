@@ -200,9 +200,28 @@ git commit -m "feat(merge): matched-DELETE writes DV on the BE via DeletionVecto
 
 ---
 
-## Task M3: Multi-branch `DistributedMergeExecutor` — one collector, one commit (the fold)
+## Task M3a: Commit-layer — fresh row-ids for appended/INSERT data (prerequisite for the fold)
 
-**Why:** This is the atomicity fix. Replace the two independent `runner.run` calls with one shared collector + one executor whose `run_coordinated_write` runs every active branch and whose `commit` fires once.
+**Why:** A folded MERGE snapshot mixes two row-lineage classes of data files: UPDATE / COW-rewrite outputs (`RowLineageData` sink, carry explicit `_row_id` → **REUSE**, must NOT advance `next-row-id`) and not-matched-INSERT outputs (`Data` sink, no `_row_id` → **FRESH**, MUST advance `next-row-id`). The snapshot row-range `n` is computed **per-manifest-path** (`fast_append.rs` / `overwrite.rs`: `n = Σ record_count`, then `with_row_range(first_row_id, n)`). M1 added `CowUpdateRewriteSet.appended_files` but routes them through `mark_replacement_manifest_row_id_assigned` (SUPPRESS, `n`-contribution 0) — correct for the empty case but **wrong for net-new INSERT rows**. This task makes BOTH atomic-fold commit ops allocate FRESH ids for INSERT data, in a separate manifest path, mirroring `overwrite.rs`.
+
+**Decision (settled — Iceberg v3 semantics + verified sink behavior):** INSERT rows are net-new and MUST get fresh ids: `first_row_id = effective_n(table.metadata())`, advance by `Σ appended record_count`. The not-matched-INSERT `Data` sink emits NO `_row_id` (`src/sql/codegen/iceberg_write_sink.rs:335,345`), so implicit manifest assignment is the mechanism (same as today's FastAppend INSERT). UPDATE/rewrite `RowLineageData` files keep the existing reuse/suppress path. The structural signal for fresh-vs-reuse is *which channel the file is in* (appended/fresh vs rewrite-or-`written`/reuse), populated by M3b — not a per-file content sniff.
+
+**Files:** `src/connector/iceberg/commit/update_cow.rs` (CowUpdate appended block), `src/connector/iceberg/commit/row_delta_dv_from_files.rs` (add a fresh-INSERT-data channel parallel to E1's reuse `written`), reusing `snapshot_lifecycle_helpers::effective_n` + the `overwrite.rs` fresh-allocation shape (`with_row_range(effective_n, Σ)`).
+
+- [ ] **Step 1: Failing unit test (CowUpdate fresh allocation).** A `CowUpdateRewriteSet` with non-empty `appended_files` (total record_count R) must advance the snapshot row-range by R (i.e., the appended manifest uses `with_row_range(effective_n, R)`), while the rewritten files still REUSE (no advance). Assert the appended manifest's row-range / the snapshot `next-row-id` delta = R. (Reuse the M1 test helpers; you may need a minimal `Table`/metadata stub or assert at the manifest-build level — match how `overwrite.rs`/`fast_append.rs` tests assert row-range.)
+- [ ] **Step 2: Run — expect FAIL** (M1 suppresses → advance is 0).
+- [ ] **Step 3: CowUpdate — route `appended_files` through FRESH allocation.** In the appended block (the `if !appended_files.is_empty()` path), use `first_row_id = effective_n(ctx.table.metadata())` and `with_row_range(first_row_id, Σ appended record_count)` instead of `mark_replacement_manifest_row_id_assigned(...)`. Keep the rewritten-files manifest on the existing reuse path. Remove the M1 `TODO(M3)` fence now that it's resolved, and update the block comment.
+- [ ] **Step 4: Failing unit test (RowDeltaDvFromFiles fresh channel).** A commit carrying reuse-data (E1's `written`, RowLineageData — suppress) PLUS fresh-data (a new `appended_files`/INSERT channel, `Data`, no `_row_id`) must advance `next-row-id` by only the fresh files' `Σ record_count`. The DV-only and reuse-only cases stay byte-identical to E1.
+- [ ] **Step 5: Run — expect FAIL** (no fresh channel yet).
+- [ ] **Step 6: RowDeltaDvFromFiles — add the fresh-INSERT-data channel.** Add `appended_files: Vec<WrittenFile>` (or equivalently-named fresh-data field) to `RowDeltaDvFromFilesTxnAction`; partition keeps `(PositionDeletes,Puffin)→DV`, `(Data,_)→` whichever channel the caller routed it to. Reuse-data → E1's existing suppress manifest; fresh-data → a `with_row_range(effective_n, Σ)` manifest (mirror the CowUpdate fix + `overwrite.rs`). Empty fresh channel ⇒ byte-identical to E1.
+- [ ] **Step 7: Run unit tests for both commit ops** — `cargo test --lib commit::update_cow commit::row_delta_dv_from_files` — PASS (incl. all pre-existing).
+- [ ] **Step 8: Commit** — `git commit -m "feat(commit): allocate fresh row-ids for appended INSERT data in CowUpdate + RowDeltaDvFromFiles (atomic MERGE fold)"`.
+
+---
+
+## Task M3b: Multi-branch `DistributedMergeExecutor` — one collector, one commit (the fold)
+
+**Why:** This is the atomicity fix. Replace the two independent `runner.run` calls with one shared collector + one executor whose `run_coordinated_write` runs every active branch and whose `commit` fires once. Uses M3a's fresh-INSERT channels so folded INSERT rows get correct fresh `_row_id`s.
 
 **Files:** `src/engine/mutation_flow.rs` (new executor + rewire `execute_merge_statement` `:2076-2232`); `src/engine/iceberg_writer.rs` (expose an INSERT write-plan builder).
 
@@ -265,9 +284,9 @@ impl IcebergWriteTransactionExecutor for DistributedMergeExecutor {
 }
 ```
 
-`run_cow_rewrites` reuses the per-file loop already in `DistributedCowUpdateExecutor` (`:1548-1636`); its COW commit attaches the INSERT's BE-written data files as `CowUpdateRewriteSet.appended_files` (M1). Add the same "non-empty matched batch ⇒ DV/data files produced" guards as E2.
+`run_cow_rewrites` reuses the per-file loop already in `DistributedCowUpdateExecutor` (`:1548-1636`); its COW commit routes the INSERT's BE-written data files into `CowUpdateRewriteSet.appended_files` (M1 field, **M3a** fresh-allocation). Add the same "non-empty matched batch ⇒ DV/data files produced" guards as E2.
 
-**ROW-LINEAGE for appended INSERT rows (surfaced by M1, must decide here):** a folded not-matched INSERT is genuinely *net-new* rows that need **fresh** `_row_id`s — unlike E1/M1's row-lineage *reuse* case. M1 conservatively marks the appended-data manifest to SUPPRESS row-id allocation (`mark_replacement_manifest_row_id_assigned` + range 0), which is correct only for the empty case. Before wiring the COW fold: (a) determine how the not-matched-INSERT `Data` sink emits row-ids — explicit `_row_id` column vs implicit manifest assignment (`first_row_id` + `next-row-id` advancement) — by reading how today's separate FastAppend INSERT path assigns them; (b) make the appended-manifest row-range in `CowUpdateCommit` allocate fresh ids accordingly (relax the strict `next_row_id == first_row_id` suppression for the appended block when `appended_files` is non-empty). The same applies to the MOR fold's INSERT data via `RowDeltaDvFromFiles`. M4's `COUNT(DISTINCT _row_id)=COUNT(*)` golden is the gate.
+**Row-lineage routing (mechanism implemented in M3a):** populate the FRESH channel with the not-matched-INSERT branch's `Data`-sink files (M3a allocates them fresh `_row_id`s via `effective_n`), and the REUSE path with UPDATE/rewrite `RowLineageData` files (explicit `_row_id`, suppressed). Concretely: COW fold → INSERT files into `CowUpdateRewriteSet.appended_files`, rewrite outputs into `touched_data_files[*].new_files`. MOR fold → INSERT files into the `RowDeltaDvFromFiles` fresh channel (M3a), UPDATE new-row files into E1's reuse `written`, DVs as Puffin. matched-DELETE+INSERT → only DV + INSERT(fresh), no reuse data. M4's `COUNT(DISTINCT _row_id)=COUNT(*)` golden is the gate.
 
 - [ ] **Step 6: Rewire `execute_merge_statement` to one transaction**
 
