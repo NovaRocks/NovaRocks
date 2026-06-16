@@ -36,7 +36,7 @@ use crate::meta::repository::iceberg_operation::{
 };
 use crate::runtime::coordinator::CoordinatedQueryResult;
 use crate::runtime::query_result::QueryResult;
-use crate::runtime::write_coordinator::{WriteCommitInput, WriterCommitInput, WriterKey};
+use crate::runtime::write_coordinator::WriteCommitInput;
 
 /// How the runner should commit the collected writer output.
 pub(crate) struct IcebergWriteCommitPolicy {
@@ -202,59 +202,11 @@ pub(crate) fn current_unix_millis() -> i64 {
         .unwrap_or(0)
 }
 
-pub(crate) fn new_local_writer_write_id() -> crate::types::TUniqueId {
-    synthetic_unique_id()
-}
-
-pub(crate) fn local_writer_commit_input(
-    write_id: crate::types::TUniqueId,
-    sink_commit_infos: Vec<crate::types::TSinkCommitInfo>,
-) -> WriteCommitInput {
-    let writer_key = WriterKey {
-        query_id: write_id.clone(),
-        fragment_instance_id: write_id.clone(),
-        backend_num: 0,
-    };
-    let loaded_rows = sink_commit_infos
-        .iter()
-        .filter_map(|info| info.iceberg_data_file.as_ref())
-        .filter_map(|file| file.record_count)
-        .sum();
-    let loaded_bytes = sink_commit_infos
-        .iter()
-        .filter_map(|info| info.iceberg_data_file.as_ref())
-        .filter_map(|file| file.file_size_in_bytes)
-        .sum();
-    WriteCommitInput {
-        write_id,
-        writers: vec![WriterCommitInput {
-            writer_id: 0,
-            writer_key,
-            sink_commit_infos,
-            tablet_commit_infos: Vec::new(),
-            tablet_fail_infos: Vec::new(),
-            load_counters: BTreeMap::new(),
-            loaded_rows,
-            loaded_bytes,
-            filtered_rows: 0,
-        }],
-    }
-}
-
 pub(crate) fn write_commit_has_files(write_commit: &WriteCommitInput) -> bool {
     write_commit
         .writers
         .iter()
         .any(|writer| !writer.sink_commit_infos.is_empty())
-}
-
-fn synthetic_unique_id() -> crate::types::TUniqueId {
-    let uuid = uuid::Uuid::new_v4();
-    let bytes = uuid.as_bytes();
-    crate::types::TUniqueId::new(
-        i64::from_be_bytes(bytes[0..8].try_into().expect("uuid hi bytes")),
-        i64::from_be_bytes(bytes[8..16].try_into().expect("uuid lo bytes")),
-    )
 }
 
 /// Drives one Iceberg write transaction through the operation state machine.
@@ -432,7 +384,7 @@ mod tests {
     use crate::connector::iceberg::commit::{CommitOutcome, CommitServiceError};
     use crate::meta::repository::iceberg_operation::IcebergOperationState;
     use crate::runtime::query_result::QueryResult;
-    use crate::runtime::write_coordinator::WriteCommitInput;
+    use crate::runtime::write_coordinator::{WriteCommitInput, WriterCommitInput, WriterKey};
     use std::cell::RefCell;
 
     struct TestEnv {
@@ -768,29 +720,6 @@ mod tests {
             stored.state,
             IcebergOperationState::FinalizeFailedKnownCommitted
         );
-    }
-
-    #[test]
-    fn local_writer_commit_input_carries_sink_commit_infos() {
-        let write_id = crate::types::TUniqueId::new(41, 42);
-        let sink_commit_info = crate::types::TSinkCommitInfo {
-            iceberg_data_file: Some(crate::types::TIcebergDataFile {
-                path: Some("file:///t/data-1.parquet".to_string()),
-                record_count: Some(3),
-                file_size_in_bytes: Some(30),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        let commit = local_writer_commit_input(write_id.clone(), vec![sink_commit_info.clone()]);
-
-        assert!(write_commit_has_files(&commit));
-        assert_eq!(commit.write_id, write_id);
-        assert_eq!(commit.writers.len(), 1);
-        assert_eq!(commit.writers[0].sink_commit_infos, vec![sink_commit_info]);
-        assert_eq!(commit.writers[0].loaded_rows, 3);
-        assert_eq!(commit.writers[0].loaded_bytes, 30);
     }
 
     #[test]
