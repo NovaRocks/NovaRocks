@@ -3540,7 +3540,7 @@ pub(crate) fn execute_query_as_iceberg_write(
         None => crate::sql::optimizer::optimize(logical, &table_stats, factory, None, Vec::new())?,
     };
     let build_result =
-        crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_with_iceberg_sink(
+        crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_via_distributed_plan_with_iceberg_sink(
             &physical,
             &catalog_snapshot,
             &connectors_snapshot,
@@ -5973,7 +5973,7 @@ enable_path_style_access = true
         let physical =
             crate::sql::optimizer::optimize(logical, &table_stats, factory, None, Vec::new())
                 .expect("optimize");
-        crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
+        crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_via_distributed_plan(
             &physical, &catalog, &registry, "default",
         )
         .expect("build fragments")
@@ -5981,7 +5981,7 @@ enable_path_style_access = true
 
     /// Build a `ConnectorRegistry` with a mock StarRocks scan planner that
     /// returns the schema_id and tablet splits from the given layout. Used by
-    /// engine-level tests that call `PlanFragmentBuilder::build` with a
+    /// engine-level tests that call `PlanFragmentBuilder::build_via_distributed_plan` with a
     /// StarRocks table but do not have a full `StandaloneState` available.
     fn mock_starrocks_registry_for_engine_test(
         layout: &crate::sql::catalog::PhysicalTableLayout,
