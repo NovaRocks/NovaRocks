@@ -3,12 +3,20 @@ id	v
 1	a
 2	b
 
--- query 4
+-- query 3
+snaps_before
+1
+
+-- query 5
+snaps_after
+2
+
+-- query 6
 id	v
 1	a
 2	bb
 3	c
 
--- query 5
+-- query 7
 distinct_row_ids	total_rows
 3	3

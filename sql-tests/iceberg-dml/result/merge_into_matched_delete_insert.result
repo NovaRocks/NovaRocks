@@ -2,7 +2,6 @@
 id	v
 1	a
 2	b
-3	c
 
 -- query 3
 snaps_before
@@ -18,5 +17,5 @@ id	v
 3	c
 
 -- query 7
-row_ids_unique
-1
+distinct_row_ids	total_rows
+2	2

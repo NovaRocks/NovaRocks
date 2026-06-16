@@ -44,22 +44,33 @@ FROM ${case_db}.t_v3_merge_matched_delete
 ORDER BY id;
 
 -- query 3
+-- Atomicity proof: capture the snapshot count immediately before the MERGE.
+SELECT count(*) AS snaps_before
+FROM ${case_db}.t_v3_merge_matched_delete$snapshots;
+
+-- query 4
 -- @skip_result_check=true
 MERGE INTO ${case_db}.t_v3_merge_matched_delete AS t
 USING ${case_db}.s_v3_merge_matched_delete AS s
 ON t.id = s.id
 WHEN MATCHED THEN DELETE;
 
--- query 4
+-- query 5
+-- Atomicity proof: a single-branch matched-DELETE MERGE commits one
+-- RowDeltaDvFromFiles snapshot, so snaps_after - snaps_before MUST be 1.
+SELECT count(*) AS snaps_after
+FROM ${case_db}.t_v3_merge_matched_delete$snapshots;
+
+-- query 6
 SELECT id, v
 FROM ${case_db}.t_v3_merge_matched_delete
 ORDER BY id;
 
--- query 5
+-- query 7
 SELECT COUNT(DISTINCT _row_id) = COUNT(*) AS row_ids_unique
 FROM ${case_db}.t_v3_merge_matched_delete;
 
--- query 6
+-- query 8
 -- @skip_result_check=true
 DROP TABLE ${case_db}.t_v3_merge_matched_delete FORCE;
 DROP TABLE ${case_db}.s_v3_merge_matched_delete FORCE;

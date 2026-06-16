@@ -26,6 +26,11 @@ INSERT INTO ${case_db}.t_merge_source VALUES
   (3, 300, 'Shenzhen');
 
 -- query 2
+-- Atomicity proof: capture the snapshot count immediately before the MERGE.
+SELECT count(*) AS snaps_before_merge
+FROM ${case_db}.t_merge_target$snapshots;
+
+-- query 3
 -- @skip_result_check=true
 MERGE INTO ${case_db}.t_merge_target AS t
   USING ${case_db}.t_merge_source AS s
@@ -33,17 +38,29 @@ MERGE INTO ${case_db}.t_merge_target AS t
   WHEN MATCHED THEN UPDATE SET population = s.population, city = s.city
   WHEN NOT MATCHED THEN INSERT (city_id, population, city) VALUES (s.city_id, s.population, s.city);
 
--- query 3
+-- query 4
+-- Atomicity proof: the MATCHED UPDATE and NOT-MATCHED INSERT fold into a
+-- single Iceberg snapshot, so snaps_after_merge - snaps_before_merge MUST be 1.
+SELECT count(*) AS snaps_after_merge
+FROM ${case_db}.t_merge_target$snapshots;
+
+-- query 5
 SELECT city_id, population, city
 FROM ${case_db}.t_merge_target
 ORDER BY city_id;
 
--- query 4
+-- query 6
 -- @skip_result_check=true
 DELETE FROM ${case_db}.t_merge_target
 WHERE city_id = 1;
 
--- query 5
+-- query 7
+-- The follow-up standalone DELETE is its own snapshot, so this count is
+-- snaps_after_merge + 1.
+SELECT count(*) AS snaps_after_delete
+FROM ${case_db}.t_merge_target$snapshots;
+
+-- query 8
 SELECT city_id, population, city
 FROM ${case_db}.t_merge_target
 ORDER BY city_id;

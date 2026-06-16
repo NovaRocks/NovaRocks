@@ -1,10 +1,22 @@
--- query 3
+-- query 2
+snaps_before_merge
+1
+
+-- query 4
+snaps_after_merge
+2
+
+-- query 5
 city_id	population	city
 1	100	Beijing
 2	250	Shanghai-updated
 3	300	Shenzhen
 
--- query 5
+-- query 7
+snaps_after_delete
+3
+
+-- query 8
 city_id	population	city
 2	250	Shanghai-updated
 3	300	Shenzhen
