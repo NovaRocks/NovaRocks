@@ -22,31 +22,6 @@ PLAN FRAGMENT 1
       4:PROJECT [1 AS k, 20 AS v] stats={rows=1}
         3:VALUES (1 rows) stats={rows=1}
 
--- query 2
-Explain String
-Planning: <MS> ms / Execution: <MS> ms / Rows: 1
-PLAN FRAGMENT 0
-  OUTPUT EXPRS: *
-  PARTITION: UNPARTITIONED
-10:PROJECT [k, sum(v) AS total_v] stats={rows=2 conf=estimated}
-  9:HASH AGGREGATE (GLOBAL, group by: [k]) stats={rows=2 conf=estimated}
-    aggregations: sum(v)
-    8:HASH EXCHANGE stats={rows=2 conf=estimated}
-PLAN FRAGMENT 1
-  OUTPUT EXPRS: *
-  PARTITION: UNPARTITIONED
-  STREAM DATA SINK
-    EXCHANGE ID: 8
-    PARTITION: HASH_PARTITIONED (k)
-7:HASH AGGREGATE (LOCAL, group by: [k]) stats={rows=2 conf=estimated}
-  aggregations: sum(v)
-  6:PROJECT [k, v] stats={rows=2 conf=estimated}
-    5:UNION ALL stats={rows=2 conf=estimated}
-      2:PROJECT [1 AS k, 10 AS v] stats={rows=1 conf=estimated}
-        1:VALUES (1 rows) stats={rows=1}
-      4:PROJECT [1 AS k, 20 AS v] stats={rows=1 conf=estimated}
-        3:VALUES (1 rows) stats={rows=1}
-
 -- query 3
 k	total_v
 1	30
