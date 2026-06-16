@@ -77,6 +77,10 @@ pub struct CowUpdateCommit {
 impl IcebergCommitAction for CowUpdateCommit {
     async fn commit(&self, ctx: CommitCtx<'_>) -> Result<CommitOutcome, String> {
         let written = ctx.collector.take_written_files()?;
+        debug_assert!(
+            ctx.collector.take_appended_files().is_empty(),
+            "CowUpdate routes net-new INSERT data via the rewrite set, not the collector appended channel"
+        );
         for f in &written {
             if f.content != DataContentType::Data {
                 return Err(format!(

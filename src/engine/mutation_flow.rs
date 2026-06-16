@@ -826,61 +826,74 @@ struct DistributedMorUpdateExecutor {
     commit_executor: IcebergWriteCommitExecutor,
 }
 
+fn run_mor_data_and_dv(
+    state: &Arc<StandaloneState>,
+    target: &crate::engine::backend_resolver::TargetBackend,
+    write: &MorUpdateDistributedWrite,
+    data_empty_msg: &str,
+    dv_empty_msg: &str,
+) -> Result<(CoordinatedQueryResult, CoordinatedQueryResult), String> {
+    // Write the replacement rows (content=Data) on the BE.
+    let data = crate::engine::execute_query_as_iceberg_write(
+        state,
+        Some(&target.catalog),
+        &target.namespace,
+        &write.data_query,
+        write.data_sink_spec.clone(),
+        None,
+        None,
+    )?;
+    if data.write_abort.is_none()
+        && data
+            .write_commit
+            .as_ref()
+            .is_none_or(|commit| !write_commit_has_files(commit))
+    {
+        return Err(data_empty_msg.to_string());
+    }
+
+    // Write the old-row deletion vectors (content=PositionDeletes/Puffin)
+    // on the BE, shuffled per `_file` so each data file gets one DV writer.
+    let dv = crate::engine::execute_query_as_iceberg_write(
+        state,
+        Some(&target.catalog),
+        &target.namespace,
+        &write.dv_query,
+        write.dv_sink_spec.clone(),
+        None,
+        Some(crate::engine::iceberg_write_shuffle_by_output_index(0)),
+    )?;
+    // The matched set is already known non-empty (the data guard above
+    // enforced it), so a file-less but non-aborted DV result is a real bug:
+    // without the DV files, the commit would keep old+new rows live. Fail fast
+    // instead of silently half-committing.
+    if dv.write_abort.is_none()
+        && dv
+            .write_commit
+            .as_ref()
+            .is_none_or(|commit| !write_commit_has_files(commit))
+    {
+        return Err(dv_empty_msg.to_string());
+    }
+
+    Ok((data, dv))
+}
+
 impl IcebergWriteTransactionExecutor for DistributedMorUpdateExecutor {
     fn run_coordinated_write(
         &self,
         _spec: &IcebergWriteTransactionSpec,
     ) -> Result<CoordinatedQueryResult, String> {
-        // Write the replacement rows (content=Data) on the BE.
-        let data = crate::engine::execute_query_as_iceberg_write(
+        let (data, dv) = run_mor_data_and_dv(
             &self.state,
-            Some(&self.target.catalog),
-            &self.target.namespace,
-            &self.write.data_query,
-            self.write.data_sink_spec.clone(),
-            None,
-            None,
+            &self.target,
+            &self.write,
+            "MOR UPDATE distributed data sink produced no replacement data files",
+            "MOR UPDATE distributed DV sink produced no deletion-vector files",
         )?;
-        if data.write_abort.is_none()
-            && data
-                .write_commit
-                .as_ref()
-                .is_none_or(|commit| !write_commit_has_files(commit))
-        {
-            return Err(
-                "MOR UPDATE distributed data sink produced no replacement data files".to_string(),
-            );
-        }
-        // Write the old-row deletion vectors (content=PositionDeletes/Puffin)
-        // on the BE, shuffled per `_file` so each data file gets one DV writer.
-        let dv = crate::engine::execute_query_as_iceberg_write(
-            &self.state,
-            Some(&self.target.catalog),
-            &self.target.namespace,
-            &self.write.dv_query,
-            self.write.dv_sink_spec.clone(),
-            None,
-            Some(crate::engine::iceberg_write_shuffle_by_output_index(0)),
-        )?;
-        // The matched set is already known non-empty (the data guard above
-        // enforced it), so a file-less but non-aborted DV result is a real bug:
-        // without it `merge_write_commits` would return the replacement data
-        // files with `write_abort=None` and the transaction would commit the
-        // new rows WITHOUT the old-row deletion vectors (old+new rows both
-        // live). Fail fast instead of silently half-committing.
-        if dv.write_abort.is_none()
-            && dv
-                .write_commit
-                .as_ref()
-                .is_none_or(|commit| !write_commit_has_files(commit))
-        {
-            return Err(
-                "MOR UPDATE distributed DV sink produced no deletion-vector files".to_string(),
-            );
-        }
         // Both sets of sink_commit_infos flow into one collector → one commit:
         // data files committed as content=Data, DV files as Puffin DVs.
-        Ok(merge_write_commits(data, dv))
+        merge_write_commits(data, dv)
     }
 
     fn commit(
@@ -904,17 +917,14 @@ impl IcebergWriteTransactionExecutor for DistributedMorUpdateExecutor {
 fn merge_write_commits(
     data: CoordinatedQueryResult,
     dv: CoordinatedQueryResult,
-) -> CoordinatedQueryResult {
+) -> Result<CoordinatedQueryResult, String> {
     // Two-part fold (MOR UPDATE: replacement data + old-row DVs). The data-side
     // and DV-side produced-no-files guards in `run_coordinated_write` reject a
     // file-less, non-aborted result before we get here, so a single-sided
     // success is unreachable; any single-sided commit here implies an abort,
     // and the partial commit is discarded by the transaction runner. The N-ary
     // path documents the same invariant.
-    match merge_all_write_commits(vec![data, dv]) {
-        Ok(result) => result,
-        Err(_) => unreachable!("two-part merge_write_commits cannot be empty"),
-    }
+    merge_all_write_commits(vec![data, dv])
 }
 
 /// N-ary generalization of [`merge_write_commits`]: concatenate every part's
@@ -2816,47 +2826,13 @@ impl IcebergWriteTransactionExecutor for DistributedMergeExecutor {
         match branches.matched {
             MergeMatchedBranch::None => {}
             MergeMatchedBranch::MorUpdate(write) => {
-                // Replacement data (content=Data, REUSE _row_id) on the BE.
-                let data = crate::engine::execute_query_as_iceberg_write(
+                let (data, dv) = run_mor_data_and_dv(
                     &self.state,
-                    Some(&self.target.catalog),
-                    &self.target.namespace,
-                    &write.data_query,
-                    write.data_sink_spec.clone(),
-                    None,
-                    None,
+                    &self.target,
+                    &write,
+                    "MERGE MOR UPDATE data sink produced no replacement data files",
+                    "MERGE MOR UPDATE DV sink produced no deletion-vector files",
                 )?;
-                if data.write_abort.is_none()
-                    && data
-                        .write_commit
-                        .as_ref()
-                        .is_none_or(|commit| !write_commit_has_files(commit))
-                {
-                    return Err(
-                        "MERGE MOR UPDATE data sink produced no replacement data files".to_string(),
-                    );
-                }
-                // Old-row deletion vectors (content=PositionDeletes/Puffin),
-                // shuffled per `_file` so each data file gets one DV writer.
-                let dv = crate::engine::execute_query_as_iceberg_write(
-                    &self.state,
-                    Some(&self.target.catalog),
-                    &self.target.namespace,
-                    &write.dv_query,
-                    write.dv_sink_spec.clone(),
-                    None,
-                    Some(crate::engine::iceberg_write_shuffle_by_output_index(0)),
-                )?;
-                if dv.write_abort.is_none()
-                    && dv
-                        .write_commit
-                        .as_ref()
-                        .is_none_or(|commit| !write_commit_has_files(commit))
-                {
-                    return Err(
-                        "MERGE MOR UPDATE DV sink produced no deletion-vector files".to_string()
-                    );
-                }
                 commit_parts.push(data);
                 commit_parts.push(dv);
             }
@@ -3046,6 +3022,55 @@ mod tests {
         assert!(
             !transaction.contains("inject_delete_group"),
             "MOR-update transaction must not inject coordinator-local delete groups"
+        );
+    }
+
+    #[test]
+    fn mor_update_data_and_dv_paths_share_helper_and_return_merge_errors() {
+        let source = include_str!("mutation_flow.rs");
+        let production_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source");
+        assert!(
+            production_source.contains("fn run_mor_data_and_dv"),
+            "MOR UPDATE data+DV writes must be routed through a shared helper"
+        );
+
+        let merge_write_commits = production_source
+            .split("fn merge_write_commits")
+            .nth(1)
+            .expect("merge_write_commits fn")
+            .split("\n/// N-ary generalization")
+            .next()
+            .expect("merge_write_commits body");
+        assert!(
+            !merge_write_commits.contains("unreachable!("),
+            "merge_write_commits must return merge_all_write_commits errors instead of panicking"
+        );
+
+        let mor_executor = production_source
+            .split("impl IcebergWriteTransactionExecutor for DistributedMorUpdateExecutor")
+            .nth(1)
+            .expect("DistributedMorUpdateExecutor impl")
+            .split("\n    fn commit(")
+            .next()
+            .expect("DistributedMorUpdateExecutor run_coordinated_write");
+        assert!(
+            mor_executor.contains("run_mor_data_and_dv"),
+            "standalone MOR UPDATE must use the shared data+DV helper"
+        );
+
+        let merge_mor_arm = production_source
+            .split("MergeMatchedBranch::MorUpdate(write) =>")
+            .nth(1)
+            .expect("MERGE MOR UPDATE arm")
+            .split("MergeMatchedBranch::Delete(write) =>")
+            .next()
+            .expect("MERGE MOR UPDATE arm body");
+        assert!(
+            merge_mor_arm.contains("run_mor_data_and_dv"),
+            "MERGE MOR UPDATE must use the shared data+DV helper"
         );
     }
 
