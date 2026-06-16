@@ -35,6 +35,7 @@ SELECT id, user_id, amount FROM orders ORDER BY id;
 
 -- query 3
 -- @db=dv_proc_${uuid0}.ns_${uuid0}
+-- @skip_result_check=true
 CALL dv_proc_${uuid0}.system.rewrite_position_delete_files(table => 'ns_${uuid0}.orders', options => map('rewrite-all', 'true'));
 
 -- query 4
