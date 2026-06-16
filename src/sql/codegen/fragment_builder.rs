@@ -522,6 +522,24 @@ impl<'a> PlanFragmentBuilder<'a> {
             }
             _ => plan,
         };
+        if let Some(build) = Self::try_build_branch_union_aggregate_direct_via_ir(
+            plan,
+            catalog,
+            connectors,
+            _current_database,
+            mv_refresh_ctx,
+        )? {
+            return Ok(build);
+        }
+        if matches!(plan.op, Operator::PhysicalAggregateStateMerge(_)) {
+            return Self::build_aggregate_state_merge_direct_via_ir(
+                plan,
+                catalog,
+                connectors,
+                _current_database,
+                mv_refresh_ctx,
+            );
+        }
         let dp = crate::sql::codegen::ir::build_distributed_plan(plan)?;
         crate::sql::codegen::ir::lower_distributed_plan(&dp, catalog, connectors, mv_refresh_ctx)
     }
@@ -808,6 +826,38 @@ impl<'a> PlanFragmentBuilder<'a> {
         )
     }
 
+    fn build_aggregate_state_merge_direct_via_ir(
+        plan: &PhysicalPlanNode,
+        catalog: &'a dyn CatalogProvider,
+        connectors: &'a crate::connector::ConnectorRegistry,
+        current_database: &str,
+        mv_refresh_ctx: Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+    ) -> Result<MultiFragmentBuildResult, String> {
+        let Operator::PhysicalAggregateStateMerge(_op) = &plan.op else {
+            return Err("internal error: expected PhysicalAggregateStateMerge".to_string());
+        };
+        if plan.children.len() != 2 {
+            return Err(format!(
+                "AggregateStateMerge codegen expects two children, got {}",
+                plan.children.len()
+            ));
+        }
+        let refresh_ctx = mv_refresh_ctx
+            .ok_or_else(|| "AggregateStateMerge codegen requires MV refresh context".to_string())?;
+        let (_shape, layout) = refresh_ctx
+            .rewrite
+            .aggregate_shape_and_layout_for_execution()?;
+        Self::build_aggregate_state_merge_direct_with_layout_via_ir(
+            plan,
+            catalog,
+            connectors,
+            current_database,
+            mv_refresh_ctx,
+            layout,
+            None,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn build_aggregate_state_merge_direct_with_layout(
         plan: &PhysicalPlanNode,
@@ -848,6 +898,134 @@ impl<'a> PlanFragmentBuilder<'a> {
             current_database,
             mv_refresh_ctx,
         )?)
+        .map_err(|e| {
+            format!(
+                "AggregateStateMerge direct execution requires local single-fragment children; delta input: {e}"
+            )
+        })?;
+        let physical_columns = aggregate_physical_output_columns(&layout)?;
+        validate_aggregate_state_merge_child_output(
+            "old",
+            &old_input.output_columns,
+            &physical_columns,
+        )?;
+        let delta_state_columns = aggregate_state_shaped_output_columns(&layout)?;
+        validate_aggregate_state_merge_child_output(
+            "delta state-shaped",
+            &delta_state_input.output_columns,
+            &delta_state_columns,
+        )?;
+        let delta_input = Box::new(crate::sql::codegen::PlanBuildResult {
+            plan: plan_nodes::TPlan::new(Vec::new()),
+            desc_tbl: DescriptorTableBuilder::new().build(),
+            exec_params: nodes::build_exec_params_multi_with_refresh_context(
+                connectors,
+                &[],
+                mv_refresh_ctx,
+            )?,
+            output_columns: physical_columns.clone(),
+            direct_exec: Some(Box::new(DirectExecPlan::AggregateStatePhysicalize {
+                input: delta_state_input,
+                layout: layout.clone(),
+            })),
+            boundary_schemas: vec![direct_plan_boundary_schema_report(&physical_columns)],
+            query_global_dicts: None,
+            query_global_dict_exprs: None,
+        });
+
+        let output_columns = output_columns_for_boundary(&op.output_columns);
+        let exec_params =
+            nodes::build_exec_params_multi_with_refresh_context(connectors, &[], mv_refresh_ctx)?;
+        let pruning_limits = mv_refresh_ctx
+            .map(|ctx| ctx.pruning_limits)
+            .unwrap_or_default();
+        let target_position_locator =
+            mv_refresh_ctx.map(
+                |ctx| crate::sql::codegen::AggregateStateTargetPositionLocator {
+                    target_entry: std::sync::Arc::clone(&ctx.target_entry),
+                    target_table: ctx.target_table.clone(),
+                    partition_filter: ctx.affected_partitions_to_target_partition_filter(),
+                    apply_key_column: layout.row_id_column.column.name.clone(),
+                },
+            );
+        let boundary_schemas = vec![result_root_boundary_schema_report(0, -1, &output_columns)];
+        let fragment = FragmentBuildResult {
+            fragment_id: 0,
+            plan: plan_nodes::TPlan::new(Vec::new()),
+            desc_tbl: DescriptorTableBuilder::new().build(),
+            exec_params,
+            output_sink: build_result_sink(),
+            output_exprs: None,
+            output_columns,
+            direct_exec: Some(Box::new(DirectExecPlan::AggregateStateMerge {
+                old_input,
+                delta_input,
+                layout,
+                branch_id,
+                pruning_limits,
+                target_position_locator,
+            })),
+            boundary_schemas,
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+            query_global_dicts: None,
+            query_global_dict_exprs: None,
+        };
+
+        let boundary_schemas = fragment.boundary_schemas.clone();
+        Ok(MultiFragmentBuildResult {
+            fragment_results: vec![fragment],
+            root_fragment_id: 0,
+            edges: Vec::new(),
+            boundary_schemas,
+            rf_plan: None,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_aggregate_state_merge_direct_with_layout_via_ir(
+        plan: &PhysicalPlanNode,
+        catalog: &'a dyn CatalogProvider,
+        connectors: &'a crate::connector::ConnectorRegistry,
+        current_database: &str,
+        mv_refresh_ctx: Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+        layout: crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
+        branch_id: Option<i32>,
+    ) -> Result<MultiFragmentBuildResult, String> {
+        let Operator::PhysicalAggregateStateMerge(op) = &plan.op else {
+            return Err("internal error: expected PhysicalAggregateStateMerge".to_string());
+        };
+        if plan.children.len() != 2 {
+            return Err(format!(
+                "AggregateStateMerge codegen expects two children, got {}",
+                plan.children.len()
+            ));
+        }
+        Self::validate_aggregate_state_merge_layout(op, &layout)?;
+
+        let old_input = single_fragment_child_plan(
+            Self::build_via_distributed_plan_with_mv_refresh_ctx(
+                &plan.children[0],
+                catalog,
+                connectors,
+                current_database,
+                mv_refresh_ctx,
+            )?,
+        )
+        .map_err(|e| {
+            format!(
+                "AggregateStateMerge direct execution requires local single-fragment children; old input: {e}"
+            )
+        })?;
+        let delta_state_input = single_fragment_child_plan(
+            Self::build_via_distributed_plan_with_mv_refresh_ctx(
+                &plan.children[1],
+                catalog,
+                connectors,
+                current_database,
+                mv_refresh_ctx,
+            )?,
+        )
         .map_err(|e| {
             format!(
                 "AggregateStateMerge direct execution requires local single-fragment children; delta input: {e}"
@@ -981,6 +1159,91 @@ impl<'a> PlanFragmentBuilder<'a> {
                     layout,
                     Some(branch_id),
                 )?)?;
+            branch_inputs.push(*child);
+        }
+
+        let output_columns = output_columns_for_boundary(&union_op.output_columns);
+        let exec_params =
+            nodes::build_exec_params_multi_with_refresh_context(connectors, &[], mv_refresh_ctx)?;
+        let boundary_schemas = vec![result_root_boundary_schema_report(0, -1, &output_columns)];
+        let fragment = FragmentBuildResult {
+            fragment_id: 0,
+            plan: plan_nodes::TPlan::new(Vec::new()),
+            desc_tbl: DescriptorTableBuilder::new().build(),
+            exec_params,
+            output_sink: build_result_sink(),
+            output_exprs: None,
+            output_columns,
+            direct_exec: Some(Box::new(DirectExecPlan::UnionAll {
+                inputs: branch_inputs,
+            })),
+            boundary_schemas,
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+            query_global_dicts: None,
+            query_global_dict_exprs: None,
+        };
+
+        let boundary_schemas = fragment.boundary_schemas.clone();
+        Ok(Some(MultiFragmentBuildResult {
+            fragment_results: vec![fragment],
+            root_fragment_id: 0,
+            edges: Vec::new(),
+            boundary_schemas,
+            rf_plan: None,
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_build_branch_union_aggregate_direct_via_ir(
+        plan: &PhysicalPlanNode,
+        catalog: &'a dyn CatalogProvider,
+        connectors: &'a crate::connector::ConnectorRegistry,
+        current_database: &str,
+        mv_refresh_ctx: Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+    ) -> Result<Option<MultiFragmentBuildResult>, String> {
+        let Operator::PhysicalUnion(union_op) = &plan.op else {
+            return Ok(None);
+        };
+        if !union_op.all || plan.children.is_empty() {
+            return Ok(None);
+        }
+        let Some(refresh_ctx) = mv_refresh_ctx else {
+            return Ok(None);
+        };
+
+        let mut branch_inputs = Vec::with_capacity(plan.children.len());
+        for branch in &plan.children {
+            let Operator::PhysicalProject(project_op) = &branch.op else {
+                return Ok(None);
+            };
+            let Some(branch_id) = branch_union_project_branch_id(project_op) else {
+                return Ok(None);
+            };
+            if branch.children.len() != 1 {
+                return Err(format!(
+                    "branch UNION aggregate direct codegen expected Project with one child, got {}",
+                    branch.children.len()
+                ));
+            }
+            let merge = &branch.children[0];
+            if !matches!(merge.op, Operator::PhysicalAggregateStateMerge(_)) {
+                return Ok(None);
+            }
+            let (_shape, layout) = refresh_ctx
+                .rewrite
+                .aggregate_shape_and_layout_for_execution()?;
+            let child = single_fragment_child_plan(
+                Self::build_aggregate_state_merge_direct_with_layout_via_ir(
+                    merge,
+                    catalog,
+                    connectors,
+                    current_database,
+                    mv_refresh_ctx,
+                    layout,
+                    Some(branch_id),
+                )?,
+            )?;
             branch_inputs.push(*child);
         }
 
@@ -4261,11 +4524,20 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::path::PathBuf;
     use std::rc::Rc;
+    use std::sync::Arc;
 
     use arrow::datatypes::DataType;
+    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
     use tempfile::NamedTempFile;
 
     use super::*;
+    use crate::meta::repository::mv::StoredMvDefinition;
+    use crate::meta::repository::mv_contract::{
+        AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
+        ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
+        ExpressionLineage, HiddenApplyKeyContract, MvSchemaContract, OutputColumnLineage,
+        OutputContract, TargetContract, TargetVisibleColumn,
+    };
     use crate::plan_nodes;
     use crate::sql::analysis::{
         BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, SortItem, TypedExpr,
@@ -4812,6 +5084,274 @@ mod tests {
         ]
     }
 
+    fn aggregate_refresh_context_for_test()
+    -> crate::engine::mv::refresh_context::IcebergMvRefreshContext {
+        use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+        use iceberg::{CatalogBuilder, NamespaceIdent, TableIdent};
+
+        let target_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(7)
+                .with_fields(vec![
+                    Arc::new(NestedField::optional(
+                        100,
+                        "region",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                    Arc::new(NestedField::required(
+                        101,
+                        "c",
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                    Arc::new(NestedField::optional(
+                        102,
+                        "s",
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                    Arc::new(NestedField::required(
+                        999,
+                        "__row_id__",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                    Arc::new(NestedField::required(
+                        200,
+                        "__agg_state_c",
+                        Type::Primitive(PrimitiveType::Binary),
+                    )),
+                    Arc::new(NestedField::required(
+                        201,
+                        "__agg_state_s",
+                        Type::Primitive(PrimitiveType::Binary),
+                    )),
+                ])
+                .build()
+                .expect("aggregate target schema"),
+        );
+        let contract = MvSchemaContract {
+            contract_version: 3,
+            base: BaseContract {
+                table_fqn: "ice.ns.orders".to_string(),
+                table_uuid: "uuid-orders".to_string(),
+                alias_at_create: None,
+                schema_id_at_create: 0,
+                schema_at_create: BaseSchemaSnapshot {
+                    fields: vec![
+                        BaseFieldRecord {
+                            field_id: 1,
+                            name_at_create: "region".to_string(),
+                            type_signature: "string".to_string(),
+                            required: false,
+                        },
+                        BaseFieldRecord {
+                            field_id: 2,
+                            name_at_create: "amount".to_string(),
+                            type_signature: "long".to_string(),
+                            required: false,
+                        },
+                    ],
+                },
+            },
+            bases: Vec::new(),
+            output: OutputContract {
+                columns: vec![
+                    OutputColumnLineage {
+                        expression: ExpressionLineage {
+                            kind: ExpressionKind::Column,
+                            referenced_base_field_ids: vec![1],
+                            referenced_base_fields: Vec::new(),
+                        },
+                    },
+                    OutputColumnLineage {
+                        expression: ExpressionLineage {
+                            kind: ExpressionKind::Func,
+                            referenced_base_field_ids: Vec::new(),
+                            referenced_base_fields: Vec::new(),
+                        },
+                    },
+                    OutputColumnLineage {
+                        expression: ExpressionLineage {
+                            kind: ExpressionKind::Func,
+                            referenced_base_field_ids: vec![2],
+                            referenced_base_fields: Vec::new(),
+                        },
+                    },
+                ],
+                filter: None,
+            },
+            join: None,
+            aggregate: Some(AggregateStateContract {
+                state_layout_version: 1,
+                row_id_column_name: "__row_id__".to_string(),
+                state_columns: vec![
+                    AggregateStateColumnContract {
+                        column_name: "__agg_state_c".to_string(),
+                        target_field_id: 200,
+                        type_signature: "binary".to_string(),
+                        nullable: false,
+                        role: AggregateStateRoleContract::Single,
+                    },
+                    AggregateStateColumnContract {
+                        column_name: "__agg_state_s".to_string(),
+                        target_field_id: 201,
+                        type_signature: "binary".to_string(),
+                        nullable: false,
+                        role: AggregateStateRoleContract::Single,
+                    },
+                ],
+            }),
+            branch: None,
+            target: TargetContract {
+                table_fqn: "tgt.ns.orders_mv".to_string(),
+                table_uuid: "uuid-target".to_string(),
+                schema_id_at_create: 7,
+                visible_columns: vec![
+                    TargetVisibleColumn {
+                        output_name: "region".to_string(),
+                        target_field_id: 100,
+                        type_signature: "string".to_string(),
+                        nullable: true,
+                    },
+                    TargetVisibleColumn {
+                        output_name: "c".to_string(),
+                        target_field_id: 101,
+                        type_signature: "long".to_string(),
+                        nullable: false,
+                    },
+                    TargetVisibleColumn {
+                        output_name: "s".to_string(),
+                        target_field_id: 102,
+                        type_signature: "long".to_string(),
+                        nullable: true,
+                    },
+                ],
+                hidden_apply_key: HiddenApplyKeyContract {
+                    column_name: "__row_id__".to_string(),
+                    target_field_id: 999,
+                    source: ApplyKeySource::GroupRowId,
+                },
+                partition: None,
+            },
+        };
+        let mut mv_definition = StoredMvDefinition {
+            mv_id: 42,
+            select_sql:
+                "select region, count(*) as c, sum(amount) as s from ice.ns.orders group by region"
+                    .to_string(),
+            base_table_refs: vec!["ice.ns.orders".to_string()],
+            primary_key_columns: vec!["__row_id__".to_string()],
+            storage_engine: "iceberg".to_string(),
+            target_catalog: Some("tgt".to_string()),
+            target_namespace: Some("ns".to_string()),
+            target_table: Some("orders_mv".to_string()),
+            schema_contract: Some(contract.clone()),
+            partition_spec: None,
+            partition_state_complete: false,
+            last_refresh_ms: None,
+            last_refresh_rows: None,
+            last_refresh_snapshots: [("ice.ns.orders".to_string(), 11i64)].into_iter().collect(),
+            last_refresh_table_uuids: [("ice.ns.orders".to_string(), "uuid-orders".to_string())]
+                .into_iter()
+                .collect(),
+            last_refreshed_iceberg_snapshot_id: Some(99),
+            refresh_in_progress: false,
+            active_refresh_id: None,
+            refresh_target_snapshots: Default::default(),
+            refresh_policy: Default::default(),
+            refresh_paused: false,
+            refresh_interval_ms: None,
+            max_staleness_ms: None,
+            last_scheduler_error: None,
+            next_refresh_after_ms: None,
+            created_at_ms: 0,
+        };
+        mv_definition.schema_contract = Some(contract.clone());
+        let query = Arc::new(
+            crate::engine::mv::refresh_context::tests_support::parse_query(
+                "select region, count(*) as c, sum(amount) as s from ice.ns.orders group by region",
+            ),
+        );
+        let base_refs: Arc<[crate::connector::starrocks::table::model::IcebergTableRef]> =
+            Arc::from(vec![
+                crate::engine::mv::refresh_context::tests_support::make_ref("ice", "ns", "orders"),
+            ]);
+        let pin = Arc::new(crate::engine::mv::refresh_context::tests_support::make_pin(
+            &[("ice.ns.orders", 22, "uuid-orders")],
+        ));
+        let rewrite = Arc::new(
+            crate::engine::mv::refresh_context::IcebergMvRewriteContext::from_parts(
+                crate::engine::mv::iceberg_refresh::IcebergMvTarget {
+                    catalog: "tgt".to_string(),
+                    namespace: "ns".to_string(),
+                    table: "orders_mv".to_string(),
+                },
+                42,
+                Some("sess_cat".to_string()),
+                "sess_db".to_string(),
+                Arc::new(mv_definition),
+                query,
+                base_refs,
+                pin,
+                Some(99),
+                "uuid-target".to_string(),
+                target_schema.clone(),
+                Some(Arc::new(contract)),
+            )
+            .expect("aggregate rewrite context"),
+        );
+        let warehouse = format!("memory://fragment-builder-{}", uuid::Uuid::new_v4());
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let iceberg_catalog: Arc<dyn iceberg::Catalog> = Arc::new(
+            runtime
+                .block_on(MemoryCatalogBuilder::default().load(
+                    "memory",
+                    HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse.clone())]),
+                ))
+                .expect("memory catalog"),
+        );
+        let target_entry = Arc::new(
+            crate::connector::iceberg::catalog::registry::build_catalog_entry(
+                "tgt",
+                &[
+                    ("iceberg.catalog.type".to_string(), "memory".to_string()),
+                    ("iceberg.catalog.warehouse".to_string(), warehouse),
+                ],
+            )
+            .expect("target entry"),
+        );
+        let metadata = iceberg::spec::TableMetadataBuilder::new(
+            target_schema.as_ref().clone(),
+            iceberg::spec::PartitionSpec::unpartition_spec().into_unbound(),
+            iceberg::spec::SortOrder::unsorted_order(),
+            "memory://target/orders_mv".to_string(),
+            iceberg::spec::FormatVersion::V3,
+            HashMap::new(),
+        )
+        .expect("metadata builder")
+        .build()
+        .expect("metadata")
+        .metadata;
+        let target_table = iceberg::table::Table::builder()
+            .file_io(iceberg::io::FileIO::new_with_memory())
+            .metadata(metadata)
+            .identifier(TableIdent::new(
+                NamespaceIdent::new("ns".to_string()),
+                "orders_mv".to_string(),
+            ))
+            .build()
+            .expect("target table");
+
+        crate::engine::mv::refresh_context::IcebergMvRefreshContext {
+            rewrite,
+            target_entry,
+            base_catalog_entries: BTreeMap::new(),
+            iceberg_catalog,
+            target_table,
+            affected_partitions:
+                crate::engine::mv::partition::AffectedTargetPartitions::not_derived("test context"),
+            pruning_limits: crate::engine::mv::refresh_context::MvRefreshPruningLimits::default(),
+        }
+    }
+
     fn aggregate_sum_only_physical_columns_for_test() -> Vec<OutputColumn> {
         vec![
             output_col_for_test(10, "__row_id__", DataType::Utf8, false),
@@ -4828,6 +5368,61 @@ mod tests {
             output_col_for_test(22, "__agg_state_s", DataType::Binary, false),
             output_col_for_test(23, "__agg_state___ivm_row_count", DataType::Int64, false),
         ]
+    }
+
+    fn branch_union_project_for_test(
+        merge: PhysicalPlanNode,
+        branch_id: i32,
+        output_id_base: u32,
+    ) -> PhysicalPlanNode {
+        let mut items = merge
+            .output_columns
+            .iter()
+            .enumerate()
+            .map(|(idx, column)| ProjectItem {
+                expr: column_ref_expr_for_test(
+                    column.column_id,
+                    &column.name,
+                    column.data_type.clone(),
+                    column.nullable,
+                ),
+                output_name: column.name.clone(),
+                output_column_id: ColumnId::new_for_test(output_id_base + idx as u32),
+            })
+            .collect::<Vec<_>>();
+        let branch_column_id = ColumnId::new_for_test(output_id_base + items.len() as u32);
+        items.push(ProjectItem {
+            expr: TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Int(branch_id as i64)),
+                data_type: DataType::Int32,
+                nullable: false,
+            },
+            output_name: crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN
+                .to_string(),
+            output_column_id: branch_column_id,
+        });
+        let output_columns = items
+            .iter()
+            .map(|item| OutputColumn {
+                column_id: item.output_column_id,
+                name: item.output_name.clone(),
+                data_type: item.expr.data_type.clone(),
+                nullable: item.expr.nullable,
+                is_internal: false,
+            })
+            .collect::<Vec<_>>();
+        PhysicalPlanNode {
+            op: Operator::PhysicalProject(PhysicalProjectOp {
+                items,
+                output_qualifier: None,
+            }),
+            children: vec![merge],
+            stats: stats_for_test(),
+            output_columns,
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+        }
     }
 
     #[test]
@@ -4943,6 +5538,129 @@ mod tests {
             delta_input.direct_exec.as_deref(),
             Some(DirectExecPlan::AggregateStatePhysicalize { .. })
         ));
+    }
+
+    #[test]
+    fn aggregate_state_merge_ir_entry_builds_direct_exec() {
+        let ctx = aggregate_refresh_context_for_test();
+        let layout = ctx
+            .rewrite
+            .aggregate_shape_and_layout_for_execution()
+            .expect("layout")
+            .1;
+        let state_names = layout
+            .state_columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        let plan = aggregate_merge_plan_for_test(
+            values_plan_for_test(aggregate_physical_columns_for_test()),
+            values_plan_for_test(aggregate_delta_state_columns_for_test()),
+            state_names,
+        );
+
+        let build = PlanFragmentBuilder::build_via_distributed_plan_with_mv_refresh_ctx(
+            &plan,
+            &DummyCatalog,
+            &crate::connector::ConnectorRegistry::default(),
+            "db",
+            Some(&ctx),
+        )
+        .expect("IR direct aggregate merge build");
+        let root = build
+            .fragment_results
+            .into_iter()
+            .next()
+            .expect("root fragment");
+        let Some(direct) = root.direct_exec else {
+            panic!("expected direct exec plan");
+        };
+        let DirectExecPlan::AggregateStateMerge { delta_input, .. } = *direct else {
+            panic!("expected aggregate state merge direct plan");
+        };
+        assert!(matches!(
+            delta_input.direct_exec.as_deref(),
+            Some(DirectExecPlan::AggregateStatePhysicalize { .. })
+        ));
+    }
+
+    #[test]
+    fn branch_union_aggregate_ir_entry_builds_direct_union_all() {
+        let ctx = aggregate_refresh_context_for_test();
+        let layout = ctx
+            .rewrite
+            .aggregate_shape_and_layout_for_execution()
+            .expect("layout")
+            .1;
+        let state_names = layout
+            .state_columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        let branch0 = branch_union_project_for_test(
+            aggregate_merge_plan_for_test(
+                values_plan_for_test(aggregate_physical_columns_for_test()),
+                values_plan_for_test(aggregate_delta_state_columns_for_test()),
+                state_names.clone(),
+            ),
+            0,
+            1000,
+        );
+        let branch1 = branch_union_project_for_test(
+            aggregate_merge_plan_for_test(
+                values_plan_for_test(aggregate_physical_columns_for_test()),
+                values_plan_for_test(aggregate_delta_state_columns_for_test()),
+                state_names,
+            ),
+            1,
+            1100,
+        );
+        let output_columns = branch0.output_columns.clone();
+        let plan = PhysicalPlanNode {
+            op: Operator::PhysicalUnion(PhysicalUnionOp {
+                all: true,
+                output_columns: output_columns.clone(),
+                child_output_columns: vec![
+                    branch0.output_columns.clone(),
+                    branch1.output_columns.clone(),
+                ],
+            }),
+            children: vec![branch0, branch1],
+            stats: stats_for_test(),
+            output_columns,
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+        };
+
+        let build = PlanFragmentBuilder::build_via_distributed_plan_with_mv_refresh_ctx(
+            &plan,
+            &DummyCatalog,
+            &crate::connector::ConnectorRegistry::default(),
+            "db",
+            Some(&ctx),
+        )
+        .expect("IR branch-union aggregate direct build");
+        let root = build
+            .fragment_results
+            .into_iter()
+            .next()
+            .expect("root fragment");
+        let Some(direct) = root.direct_exec else {
+            panic!("expected direct exec plan");
+        };
+        let DirectExecPlan::UnionAll { inputs } = *direct else {
+            panic!("expected union-all direct plan");
+        };
+        assert_eq!(inputs.len(), 2);
+        for (expected_branch, input) in [0, 1].into_iter().zip(inputs.iter()) {
+            let Some(DirectExecPlan::AggregateStateMerge { branch_id, .. }) =
+                input.direct_exec.as_deref()
+            else {
+                panic!("expected aggregate state merge branch input");
+            };
+            assert_eq!(*branch_id, Some(expected_branch));
+        }
     }
 
     #[test]
