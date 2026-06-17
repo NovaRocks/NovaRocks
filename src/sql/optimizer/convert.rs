@@ -20,6 +20,13 @@ use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind};
 pub(crate) fn logical_plan_to_memo(plan: &LogicalPlanNode, memo: &mut Memo) -> GroupId {
     match &plan.kind {
         LogicalPlanNodeKind::Scan(node) => {
+            for column in &node.columns {
+                memo.scalars.remember_source_column_display(
+                    column.column_id,
+                    node.alias.clone(),
+                    column.name.clone(),
+                );
+            }
             let op = Operator::LogicalScan(ScanOp {
                 database: node.database.clone(),
                 table: node.table.clone(),
@@ -69,6 +76,10 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlanNode, memo: &mut Memo) -> G
         LogicalPlanNodeKind::Aggregate(node) => {
             let child = logical_plan_to_memo(plan.unary_input(), memo);
             let group_by = intern_exprs(&mut memo.scalars, &node.group_by);
+            for (scalar_id, output) in group_by.iter().zip(node.output_columns.iter()) {
+                memo.scalars
+                    .remember_column_display_from_scalar(output.column_id, *scalar_id);
+            }
             let aggregates = intern_aggregate_calls(&mut memo.scalars, &node.aggregates);
             let op = Operator::LogicalAggregate(LogicalAggregateOp::single(
                 group_by,

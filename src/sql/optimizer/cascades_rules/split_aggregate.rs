@@ -6,6 +6,7 @@ use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::memo::{MExpr, Memo};
 use crate::sql::optimizer::operator::{AggStage, LogicalAggregateOp, Operator};
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
+use crate::sql::optimizer::scalar::{ScalarArena, ScalarId};
 use crate::sql::optimizer::scalar_bridge::{
     intern_exprs, materialize_aggregate_calls, materialize_exprs,
 };
@@ -42,9 +43,11 @@ impl Rule for SplitAggregateRule {
         }
 
         let local_output_columns = local_output_columns(agg, &group_by, &aggregates);
+        remember_group_key_output_displays(&mut memo.scalars, &agg.group_by, &local_output_columns);
         let local_group_by_typed =
             aggregate_group_key_output_ref(&local_output_columns, agg.group_by.len());
         let local_group_by = intern_exprs(&mut memo.scalars, &local_group_by_typed);
+        remember_group_key_output_displays(&mut memo.scalars, &local_group_by, &agg.output_columns);
         let local = LogicalAggregateOp::staged(
             AggStage::Local,
             agg.group_by.clone(),
@@ -76,6 +79,16 @@ impl Rule for SplitAggregateRule {
             op: Operator::LogicalAggregate(global),
             children: vec![local_group],
         }]
+    }
+}
+
+fn remember_group_key_output_displays(
+    scalars: &mut ScalarArena,
+    group_by: &[ScalarId],
+    output_columns: &[OutputColumn],
+) {
+    for (scalar_id, output) in group_by.iter().zip(output_columns.iter()) {
+        scalars.remember_column_display_from_scalar(output.column_id, *scalar_id);
     }
 }
 

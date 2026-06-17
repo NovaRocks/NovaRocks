@@ -4,9 +4,10 @@ use arrow::datatypes::DataType;
 
 use crate::partitions;
 use crate::runtime::profile_correlate::ActualMetrics;
-use crate::sql::analysis::{JoinKind, SortItem, TypedExpr};
+use crate::sql::analysis::{ExprKind, JoinKind, SortItem, TypedExpr};
 use crate::sql::catalog::{ScanSource, TableDef};
-use crate::sql::explain::{ExplainLevel, format_expr};
+use crate::sql::column_id::ColumnId;
+use crate::sql::explain::{ExplainLevel, format_expr, format_project_item};
 use crate::sql::optimizer::estimate::arith::MAX_ROW_COUNT;
 use crate::sql::optimizer::operator::{AggMode, JoinDistribution, TopNPhase};
 use crate::sql::optimizer::physical_plan::JoinExecutionDistribution;
@@ -276,10 +277,112 @@ fn format_scan_node(
         out.push(format!("{pad}     min-max stats"));
     }
     if !scan.predicates.is_empty() {
-        let preds = scan.predicates.iter().map(format_expr).collect::<Vec<_>>();
+        let preds = scan
+            .predicates
+            .iter()
+            .map(|expr| format_scan_predicate(expr, scan))
+            .collect::<Vec<_>>();
         out.push(format!("{pad}     predicates: {}", preds.join(" AND ")));
     }
     push_probe_rf_lines(&node.probe_runtime_filters, level, pad, out);
+}
+
+fn format_scan_predicate(expr: &TypedExpr, scan: &DistributedScanNode) -> String {
+    let displays = scan
+        .columns
+        .iter()
+        .map(|column| (column.column_id, (scan.alias.clone(), column.name.clone())))
+        .collect::<HashMap<ColumnId, (Option<String>, String)>>();
+    let mut expr = expr.clone();
+    rewrite_scan_column_display(&mut expr, &displays);
+    format_expr(&expr)
+}
+
+fn rewrite_scan_column_display(
+    expr: &mut TypedExpr,
+    displays: &HashMap<ColumnId, (Option<String>, String)>,
+) {
+    match &mut expr.kind {
+        ExprKind::ColumnRef {
+            column_id,
+            qualifier,
+            column,
+        } => {
+            if let Some((scan_qualifier, scan_column)) = displays.get(column_id) {
+                *qualifier = scan_qualifier.clone();
+                *column = scan_column.clone();
+            }
+        }
+        ExprKind::BinaryOp { left, right, .. } => {
+            rewrite_scan_column_display(left, displays);
+            rewrite_scan_column_display(right, displays);
+        }
+        ExprKind::UnaryOp { expr, .. }
+        | ExprKind::Cast { expr, .. }
+        | ExprKind::IsNull { expr, .. }
+        | ExprKind::IsTruthValue { expr, .. }
+        | ExprKind::Nested(expr) => rewrite_scan_column_display(expr, displays),
+        ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
+            for arg in args {
+                rewrite_scan_column_display(arg, displays);
+            }
+        }
+        ExprKind::LambdaFunction { body, .. } | ExprKind::Lambda { body, .. } => {
+            rewrite_scan_column_display(body, displays);
+        }
+        ExprKind::InList { expr, list, .. } => {
+            rewrite_scan_column_display(expr, displays);
+            for item in list {
+                rewrite_scan_column_display(item, displays);
+            }
+        }
+        ExprKind::Between {
+            expr, low, high, ..
+        } => {
+            rewrite_scan_column_display(expr, displays);
+            rewrite_scan_column_display(low, displays);
+            rewrite_scan_column_display(high, displays);
+        }
+        ExprKind::Like { expr, pattern, .. } => {
+            rewrite_scan_column_display(expr, displays);
+            rewrite_scan_column_display(pattern, displays);
+        }
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(operand) = operand {
+                rewrite_scan_column_display(operand, displays);
+            }
+            for (when, then) in when_then {
+                rewrite_scan_column_display(when, displays);
+                rewrite_scan_column_display(then, displays);
+            }
+            if let Some(else_expr) = else_expr {
+                rewrite_scan_column_display(else_expr, displays);
+            }
+        }
+        ExprKind::WindowCall {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for arg in args {
+                rewrite_scan_column_display(arg, displays);
+            }
+            for partition in partition_by {
+                rewrite_scan_column_display(partition, displays);
+            }
+            for item in order_by {
+                rewrite_scan_column_display(&mut item.expr, displays);
+            }
+        }
+        ExprKind::Literal(_)
+        | ExprKind::LambdaParamRef { .. }
+        | ExprKind::SubqueryPlaceholder { .. } => {}
+    }
 }
 
 fn format_project_node(
@@ -293,14 +396,7 @@ fn format_project_node(
     let items = project
         .items
         .iter()
-        .map(|item| {
-            let expr_str = format_expr(&item.expr);
-            if item.output_name != expr_str {
-                format!("{expr_str} AS {}", item.output_name)
-            } else {
-                expr_str
-            }
-        })
+        .map(format_project_item)
         .collect::<Vec<_>>();
     out.push(format!(
         "{pad}{}PROJECT [{}]{costs_suffix}{stats_suffix}",
@@ -394,7 +490,16 @@ fn format_hash_aggregate_node(
         AggMode::DistinctGlobal => "DISTINCT_GLOBAL",
         AggMode::DistinctLocal => "DISTINCT_LOCAL",
     };
-    let groups = agg.group_by.iter().map(format_expr).collect::<Vec<_>>();
+    let group_lookup = node
+        .children
+        .first()
+        .map(column_display_lookup)
+        .unwrap_or_default();
+    let groups = agg
+        .group_by
+        .iter()
+        .map(|expr| format_group_expr(expr, &group_lookup))
+        .collect::<Vec<_>>();
     let aggs = agg
         .aggregates
         .iter()
@@ -546,6 +651,47 @@ fn format_repeat_node(
         node_prefix(node),
         repeat.grouping_ids.len()
     ));
+}
+
+#[derive(Default)]
+struct ColumnDisplayLookup {
+    by_id: HashMap<ColumnId, (Option<String>, String)>,
+}
+
+fn column_display_lookup(node: &DistributedPlanNode) -> ColumnDisplayLookup {
+    let mut lookup = ColumnDisplayLookup::default();
+    collect_column_displays(node, &mut lookup);
+    lookup
+}
+
+fn collect_column_displays(node: &DistributedPlanNode, lookup: &mut ColumnDisplayLookup) {
+    if let DistributedPlanNodeKind::Scan(scan) = &node.kind {
+        for column in &scan.columns {
+            let display = (scan.alias.clone(), column.name.clone());
+            lookup
+                .by_id
+                .entry(column.column_id)
+                .or_insert(display.clone());
+        }
+    }
+    for child in &node.children {
+        collect_column_displays(child, lookup);
+    }
+}
+
+fn format_group_expr(expr: &TypedExpr, lookup: &ColumnDisplayLookup) -> String {
+    let ExprKind::ColumnRef { column_id, .. } = &expr.kind else {
+        return format_expr(expr);
+    };
+
+    let display = lookup.by_id.get(column_id);
+    let Some((display_qualifier, display_column)) = display else {
+        return format_expr(expr);
+    };
+    match display_qualifier {
+        Some(qualifier) => format!("{qualifier}.{display_column}"),
+        None => display_column.clone(),
+    }
 }
 
 fn format_set_op_node(
@@ -1198,7 +1344,7 @@ mod tests {
         let text = explain_distributed_plan(&dp, ExplainLevel::Normal).join("\n");
 
         assert!(
-            text.contains("2:SORT BY [col1 ASC NULLS LAST] partition_limit=3 topn_type=RANK"),
+            text.contains("2:SORT BY [t.k ASC NULLS LAST] partition_limit=3 topn_type=RANK"),
             "expected ranking-window sort suffix in IR explain output:\n{text}"
         );
     }
@@ -1306,7 +1452,7 @@ mod tests {
             explain_distributed_plan_analyze(&dp, ExplainLevel::Analyze, &actuals).join("\n");
 
         assert!(
-            text.contains("3:HASH AGGREGATE (SINGLE, group by: [col1]) stats={rows=3 conf=fallback} act={rows=7 time=2.3ms peak=4.0MB}"),
+            text.contains("3:HASH AGGREGATE (SINGLE, group by: [t.k]) stats={rows=3 conf=fallback} act={rows=7 time=2.3ms peak=4.0MB}"),
             "expected aggregate actuals after estimate trailer:\n{text}"
         );
         assert!(
@@ -1314,11 +1460,11 @@ mod tests {
             "expected scan actuals after estimate trailer:\n{text}"
         );
         assert!(
-            text.contains("2:PROJECT [col1 AS k] stats={rows=3 conf=fallback}"),
+            text.contains("2:PROJECT [t.k AS k] stats={rows=3 conf=fallback}"),
             "expected project estimate trailer:\n{text}"
         );
         assert!(
-            !text.contains("2:PROJECT [col1 AS k] stats={rows=3 conf=fallback} act="),
+            !text.contains("2:PROJECT [t.k AS k] stats={rows=3 conf=fallback} act="),
             "nodes absent from the actuals map must not print act=:\n{text}"
         );
     }
@@ -1332,6 +1478,25 @@ mod tests {
         assert_eq!(
             explain_distributed_plan(&dp, ExplainLevel::Analyze),
             explain_distributed_plan_analyze(&dp, ExplainLevel::Analyze, &actuals)
+        );
+    }
+
+    #[test]
+    fn aggregate_group_display_does_not_match_descendant_scan_by_name_only() {
+        let dp = build_distributed_plan(&aggregate_count_on_projected_id_plan(
+            project_alias_collision_plan(alias_collision_scan_plan()),
+        ))
+        .expect("build DistributedPlan");
+
+        let text = explain_distributed_plan(&dp, ExplainLevel::Normal).join("\n");
+
+        assert!(
+            text.contains("3:HASH AGGREGATE (SINGLE, group by: [id])"),
+            "expected projected group key name to remain unqualified:\n{text}"
+        );
+        assert!(
+            !text.contains("group by: [base.id]"),
+            "group key display must not fall back to a same-name descendant scan column:\n{text}"
         );
     }
 
@@ -1352,6 +1517,56 @@ mod tests {
             }),
             vec![],
             vec![k, v],
+        )
+    }
+
+    fn alias_collision_scan_plan() -> PhysicalPlanNode {
+        let id = output_col(1, "id", DataType::Int64, false);
+        let v = output_col(2, "v", DataType::Int64, true);
+        physical_node(
+            Operator::PhysicalScan(ScanOp {
+                database: "test_db".to_string(),
+                table: TableDef {
+                    name: "t".to_string(),
+                    columns: vec![
+                        column_def("id", DataType::Int64, false),
+                        column_def("v", DataType::Int64, true),
+                    ],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: ScanSource::StarRocks {
+                        db_id: 1,
+                        table_id: 2,
+                    },
+                },
+                alias: Some("base".to_string()),
+                columns: vec![id.clone(), v.clone()],
+                predicates: vec![],
+                required_columns: Some(vec!["id".to_string(), "v".to_string()]),
+                dict_columns: vec![],
+                variant_columns: vec![],
+                mv_rewritten_from: None,
+            }),
+            vec![],
+            vec![id, v],
+        )
+    }
+
+    fn project_alias_collision_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
+        let mut scalars = scalars_from_children(std::slice::from_ref(&child));
+        let output_columns = vec![output_col(3, "id", DataType::Int64, true)];
+        let items = vec![ProjectItem {
+            expr: column_ref_expr_with_qualifier(2, "base", "v", DataType::Int64, true),
+            output_name: "id".to_string(),
+            output_column_id: ColumnId::new_for_test(3),
+        }];
+        physical_node_with_scalars(
+            Operator::PhysicalProject(ProjectOp {
+                items: intern_project_items(&mut scalars, &items),
+                output_qualifier: None,
+            }),
+            vec![child],
+            output_columns,
+            scalars,
         )
     }
 
@@ -1399,6 +1614,43 @@ mod tests {
             }),
             vec![child],
             vec![k, count],
+            scalars,
+        )
+    }
+
+    fn aggregate_count_on_projected_id_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
+        let mut scalars = scalars_from_children(std::slice::from_ref(&child));
+        let id = output_col(3, "id", DataType::Int64, true);
+        let count = output_col(4, "count(*)", DataType::Int64, true);
+        let aggregate_calls = vec![AggregateCall {
+            name: "count".to_string(),
+            args: vec![],
+            distinct: false,
+            result_type: DataType::Int64,
+            order_by: vec![],
+            output_column_id: ColumnId::new_for_test(4),
+        }];
+        physical_node_with_scalars(
+            Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+                mode: AggMode::Single,
+                group_by: intern_exprs(
+                    &mut scalars,
+                    &[TypedExpr {
+                        kind: ExprKind::ColumnRef {
+                            column_id: ColumnId::new_for_test(3),
+                            qualifier: None,
+                            column: "id".to_string(),
+                        },
+                        data_type: DataType::Int64,
+                        nullable: true,
+                    }],
+                ),
+                aggregates: intern_aggregate_calls(&mut scalars, &aggregate_calls),
+                output_columns: vec![id.clone(), count.clone()],
+                is_merge: vec![false],
+            }),
+            vec![child],
+            vec![id, count],
             scalars,
         )
     }
@@ -1509,10 +1761,20 @@ mod tests {
     }
 
     fn column_ref_expr(id: u32, column: &str, data_type: DataType, nullable: bool) -> TypedExpr {
+        column_ref_expr_with_qualifier(id, "t", column, data_type, nullable)
+    }
+
+    fn column_ref_expr_with_qualifier(
+        id: u32,
+        qualifier: &str,
+        column: &str,
+        data_type: DataType,
+        nullable: bool,
+    ) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
                 column_id: ColumnId::new_for_test(id),
-                qualifier: Some("t".to_string()),
+                qualifier: Some(qualifier.to_string()),
                 column: column.to_string(),
             },
             data_type,

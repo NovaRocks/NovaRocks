@@ -61,6 +61,7 @@ pub(crate) struct SortKey {
     pub expr: ScalarId,
     pub asc: bool,
     pub nulls_first: bool,
+    pub display: Option<ColumnDisplay>,
 }
 
 /// One scalar node. Children are referenced by `ScalarId` (never inlined), so a
@@ -155,6 +156,42 @@ struct ScalarKey {
     nullable: bool,
 }
 
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct ColumnDisplay {
+    pub qualifier: Option<String>,
+    pub column: String,
+}
+
+impl ColumnDisplay {
+    pub(crate) fn from_expr(expr: &TypedExpr) -> Option<Self> {
+        match &expr.kind {
+            ExprKind::ColumnRef {
+                qualifier, column, ..
+            } => Some(Self {
+                qualifier: qualifier.clone(),
+                column: column.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    fn is_fallback_for(&self, column_id: ColumnId) -> bool {
+        self.qualifier.is_none() && self.column == format!("col{}", column_id.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ColumnDisplayPriority {
+    Expression,
+    ProjectOutput,
+}
+
+#[derive(Clone, Debug)]
+struct StoredColumnDisplay {
+    display: ColumnDisplay,
+    priority: ColumnDisplayPriority,
+}
+
 /// Owns all scalar nodes for one optimize() call; interns (hash-conses) on push.
 #[derive(Clone, Debug)]
 pub(crate) struct ScalarArena {
@@ -162,6 +199,7 @@ pub(crate) struct ScalarArena {
     types: Vec<DataType>,
     nullable: Vec<bool>,
     intern: HashMap<ScalarKey, ScalarId>,
+    column_displays: HashMap<ColumnId, StoredColumnDisplay>,
 }
 
 impl ScalarArena {
@@ -171,6 +209,7 @@ impl ScalarArena {
             types: Vec::new(),
             nullable: Vec::new(),
             intern: HashMap::new(),
+            column_displays: HashMap::new(),
         }
     }
 
@@ -223,6 +262,154 @@ impl ScalarArena {
     pub(crate) fn nullable(&self, id: ScalarId) -> bool {
         self.nullable[id.0 as usize]
     }
+
+    fn remember_column_display(
+        &mut self,
+        column_id: ColumnId,
+        qualifier: Option<String>,
+        column: String,
+    ) {
+        self.remember_column_display_with_priority(
+            column_id,
+            ColumnDisplay { qualifier, column },
+            ColumnDisplayPriority::Expression,
+        );
+    }
+
+    pub(crate) fn remember_source_column_display(
+        &mut self,
+        column_id: ColumnId,
+        qualifier: Option<String>,
+        column: String,
+    ) {
+        if column_id == ColumnId::UNSET {
+            return;
+        }
+        self.remember_column_display(column_id, qualifier, column);
+    }
+
+    pub(crate) fn remember_project_output_display(
+        &mut self,
+        column_id: ColumnId,
+        qualifier: Option<String>,
+        column: String,
+    ) {
+        if column_id == ColumnId::UNSET {
+            return;
+        }
+        self.remember_column_display_with_priority(
+            column_id,
+            ColumnDisplay { qualifier, column },
+            ColumnDisplayPriority::ProjectOutput,
+        );
+    }
+
+    pub(crate) fn remember_column_display_from_scalar(
+        &mut self,
+        column_id: ColumnId,
+        source: ScalarId,
+    ) {
+        if column_id == ColumnId::UNSET {
+            return;
+        }
+        let Some(display) = self
+            .source_column_display(source)
+            .filter(|display| !display.is_fallback_for(column_id))
+            .cloned()
+        else {
+            return;
+        };
+        self.remember_column_display_with_priority(
+            column_id,
+            display,
+            ColumnDisplayPriority::Expression,
+        );
+    }
+
+    fn remember_column_display_with_priority(
+        &mut self,
+        column_id: ColumnId,
+        incoming: ColumnDisplay,
+        priority: ColumnDisplayPriority,
+    ) {
+        match self.column_displays.get_mut(&column_id) {
+            Some(existing)
+                if should_replace_column_display(column_id, existing, &incoming, priority) =>
+            {
+                *existing = StoredColumnDisplay {
+                    display: incoming,
+                    priority,
+                };
+            }
+            Some(_) => {}
+            None => {
+                self.column_displays.insert(
+                    column_id,
+                    StoredColumnDisplay {
+                        display: incoming,
+                        priority,
+                    },
+                );
+            }
+        }
+    }
+
+    pub(crate) fn column_display(&self, column_id: ColumnId) -> Option<&ColumnDisplay> {
+        self.column_displays
+            .get(&column_id)
+            .map(|stored| &stored.display)
+    }
+
+    fn source_column_display(&self, scalar_id: ScalarId) -> Option<&ColumnDisplay> {
+        match self.node(scalar_id) {
+            ScalarNode::ColumnRef(column_id) => self.column_display(*column_id),
+            _ => None,
+        }
+    }
+}
+
+fn should_replace_column_display(
+    column_id: ColumnId,
+    existing: &StoredColumnDisplay,
+    incoming: &ColumnDisplay,
+    priority: ColumnDisplayPriority,
+) -> bool {
+    if incoming.is_fallback_for(column_id) {
+        return false;
+    }
+    if existing.display.is_fallback_for(column_id) {
+        return true;
+    }
+    if existing.priority == ColumnDisplayPriority::Expression
+        && priority == ColumnDisplayPriority::ProjectOutput
+    {
+        let existing_full = existing
+            .display
+            .qualifier
+            .as_deref()
+            .map(|qualifier| format!("{qualifier}.{}", existing.display.column));
+        return incoming.column != existing.display.column
+            && existing_full.as_deref() != Some(incoming.column.as_str());
+    }
+    if priority > existing.priority {
+        return existing.display.column != incoming.column
+            || (existing.display.qualifier.is_none() && incoming.qualifier.is_some());
+    }
+    if priority == existing.priority {
+        if priority == ColumnDisplayPriority::ProjectOutput
+            && existing.display.column != incoming.column
+        {
+            return true;
+        }
+        return existing.display.column == incoming.column
+            && existing.display.qualifier.is_none()
+            && incoming.qualifier.is_some();
+    }
+    existing.priority == ColumnDisplayPriority::ProjectOutput
+        && priority == ColumnDisplayPriority::Expression
+        && existing.display.column == incoming.column
+        && existing.display.qualifier.is_none()
+        && incoming.qualifier.is_some()
 }
 
 fn intern_sort_key(arena: &mut ScalarArena, item: &SortItem) -> SortKey {
@@ -230,12 +417,24 @@ fn intern_sort_key(arena: &mut ScalarArena, item: &SortItem) -> SortKey {
         expr: intern_typed(arena, &item.expr),
         asc: item.asc,
         nulls_first: item.nulls_first,
+        display: ColumnDisplay::from_expr(&item.expr),
     }
 }
 
 fn materialize_sort_key(arena: &ScalarArena, key: &SortKey) -> SortItem {
+    let mut expr = materialize(arena, key.expr);
+    if let (
+        Some(display),
+        ExprKind::ColumnRef {
+            qualifier, column, ..
+        },
+    ) = (&key.display, &mut expr.kind)
+    {
+        *qualifier = display.qualifier.clone();
+        *column = display.column.clone();
+    }
     SortItem {
-        expr: materialize(arena, key.expr),
+        expr,
         asc: key.asc,
         nulls_first: key.nulls_first,
     }
@@ -258,6 +457,7 @@ pub(crate) fn intern_typed(arena: &mut ScalarArena, expr: &TypedExpr) -> ScalarI
                     "ColumnId::UNSET cannot be interned into ScalarArena; resolve column '{display_name}' before optimizer scalar interning"
                 );
             }
+            arena.remember_column_display(*column_id, qualifier.clone(), column.clone());
             ScalarNode::ColumnRef(*column_id)
         }
         ExprKind::LambdaParamRef { name, slot_id } => ScalarNode::LambdaParamRef {
@@ -407,13 +607,18 @@ pub(crate) fn intern_typed(arena: &mut ScalarArena, expr: &TypedExpr) -> ScalarI
 /// not a long-lived optimizer type.
 pub(crate) fn materialize(arena: &ScalarArena, id: ScalarId) -> TypedExpr {
     let kind = match arena.node(id) {
-        ScalarNode::ColumnRef(cid) => ExprKind::ColumnRef {
-            column_id: *cid,
-            // ColumnRef name/qualifier are display-only; the optimizer addresses
-            // columns by ColumnId. Resolve original display names at the boundary.
-            qualifier: None,
-            column: format!("col{}", cid.0),
-        },
+        ScalarNode::ColumnRef(cid) => {
+            let display = arena.column_display(*cid);
+            ExprKind::ColumnRef {
+                column_id: *cid,
+                // ColumnRef name/qualifier are display-only; the optimizer addresses
+                // columns by ColumnId. Resolve original display names at the boundary.
+                qualifier: display.and_then(|item| item.qualifier.clone()),
+                column: display
+                    .map(|item| item.column.clone())
+                    .unwrap_or_else(|| format!("col{}", cid.0)),
+            }
+        }
         ScalarNode::LambdaParamRef { name, slot_id } => ExprKind::LambdaParamRef {
             name: name.clone(),
             slot_id: *slot_id,
@@ -652,10 +857,11 @@ mod tests {
 mod bridge_tests {
     use super::*;
     use crate::sql::analysis::{
-        BinOp, ExprKind, LambdaParam, LiteralValue, SortItem, TypedExpr, UnOp, WindowBound,
-        WindowFrame, WindowFrameType,
+        BinOp, ExprKind, LambdaParam, LiteralValue, ProjectItem, SortItem, TypedExpr, UnOp,
+        WindowBound, WindowFrame, WindowFrameType,
     };
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::scalar_bridge::{intern_project_item, materialize_project_item};
     use arrow::datatypes::DataType;
 
     fn col(id: u32, ty: DataType) -> TypedExpr {
@@ -775,6 +981,158 @@ mod bridge_tests {
         };
 
         intern_typed(&mut a, &expr);
+    }
+
+    #[test]
+    fn materialize_preserves_column_ref_display_metadata() {
+        let mut a = ScalarArena::new();
+        let expr = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId(7),
+                qualifier: Some("t".into()),
+                column: "k".into(),
+            },
+            data_type: DataType::Int64,
+            nullable: false,
+        };
+
+        let id = intern_typed(&mut a, &expr);
+        let back = materialize(&a, id);
+
+        let ExprKind::ColumnRef {
+            column_id,
+            qualifier,
+            column,
+        } = back.kind
+        else {
+            panic!("expected materialized ColumnRef");
+        };
+        assert_eq!(column_id, ColumnId(7));
+        assert_eq!(qualifier.as_deref(), Some("t"));
+        assert_eq!(column, "k");
+    }
+
+    #[test]
+    fn project_item_materialize_uses_item_display_before_output_alias() {
+        let mut a = ScalarArena::new();
+        let item = ProjectItem {
+            expr: TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: ColumnId(7),
+                    qualifier: None,
+                    column: "id".into(),
+                },
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+            output_name: "alias_id".into(),
+            output_column_id: ColumnId(7),
+        };
+
+        let scalar_item = intern_project_item(&mut a, &item);
+
+        let general = materialize(&a, scalar_item.expr);
+        let ExprKind::ColumnRef { column, .. } = general.kind else {
+            panic!("expected materialized ColumnRef");
+        };
+        assert_eq!(column, "alias_id");
+
+        let projected = materialize_project_item(&a, &scalar_item);
+        let ExprKind::ColumnRef { column, .. } = projected.expr.kind else {
+            panic!("expected materialized project ColumnRef");
+        };
+        assert_eq!(column, "id");
+        assert_eq!(projected.output_name, "alias_id");
+    }
+
+    #[test]
+    fn project_output_does_not_drop_existing_source_qualifier_for_same_name() {
+        let mut a = ScalarArena::new();
+        let item = ProjectItem {
+            expr: TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: ColumnId(7),
+                    qualifier: Some("a".into()),
+                    column: "k".into(),
+                },
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+            output_name: "k".into(),
+            output_column_id: ColumnId(7),
+        };
+
+        let scalar_item = intern_project_item(&mut a, &item);
+        let general = materialize(&a, scalar_item.expr);
+        let ExprKind::ColumnRef {
+            qualifier, column, ..
+        } = general.kind
+        else {
+            panic!("expected materialized ColumnRef");
+        };
+        assert_eq!(qualifier.as_deref(), Some("a"));
+        assert_eq!(column, "k");
+    }
+
+    #[test]
+    fn project_output_real_alias_replaces_existing_source_display_for_same_id() {
+        let mut a = ScalarArena::new();
+        let item = ProjectItem {
+            expr: TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: ColumnId(7),
+                    qualifier: Some("a".into()),
+                    column: "v".into(),
+                },
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+            output_name: "av".into(),
+            output_column_id: ColumnId(7),
+        };
+
+        let scalar_item = intern_project_item(&mut a, &item);
+        let general = materialize(&a, scalar_item.expr);
+        let ExprKind::ColumnRef {
+            qualifier, column, ..
+        } = general.kind
+        else {
+            panic!("expected materialized ColumnRef");
+        };
+        assert_eq!(qualifier, None);
+        assert_eq!(column, "av");
+    }
+
+    #[test]
+    fn project_output_source_display_name_does_not_replace_existing_source_display_for_same_id() {
+        let mut a = ScalarArena::new();
+        let item = ProjectItem {
+            expr: TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: ColumnId(7),
+                    qualifier: Some("a".into()),
+                    column: "k".into(),
+                },
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+            output_name: "a.k".into(),
+            output_column_id: ColumnId(7),
+        };
+
+        let scalar_item = intern_project_item(&mut a, &item);
+        let general = materialize(&a, scalar_item.expr);
+        let ExprKind::ColumnRef {
+            qualifier, column, ..
+        } = general.kind
+        else {
+            panic!("expected materialized ColumnRef");
+        };
+        assert_eq!(qualifier.as_deref(), Some("a"));
+        assert_eq!(column, "k");
+
+        let projected = materialize_project_item(&a, &scalar_item);
+        assert_eq!(projected.output_name, "a.k");
     }
 
     #[test]

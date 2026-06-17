@@ -6,7 +6,9 @@ use arrow::datatypes::DataType;
 use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::{ScalarAggregateSpec, ScalarProjectItem, ScalarWindowSpec};
-use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, SortKey, intern_typed, materialize};
+use crate::sql::optimizer::scalar::{
+    ColumnDisplay, ScalarArena, ScalarId, SortKey, intern_typed, materialize,
+};
 use crate::sql::planner::plan::{AggregateCall, WindowExpr};
 
 pub(crate) fn intern_exprs(arena: &mut ScalarArena, exprs: &[TypedExpr]) -> Vec<ScalarId> {
@@ -22,6 +24,7 @@ pub(crate) fn intern_sort_item(arena: &mut ScalarArena, item: &SortItem) -> Sort
         expr: intern_typed(arena, &item.expr),
         asc: item.asc,
         nulls_first: item.nulls_first,
+        display: ColumnDisplay::from_expr(&item.expr),
     }
 }
 
@@ -33,8 +36,10 @@ pub(crate) fn intern_sort_items(arena: &mut ScalarArena, items: &[SortItem]) -> 
 }
 
 pub(crate) fn materialize_sort_key(arena: &ScalarArena, key: &SortKey) -> SortItem {
+    let mut expr = materialize(arena, key.expr);
+    apply_column_display(&mut expr, key.display.as_ref());
     SortItem {
-        expr: materialize(arena, key.expr),
+        expr,
         asc: key.asc,
         nulls_first: key.nulls_first,
     }
@@ -50,11 +55,14 @@ pub(crate) fn intern_project_item(
     arena: &mut ScalarArena,
     item: &ProjectItem,
 ) -> ScalarProjectItem {
-    ScalarProjectItem {
+    let scalar_item = ScalarProjectItem {
         expr: intern_typed(arena, &item.expr),
         output_name: item.output_name.clone(),
         output_column_id: item.output_column_id,
-    }
+        expr_display: ColumnDisplay::from_expr(&item.expr),
+    };
+    arena.remember_project_output_display(item.output_column_id, None, item.output_name.clone());
+    scalar_item
 }
 
 pub(crate) fn intern_project_items(
@@ -71,8 +79,10 @@ pub(crate) fn materialize_project_item(
     arena: &ScalarArena,
     item: &ScalarProjectItem,
 ) -> ProjectItem {
+    let mut expr = materialize(arena, item.expr);
+    apply_column_display(&mut expr, item.expr_display.as_ref());
     ProjectItem {
-        expr: materialize(arena, item.expr),
+        expr,
         output_name: item.output_name.clone(),
         output_column_id: item.output_column_id,
     }
@@ -225,6 +235,20 @@ pub(crate) fn intern_column_sort_key(
         expr: intern_typed(arena, &expr),
         asc: key.asc,
         nulls_first: key.nulls_first,
+        display: None,
+    }
+}
+
+fn apply_column_display(expr: &mut TypedExpr, display: Option<&ColumnDisplay>) {
+    if let (
+        Some(display),
+        ExprKind::ColumnRef {
+            qualifier, column, ..
+        },
+    ) = (display, &mut expr.kind)
+    {
+        *qualifier = display.qualifier.clone();
+        *column = display.column.clone();
     }
 }
 

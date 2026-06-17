@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 
-use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, TypedExpr, UnOp};
+use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, ProjectItem, TypedExpr, UnOp};
 use crate::sql::catalog::ScanSource;
 use crate::sql::planner::plan::{ApplyKind, LogicalPlanNode, LogicalPlanNodeKind};
 
@@ -70,18 +70,7 @@ fn format_node(plan: &LogicalPlanNode, level: ExplainLevel, indent: usize, out: 
             format_node(plan.unary_input(), level, indent + 1, out);
         }
         LogicalPlanNodeKind::Project(node) => {
-            let items: Vec<String> = node
-                .items
-                .iter()
-                .map(|item| {
-                    let expr_str = format_expr(&item.expr);
-                    if item.output_name != expr_str {
-                        format!("{expr_str} AS {}", item.output_name)
-                    } else {
-                        expr_str
-                    }
-                })
-                .collect();
+            let items: Vec<String> = node.items.iter().map(format_project_item).collect();
             out.push(format!("{pad}PROJECT [{}]", items.join(", ")));
             format_node(plan.unary_input(), level, indent + 1, out);
         }
@@ -308,6 +297,15 @@ pub(crate) fn format_expr(expr: &TypedExpr) -> String {
     format_expr_kind(&expr.kind)
 }
 
+pub(crate) fn format_project_item(item: &ProjectItem) -> String {
+    let expr_str = format_expr(&item.expr);
+    if item.output_name == expr_str {
+        expr_str
+    } else {
+        format!("{expr_str} AS {}", item.output_name)
+    }
+}
+
 fn format_expr_kind(kind: &ExprKind) -> String {
     match kind {
         ExprKind::ColumnRef {
@@ -344,7 +342,19 @@ fn format_expr_kind(kind: &ExprKind) -> String {
                 BinOp::And => "AND",
                 BinOp::Or => "OR",
             };
-            format!("{} {op_str} {}", format_expr(left), format_expr(right))
+            let (display_left, display_right) = if matches!(op, BinOp::Eq | BinOp::EqForNull)
+                && matches!(left.kind, ExprKind::Literal(_))
+                && matches!(right.kind, ExprKind::ColumnRef { .. })
+            {
+                (right.as_ref(), left.as_ref())
+            } else {
+                (left.as_ref(), right.as_ref())
+            };
+            format!(
+                "{} {op_str} {}",
+                format_expr(display_left),
+                format_expr(display_right)
+            )
         }
         ExprKind::UnaryOp { op, expr } => {
             let op_str = match op {
@@ -466,8 +476,10 @@ mod tests {
 
     use arrow::datatypes::DataType;
 
-    use super::{ExplainLevel, explain_plan};
-    use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
+    use super::{ExplainLevel, explain_plan, format_expr, format_project_item};
+    use crate::sql::analysis::{
+        BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
+    };
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::plan::{
         ApplyKind, LogicalAggregateStateMergeNode, LogicalApplyNode, LogicalAssertOneRowNode,
@@ -557,5 +569,70 @@ mod tests {
             out.contains("ASSERT ONE ROW"),
             "missing ASSERT ONE ROW line: {out}"
         );
+    }
+
+    #[test]
+    fn format_expr_prints_column_before_literal_for_equality() {
+        let expr = TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::Int(10)),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                }),
+                op: BinOp::Eq,
+                right: Box::new(TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        column_id: ColumnId(42),
+                        qualifier: Some("r".to_string()),
+                        column: "rk".to_string(),
+                    },
+                    data_type: DataType::Int64,
+                    nullable: false,
+                }),
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        };
+
+        assert_eq!(format_expr(&expr), "r.rk = 10");
+    }
+
+    #[test]
+    fn format_project_item_keeps_qualified_column_alias() {
+        let item = ProjectItem {
+            expr: TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: ColumnId(1),
+                    qualifier: Some("a".to_string()),
+                    column: "k".to_string(),
+                },
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+            output_name: "k".to_string(),
+            output_column_id: ColumnId(1),
+        };
+
+        assert_eq!(format_project_item(&item), "a.k AS k");
+    }
+
+    #[test]
+    fn format_project_item_keeps_real_column_alias() {
+        let item = ProjectItem {
+            expr: TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: ColumnId(1),
+                    qualifier: None,
+                    column: "id".to_string(),
+                },
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+            output_name: "alias_id".to_string(),
+            output_column_id: ColumnId(1),
+        };
+
+        assert_eq!(format_project_item(&item), "id AS alias_id");
     }
 }

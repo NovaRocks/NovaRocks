@@ -8,7 +8,7 @@ use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{JoinKind, OutputColumn, WindowFrame};
 use crate::sql::catalog::TableDef;
 use crate::sql::column_id::ColumnId;
-use crate::sql::optimizer::scalar::{ScalarId, SortKey};
+use crate::sql::optimizer::scalar::{ColumnDisplay, ScalarId, SortKey};
 use crate::sql::planner::plan::DecodeMapping;
 
 pub(crate) use crate::sql::planner::plan::{ScanDictionaryColumn, ScanVariantColumn};
@@ -76,6 +76,7 @@ pub(crate) struct ScalarProjectItem {
     pub expr: ScalarId,
     pub output_name: String,
     pub output_column_id: ColumnId,
+    pub expr_display: Option<ColumnDisplay>,
 }
 
 #[derive(Clone, Debug)]
