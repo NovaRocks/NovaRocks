@@ -313,7 +313,7 @@ mod tests {
     use crate::sql::analysis::LiteralValue;
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::optimizer::memo::MExpr;
-    use crate::sql::optimizer::operator::{FilterOp, LogicalJoinOp, LogicalScanOp};
+    use crate::sql::optimizer::operator::{FilterOp, LogicalJoinOp, ScanOp};
     use crate::sql::optimizer::scalar::intern_typed;
     use crate::sql::planner::plan::*;
     use std::path::PathBuf;
@@ -375,7 +375,7 @@ mod tests {
     fn scan_group(memo: &mut Memo, id: u32, name: &str) -> GroupId {
         memo.new_group(MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalScan(LogicalScanOp {
+            op: Operator::LogicalScan(ScanOp {
                 database: "db".to_string(),
                 table: TableDef {
                     name: format!("t{id}"),

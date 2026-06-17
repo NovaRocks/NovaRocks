@@ -3,9 +3,9 @@ use std::collections::HashSet;
 use crate::sql::analysis::{ExprKind, SortItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::{
-    AggregateStateMergeOp, Operator, PhysicalDecodeOp, PhysicalDistributionOp,
-    PhysicalGenerateSeriesOp, PhysicalHashAggregateOp, PhysicalHashJoinOp, PhysicalNestLoopJoinOp,
-    PhysicalProjectOp, PhysicalRepeatOp, PhysicalTableFunctionOp, PhysicalWindowOp,
+    AggregateStateMergeOp, DecodeOp, GenerateSeriesOp, Operator, PhysicalDistributionOp,
+    PhysicalHashAggregateOp, PhysicalHashJoinOp, PhysicalNestLoopJoinOp, ProjectOp, RepeatOp,
+    TableFunctionOp, WindowOp,
 };
 use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
 use crate::sql::optimizer::property::DistributionSpec;
@@ -171,7 +171,7 @@ fn verify_node(
 }
 
 fn verify_project(
-    op: &PhysicalProjectOp,
+    op: &ProjectOp,
     child_outputs: &[HashSet<ColumnId>],
     scalars: &ScalarArena,
 ) -> Result<HashSet<ColumnId>, String> {
@@ -232,7 +232,7 @@ fn verify_hash_aggregate(
 }
 
 fn verify_window(
-    op: &PhysicalWindowOp,
+    op: &WindowOp,
     child_outputs: &[HashSet<ColumnId>],
     scalars: &ScalarArena,
 ) -> Result<HashSet<ColumnId>, String> {
@@ -292,7 +292,7 @@ fn verify_nested_loop_join(
 }
 
 fn verify_table_function(
-    op: &PhysicalTableFunctionOp,
+    op: &TableFunctionOp,
     child_outputs: &[HashSet<ColumnId>],
     scalars: &ScalarArena,
 ) -> Result<HashSet<ColumnId>, String> {
@@ -308,7 +308,7 @@ fn verify_table_function(
 }
 
 fn verify_repeat(
-    op: &PhysicalRepeatOp,
+    op: &RepeatOp,
     child_outputs: &[HashSet<ColumnId>],
 ) -> Result<HashSet<ColumnId>, String> {
     let input = only_child(child_outputs, "PhysicalRepeat")?;
@@ -337,7 +337,7 @@ fn verify_repeat(
 }
 
 fn verify_decode(
-    op: &PhysicalDecodeOp,
+    op: &DecodeOp,
     child_outputs: &[HashSet<ColumnId>],
 ) -> Result<HashSet<ColumnId>, String> {
     let input = only_child(child_outputs, "PhysicalDecode")?;
@@ -355,7 +355,7 @@ fn verify_decode(
     Ok(output_ids)
 }
 
-fn verify_generate_series(op: &PhysicalGenerateSeriesOp) -> Result<HashSet<ColumnId>, String> {
+fn verify_generate_series(op: &GenerateSeriesOp) -> Result<HashSet<ColumnId>, String> {
     verify_output_id(op.output_column_id, "PhysicalGenerateSeries output")?;
     Ok(output_ids(std::iter::once(op.output_column_id)))
 }
@@ -590,7 +590,7 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
     use crate::sql::optimizer::operator::{
-        AggMode, PhysicalHashAggregateOp, PhysicalProjectOp, PhysicalRepeatOp, PhysicalValuesOp,
+        AggMode, PhysicalHashAggregateOp, ProjectOp, RepeatOp, ValuesOp,
     };
     use crate::sql::optimizer::physical_plan::{PlanExecutionProps, attach_scalar_arena};
     use crate::sql::optimizer::scalar::ScalarArena;
@@ -624,7 +624,7 @@ mod tests {
 
     fn values_node(columns: Vec<OutputColumn>) -> PhysicalPlanNode {
         PhysicalPlanNode {
-            op: Operator::PhysicalValues(PhysicalValuesOp {
+            op: Operator::PhysicalValues(ValuesOp {
                 rows: vec![],
                 columns: columns.clone(),
             }),
@@ -654,7 +654,7 @@ mod tests {
             output_column_id: output_id,
         }];
         let mut plan = PhysicalPlanNode {
-            op: Operator::PhysicalProject(PhysicalProjectOp {
+            op: Operator::PhysicalProject(ProjectOp {
                 items: intern_project_items(&mut scalars, &items),
                 output_qualifier: None,
             }),
@@ -710,7 +710,7 @@ mod tests {
     fn repeat_over(child: PhysicalPlanNode, grouping_output_id: ColumnId) -> PhysicalPlanNode {
         let rollup_id = ColumnId::new_for_test(1);
         PhysicalPlanNode {
-            op: Operator::PhysicalRepeat(PhysicalRepeatOp {
+            op: Operator::PhysicalRepeat(RepeatOp {
                 repeat_column_ref_list: vec![vec!["a".to_string()], vec![]],
                 repeat_column_ref_ids: vec![vec![rollup_id], vec![]],
                 grouping_ids: vec![0, 1],

@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use super::memo::{GroupId, Memo};
-use super::operator::{JoinDistribution, Operator, PhysicalDistributionOp, PhysicalSortOp};
+use super::operator::{JoinDistribution, Operator, PhysicalDistributionOp, SortOp};
 use super::physical_plan::{JoinExecutionDistribution, PhysicalPlanNode, PlanExecutionProps};
 use super::property::{OrderingSpec, PhysicalPropertySet};
 use super::search::{EnforcerKind, Winner};
@@ -140,7 +140,7 @@ pub(crate) fn extract_best(
                 // pure ORDER BY enforcers, not analytic precursor sorts —
                 // those come from `WindowToPhysical`. Leave the analytic
                 // partition tag empty so this Sort still requires Gather.
-                Operator::PhysicalSort(PhysicalSortOp {
+                Operator::PhysicalSort(SortOp {
                     items,
                     analytic_partition_exprs: Vec::new(),
                     partition_limit: None,
@@ -204,8 +204,8 @@ mod tests {
     use crate::sql::optimizer::derive::PropertyAlternativeKind;
     use crate::sql::optimizer::memo::{MExpr, Memo};
     use crate::sql::optimizer::operator::{
-        JoinDistribution, Operator, PhysicalHashJoinEqCondition, PhysicalHashJoinOp,
-        PhysicalLimitOp, PhysicalScanOp, PhysicalValuesOp,
+        JoinDistribution, LimitOp, Operator, PhysicalHashJoinEqCondition, PhysicalHashJoinOp,
+        ScanOp, ValuesOp,
     };
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::scalar::intern_typed;
@@ -224,7 +224,7 @@ mod tests {
     }
 
     fn scan_op(table: &str) -> Operator {
-        Operator::PhysicalScan(PhysicalScanOp {
+        Operator::PhysicalScan(ScanOp {
             database: "db".into(),
             table: crate::sql::catalog::TableDef {
                 name: table.into(),
@@ -261,7 +261,7 @@ mod tests {
         };
         let left = memo.new_group(MExpr {
             id: memo.next_expr_id(),
-            op: Operator::PhysicalValues(PhysicalValuesOp {
+            op: Operator::PhysicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![],
             }),
@@ -269,7 +269,7 @@ mod tests {
         });
         let right = memo.new_group(MExpr {
             id: memo.next_expr_id(),
-            op: Operator::PhysicalValues(PhysicalValuesOp {
+            op: Operator::PhysicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![],
             }),
@@ -354,7 +354,7 @@ mod tests {
         let mut memo = Memo::new();
         let child = memo.new_group(MExpr {
             id: memo.next_expr_id(),
-            op: Operator::PhysicalValues(PhysicalValuesOp {
+            op: Operator::PhysicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![],
             }),
@@ -362,7 +362,7 @@ mod tests {
         });
         let root = memo.new_group(MExpr {
             id: memo.next_expr_id(),
-            op: Operator::PhysicalLimit(PhysicalLimitOp {
+            op: Operator::PhysicalLimit(LimitOp {
                 limit: Some(1),
                 offset: None,
             }),
@@ -427,7 +427,7 @@ mod tests {
         };
         let left = memo.new_group(MExpr {
             id: memo.next_expr_id(),
-            op: Operator::PhysicalValues(PhysicalValuesOp {
+            op: Operator::PhysicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![],
             }),
@@ -435,7 +435,7 @@ mod tests {
         });
         let right = memo.new_group(MExpr {
             id: memo.next_expr_id(),
-            op: Operator::PhysicalValues(PhysicalValuesOp {
+            op: Operator::PhysicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![],
             }),
@@ -549,7 +549,7 @@ mod tests {
         });
         let root = memo.new_group(MExpr {
             id: 1,
-            op: Operator::PhysicalLimit(PhysicalLimitOp {
+            op: Operator::PhysicalLimit(LimitOp {
                 limit: Some(1),
                 offset: None,
             }),

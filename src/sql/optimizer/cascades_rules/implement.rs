@@ -470,7 +470,7 @@ impl Rule for ScanToPhysical {
             return vec![];
         };
         vec![NewExpr {
-            op: Operator::PhysicalScan(PhysicalScanOp {
+            op: Operator::PhysicalScan(ScanOp {
                 database: op.database.clone(),
                 table: op.table.clone(),
                 alias: op.alias.clone(),
@@ -542,7 +542,7 @@ impl Rule for ProjectToPhysical {
             return vec![];
         };
         vec![NewExpr {
-            op: Operator::PhysicalProject(PhysicalProjectOp {
+            op: Operator::PhysicalProject(ProjectOp {
                 items: op.items.clone(),
                 output_qualifier: op.output_qualifier.clone(),
             }),
@@ -751,7 +751,7 @@ impl Rule for SortToPhysical {
             return vec![];
         };
         vec![NewExpr {
-            op: Operator::PhysicalSort(PhysicalSortOp {
+            op: Operator::PhysicalSort(SortOp {
                 items: op.items.clone(),
                 // Propagate the analytic-partition tag through Logical→Physical
                 // so the optimizer's required-distribution logic can see it.
@@ -806,7 +806,7 @@ impl Rule for LimitToPhysical {
         }
 
         vec![NewExpr {
-            op: Operator::PhysicalLimit(PhysicalLimitOp {
+            op: Operator::PhysicalLimit(LimitOp {
                 limit: op.limit,
                 offset: op.offset,
             }),
@@ -836,7 +836,7 @@ impl Rule for AssertOneRowToPhysical {
             return vec![];
         };
         vec![NewExpr {
-            op: Operator::PhysicalAssertOneRow(PhysicalAssertOneRowOp {
+            op: Operator::PhysicalAssertOneRow(AssertOneRowOp {
                 subquery_text: op.subquery_text.clone(),
             }),
             children: expr.children.clone(),
@@ -865,7 +865,7 @@ impl Rule for TopNToPhysical {
             return vec![];
         };
         vec![NewExpr {
-            op: Operator::PhysicalTopN(PhysicalTopNOp {
+            op: Operator::PhysicalTopN(TopNOp {
                 items: op.items.clone(),
                 limit: op.limit,
                 offset: op.offset,
@@ -945,7 +945,7 @@ impl Rule for WindowToPhysical {
         // between window nodes when their partition key sets differ, which
         // breaks pipelined analytic execution.
         vec![NewExpr {
-            op: Operator::PhysicalWindow(PhysicalWindowOp {
+            op: Operator::PhysicalWindow(WindowOp {
                 window_exprs: op.window_exprs.clone(),
                 output_columns: op.output_columns.clone(),
             }),
@@ -975,7 +975,7 @@ impl Rule for CTEAnchorToPhysical {
             return vec![];
         };
         vec![NewExpr {
-            op: Operator::PhysicalCTEAnchor(PhysicalCTEAnchorOp { cte_id: op.cte_id }),
+            op: Operator::PhysicalCTEAnchor(CTEAnchorOp { cte_id: op.cte_id }),
             children: expr.children.clone(),
         }]
     }
@@ -1002,7 +1002,7 @@ impl Rule for CTEProduceToPhysical {
             return vec![];
         };
         vec![NewExpr {
-            op: Operator::PhysicalCTEProduce(PhysicalCTEProduceOp {
+            op: Operator::PhysicalCTEProduce(CTEProduceOp {
                 cte_id: op.cte_id,
                 output_columns: op.output_columns.clone(),
             }),
@@ -1032,7 +1032,7 @@ impl Rule for CTEConsumeToPhysical {
             return vec![];
         };
         vec![NewExpr {
-            op: Operator::PhysicalCTEConsume(PhysicalCTEConsumeOp {
+            op: Operator::PhysicalCTEConsume(CTEConsumeOp {
                 cte_id: op.cte_id,
                 alias: op.alias.clone(),
                 output_columns: op.output_columns.clone(),
@@ -1063,7 +1063,7 @@ impl Rule for RepeatToPhysical {
             return vec![];
         };
         vec![NewExpr {
-            op: Operator::PhysicalRepeat(PhysicalRepeatOp {
+            op: Operator::PhysicalRepeat(RepeatOp {
                 repeat_column_ref_list: op.repeat_column_ref_list.clone(),
                 repeat_column_ref_ids: op.repeat_column_ref_ids.clone(),
                 grouping_ids: op.grouping_ids.clone(),
@@ -1100,7 +1100,7 @@ impl Rule for UnionToPhysical {
             return vec![];
         };
         vec![NewExpr {
-            op: Operator::PhysicalUnion(PhysicalUnionOp {
+            op: Operator::PhysicalUnion(UnionOp {
                 all: op.all,
                 output_columns: op.output_columns.clone(),
                 child_output_columns: op.child_output_columns.clone(),
@@ -1131,7 +1131,7 @@ impl Rule for IntersectToPhysical {
             return vec![];
         };
         vec![NewExpr {
-            op: Operator::PhysicalIntersect(PhysicalIntersectOp {
+            op: Operator::PhysicalIntersect(IntersectOp {
                 output_columns: op.output_columns.clone(),
                 child_output_columns: op.child_output_columns.clone(),
             }),
@@ -1161,7 +1161,7 @@ impl Rule for ExceptToPhysical {
             return vec![];
         };
         vec![NewExpr {
-            op: Operator::PhysicalExcept(PhysicalExceptOp {
+            op: Operator::PhysicalExcept(ExceptOp {
                 output_columns: op.output_columns.clone(),
                 child_output_columns: op.child_output_columns.clone(),
             }),
@@ -1191,7 +1191,7 @@ impl Rule for ValuesToPhysical {
             return vec![];
         };
         vec![NewExpr {
-            op: Operator::PhysicalValues(PhysicalValuesOp {
+            op: Operator::PhysicalValues(ValuesOp {
                 rows: op.rows.clone(),
                 columns: op.columns.clone(),
             }),
@@ -1221,7 +1221,7 @@ impl Rule for GenerateSeriesToPhysical {
             return vec![];
         };
         vec![NewExpr {
-            op: Operator::PhysicalGenerateSeries(PhysicalGenerateSeriesOp {
+            op: Operator::PhysicalGenerateSeries(GenerateSeriesOp {
                 start: op.start,
                 end: op.end,
                 step: op.step,
@@ -1255,7 +1255,7 @@ impl Rule for TableFunctionToPhysical {
             return vec![];
         };
         vec![NewExpr {
-            op: Operator::PhysicalTableFunction(PhysicalTableFunctionOp {
+            op: Operator::PhysicalTableFunction(TableFunctionOp {
                 function_name: op.function_name.clone(),
                 args: op.args.clone(),
                 output_columns: op.output_columns.clone(),
@@ -1288,7 +1288,7 @@ impl Rule for DecodeToPhysical {
             return vec![];
         };
         vec![NewExpr {
-            op: Operator::PhysicalDecode(PhysicalDecodeOp {
+            op: Operator::PhysicalDecode(DecodeOp {
                 mappings: op.mappings.clone(),
                 output_columns: op.output_columns.clone(),
             }),
@@ -1330,7 +1330,7 @@ mod decode_tests {
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::{MExpr, Memo};
-    use crate::sql::optimizer::operator::{LogicalDecodeOp, LogicalValuesOp};
+    use crate::sql::optimizer::operator::{DecodeOp, ValuesOp};
     use crate::sql::planner::plan::DecodeMapping;
     use arrow::datatypes::DataType;
 
@@ -1340,7 +1340,7 @@ mod decode_tests {
         // Dummy child group so the rule has a valid child slot to forward.
         let child_mexpr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalValues(LogicalValuesOp {
+            op: Operator::LogicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![],
             }),
@@ -1356,7 +1356,7 @@ mod decode_tests {
         }];
         let logical_decode = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalDecode(LogicalDecodeOp {
+            op: Operator::LogicalDecode(DecodeOp {
                 mappings: mappings.clone(),
                 output_columns: vec![],
             }),
@@ -1380,7 +1380,7 @@ mod decode_tests {
         let mut memo = Memo::new();
         let child_mexpr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalValues(LogicalValuesOp {
+            op: Operator::LogicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![],
             }),
@@ -1406,7 +1406,7 @@ mod decode_tests {
         }];
         let logical_decode = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalDecode(LogicalDecodeOp {
+            op: Operator::LogicalDecode(DecodeOp {
                 mappings,
                 output_columns: logical_outputs.clone(),
             }),
@@ -1430,14 +1430,14 @@ mod decode_tests {
 mod top_n_tests {
     use super::*;
     use crate::sql::optimizer::memo::{MExpr, Memo};
-    use crate::sql::optimizer::operator::{LogicalGenerateSeriesOp, LogicalTopNOp, TopNPhase};
+    use crate::sql::optimizer::operator::{GenerateSeriesOp, TopNOp, TopNPhase};
 
     #[test]
     fn top_n_to_physical_produces_physical_top_n() {
         let mut memo = Memo::new();
         let values_mexpr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalValues(LogicalValuesOp {
+            op: Operator::LogicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![],
             }),
@@ -1447,7 +1447,7 @@ mod top_n_tests {
 
         let expr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalTopN(LogicalTopNOp {
+            op: Operator::LogicalTopN(TopNOp {
                 items: vec![],
                 limit: Some(50),
                 offset: Some(10),
@@ -1475,7 +1475,7 @@ mod top_n_tests {
         let output_column_id = ColumnId::new_for_test(8101);
         let expr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalGenerateSeries(LogicalGenerateSeriesOp {
+            op: Operator::LogicalGenerateSeries(GenerateSeriesOp {
                 start: 1,
                 end: 10,
                 step: 2,
@@ -1642,7 +1642,7 @@ mod join_demotion_tests {
             .collect();
         let scan_mexpr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalScan(LogicalScanOp {
+            op: Operator::LogicalScan(ScanOp {
                 database: "db".into(),
                 table: TableDef {
                     name: "t".into(),
@@ -2096,7 +2096,7 @@ mod window_split_tests {
 
         let values_mexpr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalValues(LogicalValuesOp {
+            op: Operator::LogicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![],
             }),
@@ -2108,7 +2108,7 @@ mod window_split_tests {
         let window_exprs = intern_window_exprs(&mut memo.scalars, &[mk_window_expr("w1", vec![])]);
         let logical_window_mexpr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalWindow(LogicalWindowOp {
+            op: Operator::LogicalWindow(WindowOp {
                 window_exprs,
                 output_columns: vec![],
             }),
@@ -2229,7 +2229,7 @@ mod two_phase_agg_tests {
         let id = memo.next_expr_id();
         memo.new_group(MExpr {
             id,
-            op: Operator::LogicalValues(LogicalValuesOp {
+            op: Operator::LogicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![],
             }),

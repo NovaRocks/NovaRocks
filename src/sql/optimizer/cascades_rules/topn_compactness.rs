@@ -1,6 +1,6 @@
 use crate::sql::analysis::{ExprKind, OutputColumn, SortItem};
 use crate::sql::optimizer::memo::{MExpr, Memo};
-use crate::sql::optimizer::operator::{LogicalTopNOp, Operator, TopNPhase};
+use crate::sql::optimizer::operator::{Operator, TopNOp, TopNPhase};
 use crate::sql::optimizer::property::typed_expr_to_column_id;
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
 use crate::sql::optimizer::scalar_bridge::{
@@ -291,7 +291,7 @@ fn push_topn_through_project(expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
         };
         let remapped_items = intern_sort_items(&mut memo.scalars, &remapped_items);
 
-        let pushed_op = Operator::LogicalTopN(LogicalTopNOp {
+        let pushed_op = Operator::LogicalTopN(TopNOp {
             items: remapped_items,
             limit: topn.limit,
             offset: topn.offset,
@@ -433,12 +433,12 @@ fn push_topn_through_setop(expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
 }
 
 fn build_union_branch_topn_ops(
-    topn: &LogicalTopNOp,
+    topn: &TopNOp,
     branch_limit: i64,
-    union: &crate::sql::optimizer::operator::LogicalUnionOp,
+    union: &crate::sql::optimizer::operator::UnionOp,
     branch_groups: &[usize],
     memo: &mut Memo,
-) -> Option<Vec<LogicalTopNOp>> {
+) -> Option<Vec<TopNOp>> {
     let topn_items = materialize_sort_keys(&memo.scalars, &topn.items);
     branch_groups
         .iter()
@@ -455,7 +455,7 @@ fn build_union_branch_topn_ops(
                 &union.output_columns,
                 &branch_outputs,
             )?;
-            Some(LogicalTopNOp {
+            Some(TopNOp {
                 items: intern_sort_items(&mut memo.scalars, &items),
                 limit: Some(branch_limit),
                 offset: Some(0),
@@ -519,7 +519,7 @@ fn find_existing_logical_group(memo: &Memo, op: &Operator, children: &[usize]) -
     })
 }
 
-fn topn_phase_can_merge(outer: &LogicalTopNOp, inner: &LogicalTopNOp) -> bool {
+fn topn_phase_can_merge(outer: &TopNOp, inner: &TopNOp) -> bool {
     matches!(
         (outer.phase, inner.phase, outer.is_split, inner.is_split),
         (TopNPhase::Final, TopNPhase::Final, false, false)
@@ -536,8 +536,8 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
     use crate::sql::optimizer::operator::{
-        LogicalAggregateOp, LogicalJoinOp, LogicalProjectOp, LogicalScanOp, LogicalSortOp,
-        LogicalTopNOp, LogicalUnionOp, LogicalValuesOp, TopNPhase,
+        LogicalAggregateOp, LogicalJoinOp, ProjectOp, ScanOp, SortOp, TopNOp, TopNPhase, UnionOp,
+        ValuesOp,
     };
     use crate::sql::optimizer::rule::NewExpr;
     use crate::sql::optimizer::scalar_bridge::{
@@ -578,7 +578,7 @@ mod tests {
     fn scan_group(memo: &mut Memo) -> usize {
         let scan = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalScan(LogicalScanOp {
+            op: Operator::LogicalScan(ScanOp {
                 database: "db".to_string(),
                 table: TableDef {
                     name: "t".to_string(),
@@ -628,7 +628,7 @@ mod tests {
             .collect::<Vec<_>>();
         let group = memo.new_group(MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalValues(LogicalValuesOp {
+            op: Operator::LogicalValues(ValuesOp {
                 rows: vec![],
                 columns: columns.clone(),
             }),
@@ -689,7 +689,7 @@ mod tests {
             .collect::<Vec<_>>();
         memo.new_group(MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalUnion(LogicalUnionOp {
+            op: Operator::LogicalUnion(UnionOp {
                 all,
                 output_columns,
                 child_output_columns,
@@ -709,7 +709,7 @@ mod tests {
     ) -> MExpr {
         MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalTopN(LogicalTopNOp {
+            op: Operator::LogicalTopN(TopNOp {
                 items: intern_sort_items(&mut memo.scalars, &[item]),
                 limit: Some(limit),
                 offset: Some(offset),
@@ -767,7 +767,7 @@ mod tests {
     fn sort_with_items(memo: &mut Memo, items: Vec<SortItem>, child_group: usize) -> MExpr {
         MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalSort(LogicalSortOp {
+            op: Operator::LogicalSort(SortOp {
                 items: intern_sort_items(&mut memo.scalars, &items),
                 analytic_partition_exprs: Vec::new(),
                 partition_limit: None,
@@ -785,7 +785,7 @@ mod tests {
     fn project_with_items(memo: &mut Memo, items: Vec<ProjectItem>, child_group: usize) -> MExpr {
         MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalProject(LogicalProjectOp {
+            op: Operator::LogicalProject(ProjectOp {
                 items: intern_project_items(&mut memo.scalars, &items),
                 output_qualifier: None,
             }),
@@ -874,7 +874,7 @@ mod tests {
     ) -> MExpr {
         MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalSort(LogicalSortOp {
+            op: Operator::LogicalSort(SortOp {
                 items: intern_sort_items(&mut memo.scalars, &items),
                 analytic_partition_exprs: intern_exprs(&mut memo.scalars, &[col(2)]),
                 partition_limit: None,
@@ -896,7 +896,7 @@ mod tests {
     fn partition_topn_sort(memo: &mut Memo, items: Vec<SortItem>, child_group: usize) -> MExpr {
         MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalSort(LogicalSortOp {
+            op: Operator::LogicalSort(SortOp {
                 items: intern_sort_items(&mut memo.scalars, &items),
                 analytic_partition_exprs: intern_exprs(&mut memo.scalars, &[col(2)]),
                 partition_limit: Some(2),

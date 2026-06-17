@@ -6,7 +6,7 @@
 //! ordering required by the first window signature.
 
 use crate::sql::column_id::ColumnId;
-use crate::sql::optimizer::operator::PhysicalWindowOp;
+use crate::sql::optimizer::operator::WindowOp;
 use crate::sql::optimizer::property::{
     DistributionSpec, OrderingSpec, PhysicalPropertySet, typed_expr_to_column_id,
     window_ordering_spec,
@@ -17,7 +17,7 @@ use crate::sql::planner::plan::WindowExpr;
 
 use super::{DeriveOutput, DeriveRequired};
 
-impl DeriveOutput for PhysicalWindowOp {
+impl DeriveOutput for WindowOp {
     fn derive_output(
         &self,
         scalars: &ScalarArena,
@@ -37,7 +37,7 @@ impl DeriveOutput for PhysicalWindowOp {
     }
 }
 
-impl DeriveRequired for PhysicalWindowOp {
+impl DeriveRequired for WindowOp {
     fn derive_required(
         &self,
         scalars: &ScalarArena,
@@ -130,7 +130,7 @@ mod tests {
         }
     }
 
-    fn window_op(scalars: &mut ScalarArena, exprs: Vec<WindowExpr>) -> PhysicalWindowOp {
+    fn window_op(scalars: &mut ScalarArena, exprs: Vec<WindowExpr>) -> WindowOp {
         let output_columns = exprs
             .iter()
             .enumerate()
@@ -143,7 +143,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let window_exprs = intern_window_exprs(scalars, &exprs);
-        PhysicalWindowOp {
+        WindowOp {
             window_exprs,
             output_columns,
         }

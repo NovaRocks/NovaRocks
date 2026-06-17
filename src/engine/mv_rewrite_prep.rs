@@ -189,7 +189,7 @@ fn build_candidate(
 
     // 4. Build the executable target TableDef via the iceberg connector pair
     //    (same mechanism as register_external_table_by_name; no global
-    //    registration needed — LogicalScanOp embeds the TableDef).
+    //    registration needed — ScanOp embeds the TableDef).
     let (Some(cat), Some(ns), Some(tbl)) = (
         &def.target_catalog,
         &def.target_namespace,

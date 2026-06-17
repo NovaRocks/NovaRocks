@@ -5,7 +5,7 @@
 //! TopN has [grandchild_group].
 
 use crate::sql::optimizer::memo::{MExpr, Memo};
-use crate::sql::optimizer::operator::{LogicalTopNOp, Operator, TopNPhase};
+use crate::sql::optimizer::operator::{Operator, TopNOp, TopNPhase};
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
 
 pub(crate) struct SortLimitToTopN;
@@ -62,7 +62,7 @@ impl Rule for SortLimitToTopN {
             }
             let grandchild_group_id = child_mexpr.children[0];
             results.push(NewExpr {
-                op: Operator::LogicalTopN(LogicalTopNOp {
+                op: Operator::LogicalTopN(TopNOp {
                     items: sort_op.items.clone(),
                     limit: limit_op.limit,
                     offset: limit_op.offset,
@@ -80,13 +80,13 @@ impl Rule for SortLimitToTopN {
 mod tests {
     use super::*;
     use crate::sql::optimizer::memo::Memo;
-    use crate::sql::optimizer::operator::{LogicalLimitOp, LogicalScanOp, LogicalSortOp};
+    use crate::sql::optimizer::operator::{LimitOp, ScanOp, SortOp};
     use crate::sql::optimizer::scalar::intern_typed;
 
     fn mk_scan_mexpr(memo: &mut Memo) -> MExpr {
         MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalScan(LogicalScanOp {
+            op: Operator::LogicalScan(ScanOp {
                 database: "db".into(),
                 table: crate::sql::catalog::TableDef {
                     name: "t".into(),
@@ -117,7 +117,7 @@ mod tests {
 
         let sort_mexpr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalSort(LogicalSortOp {
+            op: Operator::LogicalSort(SortOp {
                 items: vec![],
                 analytic_partition_exprs: Vec::new(),
                 partition_limit: None,
@@ -129,7 +129,7 @@ mod tests {
 
         let limit_mexpr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalLimit(LogicalLimitOp {
+            op: Operator::LogicalLimit(LimitOp {
                 limit: Some(100),
                 offset: None,
             }),
@@ -158,7 +158,7 @@ mod tests {
 
         let limit_mexpr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalLimit(LogicalLimitOp {
+            op: Operator::LogicalLimit(LimitOp {
                 limit: Some(10),
                 offset: None,
             }),
@@ -183,7 +183,7 @@ mod tests {
 
         let sort_mexpr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalSort(LogicalSortOp {
+            op: Operator::LogicalSort(SortOp {
                 items: vec![],
                 analytic_partition_exprs: Vec::new(),
                 partition_limit: None,
@@ -195,7 +195,7 @@ mod tests {
 
         let limit_mexpr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalLimit(LogicalLimitOp {
+            op: Operator::LogicalLimit(LimitOp {
                 limit: None,
                 offset: Some(5),
             }),
@@ -229,7 +229,7 @@ mod tests {
 
         let sort_mexpr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalSort(LogicalSortOp {
+            op: Operator::LogicalSort(SortOp {
                 items: vec![],
                 // non-empty: partition-topn Sort always carries these
                 analytic_partition_exprs: vec![partition_expr],
@@ -242,7 +242,7 @@ mod tests {
 
         let limit_mexpr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalLimit(LogicalLimitOp {
+            op: Operator::LogicalLimit(LimitOp {
                 limit: Some(10),
                 offset: None,
             }),

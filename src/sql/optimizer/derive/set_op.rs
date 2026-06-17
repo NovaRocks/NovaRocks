@@ -6,7 +6,7 @@
 //! fragments.
 
 use crate::sql::analysis::OutputColumn;
-use crate::sql::optimizer::operator::{PhysicalExceptOp, PhysicalIntersectOp, PhysicalUnionOp};
+use crate::sql::optimizer::operator::{ExceptOp, IntersectOp, UnionOp};
 use crate::sql::optimizer::property::{
     DistributionSpec, HashSource, OrderingSpec, PhysicalPropertySet,
 };
@@ -48,7 +48,7 @@ fn set_op_required(
         .collect()
 }
 
-impl DeriveOutput for PhysicalUnionOp {
+impl DeriveOutput for UnionOp {
     fn derive_output(
         &self,
         _scalars: &ScalarArena,
@@ -62,7 +62,7 @@ impl DeriveOutput for PhysicalUnionOp {
     }
 }
 
-impl DeriveRequired for PhysicalUnionOp {
+impl DeriveRequired for UnionOp {
     fn derive_required(
         &self,
         _scalars: &ScalarArena,
@@ -77,7 +77,7 @@ impl DeriveRequired for PhysicalUnionOp {
     }
 }
 
-impl DeriveOutput for PhysicalIntersectOp {
+impl DeriveOutput for IntersectOp {
     fn derive_output(
         &self,
         _scalars: &ScalarArena,
@@ -87,7 +87,7 @@ impl DeriveOutput for PhysicalIntersectOp {
     }
 }
 
-impl DeriveRequired for PhysicalIntersectOp {
+impl DeriveRequired for IntersectOp {
     fn derive_required(
         &self,
         _scalars: &ScalarArena,
@@ -98,7 +98,7 @@ impl DeriveRequired for PhysicalIntersectOp {
     }
 }
 
-impl DeriveOutput for PhysicalExceptOp {
+impl DeriveOutput for ExceptOp {
     fn derive_output(
         &self,
         _scalars: &ScalarArena,
@@ -108,7 +108,7 @@ impl DeriveOutput for PhysicalExceptOp {
     }
 }
 
-impl DeriveRequired for PhysicalExceptOp {
+impl DeriveRequired for ExceptOp {
     fn derive_required(
         &self,
         _scalars: &ScalarArena,
@@ -140,7 +140,7 @@ mod tests {
 
     #[test]
     fn except_requires_each_child_shuffle_by_its_position_aligned_set_keys() {
-        let op = PhysicalExceptOp {
+        let op = ExceptOp {
             output_columns: vec![col(10, "k")],
             child_output_columns: vec![vec![col(10, "k")], vec![col(20, "k")]],
         };
@@ -167,7 +167,7 @@ mod tests {
 
     #[test]
     fn intersect_outputs_shuffle_by_declared_set_keys() {
-        let op = PhysicalIntersectOp {
+        let op = IntersectOp {
             output_columns: vec![col(30, "k")],
             child_output_columns: vec![vec![col(10, "k")], vec![col(20, "k")]],
         };
@@ -186,7 +186,7 @@ mod tests {
 
     #[test]
     fn union_all_keeps_children_unconstrained() {
-        let op = PhysicalUnionOp {
+        let op = UnionOp {
             all: true,
             output_columns: vec![col(10, "k")],
             child_output_columns: vec![vec![col(10, "k")], vec![col(20, "k")]],

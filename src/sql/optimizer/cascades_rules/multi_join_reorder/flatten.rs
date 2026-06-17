@@ -154,7 +154,7 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn};
     use crate::sql::optimizer::memo::{JoinTree, LogicalProperties, MExpr};
-    use crate::sql::optimizer::operator::LogicalValuesOp;
+    use crate::sql::optimizer::operator::ValuesOp;
     use crate::sql::optimizer::scalar::intern_typed;
     use crate::sql::optimizer::statistics::ColumnStatistic;
     use crate::sql::optimizer::stats::copy_in_join_tree;
@@ -217,7 +217,7 @@ mod tests {
     fn leaf(memo: &mut Memo, col_id: u32, rows: f64) -> GroupId {
         let g = memo.new_group(MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalValues(LogicalValuesOp {
+            op: Operator::LogicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![],
             }),

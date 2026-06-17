@@ -330,7 +330,7 @@ mod tests {
     /// Build a simple memo with a single PhysicalScan group.
     pub(super) fn single_scan_memo() -> (Memo, GroupId) {
         let mut memo = Memo::new();
-        let scan_op = Operator::PhysicalScan(PhysicalScanOp {
+        let scan_op = Operator::PhysicalScan(ScanOp {
             database: "db".into(),
             table: crate::sql::catalog::TableDef {
                 name: "t".into(),
@@ -410,7 +410,7 @@ mod tests {
         let mut memo = Memo::new();
         let left_group = memo.new_group(MExpr {
             id: 0,
-            op: Operator::PhysicalScan(PhysicalScanOp {
+            op: Operator::PhysicalScan(ScanOp {
                 database: "db".into(),
                 table: crate::sql::catalog::TableDef {
                     name: "left_t".into(),
@@ -433,7 +433,7 @@ mod tests {
         });
         let right_group = memo.new_group(MExpr {
             id: 1,
-            op: Operator::PhysicalScan(PhysicalScanOp {
+            op: Operator::PhysicalScan(ScanOp {
                 database: "db".into(),
                 table: crate::sql::catalog::TableDef {
                     name: "right_t".into(),
@@ -548,7 +548,7 @@ mod tests {
         let mut memo = Memo::new();
         let left_scan = memo.new_group(MExpr {
             id: memo.next_expr_id(),
-            op: Operator::PhysicalValues(PhysicalValuesOp {
+            op: Operator::PhysicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![],
             }),
@@ -556,7 +556,7 @@ mod tests {
         });
         let right_scan = memo.new_group(MExpr {
             id: memo.next_expr_id(),
-            op: Operator::PhysicalValues(PhysicalValuesOp {
+            op: Operator::PhysicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![],
             }),
@@ -594,7 +594,7 @@ mod tests {
         let mut memo = Memo::new();
         let child_group = memo.new_group(MExpr {
             id: 0,
-            op: Operator::PhysicalScan(PhysicalScanOp {
+            op: Operator::PhysicalScan(ScanOp {
                 database: "db".into(),
                 table: crate::sql::catalog::TableDef {
                     name: "single_child".into(),
@@ -667,7 +667,7 @@ mod tests {
     fn empty_group_returns_infinity() {
         let mut memo = Memo::new();
         // Create a group with only a logical expr (no physical).
-        let logical_op = Operator::LogicalScan(LogicalScanOp {
+        let logical_op = Operator::LogicalScan(ScanOp {
             database: "db".into(),
             table: crate::sql::catalog::TableDef {
                 name: "t".into(),
@@ -967,7 +967,7 @@ mod cascaded_derivation_tests {
     }
 
     fn scan_op(table: &str) -> Operator {
-        Operator::PhysicalScan(PhysicalScanOp {
+        Operator::PhysicalScan(ScanOp {
             database: "db".into(),
             table: crate::sql::catalog::TableDef {
                 name: table.into(),
@@ -1072,7 +1072,7 @@ mod cascaded_derivation_tests {
             output_column_id: crate::sql::column_id::ColumnId::UNSET,
             result_type: DataType::Int64,
         };
-        let window = Operator::PhysicalWindow(PhysicalWindowOp {
+        let window = Operator::PhysicalWindow(WindowOp {
             window_exprs: intern_window_exprs(&mut memo.scalars, &[window_expr]),
             output_columns: vec![crate::sql::analysis::OutputColumn {
                 column_id: ColumnId(1000),

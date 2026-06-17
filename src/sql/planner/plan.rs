@@ -229,7 +229,7 @@ pub(crate) struct LogicalSortNode {
     /// Populated by `build_window_and_project` when this Sort was inserted
     /// as a precursor to a Window operator (PARTITION BY ...). Carries the
     /// window's partition_by columns, which become the analytic-partition
-    /// tag on the downstream LogicalSortOp / PhysicalSortOp / TSortNode.
+    /// tag on the downstream SortOp / SortOp / TSortNode.
     /// Empty for top-level `ORDER BY` sorts.
     pub analytic_partition_by: Vec<TypedExpr>,
     /// Set by RankingWindowPredicatePushdown: per-partition rank cap + ranking

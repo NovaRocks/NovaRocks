@@ -1146,8 +1146,7 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::explain::ExplainLevel;
     use crate::sql::optimizer::operator::{
-        AggMode, Operator, PhysicalDistributionOp, PhysicalHashAggregateOp, PhysicalProjectOp,
-        PhysicalScanOp,
+        AggMode, Operator, PhysicalDistributionOp, PhysicalHashAggregateOp, ProjectOp, ScanOp,
     };
     use crate::sql::optimizer::options::OptimizerOptions;
     use crate::sql::optimizer::physical_plan::{
@@ -1340,7 +1339,7 @@ mod tests {
         let k = output_col(1, "k", DataType::Int64, false);
         let v = output_col(2, "v", DataType::Int64, true);
         physical_node(
-            Operator::PhysicalScan(PhysicalScanOp {
+            Operator::PhysicalScan(ScanOp {
                 database: "test_db".to_string(),
                 table: table_def(),
                 alias: Some("t".to_string()),
@@ -1365,7 +1364,7 @@ mod tests {
             output_column_id: ColumnId::new_for_test(1),
         }];
         physical_node_with_scalars(
-            Operator::PhysicalProject(PhysicalProjectOp {
+            Operator::PhysicalProject(ProjectOp {
                 items: intern_project_items(&mut scalars, &items),
                 output_qualifier: None,
             }),
@@ -1408,7 +1407,7 @@ mod tests {
         let mut scalars = scalars_from_children(std::slice::from_ref(&child));
         let output_columns = child.output_columns.clone();
         physical_node_with_scalars(
-            Operator::PhysicalSort(crate::sql::optimizer::operator::PhysicalSortOp {
+            Operator::PhysicalSort(crate::sql::optimizer::operator::SortOp {
                 items: intern_sort_items(
                     &mut scalars,
                     &[SortItem {

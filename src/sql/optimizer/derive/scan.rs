@@ -1,15 +1,13 @@
 //! Leaf operators: Scan, Values, GenerateSeries, CTEConsume.
 //! All return `Any` output and require no children.
 
-use crate::sql::optimizer::operator::{
-    PhysicalCTEConsumeOp, PhysicalGenerateSeriesOp, PhysicalScanOp, PhysicalValuesOp,
-};
+use crate::sql::optimizer::operator::{CTEConsumeOp, GenerateSeriesOp, ScanOp, ValuesOp};
 use crate::sql::optimizer::property::PhysicalPropertySet;
 use crate::sql::optimizer::scalar::ScalarArena;
 
 use super::{DeriveOutput, DeriveRequired};
 
-impl DeriveOutput for PhysicalScanOp {
+impl DeriveOutput for ScanOp {
     fn derive_output(
         &self,
         _scalars: &ScalarArena,
@@ -19,7 +17,7 @@ impl DeriveOutput for PhysicalScanOp {
     }
 }
 
-impl DeriveRequired for PhysicalScanOp {
+impl DeriveRequired for ScanOp {
     fn derive_required(
         &self,
         _scalars: &ScalarArena,
@@ -30,7 +28,7 @@ impl DeriveRequired for PhysicalScanOp {
     }
 }
 
-impl DeriveOutput for PhysicalValuesOp {
+impl DeriveOutput for ValuesOp {
     fn derive_output(
         &self,
         _scalars: &ScalarArena,
@@ -40,7 +38,7 @@ impl DeriveOutput for PhysicalValuesOp {
     }
 }
 
-impl DeriveRequired for PhysicalValuesOp {
+impl DeriveRequired for ValuesOp {
     fn derive_required(
         &self,
         _scalars: &ScalarArena,
@@ -51,7 +49,7 @@ impl DeriveRequired for PhysicalValuesOp {
     }
 }
 
-impl DeriveOutput for PhysicalGenerateSeriesOp {
+impl DeriveOutput for GenerateSeriesOp {
     fn derive_output(
         &self,
         _scalars: &ScalarArena,
@@ -61,7 +59,7 @@ impl DeriveOutput for PhysicalGenerateSeriesOp {
     }
 }
 
-impl DeriveRequired for PhysicalGenerateSeriesOp {
+impl DeriveRequired for GenerateSeriesOp {
     fn derive_required(
         &self,
         _scalars: &ScalarArena,
@@ -72,7 +70,7 @@ impl DeriveRequired for PhysicalGenerateSeriesOp {
     }
 }
 
-impl DeriveOutput for PhysicalCTEConsumeOp {
+impl DeriveOutput for CTEConsumeOp {
     fn derive_output(
         &self,
         _scalars: &ScalarArena,
@@ -82,7 +80,7 @@ impl DeriveOutput for PhysicalCTEConsumeOp {
     }
 }
 
-impl DeriveRequired for PhysicalCTEConsumeOp {
+impl DeriveRequired for CTEConsumeOp {
     fn derive_required(
         &self,
         _scalars: &ScalarArena,

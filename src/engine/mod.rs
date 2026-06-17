@@ -5358,8 +5358,7 @@ path = "{metadata_path}"
     fn single_fragment_collapse_removes_distribution_enforcers() {
         use crate::sql::analysis::JoinKind;
         use crate::sql::optimizer::operator::{
-            JoinDistribution, Operator, PhysicalDistributionOp, PhysicalHashJoinOp,
-            PhysicalValuesOp,
+            JoinDistribution, Operator, PhysicalDistributionOp, PhysicalHashJoinOp, ValuesOp,
         };
         use crate::sql::optimizer::physical_plan::{
             JoinExecutionDistribution, PhysicalPlanNode, PlanExecutionProps,
@@ -5378,7 +5377,7 @@ path = "{metadata_path}"
 
         fn values_node() -> PhysicalPlanNode {
             PhysicalPlanNode {
-                op: Operator::PhysicalValues(PhysicalValuesOp {
+                op: Operator::PhysicalValues(ValuesOp {
                     rows: Vec::new(),
                     columns: Vec::new(),
                 }),

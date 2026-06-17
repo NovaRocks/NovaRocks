@@ -56,8 +56,7 @@ pub(crate) fn passthrough_required_full(
 }
 
 use crate::sql::optimizer::operator::{
-    FilterOp, PhysicalCTEProduceOp, PhysicalDecodeOp, PhysicalLimitOp, PhysicalProjectOp,
-    PhysicalRepeatOp, PhysicalTableFunctionOp,
+    CTEProduceOp, DecodeOp, FilterOp, LimitOp, ProjectOp, RepeatOp, TableFunctionOp,
 };
 
 use super::{DeriveOutput, DeriveRequired};
@@ -90,14 +89,9 @@ macro_rules! passthrough_distribution_blind_impls {
     };
 }
 
-passthrough_distribution_blind_impls!(
-    FilterOp,
-    PhysicalProjectOp,
-    PhysicalDecodeOp,
-    PhysicalCTEProduceOp,
-);
+passthrough_distribution_blind_impls!(FilterOp, ProjectOp, DecodeOp, CTEProduceOp,);
 
-impl DeriveOutput for PhysicalRepeatOp {
+impl DeriveOutput for RepeatOp {
     fn derive_output(
         &self,
         _scalars: &ScalarArena,
@@ -111,7 +105,7 @@ impl DeriveOutput for PhysicalRepeatOp {
     }
 }
 
-impl DeriveRequired for PhysicalRepeatOp {
+impl DeriveRequired for RepeatOp {
     fn derive_required(
         &self,
         _scalars: &ScalarArena,
@@ -150,7 +144,7 @@ macro_rules! passthrough_full_impls {
     };
 }
 
-impl DeriveOutput for PhysicalLimitOp {
+impl DeriveOutput for LimitOp {
     fn derive_output(
         &self,
         _scalars: &ScalarArena,
@@ -166,7 +160,7 @@ impl DeriveOutput for PhysicalLimitOp {
     }
 }
 
-impl DeriveRequired for PhysicalLimitOp {
+impl DeriveRequired for LimitOp {
     fn derive_required(
         &self,
         _scalars: &ScalarArena,
@@ -180,14 +174,14 @@ impl DeriveRequired for PhysicalLimitOp {
     }
 }
 
-passthrough_full_impls!(PhysicalTableFunctionOp);
+passthrough_full_impls!(TableFunctionOp);
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::operator::{FilterOp, PhysicalLimitOp, PhysicalProjectOp};
+    use crate::sql::optimizer::operator::{FilterOp, LimitOp, ProjectOp};
     use crate::sql::optimizer::property::{DistributionSpec, OrderingSpec, SortKey};
     use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
     use arrow::datatypes::DataType;
@@ -203,15 +197,15 @@ mod tests {
         }
     }
 
-    fn make_minimal_limit_op() -> PhysicalLimitOp {
-        PhysicalLimitOp {
+    fn make_minimal_limit_op() -> LimitOp {
+        LimitOp {
             limit: Some(10),
             offset: None,
         }
     }
 
-    fn make_minimal_project_op() -> PhysicalProjectOp {
-        PhysicalProjectOp {
+    fn make_minimal_project_op() -> ProjectOp {
+        ProjectOp {
             items: vec![],
             output_qualifier: None,
         }
@@ -311,7 +305,7 @@ mod tests {
 
     #[test]
     fn repeat_output_does_not_inherit_child_hash_distribution() {
-        let op = PhysicalRepeatOp {
+        let op = RepeatOp {
             repeat_column_ref_list: vec![vec!["k".to_string()], vec![]],
             repeat_column_ref_ids: vec![vec![ColumnId(1)], vec![]],
             grouping_ids: vec![0, 1],

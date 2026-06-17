@@ -121,8 +121,8 @@ mod rf_field_tests {
     }
 
     fn make_test_op() -> Operator {
-        use crate::sql::optimizer::operator::PhysicalValuesOp;
-        Operator::PhysicalValues(PhysicalValuesOp {
+        use crate::sql::optimizer::operator::ValuesOp;
+        Operator::PhysicalValues(ValuesOp {
             rows: vec![],
             columns: vec![],
         })

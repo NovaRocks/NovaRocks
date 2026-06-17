@@ -5,14 +5,14 @@
 //! argument as a global LIMIT). Output mirrors the child's output; ordering
 //! requirements pass through.
 
-use crate::sql::optimizer::operator::PhysicalAssertOneRowOp;
+use crate::sql::optimizer::operator::AssertOneRowOp;
 use crate::sql::optimizer::property::{DistributionSpec, PhysicalPropertySet};
 use crate::sql::optimizer::scalar::ScalarArena;
 
 use super::passthrough::passthrough_output;
 use super::{DeriveOutput, DeriveRequired};
 
-impl DeriveOutput for PhysicalAssertOneRowOp {
+impl DeriveOutput for AssertOneRowOp {
     fn derive_output(
         &self,
         _scalars: &ScalarArena,
@@ -22,7 +22,7 @@ impl DeriveOutput for PhysicalAssertOneRowOp {
     }
 }
 
-impl DeriveRequired for PhysicalAssertOneRowOp {
+impl DeriveRequired for AssertOneRowOp {
     fn derive_required(
         &self,
         _scalars: &ScalarArena,

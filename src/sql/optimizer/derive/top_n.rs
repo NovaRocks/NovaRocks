@@ -2,7 +2,7 @@
 
 use crate::sql::analysis::TypedExpr;
 use crate::sql::column_id::ColumnId;
-use crate::sql::optimizer::operator::{PhysicalTopNOp, TopNPhase};
+use crate::sql::optimizer::operator::{TopNOp, TopNPhase};
 use crate::sql::optimizer::property::{
     DistributionSpec, OrderingSpec, PhysicalPropertySet, SortKey,
 };
@@ -18,7 +18,7 @@ fn typed_expr_to_column_id(expr: &TypedExpr) -> Option<ColumnId> {
     }
 }
 
-impl DeriveOutput for PhysicalTopNOp {
+impl DeriveOutput for TopNOp {
     fn derive_output(
         &self,
         scalars: &ScalarArena,
@@ -51,7 +51,7 @@ impl DeriveOutput for PhysicalTopNOp {
     }
 }
 
-impl DeriveRequired for PhysicalTopNOp {
+impl DeriveRequired for TopNOp {
     fn derive_required(
         &self,
         _scalars: &ScalarArena,
@@ -76,7 +76,7 @@ mod tests {
     #[test]
     fn top_n_output_is_gather_when_sort_keys_resolve() {
         let scalars = ScalarArena::new();
-        let op = PhysicalTopNOp {
+        let op = TopNOp {
             items: vec![],
             limit: Some(100),
             offset: None,
@@ -92,7 +92,7 @@ mod tests {
     #[test]
     fn top_n_requires_gather_input() {
         let scalars = ScalarArena::new();
-        let op = PhysicalTopNOp {
+        let op = TopNOp {
             items: vec![],
             limit: Some(100),
             offset: None,
@@ -107,7 +107,7 @@ mod tests {
     #[test]
     fn top_n_partial_requires_any_and_provides_any() {
         let scalars = ScalarArena::new();
-        let op = PhysicalTopNOp {
+        let op = TopNOp {
             items: vec![],
             limit: Some(100),
             offset: None,
@@ -125,7 +125,7 @@ mod tests {
     #[test]
     fn top_n_final_split_requires_any_and_provides_gather() {
         let scalars = ScalarArena::new();
-        let op = PhysicalTopNOp {
+        let op = TopNOp {
             items: vec![],
             limit: Some(100),
             offset: None,
@@ -143,7 +143,7 @@ mod tests {
     #[test]
     fn top_n_non_column_sort_key_does_not_claim_ordering() {
         let mut scalars = ScalarArena::new();
-        let op = PhysicalTopNOp {
+        let op = TopNOp {
             items: intern_sort_items(
                 &mut scalars,
                 &[SortItem {

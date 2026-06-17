@@ -2,11 +2,9 @@
 
 use super::memo::{GroupId, MExpr, Memo};
 use super::operator::{
-    AggregateStateMergeOp, FilterOp, LogicalAggregateOp, LogicalAssertOneRowOp, LogicalCTEAnchorOp,
-    LogicalCTEConsumeOp, LogicalCTEProduceOp, LogicalDecodeOp, LogicalExceptOp,
-    LogicalGenerateSeriesOp, LogicalIntersectOp, LogicalJoinOp, LogicalLimitOp, LogicalProjectOp,
-    LogicalRepeatOp, LogicalScanOp, LogicalSortOp, LogicalTableFunctionOp, LogicalUnionOp,
-    LogicalValuesOp, LogicalWindowOp, Operator,
+    AggregateStateMergeOp, AssertOneRowOp, CTEAnchorOp, CTEConsumeOp, CTEProduceOp, DecodeOp,
+    ExceptOp, FilterOp, GenerateSeriesOp, IntersectOp, LimitOp, LogicalAggregateOp, LogicalJoinOp,
+    Operator, ProjectOp, RepeatOp, ScanOp, SortOp, TableFunctionOp, UnionOp, ValuesOp, WindowOp,
 };
 use crate::sql::optimizer::scalar::intern_typed;
 use crate::sql::optimizer::scalar_bridge::{
@@ -22,7 +20,7 @@ use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind};
 pub(crate) fn logical_plan_to_memo(plan: &LogicalPlanNode, memo: &mut Memo) -> GroupId {
     match &plan.kind {
         LogicalPlanNodeKind::Scan(node) => {
-            let op = Operator::LogicalScan(LogicalScanOp {
+            let op = Operator::LogicalScan(ScanOp {
                 database: node.database.clone(),
                 table: node.table.clone(),
                 alias: node.alias.clone(),
@@ -56,7 +54,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlanNode, memo: &mut Memo) -> G
 
         LogicalPlanNodeKind::Project(node) => {
             let child = logical_plan_to_memo(plan.unary_input(), memo);
-            let op = Operator::LogicalProject(LogicalProjectOp {
+            let op = Operator::LogicalProject(ProjectOp {
                 items: intern_project_items(&mut memo.scalars, &node.items),
                 output_qualifier: node.output_qualifier.clone(),
             });
@@ -105,7 +103,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlanNode, memo: &mut Memo) -> G
 
         LogicalPlanNodeKind::Sort(node) => {
             let child = logical_plan_to_memo(plan.unary_input(), memo);
-            let op = Operator::LogicalSort(LogicalSortOp {
+            let op = Operator::LogicalSort(SortOp {
                 items: intern_sort_items(&mut memo.scalars, &node.items),
                 analytic_partition_exprs: intern_exprs(
                     &mut memo.scalars,
@@ -124,7 +122,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlanNode, memo: &mut Memo) -> G
 
         LogicalPlanNodeKind::Limit(node) => {
             let child = logical_plan_to_memo(plan.unary_input(), memo);
-            let op = Operator::LogicalLimit(LogicalLimitOp {
+            let op = Operator::LogicalLimit(LimitOp {
                 limit: node.limit,
                 offset: node.offset,
             });
@@ -147,7 +145,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlanNode, memo: &mut Memo) -> G
                 .iter()
                 .map(|input| logical_plan_to_memo(input, memo))
                 .collect();
-            let op = Operator::LogicalUnion(LogicalUnionOp {
+            let op = Operator::LogicalUnion(UnionOp {
                 all: node.all,
                 output_columns: node.output_columns.clone(),
                 child_output_columns,
@@ -171,7 +169,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlanNode, memo: &mut Memo) -> G
                 .iter()
                 .map(|input| logical_plan_to_memo(input, memo))
                 .collect();
-            let op = Operator::LogicalIntersect(LogicalIntersectOp {
+            let op = Operator::LogicalIntersect(IntersectOp {
                 output_columns: node.output_columns.clone(),
                 child_output_columns,
             });
@@ -194,7 +192,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlanNode, memo: &mut Memo) -> G
                 .iter()
                 .map(|input| logical_plan_to_memo(input, memo))
                 .collect();
-            let op = Operator::LogicalExcept(LogicalExceptOp {
+            let op = Operator::LogicalExcept(ExceptOp {
                 output_columns: node.output_columns.clone(),
                 child_output_columns,
             });
@@ -207,7 +205,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlanNode, memo: &mut Memo) -> G
         }
 
         LogicalPlanNodeKind::Values(node) => {
-            let op = Operator::LogicalValues(LogicalValuesOp {
+            let op = Operator::LogicalValues(ValuesOp {
                 rows: node
                     .rows
                     .iter()
@@ -224,7 +222,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlanNode, memo: &mut Memo) -> G
         }
 
         LogicalPlanNodeKind::GenerateSeries(node) => {
-            let op = Operator::LogicalGenerateSeries(LogicalGenerateSeriesOp {
+            let op = Operator::LogicalGenerateSeries(GenerateSeriesOp {
                 start: node.start,
                 end: node.end,
                 step: node.step,
@@ -242,7 +240,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlanNode, memo: &mut Memo) -> G
 
         LogicalPlanNodeKind::TableFunction(node) => {
             let child = logical_plan_to_memo(plan.unary_input(), memo);
-            let op = Operator::LogicalTableFunction(LogicalTableFunctionOp {
+            let op = Operator::LogicalTableFunction(TableFunctionOp {
                 function_name: node.function_name.clone(),
                 args: intern_exprs(&mut memo.scalars, &node.args),
                 output_columns: node.output_columns.clone(),
@@ -259,7 +257,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlanNode, memo: &mut Memo) -> G
 
         LogicalPlanNodeKind::Window(node) => {
             let child = logical_plan_to_memo(plan.unary_input(), memo);
-            let op = Operator::LogicalWindow(LogicalWindowOp {
+            let op = Operator::LogicalWindow(WindowOp {
                 window_exprs: intern_window_exprs(&mut memo.scalars, &node.window_exprs),
                 output_columns: node.output_columns.clone(),
             });
@@ -273,7 +271,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlanNode, memo: &mut Memo) -> G
 
         LogicalPlanNodeKind::Repeat(node) => {
             let child = logical_plan_to_memo(plan.unary_input(), memo);
-            let op = Operator::LogicalRepeat(LogicalRepeatOp {
+            let op = Operator::LogicalRepeat(RepeatOp {
                 repeat_column_ref_list: node.repeat_column_ref_list.clone(),
                 repeat_column_ref_ids: node.repeat_column_ref_ids.clone(),
                 grouping_ids: node.grouping_ids.clone(),
@@ -293,7 +291,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlanNode, memo: &mut Memo) -> G
         }
 
         LogicalPlanNodeKind::CTEConsume(node) => {
-            let op = Operator::LogicalCTEConsume(LogicalCTEConsumeOp {
+            let op = Operator::LogicalCTEConsume(CTEConsumeOp {
                 cte_id: node.cte_id,
                 alias: node.alias.clone(),
                 output_columns: node.output_columns.clone(),
@@ -311,7 +309,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlanNode, memo: &mut Memo) -> G
             let consumer = logical_plan_to_memo(plan.child(1), memo);
             let expr = MExpr {
                 id: memo.next_expr_id(),
-                op: Operator::LogicalCTEAnchor(LogicalCTEAnchorOp {
+                op: Operator::LogicalCTEAnchor(CTEAnchorOp {
                     cte_id: node.cte_id,
                 }),
                 children: vec![produce, consumer],
@@ -321,7 +319,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlanNode, memo: &mut Memo) -> G
 
         LogicalPlanNodeKind::CTEProduce(node) => {
             let child = logical_plan_to_memo(plan.unary_input(), memo);
-            let op = Operator::LogicalCTEProduce(LogicalCTEProduceOp {
+            let op = Operator::LogicalCTEProduce(CTEProduceOp {
                 cte_id: node.cte_id,
                 output_columns: node.output_columns.clone(),
             });
@@ -338,7 +336,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlanNode, memo: &mut Memo) -> G
 
         LogicalPlanNodeKind::Decode(node) => {
             let child = logical_plan_to_memo(plan.unary_input(), memo);
-            let op = Operator::LogicalDecode(LogicalDecodeOp {
+            let op = Operator::LogicalDecode(DecodeOp {
                 mappings: node.mappings.clone(),
                 output_columns: node.output_columns.clone(),
             });
@@ -369,7 +367,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlanNode, memo: &mut Memo) -> G
 
         LogicalPlanNodeKind::AssertOneRow(node) => {
             let child = logical_plan_to_memo(plan.unary_input(), memo);
-            let op = Operator::LogicalAssertOneRow(LogicalAssertOneRowOp {
+            let op = Operator::LogicalAssertOneRow(AssertOneRowOp {
                 subquery_text: node.subquery_text.clone(),
             });
             let expr = MExpr {

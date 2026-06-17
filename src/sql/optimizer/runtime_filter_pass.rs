@@ -545,8 +545,7 @@ pub(crate) mod test_support {
     use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
-        JoinDistribution, Operator, PhysicalHashJoinEqCondition, PhysicalHashJoinOp,
-        PhysicalValuesOp,
+        JoinDistribution, Operator, PhysicalHashJoinEqCondition, PhysicalHashJoinOp, ValuesOp,
     };
     use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, attach_scalar_arena};
     use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
@@ -601,7 +600,7 @@ pub(crate) mod test_support {
 
     fn leaf(rows: f64, oc: OutputColumn) -> PhysicalPlanNode {
         PhysicalPlanNode {
-            op: Operator::PhysicalValues(PhysicalValuesOp {
+            op: Operator::PhysicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![],
             }),
@@ -915,14 +914,14 @@ pub(crate) mod test_support {
     }
 
     pub(crate) fn join_with_project_over_probe_scan() -> PhysicalPlanNode {
-        use crate::sql::optimizer::operator::PhysicalProjectOp;
+        use crate::sql::optimizer::operator::ProjectOp;
         let mut scalars = ScalarArena::new();
         let (loc, lexpr) = col(1, "lc"); // probe column
         let (roc, rexpr) = col(2, "rc"); // build column
         // probe side: PhysicalProject(node) over a leaf scan; both expose column 1.
         let scan = leaf(1_000_000.0, loc.clone());
         let project = PhysicalPlanNode {
-            op: Operator::PhysicalProject(PhysicalProjectOp {
+            op: Operator::PhysicalProject(ProjectOp {
                 items: vec![],
                 output_qualifier: None,
             }),

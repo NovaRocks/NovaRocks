@@ -1,7 +1,7 @@
 //! Sort: top-level ORDER BY (Gather + Required) or analytic precursor
 //! (Hash(partition_cols) + Required).
 
-use crate::sql::optimizer::operator::PhysicalSortOp;
+use crate::sql::optimizer::operator::SortOp;
 use crate::sql::optimizer::property::{
     DistributionSpec, OrderingSpec, PhysicalPropertySet, typed_exprs_to_column_ids,
 };
@@ -10,7 +10,7 @@ use crate::sql::optimizer::scalar_bridge::{materialize_exprs, materialize_sort_k
 
 use super::{DeriveOutput, DeriveRequired};
 
-impl DeriveOutput for PhysicalSortOp {
+impl DeriveOutput for SortOp {
     fn derive_output(
         &self,
         scalars: &ScalarArena,
@@ -32,7 +32,7 @@ impl DeriveOutput for PhysicalSortOp {
     }
 }
 
-impl DeriveRequired for PhysicalSortOp {
+impl DeriveRequired for SortOp {
     fn derive_required(
         &self,
         scalars: &ScalarArena,
@@ -74,7 +74,7 @@ mod tests {
             nullable: false,
         };
         let mut scalars = ScalarArena::new();
-        let op = PhysicalSortOp {
+        let op = SortOp {
             items: intern_sort_items(
                 &mut scalars,
                 &[SortItem {
@@ -105,7 +105,7 @@ mod tests {
         };
         let mut scalars = ScalarArena::new();
         let partition = intern_typed(&mut scalars, &partition);
-        let op = PhysicalSortOp {
+        let op = SortOp {
             items: vec![],
             analytic_partition_exprs: vec![partition],
             partition_limit: None,

@@ -1373,9 +1373,9 @@ fn derive_window_statistics(
     child_stats
 }
 
-/// Derive scan statistics from a `LogicalScanOp`.
+/// Derive scan statistics from a `ScanOp`.
 fn derive_scan(
-    scan: &super::operator::LogicalScanOp,
+    scan: &super::operator::ScanOp,
     scalars: &ScalarArena,
     table_stats: &HashMap<String, TableStatistics>,
 ) -> Statistics {
@@ -2114,7 +2114,7 @@ mod tests {
     #[test]
     fn physical_scan_uses_same_confidence_rules_as_logical_scan() {
         use crate::sql::optimizer::memo::MExpr;
-        use crate::sql::optimizer::operator::{Operator, PhysicalScanOp};
+        use crate::sql::optimizer::operator::{Operator, ScanOp};
 
         let (name, ts) = make_table_stats("orders", 100_000, &[("id", 100.0)]);
         let mut table_stats = HashMap::new();
@@ -2128,7 +2128,7 @@ mod tests {
         let predicates = intern_exprs(&mut memo.scalars, &scan.predicates);
         let expr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::PhysicalScan(PhysicalScanOp {
+            op: Operator::PhysicalScan(ScanOp {
                 database: scan.database,
                 table: scan.table,
                 alias: scan.alias,
@@ -2155,12 +2155,12 @@ mod tests {
     #[test]
     fn child_statistics_preserves_logical_props_row_count_confidence() {
         use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
-        use crate::sql::optimizer::operator::{LogicalValuesOp, Operator};
+        use crate::sql::optimizer::operator::{Operator, ValuesOp};
 
         let mut memo = Memo::new();
         let child = memo.new_group(MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalValues(LogicalValuesOp {
+            op: Operator::LogicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![],
             }),
@@ -2182,9 +2182,7 @@ mod tests {
         use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
         use crate::sql::column_id::ColumnId;
         use crate::sql::optimizer::memo::{LogicalProperties, MExpr, Memo};
-        use crate::sql::optimizer::operator::{
-            AggStage, LogicalAggregateOp, LogicalValuesOp, Operator,
-        };
+        use crate::sql::optimizer::operator::{AggStage, LogicalAggregateOp, Operator, ValuesOp};
         use crate::sql::optimizer::statistics::ColumnStatistic;
         use crate::sql::planner::plan::AggregateCall;
 
@@ -2225,7 +2223,7 @@ mod tests {
             let id = memo.next_expr_id();
             memo.new_group(MExpr {
                 id,
-                op: Operator::LogicalValues(LogicalValuesOp {
+                op: Operator::LogicalValues(ValuesOp {
                     rows: vec![],
                     columns: vec![],
                 }),
@@ -2348,11 +2346,11 @@ mod tests {
         stat: ColumnStatistic,
     ) -> usize {
         use crate::sql::optimizer::memo::LogicalProperties;
-        use crate::sql::optimizer::operator::{LogicalValuesOp, Operator};
+        use crate::sql::optimizer::operator::{Operator, ValuesOp};
 
         let group = memo.new_group(MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalValues(LogicalValuesOp {
+            op: Operator::LogicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![],
             }),
@@ -2374,11 +2372,11 @@ mod tests {
         output_name: &str,
     ) -> usize {
         use crate::sql::optimizer::memo::LogicalProperties;
-        use crate::sql::optimizer::operator::{LogicalValuesOp, Operator};
+        use crate::sql::optimizer::operator::{Operator, ValuesOp};
 
         let group = memo.new_group(MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalValues(LogicalValuesOp {
+            op: Operator::LogicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![],
             }),
@@ -2393,7 +2391,7 @@ mod tests {
     #[test]
     fn logical_union_all_saturates_rows_and_caps_merged_column_ndv() {
         use crate::sql::optimizer::estimate::arith::MAX_ROW_COUNT;
-        use crate::sql::optimizer::operator::{LogicalUnionOp, Operator};
+        use crate::sql::optimizer::operator::{Operator, UnionOp};
 
         let mut memo = Memo::new();
         let left = set_op_child_group(
@@ -2412,7 +2410,7 @@ mod tests {
         );
         let union = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalUnion(LogicalUnionOp {
+            op: Operator::LogicalUnion(UnionOp {
                 all: true,
                 output_columns: vec![stats_output_column(10, "k")],
                 child_output_columns: vec![],
@@ -2435,7 +2433,7 @@ mod tests {
 
     #[test]
     fn logical_union_distinct_applies_correlation_and_merges_column_ranges() {
-        use crate::sql::optimizer::operator::{LogicalUnionOp, Operator};
+        use crate::sql::optimizer::operator::{Operator, UnionOp};
 
         let mut memo = Memo::new();
         let left = set_op_child_group(
@@ -2454,7 +2452,7 @@ mod tests {
         );
         let union = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalUnion(LogicalUnionOp {
+            op: Operator::LogicalUnion(UnionOp {
                 all: false,
                 output_columns: vec![stats_output_column(10, "k")],
                 child_output_columns: vec![],
@@ -2477,7 +2475,7 @@ mod tests {
 
     #[test]
     fn logical_union_column_stat_missing_child_degrades_confidence() {
-        use crate::sql::optimizer::operator::{LogicalUnionOp, Operator};
+        use crate::sql::optimizer::operator::{Operator, UnionOp};
 
         let mut memo = Memo::new();
         let left = set_op_child_group(
@@ -2491,7 +2489,7 @@ mod tests {
             set_op_child_group_without_column_stat(&mut memo, 200.0, Confidence::Exact, "right_k");
         let union = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalUnion(LogicalUnionOp {
+            op: Operator::LogicalUnion(UnionOp {
                 all: true,
                 output_columns: vec![stats_output_column(10, "k")],
                 child_output_columns: vec![],
@@ -2511,7 +2509,7 @@ mod tests {
 
     #[test]
     fn logical_intersect_halves_min_rows_and_uses_min_column_ndv() {
-        use crate::sql::optimizer::operator::{LogicalIntersectOp, Operator};
+        use crate::sql::optimizer::operator::{IntersectOp, Operator};
 
         let mut memo = Memo::new();
         let left = set_op_child_group(
@@ -2530,7 +2528,7 @@ mod tests {
         );
         let intersect = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalIntersect(LogicalIntersectOp {
+            op: Operator::LogicalIntersect(IntersectOp {
                 output_columns: vec![stats_output_column(10, "k")],
                 child_output_columns: vec![],
             }),
@@ -2552,7 +2550,7 @@ mod tests {
 
     #[test]
     fn logical_except_halves_first_rows_and_merges_column_stats_with_min_ndv() {
-        use crate::sql::optimizer::operator::{LogicalExceptOp, Operator};
+        use crate::sql::optimizer::operator::{ExceptOp, Operator};
 
         let mut memo = Memo::new();
         let left = set_op_child_group(
@@ -2571,7 +2569,7 @@ mod tests {
         );
         let except = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalExcept(LogicalExceptOp {
+            op: Operator::LogicalExcept(ExceptOp {
                 output_columns: vec![stats_output_column(10, "k")],
                 child_output_columns: vec![],
             }),
@@ -2608,12 +2606,12 @@ mod tests {
         row_count_confidence: Confidence,
     ) -> usize {
         use crate::sql::optimizer::memo::LogicalProperties;
-        use crate::sql::optimizer::operator::{LogicalValuesOp, Operator};
+        use crate::sql::optimizer::operator::{Operator, ValuesOp};
 
         let id = memo.next_expr_id();
         let group = memo.new_group(MExpr {
             id,
-            op: Operator::LogicalValues(LogicalValuesOp {
+            op: Operator::LogicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![],
             }),
@@ -2834,7 +2832,7 @@ mod tests {
         use crate::sql::column_id::ColumnId;
         use crate::sql::optimizer::memo::{LogicalProperties, MExpr, Memo};
         use crate::sql::optimizer::operator::{
-            AggMode, LogicalValuesOp, Operator, PhysicalHashAggregateOp,
+            AggMode, Operator, PhysicalHashAggregateOp, ValuesOp,
         };
         use crate::sql::optimizer::statistics::ColumnStatistic;
         use std::collections::HashMap;
@@ -2864,7 +2862,7 @@ mod tests {
             let id = memo.next_expr_id();
             let g = memo.new_group(MExpr {
                 id,
-                op: Operator::LogicalValues(LogicalValuesOp {
+                op: Operator::LogicalValues(ValuesOp {
                     rows: vec![],
                     columns: vec![],
                 }),
@@ -2985,11 +2983,11 @@ mod tests {
 
     fn filter_ndv_child_group(memo: &mut Memo) -> usize {
         use crate::sql::optimizer::memo::LogicalProperties;
-        use crate::sql::optimizer::operator::{LogicalValuesOp, Operator};
+        use crate::sql::optimizer::operator::{Operator, ValuesOp};
 
         let group = memo.new_group(MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalValues(LogicalValuesOp {
+            op: Operator::LogicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![],
             }),
@@ -3110,8 +3108,7 @@ mod tests {
     fn physical_hash_join_stats_use_shared_cardinality_estimator() {
         use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
         use crate::sql::optimizer::operator::{
-            JoinDistribution, LogicalValuesOp, Operator, PhysicalHashJoinEqCondition,
-            PhysicalHashJoinOp,
+            JoinDistribution, Operator, PhysicalHashJoinEqCondition, PhysicalHashJoinOp, ValuesOp,
         };
 
         fn column_stat(ndv: f64) -> ColumnStatistic {
@@ -3129,7 +3126,7 @@ mod tests {
             let id = memo.next_expr_id();
             let group = memo.new_group(MExpr {
                 id,
-                op: Operator::LogicalValues(LogicalValuesOp {
+                op: Operator::LogicalValues(ValuesOp {
                     rows: vec![],
                     columns: vec![],
                 }),
@@ -3187,8 +3184,7 @@ mod tests {
     fn physical_hash_join_caps_output_ndv_and_merges_key_equivalence() {
         use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
         use crate::sql::optimizer::operator::{
-            JoinDistribution, LogicalValuesOp, Operator, PhysicalHashJoinEqCondition,
-            PhysicalHashJoinOp,
+            JoinDistribution, Operator, PhysicalHashJoinEqCondition, PhysicalHashJoinOp, ValuesOp,
         };
 
         fn column_stat(ndv: f64) -> ColumnStatistic {
@@ -3205,7 +3201,7 @@ mod tests {
         fn values_group(memo: &mut Memo, rows: f64, stats: &[(&str, f64)]) -> usize {
             let group = memo.new_group(MExpr {
                 id: memo.next_expr_id(),
-                op: Operator::LogicalValues(LogicalValuesOp {
+                op: Operator::LogicalValues(ValuesOp {
                     rows: vec![],
                     columns: vec![],
                 }),
@@ -3268,7 +3264,7 @@ mod tests {
     #[test]
     fn logical_join_stats_use_shared_cardinality_estimator_for_condition() {
         use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
-        use crate::sql::optimizer::operator::{LogicalJoinOp, LogicalValuesOp, Operator};
+        use crate::sql::optimizer::operator::{LogicalJoinOp, Operator, ValuesOp};
 
         fn column_stat(ndv: f64) -> ColumnStatistic {
             ColumnStatistic {
@@ -3285,7 +3281,7 @@ mod tests {
             let id = memo.next_expr_id();
             let group = memo.new_group(MExpr {
                 id,
-                op: Operator::LogicalValues(LogicalValuesOp {
+                op: Operator::LogicalValues(ValuesOp {
                     rows: vec![],
                     columns: vec![],
                 }),
@@ -3332,7 +3328,7 @@ mod tests {
     #[test]
     fn logical_join_condition_merges_key_equivalence_and_caps_payload_ndv() {
         use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
-        use crate::sql::optimizer::operator::{LogicalJoinOp, LogicalValuesOp, Operator};
+        use crate::sql::optimizer::operator::{LogicalJoinOp, Operator, ValuesOp};
 
         fn column_stat(ndv: f64) -> ColumnStatistic {
             ColumnStatistic {
@@ -3348,7 +3344,7 @@ mod tests {
         fn values_group(memo: &mut Memo, rows: f64, stats: &[(&str, f64)]) -> usize {
             let group = memo.new_group(MExpr {
                 id: memo.next_expr_id(),
-                op: Operator::LogicalValues(LogicalValuesOp {
+                op: Operator::LogicalValues(ValuesOp {
                     rows: vec![],
                     columns: vec![],
                 }),
@@ -3412,7 +3408,7 @@ mod tests {
     #[test]
     fn logical_join_applies_only_residual_non_equi_selectivity() {
         use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
-        use crate::sql::optimizer::operator::{LogicalJoinOp, LogicalValuesOp, Operator};
+        use crate::sql::optimizer::operator::{LogicalJoinOp, Operator, ValuesOp};
 
         fn column_stat(ndv: f64) -> ColumnStatistic {
             ColumnStatistic {
@@ -3428,7 +3424,7 @@ mod tests {
         fn values_group(memo: &mut Memo, rows: f64, stats: &[(&str, f64)]) -> usize {
             let group = memo.new_group(MExpr {
                 id: memo.next_expr_id(),
-                op: Operator::LogicalValues(LogicalValuesOp {
+                op: Operator::LogicalValues(ValuesOp {
                     rows: vec![],
                     columns: vec![],
                 }),
@@ -3473,7 +3469,7 @@ mod tests {
     #[test]
     fn logical_join_reversed_condition_merges_key_equivalence() {
         use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
-        use crate::sql::optimizer::operator::{LogicalJoinOp, LogicalValuesOp, Operator};
+        use crate::sql::optimizer::operator::{LogicalJoinOp, Operator, ValuesOp};
 
         fn column_stat(ndv: f64) -> ColumnStatistic {
             ColumnStatistic {
@@ -3489,7 +3485,7 @@ mod tests {
         fn values_group(memo: &mut Memo, rows: f64, stats: &[(&str, f64)]) -> usize {
             let group = memo.new_group(MExpr {
                 id: memo.next_expr_id(),
-                op: Operator::LogicalValues(LogicalValuesOp {
+                op: Operator::LogicalValues(ValuesOp {
                     rows: vec![],
                     columns: vec![],
                 }),
@@ -3536,7 +3532,7 @@ mod tests {
     #[test]
     fn logical_join_nested_and_condition_merges_multiple_key_pairs() {
         use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
-        use crate::sql::optimizer::operator::{LogicalJoinOp, LogicalValuesOp, Operator};
+        use crate::sql::optimizer::operator::{LogicalJoinOp, Operator, ValuesOp};
 
         fn column_stat(ndv: f64) -> ColumnStatistic {
             ColumnStatistic {
@@ -3552,7 +3548,7 @@ mod tests {
         fn values_group(memo: &mut Memo, rows: f64, stats: &[(&str, f64)]) -> usize {
             let group = memo.new_group(MExpr {
                 id: memo.next_expr_id(),
-                op: Operator::LogicalValues(LogicalValuesOp {
+                op: Operator::LogicalValues(ValuesOp {
                     rows: vec![],
                     columns: vec![],
                 }),
@@ -3609,12 +3605,12 @@ mod tests {
     #[test]
     fn logical_join_unknown_key_ndv_does_not_collapse_real_side_to_one() {
         use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
-        use crate::sql::optimizer::operator::{LogicalJoinOp, LogicalValuesOp, Operator};
+        use crate::sql::optimizer::operator::{LogicalJoinOp, Operator, ValuesOp};
 
         fn values_group(memo: &mut Memo, rows: f64, name: &str, stat: ColumnStatistic) -> usize {
             let group = memo.new_group(MExpr {
                 id: memo.next_expr_id(),
-                op: Operator::LogicalValues(LogicalValuesOp {
+                op: Operator::LogicalValues(ValuesOp {
                     rows: vec![],
                     columns: vec![],
                 }),
@@ -3674,7 +3670,7 @@ mod tests {
     #[test]
     fn p4_self_join_same_name_columns_keep_distinct_statistics() {
         use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
-        use crate::sql::optimizer::operator::{LogicalJoinOp, LogicalValuesOp, Operator};
+        use crate::sql::optimizer::operator::{LogicalJoinOp, Operator, ValuesOp};
 
         fn column_stat(ndv: f64) -> ColumnStatistic {
             ColumnStatistic {
@@ -3702,7 +3698,7 @@ mod tests {
         fn values_group(memo: &mut Memo, rows: f64, column_id: ColumnId, ndv: f64) -> usize {
             let group = memo.new_group(MExpr {
                 id: memo.next_expr_id(),
-                op: Operator::LogicalValues(LogicalValuesOp {
+                op: Operator::LogicalValues(ValuesOp {
                     rows: vec![],
                     columns: vec![],
                 }),
@@ -3748,7 +3744,7 @@ mod tests {
     #[test]
     fn physical_nest_loop_join_stats_use_shared_cardinality_estimator_for_non_equi_semi() {
         use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
-        use crate::sql::optimizer::operator::{LogicalValuesOp, Operator, PhysicalNestLoopJoinOp};
+        use crate::sql::optimizer::operator::{Operator, PhysicalNestLoopJoinOp, ValuesOp};
 
         fn column_stat(ndv: f64) -> ColumnStatistic {
             ColumnStatistic {
@@ -3765,7 +3761,7 @@ mod tests {
             let id = memo.next_expr_id();
             let group = memo.new_group(MExpr {
                 id,
-                op: Operator::LogicalValues(LogicalValuesOp {
+                op: Operator::LogicalValues(ValuesOp {
                     rows: vec![],
                     columns: vec![],
                 }),
@@ -3812,7 +3808,7 @@ mod tests {
     #[test]
     fn physical_nest_loop_right_anti_keeps_only_right_side_stats() {
         use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
-        use crate::sql::optimizer::operator::{LogicalValuesOp, Operator, PhysicalNestLoopJoinOp};
+        use crate::sql::optimizer::operator::{Operator, PhysicalNestLoopJoinOp, ValuesOp};
 
         fn column_stat(ndv: f64) -> ColumnStatistic {
             ColumnStatistic {
@@ -3829,7 +3825,7 @@ mod tests {
             let id = memo.next_expr_id();
             let group = memo.new_group(MExpr {
                 id,
-                op: Operator::LogicalValues(LogicalValuesOp {
+                op: Operator::LogicalValues(ValuesOp {
                     rows: vec![],
                     columns: vec![],
                 }),
@@ -3875,9 +3871,7 @@ mod tests {
     #[test]
     fn window_stats_preserve_child_columns_and_mark_window_outputs_fallback() {
         use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
-        use crate::sql::optimizer::operator::{
-            LogicalValuesOp, LogicalWindowOp, Operator, PhysicalWindowOp,
-        };
+        use crate::sql::optimizer::operator::{Operator, ValuesOp, WindowOp};
 
         fn window_expr(output_name: &str) -> WindowExpr {
             WindowExpr {
@@ -3897,7 +3891,7 @@ mod tests {
         fn child_group(memo: &mut Memo) -> usize {
             let group = memo.new_group(MExpr {
                 id: memo.next_expr_id(),
-                op: Operator::LogicalValues(LogicalValuesOp {
+                op: Operator::LogicalValues(ValuesOp {
                     rows: vec![],
                     columns: vec![],
                 }),
@@ -3937,7 +3931,7 @@ mod tests {
         let logical_window_exprs = intern_window_exprs(&mut memo.scalars, &[window_expr("rn")]);
         let logical_window = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalWindow(LogicalWindowOp {
+            op: Operator::LogicalWindow(WindowOp {
                 window_exprs: logical_window_exprs,
                 output_columns: vec![stats_output_column(1, "base"), stats_output_column(2, "rn")],
             }),
@@ -3948,7 +3942,7 @@ mod tests {
         let physical_window_exprs = intern_window_exprs(&mut memo.scalars, &[window_expr("rn")]);
         let physical_window = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::PhysicalWindow(PhysicalWindowOp {
+            op: Operator::PhysicalWindow(WindowOp {
                 window_exprs: physical_window_exprs,
                 output_columns: vec![stats_output_column(1, "base"), stats_output_column(2, "rn")],
             }),
@@ -4120,7 +4114,7 @@ mod tests {
     #[test]
     fn cte_consume_remaps_produce_column_statistics_to_consume_columns() {
         use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
-        use crate::sql::optimizer::operator::{LogicalCTEConsumeOp, LogicalValuesOp, Operator};
+        use crate::sql::optimizer::operator::{CTEConsumeOp, Operator, ValuesOp};
 
         let cte_id: crate::sql::analysis::cte::CteId = 1;
         let mut memo = Memo::new();
@@ -4128,7 +4122,7 @@ mod tests {
         // Producer group: output column id 1 ("customer_id"), NDV 50_000, 100_000 rows.
         let produce_group = memo.new_group(MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalValues(LogicalValuesOp {
+            op: Operator::LogicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![],
             }),
@@ -4148,7 +4142,7 @@ mod tests {
         // exactly as a second `year_total` reference would in tpc-ds q4.
         let consume = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalCTEConsume(LogicalCTEConsumeOp {
+            op: Operator::LogicalCTEConsume(CTEConsumeOp {
                 cte_id,
                 alias: "t_s_firstyear".to_string(),
                 output_columns: vec![stats_output_column(7, "customer_id")],
@@ -4195,8 +4189,8 @@ mod tests {
         // the equi-join collapses to |L|*|R|/ndv ~= 694k.
         use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
         use crate::sql::optimizer::operator::{
-            JoinDistribution, LogicalCTEConsumeOp, LogicalValuesOp, Operator,
-            PhysicalHashJoinEqCondition, PhysicalHashJoinOp,
+            CTEConsumeOp, JoinDistribution, Operator, PhysicalHashJoinEqCondition,
+            PhysicalHashJoinOp, ValuesOp,
         };
 
         fn col_ref_id(id: u32, name: &str) -> TypedExpr {
@@ -4217,7 +4211,7 @@ mod tests {
         // Producer: 250_000 rows grouped by customer_id (NDV 90_000), id 100.
         let produce_group = memo.new_group(MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalValues(LogicalValuesOp {
+            op: Operator::LogicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![],
             }),
@@ -4238,7 +4232,7 @@ mod tests {
         let mut consume_group = |col_id: u32, alias: &str| -> usize {
             let expr = MExpr {
                 id: memo.next_expr_id(),
-                op: Operator::LogicalCTEConsume(LogicalCTEConsumeOp {
+                op: Operator::LogicalCTEConsume(CTEConsumeOp {
                     cte_id,
                     alias: alias.to_string(),
                     output_columns: vec![stats_output_column(col_id, "customer_id")],
@@ -4418,13 +4412,13 @@ mod tests {
     #[test]
     fn generate_series_synthesizes_exact_column_statistics() {
         use crate::sql::optimizer::memo::MExpr;
-        use crate::sql::optimizer::operator::{LogicalGenerateSeriesOp, Operator};
+        use crate::sql::optimizer::operator::{GenerateSeriesOp, Operator};
 
         let col = ColumnId::new_for_test(42);
         let memo = Memo::new();
         let expr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalGenerateSeries(LogicalGenerateSeriesOp {
+            op: Operator::LogicalGenerateSeries(GenerateSeriesOp {
                 start: 1,
                 end: 1000,
                 step: 1,
@@ -4456,7 +4450,7 @@ mod tests {
     #[test]
     fn values_synthesizes_exact_column_statistics_from_literals() {
         use crate::sql::optimizer::memo::MExpr;
-        use crate::sql::optimizer::operator::{LogicalValuesOp, Operator};
+        use crate::sql::optimizer::operator::{Operator, ValuesOp};
 
         let col = ColumnId::new_for_test(7);
         let mut memo = Memo::new();
@@ -4467,7 +4461,7 @@ mod tests {
         ];
         let expr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalValues(LogicalValuesOp {
+            op: Operator::LogicalValues(ValuesOp {
                 rows,
                 columns: vec![stats_output_column(7, "v")],
             }),
@@ -4492,13 +4486,13 @@ mod tests {
     #[test]
     fn table_function_passes_through_child_column_statistics() {
         use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
-        use crate::sql::optimizer::operator::{LogicalTableFunctionOp, LogicalValuesOp, Operator};
+        use crate::sql::optimizer::operator::{Operator, TableFunctionOp, ValuesOp};
 
         let base = ColumnId::new_for_test(3);
         let mut memo = Memo::new();
         let child = memo.new_group(MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalValues(LogicalValuesOp {
+            op: Operator::LogicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![],
             }),
@@ -4514,7 +4508,7 @@ mod tests {
 
         let tf = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalTableFunction(LogicalTableFunctionOp {
+            op: Operator::LogicalTableFunction(TableFunctionOp {
                 function_name: "unnest".to_string(),
                 args: vec![],
                 output_columns: vec![],
@@ -4538,12 +4532,12 @@ mod tests {
     #[test]
     fn aggregate_state_merge_merges_child_column_statistics() {
         use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
-        use crate::sql::optimizer::operator::{AggregateStateMergeOp, LogicalValuesOp, Operator};
+        use crate::sql::optimizer::operator::{AggregateStateMergeOp, Operator, ValuesOp};
 
         fn child_with_key(memo: &mut Memo, col_id: u32, ndv: f64, rows: f64) -> usize {
             let g = memo.new_group(MExpr {
                 id: memo.next_expr_id(),
-                op: Operator::LogicalValues(LogicalValuesOp {
+                op: Operator::LogicalValues(ValuesOp {
                     rows: vec![],
                     columns: vec![],
                 }),
@@ -4588,10 +4582,10 @@ mod tests {
     /// Build a leaf memo group exposing one column with the given NDV/row count.
     fn join_leaf_group(memo: &mut Memo, col_id: u32, ndv: f64, rows: f64) -> usize {
         use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
-        use crate::sql::optimizer::operator::{LogicalValuesOp, Operator};
+        use crate::sql::optimizer::operator::{Operator, ValuesOp};
         let g = memo.new_group(MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalValues(LogicalValuesOp {
+            op: Operator::LogicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![],
             }),
@@ -4821,7 +4815,7 @@ mod tests {
     #[test]
     fn derive_group_statistics_skips_already_computed_groups() {
         use crate::sql::optimizer::memo::{LogicalProperties, MExpr, Memo};
-        use crate::sql::optimizer::operator::{LogicalValuesOp, Operator};
+        use crate::sql::optimizer::operator::{Operator, ValuesOp};
         use std::collections::HashMap;
 
         let mut memo = Memo::new();
@@ -4831,7 +4825,7 @@ mod tests {
         // produce for an empty LogicalValues (which derives to 0).
         let group_a = memo.new_group(MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalValues(LogicalValuesOp {
+            op: Operator::LogicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![],
             }),
@@ -4842,7 +4836,7 @@ mod tests {
         // Group B: simulates a fresh group minted by implement() — logical_props=None.
         let group_b = memo.new_group(MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalValues(LogicalValuesOp {
+            op: Operator::LogicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![],
             }),

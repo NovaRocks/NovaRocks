@@ -320,7 +320,7 @@ mod tests {
     #[test]
     fn scan_cost_equals_data_size() {
         let s = stats(1000.0, 100.0);
-        let op = Operator::PhysicalScan(PhysicalScanOp {
+        let op = Operator::PhysicalScan(ScanOp {
             database: String::new(),
             table: crate::sql::catalog::TableDef {
                 name: "t".into(),
@@ -571,7 +571,7 @@ mod tests {
     #[test]
     fn sort_cost_nlogn() {
         let s = stats(1024.0, 10.0);
-        let op = Operator::PhysicalSort(PhysicalSortOp {
+        let op = Operator::PhysicalSort(SortOp {
             items: vec![],
             analytic_partition_exprs: Vec::new(),
             partition_limit: None,
@@ -585,7 +585,7 @@ mod tests {
     #[test]
     fn logical_ops_have_zero_cost() {
         let s = stats(1000.0, 100.0);
-        let op = Operator::LogicalScan(LogicalScanOp {
+        let op = Operator::LogicalScan(ScanOp {
             database: String::new(),
             table: crate::sql::catalog::TableDef {
                 name: "t".into(),
@@ -610,7 +610,7 @@ mod tests {
     #[test]
     fn limit_is_nearly_free() {
         let s = stats(1_000_000.0, 100.0);
-        let op = Operator::PhysicalLimit(PhysicalLimitOp {
+        let op = Operator::PhysicalLimit(LimitOp {
             limit: Some(10),
             offset: None,
         });
@@ -635,13 +635,13 @@ mod tests {
         // while its child's output (the scan) has 10M rows.
         let input = stats(10_000_000.0, 50.0);
         let own = stats(100.0, 50.0);
-        let sort = Operator::PhysicalSort(PhysicalSortOp {
+        let sort = Operator::PhysicalSort(SortOp {
             items: vec![],
             analytic_partition_exprs: Vec::new(),
             partition_limit: None,
             topn_type: None,
         });
-        let top_n = Operator::PhysicalTopN(PhysicalTopNOp {
+        let top_n = Operator::PhysicalTopN(TopNOp {
             items: vec![],
             limit: Some(100),
             offset: None,
@@ -665,13 +665,13 @@ mod tests {
         // equals Sort's cost (both are n * log2(n)).
         let input = stats(100.0, 10.0);
         let own = stats(100.0, 10.0); // unlimited output (limit exceeds input)
-        let sort = Operator::PhysicalSort(PhysicalSortOp {
+        let sort = Operator::PhysicalSort(SortOp {
             items: vec![],
             analytic_partition_exprs: Vec::new(),
             partition_limit: None,
             topn_type: None,
         });
-        let top_n = Operator::PhysicalTopN(PhysicalTopNOp {
+        let top_n = Operator::PhysicalTopN(TopNOp {
             items: vec![],
             limit: Some(10_000),
             offset: None,
@@ -688,7 +688,7 @@ mod tests {
         // limit=50 + offset=50 => k=100. Same cost as limit=100, offset=None.
         let input = stats(10_000.0, 10.0);
         let own = stats(100.0, 10.0);
-        let top_n = Operator::PhysicalTopN(PhysicalTopNOp {
+        let top_n = Operator::PhysicalTopN(TopNOp {
             items: vec![],
             limit: Some(50),
             offset: Some(50),

@@ -98,7 +98,7 @@ pub(crate) struct ScalarWindowSpec {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct LogicalScanOp {
+pub(crate) struct ScanOp {
     pub database: String,
     pub table: TableDef,
     pub alias: Option<String>,
@@ -107,11 +107,11 @@ pub(crate) struct LogicalScanOp {
     pub required_columns: Option<Vec<String>>,
     /// Per-scan dictionary plan hints. Populated by the Task 7
     /// `LowCardinalityDictionaryRewrite` rule on the logical side and
-    /// propagated to `PhysicalScanOp` by `ScanToPhysical`.
+    /// propagated to `ScanOp` by `ScanToPhysical`.
     pub dict_columns: Vec<ScanDictionaryColumn>,
     /// Synthetic typed columns materialized from variant paths during scan.
     /// Populated by `VariantPathPushdownRule` and propagated to
-    /// `PhysicalScanOp` by `ScanToPhysical`.
+    /// `ScanOp` by `ScanToPhysical`.
     pub variant_columns: Vec<ScanVariantColumn>,
     /// When this scan was injected by the MvRewrite rule, the source MV name
     /// (shown in EXPLAIN as `rewritten with mv: <name>`). None for all
@@ -125,7 +125,7 @@ pub(crate) struct FilterOp {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct LogicalProjectOp {
+pub(crate) struct ProjectOp {
     pub items: Vec<ScalarProjectItem>,
     pub output_qualifier: Option<String>,
 }
@@ -192,7 +192,7 @@ pub(crate) struct LogicalJoinOp {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct LogicalSortOp {
+pub(crate) struct SortOp {
     pub items: Vec<SortKey>,
     /// Set by `build_window_and_project` when this Sort was inserted as a
     /// precursor to a Window (PARTITION BY + ORDER BY). Empty otherwise.
@@ -209,13 +209,13 @@ pub(crate) struct LogicalSortOp {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct LogicalLimitOp {
+pub(crate) struct LimitOp {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct LogicalTopNOp {
+pub(crate) struct TopNOp {
     pub items: Vec<SortKey>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
@@ -224,38 +224,38 @@ pub(crate) struct LogicalTopNOp {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct LogicalWindowOp {
+pub(crate) struct WindowOp {
     pub window_exprs: Vec<ScalarWindowSpec>,
     pub output_columns: Vec<OutputColumn>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct LogicalUnionOp {
+pub(crate) struct UnionOp {
     pub all: bool,
     pub output_columns: Vec<OutputColumn>,
     pub child_output_columns: Vec<Vec<OutputColumn>>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct LogicalIntersectOp {
+pub(crate) struct IntersectOp {
     pub output_columns: Vec<OutputColumn>,
     pub child_output_columns: Vec<Vec<OutputColumn>>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct LogicalExceptOp {
+pub(crate) struct ExceptOp {
     pub output_columns: Vec<OutputColumn>,
     pub child_output_columns: Vec<Vec<OutputColumn>>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct LogicalValuesOp {
+pub(crate) struct ValuesOp {
     pub rows: Vec<Vec<ScalarId>>,
     pub columns: Vec<OutputColumn>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct LogicalGenerateSeriesOp {
+pub(crate) struct GenerateSeriesOp {
     pub start: i64,
     pub end: i64,
     pub step: i64,
@@ -265,7 +265,7 @@ pub(crate) struct LogicalGenerateSeriesOp {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct LogicalTableFunctionOp {
+pub(crate) struct TableFunctionOp {
     pub function_name: String,
     pub args: Vec<ScalarId>,
     pub output_columns: Vec<OutputColumn>,
@@ -274,7 +274,7 @@ pub(crate) struct LogicalTableFunctionOp {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct LogicalRepeatOp {
+pub(crate) struct RepeatOp {
     pub repeat_column_ref_list: Vec<Vec<String>>,
     pub repeat_column_ref_ids: Vec<Vec<ColumnId>>,
     pub grouping_ids: Vec<u64>,
@@ -287,27 +287,33 @@ pub(crate) struct LogicalRepeatOp {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct LogicalCTEAnchorOp {
+pub(crate) struct CTEAnchorOp {
     pub cte_id: CteId,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct LogicalCTEProduceOp {
+pub(crate) struct CTEProduceOp {
     pub cte_id: CteId,
     pub output_columns: Vec<OutputColumn>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct LogicalCTEConsumeOp {
+pub(crate) struct CTEConsumeOp {
     pub cte_id: CteId,
     pub alias: String,
     pub output_columns: Vec<OutputColumn>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct AssertOneRowOp {
+    /// Original subquery text used in the runtime error message.
+    pub subquery_text: String,
+}
+
 /// Logical dictionary-decode operator. Maps dictionary-encoded child columns
 /// back to their string form. Produced exclusively by the dictionary-rewrite
 /// rule (Task 7); the implementation rule `DecodeToPhysical` lowers it to
-/// `PhysicalDecodeOp`.
+/// `DecodeOp`.
 ///
 /// `output_columns` mirrors the input group's output columns with each
 /// `dict_column` swapped for its `string_column`. Without it
@@ -315,7 +321,7 @@ pub(crate) struct LogicalCTEConsumeOp {
 /// (the dict columns) to consumers, and parent lookups for the
 /// string column would fail to resolve.
 #[derive(Clone, Debug)]
-pub(crate) struct LogicalDecodeOp {
+pub(crate) struct DecodeOp {
     pub mappings: Vec<DecodeMapping>,
     pub output_columns: Vec<OutputColumn>,
 }
@@ -323,39 +329,6 @@ pub(crate) struct LogicalDecodeOp {
 // ---------------------------------------------------------------------------
 // Physical operator structs
 // ---------------------------------------------------------------------------
-
-#[derive(Clone, Debug)]
-pub(crate) struct PhysicalScanOp {
-    pub database: String,
-    pub table: TableDef,
-    pub alias: Option<String>,
-    pub columns: Vec<OutputColumn>,
-    pub predicates: Vec<ScalarId>,
-    pub required_columns: Option<Vec<String>>,
-    /// Per-scan dictionary plan hints. Populated by the Task 7
-    /// `LowCardinalityDictionaryRewrite` rule when a string column on this
-    /// scan is eligible for low-cardinality rewriting. Codegen reads this to
-    /// emit a hidden INT dict slot, a `TGlobalDict` payload on the owning
-    /// fragment, and (for StarRocks scans) the
-    /// `TLakeScanNode.dict_string_id_to_int_ids` mapping. Empty in all
-    /// production paths today.
-    #[allow(dead_code)] // Read by codegen when Task 7 populates it.
-    pub dict_columns: Vec<ScanDictionaryColumn>,
-    /// Synthetic typed columns materialized from variant paths during scan.
-    /// Codegen/lowering in later IV3-6 PR-4 tasks consumes this carrier.
-    #[allow(dead_code)] // Populated by a later rule in this PR line.
-    pub variant_columns: Vec<ScanVariantColumn>,
-    /// When this scan was injected by the MvRewrite rule, the source MV name
-    /// (shown in EXPLAIN as `rewritten with mv: <name>`). None for all
-    /// user-written scans.
-    pub mv_rewritten_from: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct PhysicalProjectOp {
-    pub items: Vec<ScalarProjectItem>,
-    pub output_qualifier: Option<String>,
-}
 
 #[derive(Clone, Debug)]
 pub(crate) struct PhysicalHashJoinOp {
@@ -391,141 +364,10 @@ pub(crate) struct PhysicalHashAggregateOp {
     pub is_merge: Vec<bool>,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct PhysicalSortOp {
-    pub items: Vec<SortKey>,
-    /// Propagated from `LogicalSortOp::analytic_partition_exprs`. See the
-    /// LogicalSortOp doc-comment for semantics.
-    pub analytic_partition_exprs: Vec<ScalarId>,
-    /// Propagated from `LogicalSortOp::partition_limit`. See OQ-13 §4.
-    pub partition_limit: Option<usize>,
-    pub topn_type: Option<crate::exec::node::sort::SortTopNType>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct PhysicalLimitOp {
-    pub limit: Option<i64>,
-    pub offset: Option<i64>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct LogicalAssertOneRowOp {
-    /// Original subquery text used in the runtime error message.
-    pub subquery_text: String,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct PhysicalAssertOneRowOp {
-    /// Original subquery text forwarded to the runtime error message.
-    pub subquery_text: String,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct PhysicalTopNOp {
-    pub items: Vec<SortKey>,
-    pub limit: Option<i64>,
-    pub offset: Option<i64>,
-    pub phase: TopNPhase,
-    pub is_split: bool,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct PhysicalWindowOp {
-    pub window_exprs: Vec<ScalarWindowSpec>,
-    pub output_columns: Vec<OutputColumn>,
-}
-
 /// Distribution enforcer node.
 #[derive(Clone, Debug)]
 pub(crate) struct PhysicalDistributionOp {
     pub spec: super::property::DistributionSpec,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct PhysicalCTEAnchorOp {
-    pub cte_id: CteId,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct PhysicalCTEProduceOp {
-    pub cte_id: CteId,
-    pub output_columns: Vec<OutputColumn>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct PhysicalCTEConsumeOp {
-    pub cte_id: CteId,
-    pub alias: String,
-    pub output_columns: Vec<OutputColumn>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct PhysicalRepeatOp {
-    pub repeat_column_ref_list: Vec<Vec<String>>,
-    pub repeat_column_ref_ids: Vec<Vec<ColumnId>>,
-    pub grouping_ids: Vec<u64>,
-    pub all_rollup_columns: Vec<String>,
-    pub all_rollup_column_ids: Vec<ColumnId>,
-    pub grouping_key_aliases: Vec<(String, String)>,
-    pub grouping_fn_args: Vec<(String, Vec<String>)>,
-    pub grouping_fn_arg_ids: Vec<Vec<ColumnId>>,
-    pub grouping_fn_ids: Vec<(String, ColumnId)>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct PhysicalUnionOp {
-    pub all: bool,
-    pub output_columns: Vec<OutputColumn>,
-    pub child_output_columns: Vec<Vec<OutputColumn>>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct PhysicalIntersectOp {
-    pub output_columns: Vec<OutputColumn>,
-    pub child_output_columns: Vec<Vec<OutputColumn>>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct PhysicalExceptOp {
-    pub output_columns: Vec<OutputColumn>,
-    pub child_output_columns: Vec<Vec<OutputColumn>>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct PhysicalValuesOp {
-    pub rows: Vec<Vec<ScalarId>>,
-    pub columns: Vec<OutputColumn>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct PhysicalGenerateSeriesOp {
-    pub start: i64,
-    pub end: i64,
-    pub step: i64,
-    pub column_name: String,
-    pub alias: Option<String>,
-    pub output_column_id: crate::sql::column_id::ColumnId,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct PhysicalTableFunctionOp {
-    pub function_name: String,
-    pub args: Vec<ScalarId>,
-    pub output_columns: Vec<OutputColumn>,
-    pub alias: Option<String>,
-    pub is_left_join: bool,
-}
-
-/// Physical counterpart of [`LogicalDecodeOp`]. The codegen step (Task 6)
-/// turns this into a dictionary-decode execution node; Task 5 only routes
-/// the operator through the optimizer.
-///
-/// `output_columns` is propagated verbatim from `LogicalDecodeOp` by the
-/// `DecodeToPhysical` implementation rule.
-#[derive(Clone, Debug)]
-pub(crate) struct PhysicalDecodeOp {
-    pub mappings: Vec<DecodeMapping>,
-    pub output_columns: Vec<OutputColumn>,
 }
 
 // ---------------------------------------------------------------------------
@@ -535,54 +377,54 @@ pub(crate) struct PhysicalDecodeOp {
 #[derive(Clone, Debug)]
 pub(crate) enum Operator {
     // Logical operators
-    LogicalScan(LogicalScanOp),
+    LogicalScan(ScanOp),
     LogicalFilter(FilterOp),
-    LogicalProject(LogicalProjectOp),
+    LogicalProject(ProjectOp),
     LogicalAggregate(LogicalAggregateOp),
     LogicalJoin(LogicalJoinOp),
-    LogicalSort(LogicalSortOp),
-    LogicalLimit(LogicalLimitOp),
-    LogicalTopN(LogicalTopNOp),
-    LogicalWindow(LogicalWindowOp),
-    LogicalUnion(LogicalUnionOp),
-    LogicalIntersect(LogicalIntersectOp),
-    LogicalExcept(LogicalExceptOp),
-    LogicalValues(LogicalValuesOp),
-    LogicalGenerateSeries(LogicalGenerateSeriesOp),
-    LogicalTableFunction(LogicalTableFunctionOp),
-    LogicalRepeat(LogicalRepeatOp),
-    LogicalCTEAnchor(LogicalCTEAnchorOp),
-    LogicalCTEProduce(LogicalCTEProduceOp),
-    LogicalCTEConsume(LogicalCTEConsumeOp),
-    LogicalDecode(LogicalDecodeOp),
+    LogicalSort(SortOp),
+    LogicalLimit(LimitOp),
+    LogicalTopN(TopNOp),
+    LogicalWindow(WindowOp),
+    LogicalUnion(UnionOp),
+    LogicalIntersect(IntersectOp),
+    LogicalExcept(ExceptOp),
+    LogicalValues(ValuesOp),
+    LogicalGenerateSeries(GenerateSeriesOp),
+    LogicalTableFunction(TableFunctionOp),
+    LogicalRepeat(RepeatOp),
+    LogicalCTEAnchor(CTEAnchorOp),
+    LogicalCTEProduce(CTEProduceOp),
+    LogicalCTEConsume(CTEConsumeOp),
+    LogicalDecode(DecodeOp),
     LogicalAggregateStateMerge(AggregateStateMergeOp),
-    LogicalAssertOneRow(LogicalAssertOneRowOp),
+    LogicalAssertOneRow(AssertOneRowOp),
 
     // Physical operators
-    PhysicalScan(PhysicalScanOp),
+    PhysicalScan(ScanOp),
     PhysicalFilter(FilterOp),
-    PhysicalProject(PhysicalProjectOp),
+    PhysicalProject(ProjectOp),
     PhysicalHashJoin(PhysicalHashJoinOp),
     PhysicalNestLoopJoin(PhysicalNestLoopJoinOp),
     PhysicalHashAggregate(PhysicalHashAggregateOp),
-    PhysicalSort(PhysicalSortOp),
-    PhysicalLimit(PhysicalLimitOp),
-    PhysicalTopN(PhysicalTopNOp),
-    PhysicalWindow(PhysicalWindowOp),
+    PhysicalSort(SortOp),
+    PhysicalLimit(LimitOp),
+    PhysicalTopN(TopNOp),
+    PhysicalWindow(WindowOp),
     PhysicalDistribution(PhysicalDistributionOp),
-    PhysicalCTEAnchor(PhysicalCTEAnchorOp),
-    PhysicalCTEProduce(PhysicalCTEProduceOp),
-    PhysicalCTEConsume(PhysicalCTEConsumeOp),
-    PhysicalRepeat(PhysicalRepeatOp),
-    PhysicalUnion(PhysicalUnionOp),
-    PhysicalIntersect(PhysicalIntersectOp),
-    PhysicalExcept(PhysicalExceptOp),
-    PhysicalValues(PhysicalValuesOp),
-    PhysicalGenerateSeries(PhysicalGenerateSeriesOp),
-    PhysicalTableFunction(PhysicalTableFunctionOp),
-    PhysicalDecode(PhysicalDecodeOp),
+    PhysicalCTEAnchor(CTEAnchorOp),
+    PhysicalCTEProduce(CTEProduceOp),
+    PhysicalCTEConsume(CTEConsumeOp),
+    PhysicalRepeat(RepeatOp),
+    PhysicalUnion(UnionOp),
+    PhysicalIntersect(IntersectOp),
+    PhysicalExcept(ExceptOp),
+    PhysicalValues(ValuesOp),
+    PhysicalGenerateSeries(GenerateSeriesOp),
+    PhysicalTableFunction(TableFunctionOp),
+    PhysicalDecode(DecodeOp),
     PhysicalAggregateStateMerge(AggregateStateMergeOp),
-    PhysicalAssertOneRow(PhysicalAssertOneRowOp),
+    PhysicalAssertOneRow(AssertOneRowOp),
 }
 
 impl Operator {

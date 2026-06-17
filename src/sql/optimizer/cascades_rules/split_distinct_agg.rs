@@ -475,7 +475,7 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
     use crate::sql::optimizer::memo::Memo;
-    use crate::sql::optimizer::operator::{AggMode, LogicalAggregateOp, LogicalScanOp};
+    use crate::sql::optimizer::operator::{AggMode, LogicalAggregateOp, ScanOp};
     use crate::sql::optimizer::scalar::materialize;
     use arrow::datatypes::DataType;
     use std::sync::Arc;
@@ -516,7 +516,7 @@ mod tests {
     fn scan_group(memo: &mut Memo) -> usize {
         let m = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalScan(LogicalScanOp {
+            op: Operator::LogicalScan(ScanOp {
                 database: "db".into(),
                 table: crate::sql::catalog::TableDef {
                     name: "t".into(),

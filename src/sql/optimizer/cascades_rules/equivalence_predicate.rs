@@ -310,7 +310,7 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue};
     use crate::sql::catalog::{ScanSource, TableDef};
-    use crate::sql::optimizer::operator::LogicalScanOp;
+    use crate::sql::optimizer::operator::ScanOp;
     use crate::sql::optimizer::scalar::{ScalarId, intern_typed, materialize};
     use arrow::datatypes::DataType;
 
@@ -404,7 +404,7 @@ mod tests {
         let predicates = predicates.iter().map(|expr| intern(memo, expr)).collect();
         let group = memo.new_group(MExpr {
             id: id_expr,
-            op: Operator::LogicalScan(LogicalScanOp {
+            op: Operator::LogicalScan(ScanOp {
                 database: "db".to_string(),
                 table: TableDef {
                     name: format!("t{id}"),

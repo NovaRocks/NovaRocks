@@ -24,7 +24,7 @@ pub(crate) struct MvRewriteCandidate {
     /// SPJG decomposition of the MV defining query, expressed over the
     /// base table's ColumnIds (allocated in the shared ColumnRefFactory).
     pub mv: SpjgDescriptor,
-    /// Database (namespace) of the MV target table, for LogicalScanOp.
+    /// Database (namespace) of the MV target table, for ScanOp.
     pub target_database: String,
     /// Executable TableDef of the MV target table
     /// (ScanSource::IcebergDataFiles, binding = CurrentSnapshot).

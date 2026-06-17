@@ -4,7 +4,7 @@
 //! single-stage TopN (original) and this two-stage alternative.
 
 use crate::sql::optimizer::memo::{MExpr, Memo};
-use crate::sql::optimizer::operator::{LogicalTopNOp, Operator, TopNPhase};
+use crate::sql::optimizer::operator::{Operator, TopNOp, TopNPhase};
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
 
 pub(crate) struct SplitTopN;
@@ -50,7 +50,7 @@ impl Rule for SplitTopN {
         // PARTIAL child: same sort items, larger limit, zero offset.
         let partial_mexpr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalTopN(LogicalTopNOp {
+            op: Operator::LogicalTopN(TopNOp {
                 items: src.items.clone(),
                 limit: Some(partial_limit),
                 offset: Some(0),
@@ -63,7 +63,7 @@ impl Rule for SplitTopN {
 
         // FINAL with split flag, original limit/offset. Child = new partial group.
         let final_expr = NewExpr {
-            op: Operator::LogicalTopN(LogicalTopNOp {
+            op: Operator::LogicalTopN(TopNOp {
                 items: src.items.clone(),
                 limit: src.limit,
                 offset: src.offset,
@@ -81,12 +81,12 @@ impl Rule for SplitTopN {
 mod tests {
     use super::*;
     use crate::sql::optimizer::memo::Memo;
-    use crate::sql::optimizer::operator::{LogicalScanOp, LogicalTopNOp};
+    use crate::sql::optimizer::operator::{ScanOp, TopNOp};
 
     fn mk_scan_group(memo: &mut Memo) -> usize {
         let m = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalScan(LogicalScanOp {
+            op: Operator::LogicalScan(ScanOp {
                 database: "db".into(),
                 table: crate::sql::catalog::TableDef {
                     name: "t".into(),
@@ -116,7 +116,7 @@ mod tests {
         let scan_group = mk_scan_group(&mut memo);
         let topn_mexpr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalTopN(LogicalTopNOp {
+            op: Operator::LogicalTopN(TopNOp {
                 items: vec![],
                 limit: Some(100),
                 offset: Some(0),
@@ -157,7 +157,7 @@ mod tests {
         let scan_group = mk_scan_group(&mut memo);
         let topn_mexpr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalTopN(LogicalTopNOp {
+            op: Operator::LogicalTopN(TopNOp {
                 items: vec![],
                 limit: Some(100),
                 offset: Some(10),
@@ -179,7 +179,7 @@ mod tests {
         let scan_group = mk_scan_group(&mut memo);
         let topn_mexpr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalTopN(LogicalTopNOp {
+            op: Operator::LogicalTopN(TopNOp {
                 items: vec![],
                 limit: Some(100),
                 offset: None,
@@ -200,7 +200,7 @@ mod tests {
         let scan_group = mk_scan_group(&mut memo);
         let topn_mexpr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalTopN(LogicalTopNOp {
+            op: Operator::LogicalTopN(TopNOp {
                 items: vec![],
                 limit: Some(100),
                 offset: None,
@@ -221,7 +221,7 @@ mod tests {
         let scan_group = mk_scan_group(&mut memo);
         let topn_mexpr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalTopN(LogicalTopNOp {
+            op: Operator::LogicalTopN(TopNOp {
                 items: vec![],
                 limit: None,
                 offset: Some(5),

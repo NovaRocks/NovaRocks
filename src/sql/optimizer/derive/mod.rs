@@ -278,7 +278,7 @@ mod tests {
     #[test]
     fn default_required_alternative_wraps_legacy_deriver() {
         let scalars = ScalarArena::new();
-        let op = Operator::PhysicalLimit(PhysicalLimitOp {
+        let op = Operator::PhysicalLimit(LimitOp {
             limit: Some(10),
             offset: None,
         });

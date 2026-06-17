@@ -16,9 +16,7 @@ use std::sync::Mutex;
 
 use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
 use crate::sql::optimizer::memo::{MExpr, MExprId, Memo};
-use crate::sql::optimizer::operator::{
-    FilterOp, LogicalAggregateOp, LogicalProjectOp, LogicalScanOp, Operator,
-};
+use crate::sql::optimizer::operator::{FilterOp, LogicalAggregateOp, Operator, ProjectOp, ScanOp};
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
 use crate::sql::optimizer::scalar::{intern_typed, materialize};
 use crate::sql::optimizer::scalar_bridge::{
@@ -151,7 +149,7 @@ fn try_rewrite(
     // 5. Build the operator chain bottom-up.
     let scan_group = memo.new_group(MExpr {
         id: memo.next_expr_id(),
-        op: Operator::LogicalScan(LogicalScanOp {
+        op: Operator::LogicalScan(ScanOp {
             database: cand.target_database.clone(),
             table: cand.target_table.clone(),
             alias: None,
@@ -194,7 +192,7 @@ fn try_rewrite(
                 })
                 .collect::<Option<Vec<_>>>()?;
             Some(NewExpr {
-                op: Operator::LogicalProject(LogicalProjectOp {
+                op: Operator::LogicalProject(ProjectOp {
                     items: intern_project_items(&mut memo.scalars, &items),
                     output_qualifier: None,
                 }),
@@ -280,7 +278,7 @@ fn try_rewrite(
                         });
                     }
                     Some(NewExpr {
-                        op: Operator::LogicalProject(LogicalProjectOp {
+                        op: Operator::LogicalProject(ProjectOp {
                             items: intern_project_items(&mut memo.scalars, &items),
                             output_qualifier: None,
                         }),
@@ -377,7 +375,7 @@ fn try_rewrite(
                         })
                         .collect();
                     Some(NewExpr {
-                        op: Operator::LogicalProject(LogicalProjectOp {
+                        op: Operator::LogicalProject(ProjectOp {
                             items: intern_project_items(&mut memo.scalars, &items),
                             output_qualifier: None,
                         }),
@@ -631,7 +629,7 @@ mod tests {
 
     /// Walk a child-group chain from `gid`, following first logical expr, and
     /// return the first `LogicalScan` op reached (panics if none).
-    fn find_scan(memo: &Memo, gid: usize) -> &LogicalScanOp {
+    fn find_scan(memo: &Memo, gid: usize) -> &ScanOp {
         let expr = &memo.groups[gid].logical_exprs[0];
         match &expr.op {
             Operator::LogicalScan(s) => s,

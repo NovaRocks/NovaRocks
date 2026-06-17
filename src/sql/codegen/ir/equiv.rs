@@ -35,13 +35,11 @@ mod tests {
     };
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
-        AggMode, AggregateStateMergeOp, FilterOp, JoinDistribution, Operator,
-        PhysicalAssertOneRowOp, PhysicalCTEAnchorOp, PhysicalCTEConsumeOp, PhysicalCTEProduceOp,
-        PhysicalDecodeOp, PhysicalDistributionOp, PhysicalExceptOp, PhysicalGenerateSeriesOp,
-        PhysicalHashAggregateOp, PhysicalHashJoinEqCondition, PhysicalHashJoinOp,
-        PhysicalIntersectOp, PhysicalLimitOp, PhysicalNestLoopJoinOp, PhysicalProjectOp,
-        PhysicalRepeatOp, PhysicalScanOp, PhysicalSortOp, PhysicalTableFunctionOp, PhysicalTopNOp,
-        PhysicalUnionOp, PhysicalValuesOp, PhysicalWindowOp, ScanDictionaryColumn, TopNPhase,
+        AggMode, AggregateStateMergeOp, AssertOneRowOp, CTEAnchorOp, CTEConsumeOp, CTEProduceOp,
+        DecodeOp, ExceptOp, FilterOp, GenerateSeriesOp, IntersectOp, JoinDistribution, LimitOp,
+        Operator, PhysicalDistributionOp, PhysicalHashAggregateOp, PhysicalHashJoinEqCondition,
+        PhysicalHashJoinOp, PhysicalNestLoopJoinOp, ProjectOp, RepeatOp, ScanDictionaryColumn,
+        ScanOp, SortOp, TableFunctionOp, TopNOp, TopNPhase, UnionOp, ValuesOp, WindowOp,
     };
     use crate::sql::optimizer::physical_plan::{
         PhysicalPlanNode, PlanExecutionProps, attach_scalar_arena,
@@ -670,7 +668,7 @@ mod tests {
             .expect("branch1 test plan must carry scalar arena")
             .clone();
         let plan = physical_node_with_scalars(
-            Operator::PhysicalUnion(PhysicalUnionOp {
+            Operator::PhysicalUnion(UnionOp {
                 all: true,
                 output_columns: output_columns.clone(),
                 child_output_columns: vec![
@@ -1442,7 +1440,7 @@ mod tests {
         let k = output_col(1, "k", DataType::Int64, false);
         let v = output_col(2, "v", DataType::Int64, true);
         physical_node_with_scalars(
-            Operator::PhysicalScan(PhysicalScanOp {
+            Operator::PhysicalScan(ScanOp {
                 database: "test_db".to_string(),
                 table: metadata_table_def(),
                 alias: Some("t".to_string()),
@@ -1471,7 +1469,7 @@ mod tests {
         let k = output_col(1, "k", DataType::Int64, false);
         let v = output_col(2, "v", DataType::Int64, true);
         physical_node_with_scalars(
-            Operator::PhysicalScan(PhysicalScanOp {
+            Operator::PhysicalScan(ScanOp {
                 database: "test_db".to_string(),
                 table: iceberg_data_table_def(),
                 alias: Some("t".to_string()),
@@ -1497,7 +1495,7 @@ mod tests {
 
     fn values_plan_for_columns(columns: Vec<OutputColumn>) -> PhysicalPlanNode {
         physical_node(
-            Operator::PhysicalValues(PhysicalValuesOp {
+            Operator::PhysicalValues(ValuesOp {
                 rows: Vec::new(),
                 columns: columns.clone(),
             }),
@@ -1536,7 +1534,7 @@ mod tests {
         let region = output_col(111, "region", DataType::Utf8, true);
         let scan = target_state_scan_for_context(ctx);
         physical_node(
-            Operator::PhysicalScan(PhysicalScanOp {
+            Operator::PhysicalScan(ScanOp {
                 database: "ns".to_string(),
                 table: target_state_table_def(scan),
                 alias: Some("mv".to_string()),
@@ -1761,7 +1759,7 @@ mod tests {
     fn version_scan_plan_for_fixture(fixture: &LocalVersionScanFixture) -> PhysicalPlanNode {
         let id = output_col(120, "id", DataType::Int64, false);
         physical_node(
-            Operator::PhysicalScan(PhysicalScanOp {
+            Operator::PhysicalScan(ScanOp {
                 database: "ns".to_string(),
                 table: TableDef {
                     name: fixture.table_info.table.clone(),
@@ -1876,7 +1874,7 @@ mod tests {
             .cloned()
             .unwrap_or_else(|| scalars_from_children(std::slice::from_ref(&merge)));
         physical_node_with_scalars(
-            Operator::PhysicalProject(PhysicalProjectOp {
+            Operator::PhysicalProject(ProjectOp {
                 items: intern_project_items(&mut scalars, &items),
                 output_qualifier: None,
             }),
@@ -2200,7 +2198,7 @@ mod tests {
             output_column_id: ColumnId::new_for_test(101),
         }];
         physical_node_with_scalars(
-            Operator::PhysicalProject(PhysicalProjectOp {
+            Operator::PhysicalProject(ProjectOp {
                 items: intern_project_items(&mut scalars, &items),
                 output_qualifier: None,
             }),
@@ -2215,7 +2213,7 @@ mod tests {
         let sort_col = child.output_columns[0].clone();
         let output_columns = child.output_columns.clone();
         physical_node_with_scalars(
-            Operator::PhysicalSort(PhysicalSortOp {
+            Operator::PhysicalSort(SortOp {
                 items: intern_sort_items(
                     &mut scalars,
                     &[SortItem {
@@ -2246,7 +2244,7 @@ mod tests {
     ) -> PhysicalPlanNode {
         let output_columns = child.output_columns.clone();
         physical_node(
-            Operator::PhysicalLimit(PhysicalLimitOp { limit, offset }),
+            Operator::PhysicalLimit(LimitOp { limit, offset }),
             vec![child],
             output_columns,
         )
@@ -2263,7 +2261,7 @@ mod tests {
         let sort_col = child.output_columns[0].clone();
         let output_columns = child.output_columns.clone();
         physical_node_with_scalars(
-            Operator::PhysicalTopN(PhysicalTopNOp {
+            Operator::PhysicalTopN(TopNOp {
                 items: intern_sort_items(
                     &mut scalars,
                     &[SortItem {
@@ -2363,7 +2361,7 @@ mod tests {
         let produce_output_columns = produce.output_columns.clone();
         let consume_output_columns = vec![output_col(1102, "k", DataType::Int64, false)];
         let produce = physical_node(
-            Operator::PhysicalCTEProduce(PhysicalCTEProduceOp {
+            Operator::PhysicalCTEProduce(CTEProduceOp {
                 cte_id,
                 output_columns: produce_output_columns.clone(),
             }),
@@ -2371,7 +2369,7 @@ mod tests {
             produce_output_columns,
         );
         let consume = physical_node(
-            Operator::PhysicalCTEConsume(PhysicalCTEConsumeOp {
+            Operator::PhysicalCTEConsume(CTEConsumeOp {
                 cte_id,
                 alias: "cte".to_string(),
                 output_columns: consume_output_columns.clone(),
@@ -2380,7 +2378,7 @@ mod tests {
             consume_output_columns.clone(),
         );
         physical_node(
-            Operator::PhysicalCTEAnchor(PhysicalCTEAnchorOp { cte_id }),
+            Operator::PhysicalCTEAnchor(CTEAnchorOp { cte_id }),
             vec![produce, consume],
             consume_output_columns,
         )
@@ -2598,7 +2596,7 @@ mod tests {
     fn union_plan(all: bool, left: PhysicalPlanNode, right: PhysicalPlanNode) -> PhysicalPlanNode {
         let output_columns = set_op_output_columns();
         physical_node(
-            Operator::PhysicalUnion(PhysicalUnionOp {
+            Operator::PhysicalUnion(UnionOp {
                 all,
                 output_columns: output_columns.clone(),
                 child_output_columns: vec![
@@ -2614,7 +2612,7 @@ mod tests {
     fn intersect_plan(left: PhysicalPlanNode, right: PhysicalPlanNode) -> PhysicalPlanNode {
         let output_columns = set_op_output_columns();
         physical_node(
-            Operator::PhysicalIntersect(PhysicalIntersectOp {
+            Operator::PhysicalIntersect(IntersectOp {
                 output_columns: output_columns.clone(),
                 child_output_columns: vec![
                     left.output_columns.clone(),
@@ -2629,7 +2627,7 @@ mod tests {
     fn except_plan(left: PhysicalPlanNode, right: PhysicalPlanNode) -> PhysicalPlanNode {
         let output_columns = set_op_output_columns();
         physical_node(
-            Operator::PhysicalExcept(PhysicalExceptOp {
+            Operator::PhysicalExcept(ExceptOp {
                 output_columns: output_columns.clone(),
                 child_output_columns: vec![
                     left.output_columns.clone(),
@@ -2657,7 +2655,7 @@ mod tests {
             vec![int_lit(2), null_int_lit()],
         ];
         physical_node_with_scalars(
-            Operator::PhysicalValues(PhysicalValuesOp {
+            Operator::PhysicalValues(ValuesOp {
                 rows: rows
                     .iter()
                     .map(|row| intern_exprs(&mut scalars, row))
@@ -2676,7 +2674,7 @@ mod tests {
         let v = output_col(612, "v", DataType::Int64, true);
         let row = vec![int_lit(1)];
         physical_node_with_scalars(
-            Operator::PhysicalValues(PhysicalValuesOp {
+            Operator::PhysicalValues(ValuesOp {
                 rows: vec![intern_exprs(&mut scalars, &row)],
                 columns: vec![k.clone(), v.clone()],
             }),
@@ -2704,7 +2702,7 @@ mod tests {
             ],
         ];
         physical_node(
-            Operator::PhysicalUnion(PhysicalUnionOp {
+            Operator::PhysicalUnion(UnionOp {
                 all: true,
                 output_columns: output_columns.clone(),
                 child_output_columns,
@@ -2718,7 +2716,7 @@ mod tests {
         let k = output_col(k_id, "k", DataType::Int64, false);
         let s = output_col(s_id, "s", DataType::Utf8, true);
         physical_node(
-            Operator::PhysicalValues(PhysicalValuesOp {
+            Operator::PhysicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![k.clone(), s.clone()],
             }),
@@ -2730,7 +2728,7 @@ mod tests {
     fn assert_one_row_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
         let output_columns = child.output_columns.clone();
         physical_node(
-            Operator::PhysicalAssertOneRow(PhysicalAssertOneRowOp {
+            Operator::PhysicalAssertOneRow(AssertOneRowOp {
                 subquery_text: "select k from t".to_string(),
             }),
             vec![child],
@@ -2742,7 +2740,7 @@ mod tests {
         let source_id = ColumnId::new_for_test(701);
         let output_id = ColumnId::new_for_test(702);
         let scan = physical_node(
-            Operator::PhysicalScan(PhysicalScanOp {
+            Operator::PhysicalScan(ScanOp {
                 database: "test_db".to_string(),
                 table: dict_metadata_table_def(),
                 alias: Some("t".to_string()),
@@ -2774,7 +2772,7 @@ mod tests {
         );
         let decoded = output_col(output_id.0, "s", DataType::Utf8, false);
         physical_node(
-            Operator::PhysicalDecode(PhysicalDecodeOp {
+            Operator::PhysicalDecode(DecodeOp {
                 mappings: vec![DecodeMapping {
                     source_column_id: source_id,
                     output_column_id: output_id,
@@ -2792,7 +2790,7 @@ mod tests {
         let k = output_col(801, "k", DataType::Int64, false);
         let grouping_col = output_col(802, "__grouping_fn_0", DataType::Int64, false);
         physical_node(
-            Operator::PhysicalRepeat(PhysicalRepeatOp {
+            Operator::PhysicalRepeat(RepeatOp {
                 repeat_column_ref_list: vec![vec!["k".to_string()], vec![]],
                 repeat_column_ref_ids: vec![vec![k.column_id], vec![]],
                 grouping_ids: vec![0, 1],
@@ -2827,7 +2825,7 @@ mod tests {
             ignore_nulls: false,
         }];
         physical_node_with_scalars(
-            Operator::PhysicalWindow(PhysicalWindowOp {
+            Operator::PhysicalWindow(WindowOp {
                 window_exprs: intern_window_exprs(&mut scalars, &window_exprs),
                 output_columns: vec![k.clone(), row_number.clone()],
             }),
@@ -2840,7 +2838,7 @@ mod tests {
     fn generate_series_plan() -> PhysicalPlanNode {
         let value = output_col(911, "value", DataType::Int64, false);
         physical_node(
-            Operator::PhysicalGenerateSeries(PhysicalGenerateSeriesOp {
+            Operator::PhysicalGenerateSeries(GenerateSeriesOp {
                 start: 1,
                 end: 3,
                 step: 1,
@@ -2864,7 +2862,7 @@ mod tests {
         let child = single_column_scan_plan(arr.clone());
         let mut scalars = scalars_from_children(std::slice::from_ref(&child));
         physical_node_with_scalars(
-            Operator::PhysicalTableFunction(PhysicalTableFunctionOp {
+            Operator::PhysicalTableFunction(TableFunctionOp {
                 function_name: "unnest".to_string(),
                 args: intern_exprs(
                     &mut scalars,
@@ -2884,7 +2882,7 @@ mod tests {
         let k = output_col(key_id, "k", DataType::Int64, false);
         let v = output_col(value_id, "v", DataType::Int64, true);
         physical_node(
-            Operator::PhysicalScan(PhysicalScanOp {
+            Operator::PhysicalScan(ScanOp {
                 database: "test_db".to_string(),
                 table: metadata_table_def(),
                 alias: Some(alias.to_string()),
@@ -2902,7 +2900,7 @@ mod tests {
 
     fn single_column_scan_plan(column: OutputColumn) -> PhysicalPlanNode {
         physical_node(
-            Operator::PhysicalScan(PhysicalScanOp {
+            Operator::PhysicalScan(ScanOp {
                 database: "test_db".to_string(),
                 table: single_column_metadata_table_def(&column),
                 alias: Some("t".to_string()),

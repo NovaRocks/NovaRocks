@@ -420,9 +420,7 @@ mod is_known_rule_name_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::sql::optimizer::memo::{MExpr, Memo};
-    use crate::sql::optimizer::operator::{
-        LogicalLimitOp, LogicalValuesOp, Operator, PhysicalLimitOp, PhysicalValuesOp,
-    };
+    use crate::sql::optimizer::operator::{LimitOp, Operator, ValuesOp};
     use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
 
     #[test]
@@ -475,14 +473,14 @@ mod is_known_rule_name_tests {
             };
             let child_group = memo.new_group(MExpr {
                 id: memo.next_expr_id(),
-                op: Operator::PhysicalValues(PhysicalValuesOp {
+                op: Operator::PhysicalValues(ValuesOp {
                     rows: vec![],
                     columns: vec![],
                 }),
                 children: vec![],
             });
             vec![NewExpr {
-                op: Operator::PhysicalLimit(PhysicalLimitOp {
+                op: Operator::PhysicalLimit(LimitOp {
                     limit: limit.limit,
                     offset: limit.offset,
                 }),
@@ -511,7 +509,7 @@ mod is_known_rule_name_tests {
                 return vec![];
             };
             vec![NewExpr {
-                op: Operator::PhysicalLimit(PhysicalLimitOp {
+                op: Operator::PhysicalLimit(LimitOp {
                     limit: limit.limit,
                     offset: limit.offset,
                 }),
@@ -523,7 +521,7 @@ mod is_known_rule_name_tests {
     fn logical_values_group(memo: &mut Memo) -> usize {
         memo.new_group(MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalValues(LogicalValuesOp {
+            op: Operator::LogicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![],
             }),
@@ -534,7 +532,7 @@ mod is_known_rule_name_tests {
     fn logical_limit(child: usize) -> MExpr {
         MExpr {
             id: 0,
-            op: Operator::LogicalLimit(LogicalLimitOp {
+            op: Operator::LogicalLimit(LimitOp {
                 limit: Some(1),
                 offset: Some(0),
             }),

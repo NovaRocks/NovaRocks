@@ -201,7 +201,7 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::operator::{AggStage, LogicalAggregateOp, LogicalValuesOp};
+    use crate::sql::optimizer::operator::{AggStage, LogicalAggregateOp, ValuesOp};
     use crate::sql::optimizer::scalar::materialize;
     use crate::sql::optimizer::scalar_bridge::{intern_aggregate_calls, intern_exprs};
     use crate::sql::planner::plan::AggregateCall;
@@ -280,7 +280,7 @@ mod tests {
         let id = memo.next_expr_id();
         memo.new_group(MExpr {
             id,
-            op: Operator::LogicalValues(LogicalValuesOp {
+            op: Operator::LogicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![],
             }),

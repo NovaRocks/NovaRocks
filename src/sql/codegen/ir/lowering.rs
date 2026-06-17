@@ -39,8 +39,7 @@ use crate::sql::codegen::{
     FragmentBuildResult, FragmentId, MultiFragmentBuildResult, OutputColumn,
 };
 use crate::sql::optimizer::operator::{
-    AggMode, PhysicalAssertOneRowOp, PhysicalDecodeOp, PhysicalGenerateSeriesOp, PhysicalRepeatOp,
-    ScanDictionaryColumn, TopNPhase,
+    AggMode, AssertOneRowOp, DecodeOp, GenerateSeriesOp, RepeatOp, ScanDictionaryColumn, TopNPhase,
 };
 use crate::sql::optimizer::physical_plan::JoinExecutionDistribution;
 use crate::sql::optimizer::property::{OrderingSpec, window_ordering_spec};
@@ -3346,7 +3345,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         &mut self,
         table_fn_node_id: i32,
         output_tuple_id: i32,
-        op: &PhysicalGenerateSeriesOp,
+        op: &GenerateSeriesOp,
     ) -> Result<(Vec<plan_nodes::TPlanNode>, ExprScope), String> {
         let derived_param_values_node = table_fn_node_id - 1;
         let derived_param_tuple = output_tuple_id - 1;
@@ -3745,7 +3744,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
     pub(crate) fn lower_assert_one_row(
         &mut self,
         assert_node_id: i32,
-        op: &PhysicalAssertOneRowOp,
+        op: &AssertOneRowOp,
         child_tuple_ids: &[i32],
     ) -> plan_nodes::TPlanNode {
         let mut plan_node = nodes::default_plan_node();
@@ -3768,7 +3767,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         &mut self,
         decode_node_id: i32,
         decode_tuple_id: i32,
-        op: &PhysicalDecodeOp,
+        op: &DecodeOp,
         child_scope: &ExprScope,
     ) -> Result<(plan_nodes::TPlanNode, ExprScope), String> {
         let child_columns: Vec<(String, ColumnBinding)> = child_scope
@@ -3898,7 +3897,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         &mut self,
         repeat_node_id: i32,
         virtual_tuple_id: i32,
-        op: &PhysicalRepeatOp,
+        op: &RepeatOp,
         child_scope: ExprScope,
         child_tuple_ids: Vec<i32>,
         child_output_columns: Vec<AnalysisOutputColumn>,
@@ -4362,21 +4361,21 @@ fn apply_ignore_nulls_to_root_fn(texpr: &mut exprs::TExpr, ignore_nulls: bool) {
 
 fn assert_one_row_node_to_physical_op(
     kind: &super::kind::DistributedAssertOneRowNode,
-) -> PhysicalAssertOneRowOp {
-    PhysicalAssertOneRowOp {
+) -> AssertOneRowOp {
+    AssertOneRowOp {
         subquery_text: kind.subquery_text.clone(),
     }
 }
 
-fn decode_node_to_physical_op(kind: &super::kind::DistributedDecodeNode) -> PhysicalDecodeOp {
-    PhysicalDecodeOp {
+fn decode_node_to_physical_op(kind: &super::kind::DistributedDecodeNode) -> DecodeOp {
+    DecodeOp {
         mappings: kind.mappings.clone(),
         output_columns: kind.output_columns.clone(),
     }
 }
 
-fn repeat_node_to_physical_op(kind: &super::kind::DistributedRepeatNode) -> PhysicalRepeatOp {
-    PhysicalRepeatOp {
+fn repeat_node_to_physical_op(kind: &super::kind::DistributedRepeatNode) -> RepeatOp {
+    RepeatOp {
         repeat_column_ref_list: kind.repeat_column_ref_list.clone(),
         repeat_column_ref_ids: kind.repeat_column_ref_ids.clone(),
         grouping_ids: kind.grouping_ids.clone(),
@@ -4391,8 +4390,8 @@ fn repeat_node_to_physical_op(kind: &super::kind::DistributedRepeatNode) -> Phys
 
 fn generate_series_node_to_physical_op(
     kind: &super::kind::DistributedGenerateSeriesNode,
-) -> PhysicalGenerateSeriesOp {
-    PhysicalGenerateSeriesOp {
+) -> GenerateSeriesOp {
+    GenerateSeriesOp {
         start: kind.start,
         end: kind.end,
         step: kind.step,
@@ -4536,9 +4535,7 @@ mod tests {
     use crate::sql::codegen::resolve::{ColumnBinding, ExprScope};
     use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentStreamKind};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::operator::{
-        JoinDistribution, Operator, PhysicalProjectOp, PhysicalScanOp,
-    };
+    use crate::sql::optimizer::operator::{JoinDistribution, Operator, ProjectOp, ScanOp};
     use crate::sql::optimizer::physical_plan::{
         PhysicalPlanNode, PlanExecutionProps, attach_scalar_arena,
     };
@@ -5185,7 +5182,7 @@ mod tests {
     fn project_over_metadata_scan_plan() -> PhysicalPlanNode {
         let k = output_col(1, "k", DataType::Int64, false);
         let scan = physical_node(
-            Operator::PhysicalScan(PhysicalScanOp {
+            Operator::PhysicalScan(ScanOp {
                 database: "test_db".to_string(),
                 table: metadata_table_def(),
                 alias: Some("t".to_string()),
@@ -5213,7 +5210,7 @@ mod tests {
             output_column_id: ColumnId::new_for_test(1),
         }];
         let mut plan = physical_node(
-            Operator::PhysicalProject(PhysicalProjectOp {
+            Operator::PhysicalProject(ProjectOp {
                 items: intern_project_items(&mut scalars, &items),
                 output_qualifier: None,
             }),
