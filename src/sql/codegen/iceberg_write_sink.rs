@@ -30,7 +30,6 @@ pub(crate) enum IcebergWriteSinkMode {
     RowLineageData,
     PositionDeletes,
     DeletionVectors,
-    #[allow(dead_code)]
     EqualityDeletes,
 }
 

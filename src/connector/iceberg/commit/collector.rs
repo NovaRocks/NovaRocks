@@ -269,6 +269,17 @@ impl IcebergCommitCollector {
         std::mem::take(&mut *guard)
     }
 
+    /// Read-only check that no net-new INSERT data files were registered via
+    /// [`inject_appended_files`]. Used by `CowUpdateCommit` to assert it routes
+    /// appended rows through the rewrite set, NOT this channel. Non-draining, so
+    /// it is safe inside `debug_assert!` (no debug/release state divergence).
+    pub(crate) fn appended_is_empty(&self) -> bool {
+        self.appended
+            .lock()
+            .expect("collector appended lock poisoned")
+            .is_empty()
+    }
+
     /// Convert one writer-reported sink commit payload without mutating the
     /// collector. This lets callers validate all writer payloads before any file
     /// becomes visible to the commit-action or abort log.
