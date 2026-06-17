@@ -13,7 +13,6 @@ use crate::data_sinks;
 use crate::exprs;
 use crate::plan_nodes;
 
-use crate::sql::analysis::cte::CteId;
 use crate::sql::catalog::{CatalogProvider, IcebergSchemaDef};
 use crate::sql::codegen::FragmentId;
 use crate::sql::codegen::boundary_schema::{
@@ -4785,7 +4784,7 @@ mod tests {
 
     #[test]
     fn build_via_distributed_plan_with_iceberg_sink_maps_file_hash_distribution_to_partitioned_edge()
-    {
+     {
         let file_col_id = ColumnId::new_for_test(2);
         let output_columns = vec![
             output_col_for_test(1, "id", DataType::Int32, false),
