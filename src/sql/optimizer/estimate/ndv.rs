@@ -314,6 +314,9 @@ mod tests {
             single, global,
             "two-phase agg (global over local) must equal single-phase: stage-idempotent"
         );
-        assert_eq!(single, input, "row-count cap must bind at input_rows, not input*0.75");
+        assert_eq!(
+            single, input,
+            "row-count cap must bind at input_rows, not input*0.75"
+        );
     }
 }

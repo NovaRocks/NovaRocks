@@ -2806,8 +2806,8 @@ mod tests {
                 is_internal: false,
             }
         }
-        // A leaf group with the given row_count and a single group-by column (id=1) of NDV=100.
-        fn child_with_rows(memo: &mut Memo, rows: f64) -> usize {
+        // A leaf group with the given row_count and a single group-by column (id=1).
+        fn child_with_stats(memo: &mut Memo, rows: f64, ndv: f64) -> usize {
             let id = memo.next_expr_id();
             let g = memo.new_group(MExpr {
                 id,
@@ -2825,7 +2825,7 @@ mod tests {
                     max_value: rows,
                     nulls_fraction: 0.0,
                     average_row_size: 8.0,
-                    distinct_values_count: 100.0,
+                    distinct_values_count: ndv,
                     ..Default::default()
                 },
             );
@@ -2847,10 +2847,10 @@ mod tests {
         }
 
         let mut memo = Memo::new();
-        // big: 200 * 0.75 = 150 >= NDV 100  -> agg_group_rows = min(100, 150) = 100 (NDV-capped)
-        let big = child_with_rows(&mut memo, 200.0);
-        // small: 100 * 0.75 = 75 < NDV 100  -> agg_group_rows = min(100, 75) = 75 (row-capped)
-        let small = child_with_rows(&mut memo, 100.0);
+        // big: rows=200, NDV=100 -> agg_group_rows = min(100, 200) = 100.
+        let big = child_with_stats(&mut memo, 200.0, 100.0);
+        // small: rows=100, NDV=50 -> agg_group_rows = min(50, 100) = 50.
+        let small = child_with_stats(&mut memo, 100.0, 50.0);
 
         let big_stats = derive_statistics(&agg_over(big, &memo), &memo, &HashMap::new());
         let small_stats = derive_statistics(&agg_over(small, &memo), &memo, &HashMap::new());
@@ -3935,7 +3935,7 @@ mod tests {
         derive_group_statistics(&mut memo, &table_stats);
 
         // Agg group: real NDV(status)=5 now flows through child_statistics,
-        // so output = min(5, 100000*0.75) = 5.
+        // so output = min(5, 100000) = 5.
         let agg_props = memo.groups[1].logical_props.as_ref().unwrap();
         assert!((agg_props.row_count - 5.0).abs() < 1.0);
     }

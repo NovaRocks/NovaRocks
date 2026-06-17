@@ -2,18 +2,18 @@ Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
-12:PROJECT [a.k AS k, sum(a.v)] stats={rows=68}
-  11:PROJECT [a.k, sum(sum(a.v)) AS sum(a.v)] stats={rows=68}
-    10:HASH AGGREGATE (GLOBAL, group by: [a.k]) stats={rows=68}
+12:PROJECT [a.k AS k, sum(a.v)] stats={rows=90}
+  11:PROJECT [a.k, sum(sum(a.v)) AS sum(a.v)] stats={rows=90}
+    10:HASH AGGREGATE (GLOBAL, group by: [a.k]) stats={rows=90}
       aggregations: sum(sum(a.v))
-      9:HASH EXCHANGE stats={rows=68}
+      9:HASH EXCHANGE stats={rows=90}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 9
     PARTITION: HASH_PARTITIONED (a.k)
-8:HASH AGGREGATE (LOCAL, group by: [a.k]) stats={rows=68}
+8:HASH AGGREGATE (LOCAL, group by: [a.k]) stats={rows=90}
   aggregations: sum(sum(a.v))
   7:HASH JOIN (BROADCAST, INNER, eq: [b.k = a.k]) stats={rows=90}
     build runtime filters:

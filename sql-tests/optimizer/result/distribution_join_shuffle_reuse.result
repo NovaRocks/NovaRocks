@@ -2,25 +2,25 @@ Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
-10:SORT BY [l.k ASC NULLS FIRST] stats={rows=2}
-  9:GATHER stats={rows=2}
+10:SORT BY [l.k ASC NULLS FIRST] stats={rows=3}
+  9:GATHER stats={rows=3}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 9
     PARTITION: UNPARTITIONED
-8:PROJECT [l.k AS k, sum(r.v) AS total_v] stats={rows=2}
-  7:HASH AGGREGATE (GLOBAL, group by: [l.k]) stats={rows=2}
+8:PROJECT [l.k AS k, sum(r.v) AS total_v] stats={rows=3}
+  7:HASH AGGREGATE (GLOBAL, group by: [l.k]) stats={rows=3}
     aggregations: sum(r.v)
-    6:HASH EXCHANGE stats={rows=2}
+    6:HASH EXCHANGE stats={rows=3}
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 6
     PARTITION: HASH_PARTITIONED (l.k)
-5:HASH AGGREGATE (LOCAL, group by: [l.k]) stats={rows=2}
+5:HASH AGGREGATE (LOCAL, group by: [l.k]) stats={rows=3}
   aggregations: sum(r.v)
   4:HASH JOIN (BROADCAST, INNER, eq: [l.k = r.k]) stats={rows=3}
     build runtime filters:

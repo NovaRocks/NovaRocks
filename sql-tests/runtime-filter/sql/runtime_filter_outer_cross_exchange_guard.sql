@@ -34,7 +34,7 @@ INSERT INTO ${case_db}.rf_outer_dim VALUES (10), (30), (40);
 SET disable_optimizer_rules = '';
 -- @explain_contains=HASH JOIN (PARTITIONED, FULL OUTER
 -- @explain_contains=build runtime filters:
--- @explain_contains=probe_expr = (d.k)
+-- @explain_contains=build_expr = (d.k)
 -- @explain_not_contains=probe_expr = (l.k)
 -- @explain_not_contains=probe_expr = (r.k)
 WITH x AS (
