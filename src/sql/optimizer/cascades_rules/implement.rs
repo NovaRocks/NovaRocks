@@ -1704,6 +1704,13 @@ mod join_demotion_tests {
         materialize(&memo.scalars, expr)
     }
 
+    fn assert_col_id(expr: &TypedExpr, expected: ColumnId, message: &str) {
+        match &expr.kind {
+            ExprKind::ColumnRef { column_id, .. } => assert_eq!(*column_id, expected, "{message}"),
+            other => panic!("expected ColumnRef for {message}, got {:?}", other),
+        }
+    }
+
     /// The full demotion path: a same-side eq pair must land in other_condition
     /// while an orientable pair lands (correctly oriented) in eq_conditions.
     #[test]
@@ -1752,18 +1759,16 @@ mod join_demotion_tests {
         );
         let lhs = mat(&memo, eq.left);
         let rhs = mat(&memo, eq.right);
-        match &lhs.kind {
-            ExprKind::ColumnRef { column, .. } => {
-                assert_eq!(column, "a_id", "left side of eq_condition should be a_id")
-            }
-            other => panic!("expected ColumnRef on left of eq pair, got {:?}", other),
-        }
-        match &rhs.kind {
-            ExprKind::ColumnRef { column, .. } => {
-                assert_eq!(column, "b_id", "right side of eq_condition should be b_id")
-            }
-            other => panic!("expected ColumnRef on right of eq pair, got {:?}", other),
-        }
+        assert_col_id(
+            &lhs,
+            test_col_id("a_id"),
+            "left side of eq_condition should be a_id",
+        );
+        assert_col_id(
+            &rhs,
+            test_col_id("b_id"),
+            "right side of eq_condition should be b_id",
+        );
 
         // ── other_condition: the demoted (a_id = a_name) pair ───────────────
         let other = phys
@@ -1780,11 +1785,13 @@ mod join_demotion_tests {
                 );
                 match (&left.kind, &right.kind) {
                     (
-                        ExprKind::ColumnRef { column: l, .. },
-                        ExprKind::ColumnRef { column: r, .. },
+                        ExprKind::ColumnRef { column_id: l, .. },
+                        ExprKind::ColumnRef { column_id: r, .. },
                     ) => {
+                        let a_id = test_col_id("a_id");
+                        let a_name = test_col_id("a_name");
                         assert!(
-                            (l == "a_id" && r == "a_name") || (l == "a_name" && r == "a_id"),
+                            (*l == a_id && *r == a_name) || (*l == a_name && *r == a_id),
                             "expected (a_id, a_name) in demoted eq, got ({}, {})",
                             l,
                             r
@@ -1942,10 +1949,7 @@ mod join_demotion_tests {
             "only the scalar equality should remain as a hash key"
         );
         let left_key = mat(&memo, phys.eq_conditions[0].left);
-        match &left_key.kind {
-            ExprKind::ColumnRef { column, .. } => assert_eq!(column, "a_id"),
-            other => panic!("expected scalar hash key on left, got {:?}", other),
-        }
+        assert_col_id(&left_key, test_col_id("a_id"), "scalar hash key on left");
         assert!(
             phys.other_condition.is_some(),
             "complex equality must survive as a residual predicate"
@@ -2146,10 +2150,20 @@ mod two_phase_agg_tests {
     use crate::sql::planner::plan::AggregateCall;
     use arrow::datatypes::DataType;
 
+    fn test_col_id(name: &str) -> ColumnId {
+        match name {
+            "k" => ColumnId::new_for_test(1),
+            "v" => ColumnId::new_for_test(2),
+            "city" => ColumnId::new_for_test(4),
+            "id" => ColumnId::new_for_test(5),
+            _ => ColumnId::new_for_test(100),
+        }
+    }
+
     fn col(name: &str) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
-                column_id: ColumnId::UNSET,
+                column_id: test_col_id(name),
                 qualifier: None,
                 column: name.into(),
             },
@@ -2318,14 +2332,14 @@ mod two_phase_agg_tests {
                 }],
                 vec![
                     OutputColumn {
-                        column_id: ColumnId::UNSET,
+                        column_id: test_col_id("city"),
                         name: "city".into(),
                         data_type: DataType::Int32,
                         nullable: false,
                         is_internal: false,
                     },
                     OutputColumn {
-                        column_id: ColumnId::UNSET,
+                        column_id: ColumnId::new_for_test(6),
                         name: "count(distinct id)".into(),
                         data_type: DataType::Int64,
                         nullable: true,

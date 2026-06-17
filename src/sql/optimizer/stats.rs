@@ -2885,12 +2885,13 @@ mod tests {
             memo.groups[g].logical_props = Some(props);
             g
         }
-        fn agg_over(child: usize, memo: &Memo) -> MExpr {
+        fn agg_over(child: usize, memo: &mut Memo) -> MExpr {
+            let group_by = intern_exprs(&mut memo.scalars, &[col_ref(1, "k")]);
             MExpr {
                 id: memo.next_expr_id(), // id is irrelevant to derive_statistics
                 op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
                     mode: AggMode::Single,
-                    group_by: vec![col_ref(1, "k")],
+                    group_by,
                     aggregates: vec![],
                     output_columns: vec![output_column(1, "k")],
                     is_merge: vec![],
@@ -2905,8 +2906,8 @@ mod tests {
         // small: rows=100, NDV=50 -> agg_group_rows = min(50, 100) = 50.
         let small = child_with_stats(&mut memo, 100.0, 50.0);
 
-        let big_stats = derive_statistics(&agg_over(big, &memo), &memo, &HashMap::new());
-        let small_stats = derive_statistics(&agg_over(small, &memo), &memo, &HashMap::new());
+        let big_stats = derive_statistics(&agg_over(big, &mut memo), &memo, &HashMap::new());
+        let small_stats = derive_statistics(&agg_over(small, &mut memo), &memo, &HashMap::new());
 
         // Same op, different children -> different own_stats. A single group cache
         // cannot represent both, which is exactly why search.rs keeps own_stats per-expr.

@@ -70,10 +70,17 @@ mod tests {
     use crate::sql::planner::plan::*;
     use arrow::datatypes::DataType;
 
+    fn test_col_id(name: &str) -> ColumnId {
+        match name {
+            "k" => ColumnId::new_for_test(1),
+            _ => ColumnId::new_for_test(100),
+        }
+    }
+
     fn col_ref(name: &str) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
-                column_id: ColumnId::UNSET,
+                column_id: test_col_id(name),
                 qualifier: None,
                 column: name.into(),
             },
@@ -102,7 +109,7 @@ mod tests {
                 },
                 alias: None,
                 columns: vec![OutputColumn {
-                    column_id: ColumnId::UNSET,
+                    column_id: test_col_id(col),
                     name: col.into(),
                     data_type: DataType::Int64,
                     nullable: false,

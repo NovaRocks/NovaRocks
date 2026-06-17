@@ -573,7 +573,7 @@ mod tests {
     fn col_ref(id: u32) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
-                column_id: ColumnId::new_for_test(id),
+                column_id: ColumnId::new_for_test(id + 1),
                 qualifier: None,
                 column: format!("c{id}"),
             },
@@ -597,7 +597,7 @@ mod tests {
     fn atom_stats(col_id: u32, rows: f64, ndv: f64) -> Statistics {
         let mut cs = HashMap::new();
         cs.insert(
-            ColumnId::new_for_test(col_id),
+            ColumnId::new_for_test(col_id + 1),
             ColumnStatistic {
                 min_value: 0.0,
                 max_value: ndv,

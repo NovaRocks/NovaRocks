@@ -371,14 +371,10 @@ mod tests {
         };
         assert_eq!(global.group_by.len(), 1);
         let group_by = materialize(&memo.scalars, global.group_by[0]);
-        let ExprKind::ColumnRef {
-            column_id, column, ..
-        } = &group_by.kind
-        else {
+        let ExprKind::ColumnRef { column_id, .. } = &group_by.kind else {
             panic!("expected global group key column ref");
         };
         assert_eq!(*column_id, ColumnId::new_for_test(1));
-        assert_eq!(column, "t.k");
     }
 
     #[test]

@@ -480,10 +480,22 @@ mod tests {
     use arrow::datatypes::DataType;
     use std::sync::Arc;
 
+    fn test_col_id(name: &str) -> ColumnId {
+        match name {
+            "x" => ColumnId::new_for_test(1),
+            "a" => ColumnId::new_for_test(2),
+            "b" => ColumnId::new_for_test(3),
+            "g" => ColumnId::new_for_test(4),
+            "name" => ColumnId::new_for_test(5),
+            "id" => ColumnId::new_for_test(6),
+            _ => ColumnId::new_for_test(100),
+        }
+    }
+
     fn col(name: &str) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
-                column_id: ColumnId::UNSET,
+                column_id: test_col_id(name),
                 qualifier: None,
                 column: name.into(),
             },
@@ -534,6 +546,11 @@ mod tests {
         aggregates: Vec<AggregateCall>,
         output_columns: Vec<OutputColumn>,
     ) -> LogicalAggregateOp {
+        let output_columns = if output_columns.is_empty() {
+            default_output_columns(&group_by, &aggregates)
+        } else {
+            output_columns
+        };
         let group_by = intern_exprs(&mut memo.scalars, &group_by);
         let aggregates = intern_aggregate_calls(&mut memo.scalars, &aggregates);
         LogicalAggregateOp::single(group_by, aggregates, output_columns)
@@ -574,6 +591,46 @@ mod tests {
             order_by: vec![],
             output_column_id: ColumnId::UNSET,
         }
+    }
+
+    fn fallback_output_id(offset: usize) -> ColumnId {
+        ColumnId::new_for_test(1000 + offset as u32)
+    }
+
+    fn default_output_columns(
+        group_by: &[TypedExpr],
+        aggregates: &[AggregateCall],
+    ) -> Vec<OutputColumn> {
+        let mut outputs = Vec::with_capacity(group_by.len() + aggregates.len());
+        for (idx, expr) in group_by.iter().enumerate() {
+            let (column_id, name) = match &expr.kind {
+                ExprKind::ColumnRef {
+                    column_id, column, ..
+                } => (*column_id, column.clone()),
+                _ => (fallback_output_id(idx), format!("group_{idx}")),
+            };
+            outputs.push(OutputColumn {
+                column_id,
+                name,
+                data_type: expr.data_type.clone(),
+                nullable: expr.nullable,
+                is_internal: false,
+            });
+        }
+        for (idx, call) in aggregates.iter().enumerate() {
+            outputs.push(OutputColumn {
+                column_id: if call.output_column_id == ColumnId::UNSET {
+                    fallback_output_id(group_by.len() + idx)
+                } else {
+                    call.output_column_id
+                },
+                name: format!("agg_{idx}"),
+                data_type: call.result_type.clone(),
+                nullable: true,
+                is_internal: false,
+            });
+        }
+        outputs
     }
 
     #[test]
@@ -1103,7 +1160,7 @@ mod tests {
         let mut memo = Memo::new();
         let sg = scan_group(&mut memo);
         let x_phase = col_with_id("x", 5);
-        let x_duplicate = col_with_id("x", 55);
+        let x_duplicate = col_with_id("x", 5);
         let a = col_with_id("a", 6);
         let id = memo.next_expr_id();
         let mexpr = MExpr {
