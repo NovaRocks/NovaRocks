@@ -56,7 +56,7 @@ pub(crate) fn passthrough_required_full(
 }
 
 use crate::sql::optimizer::operator::{
-    PhysicalCTEProduceOp, PhysicalDecodeOp, PhysicalFilterOp, PhysicalLimitOp, PhysicalProjectOp,
+    FilterOp, PhysicalCTEProduceOp, PhysicalDecodeOp, PhysicalLimitOp, PhysicalProjectOp,
     PhysicalRepeatOp, PhysicalTableFunctionOp,
 };
 
@@ -91,7 +91,7 @@ macro_rules! passthrough_distribution_blind_impls {
 }
 
 passthrough_distribution_blind_impls!(
-    PhysicalFilterOp,
+    FilterOp,
     PhysicalProjectOp,
     PhysicalDecodeOp,
     PhysicalCTEProduceOp,
@@ -187,18 +187,18 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::operator::{PhysicalFilterOp, PhysicalLimitOp, PhysicalProjectOp};
+    use crate::sql::optimizer::operator::{FilterOp, PhysicalLimitOp, PhysicalProjectOp};
     use crate::sql::optimizer::property::{DistributionSpec, OrderingSpec, SortKey};
     use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
     use arrow::datatypes::DataType;
 
-    fn bool_filter(scalars: &mut ScalarArena) -> PhysicalFilterOp {
+    fn bool_filter(scalars: &mut ScalarArena) -> FilterOp {
         let predicate = TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Bool(true)),
             data_type: DataType::Boolean,
             nullable: false,
         };
-        PhysicalFilterOp {
+        FilterOp {
             predicate: intern_typed(scalars, &predicate),
         }
     }

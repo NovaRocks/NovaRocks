@@ -7,7 +7,7 @@ use crate::sql::optimizer::logical_props::{
     make_eq_literal_predicate,
 };
 use crate::sql::optimizer::memo::{GroupId, LogicalProperties, MExpr, Memo};
-use crate::sql::optimizer::operator::{LogicalFilterOp, LogicalJoinOp, Operator};
+use crate::sql::optimizer::operator::{FilterOp, LogicalJoinOp, Operator};
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
 use crate::sql::optimizer::scalar::{intern_typed, materialize};
 use std::collections::{HashMap, HashSet};
@@ -284,7 +284,7 @@ fn add_filter_group(memo: &mut Memo, child_group: GroupId, predicates: Vec<Typed
     let predicate = intern_typed(&mut memo.scalars, &predicate);
     let filter_expr = MExpr {
         id: memo.next_expr_id(),
-        op: Operator::LogicalFilter(LogicalFilterOp { predicate }),
+        op: Operator::LogicalFilter(FilterOp { predicate }),
         children: vec![child_group],
     };
     let new_group = memo.new_group(filter_expr);
@@ -510,7 +510,7 @@ mod tests {
         let right_filter_predicate = intern(&mut memo, &eq(col(2, "rk"), lit(10)));
         let right_filter = memo.new_group(MExpr {
             id: right_filter_id,
-            op: Operator::LogicalFilter(LogicalFilterOp {
+            op: Operator::LogicalFilter(FilterOp {
                 predicate: right_filter_predicate,
             }),
             children: vec![right_scan],

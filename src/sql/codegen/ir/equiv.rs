@@ -35,9 +35,9 @@ mod tests {
     };
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
-        AggMode, AggregateStateMergeOp, JoinDistribution, Operator, PhysicalAssertOneRowOp,
-        PhysicalCTEAnchorOp, PhysicalCTEConsumeOp, PhysicalCTEProduceOp, PhysicalDecodeOp,
-        PhysicalDistributionOp, PhysicalExceptOp, PhysicalFilterOp, PhysicalGenerateSeriesOp,
+        AggMode, AggregateStateMergeOp, FilterOp, JoinDistribution, Operator,
+        PhysicalAssertOneRowOp, PhysicalCTEAnchorOp, PhysicalCTEConsumeOp, PhysicalCTEProduceOp,
+        PhysicalDecodeOp, PhysicalDistributionOp, PhysicalExceptOp, PhysicalGenerateSeriesOp,
         PhysicalHashAggregateOp, PhysicalHashJoinEqCondition, PhysicalHashJoinOp,
         PhysicalIntersectOp, PhysicalLimitOp, PhysicalNestLoopJoinOp, PhysicalProjectOp,
         PhysicalRepeatOp, PhysicalScanOp, PhysicalSortOp, PhysicalTableFunctionOp, PhysicalTopNOp,
@@ -2168,7 +2168,7 @@ mod tests {
         let mut scalars = scalars_from_children(std::slice::from_ref(&child));
         let output_columns = child.output_columns.clone();
         physical_node_with_scalars(
-            Operator::PhysicalFilter(PhysicalFilterOp {
+            Operator::PhysicalFilter(FilterOp {
                 predicate: intern_exprs(
                     &mut scalars,
                     &[and_expr(

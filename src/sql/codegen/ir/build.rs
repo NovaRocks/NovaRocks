@@ -1301,7 +1301,7 @@ mod tests {
     use crate::sql::codegen::ir::DistributedPlanNodeKind;
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
-        Operator, PhysicalAssertOneRowOp, PhysicalFilterOp, PhysicalProjectOp, PhysicalScanOp,
+        FilterOp, Operator, PhysicalAssertOneRowOp, PhysicalProjectOp, PhysicalScanOp,
         PhysicalSortOp, PhysicalWindowOp,
     };
     use crate::sql::optimizer::physical_plan::{
@@ -1575,7 +1575,7 @@ mod tests {
         let mut scalars = scalars_from_children(std::slice::from_ref(&child));
         let output_columns = child.output_columns.clone();
         let mut plan = physical_node_with_row_count(
-            Operator::PhysicalFilter(PhysicalFilterOp {
+            Operator::PhysicalFilter(FilterOp {
                 predicate: intern_typed(
                     &mut scalars,
                     &and_expr(

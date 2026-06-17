@@ -17,7 +17,7 @@ use std::sync::Mutex;
 use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
 use crate::sql::optimizer::memo::{MExpr, MExprId, Memo};
 use crate::sql::optimizer::operator::{
-    LogicalAggregateOp, LogicalFilterOp, LogicalProjectOp, LogicalScanOp, Operator,
+    FilterOp, LogicalAggregateOp, LogicalProjectOp, LogicalScanOp, Operator,
 };
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
 use crate::sql::optimizer::scalar::{intern_typed, materialize};
@@ -170,7 +170,7 @@ fn try_rewrite(
         let predicate = intern_typed(&mut memo.scalars, &predicate);
         child_group = memo.new_group(MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalFilter(LogicalFilterOp { predicate }),
+            op: Operator::LogicalFilter(FilterOp { predicate }),
             children: vec![scan_group],
         });
     }

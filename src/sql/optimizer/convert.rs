@@ -2,8 +2,8 @@
 
 use super::memo::{GroupId, MExpr, Memo};
 use super::operator::{
-    AggregateStateMergeOp, LogicalAggregateOp, LogicalAssertOneRowOp, LogicalCTEAnchorOp,
-    LogicalCTEConsumeOp, LogicalCTEProduceOp, LogicalDecodeOp, LogicalExceptOp, LogicalFilterOp,
+    AggregateStateMergeOp, FilterOp, LogicalAggregateOp, LogicalAssertOneRowOp, LogicalCTEAnchorOp,
+    LogicalCTEConsumeOp, LogicalCTEProduceOp, LogicalDecodeOp, LogicalExceptOp,
     LogicalGenerateSeriesOp, LogicalIntersectOp, LogicalJoinOp, LogicalLimitOp, LogicalProjectOp,
     LogicalRepeatOp, LogicalScanOp, LogicalSortOp, LogicalTableFunctionOp, LogicalUnionOp,
     LogicalValuesOp, LogicalWindowOp, Operator,
@@ -43,7 +43,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlanNode, memo: &mut Memo) -> G
 
         LogicalPlanNodeKind::Filter(node) => {
             let child = logical_plan_to_memo(plan.unary_input(), memo);
-            let op = Operator::LogicalFilter(LogicalFilterOp {
+            let op = Operator::LogicalFilter(FilterOp {
                 predicate: intern_typed(&mut memo.scalars, &node.predicate),
             });
             let expr = MExpr {

@@ -3022,13 +3022,13 @@ mod tests {
 
     #[test]
     fn logical_filter_caps_payload_ndv_at_output_rows() {
-        use crate::sql::optimizer::operator::{LogicalFilterOp, Operator};
+        use crate::sql::optimizer::operator::{FilterOp, Operator};
 
         let mut memo = Memo::new();
         let child = filter_ndv_child_group(&mut memo);
         let filter = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalFilter(LogicalFilterOp {
+            op: Operator::LogicalFilter(FilterOp {
                 predicate: intern_typed(
                     &mut memo.scalars,
                     &eq_expr(col_ref("filter_col"), int_lit(1)),
@@ -3042,13 +3042,13 @@ mod tests {
 
     #[test]
     fn physical_filter_caps_payload_ndv_at_output_rows() {
-        use crate::sql::optimizer::operator::{Operator, PhysicalFilterOp};
+        use crate::sql::optimizer::operator::{FilterOp, Operator};
 
         let mut memo = Memo::new();
         let child = filter_ndv_child_group(&mut memo);
         let filter = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::PhysicalFilter(PhysicalFilterOp {
+            op: Operator::PhysicalFilter(FilterOp {
                 predicate: intern_typed(
                     &mut memo.scalars,
                     &eq_expr(col_ref("filter_col"), int_lit(1)),

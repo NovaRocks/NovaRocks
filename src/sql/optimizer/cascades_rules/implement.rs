@@ -513,7 +513,7 @@ impl Rule for FilterToPhysical {
             return vec![];
         };
         vec![NewExpr {
-            op: Operator::PhysicalFilter(PhysicalFilterOp {
+            op: Operator::PhysicalFilter(FilterOp {
                 predicate: op.predicate.clone(),
             }),
             children: expr.children.clone(),

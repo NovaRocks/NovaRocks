@@ -120,7 +120,7 @@ pub(crate) struct LogicalScanOp {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct LogicalFilterOp {
+pub(crate) struct FilterOp {
     pub predicate: ScalarId,
 }
 
@@ -352,11 +352,6 @@ pub(crate) struct PhysicalScanOp {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct PhysicalFilterOp {
-    pub predicate: ScalarId,
-}
-
-#[derive(Clone, Debug)]
 pub(crate) struct PhysicalProjectOp {
     pub items: Vec<ScalarProjectItem>,
     pub output_qualifier: Option<String>,
@@ -541,7 +536,7 @@ pub(crate) struct PhysicalDecodeOp {
 pub(crate) enum Operator {
     // Logical operators
     LogicalScan(LogicalScanOp),
-    LogicalFilter(LogicalFilterOp),
+    LogicalFilter(FilterOp),
     LogicalProject(LogicalProjectOp),
     LogicalAggregate(LogicalAggregateOp),
     LogicalJoin(LogicalJoinOp),
@@ -565,7 +560,7 @@ pub(crate) enum Operator {
 
     // Physical operators
     PhysicalScan(PhysicalScanOp),
-    PhysicalFilter(PhysicalFilterOp),
+    PhysicalFilter(FilterOp),
     PhysicalProject(PhysicalProjectOp),
     PhysicalHashJoin(PhysicalHashJoinOp),
     PhysicalNestLoopJoin(PhysicalNestLoopJoinOp),
