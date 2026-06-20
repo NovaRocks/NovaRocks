@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
-use crate::sql::analysis::{BinOp, LiteralValue};
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::{BinOp, LiteralValue};
 use crate::sql::optimizer::operator::{Operator, ScalarWindowSpec, SortOp, WindowOp};
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;

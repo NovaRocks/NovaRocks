@@ -1,7 +1,7 @@
 //! Aggregate pushdown rewriter — phase 2 of the rule.
 
-use crate::sql::analysis::OutputColumn;
 use crate::sql::column_id::{ColumnId, ColumnRefFactory};
+use crate::sql::common::OutputColumn;
 use crate::sql::optimizer::operator::{
     AggStage, LogicalAggregateOp, Operator, ProjectOp, ScalarAggregateSpec, ScalarProjectItem,
 };

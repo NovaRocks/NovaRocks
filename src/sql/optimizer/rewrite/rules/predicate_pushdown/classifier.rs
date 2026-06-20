@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
-use crate::sql::analysis::JoinKind;
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::JoinKind;
 use crate::sql::optimizer::rewrite::rules::predicate_pushdown::predicate_group::PredicateGroup;
 
 #[derive(Clone, Debug, Default)]

@@ -32,7 +32,7 @@ fn is_assert_true_item(arena: &ScalarArena, item: &ScalarProjectItem) -> bool {
 
 /// Intern `const 1` (Int64) into the arena and return its `ScalarId`.
 fn intern_const_one(arena: &mut ScalarArena) -> ScalarId {
-    use crate::sql::analysis::LiteralValue;
+    use crate::sql::common::LiteralValue;
     arena.intern(
         ScalarNode::Literal(scalar::HashableLiteral(LiteralValue::Int(1))),
         DataType::Int64,

@@ -8,9 +8,9 @@ use std::collections::{HashMap, HashSet};
 use super::operator::{LogicalJoinOp, Operator};
 use super::property::{ColumnIdSet, EquivalenceClasses};
 use super::statistics::{ColumnStatistic, Confidence};
-use crate::sql::analysis::OutputColumn;
-use crate::sql::analysis::cte::CteId;
 use crate::sql::column_id::{ColumnId, ColumnRefFactory};
+use crate::sql::common::CteId;
+use crate::sql::common::OutputColumn;
 use crate::sql::optimizer::scalar::ScalarArena;
 
 // ---------------------------------------------------------------------------

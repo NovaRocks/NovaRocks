@@ -2,9 +2,9 @@ use arrow::datatypes::DataType;
 
 use crate::exec::expr::function::variant::variant_get_target_type;
 use crate::exec::variant::{VariantPathSegment, parse_variant_path};
-use crate::sql::analysis::{LiteralValue, OutputColumn};
 use crate::sql::catalog::ScanSource;
 use crate::sql::column_id::{ColumnId, ColumnRefFactory};
+use crate::sql::common::{LiteralValue, OutputColumn};
 use crate::sql::optimizer::operator::{FilterOp, Operator, ProjectOp, ScanOp, ScanVariantColumn};
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use crate::sql::analysis::{BinOp, LiteralValue};
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::{BinOp, LiteralValue};
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence, PREDICATE_UNKNOWN_FILTER};
 

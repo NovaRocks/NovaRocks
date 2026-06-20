@@ -151,7 +151,7 @@ impl SearchContext {
                     let required_for_correctness = matches!(
                         &expr.op,
                         Operator::PhysicalHashJoin(join)
-                            if join.join_type == crate::sql::analysis::JoinKind::NullAwareLeftAnti
+                            if join.join_type == crate::sql::common::JoinKind::NullAwareLeftAnti
                     );
                     if let (Some(&probe_group_id), Some(&build_group_id)) =
                         (expr.children.first(), expr.children.get(1))

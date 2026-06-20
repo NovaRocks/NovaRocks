@@ -4,8 +4,8 @@ use std::collections::HashSet;
 
 use arrow::datatypes::DataType;
 
-use crate::sql::analysis::{BinOp, LiteralValue, UnOp};
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::{BinOp, LiteralValue, UnOp};
 use crate::sql::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNode, SortKey};
 
 pub(crate) fn column_id(arena: &ScalarArena, expr: ScalarId) -> Option<ColumnId> {

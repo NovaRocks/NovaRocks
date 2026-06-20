@@ -9,7 +9,7 @@
 
 use arrow::datatypes::DataType;
 
-use crate::sql::analysis::{BinOp, JoinKind};
+use crate::sql::common::{BinOp, JoinKind};
 use crate::sql::optimizer::estimate::cardinality::{JoinCardInput, estimate_join_cardinality};
 use crate::sql::optimizer::estimate::join_condition::estimate_join_condition;
 use crate::sql::optimizer::memo::JoinTree;

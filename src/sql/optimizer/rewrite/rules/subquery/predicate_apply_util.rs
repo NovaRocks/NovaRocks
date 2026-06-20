@@ -6,8 +6,8 @@
 use std::collections::HashSet;
 
 use super::scalar_utils;
-use crate::sql::analysis::BinOp;
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::BinOp;
 use crate::sql::optimizer::operator::{Operator, ProjectOp, ScalarProjectItem};
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};

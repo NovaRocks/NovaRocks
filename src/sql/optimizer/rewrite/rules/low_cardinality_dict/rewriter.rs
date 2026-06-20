@@ -61,8 +61,8 @@
 
 use arrow::datatypes::DataType;
 
-use crate::sql::analysis::{BinOp, OutputColumn};
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::{BinOp, OutputColumn};
 use crate::sql::optimizer::operator::{
     DecodeOp, LogicalAggregateOp, LogicalJoinOp, Operator, ProjectOp, ScalarAggregateSpec,
     ScalarProjectItem, ScanOp, SortOp, TopNOp, UnionOp,

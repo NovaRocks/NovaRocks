@@ -4,8 +4,8 @@
 
 use std::collections::HashMap;
 
-use crate::sql::analysis::{BinOp, OutputColumn, UnOp};
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::{BinOp, OutputColumn, UnOp};
 use crate::sql::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNode};
 
 /// Canonical, ColumnId-independent expression form. Two exprs over the same

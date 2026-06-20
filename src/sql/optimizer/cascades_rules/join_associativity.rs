@@ -10,7 +10,7 @@
 //! rewrite is skipped. Full predicate re-association across the rewrite
 //! is a future improvement.
 
-use crate::sql::analysis::JoinKind;
+use crate::sql::common::JoinKind;
 use crate::sql::optimizer::memo::{MExpr, Memo};
 use crate::sql::optimizer::operator::{LogicalJoinOp, Operator};
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};

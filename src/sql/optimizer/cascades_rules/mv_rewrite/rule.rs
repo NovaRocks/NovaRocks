@@ -14,7 +14,7 @@
 use std::collections::HashSet;
 use std::sync::Mutex;
 
-use crate::sql::analysis::{LiteralValue, OutputColumn};
+use crate::sql::common::{LiteralValue, OutputColumn};
 use crate::sql::optimizer::memo::{MExpr, MExprId, Memo};
 use crate::sql::optimizer::operator::{
     FilterOp, LogicalAggregateOp, Operator, ProjectOp, ScalarAggregateSpec, ScalarProjectItem,

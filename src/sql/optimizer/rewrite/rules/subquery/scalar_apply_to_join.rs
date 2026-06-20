@@ -20,8 +20,8 @@ use std::collections::HashSet;
 use arrow::datatypes::DataType;
 
 use super::scalar_utils;
-use crate::sql::analysis::{BinOp, JoinKind, OutputColumn};
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::{BinOp, JoinKind, OutputColumn};
 use crate::sql::optimizer::operator::{
     AssertOneRowOp, LogicalAggregateOp, Operator, ProjectOp, ScalarProjectItem,
 };

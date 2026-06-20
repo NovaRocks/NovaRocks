@@ -6,9 +6,9 @@
 
 use std::collections::HashMap;
 
-use crate::sql::analysis::OutputColumn;
 use crate::sql::catalog::TableDef;
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::OutputColumn;
 use crate::sql::optimizer::memo::{MExpr, Memo};
 use crate::sql::optimizer::operator::{
     AggStage, LogicalAggregateOp, Operator, ProjectOp, ScalarAggregateSpec,

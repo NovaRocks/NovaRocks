@@ -8,8 +8,8 @@ use std::collections::HashSet;
 
 use arrow::datatypes::DataType;
 
-use crate::sql::analysis::{BinOp, JoinKind};
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::{BinOp, JoinKind};
 use crate::sql::optimizer::operator::{FilterOp, Operator};
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;

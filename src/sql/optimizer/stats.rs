@@ -10,8 +10,8 @@ use super::estimate::ndv::{agg_group_rows, cap_ndv_at_rows};
 use super::estimate::selectivity::apply_filter;
 use super::memo::{GroupId, JoinTree, MExpr, Memo};
 use super::operator::Operator;
-use crate::sql::analysis::{BinOp, JoinKind, LiteralValue, OutputColumn, UnOp};
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::{BinOp, JoinKind, LiteralValue, OutputColumn, UnOp};
 use crate::sql::optimizer::estimate::arith::{damped_conjunction, sat_add};
 use crate::sql::optimizer::estimate::cardinality::{
     JoinCardInput, estimate_join_cardinality, except_rows, intersect_rows, union_all_rows,
@@ -2131,14 +2131,12 @@ fn derive_join(
 ///  - LeftSemi, LeftAnti:  only left columns survive; no widening needed
 ///  - RightSemi, RightAnti: only right columns survive; no widening needed
 fn widen_for_join_kind(
-    join_type: crate::sql::analysis::JoinKind,
-    left_cols: Vec<crate::sql::analysis::OutputColumn>,
-    right_cols: Vec<crate::sql::analysis::OutputColumn>,
-) -> Vec<crate::sql::analysis::OutputColumn> {
-    use crate::sql::analysis::JoinKind::*;
-    fn widen(
-        cols: Vec<crate::sql::analysis::OutputColumn>,
-    ) -> Vec<crate::sql::analysis::OutputColumn> {
+    join_type: crate::sql::common::JoinKind,
+    left_cols: Vec<crate::sql::common::OutputColumn>,
+    right_cols: Vec<crate::sql::common::OutputColumn>,
+) -> Vec<crate::sql::common::OutputColumn> {
+    use crate::sql::common::JoinKind::*;
+    fn widen(cols: Vec<crate::sql::common::OutputColumn>) -> Vec<crate::sql::common::OutputColumn> {
         cols.into_iter()
             .map(|mut c| {
                 c.nullable = true;
@@ -2173,7 +2171,7 @@ fn widen_for_join_kind(
 }
 
 /// Derive output columns for a group from its first expression.
-fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analysis::OutputColumn> {
+fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::common::OutputColumn> {
     let group = &memo.groups[group_idx];
     let expr = group.logical_exprs.first().or(group.physical_exprs.first());
 
@@ -2186,7 +2184,7 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
         Operator::LogicalProject(p) => p
             .items
             .iter()
-            .map(|item| crate::sql::analysis::OutputColumn {
+            .map(|item| crate::sql::common::OutputColumn {
                 column_id: item.output_column_id,
                 name: item.output_name.clone(),
                 data_type: memo.scalars.data_type(item.expr).clone(),
@@ -2207,7 +2205,7 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
         Operator::LogicalCTEProduce(c) => c.output_columns.clone(),
         Operator::LogicalCTEConsume(c) => c.output_columns.clone(),
         Operator::LogicalGenerateSeries(g) => {
-            vec![crate::sql::analysis::OutputColumn {
+            vec![crate::sql::common::OutputColumn {
                 column_id: g.output_column_id,
                 name: g.column_name.clone(),
                 data_type: arrow::datatypes::DataType::Int64,
@@ -2266,7 +2264,7 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
         Operator::PhysicalProject(p) => p
             .items
             .iter()
-            .map(|item| crate::sql::analysis::OutputColumn {
+            .map(|item| crate::sql::common::OutputColumn {
                 column_id: item.output_column_id,
                 name: item.output_name.clone(),
                 data_type: memo.scalars.data_type(item.expr).clone(),
@@ -2284,7 +2282,7 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
         Operator::PhysicalCTEProduce(c) => c.output_columns.clone(),
         Operator::PhysicalCTEConsume(c) => c.output_columns.clone(),
         Operator::PhysicalGenerateSeries(g) => {
-            vec![crate::sql::analysis::OutputColumn {
+            vec![crate::sql::common::OutputColumn {
                 column_id: g.output_column_id,
                 name: g.column_name.clone(),
                 data_type: arrow::datatypes::DataType::Int64,
@@ -2366,7 +2364,7 @@ fn child_output_columns(
     memo: &Memo,
     children: &[usize],
     child_idx: usize,
-) -> Vec<crate::sql::analysis::OutputColumn> {
+) -> Vec<crate::sql::common::OutputColumn> {
     children
         .get(child_idx)
         .and_then(|&child_id| memo.groups[child_id].logical_props.as_ref())

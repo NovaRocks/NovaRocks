@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
-use crate::sql::analysis::JoinKind;
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::JoinKind;
 use crate::sql::optimizer::operator::{FilterOp, LogicalJoinOp, Operator};
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;

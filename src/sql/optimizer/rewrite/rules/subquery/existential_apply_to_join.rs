@@ -7,7 +7,7 @@
 
 use super::predicate_apply_util::lift_correlated_inner_opt;
 use super::scalar_utils;
-use crate::sql::analysis::JoinKind;
+use crate::sql::common::JoinKind;
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;

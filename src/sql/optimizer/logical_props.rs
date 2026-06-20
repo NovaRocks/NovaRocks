@@ -6,8 +6,8 @@ use super::memo::{GroupId, LogicalProperties, MExpr, Memo};
 use super::operator::Operator;
 use super::property::ColumnIdSet;
 use super::statistics::{ColumnStatistic, Confidence};
-use crate::sql::analysis::{BinOp, JoinKind, OutputColumn};
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::{BinOp, JoinKind, OutputColumn};
 use crate::sql::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNode};
 use arrow::datatypes::DataType;
 

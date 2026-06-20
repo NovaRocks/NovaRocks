@@ -17,8 +17,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::sql::analysis::cte::CteId;
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::CteId;
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;

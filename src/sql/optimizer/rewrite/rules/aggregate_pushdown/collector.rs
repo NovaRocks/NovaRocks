@@ -2,8 +2,8 @@
 
 use std::collections::HashMap;
 
-use crate::sql::analysis::BinOp;
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::BinOp;
 use crate::sql::optimizer::operator::{LogicalAggregateOp, LogicalJoinOp, Operator};
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
@@ -115,7 +115,7 @@ fn split_at_join(
     ctx: AggregatePushDownContext,
     arena: &ScalarArena,
 ) -> Option<PushPlan> {
-    use crate::sql::analysis::JoinKind;
+    use crate::sql::common::JoinKind;
 
     // Step 1: join-shape filter.
     match join.join_type {

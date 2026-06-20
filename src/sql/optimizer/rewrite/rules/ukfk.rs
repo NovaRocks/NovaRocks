@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet};
 
 use arrow::datatypes::DataType;
 
-use crate::sql::analysis::{BinOp, JoinKind};
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::{BinOp, JoinKind};
 use crate::sql::optimizer::operator::{
     FilterOp, LogicalJoinOp, Operator, ProjectOp, ScalarAggregateSpec, ScalarProjectItem, ScanOp,
 };

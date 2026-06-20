@@ -35,8 +35,8 @@ pub(crate) fn join_execution_distribution_for_alternative(
 ///
 /// For RightOuter / RightSemi / RightAnti / FullOuter the output is NOT
 /// preserved-left (see hash_join.rs derive_output's else branch).
-fn preserves_left(jk: &crate::sql::analysis::JoinKind) -> bool {
-    use crate::sql::analysis::JoinKind::*;
+fn preserves_left(jk: &crate::sql::common::JoinKind) -> bool {
+    use crate::sql::common::JoinKind::*;
     matches!(jk, Inner | LeftOuter | LeftSemi | LeftAnti | Cross)
 }
 
@@ -184,13 +184,13 @@ fn aligned_shuffle_keys(
     (aligned_left, aligned_right)
 }
 
-fn hash_join_only_shuffle(join_type: crate::sql::analysis::JoinKind) -> bool {
-    use crate::sql::analysis::JoinKind::*;
+fn hash_join_only_shuffle(join_type: crate::sql::common::JoinKind) -> bool {
+    use crate::sql::common::JoinKind::*;
     matches!(join_type, RightOuter | RightSemi | RightAnti | FullOuter)
 }
 
-fn hash_join_only_broadcast(join_type: crate::sql::analysis::JoinKind) -> bool {
-    use crate::sql::analysis::JoinKind::*;
+fn hash_join_only_broadcast(join_type: crate::sql::common::JoinKind) -> bool {
+    use crate::sql::common::JoinKind::*;
     matches!(join_type, NullAwareLeftAnti)
 }
 

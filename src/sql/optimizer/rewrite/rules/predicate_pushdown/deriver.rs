@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet};
 
 use arrow::datatypes::DataType;
 
-use crate::sql::analysis::{BinOp, LiteralValue};
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::{BinOp, LiteralValue};
 use crate::sql::optimizer::rewrite::rules::predicate_pushdown::predicate_group::{
     PredicateDerivedKind, PredicateGroup, PredicateOrigin, dedupe_groups,
 };

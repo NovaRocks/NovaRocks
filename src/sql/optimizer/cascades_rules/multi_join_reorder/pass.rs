@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::sql::analysis::JoinKind;
+use crate::sql::common::JoinKind;
 use crate::sql::optimizer::memo::{GroupId, JoinTree, MExpr, Memo};
 use crate::sql::optimizer::operator::{LogicalJoinOp, Operator};
 use crate::sql::optimizer::statistics::{Confidence, TableStatistics};

@@ -1,7 +1,7 @@
 //! Inner join equivalence predicate propagation.
 
-use crate::sql::analysis::{JoinKind, OutputColumn};
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::{JoinKind, OutputColumn};
 use crate::sql::optimizer::logical_props::{
     collect_column_equalities, collect_literal_equalities, combine_with_and, literal_signature,
     make_eq_literal_predicate,

@@ -4,8 +4,8 @@
 
 use std::collections::HashMap;
 
-use crate::sql::analysis::{BinOp, LiteralValue};
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::{BinOp, LiteralValue};
 use crate::sql::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNode};
 
 use super::column_mapping::{NormExpr, normalize};

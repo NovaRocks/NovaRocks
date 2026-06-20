@@ -16,8 +16,8 @@
 //! Mirrors legacy `push_semi_condition_into_children` from
 //! `src/sql/optimizer/predicate_pushdown.rs`. Migrated to `OptExpr` / `LogicalRewriteRule`.
 
-use crate::sql::analysis::JoinKind;
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::JoinKind;
 use crate::sql::optimizer::operator::{FilterOp, LogicalJoinOp, Operator};
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;

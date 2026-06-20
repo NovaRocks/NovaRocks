@@ -5,8 +5,8 @@
 //! descendant that can bind the probe column. EXPLAIN renders the annotations;
 //! codegen lowers them to thrift `TRuntimeFilterDescription`.
 
-use crate::sql::analysis::JoinKind;
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::JoinKind;
 use crate::sql::optimizer::operator::{JoinDistribution, Operator, PhysicalHashJoinEqCondition};
 use crate::sql::optimizer::options::OptimizerOptions;
 use crate::sql::optimizer::physical_plan::{JoinExecutionDistribution, PhysicalPlanNode};

@@ -1,4 +1,4 @@
-use crate::sql::analysis::JoinKind;
+use crate::sql::common::JoinKind;
 use crate::sql::optimizer::estimate::arith::{MAX_ROW_COUNT, damped_conjunction, sat_add, sat_mul};
 use crate::sql::optimizer::statistics::{
     ANTI_JOIN_SELECTIVITY, Confidence, PREDICATE_UNKNOWN_FILTER, SEMI_JOIN_SELECTIVITY,

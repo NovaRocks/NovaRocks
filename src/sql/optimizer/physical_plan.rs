@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::sql::analysis::OutputColumn;
+use crate::sql::common::OutputColumn;
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::property::PhysicalPropertySet;
 use crate::sql::optimizer::scalar::ScalarArena;

@@ -5,7 +5,7 @@
 //! same partition; otherwise cross-process execution compares only local
 //! fragments.
 
-use crate::sql::analysis::OutputColumn;
+use crate::sql::common::OutputColumn;
 use crate::sql::optimizer::operator::{ExceptOp, IntersectOp, UnionOp};
 use crate::sql::optimizer::property::{
     DistributionSpec, HashSource, OrderingSpec, PhysicalPropertySet,

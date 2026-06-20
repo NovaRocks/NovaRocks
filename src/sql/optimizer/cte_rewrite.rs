@@ -1,5 +1,5 @@
-use crate::sql::analysis::cte::CteId;
-use crate::sql::analysis::{JoinKind, OutputColumn};
+use crate::sql::common::CteId;
+use crate::sql::common::{JoinKind, OutputColumn};
 use crate::sql::optimizer::operator::{Operator, ProjectOp, ScalarProjectItem};
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::scalar::{ColumnDisplay, ScalarArena, ScalarNode};

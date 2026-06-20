@@ -12,8 +12,8 @@ use super::scalar_utils;
 use super::win_magic_util::{
     TableIdentity, collect_scan_column_map, collect_table_ids, expr_phys_eq,
 };
-use crate::sql::analysis::{JoinKind, OutputColumn};
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::{JoinKind, OutputColumn};
 use crate::sql::optimizer::operator::{
     ApplyOp, LogicalAggregateOp, Operator, ScalarAggregateSpec, SortOp, WindowOp,
 };

@@ -4,8 +4,8 @@ use std::collections::HashMap;
 
 use arrow::datatypes::DataType;
 
-use crate::sql::analysis::{BinOp, LiteralValue, UnOp};
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::{BinOp, LiteralValue, UnOp};
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 use crate::sql::optimizer::statistics::{
     ColumnStatistic, Confidence, IN_PREDICATE_DEFAULT_FILTER, IS_NULL_FILTER,

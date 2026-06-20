@@ -1,4 +1,4 @@
-use crate::sql::analysis::OutputColumn;
+use crate::sql::common::OutputColumn;
 use crate::sql::optimizer::memo::{MExpr, Memo};
 use crate::sql::optimizer::operator::{Operator, TopNOp, TopNPhase};
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};

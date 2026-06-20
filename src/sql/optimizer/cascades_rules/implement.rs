@@ -7,8 +7,8 @@ use std::collections::HashSet;
 
 use arrow::datatypes::DataType;
 
-use crate::sql::analysis::{BinOp, JoinKind};
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::{BinOp, JoinKind};
 use crate::sql::optimizer::memo::{GroupId, MExpr, Memo};
 use crate::sql::optimizer::operator::*;
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};

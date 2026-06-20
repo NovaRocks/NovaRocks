@@ -2,8 +2,8 @@
 
 use std::collections::HashSet;
 
-use crate::sql::analysis::BinOp;
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::BinOp;
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 
 use super::scalar_utils;

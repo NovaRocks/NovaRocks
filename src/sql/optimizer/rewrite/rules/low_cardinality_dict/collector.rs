@@ -13,7 +13,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::sql::analysis::BinOp;
+use crate::sql::common::BinOp;
 use crate::sql::optimizer::operator::{Operator, ScanOp};
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;

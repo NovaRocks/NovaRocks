@@ -115,7 +115,7 @@ pub(crate) fn compute_cost(
             };
 
             // Apply cross join penalty (StarRocks: getCrossJoinCostPenalty = 10).
-            let cost_after_cross = if j.join_type == crate::sql::analysis::JoinKind::Cross {
+            let cost_after_cross = if j.join_type == crate::sql::common::JoinKind::Cross {
                 base_cost * CROSS_JOIN_COST_PENALTY
             } else {
                 base_cost
@@ -793,7 +793,7 @@ fn compute_legacy_cost_with_properties(
                 PropertyAlternativeKind::Default => compute_cost(op, own_stats, child_stats),
             };
 
-            let cost_after_cross = if j.join_type == crate::sql::analysis::JoinKind::Cross {
+            let cost_after_cross = if j.join_type == crate::sql::common::JoinKind::Cross {
                 base_cost * CROSS_JOIN_COST_PENALTY
             } else {
                 base_cost
