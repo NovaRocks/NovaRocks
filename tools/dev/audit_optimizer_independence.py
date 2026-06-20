@@ -86,8 +86,14 @@ FORBIDDEN_SYMBOL_PATTERN = re.compile(
 )
 
 FORBIDDEN_IMPORT_PATTERN = re.compile(
-    r"\b(crate::sql::analysis|crate::sql::planner|"
-    r"crate::sql::codegen|crate::engine)\b"
+    r"\b("
+    r"crate::sql::(?:analysis|planner|codegen)\b|"
+    r"crate::sql::\{[^;]*\b(?:analysis|planner|codegen)\s*::|"
+    r"crate::\{[^;]*\bsql::(?:analysis|planner|codegen)\b|"
+    r"crate::\{[^;]*\bsql::\{[^;]*\b(?:analysis|planner|codegen)\s*::|"
+    r"crate::engine\b|"
+    r"crate::\{[^;]*\bengine\s*::"
+    r")"
 )
 
 
