@@ -2436,8 +2436,10 @@ mod tests {
             crate::sql::analyzer::analyze(&query, &catalog, "default")?;
         let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
         let mut scalar_arena = optimizer::scalar::ScalarArena::new();
-        let opt_expr =
-            optimizer::convert::try_logical_plan_to_opt_expr(&logical, &mut scalar_arena)?;
+        let opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+            &logical,
+            &mut scalar_arena,
+        )?;
         let physical = optimizer::optimize(
             opt_expr,
             scalar_arena,
@@ -2463,8 +2465,10 @@ mod tests {
             crate::sql::analyzer::analyze(&query, &catalog, "default")?;
         let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
         let mut scalar_arena = optimizer::scalar::ScalarArena::new();
-        let opt_expr =
-            optimizer::convert::try_logical_plan_to_opt_expr(&logical, &mut scalar_arena)?;
+        let opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+            &logical,
+            &mut scalar_arena,
+        )?;
         let physical = optimizer::optimize(
             opt_expr,
             scalar_arena,

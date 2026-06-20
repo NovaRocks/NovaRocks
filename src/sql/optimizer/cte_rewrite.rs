@@ -423,7 +423,7 @@ mod tests {
     ) -> Result<Vec<OutputColumn>, String> {
         let mut memo = crate::sql::optimizer::Memo::new();
         memo.scalars = arena.clone();
-        let root_group = crate::sql::optimizer::convert::opt_expr_to_memo(plan, &mut memo);
+        let root_group = crate::sql::optimizer::memo_copy::opt_expr_to_memo(plan, &mut memo);
         crate::sql::optimizer::stats::derive_group_statistics(&mut memo, &HashMap::new());
         Ok(memo.groups[root_group]
             .logical_props

@@ -229,12 +229,12 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use crate::sql::optimizer::convert::logical_plan_to_opt_expr;
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::imv_rewrite::action_propagation::InjectActionColumnRule;
     use crate::sql::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
+    use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
     use std::sync::Arc;
     use std::sync::atomic::AtomicU32;
 
@@ -359,7 +359,7 @@ mod tests {
             panic!("expected changed scan");
         };
         let arena_ref = ctx.scalar_arena();
-        let changed = crate::sql::optimizer::convert::opt_expr_to_logical_plan(
+        let changed = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
             changed_expr.clone(),
             &arena_ref.borrow(),
         );
@@ -416,7 +416,7 @@ mod tests {
             panic!("expected changed scan");
         };
         let arena_ref = ctx.scalar_arena();
-        let changed = crate::sql::optimizer::convert::opt_expr_to_logical_plan(
+        let changed = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
             changed_expr,
             &arena_ref.borrow(),
         );

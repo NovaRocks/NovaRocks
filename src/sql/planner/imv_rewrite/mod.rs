@@ -13,7 +13,7 @@ pub(crate) fn opt_expr_to_plan(
     ctx: &crate::sql::optimizer::rewrite::context::RewriteContext,
 ) -> crate::sql::planner::plan::LogicalPlanNode {
     let arena = ctx.scalar_arena();
-    crate::sql::optimizer::convert::opt_expr_to_logical_plan(expr, &arena.borrow())
+    crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(expr, &arena.borrow())
 }
 
 /// Intermediate result type used by closures passed to [`bridge_apply_result`].
@@ -48,7 +48,7 @@ where
     let arena = ctx.scalar_arena();
     let converted = match result {
         PlanRewriteResult::Changed(plan_out) => {
-            let opt_out = crate::sql::optimizer::convert::logical_plan_to_opt_expr(
+            let opt_out = crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr(
                 &plan_out,
                 &mut arena.borrow_mut(),
             );

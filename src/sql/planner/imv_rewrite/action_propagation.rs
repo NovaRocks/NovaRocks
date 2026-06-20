@@ -596,10 +596,12 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use crate::sql::optimizer::convert::{logical_plan_to_opt_expr, opt_expr_to_logical_plan};
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
+    use crate::sql::planner::optimizer_bridge::plan::{
+        logical_plan_to_opt_expr, opt_expr_to_logical_plan,
+    };
     use crate::sql::planner::plan::{
         AggregateCall, LogicalAggregateNode, LogicalAggregateStateMergeNode, LogicalFilterNode,
         LogicalJoinNode, LogicalPlanNode, LogicalScanNode, LogicalUnionNode, PlanNodeKind,

@@ -373,12 +373,12 @@ mod tests {
         ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::convert::logical_plan_to_opt_expr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
     use crate::sql::planner::imv_rewrite::marker::ImvVersionRef;
     use crate::sql::planner::imv_rewrite::scan_binding::ImvVersionRole;
+    use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
     use crate::sql::planner::plan::{
         LogicalAggregateNode, LogicalImvVersionNode, LogicalJoinNode, LogicalProjectNode,
         LogicalScanNode, PlanNodeKind,
@@ -441,8 +441,10 @@ mod tests {
             panic!("pure join-delta must expand ImvDelta(Join) directly into a Union");
         };
         let arena = ctx.scalar_arena();
-        let changed =
-            crate::sql::optimizer::convert::opt_expr_to_logical_plan(changed_expr, &arena.borrow());
+        let changed = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+            changed_expr,
+            &arena.borrow(),
+        );
         let PlanNodeKind::Union(union) = &changed.kind else {
             panic!("expected Union");
         };
@@ -490,8 +492,10 @@ mod tests {
             panic!("pure join-delta must expand into a Union");
         };
         let arena = ctx.scalar_arena();
-        let changed =
-            crate::sql::optimizer::convert::opt_expr_to_logical_plan(changed_expr, &arena.borrow());
+        let changed = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+            changed_expr,
+            &arena.borrow(),
+        );
         let PlanNodeKind::Union(union) = &changed.kind else {
             panic!("expected Union");
         };
@@ -562,8 +566,10 @@ mod tests {
             panic!("expected Union");
         };
         let arena = ctx.scalar_arena();
-        let changed =
-            crate::sql::optimizer::convert::opt_expr_to_logical_plan(changed_expr, &arena.borrow());
+        let changed = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+            changed_expr,
+            &arena.borrow(),
+        );
         let PlanNodeKind::Union(_) = &changed.kind else {
             panic!("expected Union");
         };

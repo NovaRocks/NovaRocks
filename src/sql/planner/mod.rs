@@ -4573,7 +4573,7 @@ mod tests {
         let logical =
             plan_query(resolved, cte_registry, &mut factory).expect("planner should succeed");
         let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-        let opt_expr = crate::sql::optimizer::convert::try_logical_plan_to_opt_expr(
+        let opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
             &logical,
             &mut scalar_arena,
         )

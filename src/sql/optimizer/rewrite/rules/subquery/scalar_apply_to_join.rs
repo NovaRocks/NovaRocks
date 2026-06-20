@@ -437,12 +437,12 @@ mod tests {
     };
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::{ColumnId, ColumnRefFactory};
-    use crate::sql::optimizer::convert::logical_plan_to_opt_expr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rules::subquery::bridge::opt_expr_to_plan;
     use crate::sql::optimizer::rewrite::rules::utils::collect_column_id_refs;
     use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
     use crate::sql::planner::plan::{
         AggregateCall, ApplyKind, LogicalAggregateNode, LogicalApplyNode, LogicalPlanNode,
         LogicalScanNode, LogicalValuesNode, PlanNodeKind,

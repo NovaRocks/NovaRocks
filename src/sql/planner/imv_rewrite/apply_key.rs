@@ -232,11 +232,13 @@ mod tests {
         ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::convert::{logical_plan_to_opt_expr, opt_expr_to_logical_plan};
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
     use crate::sql::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
     use crate::sql::planner::imv_rewrite::row_id_column::ImvRowIdColumn;
+    use crate::sql::planner::optimizer_bridge::plan::{
+        logical_plan_to_opt_expr, opt_expr_to_logical_plan,
+    };
     use std::cell::RefCell;
     use std::rc::Rc;
 

@@ -1619,8 +1619,8 @@ fn plan_output_columns(plan: &OptExpr, arena: &ScalarArena) -> Vec<OutputColumn>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::optimizer::convert::logical_plan_to_opt_expr;
     use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
     use crate::sql::planner::plan::*;
     use crate::sql::planner::plan::{
         LogicalExceptNode, LogicalIntersectNode, LogicalUnionNode, LogicalValuesNode, PlanNodeKind,

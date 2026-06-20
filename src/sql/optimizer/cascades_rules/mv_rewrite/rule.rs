@@ -480,17 +480,20 @@ mod tests {
     // --- fixture helpers --------------------------------------------------
 
     fn logical_plan_to_memo_for_test(plan: &LogicalPlanNode, memo: &mut Memo) -> GroupId {
-        let opt_expr =
-            crate::sql::optimizer::convert::try_logical_plan_to_opt_expr(plan, &mut memo.scalars)
-                .expect("logical plan to opt expr");
-        crate::sql::optimizer::convert::opt_expr_to_memo(&opt_expr, memo)
+        let opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+            plan,
+            &mut memo.scalars,
+        )
+        .expect("logical plan to opt expr");
+        crate::sql::optimizer::memo_copy::opt_expr_to_memo(&opt_expr, memo)
     }
 
     fn spjg_descriptor_for_test(plan: &LogicalPlanNode) -> (SpjgDescriptor, ScalarArena) {
         let mut arena = ScalarArena::new();
-        let opt_expr =
-            crate::sql::optimizer::convert::try_logical_plan_to_opt_expr(plan, &mut arena)
-                .expect("logical plan to opt expr");
+        let opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+            plan, &mut arena,
+        )
+        .expect("logical plan to opt expr");
         let descriptor = SpjgDescriptor::from_opt_expr(&opt_expr, &mut arena).expect("mv spjg");
         (descriptor, arena)
     }

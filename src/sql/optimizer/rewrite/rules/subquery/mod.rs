@@ -69,10 +69,10 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::convert::logical_plan_to_opt_expr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::registry::query_rewrite_pipeline;
     use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
     use crate::sql::planner::plan::{
         ApplyKind, LogicalApplyNode, LogicalLimitNode, LogicalValuesNode, PlanNodeKind,
     };

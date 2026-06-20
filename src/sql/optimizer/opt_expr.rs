@@ -3,7 +3,7 @@
 //! Mirrors StarRocks `OptExpression`: an `Operator` payload plus child
 //! `OptExpr`s. Scalars inside the operator are already interned `ScalarId`
 //! handles into the owning `ScalarArena`. This is the tree the RBO rewrite
-//! phase operates on; `convert::opt_expr_to_memo` copies it into the Memo for
+//! phase operates on; `memo_copy::opt_expr_to_memo` copies it into the Memo for
 //! CBO.
 
 use std::collections::HashSet;

@@ -1,7 +1,6 @@
 //! Cascades optimizer framework.
 
 pub(crate) mod cascades_rules;
-pub(crate) mod convert;
 pub(crate) mod cost;
 pub(crate) mod cte_rewrite;
 pub(crate) mod derive;
@@ -9,6 +8,7 @@ pub(crate) mod estimate;
 pub(crate) mod extract;
 pub(crate) mod logical_props;
 pub(crate) mod memo;
+pub(crate) mod memo_copy;
 pub(crate) mod operator;
 pub(crate) mod opt_expr;
 pub(crate) mod options;
@@ -174,7 +174,7 @@ fn optimize_with_root_property(
     let mut memo = Memo::new();
     memo.factory = factory;
     memo.scalars = arena.borrow().clone();
-    let root_group = convert::opt_expr_to_memo(&rewritten_expr, &mut memo);
+    let root_group = memo_copy::opt_expr_to_memo(&rewritten_expr, &mut memo);
 
     // 6. Derive initial statistics.
     stats::derive_group_statistics(&mut memo, table_stats);
@@ -648,11 +648,11 @@ mod is_known_rule_name_tests {
     };
     use std::cell::RefCell;
 
-    use crate::sql::optimizer::convert::{
-        logical_plan_to_opt_expr, opt_expr_to_logical_plan, try_logical_plan_to_opt_expr,
-    };
     use crate::sql::optimizer::rewrite::registry::query_rewrite_pipeline;
     use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::planner::optimizer_bridge::plan::{
+        logical_plan_to_opt_expr, opt_expr_to_logical_plan, try_logical_plan_to_opt_expr,
+    };
     use crate::sql::planner::plan::{
         AggregateCall, LogicalAggregateNode, LogicalPlanNode, LogicalScanNode, PlanNodeKind,
     };
@@ -1180,9 +1180,11 @@ mod is_known_rule_name_tests {
         let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)
             .expect("plan query");
         let mut scalars = crate::sql::optimizer::scalar::ScalarArena::new();
-        let opt_plan =
-            crate::sql::optimizer::convert::try_logical_plan_to_opt_expr(&logical, &mut scalars)
-                .expect("logical to opt expr");
+        let opt_plan = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+            &logical,
+            &mut scalars,
+        )
+        .expect("logical to opt expr");
         let mut rewrite_ctx =
             crate::sql::optimizer::rewrite::context::RewriteContext::for_query(Vec::new());
         let arena = std::rc::Rc::new(std::cell::RefCell::new(scalars));
@@ -1191,10 +1193,11 @@ mod is_known_rule_name_tests {
             crate::sql::optimizer::rewrite::registry::query_rewrite_pipeline(&HashMap::new())
                 .rewrite(opt_plan, &mut rewrite_ctx)
                 .expect("rewrite pipeline");
-        let rewritten_logical = crate::sql::optimizer::convert::opt_expr_to_logical_plan(
-            rewritten_expr,
-            &arena.borrow(),
-        );
+        let rewritten_logical =
+            crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+                rewritten_expr,
+                &arena.borrow(),
+            );
         assert!(
             logical_has_rank_partition_topn_sort(&rewritten_logical),
             "expected query rewrite pipeline to set ranking partition-topn, trace: {:#?}, got: {rewritten_logical:#?}",

@@ -352,12 +352,12 @@ mod tests {
         ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::convert::logical_plan_to_opt_expr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
+    use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
     use crate::sql::planner::plan::{
         AggregateCall, LogicalAggregateNode, LogicalFilterNode, LogicalJoinNode, LogicalPlanNode,
         LogicalProjectNode, LogicalScanNode, LogicalUnionNode, PlanNodeKind,
@@ -387,7 +387,7 @@ mod tests {
             panic!("expected Changed(Union)");
         };
         let arena = ctx.scalar_arena();
-        let rewritten = crate::sql::optimizer::convert::opt_expr_to_logical_plan(
+        let rewritten = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
             rewritten_expr,
             &arena.borrow(),
         );
@@ -449,7 +449,7 @@ mod tests {
             panic!("expected Changed(Union)");
         };
         let arena = ctx.scalar_arena();
-        let rewritten = crate::sql::optimizer::convert::opt_expr_to_logical_plan(
+        let rewritten = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
             rewritten_expr,
             &arena.borrow(),
         );
@@ -584,8 +584,10 @@ mod tests {
             .rewrite(expr, &mut ctx)
             .expect("pipeline must succeed");
         let arena = ctx.scalar_arena();
-        let out =
-            crate::sql::optimizer::convert::opt_expr_to_logical_plan(out_expr, &arena.borrow());
+        let out = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+            out_expr,
+            &arena.borrow(),
+        );
 
         // Top is a Union whose branches each end in Project over AggregateStateMerge,
         // carrying a __branch_id__ column, with no IMV marker left anywhere.
@@ -992,8 +994,10 @@ mod tests {
             .rewrite(expr, &mut ctx)
             .expect("aggregate over filtered join must compose");
         let arena = ctx.scalar_arena();
-        let out =
-            crate::sql::optimizer::convert::opt_expr_to_logical_plan(out_expr, &arena.borrow());
+        let out = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+            out_expr,
+            &arena.borrow(),
+        );
 
         assert!(
             !plan_contains_imv_marker(&out),
@@ -1018,8 +1022,10 @@ mod tests {
             .rewrite(expr, &mut ctx)
             .expect("aggregate over nested join must compose");
         let arena = ctx.scalar_arena();
-        let out =
-            crate::sql::optimizer::convert::opt_expr_to_logical_plan(out_expr, &arena.borrow());
+        let out = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+            out_expr,
+            &arena.borrow(),
+        );
 
         assert!(
             !plan_contains_imv_marker(&out),
@@ -1054,8 +1060,10 @@ mod tests {
             .rewrite(expr, &mut ctx)
             .expect("branch union of Project-over-Aggregate must compose");
         let arena = ctx.scalar_arena();
-        let out =
-            crate::sql::optimizer::convert::opt_expr_to_logical_plan(out_expr, &arena.borrow());
+        let out = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+            out_expr,
+            &arena.borrow(),
+        );
         assert!(
             !plan_contains_imv_marker(&out),
             "no marker may survive: each Project-over-Aggregate branch must fully decompose"
@@ -1117,8 +1125,10 @@ mod tests {
             .rewrite(expr, &mut ctx)
             .expect("branch union of aggregate-over-join must compose");
         let arena = ctx.scalar_arena();
-        let out =
-            crate::sql::optimizer::convert::opt_expr_to_logical_plan(out_expr, &arena.borrow());
+        let out = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+            out_expr,
+            &arena.borrow(),
+        );
         assert!(
             !plan_contains_imv_marker(&out),
             "no marker may survive: the inner joins must be delta-expanded and bound"

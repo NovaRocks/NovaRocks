@@ -697,7 +697,7 @@ pub(crate) fn derive_opt_expr_statistics(
     let mut memo = Memo::new();
     // Donate a clone of the caller's arena so the memo can materialize scalars.
     memo.scalars = arena.clone();
-    let root_group = super::convert::opt_expr_to_memo(expr, &mut memo);
+    let root_group = super::memo_copy::opt_expr_to_memo(expr, &mut memo);
     derive_group_statistics(&mut memo, table_stats);
     memo.groups
         .get(root_group)
@@ -1060,7 +1060,7 @@ fn aggregate_group_column_statistics_scalar(
 
 /// Derive statistics for all groups in the Memo, bottom-up.
 ///
-/// Groups are visited in order (0..N). Since `convert.rs` inserts leaves
+/// Groups are visited in order (0..N). Since `memo_copy` inserts leaves
 /// before their parents, group 0 is the deepest leaf and the last group
 /// is the root. This guarantees that all child groups have their
 /// `logical_props` set before any parent group is processed.
@@ -2395,10 +2395,12 @@ mod tests {
     use arrow::datatypes::DataType;
 
     fn logical_plan_to_memo_for_test(plan: &LogicalPlanNode, memo: &mut Memo) -> GroupId {
-        let opt_expr =
-            crate::sql::optimizer::convert::try_logical_plan_to_opt_expr(plan, &mut memo.scalars)
-                .expect("logical plan to opt expr");
-        crate::sql::optimizer::convert::opt_expr_to_memo(&opt_expr, memo)
+        let opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+            plan,
+            &mut memo.scalars,
+        )
+        .expect("logical plan to opt expr");
+        crate::sql::optimizer::memo_copy::opt_expr_to_memo(&opt_expr, memo)
     }
 
     fn estimate_selectivity_for_test(

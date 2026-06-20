@@ -6,12 +6,14 @@ use std::sync::atomic::AtomicU32;
 use std::time::Instant;
 
 use crate::engine::mv::refresh_context::IcebergMvRewriteContext;
-use crate::sql::optimizer::convert::{opt_expr_to_logical_plan, try_logical_plan_to_opt_expr};
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::trace::RewriteTrace;
 use crate::sql::optimizer::scalar::ScalarArena;
 use crate::sql::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
 use crate::sql::planner::imv_rewrite::pipeline::build_imv_pipeline;
+use crate::sql::planner::optimizer_bridge::plan::{
+    opt_expr_to_logical_plan, try_logical_plan_to_opt_expr,
+};
 use crate::sql::planner::plan::LogicalPlanNode;
 
 pub(crate) struct ImvRewriteInput {
@@ -126,7 +128,10 @@ mod tests {
     fn plan_to_opt_expr_with_arena(plan: &LogicalPlanNode, ctx: &mut RewriteContext) -> OptExpr {
         let arena = std::rc::Rc::new(std::cell::RefCell::new(ScalarArena::new()));
         ctx.set_scalar_arena(std::rc::Rc::clone(&arena));
-        crate::sql::optimizer::convert::logical_plan_to_opt_expr(plan, &mut arena.borrow_mut())
+        crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr(
+            plan,
+            &mut arena.borrow_mut(),
+        )
     }
     use std::collections::{BTreeMap, HashMap};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1586,7 +1591,7 @@ mod tests {
         let opt_out = pipeline
             .rewrite(opt_in, &mut ctx)
             .expect("query rewrite must preserve join aggregate delta action");
-        let rewritten = crate::sql::optimizer::convert::opt_expr_to_logical_plan(
+        let rewritten = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
             opt_out,
             &ctx.scalar_arena().borrow(),
         );

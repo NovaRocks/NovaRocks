@@ -73,7 +73,6 @@ mod tests {
     use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::convert::{logical_plan_to_opt_expr, opt_expr_to_logical_plan};
     use crate::sql::optimizer::operator::{Operator, SortOp, TopNOp, TopNPhase};
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::{QueryDictionaryProvider, RewriteContext};
@@ -81,6 +80,9 @@ mod tests {
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
     use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::planner::optimizer_bridge::plan::{
+        logical_plan_to_opt_expr, opt_expr_to_logical_plan,
+    };
     use crate::sql::planner::optimizer_bridge::scalar::{intern_sort_items, materialize_sort_keys};
     use crate::sql::planner::plan::{
         AggregateCall, LogicalAggregateNode, LogicalPlanNode, LogicalScanNode, LogicalSortNode,

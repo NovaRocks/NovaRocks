@@ -449,11 +449,11 @@ mod tests {
         ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::convert::logical_plan_to_opt_expr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
     use crate::sql::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
+    use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
     use crate::sql::planner::plan::{
         LogicalAggregateNode, LogicalFilterNode, LogicalJoinNode, LogicalProjectNode,
         LogicalScanNode, LogicalUnionNode, PlanNodeKind,
@@ -495,7 +495,7 @@ mod tests {
             panic!("expected Changed(ImvDelta)");
         };
         let arena_ref = ctx.scalar_arena();
-        let rewritten = crate::sql::optimizer::convert::opt_expr_to_logical_plan(
+        let rewritten = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
             rewritten_expr,
             &arena_ref.borrow(),
         );
@@ -561,7 +561,7 @@ mod tests {
             panic!("expected Changed(Union)");
         };
         let arena_ref = ctx.scalar_arena();
-        let rewritten = crate::sql::optimizer::convert::opt_expr_to_logical_plan(
+        let rewritten = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
             rewritten_expr,
             &arena_ref.borrow(),
         );

@@ -3256,8 +3256,10 @@ fn explain_analyze_query(
     };
     // dictionary_provider intentionally None; installed via TLS by execute_in_context.
     let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-    let opt_expr =
-        crate::sql::optimizer::convert::try_logical_plan_to_opt_expr(&logical, &mut scalar_arena)?;
+    let opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+        &logical,
+        &mut scalar_arena,
+    )?;
     let physical = crate::sql::optimizer::optimize(
         opt_expr,
         scalar_arena,
@@ -3374,8 +3376,10 @@ fn explain_query(
     };
     // dictionary_provider intentionally None; installed via TLS by execute_in_context.
     let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-    let opt_expr =
-        crate::sql::optimizer::convert::try_logical_plan_to_opt_expr(&logical, &mut scalar_arena)?;
+    let opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+        &logical,
+        &mut scalar_arena,
+    )?;
     let physical = crate::sql::optimizer::optimize(
         opt_expr,
         scalar_arena,
@@ -3573,8 +3577,10 @@ pub(crate) fn execute_query_as_iceberg_write(
         None => None,
     };
     let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-    let opt_expr =
-        crate::sql::optimizer::convert::try_logical_plan_to_opt_expr(&logical, &mut scalar_arena)?;
+    let opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+        &logical,
+        &mut scalar_arena,
+    )?;
     let physical = match root_distribution {
         Some(root_distribution) => crate::sql::optimizer::optimize_with_root_distribution(
             opt_expr,
@@ -3769,8 +3775,10 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
     };
     // dictionary_provider intentionally None; installed via TLS by execute_in_context.
     let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-    let opt_expr =
-        crate::sql::optimizer::convert::try_logical_plan_to_opt_expr(&logical, &mut scalar_arena)?;
+    let opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+        &logical,
+        &mut scalar_arena,
+    )?;
     let mut physical = crate::sql::optimizer::optimize(
         opt_expr,
         scalar_arena,
@@ -6041,7 +6049,7 @@ enable_path_style_access = true
             .expect("plan query");
         let table_stats = super::build_table_stats_from_plan(&logical);
         let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-        let opt_expr = crate::sql::optimizer::convert::try_logical_plan_to_opt_expr(
+        let opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
             &logical,
             &mut scalar_arena,
         )

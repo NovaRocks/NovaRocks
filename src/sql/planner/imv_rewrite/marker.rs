@@ -173,8 +173,10 @@ fn collect_into(plan: &LogicalPlanNode, found: &mut Vec<&'static str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::optimizer::convert::{logical_plan_to_opt_expr, opt_expr_to_logical_plan};
     use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::planner::optimizer_bridge::plan::{
+        logical_plan_to_opt_expr, opt_expr_to_logical_plan,
+    };
     use crate::sql::planner::plan::*;
     use crate::sql::planner::plan::{LogicalPlanNode, LogicalValuesNode, PlanNodeKind};
 

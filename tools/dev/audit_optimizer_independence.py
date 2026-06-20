@@ -5,7 +5,6 @@ import re
 import sys
 
 DEFAULT_SYMBOL_ALLOW = {
-    "src/sql/optimizer/convert.rs",
     "src/sql/optimizer/property.rs",
 }
 
@@ -24,7 +23,6 @@ DEFAULT_IMPORT_ALLOW = {
     "src/sql/optimizer/cascades_rules/split_aggregate.rs",
     "src/sql/optimizer/cascades_rules/split_distinct_agg.rs",
     "src/sql/optimizer/cascades_rules/topn_compactness.rs",
-    "src/sql/optimizer/convert.rs",
     "src/sql/optimizer/cost.rs",
     "src/sql/optimizer/cte_rewrite.rs",
     "src/sql/optimizer/derive/hash_join.rs",

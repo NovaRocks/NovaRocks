@@ -112,12 +112,12 @@ mod tests {
     use std::rc::Rc;
 
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::convert::logical_plan_to_opt_expr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
+    use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
     use crate::sql::planner::plan::{LogicalPlanNode, LogicalScanNode, PlanNodeKind};
 
     fn build_ctx() -> RewriteContext {
@@ -203,8 +203,10 @@ mod tests {
             panic!("expected Changed(Scan)");
         };
         let arena = ctx.scalar_arena();
-        let changed =
-            crate::sql::optimizer::convert::opt_expr_to_logical_plan(changed_expr, &arena.borrow());
+        let changed = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+            changed_expr,
+            &arena.borrow(),
+        );
         let PlanNodeKind::Scan(scan) = changed.kind else {
             panic!("expected Changed(Scan)");
         };
@@ -233,8 +235,10 @@ mod tests {
             panic!("expected Changed(Scan)");
         };
         let arena = ctx.scalar_arena();
-        let changed =
-            crate::sql::optimizer::convert::opt_expr_to_logical_plan(changed_expr, &arena.borrow());
+        let changed = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+            changed_expr,
+            &arena.borrow(),
+        );
         let PlanNodeKind::Scan(scan) = changed.kind else {
             panic!("expected Changed(Scan)");
         };
