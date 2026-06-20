@@ -15,8 +15,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::engine::dictionary::model::DictionarySnapshot;
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::DictionarySnapshot;
 
 /// Identifies a base-table column that is participating in dictionary
 /// rewrite. `(database, table, column)` are all lowercased to match the

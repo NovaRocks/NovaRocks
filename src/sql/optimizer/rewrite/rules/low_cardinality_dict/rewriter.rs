@@ -62,7 +62,7 @@
 use arrow::datatypes::DataType;
 
 use crate::sql::column_id::ColumnId;
-use crate::sql::common::{BinOp, OutputColumn};
+use crate::sql::common::{BinOp, DictionarySnapshot, OutputColumn};
 use crate::sql::common::{DecodeMapping, ScanDictionaryColumn};
 use crate::sql::optimizer::operator::{
     DecodeOp, LogicalAggregateOp, LogicalJoinOp, Operator, ProjectOp, ScalarAggregateSpec,
@@ -599,7 +599,7 @@ fn rewrite_aggregate(
         String,
         String,
         ColumnId,
-        std::sync::Arc<crate::engine::dictionary::model::DictionarySnapshot>,
+        std::sync::Arc<DictionarySnapshot>,
     )> = Vec::new();
     for (index, expr) in node.group_by.iter().copied().enumerate() {
         if matches!(arena.node(expr), ScalarNode::ColumnRef(_))
@@ -707,10 +707,7 @@ fn rewrite_aggregate(
     // names and types on the decode's output_columns.
     let mut decoded_index: std::collections::BTreeMap<
         String,
-        (
-            String,
-            std::sync::Arc<crate::engine::dictionary::model::DictionarySnapshot>,
-        ),
+        (String, std::sync::Arc<DictionarySnapshot>),
     > = std::collections::BTreeMap::new();
     for (dict, string, _, snap) in &decoded_group_keys {
         decoded_index.insert(dict.clone(), (string.clone(), snap.clone()));

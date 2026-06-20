@@ -5,9 +5,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::engine::dictionary::model::DictionarySnapshot;
 use crate::sql::catalog::TableDef;
 use crate::sql::column_id::ColumnRefFactory;
+use crate::sql::common::DictionarySnapshot;
 use crate::sql::optimizer::rewrite::trace::RewriteTrace;
 use crate::sql::optimizer::scalar::ScalarArena;
 use crate::sql::optimizer::statistics::TableStatistics;

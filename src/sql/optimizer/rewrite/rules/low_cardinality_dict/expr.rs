@@ -2,8 +2,8 @@
 
 use arrow::datatypes::DataType;
 
-use crate::engine::dictionary::model::DictionarySnapshot;
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::DictionarySnapshot;
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 
 use super::context::{DictBinding, DictScope};
