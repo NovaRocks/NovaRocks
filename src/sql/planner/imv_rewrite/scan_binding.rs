@@ -7,6 +7,7 @@
 use crate::connector::starrocks::table::model::IcebergTableRef;
 use crate::engine::mv::refresh_context::IcebergMvRewriteContext;
 use crate::sql::catalog::{IcebergTableInfo, ScanSource};
+pub(crate) use crate::sql::common::ImvVersionRole;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
@@ -16,12 +17,6 @@ use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
 use crate::sql::planner::imv_rewrite::annotation::ImvExtension;
 use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
 use crate::sql::planner::plan::{LogicalPlanNode, LogicalScanNode, PlanNodeKind};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ImvVersionRole {
-    From,
-    To,
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ImvSnapshotWindow {

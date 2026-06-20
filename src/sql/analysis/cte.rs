@@ -6,7 +6,7 @@
 use super::{OutputColumn, ResolvedQuery};
 
 /// Unique identifier for a CTE within a query.
-pub(crate) type CteId = u32;
+pub(crate) use crate::sql::common::CteId;
 
 /// Accumulated registry of all non-recursive CTEs produced by the analyzer.
 /// The planner turns these definitions into `CTEProduce` / `CTEAnchor`

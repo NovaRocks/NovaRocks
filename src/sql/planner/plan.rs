@@ -12,6 +12,9 @@ use crate::sql::catalog::TableDef;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{JoinKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
+pub(crate) use crate::sql::common::{
+    ApplyKind, DecodeMapping, ScanDictionaryColumn, ScanVariantColumn,
+};
 use crate::sql::optimizer::operator::{AggMode, JoinDistribution, TopNPhase};
 
 // ---------------------------------------------------------------------------
@@ -462,28 +465,6 @@ pub(crate) struct LogicalImvVersionNode {
     pub version_ref: crate::sql::planner::imv_rewrite::marker::ImvVersionRef,
 }
 
-/// Per-column mapping from the dictionary-encoded slot back to the original
-/// string slot. `dict_column` is the input column produced by the upstream
-/// dict-encoded plan; `string_column` is the string output exposed to the
-/// rest of the plan.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DecodeMapping {
-    pub source_column_id: ColumnId,
-    pub output_column_id: ColumnId,
-    pub dict_column: String,
-    pub string_column: String,
-}
-
-/// What the subquery expression looks like to its enclosing clause.
-/// M1 consumes the non-Scalar variants; remove the allow then.
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ApplyKind {
-    Scalar,
-    Exists { negated: bool },
-    In { negated: bool },
-}
-
 /// A single window function expression with its OVER specification.
 #[derive(Clone, Debug)]
 pub(crate) struct WindowExpr {
@@ -505,29 +486,6 @@ pub(crate) struct WindowExpr {
     /// `IGNORE NULLS` modifier. Currently honored by first_value / last_value
     /// / lead / lag; ignored for other window functions.
     pub ignore_nulls: bool,
-}
-
-/// Plan hint for a single dict-encoded string column on a scan.
-/// `source_column` is the original string column name in the scan
-/// output; `dict_column` is the synthetic `Int32` slot name introduced
-/// by the rewrite rule; `dictionary` is the snapshot whose `(id, bytes)`
-/// pairs become a `TGlobalDict` payload at codegen time.
-#[derive(Clone, Debug)]
-pub(crate) struct ScanDictionaryColumn {
-    pub source_column: String,
-    pub dict_column: String,
-    pub dictionary: std::sync::Arc<crate::engine::dictionary::model::DictionarySnapshot>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ScanVariantColumn {
-    pub source_column_id: ColumnId,
-    pub source_column: String,
-    pub synthetic_column_id: ColumnId,
-    pub synthetic_column: String,
-    pub canonical_path: String,
-    pub requested_type: DataType,
-    pub strict: bool,
 }
 
 #[derive(Clone, Debug)]

@@ -9,6 +9,10 @@ use arrow::datatypes::DataType;
 
 use crate::sql::catalog::TableDef;
 use crate::sql::column_id::ColumnId;
+pub(crate) use crate::sql::common::{
+    BinOp, JoinKind, LambdaParam, LiteralValue, OutputColumn, UnOp, WindowBound, WindowFrame,
+    WindowFrameType,
+};
 
 // ---------------------------------------------------------------------------
 // Top-level query
@@ -23,18 +27,6 @@ pub(crate) struct ResolvedQuery {
     pub output_columns: Vec<OutputColumn>,
     /// CTE ids declared by this query block's WITH clause, in declaration order.
     pub local_cte_ids: Vec<cte::CteId>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct OutputColumn {
-    pub column_id: ColumnId,
-    pub name: String,
-    pub data_type: DataType,
-    pub nullable: bool,
-    /// Internal optimizer-managed column not visible to users. Set true for
-    /// pseudo-columns synthesized by rewrite rules (e.g. IMV action column);
-    /// column pruning treats internal columns as always required.
-    pub is_internal: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -235,29 +227,6 @@ pub(crate) struct JoinRelation {
     pub condition: Option<TypedExpr>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum JoinKind {
-    Inner,
-    LeftOuter,
-    RightOuter,
-    FullOuter,
-    Cross,
-    LeftSemi,
-    RightSemi,
-    LeftAnti,
-    RightAnti,
-    /// SQL `lhs NOT IN (SELECT … FROM r)` with nullable operands. Identical
-    /// to LeftAnti in row-pairing, plus two runtime guards required by SQL's
-    /// "any NULL anywhere makes NOT IN return UNKNOWN" semantics:
-    ///   - if any build-side key is NULL → drop every probe row;
-    ///   - any probe-side NULL key is also dropped.
-    /// Emitted only by the analyzer's NOT IN rewrite when either operand is
-    /// nullable; never appears in user SQL directly. Codegen lowers it to
-    /// thrift `TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN` which the exec layer's
-    /// `JoinType::NullAwareLeftAnti` already implements.
-    NullAwareLeftAnti,
-}
-
 // ---------------------------------------------------------------------------
 // Set operations (UNION / INTERSECT / EXCEPT)
 // ---------------------------------------------------------------------------
@@ -294,14 +263,6 @@ pub(crate) struct ResolvedValues {
 #[derive(Clone, Debug)]
 pub(crate) struct TypedExpr {
     pub kind: ExprKind,
-    pub data_type: DataType,
-    pub nullable: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct LambdaParam {
-    pub name: String,
-    pub slot_id: i32,
     pub data_type: DataType,
     pub nullable: bool,
 }
@@ -520,73 +481,4 @@ pub(crate) struct SubqueryInfo {
     pub data_type: DataType,
     /// For IN subquery: the left-hand expression from the outer query.
     pub in_expr: Option<Box<sqlparser::ast::Expr>>,
-}
-
-/// Window frame specification for analytic functions.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct WindowFrame {
-    pub frame_type: WindowFrameType,
-    pub start: WindowBound,
-    pub end: WindowBound,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum WindowFrameType {
-    Rows,
-    Range,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum WindowBound {
-    UnboundedPreceding,
-    Preceding(i64),
-    CurrentRow,
-    Following(i64),
-    UnboundedFollowing,
-}
-
-// ---------------------------------------------------------------------------
-// Expression primitives
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum LiteralValue {
-    Null,
-    Bool(bool),
-    Int(i64),
-    LargeInt(i128),
-    Float(f64),
-    /// Decimal literal with its original string representation (e.g. "100.00").
-    /// Precision and scale are inferred from the text: `100.00` → precision=5, scale=2.
-    Decimal(String),
-    String(String),
-    Binary(Vec<u8>),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum BinOp {
-    // Arithmetic
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Mod,
-    // Comparison
-    Eq,
-    Ne,
-    Lt,
-    Le,
-    Gt,
-    Ge,
-    EqForNull,
-    // Logical
-    And,
-    Or,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum UnOp {
-    Not,
-    Negate,
-    BitwiseNot,
 }
