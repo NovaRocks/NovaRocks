@@ -88,17 +88,20 @@ FORBIDDEN_SYMBOL_PATTERN = re.compile(
 FORBIDDEN_IMPORT_PATTERN = re.compile(
     r"\b("
     r"crate::sql::(?:analysis|planner|codegen)\b|"
-    r"crate::sql::\{[^;]*\b(?:analysis|planner|codegen)\s*::|"
+    r"crate::sql::\{[^;]*\b(?:analysis|planner|codegen)\b"
+    r"\s*(?:(?:as\s+[A-Za-z_]\w*)?\s*[,}]|::)|"
     r"crate::\{[^;]*\bsql::(?:analysis|planner|codegen)\b|"
-    r"crate::\{[^;]*\bsql::\{[^;]*\b(?:analysis|planner|codegen)\s*::|"
+    r"crate::\{[^;]*\bsql::\{[^;]*\b(?:analysis|planner|codegen)\b"
+    r"\s*(?:(?:as\s+[A-Za-z_]\w*)?\s*[,}]|::)|"
     r"crate::engine\b|"
-    r"crate::\{[^;]*\bengine\s*::"
+    r"crate::\{[^;]*\bengine\b\s*(?:(?:as\s+[A-Za-z_]\w*)?\s*[,}]|::)"
     r")"
 )
 
 USE_ITEM_START_PATTERN = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?use\b")
 FORBIDDEN_IMPORT_COMPONENT_PATTERN = re.compile(
-    r"\b(?:analysis|planner|codegen|engine)\s*::"
+    r"\b(?:analysis|planner|codegen|engine)\b"
+    r"\s*(?:(?:as\s+[A-Za-z_]\w*)?\s*(?:[,}]|$)|::)"
 )
 
 
