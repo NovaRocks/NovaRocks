@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 use arrow::datatypes::DataType;
 
-use crate::sql::analysis::{BinOp, LiteralValue};
+use crate::sql::analysis::{BinOp, LiteralValue, UnOp};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNode, SortKey};
 
@@ -268,6 +268,211 @@ pub(crate) fn contains_aggregate(arena: &ScalarArena, expr: ScalarId) -> bool {
 
 pub(crate) fn sort_key_column_id(arena: &ScalarArena, key: &SortKey) -> Option<ColumnId> {
     column_id(arena, key.expr)
+}
+
+pub(crate) fn scalar_display_name(arena: &ScalarArena, expr: ScalarId) -> String {
+    match arena.node(expr) {
+        ScalarNode::ColumnRef(column_id) => {
+            if let Some(display) = arena.column_display(*column_id) {
+                return display
+                    .qualifier
+                    .as_ref()
+                    .map(|qualifier| format!("{qualifier}.{}", display.column))
+                    .unwrap_or_else(|| display.column.clone());
+            }
+            format!("col{}", column_id.0)
+        }
+        ScalarNode::LambdaParamRef { name, .. } => name.clone(),
+        ScalarNode::Literal(HashableLiteral(value)) => literal_display_name(value),
+        ScalarNode::FunctionCall { name, args, .. } if name == "__array_literal" => {
+            format!(
+                "[{}]",
+                args.iter()
+                    .map(|arg| scalar_display_name(arena, *arg))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+        ScalarNode::FunctionCall { name, args, .. } if name == "map" => {
+            let mut parts = Vec::new();
+            let mut iter = args.iter();
+            while let Some(key) = iter.next() {
+                let key_display = scalar_display_name(arena, *key);
+                if let Some(value) = iter.next() {
+                    parts.push(format!(
+                        "{key_display}:{}",
+                        scalar_display_name(arena, *value)
+                    ));
+                } else {
+                    parts.push(key_display);
+                }
+            }
+            format!("map{{{}}}", parts.join(","))
+        }
+        ScalarNode::FunctionCall { name, args, .. } => {
+            format!(
+                "{}({})",
+                name.to_ascii_lowercase(),
+                args.iter()
+                    .map(|arg| scalar_display_name(arena, *arg))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+        ScalarNode::LambdaFunction { params, body } => {
+            let params = params
+                .iter()
+                .map(|param| param.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("({params}) -> {}", scalar_display_name(arena, *body))
+        }
+        ScalarNode::AggregateCall {
+            name,
+            args,
+            distinct,
+            order_by,
+        } => aggregate_display_name(arena, name, args, *distinct, order_by),
+        ScalarNode::Cast { child, target } => {
+            format!(
+                "cast({} as {:?})",
+                scalar_display_name(arena, *child),
+                target
+            )
+        }
+        ScalarNode::IsNull { child, negated } => {
+            let child = scalar_display_name_with_parens(arena, *child);
+            if *negated {
+                format!("{child} IS NOT NULL")
+            } else {
+                format!("{child} IS NULL")
+            }
+        }
+        ScalarNode::BinaryOp { left, op, right } => {
+            format!(
+                "{} {} {}",
+                scalar_display_name_with_parens(arena, *left),
+                bin_op_display(*op),
+                scalar_display_name_with_parens(arena, *right)
+            )
+        }
+        ScalarNode::UnaryOp { op, child } => match op {
+            UnOp::Not => format!("NOT {}", scalar_display_name_with_parens(arena, *child)),
+            UnOp::Negate => format!("-{}", scalar_display_name_with_parens(arena, *child)),
+            UnOp::BitwiseNot => format!("~{}", scalar_display_name_with_parens(arena, *child)),
+        },
+        ScalarNode::Nested(child) => scalar_display_name(arena, *child),
+        other => format!("{:?}", other),
+    }
+}
+
+pub(crate) fn aggregate_display_name(
+    arena: &ScalarArena,
+    name: &str,
+    args: &[ScalarId],
+    distinct: bool,
+    order_by: &[SortKey],
+) -> String {
+    let distinct = distinct || matches!(name, "array_agg_distinct");
+    let display_name = canonical_agg_display_name(name);
+    let args_display = if args.is_empty() {
+        "*".to_string()
+    } else {
+        args.iter()
+            .map(|arg| scalar_display_name(arena, *arg))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    let mut out = if distinct {
+        format!("{display_name}(DISTINCT {args_display}")
+    } else {
+        format!("{display_name}({args_display}")
+    };
+
+    let visible_order_by = order_by
+        .iter()
+        .filter(|item| !matches!(arena.node(item.expr), ScalarNode::Literal(_)))
+        .collect::<Vec<_>>();
+    if !visible_order_by.is_empty() {
+        let order_by_display = visible_order_by
+            .iter()
+            .map(|item| sort_key_display_name(arena, item))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(" order by ");
+        out.push_str(&order_by_display);
+    }
+
+    out.push(')');
+    out
+}
+
+fn sort_key_display_name(arena: &ScalarArena, key: &SortKey) -> String {
+    let mut out = scalar_display_name(arena, key.expr);
+    out.push_str(if key.asc { " asc" } else { " desc" });
+    if key.nulls_first != key.asc {
+        out.push_str(if key.nulls_first {
+            " nulls first"
+        } else {
+            " nulls last"
+        });
+    }
+    out
+}
+
+fn literal_display_name(value: &LiteralValue) -> String {
+    match value {
+        LiteralValue::Null => "NULL".to_string(),
+        LiteralValue::Bool(true) => "TRUE".to_string(),
+        LiteralValue::Bool(false) => "FALSE".to_string(),
+        LiteralValue::Int(value) => value.to_string(),
+        LiteralValue::LargeInt(value) => value.to_string(),
+        LiteralValue::Float(value) => value.to_string(),
+        LiteralValue::Decimal(value) => value.clone(),
+        LiteralValue::String(value) => format!("'{value}'"),
+        LiteralValue::Binary(value) => format!("X'{}'", hex::encode_upper(value)),
+    }
+}
+
+fn scalar_display_name_with_parens(arena: &ScalarArena, expr: ScalarId) -> String {
+    match arena.node(expr) {
+        ScalarNode::ColumnRef(_)
+        | ScalarNode::LambdaParamRef { .. }
+        | ScalarNode::Literal(_)
+        | ScalarNode::FunctionCall { .. }
+        | ScalarNode::AggregateCall { .. } => scalar_display_name(arena, expr),
+        _ => format!("({})", scalar_display_name(arena, expr)),
+    }
+}
+
+fn bin_op_display(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Add => "+",
+        BinOp::Sub => "-",
+        BinOp::Mul => "*",
+        BinOp::Div => "/",
+        BinOp::Mod => "%",
+        BinOp::Eq => "=",
+        BinOp::Ne => "!=",
+        BinOp::Lt => "<",
+        BinOp::Le => "<=",
+        BinOp::Gt => ">",
+        BinOp::Ge => ">=",
+        BinOp::EqForNull => "<=>",
+        BinOp::And => "AND",
+        BinOp::Or => "OR",
+    }
+}
+
+fn canonical_agg_display_name(name: &str) -> &str {
+    match name {
+        "string_agg" => "group_concat",
+        "array_agg_distinct" => "array_agg",
+        "variance_samp" => "var_samp",
+        "variance_pop" => "var_pop",
+        other => other,
+    }
 }
 
 pub(crate) fn is_true_literal(arena: &ScalarArena, expr: ScalarId) -> bool {

@@ -2,11 +2,12 @@
 
 use std::collections::HashMap;
 
-use crate::sql::analysis::{ExprKind, TypedExpr};
+use crate::sql::analysis::BinOp;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::{LogicalAggregateOp, LogicalJoinOp, Operator};
 use crate::sql::optimizer::opt_expr::OptExpr;
-use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, materialize};
+use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
+use crate::sql::optimizer::scalar_expr;
 use crate::sql::optimizer::statistics::TableStatistics;
 
 use super::context::{AggregatePushDownContext, ColumnRefIdentity, PushPlan, Side};
@@ -47,12 +48,10 @@ pub(crate) fn entry_safety_check(
         }
         // Args must be bare ColumnRefs.
         for arg_id in &spec.args {
-            let arg = materialize(arena, *arg_id);
-            if !matches!(arg.kind, ExprKind::ColumnRef { .. }) {
+            if !matches!(arena.node(*arg_id), ScalarNode::ColumnRef(_)) {
                 return None;
             }
-            // Non-deterministic functions in args.
-            if expr_uses_nondeterministic(&arg) {
+            if scalar_expr::contains_non_deterministic_function(arena, *arg_id) {
                 return None;
             }
         }
@@ -71,55 +70,20 @@ fn collect_required_column_refs(
 ) -> Vec<ColumnRefIdentity> {
     let mut out = Vec::new();
     for gb_id in &aggregate.group_by {
-        let gb = materialize(arena, *gb_id);
-        collect_column_ref_identities_into(&gb, &mut out);
+        if let Some(identity) = column_ref_qualified(arena, *gb_id) {
+            out.push(identity);
+        }
     }
     for spec in &aggregate.aggregates {
         for arg_id in &spec.args {
-            let arg = materialize(arena, *arg_id);
-            collect_column_ref_identities_into(&arg, &mut out);
+            if let Some(identity) = column_ref_qualified(arena, *arg_id) {
+                out.push(identity);
+            }
         }
     }
     out.sort();
     out.dedup();
     out
-}
-
-fn collect_column_ref_identities_into(expr: &TypedExpr, out: &mut Vec<ColumnRefIdentity>) {
-    if let ExprKind::ColumnRef {
-        qualifier, column, ..
-    } = &expr.kind
-    {
-        out.push((qualifier.clone(), column.clone()));
-    }
-}
-
-const NONDETERMINISTIC_FUNCTIONS: &[&str] = &[
-    "rand",
-    "random",
-    "uuid",
-    "now",
-    "current_timestamp",
-    "current_date",
-];
-
-fn expr_uses_nondeterministic(expr: &TypedExpr) -> bool {
-    match &expr.kind {
-        ExprKind::FunctionCall { name, args, .. } => {
-            if NONDETERMINISTIC_FUNCTIONS
-                .iter()
-                .any(|n| n.eq_ignore_ascii_case(name))
-            {
-                return true;
-            }
-            args.iter().any(expr_uses_nondeterministic)
-        }
-        ExprKind::BinaryOp { left, right, .. } => {
-            expr_uses_nondeterministic(left) || expr_uses_nondeterministic(right)
-        }
-        ExprKind::UnaryOp { expr: inner, .. } => expr_uses_nondeterministic(inner),
-        _ => false,
-    }
 }
 
 /// Top-level collector entry.
@@ -159,8 +123,7 @@ fn split_at_join(
         _ => return None,
     }
     let cond_id = join.condition?;
-    let cond = materialize(arena, cond_id);
-    let equi_keys = extract_equi_key_pairs(&cond);
+    let equi_keys = extract_equi_key_pairs(arena, cond_id);
     if equi_keys.is_empty() {
         return None;
     }
@@ -214,34 +177,26 @@ fn split_at_join(
         .original_groupby
         .iter()
         .filter(|gb_id| {
-            let gb = materialize(arena, **gb_id);
-            match &gb.kind {
-                ExprKind::ColumnRef {
-                    qualifier, column, ..
-                } => column_ref_belongs_to_side(
-                    &(qualifier.clone(), column.clone()),
-                    side_qcols,
-                    other_qcols,
-                ),
-                _ => false,
-            }
+            column_ref_qualified(arena, **gb_id).is_some_and(|identity| {
+                column_ref_belongs_to_side(&identity, side_qcols, other_qcols)
+            })
         })
         .copied()
         .collect();
 
-    let mut partial_extra_groupby: Vec<TypedExpr> = Vec::new();
+    let mut partial_extra_groupby: Vec<ScalarId> = Vec::new();
     for (left_key, right_key) in &equi_keys {
-        let candidate_expr = side_bound_equi_key(left_key, right_key, side_qcols)?;
+        let candidate_expr = side_bound_equi_key(arena, *left_key, *right_key, side_qcols)?;
         // Check if it's already in partial_groupby by ColumnId, falling back
         // to qualified identity only for synthetic/unset test expressions.
-        let already = partial_groupby.iter().any(|gb_id| {
-            let gb = materialize(arena, *gb_id);
-            same_column_ref_identity(&gb, candidate_expr)
-        }) || partial_extra_groupby
+        let already = partial_groupby
             .iter()
-            .any(|gb| same_column_ref_identity(gb, candidate_expr));
+            .any(|gb_id| same_column_ref_identity(arena, *gb_id, candidate_expr))
+            || partial_extra_groupby
+                .iter()
+                .any(|gb| same_column_ref_identity(arena, *gb, candidate_expr));
         if !already {
-            partial_extra_groupby.push(candidate_expr.clone());
+            partial_extra_groupby.push(candidate_expr);
         }
     }
 
@@ -254,17 +209,18 @@ fn split_at_join(
     })
 }
 
-fn side_bound_equi_key<'a>(
-    left_key: &'a TypedExpr,
-    right_key: &'a TypedExpr,
+fn side_bound_equi_key(
+    arena: &ScalarArena,
+    left_key: ScalarId,
+    right_key: ScalarId,
     side_qcols: &[(Option<String>, String)],
-) -> Option<&'a TypedExpr> {
+) -> Option<ScalarId> {
     // Disambiguate by QUALIFIED identity (qualifier + name). Bare column names
     // are ambiguous when both join keys share a name (the common `a.k = b.k`
     // case): both would test as "in side" and the key would be dropped. Matching
     // on (qualifier, name) keeps the operand actually bound to the chosen side.
-    let left_q = column_ref_qualified(left_key)?;
-    let right_q = column_ref_qualified(right_key)?;
+    let left_q = column_ref_qualified(arena, left_key)?;
+    let right_q = column_ref_qualified(arena, right_key)?;
     let left_in_side = side_qcols.contains(&left_q);
     let right_in_side = side_qcols.contains(&right_q);
     match (left_in_side, right_in_side) {
@@ -274,33 +230,23 @@ fn side_bound_equi_key<'a>(
     }
 }
 
-fn column_ref_qualified(expr: &TypedExpr) -> Option<(Option<String>, String)> {
-    match &expr.kind {
-        ExprKind::ColumnRef {
-            qualifier, column, ..
-        } => Some((qualifier.clone(), column.clone())),
-        _ => None,
-    }
+fn column_ref_qualified(arena: &ScalarArena, expr: ScalarId) -> Option<ColumnRefIdentity> {
+    let ScalarNode::ColumnRef(column_id) = arena.node(expr) else {
+        return None;
+    };
+    let Some(display) = arena.column_display(*column_id) else {
+        return Some((None, format!("col{}", column_id.0)));
+    };
+    Some((display.qualifier.clone(), display.column.clone()))
 }
 
-fn same_column_ref_identity(a: &TypedExpr, b: &TypedExpr) -> bool {
-    match (&a.kind, &b.kind) {
-        (
-            ExprKind::ColumnRef {
-                column_id: a_id,
-                qualifier: a_qualifier,
-                column: a_column,
-            },
-            ExprKind::ColumnRef {
-                column_id: b_id,
-                qualifier: b_qualifier,
-                column: b_column,
-            },
-        ) => {
+fn same_column_ref_identity(arena: &ScalarArena, a: ScalarId, b: ScalarId) -> bool {
+    match (arena.node(a), arena.node(b)) {
+        (ScalarNode::ColumnRef(a_id), ScalarNode::ColumnRef(b_id)) => {
             if *a_id != ColumnId::UNSET && *b_id != ColumnId::UNSET {
                 a_id == b_id
             } else {
-                a_qualifier == b_qualifier && a_column == b_column
+                column_ref_qualified(arena, a) == column_ref_qualified(arena, b)
             }
         }
         _ => false,
@@ -360,33 +306,33 @@ fn collect_qualified_output_names(plan: &OptExpr) -> Vec<(Option<String>, String
     }
 }
 
-fn extract_equi_key_pairs(cond: &TypedExpr) -> Vec<(TypedExpr, TypedExpr)> {
+fn extract_equi_key_pairs(arena: &ScalarArena, cond: ScalarId) -> Vec<(ScalarId, ScalarId)> {
     let mut out = Vec::new();
-    walk_and_collect_equi(cond, &mut out);
+    walk_and_collect_equi(arena, cond, &mut out);
     out
 }
 
-fn walk_and_collect_equi(expr: &TypedExpr, out: &mut Vec<(TypedExpr, TypedExpr)>) {
-    use crate::sql::analysis::BinOp;
-    match &expr.kind {
-        ExprKind::BinaryOp {
+fn walk_and_collect_equi(arena: &ScalarArena, expr: ScalarId, out: &mut Vec<(ScalarId, ScalarId)>) {
+    match arena.node(expr) {
+        ScalarNode::Nested(inner) => walk_and_collect_equi(arena, *inner, out),
+        ScalarNode::BinaryOp {
             left,
             op: BinOp::Eq,
             right,
         } => {
-            if matches!(left.kind, ExprKind::ColumnRef { .. })
-                && matches!(right.kind, ExprKind::ColumnRef { .. })
+            if matches!(arena.node(*left), ScalarNode::ColumnRef(_))
+                && matches!(arena.node(*right), ScalarNode::ColumnRef(_))
             {
-                out.push(((**left).clone(), (**right).clone()));
+                out.push((*left, *right));
             }
         }
-        ExprKind::BinaryOp {
+        ScalarNode::BinaryOp {
             left,
             op: BinOp::And,
             right,
         } => {
-            walk_and_collect_equi(left, out);
-            walk_and_collect_equi(right, out);
+            walk_and_collect_equi(arena, *left, out);
+            walk_and_collect_equi(arena, *right, out);
         }
         _ => {}
     }
@@ -407,7 +353,7 @@ mod tests {
     };
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
-    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
+    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed, materialize};
     use arrow::datatypes::DataType;
 
     fn make_arena() -> ScalarArena {
@@ -916,7 +862,8 @@ mod tests {
             let expr = materialize(&arena, *id);
             matches!(&expr.kind, ExprKind::ColumnRef { column, .. } if column == "cs_call_center_sk")
         }));
-        assert!(plan.partial_extra_groupby.iter().any(|expr| {
+        assert!(plan.partial_extra_groupby.iter().any(|id| {
+            let expr = materialize(&arena, *id);
             matches!(&expr.kind, ExprKind::ColumnRef { column, column_id, .. }
                 if column == "cs_sold_date_sk"
                     && *column_id == test_col_id(Some("cs"), "cs_sold_date_sk"))

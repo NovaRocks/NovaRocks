@@ -61,20 +61,15 @@
 
 use arrow::datatypes::DataType;
 
-use crate::sql::analysis::{BinOp, ExprKind, OutputColumn, TypedExpr};
+use crate::sql::analysis::{BinOp, OutputColumn};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::{
-    DecodeOp, LogicalAggregateOp, LogicalJoinOp, Operator, ProjectOp, ScanOp, SortOp, TopNOp,
-    UnionOp,
+    DecodeOp, LogicalAggregateOp, LogicalJoinOp, Operator, ProjectOp, ScalarAggregateSpec,
+    ScalarProjectItem, ScanOp, SortOp, TopNOp, UnionOp,
 };
 use crate::sql::optimizer::opt_expr::OptExpr;
-use crate::sql::optimizer::scalar::{self, ScalarArena};
-use crate::sql::optimizer::scalar_bridge::{
-    intern_aggregate_calls, intern_exprs, intern_project_items, intern_sort_items,
-    materialize_aggregate_calls, materialize_exprs, materialize_project_items,
-    materialize_sort_keys,
-};
-use crate::sql::planner::plan::{AggregateCall, DecodeMapping, ScanDictionaryColumn};
+use crate::sql::optimizer::scalar::{ColumnDisplay, ScalarArena, ScalarId, ScalarNode};
+use crate::sql::planner::plan::{DecodeMapping, ScanDictionaryColumn};
 
 use super::context::{DictBinding, DictScope, DictionaryRewriteContext};
 use super::expr::{DICT_AGG_FUNCTIONS, dict_keys_compatible, rewrite_column_ref_with_scope};
@@ -237,130 +232,102 @@ fn remember_dict_column_display(arena: &mut ScalarArena, binding: &DictBinding) 
     );
 }
 
-fn remember_scope_dict_ref_displays(arena: &mut ScalarArena, expr: &TypedExpr, scope: &DictScope) {
-    remember_dict_ref_displays_by(arena, expr, &|column_id, column| {
-        resolve_scope_dict_ref(scope, column_id, column)
+fn remember_scope_dict_ref_displays(arena: &mut ScalarArena, expr: ScalarId, scope: &DictScope) {
+    remember_dict_ref_displays_by(arena, expr, &|arena, expr| {
+        resolve_scope_dict_ref(arena, expr, scope)
     });
 }
 
 fn remember_join_dict_ref_displays(
     arena: &mut ScalarArena,
-    expr: &TypedExpr,
+    expr: ScalarId,
     left_scope: &DictScope,
     right_scope: &DictScope,
 ) {
-    remember_dict_ref_displays_by(arena, expr, &|column_id, column| {
-        resolve_scope_dict_ref(left_scope, column_id, column)
-            .or_else(|| resolve_scope_dict_ref(right_scope, column_id, column))
+    remember_dict_ref_displays_by(arena, expr, &|arena, expr| {
+        resolve_scope_dict_ref(arena, expr, left_scope)
+            .or_else(|| resolve_scope_dict_ref(arena, expr, right_scope))
     });
 }
 
 fn resolve_scope_dict_ref(
+    arena: &ScalarArena,
+    expr: ScalarId,
     scope: &DictScope,
-    column_id: ColumnId,
-    column: &str,
 ) -> Option<DictBinding> {
-    if column_id != ColumnId::UNSET
-        && let Some((_, binding)) = scope.iter().find(|(_, binding)| {
-            binding.source_column_id == column_id
-                && column.eq_ignore_ascii_case(&binding.dict_column)
-        })
-    {
-        return Some(binding.clone());
-    }
-    scope.resolve_either(column).and_then(|(_, binding)| {
-        if column.eq_ignore_ascii_case(&binding.dict_column) {
-            Some(binding.clone())
-        } else {
-            None
-        }
-    })
-}
-
-fn rewrite_column_ref_to_binding(expr: &TypedExpr, binding: &DictBinding) -> TypedExpr {
-    let qualifier = match &expr.kind {
-        ExprKind::ColumnRef { qualifier, .. } => qualifier.clone(),
-        _ => None,
-    };
-    TypedExpr {
-        kind: ExprKind::ColumnRef {
-            column_id: binding.source_column_id,
-            qualifier,
-            column: binding.dict_column.clone(),
-        },
-        data_type: DataType::Int32,
-        nullable: expr.nullable,
+    let (_, binding) = resolve_scalar_ref(arena, expr, scope)?;
+    if is_dict_ref(arena, expr, binding) {
+        Some(binding.clone())
+    } else {
+        None
     }
 }
 
 fn remember_dict_ref_displays_by(
     arena: &mut ScalarArena,
-    expr: &TypedExpr,
-    resolve: &impl Fn(ColumnId, &str) -> Option<DictBinding>,
+    expr: ScalarId,
+    resolve: &impl Fn(&ScalarArena, ScalarId) -> Option<DictBinding>,
 ) {
-    match &expr.kind {
-        ExprKind::ColumnRef {
-            column_id, column, ..
-        } => {
-            if let Some(binding) = resolve(*column_id, column) {
+    let node = arena.node(expr).clone();
+    match node {
+        ScalarNode::ColumnRef(_) => {
+            if let Some(binding) = resolve(arena, expr) {
                 remember_dict_column_display(arena, &binding);
             }
         }
-        ExprKind::Literal(_)
-        | ExprKind::LambdaParamRef { .. }
-        | ExprKind::SubqueryPlaceholder { .. } => {}
-        ExprKind::BinaryOp { left, right, .. } => {
+        ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {}
+        ScalarNode::BinaryOp { left, right, .. } => {
             remember_dict_ref_displays_by(arena, left, resolve);
             remember_dict_ref_displays_by(arena, right, resolve);
         }
-        ExprKind::UnaryOp { expr, .. }
-        | ExprKind::LambdaFunction { body: expr, .. }
-        | ExprKind::Cast { expr, .. }
-        | ExprKind::IsNull { expr, .. }
-        | ExprKind::IsTruthValue { expr, .. }
-        | ExprKind::Nested(expr)
-        | ExprKind::Lambda { body: expr, .. } => {
-            remember_dict_ref_displays_by(arena, expr, resolve);
+        ScalarNode::UnaryOp { child, .. }
+        | ScalarNode::LambdaFunction { body: child, .. }
+        | ScalarNode::Cast { child, .. }
+        | ScalarNode::IsNull { child, .. }
+        | ScalarNode::IsTruthValue { child, .. }
+        | ScalarNode::Nested(child)
+        | ScalarNode::Lambda { body: child, .. } => {
+            remember_dict_ref_displays_by(arena, child, resolve);
         }
-        ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
+        ScalarNode::FunctionCall { args, .. } | ScalarNode::AggregateCall { args, .. } => {
             for arg in args {
                 remember_dict_ref_displays_by(arena, arg, resolve);
             }
         }
-        ExprKind::InList { expr, list, .. } => {
-            remember_dict_ref_displays_by(arena, expr, resolve);
+        ScalarNode::InList { child, list, .. } => {
+            remember_dict_ref_displays_by(arena, child, resolve);
             for item in list {
                 remember_dict_ref_displays_by(arena, item, resolve);
             }
         }
-        ExprKind::Between {
-            expr, low, high, ..
+        ScalarNode::Between {
+            child, low, high, ..
         } => {
-            remember_dict_ref_displays_by(arena, expr, resolve);
+            remember_dict_ref_displays_by(arena, child, resolve);
             remember_dict_ref_displays_by(arena, low, resolve);
             remember_dict_ref_displays_by(arena, high, resolve);
         }
-        ExprKind::Like { expr, pattern, .. } => {
-            remember_dict_ref_displays_by(arena, expr, resolve);
+        ScalarNode::Like { child, pattern, .. } => {
+            remember_dict_ref_displays_by(arena, child, resolve);
             remember_dict_ref_displays_by(arena, pattern, resolve);
         }
-        ExprKind::Case {
+        ScalarNode::Case {
             operand,
             when_then,
             else_expr,
         } => {
-            if let Some(operand) = operand.as_deref() {
+            if let Some(operand) = operand {
                 remember_dict_ref_displays_by(arena, operand, resolve);
             }
             for (when, then) in when_then {
                 remember_dict_ref_displays_by(arena, when, resolve);
                 remember_dict_ref_displays_by(arena, then, resolve);
             }
-            if let Some(else_expr) = else_expr.as_deref() {
+            if let Some(else_expr) = else_expr {
                 remember_dict_ref_displays_by(arena, else_expr, resolve);
             }
         }
-        ExprKind::WindowCall {
+        ScalarNode::WindowCall {
             args,
             partition_by,
             order_by,
@@ -373,10 +340,53 @@ fn remember_dict_ref_displays_by(
                 remember_dict_ref_displays_by(arena, expr, resolve);
             }
             for item in order_by {
-                remember_dict_ref_displays_by(arena, &item.expr, resolve);
+                remember_dict_ref_displays_by(arena, item.expr, resolve);
             }
         }
     }
+}
+
+fn resolve_scalar_ref<'a>(
+    arena: &ScalarArena,
+    expr: ScalarId,
+    scope: &'a DictScope,
+) -> Option<(&'a str, &'a DictBinding)> {
+    super::expr::resolve_column_ref(arena, expr, scope)
+}
+
+fn is_dict_ref(arena: &ScalarArena, expr: ScalarId, binding: &DictBinding) -> bool {
+    matches!(arena.node(expr), ScalarNode::ColumnRef(column_id) if *column_id == binding.source_column_id)
+        && matches!(arena.data_type(expr), DataType::Int32)
+}
+
+fn dict_column_display(binding: &DictBinding) -> ColumnDisplay {
+    ColumnDisplay {
+        qualifier: None,
+        column: binding.dict_column.clone(),
+    }
+}
+
+fn dict_column_ref(arena: &mut ScalarArena, expr: ScalarId, binding: &DictBinding) -> ScalarId {
+    rewrite_column_ref_with_scope(arena, expr, &single_binding_scope(binding))
+}
+
+fn dict_column_ref_with_nullable(
+    arena: &mut ScalarArena,
+    binding: &DictBinding,
+    nullable: bool,
+) -> ScalarId {
+    remember_dict_column_display(arena, binding);
+    arena.intern(
+        ScalarNode::ColumnRef(binding.source_column_id),
+        DataType::Int32,
+        nullable,
+    )
+}
+
+fn single_binding_scope(binding: &DictBinding) -> DictScope {
+    let mut scope = DictScope::new();
+    scope.insert(binding.dict_column.clone(), binding.clone());
+    scope
 }
 
 fn rewrite_scan(scan: &mut ScanOp, ctx: &mut DictionaryRewriteContext) -> DictScope {
@@ -492,25 +502,27 @@ fn rewrite_project(
     // the dict binding under the alias name so a downstream boundary
     // can still find the dict column to decode.
     let mut output_scope = DictScope::new();
-    let mut items: Vec<crate::sql::analysis::ProjectItem> = Vec::with_capacity(node.items.len());
-    for item in materialize_project_items(arena, &node.items).into_iter() {
-        if let ExprKind::ColumnRef { column, .. } = &item.expr.kind
-            && let Some(binding) = input_scope.get(column)
+    let mut items: Vec<ScalarProjectItem> = Vec::with_capacity(node.items.len());
+    for item in node.items.into_iter() {
+        if matches!(arena.node(item.expr), ScalarNode::ColumnRef(_))
+            && let Some((_, binding)) = resolve_scalar_ref(arena, item.expr, &input_scope)
         {
+            let binding = binding.clone();
             output_scope.insert(item.output_name.clone(), binding.clone());
             // Idempotency: don't double-rewrite when the column is
             // already the dict slot (post-iteration-1 of the pipeline's
             // fixed-point loop).
-            let already_dict = column.eq_ignore_ascii_case(&binding.dict_column);
+            let already_dict = is_dict_ref(arena, item.expr, &binding);
             let rewritten = if already_dict {
-                item.expr.clone()
+                item.expr
             } else {
-                rewrite_column_ref_with_scope(&item.expr, &input_scope)
+                dict_column_ref(arena, item.expr, &binding)
             };
-            items.push(crate::sql::analysis::ProjectItem {
+            items.push(ScalarProjectItem {
                 expr: rewritten,
                 output_name: item.output_name,
                 output_column_id: item.output_column_id,
+                expr_display: Some(dict_column_display(&binding)),
             });
             continue;
         }
@@ -552,25 +564,18 @@ fn rewrite_project(
             .find(|c| c.name.eq_ignore_ascii_case(&dict_name))
             .map(|c| c.nullable)
             .unwrap_or(true);
-        items.push(crate::sql::analysis::ProjectItem {
-            expr: TypedExpr {
-                kind: ExprKind::ColumnRef {
-                    column_id: binding.source_column_id,
-                    qualifier: None,
-                    column: dict_name.clone(),
-                },
-                data_type: DataType::Int32,
-                nullable,
-            },
+        items.push(ScalarProjectItem {
+            expr: dict_column_ref_with_nullable(arena, binding, nullable),
             output_name: dict_name,
             // Synthetic dict-slot pass-through; not addressed by the pruning pass.
             output_column_id: binding.source_column_id,
+            expr_display: Some(dict_column_display(binding)),
         });
     }
     Ok((
         opt_expr(
             Operator::LogicalProject(ProjectOp {
-                items: intern_project_items(arena, &items),
+                items,
                 output_qualifier: node.output_qualifier,
             }),
             vec![input],
@@ -589,13 +594,6 @@ fn rewrite_aggregate(
 ) -> Result<(OptExpr, DictScope), String> {
     let input = take_unary_child(&mut children);
     let (input, input_scope) = rewrite_node(input, ctx, arena)?;
-    let original_group_by = materialize_exprs(arena, &node.group_by);
-    let original_aggregates = materialize_aggregate_calls(
-        arena,
-        &node.aggregates,
-        node.group_by.len(),
-        &node.output_columns,
-    );
     let mut group_by = Vec::with_capacity(node.group_by.len());
     let mut decoded_group_keys: Vec<(
         String,
@@ -603,11 +601,12 @@ fn rewrite_aggregate(
         ColumnId,
         std::sync::Arc<crate::engine::dictionary::model::DictionarySnapshot>,
     )> = Vec::new();
-    for (index, expr) in original_group_by.iter().enumerate() {
-        if let crate::sql::analysis::ExprKind::ColumnRef { column, .. } = &expr.kind
-            && let Some((source_name, binding)) = input_scope.resolve_either(column)
+    for (index, expr) in node.group_by.iter().copied().enumerate() {
+        if matches!(arena.node(expr), ScalarNode::ColumnRef(_))
+            && let Some((source_name, binding)) = resolve_scalar_ref(arena, expr, &input_scope)
         {
-            group_by.push(rewrite_column_ref_to_binding(expr, binding));
+            let binding = binding.clone();
+            group_by.push(dict_column_ref(arena, expr, &binding));
             // Skip the decode-wrap bookkeeping only when the aggregate
             // output is already the dict slot. With realistic shared
             // ColumnIds, ScalarArena display metadata can materialize a
@@ -632,7 +631,7 @@ fn rewrite_aggregate(
             ));
             continue;
         }
-        group_by.push(expr.clone());
+        group_by.push(expr);
     }
 
     // Output columns: dict-encoded group-by columns are renamed to the
@@ -668,27 +667,28 @@ fn rewrite_aggregate(
     // extra Decode is needed for these argument paths. Group-by keys
     // are still handled above and are responsible for the post-aggregate
     // Decode boundary that restores the user-facing string name.
-    let aggregates = original_aggregates
+    let aggregates = node
+        .aggregates
         .into_iter()
-        .map(|agg| rewrite_aggregate_call(agg, &input_scope, ctx))
+        .map(|agg| rewrite_aggregate_call(agg, &input_scope, ctx, arena))
         .collect::<Vec<_>>();
     for expr in &group_by {
-        remember_scope_dict_ref_displays(arena, expr, &input_scope);
+        remember_scope_dict_ref_displays(arena, *expr, &input_scope);
     }
     for agg in &aggregates {
         for arg in &agg.args {
-            remember_scope_dict_ref_displays(arena, arg, &input_scope);
+            remember_scope_dict_ref_displays(arena, *arg, &input_scope);
         }
         for item in &agg.order_by {
-            remember_scope_dict_ref_displays(arena, &item.expr, &input_scope);
+            remember_scope_dict_ref_displays(arena, item.expr, &input_scope);
         }
     }
 
     let aggregate = opt_expr(
         Operator::LogicalAggregate(LogicalAggregateOp {
             stage: node.stage,
-            group_by: intern_exprs(arena, &group_by),
-            aggregates: intern_aggregate_calls(arena, &aggregates),
+            group_by,
+            aggregates,
             output_columns: output_columns.clone(),
             is_merge: node.is_merge,
             is_split: node.is_split,
@@ -757,15 +757,10 @@ fn rewrite_sort(
 ) -> Result<(OptExpr, DictScope), String> {
     let input = take_unary_child(&mut children);
     let (input, input_scope) = rewrite_node(input, ctx, arena)?;
-    let original_items = materialize_sort_keys(arena, &node.items);
+    let original_items = node.items;
     let needs_decode = original_items.iter().any(|item| {
-        if let crate::sql::analysis::ExprKind::ColumnRef { column, .. } = &item.expr.kind
-            && let Some(binding) = input_scope.get(column)
-        {
-            !binding.snapshot.order_preserving
-        } else {
-            false
-        }
+        resolve_scalar_ref(arena, item.expr, &input_scope)
+            .is_some_and(|(_, binding)| !binding.snapshot.order_preserving)
     });
     let (items, input, output_scope) = if needs_decode {
         // Decode below the sort: the sort itself now sees strings and
@@ -776,14 +771,20 @@ fn rewrite_sort(
             DictScope::new(),
         )
     } else {
-        let mut items = Vec::with_capacity(node.items.len());
+        let mut items = Vec::with_capacity(original_items.len());
         for item in &original_items {
-            if let crate::sql::analysis::ExprKind::ColumnRef { column, .. } = &item.expr.kind
-                && let Some(binding) = input_scope.get(column)
+            if matches!(arena.node(item.expr), ScalarNode::ColumnRef(_))
+                && let Some((_, binding)) = resolve_scalar_ref(arena, item.expr, &input_scope)
             {
-                let already_dict = column.eq_ignore_ascii_case(&binding.dict_column);
+                let binding = binding.clone();
+                let already_dict = is_dict_ref(arena, item.expr, &binding);
                 let mut rewritten = item.clone();
-                rewritten.expr = rewrite_column_ref_with_scope(&item.expr, &input_scope);
+                rewritten.expr = if already_dict {
+                    item.expr
+                } else {
+                    dict_column_ref(arena, item.expr, &binding)
+                };
+                rewritten.display = Some(dict_column_display(&binding));
                 items.push(rewritten);
                 if !already_dict {
                     ctx.mark_changed();
@@ -797,7 +798,7 @@ fn rewrite_sort(
     Ok((
         opt_expr(
             Operator::LogicalSort(SortOp {
-                items: intern_sort_items(arena, &items),
+                items,
                 analytic_partition_exprs: node.analytic_partition_exprs,
                 partition_limit: node.partition_limit,
                 topn_type: node.topn_type,
@@ -818,15 +819,10 @@ fn rewrite_topn(
 ) -> Result<(OptExpr, DictScope), String> {
     let input = take_unary_child(&mut children);
     let (input, input_scope) = rewrite_node(input, ctx, arena)?;
-    let original_items = materialize_sort_keys(arena, &node.items);
+    let original_items = node.items;
     let needs_decode = original_items.iter().any(|item| {
-        if let crate::sql::analysis::ExprKind::ColumnRef { column, .. } = &item.expr.kind
-            && let Some(binding) = input_scope.get(column)
-        {
-            !binding.snapshot.order_preserving
-        } else {
-            false
-        }
+        resolve_scalar_ref(arena, item.expr, &input_scope)
+            .is_some_and(|(_, binding)| !binding.snapshot.order_preserving)
     });
     let (items, input, output_scope) = if needs_decode {
         (
@@ -835,14 +831,20 @@ fn rewrite_topn(
             DictScope::new(),
         )
     } else {
-        let mut items = Vec::with_capacity(node.items.len());
+        let mut items = Vec::with_capacity(original_items.len());
         for item in &original_items {
-            if let crate::sql::analysis::ExprKind::ColumnRef { column, .. } = &item.expr.kind
-                && let Some(binding) = input_scope.get(column)
+            if matches!(arena.node(item.expr), ScalarNode::ColumnRef(_))
+                && let Some((_, binding)) = resolve_scalar_ref(arena, item.expr, &input_scope)
             {
-                let already_dict = column.eq_ignore_ascii_case(&binding.dict_column);
+                let binding = binding.clone();
+                let already_dict = is_dict_ref(arena, item.expr, &binding);
                 let mut rewritten = item.clone();
-                rewritten.expr = rewrite_column_ref_with_scope(&item.expr, &input_scope);
+                rewritten.expr = if already_dict {
+                    item.expr
+                } else {
+                    dict_column_ref(arena, item.expr, &binding)
+                };
+                rewritten.display = Some(dict_column_display(&binding));
                 items.push(rewritten);
                 if !already_dict {
                     ctx.mark_changed();
@@ -856,7 +858,7 @@ fn rewrite_topn(
     Ok((
         opt_expr(
             Operator::LogicalTopN(TopNOp {
-                items: intern_sort_items(arena, &items),
+                items,
                 limit: node.limit,
                 offset: node.offset,
                 phase: node.phase,
@@ -889,10 +891,11 @@ fn rewrite_topn(
 /// the only rewrites possible are over those two functions, and
 /// `DISTINCT` is safe for both.
 fn rewrite_aggregate_call(
-    mut agg: AggregateCall,
+    mut agg: ScalarAggregateSpec,
     input_scope: &DictScope,
     ctx: &mut DictionaryRewriteContext,
-) -> AggregateCall {
+    arena: &mut ScalarArena,
+) -> ScalarAggregateSpec {
     let lower = agg.name.to_ascii_lowercase();
     if !DICT_AGG_FUNCTIONS.iter().any(|f| *f == lower) {
         return agg;
@@ -907,32 +910,31 @@ fn rewrite_aggregate_call(
     // defensive check: if the agg ever carries an ORDER BY over a
     // non-order-preserving dict column, fall back to the string arg.
     let order_by_dict_compatible = agg.order_by.iter().all(|item| {
-        match &item.expr.kind {
-            ExprKind::ColumnRef { column, .. } => match input_scope.get(column) {
-                Some(binding) => binding.snapshot.order_preserving,
-                // No dict binding on this order_by column — irrelevant,
-                // it stays as-is and does not block the agg-arg rewrite.
-                None => true,
-            },
-            // Non-column-ref ORDER BY expressions cannot be reasoned
-            // about cheaply; play it safe and skip the dict-id rewrite.
-            _ => false,
+        if !matches!(arena.node(item.expr), ScalarNode::ColumnRef(_)) {
+            return false;
         }
+        resolve_scalar_ref(arena, item.expr, input_scope)
+            .is_none_or(|(_, binding)| binding.snapshot.order_preserving)
     });
 
     let mut rewrote_any_arg = false;
     let mut new_args = Vec::with_capacity(agg.args.len());
     for arg in agg.args.drain(..) {
-        if let ExprKind::ColumnRef { column, .. } = &arg.kind
-            && let Some(binding) = input_scope.get(column)
-            && order_by_dict_compatible
+        if order_by_dict_compatible
+            && matches!(arena.node(arg), ScalarNode::ColumnRef(_))
+            && let Some((_, binding)) = resolve_scalar_ref(arena, arg, input_scope)
         {
+            let binding = binding.clone();
             // Idempotency: an already-dict-rewritten arg (post first
             // pipeline iteration) keeps the same ColumnRef without
             // marking the rewrite changed; otherwise the pipeline's
             // fixed-point loop would never terminate.
-            let already_dict = column.eq_ignore_ascii_case(&binding.dict_column);
-            new_args.push(rewrite_column_ref_with_scope(&arg, input_scope));
+            let already_dict = is_dict_ref(arena, arg, &binding);
+            new_args.push(if already_dict {
+                arg
+            } else {
+                dict_column_ref(arena, arg, &binding)
+            });
             if !already_dict {
                 rewrote_any_arg = true;
             }
@@ -986,14 +988,12 @@ fn rewrite_join(
             DictScope::new(),
         ));
     };
-    let condition = scalar::materialize(arena, condition_id);
-
     // Collect the equality pairs that align two dict-compatible columns.
     // For each such pair we keep both sides' dict columns and rewrite the
     // ColumnRef nodes inside the condition. Pairs that don't align
     // (different snapshots, only one side has a dict binding, or non-
     // equality predicates) fall through to per-side Decode.
-    let aligned = aligned_dict_join_pairs(&condition, &left_scope, &right_scope);
+    let aligned = aligned_dict_join_pairs(arena, condition_id, &left_scope, &right_scope);
 
     // Build the sets of output column names we are KEEPING dict-encoded
     // on each input side. Everything else gets decoded below the join.
@@ -1041,13 +1041,13 @@ fn rewrite_join(
     let condition = if aligned.is_empty() {
         Some(condition_id)
     } else {
-        if condition_references_source_names(&condition, &left_scope, &right_scope) {
+        if condition_references_source_names(arena, condition_id, &left_scope, &right_scope) {
             ctx.mark_changed();
         }
         let rewritten =
-            rewrite_join_condition_pairs(&condition, &aligned, &left_scope, &right_scope);
-        remember_join_dict_ref_displays(arena, &rewritten, &left_scope, &right_scope);
-        Some(scalar::intern_typed(arena, &rewritten))
+            rewrite_join_condition_pairs(arena, condition_id, &aligned, &left_scope, &right_scope);
+        remember_join_dict_ref_displays(arena, rewritten, &left_scope, &right_scope);
+        Some(rewritten)
     };
 
     // Output scope: the equi-keys we kept stay dict-encoded and are
@@ -1104,50 +1104,52 @@ struct AlignedEquiPair {
 /// dict ids inherits the same null behaviour as comparing strings,
 /// because the scan emits NULL → null_id consistently per snapshot.
 fn aligned_dict_join_pairs(
-    cond: &TypedExpr,
+    arena: &ScalarArena,
+    cond: ScalarId,
     left_scope: &DictScope,
     right_scope: &DictScope,
 ) -> Vec<AlignedEquiPair> {
     let mut out = Vec::new();
-    collect_equi_pairs(cond, left_scope, right_scope, &mut out);
+    collect_equi_pairs(arena, cond, left_scope, right_scope, &mut out);
     out
 }
 
 fn collect_equi_pairs(
-    expr: &TypedExpr,
+    arena: &ScalarArena,
+    expr: ScalarId,
     left_scope: &DictScope,
     right_scope: &DictScope,
     out: &mut Vec<AlignedEquiPair>,
 ) {
-    match &expr.kind {
-        ExprKind::BinaryOp { left, op, right } if matches!(op, BinOp::And) => {
-            collect_equi_pairs(left, left_scope, right_scope, out);
-            collect_equi_pairs(right, left_scope, right_scope, out);
+    match arena.node(expr) {
+        ScalarNode::BinaryOp { left, op, right } if matches!(op, BinOp::And) => {
+            collect_equi_pairs(arena, *left, left_scope, right_scope, out);
+            collect_equi_pairs(arena, *right, left_scope, right_scope, out);
         }
-        ExprKind::BinaryOp { left, op, right } if matches!(op, BinOp::Eq | BinOp::EqForNull) => {
-            if let Some(pair) = pair_dict_columns(left, right, left_scope, right_scope) {
+        ScalarNode::BinaryOp { left, op, right } if matches!(op, BinOp::Eq | BinOp::EqForNull) => {
+            if let Some(pair) = pair_dict_columns(arena, *left, *right, left_scope, right_scope) {
                 out.push(pair);
             }
         }
-        ExprKind::Nested(inner) => collect_equi_pairs(inner, left_scope, right_scope, out),
+        ScalarNode::Nested(inner) => {
+            collect_equi_pairs(arena, *inner, left_scope, right_scope, out)
+        }
         _ => {}
     }
 }
 
 fn pair_dict_columns(
-    a: &TypedExpr,
-    b: &TypedExpr,
+    arena: &ScalarArena,
+    a: ScalarId,
+    b: ScalarId,
     left_scope: &DictScope,
     right_scope: &DictScope,
 ) -> Option<AlignedEquiPair> {
-    let a_name = match &a.kind {
-        ExprKind::ColumnRef { column, .. } => column.clone(),
-        _ => return None,
-    };
-    let b_name = match &b.kind {
-        ExprKind::ColumnRef { column, .. } => column.clone(),
-        _ => return None,
-    };
+    if !matches!(arena.node(a), ScalarNode::ColumnRef(_))
+        || !matches!(arena.node(b), ScalarNode::ColumnRef(_))
+    {
+        return None;
+    }
     // Resolve by EITHER the source column name (`name`) OR the dict
     // column name (`__nr_dict_t1_name`). After a prior pipeline
     // iteration the ColumnRefs in the condition already point at the
@@ -1155,13 +1157,13 @@ fn pair_dict_columns(
     // too. The returned `key` is the binding's source-name registration
     // — used by the caller for the keep-set bookkeeping.
     let (left_key, right_key, left_binding, right_binding, lhs_is_left_input) = match (
-        left_scope.resolve_either(&a_name),
-        right_scope.resolve_either(&b_name),
+        resolve_scalar_ref(arena, a, left_scope),
+        resolve_scalar_ref(arena, b, right_scope),
     ) {
         (Some(l), Some(r)) => (l.0.to_string(), r.0.to_string(), l.1, r.1, true),
         _ => match (
-            left_scope.resolve_either(&b_name),
-            right_scope.resolve_either(&a_name),
+            resolve_scalar_ref(arena, b, left_scope),
+            resolve_scalar_ref(arena, a, right_scope),
         ) {
             (Some(l), Some(r)) => (l.0.to_string(), r.0.to_string(), l.1, r.1, false),
             _ => return None,
@@ -1184,26 +1186,27 @@ fn pair_dict_columns(
 /// avoid marking the rewrite as "changed" when iteration N+1 sees a
 /// condition that iteration N already rewrote.
 fn condition_references_source_names(
-    expr: &TypedExpr,
+    arena: &ScalarArena,
+    expr: ScalarId,
     left_scope: &DictScope,
     right_scope: &DictScope,
 ) -> bool {
-    match &expr.kind {
-        ExprKind::ColumnRef { column, .. } => {
-            if let Some(b) = left_scope.get(column) {
-                return !column.eq_ignore_ascii_case(&b.dict_column);
+    match arena.node(expr) {
+        ScalarNode::ColumnRef(_) => {
+            if let Some((_, binding)) = resolve_scalar_ref(arena, expr, left_scope) {
+                return !is_dict_ref(arena, expr, binding);
             }
-            if let Some(b) = right_scope.get(column) {
-                return !column.eq_ignore_ascii_case(&b.dict_column);
+            if let Some((_, binding)) = resolve_scalar_ref(arena, expr, right_scope) {
+                return !is_dict_ref(arena, expr, binding);
             }
             false
         }
-        ExprKind::BinaryOp { left, right, .. } => {
-            condition_references_source_names(left, left_scope, right_scope)
-                || condition_references_source_names(right, left_scope, right_scope)
+        ScalarNode::BinaryOp { left, right, .. } => {
+            condition_references_source_names(arena, *left, left_scope, right_scope)
+                || condition_references_source_names(arena, *right, left_scope, right_scope)
         }
-        ExprKind::Nested(inner) => {
-            condition_references_source_names(inner, left_scope, right_scope)
+        ScalarNode::Nested(inner) => {
+            condition_references_source_names(arena, *inner, left_scope, right_scope)
         }
         _ => false,
     }
@@ -1216,124 +1219,95 @@ fn condition_references_source_names(
 /// orientation) is rewritten to compare the dict slots directly. Other
 /// predicates are returned unchanged.
 fn rewrite_join_condition_pairs(
-    cond: &TypedExpr,
+    arena: &mut ScalarArena,
+    cond: ScalarId,
     aligned: &[AlignedEquiPair],
     left_scope: &DictScope,
     right_scope: &DictScope,
-) -> TypedExpr {
-    match &cond.kind {
-        ExprKind::BinaryOp { left, op, right } if matches!(op, BinOp::And) => TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: Box::new(rewrite_join_condition_pairs(
-                    left,
-                    aligned,
-                    left_scope,
-                    right_scope,
-                )),
-                op: *op,
-                right: Box::new(rewrite_join_condition_pairs(
-                    right,
-                    aligned,
-                    left_scope,
-                    right_scope,
-                )),
-            },
-            data_type: cond.data_type.clone(),
-            nullable: cond.nullable,
-        },
-        ExprKind::Nested(inner) => TypedExpr {
-            kind: ExprKind::Nested(Box::new(rewrite_join_condition_pairs(
-                inner,
-                aligned,
-                left_scope,
-                right_scope,
-            ))),
-            data_type: cond.data_type.clone(),
-            nullable: cond.nullable,
-        },
-        ExprKind::BinaryOp { left, op, right } if matches!(op, BinOp::Eq | BinOp::EqForNull) => {
-            if let (
-                ExprKind::ColumnRef { column: a_col, .. },
-                ExprKind::ColumnRef { column: b_col, .. },
-            ) = (&left.kind, &right.kind)
+) -> ScalarId {
+    let node = arena.node(cond).clone();
+    match node {
+        ScalarNode::BinaryOp { left, op, right } if matches!(op, BinOp::And) => {
+            let new_left =
+                rewrite_join_condition_pairs(arena, left, aligned, left_scope, right_scope);
+            let new_right =
+                rewrite_join_condition_pairs(arena, right, aligned, left_scope, right_scope);
+            arena.intern(
+                ScalarNode::BinaryOp {
+                    left: new_left,
+                    op,
+                    right: new_right,
+                },
+                arena.data_type(cond).clone(),
+                arena.nullable(cond),
+            )
+        }
+        ScalarNode::Nested(inner) => {
+            let new_inner =
+                rewrite_join_condition_pairs(arena, inner, aligned, left_scope, right_scope);
+            arena.intern(
+                ScalarNode::Nested(new_inner),
+                arena.data_type(cond).clone(),
+                arena.nullable(cond),
+            )
+        }
+        ScalarNode::BinaryOp { left, op, right } if matches!(op, BinOp::Eq | BinOp::EqForNull) => {
+            if !matches!(arena.node(left), ScalarNode::ColumnRef(_))
+                || !matches!(arena.node(right), ScalarNode::ColumnRef(_))
             {
-                for pair in aligned {
-                    let (predicate_left, predicate_right) = if pair.predicate_left_is_left_input {
-                        (&pair.left_column, &pair.right_column)
-                    } else {
-                        (&pair.right_column, &pair.left_column)
-                    };
-                    let lhs_scope = if pair.predicate_left_is_left_input {
-                        left_scope
-                    } else {
-                        right_scope
-                    };
-                    let rhs_scope = if pair.predicate_left_is_left_input {
-                        right_scope
-                    } else {
-                        left_scope
-                    };
-                    // Match by EITHER the source-column name or the
-                    // already-rewritten dict-column name. The latter is
-                    // how iteration 2 sees the condition after the rule
-                    // first fired.
-                    let lhs_match = a_col.eq_ignore_ascii_case(predicate_left)
-                        || lhs_scope
-                            .get(predicate_left)
-                            .is_some_and(|b| a_col.eq_ignore_ascii_case(&b.dict_column));
-                    let rhs_match = b_col.eq_ignore_ascii_case(predicate_right)
-                        || rhs_scope
-                            .get(predicate_right)
-                            .is_some_and(|b| b_col.eq_ignore_ascii_case(&b.dict_column));
-                    if lhs_match && rhs_match {
-                        // Build new ColumnRef nodes that point at the
-                        // dict slots. Re-using `rewrite_column_ref_with_scope`
-                        // would need a lookup-by-name, but the column may
-                        // already be the dict slot — easier to construct
-                        // directly from the binding.
-                        let lhs_binding = lhs_scope.get(predicate_left).expect("scope has binding");
-                        let rhs_binding =
-                            rhs_scope.get(predicate_right).expect("scope has binding");
-                        let new_left = TypedExpr {
-                            kind: ExprKind::ColumnRef {
-                                column_id: lhs_binding.source_column_id,
-                                qualifier: match &left.kind {
-                                    ExprKind::ColumnRef { qualifier, .. } => qualifier.clone(),
-                                    _ => None,
-                                },
-                                column: lhs_binding.dict_column.clone(),
-                            },
-                            data_type: DataType::Int32,
-                            nullable: left.nullable,
-                        };
-                        let new_right = TypedExpr {
-                            kind: ExprKind::ColumnRef {
-                                column_id: rhs_binding.source_column_id,
-                                qualifier: match &right.kind {
-                                    ExprKind::ColumnRef { qualifier, .. } => qualifier.clone(),
-                                    _ => None,
-                                },
-                                column: rhs_binding.dict_column.clone(),
-                            },
-                            data_type: DataType::Int32,
-                            nullable: right.nullable,
-                        };
-                        return TypedExpr {
-                            kind: ExprKind::BinaryOp {
-                                left: Box::new(new_left),
-                                op: *op,
-                                right: Box::new(new_right),
-                            },
-                            data_type: cond.data_type.clone(),
-                            nullable: cond.nullable,
-                        };
-                    }
+                return cond;
+            }
+            for pair in aligned {
+                let (predicate_left, predicate_right) = if pair.predicate_left_is_left_input {
+                    (&pair.left_column, &pair.right_column)
+                } else {
+                    (&pair.right_column, &pair.left_column)
+                };
+                let lhs_scope = if pair.predicate_left_is_left_input {
+                    left_scope
+                } else {
+                    right_scope
+                };
+                let rhs_scope = if pair.predicate_left_is_left_input {
+                    right_scope
+                } else {
+                    left_scope
+                };
+                let lhs_match = scalar_ref_matches_binding(arena, left, lhs_scope, predicate_left);
+                let rhs_match =
+                    scalar_ref_matches_binding(arena, right, rhs_scope, predicate_right);
+                if lhs_match && rhs_match {
+                    let lhs_binding = lhs_scope.get(predicate_left).expect("scope has binding");
+                    let rhs_binding = rhs_scope.get(predicate_right).expect("scope has binding");
+                    let new_left = dict_column_ref(arena, left, lhs_binding);
+                    let new_right = dict_column_ref(arena, right, rhs_binding);
+                    return arena.intern(
+                        ScalarNode::BinaryOp {
+                            left: new_left,
+                            op,
+                            right: new_right,
+                        },
+                        arena.data_type(cond).clone(),
+                        arena.nullable(cond),
+                    );
                 }
             }
-            cond.clone()
+            cond
         }
-        _ => cond.clone(),
+        _ => cond,
     }
+}
+
+fn scalar_ref_matches_binding(
+    arena: &ScalarArena,
+    expr: ScalarId,
+    scope: &DictScope,
+    source_name: &str,
+) -> bool {
+    resolve_scalar_ref(arena, expr, scope).is_some_and(|(resolved_name, binding)| {
+        resolved_name.eq_ignore_ascii_case(source_name)
+            || binding.dict_column.eq_ignore_ascii_case(source_name)
+    })
 }
 
 /// Wrap `plan` with a `Decode` for every dict column in `scope` whose

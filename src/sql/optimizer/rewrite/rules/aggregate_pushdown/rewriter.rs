@@ -1,68 +1,79 @@
 //! Aggregate pushdown rewriter — phase 2 of the rule.
 
-use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
-use crate::sql::codegen::helpers::{agg_call_display_name_from_parts, typed_expr_display_name};
+use crate::sql::analysis::OutputColumn;
 use crate::sql::column_id::{ColumnId, ColumnRefFactory};
 use crate::sql::optimizer::operator::{
     AggStage, LogicalAggregateOp, Operator, ProjectOp, ScalarAggregateSpec, ScalarProjectItem,
 };
 use crate::sql::optimizer::opt_expr::OptExpr;
-use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, intern_typed, materialize};
-use crate::sql::optimizer::scalar_bridge::{materialize_exprs, materialize_sort_keys};
+use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
+use crate::sql::optimizer::scalar_expr;
 
 use super::context::PushPlan;
 
-/// Build the display name for a `ScalarAggregateSpec` by materializing its args.
 fn agg_spec_display_name(spec: &ScalarAggregateSpec, arena: &ScalarArena) -> String {
-    let args = materialize_exprs(arena, &spec.args);
-    let order_by = materialize_sort_keys(arena, &spec.order_by);
-    agg_call_display_name_from_parts(&spec.name, &args, spec.distinct, &order_by)
+    scalar_expr::aggregate_display_name(
+        arena,
+        &spec.name,
+        &spec.args,
+        spec.distinct,
+        &spec.order_by,
+    )
 }
 
-/// Build the display name for a ScalarId group-by expression.
 fn group_by_display_name(id: ScalarId, arena: &ScalarArena) -> String {
-    let expr = materialize(arena, id);
-    typed_expr_display_name(&expr)
+    scalar_expr::scalar_display_name(arena, id)
 }
 
 fn append_extra_groupby(
     partial_groupby: &mut Vec<ScalarId>,
-    extra_groupby: Vec<TypedExpr>,
+    extra_groupby: Vec<ScalarId>,
     arena: &mut ScalarArena,
 ) {
     for expr in extra_groupby {
         if partial_groupby
             .iter()
-            .any(|id| same_column_ref_identity(&materialize(arena, *id), &expr))
+            .any(|id| same_column_ref_identity(arena, *id, expr))
         {
             continue;
         }
-        partial_groupby.push(intern_typed(arena, &expr));
+        partial_groupby.push(expr);
     }
 }
 
-fn same_column_ref_identity(a: &TypedExpr, b: &TypedExpr) -> bool {
-    match (&a.kind, &b.kind) {
-        (
-            ExprKind::ColumnRef {
-                column_id: a_id,
-                qualifier: a_qualifier,
-                column: a_column,
-            },
-            ExprKind::ColumnRef {
-                column_id: b_id,
-                qualifier: b_qualifier,
-                column: b_column,
-            },
-        ) => {
+fn same_column_ref_identity(arena: &ScalarArena, a: ScalarId, b: ScalarId) -> bool {
+    match (arena.node(a), arena.node(b)) {
+        (ScalarNode::ColumnRef(a_id), ScalarNode::ColumnRef(b_id)) => {
             if *a_id != ColumnId::UNSET && *b_id != ColumnId::UNSET {
                 a_id == b_id
             } else {
-                a_qualifier == b_qualifier && a_column == b_column
+                column_ref_display(arena, *a_id) == column_ref_display(arena, *b_id)
             }
         }
         _ => false,
     }
+}
+
+fn column_ref_display(arena: &ScalarArena, column_id: ColumnId) -> (Option<String>, String) {
+    arena
+        .column_display(column_id)
+        .map(|display| (display.qualifier.clone(), display.column.clone()))
+        .unwrap_or_else(|| (None, format!("col{}", column_id.0)))
+}
+
+fn column_ref_name(arena: &ScalarArena, column_id: ColumnId) -> String {
+    column_ref_display(arena, column_id).1
+}
+
+fn column_ref_scalar(
+    arena: &mut ScalarArena,
+    column_id: ColumnId,
+    name: String,
+    data_type: arrow::datatypes::DataType,
+    nullable: bool,
+) -> ScalarId {
+    arena.remember_source_column_display(column_id, None, name);
+    arena.intern(ScalarNode::ColumnRef(column_id), data_type, nullable)
 }
 
 /// Construct the final OptExpr: a top-level Aggregate (with is_split=true)
@@ -115,9 +126,7 @@ pub(crate) fn rewrite(
                     .map(|c| c.data_type.clone())
                     .or_else(|| {
                         // Fallback: materialize first arg and use its type.
-                        spec.args
-                            .first()
-                            .map(|id| materialize(arena, *id).data_type)
+                        spec.args.first().map(|id| arena.data_type(*id).clone())
                     })
                     .unwrap_or(arrow::datatypes::DataType::Int64);
                 let partial_col_id = column_ref_factory.create(
@@ -140,20 +149,15 @@ pub(crate) fn rewrite(
     // 2. Partial group-by output columns (column-ref pass-through).
     let partial_groupby_outputs: Vec<OutputColumn> = partial_groupby
         .iter()
-        .filter_map(|gb_id| {
-            let gb = materialize(arena, *gb_id);
-            match &gb.kind {
-                ExprKind::ColumnRef {
-                    column_id, column, ..
-                } => Some(OutputColumn {
-                    column_id: *column_id,
-                    name: column.clone(),
-                    data_type: gb.data_type.clone(),
-                    nullable: gb.nullable,
-                    is_internal: false,
-                }),
-                _ => None,
-            }
+        .filter_map(|gb_id| match arena.node(*gb_id) {
+            ScalarNode::ColumnRef(column_id) => Some(OutputColumn {
+                column_id: *column_id,
+                name: column_ref_name(arena, *column_id),
+                data_type: arena.data_type(*gb_id).clone(),
+                nullable: arena.nullable(*gb_id),
+                is_internal: false,
+            }),
+            _ => None,
         })
         .collect();
 
@@ -205,16 +209,13 @@ pub(crate) fn rewrite(
         .iter()
         .zip(partial_agg_output_cols.iter())
         .map(|(orig_spec, pc)| {
-            let col_ref_typed = crate::sql::analysis::TypedExpr {
-                kind: ExprKind::ColumnRef {
-                    column_id: pc.column_id,
-                    qualifier: None,
-                    column: pc.name.clone(),
-                },
-                data_type: pc.data_type.clone(),
-                nullable: pc.nullable,
-            };
-            let arg_id = crate::sql::optimizer::scalar::intern_typed(arena, &col_ref_typed);
+            let arg_id = column_ref_scalar(
+                arena,
+                pc.column_id,
+                pc.name.clone(),
+                pc.data_type.clone(),
+                pc.nullable,
+            );
             ScalarAggregateSpec {
                 name: final_fn_name(&orig_spec.name),
                 args: vec![arg_id],
@@ -229,9 +230,8 @@ pub(crate) fn rewrite(
         .group_by
         .iter()
         .map(|gb_id| {
-            let gb = materialize(arena, *gb_id);
-            let (column_id, name) = match &gb.kind {
-                ExprKind::ColumnRef { column_id, .. } => {
+            let (column_id, name) = match arena.node(*gb_id) {
+                ScalarNode::ColumnRef(column_id) => {
                     (*column_id, group_by_display_name(*gb_id, arena))
                 }
                 _ => (ColumnId::UNSET, group_by_display_name(*gb_id, arena)),
@@ -239,8 +239,8 @@ pub(crate) fn rewrite(
             OutputColumn {
                 column_id,
                 name,
-                data_type: gb.data_type.clone(),
-                nullable: gb.nullable,
+                data_type: arena.data_type(*gb_id).clone(),
+                nullable: arena.nullable(*gb_id),
                 is_internal: false,
             }
         })
@@ -252,11 +252,7 @@ pub(crate) fn rewrite(
             .output_columns
             .get(group_by_len + idx)
             .map(|c| c.data_type.clone())
-            .or_else(|| {
-                spec.args
-                    .first()
-                    .map(|id| materialize(arena, *id).data_type)
-            })
+            .or_else(|| spec.args.first().map(|id| arena.data_type(*id).clone()))
             .unwrap_or(arrow::datatypes::DataType::Int64);
         let col_id =
             column_ref_factory.create(None, display_name.clone(), result_type.clone(), true);
@@ -319,33 +315,27 @@ fn exposure_project_items(
     group_by_len: usize,
     arena: &mut ScalarArena,
 ) -> Vec<ScalarProjectItem> {
-    use crate::sql::optimizer::scalar::intern_typed;
-
     let mut items: Vec<ScalarProjectItem> = original
         .group_by
         .iter()
         .map(|gb_id| {
-            let gb = materialize(arena, *gb_id);
             let output_name = group_by_display_name(*gb_id, arena);
-            let (column_id, col_name) = match &gb.kind {
-                ExprKind::ColumnRef {
-                    column_id, column, ..
-                } => (*column_id, column.clone()),
+            let (column_id, col_name) = match arena.node(*gb_id) {
+                ScalarNode::ColumnRef(column_id) => {
+                    (*column_id, column_ref_name(arena, *column_id))
+                }
                 _ => (ColumnId::UNSET, output_name.clone()),
             };
             // The exposure project emits a ColumnRef to the final aggregate's
             // group-by output column (same ColumnId as the original).
-            let col_ref = crate::sql::analysis::TypedExpr {
-                kind: ExprKind::ColumnRef {
-                    column_id,
-                    qualifier: None,
-                    column: col_name,
-                },
-                data_type: gb.data_type.clone(),
-                nullable: gb.nullable,
-            };
             ScalarProjectItem {
-                expr: intern_typed(arena, &col_ref),
+                expr: column_ref_scalar(
+                    arena,
+                    column_id,
+                    col_name,
+                    arena.data_type(*gb_id).clone(),
+                    arena.nullable(*gb_id),
+                ),
                 output_name,
                 output_column_id: column_id,
                 expr_display: None,
@@ -364,15 +354,6 @@ fn exposure_project_items(
             .map(|(idx, (orig_spec, final_spec))| {
                 let final_col = &final_output_cols[group_by_len + idx];
                 let final_display = agg_spec_display_name(final_spec, arena);
-                let col_ref = crate::sql::analysis::TypedExpr {
-                    kind: ExprKind::ColumnRef {
-                        column_id: final_col.column_id,
-                        qualifier: None,
-                        column: final_display.clone(),
-                    },
-                    data_type: final_col.data_type.clone(),
-                    nullable: true,
-                };
                 let orig_display = agg_spec_display_name(orig_spec, arena);
                 // The output_column_id from the original aggregate's output
                 // columns (if present) so upstream selects resolve correctly.
@@ -382,7 +363,13 @@ fn exposure_project_items(
                     .map(|c| c.column_id)
                     .unwrap_or(ColumnId::UNSET);
                 ScalarProjectItem {
-                    expr: intern_typed(arena, &col_ref),
+                    expr: column_ref_scalar(
+                        arena,
+                        final_col.column_id,
+                        final_display,
+                        final_col.data_type.clone(),
+                        true,
+                    ),
                     output_name: orig_display,
                     output_column_id: orig_output_col_id,
                     expr_display: None,
@@ -400,7 +387,7 @@ mod tests {
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{LogicalJoinOp, ScanOp};
-    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
+    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed, materialize};
     use arrow::datatypes::DataType;
 
     /// Deterministic test ColumnId for a column name: hash the name bytes to get a
@@ -920,16 +907,15 @@ mod tests {
             vec![false],
             false,
         );
+        let sold_date_id = intern_typed(
+            &mut arena,
+            &qualified_col("cs", "cs_sold_date_sk", sold_date, DataType::Int64),
+        );
         let push = PushPlan {
             side: super::super::context::Side::Left,
             target_subtree: left,
             partial_groupby: original.group_by.clone(),
-            partial_extra_groupby: vec![qualified_col(
-                "cs",
-                "cs_sold_date_sk",
-                sold_date,
-                DataType::Int64,
-            )],
+            partial_extra_groupby: vec![sold_date_id],
             partial_aggregates: vec![sum],
         };
 

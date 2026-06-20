@@ -97,6 +97,16 @@ impl DictScope {
         None
     }
 
+    pub(crate) fn resolve_column_id(&self, column_id: ColumnId) -> Option<(&str, &DictBinding)> {
+        if column_id == ColumnId::UNSET {
+            return None;
+        }
+        self.bindings
+            .iter()
+            .find(|(_, binding)| binding.source_column_id == column_id)
+            .map(|(name, binding)| (name.as_str(), binding))
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.bindings.is_empty()
     }

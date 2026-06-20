@@ -13,16 +13,11 @@
 
 use std::collections::BTreeSet;
 
-use crate::sql::analysis::{BinOp, ExprKind, TypedExpr};
+use crate::sql::analysis::BinOp;
 use crate::sql::optimizer::operator::{Operator, ScanOp};
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
-use crate::sql::optimizer::scalar;
-use crate::sql::optimizer::scalar::ScalarArena;
-use crate::sql::optimizer::scalar_bridge::{
-    materialize_aggregate_calls, materialize_exprs, materialize_project_items,
-    materialize_sort_keys,
-};
+use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 
 use super::context::{DictionaryRewriteContext, ScanColumnKey};
 use super::expr::{
@@ -79,15 +74,14 @@ fn collect_blocklist(expr: &OptExpr, arena: &ScalarArena, out: &mut BTreeSet<Str
         Operator::LogicalFilter(node) => {
             // A filter predicate is never retargeted — even a bare
             // `s = 'x'` evaluates against the string value.
-            let predicate = scalar::materialize(arena, node.predicate);
-            collect_all_columns(&predicate, out);
+            collect_all_columns(arena, node.predicate, out);
             collect_blocklist(expr.unary_input(), arena, out);
         }
         Operator::LogicalProject(node) => {
             // Bare ColumnRef items merely propagate the dict slot (safe);
             // any compound item consumes the string.
-            for item in materialize_project_items(arena, &node.items) {
-                collect_nested_columns(&item.expr, out);
+            for item in &node.items {
+                collect_nested_columns(arena, item.expr, out);
             }
             collect_blocklist(expr.unary_input(), arena, out);
         }
@@ -95,35 +89,29 @@ fn collect_blocklist(expr: &OptExpr, arena: &ScalarArena, out: &mut BTreeSet<Str
             // Bare ColumnRef group keys are safe (rewritten to the dict
             // slot + post-aggregate Decode); compound group keys consume
             // the string.
-            for group_expr in materialize_exprs(arena, &node.group_by) {
-                collect_nested_columns(&group_expr, out);
+            for group_expr in &node.group_by {
+                collect_nested_columns(arena, *group_expr, out);
             }
-            let aggregates = materialize_aggregate_calls(
-                arena,
-                &node.aggregates,
-                node.group_by.len(),
-                &node.output_columns,
-            );
-            for agg in &aggregates {
+            for agg in &node.aggregates {
                 let lower = agg.name.to_ascii_lowercase();
                 if DICT_AGG_FUNCTIONS.iter().any(|f| *f == lower) {
                     // Allowlisted aggregate: a bare ColumnRef arg may
                     // consume the dict id directly (safe). Only compound
                     // args / order_by exprs consume the string.
                     for arg in &agg.args {
-                        collect_nested_columns(arg, out);
+                        collect_nested_columns(arena, *arg, out);
                     }
                     for item in &agg.order_by {
-                        collect_nested_columns(&item.expr, out);
+                        collect_nested_columns(arena, item.expr, out);
                     }
                 } else {
                     // Non-allowlisted aggregate (e.g. min/max/sum/...):
                     // the string is consumed regardless of arg shape.
                     for arg in &agg.args {
-                        collect_all_columns(arg, out);
+                        collect_all_columns(arena, *arg, out);
                     }
                     for item in &agg.order_by {
-                        collect_all_columns(&item.expr, out);
+                        collect_all_columns(arena, item.expr, out);
                     }
                 }
             }
@@ -133,14 +121,14 @@ fn collect_blocklist(expr: &OptExpr, arena: &ScalarArena, out: &mut BTreeSet<Str
             // Bare ColumnRef sort keys are safe — the rewriter decodes
             // non-order-preserving ones itself. Compound keys consume the
             // string.
-            for item in materialize_sort_keys(arena, &node.items) {
-                collect_nested_columns(&item.expr, out);
+            for item in &node.items {
+                collect_nested_columns(arena, item.expr, out);
             }
             collect_blocklist(expr.unary_input(), arena, out);
         }
         Operator::LogicalTopN(node) => {
-            for item in materialize_sort_keys(arena, &node.items) {
-                collect_nested_columns(&item.expr, out);
+            for item in &node.items {
+                collect_nested_columns(arena, item.expr, out);
             }
             collect_blocklist(expr.unary_input(), arena, out);
         }
@@ -148,8 +136,7 @@ fn collect_blocklist(expr: &OptExpr, arena: &ScalarArena, out: &mut BTreeSet<Str
             if let Some(cond) = node.condition {
                 // Spare equi-join keys the rewriter would dict-join;
                 // collect every other column the condition consumes.
-                let cond = scalar::materialize(arena, cond);
-                collect_join_condition(&cond, out);
+                collect_join_condition(arena, cond, out);
             }
             for child in &expr.children {
                 collect_blocklist(child, arena, out);
@@ -177,26 +164,26 @@ fn collect_blocklist(expr: &OptExpr, arena: &ScalarArena, out: &mut BTreeSet<Str
 ///   unwraps `Nested` when collecting equi pairs).
 /// * anything else → `collect_all_columns` (decoded by the join, consumes
 ///   the string).
-fn collect_join_condition(expr: &TypedExpr, out: &mut BTreeSet<String>) {
-    match &expr.kind {
-        ExprKind::BinaryOp { left, op, right } if matches!(op, BinOp::And) => {
-            collect_join_condition(left, out);
-            collect_join_condition(right, out);
+fn collect_join_condition(arena: &ScalarArena, expr: ScalarId, out: &mut BTreeSet<String>) {
+    match arena.node(expr) {
+        ScalarNode::BinaryOp { left, op, right } if matches!(op, BinOp::And) => {
+            collect_join_condition(arena, *left, out);
+            collect_join_condition(arena, *right, out);
         }
-        ExprKind::BinaryOp { left, op, right } if matches!(op, BinOp::Eq | BinOp::EqForNull) => {
-            let both_bare = matches!(left.kind, ExprKind::ColumnRef { .. })
-                && matches!(right.kind, ExprKind::ColumnRef { .. });
+        ScalarNode::BinaryOp { left, op, right } if matches!(op, BinOp::Eq | BinOp::EqForNull) => {
+            let both_bare = matches!(arena.node(*left), ScalarNode::ColumnRef(_))
+                && matches!(arena.node(*right), ScalarNode::ColumnRef(_));
             if both_bare {
                 // Safe equi key — the rewriter dict-joins it. Contribute
                 // nothing. (Whether the two sides' snapshots are actually
                 // compatible is decided by the rewriter; if not, it
                 // decodes the columns itself, which is still correct.)
             } else {
-                collect_all_columns(expr, out);
+                collect_all_columns(arena, expr, out);
             }
         }
-        ExprKind::Nested(inner) => collect_join_condition(inner, out),
-        _ => collect_all_columns(expr, out),
+        ScalarNode::Nested(inner) => collect_join_condition(arena, *inner, out),
+        _ => collect_all_columns(arena, expr, out),
     }
 }
 

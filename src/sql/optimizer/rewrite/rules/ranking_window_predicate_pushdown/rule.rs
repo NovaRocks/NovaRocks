@@ -1,4 +1,6 @@
-use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
+use std::collections::HashSet;
+
+use crate::sql::analysis::{BinOp, LiteralValue};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::{Operator, ScalarWindowSpec, SortOp, WindowOp};
 use crate::sql::optimizer::opt_expr::OptExpr;
@@ -6,8 +8,8 @@ use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::optimizer::rewrite::rules::utils::split_and;
-use crate::sql::optimizer::scalar::{self, ScalarArena};
+use crate::sql::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNode};
+use crate::sql::optimizer::scalar_expr;
 
 pub(crate) struct RankingWindowPredicatePushdownRule;
 
@@ -23,35 +25,28 @@ fn ranking_topn_type(name: &str) -> Option<crate::exec::node::sort::SortTopNType
     }
 }
 
+#[derive(Debug, Hash, PartialEq, Eq)]
+struct WindowSignatureKey {
+    partition_by: Vec<ScalarId>,
+    order_by: Vec<(ScalarId, bool, bool)>,
+    window_frame: String,
+}
+
 /// Returns the number of distinct (partition_by, order_by, frame) groups.
-/// Uses the same string-signature approach as `codegen::helpers::group_win_exprs_by_sig`
-/// but operates on `ScalarWindowSpec` with `ScalarId`s materialized from `arena`.
-fn count_unique_signatures(window_exprs: &[ScalarWindowSpec], arena: &ScalarArena) -> usize {
-    let sig = |e: &ScalarWindowSpec| -> String {
-        format!(
-            "{:?}|{:?}|{:?}",
-            e.partition_by
+fn count_unique_signatures(window_exprs: &[ScalarWindowSpec]) -> usize {
+    window_exprs
+        .iter()
+        .map(|expr| WindowSignatureKey {
+            partition_by: expr.partition_by.clone(),
+            order_by: expr
+                .order_by
                 .iter()
-                .map(|id| format!("{:?}", scalar::materialize(arena, *id).kind))
-                .collect::<Vec<_>>(),
-            e.order_by
-                .iter()
-                .map(|sk| {
-                    let expr = scalar::materialize(arena, sk.expr);
-                    format!("{:?}:{}", expr.kind, sk.asc)
-                })
-                .collect::<Vec<_>>(),
-            e.window_frame,
-        )
-    };
-    let mut seen: Vec<String> = Vec::new();
-    for e in window_exprs {
-        let s = sig(e);
-        if !seen.contains(&s) {
-            seen.push(s);
-        }
-    }
-    seen.len()
+                .map(|item| (item.expr, item.asc, item.nulls_first))
+                .collect(),
+            window_frame: format!("{:?}", expr.window_frame),
+        })
+        .collect::<HashSet<_>>()
+        .len()
 }
 
 impl LogicalRewriteRule for RankingWindowPredicatePushdownRule {
@@ -160,7 +155,7 @@ impl LogicalRewriteRule for RankingWindowPredicatePushdownRule {
 
         // --- Step 3b: Single-signature guard ---
         let arena_rc = ctx.scalar_arena();
-        if count_unique_signatures(&window_op.window_exprs, &arena_rc.borrow()) != 1 {
+        if count_unique_signatures(&window_op.window_exprs) != 1 {
             return Ok(RewriteResult::Unchanged);
         }
 
@@ -168,9 +163,6 @@ impl LogicalRewriteRule for RankingWindowPredicatePushdownRule {
         if sort_op.analytic_partition_exprs.is_empty() {
             return Ok(RewriteResult::Unchanged);
         }
-
-        // Materialize the filter predicate for rank_upper_bound.
-        let filter_predicate_typed = scalar::materialize(&arena_rc.borrow(), filter_predicate_id);
 
         // --- Step 5: Find a ranking window expr with a finite upper bound ---
         // Window output columns are laid out as input columns followed by one
@@ -183,50 +175,52 @@ impl LogicalRewriteRule for RankingWindowPredicatePushdownRule {
         else {
             return Ok(RewriteResult::Unchanged);
         };
-        let found = window_op
-            .window_exprs
-            .iter()
-            .enumerate()
-            .find_map(|(i, w_expr)| {
-                let window_output_col_id = window_op
-                    .output_columns
-                    .get(window_output_start + i)
-                    .map(|oc| oc.column_id)
-                    .unwrap_or(ColumnId::UNSET);
-                if window_output_col_id == ColumnId::UNSET {
-                    return None;
-                }
-
-                // Determine which ColumnId the filter predicate references for this expr.
-                let filter_col_id = if let Some(project_expr) = project_expr_ref {
-                    let Operator::LogicalProject(project_op) = &project_expr.op else {
+        let found = {
+            let arena = arena_rc.borrow();
+            window_op
+                .window_exprs
+                .iter()
+                .enumerate()
+                .find_map(|(i, w_expr)| {
+                    let window_output_col_id = window_op
+                        .output_columns
+                        .get(window_output_start + i)
+                        .map(|oc| oc.column_id)
+                        .unwrap_or(ColumnId::UNSET);
+                    if window_output_col_id == ColumnId::UNSET {
                         return None;
+                    }
+
+                    // Determine which ColumnId the filter predicate references for this expr.
+                    let filter_col_id = if let Some(project_expr) = project_expr_ref {
+                        let Operator::LogicalProject(project_op) = &project_expr.op else {
+                            return None;
+                        };
+                        project_op.items.iter().find_map(|item| {
+                            if scalar_expr::column_id(&arena, item.expr)
+                                == Some(window_output_col_id)
+                            {
+                                return Some(item.output_column_id);
+                            }
+                            None
+                        })?
+                    } else {
+                        window_output_col_id
                     };
-                    // Walk project items: find one whose expr is a bare ColumnRef to window_output_col_id.
-                    project_op.items.iter().find_map(|item| {
-                        let item_expr = scalar::materialize(&arena_rc.borrow(), item.expr);
-                        if let ExprKind::ColumnRef { column_id, .. } = &item_expr.kind
-                            && *column_id == window_output_col_id
-                        {
-                            return Some(item.output_column_id);
-                        }
-                        None
-                    })?
-                } else {
-                    window_output_col_id
-                };
 
-                let k = rank_upper_bound(&filter_predicate_typed, filter_col_id)?;
-                Some((k, w_expr))
-            });
+                    let k = rank_upper_bound(&arena, filter_predicate_id, filter_col_id)?;
+                    Some((
+                        k,
+                        ranking_topn_type(&w_expr.name).expect("all-ranking guard passed"),
+                    ))
+                })
+        };
 
-        let Some((k, matched_w_expr)) = found else {
+        let Some((k, topn_type)) = found else {
             return Ok(RewriteResult::Unchanged);
         };
 
         // --- Step 6: Rebuild the tree with partition_limit / topn_type on the Sort ---
-        let topn_type = ranking_topn_type(&matched_w_expr.name).unwrap();
-
         // Clone sort's children (the subtree below Sort stays the same).
         let sort_children = sort_expr_ref.children.clone();
         let sort_required = sort_expr_ref.required_output_columns.clone();
@@ -278,10 +272,16 @@ impl LogicalRewriteRule for RankingWindowPredicatePushdownRule {
 /// Smallest finite upper bound K (>= 1) such that the conjunctive predicate can
 /// only pass rows with rank_col <= K.  Returns None if no finite positive bound
 /// exists (e.g., lower-bound-only predicates, K <= 0, or no reference to rank_col).
-pub(crate) fn rank_upper_bound(predicate: &TypedExpr, rank_col: ColumnId) -> Option<usize> {
+pub(crate) fn rank_upper_bound(
+    arena: &ScalarArena,
+    predicate: ScalarId,
+    rank_col: ColumnId,
+) -> Option<usize> {
     let mut best: Option<i64> = None;
-    for conj in split_and(predicate.clone()) {
-        if let Some(k) = conjunct_upper_bound(&conj, rank_col) {
+    let mut conjuncts = Vec::new();
+    scalar_expr::split_conjuncts(arena, predicate, &mut conjuncts);
+    for conj in conjuncts {
+        if let Some(k) = conjunct_upper_bound(arena, conj, rank_col) {
             best = Some(best.map_or(k, |b| b.min(k)));
         }
     }
@@ -291,24 +291,24 @@ pub(crate) fn rank_upper_bound(predicate: &TypedExpr, rank_col: ColumnId) -> Opt
     }
 }
 
-fn is_rank_col(e: &TypedExpr, rank_col: ColumnId) -> bool {
-    matches!(&e.kind, ExprKind::ColumnRef { column_id, .. } if *column_id == rank_col)
+fn is_rank_col(arena: &ScalarArena, expr: ScalarId, rank_col: ColumnId) -> bool {
+    scalar_expr::column_id(arena, expr) == Some(rank_col)
 }
 
-fn int_lit(e: &TypedExpr) -> Option<i64> {
-    match &e.kind {
-        ExprKind::Literal(LiteralValue::Int(v)) => Some(*v),
+fn int_lit(arena: &ScalarArena, expr: ScalarId) -> Option<i64> {
+    match arena.node(expr) {
+        ScalarNode::Literal(HashableLiteral(LiteralValue::Int(v))) => Some(*v),
         _ => None,
     }
 }
 
-fn conjunct_upper_bound(e: &TypedExpr, rank_col: ColumnId) -> Option<i64> {
-    match &e.kind {
-        ExprKind::BinaryOp { left, op, right } => {
-            let (lit, col_on_left) = if is_rank_col(left, rank_col) {
-                (int_lit(right)?, true)
-            } else if is_rank_col(right, rank_col) {
-                (int_lit(left)?, false)
+fn conjunct_upper_bound(arena: &ScalarArena, expr: ScalarId, rank_col: ColumnId) -> Option<i64> {
+    match arena.node(expr) {
+        ScalarNode::BinaryOp { left, op, right } => {
+            let (lit, col_on_left) = if is_rank_col(arena, *left, rank_col) {
+                (int_lit(arena, *right)?, true)
+            } else if is_rank_col(arena, *right, rank_col) {
+                (int_lit(arena, *left)?, false)
             } else {
                 return None;
             };
@@ -323,20 +323,20 @@ fn conjunct_upper_bound(e: &TypedExpr, rank_col: ColumnId) -> Option<i64> {
             }
         }
         // BETWEEN low AND high: upper bound is `high`
-        ExprKind::Between {
-            expr,
+        ScalarNode::Between {
+            child,
             high,
             negated: false,
             ..
-        } if is_rank_col(expr, rank_col) => int_lit(high),
+        } if is_rank_col(arena, *child, rank_col) => int_lit(arena, *high),
         // IN (v1, v2, ...): upper bound is the max value in the list
-        ExprKind::InList {
-            expr,
+        ScalarNode::InList {
+            child,
             list,
             negated: false,
-        } if is_rank_col(expr, rank_col) => list
+        } if is_rank_col(arena, *child, rank_col) => list
             .iter()
-            .map(int_lit)
+            .map(|item| int_lit(arena, *item))
             .collect::<Option<Vec<_>>>()?
             .into_iter()
             .max(),
@@ -441,6 +441,12 @@ mod tests {
             data_type: DataType::Boolean,
             nullable: false,
         }
+    }
+
+    fn rank_upper_bound_typed(predicate: TypedExpr, rank_col: ColumnId) -> Option<usize> {
+        let mut arena = ScalarArena::new();
+        let predicate = scalar::intern_typed(&mut arena, &predicate);
+        rank_upper_bound(&arena, predicate, rank_col)
     }
 
     fn empty_values_opt() -> OptExpr {
@@ -670,20 +676,32 @@ mod tests {
         let rk = ColumnId::new_for_test(7);
         let other = ColumnId::new_for_test(99);
 
-        assert_eq!(rank_upper_bound(&le_typed(col_typed(rk), 5), rk), Some(5));
-        assert_eq!(rank_upper_bound(&lt_typed(col_typed(rk), 5), rk), Some(4));
-        assert_eq!(rank_upper_bound(&eq_typed(col_typed(rk), 3), rk), Some(3));
         assert_eq!(
-            rank_upper_bound(&between_typed(col_typed(rk), 2, 9), rk),
+            rank_upper_bound_typed(le_typed(col_typed(rk), 5), rk),
+            Some(5)
+        );
+        assert_eq!(
+            rank_upper_bound_typed(lt_typed(col_typed(rk), 5), rk),
+            Some(4)
+        );
+        assert_eq!(
+            rank_upper_bound_typed(eq_typed(col_typed(rk), 3), rk),
+            Some(3)
+        );
+        assert_eq!(
+            rank_upper_bound_typed(between_typed(col_typed(rk), 2, 9), rk),
             Some(9)
         );
         assert_eq!(
-            rank_upper_bound(&in_list_typed(col_typed(rk), &[1, 3, 5]), rk),
+            rank_upper_bound_typed(in_list_typed(col_typed(rk), &[1, 3, 5]), rk),
             Some(5)
         );
-        assert_eq!(rank_upper_bound(&ge_typed(col_typed(rk), 5), rk), None);
-        assert_eq!(rank_upper_bound(&le_typed(col_typed(rk), 0), rk), None);
-        assert_eq!(rank_upper_bound(&le_typed(col_typed(other), 5), rk), None);
+        assert_eq!(rank_upper_bound_typed(ge_typed(col_typed(rk), 5), rk), None);
+        assert_eq!(rank_upper_bound_typed(le_typed(col_typed(rk), 0), rk), None);
+        assert_eq!(
+            rank_upper_bound_typed(le_typed(col_typed(other), 5), rk),
+            None
+        );
     }
 
     #[test]
