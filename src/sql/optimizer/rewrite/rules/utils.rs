@@ -5,576 +5,14 @@
 
 use std::collections::HashSet;
 
-use crate::sql::analysis::{BinOp, ExprKind, TypedExpr};
+use crate::sql::analysis::BinOp;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::{FilterOp, LogicalJoinOp, Operator};
 use crate::sql::optimizer::opt_expr::OptExpr;
-use crate::sql::optimizer::scalar::{self, ScalarArena, ScalarId, ScalarNode};
-use crate::sql::planner::plan::*;
+use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 
-/// Split an expression on AND into a flat list of conjuncts.
-pub(crate) fn split_and(expr: TypedExpr) -> Vec<TypedExpr> {
-    let mut out = Vec::new();
-    split_and_inner(expr, &mut out);
-    out
-}
-
-fn split_and_inner(expr: TypedExpr, out: &mut Vec<TypedExpr>) {
-    match expr.kind {
-        ExprKind::BinaryOp {
-            left,
-            op: BinOp::And,
-            right,
-        } => {
-            split_and_inner(*left, out);
-            split_and_inner(*right, out);
-        }
-        _ => out.push(expr),
-    }
-}
-
-/// Combine a list of conjuncts back into a single AND expression.
-/// Panics if `exprs` is empty.
-pub(crate) fn combine_and(mut exprs: Vec<TypedExpr>) -> TypedExpr {
-    assert!(!exprs.is_empty());
-    let mut result = exprs.pop().unwrap();
-    while let Some(left) = exprs.pop() {
-        result = TypedExpr {
-            data_type: arrow::datatypes::DataType::Boolean,
-            nullable: left.nullable || result.nullable,
-            kind: ExprKind::BinaryOp {
-                left: Box::new(left),
-                op: BinOp::And,
-                right: Box::new(result),
-            },
-        };
-    }
-    result
-}
-
-/// Collect all column names referenced in an expression (unqualified, lowercase).
-pub(crate) fn collect_column_refs(expr: &TypedExpr) -> Vec<&str> {
-    let mut out = Vec::new();
-    collect_column_refs_inner(expr, &mut out);
-    out
-}
-
-fn collect_column_refs_inner<'a>(expr: &'a TypedExpr, out: &mut Vec<&'a str>) {
-    match &expr.kind {
-        ExprKind::ColumnRef { column, .. } => out.push(column.as_str()),
-        ExprKind::LambdaParamRef { .. } => {}
-        ExprKind::BinaryOp { left, right, .. } => {
-            collect_column_refs_inner(left, out);
-            collect_column_refs_inner(right, out);
-        }
-        ExprKind::UnaryOp { expr, .. } => collect_column_refs_inner(expr, out),
-        ExprKind::FunctionCall { args, .. } => {
-            for arg in args {
-                collect_column_refs_inner(arg, out);
-            }
-        }
-        ExprKind::LambdaFunction { body, .. } => collect_column_refs_inner(body, out),
-        ExprKind::AggregateCall { args, order_by, .. } => {
-            for arg in args {
-                collect_column_refs_inner(arg, out);
-            }
-            for ob in order_by {
-                collect_column_refs_inner(&ob.expr, out);
-            }
-        }
-        ExprKind::Cast { expr, .. } => collect_column_refs_inner(expr, out),
-        ExprKind::IsNull { expr, .. } => collect_column_refs_inner(expr, out),
-        ExprKind::InList { expr, list, .. } => {
-            collect_column_refs_inner(expr, out);
-            for item in list {
-                collect_column_refs_inner(item, out);
-            }
-        }
-        ExprKind::Between {
-            expr, low, high, ..
-        } => {
-            collect_column_refs_inner(expr, out);
-            collect_column_refs_inner(low, out);
-            collect_column_refs_inner(high, out);
-        }
-        ExprKind::Like { expr, pattern, .. } => {
-            collect_column_refs_inner(expr, out);
-            collect_column_refs_inner(pattern, out);
-        }
-        ExprKind::Case {
-            operand,
-            when_then,
-            else_expr,
-        } => {
-            if let Some(operand) = operand {
-                collect_column_refs_inner(operand, out);
-            }
-            for (when, then) in when_then {
-                collect_column_refs_inner(when, out);
-                collect_column_refs_inner(then, out);
-            }
-            if let Some(else_expr) = else_expr {
-                collect_column_refs_inner(else_expr, out);
-            }
-        }
-        ExprKind::IsTruthValue { expr, .. } => collect_column_refs_inner(expr, out),
-        ExprKind::Nested(inner) => collect_column_refs_inner(inner, out),
-        ExprKind::Literal(_) => {}
-        ExprKind::WindowCall {
-            args,
-            partition_by,
-            order_by,
-            ..
-        } => {
-            for arg in args {
-                collect_column_refs_inner(arg, out);
-            }
-            for pb in partition_by {
-                collect_column_refs_inner(pb, out);
-            }
-            for ob in order_by {
-                collect_column_refs_inner(&ob.expr, out);
-            }
-        }
-        // SubqueryPlaceholder should be rewritten before reaching here,
-        // but handle gracefully as a no-op.
-        ExprKind::SubqueryPlaceholder { .. } => {}
-        ExprKind::Lambda { params, body } => {
-            // Walk the body but drop lambda-bound parameter names so we do not
-            // misclassify them as outer-column references. Outer column refs
-            // remain visible (`x + v2` inside `array_map(x -> x + v2, ...)`
-            // must still report `v2`).
-            let mut nested: Vec<&'a str> = Vec::new();
-            collect_column_refs_inner(body, &mut nested);
-            let bound: std::collections::HashSet<String> =
-                params.iter().map(|p| p.to_lowercase()).collect();
-            for name in nested {
-                if !bound.contains(&name.to_lowercase()) {
-                    out.push(name);
-                }
-            }
-        }
-    }
-}
-
-/// Collect all column names available from a plan subtree (lowercase).
-///
-/// This is used by predicate pushdown to determine which side of a join a
-/// predicate references.
-pub(crate) fn collect_output_columns(plan: &LogicalPlanNode) -> HashSet<String> {
-    match &plan.kind {
-        PlanNodeKind::Scan(s) => s.columns.iter().map(|c| c.name.to_lowercase()).collect(),
-        PlanNodeKind::Filter(_) => collect_output_columns(plan.unary_input()),
-        PlanNodeKind::Project(p) => p
-            .items
-            .iter()
-            .map(|item| item.output_name.to_lowercase())
-            .collect(),
-        PlanNodeKind::Join(j) => {
-            let left_only = matches!(
-                j.join_type,
-                crate::sql::analysis::JoinKind::LeftSemi
-                    | crate::sql::analysis::JoinKind::LeftAnti
-                    | crate::sql::analysis::JoinKind::RightSemi
-                    | crate::sql::analysis::JoinKind::RightAnti
-            );
-            if left_only {
-                collect_output_columns(plan.left())
-            } else {
-                let mut cols = collect_output_columns(plan.left());
-                cols.extend(collect_output_columns(plan.right()));
-                cols
-            }
-        }
-        PlanNodeKind::Aggregate(a) => a
-            .output_columns
-            .iter()
-            .map(|c| c.name.to_lowercase())
-            .collect(),
-        PlanNodeKind::AggregateStateMerge(a) => a
-            .output_columns
-            .iter()
-            .map(|c| c.name.to_lowercase())
-            .collect(),
-        PlanNodeKind::Sort(_) => collect_output_columns(plan.unary_input()),
-        PlanNodeKind::Limit(_) => collect_output_columns(plan.unary_input()),
-        PlanNodeKind::Window(w) => w
-            .output_columns
-            .iter()
-            .map(|c| c.name.to_lowercase())
-            .collect(),
-        PlanNodeKind::Union(_) => {
-            if let Some(first) = plan.children.first() {
-                collect_output_columns(first)
-            } else {
-                HashSet::new()
-            }
-        }
-        PlanNodeKind::Intersect(_) => {
-            if let Some(first) = plan.children.first() {
-                collect_output_columns(first)
-            } else {
-                HashSet::new()
-            }
-        }
-        PlanNodeKind::Except(_) => {
-            if let Some(first) = plan.children.first() {
-                collect_output_columns(first)
-            } else {
-                HashSet::new()
-            }
-        }
-        PlanNodeKind::Values(v) => v.columns.iter().map(|c| c.name.to_lowercase()).collect(),
-        PlanNodeKind::GenerateSeries(g) => {
-            let mut cols = HashSet::new();
-            cols.insert(g.column_name.to_lowercase());
-            cols
-        }
-        PlanNodeKind::TableFunction(t) => {
-            let mut cols = collect_output_columns(plan.unary_input());
-            cols.extend(t.output_columns.iter().map(|c| c.name.to_lowercase()));
-            cols
-        }
-        PlanNodeKind::CTEAnchor(_) => collect_output_columns(plan.child(1)),
-        PlanNodeKind::CTEProduce(p) => p
-            .output_columns
-            .iter()
-            .map(|col| col.name.to_lowercase())
-            .collect(),
-        PlanNodeKind::Repeat(_) => collect_output_columns(plan.unary_input()),
-        PlanNodeKind::CTEConsume(c) => c
-            .output_columns
-            .iter()
-            .map(|col| col.name.to_lowercase())
-            .collect(),
-        PlanNodeKind::Decode(d) => {
-            // Decode replaces dict columns with their string counterparts
-            // but otherwise passes through the child's output set.
-            let mut cols = collect_output_columns(plan.unary_input());
-            for mapping in &d.mappings {
-                cols.remove(&mapping.dict_column.to_lowercase());
-                cols.insert(mapping.string_column.to_lowercase());
-            }
-            cols
-        }
-        PlanNodeKind::Apply(a) => {
-            let mut out = collect_output_columns(plan.left());
-            out.insert(a.output_column.name.to_lowercase());
-            out
-        }
-        PlanNodeKind::AssertOneRow(_) => collect_output_columns(plan.unary_input()),
-        PlanNodeKind::ImvDelta(_) | PlanNodeKind::ImvVersion(_) => {
-            panic!("imv marker leaked into non-IMV plan");
-        }
-        PlanNodeKind::TopN(_)
-        | PlanNodeKind::Exchange(_)
-        | PlanNodeKind::HashAggregate(_)
-        | PlanNodeKind::HashJoin(_)
-        | PlanNodeKind::NestLoopJoin(_)
-        | PlanNodeKind::SetOp(_) => {
-            panic!("distributed plan node leaked into logical rewrite utility");
-        }
-    }
-}
-
-/// Collect every [`ColumnId`] referenced by an expression.
-///
-/// [`ColumnId::UNSET`] is deliberately excluded — an unresolved reference must
-/// not constrain column pruning.
-pub(crate) fn collect_column_id_refs(expr: &TypedExpr) -> HashSet<crate::sql::column_id::ColumnId> {
-    let mut out = HashSet::new();
-    collect_column_id_refs_inner(expr, &mut out);
-    out
-}
-
-fn collect_column_id_refs_inner(
-    expr: &TypedExpr,
-    out: &mut HashSet<crate::sql::column_id::ColumnId>,
-) {
-    match &expr.kind {
-        ExprKind::ColumnRef { column_id, .. } => {
-            if *column_id != crate::sql::column_id::ColumnId::UNSET {
-                out.insert(*column_id);
-            }
-        }
-        ExprKind::LambdaParamRef { .. } => {}
-        ExprKind::BinaryOp { left, right, .. } => {
-            collect_column_id_refs_inner(left, out);
-            collect_column_id_refs_inner(right, out);
-        }
-        ExprKind::UnaryOp { expr, .. } => collect_column_id_refs_inner(expr, out),
-        ExprKind::FunctionCall { args, .. } => {
-            for arg in args {
-                collect_column_id_refs_inner(arg, out);
-            }
-        }
-        ExprKind::LambdaFunction { body, .. } => collect_column_id_refs_inner(body, out),
-        ExprKind::AggregateCall { args, order_by, .. } => {
-            for arg in args {
-                collect_column_id_refs_inner(arg, out);
-            }
-            for ob in order_by {
-                collect_column_id_refs_inner(&ob.expr, out);
-            }
-        }
-        ExprKind::Cast { expr, .. } => collect_column_id_refs_inner(expr, out),
-        ExprKind::IsNull { expr, .. } => collect_column_id_refs_inner(expr, out),
-        ExprKind::InList { expr, list, .. } => {
-            collect_column_id_refs_inner(expr, out);
-            for item in list {
-                collect_column_id_refs_inner(item, out);
-            }
-        }
-        ExprKind::Between {
-            expr, low, high, ..
-        } => {
-            collect_column_id_refs_inner(expr, out);
-            collect_column_id_refs_inner(low, out);
-            collect_column_id_refs_inner(high, out);
-        }
-        ExprKind::Like { expr, pattern, .. } => {
-            collect_column_id_refs_inner(expr, out);
-            collect_column_id_refs_inner(pattern, out);
-        }
-        ExprKind::Case {
-            operand,
-            when_then,
-            else_expr,
-        } => {
-            if let Some(operand) = operand {
-                collect_column_id_refs_inner(operand, out);
-            }
-            for (when, then) in when_then {
-                collect_column_id_refs_inner(when, out);
-                collect_column_id_refs_inner(then, out);
-            }
-            if let Some(else_expr) = else_expr {
-                collect_column_id_refs_inner(else_expr, out);
-            }
-        }
-        ExprKind::IsTruthValue { expr, .. } => collect_column_id_refs_inner(expr, out),
-        ExprKind::Nested(inner) => collect_column_id_refs_inner(inner, out),
-        ExprKind::Literal(_) => {}
-        ExprKind::WindowCall {
-            args,
-            partition_by,
-            order_by,
-            ..
-        } => {
-            for arg in args {
-                collect_column_id_refs_inner(arg, out);
-            }
-            for pb in partition_by {
-                collect_column_id_refs_inner(pb, out);
-            }
-            for ob in order_by {
-                collect_column_id_refs_inner(&ob.expr, out);
-            }
-        }
-        // SubqueryPlaceholder should be rewritten before reaching here,
-        // but handle gracefully as a no-op.
-        ExprKind::SubqueryPlaceholder { .. } => {}
-        ExprKind::Lambda { body, .. } => {
-            // Lambda-bound parameters are emitted as the distinct `LambdaParamRef`
-            // variant (a no-op above), NOT as `ColumnRef`, so they never enter the
-            // id set — no filtering needed here. Walk the body to capture outer
-            // column refs the closure captures.
-            collect_column_id_refs_inner(body, out);
-        }
-    }
-}
-
-/// Return the ordered list of [`ColumnId`]s in the output schema of a plan node.
-///
-/// This is the authoritative source for "which ColumnIds does this subtree produce",
-/// used by the Phase-1 column-pruning tagging pass to split a parent's needed set
-/// across join/set-op children.
-pub(crate) fn collect_output_ids_ordered(
-    plan: &LogicalPlanNode,
-) -> Vec<crate::sql::column_id::ColumnId> {
-    match &plan.kind {
-        PlanNodeKind::Scan(s) => s.columns.iter().map(|c| c.column_id).collect(),
-        PlanNodeKind::Project(p) => p
-            .items
-            .iter()
-            .map(|item| item.output_column_id)
-            .filter(|id| *id != crate::sql::column_id::ColumnId::UNSET)
-            .collect(),
-        PlanNodeKind::Aggregate(a) => a.output_columns.iter().map(|c| c.column_id).collect(),
-        PlanNodeKind::Window(w) => w.output_columns.iter().map(|c| c.column_id).collect(),
-        PlanNodeKind::CTEProduce(p) => p.output_columns.iter().map(|c| c.column_id).collect(),
-        PlanNodeKind::CTEConsume(c) => c.output_columns.iter().map(|c| c.column_id).collect(),
-        PlanNodeKind::Union(u) => u.output_columns.iter().map(|c| c.column_id).collect(),
-        PlanNodeKind::Intersect(i) => i.output_columns.iter().map(|c| c.column_id).collect(),
-        PlanNodeKind::Except(e) => e.output_columns.iter().map(|c| c.column_id).collect(),
-        PlanNodeKind::Decode(d) => d.output_columns.iter().map(|c| c.column_id).collect(),
-        PlanNodeKind::AggregateStateMerge(a) => {
-            a.output_columns.iter().map(|c| c.column_id).collect()
-        }
-        PlanNodeKind::Values(v) => v.columns.iter().map(|c| c.column_id).collect(),
-        PlanNodeKind::GenerateSeries(g) => {
-            if g.output_column_id == crate::sql::column_id::ColumnId::UNSET {
-                vec![]
-            } else {
-                vec![g.output_column_id]
-            }
-        }
-        // Passthrough: the node does not add or rename output ColumnIds.
-        PlanNodeKind::Filter(_)
-        | PlanNodeKind::Sort(_)
-        | PlanNodeKind::Limit(_)
-        | PlanNodeKind::Repeat(_) => collect_output_ids_ordered(plan.unary_input()),
-        PlanNodeKind::TableFunction(t) => {
-            // TableFunction extends the input's output with its own output columns.
-            let mut ids = collect_output_ids_ordered(plan.unary_input());
-            ids.extend(t.output_columns.iter().map(|c| c.column_id));
-            ids
-        }
-        PlanNodeKind::Join(_) => {
-            // Join output = left output ids ++ right output ids (left first).
-            let mut ids = collect_output_ids_ordered(plan.left());
-            ids.extend(collect_output_ids_ordered(plan.right()));
-            ids
-        }
-        PlanNodeKind::CTEAnchor(_) => collect_output_ids_ordered(plan.child(1)),
-        PlanNodeKind::Apply(a) => {
-            let mut ids = collect_output_ids_ordered(plan.left());
-            ids.push(a.output_column.column_id);
-            ids
-        }
-        PlanNodeKind::AssertOneRow(_) => collect_output_ids_ordered(plan.unary_input()),
-        PlanNodeKind::ImvDelta(_) | PlanNodeKind::ImvVersion(_) => {
-            panic!("imv marker should not appear in non-IMV pruning")
-        }
-        PlanNodeKind::TopN(_)
-        | PlanNodeKind::Exchange(_)
-        | PlanNodeKind::HashAggregate(_)
-        | PlanNodeKind::HashJoin(_)
-        | PlanNodeKind::NestLoopJoin(_)
-        | PlanNodeKind::SetOp(_) => {
-            panic!("distributed plan node leaked into logical rewrite utility");
-        }
-    }
-}
-
-/// Return the set of [`ColumnId`]s in the output schema of a plan node.
-///
-/// `collect_output_ids(plan) = collect_output_ids_ordered(plan).into_iter().collect()`.
-pub(crate) fn collect_output_ids(
-    plan: &LogicalPlanNode,
-) -> HashSet<crate::sql::column_id::ColumnId> {
-    collect_output_ids_ordered(plan).into_iter().collect()
-}
-
-/// Collect every referenced [`ColumnId`] only when all column references in the
-/// expression have been bound.
-///
-/// Constants return `Some(empty set)`. Any `ColumnRef` carrying
-/// [`ColumnId::UNSET`] returns `None`, so rewrite rules can leave the predicate
-/// in place instead of falling back to names.
-pub(crate) fn collect_column_id_refs_strict(
-    expr: &TypedExpr,
-) -> Option<HashSet<crate::sql::column_id::ColumnId>> {
-    let mut out = HashSet::new();
-    collect_column_id_refs_strict_inner(expr, &mut out)?;
-    Some(out)
-}
-
-fn collect_column_id_refs_strict_inner(
-    expr: &TypedExpr,
-    out: &mut HashSet<crate::sql::column_id::ColumnId>,
-) -> Option<()> {
-    use crate::sql::column_id::ColumnId;
-
-    match &expr.kind {
-        ExprKind::ColumnRef { column_id, .. } => {
-            if *column_id == ColumnId::UNSET {
-                return None;
-            }
-            out.insert(*column_id);
-        }
-        ExprKind::LambdaParamRef { .. } | ExprKind::Literal(_) => {}
-        ExprKind::BinaryOp { left, right, .. } => {
-            collect_column_id_refs_strict_inner(left, out)?;
-            collect_column_id_refs_strict_inner(right, out)?;
-        }
-        ExprKind::UnaryOp { expr, .. } => collect_column_id_refs_strict_inner(expr, out)?,
-        ExprKind::FunctionCall { args, .. } => {
-            for arg in args {
-                collect_column_id_refs_strict_inner(arg, out)?;
-            }
-        }
-        ExprKind::LambdaFunction { body, .. } => {
-            collect_column_id_refs_strict_inner(body, out)?;
-        }
-        ExprKind::AggregateCall { args, order_by, .. } => {
-            for arg in args {
-                collect_column_id_refs_strict_inner(arg, out)?;
-            }
-            for item in order_by {
-                collect_column_id_refs_strict_inner(&item.expr, out)?;
-            }
-        }
-        ExprKind::Cast { expr, .. } => collect_column_id_refs_strict_inner(expr, out)?,
-        ExprKind::IsNull { expr, .. } => collect_column_id_refs_strict_inner(expr, out)?,
-        ExprKind::InList { expr, list, .. } => {
-            collect_column_id_refs_strict_inner(expr, out)?;
-            for item in list {
-                collect_column_id_refs_strict_inner(item, out)?;
-            }
-        }
-        ExprKind::Between {
-            expr, low, high, ..
-        } => {
-            collect_column_id_refs_strict_inner(expr, out)?;
-            collect_column_id_refs_strict_inner(low, out)?;
-            collect_column_id_refs_strict_inner(high, out)?;
-        }
-        ExprKind::Like { expr, pattern, .. } => {
-            collect_column_id_refs_strict_inner(expr, out)?;
-            collect_column_id_refs_strict_inner(pattern, out)?;
-        }
-        ExprKind::Case {
-            operand,
-            when_then,
-            else_expr,
-        } => {
-            if let Some(operand) = operand {
-                collect_column_id_refs_strict_inner(operand, out)?;
-            }
-            for (when, then) in when_then {
-                collect_column_id_refs_strict_inner(when, out)?;
-                collect_column_id_refs_strict_inner(then, out)?;
-            }
-            if let Some(else_expr) = else_expr {
-                collect_column_id_refs_strict_inner(else_expr, out)?;
-            }
-        }
-        ExprKind::IsTruthValue { expr, .. } => collect_column_id_refs_strict_inner(expr, out)?,
-        ExprKind::Nested(inner) => collect_column_id_refs_strict_inner(inner, out)?,
-        ExprKind::WindowCall {
-            args,
-            partition_by,
-            order_by,
-            ..
-        } => {
-            for arg in args {
-                collect_column_id_refs_strict_inner(arg, out)?;
-            }
-            for expr in partition_by {
-                collect_column_id_refs_strict_inner(expr, out)?;
-            }
-            for item in order_by {
-                collect_column_id_refs_strict_inner(&item.expr, out)?;
-            }
-        }
-        ExprKind::SubqueryPlaceholder { .. } => {}
-        ExprKind::Lambda { body, .. } => {
-            collect_column_id_refs_strict_inner(body, out)?;
-        }
-    }
-    Some(())
-}
+/// Qualified column reference: (qualifier, column), both lowercase.
+pub(crate) type QualifiedRef = (Option<String>, String);
 
 pub(crate) fn collect_scalar_column_id_refs_strict(
     arena: &ScalarArena,
@@ -675,293 +113,6 @@ fn collect_scalar_column_id_refs_strict_inner(
     Some(())
 }
 
-/// Merge a parent's needed columns with additional column names.
-pub(crate) fn merge_needed(parent: Option<&HashSet<String>>, extra: &[&str]) -> HashSet<String> {
-    let mut result = parent.cloned().unwrap_or_default();
-    for col in extra {
-        result.insert(col.to_lowercase());
-    }
-    result
-}
-
-/// Wrap a plan in a Filter if there are remaining (un-pushed) predicates.
-pub(crate) fn wrap_remaining_filter(
-    plan: LogicalPlanNode,
-    remaining: Vec<TypedExpr>,
-) -> LogicalPlanNode {
-    if remaining.is_empty() {
-        plan
-    } else {
-        LogicalPlanNode::new(
-            PlanNodeKind::Filter(LogicalFilterNode {
-                predicate: combine_and(remaining),
-            }),
-            vec![plan],
-            None,
-        )
-    }
-}
-
-/// Qualified column reference: (qualifier, column), both lowercase.
-pub(crate) type QualifiedRef = (Option<String>, String);
-
-/// Collect all column references in an expression, preserving qualifiers.
-///
-/// Unlike [`collect_column_refs`] which returns bare column names, this
-/// function returns `(qualifier, column)` pairs so that self-join predicates
-/// (where both sides have the same column names) can be properly classified.
-pub(crate) fn collect_qualified_column_refs(expr: &TypedExpr) -> Vec<QualifiedRef> {
-    let mut out = Vec::new();
-    collect_qualified_column_refs_inner(expr, &mut out);
-    out
-}
-
-fn collect_qualified_column_refs_inner(expr: &TypedExpr, out: &mut Vec<QualifiedRef>) {
-    match &expr.kind {
-        ExprKind::ColumnRef {
-            qualifier, column, ..
-        } => {
-            out.push((
-                qualifier.as_ref().map(|q| q.to_lowercase()),
-                column.to_lowercase(),
-            ));
-        }
-        ExprKind::LambdaParamRef { .. } => {}
-        ExprKind::BinaryOp { left, right, .. } => {
-            collect_qualified_column_refs_inner(left, out);
-            collect_qualified_column_refs_inner(right, out);
-        }
-        ExprKind::UnaryOp { expr, .. } => collect_qualified_column_refs_inner(expr, out),
-        ExprKind::FunctionCall { args, .. } => {
-            for arg in args {
-                collect_qualified_column_refs_inner(arg, out);
-            }
-        }
-        ExprKind::LambdaFunction { body, .. } => {
-            collect_qualified_column_refs_inner(body, out);
-        }
-        ExprKind::AggregateCall { args, order_by, .. } => {
-            for arg in args {
-                collect_qualified_column_refs_inner(arg, out);
-            }
-            for ob in order_by {
-                collect_qualified_column_refs_inner(&ob.expr, out);
-            }
-        }
-        ExprKind::Cast { expr, .. } => collect_qualified_column_refs_inner(expr, out),
-        ExprKind::IsNull { expr, .. } => collect_qualified_column_refs_inner(expr, out),
-        ExprKind::InList { expr, list, .. } => {
-            collect_qualified_column_refs_inner(expr, out);
-            for item in list {
-                collect_qualified_column_refs_inner(item, out);
-            }
-        }
-        ExprKind::Between {
-            expr, low, high, ..
-        } => {
-            collect_qualified_column_refs_inner(expr, out);
-            collect_qualified_column_refs_inner(low, out);
-            collect_qualified_column_refs_inner(high, out);
-        }
-        ExprKind::Like { expr, pattern, .. } => {
-            collect_qualified_column_refs_inner(expr, out);
-            collect_qualified_column_refs_inner(pattern, out);
-        }
-        ExprKind::Case {
-            operand,
-            when_then,
-            else_expr,
-        } => {
-            if let Some(operand) = operand {
-                collect_qualified_column_refs_inner(operand, out);
-            }
-            for (when, then) in when_then {
-                collect_qualified_column_refs_inner(when, out);
-                collect_qualified_column_refs_inner(then, out);
-            }
-            if let Some(else_expr) = else_expr {
-                collect_qualified_column_refs_inner(else_expr, out);
-            }
-        }
-        ExprKind::IsTruthValue { expr, .. } => collect_qualified_column_refs_inner(expr, out),
-        ExprKind::Nested(inner) => collect_qualified_column_refs_inner(inner, out),
-        ExprKind::Literal(_) => {}
-        ExprKind::WindowCall {
-            args,
-            partition_by,
-            order_by,
-            ..
-        } => {
-            for arg in args {
-                collect_qualified_column_refs_inner(arg, out);
-            }
-            for pb in partition_by {
-                collect_qualified_column_refs_inner(pb, out);
-            }
-            for ob in order_by {
-                collect_qualified_column_refs_inner(&ob.expr, out);
-            }
-        }
-        ExprKind::SubqueryPlaceholder { .. } => {}
-        ExprKind::Lambda { params, body } => {
-            // Filter out lambda-bound parameter names from collected refs.
-            let mut nested = Vec::new();
-            collect_qualified_column_refs_inner(body, &mut nested);
-            let bound: std::collections::HashSet<String> =
-                params.iter().map(|p| p.to_lowercase()).collect();
-            for (qual, name) in nested {
-                if qual.is_some() || !bound.contains(&name) {
-                    out.push((qual, name));
-                }
-            }
-        }
-    }
-}
-
-/// Collect qualified output columns from a plan subtree.
-///
-/// Returns `(qualifier, column_name)` pairs where `qualifier` is the table
-/// alias (for Scan nodes with an alias) or `None`.  Each column also yields a
-/// bare `(None, column_name)` entry so that unqualified references still match.
-pub(crate) fn collect_qualified_output_columns(plan: &LogicalPlanNode) -> HashSet<QualifiedRef> {
-    let mut out = HashSet::new();
-    collect_qualified_output_columns_inner(plan, &mut out);
-    out
-}
-
-fn collect_qualified_output_columns_inner(plan: &LogicalPlanNode, out: &mut HashSet<QualifiedRef>) {
-    match &plan.kind {
-        PlanNodeKind::Scan(s) => {
-            let alias = s
-                .alias
-                .as_ref()
-                .map(|a| a.to_lowercase())
-                .or_else(|| Some(s.table.name.to_lowercase()));
-            for c in &s.columns {
-                let col = c.name.to_lowercase();
-                // Qualified entry: (alias, column)
-                if let Some(ref q) = alias {
-                    out.insert((Some(q.clone()), col.clone()));
-                }
-                // Bare entry: (None, column)
-                out.insert((None, col));
-            }
-        }
-        PlanNodeKind::Filter(_) => collect_qualified_output_columns_inner(plan.unary_input(), out),
-        PlanNodeKind::Project(p) => {
-            for item in &p.items {
-                out.insert((None, item.output_name.to_lowercase()));
-            }
-        }
-        PlanNodeKind::Join(_) => {
-            collect_qualified_output_columns_inner(plan.left(), out);
-            collect_qualified_output_columns_inner(plan.right(), out);
-        }
-        PlanNodeKind::Aggregate(a) => {
-            for c in &a.output_columns {
-                out.insert((None, c.name.to_lowercase()));
-            }
-        }
-        PlanNodeKind::AggregateStateMerge(a) => {
-            for c in &a.output_columns {
-                out.insert((None, c.name.to_lowercase()));
-            }
-        }
-        PlanNodeKind::Sort(_) | PlanNodeKind::Limit(_) => {
-            collect_qualified_output_columns_inner(plan.unary_input(), out)
-        }
-        PlanNodeKind::Window(w) => {
-            for c in &w.output_columns {
-                out.insert((None, c.name.to_lowercase()));
-            }
-        }
-        PlanNodeKind::Union(_) => {
-            if let Some(first) = plan.children.first() {
-                collect_qualified_output_columns_inner(first, out);
-            }
-        }
-        PlanNodeKind::Intersect(_) => {
-            if let Some(first) = plan.children.first() {
-                collect_qualified_output_columns_inner(first, out);
-            }
-        }
-        PlanNodeKind::Except(_) => {
-            if let Some(first) = plan.children.first() {
-                collect_qualified_output_columns_inner(first, out);
-            }
-        }
-        PlanNodeKind::Values(v) => {
-            for c in &v.columns {
-                out.insert((None, c.name.to_lowercase()));
-            }
-        }
-        PlanNodeKind::GenerateSeries(g) => {
-            out.insert((None, g.column_name.to_lowercase()));
-        }
-        PlanNodeKind::TableFunction(t) => {
-            collect_qualified_output_columns_inner(plan.unary_input(), out);
-            for col in &t.output_columns {
-                out.insert((
-                    t.alias.as_ref().map(|alias| alias.to_lowercase()),
-                    col.name.to_lowercase(),
-                ));
-            }
-        }
-        PlanNodeKind::CTEAnchor(_) => {
-            collect_qualified_output_columns_inner(plan.child(1), out);
-        }
-        PlanNodeKind::CTEProduce(p) => {
-            for col in &p.output_columns {
-                out.insert((None, col.name.to_lowercase()));
-            }
-        }
-        PlanNodeKind::Repeat(_) => collect_qualified_output_columns_inner(plan.unary_input(), out),
-        PlanNodeKind::CTEConsume(c) => {
-            let alias_lower = c.alias.to_lowercase();
-            for col in &c.output_columns {
-                let col_name = col.name.to_lowercase();
-                out.insert((Some(alias_lower.clone()), col_name.clone()));
-                out.insert((None, col_name));
-            }
-        }
-        PlanNodeKind::Decode(d) => {
-            collect_qualified_output_columns_inner(plan.unary_input(), out);
-            // Decode adds string output columns alongside the dict inputs.
-            for mapping in &d.mappings {
-                out.insert((None, mapping.string_column.to_lowercase()));
-            }
-        }
-        // Apply's synthesized output column is unqualified; only the left
-        // side contributes qualified refs.
-        // Apply's right child (the subquery) is in a nested scope; its table
-        // qualifications are not visible in the outer query.
-        PlanNodeKind::Apply(_) => collect_qualified_output_columns_inner(plan.left(), out),
-        PlanNodeKind::AssertOneRow(_) => {
-            collect_qualified_output_columns_inner(plan.unary_input(), out)
-        }
-        PlanNodeKind::ImvDelta(_) | PlanNodeKind::ImvVersion(_) => {
-            panic!("imv marker leaked into non-IMV plan");
-        }
-        PlanNodeKind::TopN(_)
-        | PlanNodeKind::Exchange(_)
-        | PlanNodeKind::HashAggregate(_)
-        | PlanNodeKind::HashJoin(_)
-        | PlanNodeKind::NestLoopJoin(_)
-        | PlanNodeKind::SetOp(_) => {
-            panic!("distributed plan node leaked into logical rewrite utility");
-        }
-    }
-}
-
-/// One equi-join key pair, with operands oriented so `left` comes from the
-/// join's left child and `right` from the right child. Operands are the
-/// unwrapped inner `ColumnRef` (Cast/Nested peeled).
-#[derive(Debug)]
-pub(crate) struct JoinEquiKey {
-    pub(crate) left: TypedExpr,
-    pub(crate) right: TypedExpr,
-}
-
 /// ScalarId-native equi-join key pair for the OptExpr rewrite path.
 ///
 /// Operands are ids of the unwrapped inner `ScalarNode::ColumnRef`
@@ -976,121 +127,6 @@ pub(crate) struct ScalarJoinEquiKey {
 enum JoinSide {
     Left,
     Right,
-}
-
-/// Peel `Cast` / `Nested` wrappers and return the inner `ColumnRef` expr, if any.
-fn unwrap_column_ref(expr: &TypedExpr) -> Option<&TypedExpr> {
-    match &expr.kind {
-        ExprKind::ColumnRef { .. } => Some(expr),
-        ExprKind::Cast { expr, .. } | ExprKind::Nested(expr) => unwrap_column_ref(expr),
-        _ => None,
-    }
-}
-
-/// Classify a join-condition operand as left/right child column, returning the
-/// unwrapped inner `ColumnRef` clone. `None` if it is not a column unambiguously
-/// owned by exactly one side (constants, expressions, ambiguous self-join refs).
-fn classify_operand(
-    expr: &TypedExpr,
-    left_ids: &HashSet<crate::sql::column_id::ColumnId>,
-    right_ids: &HashSet<crate::sql::column_id::ColumnId>,
-    left_cols: &HashSet<QualifiedRef>,
-    right_cols: &HashSet<QualifiedRef>,
-) -> Option<(JoinSide, TypedExpr)> {
-    let inner = unwrap_column_ref(expr)?;
-    let ExprKind::ColumnRef {
-        column_id,
-        qualifier,
-        column,
-    } = &inner.kind
-    else {
-        unreachable!("unwrap_column_ref only returns a ColumnRef expression");
-    };
-    if *column_id != crate::sql::column_id::ColumnId::UNSET {
-        match (left_ids.contains(column_id), right_ids.contains(column_id)) {
-            (true, false) => return Some((JoinSide::Left, inner.clone())),
-            (false, true) => return Some((JoinSide::Right, inner.clone())),
-            _ => {}
-        }
-    }
-
-    let key = (
-        qualifier.as_ref().map(|q| q.to_lowercase()),
-        column.to_lowercase(),
-    );
-    match (left_cols.contains(&key), right_cols.contains(&key)) {
-        (true, false) => Some((JoinSide::Left, inner.clone())),
-        (false, true) => Some((JoinSide::Right, inner.clone())),
-        _ => None,
-    }
-}
-
-/// Extract equi-join key pairs from a join's ON condition (lenient: walks the
-/// top-level AND chain and keeps every `col = col` conjunct it can orient,
-/// ignoring other conjuncts). Returns empty when there is no usable equi key.
-pub(crate) fn join_equi_keys(
-    join: &LogicalJoinNode,
-    left: &LogicalPlanNode,
-    right: &LogicalPlanNode,
-) -> Vec<JoinEquiKey> {
-    let Some(condition) = join.condition.as_ref() else {
-        return Vec::new();
-    };
-    let left_cols = collect_qualified_output_columns(left);
-    let right_cols = collect_qualified_output_columns(right);
-    let left_ids = collect_output_ids(left);
-    let right_ids = collect_output_ids(right);
-    let mut keys = Vec::new();
-    collect_join_equi_keys(
-        condition,
-        &left_ids,
-        &right_ids,
-        &left_cols,
-        &right_cols,
-        &mut keys,
-    );
-    keys
-}
-
-fn collect_join_equi_keys(
-    expr: &TypedExpr,
-    left_ids: &HashSet<crate::sql::column_id::ColumnId>,
-    right_ids: &HashSet<crate::sql::column_id::ColumnId>,
-    left_cols: &HashSet<QualifiedRef>,
-    right_cols: &HashSet<QualifiedRef>,
-    keys: &mut Vec<JoinEquiKey>,
-) {
-    match &expr.kind {
-        ExprKind::BinaryOp {
-            left,
-            op: BinOp::And,
-            right,
-        } => {
-            collect_join_equi_keys(left, left_ids, right_ids, left_cols, right_cols, keys);
-            collect_join_equi_keys(right, left_ids, right_ids, left_cols, right_cols, keys);
-        }
-        // Only strict `Eq`. `EqForNull` (<=>) is null-safe (NULL <=> NULL is
-        // true), so deriving IS NOT NULL on its operands would change results;
-        // it is intentionally excluded (matches StarRocks `isEqual()`).
-        ExprKind::BinaryOp {
-            left,
-            op: BinOp::Eq,
-            right,
-        } => match (
-            classify_operand(left, left_ids, right_ids, left_cols, right_cols),
-            classify_operand(right, left_ids, right_ids, left_cols, right_cols),
-        ) {
-            (Some((JoinSide::Left, le)), Some((JoinSide::Right, re)))
-            | (Some((JoinSide::Right, re)), Some((JoinSide::Left, le))) => {
-                keys.push(JoinEquiKey {
-                    left: le,
-                    right: re,
-                });
-            }
-            _ => {}
-        },
-        _ => {}
-    }
 }
 
 fn unwrap_scalar_column_ref(arena: &ScalarArena, expr: ScalarId) -> Option<ScalarId> {
@@ -1371,20 +407,6 @@ fn collect_qualified_output_columns_opt_inner(expr: &OptExpr, out: &mut HashSet<
     }
 }
 
-/// Wrap an `OptExpr` in a `LogicalFilter` if there are remaining conjuncts.
-/// Each `TypedExpr` in `remaining` is interned into `arena`.
-pub(crate) fn wrap_remaining_filter_opt(
-    plan: OptExpr,
-    remaining: Vec<TypedExpr>,
-    arena: &mut ScalarArena,
-) -> OptExpr {
-    if remaining.is_empty() {
-        return plan;
-    }
-    let predicate = scalar::intern_typed(arena, &combine_and(remaining));
-    OptExpr::new(Operator::LogicalFilter(FilterOp { predicate }), vec![plan])
-}
-
 /// Wrap an `OptExpr` in a `LogicalFilter` if scalar conjuncts remain.
 pub(crate) fn wrap_remaining_filter_opt_scalar(
     plan: OptExpr,
@@ -1429,11 +451,405 @@ pub(crate) fn join_equi_keys_opt(
 }
 
 #[cfg(test)]
+pub(crate) use typed_legacy::{
+    JoinEquiKey, collect_column_id_refs, collect_output_ids, collect_output_ids_ordered,
+    join_equi_keys, split_and,
+};
+
+#[cfg(test)]
+mod typed_legacy {
+    use std::collections::HashSet;
+
+    use arrow::datatypes::DataType;
+
+    use super::{JoinSide, QualifiedRef};
+    use crate::sql::analysis::{BinOp, ExprKind, TypedExpr};
+    use crate::sql::column_id::ColumnId;
+    use crate::sql::planner::plan::*;
+
+    #[derive(Debug)]
+    pub(crate) struct JoinEquiKey {
+        pub(crate) left: TypedExpr,
+        pub(crate) right: TypedExpr,
+    }
+
+    pub(crate) fn split_and(expr: TypedExpr) -> Vec<TypedExpr> {
+        let mut out = Vec::new();
+        split_and_inner(expr, &mut out);
+        out
+    }
+
+    fn split_and_inner(expr: TypedExpr, out: &mut Vec<TypedExpr>) {
+        match expr.kind {
+            ExprKind::BinaryOp {
+                left,
+                op: BinOp::And,
+                right,
+            } => {
+                split_and_inner(*left, out);
+                split_and_inner(*right, out);
+            }
+            _ => out.push(expr),
+        }
+    }
+
+    fn combine_and(mut exprs: Vec<TypedExpr>) -> TypedExpr {
+        assert!(!exprs.is_empty());
+        let mut result = exprs.pop().unwrap();
+        while let Some(left) = exprs.pop() {
+            result = TypedExpr {
+                data_type: DataType::Boolean,
+                nullable: left.nullable || result.nullable,
+                kind: ExprKind::BinaryOp {
+                    left: Box::new(left),
+                    op: BinOp::And,
+                    right: Box::new(result),
+                },
+            };
+        }
+        result
+    }
+
+    pub(crate) fn collect_column_id_refs(expr: &TypedExpr) -> HashSet<ColumnId> {
+        let mut out = HashSet::new();
+        collect_column_id_refs_inner(expr, &mut out);
+        out
+    }
+
+    fn collect_column_id_refs_inner(expr: &TypedExpr, out: &mut HashSet<ColumnId>) {
+        match &expr.kind {
+            ExprKind::ColumnRef { column_id, .. } => {
+                if *column_id != ColumnId::UNSET {
+                    out.insert(*column_id);
+                }
+            }
+            ExprKind::LambdaParamRef { .. } | ExprKind::Literal(_) => {}
+            ExprKind::BinaryOp { left, right, .. } => {
+                collect_column_id_refs_inner(left, out);
+                collect_column_id_refs_inner(right, out);
+            }
+            ExprKind::UnaryOp { expr, .. }
+            | ExprKind::Cast { expr, .. }
+            | ExprKind::IsNull { expr, .. }
+            | ExprKind::IsTruthValue { expr, .. }
+            | ExprKind::Nested(expr) => collect_column_id_refs_inner(expr, out),
+            ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
+                for arg in args {
+                    collect_column_id_refs_inner(arg, out);
+                }
+                if let ExprKind::AggregateCall { order_by, .. } = &expr.kind {
+                    for item in order_by {
+                        collect_column_id_refs_inner(&item.expr, out);
+                    }
+                }
+            }
+            ExprKind::LambdaFunction { body, .. } | ExprKind::Lambda { body, .. } => {
+                collect_column_id_refs_inner(body, out);
+            }
+            ExprKind::InList { expr, list, .. } => {
+                collect_column_id_refs_inner(expr, out);
+                for item in list {
+                    collect_column_id_refs_inner(item, out);
+                }
+            }
+            ExprKind::Between {
+                expr, low, high, ..
+            } => {
+                collect_column_id_refs_inner(expr, out);
+                collect_column_id_refs_inner(low, out);
+                collect_column_id_refs_inner(high, out);
+            }
+            ExprKind::Like { expr, pattern, .. } => {
+                collect_column_id_refs_inner(expr, out);
+                collect_column_id_refs_inner(pattern, out);
+            }
+            ExprKind::Case {
+                operand,
+                when_then,
+                else_expr,
+            } => {
+                if let Some(operand) = operand {
+                    collect_column_id_refs_inner(operand, out);
+                }
+                for (when, then) in when_then {
+                    collect_column_id_refs_inner(when, out);
+                    collect_column_id_refs_inner(then, out);
+                }
+                if let Some(else_expr) = else_expr {
+                    collect_column_id_refs_inner(else_expr, out);
+                }
+            }
+            ExprKind::WindowCall {
+                args,
+                partition_by,
+                order_by,
+                ..
+            } => {
+                for arg in args {
+                    collect_column_id_refs_inner(arg, out);
+                }
+                for expr in partition_by {
+                    collect_column_id_refs_inner(expr, out);
+                }
+                for item in order_by {
+                    collect_column_id_refs_inner(&item.expr, out);
+                }
+            }
+            ExprKind::SubqueryPlaceholder { .. } => {}
+        }
+    }
+
+    pub(crate) fn collect_output_ids_ordered(plan: &LogicalPlanNode) -> Vec<ColumnId> {
+        match &plan.kind {
+            PlanNodeKind::Scan(s) => s.columns.iter().map(|c| c.column_id).collect(),
+            PlanNodeKind::Project(p) => p
+                .items
+                .iter()
+                .map(|item| item.output_column_id)
+                .filter(|id| *id != ColumnId::UNSET)
+                .collect(),
+            PlanNodeKind::Aggregate(a) => a.output_columns.iter().map(|c| c.column_id).collect(),
+            PlanNodeKind::Window(w) => w.output_columns.iter().map(|c| c.column_id).collect(),
+            PlanNodeKind::CTEProduce(p) => p.output_columns.iter().map(|c| c.column_id).collect(),
+            PlanNodeKind::CTEConsume(c) => c.output_columns.iter().map(|c| c.column_id).collect(),
+            PlanNodeKind::Union(u) => u.output_columns.iter().map(|c| c.column_id).collect(),
+            PlanNodeKind::Intersect(i) => i.output_columns.iter().map(|c| c.column_id).collect(),
+            PlanNodeKind::Except(e) => e.output_columns.iter().map(|c| c.column_id).collect(),
+            PlanNodeKind::Decode(d) => d.output_columns.iter().map(|c| c.column_id).collect(),
+            PlanNodeKind::AggregateStateMerge(a) => {
+                a.output_columns.iter().map(|c| c.column_id).collect()
+            }
+            PlanNodeKind::Values(v) => v.columns.iter().map(|c| c.column_id).collect(),
+            PlanNodeKind::GenerateSeries(g) => {
+                if g.output_column_id == ColumnId::UNSET {
+                    vec![]
+                } else {
+                    vec![g.output_column_id]
+                }
+            }
+            PlanNodeKind::Filter(_)
+            | PlanNodeKind::Sort(_)
+            | PlanNodeKind::Limit(_)
+            | PlanNodeKind::Repeat(_) => collect_output_ids_ordered(plan.unary_input()),
+            PlanNodeKind::TableFunction(t) => {
+                let mut ids = collect_output_ids_ordered(plan.unary_input());
+                ids.extend(t.output_columns.iter().map(|c| c.column_id));
+                ids
+            }
+            PlanNodeKind::Join(_) => {
+                let mut ids = collect_output_ids_ordered(plan.left());
+                ids.extend(collect_output_ids_ordered(plan.right()));
+                ids
+            }
+            PlanNodeKind::CTEAnchor(_) => collect_output_ids_ordered(plan.child(1)),
+            PlanNodeKind::Apply(a) => {
+                let mut ids = collect_output_ids_ordered(plan.left());
+                ids.push(a.output_column.column_id);
+                ids
+            }
+            PlanNodeKind::AssertOneRow(_) => collect_output_ids_ordered(plan.unary_input()),
+            PlanNodeKind::ImvDelta(_) | PlanNodeKind::ImvVersion(_) => {
+                panic!("imv marker should not appear in non-IMV pruning")
+            }
+            PlanNodeKind::TopN(_)
+            | PlanNodeKind::Exchange(_)
+            | PlanNodeKind::HashAggregate(_)
+            | PlanNodeKind::HashJoin(_)
+            | PlanNodeKind::NestLoopJoin(_)
+            | PlanNodeKind::SetOp(_) => {
+                panic!("distributed plan node leaked into logical rewrite utility");
+            }
+        }
+    }
+
+    pub(crate) fn collect_output_ids(plan: &LogicalPlanNode) -> HashSet<ColumnId> {
+        collect_output_ids_ordered(plan).into_iter().collect()
+    }
+
+    fn collect_qualified_output_columns(plan: &LogicalPlanNode) -> HashSet<QualifiedRef> {
+        let mut out = HashSet::new();
+        collect_qualified_output_columns_inner(plan, &mut out);
+        out
+    }
+
+    fn collect_qualified_output_columns_inner(
+        plan: &LogicalPlanNode,
+        out: &mut HashSet<QualifiedRef>,
+    ) {
+        match &plan.kind {
+            PlanNodeKind::Scan(s) => {
+                let alias = s
+                    .alias
+                    .as_ref()
+                    .map(|a| a.to_lowercase())
+                    .or_else(|| Some(s.table.name.to_lowercase()));
+                for c in &s.columns {
+                    let col = c.name.to_lowercase();
+                    if let Some(ref q) = alias {
+                        out.insert((Some(q.clone()), col.clone()));
+                    }
+                    out.insert((None, col));
+                }
+            }
+            PlanNodeKind::Filter(_) | PlanNodeKind::Sort(_) | PlanNodeKind::Limit(_) => {
+                collect_qualified_output_columns_inner(plan.unary_input(), out)
+            }
+            PlanNodeKind::Project(p) => {
+                for item in &p.items {
+                    out.insert((None, item.output_name.to_lowercase()));
+                }
+            }
+            PlanNodeKind::Join(_) => {
+                collect_qualified_output_columns_inner(plan.left(), out);
+                collect_qualified_output_columns_inner(plan.right(), out);
+            }
+            PlanNodeKind::Aggregate(a) => {
+                for c in &a.output_columns {
+                    out.insert((None, c.name.to_lowercase()));
+                }
+            }
+            PlanNodeKind::Values(v) => {
+                for c in &v.columns {
+                    out.insert((None, c.name.to_lowercase()));
+                }
+            }
+            PlanNodeKind::CTEAnchor(_) => {
+                collect_qualified_output_columns_inner(plan.child(1), out);
+            }
+            PlanNodeKind::CTEConsume(c) => {
+                let alias_lower = c.alias.to_lowercase();
+                for col in &c.output_columns {
+                    let col_name = col.name.to_lowercase();
+                    out.insert((Some(alias_lower.clone()), col_name.clone()));
+                    out.insert((None, col_name));
+                }
+            }
+            PlanNodeKind::Apply(_) => collect_qualified_output_columns_inner(plan.left(), out),
+            PlanNodeKind::AssertOneRow(_) | PlanNodeKind::Repeat(_) => {
+                collect_qualified_output_columns_inner(plan.unary_input(), out)
+            }
+            _ => {}
+        }
+    }
+
+    fn unwrap_column_ref(expr: &TypedExpr) -> Option<&TypedExpr> {
+        match &expr.kind {
+            ExprKind::ColumnRef { .. } => Some(expr),
+            ExprKind::Cast { expr, .. } | ExprKind::Nested(expr) => unwrap_column_ref(expr),
+            _ => None,
+        }
+    }
+
+    fn classify_operand(
+        expr: &TypedExpr,
+        left_ids: &HashSet<ColumnId>,
+        right_ids: &HashSet<ColumnId>,
+        left_cols: &HashSet<QualifiedRef>,
+        right_cols: &HashSet<QualifiedRef>,
+    ) -> Option<(JoinSide, TypedExpr)> {
+        let inner = unwrap_column_ref(expr)?;
+        let ExprKind::ColumnRef {
+            column_id,
+            qualifier,
+            column,
+        } = &inner.kind
+        else {
+            unreachable!("unwrap_column_ref only returns a ColumnRef expression");
+        };
+        if *column_id != ColumnId::UNSET {
+            match (left_ids.contains(column_id), right_ids.contains(column_id)) {
+                (true, false) => return Some((JoinSide::Left, inner.clone())),
+                (false, true) => return Some((JoinSide::Right, inner.clone())),
+                _ => {}
+            }
+        }
+
+        let key = (
+            qualifier.as_ref().map(|q| q.to_lowercase()),
+            column.to_lowercase(),
+        );
+        match (left_cols.contains(&key), right_cols.contains(&key)) {
+            (true, false) => Some((JoinSide::Left, inner.clone())),
+            (false, true) => Some((JoinSide::Right, inner.clone())),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn join_equi_keys(
+        join: &LogicalJoinNode,
+        left: &LogicalPlanNode,
+        right: &LogicalPlanNode,
+    ) -> Vec<JoinEquiKey> {
+        let Some(condition) = join.condition.as_ref() else {
+            return Vec::new();
+        };
+        let left_cols = collect_qualified_output_columns(left);
+        let right_cols = collect_qualified_output_columns(right);
+        let left_ids = collect_output_ids(left);
+        let right_ids = collect_output_ids(right);
+        let mut keys = Vec::new();
+        collect_join_equi_keys(
+            condition,
+            &left_ids,
+            &right_ids,
+            &left_cols,
+            &right_cols,
+            &mut keys,
+        );
+        keys
+    }
+
+    fn collect_join_equi_keys(
+        expr: &TypedExpr,
+        left_ids: &HashSet<ColumnId>,
+        right_ids: &HashSet<ColumnId>,
+        left_cols: &HashSet<QualifiedRef>,
+        right_cols: &HashSet<QualifiedRef>,
+        keys: &mut Vec<JoinEquiKey>,
+    ) {
+        match &expr.kind {
+            ExprKind::BinaryOp {
+                left,
+                op: BinOp::And,
+                right,
+            } => {
+                collect_join_equi_keys(left, left_ids, right_ids, left_cols, right_cols, keys);
+                collect_join_equi_keys(right, left_ids, right_ids, left_cols, right_cols, keys);
+            }
+            ExprKind::BinaryOp {
+                left,
+                op: BinOp::Eq,
+                right,
+            } => match (
+                classify_operand(left, left_ids, right_ids, left_cols, right_cols),
+                classify_operand(right, left_ids, right_ids, left_cols, right_cols),
+            ) {
+                (Some((JoinSide::Left, le)), Some((JoinSide::Right, re)))
+                | (Some((JoinSide::Right, re)), Some((JoinSide::Left, le))) => {
+                    keys.push(JoinEquiKey {
+                        left: le,
+                        right: re,
+                    });
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    #[allow(dead_code)]
+    fn _combine_and_for_legacy_tests(exprs: Vec<TypedExpr>) -> TypedExpr {
+        combine_and(exprs)
+    }
+}
+
+#[cfg(test)]
 mod column_id_helper_tests {
     use super::*;
-    use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem};
+    use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::planner::plan::*;
     use arrow::datatypes::DataType;
 
     // -----------------------------------------------------------------------
