@@ -201,6 +201,9 @@ def production_hits(path: Path):
         if not stripped_code:
             continue
 
+        if "#![cfg(test)]" in code_line:
+            break
+
         test_attr_start = code_line.find("#[cfg(test)]")
         if test_attr_start != -1:
             after_attr = code_line[test_attr_start + len("#[cfg(test)]") :]

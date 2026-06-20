@@ -117,6 +117,7 @@ fn collect_column_ids_strict_inner(
 
 pub(crate) fn split_conjuncts(arena: &ScalarArena, expr: ScalarId, out: &mut Vec<ScalarId>) {
     match arena.node(expr) {
+        ScalarNode::Nested(inner) => split_conjuncts(arena, *inner, out),
         ScalarNode::BinaryOp {
             op: BinOp::And,
             left,
@@ -133,12 +134,42 @@ pub(crate) fn combine_conjuncts(
     arena: &mut ScalarArena,
     mut exprs: Vec<ScalarId>,
 ) -> Option<ScalarId> {
+    combine_binary_bool(arena, &mut exprs, BinOp::And)
+}
+
+pub(crate) fn split_disjuncts(arena: &ScalarArena, expr: ScalarId, out: &mut Vec<ScalarId>) {
+    match arena.node(expr) {
+        ScalarNode::Nested(inner) => split_disjuncts(arena, *inner, out),
+        ScalarNode::BinaryOp {
+            op: BinOp::Or,
+            left,
+            right,
+        } => {
+            split_disjuncts(arena, *left, out);
+            split_disjuncts(arena, *right, out);
+        }
+        _ => out.push(expr),
+    }
+}
+
+pub(crate) fn combine_disjuncts(
+    arena: &mut ScalarArena,
+    mut exprs: Vec<ScalarId>,
+) -> Option<ScalarId> {
+    combine_binary_bool(arena, &mut exprs, BinOp::Or)
+}
+
+fn combine_binary_bool(
+    arena: &mut ScalarArena,
+    exprs: &mut Vec<ScalarId>,
+    op: BinOp,
+) -> Option<ScalarId> {
     let mut result = exprs.pop()?;
     while let Some(next) = exprs.pop() {
         let nullable = arena.nullable(next) || arena.nullable(result);
         result = arena.intern(
             ScalarNode::BinaryOp {
-                op: BinOp::And,
+                op,
                 left: next,
                 right: result,
             },
@@ -237,6 +268,105 @@ pub(crate) fn contains_aggregate(arena: &ScalarArena, expr: ScalarId) -> bool {
 
 pub(crate) fn sort_key_column_id(arena: &ScalarArena, key: &SortKey) -> Option<ColumnId> {
     column_id(arena, key.expr)
+}
+
+pub(crate) fn is_true_literal(arena: &ScalarArena, expr: ScalarId) -> bool {
+    matches!(
+        arena.node(expr),
+        ScalarNode::Literal(HashableLiteral(LiteralValue::Bool(true)))
+    )
+}
+
+pub(crate) fn contains_non_deterministic_function(arena: &ScalarArena, expr: ScalarId) -> bool {
+    match arena.node(expr) {
+        ScalarNode::FunctionCall { name, args, .. } => {
+            let lower = name.to_lowercase();
+            matches!(
+                lower.as_str(),
+                "rand"
+                    | "random"
+                    | "uuid"
+                    | "now"
+                    | "current_timestamp"
+                    | "current_date"
+                    | "curdate"
+                    | "current_time"
+                    | "curtime"
+                    | "localtime"
+                    | "localtimestamp"
+                    | "utc_timestamp"
+                    | "utc_time"
+            ) || args
+                .iter()
+                .any(|arg| contains_non_deterministic_function(arena, *arg))
+        }
+        ScalarNode::AggregateCall { args, order_by, .. } => {
+            args.iter()
+                .any(|arg| contains_non_deterministic_function(arena, *arg))
+                || order_by
+                    .iter()
+                    .any(|item| contains_non_deterministic_function(arena, item.expr))
+        }
+        ScalarNode::WindowCall {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            args.iter()
+                .any(|arg| contains_non_deterministic_function(arena, *arg))
+                || partition_by
+                    .iter()
+                    .any(|expr| contains_non_deterministic_function(arena, *expr))
+                || order_by
+                    .iter()
+                    .any(|item| contains_non_deterministic_function(arena, item.expr))
+        }
+        ScalarNode::BinaryOp { left, right, .. } => {
+            contains_non_deterministic_function(arena, *left)
+                || contains_non_deterministic_function(arena, *right)
+        }
+        ScalarNode::UnaryOp { child, .. }
+        | ScalarNode::Cast { child, .. }
+        | ScalarNode::IsNull { child, .. }
+        | ScalarNode::IsTruthValue { child, .. }
+        | ScalarNode::Nested(child) => contains_non_deterministic_function(arena, *child),
+        ScalarNode::InList { child, list, .. } => {
+            contains_non_deterministic_function(arena, *child)
+                || list
+                    .iter()
+                    .any(|item| contains_non_deterministic_function(arena, *item))
+        }
+        ScalarNode::Between {
+            child, low, high, ..
+        } => {
+            contains_non_deterministic_function(arena, *child)
+                || contains_non_deterministic_function(arena, *low)
+                || contains_non_deterministic_function(arena, *high)
+        }
+        ScalarNode::Like { child, pattern, .. } => {
+            contains_non_deterministic_function(arena, *child)
+                || contains_non_deterministic_function(arena, *pattern)
+        }
+        ScalarNode::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            operand.is_some_and(|expr| contains_non_deterministic_function(arena, expr))
+                || when_then.iter().any(|(when, then)| {
+                    contains_non_deterministic_function(arena, *when)
+                        || contains_non_deterministic_function(arena, *then)
+                })
+                || else_expr.is_some_and(|expr| contains_non_deterministic_function(arena, expr))
+        }
+        ScalarNode::LambdaFunction { body, .. } | ScalarNode::Lambda { body, .. } => {
+            contains_non_deterministic_function(arena, *body)
+        }
+        ScalarNode::ColumnRef(_) | ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {
+            false
+        }
+    }
 }
 
 #[cfg(test)]

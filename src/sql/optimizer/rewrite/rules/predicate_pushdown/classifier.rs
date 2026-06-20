@@ -107,6 +107,7 @@ mod tests {
     use crate::sql::optimizer::rewrite::rules::predicate_pushdown::predicate_group::{
         PredicateDerivedKind, PredicateGroup, PredicateOrigin,
     };
+    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
     use arrow::datatypes::DataType;
     use std::collections::HashSet;
 
@@ -142,8 +143,14 @@ mod tests {
         }
     }
 
-    fn group(expr: TypedExpr) -> PredicateGroup {
-        PredicateGroup::new(expr, PredicateOrigin::Filter, PredicateDerivedKind::None)
+    fn group(arena: &mut ScalarArena, expr: TypedExpr) -> PredicateGroup {
+        let expr = intern_typed(arena, &expr);
+        PredicateGroup::new(
+            arena,
+            expr,
+            PredicateOrigin::Filter,
+            PredicateDerivedKind::None,
+        )
     }
 
     fn ids(values: &[u32]) -> HashSet<ColumnId> {
@@ -152,14 +159,15 @@ mod tests {
 
     #[test]
     fn inner_join_classifies_left_right_and_join_groups_by_column_id() {
+        let mut arena = ScalarArena::new();
         let placement = classify_predicate_groups(
             JoinKind::Inner,
             &ids(&[1]),
             &ids(&[2]),
             vec![
-                group(eq(col("a", 1), int_lit(10))),
-                group(eq(col("b", 2), int_lit(20))),
-                group(eq(col("a", 1), col("b", 2))),
+                group(&mut arena, eq(col("a", 1), int_lit(10))),
+                group(&mut arena, eq(col("b", 2), int_lit(20))),
+                group(&mut arena, eq(col("a", 1), col("b", 2))),
             ],
         );
 
@@ -171,11 +179,12 @@ mod tests {
 
     #[test]
     fn left_outer_keeps_right_filter_above_join() {
+        let mut arena = ScalarArena::new();
         let placement = classify_predicate_groups(
             JoinKind::LeftOuter,
             &ids(&[1]),
             &ids(&[2]),
-            vec![group(eq(col("b", 2), int_lit(20)))],
+            vec![group(&mut arena, eq(col("b", 2), int_lit(20)))],
         );
 
         assert!(placement.right_pushdown.is_empty());
@@ -184,13 +193,14 @@ mod tests {
 
     #[test]
     fn full_outer_keeps_single_side_filters_above_join() {
+        let mut arena = ScalarArena::new();
         let placement = classify_predicate_groups(
             JoinKind::FullOuter,
             &ids(&[1]),
             &ids(&[2]),
             vec![
-                group(eq(col("a", 1), int_lit(10))),
-                group(eq(col("b", 2), int_lit(20))),
+                group(&mut arena, eq(col("a", 1), int_lit(10))),
+                group(&mut arena, eq(col("b", 2), int_lit(20))),
             ],
         );
 
@@ -199,11 +209,12 @@ mod tests {
 
     #[test]
     fn null_aware_left_anti_pushes_left_filter_to_probe_side() {
+        let mut arena = ScalarArena::new();
         let placement = classify_predicate_groups(
             JoinKind::NullAwareLeftAnti,
             &ids(&[1]),
             &ids(&[2]),
-            vec![group(eq(col("a", 1), int_lit(10)))],
+            vec![group(&mut arena, eq(col("a", 1), int_lit(10)))],
         );
 
         assert_eq!(placement.left_pushdown.len(), 1);
@@ -212,11 +223,12 @@ mod tests {
 
     #[test]
     fn constants_follow_left_pushdown_guard() {
+        let mut arena = ScalarArena::new();
         let inner = classify_predicate_groups(
             JoinKind::Inner,
             &ids(&[1]),
             &ids(&[2]),
-            vec![group(eq(int_lit(1), int_lit(1)))],
+            vec![group(&mut arena, eq(int_lit(1), int_lit(1)))],
         );
         assert_eq!(inner.left_pushdown.len(), 1);
         assert!(inner.remain_above_join.is_empty());
@@ -225,7 +237,7 @@ mod tests {
             JoinKind::LeftOuter,
             &ids(&[1]),
             &ids(&[2]),
-            vec![group(eq(int_lit(1), int_lit(1)))],
+            vec![group(&mut arena, eq(int_lit(1), int_lit(1)))],
         );
         assert_eq!(left_outer.left_pushdown.len(), 1);
         assert!(left_outer.remain_above_join.is_empty());
@@ -234,7 +246,7 @@ mod tests {
             JoinKind::FullOuter,
             &ids(&[1]),
             &ids(&[2]),
-            vec![group(eq(int_lit(1), int_lit(1)))],
+            vec![group(&mut arena, eq(int_lit(1), int_lit(1)))],
         );
         assert!(full_outer.left_pushdown.is_empty());
         assert_eq!(full_outer.remain_above_join.len(), 1);
@@ -242,11 +254,12 @@ mod tests {
 
     #[test]
     fn unknown_and_overlapping_column_ids_remain_above_join() {
+        let mut arena = ScalarArena::new();
         let unknown = classify_predicate_groups(
             JoinKind::Inner,
             &ids(&[1]),
             &ids(&[2]),
-            vec![group(eq(col("c", 3), int_lit(30)))],
+            vec![group(&mut arena, eq(col("c", 3), int_lit(30)))],
         );
         assert_eq!(unknown.remain_above_join.len(), 1);
         assert!(unknown.left_pushdown.is_empty());
@@ -257,7 +270,7 @@ mod tests {
             JoinKind::Inner,
             &ids(&[1]),
             &ids(&[1]),
-            vec![group(eq(col("a", 1), int_lit(10)))],
+            vec![group(&mut arena, eq(col("a", 1), int_lit(10)))],
         );
         assert_eq!(overlapping.remain_above_join.len(), 1);
         assert!(overlapping.left_pushdown.is_empty());

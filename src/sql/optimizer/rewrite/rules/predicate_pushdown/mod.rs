@@ -15,7 +15,6 @@
 
 pub(crate) mod classifier;
 pub(crate) mod deriver;
-pub(crate) mod join_pushdown;
 pub(crate) mod move_around;
 pub(crate) mod predicate_group;
 pub(crate) mod push_through_project;

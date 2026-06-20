@@ -8,7 +8,6 @@
 
 use std::collections::HashSet;
 
-use crate::sql::analysis::TypedExpr;
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
@@ -17,9 +16,9 @@ use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
 use crate::sql::optimizer::rewrite::rules::predicate_pushdown::predicate_group::predicate_key as canonical_predicate_key;
 use crate::sql::optimizer::rewrite::rules::utils::{
-    collect_column_id_refs_strict, collect_output_ids_opt, split_and, wrap_remaining_filter_opt,
+    collect_output_ids_opt, wrap_remaining_filter_opt_scalar,
 };
-use crate::sql::optimizer::scalar;
+use crate::sql::optimizer::scalar_expr;
 
 pub(crate) struct PushDownPredicateScan;
 
@@ -64,12 +63,11 @@ impl LogicalRewriteRule for PushDownPredicateScan {
         };
 
         let arena_rc = ctx.scalar_arena();
-        let predicate_typed = {
+        let mut conjuncts = Vec::new();
+        {
             let arena = arena_rc.borrow();
-            scalar::materialize(&arena, filter.predicate)
-        };
-
-        let conjuncts = split_and(predicate_typed);
+            scalar_expr::split_conjuncts(&arena, filter.predicate, &mut conjuncts);
+        }
 
         // Build a temporary OptExpr to use collect_output_ids_opt.
         let scan_for_ids = OptExpr {
@@ -85,21 +83,21 @@ impl LogicalRewriteRule for PushDownPredicateScan {
             let arena = arena_rc.borrow();
             scan.predicates
                 .iter()
-                .map(|id| predicate_key(&scalar::materialize(&arena, *id)))
+                .map(|id| predicate_key(&arena, *id))
                 .collect()
         };
 
         let mut pushed_any = false;
-        let mut remaining: Vec<TypedExpr> = Vec::new();
+        let mut remaining = Vec::new();
         for conj in conjuncts {
-            let Some(refs) = collect_column_id_refs_strict(&conj) else {
+            let Some(refs) = scalar_expr::collect_column_ids_strict(&arena_rc.borrow(), conj)
+            else {
                 remaining.push(conj);
                 continue;
             };
             if refs.is_empty() || refs.iter().all(|id| scan_ids.contains(id)) {
-                if seen.insert(predicate_key(&conj)) {
-                    let interned = scalar::intern_typed(&mut arena_rc.borrow_mut(), &conj);
-                    scan.predicates.push(interned);
+                if seen.insert(predicate_key(&arena_rc.borrow(), conj)) {
+                    scan.predicates.push(conj);
                 }
                 pushed_any = true;
             } else {
@@ -117,14 +115,18 @@ impl LogicalRewriteRule for PushDownPredicateScan {
             required_output_columns,
         };
 
-        let result = wrap_remaining_filter_opt(new_scan, remaining, &mut arena_rc.borrow_mut());
+        let result =
+            wrap_remaining_filter_opt_scalar(new_scan, remaining, &mut arena_rc.borrow_mut());
         Ok(RewriteResult::Changed(result))
     }
 }
 
 /// Canonical key for structural predicate equality.
-fn predicate_key(expr: &TypedExpr) -> String {
-    canonical_predicate_key(expr).as_str().to_string()
+fn predicate_key(
+    arena: &crate::sql::optimizer::scalar::ScalarArena,
+    expr: crate::sql::optimizer::scalar::ScalarId,
+) -> String {
+    canonical_predicate_key(arena, expr).as_str().to_string()
 }
 
 #[cfg(test)]

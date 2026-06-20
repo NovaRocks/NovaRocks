@@ -16,7 +16,7 @@
 //! Mirrors legacy `push_semi_condition_into_children` from
 //! `src/sql/optimizer/predicate_pushdown.rs`. Migrated to `OptExpr` / `LogicalRewriteRule`.
 
-use crate::sql::analysis::{JoinKind, TypedExpr};
+use crate::sql::analysis::JoinKind;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::{FilterOp, LogicalJoinOp, Operator};
 use crate::sql::optimizer::opt_expr::OptExpr;
@@ -24,10 +24,9 @@ use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::optimizer::rewrite::rules::utils::{
-    collect_column_id_refs_strict, collect_output_ids_opt, combine_and, split_and,
-};
-use crate::sql::optimizer::scalar;
+use crate::sql::optimizer::rewrite::rules::utils::collect_output_ids_opt;
+use crate::sql::optimizer::scalar::ScalarId;
+use crate::sql::optimizer::scalar_expr;
 
 pub(crate) struct PushSemiAntiRightOnlyCondition;
 
@@ -71,21 +70,20 @@ impl LogicalRewriteRule for PushSemiAntiRightOnlyCondition {
         let arena_rc = ctx.scalar_arena();
         let mut arena = arena_rc.borrow_mut();
 
-        // Materialize the join condition.
-        let condition = scalar::materialize(&arena, cond_id);
-
-        let conjuncts = split_and(condition);
+        let mut conjuncts = Vec::new();
+        scalar_expr::split_conjuncts(&arena, cond_id, &mut conjuncts);
         let mut right_ids = collect_output_ids_opt(&right);
         let mut left_ids = collect_output_ids_opt(&left);
         right_ids.remove(&ColumnId::UNSET);
         left_ids.remove(&ColumnId::UNSET);
 
-        let mut keep_in_condition: Vec<TypedExpr> = Vec::new();
-        let mut push_to_right: Vec<TypedExpr> = Vec::new();
+        let mut keep_in_condition = Vec::new();
+        let mut push_to_right = Vec::new();
 
         for conj in conjuncts {
             let is_right_only =
-                classify_right_only_by_column_ids(&conj, &left_ids, &right_ids).unwrap_or(false);
+                classify_right_only_by_column_ids(conj, &left_ids, &right_ids, &arena)
+                    .unwrap_or(false);
 
             if is_right_only {
                 push_to_right.push(conj);
@@ -101,11 +99,11 @@ impl LogicalRewriteRule for PushSemiAntiRightOnlyCondition {
         let new_condition = if keep_in_condition.is_empty() {
             None
         } else {
-            let combined = combine_and(keep_in_condition);
-            Some(scalar::intern_typed(&mut arena, &combined))
+            scalar_expr::combine_conjuncts(&mut arena, keep_in_condition)
         };
-        let pushed_pred = combine_and(push_to_right);
-        let pushed_id = scalar::intern_typed(&mut arena, &pushed_pred);
+        let Some(pushed_id) = scalar_expr::combine_conjuncts(&mut arena, push_to_right) else {
+            return Ok(RewriteResult::Unchanged);
+        };
         let new_right = OptExpr::new(
             Operator::LogicalFilter(FilterOp {
                 predicate: pushed_id,
@@ -125,11 +123,12 @@ impl LogicalRewriteRule for PushSemiAntiRightOnlyCondition {
 }
 
 fn classify_right_only_by_column_ids(
-    expr: &TypedExpr,
+    expr: ScalarId,
     left_ids: &std::collections::HashSet<ColumnId>,
     right_ids: &std::collections::HashSet<ColumnId>,
+    arena: &crate::sql::optimizer::scalar::ScalarArena,
 ) -> Option<bool> {
-    let ids = collect_column_id_refs_strict(expr)?;
+    let ids = scalar_expr::collect_column_ids_strict(arena, expr)?;
     if ids.is_empty() {
         return Some(false);
     }

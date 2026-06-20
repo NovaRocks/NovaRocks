@@ -10,10 +10,11 @@ use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
 use crate::sql::optimizer::rewrite::rules::predicate_pushdown::deriver::derive_inner_join_predicates;
 use crate::sql::optimizer::rewrite::rules::predicate_pushdown::predicate_group::{
-    PredicateGroup, PredicateKey, PredicateOrigin, predicate_key, split_and_refs,
+    PredicateGroup, PredicateKey, PredicateOrigin, predicate_key,
 };
-use crate::sql::optimizer::rewrite::rules::utils::{collect_output_ids_opt, combine_and};
-use crate::sql::optimizer::scalar;
+use crate::sql::optimizer::rewrite::rules::utils::collect_output_ids_opt;
+use crate::sql::optimizer::scalar::{ScalarArena, ScalarId};
+use crate::sql::optimizer::scalar_expr;
 
 pub(crate) struct JoinPredicateMoveAround;
 
@@ -62,16 +63,20 @@ impl LogicalRewriteRule for JoinPredicateMoveAround {
         let left_ids = collect_output_ids_opt(&left);
         let right_ids = collect_output_ids_opt(&right);
 
-        let condition_typed = scalar::materialize(&arena, condition_id);
         let join_groups =
-            PredicateGroup::from_predicate(condition_typed, PredicateOrigin::JoinCondition);
+            PredicateGroup::from_predicate(&arena, condition_id, PredicateOrigin::JoinCondition);
 
         let mut child_groups = Vec::new();
         collect_child_predicate_groups(&left, &mut child_groups, &arena);
         collect_child_predicate_groups(&right, &mut child_groups, &arena);
 
-        let derived =
-            derive_inner_join_predicates(&left_ids, &right_ids, &join_groups, &child_groups);
+        let derived = derive_inner_join_predicates(
+            &mut arena,
+            &left_ids,
+            &right_ids,
+            &join_groups,
+            &child_groups,
+        );
 
         let left_existing = existing_child_predicate_keys(&left, &arena);
         let right_existing = existing_child_predicate_keys(&right, &arena);
@@ -98,13 +103,15 @@ impl LogicalRewriteRule for JoinPredicateMoveAround {
         let new_left = if left_fresh.is_empty() {
             left
         } else {
-            let predicate = scalar::intern_typed(&mut arena, &combine_and(left_fresh));
+            let predicate =
+                scalar_expr::combine_conjuncts(&mut arena, left_fresh).expect("non-empty");
             OptExpr::new(Operator::LogicalFilter(FilterOp { predicate }), vec![left])
         };
         let new_right = if right_fresh.is_empty() {
             right
         } else {
-            let predicate = scalar::intern_typed(&mut arena, &combine_and(right_fresh));
+            let predicate =
+                scalar_expr::combine_conjuncts(&mut arena, right_fresh).expect("non-empty");
             OptExpr::new(Operator::LogicalFilter(FilterOp { predicate }), vec![right])
         };
 
@@ -148,13 +155,13 @@ fn classify_group_side(
 fn collect_child_predicate_groups(
     expr: &OptExpr,
     out: &mut Vec<PredicateGroup>,
-    arena: &crate::sql::optimizer::scalar::ScalarArena,
+    arena: &ScalarArena,
 ) {
     match &expr.op {
         Operator::LogicalFilter(filter) => {
-            let typed = scalar::materialize(arena, filter.predicate);
             out.extend(PredicateGroup::from_predicate(
-                typed,
+                arena,
+                filter.predicate,
                 PredicateOrigin::Filter,
             ));
             if !expr.children.is_empty() {
@@ -163,9 +170,9 @@ fn collect_child_predicate_groups(
         }
         Operator::LogicalScan(scan) => {
             for &pred_id in &scan.predicates {
-                let typed = scalar::materialize(arena, pred_id);
                 out.extend(PredicateGroup::from_predicate(
-                    typed,
+                    arena,
+                    pred_id,
                     PredicateOrigin::Filter,
                 ));
             }
@@ -179,9 +186,9 @@ fn collect_child_predicate_groups(
             if matches!(join.join_type, JoinKind::Inner | JoinKind::Cross) =>
         {
             if let Some(cond_id) = join.condition {
-                let typed = scalar::materialize(arena, cond_id);
                 out.extend(PredicateGroup::from_predicate(
-                    typed,
+                    arena,
+                    cond_id,
                     PredicateOrigin::JoinCondition,
                 ));
             }
@@ -194,10 +201,7 @@ fn collect_child_predicate_groups(
     }
 }
 
-fn existing_child_predicate_keys(
-    expr: &OptExpr,
-    arena: &crate::sql::optimizer::scalar::ScalarArena,
-) -> HashSet<PredicateKey> {
+fn existing_child_predicate_keys(expr: &OptExpr, arena: &ScalarArena) -> HashSet<PredicateKey> {
     let mut keys = HashSet::new();
     collect_existing_child_predicate_keys(expr, &mut keys, arena);
     keys
@@ -206,20 +210,18 @@ fn existing_child_predicate_keys(
 fn collect_existing_child_predicate_keys(
     expr: &OptExpr,
     out: &mut HashSet<PredicateKey>,
-    arena: &crate::sql::optimizer::scalar::ScalarArena,
+    arena: &ScalarArena,
 ) {
     match &expr.op {
         Operator::LogicalFilter(filter) => {
-            let typed = scalar::materialize(arena, filter.predicate);
-            collect_top_level_conjunct_keys(&typed, out);
+            collect_top_level_conjunct_keys(arena, filter.predicate, out);
             if !expr.children.is_empty() {
                 collect_existing_child_predicate_keys(expr.unary_input(), out, arena);
             }
         }
         Operator::LogicalScan(scan) => {
             for &pred_id in &scan.predicates {
-                let typed = scalar::materialize(arena, pred_id);
-                collect_top_level_conjunct_keys(&typed, out);
+                collect_top_level_conjunct_keys(arena, pred_id, out);
             }
         }
         Operator::LogicalProject(_) | Operator::LogicalSort(_) | Operator::LogicalLimit(_) => {
@@ -231,8 +233,7 @@ fn collect_existing_child_predicate_keys(
             if matches!(join.join_type, JoinKind::Inner | JoinKind::Cross) =>
         {
             if let Some(cond_id) = join.condition {
-                let typed = scalar::materialize(arena, cond_id);
-                collect_top_level_conjunct_keys(&typed, out);
+                collect_top_level_conjunct_keys(arena, cond_id, out);
             }
             if expr.children.len() >= 2 {
                 collect_existing_child_predicate_keys(expr.left(), out, arena);
@@ -244,11 +245,14 @@ fn collect_existing_child_predicate_keys(
 }
 
 fn collect_top_level_conjunct_keys(
-    expr: &crate::sql::analysis::TypedExpr,
+    arena: &ScalarArena,
+    expr: ScalarId,
     out: &mut HashSet<PredicateKey>,
 ) {
-    for conjunct in split_and_refs(expr) {
-        out.insert(predicate_key(conjunct));
+    let mut conjuncts = Vec::new();
+    scalar_expr::split_conjuncts(arena, expr, &mut conjuncts);
+    for conjunct in conjuncts {
+        out.insert(predicate_key(arena, conjunct));
     }
 }
 

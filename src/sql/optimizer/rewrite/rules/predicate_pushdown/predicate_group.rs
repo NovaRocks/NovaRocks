@@ -1,10 +1,9 @@
 use std::collections::{BTreeSet, HashSet};
 
-use arrow::datatypes::DataType;
-
-use crate::sql::analysis::{BinOp, ExprKind, TypedExpr};
+use crate::sql::analysis::BinOp;
 use crate::sql::column_id::ColumnId;
-use crate::sql::optimizer::rewrite::rules::utils::collect_column_id_refs;
+use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
+use crate::sql::optimizer::scalar_expr;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct PredicateKey(String);
@@ -34,7 +33,7 @@ pub(crate) enum PredicateDerivedKind {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PredicateGroup {
-    pub(crate) expr: TypedExpr,
+    pub(crate) expr: ScalarId,
     pub(crate) referenced_ids: BTreeSet<ColumnId>,
     pub(crate) key: PredicateKey,
     pub(crate) origin: PredicateOrigin,
@@ -44,13 +43,17 @@ pub(crate) struct PredicateGroup {
 
 impl PredicateGroup {
     pub(crate) fn new(
-        expr: TypedExpr,
+        arena: &ScalarArena,
+        expr: ScalarId,
         origin: PredicateOrigin,
         derived: PredicateDerivedKind,
     ) -> Self {
-        let referenced_ids = collect_column_id_refs(&expr).into_iter().collect();
-        let key = predicate_key(&expr);
-        let deterministic = !contains_non_deterministic_function(&expr);
+        let referenced_ids = scalar_expr::collect_column_ids_strict(arena, expr)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let key = predicate_key(arena, expr);
+        let deterministic = !scalar_expr::contains_non_deterministic_function(arena, expr);
         Self {
             expr,
             referenced_ids,
@@ -61,37 +64,43 @@ impl PredicateGroup {
         }
     }
 
-    pub(crate) fn from_predicate(expr: TypedExpr, origin: PredicateOrigin) -> Vec<Self> {
-        split_and_owned(expr)
+    pub(crate) fn from_predicate(
+        arena: &ScalarArena,
+        expr: ScalarId,
+        origin: PredicateOrigin,
+    ) -> Vec<Self> {
+        let mut conjuncts = Vec::new();
+        scalar_expr::split_conjuncts(arena, expr, &mut conjuncts);
+        conjuncts
             .into_iter()
-            .map(|expr| Self::new(expr, origin, PredicateDerivedKind::None))
+            .map(|expr| Self::new(arena, expr, origin, PredicateDerivedKind::None))
             .collect()
     }
 }
 
-pub(crate) fn predicate_key(expr: &TypedExpr) -> PredicateKey {
-    PredicateKey(canonical_expr_key(expr))
+pub(crate) fn predicate_key(arena: &ScalarArena, expr: ScalarId) -> PredicateKey {
+    PredicateKey(canonical_expr_key(arena, expr))
 }
 
-fn canonical_expr_key(expr: &TypedExpr) -> String {
-    match &expr.kind {
-        ExprKind::Nested(inner) => canonical_expr_key(inner),
-        ExprKind::BinaryOp {
+fn canonical_expr_key(arena: &ScalarArena, expr: ScalarId) -> String {
+    match arena.node(expr) {
+        ScalarNode::Nested(inner) => canonical_expr_key(arena, *inner),
+        ScalarNode::BinaryOp {
             left,
             op: BinOp::And,
             right,
-        } => canonical_bool_key("AND", left, right),
-        ExprKind::BinaryOp {
+        } => canonical_bool_key(arena, "AND", *left, *right),
+        ScalarNode::BinaryOp {
             left,
             op: BinOp::Or,
             right,
-        } => canonical_bool_key("OR", left, right),
-        ExprKind::BinaryOp { left, op, right } => {
+        } => canonical_bool_key(arena, "OR", *left, *right),
+        ScalarNode::BinaryOp { left, op, right } => {
             // For commutative ops (Eq, Ne) canonicalize operand order so that
             // `a = b` and `b = a` produce the same key regardless of which
             // direction the arena normalization swapped them.
-            let lk = canonical_expr_key(left);
-            let rk = canonical_expr_key(right);
+            let lk = canonical_expr_key(arena, *left);
+            let rk = canonical_expr_key(arena, *right);
             let (lk, rk) = if matches!(op, BinOp::Eq | BinOp::Ne) && lk > rk {
                 (rk, lk)
             } else {
@@ -99,95 +108,102 @@ fn canonical_expr_key(expr: &TypedExpr) -> String {
             };
             format!("BinaryOp({op:?},{lk},{rk})")
         }
-        ExprKind::UnaryOp { op, expr } => {
-            format!("UnaryOp({op:?},{})", canonical_expr_key(expr))
+        ScalarNode::UnaryOp { op, child } => {
+            format!("UnaryOp({op:?},{})", canonical_expr_key(arena, *child))
         }
-        ExprKind::FunctionCall {
+        ScalarNode::FunctionCall {
             name,
             args,
             distinct,
         } => format!(
             "FunctionCall({name},{distinct},{})",
-            canonical_expr_list_key(args)
+            canonical_expr_list_key(arena, args)
         ),
-        ExprKind::LambdaFunction { params, body } => {
-            format!("LambdaFunction({params:?},{})", canonical_expr_key(body))
+        ScalarNode::LambdaFunction { params, body } => {
+            format!(
+                "LambdaFunction({params:?},{})",
+                canonical_expr_key(arena, *body)
+            )
         }
-        ExprKind::AggregateCall {
+        ScalarNode::AggregateCall {
             name,
             args,
             distinct,
             order_by,
         } => format!(
             "AggregateCall({name},{distinct},{},{order_by:?})",
-            canonical_expr_list_key(args)
+            canonical_expr_list_key(arena, args)
         ),
-        ExprKind::Cast { expr, target } => {
-            format!("Cast({},{target:?})", canonical_expr_key(expr))
+        ScalarNode::Cast { child, target } => {
+            format!("Cast({},{target:?})", canonical_expr_key(arena, *child))
         }
-        ExprKind::IsNull { expr, negated } => {
-            format!("IsNull({},{negated})", canonical_expr_key(expr))
+        ScalarNode::IsNull { child, negated } => {
+            format!("IsNull({},{negated})", canonical_expr_key(arena, *child))
         }
-        ExprKind::InList {
-            expr,
+        ScalarNode::InList {
+            child,
             list,
             negated,
         } => format!(
             "InList({},{},{negated})",
-            canonical_expr_key(expr),
-            canonical_expr_list_key(list)
+            canonical_expr_key(arena, *child),
+            canonical_expr_list_key(arena, list)
         ),
-        ExprKind::Between {
-            expr,
+        ScalarNode::Between {
+            child,
             low,
             high,
             negated,
         } => format!(
             "Between({},{},{},{negated})",
-            canonical_expr_key(expr),
-            canonical_expr_key(low),
-            canonical_expr_key(high)
+            canonical_expr_key(arena, *child),
+            canonical_expr_key(arena, *low),
+            canonical_expr_key(arena, *high)
         ),
-        ExprKind::Like {
-            expr,
+        ScalarNode::Like {
+            child,
             pattern,
             negated,
         } => format!(
             "Like({},{},{negated})",
-            canonical_expr_key(expr),
-            canonical_expr_key(pattern)
+            canonical_expr_key(arena, *child),
+            canonical_expr_key(arena, *pattern)
         ),
-        ExprKind::Case {
+        ScalarNode::Case {
             operand,
             when_then,
             else_expr,
         } => {
             let operand_key = operand
                 .as_ref()
-                .map(|expr| canonical_expr_key(expr))
+                .map(|expr| canonical_expr_key(arena, *expr))
                 .unwrap_or_else(|| "None".to_string());
             let when_then_key = when_then
                 .iter()
                 .map(|(when, then)| {
-                    format!("{}=>{}", canonical_expr_key(when), canonical_expr_key(then))
+                    format!(
+                        "{}=>{}",
+                        canonical_expr_key(arena, *when),
+                        canonical_expr_key(arena, *then)
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join(",");
             let else_key = else_expr
                 .as_ref()
-                .map(|expr| canonical_expr_key(expr))
+                .map(|expr| canonical_expr_key(arena, *expr))
                 .unwrap_or_else(|| "None".to_string());
             format!("Case({operand_key},{when_then_key},{else_key})")
         }
-        ExprKind::IsTruthValue {
-            expr,
+        ScalarNode::IsTruthValue {
+            child,
             value,
             negated,
         } => format!(
             "IsTruthValue({},{value},{negated})",
-            canonical_expr_key(expr)
+            canonical_expr_key(arena, *child)
         ),
-        ExprKind::WindowCall {
+        ScalarNode::WindowCall {
             name,
             args,
             distinct,
@@ -197,31 +213,35 @@ fn canonical_expr_key(expr: &TypedExpr) -> String {
             ignore_nulls,
         } => format!(
             "WindowCall({name},{distinct},{},{},{order_by:?},{window_frame:?},{ignore_nulls})",
-            canonical_expr_list_key(args),
-            canonical_expr_list_key(partition_by)
+            canonical_expr_list_key(arena, args),
+            canonical_expr_list_key(arena, partition_by)
         ),
-        ExprKind::Lambda { params, body } => {
-            format!("Lambda({params:?},{})", canonical_expr_key(body))
+        ScalarNode::Lambda { params, body } => {
+            format!("Lambda({params:?},{})", canonical_expr_key(arena, *body))
         }
-        ExprKind::ColumnRef { .. }
-        | ExprKind::LambdaParamRef { .. }
-        | ExprKind::Literal(_)
-        | ExprKind::SubqueryPlaceholder { .. } => format!("{:?}", expr.kind),
+        ScalarNode::ColumnRef(_) | ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {
+            format!("{:?}", arena.node(expr))
+        }
     }
 }
 
-fn canonical_bool_key(op_name: &str, left: &TypedExpr, right: &TypedExpr) -> String {
+fn canonical_bool_key(
+    arena: &ScalarArena,
+    op_name: &str,
+    left: ScalarId,
+    right: ScalarId,
+) -> String {
     let mut terms = Vec::new();
-    collect_bool_terms(left, op_name, &mut terms);
-    collect_bool_terms(right, op_name, &mut terms);
+    collect_bool_terms(arena, left, op_name, &mut terms);
+    collect_bool_terms(arena, right, op_name, &mut terms);
     terms.sort();
     format!("{op_name}({})", terms.join(","))
 }
 
-fn collect_bool_terms(expr: &TypedExpr, op_name: &str, out: &mut Vec<String>) {
-    match (&expr.kind, op_name) {
+fn collect_bool_terms(arena: &ScalarArena, expr: ScalarId, op_name: &str, out: &mut Vec<String>) {
+    match (arena.node(expr), op_name) {
         (
-            ExprKind::BinaryOp {
+            ScalarNode::BinaryOp {
                 left,
                 op: BinOp::And,
                 right,
@@ -229,25 +249,25 @@ fn collect_bool_terms(expr: &TypedExpr, op_name: &str, out: &mut Vec<String>) {
             "AND",
         )
         | (
-            ExprKind::BinaryOp {
+            ScalarNode::BinaryOp {
                 left,
                 op: BinOp::Or,
                 right,
             },
             "OR",
         ) => {
-            collect_bool_terms(left, op_name, out);
-            collect_bool_terms(right, op_name, out);
+            collect_bool_terms(arena, *left, op_name, out);
+            collect_bool_terms(arena, *right, op_name, out);
         }
-        (ExprKind::Nested(inner), _) => collect_bool_terms(inner, op_name, out),
-        _ => out.push(canonical_expr_key(expr)),
+        (ScalarNode::Nested(inner), _) => collect_bool_terms(arena, *inner, op_name, out),
+        _ => out.push(canonical_expr_key(arena, expr)),
     }
 }
 
-fn canonical_expr_list_key(exprs: &[TypedExpr]) -> String {
+fn canonical_expr_list_key(arena: &ScalarArena, exprs: &[ScalarId]) -> String {
     exprs
         .iter()
-        .map(canonical_expr_key)
+        .map(|expr| canonical_expr_key(arena, *expr))
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -263,168 +283,13 @@ pub(crate) fn dedupe_groups(groups: Vec<PredicateGroup>) -> Vec<PredicateGroup> 
     out
 }
 
-pub(crate) fn exprs_from_groups(groups: Vec<PredicateGroup>) -> Vec<TypedExpr> {
-    groups.into_iter().map(|group| group.expr).collect()
-}
-
-pub(crate) fn combine_or(mut exprs: Vec<TypedExpr>) -> TypedExpr {
-    assert!(!exprs.is_empty());
-    let mut result = exprs.pop().unwrap();
-    while let Some(left) = exprs.pop() {
-        result = TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: left.nullable || result.nullable,
-            kind: ExprKind::BinaryOp {
-                left: Box::new(left),
-                op: BinOp::Or,
-                right: Box::new(result),
-            },
-        };
-    }
-    result
-}
-
-pub(crate) fn split_or_refs(expr: &TypedExpr) -> Vec<&TypedExpr> {
-    match &expr.kind {
-        ExprKind::BinaryOp {
-            left,
-            op: BinOp::Or,
-            right,
-        } => {
-            let mut out = split_or_refs(left);
-            out.extend(split_or_refs(right));
-            out
-        }
-        ExprKind::Nested(inner) => split_or_refs(inner),
-        _ => vec![expr],
-    }
-}
-
-pub(crate) fn split_and_refs(expr: &TypedExpr) -> Vec<&TypedExpr> {
-    match &expr.kind {
-        ExprKind::BinaryOp {
-            left,
-            op: BinOp::And,
-            right,
-        } => {
-            let mut out = split_and_refs(left);
-            out.extend(split_and_refs(right));
-            out
-        }
-        ExprKind::Nested(inner) => split_and_refs(inner),
-        _ => vec![expr],
-    }
-}
-
-fn split_and_owned(expr: TypedExpr) -> Vec<TypedExpr> {
-    match expr.kind {
-        ExprKind::BinaryOp {
-            left,
-            op: BinOp::And,
-            right,
-        } => {
-            let mut out = split_and_owned(*left);
-            out.extend(split_and_owned(*right));
-            out
-        }
-        ExprKind::Nested(inner) => split_and_owned(*inner),
-        _ => vec![expr],
-    }
-}
-
-pub(crate) fn contains_non_deterministic_function(expr: &TypedExpr) -> bool {
-    match &expr.kind {
-        ExprKind::FunctionCall { name, args, .. } => {
-            let lower = name.to_lowercase();
-            matches!(
-                lower.as_str(),
-                "rand"
-                    | "random"
-                    | "uuid"
-                    | "now"
-                    | "current_timestamp"
-                    | "current_date"
-                    | "curdate"
-                    | "current_time"
-                    | "curtime"
-                    | "localtime"
-                    | "localtimestamp"
-                    | "utc_timestamp"
-                    | "utc_time"
-            ) || args.iter().any(contains_non_deterministic_function)
-        }
-        ExprKind::AggregateCall { args, order_by, .. } => {
-            args.iter().any(contains_non_deterministic_function)
-                || order_by
-                    .iter()
-                    .any(|item| contains_non_deterministic_function(&item.expr))
-        }
-        ExprKind::WindowCall {
-            args,
-            partition_by,
-            order_by,
-            ..
-        } => {
-            args.iter().any(contains_non_deterministic_function)
-                || partition_by.iter().any(contains_non_deterministic_function)
-                || order_by
-                    .iter()
-                    .any(|item| contains_non_deterministic_function(&item.expr))
-        }
-        ExprKind::BinaryOp { left, right, .. } => {
-            contains_non_deterministic_function(left) || contains_non_deterministic_function(right)
-        }
-        ExprKind::UnaryOp { expr, .. }
-        | ExprKind::Cast { expr, .. }
-        | ExprKind::IsNull { expr, .. }
-        | ExprKind::IsTruthValue { expr, .. }
-        | ExprKind::Nested(expr) => contains_non_deterministic_function(expr),
-        ExprKind::InList { expr, list, .. } => {
-            contains_non_deterministic_function(expr)
-                || list.iter().any(contains_non_deterministic_function)
-        }
-        ExprKind::Between {
-            expr, low, high, ..
-        } => {
-            contains_non_deterministic_function(expr)
-                || contains_non_deterministic_function(low)
-                || contains_non_deterministic_function(high)
-        }
-        ExprKind::Like { expr, pattern, .. } => {
-            contains_non_deterministic_function(expr)
-                || contains_non_deterministic_function(pattern)
-        }
-        ExprKind::Case {
-            operand,
-            when_then,
-            else_expr,
-        } => {
-            operand
-                .as_ref()
-                .is_some_and(|expr| contains_non_deterministic_function(expr))
-                || when_then.iter().any(|(when, then)| {
-                    contains_non_deterministic_function(when)
-                        || contains_non_deterministic_function(then)
-                })
-                || else_expr
-                    .as_ref()
-                    .is_some_and(|expr| contains_non_deterministic_function(expr))
-        }
-        ExprKind::LambdaFunction { body, .. } | ExprKind::Lambda { body, .. } => {
-            contains_non_deterministic_function(body)
-        }
-        ExprKind::ColumnRef { .. }
-        | ExprKind::LambdaParamRef { .. }
-        | ExprKind::Literal(_)
-        | ExprKind::SubqueryPlaceholder { .. } => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::{BinOp, ExprKind, LiteralValue};
+    use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed, materialize};
+    use crate::sql::optimizer::scalar_expr;
     use arrow::datatypes::DataType;
 
     fn col(name: &str, id: u32) -> TypedExpr {
@@ -471,6 +336,21 @@ mod tests {
         }
     }
 
+    fn groups_from_typed(arena: &mut ScalarArena, expr: TypedExpr) -> Vec<PredicateGroup> {
+        let id = intern_typed(arena, &expr);
+        PredicateGroup::from_predicate(arena, id, PredicateOrigin::Filter)
+    }
+
+    fn group_from_typed(
+        arena: &mut ScalarArena,
+        expr: TypedExpr,
+        origin: PredicateOrigin,
+        derived: PredicateDerivedKind,
+    ) -> PredicateGroup {
+        let id = intern_typed(arena, &expr);
+        PredicateGroup::new(arena, id, origin, derived)
+    }
+
     #[test]
     fn top_level_and_is_split_but_or_stays_atomic() {
         let expr = bool_expr(
@@ -483,7 +363,8 @@ mod tests {
             ),
         );
 
-        let groups = PredicateGroup::from_predicate(expr, PredicateOrigin::Filter);
+        let mut arena = ScalarArena::new();
+        let groups = groups_from_typed(&mut arena, expr);
 
         assert_eq!(groups.len(), 2);
         assert!(
@@ -496,8 +377,9 @@ mod tests {
                 .referenced_ids
                 .contains(&ColumnId::new_for_test(2))
         );
+        let second_expr = materialize(&arena, groups[1].expr);
         assert!(matches!(
-            groups[1].expr.kind,
+            second_expr.kind,
             ExprKind::BinaryOp { op: BinOp::Or, .. }
         ));
     }
@@ -514,19 +396,23 @@ mod tests {
             nullable: true,
         };
 
-        let groups = PredicateGroup::from_predicate(expr, PredicateOrigin::Filter);
+        let mut arena = ScalarArena::new();
+        let groups = groups_from_typed(&mut arena, expr);
 
         assert_eq!(groups.len(), 2);
     }
 
     #[test]
     fn dedupe_keeps_first_group_for_same_canonical_key() {
-        let first = PredicateGroup::new(
+        let mut arena = ScalarArena::new();
+        let first = group_from_typed(
+            &mut arena,
             bool_expr(col("a", 1), BinOp::Eq, int_lit(1)),
             PredicateOrigin::Filter,
             PredicateDerivedKind::None,
         );
-        let second = PredicateGroup::new(
+        let second = group_from_typed(
+            &mut arena,
             bool_expr(col("a", 1), BinOp::Eq, int_lit(1)),
             PredicateOrigin::Derived,
             PredicateDerivedKind::Equivalence,
@@ -550,20 +436,27 @@ mod tests {
             ),
         );
 
-        assert_eq!(split_or_refs(&expr).len(), 3);
+        let mut arena = ScalarArena::new();
+        let id = intern_typed(&mut arena, &expr);
+        let mut branches = Vec::new();
+        scalar_expr::split_disjuncts(&arena, id, &mut branches);
+        assert_eq!(branches.len(), 3);
     }
 
     #[test]
     fn combine_or_round_trips_to_left_to_right_or_branches() {
-        let expr = combine_or(vec![
-            bool_expr(col("a", 1), BinOp::Eq, int_lit(1)),
-            bool_expr(col("a", 1), BinOp::Eq, int_lit(2)),
-            bool_expr(col("a", 1), BinOp::Eq, int_lit(3)),
-        ]);
-
-        let branch_debugs: Vec<String> = split_or_refs(&expr)
+        let mut arena = ScalarArena::new();
+        let exprs = vec![
+            intern_typed(&mut arena, &bool_expr(col("a", 1), BinOp::Eq, int_lit(1))),
+            intern_typed(&mut arena, &bool_expr(col("a", 1), BinOp::Eq, int_lit(2))),
+            intern_typed(&mut arena, &bool_expr(col("a", 1), BinOp::Eq, int_lit(3))),
+        ];
+        let expr = scalar_expr::combine_disjuncts(&mut arena, exprs).unwrap();
+        let mut branches = Vec::new();
+        scalar_expr::split_disjuncts(&arena, expr, &mut branches);
+        let branch_debugs: Vec<String> = branches
             .into_iter()
-            .map(|branch| format!("{:?}", branch.kind))
+            .map(|branch| format!("{:?}", materialize(&arena, branch).kind))
             .collect();
 
         assert_eq!(branch_debugs.len(), 3);
@@ -584,21 +477,24 @@ mod tests {
             nullable: false,
         };
 
-        assert!(contains_non_deterministic_function(&expr));
+        let mut arena = ScalarArena::new();
+        let id = intern_typed(&mut arena, &expr);
+        assert!(scalar_expr::contains_non_deterministic_function(&arena, id));
     }
 
     #[test]
     fn curdate_is_detected_as_non_deterministic() {
-        assert!(contains_non_deterministic_function(&func(
-            "curdate",
-            vec![]
-        )));
+        let mut arena = ScalarArena::new();
+        let id = intern_typed(&mut arena, &func("curdate", vec![]));
+        assert!(scalar_expr::contains_non_deterministic_function(&arena, id));
     }
 
     #[test]
     fn nested_scalar_function_argument_is_checked_for_non_determinism() {
         let expr = func("if", vec![col("a", 1), func("curdate", vec![]), int_lit(1)]);
 
-        assert!(contains_non_deterministic_function(&expr));
+        let mut arena = ScalarArena::new();
+        let id = intern_typed(&mut arena, &expr);
+        assert!(scalar_expr::contains_non_deterministic_function(&arena, id));
     }
 }

@@ -20,10 +20,9 @@ use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::optimizer::rewrite::rules::utils::{
-    collect_column_id_refs_strict, combine_and, split_and, wrap_remaining_filter_opt,
-};
-use crate::sql::optimizer::scalar;
+use crate::sql::optimizer::rewrite::rules::utils::wrap_remaining_filter_opt_scalar;
+use crate::sql::optimizer::scalar::ScalarNode;
+use crate::sql::optimizer::scalar_expr;
 
 pub(crate) struct PushDownPredicateAggregate;
 
@@ -88,29 +87,25 @@ impl LogicalRewriteRule for PushDownPredicateAggregate {
         let arena_rc = ctx.scalar_arena();
         let mut arena = arena_rc.borrow_mut();
 
-        // Materialize the filter predicate from its ScalarId.
-        let predicate = scalar::materialize(&arena, filter_op.predicate);
-
         // GROUP BY key ColumnIds — only bare ColumnRef items contribute
         // pushable ids; computed GROUP BY expressions do not.
         let group_by_ids: HashSet<ColumnId> = agg
             .group_by
             .iter()
             .filter_map(|&id| match arena.node(id) {
-                crate::sql::optimizer::scalar::ScalarNode::ColumnRef(column_id)
-                    if *column_id != ColumnId::UNSET =>
-                {
+                ScalarNode::ColumnRef(column_id) if *column_id != ColumnId::UNSET => {
                     Some(*column_id)
                 }
                 _ => None,
             })
             .collect();
 
-        let conjuncts = split_and(predicate);
+        let mut conjuncts = Vec::new();
+        scalar_expr::split_conjuncts(&arena, filter_op.predicate, &mut conjuncts);
         let mut pushable = Vec::new();
         let mut remaining = Vec::new();
         for conj in conjuncts {
-            let refs = collect_column_id_refs_strict(&conj);
+            let refs = scalar_expr::collect_column_ids_strict(&arena, conj);
             // Keep the `!refs.is_empty()` guard: constant predicates (empty
             // refs) are not pushed through aggregates.
             if let Some(refs) = refs
@@ -127,8 +122,9 @@ impl LogicalRewriteRule for PushDownPredicateAggregate {
             return Ok(RewriteResult::Unchanged);
         }
 
-        let pushed_pred = combine_and(pushable);
-        let pushed_id = scalar::intern_typed(&mut arena, &pushed_pred);
+        let Some(pushed_id) = scalar_expr::combine_conjuncts(&mut arena, pushable) else {
+            return Ok(RewriteResult::Unchanged);
+        };
         let new_child = OptExpr::new(
             Operator::LogicalFilter(FilterOp {
                 predicate: pushed_id,
@@ -138,7 +134,7 @@ impl LogicalRewriteRule for PushDownPredicateAggregate {
         let mut new_agg_expr = OptExpr::new(Operator::LogicalAggregate(agg), vec![new_child]);
         new_agg_expr.required_output_columns = aggregate_required_output_columns;
 
-        let result = wrap_remaining_filter_opt(new_agg_expr, remaining, &mut arena);
+        let result = wrap_remaining_filter_opt_scalar(new_agg_expr, remaining, &mut arena);
         Ok(RewriteResult::Changed(result))
     }
 }

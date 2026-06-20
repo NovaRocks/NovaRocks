@@ -8,18 +8,18 @@
 //!
 //! Migrated to `OptExpr` / `LogicalRewriteRule`.
 
-use crate::sql::analysis::{ExprKind, SortItem, TypedExpr};
+use std::collections::HashMap;
+
 use crate::sql::column_id::ColumnId;
-use crate::sql::optimizer::operator::{FilterOp, Operator, ProjectOp};
+use crate::sql::optimizer::operator::{FilterOp, Operator, ProjectOp, ScalarProjectItem};
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::optimizer::rewrite::rules::utils::{
-    combine_and, split_and, wrap_remaining_filter_opt,
-};
-use crate::sql::optimizer::scalar::{self, ScalarArena};
+use crate::sql::optimizer::rewrite::rules::utils::wrap_remaining_filter_opt_scalar;
+use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode, SortKey};
+use crate::sql::optimizer::scalar_expr;
 
 pub(crate) struct PushDownPredicateProject;
 
@@ -68,16 +68,14 @@ impl LogicalRewriteRule for PushDownPredicateProject {
         let project_input = project_children.remove(0);
 
         let arena_rc = ctx.scalar_arena();
-        let predicate_typed = {
-            let arena = arena_rc.borrow();
-            scalar::materialize(&arena, filter.predicate)
-        };
+        let mut arena = arena_rc.borrow_mut();
 
-        let conjuncts = split_and(predicate_typed);
-        let mut pushable: Vec<TypedExpr> = Vec::new();
-        let mut remaining: Vec<TypedExpr> = Vec::new();
+        let mut conjuncts = Vec::new();
+        scalar_expr::split_conjuncts(&arena, filter.predicate, &mut conjuncts);
+        let mut pushable = Vec::new();
+        let mut remaining = Vec::new();
         for conj in conjuncts {
-            match rewrite_predicate_through_project(&conj, &proj, &arena_rc.borrow()) {
+            match remap_predicate_through_project(&mut arena, conj, &proj.items) {
                 Some(rewritten) => pushable.push(rewritten),
                 None => remaining.push(conj),
             }
@@ -87,8 +85,9 @@ impl LogicalRewriteRule for PushDownPredicateProject {
             return Ok(RewriteResult::Unchanged);
         }
 
-        let pushed = combine_and(pushable);
-        let pushed_id = scalar::intern_typed(&mut arena_rc.borrow_mut(), &pushed);
+        let Some(pushed_id) = scalar_expr::combine_conjuncts(&mut arena, pushable) else {
+            return Ok(RewriteResult::Unchanged);
+        };
         let new_child = OptExpr::new(
             Operator::LogicalFilter(FilterOp {
                 predicate: pushed_id,
@@ -103,205 +102,214 @@ impl LogicalRewriteRule for PushDownPredicateProject {
             children: vec![new_child],
             required_output_columns,
         };
-        let result = wrap_remaining_filter_opt(new_project, remaining, &mut arena_rc.borrow_mut());
+        let result = wrap_remaining_filter_opt_scalar(new_project, remaining, &mut arena);
         Ok(RewriteResult::Changed(result))
     }
 }
 
-/// Try to rewrite `expr` (a predicate fragment) so it references only the
-/// Project's input columns rather than its output column names. Returns `None`
-/// if any `ColumnRef` in `expr` maps to a computed (non-passthrough) item.
-fn rewrite_predicate_through_project(
-    expr: &TypedExpr,
-    proj: &ProjectOp,
+fn remap_predicate_through_project(
+    arena: &mut ScalarArena,
+    predicate: ScalarId,
+    project_items: &[ScalarProjectItem],
+) -> Option<ScalarId> {
+    let bindings = project_bindings(arena, project_items);
+    remap_scalar(arena, predicate, &bindings)
+}
+
+fn project_bindings(
     arena: &ScalarArena,
-) -> Option<TypedExpr> {
-    match &expr.kind {
-        ExprKind::ColumnRef {
-            column_id,
-            qualifier,
-            column,
-        } => lookup_passthrough_projection(*column_id, qualifier.as_deref(), column, proj, arena),
-        ExprKind::LambdaParamRef { .. } | ExprKind::Literal(_) => Some(expr.clone()),
-        ExprKind::BinaryOp { left, op, right } => Some(TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
-            kind: ExprKind::BinaryOp {
-                left: Box::new(rewrite_predicate_through_project(left, proj, arena)?),
-                op: *op,
-                right: Box::new(rewrite_predicate_through_project(right, proj, arena)?),
-            },
-        }),
-        ExprKind::UnaryOp { op, expr: inner } => Some(TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
-            kind: ExprKind::UnaryOp {
-                op: *op,
-                expr: Box::new(rewrite_predicate_through_project(inner, proj, arena)?),
-            },
-        }),
-        ExprKind::FunctionCall {
+    project_items: &[ScalarProjectItem],
+) -> HashMap<ColumnId, Option<ScalarId>> {
+    let mut bindings = HashMap::new();
+    for item in project_items {
+        if item.output_column_id == ColumnId::UNSET {
+            continue;
+        }
+        let input = match arena.node(item.expr) {
+            ScalarNode::ColumnRef(input_id) if *input_id != ColumnId::UNSET => Some(item.expr),
+            _ => None,
+        };
+        bindings.insert(item.output_column_id, input);
+    }
+    bindings
+}
+
+fn remap_scalar(
+    arena: &mut ScalarArena,
+    expr: ScalarId,
+    bindings: &HashMap<ColumnId, Option<ScalarId>>,
+) -> Option<ScalarId> {
+    let node = arena.node(expr).clone();
+    let data_type = arena.data_type(expr).clone();
+    let nullable = arena.nullable(expr);
+    match node {
+        ScalarNode::ColumnRef(column_id) => bindings.get(&column_id).copied().flatten(),
+        ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => Some(expr),
+        ScalarNode::BinaryOp { op, left, right } => {
+            let left = remap_scalar(arena, left, bindings)?;
+            let right = remap_scalar(arena, right, bindings)?;
+            Some(arena.intern(
+                ScalarNode::BinaryOp { op, left, right },
+                data_type,
+                nullable,
+            ))
+        }
+        ScalarNode::UnaryOp { op, child } => {
+            let child = remap_scalar(arena, child, bindings)?;
+            Some(arena.intern(ScalarNode::UnaryOp { op, child }, data_type, nullable))
+        }
+        ScalarNode::FunctionCall {
             name,
             args,
             distinct,
-        } => Some(TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
-            kind: ExprKind::FunctionCall {
-                name: name.clone(),
-                args: rewrite_expr_list_through_project(args, proj, arena)?,
-                distinct: *distinct,
-            },
-        }),
-        ExprKind::LambdaFunction { params, body } => Some(TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
-            kind: ExprKind::LambdaFunction {
-                params: params.clone(),
-                body: Box::new(rewrite_predicate_through_project(body, proj, arena)?),
-            },
-        }),
-        ExprKind::AggregateCall {
+        } => {
+            let args = remap_scalar_vec(arena, args, bindings)?;
+            Some(arena.intern(
+                ScalarNode::FunctionCall {
+                    name,
+                    args,
+                    distinct,
+                },
+                data_type,
+                nullable,
+            ))
+        }
+        ScalarNode::LambdaFunction { params, body } => {
+            let body = remap_scalar(arena, body, bindings)?;
+            Some(arena.intern(
+                ScalarNode::LambdaFunction { params, body },
+                data_type,
+                nullable,
+            ))
+        }
+        ScalarNode::AggregateCall {
             name,
             args,
             distinct,
             order_by,
-        } => Some(TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
-            kind: ExprKind::AggregateCall {
-                name: name.clone(),
-                args: rewrite_expr_list_through_project(args, proj, arena)?,
-                distinct: *distinct,
-                order_by: order_by
-                    .iter()
-                    .map(|item| {
-                        rewrite_predicate_through_project(&item.expr, proj, arena).map(|expr| {
-                            SortItem {
-                                expr,
-                                asc: item.asc,
-                                nulls_first: item.nulls_first,
-                            }
-                        })
-                    })
-                    .collect::<Option<Vec<_>>>()?,
-            },
-        }),
-        ExprKind::Cast {
-            expr: inner,
-            target,
-        } => Some(TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
-            kind: ExprKind::Cast {
-                expr: Box::new(rewrite_predicate_through_project(inner, proj, arena)?),
-                target: target.clone(),
-            },
-        }),
-        ExprKind::IsNull {
-            expr: inner,
-            negated,
-        } => Some(TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
-            kind: ExprKind::IsNull {
-                expr: Box::new(rewrite_predicate_through_project(inner, proj, arena)?),
-                negated: *negated,
-            },
-        }),
-        ExprKind::InList {
-            expr: inner,
+        } => {
+            let args = remap_scalar_vec(arena, args, bindings)?;
+            let order_by = remap_sort_keys(arena, order_by, bindings)?;
+            Some(arena.intern(
+                ScalarNode::AggregateCall {
+                    name,
+                    args,
+                    distinct,
+                    order_by,
+                },
+                data_type,
+                nullable,
+            ))
+        }
+        ScalarNode::Cast { child, target } => {
+            let child = remap_scalar(arena, child, bindings)?;
+            Some(arena.intern(ScalarNode::Cast { child, target }, data_type, nullable))
+        }
+        ScalarNode::IsNull { child, negated } => {
+            let child = remap_scalar(arena, child, bindings)?;
+            Some(arena.intern(ScalarNode::IsNull { child, negated }, data_type, nullable))
+        }
+        ScalarNode::InList {
+            child,
             list,
             negated,
-        } => Some(TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
-            kind: ExprKind::InList {
-                expr: Box::new(rewrite_predicate_through_project(inner, proj, arena)?),
-                list: rewrite_expr_list_through_project(list, proj, arena)?,
-                negated: *negated,
-            },
-        }),
-        ExprKind::Between {
-            expr: inner,
+        } => {
+            let child = remap_scalar(arena, child, bindings)?;
+            let list = remap_scalar_vec(arena, list, bindings)?;
+            Some(arena.intern(
+                ScalarNode::InList {
+                    child,
+                    list,
+                    negated,
+                },
+                data_type,
+                nullable,
+            ))
+        }
+        ScalarNode::Between {
+            child,
             low,
             high,
             negated,
-        } => Some(TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
-            kind: ExprKind::Between {
-                expr: Box::new(rewrite_predicate_through_project(inner, proj, arena)?),
-                low: Box::new(rewrite_predicate_through_project(low, proj, arena)?),
-                high: Box::new(rewrite_predicate_through_project(high, proj, arena)?),
-                negated: *negated,
-            },
-        }),
-        ExprKind::Like {
-            expr: inner,
+        } => {
+            let child = remap_scalar(arena, child, bindings)?;
+            let low = remap_scalar(arena, low, bindings)?;
+            let high = remap_scalar(arena, high, bindings)?;
+            Some(arena.intern(
+                ScalarNode::Between {
+                    child,
+                    low,
+                    high,
+                    negated,
+                },
+                data_type,
+                nullable,
+            ))
+        }
+        ScalarNode::Like {
+            child,
             pattern,
             negated,
-        } => Some(TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
-            kind: ExprKind::Like {
-                expr: Box::new(rewrite_predicate_through_project(inner, proj, arena)?),
-                pattern: Box::new(rewrite_predicate_through_project(pattern, proj, arena)?),
-                negated: *negated,
-            },
-        }),
-        ExprKind::Case {
+        } => {
+            let child = remap_scalar(arena, child, bindings)?;
+            let pattern = remap_scalar(arena, pattern, bindings)?;
+            Some(arena.intern(
+                ScalarNode::Like {
+                    child,
+                    pattern,
+                    negated,
+                },
+                data_type,
+                nullable,
+            ))
+        }
+        ScalarNode::Case {
             operand,
             when_then,
             else_expr,
-        } => Some(TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
-            kind: ExprKind::Case {
-                operand: match operand {
-                    Some(operand) => Some(Box::new(rewrite_predicate_through_project(
-                        operand, proj, arena,
-                    )?)),
-                    None => None,
+        } => {
+            let operand = remap_optional_scalar(arena, operand, bindings)?;
+            let when_then = when_then
+                .into_iter()
+                .map(|(when, then)| {
+                    Some((
+                        remap_scalar(arena, when, bindings)?,
+                        remap_scalar(arena, then, bindings)?,
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            let else_expr = remap_optional_scalar(arena, else_expr, bindings)?;
+            Some(arena.intern(
+                ScalarNode::Case {
+                    operand,
+                    when_then,
+                    else_expr,
                 },
-                when_then: when_then
-                    .iter()
-                    .map(|(when, then)| {
-                        Some((
-                            rewrite_predicate_through_project(when, proj, arena)?,
-                            rewrite_predicate_through_project(then, proj, arena)?,
-                        ))
-                    })
-                    .collect::<Option<Vec<_>>>()?,
-                else_expr: match else_expr {
-                    Some(else_expr) => Some(Box::new(rewrite_predicate_through_project(
-                        else_expr, proj, arena,
-                    )?)),
-                    None => None,
-                },
-            },
-        }),
-        ExprKind::IsTruthValue {
-            expr: inner,
+                data_type,
+                nullable,
+            ))
+        }
+        ScalarNode::IsTruthValue {
+            child,
             value,
             negated,
-        } => Some(TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
-            kind: ExprKind::IsTruthValue {
-                expr: Box::new(rewrite_predicate_through_project(inner, proj, arena)?),
-                value: *value,
-                negated: *negated,
-            },
-        }),
-        ExprKind::Nested(inner) => Some(TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
-            kind: ExprKind::Nested(Box::new(rewrite_predicate_through_project(
-                inner, proj, arena,
-            )?)),
-        }),
-        ExprKind::WindowCall {
+        } => {
+            let child = remap_scalar(arena, child, bindings)?;
+            Some(arena.intern(
+                ScalarNode::IsTruthValue {
+                    child,
+                    value,
+                    negated,
+                },
+                data_type,
+                nullable,
+            ))
+        }
+        ScalarNode::Nested(child) => {
+            let child = remap_scalar(arena, child, bindings)?;
+            Some(arena.intern(ScalarNode::Nested(child), data_type, nullable))
+        }
+        ScalarNode::WindowCall {
             name,
             args,
             distinct,
@@ -309,100 +317,68 @@ fn rewrite_predicate_through_project(
             order_by,
             window_frame,
             ignore_nulls,
-        } => Some(TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
-            kind: ExprKind::WindowCall {
-                name: name.clone(),
-                args: rewrite_expr_list_through_project(args, proj, arena)?,
-                distinct: *distinct,
-                partition_by: rewrite_expr_list_through_project(partition_by, proj, arena)?,
-                order_by: order_by
-                    .iter()
-                    .map(|item| {
-                        rewrite_predicate_through_project(&item.expr, proj, arena).map(|expr| {
-                            SortItem {
-                                expr,
-                                asc: item.asc,
-                                nulls_first: item.nulls_first,
-                            }
-                        })
-                    })
-                    .collect::<Option<Vec<_>>>()?,
-                window_frame: window_frame.clone(),
-                ignore_nulls: *ignore_nulls,
-            },
-        }),
-        ExprKind::SubqueryPlaceholder { .. } => Some(expr.clone()),
-        ExprKind::Lambda { params, body } => Some(TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
-            kind: ExprKind::Lambda {
-                params: params.clone(),
-                body: Box::new(rewrite_predicate_through_project(body, proj, arena)?),
-            },
-        }),
+        } => {
+            let args = remap_scalar_vec(arena, args, bindings)?;
+            let partition_by = remap_scalar_vec(arena, partition_by, bindings)?;
+            let order_by = remap_sort_keys(arena, order_by, bindings)?;
+            Some(arena.intern(
+                ScalarNode::WindowCall {
+                    name,
+                    args,
+                    distinct,
+                    partition_by,
+                    order_by,
+                    window_frame,
+                    ignore_nulls,
+                },
+                data_type,
+                nullable,
+            ))
+        }
+        ScalarNode::Lambda { params, body } => {
+            let body = remap_scalar(arena, body, bindings)?;
+            Some(arena.intern(ScalarNode::Lambda { params, body }, data_type, nullable))
+        }
     }
 }
 
-fn rewrite_expr_list_through_project(
-    exprs: &[TypedExpr],
-    proj: &ProjectOp,
-    arena: &ScalarArena,
-) -> Option<Vec<TypedExpr>> {
+fn remap_scalar_vec(
+    arena: &mut ScalarArena,
+    exprs: Vec<ScalarId>,
+    bindings: &HashMap<ColumnId, Option<ScalarId>>,
+) -> Option<Vec<ScalarId>> {
     exprs
-        .iter()
-        .map(|expr| rewrite_predicate_through_project(expr, proj, arena))
+        .into_iter()
+        .map(|expr| remap_scalar(arena, expr, bindings))
         .collect()
 }
 
-/// Look up a ColumnRef in the project items. Returns the underlying input
-/// expression only when the item is a passthrough (bare ColumnRef) item.
-/// The item's `expr` is a `ScalarId` — we materialize it to check if it's a
-/// ColumnRef, and if so return the materialized expression as the rewritten ref.
-fn lookup_passthrough_projection(
-    column_id: ColumnId,
-    qualifier: Option<&str>,
-    column: &str,
-    proj: &ProjectOp,
-    arena: &ScalarArena,
-) -> Option<TypedExpr> {
-    use crate::sql::optimizer::scalar::ScalarNode;
-    for item in &proj.items {
-        // Check directly whether the item is a bare ColumnRef without going
-        // through the display-lookup path (which can be polluted by later
-        // intern_typed calls that overwrite the qualifier for the same column_id).
-        let ScalarNode::ColumnRef(input_col_id) = arena.node(item.expr) else {
-            continue;
-        };
-        let input_col_id = *input_col_id;
-        // The pushed predicate must reference the INPUT column without the
-        // project's output_qualifier — the qualifier belongs to the project's
-        // aliased output, not the underlying column.
-        let stripped = TypedExpr {
-            data_type: arena.data_type(item.expr).clone(),
-            nullable: arena.nullable(item.expr),
-            kind: ExprKind::ColumnRef {
-                column_id: input_col_id,
-                qualifier: None,
-                column: item.output_name.clone(),
-            },
-        };
-        if column_id != ColumnId::UNSET && item.output_column_id == column_id {
-            return Some(stripped);
-        }
-        if let Some(ref output_qualifier) = proj.output_qualifier
-            && !qualifier
-                .map(|q| q.eq_ignore_ascii_case(output_qualifier))
-                .unwrap_or(true)
-        {
-            continue;
-        }
-        if item.output_name.eq_ignore_ascii_case(column) {
-            return Some(stripped);
-        }
+fn remap_optional_scalar(
+    arena: &mut ScalarArena,
+    expr: Option<ScalarId>,
+    bindings: &HashMap<ColumnId, Option<ScalarId>>,
+) -> Option<Option<ScalarId>> {
+    match expr {
+        Some(expr) => Some(Some(remap_scalar(arena, expr, bindings)?)),
+        None => Some(None),
     }
-    None
+}
+
+fn remap_sort_keys(
+    arena: &mut ScalarArena,
+    keys: Vec<SortKey>,
+    bindings: &HashMap<ColumnId, Option<ScalarId>>,
+) -> Option<Vec<SortKey>> {
+    keys.into_iter()
+        .map(|key| {
+            Some(SortKey {
+                expr: remap_scalar(arena, key.expr, bindings)?,
+                asc: key.asc,
+                nulls_first: key.nulls_first,
+                display: key.display,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]

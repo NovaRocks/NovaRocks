@@ -1385,6 +1385,22 @@ pub(crate) fn wrap_remaining_filter_opt(
     OptExpr::new(Operator::LogicalFilter(FilterOp { predicate }), vec![plan])
 }
 
+/// Wrap an `OptExpr` in a `LogicalFilter` if scalar conjuncts remain.
+pub(crate) fn wrap_remaining_filter_opt_scalar(
+    plan: OptExpr,
+    remaining: Vec<ScalarId>,
+    arena: &mut ScalarArena,
+) -> OptExpr {
+    if remaining.is_empty() {
+        return plan;
+    }
+    let Some(predicate) = crate::sql::optimizer::scalar_expr::combine_conjuncts(arena, remaining)
+    else {
+        return plan;
+    };
+    OptExpr::new(Operator::LogicalFilter(FilterOp { predicate }), vec![plan])
+}
+
 /// Extract equi-join key pairs from an `OptExpr` join.
 pub(crate) fn join_equi_keys_opt(
     join_op: &LogicalJoinOp,
