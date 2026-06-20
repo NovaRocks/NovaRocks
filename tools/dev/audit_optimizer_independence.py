@@ -96,6 +96,11 @@ FORBIDDEN_IMPORT_PATTERN = re.compile(
     r")"
 )
 
+USE_ITEM_START_PATTERN = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?use\b")
+FORBIDDEN_IMPORT_COMPONENT_PATTERN = re.compile(
+    r"\b(?:analysis|planner|codegen|engine)\s*::"
+)
+
 
 def starts_raw_string(line: str, i: int) -> tuple[int, int] | None:
     start = i
@@ -256,9 +261,25 @@ def skip_test_item_state(line: str) -> tuple[bool, int | None]:
     return True, None
 
 
+def buffered_use_import_hit(
+    use_item_lines: list[tuple[int, str, str]],
+) -> tuple[int, str] | None:
+    code = "\n".join(code_line for _, code_line, _ in use_item_lines)
+    if not FORBIDDEN_IMPORT_PATTERN.search(code):
+        return None
+
+    for lineno, code_line, original_line in use_item_lines:
+        if FORBIDDEN_IMPORT_COMPONENT_PATTERN.search(code_line):
+            return lineno, original_line
+
+    lineno, _, original_line = use_item_lines[0]
+    return lineno, original_line
+
+
 def production_hits(path: Path):
     pending_test_item = False
     test_item_brace_depth = None
+    use_item_lines: list[tuple[int, str, str]] | None = None
     scanner_state: dict[str, object] = {
         "block_depth": 0,
         "raw_hashes": None,
@@ -294,7 +315,19 @@ def production_hits(path: Path):
             continue
 
         symbol_hit = FORBIDDEN_SYMBOL_PATTERN.search(code_line)
-        import_hit = FORBIDDEN_IMPORT_PATTERN.search(code_line)
+        import_hit = None
+        buffered_import_hit = None
+
+        if use_item_lines is not None:
+            use_item_lines.append((lineno, code_line, line.rstrip()))
+            if ";" in code_line:
+                buffered_import_hit = buffered_use_import_hit(use_item_lines)
+                use_item_lines = None
+        elif USE_ITEM_START_PATTERN.search(code_line) and ";" not in code_line:
+            use_item_lines = [(lineno, code_line, line.rstrip())]
+        else:
+            import_hit = FORBIDDEN_IMPORT_PATTERN.search(code_line)
+
         if symbol_hit or import_hit:
             kinds = []
             if symbol_hit:
@@ -302,6 +335,9 @@ def production_hits(path: Path):
             if import_hit:
                 kinds.append("import")
             yield lineno, ",".join(kinds), line.rstrip()
+        if buffered_import_hit:
+            import_lineno, import_line = buffered_import_hit
+            yield import_lineno, "import", import_line
 
 
 def main() -> int:
