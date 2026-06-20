@@ -17,7 +17,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::sql::analysis::ExprKind;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::Operator;
@@ -27,9 +26,9 @@ use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
 use crate::sql::optimizer::rewrite::rules::utils::{
-    collect_column_id_refs, collect_output_ids_opt, collect_output_ids_ordered_opt,
+    collect_output_ids_opt, collect_output_ids_ordered_opt,
 };
-use crate::sql::optimizer::scalar::{self, ScalarArena};
+use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -164,6 +163,108 @@ fn tag_generate_series(mut expr: OptExpr, parent_needed: Option<HashSet<ColumnId
 // Unary handlers
 // ---------------------------------------------------------------------------
 
+fn collect_scalar_column_id_refs(arena: &ScalarArena, expr: ScalarId) -> HashSet<ColumnId> {
+    let mut out = HashSet::new();
+    collect_scalar_column_id_refs_inner(arena, expr, &mut out);
+    out
+}
+
+fn collect_scalar_column_id_refs_inner(
+    arena: &ScalarArena,
+    expr: ScalarId,
+    out: &mut HashSet<ColumnId>,
+) {
+    match arena.node(expr) {
+        ScalarNode::ColumnRef(column_id) => {
+            if *column_id != ColumnId::UNSET {
+                out.insert(*column_id);
+            }
+        }
+        ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {}
+        ScalarNode::BinaryOp { left, right, .. } => {
+            collect_scalar_column_id_refs_inner(arena, *left, out);
+            collect_scalar_column_id_refs_inner(arena, *right, out);
+        }
+        ScalarNode::UnaryOp { child, .. }
+        | ScalarNode::Cast { child, .. }
+        | ScalarNode::IsNull { child, .. }
+        | ScalarNode::IsTruthValue { child, .. }
+        | ScalarNode::Nested(child) => collect_scalar_column_id_refs_inner(arena, *child, out),
+        ScalarNode::FunctionCall { args, .. } => {
+            for arg in args {
+                collect_scalar_column_id_refs_inner(arena, *arg, out);
+            }
+        }
+        ScalarNode::LambdaFunction { body, .. } | ScalarNode::Lambda { body, .. } => {
+            collect_scalar_column_id_refs_inner(arena, *body, out);
+        }
+        ScalarNode::AggregateCall { args, order_by, .. } => {
+            for arg in args {
+                collect_scalar_column_id_refs_inner(arena, *arg, out);
+            }
+            for item in order_by {
+                collect_scalar_column_id_refs_inner(arena, item.expr, out);
+            }
+        }
+        ScalarNode::InList { child, list, .. } => {
+            collect_scalar_column_id_refs_inner(arena, *child, out);
+            for item in list {
+                collect_scalar_column_id_refs_inner(arena, *item, out);
+            }
+        }
+        ScalarNode::Between {
+            child, low, high, ..
+        } => {
+            collect_scalar_column_id_refs_inner(arena, *child, out);
+            collect_scalar_column_id_refs_inner(arena, *low, out);
+            collect_scalar_column_id_refs_inner(arena, *high, out);
+        }
+        ScalarNode::Like { child, pattern, .. } => {
+            collect_scalar_column_id_refs_inner(arena, *child, out);
+            collect_scalar_column_id_refs_inner(arena, *pattern, out);
+        }
+        ScalarNode::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(operand) = operand {
+                collect_scalar_column_id_refs_inner(arena, *operand, out);
+            }
+            for (when, then) in when_then {
+                collect_scalar_column_id_refs_inner(arena, *when, out);
+                collect_scalar_column_id_refs_inner(arena, *then, out);
+            }
+            if let Some(else_expr) = else_expr {
+                collect_scalar_column_id_refs_inner(arena, *else_expr, out);
+            }
+        }
+        ScalarNode::WindowCall {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for arg in args {
+                collect_scalar_column_id_refs_inner(arena, *arg, out);
+            }
+            for item in partition_by {
+                collect_scalar_column_id_refs_inner(arena, *item, out);
+            }
+            for item in order_by {
+                collect_scalar_column_id_refs_inner(arena, item.expr, out);
+            }
+        }
+    }
+}
+
+fn scalar_is_assert_true(arena: &ScalarArena, expr: ScalarId) -> bool {
+    matches!(
+        arena.node(expr),
+        ScalarNode::FunctionCall { name, .. } if name == "assert_true"
+    )
+}
+
 fn tag_project(
     mut expr: OptExpr,
     arena: &ScalarArena,
@@ -188,20 +289,11 @@ fn tag_project(
             None => true,
             Some(n) => {
                 let is_needed = n.contains(&item.output_column_id);
-                let is_assert_true = {
-                    let materialized = scalar::materialize(arena, item.expr);
-                    matches!(
-                        &materialized.kind,
-                        ExprKind::FunctionCall { name, .. } if name == "assert_true"
-                    )
-                };
+                let is_assert_true = scalar_is_assert_true(arena, item.expr);
                 is_needed || is_assert_true
             }
         })
-        .flat_map(|item| {
-            let materialized = scalar::materialize(arena, item.expr);
-            collect_column_id_refs(&materialized)
-        })
+        .flat_map(|item| collect_scalar_column_id_refs(arena, item.expr))
         .collect();
     let mut children = expr.children;
     let input = children.remove(0);
@@ -225,10 +317,9 @@ fn tag_filter(
     // the predicate.  When parent_needed is None (keep all), propagate None so
     // the child also keeps all columns instead of collapsing to just the
     // predicate refs.
-    let predicate_typed = scalar::materialize(arena, node.predicate);
     let child_needed = parent_needed.as_ref().map(|needed| {
         let mut child = needed.clone();
-        child.extend(collect_column_id_refs(&predicate_typed));
+        child.extend(collect_scalar_column_id_refs(arena, node.predicate));
         child
     });
     let mut children = expr.children;
@@ -254,12 +345,10 @@ fn tag_sort(
     let child_needed = parent_needed.as_ref().map(|needed| {
         let mut child = needed.clone();
         for item in &node.items {
-            let typed = scalar::materialize(arena, item.expr);
-            child.extend(collect_column_id_refs(&typed));
+            child.extend(collect_scalar_column_id_refs(arena, item.expr));
         }
         for &sid in &node.analytic_partition_exprs {
-            let typed = scalar::materialize(arena, sid);
-            child.extend(collect_column_id_refs(&typed));
+            child.extend(collect_scalar_column_id_refs(arena, sid));
         }
         child
     });
@@ -320,17 +409,14 @@ fn tag_aggregate(
     let child_needed: Option<HashSet<ColumnId>> = parent_needed.as_ref().map(|_| {
         let mut needed: HashSet<ColumnId> = HashSet::new();
         for &gb in &node.group_by {
-            let typed = scalar::materialize(arena, gb);
-            needed.extend(collect_column_id_refs(&typed));
+            needed.extend(collect_scalar_column_id_refs(arena, gb));
         }
         for agg in &node.aggregates {
             for &arg in &agg.args {
-                let typed = scalar::materialize(arena, arg);
-                needed.extend(collect_column_id_refs(&typed));
+                needed.extend(collect_scalar_column_id_refs(arena, arg));
             }
             for item in &agg.order_by {
-                let typed = scalar::materialize(arena, item.expr);
-                needed.extend(collect_column_id_refs(&typed));
+                needed.extend(collect_scalar_column_id_refs(arena, item.expr));
             }
         }
         needed
@@ -458,8 +544,7 @@ fn tag_join(
         None => (None, None),
         Some(mut combined) => {
             if let Some(cond_id) = node.condition {
-                let cond_typed = scalar::materialize(arena, cond_id);
-                combined.extend(collect_column_id_refs(&cond_typed));
+                combined.extend(collect_scalar_column_id_refs(arena, cond_id));
             }
             let left_outputs = collect_output_ids_opt(expr.left());
             let right_outputs = collect_output_ids_opt(expr.right());
@@ -2022,7 +2107,6 @@ mod tests {
     fn tag_required_columns_rule_runs_through_pipeline_and_stamps_nodes() {
         use crate::sql::optimizer::rewrite::context::RewriteContext;
         use crate::sql::optimizer::rewrite::registry::query_rewrite_pipeline;
-        use crate::sql::optimizer::scalar;
         use std::collections::HashMap;
 
         let arena_rc = make_arena();
