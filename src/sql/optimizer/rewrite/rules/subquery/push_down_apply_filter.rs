@@ -11,20 +11,17 @@
 
 use std::collections::HashSet;
 
-use super::bridge::{opt_expr_to_plan, plan_to_opt_expr};
-use super::decorrelate_util::{all_binary_eq, orient_eq, partition_conjuncts};
-use crate::sql::analysis::ExprKind;
+use super::decorrelate_util::{all_binary_eq_opt, orient_eq_opt, partition_conjuncts_opt};
+use super::scalar_utils;
 use crate::sql::column_id::ColumnId;
+use crate::sql::optimizer::operator::{FilterOp, Operator, ProjectOp};
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::optimizer::rewrite::rules::utils::combine_and;
-use crate::sql::planner::plan::{
-    ApplyKind, LogicalApplyNode, LogicalFilterNode, LogicalPlanNode, LogicalProjectNode,
-    PlanNodeKind,
-};
+use crate::sql::optimizer::scalar::ScalarArena;
+use crate::sql::planner::plan::ApplyKind;
 
 pub(crate) struct PushDownApplyFilter;
 
@@ -39,25 +36,21 @@ impl LogicalRewriteRule for PushDownApplyFilter {
 
     fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
         let arena = ctx.scalar_arena();
-        let plan = opt_expr_to_plan(expr, &arena.borrow());
-        matches_plan(&plan)
+        matches_expr(expr, &arena.borrow())
     }
 
     fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         let arena = ctx.scalar_arena();
-        let plan = opt_expr_to_plan(&expr, &arena.borrow());
-        match apply_plan(plan)? {
-            Some(new_plan) => {
-                let new_expr = plan_to_opt_expr(&new_plan, &mut arena.borrow_mut());
-                Ok(RewriteResult::Changed(new_expr))
-            }
+        let mut arena = arena.borrow_mut();
+        match apply_expr(expr, &mut arena)? {
+            Some(new_expr) => Ok(RewriteResult::Changed(new_expr)),
             None => Ok(RewriteResult::Unchanged),
         }
     }
 }
 
-fn matches_plan(plan: &LogicalPlanNode) -> bool {
-    let PlanNodeKind::Apply(a) = &plan.kind else {
+fn matches_expr(expr: &OptExpr, arena: &ScalarArena) -> bool {
+    let Operator::LogicalApply(a) = &expr.op else {
         return false;
     };
     if a.kind != ApplyKind::Scalar {
@@ -67,16 +60,16 @@ fn matches_plan(plan: &LogicalPlanNode) -> bool {
         return false;
     }
     let corr_ids: HashSet<ColumnId> = a.correlation_column_ids.iter().copied().collect();
-    inner_has_correlated_nonagg_filter(plan.right(), &corr_ids)
+    inner_has_correlated_nonagg_filter(expr.right(), arena, &corr_ids)
 }
 
-fn apply_plan(plan: LogicalPlanNode) -> Result<Option<LogicalPlanNode>, String> {
-    let LogicalPlanNode {
-        kind,
+fn apply_expr(expr: OptExpr, arena: &mut ScalarArena) -> Result<Option<OptExpr>, String> {
+    let OptExpr {
+        op,
         mut children,
         required_output_columns,
-    } = plan;
-    let PlanNodeKind::Apply(a) = kind else {
+    } = expr;
+    let Operator::LogicalApply(mut apply) = op else {
         return Ok(None);
     };
     if children.len() != 2 {
@@ -84,21 +77,21 @@ fn apply_plan(plan: LogicalPlanNode) -> Result<Option<LogicalPlanNode>, String> 
     }
     let right = children.remove(1);
     let left = children.remove(0);
-    let corr_ids: HashSet<ColumnId> = a.correlation_column_ids.iter().copied().collect();
+    let corr_ids: HashSet<ColumnId> = apply.correlation_column_ids.iter().copied().collect();
 
     // Peel the optional leading Project and extract the filter node.
-    let peeled = peel_inner(&right, &corr_ids)
+    let peeled = peel_inner(right, arena, &corr_ids)
         .ok_or_else(|| "PushDownApplyFilter: inner shape mismatch".to_string())?;
 
     // Split the Filter predicate into (correlated, residual).
-    let predicate = peeled.filter.predicate.clone();
-    let (correlated, residual) = partition_conjuncts(predicate, &corr_ids);
+    let predicate = peeled.filter.predicate;
+    let (correlated, residual) = partition_conjuncts_opt(arena, predicate, &corr_ids);
 
     // If nothing to hoist, leave unchanged.
     if correlated.is_empty() {
         return Ok(None);
     }
-    if !all_binary_eq(&correlated) {
+    if !all_binary_eq_opt(arena, &correlated) {
         return Err(
             "non-EQ correlated predicate in correlated subquery is not supported".to_string(),
         );
@@ -107,37 +100,33 @@ fn apply_plan(plan: LogicalPlanNode) -> Result<Option<LogicalPlanNode>, String> 
     // Require each correlated EQ conjunct's inner side to be a ColumnRef.
     // Non-column inner sides are out of M1b scope — fall back to Unchanged.
     for conj in &correlated {
-        let Some((_, inner_side)) = orient_eq(conj, &corr_ids) else {
+        let Some((_, inner_side)) = orient_eq_opt(arena, *conj, &corr_ids) else {
             return Ok(None);
         };
-        if !matches!(&inner_side.kind, ExprKind::ColumnRef { .. }) {
+        if scalar_utils::is_column_ref(arena, inner_side).is_none() {
             return Ok(None);
         }
     }
 
     // Rebuild the filter input: drop the Filter if all conjuncts were correlated,
     // or keep a Filter with only the residual conjuncts.
-    let new_filter_input: LogicalPlanNode = if residual.is_empty() {
-        peeled.filter_input.clone()
+    let new_filter_input = if residual.is_empty() {
+        peeled.filter_input
     } else {
-        LogicalPlanNode::new(
-            PlanNodeKind::Filter(LogicalFilterNode {
-                predicate: combine_and(residual),
-            }),
-            vec![peeled.filter_input.clone()],
-            None,
-        )
+        let Some(predicate) = scalar_utils::combine_and(arena, residual) else {
+            return Ok(None);
+        };
+        scalar_utils::filter(peeled.filter_input, predicate)
     };
 
     // Re-wrap in the leading Project if present (input is updated to the new filter input).
-    let new_inner: LogicalPlanNode = if let Some(proj) = peeled.leading_project {
-        LogicalPlanNode::new(
-            PlanNodeKind::Project(LogicalProjectNode {
-                items: proj.items.clone(),
-                output_qualifier: proj.output_qualifier.clone(),
+    let new_inner = if let Some(project) = peeled.leading_project {
+        OptExpr::new(
+            Operator::LogicalProject(ProjectOp {
+                items: project.items,
+                output_qualifier: project.output_qualifier,
             }),
             vec![new_filter_input],
-            None,
         )
     } else {
         new_filter_input
@@ -145,19 +134,13 @@ fn apply_plan(plan: LogicalPlanNode) -> Result<Option<LogicalPlanNode>, String> 
 
     // Append the correlated EQ conjuncts to correlation_conjuncts.
     // need_check_max_rows stays true — ScalarApplyToJoin's with-check branch handles this.
-    let mut new_correlation = a.correlation_conjuncts.clone();
-    new_correlation.extend(correlated);
+    apply.correlation_conjuncts.extend(correlated);
 
-    Ok(Some(LogicalPlanNode::new(
-        PlanNodeKind::Apply(LogicalApplyNode {
-            correlation_conjuncts: new_correlation,
-            // need_check_max_rows stays true: no aggregate → ScalarApplyToJoin
-            // must add the count(1)/any_value/assert_true row-check.
-            ..a
-        }),
-        vec![left, new_inner],
+    Ok(Some(OptExpr {
+        op: Operator::LogicalApply(apply),
+        children: vec![left, new_inner],
         required_output_columns,
-    )))
+    }))
 }
 
 /// Returns true iff the given plan has the shape:
@@ -168,52 +151,67 @@ fn apply_plan(plan: LogicalPlanNode) -> Result<Option<LogicalPlanNode>, String> 
 /// If the inner is `Aggregate(Filter(...))` this returns false so that
 /// `PushDownApplyAggFilter` can own it (mutual exclusion guarantee).
 fn inner_has_correlated_nonagg_filter(
-    plan: &LogicalPlanNode,
+    plan: &OptExpr,
+    arena: &ScalarArena,
     corr_ids: &HashSet<ColumnId>,
 ) -> bool {
-    let after_project = if matches!(&plan.kind, PlanNodeKind::Project(_)) {
+    let after_project = if matches!(&plan.op, Operator::LogicalProject(_)) {
         plan.unary_input()
     } else {
         plan
     };
     // The node after the optional project must be a Filter, NOT an Aggregate.
     // An Aggregate (possibly over a Filter) belongs to PushDownApplyAggFilter.
-    match &after_project.kind {
-        PlanNodeKind::Aggregate(_) => false,
-        PlanNodeKind::Filter(f) => {
+    match &after_project.op {
+        Operator::LogicalAggregate(_) => false,
+        Operator::LogicalFilter(filter) => {
             // At least one conjunct must reference a corr_id.
-            use crate::sql::optimizer::rewrite::rules::utils::{collect_column_id_refs, split_and};
-            split_and(f.predicate.clone())
+            scalar_utils::split_and(arena, filter.predicate)
                 .iter()
-                .any(|c| !collect_column_id_refs(c).is_disjoint(corr_ids))
+                .any(|conjunct| scalar_utils::scalar_refs_any(arena, *conjunct, corr_ids))
         }
         _ => false,
     }
 }
 
-struct PeeledFilter<'a> {
-    leading_project: Option<&'a LogicalProjectNode>,
-    filter: &'a LogicalFilterNode,
-    filter_input: &'a LogicalPlanNode,
+struct PeeledFilter {
+    leading_project: Option<ProjectOp>,
+    filter: FilterOp,
+    filter_input: OptExpr,
 }
 
 /// Destructures the inner plan into `[Project?] Filter(input)`.
 /// Returns `None` if the shape doesn't match (non-agg Filter required).
-fn peel_inner<'a>(
-    plan: &'a LogicalPlanNode,
+fn peel_inner(
+    plan: OptExpr,
+    arena: &ScalarArena,
     corr_ids: &HashSet<ColumnId>,
-) -> Option<PeeledFilter<'a>> {
-    match &plan.kind {
-        PlanNodeKind::Project(proj) => {
-            let (filter, filter_input) = peel_corr_filter(plan.unary_input(), corr_ids)?;
+) -> Option<PeeledFilter> {
+    let OptExpr {
+        op,
+        children,
+        required_output_columns,
+    } = plan;
+    match op {
+        Operator::LogicalProject(project) => {
+            if children.len() != 1 {
+                return None;
+            }
+            let input = children.into_iter().next()?;
+            let (filter, filter_input) = peel_corr_filter(input, arena, corr_ids)?;
             Some(PeeledFilter {
-                leading_project: Some(proj),
+                leading_project: Some(project),
                 filter,
                 filter_input,
             })
         }
         _ => {
-            let (filter, filter_input) = peel_corr_filter(plan, corr_ids)?;
+            let plan = OptExpr {
+                op,
+                children,
+                required_output_columns,
+            };
+            let (filter, filter_input) = peel_corr_filter(plan, arena, corr_ids)?;
             Some(PeeledFilter {
                 leading_project: None,
                 filter,
@@ -223,22 +221,30 @@ fn peel_inner<'a>(
     }
 }
 
-fn peel_corr_filter<'a>(
-    plan: &'a LogicalPlanNode,
+fn peel_corr_filter(
+    plan: OptExpr,
+    arena: &ScalarArena,
     corr_ids: &HashSet<ColumnId>,
-) -> Option<(&'a LogicalFilterNode, &'a LogicalPlanNode)> {
+) -> Option<(FilterOp, OptExpr)> {
     // Only match a Filter that is NOT an Aggregate-over-Filter (that's PushDownApplyAggFilter).
     // A plain Filter node with a correlated predicate is what we want.
-    let PlanNodeKind::Filter(f) = &plan.kind else {
+    let OptExpr {
+        op,
+        mut children,
+        required_output_columns: _,
+    } = plan;
+    let Operator::LogicalFilter(filter) = op else {
         return None;
     };
+    if children.len() != 1 {
+        return None;
+    }
     // Verify at least one conjunct references a corr_id.
-    use crate::sql::optimizer::rewrite::rules::utils::{collect_column_id_refs, split_and};
-    let has_corr = split_and(f.predicate.clone())
+    let has_corr = scalar_utils::split_and(arena, filter.predicate)
         .iter()
-        .any(|c| !collect_column_id_refs(c).is_disjoint(corr_ids));
+        .any(|conjunct| scalar_utils::scalar_refs_any(arena, *conjunct, corr_ids));
     if has_corr {
-        Some((f, plan.unary_input()))
+        Some((filter, children.remove(0)))
     } else {
         None
     }
@@ -262,6 +268,7 @@ mod tests {
     use crate::sql::optimizer::convert::logical_plan_to_opt_expr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::result::RewriteResult;
+    use crate::sql::optimizer::rewrite::rules::subquery::bridge::opt_expr_to_plan;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::{
         AggregateCall, ApplyKind, LogicalAggregateNode, LogicalApplyNode, LogicalFilterNode,

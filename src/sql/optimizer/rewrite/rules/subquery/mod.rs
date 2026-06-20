@@ -6,6 +6,7 @@
 
 mod apply_exception;
 mod apply_to_window;
+#[cfg(test)]
 mod bridge;
 mod decorrelate_util;
 mod existential_apply_to_join;
@@ -14,6 +15,7 @@ mod push_down_apply_agg_filter;
 mod push_down_apply_filter;
 mod quantified_apply_to_join;
 mod scalar_apply_to_join;
+mod scalar_utils;
 mod win_magic_util;
 
 pub(crate) use apply_exception::ApplyException;

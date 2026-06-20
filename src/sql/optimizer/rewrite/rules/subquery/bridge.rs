@@ -1,16 +1,9 @@
 //! Local bridges between `OptExpr` and `LogicalPlanNode` for subquery rules.
 //!
 //! The subquery rewrite rules were originally written against `LogicalPlanNode`.
-//! This module provides:
-//!   - `opt_expr_to_plan` — materialise an `OptExpr` tree into a `LogicalPlanNode`
-//!     tree by converting all `ScalarId` handles back to `TypedExpr`.
-//!   - `plan_to_opt_expr` — intern a `LogicalPlanNode` tree back into `OptExpr`
-//!     (delegates to the forward bridge in `convert::logical_plan_to_opt_expr`).
-//!
-//! Both functions accept a `&ScalarArena` / `&mut ScalarArena` respectively.
-//! Callers borrow the arena from `ctx.scalar_arena()`.
+//! This module keeps the test-only reverse bridge used by legacy subquery
+//! assertions to materialise `ScalarId` handles back to `TypedExpr`.
 
-use crate::sql::optimizer::convert::logical_plan_to_opt_expr;
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::scalar::{ScalarArena, materialize};
@@ -238,10 +231,4 @@ pub(super) fn opt_expr_to_plan(expr: &OptExpr, arena: &ScalarArena) -> LogicalPl
     let mut plan = LogicalPlanNode::new(kind, children, None);
     plan.required_output_columns = expr.required_output_columns.clone();
     plan
-}
-
-/// Intern a `LogicalPlanNode` tree back into an `OptExpr` tree.
-/// All `TypedExpr` scalars are interned into the provided `ScalarArena`.
-pub(super) fn plan_to_opt_expr(plan: &LogicalPlanNode, arena: &mut ScalarArena) -> OptExpr {
-    logical_plan_to_opt_expr(plan, arena)
 }

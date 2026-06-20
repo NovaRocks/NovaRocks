@@ -19,21 +19,19 @@ use std::collections::HashSet;
 
 use arrow::datatypes::DataType;
 
-use super::bridge::{opt_expr_to_plan, plan_to_opt_expr};
-use super::decorrelate_util::orient_eq;
-use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
+use super::scalar_utils;
+use crate::sql::analysis::{BinOp, JoinKind, OutputColumn};
 use crate::sql::column_id::ColumnId;
+use crate::sql::optimizer::operator::{
+    AssertOneRowOp, LogicalAggregateOp, Operator, ProjectOp, ScalarProjectItem,
+};
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::optimizer::rewrite::rules::utils::combine_and;
-use crate::sql::planner::plan::{
-    AggregateCall, ApplyKind, LogicalAggregateNode, LogicalAssertOneRowNode, LogicalJoinNode,
-    LogicalPlanNode, LogicalProjectNode, PlanNodeKind,
-};
-use crate::sql::planner::plan_output_columns;
+use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
+use crate::sql::planner::plan::ApplyKind;
 
 pub(crate) struct ScalarApplyToJoin;
 
@@ -47,36 +45,36 @@ impl LogicalRewriteRule for ScalarApplyToJoin {
     }
 
     fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
-        let arena = ctx.scalar_arena();
-        let plan = opt_expr_to_plan(expr, &arena.borrow());
-        matches!(&plan.kind, PlanNodeKind::Apply(a) if a.kind == ApplyKind::Scalar)
+        let _ = ctx;
+        matches!(&expr.op, Operator::LogicalApply(a) if a.kind == ApplyKind::Scalar)
     }
 
     fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         let arena = ctx.scalar_arena();
-        let plan = opt_expr_to_plan(&expr, &arena.borrow());
-        match apply_plan(plan, ctx)? {
-            Some(new_plan) => {
-                let new_expr = plan_to_opt_expr(&new_plan, &mut arena.borrow_mut());
-                Ok(RewriteResult::Changed(new_expr))
-            }
+        let mut arena = arena.borrow_mut();
+        match apply_opt(expr, ctx, &mut arena)? {
+            Some(new_expr) => Ok(RewriteResult::Changed(new_expr)),
             None => Ok(RewriteResult::Unchanged),
         }
     }
 }
 
-fn apply_plan(
-    plan: LogicalPlanNode,
+fn apply_opt(
+    expr: OptExpr,
     ctx: &mut RewriteContext,
-) -> Result<Option<LogicalPlanNode>, String> {
-    let LogicalPlanNode {
-        kind,
+    arena: &mut ScalarArena,
+) -> Result<Option<OptExpr>, String> {
+    let OptExpr {
+        op,
         mut children,
         required_output_columns: _,
-    } = plan;
-    let PlanNodeKind::Apply(a) = &kind else {
+    } = expr;
+    let Operator::LogicalApply(a) = op else {
         return Ok(None);
     };
+    if a.kind != ApplyKind::Scalar {
+        return Ok(None);
+    }
     if children.len() != 2 {
         return Ok(None);
     }
@@ -86,41 +84,26 @@ fn apply_plan(
     // --- Uncorrelated arm ---
     if a.correlation_column_ids.is_empty() {
         let provably_le_one_row = inner_is_provably_le_one_row(&right);
-        // Capture info needed for output project before consuming a.
-        let left_ref = left.clone();
-        let inner_output_column_id = a.inner_output_column_id;
-        let output_col = a.output_column.clone();
-        let is_count = is_count_aggregate_result(&right, inner_output_column_id);
-        let inner_out_type =
-            find_column_type(&right, inner_output_column_id).unwrap_or(DataType::Null);
+        let project_items = build_output_project_items(
+            arena,
+            &left,
+            &right,
+            a.inner_output_column_id,
+            &a.output_column,
+        )?;
 
         let inner_plan = if provably_le_one_row {
             right
         } else {
-            LogicalPlanNode::new(
-                PlanNodeKind::AssertOneRow(LogicalAssertOneRowNode {
+            OptExpr::new(
+                Operator::LogicalAssertOneRow(AssertOneRowOp {
                     subquery_text: String::new(),
                 }),
                 vec![right],
-                None,
             )
         };
-        let join = LogicalPlanNode::new(
-            PlanNodeKind::Join(LogicalJoinNode {
-                join_type: crate::sql::analysis::JoinKind::Cross,
-                condition: None,
-            }),
-            vec![left, inner_plan],
-            None,
-        );
-        let project = build_output_project_from_parts(
-            join,
-            &left_ref,
-            inner_output_column_id,
-            &inner_out_type,
-            is_count,
-            &output_col,
-        )?;
+        let join = scalar_utils::join(left, inner_plan, JoinKind::Cross, None);
+        let project = scalar_utils::simple_project(join, project_items);
         return Ok(Some(project));
     }
 
@@ -133,50 +116,36 @@ fn apply_plan(
 
     // --- Correlated, no-check arm (PushDownApplyAggFilter ran) ---
     if !a.need_check_max_rows {
-        let cond = combine_and(a.correlation_conjuncts.clone());
-        // Capture info needed before consuming a.
-        let left_ref = left.clone();
-        let inner_output_column_id = a.inner_output_column_id;
-        let output_col = a.output_column.clone();
-        let is_count = is_count_aggregate_result(&right, inner_output_column_id);
-        let inner_out_type =
-            find_column_type(&right, inner_output_column_id).unwrap_or(DataType::Null);
-
-        let join = LogicalPlanNode::new(
-            PlanNodeKind::Join(LogicalJoinNode {
-                join_type: crate::sql::analysis::JoinKind::LeftOuter,
-                condition: Some(cond),
-            }),
-            vec![left, right],
-            None,
-        );
-        let project = build_output_project_from_parts(
-            join,
-            &left_ref,
-            inner_output_column_id,
-            &inner_out_type,
-            is_count,
-            &output_col,
+        let cond = scalar_utils::combine_and(arena, a.correlation_conjuncts.clone());
+        let project_items = build_output_project_items(
+            arena,
+            &left,
+            &right,
+            a.inner_output_column_id,
+            &a.output_column,
         )?;
+
+        let join = scalar_utils::join(left, right, JoinKind::LeftOuter, cond);
+        let project = scalar_utils::simple_project(join, project_items);
         return Ok(Some(project));
     }
 
     // --- Correlated, with-check arm (PushDownApplyFilter ran) ---
     // Extract group keys from the correlation conjuncts' inner sides.
     let corr_ids: HashSet<ColumnId> = a.correlation_column_ids.iter().copied().collect();
-    let mut gk_exprs: Vec<TypedExpr> = Vec::new();
+    let mut group_by: Vec<ScalarId> = Vec::new();
     let mut seen_gk_ids: HashSet<ColumnId> = HashSet::new();
     for conj in &a.correlation_conjuncts {
-        let Some((_, inner_side)) = orient_eq(conj, &corr_ids) else {
+        let Some((_, inner_side)) = scalar_utils::orient_eq(arena, *conj, &corr_ids) else {
             // Cannot orient the conjunct — fall back to ApplyException.
             return Ok(None);
         };
-        let ExprKind::ColumnRef { column_id, .. } = &inner_side.kind else {
+        let Some(column_id) = scalar_utils::is_column_ref(arena, inner_side) else {
             // Non-ColumnRef inner side is out of M1b scope.
             return Ok(None);
         };
-        if seen_gk_ids.insert(*column_id) {
-            gk_exprs.push(inner_side.clone());
+        if seen_gk_ids.insert(column_id) {
+            group_by.push(inner_side);
         }
     }
 
@@ -186,9 +155,10 @@ fn apply_plan(
         .ok_or_else(|| "ScalarApplyToJoin requires ColumnRefFactory".to_string())?;
     let mut factory = factory.borrow_mut();
 
-    // Find the inner scalar column's type from the inner plan.
-    let inner_scalar_type =
-        find_column_type(&right, a.inner_output_column_id).unwrap_or(DataType::Null);
+    let inner_scalar_type = scalar_utils::find_column_type(&right, arena, a.inner_output_column_id)
+        .unwrap_or(DataType::Null);
+    let inner_scalar_nullable =
+        scalar_utils::find_column_nullable(&right, arena, a.inner_output_column_id).unwrap_or(true);
 
     let cnt_id = factory.create(None, "count(1)".to_string(), DataType::Int64, false);
     let anyval_id = factory.create(
@@ -211,207 +181,118 @@ fn apply_plan(
     // The analyzer's leading Project always selects the inner scalar column,
     // so any_value's arg (a.inner_output_column_id) always resolves without
     // needing explicit enforcement here.
-    let agg_input = ensure_exposes_columns(&right, &gk_exprs)?;
+    let agg_input = ensure_exposes_columns(right, &group_by, arena)?;
 
     // Build group-key OutputColumns (reuse existing column ids, do NOT mint).
-    let gk_output_cols: Vec<OutputColumn> = gk_exprs
+    let agg_input_columns = scalar_utils::opt_output_columns(&agg_input, arena)?;
+    let gk_output_cols: Vec<OutputColumn> = group_by
         .iter()
-        .map(|e| {
-            let ExprKind::ColumnRef {
-                column_id,
-                column: col_name,
-                ..
-            } = &e.kind
-            else {
-                unreachable!("verified as ColumnRef above");
-            };
-            OutputColumn {
-                column_id: *column_id,
-                name: col_name.clone(),
-                data_type: e.data_type.clone(),
-                nullable: e.nullable,
-                is_internal: false,
-            }
+        .map(|expr| {
+            let column_id = scalar_utils::is_column_ref(arena, *expr)
+                .expect("group key was verified as ColumnRef above");
+            scalar_utils::find_output_column(&agg_input_columns, column_id)
+                .cloned()
+                .ok_or_else(|| format!("missing group key output column {:?}", column_id))
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
     // Build the vector aggregate: group by corr-key, count(1), any_value(scalar).
-    let cnt_agg = AggregateCall {
-        name: "count".to_string(),
-        args: vec![TypedExpr {
-            kind: ExprKind::Literal(LiteralValue::Int(1)),
-            data_type: DataType::Int64,
-            nullable: false,
-        }],
-        distinct: false,
-        result_type: DataType::Int64,
-        order_by: vec![],
-        output_column_id: cnt_id,
-    };
-    let anyval_col_ref = TypedExpr {
-        kind: ExprKind::ColumnRef {
-            column_id: a.inner_output_column_id,
-            qualifier: None,
-            column: "inner_scalar".to_string(),
-        },
-        data_type: inner_scalar_type.clone(),
-        nullable: true,
-    };
-    let anyval_agg = AggregateCall {
-        name: "any_value".to_string(),
-        args: vec![anyval_col_ref],
-        distinct: false,
-        result_type: inner_scalar_type.clone(),
-        order_by: vec![],
-        output_column_id: anyval_id,
+    let inner_scalar_ref = arena.intern(
+        ScalarNode::ColumnRef(a.inner_output_column_id),
+        inner_scalar_type.clone(),
+        inner_scalar_nullable,
+    );
+    if let Some(inner_column) =
+        scalar_utils::find_output_column(&agg_input_columns, a.inner_output_column_id)
+    {
+        arena.remember_project_output_display(
+            inner_column.column_id,
+            None,
+            inner_column.name.clone(),
+        );
     };
 
     let mut agg_output_cols = gk_output_cols.clone();
-    agg_output_cols.push(OutputColumn {
+    let cnt_output = OutputColumn {
         column_id: cnt_id,
         name: "count(1)".to_string(),
         data_type: DataType::Int64,
         nullable: false,
         is_internal: false,
-    });
-    agg_output_cols.push(OutputColumn {
+    };
+    let anyval_output = OutputColumn {
         column_id: anyval_id,
         name: "any_value".to_string(),
         data_type: inner_scalar_type.clone(),
         nullable: true,
         is_internal: false,
-    });
+    };
+    agg_output_cols.push(cnt_output.clone());
+    agg_output_cols.push(anyval_output.clone());
 
-    let vector_agg = LogicalPlanNode::new(
-        PlanNodeKind::Aggregate(LogicalAggregateNode {
-            group_by: gk_exprs,
-            aggregates: vec![cnt_agg, anyval_agg],
-            output_columns: agg_output_cols,
-            already_pushed: false,
-        }),
+    let vector_agg = OptExpr::new(
+        Operator::LogicalAggregate(LogicalAggregateOp::single(
+            group_by,
+            vec![
+                scalar_utils::count_one_spec(arena),
+                scalar_utils::any_value_spec(inner_scalar_ref),
+            ],
+            agg_output_cols,
+        )),
         vec![agg_input],
-        None,
     );
 
     // LEFT OUTER JOIN on the correlation conjuncts.
-    let cond = combine_and(a.correlation_conjuncts.clone());
-    let join = LogicalPlanNode::new(
-        PlanNodeKind::Join(LogicalJoinNode {
-            join_type: crate::sql::analysis::JoinKind::LeftOuter,
-            condition: Some(cond),
-        }),
-        vec![left.clone(), vector_agg],
-        None,
-    );
+    let cond = scalar_utils::combine_and(arena, a.correlation_conjuncts.clone());
+    let mut items = scalar_utils::left_project_items(&left, arena)?;
+    let join = scalar_utils::join(left, vector_agg, JoinKind::LeftOuter, cond);
 
     // Build the output project.
     // Items: all left columns (pass-through) + anyval item (scalar output) +
     // internal assert_true item (row-check).
-    let left_cols = plan_output_columns(&left)?;
-    let mut items: Vec<ProjectItem> = left_cols
-        .iter()
-        .map(|c| ProjectItem {
-            expr: TypedExpr {
-                kind: ExprKind::ColumnRef {
-                    column_id: c.column_id,
-                    qualifier: None,
-                    column: c.name.clone(),
-                },
-                data_type: c.data_type.clone(),
-                nullable: c.nullable,
-            },
-            output_name: c.name.clone(),
-            output_column_id: c.column_id,
-        })
-        .collect();
-
     // Map output_column to anyval (the scalar subquery result).
-    items.push(ProjectItem {
-        expr: TypedExpr {
-            kind: ExprKind::ColumnRef {
-                column_id: anyval_id,
-                qualifier: None,
-                column: "any_value".to_string(),
-            },
-            data_type: inner_scalar_type.clone(),
-            nullable: true,
-        },
+    let anyval_ref = scalar_utils::column_ref(arena, &anyval_output);
+    items.push(ScalarProjectItem {
+        expr: anyval_ref,
         output_name: a.output_column.name.clone(),
         output_column_id: a.output_column.column_id,
+        expr_display: None,
     });
 
     // Build the assert_true condition: cnt IS NULL OR cnt <= 1
-    let cnt_ref = TypedExpr {
-        kind: ExprKind::ColumnRef {
-            column_id: cnt_id,
-            qualifier: None,
-            column: "count(1)".to_string(),
-        },
-        data_type: DataType::Int64,
-        nullable: false,
-    };
-    let cnt_is_null = TypedExpr {
-        kind: ExprKind::IsNull {
-            expr: Box::new(cnt_ref.clone()),
+    let cnt_ref = scalar_utils::column_ref(arena, &cnt_output);
+    let cnt_is_null = arena.intern(
+        ScalarNode::IsNull {
+            child: cnt_ref,
             negated: false,
         },
-        data_type: DataType::Boolean,
-        nullable: false,
-    };
-    let cnt_le_1 = TypedExpr {
-        kind: ExprKind::BinaryOp {
-            left: Box::new(cnt_ref),
-            op: BinOp::Le,
-            right: Box::new(TypedExpr {
-                kind: ExprKind::Literal(LiteralValue::Int(1)),
-                data_type: DataType::Int64,
-                nullable: false,
-            }),
-        },
-        data_type: DataType::Boolean,
-        nullable: false,
-    };
-    let assert_cond = TypedExpr {
-        kind: ExprKind::BinaryOp {
-            left: Box::new(cnt_is_null),
-            op: BinOp::Or,
-            right: Box::new(cnt_le_1),
-        },
-        data_type: DataType::Boolean,
-        nullable: false,
-    };
-    let assert_expr = TypedExpr {
-        kind: ExprKind::FunctionCall {
-            name: "assert_true".to_string(),
-            args: vec![
-                assert_cond,
-                TypedExpr {
-                    kind: ExprKind::Literal(LiteralValue::String(
-                        "correlate scalar subquery result must 1 row".to_string(),
-                    )),
-                    data_type: DataType::Utf8,
-                    nullable: false,
-                },
-            ],
-            distinct: false,
-        },
-        data_type: DataType::Boolean,
-        nullable: false,
-    };
-    items.push(ProjectItem {
+        DataType::Boolean,
+        false,
+    );
+    let one = scalar_utils::int_literal(arena, 1);
+    let cnt_le_1 =
+        scalar_utils::binary_op(arena, BinOp::Le, cnt_ref, one, DataType::Boolean, false);
+    let assert_cond = scalar_utils::binary_op(
+        arena,
+        BinOp::Or,
+        cnt_is_null,
+        cnt_le_1,
+        DataType::Boolean,
+        false,
+    );
+    let assert_expr = scalar_utils::assert_true(
+        arena,
+        assert_cond,
+        "correlate scalar subquery result must 1 row",
+    );
+    items.push(ScalarProjectItem {
         expr: assert_expr,
         output_name: "__subquery_assertion".to_string(),
         output_column_id: assert_id,
+        expr_display: None,
     });
 
-    let project = LogicalPlanNode::new(
-        PlanNodeKind::Project(LogicalProjectNode {
-            items,
-            output_qualifier: None,
-        }),
-        vec![join],
-        None,
-    );
+    let project = scalar_utils::simple_project(join, items);
 
     // The assertion project item is a regular Project item. PruneProjectColumns
     // preserves it via the assert_true carve-out: items whose expr is an
@@ -426,187 +307,51 @@ fn apply_plan(
 /// Returns true iff the plan is provably at most 1 row:
 /// - A global aggregate (empty group_by), possibly under a leading Project.
 /// - A Values node with at most 1 row.
-fn inner_is_provably_le_one_row(plan: &LogicalPlanNode) -> bool {
-    match &plan.kind {
-        PlanNodeKind::Aggregate(agg) => agg.group_by.is_empty(),
-        PlanNodeKind::Project(_) => inner_is_provably_le_one_row(plan.unary_input()),
-        PlanNodeKind::Values(v) => v.rows.len() <= 1,
+fn inner_is_provably_le_one_row(plan: &OptExpr) -> bool {
+    match &plan.op {
+        Operator::LogicalAggregate(agg) => agg.group_by.is_empty(),
+        Operator::LogicalProject(_) => inner_is_provably_le_one_row(plan.unary_input()),
+        Operator::LogicalValues(v) => v.rows.len() <= 1,
         _ => false,
     }
 }
 
-/// Build the output project for uncorrelated and no-check correlated arms.
-///
-/// Takes pre-computed pieces to avoid borrow-after-partial-move in the caller:
-/// - `left` — the original left plan (to get pass-through columns)
-/// - `inner_output_column_id` — the inner scalar result column id
-/// - `inner_out_type` — data type of the inner scalar column
-/// - `is_count` — whether the inner column is produced by a `count` aggregate
-///   (if true, wrap in `ifnull(..., 0)`)
-/// - `output_col` — the Apply's minted output column (id and name)
-fn build_output_project_from_parts(
-    child: LogicalPlanNode,
-    left: &LogicalPlanNode,
+fn build_output_project_items(
+    arena: &mut ScalarArena,
+    left: &OptExpr,
+    right: &OptExpr,
     inner_output_column_id: ColumnId,
-    inner_out_type: &DataType,
-    is_count: bool,
     output_col: &OutputColumn,
-) -> Result<LogicalPlanNode, String> {
-    let left_cols = plan_output_columns(left)?;
-    let mut items: Vec<ProjectItem> = left_cols
-        .iter()
-        .map(|c| ProjectItem {
-            expr: TypedExpr {
-                kind: ExprKind::ColumnRef {
-                    column_id: c.column_id,
-                    qualifier: None,
-                    column: c.name.clone(),
-                },
-                data_type: c.data_type.clone(),
-                nullable: c.nullable,
-            },
-            output_name: c.name.clone(),
-            output_column_id: c.column_id,
-        })
-        .collect();
+) -> Result<Vec<ScalarProjectItem>, String> {
+    let mut items = scalar_utils::left_project_items(left, arena)?;
+    let inner_out_type = scalar_utils::find_column_type(right, arena, inner_output_column_id)
+        .unwrap_or(DataType::Null);
+    let inner_nullable =
+        scalar_utils::find_column_nullable(right, arena, inner_output_column_id).unwrap_or(true);
 
-    let inner_col_ref = TypedExpr {
-        kind: ExprKind::ColumnRef {
-            column_id: inner_output_column_id,
-            qualifier: None,
-            column: "inner_scalar".to_string(),
-        },
-        data_type: inner_out_type.clone(),
-        nullable: true,
-    };
+    let inner_col_ref = arena.intern(
+        ScalarNode::ColumnRef(inner_output_column_id),
+        inner_out_type.clone(),
+        inner_nullable,
+    );
 
-    let scalar_expr = if is_count {
-        // ifnull(count_result, 0): count(1) with LEFT OUTER returns NULL when no
-        // match; normalize to 0 (SQL COUNT semantics).
-        TypedExpr {
-            kind: ExprKind::FunctionCall {
-                name: "ifnull".to_string(),
-                args: vec![
-                    inner_col_ref,
-                    TypedExpr {
-                        kind: ExprKind::Literal(LiteralValue::Int(0)),
-                        data_type: DataType::Int64,
-                        nullable: false,
-                    },
-                ],
-                distinct: false,
-            },
-            data_type: inner_out_type.clone(),
-            nullable: false,
-        }
-    } else {
-        inner_col_ref
-    };
+    let scalar_expr =
+        if scalar_utils::is_count_aggregate_result(right, arena, inner_output_column_id) {
+            // ifnull(count_result, 0): count(1) with LEFT OUTER returns NULL when no
+            // match; normalize to 0 (SQL COUNT semantics).
+            scalar_utils::ifnull_zero(arena, inner_col_ref, inner_out_type)
+        } else {
+            inner_col_ref
+        };
 
-    items.push(ProjectItem {
+    items.push(ScalarProjectItem {
         expr: scalar_expr,
         output_name: output_col.name.clone(),
         output_column_id: output_col.column_id,
+        expr_display: None,
     });
 
-    Ok(LogicalPlanNode::new(
-        PlanNodeKind::Project(LogicalProjectNode {
-            items,
-            output_qualifier: None,
-        }),
-        vec![child],
-        None,
-    ))
-}
-
-/// Walk the plan to find the data type of a column with the given id.
-/// Looks at Aggregate output_columns, Project items, Scan columns, and Values columns.
-fn find_column_type(plan: &LogicalPlanNode, col_id: ColumnId) -> Option<DataType> {
-    match &plan.kind {
-        PlanNodeKind::Aggregate(agg) => {
-            // Check output_columns.
-            for oc in &agg.output_columns {
-                if oc.column_id == col_id {
-                    return Some(oc.data_type.clone());
-                }
-            }
-            // Also check input for column type (for group-key sourced columns).
-            find_column_type(plan.unary_input(), col_id)
-        }
-        PlanNodeKind::Project(p) => {
-            for item in &p.items {
-                if item.output_column_id == col_id {
-                    return Some(item.expr.data_type.clone());
-                }
-            }
-            find_column_type(plan.unary_input(), col_id)
-        }
-        PlanNodeKind::Filter(_) => find_column_type(plan.unary_input(), col_id),
-        PlanNodeKind::Scan(s) => {
-            for oc in &s.columns {
-                if oc.column_id == col_id {
-                    return Some(oc.data_type.clone());
-                }
-            }
-            None
-        }
-        PlanNodeKind::Values(v) => {
-            for oc in &v.columns {
-                if oc.column_id == col_id {
-                    return Some(oc.data_type.clone());
-                }
-            }
-            None
-        }
-        PlanNodeKind::AssertOneRow(_) => find_column_type(plan.unary_input(), col_id),
-        // Note: does not model outer-join null-extension (nullability may be
-        // understated for columns from the null-extended side). This function
-        // is only called on the inner subquery plan, never on a join, so this
-        // is not a live issue in the current call sites.
-        PlanNodeKind::Join(_) => {
-            find_column_type(plan.left(), col_id).or_else(|| find_column_type(plan.right(), col_id))
-        }
-        _ => None,
-    }
-}
-
-/// Returns true iff `col_id` is the output column of a `count` aggregate call
-/// in the inner plan.
-///
-/// When traversing a Project, the outer `col_id` must be mapped to the
-/// inner column id via the Project's items (a Project may rename a count
-/// aggregate output from id X to outer id Y; the Aggregate carries X, not Y).
-fn is_count_aggregate_result(plan: &LogicalPlanNode, col_id: ColumnId) -> bool {
-    match &plan.kind {
-        PlanNodeKind::Aggregate(agg) => agg
-            .aggregates
-            .iter()
-            .any(|call| call.output_column_id == col_id && call.name == "count"),
-        PlanNodeKind::Project(p) => {
-            // Translate col_id through the Project: find the ProjectItem whose
-            // output_column_id == col_id, then follow its expr ColumnRef into
-            // the child. This is necessary because apply_query_modifiers wraps
-            // the inner Aggregate in a Project with fresh output ColumnIds.
-            let inner_id = p.items.iter().find_map(|item| {
-                if item.output_column_id == col_id {
-                    if let ExprKind::ColumnRef { column_id, .. } = &item.expr.kind {
-                        Some(*column_id)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            });
-            if let Some(translated_id) = inner_id {
-                is_count_aggregate_result(plan.unary_input(), translated_id)
-            } else {
-                false
-            }
-        }
-        PlanNodeKind::Filter(_) => is_count_aggregate_result(plan.unary_input(), col_id),
-        _ => false,
-    }
+    Ok(items)
 }
 
 /// Ensure the plan exposes the given group-key columns.
@@ -620,50 +365,61 @@ fn is_count_aggregate_result(plan: &LogicalPlanNode, col_id: ColumnId) -> bool {
 /// leading Project always selects it, so any_value's arg resolves without
 /// explicit enforcement.
 fn ensure_exposes_columns(
-    plan: &LogicalPlanNode,
-    gk_exprs: &[TypedExpr],
-) -> Result<LogicalPlanNode, String> {
-    match &plan.kind {
-        PlanNodeKind::Project(proj) => {
-            let projected_ids: HashSet<ColumnId> =
-                proj.items.iter().map(|i| i.output_column_id).collect();
+    plan: OptExpr,
+    group_by: &[ScalarId],
+    arena: &mut ScalarArena,
+) -> Result<OptExpr, String> {
+    let Operator::LogicalProject(project) = &plan.op else {
+        return Ok(plan);
+    };
+    let projected_ids: HashSet<ColumnId> = project
+        .items
+        .iter()
+        .map(|item| item.output_column_id)
+        .collect();
+    let child = plan.unary_input();
+    let child_columns = scalar_utils::opt_output_columns(child, arena)?;
 
-            let mut new_items = proj.items.clone();
-            for gk in gk_exprs {
-                let ExprKind::ColumnRef {
-                    column_id,
-                    column: col_name,
-                    ..
-                } = &gk.kind
-                else {
-                    continue;
-                };
-                if !projected_ids.contains(column_id) {
-                    new_items.push(ProjectItem {
-                        expr: gk.clone(),
-                        output_name: col_name.clone(),
-                        output_column_id: *column_id,
-                    });
-                }
-            }
-
-            if new_items.len() == proj.items.len() {
-                // Nothing added — return original.
-                Ok(plan.clone())
-            } else {
-                Ok(LogicalPlanNode::new(
-                    PlanNodeKind::Project(LogicalProjectNode {
-                        items: new_items,
-                        output_qualifier: proj.output_qualifier.clone(),
-                    }),
-                    vec![plan.unary_input().clone()],
-                    None,
-                ))
-            }
+    let mut new_items = project.items.clone();
+    for group_key in group_by {
+        let Some(column_id) = scalar_utils::is_column_ref(arena, *group_key) else {
+            continue;
+        };
+        if projected_ids.contains(&column_id) {
+            continue;
         }
-        // No leading Project: Scan/Filter already expose all columns.
-        _ => Ok(plan.clone()),
+        let output_column = scalar_utils::find_output_column(&child_columns, column_id)
+            .cloned()
+            .unwrap_or_else(|| OutputColumn {
+                column_id,
+                name: format!("col_{}", column_id.0),
+                data_type: arena.data_type(*group_key).clone(),
+                nullable: arena.nullable(*group_key),
+                is_internal: false,
+            });
+        new_items.push(ScalarProjectItem {
+            expr: *group_key,
+            output_name: output_column.name,
+            output_column_id: column_id,
+            expr_display: None,
+        });
     }
+
+    if new_items.len() == project.items.len() {
+        return Ok(plan);
+    }
+
+    let mut children = plan.children;
+    let child = children
+        .pop()
+        .ok_or_else(|| "LogicalProject must have one child".to_string())?;
+    Ok(OptExpr::new(
+        Operator::LogicalProject(ProjectOp {
+            items: new_items,
+            output_qualifier: project.output_qualifier.clone(),
+        }),
+        vec![child],
+    ))
 }
 
 #[cfg(test)]
@@ -676,12 +432,15 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::sql::analysis::{BinOp, ExprKind, JoinKind, OutputColumn, ProjectItem, TypedExpr};
+    use crate::sql::analysis::{
+        BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
+    };
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::{ColumnId, ColumnRefFactory};
     use crate::sql::optimizer::convert::logical_plan_to_opt_expr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::result::RewriteResult;
+    use crate::sql::optimizer::rewrite::rules::subquery::bridge::opt_expr_to_plan;
     use crate::sql::optimizer::rewrite::rules::utils::collect_column_id_refs;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::{

@@ -6,30 +6,24 @@
 //! precondition failure returns `Unchanged` so `ScalarApplyToJoin` produces the
 //! M1 join form. Never errors (the join form is always a valid fallback).
 
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use arrow::datatypes::DataType;
-
-use super::bridge::{opt_expr_to_plan, plan_to_opt_expr};
+use super::scalar_utils;
 use super::win_magic_util::{
     TableIdentity, collect_scan_column_map, collect_table_ids, expr_phys_eq,
 };
-use crate::sql::analysis::{ExprKind, OutputColumn, SortItem, TypedExpr};
+use crate::sql::analysis::{JoinKind, OutputColumn};
 use crate::sql::column_id::ColumnId;
+use crate::sql::optimizer::operator::{
+    ApplyOp, LogicalAggregateOp, Operator, ScalarAggregateSpec, SortOp, WindowOp,
+};
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::optimizer::rewrite::rules::utils::{
-    collect_column_id_refs, combine_and, split_and,
-};
-use crate::sql::planner::plan::{
-    AggregateCall, ApplyKind, LogicalAggregateNode, LogicalApplyNode, LogicalFilterNode,
-    LogicalPlanNode, LogicalSortNode, LogicalWindowNode, PlanNodeKind, WindowExpr,
-};
-use crate::sql::planner::plan_output_columns;
+use crate::sql::optimizer::scalar::{ScalarArena, ScalarId};
+use crate::sql::planner::plan::ApplyKind;
 
 const WHITELIST: &[&str] = &["count", "sum", "avg", "min", "max"];
 
@@ -39,13 +33,15 @@ pub(crate) struct ApplyToWindow;
 #[allow(dead_code)]
 pub(super) struct WinMagicMatch {
     /// All conjuncts of the matched WHERE Filter (already AND-split).
-    pub outer_conjuncts: Vec<TypedExpr>,
+    pub outer_conjuncts: Vec<ScalarId>,
     /// The single outer conjunct that references `APPLY_OUT`.
-    pub subquery_conjunct: TypedExpr,
+    pub subquery_conjunct: ScalarId,
     /// Outer-side ColumnRef of each correlation conjunct — the window PARTITION BY keys.
-    pub partition_by: Vec<TypedExpr>,
+    pub partition_by: Vec<ScalarId>,
     /// The inner single aggregate call (name in WHITELIST, non-distinct).
-    pub inner_agg: AggregateCall,
+    pub inner_agg: ScalarAggregateSpec,
+    /// Output column for the inner aggregate call.
+    pub inner_agg_output: OutputColumn,
 }
 
 impl LogicalRewriteRule for ApplyToWindow {
@@ -58,65 +54,68 @@ impl LogicalRewriteRule for ApplyToWindow {
     }
 
     fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
-        let arena = ctx.scalar_arena();
-        let plan = opt_expr_to_plan(expr, &arena.borrow());
-        matches_plan(&plan)
+        let _ = ctx;
+        matches_plan(expr)
     }
 
     fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         let arena = ctx.scalar_arena();
-        let plan = opt_expr_to_plan(&expr, &arena.borrow());
-        match apply_plan_inner(plan, ctx)? {
-            Some(new_plan) => {
-                let new_expr = plan_to_opt_expr(&new_plan, &mut arena.borrow_mut());
-                Ok(RewriteResult::Changed(new_expr))
-            }
+        let mut arena = arena.borrow_mut();
+        match apply_plan_inner(expr, ctx, &mut arena)? {
+            Some(new_expr) => Ok(RewriteResult::Changed(new_expr)),
             None => Ok(RewriteResult::Unchanged),
         }
     }
 }
 
-fn matches_plan(plan: &LogicalPlanNode) -> bool {
-    let PlanNodeKind::Filter(_) = &plan.kind else {
+fn matches_plan(plan: &OptExpr) -> bool {
+    let Operator::LogicalFilter(_) = &plan.op else {
         return false;
     };
     let apply = plan.unary_input();
-    let PlanNodeKind::Apply(a) = &apply.kind else {
+    let Operator::LogicalApply(a) = &apply.op else {
         return false;
     };
     a.kind == ApplyKind::Scalar && !a.need_check_max_rows && !a.correlation_conjuncts.is_empty()
 }
 
 fn apply_plan_inner(
-    plan: LogicalPlanNode,
+    plan: OptExpr,
     ctx: &mut RewriteContext,
-) -> Result<Option<LogicalPlanNode>, String> {
+    arena: &mut ScalarArena,
+) -> Result<Option<OptExpr>, String> {
     let Some(m) = ({
-        let PlanNodeKind::Filter(f) = &plan.kind else {
+        let Operator::LogicalFilter(f) = &plan.op else {
             return Ok(None);
         };
         let apply = plan.unary_input();
-        let PlanNodeKind::Apply(a) = &apply.kind else {
+        let Operator::LogicalApply(a) = &apply.op else {
             return Ok(None);
         };
-        check_preconditions(&f.predicate, a, apply.left(), apply.right())
+        check_preconditions_opt(f.predicate, a, apply.left(), apply.right(), arena)
     }) else {
         return Ok(None);
     };
 
-    // Re-own the pieces. (matches_plan() guaranteed Filter(Apply).)
-    let mut apply_plan = plan.into_single_child();
-    let (outer_subtree, apply_right) = apply_plan.take_two_children();
-    let PlanNodeKind::Apply(a) = apply_plan.kind else {
+    let mut filter_children = plan.children;
+    let apply_expr = filter_children.remove(0);
+    let OptExpr {
+        op,
+        mut children,
+        required_output_columns: _,
+    } = apply_expr;
+    let Operator::LogicalApply(a) = op else {
         unreachable!()
     };
+    let apply_right = children.remove(1);
+    let outer_subtree = children.remove(0);
 
     // --- 1. Remap the inner aggregate's args to the outer instance of the same physical column. ---
     let outer_map = collect_scan_column_map(&outer_subtree);
     let inner_map = collect_scan_column_map(&apply_right);
     // Collect the set of inner-scan ColumnIds upfront; used by post-condition guards.
     let inner_ids: HashSet<ColumnId> = inner_map.keys().copied().collect();
-    let outer_cols = plan_output_columns(&outer_subtree)?;
+    let outer_cols = scalar_utils::opt_output_columns(&outer_subtree, arena)?;
     let mut phys_to_outer: HashMap<(TableIdentity, String), OutputColumn> = HashMap::new();
     for oc in &outer_cols {
         if let Some((tab, name)) = outer_map.get(&oc.column_id) {
@@ -125,15 +124,16 @@ fn apply_plan_inner(
     }
     let mut agg_args = m.inner_agg.args.clone();
     for arg in &mut agg_args {
-        if !remap_inner_to_outer(arg, &inner_map, &phys_to_outer) {
+        let Some(remapped) = remap_inner_to_outer(arena, *arg, &inner_map, &phys_to_outer) else {
             // Required column unavailable on outer side → fall back to join form.
             return Ok(None);
-        }
+        };
+        *arg = remapped;
     }
     // Guard 1: post-condition — verify no inner-scan column survived the remap.
     // This catches any ExprKind variant that remap_inner_to_outer might have missed.
     for arg in &agg_args {
-        if !collect_column_id_refs(arg).is_disjoint(&inner_ids) {
+        if !scalar_utils::collect_column_ids(arena, *arg).is_disjoint(&inner_ids) {
             return Ok(None); // an inner column survived the remap
         }
     }
@@ -145,110 +145,96 @@ fn apply_plan_inner(
     let win_id = factory.borrow_mut().create(
         None,
         format!("{}_window", m.inner_agg.name),
-        m.inner_agg.result_type.clone(),
+        m.inner_agg_output.data_type.clone(),
         true,
     );
-    let win_expr = WindowExpr {
+    let win_expr = crate::sql::optimizer::operator::ScalarWindowSpec {
         name: m.inner_agg.name.clone(),
         args: agg_args,
         distinct: false,
         partition_by: m.partition_by.clone(),
         order_by: vec![],
         window_frame: None,
-        result_type: m.inner_agg.result_type.clone(),
-        output_name: format!("{}_window", m.inner_agg.name),
-        output_column_id: win_id,
         ignore_nulls: false,
+    };
+    let win_output = OutputColumn {
+        column_id: win_id,
+        name: format!("{}_window", m.inner_agg.name),
+        data_type: m.inner_agg_output.data_type.clone(),
+        nullable: true,
+        is_internal: true,
     };
 
     // --- 3. before-window Filter = all outer conjuncts except the subquery one. ---
-    let before: Vec<TypedExpr> = m
+    let before: Vec<ScalarId> = m
         .outer_conjuncts
         .iter()
-        .filter(|oc| !expr_struct_eq(oc, &m.subquery_conjunct))
-        .cloned()
+        .filter(|oc| **oc != m.subquery_conjunct)
+        .copied()
         .collect();
     let before_filtered = if before.is_empty() {
         outer_subtree
     } else {
-        LogicalPlanNode::new(
-            PlanNodeKind::Filter(LogicalFilterNode {
-                predicate: combine_and(before),
-            }),
-            vec![outer_subtree],
-            None,
-        )
+        let Some(predicate) = scalar_utils::combine_and(arena, before) else {
+            return Ok(None);
+        };
+        scalar_utils::filter(outer_subtree, predicate)
     };
 
     // --- 4. Sort(partition keys) under the Window. ---
-    let sort_items: Vec<SortItem> = m
+    let sort_items = m
         .partition_by
         .iter()
-        .map(|e| SortItem {
-            expr: e.clone(),
-            asc: true,
-            nulls_first: true,
-        })
+        .copied()
+        .map(scalar_utils::sort_key)
         .collect();
-    let sorted = LogicalPlanNode::new(
-        PlanNodeKind::Sort(LogicalSortNode {
+    let sorted = OptExpr::new(
+        Operator::LogicalSort(SortOp {
             items: sort_items,
-            analytic_partition_by: m.partition_by.clone(),
-            output_columns: vec![],
-            offset: None,
+            analytic_partition_exprs: m.partition_by.clone(),
             partition_limit: None,
             topn_type: None,
         }),
         vec![before_filtered],
-        None,
     );
 
     // --- 5. Window node: output = base outer columns + the window column. ---
-    let mut window_output = plan_output_columns(&sorted)?;
-    window_output.push(OutputColumn {
-        column_id: win_id,
-        name: format!("{}_window", m.inner_agg.name),
-        data_type: m.inner_agg.result_type.clone(),
-        nullable: true,
-        is_internal: true,
-    });
-    let window = LogicalPlanNode::new(
-        PlanNodeKind::Window(LogicalWindowNode {
+    let mut window_output = scalar_utils::opt_output_columns(&sorted, arena)?;
+    window_output.push(win_output.clone());
+    let window = OptExpr::new(
+        Operator::LogicalWindow(WindowOp {
             window_exprs: vec![win_expr],
             output_columns: window_output,
         }),
         vec![sorted],
-        None,
     );
 
     // --- 6. after-window Filter = subquery comparison with APPLY_OUT replaced by the value expr. ---
     let value_expr = build_value_expr(
         &apply_right,
         a.inner_output_column_id,
-        m.inner_agg.output_column_id,
-        win_id,
-        &m.inner_agg.result_type,
-    )?;
+        m.inner_agg_output.column_id,
+        &win_output,
+        arena,
+    );
     // Guard 2: value_expr must not reference the inner agg output or any inner-scan column.
     {
-        let vrefs = collect_column_id_refs(&value_expr);
-        if vrefs.contains(&m.inner_agg.output_column_id) || !vrefs.is_disjoint(&inner_ids) {
+        let vrefs = scalar_utils::collect_column_ids(arena, value_expr);
+        if vrefs.contains(&m.inner_agg_output.column_id) || !vrefs.is_disjoint(&inner_ids) {
             return Ok(None); // value expr still references a disappearing inner column
         }
     }
-    let mut after_pred = m.subquery_conjunct.clone();
-    replace_column_ref(&mut after_pred, a.output_column.column_id, &value_expr);
+    let after_pred = scalar_utils::replace_column_ref(
+        arena,
+        m.subquery_conjunct,
+        a.output_column.column_id,
+        value_expr,
+    );
     // Guard 3: APPLY_OUT must be gone from after_pred — it has been fully replaced.
-    if collect_column_id_refs(&after_pred).contains(&a.output_column.column_id) {
+    if scalar_utils::collect_column_ids(arena, after_pred).contains(&a.output_column.column_id) {
         return Ok(None); // APPLY_OUT survived (comparison used an unhandled node)
     }
-    let after = LogicalPlanNode::new(
-        PlanNodeKind::Filter(LogicalFilterNode {
-            predicate: after_pred,
-        }),
-        vec![window],
-        None,
-    );
+    let after = scalar_utils::filter(window, after_pred);
 
     Ok(Some(after))
 }
@@ -265,147 +251,18 @@ fn apply_plan_inner(
 /// ColumnRefs whose ids are NOT in `inner_map` (e.g. already-outer refs or
 /// literal-derived ids) are left unchanged and contribute `true`.
 fn remap_inner_to_outer(
-    expr: &mut TypedExpr,
+    arena: &mut ScalarArena,
+    expr: ScalarId,
     inner_map: &HashMap<ColumnId, (TableIdentity, String)>,
     phys_to_outer: &HashMap<(TableIdentity, String), OutputColumn>,
-) -> bool {
-    match &mut expr.kind {
-        ExprKind::ColumnRef {
-            column_id, column, ..
-        } => {
-            if let Some((tab, name)) = inner_map.get(column_id) {
-                // This ColumnRef is from an inner scan; find its outer twin.
-                match phys_to_outer.get(&(tab.clone(), name.clone())) {
-                    Some(outer_col) => {
-                        *column_id = outer_col.column_id;
-                        *column = outer_col.name.clone();
-                        expr.data_type = outer_col.data_type.clone();
-                        expr.nullable = outer_col.nullable;
-                        true
-                    }
-                    None => false, // inner column has no outer counterpart
-                }
-            } else {
-                // Not an inner-scan column; leave unchanged.
-                true
-            }
-        }
-        ExprKind::BinaryOp { left, right, .. } => {
-            // Clone to avoid simultaneous mutable borrows via reborrow trick.
-            let l_ok = remap_inner_to_outer(left, inner_map, phys_to_outer);
-            let r_ok = remap_inner_to_outer(right, inner_map, phys_to_outer);
-            l_ok && r_ok
-        }
-        ExprKind::FunctionCall { args, .. } => {
-            let mut ok = true;
-            for arg in args.iter_mut() {
-                if !remap_inner_to_outer(arg, inner_map, phys_to_outer) {
-                    ok = false;
-                }
-            }
-            ok
-        }
-        ExprKind::IsNull {
-            expr: inner_expr, ..
-        } => remap_inner_to_outer(inner_expr, inner_map, phys_to_outer),
-        ExprKind::UnaryOp {
-            expr: inner_expr, ..
-        } => remap_inner_to_outer(inner_expr, inner_map, phys_to_outer),
-        ExprKind::Cast {
-            expr: inner_expr, ..
-        } => remap_inner_to_outer(inner_expr, inner_map, phys_to_outer),
-        ExprKind::InList {
-            expr: inner_expr,
-            list,
-            ..
-        } => {
-            let e_ok = remap_inner_to_outer(inner_expr, inner_map, phys_to_outer);
-            let l_ok = list
-                .iter_mut()
-                .all(|item| remap_inner_to_outer(item, inner_map, phys_to_outer));
-            e_ok && l_ok
-        }
-        ExprKind::Between {
-            expr: inner_expr,
-            low,
-            high,
-            ..
-        } => {
-            let e_ok = remap_inner_to_outer(inner_expr, inner_map, phys_to_outer);
-            let lo_ok = remap_inner_to_outer(low, inner_map, phys_to_outer);
-            let hi_ok = remap_inner_to_outer(high, inner_map, phys_to_outer);
-            e_ok && lo_ok && hi_ok
-        }
-        ExprKind::Like {
-            expr: inner_expr,
-            pattern,
-            ..
-        } => {
-            let e_ok = remap_inner_to_outer(inner_expr, inner_map, phys_to_outer);
-            let p_ok = remap_inner_to_outer(pattern, inner_map, phys_to_outer);
-            e_ok && p_ok
-        }
-        ExprKind::Case {
-            operand,
-            when_then,
-            else_expr,
-        } => {
-            let mut ok = true;
-            if let Some(op) = operand {
-                ok &= remap_inner_to_outer(op, inner_map, phys_to_outer);
-            }
-            for (when, then) in when_then.iter_mut() {
-                ok &= remap_inner_to_outer(when, inner_map, phys_to_outer);
-                ok &= remap_inner_to_outer(then, inner_map, phys_to_outer);
-            }
-            if let Some(els) = else_expr {
-                ok &= remap_inner_to_outer(els, inner_map, phys_to_outer);
-            }
-            ok
-        }
-        ExprKind::IsTruthValue {
-            expr: inner_expr, ..
-        } => remap_inner_to_outer(inner_expr, inner_map, phys_to_outer),
-        ExprKind::Nested(inner_expr) => remap_inner_to_outer(inner_expr, inner_map, phys_to_outer),
-        ExprKind::AggregateCall { args, order_by, .. } => {
-            let mut ok = true;
-            for arg in args.iter_mut() {
-                ok &= remap_inner_to_outer(arg, inner_map, phys_to_outer);
-            }
-            for ob in order_by.iter_mut() {
-                ok &= remap_inner_to_outer(&mut ob.expr, inner_map, phys_to_outer);
-            }
-            ok
-        }
-        ExprKind::LambdaFunction { body, .. } => {
-            remap_inner_to_outer(body, inner_map, phys_to_outer)
-        }
-        ExprKind::Lambda { body, .. } => remap_inner_to_outer(body, inner_map, phys_to_outer),
-        ExprKind::WindowCall {
-            args,
-            partition_by,
-            order_by,
-            ..
-        } => {
-            let mut ok = true;
-            for arg in args.iter_mut() {
-                ok &= remap_inner_to_outer(arg, inner_map, phys_to_outer);
-            }
-            for pb in partition_by.iter_mut() {
-                ok &= remap_inner_to_outer(pb, inner_map, phys_to_outer);
-            }
-            for ob in order_by.iter_mut() {
-                ok &= remap_inner_to_outer(&mut ob.expr, inner_map, phys_to_outer);
-            }
-            ok
-        }
-        // True leaf variants: no child TypedExprs to recurse into.
-        // ColumnRef is handled above; LambdaParamRef, Literal, SubqueryPlaceholder
-        // carry no child expressions.
-        ExprKind::LambdaParamRef { .. }
-        | ExprKind::Literal(_)
-        | ExprKind::SubqueryPlaceholder { .. } => true,
-    }
+) -> Option<ScalarId> {
+    scalar_utils::remap_column_refs(arena, expr, &mut |arena, column_id| {
+        let Some((tab, name)) = inner_map.get(&column_id) else {
+            return Some(None);
+        };
+        let outer_col = phys_to_outer.get(&(tab.clone(), name.clone()))?;
+        Some(Some(scalar_utils::column_ref(arena, outer_col)))
+    })
 }
 
 /// Build the "value expression" that replaces `APPLY_OUT` in the after-window
@@ -418,186 +275,36 @@ fn remap_inner_to_outer(
 /// `WIN_ID`. If there is no leading Project (bare aggregate, `inner_output_col_id
 /// == agg_out_col_id`), return a bare `ColumnRef(WIN_ID)`.
 fn build_value_expr(
-    apply_right: &LogicalPlanNode,
+    apply_right: &OptExpr,
     inner_output_col_id: ColumnId,
     agg_out_col_id: ColumnId,
-    win_id: ColumnId,
-    win_type: &DataType,
-) -> Result<TypedExpr, String> {
-    let win_ref = col_ref_expr(win_id, win_type);
+    win_output: &OutputColumn,
+    arena: &mut ScalarArena,
+) -> ScalarId {
+    let win_ref = scalar_utils::column_ref(arena, win_output);
     // Peel exactly one optional leading Project (single-leading-Project assumption:
     // PushDownApplyAggFilter inserts at most one Project above the Aggregate).
-    if let PlanNodeKind::Project(proj) = &apply_right.kind {
+    if let Operator::LogicalProject(proj) = &apply_right.op {
         // Look for the Project item whose output id matches inner_output_col_id.
         for item in &proj.items {
             if item.output_column_id == inner_output_col_id {
-                let mut value_expr = item.expr.clone();
                 // Replace the aggregate output column reference with win_id.
-                replace_column_ref(&mut value_expr, agg_out_col_id, &win_ref);
-                return Ok(value_expr);
+                return scalar_utils::replace_column_ref(arena, item.expr, agg_out_col_id, win_ref);
             }
         }
         // No matching item found in the Project (unusual shape) → safe fallback.
     }
     // No leading Project OR no matching item: inner_output_col_id IS the aggregate
     // output column (bare agg case, e.g. q2 min/max with no arithmetic).
-    Ok(win_ref)
+    win_ref
 }
 
-/// Build a nullable `ColumnRef` TypedExpr for `id` with the given type.
-fn col_ref_expr(id: ColumnId, dt: &DataType) -> TypedExpr {
-    TypedExpr {
-        kind: ExprKind::ColumnRef {
-            column_id: id,
-            qualifier: None,
-            column: format!("col_{}", id.0),
-        },
-        data_type: dt.clone(),
-        nullable: true,
-    }
-}
-
-/// Recursively replace every `ColumnRef { column_id == target }` in `expr` with
-/// `replacement.clone()`.
-fn replace_column_ref(expr: &mut TypedExpr, target: ColumnId, replacement: &TypedExpr) {
-    // Base case: this node IS the target column ref — replace in place and return.
-    if let ExprKind::ColumnRef { column_id, .. } = &expr.kind
-        && *column_id == target
-    {
-        *expr = replacement.clone();
-        return;
-    }
-    // Recurse into all compound variants.
-    match &mut expr.kind {
-        ExprKind::BinaryOp { left, right, .. } => {
-            replace_column_ref(left, target, replacement);
-            replace_column_ref(right, target, replacement);
-        }
-        ExprKind::FunctionCall { args, .. } => {
-            for arg in args.iter_mut() {
-                replace_column_ref(arg, target, replacement);
-            }
-        }
-        ExprKind::IsNull {
-            expr: inner_expr, ..
-        } => {
-            replace_column_ref(inner_expr, target, replacement);
-        }
-        ExprKind::UnaryOp {
-            expr: inner_expr, ..
-        } => {
-            replace_column_ref(inner_expr, target, replacement);
-        }
-        ExprKind::Cast {
-            expr: inner_expr, ..
-        } => {
-            replace_column_ref(inner_expr, target, replacement);
-        }
-        ExprKind::InList {
-            expr: inner_expr,
-            list,
-            ..
-        } => {
-            replace_column_ref(inner_expr, target, replacement);
-            for item in list.iter_mut() {
-                replace_column_ref(item, target, replacement);
-            }
-        }
-        ExprKind::Between {
-            expr: inner_expr,
-            low,
-            high,
-            ..
-        } => {
-            replace_column_ref(inner_expr, target, replacement);
-            replace_column_ref(low, target, replacement);
-            replace_column_ref(high, target, replacement);
-        }
-        ExprKind::Like {
-            expr: inner_expr,
-            pattern,
-            ..
-        } => {
-            replace_column_ref(inner_expr, target, replacement);
-            replace_column_ref(pattern, target, replacement);
-        }
-        ExprKind::Case {
-            operand,
-            when_then,
-            else_expr,
-        } => {
-            if let Some(op) = operand {
-                replace_column_ref(op, target, replacement);
-            }
-            for (when, then) in when_then.iter_mut() {
-                replace_column_ref(when, target, replacement);
-                replace_column_ref(then, target, replacement);
-            }
-            if let Some(els) = else_expr {
-                replace_column_ref(els, target, replacement);
-            }
-        }
-        ExprKind::IsTruthValue {
-            expr: inner_expr, ..
-        } => {
-            replace_column_ref(inner_expr, target, replacement);
-        }
-        ExprKind::Nested(inner_expr) => {
-            replace_column_ref(inner_expr, target, replacement);
-        }
-        ExprKind::AggregateCall { args, order_by, .. } => {
-            for arg in args.iter_mut() {
-                replace_column_ref(arg, target, replacement);
-            }
-            for ob in order_by.iter_mut() {
-                replace_column_ref(&mut ob.expr, target, replacement);
-            }
-        }
-        ExprKind::LambdaFunction { body, .. } => {
-            replace_column_ref(body, target, replacement);
-        }
-        ExprKind::Lambda { body, .. } => {
-            replace_column_ref(body, target, replacement);
-        }
-        ExprKind::WindowCall {
-            args,
-            partition_by,
-            order_by,
-            ..
-        } => {
-            for arg in args.iter_mut() {
-                replace_column_ref(arg, target, replacement);
-            }
-            for pb in partition_by.iter_mut() {
-                replace_column_ref(pb, target, replacement);
-            }
-            for ob in order_by.iter_mut() {
-                replace_column_ref(&mut ob.expr, target, replacement);
-            }
-        }
-        // True leaf variants: ColumnRef already handled as base case above;
-        // LambdaParamRef, Literal, SubqueryPlaceholder carry no child exprs.
-        ExprKind::ColumnRef { .. }
-        | ExprKind::LambdaParamRef { .. }
-        | ExprKind::Literal(_)
-        | ExprKind::SubqueryPlaceholder { .. } => {}
-    }
-}
-
-/// Structural equality used ONLY to identify the exact `subquery_conjunct` within
-/// the `outer_conjuncts` set. Both expressions come from the same `where_pred`
-/// via `split_and`, so debug-format equality is exact and correct here.
-fn expr_struct_eq(a: &TypedExpr, b: &TypedExpr) -> bool {
-    format!("{:?}", a.kind) == format!("{:?}", b.kind)
-}
-
-/// Port of StarRocks ScalarApply2AnalyticRule's check() family. Returns the
-/// validated match data, or None if any precondition fails (-> caller Unchanged).
-pub(super) fn check_preconditions(
-    where_pred: &TypedExpr,
-    a: &LogicalApplyNode,
-    apply_left: &LogicalPlanNode,
-    apply_right: &LogicalPlanNode,
+fn check_preconditions_opt(
+    where_pred: ScalarId,
+    a: &ApplyOp,
+    apply_left: &OptExpr,
+    apply_right: &OptExpr,
+    arena: &ScalarArena,
 ) -> Option<WinMagicMatch> {
     // (0) Inner: peel optional leading Project, require a vector Aggregate with a
     // single non-DISTINCT whitelisted aggregate.
@@ -612,6 +319,7 @@ pub(super) fn check_preconditions(
     if !WHITELIST.contains(&inner_agg.name.as_str()) {
         return None;
     }
+    let inner_agg_output = agg.output_columns.get(agg.group_by.len())?.clone();
 
     // (1) No LIMIT and only whitelisted operators in either subtree.
     if !operator_whitelist_ok(apply_left, false) {
@@ -648,15 +356,13 @@ pub(super) fn check_preconditions(
     let col_map = collect_scan_column_map(apply_left);
     let mut partition_by = Vec::new();
     for conj in &a.correlation_conjuncts {
-        let (outer_side, _inner) = super::decorrelate_util::orient_eq(conj, &corr_ids)?;
-        let ExprKind::ColumnRef { column_id, .. } = &outer_side.kind else {
-            return None;
-        };
-        match col_map.get(column_id) {
+        let (outer_side, _inner) = scalar_utils::orient_eq(arena, *conj, &corr_ids)?;
+        let column_id = scalar_utils::is_column_ref(arena, outer_side)?;
+        match col_map.get(&column_id) {
             Some((tab, _)) if *tab == correlated_outer_table => {}
             _ => return None,
         }
-        partition_by.push(outer_side.clone());
+        partition_by.push(outer_side);
     }
 
     // (4) Predicate identity (StarRocks checkPredicate, 4 steps). Use a phys map
@@ -666,14 +372,14 @@ pub(super) fn check_preconditions(
         m.extend(collect_scan_column_map(apply_right));
         m
     };
-    let mut outer_conjuncts = split_and(where_pred.clone());
+    let mut outer_conjuncts = scalar_utils::split_and(arena, where_pred);
 
     // 4a. Each correlation conjunct must have a phys-identical twin among outer conjuncts.
     let mut unmatched_corr = a.correlation_conjuncts.clone();
     unmatched_corr.retain(|cc| {
         if let Some(pos) = outer_conjuncts
             .iter()
-            .position(|oc| expr_phys_eq(cc, oc, &full_map))
+            .position(|oc| expr_phys_eq(arena, *cc, *oc, &full_map))
         {
             outer_conjuncts.remove(pos);
             false
@@ -689,18 +395,18 @@ pub(super) fn check_preconditions(
     let apply_out = a.output_column.column_id;
     let sub_pos = outer_conjuncts
         .iter()
-        .position(|oc| collect_column_id_refs(oc).contains(&apply_out))?;
+        .position(|oc| scalar_utils::collect_column_ids(arena, *oc).contains(&apply_out))?;
     let subquery_conjunct = outer_conjuncts.remove(sub_pos);
     if outer_conjuncts
         .iter()
-        .any(|oc| collect_column_id_refs(oc).contains(&apply_out))
+        .any(|oc| scalar_utils::collect_column_ids(arena, *oc).contains(&apply_out))
     {
         return None;
     }
 
     // 4c. Drop outer conjuncts that reference ONLY `correlated_outer_table`.
     outer_conjuncts.retain(|oc| {
-        let refs = collect_column_id_refs(oc);
+        let refs = scalar_utils::collect_column_ids(arena, *oc);
         let only_extra = !refs.is_empty()
             && refs
                 .iter()
@@ -709,14 +415,14 @@ pub(super) fn check_preconditions(
     });
 
     // 4d. Remaining outer conjuncts must 1:1 phys-match the subquery's residual Filter conjuncts.
-    let mut sub_residual = subquery_residual_conjuncts(apply_right);
+    let mut sub_residual = subquery_residual_conjuncts(apply_right, arena);
     if outer_conjuncts.len() != sub_residual.len() {
         return None;
     }
     for oc in &outer_conjuncts {
         match sub_residual
             .iter()
-            .position(|sc| expr_phys_eq(oc, sc, &full_map))
+            .position(|sc| expr_phys_eq(arena, *oc, *sc, &full_map))
         {
             Some(pos) => {
                 sub_residual.remove(pos);
@@ -726,18 +432,19 @@ pub(super) fn check_preconditions(
     }
 
     Some(WinMagicMatch {
-        outer_conjuncts: split_and(where_pred.clone()),
+        outer_conjuncts: scalar_utils::split_and(arena, where_pred),
         subquery_conjunct,
         partition_by,
         inner_agg,
+        inner_agg_output,
     })
 }
 
 /// Peel optional leading Project and return the underlying aggregate payload, if any.
-fn peel_to_aggregate(plan: &LogicalPlanNode) -> Option<&LogicalAggregateNode> {
-    match &plan.kind {
-        PlanNodeKind::Aggregate(agg) => Some(agg),
-        PlanNodeKind::Project(_) => peel_to_aggregate(plan.unary_input()),
+fn peel_to_aggregate(plan: &OptExpr) -> Option<&LogicalAggregateOp> {
+    match &plan.op {
+        Operator::LogicalAggregate(agg) => Some(agg),
+        Operator::LogicalProject(_) => peel_to_aggregate(plan.unary_input()),
         _ => None,
     }
 }
@@ -750,20 +457,20 @@ fn peel_to_aggregate(plan: &LogicalPlanNode) -> Option<&LogicalAggregateNode> {
 /// Aggregate.
 ///
 /// Any other node (Limit, Sort, Window, Union, Apply, …) returns `false`.
-fn operator_whitelist_ok(plan: &LogicalPlanNode, is_subquery: bool) -> bool {
-    match &plan.kind {
-        PlanNodeKind::Scan(_) => true,
-        PlanNodeKind::Filter(_) | PlanNodeKind::Project(_) => {
+fn operator_whitelist_ok(plan: &OptExpr, is_subquery: bool) -> bool {
+    match &plan.op {
+        Operator::LogicalScan(_) => true,
+        Operator::LogicalFilter(_) | Operator::LogicalProject(_) => {
             operator_whitelist_ok(plan.unary_input(), is_subquery)
         }
-        PlanNodeKind::Join(j) => {
-            if j.join_type != crate::sql::analysis::JoinKind::Cross {
+        Operator::LogicalJoin(j) => {
+            if j.join_type != JoinKind::Cross {
                 return false;
             }
             operator_whitelist_ok(plan.left(), is_subquery)
                 && operator_whitelist_ok(plan.right(), is_subquery)
         }
-        PlanNodeKind::Aggregate(_) if is_subquery => {
+        Operator::LogicalAggregate(_) if is_subquery => {
             operator_whitelist_ok(plan.unary_input(), is_subquery)
         }
         _ => false,
@@ -772,22 +479,22 @@ fn operator_whitelist_ok(plan: &LogicalPlanNode, is_subquery: bool) -> bool {
 
 /// Collect the residual (non-correlation) Filter conjuncts from the subquery's
 /// aggregate input, if a Filter is present.
-fn subquery_residual_conjuncts(apply_right: &LogicalPlanNode) -> Vec<TypedExpr> {
+fn subquery_residual_conjuncts(apply_right: &OptExpr, arena: &ScalarArena) -> Vec<ScalarId> {
     // Peel optional leading Project, then the Aggregate.
-    let aggregate_plan = match &apply_right.kind {
-        PlanNodeKind::Aggregate(_) => apply_right,
-        PlanNodeKind::Project(_) => {
+    let aggregate_plan = match &apply_right.op {
+        Operator::LogicalAggregate(_) => apply_right,
+        Operator::LogicalProject(_) => {
             let input = apply_right.unary_input();
-            match &input.kind {
-                PlanNodeKind::Aggregate(_) => input,
+            match &input.op {
+                Operator::LogicalAggregate(_) => input,
                 _ => return vec![],
             }
         }
         _ => return vec![],
     };
     // If the aggregate's input is a Filter, split its predicate into conjuncts.
-    match &aggregate_plan.unary_input().kind {
-        PlanNodeKind::Filter(f) => split_and(f.predicate.clone()),
+    match &aggregate_plan.unary_input().op {
+        Operator::LogicalFilter(f) => scalar_utils::split_and(arena, f.predicate),
         _ => vec![],
     }
 }
@@ -807,15 +514,55 @@ mod tests {
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::{ColumnId, ColumnRefFactory};
     use crate::sql::optimizer::convert::logical_plan_to_opt_expr;
+    use crate::sql::optimizer::operator::Operator;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
+    use crate::sql::optimizer::rewrite::rules::subquery::bridge::opt_expr_to_plan;
+    use crate::sql::optimizer::rewrite::rules::utils::{collect_column_id_refs, split_and};
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::{
         AggregateCall, ApplyKind, LogicalAggregateNode, LogicalApplyNode, LogicalFilterNode,
         LogicalJoinNode, LogicalLimitNode, LogicalPlanNode, LogicalProjectNode, LogicalScanNode,
         PlanNodeKind,
     };
+
+    fn check_preconditions(
+        where_pred: &TypedExpr,
+        apply: &LogicalApplyNode,
+        apply_left: &LogicalPlanNode,
+        apply_right: &LogicalPlanNode,
+    ) -> Option<()> {
+        let apply_plan = LogicalPlanNode::new(
+            PlanNodeKind::Apply(apply.clone()),
+            vec![apply_left.clone(), apply_right.clone()],
+            None,
+        );
+        let plan = LogicalPlanNode::new(
+            PlanNodeKind::Filter(LogicalFilterNode {
+                predicate: where_pred.clone(),
+            }),
+            vec![apply_plan],
+            None,
+        );
+        let mut arena = ScalarArena::new();
+        let opt = logical_plan_to_opt_expr(&plan, &mut arena);
+        let Operator::LogicalFilter(filter) = &opt.op else {
+            return None;
+        };
+        let apply_expr = opt.unary_input();
+        let Operator::LogicalApply(apply_op) = &apply_expr.op else {
+            return None;
+        };
+        super::check_preconditions_opt(
+            filter.predicate,
+            apply_op,
+            apply_expr.left(),
+            apply_expr.right(),
+            &arena,
+        )
+        .map(|_| ())
+    }
 
     // ---- Column ID constants -------------------------------------------------
     // Outer lineitem scan (table_id=1, first instance)

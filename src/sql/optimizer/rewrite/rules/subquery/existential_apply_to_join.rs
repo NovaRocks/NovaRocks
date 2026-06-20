@@ -5,15 +5,17 @@
 //! `outer LEFT SEMI JOIN inner ON <normalized correlation predicate>`;
 //! NOT EXISTS -> LEFT ANTI; uncorrelated -> semi/anti ON true.
 
-use super::bridge::{opt_expr_to_plan, plan_to_opt_expr};
-use super::predicate_apply_util::{lift_correlated_inner, literal_true};
+use super::predicate_apply_util::lift_correlated_inner_opt;
+use super::scalar_utils;
 use crate::sql::analysis::JoinKind;
+use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::planner::plan::{ApplyKind, LogicalJoinNode, LogicalPlanNode, PlanNodeKind};
+use crate::sql::optimizer::scalar::ScalarArena;
+use crate::sql::planner::plan::ApplyKind;
 
 #[allow(dead_code)] // Registered by Task 6.
 pub(crate) struct ExistentialApplyToJoin;
@@ -28,35 +30,31 @@ impl LogicalRewriteRule for ExistentialApplyToJoin {
     }
 
     fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
-        let arena = ctx.scalar_arena();
-        let plan = opt_expr_to_plan(expr, &arena.borrow());
-        matches_plan(&plan)
+        let _ = ctx;
+        matches_expr(expr)
     }
 
     fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         let arena = ctx.scalar_arena();
-        let plan = opt_expr_to_plan(&expr, &arena.borrow());
-        match apply_plan(plan)? {
-            Some(new_plan) => {
-                let new_expr = plan_to_opt_expr(&new_plan, &mut arena.borrow_mut());
-                Ok(RewriteResult::Changed(new_expr))
-            }
+        let mut arena = arena.borrow_mut();
+        match apply_expr(expr, &mut arena)? {
+            Some(new_expr) => Ok(RewriteResult::Changed(new_expr)),
             None => Ok(RewriteResult::Unchanged),
         }
     }
 }
 
-fn matches_plan(plan: &LogicalPlanNode) -> bool {
-    matches!(&plan.kind, PlanNodeKind::Apply(a) if matches!(a.kind, ApplyKind::Exists { .. }))
+fn matches_expr(expr: &OptExpr) -> bool {
+    matches!(&expr.op, Operator::LogicalApply(a) if matches!(a.kind, ApplyKind::Exists { .. }))
 }
 
-fn apply_plan(plan: LogicalPlanNode) -> Result<Option<LogicalPlanNode>, String> {
-    let LogicalPlanNode {
-        kind,
+fn apply_expr(expr: OptExpr, arena: &mut ScalarArena) -> Result<Option<OptExpr>, String> {
+    let OptExpr {
+        op,
         mut children,
         required_output_columns: _,
-    } = plan;
-    let PlanNodeKind::Apply(a) = &kind else {
+    } = expr;
+    let Operator::LogicalApply(a) = op else {
         return Ok(None);
     };
     if children.len() != 2 {
@@ -75,9 +73,10 @@ fn apply_plan(plan: LogicalPlanNode) -> Result<Option<LogicalPlanNode>, String> 
     };
 
     let (right, condition) = if a.correlation_column_ids.is_empty() {
-        (apply_right, literal_true())
+        (apply_right, scalar_utils::bool_literal(arena, true))
     } else {
-        let Some(lifted) = lift_correlated_inner(apply_right, &a.correlation_column_ids) else {
+        let Some(lifted) = lift_correlated_inner_opt(apply_right, &a.correlation_column_ids, arena)
+        else {
             return Ok(None);
         };
         let Some(pred) = lifted.on_predicate else {
@@ -86,13 +85,11 @@ fn apply_plan(plan: LogicalPlanNode) -> Result<Option<LogicalPlanNode>, String> 
         (lifted.right, pred)
     };
 
-    Ok(Some(LogicalPlanNode::new(
-        PlanNodeKind::Join(LogicalJoinNode {
-            join_type,
-            condition: Some(condition),
-        }),
-        vec![apply_left, right],
-        None,
+    Ok(Some(scalar_utils::join(
+        apply_left,
+        right,
+        join_type,
+        Some(condition),
     )))
 }
 
@@ -113,6 +110,7 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::convert::logical_plan_to_opt_expr;
     use crate::sql::optimizer::rewrite::result::RewriteResult;
+    use crate::sql::optimizer::rewrite::rules::subquery::bridge::opt_expr_to_plan;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::{
         ApplyKind, LogicalApplyNode, LogicalFilterNode, LogicalJoinNode, LogicalProjectNode,
@@ -353,13 +351,6 @@ mod tests {
         ));
         assert_eq!(condition.data_type, DataType::Boolean);
         assert!(!condition.nullable);
-    }
-
-    fn assert_column_id(expr: &TypedExpr, expected: ColumnId) {
-        let ExprKind::ColumnRef { column_id, .. } = &expr.kind else {
-            panic!("expected column ref, got: {expr:?}");
-        };
-        assert_eq!(*column_id, expected);
     }
 
     fn contains_apply(plan: &LogicalPlanNode) -> bool {

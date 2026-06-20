@@ -9,6 +9,7 @@ DEFAULT_ALLOW = {
     "src/sql/optimizer/scalar/mod.rs",
     "src/sql/optimizer/scalar_bridge.rs",
     "src/sql/optimizer/convert.rs",
+    "src/sql/optimizer/rewrite/rules/subquery/bridge.rs",
 }
 
 PATTERN = re.compile(r"\b(TypedExpr|LogicalPlanNode|ProjectItem|SortItem|materialize)\b")

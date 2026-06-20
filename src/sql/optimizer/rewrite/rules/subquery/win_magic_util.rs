@@ -4,10 +4,12 @@
 
 use std::collections::HashMap;
 
-use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
+use crate::sql::analysis::BinOp;
 use crate::sql::catalog::ScanSource;
 use crate::sql::column_id::ColumnId;
-use crate::sql::planner::plan::{LogicalPlanNode, LogicalScanNode, PlanNodeKind};
+use crate::sql::optimizer::operator::{Operator, ScanOp};
+use crate::sql::optimizer::opt_expr::OptExpr;
+use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 
 /// Physical identity of a scanned table. Two scans of the same physical table
 /// (e.g. a self-join's two legs, or an outer table re-scanned in a subquery)
@@ -29,7 +31,7 @@ pub(super) enum TableIdentity {
 
 impl TableIdentity {
     #[allow(dead_code)]
-    pub(super) fn from_scan(scan: &LogicalScanNode) -> Self {
+    pub(super) fn from_scan(scan: &ScanOp) -> Self {
         match &scan.table.source {
             ScanSource::StarRocks { db_id, table_id } => TableIdentity::StarRocks {
                 db_id: *db_id,
@@ -63,28 +65,28 @@ impl TableIdentity {
 /// left-to-right order, WITH duplicates preserved (so callers can detect a
 /// self-join / duplicate-table by comparing `Vec::len()` against the set size).
 #[allow(dead_code)]
-pub(super) fn collect_table_ids(plan: &LogicalPlanNode) -> Vec<TableIdentity> {
+pub(super) fn collect_table_ids(plan: &OptExpr) -> Vec<TableIdentity> {
     let mut out = Vec::new();
     collect_table_ids_inner(plan, &mut out);
     out
 }
 
-fn collect_table_ids_inner(plan: &LogicalPlanNode, out: &mut Vec<TableIdentity>) {
-    if let PlanNodeKind::Scan(s) = &plan.kind {
+fn collect_table_ids_inner(plan: &OptExpr, out: &mut Vec<TableIdentity>) {
+    if let Operator::LogicalScan(s) = &plan.op {
         out.push(TableIdentity::from_scan(s));
         return;
     }
 
     if matches!(
-        plan.kind,
-        PlanNodeKind::Join(_)
-            | PlanNodeKind::Filter(_)
-            | PlanNodeKind::Project(_)
-            | PlanNodeKind::Aggregate(_)
-            | PlanNodeKind::Sort(_)
-            | PlanNodeKind::Window(_)
-            | PlanNodeKind::AssertOneRow(_)
-            | PlanNodeKind::Apply(_)
+        plan.op,
+        Operator::LogicalJoin(_)
+            | Operator::LogicalFilter(_)
+            | Operator::LogicalProject(_)
+            | Operator::LogicalAggregate(_)
+            | Operator::LogicalSort(_)
+            | Operator::LogicalWindow(_)
+            | Operator::LogicalAssertOneRow(_)
+            | Operator::LogicalApply(_)
     ) {
         for child in &plan.children {
             collect_table_ids_inner(child, out);
@@ -103,7 +105,7 @@ fn collect_table_ids_inner(plan: &LogicalPlanNode, out: &mut Vec<TableIdentity>)
 /// the predicate-identity check only compares base-table column references.
 #[allow(dead_code)]
 pub(super) fn collect_scan_column_map(
-    plan: &LogicalPlanNode,
+    plan: &OptExpr,
 ) -> HashMap<ColumnId, (TableIdentity, String)> {
     let mut map = HashMap::new();
     collect_scan_column_map_inner(plan, &mut map);
@@ -111,10 +113,10 @@ pub(super) fn collect_scan_column_map(
 }
 
 fn collect_scan_column_map_inner(
-    plan: &LogicalPlanNode,
+    plan: &OptExpr,
     map: &mut HashMap<ColumnId, (TableIdentity, String)>,
 ) {
-    if let PlanNodeKind::Scan(s) = &plan.kind {
+    if let Operator::LogicalScan(s) = &plan.op {
         let id = TableIdentity::from_scan(s);
         for c in &s.columns {
             map.insert(c.column_id, (id.clone(), c.name.clone()));
@@ -123,15 +125,15 @@ fn collect_scan_column_map_inner(
     }
 
     if matches!(
-        plan.kind,
-        PlanNodeKind::Join(_)
-            | PlanNodeKind::Filter(_)
-            | PlanNodeKind::Project(_)
-            | PlanNodeKind::Aggregate(_)
-            | PlanNodeKind::Sort(_)
-            | PlanNodeKind::Window(_)
-            | PlanNodeKind::AssertOneRow(_)
-            | PlanNodeKind::Apply(_)
+        plan.op,
+        Operator::LogicalJoin(_)
+            | Operator::LogicalFilter(_)
+            | Operator::LogicalProject(_)
+            | Operator::LogicalAggregate(_)
+            | Operator::LogicalSort(_)
+            | Operator::LogicalWindow(_)
+            | Operator::LogicalAssertOneRow(_)
+            | Operator::LogicalApply(_)
     ) {
         for child in &plan.children {
             collect_scan_column_map_inner(child, map);
@@ -150,42 +152,43 @@ fn collect_scan_column_map_inner(
 /// the *same* `ColumnId`. Mirrors StarRocks `PredicateComparator.isIdentical`.
 #[allow(dead_code)]
 pub(super) fn expr_phys_eq(
-    a: &TypedExpr,
-    b: &TypedExpr,
+    arena: &ScalarArena,
+    a: ScalarId,
+    b: ScalarId,
     map: &HashMap<ColumnId, (TableIdentity, String)>,
 ) -> bool {
-    match (&a.kind, &b.kind) {
-        (ExprKind::ColumnRef { column_id: ia, .. }, ExprKind::ColumnRef { column_id: ib, .. }) => {
+    match (arena.node(a), arena.node(b)) {
+        (ScalarNode::ColumnRef(ia), ScalarNode::ColumnRef(ib)) => {
             match (map.get(ia), map.get(ib)) {
                 (Some(pa), Some(pb)) => pa == pb,
                 _ => ia == ib,
             }
         }
         (
-            ExprKind::BinaryOp {
+            ScalarNode::BinaryOp {
                 left: la,
                 op: oa,
                 right: ra,
             },
-            ExprKind::BinaryOp {
+            ScalarNode::BinaryOp {
                 left: lb,
                 op: ob,
                 right: rb,
             },
         ) => {
             oa == ob
-                && ((expr_phys_eq(la, lb, map) && expr_phys_eq(ra, rb, map))
+                && ((expr_phys_eq(arena, *la, *lb, map) && expr_phys_eq(arena, *ra, *rb, map))
                     || (matches!(oa, BinOp::Eq | BinOp::Ne)
-                        && expr_phys_eq(la, rb, map)
-                        && expr_phys_eq(ra, lb, map)))
+                        && expr_phys_eq(arena, *la, *rb, map)
+                        && expr_phys_eq(arena, *ra, *lb, map)))
         }
         (
-            ExprKind::FunctionCall {
+            ScalarNode::FunctionCall {
                 name: na,
                 args: aa,
                 distinct: da,
             },
-            ExprKind::FunctionCall {
+            ScalarNode::FunctionCall {
                 name: nb,
                 args: ab,
                 distinct: db,
@@ -194,32 +197,30 @@ pub(super) fn expr_phys_eq(
             na == nb
                 && da == db
                 && aa.len() == ab.len()
-                && aa.iter().zip(ab).all(|(x, y)| expr_phys_eq(x, y, map))
+                && aa
+                    .iter()
+                    .zip(ab)
+                    .all(|(x, y)| expr_phys_eq(arena, *x, *y, map))
         }
         (
-            ExprKind::IsNull {
-                expr: ea,
+            ScalarNode::IsNull {
+                child: ea,
                 negated: ga,
             },
-            ExprKind::IsNull {
-                expr: eb,
+            ScalarNode::IsNull {
+                child: eb,
                 negated: gb,
             },
-        ) => ga == gb && expr_phys_eq(ea, eb, map),
-        (ExprKind::Literal(la), ExprKind::Literal(lb)) => literal_eq(la, lb),
+        ) => ga == gb && expr_phys_eq(arena, *ea, *eb, map),
+        (ScalarNode::Literal(la), ScalarNode::Literal(lb)) => la == lb,
         // Other / mixed kinds: conservative debug-structural equality.
-        _ => format!("{:?}", a.kind) == format!("{:?}", b.kind),
+        _ => arena.node(a) == arena.node(b),
     }
-}
-
-fn literal_eq(a: &LiteralValue, b: &LiteralValue) -> bool {
-    format!("{a:?}") == format!("{b:?}")
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::sql::planner::plan::*;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     use arrow::datatypes::DataType;
 
@@ -227,6 +228,8 @@ mod tests {
     use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, TypedExpr};
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::convert::logical_plan_to_opt_expr;
+    use crate::sql::optimizer::scalar::{self, ScalarArena};
     use crate::sql::planner::plan::{
         LogicalJoinNode, LogicalPlanNode, LogicalScanNode, PlanNodeKind,
     };
@@ -295,6 +298,31 @@ mod tests {
         }
     }
 
+    fn collect_table_ids(plan: &LogicalPlanNode) -> Vec<TableIdentity> {
+        let mut arena = ScalarArena::new();
+        let expr = logical_plan_to_opt_expr(plan, &mut arena);
+        super::collect_table_ids(&expr)
+    }
+
+    fn collect_scan_column_map(
+        plan: &LogicalPlanNode,
+    ) -> HashMap<ColumnId, (TableIdentity, String)> {
+        let mut arena = ScalarArena::new();
+        let expr = logical_plan_to_opt_expr(plan, &mut arena);
+        super::collect_scan_column_map(&expr)
+    }
+
+    fn expr_phys_eq(
+        a: &TypedExpr,
+        b: &TypedExpr,
+        map: &HashMap<ColumnId, (TableIdentity, String)>,
+    ) -> bool {
+        let mut arena = ScalarArena::new();
+        let a = scalar::intern_typed(&mut arena, a);
+        let b = scalar::intern_typed(&mut arena, b);
+        super::expr_phys_eq(&arena, a, b, map)
+    }
+
     // -----------------------------------------------------------------
     // table_identity_from_starrocks_scan
     // -----------------------------------------------------------------
@@ -319,7 +347,13 @@ mod tests {
             variant_columns: vec![],
             mv_rewritten_from: None,
         };
-        let id = TableIdentity::from_scan(&scan_node);
+        let plan = LogicalPlanNode::new(PlanNodeKind::Scan(scan_node), vec![], None);
+        let mut arena = ScalarArena::new();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let Operator::LogicalScan(scan) = &expr.op else {
+            panic!("expected scan")
+        };
+        let id = TableIdentity::from_scan(scan);
         assert_eq!(
             id,
             TableIdentity::StarRocks {

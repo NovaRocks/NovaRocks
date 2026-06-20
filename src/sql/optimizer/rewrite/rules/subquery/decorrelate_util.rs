@@ -2,59 +2,107 @@
 
 use std::collections::HashSet;
 
-use crate::sql::analysis::{BinOp, ExprKind, TypedExpr};
+use crate::sql::analysis::BinOp;
 use crate::sql::column_id::ColumnId;
-use crate::sql::optimizer::rewrite::rules::utils::{collect_column_id_refs, split_and};
+use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 
-/// Split a predicate's AND-conjuncts into (correlated, residual): a conjunct is
-/// correlated iff it references any column id in `corr_ids` (an outer column).
-pub(super) fn partition_conjuncts(
-    predicate: TypedExpr,
+use super::scalar_utils;
+
+pub(super) fn partition_conjuncts_opt(
+    arena: &ScalarArena,
+    predicate: ScalarId,
     corr_ids: &HashSet<ColumnId>,
-) -> (Vec<TypedExpr>, Vec<TypedExpr>) {
+) -> (Vec<ScalarId>, Vec<ScalarId>) {
     let mut correlated = Vec::new();
     let mut residual = Vec::new();
-    for c in split_and(predicate) {
-        if collect_column_id_refs(&c).is_disjoint(corr_ids) {
-            residual.push(c);
+    for conjunct in scalar_utils::split_and(arena, predicate) {
+        if scalar_utils::collect_column_ids(arena, conjunct).is_disjoint(corr_ids) {
+            residual.push(conjunct);
         } else {
-            correlated.push(c);
+            correlated.push(conjunct);
         }
     }
     (correlated, residual)
 }
 
-/// True iff every conjunct is a binary `=` comparison (the only correlation
-/// shape decorrelation supports; mirrors StarRocks checkAllIsBinaryEQ).
-pub(super) fn all_binary_eq(conjuncts: &[TypedExpr]) -> bool {
-    conjuncts
-        .iter()
-        .all(|c| matches!(&c.kind, ExprKind::BinaryOp { op: BinOp::Eq, .. }))
+pub(super) fn all_binary_eq_opt(arena: &ScalarArena, conjuncts: &[ScalarId]) -> bool {
+    conjuncts.iter().all(|conjunct| {
+        matches!(
+            arena.node(*conjunct),
+            ScalarNode::BinaryOp { op: BinOp::Eq, .. }
+        )
+    })
 }
 
-/// For a correlated EQ conjunct `a == b`, return (outer_side, inner_side) by
-/// testing which side references an outer (corr) id. The inner side becomes a
-/// GROUP BY key; the outer side becomes the join-condition outer operand.
-pub(super) fn orient_eq<'a>(
-    conjunct: &'a TypedExpr,
+pub(super) fn orient_eq_opt(
+    arena: &ScalarArena,
+    conjunct: ScalarId,
     corr_ids: &HashSet<ColumnId>,
-) -> Option<(&'a TypedExpr, &'a TypedExpr)> {
-    let ExprKind::BinaryOp {
-        left,
-        op: BinOp::Eq,
-        right,
-    } = &conjunct.kind
-    else {
-        return None;
-    };
-    let left_outer = !collect_column_id_refs(left).is_disjoint(corr_ids);
-    let right_outer = !collect_column_id_refs(right).is_disjoint(corr_ids);
-    match (left_outer, right_outer) {
-        (true, false) => Some((left, right)), // (outer, inner)
-        (false, true) => Some((right, left)), // swap: (outer, inner)
-        _ => None,                            // both/neither outer → not a clean correlation key
+) -> Option<(ScalarId, ScalarId)> {
+    scalar_utils::orient_eq(arena, conjunct, corr_ids)
+}
+
+#[cfg(test)]
+mod legacy {
+    use std::collections::HashSet;
+
+    use crate::sql::analysis::{BinOp, ExprKind, TypedExpr};
+    use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::rewrite::rules::utils::{collect_column_id_refs, split_and};
+
+    /// Split a predicate's AND-conjuncts into (correlated, residual): a conjunct is
+    /// correlated iff it references any column id in `corr_ids` (an outer column).
+    pub(crate) fn partition_conjuncts(
+        predicate: TypedExpr,
+        corr_ids: &HashSet<ColumnId>,
+    ) -> (Vec<TypedExpr>, Vec<TypedExpr>) {
+        let mut correlated = Vec::new();
+        let mut residual = Vec::new();
+        for c in split_and(predicate) {
+            if collect_column_id_refs(&c).is_disjoint(corr_ids) {
+                residual.push(c);
+            } else {
+                correlated.push(c);
+            }
+        }
+        (correlated, residual)
+    }
+
+    /// True iff every conjunct is a binary `=` comparison (the only correlation
+    /// shape decorrelation supports; mirrors StarRocks checkAllIsBinaryEQ).
+    pub(crate) fn all_binary_eq(conjuncts: &[TypedExpr]) -> bool {
+        conjuncts
+            .iter()
+            .all(|c| matches!(&c.kind, ExprKind::BinaryOp { op: BinOp::Eq, .. }))
+    }
+
+    /// For a correlated EQ conjunct `a == b`, return (outer_side, inner_side) by
+    /// testing which side references an outer (corr) id. The inner side becomes a
+    /// GROUP BY key; the outer side becomes the join-condition outer operand.
+    pub(crate) fn orient_eq<'a>(
+        conjunct: &'a TypedExpr,
+        corr_ids: &HashSet<ColumnId>,
+    ) -> Option<(&'a TypedExpr, &'a TypedExpr)> {
+        let ExprKind::BinaryOp {
+            left,
+            op: BinOp::Eq,
+            right,
+        } = &conjunct.kind
+        else {
+            return None;
+        };
+        let left_outer = !collect_column_id_refs(left).is_disjoint(corr_ids);
+        let right_outer = !collect_column_id_refs(right).is_disjoint(corr_ids);
+        match (left_outer, right_outer) {
+            (true, false) => Some((left, right)), // (outer, inner)
+            (false, true) => Some((right, left)), // swap: (outer, inner)
+            _ => None, // both/neither outer → not a clean correlation key
+        }
     }
 }
+
+#[cfg(test)]
+pub(super) use legacy::{all_binary_eq, orient_eq, partition_conjuncts};
 
 #[cfg(test)]
 mod tests {
@@ -63,6 +111,7 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{ExprKind, TypedExpr};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::rewrite::rules::utils::collect_column_id_refs;
 
     fn col_ref(id: ColumnId) -> TypedExpr {
         TypedExpr {
