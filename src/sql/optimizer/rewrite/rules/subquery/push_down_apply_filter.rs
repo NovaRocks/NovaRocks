@@ -14,6 +14,7 @@ use std::collections::HashSet;
 use super::decorrelate_util::{all_binary_eq_opt, orient_eq_opt, partition_conjuncts_opt};
 use super::scalar_utils;
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::ApplyKind;
 use crate::sql::optimizer::operator::{FilterOp, Operator, ProjectOp};
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
@@ -21,7 +22,6 @@ use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
 use crate::sql::optimizer::scalar::ScalarArena;
-use crate::sql::planner::plan::ApplyKind;
 
 pub(crate) struct PushDownApplyFilter;
 

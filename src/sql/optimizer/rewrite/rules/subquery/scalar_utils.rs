@@ -5,14 +5,14 @@ use std::collections::{HashMap, HashSet};
 use arrow::datatypes::DataType;
 
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::ApplyKind;
 use crate::sql::common::{BinOp, LiteralValue};
+use crate::sql::common::{JoinKind, OutputColumn};
 use crate::sql::optimizer::operator::{
     FilterOp, LogicalJoinOp, Operator, ScalarAggregateSpec, ScalarProjectItem, ScalarWindowSpec,
 };
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNode, SortKey};
-use crate::sql::planner::plan::ApplyKind;
-use crate::sql::{analysis::JoinKind, analysis::OutputColumn};
 
 pub(super) fn opt_output_columns(
     expr: &OptExpr,

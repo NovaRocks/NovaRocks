@@ -9,6 +9,7 @@
 
 use super::predicate_apply_util::lift_correlated_inner_opt;
 use super::scalar_utils;
+use crate::sql::common::ApplyKind;
 use crate::sql::common::JoinKind;
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::opt_expr::OptExpr;
@@ -17,7 +18,6 @@ use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
 use crate::sql::optimizer::scalar::ScalarArena;
-use crate::sql::planner::plan::ApplyKind;
 
 #[allow(dead_code)] // Registered by Task 6.
 pub(crate) struct QuantifiedApplyToJoin;

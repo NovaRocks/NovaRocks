@@ -63,13 +63,13 @@ use arrow::datatypes::DataType;
 
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::{BinOp, OutputColumn};
+use crate::sql::common::{DecodeMapping, ScanDictionaryColumn};
 use crate::sql::optimizer::operator::{
     DecodeOp, LogicalAggregateOp, LogicalJoinOp, Operator, ProjectOp, ScalarAggregateSpec,
     ScalarProjectItem, ScanOp, SortOp, TopNOp, UnionOp,
 };
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::scalar::{ColumnDisplay, ScalarArena, ScalarId, ScalarNode};
-use crate::sql::planner::plan::{DecodeMapping, ScanDictionaryColumn};
 
 use super::context::{DictBinding, DictScope, DictionaryRewriteContext};
 use super::expr::{DICT_AGG_FUNCTIONS, dict_keys_compatible, rewrite_column_ref_with_scope};

@@ -21,6 +21,7 @@ use arrow::datatypes::DataType;
 
 use super::scalar_utils;
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::ApplyKind;
 use crate::sql::common::{BinOp, JoinKind, OutputColumn};
 use crate::sql::optimizer::operator::{
     AssertOneRowOp, LogicalAggregateOp, Operator, ProjectOp, ScalarProjectItem,
@@ -31,7 +32,6 @@ use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
-use crate::sql::planner::plan::ApplyKind;
 
 pub(crate) struct ScalarApplyToJoin;
 
