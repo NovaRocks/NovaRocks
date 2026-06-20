@@ -1,16 +1,12 @@
-use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
-use crate::sql::codegen::helpers::{
-    agg_call_display_name, agg_call_display_name_without_qualifiers, typed_expr_display_name,
-};
+use crate::sql::analysis::OutputColumn;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::memo::{MExpr, Memo};
-use crate::sql::optimizer::operator::{AggStage, LogicalAggregateOp, Operator};
-use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
-use crate::sql::optimizer::scalar::{ScalarArena, ScalarId};
-use crate::sql::optimizer::scalar_bridge::{
-    intern_exprs, materialize_aggregate_calls, materialize_exprs,
+use crate::sql::optimizer::operator::{
+    AggStage, LogicalAggregateOp, Operator, ScalarAggregateSpec,
 };
-use crate::sql::planner::plan::AggregateCall;
+use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
+use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
+use crate::sql::optimizer::scalar_expr;
 
 pub(crate) struct SplitAggregateRule;
 
@@ -31,22 +27,17 @@ impl Rule for SplitAggregateRule {
         let Operator::LogicalAggregate(agg) = &expr.op else {
             return Vec::new();
         };
-        let group_by = materialize_exprs(&memo.scalars, &agg.group_by);
-        let aggregates = materialize_aggregate_calls(
-            &memo.scalars,
-            &agg.aggregates,
-            agg.group_by.len(),
-            &agg.output_columns,
-        );
-        if !is_eligible(agg, &aggregates) {
+        if !is_eligible(agg) {
             return Vec::new();
         }
 
-        let local_output_columns = local_output_columns(agg, &group_by, &aggregates);
+        let local_output_columns = local_output_columns(agg, &memo.scalars);
         remember_group_key_output_displays(&mut memo.scalars, &agg.group_by, &local_output_columns);
-        let local_group_by_typed =
-            aggregate_group_key_output_ref(&local_output_columns, agg.group_by.len());
-        let local_group_by = intern_exprs(&mut memo.scalars, &local_group_by_typed);
+        let local_group_by = aggregate_group_key_output_ref(
+            &mut memo.scalars,
+            &local_output_columns,
+            agg.group_by.len(),
+        );
         remember_group_key_output_displays(&mut memo.scalars, &local_group_by, &agg.output_columns);
         let local = LogicalAggregateOp::staged(
             AggStage::Local,
@@ -92,56 +83,63 @@ fn remember_group_key_output_displays(
     }
 }
 
-fn is_eligible(agg: &LogicalAggregateOp, aggregates: &[AggregateCall]) -> bool {
+fn is_eligible(agg: &LogicalAggregateOp) -> bool {
     agg.stage == AggStage::Single
         && !agg.is_split
         && agg.is_merge.iter().all(|flag| !*flag)
         && (!agg.aggregates.is_empty() || !agg.group_by.is_empty())
-        && aggregates.iter().all(is_splittable_aggregate)
+        && agg.aggregates.iter().all(is_splittable_aggregate)
 }
 
-fn is_splittable_aggregate(call: &AggregateCall) -> bool {
-    use crate::sql::agg_mergeability::{AggMergeability, aggregate_mergeability};
-    aggregate_mergeability(call) == AggMergeability::TwoPhase
+fn is_splittable_aggregate(call: &ScalarAggregateSpec) -> bool {
+    use crate::sql::agg_mergeability::{AggMergeability, scalar_aggregate_mergeability};
+    scalar_aggregate_mergeability(call) == AggMergeability::TwoPhase
 }
 
-fn local_output_columns(
-    agg: &LogicalAggregateOp,
-    group_by: &[TypedExpr],
-    aggregates: &[AggregateCall],
-) -> Vec<OutputColumn> {
+fn local_output_columns(agg: &LogicalAggregateOp, arena: &ScalarArena) -> Vec<OutputColumn> {
     let mut columns = Vec::with_capacity(agg.group_by.len() + agg.aggregates.len());
-    columns.extend(group_by.iter().enumerate().map(|(idx, expr)| {
-        let name = typed_expr_display_name(expr);
+    columns.extend(agg.group_by.iter().enumerate().map(|(idx, expr)| {
+        let name = scalar_expr::scalar_display_name(arena, *expr);
         // Non-ColumnRef group keys (constant/alias/expression, e.g. `'a' as g`)
         // reuse the original aggregate's group output id *by position* (the
         // first group_by.len() output columns are the group keys, in order).
         // The previous by-name lookup returned ColumnId::UNSET when the output
         // name was a SELECT alias rather than the expression's display name,
         // which the id-binding verifier rejects once the aggregate is split.
-        let column_id = match &expr.kind {
-            ExprKind::ColumnRef { column_id, .. } => *column_id,
+        let column_id = match arena.node(*expr) {
+            ScalarNode::ColumnRef(column_id) => *column_id,
             _ => agg
                 .output_columns
                 .get(idx)
                 .map(|output| output.column_id)
                 .filter(|id| *id != ColumnId::UNSET)
-                .unwrap_or_else(|| group_key_output_column_id(expr, &name, &agg.output_columns)),
+                .unwrap_or_else(|| {
+                    group_key_output_column_id(arena, *expr, &name, &agg.output_columns)
+                }),
         };
         OutputColumn {
             column_id,
             name,
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            data_type: arena.data_type(*expr).clone(),
+            nullable: arena.nullable(*expr),
             is_internal: false,
         }
     }));
-    columns.extend(aggregates.iter().map(|call| {
-        let name = agg_call_display_name(call);
+    columns.extend(agg.aggregates.iter().enumerate().map(|(idx, call)| {
+        let name = scalar_expr::aggregate_display_name(
+            arena,
+            &call.name,
+            &call.args,
+            call.distinct,
+            &call.order_by,
+        );
+        let source_output = aggregate_output_column(agg, idx);
         OutputColumn {
-            column_id: aggregate_output_column_id(call, &name, &agg.output_columns),
+            column_id: aggregate_output_column_id(&name, source_output),
             name,
-            data_type: call.result_type.clone(),
+            data_type: source_output
+                .map(|output| output.data_type.clone())
+                .unwrap_or_else(|| arrow::datatypes::DataType::Null),
             nullable: true,
             is_internal: true,
         }
@@ -150,12 +148,13 @@ fn local_output_columns(
 }
 
 pub(crate) fn group_key_output_column_id(
-    expr: &TypedExpr,
+    arena: &ScalarArena,
+    expr: ScalarId,
     display_name: &str,
     existing_outputs: &[OutputColumn],
 ) -> ColumnId {
-    match &expr.kind {
-        ExprKind::ColumnRef { column_id, .. } => *column_id,
+    match arena.node(expr) {
+        ScalarNode::ColumnRef(column_id) => *column_id,
         _ => existing_outputs
             .iter()
             .find(|output| output.name == display_name)
@@ -165,36 +164,37 @@ pub(crate) fn group_key_output_column_id(
 }
 
 fn aggregate_output_column_id(
-    call: &AggregateCall,
     display_name: &str,
-    existing_outputs: &[OutputColumn],
+    source_output: Option<&OutputColumn>,
 ) -> ColumnId {
-    if call.output_column_id != ColumnId::UNSET {
-        return call.output_column_id;
-    }
-    let unqualified_display_name = agg_call_display_name_without_qualifiers(call);
-    existing_outputs
-        .iter()
-        .find(|output| output.name == display_name || output.name == unqualified_display_name)
+    source_output
+        .filter(|output| output.name == display_name || output.column_id != ColumnId::UNSET)
         .map(|output| output.column_id)
         .unwrap_or(ColumnId::UNSET)
 }
 
+fn aggregate_output_column(
+    agg: &LogicalAggregateOp,
+    aggregate_idx: usize,
+) -> Option<&OutputColumn> {
+    agg.output_columns.get(agg.group_by.len() + aggregate_idx)
+}
+
 pub(crate) fn aggregate_group_key_output_ref(
+    arena: &mut ScalarArena,
     local_output_columns: &[OutputColumn],
     group_by_len: usize,
-) -> Vec<TypedExpr> {
+) -> Vec<ScalarId> {
     local_output_columns
         .iter()
         .take(group_by_len)
-        .map(|output| TypedExpr {
-            kind: ExprKind::ColumnRef {
-                column_id: output.column_id,
-                qualifier: None,
-                column: output.name.clone(),
-            },
-            data_type: output.data_type.clone(),
-            nullable: output.nullable,
+        .map(|output| {
+            arena.remember_project_output_display(output.column_id, None, output.name.clone());
+            arena.intern(
+                ScalarNode::ColumnRef(output.column_id),
+                output.data_type.clone(),
+                output.nullable,
+            )
         })
         .collect()
 }

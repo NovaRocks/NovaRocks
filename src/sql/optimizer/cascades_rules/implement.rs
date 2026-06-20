@@ -7,13 +7,13 @@ use std::collections::HashSet;
 
 use arrow::datatypes::DataType;
 
-use crate::sql::analysis::{BinOp, ExprKind, JoinKind, TypedExpr};
+use crate::sql::analysis::{BinOp, JoinKind};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::memo::{GroupId, MExpr, Memo};
 use crate::sql::optimizer::operator::*;
-use crate::sql::optimizer::rewrite::rules::utils::collect_column_id_refs_strict;
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
-use crate::sql::optimizer::scalar::{intern_typed, materialize};
+use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
+use crate::sql::optimizer::scalar_expr;
 use crate::sql::types::wider_type;
 
 pub(super) fn get_group_column_ids(memo: &Memo, group_id: GroupId) -> HashSet<ColumnId> {
@@ -31,58 +31,16 @@ pub(super) fn get_group_column_ids(memo: &Memo, group_id: GroupId) -> HashSet<Co
         .unwrap_or_default()
 }
 
-/// Walk a TypedExpr and return the set of lowercase column names it references.
 /// True if `expr` contains at least one ColumnRef. Used to decide whether a
 /// side of an `Eq` predicate could be a join key (vs. a constant filter).
-pub(super) fn expr_has_column_ref(expr: &TypedExpr) -> bool {
-    let mut found = false;
-    expr_has_column_ref_inner(expr, &mut found);
-    found
-}
-
-fn expr_has_column_ref_inner(expr: &TypedExpr, out: &mut bool) {
-    if *out {
-        return;
-    }
-    match &expr.kind {
-        ExprKind::ColumnRef { .. } => *out = true,
-        ExprKind::BinaryOp { left, right, .. } => {
-            expr_has_column_ref_inner(left, out);
-            expr_has_column_ref_inner(right, out);
-        }
-        ExprKind::UnaryOp { expr: inner, .. } => expr_has_column_ref_inner(inner, out),
-        ExprKind::IsNull { expr: inner, .. } => expr_has_column_ref_inner(inner, out),
-        ExprKind::Cast { expr: inner, .. } => expr_has_column_ref_inner(inner, out),
-        ExprKind::Nested(inner) => expr_has_column_ref_inner(inner, out),
-        ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
-            for a in args {
-                expr_has_column_ref_inner(a, out);
-            }
-        }
-        ExprKind::Case {
-            operand,
-            when_then,
-            else_expr,
-        } => {
-            if let Some(op) = operand {
-                expr_has_column_ref_inner(op, out);
-            }
-            for (when, then) in when_then {
-                expr_has_column_ref_inner(when, out);
-                expr_has_column_ref_inner(then, out);
-            }
-            if let Some(else_) = else_expr {
-                expr_has_column_ref_inner(else_, out);
-            }
-        }
-        _ => {}
-    }
+pub(super) fn expr_has_column_ref(arena: &ScalarArena, expr: ScalarId) -> bool {
+    scalar_expr::collect_column_ids_strict(arena, expr).is_some_and(|ids| !ids.is_empty())
 }
 
 #[derive(Clone, Debug)]
-struct TypedHashJoinEqCondition {
-    left: TypedExpr,
-    right: TypedExpr,
+struct ScalarHashJoinEqCondition {
+    left: ScalarId,
+    right: ScalarId,
     null_safe: bool,
 }
 
@@ -91,17 +49,18 @@ struct TypedHashJoinEqCondition {
 /// has unresolved ids, cannot be assigned exclusively to one child, or both
 /// expressions reference the same child.
 fn orient_eq_pair(
-    pair: TypedHashJoinEqCondition,
+    pair: ScalarHashJoinEqCondition,
+    arena: &ScalarArena,
     left_ids: &HashSet<ColumnId>,
     right_ids: &HashSet<ColumnId>,
-) -> Option<TypedHashJoinEqCondition> {
-    let TypedHashJoinEqCondition {
+) -> Option<ScalarHashJoinEqCondition> {
+    let ScalarHashJoinEqCondition {
         left: a,
         right: b,
         null_safe,
     } = pair;
-    let a_ids = collect_column_id_refs_strict(&a)?;
-    let b_ids = collect_column_id_refs_strict(&b)?;
+    let a_ids = scalar_expr::collect_column_ids_strict(arena, a)?;
+    let b_ids = scalar_expr::collect_column_ids_strict(arena, b)?;
     if a_ids.is_empty() || b_ids.is_empty() {
         return None;
     }
@@ -121,7 +80,7 @@ fn orient_eq_pair(
 
     // Unambiguous exclusive assignment: a from left only, b from right only.
     if a_in_left && !a_in_right && b_in_right && !b_in_left {
-        return Some(TypedHashJoinEqCondition {
+        return Some(ScalarHashJoinEqCondition {
             left: a,
             right: b,
             null_safe,
@@ -129,7 +88,7 @@ fn orient_eq_pair(
     }
     // Unambiguous exclusive swap: a from right only, b from left only.
     if a_in_right && !a_in_left && b_in_left && !b_in_right {
-        return Some(TypedHashJoinEqCondition {
+        return Some(ScalarHashJoinEqCondition {
             left: b,
             right: a,
             null_safe,
@@ -153,52 +112,61 @@ fn hash_join_key_type_is_supported(data_type: &DataType) -> bool {
     )
 }
 
-fn hash_join_eq_condition_is_hashable(eq: &TypedHashJoinEqCondition) -> bool {
-    if eq.left.data_type == eq.right.data_type {
-        return hash_join_key_type_is_supported(&eq.left.data_type);
+fn hash_join_eq_condition_is_hashable(arena: &ScalarArena, eq: &ScalarHashJoinEqCondition) -> bool {
+    let left_type = arena.data_type(eq.left);
+    let right_type = arena.data_type(eq.right);
+    if left_type == right_type {
+        return hash_join_key_type_is_supported(left_type);
     }
-    let common_type = wider_type(&eq.left.data_type, &eq.right.data_type);
+    let common_type = wider_type(left_type, right_type);
     hash_join_key_type_is_supported(&common_type)
 }
 
-fn coerce_hash_join_eq_condition(eq: TypedHashJoinEqCondition) -> Option<TypedHashJoinEqCondition> {
-    if hash_join_eq_condition_is_hashable(&eq) {
+fn coerce_hash_join_eq_condition(
+    arena: &ScalarArena,
+    eq: ScalarHashJoinEqCondition,
+) -> Option<ScalarHashJoinEqCondition> {
+    if hash_join_eq_condition_is_hashable(arena, &eq) {
         return Some(eq);
     }
     None
 }
 
-fn eq_condition_to_expr(eq: TypedHashJoinEqCondition) -> TypedExpr {
-    TypedExpr {
-        data_type: DataType::Boolean,
-        nullable: if eq.null_safe {
-            false
-        } else {
-            eq.left.nullable || eq.right.nullable
-        },
-        kind: ExprKind::BinaryOp {
-            left: Box::new(eq.left),
+fn eq_condition_to_expr(arena: &mut ScalarArena, eq: ScalarHashJoinEqCondition) -> ScalarId {
+    arena.intern(
+        ScalarNode::BinaryOp {
+            left: eq.left,
             op: if eq.null_safe {
                 BinOp::EqForNull
             } else {
                 BinOp::Eq
             },
-            right: Box::new(eq.right),
+            right: eq.right,
         },
-    }
+        DataType::Boolean,
+        if eq.null_safe {
+            false
+        } else {
+            arena.nullable(eq.left) || arena.nullable(eq.right)
+        },
+    )
 }
 
-fn append_residual_condition(other: &mut Option<TypedExpr>, residual: TypedExpr) {
+fn append_residual_condition(
+    arena: &mut ScalarArena,
+    other: &mut Option<ScalarId>,
+    residual: ScalarId,
+) {
     *other = Some(match other.take() {
-        Some(existing) => TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
-            kind: ExprKind::BinaryOp {
-                left: Box::new(existing),
+        Some(existing) => arena.intern(
+            ScalarNode::BinaryOp {
+                left: existing,
                 op: BinOp::And,
-                right: Box::new(residual),
+                right: residual,
             },
-        },
+            DataType::Boolean,
+            false,
+        ),
         None => residual,
     });
 }
@@ -217,22 +185,23 @@ fn append_residual_condition(other: &mut Option<TypedExpr>, residual: TypedExpr)
 /// For cross joins (condition is `None`) or when no equalities are found,
 /// `eq_pairs` will be empty.
 fn extract_eq_conditions(
-    condition: &Option<TypedExpr>,
+    condition: Option<ScalarId>,
     _join_type: &JoinKind,
-) -> (Vec<TypedHashJoinEqCondition>, Option<TypedExpr>) {
+    arena: &mut ScalarArena,
+) -> (Vec<ScalarHashJoinEqCondition>, Option<ScalarId>) {
     let Some(cond) = condition else {
         return (vec![], None);
     };
     let mut eq_pairs = Vec::new();
     let mut others = Vec::new();
-    collect_conjuncts(cond, &mut eq_pairs, &mut others);
+    collect_conjuncts(arena, cond, &mut eq_pairs, &mut others);
 
     // If no equalities were found from top-level AND, try to extract common
     // equalities from OR branches among the "other" predicates.
     if eq_pairs.is_empty() {
         let mut new_others = Vec::new();
         for part in others {
-            let (common, rewritten) = try_extract_common_eq_from_or(&part);
+            let (common, rewritten) = try_extract_common_eq_from_or(arena, part);
             eq_pairs.extend(common);
             if let Some(r) = rewritten {
                 new_others.push(r);
@@ -241,31 +210,32 @@ fn extract_eq_conditions(
         others = new_others;
     }
 
-    let remaining = combine_conjuncts(others);
+    let remaining = scalar_expr::combine_conjuncts(arena, others);
     (eq_pairs, remaining)
 }
 
 /// Recursively flatten top-level AND nodes and classify each conjunct as
 /// either an equality pair or a residual predicate.
 fn collect_conjuncts(
-    expr: &TypedExpr,
-    eq_pairs: &mut Vec<TypedHashJoinEqCondition>,
-    others: &mut Vec<TypedExpr>,
+    arena: &ScalarArena,
+    expr: ScalarId,
+    eq_pairs: &mut Vec<ScalarHashJoinEqCondition>,
+    others: &mut Vec<ScalarId>,
 ) {
-    match &expr.kind {
+    match arena.node(expr) {
         // Unwrap parenthesized expressions transparently.
-        ExprKind::Nested(inner) => {
-            collect_conjuncts(inner, eq_pairs, others);
+        ScalarNode::Nested(inner) => {
+            collect_conjuncts(arena, *inner, eq_pairs, others);
         }
-        ExprKind::BinaryOp {
+        ScalarNode::BinaryOp {
             left,
             op: BinOp::And,
             right,
         } => {
-            collect_conjuncts(left, eq_pairs, others);
-            collect_conjuncts(right, eq_pairs, others);
+            collect_conjuncts(arena, *left, eq_pairs, others);
+            collect_conjuncts(arena, *right, eq_pairs, others);
         }
-        ExprKind::BinaryOp { left, op, right } if matches!(op, BinOp::Eq | BinOp::EqForNull) => {
+        ScalarNode::BinaryOp { left, op, right } if matches!(op, BinOp::Eq | BinOp::EqForNull) => {
             // Treat as equi-join key when BOTH sides reference at least
             // one column. A side that's purely literal/constant
             // (`col = 2002`) is a filter, not an equi-key; let it fall
@@ -275,71 +245,29 @@ fn collect_conjuncts(
             // exec-layer hash join hashes the lowered expression, and
             // `orient_eq_pair` below collects column refs from each
             // side to determine left/right orientation.
-            let left_has_col = expr_has_column_ref(left);
-            let right_has_col = expr_has_column_ref(right);
+            let left_has_col = expr_has_column_ref(arena, *left);
+            let right_has_col = expr_has_column_ref(arena, *right);
             if left_has_col && right_has_col {
-                eq_pairs.push(TypedHashJoinEqCondition {
-                    left: *left.clone(),
-                    right: *right.clone(),
+                eq_pairs.push(ScalarHashJoinEqCondition {
+                    left: *left,
+                    right: *right,
                     null_safe: matches!(op, BinOp::EqForNull),
                 });
             } else {
-                others.push(expr.clone());
+                others.push(expr);
             }
         }
         _ => {
-            others.push(expr.clone());
+            others.push(expr);
         }
     }
 }
 
 /// Split a top-level OR expression into its disjuncts.
-fn split_or(expr: &TypedExpr) -> Vec<TypedExpr> {
-    match &expr.kind {
-        ExprKind::Nested(inner) => split_or(inner),
-        ExprKind::BinaryOp {
-            left,
-            op: BinOp::Or,
-            right,
-        } => {
-            let mut parts = split_or(left);
-            parts.extend(split_or(right));
-            parts
-        }
-        _ => vec![expr.clone()],
-    }
-}
-
-/// Combine a list of disjuncts back into a single OR-connected expression.
-fn combine_disjuncts(mut parts: Vec<TypedExpr>) -> Option<TypedExpr> {
-    if parts.is_empty() {
-        return None;
-    }
-    let mut result = parts.pop().unwrap();
-    while let Some(p) = parts.pop() {
-        result = TypedExpr {
-            data_type: arrow::datatypes::DataType::Boolean,
-            nullable: p.nullable || result.nullable,
-            kind: ExprKind::BinaryOp {
-                left: Box::new(p),
-                op: BinOp::Or,
-                right: Box::new(result),
-            },
-        };
-    }
-    Some(result)
-}
-
-/// Structural equality for TypedExpr using Debug representation.
-fn typed_expr_eq(a: &TypedExpr, b: &TypedExpr) -> bool {
-    format!("{:?}", a) == format!("{:?}", b)
-}
-
 /// Check if two eq pairs are structurally equal (possibly with swapped sides).
-fn eq_pair_matches(a: &TypedHashJoinEqCondition, b: &TypedHashJoinEqCondition) -> bool {
+fn eq_pair_matches(a: &ScalarHashJoinEqCondition, b: &ScalarHashJoinEqCondition) -> bool {
     a.null_safe == b.null_safe
-        && ((typed_expr_eq(&a.left, &b.left) && typed_expr_eq(&a.right, &b.right))
-            || (typed_expr_eq(&a.left, &b.right) && typed_expr_eq(&a.right, &b.left)))
+        && ((a.left == b.left && a.right == b.right) || (a.left == b.right && a.right == b.left))
 }
 
 /// Try to extract common equality conditions from an OR expression.
@@ -349,27 +277,29 @@ fn eq_pair_matches(a: &TypedHashJoinEqCondition, b: &TypedHashJoinEqCondition) -
 ///
 /// Returns `(common_eq_pairs, rewritten_or_condition)`.
 fn try_extract_common_eq_from_or(
-    expr: &TypedExpr,
-) -> (Vec<TypedHashJoinEqCondition>, Option<TypedExpr>) {
-    let branches = split_or(expr);
+    arena: &mut ScalarArena,
+    expr: ScalarId,
+) -> (Vec<ScalarHashJoinEqCondition>, Option<ScalarId>) {
+    let mut branches = Vec::new();
+    scalar_expr::split_disjuncts(arena, expr, &mut branches);
     if branches.len() < 2 {
-        return (vec![], Some(expr.clone()));
+        return (vec![], Some(expr));
     }
 
     // For each branch, extract eq pairs and residual.
-    let mut branch_eqs: Vec<Vec<TypedHashJoinEqCondition>> = Vec::new();
-    let mut branch_others: Vec<Vec<TypedExpr>> = Vec::new();
+    let mut branch_eqs: Vec<Vec<ScalarHashJoinEqCondition>> = Vec::new();
+    let mut branch_others: Vec<Vec<ScalarId>> = Vec::new();
     for branch in &branches {
         let mut eqs = Vec::new();
         let mut others = Vec::new();
-        collect_conjuncts(branch, &mut eqs, &mut others);
+        collect_conjuncts(arena, *branch, &mut eqs, &mut others);
         branch_eqs.push(eqs);
         branch_others.push(others);
     }
 
     // Find eq pairs that appear in ALL branches.
     let first_eqs = &branch_eqs[0];
-    let mut common: Vec<TypedHashJoinEqCondition> = Vec::new();
+    let mut common: Vec<ScalarHashJoinEqCondition> = Vec::new();
     for eq in first_eqs {
         if branch_eqs[1..]
             .iter()
@@ -380,32 +310,20 @@ fn try_extract_common_eq_from_or(
     }
 
     if common.is_empty() {
-        return (vec![], Some(expr.clone()));
+        return (vec![], Some(expr));
     }
 
     // Rewrite each branch: remove the common eq pairs, recombine.
     let mut rewritten_branches = Vec::new();
     for (eqs, others) in branch_eqs.iter().zip(branch_others.iter()) {
-        let mut remaining_parts: Vec<TypedExpr> = others.clone();
+        let mut remaining_parts: Vec<ScalarId> = others.clone();
         for eq in eqs {
             if !common.iter().any(|c| eq_pair_matches(c, eq)) {
                 // Keep non-common eq pairs as regular conjuncts.
-                remaining_parts.push(TypedExpr {
-                    data_type: DataType::Boolean,
-                    nullable: eq.left.nullable || eq.right.nullable,
-                    kind: ExprKind::BinaryOp {
-                        left: Box::new(eq.left.clone()),
-                        op: if eq.null_safe {
-                            BinOp::EqForNull
-                        } else {
-                            BinOp::Eq
-                        },
-                        right: Box::new(eq.right.clone()),
-                    },
-                });
+                remaining_parts.push(eq_condition_to_expr(arena, eq.clone()));
             }
         }
-        if let Some(branch_expr) = combine_conjuncts(remaining_parts) {
+        if let Some(branch_expr) = scalar_expr::combine_conjuncts(arena, remaining_parts) {
             rewritten_branches.push(branch_expr);
         }
         // If a branch becomes empty (only common eqs), skip it — it
@@ -414,7 +332,7 @@ fn try_extract_common_eq_from_or(
     }
 
     let rewritten = if rewritten_branches.len() == branches.len() {
-        combine_disjuncts(rewritten_branches)
+        scalar_expr::combine_disjuncts(arena, rewritten_branches)
     } else {
         // Some branches were pure eq-only; the entire OR condition is
         // satisfied whenever the common equalities hold.
@@ -422,27 +340,6 @@ fn try_extract_common_eq_from_or(
     };
 
     (common, rewritten)
-}
-
-/// Combine a list of residual predicates back into a single AND-connected
-/// expression. Returns `None` if the list is empty.
-fn combine_conjuncts(mut parts: Vec<TypedExpr>) -> Option<TypedExpr> {
-    if parts.is_empty() {
-        return None;
-    }
-    let mut result = parts.pop().unwrap();
-    while let Some(p) = parts.pop() {
-        result = TypedExpr {
-            data_type: arrow::datatypes::DataType::Boolean,
-            nullable: p.nullable || result.nullable,
-            kind: ExprKind::BinaryOp {
-                left: Box::new(p),
-                op: BinOp::And,
-                right: Box::new(result),
-            },
-        };
-    }
-    Some(result)
 }
 
 // ===========================================================================
@@ -571,10 +468,8 @@ impl Rule for JoinToHashJoin {
         let Operator::LogicalJoin(op) = &expr.op else {
             return vec![];
         };
-        let condition = op
-            .condition
-            .map(|condition| materialize(&memo.scalars, condition));
-        let (raw_eq_conds, mut other) = extract_eq_conditions(&condition, &op.join_type);
+        let (raw_eq_conds, mut other) =
+            extract_eq_conditions(op.condition, &op.join_type, &mut memo.scalars);
 
         // Orient eq_conditions so that pair.0 references the left child's
         // columns and pair.1 references the right child's columns.  Pairs
@@ -585,26 +480,30 @@ impl Rule for JoinToHashJoin {
             let left_ids = get_group_column_ids(memo, expr.children[0]);
             let right_ids = get_group_column_ids(memo, expr.children[1]);
             for pair in raw_eq_conds {
-                let a = pair.left.clone();
-                let b = pair.right.clone();
+                let a = pair.left;
+                let b = pair.right;
                 let null_safe = pair.null_safe;
-                match orient_eq_pair(pair, &left_ids, &right_ids) {
+                match orient_eq_pair(pair, &memo.scalars, &left_ids, &right_ids) {
                     Some(oriented) => {
-                        if let Some(coerced) = coerce_hash_join_eq_condition(oriented.clone()) {
+                        if let Some(coerced) =
+                            coerce_hash_join_eq_condition(&memo.scalars, oriented.clone())
+                        {
                             eq_conds.push(coerced);
                         } else {
-                            append_residual_condition(&mut other, eq_condition_to_expr(oriented));
+                            let residual = eq_condition_to_expr(&mut memo.scalars, oriented);
+                            append_residual_condition(&mut memo.scalars, &mut other, residual);
                         }
                     }
                     None => {
-                        append_residual_condition(
-                            &mut other,
-                            eq_condition_to_expr(TypedHashJoinEqCondition {
+                        let residual = eq_condition_to_expr(
+                            &mut memo.scalars,
+                            ScalarHashJoinEqCondition {
                                 left: a,
                                 right: b,
                                 null_safe,
-                            }),
+                            },
                         );
+                        append_residual_condition(&mut memo.scalars, &mut other, residual);
                     }
                 }
             }
@@ -619,14 +518,12 @@ impl Rule for JoinToHashJoin {
         let eq_conditions = eq_conds
             .into_iter()
             .map(|eq| PhysicalHashJoinEqCondition {
-                left: intern_typed(&mut memo.scalars, &eq.left),
-                right: intern_typed(&mut memo.scalars, &eq.right),
+                left: eq.left,
+                right: eq.right,
                 null_safe: eq.null_safe,
             })
             .collect();
-        let other_condition = other
-            .as_ref()
-            .map(|condition| intern_typed(&mut memo.scalars, condition));
+        let other_condition = other;
         vec![NewExpr {
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: op.join_type,
@@ -668,17 +565,14 @@ impl Rule for JoinToNestLoop {
         // physical alternatives. Without this guard, the memo group has no
         // feasible implementation and the optimizer surfaces "no feasible
         // plan for group N".
-        let condition = op
-            .condition
-            .map(|condition| materialize(&memo.scalars, condition));
-        let (eq_conds, _) = extract_eq_conditions(&condition, &op.join_type);
+        let (eq_conds, _) = extract_eq_conditions(op.condition, &op.join_type, &mut memo.scalars);
         if !eq_conds.is_empty() && op.join_type != JoinKind::Cross && expr.children.len() == 2 {
             let left_ids = get_group_column_ids(memo, expr.children[0]);
             let right_ids = get_group_column_ids(memo, expr.children[1]);
             let has_orientable_pair = eq_conds
                 .iter()
-                .filter_map(|p| orient_eq_pair(p.clone(), &left_ids, &right_ids))
-                .any(|p| coerce_hash_join_eq_condition(p).is_some());
+                .filter_map(|p| orient_eq_pair(p.clone(), &memo.scalars, &left_ids, &right_ids))
+                .any(|p| coerce_hash_join_eq_condition(&memo.scalars, p).is_some());
             if has_orientable_pair {
                 // Has at least one usable equi-key — JoinToHashJoin handles this.
                 return vec![];
@@ -883,6 +777,7 @@ impl Rule for TopNToPhysical {
 
 /// Split a LogicalWindow's expressions into groups sharing the same
 /// (partition_by, order_by) signature. Preserves first-seen order.
+#[cfg(test)]
 #[allow(dead_code)]
 fn split_window_exprs_by_signature(
     exprs: &[crate::sql::planner::plan::WindowExpr],
@@ -897,6 +792,7 @@ fn split_window_exprs_by_signature(
 /// Derive sort items for a window's partition_by + order_by.
 /// Window sort ordering is: partition_by columns first (ASC, NULLS FIRST),
 /// then order_by columns with their own direction.
+#[cfg(test)]
 #[allow(dead_code)]
 fn sort_items_for_window(
     win: &crate::sql::planner::plan::WindowExpr,
@@ -1500,7 +1396,9 @@ mod top_n_tests {
 #[cfg(test)]
 mod eq_pair_tests {
     use super::*;
+    use crate::sql::analysis::{ExprKind, TypedExpr};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, intern_typed, materialize};
     use arrow::datatypes::DataType;
 
     fn col_id(name: &str, id: u32) -> TypedExpr {
@@ -1519,81 +1417,88 @@ mod eq_pair_tests {
         values.iter().copied().map(ColumnId).collect()
     }
 
-    fn eq_pair(left: TypedExpr, right: TypedExpr) -> TypedHashJoinEqCondition {
-        TypedHashJoinEqCondition {
-            left,
-            right,
+    fn eq_pair(
+        arena: &mut ScalarArena,
+        left: TypedExpr,
+        right: TypedExpr,
+    ) -> ScalarHashJoinEqCondition {
+        ScalarHashJoinEqCondition {
+            left: intern_typed(arena, &left),
+            right: intern_typed(arena, &right),
             null_safe: false,
+        }
+    }
+
+    fn assert_column_name(arena: &ScalarArena, expr: ScalarId, expected: &str) {
+        let expr = materialize(arena, expr);
+        match &expr.kind {
+            ExprKind::ColumnRef { column, .. } => assert_eq!(column, expected),
+            _ => panic!("expected ColumnRef"),
+        }
+    }
+
+    fn assert_column_id(arena: &ScalarArena, expr: ScalarId, expected: ColumnId) {
+        let expr = materialize(arena, expr);
+        match &expr.kind {
+            ExprKind::ColumnRef { column_id, .. } => assert_eq!(*column_id, expected),
+            _ => panic!("expected ColumnRef"),
         }
     }
 
     #[test]
     fn orient_natural_order_keeps_order() {
+        let mut arena = ScalarArena::new();
         let left_ids = ids(&[10]);
         let right_ids = ids(&[20]);
-        let pair = eq_pair(col_id("a_id", 10), col_id("b_id", 20));
-        let out = orient_eq_pair(pair, &left_ids, &right_ids).expect("should orient");
-        match &out.left.kind {
-            ExprKind::ColumnRef { column, .. } => assert_eq!(column, "a_id"),
-            _ => panic!("expected ColumnRef"),
-        }
-        match &out.right.kind {
-            ExprKind::ColumnRef { column, .. } => assert_eq!(column, "b_id"),
-            _ => panic!("expected ColumnRef"),
-        }
+        let pair = eq_pair(&mut arena, col_id("a_id", 10), col_id("b_id", 20));
+        let out = orient_eq_pair(pair, &arena, &left_ids, &right_ids).expect("should orient");
+        assert_column_name(&arena, out.left, "a_id");
+        assert_column_name(&arena, out.right, "b_id");
     }
 
     #[test]
     fn orient_swapped_pair_returns_swapped() {
+        let mut arena = ScalarArena::new();
         let left_ids = ids(&[10]);
         let right_ids = ids(&[20]);
-        let pair = eq_pair(col_id("b_id", 20), col_id("a_id", 10));
-        let out = orient_eq_pair(pair, &left_ids, &right_ids).expect("should orient");
-        match &out.left.kind {
-            ExprKind::ColumnRef { column, .. } => assert_eq!(column, "a_id"),
-            _ => panic!("expected ColumnRef"),
-        }
-        match &out.right.kind {
-            ExprKind::ColumnRef { column, .. } => assert_eq!(column, "b_id"),
-            _ => panic!("expected ColumnRef"),
-        }
+        let pair = eq_pair(&mut arena, col_id("b_id", 20), col_id("a_id", 10));
+        let out = orient_eq_pair(pair, &arena, &left_ids, &right_ids).expect("should orient");
+        assert_column_name(&arena, out.left, "a_id");
+        assert_column_name(&arena, out.right, "b_id");
     }
 
     #[test]
     fn orient_single_side_pair_returns_none() {
+        let mut arena = ScalarArena::new();
         let left_ids = ids(&[10, 11]);
         let right_ids = ids(&[20]);
-        let pair = eq_pair(col_id("a_id", 10), col_id("a_name", 11));
-        assert!(orient_eq_pair(pair, &left_ids, &right_ids).is_none());
+        let pair = eq_pair(&mut arena, col_id("a_id", 10), col_id("a_name", 11));
+        assert!(orient_eq_pair(pair, &arena, &left_ids, &right_ids).is_none());
     }
 
     #[test]
     fn orient_uses_column_ids_when_names_are_ambiguous() {
+        let mut arena = ScalarArena::new();
         let left_ids = ids(&[10]);
         let right_ids = ids(&[20]);
-        let pair = eq_pair(col_id("id", 20), col_id("id", 10));
-        let out = orient_eq_pair(pair, &left_ids, &right_ids)
+        let pair = eq_pair(&mut arena, col_id("id", 20), col_id("id", 10));
+        let out = orient_eq_pair(pair, &arena, &left_ids, &right_ids)
             .expect("column ids should disambiguate the join sides");
 
-        match &out.left.kind {
-            ExprKind::ColumnRef { column_id, .. } => assert_eq!(*column_id, ColumnId(10)),
-            _ => panic!("expected ColumnRef"),
-        }
-        match &out.right.kind {
-            ExprKind::ColumnRef { column_id, .. } => assert_eq!(*column_id, ColumnId(20)),
-            _ => panic!("expected ColumnRef"),
-        }
+        assert_column_id(&arena, out.left, ColumnId(10));
+        assert_column_id(&arena, out.right, ColumnId(20));
     }
 }
 
 #[cfg(test)]
 mod join_demotion_tests {
     use super::*;
-    use crate::sql::analysis::OutputColumn;
+    use crate::sql::analysis::{BinOp, ExprKind, JoinKind, OutputColumn, TypedExpr};
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::{LogicalProperties, MExpr, Memo};
-    use crate::sql::optimizer::scalar::ScalarId;
+    use crate::sql::optimizer::operator::{LogicalJoinOp, ScanOp};
+    use crate::sql::optimizer::scalar::{ScalarId, intern_typed, materialize};
     use arrow::datatypes::{DataType, Field};
     use std::sync::Arc;
 
@@ -1982,6 +1887,7 @@ mod join_demotion_tests {
 #[cfg(test)]
 mod window_split_tests {
     use super::*;
+    use crate::sql::analysis::{ExprKind, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::scalar_bridge::intern_window_exprs;
     use crate::sql::planner::plan::WindowExpr;
@@ -2143,7 +2049,7 @@ mod window_split_tests {
 #[cfg(test)]
 mod two_phase_agg_tests {
     use super::*;
-    use crate::sql::analysis::OutputColumn;
+    use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::{MExpr, Memo};
     use crate::sql::optimizer::scalar_bridge::{intern_aggregate_calls, intern_exprs};

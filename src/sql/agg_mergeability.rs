@@ -6,6 +6,8 @@
 //! Conservative by default: distinct, ordered, order-sensitive, and unknown
 //! functions stay `SinglePhaseOnly`. Distinct goes through `SplitDistinctAgg`.
 
+use crate::sql::optimizer::operator::ScalarAggregateSpec;
+#[cfg(test)]
 use crate::sql::planner::plan::AggregateCall;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,13 +35,22 @@ fn has_two_phase_merge(name: &str) -> bool {
     matches!(name, "sum" | "min" | "max" | "count" | "avg")
 }
 
+#[cfg(test)]
 pub(crate) fn aggregate_mergeability(call: &AggregateCall) -> AggMergeability {
-    let name = call.name.to_ascii_lowercase();
-    if call.distinct
-        || !call.order_by.is_empty()
-        || is_order_sensitive(&name)
-        || !has_two_phase_merge(&name)
-    {
+    aggregate_mergeability_from_parts(&call.name, call.distinct, call.order_by.is_empty())
+}
+
+pub(crate) fn scalar_aggregate_mergeability(call: &ScalarAggregateSpec) -> AggMergeability {
+    aggregate_mergeability_from_parts(&call.name, call.distinct, call.order_by.is_empty())
+}
+
+fn aggregate_mergeability_from_parts(
+    name: &str,
+    distinct: bool,
+    order_by_is_empty: bool,
+) -> AggMergeability {
+    let name = name.to_ascii_lowercase();
+    if distinct || !order_by_is_empty || is_order_sensitive(&name) || !has_two_phase_merge(&name) {
         AggMergeability::SinglePhaseOnly
     } else {
         AggMergeability::TwoPhase
