@@ -44,7 +44,7 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{ExprKind, LiteralValue, SortItem, TypedExpr};
     use crate::sql::optimizer::property::OrderingSpec;
-    use crate::sql::optimizer::scalar_bridge::intern_sort_items;
+    use crate::sql::planner::optimizer_bridge::scalar::intern_sort_items;
 
     #[test]
     fn top_n_output_is_gather_when_sort_keys_resolve() {

@@ -10,9 +10,9 @@ use super::operator::{JoinDistribution, Operator, PhysicalDistributionOp, SortOp
 use super::physical_plan::{JoinExecutionDistribution, PhysicalPlanNode, PlanExecutionProps};
 use super::property::{OrderingSpec, PhysicalPropertySet};
 use super::search::{EnforcerKind, Winner};
-use crate::sql::optimizer::scalar::{ScalarArena, SortKey};
-use crate::sql::optimizer::scalar_bridge::intern_column_sort_key;
+use crate::sql::optimizer::scalar::{ScalarArena, ScalarNode, SortKey};
 use crate::sql::optimizer::statistics::Statistics;
+use arrow::datatypes::DataType;
 
 /// Extract the best physical plan tree from the Memo.
 ///
@@ -191,7 +191,12 @@ fn ordering_spec_to_sort_keys(arena: &mut ScalarArena, ordering: &OrderingSpec) 
         OrderingSpec::Any => vec![],
         OrderingSpec::Required(sort_keys) => sort_keys
             .iter()
-            .map(|sk| intern_column_sort_key(arena, sk))
+            .map(|sk| SortKey {
+                expr: arena.intern(ScalarNode::ColumnRef(sk.column), DataType::Null, true),
+                asc: sk.asc,
+                nulls_first: sk.nulls_first,
+                display: None,
+            })
             .collect(),
     }
 }
@@ -208,8 +213,8 @@ mod tests {
         ScanOp, ValuesOp,
     };
     use crate::sql::optimizer::property::DistributionSpec;
-    use crate::sql::optimizer::scalar::intern_typed;
     use crate::sql::optimizer::search::{EnforcerInfo, Winner};
+    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
 
     fn test_col(id: u32) -> TypedExpr {
         TypedExpr {

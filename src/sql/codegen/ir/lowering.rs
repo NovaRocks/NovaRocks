@@ -44,7 +44,8 @@ use crate::sql::optimizer::operator::{
 };
 use crate::sql::optimizer::physical_plan::JoinExecutionDistribution;
 use crate::sql::optimizer::property::{OrderingSpec, window_ordering_spec};
-use crate::sql::optimizer::scalar::{ScalarArena, materialize};
+use crate::sql::optimizer::scalar::ScalarArena;
+use crate::sql::planner::optimizer_bridge::scalar::materialize;
 use crate::sql::planner::plan::{AggregateCall, WindowExpr};
 use crate::types;
 
@@ -4578,8 +4579,8 @@ mod tests {
         PhysicalPlanNode, PlanExecutionProps, attach_scalar_arena,
     };
     use crate::sql::optimizer::scalar::ScalarArena;
-    use crate::sql::optimizer::scalar_bridge::intern_project_items;
     use crate::sql::optimizer::statistics::Statistics;
+    use crate::sql::planner::optimizer_bridge::scalar::intern_project_items;
 
     #[test]
     fn aggregate_slot_contract_uses_intermediate_only_for_non_finalize() {

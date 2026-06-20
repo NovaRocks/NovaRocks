@@ -47,11 +47,11 @@ mod tests {
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::runtime_filter_pass::{RuntimeFilterDesc, RuntimeFilterProbe};
     use crate::sql::optimizer::scalar::ScalarArena;
-    use crate::sql::optimizer::scalar_bridge::{
+    use crate::sql::optimizer::statistics::Statistics;
+    use crate::sql::planner::optimizer_bridge::scalar::{
         intern_aggregate_calls, intern_exprs, intern_project_items, intern_sort_items,
         intern_window_exprs,
     };
-    use crate::sql::optimizer::statistics::Statistics;
     use crate::sql::planner::plan::{AggregateCall, DecodeMapping, WindowExpr};
 
     #[test]

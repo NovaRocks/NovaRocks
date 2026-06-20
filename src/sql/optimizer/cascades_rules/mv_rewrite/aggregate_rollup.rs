@@ -145,8 +145,10 @@ mod tests {
     use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::ScalarAggregateSpec;
-    use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, intern_typed};
-    use crate::sql::optimizer::scalar_bridge::intern_aggregate_call;
+    use crate::sql::optimizer::scalar::{ScalarArena, ScalarId};
+
+    use crate::sql::planner::optimizer_bridge::scalar::intern_aggregate_call;
+    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
     use crate::sql::planner::plan::AggregateCall;
     use arrow::datatypes::DataType;
     use std::collections::HashMap;

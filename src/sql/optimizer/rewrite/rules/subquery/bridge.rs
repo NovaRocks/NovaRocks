@@ -8,8 +8,9 @@
 
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::opt_expr::OptExpr;
-use crate::sql::optimizer::scalar::{ScalarArena, materialize};
-use crate::sql::optimizer::scalar_bridge::{
+use crate::sql::optimizer::scalar::ScalarArena;
+use crate::sql::planner::optimizer_bridge::scalar::materialize;
+use crate::sql::planner::optimizer_bridge::scalar::{
     materialize_aggregate_call, materialize_exprs, materialize_project_items,
     materialize_sort_keys, materialize_window_exprs,
 };

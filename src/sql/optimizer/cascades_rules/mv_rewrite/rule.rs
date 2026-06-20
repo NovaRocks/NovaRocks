@@ -470,7 +470,7 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::{GroupId, Memo};
     use crate::sql::optimizer::scalar::ScalarArena;
-    use crate::sql::optimizer::scalar::materialize;
+    use crate::sql::planner::optimizer_bridge::scalar::materialize;
     use crate::sql::planner::plan::{
         AggregateCall, LogicalAggregateNode, LogicalFilterNode, LogicalPlanNode, LogicalScanNode,
         PlanNodeKind,

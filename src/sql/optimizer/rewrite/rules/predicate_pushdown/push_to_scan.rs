@@ -257,7 +257,8 @@ mod tests {
     }
 
     fn filter_opt(arena: &mut ScalarArena, predicate: TypedExpr, child: OptExpr) -> OptExpr {
-        let pred_id = scalar::intern_typed(arena, &predicate);
+        let pred_id =
+            crate::sql::planner::optimizer_bridge::scalar::intern_typed(arena, &predicate);
         OptExpr::new(
             Operator::LogicalFilter(FilterOp { predicate: pred_id }),
             vec![child],
@@ -377,7 +378,10 @@ mod tests {
         let pred_id = {
             let arena_rc = ctx.scalar_arena();
             let mut arena = arena_rc.borrow_mut();
-            scalar::intern_typed(&mut arena, &is_not_null(col("a")))
+            crate::sql::planner::optimizer_bridge::scalar::intern_typed(
+                &mut arena,
+                &is_not_null(col("a")),
+            )
         };
         let filter2 = OptExpr::new(
             Operator::LogicalFilter(FilterOp { predicate: pred_id }),

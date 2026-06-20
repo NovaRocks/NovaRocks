@@ -15,7 +15,8 @@ use crate::sql::optimizer::estimate::arith::MAX_ROW_COUNT;
 use crate::sql::optimizer::operator::{AggMode, JoinDistribution, TopNPhase};
 use crate::sql::optimizer::physical_plan::JoinExecutionDistribution;
 use crate::sql::optimizer::runtime_filter_pass::{RuntimeFilterDesc, RuntimeFilterProbe};
-use crate::sql::optimizer::scalar::{ScalarArena, materialize};
+use crate::sql::optimizer::scalar::ScalarArena;
+use crate::sql::planner::optimizer_bridge::scalar::materialize;
 use crate::sql::planner::plan::{
     DistributedExchangeNode, DistributedHashAggregateNode, DistributedHashJoinNode,
     DistributedNestLoopJoinNode, DistributedSetOpNode, DistributedTopNNode, ExchangeFlavor,
@@ -1342,10 +1343,10 @@ mod tests {
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::runtime_filter_pass::{self, test_support};
     use crate::sql::optimizer::scalar::ScalarArena;
-    use crate::sql::optimizer::scalar_bridge::{
+    use crate::sql::optimizer::statistics::{ColumnStatistic, Statistics};
+    use crate::sql::planner::optimizer_bridge::scalar::{
         intern_aggregate_calls, intern_exprs, intern_project_items, intern_sort_items,
     };
-    use crate::sql::optimizer::statistics::{ColumnStatistic, Statistics};
     use crate::sql::planner::plan::AggregateCall;
 
     #[test]

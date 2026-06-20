@@ -168,7 +168,7 @@ mod tests {
     use crate::sql::optimizer::scalar::{
         ColumnDisplay, HashableLiteral, ScalarArena, ScalarNode, SortKey as ScalarSortKey,
     };
-    use crate::sql::optimizer::scalar_bridge::{intern_project_items, intern_sort_items};
+    use crate::sql::planner::optimizer_bridge::scalar::{intern_project_items, intern_sort_items};
     use arrow::datatypes::DataType;
 
     fn col(id: u32, name: &str) -> TypedExpr {

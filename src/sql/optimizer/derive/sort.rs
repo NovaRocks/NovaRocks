@@ -56,8 +56,8 @@ mod tests {
     use crate::sql::analysis::{ExprKind, SortItem, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::property::HashSource;
-    use crate::sql::optimizer::scalar::intern_typed;
-    use crate::sql::optimizer::scalar_bridge::intern_sort_items;
+    use crate::sql::planner::optimizer_bridge::scalar::intern_sort_items;
+    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
 
     #[test]
     fn output_properties_sort_has_gather_and_ordering() {

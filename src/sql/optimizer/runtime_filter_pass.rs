@@ -542,8 +542,10 @@ pub(crate) mod test_support {
         JoinDistribution, Operator, PhysicalHashJoinEqCondition, PhysicalHashJoinOp, ValuesOp,
     };
     use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, attach_scalar_arena};
-    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
+    use crate::sql::optimizer::scalar::ScalarArena;
+
     use crate::sql::optimizer::statistics::Statistics;
+    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
 
     /// Helper: an Int32 column + a matching ColumnRef expr + OutputColumn.
     fn col(id: u32, name: &str) -> (OutputColumn, TypedExpr) {

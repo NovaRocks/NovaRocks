@@ -90,7 +90,9 @@ mod tests {
     use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::property::HashSource;
-    use crate::sql::optimizer::scalar::{ScalarId, intern_typed};
+    use crate::sql::optimizer::scalar::ScalarId;
+
+    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
 
     fn intern_group_by(scalars: &mut ScalarArena, exprs: Vec<TypedExpr>) -> Vec<ScalarId> {
         exprs

@@ -218,7 +218,9 @@ mod tests {
 
     fn project_over_scan(table_name: &str) -> OptExpr {
         use crate::sql::analysis::{ExprKind, TypedExpr};
-        use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
+        use crate::sql::optimizer::scalar::ScalarArena;
+
+        use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
         let output = output_column("c1");
         let mut arena = ScalarArena::new();
         let col_expr = TypedExpr {

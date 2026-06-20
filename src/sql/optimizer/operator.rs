@@ -516,7 +516,9 @@ mod aggregate_stage_tests {
     use super::*;
     use crate::sql::analysis::{OutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
+    use crate::sql::optimizer::scalar::ScalarArena;
+
+    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
 
     fn output_column(id: u32, name: &str) -> OutputColumn {
         OutputColumn {

@@ -445,7 +445,8 @@ mod tests {
 
     fn rank_upper_bound_typed(predicate: TypedExpr, rank_col: ColumnId) -> Option<usize> {
         let mut arena = ScalarArena::new();
-        let predicate = scalar::intern_typed(&mut arena, &predicate);
+        let predicate =
+            crate::sql::planner::optimizer_bridge::scalar::intern_typed(&mut arena, &predicate);
         rank_upper_bound(&arena, predicate, rank_col)
     }
 
@@ -468,7 +469,10 @@ mod tests {
 
     fn make_sort_key(arena: &mut ScalarArena, id: ColumnId) -> SortKey {
         SortKey {
-            expr: scalar::intern_typed(arena, &col_typed(id)),
+            expr: crate::sql::planner::optimizer_bridge::scalar::intern_typed(
+                arena,
+                &col_typed(id),
+            ),
             asc: true,
             nulls_first: true,
             display: None,
@@ -476,7 +480,8 @@ mod tests {
     }
 
     fn make_sort_opt(arena: &mut ScalarArena, p_id: ColumnId) -> OptExpr {
-        let partition_expr = scalar::intern_typed(arena, &col_typed(p_id));
+        let partition_expr =
+            crate::sql::planner::optimizer_bridge::scalar::intern_typed(arena, &col_typed(p_id));
         let sort_key = make_sort_key(arena, p_id);
         OptExpr::new(
             Operator::LogicalSort(SortOp {
@@ -491,7 +496,8 @@ mod tests {
 
     fn make_sort_opt_with_limit(arena: &mut ScalarArena, p_id: ColumnId, limit: usize) -> OptExpr {
         use crate::exec::node::sort::SortTopNType;
-        let partition_expr = scalar::intern_typed(arena, &col_typed(p_id));
+        let partition_expr =
+            crate::sql::planner::optimizer_bridge::scalar::intern_typed(arena, &col_typed(p_id));
         let sort_key = make_sort_key(arena, p_id);
         OptExpr::new(
             Operator::LogicalSort(SortOp {
@@ -522,7 +528,8 @@ mod tests {
         fn_name: &str,
         p_id: ColumnId,
     ) -> ScalarWindowSpec {
-        let partition_expr = scalar::intern_typed(arena, &col_typed(p_id));
+        let partition_expr =
+            crate::sql::planner::optimizer_bridge::scalar::intern_typed(arena, &col_typed(p_id));
         let sort_key = make_sort_key(arena, p_id);
         ScalarWindowSpec {
             name: fn_name.to_string(),
@@ -541,7 +548,8 @@ mod tests {
         p_id: ColumnId,
         order_id: ColumnId,
     ) -> ScalarWindowSpec {
-        let partition_expr = scalar::intern_typed(arena, &col_typed(p_id));
+        let partition_expr =
+            crate::sql::planner::optimizer_bridge::scalar::intern_typed(arena, &col_typed(p_id));
         let order_key = make_sort_key(arena, order_id);
         ScalarWindowSpec {
             name: fn_name.to_string(),
@@ -569,7 +577,8 @@ mod tests {
     }
 
     fn filter_opt(arena: &mut ScalarArena, input: OptExpr, predicate: TypedExpr) -> OptExpr {
-        let pred_id = scalar::intern_typed(arena, &predicate);
+        let pred_id =
+            crate::sql::planner::optimizer_bridge::scalar::intern_typed(arena, &predicate);
         OptExpr::new(
             Operator::LogicalFilter(FilterOp { predicate: pred_id }),
             vec![input],
@@ -584,7 +593,8 @@ mod tests {
         let scalar_items = items
             .into_iter()
             .map(|(expr, out_id)| {
-                let expr_id = scalar::intern_typed(arena, &expr);
+                let expr_id =
+                    crate::sql::planner::optimizer_bridge::scalar::intern_typed(arena, &expr);
                 ScalarProjectItem {
                     expr: expr_id,
                     output_name: format!("c_{}", out_id.0),
@@ -1082,7 +1092,10 @@ mod tests {
         let mut arena = ScalarArena::new();
 
         // Sort keyed on partition=[p_id], order=[a_id]
-        let partition_expr = scalar::intern_typed(&mut arena, &col_typed(p_id));
+        let partition_expr = crate::sql::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            &col_typed(p_id),
+        );
         let sort_key_p = make_sort_key(&mut arena, p_id);
         let sort_key_a = make_sort_key(&mut arena, a_id);
         let sort = OptExpr::new(
@@ -1140,7 +1153,10 @@ mod tests {
         let o_id = ColumnId::new_for_test(103);
         let mut arena = ScalarArena::new();
 
-        let partition_expr = scalar::intern_typed(&mut arena, &col_typed(p_id));
+        let partition_expr = crate::sql::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            &col_typed(p_id),
+        );
         let sort_key_p = make_sort_key(&mut arena, p_id);
         let sort_key_o = make_sort_key(&mut arena, o_id);
         let sort = OptExpr::new(

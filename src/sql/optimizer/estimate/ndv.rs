@@ -120,8 +120,8 @@ mod tests {
     use crate::sql::analysis::{ExprKind, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::estimate::arith::MAX_ROW_COUNT;
-    use crate::sql::optimizer::scalar::intern_typed;
     use crate::sql::optimizer::statistics::ColumnStatistic;
+    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
 
     fn test_col_id(name: &str) -> ColumnId {
         match name {

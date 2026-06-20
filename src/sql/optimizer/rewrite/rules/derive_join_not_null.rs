@@ -339,7 +339,8 @@ mod tests {
         right: OptExpr,
         cond: Option<TypedExpr>,
     ) -> OptExpr {
-        let condition = cond.map(|c| scalar::intern_typed(arena, &c));
+        let condition =
+            cond.map(|c| crate::sql::planner::optimizer_bridge::scalar::intern_typed(arena, &c));
         OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
                 join_type: jt,
@@ -528,8 +529,14 @@ mod tests {
             data_type: DataType::Boolean,
             nullable: false,
         };
-        let pred_l_id = scalar::intern_typed(&mut arena, &not_null_pred_l);
-        let pred_r_id = scalar::intern_typed(&mut arena, &not_null_pred_r);
+        let pred_l_id = crate::sql::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            &not_null_pred_l,
+        );
+        let pred_r_id = crate::sql::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            &not_null_pred_r,
+        );
 
         let left_scan = ScanOp {
             database: "default".to_string(),
@@ -595,7 +602,8 @@ mod tests {
         };
 
         let cond = eq_expr(col_typed("l", "a", 1, true), col_typed("r", "b", 2, true));
-        let cond_id = scalar::intern_typed(&mut arena, &cond);
+        let cond_id =
+            crate::sql::planner::optimizer_bridge::scalar::intern_typed(&mut arena, &cond);
         let plan = OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,

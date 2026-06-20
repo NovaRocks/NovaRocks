@@ -76,8 +76,10 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{Operator, ScanOp};
     use crate::sql::optimizer::opt_expr::OptExpr;
-    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
+    use crate::sql::optimizer::scalar::ScalarArena;
+
     use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence};
+    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
     use arrow::datatypes::DataType;
 
     fn test_col_id(name: &str) -> ColumnId {

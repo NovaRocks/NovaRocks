@@ -100,7 +100,7 @@ mod tests {
     use crate::sql::analysis::{ExprKind, OutputColumn, SortItem, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::property::{HashSource, OrderingSpec};
-    use crate::sql::optimizer::scalar_bridge::intern_window_exprs;
+    use crate::sql::planner::optimizer_bridge::scalar::intern_window_exprs;
     use crate::sql::planner::plan::WindowExpr;
 
     fn test_col(column_id: ColumnId, name: &str) -> TypedExpr {

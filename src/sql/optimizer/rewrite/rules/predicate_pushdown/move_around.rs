@@ -265,7 +265,9 @@ mod tests {
     use crate::sql::optimizer::operator::{LogicalJoinOp, ScanOp};
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
-    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
+    use crate::sql::optimizer::scalar::ScalarArena;
+
+    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
     use arrow::datatypes::DataType;
     use std::cell::RefCell;
     use std::rc::Rc;

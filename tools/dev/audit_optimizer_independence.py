@@ -7,8 +7,6 @@ import sys
 DEFAULT_SYMBOL_ALLOW = {
     "src/sql/optimizer/convert.rs",
     "src/sql/optimizer/property.rs",
-    "src/sql/optimizer/scalar/mod.rs",
-    "src/sql/optimizer/scalar_bridge.rs",
 }
 
 DEFAULT_IMPORT_ALLOW = {
@@ -70,8 +68,6 @@ DEFAULT_IMPORT_ALLOW = {
     "src/sql/optimizer/rewrite/rules/utils.rs",
     "src/sql/optimizer/rewrite/rules/variant_path_pushdown/rule.rs",
     "src/sql/optimizer/runtime_filter_pass.rs",
-    "src/sql/optimizer/scalar/mod.rs",
-    "src/sql/optimizer/scalar_bridge.rs",
     "src/sql/optimizer/scalar_expr.rs",
     "src/sql/optimizer/search.rs",
     "src/sql/optimizer/stats.rs",

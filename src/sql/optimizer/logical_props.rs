@@ -338,9 +338,9 @@ pub(crate) fn make_eq_literal_predicate_for_test(
     column: &OutputColumn,
     literal: crate::sql::analysis::TypedExpr,
 ) -> crate::sql::analysis::TypedExpr {
-    let literal = crate::sql::optimizer::scalar::intern_typed(arena, &literal);
+    let literal = crate::sql::planner::optimizer_bridge::scalar::intern_typed(arena, &literal);
     let predicate = make_eq_literal_predicate(arena, column, literal);
-    crate::sql::optimizer::scalar::materialize(arena, predicate)
+    crate::sql::planner::optimizer_bridge::scalar::materialize(arena, predicate)
 }
 
 #[cfg(test)]
@@ -350,10 +350,13 @@ pub(crate) fn combine_with_and_for_test(
 ) -> Option<crate::sql::analysis::TypedExpr> {
     let predicates = predicates
         .iter()
-        .map(|predicate| crate::sql::optimizer::scalar::intern_typed(arena, predicate))
+        .map(|predicate| {
+            crate::sql::planner::optimizer_bridge::scalar::intern_typed(arena, predicate)
+        })
         .collect();
-    combine_with_and(arena, predicates)
-        .map(|predicate| crate::sql::optimizer::scalar::materialize(arena, predicate))
+    combine_with_and(arena, predicates).map(|predicate| {
+        crate::sql::planner::optimizer_bridge::scalar::materialize(arena, predicate)
+    })
 }
 
 #[cfg(test)]
@@ -363,7 +366,7 @@ mod tests {
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::optimizer::memo::MExpr;
     use crate::sql::optimizer::operator::{FilterOp, LogicalJoinOp, ScanOp};
-    use crate::sql::optimizer::scalar::intern_typed;
+    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
     use crate::sql::planner::plan::*;
     use std::path::PathBuf;
 

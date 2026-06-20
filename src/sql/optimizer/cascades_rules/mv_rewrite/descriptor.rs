@@ -976,7 +976,7 @@ mod tests {
     #[test]
     fn from_memo_rejects_split_aggregate() {
         use crate::sql::optimizer::operator::{LogicalAggregateOp, Operator};
-        use crate::sql::optimizer::scalar_bridge::{intern_aggregate_calls, intern_exprs};
+        use crate::sql::planner::optimizer_bridge::scalar::{intern_aggregate_calls, intern_exprs};
         // A split (Local) aggregate is not the original Single shape and must
         // be rejected even when it sits at the matched position.
         let a = col(1, "a");

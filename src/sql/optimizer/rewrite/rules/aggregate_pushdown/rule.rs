@@ -160,7 +160,9 @@ mod tests {
     fn idempotent_does_not_repush_already_pushed_plan() {
         use crate::sql::analysis::{BinOp, ExprKind, JoinKind};
         use crate::sql::optimizer::operator::{LogicalJoinOp, ScalarAggregateSpec};
-        use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
+        use crate::sql::optimizer::scalar::ScalarArena;
+
+        use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
         use std::cell::RefCell;
         use std::rc::Rc;
 

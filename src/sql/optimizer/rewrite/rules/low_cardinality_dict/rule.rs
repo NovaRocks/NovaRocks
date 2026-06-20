@@ -81,7 +81,7 @@ mod tests {
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
     use crate::sql::optimizer::scalar::ScalarArena;
-    use crate::sql::optimizer::scalar_bridge::{intern_sort_items, materialize_sort_keys};
+    use crate::sql::planner::optimizer_bridge::scalar::{intern_sort_items, materialize_sort_keys};
     use crate::sql::planner::plan::{
         AggregateCall, LogicalAggregateNode, LogicalPlanNode, LogicalScanNode, LogicalSortNode,
         PlanNodeKind,

@@ -288,8 +288,10 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed, materialize};
+    use crate::sql::optimizer::scalar::ScalarArena;
+
     use crate::sql::optimizer::scalar_expr;
+    use crate::sql::planner::optimizer_bridge::scalar::{intern_typed, materialize};
     use arrow::datatypes::DataType;
 
     fn col(name: &str, id: u32) -> TypedExpr {

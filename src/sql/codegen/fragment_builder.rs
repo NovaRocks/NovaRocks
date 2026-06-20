@@ -30,7 +30,8 @@ use crate::sql::codegen::{
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::operator::ProjectOp;
 use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
-use crate::sql::optimizer::scalar::{ScalarArena, materialize};
+use crate::sql::optimizer::scalar::ScalarArena;
+use crate::sql::planner::optimizer_bridge::scalar::materialize;
 
 use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
 
@@ -997,11 +998,12 @@ mod tests {
     };
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::runtime_filter_pass::RuntimeFilterDesc;
-    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
-    use crate::sql::optimizer::scalar_bridge::{
+    use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::optimizer::statistics::Statistics;
+    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
+    use crate::sql::planner::optimizer_bridge::scalar::{
         intern_exprs, intern_project_items, intern_sort_items, intern_window_exprs,
     };
-    use crate::sql::optimizer::statistics::Statistics;
     use crate::sql::planner::plan::WindowExpr;
 
     /// OQ-5 B1: `remap_rf_expr_order` must translate a runtime filter's

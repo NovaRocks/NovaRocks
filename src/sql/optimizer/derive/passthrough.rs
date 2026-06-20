@@ -183,7 +183,9 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{FilterOp, LimitOp, ProjectOp};
     use crate::sql::optimizer::property::{DistributionSpec, OrderingSpec, SortKey};
-    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
+    use crate::sql::optimizer::scalar::ScalarArena;
+
+    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
     use arrow::datatypes::DataType;
 
     fn bool_filter(scalars: &mut ScalarArena) -> FilterOp {

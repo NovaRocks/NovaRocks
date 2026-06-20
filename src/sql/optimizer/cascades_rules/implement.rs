@@ -1398,7 +1398,9 @@ mod eq_pair_tests {
     use super::*;
     use crate::sql::analysis::{ExprKind, TypedExpr};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, intern_typed, materialize};
+    use crate::sql::optimizer::scalar::{ScalarArena, ScalarId};
+
+    use crate::sql::planner::optimizer_bridge::scalar::{intern_typed, materialize};
     use arrow::datatypes::DataType;
 
     fn col_id(name: &str, id: u32) -> TypedExpr {
@@ -1498,7 +1500,9 @@ mod join_demotion_tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::{LogicalProperties, MExpr, Memo};
     use crate::sql::optimizer::operator::{LogicalJoinOp, ScanOp};
-    use crate::sql::optimizer::scalar::{ScalarId, intern_typed, materialize};
+    use crate::sql::optimizer::scalar::ScalarId;
+
+    use crate::sql::planner::optimizer_bridge::scalar::{intern_typed, materialize};
     use arrow::datatypes::{DataType, Field};
     use std::sync::Arc;
 
@@ -1889,7 +1893,7 @@ mod window_split_tests {
     use super::*;
     use crate::sql::analysis::{ExprKind, TypedExpr};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::scalar_bridge::intern_window_exprs;
+    use crate::sql::planner::optimizer_bridge::scalar::intern_window_exprs;
     use crate::sql::planner::plan::WindowExpr;
     use arrow::datatypes::DataType;
 
@@ -2052,7 +2056,7 @@ mod two_phase_agg_tests {
     use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::{MExpr, Memo};
-    use crate::sql::optimizer::scalar_bridge::{intern_aggregate_calls, intern_exprs};
+    use crate::sql::planner::optimizer_bridge::scalar::{intern_aggregate_calls, intern_exprs};
     use crate::sql::planner::plan::AggregateCall;
     use arrow::datatypes::DataType;
 

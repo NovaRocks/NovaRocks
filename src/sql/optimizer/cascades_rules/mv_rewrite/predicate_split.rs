@@ -307,7 +307,9 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, intern_typed};
+    use crate::sql::optimizer::scalar::{ScalarArena, ScalarId};
+
+    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
     use arrow::datatypes::DataType;
     use std::collections::HashMap;
 

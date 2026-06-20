@@ -9,8 +9,9 @@ use crate::sql::optimizer::operator::{
 };
 use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
 use crate::sql::optimizer::property::DistributionSpec;
-use crate::sql::optimizer::scalar::{ScalarArena, materialize};
-use crate::sql::optimizer::scalar_bridge::{
+use crate::sql::optimizer::scalar::ScalarArena;
+use crate::sql::planner::optimizer_bridge::scalar::materialize;
+use crate::sql::planner::optimizer_bridge::scalar::{
     materialize_aggregate_calls, materialize_exprs, materialize_project_items,
     materialize_sort_keys, materialize_window_exprs,
 };
@@ -594,10 +595,10 @@ mod tests {
     };
     use crate::sql::optimizer::physical_plan::{PlanExecutionProps, attach_scalar_arena};
     use crate::sql::optimizer::scalar::ScalarArena;
-    use crate::sql::optimizer::scalar_bridge::{
+    use crate::sql::optimizer::statistics::Statistics;
+    use crate::sql::planner::optimizer_bridge::scalar::{
         intern_aggregate_calls, intern_exprs, intern_project_items,
     };
-    use crate::sql::optimizer::statistics::Statistics;
     use crate::sql::planner::plan::AggregateCall;
 
     fn int_col(column_id: ColumnId, name: &str) -> OutputColumn {

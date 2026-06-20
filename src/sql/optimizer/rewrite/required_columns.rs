@@ -936,7 +936,7 @@ mod tests {
             data_type: DataType::Int32,
             nullable: false,
         };
-        scalar::intern_typed(arena, &expr)
+        crate::sql::planner::optimizer_bridge::scalar::intern_typed(arena, &expr)
     }
 
     fn int_literal_scalar(
@@ -948,7 +948,7 @@ mod tests {
             data_type: DataType::Int64,
             nullable: false,
         };
-        scalar::intern_typed(arena, &expr)
+        crate::sql::planner::optimizer_bridge::scalar::intern_typed(arena, &expr)
     }
 
     fn binop_scalar(
@@ -957,8 +957,8 @@ mod tests {
         op: BinOp,
         right: crate::sql::optimizer::scalar::ScalarId,
     ) -> crate::sql::optimizer::scalar::ScalarId {
-        let left_typed = scalar::materialize(arena, left);
-        let right_typed = scalar::materialize(arena, right);
+        let left_typed = crate::sql::planner::optimizer_bridge::scalar::materialize(arena, left);
+        let right_typed = crate::sql::planner::optimizer_bridge::scalar::materialize(arena, right);
         let expr = crate::sql::analysis::TypedExpr {
             kind: ExprKind::BinaryOp {
                 left: Box::new(left_typed),
@@ -968,7 +968,7 @@ mod tests {
             data_type: DataType::Boolean,
             nullable: false,
         };
-        scalar::intern_typed(arena, &expr)
+        crate::sql::planner::optimizer_bridge::scalar::intern_typed(arena, &expr)
     }
 
     fn make_scan_with_ids(

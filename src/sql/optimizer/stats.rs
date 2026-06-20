@@ -2387,8 +2387,8 @@ mod tests {
     };
     use crate::sql::optimizer::estimate::selectivity::estimate_selectivity;
     use crate::sql::optimizer::memo::Memo;
-    use crate::sql::optimizer::scalar::intern_typed;
-    use crate::sql::optimizer::scalar_bridge::{
+    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
+    use crate::sql::planner::optimizer_bridge::scalar::{
         intern_aggregate_calls, intern_exprs, intern_window_exprs,
     };
     use crate::sql::planner::plan::*;
@@ -5508,7 +5508,7 @@ mod sort_partition_limit_tests {
     use super::*;
     use crate::sql::analysis::{ExprKind, TypedExpr};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::scalar::intern_typed;
+    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
     use arrow::datatypes::DataType;
 
     fn intern_col_ref(scalars: &mut ScalarArena, col_id: u32, name: &str) -> ScalarId {

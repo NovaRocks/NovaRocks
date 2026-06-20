@@ -529,7 +529,10 @@ mod tests {
         let items: Vec<ScalarProjectItem> = cols
             .iter()
             .map(|(name, id)| {
-                let expr_id = scalar::intern_typed(arena, &col_ref(name, *id));
+                let expr_id = crate::sql::planner::optimizer_bridge::scalar::intern_typed(
+                    arena,
+                    &col_ref(name, *id),
+                );
                 ScalarProjectItem {
                     expr: expr_id,
                     output_name: (*name).into(),
@@ -548,7 +551,8 @@ mod tests {
     }
 
     fn filter_opt(arena: &mut ScalarArena, predicate: TypedExpr, child: OptExpr) -> OptExpr {
-        let pred_id = scalar::intern_typed(arena, &predicate);
+        let pred_id =
+            crate::sql::planner::optimizer_bridge::scalar::intern_typed(arena, &predicate);
         OptExpr::new(
             Operator::LogicalFilter(FilterOp { predicate: pred_id }),
             vec![child],
@@ -622,7 +626,10 @@ mod tests {
                 };
                 let arena_ref = ctx.scalar_arena();
                 let arena = arena_ref.borrow();
-                let pred_expr = scalar::materialize(&arena, inner_filter.predicate);
+                let pred_expr = crate::sql::planner::optimizer_bridge::scalar::materialize(
+                    &arena,
+                    inner_filter.predicate,
+                );
                 let ExprKind::IsNull { expr, negated } = &pred_expr.kind else {
                     panic!("expected pushed IS NOT NULL predicate");
                 };
@@ -664,7 +671,8 @@ mod tests {
                 right: Box::new(int_lit(1)),
             },
         };
-        let computed_id = scalar::intern_typed(&mut arena, &computed_expr);
+        let computed_id =
+            crate::sql::planner::optimizer_bridge::scalar::intern_typed(&mut arena, &computed_expr);
         let project = OptExpr::new(
             Operator::LogicalProject(ProjectOp {
                 items: vec![ScalarProjectItem {
@@ -728,8 +736,12 @@ mod tests {
                 right: Box::new(int_lit(1)),
             },
         };
-        let passthrough_id = scalar::intern_typed(&mut arena, &col_ref("a", a_id));
-        let computed_id = scalar::intern_typed(&mut arena, &computed_expr);
+        let passthrough_id = crate::sql::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            &col_ref("a", a_id),
+        );
+        let computed_id =
+            crate::sql::planner::optimizer_bridge::scalar::intern_typed(&mut arena, &computed_expr);
         let project = OptExpr::new(
             Operator::LogicalProject(ProjectOp {
                 items: vec![

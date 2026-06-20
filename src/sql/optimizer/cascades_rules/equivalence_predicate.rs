@@ -308,7 +308,9 @@ mod tests {
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::optimizer::operator::ScanOp;
-    use crate::sql::optimizer::scalar::{ScalarId, intern_typed};
+    use crate::sql::optimizer::scalar::ScalarId;
+
+    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
     use arrow::datatypes::DataType;
 
     fn output(id: u32, name: &str) -> OutputColumn {

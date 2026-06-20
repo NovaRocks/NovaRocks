@@ -9,6 +9,7 @@ mod distributed_build;
 mod distributed_fragment;
 mod distributed_node;
 pub(crate) mod imv_rewrite;
+pub(crate) mod optimizer_bridge;
 pub(crate) mod plan;
 
 pub(crate) use distributed_build::build_distributed_plan;

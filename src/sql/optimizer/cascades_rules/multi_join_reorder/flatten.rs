@@ -255,9 +255,9 @@ mod tests {
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr};
     use crate::sql::optimizer::memo::{JoinTree, LogicalProperties, MExpr};
     use crate::sql::optimizer::operator::ValuesOp;
-    use crate::sql::optimizer::scalar::intern_typed;
     use crate::sql::optimizer::statistics::ColumnStatistic;
     use crate::sql::optimizer::stats::copy_in_join_tree;
+    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
     use std::collections::HashMap as Map;
 
     fn col(id: u32) -> TypedExpr {

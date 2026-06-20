@@ -353,7 +353,9 @@ mod tests {
     };
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
-    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed, materialize};
+    use crate::sql::optimizer::scalar::ScalarArena;
+
+    use crate::sql::planner::optimizer_bridge::scalar::{intern_typed, materialize};
     use arrow::datatypes::DataType;
 
     fn make_arena() -> ScalarArena {

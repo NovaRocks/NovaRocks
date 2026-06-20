@@ -837,8 +837,9 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::*;
     use crate::sql::optimizer::property::{DistributionSpec, OrderingSpec};
-    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
+    use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::optimizer::statistics::{ColumnStatistic, CostEstimate};
+    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
     use crate::sql::planner::plan::*;
     use std::collections::HashMap;
 

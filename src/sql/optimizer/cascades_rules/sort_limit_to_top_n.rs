@@ -81,7 +81,7 @@ mod tests {
     use super::*;
     use crate::sql::optimizer::memo::Memo;
     use crate::sql::optimizer::operator::{LimitOp, ScanOp, SortOp};
-    use crate::sql::optimizer::scalar::intern_typed;
+    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
 
     fn mk_scan_mexpr(memo: &mut Memo) -> MExpr {
         MExpr {

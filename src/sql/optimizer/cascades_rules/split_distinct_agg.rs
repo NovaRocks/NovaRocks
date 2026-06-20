@@ -549,8 +549,8 @@ mod tests {
     use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
     use crate::sql::optimizer::memo::Memo;
     use crate::sql::optimizer::operator::{AggMode, LogicalAggregateOp, ScanOp};
-    use crate::sql::optimizer::scalar::materialize;
-    use crate::sql::optimizer::scalar_bridge::{
+    use crate::sql::planner::optimizer_bridge::scalar::materialize;
+    use crate::sql::planner::optimizer_bridge::scalar::{
         intern_aggregate_calls, intern_exprs, materialize_aggregate_calls,
     };
     use crate::sql::planner::plan::AggregateCall;

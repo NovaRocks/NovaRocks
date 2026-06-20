@@ -107,7 +107,9 @@ mod tests {
     use crate::sql::optimizer::rewrite::rules::predicate_pushdown::predicate_group::{
         PredicateDerivedKind, PredicateGroup, PredicateOrigin,
     };
-    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
+    use crate::sql::optimizer::scalar::ScalarArena;
+
+    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
     use arrow::datatypes::DataType;
     use std::collections::HashSet;
 

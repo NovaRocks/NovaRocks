@@ -20,9 +20,9 @@ use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
 use crate::sql::optimizer::property::{
     DistributionSpec, OrderingSpec, PhysicalPropertySet, window_ordering_spec,
 };
-use crate::sql::optimizer::scalar::{ScalarArena, materialize};
-use crate::sql::optimizer::scalar_bridge::{
-    materialize_aggregate_calls, materialize_exprs, materialize_project_items,
+use crate::sql::optimizer::scalar::ScalarArena;
+use crate::sql::planner::optimizer_bridge::scalar::{
+    materialize, materialize_aggregate_calls, materialize_exprs, materialize_project_items,
     materialize_sort_keys, materialize_window_exprs,
 };
 use crate::sql::optimizer::statistics::Statistics;
@@ -1361,11 +1361,11 @@ mod tests {
         PhysicalPlanNode, PlanExecutionProps, attach_scalar_arena,
     };
     use crate::sql::optimizer::property::DistributionSpec;
-    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
-    use crate::sql::optimizer::scalar_bridge::{
-        intern_project_items, intern_sort_items, intern_window_exprs,
-    };
+    use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::optimizer::statistics::{ColumnStatistic, Statistics};
+    use crate::sql::planner::optimizer_bridge::scalar::{
+        intern_project_items, intern_sort_items, intern_typed, intern_window_exprs,
+    };
     use crate::sql::planner::plan::{ExchangeFlavor, PlanNodeKind, WindowExpr};
 
     #[test]

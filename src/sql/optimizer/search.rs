@@ -335,7 +335,7 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::MExpr;
     use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
-    use crate::sql::optimizer::scalar::intern_typed;
+    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
     use arrow::datatypes::DataType;
 
     /// Build a simple memo with a single PhysicalScan group.
@@ -970,8 +970,8 @@ mod cascaded_derivation_tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::MExpr;
     use crate::sql::optimizer::operator::*;
-    use crate::sql::optimizer::scalar::intern_typed;
-    use crate::sql::optimizer::scalar_bridge::intern_window_exprs;
+    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
+    use crate::sql::planner::optimizer_bridge::scalar::intern_window_exprs;
     use arrow::datatypes::DataType;
 
     fn col(id: u32) -> TypedExpr {

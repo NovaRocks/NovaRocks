@@ -495,7 +495,10 @@ mod tests {
         };
         assert_eq!(project.items[0].output_name, "x_id");
         assert_eq!(project.items[0].output_column_id, consume_output_id);
-        let materialized = scalar::materialize(&arena, project.items[0].expr);
+        let materialized = crate::sql::planner::optimizer_bridge::scalar::materialize(
+            &arena,
+            project.items[0].expr,
+        );
         let expected = column_ref(&output_columns()[0]);
         assert_eq!(materialized.data_type, expected.data_type);
         assert_eq!(materialized.nullable, expected.nullable);
