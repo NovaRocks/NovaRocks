@@ -6,14 +6,16 @@
 
 use std::collections::HashMap;
 
-use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
+use crate::sql::analysis::OutputColumn;
 use crate::sql::catalog::TableDef;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::memo::{MExpr, Memo};
-use crate::sql::optimizer::operator::{AggStage, LogicalAggregateOp, Operator};
-use crate::sql::optimizer::scalar::materialize;
-use crate::sql::optimizer::scalar_bridge::{materialize_aggregate_call, materialize_project_item};
-use crate::sql::planner::plan::{AggregateCall, LogicalPlanNode, PlanNodeKind};
+use crate::sql::optimizer::operator::{
+    AggStage, LogicalAggregateOp, Operator, ProjectOp, ScalarAggregateSpec,
+};
+use crate::sql::optimizer::opt_expr::OptExpr;
+use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode, SortKey};
+use crate::sql::optimizer::scalar_expr;
 
 /// What the alternative must reproduce at the matched group's top.
 ///
@@ -42,9 +44,9 @@ pub(crate) struct SpjgOutput {
 #[derive(Clone, Debug)]
 pub(crate) enum SpjgOutputExpr {
     /// Expression over base-table columns (projection item or group key).
-    Dimension(TypedExpr),
+    Dimension(ScalarId),
     /// Aggregate call over base-table columns.
-    Aggregate(AggregateCall),
+    Aggregate(ScalarAggregateSpec),
 }
 
 #[derive(Clone, Debug)]
@@ -53,7 +55,7 @@ pub(crate) struct SpjgAggregate {
     /// Rollup matching only needs the group-by set; aggregate calls are matched
     /// through the descriptor's `outputs` (the `Aggregate` variant), so they are
     /// not duplicated here.
-    pub group_by: Vec<TypedExpr>,
+    pub group_by: Vec<ScalarId>,
 }
 
 #[derive(Clone, Debug)]
@@ -62,7 +64,7 @@ pub(crate) struct SpjgDescriptor {
     /// Scan output columns: ColumnId -> base column binding.
     pub scan_columns: Vec<OutputColumn>,
     /// All conjuncts below the aggregate (scan predicates + filter, CNF-split).
-    pub predicates: Vec<TypedExpr>,
+    pub predicates: Vec<ScalarId>,
     pub aggregate: Option<SpjgAggregate>,
     /// Visible outputs in order (the subtree's output schema).
     pub outputs: Vec<SpjgOutput>,
@@ -78,24 +80,36 @@ impl SpjgDescriptor {
             .collect()
     }
 
-    pub(crate) fn from_logical_plan(plan: &LogicalPlanNode) -> Result<SpjgDescriptor, String> {
+    pub(crate) fn from_opt_expr(
+        expr: &OptExpr,
+        arena: &mut ScalarArena,
+    ) -> Result<SpjgDescriptor, String> {
         // Accepted normal form, peeled top-down:
         //   [Project] -> [Aggregate] -> [Project] -> [Filter]* -> Scan
         // Anything else (Join/Sort/Limit/Window/Union/CTE/...) is rejected.
-        let mut node = plan;
+        let mut node = expr;
 
         // Optional top project (rebinding of aggregate/scan outputs).
-        let top_project = match &node.kind {
-            PlanNodeKind::Project(p) => {
-                node = node.unary_input();
+        let top_project = match &node.op {
+            Operator::LogicalProject(p) => {
+                node = node
+                    .children
+                    .first()
+                    .ok_or_else(|| "project without child in MV rewrite shape".to_string())?;
                 Some(p)
             }
             _ => None,
         };
 
-        let aggregate = match &node.kind {
-            PlanNodeKind::Aggregate(a) => {
-                node = node.unary_input();
+        let aggregate = match &node.op {
+            Operator::LogicalAggregate(a) => {
+                if a.stage != AggStage::Single || a.is_split || aggregate_has_order_by(a) {
+                    return Err("unsupported aggregate shape for MV rewrite".to_string());
+                }
+                node = node
+                    .children
+                    .first()
+                    .ok_or_else(|| "aggregate without child in MV rewrite shape".to_string())?;
                 Some(a)
             }
             _ => None,
@@ -103,51 +117,57 @@ impl SpjgDescriptor {
 
         // Optional pre-aggregate project (planner may compute group-key /
         // agg-arg expressions in a project below the aggregate).
-        let mid_project = match &node.kind {
-            PlanNodeKind::Project(p) => {
-                node = node.unary_input();
+        let mid_project = match &node.op {
+            Operator::LogicalProject(p) => {
+                node = node
+                    .children
+                    .first()
+                    .ok_or_else(|| "project without child in MV rewrite shape".to_string())?;
                 Some(p)
             }
             _ => None,
         };
 
-        let mut predicates: Vec<TypedExpr> = Vec::new();
-        while let PlanNodeKind::Filter(f) = &node.kind {
-            split_conjuncts(&f.predicate, &mut predicates);
-            node = node.unary_input();
+        let mut predicates: Vec<ScalarId> = Vec::new();
+        while let Operator::LogicalFilter(f) = &node.op {
+            scalar_expr::split_conjuncts(arena, f.predicate, &mut predicates);
+            node = node
+                .children
+                .first()
+                .ok_or_else(|| "filter without child in MV rewrite shape".to_string())?;
         }
 
-        let PlanNodeKind::Scan(scan) = &node.kind else {
+        let Operator::LogicalScan(scan) = &node.op else {
             return Err(format!(
                 "not a single-table SPJG shape: unexpected node {:?}",
-                std::mem::discriminant(&node.kind)
+                std::mem::discriminant(&node.op)
             ));
         };
-        predicates.extend(scan.predicates.iter().cloned());
+        predicates.extend(scan.predicates.iter().copied());
 
         // Composition map: ColumnId -> defining expr over scan columns
         // (from the mid project). Identity for scan columns themselves.
-        let mut defs: HashMap<ColumnId, TypedExpr> = HashMap::new();
+        let mut defs: HashMap<ColumnId, ScalarId> = HashMap::new();
         if let Some(p) = mid_project {
             for item in &p.items {
-                let composed = substitute(&item.expr, &defs);
+                let composed = substitute_scalar(arena, item.expr, &defs);
                 defs.insert(item.output_column_id, composed);
             }
         }
 
-        let compose = |e: &TypedExpr| substitute(e, &defs);
-
         let (agg, outputs) = match aggregate {
             Some(a) => {
-                let group_by: Vec<TypedExpr> = a.group_by.iter().map(&compose).collect();
-                let aggregates: Vec<AggregateCall> = a
+                let group_by: Vec<ScalarId> = a
+                    .group_by
+                    .iter()
+                    .map(|expr| substitute_scalar(arena, *expr, &defs))
+                    .collect();
+                let aggregates: Vec<ScalarAggregateSpec> = a
                     .aggregates
                     .iter()
-                    .map(|c| AggregateCall {
-                        args: c.args.iter().map(&compose).collect(),
-                        ..c.clone()
-                    })
-                    .collect();
+                    .map(|c| substitute_aggregate(arena, c, &defs))
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(|| "unsupported aggregate order_by in MV rewrite".to_string())?;
                 // Aggregate output convention: [group keys..., agg results...]
                 if a.output_columns.len() != a.group_by.len() + a.aggregates.len() {
                     return Err(format!(
@@ -171,7 +191,7 @@ impl SpjgDescriptor {
                         expr,
                     });
                 }
-                let outputs = apply_top_project(top_project, agg_outputs)?;
+                let outputs = apply_top_project(arena, top_project, agg_outputs)?;
                 (Some(SpjgAggregate { group_by }), outputs)
             }
             None => {
@@ -181,15 +201,7 @@ impl SpjgDescriptor {
                     .map(|c| SpjgOutput {
                         name: c.name.clone(),
                         column_id: c.column_id,
-                        expr: SpjgOutputExpr::Dimension(TypedExpr {
-                            kind: ExprKind::ColumnRef {
-                                column_id: c.column_id,
-                                qualifier: None,
-                                column: c.name.clone(),
-                            },
-                            data_type: c.data_type.clone(),
-                            nullable: c.nullable,
-                        }),
+                        expr: SpjgOutputExpr::Dimension(column_ref(arena, c)),
                     })
                     .collect();
                 // mid_project without aggregate is just "the" project.
@@ -200,12 +212,14 @@ impl SpjgDescriptor {
                         .map(|item| SpjgOutput {
                             name: item.output_name.clone(),
                             column_id: item.output_column_id,
-                            expr: SpjgOutputExpr::Dimension(substitute(&item.expr, &defs)),
+                            expr: SpjgOutputExpr::Dimension(substitute_scalar(
+                                arena, item.expr, &defs,
+                            )),
                         })
                         .collect(),
                     None => scan_outputs,
                 };
-                let outputs = apply_top_project(top_project, scan_outputs)?;
+                let outputs = apply_top_project(arena, top_project, scan_outputs)?;
                 (None, outputs)
             }
         };
@@ -230,33 +244,33 @@ impl SpjgDescriptor {
     /// still the original Single aggregate, which is the only form this
     /// accepts.
     ///
-    /// Mirrors [`SpjgDescriptor::from_logical_plan`] arm-by-arm but over
+    /// Mirrors [`SpjgDescriptor::from_opt_expr`] arm-by-arm but over
     /// `Operator` variants. Returns `None` for any non-SPJG operator in the
-    /// chain (the same fail-closed contract). Unlike `from_logical_plan` there
+    /// chain (the same fail-closed contract). Unlike `from_opt_expr` there
     /// is no top-project arm: the rule only matches on Aggregate/Filter/Scan,
     /// so the matched node is the subtree top.
-    pub(crate) fn from_memo(expr: &MExpr, memo: &Memo) -> Option<(SpjgDescriptor, MatchedShape)> {
-        // Helper: the first logical expr of a child group (the original shape).
-        let first_logical = |gid: usize| memo.groups[gid].logical_exprs.first();
-
+    pub(crate) fn from_memo(
+        expr: &MExpr,
+        memo: &mut Memo,
+    ) -> Option<(SpjgDescriptor, MatchedShape)> {
         // Peel an optional top aggregate.
         let (aggregate, mut node) = match &expr.op {
             Operator::LogicalAggregate(a) => {
                 // Only the original, unsplit Single aggregate is accepted.
-                if a.stage != AggStage::Single || a.is_split {
+                if a.stage != AggStage::Single || a.is_split || aggregate_has_order_by(a) {
                     return None;
                 }
-                let child = first_logical(*expr.children.first()?)?;
-                (Some(a), child)
+                let child = first_logical_expr(memo, *expr.children.first()?)?;
+                (Some(a.clone()), child)
             }
-            _ => (None, expr),
+            _ => (None, expr.clone()),
         };
 
         // Optional pre-aggregate (or sole) project below the current node.
         let mid_project = match &node.op {
             Operator::LogicalProject(p) => {
-                let child = first_logical(*node.children.first()?)?;
-                let saved = p;
+                let child = first_logical_expr(memo, *node.children.first()?)?;
+                let saved = p.clone();
                 node = child;
                 Some(saved)
             }
@@ -264,11 +278,10 @@ impl SpjgDescriptor {
         };
 
         // Filter chain down to the scan.
-        let mut predicates: Vec<TypedExpr> = Vec::new();
+        let mut predicates: Vec<ScalarId> = Vec::new();
         while let Operator::LogicalFilter(f) = &node.op {
-            let predicate = materialize(&memo.scalars, f.predicate);
-            split_conjuncts(&predicate, &mut predicates);
-            node = first_logical(*node.children.first()?)?;
+            scalar_expr::split_conjuncts(&memo.scalars, f.predicate, &mut predicates);
+            node = first_logical_expr(memo, *node.children.first()?)?;
         }
 
         let Operator::LogicalScan(scan) = &node.op else {
@@ -278,52 +291,36 @@ impl SpjgDescriptor {
         if scan.mv_rewritten_from.is_some() {
             return None;
         }
-        predicates.extend(
-            scan.predicates
-                .iter()
-                .map(|predicate| materialize(&memo.scalars, *predicate)),
-        );
+        predicates.extend(scan.predicates.iter().copied());
 
         // Composition map from the mid project (ColumnId -> expr over scan cols).
-        let mut defs: HashMap<ColumnId, TypedExpr> = HashMap::new();
-        if let Some(p) = mid_project {
+        let mut defs: HashMap<ColumnId, ScalarId> = HashMap::new();
+        if let Some(p) = &mid_project {
             for item in &p.items {
-                let item = materialize_project_item(&memo.scalars, item);
-                let composed = substitute(&item.expr, &defs);
+                let composed = substitute_scalar(&mut memo.scalars, item.expr, &defs);
                 defs.insert(item.output_column_id, composed);
             }
         }
-        let compose = |e: &TypedExpr| substitute(e, &defs);
 
         let (agg, outputs, shape) = match aggregate {
             Some(a) => {
-                let group_by_typed: Vec<TypedExpr> = a
+                let group_by: Vec<ScalarId> = a
                     .group_by
                     .iter()
-                    .map(|expr| materialize(&memo.scalars, *expr))
+                    .map(|expr| substitute_scalar(&mut memo.scalars, *expr, &defs))
                     .collect();
-                let group_by: Vec<TypedExpr> = group_by_typed.iter().map(&compose).collect();
-                let aggregates: Vec<AggregateCall> = a
+                let aggregates: Vec<ScalarAggregateSpec> = a
                     .aggregates
                     .iter()
-                    .enumerate()
-                    .map(|(idx, c)| {
-                        let mut call = materialize_aggregate_call(
-                            &memo.scalars,
-                            c,
-                            a.output_columns.get(a.group_by.len() + idx),
-                        );
-                        call.args = call.args.iter().map(&compose).collect();
-                        call
-                    })
-                    .collect();
+                    .map(|c| substitute_aggregate(&mut memo.scalars, c, &defs))
+                    .collect::<Option<Vec<_>>>()?;
                 if a.output_columns.len() != a.group_by.len() + a.aggregates.len() {
                     return None;
                 }
                 let mut agg_outputs: Vec<SpjgOutput> = Vec::new();
                 for (i, oc) in a.output_columns.iter().enumerate() {
                     let out_expr = if i < a.group_by.len() {
-                        SpjgOutputExpr::Dimension(group_by[i].clone())
+                        SpjgOutputExpr::Dimension(group_by[i])
                     } else {
                         SpjgOutputExpr::Aggregate(aggregates[i - a.group_by.len()].clone())
                     };
@@ -346,13 +343,14 @@ impl SpjgDescriptor {
                     Some(p) => p
                         .items
                         .iter()
-                        .map(|item| {
-                            let item = materialize_project_item(&memo.scalars, item);
-                            SpjgOutput {
-                                name: item.output_name.clone(),
-                                column_id: item.output_column_id,
-                                expr: SpjgOutputExpr::Dimension(substitute(&item.expr, &defs)),
-                            }
+                        .map(|item| SpjgOutput {
+                            name: item.output_name.clone(),
+                            column_id: item.output_column_id,
+                            expr: SpjgOutputExpr::Dimension(substitute_scalar(
+                                &mut memo.scalars,
+                                item.expr,
+                                &defs,
+                            )),
                         })
                         .collect(),
                     // No surviving Project: the scan's output IS the subtree
@@ -376,15 +374,7 @@ impl SpjgDescriptor {
                             .map(|c| SpjgOutput {
                                 name: c.name.clone(),
                                 column_id: c.column_id,
-                                expr: SpjgOutputExpr::Dimension(TypedExpr {
-                                    kind: ExprKind::ColumnRef {
-                                        column_id: c.column_id,
-                                        qualifier: None,
-                                        column: c.name.clone(),
-                                    },
-                                    data_type: c.data_type.clone(),
-                                    nullable: c.nullable,
-                                }),
+                                expr: SpjgOutputExpr::Dimension(column_ref(&mut memo.scalars, c)),
                             })
                             .collect()
                     }
@@ -410,7 +400,8 @@ impl SpjgDescriptor {
 /// must be bare ColumnRefs into the inputs (renames only); complex exprs
 /// over aggregate results reject the shape.
 fn apply_top_project(
-    project: Option<&crate::sql::planner::plan::LogicalProjectNode>,
+    arena: &mut ScalarArena,
+    project: Option<&ProjectOp>,
     inputs: Vec<SpjgOutput>,
 ) -> Result<Vec<SpjgOutput>, String> {
     let Some(p) = project else {
@@ -419,8 +410,8 @@ fn apply_top_project(
     let by_id: HashMap<ColumnId, &SpjgOutput> = inputs.iter().map(|o| (o.column_id, o)).collect();
     p.items
         .iter()
-        .map(|item| match &item.expr.kind {
-            ExprKind::ColumnRef { column_id, .. } => by_id
+        .map(|item| match arena.node(item.expr) {
+            ScalarNode::ColumnRef(column_id) => by_id
                 .get(column_id)
                 .map(|o| SpjgOutput {
                     name: item.output_name.clone(),
@@ -431,17 +422,17 @@ fn apply_top_project(
             // A computed top-project item over a pure-dimension input can be
             // composed; over aggregate outputs it is rejected (MVP).
             _ => {
-                let mut defs: HashMap<ColumnId, TypedExpr> = HashMap::new();
+                let mut defs: HashMap<ColumnId, ScalarId> = HashMap::new();
                 for o in &inputs {
                     match &o.expr {
                         SpjgOutputExpr::Dimension(e) => {
-                            defs.insert(o.column_id, e.clone());
+                            defs.insert(o.column_id, *e);
                         }
                         SpjgOutputExpr::Aggregate(_) => {}
                     }
                 }
-                let composed = substitute(&item.expr, &defs);
-                if references_any(&composed, &inputs_agg_ids(&inputs)) {
+                let composed = substitute_scalar(arena, item.expr, &defs);
+                if references_any(arena, composed, &inputs_agg_ids(&inputs)) {
                     Err("computed top-project over aggregate output (unsupported)".to_string())
                 } else {
                     Ok(SpjgOutput {
@@ -455,6 +446,10 @@ fn apply_top_project(
         .collect()
 }
 
+fn first_logical_expr(memo: &Memo, gid: usize) -> Option<MExpr> {
+    memo.groups[gid].logical_exprs.first().cloned()
+}
+
 fn inputs_agg_ids(inputs: &[SpjgOutput]) -> Vec<ColumnId> {
     inputs
         .iter()
@@ -463,373 +458,271 @@ fn inputs_agg_ids(inputs: &[SpjgOutput]) -> Vec<ColumnId> {
         .collect()
 }
 
-fn references_any(e: &TypedExpr, ids: &[ColumnId]) -> bool {
-    let mut found = false;
-    walk(e, &mut |x| {
-        if let ExprKind::ColumnRef { column_id, .. } = &x.kind
-            && ids.contains(column_id)
-        {
-            found = true;
-        }
-    });
-    found
-}
-
-/// Split a conjunction into CNF conjuncts.
-pub(crate) fn split_conjuncts(e: &TypedExpr, out: &mut Vec<TypedExpr>) {
-    if let ExprKind::BinaryOp {
-        left,
-        op: crate::sql::analysis::BinOp::And,
-        right,
-    } = &e.kind
-    {
-        split_conjuncts(left, out);
-        split_conjuncts(right, out);
-    } else {
-        out.push(e.clone());
+fn references_any(arena: &ScalarArena, expr: ScalarId, ids: &[ColumnId]) -> bool {
+    match arena.node(expr) {
+        ScalarNode::ColumnRef(column_id) => ids.contains(column_id),
+        node => scalar_children(node)
+            .into_iter()
+            .any(|child| references_any(arena, child, ids)),
     }
 }
 
-/// Replace ColumnRefs by their defining exprs (identity when absent).
-pub(crate) fn substitute(e: &TypedExpr, defs: &HashMap<ColumnId, TypedExpr>) -> TypedExpr {
-    if let ExprKind::ColumnRef { column_id, .. } = &e.kind
-        && let Some(d) = defs.get(column_id)
-    {
-        return d.clone();
+fn aggregate_has_order_by(agg: &LogicalAggregateOp) -> bool {
+    agg.aggregates.iter().any(|call| !call.order_by.is_empty())
+}
+
+fn substitute_aggregate(
+    arena: &mut ScalarArena,
+    call: &ScalarAggregateSpec,
+    defs: &HashMap<ColumnId, ScalarId>,
+) -> Option<ScalarAggregateSpec> {
+    if !call.order_by.is_empty() {
+        return None;
     }
-    map_children(e, &|child| substitute(child, defs))
-}
-
-/// Structural walk over all sub-expressions (pre-order).
-pub(crate) fn walk(e: &TypedExpr, f: &mut impl FnMut(&TypedExpr)) {
-    f(e);
-    for_each_child(e, &mut |c| walk(c, f));
-}
-
-/// Visit each immediate `TypedExpr` child of `e` (no recursion).
-///
-/// Leaf variants (`ColumnRef`/`LambdaParamRef`/`Literal`/`SubqueryPlaceholder`)
-/// have no `TypedExpr` children and do nothing. SPJG-unsupported variants
-/// (`WindowCall`/`LambdaFunction`/`Lambda`) are treated as opaque: their
-/// children are intentionally not traversed here. A valid single-table SPJG
-/// input never contains those variants; if one appears, the later normalize
-/// step fails closed and the candidate is dropped.
-pub(crate) fn for_each_child(e: &TypedExpr, f: &mut impl FnMut(&TypedExpr)) {
-    match &e.kind {
-        // Leaves: no TypedExpr children.
-        ExprKind::ColumnRef { .. }
-        | ExprKind::LambdaParamRef { .. }
-        | ExprKind::Literal(_)
-        | ExprKind::SubqueryPlaceholder { .. } => {}
-
-        ExprKind::BinaryOp { left, right, .. } => {
-            f(left);
-            f(right);
-        }
-        ExprKind::UnaryOp { expr, .. } => f(expr),
-        ExprKind::FunctionCall { args, .. } => {
-            for a in args {
-                f(a);
-            }
-        }
-        ExprKind::AggregateCall { args, order_by, .. } => {
-            for a in args {
-                f(a);
-            }
-            for s in order_by {
-                f(&s.expr);
-            }
-        }
-        ExprKind::Cast { expr, .. } => f(expr),
-        ExprKind::IsNull { expr, .. } => f(expr),
-        ExprKind::InList { expr, list, .. } => {
-            f(expr);
-            for item in list {
-                f(item);
-            }
-        }
-        ExprKind::Between {
-            expr, low, high, ..
-        } => {
-            f(expr);
-            f(low);
-            f(high);
-        }
-        ExprKind::Like { expr, pattern, .. } => {
-            f(expr);
-            f(pattern);
-        }
-        ExprKind::Case {
-            operand,
-            when_then,
-            else_expr,
-        } => {
-            if let Some(o) = operand {
-                f(o);
-            }
-            for (w, t) in when_then {
-                f(w);
-                f(t);
-            }
-            if let Some(els) = else_expr {
-                f(els);
-            }
-        }
-        ExprKind::IsTruthValue { expr, .. } => f(expr),
-        ExprKind::Nested(inner) => f(inner),
-
-        // Opaque in SPJG: do not traverse.
-        ExprKind::WindowCall { .. } | ExprKind::LambdaFunction { .. } | ExprKind::Lambda { .. } => {
-        }
-    }
-}
-
-/// Rebuild `e` with each immediate `TypedExpr` child mapped through `f`.
-///
-/// Mirrors [`for_each_child`]: leaves are returned unchanged, child-bearing
-/// variants are rebuilt, and SPJG-unsupported variants
-/// (`WindowCall`/`LambdaFunction`/`Lambda`) are returned unchanged (opaque).
-/// `AggregateCall`'s `order_by` is preserved as-is (SPJG agg order_by is empty);
-/// only `args` are rewritten.
-pub(crate) fn map_children(e: &TypedExpr, f: &impl Fn(&TypedExpr) -> TypedExpr) -> TypedExpr {
-    let kind = match &e.kind {
-        // Leaves: clone unchanged.
-        ExprKind::ColumnRef { .. }
-        | ExprKind::LambdaParamRef { .. }
-        | ExprKind::Literal(_)
-        | ExprKind::SubqueryPlaceholder { .. } => e.kind.clone(),
-
-        ExprKind::BinaryOp { left, op, right } => ExprKind::BinaryOp {
-            left: Box::new(f(left)),
-            op: *op,
-            right: Box::new(f(right)),
-        },
-        ExprKind::UnaryOp { op, expr } => ExprKind::UnaryOp {
-            op: *op,
-            expr: Box::new(f(expr)),
-        },
-        ExprKind::FunctionCall {
-            name,
-            args,
-            distinct,
-        } => ExprKind::FunctionCall {
-            name: name.clone(),
-            args: args.iter().map(f).collect(),
-            distinct: *distinct,
-        },
-        ExprKind::AggregateCall {
-            name,
-            args,
-            distinct,
-            order_by,
-        } => ExprKind::AggregateCall {
-            name: name.clone(),
-            args: args.iter().map(f).collect(),
-            distinct: *distinct,
-            order_by: order_by.clone(),
-        },
-        ExprKind::Cast { expr, target } => ExprKind::Cast {
-            expr: Box::new(f(expr)),
-            target: target.clone(),
-        },
-        ExprKind::IsNull { expr, negated } => ExprKind::IsNull {
-            expr: Box::new(f(expr)),
-            negated: *negated,
-        },
-        ExprKind::InList {
-            expr,
-            list,
-            negated,
-        } => ExprKind::InList {
-            expr: Box::new(f(expr)),
-            list: list.iter().map(f).collect(),
-            negated: *negated,
-        },
-        ExprKind::Between {
-            expr,
-            low,
-            high,
-            negated,
-        } => ExprKind::Between {
-            expr: Box::new(f(expr)),
-            low: Box::new(f(low)),
-            high: Box::new(f(high)),
-            negated: *negated,
-        },
-        ExprKind::Like {
-            expr,
-            pattern,
-            negated,
-        } => ExprKind::Like {
-            expr: Box::new(f(expr)),
-            pattern: Box::new(f(pattern)),
-            negated: *negated,
-        },
-        ExprKind::Case {
-            operand,
-            when_then,
-            else_expr,
-        } => ExprKind::Case {
-            operand: operand.as_ref().map(|o| Box::new(f(o))),
-            when_then: when_then.iter().map(|(w, t)| (f(w), f(t))).collect(),
-            else_expr: else_expr.as_ref().map(|els| Box::new(f(els))),
-        },
-        ExprKind::IsTruthValue {
-            expr,
-            value,
-            negated,
-        } => ExprKind::IsTruthValue {
-            expr: Box::new(f(expr)),
-            value: *value,
-            negated: *negated,
-        },
-        ExprKind::Nested(inner) => ExprKind::Nested(Box::new(f(inner))),
-
-        // Opaque in SPJG: return unchanged.
-        ExprKind::WindowCall { .. } | ExprKind::LambdaFunction { .. } | ExprKind::Lambda { .. } => {
-            e.kind.clone()
-        }
-    };
-    TypedExpr {
-        kind,
-        data_type: e.data_type.clone(),
-        nullable: e.nullable,
-    }
-}
-
-/// `Option`-returning analogue of [`map_children`]: rebuild `e` with each
-/// immediate `TypedExpr` child mapped through `f`, where any child returning
-/// `None` makes the whole call `None`.
-///
-/// Unlike [`map_children`] (which returns leaves/opaque variants unchanged),
-/// `try_map_children`'s contract is "rebuild fully or fail". It therefore
-/// returns `None` for LEAVES (`ColumnRef`/`LambdaParamRef`/`Literal`/
-/// `SubqueryPlaceholder`) and for OPAQUE/SPJG-unsupported variants
-/// (`WindowCall`/`LambdaFunction`/`Lambda`). [`MvColumnMap::rewrite`] handles
-/// `ColumnRef`/`Literal` itself and only calls this for the "everything else"
-/// recursion, so a subtree this cannot fully verify must fail closed rather
-/// than be emitted as a rewrite.
-pub(crate) fn try_map_children(
-    e: &TypedExpr,
-    f: &mut impl FnMut(&TypedExpr) -> Option<TypedExpr>,
-) -> Option<TypedExpr> {
-    let kind = match &e.kind {
-        // Leaves: pre-handled by callers, or unmappable -> fail closed.
-        ExprKind::ColumnRef { .. }
-        | ExprKind::LambdaParamRef { .. }
-        | ExprKind::Literal(_)
-        | ExprKind::SubqueryPlaceholder { .. } => return None,
-
-        ExprKind::BinaryOp { left, op, right } => ExprKind::BinaryOp {
-            left: Box::new(f(left)?),
-            op: *op,
-            right: Box::new(f(right)?),
-        },
-        ExprKind::UnaryOp { op, expr } => ExprKind::UnaryOp {
-            op: *op,
-            expr: Box::new(f(expr)?),
-        },
-        ExprKind::FunctionCall {
-            name,
-            args,
-            distinct,
-        } => ExprKind::FunctionCall {
-            name: name.clone(),
-            args: args.iter().map(&mut *f).collect::<Option<Vec<_>>>()?,
-            distinct: *distinct,
-        },
-        ExprKind::AggregateCall {
-            name,
-            args,
-            distinct,
-            order_by,
-        } => ExprKind::AggregateCall {
-            name: name.clone(),
-            args: args.iter().map(&mut *f).collect::<Option<Vec<_>>>()?,
-            distinct: *distinct,
-            order_by: order_by.clone(),
-        },
-        ExprKind::Cast { expr, target } => ExprKind::Cast {
-            expr: Box::new(f(expr)?),
-            target: target.clone(),
-        },
-        ExprKind::IsNull { expr, negated } => ExprKind::IsNull {
-            expr: Box::new(f(expr)?),
-            negated: *negated,
-        },
-        ExprKind::InList {
-            expr,
-            list,
-            negated,
-        } => ExprKind::InList {
-            expr: Box::new(f(expr)?),
-            list: list.iter().map(&mut *f).collect::<Option<Vec<_>>>()?,
-            negated: *negated,
-        },
-        ExprKind::Between {
-            expr,
-            low,
-            high,
-            negated,
-        } => ExprKind::Between {
-            expr: Box::new(f(expr)?),
-            low: Box::new(f(low)?),
-            high: Box::new(f(high)?),
-            negated: *negated,
-        },
-        ExprKind::Like {
-            expr,
-            pattern,
-            negated,
-        } => ExprKind::Like {
-            expr: Box::new(f(expr)?),
-            pattern: Box::new(f(pattern)?),
-            negated: *negated,
-        },
-        ExprKind::Case {
-            operand,
-            when_then,
-            else_expr,
-        } => {
-            let operand = match operand {
-                Some(o) => Some(Box::new(f(o)?)),
-                None => None,
-            };
-            let mut mapped_when_then = Vec::with_capacity(when_then.len());
-            for (w, t) in when_then {
-                mapped_when_then.push((f(w)?, f(t)?));
-            }
-            let else_expr = match else_expr {
-                Some(els) => Some(Box::new(f(els)?)),
-                None => None,
-            };
-            ExprKind::Case {
-                operand,
-                when_then: mapped_when_then,
-                else_expr,
-            }
-        }
-        ExprKind::IsTruthValue {
-            expr,
-            value,
-            negated,
-        } => ExprKind::IsTruthValue {
-            expr: Box::new(f(expr)?),
-            value: *value,
-            negated: *negated,
-        },
-        ExprKind::Nested(inner) => ExprKind::Nested(Box::new(f(inner)?)),
-
-        // Opaque / SPJG-unsupported: cannot verify -> fail closed.
-        ExprKind::WindowCall { .. } | ExprKind::LambdaFunction { .. } | ExprKind::Lambda { .. } => {
-            return None;
-        }
-    };
-    Some(TypedExpr {
-        kind,
-        data_type: e.data_type.clone(),
-        nullable: e.nullable,
+    Some(ScalarAggregateSpec {
+        name: call.name.clone(),
+        args: call
+            .args
+            .iter()
+            .map(|arg| substitute_scalar(arena, *arg, defs))
+            .collect(),
+        distinct: call.distinct,
+        order_by: vec![],
     })
+}
+
+fn substitute_sort_key(
+    arena: &mut ScalarArena,
+    key: &SortKey,
+    defs: &HashMap<ColumnId, ScalarId>,
+) -> SortKey {
+    SortKey {
+        expr: substitute_scalar(arena, key.expr, defs),
+        asc: key.asc,
+        nulls_first: key.nulls_first,
+        display: key.display.clone(),
+    }
+}
+
+pub(crate) fn substitute_scalar(
+    arena: &mut ScalarArena,
+    expr: ScalarId,
+    defs: &HashMap<ColumnId, ScalarId>,
+) -> ScalarId {
+    if let ScalarNode::ColumnRef(column_id) = arena.node(expr)
+        && let Some(replacement) = defs.get(column_id)
+    {
+        return *replacement;
+    }
+    let original = arena.node(expr).clone();
+    let rewritten = match original {
+        ScalarNode::ColumnRef(_) | ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {
+            return expr;
+        }
+        ScalarNode::BinaryOp { op, left, right } => ScalarNode::BinaryOp {
+            op,
+            left: substitute_scalar(arena, left, defs),
+            right: substitute_scalar(arena, right, defs),
+        },
+        ScalarNode::UnaryOp { op, child } => ScalarNode::UnaryOp {
+            op,
+            child: substitute_scalar(arena, child, defs),
+        },
+        ScalarNode::FunctionCall {
+            name,
+            args,
+            distinct,
+        } => ScalarNode::FunctionCall {
+            name,
+            args: args
+                .into_iter()
+                .map(|arg| substitute_scalar(arena, arg, defs))
+                .collect(),
+            distinct,
+        },
+        ScalarNode::AggregateCall {
+            name,
+            args,
+            distinct,
+            order_by,
+        } => ScalarNode::AggregateCall {
+            name,
+            args: args
+                .into_iter()
+                .map(|arg| substitute_scalar(arena, arg, defs))
+                .collect(),
+            distinct,
+            order_by: order_by
+                .iter()
+                .map(|key| substitute_sort_key(arena, key, defs))
+                .collect(),
+        },
+        ScalarNode::Cast { child, target } => ScalarNode::Cast {
+            child: substitute_scalar(arena, child, defs),
+            target,
+        },
+        ScalarNode::IsNull { child, negated } => ScalarNode::IsNull {
+            child: substitute_scalar(arena, child, defs),
+            negated,
+        },
+        ScalarNode::InList {
+            child,
+            list,
+            negated,
+        } => ScalarNode::InList {
+            child: substitute_scalar(arena, child, defs),
+            list: list
+                .into_iter()
+                .map(|item| substitute_scalar(arena, item, defs))
+                .collect(),
+            negated,
+        },
+        ScalarNode::Between {
+            child,
+            low,
+            high,
+            negated,
+        } => ScalarNode::Between {
+            child: substitute_scalar(arena, child, defs),
+            low: substitute_scalar(arena, low, defs),
+            high: substitute_scalar(arena, high, defs),
+            negated,
+        },
+        ScalarNode::Like {
+            child,
+            pattern,
+            negated,
+        } => ScalarNode::Like {
+            child: substitute_scalar(arena, child, defs),
+            pattern: substitute_scalar(arena, pattern, defs),
+            negated,
+        },
+        ScalarNode::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => ScalarNode::Case {
+            operand: operand.map(|item| substitute_scalar(arena, item, defs)),
+            when_then: when_then
+                .into_iter()
+                .map(|(when, then)| {
+                    (
+                        substitute_scalar(arena, when, defs),
+                        substitute_scalar(arena, then, defs),
+                    )
+                })
+                .collect(),
+            else_expr: else_expr.map(|item| substitute_scalar(arena, item, defs)),
+        },
+        ScalarNode::IsTruthValue {
+            child,
+            value,
+            negated,
+        } => ScalarNode::IsTruthValue {
+            child: substitute_scalar(arena, child, defs),
+            value,
+            negated,
+        },
+        ScalarNode::Nested(inner) => ScalarNode::Nested(substitute_scalar(arena, inner, defs)),
+        ScalarNode::WindowCall {
+            name,
+            args,
+            distinct,
+            partition_by,
+            order_by,
+            window_frame,
+            ignore_nulls,
+        } => ScalarNode::WindowCall {
+            name,
+            args: args
+                .into_iter()
+                .map(|arg| substitute_scalar(arena, arg, defs))
+                .collect(),
+            distinct,
+            partition_by: partition_by
+                .into_iter()
+                .map(|item| substitute_scalar(arena, item, defs))
+                .collect(),
+            order_by: order_by
+                .iter()
+                .map(|key| substitute_sort_key(arena, key, defs))
+                .collect(),
+            window_frame,
+            ignore_nulls,
+        },
+        ScalarNode::LambdaFunction { params, body } => ScalarNode::LambdaFunction {
+            params,
+            body: substitute_scalar(arena, body, defs),
+        },
+        ScalarNode::Lambda { params, body } => ScalarNode::Lambda {
+            params,
+            body: substitute_scalar(arena, body, defs),
+        },
+    };
+    arena.intern(
+        rewritten,
+        arena.data_type(expr).clone(),
+        arena.nullable(expr),
+    )
+}
+
+fn scalar_children(node: &ScalarNode) -> Vec<ScalarId> {
+    match node {
+        ScalarNode::ColumnRef(_) | ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {
+            vec![]
+        }
+        ScalarNode::BinaryOp { left, right, .. } => vec![*left, *right],
+        ScalarNode::UnaryOp { child, .. }
+        | ScalarNode::Cast { child, .. }
+        | ScalarNode::IsNull { child, .. }
+        | ScalarNode::Nested(child)
+        | ScalarNode::IsTruthValue { child, .. } => vec![*child],
+        ScalarNode::FunctionCall { args, .. } | ScalarNode::AggregateCall { args, .. } => {
+            args.clone()
+        }
+        ScalarNode::LambdaFunction { body, .. } | ScalarNode::Lambda { body, .. } => vec![*body],
+        ScalarNode::InList { child, list, .. } => {
+            let mut out = Vec::with_capacity(1 + list.len());
+            out.push(*child);
+            out.extend(list.iter().copied());
+            out
+        }
+        ScalarNode::Between {
+            child, low, high, ..
+        } => vec![*child, *low, *high],
+        ScalarNode::Like { child, pattern, .. } => vec![*child, *pattern],
+        ScalarNode::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            let mut out = Vec::with_capacity(operand.iter().count() + when_then.len() * 2 + 1);
+            out.extend(operand.iter().copied());
+            for (when, then) in when_then {
+                out.push(*when);
+                out.push(*then);
+            }
+            out.extend(else_expr.iter().copied());
+            out
+        }
+        ScalarNode::WindowCall {
+            args, partition_by, ..
+        } => {
+            let mut out = Vec::with_capacity(args.len() + partition_by.len());
+            out.extend(args.iter().copied());
+            out.extend(partition_by.iter().copied());
+            out
+        }
+    }
+}
+
+pub(crate) fn column_ref(arena: &mut ScalarArena, c: &OutputColumn) -> ScalarId {
+    arena.remember_project_output_display(c.column_id, None, c.name.clone());
+    arena.intern(
+        ScalarNode::ColumnRef(c.column_id),
+        c.data_type.clone(),
+        c.nullable,
+    )
 }
 
 #[cfg(test)]
@@ -838,6 +731,7 @@ mod tests {
     use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, TypedExpr};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::{
         AggregateCall, LogicalAggregateNode, LogicalFilterNode, LogicalPlanNode, LogicalScanNode,
         LogicalSortNode, PlanNodeKind,
@@ -928,6 +822,16 @@ mod tests {
         LogicalPlanNode::new(PlanNodeKind::Scan(scan(cols)), vec![], None)
     }
 
+    fn descriptor_from_plan(
+        plan: &LogicalPlanNode,
+    ) -> Result<(SpjgDescriptor, ScalarArena), String> {
+        let mut arena = ScalarArena::new();
+        let opt_expr =
+            crate::sql::optimizer::convert::try_logical_plan_to_opt_expr(plan, &mut arena)?;
+        let descriptor = SpjgDescriptor::from_opt_expr(&opt_expr, &mut arena)?;
+        Ok((descriptor, arena))
+    }
+
     #[test]
     fn extracts_filter_scan_shape() {
         let a = col(1, "a");
@@ -939,7 +843,7 @@ mod tests {
             vec![scan_plan(&[a.clone(), b.clone()])],
             None,
         );
-        let d = SpjgDescriptor::from_logical_plan(&plan).expect("spjg");
+        let (d, _arena) = descriptor_from_plan(&plan).expect("spjg");
         assert_eq!(d.table.name, "t");
         assert_eq!(d.predicates.len(), 1);
         assert!(d.aggregate.is_none());
@@ -968,7 +872,7 @@ mod tests {
             vec![scan_plan(&[a.clone(), v.clone()])],
             None,
         );
-        let d = SpjgDescriptor::from_logical_plan(&plan).expect("spjg");
+        let (d, _arena) = descriptor_from_plan(&plan).expect("spjg");
         let agg = d.aggregate.as_ref().expect("aggregate present");
         assert_eq!(agg.group_by.len(), 1);
         // outputs: Dimension(a) then Aggregate(sum(v)); the aggregate call is
@@ -994,7 +898,7 @@ mod tests {
             vec![scan_plan(std::slice::from_ref(&a))],
             None,
         );
-        assert!(SpjgDescriptor::from_logical_plan(&plan).is_err());
+        assert!(descriptor_from_plan(&plan).is_err());
     }
 
     /// Build a memo from a plan and return the first logical expr of the root
@@ -1020,9 +924,9 @@ mod tests {
             vec![scan_plan(&[a.clone(), b.clone()])],
             None,
         );
-        let logical = SpjgDescriptor::from_logical_plan(&plan).expect("spjg");
-        let (memo, root_expr) = memo_root(&plan);
-        let (mem, shape) = SpjgDescriptor::from_memo(&root_expr, &memo).expect("from_memo");
+        let (logical, _arena) = descriptor_from_plan(&plan).expect("spjg");
+        let (mut memo, root_expr) = memo_root(&plan);
+        let (mem, shape) = SpjgDescriptor::from_memo(&root_expr, &mut memo).expect("from_memo");
         assert!(matches!(shape, MatchedShape::Spj));
         assert_eq!(mem.table.name, logical.table.name);
         assert_eq!(mem.predicates.len(), logical.predicates.len());
@@ -1052,9 +956,9 @@ mod tests {
             vec![scan_plan(&[a.clone(), v.clone()])],
             None,
         );
-        let logical = SpjgDescriptor::from_logical_plan(&plan).expect("spjg");
-        let (memo, root_expr) = memo_root(&plan);
-        let (mem, shape) = SpjgDescriptor::from_memo(&root_expr, &memo).expect("from_memo");
+        let (logical, _arena) = descriptor_from_plan(&plan).expect("spjg");
+        let (mut memo, root_expr) = memo_root(&plan);
+        let (mem, shape) = SpjgDescriptor::from_memo(&root_expr, &mut memo).expect("from_memo");
         // Shape carries the original aggregate op for output-id reuse.
         let MatchedShape::Spjg { original_agg } = &shape else {
             panic!("expected Spjg shape");
@@ -1110,6 +1014,6 @@ mod tests {
             op: Operator::LogicalAggregate(split),
             children: vec![scan_gid],
         };
-        assert!(SpjgDescriptor::from_memo(&expr, &memo).is_none());
+        assert!(SpjgDescriptor::from_memo(&expr, &mut memo).is_none());
     }
 }

@@ -14,16 +14,17 @@
 use std::collections::HashSet;
 use std::sync::Mutex;
 
-use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
+use crate::sql::analysis::{LiteralValue, OutputColumn};
 use crate::sql::optimizer::memo::{MExpr, MExprId, Memo};
-use crate::sql::optimizer::operator::{FilterOp, LogicalAggregateOp, Operator, ProjectOp, ScanOp};
-use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
-use crate::sql::optimizer::scalar::intern_typed;
-use crate::sql::optimizer::scalar_bridge::{
-    intern_aggregate_calls, intern_exprs, intern_project_items, materialize_aggregate_calls,
-    materialize_exprs,
+use crate::sql::optimizer::operator::{
+    FilterOp, LogicalAggregateOp, Operator, ProjectOp, ScalarAggregateSpec, ScalarProjectItem,
+    ScanOp,
 };
-use crate::sql::planner::plan::AggregateCall;
+use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
+use crate::sql::optimizer::scalar::{
+    ColumnDisplay, HashableLiteral, ScalarArena, ScalarId, ScalarNode, SortKey,
+};
+use crate::sql::optimizer::scalar_expr;
 
 use super::aggregate_rollup::{RollupKind, plan_rollup};
 use super::column_mapping::{MvColumnMap, NormExpr, normalize};
@@ -98,8 +99,14 @@ fn try_rewrite(
     let m_names = cand.mv.base_name_of();
 
     // 2. Predicate containment + compensation (still over base columns).
-    let containment =
-        check_containment(&query.predicates, &cand.mv.predicates, &q_names, &m_names)?;
+    let containment = check_containment(
+        &query.predicates,
+        &memo.scalars,
+        &cand.mv.predicates,
+        &cand.mv_scalars,
+        &q_names,
+        &m_names,
+    )?;
 
     // 3. Allocate the MV scan: one new ColumnId per MV visible output,
     //    bound by NAME to the target table columns.
@@ -128,7 +135,7 @@ fn try_rewrite(
         scan_columns.push(oc.clone());
         match &mv_out.expr {
             SpjgOutputExpr::Dimension(e) => {
-                dims.push((normalize(e, &m_names)?, oc));
+                dims.push((normalize(&cand.mv_scalars, *e, &m_names)?, oc));
             }
             SpjgOutputExpr::Aggregate(_) => agg_cols[i] = Some(oc),
         }
@@ -140,10 +147,10 @@ fn try_rewrite(
     //    columns are not row-filterable. MvColumnMap only contains
     //    Dimension outputs, so any compensation touching an aggregate
     //    column simply fails to rewrite -> candidate dropped.
-    let compensation: Vec<TypedExpr> = containment
+    let compensation: Vec<ScalarId> = containment
         .compensation
         .iter()
-        .map(|p| col_map.rewrite(p, &q_names))
+        .map(|p| col_map.rewrite(&mut memo.scalars, *p, &q_names))
         .collect::<Option<Vec<_>>>()?;
 
     // 5. Build the operator chain bottom-up.
@@ -164,8 +171,7 @@ fn try_rewrite(
     });
     let mut child_group = scan_group;
     if !compensation.is_empty() {
-        let predicate = combine_and(compensation);
-        let predicate = intern_typed(&mut memo.scalars, &predicate);
+        let predicate = scalar_expr::combine_conjuncts(&mut memo.scalars, compensation)?;
         child_group = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalFilter(FilterOp { predicate }),
@@ -184,16 +190,18 @@ fn try_rewrite(
                     let SpjgOutputExpr::Dimension(e) = &o.expr else {
                         return None;
                     };
-                    Some(ProjectItem {
-                        expr: col_map.rewrite(e, &q_names)?,
-                        output_name: o.name.clone(),
-                        output_column_id: o.column_id,
-                    })
+                    let expr = col_map.rewrite(&mut memo.scalars, *e, &q_names)?;
+                    Some(project_item(
+                        &mut memo.scalars,
+                        expr,
+                        o.name.clone(),
+                        o.column_id,
+                    ))
                 })
                 .collect::<Option<Vec<_>>>()?;
             Some(NewExpr {
                 op: Operator::LogicalProject(ProjectOp {
-                    items: intern_project_items(&mut memo.scalars, &items),
+                    items,
                     output_qualifier: None,
                 }),
                 children: vec![child_group],
@@ -203,38 +211,22 @@ fn try_rewrite(
         (MatchedShape::Spj, Some(_)) => None,
         // SPJG query on SPJ MV: keep the query aggregate, args rewritten.
         (MatchedShape::Spjg { original_agg }, None) => {
-            let original_group_by = materialize_exprs(&memo.scalars, &original_agg.group_by);
-            let original_aggregates = materialize_aggregate_calls(
-                &memo.scalars,
-                &original_agg.aggregates,
-                original_agg.group_by.len(),
-                &original_agg.output_columns,
-            );
             let group_by = original_agg
                 .group_by
                 .iter()
-                .zip(original_group_by.iter())
-                .map(|(_, e)| col_map.rewrite(e, &q_names))
+                .map(|expr| col_map.rewrite(&mut memo.scalars, *expr, &q_names))
                 .collect::<Option<Vec<_>>>()?;
-            let aggregates = original_aggregates
+            let aggregates = original_agg
+                .aggregates
                 .iter()
-                .map(|c| {
-                    Some(AggregateCall {
-                        args: c
-                            .args
-                            .iter()
-                            .map(|a| col_map.rewrite(a, &q_names))
-                            .collect::<Option<Vec<_>>>()?,
-                        ..c.clone()
-                    })
-                })
+                .map(|c| rewrite_aggregate_to_mv(&mut memo.scalars, c, &col_map, &q_names))
                 .collect::<Option<Vec<_>>>()?;
             // DISTINCT over an SPJ MV is sound (detail rows preserved); args
             // were rewritten like any other above, so no special handling.
             Some(NewExpr {
                 op: Operator::LogicalAggregate(LogicalAggregateOp::single(
-                    intern_exprs(&mut memo.scalars, &group_by),
-                    intern_aggregate_calls(&mut memo.scalars, &aggregates),
+                    group_by,
+                    aggregates,
                     original_agg.output_columns.clone(),
                 )),
                 children: vec![child_group],
@@ -242,44 +234,44 @@ fn try_rewrite(
         }
         // SPJG query on SPJG MV: direct mapping or rollup.
         (MatchedShape::Spjg { original_agg }, Some(mv_agg)) => {
-            let original_group_by = materialize_exprs(&memo.scalars, &original_agg.group_by);
-            let original_aggregates = materialize_aggregate_calls(
-                &memo.scalars,
-                &original_agg.aggregates,
-                original_agg.group_by.len(),
-                &original_agg.output_columns,
-            );
             let plan = plan_rollup(
-                &original_group_by,
-                &original_aggregates,
+                &original_agg.group_by,
+                &original_agg.aggregates,
+                &memo.scalars,
                 &q_names,
                 mv_agg,
                 &cand.mv.outputs,
+                &cand.mv_scalars,
                 &m_names,
             )?;
-            let n_keys = original_group_by.len();
+            let n_keys = original_agg.group_by.len();
             match plan.kind {
                 RollupKind::Direct => {
                     // One row per group already: Project binding the original
                     // output ids (group keys then agg results).
-                    let mut items: Vec<ProjectItem> = Vec::new();
+                    let mut items: Vec<ScalarProjectItem> = Vec::new();
                     for (i, oc) in original_agg.output_columns.iter().enumerate() {
                         let expr = if i < n_keys {
-                            col_map.rewrite(&original_group_by[i], &q_names)?
+                            col_map.rewrite(
+                                &mut memo.scalars,
+                                original_agg.group_by[i],
+                                &q_names,
+                            )?
                         } else {
                             let item = &plan.items[i - n_keys];
                             let mv_col = agg_cols[item.mv_output_index].clone()?;
-                            column_ref(&mv_col)
+                            column_ref(&mut memo.scalars, &mv_col)
                         };
-                        items.push(ProjectItem {
+                        items.push(project_item(
+                            &mut memo.scalars,
                             expr,
-                            output_name: oc.name.clone(),
-                            output_column_id: oc.column_id,
-                        });
+                            oc.name.clone(),
+                            oc.column_id,
+                        ));
                     }
                     Some(NewExpr {
                         op: Operator::LogicalProject(ProjectOp {
-                            items: intern_project_items(&mut memo.scalars, &items),
+                            items,
                             output_qualifier: None,
                         }),
                         children: vec![child_group],
@@ -289,8 +281,7 @@ fn try_rewrite(
                     let group_by = original_agg
                         .group_by
                         .iter()
-                        .zip(original_group_by.iter())
-                        .map(|(_, e)| col_map.rewrite(e, &q_names))
+                        .map(|expr| col_map.rewrite(&mut memo.scalars, *expr, &q_names))
                         .collect::<Option<Vec<_>>>()?;
                     let needs_coalesce = plan.items.iter().any(|i| i.needs_coalesce);
                     // Aggregate outputs: reuse original ids directly unless a
@@ -310,23 +301,19 @@ fn try_rewrite(
                     let aggregates = plan
                         .items
                         .iter()
-                        .enumerate()
-                        .map(|(i, item)| {
+                        .map(|item| {
                             let mv_col = agg_cols[item.mv_output_index].clone()?;
-                            let orig = &original_aggregates[i];
-                            Some(AggregateCall {
+                            Some(ScalarAggregateSpec {
                                 name: item.rollup_fn.to_string(),
-                                args: vec![column_ref(&mv_col)],
+                                args: vec![column_ref(&mut memo.scalars, &mv_col)],
                                 distinct: false,
-                                result_type: orig.result_type.clone(),
                                 order_by: vec![],
-                                output_column_id: agg_outputs[n_keys + i].column_id,
                             })
                         })
                         .collect::<Option<Vec<_>>>()?;
                     let agg_op = Operator::LogicalAggregate(LogicalAggregateOp::single(
-                        intern_exprs(&mut memo.scalars, &group_by),
-                        intern_aggregate_calls(&mut memo.scalars, &aggregates),
+                        group_by,
+                        aggregates,
                         agg_outputs.clone(),
                     ));
                     if !needs_coalesce {
@@ -341,42 +328,23 @@ fn try_rewrite(
                         op: agg_op,
                         children: vec![child_group],
                     });
-                    let items: Vec<ProjectItem> = original_agg
+                    let items: Vec<ScalarProjectItem> = original_agg
                         .output_columns
                         .iter()
                         .enumerate()
                         .map(|(i, oc)| {
-                            let inner = column_ref(&agg_outputs[i]);
+                            let inner = column_ref(&mut memo.scalars, &agg_outputs[i]);
                             let expr = if i >= n_keys && plan.items[i - n_keys].needs_coalesce {
-                                TypedExpr {
-                                    kind: ExprKind::FunctionCall {
-                                        name: "coalesce".to_string(),
-                                        args: vec![
-                                            inner,
-                                            TypedExpr {
-                                                kind: ExprKind::Literal(LiteralValue::Int(0)),
-                                                data_type: oc.data_type.clone(),
-                                                nullable: false,
-                                            },
-                                        ],
-                                        distinct: false,
-                                    },
-                                    data_type: oc.data_type.clone(),
-                                    nullable: false,
-                                }
+                                coalesce_zero(&mut memo.scalars, inner, oc)
                             } else {
                                 inner
                             };
-                            ProjectItem {
-                                expr,
-                                output_name: oc.name.clone(),
-                                output_column_id: oc.column_id,
-                            }
+                            project_item(&mut memo.scalars, expr, oc.name.clone(), oc.column_id)
                         })
                         .collect();
                     Some(NewExpr {
                         op: Operator::LogicalProject(ProjectOp {
-                            items: intern_project_items(&mut memo.scalars, &items),
+                            items,
                             output_qualifier: None,
                         }),
                         children: vec![agg_group],
@@ -387,29 +355,89 @@ fn try_rewrite(
     }
 }
 
-fn column_ref(c: &OutputColumn) -> TypedExpr {
-    TypedExpr {
-        kind: ExprKind::ColumnRef {
-            column_id: c.column_id,
-            qualifier: None,
-            column: c.name.clone(),
-        },
-        data_type: c.data_type.clone(),
-        nullable: c.nullable,
+fn column_ref(arena: &mut ScalarArena, c: &OutputColumn) -> ScalarId {
+    arena.remember_project_output_display(c.column_id, None, c.name.clone());
+    arena.intern(
+        ScalarNode::ColumnRef(c.column_id),
+        c.data_type.clone(),
+        c.nullable,
+    )
+}
+
+fn project_item(
+    arena: &mut ScalarArena,
+    expr: ScalarId,
+    output_name: String,
+    output_column_id: crate::sql::column_id::ColumnId,
+) -> ScalarProjectItem {
+    let expr_display = column_display(arena, expr);
+    arena.remember_project_output_display(output_column_id, None, output_name.clone());
+    ScalarProjectItem {
+        expr,
+        output_name,
+        output_column_id,
+        expr_display,
     }
 }
 
-fn combine_and(mut preds: Vec<TypedExpr>) -> TypedExpr {
-    let first = preds.remove(0);
-    preds.into_iter().fold(first, |l, r| TypedExpr {
-        nullable: l.nullable || r.nullable,
-        data_type: arrow::datatypes::DataType::Boolean,
-        kind: ExprKind::BinaryOp {
-            left: Box::new(l),
-            op: crate::sql::analysis::BinOp::And,
-            right: Box::new(r),
-        },
+fn column_display(arena: &ScalarArena, expr: ScalarId) -> Option<ColumnDisplay> {
+    match arena.node(expr) {
+        ScalarNode::ColumnRef(column_id) => arena.column_display(*column_id).cloned(),
+        _ => None,
+    }
+}
+
+fn rewrite_aggregate_to_mv(
+    arena: &mut ScalarArena,
+    call: &ScalarAggregateSpec,
+    col_map: &MvColumnMap,
+    query_base_names: &std::collections::HashMap<crate::sql::column_id::ColumnId, String>,
+) -> Option<ScalarAggregateSpec> {
+    Some(ScalarAggregateSpec {
+        name: call.name.clone(),
+        args: call
+            .args
+            .iter()
+            .map(|arg| col_map.rewrite(arena, *arg, query_base_names))
+            .collect::<Option<Vec<_>>>()?,
+        distinct: call.distinct,
+        order_by: call
+            .order_by
+            .iter()
+            .map(|key| rewrite_sort_key(arena, key, col_map, query_base_names))
+            .collect::<Option<Vec<_>>>()?,
     })
+}
+
+fn rewrite_sort_key(
+    arena: &mut ScalarArena,
+    key: &SortKey,
+    col_map: &MvColumnMap,
+    query_base_names: &std::collections::HashMap<crate::sql::column_id::ColumnId, String>,
+) -> Option<SortKey> {
+    Some(SortKey {
+        expr: col_map.rewrite(arena, key.expr, query_base_names)?,
+        asc: key.asc,
+        nulls_first: key.nulls_first,
+        display: key.display.clone(),
+    })
+}
+
+fn coalesce_zero(arena: &mut ScalarArena, value: ScalarId, output: &OutputColumn) -> ScalarId {
+    let zero = arena.intern(
+        ScalarNode::Literal(HashableLiteral(LiteralValue::Int(0))),
+        output.data_type.clone(),
+        false,
+    );
+    arena.intern(
+        ScalarNode::FunctionCall {
+            name: "coalesce".to_string(),
+            args: vec![value, zero],
+            distinct: false,
+        },
+        output.data_type.clone(),
+        false,
+    )
 }
 
 /// Identity match on `(catalog, namespace, table)` only. `table_uuid` and the
@@ -441,6 +469,7 @@ mod tests {
     };
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::{GroupId, Memo};
+    use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::optimizer::scalar::materialize;
     use crate::sql::planner::plan::{
         AggregateCall, LogicalAggregateNode, LogicalFilterNode, LogicalPlanNode, LogicalScanNode,
@@ -455,6 +484,15 @@ mod tests {
             crate::sql::optimizer::convert::try_logical_plan_to_opt_expr(plan, &mut memo.scalars)
                 .expect("logical plan to opt expr");
         crate::sql::optimizer::convert::opt_expr_to_memo(&opt_expr, memo)
+    }
+
+    fn spjg_descriptor_for_test(plan: &LogicalPlanNode) -> (SpjgDescriptor, ScalarArena) {
+        let mut arena = ScalarArena::new();
+        let opt_expr =
+            crate::sql::optimizer::convert::try_logical_plan_to_opt_expr(plan, &mut arena)
+                .expect("logical plan to opt expr");
+        let descriptor = SpjgDescriptor::from_opt_expr(&opt_expr, &mut arena).expect("mv spjg");
+        (descriptor, arena)
     }
 
     fn col(id: u32, name: &str) -> OutputColumn {
@@ -599,8 +637,8 @@ mod tests {
     /// MV defining plan `SELECT a, b, sum(v) AS s FROM t WHERE a >= mv_low
     /// GROUP BY a, b`, over the SAME base identity but a DISTINCT id range
     /// (100..=110). Returned as a built `SpjgDescriptor` via the already-tested
-    /// `from_logical_plan`.
-    fn mv_descriptor(mv_low: i64) -> SpjgDescriptor {
+    /// `from_opt_expr`.
+    fn mv_descriptor(mv_low: i64) -> (SpjgDescriptor, ScalarArena) {
         let a = col(100, "a");
         let b = col(101, "b");
         let v = col(102, "v");
@@ -621,14 +659,16 @@ mod tests {
             )],
             None,
         );
-        SpjgDescriptor::from_logical_plan(&plan).expect("mv spjg")
+        spjg_descriptor_for_test(&plan)
     }
 
     /// Candidate over MV `agg_mv(a, b, s)` materializing `mv_descriptor`.
     fn agg_candidate(mv_low: i64) -> MvRewriteCandidate {
+        let (mv, mv_scalars) = mv_descriptor(mv_low);
         MvRewriteCandidate {
             mv_name: "agg_mv".to_string(),
-            mv: mv_descriptor(mv_low),
+            mv,
+            mv_scalars,
             target_database: "ns".to_string(),
             target_table: iceberg_table("cat", "ns", "agg_mv", &["a", "b", "s"]),
         }
@@ -765,10 +805,11 @@ mod tests {
             vec![base_scan(&[mv_a.clone(), mv_b.clone(), mv_v.clone()])],
             None,
         );
-        let mv = SpjgDescriptor::from_logical_plan(&mv_plan).expect("mv spjg");
+        let (mv, mv_scalars) = spjg_descriptor_for_test(&mv_plan);
         let candidate = MvRewriteCandidate {
             mv_name: "spj_mv".to_string(),
             mv,
+            mv_scalars,
             target_database: "ns".to_string(),
             target_table: iceberg_table("cat", "ns", "spj_mv", &["a", "b", "v"]),
         };
@@ -833,10 +874,11 @@ mod tests {
             )],
             None,
         );
-        let mv = SpjgDescriptor::from_logical_plan(&mv_plan).expect("mv spjg");
+        let (mv, mv_scalars) = spjg_descriptor_for_test(&mv_plan);
         let candidate = MvRewriteCandidate {
             mv_name: "cnt_mv".to_string(),
             mv,
+            mv_scalars,
             target_database: "ns".to_string(),
             target_table: iceberg_table("cat", "ns", "cnt_mv", &["a", "c"]),
         };

@@ -4,8 +4,9 @@
 
 use std::collections::HashMap;
 
-use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
+use crate::sql::analysis::{BinOp, LiteralValue};
 use crate::sql::column_id::ColumnId;
+use crate::sql::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNode};
 
 use super::column_mapping::{NormExpr, normalize};
 
@@ -26,25 +27,29 @@ struct ColumnRange {
 #[derive(Debug)]
 pub(crate) struct ContainmentResult {
     /// Query conjuncts the MV does not already guarantee; to be re-applied
-    /// as a Filter above the MV scan (in original TypedExpr form, still
-    /// over base-table columns — the caller rewrites them to MV columns).
-    pub compensation: Vec<TypedExpr>,
+    /// as a Filter above the MV scan. These ids belong to the query arena;
+    /// the caller rewrites them to MV output columns before injecting a Filter.
+    pub compensation: Vec<ScalarId>,
 }
 
 struct Classified {
     /// base column name -> (merged range, original conjuncts on the column)
-    ranges: HashMap<String, (ColumnRange, Vec<TypedExpr>)>,
+    ranges: HashMap<String, (ColumnRange, Vec<ScalarId>)>,
     /// normalized residual -> original conjunct
-    residuals: Vec<(NormExpr, TypedExpr)>,
+    residuals: Vec<(NormExpr, ScalarId)>,
 }
 
 /// Classify conjuncts. Returns None when any conjunct cannot be classified
 /// safely (e.g. un-normalizable residual) — fail closed.
-fn classify(conjuncts: &[TypedExpr], base_names: &HashMap<ColumnId, String>) -> Option<Classified> {
-    let mut ranges: HashMap<String, (ColumnRange, Vec<TypedExpr>)> = HashMap::new();
+fn classify(
+    arena: &ScalarArena,
+    conjuncts: &[ScalarId],
+    base_names: &HashMap<ColumnId, String>,
+) -> Option<Classified> {
+    let mut ranges: HashMap<String, (ColumnRange, Vec<ScalarId>)> = HashMap::new();
     let mut residuals = Vec::new();
     for c in conjuncts {
-        match as_range_conjunct(c, base_names) {
+        match as_range_conjunct(arena, *c, base_names) {
             Some((col, low, high)) => {
                 let entry = ranges.entry(col).or_default();
                 if let Some(b) = low {
@@ -53,11 +58,11 @@ fn classify(conjuncts: &[TypedExpr], base_names: &HashMap<ColumnId, String>) -> 
                 if let Some(b) = high {
                     tighten_high(&mut entry.0, b)?;
                 }
-                entry.1.push(c.clone());
+                entry.1.push(*c);
             }
             None => {
-                let n = normalize(c, base_names)?;
-                residuals.push((n, c.clone()));
+                let n = normalize(arena, *c, base_names)?;
+                residuals.push((n, *c));
             }
         }
     }
@@ -67,28 +72,27 @@ fn classify(conjuncts: &[TypedExpr], base_names: &HashMap<ColumnId, String>) -> 
 /// `col op literal` / `literal op col` / BETWEEN -> (column, low?, high?).
 /// op ∈ {<, <=, >, >=, =}. `!=`, IS NULL, IN, LIKE etc. are residuals.
 fn as_range_conjunct(
-    e: &TypedExpr,
+    arena: &ScalarArena,
+    expr: ScalarId,
     base_names: &HashMap<ColumnId, String>,
 ) -> Option<(String, Option<Bound>, Option<Bound>)> {
-    let col_of = |x: &TypedExpr| -> Option<String> {
-        if let ExprKind::ColumnRef { column_id, .. } = &x.kind {
-            base_names.get(column_id).cloned()
-        } else {
-            None
-        }
+    let col_of = |x: ScalarId| -> Option<String> {
+        let ScalarNode::ColumnRef(column_id) = arena.node(x) else {
+            return None;
+        };
+        base_names.get(column_id).cloned()
     };
-    let lit_of = |x: &TypedExpr| -> Option<LiteralValue> {
-        if let ExprKind::Literal(v) = &x.kind {
-            Some(v.clone())
-        } else {
-            None
-        }
+    let lit_of = |x: ScalarId| -> Option<LiteralValue> {
+        let ScalarNode::Literal(HashableLiteral(value)) = arena.node(x) else {
+            return None;
+        };
+        Some(value.clone())
     };
-    match &e.kind {
-        ExprKind::BinaryOp { left, op, right } => {
-            let (col, lit, op) = if let (Some(c), Some(l)) = (col_of(left), lit_of(right)) {
+    match arena.node(expr) {
+        ScalarNode::BinaryOp { left, op, right } => {
+            let (col, lit, op) = if let (Some(c), Some(l)) = (col_of(*left), lit_of(*right)) {
                 (c, l, *op)
-            } else if let (Some(l), Some(c)) = (lit_of(left), col_of(right)) {
+            } else if let (Some(l), Some(c)) = (lit_of(*left), col_of(*right)) {
                 // literal op col  ==  col flipped-op literal
                 let flipped = match op {
                     BinOp::Lt => BinOp::Gt,
@@ -149,15 +153,15 @@ fn as_range_conjunct(
                 _ => None,
             }
         }
-        ExprKind::Between {
-            expr,
+        ScalarNode::Between {
+            child,
             low,
             high,
             negated: false,
         } => {
-            let col = col_of(expr)?;
-            let lo = lit_of(low)?;
-            let hi = lit_of(high)?;
+            let col = col_of(*child)?;
+            let lo = lit_of(*low)?;
+            let hi = lit_of(*high)?;
             Some((
                 col,
                 Some(Bound {
@@ -247,17 +251,19 @@ fn high_contained(query: &Option<Bound>, mv: &Option<Bound>) -> Option<bool> {
 /// Core check: MV data ⊇ query data. Returns None when not contained (or
 /// not provably contained). On success returns the compensation conjuncts.
 pub(crate) fn check_containment(
-    query_conjuncts: &[TypedExpr],
-    mv_conjuncts: &[TypedExpr],
+    query_conjuncts: &[ScalarId],
+    query_arena: &ScalarArena,
+    mv_conjuncts: &[ScalarId],
+    mv_arena: &ScalarArena,
     // base ColumnId -> base column name maps for EACH side
     // (the two sides allocate different ColumnIds for the same table).
     query_base_names: &HashMap<ColumnId, String>,
     mv_base_names: &HashMap<ColumnId, String>,
 ) -> Option<ContainmentResult> {
-    let q = classify(query_conjuncts, query_base_names)?;
-    let m = classify(mv_conjuncts, mv_base_names)?;
+    let q = classify(query_arena, query_conjuncts, query_base_names)?;
+    let m = classify(mv_arena, mv_conjuncts, mv_base_names)?;
 
-    let mut compensation: Vec<TypedExpr> = Vec::new();
+    let mut compensation: Vec<ScalarId> = Vec::new();
 
     // Ranges: every MV-constrained column must be at least as wide as the
     // query's. Query columns unconstrained by MV compensate fully.
@@ -274,7 +280,7 @@ pub(crate) fn check_containment(
             // Identical range: fully implied, no compensation.
             Some((mv_range, _)) if mv_range == q_range => {}
             // Wider MV range (already verified) or unconstrained: re-apply.
-            _ => compensation.extend(originals.iter().cloned()),
+            _ => compensation.extend(originals.iter().copied()),
         }
     }
 
@@ -289,7 +295,7 @@ pub(crate) fn check_containment(
     let m_norms: Vec<&NormExpr> = m.residuals.iter().map(|(n, _)| n).collect();
     for (qn, orig) in &q.residuals {
         if !m_norms.contains(&qn) {
-            compensation.push(orig.clone());
+            compensation.push(*orig);
         }
     }
 
@@ -301,6 +307,7 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, intern_typed};
     use arrow::datatypes::DataType;
     use std::collections::HashMap;
 
@@ -413,6 +420,32 @@ mod tests {
         let mut m = HashMap::new();
         m.insert(ColumnId(1), "a".to_string());
         m
+    }
+
+    fn check_containment(
+        query_conjuncts: &[TypedExpr],
+        mv_conjuncts: &[TypedExpr],
+        query_base_names: &HashMap<ColumnId, String>,
+        mv_base_names: &HashMap<ColumnId, String>,
+    ) -> Option<ContainmentResult> {
+        let mut query_arena = ScalarArena::new();
+        let query_ids: Vec<ScalarId> = query_conjuncts
+            .iter()
+            .map(|expr| intern_typed(&mut query_arena, expr))
+            .collect();
+        let mut mv_arena = ScalarArena::new();
+        let mv_ids: Vec<ScalarId> = mv_conjuncts
+            .iter()
+            .map(|expr| intern_typed(&mut mv_arena, expr))
+            .collect();
+        super::check_containment(
+            &query_ids,
+            &query_arena,
+            &mv_ids,
+            &mv_arena,
+            query_base_names,
+            mv_base_names,
+        )
     }
 
     #[test]

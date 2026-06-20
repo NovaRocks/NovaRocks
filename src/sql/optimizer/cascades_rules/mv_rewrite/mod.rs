@@ -10,6 +10,7 @@ pub(crate) mod predicate_split;
 pub(crate) mod rule;
 
 use crate::sql::catalog::TableDef;
+use crate::sql::optimizer::scalar::ScalarArena;
 use descriptor::SpjgDescriptor;
 
 pub(crate) const RULE_NAME: &str = "MvRewrite";
@@ -24,6 +25,8 @@ pub(crate) struct MvRewriteCandidate {
     /// SPJG decomposition of the MV defining query, expressed over the
     /// base table's ColumnIds (allocated in the shared ColumnRefFactory).
     pub mv: SpjgDescriptor,
+    /// Scalar arena that owns every ScalarId stored in `mv`.
+    pub mv_scalars: ScalarArena,
     /// Database (namespace) of the MV target table, for ScanOp.
     pub target_database: String,
     /// Executable TableDef of the MV target table

@@ -173,7 +173,10 @@ fn build_candidate(
     let mut returned = returned;
     let mv_logical = crate::sql::planner::plan_query(resolved, ctes, &mut returned)?;
     *factory = returned;
-    let mv_desc = SpjgDescriptor::from_logical_plan(&mv_logical)?;
+    let mut mv_scalars = crate::sql::optimizer::scalar::ScalarArena::new();
+    let mv_opt_expr =
+        crate::sql::optimizer::convert::try_logical_plan_to_opt_expr(&mv_logical, &mut mv_scalars)?;
+    let mv_desc = SpjgDescriptor::from_opt_expr(&mv_opt_expr, &mut mv_scalars)?;
 
     // 3b. Fail closed on name-resolution drift: the analyzed scan must be
     //     one of the recorded base tables.
@@ -220,6 +223,7 @@ fn build_candidate(
     Ok(Some(MvRewriteCandidate {
         mv_name: tbl.clone(),
         mv: mv_desc,
+        mv_scalars,
         target_database: ns.clone(),
         target_table,
     }))

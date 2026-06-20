@@ -4,9 +4,9 @@
 
 use std::collections::HashMap;
 
-use crate::sql::analysis::TypedExpr;
 use crate::sql::column_id::ColumnId;
-use crate::sql::planner::plan::AggregateCall;
+use crate::sql::optimizer::operator::ScalarAggregateSpec;
+use crate::sql::optimizer::scalar::{ScalarArena, ScalarId};
 
 use super::column_mapping::{NormExpr, normalize};
 use super::descriptor::{SpjgAggregate, SpjgOutput, SpjgOutputExpr};
@@ -39,7 +39,11 @@ pub(crate) struct RollupPlan {
     pub items: Vec<RollupItem>,
 }
 
-fn norm_agg(call: &AggregateCall, base_names: &HashMap<ColumnId, String>) -> Option<NormExpr> {
+fn norm_agg(
+    arena: &ScalarArena,
+    call: &ScalarAggregateSpec,
+    base_names: &HashMap<ColumnId, String>,
+) -> Option<NormExpr> {
     // `order_by` is intentionally NOT part of the key: every aggregate on the
     // current whitelist (sum/min/max/count) is order-insensitive, and SPJG-MV
     // aggregate calls carry no order_by. If an order-sensitive aggregate
@@ -52,7 +56,7 @@ fn norm_agg(call: &AggregateCall, base_names: &HashMap<ColumnId, String>) -> Opt
         args: call
             .args
             .iter()
-            .map(|a| normalize(a, base_names))
+            .map(|arg| normalize(arena, *arg, base_names))
             .collect::<Option<Vec<_>>>()?,
     })
 }
@@ -60,22 +64,24 @@ fn norm_agg(call: &AggregateCall, base_names: &HashMap<ColumnId, String>) -> Opt
 /// Decide whether (and how) the query aggregate can be answered from the MV.
 /// Returns None when not rewritable.
 pub(crate) fn plan_rollup(
-    query_group_by: &[TypedExpr],
-    query_aggregates: &[AggregateCall],
+    query_group_by: &[ScalarId],
+    query_aggregates: &[ScalarAggregateSpec],
+    query_arena: &ScalarArena,
     query_base_names: &HashMap<ColumnId, String>,
     mv_agg: &SpjgAggregate,
     mv_outputs: &[SpjgOutput],
+    mv_arena: &ScalarArena,
     mv_base_names: &HashMap<ColumnId, String>,
 ) -> Option<RollupPlan> {
     // Normalized group-key sets.
     let q_keys: Vec<NormExpr> = query_group_by
         .iter()
-        .map(|e| normalize(e, query_base_names))
+        .map(|expr| normalize(query_arena, *expr, query_base_names))
         .collect::<Option<Vec<_>>>()?;
     let m_keys: Vec<NormExpr> = mv_agg
         .group_by
         .iter()
-        .map(|e| normalize(e, mv_base_names))
+        .map(|expr| normalize(mv_arena, *expr, mv_base_names))
         .collect::<Option<Vec<_>>>()?;
     if !q_keys.iter().all(|k| m_keys.contains(k)) {
         return None; // query groups by something the MV did not preserve
@@ -86,7 +92,7 @@ pub(crate) fn plan_rollup(
     let mut mv_agg_by_norm: HashMap<NormExpr, usize> = HashMap::new();
     for (i, out) in mv_outputs.iter().enumerate() {
         if let SpjgOutputExpr::Aggregate(call) = &out.expr
-            && let Some(n) = norm_agg(call, mv_base_names)
+            && let Some(n) = norm_agg(mv_arena, call, mv_base_names)
         {
             mv_agg_by_norm.insert(n, i);
         }
@@ -98,7 +104,7 @@ pub(crate) fn plan_rollup(
         if q.distinct {
             return None; // DISTINCT aggregates never rewrite onto SPJG MVs
         }
-        let qn = norm_agg(q, query_base_names)?;
+        let qn = norm_agg(query_arena, q, query_base_names)?;
         let mv_idx = *mv_agg_by_norm.get(&qn)?; // exact same call materialized?
         if equal {
             items.push(RollupItem {
@@ -138,6 +144,9 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::operator::ScalarAggregateSpec;
+    use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, intern_typed};
+    use crate::sql::optimizer::scalar_bridge::intern_aggregate_call;
     use crate::sql::planner::plan::AggregateCall;
     use arrow::datatypes::DataType;
     use std::collections::HashMap;
@@ -188,20 +197,31 @@ mod tests {
     }
 
     /// Wrap an aggregate call as a materialized MV output column.
-    fn agg_out(out: &OutputColumn, call: AggregateCall) -> SpjgOutput {
+    fn scalar_exprs(arena: &mut ScalarArena, exprs: Vec<TypedExpr>) -> Vec<ScalarId> {
+        exprs.iter().map(|expr| intern_typed(arena, expr)).collect()
+    }
+
+    fn scalar_aggs(arena: &mut ScalarArena, calls: Vec<AggregateCall>) -> Vec<ScalarAggregateSpec> {
+        calls
+            .iter()
+            .map(|call| intern_aggregate_call(arena, call))
+            .collect()
+    }
+
+    fn agg_out(out: &OutputColumn, call: AggregateCall, arena: &mut ScalarArena) -> SpjgOutput {
         SpjgOutput {
             name: out.name.clone(),
             column_id: out.column_id,
-            expr: SpjgOutputExpr::Aggregate(call),
+            expr: SpjgOutputExpr::Aggregate(intern_aggregate_call(arena, &call)),
         }
     }
 
     /// Wrap a dimension expr as an MV output column.
-    fn dim_out(out: &OutputColumn, expr: TypedExpr) -> SpjgOutput {
+    fn dim_out(out: &OutputColumn, expr: TypedExpr, arena: &mut ScalarArena) -> SpjgOutput {
         SpjgOutput {
             name: out.name.clone(),
             column_id: out.column_id,
-            expr: SpjgOutputExpr::Dimension(expr),
+            expr: SpjgOutputExpr::Dimension(intern_typed(arena, &expr)),
         }
     }
 
@@ -214,33 +234,44 @@ mod tests {
         let mv_s = col(11, "s");
         let mv_c = col(12, "c");
         let mv_names = names(&[(1, "a"), (2, "b"), (3, "v")]);
+        let mut mv_arena = ScalarArena::new();
 
         let mv_agg = SpjgAggregate {
-            group_by: vec![col_ref(&mv_a), col_ref(&mv_b)],
+            group_by: scalar_exprs(&mut mv_arena, vec![col_ref(&mv_a), col_ref(&mv_b)]),
         };
         let mv_outputs = vec![
-            dim_out(&col(101, "a"), col_ref(&mv_a)),
-            dim_out(&col(102, "b"), col_ref(&mv_b)),
-            agg_out(&mv_s, agg("sum", vec![col_ref(&mv_v)], false)),
-            agg_out(&mv_c, agg("count", vec![], false)),
+            dim_out(&col(101, "a"), col_ref(&mv_a), &mut mv_arena),
+            dim_out(&col(102, "b"), col_ref(&mv_b), &mut mv_arena),
+            agg_out(
+                &mv_s,
+                agg("sum", vec![col_ref(&mv_v)], false),
+                &mut mv_arena,
+            ),
+            agg_out(&mv_c, agg("count", vec![], false), &mut mv_arena),
         ];
 
         // query: SELECT a, sum(v), count(*) GROUP BY a (subset of {a, b}).
         let q_a = col(21, "a");
         let q_v = col(23, "v");
         let q_names = names(&[(21, "a"), (23, "v")]);
-        let q_group_by = vec![col_ref(&q_a)];
-        let q_aggs = vec![
-            agg("sum", vec![col_ref(&q_v)], false),
-            agg("count", vec![], false),
-        ];
+        let mut q_arena = ScalarArena::new();
+        let q_group_by = scalar_exprs(&mut q_arena, vec![col_ref(&q_a)]);
+        let q_aggs = scalar_aggs(
+            &mut q_arena,
+            vec![
+                agg("sum", vec![col_ref(&q_v)], false),
+                agg("count", vec![], false),
+            ],
+        );
 
         let plan = plan_rollup(
             &q_group_by,
             &q_aggs,
+            &q_arena,
             &q_names,
             &mv_agg,
             &mv_outputs,
+            &mv_arena,
             &mv_names,
         )
         .expect("subset rollup must be rewritable");
@@ -266,32 +297,43 @@ mod tests {
         let mv_s = col(11, "s");
         let mv_c = col(12, "c");
         let mv_names = names(&[(1, "a"), (3, "v")]);
+        let mut mv_arena = ScalarArena::new();
 
         let mv_agg = SpjgAggregate {
-            group_by: vec![col_ref(&mv_a)],
+            group_by: scalar_exprs(&mut mv_arena, vec![col_ref(&mv_a)]),
         };
         let mv_outputs = vec![
-            dim_out(&col(101, "a"), col_ref(&mv_a)),
-            agg_out(&mv_s, agg("sum", vec![col_ref(&mv_v)], false)),
-            agg_out(&mv_c, agg("count", vec![], false)),
+            dim_out(&col(101, "a"), col_ref(&mv_a), &mut mv_arena),
+            agg_out(
+                &mv_s,
+                agg("sum", vec![col_ref(&mv_v)], false),
+                &mut mv_arena,
+            ),
+            agg_out(&mv_c, agg("count", vec![], false), &mut mv_arena),
         ];
 
         // query: SELECT a, sum(v), count(*) GROUP BY a (== MV group-by).
         let q_a = col(21, "a");
         let q_v = col(23, "v");
         let q_names = names(&[(21, "a"), (23, "v")]);
-        let q_group_by = vec![col_ref(&q_a)];
-        let q_aggs = vec![
-            agg("sum", vec![col_ref(&q_v)], false),
-            agg("count", vec![], false),
-        ];
+        let mut q_arena = ScalarArena::new();
+        let q_group_by = scalar_exprs(&mut q_arena, vec![col_ref(&q_a)]);
+        let q_aggs = scalar_aggs(
+            &mut q_arena,
+            vec![
+                agg("sum", vec![col_ref(&q_v)], false),
+                agg("count", vec![], false),
+            ],
+        );
 
         let plan = plan_rollup(
             &q_group_by,
             &q_aggs,
+            &q_arena,
             &q_names,
             &mv_agg,
             &mv_outputs,
+            &mv_arena,
             &mv_names,
         )
         .expect("equal group-by must map directly");
@@ -315,29 +357,37 @@ mod tests {
         let mv_x = col(4, "x");
         let mv_d = col(13, "d");
         let mv_names = names(&[(1, "a"), (4, "x")]);
+        let mut mv_arena = ScalarArena::new();
 
         let mv_agg = SpjgAggregate {
-            group_by: vec![col_ref(&mv_a)],
+            group_by: scalar_exprs(&mut mv_arena, vec![col_ref(&mv_a)]),
         };
         let mv_outputs = vec![
-            dim_out(&col(101, "a"), col_ref(&mv_a)),
-            agg_out(&mv_d, agg("count", vec![col_ref(&mv_x)], true)),
+            dim_out(&col(101, "a"), col_ref(&mv_a), &mut mv_arena),
+            agg_out(
+                &mv_d,
+                agg("count", vec![col_ref(&mv_x)], true),
+                &mut mv_arena,
+            ),
         ];
 
         // query: SELECT a, count(distinct x) GROUP BY a (== MV group-by).
         let q_a = col(21, "a");
         let q_x = col(24, "x");
         let q_names = names(&[(21, "a"), (24, "x")]);
-        let q_group_by = vec![col_ref(&q_a)];
-        let q_aggs = vec![agg("count", vec![col_ref(&q_x)], true)];
+        let mut q_arena = ScalarArena::new();
+        let q_group_by = scalar_exprs(&mut q_arena, vec![col_ref(&q_a)]);
+        let q_aggs = scalar_aggs(&mut q_arena, vec![agg("count", vec![col_ref(&q_x)], true)]);
 
         assert!(
             plan_rollup(
                 &q_group_by,
                 &q_aggs,
+                &q_arena,
                 &q_names,
                 &mv_agg,
                 &mv_outputs,
+                &mv_arena,
                 &mv_names,
             )
             .is_none(),
@@ -353,28 +403,37 @@ mod tests {
         let mv_v = col(3, "v");
         let mv_m = col(14, "m");
         let mv_names = names(&[(1, "a"), (2, "b"), (3, "v")]);
+        let mut mv_arena = ScalarArena::new();
 
         let mv_agg = SpjgAggregate {
-            group_by: vec![col_ref(&mv_a), col_ref(&mv_b)],
+            group_by: scalar_exprs(&mut mv_arena, vec![col_ref(&mv_a), col_ref(&mv_b)]),
         };
         let mv_outputs = vec![
-            dim_out(&col(101, "a"), col_ref(&mv_a)),
-            dim_out(&col(102, "b"), col_ref(&mv_b)),
-            agg_out(&mv_m, agg("avg", vec![col_ref(&mv_v)], false)),
+            dim_out(&col(101, "a"), col_ref(&mv_a), &mut mv_arena),
+            dim_out(&col(102, "b"), col_ref(&mv_b), &mut mv_arena),
+            agg_out(
+                &mv_m,
+                agg("avg", vec![col_ref(&mv_v)], false),
+                &mut mv_arena,
+            ),
         ];
 
         // Subset query: GROUP BY a only -> avg cannot be rolled up -> None.
         let q_a = col(21, "a");
         let q_v = col(23, "v");
         let q_names = names(&[(21, "a"), (23, "v")]);
-        let q_aggs = vec![agg("avg", vec![col_ref(&q_v)], false)];
+        let mut q_arena = ScalarArena::new();
+        let q_group_by_subset = scalar_exprs(&mut q_arena, vec![col_ref(&q_a)]);
+        let q_aggs = scalar_aggs(&mut q_arena, vec![agg("avg", vec![col_ref(&q_v)], false)]);
         assert!(
             plan_rollup(
-                &[col_ref(&q_a)],
+                &q_group_by_subset,
                 &q_aggs,
+                &q_arena,
                 &q_names,
                 &mv_agg,
                 &mv_outputs,
+                &mv_arena,
                 &mv_names,
             )
             .is_none(),
@@ -385,12 +444,15 @@ mod tests {
         // mapping is allowed because no re-aggregation happens.
         let q_b = col(22, "b");
         let q_names_eq = names(&[(21, "a"), (22, "b"), (23, "v")]);
+        let q_group_by_equal = scalar_exprs(&mut q_arena, vec![col_ref(&q_a), col_ref(&q_b)]);
         let plan = plan_rollup(
-            &[col_ref(&q_a), col_ref(&q_b)],
+            &q_group_by_equal,
             &q_aggs,
+            &q_arena,
             &q_names_eq,
             &mv_agg,
             &mv_outputs,
+            &mv_arena,
             &mv_names,
         )
         .expect("equal group-by avg must map directly");
@@ -405,23 +467,34 @@ mod tests {
         let mv_a = col(1, "a");
         let mv_c = col(12, "c");
         let mv_names = names(&[(1, "a")]);
+        let mut mv_arena = ScalarArena::new();
 
         let mv_agg = SpjgAggregate {
-            group_by: vec![col_ref(&mv_a)],
+            group_by: scalar_exprs(&mut mv_arena, vec![col_ref(&mv_a)]),
         };
         let mv_outputs = vec![
-            dim_out(&col(101, "a"), col_ref(&mv_a)),
-            agg_out(&mv_c, agg("count", vec![], false)),
+            dim_out(&col(101, "a"), col_ref(&mv_a), &mut mv_arena),
+            agg_out(&mv_c, agg("count", vec![], false), &mut mv_arena),
         ];
 
         // query: SELECT count(*) with NO group-by (scalar). Group-by {} is a
         // subset of {a}, so this is a Rollup, and SUM over an empty MV result
         // is NULL where COUNT must be 0 -> needs_coalesce.
         let q_names = names(&[]);
-        let q_aggs = vec![agg("count", vec![], false)];
+        let mut q_arena = ScalarArena::new();
+        let q_aggs = scalar_aggs(&mut q_arena, vec![agg("count", vec![], false)]);
 
-        let plan = plan_rollup(&[], &q_aggs, &q_names, &mv_agg, &mv_outputs, &mv_names)
-            .expect("scalar count rollup must be rewritable");
+        let plan = plan_rollup(
+            &[],
+            &q_aggs,
+            &q_arena,
+            &q_names,
+            &mv_agg,
+            &mv_outputs,
+            &mv_arena,
+            &mv_names,
+        )
+        .expect("scalar count rollup must be rewritable");
         assert!(matches!(plan.kind, RollupKind::Rollup));
         assert_eq!(plan.items.len(), 1);
         assert_eq!(plan.items[0].rollup_fn, "sum");
