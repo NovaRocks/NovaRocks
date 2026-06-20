@@ -19,6 +19,7 @@ pub(crate) mod rule;
 pub(crate) mod runtime_filter_pass;
 pub(crate) mod scalar;
 pub(crate) mod scalar_bridge;
+pub(crate) mod scalar_expr;
 pub(crate) mod search;
 pub(crate) mod statistics;
 pub(crate) mod stats;
