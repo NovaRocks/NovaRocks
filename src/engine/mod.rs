@@ -3650,7 +3650,7 @@ pub(crate) fn execute_query_with_catalog_provider(
 /// `mv_refresh_ctx = Some(ctx)` runs the IMV rewrite pipeline on the
 /// logical plan before optimization. Callers that do not need IMV rewriting
 /// pass `None` (dormant until Task 9 flips the PF refresh caller).
-pub(crate) type ImvRewriteValidator<'a> = dyn Fn(&crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteOutcome) -> Result<(), String>
+pub(crate) type ImvRewriteValidator<'a> = dyn Fn(&crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteOutcome) -> Result<(), String>
     + 'a;
 
 pub(crate) fn execute_query_with_options(
@@ -3729,8 +3729,8 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
     let mut logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
     if let Some(mv_ctx) = mv_refresh_ctx {
         logical = crate::engine::mv::iceberg_refresh::normalize_imv_rewrite_root_project(logical);
-        let outcome = crate::sql::optimizer::rewrite::imv::entrypoint::run_imv_rewrite(
-            crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteInput {
+        let outcome = crate::sql::planner::imv_rewrite::entrypoint::run_imv_rewrite(
+            crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteInput {
                 plan: logical,
                 disabled_rules: crate::sql::optimizer::options::current_session_optimizer_settings(
                 )
@@ -6315,7 +6315,7 @@ enable_path_style_access = true
         let connectors = crate::connector::ConnectorRegistry::default();
         let mv_ctx = dummy_mv_refresh_context_for_validator_test();
         let validator =
-            |_outcome: &crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteOutcome| {
+            |_outcome: &crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteOutcome| {
                 Err("sentinel IMV validator error".to_string())
             };
 

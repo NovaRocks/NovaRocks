@@ -10,8 +10,8 @@ use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{JoinKind, OutputColumn, WindowFrame};
 use crate::sql::catalog::{BranchScope, TableDef};
 use crate::sql::column_id::ColumnId;
-use crate::sql::optimizer::rewrite::imv::marker::ImvVersionRef;
 use crate::sql::optimizer::scalar::{ColumnDisplay, ScalarId, SortKey};
+use crate::sql::planner::imv_rewrite::marker::ImvVersionRef;
 use crate::sql::planner::plan::{ApplyKind, DecodeMapping};
 
 pub(crate) use crate::sql::planner::plan::{ScanDictionaryColumn, ScanVariantColumn};

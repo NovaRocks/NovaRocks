@@ -9717,7 +9717,7 @@ pub(crate) fn normalize_imv_rewrite_root_project(
 fn run_imv_rewrite_for_refresh_explain(
     state: &Arc<StandaloneState>,
     ctx: &IcebergMvRefreshContext,
-) -> Result<crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteOutcome, String> {
+) -> Result<crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteOutcome, String> {
     let (plan, next_column_id) =
         plan_canonical_select_for_imv(state, ctx).map_err(|e| e.message)?;
     // Thread the active session's disable_optimizer_rules into IMV. When
@@ -9726,8 +9726,8 @@ fn run_imv_rewrite_for_refresh_explain(
     let disabled_rules = crate::sql::optimizer::options::current_session_optimizer_settings()
         .disabled_rules
         .clone();
-    crate::sql::optimizer::rewrite::imv::entrypoint::run_imv_rewrite(
-        crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteInput {
+    crate::sql::planner::imv_rewrite::entrypoint::run_imv_rewrite(
+        crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteInput {
             plan,
             mv_ctx: Arc::clone(&ctx.rewrite),
             disabled_rules,
@@ -9740,7 +9740,7 @@ fn run_imv_rewrite_for_refresh_explain(
 
 fn validate_aggregate_refresh_rewrite_outcome(
     ctx: &crate::engine::mv::refresh_context::IcebergMvRewriteContext,
-    outcome: &crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteOutcome,
+    outcome: &crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteOutcome,
     evidence: RewriteMergeRefreshEvidence,
 ) -> Result<(), String> {
     if evidence == RewriteMergeRefreshEvidence::JoinAggregate
@@ -9792,7 +9792,7 @@ fn validate_aggregate_refresh_rewrite_outcome(
 }
 
 fn rewrite_outcome_rule_changed(
-    outcome: &crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteOutcome,
+    outcome: &crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteOutcome,
     rule_name: &str,
 ) -> bool {
     outcome.trace.events().iter().any(|event| {
@@ -9998,10 +9998,10 @@ mod partition_planning_tests {
 mod aggregate_refresh_rewrite_validation_tests {
     use super::*;
 
-    use crate::sql::optimizer::rewrite::imv::annotation::ImvPlanAnnotation;
-    use crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteOutcome;
     use crate::sql::optimizer::rewrite::phase::RewritePhase;
     use crate::sql::optimizer::rewrite::trace::RewriteTrace;
+    use crate::sql::planner::imv_rewrite::annotation::ImvPlanAnnotation;
+    use crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteOutcome;
     use crate::sql::planner::plan::{
         LogicalAggregateStateMergeNode, LogicalPlanNode, LogicalValuesNode, PlanNodeKind,
     };
@@ -11267,7 +11267,7 @@ fn incremental_refresh_iceberg_mv_with_changes(
         let imv_rewrite_validator: Option<&crate::engine::ImvRewriteValidator<'_>> =
             if rewrite_evidence != RewriteMergeRefreshEvidence::None {
                 aggregate_rewrite_validator =
-                    |outcome: &crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteOutcome| {
+                    |outcome: &crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteOutcome| {
                         validate_aggregate_refresh_rewrite_outcome(
                             &ctx.rewrite,
                             outcome,

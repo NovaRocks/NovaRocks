@@ -9,14 +9,12 @@ use crate::engine::mv::refresh_context::IcebergMvRewriteContext;
 use crate::sql::catalog::{IcebergTableInfo, ScanSource};
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
-use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
-use crate::sql::optimizer::rewrite::imv::annotation::ImvExtension;
-use crate::sql::optimizer::rewrite::imv::{
-    PlanRewriteResult, bridge_apply_result, opt_expr_to_plan,
-};
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
+use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
+use crate::sql::planner::imv_rewrite::annotation::ImvExtension;
+use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
 use crate::sql::planner::plan::{LogicalPlanNode, LogicalScanNode, PlanNodeKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -232,16 +230,16 @@ mod tests {
     use crate::sql::catalog::{ColumnDef, IcebergSchemaDef, IcebergTableInfo, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
-    use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
+    use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
     use std::cell::RefCell;
     use std::rc::Rc;
 
     use crate::sql::optimizer::convert::logical_plan_to_opt_expr;
-    use crate::sql::optimizer::rewrite::imv::action_propagation::InjectActionColumnRule;
-    use crate::sql::optimizer::rewrite::imv::annotation::{ImvExtension, ImvPlanAnnotation};
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
     use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::planner::imv_rewrite::action_propagation::InjectActionColumnRule;
+    use crate::sql::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
     use std::sync::Arc;
     use std::sync::atomic::AtomicU32;
 

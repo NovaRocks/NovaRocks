@@ -5,7 +5,7 @@ use arrow::datatypes::DataType;
 use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn, ProjectItem};
 use crate::sql::catalog::ScanSource;
 use crate::sql::column_id::ColumnId;
-use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
+use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
 use crate::sql::planner::plan::{LogicalPlanNode, PlanNodeKind};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

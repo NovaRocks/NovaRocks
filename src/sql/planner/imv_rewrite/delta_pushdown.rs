@@ -11,10 +11,10 @@
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
-use crate::sql::optimizer::rewrite::imv::{PlanRewriteResult, bridge_apply_result};
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
+use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result};
 use crate::sql::planner::plan::{LogicalImvDeltaNode, LogicalPlanNode, PlanNodeKind};
 
 pub(crate) struct PushDeltaThroughUnaryRule;

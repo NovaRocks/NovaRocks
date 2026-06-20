@@ -13,18 +13,16 @@ use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, ProjectItem, Ty
 use crate::sql::catalog::ScanSource;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
-use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
-use crate::sql::optimizer::rewrite::imv::annotation::ImvExtension;
-use crate::sql::optimizer::rewrite::imv::join_delta_shape::{
-    is_supported_join_delta_branch, is_supported_join_delta_union,
-};
-use crate::sql::optimizer::rewrite::imv::row_id_column::ImvRowIdColumn;
-use crate::sql::optimizer::rewrite::imv::{
-    PlanRewriteResult, bridge_apply_result, opt_expr_to_plan,
-};
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
+use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
+use crate::sql::planner::imv_rewrite::annotation::ImvExtension;
+use crate::sql::planner::imv_rewrite::join_delta_shape::{
+    is_supported_join_delta_branch, is_supported_join_delta_union,
+};
+use crate::sql::planner::imv_rewrite::row_id_column::ImvRowIdColumn;
+use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
 use crate::sql::planner::plan::{LogicalAggregateNode, LogicalPlanNode, PlanNodeKind};
 
 // ---------------------------------------------------------------------------
@@ -600,8 +598,8 @@ mod tests {
 
     use crate::sql::optimizer::convert::{logical_plan_to_opt_expr, opt_expr_to_logical_plan};
     use crate::sql::optimizer::rewrite::context::RewriteContext;
-    use crate::sql::optimizer::rewrite::imv::annotation::{ImvExtension, ImvPlanAnnotation};
     use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
     use crate::sql::planner::plan::{
         AggregateCall, LogicalAggregateNode, LogicalAggregateStateMergeNode, LogicalFilterNode,
         LogicalJoinNode, LogicalPlanNode, LogicalScanNode, LogicalUnionNode, PlanNodeKind,
@@ -1723,7 +1721,7 @@ mod tests {
 
     #[test]
     fn propagate_carries_all_internal_columns_through_project() {
-        use crate::sql::optimizer::rewrite::imv::row_id_column::ImvRowIdColumn;
+        use crate::sql::planner::imv_rewrite::row_id_column::ImvRowIdColumn;
 
         let rule = PropagateActionColumnRule;
         let mut ctx = build_ctx();

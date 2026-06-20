@@ -15,17 +15,17 @@ use crate::sql::catalog::ScanSource;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
-use crate::sql::optimizer::rewrite::imv::action_propagation::{
-    first_delta_base_fqn, is_supported_branch_union, is_supported_fan_in_delta_union,
-};
-use crate::sql::optimizer::rewrite::imv::join_delta_shape::{
-    is_supported_join_delta_branch, is_supported_join_delta_union,
-};
-use crate::sql::optimizer::rewrite::imv::opt_expr_to_plan;
-use crate::sql::optimizer::rewrite::imv::row_id_column::ImvRowIdColumn;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::{RewriteDiagnostic, RewriteResult};
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
+use crate::sql::planner::imv_rewrite::action_propagation::{
+    first_delta_base_fqn, is_supported_branch_union, is_supported_fan_in_delta_union,
+};
+use crate::sql::planner::imv_rewrite::join_delta_shape::{
+    is_supported_join_delta_branch, is_supported_join_delta_union,
+};
+use crate::sql::planner::imv_rewrite::opt_expr_to_plan;
+use crate::sql::planner::imv_rewrite::row_id_column::ImvRowIdColumn;
 use crate::sql::planner::plan::{
     LogicalAggregateNode, LogicalPlanNode, LogicalScanNode, PlanNodeKind,
 };

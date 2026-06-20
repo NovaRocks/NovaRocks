@@ -8,10 +8,10 @@ use std::time::Instant;
 use crate::engine::mv::refresh_context::IcebergMvRewriteContext;
 use crate::sql::optimizer::convert::{opt_expr_to_logical_plan, try_logical_plan_to_opt_expr};
 use crate::sql::optimizer::rewrite::context::RewriteContext;
-use crate::sql::optimizer::rewrite::imv::annotation::{ImvExtension, ImvPlanAnnotation};
-use crate::sql::optimizer::rewrite::imv::pipeline::build_imv_pipeline;
 use crate::sql::optimizer::rewrite::trace::RewriteTrace;
 use crate::sql::optimizer::scalar::ScalarArena;
+use crate::sql::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
+use crate::sql::planner::imv_rewrite::pipeline::build_imv_pipeline;
 use crate::sql::planner::plan::LogicalPlanNode;
 
 pub(crate) struct ImvRewriteInput {
@@ -104,14 +104,14 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
-    use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
-    use crate::sql::optimizer::rewrite::imv::annotation::ImvPartitionAnnotation;
-    use crate::sql::optimizer::rewrite::imv::marker::{ImvVersionRef, plan_contains_imv_marker};
     use crate::sql::optimizer::rewrite::phase::RewritePhase;
     use crate::sql::optimizer::rewrite::registry::query_rewrite_pipeline;
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
     use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
+    use crate::sql::planner::imv_rewrite::annotation::ImvPartitionAnnotation;
+    use crate::sql::planner::imv_rewrite::marker::{ImvVersionRef, plan_contains_imv_marker};
     use crate::sql::planner::plan::*;
     use crate::sql::planner::plan::{
         AggregateCall, LogicalAggregateNode, LogicalFilterNode, LogicalJoinNode, LogicalPlanNode,

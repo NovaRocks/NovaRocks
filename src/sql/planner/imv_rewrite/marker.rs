@@ -10,28 +10,28 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::sql::optimizer::operator::{ImvDeltaOp, Operator};
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
-use crate::sql::optimizer::rewrite::imv::opt_expr_to_plan;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
+use crate::sql::planner::imv_rewrite::opt_expr_to_plan;
 use crate::sql::planner::plan::{LogicalPlanNode, PlanNodeKind};
 
 /// Snapshot window descriptor used by `LogicalImvVersionNode`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ImvVersionRef {
-    pub(crate) role: crate::sql::optimizer::rewrite::imv::scan_binding::ImvVersionRole,
+    pub(crate) role: crate::sql::planner::imv_rewrite::scan_binding::ImvVersionRole,
 }
 
 impl ImvVersionRef {
     pub(crate) fn from_snapshot() -> Self {
         Self {
-            role: crate::sql::optimizer::rewrite::imv::scan_binding::ImvVersionRole::From,
+            role: crate::sql::planner::imv_rewrite::scan_binding::ImvVersionRole::From,
         }
     }
 
     pub(crate) fn to_snapshot() -> Self {
         Self {
-            role: crate::sql::optimizer::rewrite::imv::scan_binding::ImvVersionRole::To,
+            role: crate::sql::planner::imv_rewrite::scan_binding::ImvVersionRole::To,
         }
     }
 }

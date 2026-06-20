@@ -12,13 +12,11 @@ use crate::sql::catalog::ScanSource;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
-use crate::sql::optimizer::rewrite::imv::annotation::ImvExtension;
-use crate::sql::optimizer::rewrite::imv::{
-    PlanRewriteResult, bridge_apply_result, opt_expr_to_plan,
-};
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
+use crate::sql::planner::imv_rewrite::annotation::ImvExtension;
+use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
 use crate::sql::planner::plan::{LogicalPlanNode, PlanNodeKind};
 
 pub(crate) struct ImvRowIdColumn;
@@ -116,10 +114,10 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::convert::logical_plan_to_opt_expr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
-    use crate::sql::optimizer::rewrite::imv::annotation::{ImvExtension, ImvPlanAnnotation};
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
     use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
     use crate::sql::planner::plan::{LogicalPlanNode, LogicalScanNode, PlanNodeKind};
 
     fn build_ctx() -> RewriteContext {

@@ -12,17 +12,15 @@ use crate::sql::codegen::helpers::typed_expr_display_name;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
-use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
-use crate::sql::optimizer::rewrite::imv::annotation::ImvExtension;
-use crate::sql::optimizer::rewrite::imv::join_delta::plan_output_columns;
-use crate::sql::optimizer::rewrite::imv::marker::plan_contains_imv_marker;
-use crate::sql::optimizer::rewrite::imv::target_state::build_target_state_scan_source;
-use crate::sql::optimizer::rewrite::imv::{
-    PlanRewriteResult, bridge_apply_result, opt_expr_to_plan,
-};
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
+use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
+use crate::sql::planner::imv_rewrite::annotation::ImvExtension;
+use crate::sql::planner::imv_rewrite::join_delta::plan_output_columns;
+use crate::sql::planner::imv_rewrite::marker::plan_contains_imv_marker;
+use crate::sql::planner::imv_rewrite::target_state::build_target_state_scan_source;
+use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
 use crate::sql::planner::plan::{
     AggregateCall, LogicalAggregateNode, LogicalAggregateStateMergeNode, LogicalFilterNode,
     LogicalImvDeltaNode, LogicalPlanNode, LogicalProjectNode, LogicalScanNode, PlanNodeKind,
@@ -1245,9 +1243,9 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::convert::{logical_plan_to_opt_expr, opt_expr_to_logical_plan};
     use crate::sql::optimizer::rewrite::context::RewriteContext;
-    use crate::sql::optimizer::rewrite::imv::annotation::{ImvExtension, ImvPlanAnnotation};
-    use crate::sql::optimizer::rewrite::imv::marker::ImvVersionRef;
     use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
+    use crate::sql::planner::imv_rewrite::marker::ImvVersionRef;
     use crate::sql::planner::plan::{
         AggregateCall, LogicalAggregateNode, LogicalAggregateStateMergeNode, LogicalImvDeltaNode,
         LogicalScanNode, LogicalUnionNode, PlanNodeKind,

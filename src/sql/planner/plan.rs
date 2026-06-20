@@ -459,7 +459,7 @@ pub(crate) struct LogicalImvDeltaNode {
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct LogicalImvVersionNode {
-    pub version_ref: crate::sql::optimizer::rewrite::imv::marker::ImvVersionRef,
+    pub version_ref: crate::sql::planner::imv_rewrite::marker::ImvVersionRef,
 }
 
 /// Per-column mapping from the dictionary-encoded slot back to the original

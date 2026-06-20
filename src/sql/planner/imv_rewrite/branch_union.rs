@@ -5,15 +5,13 @@ use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, ProjectItem, Ty
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
-use crate::sql::optimizer::rewrite::imv::annotation::ImvExtension;
-use crate::sql::optimizer::rewrite::imv::join_delta::plan_output_columns;
-use crate::sql::optimizer::rewrite::imv::marker::plan_contains_imv_marker;
-use crate::sql::optimizer::rewrite::imv::{
-    PlanRewriteResult, bridge_apply_result, opt_expr_to_plan,
-};
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
+use crate::sql::planner::imv_rewrite::annotation::ImvExtension;
+use crate::sql::planner::imv_rewrite::join_delta::plan_output_columns;
+use crate::sql::planner::imv_rewrite::marker::plan_contains_imv_marker;
+use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
 use crate::sql::planner::plan::{
     LogicalAggregateNode, LogicalImvDeltaNode, LogicalPlanNode, LogicalProjectNode,
     LogicalUnionNode, PlanNodeKind,
@@ -356,10 +354,10 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::convert::logical_plan_to_opt_expr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
-    use crate::sql::optimizer::rewrite::imv::annotation::{ImvExtension, ImvPlanAnnotation};
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
     use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
     use crate::sql::planner::plan::{
         AggregateCall, LogicalAggregateNode, LogicalFilterNode, LogicalJoinNode, LogicalPlanNode,
         LogicalProjectNode, LogicalScanNode, LogicalUnionNode, PlanNodeKind,
@@ -565,8 +563,8 @@ mod tests {
 
     #[test]
     fn pipeline_branch_union_of_aggregates_final_shape_is_stable() {
-        use crate::sql::optimizer::rewrite::imv::marker::plan_contains_imv_marker;
-        use crate::sql::optimizer::rewrite::imv::pipeline::build_imv_pipeline;
+        use crate::sql::planner::imv_rewrite::marker::plan_contains_imv_marker;
+        use crate::sql::planner::imv_rewrite::pipeline::build_imv_pipeline;
 
         let mut ctx = build_ctx();
         // build_ctx() registers ice.db.b as the only known base table; both
@@ -980,8 +978,8 @@ mod tests {
 
     #[test]
     fn pipeline_aggregate_over_filtered_join_composes() {
-        use crate::sql::optimizer::rewrite::imv::marker::plan_contains_imv_marker;
-        use crate::sql::optimizer::rewrite::imv::pipeline::build_imv_pipeline;
+        use crate::sql::planner::imv_rewrite::marker::plan_contains_imv_marker;
+        use crate::sql::planner::imv_rewrite::pipeline::build_imv_pipeline;
 
         let mut ctx = build_ctx();
         let join = join_of(scan("b", 1), scan("b", 10));
@@ -1006,8 +1004,8 @@ mod tests {
 
     #[test]
     fn pipeline_aggregate_over_nested_join_composes() {
-        use crate::sql::optimizer::rewrite::imv::marker::plan_contains_imv_marker;
-        use crate::sql::optimizer::rewrite::imv::pipeline::build_imv_pipeline;
+        use crate::sql::planner::imv_rewrite::marker::plan_contains_imv_marker;
+        use crate::sql::planner::imv_rewrite::pipeline::build_imv_pipeline;
 
         let mut ctx = build_ctx();
         let inner = join_of(scan("b", 1), scan("b", 10));
@@ -1032,8 +1030,8 @@ mod tests {
 
     #[test]
     fn pipeline_branch_union_of_project_over_aggregate_composes() {
-        use crate::sql::optimizer::rewrite::imv::marker::plan_contains_imv_marker;
-        use crate::sql::optimizer::rewrite::imv::pipeline::build_imv_pipeline;
+        use crate::sql::planner::imv_rewrite::marker::plan_contains_imv_marker;
+        use crate::sql::planner::imv_rewrite::pipeline::build_imv_pipeline;
 
         let mut ctx = build_ctx();
         // project_over_aggregate outputs: region (id=1) and total (id=30).
@@ -1097,8 +1095,8 @@ mod tests {
 
     #[test]
     fn pipeline_branch_union_of_aggregate_over_join_composes() {
-        use crate::sql::optimizer::rewrite::imv::marker::plan_contains_imv_marker;
-        use crate::sql::optimizer::rewrite::imv::pipeline::build_imv_pipeline;
+        use crate::sql::planner::imv_rewrite::marker::plan_contains_imv_marker;
+        use crate::sql::planner::imv_rewrite::pipeline::build_imv_pipeline;
 
         let mut ctx = build_ctx();
         let plan = LogicalPlanNode::new(

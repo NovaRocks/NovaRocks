@@ -10,12 +10,12 @@ use crate::engine::mv::partition::resolve_partition_derivation_spec;
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
-use crate::sql::optimizer::rewrite::imv::annotation::{
-    ImvExtension, ImvPartitionAnnotation, ImvPlanAnnotation,
-};
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
+use crate::sql::planner::imv_rewrite::annotation::{
+    ImvExtension, ImvPartitionAnnotation, ImvPlanAnnotation,
+};
 
 pub(crate) struct DerivePartitionSpecRule;
 

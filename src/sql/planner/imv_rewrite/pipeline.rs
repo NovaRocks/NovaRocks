@@ -5,27 +5,25 @@
 //! apply key, partition derivation, marker cleanup, validation. Each stage's
 //! name is part of the trace contract and is asserted in pipeline tests.
 
-use crate::sql::optimizer::rewrite::imv::action_column::ActionColumnValidationRule;
-use crate::sql::optimizer::rewrite::imv::action_propagation::{
-    InjectActionColumnRule, PropagateActionColumnRule,
-};
-use crate::sql::optimizer::rewrite::imv::aggregate_rewrite::RewriteAggregateStateRule;
-use crate::sql::optimizer::rewrite::imv::apply_key::InjectApplyKeyProjectRule;
-use crate::sql::optimizer::rewrite::imv::branch_union::RewriteBranchUnionRule;
-use crate::sql::optimizer::rewrite::imv::delta_pushdown::PushDeltaThroughUnaryRule;
-use crate::sql::optimizer::rewrite::imv::join_delta::RewriteJoinDeltaRule;
-use crate::sql::optimizer::rewrite::imv::marker::{
-    UnresolvedMarkerCheckRule, WrapRootInImvDeltaRule,
-};
-use crate::sql::optimizer::rewrite::imv::partition_derivation::DerivePartitionSpecRule;
-use crate::sql::optimizer::rewrite::imv::row_id_column::InjectRowIdRule;
-use crate::sql::optimizer::rewrite::imv::scan_binding::BindIcebergScanRule;
-use crate::sql::optimizer::rewrite::imv::union_delta::{
-    RewriteTopLevelUnionDeltaRule, RewriteUnionAggregateDeltaRule,
-};
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::pipeline::{RewritePipeline, RewriteStage};
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
+use crate::sql::planner::imv_rewrite::action_column::ActionColumnValidationRule;
+use crate::sql::planner::imv_rewrite::action_propagation::{
+    InjectActionColumnRule, PropagateActionColumnRule,
+};
+use crate::sql::planner::imv_rewrite::aggregate_rewrite::RewriteAggregateStateRule;
+use crate::sql::planner::imv_rewrite::apply_key::InjectApplyKeyProjectRule;
+use crate::sql::planner::imv_rewrite::branch_union::RewriteBranchUnionRule;
+use crate::sql::planner::imv_rewrite::delta_pushdown::PushDeltaThroughUnaryRule;
+use crate::sql::planner::imv_rewrite::join_delta::RewriteJoinDeltaRule;
+use crate::sql::planner::imv_rewrite::marker::{UnresolvedMarkerCheckRule, WrapRootInImvDeltaRule};
+use crate::sql::planner::imv_rewrite::partition_derivation::DerivePartitionSpecRule;
+use crate::sql::planner::imv_rewrite::row_id_column::InjectRowIdRule;
+use crate::sql::planner::imv_rewrite::scan_binding::BindIcebergScanRule;
+use crate::sql::planner::imv_rewrite::union_delta::{
+    RewriteTopLevelUnionDeltaRule, RewriteUnionAggregateDeltaRule,
+};
 
 pub(crate) fn build_imv_pipeline() -> RewritePipeline {
     RewritePipeline::from_stages(vec![

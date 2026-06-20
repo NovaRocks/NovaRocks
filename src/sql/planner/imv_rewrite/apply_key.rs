@@ -14,17 +14,15 @@ use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
-use crate::sql::optimizer::rewrite::imv::action_propagation::{
-    descendant_internal_columns, is_supported_fan_in_delta_union,
-};
-use crate::sql::optimizer::rewrite::imv::annotation::ImvExtension;
-use crate::sql::optimizer::rewrite::imv::row_id_column::ImvRowIdColumn;
-use crate::sql::optimizer::rewrite::imv::{
-    PlanRewriteResult, bridge_apply_result, opt_expr_to_plan,
-};
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
+use crate::sql::planner::imv_rewrite::action_propagation::{
+    descendant_internal_columns, is_supported_fan_in_delta_union,
+};
+use crate::sql::planner::imv_rewrite::annotation::ImvExtension;
+use crate::sql::planner::imv_rewrite::row_id_column::ImvRowIdColumn;
+use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
 use crate::sql::planner::plan::{LogicalPlanNode, LogicalProjectNode, PlanNodeKind};
 
 pub(crate) struct InjectApplyKeyProjectRule {
@@ -236,9 +234,9 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::convert::{logical_plan_to_opt_expr, opt_expr_to_logical_plan};
     use crate::sql::optimizer::rewrite::context::RewriteContext;
-    use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
-    use crate::sql::optimizer::rewrite::imv::annotation::{ImvExtension, ImvPlanAnnotation};
-    use crate::sql::optimizer::rewrite::imv::row_id_column::ImvRowIdColumn;
+    use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
+    use crate::sql::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
+    use crate::sql::planner::imv_rewrite::row_id_column::ImvRowIdColumn;
     use std::cell::RefCell;
     use std::rc::Rc;
 
