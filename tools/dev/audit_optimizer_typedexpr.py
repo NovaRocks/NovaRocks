@@ -5,11 +5,13 @@ import re
 import sys
 
 DEFAULT_ALLOW = {
-    "src/sql/optimizer/scalar.rs",
+    # Scalar intern table and explicit materialization bridge.
     "src/sql/optimizer/scalar/mod.rs",
     "src/sql/optimizer/scalar_bridge.rs",
     "src/sql/optimizer/convert.rs",
-    "src/sql/optimizer/rewrite/rules/subquery/bridge.rs",
+    # Property derivation still accepts planner/analyzer sort metadata at
+    # optimizer boundaries.
+    "src/sql/optimizer/property.rs",
 }
 
 PATTERN = re.compile(r"\b(TypedExpr|LogicalPlanNode|ProjectItem|SortItem|materialize)\b")

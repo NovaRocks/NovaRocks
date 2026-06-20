@@ -1,10 +1,10 @@
 -- query 10
 sum(a.l_ext)
-2000
+800
 
 -- query 11
 sum(a.l_ext)
-2000
+800
 
 -- query 12
 sum(l_ext)

@@ -26,4 +26,4 @@ PLAN FRAGMENT 1
      TABLE: db_sqlt_53693317611542f0.residual_rng_l
      columns: k, score, payload
      min-max stats
-     predicates: l.score BETWEEN 10 AND 20 OR l.score BETWEEN 30 AND 40 AND l.score BETWEEN 10 AND 40 AND l.k IS NOT NULL AND l.score IS NOT NULL
+     predicates: l.score BETWEEN 10 AND 40 AND l.score BETWEEN 10 AND 20 OR l.score BETWEEN 30 AND 40 AND l.k IS NOT NULL AND l.score IS NOT NULL

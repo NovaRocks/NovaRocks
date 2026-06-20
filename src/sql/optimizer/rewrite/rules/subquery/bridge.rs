@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Local bridges between `OptExpr` and `LogicalPlanNode` for subquery rules.
 //!
 //! The subquery rewrite rules were originally written against `LogicalPlanNode`.
