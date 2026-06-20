@@ -23,10 +23,10 @@ use crate::sql::optimizer::operator::{
 use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
 use crate::sql::optimizer::property::{DistributionSpec, OrderingSpec, PhysicalPropertySet};
 use crate::sql::optimizer::scalar::ScalarArena;
+use crate::sql::optimizer::statistics::Statistics;
 use crate::sql::planner::optimizer_bridge::property::{
     ordering_spec_from_sort_items, window_ordering_spec,
 };
-use crate::sql::optimizer::statistics::Statistics;
 use crate::sql::planner::plan::{
     DistributedExchangeNode, DistributedHashAggregateNode, DistributedHashJoinEqCondition,
     DistributedHashJoinNode, DistributedNestLoopJoinNode, DistributedSetOpNode,

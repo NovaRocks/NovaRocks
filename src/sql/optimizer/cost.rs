@@ -10,6 +10,7 @@ use super::operator::{
 };
 use super::property::{DistributionSpec, PhysicalPropertySet};
 use super::scalar::{ScalarArena, ScalarId, ScalarNode};
+use crate::sql::common::JoinKind;
 use crate::sql::optimizer::derive::PropertyAlternativeKind;
 use crate::sql::optimizer::statistics::{CostEstimate, Statistics};
 
@@ -115,7 +116,7 @@ pub(crate) fn compute_cost(
             };
 
             // Apply cross join penalty (StarRocks: getCrossJoinCostPenalty = 10).
-            let cost_after_cross = if j.join_type == crate::sql::common::JoinKind::Cross {
+            let cost_after_cross = if j.join_type == JoinKind::Cross {
                 base_cost * CROSS_JOIN_COST_PENALTY
             } else {
                 base_cost
@@ -538,7 +539,7 @@ fn estimate_hash_join_cost(input: &CostInput<'_>, join: &PhysicalHashJoinOp) -> 
         0.0
     };
 
-    if join.join_type == crate::sql::analysis::JoinKind::Cross {
+    if join.join_type == JoinKind::Cross {
         cpu_cost = finite_non_negative_cost(cpu_cost * CROSS_JOIN_COST_PENALTY);
         memory_cost = finite_non_negative_cost(memory_cost * CROSS_JOIN_COST_PENALTY);
     }
@@ -793,7 +794,7 @@ fn compute_legacy_cost_with_properties(
                 PropertyAlternativeKind::Default => compute_cost(op, own_stats, child_stats),
             };
 
-            let cost_after_cross = if j.join_type == crate::sql::common::JoinKind::Cross {
+            let cost_after_cross = if j.join_type == JoinKind::Cross {
                 base_cost * CROSS_JOIN_COST_PENALTY
             } else {
                 base_cost
