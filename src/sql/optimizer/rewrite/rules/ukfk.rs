@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use arrow::datatypes::DataType;
 
-use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, TypedExpr};
+use crate::sql::analysis::{BinOp, JoinKind};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::{
     FilterOp, LogicalJoinOp, Operator, ProjectOp, ScalarAggregateSpec, ScalarProjectItem, ScanOp,
@@ -15,10 +15,9 @@ use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::optimizer::rewrite::rules::utils::{
-    collect_column_id_refs_strict, collect_output_ids_opt, combine_and,
-};
-use crate::sql::optimizer::scalar::{self, ScalarArena, ScalarId};
+use crate::sql::optimizer::rewrite::rules::utils::collect_output_ids_opt;
+use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
+use crate::sql::optimizer::scalar_expr;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Side {
@@ -210,7 +209,7 @@ impl LogicalRewriteRule for EliminateUniqueAggregate {
         };
 
         let arena_rc = ctx.scalar_arena();
-        let group_columns = match group_by_columns(&aggregate.group_by, &arena_rc.borrow()) {
+        let group_columns = match group_by_columns(&aggregate.group_by, scan, &arena_rc.borrow()) {
             Some(cols) => cols,
             None => return Ok(RewriteResult::Unchanged),
         };
@@ -265,8 +264,7 @@ fn project_referenced_side(
     right_ids.remove(&ColumnId::UNSET);
     let mut side = None;
     for item in items {
-        let item_expr = scalar::materialize(arena, item.expr);
-        let ids = match collect_column_id_refs_strict(&item_expr) {
+        let ids = match scalar_expr::collect_column_ids_strict(arena, item.expr) {
             Some(ids) => ids,
             None => return Ok(None),
         };
@@ -297,13 +295,22 @@ fn join_equality_pairs(
     let Some(cond_id) = join.condition else {
         return Ok(vec![]);
     };
-    let condition = scalar::materialize(arena, cond_id);
     let mut left_ids = collect_output_ids_opt(left);
     let mut right_ids = collect_output_ids_opt(right);
     left_ids.remove(&ColumnId::UNSET);
     right_ids.remove(&ColumnId::UNSET);
+    let left_names = output_column_name_map(left);
+    let right_names = output_column_name_map(right);
     let mut pairs = Vec::new();
-    let ok = collect_join_equality_pairs(&condition, &left_ids, &right_ids, &mut pairs);
+    let ok = collect_join_equality_pairs(
+        arena,
+        cond_id,
+        &left_ids,
+        &right_ids,
+        &left_names,
+        &right_names,
+        &mut pairs,
+    );
     if ok.is_some() && !pairs.is_empty() {
         Ok(pairs)
     } else {
@@ -312,27 +319,48 @@ fn join_equality_pairs(
 }
 
 fn collect_join_equality_pairs(
-    expr: &TypedExpr,
+    arena: &ScalarArena,
+    expr: ScalarId,
     left_ids: &HashSet<ColumnId>,
     right_ids: &HashSet<ColumnId>,
+    left_names: &HashMap<ColumnId, String>,
+    right_names: &HashMap<ColumnId, String>,
     pairs: &mut Vec<(String, String)>,
 ) -> Option<()> {
-    match &expr.kind {
-        ExprKind::BinaryOp {
+    match arena.node(expr) {
+        ScalarNode::BinaryOp {
             left,
             op: BinOp::And,
             right,
         } => {
-            collect_join_equality_pairs(left, left_ids, right_ids, pairs)?;
-            collect_join_equality_pairs(right, left_ids, right_ids, pairs)
+            collect_join_equality_pairs(
+                arena,
+                *left,
+                left_ids,
+                right_ids,
+                left_names,
+                right_names,
+                pairs,
+            )?;
+            collect_join_equality_pairs(
+                arena,
+                *right,
+                left_ids,
+                right_ids,
+                left_names,
+                right_names,
+                pairs,
+            )
         }
-        ExprKind::BinaryOp {
+        ScalarNode::BinaryOp {
             left,
             op: BinOp::Eq,
             right,
         } => {
-            let left_ref = classify_column_ref(left, left_ids, right_ids)?;
-            let right_ref = classify_column_ref(right, left_ids, right_ids)?;
+            let left_ref =
+                classify_column_ref(arena, *left, left_ids, right_ids, left_names, right_names)?;
+            let right_ref =
+                classify_column_ref(arena, *right, left_ids, right_ids, left_names, right_names)?;
             match (left_ref, right_ref) {
                 ((Side::Left, left_col), (Side::Right, right_col)) => {
                     pairs.push((left_col, right_col));
@@ -373,39 +401,94 @@ fn referenced_side(
 }
 
 fn classify_column_ref(
-    expr: &TypedExpr,
+    arena: &ScalarArena,
+    expr: ScalarId,
     left_ids: &HashSet<ColumnId>,
     right_ids: &HashSet<ColumnId>,
+    left_names: &HashMap<ColumnId, String>,
+    right_names: &HashMap<ColumnId, String>,
 ) -> Option<(Side, String)> {
-    match &expr.kind {
-        ExprKind::ColumnRef {
-            column_id, column, ..
-        } => {
+    match arena.node(expr) {
+        ScalarNode::ColumnRef(column_id) => {
             if *column_id == ColumnId::UNSET {
                 return None;
             }
             match (left_ids.contains(column_id), right_ids.contains(column_id)) {
-                (true, false) => Some((Side::Left, normalize_identifier(column))),
-                (false, true) => Some((Side::Right, normalize_identifier(column))),
+                (true, false) => column_name_for_id(arena, *column_id, left_names)
+                    .map(|column| (Side::Left, column)),
+                (false, true) => column_name_for_id(arena, *column_id, right_names)
+                    .map(|column| (Side::Right, column)),
                 _ => None,
             }
         }
-        ExprKind::Cast { expr, .. } | ExprKind::Nested(expr) => {
-            classify_column_ref(expr, left_ids, right_ids)
+        ScalarNode::Cast { child, .. } | ScalarNode::Nested(child) => {
+            classify_column_ref(arena, *child, left_ids, right_ids, left_names, right_names)
         }
         _ => None,
     }
 }
 
-fn group_by_columns(group_by: &[ScalarId], arena: &ScalarArena) -> Option<Vec<String>> {
+fn output_column_name_map(expr: &OptExpr) -> HashMap<ColumnId, String> {
+    match &expr.op {
+        Operator::LogicalScan(scan) => scan
+            .columns
+            .iter()
+            .filter(|column| column.column_id != ColumnId::UNSET)
+            .map(|column| (column.column_id, normalize_identifier(&column.name)))
+            .collect(),
+        Operator::LogicalFilter(_) => output_column_name_map(expr.unary_input()),
+        Operator::LogicalProject(project) => project
+            .items
+            .iter()
+            .filter(|item| item.output_column_id != ColumnId::UNSET)
+            .map(|item| {
+                (
+                    item.output_column_id,
+                    normalize_identifier(&item.output_name),
+                )
+            })
+            .collect(),
+        Operator::LogicalAggregate(aggregate) => aggregate
+            .output_columns
+            .iter()
+            .filter(|column| column.column_id != ColumnId::UNSET)
+            .map(|column| (column.column_id, normalize_identifier(&column.name)))
+            .collect(),
+        Operator::LogicalWindow(window) => window
+            .output_columns
+            .iter()
+            .filter(|column| column.column_id != ColumnId::UNSET)
+            .map(|column| (column.column_id, normalize_identifier(&column.name)))
+            .collect(),
+        _ => HashMap::new(),
+    }
+}
+
+fn column_name_for_id(
+    arena: &ScalarArena,
+    column_id: ColumnId,
+    names: &HashMap<ColumnId, String>,
+) -> Option<String> {
+    names.get(&column_id).cloned().or_else(|| {
+        arena
+            .column_display(column_id)
+            .map(|d| normalize_identifier(&d.column))
+    })
+}
+
+fn group_by_columns(
+    group_by: &[ScalarId],
+    scan: &ScanOp,
+    arena: &ScalarArena,
+) -> Option<Vec<String>> {
     group_by
         .iter()
         .map(|id| {
-            let expr = scalar::materialize(arena, *id);
-            match &expr.kind {
-                ExprKind::ColumnRef { column, .. } => Some(normalize_identifier(column)),
-                _ => None,
-            }
+            let column_id = scalar_expr::column_id(arena, *id)?;
+            scan.columns
+                .iter()
+                .find(|column| column.column_id == column_id)
+                .map(|column| normalize_identifier(&column.name))
         })
         .collect()
 }
@@ -562,36 +645,44 @@ fn add_not_null_filter(
         .alias
         .clone()
         .unwrap_or_else(|| scan.table.name.clone());
-    let predicates = columns
-        .iter()
-        .filter_map(|column| {
-            scan.columns
-                .iter()
-                .find(|candidate| candidate.name.eq_ignore_ascii_case(column))
-                .filter(|output| output.column_id != ColumnId::UNSET)
-                .map(|output| TypedExpr {
-                    data_type: DataType::Boolean,
-                    nullable: false,
-                    kind: ExprKind::IsNull {
-                        expr: Box::new(TypedExpr {
-                            data_type: output.data_type.clone(),
-                            nullable: output.nullable,
-                            kind: ExprKind::ColumnRef {
-                                column_id: output.column_id,
-                                qualifier: Some(qualifier.clone()),
-                                column: output.name.clone(),
-                            },
-                        }),
-                        negated: true,
-                    },
-                })
-        })
-        .collect::<Vec<_>>();
+    let mut predicates = Vec::new();
+    for column in columns {
+        let Some(output) = scan
+            .columns
+            .iter()
+            .find(|candidate| candidate.name.eq_ignore_ascii_case(column))
+            .filter(|output| output.column_id != ColumnId::UNSET)
+        else {
+            continue;
+        };
+        arena.remember_source_column_display(
+            output.column_id,
+            Some(qualifier.clone()),
+            output.name.clone(),
+        );
+        let child = arena.intern(
+            ScalarNode::ColumnRef(output.column_id),
+            output.data_type.clone(),
+            output.nullable,
+        );
+        predicates.push(arena.intern(
+            ScalarNode::IsNull {
+                child,
+                negated: true,
+            },
+            DataType::Boolean,
+            false,
+        ));
+    }
     if predicates.is_empty() {
         return plan;
     }
-    let predicate = scalar::intern_typed(arena, &combine_and(predicates));
-    OptExpr::new(Operator::LogicalFilter(FilterOp { predicate }), vec![plan])
+    match scalar_expr::combine_conjuncts(arena, predicates) {
+        Some(predicate) => {
+            OptExpr::new(Operator::LogicalFilter(FilterOp { predicate }), vec![plan])
+        }
+        None => plan,
+    }
 }
 
 fn is_eliminable_count(aggregate: &ScalarAggregateSpec, arena: &ScalarArena) -> bool {
@@ -604,22 +695,17 @@ fn is_eliminable_count(aggregate: &ScalarAggregateSpec, arena: &ScalarArena) -> 
     if !aggregate.order_by.is_empty() {
         return false;
     }
-    aggregate.args.iter().all(|id| {
-        let expr = scalar::materialize(arena, *id);
-        matches!(
-            expr.kind,
-            ExprKind::Literal(LiteralValue::Int(_)) | ExprKind::Literal(LiteralValue::Null)
-        )
-    })
+    aggregate
+        .args
+        .iter()
+        .all(|id| scalar_expr::is_literal_count_arg(arena, *id))
 }
 
 fn rewrite_eliminated_aggregate_project_item(
     item: ScalarProjectItem,
     arena: &mut ScalarArena,
 ) -> Option<ScalarProjectItem> {
-    let item_expr = scalar::materialize(arena, item.expr);
-    let rewritten = rewrite_eliminated_aggregate_expr(item_expr)?;
-    let new_expr_id = scalar::intern_typed(arena, &rewritten);
+    let new_expr_id = rewrite_eliminated_aggregate_expr(arena, item.expr)?;
     Some(ScalarProjectItem {
         expr: new_expr_id,
         output_name: item.output_name,
@@ -628,76 +714,180 @@ fn rewrite_eliminated_aggregate_project_item(
     })
 }
 
-fn rewrite_eliminated_aggregate_expr(expr: TypedExpr) -> Option<TypedExpr> {
-    match expr.kind {
-        ExprKind::AggregateCall {
+fn rewrite_eliminated_aggregate_expr(arena: &mut ScalarArena, expr: ScalarId) -> Option<ScalarId> {
+    match arena.node(expr).clone() {
+        ScalarNode::AggregateCall {
             name,
             distinct,
             order_by,
             ..
         } if name.eq_ignore_ascii_case("count") && !distinct && order_by.is_empty() => {
-            Some(TypedExpr {
-                data_type: expr.data_type,
-                nullable: false,
-                kind: ExprKind::Literal(LiteralValue::Int(1)),
-            })
+            Some(scalar_expr::int_literal(arena, 1))
         }
-        _ if !contains_aggregate(&expr) => Some(expr),
+        _ if !scalar_expr::contains_aggregate(arena, expr) => Some(expr),
         _ => None,
     }
 }
 
-fn contains_aggregate(expr: &TypedExpr) -> bool {
-    match &expr.kind {
-        ExprKind::AggregateCall { .. } => true,
-        ExprKind::BinaryOp { left, right, .. } => {
-            contains_aggregate(left) || contains_aggregate(right)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::sql::analysis::{LiteralValue, OutputColumn};
+    use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
+    use crate::sql::optimizer::scalar::{HashableLiteral, ScalarNode};
+
+    fn output_col(id: u32, name: &str) -> OutputColumn {
+        OutputColumn {
+            column_id: ColumnId::new_for_test(id),
+            name: name.to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            is_internal: false,
         }
-        ExprKind::UnaryOp { expr, .. }
-        | ExprKind::Cast { expr, .. }
-        | ExprKind::IsNull { expr, .. }
-        | ExprKind::Nested(expr) => contains_aggregate(expr),
-        ExprKind::FunctionCall { args, .. } => args.iter().any(contains_aggregate),
-        ExprKind::LambdaFunction { body, .. } => contains_aggregate(body),
-        ExprKind::InList { expr, list, .. } => {
-            contains_aggregate(expr) || list.iter().any(contains_aggregate)
+    }
+
+    fn column_def(name: &str) -> ColumnDef {
+        ColumnDef {
+            name: name.to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
         }
-        ExprKind::Between {
-            expr, low, high, ..
-        } => contains_aggregate(expr) || contains_aggregate(low) || contains_aggregate(high),
-        ExprKind::Like { expr, pattern, .. } => {
-            contains_aggregate(expr) || contains_aggregate(pattern)
-        }
-        ExprKind::Case {
-            operand,
-            when_then,
-            else_expr,
-        } => {
-            operand
-                .as_ref()
-                .is_some_and(|expr| contains_aggregate(expr))
-                || when_then
-                    .iter()
-                    .any(|(when, then)| contains_aggregate(when) || contains_aggregate(then))
-                || else_expr
-                    .as_ref()
-                    .is_some_and(|expr| contains_aggregate(expr))
-        }
-        ExprKind::IsTruthValue { expr, .. } => contains_aggregate(expr),
-        ExprKind::WindowCall {
-            args,
-            partition_by,
-            order_by,
-            ..
-        } => {
-            args.iter().any(contains_aggregate)
-                || partition_by.iter().any(contains_aggregate)
-                || order_by.iter().any(|item| contains_aggregate(&item.expr))
-        }
-        ExprKind::Lambda { body, .. } => contains_aggregate(body),
-        ExprKind::ColumnRef { .. }
-        | ExprKind::LambdaParamRef { .. }
-        | ExprKind::Literal(_)
-        | ExprKind::SubqueryPlaceholder { .. } => false,
+    }
+
+    fn scan_expr(table_name: &str, cols: &[(u32, &str)]) -> OptExpr {
+        let columns = cols
+            .iter()
+            .map(|(_, name)| column_def(name))
+            .collect::<Vec<_>>();
+        let outputs = cols
+            .iter()
+            .map(|(id, name)| output_col(*id, name))
+            .collect::<Vec<_>>();
+        OptExpr::leaf(Operator::LogicalScan(ScanOp {
+            database: "default".to_string(),
+            table: TableDef {
+                name: table_name.to_string(),
+                columns,
+                iceberg_row_lineage_metadata_columns: vec![],
+                source: ScanSource::StarRocks {
+                    db_id: 0,
+                    table_id: 0,
+                },
+            },
+            alias: None,
+            columns: outputs,
+            predicates: vec![],
+            required_columns: None,
+            dict_columns: vec![],
+            variant_columns: vec![],
+            mv_rewritten_from: None,
+        }))
+    }
+
+    fn col(arena: &mut ScalarArena, id: u32) -> ScalarId {
+        arena.intern(
+            ScalarNode::ColumnRef(ColumnId::new_for_test(id)),
+            DataType::Int64,
+            false,
+        )
+    }
+
+    #[test]
+    fn project_referenced_side_rejects_cross_side_scalar_refs() {
+        let mut arena = ScalarArena::new();
+        let left = scan_expr("left_t", &[(1, "left_key")]);
+        let right = scan_expr("right_t", &[(2, "right_key")]);
+        let left_key = col(&mut arena, 1);
+        let right_key = col(&mut arena, 2);
+        let expr = arena.intern(
+            ScalarNode::BinaryOp {
+                op: BinOp::Add,
+                left: left_key,
+                right: right_key,
+            },
+            DataType::Int64,
+            false,
+        );
+        let items = vec![ScalarProjectItem {
+            expr,
+            output_name: "mixed".to_string(),
+            output_column_id: ColumnId::new_for_test(10),
+            expr_display: None,
+        }];
+
+        assert_eq!(
+            project_referenced_side(&items, &left, &right, &arena).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn join_equality_pairs_accepts_nested_or_cast_column_refs() {
+        let mut arena = ScalarArena::new();
+        let left = scan_expr("left_t", &[(1, "left_key")]);
+        let right = scan_expr("right_t", &[(2, "right_key")]);
+        let left_key = col(&mut arena, 1);
+        let right_key = col(&mut arena, 2);
+        let nested_left = arena.intern(ScalarNode::Nested(left_key), DataType::Int64, false);
+        let cast_right = arena.intern(
+            ScalarNode::Cast {
+                child: right_key,
+                target: DataType::Int64,
+            },
+            DataType::Int64,
+            false,
+        );
+        let condition = arena.intern(
+            ScalarNode::BinaryOp {
+                op: BinOp::Eq,
+                left: nested_left,
+                right: cast_right,
+            },
+            DataType::Boolean,
+            false,
+        );
+        let join = LogicalJoinOp {
+            join_type: JoinKind::Inner,
+            condition: Some(condition),
+        };
+
+        assert_eq!(
+            join_equality_pairs(&join, &left, &right, &arena).unwrap(),
+            vec![("left_key".to_string(), "right_key".to_string())]
+        );
+    }
+
+    #[test]
+    fn eliminable_count_accepts_literal_count_args_without_materializing() {
+        let mut arena = ScalarArena::new();
+        let one = arena.intern(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Int(1))),
+            DataType::Int64,
+            false,
+        );
+        let null = arena.intern(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Null)),
+            DataType::Null,
+            true,
+        );
+
+        let count_one = ScalarAggregateSpec {
+            name: "count".to_string(),
+            args: vec![one],
+            distinct: false,
+            order_by: vec![],
+        };
+        let count_null = ScalarAggregateSpec {
+            name: "count".to_string(),
+            args: vec![null],
+            distinct: false,
+            order_by: vec![],
+        };
+
+        assert!(is_eliminable_count(&count_one, &arena));
+        assert!(is_eliminable_count(&count_null, &arena));
     }
 }
