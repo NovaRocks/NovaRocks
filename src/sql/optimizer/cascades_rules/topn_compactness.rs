@@ -1,14 +1,14 @@
-use crate::sql::analysis::{ExprKind, OutputColumn, SortItem};
+use crate::sql::analysis::OutputColumn;
 use crate::sql::optimizer::memo::{MExpr, Memo};
 use crate::sql::optimizer::operator::{Operator, TopNOp, TopNPhase};
-use crate::sql::optimizer::property::typed_expr_to_column_id;
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
-use crate::sql::optimizer::scalar_bridge::{
-    intern_sort_items, materialize_project_items, materialize_sort_keys,
+use crate::sql::optimizer::scalar::{
+    ColumnDisplay, ScalarArena, ScalarNode, SortKey as ScalarSortKey,
 };
 use crate::sql::optimizer::topn_proof::{
     ScanTopNCapability, TopNWindow, default_scan_topn_capability, ordering_covers,
-    remap_sort_items_through_project, sort_items_to_keys, sort_keys_equivalent,
+    remap_sort_keys_through_project, scalar_expr_to_column_id, sort_keys_equivalent,
+    sort_keys_to_keys,
 };
 
 pub(crate) struct MergeConsecutiveTopN;
@@ -188,12 +188,10 @@ fn merge_consecutive_topn(expr: &MExpr, memo: &Memo) -> Vec<NewExpr> {
             continue;
         }
 
-        let outer_items = materialize_sort_keys(&memo.scalars, &outer.items);
-        let Some(outer_keys) = sort_items_to_keys(&outer_items) else {
+        let Some(outer_keys) = sort_keys_to_keys(&memo.scalars, &outer.items) else {
             continue;
         };
-        let inner_items = materialize_sort_keys(&memo.scalars, &inner.items);
-        let Some(inner_keys) = sort_items_to_keys(&inner_items) else {
+        let Some(inner_keys) = sort_keys_to_keys(&memo.scalars, &inner.items) else {
             continue;
         };
         let inner_child_group_id = child_expr.children[0];
@@ -221,8 +219,7 @@ fn remove_redundant_sort_under_topn(expr: &MExpr, memo: &Memo) -> Vec<NewExpr> {
     if expr.children.len() != 1 {
         return vec![];
     }
-    let topn_items = materialize_sort_keys(&memo.scalars, &topn.items);
-    let Some(topn_keys) = sort_items_to_keys(&topn_items) else {
+    let Some(topn_keys) = sort_keys_to_keys(&memo.scalars, &topn.items) else {
         return vec![];
     };
     let Some(child_group) = memo.groups.get(expr.children[0]) else {
@@ -244,8 +241,7 @@ fn remove_redundant_sort_under_topn(expr: &MExpr, memo: &Memo) -> Vec<NewExpr> {
         if child_expr.children.len() != 1 {
             continue;
         }
-        let sort_items = materialize_sort_keys(&memo.scalars, &sort.items);
-        let Some(sort_keys) = sort_items_to_keys(&sort_items) else {
+        let Some(sort_keys) = sort_keys_to_keys(&memo.scalars, &sort.items) else {
             continue;
         };
         if !ordering_covers(&sort_keys, &topn_keys, equivalences) {
@@ -283,13 +279,11 @@ fn push_topn_through_project(expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
         if project_expr.children.len() != 1 {
             continue;
         }
-        let topn_items = materialize_sort_keys(&memo.scalars, &topn.items);
-        let project_items = materialize_project_items(&memo.scalars, &project.items);
-        let Some(remapped_items) = remap_sort_items_through_project(&topn_items, &project_items)
+        let Some(remapped_items) =
+            remap_sort_keys_through_project(&memo.scalars, &topn.items, &project.items)
         else {
             continue;
         };
-        let remapped_items = intern_sort_items(&mut memo.scalars, &remapped_items);
 
         let pushed_op = Operator::LogicalTopN(TopNOp {
             items: remapped_items,
@@ -439,64 +433,69 @@ fn build_union_branch_topn_ops(
     branch_groups: &[usize],
     memo: &mut Memo,
 ) -> Option<Vec<TopNOp>> {
-    let topn_items = materialize_sort_keys(&memo.scalars, &topn.items);
-    branch_groups
-        .iter()
-        .map(|branch_group| {
-            let branch_outputs = memo
-                .groups
-                .get(*branch_group)?
-                .logical_props
-                .as_ref()?
-                .output_columns
-                .clone();
-            let items = remap_sort_items_through_union(
-                &topn_items,
-                &union.output_columns,
-                &branch_outputs,
-            )?;
-            Some(TopNOp {
-                items: intern_sort_items(&mut memo.scalars, &items),
-                limit: Some(branch_limit),
-                offset: Some(0),
-                phase: topn.phase,
-                is_split: topn.is_split,
-            })
-        })
-        .collect()
+    let mut branch_topn_ops = Vec::with_capacity(branch_groups.len());
+    for branch_group in branch_groups {
+        let branch_outputs = memo
+            .groups
+            .get(*branch_group)?
+            .logical_props
+            .as_ref()?
+            .output_columns
+            .clone();
+        let items = remap_sort_keys_through_union(
+            &mut memo.scalars,
+            &topn.items,
+            &union.output_columns,
+            &branch_outputs,
+        )?;
+        branch_topn_ops.push(TopNOp {
+            items,
+            limit: Some(branch_limit),
+            offset: Some(0),
+            phase: topn.phase,
+            is_split: topn.is_split,
+        });
+    }
+    Some(branch_topn_ops)
 }
 
-fn remap_sort_items_through_union(
-    items: &[SortItem],
+fn remap_sort_keys_through_union(
+    scalars: &mut ScalarArena,
+    items: &[ScalarSortKey],
     union_outputs: &[OutputColumn],
     branch_outputs: &[OutputColumn],
-) -> Option<Vec<SortItem>> {
+) -> Option<Vec<ScalarSortKey>> {
     items
         .iter()
         .map(|item| {
-            let union_column_id = typed_expr_to_column_id(&item.expr)?;
+            let union_column_id = scalar_expr_to_column_id(scalars, item.expr)?;
             let output_position = union_outputs
                 .iter()
                 .position(|column| column.column_id == union_column_id)?;
             let union_output = union_outputs.get(output_position)?;
             let branch_output = branch_outputs.get(output_position)?;
-            if item.expr.data_type != union_output.data_type
-                || item.expr.nullable != union_output.nullable
+            if scalars.data_type(item.expr) != &union_output.data_type
+                || scalars.nullable(item.expr) != union_output.nullable
                 || branch_output.data_type != union_output.data_type
                 || branch_output.nullable != union_output.nullable
             {
                 return None;
             }
 
-            let mut remapped = item.clone();
-            remapped.expr.kind = ExprKind::ColumnRef {
-                column_id: branch_output.column_id,
-                qualifier: None,
-                column: branch_output.name.clone(),
-            };
-            remapped.expr.data_type = branch_output.data_type.clone();
-            remapped.expr.nullable = branch_output.nullable;
-            Some(remapped)
+            let expr = scalars.intern(
+                ScalarNode::ColumnRef(branch_output.column_id),
+                branch_output.data_type.clone(),
+                branch_output.nullable,
+            );
+            Some(ScalarSortKey {
+                expr,
+                asc: item.asc,
+                nulls_first: item.nulls_first,
+                display: Some(ColumnDisplay {
+                    qualifier: None,
+                    column: branch_output.name.clone(),
+                }),
+            })
         })
         .collect()
 }

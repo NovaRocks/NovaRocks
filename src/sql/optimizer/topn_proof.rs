@@ -1,6 +1,7 @@
-use crate::sql::analysis::{ExprKind, ProjectItem, SortItem};
 use crate::sql::column_id::ColumnId;
-use crate::sql::optimizer::property::{EquivalenceClasses, SortKey, typed_expr_to_column_id};
+use crate::sql::optimizer::operator::ScalarProjectItem;
+use crate::sql::optimizer::property::{EquivalenceClasses, SortKey};
+use crate::sql::optimizer::scalar::{ScalarArena, ScalarNode, SortKey as ScalarSortKey};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TopNWindow {
@@ -36,11 +37,24 @@ impl TopNWindow {
     }
 }
 
-pub(crate) fn sort_items_to_keys(items: &[SortItem]) -> Option<Vec<SortKey>> {
+pub(crate) fn scalar_expr_to_column_id(
+    arena: &ScalarArena,
+    expr: crate::sql::optimizer::scalar::ScalarId,
+) -> Option<ColumnId> {
+    match arena.node(expr) {
+        ScalarNode::ColumnRef(column_id) if *column_id != ColumnId::UNSET => Some(*column_id),
+        _ => None,
+    }
+}
+
+pub(crate) fn sort_keys_to_keys(
+    arena: &ScalarArena,
+    items: &[ScalarSortKey],
+) -> Option<Vec<SortKey>> {
     items
         .iter()
         .map(|item| {
-            typed_expr_to_column_id(&item.expr).map(|column| SortKey {
+            scalar_expr_to_column_id(arena, item.expr).map(|column| SortKey {
                 column,
                 asc: item.asc,
                 nulls_first: item.nulls_first,
@@ -95,42 +109,43 @@ pub(crate) fn columns_equivalent(
         .unwrap_or(false)
 }
 
-pub(crate) fn passthrough_project_column_remap(items: &[ProjectItem]) -> Vec<(ColumnId, ColumnId)> {
+pub(crate) fn passthrough_project_column_remap(
+    arena: &ScalarArena,
+    items: &[ScalarProjectItem],
+) -> Vec<(ColumnId, ColumnId)> {
     items
         .iter()
         .filter_map(|item| {
-            let ExprKind::ColumnRef { column_id, .. } = &item.expr.kind else {
-                return None;
-            };
-            if *column_id == ColumnId::UNSET || item.output_column_id == ColumnId::UNSET {
+            let column_id = scalar_expr_to_column_id(arena, item.expr)?;
+            if item.output_column_id == ColumnId::UNSET {
                 return None;
             }
-            Some((item.output_column_id, *column_id))
+            Some((item.output_column_id, column_id))
         })
         .collect()
 }
 
-pub(crate) fn remap_sort_items_through_project(
-    items: &[SortItem],
-    project_items: &[ProjectItem],
-) -> Option<Vec<SortItem>> {
+pub(crate) fn remap_sort_keys_through_project(
+    arena: &ScalarArena,
+    items: &[ScalarSortKey],
+    project_items: &[ScalarProjectItem],
+) -> Option<Vec<ScalarSortKey>> {
     items
         .iter()
         .map(|item| {
-            let output_col = typed_expr_to_column_id(&item.expr)?;
+            let output_col = scalar_expr_to_column_id(arena, item.expr)?;
             let project_item = project_items
                 .iter()
                 .find(|project_item| project_item.output_column_id == output_col)?;
-            let ExprKind::ColumnRef { column_id, .. } = &project_item.expr.kind else {
-                return None;
-            };
-            if *column_id == ColumnId::UNSET || project_item.output_column_id == ColumnId::UNSET {
+            let source_col = scalar_expr_to_column_id(arena, project_item.expr)?;
+            if source_col == ColumnId::UNSET || project_item.output_column_id == ColumnId::UNSET {
                 return None;
             }
-            Some(SortItem {
-                expr: project_item.expr.clone(),
+            Some(ScalarSortKey {
+                expr: project_item.expr,
                 asc: item.asc,
                 nulls_first: item.nulls_first,
+                display: project_item.expr_display.clone(),
             })
         })
         .collect()
@@ -149,7 +164,11 @@ pub(crate) fn default_scan_topn_capability() -> ScanTopNCapability {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::{LiteralValue, ProjectItem, TypedExpr};
+    use crate::sql::analysis::{ExprKind, LiteralValue, ProjectItem, SortItem, TypedExpr};
+    use crate::sql::optimizer::scalar::{
+        ColumnDisplay, HashableLiteral, ScalarArena, ScalarNode, SortKey as ScalarSortKey,
+    };
+    use crate::sql::optimizer::scalar_bridge::{intern_project_items, intern_sort_items};
     use arrow::datatypes::DataType;
 
     fn col(id: u32, name: &str) -> TypedExpr {
@@ -192,6 +211,19 @@ mod tests {
         }
     }
 
+    fn scalar_col(arena: &mut ScalarArena, id: u32, ty: DataType, nullable: bool) -> ScalarSortKey {
+        let expr = arena.intern(ScalarNode::ColumnRef(ColumnId(id)), ty, nullable);
+        ScalarSortKey {
+            expr,
+            asc: true,
+            nulls_first: false,
+            display: Some(ColumnDisplay {
+                qualifier: None,
+                column: format!("c{id}"),
+            }),
+        }
+    }
+
     #[test]
     fn topn_window_requires_finite_non_negative_limit_and_offset() {
         assert_eq!(
@@ -224,16 +256,23 @@ mod tests {
     fn sort_keys_use_equivalence_classes() {
         let mut eq = EquivalenceClasses::default();
         eq.merge_pair(ColumnId(1), ColumnId(2));
-        let left = sort_items_to_keys(&[sort_item(1, true, false)]).unwrap();
-        let right = sort_items_to_keys(&[sort_item(2, true, false)]).unwrap();
+        let mut arena = ScalarArena::new();
+        let left_items = intern_sort_items(&mut arena, &[sort_item(1, true, false)]);
+        let right_items = intern_sort_items(&mut arena, &[sort_item(2, true, false)]);
+        let left = sort_keys_to_keys(&arena, &left_items).unwrap();
+        let right = sort_keys_to_keys(&arena, &right_items).unwrap();
         assert!(sort_keys_equivalent(&left, &right, Some(&eq)));
     }
 
     #[test]
     fn sort_keys_reject_direction_or_null_order_mismatch() {
-        let asc = sort_items_to_keys(&[sort_item(1, true, false)]).unwrap();
-        let desc = sort_items_to_keys(&[sort_item(1, false, false)]).unwrap();
-        let nulls_first = sort_items_to_keys(&[sort_item(1, true, true)]).unwrap();
+        let mut arena = ScalarArena::new();
+        let asc_items = intern_sort_items(&mut arena, &[sort_item(1, true, false)]);
+        let desc_items = intern_sort_items(&mut arena, &[sort_item(1, false, false)]);
+        let nulls_first_items = intern_sort_items(&mut arena, &[sort_item(1, true, true)]);
+        let asc = sort_keys_to_keys(&arena, &asc_items).unwrap();
+        let desc = sort_keys_to_keys(&arena, &desc_items).unwrap();
+        let nulls_first = sort_keys_to_keys(&arena, &nulls_first_items).unwrap();
         assert!(!sort_keys_equivalent(&asc, &desc, None));
         assert!(!sort_keys_equivalent(&asc, &nulls_first, None));
     }
@@ -296,17 +335,60 @@ mod tests {
                 output_column_id: ColumnId(11),
             },
         ];
+        let mut arena = ScalarArena::new();
+        let project_items = intern_project_items(&mut arena, &project_items);
+        let sort_10 = intern_sort_items(&mut arena, &[sort_item(10, true, false)]);
+        let sort_11 = intern_sort_items(&mut arena, &[sort_item(11, true, false)]);
 
         assert_eq!(
-            passthrough_project_column_remap(&project_items),
+            passthrough_project_column_remap(&arena, &project_items),
             vec![(ColumnId(10), ColumnId(1))]
         );
-        assert!(
-            remap_sort_items_through_project(&[sort_item(10, true, false)], &project_items)
-                .is_some()
+        assert!(remap_sort_keys_through_project(&arena, &sort_10, &project_items).is_some());
+        assert!(remap_sort_keys_through_project(&arena, &sort_11, &project_items).is_none());
+    }
+
+    #[test]
+    fn scalar_project_remap_accepts_column_refs_only() {
+        let mut arena = ScalarArena::new();
+        let source_key = scalar_col(&mut arena, 1, DataType::Utf8, false);
+        let output_key = scalar_col(&mut arena, 10, DataType::Utf8, false);
+        let literal = arena.intern(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Int(7))),
+            DataType::Int64,
+            false,
         );
+        let project_items = vec![
+            ScalarProjectItem {
+                expr: source_key.expr,
+                output_name: "x".to_string(),
+                output_column_id: ColumnId(10),
+                expr_display: Some(ColumnDisplay {
+                    qualifier: Some("src".to_string()),
+                    column: "source_name".to_string(),
+                }),
+            },
+            ScalarProjectItem {
+                expr: literal,
+                output_name: "lit".to_string(),
+                output_column_id: ColumnId(11),
+                expr_display: None,
+            },
+        ];
+
+        assert_eq!(
+            passthrough_project_column_remap(&arena, &project_items),
+            vec![(ColumnId(10), ColumnId(1))]
+        );
+        let remapped = remap_sort_keys_through_project(&arena, &[output_key], &project_items)
+            .expect("sort key should remap through passthrough scalar project");
+        assert_eq!(remapped.len(), 1);
+        assert_eq!(remapped[0].expr, source_key.expr);
+        assert_eq!(remapped[0].display, project_items[0].expr_display);
+
+        let literal_output_key = scalar_col(&mut arena, 11, DataType::Int64, false);
         assert!(
-            remap_sort_items_through_project(&[sort_item(11, true, false)], &project_items)
+            remap_sort_keys_through_project(&arena, &[literal_output_key], &project_items)
                 .is_none()
         );
     }
@@ -318,28 +400,25 @@ mod tests {
             output_name: "alias_name".to_string(),
             output_column_id: ColumnId(10),
         }];
+        let mut arena = ScalarArena::new();
+        let project_items = intern_project_items(&mut arena, &project_items);
+        let sort_10 = intern_sort_items(&mut arena, &[sort_item(10, false, true)]);
 
-        let remapped =
-            remap_sort_items_through_project(&[sort_item(10, false, true)], &project_items)
-                .expect("sort item should remap through passthrough project");
+        let remapped = remap_sort_keys_through_project(&arena, &sort_10, &project_items)
+            .expect("sort item should remap through passthrough project");
 
         assert_eq!(remapped.len(), 1);
         assert!(!remapped[0].asc);
         assert!(remapped[0].nulls_first);
-        assert_eq!(remapped[0].expr.data_type, DataType::Utf8);
-        assert!(!remapped[0].expr.nullable);
-        match &remapped[0].expr.kind {
-            ExprKind::ColumnRef {
-                column_id,
-                qualifier,
-                column,
-            } => {
-                assert_eq!(*column_id, ColumnId(1));
-                assert_eq!(qualifier.as_deref(), Some("src"));
-                assert_eq!(column, "source_name");
-            }
-            other => panic!("expected ColumnRef after remap, got {other:?}"),
-        }
+        assert_eq!(arena.data_type(remapped[0].expr), &DataType::Utf8);
+        assert!(!arena.nullable(remapped[0].expr));
+        assert_eq!(
+            scalar_expr_to_column_id(&arena, remapped[0].expr),
+            Some(ColumnId(1))
+        );
+        let display = remapped[0].display.as_ref().unwrap();
+        assert_eq!(display.qualifier.as_deref(), Some("src"));
+        assert_eq!(display.column, "source_name");
     }
 
     #[test]
