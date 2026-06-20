@@ -35,6 +35,7 @@ use crate::sql::codegen::runtime_filter_lowering::{
     remap_rf_expr_order, rf_build_expr_matches_join_build_expr,
     rf_layout_for_execution_distribution, rf_pipeline_dop,
 };
+use crate::sql::codegen::scalar_materialize::materialize;
 use crate::sql::codegen::type_infer;
 use crate::sql::codegen::{
     FragmentBuildResult, FragmentId, MultiFragmentBuildResult, OutputColumn,
@@ -48,7 +49,6 @@ use crate::sql::optimizer::scalar::ScalarArena;
 use crate::sql::planner::optimizer_bridge::property::{
     ordering_spec_from_sort_items, window_ordering_spec,
 };
-use crate::sql::planner::optimizer_bridge::scalar::materialize;
 use crate::sql::planner::plan::{AggregateCall, WindowExpr};
 use crate::types;
 

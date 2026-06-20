@@ -24,6 +24,7 @@ use crate::sql::codegen::iceberg_write_sink::{
     IcebergWriteSinkMode, IcebergWriteSinkSpec, partition_info_from_serialized_metadata,
 };
 use crate::sql::codegen::nodes;
+use crate::sql::codegen::scalar_materialize::materialize;
 use crate::sql::codegen::{
     DirectExecPlan, FragmentBuildResult, MultiFragmentBuildResult, OutputColumn,
 };
@@ -31,7 +32,6 @@ use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::operator::ProjectOp;
 use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
 use crate::sql::optimizer::scalar::ScalarArena;
-use crate::sql::planner::optimizer_bridge::scalar::materialize;
 
 use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
 

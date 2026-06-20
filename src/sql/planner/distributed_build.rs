@@ -9,6 +9,10 @@ use crate::partitions;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{ExprKind, TypedExpr};
 use crate::sql::codegen::helpers::{group_win_exprs_by_sig, split_and_conjuncts_typed};
+use crate::sql::codegen::scalar_materialize::{
+    materialize, materialize_aggregate_calls, materialize_exprs, materialize_project_items,
+    materialize_sort_keys, materialize_window_exprs,
+};
 use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind};
 use crate::sql::optimizer::cost::{CostInput, CostOptions, compute_cost_estimate};
 use crate::sql::optimizer::derive::PropertyAlternativeKind;
@@ -21,10 +25,6 @@ use crate::sql::optimizer::property::{DistributionSpec, OrderingSpec, PhysicalPr
 use crate::sql::optimizer::scalar::ScalarArena;
 use crate::sql::planner::optimizer_bridge::property::{
     ordering_spec_from_sort_items, window_ordering_spec,
-};
-use crate::sql::planner::optimizer_bridge::scalar::{
-    materialize, materialize_aggregate_calls, materialize_exprs, materialize_project_items,
-    materialize_sort_keys, materialize_window_exprs,
 };
 use crate::sql::optimizer::statistics::Statistics;
 use crate::sql::planner::plan::{
