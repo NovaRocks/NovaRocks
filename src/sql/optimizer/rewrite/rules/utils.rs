@@ -962,6 +962,16 @@ pub(crate) struct JoinEquiKey {
     pub(crate) right: TypedExpr,
 }
 
+/// ScalarId-native equi-join key pair for the OptExpr rewrite path.
+///
+/// Operands are ids of the unwrapped inner `ScalarNode::ColumnRef`
+/// (Cast/Nested peeled).
+#[derive(Debug)]
+pub(crate) struct ScalarJoinEquiKey {
+    pub(crate) left: ScalarId,
+    pub(crate) right: ScalarId,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum JoinSide {
     Left,
@@ -1093,22 +1103,20 @@ fn unwrap_scalar_column_ref(arena: &ScalarArena, expr: ScalarId) -> Option<Scala
     }
 }
 
-fn typed_column_ref_from_scalar(arena: &ScalarArena, expr: ScalarId) -> Option<TypedExpr> {
+fn scalar_column_display_key(
+    arena: &ScalarArena,
+    expr: ScalarId,
+) -> Option<(Option<String>, String)> {
     let ScalarNode::ColumnRef(column_id) = arena.node(expr) else {
         return None;
     };
     let display = arena.column_display(*column_id);
-    Some(TypedExpr {
-        kind: ExprKind::ColumnRef {
-            column_id: *column_id,
-            qualifier: display.and_then(|item| item.qualifier.clone()),
-            column: display
-                .map(|item| item.column.clone())
-                .unwrap_or_else(|| format!("col{}", column_id.0)),
-        },
-        data_type: arena.data_type(expr).clone(),
-        nullable: arena.nullable(expr),
-    })
+    Some((
+        display.and_then(|item| item.qualifier.as_ref().map(|q| q.to_lowercase())),
+        display
+            .map(|item| item.column.to_lowercase())
+            .unwrap_or_else(|| format!("col{}", column_id.0).to_lowercase()),
+    ))
 }
 
 fn classify_scalar_operand(
@@ -1118,32 +1126,23 @@ fn classify_scalar_operand(
     right_ids: &HashSet<crate::sql::column_id::ColumnId>,
     left_cols: &HashSet<QualifiedRef>,
     right_cols: &HashSet<QualifiedRef>,
-) -> Option<(JoinSide, TypedExpr)> {
+) -> Option<(JoinSide, ScalarId)> {
     let inner_id = unwrap_scalar_column_ref(arena, expr)?;
-    let inner = typed_column_ref_from_scalar(arena, inner_id)?;
-    let ExprKind::ColumnRef {
-        column_id,
-        qualifier,
-        column,
-    } = &inner.kind
-    else {
-        unreachable!("typed_column_ref_from_scalar only returns a ColumnRef expression");
+    let ScalarNode::ColumnRef(column_id) = arena.node(inner_id) else {
+        unreachable!("unwrap_scalar_column_ref only returns a ColumnRef scalar");
     };
     if *column_id != crate::sql::column_id::ColumnId::UNSET {
         match (left_ids.contains(column_id), right_ids.contains(column_id)) {
-            (true, false) => return Some((JoinSide::Left, inner)),
-            (false, true) => return Some((JoinSide::Right, inner)),
+            (true, false) => return Some((JoinSide::Left, inner_id)),
+            (false, true) => return Some((JoinSide::Right, inner_id)),
             _ => {}
         }
     }
 
-    let key = (
-        qualifier.as_ref().map(|q| q.to_lowercase()),
-        column.to_lowercase(),
-    );
+    let key = scalar_column_display_key(arena, inner_id)?;
     match (left_cols.contains(&key), right_cols.contains(&key)) {
-        (true, false) => Some((JoinSide::Left, inner)),
-        (false, true) => Some((JoinSide::Right, inner)),
+        (true, false) => Some((JoinSide::Left, inner_id)),
+        (false, true) => Some((JoinSide::Right, inner_id)),
         _ => None,
     }
 }
@@ -1155,7 +1154,7 @@ fn collect_join_equi_keys_opt(
     right_ids: &HashSet<crate::sql::column_id::ColumnId>,
     left_cols: &HashSet<QualifiedRef>,
     right_cols: &HashSet<QualifiedRef>,
-    keys: &mut Vec<JoinEquiKey>,
+    keys: &mut Vec<ScalarJoinEquiKey>,
 ) {
     match arena.node(expr) {
         ScalarNode::BinaryOp {
@@ -1183,7 +1182,7 @@ fn collect_join_equi_keys_opt(
         ) {
             (Some((JoinSide::Left, le)), Some((JoinSide::Right, re)))
             | (Some((JoinSide::Right, re)), Some((JoinSide::Left, le))) => {
-                keys.push(JoinEquiKey {
+                keys.push(ScalarJoinEquiKey {
                     left: le,
                     right: re,
                 });
@@ -1392,7 +1391,7 @@ pub(crate) fn join_equi_keys_opt(
     left: &OptExpr,
     right: &OptExpr,
     arena: &ScalarArena,
-) -> Vec<JoinEquiKey> {
+) -> Vec<ScalarJoinEquiKey> {
     let Some(cond_id) = join_op.condition else {
         return Vec::new();
     };
@@ -1845,13 +1844,27 @@ mod column_id_helper_tests {
         join_equi_keys(join, join_plan.left(), join_plan.right())
     }
 
-    fn test_join_equi_keys_opt(join_plan: &LogicalPlanNode) -> Vec<JoinEquiKey> {
+    fn test_join_equi_keys_opt(
+        join_plan: &LogicalPlanNode,
+    ) -> (Vec<ScalarJoinEquiKey>, ScalarArena) {
         let mut arena = ScalarArena::new();
         let expr = crate::sql::optimizer::convert::logical_plan_to_opt_expr(join_plan, &mut arena);
         let Operator::LogicalJoin(join) = &expr.op else {
             panic!("expected LogicalJoin test expression");
         };
-        join_equi_keys_opt(join, expr.left(), expr.right(), &arena)
+        (
+            join_equi_keys_opt(join, expr.left(), expr.right(), &arena),
+            arena,
+        )
+    }
+
+    fn scalar_column_qualifier(arena: &ScalarArena, expr: ScalarId) -> Option<String> {
+        let ScalarNode::ColumnRef(column_id) = arena.node(expr) else {
+            panic!("expected ColumnRef scalar");
+        };
+        arena
+            .column_display(*column_id)
+            .and_then(|display| display.qualifier.clone())
     }
 
     #[test]
@@ -1940,7 +1953,11 @@ mod column_id_helper_tests {
             data_type: DataType::Boolean,
             nullable: false,
         };
-        assert!(test_join_equi_keys_opt(&two_table_join(Some(cond))).is_empty());
+        assert!(
+            test_join_equi_keys_opt(&two_table_join(Some(cond)))
+                .0
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1980,13 +1997,15 @@ mod column_id_helper_tests {
             ],
             None,
         );
-        let keys = test_join_equi_keys_opt(&join);
+        let (keys, arena) = test_join_equi_keys_opt(&join);
         assert_eq!(keys.len(), 1);
-        assert!(
-            matches!(&keys[0].left.kind, ExprKind::ColumnRef { qualifier: Some(q), .. } if q == "a")
+        assert_eq!(
+            scalar_column_qualifier(&arena, keys[0].left).as_deref(),
+            Some("a")
         );
-        assert!(
-            matches!(&keys[0].right.kind, ExprKind::ColumnRef { qualifier: Some(q), .. } if q == "b")
+        assert_eq!(
+            scalar_column_qualifier(&arena, keys[0].right).as_deref(),
+            Some("b")
         );
     }
 

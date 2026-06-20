@@ -8,7 +8,7 @@ use std::collections::HashSet;
 
 use arrow::datatypes::DataType;
 
-use crate::sql::analysis::{BinOp, ExprKind, JoinKind, TypedExpr};
+use crate::sql::analysis::{BinOp, JoinKind};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::{FilterOp, Operator};
 use crate::sql::optimizer::opt_expr::OptExpr;
@@ -16,8 +16,8 @@ use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::optimizer::rewrite::rules::utils::{combine_and, join_equi_keys_opt};
-use crate::sql::optimizer::scalar::{self, ScalarArena, ScalarId, ScalarNode};
+use crate::sql::optimizer::rewrite::rules::utils::join_equi_keys_opt;
+use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 
 pub(crate) struct DeriveJoinNotNullPredicate;
 
@@ -71,20 +71,24 @@ impl LogicalRewriteRule for DeriveJoinNotNullPredicate {
             return Ok(RewriteResult::Unchanged);
         }
         let arena_rc = ctx.scalar_arena();
-        let keys = join_equi_keys_opt(&join, &left, &right, &arena_rc.borrow());
-        if keys.is_empty() {
-            return Ok(RewriteResult::Unchanged);
-        }
+        let (left_preds, right_preds) = {
+            let arena = arena_rc.borrow();
+            let keys = join_equi_keys_opt(&join, &left, &right, &arena);
+            if keys.is_empty() {
+                return Ok(RewriteResult::Unchanged);
+            }
 
-        let left_preds = if derive_left {
-            eligible_not_null(&left, keys.iter().map(|k| &k.left), &arena_rc.borrow())
-        } else {
-            Vec::new()
-        };
-        let right_preds = if derive_right {
-            eligible_not_null(&right, keys.iter().map(|k| &k.right), &arena_rc.borrow())
-        } else {
-            Vec::new()
+            let left_preds = if derive_left {
+                eligible_not_null(&left, keys.iter().map(|k| k.left), &arena)
+            } else {
+                Vec::new()
+            };
+            let right_preds = if derive_right {
+                eligible_not_null(&right, keys.iter().map(|k| k.right), &arena)
+            } else {
+                Vec::new()
+            };
+            (left_preds, right_preds)
         };
         if left_preds.is_empty() && right_preds.is_empty() {
             return Ok(RewriteResult::Unchanged);
@@ -106,21 +110,21 @@ impl LogicalRewriteRule for DeriveJoinNotNullPredicate {
 /// `IS NOT NULL` predicates to add: keep only operands that are (a) nullable and
 /// (b) not already guaranteed non-null by `child`'s predicate spine. Dedupe by
 /// column identity within the side.
-fn eligible_not_null<'a>(
+fn eligible_not_null(
     child: &OptExpr,
-    operands: impl Iterator<Item = &'a TypedExpr>,
+    operands: impl Iterator<Item = ScalarId>,
     arena: &ScalarArena,
-) -> Vec<TypedExpr> {
+) -> Vec<ScalarId> {
     let guaranteed_ids = spine_not_null(child, arena);
     let mut seen_ids: HashSet<ColumnId> = HashSet::new();
     let mut preds = Vec::new();
     for operand in operands {
-        if !operand.nullable {
+        if !arena.nullable(operand) {
             continue;
         }
-        // Keys from join_equi_keys are always bare ColumnRef (Cast/Nested
+        // Keys from join_equi_keys_opt are always bare ColumnRef (Cast/Nested
         // already peeled); this guard is defensive.
-        let ExprKind::ColumnRef { column_id, .. } = &operand.kind else {
+        let ScalarNode::ColumnRef(column_id) = arena.node(operand) else {
             continue;
         };
         if *column_id == ColumnId::UNSET {
@@ -130,28 +134,50 @@ fn eligible_not_null<'a>(
             continue; // already guaranteed non-null -> idempotency
         }
         if seen_ids.insert(*column_id) {
-            preds.push(is_not_null(operand.clone()));
+            preds.push(operand);
         }
     }
     preds
 }
 
-fn is_not_null(operand: TypedExpr) -> TypedExpr {
-    TypedExpr {
-        data_type: DataType::Boolean,
-        nullable: false,
-        kind: ExprKind::IsNull {
-            expr: Box::new(operand),
+fn is_not_null(arena: &mut ScalarArena, operand: ScalarId) -> ScalarId {
+    arena.intern(
+        ScalarNode::IsNull {
+            child: operand,
             negated: true,
         },
-    }
+        DataType::Boolean,
+        false,
+    )
 }
 
-fn wrap_not_null(child: OptExpr, preds: Vec<TypedExpr>, arena: &mut ScalarArena) -> OptExpr {
-    if preds.is_empty() {
+fn combine_and_scalar(arena: &mut ScalarArena, mut exprs: Vec<ScalarId>) -> ScalarId {
+    assert!(!exprs.is_empty());
+    let mut result = exprs.pop().unwrap();
+    while let Some(left) = exprs.pop() {
+        let nullable = arena.nullable(left) || arena.nullable(result);
+        result = arena.intern(
+            ScalarNode::BinaryOp {
+                left,
+                op: BinOp::And,
+                right: result,
+            },
+            DataType::Boolean,
+            nullable,
+        );
+    }
+    result
+}
+
+fn wrap_not_null(child: OptExpr, operands: Vec<ScalarId>, arena: &mut ScalarArena) -> OptExpr {
+    if operands.is_empty() {
         return child;
     }
-    let predicate = scalar::intern_typed(arena, &combine_and(preds));
+    let preds = operands
+        .into_iter()
+        .map(|operand| is_not_null(arena, operand))
+        .collect();
+    let predicate = combine_and_scalar(arena, preds);
     OptExpr::new(Operator::LogicalFilter(FilterOp { predicate }), vec![child])
 }
 
@@ -217,12 +243,11 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
-    use crate::sql::analysis::{BinOp, OutputColumn};
+    use crate::sql::analysis::{BinOp, ExprKind, OutputColumn, TypedExpr};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::optimizer::operator::{LogicalJoinOp, ScanOp};
     use crate::sql::optimizer::rewrite::context::RewriteContext;
-    use crate::sql::optimizer::rewrite::rules::utils::split_and;
-    use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::optimizer::scalar::{self, ScalarArena};
 
     fn make_ctx(arena: ScalarArena) -> RewriteContext {
         let mut ctx = RewriteContext::for_query(std::iter::empty::<String>());
@@ -346,11 +371,19 @@ mod tests {
         let Operator::LogicalFilter(f) = &expr.op else {
             return 0;
         };
-        let predicate_typed = scalar::materialize(arena, f.predicate);
-        split_and(predicate_typed)
-            .iter()
-            .filter(|e| matches!(&e.kind, ExprKind::IsNull { negated: true, .. }))
-            .count()
+        not_null_count_scalar(arena, f.predicate)
+    }
+
+    fn not_null_count_scalar(arena: &ScalarArena, expr: ScalarId) -> usize {
+        match arena.node(expr) {
+            ScalarNode::BinaryOp {
+                left,
+                op: BinOp::And,
+                right,
+            } => not_null_count_scalar(arena, *left) + not_null_count_scalar(arena, *right),
+            ScalarNode::IsNull { negated: true, .. } => 1,
+            _ => 0,
+        }
     }
 
     fn inner_eq_join_opt(
