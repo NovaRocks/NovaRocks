@@ -17,10 +17,11 @@ use crate::sql::optimizer::operator::{
     TopNPhase, UnionOp,
 };
 use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
-use crate::sql::optimizer::property::{
-    DistributionSpec, OrderingSpec, PhysicalPropertySet, window_ordering_spec,
-};
+use crate::sql::optimizer::property::{DistributionSpec, OrderingSpec, PhysicalPropertySet};
 use crate::sql::optimizer::scalar::ScalarArena;
+use crate::sql::planner::optimizer_bridge::property::{
+    ordering_spec_from_sort_items, window_ordering_spec,
+};
 use crate::sql::planner::optimizer_bridge::scalar::{
     materialize, materialize_aggregate_calls, materialize_exprs, materialize_project_items,
     materialize_sort_keys, materialize_window_exprs,
@@ -1106,10 +1107,10 @@ impl<'a> DistributedPlanBuilder<'a> {
 
 fn distributed_node_ordering(node: &DistributedPlanNode) -> OrderingSpec {
     match &node.kind {
-        PlanNodeKind::Sort(sort) => OrderingSpec::from_sort_items(&sort.items),
-        PlanNodeKind::TopN(topn) => OrderingSpec::from_sort_items(&topn.items),
+        PlanNodeKind::Sort(sort) => ordering_spec_from_sort_items(&sort.items),
+        PlanNodeKind::TopN(topn) => ordering_spec_from_sort_items(&topn.items),
         PlanNodeKind::Exchange(exchange) => match &exchange.flavor {
-            ExchangeFlavor::TopNSplit { items, .. } => OrderingSpec::from_sort_items(items),
+            ExchangeFlavor::TopNSplit { items, .. } => ordering_spec_from_sort_items(items),
             _ => OrderingSpec::Any,
         },
         PlanNodeKind::AssertOneRow(_) => node

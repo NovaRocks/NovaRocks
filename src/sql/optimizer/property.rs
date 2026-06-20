@@ -1,6 +1,5 @@
 //! Physical properties for Cascades optimizer.
 
-use crate::sql::analysis::{ExprKind, SortItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Hash)]
@@ -303,18 +302,11 @@ pub(crate) enum OrderingSpec {
 }
 
 impl OrderingSpec {
-    pub(crate) fn from_sort_items(items: &[SortItem]) -> Self {
-        let mut keys = Vec::with_capacity(items.len());
-        for item in items {
-            let Some(column) = typed_expr_to_column_id(&item.expr) else {
-                return OrderingSpec::Any;
-            };
-            keys.push(SortKey {
-                column,
-                asc: item.asc,
-                nulls_first: item.nulls_first,
-            });
-        }
+    pub(crate) fn from_sort_keys<I>(items: I) -> Self
+    where
+        I: IntoIterator<Item = SortKey>,
+    {
+        let keys: Vec<SortKey> = items.into_iter().collect();
         if keys.is_empty() {
             OrderingSpec::Any
         } else {
@@ -336,36 +328,6 @@ impl OrderingSpec {
             }
         }
     }
-}
-
-pub(crate) fn typed_expr_to_column_id(expr: &TypedExpr) -> Option<ColumnId> {
-    match &expr.kind {
-        ExprKind::ColumnRef { column_id, .. } if *column_id != ColumnId::UNSET => Some(*column_id),
-        _ => None,
-    }
-}
-
-pub(crate) fn window_sort_items(
-    partition_by: &[TypedExpr],
-    order_by: &[SortItem],
-) -> Vec<SortItem> {
-    let mut items = Vec::with_capacity(partition_by.len() + order_by.len());
-    for expr in partition_by {
-        items.push(SortItem {
-            expr: expr.clone(),
-            asc: true,
-            nulls_first: true,
-        });
-    }
-    items.extend(order_by.iter().cloned());
-    items
-}
-
-pub(crate) fn window_ordering_spec(
-    partition_by: &[TypedExpr],
-    order_by: &[SortItem],
-) -> OrderingSpec {
-    OrderingSpec::from_sort_items(&window_sort_items(partition_by, order_by))
 }
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
@@ -508,6 +470,29 @@ mod tests {
     }
 
     #[test]
+    fn ordering_from_sort_keys_returns_any_for_empty_keys() {
+        assert_eq!(OrderingSpec::from_sort_keys([]), OrderingSpec::Any);
+    }
+
+    #[test]
+    fn ordering_from_sort_keys_preserves_native_keys() {
+        let required = OrderingSpec::from_sort_keys([SortKey {
+            column: ColumnId(1),
+            asc: true,
+            nulls_first: true,
+        }]);
+
+        assert_eq!(
+            required,
+            OrderingSpec::Required(vec![SortKey {
+                column: ColumnId(1),
+                asc: true,
+                nulls_first: true,
+            }])
+        );
+    }
+
+    #[test]
     fn any_required_is_satisfied_by_anything() {
         for provided in [
             DistributionSpec::Any,
@@ -577,53 +562,6 @@ mod tests {
         }]);
 
         assert!(!provided.satisfies(&required));
-    }
-
-    #[test]
-    fn window_ordering_places_partition_keys_before_order_keys() {
-        let partition = TypedExpr {
-            kind: ExprKind::ColumnRef {
-                column_id: ColumnId(10),
-                qualifier: None,
-                column: "k".to_string(),
-            },
-            data_type: arrow::datatypes::DataType::Int32,
-            nullable: false,
-        };
-        let order = TypedExpr {
-            kind: ExprKind::ColumnRef {
-                column_id: ColumnId(20),
-                qualifier: None,
-                column: "ts".to_string(),
-            },
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
-        };
-
-        let spec = window_ordering_spec(
-            &[partition],
-            &[SortItem {
-                expr: order,
-                asc: false,
-                nulls_first: false,
-            }],
-        );
-
-        assert_eq!(
-            spec,
-            OrderingSpec::Required(vec![
-                SortKey {
-                    column: ColumnId(10),
-                    asc: true,
-                    nulls_first: true,
-                },
-                SortKey {
-                    column: ColumnId(20),
-                    asc: false,
-                    nulls_first: false,
-                },
-            ])
-        );
     }
 
     #[test]

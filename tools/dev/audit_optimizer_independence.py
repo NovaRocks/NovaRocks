@@ -4,9 +4,7 @@ import argparse
 import re
 import sys
 
-DEFAULT_SYMBOL_ALLOW = {
-    "src/sql/optimizer/property.rs",
-}
+DEFAULT_SYMBOL_ALLOW = set()
 
 DEFAULT_IMPORT_ALLOW = {
     "src/sql/optimizer/cascades_rules/equivalence_predicate.rs",
@@ -34,7 +32,6 @@ DEFAULT_IMPORT_ALLOW = {
     "src/sql/optimizer/memo.rs",
     "src/sql/optimizer/operator.rs",
     "src/sql/optimizer/physical_plan.rs",
-    "src/sql/optimizer/property.rs",
     "src/sql/optimizer/rewrite/context.rs",
     "src/sql/optimizer/rewrite/required_columns.rs",
     "src/sql/optimizer/rewrite/rules/aggregate_pushdown/collector.rs",

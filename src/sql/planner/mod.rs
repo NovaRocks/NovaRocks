@@ -26,6 +26,7 @@ use crate::sql::catalog::{IcebergDataFileInfo, IcebergDeleteFileContent};
 use crate::sql::codegen::helpers::typed_expr_display_name;
 use crate::sql::column_id::{ColumnId, ColumnRefFactory};
 use crate::sql::optimizer::property::OrderingSpec;
+use crate::sql::planner::optimizer_bridge::property::ordering_spec_from_sort_items;
 use plan::*;
 
 /// Extract ColumnId from a TypedExpr, or allocate a new one from the factory.
@@ -1588,8 +1589,8 @@ fn logical_sort_satisfies_window_ordering(
     required_items: &[SortItem],
     partition_by: &[TypedExpr],
 ) -> bool {
-    let required = OrderingSpec::from_sort_items(required_items);
-    let provided = OrderingSpec::from_sort_items(&sort.items);
+    let required = ordering_spec_from_sort_items(required_items);
+    let provided = ordering_spec_from_sort_items(&sort.items);
     if matches!(required, OrderingSpec::Any) || !provided.satisfies(&required) {
         return false;
     }
@@ -1597,7 +1598,7 @@ fn logical_sort_satisfies_window_ordering(
     // non-partitioned windows; partitioned windows need the analytic-partition
     // tag unless the child Sort already has an equivalent tag.
     partition_by.is_empty()
-        || OrderingSpec::from_sort_items(
+        || ordering_spec_from_sort_items(
             &sort
                 .analytic_partition_by
                 .iter()
@@ -1608,7 +1609,7 @@ fn logical_sort_satisfies_window_ordering(
                 })
                 .collect::<Vec<_>>(),
         )
-        .satisfies(&OrderingSpec::from_sort_items(
+        .satisfies(&ordering_spec_from_sort_items(
             &partition_by
                 .iter()
                 .map(|expr| SortItem {

@@ -43,8 +43,11 @@ use crate::sql::optimizer::operator::{
     AggMode, AssertOneRowOp, DecodeOp, GenerateSeriesOp, RepeatOp, ScanDictionaryColumn, TopNPhase,
 };
 use crate::sql::optimizer::physical_plan::JoinExecutionDistribution;
-use crate::sql::optimizer::property::{OrderingSpec, window_ordering_spec};
+use crate::sql::optimizer::property::OrderingSpec;
 use crate::sql::optimizer::scalar::ScalarArena;
+use crate::sql::planner::optimizer_bridge::property::{
+    ordering_spec_from_sort_items, window_ordering_spec,
+};
 use crate::sql::planner::optimizer_bridge::scalar::materialize;
 use crate::sql::planner::plan::{AggregateCall, WindowExpr};
 use crate::types;
@@ -1232,7 +1235,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             scope: child.scope,
             tuple_ids: child.tuple_ids,
             output_columns: sort.output_columns.clone(),
-            ordering: OrderingSpec::from_sort_items(&sort.items),
+            ordering: ordering_spec_from_sort_items(&sort.items),
         })
     }
 
@@ -1258,7 +1261,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             scope: child.scope,
             tuple_ids: child.tuple_ids,
             output_columns: child.output_columns,
-            ordering: OrderingSpec::from_sort_items(&topn.items),
+            ordering: ordering_spec_from_sort_items(&topn.items),
         })
     }
 
@@ -1334,7 +1337,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     scope: source.scope,
                     tuple_ids: source.tuple_ids,
                     output_columns: source.output_columns,
-                    ordering: OrderingSpec::from_sort_items(items),
+                    ordering: ordering_spec_from_sort_items(items),
                 })
             }
             super::kind::ExchangeFlavor::CteMulticast { .. } => {
