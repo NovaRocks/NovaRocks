@@ -39,12 +39,15 @@ struct MaintenanceTestEnv {
     current_db: String,
     _metadata_dir: TempDir,
     _warehouse_dir: TempDir,
+    _loopback_backend: crate::engine::StandaloneLoopbackTestBackend,
 }
 
 /// Real `StandaloneState` with a local hadoop iceberg catalog named `catalog`
 /// and a SQLite metadata provider, matching
 /// `open_test_state_with_hadoop_iceberg_catalog` in mv::iceberg_refresh.
 fn open_env(catalog: &str, current_db: &str) -> MaintenanceTestEnv {
+    let loopback_backend = crate::engine::install_all_in_one_loopback_backend_for_test()
+        .expect("install all-in-one loopback backend");
     let metadata_dir = TempDir::new().expect("metadata tempdir");
     let warehouse_dir = TempDir::new().expect("warehouse tempdir");
     let metadata_path = metadata_dir.path().join("standalone.sqlite");
@@ -52,6 +55,7 @@ fn open_env(catalog: &str, current_db: &str) -> MaintenanceTestEnv {
         crate::meta::SqliteMetaStoreProvider::open(&metadata_path).expect("open meta provider");
     let state = Arc::new(StandaloneState {
         metadata_provider: Some(Arc::new(metadata_provider)),
+        exchange_port: loopback_backend.exchange_port,
         ..StandaloneState::default()
     });
     crate::connector::register_standalone_backends(&state);
@@ -78,6 +82,7 @@ fn open_env(catalog: &str, current_db: &str) -> MaintenanceTestEnv {
         current_db: current_db.to_string(),
         _metadata_dir: metadata_dir,
         _warehouse_dir: warehouse_dir,
+        _loopback_backend: loopback_backend,
     }
 }
 

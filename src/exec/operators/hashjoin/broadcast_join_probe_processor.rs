@@ -290,13 +290,10 @@ impl BroadcastJoinProbeProcessorOperator {
                 // receives the merged flags and produces the output.
                 let local_flags = self.core.take_build_matched().unwrap_or_default();
                 if let Some(merged) = self.state.merge_build_matched(local_flags) {
-                    let schema = Arc::clone(self.core.build_chunk_schema());
                     let build_out = self
                         .core
                         .build_right_semi_anti_output_with_flags(&merged, false)?;
-                    out = self
-                        .core
-                        .merge_join_outputs(None, build_out, &schema, true)?;
+                    out = self.core.right_semi_anti_output_chunk(build_out)?;
                 } else {
                     // Not the last driver — no build-side output from this driver.
                     out = None;
@@ -305,13 +302,10 @@ impl BroadcastJoinProbeProcessorOperator {
             JoinType::RightSemi if self.core.probe_is_left() => {
                 let local_flags = self.core.take_build_matched().unwrap_or_default();
                 if let Some(merged) = self.state.merge_build_matched(local_flags) {
-                    let schema = Arc::clone(self.core.build_chunk_schema());
                     let build_out = self
                         .core
                         .build_right_semi_anti_output_with_flags(&merged, true)?;
-                    out = self
-                        .core
-                        .merge_join_outputs(None, build_out, &schema, true)?;
+                    out = self.core.right_semi_anti_output_chunk(build_out)?;
                 } else {
                     out = None;
                 }
@@ -462,6 +456,31 @@ mod tests {
         let right_arr = chunk
             .columns()
             .get(1)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        for i in 0..chunk.len() {
+            pairs.push((left_arr.value(i), right_arr.value(i)));
+        }
+    }
+
+    fn append_pair_columns(
+        chunk: Chunk,
+        left_index: usize,
+        right_index: usize,
+        pairs: &mut Vec<(i32, i32)>,
+    ) {
+        let left_arr = chunk
+            .columns()
+            .get(left_index)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let right_arr = chunk
+            .columns()
+            .get(right_index)
             .unwrap()
             .as_any()
             .downcast_ref::<Int32Array>()
@@ -758,13 +777,13 @@ mod tests {
         proc.push_chunk(&rt, probe).expect("probe push");
         while proc.has_output() {
             if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                append_pairs(out, &mut rows);
+                append_pair_columns(out, 2, 3, &mut rows);
             }
         }
         proc.set_finishing(&rt).expect("probe finish");
         while proc.has_output() {
             if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                append_pairs(out, &mut rows);
+                append_pair_columns(out, 2, 3, &mut rows);
             }
         }
 

@@ -699,6 +699,85 @@ pub(in crate::sql::codegen) struct LoweredFragmentOutput {
     root_sort_info: Option<plan_nodes::TSortInfo>,
 }
 
+fn boundary_tuple_ids_for_output_columns(
+    scope: &ExprScope,
+    output_columns: &[AnalysisOutputColumn],
+    lowered_output_columns: &[AnalysisOutputColumn],
+    fallback_tuple_ids: &[i32],
+    allow_ordered_prefix_fallback: bool,
+    context: &str,
+) -> Result<Vec<i32>, String> {
+    if output_columns.is_empty() {
+        return Ok(fallback_tuple_ids.to_vec());
+    }
+
+    let mut tuple_ids = Vec::new();
+    let ordered_bindings =
+        if allow_ordered_prefix_fallback && output_columns.len() <= scope.iter_columns().count() {
+            Some(
+                scope
+                    .iter_columns()
+                    .map(|(_, binding)| binding)
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        };
+    for (index, column) in output_columns.iter().enumerate() {
+        let binding = match scope.resolve_by_id(column.column_id) {
+            Some(binding) => binding,
+            None if output_columns.len() == lowered_output_columns.len() => {
+                let lowered_column = &lowered_output_columns[index];
+                if let Some(binding) = scope.resolve_by_id(lowered_column.column_id) {
+                    binding
+                } else if let Some(bindings) = &ordered_bindings {
+                    bindings[index]
+                } else {
+                    return Err(format!(
+                        "{context} cannot resolve boundary output column `{}` id={} or lowered output column `{}` id={}; scope bindings [{}]",
+                        column.name,
+                        column.column_id.0,
+                        lowered_column.name,
+                        lowered_column.column_id.0,
+                        format_boundary_scope_bindings(scope)
+                    ));
+                }
+            }
+            None => {
+                if let Some(bindings) = &ordered_bindings {
+                    bindings[index]
+                } else {
+                    return Err(format!(
+                        "{context} cannot resolve boundary output column `{}` id={} and output count {} does not match lowered output count {}; scope bindings [{}]",
+                        column.name,
+                        column.column_id.0,
+                        output_columns.len(),
+                        lowered_output_columns.len(),
+                        format_boundary_scope_bindings(scope)
+                    ));
+                }
+            }
+        };
+        if !tuple_ids.contains(&binding.tuple_id) {
+            tuple_ids.push(binding.tuple_id);
+        }
+    }
+    Ok(tuple_ids)
+}
+
+fn format_boundary_scope_bindings(scope: &ExprScope) -> String {
+    scope
+        .iter_id_bindings()
+        .map(|(column_id, binding)| {
+            format!(
+                "id={}=>tuple:{},slot:{}",
+                column_id.0, binding.tuple_id, binding.slot_id
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn aggregate_slot_contract_for_phase(
     need_finalize: bool,
     result_type: &DataType,
@@ -904,12 +983,31 @@ impl<'a> OwnedLoweringState<'a> {
         };
 
         let root_plan_node = lowered.plan_nodes.first();
+        let root_is_project = root_plan_node
+            .map(|node| node.node_type == plan_nodes::TPlanNodeType::PROJECT_NODE)
+            .unwrap_or(false);
+        // Non-root exchange senders emit the physical chunk produced by the
+        // fragment root operator. Keep the boundary schema aligned with that
+        // actual wire shape; root-result projection is handled separately by
+        // result_output_exprs_for_columns().
+        let boundary_output_columns = lowered.output_columns.clone();
+        let boundary_tuple_ids = boundary_tuple_ids_for_output_columns(
+            &lowered.scope,
+            &boundary_output_columns,
+            &lowered.output_columns,
+            &lowered.tuple_ids,
+            root_is_project,
+            &format!(
+                "fragment id={fragment_id} root={:?}",
+                root_plan_node.map(|node| node.node_type)
+            ),
+        )?;
         self.remember_lowered_fragment_output(
             fragment_id,
             LoweredFragmentOutput {
                 scope: lowered.scope.clone(),
-                tuple_ids: lowered.tuple_ids.clone(),
-                output_columns: lowered.output_columns.clone(),
+                tuple_ids: boundary_tuple_ids,
+                output_columns: boundary_output_columns,
                 root_node_id: root_plan_node.map(|node| node.node_id),
                 root_node_type: root_plan_node.map(|node| node.node_type),
                 root_sort_info: root_plan_node
@@ -1121,12 +1219,13 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             ));
         }
         let scan_tuple_id = first_tuple_id(node, "Scan")?;
-        let (scan_plan_node, scope) = self.lower_scan(node.node_id, scan_tuple_id, scan)?;
+        let (scan_plan_node, scope, output_columns) =
+            self.lower_scan(node.node_id, scan_tuple_id, scan)?;
         Ok(LoweredDistributedNode {
             plan_nodes: vec![scan_plan_node],
             scope,
             tuple_ids: vec![scan_tuple_id],
-            output_columns: scan.columns.clone(),
+            output_columns,
             ordering: OrderingSpec::Any,
         })
     }
@@ -1746,10 +1845,14 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     node.node_id, exchange.source_fragment_id
                 )
             })?;
-        if source.tuple_ids != node.tuple_ids {
+        if !source
+            .tuple_ids
+            .iter()
+            .all(|tuple_id| node.tuple_ids.contains(tuple_id))
+        {
             return Err(format!(
-                "DistributedPlan Exchange node_id={} tuple_ids {:?} do not match source fragment id={} tuple_ids {:?}",
-                node.node_id, node.tuple_ids, exchange.source_fragment_id, source.tuple_ids
+                "DistributedPlan Exchange node_id={} boundary tuple_ids {:?} are not covered by exchange tuple_ids {:?} for source fragment id={}",
+                node.node_id, source.tuple_ids, node.tuple_ids, exchange.source_fragment_id
             ));
         }
         Ok(source)
@@ -2202,11 +2305,12 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         scan_node_id: i32,
         scan_tuple_id: i32,
         op: &super::kind::DistributedScanNode,
-    ) -> Result<(plan_nodes::TPlanNode, ExprScope), String> {
+    ) -> Result<(plan_nodes::TPlanNode, ExprScope, Vec<AnalysisOutputColumn>), String> {
         let state = &mut *self.state;
         let table = state.refresh_scan_table_for_codegen(&op.table)?;
 
         let mut scope = ExprScope::new();
+        let mut scan_output_columns = Vec::new();
         let qualifier = op.alias.as_deref().or(Some(&table.name));
         let mut slot_to_column = HashMap::new();
         let mut iceberg_metadata_pseudo_column_slots = BTreeSet::new();
@@ -2349,18 +2453,19 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             // scan's child scope without having to round-trip through the
             // display name. The dict-renamed `OutputColumn` carries the
             // source column's id so the lookup still hits.
-            let col_id = op
-                .columns
-                .iter()
-                .find(|oc| {
-                    let lc = oc.name.to_ascii_lowercase();
-                    lc == col.name.to_ascii_lowercase()
-                        || dict_target
-                            .map(|dc| lc == dc.dict_column.to_ascii_lowercase())
-                            .unwrap_or(false)
-                })
+            let output_column = op.columns.iter().find(|oc| {
+                let lc = oc.name.to_ascii_lowercase();
+                lc == col.name.to_ascii_lowercase()
+                    || dict_target
+                        .map(|dc| lc == dc.dict_column.to_ascii_lowercase())
+                        .unwrap_or(false)
+            });
+            let col_id = output_column
                 .map(|oc| oc.column_id)
                 .unwrap_or(crate::sql::column_id::ColumnId::UNSET);
+            if let Some(output_column) = output_column {
+                scan_output_columns.push(output_column.clone());
+            }
             scope.add_column_with_id(
                 col_id,
                 qualifier.map(|s| s.to_string()),
@@ -2420,12 +2525,16 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 type_desc: None,
                 nullable: col.nullable,
             };
-            let col_id = op
+            let output_column = op
                 .columns
                 .iter()
-                .find(|oc| oc.name.eq_ignore_ascii_case(&col.name))
+                .find(|oc| oc.name.eq_ignore_ascii_case(&col.name));
+            let col_id = output_column
                 .map(|oc| oc.column_id)
                 .unwrap_or(crate::sql::column_id::ColumnId::UNSET);
+            if let Some(output_column) = output_column {
+                scan_output_columns.push(output_column.clone());
+            }
             scope.add_column_with_id(
                 col_id,
                 qualifier.map(|s| s.to_string()),
@@ -2487,6 +2596,13 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 variant_column.synthetic_column.clone(),
                 binding,
             );
+            if let Some(output_column) = op
+                .columns
+                .iter()
+                .find(|column| column.column_id == variant_column.synthetic_column_id)
+            {
+                scan_output_columns.push(output_column.clone());
+            }
             variant_path_columns.push(plan_nodes::TVariantPathColumn::new(
                 Some(source_slot_id),
                 Some(output_slot_id),
@@ -2657,7 +2773,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             iceberg_metadata_pseudo_column_slots,
         });
 
-        Ok((scan_plan_node, scope))
+        Ok((scan_plan_node, scope, scan_output_columns))
     }
 
     pub(crate) fn lower_project(
@@ -2902,6 +3018,11 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 name.clone(),
                 binding.clone(),
             );
+            if let Some(output_column) = op.output_columns.get(agg_start_col + idx)
+                && output_column.column_id != agg_call.output_column_id
+            {
+                agg_scope.add_id_alias(output_column.column_id, binding.clone());
+            }
             let unqualified_name = agg_call_display_name_without_qualifiers(agg_call);
             if !unqualified_name.eq_ignore_ascii_case(&name) {
                 let _ = unqualified_name;
@@ -4615,6 +4736,198 @@ mod tests {
             arrow_type_from_desc(&final_contract.type_desc),
             Some(DataType::Float64)
         );
+    }
+
+    #[test]
+    fn boundary_tuple_ids_follow_output_columns_instead_of_internal_join_scope() {
+        let mut scope = ExprScope::new();
+        let left_col = ColumnId::new_for_test(10);
+        let right_col = ColumnId::new_for_test(20);
+        scope.add_column_with_id(
+            left_col,
+            None,
+            "left_c0".to_string(),
+            ColumnBinding {
+                tuple_id: 1,
+                slot_id: 11,
+                data_type: DataType::Int32,
+                type_desc: None,
+                nullable: false,
+            },
+        );
+        scope.add_column_with_id(
+            right_col,
+            None,
+            "right_c0".to_string(),
+            ColumnBinding {
+                tuple_id: 2,
+                slot_id: 21,
+                data_type: DataType::Int32,
+                type_desc: None,
+                nullable: false,
+            },
+        );
+        let output_columns = vec![OutputColumn {
+            column_id: right_col,
+            name: "right_c0".to_string(),
+            data_type: DataType::Int32,
+            nullable: false,
+            is_internal: false,
+        }];
+
+        let tuple_ids = super::boundary_tuple_ids_for_output_columns(
+            &scope,
+            &output_columns,
+            &output_columns,
+            &[1, 2],
+            false,
+            "test fragment",
+        )
+        .expect("boundary tuple ids");
+
+        assert_eq!(tuple_ids, vec![2]);
+    }
+
+    #[test]
+    fn boundary_tuple_ids_fall_back_to_lowered_output_positions_for_aliases() {
+        let source_col = ColumnId::new_for_test(100);
+        let alias_col = ColumnId::new_for_test(200);
+        let mut scope = ExprScope::new();
+        scope.add_column_with_id(
+            source_col,
+            None,
+            "sum_col".to_string(),
+            ColumnBinding {
+                tuple_id: 7,
+                slot_id: 70,
+                data_type: DataType::Int64,
+                type_desc: None,
+                nullable: true,
+            },
+        );
+        let lowered_output_columns = vec![OutputColumn {
+            column_id: source_col,
+            name: "sum_col".to_string(),
+            data_type: DataType::Int64,
+            nullable: true,
+            is_internal: false,
+        }];
+        let boundary_output_columns = vec![OutputColumn {
+            column_id: alias_col,
+            name: "c1".to_string(),
+            data_type: DataType::Int64,
+            nullable: true,
+            is_internal: false,
+        }];
+
+        let tuple_ids = super::boundary_tuple_ids_for_output_columns(
+            &scope,
+            &boundary_output_columns,
+            &lowered_output_columns,
+            &[1, 7],
+            false,
+            "test fragment",
+        )
+        .expect("boundary tuple ids");
+
+        assert_eq!(tuple_ids, vec![7]);
+    }
+
+    #[test]
+    fn boundary_tuple_ids_use_project_ordered_prefix_for_hidden_extra_outputs() {
+        let visible_c0 = ColumnId::new_for_test(10);
+        let visible_c1 = ColumnId::new_for_test(11);
+        let project_c0 = ColumnId::new_for_test(20);
+        let project_c1 = ColumnId::new_for_test(21);
+        let project_hidden = ColumnId::new_for_test(22);
+        let mut scope = ExprScope::new();
+        scope.add_column_with_id(
+            project_c0,
+            None,
+            "c0".to_string(),
+            ColumnBinding {
+                tuple_id: 5,
+                slot_id: 50,
+                data_type: DataType::Int32,
+                type_desc: None,
+                nullable: false,
+            },
+        );
+        scope.add_column_with_id(
+            project_c1,
+            None,
+            "c1".to_string(),
+            ColumnBinding {
+                tuple_id: 5,
+                slot_id: 51,
+                data_type: DataType::Int64,
+                type_desc: None,
+                nullable: true,
+            },
+        );
+        scope.add_column_with_id(
+            project_hidden,
+            None,
+            "__extra".to_string(),
+            ColumnBinding {
+                tuple_id: 5,
+                slot_id: 52,
+                data_type: DataType::Int64,
+                type_desc: None,
+                nullable: true,
+            },
+        );
+        let boundary_output_columns = vec![
+            OutputColumn {
+                column_id: visible_c0,
+                name: "c0".to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+                is_internal: false,
+            },
+            OutputColumn {
+                column_id: visible_c1,
+                name: "c1".to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+                is_internal: false,
+            },
+        ];
+        let lowered_output_columns = vec![
+            OutputColumn {
+                column_id: visible_c0,
+                name: "c0".to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+                is_internal: false,
+            },
+            OutputColumn {
+                column_id: visible_c1,
+                name: "c1".to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+                is_internal: false,
+            },
+            OutputColumn {
+                column_id: project_hidden,
+                name: "__extra".to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+                is_internal: true,
+            },
+        ];
+
+        let tuple_ids = super::boundary_tuple_ids_for_output_columns(
+            &scope,
+            &boundary_output_columns,
+            &lowered_output_columns,
+            &[5],
+            true,
+            "test project fragment",
+        )
+        .expect("boundary tuple ids");
+
+        assert_eq!(tuple_ids, vec![5]);
     }
 
     #[test]

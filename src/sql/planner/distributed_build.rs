@@ -177,6 +177,10 @@ impl<'a> DistributedPlanBuilder<'a> {
                 let child = self.visit(child_plan)?;
                 let node_id = self.alloc_node();
                 let tuple_id = self.alloc_tuple();
+                let mut items = materialize_project_items(self.scalars, &op.items);
+                for (item, output_column) in items.iter_mut().zip(node.output_columns.iter()) {
+                    item.output_column_id = output_column.column_id;
+                }
                 Ok(DistributedPlanNode {
                     node_id,
                     fragment_id,
@@ -189,7 +193,7 @@ impl<'a> DistributedPlanBuilder<'a> {
                     children: vec![child],
                     stats: stats_for_physical_node(node),
                     kind: PlanNodeKind::Project(DistributedProjectNode {
-                        items: materialize_project_items(self.scalars, &op.items),
+                        items,
                         output_qualifier: op.output_qualifier.clone(),
                     }),
                 })

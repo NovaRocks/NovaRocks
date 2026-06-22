@@ -3694,6 +3694,34 @@ pub(crate) fn dispatcher_kind_for_test(
     }
 }
 
+#[cfg(test)]
+pub(crate) struct StandaloneLoopbackTestBackend {
+    pub(crate) exchange_port: u16,
+    _registry_guard: crate::runtime::backend_registry::BackendRegistryTestGuard,
+    _test_guard: TestSerializationGuard,
+}
+
+#[cfg(test)]
+pub(crate) fn install_all_in_one_loopback_backend_for_test()
+-> Result<StandaloneLoopbackTestBackend, String> {
+    let test_guard = acquire_standalone_test_guard();
+    let registry_guard = crate::runtime::backend_registry::BackendRegistryTestGuard::new();
+    let cfg = crate::novarocks_config::install_default_for_test();
+    let exchange_port = ensure_standalone_exchange_server()?;
+    let endpoint: std::net::SocketAddr = format!("127.0.0.1:{exchange_port}")
+        .parse()
+        .map_err(|e| format!("parse all-in-one test loopback endpoint failed: {e}"))?;
+    backend_ops::install_all_in_one_backend_registry(
+        endpoint,
+        cfg.cluster.heartbeat_timeout_retries,
+    )?;
+    Ok(StandaloneLoopbackTestBackend {
+        exchange_port,
+        _registry_guard: registry_guard,
+        _test_guard: test_guard,
+    })
+}
+
 fn ensure_standalone_exchange_server() -> Result<u16, String> {
     static STANDALONE_EXCHANGE_PORT: OnceLock<u16> = OnceLock::new();
 

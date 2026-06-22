@@ -209,3 +209,53 @@ pub fn eval_time_to_sec(
 
     Ok(Arc::new(Int64Array::from(out)) as ArrayRef)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::ids::SlotId;
+    use crate::exec::chunk::ChunkSchema;
+    use crate::exec::expr::function::FunctionKind;
+    use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
+    use arrow::array::{Array, Int32Array};
+    use arrow::datatypes::{Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    fn one_row_chunk() -> Chunk {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "dummy",
+            DataType::Int32,
+            true,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1]))]).unwrap();
+        let chunk_schema =
+            ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &[SlotId(1)])
+                .expect("chunk schema");
+        Chunk::new_with_chunk_schema(batch, chunk_schema)
+    }
+
+    #[test]
+    fn time_to_sec_preserves_sec_to_time_negative_roundtrip() {
+        let mut arena = ExprArena::default();
+        let arg = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(-1)), DataType::Int64);
+        let sec_to_time = arena.push_typed(
+            ExprNode::FunctionCall {
+                kind: FunctionKind::Date("sec_to_time"),
+                args: vec![arg],
+            },
+            DataType::Utf8,
+        );
+        let time_to_sec = arena.push_typed(
+            ExprNode::FunctionCall {
+                kind: FunctionKind::Date("time_to_sec"),
+                args: vec![sec_to_time],
+            },
+            DataType::Int64,
+        );
+
+        let out = arena.eval(time_to_sec, &one_row_chunk()).expect("eval");
+        let out = out.as_any().downcast_ref::<Int64Array>().expect("int64");
+        assert_eq!(out.value(0), -1);
+    }
+}

@@ -146,6 +146,79 @@ fn eligible(scalars: &ScalarArena, id: ScalarId) -> bool {
     }
 }
 
+fn cse_semantic_guard_ids(scalars: &ScalarArena, roots: &[ScalarId]) -> HashSet<ScalarId> {
+    let mut guards = HashSet::new();
+    for &root in roots {
+        collect_cse_semantic_guard_ids(scalars, root, &mut guards);
+    }
+    guards
+}
+
+fn is_complex_data_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)
+    )
+}
+
+fn collect_cse_semantic_guard_ids(
+    scalars: &ScalarArena,
+    id: ScalarId,
+    guards: &mut HashSet<ScalarId>,
+) {
+    if let ScalarNode::FunctionCall { name, args, .. } = scalars.node(id)
+        && name == "time_to_sec"
+    {
+        for &arg in args {
+            guard_sec_to_time_source_path(scalars, arg, guards);
+        }
+    }
+    if let ScalarNode::InList { child, .. } = scalars.node(id)
+        && is_complex_data_type(scalars.data_type(*child))
+        && !scalar_contains_column_ref(scalars, *child)
+    {
+        guard_subtree(scalars, *child, guards);
+    }
+    for child in child_ids(scalars, id) {
+        collect_cse_semantic_guard_ids(scalars, child, guards);
+    }
+}
+
+fn scalar_contains_column_ref(scalars: &ScalarArena, id: ScalarId) -> bool {
+    match scalars.node(id) {
+        ScalarNode::ColumnRef(_) => true,
+        _ => child_ids(scalars, id)
+            .into_iter()
+            .any(|child| scalar_contains_column_ref(scalars, child)),
+    }
+}
+
+fn guard_subtree(scalars: &ScalarArena, id: ScalarId, guards: &mut HashSet<ScalarId>) {
+    if !guards.insert(id) {
+        return;
+    }
+    for child in child_ids(scalars, id) {
+        guard_subtree(scalars, child, guards);
+    }
+}
+
+fn guard_sec_to_time_source_path(
+    scalars: &ScalarArena,
+    id: ScalarId,
+    guards: &mut HashSet<ScalarId>,
+) {
+    match scalars.node(id) {
+        ScalarNode::FunctionCall { name, .. } if name == "sec_to_time" => {
+            guards.insert(id);
+        }
+        ScalarNode::Cast { child, .. } | ScalarNode::Nested(child) => {
+            guards.insert(id);
+            guard_sec_to_time_source_path(scalars, *child, guards);
+        }
+        _ => {}
+    }
+}
+
 fn first_seen_order(scalars: &ScalarArena, roots: &[ScalarId]) -> HashMap<ScalarId, usize> {
     let mut order = HashMap::new();
     let mut next = 0;
@@ -158,10 +231,11 @@ fn first_seen_order(scalars: &ScalarArena, roots: &[ScalarId]) -> HashMap<Scalar
 fn pick_commons(scalars: &ScalarArena, roots: &[ScalarId]) -> Vec<ScalarId> {
     let counts = count_subexprs(scalars, roots);
     let first_seen = first_seen_order(scalars, roots);
+    let semantic_guards = cse_semantic_guard_ids(scalars, roots);
     let mut candidates = counts
         .into_iter()
         .filter_map(|(id, count)| {
-            if count >= 2 && eligible(scalars, id) {
+            if count >= 2 && !semantic_guards.contains(&id) && eligible(scalars, id) {
                 Some(id)
             } else {
                 None
@@ -472,6 +546,23 @@ fn output_column_for_project_item(scalars: &ScalarArena, item: &ScalarProjectIte
     }
 }
 
+fn repeat_virtual_output_columns(node: &PhysicalPlanNode) -> Vec<OutputColumn> {
+    let Operator::PhysicalRepeat(repeat) = &node.op else {
+        return Vec::new();
+    };
+    repeat
+        .grouping_fn_ids
+        .iter()
+        .map(|(name, column_id)| OutputColumn {
+            column_id: *column_id,
+            name: name.clone(),
+            data_type: DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        })
+        .collect()
+}
+
 fn available_output_ids(node: &PhysicalPlanNode) -> HashSet<ColumnId> {
     match &node.op {
         Operator::PhysicalScan(scan) => {
@@ -646,11 +737,21 @@ fn wrap_project_around_child(
 ) {
     let original = child.clone();
     let available = available_output_ids(&original);
-    let passthrough_columns = original
+    let mut passthrough_columns = original
         .output_columns
         .iter()
         .filter(|column| available.contains(&column.column_id))
+        .cloned()
         .collect::<Vec<_>>();
+    let mut seen_passthrough = passthrough_columns
+        .iter()
+        .map(|column| column.column_id)
+        .collect::<HashSet<_>>();
+    for column in repeat_virtual_output_columns(&original) {
+        if available.contains(&column.column_id) && seen_passthrough.insert(column.column_id) {
+            passthrough_columns.push(column);
+        }
+    }
     let mut items = Vec::with_capacity(passthrough_columns.len() + prelude.len());
     for column in &passthrough_columns {
         let expr = scalars.intern(
@@ -667,7 +768,7 @@ fn wrap_project_around_child(
     }
     items.extend(prelude.iter().cloned());
 
-    let mut output_columns = passthrough_columns.into_iter().cloned().collect::<Vec<_>>();
+    let mut output_columns = passthrough_columns;
     output_columns.extend(
         prelude
             .iter()
@@ -1062,7 +1163,8 @@ fn rewrite_window(
 
 #[cfg(test)]
 mod tests {
-    use arrow::datatypes::DataType;
+    use arrow::datatypes::{DataType, Field, Fields};
+    use std::sync::Arc;
 
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::OutputColumn;
@@ -1070,8 +1172,8 @@ mod tests {
     use crate::sql::optimizer::operator::{
         AggMode, FilterOp, JoinDistribution, Operator, PhysicalHashAggregateOp,
         PhysicalHashJoinEqCondition, PhysicalHashJoinOp, PhysicalNestLoopJoinOp, ProjectOp,
-        ScalarAggregateSpec, ScalarProjectItem, ScalarWindowSpec, SortOp, TopNOp, TopNPhase,
-        ValuesOp, WindowOp,
+        RepeatOp, ScalarAggregateSpec, ScalarProjectItem, ScalarWindowSpec, SortOp, TopNOp,
+        TopNPhase, ValuesOp, WindowOp,
     };
     use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, PlanExecutionProps};
     use crate::sql::optimizer::scalar::{
@@ -1263,6 +1365,87 @@ mod tests {
 
         assert_eq!(
             pick_commons(&arena, &[current_timestamp, current_timestamp]),
+            Vec::<ScalarId>::new()
+        );
+    }
+
+    #[test]
+    fn sec_to_time_source_for_time_to_sec_is_not_common_candidate() {
+        let mut arena = ScalarArena::new();
+        let minus_one = int_lit(&mut arena, -1);
+        let sec_to_time = call(&mut arena, "sec_to_time", vec![minus_one]);
+        let time_to_sec = call(&mut arena, "time_to_sec", vec![sec_to_time]);
+
+        assert_eq!(
+            pick_commons(&arena, &[sec_to_time, time_to_sec]),
+            Vec::<ScalarId>::new()
+        );
+    }
+
+    #[test]
+    fn complex_literal_in_list_lhs_is_not_common_candidate() {
+        let mut arena = ScalarArena::new();
+        let null = arena.intern(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Null)),
+            DataType::Null,
+            true,
+        );
+        let null_array_type = DataType::List(Arc::new(Field::new("item", DataType::Null, true)));
+        let null_array = arena.intern(
+            ScalarNode::FunctionCall {
+                name: "__array_literal".to_string(),
+                args: vec![null],
+                distinct: false,
+            },
+            null_array_type,
+            false,
+        );
+        let map_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(Fields::from(vec![
+                    Arc::new(Field::new("key", DataType::Int32, true)),
+                    Arc::new(Field::new("value", DataType::Int32, true)),
+                ])),
+                false,
+            )),
+            false,
+        );
+        let array_map_type = DataType::List(Arc::new(Field::new("item", map_type, true)));
+        let cast_null_array = arena.intern(
+            ScalarNode::Cast {
+                child: null_array,
+                target: array_map_type.clone(),
+            },
+            array_map_type.clone(),
+            false,
+        );
+        let candidate = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(10)),
+            array_map_type.clone(),
+            true,
+        );
+        let in_list = arena.intern(
+            ScalarNode::InList {
+                child: cast_null_array,
+                list: vec![candidate],
+                negated: false,
+            },
+            DataType::Boolean,
+            true,
+        );
+        let not_in_list = arena.intern(
+            ScalarNode::InList {
+                child: cast_null_array,
+                list: vec![candidate],
+                negated: true,
+            },
+            DataType::Boolean,
+            true,
+        );
+
+        assert_eq!(
+            pick_commons(&arena, &[in_list, not_in_list]),
             Vec::<ScalarId>::new()
         );
     }
@@ -1689,6 +1872,75 @@ mod tests {
                 .map(|column| column.name.as_str())
                 .collect::<Vec<_>>(),
             vec!["a", "b", "__cse_0"]
+        );
+    }
+
+    #[test]
+    fn insert_or_reuse_project_below_preserves_repeat_grouping_outputs() {
+        let mut arena = ScalarArena::new();
+        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+        let a = col(&mut arena, 101);
+        let b = col(&mut arena, 102);
+        let a_plus_b = add(&mut arena, a, b);
+        let (prelude, _) = super::build_commons(&mut arena, &mut factory, &[a_plus_b]);
+        let values = values_node(vec![output_column(101, "a"), output_column(102, "b")]);
+        let mut repeat = PhysicalPlanNode {
+            op: Operator::PhysicalRepeat(RepeatOp {
+                repeat_column_ref_list: vec![vec!["a".to_string()]],
+                repeat_column_ref_ids: vec![vec![ColumnId(101)]],
+                grouping_ids: vec![0, 1],
+                all_rollup_columns: vec!["a".to_string()],
+                all_rollup_column_ids: vec![ColumnId(101)],
+                grouping_key_aliases: vec![],
+                grouping_fn_args: vec![("__grouping_fn_0".to_string(), vec!["a".to_string()])],
+                grouping_fn_arg_ids: vec![vec![ColumnId(101)]],
+                grouping_fn_ids: vec![("__grouping_fn_0".to_string(), ColumnId(109))],
+            }),
+            children: vec![values],
+            stats: Statistics::default(),
+            output_columns: vec![output_column(101, "a"), output_column(102, "b")],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+
+        super::insert_or_reuse_project_below(&mut repeat, prelude, &mut arena);
+
+        let Operator::PhysicalProject(project) = &repeat.op else {
+            panic!("expected inserted project above repeat");
+        };
+        assert_eq!(
+            project
+                .items
+                .iter()
+                .map(|item| item.output_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "__grouping_fn_0", "__cse_0"]
+        );
+        assert_eq!(
+            repeat
+                .output_columns
+                .iter()
+                .map(|column| {
+                    (
+                        column.column_id,
+                        column.name.as_str(),
+                        column.data_type.clone(),
+                        column.nullable,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                (ColumnId(101), "a", DataType::Int64, true),
+                (ColumnId(102), "b", DataType::Int64, true),
+                (ColumnId(109), "__grouping_fn_0", DataType::Int64, false),
+                (
+                    project.items[3].output_column_id,
+                    "__cse_0",
+                    DataType::Int64,
+                    true
+                ),
+            ]
         );
     }
 

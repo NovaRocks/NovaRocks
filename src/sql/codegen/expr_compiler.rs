@@ -2219,7 +2219,7 @@ fn infer_scalar_function_return_type(
             arrow::datatypes::TimeUnit::Microsecond,
             None,
         )),
-        "date_format" | "from_unixtime" | "time_format" => Ok(DataType::Utf8),
+        "date_format" | "from_unixtime" | "time_format" | "sec_to_time" => Ok(DataType::Utf8),
         // `add_months` always returns DATETIME in StarRocks regardless of
         // input width, so handle it separately from the other date-shift
         // functions which preserve the first-arg type.
@@ -2229,9 +2229,8 @@ fn infer_scalar_function_return_type(
         )),
         "date_add" | "date_sub" | "adddate" | "subdate" | "days_add" | "days_sub" | "weeks_add"
         | "weeks_sub" | "months_add" | "months_sub" | "years_add" | "years_sub"
-        | "timestampadd" | "sec_to_time" | "hours_add" | "hours_sub" | "minutes_add"
-        | "minutes_sub" | "seconds_add" | "seconds_sub" | "microseconds_add"
-        | "microseconds_sub" => {
+        | "timestampadd" | "hours_add" | "hours_sub" | "minutes_add" | "minutes_sub"
+        | "seconds_add" | "seconds_sub" | "microseconds_add" | "microseconds_sub" => {
             let input_type = arg_types.first().cloned().unwrap_or(DataType::Timestamp(
                 arrow::datatypes::TimeUnit::Microsecond,
                 None,
@@ -4032,6 +4031,15 @@ mod tests {
         assert_eq!(
             infer_date_trunc_return_type(&[DataType::Utf8, DataType::Date32]),
             DataType::Date32
+        );
+    }
+
+    #[test]
+    fn sec_to_time_type_inference_is_utf8() {
+        assert_eq!(
+            infer_scalar_function_return_type("sec_to_time", &[DataType::Int64])
+                .expect("sec_to_time type inference"),
+            DataType::Utf8
         );
     }
 

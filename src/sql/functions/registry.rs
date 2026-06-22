@@ -507,11 +507,11 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
             Signature::new(vec![TypeSpec::Date, TypeSpec::Int64], TypeSpec::Date),
         );
     }
-    // sec_to_time: Int -> Datetime
+    // sec_to_time formats an integer second count as a TIME string.
     add(
         m,
         "sec_to_time",
-        Signature::new(vec![TypeSpec::Int64], TypeSpec::Datetime),
+        Signature::new(vec![TypeSpec::Int64], TypeSpec::Utf8),
     );
 
     // date_trunc(unit, datetime) -> datetime; date_trunc(unit, date) -> date

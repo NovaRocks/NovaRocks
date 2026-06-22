@@ -314,7 +314,6 @@ impl HashJoinProbeCore {
 
     /// Extend a build-only batch with NULL-filled probe-side columns.
     /// Mirror of `extend_with_null_build_columns` for RIGHT SEMI/ANTI.
-    #[allow(dead_code)] // used by planned right-semi/anti join paths
     fn extend_with_null_probe_columns(&self, build_batch: RecordBatch) -> Result<Chunk, String> {
         use crate::exec::chunk::ChunkSchema;
         use arrow::array::new_null_array;
@@ -346,6 +345,19 @@ impl HashJoinProbeCore {
         );
         Chunk::try_new_with_columns(chunk_schema, columns)
             .map_err(|e| format!("extend_with_null_probe_columns: {e}"))
+    }
+
+    pub(crate) fn right_semi_anti_output_chunk(
+        &mut self,
+        build_output: Option<RecordBatch>,
+    ) -> Result<Option<Chunk>, String> {
+        let Some(build_batch) = build_output else {
+            return Ok(None);
+        };
+        self.output_rows = self
+            .output_rows
+            .saturating_add(build_batch.num_rows() as u64);
+        Ok(Some(self.extend_with_null_probe_columns(build_batch)?))
     }
 
     pub(crate) fn join_probe_chunks(

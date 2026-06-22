@@ -331,18 +331,12 @@ impl PartitionedJoinProbeProcessorOperator {
         let mut out = self.core.join_probe_chunks(probe_chunks)?;
         match self.core.join_type() {
             JoinType::RightAnti if self.core.probe_is_left() => {
-                let schema = Arc::clone(self.core.build_chunk_schema());
                 let build_out = self.core.build_right_semi_anti_output(false)?;
-                out = self
-                    .core
-                    .merge_join_outputs(None, build_out, &schema, true)?;
+                out = self.core.right_semi_anti_output_chunk(build_out)?;
             }
             JoinType::RightSemi if self.core.probe_is_left() => {
-                let schema = Arc::clone(self.core.build_chunk_schema());
                 let build_out = self.core.build_right_semi_anti_output(true)?;
-                out = self
-                    .core
-                    .merge_join_outputs(None, build_out, &schema, true)?;
+                out = self.core.right_semi_anti_output_chunk(build_out)?;
             }
             JoinType::FullOuter | JoinType::RightOuter => {
                 let schema = Arc::clone(self.core.join_scope_chunk_schema());
@@ -638,6 +632,31 @@ mod tests {
         let c1 = chunk
             .columns()
             .get(1)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        for i in 0..chunk.len() {
+            out.push((c0.value(i), c1.value(i)));
+        }
+    }
+
+    fn append_pair_columns(
+        chunk: Chunk,
+        left_index: usize,
+        right_index: usize,
+        out: &mut Vec<(i32, i32)>,
+    ) {
+        let c0 = chunk
+            .columns()
+            .get(left_index)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let c1 = chunk
+            .columns()
+            .get(right_index)
             .unwrap()
             .as_any()
             .downcast_ref::<Int32Array>()
@@ -1533,13 +1552,13 @@ mod tests {
             push_expect_consumed(proc, &rt, c);
             while proc.has_output() {
                 if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_pairs(out, &mut rows);
+                    append_pair_columns(out, 2, 3, &mut rows);
                 }
             }
             proc.set_finishing(&rt).expect("probe finish");
             while proc.has_output() {
                 if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_pairs(out, &mut rows);
+                    append_pair_columns(out, 2, 3, &mut rows);
                 }
             }
         }
