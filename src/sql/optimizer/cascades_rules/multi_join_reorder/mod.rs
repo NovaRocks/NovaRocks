@@ -16,9 +16,9 @@ use crate::sql::optimizer::memo::GroupId;
 use crate::sql::optimizer::scalar::ScalarId;
 use crate::sql::optimizer::statistics::Statistics;
 
-pub(crate) use algo::{ReorderCaps, enumerate_orders};
+pub(crate) use algo::{enumerate_orders, ReorderCaps};
 pub(crate) use flatten::flatten_join_chain;
-pub(crate) use pass::{ReorderOptions, run_multi_join_reorder};
+pub(crate) use pass::{run_multi_join_reorder, ReorderOptions};
 
 /// A flattened inner/cross join chain: the leaf atoms (existing memo groups,
 /// with their cached output statistics) plus the multi-relation predicates that
@@ -40,14 +40,11 @@ pub(crate) struct MultiJoinGraph {
     /// these in `Memo::reorder_owned_groups` so `explore` skips
     /// `JoinAssociativity` on them (D2).
     pub(crate) chain_join_groups: Vec<GroupId>,
-    /// Cross-atom equivalence classes derived from the chain's own `col = col`
-    /// equi conjuncts, used to synthesize *transitive* equi-join edges
-    /// (`a=b ∧ b=c ⟹ a=c`) on demand during enumeration. Each class is the
-    /// generating column set spread across the atoms — O(atoms-in-class), never
-    /// the C(k,2) pairwise closure (the gap2 OOM vector); the reorder
-    /// enumeration consults these to make a transitively-connected atom pair
-    /// joinable and synthesizes exactly one connecting predicate per straddling
-    /// class, reusing already-interned column-ref scalars (no fresh deep copies).
+    /// Cross-atom strict equivalence classes projected from the root group's
+    /// `LogicalProperties.equivalence_classes`. These are used to synthesize
+    /// transitive `col = col` edges on demand during enumeration. Raw join
+    /// predicates still provide literal edge masks; this field is only the
+    /// strict transitive fact source.
     pub(crate) equi_classes: Vec<EquiClass>,
 }
 
