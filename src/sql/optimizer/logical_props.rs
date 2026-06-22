@@ -53,13 +53,13 @@ pub(crate) fn derive_for_expr(
     match &expr.op {
         Operator::LogicalFilter(filter) => {
             inherit_from_child(memo, expr, 0, &output_ids, &mut props);
-            for (left, right) in collect_column_equalities(&memo.scalars, filter.predicate) {
+            for (left, right) in collect_strict_column_equalities(&memo.scalars, filter.predicate) {
                 props.equivalence_classes.merge_pair(left, right);
             }
         }
         Operator::PhysicalFilter(filter) => {
             inherit_from_child(memo, expr, 0, &output_ids, &mut props);
-            for (left, right) in collect_column_equalities(&memo.scalars, filter.predicate) {
+            for (left, right) in collect_strict_column_equalities(&memo.scalars, filter.predicate) {
                 props.equivalence_classes.merge_pair(left, right);
             }
         }
@@ -68,7 +68,8 @@ pub(crate) fn derive_for_expr(
                 inherit_from_child(memo, expr, 0, &output_ids, &mut props);
                 inherit_from_child(memo, expr, 1, &output_ids, &mut props);
                 if let Some(condition) = &join.condition {
-                    for (left, right) in collect_column_equalities(&memo.scalars, *condition) {
+                    for (left, right) in collect_strict_column_equalities(&memo.scalars, *condition)
+                    {
                         props.equivalence_classes.merge_pair(left, right);
                     }
                 }
@@ -80,6 +81,9 @@ pub(crate) fn derive_for_expr(
                 inherit_from_child(memo, expr, 0, &output_ids, &mut props);
                 inherit_from_child(memo, expr, 1, &output_ids, &mut props);
                 for eq in &join.eq_conditions {
+                    if eq.null_safe {
+                        continue;
+                    }
                     if let (Some(left), Some(right)) = (
                         column_id_from_scalar(&memo.scalars, eq.left),
                         column_id_from_scalar(&memo.scalars, eq.right),
@@ -88,7 +92,8 @@ pub(crate) fn derive_for_expr(
                     }
                 }
                 if let Some(condition) = &join.other_condition {
-                    for (left, right) in collect_column_equalities(&memo.scalars, *condition) {
+                    for (left, right) in collect_strict_column_equalities(&memo.scalars, *condition)
+                    {
                         props.equivalence_classes.merge_pair(left, right);
                     }
                 }
@@ -182,33 +187,33 @@ pub(crate) fn column_id_from_scalar(scalars: &ScalarArena, expr: ScalarId) -> Op
     }
 }
 
-pub(crate) fn collect_column_equalities(
+pub(crate) fn collect_strict_column_equalities(
     scalars: &ScalarArena,
     expr: ScalarId,
 ) -> Vec<(ColumnId, ColumnId)> {
     let mut out = Vec::new();
-    collect_column_equalities_inner(scalars, expr, &mut out);
+    collect_strict_column_equalities_inner(scalars, expr, &mut out);
     out
 }
 
-fn collect_column_equalities_inner(
+fn collect_strict_column_equalities_inner(
     scalars: &ScalarArena,
     expr: ScalarId,
     out: &mut Vec<(ColumnId, ColumnId)>,
 ) {
     match scalars.node(expr) {
-        ScalarNode::Nested(inner) => collect_column_equalities_inner(scalars, *inner, out),
+        ScalarNode::Nested(inner) => collect_strict_column_equalities_inner(scalars, *inner, out),
         ScalarNode::BinaryOp {
             left,
             op: BinOp::And,
             right,
         } => {
-            collect_column_equalities_inner(scalars, *left, out);
-            collect_column_equalities_inner(scalars, *right, out);
+            collect_strict_column_equalities_inner(scalars, *left, out);
+            collect_strict_column_equalities_inner(scalars, *right, out);
         }
         ScalarNode::BinaryOp {
             left,
-            op: BinOp::Eq | BinOp::EqForNull,
+            op: BinOp::Eq,
             right,
         } => {
             if let (Some(left_id), Some(right_id)) = (
@@ -365,7 +370,10 @@ mod tests {
     use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::optimizer::memo::MExpr;
-    use crate::sql::optimizer::operator::{FilterOp, LogicalJoinOp, ScanOp};
+    use crate::sql::optimizer::operator::{
+        FilterOp, JoinDistribution, LogicalJoinOp, PhysicalHashJoinEqCondition, PhysicalHashJoinOp,
+        ScanOp,
+    };
     use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
     use crate::sql::planner::plan::*;
     use std::path::PathBuf;
@@ -395,6 +403,18 @@ mod tests {
             kind: ExprKind::BinaryOp {
                 left: Box::new(left),
                 op: BinOp::Eq,
+                right: Box::new(right),
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        }
+    }
+
+    fn eq_for_null(left: TypedExpr, right: TypedExpr) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(left),
+                op: BinOp::EqForNull,
                 right: Box::new(right),
             },
             data_type: DataType::Boolean,
@@ -451,15 +471,29 @@ mod tests {
     }
 
     #[test]
-    fn collect_column_equalities_reads_top_level_and() {
+    fn collect_strict_column_equalities_reads_top_level_and() {
         let predicate = and(eq(col(1, "a"), col(2, "b")), eq(col(1, "a"), lit(10)));
         let mut arena = ScalarArena::new();
         let predicate = intern_typed(&mut arena, &predicate);
         assert_eq!(
-            collect_column_equalities(&arena, predicate),
+            collect_strict_column_equalities(&arena, predicate),
             vec![(ColumnId(1), ColumnId(2))]
         );
         assert_eq!(collect_literal_equalities(&arena, predicate).len(), 1);
+    }
+
+    #[test]
+    fn collect_strict_column_equalities_ignores_null_safe_equality() {
+        let predicate = and(
+            eq(col(1, "a"), col(2, "b")),
+            eq_for_null(col(3, "c"), col(4, "d")),
+        );
+        let mut arena = ScalarArena::new();
+        let predicate = intern_typed(&mut arena, &predicate);
+        assert_eq!(
+            collect_strict_column_equalities(&arena, predicate),
+            vec![(ColumnId(1), ColumnId(2))]
+        );
     }
 
     #[test]
@@ -491,6 +525,37 @@ mod tests {
         assert_eq!(
             class.iter().collect::<Vec<_>>(),
             vec![ColumnId(1), ColumnId(2)]
+        );
+    }
+
+    #[test]
+    fn filter_derivation_ignores_null_safe_column_equality() {
+        let mut memo = Memo::new();
+        let child = scan_group(&mut memo, 1, "a");
+        memo.groups[child].logical_props = Some(LogicalProperties::new(
+            vec![output(1, "a"), output(2, "b")],
+            100.0,
+        ));
+        let predicate = intern_typed(&mut memo.scalars, &eq_for_null(col(1, "a"), col(2, "b")));
+        let filter = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalFilter(FilterOp { predicate }),
+            children: vec![child],
+        });
+        let props = derive_for_group(
+            &memo,
+            filter,
+            vec![output(1, "a"), output(2, "b")],
+            50.0,
+            Confidence::Estimated,
+            std::collections::HashMap::new(),
+        );
+        assert!(
+            props
+                .equivalence_classes
+                .class_containing(ColumnId(1))
+                .is_none(),
+            "null-safe equality must not populate the strict equivalence store"
         );
     }
 
@@ -554,17 +619,96 @@ mod tests {
             Confidence::Estimated,
             std::collections::HashMap::new(),
         );
-        assert!(
-            props
-                .equivalence_classes
-                .class_containing(ColumnId(1))
-                .is_none()
+        assert!(props
+            .equivalence_classes
+            .class_containing(ColumnId(1))
+            .is_none());
+        assert!(props
+            .equivalence_classes
+            .class_containing(ColumnId(2))
+            .is_none());
+    }
+
+    #[test]
+    fn physical_hash_join_derivation_skips_null_safe_hash_key() {
+        let mut memo = Memo::new();
+        let left = scan_group(&mut memo, 1, "lk");
+        let right = scan_group(&mut memo, 2, "rk");
+        memo.groups[left].logical_props = Some(LogicalProperties::new(vec![output(1, "lk")], 10.0));
+        memo.groups[right].logical_props =
+            Some(LogicalProperties::new(vec![output(2, "rk")], 10.0));
+        let left_key = intern_typed(&mut memo.scalars, &col(1, "lk"));
+        let right_key = intern_typed(&mut memo.scalars, &col(2, "rk"));
+        let join = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: left_key,
+                    right: right_key,
+                    null_safe: true,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+            }),
+            children: vec![left, right],
+        });
+        let props = derive_for_group(
+            &memo,
+            join,
+            vec![output(1, "lk"), output(2, "rk")],
+            10.0,
+            Confidence::Estimated,
+            std::collections::HashMap::new(),
         );
         assert!(
             props
                 .equivalence_classes
-                .class_containing(ColumnId(2))
-                .is_none()
+                .class_containing(ColumnId(1))
+                .is_none(),
+            "null-safe hash join key must not populate the strict equivalence store"
+        );
+    }
+
+    #[test]
+    fn physical_hash_join_derivation_keeps_strict_hash_key() {
+        let mut memo = Memo::new();
+        let left = scan_group(&mut memo, 1, "lk");
+        let right = scan_group(&mut memo, 2, "rk");
+        memo.groups[left].logical_props = Some(LogicalProperties::new(vec![output(1, "lk")], 10.0));
+        memo.groups[right].logical_props =
+            Some(LogicalProperties::new(vec![output(2, "rk")], 10.0));
+        let left_key = intern_typed(&mut memo.scalars, &col(1, "lk"));
+        let right_key = intern_typed(&mut memo.scalars, &col(2, "rk"));
+        let join = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: left_key,
+                    right: right_key,
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+            }),
+            children: vec![left, right],
+        });
+        let props = derive_for_group(
+            &memo,
+            join,
+            vec![output(1, "lk"), output(2, "rk")],
+            10.0,
+            Confidence::Estimated,
+            std::collections::HashMap::new(),
+        );
+        let class = props
+            .equivalence_classes
+            .class_containing(ColumnId(1))
+            .expect("strict hash join key equivalence class");
+        assert_eq!(
+            class.iter().collect::<Vec<_>>(),
+            vec![ColumnId(1), ColumnId(2)]
         );
     }
 }

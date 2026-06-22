@@ -3,8 +3,8 @@
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::{JoinKind, OutputColumn};
 use crate::sql::optimizer::logical_props::{
-    collect_column_equalities, collect_literal_equalities, combine_with_and, literal_signature,
-    make_eq_literal_predicate,
+    collect_literal_equalities, collect_strict_column_equalities, combine_with_and,
+    literal_signature, make_eq_literal_predicate,
 };
 use crate::sql::optimizer::memo::{GroupId, LogicalProperties, MExpr, Memo};
 use crate::sql::optimizer::operator::{FilterOp, LogicalJoinOp, Operator};
@@ -154,7 +154,7 @@ fn expand_literals_with_equivalence(
 fn join_column_pairs(memo: &Memo, join: &LogicalJoinOp) -> Vec<(ColumnId, ColumnId)> {
     join.condition
         .as_ref()
-        .map(|condition| collect_column_equalities(&memo.scalars, *condition))
+        .map(|condition| collect_strict_column_equalities(&memo.scalars, *condition))
         .unwrap_or_default()
 }
 
@@ -355,6 +355,18 @@ mod tests {
         }
     }
 
+    fn eq_for_null(left: TypedExpr, right: TypedExpr) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(left),
+                op: BinOp::EqForNull,
+                right: Box::new(right),
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        }
+    }
+
     fn and(left: TypedExpr, right: TypedExpr) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::BinaryOp {
@@ -447,7 +459,7 @@ mod tests {
             children: vec![left, right],
         });
         let mut props = LogicalProperties::new(outputs, 10.0);
-        for (left, right) in collect_column_equalities(&memo.scalars, condition_id) {
+        for (left, right) in collect_strict_column_equalities(&memo.scalars, condition_id) {
             props.equivalence_classes.merge_pair(left, right);
         }
         memo.groups[group].logical_props = Some(props);
@@ -484,6 +496,29 @@ mod tests {
     }
 
     #[test]
+    fn does_not_propagate_literal_across_null_safe_join_pair() {
+        let mut memo = Memo::new();
+        let left = scan_group(&mut memo, 1, "lk");
+        let right = scan_group(&mut memo, 2, "rk");
+        let join = join_mexpr(
+            &mut memo,
+            JoinKind::Inner,
+            and(
+                eq_for_null(col(1, "lk"), col(2, "rk")),
+                eq(col(1, "lk"), lit(10)),
+            ),
+            vec![left, right],
+        );
+
+        assert!(
+            InnerJoinEquivalencePredicateRule
+                .apply(&join, &mut memo)
+                .is_empty(),
+            "strict-only pass must not use a null-safe join pair for literal propagation"
+        );
+    }
+
+    #[test]
     fn does_not_fire_for_left_outer_join() {
         let mut memo = Memo::new();
         let left = scan_group(&mut memo, 1, "lk");
@@ -495,11 +530,9 @@ mod tests {
             vec![left, right],
         );
         assert!(!InnerJoinEquivalencePredicateRule.matches(&join.op));
-        assert!(
-            InnerJoinEquivalencePredicateRule
-                .apply(&join, &mut memo)
-                .is_empty()
-        );
+        assert!(InnerJoinEquivalencePredicateRule
+            .apply(&join, &mut memo)
+            .is_empty());
     }
 
     #[test]
@@ -524,11 +557,9 @@ mod tests {
             and(eq(col(1, "lk"), col(2, "rk")), eq(col(1, "lk"), lit(10))),
             vec![left, right_filter],
         );
-        assert!(
-            InnerJoinEquivalencePredicateRule
-                .apply(&join, &mut memo)
-                .is_empty()
-        );
+        assert!(InnerJoinEquivalencePredicateRule
+            .apply(&join, &mut memo)
+            .is_empty());
     }
 
     #[test]
@@ -551,11 +582,9 @@ mod tests {
             vec![left_join, right],
         );
 
-        assert!(
-            InnerJoinEquivalencePredicateRule
-                .apply(&join, &mut memo)
-                .is_empty()
-        );
+        assert!(InnerJoinEquivalencePredicateRule
+            .apply(&join, &mut memo)
+            .is_empty());
     }
 
     #[test]
