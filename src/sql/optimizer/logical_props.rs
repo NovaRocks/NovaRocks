@@ -619,14 +619,18 @@ mod tests {
             Confidence::Estimated,
             std::collections::HashMap::new(),
         );
-        assert!(props
-            .equivalence_classes
-            .class_containing(ColumnId(1))
-            .is_none());
-        assert!(props
-            .equivalence_classes
-            .class_containing(ColumnId(2))
-            .is_none());
+        assert!(
+            props
+                .equivalence_classes
+                .class_containing(ColumnId(1))
+                .is_none()
+        );
+        assert!(
+            props
+                .equivalence_classes
+                .class_containing(ColumnId(2))
+                .is_none()
+        );
     }
 
     #[test]

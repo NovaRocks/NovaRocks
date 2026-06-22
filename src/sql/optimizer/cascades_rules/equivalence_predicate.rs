@@ -530,9 +530,11 @@ mod tests {
             vec![left, right],
         );
         assert!(!InnerJoinEquivalencePredicateRule.matches(&join.op));
-        assert!(InnerJoinEquivalencePredicateRule
-            .apply(&join, &mut memo)
-            .is_empty());
+        assert!(
+            InnerJoinEquivalencePredicateRule
+                .apply(&join, &mut memo)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -557,9 +559,11 @@ mod tests {
             and(eq(col(1, "lk"), col(2, "rk")), eq(col(1, "lk"), lit(10))),
             vec![left, right_filter],
         );
-        assert!(InnerJoinEquivalencePredicateRule
-            .apply(&join, &mut memo)
-            .is_empty());
+        assert!(
+            InnerJoinEquivalencePredicateRule
+                .apply(&join, &mut memo)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -582,9 +586,11 @@ mod tests {
             vec![left_join, right],
         );
 
-        assert!(InnerJoinEquivalencePredicateRule
-            .apply(&join, &mut memo)
-            .is_empty());
+        assert!(
+            InnerJoinEquivalencePredicateRule
+                .apply(&join, &mut memo)
+                .is_empty()
+        );
     }
 
     #[test]
