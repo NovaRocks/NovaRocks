@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use arrow::datatypes::DataType;
 
 use crate::sql::column_id::ColumnId;
-use crate::sql::common::{BinOp, JoinKind};
+use crate::sql::common::{BinOp, JoinKind, OutputColumn};
 use crate::sql::optimizer::memo::{GroupId, MExpr, Memo};
 use crate::sql::optimizer::operator::*;
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
@@ -979,6 +979,29 @@ impl Rule for RepeatToPhysical {
 // 14. UnionToPhysical
 // ---------------------------------------------------------------------------
 
+fn refresh_set_op_child_output_columns(
+    memo: &Memo,
+    children: &[GroupId],
+    output_len: usize,
+    fallback: &[Vec<OutputColumn>],
+) -> Vec<Vec<OutputColumn>> {
+    children
+        .iter()
+        .enumerate()
+        .map(|(idx, child)| {
+            let current = memo
+                .groups
+                .get(*child)
+                .and_then(|group| group.logical_props.as_ref())
+                .map(|props| props.output_columns.clone());
+            match current {
+                Some(columns) if columns.len() == output_len => columns,
+                _ => fallback.get(idx).cloned().unwrap_or_default(),
+            }
+        })
+        .collect()
+}
+
 pub(crate) struct UnionToPhysical;
 
 impl Rule for UnionToPhysical {
@@ -991,15 +1014,21 @@ impl Rule for UnionToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalUnion(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
         let Operator::LogicalUnion(op) = &expr.op else {
             return vec![];
         };
+        let child_output_columns = refresh_set_op_child_output_columns(
+            memo,
+            &expr.children,
+            op.output_columns.len(),
+            &op.child_output_columns,
+        );
         vec![NewExpr {
             op: Operator::PhysicalUnion(UnionOp {
                 all: op.all,
                 output_columns: op.output_columns.clone(),
-                child_output_columns: op.child_output_columns.clone(),
+                child_output_columns,
             }),
             children: expr.children.clone(),
         }]
@@ -1022,14 +1051,20 @@ impl Rule for IntersectToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalIntersect(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
         let Operator::LogicalIntersect(op) = &expr.op else {
             return vec![];
         };
+        let child_output_columns = refresh_set_op_child_output_columns(
+            memo,
+            &expr.children,
+            op.output_columns.len(),
+            &op.child_output_columns,
+        );
         vec![NewExpr {
             op: Operator::PhysicalIntersect(IntersectOp {
                 output_columns: op.output_columns.clone(),
-                child_output_columns: op.child_output_columns.clone(),
+                child_output_columns,
             }),
             children: expr.children.clone(),
         }]
@@ -1052,14 +1087,20 @@ impl Rule for ExceptToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalExcept(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
         let Operator::LogicalExcept(op) = &expr.op else {
             return vec![];
         };
+        let child_output_columns = refresh_set_op_child_output_columns(
+            memo,
+            &expr.children,
+            op.output_columns.len(),
+            &op.child_output_columns,
+        );
         vec![NewExpr {
             op: Operator::PhysicalExcept(ExceptOp {
                 output_columns: op.output_columns.clone(),
-                child_output_columns: op.child_output_columns.clone(),
+                child_output_columns,
             }),
             children: expr.children.clone(),
         }]
@@ -1390,6 +1431,81 @@ mod top_n_tests {
         assert_eq!(p.output_column_id, output_column_id);
         assert_eq!(p.column_name, "x");
         assert_eq!(p.alias.as_deref(), Some("gs"));
+    }
+}
+
+#[cfg(test)]
+mod set_op_tests {
+    use super::*;
+    use crate::sql::analysis::OutputColumn;
+    use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::memo::{LogicalProperties, MExpr, Memo};
+    use crate::sql::optimizer::operator::ValuesOp;
+    use arrow::datatypes::DataType;
+
+    fn output_column(id: u32, name: &str) -> OutputColumn {
+        OutputColumn {
+            column_id: ColumnId::new_for_test(id),
+            name: name.to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        }
+    }
+
+    fn values_group_with_outputs(memo: &mut Memo, columns: Vec<OutputColumn>) -> usize {
+        let id = memo.next_expr_id();
+        let group = memo.new_group(MExpr {
+            id,
+            op: Operator::LogicalValues(ValuesOp {
+                rows: vec![],
+                columns: columns.clone(),
+            }),
+            children: vec![],
+        });
+        memo.groups[group].logical_props = Some(LogicalProperties::new(columns, 0.0));
+        group
+    }
+
+    #[test]
+    fn union_to_physical_refreshes_child_outputs_from_child_groups() {
+        let mut memo = Memo::new();
+        let left_current = output_column(101, "total");
+        let right_current = output_column(201, "total");
+        let left_group = values_group_with_outputs(&mut memo, vec![left_current.clone()]);
+        let right_group = values_group_with_outputs(&mut memo, vec![right_current.clone()]);
+
+        let logical = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalUnion(UnionOp {
+                all: true,
+                output_columns: vec![output_column(301, "total")],
+                child_output_columns: vec![
+                    vec![output_column(11, "total")],
+                    vec![output_column(21, "total")],
+                ],
+            }),
+            children: vec![left_group, right_group],
+        };
+
+        let out = UnionToPhysical.apply(&logical, &mut memo);
+        assert_eq!(out.len(), 1);
+        let Operator::PhysicalUnion(union) = &out[0].op else {
+            panic!("expected PhysicalUnion");
+        };
+        assert_eq!(union.child_output_columns.len(), 2);
+        assert_eq!(union.child_output_columns[0].len(), 1);
+        assert_eq!(union.child_output_columns[1].len(), 1);
+        assert_eq!(
+            union.child_output_columns[0][0].column_id,
+            left_current.column_id
+        );
+        assert_eq!(union.child_output_columns[0][0].name, left_current.name);
+        assert_eq!(
+            union.child_output_columns[1][0].column_id,
+            right_current.column_id
+        );
+        assert_eq!(union.child_output_columns[1][0].name, right_current.name);
     }
 }
 

@@ -188,6 +188,7 @@ fn apply_query_modifiers(
                         for extra in &extra_items {
                             collect_aggregates(&extra.expr, &mut agg.aggregates, factory);
                         }
+                        ensure_aggregate_output_columns(agg);
                         // ORDER BY-only aggregates (e.g. `count(v2)` that does
                         // not appear in SELECT) were just folded into the
                         // aggregate node above. Their extra Project items still
@@ -2224,6 +2225,29 @@ fn split_projection_for_aggregate(
     (project_items, agg_calls, output_columns, rewritten_having)
 }
 
+fn ensure_aggregate_output_columns(agg: &mut LogicalAggregateNode) {
+    let mut existing: std::collections::HashSet<ColumnId> = agg
+        .output_columns
+        .iter()
+        .map(|column| column.column_id)
+        .filter(|id| *id != ColumnId::UNSET)
+        .collect();
+
+    for call in &agg.aggregates {
+        if call.output_column_id == ColumnId::UNSET || existing.contains(&call.output_column_id) {
+            continue;
+        }
+        existing.insert(call.output_column_id);
+        agg.output_columns.push(OutputColumn {
+            column_id: call.output_column_id,
+            name: crate::sql::codegen::helpers::agg_call_display_name(call),
+            data_type: call.result_type.clone(),
+            nullable: true,
+            is_internal: true,
+        });
+    }
+}
+
 fn group_by_output_column(
     group_by: &TypedExpr,
     projection: &[ProjectItem],
@@ -3793,6 +3817,13 @@ mod tests {
         visit(plan).unwrap_or_default()
     }
 
+    fn first_aggregate_node(plan: &LogicalPlanNode) -> Option<&LogicalAggregateNode> {
+        match &plan.kind {
+            PlanNodeKind::Aggregate(node) => Some(node),
+            _ => plan.children.iter().find_map(first_aggregate_node),
+        }
+    }
+
     fn root_project_over_aggregate(
         plan: &LogicalPlanNode,
     ) -> (&LogicalProjectNode, &LogicalAggregateNode) {
@@ -4454,6 +4485,37 @@ mod tests {
             column, "sum(b)",
             "HAVING aggregate ColumnRef must preserve the display name for the P2 fallback"
         );
+    }
+
+    #[test]
+    fn order_by_only_aggregates_are_added_to_aggregate_outputs() {
+        let plan = plan_test_query(
+            "SELECT min(a) AS v1 FROM t GROUP BY b ORDER BY round(count(a) / min(a)), min(a)",
+        );
+        let aggregate = first_aggregate_node(&plan).expect("expected Aggregate in plan");
+
+        assert_eq!(
+            aggregate.output_columns.len(),
+            aggregate.group_by.len() + aggregate.aggregates.len(),
+            "Aggregate output columns must include ORDER BY-only aggregate calls"
+        );
+        for call in &aggregate.aggregates {
+            assert_ne!(
+                call.output_column_id,
+                ColumnId::UNSET,
+                "AggregateCall {} must have a real output id",
+                call.name
+            );
+            assert!(
+                aggregate
+                    .output_columns
+                    .iter()
+                    .any(|col| col.column_id == call.output_column_id),
+                "Aggregate output columns must contain {} with id {}",
+                call.name,
+                call.output_column_id
+            );
+        }
     }
 
     #[test]
