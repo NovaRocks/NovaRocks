@@ -305,12 +305,11 @@ fn add_filter_group(memo: &mut Memo, child_group: GroupId, predicates: Vec<Scala
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
     use crate::sql::catalog::{ScanSource, TableDef};
+    use crate::sql::common::{BinOp, LiteralValue};
     use crate::sql::optimizer::operator::ScanOp;
-    use crate::sql::optimizer::scalar::ScalarId;
+    use crate::sql::optimizer::scalar::{HashableLiteral, ScalarId, ScalarNode};
 
-    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
     use arrow::datatypes::DataType;
 
     fn output(id: u32, name: &str) -> OutputColumn {
@@ -323,79 +322,69 @@ mod tests {
         }
     }
 
-    fn col(id: u32, name: &str) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::ColumnRef {
-                column_id: ColumnId(id),
-                qualifier: None,
-                column: name.to_string(),
-            },
-            data_type: DataType::Int64,
-            nullable: false,
-        }
+    fn col(memo: &mut Memo, id: u32) -> ScalarId {
+        memo.scalars
+            .intern(ScalarNode::ColumnRef(ColumnId(id)), DataType::Int64, false)
     }
 
-    fn lit(value: i64) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::Literal(LiteralValue::Int(value)),
-            data_type: DataType::Int64,
-            nullable: false,
-        }
+    fn lit(memo: &mut Memo, value: i64) -> ScalarId {
+        memo.scalars.intern(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Int(value))),
+            DataType::Int64,
+            false,
+        )
     }
 
-    fn eq(left: TypedExpr, right: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: Box::new(left),
-                op: BinOp::Eq,
-                right: Box::new(right),
-            },
-            data_type: DataType::Boolean,
-            nullable: false,
-        }
+    fn binary(memo: &mut Memo, op: BinOp, left: ScalarId, right: ScalarId) -> ScalarId {
+        memo.scalars.intern(
+            ScalarNode::BinaryOp { left, op, right },
+            DataType::Boolean,
+            false,
+        )
     }
 
-    fn eq_for_null(left: TypedExpr, right: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: Box::new(left),
-                op: BinOp::EqForNull,
-                right: Box::new(right),
-            },
-            data_type: DataType::Boolean,
-            nullable: false,
-        }
+    fn eq(memo: &mut Memo, left: ScalarId, right: ScalarId) -> ScalarId {
+        binary(memo, BinOp::Eq, left, right)
     }
 
-    fn and(left: TypedExpr, right: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: Box::new(left),
-                op: BinOp::And,
-                right: Box::new(right),
-            },
-            data_type: DataType::Boolean,
-            nullable: false,
-        }
+    fn eq_for_null(memo: &mut Memo, left: ScalarId, right: ScalarId) -> ScalarId {
+        binary(memo, BinOp::EqForNull, left, right)
     }
 
-    fn intern(memo: &mut Memo, expr: &TypedExpr) -> ScalarId {
-        intern_typed(&mut memo.scalars, expr)
+    fn and(memo: &mut Memo, left: ScalarId, right: ScalarId) -> ScalarId {
+        binary(memo, BinOp::And, left, right)
+    }
+
+    fn eq_cols(memo: &mut Memo, left: u32, right: u32) -> ScalarId {
+        let left = col(memo, left);
+        let right = col(memo, right);
+        eq(memo, left, right)
+    }
+
+    fn null_safe_eq_cols(memo: &mut Memo, left: u32, right: u32) -> ScalarId {
+        let left = col(memo, left);
+        let right = col(memo, right);
+        eq_for_null(memo, left, right)
+    }
+
+    fn eq_col_lit(memo: &mut Memo, column: u32, value: i64) -> ScalarId {
+        let column = col(memo, column);
+        let value = lit(memo, value);
+        eq(memo, column, value)
     }
 
     fn join_mexpr(
         memo: &mut Memo,
         join_type: JoinKind,
-        condition: TypedExpr,
+        condition: ScalarId,
         children: Vec<GroupId>,
     ) -> MExpr {
         let id = memo.next_expr_id();
-        let condition = Some(intern(memo, &condition));
         MExpr {
             id,
             op: Operator::LogicalJoin(LogicalJoinOp {
                 join_type,
-                condition,
+                condition: Some(condition),
             }),
             children,
         }
@@ -409,10 +398,9 @@ mod tests {
         memo: &mut Memo,
         id: u32,
         name: &str,
-        predicates: Vec<TypedExpr>,
+        predicates: Vec<ScalarId>,
     ) -> GroupId {
         let id_expr = memo.next_expr_id();
-        let predicates = predicates.iter().map(|expr| intern(memo, expr)).collect();
         let group = memo.new_group(MExpr {
             id: id_expr,
             op: Operator::LogicalScan(ScanOp {
@@ -445,11 +433,10 @@ mod tests {
         memo: &mut Memo,
         left: GroupId,
         right: GroupId,
-        condition: TypedExpr,
+        condition_id: ScalarId,
         outputs: Vec<OutputColumn>,
     ) -> GroupId {
         let id = memo.next_expr_id();
-        let condition_id = intern(memo, &condition);
         let group = memo.new_group(MExpr {
             id,
             op: Operator::LogicalJoin(LogicalJoinOp {
@@ -471,12 +458,10 @@ mod tests {
         let mut memo = Memo::new();
         let left = scan_group(&mut memo, 1, "lk");
         let right = scan_group(&mut memo, 2, "rk");
-        let join = join_mexpr(
-            &mut memo,
-            JoinKind::Inner,
-            and(eq(col(1, "lk"), col(2, "rk")), eq(col(1, "lk"), lit(10))),
-            vec![left, right],
-        );
+        let join_pair = eq_cols(&mut memo, 1, 2);
+        let literal_eq = eq_col_lit(&mut memo, 1, 10);
+        let condition = and(&mut memo, join_pair, literal_eq);
+        let join = join_mexpr(&mut memo, JoinKind::Inner, condition, vec![left, right]);
 
         let out = InnerJoinEquivalencePredicateRule.apply(&join, &mut memo);
         assert_eq!(out.len(), 1);
@@ -500,15 +485,10 @@ mod tests {
         let mut memo = Memo::new();
         let left = scan_group(&mut memo, 1, "lk");
         let right = scan_group(&mut memo, 2, "rk");
-        let join = join_mexpr(
-            &mut memo,
-            JoinKind::Inner,
-            and(
-                eq_for_null(col(1, "lk"), col(2, "rk")),
-                eq(col(1, "lk"), lit(10)),
-            ),
-            vec![left, right],
-        );
+        let null_safe_pair = null_safe_eq_cols(&mut memo, 1, 2);
+        let literal_eq = eq_col_lit(&mut memo, 1, 10);
+        let condition = and(&mut memo, null_safe_pair, literal_eq);
+        let join = join_mexpr(&mut memo, JoinKind::Inner, condition, vec![left, right]);
 
         assert!(
             InnerJoinEquivalencePredicateRule
@@ -523,12 +503,10 @@ mod tests {
         let mut memo = Memo::new();
         let left = scan_group(&mut memo, 1, "lk");
         let right = scan_group(&mut memo, 2, "rk");
-        let join = join_mexpr(
-            &mut memo,
-            JoinKind::LeftOuter,
-            and(eq(col(1, "lk"), col(2, "rk")), eq(col(1, "lk"), lit(10))),
-            vec![left, right],
-        );
+        let join_pair = eq_cols(&mut memo, 1, 2);
+        let literal_eq = eq_col_lit(&mut memo, 1, 10);
+        let condition = and(&mut memo, join_pair, literal_eq);
+        let join = join_mexpr(&mut memo, JoinKind::LeftOuter, condition, vec![left, right]);
         assert!(!InnerJoinEquivalencePredicateRule.matches(&join.op));
         assert!(
             InnerJoinEquivalencePredicateRule
@@ -543,7 +521,7 @@ mod tests {
         let left = scan_group(&mut memo, 1, "lk");
         let right_scan = scan_group(&mut memo, 2, "rk");
         let right_filter_id = memo.next_expr_id();
-        let right_filter_predicate = intern(&mut memo, &eq(col(2, "rk"), lit(10)));
+        let right_filter_predicate = eq_col_lit(&mut memo, 2, 10);
         let right_filter = memo.new_group(MExpr {
             id: right_filter_id,
             op: Operator::LogicalFilter(FilterOp {
@@ -553,10 +531,13 @@ mod tests {
         });
         memo.groups[right_filter].logical_props =
             Some(LogicalProperties::new(vec![output(2, "rk")], 5.0));
+        let join_pair = eq_cols(&mut memo, 1, 2);
+        let literal_eq = eq_col_lit(&mut memo, 1, 10);
+        let condition = and(&mut memo, join_pair, literal_eq);
         let join = join_mexpr(
             &mut memo,
             JoinKind::Inner,
-            and(eq(col(1, "lk"), col(2, "rk")), eq(col(1, "lk"), lit(10))),
+            condition,
             vec![left, right_filter],
         );
         assert!(
@@ -569,20 +550,25 @@ mod tests {
     #[test]
     fn does_not_duplicate_literal_already_present_below_inner_join_side() {
         let mut memo = Memo::new();
-        let left_a = scan_group_with_predicates(&mut memo, 1, "ak", vec![eq(col(1, "ak"), lit(7))]);
-        let left_b = scan_group_with_predicates(&mut memo, 2, "bk", vec![eq(col(2, "bk"), lit(7))]);
+        let left_a_predicate = eq_col_lit(&mut memo, 1, 7);
+        let left_a = scan_group_with_predicates(&mut memo, 1, "ak", vec![left_a_predicate]);
+        let left_b_predicate = eq_col_lit(&mut memo, 2, 7);
+        let left_b = scan_group_with_predicates(&mut memo, 2, "bk", vec![left_b_predicate]);
+        let left_join_condition = eq_cols(&mut memo, 1, 2);
         let left_join = inner_join_group(
             &mut memo,
             left_a,
             left_b,
-            eq(col(1, "ak"), col(2, "bk")),
+            left_join_condition,
             vec![output(1, "ak"), output(2, "bk")],
         );
-        let right = scan_group_with_predicates(&mut memo, 3, "ck", vec![eq(col(3, "ck"), lit(7))]);
+        let right_predicate = eq_col_lit(&mut memo, 3, 7);
+        let right = scan_group_with_predicates(&mut memo, 3, "ck", vec![right_predicate]);
+        let condition = eq_cols(&mut memo, 2, 3);
         let join = join_mexpr(
             &mut memo,
             JoinKind::Inner,
-            eq(col(2, "bk"), col(3, "ck")),
+            condition,
             vec![left_join, right],
         );
 
@@ -615,7 +601,7 @@ mod tests {
         memo.groups[child].logical_props = Some(child_props);
 
         // Call add_filter_group to synthesize a filter group above the scan.
-        let predicate = intern(&mut memo, &eq(col(1, "a"), lit(42)));
+        let predicate = eq_col_lit(&mut memo, 1, 42);
         let filter_group = add_filter_group(&mut memo, child, vec![predicate]);
 
         // The filter group's logical_props must carry the child's column stats.

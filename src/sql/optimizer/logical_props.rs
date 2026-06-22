@@ -338,100 +338,64 @@ pub(crate) fn literal_signature(arena: &ScalarArena, literal: ScalarId) -> Strin
 }
 
 #[cfg(test)]
-pub(crate) fn make_eq_literal_predicate_for_test(
-    arena: &mut ScalarArena,
-    column: &OutputColumn,
-    literal: crate::sql::analysis::TypedExpr,
-) -> crate::sql::analysis::TypedExpr {
-    let literal = crate::sql::planner::optimizer_bridge::scalar::intern_typed(arena, &literal);
-    let predicate = make_eq_literal_predicate(arena, column, literal);
-    crate::sql::planner::optimizer_bridge::scalar::materialize(arena, predicate)
-}
-
-#[cfg(test)]
-pub(crate) fn combine_with_and_for_test(
-    arena: &mut ScalarArena,
-    predicates: Vec<crate::sql::analysis::TypedExpr>,
-) -> Option<crate::sql::analysis::TypedExpr> {
-    let predicates = predicates
-        .iter()
-        .map(|predicate| {
-            crate::sql::planner::optimizer_bridge::scalar::intern_typed(arena, predicate)
-        })
-        .collect();
-    combine_with_and(arena, predicates).map(|predicate| {
-        crate::sql::planner::optimizer_bridge::scalar::materialize(arena, predicate)
-    })
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
     use crate::sql::catalog::{ScanSource, TableDef};
+    use crate::sql::common::LiteralValue;
     use crate::sql::optimizer::memo::MExpr;
     use crate::sql::optimizer::operator::{
         FilterOp, JoinDistribution, LogicalJoinOp, PhysicalHashJoinEqCondition, PhysicalHashJoinOp,
         ScanOp,
     };
-    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
-    use crate::sql::planner::plan::*;
-    use std::path::PathBuf;
 
-    fn col(id: u32, name: &str) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::ColumnRef {
-                column_id: ColumnId(id),
-                qualifier: None,
-                column: name.to_string(),
-            },
-            data_type: DataType::Int64,
-            nullable: false,
-        }
+    fn col(arena: &mut ScalarArena, id: u32) -> ScalarId {
+        arena.intern(ScalarNode::ColumnRef(ColumnId(id)), DataType::Int64, false)
     }
 
-    fn lit(value: i64) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::Literal(LiteralValue::Int(value)),
-            data_type: DataType::Int64,
-            nullable: false,
-        }
+    fn lit(arena: &mut ScalarArena, value: i64) -> ScalarId {
+        arena.intern(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Int(value))),
+            DataType::Int64,
+            false,
+        )
     }
 
-    fn eq(left: TypedExpr, right: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: Box::new(left),
-                op: BinOp::Eq,
-                right: Box::new(right),
-            },
-            data_type: DataType::Boolean,
-            nullable: false,
-        }
+    fn binary(arena: &mut ScalarArena, op: BinOp, left: ScalarId, right: ScalarId) -> ScalarId {
+        arena.intern(
+            ScalarNode::BinaryOp { left, op, right },
+            DataType::Boolean,
+            false,
+        )
     }
 
-    fn eq_for_null(left: TypedExpr, right: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: Box::new(left),
-                op: BinOp::EqForNull,
-                right: Box::new(right),
-            },
-            data_type: DataType::Boolean,
-            nullable: false,
-        }
+    fn eq(arena: &mut ScalarArena, left: ScalarId, right: ScalarId) -> ScalarId {
+        binary(arena, BinOp::Eq, left, right)
     }
 
-    fn and(left: TypedExpr, right: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: Box::new(left),
-                op: BinOp::And,
-                right: Box::new(right),
-            },
-            data_type: DataType::Boolean,
-            nullable: false,
-        }
+    fn eq_for_null(arena: &mut ScalarArena, left: ScalarId, right: ScalarId) -> ScalarId {
+        binary(arena, BinOp::EqForNull, left, right)
+    }
+
+    fn and(arena: &mut ScalarArena, left: ScalarId, right: ScalarId) -> ScalarId {
+        binary(arena, BinOp::And, left, right)
+    }
+
+    fn eq_cols(arena: &mut ScalarArena, left: u32, right: u32) -> ScalarId {
+        let left = col(arena, left);
+        let right = col(arena, right);
+        eq(arena, left, right)
+    }
+
+    fn null_safe_eq_cols(arena: &mut ScalarArena, left: u32, right: u32) -> ScalarId {
+        let left = col(arena, left);
+        let right = col(arena, right);
+        eq_for_null(arena, left, right)
+    }
+
+    fn eq_col_lit(arena: &mut ScalarArena, column: u32, value: i64) -> ScalarId {
+        let column = col(arena, column);
+        let value = lit(arena, value);
+        eq(arena, column, value)
     }
 
     fn output(id: u32, name: &str) -> OutputColumn {
@@ -472,9 +436,10 @@ mod tests {
 
     #[test]
     fn collect_strict_column_equalities_reads_top_level_and() {
-        let predicate = and(eq(col(1, "a"), col(2, "b")), eq(col(1, "a"), lit(10)));
         let mut arena = ScalarArena::new();
-        let predicate = intern_typed(&mut arena, &predicate);
+        let col_eq = eq_cols(&mut arena, 1, 2);
+        let literal_eq = eq_col_lit(&mut arena, 1, 10);
+        let predicate = and(&mut arena, col_eq, literal_eq);
         assert_eq!(
             collect_strict_column_equalities(&arena, predicate),
             vec![(ColumnId(1), ColumnId(2))]
@@ -484,12 +449,10 @@ mod tests {
 
     #[test]
     fn collect_strict_column_equalities_ignores_null_safe_equality() {
-        let predicate = and(
-            eq(col(1, "a"), col(2, "b")),
-            eq_for_null(col(3, "c"), col(4, "d")),
-        );
         let mut arena = ScalarArena::new();
-        let predicate = intern_typed(&mut arena, &predicate);
+        let strict_eq = eq_cols(&mut arena, 1, 2);
+        let null_safe_eq = null_safe_eq_cols(&mut arena, 3, 4);
+        let predicate = and(&mut arena, strict_eq, null_safe_eq);
         assert_eq!(
             collect_strict_column_equalities(&arena, predicate),
             vec![(ColumnId(1), ColumnId(2))]
@@ -504,7 +467,7 @@ mod tests {
             vec![output(1, "a"), output(2, "b")],
             100.0,
         ));
-        let predicate = intern_typed(&mut memo.scalars, &eq(col(1, "a"), col(2, "b")));
+        let predicate = eq_cols(&mut memo.scalars, 1, 2);
         let filter = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalFilter(FilterOp { predicate }),
@@ -536,7 +499,7 @@ mod tests {
             vec![output(1, "a"), output(2, "b")],
             100.0,
         ));
-        let predicate = intern_typed(&mut memo.scalars, &eq_for_null(col(1, "a"), col(2, "b")));
+        let predicate = null_safe_eq_cols(&mut memo.scalars, 1, 2);
         let filter = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalFilter(FilterOp { predicate }),
@@ -567,7 +530,7 @@ mod tests {
         memo.groups[left].logical_props = Some(LogicalProperties::new(vec![output(1, "lk")], 10.0));
         memo.groups[right].logical_props =
             Some(LogicalProperties::new(vec![output(2, "rk")], 10.0));
-        let condition = intern_typed(&mut memo.scalars, &eq(col(1, "lk"), col(2, "rk")));
+        let condition = eq_cols(&mut memo.scalars, 1, 2);
         let join = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
@@ -602,7 +565,7 @@ mod tests {
         memo.groups[left].logical_props = Some(LogicalProperties::new(vec![output(1, "lk")], 10.0));
         memo.groups[right].logical_props =
             Some(LogicalProperties::new(vec![output(2, "rk")], 10.0));
-        let condition = intern_typed(&mut memo.scalars, &eq(col(1, "lk"), col(2, "rk")));
+        let condition = eq_cols(&mut memo.scalars, 1, 2);
         let join = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
@@ -641,8 +604,8 @@ mod tests {
         memo.groups[left].logical_props = Some(LogicalProperties::new(vec![output(1, "lk")], 10.0));
         memo.groups[right].logical_props =
             Some(LogicalProperties::new(vec![output(2, "rk")], 10.0));
-        let left_key = intern_typed(&mut memo.scalars, &col(1, "lk"));
-        let right_key = intern_typed(&mut memo.scalars, &col(2, "rk"));
+        let left_key = col(&mut memo.scalars, 1);
+        let right_key = col(&mut memo.scalars, 2);
         let join = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
@@ -682,8 +645,8 @@ mod tests {
         memo.groups[left].logical_props = Some(LogicalProperties::new(vec![output(1, "lk")], 10.0));
         memo.groups[right].logical_props =
             Some(LogicalProperties::new(vec![output(2, "rk")], 10.0));
-        let left_key = intern_typed(&mut memo.scalars, &col(1, "lk"));
-        let right_key = intern_typed(&mut memo.scalars, &col(2, "rk"));
+        let left_key = col(&mut memo.scalars, 1);
+        let right_key = col(&mut memo.scalars, 2);
         let join = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {

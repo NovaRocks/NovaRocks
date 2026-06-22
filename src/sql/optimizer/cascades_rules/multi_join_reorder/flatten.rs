@@ -323,75 +323,74 @@ fn collect_scalar_column_ids(arena: &ScalarArena, expr: ScalarId, out: &mut Hash
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr};
+    use crate::sql::common::{BinOp, LiteralValue, OutputColumn};
     use crate::sql::optimizer::memo::{JoinTree, LogicalProperties, MExpr};
     use crate::sql::optimizer::operator::ValuesOp;
+    use crate::sql::optimizer::scalar::HashableLiteral;
     use crate::sql::optimizer::statistics::ColumnStatistic;
     use crate::sql::optimizer::stats::copy_in_join_tree;
-    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
+    use arrow::datatypes::DataType;
     use std::collections::HashMap as Map;
 
-    fn col(id: u32) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::ColumnRef {
-                column_id: ColumnId::new_for_test(id),
-                qualifier: None,
-                column: format!("c{id}"),
-            },
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
-        }
+    fn col(memo: &mut Memo, id: u32) -> ScalarId {
+        memo.scalars.intern(
+            ScalarNode::ColumnRef(ColumnId::new_for_test(id)),
+            DataType::Int64,
+            false,
+        )
     }
 
-    fn int_lit(v: i64) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::Literal(LiteralValue::Int(v)),
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
-        }
+    fn int_lit(memo: &mut Memo, v: i64) -> ScalarId {
+        memo.scalars.intern(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Int(v))),
+            DataType::Int64,
+            false,
+        )
     }
 
-    fn eq(l: TypedExpr, r: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: Box::new(l),
-                op: BinOp::Eq,
-                right: Box::new(r),
-            },
-            data_type: arrow::datatypes::DataType::Boolean,
-            nullable: false,
-        }
+    fn binary(memo: &mut Memo, op: BinOp, left: ScalarId, right: ScalarId) -> ScalarId {
+        memo.scalars.intern(
+            ScalarNode::BinaryOp { left, op, right },
+            DataType::Boolean,
+            false,
+        )
     }
 
-    fn eq_for_null(l: TypedExpr, r: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: Box::new(l),
-                op: BinOp::EqForNull,
-                right: Box::new(r),
-            },
-            data_type: arrow::datatypes::DataType::Boolean,
-            nullable: false,
-        }
+    fn eq(memo: &mut Memo, left: ScalarId, right: ScalarId) -> ScalarId {
+        binary(memo, BinOp::Eq, left, right)
     }
 
-    fn and(l: TypedExpr, r: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: Box::new(l),
-                op: BinOp::And,
-                right: Box::new(r),
-            },
-            data_type: arrow::datatypes::DataType::Boolean,
-            nullable: false,
-        }
+    fn eq_for_null(memo: &mut Memo, left: ScalarId, right: ScalarId) -> ScalarId {
+        binary(memo, BinOp::EqForNull, left, right)
+    }
+
+    fn and(memo: &mut Memo, left: ScalarId, right: ScalarId) -> ScalarId {
+        binary(memo, BinOp::And, left, right)
+    }
+
+    fn eq_cols(memo: &mut Memo, left: u32, right: u32) -> ScalarId {
+        let left = col(memo, left);
+        let right = col(memo, right);
+        eq(memo, left, right)
+    }
+
+    fn null_safe_eq_cols(memo: &mut Memo, left: u32, right: u32) -> ScalarId {
+        let left = col(memo, left);
+        let right = col(memo, right);
+        eq_for_null(memo, left, right)
+    }
+
+    fn eq_col_lit(memo: &mut Memo, column: u32, value: i64) -> ScalarId {
+        let column = col(memo, column);
+        let value = int_lit(memo, value);
+        eq(memo, column, value)
     }
 
     fn out_col(id: u32) -> OutputColumn {
         OutputColumn {
             column_id: ColumnId::new_for_test(id),
             name: format!("c{id}"),
-            data_type: arrow::datatypes::DataType::Int64,
+            data_type: DataType::Int64,
             nullable: false,
             is_internal: false,
         }
@@ -451,10 +450,10 @@ mod tests {
         g
     }
 
-    fn inner(memo: &mut Memo, cond: TypedExpr) -> LogicalJoinOp {
+    fn inner(cond: ScalarId) -> LogicalJoinOp {
         LogicalJoinOp {
             join_type: JoinKind::Inner,
-            condition: Some(intern_typed(&mut memo.scalars, &cond)),
+            condition: Some(cond),
         }
     }
 
@@ -464,15 +463,17 @@ mod tests {
         let a = leaf(&mut memo, 1, 1000.0);
         let b = leaf(&mut memo, 2, 100.0);
         let c = leaf(&mut memo, 3, 50.0);
+        let c1_eq_c2 = eq_cols(&mut memo, 1, 2);
+        let c1_eq_c3 = eq_cols(&mut memo, 1, 3);
         // (A ⋈[c1=c2] B) ⋈[c1=c3] C
         let tree = JoinTree::Join {
             left: Box::new(JoinTree::Join {
                 left: Box::new(JoinTree::Leaf(a)),
                 right: Box::new(JoinTree::Leaf(b)),
-                op: inner(&mut memo, eq(col(1), col(2))),
+                op: inner(c1_eq_c2),
             }),
             right: Box::new(JoinTree::Leaf(c)),
-            op: inner(&mut memo, eq(col(1), col(3))),
+            op: inner(c1_eq_c3),
         };
         let root = copy_in_join_tree(&mut memo, &tree, &Map::new());
 
@@ -493,7 +494,8 @@ mod tests {
         let a = leaf(&mut memo, 1, 1000.0);
         let b = leaf(&mut memo, 2, 100.0);
         let c = leaf(&mut memo, 3, 50.0);
-        let lo_cond = intern_typed(&mut memo.scalars, &eq(col(1), col(2)));
+        let lo_cond = eq_cols(&mut memo, 1, 2);
+        let c1_eq_c3 = eq_cols(&mut memo, 1, 3);
         let lo = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
@@ -509,7 +511,7 @@ mod tests {
         let tree = JoinTree::Join {
             left: Box::new(JoinTree::Leaf(lo)),
             right: Box::new(JoinTree::Leaf(c)),
-            op: inner(&mut memo, eq(col(1), col(3))),
+            op: inner(c1_eq_c3),
         };
         let root = copy_in_join_tree(&mut memo, &tree, &Map::new());
 
@@ -532,11 +534,13 @@ mod tests {
         let a = leaf(&mut memo, 1, 1000.0);
         let b = leaf(&mut memo, 2, 100.0);
         // condition: c1 = c2  AND  c1 = 5  (the second conjunct is single-side on A)
-        let cond = and(eq(col(1), col(2)), eq(col(1), int_lit(5)));
+        let c1_eq_c2 = eq_cols(&mut memo, 1, 2);
+        let c1_eq_5 = eq_col_lit(&mut memo, 1, 5);
+        let cond = and(&mut memo, c1_eq_c2, c1_eq_5);
         let tree = JoinTree::Join {
             left: Box::new(JoinTree::Leaf(a)),
             right: Box::new(JoinTree::Leaf(b)),
-            op: inner(&mut memo, cond),
+            op: inner(cond),
         };
         let root = copy_in_join_tree(&mut memo, &tree, &Map::new());
 
@@ -555,16 +559,18 @@ mod tests {
         let a = leaf(&mut memo, 1, 1000.0);
         let b = leaf(&mut memo, 2, 100.0);
         let c = leaf(&mut memo, 3, 50.0);
+        let c1_eq_c2 = eq_cols(&mut memo, 1, 2);
+        let c2_eq_c3 = eq_cols(&mut memo, 2, 3);
         // (A ⋈[c1=c2] B) ⋈[c2=c3] C — A and C share an equi class only
         // transitively (through c2); there is no literal c1=c3 edge.
         let tree = JoinTree::Join {
             left: Box::new(JoinTree::Join {
                 left: Box::new(JoinTree::Leaf(a)),
                 right: Box::new(JoinTree::Leaf(b)),
-                op: inner(&mut memo, eq(col(1), col(2))),
+                op: inner(c1_eq_c2),
             }),
             right: Box::new(JoinTree::Leaf(c)),
-            op: inner(&mut memo, eq(col(2), col(3))),
+            op: inner(c2_eq_c3),
         };
         let root = copy_in_join_tree(&mut memo, &tree, &Map::new());
         let graph = flatten_join_chain(&mut memo, root).expect("3-atom chain flattens");
@@ -600,14 +606,16 @@ mod tests {
         let a = leaf_with_outputs(&mut memo, vec![out_col(1), out_col(2)], 1000.0);
         let b = leaf(&mut memo, 3, 100.0);
         let c = leaf(&mut memo, 4, 50.0);
+        let c1_eq_c3 = eq_cols(&mut memo, 1, 3);
+        let c2_eq_c4 = eq_cols(&mut memo, 2, 4);
         let tree = JoinTree::Join {
             left: Box::new(JoinTree::Join {
                 left: Box::new(JoinTree::Leaf(a)),
                 right: Box::new(JoinTree::Leaf(b)),
-                op: inner(&mut memo, eq(col(1), col(3))),
+                op: inner(c1_eq_c3),
             }),
             right: Box::new(JoinTree::Leaf(c)),
-            op: inner(&mut memo, eq(col(2), col(4))),
+            op: inner(c2_eq_c4),
         };
         let root = copy_in_join_tree(&mut memo, &tree, &Map::new());
         let mut root_props =
@@ -646,14 +654,16 @@ mod tests {
         let a = leaf_with_outputs(&mut memo, vec![out_col(1), out_col(2)], 1000.0);
         let b = leaf(&mut memo, 3, 100.0);
         let c = leaf(&mut memo, 4, 50.0);
+        let c1_eq_c3 = eq_cols(&mut memo, 1, 3);
+        let c2_eq_c4 = eq_cols(&mut memo, 2, 4);
         let tree = JoinTree::Join {
             left: Box::new(JoinTree::Join {
                 left: Box::new(JoinTree::Leaf(a)),
                 right: Box::new(JoinTree::Leaf(b)),
-                op: inner(&mut memo, eq(col(1), col(3))),
+                op: inner(c1_eq_c3),
             }),
             right: Box::new(JoinTree::Leaf(c)),
-            op: inner(&mut memo, eq(col(2), col(4))),
+            op: inner(c2_eq_c4),
         };
         let root = copy_in_join_tree(&mut memo, &tree, &Map::new());
         let mut root_props =
@@ -683,14 +693,16 @@ mod tests {
         let a = leaf(&mut memo, 1, 1000.0);
         let b = leaf(&mut memo, 2, 100.0);
         let c = leaf(&mut memo, 3, 50.0);
+        let c1_null_safe_c2 = null_safe_eq_cols(&mut memo, 1, 2);
+        let c2_null_safe_c3 = null_safe_eq_cols(&mut memo, 2, 3);
         let tree = JoinTree::Join {
             left: Box::new(JoinTree::Join {
                 left: Box::new(JoinTree::Leaf(a)),
                 right: Box::new(JoinTree::Leaf(b)),
-                op: inner(&mut memo, eq_for_null(col(1), col(2))),
+                op: inner(c1_null_safe_c2),
             }),
             right: Box::new(JoinTree::Leaf(c)),
-            op: inner(&mut memo, eq_for_null(col(2), col(3))),
+            op: inner(c2_null_safe_c3),
         };
         let root = copy_in_join_tree(&mut memo, &tree, &Map::new());
         memo.groups[root].logical_props = Some(LogicalProperties::new(
@@ -714,10 +726,11 @@ mod tests {
         let mut memo = Memo::new();
         let a = leaf(&mut memo, 1, 1000.0);
         let b = leaf(&mut memo, 2, 100.0);
+        let c1_eq_c2 = eq_cols(&mut memo, 1, 2);
         let tree = JoinTree::Join {
             left: Box::new(JoinTree::Leaf(a)),
             right: Box::new(JoinTree::Leaf(b)),
-            op: inner(&mut memo, eq(col(1), col(2))),
+            op: inner(c1_eq_c2),
         };
         let root = copy_in_join_tree(&mut memo, &tree, &Map::new());
         let graph = flatten_join_chain(&mut memo, root).expect("2-atom chain flattens");

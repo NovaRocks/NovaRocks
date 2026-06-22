@@ -55,19 +55,11 @@
 
 - [ ] **Step 1: Write failing strict collector and hash-join tests**
 
-In `src/sql/optimizer/logical_props.rs`, inside the existing `#[cfg(test)] mod tests`, add this helper after `fn eq(...)`:
+In `src/sql/optimizer/logical_props.rs`, inside the existing `#[cfg(test)] mod tests`, keep test scalar construction optimizer-native. If the test helpers still build analyzer expressions, first switch them to `ScalarArena::intern(ScalarNode::...)`; do not introduce new analyzer expression helpers inside optimizer modules. Add the null-safe helper beside the strict `eq(...)` helper:
 
 ```rust
-    fn eq_for_null(left: TypedExpr, right: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: Box::new(left),
-                op: BinOp::EqForNull,
-                right: Box::new(right),
-            },
-            data_type: DataType::Boolean,
-            nullable: false,
-        }
+    fn eq_for_null(arena: &mut ScalarArena, left: ScalarId, right: ScalarId) -> ScalarId {
+        binary(arena, BinOp::EqForNull, left, right)
     }
 ```
 
@@ -91,12 +83,10 @@ Then add these tests near `collect_column_equalities_reads_top_level_and`:
 ```rust
     #[test]
     fn collect_strict_column_equalities_ignores_null_safe_equality() {
-        let predicate = and(
-            eq(col(1, "a"), col(2, "b")),
-            eq_for_null(col(3, "c"), col(4, "d")),
-        );
         let mut arena = ScalarArena::new();
-        let predicate = intern_typed(&mut arena, &predicate);
+        let strict_eq = eq_cols(&mut arena, 1, 2);
+        let null_safe_eq = null_safe_eq_cols(&mut arena, 3, 4);
+        let predicate = and(&mut arena, strict_eq, null_safe_eq);
         assert_eq!(
             collect_strict_column_equalities(&arena, predicate),
             vec![(ColumnId(1), ColumnId(2))]
@@ -111,7 +101,7 @@ Then add these tests near `collect_column_equalities_reads_top_level_and`:
             vec![output(1, "a"), output(2, "b")],
             100.0,
         ));
-        let predicate = intern_typed(&mut memo.scalars, &eq_for_null(col(1, "a"), col(2, "b")));
+        let predicate = null_safe_eq_cols(&mut memo.scalars, 1, 2);
         let filter = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalFilter(FilterOp { predicate }),
@@ -142,8 +132,8 @@ Then add these tests near `collect_column_equalities_reads_top_level_and`:
         memo.groups[left].logical_props = Some(LogicalProperties::new(vec![output(1, "lk")], 10.0));
         memo.groups[right].logical_props =
             Some(LogicalProperties::new(vec![output(2, "rk")], 10.0));
-        let left_key = intern_typed(&mut memo.scalars, &col(1, "lk"));
-        let right_key = intern_typed(&mut memo.scalars, &col(2, "rk"));
+        let left_key = col(&mut memo.scalars, 1);
+        let right_key = col(&mut memo.scalars, 2);
         let join = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
@@ -183,8 +173,8 @@ Then add these tests near `collect_column_equalities_reads_top_level_and`:
         memo.groups[left].logical_props = Some(LogicalProperties::new(vec![output(1, "lk")], 10.0));
         memo.groups[right].logical_props =
             Some(LogicalProperties::new(vec![output(2, "rk")], 10.0));
-        let left_key = intern_typed(&mut memo.scalars, &col(1, "lk"));
-        let right_key = intern_typed(&mut memo.scalars, &col(2, "rk"));
+        let left_key = col(&mut memo.scalars, 1);
+        let right_key = col(&mut memo.scalars, 2);
         let join = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
@@ -341,19 +331,11 @@ git commit -m "fix: make optimizer equivalence facts strict-only"
 
 - [ ] **Step 1: Write the failing null-safe literal propagation test**
 
-Inside `src/sql/optimizer/cascades_rules/equivalence_predicate.rs` test module, add this helper after `fn eq(...)`:
+Inside `src/sql/optimizer/cascades_rules/equivalence_predicate.rs` test module, add this helper after `fn eq(...)`. Keep it on `Memo`/`ScalarId`; do not build analyzer expressions in optimizer tests:
 
 ```rust
-    fn eq_for_null(left: TypedExpr, right: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: Box::new(left),
-                op: BinOp::EqForNull,
-                right: Box::new(right),
-            },
-            data_type: DataType::Boolean,
-            nullable: false,
-        }
+    fn eq_for_null(memo: &mut Memo, left: ScalarId, right: ScalarId) -> ScalarId {
+        binary(memo, BinOp::EqForNull, left, right)
     }
 ```
 
@@ -365,13 +347,13 @@ Then add this test near `propagates_literal_from_left_to_right`:
         let mut memo = Memo::new();
         let left = scan_group(&mut memo, 1, "lk");
         let right = scan_group(&mut memo, 2, "rk");
+        let null_safe_pair = null_safe_eq_cols(&mut memo, 1, 2);
+        let literal_eq = eq_col_lit(&mut memo, 1, 10);
+        let condition = and(&mut memo, null_safe_pair, literal_eq);
         let join = join_mexpr(
             &mut memo,
             JoinKind::Inner,
-            and(
-                eq_for_null(col(1, "lk"), col(2, "rk")),
-                eq(col(1, "lk"), lit(10)),
-            ),
+            condition,
             vec![left, right],
         );
 
@@ -723,19 +705,11 @@ git commit -m "fix: project join reorder equivalence from logical props"
 
 - [ ] **Step 1: Add `eq_for_null` helper in flatten tests**
 
-Inside the flatten test module, add this helper after `fn eq(...)`:
+Inside the flatten test module, add this helper after `fn eq(...)`. Test helpers should intern optimizer scalars directly:
 
 ```rust
-    fn eq_for_null(l: TypedExpr, r: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: Box::new(l),
-                op: BinOp::EqForNull,
-                right: Box::new(r),
-            },
-            data_type: arrow::datatypes::DataType::Boolean,
-            nullable: false,
-        }
+    fn eq_for_null(memo: &mut Memo, left: ScalarId, right: ScalarId) -> ScalarId {
+        binary(memo, BinOp::EqForNull, left, right)
     }
 ```
 
@@ -750,14 +724,16 @@ Add this test after `flatten_projects_root_equivalence_class_with_atom_internal_
         let a = leaf_with_outputs(&mut memo, vec![out_col(1), out_col(2)], 1000.0);
         let b = leaf(&mut memo, 3, 100.0);
         let c = leaf(&mut memo, 4, 50.0);
+        let c1_eq_c3 = eq_cols(&mut memo, 1, 3);
+        let c2_eq_c4 = eq_cols(&mut memo, 2, 4);
         let tree = JoinTree::Join {
             left: Box::new(JoinTree::Join {
                 left: Box::new(JoinTree::Leaf(a)),
                 right: Box::new(JoinTree::Leaf(b)),
-                op: inner(&mut memo, eq(col(1), col(3))),
+                op: inner(c1_eq_c3),
             }),
             right: Box::new(JoinTree::Leaf(c)),
-            op: inner(&mut memo, eq(col(2), col(4))),
+            op: inner(c2_eq_c4),
         };
         let root = copy_in_join_tree(&mut memo, &tree, &Map::new());
         let mut root_props = LogicalProperties::new(
