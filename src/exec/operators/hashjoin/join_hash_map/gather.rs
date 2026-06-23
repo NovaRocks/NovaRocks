@@ -23,7 +23,7 @@ use arrow::compute::take;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
-use crate::exec::chunk::{Chunk, ChunkSchemaRef};
+use crate::exec::chunk::Chunk;
 use crate::exec::schema_compat::align_schema_to_arrays;
 
 pub(crate) const MAX_JOIN_OUTPUT_ROWS_PER_BATCH: usize = 16 * 1024;
@@ -167,13 +167,6 @@ pub(crate) fn concat_schemas(left: SchemaRef, right: SchemaRef) -> SchemaRef {
     Arc::new(Schema::new(fields))
 }
 
-pub(crate) fn chunk_from_batch(
-    batch: RecordBatch,
-    chunk_schema: &ChunkSchemaRef,
-) -> Result<Chunk, String> {
-    Chunk::try_new_with_chunk_schema(batch, Arc::clone(chunk_schema))
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -185,7 +178,10 @@ mod tests {
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema};
 
-    use super::{MAX_JOIN_OUTPUT_ROWS_PER_BATCH, gather_join_batches, gather_left_with_null_right};
+    use super::{
+        MAX_JOIN_OUTPUT_ROWS_PER_BATCH, gather_join_batches, gather_left_with_null_right,
+        gather_null_left_with_right,
+    };
 
     fn one_column_chunk(name: &str, slot_id: SlotId, values: Vec<i32>) -> Chunk {
         let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int32, false)]));
@@ -222,6 +218,8 @@ mod tests {
         .expect("join batches");
 
         assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].num_rows(), MAX_JOIN_OUTPUT_ROWS_PER_BATCH);
+        assert_eq!(batches[1].num_rows(), 1);
         assert_eq!(
             batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
             rows
@@ -247,5 +245,26 @@ mod tests {
         assert_eq!(batch.num_columns(), 2);
         assert_eq!(batch.column(1).len(), left_indices.len());
         assert_eq!(batch.column(1).null_count(), left_indices.len());
+    }
+
+    #[test]
+    fn gather_null_left_with_right_preserves_row_count() {
+        let right = one_column_chunk("r", SlotId::new(2), vec![100, 200, 300, 400]);
+        let left_schema = Arc::new(Schema::new(vec![Field::new("l", DataType::Int32, true)]));
+        let right_indices = vec![2, 1, 2];
+
+        let batch = gather_null_left_with_right(
+            &right,
+            &right_indices,
+            &left_schema,
+            &join_schema("l", "r"),
+        )
+        .expect("null left right")
+        .expect("batch");
+
+        assert_eq!(batch.num_rows(), right_indices.len());
+        assert_eq!(batch.num_columns(), 2);
+        assert_eq!(batch.column(0).len(), right_indices.len());
+        assert_eq!(batch.column(0).null_count(), right_indices.len());
     }
 }
