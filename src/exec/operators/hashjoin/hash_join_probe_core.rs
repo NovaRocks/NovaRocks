@@ -47,6 +47,7 @@ use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::join::JoinType;
 use crate::exec::runtime_filter::LocalRuntimeFilterSet;
 use crate::exec::schema_compat::{align_schema_to_batches, normalize_batch_to_schema};
+use crate::runtime::profile::{CounterRef, clamp_u128_to_i64};
 
 fn concat_compatible_batches(
     schema: &SchemaRef,
@@ -92,6 +93,8 @@ pub(crate) struct HashJoinProbeCore {
     residual_matched_rows: u64,
     residual_group_rows_total: u64,
     pending_output_batches: VecDeque<RecordBatch>,
+    search_timer: Option<CounterRef>,
+    output_timer: Option<CounterRef>,
 }
 
 impl HashJoinProbeCore {
@@ -135,7 +138,31 @@ impl HashJoinProbeCore {
             residual_matched_rows: 0,
             residual_group_rows_total: 0,
             pending_output_batches: VecDeque::new(),
+            search_timer: None,
+            output_timer: None,
         }
+    }
+
+    pub(crate) fn set_phase_timers(&mut self, search_timer: CounterRef, output_timer: CounterRef) {
+        self.search_timer = Some(search_timer);
+        self.output_timer = Some(output_timer);
+    }
+
+    #[inline]
+    fn record_timer_ns(timer: Option<&CounterRef>, start: std::time::Instant) {
+        if let Some(timer) = timer {
+            timer.add(clamp_u128_to_i64(start.elapsed().as_nanos()));
+        }
+    }
+
+    #[inline]
+    fn record_search_ns(&self, start: std::time::Instant) {
+        Self::record_timer_ns(self.search_timer.as_ref(), start);
+    }
+
+    #[inline]
+    fn record_output_ns(&self, start: std::time::Instant) {
+        Self::record_timer_ns(self.output_timer.as_ref(), start);
     }
 
     pub(crate) fn join_type(&self) -> JoinType {
@@ -282,6 +309,7 @@ impl HashJoinProbeCore {
         use crate::exec::chunk::ChunkSchema;
         use arrow::array::new_null_array;
         let num_rows = probe_batch.num_rows();
+        let output_start = std::time::Instant::now();
         let build_schema = self.build_chunk_schema();
         let probe_col_count = probe_batch.num_columns();
         let mut columns: Vec<arrow::array::ArrayRef> = probe_batch.columns().to_vec();
@@ -308,8 +336,10 @@ impl HashJoinProbeCore {
             ChunkSchema::try_new(adjusted_slots)
                 .map_err(|e| format!("extend_with_null_build_columns schema: {e}"))?,
         );
-        Chunk::try_new_with_columns(chunk_schema, columns)
-            .map_err(|e| format!("extend_with_null_build_columns: {e}"))
+        let chunk = Chunk::try_new_with_columns(chunk_schema, columns)
+            .map_err(|e| format!("extend_with_null_build_columns: {e}"))?;
+        self.record_output_ns(output_start);
+        Ok(chunk)
     }
 
     /// Extend a build-only batch with NULL-filled probe-side columns.
@@ -318,6 +348,7 @@ impl HashJoinProbeCore {
         use crate::exec::chunk::ChunkSchema;
         use arrow::array::new_null_array;
         let num_rows = build_batch.num_rows();
+        let output_start = std::time::Instant::now();
         let probe_schema = self.probe_chunk_schema();
         let probe_col_count = probe_schema.slots().len();
         let mut columns: Vec<arrow::array::ArrayRef> =
@@ -343,8 +374,10 @@ impl HashJoinProbeCore {
             ChunkSchema::try_new(adjusted_slots)
                 .map_err(|e| format!("extend_with_null_probe_columns schema: {e}"))?,
         );
-        Chunk::try_new_with_columns(chunk_schema, columns)
-            .map_err(|e| format!("extend_with_null_probe_columns: {e}"))
+        let chunk = Chunk::try_new_with_columns(chunk_schema, columns)
+            .map_err(|e| format!("extend_with_null_probe_columns: {e}"))?;
+        self.record_output_ns(output_start);
+        Ok(chunk)
     }
 
     pub(crate) fn right_semi_anti_output_chunk(
@@ -425,13 +458,15 @@ impl HashJoinProbeCore {
                     indices.push(row as u32);
                 }
             }
-            let Some(batch) = build_null_left_with_right(
+            let output_start = std::time::Instant::now();
+            let batch = build_null_left_with_right(
                 build_batch,
                 &indices,
                 &self.left_chunk_schema.arrow_schema_ref(),
                 &output_schema,
-            )?
-            else {
+            )?;
+            self.record_output_ns(output_start);
+            let Some(batch) = batch else {
                 continue;
             };
             if batch.num_rows() > 0 {
@@ -621,7 +656,10 @@ impl HashJoinProbeCore {
         if self.probe_keys.is_empty() {
             for left in probe_chunks {
                 for right in self.build_batches.iter() {
-                    if let Some(batch) = cross_join_chunk(&left, right, &output_schema)? {
+                    let output_start = std::time::Instant::now();
+                    let batch = cross_join_chunk(&left, right, &output_schema)?;
+                    self.record_output_ns(output_start);
+                    if let Some(batch) = batch {
                         output_batches.push(batch);
                     }
                 }
@@ -641,6 +679,8 @@ impl HashJoinProbeCore {
                     self.build_batches.as_ref(),
                     table,
                     &output_schema,
+                    self.search_timer.as_ref(),
+                    self.output_timer.as_ref(),
                 )?;
                 output_batches.extend(batches);
             }
@@ -710,6 +750,7 @@ impl HashJoinProbeCore {
                     continue;
                 }
                 let indices = (0..probe.len()).map(|i| i as u32).collect::<Vec<_>>();
+                let output_start = std::time::Instant::now();
                 let batch = if self.probe_is_left {
                     build_left_with_null_right(
                         &probe,
@@ -725,6 +766,7 @@ impl HashJoinProbeCore {
                         &output_schema,
                     )?
                 };
+                self.record_output_ns(output_start);
                 if let Some(batch) = batch {
                     output_batches.push(batch);
                 }
@@ -732,7 +774,9 @@ impl HashJoinProbeCore {
             }
 
             let table = table_opt.expect("build table");
+            let search_start = std::time::Instant::now();
             let group_ids = lookup_group_ids(&self.arena, &self.probe_keys, &probe, table)?;
+            self.record_search_ns(search_start);
             if group_ids.is_empty() {
                 continue;
             }
@@ -767,6 +811,7 @@ impl HashJoinProbeCore {
                 }
                 let build_indices = &build_indices_by_batch[batch_idx];
 
+                let output_start = std::time::Instant::now();
                 let candidate = if self.probe_is_left {
                     build_join_batch(
                         &probe,
@@ -784,6 +829,7 @@ impl HashJoinProbeCore {
                         &output_schema,
                     )?
                 };
+                self.record_output_ns(output_start);
                 let Some(candidate) = candidate else {
                     continue;
                 };
@@ -853,6 +899,7 @@ impl HashJoinProbeCore {
                     }
                 }
                 if !unmatched.is_empty() {
+                    let output_start = std::time::Instant::now();
                     let batch = if self.probe_is_left {
                         build_left_with_null_right(
                             &probe,
@@ -868,6 +915,7 @@ impl HashJoinProbeCore {
                             &output_schema,
                         )?
                     };
+                    self.record_output_ns(output_start);
                     if let Some(batch) = batch {
                         output_batches.push(batch);
                     }
@@ -964,7 +1012,9 @@ impl HashJoinProbeCore {
         let pred = self.residual_predicate;
         let mut output_batches = Vec::new();
         for probe in probe_chunks {
+            let search_start = std::time::Instant::now();
             let group_ids = lookup_group_ids(&self.arena, &self.probe_keys, &probe, table)?;
+            self.record_search_ns(search_start);
             if group_ids.is_empty() {
                 continue;
             }
@@ -989,6 +1039,7 @@ impl HashJoinProbeCore {
                         &join_scope_schema,
                         &self.join_scope_chunk_schema,
                         pred,
+                        self.output_timer.as_ref(),
                     )?;
                 self.residual_rows_checked =
                     self.residual_rows_checked.saturating_add(rows_checked);
@@ -1095,7 +1146,10 @@ impl HashJoinProbeCore {
             }
 
             let group_ids = if let Some(table) = table_opt {
-                lookup_group_ids(&self.arena, &self.probe_keys, &probe, table)?
+                let search_start = std::time::Instant::now();
+                let group_ids = lookup_group_ids(&self.arena, &self.probe_keys, &probe, table)?;
+                self.record_search_ns(search_start);
+                group_ids
             } else {
                 vec![None; probe.len()]
             };
@@ -1124,6 +1178,7 @@ impl HashJoinProbeCore {
                             &self.join_scope_schema,
                             &self.join_scope_chunk_schema,
                             pred,
+                            self.output_timer.as_ref(),
                         )?;
                     self.residual_rows_checked =
                         self.residual_rows_checked.saturating_add(rows_checked);
@@ -1149,6 +1204,7 @@ impl HashJoinProbeCore {
                         &self.join_scope_chunk_schema,
                         pred,
                         None,
+                        self.output_timer.as_ref(),
                     )?;
                 }
 
@@ -1170,6 +1226,7 @@ impl HashJoinProbeCore {
                         &self.join_scope_chunk_schema,
                         pred,
                         Some(&probe_null_rows),
+                        self.output_timer.as_ref(),
                     )?;
                 }
             }
@@ -1234,6 +1291,8 @@ impl HashJoinProbeCore {
         let Some(table) = self.build_table.as_ref() else {
             return Ok(output_indices);
         };
+        let search_timer = self.search_timer.clone();
+        let output_timer = self.output_timer.clone();
         if table.is_empty() {
             return Ok(output_indices);
         }
@@ -1248,7 +1307,9 @@ impl HashJoinProbeCore {
             if probe.is_empty() {
                 continue;
             }
+            let search_start = std::time::Instant::now();
             let group_ids = lookup_group_ids(&self.arena, &self.probe_keys, &probe, table)?;
+            Self::record_timer_ns(search_timer.as_ref(), search_start);
             if group_ids.is_empty() {
                 continue;
             }
@@ -1307,6 +1368,7 @@ impl HashJoinProbeCore {
                     continue;
                 }
                 let build_indices = &build_indices_by_batch[batch_idx];
+                let output_start = std::time::Instant::now();
                 let candidate = build_join_batch(
                     &probe,
                     build_batch,
@@ -1314,6 +1376,7 @@ impl HashJoinProbeCore {
                     build_indices,
                     &output_schema,
                 )?;
+                Self::record_timer_ns(output_timer.as_ref(), output_start);
                 let Some(candidate) = candidate else {
                     continue;
                 };
@@ -1371,6 +1434,7 @@ impl HashJoinProbeCore {
         join_scope_chunk_schema: &ChunkSchemaRef,
         pred: ExprId,
         probe_row_filter: Option<&[bool]>,
+        output_timer: Option<&CounterRef>,
     ) -> Result<Vec<bool>, String> {
         if build_batches.len() != build_rows_by_batch.len() {
             return Err(format!(
@@ -1430,14 +1494,16 @@ impl HashJoinProbeCore {
                     left_indices.push(probe_row);
                     right_indices.push(build_row);
                     if left_indices.len() == MAX_EVAL_PAIRS {
-                        let Some(joined) = build_join_batch(
+                        let output_start = std::time::Instant::now();
+                        let joined = build_join_batch(
                             probe,
                             build_batch,
                             &left_indices,
                             &right_indices,
                             join_scope_schema,
-                        )?
-                        else {
+                        )?;
+                        Self::record_timer_ns(output_timer, output_start);
+                        let Some(joined) = joined else {
                             left_indices.clear();
                             right_indices.clear();
                             continue;
@@ -1476,14 +1542,16 @@ impl HashJoinProbeCore {
             if left_indices.is_empty() {
                 continue;
             }
-            let Some(joined) = build_join_batch(
+            let output_start = std::time::Instant::now();
+            let joined = build_join_batch(
                 probe,
                 build_batch,
                 &left_indices,
                 &right_indices,
                 join_scope_schema,
-            )?
-            else {
+            )?;
+            Self::record_timer_ns(output_timer, output_start);
+            let Some(joined) = joined else {
                 continue;
             };
             let joined_chunk =
@@ -1520,6 +1588,7 @@ impl HashJoinProbeCore {
         join_scope_schema: &SchemaRef,
         join_scope_chunk_schema: &ChunkSchemaRef,
         pred: ExprId,
+        output_timer: Option<&CounterRef>,
     ) -> Result<(Vec<bool>, u64, u64, u64, u64), String> {
         if group_ids.len() != probe.len() {
             return Err("join group id vector length mismatch".to_string());
@@ -1604,6 +1673,7 @@ impl HashJoinProbeCore {
                     continue;
                 }
 
+                let output_start = std::time::Instant::now();
                 let joined = if is_left {
                     build_join_batch(
                         probe,
@@ -1621,6 +1691,7 @@ impl HashJoinProbeCore {
                         join_scope_schema,
                     )?
                 };
+                Self::record_timer_ns(output_timer, output_start);
 
                 let Some(joined) = joined else {
                     continue;

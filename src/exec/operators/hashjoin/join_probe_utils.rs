@@ -43,8 +43,16 @@ use crate::exec::hash_table::key_builder::{
 };
 use crate::exec::hash_table::key_strategy::GroupKeyStrategy;
 use crate::exec::schema_compat::align_schema_to_arrays;
+use crate::runtime::profile::{CounterRef, clamp_u128_to_i64};
 
 const MAX_JOIN_OUTPUT_ROWS_PER_BATCH: usize = 16 * 1024;
+
+#[inline]
+fn record_timer_ns(timer: Option<&CounterRef>, start: std::time::Instant) {
+    if let Some(timer) = timer {
+        timer.add(clamp_u128_to_i64(start.elapsed().as_nanos()));
+    }
+}
 
 fn build_output_record_batch(
     output_schema: &SchemaRef,
@@ -88,6 +96,8 @@ pub(crate) fn keyed_join_chunk(
     right_batches: &[Chunk],
     table: &JoinHashTable,
     output_schema: &SchemaRef,
+    search_timer: Option<&CounterRef>,
+    output_timer: Option<&CounterRef>,
 ) -> Result<Vec<RecordBatch>, String> {
     let left_len = left.len();
     if left_len == 0 {
@@ -105,6 +115,7 @@ pub(crate) fn keyed_join_chunk(
 
     let key_views = build_group_key_views(&probe_key_arrays).map_err(|e| e.to_string())?;
     let nulls = build_nulls(&key_views, left_len, table.null_safe_eq());
+    let search_start = std::time::Instant::now();
     let group_ids = match table.key_strategy() {
         GroupKeyStrategy::OneNumber => {
             let view = key_views
@@ -172,6 +183,7 @@ pub(crate) fn keyed_join_chunk(
             return Err("join hash table does not support empty keys".to_string());
         }
     };
+    record_timer_ns(search_timer, search_start);
 
     let mut counts_by_batch = vec![0usize; right_batches.len()];
     for group_id_opt in group_ids.iter() {
@@ -236,13 +248,10 @@ pub(crate) fn keyed_join_chunk(
             continue;
         }
         let right_indices = &right_indices_by_batch[batch_idx];
-        output_batches.extend(build_join_batches(
-            left,
-            right,
-            left_indices,
-            right_indices,
-            output_schema,
-        )?);
+        let output_start = std::time::Instant::now();
+        let batches = build_join_batches(left, right, left_indices, right_indices, output_schema)?;
+        record_timer_ns(output_timer, output_start);
+        output_batches.extend(batches);
     }
 
     Ok(output_batches)

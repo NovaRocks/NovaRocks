@@ -264,6 +264,9 @@ impl BroadcastJoinProbeProcessorOperator {
             profile
                 .common
                 .add_info_string("DistributionMode", "BROADCAST");
+            let search = profile.common.add_timer("SearchHashTableTime");
+            let output = profile.common.add_timer("OutputColumnTime");
+            self.core.set_phase_timers(search, output);
         }
     }
 
