@@ -211,6 +211,10 @@ impl JoinHashTable {
         Ok(&rows[start..end])
     }
 
+    pub(crate) fn group_build_rows(&self, group_id: usize) -> Result<&[u32], String> {
+        self.group_rows_slice(group_id)
+    }
+
     pub(crate) fn add_build_batch(
         &mut self,
         key_arrays: &[arrow::array::ArrayRef],

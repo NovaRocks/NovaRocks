@@ -37,6 +37,7 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 
 use super::build_artifact::JoinBuildArtifact;
+use super::join_hash_map::method::JoinHashMap;
 use super::join_hash_table::JoinHashTable;
 use super::join_probe_utils::{
     build_join_batch, build_left_with_null_right, build_null_left_with_right, concat_schemas,
@@ -76,7 +77,7 @@ pub(crate) struct HashJoinProbeCore {
     build_loaded: bool,
     build_batches: Arc<Vec<Chunk>>,
     build_null_key_rows: Option<Arc<Vec<Vec<u32>>>>,
-    build_table: Option<Arc<JoinHashTable>>,
+    build_table: Option<Arc<JoinHashMap>>,
     runtime_filters: Option<Arc<LocalRuntimeFilterSet>>,
     output_schema: Option<SchemaRef>,
     build_matched: Option<Vec<Vec<bool>>>,

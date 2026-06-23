@@ -34,7 +34,7 @@ use arrow::array::Array;
 use super::build_artifact::JoinBuildArtifact;
 use super::build_state::JoinBuildSinkState;
 use super::join_hash_map::build_store::BuildStoreBuilder;
-use super::join_hash_table::JoinHashTable;
+use super::join_hash_map::method::JoinHashMap;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::join::{JoinDistributionMode, JoinRuntimeFilterSpec, JoinType};
@@ -186,7 +186,7 @@ struct HashJoinBuildSinkOperator {
     runtime_in_filter_merger: Option<Arc<PartialRuntimeInFilterMerger>>,
     build_store_builder: BuildStoreBuilder,
     build_batches: Vec<Chunk>,
-    build_table: Option<JoinHashTable>,
+    build_table: Option<JoinHashMap>,
     runtime_filters: Option<LocalRuntimeFilterSet>,
     runtime_in_filters: Option<LocalRuntimeInFilterSet>,
     finished: bool,
@@ -332,7 +332,7 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
                 .iter()
                 .map(|array| array.data_type().clone())
                 .collect::<Vec<_>>();
-            let mut table = JoinHashTable::new(key_types, self.eq_null_safe.clone())
+            let mut table = JoinHashMap::new_chained(key_types, self.eq_null_safe.clone())
                 .map_err(|e| e.to_string())?;
             if let Some(tracker) = self.build_table_mem_tracker.as_ref() {
                 table.set_mem_tracker(Arc::clone(tracker));
@@ -408,7 +408,7 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
             .map(|p| p.common.add_timer("BuildHashTableTime"));
         if let Some(table) = self.build_table.as_mut() {
             let start = std::time::Instant::now();
-            table.finalize_groups().map_err(|e| e.to_string())?;
+            table.finalize().map_err(|e| e.to_string())?;
             if let Some(timer) = build_ht_timer.as_ref() {
                 timer.add(clamp_u128_to_i64(start.elapsed().as_nanos()));
             }
@@ -1078,8 +1078,8 @@ impl HashJoinBuildSinkOperator {
                 .ok_or_else(|| "runtime filter build key type missing".to_string())?;
             key_types.push(data_type.clone());
         }
-        let temp_table =
-            JoinHashTable::new(key_types, self.eq_null_safe.clone()).map_err(|e| e.to_string())?;
+        let temp_table = JoinHashMap::new_chained(key_types, self.eq_null_safe.clone())
+            .map_err(|e| e.to_string())?;
         Ok(temp_table.hash_seed())
     }
 

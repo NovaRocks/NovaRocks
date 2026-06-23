@@ -21,4 +21,5 @@
 pub(crate) mod build_store;
 pub(crate) mod gather;
 pub(crate) mod match_flags;
+pub(crate) mod method;
 pub(crate) mod search;
