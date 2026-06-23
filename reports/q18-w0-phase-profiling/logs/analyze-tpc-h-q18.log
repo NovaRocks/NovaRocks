@@ -1,0 +1,83 @@
+started cross-process BE[0] pid=51066 grpc_port=51574 config=/Users/harbor/.codex/worktrees/0e15/NovaRocks/.sql-test-runner-runtime/51064_1782218775951785000/be_0.toml
+started cross-process BE[1] pid=51448 grpc_port=51576 config=/Users/harbor/.codex/worktrees/0e15/NovaRocks/.sql-test-runner-runtime/51064_1782218775951785000/be_1.toml
+started cross-process BE[2] pid=51465 grpc_port=51578 config=/Users/harbor/.codex/worktrees/0e15/NovaRocks/.sql-test-runner-runtime/51064_1782218775951785000/be_2.toml
+started cross-process FE pid=51466 mysql_port=51581 config=/Users/harbor/.codex/worktrees/0e15/NovaRocks/.sql-test-runner-runtime/51064_1782218775951785000/fe.toml
+ Container nr-iceberg-rest-minio-1  Running
+ Container nr-iceberg-rest-rest-1  Running
+ Container nr-iceberg-rest-spark-1  Running
+ Container nr-iceberg-rest-mc-1  Starting
+ Container nr-iceberg-rest-mc-1  Started
+ Container nr-iceberg-rest-mc-1  Waiting
+ Container nr-iceberg-rest-mc-1  Exited
+NovaRocks workspace environment is ready.
+
+Workspace: /Users/harbor/.codex/worktrees/0e15/NovaRocks
+Environment id: novarocks-7cdafc67
+Runtime dir: /Users/harbor/.codex/worktrees/0e15/NovaRocks/docker/iceberg-rest/runtime/novarocks-7cdafc67
+Current entry: /Users/harbor/.codex/worktrees/0e15/NovaRocks/docker/iceberg-rest/runtime/current
+Compose project: nr-iceberg-rest
+Shared Docker: true
+Shared config: /Users/harbor/.codex/worktrees/0e15/NovaRocks/docker/iceberg-rest/shared.env
+
+MinIO endpoint: http://127.0.0.1:9000
+MinIO console: http://127.0.0.1:9001
+Iceberg REST: http://127.0.0.1:8181
+Iceberg REST warehouse: s3://warehouse/novarocks-7cdafc67/rest
+REST server default warehouse: s3://warehouse/shared/rest
+Spark UI: http://127.0.0.1:4040
+Docker services are running or were reused.
+
+Use:
+  source "/Users/harbor/.codex/worktrees/0e15/NovaRocks/docker/iceberg-rest/runtime/current/env.sh"
+
+  cargo run -- standalone-server --config "$NOVAROCKS_STANDALONE_CONFIG"
+  cargo run -- standalone-server --config "$NOVAROCKS_STANDALONE_SCHEDULER_CONFIG"
+  cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config "$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg --mode verify
+  cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config "$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-mv-scheduler --mode verify
+  cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config "$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-compatibility --mode verify
+  docker/iceberg-rest/spark-sql.sh "$NOVAROCKS_SPARK_V3_SMOKE_SQL"
+Checking benchmark data readiness...
+ Container nr-iceberg-rest-minio-1  Running
+Benchmark data is ready: suite=tpc-h scale=1 catalog=iceberg_cat_sqlt_18bbb6893e3a3908_51064_0
+========================================================================
+📋 TPC-H correctness runner (jobs=1)
+========================================================================
+mode=record
+cluster_mode=cross-process
+sql_dir=/Users/harbor/.codex/worktrees/0e15/NovaRocks/reports/q18-w0-phase-profiling/generated-sql/analyze/tpc-h
+sql_glob=q*.sql
+config=/Users/harbor/.codex/worktrees/0e15/NovaRocks/reports/q18-w0-phase-profiling/sql-test-q18.conf
+result_dir=/Users/harbor/.codex/worktrees/0e15/NovaRocks/reports/q18-w0-phase-profiling/plans/analyze/tpc-h
+query_timeout=300s
+target: mysql=mysql, host=127.0.0.1:51581, user=root, catalog=iceberg_cat_sqlt_18bbb6893e3a3908_51064_0, db=tpch
+suite_init=/Users/harbor/.codex/worktrees/0e15/NovaRocks/sql-tests/tpc-h/init.sql
+suite_env.catalog=iceberg_cat_sqlt_18bbb6893e3a3908_51064_0
+suite_env.db=tpch
+suite_cleanup=/Users/harbor/.codex/worktrees/0e15/NovaRocks/sql-tests/tpc-h/cleanup.sql
+cases=1
+========================================================================
+[tpc-h] running suite init on target: /Users/harbor/.codex/worktrees/0e15/NovaRocks/sql-tests/tpc-h/init.sql
+
+[tpc-h] q18 (steps=1)
+  step 1 (order_sensitive=false, epsilon=None)
+    ✅ STEP RECORDED (78.82s, rows=102)
+    ✅ RECORDED CASE -> /Users/harbor/.codex/worktrees/0e15/NovaRocks/reports/q18-w0-phase-profiling/plans/analyze/tpc-h/q18.result
+    [tpc-h] progress: pass=1, fail=0, total=1
+
+[tpc-h] running suite cleanup on target: /Users/harbor/.codex/worktrees/0e15/NovaRocks/sql-tests/tpc-h/cleanup.sql
+
+========================================================================
+summary (tpc-h, mode=record)
+========================================================================
+total=1
+pass=1
+fail=0
+cpu_time=78.82s
+  suite tpc-h wall_time=80.76s
+
+slowest cases (top 5):
+  [tpc-h] q18: 78.82s
+
+case timings (all):
+  [tpc-h] q18 PASS 78.82s
+========================================================================
