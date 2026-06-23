@@ -30,6 +30,7 @@ mod build_artifact;
 pub(crate) mod build_state;
 mod hash_join_build_sink;
 mod hash_join_probe_core;
+mod join_hash_map;
 mod join_hash_table;
 pub(crate) mod join_probe_utils;
 mod partitioned_join_probe_processor;
