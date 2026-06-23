@@ -862,12 +862,31 @@ fn actual_suffix(
     actuals: Option<&HashMap<i32, ActualMetrics>>,
 ) -> String {
     match actuals.and_then(|actuals| actuals.get(&node.node_id)) {
-        Some(metrics) => format!(
-            " act={{rows={} time={} peak={}}}",
-            metrics.output_rows,
-            fmt_time_ns(metrics.total_time_ns),
-            fmt_bytes(metrics.peak_mem_bytes)
-        ),
+        Some(metrics) => {
+            let mut s = format!(
+                " act={{rows={} time={}",
+                metrics.output_rows,
+                fmt_time_ns(metrics.total_time_ns)
+            );
+            if metrics.total_time_max_ns > 0 {
+                s.push_str(&format!(
+                    " (max={} min={})",
+                    fmt_time_ns(metrics.total_time_max_ns),
+                    fmt_time_ns(metrics.total_time_min_ns)
+                ));
+            }
+            if metrics.build_ht_ns > 0 {
+                s.push_str(&format!(" build_ht={}", fmt_time_ns(metrics.build_ht_ns)));
+            }
+            if metrics.search_ns > 0 {
+                s.push_str(&format!(" search={}", fmt_time_ns(metrics.search_ns)));
+            }
+            if metrics.output_ns > 0 {
+                s.push_str(&format!(" output={}", fmt_time_ns(metrics.output_ns)));
+            }
+            s.push_str(&format!(" peak={}}}", fmt_bytes(metrics.peak_mem_bytes)));
+            s
+        }
         None => String::new(),
     }
 }
@@ -1593,6 +1612,40 @@ mod tests {
         assert!(
             !text.contains("2:PROJECT [t.k AS k] stats={rows=3 conf=fallback} act="),
             "nodes absent from the actuals map must not print act=:\n{text}"
+        );
+    }
+
+    #[test]
+    fn actual_suffix_renders_phase_timers_and_minmax() {
+        let dp = build_distributed_plan(&aggregate_count_plan(project_plan(scan_plan())))
+            .expect("build DistributedPlan");
+        let mut actuals = HashMap::new();
+        actuals.insert(
+            1,
+            ActualMetrics {
+                output_rows: 13_502_430,
+                total_time_ns: 44_800_000_000,
+                peak_mem_bytes: 637_000_000,
+                total_time_max_ns: 46_000_000_000,
+                total_time_min_ns: 43_000_000_000,
+                build_ht_ns: 0,
+                search_ns: 20_000_000_000,
+                output_ns: 18_000_000_000,
+            },
+        );
+
+        let text =
+            explain_distributed_plan_analyze(&dp, ExplainLevel::Analyze, &actuals).join("\n");
+
+        assert!(
+            text.contains(
+                "act={rows=13502430 time=44.8s (max=46.0s min=43.0s) search=20.0s output=18.0s peak=607.5MB}"
+            ),
+            "expected scan actuals to include phase timers and per-driver min/max in order:\n{text}"
+        );
+        assert!(
+            !text.contains("build_ht="),
+            "zero build hash-table timer must not render:\n{text}"
         );
     }
 
