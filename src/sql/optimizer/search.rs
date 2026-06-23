@@ -12,7 +12,9 @@ use super::derive::PropertyAlternativeKind;
 use super::memo::{GroupId, Memo, TotalCost};
 use super::operator::*;
 use super::property::*;
-use super::statistics::{CostEstimate, MAX_FINITE_COST};
+use super::statistics::CostEstimate;
+#[cfg(test)]
+use super::statistics::MAX_FINITE_COST;
 use crate::sql::optimizer::stats_input::OptimizerStatsInput;
 
 pub(crate) use super::derive::EnforcerKind;
@@ -68,6 +70,7 @@ impl Winner {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn from_legacy_total(
         group_id: GroupId,
         expr_index: usize,
@@ -376,6 +379,7 @@ impl SearchContext {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn cost_estimate_for_total(
     total_cost: TotalCost,
     cost_options: &CostOptions,
