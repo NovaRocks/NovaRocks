@@ -38,6 +38,7 @@ use arrow::record_batch::RecordBatch;
 
 use super::build_artifact::JoinBuildArtifact;
 use super::join_hash_map::method::JoinHashMap;
+use super::join_hash_map::search::{JoinSelection, SearchStats};
 use super::join_hash_table::JoinHashTable;
 use super::join_probe_utils::{
     build_join_batch, build_left_with_null_right, build_null_left_with_right, concat_schemas,
@@ -425,39 +426,67 @@ impl HashJoinProbeCore {
         &mut self,
         probe: &Chunk,
         build: &Chunk,
-        selection: &mut crate::exec::operators::hashjoin::join_hash_map::search::JoinSelection,
+        selection: &mut JoinSelection,
         pred: ExprId,
     ) -> Result<(), String> {
         if selection.is_empty() {
             return Ok(());
         }
-        let output_start = std::time::Instant::now();
-        let candidate = crate::exec::operators::hashjoin::join_hash_map::gather::gather_join_batch(
-            probe,
-            build,
-            &selection.probe,
-            &selection.build,
-            &self.join_scope_schema,
-        )?
-        .ok_or_else(|| "join residual candidate batch missing".to_string())?;
-        self.record_output_ns(output_start);
-        let candidate_chunk =
-            Chunk::try_new_with_chunk_schema(candidate, Arc::clone(&self.join_scope_chunk_schema))?;
-        let mask_arr = self
-            .arena
-            .eval(pred, &candidate_chunk)
-            .map_err(|e| e.to_string())?;
-        let mask = mask_arr
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .ok_or_else(|| "join residual predicate must return boolean array".to_string())?;
-        let before = selection.len();
-        selection.compact_by_mask(mask)?;
-        self.residual_eval_batches = self.residual_eval_batches.saturating_add(1);
-        self.residual_eval_pairs = self.residual_eval_pairs.saturating_add(before as u64);
-        self.residual_matched_rows = self
-            .residual_matched_rows
-            .saturating_add(selection.len() as u64);
+        let mut kept = JoinSelection::new();
+        let mut offset = 0usize;
+        while offset < selection.len() {
+            let end = (offset
+                + crate::exec::operators::hashjoin::join_hash_map::gather::MAX_JOIN_OUTPUT_ROWS_PER_BATCH)
+                .min(selection.len());
+            let output_start = std::time::Instant::now();
+            let candidate =
+                crate::exec::operators::hashjoin::join_hash_map::gather::gather_join_batch(
+                    probe,
+                    build,
+                    &selection.probe[offset..end],
+                    &selection.build[offset..end],
+                    &self.join_scope_schema,
+                )?
+                .ok_or_else(|| "join residual candidate batch missing".to_string())?;
+            self.record_output_ns(output_start);
+            let candidate_chunk = Chunk::try_new_with_chunk_schema(
+                candidate,
+                Arc::clone(&self.join_scope_chunk_schema),
+            )?;
+            let mask_arr = self
+                .arena
+                .eval(pred, &candidate_chunk)
+                .map_err(|e| e.to_string())?;
+            let mask = mask_arr
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| "join residual predicate must return boolean array".to_string())?;
+            if mask.len() != end - offset {
+                return Err(format!(
+                    "join residual mask length mismatch: mask={} selection={}",
+                    mask.len(),
+                    end - offset
+                ));
+            }
+            let matched_before = kept.len();
+            for mask_idx in 0..mask.len() {
+                if mask.is_valid(mask_idx) && mask.value(mask_idx) {
+                    kept.push(
+                        selection.probe[offset + mask_idx],
+                        selection.build[offset + mask_idx],
+                    );
+                }
+            }
+            self.residual_eval_batches = self.residual_eval_batches.saturating_add(1);
+            self.residual_eval_pairs = self
+                .residual_eval_pairs
+                .saturating_add((end - offset) as u64);
+            self.residual_matched_rows = self
+                .residual_matched_rows
+                .saturating_add((kept.len() - matched_before) as u64);
+            offset = end;
+        }
+        *selection = kept;
         Ok(())
     }
 
@@ -725,17 +754,26 @@ impl HashJoinProbeCore {
                 let (group_ids, mut selection) =
                     table.lookup_selection(&self.arena, &self.probe_keys, &probe)?;
                 self.record_search_ns(search_start);
-                let stats =
-                    crate::exec::operators::hashjoin::join_hash_map::search::SearchStats::from_group_ids(
-                        &group_ids,
-                    );
+                let stats = SearchStats::from_group_ids(&group_ids);
                 self.lookup_hit_rows = self.lookup_hit_rows.saturating_add(stats.lookup_hit_rows);
                 self.lookup_miss_rows =
                     self.lookup_miss_rows.saturating_add(stats.lookup_miss_rows);
                 if selection.is_empty() {
                     continue;
                 }
+                let build_batch_lengths = self
+                    .build_batches
+                    .iter()
+                    .map(|batch| batch.len())
+                    .collect::<Vec<_>>();
+                selection.reorder_by_build_batch_lengths(&build_batch_lengths)?;
                 if let Some(pred) = self.residual_predicate {
+                    self.residual_rows_checked = self
+                        .residual_rows_checked
+                        .saturating_add(stats.lookup_hit_rows);
+                    self.residual_group_rows_total = self
+                        .residual_group_rows_total
+                        .saturating_add(selection.len() as u64);
                     self.compact_selection_by_residual(&probe, &build_chunk, &mut selection, pred)?;
                 }
                 if selection.is_empty() {

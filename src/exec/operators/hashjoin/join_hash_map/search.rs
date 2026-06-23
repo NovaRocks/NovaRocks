@@ -69,6 +69,60 @@ impl JoinSelection {
         self.build.truncate(write);
         Ok(())
     }
+
+    pub(crate) fn reorder_by_build_batch_lengths(
+        &mut self,
+        build_batch_lengths: &[usize],
+    ) -> Result<(), String> {
+        if self.probe.len() != self.build.len() {
+            return Err(format!(
+                "join selection length mismatch: probe={} build={}",
+                self.probe.len(),
+                self.build.len()
+            ));
+        }
+        if self.is_empty() {
+            return Ok(());
+        }
+        if build_batch_lengths.is_empty() {
+            return Err("join build batch ranges missing".to_string());
+        }
+
+        let mut offsets = Vec::with_capacity(build_batch_lengths.len() + 1);
+        offsets.push(0usize);
+        let mut total = 0usize;
+        for len in build_batch_lengths {
+            total = total
+                .checked_add(*len)
+                .ok_or_else(|| "join build batch row count overflow".to_string())?;
+            offsets.push(total);
+        }
+        if total == 0 {
+            return Err("join build batch ranges empty".to_string());
+        }
+
+        let mut buckets = vec![Vec::<(u32, u32)>::new(); build_batch_lengths.len()];
+        for (&probe_row, &build_row) in self.probe.iter().zip(self.build.iter()) {
+            let build_row_usize = build_row as usize;
+            if build_row_usize >= total {
+                return Err(format!(
+                    "join build row id out of bounds: row={} rows={}",
+                    build_row_usize, total
+                ));
+            }
+            let batch_idx = offsets.partition_point(|offset| *offset <= build_row_usize) - 1;
+            buckets[batch_idx].push((probe_row, build_row));
+        }
+
+        self.probe.clear();
+        self.build.clear();
+        for bucket in buckets {
+            for (probe_row, build_row) in bucket {
+                self.push(probe_row, build_row);
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,6 +227,21 @@ mod tests {
         let err = mask.set(2, true).expect_err("out of bounds");
 
         assert_eq!(err, "join probe mask row out of bounds: row=2 len=2");
+    }
+
+    #[test]
+    fn selection_reorders_by_build_batch_lengths() {
+        let mut selection = JoinSelection {
+            probe: vec![0, 0, 1, 1, 2],
+            build: vec![3, 0, 4, 1, 2],
+        };
+
+        selection
+            .reorder_by_build_batch_lengths(&[2, 2, 1])
+            .expect("reorder");
+
+        assert_eq!(selection.probe, vec![0, 1, 0, 2, 1]);
+        assert_eq!(selection.build, vec![0, 1, 3, 2, 4]);
     }
 
     #[test]
