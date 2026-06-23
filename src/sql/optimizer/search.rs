@@ -543,6 +543,37 @@ mod tests {
         (memo, gid)
     }
 
+    fn project_over_scan_memo_for_test() -> (Memo, GroupId, GroupId) {
+        let (mut memo, scan_group) = single_scan_memo();
+        let project_expr = intern_typed(&mut memo.scalars, &test_col(1, "c1"));
+        let root = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalProject(ProjectOp {
+                items: vec![ScalarProjectItem {
+                    expr: project_expr,
+                    output_name: "c1".to_string(),
+                    output_column_id: ColumnId(1),
+                    expr_display: None,
+                }],
+                output_qualifier: None,
+            }),
+            children: vec![scan_group],
+        });
+        set_group_logical_rows_for_test(
+            &mut memo,
+            scan_group,
+            1_000.0,
+            crate::sql::optimizer::statistics::Confidence::Exact,
+        );
+        set_group_logical_rows_for_test(
+            &mut memo,
+            root,
+            1_000.0,
+            crate::sql::optimizer::statistics::Confidence::Exact,
+        );
+        (memo, root, scan_group)
+    }
+
     pub(super) fn make_table_stats() -> HashMap<String, TableStatistics> {
         let mut ts = HashMap::new();
         ts.insert(
@@ -563,6 +594,20 @@ mod tests {
 
     fn empty_stats_input() -> OptimizerStatsInput {
         legacy_stats_input(HashMap::new())
+    }
+
+    fn assert_cost_estimate_close(actual: &CostEstimate, expected: &CostEstimate) {
+        assert_dimension_close("cpu", actual.cpu_cost, expected.cpu_cost);
+        assert_dimension_close("memory", actual.memory_cost, expected.memory_cost);
+        assert_dimension_close("network", actual.network_cost, expected.network_cost);
+    }
+
+    fn assert_dimension_close(label: &str, actual: f64, expected: f64) {
+        let tolerance = expected.abs().max(1.0) * 1.0e-12;
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "{label} cost mismatch: actual={actual}, expected={expected}, tolerance={tolerance}"
+        );
     }
 
     fn test_col(id: u32, name: &str) -> TypedExpr {
@@ -924,6 +969,67 @@ mod tests {
         assert_eq!(
             winner.total_cost,
             winner.cost_estimate.total_with_options(&ctx.cost_options)
+        );
+    }
+
+    #[test]
+    fn search_parent_cost_estimate_includes_child_winner_estimate() {
+        let (memo, root, child) = project_over_scan_memo_for_test();
+        let mut ctx = SearchContext::new_for_test(empty_stats_input());
+        let required = PhysicalPropertySet::any();
+
+        ctx.optimize_group(&memo, root, &required).expect("search");
+
+        let parent_winner = ctx
+            .winners
+            .get(&(root, required.clone()))
+            .expect("parent winner");
+        assert_eq!(
+            parent_winner.child_props,
+            vec![PhysicalPropertySet::any()],
+            "project should optimize its single child with Any properties"
+        );
+        assert!(
+            parent_winner.enforcer.is_none(),
+            "Any requirement should not add a parent enforcer"
+        );
+
+        let child_required = parent_winner.child_props[0].clone();
+        let child_winner = ctx
+            .winners
+            .get(&(child, child_required))
+            .expect("child winner");
+        let expr = memo.groups[root]
+            .physical_exprs
+            .get(parent_winner.expr_index)
+            .expect("parent winner expression");
+        let own_stats = stats_for_group(&memo.groups[root], &memo, &ctx.stats_input);
+        let child_stats = stats_for_group(&memo.groups[child], &memo, &ctx.stats_input);
+        let child_stats_refs = vec![&child_stats];
+        let child_output_refs = vec![&child_winner.output];
+        let parent_input = CostInput {
+            op: &expr.op,
+            own_stats: &own_stats,
+            child_stats: &child_stats_refs,
+            child_outputs: &child_output_refs,
+            required_output: &required,
+            alt_kind: &parent_winner.alt_kind,
+            scalars: Some(&memo.scalars),
+            options: &ctx.cost_options,
+        };
+        let parent_self_estimate = compute_cost_estimate(&parent_input).sanitized();
+        assert!(
+            parent_self_estimate.cpu_cost > 0.0 || parent_self_estimate.memory_cost > 0.0,
+            "fixture must have a non-zero parent self cost"
+        );
+
+        let expected = child_winner
+            .cost_estimate
+            .add_sanitized(&parent_self_estimate);
+        assert_cost_estimate_close(&parent_winner.cost_estimate, &expected);
+        assert!(
+            parent_winner.cost_estimate.cpu_cost > child_winner.cost_estimate.cpu_cost,
+            "parent CPU estimate should include child CPU plus project self CPU"
         );
     }
 
