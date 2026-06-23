@@ -12,7 +12,10 @@ use super::property::{DistributionSpec, PhysicalPropertySet};
 use super::scalar::{ScalarArena, ScalarId, ScalarNode};
 use crate::sql::common::JoinKind;
 use crate::sql::optimizer::derive::PropertyAlternativeKind;
-use crate::sql::optimizer::statistics::{CostEstimate, Statistics};
+use crate::sql::optimizer::statistics::{
+    CostEstimate, DEFAULT_CPU_COST_WEIGHT, DEFAULT_MEMORY_COST_WEIGHT, DEFAULT_NETWORK_COST_WEIGHT,
+    MAX_FINITE_COST, Statistics, finite_non_negative_dimension,
+};
 
 /// Network transfer multiplier applied to data that crosses node boundaries.
 /// Single source of truth: `derive` imports this constant.
@@ -35,8 +38,6 @@ const NON_EQUI_JOIN_COST_PENALTY: f64 = 2.0;
 /// NLJ is O(N*M) and should be heavily penalized relative to hash join.
 const NEST_LOOP_COST_PENALTY: f64 = 100.0;
 
-// Deliberately below f64::MAX so downstream weighting can still clamp safely.
-const MAX_FINITE_COST: f64 = 1.0e300;
 const DEFAULT_ROW_WIDTH: f64 = 8.0;
 
 pub(crate) struct CostInput<'a> {
@@ -234,9 +235,9 @@ pub(crate) struct CostOptions {
 impl Default for CostOptions {
     fn default() -> Self {
         Self {
-            cpu_weight: 0.5,
-            memory_weight: 2.0,
-            network_weight: 1.5,
+            cpu_weight: DEFAULT_CPU_COST_WEIGHT,
+            memory_weight: DEFAULT_MEMORY_COST_WEIGHT,
+            network_weight: DEFAULT_NETWORK_COST_WEIGHT,
             backend_factor: 3.0,
             broadcast_row_limit: 15_000_000.0,
             broadcast_byte_limit: 512.0 * 1024.0 * 1024.0,
@@ -256,26 +257,8 @@ impl Default for CostOptions {
     }
 }
 
-fn effective_cost_weight(weight: f64) -> f64 {
-    if weight.is_finite() {
-        weight.max(0.0)
-    } else {
-        0.0
-    }
-}
-
 fn finite_non_negative_cost(value: f64) -> f64 {
-    if value.is_finite() {
-        if value > 0.0 {
-            value.min(MAX_FINITE_COST)
-        } else {
-            0.0
-        }
-    } else if value.is_infinite() && value.is_sign_positive() {
-        MAX_FINITE_COST
-    } else {
-        0.0
-    }
+    finite_non_negative_dimension(value)
 }
 
 fn cost_row_count(stats: &Statistics) -> f64 {
@@ -378,9 +361,9 @@ fn sanitize_legacy_fallback_cost(
 impl CostEstimate {
     pub(crate) fn total_with_options(&self, options: &CostOptions) -> Cost {
         self.weighted_total(
-            effective_cost_weight(options.cpu_weight),
-            effective_cost_weight(options.memory_weight),
-            effective_cost_weight(options.network_weight),
+            options.cpu_weight,
+            options.memory_weight,
+            options.network_weight,
         )
     }
 }
@@ -715,11 +698,19 @@ pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
                 input.alt_kind,
                 input.options,
             );
-            let cpu_weight = effective_cost_weight(input.options.cpu_weight);
-            let cpu_cost = finite_non_negative_cost(
-                sanitize_legacy_fallback_cost(legacy_cost, input.own_stats, input.child_stats)
-                    / cpu_weight,
-            );
+            let cpu_weight =
+                if input.options.cpu_weight.is_finite() && input.options.cpu_weight > 0.0 {
+                    input.options.cpu_weight.min(MAX_FINITE_COST)
+                } else {
+                    0.0
+                };
+            let legacy_cost =
+                sanitize_legacy_fallback_cost(legacy_cost, input.own_stats, input.child_stats);
+            let cpu_cost = if cpu_weight > 0.0 {
+                finite_non_negative_cost(legacy_cost / cpu_weight)
+            } else {
+                0.0
+            };
             CostEstimate {
                 // Generic fallback stores the legacy scalar total as CPU-equivalent
                 // cost until the operator gets a real dimensional kernel.
@@ -1794,6 +1785,26 @@ mod tests {
         let total = estimate.total_with_options(&options);
         assert!(total.is_finite());
         assert_eq!(total, 0.0);
+    }
+
+    #[test]
+    fn weighted_total_is_linear_over_sanitized_cost_addition() {
+        let options = CostOptions::default();
+        let a = CostEstimate {
+            cpu_cost: 10.0,
+            memory_cost: f64::NAN,
+            network_cost: 4.0,
+        };
+        let b = CostEstimate {
+            cpu_cost: 3.0,
+            memory_cost: 7.0,
+            network_cost: -1.0,
+        };
+
+        let sum_total = a.add_sanitized(&b).total_with_options(&options);
+        let separate_total = a.total_with_options(&options) + b.total_with_options(&options);
+
+        assert!((sum_total - separate_total).abs() <= f64::EPSILON);
     }
 
     #[test]

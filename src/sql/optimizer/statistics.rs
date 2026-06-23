@@ -7,6 +7,39 @@ use arrow::datatypes::DataType;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::stats_input::{StatsMissingReason, StatsSource};
 
+pub(crate) const MAX_FINITE_COST: f64 = 1.0e300;
+pub(crate) const DEFAULT_CPU_COST_WEIGHT: f64 = 0.5;
+pub(crate) const DEFAULT_MEMORY_COST_WEIGHT: f64 = 2.0;
+pub(crate) const DEFAULT_NETWORK_COST_WEIGHT: f64 = 1.5;
+
+pub(crate) fn finite_non_negative_dimension(value: f64) -> f64 {
+    if value.is_finite() {
+        if value > 0.0 {
+            value.min(MAX_FINITE_COST)
+        } else {
+            0.0
+        }
+    } else if value.is_infinite() && value.is_sign_positive() {
+        MAX_FINITE_COST
+    } else {
+        0.0
+    }
+}
+
+fn finite_non_negative_weight(value: f64) -> f64 {
+    if value.is_finite() && value > 0.0 {
+        value.min(MAX_FINITE_COST)
+    } else {
+        0.0
+    }
+}
+
+fn add_cost_dimensions(left: f64, right: f64) -> f64 {
+    finite_non_negative_dimension(
+        finite_non_negative_dimension(left) + finite_non_negative_dimension(right),
+    )
+}
+
 /// Trustworthiness of a statistic. Variant order is meaningful: derived
 /// `Ord` makes `Measured > Exact > Estimated > Fallback`, so `min` yields
 /// the least-confident input.
@@ -302,25 +335,46 @@ pub struct CostEstimate {
 }
 
 impl CostEstimate {
+    #[cfg(test)]
     pub fn total_cost(&self) -> f64 {
-        self.cpu_cost * 0.5 + self.memory_cost * 2.0 + self.network_cost * 1.5
+        self.weighted_total(
+            DEFAULT_CPU_COST_WEIGHT,
+            DEFAULT_MEMORY_COST_WEIGHT,
+            DEFAULT_NETWORK_COST_WEIGHT,
+        )
+    }
+
+    pub fn sanitized(&self) -> CostEstimate {
+        CostEstimate {
+            cpu_cost: finite_non_negative_dimension(self.cpu_cost),
+            memory_cost: finite_non_negative_dimension(self.memory_cost),
+            network_cost: finite_non_negative_dimension(self.network_cost),
+        }
     }
 
     pub fn weighted_total(&self, cpu_weight: f64, memory_weight: f64, network_weight: f64) -> f64 {
-        fn finite_or_zero(v: f64) -> f64 {
-            if v.is_finite() && v > 0.0 { v } else { 0.0 }
-        }
-        finite_or_zero(self.cpu_cost) * cpu_weight
-            + finite_or_zero(self.memory_cost) * memory_weight
-            + finite_or_zero(self.network_cost) * network_weight
+        let cost = self.sanitized();
+        let cpu =
+            finite_non_negative_dimension(cost.cpu_cost * finite_non_negative_weight(cpu_weight));
+        let memory = finite_non_negative_dimension(
+            cost.memory_cost * finite_non_negative_weight(memory_weight),
+        );
+        let network = finite_non_negative_dimension(
+            cost.network_cost * finite_non_negative_weight(network_weight),
+        );
+        add_cost_dimensions(add_cost_dimensions(cpu, memory), network)
     }
 
     #[allow(dead_code)] // used by cost model tests
     pub fn add(&self, other: &CostEstimate) -> CostEstimate {
+        self.add_sanitized(other)
+    }
+
+    pub fn add_sanitized(&self, other: &CostEstimate) -> CostEstimate {
         CostEstimate {
-            cpu_cost: self.cpu_cost + other.cpu_cost,
-            memory_cost: self.memory_cost + other.memory_cost,
-            network_cost: self.network_cost + other.network_cost,
+            cpu_cost: add_cost_dimensions(self.cpu_cost, other.cpu_cost),
+            memory_cost: add_cost_dimensions(self.memory_cost, other.memory_cost),
+            network_cost: add_cost_dimensions(self.network_cost, other.network_cost),
         }
     }
 }
@@ -875,6 +929,54 @@ mod tests {
         assert!((c.cpu_cost - 40.0).abs() < f64::EPSILON);
         assert!((c.memory_cost - 30.0).abs() < f64::EPSILON);
         assert!((c.network_cost - 20.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn cost_estimate_sanitized_caps_positive_infinity_and_drops_invalid_values() {
+        let cost = CostEstimate {
+            cpu_cost: f64::INFINITY,
+            memory_cost: f64::NAN,
+            network_cost: -1.0,
+        }
+        .sanitized();
+
+        assert_eq!(cost.cpu_cost, MAX_FINITE_COST);
+        assert_eq!(cost.memory_cost, 0.0);
+        assert_eq!(cost.network_cost, 0.0);
+    }
+
+    #[test]
+    fn cost_estimate_add_sanitized_never_keeps_infinite_dimensions() {
+        let a = CostEstimate {
+            cpu_cost: f64::INFINITY,
+            memory_cost: 10.0,
+            network_cost: f64::NAN,
+        };
+        let b = CostEstimate {
+            cpu_cost: 1.0,
+            memory_cost: f64::INFINITY,
+            network_cost: f64::NEG_INFINITY,
+        };
+
+        let sum = a.add_sanitized(&b);
+
+        assert_eq!(sum.cpu_cost, MAX_FINITE_COST);
+        assert_eq!(sum.memory_cost, MAX_FINITE_COST);
+        assert_eq!(sum.network_cost, 0.0);
+        assert!(sum.cpu_cost.is_finite());
+        assert!(sum.memory_cost.is_finite());
+        assert!(sum.network_cost.is_finite());
+    }
+
+    #[test]
+    fn weighted_total_keeps_positive_infinity_expensive_after_sanitize() {
+        let cost = CostEstimate {
+            cpu_cost: f64::INFINITY,
+            memory_cost: f64::NAN,
+            network_cost: -1.0,
+        };
+
+        assert_eq!(cost.weighted_total(1.0, 1.0, 1.0), MAX_FINITE_COST);
     }
 
     #[test]

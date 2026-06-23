@@ -16,7 +16,10 @@ use crate::sql::optimizer::estimate::join_condition::estimate_join_condition;
 use crate::sql::optimizer::memo::JoinTree;
 use crate::sql::optimizer::operator::LogicalJoinOp;
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
-use crate::sql::optimizer::statistics::{CostEstimate, Statistics};
+use crate::sql::optimizer::statistics::{
+    CostEstimate, DEFAULT_CPU_COST_WEIGHT, DEFAULT_MEMORY_COST_WEIGHT, DEFAULT_NETWORK_COST_WEIGHT,
+    Statistics,
+};
 
 use super::MultiJoinGraph;
 
@@ -142,7 +145,7 @@ fn finite_cost(v: f64) -> f64 {
 }
 
 /// Self-cost proxy of one join (mirrors `join_reorder/cost.rs::estimate_join_cost`
-/// + `CostEstimate::total_cost`), saturated to stay finite.
+/// + the default weighted `CostEstimate` total), saturated to stay finite.
 fn join_self_cost(
     left: &Statistics,
     right: &Statistics,
@@ -174,7 +177,11 @@ fn join_self_cost(
             }
         }
     };
-    finite_cost(est.total_cost())
+    finite_cost(est.weighted_total(
+        DEFAULT_CPU_COST_WEIGHT,
+        DEFAULT_MEMORY_COST_WEIGHT,
+        DEFAULT_NETWORK_COST_WEIGHT,
+    ))
 }
 
 /// A built sub-plan: its order, output statistics, and cumulative cost proxy.
