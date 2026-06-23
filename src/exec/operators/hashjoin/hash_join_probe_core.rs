@@ -1036,7 +1036,7 @@ impl HashJoinProbeCore {
         let is_semi = matches!(self.join_type, JoinType::LeftSemi | JoinType::RightSemi);
         let is_anti = !is_semi;
 
-        let Some(table) = self.build_table.as_ref() else {
+        let Some(table) = self.build_table.clone() else {
             if is_anti {
                 let batches: Vec<_> = probe_chunks.into_iter().map(|c| c.batch).collect();
                 if batches.is_empty() {
@@ -1079,6 +1079,82 @@ impl HashJoinProbeCore {
             return Ok(None);
         }
 
+        if matches!(self.join_type, JoinType::LeftSemi | JoinType::LeftAnti) {
+            let is_semi = matches!(self.join_type, JoinType::LeftSemi);
+            let mut output_batches = Vec::new();
+            for probe in probe_chunks {
+                let search_start = std::time::Instant::now();
+                let (group_ids, mut selection) =
+                    table.lookup_selection(&self.arena, &self.probe_keys, &probe)?;
+                self.record_search_ns(search_start);
+                let stats = SearchStats::from_group_ids(&group_ids);
+                self.lookup_hit_rows = self.lookup_hit_rows.saturating_add(stats.lookup_hit_rows);
+                self.lookup_miss_rows =
+                    self.lookup_miss_rows.saturating_add(stats.lookup_miss_rows);
+
+                if let Some(pred) = self.residual_predicate
+                    && !selection.is_empty()
+                {
+                    let build_chunk = self
+                        .build_chunk
+                        .clone()
+                        .ok_or_else(|| "semi/anti join build chunk missing".to_string())?;
+                    self.residual_rows_checked = self
+                        .residual_rows_checked
+                        .saturating_add(stats.lookup_hit_rows);
+                    self.residual_group_rows_total = self
+                        .residual_group_rows_total
+                        .saturating_add(selection.len() as u64);
+                    self.compact_selection_by_residual(&probe, &build_chunk, &mut selection, pred)?;
+                }
+
+                let mut matched = vec![false; probe.len()];
+                for probe_row in selection.probe.iter() {
+                    let slot = *probe_row as usize;
+                    if slot >= matched.len() {
+                        return Err(format!(
+                            "semi/anti probe row out of bounds: row={} rows={}",
+                            slot,
+                            matched.len()
+                        ));
+                    }
+                    matched[slot] = true;
+                }
+
+                let keep = matched
+                    .into_iter()
+                    .map(|matched| if is_semi { matched } else { !matched })
+                    .collect::<Vec<bool>>();
+                let output_start = std::time::Instant::now();
+                let mask = BooleanArray::from(keep);
+                let filtered_batch = filter_record_batch(&probe.batch, &mask)
+                    .map_err(|e| format!("semi/anti filter failed: {e}"))?;
+                self.record_output_ns(output_start);
+                if filtered_batch.num_rows() > 0 {
+                    output_batches.push(filtered_batch);
+                }
+            }
+
+            if output_batches.is_empty() {
+                return Ok(None);
+            }
+            let output_rows: usize = output_batches.iter().map(|b| b.num_rows()).sum();
+            self.output_rows = self.output_rows.saturating_add(output_rows as u64);
+            let probe_batch = if output_batches.len() == 1 {
+                output_batches.remove(0)
+            } else {
+                let output_start = std::time::Instant::now();
+                let batch = concat_compatible_batches(
+                    &output_schema,
+                    &output_batches,
+                    "semi anti join concat",
+                )?;
+                self.record_output_ns(output_start);
+                batch
+            };
+            return Ok(Some(self.extend_with_null_build_columns(probe_batch)?));
+        }
+
         let build_schema = self
             .build_batches
             .first()
@@ -1095,7 +1171,7 @@ impl HashJoinProbeCore {
         let mut output_batches = Vec::new();
         for probe in probe_chunks {
             let search_start = std::time::Instant::now();
-            let group_ids = lookup_group_ids(&self.arena, &self.probe_keys, &probe, table)?;
+            let group_ids = lookup_group_ids(&self.arena, &self.probe_keys, &probe, &table)?;
             self.record_search_ns(search_start);
             if group_ids.is_empty() {
                 continue;
@@ -1115,7 +1191,7 @@ impl HashJoinProbeCore {
                         &self.arena,
                         self.join_type,
                         self.build_batches.as_ref(),
-                        table,
+                        &table,
                         &probe,
                         &group_ids,
                         &join_scope_schema,
