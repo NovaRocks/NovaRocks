@@ -214,8 +214,7 @@ mod tests {
         ScanOp, ValuesOp,
     };
     use crate::sql::optimizer::property::DistributionSpec;
-    use crate::sql::optimizer::search::{EnforcerInfo, Winner};
-    use crate::sql::optimizer::statistics::CostEstimate;
+    use crate::sql::optimizer::search::{EnforcerInfo, Winner, cost_estimate_for_total};
     use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
 
     fn test_col(id: u32) -> TypedExpr {
@@ -267,11 +266,7 @@ mod tests {
         Winner::new(
             group_id,
             expr_index,
-            CostEstimate {
-                cpu_cost: total_cost,
-                memory_cost: 0.0,
-                network_cost: 0.0,
-            },
+            cost_estimate_for_total(total_cost, &cost_options),
             &cost_options,
             enforcer,
             output,
@@ -279,6 +274,29 @@ mod tests {
             child_props,
             child_outputs,
         )
+    }
+
+    #[test]
+    fn winner_for_test_preserves_total_cost_argument() {
+        let total_cost = 6.0e299;
+        let winner = winner_for_test(
+            7,
+            3,
+            total_cost,
+            None,
+            PhysicalPropertySet::gather(),
+            PropertyAlternativeKind::Default,
+            vec![],
+            vec![],
+        );
+
+        let tolerance = total_cost * 1.0e-12;
+        assert!(
+            (winner.total_cost - total_cost).abs() <= tolerance,
+            "test fixture winner total {} should preserve argument {}",
+            winner.total_cost,
+            total_cost
+        );
     }
 
     fn make_hash_join_winner_with_shuffle_child_props_for_test() -> (

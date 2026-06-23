@@ -12,7 +12,7 @@ use super::derive::PropertyAlternativeKind;
 use super::memo::{GroupId, Memo, TotalCost};
 use super::operator::*;
 use super::property::*;
-use super::statistics::CostEstimate;
+use super::statistics::{CostEstimate, MAX_FINITE_COST};
 use crate::sql::optimizer::stats_input::OptimizerStatsInput;
 
 pub(crate) use super::derive::EnforcerKind;
@@ -345,32 +345,80 @@ impl SearchContext {
     }
 }
 
-fn cost_estimate_for_total(total_cost: TotalCost, cost_options: &CostOptions) -> CostEstimate {
+pub(crate) fn cost_estimate_for_total(
+    total_cost: TotalCost,
+    cost_options: &CostOptions,
+) -> CostEstimate {
     debug_assert!(total_cost.is_finite());
-
-    if cost_options.cpu_weight.is_finite() && cost_options.cpu_weight > 0.0 {
-        return CostEstimate {
-            cpu_cost: total_cost / cost_options.cpu_weight,
-            memory_cost: 0.0,
-            network_cost: 0.0,
-        };
-    }
-    if cost_options.memory_weight.is_finite() && cost_options.memory_weight > 0.0 {
-        return CostEstimate {
-            cpu_cost: 0.0,
-            memory_cost: total_cost / cost_options.memory_weight,
-            network_cost: 0.0,
-        };
-    }
-    if cost_options.network_weight.is_finite() && cost_options.network_weight > 0.0 {
-        return CostEstimate {
-            cpu_cost: 0.0,
-            memory_cost: 0.0,
-            network_cost: total_cost / cost_options.network_weight,
-        };
+    let total_cost = if total_cost.is_finite() && total_cost > 0.0 {
+        total_cost.min(MAX_FINITE_COST)
+    } else {
+        0.0
+    };
+    if total_cost == 0.0 {
+        return CostEstimate::default();
     }
 
-    CostEstimate::default()
+    let mut closest_estimate: Option<(CostEstimate, f64)> = None;
+    // Prefer a weight >= 1.0 so the synthetic dimension stays at or below the
+    // scalar total and does not trip the per-dimension sanitizer cap.
+    for require_weight_at_least_one in [true, false] {
+        for (dimension_index, weight) in [
+            cost_options.cpu_weight,
+            cost_options.memory_weight,
+            cost_options.network_weight,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if !weight.is_finite() || weight <= 0.0 || (require_weight_at_least_one && weight < 1.0)
+            {
+                continue;
+            }
+
+            let dimension_cost = total_cost / weight;
+            if !dimension_cost.is_finite()
+                || dimension_cost < 0.0
+                || dimension_cost > MAX_FINITE_COST
+            {
+                continue;
+            }
+
+            let estimate = match dimension_index {
+                0 => CostEstimate {
+                    cpu_cost: dimension_cost,
+                    memory_cost: 0.0,
+                    network_cost: 0.0,
+                },
+                1 => CostEstimate {
+                    cpu_cost: 0.0,
+                    memory_cost: dimension_cost,
+                    network_cost: 0.0,
+                },
+                2 => CostEstimate {
+                    cpu_cost: 0.0,
+                    memory_cost: 0.0,
+                    network_cost: dimension_cost,
+                },
+                _ => unreachable!("fixed cost dimension list has three entries"),
+            };
+
+            let weighted_total = estimate.total_with_options(cost_options);
+            let delta = (weighted_total - total_cost).abs();
+            let tolerance = total_cost.abs().max(1.0) * 1.0e-12;
+            if delta <= tolerance {
+                return estimate;
+            }
+            match &closest_estimate {
+                Some((_, closest_delta)) if *closest_delta <= delta => {}
+                _ => closest_estimate = Some((estimate, delta)),
+            }
+        }
+    }
+
+    closest_estimate
+        .map(|(estimate, _)| estimate)
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -915,6 +963,33 @@ mod tests {
         assert_eq!(winner.cost_estimate.memory_cost, estimate.memory_cost);
         assert_eq!(winner.cost_estimate.network_cost, estimate.network_cost);
         assert_eq!(winner.total_cost, estimate.total_with_options(&options));
+    }
+
+    #[test]
+    fn cost_estimate_for_total_preserves_large_finite_total() {
+        let options = CostOptions::default();
+        let best_cost = 6.0e299;
+        let estimate = cost_estimate_for_total(best_cost, &options);
+
+        let winner = Winner::new(
+            7,
+            3,
+            estimate,
+            &options,
+            None,
+            PhysicalPropertySet::gather(),
+            PropertyAlternativeKind::Default,
+            vec![PhysicalPropertySet::any()],
+            vec![PhysicalPropertySet::any()],
+        );
+
+        let tolerance = best_cost * 1.0e-12;
+        assert!(
+            (winner.total_cost - best_cost).abs() <= tolerance,
+            "winner total {} should preserve best cost {}",
+            winner.total_cost,
+            best_cost
+        );
     }
 
     #[test]
