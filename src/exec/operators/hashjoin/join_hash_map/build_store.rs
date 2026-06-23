@@ -22,16 +22,23 @@ use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
 
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
+use crate::runtime::mem_tracker::MemTracker;
 
 #[derive(Debug, Clone)]
 pub(crate) struct BuildStore {
     chunk: Arc<Chunk>,
+    tracks_independent_memory: bool,
 }
 
 impl BuildStore {
     pub(crate) fn new(chunk: Chunk) -> Self {
+        Self::with_memory_tracking(chunk, true)
+    }
+
+    fn with_memory_tracking(chunk: Chunk, tracks_independent_memory: bool) -> Self {
         Self {
             chunk: Arc::new(chunk),
+            tracks_independent_memory,
         }
     }
 
@@ -45,6 +52,12 @@ impl BuildStore {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.chunk.is_empty()
+    }
+
+    pub(crate) fn transfer_independent_memory_to(&mut self, tracker: &Arc<MemTracker>) {
+        if self.tracks_independent_memory {
+            Arc::make_mut(&mut self.chunk).transfer_to(tracker);
+        }
     }
 }
 
@@ -68,13 +81,7 @@ impl BuildStoreBuilder {
             return Ok(());
         }
         if let Some(schema) = self.schema.as_ref() {
-            if schema.slots().len() != chunk.chunk_schema().slots().len() {
-                return Err(format!(
-                    "join build store schema slot mismatch: expected={} actual={}",
-                    schema.slots().len(),
-                    chunk.chunk_schema().slots().len()
-                ));
-            }
+            validate_chunk_schema(schema, chunk)?;
         } else {
             self.schema = Some(chunk.chunk_schema_ref());
         }
@@ -98,14 +105,61 @@ impl BuildStoreBuilder {
             return Ok(None);
         }
         let arrow_schema = chunk_schema.arrow_schema_ref();
-        let batch = if self.batches.len() == 1 {
-            self.batches.into_iter().next().expect("one build batch")
+        let (batch, tracks_independent_memory) = if self.batches.len() == 1 {
+            (
+                self.batches.into_iter().next().expect("one build batch"),
+                false,
+            )
         } else {
-            concat_batches(&arrow_schema, &self.batches).map_err(|e| e.to_string())?
+            (
+                concat_batches(&arrow_schema, &self.batches).map_err(|e| e.to_string())?,
+                true,
+            )
         };
         let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema)?;
-        Ok(Some(BuildStore::new(chunk)))
+        if tracks_independent_memory {
+            Ok(Some(BuildStore::new(chunk)))
+        } else {
+            Ok(Some(BuildStore::with_memory_tracking(chunk, false)))
+        }
     }
+}
+
+fn validate_chunk_schema(expected: &ChunkSchemaRef, chunk: &Chunk) -> Result<(), String> {
+    let actual = chunk.chunk_schema();
+    if expected.slots() == actual.slots() {
+        return Ok(());
+    }
+    if expected.slots().len() != actual.slots().len() {
+        return Err(format!(
+            "join build store schema slot count mismatch: expected={} actual={}",
+            expected.slots().len(),
+            actual.slots().len()
+        ));
+    }
+    for (idx, (expected_slot, actual_slot)) in expected
+        .slots()
+        .iter()
+        .zip(actual.slots().iter())
+        .enumerate()
+    {
+        if expected_slot.slot_id() != actual_slot.slot_id() {
+            return Err(format!(
+                "join build store schema slot mismatch at index {idx}: expected={} actual={}",
+                expected_slot.slot_id(),
+                actual_slot.slot_id()
+            ));
+        }
+        if expected_slot.field() != actual_slot.field() {
+            return Err(format!(
+                "join build store schema field mismatch at slot {}: expected={:?} actual={:?}",
+                expected_slot.slot_id(),
+                expected_slot.field(),
+                actual_slot.field()
+            ));
+        }
+    }
+    Err("join build store schema mismatch".to_string())
 }
 
 #[cfg(test)]
@@ -118,17 +172,22 @@ mod tests {
 
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema};
+    use crate::runtime::mem_tracker::MemTracker;
 
     use super::*;
 
-    fn one_column_chunk(values: Vec<i32>) -> Chunk {
-        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
+    fn one_column_chunk_with_slot(slot_id: SlotId, name: &str, values: Vec<i32>) -> Chunk {
+        let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int32, false)]));
         let array = Arc::new(Int32Array::from(values)) as ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![array]).expect("record batch");
         let chunk_schema =
-            ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &[SlotId(1)])
+            ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &[slot_id])
                 .expect("chunk schema");
         Chunk::new_with_chunk_schema(batch, chunk_schema)
+    }
+
+    fn one_column_chunk(values: Vec<i32>) -> Chunk {
+        one_column_chunk_with_slot(SlotId(1), "k", values)
     }
 
     #[test]
@@ -157,5 +216,39 @@ mod tests {
         assert_eq!(values.value(0), 1);
         assert_eq!(values.value(1), 2);
         assert_eq!(values.value(2), 3);
+    }
+
+    #[test]
+    fn build_store_builder_rejects_slot_schema_mismatch() {
+        let mut builder = BuildStoreBuilder::new();
+
+        builder
+            .push_chunk(&one_column_chunk_with_slot(SlotId(1), "k", vec![1]))
+            .expect("push first chunk");
+        let err = builder
+            .push_chunk(&one_column_chunk_with_slot(SlotId(2), "k", vec![2]))
+            .expect_err("slot mismatch");
+
+        assert!(err.contains("join build store schema slot mismatch"));
+    }
+
+    #[test]
+    fn build_store_tracks_concatenated_batch_memory() {
+        let mut builder = BuildStoreBuilder::new();
+
+        builder
+            .push_chunk(&one_column_chunk(vec![1, 2]))
+            .expect("push");
+        builder
+            .push_chunk(&one_column_chunk(vec![3, 4]))
+            .expect("push");
+        let mut store = builder.finish().expect("finish").expect("store");
+        let tracker = MemTracker::new_root("build-store-test");
+
+        store.transfer_independent_memory_to(&tracker);
+
+        assert!(tracker.current() > 0);
+        drop(store);
+        assert_eq!(tracker.current(), 0);
     }
 }

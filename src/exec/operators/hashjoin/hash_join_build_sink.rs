@@ -431,6 +431,8 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
         let table_present = self.build_table.is_some();
         let mut batches = std::mem::take(&mut self.build_batches);
         let mut table = self.build_table.take();
+        let mut build_store =
+            std::mem::replace(&mut self.build_store_builder, BuildStoreBuilder::new()).finish()?;
 
         if let Some(root) = state.mem_tracker() {
             let label = format!("JoinBuildArtifact: {}", self.state.dep_name(self.partition));
@@ -443,11 +445,13 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
             if let Some(table) = table.as_mut() {
                 table.set_mem_tracker(artifact_table);
             }
+            let artifact_build_store = MemTracker::new_child("BuildStore", &artifact);
+            if let Some(store) = build_store.as_mut() {
+                store.transfer_independent_memory_to(&artifact_build_store);
+            }
         }
         let runtime_filters = self.runtime_filters.take().map(Arc::new);
         let build_null_key_rows = self.build_null_key_rows.take().map(Arc::new);
-        let build_store =
-            std::mem::replace(&mut self.build_store_builder, BuildStoreBuilder::new()).finish()?;
         let artifact = Arc::new(JoinBuildArtifact::new(
             build_store,
             batches,
