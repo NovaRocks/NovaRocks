@@ -6576,6 +6576,10 @@ enable_path_style_access = true
         assert!(text.contains("PLAN FRAGMENT 0"), "{text}");
         assert!(text.contains("stats={rows="), "{text}");
         assert!(text.contains("act={rows="), "{text}");
+        // W0': join node act trailer includes phase timing from probe/build sides.
+        assert!(text.contains("search="), "{text}");
+        assert!(text.contains("output="), "{text}");
+        assert!(text.contains("build_ht="), "{text}");
     }
 
     /// OQ-5 Task 6: codegen must lower the runtime-filter annotations the
