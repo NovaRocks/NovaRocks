@@ -1443,24 +1443,32 @@ impl HashJoinProbeCore {
             if selection.is_empty() {
                 continue;
             }
-            if let Some(pred) = self.residual_predicate {
+            let residual_matched_rows_before = if let Some(pred) = self.residual_predicate {
                 self.residual_rows_checked = self
                     .residual_rows_checked
                     .saturating_add(stats.lookup_hit_rows);
                 self.residual_group_rows_total = self
                     .residual_group_rows_total
                     .saturating_add(selection.len() as u64);
+                let residual_matched_rows_before = self.residual_matched_rows;
                 self.compact_selection_by_residual(&probe, &build_chunk, &mut selection, pred)?;
-                if selection.is_empty() {
-                    continue;
-                }
-            }
+                Some(residual_matched_rows_before)
+            } else {
+                None
+            };
 
             let Some(flags) = self.build_matched.as_mut() else {
                 return Ok(());
             };
+            let mut unique_build_rows_marked = 0u64;
             for build_row in selection.build {
-                flags.mark(build_row)?;
+                if flags.mark(build_row)? {
+                    unique_build_rows_marked = unique_build_rows_marked.saturating_add(1);
+                }
+            }
+            if let Some(residual_matched_rows_before) = residual_matched_rows_before {
+                self.residual_matched_rows =
+                    residual_matched_rows_before.saturating_add(unique_build_rows_marked);
             }
         }
 
@@ -1819,5 +1827,131 @@ pub(crate) fn join_type_str(join_type: JoinType) -> &'static str {
         JoinType::LeftAnti => "LEFT_ANTI",
         JoinType::RightAnti => "RIGHT_ANTI",
         JoinType::NullAwareLeftAnti => "NULL_AWARE_LEFT_ANTI",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Int32Array};
+    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use arrow::record_batch::RecordBatch;
+
+    use super::*;
+    use crate::common::ids::SlotId;
+    use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
+    use crate::exec::expr::ExprNode;
+    use crate::exec::operators::hashjoin::join_hash_map::build_store::BuildStore;
+
+    const LEFT_K_SLOT_ID: SlotId = SlotId::new(1);
+    const LEFT_V_SLOT_ID: SlotId = SlotId::new(2);
+    const RIGHT_K_SLOT_ID: SlotId = SlotId::new(3);
+    const RIGHT_W_SLOT_ID: SlotId = SlotId::new(4);
+
+    fn schema_kv(k_name: &str, v_name: &str) -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new(k_name, DataType::Int32, false),
+            Field::new(v_name, DataType::Int32, false),
+        ]))
+    }
+
+    fn join_schema(left: &SchemaRef, right: &SchemaRef) -> SchemaRef {
+        let mut fields = left.fields().to_vec();
+        fields.extend(right.fields().to_vec());
+        Arc::new(Schema::new(fields))
+    }
+
+    fn chunk_schema_of(schema: &SchemaRef, slot_ids: &[SlotId]) -> ChunkSchemaRef {
+        ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), slot_ids)
+            .expect("chunk schema")
+    }
+
+    fn chunk_of_two(schema: SchemaRef, slot_ids: &[SlotId], k: &[i32], v: &[i32]) -> Chunk {
+        assert_eq!(k.len(), v.len());
+        let k_arr = Arc::new(Int32Array::from(k.to_vec())) as ArrayRef;
+        let v_arr = Arc::new(Int32Array::from(v.to_vec())) as ArrayRef;
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![k_arr, v_arr]).expect("record batch");
+        Chunk::new_with_chunk_schema(batch, chunk_schema_of(&schema, slot_ids))
+    }
+
+    #[test]
+    fn right_semi_residual_counts_unique_build_rows_marked() {
+        let left_schema = schema_kv("lk", "lv");
+        let right_schema = schema_kv("rk", "rw");
+        let join_scope_schema = join_schema(&left_schema, &right_schema);
+
+        let mut arena = ExprArena::default();
+        let probe_key = arena.push_typed(ExprNode::SlotId(LEFT_K_SLOT_ID), DataType::Int32);
+        let left_v = arena.push_typed(ExprNode::SlotId(LEFT_V_SLOT_ID), DataType::Int32);
+        let right_w = arena.push_typed(ExprNode::SlotId(RIGHT_W_SLOT_ID), DataType::Int32);
+        let residual = arena.push_typed(ExprNode::Lt(left_v, right_w), DataType::Boolean);
+        let arena = Arc::new(arena);
+
+        let build_chunk = chunk_of_two(
+            Arc::clone(&right_schema),
+            &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID],
+            &[1],
+            &[10],
+        );
+        let mut build_table =
+            JoinHashMap::new_chained(vec![DataType::Int32], vec![false]).expect("build table");
+        let build_key_arrays = vec![
+            build_chunk
+                .column_by_slot_id(RIGHT_K_SLOT_ID)
+                .expect("build key"),
+        ];
+        build_table
+            .add_build_batch(&build_key_arrays, build_chunk.len(), 0)
+            .expect("add build batch");
+        build_table.finalize().expect("finalize build table");
+        let artifact = Arc::new(JoinBuildArtifact::new(
+            Some(BuildStore::new(build_chunk.clone())),
+            vec![build_chunk],
+            Some(build_table),
+            1,
+            false,
+            None,
+            None,
+        ));
+
+        let mut core = HashJoinProbeCore::new(
+            Arc::clone(&arena),
+            JoinType::RightSemi,
+            vec![probe_key],
+            Some(residual),
+            true,
+            chunk_schema_of(&left_schema, &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID]),
+            chunk_schema_of(&right_schema, &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID]),
+            chunk_schema_of(
+                &join_scope_schema,
+                &[
+                    LEFT_K_SLOT_ID,
+                    LEFT_V_SLOT_ID,
+                    RIGHT_K_SLOT_ID,
+                    RIGHT_W_SLOT_ID,
+                ],
+            ),
+        );
+        core.set_build_artifact(artifact, 1, false)
+            .expect("set build");
+
+        let probe_chunk = chunk_of_two(
+            Arc::clone(&left_schema),
+            &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID],
+            &[1, 1],
+            &[1, 2],
+        );
+
+        let probe_out = core.join_probe_chunks(vec![probe_chunk]).expect("probe");
+        assert!(probe_out.is_none());
+
+        let build_out = core
+            .build_right_semi_anti_output(true)
+            .expect("right semi output")
+            .expect("build output");
+        assert_eq!(build_out.num_rows(), 1);
+        assert_eq!(core.residual_matched_rows(), 1);
     }
 }
