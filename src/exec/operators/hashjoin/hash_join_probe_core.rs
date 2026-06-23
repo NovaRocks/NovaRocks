@@ -507,10 +507,9 @@ impl HashJoinProbeCore {
 
     pub(crate) fn build_full_outer_unmatched_build_with_flags(
         &mut self,
-        flags: &[Vec<bool>],
+        flags: &[bool],
     ) -> Result<Option<RecordBatch>, String> {
-        let flags = self.flatten_build_match_flags_by_batch(flags)?;
-        self.build_unmatched_build_output_from_flags(&flags)
+        self.build_unmatched_build_output_from_flags(flags)
     }
 
     fn build_unmatched_build_output_from_flags(
@@ -595,19 +594,18 @@ impl HashJoinProbeCore {
 
     /// Take ownership of the local build-matched flags.  Used by broadcast
     /// join to merge per-driver flags into a shared accumulator.
-    pub(crate) fn take_build_matched(&mut self) -> Option<Vec<Vec<bool>>> {
-        let flags = self.build_matched.take()?.into_vec();
-        Some(self.split_build_match_flags_by_batch(&flags))
+    pub(crate) fn take_build_matched(&mut self) -> Option<Vec<bool>> {
+        Some(self.build_matched.take()?.into_vec())
     }
 
     /// Produce output from externally-provided build-matched flags (e.g.
     /// after merging flags from all broadcast probe drivers).
     pub(crate) fn build_right_semi_anti_output_with_flags(
         &mut self,
-        flags: &[Vec<bool>],
+        flags: &[bool],
         want_matched: bool,
     ) -> Result<Option<RecordBatch>, String> {
-        self.build_right_semi_anti_output_inner(flags, want_matched)
+        self.build_right_semi_anti_output_from_flat_flags(flags, want_matched)
     }
 
     pub(crate) fn build_right_semi_anti_output(
@@ -622,15 +620,6 @@ impl HashJoinProbeCore {
         };
         // Clone to satisfy borrow checker (flags borrows self).
         let flags = flags.clone().into_vec();
-        self.build_right_semi_anti_output_from_flat_flags(&flags, want_matched)
-    }
-
-    fn build_right_semi_anti_output_inner(
-        &mut self,
-        flags: &[Vec<bool>],
-        want_matched: bool,
-    ) -> Result<Option<RecordBatch>, String> {
-        let flags = self.flatten_build_match_flags_by_batch(flags)?;
         self.build_right_semi_anti_output_from_flat_flags(&flags, want_matched)
     }
 
@@ -661,43 +650,6 @@ impl HashJoinProbeCore {
             return Ok(None);
         }
         Ok(Some(filtered))
-    }
-
-    fn flatten_build_match_flags_by_batch(&self, flags: &[Vec<bool>]) -> Result<Vec<bool>, String> {
-        if flags.len() != self.build_batches.len() {
-            return Err(format!(
-                "join build match flags batch mismatch: flags={} batches={}",
-                flags.len(),
-                self.build_batches.len()
-            ));
-        }
-        let row_count: usize = self.build_batches.iter().map(|batch| batch.len()).sum();
-        let mut flat = Vec::with_capacity(row_count);
-        for (batch_idx, (batch_flags, build_batch)) in
-            flags.iter().zip(self.build_batches.iter()).enumerate()
-        {
-            if batch_flags.len() != build_batch.len() {
-                return Err(format!(
-                    "join build match flags length mismatch: batch={} flags={} rows={}",
-                    batch_idx,
-                    batch_flags.len(),
-                    build_batch.len()
-                ));
-            }
-            flat.extend(batch_flags.iter().copied());
-        }
-        Ok(flat)
-    }
-
-    fn split_build_match_flags_by_batch(&self, flags: &[bool]) -> Vec<Vec<bool>> {
-        let mut out = Vec::with_capacity(self.build_batches.len());
-        let mut offset = 0usize;
-        for build_batch in self.build_batches.iter() {
-            let end = offset + build_batch.len();
-            out.push(flags.get(offset..end).unwrap_or_default().to_vec());
-            offset = end;
-        }
-        out
     }
 
     pub(crate) fn merge_join_outputs(
@@ -1027,7 +979,7 @@ impl HashJoinProbeCore {
             // rows matched, do not produce output during probing.  The
             // actual output is deferred to `finish_one()` where per-driver
             // flags are merged to avoid duplicates across parallel drivers.
-            self.mark_build_matches_for_semi_anti(probe_chunks, false)?;
+            self.mark_build_matches_for_semi_anti(probe_chunks)?;
             return Ok(None);
         }
 
@@ -1459,44 +1411,21 @@ impl HashJoinProbeCore {
         Ok(Some(self.extend_with_null_build_columns(probe_batch)?))
     }
 
-    fn mark_build_matches_for_semi_anti(
-        &mut self,
-        probe_chunks: Vec<Chunk>,
-        collect_output: bool,
-    ) -> Result<Option<Vec<Vec<u32>>>, String> {
-        let mut output_indices = if collect_output {
-            Some(vec![Vec::new(); self.build_batches.len()])
-        } else {
-            None
-        };
-
+    fn mark_build_matches_for_semi_anti(&mut self, probe_chunks: Vec<Chunk>) -> Result<(), String> {
         if probe_chunks.is_empty() {
-            return Ok(output_indices);
+            return Ok(());
         }
-        if self.build_batches.is_empty() {
-            return Ok(output_indices);
-        }
-        let Some(table) = self.build_table.as_ref() else {
-            return Ok(output_indices);
+        let Some(table) = self.build_table.clone() else {
+            return Ok(());
         };
-        let search_timer = self.search_timer.clone();
-        let output_timer = self.output_timer.clone();
-        if table.is_empty() {
-            return Ok(output_indices);
-        }
-        let Some(flags) = self.build_matched.as_mut() else {
-            return Ok(output_indices);
+        let Some(build_chunk) = self.build_chunk.clone() else {
+            return Ok(());
         };
-
-        let output_schema = Arc::clone(&self.join_scope_schema);
-        let has_residual = self.residual_predicate.is_some();
-        let mut build_batch_offsets = Vec::with_capacity(self.build_batches.len());
-        let mut offset = 0usize;
-        for build_batch in self.build_batches.iter() {
-            build_batch_offsets.push(offset);
-            offset = offset
-                .checked_add(build_batch.len())
-                .ok_or_else(|| "join build row count overflow".to_string())?;
+        if table.is_empty() || build_chunk.is_empty() {
+            return Ok(());
+        }
+        if self.build_matched.is_none() {
+            return Ok(());
         }
 
         for probe in probe_chunks {
@@ -1504,119 +1433,38 @@ impl HashJoinProbeCore {
                 continue;
             }
             let search_start = std::time::Instant::now();
-            let group_ids = lookup_group_ids(&self.arena, &self.probe_keys, &probe, table)?;
-            Self::record_timer_ns(search_timer.as_ref(), search_start);
-            if group_ids.is_empty() {
+            let (group_ids, mut selection) =
+                table.lookup_selection(&self.arena, &self.probe_keys, &probe)?;
+            self.record_search_ns(search_start);
+            let stats = SearchStats::from_group_ids(&group_ids);
+            self.lookup_hit_rows = self.lookup_hit_rows.saturating_add(stats.lookup_hit_rows);
+            self.lookup_miss_rows = self.lookup_miss_rows.saturating_add(stats.lookup_miss_rows);
+
+            if selection.is_empty() {
                 continue;
             }
-
-            if !has_residual {
-                for group_id_opt in group_ids.iter() {
-                    let Some(group_id) = group_id_opt else {
-                        continue;
-                    };
-                    let rows = table
-                        .group_rows_slice(*group_id)
-                        .map_err(|e| e.to_string())?;
-                    for &build_row in rows {
-                        if flags.mark(build_row)? {
-                            if let Some(indices) = output_indices.as_mut() {
-                                let (batch_idx, row_idx) =
-                                    table.row_location(build_row).map_err(|e| e.to_string())?;
-                                let slot = batch_idx as usize;
-                                if let Some(batch_indices) = indices.get_mut(slot) {
-                                    batch_indices.push(row_idx);
-                                }
-                            }
-                        }
-                    }
-                }
-                continue;
-            }
-
-            let mut probe_indices_by_batch = vec![Vec::<u32>::new(); self.build_batches.len()];
-            let mut build_indices_by_batch = vec![Vec::<u32>::new(); self.build_batches.len()];
-
-            for (probe_row, group_id_opt) in group_ids.iter().enumerate() {
-                let Some(group_id) = group_id_opt else {
+            if let Some(pred) = self.residual_predicate {
+                self.residual_rows_checked = self
+                    .residual_rows_checked
+                    .saturating_add(stats.lookup_hit_rows);
+                self.residual_group_rows_total = self
+                    .residual_group_rows_total
+                    .saturating_add(selection.len() as u64);
+                self.compact_selection_by_residual(&probe, &build_chunk, &mut selection, pred)?;
+                if selection.is_empty() {
                     continue;
-                };
-                let rows = table
-                    .group_rows_slice(*group_id)
-                    .map_err(|e| e.to_string())?;
-                for &build_row in rows {
-                    let (batch_idx, row_idx) =
-                        table.row_location(build_row).map_err(|e| e.to_string())?;
-                    let slot = batch_idx as usize;
-                    if slot >= self.build_batches.len() {
-                        return Err("join row batch index out of bounds".to_string());
-                    }
-                    probe_indices_by_batch[slot].push(probe_row as u32);
-                    build_indices_by_batch[slot].push(row_idx);
                 }
             }
 
-            for (batch_idx, build_batch) in self.build_batches.iter().enumerate() {
-                let probe_indices = &probe_indices_by_batch[batch_idx];
-                if probe_indices.is_empty() {
-                    continue;
-                }
-                let build_indices = &build_indices_by_batch[batch_idx];
-                let output_start = std::time::Instant::now();
-                let candidate = build_join_batch(
-                    &probe,
-                    build_batch,
-                    probe_indices,
-                    build_indices,
-                    &output_schema,
-                )?;
-                Self::record_timer_ns(output_timer.as_ref(), output_start);
-                let Some(candidate) = candidate else {
-                    continue;
-                };
-                if candidate.num_rows() == 0 {
-                    continue;
-                }
-
-                let mask = if let Some(pred) = self.residual_predicate {
-                    let chunk = Chunk::try_new_with_chunk_schema(
-                        candidate.clone(),
-                        Arc::clone(&self.join_scope_chunk_schema),
-                    )?;
-                    let mask_arr = self.arena.eval(pred, &chunk).map_err(|e| e.to_string())?;
-                    mask_arr
-                        .as_any()
-                        .downcast_ref::<BooleanArray>()
-                        .ok_or_else(|| {
-                            "join residual predicate must return boolean array".to_string()
-                        })?
-                        .clone()
-                } else {
-                    BooleanArray::from(vec![true; candidate.num_rows()])
-                };
-
-                for i in 0..mask.len() {
-                    if !mask.is_valid(i) || !mask.value(i) {
-                        continue;
-                    }
-                    let build_row = *build_indices
-                        .get(i)
-                        .ok_or_else(|| "join build index out of bounds".to_string())?
-                        as usize;
-                    let flat_build_row = build_batch_offsets
-                        .get(batch_idx)
-                        .and_then(|offset| offset.checked_add(build_row))
-                        .ok_or_else(|| "join build row id overflow".to_string())?;
-                    if flags.mark(flat_build_row as u32)? {
-                        if let Some(indices) = output_indices.as_mut() {
-                            indices[batch_idx].push(build_row as u32);
-                        }
-                    }
-                }
+            let Some(flags) = self.build_matched.as_mut() else {
+                return Ok(());
+            };
+            for build_row in selection.build {
+                flags.mark(build_row)?;
             }
         }
 
-        Ok(output_indices)
+        Ok(())
     }
 
     fn probe_chunk_matches_residual_against_build_rows(

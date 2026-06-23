@@ -292,7 +292,7 @@ impl BroadcastJoinProbeProcessorOperator {
                 // shared accumulator.  Only the last driver to merge
                 // receives the merged flags and produces the output.
                 let local_flags = self.core.take_build_matched().unwrap_or_default();
-                if let Some(merged) = self.state.merge_build_matched(local_flags) {
+                if let Some(merged) = self.state.merge_build_matched(local_flags)? {
                     let build_out = self
                         .core
                         .build_right_semi_anti_output_with_flags(&merged, false)?;
@@ -304,7 +304,7 @@ impl BroadcastJoinProbeProcessorOperator {
             }
             JoinType::RightSemi if self.core.probe_is_left() => {
                 let local_flags = self.core.take_build_matched().unwrap_or_default();
-                if let Some(merged) = self.state.merge_build_matched(local_flags) {
+                if let Some(merged) = self.state.merge_build_matched(local_flags)? {
                     let build_out = self
                         .core
                         .build_right_semi_anti_output_with_flags(&merged, true)?;
@@ -315,7 +315,7 @@ impl BroadcastJoinProbeProcessorOperator {
             }
             JoinType::FullOuter | JoinType::RightOuter => {
                 let local_flags = self.core.take_build_matched().unwrap_or_default();
-                if let Some(merged) = self.state.merge_build_matched(local_flags) {
+                if let Some(merged) = self.state.merge_build_matched(local_flags)? {
                     let schema = Arc::clone(self.core.join_scope_chunk_schema());
                     let build_unmatched = self
                         .core

@@ -33,16 +33,8 @@ use std::sync::{Arc, Mutex};
 
 use super::build_artifact::JoinBuildArtifact;
 use super::build_state::JoinBuildSinkState;
+use super::join_hash_map::match_flags::BuildMatchMerge;
 use crate::exec::pipeline::dependency::{DependencyHandle, DependencyManager};
-
-/// Accumulator that OR-merges per-driver build-matched flags.
-struct BuildMatchMerge {
-    /// OR-accumulated flags: `merged[batch_idx][row_idx]` is true if ANY
-    /// driver marked that build row as matched.
-    merged: Vec<Vec<bool>>,
-    drivers_merged: usize,
-    total_drivers: usize,
-}
 
 /// Shared state that publishes one broadcast join build artifact and coordinates probe readiness.
 pub(crate) struct BroadcastJoinSharedState {
@@ -103,40 +95,16 @@ impl BroadcastJoinSharedState {
     /// compute the unmatched-row output).  All other drivers receive `None`.
     pub(crate) fn merge_build_matched(
         &self,
-        local_flags: Vec<Vec<bool>>,
-    ) -> Option<Vec<Vec<bool>>> {
+        local_flags: Vec<bool>,
+    ) -> Result<Option<Vec<bool>>, String> {
         let mut guard = self
             .build_match_merge
             .lock()
             .expect("build match merge lock");
-        let merge = guard.get_or_insert_with(|| BuildMatchMerge {
-            merged: local_flags
-                .iter()
-                .map(|batch| vec![false; batch.len()])
-                .collect(),
-            drivers_merged: 0,
-            total_drivers: self.total_probe_drivers,
+        let merge = guard.get_or_insert_with(|| {
+            BuildMatchMerge::new(self.total_probe_drivers, local_flags.len())
         });
-
-        // OR-merge local flags into accumulator.
-        for (batch_idx, batch_flags) in local_flags.iter().enumerate() {
-            if let Some(merged_batch) = merge.merged.get_mut(batch_idx) {
-                for (row_idx, &matched) in batch_flags.iter().enumerate() {
-                    if matched && let Some(slot) = merged_batch.get_mut(row_idx) {
-                        *slot = true;
-                    }
-                }
-            }
-        }
-
-        merge.drivers_merged += 1;
-        if merge.drivers_merged == merge.total_drivers {
-            // Last driver: take the merged flags.
-            let result = std::mem::take(&mut merge.merged);
-            Some(result)
-        } else {
-            None
-        }
+        merge.merge_one(local_flags)
     }
 }
 
@@ -151,5 +119,29 @@ impl JoinBuildSinkState for BroadcastJoinSharedState {
 
     fn set_build(&self, _partition: usize, artifact: Arc<JoinBuildArtifact>) -> Result<(), String> {
         BroadcastJoinSharedState::set_build(self, artifact)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_build_matched_rejects_flat_flag_length_mismatch() {
+        let state = BroadcastJoinSharedState::new(7, DependencyManager::new(), 2);
+
+        assert_eq!(
+            state.merge_build_matched(vec![true, false]).expect("merge"),
+            None
+        );
+
+        let err = state
+            .merge_build_matched(vec![true])
+            .expect_err("length mismatch");
+
+        assert_eq!(
+            err,
+            "join build match merge length mismatch: local=1 merged=2"
+        );
     }
 }
