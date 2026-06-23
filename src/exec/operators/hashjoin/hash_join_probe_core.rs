@@ -435,7 +435,7 @@ impl HashJoinProbeCore {
                 + crate::exec::operators::hashjoin::join_hash_map::gather::MAX_JOIN_OUTPUT_ROWS_PER_BATCH)
                 .min(selection.len());
             let output_start = std::time::Instant::now();
-            let candidate =
+            let candidate = if self.probe_is_left {
                 crate::exec::operators::hashjoin::join_hash_map::gather::gather_join_batch(
                     probe,
                     build,
@@ -443,7 +443,16 @@ impl HashJoinProbeCore {
                     &selection.build[offset..end],
                     &self.join_scope_schema,
                 )?
-                .ok_or_else(|| "join residual candidate batch missing".to_string())?;
+            } else {
+                crate::exec::operators::hashjoin::join_hash_map::gather::gather_join_batch(
+                    build,
+                    probe,
+                    &selection.build[offset..end],
+                    &selection.probe[offset..end],
+                    &self.join_scope_schema,
+                )?
+            }
+            .ok_or_else(|| "join residual candidate batch missing".to_string())?;
             self.record_output_ns(output_start);
             let candidate_chunk = Chunk::try_new_with_chunk_schema(
                 candidate,
