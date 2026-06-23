@@ -125,6 +125,27 @@ impl JoinSelection {
     }
 }
 
+pub(crate) fn append_cross_selection(
+    selection: &mut JoinSelection,
+    probe_rows: &[u32],
+    build_rows: &[u32],
+    max_pairs: usize,
+) -> bool {
+    if selection.len() >= max_pairs {
+        return true;
+    }
+
+    for &probe_row in probe_rows {
+        for &build_row in build_rows {
+            selection.push(probe_row, build_row);
+            if selection.len() >= max_pairs {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SearchStats {
     pub(crate) lookup_hit_rows: u64,
@@ -242,6 +263,17 @@ mod tests {
 
         assert_eq!(selection.probe, vec![0, 1, 0, 2, 1]);
         assert_eq!(selection.build, vec![0, 1, 3, 2, 4]);
+    }
+
+    #[test]
+    fn cross_selection_stops_at_pair_limit() {
+        let mut selection = JoinSelection::new();
+
+        let stopped = append_cross_selection(&mut selection, &[1, 2], &[10, 11, 12], 5);
+
+        assert!(stopped);
+        assert_eq!(selection.probe, vec![1, 1, 1, 2, 2]);
+        assert_eq!(selection.build, vec![10, 11, 12, 10, 11]);
     }
 
     #[test]
