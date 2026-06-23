@@ -18,5 +18,6 @@
 //!
 //! Provides the initial three-layer primitives used by the hash join map refactor.
 
+pub(crate) mod gather;
 pub(crate) mod match_flags;
 pub(crate) mod search;

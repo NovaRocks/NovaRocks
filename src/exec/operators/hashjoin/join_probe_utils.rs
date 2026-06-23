@@ -17,8 +17,8 @@
 //! Utility functions for hash-join probe output construction.
 //!
 //! Responsibilities:
-//! - Builds joined chunks for matched, unmatched-left, and unmatched-right result cases.
-//! - Centralizes row expansion and schema concatenation logic shared by probe engines.
+//! - Keeps existing probe utility entrypoints for cross/keyed join callers.
+//! - Delegates output gather and null-fill wrappers to `join_hash_map::gather` during migration.
 //!
 //! Key exported interfaces:
 //! - Functions: `cross_join_chunk`, `keyed_join_chunk`, `lookup_group_ids`, `build_join_batch`.
@@ -27,11 +27,7 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
-use std::sync::Arc;
-
-use arrow::array::{ArrayRef, UInt32Array, new_null_array};
-use arrow::compute::take;
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 
 use super::join_hash_table::{JoinHashTable, row_has_forbidden_null};
@@ -42,25 +38,13 @@ use crate::exec::hash_table::key_builder::{
     build_one_number_hashes,
 };
 use crate::exec::hash_table::key_strategy::GroupKeyStrategy;
-use crate::exec::schema_compat::align_schema_to_arrays;
 use crate::runtime::profile::{CounterRef, clamp_u128_to_i64};
-
-const MAX_JOIN_OUTPUT_ROWS_PER_BATCH: usize = 16 * 1024;
 
 #[inline]
 fn record_timer_ns(timer: Option<&CounterRef>, start: std::time::Instant) {
     if let Some(timer) = timer {
         timer.add(clamp_u128_to_i64(start.elapsed().as_nanos()));
     }
-}
-
-fn build_output_record_batch(
-    output_schema: &SchemaRef,
-    columns: Vec<ArrayRef>,
-    context: &str,
-) -> Result<RecordBatch, String> {
-    let output_schema = align_schema_to_arrays(output_schema, &columns, context)?;
-    RecordBatch::try_new(output_schema, columns).map_err(|e| e.to_string())
 }
 
 /// Produce cross-join output rows by combining each left row with all right rows.
@@ -360,33 +344,13 @@ pub(crate) fn build_join_batch(
     right_indices: &[u32],
     output_schema: &SchemaRef,
 ) -> Result<Option<RecordBatch>, String> {
-    if left_indices.len() != right_indices.len() {
-        return Err(format!(
-            "join index length mismatch: left={} right={}",
-            left_indices.len(),
-            right_indices.len()
-        ));
-    }
-    if left_indices.is_empty() || right_indices.is_empty() {
-        return Ok(None);
-    }
-    let left_idx_array = UInt32Array::from(left_indices.to_vec());
-    let right_idx_array = UInt32Array::from(right_indices.to_vec());
-    let left_idx_ref = Arc::new(left_idx_array) as ArrayRef;
-    let right_idx_ref = Arc::new(right_idx_array) as ArrayRef;
-
-    let mut columns = Vec::with_capacity(left.batch.num_columns() + right.batch.num_columns());
-    for col in left.batch.columns() {
-        let taken = take(col.as_ref(), &left_idx_ref, None).map_err(|e| e.to_string())?;
-        columns.push(taken);
-    }
-    for col in right.batch.columns() {
-        let taken = take(col.as_ref(), &right_idx_ref, None).map_err(|e| e.to_string())?;
-        columns.push(taken);
-    }
-
-    let batch = build_output_record_batch(output_schema, columns, "join output")?;
-    Ok(Some(batch))
+    super::join_hash_map::gather::gather_join_batch(
+        left,
+        right,
+        left_indices,
+        right_indices,
+        output_schema,
+    )
 }
 
 pub(crate) fn build_join_batches(
@@ -396,33 +360,13 @@ pub(crate) fn build_join_batches(
     right_indices: &[u32],
     output_schema: &SchemaRef,
 ) -> Result<Vec<RecordBatch>, String> {
-    if left_indices.len() != right_indices.len() {
-        return Err(format!(
-            "join index length mismatch: left={} right={}",
-            left_indices.len(),
-            right_indices.len()
-        ));
-    }
-    if left_indices.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut batches = Vec::new();
-    let mut offset = 0usize;
-    while offset < left_indices.len() {
-        let end = (offset + MAX_JOIN_OUTPUT_ROWS_PER_BATCH).min(left_indices.len());
-        if let Some(batch) = build_join_batch(
-            left,
-            right,
-            &left_indices[offset..end],
-            &right_indices[offset..end],
-            output_schema,
-        )? {
-            batches.push(batch);
-        }
-        offset = end;
-    }
-    Ok(batches)
+    super::join_hash_map::gather::gather_join_batches(
+        left,
+        right,
+        left_indices,
+        right_indices,
+        output_schema,
+    )
 }
 
 /// Build left-preserving rows with null-filled right side for outer/semi join paths.
@@ -432,24 +376,12 @@ pub(crate) fn build_left_with_null_right(
     right_schema: &SchemaRef,
     output_schema: &SchemaRef,
 ) -> Result<Option<RecordBatch>, String> {
-    if left_indices.is_empty() {
-        return Ok(None);
-    }
-    let len = left_indices.len();
-    let left_idx_array = UInt32Array::from(left_indices.to_vec());
-    let left_idx_ref = Arc::new(left_idx_array) as ArrayRef;
-
-    let mut columns = Vec::with_capacity(left.batch.num_columns() + right_schema.fields().len());
-    for col in left.batch.columns() {
-        let taken = take(col.as_ref(), &left_idx_ref, None).map_err(|e| e.to_string())?;
-        columns.push(taken);
-    }
-    for field in right_schema.fields().iter() {
-        columns.push(new_null_array(field.data_type(), len));
-    }
-
-    let batch = build_output_record_batch(output_schema, columns, "join left outer output")?;
-    Ok(Some(batch))
+    super::join_hash_map::gather::gather_left_with_null_right(
+        left,
+        left_indices,
+        right_schema,
+        output_schema,
+    )
 }
 
 /// Build right-preserving rows with null-filled left side for right/full join paths.
@@ -459,24 +391,12 @@ pub(crate) fn build_null_left_with_right(
     left_schema: &SchemaRef,
     output_schema: &SchemaRef,
 ) -> Result<Option<RecordBatch>, String> {
-    if right_indices.is_empty() {
-        return Ok(None);
-    }
-    let len = right_indices.len();
-    let right_idx_array = UInt32Array::from(right_indices.to_vec());
-    let right_idx_ref = Arc::new(right_idx_array) as ArrayRef;
-
-    let mut columns = Vec::with_capacity(left_schema.fields().len() + right.batch.num_columns());
-    for field in left_schema.fields().iter() {
-        columns.push(new_null_array(field.data_type(), len));
-    }
-    for col in right.batch.columns() {
-        let taken = take(col.as_ref(), &right_idx_ref, None).map_err(|e| e.to_string())?;
-        columns.push(taken);
-    }
-
-    let batch = build_output_record_batch(output_schema, columns, "join right outer output")?;
-    Ok(Some(batch))
+    super::join_hash_map::gather::gather_null_left_with_right(
+        right,
+        right_indices,
+        left_schema,
+        output_schema,
+    )
 }
 
 fn build_nulls(views: &[GroupKeyArrayView<'_>], len: usize, null_safe_eq: &[bool]) -> Vec<bool> {
@@ -489,9 +409,7 @@ fn build_nulls(views: &[GroupKeyArrayView<'_>], len: usize, null_safe_eq: &[bool
 
 /// Concatenate left and right schemas into the joined output schema order.
 pub(crate) fn concat_schemas(left: SchemaRef, right: SchemaRef) -> SchemaRef {
-    let mut fields = left.fields().to_vec();
-    fields.extend(right.fields().to_vec());
-    Arc::new(Schema::new(fields))
+    super::join_hash_map::gather::concat_schemas(left, right)
 }
 
 #[cfg(test)]
@@ -505,7 +423,8 @@ mod tests {
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema};
 
-    use super::{MAX_JOIN_OUTPUT_ROWS_PER_BATCH, build_join_batches};
+    use super::super::join_hash_map::gather::MAX_JOIN_OUTPUT_ROWS_PER_BATCH;
+    use super::build_join_batches;
 
     fn one_column_chunk(name: &str, slot_id: SlotId, values: Vec<i32>) -> Chunk {
         let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int32, false)]));
