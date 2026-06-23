@@ -50,6 +50,7 @@ use crate::exec::runtime_filter::{
 use crate::metrics;
 use crate::novarocks_logging::{debug, warn};
 use crate::runtime::mem_tracker::MemTracker;
+use crate::runtime::profile::clamp_u128_to_i64;
 use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
 use crate::runtime::runtime_state::RuntimeState;
 use crate::service::exchange_sender;
@@ -335,10 +336,18 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
             self.build_table = Some(table);
         }
 
+        let build_ht_timer = self
+            .profiles
+            .as_ref()
+            .map(|p| p.common.add_timer("BuildHashTableTime"));
         let table = self.build_table.as_mut().expect("join build table");
+        let start = std::time::Instant::now();
         table
             .add_build_batch(&key_arrays, chunk.len(), batch_index)
             .map_err(|e| e.to_string())?;
+        if let Some(timer) = build_ht_timer.as_ref() {
+            timer.add(clamp_u128_to_i64(start.elapsed().as_nanos()));
+        }
         if !self.runtime_filter_specs.is_empty() {
             if self.build_keys.is_empty() {
                 return Err("runtime filters require join build keys".to_string());
@@ -389,8 +398,16 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
         );
         self.finished = true;
 
+        let build_ht_timer = self
+            .profiles
+            .as_ref()
+            .map(|p| p.common.add_timer("BuildHashTableTime"));
         if let Some(table) = self.build_table.as_mut() {
+            let start = std::time::Instant::now();
             table.finalize_groups().map_err(|e| e.to_string())?;
+            if let Some(timer) = build_ht_timer.as_ref() {
+                timer.add(clamp_u128_to_i64(start.elapsed().as_nanos()));
+            }
         }
 
         self.publish_runtime_filters(state)?;
@@ -1070,6 +1087,7 @@ impl HashJoinBuildSinkOperator {
             };
             profile.common.add_info_string("DistributionMode", mode);
             profile.common.add_timer("RuntimeFilterBuildTime");
+            profile.common.add_timer("BuildHashTableTime");
             profile
                 .common
                 .add_counter("RuntimeFilterNum", metrics::TUnit::UNIT);
