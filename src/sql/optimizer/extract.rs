@@ -35,7 +35,7 @@ pub(crate) fn extract_best(
         )
     })?;
 
-    if winner.cost.is_infinite() {
+    if winner.total_cost.is_infinite() {
         return Err(format!(
             "no feasible plan for group {} with props {:?}",
             root_group, required
@@ -206,6 +206,7 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{ExprKind, JoinKind, TypedExpr};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::cost::CostOptions;
     use crate::sql::optimizer::derive::PropertyAlternativeKind;
     use crate::sql::optimizer::memo::{MExpr, Memo};
     use crate::sql::optimizer::operator::{
@@ -214,6 +215,7 @@ mod tests {
     };
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::search::{EnforcerInfo, Winner};
+    use crate::sql::optimizer::statistics::CostEstimate;
     use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
 
     fn test_col(id: u32) -> TypedExpr {
@@ -249,6 +251,34 @@ mod tests {
             variant_columns: vec![],
             mv_rewritten_from: None,
         })
+    }
+
+    fn winner_for_test(
+        group_id: GroupId,
+        expr_index: usize,
+        total_cost: f64,
+        enforcer: Option<EnforcerInfo>,
+        output: PhysicalPropertySet,
+        alt_kind: PropertyAlternativeKind,
+        child_props: Vec<PhysicalPropertySet>,
+        child_outputs: Vec<PhysicalPropertySet>,
+    ) -> Winner {
+        let cost_options = CostOptions::default();
+        Winner::new(
+            group_id,
+            expr_index,
+            CostEstimate {
+                cpu_cost: total_cost,
+                memory_cost: 0.0,
+                network_cost: 0.0,
+            },
+            &cost_options,
+            enforcer,
+            output,
+            alt_kind,
+            child_props,
+            child_outputs,
+        )
     }
 
     fn make_hash_join_winner_with_shuffle_child_props_for_test() -> (
@@ -309,42 +339,42 @@ mod tests {
         let mut winners = HashMap::new();
         winners.insert(
             (left, left_req.clone()),
-            Winner {
-                group_id: left,
-                expr_index: 0,
-                cost: 1.0,
-                enforcer: None,
-                output: left_req.clone(),
-                alt_kind: PropertyAlternativeKind::Default,
-                child_props: vec![],
-                child_outputs: vec![],
-            },
+            winner_for_test(
+                left,
+                0,
+                1.0,
+                None,
+                left_req.clone(),
+                PropertyAlternativeKind::Default,
+                vec![],
+                vec![],
+            ),
         );
         winners.insert(
             (right, right_req.clone()),
-            Winner {
-                group_id: right,
-                expr_index: 0,
-                cost: 1.0,
-                enforcer: None,
-                output: right_req.clone(),
-                alt_kind: PropertyAlternativeKind::Default,
-                child_props: vec![],
-                child_outputs: vec![],
-            },
+            winner_for_test(
+                right,
+                0,
+                1.0,
+                None,
+                right_req.clone(),
+                PropertyAlternativeKind::Default,
+                vec![],
+                vec![],
+            ),
         );
         winners.insert(
             (root, required.clone()),
-            Winner {
-                group_id: root,
-                expr_index: 0,
-                cost: 3.0,
-                enforcer: None,
-                output: root_output,
-                alt_kind: PropertyAlternativeKind::ShuffleJoin,
-                child_props: vec![left_req.clone(), right_req.clone()],
-                child_outputs: vec![left_req, right_req],
-            },
+            winner_for_test(
+                root,
+                0,
+                3.0,
+                None,
+                root_output,
+                PropertyAlternativeKind::ShuffleJoin,
+                vec![left_req.clone(), right_req.clone()],
+                vec![left_req, right_req],
+            ),
         );
 
         (memo, root, winners, required)
@@ -386,32 +416,32 @@ mod tests {
         let mut winners = HashMap::new();
         winners.insert(
             (child, child_req.clone()),
-            Winner {
-                group_id: child,
-                expr_index: 0,
-                cost: 1.0,
-                enforcer: None,
-                output: child_output.clone(),
-                alt_kind: PropertyAlternativeKind::Default,
-                child_props: vec![],
-                child_outputs: vec![],
-            },
+            winner_for_test(
+                child,
+                0,
+                1.0,
+                None,
+                child_output.clone(),
+                PropertyAlternativeKind::Default,
+                vec![],
+                vec![],
+            ),
         );
         winners.insert(
             (root, required.clone()),
-            Winner {
-                group_id: root,
-                expr_index: 0,
-                cost: 3.0,
-                enforcer: Some(EnforcerInfo {
+            winner_for_test(
+                root,
+                0,
+                3.0,
+                Some(EnforcerInfo {
                     kind: EnforcerKind::Distribution(required.distribution.clone()),
                     child_props: pre_enforcer_output.clone(),
                 }),
-                output: required.clone(),
-                alt_kind: PropertyAlternativeKind::Default,
-                child_props: vec![child_req],
-                child_outputs: vec![child_output],
-            },
+                required.clone(),
+                PropertyAlternativeKind::Default,
+                vec![child_req],
+                vec![child_output],
+            ),
         );
 
         (memo, root, winners, required, pre_enforcer_output)
@@ -463,30 +493,30 @@ mod tests {
         for child in [left, right] {
             winners.insert(
                 (child, PhysicalPropertySet::any()),
-                Winner {
-                    group_id: child,
-                    expr_index: 0,
-                    cost: 1.0,
-                    enforcer: None,
-                    output: PhysicalPropertySet::any(),
-                    alt_kind: PropertyAlternativeKind::Default,
-                    child_props: vec![],
-                    child_outputs: vec![],
-                },
+                winner_for_test(
+                    child,
+                    0,
+                    1.0,
+                    None,
+                    PhysicalPropertySet::any(),
+                    PropertyAlternativeKind::Default,
+                    vec![],
+                    vec![],
+                ),
             );
         }
         winners.insert(
             (root, required.clone()),
-            Winner {
-                group_id: root,
-                expr_index: 0,
-                cost: 3.0,
-                enforcer: None,
-                output: PhysicalPropertySet::any(),
-                alt_kind: PropertyAlternativeKind::Default,
-                child_props: vec![PhysicalPropertySet::any(), PhysicalPropertySet::any()],
-                child_outputs: vec![PhysicalPropertySet::any(), PhysicalPropertySet::any()],
-            },
+            winner_for_test(
+                root,
+                0,
+                3.0,
+                None,
+                PhysicalPropertySet::any(),
+                PropertyAlternativeKind::Default,
+                vec![PhysicalPropertySet::any(), PhysicalPropertySet::any()],
+                vec![PhysicalPropertySet::any(), PhysicalPropertySet::any()],
+            ),
         );
 
         (memo, root, winners, required)
@@ -566,29 +596,29 @@ mod tests {
         let mut winners = HashMap::new();
         winners.insert(
             (child, PhysicalPropertySet::any()),
-            Winner {
-                group_id: child,
-                expr_index: 0,
-                cost: 1.0,
-                enforcer: None,
-                output: PhysicalPropertySet::any(),
-                alt_kind: PropertyAlternativeKind::Default,
-                child_props: vec![],
-                child_outputs: vec![],
-            },
+            winner_for_test(
+                child,
+                0,
+                1.0,
+                None,
+                PhysicalPropertySet::any(),
+                PropertyAlternativeKind::Default,
+                vec![],
+                vec![],
+            ),
         );
         winners.insert(
             (root, required.clone()),
-            Winner {
-                group_id: root,
-                expr_index: 0,
-                cost: 2.0,
-                enforcer: None,
-                output: PhysicalPropertySet::any(),
-                alt_kind: PropertyAlternativeKind::Default,
-                child_props: vec![],
-                child_outputs: vec![],
-            },
+            winner_for_test(
+                root,
+                0,
+                2.0,
+                None,
+                PhysicalPropertySet::any(),
+                PropertyAlternativeKind::Default,
+                vec![],
+                vec![],
+            ),
         );
 
         let err = extract_best(&mut memo, root, &required, &winners)

@@ -19,7 +19,7 @@ use crate::sql::optimizer::scalar::ScalarArena;
 
 pub(crate) type GroupId = usize;
 pub(crate) type MExprId = usize;
-pub(crate) type Cost = f64;
+pub(crate) type TotalCost = f64;
 
 /// A candidate join order produced by the reorder enumerator, expressed over
 /// existing memo groups (leaves) and new join operators (internal nodes).

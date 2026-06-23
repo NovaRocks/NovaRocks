@@ -9,9 +9,10 @@ use std::collections::{HashMap, HashSet};
 
 use super::cost::{CostInput, CostOptions, compute_cost_from_input};
 use super::derive::PropertyAlternativeKind;
-use super::memo::{Cost, GroupId, Memo};
+use super::memo::{GroupId, Memo, TotalCost};
 use super::operator::*;
 use super::property::*;
+use super::statistics::CostEstimate;
 use crate::sql::optimizer::stats_input::OptimizerStatsInput;
 
 pub(crate) use super::derive::EnforcerKind;
@@ -27,7 +28,8 @@ pub(crate) struct Winner {
     pub(crate) group_id: GroupId,
     /// Index into `group.physical_exprs`.
     pub(crate) expr_index: usize,
-    pub(crate) cost: Cost,
+    pub(crate) cost_estimate: CostEstimate,
+    pub(crate) total_cost: TotalCost,
     /// If present, the winner needs an enforcer on top of the physical expr.
     pub(crate) enforcer: Option<EnforcerInfo>,
     /// The actual physical-property set this winner delivers. For an
@@ -38,6 +40,47 @@ pub(crate) struct Winner {
     pub(crate) alt_kind: PropertyAlternativeKind,
     pub(crate) child_props: Vec<PhysicalPropertySet>,
     pub(crate) child_outputs: Vec<PhysicalPropertySet>,
+}
+
+impl Winner {
+    pub(crate) fn new(
+        group_id: GroupId,
+        expr_index: usize,
+        cost_estimate: CostEstimate,
+        cost_options: &CostOptions,
+        enforcer: Option<EnforcerInfo>,
+        output: PhysicalPropertySet,
+        alt_kind: PropertyAlternativeKind,
+        child_props: Vec<PhysicalPropertySet>,
+        child_outputs: Vec<PhysicalPropertySet>,
+    ) -> Self {
+        let total_cost = cost_estimate.total_with_options(cost_options);
+        Self {
+            group_id,
+            expr_index,
+            cost_estimate,
+            total_cost,
+            enforcer,
+            output,
+            alt_kind,
+            child_props,
+            child_outputs,
+        }
+    }
+
+    pub(crate) fn infeasible(group_id: GroupId) -> Self {
+        Self {
+            group_id,
+            expr_index: 0,
+            cost_estimate: CostEstimate::default(),
+            total_cost: f64::INFINITY,
+            enforcer: None,
+            output: PhysicalPropertySet::any(),
+            alt_kind: PropertyAlternativeKind::Default,
+            child_props: vec![],
+            child_outputs: vec![],
+        }
+    }
 }
 
 /// Describes the enforcer node that must wrap the winner expression.
@@ -95,12 +138,12 @@ impl SearchContext {
         memo: &Memo,
         group_id: GroupId,
         required: &PhysicalPropertySet,
-    ) -> Result<Cost, String> {
+    ) -> Result<TotalCost, String> {
         let cache_key = (group_id, required.clone());
 
         // 1. Check winner cache.
         if let Some(winner) = self.winners.get(&cache_key) {
-            return Ok(winner.cost);
+            return Ok(winner.total_cost);
         }
 
         // 2. Cycle guard: if this (group, props) is already being computed on
@@ -117,6 +160,7 @@ impl SearchContext {
         // Groups with no physical exprs: return infinity (not an error).
         if num_physical == 0 {
             self.in_progress.remove(&cache_key);
+            self.winners.insert(cache_key, Winner::infeasible(group_id));
             return Ok(f64::INFINITY);
         }
 
@@ -241,7 +285,7 @@ impl SearchContext {
                     }
                     let group_stats =
                         stats_for_group(&memo.groups[group_id], memo, &self.stats_input);
-                    let enforcer_cost: Cost = enforcers
+                    let enforcer_cost: TotalCost = enforcers
                         .iter()
                         .map(|e| {
                             super::derive::estimate_enforcer_cost_estimate(
@@ -280,19 +324,53 @@ impl SearchContext {
         self.in_progress.remove(&cache_key);
 
         // Cache the result even if best_cost is INFINITY (avoids recomputation).
-        let winner = Winner {
-            group_id,
-            expr_index: best_index,
-            cost: best_cost,
-            enforcer: best_enforcer,
-            output: best_output,
-            alt_kind: best_alt_kind,
-            child_props: best_child_props,
-            child_outputs: best_child_outputs,
+        let winner = if best_cost.is_infinite() {
+            Winner::infeasible(group_id)
+        } else {
+            Winner::new(
+                group_id,
+                best_index,
+                cost_estimate_for_total(best_cost, &self.cost_options),
+                &self.cost_options,
+                best_enforcer,
+                best_output,
+                best_alt_kind,
+                best_child_props,
+                best_child_outputs,
+            )
         };
+        let total_cost = winner.total_cost;
         self.winners.insert(cache_key, winner);
-        Ok(best_cost)
+        Ok(total_cost)
     }
+}
+
+fn cost_estimate_for_total(total_cost: TotalCost, cost_options: &CostOptions) -> CostEstimate {
+    debug_assert!(total_cost.is_finite());
+
+    if cost_options.cpu_weight.is_finite() && cost_options.cpu_weight > 0.0 {
+        return CostEstimate {
+            cpu_cost: total_cost / cost_options.cpu_weight,
+            memory_cost: 0.0,
+            network_cost: 0.0,
+        };
+    }
+    if cost_options.memory_weight.is_finite() && cost_options.memory_weight > 0.0 {
+        return CostEstimate {
+            cpu_cost: 0.0,
+            memory_cost: total_cost / cost_options.memory_weight,
+            network_cost: 0.0,
+        };
+    }
+    if cost_options.network_weight.is_finite() && cost_options.network_weight > 0.0 {
+        return CostEstimate {
+            cpu_cost: 0.0,
+            memory_cost: 0.0,
+            network_cost: total_cost / cost_options.network_weight,
+        };
+    }
+
+    CostEstimate::default()
 }
 
 // ---------------------------------------------------------------------------
@@ -808,6 +886,48 @@ mod tests {
     }
 
     #[test]
+    fn winner_new_keeps_total_cost_in_sync_with_estimate() {
+        let options = CostOptions {
+            cpu_weight: 1.0,
+            memory_weight: 2.0,
+            network_weight: 3.0,
+            ..Default::default()
+        };
+        let estimate = crate::sql::optimizer::statistics::CostEstimate {
+            cpu_cost: 10.0,
+            memory_cost: 20.0,
+            network_cost: 30.0,
+        };
+
+        let winner = Winner::new(
+            7,
+            3,
+            estimate.clone(),
+            &options,
+            None,
+            PhysicalPropertySet::gather(),
+            PropertyAlternativeKind::Default,
+            vec![PhysicalPropertySet::any()],
+            vec![PhysicalPropertySet::any()],
+        );
+
+        assert_eq!(winner.cost_estimate.cpu_cost, estimate.cpu_cost);
+        assert_eq!(winner.cost_estimate.memory_cost, estimate.memory_cost);
+        assert_eq!(winner.cost_estimate.network_cost, estimate.network_cost);
+        assert_eq!(winner.total_cost, estimate.total_with_options(&options));
+    }
+
+    #[test]
+    fn infeasible_winner_uses_total_cost_sentinel_without_infinite_dimensions() {
+        let winner = Winner::infeasible(9);
+
+        assert!(winner.total_cost.is_infinite());
+        assert!(winner.cost_estimate.cpu_cost.is_finite());
+        assert!(winner.cost_estimate.memory_cost.is_finite());
+        assert!(winner.cost_estimate.network_cost.is_finite());
+    }
+
+    #[test]
     fn unknown_hash_join_search_extracts_concrete_distribution() {
         let (mut memo, root) = make_two_table_inner_join_memo_for_test();
         let mut ctx = SearchContext::new_for_test(empty_stats_input());
@@ -849,7 +969,7 @@ mod tests {
             .winners
             .get(&(root, required))
             .expect("infeasible winner should still be cached");
-        assert!(winner.cost.is_infinite());
+        assert!(winner.total_cost.is_infinite());
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! a physical operator (not including children).  The formulas are aligned with
 //! StarRocks conventions and the existing `optimizer/cost.rs` model.
 
-use super::memo::Cost;
+use super::memo::TotalCost;
 use super::operator::{
     AggMode, JoinDistribution, Operator, PhysicalHashAggregateOp, PhysicalHashJoinOp, ScanOp,
 };
@@ -62,7 +62,7 @@ pub(crate) fn compute_cost(
     op: &Operator,
     own_stats: &Statistics,
     child_stats: &[&Statistics],
-) -> Cost {
+) -> TotalCost {
     match op {
         // ------------------------------------------------------------------
         // Logical operators — not costed
@@ -342,10 +342,10 @@ fn stats_has_positive_overflow_signal(stats: &Statistics) -> bool {
 }
 
 fn sanitize_legacy_fallback_cost(
-    legacy_cost: Cost,
+    legacy_cost: TotalCost,
     own_stats: &Statistics,
     child_stats: &[&Statistics],
-) -> Cost {
+) -> TotalCost {
     if legacy_cost.is_nan()
         && (stats_has_positive_overflow_signal(own_stats)
             || child_stats
@@ -359,7 +359,7 @@ fn sanitize_legacy_fallback_cost(
 }
 
 impl CostEstimate {
-    pub(crate) fn total_with_options(&self, options: &CostOptions) -> Cost {
+    pub(crate) fn total_with_options(&self, options: &CostOptions) -> TotalCost {
         self.weighted_total(
             options.cpu_weight,
             options.memory_weight,
@@ -722,7 +722,7 @@ pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
     }
 }
 
-pub(crate) fn compute_cost_from_input(input: &CostInput<'_>) -> Cost {
+pub(crate) fn compute_cost_from_input(input: &CostInput<'_>) -> TotalCost {
     compute_cost_estimate(input).total_with_options(input.options)
 }
 
@@ -761,7 +761,7 @@ fn compute_legacy_cost_with_properties(
     _child_outputs: &[&PhysicalPropertySet],
     alt_kind: &PropertyAlternativeKind,
     options: &CostOptions,
-) -> Cost {
+) -> TotalCost {
     match op {
         Operator::PhysicalHashJoin(j) => {
             let probe_stats = child_stats.first().copied();
@@ -807,7 +807,7 @@ pub(crate) fn compute_cost_with_properties(
     child_outputs: &[&PhysicalPropertySet],
     alt_kind: &PropertyAlternativeKind,
     options: &CostOptions,
-) -> Cost {
+) -> TotalCost {
     let required_output = PhysicalPropertySet::any();
     let input = CostInput {
         op,

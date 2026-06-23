@@ -12,7 +12,7 @@
 //! §1 for the explanation.
 
 use super::cost::{CostOptions, estimate_distribution_cost_estimate, estimate_sort_cost_estimate};
-use super::memo::Cost;
+use super::memo::TotalCost;
 use super::operator::*;
 use super::property::*;
 use super::scalar::{ScalarArena, ScalarId, ScalarNode, SortKey as ScalarSortKey};
@@ -311,7 +311,7 @@ pub(crate) fn estimate_enforcer_cost_estimate(
 }
 
 /// Estimate the cost of an enforcer given group statistics.
-pub(crate) fn estimate_enforcer_cost(enforcer: &EnforcerKind, stats: &Statistics) -> Cost {
+pub(crate) fn estimate_enforcer_cost(enforcer: &EnforcerKind, stats: &Statistics) -> TotalCost {
     let options = CostOptions::default();
     estimate_enforcer_cost_estimate(enforcer, stats, &options).total_with_options(&options)
 }
