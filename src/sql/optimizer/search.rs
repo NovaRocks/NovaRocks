@@ -973,6 +973,34 @@ mod tests {
     }
 
     #[test]
+    fn winner_total_cost_uses_context_weights() {
+        let (memo, gid) = single_scan_memo();
+        let options = CostOptions {
+            cpu_weight: 9.0,
+            memory_weight: 0.0,
+            network_weight: 0.0,
+            ..Default::default()
+        };
+        let mut ctx = SearchContext::new(legacy_stats_input(make_table_stats()), options.clone());
+        let required = PhysicalPropertySet::any();
+
+        ctx.optimize_group(&memo, gid, &required).expect("search");
+
+        let winner = ctx.winners.get(&(gid, required)).expect("winner");
+        assert!(winner.cost_estimate.cpu_cost > 0.0);
+        assert_eq!(
+            winner.total_cost,
+            winner.cost_estimate.total_with_options(&options)
+        );
+        assert_ne!(
+            winner.total_cost,
+            winner
+                .cost_estimate
+                .total_with_options(&CostOptions::default())
+        );
+    }
+
+    #[test]
     fn search_parent_cost_estimate_includes_child_winner_estimate() {
         let (memo, root, child) = project_over_scan_memo_for_test();
         let mut ctx = SearchContext::new_for_test(empty_stats_input());
@@ -1303,6 +1331,51 @@ mod tests {
             winner.alt_kind,
             crate::sql::optimizer::derive::PropertyAlternativeKind::ShuffleJoin
         );
+    }
+
+    #[test]
+    fn search_broadcast_gate_uses_context_cost_options() {
+        let (memo, root, table_stats) = make_large_build_inner_join_memo_for_test(
+            10_000_000.0,
+            500_001.0,
+            crate::sql::optimizer::statistics::Confidence::Fallback,
+        );
+        let required = PhysicalPropertySet::gather();
+
+        let mut default_ctx = SearchContext::new(
+            legacy_stats_input(table_stats.clone()),
+            CostOptions::default(),
+        );
+        default_ctx
+            .optimize_group(&memo, root, &required)
+            .expect("default search");
+        let default_winner = default_ctx
+            .winners
+            .get(&(root, required.clone()))
+            .expect("default winner");
+
+        let custom_options = CostOptions {
+            fallback_broadcast_row_limit: 600_000.0,
+            ..Default::default()
+        };
+        let mut custom_ctx = SearchContext::new(legacy_stats_input(table_stats), custom_options);
+        custom_ctx
+            .optimize_group(&memo, root, &required)
+            .expect("custom search");
+        let custom_winner = custom_ctx
+            .winners
+            .get(&(root, required.clone()))
+            .expect("custom winner");
+
+        assert_eq!(
+            default_winner.alt_kind,
+            crate::sql::optimizer::derive::PropertyAlternativeKind::ShuffleJoin
+        );
+        assert_eq!(
+            custom_winner.alt_kind,
+            crate::sql::optimizer::derive::PropertyAlternativeKind::BroadcastJoin
+        );
+        assert_ne!(default_winner.alt_kind, custom_winner.alt_kind);
     }
 
     #[test]
