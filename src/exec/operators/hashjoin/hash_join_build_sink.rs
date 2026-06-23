@@ -33,6 +33,7 @@ use arrow::array::Array;
 
 use super::build_artifact::JoinBuildArtifact;
 use super::build_state::JoinBuildSinkState;
+use super::join_hash_map::build_store::BuildStoreBuilder;
 use super::join_hash_table::JoinHashTable;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
@@ -141,6 +142,7 @@ impl OperatorFactory for HashJoinBuildSinkFactory {
             partition,
             runtime_filter_hub: Arc::clone(&self.runtime_filter_hub),
             runtime_in_filter_merger: self.runtime_in_filter_merger.as_ref().map(Arc::clone),
+            build_store_builder: BuildStoreBuilder::new(),
             build_batches: Vec::new(),
             build_table: None,
             runtime_filters: None,
@@ -182,6 +184,7 @@ struct HashJoinBuildSinkOperator {
     partition: usize,
     runtime_filter_hub: Arc<RuntimeFilterHub>,
     runtime_in_filter_merger: Option<Arc<PartialRuntimeInFilterMerger>>,
+    build_store_builder: BuildStoreBuilder,
     build_batches: Vec<Chunk>,
     build_table: Option<JoinHashTable>,
     runtime_filters: Option<LocalRuntimeFilterSet>,
@@ -280,6 +283,7 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
         self.input_rows = self.input_rows.saturating_add(chunk.len() as u64);
         self.input_chunks = self.input_chunks.saturating_add(1);
         self.build_row_count = self.build_row_count.saturating_add(chunk.len());
+        self.build_store_builder.push_chunk(&chunk)?;
 
         let batch_index = u32::try_from(self.build_batches.len())
             .map_err(|_| "join build batch index overflow".to_string())?;
@@ -442,7 +446,10 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
         }
         let runtime_filters = self.runtime_filters.take().map(Arc::new);
         let build_null_key_rows = self.build_null_key_rows.take().map(Arc::new);
+        let build_store =
+            std::mem::replace(&mut self.build_store_builder, BuildStoreBuilder::new()).finish()?;
         let artifact = Arc::new(JoinBuildArtifact::new(
+            build_store,
             batches,
             table,
             self.build_row_count,
