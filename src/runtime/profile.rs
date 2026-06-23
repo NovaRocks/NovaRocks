@@ -287,6 +287,17 @@ impl RuntimeProfile {
         self.counter_snapshot(name).map(|snapshot| snapshot.value)
     }
 
+    pub(crate) fn counter_value_min_max(&self, name: &str) -> Option<(i64, i64, i64)> {
+        self.counter_snapshot(name).map(|snapshot| {
+            let value = snapshot.value;
+            (
+                value,
+                snapshot.min_value.unwrap_or(value),
+                snapshot.max_value.unwrap_or(value),
+            )
+        })
+    }
+
     pub fn add_timer(&self, name: impl Into<String>) -> CounterRef {
         self.add_counter(name, metrics::TUnit::TIME_NS)
     }

@@ -25,6 +25,11 @@ pub(crate) struct ActualMetrics {
     pub(crate) output_rows: i64,
     pub(crate) total_time_ns: i64,
     pub(crate) peak_mem_bytes: i64,
+    pub(crate) total_time_max_ns: i64,
+    pub(crate) total_time_min_ns: i64,
+    pub(crate) build_ht_ns: i64,
+    pub(crate) search_ns: i64,
+    pub(crate) output_ns: i64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -122,13 +127,21 @@ pub(crate) fn collect_distributed_profile_summary_from_profile_trees(
 fn collect_rec(node: &Profiler, actuals: &mut HashMap<i32, ActualMetrics>) {
     if let Some(node_id) = parse_plan_node_id(&node.name()) {
         if let Some(common) = node.get_child("CommonMetrics") {
+            let (total_time_ns, total_time_min_ns, total_time_max_ns) = common
+                .counter_value_min_max("OperatorTotalTime")
+                .unwrap_or((0, 0, 0));
             merge_actual_metrics(
                 actuals,
                 node_id,
                 ActualMetrics {
                     output_rows: counter(&common, "PullRowNum"),
-                    total_time_ns: counter(&common, "OperatorTotalTime"),
+                    total_time_ns,
                     peak_mem_bytes: counter(&common, "OperatorPeakMemoryUsage"),
+                    total_time_max_ns,
+                    total_time_min_ns,
+                    build_ht_ns: counter(&common, "BuildHashTableTime"),
+                    search_ns: counter(&common, "SearchHashTableTime"),
+                    output_ns: counter(&common, "OutputColumnTime"),
                 },
             );
         }
@@ -161,10 +174,17 @@ fn collect_thrift_rec(
                 .get(range.start)
                 .is_some_and(|child| child.name == "CommonMetrics")
             {
+                let (total_time_max_ns, total_time_min_ns) =
+                    thrift_counter_min_max(nodes, range.clone(), "OperatorTotalTime");
                 let metrics = ActualMetrics {
                     output_rows: thrift_counter(nodes, range.clone(), "PullRowNum"),
                     total_time_ns: thrift_counter(nodes, range.clone(), "OperatorTotalTime"),
-                    peak_mem_bytes: thrift_counter(nodes, range, "OperatorPeakMemoryUsage"),
+                    peak_mem_bytes: thrift_counter(nodes, range.clone(), "OperatorPeakMemoryUsage"),
+                    total_time_max_ns,
+                    total_time_min_ns,
+                    build_ht_ns: thrift_counter(nodes, range.clone(), "BuildHashTableTime"),
+                    search_ns: thrift_counter(nodes, range.clone(), "SearchHashTableTime"),
+                    output_ns: thrift_counter(nodes, range, "OutputColumnTime"),
                 };
                 merge_actual_metrics(actuals, node_id, metrics);
                 break;
@@ -184,6 +204,15 @@ fn merge_actual_metrics(
     entry.output_rows = entry.output_rows.saturating_add(metrics.output_rows);
     entry.total_time_ns = entry.total_time_ns.max(metrics.total_time_ns);
     entry.peak_mem_bytes = entry.peak_mem_bytes.saturating_add(metrics.peak_mem_bytes);
+    entry.total_time_max_ns = entry.total_time_max_ns.max(metrics.total_time_max_ns);
+    entry.total_time_min_ns = match (entry.total_time_min_ns, metrics.total_time_min_ns) {
+        (0, incoming) => incoming,
+        (current, 0) => current,
+        (current, incoming) => current.min(incoming),
+    };
+    entry.build_ht_ns = entry.build_ht_ns.max(metrics.build_ht_ns);
+    entry.search_ns = entry.search_ns.max(metrics.search_ns);
+    entry.output_ns = entry.output_ns.max(metrics.output_ns);
 }
 
 fn counter(common: &Profiler, name: &str) -> i64 {
@@ -201,6 +230,28 @@ fn thrift_counter(
         .filter(|counter| counter.name == name)
         .map(|counter| counter.value)
         .sum()
+}
+
+fn thrift_counter_min_max(
+    nodes: &[runtime_profile::TRuntimeProfileNode],
+    range: std::ops::Range<usize>,
+    name: &str,
+) -> (i64, i64) {
+    let mut max_of_max = None;
+    let mut min_of_min = None;
+    for counter in nodes[range]
+        .iter()
+        .flat_map(|node| node.counters.iter())
+        .filter(|counter| counter.name == name)
+    {
+        if let Some(max) = counter.max_value {
+            max_of_max = Some(max_of_max.map_or(max, |current: i64| current.max(max)));
+        }
+        if let Some(min) = counter.min_value {
+            min_of_min = Some(min_of_min.map_or(min, |current: i64| current.min(min)));
+        }
+    }
+    (max_of_max.unwrap_or(0), min_of_min.unwrap_or(0))
 }
 
 fn thrift_counter_in_tree(tree: &runtime_profile::TRuntimeProfileTree, name: &str) -> i64 {
@@ -269,6 +320,9 @@ mod tests {
                 output_rows: 10,
                 total_time_ns: 5,
                 peak_mem_bytes: 64,
+                total_time_max_ns: 5,
+                total_time_min_ns: 5,
+                ..ActualMetrics::default()
             })
         );
     }
@@ -290,6 +344,48 @@ mod tests {
                 output_rows: 30,
                 total_time_ns: 5,
                 peak_mem_bytes: 96,
+                total_time_max_ns: 5,
+                total_time_min_ns: 5,
+                ..ActualMetrics::default()
+            })
+        );
+    }
+
+    #[test]
+    fn preserves_operator_total_time_minmax_after_driver_merge() {
+        let profiler = Profiler::new("query");
+        let pipeline = profiler.child("Pipeline (id=0)");
+        let driver0 = pipeline.child("PipelineDriver (id=0)");
+        add_operator_metrics(&driver0, "HASH JOIN (plan_node_id=9)", 10, 10, 64);
+        let common0 = driver0
+            .child("HASH JOIN (plan_node_id=9)")
+            .child("CommonMetrics");
+        common0.add_timer("BuildHashTableTime").set(2);
+        common0.add_timer("SearchHashTableTime").set(4);
+        common0.add_timer("OutputColumnTime").set(6);
+
+        let driver1 = pipeline.child("PipelineDriver (id=1)");
+        add_operator_metrics(&driver1, "HASH JOIN (plan_node_id=9)", 20, 30, 32);
+        let common1 = driver1
+            .child("HASH JOIN (plan_node_id=9)")
+            .child("CommonMetrics");
+        common1.add_timer("BuildHashTableTime").set(6);
+        common1.add_timer("SearchHashTableTime").set(8);
+        common1.add_timer("OutputColumnTime").set(10);
+
+        let actuals = collect_actuals_by_plan_node_id(&profiler);
+
+        assert_eq!(
+            actuals.get(&9).copied(),
+            Some(ActualMetrics {
+                output_rows: 30,
+                total_time_ns: 20,
+                peak_mem_bytes: 96,
+                total_time_max_ns: 30,
+                total_time_min_ns: 10,
+                build_ht_ns: 4,
+                search_ns: 6,
+                output_ns: 8,
             })
         );
     }
@@ -310,6 +406,9 @@ mod tests {
                 output_rows: 1,
                 total_time_ns: 12_000,
                 peak_mem_bytes: 128,
+                total_time_max_ns: 12_000,
+                total_time_min_ns: 12_000,
+                ..ActualMetrics::default()
             })
         );
     }
@@ -336,6 +435,9 @@ mod tests {
                 output_rows: 100,
                 total_time_ns: 20,
                 peak_mem_bytes: 256,
+                total_time_max_ns: 20,
+                total_time_min_ns: 20,
+                ..ActualMetrics::default()
             })
         );
         assert_eq!(
@@ -344,6 +446,9 @@ mod tests {
                 output_rows: 1,
                 total_time_ns: 30,
                 peak_mem_bytes: 512,
+                total_time_max_ns: 30,
+                total_time_min_ns: 30,
+                ..ActualMetrics::default()
             })
         );
     }
@@ -366,6 +471,9 @@ mod tests {
                 output_rows: 8,
                 total_time_ns: 900_000,
                 peak_mem_bytes: 4096,
+                total_time_max_ns: 900_000,
+                total_time_min_ns: 900_000,
+                ..ActualMetrics::default()
             })
         );
     }
@@ -412,5 +520,36 @@ mod tests {
         assert_eq!(summary.exchange_process_time_ns, 300);
         assert_eq!(summary.network_time_ns, 900);
         assert_eq!(summary.scan_io_time_ns, 1_100);
+    }
+
+    #[test]
+    fn collects_phase_timers_and_minmax_from_thrift_tree() {
+        let profiler = Profiler::new("Fragment");
+        let op = profiler.child("HASH JOIN (plan_node_id=9)");
+        let common = op.child("CommonMetrics");
+        common
+            .add_counter("PullRowNum", metrics::TUnit::UNIT)
+            .set(100);
+        let total = common.add_timer("OperatorTotalTime");
+        total.set(44_000);
+        total.set_min(43_000);
+        total.set_max(46_000);
+        common
+            .add_counter("OperatorPeakMemoryUsage", metrics::TUnit::BYTES)
+            .set(640);
+        common.add_timer("BuildHashTableTime").set(0);
+        common.add_timer("SearchHashTableTime").set(20_000);
+        common.add_timer("OutputColumnTime").set(15_000);
+
+        let tree = profiler.to_thrift_tree();
+        let actuals = collect_actuals_by_plan_node_id_from_profile_trees(&[tree]);
+        let m = actuals.get(&9).expect("node 9 metrics");
+        assert_eq!(m.output_rows, 100);
+        assert_eq!(m.total_time_ns, 44_000);
+        assert_eq!(m.total_time_max_ns, 46_000);
+        assert_eq!(m.total_time_min_ns, 43_000);
+        assert_eq!(m.search_ns, 20_000);
+        assert_eq!(m.output_ns, 15_000);
+        assert_eq!(m.build_ht_ns, 0);
     }
 }

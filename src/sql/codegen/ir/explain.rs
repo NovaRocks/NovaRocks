@@ -1562,6 +1562,7 @@ mod tests {
                 output_rows: 11,
                 total_time_ns: 450_000,
                 peak_mem_bytes: 64,
+                ..ActualMetrics::default()
             },
         );
         actuals.insert(
@@ -1570,6 +1571,7 @@ mod tests {
                 output_rows: 7,
                 total_time_ns: 2_300_000,
                 peak_mem_bytes: 4 * 1024 * 1024,
+                ..ActualMetrics::default()
             },
         );
 
