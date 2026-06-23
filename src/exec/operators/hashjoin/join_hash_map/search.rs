@@ -1,3 +1,20 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 use arrow::array::{Array, BooleanArray};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -25,6 +42,13 @@ impl JoinSelection {
     }
 
     pub(crate) fn compact_by_mask(&mut self, mask: &BooleanArray) -> Result<(), String> {
+        if self.probe.len() != self.build.len() {
+            return Err(format!(
+                "join selection length mismatch: probe={} build={}",
+                self.probe.len(),
+                self.build.len()
+            ));
+        }
         if mask.len() != self.len() {
             return Err(format!(
                 "join residual mask length mismatch: mask={} selection={}",
@@ -94,6 +118,28 @@ mod tests {
 
         assert_eq!(selection.probe, vec![0, 3, 3]);
         assert_eq!(selection.build, vec![0, 0, 2]);
+    }
+
+    #[test]
+    fn selection_compaction_rejects_mismatched_pair_lengths() {
+        let mut selection = JoinSelection {
+            probe: vec![0, 1],
+            build: vec![0],
+        };
+        let mask = BooleanArray::from(vec![Some(true), Some(true)]);
+
+        let err = selection.compact_by_mask(&mask).expect_err("mismatch");
+
+        assert_eq!(err, "join selection length mismatch: probe=2 build=1");
+    }
+
+    #[test]
+    fn probe_mask_set_updates_selected_row() {
+        let mut mask = ProbeMask::new(3, false);
+
+        mask.set(1, true).expect("set");
+
+        assert_eq!(mask.as_slice(), &[false, true, false]);
     }
 
     #[test]

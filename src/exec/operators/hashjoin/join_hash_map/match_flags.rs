@@ -1,3 +1,20 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BuildMatchFlags {
     flags: Vec<bool>,
@@ -32,7 +49,9 @@ impl BuildMatchFlags {
         self.flags
             .iter()
             .enumerate()
-            .filter_map(|(row, matched)| matched.then_some(row as u32))
+            .filter_map(|(row, matched)| {
+                matched.then(|| u32::try_from(row).expect("join build row id exceeds u32"))
+            })
             .collect()
     }
 
@@ -40,7 +59,9 @@ impl BuildMatchFlags {
         self.flags
             .iter()
             .enumerate()
-            .filter_map(|(row, matched)| (!matched).then_some(row as u32))
+            .filter_map(|(row, matched)| {
+                (!matched).then(|| u32::try_from(row).expect("join build row id exceeds u32"))
+            })
             .collect()
     }
 
@@ -66,6 +87,9 @@ impl BuildMatchMerge {
     }
 
     pub(crate) fn merge_one(&mut self, local: Vec<bool>) -> Result<Option<Vec<bool>>, String> {
+        if self.drivers_merged >= self.total_drivers {
+            return Err("join build match merge already complete".to_string());
+        }
         if local.len() != self.merged.len() {
             return Err(format!(
                 "join build match merge length mismatch: local={} merged={}",
@@ -123,5 +147,31 @@ mod tests {
                 .expect("merge"),
             Some(vec![true, true, true, false])
         );
+    }
+
+    #[test]
+    fn merge_rejects_local_flags_after_completion() {
+        let mut merge = BuildMatchMerge::new(1, 2);
+        assert_eq!(
+            merge.merge_one(vec![true, false]).expect("merge"),
+            Some(vec![true, false])
+        );
+
+        let err = merge
+            .merge_one(vec![false, true])
+            .expect_err("already complete");
+
+        assert_eq!(err, "join build match merge already complete");
+    }
+
+    #[test]
+    fn merge_rejects_zero_driver_merge() {
+        let mut merge = BuildMatchMerge::new(0, 2);
+
+        let err = merge
+            .merge_one(vec![false, true])
+            .expect_err("already complete");
+
+        assert_eq!(err, "join build match merge already complete");
     }
 }
