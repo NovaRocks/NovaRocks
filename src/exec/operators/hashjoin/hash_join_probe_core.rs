@@ -41,7 +41,7 @@ use super::join_hash_map::method::JoinHashMap;
 use super::join_hash_table::JoinHashTable;
 use super::join_probe_utils::{
     build_join_batch, build_left_with_null_right, build_null_left_with_right, concat_schemas,
-    cross_join_chunk, keyed_join_chunk, lookup_group_ids,
+    cross_join_chunk, lookup_group_ids,
 };
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::expr::{ExprArena, ExprId};
@@ -75,6 +75,7 @@ pub(crate) struct HashJoinProbeCore {
     join_scope_chunk_schema: ChunkSchemaRef,
     join_scope_schema: SchemaRef,
     build_loaded: bool,
+    build_chunk: Option<Arc<Chunk>>,
     build_batches: Arc<Vec<Chunk>>,
     build_null_key_rows: Option<Arc<Vec<Vec<u32>>>>,
     build_table: Option<Arc<JoinHashMap>>,
@@ -120,6 +121,7 @@ impl HashJoinProbeCore {
             join_scope_schema: join_scope_chunk_schema.arrow_schema_ref(),
             join_scope_chunk_schema,
             build_loaded: false,
+            build_chunk: None,
             build_batches: Arc::new(Vec::new()),
             build_null_key_rows: None,
             build_table: None,
@@ -208,6 +210,7 @@ impl HashJoinProbeCore {
         if self.build_loaded {
             return Ok(());
         }
+        self.build_chunk = artifact.build_store.as_ref().map(|store| store.chunk());
         self.build_batches = Arc::clone(&artifact.build_batches);
         self.build_null_key_rows = artifact.build_null_key_rows.clone();
         self.build_table = artifact.build_table.clone();
@@ -416,6 +419,46 @@ impl HashJoinProbeCore {
             }
             JoinType::NullAwareLeftAnti => self.join_null_aware_left_anti(probe_chunks),
         }
+    }
+
+    fn compact_selection_by_residual(
+        &mut self,
+        probe: &Chunk,
+        build: &Chunk,
+        selection: &mut crate::exec::operators::hashjoin::join_hash_map::search::JoinSelection,
+        pred: ExprId,
+    ) -> Result<(), String> {
+        if selection.is_empty() {
+            return Ok(());
+        }
+        let output_start = std::time::Instant::now();
+        let candidate = crate::exec::operators::hashjoin::join_hash_map::gather::gather_join_batch(
+            probe,
+            build,
+            &selection.probe,
+            &selection.build,
+            &self.join_scope_schema,
+        )?
+        .ok_or_else(|| "join residual candidate batch missing".to_string())?;
+        self.record_output_ns(output_start);
+        let candidate_chunk =
+            Chunk::try_new_with_chunk_schema(candidate, Arc::clone(&self.join_scope_chunk_schema))?;
+        let mask_arr = self
+            .arena
+            .eval(pred, &candidate_chunk)
+            .map_err(|e| e.to_string())?;
+        let mask = mask_arr
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| "join residual predicate must return boolean array".to_string())?;
+        let before = selection.len();
+        selection.compact_by_mask(mask)?;
+        self.residual_eval_batches = self.residual_eval_batches.saturating_add(1);
+        self.residual_eval_pairs = self.residual_eval_pairs.saturating_add(before as u64);
+        self.residual_matched_rows = self
+            .residual_matched_rows
+            .saturating_add(selection.len() as u64);
+        Ok(())
     }
 
     pub(crate) fn build_full_outer_unmatched_build(
@@ -645,7 +688,7 @@ impl HashJoinProbeCore {
     }
 
     fn join_inner(&mut self, probe_chunks: Vec<Chunk>) -> Result<Option<Chunk>, String> {
-        if self.build_batches.is_empty() {
+        if self.probe_keys.is_empty() && self.build_batches.is_empty() {
             return Ok(None);
         }
         let output_schema = Arc::clone(
@@ -654,6 +697,7 @@ impl HashJoinProbeCore {
         );
 
         let mut output_batches = Vec::new();
+        let mut residual_applied_during_selection = false;
         if self.probe_keys.is_empty() {
             for left in probe_chunks {
                 for right in self.build_batches.iter() {
@@ -666,28 +710,52 @@ impl HashJoinProbeCore {
                 }
             }
         } else {
-            let Some(table) = self.build_table.as_ref() else {
+            let Some(table) = self.build_table.clone() else {
                 return Ok(None);
             };
-            if table.is_empty() {
+            let Some(build_chunk) = self.build_chunk.clone() else {
+                return Ok(None);
+            };
+            if table.is_empty() || build_chunk.is_empty() {
                 return Ok(None);
             }
-            for left in probe_chunks {
-                let batches = keyed_join_chunk(
-                    &self.arena,
-                    &self.probe_keys,
-                    &left,
-                    self.build_batches.as_ref(),
-                    table,
-                    &output_schema,
-                    self.search_timer.as_ref(),
-                    self.output_timer.as_ref(),
-                )?;
+            residual_applied_during_selection = self.residual_predicate.is_some();
+            for probe in probe_chunks {
+                let search_start = std::time::Instant::now();
+                let (group_ids, mut selection) =
+                    table.lookup_selection(&self.arena, &self.probe_keys, &probe)?;
+                self.record_search_ns(search_start);
+                let stats =
+                    crate::exec::operators::hashjoin::join_hash_map::search::SearchStats::from_group_ids(
+                        &group_ids,
+                    );
+                self.lookup_hit_rows = self.lookup_hit_rows.saturating_add(stats.lookup_hit_rows);
+                self.lookup_miss_rows =
+                    self.lookup_miss_rows.saturating_add(stats.lookup_miss_rows);
+                if selection.is_empty() {
+                    continue;
+                }
+                if let Some(pred) = self.residual_predicate {
+                    self.compact_selection_by_residual(&probe, &build_chunk, &mut selection, pred)?;
+                }
+                if selection.is_empty() {
+                    continue;
+                }
+                let output_start = std::time::Instant::now();
+                let batches =
+                    crate::exec::operators::hashjoin::join_hash_map::gather::gather_join_batches(
+                        &probe,
+                        &build_chunk,
+                        &selection.probe,
+                        &selection.build,
+                        &output_schema,
+                    )?;
+                self.record_output_ns(output_start);
                 output_batches.extend(batches);
             }
         }
 
-        if let Some(pred) = self.residual_predicate {
+        if !residual_applied_during_selection && let Some(pred) = self.residual_predicate {
             let mut filtered = Vec::with_capacity(output_batches.len());
             for batch in output_batches.into_iter() {
                 if batch.num_rows() == 0 {
