@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::cost::{CostInput, CostOptions, compute_cost_from_input};
+use super::cost::{CostInput, CostOptions, compute_cost_estimate};
 use super::derive::PropertyAlternativeKind;
 use super::memo::{GroupId, Memo, TotalCost};
 use super::operator::*;
@@ -85,8 +85,8 @@ impl Winner {
         } else {
             0.0
         };
-        // Compatibility bridge for pre-dimensional search: keep the legacy
-        // scalar winner total until Task 4 can accumulate CostEstimate directly.
+        // Compatibility bridge for legacy fixtures that still construct
+        // winners from a scalar total.
         Self {
             group_id,
             expr_index,
@@ -197,6 +197,7 @@ impl SearchContext {
         }
 
         let mut best_cost = f64::INFINITY;
+        let mut best_cost_estimate = CostEstimate::default();
         let mut best_index: usize = 0;
         let mut best_enforcer: Option<EnforcerInfo> = None;
         let mut best_output = PhysicalPropertySet::any();
@@ -267,7 +268,7 @@ impl SearchContext {
 
                 let mut child_outputs: Vec<PhysicalPropertySet> =
                     Vec::with_capacity(expr.children.len());
-                let mut child_cost_total = 0.0;
+                let mut child_cost_estimate = CostEstimate::default();
                 let mut feasible = true;
                 for (i, &cg) in expr.children.iter().enumerate() {
                     let child_cost = self.optimize_group(memo, cg, &child_reqs[i])?;
@@ -275,11 +276,11 @@ impl SearchContext {
                         feasible = false;
                         break;
                     }
-                    child_cost_total += child_cost;
                     let cw = self
                         .winners
                         .get(&(cg, child_reqs[i].clone()))
                         .expect("child just optimized; winner must be in cache");
+                    child_cost_estimate = child_cost_estimate.add_sanitized(&cw.cost_estimate);
                     child_outputs.push(cw.output.clone());
                 }
                 if !feasible {
@@ -297,8 +298,8 @@ impl SearchContext {
                     scalars: Some(&memo.scalars),
                     options: &self.cost_options,
                 };
-                let own_cost = compute_cost_from_input(&cost_input);
-                let total = own_cost + child_cost_total;
+                let operator_estimate = compute_cost_estimate(&cost_input).sanitized();
+                let mut candidate_estimate = child_cost_estimate.add_sanitized(&operator_estimate);
                 let provided = super::derive::derive_output_for_alternative(
                     &expr.op,
                     &memo.scalars,
@@ -307,9 +308,8 @@ impl SearchContext {
                 );
 
                 // Bridge provided → required via enforcer if needed.
-                let (actual_output, enforcer_info, candidate_cost) = if provided.satisfies(required)
-                {
-                    (provided, None, total)
+                let (actual_output, enforcer_info) = if provided.satisfies(required) {
+                    (provided, None)
                 } else {
                     let enforcers = super::derive::needed_enforcers(required, &provided);
                     if enforcers.is_empty() {
@@ -317,17 +317,15 @@ impl SearchContext {
                     }
                     let group_stats =
                         stats_for_group(&memo.groups[group_id], memo, &self.stats_input);
-                    let enforcer_cost: TotalCost = enforcers
-                        .iter()
-                        .map(|e| {
-                            super::derive::estimate_enforcer_cost_estimate(
-                                e,
-                                &group_stats,
-                                &self.cost_options,
-                            )
-                            .total_with_options(&self.cost_options)
-                        })
-                        .sum();
+                    for enforcer in &enforcers {
+                        let enforcer_estimate = super::derive::estimate_enforcer_cost_estimate(
+                            enforcer,
+                            &group_stats,
+                            &self.cost_options,
+                        )
+                        .sanitized();
+                        candidate_estimate = candidate_estimate.add_sanitized(&enforcer_estimate);
+                    }
                     let kind = enforcers.into_iter().next().unwrap();
                     (
                         required.clone(),
@@ -335,12 +333,13 @@ impl SearchContext {
                             kind,
                             child_props: provided,
                         }),
-                        total + enforcer_cost,
                     )
                 };
+                let candidate_cost = candidate_estimate.total_with_options(&self.cost_options);
 
                 if candidate_cost < best_cost {
                     best_cost = candidate_cost;
+                    best_cost_estimate = candidate_estimate;
                     best_index = expr_idx;
                     best_enforcer = enforcer_info;
                     best_output = actual_output;
@@ -359,10 +358,10 @@ impl SearchContext {
         let winner = if best_cost.is_infinite() {
             Winner::infeasible(group_id)
         } else {
-            Winner::from_legacy_total(
+            Winner::new(
                 group_id,
                 best_index,
-                best_cost,
+                best_cost_estimate,
                 &self.cost_options,
                 best_enforcer,
                 best_output,
@@ -860,6 +859,72 @@ mod tests {
             .unwrap();
         // Scan provides Any, Gather requires Gather -> needs enforcer.
         assert!(winner.enforcer.is_some());
+    }
+
+    #[test]
+    fn search_records_cumulative_cost_estimate_for_scan_with_gather_enforcer() {
+        let (memo, gid) = single_scan_memo();
+        let mut ctx = SearchContext::new_for_test(legacy_stats_input(make_table_stats()));
+        let required = PhysicalPropertySet::gather();
+
+        ctx.optimize_group(&memo, gid, &required).expect("search");
+
+        let winner = ctx.winners.get(&(gid, required.clone())).expect("winner");
+        let expr = memo.groups[gid]
+            .physical_exprs
+            .get(winner.expr_index)
+            .expect("winner expression");
+        let own_stats = stats_for_group(&memo.groups[gid], &memo, &ctx.stats_input);
+        let child_outputs: Vec<&PhysicalPropertySet> = Vec::new();
+        let child_stats: Vec<&crate::sql::optimizer::statistics::Statistics> = Vec::new();
+        let scan_input = CostInput {
+            op: &expr.op,
+            own_stats: &own_stats,
+            child_stats: &child_stats,
+            child_outputs: &child_outputs,
+            required_output: &required,
+            alt_kind: &winner.alt_kind,
+            scalars: Some(&memo.scalars),
+            options: &ctx.cost_options,
+        };
+        let scan_estimate = super::super::cost::compute_cost_estimate(&scan_input).sanitized();
+        let enforcer = winner
+            .enforcer
+            .as_ref()
+            .expect("gather requirement should require distribution enforcer");
+        let enforcer_estimate = super::super::derive::estimate_enforcer_cost_estimate(
+            &enforcer.kind,
+            &own_stats,
+            &ctx.cost_options,
+        )
+        .sanitized();
+        let expected = scan_estimate.add_sanitized(&enforcer_estimate);
+
+        assert_eq!(winner.cost_estimate.cpu_cost, expected.cpu_cost);
+        assert_eq!(winner.cost_estimate.memory_cost, expected.memory_cost);
+        assert_eq!(winner.cost_estimate.network_cost, expected.network_cost);
+        assert!(winner.cost_estimate.network_cost > 0.0);
+        assert_eq!(
+            winner.total_cost,
+            winner.cost_estimate.total_with_options(&ctx.cost_options)
+        );
+    }
+
+    #[test]
+    fn search_returned_total_matches_winner_flattened_cost_for_finite_scan_path() {
+        let (memo, gid) = single_scan_memo();
+        let mut ctx = SearchContext::new_for_test(legacy_stats_input(make_table_stats()));
+        let required = PhysicalPropertySet::any();
+
+        let returned_total = ctx.optimize_group(&memo, gid, &required).expect("search");
+
+        let winner = ctx.winners.get(&(gid, required)).expect("winner");
+        assert!(returned_total.is_finite());
+        assert_eq!(returned_total, winner.total_cost);
+        assert_eq!(
+            winner.total_cost,
+            winner.cost_estimate.total_with_options(&ctx.cost_options)
+        );
     }
 
     #[test]
