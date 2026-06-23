@@ -68,6 +68,38 @@ impl Winner {
         }
     }
 
+    pub(crate) fn from_legacy_total(
+        group_id: GroupId,
+        expr_index: usize,
+        total_cost: TotalCost,
+        cost_options: &CostOptions,
+        enforcer: Option<EnforcerInfo>,
+        output: PhysicalPropertySet,
+        alt_kind: PropertyAlternativeKind,
+        child_props: Vec<PhysicalPropertySet>,
+        child_outputs: Vec<PhysicalPropertySet>,
+    ) -> Self {
+        let cost_estimate = cost_estimate_for_total(total_cost, cost_options);
+        let total_cost = if total_cost.is_finite() && total_cost > 0.0 {
+            total_cost
+        } else {
+            0.0
+        };
+        // Compatibility bridge for pre-dimensional search: keep the legacy
+        // scalar winner total until Task 4 can accumulate CostEstimate directly.
+        Self {
+            group_id,
+            expr_index,
+            cost_estimate,
+            total_cost,
+            enforcer,
+            output,
+            alt_kind,
+            child_props,
+            child_outputs,
+        }
+    }
+
     pub(crate) fn infeasible(group_id: GroupId) -> Self {
         Self {
             group_id,
@@ -327,10 +359,10 @@ impl SearchContext {
         let winner = if best_cost.is_infinite() {
             Winner::infeasible(group_id)
         } else {
-            Winner::new(
+            Winner::from_legacy_total(
                 group_id,
                 best_index,
-                cost_estimate_for_total(best_cost, &self.cost_options),
+                best_cost,
                 &self.cost_options,
                 best_enforcer,
                 best_output,
@@ -350,12 +382,12 @@ pub(crate) fn cost_estimate_for_total(
     cost_options: &CostOptions,
 ) -> CostEstimate {
     debug_assert!(total_cost.is_finite());
-    let total_cost = if total_cost.is_finite() && total_cost > 0.0 {
-        total_cost.min(MAX_FINITE_COST)
+    let requested_total = if total_cost.is_finite() && total_cost > 0.0 {
+        total_cost
     } else {
         0.0
     };
-    if total_cost == 0.0 {
+    if requested_total == 0.0 {
         return CostEstimate::default();
     }
 
@@ -376,7 +408,7 @@ pub(crate) fn cost_estimate_for_total(
                 continue;
             }
 
-            let dimension_cost = total_cost / weight;
+            let dimension_cost = requested_total / weight;
             if !dimension_cost.is_finite()
                 || dimension_cost < 0.0
                 || dimension_cost > MAX_FINITE_COST
@@ -404,8 +436,8 @@ pub(crate) fn cost_estimate_for_total(
             };
 
             let weighted_total = estimate.total_with_options(cost_options);
-            let delta = (weighted_total - total_cost).abs();
-            let tolerance = total_cost.abs().max(1.0) * 1.0e-12;
+            let delta = (weighted_total - requested_total).abs();
+            let tolerance = requested_total.abs().max(1.0) * 1.0e-12;
             if delta <= tolerance {
                 return estimate;
             }
@@ -418,7 +450,11 @@ pub(crate) fn cost_estimate_for_total(
 
     closest_estimate
         .map(|(estimate, _)| estimate)
-        .unwrap_or_default()
+        .unwrap_or_else(|| CostEstimate {
+            cpu_cost: MAX_FINITE_COST,
+            memory_cost: 0.0,
+            network_cost: 0.0,
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -990,6 +1026,35 @@ mod tests {
             winner.total_cost,
             best_cost
         );
+    }
+
+    #[test]
+    fn legacy_winner_preserves_total_above_dimension_cap() {
+        let options = CostOptions::default();
+        let total_cost = 1.6e300;
+
+        let winner = Winner::from_legacy_total(
+            7,
+            3,
+            total_cost,
+            &options,
+            None,
+            PhysicalPropertySet::gather(),
+            PropertyAlternativeKind::Default,
+            vec![PhysicalPropertySet::any()],
+            vec![PhysicalPropertySet::any()],
+        );
+
+        let tolerance = total_cost * 1.0e-12;
+        assert!(
+            (winner.total_cost - total_cost).abs() <= tolerance,
+            "legacy winner total {} should preserve scalar total {}",
+            winner.total_cost,
+            total_cost
+        );
+        assert!(winner.cost_estimate.cpu_cost.is_finite());
+        assert!(winner.cost_estimate.memory_cost.is_finite());
+        assert!(winner.cost_estimate.network_cost.is_finite());
     }
 
     #[test]

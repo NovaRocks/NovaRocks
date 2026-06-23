@@ -214,7 +214,7 @@ mod tests {
         ScanOp, ValuesOp,
     };
     use crate::sql::optimizer::property::DistributionSpec;
-    use crate::sql::optimizer::search::{EnforcerInfo, Winner, cost_estimate_for_total};
+    use crate::sql::optimizer::search::{EnforcerInfo, Winner};
     use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
 
     fn test_col(id: u32) -> TypedExpr {
@@ -263,10 +263,10 @@ mod tests {
         child_outputs: Vec<PhysicalPropertySet>,
     ) -> Winner {
         let cost_options = CostOptions::default();
-        Winner::new(
+        Winner::from_legacy_total(
             group_id,
             expr_index,
-            cost_estimate_for_total(total_cost, &cost_options),
+            total_cost,
             &cost_options,
             enforcer,
             output,
