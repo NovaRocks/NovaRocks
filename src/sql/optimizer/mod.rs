@@ -273,7 +273,7 @@ fn optimize_with_root_property(
     check_deadline(deadline)?;
 
     // 10. Top-down search with property enforcement.
-    let mut ctx = search::SearchContext::new(stats_input.clone());
+    let mut ctx = search::SearchContext::new(stats_input.clone(), options.cost_options.clone());
     ctx.optimize_group(&memo, root_group, &root_required)?;
 
     check_deadline(deadline)?;

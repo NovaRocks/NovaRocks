@@ -60,6 +60,7 @@ pub(crate) struct SearchContext {
     /// (GroupId, PhysicalPropertySet) -> Winner
     pub(crate) winners: HashMap<(GroupId, PhysicalPropertySet), Winner>,
     pub(crate) stats_input: OptimizerStatsInput,
+    pub(crate) cost_options: CostOptions,
     /// Set of (GroupId, PhysicalPropertySet) pairs currently being computed.
     /// Used to break mutual enforcer cycles: when group A's enforcer path
     /// recurses back into the same (group, props) that is already on the
@@ -68,12 +69,18 @@ pub(crate) struct SearchContext {
 }
 
 impl SearchContext {
-    pub(crate) fn new(stats_input: OptimizerStatsInput) -> Self {
+    pub(crate) fn new(stats_input: OptimizerStatsInput, cost_options: CostOptions) -> Self {
         Self {
             winners: HashMap::new(),
             stats_input,
+            cost_options,
             in_progress: HashSet::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(stats_input: OptimizerStatsInput) -> Self {
+        Self::new(stats_input, CostOptions::default())
     }
 
     /// Top-down cost-based search for the cheapest plan in `group_id` that
@@ -167,7 +174,7 @@ impl SearchContext {
                             && !super::cost::broadcast_gate_passes(
                                 &probe_stats,
                                 &build_stats,
-                                &CostOptions::default(),
+                                &self.cost_options,
                             )
                         {
                             continue;
@@ -204,7 +211,6 @@ impl SearchContext {
                 }
 
                 let child_output_refs: Vec<&PhysicalPropertySet> = child_outputs.iter().collect();
-                let options = CostOptions::default();
                 let cost_input = CostInput {
                     op: &expr.op,
                     own_stats: &own_stats,
@@ -213,7 +219,7 @@ impl SearchContext {
                     required_output: required,
                     alt_kind: &alt.kind,
                     scalars: Some(&memo.scalars),
-                    options: &options,
+                    options: &self.cost_options,
                 };
                 let own_cost = compute_cost_from_input(&cost_input);
                 let total = own_cost + child_cost_total;
@@ -241,9 +247,9 @@ impl SearchContext {
                             super::derive::estimate_enforcer_cost_estimate(
                                 e,
                                 &group_stats,
-                                &options,
+                                &self.cost_options,
                             )
-                            .total_with_options(&options)
+                            .total_with_options(&self.cost_options)
                         })
                         .sum();
                     let kind = enforcers.into_iter().next().unwrap();
@@ -670,7 +676,7 @@ mod tests {
     #[test]
     fn scan_satisfies_any() {
         let (memo, gid) = single_scan_memo();
-        let mut ctx = SearchContext::new(legacy_stats_input(make_table_stats()));
+        let mut ctx = SearchContext::new_for_test(legacy_stats_input(make_table_stats()));
         let cost = ctx
             .optimize_group(&memo, gid, &PhysicalPropertySet::any())
             .unwrap();
@@ -681,7 +687,7 @@ mod tests {
     #[test]
     fn scan_with_gather_uses_enforcer() {
         let (memo, gid) = single_scan_memo();
-        let mut ctx = SearchContext::new(legacy_stats_input(make_table_stats()));
+        let mut ctx = SearchContext::new_for_test(legacy_stats_input(make_table_stats()));
         let cost = ctx
             .optimize_group(&memo, gid, &PhysicalPropertySet::gather())
             .unwrap();
@@ -725,7 +731,7 @@ mod tests {
         };
         let gid = memo.new_group(expr);
 
-        let mut ctx = SearchContext::new(legacy_stats_input(make_table_stats()));
+        let mut ctx = SearchContext::new_for_test(legacy_stats_input(make_table_stats()));
         let cost = ctx
             .optimize_group(&memo, gid, &PhysicalPropertySet::any())
             .unwrap();
@@ -735,7 +741,7 @@ mod tests {
     #[test]
     fn winner_cache_prevents_recomputation() {
         let (memo, gid) = single_scan_memo();
-        let mut ctx = SearchContext::new(legacy_stats_input(make_table_stats()));
+        let mut ctx = SearchContext::new_for_test(legacy_stats_input(make_table_stats()));
         let cost1 = ctx
             .optimize_group(&memo, gid, &PhysicalPropertySet::any())
             .unwrap();
@@ -748,7 +754,7 @@ mod tests {
     #[test]
     fn winner_records_hash_join_alternative_and_child_properties() {
         let (mut memo, root) = make_two_table_inner_join_memo_for_test();
-        let mut ctx = SearchContext::new(empty_stats_input());
+        let mut ctx = SearchContext::new_for_test(empty_stats_input());
         let required = PhysicalPropertySet::gather();
         ctx.optimize_group(&memo, root, &required).expect("search");
 
@@ -804,7 +810,7 @@ mod tests {
     #[test]
     fn unknown_hash_join_search_extracts_concrete_distribution() {
         let (mut memo, root) = make_two_table_inner_join_memo_for_test();
-        let mut ctx = SearchContext::new(empty_stats_input());
+        let mut ctx = SearchContext::new_for_test(empty_stats_input());
         let required = PhysicalPropertySet::gather();
         ctx.optimize_group(&memo, root, &required).expect("search");
         let plan =
@@ -831,7 +837,7 @@ mod tests {
     #[test]
     fn malformed_unknown_hash_join_is_infeasible_without_panic() {
         let (memo, root) = make_malformed_unknown_hash_join_memo_for_test();
-        let mut ctx = SearchContext::new(empty_stats_input());
+        let mut ctx = SearchContext::new_for_test(empty_stats_input());
         let required = PhysicalPropertySet::gather();
 
         let cost = ctx
@@ -853,7 +859,7 @@ mod tests {
             500_001.0,
             crate::sql::optimizer::statistics::Confidence::Fallback,
         );
-        let mut ctx = SearchContext::new(legacy_stats_input(table_stats));
+        let mut ctx = SearchContext::new_for_test(legacy_stats_input(table_stats));
         let required = PhysicalPropertySet::gather();
 
         ctx.optimize_group(&memo, root, &required).expect("search");
@@ -875,7 +881,7 @@ mod tests {
             648_000.0,
             crate::sql::optimizer::statistics::Confidence::Exact,
         );
-        let mut ctx = SearchContext::new(legacy_stats_input(table_stats));
+        let mut ctx = SearchContext::new_for_test(legacy_stats_input(table_stats));
         let required = PhysicalPropertySet::gather();
 
         ctx.optimize_group(&memo, root, &required).expect("search");
@@ -894,7 +900,7 @@ mod tests {
             648_000.0,
             crate::sql::optimizer::statistics::Confidence::Estimated,
         );
-        let mut ctx = SearchContext::new(legacy_stats_input(table_stats));
+        let mut ctx = SearchContext::new_for_test(legacy_stats_input(table_stats));
         let required = PhysicalPropertySet::gather();
 
         ctx.optimize_group(&memo, root, &required).expect("search");
@@ -909,7 +915,7 @@ mod tests {
     #[test]
     fn search_allows_broadcast_when_expression_key_has_no_shuffle_fallback() {
         let (memo, root) = make_expression_key_large_estimated_build_join_memo_for_test();
-        let mut ctx = SearchContext::new(empty_stats_input());
+        let mut ctx = SearchContext::new_for_test(empty_stats_input());
         let required = PhysicalPropertySet::gather();
 
         let cost = ctx.optimize_group(&memo, root, &required).expect("search");
@@ -928,7 +934,7 @@ mod tests {
     #[test]
     fn search_reuses_child_shuffle_output_without_top_hash_enforcer() {
         let (memo, root, left, right) = make_join_over_prepartitioned_children_for_test();
-        let mut ctx = SearchContext::new(empty_stats_input());
+        let mut ctx = SearchContext::new_for_test(empty_stats_input());
         let required = PhysicalPropertySet {
             distribution: DistributionSpec::shuffle_join([ColumnId(10), ColumnId(20)]),
             ordering: OrderingSpec::Any,
@@ -1145,7 +1151,7 @@ mod cascaded_derivation_tests {
     #[test]
     fn winner_records_actual_output_for_scan() {
         let (memo, gid) = super::tests::single_scan_memo();
-        let mut ctx = SearchContext::new(super::tests::legacy_stats_input(
+        let mut ctx = SearchContext::new_for_test(super::tests::legacy_stats_input(
             super::tests::make_table_stats(),
         ));
         ctx.optimize_group(&memo, gid, &PhysicalPropertySet::any())
@@ -1157,8 +1163,9 @@ mod cascaded_derivation_tests {
     #[test]
     fn cascaded_output_through_broadcast_join_repartitions_after_join() {
         let (memo, root, g_bj) = memo_window_over_broadcast_join();
-        let mut ctx =
-            SearchContext::new(super::tests::legacy_stats_input(table_stats_for_cascaded()));
+        let mut ctx = SearchContext::new_for_test(super::tests::legacy_stats_input(
+            table_stats_for_cascaded(),
+        ));
         let cost = ctx
             .optimize_group(&memo, root, &PhysicalPropertySet::any())
             .unwrap();

@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::sql::optimizer::cascades_rules::multi_join_reorder::ReorderOptions;
+use crate::sql::optimizer::cost::CostOptions;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct SessionOptimizerSettings {
@@ -118,6 +119,8 @@ pub(crate) struct OptimizerOptions {
     /// match StarRocks; overridable via the `cbo_enable_dp/greedy_join_reorder`
     /// and `cbo_max_reorder_node*` session variables.
     pub reorder: ReorderOptions,
+    /// Physical operator cost-model options. Currently not session-overridable.
+    pub cost_options: CostOptions,
 }
 
 impl OptimizerOptions {
@@ -134,6 +137,7 @@ impl OptimizerOptions {
             rf_max_count: 1024,
             allow_cross_exchange_rf: true,
             reorder: ReorderOptions::default(),
+            cost_options: CostOptions::default(),
         }
     }
 
@@ -272,6 +276,25 @@ mod tests {
     #[test]
     fn runtime_filter_max_count_default_is_stable() {
         assert_eq!(OptimizerOptions::default_settings().rf_max_count, 1024);
+    }
+
+    #[test]
+    fn default_settings_carry_cost_options() {
+        let opts = OptimizerOptions::default_settings();
+        let default_cost_options = crate::sql::optimizer::cost::CostOptions::default();
+
+        assert_eq!(
+            opts.cost_options.cpu_weight,
+            default_cost_options.cpu_weight
+        );
+        assert_eq!(
+            opts.cost_options.memory_weight,
+            default_cost_options.memory_weight
+        );
+        assert_eq!(
+            opts.cost_options.network_weight,
+            default_cost_options.network_weight
+        );
     }
 
     #[test]
