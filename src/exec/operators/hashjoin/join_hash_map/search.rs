@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+//! Selection-vector and probe-mask primitives for hash join search.
 
 use arrow::array::{Array, BooleanArray};
 

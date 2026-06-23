@@ -14,6 +14,9 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+//! Hash join map module exports for M1.
+//!
+//! Provides the initial three-layer primitives used by the hash join map refactor.
 
 pub(crate) mod match_flags;
 pub(crate) mod search;
