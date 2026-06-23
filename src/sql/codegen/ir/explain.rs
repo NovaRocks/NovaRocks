@@ -863,16 +863,19 @@ fn actual_suffix(
 ) -> String {
     match actuals.and_then(|actuals| actuals.get(&node.node_id)) {
         Some(metrics) => {
+            let total_time_ns = metrics.total_time_ns.max(0);
+            let total_time_max_ns = metrics.total_time_max_ns.max(0);
+            let total_time_min_ns = metrics.total_time_min_ns.max(0);
             let mut s = format!(
                 " act={{rows={} time={}",
                 metrics.output_rows,
-                fmt_time_ns(metrics.total_time_ns)
+                fmt_time_ns(total_time_ns)
             );
-            if metrics.total_time_max_ns > 0 {
+            if total_time_max_ns > 0 {
                 s.push_str(&format!(
                     " (max={} min={})",
-                    fmt_time_ns(metrics.total_time_max_ns),
-                    fmt_time_ns(metrics.total_time_min_ns)
+                    fmt_time_ns(total_time_max_ns),
+                    fmt_time_ns(total_time_min_ns)
                 ));
             }
             if metrics.build_ht_ns > 0 {
@@ -1646,6 +1649,36 @@ mod tests {
         assert!(
             !text.contains("build_ht="),
             "zero build hash-table timer must not render:\n{text}"
+        );
+    }
+
+    #[test]
+    fn actual_suffix_clamps_negative_min_time() {
+        let dp = build_distributed_plan(&aggregate_count_plan(project_plan(scan_plan())))
+            .expect("build DistributedPlan");
+        let mut actuals = HashMap::new();
+        actuals.insert(
+            1,
+            ActualMetrics {
+                output_rows: 1,
+                total_time_ns: 10_000,
+                peak_mem_bytes: 0,
+                total_time_max_ns: 20_000,
+                total_time_min_ns: -5_000,
+                ..ActualMetrics::default()
+            },
+        );
+
+        let text =
+            explain_distributed_plan_analyze(&dp, ExplainLevel::Analyze, &actuals).join("\n");
+
+        assert!(
+            text.contains("min=0ns"),
+            "negative min time must clamp to zero when rendered:\n{text}"
+        );
+        assert!(
+            !text.contains("min=-"),
+            "negative min time must not be rendered:\n{text}"
         );
     }
 

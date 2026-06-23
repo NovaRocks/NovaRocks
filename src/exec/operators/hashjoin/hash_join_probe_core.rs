@@ -973,7 +973,11 @@ impl HashJoinProbeCore {
                 let probe_batch = if batches.len() == 1 {
                     batches.into_iter().next().expect("one batch")
                 } else {
-                    concat_compatible_batches(&output_schema, &batches, "anti join concat")?
+                    let output_start = std::time::Instant::now();
+                    let batch =
+                        concat_compatible_batches(&output_schema, &batches, "anti join concat")?;
+                    self.record_output_ns(output_start);
+                    batch
                 };
                 return Ok(Some(self.extend_with_null_build_columns(probe_batch)?));
             }
@@ -990,7 +994,11 @@ impl HashJoinProbeCore {
                 let probe_batch = if batches.len() == 1 {
                     batches.into_iter().next().expect("one batch")
                 } else {
-                    concat_compatible_batches(&output_schema, &batches, "anti join concat")?
+                    let output_start = std::time::Instant::now();
+                    let batch =
+                        concat_compatible_batches(&output_schema, &batches, "anti join concat")?;
+                    self.record_output_ns(output_start);
+                    batch
                 };
                 return Ok(Some(self.extend_with_null_build_columns(probe_batch)?));
             }
@@ -1067,9 +1075,11 @@ impl HashJoinProbeCore {
                     .collect::<Vec<bool>>()
             };
 
+            let output_start = std::time::Instant::now();
             let mask = BooleanArray::from(keep);
             let filtered_batch = filter_record_batch(&probe.batch, &mask)
                 .map_err(|e| format!("semi/anti filter failed: {e}"))?;
+            self.record_output_ns(output_start);
             if filtered_batch.num_rows() > 0 {
                 output_batches.push(filtered_batch);
             }
@@ -1083,7 +1093,14 @@ impl HashJoinProbeCore {
         let probe_batch = if output_batches.len() == 1 {
             output_batches.remove(0)
         } else {
-            concat_compatible_batches(&output_schema, &output_batches, "semi anti join concat")?
+            let output_start = std::time::Instant::now();
+            let batch = concat_compatible_batches(
+                &output_schema,
+                &output_batches,
+                "semi anti join concat",
+            )?;
+            self.record_output_ns(output_start);
+            batch
         };
         Ok(Some(self.extend_with_null_build_columns(probe_batch)?))
     }
@@ -1106,7 +1123,14 @@ impl HashJoinProbeCore {
             let probe_batch = if batches.len() == 1 {
                 batches.into_iter().next().expect("one batch")
             } else {
-                concat_compatible_batches(&output_schema, &batches, "null aware anti join concat")?
+                let output_start = std::time::Instant::now();
+                let batch = concat_compatible_batches(
+                    &output_schema,
+                    &batches,
+                    "null aware anti join concat",
+                )?;
+                self.record_output_ns(output_start);
+                batch
             };
             return Ok(Some(self.extend_with_null_build_columns(probe_batch)?));
         }
@@ -1246,9 +1270,11 @@ impl HashJoinProbeCore {
                 }
             }
 
+            let output_start = std::time::Instant::now();
             let mask = BooleanArray::from(keep);
             let filtered_batch = filter_record_batch(&probe.batch, &mask)
                 .map_err(|e| format!("null-aware anti filter failed: {e}"))?;
+            self.record_output_ns(output_start);
             if filtered_batch.num_rows() > 0 {
                 output_batches.push(filtered_batch);
             }
@@ -1262,11 +1288,14 @@ impl HashJoinProbeCore {
         let probe_batch = if output_batches.len() == 1 {
             output_batches.remove(0)
         } else {
-            concat_compatible_batches(
+            let output_start = std::time::Instant::now();
+            let batch = concat_compatible_batches(
                 &output_schema,
                 &output_batches,
                 "null aware anti join output concat",
-            )?
+            )?;
+            self.record_output_ns(output_start);
+            batch
         };
         Ok(Some(self.extend_with_null_build_columns(probe_batch)?))
     }

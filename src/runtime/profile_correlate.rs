@@ -200,19 +200,35 @@ fn merge_actual_metrics(
     node_id: i32,
     metrics: ActualMetrics,
 ) {
+    let metrics = sanitize_operator_total_time(metrics);
     let entry = actuals.entry(node_id).or_default();
     entry.output_rows = entry.output_rows.saturating_add(metrics.output_rows);
-    entry.total_time_ns = entry.total_time_ns.max(metrics.total_time_ns);
     entry.peak_mem_bytes = entry.peak_mem_bytes.saturating_add(metrics.peak_mem_bytes);
+    match metrics.total_time_ns.cmp(&entry.total_time_ns) {
+        std::cmp::Ordering::Greater => {
+            entry.total_time_ns = metrics.total_time_ns;
+            entry.total_time_min_ns = metrics.total_time_min_ns;
+        }
+        std::cmp::Ordering::Equal => {
+            entry.total_time_min_ns = match (entry.total_time_min_ns, metrics.total_time_min_ns) {
+                (0, incoming) => incoming,
+                (current, 0) => current,
+                (current, incoming) => current.min(incoming),
+            };
+        }
+        std::cmp::Ordering::Less => {}
+    }
     entry.total_time_max_ns = entry.total_time_max_ns.max(metrics.total_time_max_ns);
-    entry.total_time_min_ns = match (entry.total_time_min_ns, metrics.total_time_min_ns) {
-        (0, incoming) => incoming,
-        (current, 0) => current,
-        (current, incoming) => current.min(incoming),
-    };
     entry.build_ht_ns = entry.build_ht_ns.max(metrics.build_ht_ns);
     entry.search_ns = entry.search_ns.max(metrics.search_ns);
     entry.output_ns = entry.output_ns.max(metrics.output_ns);
+}
+
+fn sanitize_operator_total_time(mut metrics: ActualMetrics) -> ActualMetrics {
+    metrics.total_time_ns = metrics.total_time_ns.max(0);
+    metrics.total_time_min_ns = metrics.total_time_min_ns.max(0);
+    metrics.total_time_max_ns = metrics.total_time_max_ns.max(0);
+    metrics
 }
 
 fn counter(common: &Profiler, name: &str) -> i64 {
@@ -282,7 +298,7 @@ mod tests {
     use super::{
         ActualMetrics, collect_actuals_by_plan_node_id,
         collect_actuals_by_plan_node_id_from_profile_trees, collect_actuals_by_plan_node_id_multi,
-        collect_distributed_profile_summary_from_profile_trees,
+        collect_distributed_profile_summary_from_profile_trees, merge_actual_metrics,
     };
     use crate::metrics;
     use crate::runtime::profile::Profiler;
@@ -551,5 +567,70 @@ mod tests {
         assert_eq!(m.search_ns, 20_000);
         assert_eq!(m.output_ns, 15_000);
         assert_eq!(m.build_ht_ns, 0);
+    }
+
+    #[test]
+    fn collects_actuals_clamps_negative_operator_total_time() {
+        let profiler = Profiler::new("Fragment");
+        let op = profiler.child("SCAN (plan_node_id=2)");
+        let common = op.child("CommonMetrics");
+        let total = common.add_timer("OperatorTotalTime");
+        total.set(-10_000);
+        total.set_min(-5_000);
+        total.set_max(-1_000);
+
+        let tree = profiler.to_thrift_tree();
+        let actuals = collect_actuals_by_plan_node_id_from_profile_trees(&[tree]);
+        let m = actuals.get(&2).expect("node 2 metrics");
+        assert_eq!(m.total_time_ns, 0);
+        assert_eq!(m.total_time_min_ns, 0);
+        assert_eq!(m.total_time_max_ns, 0);
+    }
+
+    #[test]
+    fn merge_actual_metrics_keeps_min_from_winning_total_time_source() {
+        let mut actuals = std::collections::HashMap::new();
+        merge_actual_metrics(
+            &mut actuals,
+            9,
+            ActualMetrics {
+                output_rows: 100,
+                total_time_ns: 100,
+                peak_mem_bytes: 64,
+                total_time_max_ns: 100,
+                total_time_min_ns: 80,
+                build_ht_ns: 20,
+                search_ns: 30,
+                output_ns: 40,
+            },
+        );
+        merge_actual_metrics(
+            &mut actuals,
+            9,
+            ActualMetrics {
+                output_rows: 3,
+                total_time_ns: 10,
+                peak_mem_bytes: 8,
+                total_time_max_ns: 120,
+                total_time_min_ns: 1,
+                build_ht_ns: 25,
+                search_ns: 10,
+                output_ns: 45,
+            },
+        );
+
+        assert_eq!(
+            actuals.get(&9).copied(),
+            Some(ActualMetrics {
+                output_rows: 103,
+                total_time_ns: 100,
+                peak_mem_bytes: 72,
+                total_time_max_ns: 120,
+                total_time_min_ns: 80,
+                build_ht_ns: 25,
+                search_ns: 30,
+                output_ns: 45,
+            })
+        );
     }
 }
