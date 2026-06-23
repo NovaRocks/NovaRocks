@@ -1092,7 +1092,7 @@ impl HashJoinProbeCore {
                 self.lookup_miss_rows =
                     self.lookup_miss_rows.saturating_add(stats.lookup_miss_rows);
 
-                if let Some(pred) = self.residual_predicate
+                let residual_matched_rows_before = if let Some(pred) = self.residual_predicate
                     && !selection.is_empty()
                 {
                     let build_chunk = self
@@ -1105,8 +1105,12 @@ impl HashJoinProbeCore {
                     self.residual_group_rows_total = self
                         .residual_group_rows_total
                         .saturating_add(selection.len() as u64);
+                    let residual_matched_rows_before = self.residual_matched_rows;
                     self.compact_selection_by_residual(&probe, &build_chunk, &mut selection, pred)?;
-                }
+                    Some(residual_matched_rows_before)
+                } else {
+                    None
+                };
 
                 let mut matched = vec![false; probe.len()];
                 for probe_row in selection.probe.iter() {
@@ -1119,6 +1123,11 @@ impl HashJoinProbeCore {
                         ));
                     }
                     matched[slot] = true;
+                }
+                if let Some(residual_matched_rows_before) = residual_matched_rows_before {
+                    let matched_probe_rows = matched.iter().filter(|matched| **matched).count();
+                    self.residual_matched_rows =
+                        residual_matched_rows_before.saturating_add(matched_probe_rows as u64);
                 }
 
                 let keep = matched
