@@ -371,6 +371,40 @@ struct HdfsSlotInfo {
     field_id: Option<i32>,
 }
 
+fn build_hdfs_slot_info_map(
+    slot_descs: &[descriptors::TSlotDescriptor],
+    tuple_id: types::TTupleId,
+) -> Result<HashMap<SlotId, HdfsSlotInfo>, String> {
+    let mut slot_info_map: HashMap<SlotId, HdfsSlotInfo> = HashMap::new();
+    for s in slot_descs {
+        let (Some(parent), Some(id), Some(slot_type)) = (s.parent, s.id, s.slot_type.as_ref())
+        else {
+            continue;
+        };
+        if parent != tuple_id {
+            continue;
+        }
+        let name = crate::lower::layout::slot_display_name_from_desc(s);
+        let primitive =
+            primitive_type_from_desc(slot_type).unwrap_or(types::TPrimitiveType::INVALID_TYPE);
+        let arrow_type = crate::lower::type_lowering::arrow_type_from_desc(slot_type)
+            .ok_or_else(|| format!("unsupported slot_type for slot_id={id}"))?;
+        let nullable = s.is_nullable.unwrap_or(true);
+        let field_id = s.col_unique_id.filter(|v| *v > 0);
+        slot_info_map.insert(
+            SlotId::try_from(id)?,
+            HdfsSlotInfo {
+                name,
+                primitive,
+                arrow_type,
+                nullable,
+                field_id,
+            },
+        );
+    }
+    Ok(slot_info_map)
+}
+
 #[derive(Clone, Debug, Default)]
 struct HdfsScanReadColumns {
     columns: Vec<String>,
@@ -776,33 +810,7 @@ pub(crate) fn lower_hdfs_scan_node(
         .slot_descriptors
         .as_ref()
         .ok_or_else(|| "missing slot_descriptors in desc_tbl".to_string())?;
-    let mut slot_info_map: HashMap<SlotId, HdfsSlotInfo> = HashMap::new();
-    for s in slot_descs {
-        let (Some(parent), Some(id), Some(slot_type)) = (s.parent, s.id, s.slot_type.as_ref())
-        else {
-            continue;
-        };
-        if parent != tuple_id {
-            continue;
-        }
-        let name = crate::lower::layout::slot_display_name_from_desc(s);
-        let primitive =
-            primitive_type_from_desc(slot_type).unwrap_or(types::TPrimitiveType::INVALID_TYPE);
-        let arrow_type = crate::lower::type_lowering::arrow_type_from_desc(slot_type)
-            .ok_or_else(|| format!("unsupported slot_type for slot_id={id}"))?;
-        let nullable = s.is_nullable.unwrap_or(true);
-        let field_id = s.col_unique_id.filter(|v| *v > 0);
-        slot_info_map.insert(
-            SlotId::try_from(id)?,
-            HdfsSlotInfo {
-                name,
-                primitive,
-                arrow_type,
-                nullable,
-                field_id,
-            },
-        );
-    }
+    let slot_info_map = build_hdfs_slot_info_map(slot_descs, tuple_id)?;
     let has_row_position_marker_slots = slot_info_map.values().any(|info| {
         crate::exec::row_position::is_row_source_id(&info.name)
             || crate::exec::row_position::is_scan_range_id(&info.name)
@@ -1719,14 +1727,15 @@ mod tests {
     use crate::connector::FileScanRange;
     use crate::internal_service::TQueryOptions;
     use crate::lower::layout::layout_from_slot_ids;
-    use crate::{exprs, plan_nodes, types};
+    use crate::{descriptors, exprs, plan_nodes, types};
     use arrow::datatypes::{DataType, Field};
 
     use super::{
-        HdfsScanReadColumns, HdfsSlotInfo, extract_change_op_from_extended_columns,
-        file_cache_flags_from_query_options, parse_hdfs_scan_min_max_conjuncts,
-        parse_hdfs_scan_variant_path_columns, resolve_cloud_object_store_config,
-        validate_included_positions_full_file_range, variant_path_ensure_source_read_columns,
+        HdfsScanReadColumns, HdfsSlotInfo, build_hdfs_slot_info_map,
+        extract_change_op_from_extended_columns, file_cache_flags_from_query_options,
+        parse_hdfs_scan_min_max_conjuncts, parse_hdfs_scan_variant_path_columns,
+        resolve_cloud_object_store_config, validate_included_positions_full_file_range,
+        variant_path_ensure_source_read_columns,
     };
 
     #[test]
@@ -1920,6 +1929,33 @@ mod tests {
         }
     }
 
+    fn test_slot_descriptor(
+        id: i32,
+        parent: i32,
+        name: &str,
+        primitive: types::TPrimitiveType,
+        nullable: bool,
+        field_id: Option<i32>,
+    ) -> descriptors::TSlotDescriptor {
+        descriptors::TSlotDescriptor::new(
+            Some(id),
+            Some(parent),
+            Some(crate::lower::type_lowering::scalar_type_desc(primitive)),
+            Some(id - 1),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(name.to_string()),
+            Some(id - 1),
+            Some(true),
+            Some(true),
+            Some(nullable),
+            field_id,
+            None::<String>,
+            Some(false),
+        )
+    }
+
     fn test_variant_path_column(
         source_slot_id: Option<i32>,
         output_slot_id: Option<i32>,
@@ -2019,14 +2055,59 @@ mod tests {
     #[test]
     fn lower_hdfs_scan_variant_path_spec_carries_source_field_id() {
         let variant_columns = vec![test_variant_path_column(Some(1), Some(2))];
-        let mut slot_info = variant_slot_info_map();
-        slot_info.get_mut(&SlotId::new(1)).unwrap().field_id = Some(10);
+        let slot_descs = vec![
+            test_slot_descriptor(
+                1,
+                11,
+                "payload",
+                types::TPrimitiveType::VARIANT,
+                true,
+                Some(10),
+            ),
+            test_slot_descriptor(
+                2,
+                11,
+                "__nr_var_payload_a",
+                types::TPrimitiveType::BIGINT,
+                true,
+                None,
+            ),
+        ];
+        let slot_info = build_hdfs_slot_info_map(&slot_descs, 11).expect("slot info map");
 
         let plan =
             parse_hdfs_scan_variant_path_columns(7, Some(variant_columns.as_slice()), &slot_info)
                 .expect("variant path plan");
 
+        assert_eq!(slot_info.get(&SlotId::new(1)).unwrap().field_id, Some(10));
         assert_eq!(plan.specs[0].source_field_id, Some(10));
+    }
+
+    #[test]
+    fn lower_hdfs_scan_slot_info_map_ignores_non_positive_field_ids() {
+        let slot_descs = vec![
+            test_slot_descriptor(
+                1,
+                11,
+                "zero_id",
+                types::TPrimitiveType::VARIANT,
+                true,
+                Some(0),
+            ),
+            test_slot_descriptor(
+                2,
+                11,
+                "negative_id",
+                types::TPrimitiveType::BIGINT,
+                true,
+                Some(-7),
+            ),
+        ];
+
+        let slot_info = build_hdfs_slot_info_map(&slot_descs, 11).expect("slot info map");
+
+        assert_eq!(slot_info.get(&SlotId::new(1)).unwrap().field_id, None);
+        assert_eq!(slot_info.get(&SlotId::new(2)).unwrap().field_id, None);
     }
 
     #[test]
