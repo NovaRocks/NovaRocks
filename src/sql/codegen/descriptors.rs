@@ -47,11 +47,26 @@ impl DescriptorTableBuilder {
         nullable: bool,
         col_pos: i32,
     ) {
+        self.add_slot_with_field_id(slot_id, tuple_id, name, data_type, nullable, col_pos, None);
+    }
+
+    pub fn add_slot_with_field_id(
+        &mut self,
+        slot_id: types::TSlotId,
+        tuple_id: types::TTupleId,
+        name: &str,
+        data_type: &DataType,
+        nullable: bool,
+        col_pos: i32,
+        field_id: Option<i32>,
+    ) {
         let slot_type = match arrow_type_to_type_desc(data_type) {
             Ok(t) => t,
             Err(_) => return, // skip unsupported types
         };
-        self.add_slot_with_type_desc(slot_id, tuple_id, name, slot_type, nullable, col_pos);
+        self.add_slot_with_type_desc_and_field_id(
+            slot_id, tuple_id, name, slot_type, nullable, col_pos, field_id,
+        );
     }
 
     pub fn add_slot_with_type_desc(
@@ -62,6 +77,21 @@ impl DescriptorTableBuilder {
         slot_type: types::TTypeDesc,
         nullable: bool,
         col_pos: i32,
+    ) {
+        self.add_slot_with_type_desc_and_field_id(
+            slot_id, tuple_id, name, slot_type, nullable, col_pos, None,
+        );
+    }
+
+    pub fn add_slot_with_type_desc_and_field_id(
+        &mut self,
+        slot_id: types::TSlotId,
+        tuple_id: types::TTupleId,
+        name: &str,
+        slot_type: types::TTypeDesc,
+        nullable: bool,
+        col_pos: i32,
+        field_id: Option<i32>,
     ) {
         self.slots.push(descriptors::TSlotDescriptor::new(
             Some(slot_id),
@@ -76,7 +106,7 @@ impl DescriptorTableBuilder {
             Some(true), // is_materialized
             Some(true), // is_output_column
             Some(nullable),
-            None::<i32>,
+            field_id,
             None::<String>,
             None::<bool>,
         ));
@@ -378,6 +408,15 @@ mod tests {
             serialized_metadata: None,
             serialized_metadata_rows: None,
         }
+    }
+
+    #[test]
+    fn descriptor_builder_sets_slot_col_unique_id_when_field_id_is_known() {
+        let mut builder = DescriptorTableBuilder::new();
+        builder.add_slot_with_field_id(7, 1, "v", &DataType::Utf8, true, 0, Some(42));
+        let desc = builder.build();
+        let slot = desc.slot_descriptors.as_ref().unwrap().first().unwrap();
+        assert_eq!(slot.col_unique_id, Some(42));
     }
 
     #[test]

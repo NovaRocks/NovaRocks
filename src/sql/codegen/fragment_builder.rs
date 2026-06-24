@@ -5752,6 +5752,76 @@ mod tests {
     }
 
     #[test]
+    fn iceberg_scan_slots_carry_schema_field_ids() {
+        let plan = attach_test_scalar_arena(PhysicalPlanNode {
+            op: Operator::PhysicalScan(ScanOp {
+                database: "default".to_string(),
+                table: TableDef {
+                    name: "ice_t".to_string(),
+                    columns: vec![ColumnDef {
+                        name: "id".to_string(),
+                        data_type: DataType::Int32,
+                        nullable: false,
+                        write_default: None,
+                        logical_type: None,
+                    }],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: ScanSource::IcebergDataFiles {
+                        table: test_iceberg_table_info_with_schema(vec![IcebergSchemaFieldDef {
+                            field_id: 10,
+                            name: "id".to_string(),
+                            initial_default: None,
+                            write_default: None,
+                            initial_default_json: None,
+                            children: vec![],
+                        }]),
+                        files: vec![],
+                        cloud_properties: BTreeMap::new(),
+                        binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+                    },
+                },
+                alias: None,
+                stats_ref: None,
+                columns: vec![output_col_for_test(8402, "id", DataType::Int32, false)],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+                mv_rewritten_from: None,
+            }),
+            children: vec![],
+            stats: stats(),
+            output_columns: vec![output_col_for_test(8402, "id", DataType::Int32, false)],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+        });
+
+        let build = PlanFragmentBuilder::build_via_distributed_plan(
+            &plan,
+            &DummyCatalog,
+            &mock_iceberg_registry(),
+            "default",
+        )
+        .expect("build Iceberg scan");
+        let root = build
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == build.root_fragment_id)
+            .expect("root fragment");
+        let slot = root
+            .desc_tbl
+            .slot_descriptors
+            .as_ref()
+            .expect("slot descriptors")
+            .iter()
+            .find(|slot| slot.col_name.as_deref() == Some("id"))
+            .expect("id slot descriptor");
+
+        assert_eq!(slot.col_unique_id, Some(10));
+    }
+
+    #[test]
     fn starrocks_fragment_exec_params_are_generated_from_planned_connector_scan() {
         let layout = starrocks_layout();
         let plan = starrocks_scan_plan();

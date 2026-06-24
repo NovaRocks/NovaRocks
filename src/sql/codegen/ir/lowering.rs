@@ -1122,6 +1122,16 @@ struct LoweredDistributedNode {
     ordering: OrderingSpec,
 }
 
+fn iceberg_field_id_for_column(table: &crate::sql::catalog::TableDef, column: &str) -> Option<i32> {
+    let iceberg = iceberg_table_info(&table.source)?;
+    iceberg
+        .schema
+        .fields
+        .iter()
+        .find(|field| field.name.eq_ignore_ascii_case(column))
+        .map(|field| field.field_id)
+}
+
 impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
     pub(crate) fn new(state: &'s mut S) -> Self {
         Self {
@@ -2429,13 +2439,15 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 None => col.data_type.clone(),
             };
             let nullable = col.nullable;
-            state.desc_builder().add_slot(
+            let field_id = iceberg_field_id_for_column(&table, &col.name);
+            state.desc_builder().add_slot_with_field_id(
                 slot_id,
                 scan_tuple_id,
                 &col.name,
                 &slot_type,
                 nullable,
                 idx as i32,
+                field_id,
             );
             slot_to_column.insert(slot_id, col.name.clone());
             physical_slot_by_column.insert(col.name.to_lowercase(), slot_id);
