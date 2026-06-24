@@ -65,8 +65,6 @@ use page_selection::build_row_selection_for_row_groups;
 pub(crate) use reader::ParquetCachedReader;
 use row_group_selector::select_row_groups_for_range;
 pub use variant_pruning::VariantPathPruningPredicate;
-// Staged for upcoming row-group and page selector integration.
-#[allow(unused_imports)]
 pub(crate) use variant_pruning::{
     BoundVariantPathPruningPredicate, bind_variant_path_pruning_predicates,
 };
@@ -463,6 +461,12 @@ struct ParquetScanIter {
     has_dict_encoded_output: bool,
 }
 
+#[derive(Clone, Debug, Default)]
+struct CurrentPruningPredicates {
+    physical: Vec<MinMaxPredicate>,
+    variant: Vec<VariantPathPruningPredicate>,
+}
+
 impl ParquetScanIter {
     fn has_iceberg_schema_evolution(&self) -> bool {
         self.cfg.iceberg_output_schema.is_some()
@@ -474,15 +478,18 @@ impl ParquetScanIter {
         }
     }
 
-    fn current_predicates(&self) -> Result<Vec<MinMaxPredicate>, String> {
+    fn current_pruning_predicates(&self) -> Result<CurrentPruningPredicates, String> {
         if self.has_iceberg_schema_evolution() {
-            return Ok(Vec::new());
+            return Ok(CurrentPruningPredicates::default());
         }
-        let mut predicates = self.cfg.min_max_predicates.clone();
+        let mut predicates = CurrentPruningPredicates {
+            physical: self.cfg.min_max_predicates.clone(),
+            variant: self.cfg.variant_path_predicates.clone(),
+        };
         if let Some(filters) = self.runtime_filters.as_ref() {
             let mut runtime_preds = runtime_filters_to_min_max_predicates(&self.cfg, filters)?;
             if !runtime_preds.is_empty() {
-                predicates.append(&mut runtime_preds);
+                predicates.physical.append(&mut runtime_preds);
             }
         }
         Ok(predicates)
@@ -890,13 +897,19 @@ impl ParquetScanIter {
             }
 
             let metadata = builder.metadata().clone();
-            let predicates = self.current_predicates()?;
+            let predicates = self.current_pruning_predicates()?;
+            let bound_variant_predicates = bind_variant_path_pruning_predicates(
+                &metadata,
+                &self.cfg.variant_path_columns,
+                &predicates.variant,
+            );
             let limit_rows = self.limit.map(|_| self.remaining);
             let selected_row_groups = select_row_groups_for_range(
                 &metadata,
                 &range,
                 limit_rows,
-                &predicates,
+                &predicates.physical,
+                &bound_variant_predicates,
                 &self.cfg.columns,
                 self.cfg.case_sensitive,
             );
@@ -980,7 +993,7 @@ impl ParquetScanIter {
             let use_name_based_projection = !self.has_iceberg_schema_evolution();
             let active_projection_columns = if use_name_based_projection {
                 build_active_projection_columns(
-                    &predicates,
+                    &predicates.physical,
                     &self.cfg.columns,
                     self.cfg.case_sensitive,
                 )
@@ -1011,7 +1024,7 @@ impl ParquetScanIter {
                 &cached_reader,
                 &metadata,
                 &row_groups,
-                &predicates,
+                &predicates.physical,
             )? {
                 DelayedReaderDecision::Use(reader) => {
                     let reader_init_ns = reader_init_start.elapsed().as_nanos();
@@ -1040,7 +1053,7 @@ impl ParquetScanIter {
             }
 
             let maybe_reader =
-                self.build_parquet_reader(builder, &metadata, &row_groups, &predicates)?;
+                self.build_parquet_reader(builder, &metadata, &row_groups, &predicates.physical)?;
             let reader_init_ns = reader_init_start.elapsed().as_nanos();
             if let Some(profile) = self.profile.as_ref() {
                 record_reader_init(profile, reader_init_ns);

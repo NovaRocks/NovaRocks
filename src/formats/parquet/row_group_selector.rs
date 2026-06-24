@@ -15,23 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
+use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData, RowGroupMetaData};
 use parquet::file::statistics::Statistics;
 
 use crate::fs::scan_context::FileScanRange;
 use crate::novarocks_logging::debug;
 
-use super::{MinMaxPredicate, MinMaxPredicateValue};
+use super::{BoundVariantPathPruningPredicate, MinMaxPredicate, MinMaxPredicateValue};
 
 pub(crate) fn select_row_groups_for_range(
     metadata: &ParquetMetaData,
     range: &FileScanRange,
     mut remaining_rows: Option<usize>,
     min_max_predicates: &[MinMaxPredicate],
+    variant_predicates: &[BoundVariantPathPruningPredicate],
     columns: &[String],
     case_sensitive: bool,
 ) -> Option<Vec<usize>> {
-    if range.length == 0 && remaining_rows.is_none() && min_max_predicates.is_empty() {
+    if range.length == 0
+        && remaining_rows.is_none()
+        && min_max_predicates.is_empty()
+        && variant_predicates.is_empty()
+    {
         return None;
     }
 
@@ -50,9 +55,14 @@ pub(crate) fn select_row_groups_for_range(
     for (idx, row_group) in metadata.row_groups().iter().enumerate() {
         let rg_start = row_group_start_offset(row_group)?;
         if rg_start >= split_start && rg_start < split_end {
-            if !min_max_predicates.is_empty() {
-                match should_read_row_group(row_group, min_max_predicates, columns, case_sensitive)
-                {
+            if !min_max_predicates.is_empty() || !variant_predicates.is_empty() {
+                match should_read_row_group(
+                    row_group,
+                    min_max_predicates,
+                    variant_predicates,
+                    columns,
+                    case_sensitive,
+                ) {
                     Ok(true) => {
                         // Passed pruning.
                     }
@@ -96,6 +106,7 @@ pub(crate) fn select_row_groups_for_range(
 fn should_read_row_group(
     row_group: &RowGroupMetaData,
     predicates: &[MinMaxPredicate],
+    variant_predicates: &[BoundVariantPathPruningPredicate],
     columns: &[String],
     case_sensitive: bool,
 ) -> Result<bool, String> {
@@ -126,21 +137,41 @@ fn should_read_row_group(
         });
 
         if let Some(chunk) = chunk
-            && let Some(stats) = chunk.statistics()
+            && !column_stats_satisfy_predicate(chunk, pred)?
         {
-            let satisfies = match pred {
-                MinMaxPredicate::Le { value, .. } => check_min_satisfies_le(stats, value)?,
-                MinMaxPredicate::Ge { value, .. } => check_max_satisfies_ge(stats, value)?,
-                MinMaxPredicate::Lt { value, .. } => check_min_satisfies_lt(stats, value)?,
-                MinMaxPredicate::Gt { value, .. } => check_max_satisfies_gt(stats, value)?,
-                MinMaxPredicate::Eq { value, .. } => {
-                    check_max_satisfies_ge(stats, value)? && check_min_satisfies_le(stats, value)?
-                }
-            };
+            return Ok(false);
+        }
+    }
 
-            if !satisfies {
-                return Ok(false);
+    for pred in variant_predicates {
+        let Some(column) = row_group.columns().get(pred.leaf_column_index) else {
+            return Ok(true);
+        };
+        if !column_stats_satisfy_predicate(column, &pred.predicate)? {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+fn column_stats_satisfy_predicate(
+    column: &ColumnChunkMetaData,
+    pred: &MinMaxPredicate,
+) -> Result<bool, String> {
+    if let Some(stats) = column.statistics() {
+        let satisfies = match pred {
+            MinMaxPredicate::Le { value, .. } => check_min_satisfies_le(stats, value)?,
+            MinMaxPredicate::Ge { value, .. } => check_max_satisfies_ge(stats, value)?,
+            MinMaxPredicate::Lt { value, .. } => check_min_satisfies_lt(stats, value)?,
+            MinMaxPredicate::Gt { value, .. } => check_max_satisfies_gt(stats, value)?,
+            MinMaxPredicate::Eq { value, .. } => {
+                check_max_satisfies_ge(stats, value)? && check_min_satisfies_le(stats, value)?
             }
+        };
+
+        if !satisfies {
+            return Ok(false);
         }
     }
     Ok(true)
@@ -528,8 +559,127 @@ fn row_group_start_offset(row_group: &RowGroupMetaData) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
     use parquet::data_type::{ByteArray, FixedLenByteArray};
+    use parquet::file::properties::{EnabledStatistics, WriterProperties};
+    use parquet::file::reader::{FileReader, SerializedFileReader};
     use parquet::file::statistics::ValueStatistics;
+
+    use crate::formats::parquet::BoundVariantPathPruningPredicate;
+
+    fn test_scan_range() -> FileScanRange {
+        FileScanRange {
+            path: "memory.parquet".to_string(),
+            file_len: 0,
+            offset: 0,
+            length: 0,
+            scan_range_id: 0,
+            first_row_id: None,
+            data_sequence_number: None,
+            ivm_change_op: None,
+            included_positions: None,
+            external_datacache: None,
+            delete_files: Vec::new(),
+        }
+    }
+
+    fn int64_parquet_metadata(values: Vec<i64>, stats: EnabledStatistics) -> ParquetMetaData {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(values)) as ArrayRef],
+        )
+        .expect("record batch");
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(3))
+            .set_statistics_enabled(stats)
+            .build();
+
+        let mut buffer = Vec::new();
+        {
+            let cursor = Cursor::new(&mut buffer);
+            let mut writer =
+                ArrowWriter::try_new(cursor, schema, Some(props)).expect("parquet writer");
+            writer.write(&batch).expect("write parquet batch");
+            writer.close().expect("close parquet writer");
+        }
+
+        let reader =
+            SerializedFileReader::new(bytes::Bytes::from(buffer)).expect("metadata reader");
+        reader.metadata().clone()
+    }
+
+    fn variant_gt_i64_predicate(
+        leaf_column_index: usize,
+        value: i64,
+    ) -> BoundVariantPathPruningPredicate {
+        BoundVariantPathPruningPredicate {
+            leaf_column_index,
+            leaf_column_path: "a".to_string(),
+            requested_type: DataType::Int64,
+            predicate: MinMaxPredicate::Gt {
+                column: "0".to_string(),
+                value: MinMaxPredicateValue::Int64(value),
+            },
+        }
+    }
+
+    #[test]
+    fn variant_row_group_pruning_uses_bound_typed_leaf_stats() {
+        let metadata = int64_parquet_metadata(vec![1, 2, 3, 10, 11, 12], EnabledStatistics::Chunk);
+        let predicate = variant_gt_i64_predicate(0, 5);
+
+        let selected = select_row_groups_for_range(
+            &metadata,
+            &test_scan_range(),
+            None,
+            &[],
+            &[predicate],
+            &[],
+            true,
+        )
+        .expect("row groups selected");
+
+        assert_eq!(selected, vec![1]);
+    }
+
+    #[test]
+    fn variant_row_group_pruning_reads_all_when_binding_or_stats_missing() {
+        let metadata = int64_parquet_metadata(vec![1, 2, 3, 10, 11, 12], EnabledStatistics::Chunk);
+        let out_of_range = variant_gt_i64_predicate(9, 5);
+        let selected = select_row_groups_for_range(
+            &metadata,
+            &test_scan_range(),
+            None,
+            &[],
+            &[out_of_range],
+            &[],
+            true,
+        )
+        .expect("row groups selected");
+        assert_eq!(selected, vec![0, 1]);
+
+        let metadata_without_stats =
+            int64_parquet_metadata(vec![1, 2, 3, 10, 11, 12], EnabledStatistics::None);
+        let missing_stats = variant_gt_i64_predicate(0, 5);
+        let selected = select_row_groups_for_range(
+            &metadata_without_stats,
+            &test_scan_range(),
+            None,
+            &[],
+            &[missing_stats],
+            &[],
+            true,
+        )
+        .expect("row groups selected");
+        assert_eq!(selected, vec![0, 1]);
+    }
 
     #[test]
     fn fixed_len_decimal_stats_compare_numerically_with_binary_literal_width_mismatch() {
