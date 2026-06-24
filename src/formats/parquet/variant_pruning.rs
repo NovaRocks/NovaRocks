@@ -117,7 +117,8 @@ fn parquet_leaf_matches_requested_type(column: &ColumnDescriptor, requested: &Da
         DataType::Boolean => physical_type == PhysicalType::BOOLEAN,
         DataType::Int64 => {
             physical_type == PhysicalType::INT64
-                && !matches!(info.logical_type_ref(), Some(LogicalType::Timestamp { .. }))
+                && info.logical_type_ref().is_none()
+                && info.converted_type() == ConvertedType::NONE
         }
         DataType::Float64 => physical_type == PhysicalType::DOUBLE,
         DataType::Utf8 => {
@@ -140,7 +141,9 @@ mod tests {
     use std::io::Cursor;
     use std::sync::Arc;
 
-    use arrow::array::{ArrayRef, Int64Array, StructArray, TimestampMicrosecondArray};
+    use arrow::array::{
+        ArrayRef, Int64Array, StructArray, Time64MicrosecondArray, TimestampMicrosecondArray,
+    };
     use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
     use arrow::record_batch::RecordBatch;
     use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
@@ -275,6 +278,19 @@ mod tests {
         );
         let bound =
             bind_variant_path_pruning_predicates(&metadata, &specs, &[array_path, timestamp_type]);
+
+        assert!(bound.is_empty());
+    }
+
+    #[test]
+    fn variant_pruning_does_not_bind_annotated_int64_as_plain_int64() {
+        let metadata = variant_metadata_with_leaf(
+            Field::new("typed_value", DataType::Time64(TimeUnit::Microsecond), true),
+            Arc::new(Time64MicrosecondArray::from(vec![Some(1234)])),
+        );
+        let specs = vec![variant_path_spec(Some(10))];
+        let predicate = variant_path_predicate(Some(10), "$.a", DataType::Int64);
+        let bound = bind_variant_path_pruning_predicates(&metadata, &specs, &[predicate]);
 
         assert!(bound.is_empty());
     }
