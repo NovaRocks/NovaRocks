@@ -761,6 +761,21 @@ fn parse_hdfs_scan_pruning_predicates(
     Ok(predicates)
 }
 
+fn apply_row_position_pruning_gate(
+    row_position_required: bool,
+    enable_page_index: &mut bool,
+    min_max_predicates: &mut Vec<MinMaxPredicate>,
+    variant_path_predicates: &mut Vec<VariantPathPruningPredicate>,
+) {
+    if row_position_required {
+        // When row position is required, we must keep a stable row_id sequence.
+        // Page index and row group pruning can skip rows and would corrupt row_id values.
+        *enable_page_index = false;
+        min_max_predicates.clear();
+        variant_path_predicates.clear();
+    }
+}
+
 /// Lower a HDFS_SCAN_NODE plan node to a `Lowered` ExecNode.
 pub(crate) fn lower_hdfs_scan_node(
     node: &plan_nodes::TPlanNode,
@@ -1469,7 +1484,7 @@ pub(crate) fn lower_hdfs_scan_node(
         &variant_path_plan.specs,
     )?;
     let mut min_max_predicates = pruning_predicates.physical;
-    let variant_path_predicates = pruning_predicates.variant;
+    let mut variant_path_predicates = pruning_predicates.variant;
     if let Some(min_max_conjs) = hdfs.min_max_conjuncts.as_ref() {
         debug!(
             "[Row Group Pruning] parsing {} min_max_conjuncts",
@@ -1485,12 +1500,12 @@ pub(crate) fn lower_hdfs_scan_node(
             );
         }
     }
-    if row_position_spec.is_some() {
-        // When row position is required, we must keep a stable row_id sequence.
-        // Page index and row group pruning can skip rows and would corrupt row_id values.
-        enable_page_index = false;
-        min_max_predicates.clear();
-    }
+    apply_row_position_pruning_gate(
+        row_position_spec.is_some(),
+        &mut enable_page_index,
+        &mut min_max_predicates,
+        &mut variant_path_predicates,
+    );
 
     debug!(
         "HDFS_SCAN creating scan with {} ranges, {} columns",
@@ -1752,11 +1767,11 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
 
     use super::{
-        HdfsScanReadColumns, HdfsSlotInfo, build_hdfs_slot_info_map,
-        extract_change_op_from_extended_columns, file_cache_flags_from_query_options,
-        parse_hdfs_scan_pruning_predicates, parse_hdfs_scan_variant_path_columns,
-        resolve_cloud_object_store_config, validate_included_positions_full_file_range,
-        variant_path_ensure_source_read_columns,
+        HdfsScanReadColumns, HdfsSlotInfo, apply_row_position_pruning_gate,
+        build_hdfs_slot_info_map, extract_change_op_from_extended_columns,
+        file_cache_flags_from_query_options, parse_hdfs_scan_pruning_predicates,
+        parse_hdfs_scan_variant_path_columns, resolve_cloud_object_store_config,
+        validate_included_positions_full_file_range, variant_path_ensure_source_read_columns,
     };
 
     #[test]
@@ -2273,6 +2288,38 @@ mod tests {
         assert_eq!(predicates.physical[0].column(), "0");
         assert_eq!(predicates.variant.len(), 1);
         assert_eq!(predicates.variant[0].output_slot_id, SlotId::new(2));
+    }
+
+    #[test]
+    fn lower_hdfs_scan_row_position_disables_variant_pruning() {
+        let mut slots = variant_slot_info_map();
+        slots.get_mut(&SlotId::new(1)).unwrap().field_id = Some(10);
+        let plan = parse_hdfs_scan_variant_path_columns(
+            7,
+            Some(&[test_variant_path_column(Some(1), Some(2))]),
+            &slots,
+        )
+        .expect("variant path plan");
+        let layout = layout_from_slot_ids(1, [3, 2]);
+        let physical = slot_eq_int_expr(3, 7);
+        let variant = slot_binary_int_expr(2, 5, crate::opcodes::TExprOpcode::GT);
+        let predicates =
+            parse_hdfs_scan_pruning_predicates(7, Some(&[physical, variant]), &layout, &plan.specs)
+                .expect("parse pruning predicates");
+        let mut enable_page_index = true;
+        let mut min_max_predicates = predicates.physical;
+        let mut variant_path_predicates = predicates.variant;
+
+        apply_row_position_pruning_gate(
+            true,
+            &mut enable_page_index,
+            &mut min_max_predicates,
+            &mut variant_path_predicates,
+        );
+
+        assert!(!enable_page_index);
+        assert!(min_max_predicates.is_empty());
+        assert!(variant_path_predicates.is_empty());
     }
 
     #[test]
