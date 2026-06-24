@@ -111,6 +111,7 @@ fn test_iceberg_connector_module() {
         case_sensitive: false,
         enable_page_index: false,
         min_max_predicates: vec![],
+        variant_path_predicates: Vec::new(),
         batch_size: None,
         datacache: DataCacheManager::instance().external_context(test_cache_options()),
         cache_policy: ParquetReadCachePolicy::with_flags(false, false, None),
