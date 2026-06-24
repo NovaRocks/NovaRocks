@@ -31,8 +31,10 @@ use crate::connector::iceberg::{
     lookup_iceberg_table_location, snapshot_iceberg_table_locations,
 };
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::formats::parquet::{ParquetReadCachePolicy, VariantPathSpec};
-use crate::lower::expr::parse_min_max_conjuncts;
+use crate::formats::parquet::{
+    ParquetReadCachePolicy, VariantPathPruningPredicate, VariantPathSpec,
+};
+use crate::lower::expr::parse_min_max_conjuncts_with_column_resolver;
 use crate::lower::layout::{
     Layout, chunk_schema_for_layout, col_names_from_layout, find_tuple_descriptor,
     layout_from_slot_ids,
@@ -687,57 +689,75 @@ fn variant_path_ensure_source_read_columns(
     Ok(())
 }
 
-fn min_max_conjunct_references_any_slot(
+#[derive(Clone, Debug, Default)]
+struct HdfsScanPruningPredicates {
+    physical: Vec<MinMaxPredicate>,
+    variant: Vec<VariantPathPruningPredicate>,
+}
+
+fn parse_hdfs_scan_pruning_predicates(
     node_id: i32,
-    expr: &exprs::TExpr,
-    skipped_slots: &HashSet<SlotId>,
-) -> Result<bool, String> {
-    if skipped_slots.is_empty() {
-        return Ok(false);
-    }
-    for node in &expr.nodes {
-        if let Some(slot_ref) = node.slot_ref.as_ref() {
+    min_max_conjuncts: Option<&[exprs::TExpr]>,
+    out_layout: &Layout,
+    variant_path_specs: &[VariantPathSpec],
+) -> Result<HdfsScanPruningPredicates, String> {
+    let Some(min_max_conjuncts) = min_max_conjuncts else {
+        return Ok(HdfsScanPruningPredicates::default());
+    };
+
+    let variant_by_output: HashMap<SlotId, &VariantPathSpec> = variant_path_specs
+        .iter()
+        .map(|spec| (spec.output_slot_id, spec))
+        .collect();
+    let mut predicates = HdfsScanPruningPredicates::default();
+
+    for conjunct in min_max_conjuncts {
+        let parsed = parse_min_max_conjuncts_with_column_resolver(conjunct, |slot_ref| {
             let slot_id = SlotId::try_from(slot_ref.slot_id).map_err(|e| {
                 format!(
                     "HDFS_SCAN_NODE node_id={node_id} min_max_conjunct slot_ref has invalid slot_id={}: {e}",
                     slot_ref.slot_id
                 )
             })?;
-            if skipped_slots.contains(&slot_id) {
-                return Ok(true);
+            if variant_by_output.contains_key(&slot_id) {
+                return Ok(format!("variant:{}", slot_id.as_u32()));
             }
-        }
-        if let Some(slot_id) = node.vslot_ref.as_ref().and_then(|v| v.slot_id) {
-            let slot_id = SlotId::try_from(slot_id).map_err(|e| {
+
+            let key = (slot_ref.tuple_id, slot_ref.slot_id);
+            let idx = out_layout
+                .index
+                .get(&key)
+                .ok_or_else(|| format!("slot not found in layout: {:?}", key))?;
+            Ok(idx.to_string())
+        })?;
+
+        for predicate in parsed {
+            let Some(slot_text) = predicate.column().strip_prefix("variant:") else {
+                predicates.physical.push(predicate);
+                continue;
+            };
+            let slot_num = slot_text.parse::<u32>().map_err(|e| {
                 format!(
-                    "HDFS_SCAN_NODE node_id={node_id} min_max_conjunct vslot_ref has invalid slot_id={slot_id}: {e}"
+                    "HDFS_SCAN_NODE node_id={node_id} invalid variant predicate slot {slot_text:?}: {e}"
                 )
             })?;
-            if skipped_slots.contains(&slot_id) {
-                return Ok(true);
-            }
+            let output_slot_id = SlotId::new(slot_num);
+            let spec = variant_by_output.get(&output_slot_id).ok_or_else(|| {
+                format!(
+                    "HDFS_SCAN_NODE node_id={node_id} min/max variant output slot_id={output_slot_id} has no variant path spec"
+                )
+            })?;
+            predicates.variant.push(VariantPathPruningPredicate {
+                output_slot_id,
+                source_slot_id: spec.source_slot_id,
+                source_field_id: spec.source_field_id,
+                canonical_path: spec.canonical_path.clone(),
+                requested_type: spec.requested_type.clone(),
+                predicate: predicate.with_column("0".to_string()),
+            });
         }
     }
-    Ok(false)
-}
 
-fn parse_hdfs_scan_min_max_conjuncts(
-    node_id: i32,
-    min_max_conjuncts: &[exprs::TExpr],
-    out_layout: &Layout,
-    variant_output_slot_ids: &HashSet<SlotId>,
-) -> Result<Vec<MinMaxPredicate>, String> {
-    let mut predicates = Vec::new();
-    for conjunct in min_max_conjuncts {
-        if min_max_conjunct_references_any_slot(node_id, conjunct, variant_output_slot_ids)? {
-            debug!(
-                "HDFS_SCAN_NODE node_id={} skipping min/max conjunct on variant path synthetic output slot",
-                node_id
-            );
-            continue;
-        }
-        predicates.extend(parse_min_max_conjuncts(conjunct, out_layout)?);
-    }
     Ok(predicates)
 }
 
@@ -1442,18 +1462,19 @@ pub(crate) fn lower_hdfs_scan_node(
         .and_then(|opts| opts.enable_parquet_reader_page_index)
         .unwrap_or(false);
 
-    let mut min_max_predicates = Vec::new();
+    let pruning_predicates = parse_hdfs_scan_pruning_predicates(
+        node.node_id,
+        hdfs.min_max_conjuncts.as_deref(),
+        &out_layout,
+        &variant_path_plan.specs,
+    )?;
+    let mut min_max_predicates = pruning_predicates.physical;
+    let variant_path_predicates = pruning_predicates.variant;
     if let Some(min_max_conjs) = hdfs.min_max_conjuncts.as_ref() {
         debug!(
             "[Row Group Pruning] parsing {} min_max_conjuncts",
             min_max_conjs.len()
         );
-        min_max_predicates = parse_hdfs_scan_min_max_conjuncts(
-            node.node_id,
-            min_max_conjs,
-            &out_layout,
-            &variant_path_plan.output_slot_ids,
-        )?;
         for pred in &min_max_predicates {
             debug!("[Row Group Pruning] parsed predicate: {:?}", pred);
         }
@@ -1610,7 +1631,7 @@ pub(crate) fn lower_hdfs_scan_node(
         ),
         profile_label: Some(format!("hdfs_scan_node_id={}", node.node_id)),
         iceberg_output_schema,
-        variant_path_predicates: Vec::new(),
+        variant_path_predicates,
         variant_path_columns: variant_path_plan.specs,
         query_global_dicts: Default::default(),
     };
@@ -1733,7 +1754,7 @@ mod tests {
     use super::{
         HdfsScanReadColumns, HdfsSlotInfo, build_hdfs_slot_info_map,
         extract_change_op_from_extended_columns, file_cache_flags_from_query_options,
-        parse_hdfs_scan_min_max_conjuncts, parse_hdfs_scan_variant_path_columns,
+        parse_hdfs_scan_pruning_predicates, parse_hdfs_scan_variant_path_columns,
         resolve_cloud_object_store_config, validate_included_positions_full_file_range,
         variant_path_ensure_source_read_columns,
     };
@@ -1885,13 +1906,17 @@ mod tests {
         }
     }
 
-    fn slot_eq_int_expr(slot_id: i32, value: i64) -> exprs::TExpr {
+    fn slot_binary_int_expr(
+        slot_id: i32,
+        value: i64,
+        opcode: crate::opcodes::TExprOpcode,
+    ) -> exprs::TExpr {
         let type_desc =
             crate::lower::type_lowering::scalar_type_desc(types::TPrimitiveType::BIGINT);
         exprs::TExpr::new(vec![
             exprs::TExprNode {
                 node_type: exprs::TExprNodeType::BINARY_PRED,
-                opcode: Some(crate::opcodes::TExprOpcode::EQ),
+                opcode: Some(opcode),
                 num_children: 2,
                 child_type_desc: Some(type_desc.clone()),
                 ..default_expr_node()
@@ -1912,6 +1937,10 @@ mod tests {
                 ..default_expr_node()
             },
         ])
+    }
+
+    fn slot_eq_int_expr(slot_id: i32, value: i64) -> exprs::TExpr {
+        slot_binary_int_expr(slot_id, value, crate::opcodes::TExprOpcode::EQ)
     }
 
     fn test_slot_info(
@@ -2190,19 +2219,60 @@ mod tests {
     }
 
     #[test]
-    fn lower_hdfs_scan_variant_path_min_max_skips_synthetic_output_slot() {
-        let layout = layout_from_slot_ids(1, [2, 3]);
-        let variant_outputs = HashSet::from([SlotId::new(2)]);
-        let conjunct = slot_eq_int_expr(2, 7);
+    fn lower_hdfs_scan_variant_path_min_max_collects_synthetic_output_slot() {
+        let mut slots = variant_slot_info_map();
+        slots.get_mut(&SlotId::new(1)).unwrap().field_id = Some(10);
+        let plan = parse_hdfs_scan_variant_path_columns(
+            7,
+            Some(&[test_variant_path_column_with(
+                Some(1),
+                Some(2),
+                Some("$.a"),
+                types::TPrimitiveType::BIGINT,
+            )]),
+            &slots,
+        )
+        .expect("variant path plan");
+        let layout = layout_from_slot_ids(1, [1, 2]);
+        let conjunct = slot_binary_int_expr(2, 5, crate::opcodes::TExprOpcode::GT);
 
         let predicates =
-            parse_hdfs_scan_min_max_conjuncts(7, &[conjunct], &layout, &variant_outputs)
-                .expect("parse guarded min/max conjuncts");
+            parse_hdfs_scan_pruning_predicates(7, Some(&[conjunct]), &layout, &plan.specs)
+                .expect("parse pruning predicates");
 
-        assert!(
-            predicates.is_empty(),
-            "synthetic variant output min/max must not be mapped to parquet column 0"
-        );
+        assert!(predicates.physical.is_empty());
+        assert_eq!(predicates.variant.len(), 1);
+        let predicate = &predicates.variant[0];
+        assert_eq!(predicate.output_slot_id, SlotId::new(2));
+        assert_eq!(predicate.source_slot_id, SlotId::new(1));
+        assert_eq!(predicate.source_field_id, Some(10));
+        assert_eq!(predicate.canonical_path, "$.a");
+        assert_eq!(predicate.requested_type, DataType::Int64);
+        assert_eq!(predicate.predicate.column(), "0");
+    }
+
+    #[test]
+    fn lower_hdfs_scan_min_max_keeps_physical_predicates_with_variant_predicates() {
+        let mut slots = variant_slot_info_map();
+        slots.get_mut(&SlotId::new(1)).unwrap().field_id = Some(10);
+        let plan = parse_hdfs_scan_variant_path_columns(
+            7,
+            Some(&[test_variant_path_column(Some(1), Some(2))]),
+            &slots,
+        )
+        .expect("variant path plan");
+        let layout = layout_from_slot_ids(1, [3, 2]);
+        let physical = slot_eq_int_expr(3, 7);
+        let variant = slot_binary_int_expr(2, 5, crate::opcodes::TExprOpcode::GT);
+
+        let predicates =
+            parse_hdfs_scan_pruning_predicates(7, Some(&[physical, variant]), &layout, &plan.specs)
+                .expect("parse pruning predicates");
+
+        assert_eq!(predicates.physical.len(), 1);
+        assert_eq!(predicates.physical[0].column(), "0");
+        assert_eq!(predicates.variant.len(), 1);
+        assert_eq!(predicates.variant[0].output_slot_id, SlotId::new(2));
     }
 
     #[test]

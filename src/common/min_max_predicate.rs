@@ -108,6 +108,31 @@ impl MinMaxPredicate {
             MinMaxPredicate::Eq { .. } => MinMaxPredicateOp::Eq,
         }
     }
+
+    pub(crate) fn with_column(&self, column: String) -> Self {
+        match self {
+            MinMaxPredicate::Le { value, .. } => MinMaxPredicate::Le {
+                column,
+                value: value.clone(),
+            },
+            MinMaxPredicate::Ge { value, .. } => MinMaxPredicate::Ge {
+                column,
+                value: value.clone(),
+            },
+            MinMaxPredicate::Lt { value, .. } => MinMaxPredicate::Lt {
+                column,
+                value: value.clone(),
+            },
+            MinMaxPredicate::Gt { value, .. } => MinMaxPredicate::Gt {
+                column,
+                value: value.clone(),
+            },
+            MinMaxPredicate::Eq { value, .. } => MinMaxPredicate::Eq {
+                column,
+                value: value.clone(),
+            },
+        }
+    }
 }
 
 impl MinMaxPredicateValue {
