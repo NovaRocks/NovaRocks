@@ -151,6 +151,14 @@ fn apply_path_rewrite(ranges: &mut [FileScanRange]) -> Result<(), String> {
     Ok(())
 }
 
+fn scan_ranges_have_position_delete_files(ranges: &[FileScanRange]) -> bool {
+    ranges.iter().any(|range| {
+        range.delete_files.iter().any(|delete_file| {
+            delete_file.file_content == types::TIcebergFileContent::POSITION_DELETES
+        })
+    })
+}
+
 fn is_paimon_table(desc_tbl: &descriptors::TDescriptorTable, tuple_id: types::TTupleId) -> bool {
     let Ok(tuple_desc) = find_tuple_descriptor(desc_tbl, tuple_id) else {
         return false;
@@ -1500,8 +1508,9 @@ pub(crate) fn lower_hdfs_scan_node(
             );
         }
     }
+    let has_position_delete_files = scan_ranges_have_position_delete_files(&ranges);
     apply_row_position_pruning_gate(
-        row_position_spec.is_some(),
+        row_position_spec.is_some() || has_position_delete_files,
         &mut enable_page_index,
         &mut min_max_predicates,
         &mut variant_path_predicates,
@@ -1761,6 +1770,7 @@ mod tests {
 
     use crate::common::ids::SlotId;
     use crate::connector::FileScanRange;
+    use crate::connector::iceberg::position_delete::IcebergDeleteFileSpec;
     use crate::internal_service::TQueryOptions;
     use crate::lower::layout::layout_from_slot_ids;
     use crate::{descriptors, exprs, plan_nodes, types};
@@ -1771,7 +1781,8 @@ mod tests {
         build_hdfs_slot_info_map, extract_change_op_from_extended_columns,
         file_cache_flags_from_query_options, parse_hdfs_scan_pruning_predicates,
         parse_hdfs_scan_variant_path_columns, resolve_cloud_object_store_config,
-        validate_included_positions_full_file_range, variant_path_ensure_source_read_columns,
+        scan_ranges_have_position_delete_files, validate_included_positions_full_file_range,
+        variant_path_ensure_source_read_columns,
     };
 
     #[test]
@@ -2320,6 +2331,103 @@ mod tests {
         assert!(!enable_page_index);
         assert!(min_max_predicates.is_empty());
         assert!(variant_path_predicates.is_empty());
+    }
+
+    fn test_range_with_delete_file(file_content: types::TIcebergFileContent) -> FileScanRange {
+        FileScanRange {
+            path: "memory.parquet".to_string(),
+            file_len: 1,
+            offset: 0,
+            length: 1,
+            scan_range_id: 0,
+            first_row_id: None,
+            data_sequence_number: None,
+            ivm_change_op: None,
+            included_positions: None,
+            external_datacache: None,
+            delete_files: vec![IcebergDeleteFileSpec {
+                path: "delete.parquet".to_string(),
+                file_format: descriptors::THdfsFileFormat::PARQUET,
+                file_content,
+                length: Some(1),
+                content_offset: None,
+                content_size_in_bytes: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn lower_hdfs_scan_position_delete_disables_variant_pruning() {
+        let ranges = vec![test_range_with_delete_file(
+            types::TIcebergFileContent::POSITION_DELETES,
+        )];
+        assert!(scan_ranges_have_position_delete_files(&ranges));
+
+        let mut slots = variant_slot_info_map();
+        slots.get_mut(&SlotId::new(1)).unwrap().field_id = Some(10);
+        let plan = parse_hdfs_scan_variant_path_columns(
+            7,
+            Some(&[test_variant_path_column(Some(1), Some(2))]),
+            &slots,
+        )
+        .expect("variant path plan");
+        let layout = layout_from_slot_ids(1, [3, 2]);
+        let physical = slot_eq_int_expr(3, 7);
+        let variant = slot_binary_int_expr(2, 5, crate::opcodes::TExprOpcode::GT);
+        let predicates =
+            parse_hdfs_scan_pruning_predicates(7, Some(&[physical, variant]), &layout, &plan.specs)
+                .expect("parse pruning predicates");
+        let mut enable_page_index = true;
+        let mut min_max_predicates = predicates.physical;
+        let mut variant_path_predicates = predicates.variant;
+
+        apply_row_position_pruning_gate(
+            scan_ranges_have_position_delete_files(&ranges),
+            &mut enable_page_index,
+            &mut min_max_predicates,
+            &mut variant_path_predicates,
+        );
+
+        assert!(!enable_page_index);
+        assert!(min_max_predicates.is_empty());
+        assert!(variant_path_predicates.is_empty());
+    }
+
+    #[test]
+    fn lower_hdfs_scan_equality_delete_keeps_variant_pruning_gate_open() {
+        let ranges = vec![test_range_with_delete_file(
+            types::TIcebergFileContent::EQUALITY_DELETES,
+        )];
+        assert!(!scan_ranges_have_position_delete_files(&ranges));
+
+        let mut slots = variant_slot_info_map();
+        slots.get_mut(&SlotId::new(1)).unwrap().field_id = Some(10);
+        let plan = parse_hdfs_scan_variant_path_columns(
+            7,
+            Some(&[test_variant_path_column(Some(1), Some(2))]),
+            &slots,
+        )
+        .expect("variant path plan");
+        let layout = layout_from_slot_ids(1, [3, 2]);
+        let physical = slot_eq_int_expr(3, 7);
+        let variant = slot_binary_int_expr(2, 5, crate::opcodes::TExprOpcode::GT);
+        let predicates =
+            parse_hdfs_scan_pruning_predicates(7, Some(&[physical, variant]), &layout, &plan.specs)
+                .expect("parse pruning predicates");
+        let mut enable_page_index = true;
+        let mut min_max_predicates = predicates.physical;
+        let mut variant_path_predicates = predicates.variant;
+
+        apply_row_position_pruning_gate(
+            scan_ranges_have_position_delete_files(&ranges),
+            &mut enable_page_index,
+            &mut min_max_predicates,
+            &mut variant_path_predicates,
+        );
+
+        assert!(enable_page_index);
+        assert_eq!(min_max_predicates.len(), 1);
+        assert_eq!(variant_path_predicates.len(), 1);
     }
 
     #[test]
