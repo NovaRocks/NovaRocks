@@ -21,7 +21,10 @@ use parquet::file::page_index::column_index::ColumnIndexMetaData;
 use parquet::file::page_index::offset_index::OffsetIndexMetaData;
 use std::ops::Range;
 
-use super::{BoundVariantPathPruningPredicate, MinMaxPredicate};
+use super::{
+    BoundVariantPathPruningPredicate, MinMaxPredicate,
+    variant_residual_value_all_null_for_row_group,
+};
 
 pub(crate) struct PageSelectionResult {
     pub(crate) selection: Option<RowSelection>,
@@ -149,6 +152,10 @@ pub(crate) fn build_row_selection_for_row_groups(
                     col_chunk_idx
                 }
                 PagePredicateRef::Variant(predicate) => {
+                    if !variant_residual_value_all_null_for_row_group(row_group, predicate) {
+                        result.predicates_unsupported += 1;
+                        continue;
+                    }
                     if predicate.leaf_column_index >= row_group.columns().len() {
                         result.predicates_unsupported += 1;
                         continue;
@@ -472,9 +479,19 @@ mod tests {
     use super::*;
 
     fn page_index_metadata(field: Field, array: ArrayRef, rows_per_page: usize) -> ParquetMetaData {
-        let row_count = array.len();
-        let schema = Arc::new(Schema::new(vec![field]));
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![array]).expect("batch");
+        page_index_metadata_with_columns(vec![field], vec![array], rows_per_page)
+    }
+
+    fn page_index_metadata_with_columns(
+        fields: Vec<Field>,
+        arrays: Vec<ArrayRef>,
+        rows_per_page: usize,
+    ) -> ParquetMetaData {
+        assert!(!arrays.is_empty());
+        let row_count = arrays[0].len();
+        assert!(arrays.iter().all(|array| array.len() == row_count));
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), arrays).expect("batch");
         let props = WriterProperties::builder()
             .set_max_row_group_row_count(Some(row_count))
             .set_write_batch_size(rows_per_page)
@@ -503,6 +520,8 @@ mod tests {
         BoundVariantPathPruningPredicate {
             leaf_column_index: 0,
             leaf_column_path: "payload.typed_value.a.typed_value".to_string(),
+            residual_value_column_index: None,
+            residual_value_column_path: None,
             requested_type: DataType::Int64,
             predicate: MinMaxPredicate::Gt {
                 column: "__nr_var_payload_a".to_string(),
@@ -530,6 +549,39 @@ mod tests {
         assert_eq!(selection.pages_pruned, 3);
         assert_eq!(selection.predicates_unsupported, 0);
         assert!(selection.selection.is_some());
+    }
+
+    #[test]
+    fn variant_page_selection_keeps_all_rows_when_residual_value_has_non_nulls() {
+        let metadata = page_index_metadata_with_columns(
+            vec![
+                Field::new("payload.typed_value.a.typed_value", DataType::Int64, true),
+                Field::new("payload.typed_value.a.value", DataType::Utf8, true),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 10, 11, 12])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("residual"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ])) as ArrayRef,
+            ],
+            1,
+        );
+        let mut predicate = bound_variant_gt_i64(5);
+        predicate.residual_value_column_index = Some(1);
+        predicate.residual_value_column_path = Some("payload.typed_value.a.value".to_string());
+
+        let selection =
+            build_row_selection_for_row_groups(&metadata, &[0], &[], &[predicate], &[], true);
+
+        assert_eq!(selection.rows_total, 6);
+        assert_eq!(selection.rows_selected, 6);
+        assert_eq!(selection.pages_pruned, 0);
+        assert!(selection.selection.is_none());
     }
 
     #[test]

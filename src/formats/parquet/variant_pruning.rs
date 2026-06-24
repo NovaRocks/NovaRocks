@@ -17,7 +17,7 @@
 
 use arrow::datatypes::DataType;
 use parquet::basic::{ConvertedType, LogicalType, Type as PhysicalType};
-use parquet::file::metadata::ParquetMetaData;
+use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
 use parquet::schema::types::{ColumnDescriptor, Type};
 
 use crate::common::ids::SlotId;
@@ -29,6 +29,8 @@ use super::{MinMaxPredicate, VariantPathSpec};
 pub(crate) struct BoundVariantPathPruningPredicate {
     pub(crate) leaf_column_index: usize,
     pub(crate) leaf_column_path: String,
+    pub(crate) residual_value_column_index: Option<usize>,
+    pub(crate) residual_value_column_path: Option<String>,
     pub(crate) requested_type: DataType,
     pub(crate) predicate: MinMaxPredicate,
 }
@@ -86,9 +88,21 @@ pub(crate) fn bind_variant_path_pruning_predicates(
             if !parquet_leaf_matches_requested_type(column, &predicate.requested_type) {
                 continue;
             }
+            let expected_residual_path = expected_residual_value_leaf_path(root.name(), &path);
+            let residual_value_column = schema_descr.columns().iter().enumerate().find(
+                |(residual_column_index, residual_column)| {
+                    let residual_root = schema_descr.get_column_root(*residual_column_index);
+                    root_matches_field_id(residual_root, source_field_id)
+                        && residual_column.path().parts() == expected_residual_path.as_slice()
+                },
+            );
             bound.push(BoundVariantPathPruningPredicate {
                 leaf_column_index,
                 leaf_column_path: column.path().string(),
+                residual_value_column_index: residual_value_column
+                    .map(|(residual_column_index, _)| residual_column_index),
+                residual_value_column_path: residual_value_column
+                    .map(|(_, residual_column)| residual_column.path().string()),
                 requested_type: predicate.requested_type.clone(),
                 predicate: predicate.predicate.clone(),
             });
@@ -97,6 +111,26 @@ pub(crate) fn bind_variant_path_pruning_predicates(
     }
 
     bound
+}
+
+pub(crate) fn variant_residual_value_all_null_for_row_group(
+    row_group: &RowGroupMetaData,
+    pred: &BoundVariantPathPruningPredicate,
+) -> bool {
+    let Some(residual_column_index) = pred.residual_value_column_index else {
+        return true;
+    };
+    let Some(column) = row_group.columns().get(residual_column_index) else {
+        return false;
+    };
+    let Some(stats) = column.statistics() else {
+        return false;
+    };
+    let row_count = row_group.num_rows();
+    if row_count < 0 {
+        return false;
+    }
+    stats.null_count_opt() == Some(row_count as u64)
 }
 
 fn root_matches_field_id(root: &Type, source_field_id: i32) -> bool {
@@ -112,6 +146,17 @@ fn expected_typed_leaf_path(root_name: &str, path: &[String]) -> Vec<String> {
         parts.push(key.clone());
     }
     parts.push("typed_value".to_string());
+    parts
+}
+
+fn expected_residual_value_leaf_path(root_name: &str, path: &[String]) -> Vec<String> {
+    let mut parts = Vec::with_capacity(1 + path.len() * 2);
+    parts.push(root_name.to_string());
+    for key in path {
+        parts.push("typed_value".to_string());
+        parts.push(key.clone());
+    }
+    parts.push("value".to_string());
     parts
 }
 
@@ -148,8 +193,8 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::array::{
-        ArrayRef, BooleanArray, Date32Array, Float64Array, Int64Array, StringArray, StructArray,
-        Time64MicrosecondArray, TimestampMicrosecondArray,
+        ArrayRef, BinaryArray, BooleanArray, Date32Array, Float64Array, Int64Array, StringArray,
+        StructArray, Time64MicrosecondArray, TimestampMicrosecondArray,
     };
     use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
     use arrow::record_batch::RecordBatch;
@@ -240,6 +285,68 @@ mod tests {
                 typed_value_field =
                     Field::new("typed_value", typed_value_array.data_type().clone(), true);
             }
+        }
+
+        let root_typed_field =
+            Field::new("typed_value", typed_value_array.data_type().clone(), true);
+        let payload = Arc::new(struct_array(
+            vec![root_typed_field],
+            vec![typed_value_array],
+        )) as ArrayRef;
+        let payload_field = field_with_id(
+            "payload_physical",
+            payload.data_type().clone(),
+            true,
+            root_field_id,
+        );
+        let schema = Arc::new(Schema::new(vec![payload_field]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![payload]).expect("batch");
+
+        let mut buffer = Vec::new();
+        {
+            let cursor = Cursor::new(&mut buffer);
+            let mut writer = ArrowWriter::try_new(cursor, schema, None).expect("writer");
+            writer.write(&batch).expect("write batch");
+            writer.close().expect("close writer");
+        }
+        let reader =
+            SerializedFileReader::new(bytes::Bytes::from(buffer)).expect("metadata reader");
+        reader.metadata().clone()
+    }
+
+    fn variant_metadata_with_residual_value_leaf_path(
+        path: &[&str],
+        leaf_field: Field,
+        leaf_array: ArrayRef,
+        residual_value_array: ArrayRef,
+        root_field_id: i32,
+    ) -> ParquetMetaData {
+        assert!(!path.is_empty());
+
+        let final_key_node = Arc::new(struct_array(
+            vec![
+                leaf_field,
+                Field::new("value", residual_value_array.data_type().clone(), true),
+            ],
+            vec![leaf_array, residual_value_array],
+        )) as ArrayRef;
+        let final_key_field = Field::new(
+            *path.last().expect("final key"),
+            final_key_node.data_type().clone(),
+            true,
+        );
+        let mut typed_value_array =
+            Arc::new(struct_array(vec![final_key_field], vec![final_key_node])) as ArrayRef;
+
+        for key in path.iter().rev().skip(1) {
+            let typed_value_field =
+                Field::new("typed_value", typed_value_array.data_type().clone(), true);
+            let key_node = Arc::new(struct_array(
+                vec![typed_value_field],
+                vec![typed_value_array],
+            )) as ArrayRef;
+            let key_field = Field::new(*key, key_node.data_type().clone(), true);
+            typed_value_array = Arc::new(struct_array(vec![key_field], vec![key_node])) as ArrayRef;
         }
 
         let root_typed_field =
@@ -373,6 +480,32 @@ mod tests {
         );
         assert_eq!(bound[0].requested_type, DataType::Int64);
         assert_eq!(bound[0].predicate, predicate.predicate);
+    }
+
+    #[test]
+    fn variant_pruning_binds_final_path_residual_value_sibling() {
+        let metadata = variant_metadata_with_residual_value_leaf_path(
+            &["a", "b"],
+            Field::new("typed_value", DataType::Int64, true),
+            Arc::new(Int64Array::from(vec![Some(7)])),
+            Arc::new(BinaryArray::from_opt_vec(vec![Some(&[1u8, 2u8][..])])),
+            10,
+        );
+        let specs = vec![variant_path_spec_for(Some(10), "$.a.b", DataType::Int64)];
+        let predicate = variant_path_predicate(Some(10), "$.a.b", DataType::Int64);
+        let bound = bind_variant_path_pruning_predicates(&metadata, &specs, &[predicate]);
+
+        assert_eq!(bound.len(), 1);
+        assert_eq!(bound[0].leaf_column_index, 0);
+        assert_eq!(
+            bound[0].leaf_column_path,
+            "payload_physical.typed_value.a.typed_value.b.typed_value"
+        );
+        assert_eq!(bound[0].residual_value_column_index, Some(1));
+        assert_eq!(
+            bound[0].residual_value_column_path.as_deref(),
+            Some("payload_physical.typed_value.a.typed_value.b.value")
+        );
     }
 
     #[test]

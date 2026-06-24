@@ -67,6 +67,7 @@ use row_group_selector::select_row_groups_for_range;
 pub use variant_pruning::VariantPathPruningPredicate;
 pub(crate) use variant_pruning::{
     BoundVariantPathPruningPredicate, bind_variant_path_pruning_predicates,
+    variant_residual_value_all_null_for_row_group,
 };
 use variant_read::{
     collapse_variant_struct_to_largebinary, convert_variant_columns, is_variant_struct_data_type,

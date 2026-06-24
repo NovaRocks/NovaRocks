@@ -21,7 +21,10 @@ use parquet::file::statistics::Statistics;
 use crate::fs::scan_context::FileScanRange;
 use crate::novarocks_logging::debug;
 
-use super::{BoundVariantPathPruningPredicate, MinMaxPredicate, MinMaxPredicateValue};
+use super::{
+    BoundVariantPathPruningPredicate, MinMaxPredicate, MinMaxPredicateValue,
+    variant_residual_value_all_null_for_row_group,
+};
 
 pub(crate) fn select_row_groups_for_range(
     metadata: &ParquetMetaData,
@@ -144,6 +147,9 @@ fn should_read_row_group(
     }
 
     for pred in variant_predicates {
+        if !variant_residual_value_all_null_for_row_group(row_group, pred) {
+            continue;
+        }
         let Some(column) = row_group.columns().get(pred.leaf_column_index) else {
             continue;
         };
@@ -562,7 +568,7 @@ mod tests {
     use std::io::Cursor;
     use std::sync::Arc;
 
-    use arrow::array::{ArrayRef, Int64Array};
+    use arrow::array::{ArrayRef, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use parquet::arrow::ArrowWriter;
@@ -615,6 +621,52 @@ mod tests {
         reader.metadata().clone()
     }
 
+    fn typed_and_residual_parquet_metadata() -> ParquetMetaData {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("payload.typed_value.a.typed_value", DataType::Int64, true),
+            Field::new("payload.typed_value.a.value", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![
+                    Some(1),
+                    Some(2),
+                    Some(3),
+                    Some(10),
+                    Some(11),
+                    Some(12),
+                ])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("residual"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ])) as ArrayRef,
+            ],
+        )
+        .expect("record batch");
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(3))
+            .set_statistics_enabled(EnabledStatistics::Chunk)
+            .build();
+
+        let mut buffer = Vec::new();
+        {
+            let cursor = Cursor::new(&mut buffer);
+            let mut writer =
+                ArrowWriter::try_new(cursor, schema, Some(props)).expect("parquet writer");
+            writer.write(&batch).expect("write parquet batch");
+            writer.close().expect("close parquet writer");
+        }
+
+        let reader =
+            SerializedFileReader::new(bytes::Bytes::from(buffer)).expect("metadata reader");
+        reader.metadata().clone()
+    }
+
     fn variant_gt_i64_predicate(
         leaf_column_index: usize,
         value: i64,
@@ -622,6 +674,8 @@ mod tests {
         BoundVariantPathPruningPredicate {
             leaf_column_index,
             leaf_column_path: "a".to_string(),
+            residual_value_column_index: None,
+            residual_value_column_path: None,
             requested_type: DataType::Int64,
             predicate: MinMaxPredicate::Gt {
                 column: "0".to_string(),
@@ -647,6 +701,27 @@ mod tests {
         .expect("row groups selected");
 
         assert_eq!(selected, vec![1]);
+    }
+
+    #[test]
+    fn variant_row_group_pruning_keeps_group_when_residual_value_has_non_nulls() {
+        let metadata = typed_and_residual_parquet_metadata();
+        let mut predicate = variant_gt_i64_predicate(0, 5);
+        predicate.residual_value_column_index = Some(1);
+        predicate.residual_value_column_path = Some("payload.typed_value.a.value".to_string());
+
+        let selected = select_row_groups_for_range(
+            &metadata,
+            &test_scan_range(),
+            None,
+            &[],
+            &[predicate],
+            &[],
+            true,
+        )
+        .expect("row groups selected");
+
+        assert_eq!(selected, vec![0, 1]);
     }
 
     #[test]
