@@ -83,7 +83,7 @@ pub(crate) use rewrite_data_files::{LiveFileMetrics, current_live_file_metrics};
 pub use row_delta::RowDeltaCommit;
 pub use row_delta_dv::RowDeltaDvCommit;
 pub use row_delta_dv_from_files::RowDeltaDvFromFilesCommit;
-pub use run::{CleanupPathMapper, RunInput, run_iceberg_commit, run_iceberg_commit_typed};
+pub use run::{CleanupPathMapper, RunInput, run_iceberg_commit_typed};
 pub use service::{
     CleanupAttempt, CommitFailureKind, CommitServiceError, CommitServiceOutcome, RecoveryEvidence,
     classify_commit_error,

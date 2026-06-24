@@ -53,7 +53,7 @@ pub(crate) struct IcebergTestFixture {
 /// Build a `MemoryCatalog`-backed v3 iceberg table with a single `id long`
 /// column, no partitioning, and no current snapshot. Suitable as the base for
 /// the empty-table TRUNCATE test; for tests that need actual data files,
-/// drive a `FastAppendCommit` through `run_iceberg_commit` against the
+/// drive a `FastAppendCommit` through `run_iceberg_commit_typed` against the
 /// returned catalog before the action under test.
 pub(crate) async fn empty_v3_iceberg_table() -> IcebergTestFixture {
     let warehouse = format!("memory://test-warehouse-{}", Uuid::new_v4());
@@ -101,7 +101,7 @@ pub(crate) async fn empty_v3_iceberg_table() -> IcebergTestFixture {
     }
 }
 
-/// Drive a single commit-action through the same pieces `run_iceberg_commit`
+/// Drive a single commit-action through the same pieces `run_iceberg_commit_typed`
 /// does, but with a minimal collector — no pipeline, no Operator-backed
 /// abort cleanup, no sidecar threading. Suitable for direct unit testing of
 /// commit-action logic.

@@ -20,8 +20,9 @@
 //! failure decide whether to clean staged files or leave them for human
 //! review (spec §5.4 — "commit unknown").
 //!
-//! Commit failure classification is delegated to `service.rs`, which preserves
-//! the legacy cleanup decision while exposing typed lifecycle errors.
+//! Commit failure classification is delegated to `service.rs`, which exposes
+//! typed lifecycle errors while preserving cleanup behavior for known
+//! uncommitted failures.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -64,16 +65,6 @@ pub struct RunInput {
     pub snapshot_properties: BTreeMap<String, String>,
 }
 
-/// Legacy compatibility wrapper for existing engine paths.
-///
-/// New lifecycle-aware callers should use [`run_iceberg_commit_typed`] so they
-/// can branch on `CommitServiceError` without parsing user-facing strings.
-pub async fn run_iceberg_commit(input: RunInput) -> Result<CommitOutcome, String> {
-    run_iceberg_commit_typed(input)
-        .await
-        .map_err(CommitServiceError::into_legacy_string)
-}
-
 /// Dispatch a commit-action and return typed commit outcome/error.
 ///
 /// On definite commit failure this function runs best-effort abort cleanup and
@@ -103,9 +94,8 @@ pub async fn run_iceberg_commit_typed(
         CommitOpKind::RewriteDataFiles => Box::new(RewriteDataFilesCommit),
         CommitOpKind::CowUpdate => Box::new(CowUpdateCommit {
             rewrite: cow_update_rewrite.ok_or_else(|| {
-                CommitServiceError::known_uncommitted(
+                CommitServiceError::invalid_input(
                     "CowUpdate commit requires a rewrite set".to_string(),
-                    CleanupAttempt::not_attempted(),
                 )
             })?,
         }),
@@ -114,9 +104,8 @@ pub async fn run_iceberg_commit_typed(
             Box::new(super::overwrite_partitions::OverwritePartitionsCommit)
         }
         CommitOpKind::RewriteManifests => {
-            return Err(CommitServiceError::known_uncommitted(
+            return Err(CommitServiceError::invalid_input(
                 "CommitOpKind::RewriteManifests must be invoked via run_rewrite_manifests directly, not the collector dispatcher".to_string(),
-                CleanupAttempt::not_attempted(),
             ));
         }
     };
@@ -149,6 +138,13 @@ pub async fn run_iceberg_commit_typed(
                 );
                 Err(CommitServiceError::unknown(commit_err, evidence))
             }
+            CommitFailureKind::FinalizeFailedKnownCommitted => {
+                Err(CommitServiceError::finalize_failed_known_committed(
+                    None,
+                    commit_err,
+                    RecoveryEvidence::from_collector(&collector),
+                ))
+            }
             CommitFailureKind::KnownUncommitted => {
                 let cleanup_errors = if let Some(mapper) = cleanup_path_mapper {
                     collector
@@ -172,8 +168,45 @@ pub async fn run_iceberg_commit_typed(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use opendal::Operator;
+    use opendal::services::Memory;
+
     use super::super::service::{CleanupAttempt, CommitServiceError, RecoveryEvidence};
+    use super::super::test_helpers::IcebergTestFixture;
+    use super::super::test_helpers::empty_v3_iceberg_table;
     use super::*;
+
+    fn input_for_op(fixture: IcebergTestFixture, op_kind: CommitOpKind) -> RunInput {
+        let metadata = fixture.table.metadata();
+        let collector = Arc::new(
+            IcebergCommitCollector::new(
+                op_kind,
+                fixture.table_ident.clone(),
+                metadata.current_snapshot().map(|s| s.snapshot_id()),
+                metadata.last_sequence_number(),
+                metadata.current_schema().clone(),
+                metadata.default_partition_spec().clone(),
+                format!("{}/staging", metadata.location()),
+                crate::common::types::UniqueId { hi: 0, lo: 0 },
+            )
+            .with_table_metadata(metadata.clone()),
+        );
+        RunInput {
+            collector,
+            catalog: fixture.catalog,
+            table: fixture.table,
+            fs: Operator::new(Memory::default())
+                .expect("memory operator")
+                .finish(),
+            file_io: iceberg::io::FileIO::new_with_memory(),
+            cleanup_path_mapper: None,
+            cow_update_rewrite: None,
+            target_ref: "main".to_string(),
+            snapshot_properties: BTreeMap::new(),
+        }
+    }
 
     #[test]
     fn commit_service_error_legacy_string_preserves_known_failure_format() {
@@ -215,5 +248,25 @@ mod tests {
         let _ = CommitOpKind::RowDeltaDvFromFiles;
         let _ =
             std::any::type_name::<crate::connector::iceberg::commit::RowDeltaDvFromFilesCommit>();
+    }
+
+    #[tokio::test]
+    async fn invalid_dispatch_errors_are_invalid_input_not_known_uncommitted() {
+        let fixture = empty_v3_iceberg_table().await;
+
+        let cow_err =
+            run_iceberg_commit_typed(input_for_op(fixture.clone(), CommitOpKind::CowUpdate))
+                .await
+                .expect_err("missing CowUpdate rewrite set should fail before dispatch");
+        assert!(matches!(cow_err, CommitServiceError::InvalidInput { .. }));
+
+        let rewrite_manifests_err =
+            run_iceberg_commit_typed(input_for_op(fixture, CommitOpKind::RewriteManifests))
+                .await
+                .expect_err("RewriteManifests should not use the collector dispatcher");
+        assert!(matches!(
+            rewrite_manifests_err,
+            CommitServiceError::InvalidInput { .. }
+        ));
     }
 }
