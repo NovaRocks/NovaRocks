@@ -2153,6 +2153,7 @@ mod tests {
     use std::collections::HashMap;
     use std::collections::HashSet;
     use std::fs::{self, File};
+    use std::io::Cursor;
     use std::path::Path;
     use std::sync::Arc;
 
@@ -2163,6 +2164,8 @@ mod tests {
     use parquet::arrow::{
         ArrowWriter, PARQUET_FIELD_ID_META_KEY, arrow_reader::ParquetRecordBatchReaderBuilder,
     };
+    use parquet::file::metadata::ParquetMetaData;
+    use parquet::file::properties::{EnabledStatistics, WriterProperties};
     use parquet::file::reader::{FileReader, SerializedFileReader};
 
     use crate::cache::{
@@ -2176,10 +2179,12 @@ mod tests {
 
     use super::{
         MinMaxPredicate, MinMaxPredicateValue, ParquetReadCachePolicy, ParquetScanConfig,
-        VariantPathSpec, build_active_projection_columns, build_delayed_output_sources,
-        build_delayed_projection_plan, build_parquet_iter, collect_parquet_coalesce_io_ranges,
-        evaluate_batch_predicate_mask, reader::ParquetCachedReader,
-        runtime_filters_to_min_max_predicates,
+        ParquetScanIter, VariantPathPruningPredicate, VariantPathSpec,
+        bind_variant_path_pruning_predicates, build_active_projection_columns,
+        build_delayed_output_sources, build_delayed_projection_plan, build_parquet_iter,
+        collect_parquet_coalesce_io_ranges, evaluate_batch_predicate_mask,
+        reader::ParquetCachedReader, runtime_filters_to_min_max_predicates,
+        select_row_groups_for_range,
     };
 
     fn field_id_meta(field_id: i32) -> HashMap<String, String> {
@@ -2236,6 +2241,185 @@ mod tests {
             variant_path_columns: Vec::new(),
             query_global_dicts: Default::default(),
         }
+    }
+
+    fn test_scan_range() -> FileScanRange {
+        FileScanRange {
+            path: "memory.parquet".to_string(),
+            file_len: 0,
+            offset: 0,
+            length: 0,
+            scan_range_id: 0,
+            first_row_id: None,
+            data_sequence_number: None,
+            ivm_change_op: None,
+            included_positions: None,
+            external_datacache: None,
+            delete_files: Vec::new(),
+        }
+    }
+
+    fn test_scan_iter_for_predicates(cfg: ParquetScanConfig) -> ParquetScanIter {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let op =
+            build_fs_operator(temp_dir.path().to_str().expect("temp dir path")).expect("operator");
+        let factory = OpendalRangeReaderFactory::from_operator(op).expect("reader factory");
+        ParquetScanIter::new(cfg, Vec::new(), factory, None, None, None).expect("scan iter")
+    }
+
+    fn variant_row_group_metadata(stats: EnabledStatistics) -> ParquetMetaData {
+        let leaf_values = Arc::new(Int64Array::from(vec![1, 2, 3, 10, 11, 12])) as ArrayRef;
+        let typed_value_field = Arc::new(Field::new("typed_value", DataType::Int64, true));
+        let typed_value_node = StructArray::try_new(
+            vec![Arc::clone(&typed_value_field)].into(),
+            vec![leaf_values],
+            None,
+        )
+        .expect("typed value node");
+        let object_field = Arc::new(Field::new("a", typed_value_node.data_type().clone(), true));
+        let object_node = StructArray::try_new(
+            vec![Arc::clone(&object_field)].into(),
+            vec![Arc::new(typed_value_node) as ArrayRef],
+            None,
+        )
+        .expect("object node");
+        let root_typed_value_field = Arc::new(Field::new(
+            "typed_value",
+            object_node.data_type().clone(),
+            true,
+        ));
+        let payload = StructArray::try_new(
+            vec![Arc::clone(&root_typed_value_field)].into(),
+            vec![Arc::new(object_node) as ArrayRef],
+            None,
+        )
+        .expect("payload");
+        let schema = Arc::new(Schema::new(vec![field_with_id(
+            "payload_physical",
+            payload.data_type().clone(),
+            true,
+            10,
+        )]));
+        let batch =
+            arrow::record_batch::RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(payload)])
+                .expect("batch");
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(3))
+            .set_statistics_enabled(stats)
+            .build();
+
+        let mut buffer = Vec::new();
+        {
+            let cursor = Cursor::new(&mut buffer);
+            let mut writer =
+                ArrowWriter::try_new(cursor, schema, Some(props)).expect("parquet writer");
+            writer.write(&batch).expect("write parquet batch");
+            writer.close().expect("close parquet writer");
+        }
+
+        let reader =
+            SerializedFileReader::new(bytes::Bytes::from(buffer)).expect("metadata reader");
+        reader.metadata().clone()
+    }
+
+    fn variant_path_spec(source_field_id: Option<i32>) -> VariantPathSpec {
+        VariantPathSpec {
+            source_slot_id: SlotId::new(3),
+            source_read_slot_id: SlotId::new(3),
+            output_slot_id: SlotId::new(2),
+            source_field_id,
+            source_name: "payload".to_string(),
+            output_name: "__nr_var_payload_a".to_string(),
+            source_field: Field::new("payload", DataType::LargeBinary, true),
+            output_field: Field::new("__nr_var_payload_a", DataType::Int64, true),
+            canonical_path: "$.a".to_string(),
+            requested_type: DataType::Int64,
+            strict: true,
+        }
+    }
+
+    fn variant_path_predicate(source_field_id: Option<i32>) -> VariantPathPruningPredicate {
+        VariantPathPruningPredicate {
+            output_slot_id: SlotId::new(2),
+            source_slot_id: SlotId::new(3),
+            source_field_id,
+            canonical_path: "$.a".to_string(),
+            requested_type: DataType::Int64,
+            predicate: MinMaxPredicate::Gt {
+                column: "__nr_var_payload_a".to_string(),
+                value: MinMaxPredicateValue::Int64(5),
+            },
+        }
+    }
+
+    #[test]
+    fn variant_row_group_pruning_wiring_binds_and_selects_typed_leaf() {
+        let metadata = variant_row_group_metadata(EnabledStatistics::Chunk);
+        let specs = vec![variant_path_spec(Some(10))];
+        let predicates = vec![variant_path_predicate(Some(10))];
+
+        let bound = bind_variant_path_pruning_predicates(&metadata, &specs, &predicates);
+        let selected = select_row_groups_for_range(
+            &metadata,
+            &test_scan_range(),
+            None,
+            &[],
+            &bound,
+            &[],
+            true,
+        )
+        .expect("row groups selected");
+
+        assert_eq!(selected, vec![1]);
+    }
+
+    #[test]
+    fn variant_row_group_pruning_wiring_reads_all_when_binding_fails() {
+        let metadata = variant_row_group_metadata(EnabledStatistics::Chunk);
+        let specs = vec![variant_path_spec(Some(10))];
+        let predicates = vec![variant_path_predicate(Some(11))];
+
+        let bound = bind_variant_path_pruning_predicates(&metadata, &specs, &predicates);
+        let selected = select_row_groups_for_range(
+            &metadata,
+            &test_scan_range(),
+            Some(usize::MAX),
+            &[],
+            &bound,
+            &[],
+            true,
+        )
+        .expect("row groups selected");
+
+        assert!(bound.is_empty());
+        assert_eq!(selected, vec![0, 1]);
+    }
+
+    #[test]
+    fn current_pruning_predicates_schema_evolution_clears_physical_and_variant() {
+        let mut cfg = test_parquet_scan_cfg(
+            vec!["payload".to_string()],
+            vec![types::TPrimitiveType::VARIANT],
+            Some(Schema::new(vec![Field::new(
+                "payload",
+                DataType::LargeBinary,
+                true,
+            )])),
+        );
+        cfg.min_max_predicates.push(MinMaxPredicate::Gt {
+            column: "0".to_string(),
+            value: MinMaxPredicateValue::Int64(5),
+        });
+        cfg.variant_path_predicates
+            .push(variant_path_predicate(Some(10)));
+        let iter = test_scan_iter_for_predicates(cfg);
+
+        let predicates = iter
+            .current_pruning_predicates()
+            .expect("current predicates");
+
+        assert!(predicates.physical.is_empty());
+        assert!(predicates.variant.is_empty());
     }
 
     #[test]

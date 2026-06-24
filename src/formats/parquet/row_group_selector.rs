@@ -94,7 +94,7 @@ pub(crate) fn select_row_groups_for_range(
 
     if filtered_count > 0 {
         debug!(
-            "min_max filter: filtered {} row groups, kept {}",
+            "row group pruning: filtered {} row groups, kept {}",
             filtered_count,
             row_groups.len()
         );
@@ -145,7 +145,7 @@ fn should_read_row_group(
 
     for pred in variant_predicates {
         let Some(column) = row_group.columns().get(pred.leaf_column_index) else {
-            return Ok(true);
+            continue;
         };
         if !column_stats_satisfy_predicate(column, &pred.predicate)? {
             return Ok(false);
@@ -679,6 +679,26 @@ mod tests {
         )
         .expect("row groups selected");
         assert_eq!(selected, vec![0, 1]);
+    }
+
+    #[test]
+    fn variant_row_group_pruning_continues_after_unusable_variant_predicate() {
+        let metadata = int64_parquet_metadata(vec![1, 2, 3, 10, 11, 12], EnabledStatistics::Chunk);
+        let out_of_range = variant_gt_i64_predicate(9, 5);
+        let usable = variant_gt_i64_predicate(0, 5);
+
+        let selected = select_row_groups_for_range(
+            &metadata,
+            &test_scan_range(),
+            None,
+            &[],
+            &[out_of_range, usable],
+            &[],
+            true,
+        )
+        .expect("row groups selected");
+
+        assert_eq!(selected, vec![1]);
     }
 
     #[test]
