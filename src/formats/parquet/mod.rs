@@ -18,6 +18,7 @@ mod cache;
 mod page_selection;
 mod reader;
 mod row_group_selector;
+mod variant_pruning;
 mod variant_read;
 
 pub use crate::common::min_max_predicate::{
@@ -63,6 +64,11 @@ use crate::types;
 use page_selection::build_row_selection_for_row_groups;
 pub(crate) use reader::ParquetCachedReader;
 use row_group_selector::select_row_groups_for_range;
+pub use variant_pruning::VariantPathPruningPredicate;
+#[allow(unused_imports)]
+pub(crate) use variant_pruning::{
+    BoundVariantPathPruningPredicate, bind_variant_path_pruning_predicates,
+};
 use variant_read::{
     collapse_variant_struct_to_largebinary, convert_variant_columns, is_variant_struct_data_type,
     materialize_variant_path_columns,
@@ -220,16 +226,6 @@ pub struct VariantPathSpec {
     pub canonical_path: String,
     pub requested_type: DataType,
     pub strict: bool,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct VariantPathPruningPredicate {
-    pub output_slot_id: SlotId,
-    pub source_slot_id: SlotId,
-    pub source_field_id: Option<i32>,
-    pub canonical_path: String,
-    pub requested_type: DataType,
-    pub predicate: MinMaxPredicate,
 }
 
 #[derive(Clone, Debug)]

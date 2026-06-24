@@ -330,7 +330,7 @@ fn source_to_engine_variant_array(
     large_binary_to_variant_array(source)
 }
 
-fn object_key_path(path_str: &str) -> Option<Vec<String>> {
+pub(crate) fn object_key_path(path_str: &str) -> Option<Vec<String>> {
     let parsed = parse_variant_path(path_str).ok()?;
     if parsed.segments.is_empty() {
         return None;
