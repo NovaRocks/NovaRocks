@@ -64,27 +64,6 @@ pub fn ensure_iceberg_write_supported(table: &Table) -> Result<IcebergWriteMode,
     Ok(classify_iceberg_write_mode(table))
 }
 
-/// Used by the four non-INSERT write entry points (DELETE, UPDATE / MERGE,
-/// INSERT OVERWRITE, ADD EQUALITY DELETE) to reject variant-bearing tables
-/// while only the INSERT happy path supports them.
-pub fn ensure_no_variant_columns_for_row_level_mutation(table: &Table) -> Result<(), String> {
-    use iceberg::spec::{PrimitiveType, Type};
-    let schema = table.metadata().current_schema();
-    for f in schema.as_struct().fields() {
-        if matches!(
-            f.field_type.as_ref(),
-            Type::Primitive(PrimitiveType::Variant)
-        ) {
-            return Err(format!(
-                "iceberg table column '{name}' is variant; row-level mutation of variant tables is not supported in this release. \
-                 INSERT (without OVERWRITE) is supported.",
-                name = f.name,
-            ));
-        }
-    }
-    Ok(())
-}
-
 // Wired in by later tasks (insert/overwrite/update/delete planning).
 #[allow(dead_code)]
 pub fn ensure_no_variant_in_partition_spec(table: &Table) -> Result<(), String> {
@@ -638,32 +617,5 @@ mod tests {
             &DataType::Utf8,
             &iceberg_ty
         ));
-    }
-
-    #[test]
-    fn ensure_no_variant_columns_for_row_level_mutation_rejects_variant_table() {
-        use iceberg::spec::{NestedField, PrimitiveType, Type};
-        let table = make_table_with(
-            vec![
-                NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                NestedField::optional(2, "v", Type::Primitive(PrimitiveType::Variant)).into(),
-            ],
-            vec![],
-            vec![],
-        );
-        let err = ensure_no_variant_columns_for_row_level_mutation(&table).expect_err("reject");
-        assert!(err.contains("variant"), "{err}");
-        assert!(err.contains("INSERT"), "{err}");
-    }
-
-    #[test]
-    fn ensure_no_variant_columns_for_row_level_mutation_accepts_plain_table() {
-        use iceberg::spec::{NestedField, PrimitiveType, Type};
-        let table = make_table_with(
-            vec![NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into()],
-            vec![],
-            vec![],
-        );
-        ensure_no_variant_columns_for_row_level_mutation(&table).expect("ok");
     }
 }

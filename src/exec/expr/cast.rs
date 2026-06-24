@@ -3870,8 +3870,8 @@ mod tests {
     use crate::lower::type_lowering::scalar_type_desc;
     use crate::types;
     use arrow::array::{
-        ArrayRef, Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Int8Array, Int32Array,
-        Int64Array, StringArray, StructArray,
+        ArrayRef, BinaryArray, Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Int8Array,
+        Int32Array, Int64Array, LargeBinaryArray, StringArray, StructArray,
     };
     use arrow::datatypes::{Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -3956,6 +3956,20 @@ mod tests {
         assert!(out.is_null(2));
         assert!(out.is_null(3));
         assert!(out.is_null(4));
+    }
+
+    #[test]
+    fn test_cast_binary_to_largebinary_preserves_variant_payload_bytes() {
+        let input = Arc::new(BinaryArray::from(vec![Some(&[0xab, 0x01][..]), None])) as ArrayRef;
+
+        let out = cast_with_special_rules(&input, &DataType::LargeBinary).expect("cast");
+        let out = out
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .expect("LargeBinaryArray");
+
+        assert_eq!(out.value(0), &[0xab, 0x01]);
+        assert!(out.is_null(1));
     }
 
     #[test]

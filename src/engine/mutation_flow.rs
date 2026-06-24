@@ -13,7 +13,7 @@ use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_icebe
 use crate::connector::iceberg::commit::{
     CommitOpKind, CommitOutcome, CommitServiceError, CowUpdateRewriteSet, CowUpdateTouchedFile,
     IcebergCommitCollector, IcebergUpdateMode, ensure_iceberg_write_supported,
-    ensure_no_variant_columns_for_row_level_mutation, select_iceberg_update_mode,
+    select_iceberg_update_mode,
 };
 use crate::engine::write_transaction::{
     IcebergWriteCommitExecutor, IcebergWriteCommitPolicy, IcebergWriteSource,
@@ -86,11 +86,6 @@ pub(crate) fn execute_update_statement(
     );
     let table = block_on_iceberg(async { catalog.load_table(&table_ident).await })?
         .map_err(|e| format!("load iceberg table {}: {e}", &table_ident))?;
-
-    // Reject variant tables before any planning. Without this guard the
-    // failure surfaces deep inside `materialize_update_matches` as a
-    // planner error about the row-lineage `__nr_t` column.
-    ensure_no_variant_columns_for_row_level_mutation(&table).map_err(|e| format!("UPDATE: {e}"))?;
 
     // Branch writes require Iceberg v3 (row-lineage semantics).
     if target_ref != "main" {
@@ -630,12 +625,10 @@ fn build_merge_mor_data_sink_query_from_matched(
                 })?;
             let literal =
                 crate::engine::sql_expr::literal_from_batch(matched.new_rows.column(idx), row)?;
-            values.push(
-                crate::engine::iceberg_writer::literal_to_sql_for_arrow_type(
-                    &literal,
-                    &target_column.data_type,
-                )?,
-            );
+            values.push(literal_to_sql_for_values_target_column(
+                &literal,
+                target_column,
+            )?);
         }
         values.push(matched.row_ids[row].to_string());
         values.push(new_sequence_number.to_string());
@@ -1313,12 +1306,10 @@ fn build_cow_rewrite_query(
                 })?;
             let literal =
                 crate::engine::sql_expr::literal_from_batch(matched.new_rows.column(col_idx), idx)?;
-            values.push(
-                crate::engine::iceberg_writer::literal_to_sql_for_arrow_type(
-                    &literal,
-                    &target_column.data_type,
-                )?,
-            );
+            values.push(literal_to_sql_for_values_target_column(
+                &literal,
+                target_column,
+            )?);
         }
         value_rows.push(format!("({})", values.join(", ")));
     }
@@ -1387,6 +1378,21 @@ fn build_cow_rewrite_query(
         qualify_column(scan_alias, row_id_col),
     );
     parse_generated_query(&sql, "COW UPDATE rewrite")
+}
+
+fn literal_to_sql_for_values_target_column(
+    literal: &crate::sql::parser::ast::Literal,
+    target_column: &crate::engine::catalog::ColumnDef,
+) -> Result<String, String> {
+    let literal_sql = crate::engine::iceberg_writer::literal_to_sql_for_arrow_type(
+        literal,
+        &target_column.data_type,
+    )?;
+    if matches!(target_column.data_type, DataType::LargeBinary) {
+        crate::engine::iceberg_writer::target_cast_expr_sql(&literal_sql, target_column)
+    } else {
+        Ok(literal_sql)
+    }
 }
 
 struct DistributedCowUpdateExecutor {
@@ -1579,8 +1585,11 @@ fn run_one_cow_file_rewrite(
     let write_commit = result.write_commit.filter(write_commit_has_files);
     let Some(commit) = write_commit else {
         return Err(format!(
-            "COW UPDATE rewrite for data file `{}` produced no replacement data files",
-            plan.old_file
+            "COW UPDATE rewrite for data file `{}` produced no replacement data files \
+             (rows={}, query={})",
+            plan.old_file,
+            result.query_result.row_count(),
+            plan.rewrite_query
         ));
     };
     // Extract the replacement file paths from the writer-reported sink
@@ -1597,8 +1606,11 @@ fn run_one_cow_file_rewrite(
     }
     if paths.is_empty() {
         return Err(format!(
-            "COW UPDATE rewrite for data file `{}` produced no replacement data files",
-            plan.old_file
+            "COW UPDATE rewrite for data file `{}` produced no replacement data files \
+             (rows={}, query={})",
+            plan.old_file,
+            result.query_result.row_count(),
+            plan.rewrite_query
         ));
     }
     Ok(CowFileRewriteOutput {
@@ -1826,17 +1838,32 @@ fn iceberg_table_columns(
 ) -> Result<Vec<crate::engine::catalog::ColumnDef>, String> {
     let arrow_schema = schema_to_arrow_schema(table.metadata().current_schema())
         .map_err(|e| format!("convert iceberg schema to arrow schema failed: {e}"))?;
-    Ok(arrow_schema
+    let iceberg_schema = table.metadata().current_schema();
+    arrow_schema
         .fields()
         .iter()
-        .map(|field| crate::engine::catalog::ColumnDef {
-            name: field.name().clone(),
-            data_type: field.data_type().clone(),
-            nullable: field.is_nullable(),
-            write_default: None,
-            logical_type: None,
+        .map(|field| {
+            let nested = iceberg_schema
+                .field_by_name(field.name())
+                .ok_or_else(|| format!("iceberg column `{}` missing from schema", field.name()))?;
+            let data_type = match nested.field_type.as_ref() {
+                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Variant) => {
+                    DataType::LargeBinary
+                }
+                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Binary) => {
+                    DataType::Binary
+                }
+                _ => field.data_type().clone(),
+            };
+            Ok(crate::engine::catalog::ColumnDef {
+                name: field.name().clone(),
+                data_type,
+                nullable: field.is_nullable(),
+                write_default: None,
+                logical_type: None,
+            })
         })
-        .collect())
+        .collect()
 }
 
 fn iceberg_partition_source_columns(table: &iceberg::table::Table) -> Result<Vec<String>, String> {
@@ -1998,10 +2025,6 @@ pub(crate) fn execute_merge_statement(
     );
     let table = block_on_iceberg(async { catalog.load_table(&table_ident).await })?
         .map_err(|e| format!("load iceberg table {}: {e}", &table_ident))?;
-
-    // Reject variant tables before any planning (mirrors UPDATE entry).
-    ensure_no_variant_columns_for_row_level_mutation(&table)
-        .map_err(|e| format!("MERGE INTO: {e}"))?;
 
     // Validate writability up front (resolvable default-sort-order, no variant
     // in partition spec / sort order) before any branch write. The folded
@@ -2979,6 +3002,46 @@ mod tests {
     }
 
     #[test]
+    fn iceberg_table_columns_maps_variant_to_largebinary() {
+        use iceberg::spec::{NestedField, PrimitiveType, Type};
+
+        let iceberg_schema = Arc::new(
+            iceberg::spec::Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(2, "v", Type::Primitive(PrimitiveType::Variant)).into(),
+                    NestedField::optional(3, "b", Type::Primitive(PrimitiveType::Binary)).into(),
+                ])
+                .build()
+                .expect("schema"),
+        );
+        let metadata = iceberg::spec::TableMetadataBuilder::new(
+            iceberg_schema.as_ref().clone(),
+            iceberg::spec::PartitionSpec::unpartition_spec(),
+            iceberg::spec::SortOrder::unsorted_order(),
+            "file:///tmp/iv3_variant_columns".to_string(),
+            iceberg::spec::FormatVersion::V3,
+            std::collections::HashMap::new(),
+        )
+        .expect("builder")
+        .build()
+        .expect("metadata")
+        .metadata;
+        let table = iceberg::table::Table::builder()
+            .identifier(iceberg::TableIdent::from_strs(["db", "t"]).expect("ident"))
+            .file_io(iceberg::io::FileIO::new_with_fs())
+            .metadata(metadata)
+            .build()
+            .expect("table");
+
+        let columns = iceberg_table_columns(&table).expect("columns");
+        assert_eq!(columns[0].data_type, DataType::Int64);
+        assert_eq!(columns[1].data_type, DataType::LargeBinary);
+        assert_eq!(columns[2].data_type, DataType::Binary);
+    }
+
+    #[test]
     fn mor_update_uses_be_dv_sink_not_coordinator_inject() {
         let source = include_str!("mutation_flow.rs");
 
@@ -3237,6 +3300,50 @@ mod tests {
         assert!(sql.contains("'bb'"), "{sql}");
         assert!(sql.contains("'dd'"), "{sql}");
         assert!(sql.contains("ORDER BY"), "{sql}");
+    }
+
+    #[test]
+    fn cow_rewrite_query_casts_variant_values_payloads() {
+        let payload = [0x0c_u8, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03];
+        let schema = Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new("id", DataType::Int64, true),
+            arrow::datatypes::Field::new("v", DataType::LargeBinary, true),
+        ]));
+        let new_rows = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::Int64Array::from(vec![10])) as ArrayRef,
+                Arc::new(arrow::array::LargeBinaryArray::from_iter_values([
+                    payload.as_slice()
+                ])) as ArrayRef,
+            ],
+        )
+        .expect("new rows");
+        let old_rows = RecordBatch::new_empty(schema);
+        let matched = MatchedUpdateBatch {
+            row_ids: vec![7],
+            file_paths: vec!["f.parquet".to_string()],
+            row_positions: vec![1],
+            old_rows,
+            new_rows,
+        };
+
+        let query = build_cow_rewrite_query(
+            &iceberg_target(),
+            "__nr_cow_t_abc",
+            &matched,
+            &[0],
+            &[
+                typed_col("id", DataType::Int64),
+                typed_col("v", DataType::LargeBinary),
+            ],
+            42,
+        )
+        .expect("query");
+        let sql = query.to_string();
+
+        assert!(sql.contains("CAST(X'0C000000010203' AS VARIANT)"), "{sql}");
+        assert!(sql.contains("CASE WHEN"), "{sql}");
     }
 
     #[test]

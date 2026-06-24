@@ -31,10 +31,16 @@ pub(crate) fn lower_cast(
         .copied()
         .ok_or_else(|| "CAST missing child".to_string())?;
     if matches!(data_type, DataType::LargeBinary) {
-        return Err("CAST to VARIANT is not supported".to_string());
+        let child_type = arena
+            .data_type(child)
+            .ok_or_else(|| "CAST child missing data type".to_string())?;
+        if !is_encoded_variant_payload_source(child_type) {
+            return Err("CAST to VARIANT is not supported".to_string());
+        }
     }
     if let Some(child_type) = arena.data_type(child)
         && matches!(child_type, DataType::LargeBinary)
+        && !matches!(data_type, DataType::LargeBinary)
     {
         let supported = matches!(
             data_type,
@@ -63,4 +69,61 @@ pub(crate) fn lower_cast(
         ExprNode::Cast(child)
     };
     Ok(arena.push_typed(node, data_type))
+}
+
+fn is_encoded_variant_payload_source(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Binary | DataType::LargeBinary | DataType::Null
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::ids::SlotId;
+
+    fn lower_variant_cast_from(source_type: DataType) -> Result<(ExprArena, ExprId), String> {
+        let mut arena = ExprArena::default();
+        let child = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), source_type);
+        let cast = lower_cast(
+            &[child],
+            &mut arena,
+            DataType::LargeBinary,
+            Some(types::TPrimitiveType::VARIANT),
+            None,
+        )?;
+        Ok((arena, cast))
+    }
+
+    #[test]
+    fn lower_cast_allows_binary_payload_to_variant() {
+        let (arena, cast) = lower_variant_cast_from(DataType::Binary).expect("cast");
+
+        assert_eq!(arena.data_type(cast), Some(&DataType::LargeBinary));
+        assert!(matches!(arena.node(cast), Some(ExprNode::Cast(_))));
+    }
+
+    #[test]
+    fn lower_cast_allows_variant_payload_to_variant() {
+        let (arena, cast) = lower_variant_cast_from(DataType::LargeBinary).expect("cast");
+
+        assert_eq!(arena.data_type(cast), Some(&DataType::LargeBinary));
+        assert!(matches!(arena.node(cast), Some(ExprNode::Cast(_))));
+    }
+
+    #[test]
+    fn lower_cast_allows_null_to_variant() {
+        let (arena, cast) = lower_variant_cast_from(DataType::Null).expect("cast");
+
+        assert_eq!(arena.data_type(cast), Some(&DataType::LargeBinary));
+        assert!(matches!(arena.node(cast), Some(ExprNode::Cast(_))));
+    }
+
+    #[test]
+    fn lower_cast_rejects_scalar_to_variant() {
+        let err = lower_variant_cast_from(DataType::Int64).unwrap_err();
+
+        assert!(err.contains("CAST to VARIANT is not supported"));
+    }
 }

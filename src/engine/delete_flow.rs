@@ -47,7 +47,6 @@ use crate::connector::iceberg::catalog::registry::{self, block_on_iceberg, build
 use crate::connector::iceberg::commit::{
     CommitOpKind, CommitOutcome, CommitServiceError, IcebergCommitCollector,
     IcebergSqlDeleteStrategy, classify_sql_delete_strategy,
-    ensure_no_variant_columns_for_row_level_mutation,
 };
 use crate::engine::backend_resolver::{TargetBackend, resolve_existing_table_target};
 use crate::engine::write_transaction::{
@@ -133,7 +132,6 @@ pub(crate) fn execute_delete_statement(
     }
 
     // 3. Validation.
-    ensure_no_variant_columns_for_row_level_mutation(&table).map_err(|e| format!("DELETE: {e}"))?;
     let delete_strategy = classify_sql_delete_strategy(&table)?;
     // 4. Validate WHERE → iceberg::Predicate to surface unsupported clauses
     //    early. The distributed SELECT planner owns scan pruning and existing
@@ -550,7 +548,9 @@ fn translate_where(
                 // statistics (the function obscures the underlying column value),
                 // so we return AlwaysTrue here to scan all files and leave
                 // correctness to the per-row evaluator in evaluate_where_at_row.
-                if extract_scalar_fn_comparison(left, right).is_some() {
+                if extract_scalar_fn_comparison(left, right).is_some()
+                    || extract_variant_get_comparison(left, right).is_some()
+                {
                     return Ok(Predicate::AlwaysTrue);
                 }
                 let (col_name, value_expr, flipped) = extract_comparison(left, right)?;
@@ -864,6 +864,48 @@ fn extract_scalar_fn_comparison<'a>(
     None
 }
 
+/// Detect a `variant_get(col, 'path', 'type') <op> literal` predicate.
+///
+/// The generated DELETE rewrite runs the original WHERE clause through the
+/// normal query pipeline, where `variant_get` is evaluated with full analyzer
+/// and execution support. The Iceberg predicate translator only needs to
+/// accept this shape and avoid unsafe file pruning, so callers treat it as
+/// `AlwaysTrue`.
+fn extract_variant_get_comparison<'a>(
+    left: &'a sqlast::Expr,
+    right: &'a sqlast::Expr,
+) -> Option<(String, &'a sqlast::Expr, bool)> {
+    if let Some(col_name) = expr_as_variant_get_on_col(left) {
+        if is_literal_expr(right) {
+            return Some((col_name, right, false));
+        }
+    }
+    if let Some(col_name) = expr_as_variant_get_on_col(right) {
+        if is_literal_expr(left) {
+            return Some((col_name, left, true));
+        }
+    }
+    None
+}
+
+fn expr_as_variant_get_on_col(expr: &sqlast::Expr) -> Option<String> {
+    let sqlast::Expr::Function(func) = expr else {
+        return None;
+    };
+    let name = func.name.to_string().to_ascii_lowercase();
+    if !matches!(name.as_str(), "variant_get" | "try_variant_get") {
+        return None;
+    }
+    let args = function_expr_args(func)?;
+    if args.len() != 3 {
+        return None;
+    }
+    let col_name = expr_to_column_name(args[0]).ok()?;
+    extract_string_literal(args[1])?;
+    extract_string_literal(args[2])?;
+    Some(col_name)
+}
+
 /// Return `(fn_name_lowercase, col_name_lowercase)` when `expr` is a
 /// single-argument function call over a bare column reference and the function
 /// name is in the deterministic set we support for row-level evaluation.
@@ -875,25 +917,29 @@ fn expr_as_supported_scalar_fn_on_col(expr: &sqlast::Expr) -> Option<(String, St
     if !is_supported_scalar_fn(&name) {
         return None;
     }
-    let args = match &func.args {
+    let args = function_expr_args(func)?;
+    if args.len() != 1 {
+        return None;
+    }
+    let col_name = expr_to_column_name(args[0]).ok()?;
+    Some((name, col_name))
+}
+
+fn function_expr_args(func: &sqlast::Function) -> Option<Vec<&sqlast::Expr>> {
+    match &func.args {
         sqlast::FunctionArguments::List(list) => list
             .args
             .iter()
-            .filter_map(|arg| {
+            .map(|arg| {
                 if let sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) = arg {
                     Some(e)
                 } else {
                     None
                 }
             })
-            .collect::<Vec<_>>(),
-        _ => return None,
-    };
-    if args.len() != 1 {
-        return None;
+            .collect(),
+        _ => None,
     }
-    let col_name = expr_to_column_name(args[0]).ok()?;
-    Some((name, col_name))
 }
 
 /// The set of deterministic, single-argument scalar functions that the phase-1
@@ -1767,6 +1813,24 @@ mod tests {
             .expect("build iceberg schema")
     }
 
+    fn iceberg_schema_with_variant() -> iceberg::spec::Schema {
+        iceberg::spec::Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "v",
+                    Type::Primitive(PrimitiveType::Variant),
+                )),
+            ])
+            .build()
+            .expect("build iceberg schema with variant")
+    }
+
     fn delete_where_id_in_2_3() -> sqlast::Expr {
         sqlast::Expr::InList {
             expr: Box::new(sqlast::Expr::Identifier(sqlast::Ident::new("id"))),
@@ -1803,6 +1867,14 @@ mod tests {
             panic!("expected select");
         };
         select.selection.clone().expect("where clause")
+    }
+
+    #[test]
+    fn delete_translate_accepts_variant_get_predicate_for_pipeline_filtering() {
+        let where_clause =
+            where_expr("SELECT 1 FROM orders WHERE try_variant_get(v, '$.a', 'bigint') = 2");
+        super::translate_where(&where_clause, &iceberg_schema_with_variant())
+            .expect("variant_get predicate should be delegated to the query pipeline");
     }
 
     #[test]

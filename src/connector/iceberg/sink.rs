@@ -1824,7 +1824,8 @@ fn iceberg_type_from_arrow_type(data_type: &DataType) -> Result<iceberg::spec::T
         DataType::Timestamp(TimeUnit::Nanosecond, None) => Some(PrimitiveType::TimestampNs),
         DataType::Timestamp(TimeUnit::Nanosecond, Some(_)) => Some(PrimitiveType::TimestamptzNs),
         DataType::Utf8 | DataType::LargeUtf8 => Some(PrimitiveType::String),
-        DataType::Binary | DataType::LargeBinary => Some(PrimitiveType::Binary),
+        DataType::Binary => Some(PrimitiveType::Binary),
+        DataType::LargeBinary => Some(PrimitiveType::Variant),
         DataType::FixedSizeBinary(size) => {
             Some(PrimitiveType::Fixed(u64::try_from(*size).map_err(
                 |_| format!("iceberg sink fixed binary width {size} cannot convert to u64"),
@@ -3111,6 +3112,17 @@ mod tests {
             .and_then(|node| node.slot_ref.as_ref())
             .expect("region slot");
         assert_eq!(region_slot.slot_id, 11);
+    }
+
+    #[test]
+    fn iceberg_sink_maps_largebinary_to_variant() {
+        use iceberg::spec::{PrimitiveType, Type};
+
+        let binary = super::iceberg_type_from_arrow_type(&DataType::Binary).expect("binary");
+        assert!(matches!(binary, Type::Primitive(PrimitiveType::Binary)));
+
+        let variant = super::iceberg_type_from_arrow_type(&DataType::LargeBinary).expect("variant");
+        assert!(matches!(variant, Type::Primitive(PrimitiveType::Variant)));
     }
 
     #[test]

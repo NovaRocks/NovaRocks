@@ -30,7 +30,7 @@ use iceberg::spec::{FormatVersion, PrimitiveType, Type};
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
 use crate::connector::iceberg::commit::{
     CommitOpKind, CommitOutcome, CommitServiceError, EqualityDeleteColumn, IcebergCommitCollector,
-    ensure_equality_delete_single_partition_spec, ensure_no_variant_columns_for_row_level_mutation,
+    ensure_equality_delete_single_partition_spec,
 };
 use crate::engine::backend_resolver::resolve_existing_table_target;
 use crate::engine::parquet::{parse_date_string_to_days, parse_datetime_string_to_micros};
@@ -78,8 +78,6 @@ pub(crate) fn execute_add_equality_delete_statement(
     let table = block_on_iceberg(async { catalog.load_table(&table_ident).await })?
         .map_err(|e| format!("load iceberg table {}: {e}", &table_ident))?;
 
-    ensure_no_variant_columns_for_row_level_mutation(&table)
-        .map_err(|e| format!("ADD EQUALITY DELETE: {e}"))?;
     let metadata = table.metadata();
     if metadata.format_version() == FormatVersion::V1 {
         return Err("ADD EQUALITY DELETE requires an Iceberg v2 or v3 table".to_string());
@@ -455,6 +453,11 @@ fn primitive_to_arrow_type(
             DataType::Timestamp(TimeUnit::Microsecond, None)
         }
         PrimitiveType::String => DataType::Utf8,
+        PrimitiveType::Variant => {
+            return Err(format!(
+                "ADD EQUALITY DELETE column `{column_name}` is variant; variant columns cannot be equality-delete keys"
+            ));
+        }
         other => {
             return Err(format!(
                 "ADD EQUALITY DELETE does not yet support equality column `{column_name}` with type {other:?}"
@@ -860,6 +863,35 @@ mod tests {
             .expect("category column");
         assert_eq!(categories.value(0), "B");
         assert!(categories.is_null(1));
+    }
+
+    #[test]
+    fn build_equality_delete_batch_rejects_variant_key_column() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "payload",
+                    Type::Primitive(PrimitiveType::Variant),
+                )),
+            ])
+            .build()
+            .expect("schema");
+        let columns = vec!["payload".to_string()];
+        let rows = vec![vec![Literal::Null]];
+
+        let err = super::build_equality_delete_batch(&schema, &columns, &rows)
+            .expect_err("variant equality key must be rejected");
+
+        assert!(
+            err.contains("variant columns cannot be equality-delete keys"),
+            "{err}"
+        );
     }
 
     #[test]

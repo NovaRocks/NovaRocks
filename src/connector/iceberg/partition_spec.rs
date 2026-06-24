@@ -205,6 +205,11 @@ fn validate_transform(
         .ok_or_else(|| format!("partition source field id {source_id} is missing"))?;
     let source_type = field.field_type.as_ref();
     let col = field.name.as_str();
+    if matches!(source_type, Type::Primitive(PrimitiveType::Variant)) {
+        return Err(format!(
+            "iceberg table column `{col}` is variant; variant columns cannot appear in the partition spec. Use a non-variant source column for partition transforms."
+        ));
+    }
     match expr {
         IcebergPartitionFieldExpr::Year { .. }
         | IcebergPartitionFieldExpr::Month { .. }
@@ -309,7 +314,7 @@ pub(crate) fn partition_match_in_touched(
 mod tests {
     use std::sync::Arc;
 
-    use iceberg::spec::{NestedField, PrimitiveType, Transform, Type};
+    use iceberg::spec::{NestedField, PartitionSpec, PrimitiveType, Transform, Type};
 
     use super::*;
 
@@ -401,6 +406,56 @@ mod tests {
             ])
             .build()
             .unwrap()
+    }
+
+    fn schema_with_variant() -> Schema {
+        Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "v",
+                    Type::Primitive(PrimitiveType::Variant),
+                )),
+            ])
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn partition_transform_rejects_variant_source_column() {
+        let err = build_initial_partition_spec(
+            &schema_with_variant(),
+            &[IcebergPartitionFieldExpr::Identity {
+                column: "v".to_string(),
+            }],
+        )
+        .expect_err("variant partition source should be rejected at DDL time");
+        assert!(err.contains("`v`"), "{err}");
+        assert!(
+            err.contains("variant columns cannot appear in the partition spec"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn evolved_partition_spec_rejects_variant_source_column() {
+        let schema = schema_with_variant();
+        let current = Arc::new(PartitionSpec::unpartition_spec());
+        let expr = IcebergPartitionFieldExpr::Identity {
+            column: "v".to_string(),
+        };
+        let err = build_evolved_partition_spec(&schema, &current, PartitionSpecChange::Add(&expr))
+            .expect_err("variant partition source should be rejected during ALTER");
+        assert!(err.contains("`v`"), "{err}");
+        assert!(
+            err.contains("variant columns cannot appear in the partition spec"),
+            "{err}"
+        );
     }
 
     #[test]

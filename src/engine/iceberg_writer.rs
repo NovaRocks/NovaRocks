@@ -45,8 +45,7 @@ use crate::connector::iceberg::catalog::registry::{
 use crate::connector::iceberg::commit::{
     CleanupPathMapper, CommitOpKind, CommitOutcome, CommitServiceError, EqualityDeleteColumn,
     IcebergCommitCollector, WrittenFile, ensure_iceberg_write_supported,
-    ensure_no_equality_deletes, ensure_no_variant_columns_for_row_level_mutation,
-    ensure_overwrite_single_partition_spec,
+    ensure_no_equality_deletes, ensure_overwrite_single_partition_spec,
 };
 use crate::connector::starrocks::table::mv_refresh::query_result_to_chunks;
 use crate::engine::backend_resolver::TargetBackend;
@@ -116,18 +115,12 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
     // 2. Pre-lowering validators.
     let _write_mode = ensure_iceberg_write_supported(&table)?;
     if overwrite_full_table {
-        ensure_no_variant_columns_for_row_level_mutation(&table)
-            .map_err(|e| format!("INSERT OVERWRITE: {e}"))?;
         ensure_overwrite_single_partition_spec(&table)?;
         ensure_no_equality_deletes(&table)?;
     }
     if overwrite_partitions {
-        // OVERWRITE PARTITIONS shares the variant-write restriction with
-        // full-table OVERWRITE (#87 spec). Then check the partition-table
-        // requirement; v3 row-lineage + cross-historical-spec checks happen
-        // in OverwritePartitionsCommit.
-        ensure_no_variant_columns_for_row_level_mutation(&table)
-            .map_err(|e| format!("INSERT OVERWRITE PARTITIONS: {e}"))?;
+        // v3 row-lineage + cross-historical-spec checks happen in
+        // OverwritePartitionsCommit.
         if table.metadata().default_partition_spec().is_unpartitioned() {
             return Err(format!(
                 "INSERT OVERWRITE PARTITIONS requires a partitioned table; \
@@ -989,7 +982,8 @@ fn arrow_data_type_to_sql_type(dt: &arrow::datatypes::DataType) -> Result<SqlTyp
         DataType::Timestamp(TimeUnit::Nanosecond, _) => SqlType::DateTimeNs,
         DataType::Timestamp(TimeUnit::Microsecond, _) => SqlType::DateTime,
         DataType::Time64(TimeUnit::Microsecond | TimeUnit::Nanosecond) => SqlType::Time,
-        DataType::Binary | DataType::LargeBinary => SqlType::Binary,
+        DataType::Binary => SqlType::Binary,
+        DataType::LargeBinary => SqlType::Variant,
         DataType::List(element_field) => SqlType::Array(Box::new(arrow_data_type_to_sql_type(
             element_field.data_type(),
         )?)),
@@ -1040,7 +1034,7 @@ fn sql_type_name(sql_type: &SqlType) -> Result<String, String> {
         SqlType::Decimal { precision, scale } => format!("DECIMAL({precision}, {scale})"),
         SqlType::String => "STRING".to_string(),
         SqlType::Json => "JSON".to_string(),
-        SqlType::Binary => "BINARY".to_string(),
+        SqlType::Binary => "VARBINARY".to_string(),
         SqlType::Bitmap => "BITMAP".to_string(),
         SqlType::Hll => "HLL".to_string(),
         SqlType::Boolean => "BOOLEAN".to_string(),
@@ -1568,6 +1562,15 @@ mod tests {
             panic!("expected hex literal");
         };
         assert_eq!(s, "AB01");
+    }
+
+    #[test]
+    fn target_cast_expr_sql_renders_large_binary_as_variant() {
+        let column = test_column("v", DataType::LargeBinary, None);
+
+        let sql = target_cast_expr_sql("X'AB01'", &column).expect("cast sql");
+
+        assert_eq!(sql, "CAST(X'AB01' AS VARIANT)");
     }
 
     #[test]

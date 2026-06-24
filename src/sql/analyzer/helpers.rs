@@ -91,6 +91,7 @@ pub(super) fn sql_type_to_arrow(sql_type: &sqlast::DataType) -> Result<DataType,
                     crate::common::largeint::LARGEINT_BYTE_WIDTH,
                 )),
                 "json" | "jsonb" => Ok(DataType::Utf8),
+                "variant" => Ok(DataType::LargeBinary),
                 "varbinary" | "binary" => Ok(DataType::Binary),
                 "datetime_ns" | "timestamp_ns" | "timestamptz_ns" => Ok(DataType::Timestamp(
                     arrow::datatypes::TimeUnit::Nanosecond,
@@ -283,6 +284,7 @@ fn parse_custom_type_string(type_sql: &str) -> Result<DataType, String> {
         "double" | "double precision" => return Ok(DataType::Float64),
         "boolean" | "bool" => return Ok(DataType::Boolean),
         "string" | "varchar" | "char" | "character" | "text" => return Ok(DataType::Utf8),
+        "varbinary" | "binary" => return Ok(DataType::Binary),
         "date" => return Ok(DataType::Date32),
         "datetime" | "timestamp" => {
             return Ok(DataType::Timestamp(
@@ -296,6 +298,7 @@ fn parse_custom_type_string(type_sql: &str) -> Result<DataType, String> {
             ));
         }
         "json" | "jsonb" => return Ok(DataType::Utf8),
+        "variant" => return Ok(DataType::LargeBinary),
         _ => {}
     }
 
@@ -1870,7 +1873,7 @@ mod tests {
     use arrow::datatypes::{DataType, TimeUnit};
     use sqlparser::ast as sqlast;
 
-    use super::{expr_display_name, sql_type_to_arrow};
+    use super::{expr_display_name, parse_custom_type_string, sql_type_to_arrow};
     use crate::sql::parser::dialect::StarRocksDialect;
 
     fn parse_select_expr(sql: &str) -> sqlast::Expr {
@@ -1919,6 +1922,35 @@ mod tests {
         assert_eq!(
             sql_type_to_arrow(&data_type).expect("type"),
             DataType::Timestamp(TimeUnit::Nanosecond, None)
+        );
+    }
+
+    #[test]
+    fn sql_type_to_arrow_accepts_variant_alias() {
+        let expr = parse_select_expr("SELECT CAST(NULL AS VARIANT)");
+        let sqlast::Expr::Cast { data_type, .. } = expr else {
+            panic!("expected cast expression");
+        };
+
+        assert_eq!(
+            sql_type_to_arrow(&data_type).expect("type"),
+            DataType::LargeBinary
+        );
+    }
+
+    #[test]
+    fn parse_custom_type_string_accepts_varbinary_aliases() {
+        assert_eq!(
+            parse_custom_type_string("VARBINARY").expect("varbinary"),
+            DataType::Binary
+        );
+        assert_eq!(
+            parse_custom_type_string("BINARY").expect("binary"),
+            DataType::Binary
+        );
+        assert_eq!(
+            parse_custom_type_string("VARIANT").expect("variant"),
+            DataType::LargeBinary
         );
     }
 

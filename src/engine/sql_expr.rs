@@ -1470,6 +1470,13 @@ pub(crate) fn literal_from_batch(column: &ArrayRef, row_idx: usize) -> Result<Li
                 .ok_or("downcast BinaryArray")?;
             Ok(Literal::String(bytes_to_latin1_string(arr.value(row_idx))))
         }
+        DataType::LargeBinary => {
+            let arr = column
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .ok_or("downcast LargeBinaryArray")?;
+            Ok(Literal::String(bytes_to_latin1_string(arr.value(row_idx))))
+        }
         DataType::Date32 => {
             use chrono::{Duration as ChronoDuration, NaiveDate};
             let arr = column
@@ -1942,5 +1949,17 @@ mod tests {
                 "CAST to non-DECIMAL `{sql}` folded to wrong literal"
             );
         }
+    }
+
+    #[test]
+    fn literal_from_batch_extracts_large_binary_as_latin1_string() {
+        let raw = b"\x04\x00\x00\x00meta";
+        let array = Arc::new(arrow::array::LargeBinaryArray::from_iter_values([
+            raw.as_slice()
+        ])) as ArrayRef;
+
+        let literal = literal_from_batch(&array, 0).expect("large binary literal");
+
+        assert_eq!(literal, Literal::String(bytes_to_latin1_string(raw)));
     }
 }
