@@ -2650,6 +2650,74 @@ pub(crate) fn refresh_iceberg_mv(
     .map_err(IcebergMvRefreshExecutionError::into_message)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RepartitionSupport {
+    ProjectionFilterSingleBase,
+    AggregateSingleBase,
+    JoinProjectionFilter,
+    JoinAggregate,
+    FanInAggregate,
+    UnionProjectionFilter,
+}
+
+impl RepartitionSupport {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::ProjectionFilterSingleBase => "projection/filter single-base",
+            Self::AggregateSingleBase => "aggregate single-base",
+            Self::JoinProjectionFilter => "join projection/filter",
+            Self::JoinAggregate => "join aggregate",
+            Self::FanInAggregate => "fan-in aggregate",
+            Self::UnionProjectionFilter => "UNION ALL projection/filter",
+        }
+    }
+}
+
+fn validate_repartition_support(caps: &RefreshCapabilities) -> Result<RepartitionSupport, String> {
+    match (&caps.snapshot_policy, caps.has_agg_state, &caps.identity) {
+        (BaseSnapshotPolicy::SingleBase, false, RefreshIdentity::BaseRowId) => {
+            Ok(RepartitionSupport::ProjectionFilterSingleBase)
+        }
+        (BaseSnapshotPolicy::SingleBase, true, RefreshIdentity::GroupRowId) => {
+            Ok(RepartitionSupport::AggregateSingleBase)
+        }
+        (BaseSnapshotPolicy::JoinPairPartialInitialSkip, false, RefreshIdentity::JoinRowKey) => {
+            Ok(RepartitionSupport::JoinProjectionFilter)
+        }
+        (BaseSnapshotPolicy::JoinPairPartialInitialSkip, true, RefreshIdentity::GroupRowId) => {
+            Ok(RepartitionSupport::JoinAggregate)
+        }
+        (BaseSnapshotPolicy::AllBasesRequired, true, RefreshIdentity::GroupRowId) => {
+            Ok(RepartitionSupport::FanInAggregate)
+        }
+        (BaseSnapshotPolicy::AllBasesRequired, false, RefreshIdentity::BranchScoped(inner))
+            if matches!(inner.as_ref(), RefreshIdentity::BaseRowId) =>
+        {
+            Ok(RepartitionSupport::UnionProjectionFilter)
+        }
+        _ => Err(format!(
+            "UnsupportedRepartitionShape: ALTER MATERIALIZED VIEW ... REPARTITION does not support identity={:?}, snapshot_policy={:?}, aggregate_state={}; supported shapes are projection/filter single-base, aggregate single-base, join projection/filter, join aggregate, fan-in aggregate, and UNION ALL projection/filter",
+            caps.identity, caps.snapshot_policy, caps.has_agg_state
+        )),
+    }
+}
+
+fn validate_repartition_rebuild_wired(
+    support: &RepartitionSupport,
+    target: &IcebergMvTarget,
+) -> Result<(), String> {
+    match support {
+        RepartitionSupport::ProjectionFilterSingleBase => Ok(()),
+        _ => Err(format!(
+            "UnsupportedRepartitionShape: {} repartition rebuild is not wired yet; target={}.{}.{}",
+            support.label(),
+            target.catalog,
+            target.namespace,
+            target.table
+        )),
+    }
+}
+
 pub(crate) fn repartition_iceberg_mv(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
@@ -2680,20 +2748,13 @@ pub(crate) fn repartition_iceberg_mv(
         )
     })?;
     let caps = RefreshCapabilities::from_schema_contract(schema_contract)?;
-    if caps.has_agg_state
-        || caps.snapshot_policy != BaseSnapshotPolicy::SingleBase
-        || caps.identity != RefreshIdentity::BaseRowId
-    {
-        return Err(format!(
-            "ALTER MATERIALIZED VIEW ... REPARTITION currently supports single-base projection/filter Iceberg MVs only; {}.{}.{} has identity={:?}, snapshot_policy={:?}, aggregate_state={}",
-            target.catalog,
-            target.namespace,
-            target.table,
-            caps.identity,
-            caps.snapshot_policy,
-            caps.has_agg_state
-        ));
-    }
+    let support = validate_repartition_support(&caps).map_err(|err| {
+        format!(
+            "{err}; target={}.{}.{}",
+            target.catalog, target.namespace, target.table
+        )
+    })?;
+    validate_repartition_rebuild_wired(&support, &target)?;
 
     let (target_entry, iceberg_catalog, target_loaded) = load_iceberg_mv_target(state, &target)?;
     validate_target_snapshot(&target, &mv_definition, &target_loaded.table)?;
@@ -11971,6 +12032,8 @@ fn arrow_data_type_to_iceberg_primitive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType;
+    use crate::engine::mv::refresh_property::PartitionPruningPolicy;
     use crate::sql::planner::plan::*;
     use arrow::array::{BinaryArray, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
@@ -12055,6 +12118,154 @@ mod tests {
             create_apply_key_source_property(&ApplyKeyContract::join_aggregate_group_row()),
             ICEBERG_MV_APPLY_KEY_SOURCE_GROUP_ROW_ID
         );
+    }
+
+    #[test]
+    fn repartition_support_accepts_projection_filter_and_aggregate() {
+        let projection = RefreshCapabilities {
+            snapshot_policy: BaseSnapshotPolicy::SingleBase,
+            has_agg_state: false,
+            identity: RefreshIdentity::BaseRowId,
+            apply_key_column: ICEBERG_MV_APPLY_KEY_COLUMN.to_string(),
+            apply_key_value_type: ApplyKeyValueType::Int64,
+            partition_pruning: PartitionPruningPolicy::BestEffort,
+        };
+        assert_eq!(
+            validate_repartition_support(&projection).expect("projection/filter support"),
+            RepartitionSupport::ProjectionFilterSingleBase
+        );
+
+        let aggregate = RefreshCapabilities {
+            snapshot_policy: BaseSnapshotPolicy::SingleBase,
+            has_agg_state: true,
+            identity: RefreshIdentity::GroupRowId,
+            apply_key_column: ICEBERG_MV_GROUP_APPLY_KEY_COLUMN.to_string(),
+            apply_key_value_type: ApplyKeyValueType::Utf8,
+            partition_pruning: PartitionPruningPolicy::BestEffort,
+        };
+        assert_eq!(
+            validate_repartition_support(&aggregate).expect("aggregate support"),
+            RepartitionSupport::AggregateSingleBase
+        );
+    }
+
+    #[test]
+    fn repartition_support_accepts_join_and_multi_base_shapes() {
+        let join = RefreshCapabilities {
+            snapshot_policy: BaseSnapshotPolicy::JoinPairPartialInitialSkip,
+            has_agg_state: false,
+            identity: RefreshIdentity::JoinRowKey,
+            apply_key_column: ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
+            apply_key_value_type: ApplyKeyValueType::Utf8,
+            partition_pruning: PartitionPruningPolicy::BestEffort,
+        };
+        assert_eq!(
+            validate_repartition_support(&join).expect("join support"),
+            RepartitionSupport::JoinProjectionFilter
+        );
+
+        let join_aggregate = RefreshCapabilities {
+            snapshot_policy: BaseSnapshotPolicy::JoinPairPartialInitialSkip,
+            has_agg_state: true,
+            identity: RefreshIdentity::GroupRowId,
+            apply_key_column: ICEBERG_MV_GROUP_APPLY_KEY_COLUMN.to_string(),
+            apply_key_value_type: ApplyKeyValueType::Utf8,
+            partition_pruning: PartitionPruningPolicy::BestEffort,
+        };
+        assert_eq!(
+            validate_repartition_support(&join_aggregate).expect("join aggregate support"),
+            RepartitionSupport::JoinAggregate
+        );
+
+        let fan_in_aggregate = RefreshCapabilities {
+            snapshot_policy: BaseSnapshotPolicy::AllBasesRequired,
+            has_agg_state: true,
+            identity: RefreshIdentity::GroupRowId,
+            apply_key_column: ICEBERG_MV_GROUP_APPLY_KEY_COLUMN.to_string(),
+            apply_key_value_type: ApplyKeyValueType::Utf8,
+            partition_pruning: PartitionPruningPolicy::BestEffort,
+        };
+        assert_eq!(
+            validate_repartition_support(&fan_in_aggregate).expect("fan-in aggregate support"),
+            RepartitionSupport::FanInAggregate
+        );
+
+        let union_projection = RefreshCapabilities {
+            snapshot_policy: BaseSnapshotPolicy::AllBasesRequired,
+            has_agg_state: false,
+            identity: RefreshIdentity::BranchScoped(Box::new(RefreshIdentity::BaseRowId)),
+            apply_key_column: ICEBERG_MV_APPLY_KEY_COLUMN.to_string(),
+            apply_key_value_type: ApplyKeyValueType::BranchInt64,
+            partition_pruning: PartitionPruningPolicy::BestEffort,
+        };
+        assert_eq!(
+            validate_repartition_support(&union_projection).expect("union projection support"),
+            RepartitionSupport::UnionProjectionFilter
+        );
+    }
+
+    #[test]
+    fn repartition_support_blocks_unwired_non_projection_rebuild() {
+        let target = IcebergMvTarget {
+            catalog: "ice".to_string(),
+            namespace: "analytics".to_string(),
+            table: "mv_join_aggregate".to_string(),
+        };
+
+        validate_repartition_rebuild_wired(
+            &RepartitionSupport::ProjectionFilterSingleBase,
+            &target,
+        )
+        .expect("projection/filter rebuild remains wired");
+
+        for support in [
+            RepartitionSupport::AggregateSingleBase,
+            RepartitionSupport::JoinProjectionFilter,
+            RepartitionSupport::JoinAggregate,
+            RepartitionSupport::FanInAggregate,
+            RepartitionSupport::UnionProjectionFilter,
+        ] {
+            let err = validate_repartition_rebuild_wired(&support, &target)
+                .expect_err("non-projection rebuild must be temporarily blocked");
+            assert!(err.contains("UnsupportedRepartitionShape"));
+            assert!(err.contains(&format!(
+                "{} repartition rebuild is not wired yet",
+                support.label()
+            )));
+            assert!(err.contains("target=ice.analytics.mv_join_aggregate"));
+        }
+    }
+
+    #[test]
+    fn repartition_support_rejects_specific_unsupported_shape() {
+        let invalid = RefreshCapabilities {
+            snapshot_policy: BaseSnapshotPolicy::AllBasesRequired,
+            has_agg_state: false,
+            identity: RefreshIdentity::JoinRowKey,
+            apply_key_column: ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
+            apply_key_value_type: ApplyKeyValueType::Utf8,
+            partition_pruning: PartitionPruningPolicy::BestEffort,
+        };
+
+        let err = validate_repartition_support(&invalid).expect_err("shape must be rejected");
+        assert!(err.contains("UnsupportedRepartitionShape"));
+        assert!(err.contains("JoinRowKey"));
+        assert!(err.contains("AllBasesRequired"));
+        assert!(err.contains("aggregate_state=false"));
+
+        let branch_union_aggregate = RefreshCapabilities {
+            snapshot_policy: BaseSnapshotPolicy::AllBasesRequired,
+            has_agg_state: true,
+            identity: RefreshIdentity::BranchScoped(Box::new(RefreshIdentity::GroupRowId)),
+            apply_key_column: ICEBERG_MV_GROUP_APPLY_KEY_COLUMN.to_string(),
+            apply_key_value_type: ApplyKeyValueType::BranchUtf8,
+            partition_pruning: PartitionPruningPolicy::BestEffort,
+        };
+        let err = validate_repartition_support(&branch_union_aggregate)
+            .expect_err("branch UNION ALL aggregate repartition is unsupported");
+        assert!(err.contains("UnsupportedRepartitionShape"));
+        assert!(err.contains("BranchScoped"));
+        assert!(err.contains("aggregate_state=true"));
     }
 
     #[test]
