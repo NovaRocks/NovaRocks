@@ -30,6 +30,23 @@ use crate::fs::scan_context::{FileScanContext, FileScanRange};
 use crate::internal_service;
 use crate::runtime::profile::RuntimeProfile;
 
+fn delete_files_have_position_deletes(delete_files: &[IcebergDeleteFileSpec]) -> bool {
+    delete_files
+        .iter()
+        .any(|file| file.file_content == crate::types::TIcebergFileContent::POSITION_DELETES)
+}
+
+fn apply_parquet_pruning_gate_for_delete_files(
+    parquet_cfg: &mut crate::formats::parquet::ParquetScanConfig,
+    delete_files: &[IcebergDeleteFileSpec],
+) {
+    if delete_files_have_position_deletes(delete_files) {
+        parquet_cfg.enable_page_index = false;
+        parquet_cfg.min_max_predicates.clear();
+        parquet_cfg.variant_path_predicates.clear();
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct HdfsScanConfig {
     pub ranges: Vec<FileScanRange>,
@@ -167,6 +184,11 @@ impl ScanOp for HdfsScanOp {
             );
             profile.add_info_string("RangeCount", format!("{}", scan.ranges.len()));
         }
+        let current_delete_files = scan
+            .ranges
+            .first()
+            .map(|range| range.delete_files.as_slice())
+            .unwrap_or(&[]);
 
         let Some(mut format) = self.cfg.format.clone() else {
             return Err("hdfs scan missing file format for non-empty morsel".to_string());
@@ -177,6 +199,7 @@ impl ScanOp for HdfsScanOp {
                     .datacache
                     .with_external_range_options(external_datacache.as_ref())?;
                 parquet_cfg.query_global_dicts = self.cfg.query_global_dicts.clone();
+                apply_parquet_pruning_gate_for_delete_files(&mut parquet_cfg, current_delete_files);
                 FileFormatConfig::Parquet(parquet_cfg)
             }
             FileFormatConfig::Orc(mut orc_cfg) => {
@@ -575,15 +598,26 @@ fn build_external_datacache_options(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    use crate::cache::{CacheOptions, DataCacheManager};
+    use crate::common::ids::SlotId;
+    use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
+    use crate::connector::iceberg::position_delete::IcebergDeleteFileSpec;
     use crate::descriptors;
+    use crate::exec::chunk::ChunkSchema;
     use crate::exec::node::scan::{ScanMorsel, ScanOp};
+    use crate::formats::parquet::{
+        ParquetReadCachePolicy, ParquetScanConfig, VariantPathPruningPredicate,
+    };
     use crate::fs::scan_context::FileScanRange;
     use crate::internal_service;
     use crate::plan_nodes;
     use crate::{exprs, types};
 
-    use super::{HdfsScanConfig, HdfsScanOp};
+    use super::{HdfsScanConfig, HdfsScanOp, apply_parquet_pruning_gate_for_delete_files};
 
     fn make_hdfs_range(
         path: &str,
@@ -716,6 +750,102 @@ mod tests {
             is_index_only_filter: None,
             is_nondeterministic: None,
         }])
+    }
+
+    fn test_datacache_context() -> crate::cache::DataCacheContext {
+        let cache_options = CacheOptions::from_query_options(None).expect("cache options");
+        DataCacheManager::instance().external_context(cache_options)
+    }
+
+    fn test_delete_file(file_content: types::TIcebergFileContent) -> IcebergDeleteFileSpec {
+        IcebergDeleteFileSpec {
+            path: "delete.parquet".to_string(),
+            file_format: descriptors::THdfsFileFormat::PARQUET,
+            file_content,
+            length: Some(1),
+            content_offset: None,
+            content_size_in_bytes: None,
+        }
+    }
+
+    fn test_prunable_parquet_config() -> ParquetScanConfig {
+        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            &Schema::new(vec![
+                Field::new("id", DataType::Int32, true),
+                Field::new("__nr_var_payload_a", DataType::Int64, true),
+                Field::new("payload", DataType::LargeBinary, true),
+            ]),
+            &[SlotId::new(1), SlotId::new(2), SlotId::new(3)],
+        )
+        .expect("chunk schema");
+        ParquetScanConfig {
+            columns: vec!["id".to_string(), "payload".to_string()],
+            chunk_schema,
+            slot_types: vec![
+                types::TPrimitiveType::INT,
+                types::TPrimitiveType::BIGINT,
+                types::TPrimitiveType::VARIANT,
+            ],
+            case_sensitive: true,
+            enable_page_index: true,
+            min_max_predicates: vec![MinMaxPredicate::Gt {
+                column: "0".to_string(),
+                value: MinMaxPredicateValue::Int32(5),
+            }],
+            variant_path_predicates: vec![VariantPathPruningPredicate {
+                output_slot_id: SlotId::new(2),
+                source_slot_id: SlotId::new(3),
+                source_field_id: Some(10),
+                canonical_path: "$.a".to_string(),
+                requested_type: DataType::Int64,
+                predicate: MinMaxPredicate::Gt {
+                    column: "__nr_var_payload_a".to_string(),
+                    value: MinMaxPredicateValue::Int64(7),
+                },
+            }],
+            batch_size: Some(1024),
+            datacache: test_datacache_context(),
+            cache_policy: ParquetReadCachePolicy::with_flags(false, false, None),
+            profile_label: None,
+            iceberg_output_schema: Some(Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, true),
+                Field::new("payload", DataType::LargeBinary, true),
+            ]))),
+            variant_path_columns: Vec::new(),
+            query_global_dicts: Default::default(),
+        }
+    }
+
+    #[test]
+    fn hdfs_scan_position_delete_morsel_strips_parquet_pruning() {
+        let mut parquet_cfg = test_prunable_parquet_config();
+
+        apply_parquet_pruning_gate_for_delete_files(
+            &mut parquet_cfg,
+            &[test_delete_file(
+                types::TIcebergFileContent::POSITION_DELETES,
+            )],
+        );
+
+        assert!(!parquet_cfg.enable_page_index);
+        assert!(parquet_cfg.min_max_predicates.is_empty());
+        assert!(parquet_cfg.variant_path_predicates.is_empty());
+    }
+
+    #[test]
+    fn hdfs_scan_equality_delete_morsel_keeps_parquet_pruning() {
+        let mut parquet_cfg = test_prunable_parquet_config();
+
+        apply_parquet_pruning_gate_for_delete_files(
+            &mut parquet_cfg,
+            &[test_delete_file(
+                types::TIcebergFileContent::EQUALITY_DELETES,
+            )],
+        );
+
+        assert!(parquet_cfg.enable_page_index);
+        assert_eq!(parquet_cfg.min_max_predicates.len(), 1);
+        assert_eq!(parquet_cfg.variant_path_predicates.len(), 1);
     }
 
     #[test]
