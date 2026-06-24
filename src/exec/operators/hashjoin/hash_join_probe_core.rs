@@ -1439,11 +1439,7 @@ impl HashJoinProbeCore {
             ));
         }
         let build_chunk_for_residual = if has_residual {
-            Some(
-                self.build_chunk
-                    .clone()
-                    .ok_or_else(|| "null-aware anti join build chunk missing".to_string())?,
-            )
+            self.build_chunk.clone()
         } else {
             None
         };
@@ -1457,16 +1453,6 @@ impl HashJoinProbeCore {
                 self.build_batches.as_ref(),
                 build_null_rows_by_batch,
             )?
-        } else {
-            Vec::new()
-        };
-        let all_build_rows = if let Some(build_chunk) = build_chunk_for_residual.as_ref() {
-            (0..build_chunk.len())
-                .map(|row| {
-                    u32::try_from(row)
-                        .map_err(|_| "join residual build row id overflow".to_string())
-                })
-                .collect::<Result<Vec<_>, _>>()?
         } else {
             Vec::new()
         };
@@ -1507,9 +1493,6 @@ impl HashJoinProbeCore {
             let mut residual_matched_probe_rows = vec![false; probe.len()];
 
             if let Some(pred) = self.residual_predicate {
-                let build_chunk = build_chunk_for_residual
-                    .as_ref()
-                    .expect("checked residual build chunk");
                 if table_opt.is_some() {
                     let stats = SearchStats::from_group_ids(&group_ids);
                     self.residual_rows_checked = self
@@ -1519,6 +1502,9 @@ impl HashJoinProbeCore {
                         .residual_group_rows_total
                         .saturating_add(equal_selection.len() as u64);
                     if !equal_selection.is_empty() {
+                        let build_chunk = build_chunk_for_residual.as_ref().ok_or_else(|| {
+                            "null-aware anti join build chunk missing".to_string()
+                        })?;
                         equal_selection.reorder_by_build_batch_lengths(&build_batch_lengths)?;
                         self.compact_null_aware_selection(
                             &probe,
@@ -1533,6 +1519,9 @@ impl HashJoinProbeCore {
                 }
 
                 if !flat_build_null_key_rows.is_empty() {
+                    let build_chunk = build_chunk_for_residual
+                        .as_ref()
+                        .ok_or_else(|| "null-aware anti join build chunk missing".to_string())?;
                     let probe_rows = (0..probe.len()).map(|row| row as u32).collect::<Vec<_>>();
                     self.compact_cross_selection_in_chunks(
                         &probe,
@@ -1546,7 +1535,20 @@ impl HashJoinProbeCore {
                     )?;
                 }
 
-                if probe_null_rows.iter().any(|is_null| *is_null) {
+                let has_local_build_rows = build_chunk_for_residual
+                    .as_ref()
+                    .map(|chunk| !chunk.is_empty())
+                    .unwrap_or(self.build_partition_row_count > 0);
+                if has_local_build_rows && probe_null_rows.iter().any(|is_null| *is_null) {
+                    let build_chunk = build_chunk_for_residual
+                        .as_ref()
+                        .ok_or_else(|| "null-aware anti join build chunk missing".to_string())?;
+                    let all_build_rows = (0..build_chunk.len())
+                        .map(|row| {
+                            u32::try_from(row)
+                                .map_err(|_| "join residual build row id overflow".to_string())
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
                     let probe_rows = probe_null_rows
                         .iter()
                         .enumerate()
@@ -1999,5 +2001,83 @@ mod tests {
             .expect("build output");
         assert_eq!(build_out.num_rows(), 1);
         assert_eq!(core.residual_matched_rows(), 1);
+    }
+
+    #[test]
+    fn null_aware_left_anti_residual_allows_empty_local_build_partition() {
+        let left_schema = schema_kv("lk", "lv");
+        let right_schema = schema_kv("rk", "rw");
+        let join_scope_schema = join_schema(&left_schema, &right_schema);
+
+        let mut arena = ExprArena::default();
+        let probe_key = arena.push_typed(ExprNode::SlotId(LEFT_K_SLOT_ID), DataType::Int32);
+        let left_v = arena.push_typed(ExprNode::SlotId(LEFT_V_SLOT_ID), DataType::Int32);
+        let right_w = arena.push_typed(ExprNode::SlotId(RIGHT_W_SLOT_ID), DataType::Int32);
+        let residual = arena.push_typed(ExprNode::Lt(left_v, right_w), DataType::Boolean);
+        let arena = Arc::new(arena);
+
+        let artifact = Arc::new(JoinBuildArtifact::new(
+            None,
+            Vec::new(),
+            None,
+            0,
+            false,
+            Some(Arc::new(Vec::new())),
+            None,
+        ));
+        let mut core = HashJoinProbeCore::new(
+            Arc::clone(&arena),
+            JoinType::NullAwareLeftAnti,
+            vec![probe_key],
+            Some(residual),
+            true,
+            chunk_schema_of(&left_schema, &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID]),
+            chunk_schema_of(&right_schema, &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID]),
+            chunk_schema_of(
+                &join_scope_schema,
+                &[
+                    LEFT_K_SLOT_ID,
+                    LEFT_V_SLOT_ID,
+                    RIGHT_K_SLOT_ID,
+                    RIGHT_W_SLOT_ID,
+                ],
+            ),
+        );
+        core.set_build_artifact(artifact, 1, false)
+            .expect("set build");
+
+        let probe_chunk = chunk_of_two(
+            Arc::clone(&left_schema),
+            &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID],
+            &[1, 2],
+            &[100, 200],
+        );
+
+        let out = core
+            .join_probe_chunks(vec![probe_chunk])
+            .expect("empty local build partition should not require build chunk")
+            .expect("probe rows survive empty local build partition");
+
+        assert_eq!(out.len(), 2);
+        let left_k = out
+            .columns()
+            .first()
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let left_v = out
+            .columns()
+            .get(1)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(
+            (0..out.len())
+                .map(|row| (left_k.value(row), left_v.value(row)))
+                .collect::<Vec<_>>(),
+            vec![(1, 100), (2, 200)]
+        );
     }
 }
