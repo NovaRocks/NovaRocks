@@ -55,16 +55,16 @@ PLAN FRAGMENT 1
     EXCHANGE ID: 11
     PARTITION: UNPARTITIONED
 10:LOCAL TOP-N (limit=1, offset=0) [sum(score) DESC NULLS LAST] stats={rows=1}
-  9:HASH AGGREGATE (GLOBAL, group by: [id]) stats={rows=6325}
+  9:HASH AGGREGATE (GLOBAL, group by: [id]) stats={rows=10}
     aggregations: sum(score)
-    8:HASH EXCHANGE stats={rows=6325}
+    8:HASH EXCHANGE stats={rows=10}
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 8
     PARTITION: HASH_PARTITIONED (id)
-7:HASH AGGREGATE (LOCAL, group by: [id]) stats={rows=6325}
+7:HASH AGGREGATE (LOCAL, group by: [id]) stats={rows=10}
   aggregations: sum(score)
   6:PROJECT [id, score] stats={rows=200000}
     5:UNION ALL stats={rows=200000}

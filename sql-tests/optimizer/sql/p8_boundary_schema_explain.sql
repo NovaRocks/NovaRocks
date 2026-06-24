@@ -8,7 +8,12 @@ FROM (
 ) t
 GROUP BY k;
 
--- @expect_error=EXPLAIN ANALYZE requires remote fragment profile collection
+-- @skip_result_check=true
+-- @result_contains=Planning:
+-- @result_contains=Rows: 1
+-- @result_contains=Profile: fragments=
+-- @result_contains=HASH AGGREGATE
+-- @result_contains=UNION ALL
 EXPLAIN ANALYZE SELECT k, SUM(v) AS total_v
 FROM (
     SELECT 1 AS k, 10 AS v

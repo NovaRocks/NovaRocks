@@ -2,17 +2,17 @@ Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
-11:PROJECT [a.k AS k, a.v AS v, b.w AS w, rn] stats={rows=2}
-  10:WINDOW [row_number()] stats={rows=2}
-    9:SORT BY [a.k ASC NULLS FIRST, a.v ASC NULLS FIRST] stats={rows=2}
-      8:HASH EXCHANGE stats={rows=2}
+11:PROJECT [a.k AS k, a.v AS v, b.w AS w, rn] stats={rows=1}
+  10:WINDOW [row_number()] stats={rows=1}
+    9:SORT BY [a.k ASC NULLS FIRST, a.v ASC NULLS FIRST] stats={rows=1}
+      8:HASH EXCHANGE stats={rows=1}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 8
     PARTITION: HASH_PARTITIONED (k)
-7:HASH JOIN (BROADCAST, INNER, eq: [a.k = s.s]) stats={rows=2}
+7:HASH JOIN (BROADCAST, INNER, eq: [a.k = s.s]) stats={rows=1}
   build runtime filters:
   - filter_id = 1, build_expr = (s.s)
   4:HASH JOIN (BROADCAST, INNER, eq: [a.k = b.k]) stats={rows=2}

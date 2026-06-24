@@ -1,6 +1,6 @@
 -- @tags=optimizer,explain_analyze,actuals
 -- Test Objective:
--- 1. EXPLAIN ANALYZE fails fast until RemoteDispatcher can collect profiles.
+-- 1. EXPLAIN ANALYZE executes the distributed plan and renders actual metrics.
 DROP TABLE IF EXISTS ${case_db}.explain_analyze_actuals_l;
 DROP TABLE IF EXISTS ${case_db}.explain_analyze_actuals_r;
 CREATE TABLE ${case_db}.explain_analyze_actuals_l (k INT, v INT);
@@ -8,7 +8,12 @@ CREATE TABLE ${case_db}.explain_analyze_actuals_r (k INT, v INT);
 INSERT INTO ${case_db}.explain_analyze_actuals_l VALUES (1, 10), (2, 20), (3, 30);
 INSERT INTO ${case_db}.explain_analyze_actuals_r VALUES (1, 100), (2, 200), (4, 400);
 
--- @expect_error=EXPLAIN ANALYZE requires remote fragment profile collection
+-- @skip_result_check=true
+-- @result_contains=Planning:
+-- @result_contains=Rows: 1
+-- @result_contains=Profile: fragments=
+-- @result_contains=HASH JOIN (BROADCAST, INNER
+-- @result_contains=act={rows=
 EXPLAIN ANALYZE
 SELECT COUNT(*)
 FROM ${case_db}.explain_analyze_actuals_l l
