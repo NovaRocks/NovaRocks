@@ -52,6 +52,7 @@ pub struct ParquetWriterBuilder {
     props: WriterProperties,
     schema: SchemaRef,
     match_mode: FieldMatchMode,
+    arrow_schema_override: Option<ArrowSchemaRef>,
 }
 
 impl ParquetWriterBuilder {
@@ -71,7 +72,18 @@ impl ParquetWriterBuilder {
             props,
             schema,
             match_mode,
+            arrow_schema_override: None,
         }
+    }
+
+    /// Override the Arrow schema used to initialize the parquet writer.
+    ///
+    /// The Iceberg schema is still used for Iceberg data-file metrics and
+    /// field-id matching. This is only for physical Arrow layouts that extend
+    /// the canonical Iceberg Arrow conversion, such as shredded variant writes.
+    pub fn with_arrow_schema_override(mut self, arrow_schema: ArrowSchemaRef) -> Self {
+        self.arrow_schema_override = Some(arrow_schema);
+        self
     }
 }
 
@@ -86,6 +98,7 @@ impl FileWriterBuilder for ParquetWriterBuilder {
             current_row_num: 0,
             output_file,
             nan_value_count_visitor: NanValueCountVisitor::new_with_match_mode(self.match_mode),
+            arrow_schema_override: self.arrow_schema_override.clone(),
         })
     }
 }
@@ -216,6 +229,7 @@ pub struct ParquetWriter {
     writer_properties: WriterProperties,
     current_row_num: usize,
     nan_value_count_visitor: NanValueCountVisitor,
+    arrow_schema_override: Option<ArrowSchemaRef>,
 }
 
 /// Used to aggregate min and max value of each column.
@@ -489,7 +503,10 @@ impl FileWriter for ParquetWriter {
         let writer = if let Some(writer) = &mut self.inner_writer {
             writer
         } else {
-            let arrow_schema: ArrowSchemaRef = Arc::new(self.schema.as_ref().try_into()?);
+            let arrow_schema: ArrowSchemaRef = match &self.arrow_schema_override {
+                Some(schema) => Arc::clone(schema),
+                None => Arc::new(self.schema.as_ref().try_into()?),
+            };
             let inner_writer = self.output_file.writer().await?;
             let async_writer = AsyncFileWriter::new(inner_writer);
             let writer = AsyncArrowWriter::try_new(

@@ -75,9 +75,9 @@
 | 能力 | 状态 | 备注 |
 | --- | --- | --- |
 | variant（读） | ✅ | `src/exec/variant.rs` |
-| variant（INSERT 写） | ✅ | PR #87；`INSERT INTO ... VALUES (parse_json(...))` / `INSERT INTO ... SELECT` 均 OK，单 partition spec、无 shredding |
+| variant（INSERT 写） | ✅ | PR #87；`INSERT INTO ... VALUES (parse_json(...))` / `INSERT INTO ... SELECT` 均 OK；PR6 支持显式 shredding 表属性 |
 | variant（OVERWRITE / DELETE / UPDATE / MERGE / equality-delete 写） | ❌ | PR #87 fail-fast，错误信息明确指向非目标边界 |
-| variant shredding（`typed_value` 子树） | ❌ | spec optional，未做 |
+| variant shredding（`typed_value` 子树） | ✅ | 读已支持；INSERT 写通过 `write.parquet.variant-shredding.<col>` 显式开启 |
 | variant default value（`initial-default` / `write-default`） | ❌ | |
 | variant 在 partition spec / sort order / equality_ids | ❌ | spec 禁止；NovaRocks reject |
 | variant predicate pushdown 到 parquet | ❌ | 当前在 BE 层 evaluate |

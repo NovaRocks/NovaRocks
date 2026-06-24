@@ -24,7 +24,246 @@
 //! value: BinaryArray (req) }`; this module bridges the two right
 //! before `iceberg::ParquetWriter::write`.
 
+use std::collections::HashMap;
+
+use arrow::datatypes::DataType;
 use iceberg::spec::SchemaRef;
+
+pub(crate) const VARIANT_SHREDDING_PROPERTY_PREFIX: &str = "write.parquet.variant-shredding.";
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct VariantShreddingConfig {
+    specs_by_index: HashMap<usize, VariantShreddingSpec>,
+}
+
+impl VariantShreddingConfig {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.specs_by_index.is_empty()
+    }
+
+    pub(crate) fn spec_for_index(&self, index: usize) -> Option<&VariantShreddingSpec> {
+        self.specs_by_index.get(&index)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct VariantShreddingSpec {
+    as_type: DataType,
+}
+
+impl VariantShreddingSpec {
+    pub(crate) fn as_type(&self) -> &DataType {
+        &self.as_type
+    }
+}
+
+pub(crate) fn parse_variant_shredding_properties(
+    properties: &HashMap<String, String>,
+    iceberg_schema: &SchemaRef,
+) -> Result<VariantShreddingConfig, String> {
+    use iceberg::spec::{PrimitiveType, Type};
+
+    let mut columns_by_name = HashMap::new();
+    for (idx, field) in iceberg_schema.as_struct().fields().iter().enumerate() {
+        let key = crate::engine::catalog::normalize_identifier(&field.name)?;
+        columns_by_name.insert(key, (idx, field));
+    }
+
+    let mut specs_by_index = HashMap::new();
+    for (key, value) in properties {
+        let Some(column_name) = key.strip_prefix(VARIANT_SHREDDING_PROPERTY_PREFIX) else {
+            continue;
+        };
+        let normalized_column = crate::engine::catalog::normalize_identifier(column_name)
+            .map_err(|e| format!("invalid variant shredding property `{key}`: {e}"))?;
+        let Some((idx, field)) = columns_by_name.get(&normalized_column).copied() else {
+            return Err(format!(
+                "invalid variant shredding property `{key}`: column `{column_name}` does not exist"
+            ));
+        };
+        if !matches!(
+            field.field_type.as_ref(),
+            Type::Primitive(PrimitiveType::Variant)
+        ) {
+            return Err(format!(
+                "invalid variant shredding property `{key}`: column `{}` is not VARIANT",
+                field.name
+            ));
+        }
+        let spec = parse_variant_shredding_spec(key, value)?;
+        if specs_by_index.insert(idx, spec).is_some() {
+            return Err(format!(
+                "duplicate variant shredding property for column `{}`",
+                field.name
+            ));
+        }
+    }
+
+    Ok(VariantShreddingConfig { specs_by_index })
+}
+
+pub(crate) fn apply_variant_shredding_to_arrow_schema(
+    annotated_schema: &arrow::datatypes::SchemaRef,
+    shredding_config: &VariantShreddingConfig,
+) -> Result<arrow::datatypes::SchemaRef, String> {
+    use std::sync::Arc;
+
+    if shredding_config.is_empty() {
+        return Ok(Arc::clone(annotated_schema));
+    }
+
+    let fields = annotated_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(idx, field)| {
+            let Some(spec) = shredding_config.spec_for_index(idx) else {
+                return Ok(field.clone());
+            };
+            let data_type = shredded_variant_data_type(spec.as_type()).map_err(|e| {
+                format!(
+                    "derive shredded Arrow type for column `{}`: {e}",
+                    field.name()
+                )
+            })?;
+            Ok(field.as_ref().clone().with_data_type(data_type).into())
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    Ok(Arc::new(arrow::datatypes::Schema::new_with_metadata(
+        fields,
+        annotated_schema.metadata().clone(),
+    )))
+}
+
+fn shredded_variant_data_type(as_type: &DataType) -> Result<DataType, String> {
+    use arrow::array::{Array, ArrayRef, BinaryArray, StructArray};
+    use arrow::datatypes::{Field, Fields};
+    use std::sync::Arc;
+
+    let metadata = BinaryArray::from_iter_values(std::iter::empty::<&[u8]>());
+    let value = BinaryArray::from_iter_values(std::iter::empty::<&[u8]>());
+    let unshredded = StructArray::new(
+        Fields::from(vec![
+            Field::new("metadata", DataType::Binary, false),
+            Field::new("value", DataType::Binary, true),
+        ]),
+        vec![Arc::new(metadata) as ArrayRef, Arc::new(value) as ArrayRef],
+        None,
+    );
+    let variant = parquet::variant::VariantArray::try_new(&unshredded)
+        .map_err(|e| format!("build empty VariantArray: {e}"))?;
+    let shredded = parquet::variant::shred_variant(&variant, as_type)
+        .map_err(|e| format!("shred empty VariantArray: {e}"))?;
+    Ok(shredded.into_inner().data_type().clone())
+}
+
+fn parse_variant_shredding_spec(
+    property_key: &str,
+    raw: &str,
+) -> Result<VariantShreddingSpec, String> {
+    use parquet::variant::ShreddedSchemaBuilder;
+
+    let mut builder = ShreddedSchemaBuilder::new();
+    let entries = split_property_entries(raw).map_err(|e| format!("{property_key}: {e}"))?;
+    if entries.is_empty() {
+        return Err(format!(
+            "{property_key}: expected at least one `<path> <type>` entry"
+        ));
+    }
+
+    for entry in entries {
+        let (path, ty) = parse_path_type_entry(property_key, entry)?;
+        let data_type = parse_shredding_sql_type(property_key, ty)?;
+        builder = builder
+            .with_path(path, &data_type)
+            .map_err(|e| format!("{property_key}: invalid variant path `{path}`: {e}"))?;
+    }
+
+    Ok(VariantShreddingSpec {
+        as_type: builder.build(),
+    })
+}
+
+fn split_property_entries(raw: &str) -> Result<Vec<&str>, String> {
+    let mut entries = Vec::new();
+    let mut start = 0;
+    let mut depth = 0_i32;
+    for (idx, ch) in raw.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return Err("unbalanced ')' in variant shredding property".to_string());
+                }
+            }
+            ',' if depth == 0 => {
+                let item = raw[start..idx].trim();
+                if !item.is_empty() {
+                    entries.push(item);
+                }
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return Err("unbalanced '(' in variant shredding property".to_string());
+    }
+    let tail = raw[start..].trim();
+    if !tail.is_empty() {
+        entries.push(tail);
+    }
+    Ok(entries)
+}
+
+fn parse_path_type_entry<'a>(
+    property_key: &str,
+    entry: &'a str,
+) -> Result<(&'a str, &'a str), String> {
+    let Some(split_at) = entry.find(char::is_whitespace) else {
+        return Err(format!(
+            "{property_key}: expected `<path> <type>` entry, got `{entry}`"
+        ));
+    };
+    let path = entry[..split_at].trim();
+    let ty = entry[split_at..].trim();
+    if path.is_empty() || ty.is_empty() {
+        return Err(format!(
+            "{property_key}: expected `<path> <type>` entry, got `{entry}`"
+        ));
+    }
+    if path.contains('[') || path.contains(']') {
+        return Err(format!(
+            "{property_key}: array-index variant shredding path `{path}` is not supported"
+        ));
+    }
+    let path = path.strip_prefix("$.").unwrap_or(path);
+    if path.is_empty() || path.starts_with('$') {
+        return Err(format!(
+            "{property_key}: invalid variant shredding path `{path}`"
+        ));
+    }
+    Ok((path, ty))
+}
+
+fn parse_shredding_sql_type(property_key: &str, raw: &str) -> Result<DataType, String> {
+    use crate::sql::parser::ast::SqlType;
+
+    let sql_type = crate::sql::parser::dialect::create_table::parse_sql_type_string(raw)
+        .map_err(|e| format!("{property_key}: invalid shredding type `{raw}`: {e}"))?;
+    match sql_type {
+        SqlType::Boolean => Ok(DataType::Boolean),
+        SqlType::BigInt => Ok(DataType::Int64),
+        SqlType::Double => Ok(DataType::Float64),
+        SqlType::String => Ok(DataType::Utf8),
+        SqlType::Date => Ok(DataType::Date32),
+        other => Err(format!(
+            "{property_key}: unsupported variant shredding type `{raw}` ({other:?}); supported types are boolean, bigint, double, string, date"
+        )),
+    }
+}
 
 /// Returns the offsets within a `[metadata|value]` payload at which the
 /// metadata segment ends. Mirrors the parsing in
@@ -115,6 +354,7 @@ pub(crate) fn transform_variant_columns_for_write(
     batch: &RecordBatch,
     annotated_schema: &arrow::datatypes::SchemaRef,
     variant_indices: &[usize],
+    shredding_config: &VariantShreddingConfig,
 ) -> Result<RecordBatch, String> {
     use arrow::array::{
         Array, ArrayRef, BinaryArray, BinaryBuilder, LargeBinaryArray, StructArray,
@@ -203,7 +443,18 @@ pub(crate) fn transform_variant_columns_for_write(
             ],
             Some(null_buffer),
         );
-        out_columns.push(Arc::new(struct_arr));
+        let out_arr = if let Some(spec) = shredding_config.spec_for_index(idx) {
+            let variant = parquet::variant::VariantArray::try_new(&struct_arr)
+                .map_err(|e| format!("variant_write: build VariantArray for column {idx}: {e}"))?;
+            let shredded =
+                parquet::variant::shred_variant(&variant, spec.as_type()).map_err(|e| {
+                    format!("variant_write: shred variant column {idx} using table property: {e}")
+                })?;
+            Arc::new(shredded.into_inner()) as ArrayRef
+        } else {
+            Arc::new(struct_arr) as ArrayRef
+        };
+        out_columns.push(out_arr);
     }
 
     // Build the output schema by keeping the input batch's fields for all
@@ -223,7 +474,14 @@ pub(crate) fn transform_variant_columns_for_write(
             if variant_set.contains(&idx) {
                 // Use the annotated field which carries the extension metadata
                 // required by the parquet writer (ARROW:extension:name etc.).
-                annotated_schema.field(idx).clone().into()
+                let field = annotated_schema.field(idx).as_ref().clone();
+                if shredding_config.spec_for_index(idx).is_some() {
+                    field
+                        .with_data_type(out_columns[idx].data_type().clone())
+                        .into()
+                } else {
+                    field.into()
+                }
             } else {
                 input_field.clone()
             }
@@ -357,7 +615,9 @@ mod tests {
         let arr = LargeBinaryArray::from_iter_values([raw.as_slice()]);
         let batch = RecordBatch::try_new(input_schema, vec![Arc::new(arr)]).expect("batch");
 
-        let out = transform_variant_columns_for_write(&batch, &annotated, &[0]).expect("ok");
+        let out =
+            transform_variant_columns_for_write(&batch, &annotated, &[0], &Default::default())
+                .expect("ok");
         assert_eq!(out.num_columns(), 1);
         let col = out.column(0);
         let s = col
@@ -403,7 +663,9 @@ mod tests {
         let arr = LargeBinaryArray::from(vec![Some(raw.as_slice()), None, Some(raw.as_slice())]);
         let batch = RecordBatch::try_new(input_schema, vec![Arc::new(arr)]).expect("batch");
 
-        let out = transform_variant_columns_for_write(&batch, &annotated, &[0]).expect("ok");
+        let out =
+            transform_variant_columns_for_write(&batch, &annotated, &[0], &Default::default())
+                .expect("ok");
         let s = out
             .column(0)
             .as_any()
@@ -452,7 +714,9 @@ mod tests {
         let v_arr = LargeBinaryArray::from_iter_values([raw.as_slice()]);
         let batch = RecordBatch::try_new(input_schema, vec![Arc::new(id_arr), Arc::new(v_arr)])
             .expect("batch");
-        let out = transform_variant_columns_for_write(&batch, &annotated, &[1]).expect("ok");
+        let out =
+            transform_variant_columns_for_write(&batch, &annotated, &[1], &Default::default())
+                .expect("ok");
         assert_eq!(out.num_columns(), 2);
         let id = out
             .column(0)
@@ -500,8 +764,9 @@ mod tests {
             .expect("batch");
 
         // Must succeed despite id being Int64 vs annotated Int32.
-        let out = transform_variant_columns_for_write(&batch, &annotated, &[1])
-            .expect("transform must succeed for widened non-variant column");
+        let out =
+            transform_variant_columns_for_write(&batch, &annotated, &[1], &Default::default())
+                .expect("transform must succeed for widened non-variant column");
 
         // (a) Succeeds (already asserted above).
         assert_eq!(out.num_columns(), 2);
@@ -556,7 +821,9 @@ mod tests {
         let v2 = LargeBinaryArray::from_iter_values([raw2.as_slice()]);
         let batch =
             RecordBatch::try_new(input_schema, vec![Arc::new(v1), Arc::new(v2)]).expect("batch");
-        let out = transform_variant_columns_for_write(&batch, &annotated, &[0, 1]).expect("ok");
+        let out =
+            transform_variant_columns_for_write(&batch, &annotated, &[0, 1], &Default::default())
+                .expect("ok");
         let s1 = out
             .column(0)
             .as_any()
@@ -569,5 +836,133 @@ mod tests {
             .unwrap();
         assert_eq!(s1.len(), 1);
         assert_eq!(s2.len(), 1);
+    }
+
+    #[test]
+    fn parse_variant_shredding_properties_accepts_whitelisted_paths() {
+        use arrow::datatypes::{DataType, Field, Fields};
+        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        use std::collections::HashMap;
+
+        let iceberg_schema = make_iceberg_schema(vec![
+            NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::optional(2, "v", Type::Primitive(PrimitiveType::Variant)).into(),
+        ]);
+        let props = HashMap::from([(
+            "write.parquet.variant-shredding.v".to_string(),
+            "a bigint, b.c string".to_string(),
+        )]);
+
+        let config = parse_variant_shredding_properties(&props, &iceberg_schema).expect("config");
+        let spec = config.spec_for_index(1).expect("variant column spec");
+
+        assert_eq!(
+            spec.as_type(),
+            &DataType::Struct(Fields::from(vec![
+                Field::new("a", DataType::Int64, true),
+                Field::new(
+                    "b",
+                    DataType::Struct(Fields::from(vec![Field::new("c", DataType::Utf8, true)])),
+                    true,
+                ),
+            ]))
+        );
+    }
+
+    #[test]
+    fn parse_variant_shredding_properties_rejects_non_variant_column() {
+        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        use std::collections::HashMap;
+
+        let iceberg_schema = make_iceberg_schema(vec![
+            NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::optional(2, "v", Type::Primitive(PrimitiveType::Variant)).into(),
+        ]);
+        let props = HashMap::from([(
+            "write.parquet.variant-shredding.id".to_string(),
+            "a bigint".to_string(),
+        )]);
+
+        let err = parse_variant_shredding_properties(&props, &iceberg_schema)
+            .expect_err("id is not variant");
+        assert!(err.contains("variant-shredding.id"), "{err}");
+        assert!(err.contains("VARIANT"), "{err}");
+    }
+
+    #[test]
+    fn transform_variant_columns_for_write_shreds_configured_column() {
+        use arrow::array::{
+            Array, ArrayRef, BinaryArray, BinaryViewArray, LargeBinaryArray, RecordBatch,
+        };
+        use arrow::datatypes::{DataType, Field, Schema};
+        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        use parquet::variant::json_to_variant;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        fn binary_value(array: &ArrayRef, row: usize) -> Vec<u8> {
+            if let Some(arr) = array.as_any().downcast_ref::<BinaryArray>() {
+                return arr.value(row).to_vec();
+            }
+            if let Some(arr) = array.as_any().downcast_ref::<LargeBinaryArray>() {
+                return arr.value(row).to_vec();
+            }
+            if let Some(arr) = array.as_any().downcast_ref::<BinaryViewArray>() {
+                return arr.value(row).to_vec();
+            }
+            panic!("unexpected binary array type: {:?}", array.data_type());
+        }
+
+        fn engine_variant_payload_from_json(json: &str) -> Vec<u8> {
+            let json_array: ArrayRef = Arc::new(arrow::array::StringArray::from(vec![json]));
+            let variant = json_to_variant(&json_array).expect("json_to_variant");
+            let inner = variant.into_inner();
+            let metadata = binary_value(inner.column_by_name("metadata").unwrap(), 0);
+            let value = binary_value(inner.column_by_name("value").unwrap(), 0);
+            let total = (metadata.len() + value.len()) as u32;
+            let mut out = Vec::with_capacity(4 + metadata.len() + value.len());
+            out.extend_from_slice(&total.to_le_bytes());
+            out.extend_from_slice(&metadata);
+            out.extend_from_slice(&value);
+            out
+        }
+
+        let iceberg_schema = make_iceberg_schema(vec![
+            NestedField::optional(1, "v", Type::Primitive(PrimitiveType::Variant)).into(),
+        ]);
+        let annotated = make_annotated_arrow_schema(&iceberg_schema);
+        let props = HashMap::from([(
+            "write.parquet.variant-shredding.v".to_string(),
+            "a bigint".to_string(),
+        )]);
+        let config = parse_variant_shredding_properties(&props, &iceberg_schema).expect("config");
+
+        let raw = engine_variant_payload_from_json(r#"{"a": 42, "b": "x"}"#);
+        let input_schema = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            DataType::LargeBinary,
+            true,
+        )]));
+        let arr = LargeBinaryArray::from_iter_values([raw.as_slice()]);
+        let batch = RecordBatch::try_new(input_schema, vec![Arc::new(arr)]).expect("batch");
+
+        let out = transform_variant_columns_for_write(&batch, &annotated, &[0], &config)
+            .expect("shredded transform");
+        let s = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StructArray>()
+            .expect("struct");
+        assert_eq!(s.fields().len(), 3);
+        assert!(s.column_by_name("typed_value").is_some());
+        assert_eq!(
+            s.column_by_name("value").unwrap().data_type(),
+            &DataType::BinaryView
+        );
+        assert_eq!(
+            out.schema().field(0).metadata(),
+            annotated.field(0).metadata(),
+            "variant field-id and extension metadata must stay on the top-level field"
+        );
     }
 }

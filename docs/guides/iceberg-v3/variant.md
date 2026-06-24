@@ -6,11 +6,11 @@
 | --- | --- | --- |
 | Variant 列读 | ✅ | `src/exec/variant.rs` |
 | Variant 表达式函数（`variant_get` / `variant_extract` / `variant_typeof` / `get_json_string` 等） | ✅ | `src/exec/expr/function/variant/*` |
-| `INSERT INTO ... VALUES (parse_json(...))` 写 variant 列 | ✅ | PR #87；单 partition spec、无 shredding |
+| `INSERT INTO ... VALUES (parse_json(...))` 写 variant 列 | ✅ | PR #87；默认非 shredding；表属性配置后写 `typed_value` |
 | `INSERT INTO ... SELECT` 写 variant 列 | ✅ | PR #87 |
 | `INSERT OVERWRITE` / `DELETE` / `UPDATE` / `MERGE INTO` / `ADD EQUALITY DELETE` 在 variant-bearing 表 | ❌ | PR #87 fail-fast，给出可执行错误信息 |
 | Variant *shredding* 读（`typed_value` 子树） | ✅ | IV3-6 PR-1；`unshred_variant` 内核重建 |
-| Variant *shredding* 写 | ❌ | IV3-6 PR-6 计划内 |
+| Variant *shredding* 写 | ✅ | IV3-6 PR-6；显式表属性 `write.parquet.variant-shredding.<col>` |
 | Variant default value（`initial-default` / `write-default`） | ❌ | |
 | Variant 在 partition spec / sort order / equality_ids | ❌ | spec 禁止；NovaRocks reject |
 | Variant predicate pushdown 到 parquet | ❌ | |
@@ -67,7 +67,7 @@ SELECT id, get_json_string(v, '$.b') FROM t WHERE id = 1;  -- "x"
 写路径细节：
 
 - 文件落到 object storage 时是 spec-compliant parquet：variant group 标 `LogicalType::Variant`，下挂两个 required binary leaf（`metadata`、`value`）
-- 单 partition spec、无 shredding
+- 默认非 shredding；显式表属性配置后写出 `typed_value` 子树
 - 也支持 `INSERT INTO t SELECT ...` 形式（来源是另一张 variant-bearing 表）
 
 ## ❌ 其他 DML（fail-fast 拒绝）
@@ -88,14 +88,18 @@ ALTER TABLE t ADD EQUALITY DELETE ...;    -- ERROR: variant column not supported
 
 Spec 禁止；NovaRocks 在 CREATE TABLE / ALTER PARTITION 阶段 reject，错误信息明确说明。
 
-## 🟡 Variant shredding（typed_value）
+## ✅ Variant shredding（typed_value）
 
 Spec optional 能力：在 parquet 物理结构里把"已知 schema 部分"提到 `typed_value` 子树以加速点查 / pushdown。
 
 - **读：✅ 已支持。** 读端检测 `typed_value` 子树后经上游 `unshred_variant` 内核重建完整
   variant（`src/formats/parquet/variant_read.rs`），shredded 与非 shredded 文件给出逐行一致的
   查询结果。损坏行（非空行缺 metadata/value 字节）显式报错，不再静默置 null。
-- **写：❌ 未支持**（IV3-6 PR-6 计划内，显式表属性 `write.parquet.variant-shredding.<col>`）。
+- **写：✅ 已支持。** 仅读取 NovaRocks 命名空间属性
+  `write.parquet.variant-shredding.<col>`，不会读取 iceberg-java 的
+  `write.parquet.shred-variants`。属性值是逗号分隔的 `<path> <type>` 列表，例如
+  `a bigint, b.c string`。类型白名单：`boolean`、`bigint`、`double`、`string`、`date`。
+  未配置的 variant 列继续按非 shredded 的 `metadata` + `value` 两子列写出。
 
 ## ❌ Variant default value
 
@@ -109,4 +113,4 @@ Spec：variant 字段 path 提取（`payload:user.id > 1000`）应该可以下�
 
 ## 路线图
 
-按 [完成度清单](reference/support-matrix.md#43-v3-新类型) 的优先级，剩余 variant 工作（OVERWRITE / DELETE / UPDATE / MERGE 写、shredding 写、predicate pushdown、partition / sort 中使用）排在 P3（"v3 类型 tail"），优先级低于 catalog 生态、cross-engine 互通、MV 自动改写。
+按 [完成度清单](reference/support-matrix.md#43-v3-新类型) 的优先级，剩余 variant 工作（OVERWRITE / DELETE / UPDATE / MERGE 写、predicate pushdown、partition / sort 中使用）排在 P3（"v3 类型 tail"），优先级低于 catalog 生态、cross-engine 互通、MV 自动改写。

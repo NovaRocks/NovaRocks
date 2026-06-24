@@ -30,6 +30,7 @@ use crate::connector::iceberg::commit::{
     IcebergWriteMode, WrittenFile, classify_iceberg_write_mode,
 };
 use crate::connector::iceberg::data_writer::write_record_batches_as_data_files;
+use crate::connector::iceberg::variant_write::parse_variant_shredding_properties;
 use crate::engine::catalog::{ColumnDef, normalize_identifier};
 use crate::engine::parquet::parse_datetime_string_to_nanos;
 use crate::engine::sql_expr::literal_to_i128_for_integer;
@@ -557,6 +558,7 @@ pub(crate) fn create_table(
     entry.invalidate_table_cache(namespace_name, &table_name);
     let (format_version, mut all_properties) = extract_table_format_version_property(properties)?;
     let schema = build_iceberg_schema(columns, format_version)?;
+    validate_create_table_variant_shredding_properties(&all_properties, &schema)?;
     let partition_spec = crate::connector::iceberg::partition_spec::build_initial_partition_spec(
         &schema,
         partition_fields,
@@ -599,6 +601,18 @@ pub(crate) fn create_table(
     block_on_iceberg(async { catalog.create_table(&namespace, table_creation).await })
         .map_err(|e| format!("create iceberg table runtime failed: {e}"))?
         .map_err(|e| format!("create iceberg table failed: {e}"))?;
+    Ok(())
+}
+
+fn validate_create_table_variant_shredding_properties(
+    properties: &[(String, String)],
+    schema: &Schema,
+) -> Result<(), String> {
+    let property_map = properties
+        .iter()
+        .cloned()
+        .collect::<HashMap<String, String>>();
+    parse_variant_shredding_properties(&property_map, &Arc::new(schema.clone()))?;
     Ok(())
 }
 
@@ -3298,6 +3312,44 @@ mod table_property_tests {
             err.contains("unsupported iceberg format-version"),
             "error was: {err}"
         );
+    }
+
+    #[test]
+    fn create_table_variant_shredding_property_accepts_variant_column() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(2, "v", Type::Primitive(PrimitiveType::Variant)).into(),
+            ])
+            .build()
+            .expect("schema");
+        let props = vec![(
+            "write.parquet.variant-shredding.v".to_string(),
+            "a bigint, b.c string".to_string(),
+        )];
+
+        validate_create_table_variant_shredding_properties(&props, &schema)
+            .expect("valid property");
+    }
+
+    #[test]
+    fn create_table_variant_shredding_property_rejects_non_variant_column() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(2, "v", Type::Primitive(PrimitiveType::Variant)).into(),
+            ])
+            .build()
+            .expect("schema");
+        let props = vec![(
+            "write.parquet.variant-shredding.id".to_string(),
+            "a bigint".to_string(),
+        )];
+
+        let err = validate_create_table_variant_shredding_properties(&props, &schema)
+            .expect_err("id is not variant");
+        assert!(err.contains("variant-shredding.id"), "{err}");
+        assert!(err.contains("VARIANT"), "{err}");
     }
 
     #[test]

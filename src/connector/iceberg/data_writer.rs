@@ -23,7 +23,10 @@ use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use parquet::file::properties::WriterProperties;
 
 use super::theta_sketch::ThetaSketchHandle;
-use super::variant_write::{transform_variant_columns_for_write, variant_field_indices};
+use super::variant_write::{
+    VariantShreddingConfig, apply_variant_shredding_to_arrow_schema,
+    parse_variant_shredding_properties, transform_variant_columns_for_write, variant_field_indices,
+};
 use super::write_descriptor::encode_partition_descriptor;
 
 type IcebergDataFileWriterBuilder =
@@ -94,6 +97,8 @@ pub(crate) struct StagedWriteContext {
     file_io: iceberg::io::FileIO,
     writer_schema: SchemaRef,
     annotated_schema: arrow::datatypes::SchemaRef,
+    variant_input_schema: arrow::datatypes::SchemaRef,
+    variant_shredding: VariantShreddingConfig,
     /// Target table partition spec id reported in sink commit metadata. The
     /// staged writer may use synthetic metadata for schema/partition binding,
     /// but the coordinator must commit files under the real target spec id.
@@ -147,11 +152,17 @@ impl StagedWriteContext {
         partition_spec_id: i32,
     ) -> Result<Self, String> {
         let metadata = Arc::new(metadata);
+        let variant_shredding =
+            parse_variant_shredding_properties(metadata.properties(), &writer_schema)?;
+        let writer_arrow_schema =
+            apply_variant_shredding_to_arrow_schema(&annotated_schema, &variant_shredding)?;
         Ok(Self {
             metadata,
             file_io,
             writer_schema,
-            annotated_schema,
+            annotated_schema: writer_arrow_schema,
+            variant_input_schema: annotated_schema,
+            variant_shredding,
             partition_spec_id,
         })
     }
@@ -181,7 +192,8 @@ impl StagedWriteContext {
             DataFileFormat::Parquet,
         );
         let parquet_builder =
-            ParquetWriterBuilder::new(WriterProperties::default(), self.writer_schema.clone());
+            ParquetWriterBuilder::new(WriterProperties::default(), self.writer_schema.clone())
+                .with_arrow_schema_override(Arc::clone(&self.annotated_schema));
         let rolling_builder = RollingFileWriterBuilder::new_with_default_file_size(
             parquet_builder,
             self.file_io.clone(),
@@ -262,8 +274,9 @@ pub(crate) async fn write_record_batches(
             } else {
                 transform_variant_columns_for_write(
                     &batch,
-                    &ctx.annotated_schema,
+                    &ctx.variant_input_schema,
                     &variant_indices,
+                    &ctx.variant_shredding,
                 )?
             };
             let annotated = annotate_batch(&staged, &ctx.annotated_schema)?;
@@ -314,7 +327,12 @@ pub(crate) async fn write_record_batches(
         let staged = if variant_indices.is_empty() {
             batch
         } else {
-            transform_variant_columns_for_write(&batch, &ctx.annotated_schema, &variant_indices)?
+            transform_variant_columns_for_write(
+                &batch,
+                &ctx.variant_input_schema,
+                &variant_indices,
+                &ctx.variant_shredding,
+            )?
         };
         let annotated = annotate_batch(&staged, &ctx.annotated_schema)?;
         let partitioned = splitter
@@ -2828,6 +2846,115 @@ mod tests {
                 .contains("variant"),
             "v parent group must carry LogicalType::Variant; got {:?}",
             v_field.get_basic_info().logical_type_ref()
+        );
+    }
+
+    #[tokio::test]
+    async fn write_variant_column_with_shredding_property_outputs_typed_value() {
+        use arrow::array::{ArrayRef, BinaryArray, BinaryViewArray, Int32Array, LargeBinaryArray};
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use parquet::variant::json_to_variant;
+        use std::collections::HashMap;
+        use std::fs::File;
+        use std::sync::Arc;
+        use tempfile::tempdir;
+
+        fn binary_value(array: &ArrayRef, row: usize) -> Vec<u8> {
+            if let Some(arr) = array.as_any().downcast_ref::<BinaryArray>() {
+                return arr.value(row).to_vec();
+            }
+            if let Some(arr) = array.as_any().downcast_ref::<LargeBinaryArray>() {
+                return arr.value(row).to_vec();
+            }
+            if let Some(arr) = array.as_any().downcast_ref::<BinaryViewArray>() {
+                return arr.value(row).to_vec();
+            }
+            panic!("unexpected binary array type: {:?}", array.data_type());
+        }
+
+        fn engine_variant_payload_from_json(json: &str) -> Vec<u8> {
+            let json_array: ArrayRef = Arc::new(arrow::array::StringArray::from(vec![json]));
+            let variant = json_to_variant(&json_array).expect("json_to_variant");
+            let inner = variant.into_inner();
+            let metadata = binary_value(inner.column_by_name("metadata").unwrap(), 0);
+            let value = binary_value(inner.column_by_name("value").unwrap(), 0);
+            let total = (metadata.len() + value.len()) as u32;
+            let mut out = Vec::with_capacity(4 + metadata.len() + value.len());
+            out.extend_from_slice(&total.to_le_bytes());
+            out.extend_from_slice(&metadata);
+            out.extend_from_slice(&value);
+            out
+        }
+
+        let dir = tempdir().expect("tempdir");
+        let location = format!("file://{}", dir.path().display());
+
+        let iceberg_schema = Arc::new(
+            iceberg::spec::Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(2, "v", Type::Primitive(PrimitiveType::Variant)).into(),
+                ])
+                .build()
+                .expect("schema"),
+        );
+        let metadata = iceberg::spec::TableMetadataBuilder::new(
+            iceberg_schema.as_ref().clone(),
+            iceberg::spec::PartitionSpec::unpartition_spec(),
+            iceberg::spec::SortOrder::unsorted_order(),
+            location.clone(),
+            iceberg::spec::FormatVersion::V3,
+            HashMap::from([(
+                "write.parquet.variant-shredding.v".to_string(),
+                "a bigint".to_string(),
+            )]),
+        )
+        .expect("builder")
+        .build()
+        .expect("metadata")
+        .metadata;
+        let table = iceberg::table::Table::builder()
+            .identifier(iceberg::TableIdent::from_strs(["db", "t_shred"]).unwrap())
+            .file_io(iceberg::io::FileIO::new_with_fs())
+            .metadata(metadata)
+            .build()
+            .expect("table");
+
+        let payload = engine_variant_payload_from_json(r#"{"a": 42, "b": "x"}"#);
+        let input_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("v", DataType::LargeBinary, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            input_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(LargeBinaryArray::from_iter_values([payload.as_slice()])),
+            ],
+        )
+        .expect("batch");
+
+        let data_files = write_record_batches_as_data_files(&table, vec![batch])
+            .await
+            .expect("write");
+        assert_eq!(data_files.len(), 1);
+        let path = data_files[0].file_path().to_string();
+        let on_disk = path.strip_prefix("file://").unwrap_or(&path);
+
+        let f = File::open(on_disk).expect("open parquet");
+        let builder = ParquetRecordBatchReaderBuilder::try_new(f).expect("builder");
+        let paths = builder
+            .parquet_schema()
+            .columns()
+            .iter()
+            .map(|c| c.path().string())
+            .collect::<Vec<_>>();
+        assert!(
+            paths.iter().any(|p| p == "v.typed_value.a.typed_value"),
+            "expected shredded typed_value leaf, got paths: {paths:?}"
         );
     }
 

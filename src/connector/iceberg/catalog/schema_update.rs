@@ -2192,6 +2192,25 @@ mod tests {
         let computed = compute_remove_keys(&op, &existing);
         assert!(computed.is_empty());
     }
+
+    #[test]
+    fn validate_variant_shredding_property_set_rejects_non_variant_column() {
+        use crate::engine::statement::PropertiesOp;
+        use std::sync::Arc;
+
+        let schema = Arc::new(schema());
+        let op = PropertiesOp::Set {
+            entries: vec![(
+                "write.parquet.variant-shredding.id".to_string(),
+                "a bigint".to_string(),
+            )],
+        };
+
+        let err =
+            validate_variant_shredding_property_set(&op, &schema).expect_err("id is not variant");
+        assert!(err.contains("variant-shredding.id"), "{err}");
+        assert!(err.contains("VARIANT"), "{err}");
+    }
 }
 
 use std::collections::{HashMap, HashSet};
@@ -2207,6 +2226,9 @@ use crate::connector::iceberg::catalog::registry::{
     logical_type_property_value,
 };
 use crate::connector::iceberg::commit::retry::commit_with_retry;
+use crate::connector::iceberg::variant_write::{
+    VARIANT_SHREDDING_PROPERTY_PREFIX, parse_variant_shredding_properties,
+};
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::resolve_existing_table_target;
 use crate::engine::catalog::normalize_identifier;
@@ -3987,6 +4009,25 @@ fn compute_remove_keys(
     Vec::new()
 }
 
+fn validate_variant_shredding_property_set(
+    op: &PropertiesOp,
+    schema: &iceberg::spec::SchemaRef,
+) -> Result<(), String> {
+    let PropertiesOp::Set { entries } = op else {
+        return Ok(());
+    };
+    let props = entries
+        .iter()
+        .filter(|(key, _)| key.starts_with(VARIANT_SHREDDING_PROPERTY_PREFIX))
+        .cloned()
+        .collect::<HashMap<String, String>>();
+    if props.is_empty() {
+        return Ok(());
+    }
+    parse_variant_shredding_properties(&props, schema)?;
+    Ok(())
+}
+
 /// Execute SET TBLPROPERTIES or UNSET TBLPROPERTIES on an Iceberg table.
 ///
 /// Mirrors `alter_table_schema`: resolves the catalog entry, invalidates the
@@ -4074,6 +4115,11 @@ pub(crate) fn alter_table_properties(
 
                     // Strict UNSET: validate every requested key against the LATEST metadata.
                     let existing = loaded_inner.table.metadata().properties().clone();
+                    validate_variant_shredding_property_set(
+                        &op_inner,
+                        loaded_inner.table.metadata().current_schema(),
+                    )
+                    .map_err(|msg| iceberg::Error::new(iceberg::ErrorKind::DataInvalid, msg))?;
                     validate_unset_keys_present(&op_inner, &existing)
                         .map_err(|msg| iceberg::Error::new(iceberg::ErrorKind::DataInvalid, msg))?;
 

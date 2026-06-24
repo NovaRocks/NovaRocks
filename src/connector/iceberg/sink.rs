@@ -260,10 +260,13 @@ impl IcebergTableSinkFactory {
             .ok_or_else(|| "iceberg sink missing table location".to_string())?;
         let data_location = resolve_data_location(&sink)?;
         let object_store_s3 = resolve_sink_s3_config(&sink, &data_location)?;
-        let target_table_metadata = parse_position_delete_target_metadata(&iceberg_table, mode)?;
+        let target_table_metadata = parse_target_table_metadata(&iceberg_table, mode)?;
         let target_snapshot_id = iceberg_table.current_snapshot_id;
         let position_delete_data_file_partitions =
-            if let Some(metadata) = target_table_metadata.as_ref() {
+            if matches!(mode, IcebergSinkMode::PositionDeletes) {
+                let metadata = target_table_metadata.as_ref().ok_or_else(|| {
+                    "iceberg position-delete sink missing target table metadata".to_string()
+                })?;
                 build_position_delete_data_file_partition_index(
                     metadata,
                     target_snapshot_id,
@@ -353,7 +356,11 @@ impl IcebergSinkPlan {
             &self.partition_column_names,
             &self.transform_exprs,
         )?;
-        let mut properties = HashMap::new();
+        let mut properties = self
+            .target_table_metadata
+            .as_ref()
+            .map(|metadata| metadata.properties().clone())
+            .unwrap_or_default();
         properties.insert("write.data.path".to_string(), self.data_location.clone());
         iceberg::spec::TableMetadataBuilder::new(
             writer_schema.clone(),
@@ -380,22 +387,26 @@ impl IcebergSinkPlan {
     }
 }
 
-fn parse_position_delete_target_metadata(
+fn parse_target_table_metadata(
     iceberg: &descriptors::TIcebergTable,
     mode: IcebergSinkMode,
 ) -> Result<Option<iceberg::spec::TableMetadata>, String> {
-    if !matches!(
-        mode,
-        IcebergSinkMode::PositionDeletes | IcebergSinkMode::DeletionVectors
-    ) {
+    let serialized = match mode {
+        IcebergSinkMode::PositionDeletes | IcebergSinkMode::DeletionVectors => {
+            Some(iceberg.serialized_metadata.as_ref().ok_or_else(|| {
+                format!(
+                    "iceberg {:?} sink requires serialized target table metadata",
+                    mode
+                )
+            })?)
+        }
+        IcebergSinkMode::Data | IcebergSinkMode::EqualityDeletes => {
+            iceberg.serialized_metadata.as_ref()
+        }
+    };
+    let Some(serialized) = serialized else {
         return Ok(None);
-    }
-    let serialized = iceberg.serialized_metadata.as_ref().ok_or_else(|| {
-        format!(
-            "iceberg {:?} sink requires serialized target table metadata",
-            mode
-        )
-    })?;
+    };
     serde_json::from_str::<iceberg::spec::TableMetadata>(serialized)
         .map(Some)
         .map_err(|e| format!("parse iceberg {:?} target metadata failed: {e}", mode))
@@ -4030,6 +4041,86 @@ mod tests {
         assert!(
             data_file.partition_values_descriptor.is_some(),
             "writer report must carry a descriptor for non-zero target spec id"
+        );
+    }
+
+    #[test]
+    fn data_sink_staged_metadata_preserves_target_table_properties() {
+        let table_location = "file:///tmp/novarocks-iceberg-target-props".to_string();
+        let data_location = format!("{table_location}/custom-data");
+        let writer_schema = iceberg::spec::Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                iceberg::spec::NestedField::required(
+                    1,
+                    "id",
+                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
+                )
+                .into(),
+                iceberg::spec::NestedField::optional(
+                    2,
+                    "v",
+                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Variant),
+                )
+                .into(),
+            ])
+            .build()
+            .expect("schema");
+        let target_metadata = iceberg::spec::TableMetadataBuilder::new(
+            writer_schema.clone(),
+            iceberg::spec::PartitionSpec::unpartition_spec(),
+            iceberg::spec::SortOrder::unsorted_order(),
+            table_location.clone(),
+            iceberg::spec::FormatVersion::V3,
+            HashMap::from([(
+                "write.parquet.variant-shredding.v".to_string(),
+                "a bigint".to_string(),
+            )]),
+        )
+        .expect("metadata builder")
+        .build()
+        .expect("metadata")
+        .metadata;
+        let arrow_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let plan = IcebergSinkPlan {
+            mode: IcebergSinkMode::Data,
+            table_location,
+            data_location: data_location.clone(),
+            target_partition_spec_id: 0,
+            target_table_metadata: Some(target_metadata),
+            target_snapshot_id: None,
+            position_delete_data_file_partitions: HashMap::new(),
+            object_store_s3: None,
+            file_format: "parquet".to_string(),
+            compression: crate::types::TCompressionType::SNAPPY,
+            output_schema: Arc::clone(&arrow_schema),
+            target_schema: arrow_schema,
+            equality_delete_columns: Vec::new(),
+            row_lineage_data: false,
+            output_exprs: Vec::new(),
+            partition_exprs: Vec::new(),
+            partition_source_column_names: Vec::new(),
+            partition_column_names: Vec::new(),
+            transform_exprs: Vec::new(),
+        };
+
+        let staged_metadata = plan
+            .build_target_table_metadata(&writer_schema)
+            .expect("staged metadata");
+
+        assert_eq!(
+            staged_metadata
+                .properties()
+                .get("write.parquet.variant-shredding.v")
+                .map(String::as_str),
+            Some("a bigint")
+        );
+        assert_eq!(
+            staged_metadata
+                .properties()
+                .get("write.data.path")
+                .map(String::as_str),
+            Some(data_location.as_str())
         );
     }
 
