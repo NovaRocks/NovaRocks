@@ -418,6 +418,49 @@ impl HashJoinProbeCore {
         }
     }
 
+    pub(crate) fn finish(
+        &mut self,
+        probe_chunks: Vec<Chunk>,
+        merged_build_flags: Option<Vec<bool>>,
+    ) -> Result<Option<Chunk>, String> {
+        let out = self.join_probe_chunks(probe_chunks)?;
+        self.finish_from_probe_output(out, merged_build_flags, true)
+    }
+
+    pub(crate) fn finish_from_probe_output(
+        &mut self,
+        mut out: Option<Chunk>,
+        merged_build_flags: Option<Vec<bool>>,
+        count_build_rows: bool,
+    ) -> Result<Option<Chunk>, String> {
+        match self.join_type {
+            JoinType::RightAnti if self.probe_is_left => {
+                let flags = merged_build_flags
+                    .or_else(|| self.take_build_matched())
+                    .unwrap_or_default();
+                let build_out = self.build_right_semi_anti_output_with_flags(&flags, false)?;
+                out = self.right_semi_anti_output_chunk(build_out)?;
+            }
+            JoinType::RightSemi if self.probe_is_left => {
+                let flags = merged_build_flags
+                    .or_else(|| self.take_build_matched())
+                    .unwrap_or_default();
+                let build_out = self.build_right_semi_anti_output_with_flags(&flags, true)?;
+                out = self.right_semi_anti_output_chunk(build_out)?;
+            }
+            JoinType::FullOuter | JoinType::RightOuter => {
+                let flags = merged_build_flags
+                    .or_else(|| self.take_build_matched())
+                    .unwrap_or_default();
+                let schema = Arc::clone(self.join_scope_chunk_schema());
+                let build_unmatched = self.build_unmatched_build_output_from_flags(&flags)?;
+                out = self.merge_join_outputs(out, build_unmatched, &schema, count_build_rows)?;
+            }
+            _ => {}
+        }
+        Ok(out)
+    }
+
     fn compact_selection_by_residual(
         &mut self,
         probe: &Chunk,
@@ -659,23 +702,6 @@ impl HashJoinProbeCore {
             )?;
         }
         Ok(())
-    }
-
-    pub(crate) fn build_full_outer_unmatched_build(
-        &mut self,
-    ) -> Result<Option<RecordBatch>, String> {
-        let flags = match self.build_matched.as_ref() {
-            Some(f) => f.clone().into_vec(),
-            None => return Ok(None),
-        };
-        self.build_unmatched_build_output_from_flags(&flags)
-    }
-
-    pub(crate) fn build_full_outer_unmatched_build_with_flags(
-        &mut self,
-        flags: &[bool],
-    ) -> Result<Option<RecordBatch>, String> {
-        self.build_unmatched_build_output_from_flags(flags)
     }
 
     fn build_unmatched_build_output_from_flags(

@@ -331,25 +331,7 @@ impl PartitionedJoinProbeProcessorOperator {
             self.load_build_side()?;
         }
         let probe_chunks = self.collect_probe_chunks(None, true);
-        let mut out = self.core.join_probe_chunks(probe_chunks)?;
-        match self.core.join_type() {
-            JoinType::RightAnti if self.core.probe_is_left() => {
-                let build_out = self.core.build_right_semi_anti_output(false)?;
-                out = self.core.right_semi_anti_output_chunk(build_out)?;
-            }
-            JoinType::RightSemi if self.core.probe_is_left() => {
-                let build_out = self.core.build_right_semi_anti_output(true)?;
-                out = self.core.right_semi_anti_output_chunk(build_out)?;
-            }
-            JoinType::FullOuter | JoinType::RightOuter => {
-                let schema = Arc::clone(self.core.join_scope_chunk_schema());
-                let build_unmatched = self.core.build_full_outer_unmatched_build()?;
-                out = self
-                    .core
-                    .merge_join_outputs(out, build_unmatched, &schema, true)?;
-            }
-            _ => {}
-        }
+        let out = self.core.finish(probe_chunks, None)?;
         self.log_stats();
         Ok(out)
     }

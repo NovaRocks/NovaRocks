@@ -284,51 +284,29 @@ impl BroadcastJoinProbeProcessorOperator {
             self.load_build_side()?;
         }
         let probe_chunks = self.collect_probe_chunks(None);
-        let mut out = self.core.join_probe_chunks(probe_chunks)?;
-
-        match self.core.join_type() {
-            JoinType::RightAnti if self.core.probe_is_left() => {
-                // Merge this driver's local build-matched flags into the
-                // shared accumulator.  Only the last driver to merge
-                // receives the merged flags and produces the output.
-                let local_flags = self.core.take_build_matched().unwrap_or_default();
-                if let Some(merged) = self.state.merge_build_matched(local_flags)? {
-                    let build_out = self
-                        .core
-                        .build_right_semi_anti_output_with_flags(&merged, false)?;
-                    out = self.core.right_semi_anti_output_chunk(build_out)?;
-                } else {
-                    // Not the last driver — no build-side output from this driver.
-                    out = None;
+        let join_type = self.core.join_type();
+        let emits_build_side_output =
+            matches!(join_type, JoinType::FullOuter | JoinType::RightOuter)
+                || (self.core.probe_is_left()
+                    && matches!(join_type, JoinType::RightAnti | JoinType::RightSemi));
+        let out = if emits_build_side_output {
+            let probe_out = self.core.join_probe_chunks(probe_chunks)?;
+            let local_flags = self.core.take_build_matched().unwrap_or_default();
+            match self.state.merge_build_matched(local_flags)? {
+                Some(merged) => {
+                    self.core
+                        .finish_from_probe_output(probe_out, Some(merged), false)?
                 }
-            }
-            JoinType::RightSemi if self.core.probe_is_left() => {
-                let local_flags = self.core.take_build_matched().unwrap_or_default();
-                if let Some(merged) = self.state.merge_build_matched(local_flags)? {
-                    let build_out = self
-                        .core
-                        .build_right_semi_anti_output_with_flags(&merged, true)?;
-                    out = self.core.right_semi_anti_output_chunk(build_out)?;
-                } else {
-                    out = None;
+                None if self.core.probe_is_left()
+                    && matches!(join_type, JoinType::RightAnti | JoinType::RightSemi) =>
+                {
+                    None
                 }
+                None => probe_out,
             }
-            JoinType::FullOuter | JoinType::RightOuter => {
-                let local_flags = self.core.take_build_matched().unwrap_or_default();
-                if let Some(merged) = self.state.merge_build_matched(local_flags)? {
-                    let schema = Arc::clone(self.core.join_scope_chunk_schema());
-                    let build_unmatched = self
-                        .core
-                        .build_full_outer_unmatched_build_with_flags(&merged)?;
-                    out = self
-                        .core
-                        .merge_join_outputs(out, build_unmatched, &schema, false)?;
-                }
-                // Non-last drivers keep their own probe output (if any)
-                // but do not emit unmatched build rows.
-            }
-            _ => {}
-        }
+        } else {
+            self.core.finish(probe_chunks, None)?
+        };
 
         self.log_stats();
         Ok(out)
