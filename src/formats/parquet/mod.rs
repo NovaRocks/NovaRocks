@@ -134,16 +134,26 @@ fn runtime_filters_to_min_max_predicates(
     if snapshot.is_empty() {
         return Ok(Vec::new());
     }
-    if cfg.chunk_schema.slot_ids().is_empty()
-        || cfg.columns.is_empty()
-        || cfg.chunk_schema.slot_ids().len() != cfg.columns.len()
-    {
+    if cfg.chunk_schema.slot_ids().is_empty() || cfg.columns.is_empty() {
         return Ok(Vec::new());
     }
 
+    let variant_output_slots = cfg
+        .variant_path_columns
+        .iter()
+        .map(|spec| spec.output_slot_id)
+        .collect::<HashSet<_>>();
     let mut slot_to_index = HashMap::new();
-    for (idx, slot_id) in cfg.chunk_schema.slot_ids().iter().enumerate() {
-        slot_to_index.insert(*slot_id, idx.to_string());
+    for slot in cfg.chunk_schema.slots() {
+        let slot_id = slot.slot_id();
+        if variant_output_slots.contains(&slot_id) {
+            continue;
+        }
+        let Some(idx) = find_column_index_by_name(&cfg.columns, slot.name(), cfg.case_sensitive)
+        else {
+            continue;
+        };
+        slot_to_index.insert(slot_id, idx.to_string());
     }
 
     let mut preds = Vec::new();
@@ -2124,7 +2134,9 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
-    use arrow::array::{Array, Float64Array, Int32Array, StringArray, StructArray};
+    use arrow::array::{
+        Array, ArrayRef, Float64Array, Int32Array, Int64Array, StringArray, StructArray,
+    };
     use arrow::datatypes::{DataType, Field, Schema};
     use parquet::arrow::{
         ArrowWriter, PARQUET_FIELD_ID_META_KEY, arrow_reader::ParquetRecordBatchReaderBuilder,
@@ -2141,10 +2153,11 @@ mod tests {
     use crate::types;
 
     use super::{
-        ParquetReadCachePolicy, ParquetScanConfig, build_active_projection_columns,
-        build_delayed_output_sources, build_delayed_projection_plan, build_parquet_iter,
-        collect_parquet_coalesce_io_ranges, evaluate_batch_predicate_mask,
-        reader::ParquetCachedReader,
+        MinMaxPredicate, MinMaxPredicateValue, ParquetReadCachePolicy, ParquetScanConfig,
+        VariantPathSpec, build_active_projection_columns, build_delayed_output_sources,
+        build_delayed_projection_plan, build_parquet_iter, collect_parquet_coalesce_io_ranges,
+        evaluate_batch_predicate_mask, reader::ParquetCachedReader,
+        runtime_filters_to_min_max_predicates,
     };
 
     fn field_id_meta(field_id: i32) -> HashMap<String, String> {
@@ -2200,6 +2213,99 @@ mod tests {
             variant_path_columns: Vec::new(),
             query_global_dicts: Default::default(),
         }
+    }
+
+    #[test]
+    fn runtime_filters_skip_variant_synthetic_slots_but_keep_physical_slots() {
+        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            &Schema::new(vec![
+                Field::new("id", DataType::Int32, true),
+                Field::new("__nr_var_payload_a", DataType::Int64, true),
+                Field::new("payload", DataType::LargeBinary, true),
+            ]),
+            &[SlotId::new(1), SlotId::new(2), SlotId::new(3)],
+        )
+        .expect("chunk schema");
+        let cfg = ParquetScanConfig {
+            columns: vec!["id".to_string(), "payload".to_string()],
+            chunk_schema,
+            slot_types: vec![
+                types::TPrimitiveType::INT,
+                types::TPrimitiveType::BIGINT,
+                types::TPrimitiveType::VARIANT,
+            ],
+            case_sensitive: true,
+            enable_page_index: false,
+            min_max_predicates: Vec::new(),
+            batch_size: Some(1024),
+            datacache: test_datacache_context(),
+            cache_policy: ParquetReadCachePolicy::with_flags(false, false, None),
+            profile_label: None,
+            iceberg_output_schema: None,
+            variant_path_columns: vec![VariantPathSpec {
+                source_slot_id: SlotId::new(3),
+                source_read_slot_id: SlotId::new(3),
+                output_slot_id: SlotId::new(2),
+                source_name: "payload".to_string(),
+                output_name: "__nr_var_payload_a".to_string(),
+                source_field: Field::new("payload", DataType::LargeBinary, true),
+                output_field: Field::new("__nr_var_payload_a", DataType::Int64, true),
+                canonical_path: "$.a".to_string(),
+                requested_type: DataType::Int64,
+                strict: true,
+            }],
+            query_global_dicts: Default::default(),
+        };
+
+        let specs = [
+            crate::exec::node::join::JoinRuntimeFilterSpec {
+                filter_id: 1,
+                expr_order: 0,
+                probe_slot_id: SlotId::new(1),
+                build_data_type: DataType::Int32,
+                merge_nodes: Vec::new(),
+                has_remote_targets: false,
+            },
+            crate::exec::node::join::JoinRuntimeFilterSpec {
+                filter_id: 2,
+                expr_order: 1,
+                probe_slot_id: SlotId::new(2),
+                build_data_type: DataType::Int64,
+                merge_nodes: Vec::new(),
+                has_remote_targets: false,
+            },
+        ];
+        let key_arrays: Vec<ArrayRef> = vec![
+            Arc::new(Int32Array::from(vec![10, 20])),
+            Arc::new(Int64Array::from(vec![100, 200])),
+        ];
+        let mut local_filters =
+            crate::exec::runtime_filter::LocalRuntimeInFilterSet::new(&specs, &key_arrays)
+                .expect("local runtime filters");
+        local_filters
+            .add_build_arrays(&key_arrays)
+            .expect("runtime filter values");
+        let runtime_filters = crate::exec::node::scan::RuntimeFilterContext::new(
+            local_filters.into_filters(),
+            Vec::new(),
+        );
+
+        let predicates =
+            runtime_filters_to_min_max_predicates(&cfg, &runtime_filters).expect("predicates");
+
+        assert_eq!(
+            predicates,
+            vec![
+                MinMaxPredicate::Ge {
+                    column: "0".to_string(),
+                    value: MinMaxPredicateValue::Int32(10),
+                },
+                MinMaxPredicate::Le {
+                    column: "0".to_string(),
+                    value: MinMaxPredicateValue::Int32(20),
+                },
+            ]
+        );
     }
 
     #[test]
