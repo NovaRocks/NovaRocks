@@ -262,20 +262,22 @@ impl IcebergTableSinkFactory {
         let object_store_s3 = resolve_sink_s3_config(&sink, &data_location)?;
         let target_table_metadata = parse_target_table_metadata(&iceberg_table, mode)?;
         let target_snapshot_id = iceberg_table.current_snapshot_id;
-        let position_delete_data_file_partitions =
-            if matches!(mode, IcebergSinkMode::PositionDeletes) {
-                let metadata = target_table_metadata.as_ref().ok_or_else(|| {
-                    "iceberg position-delete sink missing target table metadata".to_string()
-                })?;
-                build_position_delete_data_file_partition_index(
-                    metadata,
-                    target_snapshot_id,
-                    &table_location,
-                    object_store_s3.as_ref(),
-                )?
-            } else {
-                HashMap::new()
-            };
+        let position_delete_data_file_partitions = if matches!(
+            mode,
+            IcebergSinkMode::PositionDeletes | IcebergSinkMode::DeletionVectors
+        ) {
+            let metadata = target_table_metadata
+                .as_ref()
+                .ok_or_else(|| "iceberg delete sink missing target table metadata".to_string())?;
+            build_position_delete_data_file_partition_index(
+                metadata,
+                target_snapshot_id,
+                &table_location,
+                object_store_s3.as_ref(),
+            )?
+        } else {
+            HashMap::new()
+        };
         let file_format = sink
             .file_format
             .clone()
@@ -3905,6 +3907,18 @@ mod tests {
         assert!(
             !dv_reader.contains("metadata.current_snapshot_id()"),
             "DV reader must not use metadata current snapshot id directly"
+        );
+
+        let partition_index_call_site = source
+            .split("let position_delete_data_file_partitions")
+            .nth(1)
+            .expect("partition index call site")
+            .split("let file_format")
+            .next()
+            .expect("partition index call site body");
+        assert!(
+            partition_index_call_site.contains("IcebergSinkMode::DeletionVectors"),
+            "DV sink factory must build referenced data file partition metadata"
         );
     }
 

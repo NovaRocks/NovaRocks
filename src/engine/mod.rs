@@ -5816,7 +5816,23 @@ enable_path_style_access = true
                 &mut scalar_arena,
             )
             .expect("logical to opt expr");
-        let providers = super::query_stats::QueryStatsProviders::from_connectors(&registry);
+        let stats_state = Arc::new(super::StandaloneState::default());
+        super::statistics::replace_catalog_stats_for_test(
+            &stats_state,
+            "default",
+            "tbl",
+            &[("id", 100_000, "1", "100000", "100000")],
+        )
+        .expect("install tbl stats");
+        super::statistics::replace_catalog_stats_for_test(
+            &stats_state,
+            "default",
+            "date_dim",
+            &[("id", 100, "1", "100", "100")],
+        )
+        .expect("install date_dim stats");
+        let providers =
+            super::query_stats::QueryStatsProviders::from_standalone_state(&stats_state);
         let query_stats =
             super::query_stats::QueryStatsCollector::new(providers).collect(&mut opt_expr);
         let physical = crate::sql::optimizer::optimize(
