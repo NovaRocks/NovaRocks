@@ -361,7 +361,7 @@ impl PartitionedJoinProbeProcessorOperator {
 
     fn log_stats(&self) {
         debug!(
-            "PartitionedJoinProbe finished: dep_key={} driver_id={} partition={} node_id={} join_type={} input_rows={} input_chunks={} buffered_rows={} output_rows={} build_partition_rows={} build_partition_has_null_key={} build_batches={} build_table={} probe_keys={} residual_predicate={} lookup_hit_rows={} lookup_miss_rows={} residual_rows_checked={} residual_eval_batches={} residual_eval_pairs={} residual_matched_rows={} residual_group_rows_total={}",
+            "PartitionedJoinProbe finished: dep_key={} driver_id={} partition={} node_id={} join_type={} input_rows={} input_chunks={} buffered_rows={} output_rows={} build_partition_rows={} build_partition_has_null_key={} build_store_rows={} build_table={} probe_keys={} residual_predicate={} lookup_hit_rows={} lookup_miss_rows={} residual_rows_checked={} residual_eval_batches={} residual_eval_pairs={} residual_matched_rows={} residual_group_rows_total={}",
             self.dep.name(),
             self.driver_id,
             self.partition,
@@ -373,7 +373,7 @@ impl PartitionedJoinProbeProcessorOperator {
             self.core.output_rows(),
             self.core.build_partition_row_count(),
             self.core.build_partition_has_null_key(),
-            self.core.build_batches_len(),
+            self.core.build_store_rows(),
             self.core.build_table_present(),
             self.core.probe_keys_len(),
             self.core.has_residual_predicate(),

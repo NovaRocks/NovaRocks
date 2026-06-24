@@ -31,8 +31,8 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use arrow::array::{Array, BooleanArray, UInt32Array};
-use arrow::compute::{concat_batches, filter_record_batch, take_record_batch};
+use arrow::array::{Array, BooleanArray};
+use arrow::compute::{concat_batches, filter_record_batch};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 
@@ -40,10 +40,7 @@ use super::build_artifact::JoinBuildArtifact;
 use super::join_hash_map::match_flags::BuildMatchFlags;
 use super::join_hash_map::method::JoinHashMap;
 use super::join_hash_map::search::{JoinSelection, SearchStats, append_cross_selection};
-use super::join_hash_table::JoinHashTable;
-use super::join_probe_utils::{
-    build_join_batch, concat_schemas, cross_join_chunk, lookup_group_ids,
-};
+use super::join_probe_utils::cross_join_batches;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::join::JoinType;
@@ -77,8 +74,7 @@ pub(crate) struct HashJoinProbeCore {
     join_scope_schema: SchemaRef,
     build_loaded: bool,
     build_chunk: Option<Arc<Chunk>>,
-    build_batches: Arc<Vec<Chunk>>,
-    build_null_key_rows: Option<Arc<Vec<Vec<u32>>>>,
+    build_null_key_rows: Option<Arc<Vec<u32>>>,
     build_table: Option<Arc<JoinHashMap>>,
     runtime_filters: Option<Arc<LocalRuntimeFilterSet>>,
     output_schema: Option<SchemaRef>,
@@ -123,7 +119,6 @@ impl HashJoinProbeCore {
             join_scope_chunk_schema,
             build_loaded: false,
             build_chunk: None,
-            build_batches: Arc::new(Vec::new()),
             build_null_key_rows: None,
             build_table: None,
             runtime_filters: None,
@@ -212,7 +207,6 @@ impl HashJoinProbeCore {
             return Ok(());
         }
         self.build_chunk = artifact.build_store.as_ref().map(|store| store.chunk());
-        self.build_batches = Arc::clone(&artifact.build_batches);
         self.build_null_key_rows = artifact.build_null_key_rows.clone();
         self.build_table = artifact.build_table.clone();
         self.runtime_filters = artifact.runtime_filters.clone();
@@ -238,8 +232,11 @@ impl HashJoinProbeCore {
         self.residual_predicate.is_some()
     }
 
-    pub(crate) fn build_batches_len(&self) -> usize {
-        self.build_batches.len()
+    pub(crate) fn build_store_rows(&self) -> usize {
+        self.build_chunk
+            .as_ref()
+            .map(|chunk| chunk.len())
+            .unwrap_or(0)
     }
 
     pub(crate) fn build_table_present(&self) -> bool {
@@ -538,46 +535,6 @@ impl HashJoinProbeCore {
         Ok(())
     }
 
-    fn flat_build_rows_from_batches(
-        build_batches: &[Chunk],
-        build_rows_by_batch: &[Vec<u32>],
-    ) -> Result<Vec<u32>, String> {
-        if build_batches.len() != build_rows_by_batch.len() {
-            return Err(format!(
-                "join residual build rows size mismatch: batches={} row_sets={}",
-                build_batches.len(),
-                build_rows_by_batch.len()
-            ));
-        }
-
-        let mut rows = Vec::new();
-        let mut batch_offset = 0usize;
-        for (batch, batch_rows) in build_batches.iter().zip(build_rows_by_batch.iter()) {
-            rows.reserve(batch_rows.len());
-            for &batch_row in batch_rows {
-                let batch_row = batch_row as usize;
-                if batch_row >= batch.len() {
-                    return Err(format!(
-                        "join residual build row out of bounds: row={} batch_rows={}",
-                        batch_row,
-                        batch.len()
-                    ));
-                }
-                let flat_row = batch_offset
-                    .checked_add(batch_row)
-                    .ok_or_else(|| "join residual build row overflow".to_string())?;
-                rows.push(
-                    u32::try_from(flat_row)
-                        .map_err(|_| "join residual build row id overflow".to_string())?,
-                );
-            }
-            batch_offset = batch_offset
-                .checked_add(batch.len())
-                .ok_or_else(|| "join residual build row count overflow".to_string())?;
-        }
-        Ok(rows)
-    }
-
     fn mark_probe_matches_from_selection(
         matched: &mut [bool],
         selection: &JoinSelection,
@@ -743,47 +700,6 @@ impl HashJoinProbeCore {
         Ok(out)
     }
 
-    #[allow(dead_code)] // used by planned right-semi join output
-    fn build_right_semi_output_from_indices(
-        &self,
-        indices_by_batch: &[Vec<u32>],
-    ) -> Result<Option<RecordBatch>, String> {
-        if self.build_batches.is_empty() || indices_by_batch.is_empty() {
-            return Ok(None);
-        }
-
-        let output_schema = self
-            .build_batches
-            .first()
-            .map(|b| b.schema())
-            .ok_or_else(|| "join build schema missing".to_string())?;
-
-        let mut batches = Vec::new();
-        for (batch_idx, build_batch) in self.build_batches.iter().enumerate() {
-            let Some(indices) = indices_by_batch.get(batch_idx) else {
-                continue;
-            };
-            if indices.is_empty() {
-                continue;
-            }
-            let idx_arr = UInt32Array::from(indices.clone());
-            let taken =
-                take_record_batch(&build_batch.batch, &idx_arr).map_err(|e| e.to_string())?;
-            if taken.num_rows() > 0 {
-                batches.push(taken);
-            }
-        }
-
-        if batches.is_empty() {
-            return Ok(None);
-        }
-        if batches.len() == 1 {
-            return Ok(Some(batches.remove(0)));
-        }
-        let batch = concat_compatible_batches(&output_schema, &batches, "right semi join concat")?;
-        Ok(Some(batch))
-    }
-
     /// Take ownership of the local build-matched flags.  Used by broadcast
     /// join to merge per-driver flags into a shared accumulator.
     pub(crate) fn take_build_matched(&mut self) -> Option<Vec<bool>> {
@@ -804,7 +720,12 @@ impl HashJoinProbeCore {
         &mut self,
         want_matched: bool,
     ) -> Result<Option<RecordBatch>, String> {
-        if self.build_batches.is_empty() {
+        if self
+            .build_chunk
+            .as_ref()
+            .map(|chunk| chunk.is_empty())
+            .unwrap_or(true)
+        {
             return Ok(None);
         }
         let Some(flags) = self.build_matched.as_ref() else {
@@ -886,7 +807,13 @@ impl HashJoinProbeCore {
     }
 
     fn join_inner(&mut self, probe_chunks: Vec<Chunk>) -> Result<Option<Chunk>, String> {
-        if self.probe_keys.is_empty() && self.build_batches.is_empty() {
+        let build_chunk_opt = self.build_chunk.clone();
+        if self.probe_keys.is_empty()
+            && build_chunk_opt
+                .as_ref()
+                .map(|chunk| chunk.is_empty())
+                .unwrap_or(true)
+        {
             return Ok(None);
         }
         let output_schema = Arc::clone(
@@ -897,15 +824,14 @@ impl HashJoinProbeCore {
         let mut output_batches = Vec::new();
         let mut residual_applied_during_selection = false;
         if self.probe_keys.is_empty() {
+            let Some(right) = build_chunk_opt.as_ref() else {
+                return Ok(None);
+            };
             for left in probe_chunks {
-                for right in self.build_batches.iter() {
-                    let output_start = std::time::Instant::now();
-                    let batch = cross_join_chunk(&left, right, &output_schema)?;
-                    self.record_output_ns(output_start);
-                    if let Some(batch) = batch {
-                        output_batches.push(batch);
-                    }
-                }
+                let output_start = std::time::Instant::now();
+                let batches = cross_join_batches(&left, right, &output_schema)?;
+                self.record_output_ns(output_start);
+                output_batches.extend(batches);
             }
         } else {
             let Some(table) = self.build_table.clone() else {
@@ -930,12 +856,6 @@ impl HashJoinProbeCore {
                 if selection.is_empty() {
                     continue;
                 }
-                let build_batch_lengths = self
-                    .build_batches
-                    .iter()
-                    .map(|batch| batch.len())
-                    .collect::<Vec<_>>();
-                selection.reorder_by_build_batch_lengths(&build_batch_lengths)?;
                 if let Some(pred) = self.residual_predicate {
                     self.residual_rows_checked = self
                         .residual_rows_checked
@@ -1064,12 +984,6 @@ impl HashJoinProbeCore {
             self.lookup_miss_rows = self.lookup_miss_rows.saturating_add(stats.lookup_miss_rows);
             let mut probe_matched = vec![false; probe.len()];
             if !selection.is_empty() {
-                let build_batch_lengths = self
-                    .build_batches
-                    .iter()
-                    .map(|batch| batch.len())
-                    .collect::<Vec<_>>();
-                selection.reorder_by_build_batch_lengths(&build_batch_lengths)?;
                 if let Some(pred) = self.residual_predicate {
                     self.residual_rows_checked = self
                         .residual_rows_checked
@@ -1201,7 +1115,13 @@ impl HashJoinProbeCore {
             }
             return Ok(None);
         };
-        if table.is_empty() || self.build_batches.is_empty() {
+        if table.is_empty()
+            || self
+                .build_chunk
+                .as_ref()
+                .map(|chunk| chunk.is_empty())
+                .unwrap_or(true)
+        {
             if is_anti {
                 let batches: Vec<_> = probe_chunks.into_iter().map(|c| c.batch).collect();
                 if batches.is_empty() {
@@ -1223,8 +1143,11 @@ impl HashJoinProbeCore {
             return Ok(None);
         }
 
-        if matches!(self.join_type, JoinType::LeftSemi | JoinType::LeftAnti) {
-            let is_semi = matches!(self.join_type, JoinType::LeftSemi);
+        if matches!(
+            self.join_type,
+            JoinType::LeftSemi | JoinType::LeftAnti | JoinType::RightSemi | JoinType::RightAnti
+        ) {
+            let is_semi = matches!(self.join_type, JoinType::LeftSemi | JoinType::RightSemi);
             let mut output_batches = Vec::new();
             for probe in probe_chunks {
                 let search_start = std::time::Instant::now();
@@ -1307,105 +1230,7 @@ impl HashJoinProbeCore {
             };
             return Ok(Some(self.extend_with_null_build_columns(probe_batch)?));
         }
-
-        let build_schema = self
-            .build_batches
-            .first()
-            .map(|b| b.schema())
-            .ok_or_else(|| "join build schema missing".to_string())?;
-        let join_scope_schema = if matches!(self.join_type, JoinType::LeftSemi | JoinType::LeftAnti)
-        {
-            concat_schemas(output_schema.clone(), build_schema)
-        } else {
-            concat_schemas(build_schema, output_schema.clone())
-        };
-
-        let pred = self.residual_predicate;
-        let mut output_batches = Vec::new();
-        for probe in probe_chunks {
-            let search_start = std::time::Instant::now();
-            let group_ids = lookup_group_ids(&self.arena, &self.probe_keys, &probe, &table)?;
-            self.record_search_ns(search_start);
-            if group_ids.is_empty() {
-                continue;
-            }
-
-            for group_id_opt in group_ids.iter() {
-                if group_id_opt.is_some() {
-                    self.lookup_hit_rows = self.lookup_hit_rows.saturating_add(1);
-                } else {
-                    self.lookup_miss_rows = self.lookup_miss_rows.saturating_add(1);
-                }
-            }
-
-            let keep = if let Some(pred) = pred {
-                let (matched, rows_checked, eval_batches, eval_pairs, group_rows_total) =
-                    Self::probe_chunk_matches_residual(
-                        &self.arena,
-                        self.join_type,
-                        self.build_batches.as_ref(),
-                        &table,
-                        &probe,
-                        &group_ids,
-                        &join_scope_schema,
-                        &self.join_scope_chunk_schema,
-                        pred,
-                        self.output_timer.as_ref(),
-                    )?;
-                self.residual_rows_checked =
-                    self.residual_rows_checked.saturating_add(rows_checked);
-                self.residual_eval_batches =
-                    self.residual_eval_batches.saturating_add(eval_batches);
-                self.residual_eval_pairs = self.residual_eval_pairs.saturating_add(eval_pairs);
-                self.residual_group_rows_total = self
-                    .residual_group_rows_total
-                    .saturating_add(group_rows_total);
-                self.residual_matched_rows = self
-                    .residual_matched_rows
-                    .saturating_add(matched.iter().filter(|v| **v).count() as u64);
-
-                matched
-                    .into_iter()
-                    .map(|matched| if is_semi { matched } else { !matched })
-                    .collect::<Vec<bool>>()
-            } else {
-                group_ids
-                    .iter()
-                    .map(|group_id_opt| {
-                        let matched = group_id_opt.is_some();
-                        if is_semi { matched } else { !matched }
-                    })
-                    .collect::<Vec<bool>>()
-            };
-
-            let output_start = std::time::Instant::now();
-            let mask = BooleanArray::from(keep);
-            let filtered_batch = filter_record_batch(&probe.batch, &mask)
-                .map_err(|e| format!("semi/anti filter failed: {e}"))?;
-            self.record_output_ns(output_start);
-            if filtered_batch.num_rows() > 0 {
-                output_batches.push(filtered_batch);
-            }
-        }
-
-        if output_batches.is_empty() {
-            return Ok(None);
-        }
-        let output_rows: usize = output_batches.iter().map(|b| b.num_rows()).sum();
-        self.output_rows = self.output_rows.saturating_add(output_rows as u64);
-        let probe_batch = if output_batches.len() == 1 {
-            output_batches.remove(0)
-        } else {
-            let output_start = std::time::Instant::now();
-            let batch = concat_compatible_batches(
-                &output_schema,
-                &output_batches,
-                "semi anti join concat",
-            )?;
-            self.record_output_ns(output_start);
-            batch
-        };
-        Ok(Some(self.extend_with_null_build_columns(probe_batch)?))
+        Ok(None)
     }
 
     fn join_null_aware_left_anti(
@@ -1451,36 +1276,14 @@ impl HashJoinProbeCore {
         }
 
         let build_null_key_rows = self.build_null_key_rows.clone();
-        let build_null_rows_by_batch: &[Vec<u32>] = build_null_key_rows
+        let flat_build_null_key_rows: &[u32] = build_null_key_rows
             .as_ref()
             .map(|rows| rows.as_slice())
             .unwrap_or(&[]);
-        if !build_null_rows_by_batch.is_empty()
-            && build_null_rows_by_batch.len() != self.build_batches.len()
-        {
-            return Err(format!(
-                "null-aware anti join build null-key rows size mismatch: batches={} null_key_batches={}",
-                self.build_batches.len(),
-                build_null_rows_by_batch.len()
-            ));
-        }
         let build_chunk_for_residual = if has_residual {
             self.build_chunk.clone()
         } else {
             None
-        };
-        let build_batch_lengths = self
-            .build_batches
-            .iter()
-            .map(|batch| batch.len())
-            .collect::<Vec<_>>();
-        let flat_build_null_key_rows = if has_residual && !build_null_rows_by_batch.is_empty() {
-            Self::flat_build_rows_from_batches(
-                self.build_batches.as_ref(),
-                build_null_rows_by_batch,
-            )?
-        } else {
-            Vec::new()
         };
 
         let mut output_batches = Vec::new();
@@ -1531,7 +1334,6 @@ impl HashJoinProbeCore {
                         let build_chunk = build_chunk_for_residual.as_ref().ok_or_else(|| {
                             "null-aware anti join build chunk missing".to_string()
                         })?;
-                        equal_selection.reorder_by_build_batch_lengths(&build_batch_lengths)?;
                         self.compact_null_aware_selection(
                             &probe,
                             build_chunk,
@@ -1553,7 +1355,7 @@ impl HashJoinProbeCore {
                         &probe,
                         build_chunk,
                         &probe_rows,
-                        &flat_build_null_key_rows,
+                        flat_build_null_key_rows,
                         pred,
                         &mut matched_null_key,
                         &mut residual_matched_probe_rows,
@@ -1702,166 +1504,6 @@ impl HashJoinProbeCore {
         Ok(())
     }
 
-    fn probe_chunk_matches_residual(
-        arena: &ExprArena,
-        join_type: JoinType,
-        build_batches: &[Chunk],
-        table: &JoinHashTable,
-        probe: &Chunk,
-        group_ids: &[Option<usize>],
-        join_scope_schema: &SchemaRef,
-        join_scope_chunk_schema: &ChunkSchemaRef,
-        pred: ExprId,
-        output_timer: Option<&CounterRef>,
-    ) -> Result<(Vec<bool>, u64, u64, u64, u64), String> {
-        if group_ids.len() != probe.len() {
-            return Err("join group id vector length mismatch".to_string());
-        }
-        if build_batches.is_empty() {
-            return Ok((vec![false; probe.len()], 0, 0, 0, 0));
-        }
-
-        let mut matched = vec![false; probe.len()];
-        let mut rows_checked = 0u64;
-        let mut group_rows_total = 0u64;
-
-        let mut pairs_by_batch = vec![Vec::<(u32, u32)>::new(); build_batches.len()];
-        for (probe_row, group_id_opt) in group_ids.iter().enumerate() {
-            let Some(group_id) = group_id_opt else {
-                continue;
-            };
-            rows_checked = rows_checked.saturating_add(1);
-            let rows = table
-                .group_rows_slice(*group_id)
-                .map_err(|e| e.to_string())?;
-            group_rows_total = group_rows_total.saturating_add(rows.len() as u64);
-            for &build_row_id in rows {
-                let (batch_idx, row_idx) = table
-                    .row_location(build_row_id)
-                    .map_err(|e| e.to_string())?;
-                let slot = batch_idx as usize;
-                if slot >= pairs_by_batch.len() {
-                    return Err("join row batch index out of bounds".to_string());
-                }
-                pairs_by_batch[slot].push((probe_row as u32, row_idx));
-            }
-        }
-
-        if rows_checked == 0 {
-            return Ok((matched, 0, 0, 0, group_rows_total));
-        }
-
-        const MAX_EVAL_PAIRS: usize = 16 * 1024;
-        let mut eval_batches = 0u64;
-        let mut eval_pairs = 0u64;
-
-        let is_left = matches!(
-            join_type,
-            JoinType::LeftSemi | JoinType::LeftAnti | JoinType::NullAwareLeftAnti
-        );
-
-        for (batch_idx, pairs) in pairs_by_batch.into_iter().enumerate() {
-            if pairs.is_empty() {
-                continue;
-            }
-            let Some(build_batch) = build_batches.get(batch_idx) else {
-                continue;
-            };
-
-            let mut offset = 0usize;
-            while offset < pairs.len() {
-                let end = (offset + MAX_EVAL_PAIRS).min(pairs.len());
-                let slice = &pairs[offset..end];
-                offset = end;
-
-                let mut left_indices = Vec::with_capacity(slice.len());
-                let mut right_indices = Vec::with_capacity(slice.len());
-                for &(probe_row, build_row) in slice {
-                    let probe_slot = probe_row as usize;
-                    if probe_slot >= matched.len() {
-                        return Err("join probe index out of bounds".to_string());
-                    }
-                    if matched[probe_slot] {
-                        continue;
-                    }
-                    if is_left {
-                        left_indices.push(probe_row);
-                        right_indices.push(build_row);
-                    } else {
-                        left_indices.push(build_row);
-                        right_indices.push(probe_row);
-                    }
-                }
-
-                if left_indices.is_empty() {
-                    continue;
-                }
-
-                let output_start = std::time::Instant::now();
-                let joined = if is_left {
-                    build_join_batch(
-                        probe,
-                        build_batch,
-                        &left_indices,
-                        &right_indices,
-                        join_scope_schema,
-                    )?
-                } else {
-                    build_join_batch(
-                        build_batch,
-                        probe,
-                        &left_indices,
-                        &right_indices,
-                        join_scope_schema,
-                    )?
-                };
-                Self::record_timer_ns(output_timer, output_start);
-
-                let Some(joined) = joined else {
-                    continue;
-                };
-
-                let joined_chunk =
-                    Chunk::try_new_with_chunk_schema(joined, Arc::clone(join_scope_chunk_schema))?;
-                let mask_arr = arena.eval(pred, &joined_chunk).map_err(|e| e.to_string())?;
-                eval_batches = eval_batches.saturating_add(1);
-                eval_pairs = eval_pairs.saturating_add(joined_chunk.len() as u64);
-                let mask = mask_arr
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .ok_or_else(|| {
-                        "join residual predicate must return boolean array".to_string()
-                    })?;
-                for i in 0..mask.len() {
-                    if !(mask.is_valid(i) && mask.value(i)) {
-                        continue;
-                    }
-                    let probe_row = if is_left {
-                        *left_indices
-                            .get(i)
-                            .ok_or_else(|| "join probe index out of bounds".to_string())?
-                    } else {
-                        *right_indices
-                            .get(i)
-                            .ok_or_else(|| "join probe index out of bounds".to_string())?
-                    };
-                    let probe_row = probe_row as usize;
-                    if probe_row < matched.len() {
-                        matched[probe_row] = true;
-                    }
-                }
-            }
-        }
-
-        Ok((
-            matched,
-            rows_checked,
-            eval_batches,
-            eval_pairs,
-            group_rows_total,
-        ))
-    }
-
     fn apply_runtime_filters(&self, chunks: Vec<Chunk>) -> Result<Vec<Chunk>, String> {
         if !self.should_apply_runtime_filters() {
             return Ok(chunks);
@@ -1977,12 +1619,11 @@ mod tests {
                 .expect("build key"),
         ];
         build_table
-            .add_build_batch(&build_key_arrays, build_chunk.len(), 0)
-            .expect("add build batch");
+            .add_build_rows(&build_key_arrays, build_chunk.len())
+            .expect("add build rows");
         build_table.finalize().expect("finalize build table");
         let artifact = Arc::new(JoinBuildArtifact::new(
             Some(BuildStore::new(build_chunk.clone())),
-            vec![build_chunk],
             Some(build_table),
             1,
             false,
@@ -2044,7 +1685,6 @@ mod tests {
 
         let artifact = Arc::new(JoinBuildArtifact::new(
             None,
-            Vec::new(),
             None,
             0,
             false,

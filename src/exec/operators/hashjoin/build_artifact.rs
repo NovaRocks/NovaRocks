@@ -31,34 +31,30 @@ use std::sync::Arc;
 
 use super::join_hash_map::build_store::BuildStore;
 use super::join_hash_map::method::JoinHashMap;
-use crate::exec::chunk::Chunk;
 use crate::exec::runtime_filter::LocalRuntimeFilterSet;
 
 #[derive(Clone)]
 /// Materialized build-side artifact consumed by join probe operators.
 pub(crate) struct JoinBuildArtifact {
     pub(crate) build_store: Option<Arc<BuildStore>>,
-    pub(crate) build_batches: Arc<Vec<Chunk>>,
     pub(crate) build_table: Option<Arc<JoinHashMap>>,
     pub(crate) build_row_count: usize,
     pub(crate) build_has_null_key: bool,
-    pub(crate) build_null_key_rows: Option<Arc<Vec<Vec<u32>>>>,
+    pub(crate) build_null_key_rows: Option<Arc<Vec<u32>>>,
     pub(crate) runtime_filters: Option<Arc<LocalRuntimeFilterSet>>,
 }
 
 impl JoinBuildArtifact {
     pub(crate) fn new(
         build_store: Option<BuildStore>,
-        build_batches: Vec<Chunk>,
         build_table: Option<JoinHashMap>,
         build_row_count: usize,
         build_has_null_key: bool,
-        build_null_key_rows: Option<Arc<Vec<Vec<u32>>>>,
+        build_null_key_rows: Option<Arc<Vec<u32>>>,
         runtime_filters: Option<Arc<LocalRuntimeFilterSet>>,
     ) -> Self {
         Self {
             build_store: build_store.map(Arc::new),
-            build_batches: Arc::new(build_batches),
             build_table: build_table.map(Arc::new),
             build_row_count,
             build_has_null_key,

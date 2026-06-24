@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, UInt32Array, new_null_array};
 use arrow::compute::take;
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 
 use crate::exec::chunk::Chunk;
@@ -159,12 +159,6 @@ pub(crate) fn gather_null_left_with_right(
 
     let batch = build_output_record_batch(output_schema, columns, "join right outer output")?;
     Ok(Some(batch))
-}
-
-pub(crate) fn concat_schemas(left: SchemaRef, right: SchemaRef) -> SchemaRef {
-    let mut fields = left.fields().to_vec();
-    fields.extend(right.fields().to_vec());
-    Arc::new(Schema::new(fields))
 }
 
 #[cfg(test)]

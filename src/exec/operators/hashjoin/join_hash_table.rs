@@ -68,8 +68,6 @@ pub(crate) struct JoinHashTable {
     null_safe_eq: Vec<bool>,
     group_head: Vec<u32>,
     row_next: Vec<u32>,
-    row_batch_index: Vec<u32>,
-    row_in_batch: Vec<u32>,
     row_count: usize,
     group_offsets: Option<Vec<u32>>,
     group_rows: Option<Vec<u32>>,
@@ -132,8 +130,6 @@ impl JoinHashTable {
             null_safe_eq,
             group_head: Vec::new(),
             row_next: Vec::new(),
-            row_batch_index: Vec::new(),
-            row_in_batch: Vec::new(),
             row_count: 0,
             group_offsets: None,
             group_rows: None,
@@ -215,11 +211,10 @@ impl JoinHashTable {
         self.group_rows_slice(group_id)
     }
 
-    pub(crate) fn add_build_batch(
+    pub(crate) fn add_build_rows(
         &mut self,
         key_arrays: &[arrow::array::ArrayRef],
         num_rows: usize,
-        batch_index: u32,
     ) -> Result<(), String> {
         if self.group_offsets.is_some() || self.group_rows.is_some() {
             return Err("join hash table already finalized".to_string());
@@ -244,19 +239,10 @@ impl JoinHashTable {
         }
         let base_row_id = self.row_count as u32;
         self.row_next.resize(next_row_count, ROW_NONE);
-        self.row_batch_index.resize(next_row_count, 0);
-        self.row_in_batch.resize(next_row_count, 0);
         self.row_count = next_row_count;
 
         let key_views = build_group_key_views(key_arrays)?;
         self.key_table.ensure_compressed_ctx(&key_views)?;
-
-        for row in 0..num_rows {
-            let row_id = base_row_id + row as u32;
-            let slot = row_id as usize;
-            self.row_batch_index[slot] = batch_index;
-            self.row_in_batch[slot] = row as u32;
-        }
 
         match self.key_table.key_strategy() {
             GroupKeyStrategy::OneNumber => {
@@ -574,19 +560,6 @@ impl JoinHashTable {
         Ok(group_ids)
     }
 
-    pub(crate) fn row_location(&self, row_id: u32) -> Result<(u32, u32), String> {
-        let slot = row_id as usize;
-        let batch_idx = *self
-            .row_batch_index
-            .get(slot)
-            .ok_or_else(|| "join row id out of bounds".to_string())?;
-        let row_idx = *self
-            .row_in_batch
-            .get(slot)
-            .ok_or_else(|| "join row id out of bounds".to_string())?;
-        Ok((batch_idx, row_idx))
-    }
-
     fn handle_lookup(&mut self, lookup: KeyLookup, row_id: u32) -> Result<(), String> {
         if lookup.is_new {
             if lookup.group_id != self.group_head.len() {
@@ -644,8 +617,6 @@ impl JoinHashTable {
 
         vec_bytes(&self.group_head)
             .saturating_add(vec_bytes(&self.row_next))
-            .saturating_add(vec_bytes(&self.row_batch_index))
-            .saturating_add(vec_bytes(&self.row_in_batch))
             .saturating_add(opt_vec_bytes(&self.group_offsets))
             .saturating_add(opt_vec_bytes(&self.group_rows))
     }

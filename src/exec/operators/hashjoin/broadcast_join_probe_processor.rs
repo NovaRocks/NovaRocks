@@ -314,14 +314,14 @@ impl BroadcastJoinProbeProcessorOperator {
 
     fn log_stats(&self) {
         debug!(
-            "BroadcastJoinProbe finished: dep_key={} driver_id={} input_rows={} input_chunks={} buffered_rows={} output_rows={} build_batches={} build_table={} probe_keys={}",
+            "BroadcastJoinProbe finished: dep_key={} driver_id={} input_rows={} input_chunks={} buffered_rows={} output_rows={} build_store_rows={} build_table={} probe_keys={}",
             self.dep.name(),
             self.driver_id,
             self.input_rows,
             self.input_chunks,
             self.buffered_rows,
             self.core.output_rows(),
-            self.core.build_batches_len(),
+            self.core.build_store_rows(),
             self.core.build_table_present(),
             self.core.probe_keys_len()
         );

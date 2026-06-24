@@ -64,14 +64,12 @@ impl JoinHashMap {
         self.table.is_empty()
     }
 
-    pub(crate) fn add_build_batch(
+    pub(crate) fn add_build_rows(
         &mut self,
         key_arrays: &[ArrayRef],
         num_rows: usize,
-        batch_index: u32,
     ) -> Result<(), String> {
-        self.table
-            .add_build_batch(key_arrays, num_rows, batch_index)
+        self.table.add_build_rows(key_arrays, num_rows)
     }
 
     pub(crate) fn finalize(&mut self) -> Result<(), String> {
@@ -230,7 +228,7 @@ mod tests {
     fn chained_map_lookup_selection_preserves_group_rows_and_null_semantics() {
         let mut map = JoinHashMap::new_chained(vec![DataType::Int32], vec![false]).expect("map");
         let build = int32_chunk(vec![Some(1), Some(2), Some(1), None]);
-        map.add_build_batch(build.columns(), build.len(), 0)
+        map.add_build_rows(build.columns(), build.len())
             .expect("add build");
         map.finalize().expect("finalize");
 
@@ -260,7 +258,7 @@ mod tests {
     fn chained_map_null_safe_key_matches_null_group() {
         let mut map = JoinHashMap::new_chained(vec![DataType::Int32], vec![true]).expect("map");
         let build = int32_chunk(vec![Some(1), None]);
-        map.add_build_batch(build.columns(), build.len(), 0)
+        map.add_build_rows(build.columns(), build.len())
             .expect("add build");
         map.finalize().expect("finalize");
 

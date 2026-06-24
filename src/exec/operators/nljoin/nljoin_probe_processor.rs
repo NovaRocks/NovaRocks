@@ -40,7 +40,7 @@ use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use crate::exec::node::nljoin::NestedLoopJoinType;
 use crate::exec::operators::hashjoin::join_probe_utils::{
-    build_join_batch, build_left_with_null_right, build_null_left_with_right,
+    gather_join_batch, gather_left_with_null_right, gather_null_left_with_right,
 };
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
@@ -542,7 +542,7 @@ impl NlJoinProbeProcessorOperator {
             }
         }
 
-        build_join_batch(
+        gather_join_batch(
             probe_chunk,
             right,
             &left_indices,
@@ -759,14 +759,14 @@ impl NlJoinProbeProcessorOperator {
         }
 
         if self.probe_is_left {
-            build_left_with_null_right(
+            gather_left_with_null_right(
                 probe_chunk,
                 &indices,
                 &self.right_schema,
                 &self.join_scope_schema,
             )
         } else {
-            build_null_left_with_right(
+            gather_null_left_with_right(
                 probe_chunk,
                 &indices,
                 &self.left_schema,
@@ -808,7 +808,7 @@ impl NlJoinProbeProcessorOperator {
             }
 
             if !indices.is_empty() {
-                return build_null_left_with_right(
+                return gather_null_left_with_right(
                     build_batch,
                     &indices,
                     &self.left_schema,
@@ -873,7 +873,7 @@ impl NlJoinProbeProcessorOperator {
 
         let join_scope_schema = Arc::clone(&self.join_scope_schema);
         if self.probe_is_left {
-            let batch = build_join_batch(
+            let batch = gather_join_batch(
                 probe_chunk,
                 build_batch,
                 &probe_indices,
@@ -882,7 +882,7 @@ impl NlJoinProbeProcessorOperator {
             )?;
             Ok((batch, probe_indices, build_indices))
         } else {
-            let batch = build_join_batch(
+            let batch = gather_join_batch(
                 build_batch,
                 probe_chunk,
                 &build_indices,
@@ -1111,7 +1111,7 @@ impl NlJoinProbeProcessorOperator {
             }
             let left_indices = vec![probe_row as u32; right_len];
             let right_indices = (0..right_len).map(|i| i as u32).collect::<Vec<_>>();
-            let Some(batch) = build_join_batch(
+            let Some(batch) = gather_join_batch(
                 probe_chunk,
                 right,
                 &left_indices,
@@ -1163,7 +1163,7 @@ impl NlJoinProbeProcessorOperator {
             }
             let left_indices = vec![probe_row as u32; right_len];
             let right_indices = (0..right_len).map(|i| i as u32).collect::<Vec<_>>();
-            let Some(batch) = build_join_batch(
+            let Some(batch) = gather_join_batch(
                 probe_chunk,
                 right,
                 &left_indices,

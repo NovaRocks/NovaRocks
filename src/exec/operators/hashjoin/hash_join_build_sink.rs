@@ -143,7 +143,7 @@ impl OperatorFactory for HashJoinBuildSinkFactory {
             runtime_filter_hub: Arc::clone(&self.runtime_filter_hub),
             runtime_in_filter_merger: self.runtime_in_filter_merger.as_ref().map(Arc::clone),
             build_store_builder: BuildStoreBuilder::new(),
-            build_batches: Vec::new(),
+            build_input_chunks: Vec::new(),
             build_table: None,
             runtime_filters: None,
             runtime_in_filters: None,
@@ -160,7 +160,7 @@ impl OperatorFactory for HashJoinBuildSinkFactory {
             profiles: None,
             input_rows: 0,
             input_chunks: 0,
-            build_batches_mem_tracker: None,
+            build_input_chunks_mem_tracker: None,
             build_table_mem_tracker: None,
         })
     }
@@ -185,20 +185,20 @@ struct HashJoinBuildSinkOperator {
     runtime_filter_hub: Arc<RuntimeFilterHub>,
     runtime_in_filter_merger: Option<Arc<PartialRuntimeInFilterMerger>>,
     build_store_builder: BuildStoreBuilder,
-    build_batches: Vec<Chunk>,
+    build_input_chunks: Vec<Chunk>,
     build_table: Option<JoinHashMap>,
     runtime_filters: Option<LocalRuntimeFilterSet>,
     runtime_in_filters: Option<LocalRuntimeInFilterSet>,
     finished: bool,
     build_row_count: usize,
     build_has_null_key: bool,
-    build_null_key_rows: Option<Vec<Vec<u32>>>,
+    build_null_key_rows: Option<Vec<u32>>,
     logged_first_input: bool,
     profile_initialized: bool,
     profiles: Option<crate::runtime::profile::OperatorProfiles>,
     input_rows: u64,
     input_chunks: u64,
-    build_batches_mem_tracker: Option<Arc<MemTracker>>,
+    build_input_chunks_mem_tracker: Option<Arc<MemTracker>>,
     build_table_mem_tracker: Option<Arc<MemTracker>>,
 }
 
@@ -208,10 +208,10 @@ impl Operator for HashJoinBuildSinkOperator {
     }
 
     fn set_mem_tracker(&mut self, tracker: Arc<MemTracker>) {
-        let batches = MemTracker::new_child("BuildBatches", &tracker);
-        self.build_batches_mem_tracker = Some(Arc::clone(&batches));
-        for chunk in self.build_batches.iter_mut() {
-            chunk.transfer_to(&batches);
+        let chunks = MemTracker::new_child("BuildInputChunks", &tracker);
+        self.build_input_chunks_mem_tracker = Some(Arc::clone(&chunks));
+        for chunk in self.build_input_chunks.iter_mut() {
+            chunk.transfer_to(&chunks);
         }
 
         let table = MemTracker::new_child("BuildHashTable", &tracker);
@@ -282,15 +282,14 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
         }
         self.input_rows = self.input_rows.saturating_add(chunk.len() as u64);
         self.input_chunks = self.input_chunks.saturating_add(1);
+        let base_row_id = self.build_row_count;
         self.build_row_count = self.build_row_count.saturating_add(chunk.len());
         self.build_store_builder.push_chunk(&chunk)?;
 
-        let batch_index = u32::try_from(self.build_batches.len())
-            .map_err(|_| "join build batch index overflow".to_string())?;
-        if let Some(tracker) = self.build_batches_mem_tracker.as_ref() {
+        if let Some(tracker) = self.build_input_chunks_mem_tracker.as_ref() {
             chunk.transfer_to(tracker);
         }
-        self.build_batches.push(chunk.clone());
+        self.build_input_chunks.push(chunk.clone());
 
         if self.build_keys.is_empty() {
             return Ok(());
@@ -312,8 +311,7 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
         if !self.build_has_null_key {
             self.build_has_null_key = key_arrays.iter().any(|a| a.null_count() > 0);
         }
-        if let Some(null_rows_by_batch) = self.build_null_key_rows.as_mut() {
-            let mut null_rows = Vec::new();
+        if let Some(null_key_rows) = self.build_null_key_rows.as_mut() {
             for row in 0..chunk.len() {
                 let has_forbidden_null =
                     key_arrays.iter().enumerate().any(|(key_idx, key_array)| {
@@ -321,10 +319,15 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
                             && !key_array.is_valid(row)
                     });
                 if has_forbidden_null {
-                    null_rows.push(row as u32);
+                    let flat_row_id = base_row_id
+                        .checked_add(row)
+                        .ok_or_else(|| "join build null-key row id overflow".to_string())?;
+                    null_key_rows.push(
+                        u32::try_from(flat_row_id)
+                            .map_err(|_| "join build null-key row id overflow".to_string())?,
+                    );
                 }
             }
-            null_rows_by_batch.push(null_rows);
         }
 
         if self.build_table.is_none() {
@@ -347,7 +350,7 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
         let table = self.build_table.as_mut().expect("join build table");
         let start = std::time::Instant::now();
         table
-            .add_build_batch(&key_arrays, chunk.len(), batch_index)
+            .add_build_rows(&key_arrays, chunk.len())
             .map_err(|e| e.to_string())?;
         if let Some(timer) = build_ht_timer.as_ref() {
             timer.add(clamp_u128_to_i64(start.elapsed().as_nanos()));
@@ -427,20 +430,17 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
         self.runtime_filter_hub
             .mark_local_filters_ready(self.node_id);
 
-        let batch_count = self.build_batches.len();
+        let build_store_rows = self.build_store_builder.row_count();
         let table_present = self.build_table.is_some();
-        let mut batches = std::mem::take(&mut self.build_batches);
+        let input_chunks = std::mem::take(&mut self.build_input_chunks);
         let mut table = self.build_table.take();
         let mut build_store =
             std::mem::replace(&mut self.build_store_builder, BuildStoreBuilder::new()).finish()?;
+        drop(input_chunks);
 
         if let Some(root) = state.mem_tracker() {
             let label = format!("JoinBuildArtifact: {}", self.state.dep_name(self.partition));
             let artifact = MemTracker::new_child(label, &root);
-            let artifact_batches = MemTracker::new_child("BuildBatches", &artifact);
-            for chunk in batches.iter_mut() {
-                chunk.transfer_to(&artifact_batches);
-            }
             let artifact_table = MemTracker::new_child("BuildHashTable", &artifact);
             if let Some(table) = table.as_mut() {
                 table.set_mem_tracker(artifact_table);
@@ -454,7 +454,6 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
         let build_null_key_rows = self.build_null_key_rows.take().map(Arc::new);
         let artifact = Arc::new(JoinBuildArtifact::new(
             build_store,
-            batches,
             table,
             self.build_row_count,
             self.build_has_null_key,
@@ -465,7 +464,7 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
             .set_build(self.partition, artifact)
             .map_err(|e| e.to_string())?;
         debug!(
-            "HashJoinBuildSink finished: dep_key={} driver_id={} partition={} node_id={} join_type={} input_rows={} input_chunks={} build_row_count={} build_has_null_key={} build_batches={} build_table={} build_keys={}",
+            "HashJoinBuildSink finished: dep_key={} driver_id={} partition={} node_id={} join_type={} input_rows={} input_chunks={} build_row_count={} build_has_null_key={} build_store_rows={} build_table={} build_keys={}",
             self.state.dep_name(self.partition),
             self.driver_id,
             self.partition,
@@ -475,7 +474,7 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
             self.input_chunks,
             self.build_row_count,
             self.build_has_null_key,
-            batch_count,
+            build_store_rows,
             table_present,
             self.build_keys.len()
         );
@@ -886,7 +885,7 @@ impl HashJoinBuildSinkOperator {
             return Ok(params);
         }
 
-        for chunk in &self.build_batches {
+        for chunk in &self.build_input_chunks {
             let mut key_arrays = Vec::with_capacity(self.build_keys.len());
             for expr in &self.build_keys {
                 let array = self.arena.eval(*expr, chunk).map_err(|e| e.to_string())?;

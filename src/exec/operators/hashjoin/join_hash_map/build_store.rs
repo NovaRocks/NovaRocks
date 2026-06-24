@@ -27,18 +27,12 @@ use crate::runtime::mem_tracker::MemTracker;
 #[derive(Debug, Clone)]
 pub(crate) struct BuildStore {
     chunk: Arc<Chunk>,
-    tracks_independent_memory: bool,
 }
 
 impl BuildStore {
     pub(crate) fn new(chunk: Chunk) -> Self {
-        Self::with_memory_tracking(chunk, true)
-    }
-
-    fn with_memory_tracking(chunk: Chunk, tracks_independent_memory: bool) -> Self {
         Self {
             chunk: Arc::new(chunk),
-            tracks_independent_memory,
         }
     }
 
@@ -55,9 +49,7 @@ impl BuildStore {
     }
 
     pub(crate) fn transfer_independent_memory_to(&mut self, tracker: &Arc<MemTracker>) {
-        if self.tracks_independent_memory {
-            Arc::make_mut(&mut self.chunk).transfer_to(tracker);
-        }
+        Arc::make_mut(&mut self.chunk).transfer_to(tracker);
     }
 }
 
@@ -105,23 +97,13 @@ impl BuildStoreBuilder {
             return Ok(None);
         }
         let arrow_schema = chunk_schema.arrow_schema_ref();
-        let (batch, tracks_independent_memory) = if self.batches.len() == 1 {
-            (
-                self.batches.into_iter().next().expect("one build batch"),
-                false,
-            )
+        let batch = if self.batches.len() == 1 {
+            self.batches.into_iter().next().expect("one build batch")
         } else {
-            (
-                concat_batches(&arrow_schema, &self.batches).map_err(|e| e.to_string())?,
-                true,
-            )
+            concat_batches(&arrow_schema, &self.batches).map_err(|e| e.to_string())?
         };
         let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema)?;
-        if tracks_independent_memory {
-            Ok(Some(BuildStore::new(chunk)))
-        } else {
-            Ok(Some(BuildStore::with_memory_tracking(chunk, false)))
-        }
+        Ok(Some(BuildStore::new(chunk)))
     }
 }
 
@@ -244,6 +226,23 @@ mod tests {
             .expect("push");
         let mut store = builder.finish().expect("finish").expect("store");
         let tracker = MemTracker::new_root("build-store-test");
+
+        store.transfer_independent_memory_to(&tracker);
+
+        assert!(tracker.current() > 0);
+        drop(store);
+        assert_eq!(tracker.current(), 0);
+    }
+
+    #[test]
+    fn build_store_tracks_single_batch_memory() {
+        let mut builder = BuildStoreBuilder::new();
+
+        builder
+            .push_chunk(&one_column_chunk(vec![1, 2]))
+            .expect("push");
+        let mut store = builder.finish().expect("finish").expect("store");
+        let tracker = MemTracker::new_root("build-store-single-batch-test");
 
         store.transfer_independent_memory_to(&tracker);
 
