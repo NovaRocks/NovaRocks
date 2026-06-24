@@ -2453,6 +2453,24 @@ mod tests {
         }
     }
 
+    fn variant_a_values(batch: &arrow::record_batch::RecordBatch) -> Vec<Option<i64>> {
+        let values = batch
+            .column_by_name("__nr_var_payload_a")
+            .expect("variant synthetic output")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("variant synthetic int64 output");
+        (0..values.len())
+            .map(|idx| {
+                if values.is_null(idx) {
+                    None
+                } else {
+                    Some(values.value(idx))
+                }
+            })
+            .collect()
+    }
+
     fn residual_variant_a_gt_5_values(batch: &arrow::record_batch::RecordBatch) -> Vec<i64> {
         let predicates = vec![MinMaxPredicate::Gt {
             column: "1".to_string(),
@@ -2587,6 +2605,19 @@ mod tests {
         assert!(page_selection.selection.is_none());
         assert_eq!(page_selection.pages_pruned, 0);
         assert_eq!(page_selection.rows_selected, page_selection.rows_total);
+
+        let full_batch = read_single_batch(variant_pruning_scan_cfg(false), &file_path);
+        let degraded_batch = read_single_batch(variant_pruning_scan_cfg(true), &file_path);
+        let full_values = variant_a_values(&full_batch);
+        let degraded_values = variant_a_values(&degraded_batch);
+
+        assert_eq!(full_batch.num_rows(), 6);
+        assert_eq!(degraded_batch.num_rows(), full_batch.num_rows());
+        assert_eq!(
+            full_values,
+            vec![Some(1), Some(2), Some(3), Some(10), Some(11), Some(12)]
+        );
+        assert_eq!(degraded_values, full_values);
     }
 
     #[test]
