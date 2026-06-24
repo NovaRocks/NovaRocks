@@ -447,7 +447,7 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
             }
             let artifact_build_store = MemTracker::new_child("BuildStore", &artifact);
             if let Some(store) = build_store.as_mut() {
-                store.transfer_independent_memory_to(&artifact_build_store);
+                store.transfer_to(&artifact_build_store);
             }
         }
         let runtime_filters = self.runtime_filters.take().map(Arc::new);

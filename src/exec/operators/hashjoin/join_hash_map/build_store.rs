@@ -48,7 +48,7 @@ impl BuildStore {
         self.chunk.is_empty()
     }
 
-    pub(crate) fn transfer_independent_memory_to(&mut self, tracker: &Arc<MemTracker>) {
+    pub(crate) fn transfer_to(&mut self, tracker: &Arc<MemTracker>) {
         Arc::make_mut(&mut self.chunk).transfer_to(tracker);
     }
 }
@@ -227,7 +227,7 @@ mod tests {
         let mut store = builder.finish().expect("finish").expect("store");
         let tracker = MemTracker::new_root("build-store-test");
 
-        store.transfer_independent_memory_to(&tracker);
+        store.transfer_to(&tracker);
 
         assert!(tracker.current() > 0);
         drop(store);
@@ -244,7 +244,7 @@ mod tests {
         let mut store = builder.finish().expect("finish").expect("store");
         let tracker = MemTracker::new_root("build-store-single-batch-test");
 
-        store.transfer_independent_memory_to(&tracker);
+        store.transfer_to(&tracker);
 
         assert!(tracker.current() > 0);
         drop(store);
