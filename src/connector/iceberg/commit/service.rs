@@ -87,6 +87,14 @@ pub enum CommitServiceError {
         message: String,
         evidence: RecoveryEvidence,
     },
+    InvalidInput {
+        message: String,
+    },
+    FinalizeFailedKnownCommitted {
+        outcome: Option<CommitOutcome>,
+        finalize_error: String,
+        evidence: RecoveryEvidence,
+    },
 }
 
 impl CommitServiceError {
@@ -98,13 +106,48 @@ impl CommitServiceError {
         Self::Unknown { message, evidence }
     }
 
+    pub fn invalid_input(message: String) -> Self {
+        Self::InvalidInput { message }
+    }
+
+    pub fn finalize_failed_known_committed(
+        outcome: Option<CommitOutcome>,
+        finalize_error: String,
+        evidence: RecoveryEvidence,
+    ) -> Self {
+        Self::FinalizeFailedKnownCommitted {
+            outcome,
+            finalize_error,
+            evidence,
+        }
+    }
+
     pub fn is_unknown(&self) -> bool {
         matches!(self, Self::Unknown { .. })
     }
 
+    pub fn is_finalize_failed_known_committed(&self) -> bool {
+        matches!(self, Self::FinalizeFailedKnownCommitted { .. })
+    }
+
     pub fn message(&self) -> &str {
         match self {
-            Self::KnownUncommitted { message, .. } | Self::Unknown { message, .. } => message,
+            Self::KnownUncommitted { message, .. }
+            | Self::Unknown { message, .. }
+            | Self::InvalidInput { message } => message,
+            Self::FinalizeFailedKnownCommitted { finalize_error, .. } => finalize_error,
+        }
+    }
+
+    pub fn engine_error_code(&self) -> crate::common::engine_error::EngineErrorCode {
+        match self {
+            Self::KnownUncommitted { .. } | Self::InvalidInput { .. } => {
+                crate::common::engine_error::EngineErrorCode::CommitKnownUncommitted
+            }
+            Self::Unknown { .. } => crate::common::engine_error::EngineErrorCode::CommitUnknown,
+            Self::FinalizeFailedKnownCommitted { .. } => {
+                crate::common::engine_error::EngineErrorCode::CommitKnownCommittedFinalizeFailed
+            }
         }
     }
 
@@ -124,18 +167,46 @@ impl CommitServiceError {
                 "iceberg commit unknown ({message}); staged files left at {} for manual review",
                 evidence.staging_dir
             ),
+            Self::InvalidInput { message } => message,
+            Self::FinalizeFailedKnownCommitted {
+                outcome,
+                finalize_error,
+                evidence,
+            } => match outcome {
+                Some(outcome) => format!(
+                    "iceberg commit is known committed at snapshot {} but finalization failed: {finalize_error}; do not retry commit",
+                    outcome.new_snapshot_id
+                ),
+                None => format!(
+                    "iceberg commit is known committed but finalization failed before snapshot id was captured: {finalize_error}; manual recovery required for {}",
+                    evidence.table_ident
+                ),
+            },
         }
     }
 }
 
 impl From<CommitServiceError> for crate::common::engine_error::EngineError {
     fn from(value: CommitServiceError) -> Self {
-        let is_unknown = value.is_unknown();
+        let code = value.engine_error_code();
         let message = value.into_legacy_string();
-        if is_unknown {
-            Self::commit_unknown(message)
-        } else {
-            Self::commit_known_uncommitted(message)
+        match code {
+            crate::common::engine_error::EngineErrorCode::CommitKnownUncommitted => {
+                Self::commit_known_uncommitted(message)
+            }
+            crate::common::engine_error::EngineErrorCode::CommitUnknown => {
+                Self::commit_unknown(message)
+            }
+            crate::common::engine_error::EngineErrorCode::CommitKnownCommittedFinalizeFailed => {
+                Self::commit_known_committed_finalize_failed(message)
+            }
+            _ => Self::internal_invariant(
+                crate::common::engine_error::InternalInvariantCode::UnexpectedReportStatusShape,
+                format!(
+                    "unexpected commit service engine error code: {}",
+                    code.as_str()
+                ),
+            ),
         }
     }
 }
@@ -286,6 +357,66 @@ mod tests {
         assert_eq!(
             err.into_legacy_string(),
             "CowUpdate commit requires a rewrite set"
+        );
+    }
+
+    #[test]
+    fn invalid_input_maps_to_known_uncommitted_engine_error_without_cleanup() {
+        let err = CommitServiceError::invalid_input(
+            "CommitOpKind::RewriteManifests must be invoked directly".to_string(),
+        );
+        assert_eq!(
+            err.engine_error_code(),
+            crate::common::engine_error::EngineErrorCode::CommitKnownUncommitted
+        );
+        assert_eq!(
+            err.clone().into_legacy_string(),
+            "CommitOpKind::RewriteManifests must be invoked directly"
+        );
+
+        let engine = crate::common::engine_error::EngineError::from(err);
+        assert_eq!(
+            engine.to_bracketed_user_message(),
+            "[CommitKnownUncommitted] CommitOpKind::RewriteManifests must be invoked directly"
+        );
+    }
+
+    #[test]
+    fn finalize_failed_known_committed_maps_to_distinct_engine_error() {
+        let outcome = CommitOutcome {
+            new_snapshot_id: 99,
+            written_manifest_paths: vec!["s3://warehouse/metadata/snap-99.avro".to_string()],
+        };
+        let err = CommitServiceError::finalize_failed_known_committed(
+            Some(outcome.clone()),
+            "target ref main is not visible after catalog commit".to_string(),
+            RecoveryEvidence {
+                table_ident: "ice.sales.orders".to_string(),
+                op_kind: CommitOpKind::FastAppend,
+                base_snapshot_id: Some(42),
+                base_sequence_number: 7,
+                staging_dir: "s3://warehouse/orders/_staging/attempt-1".to_string(),
+            },
+        );
+
+        assert!(err.is_finalize_failed_known_committed());
+        assert_eq!(
+            err.engine_error_code(),
+            crate::common::engine_error::EngineErrorCode::CommitKnownCommittedFinalizeFailed
+        );
+        assert_eq!(
+            err.message(),
+            "target ref main is not visible after catalog commit"
+        );
+        assert_eq!(
+            err.clone().into_legacy_string(),
+            "iceberg commit is known committed at snapshot 99 but finalization failed: target ref main is not visible after catalog commit; do not retry commit"
+        );
+
+        let engine = crate::common::engine_error::EngineError::from(err);
+        assert_eq!(
+            engine.to_bracketed_user_message(),
+            "[CommitKnownCommittedFinalizeFailed] iceberg commit is known committed at snapshot 99 but finalization failed: target ref main is not visible after catalog commit; do not retry commit"
         );
     }
 

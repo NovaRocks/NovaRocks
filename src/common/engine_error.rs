@@ -140,6 +140,10 @@ impl EngineError {
         Self::static_message(EngineErrorCode::CommitUnknown, message)
     }
 
+    pub fn commit_known_committed_finalize_failed(message: impl Into<String>) -> Self {
+        Self::static_message(EngineErrorCode::CommitKnownCommittedFinalizeFailed, message)
+    }
+
     pub fn query_timeout(message: impl Into<String>) -> Self {
         Self::static_message(EngineErrorCode::QueryTimeout, message)
     }
@@ -236,6 +240,7 @@ mod tests {
             EngineErrorCode::WriteCoordinatorGone,
             EngineErrorCode::CommitKnownUncommitted,
             EngineErrorCode::CommitUnknown,
+            EngineErrorCode::CommitKnownCommittedFinalizeFailed,
             EngineErrorCode::QueryTimeout,
             EngineErrorCode::ProtocolDecodeError,
             EngineErrorCode::InternalInvariantViolation,

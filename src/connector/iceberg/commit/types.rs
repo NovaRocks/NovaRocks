@@ -139,7 +139,7 @@ pub struct WrittenFile {
 }
 
 /// Result returned by a successful commit action.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommitOutcome {
     pub new_snapshot_id: i64,
     /// Manifest / manifest-list paths written by the commit-action; consumed by

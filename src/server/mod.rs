@@ -1674,6 +1674,11 @@ fn parse_admin_raise_engine_error_query(query: &str) -> Result<Option<EngineErro
         EngineErrorCode::CommitUnknown => {
             EngineError::commit_unknown("forced P8 SQL runner error-code smoke")
         }
+        EngineErrorCode::CommitKnownCommittedFinalizeFailed => {
+            EngineError::commit_known_committed_finalize_failed(
+                "forced P8 SQL runner error-code smoke",
+            )
+        }
         EngineErrorCode::ProtocolDecodeError => {
             EngineError::protocol_decode("forced P8 SQL runner error-code smoke")
         }
