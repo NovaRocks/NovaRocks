@@ -775,6 +775,7 @@ mod tests {
             source_slot_id: SlotId::new(1),
             source_read_slot_id: SlotId::new(90),
             output_slot_id: SlotId::new(2),
+            source_field_id: None,
             source_name: "v".to_string(),
             output_name: "v_a".to_string(),
             source_field: Field::new("v", DataType::LargeBinary, true),

@@ -368,6 +368,7 @@ struct HdfsSlotInfo {
     primitive: types::TPrimitiveType,
     arrow_type: arrow::datatypes::DataType,
     nullable: bool,
+    field_id: Option<i32>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -572,6 +573,7 @@ fn parse_hdfs_scan_variant_path_columns(
             source_slot_id,
             source_read_slot_id: source_slot_id,
             output_slot_id,
+            source_field_id: source_info.field_id,
             source_name,
             output_name,
             source_field: Field::new(
@@ -789,6 +791,7 @@ pub(crate) fn lower_hdfs_scan_node(
         let arrow_type = crate::lower::type_lowering::arrow_type_from_desc(slot_type)
             .ok_or_else(|| format!("unsupported slot_type for slot_id={id}"))?;
         let nullable = s.is_nullable.unwrap_or(true);
+        let field_id = s.col_unique_id.filter(|v| *v > 0);
         slot_info_map.insert(
             SlotId::try_from(id)?,
             HdfsSlotInfo {
@@ -796,6 +799,7 @@ pub(crate) fn lower_hdfs_scan_node(
                 primitive,
                 arrow_type,
                 nullable,
+                field_id,
             },
         );
     }
@@ -1598,6 +1602,7 @@ pub(crate) fn lower_hdfs_scan_node(
         ),
         profile_label: Some(format!("hdfs_scan_node_id={}", node.node_id)),
         iceberg_output_schema,
+        variant_path_predicates: Vec::new(),
         variant_path_columns: variant_path_plan.specs,
         query_global_dicts: Default::default(),
     };
@@ -1911,6 +1916,7 @@ mod tests {
             primitive,
             arrow_type,
             nullable,
+            field_id: None,
         }
     }
 
@@ -2008,6 +2014,19 @@ mod tests {
             spec.output_field,
             Field::new("__nr_var_payload_a", DataType::Int64, true)
         );
+    }
+
+    #[test]
+    fn lower_hdfs_scan_variant_path_spec_carries_source_field_id() {
+        let variant_columns = vec![test_variant_path_column(Some(1), Some(2))];
+        let mut slot_info = variant_slot_info_map();
+        slot_info.get_mut(&SlotId::new(1)).unwrap().field_id = Some(10);
+
+        let plan =
+            parse_hdfs_scan_variant_path_columns(7, Some(variant_columns.as_slice()), &slot_info)
+                .expect("variant path plan");
+
+        assert_eq!(plan.specs[0].source_field_id, Some(10));
     }
 
     #[test]

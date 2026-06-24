@@ -318,6 +318,7 @@ pub(crate) fn execute_lookup_request(
             case_sensitive: scan_cfg.case_sensitive,
             enable_page_index: false,
             min_max_predicates: Vec::new(),
+            variant_path_predicates: Vec::new(),
             batch_size: scan_cfg.batch_size,
             datacache: DataCacheManager::instance().external_context(cache_options.clone()),
             cache_policy: ParquetReadCachePolicy::with_flags(

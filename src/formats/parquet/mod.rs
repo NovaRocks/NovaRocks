@@ -212,6 +212,7 @@ pub struct VariantPathSpec {
     pub source_slot_id: SlotId,
     pub source_read_slot_id: SlotId,
     pub output_slot_id: SlotId,
+    pub source_field_id: Option<i32>,
     pub source_name: String,
     pub output_name: String,
     pub source_field: Field,
@@ -219,6 +220,16 @@ pub struct VariantPathSpec {
     pub canonical_path: String,
     pub requested_type: DataType,
     pub strict: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct VariantPathPruningPredicate {
+    pub output_slot_id: SlotId,
+    pub source_slot_id: SlotId,
+    pub source_field_id: Option<i32>,
+    pub canonical_path: String,
+    pub requested_type: DataType,
+    pub predicate: MinMaxPredicate,
 }
 
 #[derive(Clone, Debug)]
@@ -229,6 +240,7 @@ pub struct ParquetScanConfig {
     pub case_sensitive: bool,
     pub enable_page_index: bool,
     pub min_max_predicates: Vec<MinMaxPredicate>,
+    pub variant_path_predicates: Vec<VariantPathPruningPredicate>,
     pub batch_size: Option<usize>,
     pub datacache: DataCacheContext,
     pub cache_policy: ParquetReadCachePolicy,
@@ -2205,6 +2217,7 @@ mod tests {
             case_sensitive: true,
             enable_page_index: false,
             min_max_predicates: Vec::new(),
+            variant_path_predicates: Vec::new(),
             batch_size: Some(1024),
             datacache: test_datacache_context(),
             cache_policy: ParquetReadCachePolicy::with_flags(false, false, None),
@@ -2237,6 +2250,7 @@ mod tests {
             case_sensitive: true,
             enable_page_index: false,
             min_max_predicates: Vec::new(),
+            variant_path_predicates: Vec::new(),
             batch_size: Some(1024),
             datacache: test_datacache_context(),
             cache_policy: ParquetReadCachePolicy::with_flags(false, false, None),
@@ -2246,6 +2260,7 @@ mod tests {
                 source_slot_id: SlotId::new(3),
                 source_read_slot_id: SlotId::new(3),
                 output_slot_id: SlotId::new(2),
+                source_field_id: None,
                 source_name: "payload".to_string(),
                 output_name: "__nr_var_payload_a".to_string(),
                 source_field: Field::new("payload", DataType::LargeBinary, true),
