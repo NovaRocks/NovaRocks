@@ -2489,6 +2489,99 @@ mod tests {
     }
 
     #[test]
+    fn current_pruning_predicates_keep_variant_config_and_physical_runtime_filters_separate() {
+        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            &Schema::new(vec![
+                Field::new("id", DataType::Int32, true),
+                Field::new("payload", DataType::LargeBinary, true),
+            ]),
+            &[SlotId::new(1), SlotId::new(3)],
+        )
+        .expect("chunk schema");
+        let cfg = ParquetScanConfig {
+            columns: vec!["id".to_string(), "payload".to_string()],
+            chunk_schema,
+            slot_types: vec![types::TPrimitiveType::INT, types::TPrimitiveType::VARIANT],
+            case_sensitive: true,
+            enable_page_index: false,
+            min_max_predicates: vec![MinMaxPredicate::Gt {
+                column: "0".to_string(),
+                value: MinMaxPredicateValue::Int32(5),
+            }],
+            variant_path_predicates: vec![variant_path_predicate(Some(10))],
+            batch_size: Some(1024),
+            datacache: test_datacache_context(),
+            cache_policy: ParquetReadCachePolicy::with_flags(false, false, None),
+            profile_label: None,
+            iceberg_output_schema: None,
+            variant_path_columns: vec![variant_path_spec(Some(10))],
+            query_global_dicts: Default::default(),
+        };
+        let specs = [
+            crate::exec::node::join::JoinRuntimeFilterSpec {
+                filter_id: 1,
+                expr_order: 0,
+                probe_slot_id: SlotId::new(1),
+                build_data_type: DataType::Int32,
+                merge_nodes: Vec::new(),
+                has_remote_targets: false,
+            },
+            crate::exec::node::join::JoinRuntimeFilterSpec {
+                filter_id: 2,
+                expr_order: 1,
+                probe_slot_id: SlotId::new(2),
+                build_data_type: DataType::Int64,
+                merge_nodes: Vec::new(),
+                has_remote_targets: false,
+            },
+        ];
+        let key_arrays: Vec<ArrayRef> = vec![
+            Arc::new(Int32Array::from(vec![10, 20])),
+            Arc::new(Int64Array::from(vec![100, 200])),
+        ];
+        let mut local_filters =
+            crate::exec::runtime_filter::LocalRuntimeInFilterSet::new(&specs, &key_arrays)
+                .expect("local runtime filters");
+        local_filters
+            .add_build_arrays(&key_arrays)
+            .expect("runtime filter values");
+        let runtime_filters = crate::exec::node::scan::RuntimeFilterContext::new(
+            local_filters.into_filters(),
+            Vec::new(),
+        );
+        let iter = test_scan_iter_for_predicates_with_runtime_filters(cfg, Some(runtime_filters));
+
+        let predicates = iter
+            .current_pruning_predicates()
+            .expect("current predicates");
+
+        assert_eq!(
+            predicates.physical,
+            vec![
+                MinMaxPredicate::Gt {
+                    column: "0".to_string(),
+                    value: MinMaxPredicateValue::Int32(5),
+                },
+                MinMaxPredicate::Ge {
+                    column: "0".to_string(),
+                    value: MinMaxPredicateValue::Int32(10),
+                },
+                MinMaxPredicate::Le {
+                    column: "0".to_string(),
+                    value: MinMaxPredicateValue::Int32(20),
+                },
+            ]
+        );
+        assert_eq!(predicates.variant, vec![variant_path_predicate(Some(10))]);
+        assert!(
+            !predicates
+                .physical
+                .iter()
+                .any(|predicate| predicate.column() == "1")
+        );
+    }
+
+    #[test]
     fn runtime_filters_skip_variant_synthetic_slots_but_keep_physical_slots() {
         let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
             &Schema::new(vec![
