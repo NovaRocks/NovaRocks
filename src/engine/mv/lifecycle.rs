@@ -233,6 +233,14 @@ impl RefreshError {
         Self::new(RefreshErrorKind::PreCommitFailed, message)
     }
 
+    pub(crate) fn commit_known_uncommitted(message: impl Into<String>) -> Self {
+        Self::new(RefreshErrorKind::CommitFailedKnownUncommitted, message)
+    }
+
+    pub(crate) fn commit_known_committed_finalize_failed(message: impl Into<String>) -> Self {
+        Self::new(RefreshErrorKind::CommitFailedKnownCommitted, message)
+    }
+
     pub(crate) fn commit_unknown(message: impl Into<String>) -> Self {
         Self::new(RefreshErrorKind::CommitUnknown, message)
     }
