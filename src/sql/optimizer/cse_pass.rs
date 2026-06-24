@@ -547,20 +547,24 @@ fn output_column_for_project_item(scalars: &ScalarArena, item: &ScalarProjectIte
 }
 
 fn repeat_virtual_output_columns(node: &PhysicalPlanNode) -> Vec<OutputColumn> {
-    let Operator::PhysicalRepeat(repeat) = &node.op else {
-        return Vec::new();
+    let mut columns = match &node.op {
+        Operator::PhysicalRepeat(repeat) => repeat
+            .grouping_fn_ids
+            .iter()
+            .map(|(name, column_id)| OutputColumn {
+                column_id: *column_id,
+                name: name.clone(),
+                data_type: DataType::Int64,
+                nullable: false,
+                is_internal: false,
+            })
+            .collect(),
+        _ => Vec::new(),
     };
-    repeat
-        .grouping_fn_ids
-        .iter()
-        .map(|(name, column_id)| OutputColumn {
-            column_id: *column_id,
-            name: name.clone(),
-            data_type: DataType::Int64,
-            nullable: false,
-            is_internal: false,
-        })
-        .collect()
+    for child in &node.children {
+        columns.extend(repeat_virtual_output_columns(child));
+    }
+    columns
 }
 
 fn available_output_ids(node: &PhysicalPlanNode) -> HashSet<ColumnId> {
@@ -1170,12 +1174,13 @@ mod tests {
     use crate::sql::common::OutputColumn;
     use crate::sql::common::{BinOp, JoinKind, LiteralValue};
     use crate::sql::optimizer::operator::{
-        AggMode, FilterOp, JoinDistribution, Operator, PhysicalHashAggregateOp,
-        PhysicalHashJoinEqCondition, PhysicalHashJoinOp, PhysicalNestLoopJoinOp, ProjectOp,
-        RepeatOp, ScalarAggregateSpec, ScalarProjectItem, ScalarWindowSpec, SortOp, TopNOp,
-        TopNPhase, ValuesOp, WindowOp,
+        AggMode, FilterOp, JoinDistribution, Operator, PhysicalDistributionOp,
+        PhysicalHashAggregateOp, PhysicalHashJoinEqCondition, PhysicalHashJoinOp,
+        PhysicalNestLoopJoinOp, ProjectOp, RepeatOp, ScalarAggregateSpec, ScalarProjectItem,
+        ScalarWindowSpec, SortOp, TopNOp, TopNPhase, ValuesOp, WindowOp,
     };
     use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, PlanExecutionProps};
+    use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::scalar::{
         HashableLiteral, ScalarArena, ScalarId, ScalarNode, SortKey,
     };
@@ -2335,6 +2340,97 @@ mod tests {
                 ScalarNode::ColumnRef(column_id) if *column_id == cse_column
             ));
         }
+    }
+
+    #[test]
+    fn rewrite_aggregate_cse_preserves_repeat_grouping_outputs_through_distribution() {
+        let mut arena = ScalarArena::new();
+        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+        let a = col(&mut arena, 101);
+        let b = col(&mut arena, 102);
+        let grouping = col(&mut arena, 109);
+        let a_plus_b = add(&mut arena, a, b);
+        let values = values_node(vec![output_column(101, "a"), output_column(102, "b")]);
+        let repeat = PhysicalPlanNode {
+            op: Operator::PhysicalRepeat(RepeatOp {
+                repeat_column_ref_list: vec![vec!["a".to_string()]],
+                repeat_column_ref_ids: vec![vec![ColumnId(101)]],
+                grouping_ids: vec![0, 1],
+                all_rollup_columns: vec!["a".to_string()],
+                all_rollup_column_ids: vec![ColumnId(101)],
+                grouping_key_aliases: vec![],
+                grouping_fn_args: vec![("__grouping_fn_0".to_string(), vec!["a".to_string()])],
+                grouping_fn_arg_ids: vec![vec![ColumnId(101)]],
+                grouping_fn_ids: vec![("__grouping_fn_0".to_string(), ColumnId(109))],
+            }),
+            children: vec![values],
+            stats: Statistics::default(),
+            output_columns: vec![output_column(101, "a"), output_column(102, "b")],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+        let distribution = PhysicalPlanNode {
+            op: Operator::PhysicalDistribution(PhysicalDistributionOp {
+                spec: DistributionSpec::Gather,
+            }),
+            children: vec![repeat],
+            stats: Statistics::default(),
+            output_columns: vec![output_column(101, "a"), output_column(102, "b")],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+        let mut node = PhysicalPlanNode {
+            op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+                mode: AggMode::Single,
+                group_by: vec![a, grouping],
+                aggregates: vec![
+                    ScalarAggregateSpec {
+                        name: "sum".to_string(),
+                        args: vec![a_plus_b],
+                        distinct: false,
+                        order_by: vec![],
+                    },
+                    ScalarAggregateSpec {
+                        name: "avg".to_string(),
+                        args: vec![a_plus_b],
+                        distinct: false,
+                        order_by: vec![],
+                    },
+                ],
+                output_columns: vec![output_column(201, "sum_ab"), output_column(202, "avg_ab")],
+                is_merge: vec![false, false],
+            }),
+            children: vec![distribution],
+            stats: Statistics::default(),
+            output_columns: vec![output_column(201, "sum_ab"), output_column(202, "avg_ab")],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+
+        super::rewrite_node(&mut node, &mut arena, &mut factory);
+
+        let Operator::PhysicalProject(cse_project) = &node.children[0].op else {
+            panic!("expected inserted CSE project below aggregate");
+        };
+        assert!(
+            cse_project
+                .items
+                .iter()
+                .any(|item| item.output_column_id == ColumnId(109)
+                    && item.output_name == "__grouping_fn_0"),
+            "CSE project must pass through Repeat-generated grouping virtual columns"
+        );
+        assert!(
+            node.children[0]
+                .output_columns
+                .iter()
+                .any(|column| column.column_id == ColumnId(109)
+                    && column.name == "__grouping_fn_0"),
+            "CSE project output scope must include Repeat grouping virtual columns"
+        );
     }
 
     #[test]
