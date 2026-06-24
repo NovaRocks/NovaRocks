@@ -21,7 +21,7 @@ use parquet::file::page_index::column_index::ColumnIndexMetaData;
 use parquet::file::page_index::offset_index::OffsetIndexMetaData;
 use std::ops::Range;
 
-use super::MinMaxPredicate;
+use super::{BoundVariantPathPruningPredicate, MinMaxPredicate};
 
 pub(crate) struct PageSelectionResult {
     pub(crate) selection: Option<RowSelection>,
@@ -42,10 +42,25 @@ struct PageRangeResult {
     pages_selected: usize,
 }
 
+enum PagePredicateRef<'a> {
+    Physical(&'a MinMaxPredicate),
+    Variant(&'a BoundVariantPathPruningPredicate),
+}
+
+impl<'a> PagePredicateRef<'a> {
+    fn predicate(&self) -> &'a MinMaxPredicate {
+        match self {
+            PagePredicateRef::Physical(predicate) => predicate,
+            PagePredicateRef::Variant(predicate) => &predicate.predicate,
+        }
+    }
+}
+
 pub(crate) fn build_row_selection_for_row_groups(
     metadata: &ParquetMetaData,
     row_groups: &[usize],
     min_max_predicates: &[MinMaxPredicate],
+    variant_predicates: &[BoundVariantPathPruningPredicate],
     columns: &[String],
     case_sensitive: bool,
 ) -> PageSelectionResult {
@@ -62,7 +77,7 @@ pub(crate) fn build_row_selection_for_row_groups(
         predicates_unsupported: 0,
     };
 
-    if min_max_predicates.is_empty() {
+    if min_max_predicates.is_empty() && variant_predicates.is_empty() {
         return result;
     }
 
@@ -99,30 +114,47 @@ pub(crate) fn build_row_selection_for_row_groups(
         let mut ranges: Vec<Range<usize>> = std::iter::once(0..rg_rows).collect();
         let mut any_supported = false;
 
-        for pred in min_max_predicates {
-            let col_idx_str = pred.column();
-            let Ok(col_idx) = col_idx_str.parse::<usize>() else {
-                result.predicates_unsupported += 1;
-                continue;
-            };
-            if col_idx >= columns.len() {
-                result.predicates_unsupported += 1;
-                continue;
-            }
-            let col_name = &columns[col_idx];
+        for pred_ref in min_max_predicates
+            .iter()
+            .map(PagePredicateRef::Physical)
+            .chain(variant_predicates.iter().map(PagePredicateRef::Variant))
+        {
+            let pred = pred_ref.predicate();
+            let col_chunk_idx = match pred_ref {
+                PagePredicateRef::Physical(_) => {
+                    let col_idx_str = pred.column();
+                    let Ok(col_idx) = col_idx_str.parse::<usize>() else {
+                        result.predicates_unsupported += 1;
+                        continue;
+                    };
+                    if col_idx >= columns.len() {
+                        result.predicates_unsupported += 1;
+                        continue;
+                    }
+                    let col_name = &columns[col_idx];
 
-            let col_chunk_idx = row_group.columns().iter().position(|c| {
-                let path_str = c.column_path().string();
-                if case_sensitive {
-                    path_str == *col_name
-                } else {
-                    path_str.eq_ignore_ascii_case(col_name)
+                    let col_chunk_idx = row_group.columns().iter().position(|c| {
+                        let path_str = c.column_path().string();
+                        if case_sensitive {
+                            path_str == *col_name
+                        } else {
+                            path_str.eq_ignore_ascii_case(col_name)
+                        }
+                    });
+
+                    let Some(col_chunk_idx) = col_chunk_idx else {
+                        result.predicates_unsupported += 1;
+                        continue;
+                    };
+                    col_chunk_idx
                 }
-            });
-
-            let Some(col_chunk_idx) = col_chunk_idx else {
-                result.predicates_unsupported += 1;
-                continue;
+                PagePredicateRef::Variant(predicate) => {
+                    if predicate.leaf_column_index >= row_group.columns().len() {
+                        result.predicates_unsupported += 1;
+                        continue;
+                    }
+                    predicate.leaf_column_index
+                }
             };
 
             let Some(rg_col_index) = column_index.get(rg_idx).and_then(|v| v.get(col_chunk_idx))
@@ -222,6 +254,19 @@ fn page_ranges_for_predicate(
     };
 
     match column_index {
+        ColumnIndexMetaData::BOOLEAN(index) => {
+            let v = predicate.value().as_bool()?;
+            for page_idx in 0..num_pages {
+                if index.is_null_page(page_idx) {
+                    continue;
+                }
+                let min = index.min_values()[page_idx];
+                let max = index.max_values()[page_idx];
+                if page_satisfies_predicate_bool(min, max, v, predicate) {
+                    push_page_range(page_idx);
+                }
+            }
+        }
         ColumnIndexMetaData::INT32(index) => {
             let v = predicate.value().as_i32()?;
             for page_idx in 0..num_pages {
@@ -282,6 +327,19 @@ fn page_ranges_for_predicate(
                 }
             }
         }
+        ColumnIndexMetaData::BYTE_ARRAY(index) => {
+            let v = predicate.value().as_bytes()?;
+            for page_idx in 0..num_pages {
+                if index.is_null_page(page_idx) {
+                    continue;
+                }
+                let min = index.min_value(page_idx)?;
+                let max = index.max_value(page_idx)?;
+                if page_satisfies_predicate_bytes(min, max, v, predicate) {
+                    push_page_range(page_idx);
+                }
+            }
+        }
         _ => return None,
     }
 
@@ -331,6 +389,16 @@ fn intersect_ranges(a: &[Range<usize>], b: &[Range<usize>]) -> Vec<Range<usize>>
     out
 }
 
+fn page_satisfies_predicate_bool(min: bool, max: bool, v: bool, pred: &MinMaxPredicate) -> bool {
+    match pred {
+        MinMaxPredicate::Le { .. } => min <= v,
+        MinMaxPredicate::Ge { .. } => max >= v,
+        MinMaxPredicate::Lt { .. } => min < v,
+        MinMaxPredicate::Gt { .. } => max > v,
+        MinMaxPredicate::Eq { .. } => min <= v && max >= v,
+    }
+}
+
 fn page_satisfies_predicate_i32(min: i32, max: i32, v: i32, pred: &MinMaxPredicate) -> bool {
     match pred {
         MinMaxPredicate::Le { .. } => min <= v,
@@ -368,5 +436,173 @@ fn page_satisfies_predicate_f64(min: f64, max: f64, v: f64, pred: &MinMaxPredica
         MinMaxPredicate::Lt { .. } => min < v,
         MinMaxPredicate::Gt { .. } => max > v,
         MinMaxPredicate::Eq { .. } => min <= v && max >= v,
+    }
+}
+
+fn page_satisfies_predicate_bytes(
+    min: &[u8],
+    max: &[u8],
+    v: &[u8],
+    pred: &MinMaxPredicate,
+) -> bool {
+    match pred {
+        MinMaxPredicate::Le { .. } => min <= v,
+        MinMaxPredicate::Ge { .. } => max >= v,
+        MinMaxPredicate::Lt { .. } => min < v,
+        MinMaxPredicate::Gt { .. } => max > v,
+        MinMaxPredicate::Eq { .. } => min <= v && max >= v,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::{EnabledStatistics, WriterProperties};
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    use parquet::file::serialized_reader::ReadOptionsBuilder;
+
+    use crate::formats::parquet::{BoundVariantPathPruningPredicate, MinMaxPredicateValue};
+
+    use super::*;
+
+    fn page_index_metadata(field: Field, array: ArrayRef, rows_per_page: usize) -> ParquetMetaData {
+        let row_count = array.len();
+        let schema = Arc::new(Schema::new(vec![field]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![array]).expect("batch");
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(row_count))
+            .set_write_batch_size(rows_per_page)
+            .set_data_page_row_count_limit(rows_per_page)
+            .set_data_page_size_limit(1)
+            .set_dictionary_enabled(false)
+            .set_statistics_enabled(EnabledStatistics::Page)
+            .build();
+
+        let mut buffer = Vec::new();
+        {
+            let cursor = Cursor::new(&mut buffer);
+            let mut writer =
+                ArrowWriter::try_new(cursor, schema, Some(props)).expect("parquet writer");
+            writer.write(&batch).expect("write parquet batch");
+            writer.close().expect("close parquet writer");
+        }
+
+        let options = ReadOptionsBuilder::new().with_page_index().build();
+        let reader = SerializedFileReader::new_with_options(bytes::Bytes::from(buffer), options)
+            .expect("metadata reader");
+        reader.metadata().clone()
+    }
+
+    fn bound_variant_gt_i64(value: i64) -> BoundVariantPathPruningPredicate {
+        BoundVariantPathPruningPredicate {
+            leaf_column_index: 0,
+            leaf_column_path: "payload.typed_value.a.typed_value".to_string(),
+            requested_type: DataType::Int64,
+            predicate: MinMaxPredicate::Gt {
+                column: "__nr_var_payload_a".to_string(),
+                value: MinMaxPredicateValue::Int64(value),
+            },
+        }
+    }
+
+    #[test]
+    fn variant_page_selection_uses_bound_typed_leaf_page_index() {
+        let metadata = page_index_metadata(
+            Field::new("payload.typed_value.a.typed_value", DataType::Int64, true),
+            Arc::new(Int64Array::from(vec![1, 2, 3, 10, 11, 12])) as ArrayRef,
+            1,
+        );
+        let predicate = bound_variant_gt_i64(5);
+
+        let selection =
+            build_row_selection_for_row_groups(&metadata, &[0], &[], &[predicate], &[], true);
+
+        assert_eq!(selection.rows_total, 6);
+        assert_eq!(selection.rows_selected, 3);
+        assert_eq!(selection.pages_total, 6);
+        assert_eq!(selection.pages_selected, 3);
+        assert_eq!(selection.pages_pruned, 3);
+        assert_eq!(selection.predicates_unsupported, 0);
+        assert!(selection.selection.is_some());
+    }
+
+    #[test]
+    fn page_selection_supports_boolean_and_utf8_min_max() {
+        let bool_metadata = page_index_metadata(
+            Field::new("flag", DataType::Boolean, true),
+            Arc::new(BooleanArray::from(vec![
+                false, false, false, true, true, true,
+            ])) as ArrayRef,
+            1,
+        );
+        let bool_selection = build_row_selection_for_row_groups(
+            &bool_metadata,
+            &[0],
+            &[MinMaxPredicate::Eq {
+                column: "0".to_string(),
+                value: MinMaxPredicateValue::Boolean(true),
+            }],
+            &[],
+            &["flag".to_string()],
+            true,
+        );
+
+        assert_eq!(bool_selection.rows_total, 6);
+        assert_eq!(bool_selection.rows_selected, 3);
+        assert_eq!(bool_selection.pages_total, 6);
+        assert_eq!(bool_selection.pages_selected, 3);
+        assert_eq!(bool_selection.predicates_unsupported, 0);
+        assert!(bool_selection.selection.is_some());
+
+        let string_metadata = page_index_metadata(
+            Field::new("name", DataType::Utf8, true),
+            Arc::new(StringArray::from(vec![
+                "apple", "banana", "cat", "yak", "zebra", "zoo",
+            ])) as ArrayRef,
+            1,
+        );
+        let string_selection = build_row_selection_for_row_groups(
+            &string_metadata,
+            &[0],
+            &[MinMaxPredicate::Ge {
+                column: "0".to_string(),
+                value: MinMaxPredicateValue::ByteArray(b"m".to_vec()),
+            }],
+            &[],
+            &["name".to_string()],
+            true,
+        );
+
+        assert_eq!(string_selection.rows_total, 6);
+        assert_eq!(string_selection.rows_selected, 3);
+        assert_eq!(string_selection.pages_total, 6);
+        assert_eq!(string_selection.pages_selected, 3);
+        assert_eq!(string_selection.predicates_unsupported, 0);
+        assert!(string_selection.selection.is_some());
+    }
+
+    #[test]
+    fn variant_page_selection_ignores_out_of_range_leaf_column_index() {
+        let metadata = page_index_metadata(
+            Field::new("payload.typed_value.a.typed_value", DataType::Int64, true),
+            Arc::new(Int64Array::from(vec![1, 2, 3, 10, 11, 12])) as ArrayRef,
+            1,
+        );
+        let mut predicate = bound_variant_gt_i64(5);
+        predicate.leaf_column_index = 9;
+
+        let selection =
+            build_row_selection_for_row_groups(&metadata, &[0], &[], &[predicate], &[], true);
+
+        assert_eq!(selection.rows_total, 6);
+        assert_eq!(selection.rows_selected, 6);
+        assert_eq!(selection.predicates_unsupported, 1);
+        assert!(selection.selection.is_none());
     }
 }

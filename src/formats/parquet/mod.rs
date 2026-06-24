@@ -516,6 +516,7 @@ impl ParquetScanIter {
         row_groups: &[usize],
         projected_columns: &[String],
         predicates: &[MinMaxPredicate],
+        variant_predicates: &[BoundVariantPathPruningPredicate],
         explicit_row_selection: Option<RowSelection>,
         apply_page_selection: bool,
     ) -> Result<Option<ParquetRecordBatchReader>, String> {
@@ -553,11 +554,15 @@ impl ParquetScanIter {
 
         if let Some(selection) = explicit_row_selection {
             builder = builder.with_row_selection(selection);
-        } else if apply_page_selection && self.cfg.enable_page_index && !predicates.is_empty() {
+        } else if apply_page_selection
+            && self.cfg.enable_page_index
+            && (!predicates.is_empty() || !variant_predicates.is_empty())
+        {
             let selection = build_row_selection_for_row_groups(
                 metadata,
                 row_groups,
                 predicates,
+                variant_predicates,
                 projected_columns,
                 self.cfg.case_sensitive,
             );
@@ -580,6 +585,7 @@ impl ParquetScanIter {
         metadata: &Arc<ParquetMetaData>,
         row_groups: &[usize],
         predicates: &[MinMaxPredicate],
+        variant_predicates: &[BoundVariantPathPruningPredicate],
     ) -> Result<Option<ParquetRecordBatchReader>, String> {
         self.build_projected_parquet_reader(
             builder,
@@ -587,6 +593,7 @@ impl ParquetScanIter {
             row_groups,
             &self.cfg.columns,
             predicates,
+            variant_predicates,
             None,
             true,
         )
@@ -647,6 +654,7 @@ impl ParquetScanIter {
         metadata: &Arc<ParquetMetaData>,
         row_groups: &[usize],
         predicates: &[MinMaxPredicate],
+        variant_predicates: &[BoundVariantPathPruningPredicate],
     ) -> Result<DelayedReaderDecision, String> {
         self.record_delayed_decision("ParquetDelayedDecisionTry");
         let Some(plan) =
@@ -663,6 +671,7 @@ impl ParquetScanIter {
             metadata,
             row_groups,
             predicates,
+            variant_predicates,
             &self.cfg.columns,
             self.cfg.case_sensitive,
         );
@@ -694,6 +703,7 @@ impl ParquetScanIter {
             row_groups,
             &plan.active_columns,
             predicates,
+            &[],
             Some(active_selection),
             false,
         )?
@@ -706,6 +716,7 @@ impl ParquetScanIter {
             row_groups,
             &plan.lazy_columns,
             predicates,
+            &[],
             Some(lazy_selection),
             false,
         )?
@@ -1025,6 +1036,7 @@ impl ParquetScanIter {
                 &metadata,
                 &row_groups,
                 &predicates.physical,
+                &bound_variant_predicates,
             )? {
                 DelayedReaderDecision::Use(reader) => {
                     let reader_init_ns = reader_init_start.elapsed().as_nanos();
@@ -1052,8 +1064,13 @@ impl ParquetScanIter {
                 DelayedReaderDecision::Fallback => {}
             }
 
-            let maybe_reader =
-                self.build_parquet_reader(builder, &metadata, &row_groups, &predicates.physical)?;
+            let maybe_reader = self.build_parquet_reader(
+                builder,
+                &metadata,
+                &row_groups,
+                &predicates.physical,
+                &bound_variant_predicates,
+            )?;
             let reader_init_ns = reader_init_start.elapsed().as_nanos();
             if let Some(profile) = self.profile.as_ref() {
                 record_reader_init(profile, reader_init_ns);
