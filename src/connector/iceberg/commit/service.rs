@@ -214,8 +214,9 @@ impl From<CommitServiceError> for crate::common::engine_error::EngineError {
 
 pub fn classify_commit_error(err: &str) -> CommitFailureKind {
     let lower = err.to_lowercase();
-    if lower.contains("committed but")
-        && (lower.contains("not visible") || lower.contains("snapshot id"))
+    if (lower.contains("committed but")
+        && (lower.contains("not visible") || lower.contains("snapshot id")))
+        || (lower.contains("known committed") && lower.contains("finalization failed"))
     {
         return CommitFailureKind::FinalizeFailedKnownCommitted;
     }
@@ -330,6 +331,12 @@ mod tests {
         );
         assert_eq!(
             classify_commit_error("RowDelta committed but snapshot id 123 was not captured"),
+            CommitFailureKind::FinalizeFailedKnownCommitted
+        );
+        assert_eq!(
+            classify_commit_error(
+                "iceberg write operation op-1: metadata commit succeeded (snapshot 99, known committed) but finalization failed; do not retry the write"
+            ),
             CommitFailureKind::FinalizeFailedKnownCommitted
         );
     }

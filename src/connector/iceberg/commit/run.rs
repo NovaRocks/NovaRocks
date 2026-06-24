@@ -126,43 +126,58 @@ pub async fn run_iceberg_commit_typed(
             collector.mark_committed();
             Ok(outcome)
         }
-        Err(commit_err) => match classify_commit_error(&commit_err) {
-            CommitFailureKind::Unknown => {
-                let evidence = RecoveryEvidence::from_collector(&collector);
-                tracing::warn!(
-                    op_kind = ?collector.op_kind,
-                    table = %collector.table_ident,
-                    base_snapshot_id = ?collector.base_snapshot_id,
-                    staging_dir = collector.staging_dir,
-                    "iceberg commit unknown — leaving all staged files for manual review: {commit_err}"
-                );
-                Err(CommitServiceError::unknown(commit_err, evidence))
+        Err(commit_err) => {
+            Err(
+                handle_commit_error(commit_err, &collector, &fs, cleanup_path_mapper.as_ref())
+                    .await,
+            )
+        }
+    }
+}
+
+async fn handle_commit_error(
+    commit_err: String,
+    collector: &Arc<IcebergCommitCollector>,
+    fs: &Operator,
+    cleanup_path_mapper: Option<&CleanupPathMapper>,
+) -> CommitServiceError {
+    match classify_commit_error(&commit_err) {
+        CommitFailureKind::Unknown => {
+            let evidence = RecoveryEvidence::from_collector(collector);
+            tracing::warn!(
+                op_kind = ?collector.op_kind,
+                table = %collector.table_ident,
+                base_snapshot_id = ?collector.base_snapshot_id,
+                staging_dir = collector.staging_dir,
+                "iceberg commit unknown — leaving all staged files for manual review: {commit_err}"
+            );
+            CommitServiceError::unknown(commit_err, evidence)
+        }
+        CommitFailureKind::FinalizeFailedKnownCommitted => {
+            collector.mark_committed();
+            CommitServiceError::finalize_failed_known_committed(
+                None,
+                commit_err,
+                RecoveryEvidence::from_collector(collector),
+            )
+        }
+        CommitFailureKind::KnownUncommitted => {
+            let cleanup_errors = if let Some(mapper) = cleanup_path_mapper {
+                collector
+                    .abort_log
+                    .cleanup_with_path_mapper(fs, |path| mapper(path))
+                    .await
+            } else {
+                collector.abort_log.cleanup(fs).await
+            };
+            for e in &cleanup_errors {
+                tracing::warn!(path = %e.path, source = ?e.source, "abort cleanup error");
             }
-            CommitFailureKind::FinalizeFailedKnownCommitted => {
-                Err(CommitServiceError::finalize_failed_known_committed(
-                    None,
-                    commit_err,
-                    RecoveryEvidence::from_collector(&collector),
-                ))
-            }
-            CommitFailureKind::KnownUncommitted => {
-                let cleanup_errors = if let Some(mapper) = cleanup_path_mapper {
-                    collector
-                        .abort_log
-                        .cleanup_with_path_mapper(&fs, |path| mapper(path))
-                        .await
-                } else {
-                    collector.abort_log.cleanup(&fs).await
-                };
-                for e in &cleanup_errors {
-                    tracing::warn!(path = %e.path, source = ?e.source, "abort cleanup error");
-                }
-                Err(CommitServiceError::known_uncommitted(
-                    commit_err,
-                    CleanupAttempt::from_cleanup_errors(&cleanup_errors),
-                ))
-            }
-        },
+            CommitServiceError::known_uncommitted(
+                commit_err,
+                CleanupAttempt::from_cleanup_errors(&cleanup_errors),
+            )
+        }
     }
 }
 
@@ -268,5 +283,25 @@ mod tests {
             rewrite_manifests_err,
             CommitServiceError::InvalidInput { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn finalize_known_committed_error_marks_collector_committed() {
+        let input = input_for_op(empty_v3_iceberg_table().await, CommitOpKind::FastAppend);
+        let collector = input.collector.clone();
+
+        let err = handle_commit_error(
+            "fast_append committed but new snapshot not visible".to_string(),
+            &collector,
+            &input.fs,
+            input.cleanup_path_mapper.as_ref(),
+        )
+        .await;
+
+        assert!(matches!(
+            err,
+            CommitServiceError::FinalizeFailedKnownCommitted { .. }
+        ));
+        assert!(collector.is_committed());
     }
 }
