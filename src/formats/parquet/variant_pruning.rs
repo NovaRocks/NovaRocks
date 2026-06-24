@@ -58,6 +58,12 @@ pub(crate) fn bind_variant_path_pruning_predicates(
         else {
             continue;
         };
+        if predicate.source_slot_id != spec.source_slot_id
+            || predicate.canonical_path != spec.canonical_path
+            || predicate.requested_type != spec.requested_type
+        {
+            continue;
+        }
         let Some(source_field_id) = predicate.source_field_id else {
             continue;
         };
@@ -142,7 +148,8 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::array::{
-        ArrayRef, Int64Array, StructArray, Time64MicrosecondArray, TimestampMicrosecondArray,
+        ArrayRef, BooleanArray, Date32Array, Float64Array, Int64Array, StringArray, StructArray,
+        Time64MicrosecondArray, TimestampMicrosecondArray,
     };
     use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
     use arrow::record_batch::RecordBatch;
@@ -162,20 +169,32 @@ mod tests {
         Field::new(name, data_type, nullable).with_metadata(field_id_meta(field_id))
     }
 
-    fn variant_path_spec(source_field_id: Option<i32>) -> VariantPathSpec {
+    fn variant_path_spec_for(
+        source_field_id: Option<i32>,
+        canonical_path: &str,
+        requested_type: DataType,
+    ) -> VariantPathSpec {
+        let output_field_name = format!(
+            "__nr_var_payload_{}",
+            canonical_path.replace(['$', '.'], "")
+        );
         VariantPathSpec {
             source_slot_id: SlotId::new(1),
             source_read_slot_id: SlotId::new(1),
             output_slot_id: SlotId::new(2),
             source_field_id,
             source_name: "payload_logical".to_string(),
-            output_name: "__nr_var_payload_a".to_string(),
+            output_name: output_field_name.clone(),
             source_field: Field::new("payload_logical", DataType::LargeBinary, true),
-            output_field: Field::new("__nr_var_payload_a", DataType::Int64, true),
-            canonical_path: "$.a".to_string(),
-            requested_type: DataType::Int64,
+            output_field: Field::new(output_field_name, requested_type.clone(), true),
+            canonical_path: canonical_path.to_string(),
+            requested_type,
             strict: true,
         }
+    }
+
+    fn variant_path_spec(source_field_id: Option<i32>) -> VariantPathSpec {
+        variant_path_spec_for(source_field_id, "$.a", DataType::Int64)
     }
 
     fn variant_path_predicate(
@@ -200,16 +219,41 @@ mod tests {
         StructArray::try_new(Fields::from(fields), columns, None).expect("struct array")
     }
 
-    fn variant_metadata_with_leaf(leaf_field: Field, leaf_array: ArrayRef) -> ParquetMetaData {
-        let a_node = Arc::new(struct_array(vec![leaf_field], vec![leaf_array])) as ArrayRef;
-        let a_field = Field::new("a", a_node.data_type().clone(), true);
+    fn variant_metadata_with_leaf_path(
+        path: &[&str],
+        leaf_field: Field,
+        leaf_array: ArrayRef,
+        root_field_id: i32,
+    ) -> ParquetMetaData {
+        assert!(!path.is_empty());
 
-        let root_typed = Arc::new(struct_array(vec![a_field], vec![a_node])) as ArrayRef;
-        let root_typed_field = Field::new("typed_value", root_typed.data_type().clone(), true);
+        let mut typed_value_array = leaf_array;
+        let mut typed_value_field = leaf_field;
+        for (index, key) in path.iter().rev().enumerate() {
+            let key_node = Arc::new(struct_array(
+                vec![typed_value_field.clone()],
+                vec![typed_value_array],
+            )) as ArrayRef;
+            let key_field = Field::new(*key, key_node.data_type().clone(), true);
+            typed_value_array = Arc::new(struct_array(vec![key_field], vec![key_node])) as ArrayRef;
+            if index + 1 < path.len() {
+                typed_value_field =
+                    Field::new("typed_value", typed_value_array.data_type().clone(), true);
+            }
+        }
 
-        let payload = Arc::new(struct_array(vec![root_typed_field], vec![root_typed])) as ArrayRef;
-        let payload_field =
-            field_with_id("payload_physical", payload.data_type().clone(), true, 10);
+        let root_typed_field =
+            Field::new("typed_value", typed_value_array.data_type().clone(), true);
+        let payload = Arc::new(struct_array(
+            vec![root_typed_field],
+            vec![typed_value_array],
+        )) as ArrayRef;
+        let payload_field = field_with_id(
+            "payload_physical",
+            payload.data_type().clone(),
+            true,
+            root_field_id,
+        );
         let schema = Arc::new(Schema::new(vec![payload_field]));
         let batch = RecordBatch::try_new(Arc::clone(&schema), vec![payload]).expect("batch");
 
@@ -223,6 +267,10 @@ mod tests {
         let reader =
             SerializedFileReader::new(bytes::Bytes::from(buffer)).expect("metadata reader");
         reader.metadata().clone()
+    }
+
+    fn variant_metadata_with_leaf(leaf_field: Field, leaf_array: ArrayRef) -> ParquetMetaData {
+        variant_metadata_with_leaf_path(&["a"], leaf_field, leaf_array, 10)
     }
 
     fn variant_metadata() -> ParquetMetaData {
@@ -244,6 +292,84 @@ mod tests {
         assert_eq!(
             bound[0].leaf_column_path,
             "payload_physical.typed_value.a.typed_value"
+        );
+        assert_eq!(bound[0].requested_type, DataType::Int64);
+        assert_eq!(bound[0].predicate, predicate.predicate);
+    }
+
+    #[test]
+    fn variant_pruning_binds_all_pr5_whitelisted_leaf_types() {
+        let cases: Vec<(&str, DataType, Field, ArrayRef)> = vec![
+            (
+                "boolean",
+                DataType::Boolean,
+                Field::new("typed_value", DataType::Boolean, true),
+                Arc::new(BooleanArray::from(vec![Some(true)])),
+            ),
+            (
+                "int64",
+                DataType::Int64,
+                Field::new("typed_value", DataType::Int64, true),
+                Arc::new(Int64Array::from(vec![Some(7)])),
+            ),
+            (
+                "float64",
+                DataType::Float64,
+                Field::new("typed_value", DataType::Float64, true),
+                Arc::new(Float64Array::from(vec![Some(7.5)])),
+            ),
+            (
+                "utf8",
+                DataType::Utf8,
+                Field::new("typed_value", DataType::Utf8, true),
+                Arc::new(StringArray::from(vec![Some("value")])),
+            ),
+            (
+                "date32",
+                DataType::Date32,
+                Field::new("typed_value", DataType::Date32, true),
+                Arc::new(Date32Array::from(vec![Some(7)])),
+            ),
+        ];
+
+        for (case_name, requested_type, leaf_field, leaf_array) in cases {
+            let metadata = variant_metadata_with_leaf(leaf_field, leaf_array);
+            let specs = vec![variant_path_spec_for(
+                Some(10),
+                "$.a",
+                requested_type.clone(),
+            )];
+            let predicate = variant_path_predicate(Some(10), "$.a", requested_type.clone());
+            let bound =
+                bind_variant_path_pruning_predicates(&metadata, &specs, &[predicate.clone()]);
+
+            assert_eq!(bound.len(), 1, "{case_name}");
+            assert_eq!(
+                bound[0].leaf_column_path, "payload_physical.typed_value.a.typed_value",
+                "{case_name}"
+            );
+            assert_eq!(bound[0].requested_type, requested_type, "{case_name}");
+            assert_eq!(bound[0].predicate, predicate.predicate, "{case_name}");
+        }
+    }
+
+    #[test]
+    fn variant_pruning_binds_multi_key_typed_leaf_by_exact_path() {
+        let metadata = variant_metadata_with_leaf_path(
+            &["a", "b"],
+            Field::new("typed_value", DataType::Int64, true),
+            Arc::new(Int64Array::from(vec![Some(7)])),
+            10,
+        );
+        let specs = vec![variant_path_spec_for(Some(10), "$.a.b", DataType::Int64)];
+        let predicate = variant_path_predicate(Some(10), "$.a.b", DataType::Int64);
+        let bound = bind_variant_path_pruning_predicates(&metadata, &specs, &[predicate.clone()]);
+
+        assert_eq!(bound.len(), 1);
+        assert_eq!(bound[0].leaf_column_index, 0);
+        assert_eq!(
+            bound[0].leaf_column_path,
+            "payload_physical.typed_value.a.typed_value.b.typed_value"
         );
         assert_eq!(bound[0].requested_type, DataType::Int64);
         assert_eq!(bound[0].predicate, predicate.predicate);
@@ -278,6 +404,60 @@ mod tests {
         );
         let bound =
             bind_variant_path_pruning_predicates(&metadata, &specs, &[array_path, timestamp_type]);
+
+        assert!(bound.is_empty());
+    }
+
+    #[test]
+    fn variant_pruning_does_not_bind_inconsistent_predicate_metadata() {
+        let metadata = variant_metadata();
+
+        let mut source_slot_mismatch = variant_path_predicate(Some(10), "$.a", DataType::Int64);
+        source_slot_mismatch.source_slot_id = SlotId::new(99);
+        let bound = bind_variant_path_pruning_predicates(
+            &metadata,
+            &[variant_path_spec(Some(10))],
+            &[source_slot_mismatch],
+        );
+        assert!(bound.is_empty(), "source slot mismatch");
+
+        let mut path_mismatch_spec = variant_path_spec(Some(10));
+        path_mismatch_spec.canonical_path = "$.b".to_string();
+        let path_mismatch = variant_path_predicate(Some(10), "$.a", DataType::Int64);
+        let bound = bind_variant_path_pruning_predicates(
+            &metadata,
+            &[path_mismatch_spec],
+            &[path_mismatch],
+        );
+        assert!(bound.is_empty(), "canonical path mismatch");
+
+        let float_metadata = variant_metadata_with_leaf(
+            Field::new("typed_value", DataType::Float64, true),
+            Arc::new(Float64Array::from(vec![Some(7.5)])),
+        );
+        let mut type_mismatch_spec = variant_path_spec(Some(10));
+        type_mismatch_spec.output_field = Field::new("__nr_var_payload_a", DataType::Int64, true);
+        type_mismatch_spec.requested_type = DataType::Int64;
+        let type_mismatch = variant_path_predicate(Some(10), "$.a", DataType::Float64);
+        let bound = bind_variant_path_pruning_predicates(
+            &float_metadata,
+            &[type_mismatch_spec],
+            &[type_mismatch],
+        );
+        assert!(bound.is_empty(), "requested type mismatch");
+    }
+
+    #[test]
+    fn variant_pruning_does_not_bind_when_root_field_id_differs_even_if_name_and_path_match() {
+        let metadata = variant_metadata_with_leaf_path(
+            &["a"],
+            Field::new("typed_value", DataType::Int64, true),
+            Arc::new(Int64Array::from(vec![Some(7)])),
+            11,
+        );
+        let specs = vec![variant_path_spec(Some(10))];
+        let predicate = variant_path_predicate(Some(10), "$.a", DataType::Int64);
+        let bound = bind_variant_path_pruning_predicates(&metadata, &specs, &[predicate]);
 
         assert!(bound.is_empty());
     }

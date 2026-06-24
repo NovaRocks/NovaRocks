@@ -65,6 +65,7 @@ use page_selection::build_row_selection_for_row_groups;
 pub(crate) use reader::ParquetCachedReader;
 use row_group_selector::select_row_groups_for_range;
 pub use variant_pruning::VariantPathPruningPredicate;
+// Staged for upcoming row-group and page selector integration.
 #[allow(unused_imports)]
 pub(crate) use variant_pruning::{
     BoundVariantPathPruningPredicate, bind_variant_path_pruning_predicates,
