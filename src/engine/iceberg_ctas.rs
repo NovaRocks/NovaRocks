@@ -22,7 +22,7 @@
 //!   A. Plan the SELECT and infer the iceberg schema.
 //!   B. Catalog `create_table` (atomic point #1).
 //!   C. Drive IcebergSinkPlan over the planned SELECT (atomic point #2).
-//!   D. `run_iceberg_commit(FastAppendCommit)` (atomic point #3).
+//!   D. `run_iceberg_commit_typed(FastAppendCommit)` (atomic point #3).
 //!   E. On C / D failure, drop_table to roll back; on drop_table failure,
 //!      return the documented combined error.
 //!
