@@ -6488,6 +6488,45 @@ fn record_iceberg_mv_repartition_operation_intent(
     Ok(())
 }
 
+fn decode_mv_repartition_operation_intent(
+    operation: &StoredIcebergOperation,
+) -> Result<Option<MvRepartitionOperationIntent>, String> {
+    if operation.operation_subkind.as_deref() != Some("MV_REPARTITION") {
+        return Ok(None);
+    }
+    let Some(commit_request) = operation.commit_request.as_deref() else {
+        return Err(format!(
+            "iceberg MV repartition operation {} is missing repartition intent",
+            operation.operation_id
+        ));
+    };
+    serde_json::from_str(commit_request)
+        .map(Some)
+        .map_err(|e| format!("decode iceberg MV repartition operation intent failed: {e}"))
+}
+
+fn load_repartition_operation_intent_for_recovery(
+    state: &Arc<StandaloneState>,
+    refresh: &StoredMvRefresh,
+) -> Result<Option<MvRepartitionOperationIntent>, String> {
+    let Some(operation_id) = refresh.operation_id else {
+        return Ok(None);
+    };
+    let provider = state
+        .metadata_provider
+        .as_ref()
+        .ok_or_else(|| "metadata provider required for iceberg mv recovery".to_string())?;
+    let read = provider
+        .begin_read()
+        .map_err(|e| format!("open iceberg mv recovery operation read failed: {e}"))?;
+    let operation = state
+        .iceberg_operation_repo
+        .load_operation(read.as_ref(), operation_id)
+        .map_err(|e| format!("load iceberg mv recovery operation failed: {e}"))?
+        .ok_or_else(|| format!("iceberg operation {operation_id} not found"))?;
+    decode_mv_repartition_operation_intent(&operation)
+}
+
 fn transition_iceberg_mv_operation_to_committing(
     state: &Arc<StandaloneState>,
     txn: &mut dyn crate::meta::MetaWriteTxn,
@@ -6716,76 +6755,43 @@ fn record_iceberg_mv_operation_finalize_failure(
     Ok(())
 }
 
-fn restore_repartition_default_spec_before_recovery_abort(
-    state: &Arc<StandaloneState>,
-    refresh: &StoredMvRefresh,
+fn restore_repartition_default_spec_from_intent(
     target: &IcebergMvTarget,
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     table: &iceberg::table::Table,
+    intent: &MvRepartitionOperationIntent,
 ) -> Result<(), String> {
-    let Some(operation_id) = refresh.operation_id else {
-        return Ok(());
-    };
-    let provider = state.metadata_provider.as_ref().ok_or_else(|| {
-        "metadata provider required for iceberg mv repartition recovery".to_string()
-    })?;
-    let read = provider.begin_read().map_err(|e| {
-        format!("open iceberg mv repartition recovery read transaction failed: {e}")
-    })?;
-    let operation = state
-        .iceberg_operation_repo
-        .load_operation(read.as_ref(), operation_id)
-        .map_err(|e| format!("load iceberg mv repartition operation for recovery failed: {e}"))?
-        .ok_or_else(|| format!("iceberg operation {operation_id} not found"))?;
-    drop(read);
-    if operation.operation_subkind.as_deref() != Some("MV_REPARTITION") {
-        return Ok(());
-    }
-    let Some(previous_default_spec_id) =
-        previous_default_spec_id_from_repartition_artifacts(&operation)?
-    else {
+    let Some(old_contract) = intent.old_partition_contract.as_ref() else {
         return Ok(());
     };
     let current_default_spec_id = table.metadata().default_partition_spec_id();
-    if current_default_spec_id == previous_default_spec_id {
+    if current_default_spec_id != intent.target_new_default_spec_id {
         return Ok(());
     }
     crate::connector::iceberg::catalog::registry::set_default_partition_spec_id(
         entry,
         &target.namespace,
         &target.table,
-        current_default_spec_id,
-        previous_default_spec_id,
+        intent.target_new_default_spec_id,
+        old_contract.target_spec_id,
     )
-    .map_err(|e| format!("restore iceberg MV repartition default spec during recovery failed: {e}"))
+    .map_err(|e| {
+        format!("restore iceberg MV repartition default spec from recovery intent failed: {e}")
+    })
     .map(|_| ())
 }
 
-fn previous_default_spec_id_from_repartition_artifacts(
-    operation: &StoredIcebergOperation,
-) -> Result<Option<i32>, String> {
-    for artifact in &operation.staged_artifacts {
-        if let Some(raw) = artifact.strip_prefix("previous_default_spec_id:") {
-            return raw.parse::<i32>().map(Some).map_err(|e| {
-                format!(
-                    "decode previous iceberg mv repartition default spec id for operation {} failed: {e}",
-                    operation.operation_id
-                )
-            });
-        }
-    }
-    for artifact in &operation.staged_artifacts {
-        if let Some(raw) = artifact.strip_prefix("previous_partition_contract:") {
-            let previous: MvPartitionContract = serde_json::from_str(raw).map_err(|e| {
-                format!(
-                    "decode previous iceberg mv repartition partition contract for operation {} failed: {e}",
-                    operation.operation_id
-                )
-            })?;
-            return Ok(Some(previous.target_spec_id));
-        }
-    }
-    Ok(None)
+fn restore_repartition_default_spec_from_recovery_intent(
+    state: &Arc<StandaloneState>,
+    refresh: &StoredMvRefresh,
+    target: &IcebergMvTarget,
+    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    table: &iceberg::table::Table,
+) -> Result<(), String> {
+    let Some(intent) = load_repartition_operation_intent_for_recovery(state, refresh)? else {
+        return Ok(());
+    };
+    restore_repartition_default_spec_from_intent(target, entry, table, &intent)
 }
 
 fn reconcile_iceberg_mv_refresh(
@@ -6812,7 +6818,7 @@ fn reconcile_iceberg_mv_refresh(
             if main == refresh.expected_main_snapshot_id {
                 match staging {
                     None => {
-                        restore_repartition_default_spec_before_recovery_abort(
+                        restore_repartition_default_spec_from_recovery_intent(
                             state, &refresh, target, entry, table,
                         )?;
                         mark_iceberg_mv_refresh_aborted(state, refresh.refresh_id)?;
@@ -6825,6 +6831,9 @@ fn reconcile_iceberg_mv_refresh(
                             &refresh,
                         )? =>
                     {
+                        restore_repartition_default_spec_from_recovery_intent(
+                            state, &refresh, target, entry, table,
+                        )?;
                         drop_iceberg_mv_staging_branch(state, target, entry, staging_branch)?;
                         mark_iceberg_mv_refresh_aborted(state, refresh.refresh_id)?;
                         Ok(())
@@ -6854,6 +6863,9 @@ fn reconcile_iceberg_mv_refresh(
                 && staging.is_none()
                 && refresh.staging_snapshot_id.is_some()
             {
+                restore_repartition_default_spec_from_recovery_intent(
+                    state, &refresh, target, entry, table,
+                )?;
                 mark_iceberg_mv_refresh_aborted(state, refresh.refresh_id)?;
                 return Ok(());
             }
@@ -6867,6 +6879,9 @@ fn reconcile_iceberg_mv_refresh(
                     .transpose()?
                     == Some(true)
             {
+                restore_repartition_default_spec_from_recovery_intent(
+                    state, &refresh, target, entry, table,
+                )?;
                 drop_iceberg_mv_staging_branch(state, target, entry, staging_branch)?;
                 mark_iceberg_mv_refresh_aborted(state, refresh.refresh_id)?;
                 return Ok(());
@@ -6989,6 +7004,18 @@ fn finalize_recovered_iceberg_mv_refresh(
             refresh.refresh_id
         )
     })?;
+    if let Some(intent) = load_repartition_operation_intent_for_recovery(state, refresh)? {
+        return finalize_iceberg_mv_refresh_with_partition_contract(
+            state,
+            refresh.refresh_id,
+            rows,
+            refresh.target_snapshots.clone(),
+            refresh.base_table_uuids.clone(),
+            target_snapshot_id,
+            &intent.new_partition_contract,
+            IcebergMvPartitionStateFinalize::Clear,
+        );
+    }
     finalize_iceberg_mv_refresh(
         state,
         refresh.refresh_id,
@@ -16284,7 +16311,7 @@ mod tests {
     }
 
     #[test]
-    fn recover_repartition_intent_created_without_staging_restores_default_spec() {
+    fn recover_repartition_intent_created_without_staging_requires_operation_intent() {
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
         create_base_table_with_rows(&env.state, "ice", "sales", "orders", &[(1, "alfa")]);
         let stmt = parse_create_mv(
@@ -16361,15 +16388,179 @@ mod tests {
             "name_truncate_2"
         );
 
+        let err = recover_iceberg_mv_refreshes(&env.state)
+            .expect_err("missing repartition intent should fail recovery");
+        assert!(
+            err.contains("missing repartition intent"),
+            "unexpected recovery error: {err}"
+        );
+
+        let after =
+            crate::connector::iceberg::catalog::load_table(&target_entry, "analytics", "mv_orders")
+                .expect("load target after recovery");
+        let after_spec = after.table.metadata().default_partition_spec();
+        assert_eq!(after_spec.spec_id(), new_default_spec_id);
+        assert_eq!(after_spec.fields().len(), 1);
+        assert_eq!(after_spec.fields()[0].name, "name_truncate_2");
+
+        let provider = env
+            .state
+            .metadata_provider
+            .as_ref()
+            .expect("metadata provider");
+        let read = provider.begin_read().expect("read txn");
+        let refresh = env
+            .state
+            .mv_repo
+            .load_refresh(read.as_ref(), refresh_id)
+            .expect("load refresh")
+            .expect("refresh");
+        assert_eq!(refresh.state, MvRefreshState::IntentCreated);
+        let definition = env
+            .state
+            .mv_repo
+            .find_by_target(read.as_ref(), "ice", "analytics", "mv_orders")
+            .expect("find mv")
+            .expect("mv definition");
+        assert_eq!(definition.active_refresh_id, Some(refresh_id));
+        assert!(definition.refresh_in_progress);
+        drop(read);
+
+        let operation = load_test_operation_for_refresh(&env.state, refresh_id);
+        assert_eq!(operation.state, IcebergOperationState::Preparing);
+        assert!(operation.commit_request.is_none());
+    }
+
+    #[test]
+    fn recover_repartition_intent_created_without_staging_respects_intent_default_spec_guard() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table_with_rows(&env.state, "ice", "sales", "orders", &[(1, "alfa")]);
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_orders
+             PARTITION BY (bucket(id, 16))
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create iceberg mv");
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_orders");
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("initial refresh");
+
+        let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
+            .expect("mv definition");
+        let old_partition = mv.partition_spec.clone().expect("old partition");
+        let target = IcebergMvTarget {
+            catalog: "ice".to_string(),
+            namespace: "analytics".to_string(),
+            table: "mv_orders".to_string(),
+        };
+        let target_entry = {
+            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get("ice").expect("catalog")
+        };
+        let before =
+            crate::connector::iceberg::catalog::load_table(&target_entry, "analytics", "mv_orders")
+                .expect("load target before repartition");
+        let expected_main_snapshot_id = before
+            .table
+            .metadata()
+            .current_snapshot()
+            .map(|snapshot| snapshot.snapshot_id());
+        let old_default_spec_id = before.table.metadata().default_partition_spec_id();
+        assert_eq!(
+            before.table.metadata().default_partition_spec().fields()[0].name,
+            "id_bucket_16"
+        );
+
+        let staging_branch = format!(
+            "__nova_mv_repartition_recover_spec_guard_{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let refresh_id = begin_staged_iceberg_mv_repartition_intent(
+            &env.state,
+            &target,
+            mv.mv_id,
+            expected_main_snapshot_id,
+            mv.last_refresh_snapshots.clone(),
+            &staging_branch,
+            old_default_spec_id,
+            Some(&old_partition),
+        )
+        .expect("begin repartition intent");
+
+        let alter =
+            parse_alter_mv("ALTER MATERIALIZED VIEW mv_orders REPARTITION BY (truncate(name, 2))");
+        let AlterMaterializedViewAction::Repartition(fields) = &alter.action else {
+            panic!("expected repartition action");
+        };
+        let updated_table =
+            crate::connector::iceberg::catalog::registry::replace_default_partition_spec(
+                &target_entry,
+                "analytics",
+                "mv_orders",
+                fields,
+            )
+            .expect("replace default partition spec");
+        let new_partition_contract =
+            target_partition_contract_from_table(&updated_table).expect("new partition contract");
+        assert_ne!(new_partition_contract.target_spec_id, old_default_spec_id);
+        assert_eq!(
+            updated_table.metadata().default_partition_spec().fields()[0].name,
+            "name_truncate_2"
+        );
+        let intent = MvRepartitionOperationIntent::new(
+            Some(old_partition),
+            new_partition_contract.clone(),
+            mv.last_refresh_snapshots.clone(),
+            staging_branch,
+            expected_main_snapshot_id,
+            new_partition_contract.target_spec_id,
+        );
+        record_iceberg_mv_repartition_operation_intent(&env.state, refresh_id, intent)
+            .expect("record repartition intent");
+
+        let external_alter =
+            parse_alter_mv("ALTER MATERIALIZED VIEW mv_orders REPARTITION BY (bucket(id, 8))");
+        let AlterMaterializedViewAction::Repartition(external_fields) = &external_alter.action
+        else {
+            panic!("expected external repartition action");
+        };
+        let externally_updated_table =
+            crate::connector::iceberg::catalog::registry::replace_default_partition_spec(
+                &target_entry,
+                "analytics",
+                "mv_orders",
+                external_fields,
+            )
+            .expect("replace default partition spec externally");
+        let external_default_spec_id = externally_updated_table
+            .metadata()
+            .default_partition_spec_id();
+        assert_ne!(external_default_spec_id, old_default_spec_id);
+        assert_ne!(
+            external_default_spec_id,
+            new_partition_contract.target_spec_id
+        );
+        assert_eq!(
+            externally_updated_table
+                .metadata()
+                .default_partition_spec()
+                .fields()[0]
+                .name,
+            "id_bucket_8"
+        );
+
         recover_iceberg_mv_refreshes(&env.state).expect("recover refresh");
 
         let after =
             crate::connector::iceberg::catalog::load_table(&target_entry, "analytics", "mv_orders")
                 .expect("load target after recovery");
         let after_spec = after.table.metadata().default_partition_spec();
-        assert_eq!(after_spec.spec_id(), old_default_spec_id);
+        assert_eq!(after_spec.spec_id(), external_default_spec_id);
         assert_eq!(after_spec.fields().len(), 1);
-        assert_eq!(after_spec.fields()[0].name, "id_bucket_16");
+        assert_eq!(after_spec.fields()[0].name, "id_bucket_8");
 
         let provider = env
             .state
@@ -16384,19 +16575,180 @@ mod tests {
             .expect("load refresh")
             .expect("refresh");
         assert_eq!(refresh.state, MvRefreshState::Aborted);
-        let definition = env
+        drop(read);
+    }
+
+    #[test]
+    fn recover_repartition_pre_publish_abort_paths_restore_default_spec_from_intent() {
+        assert_repartition_pre_publish_abort_restores_default_spec_from_intent(false);
+        assert_repartition_pre_publish_abort_restores_default_spec_from_intent(true);
+    }
+
+    fn assert_repartition_pre_publish_abort_restores_default_spec_from_intent(
+        record_staging_commit: bool,
+    ) {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_base_table_with_rows(&env.state, "ice", "sales", "orders", &[(1, "alfa")]);
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_orders
+             PARTITION BY (bucket(id, 16))
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create iceberg mv");
+        refresh_iceberg_mv(
+            &env.state,
+            Some("ice"),
+            &env.current_db,
+            &parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_orders"),
+        )
+        .expect("first refresh");
+
+        let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
+            .expect("mv definition");
+        let old_partition = mv.partition_spec.clone().expect("old partition");
+        let target = IcebergMvTarget {
+            catalog: "ice".to_string(),
+            namespace: "analytics".to_string(),
+            table: "mv_orders".to_string(),
+        };
+        let entry = {
+            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get("ice").expect("catalog")
+        };
+        let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)
+            .expect("catalog");
+        let before =
+            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
+                .expect("load target before repartition recovery");
+        let expected_main_snapshot_id = before
+            .table
+            .metadata()
+            .current_snapshot()
+            .map(|snapshot| snapshot.snapshot_id());
+        let old_default_spec_id = before.table.metadata().default_partition_spec_id();
+        let staging_branch = format!(
+            "__nova_mv_repartition_abort_recover_{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let refresh_id = begin_staged_iceberg_mv_repartition_intent(
+            &env.state,
+            &target,
+            mv.mv_id,
+            expected_main_snapshot_id,
+            mv.last_refresh_snapshots.clone(),
+            &staging_branch,
+            old_default_spec_id,
+            Some(&old_partition),
+        )
+        .expect("begin repartition intent");
+
+        let alter =
+            parse_alter_mv("ALTER MATERIALIZED VIEW mv_orders REPARTITION BY (truncate(name, 2))");
+        let AlterMaterializedViewAction::Repartition(fields) = &alter.action else {
+            panic!("expected repartition action");
+        };
+        let updated_table =
+            crate::connector::iceberg::catalog::registry::replace_default_partition_spec(
+                &entry,
+                "analytics",
+                "mv_orders",
+                fields,
+            )
+            .expect("replace default partition spec");
+        let new_partition_contract =
+            target_partition_contract_from_table(&updated_table).expect("new partition contract");
+        assert_eq!(
+            new_partition_contract.fields[0].partition_field_name,
+            "name_truncate_2"
+        );
+        let intent = MvRepartitionOperationIntent::new(
+            Some(old_partition.clone()),
+            new_partition_contract.clone(),
+            mv.last_refresh_snapshots.clone(),
+            staging_branch.clone(),
+            expected_main_snapshot_id,
+            new_partition_contract.target_spec_id,
+        );
+        record_iceberg_mv_repartition_operation_intent(&env.state, refresh_id, intent)
+            .expect("record repartition intent");
+
+        let marker = load_iceberg_mv_refresh_marker(&env.state, refresh_id, mv.mv_id)
+            .expect("marker")
+            .to_summary_properties();
+        let staging_snapshot = data_block_on(async {
+            let ident = iceberg_mv_table_ident(&target).expect("ident");
+            let table = catalog.load_table(&ident).await.expect("load target");
+            let chunks = id_name_chunk(&[(1, "alfa")]);
+            let written = write_chunks_as_iceberg_data_files(&table, &chunks)
+                .await
+                .expect("write chunks");
+            commit_iceberg_mv_target_files_with_ref(
+                &table,
+                &catalog,
+                &entry,
+                &ident,
+                CommitOpKind::FastAppend,
+                written,
+                &staging_branch,
+                marker,
+            )
+            .await
+            .expect("commit staging")
+            .new_snapshot_id
+        })
+        .expect("runtime");
+        if record_staging_commit {
+            record_iceberg_mv_staging_commit(
+                &env.state,
+                refresh_id,
+                staging_snapshot,
+                1,
+                BTreeMap::new(),
+            )
+            .expect("record staging");
+        }
+
+        recover_iceberg_mv_refreshes(&env.state).expect("recover refresh");
+
+        let after =
+            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
+                .expect("load target after recovery");
+        let after_spec = after.table.metadata().default_partition_spec();
+        assert_eq!(after_spec.spec_id(), old_default_spec_id);
+        assert_eq!(after_spec.fields().len(), 1);
+        assert_eq!(after_spec.fields()[0].name, "id_bucket_16");
+        assert!(
+            !after.table.metadata().refs().contains_key(&staging_branch),
+            "staging branch should be dropped during repartition recovery abort"
+        );
+
+        let provider = env
+            .state
+            .metadata_provider
+            .as_ref()
+            .expect("metadata provider");
+        let read = provider.begin_read().expect("read txn");
+        let refresh = env
             .state
             .mv_repo
-            .find_by_target(read.as_ref(), "ice", "analytics", "mv_orders")
-            .expect("find mv")
-            .expect("mv definition");
-        assert_eq!(definition.active_refresh_id, None);
-        assert!(!definition.refresh_in_progress);
+            .load_refresh(read.as_ref(), refresh_id)
+            .expect("load refresh")
+            .expect("refresh");
+        assert_eq!(refresh.state, MvRefreshState::Aborted);
         drop(read);
 
         let operation = load_test_operation_for_refresh(&env.state, refresh_id);
-        assert_eq!(operation.state, IcebergOperationState::Aborted);
-        assert!(operation.commit_request.is_none());
+        assert!(
+            matches!(
+                operation.state,
+                IcebergOperationState::Aborted | IcebergOperationState::FailedKnownUncommitted
+            ),
+            "operation state should be a known pre-publish abort, got {:?}",
+            operation.state
+        );
     }
 
     #[test]
@@ -19021,6 +19373,175 @@ mod tests {
             .list_unfinished_branch_staged_iceberg_refreshes(read.as_ref())
             .expect("branch staged scan");
         assert!(unfinished.is_empty());
+    }
+
+    #[test]
+    fn recover_repartition_finalize_failure_replays_partition_contract() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_base_table_with_rows(&env.state, "ice", "sales", "orders", &[(1, "east")]);
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_orders
+             PARTITION BY (bucket(id, 16))
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create iceberg mv");
+        refresh_iceberg_mv(
+            &env.state,
+            Some("ice"),
+            &env.current_db,
+            &parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_orders"),
+        )
+        .expect("first refresh");
+
+        let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
+            .expect("mv definition");
+        let old_partition = mv.partition_spec.clone().expect("old partition");
+        assert_eq!(old_partition.fields[0].partition_field_name, "id_bucket_16");
+        let target = IcebergMvTarget {
+            catalog: "ice".to_string(),
+            namespace: "analytics".to_string(),
+            table: "mv_orders".to_string(),
+        };
+        let entry = {
+            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get("ice").expect("catalog")
+        };
+        let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)
+            .expect("catalog");
+        let before =
+            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
+                .expect("load target before repartition recovery");
+        let expected_main_snapshot_id = before
+            .table
+            .metadata()
+            .current_snapshot()
+            .map(|snapshot| snapshot.snapshot_id());
+        let old_default_spec_id = before.table.metadata().default_partition_spec_id();
+        let staging_branch = format!(
+            "__nova_mv_repartition_finalize_recover_{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let refresh_id = begin_staged_iceberg_mv_repartition_intent(
+            &env.state,
+            &target,
+            mv.mv_id,
+            expected_main_snapshot_id,
+            mv.last_refresh_snapshots.clone(),
+            &staging_branch,
+            old_default_spec_id,
+            Some(&old_partition),
+        )
+        .expect("begin repartition intent");
+
+        let alter =
+            parse_alter_mv("ALTER MATERIALIZED VIEW mv_orders REPARTITION BY (truncate(name, 2))");
+        let AlterMaterializedViewAction::Repartition(fields) = &alter.action else {
+            panic!("expected repartition action");
+        };
+        let updated_table =
+            crate::connector::iceberg::catalog::registry::replace_default_partition_spec(
+                &entry,
+                "analytics",
+                "mv_orders",
+                fields,
+            )
+            .expect("replace default partition spec");
+        let new_partition_contract =
+            target_partition_contract_from_table(&updated_table).expect("new partition contract");
+        assert_eq!(
+            new_partition_contract.fields[0].partition_field_name,
+            "name_truncate_2"
+        );
+        assert_ne!(
+            new_partition_contract.target_spec_id,
+            old_partition.target_spec_id
+        );
+        let intent = MvRepartitionOperationIntent::new(
+            Some(old_partition.clone()),
+            new_partition_contract.clone(),
+            mv.last_refresh_snapshots.clone(),
+            staging_branch.clone(),
+            expected_main_snapshot_id,
+            new_partition_contract.target_spec_id,
+        );
+        record_iceberg_mv_repartition_operation_intent(&env.state, refresh_id, intent)
+            .expect("record repartition intent");
+
+        let marker = load_iceberg_mv_refresh_marker(&env.state, refresh_id, mv.mv_id)
+            .expect("marker")
+            .to_summary_properties();
+        let staging_snapshot = data_block_on(async {
+            let ident = iceberg_mv_table_ident(&target).expect("ident");
+            let table = catalog.load_table(&ident).await.expect("load target");
+            let chunks = id_name_chunk(&[(1, "east")]);
+            let written = write_chunks_as_iceberg_data_files(&table, &chunks)
+                .await
+                .expect("write chunks");
+            commit_iceberg_mv_target_files_with_ref(
+                &table,
+                &catalog,
+                &entry,
+                &ident,
+                CommitOpKind::FastAppend,
+                written,
+                &staging_branch,
+                marker,
+            )
+            .await
+            .expect("commit staging")
+            .new_snapshot_id
+        })
+        .expect("runtime");
+        record_iceberg_mv_staging_commit(
+            &env.state,
+            refresh_id,
+            staging_snapshot,
+            1,
+            BTreeMap::new(),
+        )
+        .expect("record staging");
+        let published_snapshot = publish_iceberg_mv_refresh(
+            &env.state,
+            &target,
+            &entry,
+            &staging_branch,
+            expected_main_snapshot_id,
+            staging_snapshot,
+            refresh_id,
+            mv.mv_id,
+        )
+        .expect("publish repartition staging");
+        record_iceberg_mv_publish_commit(&env.state, refresh_id, published_snapshot)
+            .expect("record publish");
+        let operation = load_test_operation_for_refresh(&env.state, refresh_id);
+        record_iceberg_mv_operation_finalize_failure(
+            &env.state,
+            operation.operation_id,
+            "synthetic finalize retry".to_string(),
+        )
+        .expect("mark finalize failed");
+
+        recover_iceberg_mv_refreshes(&env.state).expect("recover repartition");
+
+        let recovered = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
+            .expect("mv definition after recovery");
+        let recovered_partition = recovered.partition_spec.expect("recovered partition");
+        assert_eq!(recovered_partition, new_partition_contract);
+        assert_eq!(
+            recovered
+                .schema_contract
+                .expect("schema contract")
+                .target
+                .partition,
+            Some(new_partition_contract)
+        );
+        assert_eq!(
+            load_test_operation_for_refresh(&env.state, refresh_id).state,
+            crate::meta::repository::iceberg_operation::IcebergOperationState::Finalized
+        );
     }
 
     #[test]
