@@ -2721,22 +2721,15 @@ fn validate_repartition_support(caps: &RefreshCapabilities) -> Result<Repartitio
 
 fn validate_repartition_rebuild_wired(
     support: &RepartitionSupport,
-    target: &IcebergMvTarget,
+    _target: &IcebergMvTarget,
 ) -> Result<(), String> {
     match support {
         RepartitionSupport::ProjectionFilterSingleBase
         | RepartitionSupport::AggregateSingleBase
+        | RepartitionSupport::JoinProjectionFilter
         | RepartitionSupport::JoinAggregate
-        | RepartitionSupport::FanInAggregate => Ok(()),
-        RepartitionSupport::JoinProjectionFilter | RepartitionSupport::UnionProjectionFilter => {
-            Err(format!(
-                "UnsupportedRepartitionShape: {} repartition payload builder is not enabled in this task; target={}.{}.{}",
-                support.label(),
-                target.catalog,
-                target.namespace,
-                target.table
-            ))
-        }
+        | RepartitionSupport::FanInAggregate
+        | RepartitionSupport::UnionProjectionFilter => Ok(()),
     }
 }
 
@@ -2786,6 +2779,16 @@ pub(crate) fn repartition_iceberg_mv(
     let select_query = parse_mv_select_query(&mv_definition.select_sql)?;
     let canonical_select_query =
         canonicalize_iceberg_mv_select_query(&select_query, current_catalog, current_database);
+    let join_repartition_aliases = if matches!(support, RepartitionSupport::JoinProjectionFilter) {
+        let aliases =
+            crate::connector::starrocks::table::aggregate_sql_calls::extract_join_aliases(
+                &canonical_select_query,
+            )?;
+        validate_join_aliases_base_refs(&aliases, &base_refs)?;
+        Some(aliases)
+    } else {
+        None
+    };
     let analysis = analyze_mv_select(
         state,
         current_catalog,
@@ -2856,7 +2859,7 @@ pub(crate) fn repartition_iceberg_mv(
                 &pinned_full_select_sql,
                 &pin,
             ) {
-                Ok(payload) => payload,
+                Ok(payload) => Some(payload),
                 Err(err) => {
                     abort_iceberg_mv_refresh(state, refresh_id)?;
                     return Err(err);
@@ -2872,19 +2875,30 @@ pub(crate) fn repartition_iceberg_mv(
             &mv_definition.select_sql,
             &pin,
         ) {
-            Ok(payload) => payload,
+            Ok(payload) => Some(payload),
             Err(err) => {
                 abort_iceberg_mv_refresh(state, refresh_id)?;
                 return Err(err);
             }
         },
-        RepartitionSupport::JoinProjectionFilter | RepartitionSupport::UnionProjectionFilter => {
-            abort_iceberg_mv_refresh(state, refresh_id)?;
-            return Err(format!(
-                "UnsupportedRepartitionShape: {} repartition payload builder is not enabled in this task",
-                support.label()
-            ));
+        RepartitionSupport::UnionProjectionFilter => {
+            match build_union_projection_repartition_payload(
+                state,
+                current_catalog,
+                current_database,
+                &mv_definition.select_sql,
+                &canonical_select_query,
+                schema_contract,
+                &pin,
+            ) {
+                Ok(payload) => Some(payload),
+                Err(err) => {
+                    abort_iceberg_mv_refresh(state, refresh_id)?;
+                    return Err(err);
+                }
+            }
         }
+        RepartitionSupport::JoinProjectionFilter => None,
     };
 
     let updated_table =
@@ -2915,10 +2929,18 @@ pub(crate) fn repartition_iceberg_mv(
             ));
         }
     };
+    let repartition_restore = RepartitionDefaultSpecRestore {
+        new_default_spec_id,
+        old_default_spec_id,
+    };
+    let base_snapshots_for_intent = payload
+        .as_ref()
+        .map(|payload| payload.base_snapshots.clone())
+        .unwrap_or_else(|| pin.to_snapshot_map());
     let intent = MvRepartitionOperationIntent::new(
         previous_partition_contract.cloned(),
         new_partition_contract.clone(),
-        payload.base_snapshots.clone(),
+        base_snapshots_for_intent,
         staging_branch.clone(),
         expected_main_snapshot_id,
         new_default_spec_id,
@@ -2935,6 +2957,76 @@ pub(crate) fn repartition_iceberg_mv(
         ));
     }
 
+    if let RepartitionSupport::JoinProjectionFilter = support {
+        let aliases = join_repartition_aliases
+            .as_ref()
+            .ok_or_else(|| "join repartition aliases were not extracted".to_string())
+            .map_err(|err| {
+                abort_and_restore_iceberg_mv_repartition_default_spec(
+                    state,
+                    refresh_id,
+                    &target_entry,
+                    &target,
+                    new_default_spec_id,
+                    old_default_spec_id,
+                    err,
+                )
+            })?;
+        let (ctx, left_ref, right_ref) = build_join_projection_repartition_context(
+            state,
+            &target,
+            &target_entry,
+            &iceberg_catalog,
+            &updated_table,
+            &target_loaded.table,
+            current_catalog,
+            current_database,
+            &mv_definition,
+            &base_refs,
+            &pin,
+            aliases,
+        )
+        .map_err(|err| {
+            abort_and_restore_iceberg_mv_repartition_default_spec(
+                state,
+                refresh_id,
+                &target_entry,
+                &target,
+                new_default_spec_id,
+                old_default_spec_id,
+                err,
+            )
+        })?;
+        let result = repartition_iceberg_join_mv_overwrite(
+            state,
+            &ctx,
+            &staging_branch,
+            refresh_id,
+            aliases,
+            &left_ref,
+            &right_ref,
+            &new_partition_contract,
+            repartition_restore,
+        );
+        result?;
+        register_iceberg_mv_target_in_catalog(state, &target)?;
+        return Ok(StatementResult::Ok);
+    }
+
+    let payload = payload.ok_or_else(|| {
+        abort_and_restore_iceberg_mv_repartition_default_spec(
+            state,
+            refresh_id,
+            &target_entry,
+            &target,
+            new_default_spec_id,
+            old_default_spec_id,
+            format!(
+                "UnsupportedRepartitionShape: {} repartition payload builder is not enabled",
+                support.label()
+            ),
+        )
+    })?;
     let result = commit_repartition_rebuild_payload(
         state,
         &target,
@@ -2946,10 +3038,7 @@ pub(crate) fn repartition_iceberg_mv(
         &mv_definition,
         payload,
         &new_partition_contract,
-        Some(RepartitionDefaultSpecRestore {
-            new_default_spec_id,
-            old_default_spec_id,
-        }),
+        Some(repartition_restore),
     );
     result.map_err(IcebergMvRefreshExecutionError::into_message)?;
     register_iceberg_mv_target_in_catalog(state, &target)?;
@@ -8131,6 +8220,31 @@ fn build_aggregate_repartition_payload(
     Ok(RepartitionRebuildPayload::from_chunks(chunks, pin))
 }
 
+fn build_union_projection_repartition_payload(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    select_sql: &str,
+    canonical_select_query: &sqlparser::ast::Query,
+    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
+) -> Result<RepartitionRebuildPayload, String> {
+    let branch_count = schema_contract
+        .branch
+        .as_ref()
+        .map(|branch| branch.branch_count as usize)
+        .unwrap_or_else(|| union_branch_count(canonical_select_query) as usize);
+    let pinned_full_select_sql = rewrite_union_projection_full_refresh_select_with_pin(
+        select_sql,
+        pin,
+        branch_count,
+        current_catalog,
+        current_database,
+    )?;
+    let chunks = run_mv_full_select_chunks(state, current_database, &pinned_full_select_sql)?;
+    Ok(RepartitionRebuildPayload::from_chunks(chunks, pin))
+}
+
 fn prepare_branch_union_aggregate_first_refresh_chunks(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
@@ -10085,6 +10199,390 @@ fn finalize_iceberg_mv_metadata_only_refresh_with_partition_state(
         table_uuids,
         target_snapshot_id,
         partition_state,
+    )?;
+    Ok(StatementResult::Ok)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_join_projection_repartition_context(
+    state: &Arc<StandaloneState>,
+    target: &IcebergMvTarget,
+    target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    iceberg_catalog: &Arc<dyn iceberg::Catalog>,
+    target_table: &iceberg::table::Table,
+    schema_validation_target_table: &iceberg::table::Table,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    mv_definition: &StoredMvDefinition,
+    base_refs: &[IcebergTableRef],
+    pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
+    aliases: &crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases,
+) -> Result<(IcebergMvRefreshContext, IcebergTableRef, IcebergTableRef), String> {
+    if base_refs.len() != 2 {
+        return Err("iceberg join MV repartition requires exactly two base tables".to_string());
+    }
+    if pin.len() != 2 {
+        return Err(format!(
+            "iceberg join MV repartition expected two refresh pins, got {}",
+            pin.len()
+        ));
+    }
+    validate_join_aliases_base_refs(aliases, base_refs)?;
+    let schema_contract = mv_definition.schema_contract.as_ref().ok_or_else(|| {
+        format!(
+            "iceberg MV target {}.{}.{} is missing A11 schema contract; recreate the MV before repartitioning",
+            target.catalog, target.namespace, target.table
+        )
+    })?;
+    if schema_contract.contract_version != 2 {
+        return Err(format!(
+            "iceberg join MV {}.{}.{} requires schema contract version 2, got {}",
+            target.catalog, target.namespace, target.table, schema_contract.contract_version
+        ));
+    }
+    let (left_ref, right_ref) = join_base_refs_for_aliases(aliases, base_refs)?;
+    let left_loaded = load_current_iceberg_base_table(state, left_ref)?;
+    let right_loaded = load_current_iceberg_base_table(state, right_ref)?;
+    let effective_definition = validate_join_schema_contract(
+        schema_contract,
+        &[
+            (left_ref, &left_loaded.table),
+            (right_ref, &right_loaded.table),
+        ],
+        schema_validation_target_table,
+    )?
+    .into_definition(mv_definition)?;
+    let canonical_select_query = canonicalize_iceberg_mv_select_query(
+        &parse_mv_select_query(&effective_definition.select_sql)?,
+        current_catalog,
+        current_database,
+    );
+    let ctx = {
+        let iceberg_catalog_guard = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+        IcebergMvRefreshContext::new_with_pruning_limits(
+            target.clone(),
+            effective_definition.mv_id,
+            current_catalog,
+            current_database,
+            Arc::new(effective_definition),
+            Arc::new(canonical_select_query),
+            Arc::from(base_refs.to_vec()),
+            Arc::new(pin.clone()),
+            &iceberg_catalog_guard,
+            Arc::new(target_entry.clone()),
+            iceberg_catalog.clone(),
+            target_table.clone(),
+            state.mv_refresh_pruning_limits,
+        )?
+    };
+    Ok((ctx, left_ref.clone(), right_ref.clone()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn repartition_iceberg_join_mv_overwrite(
+    state: &Arc<StandaloneState>,
+    ctx: &IcebergMvRefreshContext,
+    staging_branch: &str,
+    refresh_id: i64,
+    aliases: &crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases,
+    left_ref: &IcebergTableRef,
+    right_ref: &IcebergTableRef,
+    partition_contract: &crate::meta::repository::mv_contract::MvPartitionContract,
+    repartition_restore: RepartitionDefaultSpecRestore,
+) -> Result<StatementResult, String> {
+    let target = &ctx.rewrite.target;
+    let target_entry = &*ctx.target_entry;
+    let iceberg_catalog = &ctx.iceberg_catalog;
+    let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
+    let current_database = ctx.rewrite.current_database.as_str();
+    let mv_definition = &*ctx.rewrite.mv_definition;
+    let pin = &*ctx.rewrite.pin;
+    if let Err(err) = ensure_iceberg_mv_staging_branch(
+        iceberg_catalog,
+        target,
+        staging_branch,
+        expected_main_snapshot_id,
+    ) {
+        return Err(abort_and_restore_iceberg_mv_repartition_default_spec(
+            state,
+            refresh_id,
+            target_entry,
+            target,
+            repartition_restore.new_default_spec_id,
+            repartition_restore.old_default_spec_id,
+            err,
+        ));
+    }
+    let target_table = match reload_iceberg_mv_target_table(target_entry, target) {
+        Ok(table) => table,
+        Err(err) => {
+            return Err(
+                handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
+                    state,
+                    target,
+                    target_entry,
+                    staging_branch,
+                    refresh_id,
+                    err,
+                    Some(repartition_restore),
+                ),
+            );
+        }
+    };
+    let left_snapshot = pin
+        .get(left_ref)
+        .ok_or_else(|| format!("missing refresh pin for {}", left_ref.fqn()))
+        .map_err(|err| {
+            handle_iceberg_mv_commit_error_with_repartition_restore(
+                state,
+                target,
+                target_entry,
+                staging_branch,
+                refresh_id,
+                err,
+                Some(repartition_restore),
+            )
+        })?;
+    let right_snapshot = pin
+        .get(right_ref)
+        .ok_or_else(|| format!("missing refresh pin for {}", right_ref.fqn()))
+        .map_err(|err| {
+            handle_iceberg_mv_commit_error_with_repartition_restore(
+                state,
+                target,
+                target_entry,
+                staging_branch,
+                refresh_id,
+                err,
+                Some(repartition_restore),
+            )
+        })?;
+    let mut query = parse_mv_select_query(&mv_definition.select_sql).map_err(|err| {
+        handle_iceberg_mv_commit_error_with_repartition_restore(
+            state,
+            target,
+            target_entry,
+            staging_branch,
+            refresh_id,
+            err,
+            Some(repartition_restore),
+        )
+    })?;
+    rewrite_join_full_refresh_query(
+        &mut query,
+        left_ref,
+        left_snapshot,
+        right_ref,
+        right_snapshot,
+        &aliases.left_alias,
+        &aliases.right_alias,
+    )
+    .map_err(|err| {
+        handle_iceberg_mv_commit_error_with_repartition_restore(
+            state,
+            target,
+            target_entry,
+            staging_branch,
+            refresh_id,
+            err,
+            Some(repartition_restore),
+        )
+    })?;
+    let branch_catalog = build_join_snapshot_catalog(
+        state,
+        &[(left_ref, left_snapshot), (right_ref, right_snapshot)],
+    )
+    .map_err(|err| {
+        handle_iceberg_mv_commit_error_with_repartition_restore(
+            state,
+            target,
+            target_entry,
+            staging_branch,
+            refresh_id,
+            err,
+            Some(repartition_restore),
+        )
+    })?;
+    let coalescer = crate::engine::mv::iceberg_join_coalesce::JoinDeltaCoalescer::new(
+        pin.uuid(left_ref)
+            .ok_or_else(|| format!("missing uuid for {}", left_ref.fqn()))
+            .map_err(|err| {
+                handle_iceberg_mv_commit_error_with_repartition_restore(
+                    state,
+                    target,
+                    target_entry,
+                    staging_branch,
+                    refresh_id,
+                    err,
+                    Some(repartition_restore),
+                )
+            })?
+            .to_string(),
+        pin.uuid(right_ref)
+            .ok_or_else(|| format!("missing uuid for {}", right_ref.fqn()))
+            .map_err(|err| {
+                handle_iceberg_mv_commit_error_with_repartition_restore(
+                    state,
+                    target,
+                    target_entry,
+                    staging_branch,
+                    refresh_id,
+                    err,
+                    Some(repartition_restore),
+                )
+            })?
+            .to_string(),
+        1_000_000,
+    );
+    let sink = crate::engine::mv::iceberg_join_coalesce::IcebergJoinCoalesceSinkFactory::new(
+        Arc::clone(&coalescer),
+    );
+    {
+        let connectors_snapshot = state
+            .connectors
+            .read()
+            .expect("standalone connector registry read lock")
+            .clone();
+        let catalogs_guard = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+        if let Err(err) = crate::engine::execute_query_with_options(
+            &query,
+            &branch_catalog,
+            &connectors_snapshot,
+            current_database,
+            state.exchange_port,
+            None,
+            Some(Box::new(sink)),
+            Some(&*catalogs_guard),
+            None,
+        ) {
+            drop(catalogs_guard);
+            return Err(handle_iceberg_mv_commit_error_with_repartition_restore(
+                state,
+                target,
+                target_entry,
+                staging_branch,
+                refresh_id,
+                err,
+                Some(repartition_restore),
+            ));
+        }
+    }
+
+    let marker = load_iceberg_mv_refresh_marker(state, refresh_id, mv_definition.mv_id)
+        .map_err(|err| {
+            handle_iceberg_mv_commit_error_with_repartition_restore(
+                state,
+                target,
+                target_entry,
+                staging_branch,
+                refresh_id,
+                err,
+                Some(repartition_restore),
+            )
+        })?
+        .to_summary_properties();
+    let ident = iceberg_mv_table_ident(target).map_err(|err| {
+        handle_iceberg_mv_commit_error_with_repartition_restore(
+            state,
+            target,
+            target_entry,
+            staging_branch,
+            refresh_id,
+            err,
+            Some(repartition_restore),
+        )
+    })?;
+    let collector = new_iceberg_mv_commit_collector(
+        &target_table,
+        &ident,
+        staging_branch,
+        CommitOpKind::Overwrite,
+    );
+    let flush_outcome = coalescer
+        .flush_to_iceberg_commit_collector(&target_table, Arc::clone(&collector), None)
+        .map_err(|err| {
+            handle_iceberg_mv_commit_error_with_repartition_restore(
+                state,
+                target,
+                target_entry,
+                staging_branch,
+                refresh_id,
+                err,
+                Some(repartition_restore),
+            )
+        })?;
+    let new_snapshot_id = match data_block_on(commit_iceberg_mv_with_populated_collector(
+        &target_table,
+        iceberg_catalog,
+        target_entry,
+        &ident,
+        Arc::clone(&collector),
+        staging_branch,
+        marker,
+    )) {
+        Ok(Ok(outcome)) => outcome.new_snapshot_id,
+        Ok(Err(err)) | Err(err) => {
+            return Err(handle_iceberg_mv_commit_error_with_repartition_restore(
+                state,
+                target,
+                target_entry,
+                staging_branch,
+                refresh_id,
+                err,
+                Some(repartition_restore),
+            ));
+        }
+    };
+
+    let snapshots = pin.to_snapshot_map();
+    let table_uuids = pin.to_table_uuid_map();
+    record_iceberg_mv_staging_commit(
+        state,
+        refresh_id,
+        new_snapshot_id,
+        flush_outcome.added_rows,
+        table_uuids.clone(),
+    )?;
+    let published_snapshot_id = match publish_iceberg_mv_refresh(
+        state,
+        target,
+        target_entry,
+        staging_branch,
+        expected_main_snapshot_id,
+        new_snapshot_id,
+        refresh_id,
+        mv_definition.mv_id,
+    ) {
+        Ok(snapshot_id) => snapshot_id,
+        Err(err) => {
+            return Err(handle_iceberg_mv_publish_error_with_repartition_restore(
+                state,
+                target,
+                target_entry,
+                staging_branch,
+                refresh_id,
+                err,
+                Some(repartition_restore),
+            ));
+        }
+    };
+    record_iceberg_mv_publish_commit(state, refresh_id, published_snapshot_id)?;
+    drop_iceberg_mv_staging_branch(state, target, target_entry, staging_branch)?;
+    finalize_iceberg_mv_refresh_with_partition_contract(
+        state,
+        refresh_id,
+        flush_outcome.added_rows,
+        snapshots,
+        table_uuids,
+        published_snapshot_id,
+        partition_contract,
+        IcebergMvPartitionStateFinalize::Clear,
     )?;
     Ok(StatementResult::Ok)
 }
@@ -12850,39 +13348,23 @@ mod tests {
     }
 
     #[test]
-    fn repartition_support_blocks_unwired_non_projection_rebuild() {
+    fn repartition_support_wired_guard_accepts_all_supported_shapes() {
         let target = IcebergMvTarget {
             catalog: "ice".to_string(),
             namespace: "analytics".to_string(),
             table: "mv_join_aggregate".to_string(),
         };
 
-        validate_repartition_rebuild_wired(
-            &RepartitionSupport::ProjectionFilterSingleBase,
-            &target,
-        )
-        .expect("projection/filter rebuild remains wired");
         for support in [
+            RepartitionSupport::ProjectionFilterSingleBase,
             RepartitionSupport::AggregateSingleBase,
+            RepartitionSupport::JoinProjectionFilter,
             RepartitionSupport::JoinAggregate,
             RepartitionSupport::FanInAggregate,
-        ] {
-            validate_repartition_rebuild_wired(&support, &target)
-                .expect("aggregate-family rebuild is wired");
-        }
-
-        for support in [
-            RepartitionSupport::JoinProjectionFilter,
             RepartitionSupport::UnionProjectionFilter,
         ] {
-            let err = validate_repartition_rebuild_wired(&support, &target)
-                .expect_err("non-aggregate projection/filter rebuild must be temporarily blocked");
-            assert!(err.contains("UnsupportedRepartitionShape"));
-            assert!(err.contains(&format!(
-                "{} repartition payload builder is not enabled in this task",
-                support.label()
-            )));
-            assert!(err.contains("target=ice.analytics.mv_join_aggregate"));
+            validate_repartition_rebuild_wired(&support, &target)
+                .unwrap_or_else(|err| panic!("{} rebuild should be wired: {err}", support.label()));
         }
     }
 
@@ -13889,6 +14371,26 @@ mod tests {
         rows
     }
 
+    fn join_repartition_rows(
+        state: &Arc<StandaloneState>,
+        current_catalog: &str,
+        current_database: &str,
+        mv_name: &str,
+    ) -> Vec<(i32, String)> {
+        let sql = format!("SELECT id, region FROM {mv_name} ORDER BY id");
+        let session = crate::engine::StandaloneSession {
+            inner: Arc::clone(state),
+        };
+        let result = match session
+            .execute_in_context(&sql, Some(current_catalog), current_database, None)
+            .expect("query join repartition mv")
+        {
+            StatementResult::Query(result) => result,
+            StatementResult::Ok => panic!("expected query result for {sql}"),
+        };
+        id_name_rows(&result)
+    }
+
     fn union_projection_rows_with_hidden(
         state: &Arc<StandaloneState>,
         current_catalog: &str,
@@ -14493,6 +14995,88 @@ mod tests {
         .expect("create aggregate dim iceberg table");
     }
 
+    fn create_join_orders_table(
+        state: &Arc<StandaloneState>,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) {
+        let entry = {
+            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get(catalog).expect("catalog")
+        };
+        let columns = vec![
+            crate::sql::TableColumnDef {
+                name: "id".to_string(),
+                data_type: crate::sql::SqlType::Int,
+                nullable: false,
+                aggregation: None,
+                default: None,
+            },
+            crate::sql::TableColumnDef {
+                name: "customer_id".to_string(),
+                data_type: crate::sql::SqlType::Int,
+                nullable: false,
+                aggregation: None,
+                default: None,
+            },
+        ];
+        crate::connector::iceberg::catalog::registry::create_table(
+            &entry,
+            namespace,
+            table,
+            &columns,
+            None,
+            &[],
+            &[
+                ("format-version".to_string(), "3".to_string()),
+                ("write.row-lineage".to_string(), "true".to_string()),
+            ],
+        )
+        .expect("create join orders iceberg table");
+    }
+
+    fn create_join_customers_table(
+        state: &Arc<StandaloneState>,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) {
+        let entry = {
+            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get(catalog).expect("catalog")
+        };
+        let columns = vec![
+            crate::sql::TableColumnDef {
+                name: "id".to_string(),
+                data_type: crate::sql::SqlType::Int,
+                nullable: false,
+                aggregation: None,
+                default: None,
+            },
+            crate::sql::TableColumnDef {
+                name: "region".to_string(),
+                data_type: crate::sql::SqlType::String,
+                nullable: true,
+                aggregation: None,
+                default: None,
+            },
+        ];
+        crate::connector::iceberg::catalog::registry::create_table(
+            &entry,
+            namespace,
+            table,
+            &columns,
+            None,
+            &[],
+            &[
+                ("format-version".to_string(), "3".to_string()),
+                ("write.row-lineage".to_string(), "true".to_string()),
+            ],
+        )
+        .expect("create join customers iceberg table");
+    }
+
     fn create_identity_partitioned_base_table(
         state: &Arc<StandaloneState>,
         catalog: &str,
@@ -14624,6 +15208,54 @@ mod tests {
             .collect::<Vec<_>>();
         crate::connector::iceberg::catalog::registry::insert_rows(&entry, namespace, table, &rows)
             .expect("insert aggregate dim iceberg rows");
+    }
+
+    fn insert_into_join_orders_table(
+        state: &Arc<StandaloneState>,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        rows: &[(i32, i32)],
+    ) {
+        let entry = {
+            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get(catalog).expect("catalog")
+        };
+        let rows = rows
+            .iter()
+            .map(|(id, customer_id)| {
+                vec![
+                    crate::sql::Literal::Int(i64::from(*id)),
+                    crate::sql::Literal::Int(i64::from(*customer_id)),
+                ]
+            })
+            .collect::<Vec<_>>();
+        crate::connector::iceberg::catalog::registry::insert_rows(&entry, namespace, table, &rows)
+            .expect("insert join orders iceberg rows");
+    }
+
+    fn insert_into_join_customers_table(
+        state: &Arc<StandaloneState>,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        rows: &[(i32, &str)],
+    ) {
+        let entry = {
+            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get(catalog).expect("catalog")
+        };
+        let rows = rows
+            .iter()
+            .map(|(id, region)| {
+                vec![
+                    crate::sql::Literal::Int(i64::from(*id)),
+                    crate::sql::Literal::String((*region).to_string()),
+                ]
+            })
+            .collect::<Vec<_>>();
+        crate::connector::iceberg::catalog::registry::insert_rows(&entry, namespace, table, &rows)
+            .expect("insert join customers iceberg rows");
     }
 
     fn create_base_table_with_rows(
@@ -15301,6 +15933,109 @@ mod tests {
             Some("MV_REPARTITION")
         );
         assert_eq!(operation.state, IcebergOperationState::Finalized);
+    }
+
+    #[test]
+    fn alter_iceberg_join_mv_repartition_rebuilds_with_join_apply_key() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_join_orders_table(&env.state, "ice", "sales", "orders");
+        create_join_customers_table(&env.state, "ice", "sales", "customers");
+        insert_into_join_orders_table(
+            &env.state,
+            "ice",
+            "sales",
+            "orders",
+            &[(1, 10), (2, 20), (3, 10)],
+        );
+        insert_into_join_customers_table(
+            &env.state,
+            "ice",
+            "sales",
+            "customers",
+            &[(10, "east"), (20, "west")],
+        );
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_orders_customers
+             PARTITION BY (region)
+             DISTRIBUTED BY HASH(region) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT o.id, c.region
+                FROM ice.sales.orders o
+                JOIN ice.sales.customers c ON o.customer_id = c.id",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create join iceberg mv");
+
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_orders_customers");
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("first join refresh");
+        assert_eq!(
+            join_repartition_rows(&env.state, "ice", &env.current_db, "mv_orders_customers"),
+            vec![
+                (1, "east".to_string()),
+                (2, "west".to_string()),
+                (3, "east".to_string())
+            ]
+        );
+
+        let alter = parse_alter_mv(
+            "ALTER MATERIALIZED VIEW mv_orders_customers REPARTITION BY (truncate(region, 2))",
+        );
+        repartition_iceberg_mv(&env.state, Some("ice"), &env.current_db, &alter)
+            .expect("repartition join iceberg mv");
+        assert_eq!(
+            join_repartition_rows(&env.state, "ice", &env.current_db, "mv_orders_customers"),
+            vec![
+                (1, "east".to_string()),
+                (2, "west".to_string()),
+                (3, "east".to_string())
+            ]
+        );
+
+        let entry = {
+            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get("ice").expect("catalog")
+        };
+        let loaded = crate::connector::iceberg::catalog::load_table(
+            &entry,
+            "analytics",
+            "mv_orders_customers",
+        )
+        .expect("load repartitioned join target");
+        let spec = loaded.table.metadata().default_partition_spec();
+        assert_ne!(spec.spec_id(), 0);
+        assert_eq!(spec.fields().len(), 1);
+        assert_eq!(spec.fields()[0].name, "region_truncate_2");
+
+        let apply_key_field = loaded
+            .table
+            .metadata()
+            .current_schema()
+            .as_struct()
+            .fields()
+            .iter()
+            .find(|field| field.name == ICEBERG_MV_JOIN_APPLY_KEY_COLUMN)
+            .expect("join apply-key field remains in target schema");
+        assert!(apply_key_field.required);
+
+        let definition =
+            find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders_customers")
+                .expect("mv definition after join repartition");
+        let stored_partition = definition.partition_spec.expect("stored partition spec");
+        assert_eq!(stored_partition.target_spec_id, spec.spec_id());
+        assert_eq!(
+            stored_partition.fields[0].partition_field_name,
+            "region_truncate_2"
+        );
+        assert_eq!(
+            definition
+                .schema_contract
+                .expect("schema contract")
+                .target
+                .hidden_apply_key
+                .column_name,
+            ICEBERG_MV_JOIN_APPLY_KEY_COLUMN
+        );
     }
 
     #[test]
@@ -16290,6 +17025,71 @@ mod tests {
         assert_eq!(
             second_rows,
             vec![(10, "same".to_string(), first_rows[1].2, 1)]
+        );
+    }
+
+    #[test]
+    fn alter_iceberg_union_all_projection_mv_repartition_rebuilds_union_payload() {
+        let catalog = "ice_union_projection_repartition";
+        let env = open_test_state_with_hadoop_iceberg_catalog(catalog, "analytics");
+        create_base_table_with_rows(&env.state, catalog, "sales", "orders", &[(1, "alfa")]);
+        create_base_table_with_rows(&env.state, catalog, "sales", "returns", &[(2, "beta")]);
+        let stmt = parse_create_mv(&format!(
+            "CREATE MATERIALIZED VIEW mv_union_orders
+             PARTITION BY (bucket(id, 16))
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM {catalog}.sales.orders
+                UNION ALL
+                SELECT id, name FROM {catalog}.sales.returns"
+        ));
+        create_iceberg_mv(&env.state, Some(catalog), &env.current_db, &stmt)
+            .expect("create projection/filter UNION ALL iceberg mv");
+
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_union_orders");
+        refresh_iceberg_mv(&env.state, Some(catalog), &env.current_db, &refresh)
+            .expect("first projection/filter UNION ALL refresh");
+
+        let alter = parse_alter_mv(
+            "ALTER MATERIALIZED VIEW mv_union_orders REPARTITION BY (truncate(name, 2))",
+        );
+        repartition_iceberg_mv(&env.state, Some(catalog), &env.current_db, &alter)
+            .expect("repartition projection/filter UNION ALL iceberg mv");
+
+        let rows = union_projection_rows_with_hidden(
+            &env.state,
+            catalog,
+            &env.current_db,
+            "mv_union_orders",
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, 1);
+        assert_eq!(rows[0].1, "alfa");
+        assert_eq!(rows[0].3, 0);
+        assert_eq!(rows[1].0, 2);
+        assert_eq!(rows[1].1, "beta");
+        assert_eq!(rows[1].3, 1);
+
+        let entry = {
+            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get(catalog).expect("catalog")
+        };
+        let loaded =
+            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_union_orders")
+                .expect("load repartitioned UNION target");
+        let spec = loaded.table.metadata().default_partition_spec();
+        assert_ne!(spec.spec_id(), 0);
+        assert_eq!(spec.fields().len(), 1);
+        assert_eq!(spec.fields()[0].name, "name_truncate_2");
+
+        let definition =
+            find_iceberg_mv_definition(&env.state, catalog, "analytics", "mv_union_orders")
+                .expect("mv definition after UNION repartition");
+        let stored_partition = definition.partition_spec.expect("stored partition spec");
+        assert_eq!(stored_partition.target_spec_id, spec.spec_id());
+        assert_eq!(
+            stored_partition.fields[0].partition_field_name,
+            "name_truncate_2"
         );
     }
 
