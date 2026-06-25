@@ -32,7 +32,7 @@ use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_icebe
 use crate::connector::iceberg::catalog::row_lineage_enabled;
 use crate::connector::iceberg::commit::{
     AbortLog, CommitOpKind, IcebergCommitCollector, LiveFileMetrics, RunInput,
-    current_live_file_metrics, run_iceberg_commit,
+    current_live_file_metrics, run_iceberg_commit_typed,
 };
 use crate::connector::iceberg::data_writer::{
     RowLineageColumns, RowLineageWriteBatch, write_row_lineage_batches_as_data_files,
@@ -533,7 +533,7 @@ pub(crate) fn execute_whole_table_rewrite_with_metrics_for_target(
 
     let abort_cleanup = build_abort_cleanup_for_catalog_entry(&entry)?;
     let file_io = table.file_io().clone();
-    let commit_outcome = block_on_iceberg(run_iceberg_commit(RunInput {
+    let commit_outcome = block_on_iceberg(run_iceberg_commit_typed(RunInput {
         collector,
         catalog: Arc::clone(&catalog),
         table,
@@ -543,7 +543,9 @@ pub(crate) fn execute_whole_table_rewrite_with_metrics_for_target(
         cow_update_rewrite: None,
         target_ref: "main".to_string(),
         snapshot_properties: BTreeMap::new(),
-    }))??;
+    }))
+    .map_err(|err| format!("iceberg rewrite_data_files commit runtime failed: {err}"))?
+    .map_err(compact_commit_error_to_user_message)?;
 
     invalidate_iceberg_caches(state, &target)?;
 
@@ -999,6 +1001,12 @@ fn cleanup_written_data_files_after_error(
     }
 }
 
+fn compact_commit_error_to_user_message(
+    err: crate::connector::iceberg::commit::CommitServiceError,
+) -> String {
+    crate::common::engine_error::EngineError::from(err).to_bracketed_user_message()
+}
+
 fn quote_ident(ident: &str) -> String {
     format!("`{}`", ident.replace('`', "``"))
 }
@@ -1016,18 +1024,64 @@ fn now_ms() -> i64 {
 mod tests {
     use std::sync::Arc;
 
+    use crate::connector::iceberg::commit::{
+        CleanupAttempt, CommitOpKind, CommitServiceError, RecoveryEvidence,
+    };
     use crate::engine::StandaloneState;
     use crate::meta::repository::job::{
         CreateIcebergOptimizeJobRequest, IcebergOptimizeJobOutcome, IcebergOptimizeJobState,
     };
     use crate::meta::{MetaStoreProvider, SqliteMetaStoreProvider};
 
-    use super::{quote_ident, reconcile_running_optimize_jobs_once};
+    use super::{
+        compact_commit_error_to_user_message, quote_ident, reconcile_running_optimize_jobs_once,
+    };
 
     #[test]
     fn quote_ident_backtick_quotes_and_escapes_backticks() {
         assert_eq!(quote_ident("orders"), "`orders`");
         assert_eq!(quote_ident("line`item"), "`line``item`");
+    }
+
+    #[test]
+    fn compact_formats_known_uncommitted_without_marking_unknown() {
+        let err = CommitServiceError::known_uncommitted(
+            "catalog commit conflict".to_string(),
+            CleanupAttempt::completed(Vec::new()),
+        );
+
+        let message = compact_commit_error_to_user_message(err);
+
+        assert_eq!(
+            message,
+            "[CommitKnownUncommitted] iceberg commit failed: catalog commit conflict; abort cleanup ran (0 error(s))"
+        );
+    }
+
+    #[test]
+    fn compact_formats_unknown_with_recovery_evidence() {
+        let staging_dir = "s3://warehouse/optimize_t/_staging/rewrite".to_string();
+        let err = CommitServiceError::unknown(
+            "connection reset by peer".to_string(),
+            RecoveryEvidence {
+                table_ident: "ice.db.optimize_t".to_string(),
+                op_kind: CommitOpKind::RewriteDataFiles,
+                base_snapshot_id: Some(15),
+                base_sequence_number: 4,
+                staging_dir: staging_dir.clone(),
+            },
+        );
+
+        let message = compact_commit_error_to_user_message(err);
+
+        assert!(
+            message.starts_with("[CommitUnknown] iceberg commit unknown"),
+            "got: {message}"
+        );
+        assert!(
+            message.contains(&staging_dir),
+            "message should contain staging dir {staging_dir}, got: {message}"
+        );
     }
 
     #[test]
