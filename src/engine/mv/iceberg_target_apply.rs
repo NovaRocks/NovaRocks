@@ -2231,6 +2231,113 @@ mod tests {
         }
     }
 
+    fn hadoop_catalog_entry_for_target(
+        target_table: &iceberg::table::Table,
+    ) -> crate::connector::iceberg::catalog::IcebergCatalogEntry {
+        crate::connector::iceberg::catalog::registry::build_catalog_entry(
+            "ice",
+            &[
+                ("type".to_string(), "iceberg".to_string()),
+                ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                (
+                    "iceberg.catalog.warehouse".to_string(),
+                    target_table
+                        .metadata()
+                        .location()
+                        .strip_suffix("/db/mv_apply_target")
+                        .expect("target table location under warehouse")
+                        .to_string(),
+                ),
+            ],
+        )
+        .expect("build iceberg catalog entry")
+    }
+
+    async fn commit_existing_position_delete_to_partitioned_target(
+        fixture: &PartitionedApplyKeyTargetFixture,
+        referenced_data_file: &str,
+        position: i64,
+    ) -> Result<iceberg::table::Table, String> {
+        let snapshot_id = fixture
+            .table
+            .metadata()
+            .current_snapshot()
+            .ok_or_else(|| "target table has no snapshot".to_string())?
+            .snapshot_id();
+        let data_files =
+            crate::connector::iceberg::catalog::registry::extract_data_files_with_stats_at(
+                &fixture.table,
+                snapshot_id,
+            )?;
+        let data_file = data_files
+            .into_iter()
+            .find(|file| file.path == referenced_data_file)
+            .ok_or_else(|| format!("missing target data file `{referenced_data_file}`"))?;
+        let delete_groups = vec![PositionDeleteGroup {
+            referenced_data_file: referenced_data_file.to_string(),
+            partition_spec_id: data_file.partition_spec_id.unwrap_or(0),
+            partition_values: data_file.partition_values.unwrap_or_else(Struct::empty),
+            positions: vec![position],
+        }];
+        let metadata = fixture.table.metadata();
+        let staging_dir = format!(
+            "{}/data/_staging/{}",
+            metadata.location(),
+            uuid::Uuid::new_v4()
+        );
+        let written = crate::connector::iceberg::commit::write_position_delete_files(
+            &fixture.table.file_io().clone(),
+            &staging_dir,
+            delete_groups,
+        )
+        .await?;
+
+        let table_ident = iceberg::TableIdent::new(
+            iceberg::NamespaceIdent::new("db".to_string()),
+            "mv_apply_target".to_string(),
+        );
+        let collector = std::sync::Arc::new(
+            crate::connector::iceberg::commit::IcebergCommitCollector::new(
+                crate::connector::iceberg::commit::CommitOpKind::RowDelta,
+                table_ident.clone(),
+                metadata
+                    .current_snapshot()
+                    .map(|snapshot| snapshot.snapshot_id()),
+                metadata.last_sequence_number(),
+                metadata.current_schema().clone(),
+                metadata.default_partition_spec().clone(),
+                staging_dir,
+                crate::common::types::UniqueId { hi: 0, lo: 0 },
+            )
+            .with_table_metadata(metadata.clone()),
+        );
+        for file in written {
+            collector.inject_written_file(file);
+        }
+        let file_io = fixture.table.file_io().clone();
+        let snapshot_properties = std::collections::BTreeMap::new();
+        let ctx = crate::connector::iceberg::commit::CommitCtx {
+            collector: &collector,
+            table: &fixture.table,
+            catalog: fixture._catalog.as_ref(),
+            file_io: &file_io,
+            commit_uuid: uuid::Uuid::new_v4(),
+            abort_handle: collector.abort_log.clone(),
+            target_ref: "main",
+            snapshot_properties: &snapshot_properties,
+        };
+        crate::connector::iceberg::commit::IcebergCommitAction::commit(
+            &crate::connector::iceberg::commit::RowDeltaCommit,
+            ctx,
+        )
+        .await?;
+        fixture
+            ._catalog
+            .load_table(&table_ident)
+            .await
+            .map_err(|e| format!("reload target after position delete failed: {e}"))
+    }
+
     fn loaded_partitioned_apply_key_target(
         target_table: &iceberg::table::Table,
     ) -> crate::connector::iceberg::catalog::IcebergLoadedTable {
@@ -2625,6 +2732,143 @@ mod tests {
             .get("db", "mv_target")
             .expect("registered target table");
         assert_standard_mv_target_table_def_hides_physical_apply_key(&target_def_after_framework);
+        drop(loopback_backend);
+    }
+
+    #[test]
+    fn framework_locate_respects_existing_position_deletes() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let loopback_backend = crate::engine::install_all_in_one_loopback_backend_for_test()
+            .expect("install all-in-one loopback backend");
+        let state = std::sync::Arc::new(crate::engine::StandaloneState {
+            exchange_port: loopback_backend.exchange_port,
+            ..crate::engine::StandaloneState::default()
+        });
+        crate::connector::register_standalone_backends(&state);
+
+        let mut fixture = build_partitioned_apply_key_target_with_rows();
+        let deleted_key = vec!["key-a".to_string()];
+        let live_key = vec!["key-b".to_string()];
+        let snapshot_before_position_delete = fixture
+            .table
+            .metadata()
+            .current_snapshot()
+            .expect("target snapshot before position delete")
+            .snapshot_id();
+        fixture.table = rt
+            .block_on(commit_existing_position_delete_to_partitioned_target(
+                &fixture,
+                &fixture.file_paths[0],
+                0,
+            ))
+            .expect("commit existing position delete");
+        let snapshot_after_position_delete = fixture
+            .table
+            .metadata()
+            .current_snapshot()
+            .expect("target snapshot after position delete")
+            .snapshot_id();
+        assert_ne!(
+            snapshot_before_position_delete, snapshot_after_position_delete,
+            "row-delta position-delete commit must advance the target snapshot"
+        );
+
+        let target_entry = hadoop_catalog_entry_for_target(&fixture.table);
+        let (existing_deletes_by_file, referenced_data_file_partitions) =
+            super::load_target_apply_locator_inputs(&target_entry, &fixture.table)
+                .expect("load target apply locator inputs");
+        assert!(
+            existing_deletes_by_file
+                .get(&fixture.file_paths[0])
+                .map(|visibility| visibility.deleted_positions.contains(0))
+                .unwrap_or(false),
+            "position delete for key-a must be visible in locator inputs"
+        );
+        assert!(
+            !existing_deletes_by_file
+                .get(&fixture.file_paths[1])
+                .map(|visibility| visibility.deleted_positions.contains(0))
+                .unwrap_or(false),
+            "position 0 for key-b's data file must remain visible in locator inputs"
+        );
+
+        let live_partition = referenced_data_file_partitions
+            .get(&fixture.file_paths[1])
+            .expect("partition metadata for key-b data file");
+        let expected_live_groups = || {
+            vec![PositionDeleteGroup {
+                referenced_data_file: fixture.file_paths[1].clone(),
+                partition_spec_id: live_partition.partition_spec_id,
+                partition_values: live_partition.partition_values.clone(),
+                positions: vec![0],
+            }]
+        };
+        let direct_live_groups = rt
+            .block_on(super::locate_target_rows_by_string_apply_key(
+                &fixture.table,
+                ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+                &live_key,
+                &existing_deletes_by_file,
+                &referenced_data_file_partitions,
+                &TargetPartitionFilter::None,
+            ))
+            .expect("direct locator must still see key-b");
+        assert_position_delete_groups_eq(expected_live_groups(), direct_live_groups);
+        let framework_live_groups = super::resolve_target_positions_via_framework(
+            &state,
+            &fixture.table,
+            "ice",
+            "db",
+            "mv_target",
+            ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+            ApplyKeyRequest::Utf8(&live_key),
+            &referenced_data_file_partitions,
+            &TargetPartitionFilter::None,
+        )
+        .expect("framework locator must still see key-b")
+        .delete_groups;
+        assert_position_delete_groups_eq(expected_live_groups(), framework_live_groups);
+
+        let direct_result = rt.block_on(super::locate_target_rows_by_string_apply_key(
+            &fixture.table,
+            ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+            &deleted_key,
+            &existing_deletes_by_file,
+            &referenced_data_file_partitions,
+            &TargetPartitionFilter::None,
+        ));
+        let direct_err = match direct_result {
+            Ok(_) => panic!("direct locator must not see a position-deleted target row"),
+            Err(err) => err,
+        };
+
+        let framework_result = super::resolve_target_positions_via_framework(
+            &state,
+            &fixture.table,
+            "ice",
+            "db",
+            "mv_target",
+            ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+            ApplyKeyRequest::Utf8(&deleted_key),
+            &referenced_data_file_partitions,
+            &TargetPartitionFilter::None,
+        );
+        let framework_err = match framework_result {
+            Ok(_) => panic!("framework locator must not see a position-deleted target row"),
+            Err(err) => err,
+        };
+
+        assert!(
+            direct_err.contains("iceberg MV target row not found for apply key"),
+            "err={direct_err}"
+        );
+        assert!(direct_err.contains("key-a"), "err={direct_err}");
+        assert!(
+            framework_err.contains("iceberg MV target row not found for apply key"),
+            "err={framework_err}"
+        );
+        assert!(framework_err.contains("key-a"), "err={framework_err}");
+        assert_eq!(direct_err, framework_err);
         drop(loopback_backend);
     }
 
