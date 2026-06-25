@@ -27,7 +27,7 @@
 //! DELETED. The `IcebergCommitCollector` is built with
 //! `CommitOpKind::Truncate` and no `inject_written_file` calls; the
 //! `TruncateCommit` action then drives the manifest writes through
-//! `run_iceberg_commit` exactly the same way `OverwriteCommit` does.
+//! `run_iceberg_commit_typed` exactly the same way `OverwriteCommit` does.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -38,7 +38,7 @@ use iceberg::{NamespaceIdent, TableIdent};
 use crate::connector::backend::ResolvedTable;
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
 use crate::connector::iceberg::commit::{
-    CommitOpKind, IcebergCommitCollector, RunInput, run_iceberg_commit,
+    CommitOpKind, IcebergCommitCollector, RunInput, run_iceberg_commit_typed,
 };
 use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::iceberg_writer::{
@@ -87,7 +87,7 @@ pub(crate) fn execute_iceberg_truncate_table(
     // 3. Build the collector. TRUNCATE never adds files, so no
     //    `inject_written_file` calls — the collector exists only to carry the
     //    op-kind, table identifier, base snapshot id, sequence number, schema,
-    //    and partition spec into `run_iceberg_commit`.
+    //    and partition spec into `run_iceberg_commit_typed`.
     let metadata = table.metadata();
     let staging_dir = format!(
         "{}/data/_staging/{}",
@@ -114,7 +114,7 @@ pub(crate) fn execute_iceberg_truncate_table(
 
     // 5. Drive commit + abort cleanup on failure.
     let _outcome = block_on_iceberg(async {
-        run_iceberg_commit(RunInput {
+        run_iceberg_commit_typed(RunInput {
             collector: collector.clone(),
             catalog: catalog.clone(),
             table,
@@ -126,7 +126,9 @@ pub(crate) fn execute_iceberg_truncate_table(
             snapshot_properties: BTreeMap::new(),
         })
         .await
-    })??;
+    })
+    .map_err(|err| format!("iceberg truncate commit runtime failed: {err}"))?
+    .map_err(iceberg_commit_error_to_user_message)?;
 
     // 6. Invalidate the iceberg entry's table cache so subsequent SELECTs
     //    see the new (zero-row) snapshot.
@@ -138,4 +140,41 @@ pub(crate) fn execute_iceberg_truncate_table(
 
 fn target_string(t: &TargetBackend) -> String {
     format!("{}.{}.{}", t.catalog, t.namespace, t.table)
+}
+
+fn iceberg_commit_error_to_user_message(
+    err: crate::connector::iceberg::commit::CommitServiceError,
+) -> String {
+    crate::common::engine_error::EngineError::from(err).to_bracketed_user_message()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connector::iceberg::commit::{CommitOpKind, CommitServiceError, RecoveryEvidence};
+
+    #[test]
+    fn truncate_formats_commit_unknown_at_boundary() {
+        let staging_dir = "s3://warehouse/db/t/data/_staging/truncate-attempt".to_string();
+        let err = CommitServiceError::unknown(
+            "catalog transport disconnected".to_string(),
+            RecoveryEvidence {
+                table_ident: "db.t".to_string(),
+                op_kind: CommitOpKind::Truncate,
+                base_snapshot_id: Some(42),
+                base_sequence_number: 7,
+                staging_dir: staging_dir.clone(),
+            },
+        );
+
+        let message = iceberg_commit_error_to_user_message(err);
+        assert!(
+            message.starts_with("[CommitUnknown] iceberg commit unknown"),
+            "got: {message}"
+        );
+        assert!(
+            message.contains(&staging_dir),
+            "message should contain staging dir {staging_dir}, got: {message}"
+        );
+    }
 }
