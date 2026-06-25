@@ -16,10 +16,10 @@ use crate::connector::iceberg::changes::{
     IcebergChangePolicySignal, plan_changes, policy_signal_from_change_error,
 };
 use crate::connector::iceberg::commit::{
-    CommitOpKind, CommitOutcome, CommitServiceError, IcebergCommitCollector, MvRefreshPublishPlan,
-    MvRefreshSnapshotMarker, PositionDeleteGroup, RecoveryEvidence, RefAction, RefActionPlan,
-    RunInput, execute_ref_action, publish_staging_branch_to_main, run_iceberg_commit_typed,
-    snapshot_matches_refresh_marker,
+    CleanupAttempt, CommitOpKind, CommitOutcome, CommitServiceError, IcebergCommitCollector,
+    MvRefreshPublishPlan, MvRefreshSnapshotMarker, PositionDeleteGroup, RecoveryEvidence,
+    RefAction, RefActionPlan, RunInput, execute_ref_action, publish_staging_branch_to_main,
+    run_iceberg_commit_typed, snapshot_matches_refresh_marker,
 };
 use crate::connector::iceberg::data_writer::{
     write_record_batches_as_data_files, written_file_to_sink_commit_info_for_metadata,
@@ -6686,22 +6686,64 @@ fn handle_iceberg_mv_commit_service_error(
         CommitServiceError::KnownUncommitted { .. } | CommitServiceError::InvalidInput { .. }
     );
     let mut refresh_err = refresh_error_from_commit_error(err.clone());
+    let mut fact_error = err;
     if cleanup_staging_branch {
-        refresh_err.message = cleanup_iceberg_mv_staging_branch_after_failure(
-            state,
-            target,
-            target_entry,
-            staging_branch,
-            refresh_err.message,
-        );
+        if let Err(cleanup_err) =
+            drop_iceberg_mv_staging_branch(state, target, target_entry, staging_branch)
+        {
+            refresh_err.message = mv_staging_cleanup_failure_message(
+                refresh_err.message,
+                staging_branch,
+                &cleanup_err,
+            );
+            fact_error = commit_error_with_mv_staging_cleanup_failure(
+                fact_error,
+                staging_branch,
+                cleanup_err,
+            );
+        }
     }
-    if let Err(mark_err) = mark_iceberg_mv_refresh_commit_error(state, refresh_id, &err) {
+    if let Err(mark_err) = mark_iceberg_mv_refresh_commit_error(state, refresh_id, &fact_error) {
         refresh_err.message = format!(
             "{}; additionally failed to record mv refresh commit error: {mark_err}",
             refresh_err.message
         );
     }
     IcebergMvRefreshExecutionError::commit(refresh_err)
+}
+
+fn mv_staging_cleanup_failure_message(
+    message: impl Into<String>,
+    staging_branch: &str,
+    cleanup_error: &str,
+) -> String {
+    format!(
+        "{}; additionally failed to drop staging branch {staging_branch}: {cleanup_error}",
+        message.into()
+    )
+}
+
+fn commit_error_with_mv_staging_cleanup_failure(
+    commit_error: CommitServiceError,
+    staging_branch: &str,
+    cleanup_error: String,
+) -> CommitServiceError {
+    let cleanup_path = format!("branch:{staging_branch}");
+    match commit_error {
+        CommitServiceError::KnownUncommitted { message, cleanup } => {
+            let mut error_paths = cleanup.error_paths;
+            error_paths.push(cleanup_path);
+            CommitServiceError::known_uncommitted(
+                mv_staging_cleanup_failure_message(message, staging_branch, &cleanup_error),
+                CleanupAttempt::completed(error_paths),
+            )
+        }
+        CommitServiceError::InvalidInput { message } => CommitServiceError::known_uncommitted(
+            mv_staging_cleanup_failure_message(message, staging_branch, &cleanup_error),
+            CleanupAttempt::completed(vec![cleanup_path]),
+        ),
+        other => other,
+    }
 }
 
 fn handle_iceberg_mv_definite_pre_publish_error(
@@ -16311,6 +16353,69 @@ mod tests {
             "s3://warehouse/mv_orders/_staging/typed-unknown"
         );
         assert!(!operation.state.is_finished());
+    }
+
+    #[test]
+    fn mv_staging_cleanup_failure_on_known_uncommitted_requests_retry_abort() {
+        let commit_error = crate::connector::iceberg::commit::CommitServiceError::known_uncommitted(
+            "commit conflict before catalog update".to_string(),
+            crate::connector::iceberg::commit::CleanupAttempt::completed(Vec::new()),
+        );
+
+        let commit_error = commit_error_with_mv_staging_cleanup_failure(
+            commit_error,
+            "__nova_mv_refresh_cleanup_failed",
+            "drop ref failed".to_string(),
+        );
+        let fact = operation_fact_from_commit_result(Err(&commit_error));
+
+        let cleanup = fact.cleanup_outcome.expect("cleanup outcome");
+        assert!(cleanup.attempted);
+        assert_eq!(cleanup.error_count, 1);
+        assert_eq!(
+            cleanup.error_paths,
+            vec!["branch:__nova_mv_refresh_cleanup_failed".to_string()]
+        );
+        let failure = fact.failure.expect("failure");
+        assert_eq!(
+            failure.next_action,
+            crate::meta::repository::iceberg_operation::IcebergOperationNextAction::RetryAbort
+        );
+        assert!(
+            failure
+                .message
+                .contains("commit conflict before catalog update")
+        );
+        assert!(failure.message.contains("drop ref failed"));
+    }
+
+    #[test]
+    fn mv_staging_cleanup_failure_on_invalid_input_records_retry_abort() {
+        let commit_error = crate::connector::iceberg::commit::CommitServiceError::invalid_input(
+            "invalid commit input".to_string(),
+        );
+
+        let commit_error = commit_error_with_mv_staging_cleanup_failure(
+            commit_error,
+            "__nova_mv_refresh_invalid_cleanup_failed",
+            "drop ref failed".to_string(),
+        );
+        let fact = operation_fact_from_commit_result(Err(&commit_error));
+
+        let cleanup = fact.cleanup_outcome.expect("cleanup outcome");
+        assert!(cleanup.attempted);
+        assert_eq!(cleanup.error_count, 1);
+        assert_eq!(
+            cleanup.error_paths,
+            vec!["branch:__nova_mv_refresh_invalid_cleanup_failed".to_string()]
+        );
+        let failure = fact.failure.expect("failure");
+        assert_eq!(
+            failure.next_action,
+            crate::meta::repository::iceberg_operation::IcebergOperationNextAction::RetryAbort
+        );
+        assert!(failure.message.contains("invalid commit input"));
+        assert!(failure.message.contains("drop ref failed"));
     }
 
     #[test]
