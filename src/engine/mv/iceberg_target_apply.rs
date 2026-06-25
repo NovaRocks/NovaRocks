@@ -822,22 +822,6 @@ pub(crate) fn resolve_target_positions_via_framework(
             matched_positions: Vec::new(),
         });
     }
-    if matches!(
-        requested_keys,
-        ApplyKeyRequest::BranchInt64(_) | ApplyKeyRequest::BranchUtf8(_)
-    ) {
-        return Err(
-            "framework target locator does not yet support branch-scoped apply-key requests"
-                .to_string(),
-        );
-    }
-    if partition_filter.is_allow_list() {
-        return Err(
-            "framework target locator does not yet support partition allow-list filters"
-                .to_string(),
-        );
-    }
-
     let requested = requested_apply_key_values(requested_keys);
     let request_is_i64 = matches!(requested_keys, ApplyKeyRequest::Int64(_));
     let (locator_registration, sql) = register_scoped_framework_locator_table_for_query(
@@ -848,6 +832,7 @@ pub(crate) fn resolve_target_positions_via_framework(
         target_table_name,
         apply_key_column,
         requested_keys,
+        partition_filter,
     )?;
     let session = crate::engine::StandaloneSession {
         inner: std::sync::Arc::clone(state),
@@ -865,14 +850,31 @@ pub(crate) fn resolve_target_positions_via_framework(
     let empty_deletes_by_file = std::collections::HashMap::new();
     let mut matches = std::collections::HashMap::<ApplyKeyValue, (String, i64)>::new();
     for chunk in &result.chunks {
-        process_apply_key_locator_batch(
-            &chunk.batch,
-            apply_key_column,
-            request_is_i64,
-            &requested,
-            &mut matches,
-            &empty_deletes_by_file,
-        )?;
+        if matches!(requested_keys, ApplyKeyRequest::BranchInt64(_)) {
+            process_branch_i64_apply_key_locator_batch(
+                &chunk.batch,
+                &requested,
+                &mut matches,
+                &empty_deletes_by_file,
+            )?;
+        } else if matches!(requested_keys, ApplyKeyRequest::BranchUtf8(_)) {
+            process_branch_utf8_apply_key_locator_batch(
+                &chunk.batch,
+                apply_key_column,
+                &requested,
+                &mut matches,
+                &empty_deletes_by_file,
+            )?;
+        } else {
+            process_apply_key_locator_batch(
+                &chunk.batch,
+                apply_key_column,
+                request_is_i64,
+                &requested,
+                &mut matches,
+                &empty_deletes_by_file,
+            )?;
+        }
     }
 
     ensure_all_requested_apply_keys_matched(&requested, &matches)?;
@@ -890,6 +892,7 @@ fn register_scoped_framework_locator_table_for_query(
     target_table_name: &str,
     apply_key_column: &str,
     requested_keys: ApplyKeyRequest<'_>,
+    partition_filter: &TargetPartitionFilter,
 ) -> Result<(ScopedFrameworkLocatorTable, String), String> {
     for _ in 0..1024 {
         let locator_table_name =
@@ -901,6 +904,7 @@ fn register_scoped_framework_locator_table_for_query(
             target_namespace,
             &locator_table_name,
             apply_key_column,
+            partition_filter,
         )?;
         let sql = framework_locator_select_sql(
             target_namespace,
@@ -1086,6 +1090,7 @@ fn build_locator_visible_target_table_def(
     target_namespace: &str,
     target_table_name: &str,
     apply_key_column: &str,
+    partition_filter: &TargetPartitionFilter,
 ) -> Result<crate::sql::catalog::TableDef, String> {
     let entry = framework_locator_catalog_entry(state, target_catalog_name, target_table)?;
     let files = match target_table
@@ -1101,6 +1106,7 @@ fn build_locator_visible_target_table_def(
         }
         None => Vec::new(),
     };
+    let files = filter_locator_data_files_by_partition(target_table, files, partition_filter)?;
     let loaded =
         framework_locator_loaded_table(target_table, entry.object_store_config().cloned())?;
     let table_def = crate::connector::iceberg::catalog::build_iceberg_table_def_with_files(
@@ -1112,6 +1118,78 @@ fn build_locator_visible_target_table_def(
         files,
     )?;
     expose_physical_apply_key_for_locator_registration(table_def, target_table, apply_key_column)
+}
+
+fn filter_locator_data_files_by_partition(
+    target_table: &iceberg::table::Table,
+    files: Vec<crate::connector::iceberg::catalog::registry::DataFileWithStats>,
+    partition_filter: &TargetPartitionFilter,
+) -> Result<Vec<crate::connector::iceberg::catalog::registry::DataFileWithStats>, String> {
+    if !partition_filter.is_allow_list() {
+        return Ok(files);
+    }
+
+    let target_metadata = target_table.metadata_ref();
+    files
+        .into_iter()
+        .filter_map(|file| {
+            match locator_data_file_matches_partition_filter(
+                &target_metadata,
+                &file,
+                partition_filter,
+            ) {
+                Ok(true) => Some(Ok(file)),
+                Ok(false) => None,
+                Err(err) => Some(Err(err)),
+            }
+        })
+        .collect()
+}
+
+fn locator_data_file_matches_partition_filter(
+    target_metadata: &iceberg::spec::TableMetadata,
+    file: &crate::connector::iceberg::catalog::registry::DataFileWithStats,
+    partition_filter: &TargetPartitionFilter,
+) -> Result<bool, String> {
+    let partition_struct = file.partition_values.as_ref().ok_or_else(|| {
+        format!(
+            "iceberg MV target locator: data file `{}` is missing partition metadata",
+            file.path
+        )
+    })?;
+    let spec_id = file
+        .partition_spec_id
+        .unwrap_or_else(|| target_metadata.default_partition_spec().spec_id());
+    let values = crate::connector::iceberg::changes::change_partition_field_values(
+        target_metadata,
+        spec_id,
+        partition_struct,
+    )
+    .map_err(|e| {
+        format!(
+            "iceberg MV target locator: cannot derive partition values for `{}`: {e}",
+            file.path
+        )
+    })?;
+    let mut fields = Vec::with_capacity(values.len());
+    for value in &values {
+        let mv_value = crate::engine::mv::partition::mapping::change_partition_value_to_mv_value(
+            &file.path,
+            &value.value,
+        )?;
+        fields.push(crate::engine::mv::partition::MvPartitionKeyField::new(
+            value.field_name.clone(),
+            mv_value,
+        ));
+    }
+    let key_spec_id = match partition_filter {
+        TargetPartitionFilter::AllowList(set) => {
+            set.iter().next().map(|key| key.spec_id).unwrap_or(spec_id)
+        }
+        TargetPartitionFilter::None => spec_id,
+    };
+    let key = crate::engine::mv::partition::MvPartitionKey::new(key_spec_id, fields);
+    Ok(partition_filter.matches(&key))
 }
 
 fn framework_locator_catalog_entry(
@@ -1271,34 +1349,80 @@ fn framework_locator_select_sql(
     );
     let apply_key = quote_sql_identifier(apply_key_column);
     let in_list = framework_locator_in_list(requested_keys)?;
+    let mut projections = vec![quote_sql_identifier("_file"), quote_sql_identifier("_pos")];
+    if matches!(
+        requested_keys,
+        ApplyKeyRequest::BranchInt64(_) | ApplyKeyRequest::BranchUtf8(_)
+    ) {
+        projections.push(quote_sql_identifier(ICEBERG_MV_BRANCH_ID_COLUMN));
+    }
+    projections.push(apply_key.clone());
+    let mut predicates = vec![format!("{apply_key} IN ({in_list})")];
+    if let Some(branch_in_list) = framework_locator_branch_id_in_list(requested_keys) {
+        predicates.push(format!(
+            "{} IN ({})",
+            quote_sql_identifier(ICEBERG_MV_BRANCH_ID_COLUMN),
+            branch_in_list
+        ));
+    }
     Ok(format!(
-        "SELECT {}, {}, {} FROM {} WHERE {} IN ({})",
-        quote_sql_identifier("_file"),
-        quote_sql_identifier("_pos"),
-        apply_key,
+        "SELECT {} FROM {} WHERE {}",
+        projections.join(", "),
         table_name,
-        apply_key,
-        in_list
+        predicates.join(" AND ")
     ))
 }
 
 fn framework_locator_in_list(requested_keys: ApplyKeyRequest<'_>) -> Result<String, String> {
     match requested_keys {
-        ApplyKeyRequest::Int64(keys) => Ok(keys
-            .iter()
-            .map(i64::to_string)
-            .collect::<Vec<_>>()
-            .join(", ")),
-        ApplyKeyRequest::Utf8(keys) => Ok(keys
-            .iter()
-            .map(|key| quote_sql_string_literal(key))
-            .collect::<Vec<_>>()
-            .join(", ")),
-        ApplyKeyRequest::BranchInt64(_) | ApplyKeyRequest::BranchUtf8(_) => Err(
-            "framework target locator does not yet support branch-scoped apply-key requests"
-                .to_string(),
-        ),
+        ApplyKeyRequest::Int64(keys) => Ok(join_i64_in_list(keys.iter().copied())),
+        ApplyKeyRequest::Utf8(keys) => Ok(join_string_in_list(keys.iter().map(String::as_str))),
+        ApplyKeyRequest::BranchInt64(keys) => {
+            Ok(join_i64_in_list(keys.iter().map(|key| key.base_row_id)))
+        }
+        ApplyKeyRequest::BranchUtf8(keys) => {
+            Ok(join_string_in_list(keys.iter().map(|key| key.key.as_str())))
+        }
     }
+}
+
+fn framework_locator_branch_id_in_list(requested_keys: ApplyKeyRequest<'_>) -> Option<String> {
+    match requested_keys {
+        ApplyKeyRequest::BranchInt64(keys) => {
+            Some(join_i32_in_list(keys.iter().map(|key| key.branch_id)))
+        }
+        ApplyKeyRequest::BranchUtf8(keys) => {
+            Some(join_i32_in_list(keys.iter().map(|key| key.branch_id)))
+        }
+        ApplyKeyRequest::Int64(_) | ApplyKeyRequest::Utf8(_) => None,
+    }
+}
+
+fn join_i64_in_list(values: impl Iterator<Item = i64>) -> String {
+    values
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn join_i32_in_list(values: impl Iterator<Item = i32>) -> String {
+    values
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn join_string_in_list<'a>(values: impl Iterator<Item = &'a str>) -> String {
+    values
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(quote_sql_string_literal)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn quote_sql_identifier(identifier: &str) -> String {
@@ -2231,6 +2355,164 @@ mod tests {
         }
     }
 
+    struct BranchApplyKeyTargetFixture {
+        table: iceberg::table::Table,
+        file_paths: Vec<String>,
+        _catalog: std::sync::Arc<dyn iceberg::Catalog>,
+        _warehouse_dir: tempfile::TempDir,
+    }
+
+    fn build_branch_apply_key_target_with_rows() -> BranchApplyKeyTargetFixture {
+        use iceberg::spec::{
+            FormatVersion, NestedField, PrimitiveType, Schema as IcebergSchema, Type,
+        };
+        use iceberg::transaction::{ApplyTransactionAction, Transaction};
+        use iceberg::{NamespaceIdent, TableCreation, TableIdent};
+        use uuid::Uuid;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let warehouse_dir = tempfile::Builder::new()
+            .prefix("novarocks-branch-target-apply-")
+            .tempdir()
+            .expect("warehouse tempdir");
+        let warehouse = format!("file://{}", warehouse_dir.path().display());
+        let (table, file_paths, catalog) = rt.block_on(async {
+            let entry = crate::connector::iceberg::catalog::registry::build_catalog_entry(
+                "ice",
+                &[
+                    ("type".to_string(), "iceberg".to_string()),
+                    ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                    ("iceberg.catalog.warehouse".to_string(), warehouse),
+                ],
+            )
+            .expect("build hadoop catalog entry");
+            let catalog =
+                crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)
+                    .expect("build hadoop catalog");
+
+            let namespace = NamespaceIdent::new("db".to_string());
+            catalog
+                .create_namespace(&namespace, std::collections::HashMap::new())
+                .await
+                .expect("create_namespace");
+
+            let schema = IcebergSchema::builder()
+                .with_fields(vec![
+                    NestedField::required(
+                        1,
+                        ICEBERG_MV_BRANCH_ID_COLUMN,
+                        Type::Primitive(PrimitiveType::Int),
+                    )
+                    .into(),
+                    NestedField::required(
+                        2,
+                        ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+                        Type::Primitive(PrimitiveType::String),
+                    )
+                    .into(),
+                    NestedField::required(
+                        3,
+                        ICEBERG_MV_APPLY_KEY_COLUMN,
+                        Type::Primitive(PrimitiveType::Long),
+                    )
+                    .into(),
+                ])
+                .build()
+                .expect("build schema");
+
+            let table_ident = TableIdent::new(namespace.clone(), "mv_branch_target".to_string());
+            let table = catalog
+                .create_table(
+                    &namespace,
+                    TableCreation::builder()
+                        .name("mv_branch_target".to_string())
+                        .schema(schema)
+                        .properties([
+                            ("write.row-lineage".to_string(), "true".to_string()),
+                            (
+                                ICEBERG_MV_PROP_APPLY_KEY_COLUMN.to_string(),
+                                ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
+                            ),
+                            (
+                                ICEBERG_MV_PROP_APPLY_KEY_SOURCE.to_string(),
+                                ICEBERG_MV_APPLY_KEY_SOURCE_JOIN_ROW_KEY.to_string(),
+                            ),
+                            (
+                                ICEBERG_MV_PROP_APPLY_KEY_FIELD_ID.to_string(),
+                                "2".to_string(),
+                            ),
+                        ])
+                        .format_version(FormatVersion::V3)
+                        .build(),
+                )
+                .await
+                .expect("create_table");
+
+            let arrow_schema = Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new(
+                    ICEBERG_MV_BRANCH_ID_COLUMN,
+                    arrow::datatypes::DataType::Int32,
+                    false,
+                ),
+                arrow::datatypes::Field::new(
+                    ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+                    arrow::datatypes::DataType::Utf8,
+                    false,
+                ),
+                arrow::datatypes::Field::new(
+                    ICEBERG_MV_APPLY_KEY_COLUMN,
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
+            ]));
+            let batch = RecordBatch::try_new(
+                arrow_schema,
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2, 2])) as ArrayRef,
+                    Arc::new(StringArray::from(vec!["shared", "shared", "other"])) as ArrayRef,
+                    Arc::new(Int64Array::from(vec![100, 100, 200])) as ArrayRef,
+                ],
+            )
+            .expect("branch batch");
+
+            let data_files =
+                crate::connector::iceberg::data_writer::write_record_batches_as_data_files(
+                    &table,
+                    vec![batch],
+                )
+                .await
+                .expect("write data files");
+            assert_eq!(data_files.len(), 1, "expected one unpartitioned data file");
+            let file_paths = data_files
+                .iter()
+                .map(|file| file.file_path().to_string())
+                .collect::<Vec<_>>();
+
+            let tx = Transaction::new(&table);
+            let action = tx
+                .fast_append()
+                .add_data_files(data_files)
+                .set_commit_uuid(Uuid::new_v4());
+            let tx = action.apply(tx).expect("fast_append apply");
+            let _table_after: iceberg::table::Table = tx
+                .commit(catalog.as_ref())
+                .await
+                .expect("fast_append commit");
+
+            let refreshed = catalog
+                .load_table(&table_ident)
+                .await
+                .expect("reload table");
+            (refreshed, file_paths, catalog)
+        });
+        BranchApplyKeyTargetFixture {
+            table,
+            file_paths,
+            _catalog: catalog,
+            _warehouse_dir: warehouse_dir,
+        }
+    }
+
     fn hadoop_catalog_entry_for_target(
         target_table: &iceberg::table::Table,
     ) -> crate::connector::iceberg::catalog::IcebergCatalogEntry {
@@ -2447,6 +2729,44 @@ mod tests {
                 "group {idx} positions differ"
             );
         }
+    }
+
+    fn normalize_matched_positions(sets: &mut [TargetRowPositionSet]) {
+        for set in sets.iter_mut() {
+            set.positions.sort_unstable();
+        }
+        sets.sort_by(|left, right| {
+            left.referenced_data_file
+                .cmp(&right.referenced_data_file)
+                .then_with(|| left.positions.cmp(&right.positions))
+        });
+    }
+
+    fn assert_locator_results_eq(
+        expected: TargetApplyLocatorResult,
+        actual: TargetApplyLocatorResult,
+    ) {
+        assert_position_delete_groups_eq(expected.delete_groups, actual.delete_groups);
+        let mut expected_positions = expected.matched_positions;
+        let mut actual_positions = actual.matched_positions;
+        normalize_matched_positions(&mut expected_positions);
+        normalize_matched_positions(&mut actual_positions);
+        assert_eq!(expected_positions, actual_positions);
+    }
+
+    fn referenced_partitions_for_table(
+        table: &iceberg::table::Table,
+    ) -> crate::engine::delete_flow::ReferencedDataFilePartitions {
+        let snapshot_id = table
+            .metadata()
+            .current_snapshot()
+            .expect("target snapshot")
+            .snapshot_id();
+        crate::engine::delete_flow::load_referenced_data_file_partitions_at(
+            table,
+            Some(snapshot_id),
+        )
+        .expect("load referenced data file partitions")
     }
 
     #[test]
@@ -2869,6 +3189,188 @@ mod tests {
         );
         assert!(framework_err.contains("key-a"), "err={framework_err}");
         assert_eq!(direct_err, framework_err);
+        drop(loopback_backend);
+    }
+
+    #[test]
+    fn framework_locate_branch_parity() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let loopback_backend = crate::engine::install_all_in_one_loopback_backend_for_test()
+            .expect("install all-in-one loopback backend");
+        let state = std::sync::Arc::new(crate::engine::StandaloneState {
+            exchange_port: loopback_backend.exchange_port,
+            ..crate::engine::StandaloneState::default()
+        });
+        crate::connector::register_standalone_backends(&state);
+
+        let fixture = build_branch_apply_key_target_with_rows();
+        let empty_deletes = std::collections::HashMap::new();
+        let referenced = referenced_partitions_for_table(&fixture.table);
+
+        let branch_string_keys = vec![BranchStringApplyKey {
+            branch_id: 2,
+            key: "shared".to_string(),
+        }];
+        let direct_string = rt
+            .block_on(
+                super::locate_target_rows_by_branch_string_apply_key_with_matches(
+                    &fixture.table,
+                    ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+                    &branch_string_keys,
+                    &empty_deletes,
+                    &referenced,
+                    &TargetPartitionFilter::None,
+                ),
+            )
+            .expect("direct branch string locator");
+        assert_eq!(
+            direct_string.matched_positions,
+            vec![TargetRowPositionSet {
+                referenced_data_file: fixture.file_paths[0].clone(),
+                positions: vec![1],
+            }],
+            "branch-scoped string locator must choose branch=2, not branch=1"
+        );
+        let framework_string = super::resolve_target_positions_via_framework(
+            &state,
+            &fixture.table,
+            "ice",
+            "db",
+            "mv_target",
+            ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+            ApplyKeyRequest::BranchUtf8(&branch_string_keys),
+            &referenced,
+            &TargetPartitionFilter::None,
+        )
+        .expect("framework branch string locator");
+        assert_locator_results_eq(direct_string, framework_string);
+
+        let branch_i64_keys = vec![BranchApplyKey {
+            branch_id: 2,
+            base_row_id: 100,
+        }];
+        let direct_i64 = rt
+            .block_on(super::locate_target_rows_by_branch_apply_key_with_matches(
+                &fixture.table,
+                &branch_i64_keys,
+                &empty_deletes,
+                &referenced,
+                &TargetPartitionFilter::None,
+            ))
+            .expect("direct branch i64 locator");
+        assert_eq!(
+            direct_i64.matched_positions,
+            vec![TargetRowPositionSet {
+                referenced_data_file: fixture.file_paths[0].clone(),
+                positions: vec![1],
+            }],
+            "branch-scoped i64 locator must choose branch=2, not branch=1"
+        );
+        let framework_i64 = super::resolve_target_positions_via_framework(
+            &state,
+            &fixture.table,
+            "ice",
+            "db",
+            "mv_target",
+            ICEBERG_MV_APPLY_KEY_COLUMN,
+            ApplyKeyRequest::BranchInt64(&branch_i64_keys),
+            &referenced,
+            &TargetPartitionFilter::None,
+        )
+        .expect("framework branch i64 locator");
+        assert_locator_results_eq(direct_i64, framework_i64);
+        drop(loopback_backend);
+    }
+
+    #[test]
+    fn framework_locate_allow_list_parity() {
+        use crate::engine::mv::partition::{MvPartitionKey, MvPartitionKeyField, MvPartitionValue};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let loopback_backend = crate::engine::install_all_in_one_loopback_backend_for_test()
+            .expect("install all-in-one loopback backend");
+        let state = std::sync::Arc::new(crate::engine::StandaloneState {
+            exchange_port: loopback_backend.exchange_port,
+            ..crate::engine::StandaloneState::default()
+        });
+        crate::connector::register_standalone_backends(&state);
+
+        let fixture = build_partitioned_apply_key_target_with_rows();
+        let referenced = referenced_partitions_for_table(&fixture.table);
+        let empty_deletes = std::collections::HashMap::new();
+        let allow_key = MvPartitionKey::new(
+            0,
+            vec![MvPartitionKeyField::new(
+                "region".to_string(),
+                MvPartitionValue::String("a".to_string()),
+            )],
+        );
+        let filter = TargetPartitionFilter::AllowList(
+            std::iter::once(allow_key).collect::<std::collections::BTreeSet<_>>(),
+        );
+
+        let requested_key_a = vec!["key-a".to_string()];
+        let direct_key_a = rt
+            .block_on(super::locate_target_rows_by_string_apply_key_with_matches(
+                &fixture.table,
+                ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+                &requested_key_a,
+                &empty_deletes,
+                &referenced,
+                &filter,
+            ))
+            .expect("direct allow-list locator");
+        assert_eq!(
+            direct_key_a.matched_positions,
+            vec![TargetRowPositionSet {
+                referenced_data_file: fixture.file_paths[0].clone(),
+                positions: vec![0],
+            }],
+            "allow-list must keep only region=a / key-a"
+        );
+        let framework_key_a = super::resolve_target_positions_via_framework(
+            &state,
+            &fixture.table,
+            "ice",
+            "db",
+            "mv_target",
+            ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+            ApplyKeyRequest::Utf8(&requested_key_a),
+            &referenced,
+            &filter,
+        )
+        .expect("framework allow-list locator");
+        assert_locator_results_eq(direct_key_a, framework_key_a);
+
+        let requested_key_b = vec!["key-b".to_string()];
+        let direct_key_b = rt.block_on(super::locate_target_rows_by_string_apply_key_with_matches(
+            &fixture.table,
+            ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+            &requested_key_b,
+            &empty_deletes,
+            &referenced,
+            &filter,
+        ));
+        let framework_key_b = super::resolve_target_positions_via_framework(
+            &state,
+            &fixture.table,
+            "ice",
+            "db",
+            "mv_target",
+            ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+            ApplyKeyRequest::Utf8(&requested_key_b),
+            &referenced,
+            &filter,
+        );
+        let direct_key_b_err = match direct_key_b {
+            Ok(_) => panic!("direct locator must prune region=b"),
+            Err(err) => err,
+        };
+        let framework_key_b_err = match framework_key_b {
+            Ok(_) => panic!("framework locator must prune region=b"),
+            Err(err) => err,
+        };
+        assert_eq!(direct_key_b_err, framework_key_b_err);
         drop(loopback_backend);
     }
 
