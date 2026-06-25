@@ -337,6 +337,33 @@ impl IcebergOperationRepository {
         Ok(load_versioned_operation(txn, operation_id)?.map(|versioned| versioned.value))
     }
 
+    pub fn record_commit_request(
+        &self,
+        txn: &mut dyn MetaWriteTxn,
+        operation_id: i64,
+        commit_request: String,
+        now_ms: i64,
+    ) -> RepositoryResult<()> {
+        let mut versioned = load_versioned_operation(txn, operation_id)?.ok_or_else(|| {
+            RepositoryError::not_found(format!("iceberg operation {operation_id} not found"))
+        })?;
+        if let Some(existing) = versioned.value.commit_request.as_ref() {
+            if existing == &commit_request {
+                return Ok(());
+            }
+            return Err(RepositoryError::conflict(format!(
+                "conflicting Iceberg operation commit request for operation {operation_id}"
+            )));
+        }
+        versioned.value.commit_request = Some(commit_request);
+        versioned.value.updated_at_ms = now_ms;
+        put_operation(
+            txn,
+            &versioned.value,
+            ExpectedRevision::Exact(versioned.record_revision),
+        )
+    }
+
     pub fn list_unfinished_operations(
         &self,
         txn: &dyn MetaReadTxn,

@@ -600,6 +600,62 @@ fn iceberg_operation_repository_create_load_and_list_unfinished()
 }
 
 #[test]
+fn iceberg_operation_repository_records_commit_request() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = IcebergOperationRepository::default();
+
+    let operation_id = {
+        let mut txn = provider.begin_write("create iceberg repartition operation")?;
+        let stored = repository.create_operation(
+            txn.as_mut(),
+            CreateIcebergOperationRequest {
+                operation_kind: IcebergOperationKind::Maintenance,
+                operation_subkind: Some("MV_REPARTITION".to_string()),
+                target: IcebergOperationTarget {
+                    catalog: "ice".to_string(),
+                    namespace: "analytics".to_string(),
+                    table: "mv_orders".to_string(),
+                    ref_name: Some("__nova_mv_repartition_1".to_string()),
+                },
+                attempt_id: "mv-repartition-1".to_string(),
+                base_snapshot_id: Some(42),
+                base_snapshot_map: BTreeMap::from([("ice.sales.orders".to_string(), 7)]),
+                staged_artifacts: vec!["branch:__nova_mv_repartition_1".to_string()],
+                created_at_ms: 1000,
+            },
+        )?;
+        txn.commit()?;
+        stored.operation_id
+    };
+
+    let commit_request = r#"{"kind":"MV_REPARTITION"}"#.to_string();
+    {
+        let mut txn = provider.begin_write("record iceberg operation commit request")?;
+        repository.record_commit_request(
+            txn.as_mut(),
+            operation_id,
+            commit_request.clone(),
+            1200,
+        )?;
+        txn.commit()?;
+    }
+
+    let read = provider.begin_read()?;
+    let loaded = repository
+        .load_operation(read.as_ref(), operation_id)?
+        .expect("operation should exist");
+    assert_eq!(
+        loaded.commit_request.as_deref(),
+        Some(commit_request.as_str())
+    );
+    assert_eq!(loaded.updated_at_ms, 1200);
+    assert_eq!(loaded.state, IcebergOperationState::Preparing);
+
+    Ok(())
+}
+
+#[test]
 fn iceberg_operation_repository_records_commit_unknown_fact_without_finishing()
 -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
