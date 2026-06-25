@@ -377,7 +377,7 @@ pub(crate) async fn locate_target_rows_by_branch_string_apply_key_with_matches(
 }
 
 #[derive(Clone, Copy)]
-enum ApplyKeyRequest<'a> {
+pub(crate) enum ApplyKeyRequest<'a> {
     Int64(&'a [i64]),
     Utf8(&'a [String]),
     BranchInt64(&'a [BranchApplyKey]),
@@ -803,6 +803,510 @@ fn build_target_apply_locator_result_from_apply_key_matches(
         delete_groups,
         matched_positions,
     })
+}
+
+pub(crate) fn resolve_target_positions_via_framework(
+    state: &std::sync::Arc<crate::engine::StandaloneState>,
+    target_table: &iceberg::table::Table,
+    target_catalog_name: &str,
+    target_namespace: &str,
+    target_table_name: &str,
+    apply_key_column: &str,
+    requested_keys: ApplyKeyRequest<'_>,
+    referenced_data_file_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
+    partition_filter: &TargetPartitionFilter,
+) -> Result<TargetApplyLocatorResult, String> {
+    if requested_keys.is_empty() {
+        return Ok(TargetApplyLocatorResult {
+            delete_groups: Vec::new(),
+            matched_positions: Vec::new(),
+        });
+    }
+    if matches!(
+        requested_keys,
+        ApplyKeyRequest::BranchInt64(_) | ApplyKeyRequest::BranchUtf8(_)
+    ) {
+        return Err(
+            "framework target locator does not yet support branch-scoped apply-key requests"
+                .to_string(),
+        );
+    }
+    if partition_filter.is_allow_list() {
+        return Err(
+            "framework target locator does not yet support partition allow-list filters"
+                .to_string(),
+        );
+    }
+
+    let requested = requested_apply_key_values(requested_keys);
+    let request_is_i64 = matches!(requested_keys, ApplyKeyRequest::Int64(_));
+    let (locator_registration, sql) = register_scoped_framework_locator_table_for_query(
+        state,
+        target_table,
+        target_catalog_name,
+        target_namespace,
+        target_table_name,
+        apply_key_column,
+        requested_keys,
+    )?;
+    let session = crate::engine::StandaloneSession {
+        inner: std::sync::Arc::clone(state),
+    };
+    let result = session.execute_in_context(&sql, None, target_namespace, None);
+    let result = result?;
+    locator_registration.cleanup()?;
+    let result = match result {
+        crate::engine::StatementResult::Query(result) => result,
+        crate::engine::StatementResult::Ok => {
+            return Err("framework target locator SELECT returned no rows schema".to_string());
+        }
+    };
+
+    let empty_deletes_by_file = std::collections::HashMap::new();
+    let mut matches = std::collections::HashMap::<ApplyKeyValue, (String, i64)>::new();
+    for chunk in &result.chunks {
+        process_apply_key_locator_batch(
+            &chunk.batch,
+            apply_key_column,
+            request_is_i64,
+            &requested,
+            &mut matches,
+            &empty_deletes_by_file,
+        )?;
+    }
+
+    ensure_all_requested_apply_keys_matched(&requested, &matches)?;
+    build_target_apply_locator_result_from_apply_key_matches(
+        matches,
+        referenced_data_file_partitions,
+    )
+}
+
+fn register_scoped_framework_locator_table_for_query(
+    state: &std::sync::Arc<crate::engine::StandaloneState>,
+    target_table: &iceberg::table::Table,
+    target_catalog_name: &str,
+    target_namespace: &str,
+    target_table_name: &str,
+    apply_key_column: &str,
+    requested_keys: ApplyKeyRequest<'_>,
+) -> Result<(ScopedFrameworkLocatorTable, String), String> {
+    for _ in 0..1024 {
+        let locator_table_name =
+            next_framework_locator_synthetic_table_name(target_table_name, target_table);
+        let table_def = build_locator_visible_target_table_def(
+            state,
+            target_table,
+            target_catalog_name,
+            target_namespace,
+            &locator_table_name,
+            apply_key_column,
+        )?;
+        let sql = framework_locator_select_sql(
+            target_namespace,
+            &locator_table_name,
+            apply_key_column,
+            requested_keys,
+        )?;
+        if let Some(registration) =
+            try_register_scoped_framework_locator_table(state, target_namespace, table_def)?
+        {
+            return Ok((registration, sql));
+        }
+    }
+    Err(
+        "framework target locator could not allocate a collision-free synthetic table name"
+            .to_string(),
+    )
+}
+
+fn try_register_scoped_framework_locator_table(
+    state: &std::sync::Arc<crate::engine::StandaloneState>,
+    namespace: &str,
+    table_def: crate::sql::catalog::TableDef,
+) -> Result<Option<ScopedFrameworkLocatorTable>, String> {
+    let table_name = table_def.name.clone();
+    let mut catalog = state
+        .catalog
+        .write()
+        .map_err(|e| format!("standalone catalog write lock: {e}"))?;
+    catalog
+        .create_database(namespace)
+        .map_err(|e| format!("create framework target locator database: {e}"))?;
+    match catalog.get(namespace, &table_name) {
+        Ok(_) => return Ok(None),
+        Err(err) if err.contains("unknown table") => {}
+        Err(err) => {
+            return Err(format!(
+                "check framework target locator synthetic table collision: {err}"
+            ));
+        }
+    }
+    let ownership_fingerprint = FrameworkLocatorTableFingerprint::from_table_def(&table_def);
+    catalog
+        .register(namespace, table_def)
+        .map_err(|e| format!("register framework target locator synthetic table: {e}"))?;
+    Ok(Some(ScopedFrameworkLocatorTable {
+        state: std::sync::Arc::clone(state),
+        namespace: namespace.to_string(),
+        table: table_name,
+        ownership_fingerprint,
+        active: true,
+    }))
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct FrameworkLocatorTableFingerprint {
+    columns: Vec<crate::engine::ColumnDef>,
+    iceberg_row_lineage_metadata_columns: Vec<crate::engine::ColumnDef>,
+    source_debug: String,
+}
+
+impl FrameworkLocatorTableFingerprint {
+    fn from_table_def(table_def: &crate::sql::catalog::TableDef) -> Self {
+        Self {
+            columns: table_def.columns.clone(),
+            iceberg_row_lineage_metadata_columns: table_def
+                .iceberg_row_lineage_metadata_columns
+                .clone(),
+            source_debug: format!("{:?}", table_def.source),
+        }
+    }
+
+    fn matches_table_def(&self, table_def: &crate::sql::catalog::TableDef) -> bool {
+        self.columns == table_def.columns
+            && self.iceberg_row_lineage_metadata_columns
+                == table_def.iceberg_row_lineage_metadata_columns
+            && self.source_debug == format!("{:?}", table_def.source)
+    }
+}
+
+struct ScopedFrameworkLocatorTable {
+    state: std::sync::Arc<crate::engine::StandaloneState>,
+    namespace: String,
+    table: String,
+    ownership_fingerprint: FrameworkLocatorTableFingerprint,
+    active: bool,
+}
+
+impl ScopedFrameworkLocatorTable {
+    fn cleanup(mut self) -> Result<(), String> {
+        self.cleanup_active()
+    }
+
+    fn cleanup_active(&mut self) -> Result<(), String> {
+        if !self.active {
+            return Ok(());
+        }
+
+        let mut catalog = self
+            .state
+            .catalog
+            .write()
+            .map_err(|e| format!("standalone catalog write lock: {e}"))?;
+        let current_table = match catalog.get(&self.namespace, &self.table) {
+            Ok(table_def) => table_def,
+            Err(err) if err.contains("unknown") => {
+                self.active = false;
+                return Ok(());
+            }
+            Err(err) => {
+                return Err(format!(
+                    "check framework target locator synthetic table cleanup ownership: {err}"
+                ));
+            }
+        };
+
+        if !self.ownership_fingerprint.matches_table_def(&current_table) {
+            self.active = false;
+            return Ok(());
+        }
+
+        match catalog.drop_table(&self.namespace, &self.table) {
+            Ok(()) => {
+                self.active = false;
+                Ok(())
+            }
+            Err(err) if err.contains("unknown") => {
+                self.active = false;
+                Ok(())
+            }
+            Err(err) => Err(format!(
+                "drop framework target locator synthetic table: {err}"
+            )),
+        }
+    }
+}
+
+impl Drop for ScopedFrameworkLocatorTable {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.cleanup_active();
+        }
+    }
+}
+
+fn next_framework_locator_synthetic_table_name(
+    target_table_name: &str,
+    target_table: &iceberg::table::Table,
+) -> String {
+    static NEXT_LOCATOR_TABLE_ID: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    let snapshot = target_table
+        .metadata()
+        .current_snapshot()
+        .map(|snapshot| snapshot.snapshot_id().to_string().replace('-', "m"))
+        .unwrap_or_else(|| "no_snapshot".to_string());
+    let target = framework_locator_identifier_token(target_table_name);
+    let nonce = NEXT_LOCATOR_TABLE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("__nova_mv_locator_{target}_{snapshot}_{nonce}")
+}
+
+fn framework_locator_identifier_token(identifier: &str) -> String {
+    let mut out = String::with_capacity(identifier.len().max(1));
+    for ch in identifier.chars() {
+        if ch == '_' || ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "target".to_string()
+    } else {
+        out
+    }
+}
+
+fn build_locator_visible_target_table_def(
+    state: &std::sync::Arc<crate::engine::StandaloneState>,
+    target_table: &iceberg::table::Table,
+    target_catalog_name: &str,
+    target_namespace: &str,
+    target_table_name: &str,
+    apply_key_column: &str,
+) -> Result<crate::sql::catalog::TableDef, String> {
+    let entry = framework_locator_catalog_entry(state, target_catalog_name, target_table)?;
+    let files = match target_table
+        .metadata()
+        .current_snapshot()
+        .map(|snapshot| snapshot.snapshot_id())
+    {
+        Some(snapshot_id) => {
+            crate::connector::iceberg::catalog::registry::extract_data_files_with_stats_at(
+                target_table,
+                snapshot_id,
+            )?
+        }
+        None => Vec::new(),
+    };
+    let loaded =
+        framework_locator_loaded_table(target_table, entry.object_store_config().cloned())?;
+    let table_def = crate::connector::iceberg::catalog::build_iceberg_table_def_with_files(
+        &entry,
+        target_catalog_name,
+        target_namespace,
+        target_table_name,
+        loaded,
+        files,
+    )?;
+    expose_physical_apply_key_for_locator_registration(table_def, target_table, apply_key_column)
+}
+
+fn framework_locator_catalog_entry(
+    state: &std::sync::Arc<crate::engine::StandaloneState>,
+    target_catalog_name: &str,
+    target_table: &iceberg::table::Table,
+) -> Result<crate::connector::iceberg::catalog::IcebergCatalogEntry, String> {
+    match state
+        .iceberg_catalogs
+        .read()
+        .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?
+        .get(target_catalog_name)
+    {
+        Ok(entry) => Ok(entry),
+        Err(_) => {
+            let warehouse_uri = framework_locator_local_warehouse_uri(target_table)?;
+            crate::connector::iceberg::catalog::registry::build_catalog_entry(
+                target_catalog_name,
+                &[
+                    ("type".to_string(), "iceberg".to_string()),
+                    ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                    ("iceberg.catalog.warehouse".to_string(), warehouse_uri),
+                ],
+            )
+        }
+    }
+}
+
+fn framework_locator_local_warehouse_uri(
+    target_table: &iceberg::table::Table,
+) -> Result<String, String> {
+    let location = target_table.metadata().location().trim_end_matches('/');
+    if !location.starts_with("file://") {
+        return Err(
+            "framework target locator requires the target Iceberg catalog to be registered for non-local tables"
+                .to_string(),
+        );
+    }
+    let ident = target_table.identifier();
+    let mut table_path_segments = ident.namespace().as_ref().clone();
+    table_path_segments.push(ident.name().to_string());
+    let table_path_suffix = format!("/{}", table_path_segments.join("/"));
+    Ok(location
+        .strip_suffix(&table_path_suffix)
+        .unwrap_or(location)
+        .to_string())
+}
+
+fn framework_locator_loaded_table(
+    target_table: &iceberg::table::Table,
+    object_store_config: Option<crate::fs::object_store::ObjectStoreConfig>,
+) -> Result<crate::connector::iceberg::catalog::IcebergLoadedTable, String> {
+    let iceberg_schema = target_table.metadata().current_schema();
+    let arrow_schema = iceberg::arrow::schema_to_arrow_schema(iceberg_schema)
+        .map_err(|e| format!("convert iceberg target schema to arrow schema failed: {e}"))?;
+    let columns = arrow_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let nested = iceberg_schema.field_by_name(field.name()).ok_or_else(|| {
+                format!(
+                    "iceberg target column `{}` missing from schema",
+                    field.name()
+                )
+            })?;
+            Ok(crate::engine::ColumnDef {
+                name: field.name().clone(),
+                data_type: field.data_type().clone(),
+                nullable: field.is_nullable(),
+                write_default: nested.write_default.clone(),
+                logical_type: None,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(crate::connector::iceberg::catalog::IcebergLoadedTable {
+        table: target_table.clone(),
+        columns,
+        logical_types: std::collections::HashMap::new(),
+        key_desc: None,
+        column_aggregations: std::collections::HashMap::new(),
+        object_store_config,
+    })
+}
+
+fn expose_physical_apply_key_for_locator_registration(
+    mut table_def: crate::sql::catalog::TableDef,
+    target_table: &iceberg::table::Table,
+    apply_key_column: &str,
+) -> Result<crate::sql::catalog::TableDef, String> {
+    let has_file = table_def
+        .iceberg_row_lineage_metadata_columns
+        .iter()
+        .any(|column| column.name == "_file");
+    let has_pos = table_def
+        .iceberg_row_lineage_metadata_columns
+        .iter()
+        .any(|column| column.name == "_pos");
+    if !has_file || !has_pos {
+        return Err(
+            "framework target locator registration missing _file/_pos metadata".to_string(),
+        );
+    }
+    if table_def
+        .columns
+        .iter()
+        .any(|column| column.name.eq_ignore_ascii_case(apply_key_column))
+    {
+        return Ok(table_def);
+    }
+
+    // Standard MV target registration hides the physical apply-key; the
+    // internal locator table re-exposes it only for this framework SELECT.
+    let apply_key = iceberg_column_def_for_locator(target_table, apply_key_column)?;
+    table_def.columns.insert(0, apply_key);
+    Ok(table_def)
+}
+
+fn iceberg_column_def_for_locator(
+    target_table: &iceberg::table::Table,
+    column_name: &str,
+) -> Result<crate::engine::ColumnDef, String> {
+    let iceberg_schema = target_table.metadata().current_schema();
+    let arrow_schema = iceberg::arrow::schema_to_arrow_schema(iceberg_schema)
+        .map_err(|e| format!("convert iceberg target schema to arrow schema failed: {e}"))?;
+    let field = arrow_schema
+        .fields()
+        .iter()
+        .find(|field| field.name().eq_ignore_ascii_case(column_name))
+        .ok_or_else(|| {
+            format!("iceberg MV target schema is missing apply-key column {column_name}")
+        })?;
+    let nested = iceberg_schema.field_by_name(field.name()).ok_or_else(|| {
+        format!(
+            "iceberg target column `{}` missing from schema",
+            field.name()
+        )
+    })?;
+    Ok(crate::engine::ColumnDef {
+        name: field.name().clone(),
+        data_type: field.data_type().clone(),
+        nullable: field.is_nullable(),
+        write_default: nested.write_default.clone(),
+        logical_type: None,
+    })
+}
+
+fn framework_locator_select_sql(
+    target_namespace: &str,
+    target_table_name: &str,
+    apply_key_column: &str,
+    requested_keys: ApplyKeyRequest<'_>,
+) -> Result<String, String> {
+    let table_name = format!(
+        "{}.{}",
+        quote_sql_identifier(target_namespace),
+        quote_sql_identifier(target_table_name)
+    );
+    let apply_key = quote_sql_identifier(apply_key_column);
+    let in_list = framework_locator_in_list(requested_keys)?;
+    Ok(format!(
+        "SELECT {}, {}, {} FROM {} WHERE {} IN ({})",
+        quote_sql_identifier("_file"),
+        quote_sql_identifier("_pos"),
+        apply_key,
+        table_name,
+        apply_key,
+        in_list
+    ))
+}
+
+fn framework_locator_in_list(requested_keys: ApplyKeyRequest<'_>) -> Result<String, String> {
+    match requested_keys {
+        ApplyKeyRequest::Int64(keys) => Ok(keys
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")),
+        ApplyKeyRequest::Utf8(keys) => Ok(keys
+            .iter()
+            .map(|key| quote_sql_string_literal(key))
+            .collect::<Vec<_>>()
+            .join(", ")),
+        ApplyKeyRequest::BranchInt64(_) | ApplyKeyRequest::BranchUtf8(_) => Err(
+            "framework target locator does not yet support branch-scoped apply-key requests"
+                .to_string(),
+        ),
+    }
+}
+
+fn quote_sql_identifier(identifier: &str) -> String {
+    format!("`{}`", identifier.replace('`', "``"))
+}
+
+fn quote_sql_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 async fn locate_target_rows_by_apply_key_impl(
@@ -1838,17 +2342,6 @@ mod tests {
         }
     }
 
-    async fn pending_resolve_target_positions_via_framework(
-        _target_table: &iceberg::table::Table,
-        _apply_key_column: &str,
-        _requested_keys: &[String],
-        _existing_deletes_by_file: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
-        _referenced_data_file_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
-        _partition_filter: &TargetPartitionFilter,
-    ) -> Result<Vec<PositionDeleteGroup>, String> {
-        panic!("pending framework locator implementation")
-    }
-
     #[test]
     fn spike_framework_select_file_pos_on_target() {
         use arrow::array::{Int64Array, StringArray};
@@ -2025,10 +2518,66 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "pending framework locator implementation"]
     fn framework_locate_matches_direct_locator_partitioned() {
         let rt = tokio::runtime::Runtime::new().unwrap();
+        let loopback_backend = crate::engine::install_all_in_one_loopback_backend_for_test()
+            .expect("install all-in-one loopback backend");
+        let state = std::sync::Arc::new(crate::engine::StandaloneState {
+            exchange_port: loopback_backend.exchange_port,
+            ..crate::engine::StandaloneState::default()
+        });
+        crate::connector::register_standalone_backends(&state);
+
         let fixture = build_partitioned_apply_key_target_with_rows();
+        let snapshot_id = fixture
+            .table
+            .metadata()
+            .current_snapshot()
+            .expect("target snapshot")
+            .snapshot_id();
+        let data_files =
+            crate::connector::iceberg::catalog::registry::extract_data_files_with_stats_at(
+                &fixture.table,
+                snapshot_id,
+            )
+            .expect("extract target data files");
+        let entry = crate::connector::iceberg::catalog::registry::build_catalog_entry(
+            "ice",
+            &[
+                ("type".to_string(), "iceberg".to_string()),
+                ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                (
+                    "iceberg.catalog.warehouse".to_string(),
+                    fixture
+                        .table
+                        .metadata()
+                        .location()
+                        .strip_suffix("/db/mv_apply_target")
+                        .expect("target table location under warehouse")
+                        .to_string(),
+                ),
+            ],
+        )
+        .expect("build iceberg catalog entry");
+        let standard_table_def =
+            crate::connector::iceberg::catalog::build_iceberg_table_def_with_files(
+                &entry,
+                "ice",
+                "db",
+                "mv_target",
+                loaded_partitioned_apply_key_target(&fixture.table),
+                data_files,
+            )
+            .expect("build standard target table def");
+        assert_standard_mv_target_table_def_hides_physical_apply_key(&standard_table_def);
+        {
+            let mut catalog_guard = state.catalog.write().expect("standalone catalog");
+            catalog_guard.create_database("db").expect("create db");
+            catalog_guard
+                .register("db", standard_table_def)
+                .expect("register standard target table def");
+        }
+
         let requested = vec!["key-a".to_string(), "key-b".to_string()];
         let empty_deletes = std::collections::HashMap::new();
         let mut referenced: crate::engine::delete_flow::ReferencedDataFilePartitions =
@@ -2054,18 +2603,160 @@ mod tests {
             ))
             .expect("direct apply-key locator");
 
-        let framework_groups = rt
-            .block_on(pending_resolve_target_positions_via_framework(
-                &fixture.table,
-                ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
-                &requested,
-                &empty_deletes,
-                &referenced,
-                &TargetPartitionFilter::None,
-            ))
-            .expect("framework apply-key locator");
+        let framework_groups = super::resolve_target_positions_via_framework(
+            &state,
+            &fixture.table,
+            "ice",
+            "db",
+            "mv_target",
+            ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+            ApplyKeyRequest::Utf8(&requested),
+            &referenced,
+            &TargetPartitionFilter::None,
+        )
+        .expect("framework apply-key locator")
+        .delete_groups;
 
         assert_position_delete_groups_eq(direct_groups, framework_groups);
+        let target_def_after_framework = state
+            .catalog
+            .read()
+            .expect("standalone catalog")
+            .get("db", "mv_target")
+            .expect("registered target table");
+        assert_standard_mv_target_table_def_hides_physical_apply_key(&target_def_after_framework);
+        drop(loopback_backend);
+    }
+
+    #[test]
+    fn framework_locator_preserves_preexisting_synthetic_name_collision() {
+        let loopback_backend = crate::engine::install_all_in_one_loopback_backend_for_test()
+            .expect("install all-in-one loopback backend");
+        let state = std::sync::Arc::new(crate::engine::StandaloneState {
+            exchange_port: loopback_backend.exchange_port,
+            ..crate::engine::StandaloneState::default()
+        });
+        crate::connector::register_standalone_backends(&state);
+
+        let fixture = build_partitioned_apply_key_target_with_rows();
+        let burned =
+            super::next_framework_locator_synthetic_table_name("mv_target", &fixture.table);
+        let (prefix, nonce) = burned.rsplit_once('_').expect("synthetic nonce suffix");
+        let first_collision_nonce = nonce.parse::<u64>().expect("numeric synthetic nonce") + 1;
+        let colliding_names = (first_collision_nonce..first_collision_nonce + 8)
+            .map(|nonce| format!("{prefix}_{nonce}"))
+            .collect::<Vec<_>>();
+        {
+            let mut catalog_guard = state.catalog.write().expect("standalone catalog");
+            catalog_guard.create_database("db").expect("create db");
+            for name in &colliding_names {
+                catalog_guard
+                    .register("db", sentinel_collision_table_def(name))
+                    .expect("register colliding synthetic table");
+            }
+        }
+
+        let requested = vec!["key-a".to_string()];
+        let mut referenced: crate::engine::delete_flow::ReferencedDataFilePartitions =
+            std::collections::HashMap::new();
+        for path in &fixture.file_paths {
+            referenced.insert(
+                path.clone(),
+                crate::engine::delete_flow::ReferencedDataFilePartition {
+                    partition_spec_id: 0,
+                    partition_values: iceberg::spec::Struct::empty(),
+                },
+            );
+        }
+
+        let located = super::resolve_target_positions_via_framework(
+            &state,
+            &fixture.table,
+            "ice",
+            "db",
+            "mv_target",
+            ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+            ApplyKeyRequest::Utf8(&requested),
+            &referenced,
+            &TargetPartitionFilter::None,
+        )
+        .expect("framework apply-key locator");
+        assert_eq!(located.delete_groups.len(), 1);
+
+        let catalog_guard = state.catalog.read().expect("standalone catalog");
+        for name in &colliding_names {
+            let table_def = catalog_guard.get("db", name).unwrap_or_else(|err| {
+                panic!("pre-existing collision table {name} was dropped: {err}")
+            });
+            assert_eq!(
+                table_def.columns,
+                sentinel_collision_table_def(name).columns,
+                "pre-existing collision table {name} was overwritten"
+            );
+        }
+        drop(catalog_guard);
+        drop(loopback_backend);
+    }
+
+    #[test]
+    fn framework_locator_cleanup_preserves_overwritten_synthetic_table() {
+        let state = std::sync::Arc::new(crate::engine::StandaloneState::default());
+        let synthetic_name = "mv_target__nr_framework_locator_cleanup_owner";
+        let original_table_def =
+            sentinel_framework_locator_table_def(synthetic_name, "original_owner", 9101, 9102);
+        let locator_registration =
+            super::try_register_scoped_framework_locator_table(&state, "db", original_table_def)
+                .expect("register scoped framework locator table")
+                .expect("collision-free synthetic table");
+
+        let overwritten_table_def =
+            sentinel_framework_locator_table_def(synthetic_name, "overwritten_owner", 9201, 9202);
+        {
+            let mut catalog_guard = state.catalog.write().expect("standalone catalog");
+            catalog_guard
+                .register("db", overwritten_table_def.clone())
+                .expect("overwrite synthetic table name");
+        }
+
+        locator_registration
+            .cleanup()
+            .expect("cleanup overwritten locator table");
+
+        let current_table_def = state
+            .catalog
+            .read()
+            .expect("standalone catalog")
+            .get("db", synthetic_name)
+            .expect("overwritten synthetic table should remain registered");
+        assert_eq!(current_table_def.columns, overwritten_table_def.columns);
+        assert_eq!(
+            format!("{:?}", current_table_def.source),
+            format!("{:?}", overwritten_table_def.source)
+        );
+    }
+
+    fn sentinel_collision_table_def(name: &str) -> crate::sql::catalog::TableDef {
+        sentinel_framework_locator_table_def(name, "sentinel_collision_column", 9001, 9002)
+    }
+
+    fn sentinel_framework_locator_table_def(
+        name: &str,
+        column_name: &str,
+        db_id: i64,
+        table_id: i64,
+    ) -> crate::sql::catalog::TableDef {
+        crate::sql::catalog::TableDef {
+            name: name.to_string(),
+            columns: vec![crate::engine::ColumnDef {
+                name: column_name.to_string(),
+                data_type: arrow::datatypes::DataType::Int32,
+                nullable: false,
+                write_default: None,
+                logical_type: None,
+            }],
+            iceberg_row_lineage_metadata_columns: vec![],
+            source: crate::sql::catalog::ScanSource::StarRocks { db_id, table_id },
+        }
     }
 
     /// Verify that the AllowList pruning path:
