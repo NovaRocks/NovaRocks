@@ -2902,11 +2902,12 @@ pub(crate) fn repartition_iceberg_mv(
     };
 
     let updated_table =
-        match crate::connector::iceberg::catalog::registry::replace_default_partition_spec(
+        match crate::connector::iceberg::catalog::registry::replace_default_partition_spec_with_expected_default(
             &target_entry,
             &target.namespace,
             &target.table,
             fields,
+            old_default_spec_id,
         ) {
             Ok(updated) => updated,
             Err(err) => {
@@ -16177,6 +16178,82 @@ mod tests {
             .expect("mv definition after failed repartition");
         assert_eq!(definition.active_refresh_id, None);
         assert!(!definition.refresh_in_progress);
+    }
+
+    #[test]
+    fn replace_default_partition_spec_expected_default_rejects_external_spec_change() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table_with_rows(&env.state, "ice", "sales", "orders", &[(1, "alfa")]);
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_orders
+             PARTITION BY (bucket(id, 16))
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create iceberg mv");
+
+        let entry = {
+            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get("ice").expect("catalog")
+        };
+        let before =
+            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
+                .expect("load target before external spec change");
+        let old_default_spec_id = before.table.metadata().default_partition_spec_id();
+        assert_eq!(
+            before.table.metadata().default_partition_spec().fields()[0].name,
+            "id_bucket_16"
+        );
+
+        let external_alter =
+            parse_alter_mv("ALTER MATERIALIZED VIEW mv_orders REPARTITION BY (bucket(id, 8))");
+        let AlterMaterializedViewAction::Repartition(external_fields) = &external_alter.action
+        else {
+            panic!("expected external repartition action");
+        };
+        let externally_updated =
+            crate::connector::iceberg::catalog::registry::replace_default_partition_spec(
+                &entry,
+                "analytics",
+                "mv_orders",
+                external_fields,
+            )
+            .expect("replace default partition spec externally");
+        let external_default_spec_id = externally_updated.metadata().default_partition_spec_id();
+        assert_ne!(external_default_spec_id, old_default_spec_id);
+        assert_eq!(
+            externally_updated
+                .metadata()
+                .default_partition_spec()
+                .fields()[0]
+                .name,
+            "id_bucket_8"
+        );
+
+        let alter =
+            parse_alter_mv("ALTER MATERIALIZED VIEW mv_orders REPARTITION BY (truncate(name, 2))");
+        let AlterMaterializedViewAction::Repartition(fields) = &alter.action else {
+            panic!("expected repartition action");
+        };
+        let err = crate::connector::iceberg::catalog::registry::replace_default_partition_spec_with_expected_default(
+            &entry,
+            "analytics",
+            "mv_orders",
+            fields,
+            old_default_spec_id,
+        )
+        .expect_err("stale expected default spec id should reject replacement");
+        assert!(err.contains("expected default spec id"), "{err}");
+
+        let after =
+            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
+                .expect("load target after rejected replacement");
+        let after_spec = after.table.metadata().default_partition_spec();
+        assert_eq!(after_spec.spec_id(), external_default_spec_id);
+        assert_eq!(after_spec.fields().len(), 1);
+        assert_eq!(after_spec.fields()[0].name, "id_bucket_8");
     }
 
     #[test]

@@ -700,11 +700,38 @@ pub(crate) fn alter_partition_spec(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn replace_default_partition_spec(
     entry: &IcebergCatalogEntry,
     namespace_name: &str,
     table_name: &str,
     fields: &[crate::sql::parser::ast::IcebergPartitionFieldExpr],
+) -> Result<iceberg::table::Table, String> {
+    replace_default_partition_spec_impl(entry, namespace_name, table_name, fields, None)
+}
+
+pub(crate) fn replace_default_partition_spec_with_expected_default(
+    entry: &IcebergCatalogEntry,
+    namespace_name: &str,
+    table_name: &str,
+    fields: &[crate::sql::parser::ast::IcebergPartitionFieldExpr],
+    expected_default_spec_id: i32,
+) -> Result<iceberg::table::Table, String> {
+    replace_default_partition_spec_impl(
+        entry,
+        namespace_name,
+        table_name,
+        fields,
+        Some(expected_default_spec_id),
+    )
+}
+
+fn replace_default_partition_spec_impl(
+    entry: &IcebergCatalogEntry,
+    namespace_name: &str,
+    table_name: &str,
+    fields: &[crate::sql::parser::ast::IcebergPartitionFieldExpr],
+    expected_default_spec_id: Option<i32>,
 ) -> Result<iceberg::table::Table, String> {
     use iceberg::{TableCommit, TableRequirement, TableUpdate};
 
@@ -717,6 +744,14 @@ pub(crate) fn replace_default_partition_spec(
         .map_err(|e| format!("load iceberg table {ident}: {e}"))?;
     let metadata = table.metadata();
     let base_default_spec_id = metadata.default_partition_spec_id();
+    if let Some(expected_default_spec_id) = expected_default_spec_id
+        && base_default_spec_id != expected_default_spec_id
+    {
+        return Err(format!(
+            "replace iceberg partition spec expected default spec id {expected_default_spec_id}, found {base_default_spec_id}"
+        ));
+    }
+    let required_default_spec_id = expected_default_spec_id.unwrap_or(base_default_spec_id);
     let prev_last_partition_id = metadata.last_partition_id();
     let evolved = crate::connector::iceberg::partition_spec::build_replacement_partition_spec(
         metadata.current_schema().as_ref(),
@@ -726,7 +761,7 @@ pub(crate) fn replace_default_partition_spec(
     let commit = TableCommit::builder()
         .ident(ident.clone())
         .requirements(vec![TableRequirement::DefaultSpecIdMatch {
-            default_spec_id: base_default_spec_id,
+            default_spec_id: required_default_spec_id,
         }])
         .updates(vec![
             TableUpdate::AddSpec { spec: evolved },
