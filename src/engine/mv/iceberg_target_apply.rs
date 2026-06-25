@@ -1027,7 +1027,7 @@ mod tests {
 
             let namespace = NamespaceIdent::new("db".to_string());
             catalog
-                .create_namespace(&namespace, HashMap::new())
+                .create_namespace(&namespace, std::collections::HashMap::new())
                 .await
                 .expect("create_namespace");
 
@@ -1563,40 +1563,47 @@ mod tests {
     ///         `region` (Utf8 optional, field_id=2).
     /// Partition spec: identity(region), bound spec_id=0.
     ///
-    /// Returns `(Table, data_file_paths, Arc<Catalog>)`. The catalog arc must
-    /// be kept alive for the duration of the test; `data_file_paths[0]` holds
-    /// the region=a file path and `data_file_paths[1]` the region=b path.
-    fn build_partitioned_apply_key_target_with_rows() -> (
-        iceberg::table::Table,
-        Vec<String>,
-        std::sync::Arc<dyn iceberg::Catalog>,
-    ) {
-        use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+    struct PartitionedApplyKeyTargetFixture {
+        table: iceberg::table::Table,
+        file_paths: Vec<String>,
+        _catalog: std::sync::Arc<dyn iceberg::Catalog>,
+        _warehouse_dir: tempfile::TempDir,
+    }
+
+    /// Returns a real MV-target-shaped Iceberg table fixture. The tempdir and
+    /// catalog guards must stay alive while the table is scanned.
+    fn build_partitioned_apply_key_target_with_rows() -> PartitionedApplyKeyTargetFixture {
         use iceberg::spec::{
             FormatVersion, NestedField, PrimitiveType, Schema as IcebergSchema, Transform, Type,
             UnboundPartitionSpec,
         };
         use iceberg::transaction::{ApplyTransactionAction, Transaction};
-        use iceberg::{CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
-        use std::collections::HashMap;
+        use iceberg::{NamespaceIdent, TableCreation, TableIdent};
         use uuid::Uuid;
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let warehouse = format!("memory://test-warehouse-{}", Uuid::new_v4());
-            let catalog: std::sync::Arc<dyn iceberg::Catalog> = std::sync::Arc::new(
-                MemoryCatalogBuilder::default()
-                    .load(
-                        "memory",
-                        HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse)]),
-                    )
-                    .await
-                    .expect("MemoryCatalog::load"),
-            );
+        let warehouse_dir = tempfile::Builder::new()
+            .prefix("novarocks-target-apply-")
+            .tempdir()
+            .expect("warehouse tempdir");
+        let warehouse = format!("file://{}", warehouse_dir.path().display());
+        let (table, file_paths, catalog) = rt.block_on(async {
+            let entry = crate::connector::iceberg::catalog::registry::build_catalog_entry(
+                "ice",
+                &[
+                    ("type".to_string(), "iceberg".to_string()),
+                    ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                    ("iceberg.catalog.warehouse".to_string(), warehouse),
+                ],
+            )
+            .expect("build hadoop catalog entry");
+            let catalog =
+                crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)
+                    .expect("build hadoop catalog");
 
             let namespace = NamespaceIdent::new("db".to_string());
             catalog
-                .create_namespace(&namespace, HashMap::new())
+                .create_namespace(&namespace, std::collections::HashMap::new())
                 .await
                 .expect("create_namespace");
 
@@ -1629,7 +1636,22 @@ mod tests {
                         .name("mv_apply_target".to_string())
                         .schema(schema)
                         .partition_spec(partition_spec)
-                        .format_version(FormatVersion::V2)
+                        .properties([
+                            ("write.row-lineage".to_string(), "true".to_string()),
+                            (
+                                ICEBERG_MV_PROP_APPLY_KEY_COLUMN.to_string(),
+                                ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
+                            ),
+                            (
+                                ICEBERG_MV_PROP_APPLY_KEY_SOURCE.to_string(),
+                                ICEBERG_MV_APPLY_KEY_SOURCE_JOIN_ROW_KEY.to_string(),
+                            ),
+                            (
+                                ICEBERG_MV_PROP_APPLY_KEY_FIELD_ID.to_string(),
+                                "1".to_string(),
+                            ),
+                        ])
+                        .format_version(FormatVersion::V3)
                         .build(),
                 )
                 .await
@@ -1695,7 +1717,256 @@ mod tests {
                 .await
                 .expect("reload table");
             (refreshed, file_paths, catalog)
-        })
+        });
+        PartitionedApplyKeyTargetFixture {
+            table,
+            file_paths,
+            _catalog: catalog,
+            _warehouse_dir: warehouse_dir,
+        }
+    }
+
+    fn loaded_partitioned_apply_key_target(
+        target_table: &iceberg::table::Table,
+    ) -> crate::connector::iceberg::catalog::IcebergLoadedTable {
+        crate::connector::iceberg::catalog::IcebergLoadedTable {
+            table: target_table.clone(),
+            columns: vec![
+                crate::engine::ColumnDef {
+                    name: ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
+                    data_type: arrow::datatypes::DataType::Utf8,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                },
+                crate::engine::ColumnDef {
+                    name: "region".to_string(),
+                    data_type: arrow::datatypes::DataType::Utf8,
+                    nullable: true,
+                    write_default: None,
+                    logical_type: None,
+                },
+            ],
+            logical_types: std::collections::HashMap::new(),
+            key_desc: None,
+            column_aggregations: std::collections::HashMap::new(),
+            object_store_config: None,
+        }
+    }
+
+    fn assert_standard_mv_target_table_def_hides_physical_apply_key(
+        table_def: &crate::sql::catalog::TableDef,
+    ) {
+        assert!(
+            table_def.columns.iter().all(|column| !column
+                .name
+                .eq_ignore_ascii_case(ICEBERG_MV_JOIN_APPLY_KEY_COLUMN)),
+            "standard MV target registration must hide the physical apply-key column"
+        );
+        assert!(
+            table_def
+                .iceberg_row_lineage_metadata_columns
+                .iter()
+                .any(|column| column.name == "_file")
+        );
+        assert!(
+            table_def
+                .iceberg_row_lineage_metadata_columns
+                .iter()
+                .any(|column| column.name == "_pos")
+        );
+    }
+
+    fn expose_physical_apply_key_for_locator_test_registration(
+        mut table_def: crate::sql::catalog::TableDef,
+    ) -> crate::sql::catalog::TableDef {
+        assert_standard_mv_target_table_def_hides_physical_apply_key(&table_def);
+        table_def.columns.insert(
+            0,
+            crate::engine::ColumnDef {
+                name: ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
+                data_type: arrow::datatypes::DataType::Utf8,
+                nullable: false,
+                write_default: None,
+                logical_type: None,
+            },
+        );
+        table_def
+    }
+
+    #[test]
+    fn spike_framework_select_file_pos_on_target() {
+        use arrow::array::{Int64Array, StringArray};
+
+        let loopback_backend = crate::engine::install_all_in_one_loopback_backend_for_test()
+            .expect("install all-in-one loopback backend");
+        let state = std::sync::Arc::new(crate::engine::StandaloneState {
+            exchange_port: loopback_backend.exchange_port,
+            ..crate::engine::StandaloneState::default()
+        });
+        crate::connector::register_standalone_backends(&state);
+
+        let fixture = build_partitioned_apply_key_target_with_rows();
+        let target_table = &fixture.table;
+        let file_paths = &fixture.file_paths;
+        assert_eq!(
+            target_table.metadata().format_version(),
+            iceberg::spec::FormatVersion::V3
+        );
+        assert_eq!(
+            target_table
+                .metadata()
+                .properties()
+                .get("write.row-lineage")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            target_table
+                .metadata()
+                .properties()
+                .get(ICEBERG_MV_PROP_APPLY_KEY_COLUMN)
+                .map(String::as_str),
+            Some(ICEBERG_MV_JOIN_APPLY_KEY_COLUMN)
+        );
+        assert_eq!(
+            target_table
+                .metadata()
+                .properties()
+                .get(ICEBERG_MV_PROP_APPLY_KEY_SOURCE)
+                .map(String::as_str),
+            Some(ICEBERG_MV_APPLY_KEY_SOURCE_JOIN_ROW_KEY)
+        );
+        assert_eq!(
+            target_table
+                .metadata()
+                .properties()
+                .get(ICEBERG_MV_PROP_APPLY_KEY_FIELD_ID)
+                .map(String::as_str),
+            Some("1")
+        );
+
+        let snapshot_id = target_table
+            .metadata()
+            .current_snapshot()
+            .expect("target snapshot")
+            .snapshot_id();
+        let data_files =
+            crate::connector::iceberg::catalog::registry::extract_data_files_with_stats_at(
+                target_table,
+                snapshot_id,
+            )
+            .expect("extract target data files");
+        assert_eq!(data_files.len(), 2, "expected one data file per partition");
+
+        let entry = crate::connector::iceberg::catalog::registry::build_catalog_entry(
+            "ice",
+            &[
+                ("type".to_string(), "iceberg".to_string()),
+                ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                (
+                    "iceberg.catalog.warehouse".to_string(),
+                    target_table
+                        .metadata()
+                        .location()
+                        .strip_suffix("/db/mv_apply_target")
+                        .expect("target table location under warehouse")
+                        .to_string(),
+                ),
+            ],
+        )
+        .expect("build iceberg catalog entry");
+
+        let standard_table_def =
+            crate::connector::iceberg::catalog::build_iceberg_table_def_with_files(
+                &entry,
+                "ice",
+                "db",
+                "mv_target",
+                loaded_partitioned_apply_key_target(target_table),
+                data_files,
+            )
+            .expect("build standard target table def");
+        assert_standard_mv_target_table_def_hides_physical_apply_key(&standard_table_def);
+
+        let table_def = expose_physical_apply_key_for_locator_test_registration(standard_table_def);
+        assert!(
+            table_def.columns.iter().any(|column| column
+                .name
+                .eq_ignore_ascii_case(ICEBERG_MV_JOIN_APPLY_KEY_COLUMN)),
+            "locator/test registration must expose the physical apply-key column"
+        );
+        assert!(
+            table_def
+                .iceberg_row_lineage_metadata_columns
+                .iter()
+                .any(|column| column.name == "_file")
+        );
+        assert!(
+            table_def
+                .iceberg_row_lineage_metadata_columns
+                .iter()
+                .any(|column| column.name == "_pos")
+        );
+        {
+            let mut catalog_guard = state.catalog.write().expect("standalone catalog");
+            catalog_guard.create_database("db").expect("create db");
+            catalog_guard
+                .register("db", table_def)
+                .expect("register target table def");
+        }
+
+        let session = crate::engine::StandaloneSession {
+            inner: std::sync::Arc::clone(&state),
+        };
+        let sql = format!(
+            "SELECT _file, _pos, {apply_key} \
+             FROM db.mv_target \
+             WHERE {apply_key} IN ('key-a')",
+            apply_key = ICEBERG_MV_JOIN_APPLY_KEY_COLUMN
+        );
+        let result = match session
+            .execute_in_context(&sql, None, "db", None)
+            .expect("framework SELECT")
+        {
+            crate::engine::StatementResult::Query(result) => result,
+            crate::engine::StatementResult::Ok => panic!("SELECT returned Ok"),
+        };
+
+        assert_eq!(result.row_count(), 1, "result={result:?}");
+        let chunk = result
+            .chunks
+            .iter()
+            .find(|chunk| chunk.batch.num_rows() == 1)
+            .expect("one-row chunk");
+        let file = chunk
+            .batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("_file utf8");
+        let pos = chunk
+            .batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("_pos int64");
+        let apply_key = chunk
+            .batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("apply-key utf8");
+
+        assert!(
+            file.value(0).contains(&file_paths[0]),
+            "_file={} file_a={}",
+            file.value(0),
+            file_paths[0]
+        );
+        assert_eq!(pos.value(0), 0);
+        assert_eq!(apply_key.value(0), "key-a");
+        drop(loopback_backend);
     }
 
     /// Verify that the AllowList pruning path:
@@ -1714,7 +1985,9 @@ mod tests {
         use crate::engine::mv::partition::{MvPartitionKey, MvPartitionKeyField, MvPartitionValue};
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let (target_table, file_paths, _catalog) = build_partitioned_apply_key_target_with_rows();
+        let fixture = build_partitioned_apply_key_target_with_rows();
+        let target_table = &fixture.table;
+        let file_paths = &fixture.file_paths;
 
         // The contract's target_spec_id is 7 — intentionally different from the
         // table's raw default spec_id (0) to reproduce the production mismatch.
@@ -1737,7 +2010,7 @@ mod tests {
         // just created so its only partition spec has id=0.
         let mut referenced: crate::engine::delete_flow::ReferencedDataFilePartitions =
             std::collections::HashMap::new();
-        for path in &file_paths {
+        for path in file_paths {
             referenced.insert(
                 path.clone(),
                 crate::engine::delete_flow::ReferencedDataFilePartition {
@@ -1752,7 +2025,7 @@ mod tests {
 
         let result = rt
             .block_on(super::locate_target_rows_by_string_apply_key_with_matches(
-                &target_table,
+                target_table,
                 ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
                 &join_keys,
                 &existing,
