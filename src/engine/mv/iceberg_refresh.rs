@@ -55,8 +55,7 @@ use crate::engine::mv::rebind::rewrite_select_sql_for_rebind;
 use crate::engine::mv::refresh_context::IcebergMvRefreshContext;
 use crate::engine::mv::refresh_contract::{ApplyKeyContract, ImvRefreshContract, RewriteEvidence};
 use crate::engine::mv::refresh_driver::{
-    BaseSnapshotPolicy, BaseSnapshotStatus, IcebergMvRefreshLifecycle, RefreshDecision,
-    decide_refresh,
+    BaseSnapshotPolicy, BaseSnapshotStatus, RefreshDecision, decide_refresh,
 };
 use crate::engine::mv::refresh_property::{
     RefreshCapabilities, RefreshFragmentProperty, RefreshIdentity, TargetIdentity,
@@ -87,6 +86,57 @@ pub(crate) struct IcebergMvTarget {
     pub(crate) catalog: String,
     pub(crate) namespace: String,
     pub(crate) table: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum IcebergMvRefreshExecutionError {
+    PreCommit(String),
+    Commit(RefreshError),
+}
+
+impl IcebergMvRefreshExecutionError {
+    fn pre_commit(message: impl Into<String>) -> Self {
+        Self::PreCommit(message.into())
+    }
+
+    fn commit(error: RefreshError) -> Self {
+        Self::Commit(error)
+    }
+
+    fn into_message(self) -> String {
+        match self {
+            Self::PreCommit(message) => message,
+            Self::Commit(error) => error.message,
+        }
+    }
+
+    fn into_refresh_error(self) -> RefreshError {
+        match self {
+            Self::PreCommit(message) => RefreshError::pre_commit(message),
+            Self::Commit(error) => error,
+        }
+    }
+}
+
+impl From<String> for IcebergMvRefreshExecutionError {
+    fn from(message: String) -> Self {
+        Self::pre_commit(message)
+    }
+}
+
+fn run_iceberg_mv_refresh_lifecycle(
+    decision: RefreshDecision,
+    first_refresh: impl FnOnce() -> Result<StatementResult, IcebergMvRefreshExecutionError>,
+    metadata_only: impl FnOnce() -> Result<StatementResult, IcebergMvRefreshExecutionError>,
+    incremental: impl FnOnce() -> Result<StatementResult, IcebergMvRefreshExecutionError>,
+) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
+    match decision {
+        RefreshDecision::SkipEmpty => Ok(StatementResult::Ok),
+        RefreshDecision::FirstRefresh => first_refresh(),
+        RefreshDecision::MetadataOnly => metadata_only(),
+        RefreshDecision::Incremental => incremental(),
+        RefreshDecision::FailFast { reason } => Err(reason.into()),
+    }
 }
 
 pub(crate) fn create_iceberg_mv(
@@ -2597,6 +2647,7 @@ pub(crate) fn refresh_iceberg_mv(
         stmt,
         &affected_partitions,
     )
+    .map_err(IcebergMvRefreshExecutionError::into_message)
 }
 
 pub(crate) fn repartition_iceberg_mv(
@@ -2785,7 +2836,7 @@ pub(crate) fn repartition_iceberg_mv(
         current_table_uuid,
         Some(&new_partition_contract),
     );
-    result?;
+    result.map_err(IcebergMvRefreshExecutionError::into_message)?;
     register_iceberg_mv_target_in_catalog(state, &target)?;
     Ok(StatementResult::Ok)
 }
@@ -2827,7 +2878,7 @@ fn refresh_iceberg_mv_with_planned_partitions(
     current_database: &str,
     stmt: &RefreshMaterializedViewStmt,
     planned_affected_partitions: &crate::engine::mv::partition::AffectedTargetPartitions,
-) -> Result<StatementResult, String> {
+) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let _refresh_guard = acquire_mv_refresh_lock()?;
     let target = resolve_refresh_target(current_catalog, current_database, &stmt.name)?;
     if stmt.full {
@@ -2849,7 +2900,8 @@ fn refresh_iceberg_mv_with_planned_partitions(
              was misleading and non-atomic. To recover from a broken contract or corrupted \
              target, run DROP MATERIALIZED VIEW <name>; CREATE MATERIALIZED VIEW <name> ...; \
              REFRESH MATERIALIZED VIEW <name>; manually."
-                .to_string(),
+                .to_string()
+                .into(),
         );
     }
     recover_iceberg_mv_refreshes(state)?;
@@ -3023,13 +3075,15 @@ fn refresh_iceberg_mv_with_planned_partitions(
                 "iceberg MV target {}.{}.{} has an aggregate AllBasesRequired contract with an \
                  unexpected row identity {identity:?}; recreate the MV",
                 target.catalog, target.namespace, target.table
-            ));
+            )
+            .into());
         }
     }
     let [base_ref] = base_refs.as_slice() else {
         return Err(
             "iceberg materialized view refresh requires exactly one base table reference"
-                .to_string(),
+                .to_string()
+                .into(),
         );
     };
     let schema_contract = mv_definition.schema_contract.as_ref().ok_or_else(|| {
@@ -3077,7 +3131,7 @@ fn refresh_iceberg_mv_with_planned_partitions(
             );
             return Ok(StatementResult::Ok);
         }
-        RefreshDecision::FailFast { reason } => return Err(reason),
+        RefreshDecision::FailFast { reason } => return Err(reason.into()),
         RefreshDecision::FirstRefresh
         | RefreshDecision::MetadataOnly
         | RefreshDecision::Incremental => {}
@@ -3111,7 +3165,7 @@ fn refresh_iceberg_mv_with_planned_partitions(
         &target_loaded.table,
     ) {
         crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
-            return Err(format!("{err}"));
+            return Err(format!("{err}").into());
         }
         crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
             rebound_columns,
@@ -3146,7 +3200,8 @@ fn refresh_iceberg_mv_with_planned_partitions(
         return Err(format!(
             "iceberg MV base table identity changed for {}; incremental refresh is unsafe, rebuild or recreate the MV",
             base_ref.fqn()
-        ));
+        )
+        .into());
     }
 
     let ctx = {
@@ -3189,11 +3244,13 @@ fn refresh_iceberg_mv_with_planned_partitions(
         &refresh_label,
     );
 
-    IcebergMvRefreshLifecycle::run(
+    run_iceberg_mv_refresh_lifecycle(
         refresh_decision,
         || {
             let Some(cur) = current_snapshot_id else {
-                return Err("invalid projection/filter MV first-refresh decision".to_string());
+                return Err("invalid projection/filter MV first-refresh decision"
+                    .to_string()
+                    .into());
             };
             let refresh_id = begin_staged_iceberg_mv_refresh_intent(
                 state,
@@ -3216,7 +3273,9 @@ fn refresh_iceberg_mv_with_planned_partitions(
         },
         || {
             let Some(cur) = current_snapshot_id else {
-                return Err("invalid projection/filter MV metadata-only decision".to_string());
+                return Err("invalid projection/filter MV metadata-only decision"
+                    .to_string()
+                    .into());
             };
             tracing::info!(
                 "iceberg mv {}.{}.{}: base snapshot {cur} unchanged; updating metadata only",
@@ -3242,7 +3301,9 @@ fn refresh_iceberg_mv_with_planned_partitions(
         },
         || {
             let (Some(prev), Some(cur)) = (previous_snapshot_id, current_snapshot_id) else {
-                return Err("invalid projection/filter MV incremental decision".to_string());
+                return Err("invalid projection/filter MV incremental decision"
+                    .to_string()
+                    .into());
             };
             incremental_refresh_iceberg_mv(
                 state,
@@ -3277,7 +3338,7 @@ fn refresh_iceberg_union_projection_mv(
     branch_count: usize,
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
     apply_key: ApplyKeyContract,
-) -> Result<StatementResult, String> {
+) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     validate_union_projection_base_refs(base_refs, schema_contract)?;
 
     let mut pre_pin_current_snapshots = BTreeMap::new();
@@ -3321,7 +3382,8 @@ fn refresh_iceberg_union_projection_mv(
         return Err(format!(
             "iceberg UNION ALL projection/filter MV {}.{}.{} has partial previous refresh metadata; recreate the MV",
             target.catalog, target.namespace, target.table
-        ));
+        )
+        .into());
     }
     let refresh_label = format!(
         "iceberg UNION ALL projection/filter MV {}.{}.{}",
@@ -3354,7 +3416,7 @@ fn refresh_iceberg_union_projection_mv(
             );
             return Ok(StatementResult::Ok);
         }
-        RefreshDecision::FailFast { reason } => return Err(reason),
+        RefreshDecision::FailFast { reason } => return Err(reason.into()),
         RefreshDecision::FirstRefresh
         | RefreshDecision::MetadataOnly
         | RefreshDecision::Incremental => {}
@@ -3473,7 +3535,7 @@ fn refresh_iceberg_union_projection_mv(
         &refresh_label,
     );
 
-    IcebergMvRefreshLifecycle::run(
+    run_iceberg_mv_refresh_lifecycle(
         refresh_decision,
         || {
             let full_select_sql = rewrite_union_projection_full_refresh_select_with_pin(
@@ -3577,7 +3639,7 @@ fn refresh_iceberg_aggregate_mv(
     join_aliases: Option<&crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases>,
     apply_key: ApplyKeyContract,
     planned_affected_partitions: &crate::engine::mv::partition::AffectedTargetPartitions,
-) -> Result<StatementResult, String> {
+) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let schema_contract = validate_aggregate_schema_contract_metadata(target, mv_definition)?;
     // Tier-2 dispatch (Phase 3 / B2): single-base aggregate, fan-in aggregate
     // (AllBasesRequired), and join aggregate are selected by capability. The
@@ -3695,11 +3757,12 @@ fn refresh_single_aggregate_iceberg_mv(
     aggregate_calls: &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls,
     apply_key: ApplyKeyContract,
     planned_affected_partitions: &crate::engine::mv::partition::AffectedTargetPartitions,
-) -> Result<StatementResult, String> {
+) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let [base_ref] = base_refs else {
         return Err(
             "iceberg aggregate materialized view refresh requires exactly one base table reference"
-                .to_string(),
+                .to_string()
+                .into(),
         );
     };
     let pre_pin_loaded = load_current_iceberg_base_table(state, base_ref)?;
@@ -3730,7 +3793,7 @@ fn refresh_single_aggregate_iceberg_mv(
             );
             return Ok(StatementResult::Ok);
         }
-        RefreshDecision::FailFast { reason } => return Err(reason),
+        RefreshDecision::FailFast { reason } => return Err(reason.into()),
         RefreshDecision::FirstRefresh
         | RefreshDecision::MetadataOnly
         | RefreshDecision::Incremental => {}
@@ -3751,7 +3814,7 @@ fn refresh_single_aggregate_iceberg_mv(
         target_table,
     ) {
         crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
-            return Err(format!("{err}"));
+            return Err(format!("{err}").into());
         }
         crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
             rebound_columns,
@@ -3831,7 +3894,7 @@ fn refresh_single_aggregate_iceberg_mv(
         &refresh_label,
     );
 
-    IcebergMvRefreshLifecycle::run(
+    run_iceberg_mv_refresh_lifecycle(
         refresh_decision,
         || {
             let staging_branch = format!(
@@ -3862,18 +3925,22 @@ fn refresh_single_aggregate_iceberg_mv(
                 target.namespace,
                 target.table
             );
-            finalize_iceberg_mv_metadata_only_refresh_with_partition_state(
-                state,
-                target,
-                mv_definition,
-                pin.to_snapshot_map(),
-                pin.to_table_uuid_map(),
-                IcebergMvPartitionStateFinalize::FromAffected(&ctx.affected_partitions),
+            Ok(
+                finalize_iceberg_mv_metadata_only_refresh_with_partition_state(
+                    state,
+                    target,
+                    mv_definition,
+                    pin.to_snapshot_map(),
+                    pin.to_table_uuid_map(),
+                    IcebergMvPartitionStateFinalize::FromAffected(&ctx.affected_partitions),
+                )?,
             )
         },
         || {
             let Some(prev) = previous else {
-                return Err("invalid aggregate MV incremental decision".to_string());
+                return Err("invalid aggregate MV incremental decision"
+                    .to_string()
+                    .into());
             };
             let current_table_uuid = pin
                 .uuid(base_ref)
@@ -3981,7 +4048,7 @@ fn refresh_fan_in_aggregate_iceberg_mv(
     refresh: AllBasesAggregateRefresh<'_>,
     apply_key: ApplyKeyContract,
     planned_affected_partitions: &crate::engine::mv::partition::AffectedTargetPartitions,
-) -> Result<StatementResult, String> {
+) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     // Identity-gated branch-contract validation. `FanIn` already received its
     // validated schema contract; `BranchUnion` re-derives + validates it here,
     // exactly as the former dedicated branch-union wrapper did. The bound
@@ -4056,7 +4123,7 @@ fn refresh_fan_in_aggregate_iceberg_mv(
             );
             return Ok(StatementResult::Ok);
         }
-        RefreshDecision::FailFast { reason } => return Err(reason),
+        RefreshDecision::FailFast { reason } => return Err(reason.into()),
         RefreshDecision::FirstRefresh
         | RefreshDecision::MetadataOnly
         | RefreshDecision::Incremental => {}
@@ -4180,7 +4247,7 @@ fn refresh_fan_in_aggregate_iceberg_mv(
         &refresh_label,
     );
 
-    IcebergMvRefreshLifecycle::run(
+    run_iceberg_mv_refresh_lifecycle(
         refresh_decision,
         || {
             let staging_branch = format!(
@@ -4237,13 +4304,15 @@ fn refresh_fan_in_aggregate_iceberg_mv(
                 target.namespace,
                 target.table
             );
-            finalize_iceberg_mv_metadata_only_refresh_with_partition_state(
-                state,
-                target,
-                mv_definition,
-                pin.to_snapshot_map(),
-                pin.to_table_uuid_map(),
-                IcebergMvPartitionStateFinalize::FromAffected(&ctx.affected_partitions),
+            Ok(
+                finalize_iceberg_mv_metadata_only_refresh_with_partition_state(
+                    state,
+                    target,
+                    mv_definition,
+                    pin.to_snapshot_map(),
+                    pin.to_table_uuid_map(),
+                    IcebergMvPartitionStateFinalize::FromAffected(&ctx.affected_partitions),
+                )?,
             )
         },
         || {
@@ -4298,11 +4367,12 @@ fn refresh_join_aggregate_iceberg_mv(
     aggregate_calls: &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls,
     apply_key: ApplyKeyContract,
     planned_affected_partitions: &crate::engine::mv::partition::AffectedTargetPartitions,
-) -> Result<StatementResult, String> {
+) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     if base_refs.len() != 2 {
         return Err(
             "iceberg join aggregate MV refresh requires exactly two base table references"
-                .to_string(),
+                .to_string()
+                .into(),
         );
     }
     // Base-ref matching uses the join aliases (left/right table FQNs); the join
@@ -4346,7 +4416,7 @@ fn refresh_join_aggregate_iceberg_mv(
             );
             return Ok(StatementResult::Ok);
         }
-        RefreshDecision::FailFast { reason } => return Err(reason),
+        RefreshDecision::FailFast { reason } => return Err(reason.into()),
         RefreshDecision::FirstRefresh
         | RefreshDecision::MetadataOnly
         | RefreshDecision::Incremental => {}
@@ -4359,7 +4429,8 @@ fn refresh_join_aggregate_iceberg_mv(
         return Err(format!(
             "iceberg join aggregate MV refresh expected two refresh pins, got {}",
             pin.len()
-        ));
+        )
+        .into());
     }
     validate_refresh_pin_table_uuids(mv_definition, &pin, base_refs)?;
 
@@ -4444,7 +4515,7 @@ fn refresh_join_aggregate_iceberg_mv(
         &refresh_label,
     );
 
-    IcebergMvRefreshLifecycle::run(
+    run_iceberg_mv_refresh_lifecycle(
         refresh_decision,
         || {
             let staging_branch = format!(
@@ -4475,18 +4546,22 @@ fn refresh_join_aggregate_iceberg_mv(
                 target.namespace,
                 target.table
             );
-            finalize_iceberg_mv_metadata_only_refresh_with_partition_state(
-                state,
-                target,
-                mv_definition,
-                pin.to_snapshot_map(),
-                pin.to_table_uuid_map(),
-                IcebergMvPartitionStateFinalize::FromAffected(&ctx.affected_partitions),
+            Ok(
+                finalize_iceberg_mv_metadata_only_refresh_with_partition_state(
+                    state,
+                    target,
+                    mv_definition,
+                    pin.to_snapshot_map(),
+                    pin.to_table_uuid_map(),
+                    IcebergMvPartitionStateFinalize::FromAffected(&ctx.affected_partitions),
+                )?,
             )
         },
         || {
             let (Some(left_prev), Some(right_prev)) = (left_previous, right_previous) else {
-                return Err("invalid join aggregate MV incremental decision".to_string());
+                return Err("invalid join aggregate MV incremental decision"
+                    .to_string()
+                    .into());
             };
             let left_table_uuid = pin
                 .uuid(left_ref)
@@ -5816,7 +5891,7 @@ pub(crate) fn execute_iceberg_mv_refresh(
         &plan.stmt,
         &plan.affected_partitions,
     )
-    .map_err(RefreshError::pre_commit)?;
+    .map_err(IcebergMvRefreshExecutionError::into_refresh_error)?;
     Ok(IcebergRefreshOutcome {
         completed_inside_execute: true,
     })
@@ -6071,7 +6146,6 @@ fn mark_iceberg_mv_refresh_commit_error(
             .mark_refresh_commit_unknown(txn.as_mut(), refresh_id)
             .map_err(|e| format!("mark iceberg mv refresh commit unknown failed: {e}"))?,
         CommitServiceError::KnownUncommitted { .. } | CommitServiceError::InvalidInput { .. } => {
-            record_iceberg_mv_operation_committing(state, txn.as_mut(), refresh_id)?;
             state
                 .mv_repo
                 .clear_refresh_progress(txn.as_mut(), refresh.mv_id)
@@ -6080,24 +6154,11 @@ fn mark_iceberg_mv_refresh_commit_error(
                         "clear iceberg mv refresh progress after known-uncommitted commit failed: {e}"
                     )
                 })?;
-            if let Some(operation_id) = refresh.operation_id {
-                record_iceberg_mv_operation_abort(
-                    state,
-                    txn.as_mut(),
-                    operation_id,
-                    commit_error.message().to_string(),
-                )?;
-            }
         }
         CommitServiceError::FinalizeFailedKnownCommitted { .. } => {}
     }
 
-    if !matches!(
-        commit_error,
-        CommitServiceError::KnownUncommitted { .. } | CommitServiceError::InvalidInput { .. }
-    ) {
-        record_iceberg_mv_operation_commit_error(state, txn.as_mut(), refresh_id, commit_error)?;
-    }
+    record_iceberg_mv_operation_commit_error(state, txn.as_mut(), refresh_id, commit_error)?;
     txn.commit()
         .map_err(|e| format!("commit iceberg mv commit-error marker failed: {e}"))?;
     Ok(())
@@ -6245,6 +6306,16 @@ fn record_iceberg_mv_operation_commit_error(
     let now_ms = now_ms();
     transition_iceberg_mv_operation_to_committing(state, txn, operation_id, now_ms)?;
     let fact = operation_fact_from_commit_result(Err(commit_error));
+    if fact.state == IcebergOperationState::FinalizeFailedKnownCommitted {
+        state
+            .iceberg_operation_repo
+            .transition_operation(txn, operation_id, IcebergOperationState::Committed, now_ms)
+            .map_err(|e| format!("mark iceberg mv operation committed failed: {e}"))?;
+        state
+            .iceberg_operation_repo
+            .transition_operation(txn, operation_id, IcebergOperationState::Finalizing, now_ms)
+            .map_err(|e| format!("mark iceberg mv operation finalizing failed: {e}"))?;
+    }
     state
         .iceberg_operation_repo
         .record_operation_fact(
@@ -6591,7 +6662,7 @@ fn handle_iceberg_mv_commit_error(
     staging_branch: &str,
     refresh_id: i64,
     err: String,
-) -> String {
+) -> IcebergMvRefreshExecutionError {
     handle_iceberg_mv_definite_pre_publish_error(
         state,
         target,
@@ -6604,17 +6675,33 @@ fn handle_iceberg_mv_commit_error(
 
 fn handle_iceberg_mv_commit_service_error(
     state: &Arc<StandaloneState>,
+    target: &IcebergMvTarget,
+    target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    staging_branch: &str,
     refresh_id: i64,
     err: CommitServiceError,
-) -> String {
+) -> IcebergMvRefreshExecutionError {
+    let cleanup_staging_branch = matches!(
+        &err,
+        CommitServiceError::KnownUncommitted { .. } | CommitServiceError::InvalidInput { .. }
+    );
+    let mut refresh_err = refresh_error_from_commit_error(err.clone());
+    if cleanup_staging_branch {
+        refresh_err.message = cleanup_iceberg_mv_staging_branch_after_failure(
+            state,
+            target,
+            target_entry,
+            staging_branch,
+            refresh_err.message,
+        );
+    }
     if let Err(mark_err) = mark_iceberg_mv_refresh_commit_error(state, refresh_id, &err) {
-        let refresh_err = refresh_error_from_commit_error(err);
-        return format!(
+        refresh_err.message = format!(
             "{}; additionally failed to record mv refresh commit error: {mark_err}",
             refresh_err.message
         );
     }
-    refresh_error_from_commit_error(err).message
+    IcebergMvRefreshExecutionError::commit(refresh_err)
 }
 
 fn handle_iceberg_mv_definite_pre_publish_error(
@@ -6624,7 +6711,7 @@ fn handle_iceberg_mv_definite_pre_publish_error(
     staging_branch: &str,
     refresh_id: i64,
     err: String,
-) -> String {
+) -> IcebergMvRefreshExecutionError {
     let err = cleanup_iceberg_mv_staging_branch_after_failure(
         state,
         target,
@@ -6633,9 +6720,11 @@ fn handle_iceberg_mv_definite_pre_publish_error(
         err,
     );
     if let Err(abort_err) = abort_iceberg_mv_refresh(state, refresh_id) {
-        return format!("{err}; additionally failed to abort mv refresh: {abort_err}");
+        return IcebergMvRefreshExecutionError::pre_commit(format!(
+            "{err}; additionally failed to abort mv refresh: {abort_err}"
+        ));
     }
-    err
+    IcebergMvRefreshExecutionError::pre_commit(err)
 }
 
 fn cleanup_iceberg_mv_staging_branch_after_failure(
@@ -7156,7 +7245,7 @@ fn first_refresh_iceberg_mv(
     base_snapshot_id: i64,
     current_table_uuid: &str,
     pinned_full_select_sql: &str,
-) -> Result<StatementResult, String> {
+) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let physical_sql = iceberg_mv_physical_select_sql(pinned_full_select_sql)?;
     first_refresh_iceberg_mv_with_physical_sql(
         state,
@@ -7177,7 +7266,7 @@ fn first_refresh_iceberg_mv_with_physical_sql(
     snapshots: BTreeMap<String, i64>,
     table_uuids: BTreeMap<String, String>,
     physical_sql: &str,
-) -> Result<StatementResult, String> {
+) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let target = &ctx.rewrite.target;
     let target_entry = &*ctx.target_entry;
     let iceberg_catalog = &ctx.iceberg_catalog;
@@ -7190,7 +7279,7 @@ fn first_refresh_iceberg_mv_with_physical_sql(
         Ok(chunks) => chunks,
         Err(err) => {
             abort_iceberg_mv_refresh(state, refresh_id)?;
-            return Err(err);
+            return Err(err.into());
         }
     };
     let total_rows: i64 = chunks.iter().map(|c| c.batch.num_rows() as i64).sum();
@@ -7221,7 +7310,7 @@ fn first_refresh_iceberg_mv_with_physical_sql(
         expected_main_snapshot_id,
     ) {
         abort_iceberg_mv_refresh(state, refresh_id)?;
-        return Err(err);
+        return Err(err.into());
     }
     let target_table = match reload_iceberg_mv_target_table(target_entry, target) {
         Ok(table) => table,
@@ -7256,7 +7345,12 @@ fn first_refresh_iceberg_mv_with_physical_sql(
         Ok(Ok(Ok(snapshot_id))) => snapshot_id,
         Ok(Ok(Err(err))) => {
             return Err(handle_iceberg_mv_commit_service_error(
-                state, refresh_id, err,
+                state,
+                target,
+                target_entry,
+                staging_branch,
+                refresh_id,
+                err,
             ));
         }
         Ok(Err(err)) => {
@@ -7351,7 +7445,7 @@ fn first_refresh_iceberg_aggregate_mv(
     staging_branch: &str,
     refresh_id: i64,
     aggregate_calls: &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls,
-) -> Result<StatementResult, String> {
+) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let current_catalog = ctx.rewrite.current_catalog.as_deref();
     let current_database = ctx.rewrite.current_database.as_str();
     let mv_definition = &*ctx.rewrite.mv_definition;
@@ -7367,7 +7461,7 @@ fn first_refresh_iceberg_aggregate_mv(
         Ok(chunks) => chunks,
         Err(err) => {
             abort_iceberg_mv_refresh(state, refresh_id)?;
-            return Err(err);
+            return Err(err.into());
         }
     };
     commit_first_refresh_iceberg_aggregate_chunks(
@@ -7387,7 +7481,7 @@ fn first_refresh_branch_union_aggregate_iceberg_mv(
     refresh_id: i64,
     branch_count: usize,
     first_branch_calls: &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls,
-) -> Result<StatementResult, String> {
+) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let current_catalog = ctx.rewrite.current_catalog.as_deref();
     let current_database = ctx.rewrite.current_database.as_str();
     let mv_definition = &*ctx.rewrite.mv_definition;
@@ -7404,7 +7498,7 @@ fn first_refresh_branch_union_aggregate_iceberg_mv(
         Ok(chunks) => chunks,
         Err(err) => {
             abort_iceberg_mv_refresh(state, refresh_id)?;
-            return Err(err);
+            return Err(err.into());
         }
     };
     commit_first_refresh_iceberg_aggregate_chunks(
@@ -7424,7 +7518,7 @@ fn commit_first_refresh_iceberg_aggregate_chunks(
     refresh_id: i64,
     chunks: Vec<crate::exec::chunk::Chunk>,
     refresh_label: &str,
-) -> Result<StatementResult, String> {
+) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let target = &ctx.rewrite.target;
     let target_entry = &*ctx.target_entry;
     let iceberg_catalog = &ctx.iceberg_catalog;
@@ -7455,7 +7549,7 @@ fn commit_first_refresh_iceberg_aggregate_chunks(
         expected_main_snapshot_id,
     ) {
         abort_iceberg_mv_refresh(state, refresh_id)?;
-        return Err(err);
+        return Err(err.into());
     }
     let target_table = match reload_iceberg_mv_target_table(target_entry, target) {
         Ok(table) => table,
@@ -7490,7 +7584,12 @@ fn commit_first_refresh_iceberg_aggregate_chunks(
         Ok(Ok(Ok(snapshot_id))) => snapshot_id,
         Ok(Ok(Err(err))) => {
             return Err(handle_iceberg_mv_commit_service_error(
-                state, refresh_id, err,
+                state,
+                target,
+                target_entry,
+                staging_branch,
+                refresh_id,
+                err,
             ));
         }
         Ok(Err(err)) => {
@@ -8085,13 +8184,13 @@ fn rebuild_iceberg_mv(
     base_snapshot_id: Option<i64>,
     current_table_uuid: &str,
     partition_contract: Option<&crate::meta::repository::mv_contract::MvPartitionContract>,
-) -> Result<StatementResult, String> {
+) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let physical_sql = iceberg_mv_physical_select_sql(pinned_full_select_sql)?;
     let chunks = match run_mv_full_select_chunks(state, current_database, &physical_sql) {
         Ok(chunks) => chunks,
         Err(err) => {
             abort_iceberg_mv_refresh(state, refresh_id)?;
-            return Err(err);
+            return Err(err.into());
         }
     };
     let total_rows: i64 = chunks.iter().map(|c| c.batch.num_rows() as i64).sum();
@@ -8106,7 +8205,7 @@ fn rebuild_iceberg_mv(
         expected_main_snapshot_id,
     ) {
         abort_iceberg_mv_refresh(state, refresh_id)?;
-        return Err(err);
+        return Err(err.into());
     }
     let target_table = match reload_iceberg_mv_target_table(target_entry, target) {
         Ok(table) => table,
@@ -8143,7 +8242,12 @@ fn rebuild_iceberg_mv(
         Ok(Ok(Ok(snapshot_id))) => snapshot_id,
         Ok(Ok(Err(err))) => {
             return Err(handle_iceberg_mv_commit_service_error(
-                state, refresh_id, err,
+                state,
+                target,
+                target_entry,
+                staging_branch,
+                refresh_id,
+                err,
             ));
         }
         Ok(Err(err)) => {
@@ -8239,7 +8343,8 @@ async fn recover_mv_branch_commit_outcome(
         unreachable!("checked finalize failed known committed above")
     };
     let reloaded = catalog.load_table(ident).await.map_err(|e| {
-        CommitServiceError::unknown(
+        CommitServiceError::finalize_failed_known_committed(
+            None,
             format!(
                 "load iceberg table after branch commit recovery failed: {e}; original error: {finalize_error}"
             ),
@@ -8780,14 +8885,17 @@ fn refresh_iceberg_join_mv(
     base_refs: &[IcebergTableRef],
     aliases: &crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases,
     apply_key: ApplyKeyContract,
-) -> Result<StatementResult, String> {
+) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     if base_refs.len() != 2 {
-        return Err("iceberg join MV refresh requires exactly two base tables".to_string());
+        return Err("iceberg join MV refresh requires exactly two base tables"
+            .to_string()
+            .into());
     }
     if apply_key != ApplyKeyContract::join_projection_filter() {
         return Err(
             "iceberg join MV refresh contract did not match join projection/filter apply key"
-                .to_string(),
+                .to_string()
+                .into(),
         );
     }
     validate_join_aliases_base_refs(aliases, base_refs)?;
@@ -8801,7 +8909,8 @@ fn refresh_iceberg_join_mv(
         return Err(format!(
             "iceberg join MV {}.{}.{} requires schema contract version 2, got {}",
             target.catalog, target.namespace, target.table, schema_contract.contract_version
-        ));
+        )
+        .into());
     }
     let (left_ref, right_ref) = join_base_refs_for_aliases(aliases, base_refs)?;
     let left_loaded_before_pin = load_current_iceberg_base_table(state, left_ref)?;
@@ -8845,7 +8954,7 @@ fn refresh_iceberg_join_mv(
             );
             return Ok(StatementResult::Ok);
         }
-        RefreshDecision::FailFast { reason } => return Err(reason),
+        RefreshDecision::FailFast { reason } => return Err(reason.into()),
         RefreshDecision::FirstRefresh
         | RefreshDecision::MetadataOnly
         | RefreshDecision::Incremental => {}
@@ -8858,7 +8967,8 @@ fn refresh_iceberg_join_mv(
         return Err(format!(
             "iceberg join MV refresh expected two refresh pins, got {}",
             pin.len()
-        ));
+        )
+        .into());
     }
     validate_refresh_pin_table_uuids(mv_definition, &pin, base_refs)?;
 
@@ -8927,7 +9037,7 @@ fn refresh_iceberg_join_mv(
         &refresh_label,
     );
 
-    IcebergMvRefreshLifecycle::run(
+    run_iceberg_mv_refresh_lifecycle(
         refresh_decision,
         || {
             let staging_branch = format!(
@@ -8960,13 +9070,15 @@ fn refresh_iceberg_join_mv(
                 target.namespace,
                 target.table
             );
-            finalize_iceberg_mv_metadata_only_refresh_with_partition_state(
-                state,
-                target,
-                mv_definition,
-                pin.to_snapshot_map(),
-                pin.to_table_uuid_map(),
-                IcebergMvPartitionStateFinalize::FromAffected(&ctx.affected_partitions),
+            Ok(
+                finalize_iceberg_mv_metadata_only_refresh_with_partition_state(
+                    state,
+                    target,
+                    mv_definition,
+                    pin.to_snapshot_map(),
+                    pin.to_table_uuid_map(),
+                    IcebergMvPartitionStateFinalize::FromAffected(&ctx.affected_partitions),
+                )?,
             )
         },
         || {
@@ -9237,7 +9349,7 @@ fn first_refresh_iceberg_join_mv(
     aliases: &crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases,
     left_ref: &IcebergTableRef,
     right_ref: &IcebergTableRef,
-) -> Result<StatementResult, String> {
+) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let target = &ctx.rewrite.target;
     let target_entry = &*ctx.target_entry;
     let iceberg_catalog = &ctx.iceberg_catalog;
@@ -9252,7 +9364,7 @@ fn first_refresh_iceberg_join_mv(
         expected_main_snapshot_id,
     ) {
         abort_iceberg_mv_refresh(state, refresh_id)?;
-        return Err(err);
+        return Err(err.into());
     }
     let target_table = match reload_iceberg_mv_target_table(target_entry, target) {
         Ok(table) => table,
@@ -9430,7 +9542,12 @@ fn first_refresh_iceberg_join_mv(
         Ok(Ok(outcome)) => outcome.new_snapshot_id,
         Ok(Err(err)) => {
             return Err(handle_iceberg_mv_commit_service_error(
-                state, refresh_id, err,
+                state,
+                target,
+                target_entry,
+                staging_branch,
+                refresh_id,
+                err,
             ));
         }
         Err(err) => {
@@ -10434,7 +10551,7 @@ fn incremental_refresh_iceberg_join_mv(
     ctx: &IcebergMvRefreshContext,
     base_refs: &[IcebergTableRef],
     aliases: &crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases,
-) -> Result<StatementResult, String> {
+) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let target = &ctx.rewrite.target;
     let target_entry = &*ctx.target_entry;
     let iceberg_catalog = &ctx.iceberg_catalog;
@@ -10443,7 +10560,9 @@ fn incremental_refresh_iceberg_join_mv(
     let mv_definition = &*ctx.rewrite.mv_definition;
     let pin = &*ctx.rewrite.pin;
     if base_refs.len() != 2 {
-        return Err("iceberg join MV refresh requires exactly two base tables".to_string());
+        return Err("iceberg join MV refresh requires exactly two base tables"
+            .to_string()
+            .into());
     }
     let left_ref = &base_refs[0];
     let right_ref = &base_refs[1];
@@ -10485,13 +10604,15 @@ fn incremental_refresh_iceberg_join_mv(
         return Err(format!(
             "join MV left change batch snapshot mismatch: expected {left_to}, got {}",
             left_batch.current_snapshot_id
-        ));
+        )
+        .into());
     }
     if right_batch.current_snapshot_id != right_to {
         return Err(format!(
             "join MV right change batch snapshot mismatch: expected {right_to}, got {}",
             right_batch.current_snapshot_id
-        ));
+        )
+        .into());
     }
     let left_has_changes =
         !left_batch.inserts.is_empty() || iceberg_change_batch_has_row_deletes(&left_batch);
@@ -10512,13 +10633,15 @@ fn incremental_refresh_iceberg_join_mv(
         right_has_changes,
     );
     if branches.is_empty() {
-        return finalize_iceberg_mv_metadata_only_refresh_with_partition_state(
-            state,
-            target,
-            mv_definition,
-            pin.to_snapshot_map(),
-            pin.to_table_uuid_map(),
-            IcebergMvPartitionStateFinalize::FromAffected(&ctx.affected_partitions),
+        return Ok(
+            finalize_iceberg_mv_metadata_only_refresh_with_partition_state(
+                state,
+                target,
+                mv_definition,
+                pin.to_snapshot_map(),
+                pin.to_table_uuid_map(),
+                IcebergMvPartitionStateFinalize::FromAffected(&ctx.affected_partitions),
+            )?,
         );
     }
     execute_join_delta_branches(
@@ -10549,7 +10672,7 @@ fn execute_join_delta_branches(
     pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
     affected_partitions: &crate::engine::mv::partition::AffectedTargetPartitions,
     branches: Vec<crate::engine::mv::iceberg_join_branch::JoinDeltaBranchPlan>,
-) -> Result<StatementResult, String> {
+) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let base_query = parse_mv_select_query(&mv_definition.select_sql)?;
     let first_branch = branches
         .first()
@@ -10585,7 +10708,7 @@ fn execute_join_delta_branches(
         expected_main_snapshot_id,
     ) {
         abort_iceberg_mv_refresh(state, refresh_id)?;
-        return Err(err);
+        return Err(err.into());
     }
     let target_table = match reload_iceberg_mv_target_table(target_entry, target) {
         Ok(table) => table,
@@ -10686,13 +10809,15 @@ fn execute_join_delta_branches(
     if pending.added_rows == 0 && pending.deleted_rows == 0 {
         drop_iceberg_mv_staging_branch(state, target, target_entry, &staging_branch)?;
         abort_iceberg_mv_refresh(state, refresh_id)?;
-        return finalize_iceberg_mv_metadata_only_refresh_with_partition_state(
-            state,
-            target,
-            mv_definition,
-            pin.to_snapshot_map(),
-            pin.to_table_uuid_map(),
-            IcebergMvPartitionStateFinalize::FromAffected(affected_partitions),
+        return Ok(
+            finalize_iceberg_mv_metadata_only_refresh_with_partition_state(
+                state,
+                target,
+                mv_definition,
+                pin.to_snapshot_map(),
+                pin.to_table_uuid_map(),
+                IcebergMvPartitionStateFinalize::FromAffected(affected_partitions),
+            )?,
         );
     }
     let new_total_rows = mv_definition
@@ -10774,13 +10899,15 @@ fn execute_join_delta_branches(
     if flush_outcome.added_rows == 0 && flush_outcome.deleted_rows == 0 {
         drop_iceberg_mv_staging_branch(state, target, target_entry, &staging_branch)?;
         abort_iceberg_mv_refresh(state, refresh_id)?;
-        return finalize_iceberg_mv_metadata_only_refresh_with_partition_state(
-            state,
-            target,
-            mv_definition,
-            pin.to_snapshot_map(),
-            pin.to_table_uuid_map(),
-            IcebergMvPartitionStateFinalize::FromAffected(affected_partitions),
+        return Ok(
+            finalize_iceberg_mv_metadata_only_refresh_with_partition_state(
+                state,
+                target,
+                mv_definition,
+                pin.to_snapshot_map(),
+                pin.to_table_uuid_map(),
+                IcebergMvPartitionStateFinalize::FromAffected(affected_partitions),
+            )?,
         );
     }
 
@@ -10796,7 +10923,12 @@ fn execute_join_delta_branches(
         Ok(Ok(outcome)) => outcome,
         Ok(Err(err)) => {
             return Err(handle_iceberg_mv_commit_service_error(
-                state, refresh_id, err,
+                state,
+                target,
+                target_entry,
+                &staging_branch,
+                refresh_id,
+                err,
             ));
         }
         Err(err) => {
@@ -11038,7 +11170,7 @@ fn incremental_refresh_iceberg_mv(
     current_table_uuid: &str,
     pinned_full_select_sql: &str,
     options: RewriteMergeRefreshOptions,
-) -> Result<StatementResult, String> {
+) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let change = RewriteMergeBaseChange {
         base_ref,
         previous_snapshot_id,
@@ -11062,7 +11194,7 @@ fn incremental_refresh_iceberg_mv_with_changes(
     changes: &[RewriteMergeBaseChange<'_>],
     pinned_full_select_sql: Option<&str>,
     options: RewriteMergeRefreshOptions,
-) -> Result<StatementResult, String> {
+) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let target = &ctx.rewrite.target;
     let target_entry = &*ctx.target_entry;
     let iceberg_catalog = &ctx.iceberg_catalog;
@@ -11072,7 +11204,11 @@ fn incremental_refresh_iceberg_mv_with_changes(
     let apply_key = options.apply_key;
     let rewrite_evidence = rewrite_merge_refresh_evidence(apply_key);
     if changes.is_empty() {
-        return Err("iceberg MV incremental refresh requires at least one base change".to_string());
+        return Err(
+            "iceberg MV incremental refresh requires at least one base change"
+                .to_string()
+                .into(),
+        );
     }
     let snapshots = rewrite_refresh_snapshot_map(changes);
     let table_uuids = rewrite_refresh_table_uuid_map(changes);
@@ -11094,13 +11230,15 @@ fn incremental_refresh_iceberg_mv_with_changes(
                         return Err(format!(
                             "iceberg aggregate MV {}.{}.{} cannot refresh incrementally and automatic full rebuild is disabled: {reason}",
                             target.catalog, target.namespace, target.table
-                        ));
+                        )
+                        .into());
                     }
                     let [change] = changes else {
                         return Err(format!(
                             "iceberg MV {}.{}.{} cannot fall back to full rebuild for multi-base incremental refresh: {reason}",
                             target.catalog, target.namespace, target.table
-                        ));
+                        )
+                        .into());
                     };
                     let pinned_full_select_sql = pinned_full_select_sql.ok_or_else(|| {
                         format!(
@@ -11147,12 +11285,14 @@ fn incremental_refresh_iceberg_mv_with_changes(
                 IcebergChangePolicySignal::Unsupported { reason } => {
                     return Err(format!(
                         "iceberg-stored materialized view refresh unsupported: {reason}"
-                    ));
+                    )
+                    .into());
                 }
                 IcebergChangePolicySignal::Incremental => {
                     return Err(
                         "iceberg-stored materialized view refresh produced invalid incremental policy from change planner"
-                            .to_string(),
+                            .to_string()
+                            .into(),
                     );
                 }
             },
@@ -11163,7 +11303,8 @@ fn incremental_refresh_iceberg_mv_with_changes(
                 change.base_ref.fqn(),
                 change.current_snapshot_id,
                 batch.current_snapshot_id,
-            ));
+            )
+            .into());
         }
         has_insert_changes |= !batch.inserts.is_empty();
         has_delete_changes |= !batch.deletes.is_empty()
@@ -11222,7 +11363,7 @@ fn incremental_refresh_iceberg_mv_with_changes(
         expected_main_snapshot_id,
     ) {
         abort_iceberg_mv_refresh(state, refresh_id)?;
-        return Err(err);
+        return Err(err.into());
     }
     let target_table = match reload_iceberg_mv_target_table(target_entry, target) {
         Ok(table) => table,
@@ -11499,7 +11640,12 @@ fn incremental_refresh_iceberg_mv_with_changes(
         Ok(Ok(outcome)) => outcome.new_snapshot_id,
         Ok(Err(err)) => {
             return Err(handle_iceberg_mv_commit_service_error(
-                state, refresh_id, err,
+                state,
+                target,
+                target_entry,
+                &staging_branch,
+                refresh_id,
+                err,
             ));
         }
         Err(err) => {
@@ -16226,6 +16372,14 @@ mod tests {
             crate::meta::repository::iceberg_operation::IcebergOperationFailureKind::KnownUncommitted
         );
         assert_eq!(failure.message, "commit conflict before catalog update");
+        assert_eq!(
+            failure.next_action,
+            crate::meta::repository::iceberg_operation::IcebergOperationNextAction::None
+        );
+        let cleanup = operation.cleanup_outcome.expect("cleanup outcome");
+        assert!(cleanup.attempted);
+        assert_eq!(cleanup.error_count, 0);
+        assert!(cleanup.error_paths.is_empty());
     }
 
     #[test]
