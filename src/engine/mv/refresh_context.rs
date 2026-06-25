@@ -757,7 +757,9 @@ impl IcebergMvRefreshContext {
         &self,
     ) -> crate::engine::mv::partition::TargetPartitionFilter {
         match &self.affected_partitions {
-            crate::engine::mv::partition::AffectedTargetPartitions::Known { partitions } => {
+            crate::engine::mv::partition::AffectedTargetPartitions::Known {
+                partitions, ..
+            } => {
                 if self
                     .pruning_limits
                     .affected_partition_count_exceeds_limit(partitions.len())
@@ -961,6 +963,7 @@ impl IcebergMvRefreshContext {
                     }
                     crate::engine::mv::partition::AffectedTargetPartitions::Known {
                         partitions,
+                        ..
                     } => {
                         if self
                             .pruning_limits

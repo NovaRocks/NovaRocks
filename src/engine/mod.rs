@@ -2934,6 +2934,51 @@ fn bind_plan_build_result_hdfs_positions(
     Ok(())
 }
 
+fn row_derived_partition_filter_from_delta_preview(
+    plan_filter: &crate::engine::mv::partition::TargetPartitionFilter,
+    partition_derivation: Option<&crate::engine::mv::partition::BoundJoinTargetPartitionDerivation>,
+    delta_chunks: &[crate::exec::chunk::Chunk],
+    pruning_limits: crate::engine::mv::refresh_context::MvRefreshPruningLimits,
+) -> Result<crate::engine::mv::partition::TargetPartitionFilter, String> {
+    if let Some(partition_count) = plan_filter.allow_list_len() {
+        if pruning_limits.affected_partition_count_exceeds_limit(partition_count) {
+            tracing::warn!(
+                affected_partition_count = partition_count,
+                max_affected_partitions = pruning_limits.max_affected_partitions,
+                fallback_reason = "affected_partition_threshold",
+                "falling back to unpartitioned aggregate old-state locator because plan-time affected partition allow-list exceeds configured threshold"
+            );
+            return Ok(crate::engine::mv::partition::TargetPartitionFilter::None);
+        }
+        return Ok(plan_filter.clone());
+    }
+
+    let Some(derivation) = partition_derivation else {
+        return Ok(crate::engine::mv::partition::TargetPartitionFilter::None);
+    };
+    let partitions = crate::engine::mv::partition::evaluate_partition_spec(
+        derivation.target_spec_id,
+        &derivation.bound_fields,
+        delta_chunks,
+    )
+    .map_err(|err| format!("aggregate delta preview partition derivation: {err}"))?;
+    if pruning_limits.affected_partition_count_exceeds_limit(partitions.len()) {
+        tracing::warn!(
+            affected_partition_count = partitions.len(),
+            max_affected_partitions = pruning_limits.max_affected_partitions,
+            fallback_reason = "affected_partition_threshold",
+            "falling back to unpartitioned aggregate old-state locator because row-derived affected partition allow-list exceeds configured threshold"
+        );
+        return Ok(crate::engine::mv::partition::TargetPartitionFilter::None);
+    }
+    tracing::info!(
+        affected_partition_count = partitions.len(),
+        source = "row-derived",
+        "derived join MV affected target partitions from aggregate delta preview"
+    );
+    Ok(crate::engine::mv::partition::TargetPartitionFilter::AllowList(partitions))
+}
+
 fn bind_aggregate_old_input_positions_from_delta_preview(
     old_input: &mut PlanBuildResult,
     delta_input: &PlanBuildResult,
@@ -2960,6 +3005,23 @@ fn bind_aggregate_old_input_positions_from_delta_preview(
                 "falling back to unpositioned aggregate old-state scan"
             );
             return Ok(());
+        }
+    };
+    let partition_filter = match row_derived_partition_filter_from_delta_preview(
+        &locator.partition_filter,
+        locator.partition_derivation.as_ref(),
+        &delta_preview.chunks,
+        pruning_limits,
+    ) {
+        Ok(filter) => filter,
+        Err(err) => {
+            tracing::warn!(
+                target = %target,
+                error = %err,
+                fallback_reason = "delta_preview_partition_derivation",
+                "falling back to locator partition filter from refresh context"
+            );
+            locator.partition_filter.clone()
         }
     };
     let row_ids = match aggregate_delta_row_ids_for_position_locator(layout, &delta_preview.chunks)
@@ -3012,7 +3074,7 @@ fn bind_aggregate_old_input_positions_from_delta_preview(
             &row_ids,
             &existing_deletes_by_file,
             &referenced_data_file_partitions,
-            &locator.partition_filter,
+            &partition_filter,
         ),
     ) {
         Ok(Ok(result)) => result,
@@ -4671,6 +4733,7 @@ mod tests {
         QueryResult, StandaloneNovaRocks, StandaloneOptions, StandaloneSession, StandaloneState,
         StatementResult, dispatch_statement, recover_starrocks_tablet_paths_from_installed_config,
         recover_starrocks_tablet_paths_from_state, register_connector_backends,
+        row_derived_partition_filter_from_delta_preview,
     };
     use crate::connector::starrocks::fe_v2_meta::LakeTableIdentity;
     use crate::connector::starrocks::lake::context::lock_runtime_test_state;
@@ -4710,6 +4773,68 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn aggregate_delta_preview_partition_filter_uses_row_derived_when_plan_filter_is_none() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let derivation = crate::engine::mv::partition::BoundJoinTargetPartitionDerivation {
+            target_spec_id: 7,
+            bound_fields: vec![crate::engine::mv::partition::BoundPartitionField {
+                partition_field_name: "region".to_string(),
+                column_name: "region".to_string(),
+                transform: iceberg::spec::Transform::Identity,
+            }],
+        };
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "region",
+                DataType::Utf8,
+                true,
+            )])),
+            vec![Arc::new(StringArray::from(vec!["west", "east", "west"]))],
+        )
+        .expect("batch");
+        let chunk = crate::engine::record_batch_to_chunk(batch).expect("chunk");
+        let filter = row_derived_partition_filter_from_delta_preview(
+            &crate::engine::mv::partition::TargetPartitionFilter::None,
+            Some(&derivation),
+            &[chunk],
+            crate::engine::mv::refresh_context::MvRefreshPruningLimits::default(),
+        )
+        .expect("filter");
+
+        assert_eq!(
+            filter,
+            crate::engine::mv::partition::TargetPartitionFilter::AllowList(
+                [
+                    crate::engine::mv::partition::MvPartitionKey::new(
+                        7,
+                        vec![crate::engine::mv::partition::MvPartitionKeyField::new(
+                            "region".to_string(),
+                            crate::engine::mv::partition::MvPartitionValue::String(
+                                "east".to_string(),
+                            ),
+                        )],
+                    ),
+                    crate::engine::mv::partition::MvPartitionKey::new(
+                        7,
+                        vec![crate::engine::mv::partition::MvPartitionKeyField::new(
+                            "region".to_string(),
+                            crate::engine::mv::partition::MvPartitionValue::String(
+                                "west".to_string(),
+                            ),
+                        )],
+                    ),
+                ]
+                .into_iter()
+                .collect()
+            )
+        );
     }
 
     fn write_test_metadata_config(dir: &TempDir, metadata_path: &str) -> PathBuf {

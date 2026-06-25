@@ -66,7 +66,8 @@ mod tests {
         IcebergChangeBatch, PositionDeleteRef,
     };
     use crate::engine::mv::partition::{
-        AffectedTargetPartitions, MvPartitionKey, MvPartitionKeyField, MvPartitionValue,
+        AffectedPartitionDerivationSource, AffectedTargetPartitions, MvPartitionKey,
+        MvPartitionKeyField, MvPartitionValue,
     };
     use crate::meta::repository::mv_contract::{
         ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
@@ -210,7 +211,11 @@ mod tests {
             change_batch: Some(&batch),
         });
 
-        let AffectedTargetPartitions::Known { partitions } = result else {
+        assert_eq!(
+            result.derivation_source(),
+            Some(AffectedPartitionDerivationSource::MetadataDerived)
+        );
+        let AffectedTargetPartitions::Known { partitions, .. } = result else {
             panic!("expected known affected partitions");
         };
         assert_eq!(
@@ -235,7 +240,11 @@ mod tests {
             change_batch: Some(&batch),
         });
 
-        let AffectedTargetPartitions::Known { partitions } = result else {
+        assert_eq!(
+            result.derivation_source(),
+            Some(AffectedPartitionDerivationSource::MetadataDerived)
+        );
+        let AffectedTargetPartitions::Known { partitions, .. } = result else {
             panic!("expected known affected partitions");
         };
         let partitions: Vec<_> = partitions.into_iter().collect();

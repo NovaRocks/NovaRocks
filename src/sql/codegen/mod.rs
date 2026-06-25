@@ -60,6 +60,8 @@ pub(crate) struct AggregateStateTargetPositionLocator {
         std::sync::Arc<crate::connector::iceberg::catalog::registry::IcebergCatalogEntry>,
     pub(crate) target_table: iceberg::table::Table,
     pub(crate) partition_filter: crate::engine::mv::partition::TargetPartitionFilter,
+    pub(crate) partition_derivation:
+        Option<crate::engine::mv::partition::BoundJoinTargetPartitionDerivation>,
     pub(crate) apply_key_column: String,
 }
 

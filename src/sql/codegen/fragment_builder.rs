@@ -578,6 +578,12 @@ impl PlanFragmentBuilder {
                     target_entry: std::sync::Arc::clone(&ctx.target_entry),
                     target_table: ctx.target_table.clone(),
                     partition_filter: ctx.affected_partitions_to_target_partition_filter(),
+                    partition_derivation:
+                        crate::engine::mv::partition::target_visible_partition_derivation(
+                            &ctx.rewrite.schema_contract,
+                        )
+                        .ok()
+                        .flatten(),
                     apply_key_column: layout.row_id_column.column.name.clone(),
                 },
             );

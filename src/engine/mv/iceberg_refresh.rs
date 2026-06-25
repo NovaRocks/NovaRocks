@@ -4623,10 +4623,26 @@ fn refresh_join_aggregate_iceberg_mv(
 //     distribution, properties).
 // See the rejection in refresh_iceberg_mv for the user-facing error.
 
-fn unknown_join_affected_partitions() -> crate::engine::mv::partition::AffectedTargetPartitions {
-    crate::engine::mv::partition::AffectedTargetPartitions::not_derived(
-        "join MV affected partition planning is not implemented",
-    )
+fn plan_join_mv_affected_partitions(
+    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    mode: RefreshMode,
+) -> crate::engine::mv::partition::AffectedTargetPartitions {
+    if is_unpartitioned_mv_contract(schema_contract) {
+        return crate::engine::mv::partition::AffectedTargetPartitions::Unpartitioned;
+    }
+    match mode {
+        RefreshMode::Noop => noop_affected_partitions(schema_contract),
+        RefreshMode::Full | RefreshMode::Rebuild => {
+            crate::engine::mv::partition::AffectedTargetPartitions::not_derived(
+                "join MV full refresh affected partition planning requires row-derived delta rows",
+            )
+        }
+        RefreshMode::Incremental => {
+            crate::engine::mv::partition::AffectedTargetPartitions::not_derived(
+                "join MV affected partition planning requires row-derived delta rows",
+            )
+        }
+    }
 }
 
 fn plan_refresh_mode_from_decision(decision: RefreshDecision) -> Result<RefreshMode, RefreshError> {
@@ -4677,11 +4693,17 @@ fn merge_affected_partition_results(
     >,
 ) -> crate::engine::mv::partition::AffectedTargetPartitions {
     let mut merged = BTreeSet::new();
+    let mut merged_source =
+        crate::engine::mv::partition::AffectedPartitionDerivationSource::MetadataDerived;
     let mut saw_unpartitioned = false;
 
     for (base, result) in results {
         match result {
-            crate::engine::mv::partition::AffectedTargetPartitions::Known { partitions } => {
+            crate::engine::mv::partition::AffectedTargetPartitions::Known {
+                partitions,
+                source,
+            } => {
+                merged_source = merged_source.merge(source);
                 merged.extend(partitions);
             }
             crate::engine::mv::partition::AffectedTargetPartitions::Unpartitioned => {
@@ -4704,7 +4726,10 @@ fn merge_affected_partition_results(
             ))
         }
     } else {
-        crate::engine::mv::partition::AffectedTargetPartitions::known(merged)
+        crate::engine::mv::partition::AffectedTargetPartitions::known_with_source(
+            merged,
+            merged_source,
+        )
     }
 }
 
@@ -4832,6 +4857,61 @@ fn plan_aggregate_mv_affected_partitions(
     }
 }
 
+fn plan_single_base_mv_affected_partitions(
+    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    mode: RefreshMode,
+    previous_snapshot_id: Option<i64>,
+    current_snapshot_id: Option<i64>,
+    base_table: &iceberg::table::Table,
+) -> crate::engine::mv::partition::AffectedTargetPartitions {
+    match mode {
+        RefreshMode::Noop => noop_affected_partitions(schema_contract),
+        RefreshMode::Incremental => {
+            if is_unpartitioned_mv_contract(schema_contract) {
+                crate::engine::mv::partition::AffectedTargetPartitions::Unpartitioned
+            } else {
+                let Some(previous) = previous_snapshot_id else {
+                    return crate::engine::mv::partition::AffectedTargetPartitions::not_derived(
+                        "incremental affected partition planning missing previous snapshot",
+                    );
+                };
+                let Some(current) = current_snapshot_id else {
+                    return crate::engine::mv::partition::AffectedTargetPartitions::not_derived(
+                        "incremental affected partition planning missing current snapshot",
+                    );
+                };
+                match plan_changes(base_table, previous, Some(current), &[]) {
+                    Ok(batch) => crate::engine::mv::partition::planner::plan_affected_partitions(
+                        &crate::engine::mv::partition::planner::AffectedPartitionPlanInput {
+                            schema_contract,
+                            change_batch: Some(&batch),
+                        },
+                    ),
+                    Err(err) => {
+                        crate::engine::mv::partition::AffectedTargetPartitions::not_derived(
+                            format!(
+                                "failed to plan Iceberg changes for affected partitions: {err}"
+                            ),
+                        )
+                    }
+                }
+            }
+        }
+        RefreshMode::Full | RefreshMode::Rebuild => {
+            if is_unpartitioned_mv_contract(schema_contract) {
+                crate::engine::mv::partition::AffectedTargetPartitions::Unpartitioned
+            } else {
+                crate::engine::mv::partition::planner::plan_affected_partitions(
+                    &crate::engine::mv::partition::planner::AffectedPartitionPlanInput {
+                        schema_contract,
+                        change_batch: None,
+                    },
+                )
+            }
+        }
+    }
+}
+
 fn is_unpartitioned_mv_contract(
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
 ) -> bool {
@@ -4854,6 +4934,362 @@ fn log_planned_iceberg_mv_affected_partitions(
         affected_partitions = ?affected_partitions,
         "planned iceberg MV affected partitions"
     );
+}
+
+fn pinned_current_snapshots_for_explain(
+    base_refs: &[IcebergTableRef],
+    pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
+) -> Result<BTreeMap<String, Option<i64>>, String> {
+    let mut current_snapshots = BTreeMap::new();
+    for base_ref in base_refs {
+        let current = pin.get(base_ref).ok_or_else(|| {
+            format!(
+                "EXPLAIN REFRESH missing snapshot pin for base {}",
+                base_ref.fqn()
+            )
+        })?;
+        current_snapshots.insert(base_ref.fqn(), Some(current));
+    }
+    Ok(current_snapshots)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_iceberg_mv_refresh_affected_partitions_for_explain(
+    state: &Arc<StandaloneState>,
+    iceberg_target: &IcebergMvTarget,
+    target_table: &iceberg::table::Table,
+    mv_definition: &StoredMvDefinition,
+    base_refs: &[IcebergTableRef],
+    caps: &RefreshCapabilities,
+    canonical_select_query: &sqlparser::ast::Query,
+    pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
+) -> Result<crate::engine::mv::partition::AffectedTargetPartitions, String> {
+    let schema_contract = mv_definition.schema_contract.as_ref().ok_or_else(|| {
+        format!(
+            "iceberg MV target {}.{}.{} is missing A11 schema contract; rebuild or recreate the MV",
+            iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+        )
+    })?;
+    let current_snapshots = pinned_current_snapshots_for_explain(base_refs, pin)?;
+    match (caps.has_agg_state, &caps.snapshot_policy, &caps.identity) {
+        (false, BaseSnapshotPolicy::JoinPairPartialInitialSkip, _) => {
+            let join_aliases =
+                crate::connector::starrocks::table::aggregate_sql_calls::extract_join_aliases(
+                    canonical_select_query,
+                )?;
+            if base_refs.len() != 2 {
+                return Err(
+                    "iceberg join materialized view refresh requires exactly two base table references"
+                        .to_string(),
+                );
+            }
+            validate_join_aliases_base_refs(&join_aliases, base_refs)?;
+            if schema_contract.contract_version != 2 {
+                return Err(format!(
+                    "iceberg join MV {}.{}.{} requires schema contract version 2, got {}",
+                    iceberg_target.catalog,
+                    iceberg_target.namespace,
+                    iceberg_target.table,
+                    schema_contract.contract_version
+                ));
+            }
+            let (left_ref, right_ref) = join_base_refs_for_aliases(&join_aliases, base_refs)?;
+            let left_loaded = load_current_iceberg_base_table(state, left_ref)?;
+            let right_loaded = load_current_iceberg_base_table(state, right_ref)?;
+            match validate_join_schema_contract(
+                schema_contract,
+                &[
+                    (left_ref, &left_loaded.table),
+                    (right_ref, &right_loaded.table),
+                ],
+                target_table,
+            )? {
+                JoinSchemaContractDecision::CompatibleSafe
+                | JoinSchemaContractDecision::CompatibleSafeWithRebind { .. } => {}
+            }
+            let refresh_label = format!(
+                "iceberg join MV {}.{}.{}",
+                iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+            );
+            let refresh_statuses = base_snapshot_statuses_for_plan(
+                base_refs,
+                &mv_definition.last_refresh_snapshots,
+                &current_snapshots,
+            );
+            let mode = plan_refresh_mode_from_decision(decide_refresh(
+                BaseSnapshotPolicy::JoinPairPartialInitialSkip,
+                &refresh_statuses,
+                &refresh_label,
+            ))
+            .map_err(|e| e.to_string())?;
+            Ok(plan_join_mv_affected_partitions(schema_contract, mode))
+        }
+        (false, BaseSnapshotPolicy::SingleBase, _) => {
+            let [base_ref] = base_refs else {
+                return Err(
+                    "iceberg materialized view refresh requires exactly one base table reference"
+                        .to_string(),
+                );
+            };
+            let loaded = load_current_iceberg_base_table(state, base_ref)?;
+            match crate::engine::mv::schema_contract::validate_schema_contract(
+                schema_contract,
+                &loaded.table,
+                target_table,
+            ) {
+                crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
+                    return Err(format!("{err}"));
+                }
+                crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe
+                | crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
+                    ..
+                } => {}
+            }
+            let previous = mv_definition
+                .last_refresh_snapshots
+                .get(&base_ref.fqn())
+                .copied();
+            let current = pin.get(base_ref).ok_or_else(|| {
+                format!(
+                    "EXPLAIN REFRESH missing snapshot pin for base {}",
+                    base_ref.fqn()
+                )
+            })?;
+            let refresh_label = format!(
+                "iceberg materialized view {}.{}.{}",
+                iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+            );
+            let mode = plan_refresh_mode_from_decision(decide_refresh(
+                BaseSnapshotPolicy::SingleBase,
+                &[base_snapshot_status_for_refresh(
+                    base_ref,
+                    previous,
+                    Some(current),
+                )],
+                &refresh_label,
+            ))
+            .map_err(|e| e.to_string())?;
+            Ok(plan_single_base_mv_affected_partitions(
+                schema_contract,
+                mode,
+                previous,
+                Some(current),
+                &loaded.table,
+            ))
+        }
+        (false, BaseSnapshotPolicy::AllBasesRequired, _) => {
+            validate_union_projection_base_refs(base_refs, schema_contract)?;
+            let branch_count = schema_contract
+                .branch
+                .as_ref()
+                .map(|b| b.branch_count as usize)
+                .unwrap_or_else(|| union_branch_count(canonical_select_query) as usize);
+            let mut loaded_bases = BTreeMap::new();
+            for base_ref in base_refs {
+                let loaded = load_current_iceberg_base_table(state, base_ref)?;
+                validate_union_projection_schema_contract_for_base(
+                    iceberg_target,
+                    schema_contract,
+                    branch_count,
+                    base_ref,
+                    &loaded.table,
+                    target_table,
+                )?;
+                loaded_bases.insert(base_ref.fqn(), loaded);
+            }
+            let refresh_label = format!(
+                "iceberg UNION ALL projection/filter MV {}.{}.{}",
+                iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+            );
+            let refresh_statuses = base_snapshot_statuses_for_plan(
+                base_refs,
+                &mv_definition.last_refresh_snapshots,
+                &current_snapshots,
+            );
+            let mode = plan_refresh_mode_from_decision(decide_refresh(
+                BaseSnapshotPolicy::AllBasesRequired,
+                &refresh_statuses,
+                &refresh_label,
+            ))
+            .map_err(|e| e.to_string())?;
+            Ok(plan_multi_base_affected_partitions(
+                schema_contract,
+                mode,
+                base_refs,
+                &mv_definition.last_refresh_snapshots,
+                &current_snapshots,
+                |base_ref| {
+                    loaded_bases
+                        .get(&base_ref.fqn())
+                        .map(|loaded| &loaded.table)
+                },
+                "UNION ALL MV affected partition planning",
+            ))
+        }
+        (true, BaseSnapshotPolicy::SingleBase, _) => {
+            let [base_ref] = base_refs else {
+                return Err(
+                    "iceberg aggregate materialized view refresh requires exactly one base table reference"
+                        .to_string(),
+                );
+            };
+            let loaded = load_current_iceberg_base_table(state, base_ref)?;
+            match crate::engine::mv::schema_contract::validate_schema_contract(
+                schema_contract,
+                &loaded.table,
+                target_table,
+            ) {
+                crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
+                    return Err(format!("{err}"));
+                }
+                crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe
+                | crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
+                    ..
+                } => {}
+            }
+            let previous = mv_definition
+                .last_refresh_snapshots
+                .get(&base_ref.fqn())
+                .copied();
+            let current = pin.get(base_ref).ok_or_else(|| {
+                format!(
+                    "EXPLAIN REFRESH missing snapshot pin for base {}",
+                    base_ref.fqn()
+                )
+            })?;
+            let refresh_label = format!(
+                "iceberg aggregate materialized view {}.{}.{}",
+                iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+            );
+            let mode = plan_refresh_mode_from_decision(decide_refresh(
+                BaseSnapshotPolicy::SingleBase,
+                &[base_snapshot_status_for_refresh(
+                    base_ref,
+                    previous,
+                    Some(current),
+                )],
+                &refresh_label,
+            ))
+            .map_err(|e| e.to_string())?;
+            Ok(plan_aggregate_mv_affected_partitions(
+                schema_contract,
+                mode,
+                previous,
+                Some(current),
+                &loaded.table,
+            ))
+        }
+        (true, BaseSnapshotPolicy::JoinPairPartialInitialSkip, _) => {
+            let join_aliases =
+                crate::connector::starrocks::table::aggregate_sql_calls::extract_join_aliases(
+                    canonical_select_query,
+                )?;
+            if base_refs.len() != 2 {
+                return Err(
+                    "iceberg join aggregate MV refresh requires exactly two base table references"
+                        .to_string(),
+                );
+            }
+            validate_join_aliases_base_refs(&join_aliases, base_refs)?;
+            let (left_ref, right_ref) = join_base_refs_for_aliases(&join_aliases, base_refs)?;
+            let left_loaded = load_current_iceberg_base_table(state, left_ref)?;
+            let right_loaded = load_current_iceberg_base_table(state, right_ref)?;
+            match validate_join_schema_contract(
+                schema_contract,
+                &[
+                    (left_ref, &left_loaded.table),
+                    (right_ref, &right_loaded.table),
+                ],
+                target_table,
+            )? {
+                JoinSchemaContractDecision::CompatibleSafe
+                | JoinSchemaContractDecision::CompatibleSafeWithRebind { .. } => {}
+            }
+            let refresh_label = format!(
+                "iceberg join aggregate MV {}.{}.{}",
+                iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+            );
+            let refresh_statuses = base_snapshot_statuses_for_plan(
+                base_refs,
+                &mv_definition.last_refresh_snapshots,
+                &current_snapshots,
+            );
+            let mode = plan_refresh_mode_from_decision(decide_refresh(
+                BaseSnapshotPolicy::JoinPairPartialInitialSkip,
+                &refresh_statuses,
+                &refresh_label,
+            ))
+            .map_err(|e| e.to_string())?;
+            Ok(plan_join_mv_affected_partitions(schema_contract, mode))
+        }
+        (true, BaseSnapshotPolicy::AllBasesRequired, _) => {
+            let is_branch_union = matches!(caps.identity, RefreshIdentity::BranchScoped(_));
+            let is_composed_join_aggregate =
+                !is_branch_union && !from_clause_is_fan_in_union(canonical_select_query);
+            if is_branch_union {
+                let branch_count = union_branch_count(canonical_select_query) as usize;
+                validate_branch_union_contract(
+                    iceberg_target,
+                    schema_contract,
+                    branch_count,
+                    target_table,
+                )?;
+                validate_branch_union_aggregate_base_refs(base_refs)?;
+            } else if is_composed_join_aggregate {
+                validate_composed_aggregate_fallback_query(canonical_select_query)?;
+            } else {
+                validate_aggregate_fan_in_base_refs(base_refs)?;
+            }
+            let mut loaded_bases = BTreeMap::new();
+            for base_ref in base_refs {
+                let loaded = load_current_iceberg_base_table(state, base_ref)?;
+                validate_aggregate_schema_contract_for_base(
+                    schema_contract,
+                    base_ref,
+                    &loaded.table,
+                    target_table,
+                )?;
+                loaded_bases.insert(base_ref.fqn(), loaded);
+            }
+            let refresh_kind_label = if is_branch_union {
+                "branch UNION ALL aggregate"
+            } else if is_composed_join_aggregate {
+                "composed join aggregate"
+            } else {
+                "aggregate-over-UNION-ALL"
+            };
+            let refresh_label = format!(
+                "iceberg {refresh_kind_label} MV {}.{}.{}",
+                iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+            );
+            let refresh_statuses = base_snapshot_statuses_for_plan(
+                base_refs,
+                &mv_definition.last_refresh_snapshots,
+                &current_snapshots,
+            );
+            let mode = plan_refresh_mode_from_decision(decide_refresh(
+                BaseSnapshotPolicy::AllBasesRequired,
+                &refresh_statuses,
+                &refresh_label,
+            ))
+            .map_err(|e| e.to_string())?;
+            let affected_partition_context =
+                format!("iceberg {refresh_kind_label} MV affected partition planning");
+            Ok(plan_multi_base_affected_partitions(
+                schema_contract,
+                mode,
+                base_refs,
+                &mv_definition.last_refresh_snapshots,
+                &current_snapshots,
+                |base_ref| {
+                    loaded_bases
+                        .get(&base_ref.fqn())
+                        .map(|loaded| &loaded.table)
+                },
+                &affected_partition_context,
+            ))
+        }
+    }
 }
 
 pub(crate) fn plan_iceberg_mv_refresh(
@@ -5077,7 +5513,7 @@ pub(crate) fn plan_iceberg_mv_refresh(
                 })?;
             }
         }
-        let affected_partitions = unknown_join_affected_partitions();
+        let affected_partitions = plan_join_mv_affected_partitions(schema_contract, mode);
         log_planned_iceberg_mv_affected_partitions(&iceberg_target, &affected_partitions);
         return Ok(RefreshPlan {
             mv_id: Some(mv_definition.mv_id),
@@ -5828,7 +6264,7 @@ fn plan_iceberg_aggregate_mv_refresh(
                     })?;
                 }
             }
-            let affected_partitions = unknown_join_affected_partitions();
+            let affected_partitions = plan_join_mv_affected_partitions(schema_contract, mode);
             log_planned_iceberg_mv_affected_partitions(iceberg_target, &affected_partitions);
             Ok(build_iceberg_refresh_plan(
                 mv_definition,
@@ -7115,7 +7551,9 @@ fn finalize_iceberg_mv_partition_state(
                 .map_err(|e| format!("clear iceberg mv partition state failed: {e}"))?;
         }
         IcebergMvPartitionStateFinalize::FromAffected(affected) => match affected {
-            crate::engine::mv::partition::AffectedTargetPartitions::Known { partitions } => {
+            crate::engine::mv::partition::AffectedTargetPartitions::Known {
+                partitions, ..
+            } => {
                 let partition_keys = partitions
                     .iter()
                     .map(|key| key.canonical_string())
@@ -10192,6 +10630,19 @@ mod partition_planning_tests {
     }
 
     #[test]
+    fn merge_sink_partition_derivation_keeps_generic_partition_contracts() {
+        let derivation = merge_sink_partition_derivation(&contract_with_identity_partition())
+            .expect("derivation");
+
+        assert_eq!(derivation.target_spec_id, 7);
+        assert_eq!(derivation.bound_fields.len(), 1);
+        let field = &derivation.bound_fields[0];
+        assert_eq!(field.partition_field_name, "id");
+        assert_eq!(field.column_name, "id");
+        assert_eq!(field.transform, iceberg::spec::Transform::Identity);
+    }
+
+    #[test]
     fn merge_affected_partition_results_unions_known_sets() {
         let merged = merge_affected_partition_results(
             "UNION ALL MV affected partition planning",
@@ -10221,6 +10672,31 @@ mod partition_planning_tests {
                 key("west"),
             ])
         );
+    }
+
+    #[test]
+    fn merge_affected_partition_results_promotes_row_derived_source() {
+        let merged = merge_affected_partition_results(
+            "UNION ALL MV affected partition planning",
+            vec![
+                (
+                    "ice.db.left".to_string(),
+                    crate::engine::mv::partition::AffectedTargetPartitions::known([key("west")]),
+                ),
+                (
+                    "ice.db.right".to_string(),
+                    crate::engine::mv::partition::AffectedTargetPartitions::known_row_derived([
+                        key("east"),
+                    ]),
+                ),
+            ],
+        );
+
+        assert_eq!(
+            merged.derivation_source(),
+            Some(crate::engine::mv::partition::AffectedPartitionDerivationSource::RowDerived)
+        );
+        assert_eq!(merged.explain_summary(), "known(row-derived, count=2)");
     }
 
     #[test]
@@ -10508,7 +10984,8 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan(
             target.catalog, target.namespace, target.table
         )
     })?;
-    if RefreshCapabilities::from_schema_contract(dispatch_schema_contract)?.has_agg_state {
+    let caps = RefreshCapabilities::from_schema_contract(dispatch_schema_contract)?;
+    if caps.has_agg_state {
         validate_aggregate_schema_contract_metadata(&target, &mv_definition)?;
     }
 
@@ -10516,13 +10993,23 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan(
         state, &base_refs,
     )?;
     validate_refresh_pin_table_uuids(&mv_definition, &pin, &base_refs)?;
+    let planned_affected_partitions = plan_iceberg_mv_refresh_affected_partitions_for_explain(
+        state,
+        &target,
+        &target_loaded.table,
+        &mv_definition,
+        &base_refs,
+        &caps,
+        &canonical_select_query,
+        &pin,
+    )?;
 
     let ctx = {
         let iceberg_catalog_guard = state
             .iceberg_catalogs
             .read()
             .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        IcebergMvRefreshContext::new_with_pruning_limits(
+        IcebergMvRefreshContext::new_with_affected_partitions_and_pruning_limits(
             target,
             mv_definition.mv_id,
             current_catalog,
@@ -10535,11 +11022,20 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan(
             Arc::new(target_entry),
             iceberg_catalog,
             target_loaded.table,
+            planned_affected_partitions.clone(),
             state.mv_refresh_pruning_limits,
         )?
     };
     let outcome = run_imv_rewrite_for_refresh_explain(state, &ctx)?;
-    crate::sql::explain::explain_plan_checked(&outcome.plan, level)
+    let mut lines = vec![format!(
+        "MV Refresh affected partitions: {}",
+        planned_affected_partitions.explain_summary()
+    )];
+    lines.extend(crate::sql::explain::explain_plan_checked(
+        &outcome.plan,
+        level,
+    )?);
+    Ok(lines)
 }
 
 fn build_iceberg_table_def_for_snapshot_scan(
@@ -11187,14 +11683,14 @@ fn rewrite_refresh_table_uuid_map(
 
 fn merge_sink_partition_derivation(
     contract: &crate::meta::repository::mv_contract::MvSchemaContract,
-) -> Option<crate::engine::mv::iceberg_merge_sink::BoundTargetPartitionDerivation> {
+) -> Option<crate::engine::mv::partition::BoundJoinTargetPartitionDerivation> {
     let spec = crate::engine::mv::partition::resolve_partition_derivation_spec(contract)
         .ok()
         .flatten()?;
     let bound_fields =
         crate::engine::mv::partition::bind_spec_to_target_visible_columns(&spec, contract).ok()?;
     Some(
-        crate::engine::mv::iceberg_merge_sink::BoundTargetPartitionDerivation {
+        crate::engine::mv::partition::BoundJoinTargetPartitionDerivation {
             target_spec_id: spec.target_spec_id,
             bound_fields,
         },
@@ -15890,7 +16386,7 @@ mod tests {
             plan_iceberg_mv_refresh(&env.state, Some("ice"), &env.current_db, &refresh, target)
                 .expect("second refresh plan");
 
-        let crate::engine::mv::partition::AffectedTargetPartitions::Known { partitions } =
+        let crate::engine::mv::partition::AffectedTargetPartitions::Known { partitions, .. } =
             plan.affected_partitions
         else {
             panic!(
@@ -15948,10 +16444,11 @@ mod tests {
     #[test]
     fn plan_iceberg_mv_refresh_reports_unknown_for_join_mv() {
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_base_table(&env.state, "ice", "sales", "left_orders");
-        create_base_table(&env.state, "ice", "sales", "right_orders");
+        create_base_table_with_rows(&env.state, "ice", "sales", "left_orders", &[(1, "a")]);
+        create_base_table_with_rows(&env.state, "ice", "sales", "right_orders", &[(1, "a")]);
         let stmt = parse_create_mv(
             "CREATE MATERIALIZED VIEW mv_join_orders
+             PARTITION BY (id)
              DISTRIBUTED BY HASH(id) BUCKETS 1
              PROPERTIES('storage_engine'='iceberg')
              AS SELECT l.id, l.name
@@ -15962,6 +16459,11 @@ mod tests {
             .expect("create join iceberg mv");
 
         let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_join_orders");
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("first join refresh");
+        insert_into_iceberg_table(&env.state, "ice", "sales", "left_orders", &[(2, "b")]);
+        insert_into_iceberg_table(&env.state, "ice", "sales", "right_orders", &[(2, "b")]);
+
         let target = crate::engine::mv::lifecycle::MvTarget {
             catalog: Some("ice".to_string()),
             database: "analytics".to_string(),
@@ -15973,8 +16475,72 @@ mod tests {
 
         assert_eq!(
             plan.affected_partitions.not_derived_reason(),
-            Some("join MV affected partition planning is not implemented")
+            Some("join MV affected partition planning requires row-derived delta rows")
         );
+        assert_ne!(
+            plan.affected_partitions.not_derived_reason(),
+            Some(concat!(
+                "join MV affected partition planning is not ",
+                "implemented"
+            ))
+        );
+    }
+
+    #[test]
+    fn affected_partitions_explain_summary_is_stable_for_join_pending_row_derivation() {
+        let affected = crate::engine::mv::partition::AffectedTargetPartitions::not_derived(
+            "join MV affected partition planning requires row-derived delta rows",
+        );
+
+        assert_eq!(
+            format!(
+                "MV Refresh affected partitions: {}",
+                affected.explain_summary()
+            ),
+            "MV Refresh affected partitions: not-derived(join MV affected partition planning requires row-derived delta rows)"
+        );
+    }
+
+    #[test]
+    fn explain_refresh_affected_partition_header_uses_read_only_planner() {
+        let source = std::fs::read_to_string(file!()).expect("read source");
+        let body = extract_function_body(
+            &source,
+            "pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan",
+        );
+
+        assert!(
+            !body.contains("plan_iceberg_mv_refresh("),
+            "EXPLAIN refresh must not call the stateful refresh planner"
+        );
+        assert!(
+            body.contains("plan_iceberg_mv_refresh_affected_partitions_for_explain("),
+            "EXPLAIN refresh should use the read-only affected-partition planner"
+        );
+    }
+
+    fn extract_function_body<'a>(source: &'a str, function_signature: &str) -> &'a str {
+        let start = source
+            .find(function_signature)
+            .unwrap_or_else(|| panic!("missing function signature: {function_signature}"));
+        let open = source[start..]
+            .find('{')
+            .map(|idx| start + idx)
+            .expect("function body starts");
+        let mut depth = 0usize;
+        for (offset, ch) in source[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[open + 1..open + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("function body is not closed: {function_signature}");
     }
 
     #[test]

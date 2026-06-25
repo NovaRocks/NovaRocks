@@ -13,11 +13,34 @@ use crate::engine::mv::partition::{MvPartitionKey, MvPartitionKeyField};
 use crate::exec::chunk::Chunk;
 use crate::meta::repository::mv_contract::{ExpressionKind, MvSchemaContract};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AffectedPartitionDerivationSource {
+    MetadataDerived,
+    RowDerived,
+}
+
+impl AffectedPartitionDerivationSource {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::MetadataDerived => "metadata-derived",
+            Self::RowDerived => "row-derived",
+        }
+    }
+
+    pub(crate) fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::RowDerived, _) | (_, Self::RowDerived) => Self::RowDerived,
+            (Self::MetadataDerived, Self::MetadataDerived) => Self::MetadataDerived,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AffectedTargetPartitions {
     Unpartitioned,
     Known {
         partitions: BTreeSet<MvPartitionKey>,
+        source: AffectedPartitionDerivationSource,
     },
     NotDerived {
         reason: String,
@@ -26,14 +49,46 @@ pub(crate) enum AffectedTargetPartitions {
 
 impl AffectedTargetPartitions {
     pub(crate) fn known<I: IntoIterator<Item = MvPartitionKey>>(partitions: I) -> Self {
+        Self::known_with_source(
+            partitions,
+            AffectedPartitionDerivationSource::MetadataDerived,
+        )
+    }
+
+    pub(crate) fn known_row_derived<I: IntoIterator<Item = MvPartitionKey>>(partitions: I) -> Self {
+        Self::known_with_source(partitions, AffectedPartitionDerivationSource::RowDerived)
+    }
+
+    pub(crate) fn known_with_source<I: IntoIterator<Item = MvPartitionKey>>(
+        partitions: I,
+        source: AffectedPartitionDerivationSource,
+    ) -> Self {
         Self::Known {
             partitions: partitions.into_iter().collect(),
+            source,
         }
     }
 
     pub(crate) fn not_derived(reason: impl Into<String>) -> Self {
         Self::NotDerived {
             reason: reason.into(),
+        }
+    }
+
+    pub(crate) fn derivation_source(&self) -> Option<AffectedPartitionDerivationSource> {
+        match self {
+            Self::Known { source, .. } => Some(*source),
+            Self::Unpartitioned | Self::NotDerived { .. } => None,
+        }
+    }
+
+    pub(crate) fn explain_summary(&self) -> String {
+        match self {
+            Self::Unpartitioned => "unpartitioned".to_string(),
+            Self::Known { partitions, source } => {
+                format!("known({}, count={})", source.as_str(), partitions.len())
+            }
+            Self::NotDerived { reason } => format!("not-derived({reason})"),
         }
     }
 
@@ -51,7 +106,7 @@ impl AffectedTargetPartitions {
     pub(crate) fn partition_count(&self) -> usize {
         match self {
             Self::Unpartitioned | Self::NotDerived { .. } => 0,
-            Self::Known { partitions } => partitions.len(),
+            Self::Known { partitions, .. } => partitions.len(),
         }
     }
 
@@ -66,7 +121,7 @@ impl AffectedTargetPartitions {
     ) -> crate::engine::mv::partition::TargetPartitionFilter {
         use crate::engine::mv::partition::TargetPartitionFilter;
         match self {
-            Self::Known { partitions } => TargetPartitionFilter::AllowList(partitions.clone()),
+            Self::Known { partitions, .. } => TargetPartitionFilter::AllowList(partitions.clone()),
             Self::Unpartitioned | Self::NotDerived { .. } => TargetPartitionFilter::None,
         }
     }
@@ -544,9 +599,43 @@ mod tests {
     }
 
     #[test]
+    fn affected_target_partitions_known_defaults_to_metadata_source() {
+        let result = AffectedTargetPartitions::known([key("a")]);
+
+        assert_eq!(
+            result.derivation_source(),
+            Some(AffectedPartitionDerivationSource::MetadataDerived)
+        );
+        assert_eq!(result.explain_summary(), "known(metadata-derived, count=1)");
+    }
+
+    #[test]
+    fn affected_target_partitions_known_row_derived_reports_source() {
+        let result = AffectedTargetPartitions::known_row_derived([key("a"), key("b")]);
+
+        assert_eq!(
+            result.derivation_source(),
+            Some(AffectedPartitionDerivationSource::RowDerived)
+        );
+        assert_eq!(result.explain_summary(), "known(row-derived, count=2)");
+    }
+
+    #[test]
+    fn affected_target_partitions_not_derived_explain_summary_includes_reason() {
+        let result = AffectedTargetPartitions::not_derived(
+            "join MV target partition field region is not a pure column lineage",
+        );
+
+        assert_eq!(
+            result.explain_summary(),
+            "not-derived(join MV target partition field region is not a pure column lineage)"
+        );
+    }
+
+    #[test]
     fn affected_target_partitions_known_dedupes_and_sorts() {
         let result = AffectedTargetPartitions::known([key("b"), key("a"), key("a")]);
-        let AffectedTargetPartitions::Known { partitions } = result else {
+        let AffectedTargetPartitions::Known { partitions, .. } = result else {
             panic!("expected Known");
         };
         assert_eq!(
@@ -1174,7 +1263,7 @@ mod tests {
     // (resolve -> bind -> evaluate) exactly as the old single-shot deriver
     // did, so these lock the same observable behavior over the retained
     // derivation library. `None` mirrors the old `Unpartitioned` result;
-    // `Some(partitions)` mirrors the old `Known { partitions }` result.
+    // `Some(partitions)` mirrors the old known-partition result.
     fn derive_for_test(
         contract: &MvSchemaContract,
         layout: &AggregateMvLayout,

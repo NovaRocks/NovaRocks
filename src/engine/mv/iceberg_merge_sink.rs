@@ -59,19 +59,14 @@ pub struct IcebergMergeSinkPlan {
     pub partition_filter: crate::engine::mv::partition::TargetPartitionFilter,
     /// Target-visible partition derivation used when plan-time affected
     /// partitions are not available, for example join-side row movement.
-    pub(crate) partition_derivation: Option<BoundTargetPartitionDerivation>,
+    pub(crate) partition_derivation:
+        Option<crate::engine::mv::partition::BoundJoinTargetPartitionDerivation>,
     pub(crate) pruning_limits: crate::engine::mv::refresh_context::MvRefreshPruningLimits,
 }
 
 pub struct TargetLocatorState {
     pub existing_deletes_by_file: crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
     pub referenced_data_file_partitions: crate::engine::delete_flow::ReferencedDataFilePartitions,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct BoundTargetPartitionDerivation {
-    pub(crate) target_spec_id: i32,
-    pub(crate) bound_fields: Vec<crate::engine::mv::partition::BoundPartitionField>,
 }
 
 pub struct IcebergMergeSinkFactory {
@@ -303,7 +298,7 @@ impl IcebergMergeSinkOperator {
 
 fn delete_batch_partition_filter(
     plan_filter: &crate::engine::mv::partition::TargetPartitionFilter,
-    partition_derivation: Option<&BoundTargetPartitionDerivation>,
+    partition_derivation: Option<&crate::engine::mv::partition::BoundJoinTargetPartitionDerivation>,
     batch: &RecordBatch,
     pruning_limits: crate::engine::mv::refresh_context::MvRefreshPruningLimits,
 ) -> Result<crate::engine::mv::partition::TargetPartitionFilter, String> {
@@ -659,8 +654,9 @@ mod tests {
         .unwrap()
     }
 
-    fn bound_partition_derivation() -> BoundTargetPartitionDerivation {
-        BoundTargetPartitionDerivation {
+    fn bound_partition_derivation()
+    -> crate::engine::mv::partition::BoundJoinTargetPartitionDerivation {
+        crate::engine::mv::partition::BoundJoinTargetPartitionDerivation {
             target_spec_id: 7,
             bound_fields: vec![crate::engine::mv::partition::BoundPartitionField {
                 partition_field_name: "region".to_string(),

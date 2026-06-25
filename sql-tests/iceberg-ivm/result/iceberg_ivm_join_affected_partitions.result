@@ -1,0 +1,16 @@
+-- query 3
+id	region	amount
+1	east	100
+2	west	200
+
+-- query 7
+id	region	amount
+1	east	100
+2	west	200
+3	west	300
+
+-- query 8
+id	region	amount
+1	east	100
+2	west	200
+3	west	300

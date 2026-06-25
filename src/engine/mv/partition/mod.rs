@@ -1,10 +1,12 @@
 pub(crate) mod derivation;
+pub(crate) mod join;
 pub(crate) mod key;
 pub(crate) mod mapping;
 pub(crate) mod planner;
 
 pub(crate) use derivation::{
-    AffectedTargetPartitions, PartitionDerivationSpec, resolve_partition_derivation_spec,
+    AffectedPartitionDerivationSource, AffectedTargetPartitions, PartitionDerivationSpec,
+    resolve_partition_derivation_spec,
 };
 // P2 partition-pruning asset: the chunk evaluator + its bound/error types were
 // extracted in P1 (the dead pre-cutover apply path that used them is removed),
@@ -15,6 +17,13 @@ pub(crate) use derivation::{
     AffectedPartitionError, BoundPartitionField, PartitionDerivationField,
     bind_spec_to_aggregate_layout, bind_spec_to_target_visible_columns, evaluate_partition_spec,
     evaluate_partition_spec_record_batch,
+};
+// Task 2 exposes the join row-derivation library before refresh planning and
+// merge-sink callers are wired in later tasks.
+#[allow(unused_imports)]
+pub(crate) use join::{
+    BoundJoinTargetPartitionDerivation, derive_join_target_partitions_from_delta_chunks,
+    target_visible_partition_derivation,
 };
 pub(crate) use key::{
     MvPartitionKey, MvPartitionKeyField, MvPartitionValue, TargetPartitionFilter,
