@@ -27,3 +27,29 @@ id	region	amount	category
 2	west	20	games
 5	west	40	toys
 7	east	70	books
+
+-- query 13
+region	c	s
+east	1	70
+north	2	6
+south	1	8
+west	2	60
+
+-- query 14
+region	c	s
+east	1	70
+north	2	6
+south	1	8
+west	2	60
+
+-- query 16
+id	region	amount
+101	east	100
+102	west	200
+103	east	300
+
+-- query 17
+id	region	amount
+101	east	100
+102	west	200
+103	east	300
