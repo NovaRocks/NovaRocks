@@ -2724,14 +2724,19 @@ fn validate_repartition_rebuild_wired(
     target: &IcebergMvTarget,
 ) -> Result<(), String> {
     match support {
-        RepartitionSupport::ProjectionFilterSingleBase => Ok(()),
-        _ => Err(format!(
-            "UnsupportedRepartitionShape: {} repartition rebuild is not wired yet; target={}.{}.{}",
-            support.label(),
-            target.catalog,
-            target.namespace,
-            target.table
-        )),
+        RepartitionSupport::ProjectionFilterSingleBase
+        | RepartitionSupport::AggregateSingleBase
+        | RepartitionSupport::JoinAggregate
+        | RepartitionSupport::FanInAggregate => Ok(()),
+        RepartitionSupport::JoinProjectionFilter | RepartitionSupport::UnionProjectionFilter => {
+            Err(format!(
+                "UnsupportedRepartitionShape: {} repartition payload builder is not enabled in this task; target={}.{}.{}",
+                support.label(),
+                target.catalog,
+                target.namespace,
+                target.table
+            ))
+        }
     }
 }
 
@@ -2776,18 +2781,7 @@ pub(crate) fn repartition_iceberg_mv(
     let (target_entry, iceberg_catalog, target_loaded) = load_iceberg_mv_target(state, &target)?;
     validate_target_snapshot(&target, &mv_definition, &target_loaded.table)?;
     let base_refs = parse_iceberg_table_refs(&mv_definition.base_table_refs)?;
-    let [base_ref] = base_refs.as_slice() else {
-        return Err(format!(
-            "ALTER MATERIALIZED VIEW ... REPARTITION currently supports exactly one base table, got {}",
-            base_refs.len()
-        ));
-    };
-    let loaded_base = load_current_iceberg_base_table(state, base_ref)?;
-    ensure_schema_contract_compatible_for_refresh(
-        schema_contract,
-        &loaded_base.table,
-        &target_loaded.table,
-    )?;
+    validate_repartition_schema_contract(state, schema_contract, &base_refs, &target_loaded.table)?;
 
     let select_query = parse_mv_select_query(&mv_definition.select_sql)?;
     let canonical_select_query =
@@ -2807,26 +2801,7 @@ pub(crate) fn repartition_iceberg_mv(
     let pin = crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin::capture(
         state, &base_refs,
     )?;
-    pin.get(base_ref).ok_or_else(|| {
-        format!(
-            "repartition refresh pin missing snapshot for base {}",
-            base_ref.fqn()
-        )
-    })?;
-    let current_table_uuid = pin.uuid(base_ref).ok_or_else(|| {
-        format!(
-            "repartition refresh pin missing uuid for base {}",
-            base_ref.fqn()
-        )
-    })?;
-    if let Some(previous_uuid) = mv_definition.last_refresh_table_uuids.get(&base_ref.fqn())
-        && previous_uuid != current_table_uuid
-    {
-        return Err(format!(
-            "iceberg MV base table identity changed for {}; repartition is unsafe, recreate the MV",
-            base_ref.fqn()
-        ));
-    }
+    validate_repartition_refresh_pin_table_uuids(&mv_definition, &pin, &base_refs)?;
 
     let expected_main_snapshot_id = target_loaded
         .table
@@ -2855,24 +2830,60 @@ pub(crate) fn repartition_iceberg_mv(
         previous_partition_contract,
     )?;
 
-    let pinned_full_select_sql =
-        match rewrite_full_refresh_select_with_pin(&mv_definition.select_sql, &pin, base_ref) {
-            Ok(sql) => sql,
+    let payload = match &support {
+        RepartitionSupport::ProjectionFilterSingleBase => {
+            let [base_ref] = base_refs.as_slice() else {
+                abort_iceberg_mv_refresh(state, refresh_id)?;
+                return Err(format!(
+                    "ALTER MATERIALIZED VIEW ... REPARTITION projection/filter payload requires exactly one base table, got {}",
+                    base_refs.len()
+                ));
+            };
+            let pinned_full_select_sql = match rewrite_full_refresh_select_with_pin(
+                &mv_definition.select_sql,
+                &pin,
+                base_ref,
+            ) {
+                Ok(sql) => sql,
+                Err(err) => {
+                    abort_iceberg_mv_refresh(state, refresh_id)?;
+                    return Err(err);
+                }
+            };
+            match collect_repartition_rebuild_payload(
+                state,
+                current_database,
+                &pinned_full_select_sql,
+                &pin,
+            ) {
+                Ok(payload) => payload,
+                Err(err) => {
+                    abort_iceberg_mv_refresh(state, refresh_id)?;
+                    return Err(err);
+                }
+            }
+        }
+        RepartitionSupport::AggregateSingleBase
+        | RepartitionSupport::JoinAggregate
+        | RepartitionSupport::FanInAggregate => match build_aggregate_repartition_payload(
+            state,
+            current_catalog,
+            current_database,
+            &mv_definition.select_sql,
+            &pin,
+        ) {
+            Ok(payload) => payload,
             Err(err) => {
                 abort_iceberg_mv_refresh(state, refresh_id)?;
                 return Err(err);
             }
-        };
-    let payload = match collect_repartition_rebuild_payload(
-        state,
-        current_database,
-        &pinned_full_select_sql,
-        &pin,
-    ) {
-        Ok(payload) => payload,
-        Err(err) => {
+        },
+        RepartitionSupport::JoinProjectionFilter | RepartitionSupport::UnionProjectionFilter => {
             abort_iceberg_mv_refresh(state, refresh_id)?;
-            return Err(err);
+            return Err(format!(
+                "UnsupportedRepartitionShape: {} repartition payload builder is not enabled in this task",
+                support.label()
+            ));
         }
     };
 
@@ -8097,6 +8108,29 @@ fn prepare_aggregate_first_refresh_chunks_for_select_sql(
     )
 }
 
+fn build_aggregate_repartition_payload(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    select_sql: &str,
+    pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
+) -> Result<RepartitionRebuildPayload, String> {
+    let select_query = parse_mv_select_query(select_sql)?;
+    let calls =
+        crate::connector::starrocks::table::aggregate_sql_calls::extract_aggregate_sql_calls(
+            &select_query,
+        )?;
+    let chunks = prepare_aggregate_first_refresh_chunks_for_select_sql(
+        state,
+        current_catalog,
+        current_database,
+        select_sql,
+        &calls,
+        pin,
+    )?;
+    Ok(RepartitionRebuildPayload::from_chunks(chunks, pin))
+}
+
 fn prepare_branch_union_aggregate_first_refresh_chunks(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
@@ -9425,6 +9459,139 @@ fn ensure_schema_contract_compatible_for_refresh(
     }
 }
 
+fn validate_repartition_schema_contract(
+    state: &Arc<StandaloneState>,
+    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    base_refs: &[IcebergTableRef],
+    target_table: &iceberg::table::Table,
+) -> Result<(), String> {
+    if schema_contract.join.is_some() {
+        let [left_ref, right_ref] = base_refs else {
+            return Err(format!(
+                "Iceberg join MV repartition schema contract requires exactly two base tables, got {}",
+                base_refs.len()
+            ));
+        };
+        let left_loaded = load_current_iceberg_base_table(state, left_ref)?;
+        let right_loaded = load_current_iceberg_base_table(state, right_ref)?;
+        match validate_join_schema_contract(
+            schema_contract,
+            &[
+                (left_ref, &left_loaded.table),
+                (right_ref, &right_loaded.table),
+            ],
+            target_table,
+        )? {
+            JoinSchemaContractDecision::CompatibleSafe => {}
+            JoinSchemaContractDecision::CompatibleSafeWithRebind { rebound_columns } => {
+                if schema_contract.aggregate.is_some() {
+                    return Err(format!(
+                        "iceberg join aggregate MV repartition requires schema rebind for {rebound_columns:?}, which is not supported during repartition; recreate the MV"
+                    ));
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    if !schema_contract.bases.is_empty() {
+        for base_ref in base_refs {
+            let loaded = load_current_iceberg_base_table(state, base_ref)?;
+            if schema_contract.aggregate.is_some() {
+                validate_aggregate_repartition_schema_contract_for_base(
+                    schema_contract,
+                    base_ref,
+                    &loaded.table,
+                    target_table,
+                )?;
+            } else {
+                validate_repartition_base_schema_contract(
+                    schema_contract,
+                    base_ref,
+                    &loaded.table,
+                    target_table,
+                )?;
+            }
+        }
+        return Ok(());
+    }
+
+    let [base_ref] = base_refs else {
+        return Err(format!(
+            "ALTER MATERIALIZED VIEW ... REPARTITION single-base schema contract requires exactly one base table, got {}",
+            base_refs.len()
+        ));
+    };
+    let loaded = load_current_iceberg_base_table(state, base_ref)?;
+    if schema_contract.aggregate.is_some() {
+        validate_aggregate_repartition_schema_contract_for_base(
+            schema_contract,
+            base_ref,
+            &loaded.table,
+            target_table,
+        )
+    } else {
+        ensure_schema_contract_compatible_for_refresh(schema_contract, &loaded.table, target_table)
+    }
+}
+
+fn validate_aggregate_repartition_schema_contract_for_base(
+    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    base_ref: &IcebergTableRef,
+    base_table: &iceberg::table::Table,
+    target_table: &iceberg::table::Table,
+) -> Result<(), String> {
+    validate_aggregate_schema_contract_for_base(
+        schema_contract,
+        base_ref,
+        base_table,
+        target_table,
+    )
+    .map_err(|err| {
+        if err.contains("requires schema rebind") {
+            format!(
+                "iceberg aggregate MV repartition requires schema rebind for base {}, which is not supported during repartition; recreate the MV",
+                base_ref.fqn()
+            )
+        } else {
+            err
+        }
+    })
+}
+
+fn validate_repartition_base_schema_contract(
+    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    base_ref: &IcebergTableRef,
+    base_table: &iceberg::table::Table,
+    target_table: &iceberg::table::Table,
+) -> Result<(), String> {
+    let mut base_contract = schema_contract.clone();
+    base_contract.base = schema_contract
+        .bases
+        .iter()
+        .find(|base| base.table_fqn.eq_ignore_ascii_case(&base_ref.fqn()))
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "Iceberg MV repartition schema contract missing base {}; recreate the MV",
+                base_ref.fqn()
+            )
+        })?;
+    match crate::engine::mv::schema_contract::validate_schema_contract(
+        &base_contract,
+        base_table,
+        target_table,
+    ) {
+        crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
+            Err(format!("{err}"))
+        }
+        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe
+        | crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
+            ..
+        } => Ok(()),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn refresh_iceberg_join_mv(
     state: &Arc<StandaloneState>,
@@ -9691,6 +9858,33 @@ fn validate_refresh_pin_table_uuids(
     pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
     base_refs: &[IcebergTableRef],
 ) -> Result<(), String> {
+    validate_refresh_pin_table_uuids_for_operation(
+        mv_definition,
+        pin,
+        base_refs,
+        "incremental refresh is unsafe, rebuild or recreate the MV",
+    )
+}
+
+fn validate_repartition_refresh_pin_table_uuids(
+    mv_definition: &StoredMvDefinition,
+    pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
+    base_refs: &[IcebergTableRef],
+) -> Result<(), String> {
+    validate_refresh_pin_table_uuids_for_operation(
+        mv_definition,
+        pin,
+        base_refs,
+        "repartition is unsafe, recreate the MV",
+    )
+}
+
+fn validate_refresh_pin_table_uuids_for_operation(
+    mv_definition: &StoredMvDefinition,
+    pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
+    base_refs: &[IcebergTableRef],
+    unsafe_message: &str,
+) -> Result<(), String> {
     for base_ref in base_refs {
         let Some(previous_uuid) = mv_definition.last_refresh_table_uuids.get(&base_ref.fqn())
         else {
@@ -9704,8 +9898,8 @@ fn validate_refresh_pin_table_uuids(
         })?;
         if previous_uuid != current_uuid {
             return Err(format!(
-                "iceberg MV base table identity changed for {}; incremental refresh is unsafe, rebuild or recreate the MV",
-                base_ref.fqn()
+                "iceberg MV base table identity changed for {}; {unsafe_message}",
+                base_ref.fqn(),
             ));
         }
     }
@@ -12668,19 +12862,24 @@ mod tests {
             &target,
         )
         .expect("projection/filter rebuild remains wired");
-
         for support in [
             RepartitionSupport::AggregateSingleBase,
-            RepartitionSupport::JoinProjectionFilter,
             RepartitionSupport::JoinAggregate,
             RepartitionSupport::FanInAggregate,
+        ] {
+            validate_repartition_rebuild_wired(&support, &target)
+                .expect("aggregate-family rebuild is wired");
+        }
+
+        for support in [
+            RepartitionSupport::JoinProjectionFilter,
             RepartitionSupport::UnionProjectionFilter,
         ] {
             let err = validate_repartition_rebuild_wired(&support, &target)
-                .expect_err("non-projection rebuild must be temporarily blocked");
+                .expect_err("non-aggregate projection/filter rebuild must be temporarily blocked");
             assert!(err.contains("UnsupportedRepartitionShape"));
             assert!(err.contains(&format!(
-                "{} repartition rebuild is not wired yet",
+                "{} repartition payload builder is not enabled in this task",
                 support.label()
             )));
             assert!(err.contains("target=ice.analytics.mv_join_aggregate"));
@@ -14036,6 +14235,41 @@ mod tests {
         txn.commit().expect("commit uuid-only metadata seed");
     }
 
+    fn seed_mismatched_refresh_uuid_metadata(
+        state: &Arc<StandaloneState>,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        mismatched_base_fqn: &str,
+    ) {
+        let mv = find_iceberg_mv_definition(state, catalog, namespace, table)
+            .expect("mv definition for mismatched uuid metadata seed");
+        let provider = state.metadata_provider.as_ref().expect("metadata provider");
+        let mut txn = provider
+            .begin_write("seed mismatched iceberg mv refresh uuid metadata")
+            .expect("write txn");
+        let mut table_uuids = mv.last_refresh_table_uuids.clone();
+        table_uuids.insert(
+            mismatched_base_fqn.to_string(),
+            "mismatched-table-uuid".to_string(),
+        );
+        let updated = state
+            .mv_repo
+            .update_starrocks_refresh_summary_if_present(
+                txn.as_mut(),
+                crate::meta::repository::mv::UpdateStarRocksMvRefreshSummaryRequest {
+                    mv_id: mv.mv_id,
+                    last_refresh_ms: now_ms(),
+                    last_refresh_rows: mv.last_refresh_rows.unwrap_or(0),
+                    base_snapshots: mv.last_refresh_snapshots.clone(),
+                    base_table_uuids: table_uuids,
+                },
+            )
+            .expect("seed mismatched uuid refresh metadata");
+        assert!(updated);
+        txn.commit().expect("commit mismatched uuid metadata seed");
+    }
+
     fn seed_union_projection_mismatched_uuid_refresh_metadata(
         state: &Arc<StandaloneState>,
         catalog: &str,
@@ -14989,6 +15223,151 @@ mod tests {
             operation.target.ref_name.as_deref()
         );
         assert_eq!(intent.target_new_default_spec_id, spec.spec_id());
+    }
+
+    #[test]
+    fn alter_iceberg_aggregate_mv_repartition_rebuilds_state_and_contract() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_aggregate_fact_table(&env.state, "ice", "sales", "orders");
+        insert_into_aggregate_fact_table(
+            &env.state,
+            "ice",
+            "sales",
+            "orders",
+            &[(1, "east", 10), (2, "west", 20), (3, "east", 30)],
+        );
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_sales_agg
+             PARTITION BY (region)
+             DISTRIBUTED BY HASH(region) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT region, COUNT(*) AS c, SUM(amount) AS s
+                FROM ice.sales.orders
+                GROUP BY region",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create aggregate iceberg mv");
+
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_sales_agg");
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("first aggregate refresh");
+        assert_aggregate_region_rows(
+            &env.state,
+            "ice",
+            &env.current_db,
+            "mv_sales_agg",
+            &[("east", 2, 40), ("west", 1, 20)],
+        );
+
+        let alter = parse_alter_mv(
+            "ALTER MATERIALIZED VIEW mv_sales_agg REPARTITION BY (truncate(region, 2))",
+        );
+        repartition_iceberg_mv(&env.state, Some("ice"), &env.current_db, &alter)
+            .expect("repartition aggregate iceberg mv");
+        assert_aggregate_region_rows(
+            &env.state,
+            "ice",
+            &env.current_db,
+            "mv_sales_agg",
+            &[("east", 2, 40), ("west", 1, 20)],
+        );
+
+        let entry = {
+            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get("ice").expect("catalog")
+        };
+        let loaded =
+            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_sales_agg")
+                .expect("load repartitioned aggregate target");
+        let spec = loaded.table.metadata().default_partition_spec();
+        assert_ne!(spec.spec_id(), 0);
+        assert_eq!(spec.fields().len(), 1);
+        assert_eq!(spec.fields()[0].name, "region_truncate_2");
+
+        let definition = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_sales_agg")
+            .expect("mv definition after aggregate repartition");
+        let stored_partition = definition.partition_spec.expect("stored partition spec");
+        assert_eq!(stored_partition.target_spec_id, spec.spec_id());
+        assert_eq!(
+            stored_partition.fields[0].partition_field_name,
+            "region_truncate_2"
+        );
+
+        let refreshes = load_all_mv_refreshes(&env.state);
+        let repartition_refresh = refreshes.last().expect("repartition refresh");
+        let operation = load_test_operation_for_refresh(&env.state, repartition_refresh.refresh_id);
+        assert_eq!(
+            operation.operation_subkind.as_deref(),
+            Some("MV_REPARTITION")
+        );
+        assert_eq!(operation.state, IcebergOperationState::Finalized);
+    }
+
+    #[test]
+    fn alter_iceberg_aggregate_mv_repartition_rejects_base_rebind() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_aggregate_fact_table(&env.state, "ice", "sales", "orders");
+        insert_into_aggregate_fact_table(
+            &env.state,
+            "ice",
+            "sales",
+            "orders",
+            &[(1, "east", 10), (2, "west", 20)],
+        );
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_sales_agg
+             PARTITION BY (region)
+             DISTRIBUTED BY HASH(region) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT region, COUNT(*) AS c, SUM(amount) AS s
+                FROM ice.sales.orders
+                GROUP BY region",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create aggregate iceberg mv");
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_sales_agg");
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("first aggregate refresh");
+
+        execute_iceberg_sql(
+            &env.state,
+            Some("ice"),
+            &env.current_db,
+            "ALTER TABLE ice.sales.orders RENAME COLUMN region TO area",
+        );
+
+        let alter = parse_alter_mv(
+            "ALTER MATERIALIZED VIEW mv_sales_agg REPARTITION BY (truncate(region, 2))",
+        );
+        let err = repartition_iceberg_mv(&env.state, Some("ice"), &env.current_db, &alter)
+            .expect_err("aggregate repartition should reject schema rebind");
+        assert!(err.contains("aggregate"), "err={err}");
+        assert!(err.contains("schema rebind"), "err={err}");
+        assert!(err.contains("repartition"), "err={err}");
+        assert!(err.contains("recreate the MV"), "err={err}");
+    }
+
+    #[test]
+    fn alter_iceberg_mv_repartition_uuid_mismatch_uses_repartition_error() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table_with_rows(&env.state, "ice", "sales", "orders", &[(1, "alfa")]);
+        create_mv_and_refresh_once(&env.state, Some("ice"), &env.current_db, "mv_orders");
+        seed_mismatched_refresh_uuid_metadata(
+            &env.state,
+            "ice",
+            "analytics",
+            "mv_orders",
+            "ice.sales.orders",
+        );
+
+        let alter =
+            parse_alter_mv("ALTER MATERIALIZED VIEW mv_orders REPARTITION BY (truncate(name, 2))");
+        let err = repartition_iceberg_mv(&env.state, Some("ice"), &env.current_db, &alter)
+            .expect_err("mismatched base table uuid should reject repartition");
+        assert!(err.contains("base table identity changed"), "err={err}");
+        assert!(err.contains("ice.sales.orders"), "err={err}");
+        assert!(err.contains("repartition is unsafe"), "err={err}");
+        assert!(!err.contains("incremental refresh is unsafe"), "err={err}");
     }
 
     #[test]
