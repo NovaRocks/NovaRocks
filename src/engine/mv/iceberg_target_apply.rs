@@ -991,6 +991,7 @@ pub(crate) async fn locate_target_rows_by_apply_key_string(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connector::iceberg::commit::PositionDeleteGroup;
     use crate::engine::mv::partition::TargetPartitionFilter;
     use arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -1794,6 +1795,60 @@ mod tests {
         table_def
     }
 
+    fn normalize_position_delete_groups(groups: &mut [PositionDeleteGroup]) {
+        for group in groups.iter_mut() {
+            group.positions.sort_unstable();
+        }
+        groups.sort_by(|left, right| {
+            left.referenced_data_file
+                .cmp(&right.referenced_data_file)
+                .then_with(|| left.partition_spec_id.cmp(&right.partition_spec_id))
+                .then_with(|| left.positions.cmp(&right.positions))
+        });
+    }
+
+    fn assert_position_delete_groups_eq(
+        mut expected: Vec<PositionDeleteGroup>,
+        mut actual: Vec<PositionDeleteGroup>,
+    ) {
+        normalize_position_delete_groups(&mut expected);
+        normalize_position_delete_groups(&mut actual);
+        assert_eq!(
+            expected.len(),
+            actual.len(),
+            "position-delete group count differs"
+        );
+        for (idx, (expected, actual)) in expected.iter().zip(actual.iter()).enumerate() {
+            assert_eq!(
+                expected.referenced_data_file, actual.referenced_data_file,
+                "group {idx} referenced_data_file differs"
+            );
+            assert_eq!(
+                expected.partition_spec_id, actual.partition_spec_id,
+                "group {idx} partition_spec_id differs"
+            );
+            assert_eq!(
+                expected.partition_values, actual.partition_values,
+                "group {idx} partition_values differ"
+            );
+            assert_eq!(
+                expected.positions, actual.positions,
+                "group {idx} positions differ"
+            );
+        }
+    }
+
+    async fn pending_resolve_target_positions_via_framework(
+        _target_table: &iceberg::table::Table,
+        _apply_key_column: &str,
+        _requested_keys: &[String],
+        _existing_deletes_by_file: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
+        _referenced_data_file_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
+        _partition_filter: &TargetPartitionFilter,
+    ) -> Result<Vec<PositionDeleteGroup>, String> {
+        panic!("pending framework locator implementation")
+    }
+
     #[test]
     fn spike_framework_select_file_pos_on_target() {
         use arrow::array::{Int64Array, StringArray};
@@ -1967,6 +2022,50 @@ mod tests {
         assert_eq!(pos.value(0), 0);
         assert_eq!(apply_key.value(0), "key-a");
         drop(loopback_backend);
+    }
+
+    #[test]
+    #[ignore = "pending framework locator implementation"]
+    fn framework_locate_matches_direct_locator_partitioned() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let fixture = build_partitioned_apply_key_target_with_rows();
+        let requested = vec!["key-a".to_string(), "key-b".to_string()];
+        let empty_deletes = std::collections::HashMap::new();
+        let mut referenced: crate::engine::delete_flow::ReferencedDataFilePartitions =
+            std::collections::HashMap::new();
+        for path in &fixture.file_paths {
+            referenced.insert(
+                path.clone(),
+                crate::engine::delete_flow::ReferencedDataFilePartition {
+                    partition_spec_id: 0,
+                    partition_values: iceberg::spec::Struct::empty(),
+                },
+            );
+        }
+
+        let direct_groups = rt
+            .block_on(super::locate_target_rows_by_string_apply_key(
+                &fixture.table,
+                ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+                &requested,
+                &empty_deletes,
+                &referenced,
+                &TargetPartitionFilter::None,
+            ))
+            .expect("direct apply-key locator");
+
+        let framework_groups = rt
+            .block_on(pending_resolve_target_positions_via_framework(
+                &fixture.table,
+                ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+                &requested,
+                &empty_deletes,
+                &referenced,
+                &TargetPartitionFilter::None,
+            ))
+            .expect("framework apply-key locator");
+
+        assert_position_delete_groups_eq(direct_groups, framework_groups);
     }
 
     /// Verify that the AllowList pruning path:
