@@ -169,7 +169,7 @@ fn parse_usize_property(key: &str, value: &str) -> Option<usize> {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ObjectStoreConfig {
     pub endpoint: String,
     pub bucket: String,

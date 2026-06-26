@@ -2687,6 +2687,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         );
         let mut scan_plan_node = nodes::build_scan_node(
             state.connectors(),
+            state.mv_refresh_ctx(),
             scan_node_id,
             scan_tuple_id,
             &resolved,

@@ -1112,7 +1112,7 @@ pub(crate) fn execute_drop_table_statement(
                     &target.namespace,
                     &target.table,
                 )?;
-                crate::engine::query_prep::drop_registered_external_table(
+                crate::engine::query_prep::drop_local_table_registration_if_exists(
                     state,
                     &target.namespace,
                     &target.table,
@@ -1131,7 +1131,7 @@ pub(crate) fn execute_drop_table_statement(
                     &target.namespace,
                     &target.table,
                 )?;
-                crate::engine::query_prep::drop_registered_external_table(
+                crate::engine::query_prep::drop_local_table_registration_if_exists(
                     state,
                     &target.namespace,
                     &target.table,

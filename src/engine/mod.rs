@@ -4053,7 +4053,6 @@ fn lower_plan_build_result(
         &layout_hints,
         None,
         None,
-        iceberg_catalogs,
     )?;
     Ok(lowered.node)
 }

@@ -3,6 +3,7 @@ use std::any::Any;
 use crate::connector::scan_planning::{ConnectorScanHandle, ConnectorSplit, ScanHandle, Split};
 
 const CONNECTOR_ID: &str = "starrocks";
+const DEFAULT_FE_CATALOG: &str = "default_catalog";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StarRocksTableHandle {
@@ -131,6 +132,7 @@ impl StarRocksTableScanPlanner {
             Some(false),
             Some(false),
             None::<i64>,
+            Some(DEFAULT_FE_CATALOG.to_string()),
         );
 
         internal_service::TScanRangeParams::new(

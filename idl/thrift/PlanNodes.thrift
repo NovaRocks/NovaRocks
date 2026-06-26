@@ -154,6 +154,7 @@ struct TInternalScanRange {
   // skip local disk data cache when access page data
   15: optional bool skip_disk_cache = false;
   16: optional i64 gtid
+  17: optional string catalog_name;
 }
 
 enum TFileFormatType {
@@ -1496,12 +1497,11 @@ struct TLookUpNode {
 
 // This is essentially a union of all messages corresponding to subclasses
 // of PlanNode.
-// NovaRocks-only: IVM-A1 Iceberg incremental delta scan source. Carries only
-// lightweight descriptors (catalog/namespace/table strings + from/to
-// snapshot ids). The list of change files and runtime state (delete
-// visibility, first_row_id index, opendal factory) are computed at
-// lower_plan time by `plan_changes` so they never traverse the Thrift
-// wire format.
+// NovaRocks-only: IVM-A1 Iceberg incremental delta scan source. Carries the
+// base table identity, snapshot range, and a NovaRocks-private explicit JSON
+// payload produced at refresh/codegen time. The payload contains the planned
+// change files and runtime descriptors needed by lower_plan, so lower does
+// not read connector catalog state.
 struct TIcebergDeltaScanNode {
   // `namespace` is a C++ reserved keyword and thrift's C++ codegen emits the
   // field name verbatim (no escaping), so we have to spell it differently
@@ -1512,6 +1512,7 @@ struct TIcebergDeltaScanNode {
   3: required string table
   4: required i64 from_snapshot_id
   5: required i64 to_snapshot_id
+  6: optional string explicit_payload_json
 }
 
 struct TPlanNode {

@@ -1257,6 +1257,126 @@ pub(crate) fn load_existing_delete_visibility_by_data_file(
     load_existing_delete_visibility_by_data_file_at(table, None, object_store_config)
 }
 
+pub(crate) fn load_existing_delete_visibility_from_descriptors(
+    data_files: &[crate::connector::iceberg::changes::DeleteVisibilityDataFileDescriptor],
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+) -> Result<ExistingDeleteVisibilityByDataFile, String> {
+    let mut out: ExistingDeleteVisibilityByDataFile = HashMap::new();
+
+    for data_file in data_files {
+        if data_file.delete_files.is_empty() {
+            continue;
+        }
+
+        let data_file_len = u64::try_from(data_file.size)
+            .map_err(|_| format!("iceberg data file size is negative: {}", data_file.path))?;
+        let mut loader_ranges = Vec::with_capacity(1 + data_file.delete_files.len());
+        loader_ranges.push(crate::fs::scan_context::FileScanRange {
+            path: data_file.path.clone(),
+            file_len: data_file_len,
+            offset: 0,
+            length: data_file_len,
+            scan_range_id: -1,
+            first_row_id: data_file.first_row_id,
+            data_sequence_number: data_file.data_sequence_number,
+            ivm_change_op: None,
+            included_positions: None,
+            external_datacache: None,
+            delete_files: Vec::new(),
+        });
+        for delete_file in &data_file.delete_files {
+            let delete_len_i64 = delete_file.length.unwrap_or(0);
+            let delete_len = u64::try_from(delete_len_i64).map_err(|_| {
+                format!("iceberg delete file size is negative: {}", delete_file.path)
+            })?;
+            loader_ranges.push(crate::fs::scan_context::FileScanRange {
+                path: delete_file.path.clone(),
+                file_len: delete_len,
+                offset: 0,
+                length: delete_len,
+                scan_range_id: -1,
+                first_row_id: None,
+                data_sequence_number: None,
+                ivm_change_op: None,
+                included_positions: None,
+                external_datacache: None,
+                delete_files: Vec::new(),
+            });
+        }
+
+        let ctx = crate::fs::scan_context::FileScanContext::build(
+            loader_ranges,
+            None,
+            object_store_config,
+        )?;
+        let normalized_delete_specs = ctx
+            .ranges
+            .iter()
+            .skip(1)
+            .zip(data_file.delete_files.iter())
+            .map(|(resolved, original)| {
+                let file_format = match original.file_format {
+                    crate::connector::iceberg::changes::DeleteVisibilityDeleteFileFormat::Parquet => {
+                        crate::thrift::descriptors::THdfsFileFormat::PARQUET
+                    }
+                    crate::connector::iceberg::changes::DeleteVisibilityDeleteFileFormat::Puffin => {
+                        crate::thrift::descriptors::THdfsFileFormat::PARQUET
+                    }
+                };
+                let file_content = match original.file_content {
+                    crate::connector::iceberg::changes::DeleteVisibilityDeleteFileContent::Position => {
+                        crate::thrift::types::TIcebergFileContent::POSITION_DELETES
+                    }
+                    crate::connector::iceberg::changes::DeleteVisibilityDeleteFileContent::Equality => {
+                        crate::thrift::types::TIcebergFileContent::EQUALITY_DELETES
+                    }
+                };
+                Ok(
+                    crate::connector::iceberg::position_delete::IcebergDeleteFileSpec {
+                        path: resolved.path.clone(),
+                        file_format,
+                        file_content,
+                        length: original
+                            .length
+                            .map(u64::try_from)
+                            .transpose()
+                            .map_err(|_| {
+                                format!("iceberg delete file size is negative: {}", original.path)
+                            })?,
+                        content_offset: original.content_offset,
+                        content_size_in_bytes: original.content_size_in_bytes,
+                    },
+                )
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let deleted_positions = crate::connector::iceberg::position_delete::load_position_deletes(
+            &normalized_delete_specs,
+            &data_file.path,
+            &ctx.factory,
+        )?;
+        let equality_deletes =
+            crate::connector::iceberg::equality_delete::load_equality_delete_sets(
+                &normalized_delete_specs,
+                &ctx.factory,
+            )?;
+        if deleted_positions.is_empty() && equality_deletes.is_empty() {
+            continue;
+        }
+        let visibility = ExistingDeleteVisibility {
+            deleted_positions,
+            equality_deletes,
+        };
+        if let Some(resolved_data_file) = ctx.ranges.first()
+            && resolved_data_file.path != data_file.path
+        {
+            out.insert(resolved_data_file.path.clone(), visibility.clone());
+        }
+        out.insert(data_file.path.clone(), visibility);
+    }
+
+    Ok(out)
+}
+
 fn load_delete_visibility_from_data_files(
     data_files: Vec<crate::connector::iceberg::catalog::registry::DataFileWithStats>,
     object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,

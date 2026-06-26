@@ -438,7 +438,7 @@ fn handle_analyze_statement(
     // Ordinary SELECT no longer does this; it resolves external tables through
     // CatalogMgrProvider. No-op for local/StarRocks tables, which register on
     // CREATE.
-    crate::engine::query_prep::register_external_table_by_name(
+    crate::engine::query_prep::materialize_external_schema_table_for_statement(
         state,
         current_catalog,
         current_database,
@@ -501,7 +501,7 @@ fn handle_analyze_statement(
         state,
         current_catalog,
         current_database,
-        &table, // the ObjectName already parsed above (the same value passed to register_external_table_by_name)
+        &table, // the ObjectName already parsed above for statement-scoped schema materialization
         &columns,
     )?;
     let rows = collect_column_stats_by_query(state, &key, &columns, &ndv_by_name)?;

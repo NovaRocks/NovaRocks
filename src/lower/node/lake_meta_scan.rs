@@ -52,7 +52,7 @@ use crate::runtime::query_context::QueryId;
 use crate::service::grpc_client::proto::starrocks::{ColumnPb, TabletSchemaPb};
 use crate::thrift::{descriptors, internal_service, plan_nodes, types};
 
-use super::lake_scan::{build_lake_properties, load_lake_catalog};
+use super::lake_scan::{build_lake_properties, record_internal_catalog_name};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum MetaMetricKind {
@@ -95,6 +95,11 @@ struct MetaColumnMinMax {
 }
 
 /// Lower a LAKE_META_SCAN_NODE to a one-row `ValuesNode`.
+///
+/// The FE side must provide tablet ids, versions, schema id, row-count hints,
+/// and table identity through descriptors plus `per_node_scan_ranges`. Catalog
+/// identity is part of the explicit internal scan range contract; this lower
+/// path must not read process-local StarRocks catalog configuration.
 ///
 /// Supported metrics:
 /// - rows_<column_id>       => total row count
@@ -169,6 +174,7 @@ pub(crate) fn lower_lake_meta_scan_node(
 
     let mut tablet_versions: HashMap<i64, i64> = HashMap::new();
     let mut tablet_row_count_hints: HashMap<i64, i64> = HashMap::new();
+    let mut internal_catalog_name: Option<String> = None;
     let mut internal_db_name: Option<String> = None;
     let mut internal_table_name: Option<String> = None;
     let mut min_partition_id: Option<i64> = None;
@@ -187,6 +193,12 @@ pub(crate) fn lower_lake_meta_scan_node(
                 node.node_id
             ));
         };
+        record_internal_catalog_name(
+            &mut internal_catalog_name,
+            internal.catalog_name.as_deref(),
+            "LAKE_META_SCAN_NODE",
+            node.node_id,
+        )?;
         if internal.tablet_id <= 0 {
             return Err(format!(
                 "LAKE_META_SCAN_NODE has invalid tablet_id={}",
@@ -305,7 +317,12 @@ pub(crate) fn lower_lake_meta_scan_node(
     } else {
         table_desc.table_name.trim().to_string()
     };
-    let catalog = load_lake_catalog()?;
+    let catalog = internal_catalog_name.ok_or_else(|| {
+        format!(
+            "LAKE_META_SCAN_NODE node_id={} missing catalog_name in effective scan ranges",
+            node.node_id
+        )
+    })?;
     let table_identity = LakeTableIdentity {
         catalog,
         db_name,

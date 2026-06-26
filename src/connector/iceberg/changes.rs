@@ -4,6 +4,11 @@
 //! error enum so that CREATE-time PRIMARY KEY validation has a stable type
 //! to return.
 
+use crate::exec::node::iceberg_delta_scan::{
+    DeltaSourceFile, DeltaSourceRole, EqualityDeleteTargetData, PositionDeleteFileFormat,
+    PositionDeleteSourceData,
+};
+
 /// All failure modes the iceberg change-planning and IVM CREATE/REFRESH
 /// paths can surface. STRICT fail-fast: every variant is a hard rejection,
 /// not a fallback signal. Variants not constructed in this PR are reserved
@@ -239,6 +244,37 @@ pub(crate) struct PositionDeleteRef {
     pub partition_values: Vec<ChangePartitionFieldValue>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub(crate) enum DeleteVisibilityDeleteFileFormat {
+    Parquet,
+    Puffin,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub(crate) enum DeleteVisibilityDeleteFileContent {
+    Position,
+    Equality,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub(crate) struct DeleteVisibilityDeleteFileDescriptor {
+    pub path: String,
+    pub file_format: DeleteVisibilityDeleteFileFormat,
+    pub file_content: DeleteVisibilityDeleteFileContent,
+    pub length: Option<i64>,
+    pub content_offset: Option<i64>,
+    pub content_size_in_bytes: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub(crate) struct DeleteVisibilityDataFileDescriptor {
+    pub path: String,
+    pub size: i64,
+    pub first_row_id: Option<i64>,
+    pub data_sequence_number: Option<i64>,
+    pub delete_files: Vec<DeleteVisibilityDeleteFileDescriptor>,
+}
+
 /// Reference to a single equality-delete file added to the table. Unlike
 /// position deletes, equality deletes do not name row positions; reverse
 /// projection must scan older data files in the same partition and keep rows
@@ -406,6 +442,149 @@ pub(crate) struct IcebergChangeBatch {
     pub deletes: Vec<PositionDeleteRef>,
     pub equality_deletes: Vec<EqualityDeleteRef>,
     pub deleted_data_files: Vec<DeletedDataFileRef>,
+}
+
+pub(crate) fn delta_source_files_from_change_batch(
+    batch: &IcebergChangeBatch,
+) -> Result<Vec<DeltaSourceFile>, String> {
+    let mut out = Vec::with_capacity(
+        batch.inserts.len()
+            + batch.deletes.len()
+            + batch.equality_deletes.len()
+            + batch.deleted_data_files.len(),
+    );
+    for ins in &batch.inserts {
+        out.push(DeltaSourceFile {
+            path: ins.path.clone(),
+            size: ins.size,
+            role: DeltaSourceRole::DataFile,
+            partition_spec_id: ins.partition_spec_id,
+            partition_key: ins.partition_key.clone(),
+            first_row_id: ins.first_row_id,
+            data_sequence_number: ins.data_sequence_number,
+            row_id_allow_list: ins.row_id_allow_list.clone(),
+        });
+    }
+    let mut position_deletes = Vec::with_capacity(batch.deletes.len());
+    for del in &batch.deletes {
+        position_deletes.push(PositionDeleteSourceData {
+            delete_file_path: del.delete_file_path.clone(),
+            delete_file_size: del.delete_file_size,
+            referenced_data_file: del.referenced_data_file.clone(),
+            file_format: match del.file_format {
+                iceberg::spec::DataFileFormat::Parquet => PositionDeleteFileFormat::Parquet,
+                iceberg::spec::DataFileFormat::Puffin => PositionDeleteFileFormat::Puffin,
+                other => {
+                    return Err(format!(
+                        "ivm-a1 delta-scan payload: position-delete file {} has unsupported \
+                         file_format {:?}; only Parquet and Puffin are supported",
+                        del.delete_file_path, other
+                    ));
+                }
+            },
+            content_offset: del.content_offset,
+            content_size_in_bytes: del.content_size_in_bytes,
+        });
+    }
+    if let Some(first) = position_deletes.first() {
+        out.push(DeltaSourceFile {
+            path: first.delete_file_path.clone(),
+            size: 0,
+            role: DeltaSourceRole::PositionDelete {
+                deletes: position_deletes,
+            },
+            partition_spec_id: None,
+            partition_key: None,
+            first_row_id: None,
+            data_sequence_number: None,
+            row_id_allow_list: None,
+        });
+    }
+    for eq in &batch.equality_deletes {
+        out.push(DeltaSourceFile {
+            path: eq.delete_file_path.clone(),
+            size: eq.delete_file_size,
+            role: DeltaSourceRole::EqualityDelete {
+                equality_field_ids: eq.equality_ids.clone(),
+                targets: Vec::<EqualityDeleteTargetData>::new(),
+            },
+            partition_spec_id: eq.partition_spec_id,
+            partition_key: eq.partition_key.clone(),
+            first_row_id: None,
+            data_sequence_number: eq.sequence_number,
+            row_id_allow_list: None,
+        });
+    }
+    for d in &batch.deleted_data_files {
+        out.push(DeltaSourceFile {
+            path: d.path.clone(),
+            size: d.size,
+            role: DeltaSourceRole::DeletedDataFile {
+                previous_data_file_visibility: None,
+            },
+            partition_spec_id: d.partition_spec_id,
+            partition_key: d.partition_key.clone(),
+            first_row_id: d.first_row_id,
+            data_sequence_number: d.data_sequence_number,
+            row_id_allow_list: None,
+        });
+    }
+    Ok(out)
+}
+
+pub(crate) fn delete_visibility_data_files_at(
+    table: &iceberg::table::Table,
+    snapshot_id: i64,
+) -> Result<Vec<DeleteVisibilityDataFileDescriptor>, String> {
+    crate::connector::iceberg::catalog::registry::extract_data_files_with_stats_at(
+        table,
+        snapshot_id,
+    )?
+    .into_iter()
+    .map(delete_visibility_data_file_from_stats)
+    .collect()
+}
+
+fn delete_visibility_data_file_from_stats(
+    file: crate::connector::iceberg::catalog::registry::DataFileWithStats,
+) -> Result<DeleteVisibilityDataFileDescriptor, String> {
+    let delete_files = file
+        .delete_files
+        .into_iter()
+        .map(|delete| {
+            let file_format = match delete.file_format {
+                crate::sql::catalog::IcebergDeleteFileFormat::Parquet => {
+                    DeleteVisibilityDeleteFileFormat::Parquet
+                }
+                crate::sql::catalog::IcebergDeleteFileFormat::Puffin => {
+                    DeleteVisibilityDeleteFileFormat::Puffin
+                }
+            };
+            let file_content = match delete.file_content {
+                crate::sql::catalog::IcebergDeleteFileContent::Position => {
+                    DeleteVisibilityDeleteFileContent::Position
+                }
+                crate::sql::catalog::IcebergDeleteFileContent::Equality => {
+                    DeleteVisibilityDeleteFileContent::Equality
+                }
+            };
+            Ok(DeleteVisibilityDeleteFileDescriptor {
+                path: delete.path,
+                file_format,
+                file_content,
+                length: delete.length,
+                content_offset: delete.content_offset,
+                content_size_in_bytes: delete.content_size_in_bytes,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(DeleteVisibilityDataFileDescriptor {
+        path: file.path,
+        size: file.size,
+        first_row_id: file.first_row_id,
+        data_sequence_number: file.data_sequence_number,
+        delete_files,
+    })
 }
 
 /// Per-row Change action: this row got inserted or deleted relative to

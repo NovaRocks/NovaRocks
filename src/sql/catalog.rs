@@ -281,8 +281,8 @@ pub struct PhysicalTableLayout {
 /// - `IcebergMetadataTable`: synthetic source for iceberg metadata
 ///   tables (`t$snapshots` etc.); the operator reads
 ///   `iceberg::spec::TableMetadata` natively in Rust.
-/// - `IcebergDeltaTable`: lightweight identity for IVM-A1 delta
-///   scans; the actual change-file list is resolved at lower time.
+/// - `IcebergDeltaTable`: plan-time identity for IVM-A1 delta
+///   scans; codegen expands it into an explicit change-file payload.
 #[derive(Clone, Debug)]
 pub enum ScanSource {
     /// StarRocks table: data lives in object storage (s3:// or
@@ -332,11 +332,10 @@ pub enum ScanSource {
     /// IVM-A1 plan-time Iceberg delta-scan placeholder. Produced by the
     /// analyzer/planner when it recognizes the
     /// `__nr_ivm_delta('cat.ns.tbl', from, to)` table function. Codegen
-    /// emits `TPlanNodeType::ICEBERG_DELTA_SCAN_NODE` whose lowering
-    /// re-discovers the actual change files via
-    /// `connector::iceberg::changes::plan_changes`. The descriptor here
-    /// carries only the lightweight identity and snapshot range so the
-    /// Thrift plan stays small.
+    /// emits `TPlanNodeType::ICEBERG_DELTA_SCAN_NODE` with an explicit
+    /// payload produced by `connector::iceberg::changes::plan_changes`.
+    /// Lowering consumes that payload and does not re-read connector catalog
+    /// state.
     IcebergDeltaTable {
         table: IcebergTableInfo,
         from_snapshot_id: i64,
@@ -394,6 +393,10 @@ pub enum TableLookupMode {
 }
 
 /// Catalog abstraction for SQL analysis.
+///
+/// This remains the analyzer adapter surface. Engine entrypoints that resolve
+/// standalone external catalogs should construct a `CatalogMgrProvider` instead
+/// of reintroducing query-scoped global `InMemoryCatalog` registration.
 pub trait CatalogProvider {
     fn get_table(&self, database: &str, table: &str) -> Result<TableDef, String>;
 

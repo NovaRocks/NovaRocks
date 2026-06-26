@@ -17,23 +17,20 @@
 
 //! Lowering for `TPlanNodeType::ICEBERG_DELTA_SCAN_NODE` (IVM-A1).
 //!
-//! The Thrift node carries only the lightweight identity
-//! (`catalog/namespace/table`) plus the snapshot range. The full change
-//! batch (insert data files, position-delete, equality-delete, deleted
-//! data files) is computed here at lower_plan time via
-//! `connector::iceberg::changes::plan_changes`. The delete-side
-//! preloads (`base_data_file_lineage`, `previous_delete_visibility`) are
-//! captured into `IcebergRuntimeHandles` so per-file operator code can
-//! borrow them instead of rebuilding them per file.
+//! The Thrift node carries identity, snapshot range, and a NovaRocks-private
+//! explicit payload produced at refresh/codegen time. Lowering parses that
+//! payload into change files, table metadata, object-store config, and
+//! delete-side descriptors; it does not read connector catalog state.
+//! Delete-side runtime state is captured into `IcebergRuntimeHandles` so
+//! per-file operator code can borrow it instead of rebuilding it per file.
 
 use std::sync::Arc;
 
-use crate::connector::iceberg::catalog::IcebergCatalogRegistry;
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::node::iceberg_delta_scan::{
-    ApplyKeySource, BaseTableIdent, DeltaScanDeleteSide, DeltaSourceFile, DeltaSourceRole,
-    EqualityDeleteTargetData, IcebergDeltaScanNode, IcebergRuntimeHandles,
-    PositionDeleteFileFormat, PositionDeleteSourceData,
+    ApplyKeySource, BaseTableIdent, DeltaScanDeleteSide, DeltaScanDeleteSidePayload,
+    ICEBERG_DELTA_EXPLICIT_PAYLOAD_VERSION, IcebergDeltaExplicitPayload, IcebergDeltaScanNode,
+    IcebergRuntimeHandles,
 };
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::lower::layout::{Layout, chunk_schema_for_layout};
@@ -42,25 +39,16 @@ use crate::thrift::descriptors;
 use crate::thrift::plan_nodes;
 
 /// Lower an `ICEBERG_DELTA_SCAN_NODE` into an `ExecNode` of kind
-/// `IcebergDeltaScan`. Requires an `IcebergCatalogRegistry` so the base
-/// table can be re-loaded; standard FE-compatible paths do not provide
-/// one and reject the node before reaching this function.
+/// `IcebergDeltaScan`. The node must carry an explicit refresh/codegen-time
+/// payload; this boundary does not read connector catalog state.
 pub(crate) fn lower_iceberg_delta_scan_node(
     node: &plan_nodes::TPlanNode,
     desc_tbl: Option<&descriptors::TDescriptorTable>,
     out_layout: Layout,
-    iceberg_catalogs: Option<&IcebergCatalogRegistry>,
 ) -> Result<Lowered, String> {
     let payload = node.iceberg_delta_scan_node.as_ref().ok_or_else(|| {
         format!(
             "ICEBERG_DELTA_SCAN_NODE node_id={} missing iceberg_delta_scan_node payload",
-            node.node_id
-        )
-    })?;
-    let iceberg_catalogs = iceberg_catalogs.ok_or_else(|| {
-        format!(
-            "ICEBERG_DELTA_SCAN_NODE node_id={} requires an iceberg_catalogs registry; \
-             this entrypoint is IVM-only and the lower_plan caller did not provide one",
             node.node_id
         )
     })?;
@@ -83,118 +71,44 @@ pub(crate) fn lower_iceberg_delta_scan_node(
         ));
     }
 
-    let entry = iceberg_catalogs.get(&payload.catalog)?;
-    let loaded = crate::connector::iceberg::catalog::load_table(
-        &entry,
-        &payload.iceberg_namespace,
-        &payload.table,
-    )?;
-
-    // The snapshot interval is (from_snapshot_id, to_snapshot_id] semantically.
-    // Lineage validation (to in metadata, from is a descendant ancestor of to)
-    // is enforced by plan_changes / classify_lineage.
-    let batch = crate::connector::iceberg::changes::plan_changes(
-        &loaded.table,
-        payload.from_snapshot_id,
-        Some(payload.to_snapshot_id),
-        &[],
-    )
-    .map_err(|e| {
+    let explicit_payload = payload.explicit_payload_json.as_deref().ok_or_else(|| {
         format!(
-            "ivm-a1 lower delta-scan: plan_changes failed for {}.{}.{} from_snapshot={} to_snapshot={}: {e}",
-            payload.catalog,
-            payload.iceberg_namespace,
-            payload.table,
-            payload.from_snapshot_id,
-            payload.to_snapshot_id
+            "ICEBERG_DELTA_SCAN_NODE node_id={} requires explicit_payload_json; \
+             lower does not read connector catalog state",
+            node.node_id
         )
     })?;
-
-    let change_files = build_delta_source_files_from_batch(&batch)?;
-
+    let explicit: IcebergDeltaExplicitPayload =
+        serde_json::from_str(explicit_payload).map_err(|e| {
+            format!(
+                "ICEBERG_DELTA_SCAN_NODE node_id={} parse explicit_payload_json failed: {e}",
+                node.node_id
+            )
+        })?;
+    if explicit.version != ICEBERG_DELTA_EXPLICIT_PAYLOAD_VERSION {
+        return Err(format!(
+            "ICEBERG_DELTA_SCAN_NODE node_id={} unsupported explicit payload version {}; expected {}",
+            node.node_id, explicit.version, ICEBERG_DELTA_EXPLICIT_PAYLOAD_VERSION
+        ));
+    }
+    let metadata: iceberg::spec::TableMetadata =
+        serde_json::from_str(&explicit.serialized_table_metadata).map_err(|e| {
+            format!(
+                "ICEBERG_DELTA_SCAN_NODE node_id={} parse serialized_table_metadata failed: {e}",
+                node.node_id
+            )
+        })?;
+    let change_files = explicit.change_files;
+    let delete_side_payload = explicit.delete_side;
+    let base_table = build_base_table_from_explicit_metadata(payload, metadata)?;
+    let object_store_config = explicit.object_store_config;
     let object_store_factory =
         Arc::new(crate::connector::iceberg::changes::build_factory_for_table(
-            &loaded.table,
-            entry.object_store_config(),
+            &base_table,
+            object_store_config.as_ref(),
         )?);
-
-    // Only preload the delete-side full-table indices when the change
-    // batch actually contains delete-side roles. Empty preloads waste I/O
-    // on the common insert-only path.
-    let has_delete = !batch.deletes.is_empty()
-        || !batch.equality_deletes.is_empty()
-        || !batch.deleted_data_files.is_empty();
-    let delete_side = if has_delete {
-        let base_data_file_lineage =
-            crate::connector::iceberg::changes::base_data_file_lineage_index_at(
-                &loaded.table,
-                batch.current_snapshot_id,
-            )?;
-        // For OVERWRITE-deleted files we need the original `first_row_id`
-        // from the previous-snapshot view (the file is no longer alive in
-        // the delta-scan upper snapshot, so `base_data_file_lineage` doesn't
-        // index it). Only build this when the change batch actually contains
-        // `deleted_data_files`, since the lookup walks every manifest in
-        // the previous snapshot.
-        let previous_data_file_lineage = if !batch.deleted_data_files.is_empty() {
-            crate::connector::iceberg::changes::previous_snapshot_data_file_lineage_index(
-                &loaded.table,
-                batch.previous_snapshot_id,
-            )?
-        } else {
-            std::collections::HashMap::new()
-        };
-        let deleted_data_file_paths = batch
-            .deleted_data_files
-            .iter()
-            .map(|file| file.path.clone())
-            .collect();
-        let touched_referenced_data_files: std::collections::HashSet<String> = batch
-            .deletes
-            .iter()
-            .filter_map(|delete| delete.referenced_data_file.clone())
-            .collect();
-        let previously_deleted_positions_per_file = if !touched_referenced_data_files.is_empty() {
-            crate::connector::iceberg::scan_deletes::previously_deleted_positions_at_snapshot(
-                &loaded.table,
-                batch.previous_snapshot_id,
-                object_store_factory.as_ref(),
-                &|path: &str| {
-                    crate::connector::iceberg::changes::normalize_delete_projection_path(
-                        path,
-                        entry.object_store_config(),
-                    )
-                },
-                |data_file_path: &str| touched_referenced_data_files.contains(data_file_path),
-            )
-            .map_err(|e| {
-                format!(
-                    "ivm-a1 lower delta-scan: preload previous deleted positions failed for {}.{}.{} at snapshot {}: {e}",
-                    payload.catalog,
-                    payload.iceberg_namespace,
-                    payload.table,
-                    batch.previous_snapshot_id,
-                )
-            })?
-        } else {
-            std::collections::HashMap::new()
-        };
-        let previous_delete_visibility =
-            crate::engine::delete_flow::load_existing_delete_visibility_by_data_file_at(
-                &loaded.table,
-                Some(batch.previous_snapshot_id),
-                entry.object_store_config(),
-            )?;
-        Some(DeltaScanDeleteSide {
-            base_data_file_lineage,
-            previous_delete_visibility,
-            previously_deleted_positions_per_file,
-            previous_data_file_lineage,
-            deleted_data_file_paths,
-        })
-    } else {
-        None
-    };
+    let delete_side =
+        build_delete_side_from_payload(delete_side_payload, object_store_config.as_ref())?;
 
     let output_chunk_schema: ChunkSchemaRef = if out_layout.order.is_empty() {
         Arc::new(crate::exec::chunk::ChunkSchema::empty())
@@ -219,9 +133,9 @@ pub(crate) fn lower_iceberg_delta_scan_node(
         output_chunk_schema,
         apply_key_source: ApplyKeySource::BaseRowId,
         change_files,
-        object_store_config: entry.object_store_config().cloned(),
+        object_store_config,
         iceberg_runtime: Arc::new(IcebergRuntimeHandles {
-            base_table: loaded.table,
+            base_table,
             object_store_factory,
             delete_side,
         }),
@@ -236,108 +150,144 @@ pub(crate) fn lower_iceberg_delta_scan_node(
     })
 }
 
-/// Flatten an `IcebergChangeBatch` into the operator's per-file work list.
-/// Each delta source file is annotated with its semantic role
-/// (DataFile / PositionDelete / EqualityDelete / DeletedDataFile) so the
-/// downstream `IcebergDeltaScanOperator` can dispatch on it.
-///
-/// **Why `targets` / `previous_data_file_visibility` are empty here:**
-/// `PositionDelete::targets` and `EqualityDelete::targets` are populated with
-/// `Vec::new()`, and `DeletedDataFile::previous_data_file_visibility` is `None`.
-/// This is intentional — operator scanners read from `runtime.delete_side`
-/// (the preloaded base-table row-id index and previous delete-visibility map)
-/// rather than these per-role fields. Populating per-role fields would duplicate
-/// what the runtime already holds and create a second source of truth.
-/// See: `src/exec/operators/iceberg_delta_scan.rs::open_position_delete_scanner`,
-///      `open_equality_delete_scanner`, `open_deleted_data_file_scanner`.
-fn build_delta_source_files_from_batch(
-    batch: &crate::connector::iceberg::changes::IcebergChangeBatch,
-) -> Result<Vec<DeltaSourceFile>, String> {
-    let mut out = Vec::with_capacity(
-        batch.inserts.len()
-            + batch.deletes.len()
-            + batch.equality_deletes.len()
-            + batch.deleted_data_files.len(),
-    );
-    for ins in &batch.inserts {
-        out.push(DeltaSourceFile {
-            path: ins.path.clone(),
-            size: ins.size,
-            role: DeltaSourceRole::DataFile,
-            partition_spec_id: ins.partition_spec_id,
-            partition_key: ins.partition_key.clone(),
-            first_row_id: ins.first_row_id,
-            data_sequence_number: ins.data_sequence_number,
-            row_id_allow_list: ins.row_id_allow_list.clone(),
-        });
+fn build_base_table_from_explicit_metadata(
+    payload: &plan_nodes::TIcebergDeltaScanNode,
+    metadata: iceberg::spec::TableMetadata,
+) -> Result<iceberg::table::Table, String> {
+    let file_io = if metadata.location().starts_with("memory://") {
+        iceberg::io::FileIO::new_with_memory()
+    } else {
+        iceberg::io::FileIO::new_with_fs()
+    };
+    iceberg::table::Table::builder()
+        .file_io(file_io)
+        .metadata(metadata)
+        .identifier(iceberg::TableIdent::new(
+            iceberg::NamespaceIdent::new(payload.iceberg_namespace.clone()),
+            payload.table.clone(),
+        ))
+        .build()
+        .map_err(|e| {
+            format!(
+                "ICEBERG_DELTA_SCAN_NODE build base table handle for {}.{}.{} from explicit metadata failed: {e}",
+                payload.catalog, payload.iceberg_namespace, payload.table
+            )
+        })
+}
+
+fn build_delete_side_from_payload(
+    payload: Option<DeltaScanDeleteSidePayload>,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+) -> Result<Option<DeltaScanDeleteSide>, String> {
+    let Some(payload) = payload else {
+        return Ok(None);
+    };
+    let mut previously_deleted_positions_per_file = std::collections::HashMap::new();
+    for (path, positions) in payload.previously_deleted_positions_per_file {
+        let mut bitmap = roaring::RoaringTreemap::new();
+        for pos in positions {
+            bitmap.insert(pos);
+        }
+        previously_deleted_positions_per_file.insert(path, bitmap);
     }
-    let mut position_deletes = Vec::with_capacity(batch.deletes.len());
-    for del in &batch.deletes {
-        position_deletes.push(PositionDeleteSourceData {
-            delete_file_path: del.delete_file_path.clone(),
-            delete_file_size: del.delete_file_size,
-            referenced_data_file: del.referenced_data_file.clone(),
-            file_format: match del.file_format {
-                iceberg::spec::DataFileFormat::Parquet => PositionDeleteFileFormat::Parquet,
-                iceberg::spec::DataFileFormat::Puffin => PositionDeleteFileFormat::Puffin,
-                other => {
-                    return Err(format!(
-                        "ivm-a1 lower delta-scan: position-delete file {} has unsupported \
-                         file_format {:?}; only Parquet and Puffin are supported",
-                        del.delete_file_path, other
-                    ));
+    let previous_delete_visibility =
+        crate::engine::delete_flow::load_existing_delete_visibility_from_descriptors(
+            &payload.previous_delete_visibility_data_files,
+            object_store_config,
+        )?;
+    Ok(Some(DeltaScanDeleteSide {
+        base_data_file_lineage: payload.base_data_file_lineage,
+        previous_delete_visibility,
+        previously_deleted_positions_per_file,
+        previous_data_file_lineage: payload.previous_data_file_lineage,
+        deleted_data_file_paths: payload.deleted_data_file_paths,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use iceberg::spec::{
+        FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder,
+        TableMetadataBuilder, Type,
+    };
+
+    use super::*;
+
+    fn serialized_test_table_metadata() -> String {
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .build()
+            .expect("schema");
+        let metadata = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec().into_unbound(),
+            SortOrder::unsorted_order(),
+            "file:///tmp/iceberg_delta_payload_table".to_string(),
+            FormatVersion::V3,
+            HashMap::new(),
+        )
+        .expect("metadata builder")
+        .build()
+        .expect("metadata")
+        .metadata;
+        serde_json::to_string(&metadata).expect("serialize metadata")
+    }
+
+    #[test]
+    fn delta_scan_lowers_from_explicit_payload_without_catalog_registry() {
+        let payload = serde_json::json!({
+            "version": 1,
+            "serialized_table_metadata": serialized_test_table_metadata(),
+            "object_store_config": null,
+            "change_files": [
+                {
+                    "path": "file:///tmp/added.parquet",
+                    "size": 123,
+                    "role": "DataFile",
+                    "partition_spec_id": null,
+                    "partition_key": null,
+                    "first_row_id": 1000,
+                    "data_sequence_number": 7,
+                    "row_id_allow_list": null
                 }
-            },
-            content_offset: del.content_offset,
-            content_size_in_bytes: del.content_size_in_bytes,
+            ],
+            "delete_side": null
         });
-    }
-    if let Some(first) = position_deletes.first() {
-        out.push(DeltaSourceFile {
-            path: first.delete_file_path.clone(),
-            size: 0,
-            role: DeltaSourceRole::PositionDelete {
-                deletes: position_deletes,
-            },
-            partition_spec_id: None,
-            partition_key: None,
-            first_row_id: None,
-            data_sequence_number: None,
-            row_id_allow_list: None,
+        let mut node = crate::sql::codegen::nodes::default_plan_node();
+        node.node_id = 42;
+        node.node_type = plan_nodes::TPlanNodeType::ICEBERG_DELTA_SCAN_NODE;
+        node.num_children = 0;
+        node.row_tuples = vec![];
+        node.iceberg_delta_scan_node = Some(plan_nodes::TIcebergDeltaScanNode {
+            catalog: "ice".to_string(),
+            iceberg_namespace: "db".to_string(),
+            table: "orders".to_string(),
+            from_snapshot_id: 10,
+            to_snapshot_id: 11,
+            explicit_payload_json: Some(payload.to_string()),
         });
-    }
-    for eq in &batch.equality_deletes {
-        // Equality deletes don't carry per-target row-ids; the operator
-        // scans older data files in the same partition through the iceberg
-        // reader, again leveraging the preloaded `base_data_file_lineage`.
-        let targets: Vec<EqualityDeleteTargetData> = Vec::new();
-        out.push(DeltaSourceFile {
-            path: eq.delete_file_path.clone(),
-            size: eq.delete_file_size,
-            role: DeltaSourceRole::EqualityDelete {
-                equality_field_ids: eq.equality_ids.clone(),
-                targets,
+
+        let lowered = lower_iceberg_delta_scan_node(
+            &node,
+            None,
+            Layout {
+                order: Vec::new(),
+                index: HashMap::new(),
             },
-            partition_spec_id: eq.partition_spec_id,
-            partition_key: eq.partition_key.clone(),
-            first_row_id: None,
-            data_sequence_number: eq.sequence_number,
-            row_id_allow_list: None,
-        });
+        )
+        .expect("lower from explicit payload without registry");
+        let ExecNodeKind::IcebergDeltaScan(scan) = lowered.node.kind else {
+            panic!("expected iceberg delta scan");
+        };
+        assert_eq!(scan.change_files.len(), 1);
+        assert_eq!(scan.change_files[0].path, "file:///tmp/added.parquet");
+        assert_eq!(scan.base_table_ident.catalog, "ice");
     }
-    for d in &batch.deleted_data_files {
-        out.push(DeltaSourceFile {
-            path: d.path.clone(),
-            size: d.size,
-            role: DeltaSourceRole::DeletedDataFile {
-                previous_data_file_visibility: None,
-            },
-            partition_spec_id: d.partition_spec_id,
-            partition_key: d.partition_key.clone(),
-            first_row_id: d.first_row_id,
-            data_sequence_number: d.data_sequence_number,
-            row_id_allow_list: None,
-        });
-    }
-    Ok(out)
 }

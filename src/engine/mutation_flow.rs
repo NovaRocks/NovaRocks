@@ -1554,7 +1554,7 @@ fn run_one_cow_file_rewrite(
     data_sink_spec: &IcebergWriteSinkSpec,
     collector: &Arc<IcebergCommitCollector>,
 ) -> Result<CowFileRewriteOutput, String> {
-    crate::engine::query_prep::register_external_table_for_query(
+    crate::engine::query_prep::register_synthetic_table_for_query(
         state,
         &plan.namespace,
         plan.synthetic_table_def.clone(),
@@ -1568,7 +1568,7 @@ fn run_one_cow_file_rewrite(
         None,
         None,
     );
-    let drop_result = crate::engine::query_prep::drop_registered_external_table(
+    let drop_result = crate::engine::query_prep::drop_local_table_registration_if_exists(
         state,
         &plan.namespace,
         &plan.synthetic_table_name,

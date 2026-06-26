@@ -32,6 +32,7 @@ pub(crate) struct PlannedScanTable {
 
 pub(crate) fn build_scan_node(
     connectors: &crate::connector::ConnectorRegistry,
+    mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
     node_id: i32,
     scan_tuple_id: i32,
     resolved: &ResolvedTable,
@@ -103,7 +104,8 @@ pub(crate) fn build_scan_node(
             scan_tuple_id,
             resolved,
             conjuncts,
-        )),
+            mv_refresh_ctx,
+        )?),
         _ => Ok(build_hdfs_scan_node(
             node_id,
             scan_tuple_id,
@@ -114,9 +116,10 @@ pub(crate) fn build_scan_node(
 }
 
 /// Emit `TPlanNodeType::ICEBERG_DELTA_SCAN_NODE` for an IVM-A1 delta scan.
-/// Only the lightweight identity + snapshot range is carried in the Thrift
-/// payload; the actual change-file enumeration happens at `lower_plan`
-/// time via `connector::iceberg::changes::plan_changes`.
+/// The Thrift payload carries identity, snapshot range, and an explicit JSON
+/// payload. The actual change-file enumeration happens here at
+/// refresh/codegen time via `connector::iceberg::changes::plan_changes`, and
+/// lower_plan only consumes the explicit payload.
 ///
 /// `conjuncts` is the predicate-pushdown output for this scan. We forward
 /// them on `node.conjuncts` so the shared `LowerNode::evaluate_conjuncts`
@@ -128,20 +131,14 @@ fn build_iceberg_delta_scan_node(
     scan_tuple_id: i32,
     resolved: &ResolvedTable,
     conjuncts: Vec<exprs::TExpr>,
-) -> plan_nodes::TPlanNode {
-    let (catalog, namespace, table, from_snapshot_id, to_snapshot_id) = match &resolved.table.source
-    {
+    mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+) -> Result<plan_nodes::TPlanNode, String> {
+    let (table_info, from_snapshot_id, to_snapshot_id) = match &resolved.table.source {
         ScanSource::IcebergDeltaTable {
             table,
             from_snapshot_id,
             to_snapshot_id,
-        } => (
-            table.catalog.clone(),
-            table.namespace.clone(),
-            table.table.clone(),
-            *from_snapshot_id,
-            *to_snapshot_id,
-        ),
+        } => (table, *from_snapshot_id, *to_snapshot_id),
         _ => unreachable!("build_iceberg_delta_scan_node called on non-IcebergDeltaTable"),
     };
     let mut node = default_plan_node();
@@ -158,13 +155,170 @@ fn build_iceberg_delta_scan_node(
     };
     node.compact_data = true;
     node.iceberg_delta_scan_node = Some(plan_nodes::TIcebergDeltaScanNode {
-        catalog,
-        iceberg_namespace: namespace,
-        table,
+        catalog: table_info.catalog.clone(),
+        iceberg_namespace: table_info.namespace.clone(),
+        table: table_info.table.clone(),
         from_snapshot_id,
         to_snapshot_id,
+        explicit_payload_json: Some(build_iceberg_delta_explicit_payload_json(
+            table_info,
+            from_snapshot_id,
+            to_snapshot_id,
+            mv_refresh_ctx,
+        )?),
     });
-    node
+    Ok(node)
+}
+
+fn build_iceberg_delta_explicit_payload_json(
+    table: &crate::sql::catalog::IcebergTableInfo,
+    from_snapshot_id: i64,
+    to_snapshot_id: i64,
+    mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+) -> Result<String, String> {
+    let refresh_ctx = mv_refresh_ctx
+        .ok_or_else(|| "Iceberg delta scan requires MV refresh context".to_string())?;
+    let catalog_key = crate::engine::catalog::normalize_identifier(&table.catalog)?;
+    let entry = refresh_ctx
+        .base_catalog_entries
+        .get(&catalog_key)
+        .ok_or_else(|| {
+            format!(
+                "Iceberg delta scan requires base catalog {} in MV refresh context",
+                table.catalog
+            )
+        })?;
+    let ident = iceberg::TableIdent::from_strs([table.namespace.as_str(), table.table.as_str()])
+        .map_err(|e| {
+            format!(
+                "build iceberg table ident for delta scan {}.{}.{}: {e}",
+                table.catalog, table.namespace, table.table
+            )
+        })?;
+    let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(entry)
+        .map_err(|e| {
+            format!(
+                "build iceberg catalog for delta scan {}.{}.{}: {e}",
+                table.catalog, table.namespace, table.table
+            )
+        })?;
+    let loaded = crate::connector::iceberg::catalog::registry::block_on_iceberg(async {
+        catalog.load_table(&ident).await
+    })
+    .map_err(|e| format!("load iceberg table for delta scan runtime failed: {e}"))?
+    .map_err(|e| {
+        format!(
+            "load iceberg table for delta scan {}.{}.{}: {e}",
+            table.catalog, table.namespace, table.table
+        )
+    })?;
+
+    let batch = crate::connector::iceberg::changes::plan_changes(
+        &loaded,
+        from_snapshot_id,
+        Some(to_snapshot_id),
+        &[],
+    )
+    .map_err(|e| {
+        format!(
+            "ivm-a1 codegen delta-scan: plan_changes failed for {}.{}.{} from_snapshot={} to_snapshot={}: {e}",
+            table.catalog, table.namespace, table.table, from_snapshot_id, to_snapshot_id
+        )
+    })?;
+    let change_files =
+        crate::connector::iceberg::changes::delta_source_files_from_change_batch(&batch)?;
+    let has_delete = !batch.deletes.is_empty()
+        || !batch.equality_deletes.is_empty()
+        || !batch.deleted_data_files.is_empty();
+    let delete_side = if has_delete {
+        let object_store_factory = crate::connector::iceberg::changes::build_factory_for_table(
+            &loaded,
+            entry.object_store_config(),
+        )?;
+        let object_store_factory = std::sync::Arc::new(object_store_factory);
+        let base_data_file_lineage =
+            crate::connector::iceberg::changes::base_data_file_lineage_index_at(
+                &loaded,
+                batch.current_snapshot_id,
+            )?;
+        let previous_data_file_lineage = if !batch.deleted_data_files.is_empty() {
+            crate::connector::iceberg::changes::previous_snapshot_data_file_lineage_index(
+                &loaded,
+                batch.previous_snapshot_id,
+            )?
+        } else {
+            HashMap::new()
+        };
+        let deleted_data_file_paths = batch
+            .deleted_data_files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect();
+        let touched_referenced_data_files: std::collections::HashSet<String> = batch
+            .deletes
+            .iter()
+            .filter_map(|delete| delete.referenced_data_file.clone())
+            .collect();
+        let previously_deleted_positions_per_file = if !touched_referenced_data_files.is_empty() {
+            crate::connector::iceberg::scan_deletes::previously_deleted_positions_at_snapshot(
+                &loaded,
+                batch.previous_snapshot_id,
+                object_store_factory.as_ref(),
+                &|path: &str| {
+                    crate::connector::iceberg::changes::normalize_delete_projection_path(
+                        path,
+                        entry.object_store_config(),
+                    )
+                },
+                |data_file_path: &str| touched_referenced_data_files.contains(data_file_path),
+            )
+            .map_err(|e| {
+                format!(
+                    "ivm-a1 codegen delta-scan: preload previous deleted positions failed for {}.{}.{} at snapshot {}: {e}",
+                    table.catalog, table.namespace, table.table, batch.previous_snapshot_id
+                )
+            })?
+            .into_iter()
+            .map(|(path, bitmap)| (path, bitmap.iter().collect::<Vec<_>>()))
+            .collect()
+        } else {
+            HashMap::new()
+        };
+        let previous_delete_visibility_data_files =
+            crate::connector::iceberg::changes::delete_visibility_data_files_at(
+                &loaded,
+                batch.previous_snapshot_id,
+            )?;
+        Some(
+            crate::exec::node::iceberg_delta_scan::DeltaScanDeleteSidePayload {
+                base_data_file_lineage,
+                previous_data_file_lineage,
+                previous_delete_visibility_data_files,
+                previously_deleted_positions_per_file,
+                deleted_data_file_paths,
+            },
+        )
+    } else {
+        None
+    };
+    let explicit = crate::exec::node::iceberg_delta_scan::IcebergDeltaExplicitPayload {
+        version: crate::exec::node::iceberg_delta_scan::ICEBERG_DELTA_EXPLICIT_PAYLOAD_VERSION,
+        serialized_table_metadata: serde_json::to_string(loaded.metadata()).map_err(|e| {
+            format!(
+                "serialize iceberg delta scan table metadata for {}.{}.{} failed: {e}",
+                table.catalog, table.namespace, table.table
+            )
+        })?,
+        object_store_config: entry.object_store_config().cloned(),
+        change_files,
+        delete_side,
+    };
+    serde_json::to_string(&explicit).map_err(|e| {
+        format!(
+            "serialize iceberg delta scan explicit payload for {}.{}.{} failed: {e}",
+            table.catalog, table.namespace, table.table
+        )
+    })
 }
 
 fn build_hdfs_scan_node(
@@ -1477,6 +1631,85 @@ mod tests {
         assert_eq!(internal.partition_id, Some(100));
         assert_eq!(internal.version, "7");
         assert_eq!(internal.schema_hash, "30");
+    }
+
+    #[test]
+    fn starrocks_scan_ranges_include_catalog_identity() {
+        use crate::connector::scan_planning::{ScanHandle, Split};
+        use crate::connector::starrocks::table::{
+            StarRocksScanHandle, StarRocksSplit, StarRocksTableHandle,
+        };
+        use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
+        use crate::sql::codegen::resolve::{PlannedConnectorScan, ResolvedTable};
+        use arrow::datatypes::DataType;
+
+        let table = TableDef {
+            name: "orders".to_string(),
+            columns: vec![ColumnDef {
+                name: "id".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                write_default: None,
+                logical_type: None,
+            }],
+            iceberg_row_lineage_metadata_columns: vec![],
+            source: ScanSource::StarRocks {
+                db_id: 10,
+                table_id: 20,
+            },
+        };
+        let planned_scan = PlannedConnectorScan {
+            scan: ScanHandle::new(
+                "starrocks",
+                StarRocksScanHandle {
+                    table: StarRocksTableHandle {
+                        database: "analytics".to_string(),
+                        table: "orders".to_string(),
+                        db_id: 10,
+                        table_id: 20,
+                    },
+                    schema_id: 30,
+                },
+            ),
+            splits: vec![Split::new(
+                "starrocks",
+                StarRocksSplit {
+                    tablet_id: 300,
+                    partition_id: 100,
+                    version: 7,
+                },
+            )],
+        };
+        let planned = PlannedScanTable {
+            scan_node_id: 3,
+            scan_tuple_id: 4,
+            resolved: ResolvedTable {
+                database: "analytics".to_string(),
+                table,
+                planned_scan: Some(planned_scan),
+                alias: None,
+            },
+            min_max_conjuncts: vec![],
+            slot_to_column: HashMap::new(),
+            iceberg_metadata_pseudo_column_slots: Default::default(),
+        };
+        let registry = test_connector_registry();
+        let planner = registry
+            .scan_planner("starrocks")
+            .expect("starrocks scan planner");
+
+        let ranges =
+            super::build_starrocks_scan_ranges_from_planned_scan(planner.as_ref(), &planned)
+                .expect("planned scan ranges");
+        let internal = ranges[0]
+            .scan_range
+            .internal_scan_range
+            .as_ref()
+            .expect("internal scan range");
+
+        assert_eq!(internal.catalog_name.as_deref(), Some("default_catalog"));
+        assert_eq!(internal.db_name, "analytics");
+        assert_eq!(internal.table_name.as_deref(), Some("orders"));
     }
 
     #[test]

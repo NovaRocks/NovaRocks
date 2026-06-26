@@ -30,6 +30,27 @@ use crate::exec::chunk::ChunkSchemaRef;
 use crate::fs::object_store::ObjectStoreConfig;
 use crate::fs::opendal::OpendalRangeReaderFactory;
 
+pub(crate) const ICEBERG_DELTA_EXPLICIT_PAYLOAD_VERSION: u16 = 1;
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub(crate) struct IcebergDeltaExplicitPayload {
+    pub version: u16,
+    pub serialized_table_metadata: String,
+    pub object_store_config: Option<ObjectStoreConfig>,
+    pub change_files: Vec<DeltaSourceFile>,
+    pub delete_side: Option<DeltaScanDeleteSidePayload>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub(crate) struct DeltaScanDeleteSidePayload {
+    pub base_data_file_lineage: std::collections::HashMap<String, BaseDataFileLineage>,
+    pub previous_data_file_lineage: std::collections::HashMap<String, BaseDataFileLineage>,
+    pub previous_delete_visibility_data_files:
+        Vec<crate::connector::iceberg::changes::DeleteVisibilityDataFileDescriptor>,
+    pub previously_deleted_positions_per_file: std::collections::HashMap<String, Vec<u64>>,
+    pub deleted_data_file_paths: std::collections::HashSet<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct IcebergDeltaScanNode {
     pub base_table_ident: BaseTableIdent,
@@ -60,7 +81,7 @@ pub enum ApplyKeySource {
     BaseRowId,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct DeltaSourceFile {
     pub path: String,
     pub size: i64,
@@ -79,7 +100,7 @@ pub struct DeltaSourceFile {
     pub row_id_allow_list: Option<std::collections::BTreeSet<i64>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub enum DeltaSourceRole {
     DataFile,
     PositionDelete {
@@ -101,7 +122,7 @@ pub enum DeltaSourceRole {
 /// `IcebergDeltaScanNode` does not need to leak the wider iceberg enum
 /// through its public type surface — and so adding new formats in the
 /// future is a single localized change.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum PositionDeleteFileFormat {
     /// v2 position-delete file (one row per (file, pos) pair, parquet-encoded).
     Parquet,
@@ -109,7 +130,7 @@ pub enum PositionDeleteFileFormat {
     Puffin,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct PositionDeleteSourceData {
     pub delete_file_path: String,
     pub delete_file_size: i64,
@@ -128,13 +149,13 @@ pub struct PositionDeleteSourceData {
     pub content_size_in_bytes: Option<i64>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct EqualityDeleteTargetData {
     pub data_file_path: String,
     pub data_file_first_row_id: Option<i64>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct DeletedFileVisibility {
     pub already_deleted_positions: Vec<i64>,
 }
@@ -160,7 +181,7 @@ pub struct IcebergRuntimeHandles {
 /// `_file` / `_pos` / `_row_id` / `_last_updated_sequence_number` virtual
 /// columns when reverse-projecting deleted rows. Filled in from the relevant
 /// snapshot read views.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize)]
 pub struct BaseDataFileLineage {
     pub first_row_id: i64,
     pub data_sequence_number: i64,

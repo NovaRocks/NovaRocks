@@ -38,7 +38,6 @@ use crate::lower::layout::{
 };
 use crate::lower::node::decode::build_scan_query_global_dicts;
 use crate::lower::node::{Lowered, QueryGlobalDictMap, local_rf_waiting_set};
-use crate::novarocks_config::config as novarocks_app_config;
 use crate::novarocks_connectors::{
     ConnectorRegistry, LakeScanSchemaMeta, ScanConfig, StarRocksScanConfig, StarRocksScanRange,
 };
@@ -48,6 +47,12 @@ use crate::runtime::starlet_shard_registry::{self, S3StoreConfig};
 use crate::thrift::{descriptors, internal_service, plan_nodes, runtime_filter, types};
 
 /// Lower a LAKE_SCAN_NODE plan node to a `Lowered` ExecNode.
+///
+/// FE-compatible lake scan lowering consumes tablet ids, versions, schema ids,
+/// row-count hints, and catalog identity from Thrift descriptors and
+/// `per_node_scan_ranges`. Lowering must not read process-local StarRocks
+/// catalog configuration because FE-compatible plans need explicit execution
+/// descriptors.
 pub(crate) fn lower_lake_scan_node(
     node: &plan_nodes::TPlanNode,
     desc_tbl: Option<&descriptors::TDescriptorTable>,
@@ -257,6 +262,7 @@ pub(crate) fn lower_lake_scan_node(
 
     let mut ranges = Vec::new();
     let mut refs = Vec::new();
+    let mut internal_catalog_name: Option<String> = None;
     let mut internal_db_name: Option<String> = None;
     let mut internal_table_name: Option<String> = None;
     let mut has_more = false;
@@ -273,6 +279,12 @@ pub(crate) fn lower_lake_scan_node(
                 node.node_id
             ));
         };
+        record_internal_catalog_name(
+            &mut internal_catalog_name,
+            internal.catalog_name.as_deref(),
+            "LAKE_SCAN_NODE",
+            node.node_id,
+        )?;
         let version = internal
             .version
             .parse::<i64>()
@@ -390,7 +402,16 @@ pub(crate) fn lower_lake_scan_node(
             table_id, table_desc.id
         ));
     }
-    let catalog = load_lake_catalog()?;
+    let catalog = if refs.is_empty() {
+        internal_catalog_name.unwrap_or_default()
+    } else {
+        internal_catalog_name.ok_or_else(|| {
+            format!(
+                "LAKE_SCAN_NODE node_id={} missing catalog_name in effective scan ranges",
+                node.node_id
+            )
+        })?
+    };
     if (db_name == "__unknown_db__" || table_name == "__unknown_table__")
         && let Some((cached_db_name, cached_table_name)) =
             find_cached_table_identity_names(&catalog, db_id, table_id)
@@ -651,15 +672,6 @@ fn resolve_layout_slot_tuple_id(
     Ok(tuple_id)
 }
 
-pub(crate) fn load_lake_catalog() -> Result<String, String> {
-    let cfg = novarocks_app_config().map_err(|e| e.to_string())?;
-    let catalog = cfg.starrocks.fe_catalog.trim();
-    if catalog.is_empty() {
-        return Err("starrocks.fe_catalog cannot be empty".to_string());
-    }
-    Ok(catalog.to_string())
-}
-
 fn normalize_optional_table_name(name: &str, unknown_sentinel: &str) -> Option<String> {
     let trimmed = name.trim();
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case(unknown_sentinel) {
@@ -667,6 +679,30 @@ fn normalize_optional_table_name(name: &str, unknown_sentinel: &str) -> Option<S
     } else {
         Some(trimmed.to_string())
     }
+}
+
+pub(crate) fn record_internal_catalog_name(
+    current: &mut Option<String>,
+    catalog_name: Option<&str>,
+    node_label: &str,
+    node_id: i32,
+) -> Result<(), String> {
+    let candidate = catalog_name
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| {
+            format!("{node_label} node_id={node_id} missing catalog_name in internal_scan_range")
+        })?;
+    if let Some(existing) = current.as_deref() {
+        if existing != candidate {
+            return Err(format!(
+                "{node_label} node_id={node_id} has inconsistent catalog_name: {existing} vs {candidate}"
+            ));
+        }
+    } else {
+        *current = Some(candidate.to_string());
+    }
+    Ok(())
 }
 
 pub(crate) fn build_lake_properties(

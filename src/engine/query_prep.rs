@@ -368,7 +368,7 @@ fn rewrite_time_travel_in_factor(
                     name: synthetic_table_name.clone(),
                     ..table_def
                 };
-                register_external_table(state, &target.namespace, synthetic_def)?;
+                register_local_table_registration(state, &target.namespace, synthetic_def)?;
             }
 
             // Rewrite the AST node in-place:
@@ -427,7 +427,7 @@ fn rewrite_time_travel_in_factor(
 /// already succeeds. Unlike the best-effort query-prep loop, a load failure for
 /// an iceberg table here is surfaced as an error: the table was named
 /// explicitly by the statement, so an unresolvable name is a real error.
-pub(crate) fn register_external_table_by_name(
+pub(crate) fn materialize_external_schema_table_for_statement(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
     current_database: &str,
@@ -464,7 +464,7 @@ pub(crate) fn register_external_table_by_name(
         let entry = registry.get(&target.catalog)?;
         entry.invalidate_table_cache(&target.namespace, &target.table);
     }
-    drop_registered_external_table(state, &target.namespace, &target.table)?;
+    drop_local_table_registration_if_exists(state, &target.namespace, &target.table)?;
 
     let resolved = catalog
         .load_table(&target.catalog, &target.namespace, &target.table)
@@ -475,7 +475,7 @@ pub(crate) fn register_external_table_by_name(
             )
         })?;
     let table_def = source.build_schema_table_def(&resolved)?;
-    register_external_table(state, &target.namespace, table_def)
+    register_local_table_registration(state, &target.namespace, table_def)
 }
 
 /// Returns true if `table_name` was produced by the time-travel rewriter.
@@ -490,7 +490,7 @@ fn is_synthetic_time_travel_table(table_name: &str) -> bool {
     }
 }
 
-fn register_external_table(
+fn register_local_table_registration(
     state: &Arc<StandaloneState>,
     namespace: &str,
     table_def: TableDef,
@@ -499,24 +499,24 @@ fn register_external_table(
     guard.create_database(namespace).ok();
     guard
         .register(namespace, table_def)
-        .map_err(|e| format!("register external table: {e}"))
+        .map_err(|e| format!("register local table metadata: {e}"))
 }
 
 /// Register a synthetic `TableDef` into the standalone in-memory catalog so a
 /// generated query can reference it by name (e.g. a single-file
 /// `ExplicitFiles`-bound scan used by distributed COW UPDATE rewrites). Mirrors
 /// the time-travel synthetic-table registration. Callers are responsible for
-/// dropping the table via [`drop_registered_external_table`] once the query has
-/// run.
-pub(crate) fn register_external_table_for_query(
+/// dropping the table via [`drop_local_table_registration_if_exists`] once the
+/// query has run.
+pub(crate) fn register_synthetic_table_for_query(
     state: &Arc<StandaloneState>,
     namespace: &str,
     table_def: TableDef,
 ) -> Result<(), String> {
-    register_external_table(state, namespace, table_def)
+    register_local_table_registration(state, namespace, table_def)
 }
 
-pub(crate) fn drop_registered_external_table(
+pub(crate) fn drop_local_table_registration_if_exists(
     state: &Arc<StandaloneState>,
     namespace: &str,
     table: &str,
@@ -528,7 +528,7 @@ pub(crate) fn drop_registered_external_table(
     match guard.drop_table(namespace, table) {
         Ok(()) => Ok(()),
         Err(err) if err.contains("unknown") => Ok(()),
-        Err(err) => Err(format!("drop registered external table: {err}")),
+        Err(err) => Err(format!("drop local table metadata: {err}")),
     }
 }
 
@@ -886,6 +886,46 @@ mod tests {
                 binding,
             },
         }
+    }
+
+    #[test]
+    fn synthetic_query_table_registration_is_explicitly_local_and_scoped() {
+        let state = std::sync::Arc::new(crate::engine::StandaloneState::default());
+        let table = crate::connector::backend::ResolvedTable {
+            catalog: "ice".to_string(),
+            namespace: "scratch".to_string(),
+            table: "rewrite_piece".to_string(),
+            columns: vec![],
+        };
+        let table_def = table_def_with_binding(
+            &table,
+            crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles,
+        );
+
+        super::register_synthetic_table_for_query(&state, "scratch", table_def)
+            .expect("register synthetic table");
+
+        let registered = state
+            .catalog
+            .read()
+            .expect("catalog read lock")
+            .get("scratch", "rewrite_piece")
+            .expect("synthetic table is visible in local catalog");
+        assert_eq!(registered.name, "rewrite_piece");
+
+        super::drop_local_table_registration_if_exists(&state, "scratch", "rewrite_piece")
+            .expect("drop synthetic table");
+        assert!(
+            state
+                .catalog
+                .read()
+                .expect("catalog read lock")
+                .get("scratch", "rewrite_piece")
+                .is_err(),
+            "synthetic table must not outlive the scoped query"
+        );
+        super::drop_local_table_registration_if_exists(&state, "scratch", "rewrite_piece")
+            .expect("drop is idempotent for scoped cleanup");
     }
 
     fn state_with_per_table_binding_source() -> std::sync::Arc<crate::engine::StandaloneState> {

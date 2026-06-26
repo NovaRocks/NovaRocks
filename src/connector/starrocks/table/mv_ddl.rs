@@ -11,7 +11,7 @@ use crate::connector::starrocks::lake::context::{get_tablet_runtime, remove_tabl
 use crate::connector::starrocks::lake::schema::create_lake_tablet_from_req_with_schema_patch;
 use crate::connector::starrocks::lake::transactions::delete_tablet;
 use crate::engine::catalog::normalize_identifier;
-use crate::engine::query_prep::drop_registered_external_table;
+use crate::engine::query_prep::drop_local_table_registration_if_exists;
 use crate::engine::record_batch_to_chunk;
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
 use crate::meta::MetaReadTxn;
@@ -1562,7 +1562,7 @@ fn register_iceberg_tables_for_mv_analysis(
         else {
             continue;
         };
-        drop_registered_external_table(state, namespace, table)?;
+        drop_local_table_registration_if_exists(state, namespace, table)?;
         let resolved = catalog_backend
             .load_table(catalog, namespace, table)
             .map_err(|err| {
