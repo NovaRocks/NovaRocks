@@ -4,10 +4,10 @@ PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
 10:PROJECT [a.payload AS payload, b.payload AS payload, c.payload AS payload] stats={rows=2}
-  9:HASH JOIN (BROADCAST, INNER, eq: [strict_eq_a.a2 = c.c]) stats={rows=2}
+  9:HASH JOIN (BROADCAST, INNER, eq: [strict_eq_a.a2 = c.c]) bcast_verdict=feasible stats={rows=2}
     build runtime filters:
     - filter_id = 1, build_expr = (c.c)
-    6:HASH JOIN (BROADCAST, INNER, eq: [strict_eq_a.a1 = b.b]) stats={rows=2}
+    6:HASH JOIN (BROADCAST, INNER, eq: [strict_eq_a.a1 = b.b]) bcast_verdict=feasible stats={rows=2}
       build runtime filters:
       - filter_id = 0, build_expr = (b.b)
       3:PROJECT [a1, a2, payload] stats={rows=2025}
@@ -51,10 +51,10 @@ PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
 10:PROJECT [a.payload AS payload, b.payload AS payload, c.payload AS payload] stats={rows=2}
-  9:HASH JOIN (BROADCAST, INNER, eq: [strict_eq_a.a2 = c.c]) stats={rows=2}
+  9:HASH JOIN (BROADCAST, INNER, eq: [strict_eq_a.a2 = c.c]) bcast_verdict=feasible stats={rows=2}
     build runtime filters:
     - filter_id = 1, build_expr = (c.c)
-    6:HASH JOIN (BROADCAST, INNER, eq: [strict_eq_a.a1 = b.b]) stats={rows=2}
+    6:HASH JOIN (BROADCAST, INNER, eq: [strict_eq_a.a1 = b.b]) bcast_verdict=feasible stats={rows=2}
       build runtime filters:
       - filter_id = 0, build_expr = (b.b)
       3:PROJECT [a1, a2, payload] stats={rows=2025}

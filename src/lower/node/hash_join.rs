@@ -27,7 +27,7 @@ use crate::lower::expr::lower_t_expr;
 use crate::lower::layout::{Layout, chunk_schema_for_layout};
 use crate::lower::node::Lowered;
 use crate::novarocks_logging::warn;
-use crate::sql::types::wider_type;
+use crate::types::wider_type;
 
 use crate::thrift::{descriptors, plan_nodes, runtime_filter, types};
 

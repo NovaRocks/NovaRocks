@@ -7,4 +7,4 @@ PLAN FRAGMENT 0
        TABLE: db_sqlt_bbe2afdec0e97ad3.oq12_stats_or
        columns: b, a
        min-max stats
-       predicates: a = 1 OR a = 2
+       predicates: CAST(a AS Int64) = 1 OR CAST(a AS Int64) = 2

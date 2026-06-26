@@ -63,7 +63,7 @@ fn sum_spec_from_type(data_type: &DataType) -> Result<AggSpec, String> {
             // Canonical sum decimal output is Decimal128(38, scale) (P2 single
             // source of truth), matching the analyzer/codegen so the same slot
             // carries an identical descriptor fleet-wide.
-            let canonical = crate::sql::types::canonical_agg_decimal_type("sum", data_type)
+            let canonical = crate::types::canonical_agg_decimal_type("sum", data_type)
                 .expect("sum decimal canonical type");
             Ok(AggSpec {
                 kind: AggKind::SumDecimal128,

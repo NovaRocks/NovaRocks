@@ -14,7 +14,7 @@ PLAN FRAGMENT 1
   STREAM DATA SINK
     EXCHANGE ID: 8
     PARTITION: UNPARTITIONED
-7:HASH JOIN (BROADCAST, INNER, eq: [b.k = a.k]) stats={rows=90}
+7:HASH JOIN (BROADCAST, INNER, eq: [b.k = a.k]) bcast_verdict=feasible stats={rows=90}
   build runtime filters:
   - filter_id = 0, build_expr = (a.k)
   1:SCAN db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_b (alias=b) stats={rows=90}
@@ -65,7 +65,7 @@ PLAN FRAGMENT 1
     PARTITION: HASH_PARTITIONED (a.k)
 5:HASH AGGREGATE (LOCAL, group by: [a.k]) stats={rows=90}
   aggregations: sum(a.v)
-  4:HASH JOIN (BROADCAST, INNER, eq: [a.k = b.k]) stats={rows=16200}
+  4:HASH JOIN (BROADCAST, INNER, eq: [a.k = b.k]) bcast_verdict=feasible stats={rows=16200}
     build runtime filters:
     - filter_id = 0, build_expr = (b.k)
     1:SCAN db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_a (alias=a) stats={rows=18000}

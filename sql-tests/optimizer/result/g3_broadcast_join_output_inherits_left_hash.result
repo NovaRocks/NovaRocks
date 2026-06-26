@@ -12,10 +12,10 @@ PLAN FRAGMENT 1
   STREAM DATA SINK
     EXCHANGE ID: 8
     PARTITION: HASH_PARTITIONED (k)
-7:HASH JOIN (BROADCAST, INNER, eq: [a.k = s.s]) stats={rows=1}
+7:HASH JOIN (BROADCAST, INNER, eq: [a.k = s.s]) bcast_verdict=feasible stats={rows=1}
   build runtime filters:
   - filter_id = 1, build_expr = (s.s)
-  4:HASH JOIN (BROADCAST, INNER, eq: [a.k = b.k]) stats={rows=2}
+  4:HASH JOIN (BROADCAST, INNER, eq: [a.k = b.k]) bcast_verdict=feasible stats={rows=2}
     build runtime filters:
     - filter_id = 0, build_expr = (b.k)
     1:SCAN db_sqlt_fc3e81882b2a0111.g3_bj_left (alias=a) stats={rows=2}

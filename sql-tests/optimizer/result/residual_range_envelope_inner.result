@@ -3,7 +3,7 @@ PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
 5:PROJECT [l.payload AS payload, r.payload AS payload] stats={rows=11212646}
-  4:HASH JOIN (BROADCAST, INNER, eq: [r.k = l.k, r.score = l.score]) stats={rows=11212646}
+  4:HASH JOIN (BROADCAST, INNER, eq: [r.k = l.k, r.score = l.score]) bcast_verdict=feasible stats={rows=11212646}
     build runtime filters:
     - filter_id = 0, build_expr = (l.k)
     - filter_id = 1, build_expr = (l.score)

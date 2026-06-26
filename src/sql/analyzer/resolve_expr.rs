@@ -4,7 +4,7 @@ use arrow::datatypes::DataType;
 use sqlparser::ast as sqlast;
 
 use crate::sql::analysis::*;
-use crate::sql::types::{arithmetic_result_type_with_op, comparison_common_type, wider_type};
+use crate::types::{arithmetic_result_type_with_op, comparison_common_type, wider_type};
 
 use super::functions::*;
 use super::helpers::{eval_const_i64, expr_display_name, sql_type_to_arrow};

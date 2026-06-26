@@ -206,7 +206,7 @@ pub(crate) fn realize(spec: &TypeSpec, bindings: &Bindings) -> Result<DataType, 
 /// `Strict` requires every occurrence to bind to the same concrete type
 /// — used by the polymorphic match pass.
 ///
-/// `Widening` merges conflicting bindings via [`crate::sql::types::wider_type`]
+/// `Widening` merges conflicting bindings via [`crate::types::wider_type`]
 /// — used by the widening-cast match pass, which is what makes a call
 /// like `coalesce(Int8, Int64)` match the signature
 /// `coalesce(Any("T"), Any("T"), ...) -> Any("T")` and yield `Int64`.
@@ -250,7 +250,7 @@ impl Bindings {
     /// widened type is actually nonsensical.
     pub(crate) fn bind_widening(&mut self, name: &'static str, dt: &DataType) -> bool {
         if let Some(existing) = self.lookup(name) {
-            let widened = crate::sql::types::wider_type(&existing, dt);
+            let widened = crate::types::wider_type(&existing, dt);
             for entry in self.entries.iter_mut() {
                 if entry.0 == name {
                     entry.1 = widened.clone();

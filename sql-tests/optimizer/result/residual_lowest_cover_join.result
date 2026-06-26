@@ -2,47 +2,42 @@ Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
-9:PROJECT [a.payload AS payload, b.payload AS payload, c.payload AS payload] stats={rows=885937500}
-  8:HASH JOIN (BROADCAST, INNER, eq: [b.k = c.k]) stats={rows=885937500}
+8:PROJECT [a.payload AS payload, b.payload AS payload, c.payload AS payload] stats={rows=885937500}
+  7:HASH JOIN (BROADCAST, INNER, eq: [b.k = c.k]) bcast_verdict=feasible stats={rows=885937500}
     build runtime filters:
-    - filter_id = 0, build_expr = (c.k)
-    5:HASH JOIN (PARTITIONED, INNER, eq: [a.k = b.k]) stats={rows=885937500}
+    - filter_id = 1, build_expr = (c.k)
+    4:HASH JOIN (BROADCAST, INNER, eq: [a.k = b.k]) bcast_verdict=feasible stats={rows=885937500}
       other: a.bucket = b.bucket OR a.payload = b.payload
-      2:HASH EXCHANGE stats={rows=90000}
-      4:HASH EXCHANGE stats={rows=90000}
-    7:GATHER stats={rows=22500}
+      build runtime filters:
+      - filter_id = 0, build_expr = (b.k)
+      1:SCAN db_sqlt_3bb2790a141d6d78.residual_lcj_a (alias=a) stats={rows=90000}
+           TABLE: db_sqlt_3bb2790a141d6d78.residual_lcj_a
+           columns: k, bucket, payload
+           min-max stats
+           predicates: a.k IS NOT NULL
+          probe runtime filters:
+          - filter_id = 0, probe_expr = (a.k)
+      3:GATHER stats={rows=90000}
+    6:GATHER stats={rows=22500}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
-    EXCHANGE ID: 7
+    EXCHANGE ID: 6
     PARTITION: UNPARTITIONED
-6:SCAN db_sqlt_3bb2790a141d6d78.residual_lcj_c (alias=c) stats={rows=22500}
+5:SCAN db_sqlt_3bb2790a141d6d78.residual_lcj_c (alias=c) stats={rows=22500}
      TABLE: db_sqlt_3bb2790a141d6d78.residual_lcj_c
      columns: k, payload, flag
      min-max stats
-     predicates: c.flag = 1 AND c.k IS NOT NULL
+     predicates: CAST(c.flag AS Int64) = 1 AND c.k IS NOT NULL
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
-    EXCHANGE ID: 4
-    PARTITION: HASH_PARTITIONED (k)
-3:SCAN db_sqlt_3bb2790a141d6d78.residual_lcj_b (alias=b) stats={rows=90000}
+    EXCHANGE ID: 3
+    PARTITION: UNPARTITIONED
+2:SCAN db_sqlt_3bb2790a141d6d78.residual_lcj_b (alias=b) stats={rows=90000}
      TABLE: db_sqlt_3bb2790a141d6d78.residual_lcj_b
      columns: k, bucket, payload
      min-max stats
      predicates: b.k IS NOT NULL
-    probe runtime filters:
-    - filter_id = 0, probe_expr = (b.k)
-PLAN FRAGMENT 3
-  OUTPUT EXPRS: *
-  PARTITION: UNPARTITIONED
-  STREAM DATA SINK
-    EXCHANGE ID: 2
-    PARTITION: HASH_PARTITIONED (k)
-1:SCAN db_sqlt_3bb2790a141d6d78.residual_lcj_a (alias=a) stats={rows=90000}
-     TABLE: db_sqlt_3bb2790a141d6d78.residual_lcj_a
-     columns: k, bucket, payload
-     min-max stats
-     predicates: a.k IS NOT NULL

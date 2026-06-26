@@ -29,7 +29,7 @@ use crate::sql::analysis::{
     ResolvedQuery, ResolvedSelect, ResolvedSetOp, ResolvedValues, SetOpKind, SortItem,
     SubqueryInfo, TypedExpr,
 };
-use crate::sql::types::wider_type;
+use crate::types::wider_type;
 
 use helpers::{expr_display_name, extract_limit, extract_offset};
 use scope::AnalyzerScope;

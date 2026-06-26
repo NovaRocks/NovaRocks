@@ -4,7 +4,7 @@ use arrow::datatypes::DataType;
 
 use crate::common::largeint;
 use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
-use crate::sql::types::{canonical_agg_decimal_type, wider_type};
+use crate::types::{canonical_agg_decimal_type, wider_type};
 
 pub(super) fn is_window_only_function(name: &str) -> bool {
     matches!(

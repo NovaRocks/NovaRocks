@@ -2753,7 +2753,7 @@ pub(crate) fn infer_agg_function_types(
                     DataType::FixedSizeBinary(*width)
                 }
                 DataType::Decimal128(..) => {
-                    crate::sql::types::canonical_agg_decimal_type("sum", &first_arg)
+                    crate::types::canonical_agg_decimal_type("sum", &first_arg)
                         .expect("sum decimal canonical type")
                 }
                 _ => DataType::Float64,
@@ -2763,7 +2763,7 @@ pub(crate) fn infer_agg_function_types(
         "avg" => {
             let out = match &first_arg {
                 DataType::Decimal128(..) => {
-                    crate::sql::types::canonical_agg_decimal_type("avg", &first_arg)
+                    crate::types::canonical_agg_decimal_type("avg", &first_arg)
                         .expect("avg decimal canonical type")
                 }
                 _ => DataType::Float64,
@@ -2872,7 +2872,7 @@ pub(crate) fn infer_agg_function_types(
                     DataType::FixedSizeBinary(*width)
                 }
                 DataType::Decimal128(..) => {
-                    crate::sql::types::canonical_agg_decimal_type("multi_distinct_sum", &first_arg)
+                    crate::types::canonical_agg_decimal_type("multi_distinct_sum", &first_arg)
                         .expect("multi_distinct_sum decimal canonical type")
                 }
                 _ => DataType::Float64,

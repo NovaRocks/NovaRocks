@@ -64,7 +64,7 @@ fn avg_spec_from_input_type(data_type: &DataType) -> Result<AggSpec, String> {
             // Canonical avg decimal output is Decimal128(38, division-scale) (P2
             // single source of truth), matching analyzer/codegen. The
             // intermediate stays the sum/count accumulator layout.
-            output_type: crate::sql::types::canonical_agg_decimal_type("avg", data_type)
+            output_type: crate::types::canonical_agg_decimal_type("avg", data_type)
                 .expect("avg decimal canonical type"),
             intermediate_type: avg_decimal_intermediate_type(*precision, *scale),
             input_arg_type: None,

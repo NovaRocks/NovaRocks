@@ -30,6 +30,7 @@ pub mod runtime;
 pub mod server;
 pub mod service;
 pub mod sql;
+pub mod types;
 pub mod version;
 // StarRocks-BE-like folder layout, with `novarocks_*` convenience aliases.
 pub use common::app_config as novarocks_config;

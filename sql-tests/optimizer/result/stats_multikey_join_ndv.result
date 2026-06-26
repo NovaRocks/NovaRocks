@@ -14,7 +14,7 @@ PLAN FRAGMENT 1
     PARTITION: HASH_PARTITIONED (l.k1, l.k2)
 5:HASH AGGREGATE (LOCAL, group by: [l.k1, l.k2]) stats={rows=224}
   aggregations: count()
-  4:HASH JOIN (BROADCAST, INNER, eq: [l.k1 = r.k1, l.k2 = r.k2]) stats={rows=293}
+  4:HASH JOIN (BROADCAST, INNER, eq: [l.k1 = r.k1, l.k2 = r.k2]) bcast_verdict=feasible stats={rows=293}
     build runtime filters:
     - filter_id = 0, build_expr = (r.k1)
     - filter_id = 1, build_expr = (r.k2)

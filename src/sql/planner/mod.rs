@@ -3537,7 +3537,7 @@ fn plan_set_operation_scoped(
         .iter()
         .zip(set_op.right.output_columns.iter())
         .map(|(lc, rc)| {
-            let dt = crate::sql::types::wider_type(&lc.data_type, &rc.data_type);
+            let dt = crate::types::wider_type(&lc.data_type, &rc.data_type);
             OutputColumn {
                 column_id: lc.column_id,
                 name: lc.name.clone(),

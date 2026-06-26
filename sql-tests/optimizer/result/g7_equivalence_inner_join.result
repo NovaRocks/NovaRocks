@@ -4,7 +4,7 @@ PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
 5:PROJECT [l.lk AS lk, r.rk AS rk] stats={rows=126562500}
-  4:HASH JOIN (BROADCAST, INNER, eq: [l.lk = r.rk]) stats={rows=126562500}
+  4:HASH JOIN (BROADCAST, INNER, eq: [l.lk = r.rk]) bcast_verdict=feasible stats={rows=126562500}
     build runtime filters:
     - filter_id = 0, build_expr = (r.rk)
     1:SCAN db_sqlt_78546de01468a3d3.g7_l (alias=l) stats={rows=22500}
@@ -33,7 +33,7 @@ PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
 5:PROJECT [l.lk AS lk, r.rk AS rk] stats={rows=126562500}
-  4:HASH JOIN (BROADCAST, INNER, eq: [l.lk = r.rk]) stats={rows=126562500}
+  4:HASH JOIN (BROADCAST, INNER, eq: [l.lk = r.rk]) bcast_verdict=feasible stats={rows=126562500}
     build runtime filters:
     - filter_id = 0, build_expr = (r.rk)
     1:SCAN db_sqlt_78546de01468a3d3.g7_l (alias=l) stats={rows=22500}

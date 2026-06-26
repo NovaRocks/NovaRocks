@@ -12,7 +12,7 @@ PLAN FRAGMENT 1
   STREAM DATA SINK
     EXCHANGE ID: 5
     PARTITION: HASH_PARTITIONED (k)
-4:HASH JOIN (BROADCAST, LEFT OUTER, eq: [l.k = r.k]) stats={rows=2}
+4:HASH JOIN (BROADCAST, LEFT OUTER, eq: [l.k = r.k]) bcast_verdict=feasible stats={rows=2}
   1:SCAN db_sqlt_b1ed07372697ffe9.lineitem (alias=l) stats={rows=2}
        TABLE: db_sqlt_b1ed07372697ffe9.lineitem
        columns: k, v, _file, _pos
