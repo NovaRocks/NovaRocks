@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 include!(concat!(env!("OUT_DIR"), "/thrift_root_mod.rs"));
-
-pub mod proto;
+include!(concat!(env!("OUT_DIR"), "/proto_root_mod.rs"));
 
 pub mod cache;
 pub mod common;
