@@ -1,7 +1,7 @@
 -- @order_sensitive=true
 -- IV3-2: validate that snapshot summaries carry total-* and engine identity.
 -- Numeric carry-forward correctness is unit-tested in commit/*.rs; here we
--- assert the keys are present in the surfaced summary across operations.
+-- assert the surfaced summary carries exact totals across operations.
 
 -- query 1
 -- @skip_result_check=true
@@ -21,19 +21,19 @@ INSERT INTO iceberg_cat_${suite_uuid0}.iv32_db_${uuid0}.t_${uuid0} VALUES (1, 10
 INSERT INTO iceberg_cat_${suite_uuid0}.iv32_db_${uuid0}.t_${uuid0} VALUES (3, 30);
 
 -- query 5
--- Latest append summary carries all expected total-* keys + engine-name.
--- Use a subquery so ORDER BY can reference snapshot_id without it appearing
+-- Latest append summary carries exact total records/data-files + engine-name.
+-- Use a subquery so ORDER BY can reference committed_at without it appearing
 -- in the golden output.
-SELECT has_total_data_files, has_total_records, has_total_files_size, has_engine_name
+SELECT total_data_files_is_2, total_records_is_3, has_total_files_size, has_engine_name
 FROM (
   SELECT
-    snapshot_id,
-    summary LIKE '%total-data-files%'        AS has_total_data_files,
-    summary LIKE '%total-records%'           AS has_total_records,
+    committed_at,
+    summary LIKE '%"total-data-files":"2"%'  AS total_data_files_is_2,
+    summary LIKE '%"total-records":"3"%'     AS total_records_is_3,
     summary LIKE '%total-files-size%'        AS has_total_files_size,
     summary LIKE '%engine-name%'             AS has_engine_name
   FROM iceberg_cat_${suite_uuid0}.iv32_db_${uuid0}.t_${uuid0}$snapshots
-  ORDER BY snapshot_id DESC
+  ORDER BY committed_at DESC
   LIMIT 1
 ) t;
 
@@ -42,15 +42,15 @@ FROM (
 DELETE FROM iceberg_cat_${suite_uuid0}.iv32_db_${uuid0}.t_${uuid0} WHERE id = 1;
 
 -- query 7
--- Delete snapshot also carries totals + engine-name.
-SELECT has_total_records, has_engine_name
+-- Delete snapshot carries the decremented total-records + engine-name.
+SELECT total_records_is_2, has_engine_name
 FROM (
   SELECT
-    snapshot_id,
-    summary LIKE '%total-records%'   AS has_total_records,
-    summary LIKE '%engine-name%'     AS has_engine_name
+    committed_at,
+    summary LIKE '%"total-records":"2"%' AS total_records_is_2,
+    summary LIKE '%engine-name%'         AS has_engine_name
   FROM iceberg_cat_${suite_uuid0}.iv32_db_${uuid0}.t_${uuid0}$snapshots
-  ORDER BY snapshot_id DESC
+  ORDER BY committed_at DESC
   LIMIT 1
 ) t;
 

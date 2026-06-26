@@ -21,7 +21,7 @@ use arrow::array::{
     ArrayRef, Int32Array, Int64Array, MapBuilder, MapFieldNames, RecordBatch, RecordBatchOptions,
     StringArray, StringBuilder,
 };
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 
 use iceberg::spec::{SnapshotRetention, TableMetadata};
 
@@ -963,6 +963,143 @@ fn build_int_binary_map_array(rows: &[serde_json::Value], name: &str) -> Result<
     Ok(Arc::new(builder.finish()))
 }
 
+fn partition_field_value<'a>(
+    row: &'a serde_json::Value,
+    field: &Field,
+) -> Option<&'a serde_json::Value> {
+    row.get("partition")
+        .and_then(|value| value.as_object())
+        .and_then(|partition| partition.get(field.name()))
+        .filter(|value| !value.is_null())
+}
+
+fn build_partition_child_array(
+    field: &Field,
+    rows: &[serde_json::Value],
+) -> Result<ArrayRef, String> {
+    use arrow::array::{
+        BinaryBuilder, BooleanArray, Date32Array, Float32Array, Float64Array, Int32Array,
+        Int64Array, StringArray, Time64MicrosecondArray, Time64NanosecondArray,
+        TimestampMicrosecondArray, TimestampNanosecondArray,
+    };
+
+    match field.data_type() {
+        DataType::Boolean => Ok(Arc::new(BooleanArray::from(
+            rows.iter()
+                .map(|row| partition_field_value(row, field).and_then(|value| value.as_bool()))
+                .collect::<Vec<_>>(),
+        ))),
+        DataType::Int32 => Ok(Arc::new(Int32Array::from(
+            rows.iter()
+                .map(|row| {
+                    partition_field_value(row, field)
+                        .and_then(|value| value.as_i64())
+                        .map(|value| value as i32)
+                })
+                .collect::<Vec<_>>(),
+        ))),
+        DataType::Int64 => Ok(Arc::new(Int64Array::from(
+            rows.iter()
+                .map(|row| partition_field_value(row, field).and_then(|value| value.as_i64()))
+                .collect::<Vec<_>>(),
+        ))),
+        DataType::Float32 => Ok(Arc::new(Float32Array::from(
+            rows.iter()
+                .map(|row| {
+                    partition_field_value(row, field)
+                        .and_then(|value| value.as_f64())
+                        .map(|value| value as f32)
+                })
+                .collect::<Vec<_>>(),
+        ))),
+        DataType::Float64 => Ok(Arc::new(Float64Array::from(
+            rows.iter()
+                .map(|row| partition_field_value(row, field).and_then(|value| value.as_f64()))
+                .collect::<Vec<_>>(),
+        ))),
+        DataType::Utf8 => Ok(Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| partition_field_value(row, field).and_then(|value| value.as_str()))
+                .collect::<Vec<_>>(),
+        ))),
+        DataType::Binary => {
+            let mut builder = BinaryBuilder::new();
+            for row in rows {
+                match partition_field_value(row, field).and_then(|value| value.as_array()) {
+                    Some(bytes) => builder.append_value(json_u8_array(bytes)?),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Date32 => Ok(Arc::new(Date32Array::from(
+            rows.iter()
+                .map(|row| {
+                    partition_field_value(row, field)
+                        .and_then(|value| value.as_i64())
+                        .map(|value| value as i32)
+                })
+                .collect::<Vec<_>>(),
+        ))),
+        DataType::Time64(TimeUnit::Microsecond) => Ok(Arc::new(Time64MicrosecondArray::from(
+            rows.iter()
+                .map(|row| partition_field_value(row, field).and_then(|value| value.as_i64()))
+                .collect::<Vec<_>>(),
+        ))),
+        DataType::Time64(TimeUnit::Nanosecond) => Ok(Arc::new(Time64NanosecondArray::from(
+            rows.iter()
+                .map(|row| partition_field_value(row, field).and_then(|value| value.as_i64()))
+                .collect::<Vec<_>>(),
+        ))),
+        DataType::Timestamp(TimeUnit::Microsecond, None) => {
+            Ok(Arc::new(TimestampMicrosecondArray::from(
+                rows.iter()
+                    .map(|row| partition_field_value(row, field).and_then(|value| value.as_i64()))
+                    .collect::<Vec<_>>(),
+            )))
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, None) => {
+            Ok(Arc::new(TimestampNanosecondArray::from(
+                rows.iter()
+                    .map(|row| partition_field_value(row, field).and_then(|value| value.as_i64()))
+                    .collect::<Vec<_>>(),
+            )))
+        }
+        other => Err(format!(
+            "unsupported iceberg files partition field {} type {:?}",
+            field.name(),
+            other
+        )),
+    }
+}
+
+fn build_partition_struct_array(
+    column: &IcebergMetadataOutputColumn,
+    rows: &[serde_json::Value],
+) -> Result<ArrayRef, String> {
+    use arrow::array::StructArray;
+    let DataType::Struct(fields) = &column.data_type else {
+        return Err(format!(
+            "iceberg files partition column must be STRUCT, got {:?}",
+            column.data_type
+        ));
+    };
+    if fields.is_empty() {
+        return Ok(Arc::new(
+            StructArray::try_new_with_length(fields.clone(), vec![], None, rows.len())
+                .map_err(|e| format!("build empty iceberg partition struct failed: {e}"))?,
+        ));
+    }
+    let arrays = fields
+        .iter()
+        .map(|field| build_partition_child_array(field.as_ref(), rows))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Arc::new(
+        StructArray::try_new(fields.clone(), arrays, None)
+            .map_err(|e| format!("build iceberg partition struct failed: {e}"))?,
+    ))
+}
+
 /// Build the Arrow array for a single `$files` column from the JSON rows. The
 /// produced array type EXACTLY matches the analyzer's `files_columns()`
 /// declaration for that column (scalars, field-id maps, lists). Non-nullable
@@ -1018,14 +1155,7 @@ fn build_files_array(
             }
             Ok(Arc::new(b.finish()))
         }
-        // Nullable Utf8 scalar.
-        "partition" => {
-            let mut b = StringBuilder::new();
-            for r in rows {
-                b.append_option(r.get(&column.name).and_then(|v| v.as_str()));
-            }
-            Ok(Arc::new(b.finish()))
-        }
+        "partition" => build_partition_struct_array(column, rows),
         // Nullable Binary scalar.
         "key_metadata" => {
             let mut b = BinaryBuilder::new();
@@ -1553,11 +1683,20 @@ mod tests {
         metadata_table_schema(ty)
             .into_iter()
             .enumerate()
-            .map(|(i, c)| IcebergMetadataOutputColumn {
-                name: c.name,
-                slot_id: SlotId::new((i + 1) as u32),
-                data_type: c.data_type,
-                nullable: c.nullable,
+            .map(|(i, c)| {
+                let is_partition = c.name == "partition";
+                IcebergMetadataOutputColumn {
+                    name: c.name,
+                    slot_id: SlotId::new((i + 1) as u32),
+                    data_type: if is_partition {
+                        DataType::Struct(
+                            vec![Arc::new(Field::new("region", DataType::Utf8, true))].into(),
+                        )
+                    } else {
+                        c.data_type
+                    },
+                    nullable: c.nullable,
+                }
             })
             .collect()
     }
@@ -1629,8 +1768,19 @@ mod tests {
             "sort_order_id": 0,
             "key_metadata": serde_json::Value::Null,
             "first_row_id": serde_json::Value::Null,
-            "partition": "Struct([])"
+            "partition": serde_json::json!({"region": "us"})
         })
+    }
+
+    fn partition_struct_column() -> IcebergMetadataOutputColumn {
+        IcebergMetadataOutputColumn {
+            name: "partition".to_string(),
+            slot_id: SlotId::new(99),
+            data_type: DataType::Struct(
+                vec![Arc::new(Field::new("region", DataType::Utf8, true))].into(),
+            ),
+            nullable: true,
+        }
     }
 
     #[test]
@@ -1653,12 +1803,18 @@ mod tests {
             .unwrap();
         assert_eq!(path.value(0), "s3://bucket/data/f0.parquet");
 
-        let part = build_files_array(column_named(&cols, "partition"), &rows).unwrap();
+        let part = build_files_array(&partition_struct_column(), &rows).unwrap();
         let part = part
+            .as_any()
+            .downcast_ref::<arrow::array::StructArray>()
+            .unwrap();
+        let region = part
+            .column_by_name("region")
+            .unwrap()
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
             .unwrap();
-        assert_eq!(part.value(0), "Struct([])");
+        assert_eq!(region.value(0), "us");
 
         // Nullable scalars surfaced as null.
         let frid = build_files_array(column_named(&cols, "first_row_id"), &rows).unwrap();
@@ -1880,7 +2036,7 @@ mod tests {
             "sort_order_id": serde_json::Value::Null,
             "key_metadata": serde_json::Value::Null,
             "first_row_id": serde_json::Value::Null,
-            "partition": "Struct([])"
+            "partition": serde_json::json!({"region": "us"})
         });
         let rows = vec![added, deleted];
         let cols = output_columns_for(IcebergMetadataTableType::LogicalIcebergMetadata);

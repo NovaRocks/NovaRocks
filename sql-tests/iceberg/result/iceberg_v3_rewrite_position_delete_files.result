@@ -7,3 +7,7 @@ id	user_id	amount
 id	user_id	amount
 1	10	100
 3	30	300
+
+-- query 5
+puffin_delete_files
+1

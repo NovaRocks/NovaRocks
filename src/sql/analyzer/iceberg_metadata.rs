@@ -3,10 +3,12 @@
 //!
 //! Mirrors `iceberg_ref::split_ref_suffix` for branch/tag.
 
-use arrow::datatypes::{DataType, Field};
+use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
+use iceberg::spec::{PrimitiveType, TableMetadata, Type};
 use std::sync::Arc;
 
 use crate::connector::iceberg::IcebergMetadataTableType;
+use crate::sql::catalog::{IcebergTableInfo, ScanSource};
 
 /// Inspect the trailing identifier part of a qualified name and, if it
 /// matches `__nr_meta_<type>__`, return the parts with the suffix stripped
@@ -63,7 +65,7 @@ fn list_of(value: DataType) -> DataType {
     DataType::List(Arc::new(Field::new("item", value, true)))
 }
 
-fn files_columns() -> Vec<MetadataColumn> {
+fn files_columns_with_partition(partition_type: DataType) -> Vec<MetadataColumn> {
     vec![
         MetadataColumn::new("content", DataType::Int32, false),
         MetadataColumn::new("file_path", DataType::Utf8, false),
@@ -82,8 +84,155 @@ fn files_columns() -> Vec<MetadataColumn> {
         MetadataColumn::new("sort_order_id", DataType::Int32, true),
         MetadataColumn::new("key_metadata", DataType::Binary, true),
         MetadataColumn::new("first_row_id", DataType::Int64, true),
-        MetadataColumn::new("partition", DataType::Utf8, true),
+        MetadataColumn::new("partition", partition_type, true),
     ]
+}
+
+fn files_columns() -> Vec<MetadataColumn> {
+    files_columns_with_partition(DataType::Utf8)
+}
+
+fn iceberg_type_to_arrow_type(ty: &Type) -> Result<DataType, String> {
+    match ty {
+        Type::Primitive(primitive) => Ok(match primitive {
+            PrimitiveType::Boolean => DataType::Boolean,
+            PrimitiveType::Int => DataType::Int32,
+            PrimitiveType::Long => DataType::Int64,
+            PrimitiveType::Float => DataType::Float32,
+            PrimitiveType::Double => DataType::Float64,
+            PrimitiveType::Decimal { precision, scale } => DataType::Decimal128(
+                u8::try_from(*precision)
+                    .map_err(|_| format!("iceberg decimal precision out of range: {precision}"))?,
+                i8::try_from(*scale)
+                    .map_err(|_| format!("iceberg decimal scale out of range: {scale}"))?,
+            ),
+            PrimitiveType::Date => DataType::Date32,
+            PrimitiveType::Time => DataType::Time64(TimeUnit::Microsecond),
+            PrimitiveType::Timestamp | PrimitiveType::Timestamptz => {
+                DataType::Timestamp(TimeUnit::Microsecond, None)
+            }
+            PrimitiveType::TimestampNs | PrimitiveType::TimestamptzNs => {
+                DataType::Timestamp(TimeUnit::Nanosecond, None)
+            }
+            PrimitiveType::String | PrimitiveType::Uuid => DataType::Utf8,
+            PrimitiveType::Fixed(width) => DataType::FixedSizeBinary(
+                i32::try_from(*width)
+                    .map_err(|_| format!("iceberg fixed width out of range: {width}"))?,
+            ),
+            PrimitiveType::Binary | PrimitiveType::Variant => DataType::Binary,
+        }),
+        other => Err(format!(
+            "iceberg metadata partition field must be primitive, got {other:?}"
+        )),
+    }
+}
+
+fn partition_source_type<'a>(metadata: &'a TableMetadata, source_id: i32) -> Option<&'a Type> {
+    metadata
+        .current_schema()
+        .field_by_id(source_id)
+        .map(|field| field.field_type.as_ref())
+        .or_else(|| {
+            metadata.schemas_iter().find_map(|schema| {
+                schema
+                    .field_by_id(source_id)
+                    .map(|field| field.field_type.as_ref())
+            })
+        })
+}
+
+fn partition_struct_type(table: &IcebergTableInfo) -> Result<DataType, String> {
+    let Some(serialized) = table.serialized_metadata.as_deref() else {
+        return Err(format!(
+            "iceberg metadata table {}.{} requires serialized metadata to type partition struct",
+            table.namespace, table.table
+        ));
+    };
+    let metadata: TableMetadata = serde_json::from_str(serialized)
+        .map_err(|e| format!("parse iceberg table metadata for partition schema failed: {e}"))?;
+    let mut specs = metadata.partition_specs_iter().cloned().collect::<Vec<_>>();
+    specs.sort_by_key(|spec| spec.spec_id());
+
+    let mut fields: Vec<Arc<Field>> = Vec::new();
+    for spec in specs {
+        for part_field in spec.fields() {
+            let source_type =
+                partition_source_type(&metadata, part_field.source_id).ok_or_else(|| {
+                    format!(
+                        "iceberg partition field {} references missing source field id {}",
+                        part_field.name, part_field.source_id
+                    )
+                })?;
+            let result_type = part_field.transform.result_type(source_type).map_err(|e| {
+                format!(
+                    "infer iceberg partition field {} type: {e}",
+                    part_field.name
+                )
+            })?;
+            let arrow_type = iceberg_type_to_arrow_type(&result_type)?;
+            if let Some(existing) = fields
+                .iter()
+                .find(|field| field.name().eq_ignore_ascii_case(&part_field.name))
+            {
+                if existing.data_type() != &arrow_type {
+                    return Err(format!(
+                        "iceberg partition field {} has incompatible types across specs: {:?} vs {:?}",
+                        part_field.name,
+                        existing.data_type(),
+                        arrow_type
+                    ));
+                }
+                continue;
+            }
+            fields.push(Arc::new(Field::new(
+                part_field.name.clone(),
+                arrow_type,
+                true,
+            )));
+        }
+    }
+    Ok(DataType::Struct(Fields::from(fields)))
+}
+
+fn table_info_from_source(source: &ScanSource) -> Option<&IcebergTableInfo> {
+    match source {
+        ScanSource::IcebergDataFiles { table, .. }
+        | ScanSource::IcebergMetadataTable { table, .. }
+        | ScanSource::IcebergDeltaTable { table, .. }
+        | ScanSource::IcebergVersionTable { table, .. } => Some(table),
+        ScanSource::StarRocks { .. } | ScanSource::IcebergMvTargetState { .. } => None,
+    }
+}
+
+pub fn metadata_table_schema_for_source(
+    ty: IcebergMetadataTableType,
+    source: &ScanSource,
+) -> Result<Vec<MetadataColumn>, String> {
+    let Some(table) = table_info_from_source(source) else {
+        return Err("iceberg metadata table requires iceberg table identity".to_string());
+    };
+    metadata_table_schema_for_table(ty, table)
+}
+
+pub fn metadata_table_schema_for_table(
+    ty: IcebergMetadataTableType,
+    table: &IcebergTableInfo,
+) -> Result<Vec<MetadataColumn>, String> {
+    use IcebergMetadataTableType as T;
+    match ty {
+        T::Files => Ok(files_columns_with_partition(partition_struct_type(table)?)),
+        T::LogicalIcebergMetadata => {
+            let mut cols = vec![
+                MetadataColumn::new("status", DataType::Int32, false),
+                MetadataColumn::new("snapshot_id", DataType::Int64, true),
+                MetadataColumn::new("sequence_number", DataType::Int64, true),
+                MetadataColumn::new("file_sequence_number", DataType::Int64, true),
+            ];
+            cols.extend(files_columns_with_partition(partition_struct_type(table)?));
+            Ok(cols)
+        }
+        other => Ok(metadata_table_schema(other)),
+    }
 }
 
 /// Fixed analyzer-level column schema for each Iceberg metadata table.

@@ -3196,10 +3196,11 @@ fn plan_iceberg_metadata_scan(
     rel: IcebergMetadataScanRelation,
     factory: &mut ColumnRefFactory,
 ) -> Result<LogicalPlanNode, String> {
-    use crate::sql::analyzer::iceberg_metadata::metadata_table_schema;
+    use crate::sql::analyzer::iceberg_metadata::metadata_table_schema_for_source;
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
 
-    let cols = metadata_table_schema(rel.metadata_table_type.clone());
+    let cols =
+        metadata_table_schema_for_source(rel.metadata_table_type.clone(), &rel.table.source)?;
     if cols.is_empty() {
         return Err(format!(
             "iceberg metadata table type {:?} is not supported",

@@ -45,6 +45,12 @@ CALL dv_proc_${uuid0}.system.rewrite_position_delete_files(table => 'ns_${uuid0}
 SELECT id, user_id, amount FROM orders ORDER BY id;
 
 -- query 5
+-- @db=dv_proc_${uuid0}.ns_${uuid0}
+SELECT count(*) AS puffin_delete_files
+  FROM orders$files
+  WHERE content = 1 AND file_format = 'PUFFIN';
+
+-- query 6
 -- @skip_result_check=true
 DROP TABLE dv_proc_${uuid0}.ns_${uuid0}.orders FORCE;
 DROP DATABASE dv_proc_${uuid0}.ns_${uuid0};

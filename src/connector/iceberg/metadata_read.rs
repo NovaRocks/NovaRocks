@@ -27,16 +27,46 @@ use std::collections::HashMap;
 
 use iceberg::io::FileIO;
 use iceberg::spec::{
-    DataContentType, DataFile, DataFileFormat, ManifestContentType, ManifestStatus,
+    DataContentType, DataFile, DataFileFormat, Literal, ManifestContentType, ManifestStatus,
+    PrimitiveLiteral, TableMetadata,
 };
 use iceberg::table::Table;
 use serde_json::{Value, json};
 
 use crate::connector::iceberg::IcebergMetadataTableType;
 
-fn partition_string(df: &DataFile) -> String {
-    crate::connector::iceberg::read::iceberg_partition_key(df.partition())
-        .unwrap_or_else(|| "Struct([])".to_string())
+fn literal_to_partition_json(literal: &Literal) -> Value {
+    match literal {
+        Literal::Primitive(PrimitiveLiteral::Boolean(v)) => json!(v),
+        Literal::Primitive(PrimitiveLiteral::Int(v)) => json!(v),
+        Literal::Primitive(PrimitiveLiteral::Long(v)) => json!(v),
+        Literal::Primitive(PrimitiveLiteral::Float(v)) => json!(v.0),
+        Literal::Primitive(PrimitiveLiteral::Double(v)) => json!(v.0),
+        Literal::Primitive(PrimitiveLiteral::String(v)) => json!(v),
+        Literal::Primitive(PrimitiveLiteral::Binary(v)) => json!(v),
+        Literal::Primitive(PrimitiveLiteral::Int128(v)) => json!(v.to_string()),
+        Literal::Primitive(PrimitiveLiteral::UInt128(v)) => json!(v.to_string()),
+        Literal::Primitive(PrimitiveLiteral::AboveMax) => Value::Null,
+        Literal::Primitive(PrimitiveLiteral::BelowMin) => Value::Null,
+        other => json!(format!("{other:?}")),
+    }
+}
+
+fn partition_value(metadata: &TableMetadata, df: &DataFile, spec_id: i32) -> Result<Value, String> {
+    let spec = metadata
+        .partition_spec_by_id(spec_id)
+        .ok_or_else(|| format!("data file references unknown partition spec id {spec_id}"))?;
+    let values = df.partition().fields();
+    let mut out = serde_json::Map::new();
+    for (idx, field) in spec.fields().iter().enumerate() {
+        let value = values
+            .get(idx)
+            .and_then(|value| value.as_ref())
+            .map(literal_to_partition_json)
+            .unwrap_or(Value::Null);
+        out.insert(field.name.clone(), value);
+    }
+    Ok(Value::Object(out))
 }
 
 fn content_code(df: &DataFile) -> i32 {
@@ -72,7 +102,12 @@ fn bytes_map(m: &HashMap<i32, Vec<u8>>) -> Value {
 // the iceberg-rust `DataFile::partition_spec_id` is crate-private with no
 // public accessor, and every data file in a manifest shares the manifest's
 // partition spec.
-fn file_row(df: &DataFile, spec_id: i32, entry_cols: Option<Value>) -> Result<Value, String> {
+fn file_row(
+    metadata: &TableMetadata,
+    df: &DataFile,
+    spec_id: i32,
+    entry_cols: Option<Value>,
+) -> Result<Value, String> {
     let mut lower = HashMap::new();
     for (k, datum) in df.lower_bounds() {
         if let Ok(b) = datum.to_bytes() {
@@ -103,7 +138,7 @@ fn file_row(df: &DataFile, spec_id: i32, entry_cols: Option<Value>) -> Result<Va
         "sort_order_id": df.sort_order_id(),
         "key_metadata": df.key_metadata().map(|b| b.to_vec()),
         "first_row_id": df.first_row_id(),
-        "partition": partition_string(df),
+        "partition": partition_value(metadata, df, spec_id)?,
     });
     match entry_cols {
         None => Ok(base),
@@ -176,7 +211,7 @@ pub async fn read_metadata_table_rows(
                     if entry.status() == ManifestStatus::Deleted {
                         continue;
                     }
-                    rows.push(file_row(df, mf.partition_spec_id, None)?);
+                    rows.push(file_row(metadata, df, mf.partition_spec_id, None)?);
                 }
                 IcebergMetadataTableType::LogicalIcebergMetadata => {
                     let status = match entry.status() {
@@ -193,7 +228,12 @@ pub async fn read_metadata_table_rows(
                         "sequence_number": entry.sequence_number(),
                         "file_sequence_number": entry.file_sequence_number,
                     });
-                    rows.push(file_row(df, mf.partition_spec_id, Some(entry_cols))?);
+                    rows.push(file_row(
+                        metadata,
+                        df,
+                        mf.partition_spec_id,
+                        Some(entry_cols),
+                    )?);
                 }
                 _ => unreachable!("manifests handled above"),
             }

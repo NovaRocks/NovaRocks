@@ -5,3 +5,8 @@ n_data_files
 -- query 6
 total_records
 2
+
+-- query 7
+part_region	records
+eu	1
+us	1

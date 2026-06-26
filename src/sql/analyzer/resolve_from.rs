@@ -4,7 +4,7 @@ use sqlparser::ast as sqlast;
 use crate::sql::analysis::*;
 
 use super::helpers::eval_const_i64;
-use super::iceberg_metadata::{metadata_table_schema, split_metadata_suffix};
+use super::iceberg_metadata::{metadata_table_schema_for_source, split_metadata_suffix};
 use super::scope::AnalyzerScope;
 
 impl<'a> super::AnalyzerContext<'a> {
@@ -372,8 +372,10 @@ impl<'a> super::AnalyzerContext<'a> {
                     )?;
                     let alias_name = alias.as_ref().map(|a| a.name.value.clone());
 
-                    // Build scope from the fixed metadata schema.
-                    let cols = metadata_table_schema(metadata_ty.clone());
+                    // Build scope from the metadata schema, including dynamic
+                    // partition struct fields for `$files` / `$entries`.
+                    let cols =
+                        metadata_table_schema_for_source(metadata_ty.clone(), &table_def.source)?;
                     let mut scope = self.new_scope();
                     let qualifier = alias_name.as_deref().unwrap_or(&table_def.name);
                     // Collect analyzer-allocated ColumnIds so the planner can reuse
