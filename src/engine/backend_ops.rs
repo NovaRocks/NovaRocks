@@ -510,6 +510,7 @@ mod tests {
 
     #[test]
     fn all_in_one_loopback_registry_installs_live_backend_zero() {
+        let _guard = crate::engine::acquire_standalone_test_guard();
         let _registry = BackendRegistryReset::new();
         let endpoint: std::net::SocketAddr = "127.0.0.1:19070".parse().unwrap();
 
@@ -534,6 +535,7 @@ mod tests {
 
     #[test]
     fn all_in_one_loopback_registry_rejects_mismatched_existing_registry() {
+        let _guard = crate::engine::acquire_standalone_test_guard();
         let _registry = BackendRegistryReset::new();
         let existing_endpoint: std::net::SocketAddr = "127.0.0.1:19070".parse().unwrap();
         let requested_endpoint: std::net::SocketAddr = "127.0.0.1:19071".parse().unwrap();

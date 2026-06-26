@@ -510,6 +510,8 @@ impl StandaloneNovaRocks {
     pub fn open(opts: StandaloneOptions) -> Result<Self, String> {
         #[cfg(test)]
         let _test_guard = Some(acquire_standalone_test_guard());
+        #[cfg(test)]
+        crate::runtime::backend_registry::replace_backend_registry_for_test(None);
         match opts.config_path.as_deref() {
             Some(path) => {
                 novarocks_config::init_from_path(path)
@@ -545,6 +547,8 @@ impl StandaloneNovaRocks {
     ) -> Result<Self, String> {
         #[cfg(test)]
         let _test_guard = Some(acquire_standalone_test_guard());
+        #[cfg(test)]
+        crate::runtime::backend_registry::replace_backend_registry_for_test(None);
         novarocks_config::install_preloaded_config(cfg);
         #[cfg(test)]
         return Self::open_body(opts, _test_guard);
@@ -4676,7 +4680,6 @@ mod tests {
     use crate::connector::starrocks::lake::context::lock_runtime_test_state;
     use crate::connector::starrocks::table::config::StarRocksTableConfig;
     use crate::meta::MetaStoreProvider;
-    use crate::runtime::backend_registry::BackendRegistryTestGuard as BackendRegistryReset;
     use crate::sql::planner::plan::*;
     use arrow::array::{
         Array, FixedSizeBinaryArray, Int32Array, Int64Array, ListArray, StringArray,
@@ -4973,7 +4976,6 @@ path = "{metadata_path}"
 
     #[test]
     fn backend_management_sql_add_show_drop_force() {
-        let _registry = BackendRegistryReset::new();
         let mut cfg = crate::common::app_config::NovaRocksConfig::default();
         cfg.cluster.role = crate::common::app_config::ClusterRole::Fe;
         cfg.cluster.backends.clear();
@@ -4999,7 +5001,6 @@ path = "{metadata_path}"
 
     #[test]
     fn backend_management_sql_restores_persisted_backend_metadata() {
-        let _registry = BackendRegistryReset::new();
         let dir = TempDir::new().expect("tempdir");
         let metadata_path = dir.path().join("meta.sqlite");
         let mut cfg = crate::common::app_config::NovaRocksConfig::default();
@@ -5019,7 +5020,6 @@ path = "{metadata_path}"
             .expect("ADD BACKEND");
         drop(engine);
 
-        crate::runtime::backend_registry::replace_backend_registry_for_test(None);
         let reopened = StandaloneNovaRocks::open_with_config(StandaloneOptions::default(), cfg)
             .expect("reopen FE engine");
         let result = reopened
@@ -5033,7 +5033,6 @@ path = "{metadata_path}"
 
     #[test]
     fn add_backend_requires_fe_role_but_show_backends_works_in_all_in_one() {
-        let _registry = BackendRegistryReset::new();
         let mut cfg = crate::common::app_config::NovaRocksConfig::default();
         cfg.cluster.role = crate::common::app_config::ClusterRole::AllInOne;
         let engine = StandaloneNovaRocks::open_with_config(StandaloneOptions::default(), cfg)
@@ -9393,7 +9392,8 @@ path = "meta/operations.sqlite"
     #[test]
     fn dispatcher_for_role_all_in_one_ok() {
         use crate::common::app_config::ClusterRole;
-        let _registry = BackendRegistryReset::new();
+        let _guard = super::acquire_standalone_test_guard();
+        let _registry = crate::runtime::backend_registry::BackendRegistryTestGuard::new();
         crate::engine::backend_ops::install_all_in_one_backend_registry(
             "127.0.0.1:19070".parse().unwrap(),
             3,
@@ -9406,7 +9406,7 @@ path = "meta/operations.sqlite"
     #[test]
     fn all_in_one_dispatcher_uses_remote_registry() {
         let _guard = super::acquire_standalone_test_guard();
-        let _registry = BackendRegistryReset::new();
+        let _registry = crate::runtime::backend_registry::BackendRegistryTestGuard::new();
         use crate::common::app_config::{ClusterRole, NovaRocksConfig};
         let mut cfg = NovaRocksConfig::default();
         cfg.cluster.role = ClusterRole::AllInOne;
@@ -9426,7 +9426,7 @@ path = "meta/operations.sqlite"
     #[test]
     fn coordinated_execution_services_use_one_live_backend_snapshot() {
         let _guard = super::acquire_standalone_test_guard();
-        let _registry = BackendRegistryReset::new();
+        let _registry = crate::runtime::backend_registry::BackendRegistryTestGuard::new();
         use crate::common::app_config::{ClusterRole, NovaRocksConfig};
         use crate::runtime::backend_registry::{BackendRegistry, BackendState};
         let mut cfg = NovaRocksConfig::default();
@@ -9460,7 +9460,7 @@ path = "meta/operations.sqlite"
     #[test]
     fn live_effective_backend_count_prefers_live_registry_over_runtime_config() {
         let _guard = super::acquire_standalone_test_guard();
-        let _registry = BackendRegistryReset::new();
+        let _registry = crate::runtime::backend_registry::BackendRegistryTestGuard::new();
         use crate::runtime::backend_registry::{BackendRegistry, BackendState};
 
         install_optimizer_backend_count_config(7, vec!["127.0.0.1:19080".to_string()]);
@@ -9475,7 +9475,7 @@ path = "meta/operations.sqlite"
     #[test]
     fn live_effective_backend_count_prefers_runtime_config_when_registry_absent() {
         let _guard = super::acquire_standalone_test_guard();
-        let _registry = BackendRegistryReset::new();
+        let _registry = crate::runtime::backend_registry::BackendRegistryTestGuard::new();
 
         install_optimizer_backend_count_config(
             7,
@@ -9488,7 +9488,7 @@ path = "meta/operations.sqlite"
     #[test]
     fn live_effective_backend_count_prefers_runtime_config_when_registry_empty() {
         let _guard = super::acquire_standalone_test_guard();
-        let _registry = BackendRegistryReset::new();
+        let _registry = crate::runtime::backend_registry::BackendRegistryTestGuard::new();
         let registry = Arc::new(crate::runtime::backend_registry::BackendRegistry::new(3));
 
         install_optimizer_backend_count_config(7, vec!["127.0.0.1:19085".to_string()]);
@@ -9500,7 +9500,7 @@ path = "meta/operations.sqlite"
     #[test]
     fn live_effective_backend_count_defaults_to_one_without_registry_or_runtime_config() {
         let _guard = super::acquire_standalone_test_guard();
-        let _registry = BackendRegistryReset::new();
+        let _registry = crate::runtime::backend_registry::BackendRegistryTestGuard::new();
 
         install_optimizer_backend_count_config(0, Vec::new());
 
@@ -9707,7 +9707,7 @@ path = "meta/operations.sqlite"
     #[test]
     fn dispatcher_for_role_fe_uses_live_registry_backend_ids() {
         let _guard = super::acquire_standalone_test_guard();
-        let _registry = BackendRegistryReset::new();
+        let _registry = crate::runtime::backend_registry::BackendRegistryTestGuard::new();
         use crate::common::app_config::{ClusterRole, NovaRocksConfig};
         use crate::runtime::backend_registry::{BackendRegistry, BackendState};
         let mut cfg = NovaRocksConfig::default();
