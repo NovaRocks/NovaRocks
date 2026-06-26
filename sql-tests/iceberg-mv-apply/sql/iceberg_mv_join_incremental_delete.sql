@@ -89,6 +89,49 @@ ORDER BY f.id, d.label;
 
 -- query 8
 -- @skip_result_check=true
+INSERT INTO ice_mv_apply_${uuid0}.ns_${uuid0}.dim_${uuid0}
+SELECT id, concat('bulk-', cast(id as varchar))
+FROM TABLE(generate_series(1000, 3499)) AS gs(id);
+INSERT INTO ice_mv_apply_${uuid0}.ns_${uuid0}.fact_${uuid0}
+SELECT id, id, id * 10
+FROM TABLE(generate_series(1000, 3499)) AS gs(id);
+REFRESH MATERIALIZED VIEW join_apply_mv_${uuid0};
+
+-- query 9
+SELECT COUNT(*) AS c, SUM(id) AS sum_id, SUM(amount) AS sum_amount
+FROM join_apply_mv_${uuid0};
+
+-- query 10
+-- @skip_result_check=true
+DELETE FROM ice_mv_apply_${uuid0}.ns_${uuid0}.fact_${uuid0}
+WHERE id >= 1000 AND id <= 2999;
+UPDATE ice_mv_apply_${uuid0}.ns_${uuid0}.dim_${uuid0}
+SET label = concat('bulk-new-', cast(id as varchar))
+WHERE id >= 3000 AND id <= 3499;
+INSERT INTO ice_mv_apply_${uuid0}.ns_${uuid0}.dim_${uuid0}
+SELECT id, concat('bulk-', cast(id as varchar))
+FROM TABLE(generate_series(3500, 3999)) AS gs(id);
+INSERT INTO ice_mv_apply_${uuid0}.ns_${uuid0}.fact_${uuid0}
+SELECT id, id, id * 10
+FROM TABLE(generate_series(3500, 3999)) AS gs(id);
+
+-- query 11
+-- @skip_result_check=true
+-- @explain_contains=IcebergVersionTable
+REFRESH MATERIALIZED VIEW join_apply_mv_${uuid0};
+
+-- query 12
+SELECT COUNT(*) AS c, SUM(id) AS sum_id, SUM(amount) AS sum_amount
+FROM join_apply_mv_${uuid0};
+
+-- query 13
+SELECT id, amount, label
+FROM join_apply_mv_${uuid0}
+WHERE id IN (2, 3, 3000, 3499, 3500, 3999)
+ORDER BY id;
+
+-- query 14
+-- @skip_result_check=true
 DROP MATERIALIZED VIEW join_apply_mv_${uuid0};
 DROP TABLE ice_mv_apply_${uuid0}.ns_${uuid0}.fact_${uuid0} FORCE;
 DROP TABLE ice_mv_apply_${uuid0}.ns_${uuid0}.dim_${uuid0} FORCE;

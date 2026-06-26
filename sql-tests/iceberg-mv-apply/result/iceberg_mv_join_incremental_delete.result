@@ -12,3 +12,20 @@ id	amount	label
 id	amount	label
 2	200	new-b
 3	300	new-c
+
+-- query 9
+c	sum_id	sum_amount
+2502	5623755	56238000
+
+-- query 12
+c	sum_id	sum_amount
+1002	3499505	34995500
+
+-- query 13
+id	amount	label
+2	200	new-b
+3	300	new-c
+3000	30000	bulk-new-3000
+3499	34990	bulk-new-3499
+3500	35000	bulk-3500
+3999	39990	bulk-3999
