@@ -37,6 +37,7 @@ use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::row_position::RowPositionDescriptor;
+use crate::proto as internal_proto;
 #[cfg(feature = "compat")]
 use crate::runtime::lookup::decode_column_ipc;
 use crate::runtime::lookup::{
@@ -44,7 +45,6 @@ use crate::runtime::lookup::{
 };
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::runtime::runtime_state::RuntimeState;
-use crate::service::grpc_proto as internal_proto;
 use crate::thrift::descriptors;
 use crate::thrift::descriptors::TRowPositionType;
 
@@ -334,8 +334,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::FetchProcessor;
+    use crate::proto as internal_proto;
     use crate::runtime::query_context::QueryId;
-    use crate::service::grpc_proto as internal_proto;
     use crate::service::internal_rpc_client;
     use crate::thrift::descriptors;
 

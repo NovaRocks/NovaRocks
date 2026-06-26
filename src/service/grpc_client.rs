@@ -27,7 +27,7 @@ use crate::common::types::UniqueId;
 use crate::novarocks_logging::error;
 use crate::runtime::global_async_runtime::{data_block_on, data_runtime_handle};
 
-pub use crate::service::grpc_proto as proto;
+pub use crate::proto;
 
 /// gRPC client for NovaRocks BE-to-BE and coordinator RPCs.
 ///

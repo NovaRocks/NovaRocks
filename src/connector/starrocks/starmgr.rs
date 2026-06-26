@@ -21,9 +21,9 @@ use std::time::Duration;
 use tokio::time::{Instant, sleep};
 use tonic::transport::{Channel, Endpoint};
 
+use crate::proto::staros;
 use crate::runtime::global_async_runtime::data_block_on;
 use crate::runtime::starlet_shard_registry::{self, S3StoreConfig, StarletShardInfo};
-use crate::service::grpc_proto::staros;
 
 const STARMGR_SERVICE_NAME: &str = "starrocks";
 const DEFAULT_WORKER_GROUP_ID: u64 = 0;
@@ -622,8 +622,8 @@ mod tests {
         parse_s3_config_from_file_path_info, parse_s3_config_from_file_store_info,
         require_ok_status, resolve_routing, split_object_store_path,
     };
+    use crate::proto::staros;
     use crate::runtime::global_async_runtime::data_block_on;
-    use crate::service::grpc_proto::staros;
 
     fn sample_file_path_info() -> staros::FilePathInfo {
         staros::FilePathInfo {

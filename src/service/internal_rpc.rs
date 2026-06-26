@@ -20,10 +20,10 @@ use crate::common::failpoint::{self, FailPointMode};
 use crate::common::ids::SlotId;
 use crate::exec::runtime_filter::arrow_type_from_proto_type_desc;
 use crate::novarocks_logging::warn;
+use crate::proto;
 use crate::runtime::exchange;
 use crate::runtime::lookup::{decode_column_ipc, encode_column_ipc, execute_lookup_request};
 use crate::runtime::query_context::{QueryId, query_context_manager, query_expire_durations};
-use crate::service::grpc_proto as proto;
 
 fn ok_status() -> proto::starrocks::StatusPb {
     proto::starrocks::StatusPb {
@@ -360,9 +360,9 @@ mod tests {
     #[cfg(feature = "compat")]
     use crate::exec::runtime_filter::{arrow_type_to_proto_type_desc, decode_starrocks_in_filter};
     use crate::fs::scan_context::FileScanRange;
+    use crate::proto;
     use crate::runtime::exchange;
     use crate::runtime::query_context::{QueryId, query_context_manager};
-    use crate::service::grpc_proto as proto;
     #[cfg(feature = "compat")]
     use crate::service::internal_rpc_client;
     use crate::thrift::descriptors;

@@ -46,7 +46,7 @@ use crate::service::{load_tracking_http, metrics_http, stream_load_http};
 pub(crate) use crate::common::engine_error::{
     REPORT_EXEC_STATUS_OK, REPORT_EXEC_STATUS_QUERY_GONE,
 };
-pub use crate::service::grpc_proto as proto;
+pub use crate::proto;
 
 const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const CANCEL_FRAGMENT_OK: i32 = 0;

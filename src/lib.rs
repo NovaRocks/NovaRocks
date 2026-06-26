@@ -16,6 +16,8 @@
 // under the License.
 include!(concat!(env!("OUT_DIR"), "/thrift_root_mod.rs"));
 
+pub mod proto;
+
 pub mod cache;
 pub mod common;
 pub mod connector;

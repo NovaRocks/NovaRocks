@@ -21,7 +21,7 @@ use prost::Message;
 use crate::common::types::UniqueId;
 use crate::service::engine_ffi::NovaRocksRustBuf;
 
-pub use crate::service::grpc_proto as proto;
+pub use crate::proto;
 
 unsafe extern "C" {
     fn novarocks_compat_transmit_chunk(

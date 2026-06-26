@@ -43,11 +43,11 @@ use crate::exec::chunk::Chunk;
 #[cfg(test)]
 use crate::exec::chunk::ChunkSchema;
 use crate::exec::chunk::ChunkSchemaRef;
-use crate::service::grpc_client::NovaRocksGrpcRemoteClient;
-use crate::service::grpc_proto::novarocks::{
+use crate::proto::novarocks::{
     CancelFragmentRequest, FetchResultRequest, PUniqueId, SubmitFragmentRequest,
     fetch_result_response::Status as FetchStatus,
 };
+use crate::service::grpc_client::NovaRocksGrpcRemoteClient;
 #[cfg(test)]
 use crate::thrift::data_sinks;
 use crate::thrift::internal_service;
@@ -381,7 +381,7 @@ mod tests {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
-    use crate::service::grpc_proto as proto;
+    use crate::proto;
     use arrow::array::Int32Array;
     use proto::novarocks::fetch_result_response::Status as FetchStatus;
     use proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc;

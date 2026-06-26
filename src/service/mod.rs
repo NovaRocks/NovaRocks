@@ -26,7 +26,6 @@ pub(crate) mod exec_status_report;
 pub mod fe_report;
 pub mod frontend_rpc;
 pub mod grpc_client;
-pub mod grpc_proto;
 pub mod grpc_server;
 pub mod heartbeat_service;
 pub(crate) mod internal_rpc;
