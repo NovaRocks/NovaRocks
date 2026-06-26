@@ -30,7 +30,7 @@ use std::cmp::Ordering;
 use crate::common::largeint;
 use crate::exec::chunk::ChunkFieldSchema;
 use crate::exec::variant::VariantValue;
-use crate::types;
+use crate::thrift::types;
 
 fn format_date32_for_mysql(days: i32) -> String {
     let Some(date) = NaiveDate::from_num_days_from_ce_opt(719163 + days) else {
@@ -1576,7 +1576,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, TimeUnit};
 
     use crate::exec::chunk::ChunkFieldSchema;
-    use crate::types;
+    use crate::thrift::types;
 
     #[test]
     fn format_timestamp_microsecond_omits_zero_fraction() {

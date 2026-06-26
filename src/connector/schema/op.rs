@@ -27,7 +27,7 @@ use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{ScanMorsel, ScanMorsels, ScanOp};
 use crate::novarocks_config::config as novarocks_app_config;
 use crate::runtime::backend_id;
-use crate::types;
+use crate::thrift::types;
 
 use super::be_compaction_stats_store;
 use super::be_tablet_write_log_store;

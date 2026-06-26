@@ -38,7 +38,7 @@ use crate::lower::layout::Layout;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::OperatorProfiles;
 use crate::runtime::runtime_state::RuntimeState;
-use crate::{data_sinks, internal_service, types};
+use crate::thrift::{data_sinks, internal_service, types};
 
 use super::DataStreamSinkFactory;
 

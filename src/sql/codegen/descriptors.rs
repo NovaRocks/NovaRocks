@@ -1,9 +1,9 @@
 use arrow::datatypes::DataType;
 use std::collections::BTreeSet;
 
-use crate::descriptors;
 use crate::sql::catalog::{IcebergSchemaDef, IcebergSchemaFieldDef, TableDef};
-use crate::types;
+use crate::thrift::descriptors;
+use crate::thrift::types;
 
 use super::type_infer::arrow_type_to_type_desc;
 
@@ -233,14 +233,14 @@ impl DescriptorTableBuilder {
                     Some(column.nullable),
                     None::<String>,
                     None::<bool>,
-                    None::<crate::exprs::TExpr>,
+                    None::<crate::thrift::exprs::TExpr>,
                     None::<bool>,
                     None::<i32>,
                     None::<bool>,
                     None::<types::TAggStateDesc>,
                     None::<i32>,
                     type_desc,
-                    None::<crate::exprs::TExpr>,
+                    None::<crate::thrift::exprs::TExpr>,
                 )
             })
             .collect::<Vec<_>>();
@@ -563,7 +563,7 @@ mod tests {
             Some("id".to_string()),
             Some("id".to_string()),
             Some("identity".to_string()),
-            None::<crate::exprs::TExpr>,
+            None::<crate::thrift::exprs::TExpr>,
         )];
 
         builder.add_iceberg_target_table(99, "db", &table, &iceberg, partition_info, None);

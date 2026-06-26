@@ -9,9 +9,9 @@ use std::collections::HashMap;
 
 use arrow::datatypes::DataType;
 
-use crate::data_sinks;
-use crate::exprs;
-use crate::plan_nodes;
+use crate::thrift::data_sinks;
+use crate::thrift::exprs;
+use crate::thrift::plan_nodes;
 
 use crate::sql::catalog::{CatalogProvider, IcebergSchemaDef};
 use crate::sql::codegen::FragmentId;
@@ -864,7 +864,7 @@ fn root_output_tuple_id_for_sink(fragment: &FragmentBuildResult) -> Result<i32, 
 }
 
 fn iceberg_sink_output_exprs_for_tuple(
-    desc_tbl: &crate::descriptors::TDescriptorTable,
+    desc_tbl: &crate::thrift::descriptors::TDescriptorTable,
     tuple_id: i32,
     target_column_count: usize,
 ) -> Result<Vec<exprs::TExpr>, String> {
@@ -972,7 +972,6 @@ mod tests {
         ExpressionLineage, HiddenApplyKeyContract, MvSchemaContract, OutputColumnLineage,
         OutputContract, TargetContract, TargetVisibleColumn,
     };
-    use crate::plan_nodes;
     use crate::sql::analysis::{
         BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, SortItem, TypedExpr,
         WindowBound, WindowFrame, WindowFrameType,
@@ -1005,6 +1004,7 @@ mod tests {
         intern_exprs, intern_project_items, intern_sort_items, intern_window_exprs,
     };
     use crate::sql::planner::plan::WindowExpr;
+    use crate::thrift::plan_nodes;
 
     /// OQ-5 B1: `remap_rf_expr_order` must translate a runtime filter's
     /// pre-demote `op.eq_conditions` index into the post-demote
@@ -3768,7 +3768,7 @@ mod tests {
         );
         assert_eq!(
             build.edges[0].output_partition.type_,
-            crate::partitions::TPartitionType::UNPARTITIONED
+            crate::thrift::partitions::TPartitionType::UNPARTITIONED
         );
     }
 
@@ -3870,11 +3870,11 @@ mod tests {
 
         assert_eq!(
             rf.build_join_mode,
-            Some(crate::runtime_filter::TRuntimeFilterBuildJoinMode::PARTITIONED)
+            Some(crate::thrift::runtime_filter::TRuntimeFilterBuildJoinMode::PARTITIONED)
         );
         assert_eq!(
             rf.layout.as_ref().and_then(|layout| layout.global_layout),
-            Some(crate::runtime_filter::TRuntimeFilterLayoutMode::GLOBAL_SHUFFLE_1L)
+            Some(crate::thrift::runtime_filter::TRuntimeFilterLayoutMode::GLOBAL_SHUFFLE_1L)
         );
     }
 
@@ -3996,11 +3996,11 @@ mod tests {
 
         assert_eq!(
             rf.build_join_mode,
-            Some(crate::runtime_filter::TRuntimeFilterBuildJoinMode::BORADCAST)
+            Some(crate::thrift::runtime_filter::TRuntimeFilterBuildJoinMode::BORADCAST)
         );
         assert_eq!(
             rf.layout.as_ref().and_then(|layout| layout.global_layout),
-            Some(crate::runtime_filter::TRuntimeFilterLayoutMode::SINGLETON)
+            Some(crate::thrift::runtime_filter::TRuntimeFilterLayoutMode::SINGLETON)
         );
     }
 
@@ -4258,7 +4258,7 @@ mod tests {
         );
         assert_eq!(
             edge.output_partition.type_,
-            crate::partitions::TPartitionType::HASH_PARTITIONED
+            crate::thrift::partitions::TPartitionType::HASH_PARTITIONED
         );
         assert_eq!(
             edge.output_partition
@@ -4419,7 +4419,7 @@ mod tests {
         ));
         assert_eq!(
             build.edges[0].output_partition.type_,
-            crate::partitions::TPartitionType::UNPARTITIONED
+            crate::thrift::partitions::TPartitionType::UNPARTITIONED
         );
 
         let root = build
@@ -4637,7 +4637,7 @@ mod tests {
             .expect("synthetic iceberg table descriptor");
         assert_eq!(
             table_desc.table_type,
-            crate::types::TTableType::ICEBERG_TABLE
+            crate::thrift::types::TTableType::ICEBERG_TABLE
         );
         assert_eq!(
             table_desc
@@ -4712,7 +4712,7 @@ mod tests {
             .expect("target iceberg table descriptor");
         assert_eq!(
             target_desc.table_type,
-            crate::types::TTableType::ICEBERG_TABLE
+            crate::thrift::types::TTableType::ICEBERG_TABLE
         );
         let partition_info = target_desc
             .iceberg_table
@@ -4788,7 +4788,7 @@ mod tests {
             .expect("target iceberg table descriptor");
         assert_eq!(
             target_desc.table_type,
-            crate::types::TTableType::ICEBERG_TABLE
+            crate::thrift::types::TTableType::ICEBERG_TABLE
         );
         let partition_info = target_desc
             .iceberg_table
@@ -4952,7 +4952,7 @@ mod tests {
         );
         assert_eq!(
             edge.output_partition.type_,
-            crate::partitions::TPartitionType::HASH_PARTITIONED
+            crate::thrift::partitions::TPartitionType::HASH_PARTITIONED
         );
         let partition_exprs = edge
             .output_partition
@@ -5017,7 +5017,7 @@ mod tests {
             .expect("iceberg table descriptor");
         assert_eq!(
             iceberg_desc.table_type,
-            crate::types::TTableType::ICEBERG_TABLE
+            crate::thrift::types::TTableType::ICEBERG_TABLE
         );
         let starrocks_desc = table_descs
             .iter()
@@ -5025,7 +5025,7 @@ mod tests {
             .expect("StarRocks table descriptor");
         assert_eq!(
             starrocks_desc.table_type,
-            crate::types::TTableType::OLAP_TABLE
+            crate::thrift::types::TTableType::OLAP_TABLE
         );
     }
 
@@ -5115,7 +5115,10 @@ mod tests {
     /// Look up the slot id of a slot by its column name in `desc_tbl`.
     /// Panics if no such slot exists — the caller is asserting that the
     /// builder produced a slot with the expected name.
-    fn slot_id_by_name(desc_tbl: &crate::descriptors::TDescriptorTable, column_name: &str) -> i32 {
+    fn slot_id_by_name(
+        desc_tbl: &crate::thrift::descriptors::TDescriptorTable,
+        column_name: &str,
+    ) -> i32 {
         slot_id_by_name_opt(desc_tbl, column_name)
             .unwrap_or_else(|| panic!("no slot named `{}` in desc_tbl", column_name))
     }
@@ -5124,7 +5127,7 @@ mod tests {
     /// (e.g. Bug B regression: a dict-rewritten scan must NOT emit a
     /// separate source-string slot alongside its dict slot).
     fn slot_id_by_name_opt(
-        desc_tbl: &crate::descriptors::TDescriptorTable,
+        desc_tbl: &crate::thrift::descriptors::TDescriptorTable,
         column_name: &str,
     ) -> Option<i32> {
         let slots = desc_tbl.slot_descriptors.as_ref()?;
@@ -5428,7 +5431,7 @@ mod tests {
                 .and_then(|tys| tys.first())
                 .and_then(|tn| tn.scalar_type.as_ref())
                 .map(|st| st.type_),
-            Some(crate::types::TPrimitiveType::INT),
+            Some(crate::thrift::types::TPrimitiveType::INT),
             "dict slot type must be INT (Int32) — see build_scan_schema_for_global_dict_encoding"
         );
         // The tuple itself should contain exactly the two dict slots.
@@ -5603,7 +5606,7 @@ mod tests {
             .first()
             .and_then(|t| t.id)
             .expect("scan tuple id");
-        let scan_slots: Vec<&crate::descriptors::TSlotDescriptor> = root
+        let scan_slots: Vec<&crate::thrift::descriptors::TSlotDescriptor> = root
             .desc_tbl
             .slot_descriptors
             .as_deref()
@@ -5630,7 +5633,7 @@ mod tests {
                 .and_then(|tys| tys.first())
                 .and_then(|tn| tn.scalar_type.as_ref())
                 .map(|st| st.type_),
-            Some(crate::types::TPrimitiveType::INT),
+            Some(crate::thrift::types::TPrimitiveType::INT),
             "dict slot type must be INT (Int32)"
         );
         let dict_slot_id = dict_slot.id.expect("dict slot id");
@@ -6137,7 +6140,7 @@ mod tests {
                 .and_then(|nodes| nodes.first())
                 .and_then(|node| node.scalar_type.as_ref())
                 .map(|scalar| scalar.type_),
-            Some(crate::types::TPrimitiveType::BIGINT)
+            Some(crate::thrift::types::TPrimitiveType::BIGINT)
         );
 
         let output_exprs = root.output_exprs.as_ref().expect("root output exprs");

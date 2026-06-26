@@ -1006,7 +1006,12 @@ mod tests {
             FetchResult {
                 packet_seq: 0,
                 eos: false,
-                result_batch: crate::data::TResultBatch::new(vec![b"row".to_vec()], false, 0, None),
+                result_batch: crate::thrift::data::TResultBatch::new(
+                    vec![b"row".to_vec()],
+                    false,
+                    0,
+                    None,
+                ),
             },
         );
 

@@ -23,7 +23,7 @@ use arrow::record_batch::RecordBatch;
 use super::{Chunk, ChunkSchema, ChunkSlotSchema};
 use crate::common::ids::SlotId;
 use crate::lower::type_lowering::scalar_type_desc;
-use crate::types::TPrimitiveType;
+use crate::thrift::types::TPrimitiveType;
 
 #[test]
 fn strict_requires_chunk_schema_metadata() {

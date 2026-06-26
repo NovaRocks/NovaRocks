@@ -27,7 +27,7 @@ use thrift::protocol::{
 };
 use thrift::transport::{TBufferedReadTransport, TBufferedWriteTransport, TIoChannel, TTcpChannel};
 
-use crate::types;
+use crate::thrift::types;
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

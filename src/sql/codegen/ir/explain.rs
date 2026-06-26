@@ -2,7 +2,6 @@ use std::{collections::HashMap, fmt::Write};
 
 use arrow::datatypes::DataType;
 
-use crate::partitions;
 use crate::runtime::profile_correlate::{ActualMetrics, DistributedProfileSummary};
 use crate::sql::analysis::{ExprKind, JoinKind, TypedExpr};
 use crate::sql::catalog::{ScanSource, TableDef};
@@ -30,6 +29,7 @@ use crate::sql::planner::plan::{
     ScanVariantColumn,
 };
 use crate::sql::planner::{DistributedPlan, DistributedPlanNode, PlanFragment, PlanNodeStats};
+use crate::thrift::partitions;
 
 pub(crate) fn explain_distributed_plan(dp: &DistributedPlan, level: ExplainLevel) -> Vec<String> {
     explain_distributed_plan_inner(dp, level, None, None)

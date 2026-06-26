@@ -441,10 +441,10 @@ mod tests {
     }
 
     fn write_commit_with_writer_without_files() -> WriteCommitInput {
-        let write_id = crate::types::TUniqueId::new(10, 20);
+        let write_id = crate::thrift::types::TUniqueId::new(10, 20);
         let writer_key = WriterKey {
             query_id: write_id.clone(),
-            fragment_instance_id: crate::types::TUniqueId::new(101, 201),
+            fragment_instance_id: crate::thrift::types::TUniqueId::new(101, 201),
             backend_num: 0,
         };
         WriteCommitInput {

@@ -35,7 +35,7 @@ use crate::service::grpc_client::proto::starrocks::{
     PersistentIndexTypePb, TabletMetadataPb, TabletSchemaPb,
 };
 pub(crate) fn build_sink_tablet_schema(
-    schema: &crate::descriptors::TOlapTableSchemaParam,
+    schema: &crate::thrift::descriptors::TOlapTableSchemaParam,
     schema_id: i64,
     keys_type: KeysType,
 ) -> Result<TabletSchemaPb, String> {
@@ -195,7 +195,7 @@ pub(crate) fn build_sink_tablet_schema(
 }
 
 pub(crate) fn create_lake_tablet_from_req(
-    request: &crate::agent_service::TCreateTabletReq,
+    request: &crate::thrift::agent_service::TCreateTabletReq,
     tablet_root_path: &str,
     s3_config: Option<S3StoreConfig>,
 ) -> Result<(), String> {
@@ -203,7 +203,7 @@ pub(crate) fn create_lake_tablet_from_req(
 }
 
 pub(crate) fn create_lake_tablet_from_req_with_schema_patch<P>(
-    request: &crate::agent_service::TCreateTabletReq,
+    request: &crate::thrift::agent_service::TCreateTabletReq,
     tablet_root_path: &str,
     s3_config: Option<S3StoreConfig>,
     patch: P,
@@ -311,7 +311,7 @@ fn is_missing_tablet_page_in_bundle_error(error: &str) -> bool {
 }
 
 fn build_create_tablet_schema(
-    request: &crate::agent_service::TCreateTabletReq,
+    request: &crate::thrift::agent_service::TCreateTabletReq,
 ) -> Result<TabletSchemaPb, String> {
     let schema = &request.tablet_schema;
     if schema.columns.is_empty() {
@@ -451,7 +451,7 @@ fn build_create_tablet_schema(
     let compression = request
         .compression_type
         .or(schema.compression_type)
-        .unwrap_or(crate::types::TCompressionType::LZ4_FRAME);
+        .unwrap_or(crate::thrift::types::TCompressionType::LZ4_FRAME);
     let compression_type = map_create_tablet_compression_type(compression)? as i32;
     let compression_level = request
         .compression_level
@@ -478,7 +478,7 @@ fn build_create_tablet_schema(
 }
 
 pub(crate) fn build_tablet_schema_pb_from_thrift(
-    schema: &crate::agent_service::TTabletSchema,
+    schema: &crate::thrift::agent_service::TTabletSchema,
 ) -> Result<TabletSchemaPb, String> {
     if schema.columns.is_empty() {
         return Err("schema_change base_tablet_read_schema.columns is empty".to_string());
@@ -613,7 +613,7 @@ pub(crate) fn build_tablet_schema_pb_from_thrift(
         .max(fallback_next_unique_id as i32) as u32;
     let compression = schema
         .compression_type
-        .unwrap_or(crate::types::TCompressionType::LZ4_FRAME);
+        .unwrap_or(crate::thrift::types::TCompressionType::LZ4_FRAME);
     let compression_type = map_create_tablet_compression_type(compression)? as i32;
     let compression_level = schema.compression_level.or(Some(-1));
 
@@ -637,7 +637,7 @@ pub(crate) fn build_tablet_schema_pb_from_thrift(
 }
 
 fn resolve_create_tablet_column_pb(
-    column: &crate::descriptors::TColumn,
+    column: &crate::thrift::descriptors::TColumn,
     column_idx: usize,
 ) -> Result<ColumnPb, String> {
     if let Some(type_desc) = column.type_desc.as_ref() {
@@ -653,7 +653,7 @@ fn resolve_create_tablet_column_pb(
 }
 
 fn build_create_tablet_column_pb_from_column_type(
-    column_type: &crate::types::TColumnType,
+    column_type: &crate::thrift::types::TColumnType,
     column_idx: usize,
 ) -> Result<ColumnPb, String> {
     let sr_type = map_primitive_to_starrocks_type(column_type.type_).ok_or_else(|| {
@@ -688,7 +688,7 @@ fn build_create_tablet_column_pb_from_column_type(
 }
 
 fn build_create_tablet_column_pb_from_type_desc(
-    type_desc: &crate::types::TTypeDesc,
+    type_desc: &crate::thrift::types::TTypeDesc,
     column_idx: usize,
 ) -> Result<ColumnPb, String> {
     let nodes = type_desc.types.as_ref().ok_or_else(|| {
@@ -718,7 +718,7 @@ fn build_create_tablet_column_pb_from_type_desc(
 }
 
 fn type_desc_to_column_pb(
-    nodes: &[crate::types::TTypeNode],
+    nodes: &[crate::thrift::types::TTypeNode],
     cursor: &mut usize,
     column_idx: usize,
     path: &str,
@@ -735,7 +735,7 @@ fn type_desc_to_column_pb(
     })?;
     *cursor += 1;
 
-    if node.type_ == crate::types::TTypeNodeType::SCALAR {
+    if node.type_ == crate::thrift::types::TTypeNodeType::SCALAR {
         let scalar = node.scalar_type.as_ref().ok_or_else(|| {
             format!(
                 "create_tablet column {} scalar node missing scalar_type at path={}",
@@ -758,7 +758,7 @@ fn type_desc_to_column_pb(
         return Ok(());
     }
 
-    if node.type_ == crate::types::TTypeNodeType::ARRAY {
+    if node.type_ == crate::thrift::types::TTypeNodeType::ARRAY {
         column_pb.r#type = "ARRAY".to_string();
         let mut element = init_create_tablet_sub_field_pb();
         type_desc_to_column_pb(
@@ -773,7 +773,7 @@ fn type_desc_to_column_pb(
         return Ok(());
     }
 
-    if node.type_ == crate::types::TTypeNodeType::MAP {
+    if node.type_ == crate::thrift::types::TTypeNodeType::MAP {
         column_pb.r#type = "MAP".to_string();
         let mut key = init_create_tablet_sub_field_pb();
         type_desc_to_column_pb(nodes, cursor, column_idx, &format!("{path}.key"), &mut key)?;
@@ -793,7 +793,7 @@ fn type_desc_to_column_pb(
         return Ok(());
     }
 
-    if node.type_ == crate::types::TTypeNodeType::STRUCT {
+    if node.type_ == crate::thrift::types::TTypeNodeType::STRUCT {
         column_pb.r#type = "STRUCT".to_string();
         let struct_fields = node.struct_fields.as_ref().ok_or_else(|| {
             format!(
@@ -863,11 +863,11 @@ fn init_create_tablet_sub_field_pb() -> ColumnPb {
 }
 
 fn resolve_decimal_type_attrs(
-    primitive: crate::types::TPrimitiveType,
+    primitive: crate::thrift::types::TPrimitiveType,
     precision: Option<i32>,
     scale: Option<i32>,
 ) -> (Option<i32>, Option<i32>) {
-    if primitive == crate::types::TPrimitiveType::DECIMALV2 {
+    if primitive == crate::thrift::types::TPrimitiveType::DECIMALV2 {
         return (
             Some(i32::from(LEGACY_DECIMALV2_PRECISION)),
             Some(i32::from(LEGACY_DECIMALV2_SCALE)),
@@ -894,17 +894,19 @@ fn normalize_column_pb_type_attrs(column: &mut ColumnPb) {
     }
 }
 
-fn map_create_tablet_keys_type(keys_type: crate::types::TKeysType) -> Result<KeysType, String> {
-    if keys_type == crate::types::TKeysType::DUP_KEYS {
+fn map_create_tablet_keys_type(
+    keys_type: crate::thrift::types::TKeysType,
+) -> Result<KeysType, String> {
+    if keys_type == crate::thrift::types::TKeysType::DUP_KEYS {
         return Ok(KeysType::DupKeys);
     }
-    if keys_type == crate::types::TKeysType::UNIQUE_KEYS {
+    if keys_type == crate::thrift::types::TKeysType::UNIQUE_KEYS {
         return Ok(KeysType::UniqueKeys);
     }
-    if keys_type == crate::types::TKeysType::AGG_KEYS {
+    if keys_type == crate::thrift::types::TKeysType::AGG_KEYS {
         return Ok(KeysType::AggKeys);
     }
-    if keys_type == crate::types::TKeysType::PRIMARY_KEYS {
+    if keys_type == crate::thrift::types::TKeysType::PRIMARY_KEYS {
         return Ok(KeysType::PrimaryKeys);
     }
     Err(format!(
@@ -914,38 +916,38 @@ fn map_create_tablet_keys_type(keys_type: crate::types::TKeysType) -> Result<Key
 }
 
 fn map_create_tablet_compression_type(
-    compression_type: crate::types::TCompressionType,
+    compression_type: crate::thrift::types::TCompressionType,
 ) -> Result<CompressionTypePb, String> {
-    if compression_type == crate::types::TCompressionType::DEFAULT_COMPRESSION {
+    if compression_type == crate::thrift::types::TCompressionType::DEFAULT_COMPRESSION {
         return Ok(CompressionTypePb::DefaultCompression);
     }
-    if compression_type == crate::types::TCompressionType::NO_COMPRESSION {
+    if compression_type == crate::thrift::types::TCompressionType::NO_COMPRESSION {
         return Ok(CompressionTypePb::NoCompression);
     }
-    if compression_type == crate::types::TCompressionType::SNAPPY {
+    if compression_type == crate::thrift::types::TCompressionType::SNAPPY {
         return Ok(CompressionTypePb::Snappy);
     }
-    if compression_type == crate::types::TCompressionType::LZ4
-        || compression_type == crate::types::TCompressionType::LZ4_FRAME
+    if compression_type == crate::thrift::types::TCompressionType::LZ4
+        || compression_type == crate::thrift::types::TCompressionType::LZ4_FRAME
     {
         return Ok(CompressionTypePb::Lz4Frame);
     }
-    if compression_type == crate::types::TCompressionType::ZLIB {
+    if compression_type == crate::thrift::types::TCompressionType::ZLIB {
         return Ok(CompressionTypePb::Zlib);
     }
-    if compression_type == crate::types::TCompressionType::ZSTD {
+    if compression_type == crate::thrift::types::TCompressionType::ZSTD {
         return Ok(CompressionTypePb::Zstd);
     }
-    if compression_type == crate::types::TCompressionType::GZIP {
+    if compression_type == crate::thrift::types::TCompressionType::GZIP {
         return Ok(CompressionTypePb::Gzip);
     }
-    if compression_type == crate::types::TCompressionType::DEFLATE {
+    if compression_type == crate::thrift::types::TCompressionType::DEFLATE {
         return Ok(CompressionTypePb::Deflate);
     }
-    if compression_type == crate::types::TCompressionType::BZIP2 {
+    if compression_type == crate::thrift::types::TCompressionType::BZIP2 {
         return Ok(CompressionTypePb::Bzip2);
     }
-    if compression_type == crate::types::TCompressionType::BROTLI {
+    if compression_type == crate::thrift::types::TCompressionType::BROTLI {
         return Ok(CompressionTypePb::Brotli);
     }
     Err(format!(
@@ -955,12 +957,12 @@ fn map_create_tablet_compression_type(
 }
 
 fn map_create_tablet_persistent_index_type(
-    persistent_index_type: crate::agent_service::TPersistentIndexType,
+    persistent_index_type: crate::thrift::agent_service::TPersistentIndexType,
 ) -> Result<PersistentIndexTypePb, String> {
-    if persistent_index_type == crate::agent_service::TPersistentIndexType::LOCAL {
+    if persistent_index_type == crate::thrift::agent_service::TPersistentIndexType::LOCAL {
         return Ok(PersistentIndexTypePb::Local);
     }
-    if persistent_index_type == crate::agent_service::TPersistentIndexType::CLOUD_NATIVE {
+    if persistent_index_type == crate::thrift::agent_service::TPersistentIndexType::CLOUD_NATIVE {
         return Ok(PersistentIndexTypePb::CloudNative);
     }
     Err(format!(
@@ -970,12 +972,12 @@ fn map_create_tablet_persistent_index_type(
 }
 
 fn map_create_tablet_compaction_strategy(
-    compaction_strategy: crate::agent_service::TCompactionStrategy,
+    compaction_strategy: crate::thrift::agent_service::TCompactionStrategy,
 ) -> Result<i32, String> {
-    if compaction_strategy == crate::agent_service::TCompactionStrategy::DEFAULT {
+    if compaction_strategy == crate::thrift::agent_service::TCompactionStrategy::DEFAULT {
         return Ok(CompactionStrategyPb::Default as i32);
     }
-    if compaction_strategy == crate::agent_service::TCompactionStrategy::REAL_TIME {
+    if compaction_strategy == crate::thrift::agent_service::TCompactionStrategy::REAL_TIME {
         return Ok(CompactionStrategyPb::RealTime as i32);
     }
     Err(format!(
@@ -985,8 +987,8 @@ fn map_create_tablet_compaction_strategy(
 }
 
 fn build_slot_descs_by_name(
-    schema: &crate::descriptors::TOlapTableSchemaParam,
-) -> Result<HashMap<String, &crate::descriptors::TSlotDescriptor>, String> {
+    schema: &crate::thrift::descriptors::TOlapTableSchemaParam,
+) -> Result<HashMap<String, &crate::thrift::descriptors::TSlotDescriptor>, String> {
     let mut map = HashMap::new();
     for (idx, slot) in schema.slot_descs.iter().enumerate() {
         let name = slot
@@ -1007,10 +1009,10 @@ fn build_slot_descs_by_name(
 }
 
 fn resolve_sink_unique_id(
-    column: &crate::descriptors::TColumn,
+    column: &crate::thrift::descriptors::TColumn,
     column_name: &str,
     column_idx: usize,
-    slot_descs_by_name: &HashMap<String, &crate::descriptors::TSlotDescriptor>,
+    slot_descs_by_name: &HashMap<String, &crate::thrift::descriptors::TSlotDescriptor>,
 ) -> i32 {
     column
         .col_unique_id
@@ -1025,11 +1027,11 @@ fn resolve_sink_unique_id(
 }
 
 fn resolve_sink_column_pb(
-    column: &crate::descriptors::TColumn,
+    column: &crate::thrift::descriptors::TColumn,
     column_name: &str,
     column_idx: usize,
     schema_id: i64,
-    slot_descs_by_name: &HashMap<String, &crate::descriptors::TSlotDescriptor>,
+    slot_descs_by_name: &HashMap<String, &crate::thrift::descriptors::TSlotDescriptor>,
 ) -> Result<ColumnPb, String> {
     if let Some(column_type) = column.column_type.as_ref() {
         return build_create_tablet_column_pb_from_column_type(column_type, column_idx).map_err(
@@ -1076,7 +1078,7 @@ fn resolve_sink_column_pb(
 }
 
 fn map_aggregation_type_to_schema_string(
-    aggregation_type: Option<crate::types::TAggregationType>,
+    aggregation_type: Option<crate::thrift::types::TAggregationType>,
     is_key: bool,
     keys_type: KeysType,
     column_idx: usize,
@@ -1094,16 +1096,16 @@ fn map_aggregation_type_to_schema_string(
         )
     })?;
     let name = match agg {
-        crate::types::TAggregationType::SUM => "SUM",
-        crate::types::TAggregationType::MAX => "MAX",
-        crate::types::TAggregationType::MIN => "MIN",
-        crate::types::TAggregationType::REPLACE => "REPLACE",
-        crate::types::TAggregationType::HLL_UNION => "HLL_UNION",
-        crate::types::TAggregationType::NONE => "NONE",
-        crate::types::TAggregationType::BITMAP_UNION => "BITMAP_UNION",
-        crate::types::TAggregationType::REPLACE_IF_NOT_NULL => "REPLACE_IF_NOT_NULL",
-        crate::types::TAggregationType::PERCENTILE_UNION => "PERCENTILE_UNION",
-        crate::types::TAggregationType::AGG_STATE_UNION => "AGG_STATE_UNION",
+        crate::thrift::types::TAggregationType::SUM => "SUM",
+        crate::thrift::types::TAggregationType::MAX => "MAX",
+        crate::thrift::types::TAggregationType::MIN => "MIN",
+        crate::thrift::types::TAggregationType::REPLACE => "REPLACE",
+        crate::thrift::types::TAggregationType::HLL_UNION => "HLL_UNION",
+        crate::thrift::types::TAggregationType::NONE => "NONE",
+        crate::thrift::types::TAggregationType::BITMAP_UNION => "BITMAP_UNION",
+        crate::thrift::types::TAggregationType::REPLACE_IF_NOT_NULL => "REPLACE_IF_NOT_NULL",
+        crate::thrift::types::TAggregationType::PERCENTILE_UNION => "PERCENTILE_UNION",
+        crate::thrift::types::TAggregationType::AGG_STATE_UNION => "AGG_STATE_UNION",
         other => {
             return Err(format!(
                 "unsupported aggregation_type for value column in schema.indexes column index {}: {:?}",
@@ -1115,58 +1117,59 @@ fn map_aggregation_type_to_schema_string(
 }
 
 fn map_primitive_to_starrocks_type(
-    primitive: crate::types::TPrimitiveType,
+    primitive: crate::thrift::types::TPrimitiveType,
 ) -> Option<&'static str> {
     let t = primitive;
-    Some(if t == crate::types::TPrimitiveType::BOOLEAN {
+    Some(if t == crate::thrift::types::TPrimitiveType::BOOLEAN {
         "BOOLEAN"
-    } else if t == crate::types::TPrimitiveType::TINYINT {
+    } else if t == crate::thrift::types::TPrimitiveType::TINYINT {
         "TINYINT"
-    } else if t == crate::types::TPrimitiveType::SMALLINT {
+    } else if t == crate::thrift::types::TPrimitiveType::SMALLINT {
         "SMALLINT"
-    } else if t == crate::types::TPrimitiveType::INT {
+    } else if t == crate::thrift::types::TPrimitiveType::INT {
         "INT"
-    } else if t == crate::types::TPrimitiveType::BIGINT {
+    } else if t == crate::thrift::types::TPrimitiveType::BIGINT {
         "BIGINT"
-    } else if t == crate::types::TPrimitiveType::LARGEINT {
+    } else if t == crate::thrift::types::TPrimitiveType::LARGEINT {
         "LARGEINT"
-    } else if t == crate::types::TPrimitiveType::FLOAT {
+    } else if t == crate::thrift::types::TPrimitiveType::FLOAT {
         "FLOAT"
-    } else if t == crate::types::TPrimitiveType::DOUBLE {
+    } else if t == crate::thrift::types::TPrimitiveType::DOUBLE {
         "DOUBLE"
-    } else if t == crate::types::TPrimitiveType::DATE {
+    } else if t == crate::thrift::types::TPrimitiveType::DATE {
         "DATE"
-    } else if t == crate::types::TPrimitiveType::DATETIME || t == crate::types::TPrimitiveType::TIME
+    } else if t == crate::thrift::types::TPrimitiveType::DATETIME
+        || t == crate::thrift::types::TPrimitiveType::TIME
     {
         "DATETIME"
-    } else if t == crate::types::TPrimitiveType::CHAR {
+    } else if t == crate::thrift::types::TPrimitiveType::CHAR {
         "CHAR"
-    } else if t == crate::types::TPrimitiveType::VARCHAR {
+    } else if t == crate::thrift::types::TPrimitiveType::VARCHAR {
         "VARCHAR"
-    } else if t == crate::types::TPrimitiveType::HLL {
+    } else if t == crate::thrift::types::TPrimitiveType::HLL {
         "HLL"
-    } else if t == crate::types::TPrimitiveType::OBJECT {
+    } else if t == crate::thrift::types::TPrimitiveType::OBJECT {
         "OBJECT"
-    } else if t == crate::types::TPrimitiveType::PERCENTILE {
+    } else if t == crate::thrift::types::TPrimitiveType::PERCENTILE {
         "PERCENTILE"
-    } else if t == crate::types::TPrimitiveType::BINARY {
+    } else if t == crate::thrift::types::TPrimitiveType::BINARY {
         "BINARY"
-    } else if t == crate::types::TPrimitiveType::VARBINARY {
+    } else if t == crate::thrift::types::TPrimitiveType::VARBINARY {
         "VARBINARY"
-    } else if t == crate::types::TPrimitiveType::DECIMAL
-        || t == crate::types::TPrimitiveType::DECIMALV2
+    } else if t == crate::thrift::types::TPrimitiveType::DECIMAL
+        || t == crate::thrift::types::TPrimitiveType::DECIMALV2
     {
         // Native writer path is DecimalV3-based; map legacy decimal primitives to Decimal128.
         "DECIMAL128"
-    } else if t == crate::types::TPrimitiveType::DECIMAL32 {
+    } else if t == crate::thrift::types::TPrimitiveType::DECIMAL32 {
         "DECIMAL32"
-    } else if t == crate::types::TPrimitiveType::DECIMAL64 {
+    } else if t == crate::thrift::types::TPrimitiveType::DECIMAL64 {
         "DECIMAL64"
-    } else if t == crate::types::TPrimitiveType::DECIMAL128 {
+    } else if t == crate::thrift::types::TPrimitiveType::DECIMAL128 {
         "DECIMAL128"
-    } else if t == crate::types::TPrimitiveType::DECIMAL256 {
+    } else if t == crate::thrift::types::TPrimitiveType::DECIMAL256 {
         "DECIMAL256"
-    } else if t == crate::types::TPrimitiveType::JSON {
+    } else if t == crate::thrift::types::TPrimitiveType::JSON {
         "JSON"
     } else {
         return None;
@@ -1179,7 +1182,7 @@ fn map_primitive_to_starrocks_type(
 ///
 /// Returns None if the expression cannot be evaluated as a constant literal
 /// (e.g., unsupported node type, malformed expression).
-fn convert_define_expr_to_json(expr: &crate::exprs::TExpr) -> Option<String> {
+fn convert_define_expr_to_json(expr: &crate::thrift::exprs::TExpr) -> Option<String> {
     if expr.nodes.is_empty() {
         return None;
     }
@@ -1194,7 +1197,7 @@ fn convert_define_expr_to_json(expr: &crate::exprs::TExpr) -> Option<String> {
 }
 
 /// Extract struct field names from a TTypeDesc, if it describes a STRUCT type.
-fn extract_struct_field_names(type_desc: &crate::types::TTypeDesc) -> Option<Vec<String>> {
+fn extract_struct_field_names(type_desc: &crate::thrift::types::TTypeDesc) -> Option<Vec<String>> {
     let nodes = type_desc.types.as_ref()?;
     for type_node in nodes {
         if let Some(fields) = &type_node.struct_fields {
@@ -1214,7 +1217,7 @@ fn extract_struct_field_names(type_desc: &crate::types::TTypeDesc) -> Option<Vec
 /// `struct_fields_hint`: when Some, the caller knows the expected struct field names
 /// (used for positional `row(v1, v2, ...)` calls where field names aren't in the expr).
 fn eval_texpr_node(
-    nodes: &[crate::exprs::TExprNode],
+    nodes: &[crate::thrift::exprs::TExprNode],
     idx: &mut usize,
     struct_fields_hint: Option<Vec<String>>,
 ) -> Result<serde_json::Value, String> {
@@ -1230,7 +1233,7 @@ fn eval_texpr_node(
     let num_children = node.num_children as usize;
     let nt = node.node_type;
 
-    use crate::exprs::TExprNodeType;
+    use crate::thrift::exprs::TExprNodeType;
     if nt == TExprNodeType::INT_LITERAL {
         let v = node
             .int_literal
@@ -1417,7 +1420,7 @@ mod tests {
     #[test]
     fn create_tablet_map_supports_largeint() {
         assert_eq!(
-            map_primitive_to_starrocks_type(crate::types::TPrimitiveType::LARGEINT),
+            map_primitive_to_starrocks_type(crate::thrift::types::TPrimitiveType::LARGEINT),
             Some("LARGEINT")
         );
     }
@@ -1425,7 +1428,7 @@ mod tests {
     #[test]
     fn create_tablet_map_supports_hll() {
         assert_eq!(
-            map_primitive_to_starrocks_type(crate::types::TPrimitiveType::HLL),
+            map_primitive_to_starrocks_type(crate::thrift::types::TPrimitiveType::HLL),
             Some("HLL")
         );
     }
@@ -1433,7 +1436,7 @@ mod tests {
     #[test]
     fn create_tablet_map_supports_object() {
         assert_eq!(
-            map_primitive_to_starrocks_type(crate::types::TPrimitiveType::OBJECT),
+            map_primitive_to_starrocks_type(crate::thrift::types::TPrimitiveType::OBJECT),
             Some("OBJECT")
         );
     }
@@ -1441,7 +1444,7 @@ mod tests {
     #[test]
     fn create_tablet_map_supports_percentile() {
         assert_eq!(
-            map_primitive_to_starrocks_type(crate::types::TPrimitiveType::PERCENTILE),
+            map_primitive_to_starrocks_type(crate::thrift::types::TPrimitiveType::PERCENTILE),
             Some("PERCENTILE")
         );
     }
@@ -1449,7 +1452,7 @@ mod tests {
     #[test]
     fn create_tablet_map_supports_decimal256() {
         assert_eq!(
-            map_primitive_to_starrocks_type(crate::types::TPrimitiveType::DECIMAL256),
+            map_primitive_to_starrocks_type(crate::thrift::types::TPrimitiveType::DECIMAL256),
             Some("DECIMAL256")
         );
     }
@@ -1639,8 +1642,8 @@ mod tests {
     #[test]
     fn create_tablet_column_pb_normalizes_decimalv2_column_type() {
         let column_pb = build_create_tablet_column_pb_from_column_type(
-            &crate::types::TColumnType {
-                type_: crate::types::TPrimitiveType::DECIMALV2,
+            &crate::thrift::types::TColumnType {
+                type_: crate::thrift::types::TPrimitiveType::DECIMALV2,
                 len: None,
                 index_len: None,
                 precision: Some(9),
@@ -1657,18 +1660,18 @@ mod tests {
 
     #[test]
     fn create_tablet_column_pb_normalizes_nested_decimalv2_type_desc() {
-        let type_desc = crate::types::TTypeDesc {
+        let type_desc = crate::thrift::types::TTypeDesc {
             types: Some(vec![
-                crate::types::TTypeNode {
-                    type_: crate::types::TTypeNodeType::ARRAY,
+                crate::thrift::types::TTypeNode {
+                    type_: crate::thrift::types::TTypeNodeType::ARRAY,
                     scalar_type: None,
                     is_named: None,
                     struct_fields: None,
                 },
-                crate::types::TTypeNode {
-                    type_: crate::types::TTypeNodeType::SCALAR,
-                    scalar_type: Some(crate::types::TScalarType {
-                        type_: crate::types::TPrimitiveType::DECIMALV2,
+                crate::thrift::types::TTypeNode {
+                    type_: crate::thrift::types::TTypeNodeType::SCALAR,
+                    scalar_type: Some(crate::thrift::types::TScalarType {
+                        type_: crate::thrift::types::TPrimitiveType::DECIMALV2,
                         len: None,
                         precision: Some(9),
                         scale: Some(0),
@@ -1693,11 +1696,11 @@ mod tests {
     fn build_test_create_tablet_req(
         tablet_id: i64,
         enable_tablet_creation_optimization: bool,
-    ) -> crate::agent_service::TCreateTabletReq {
-        let column = crate::descriptors::TColumn {
+    ) -> crate::thrift::agent_service::TCreateTabletReq {
+        let column = crate::thrift::descriptors::TColumn {
             column_name: "c1".to_string(),
-            column_type: Some(crate::types::TColumnType {
-                type_: crate::types::TPrimitiveType::BIGINT,
+            column_type: Some(crate::thrift::types::TColumnType {
+                type_: crate::thrift::types::TPrimitiveType::BIGINT,
                 len: Some(8),
                 index_len: Some(8),
                 precision: None,
@@ -1717,11 +1720,11 @@ mod tests {
             index_len: Some(8),
             type_desc: None,
         };
-        let schema = crate::agent_service::TTabletSchema {
+        let schema = crate::thrift::agent_service::TTabletSchema {
             short_key_column_count: 1,
             schema_hash: 1001,
-            keys_type: crate::types::TKeysType::DUP_KEYS,
-            storage_type: crate::types::TStorageType::COLUMN,
+            keys_type: crate::thrift::types::TKeysType::DUP_KEYS,
+            storage_type: crate::thrift::types::TStorageType::COLUMN,
             columns: vec![column],
             bloom_filter_fpp: None,
             indexes: None,
@@ -1730,10 +1733,10 @@ mod tests {
             sort_key_idxes: None,
             sort_key_unique_ids: None,
             schema_version: Some(0),
-            compression_type: Some(crate::types::TCompressionType::LZ4_FRAME),
+            compression_type: Some(crate::thrift::types::TCompressionType::LZ4_FRAME),
             compression_level: None,
         };
-        crate::agent_service::TCreateTabletReq {
+        crate::thrift::agent_service::TCreateTabletReq {
             tablet_id,
             tablet_schema: schema,
             version: None,
@@ -1749,7 +1752,7 @@ mod tests {
             storage_format: None,
             tablet_type: None,
             enable_persistent_index: Some(false),
-            compression_type: Some(crate::types::TCompressionType::LZ4_FRAME),
+            compression_type: Some(crate::thrift::types::TCompressionType::LZ4_FRAME),
             binlog_config: None,
             persistent_index_type: None,
             primary_index_cache_expire_sec: None,
@@ -1766,11 +1769,11 @@ mod tests {
     fn build_test_sink_schema(
         column_unique_id: Option<i32>,
         slot_unique_id: Option<i32>,
-    ) -> crate::descriptors::TOlapTableSchemaParam {
-        let column = crate::descriptors::TColumn {
+    ) -> crate::thrift::descriptors::TOlapTableSchemaParam {
+        let column = crate::thrift::descriptors::TColumn {
             column_name: "c1".to_string(),
-            column_type: Some(crate::types::TColumnType {
-                type_: crate::types::TPrimitiveType::BIGINT,
+            column_type: Some(crate::thrift::types::TColumnType {
+                type_: crate::thrift::types::TPrimitiveType::BIGINT,
                 len: Some(8),
                 index_len: Some(8),
                 precision: None,
@@ -1790,18 +1793,18 @@ mod tests {
             index_len: Some(8),
             type_desc: None,
         };
-        crate::descriptors::TOlapTableSchemaParam {
+        crate::thrift::descriptors::TOlapTableSchemaParam {
             db_id: 1,
             table_id: 2,
             version: 1,
-            slot_descs: vec![crate::descriptors::TSlotDescriptor {
+            slot_descs: vec![crate::thrift::descriptors::TSlotDescriptor {
                 id: Some(1),
                 parent: None,
-                slot_type: Some(crate::types::TTypeDesc {
-                    types: Some(vec![crate::types::TTypeNode {
-                        type_: crate::types::TTypeNodeType::SCALAR,
-                        scalar_type: Some(crate::types::TScalarType {
-                            type_: crate::types::TPrimitiveType::BIGINT,
+                slot_type: Some(crate::thrift::types::TTypeDesc {
+                    types: Some(vec![crate::thrift::types::TTypeNode {
+                        type_: crate::thrift::types::TTypeNodeType::SCALAR,
+                        scalar_type: Some(crate::thrift::types::TScalarType {
+                            type_: crate::thrift::types::TPrimitiveType::BIGINT,
                             len: None,
                             precision: None,
                             scale: None,
@@ -1824,18 +1827,18 @@ mod tests {
                 col_physical_name: None,
                 is_virtual_column: None,
             }],
-            tuple_desc: crate::descriptors::TTupleDescriptor {
+            tuple_desc: crate::thrift::descriptors::TTupleDescriptor {
                 id: Some(1),
                 byte_size: Some(8),
                 num_null_bytes: Some(0),
                 table_id: Some(2),
                 num_null_slots: Some(0),
             },
-            indexes: vec![crate::descriptors::TOlapTableIndexSchema {
+            indexes: vec![crate::thrift::descriptors::TOlapTableIndexSchema {
                 id: 10,
                 columns: vec!["c1".to_string()],
                 schema_hash: 1,
-                column_param: Some(crate::descriptors::TOlapTableColumnParam {
+                column_param: Some(crate::thrift::descriptors::TOlapTableColumnParam {
                     columns: vec![column],
                     sort_key_uid: Vec::new(),
                     short_key_column_count: 1,

@@ -16,6 +16,7 @@
 // under the License.
 
 namespace java com.starrocks.thrift
+namespace rs thrift
 
 enum TExprOpcode {
     INVALID_OPCODE,

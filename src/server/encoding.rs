@@ -544,7 +544,7 @@ mod tests {
     use super::*;
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
-    use crate::types;
+    use crate::thrift::types;
 
     fn array_json_type_desc() -> types::TTypeDesc {
         types::TTypeDesc::new(vec![

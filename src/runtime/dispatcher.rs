@@ -39,19 +39,19 @@ use thrift::transport::{TBufferChannel, TIoChannel};
 
 #[cfg(test)]
 use crate::common::ids::SlotId;
-#[cfg(test)]
-use crate::data_sinks;
 use crate::exec::chunk::Chunk;
 #[cfg(test)]
 use crate::exec::chunk::ChunkSchema;
 use crate::exec::chunk::ChunkSchemaRef;
-use crate::internal_service;
 use crate::service::grpc_client::NovaRocksGrpcRemoteClient;
 use crate::service::grpc_proto::novarocks::{
     CancelFragmentRequest, FetchResultRequest, PUniqueId, SubmitFragmentRequest,
     fetch_result_response::Status as FetchStatus,
 };
-use crate::types;
+#[cfg(test)]
+use crate::thrift::data_sinks;
+use crate::thrift::internal_service;
+use crate::thrift::types;
 use tracing::warn;
 
 static REMOTE_SUBMIT_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -424,7 +424,7 @@ mod tests {
 
     /// Build a minimal TExecPlanFragmentParams with a non-result (NOOP) sink.
     fn make_noop_sink_params(hi: i64, lo: i64) -> internal_service::TExecPlanFragmentParams {
-        use crate::partitions;
+        use crate::thrift::partitions;
         let noop_sink = data_sinks::TDataSink::new(
             data_sinks::TDataSinkType::NOOP_SINK,
             None::<data_sinks::TDataStreamSink>,
@@ -443,28 +443,28 @@ mod tests {
             None::<i64>,
             None::<data_sinks::TSplitDataStreamSink>,
         );
-        let fragment = crate::planner::TPlanFragment::new(
-            None::<crate::plan_nodes::TPlan>,
-            None::<Vec<crate::exprs::TExpr>>,
+        let fragment = crate::thrift::planner::TPlanFragment::new(
+            None::<crate::thrift::plan_nodes::TPlan>,
+            None::<Vec<crate::thrift::exprs::TExpr>>,
             Some(noop_sink),
             partitions::TDataPartition::new(
                 partitions::TPartitionType::UNPARTITIONED,
-                None::<Vec<crate::exprs::TExpr>>,
+                None::<Vec<crate::thrift::exprs::TExpr>>,
                 None::<Vec<partitions::TRangePartition>>,
                 None::<Vec<partitions::TBucketProperty>>,
             ),
             None::<i64>,
             None::<i64>,
-            None::<Vec<crate::data::TGlobalDict>>,
-            None::<Vec<crate::data::TGlobalDict>>,
-            None::<crate::planner::TCacheParam>,
-            None::<std::collections::BTreeMap<i32, crate::exprs::TExpr>>,
-            None::<crate::planner::TGroupExecutionParam>,
+            None::<Vec<crate::thrift::data::TGlobalDict>>,
+            None::<Vec<crate::thrift::data::TGlobalDict>>,
+            None::<crate::thrift::planner::TCacheParam>,
+            None::<std::collections::BTreeMap<i32, crate::thrift::exprs::TExpr>>,
+            None::<crate::thrift::planner::TGroupExecutionParam>,
         );
         internal_service::TExecPlanFragmentParams::new(
             internal_service::InternalServiceVersion::V1,
             Some(fragment),
-            None::<crate::descriptors::TDescriptorTable>,
+            None::<crate::thrift::descriptors::TDescriptorTable>,
             Some(make_empty_exec_params(hi, lo)),
             None::<types::TNetworkAddress>,
             None::<i32>,
@@ -479,7 +479,7 @@ mod tests {
             None::<bool>,
             None::<i32>,
             None::<std::collections::BTreeMap<types::TPlanNodeId, i32>>,
-            None::<crate::work_group::TWorkGroup>,
+            None::<crate::thrift::work_group::TWorkGroup>,
             None::<bool>,
             None::<i32>,
             None::<bool>,

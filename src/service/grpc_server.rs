@@ -511,7 +511,7 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
     ) -> Result<tonic::Response<proto::novarocks::ReportExecStatusResponse>, tonic::Status> {
         let bytes = request.into_inner().report_exec_status_params_thrift;
         let result = tokio::task::spawn_blocking(move || {
-            let params: crate::frontend_service::TReportExecStatusParams =
+            let params: crate::thrift::frontend_service::TReportExecStatusParams =
                 crate::common::thrift::thrift_binary_deserialize(&bytes).map_err(|e| {
                     EngineError::protocol_decode(format!(
                         "failed to deserialize TReportExecStatusParams thrift: {e}"
@@ -551,7 +551,7 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         let payloads = request.into_inner().report_exec_status_params_thrift;
         let result = tokio::task::spawn_blocking(move || {
             for bytes in payloads {
-                let params: crate::frontend_service::TReportExecStatusParams =
+                let params: crate::thrift::frontend_service::TReportExecStatusParams =
                     crate::common::thrift::thrift_binary_deserialize(&bytes).map_err(|e| {
                         EngineError::protocol_decode(format!(
                             "failed to deserialize TReportExecStatusParams thrift: {e}"
@@ -593,7 +593,7 @@ fn emit_grpc_typed_fetch_marker(status: i32) {
 }
 
 fn handle_standalone_report_exec_status(
-    params: crate::frontend_service::TReportExecStatusParams,
+    params: crate::thrift::frontend_service::TReportExecStatusParams,
 ) -> Result<(), EngineError> {
     let failure = failed_query_from_report(&params).map_err(EngineError::protocol_decode)?;
     let profile_report_accepted =
@@ -644,12 +644,12 @@ struct FailedQueryReport {
 }
 
 fn failed_query_from_report(
-    params: &crate::frontend_service::TReportExecStatusParams,
+    params: &crate::thrift::frontend_service::TReportExecStatusParams,
 ) -> Result<Option<FailedQueryReport>, String> {
     let Some(status) = params.status.as_ref() else {
         return Ok(None);
     };
-    if status.status_code == crate::status_code::TStatusCode::OK {
+    if status.status_code == crate::thrift::status_code::TStatusCode::OK {
         return Ok(None);
     }
     let query = params
@@ -1394,7 +1394,7 @@ mod pr3_tests {
         ReportExecStatusRequest, SubmitFragmentRequest,
     };
     use crate::common::thrift::thrift_binary_serialize;
-    use crate::{frontend_service, status, status_code, types};
+    use crate::thrift::{frontend_service, status, status_code, types};
     use tonic::Request;
 
     fn ok_report_params(
@@ -1923,7 +1923,7 @@ mod pr3_tests {
                 FetchResult {
                     packet_seq: 0,
                     eos: false,
-                    result_batch: crate::data::TResultBatch::new(
+                    result_batch: crate::thrift::data::TResultBatch::new(
                         vec![b"hello".to_vec()],
                         false,
                         0,

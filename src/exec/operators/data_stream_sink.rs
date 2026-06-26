@@ -37,7 +37,7 @@ use crate::lower::layout::Layout;
 use crate::runtime::exchange;
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use crate::service::exchange_sender::{ExchangeSendTask, ExchangeSendTracker, exchange_send_queue};
-use crate::{data_sinks, internal_service, partitions, types};
+use crate::thrift::{data_sinks, internal_service, partitions, types};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
@@ -1397,7 +1397,7 @@ impl DataStreamSinkOperator {
             profile.common.add_info_string("PartType", part_type);
             profile.common.counter_add(
                 "ChannelNum",
-                crate::metrics::TUnit::UNIT,
+                crate::thrift::metrics::TUnit::UNIT,
                 clamp_u128_to_i64(channel_num),
             );
         }
@@ -1661,12 +1661,12 @@ impl DataStreamSinkOperator {
         if let Some(profile) = self.profiles.as_ref() {
             profile.common.counter_add(
                 "SerializeChunkTime",
-                crate::metrics::TUnit::TIME_NS,
+                crate::thrift::metrics::TUnit::TIME_NS,
                 clamp_u128_to_i64(encode_ns),
             );
             profile.common.counter_add(
                 "SerializedBytes",
-                crate::metrics::TUnit::BYTES,
+                crate::thrift::metrics::TUnit::BYTES,
                 clamp_u128_to_i64(payload_bytes as u128),
             );
         }
@@ -2111,7 +2111,7 @@ mod tests {
                 1,
                 partitions::TDataPartition::new(
                     partitions::TPartitionType::UNPARTITIONED,
-                    None::<Vec<crate::exprs::TExpr>>,
+                    None::<Vec<crate::thrift::exprs::TExpr>>,
                     None::<Vec<partitions::TRangePartition>>,
                     None::<Vec<partitions::TBucketProperty>>,
                 ),

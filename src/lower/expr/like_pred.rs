@@ -17,7 +17,7 @@
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, function::FunctionKind};
 use arrow::datatypes::DataType;
 
-use crate::exprs;
+use crate::thrift::exprs;
 
 /// Lower LIKE_PRED expression to ExprNode::FunctionCall(FunctionKind::Like).
 pub(crate) fn lower_like_pred(

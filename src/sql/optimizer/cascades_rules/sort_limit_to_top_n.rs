@@ -55,11 +55,7 @@ impl Rule for SortLimitToTopN {
                 continue;
             }
             let grandchild_group_id = child_mexpr.children[0];
-            results.extend(rewrite_one_sort(
-                limit_op,
-                sort_op,
-                grandchild_group_id,
-            ));
+            results.extend(rewrite_one_sort(limit_op, sort_op, grandchild_group_id));
         }
         results
     }

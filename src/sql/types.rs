@@ -363,7 +363,10 @@ mod tests {
     #[test]
     fn comparison_common_type_numeric_and_decimal() {
         // equal -> None (no cast needed)
-        assert_eq!(comparison_common_type(&DataType::Int32, &DataType::Int32), None);
+        assert_eq!(
+            comparison_common_type(&DataType::Int32, &DataType::Int32),
+            None
+        );
         // int width mismatch -> both Int64 (aligned with normalize_comparison_types,
         // NOT wider_type's Int16/Int8 behavior)
         assert_eq!(
@@ -394,8 +397,14 @@ mod tests {
             None
         );
         // non-numeric (string / cross-family) -> None (out of scope here)
-        assert_eq!(comparison_common_type(&DataType::Utf8, &DataType::Int32), None);
-        assert_eq!(comparison_common_type(&DataType::Utf8, &DataType::Utf8), None);
+        assert_eq!(
+            comparison_common_type(&DataType::Utf8, &DataType::Int32),
+            None
+        );
+        assert_eq!(
+            comparison_common_type(&DataType::Utf8, &DataType::Utf8),
+            None
+        );
     }
 
     #[test]

@@ -16,12 +16,12 @@
 // under the License.
 use crate::exec::expr::LiteralValue;
 use crate::lower::type_lowering::{arrow_type_from_desc, primitive_type_from_node};
-use crate::types;
+use crate::thrift::types;
 use arrow::datatypes::DataType;
 use arrow_buffer::i256;
 use chrono::{Datelike, NaiveDate, NaiveDateTime};
 
-use crate::exprs;
+use crate::thrift::exprs;
 
 /// Parse date literal string to days since epoch.
 pub(crate) fn parse_date_literal(value: &str) -> Result<i32, String> {

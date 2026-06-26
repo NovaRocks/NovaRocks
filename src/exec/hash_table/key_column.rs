@@ -1167,7 +1167,7 @@ mod tests {
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
     use crate::lower::type_lowering::scalar_type_desc;
-    use crate::types::TPrimitiveType;
+    use crate::thrift::types::TPrimitiveType;
     use std::sync::Arc;
 
     #[test]

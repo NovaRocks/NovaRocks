@@ -25,7 +25,7 @@ pub(crate) fn run_insert(
     overwrite_mode: OverwriteMode,
     current_catalog: Option<&str>,
     current_database: &str,
-    query_opts: Option<&crate::internal_service::TQueryOptions>,
+    query_opts: Option<&crate::thrift::internal_service::TQueryOptions>,
 ) -> Result<StatementResult, String> {
     let is_overwrite = matches!(
         overwrite_mode,
@@ -196,7 +196,7 @@ pub(crate) fn execute_insert_from_query_on_pipeline(
     resolved: &ResolvedTable,
     insert_columns: &[String],
     query: &sqlparser::ast::Query,
-    query_opts: Option<&crate::internal_service::TQueryOptions>,
+    query_opts: Option<&crate::thrift::internal_service::TQueryOptions>,
 ) -> Result<RecordBatch, String> {
     let query_result = crate::engine::execute_query_with_catalog_mgr(
         state,

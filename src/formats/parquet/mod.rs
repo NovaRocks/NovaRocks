@@ -57,10 +57,10 @@ use crate::fs::coalesce_policy::AdaptiveCoalesceController;
 use crate::fs::opendal::OpendalRangeReaderFactory;
 use crate::fs::range_plan::PlannedIoRanges;
 use crate::fs::scan_context::FileScanRange;
-use crate::metrics;
 use crate::novarocks_logging::debug;
 use crate::runtime::profile::{RuntimeProfile, clamp_u128_to_i64};
-use crate::types;
+use crate::thrift::metrics;
+use crate::thrift::types;
 use page_selection::build_row_selection_for_row_groups;
 pub(crate) use reader::ParquetCachedReader;
 use row_group_selector::select_row_groups_for_range;
@@ -2197,7 +2197,7 @@ mod tests {
     use crate::exec::chunk::ChunkSchema;
     use crate::fs::opendal::{OpendalRangeReaderFactory, build_fs_operator};
     use crate::fs::scan_context::{FileScanContext, FileScanRange};
-    use crate::types;
+    use crate::thrift::types;
 
     use super::{
         MinMaxPredicate, MinMaxPredicateValue, ParquetReadCachePolicy, ParquetScanConfig,

@@ -17,8 +17,8 @@
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, function::FunctionKind};
 use arrow::datatypes::DataType;
 
-use crate::exprs;
-use crate::opcodes;
+use crate::thrift::exprs;
+use crate::thrift::opcodes;
 
 /// Lower ARITHMETIC_EXPR expression to arithmetic ExprNode.
 pub(crate) fn lower_arithmetic(
@@ -104,11 +104,11 @@ mod tests {
     use crate::common::ids::SlotId;
     use crate::exec::chunk::Chunk;
     use crate::exec::expr::{ExprArena, LiteralValue};
-    use crate::exprs::{TExpr, TExprNode, TExprNodeType, TIntLiteral};
     use crate::lower::expr::lower_t_expr;
     use crate::lower::layout::Layout;
-    use crate::opcodes::TExprOpcode;
-    use crate::types::{TTypeDesc, TTypeNode, TTypeNodeType};
+    use crate::thrift::exprs::{TExpr, TExprNode, TExprNodeType, TIntLiteral};
+    use crate::thrift::opcodes::TExprOpcode;
+    use crate::thrift::types::{TTypeDesc, TTypeNode, TTypeNodeType};
     use arrow::array::{
         Array, ArrayRef, Float64Array, Int64Array, RecordBatch, RecordBatchOptions,
     };
@@ -270,7 +270,7 @@ mod tests {
             node_type: TExprNodeType::SLOT_REF,
             type_: create_dummy_type(),
             num_children: 0,
-            slot_ref: Some(crate::exprs::TSlotRef {
+            slot_ref: Some(crate::thrift::exprs::TSlotRef {
                 slot_id: 0,
                 tuple_id: 0,
             }),
@@ -282,7 +282,7 @@ mod tests {
             node_type: TExprNodeType::SLOT_REF,
             type_: create_dummy_type(),
             num_children: 0,
-            slot_ref: Some(crate::exprs::TSlotRef {
+            slot_ref: Some(crate::thrift::exprs::TSlotRef {
                 slot_id: 1,
                 tuple_id: 0,
             }),
@@ -331,7 +331,7 @@ mod tests {
 
     #[test]
     fn test_arithmetic_ops_float() {
-        use crate::exprs::TFloatLiteral;
+        use crate::thrift::exprs::TFloatLiteral;
         use thrift::OrderedFloat;
 
         let cases = vec![
@@ -403,7 +403,7 @@ mod tests {
 
     #[test]
     fn test_arithmetic_mixed_int_float() {
-        use crate::exprs::TFloatLiteral;
+        use crate::thrift::exprs::TFloatLiteral;
         use thrift::OrderedFloat;
 
         // Test: 10 (int) + 2.5 (float) = 12.5 (float)

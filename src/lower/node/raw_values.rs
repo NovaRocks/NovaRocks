@@ -28,7 +28,7 @@ use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::lower::layout::{Layout, layout_from_slot_ids};
 use crate::lower::node::Lowered;
 
-use crate::plan_nodes;
+use crate::thrift::plan_nodes;
 
 /// Lower a RAW_VALUES_NODE plan node to a `Lowered` ExecNode.
 pub(crate) fn lower_raw_values_node(

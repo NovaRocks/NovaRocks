@@ -1,6 +1,6 @@
-use crate::plan_nodes;
 use crate::sql::analysis::{self as query_ir, BinOp, ExprKind, TypedExpr};
 use crate::sql::planner::plan::{AggregateCall, WindowExpr};
+use crate::thrift::plan_nodes;
 
 /// Split a TypedExpr on AND into a flat list of conjuncts.
 pub(crate) fn split_and_conjuncts_typed(expr: &TypedExpr) -> Vec<&TypedExpr> {

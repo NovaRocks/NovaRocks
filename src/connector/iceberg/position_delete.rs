@@ -33,11 +33,11 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use roaring::RoaringTreemap;
 
 use crate::cache::CachedRangeReader;
-use crate::descriptors::THdfsFileFormat;
 use crate::formats::parquet::{ParquetCachedReader, ParquetReadCachePolicy};
 use crate::fs::opendal::OpendalRangeReaderFactory;
-use crate::plan_nodes::THdfsScanRange;
-use crate::types::TIcebergFileContent;
+use crate::thrift::descriptors::THdfsFileFormat;
+use crate::thrift::plan_nodes::THdfsScanRange;
+use crate::thrift::types::TIcebergFileContent;
 
 /// The only two column names a position-delete Parquet file is allowed to
 /// have (equality-delete files carry a different schema and are rejected in
@@ -369,7 +369,7 @@ mod tests {
         file_content: TIcebergFileContent,
     ) -> THdfsScanRange {
         let mut range = THdfsScanRange::default();
-        range.delete_files = Some(vec![crate::plan_nodes::TIcebergDeleteFile::new(
+        range.delete_files = Some(vec![crate::thrift::plan_nodes::TIcebergDeleteFile::new(
             Some(path.to_string()),
             Some(THdfsFileFormat::PARQUET),
             Some(file_content),

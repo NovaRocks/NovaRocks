@@ -41,12 +41,12 @@ use crate::connector::starrocks::lake::{
     execute_update_tablet_meta_info_task as execute_lake_update_tablet_meta_info_task,
 };
 use crate::connector::starrocks::sink::auto_increment::clear_auto_increment_cache_for_table;
-use crate::master_service;
 use crate::novarocks_config::config as novarocks_app_config;
 use crate::runtime::starlet_shard_registry;
 use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
 use crate::service::{disk_report, stream_load};
-use crate::{
+use crate::thrift::master_service;
+use crate::thrift::{
     agent_service,
     backend_service::{
         BackendServiceSyncHandler, BackendServiceSyncProcessor, TExportTaskRequest,
@@ -497,7 +497,7 @@ impl BackendServiceSyncHandler for BackendHandler {
         params: internal_service::TFetchDataParams,
     ) -> thrift::Result<internal_service::TFetchDataResult> {
         let _ = params;
-        let empty_batch = crate::data::TResultBatch::new(vec![], false, 0, None);
+        let empty_batch = crate::thrift::data::TResultBatch::new(vec![], false, 0, None);
         Ok(internal_service::TFetchDataResult::new(
             empty_batch,
             true,
@@ -923,10 +923,8 @@ mod tests {
         send_finish_task_to_fe, start_backend_service, stop_backend_service,
     };
     use crate::common::thrift::{thrift_binary_deserialize, thrift_binary_serialize};
-    use crate::{
-        agent_service, descriptors, master_service, service::disk_report, status, status_code,
-        types,
-    };
+    use crate::service::disk_report;
+    use crate::thrift::{agent_service, descriptors, master_service, status, status_code, types};
 
     mod fe_rpc_server {
         include!(concat!(
@@ -1055,7 +1053,7 @@ mod tests {
     fn ok_master_result() -> master_service::TMasterResult {
         master_service::TMasterResult::new(
             status::TStatus::new(status_code::TStatusCode::OK, None),
-            None::<Vec<crate::work_group::TWorkGroupOp>>,
+            None::<Vec<crate::thrift::work_group::TWorkGroupOp>>,
         )
     }
 
@@ -1166,7 +1164,7 @@ mod tests {
                     status_code::TStatusCode::LEADER_TRANSFERRED,
                     Some(vec!["leader transferred".to_string()]),
                 ),
-                None::<Vec<crate::work_group::TWorkGroupOp>>,
+                None::<Vec<crate::thrift::work_group::TWorkGroupOp>>,
             )),
             Ok(ok_master_result()),
         ]);
@@ -1235,12 +1233,12 @@ mod tests {
             Some(333_i64),
             None::<agent_service::TAlterTabletMaterializedColumnReq>,
             None::<i64>,
-            None::<crate::internal_service::TQueryGlobals>,
-            None::<crate::internal_service::TQueryOptions>,
+            None::<crate::thrift::internal_service::TQueryGlobals>,
+            None::<crate::thrift::internal_service::TQueryOptions>,
             None::<Vec<descriptors::TColumn>>,
             Some(agent_service::TAlterJobType::SCHEMA_CHANGE),
             None::<descriptors::TDescriptorTable>,
-            None::<crate::exprs::TExpr>,
+            None::<crate::thrift::exprs::TExpr>,
             None::<Vec<String>>,
             Some(schema.clone()),
         );
@@ -1268,12 +1266,12 @@ mod tests {
             Some(444_i64),
             None::<agent_service::TAlterTabletMaterializedColumnReq>,
             None::<i64>,
-            None::<crate::internal_service::TQueryGlobals>,
-            None::<crate::internal_service::TQueryOptions>,
+            None::<crate::thrift::internal_service::TQueryGlobals>,
+            None::<crate::thrift::internal_service::TQueryOptions>,
             None::<Vec<descriptors::TColumn>>,
             Some(agent_service::TAlterJobType::SCHEMA_CHANGE),
             None::<descriptors::TDescriptorTable>,
-            None::<crate::exprs::TExpr>,
+            None::<crate::thrift::exprs::TExpr>,
             None::<Vec<String>>,
             None::<agent_service::TTabletSchema>,
         );

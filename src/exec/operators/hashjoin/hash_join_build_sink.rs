@@ -50,13 +50,13 @@ use crate::exec::runtime_filter::{
     encode_starrocks_bloom_filter, encode_starrocks_empty_filter,
     maybe_build_runtime_bitset_filter,
 };
-use crate::metrics;
 use crate::novarocks_logging::{debug, warn};
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use crate::runtime::profile::clamp_u128_to_i64;
 use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
 use crate::runtime::runtime_state::RuntimeState;
 use crate::service::exchange_sender;
+use crate::thrift::metrics;
 use std::collections::{HashMap, HashSet};
 
 /// Factory for hash-join build sinks that construct build-side hash structures.
@@ -947,7 +947,7 @@ impl HashJoinBuildSinkOperator {
                             "runtime membership filter unsupported type: filter_id={} err={}",
                             spec.filter_id, e
                         );
-                        crate::types::TPrimitiveType::INT
+                        crate::thrift::types::TPrimitiveType::INT
                     }
                 },
                 None => {
@@ -955,7 +955,7 @@ impl HashJoinBuildSinkOperator {
                         "runtime membership filter missing build key type: filter_id={}",
                         spec.filter_id
                     );
-                    crate::types::TPrimitiveType::INT
+                    crate::thrift::types::TPrimitiveType::INT
                 }
             };
             params.push(RuntimeMembershipFilterBuildParam::new(
@@ -1128,9 +1128,9 @@ impl HashJoinBuildSinkOperator {
             let ltype = match expr.and_then(|id| self.arena.data_type(id)) {
                 Some(data_type) => match data_type_to_tprimitive(data_type) {
                     Ok(t) => t,
-                    Err(_) => crate::types::TPrimitiveType::INT,
+                    Err(_) => crate::thrift::types::TPrimitiveType::INT,
                 },
-                None => crate::types::TPrimitiveType::INT,
+                None => crate::thrift::types::TPrimitiveType::INT,
             };
             let min_max = if self.build_row_count == 0 {
                 RuntimeMinMaxFilter::empty_range(ltype)?

@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::common::file_identity::FileIdentity;
-use crate::metrics;
 use crate::novarocks_logging::debug;
 use crate::runtime::global_async_runtime::data_runtime;
 use crate::runtime::profile::{CounterRef, RuntimeProfile, clamp_u128_to_i64};
+use crate::thrift::metrics;
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use opendal::Operator;

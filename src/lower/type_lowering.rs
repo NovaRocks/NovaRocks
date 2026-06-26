@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::common::decimal::{LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE};
-use crate::types;
+use crate::thrift::types;
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use std::sync::Arc;
 
@@ -43,7 +43,7 @@ pub(crate) fn thrift_time_unit_for_arrow(
 
 /// Extract primitive type from TExprNode.
 pub(crate) fn primitive_type_from_node(
-    node: &crate::exprs::TExprNode,
+    node: &crate::thrift::exprs::TExprNode,
 ) -> Option<types::TPrimitiveType> {
     let types = node.type_.types.as_ref()?;
     let first = types.first()?;
@@ -269,8 +269,8 @@ pub(crate) fn decimal_params_from_desc(desc: &types::TTypeDesc) -> Option<(u8, i
 #[cfg(test)]
 mod tests {
     use super::{arrow_type_from_desc, arrow_type_from_primitive};
-    use crate::types::TPrimitiveType;
-    use crate::types::{TScalarType, TTypeDesc, TTypeNode, TTypeNodeType};
+    use crate::thrift::types::TPrimitiveType;
+    use crate::thrift::types::{TScalarType, TTypeDesc, TTypeNode, TTypeNodeType};
     use arrow::datatypes::DataType;
 
     #[test]

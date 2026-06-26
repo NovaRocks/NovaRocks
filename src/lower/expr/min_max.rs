@@ -20,7 +20,6 @@ use tracing::debug;
 
 use crate::connector::{MinMaxPredicate, MinMaxPredicateValue};
 use crate::exec::expr::LiteralValue;
-use crate::exprs;
 use crate::lower::expr::literals::{
     build_decimal_literal, parse_date_literal, parse_decimal_literal,
 };
@@ -29,7 +28,8 @@ use crate::lower::type_lowering::{
     THRIFT_TIME_UNIT_NANOS, arrow_type_from_desc, arrow_type_from_primitive,
     primitive_type_from_node,
 };
-use crate::types;
+use crate::thrift::exprs;
+use crate::thrift::types;
 
 /// Parse a min/max conjunct TExpr into MinMaxPredicates used for pruning.
 pub(crate) fn parse_min_max_conjuncts(
@@ -71,7 +71,7 @@ where
         .ok_or_else(|| format!("malformed TExpr: missing node at index {idx}"))?;
 
     if node.node_type == exprs::TExprNodeType::COMPOUND_PRED
-        && node.opcode == Some(crate::opcodes::TExprOpcode::COMPOUND_AND)
+        && node.opcode == Some(crate::thrift::opcodes::TExprOpcode::COMPOUND_AND)
     {
         let child_count = child_count(node)?;
         let mut next = idx + 1;
@@ -105,15 +105,15 @@ where
         return Ok(None);
     };
 
-    let predicate_type = if opcode == crate::opcodes::TExprOpcode::LE {
+    let predicate_type = if opcode == crate::thrift::opcodes::TExprOpcode::LE {
         "Le"
-    } else if opcode == crate::opcodes::TExprOpcode::GE {
+    } else if opcode == crate::thrift::opcodes::TExprOpcode::GE {
         "Ge"
-    } else if opcode == crate::opcodes::TExprOpcode::LT {
+    } else if opcode == crate::thrift::opcodes::TExprOpcode::LT {
         "Lt"
-    } else if opcode == crate::opcodes::TExprOpcode::GT {
+    } else if opcode == crate::thrift::opcodes::TExprOpcode::GT {
         "Gt"
-    } else if opcode == crate::opcodes::TExprOpcode::EQ {
+    } else if opcode == crate::thrift::opcodes::TExprOpcode::EQ {
         "Eq"
     } else {
         return Ok(None);
@@ -873,7 +873,7 @@ mod tests {
             nodes: vec![
                 exprs::TExprNode {
                     node_type: exprs::TExprNodeType::BINARY_PRED,
-                    opcode: Some(crate::opcodes::TExprOpcode::EQ),
+                    opcode: Some(crate::thrift::opcodes::TExprOpcode::EQ),
                     num_children: 2,
                     ..default_t_expr_node()
                 },
@@ -911,7 +911,7 @@ mod tests {
             nodes: vec![
                 exprs::TExprNode {
                     node_type: exprs::TExprNodeType::BINARY_PRED,
-                    opcode: Some(crate::opcodes::TExprOpcode::EQ),
+                    opcode: Some(crate::thrift::opcodes::TExprOpcode::EQ),
                     num_children: 2,
                     ..default_t_expr_node()
                 },
@@ -947,7 +947,7 @@ mod tests {
             nodes: vec![
                 exprs::TExprNode {
                     node_type: exprs::TExprNodeType::BINARY_PRED,
-                    opcode: Some(crate::opcodes::TExprOpcode::EQ),
+                    opcode: Some(crate::thrift::opcodes::TExprOpcode::EQ),
                     num_children: 2,
                     child_type_desc: Some(type_desc(&DataType::Utf8)),
                     ..default_t_expr_node()
@@ -986,7 +986,7 @@ mod tests {
             nodes: vec![
                 exprs::TExprNode {
                     node_type: exprs::TExprNodeType::BINARY_PRED,
-                    opcode: Some(crate::opcodes::TExprOpcode::EQ),
+                    opcode: Some(crate::thrift::opcodes::TExprOpcode::EQ),
                     num_children: 2,
                     child_type_desc: Some(type_desc(&DataType::Utf8)),
                     ..default_t_expr_node()
@@ -1024,13 +1024,13 @@ mod tests {
             nodes: vec![
                 exprs::TExprNode {
                     node_type: exprs::TExprNodeType::COMPOUND_PRED,
-                    opcode: Some(crate::opcodes::TExprOpcode::COMPOUND_AND),
+                    opcode: Some(crate::thrift::opcodes::TExprOpcode::COMPOUND_AND),
                     num_children: 2,
                     ..default_t_expr_node()
                 },
                 exprs::TExprNode {
                     node_type: exprs::TExprNodeType::BINARY_PRED,
-                    opcode: Some(crate::opcodes::TExprOpcode::GE),
+                    opcode: Some(crate::thrift::opcodes::TExprOpcode::GE),
                     num_children: 2,
                     ..default_t_expr_node()
                 },
@@ -1049,7 +1049,7 @@ mod tests {
                 },
                 exprs::TExprNode {
                     node_type: exprs::TExprNodeType::BINARY_PRED,
-                    opcode: Some(crate::opcodes::TExprOpcode::LE),
+                    opcode: Some(crate::thrift::opcodes::TExprOpcode::LE),
                     num_children: 2,
                     ..default_t_expr_node()
                 },

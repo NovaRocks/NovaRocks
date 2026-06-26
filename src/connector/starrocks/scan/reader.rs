@@ -393,7 +393,7 @@ fn build_required_schema_unique_id_map(
 }
 
 fn build_lake_schema_column_hints(
-    schema: &crate::agent_service::TTabletSchema,
+    schema: &crate::thrift::agent_service::TTabletSchema,
 ) -> Result<HashMap<String, LakeSchemaColumnHint>, String> {
     let mut out = HashMap::new();
     for column in &schema.columns {

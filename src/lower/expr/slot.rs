@@ -18,8 +18,8 @@ use crate::common::ids::SlotId;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use arrow::datatypes::DataType;
 
-use crate::exprs;
 use crate::lower::layout::Layout;
+use crate::thrift::exprs;
 
 /// Lower SLOT_REF expression to ExprNode::SlotId.
 pub(crate) fn lower_slot_ref(

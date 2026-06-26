@@ -22,11 +22,11 @@ use std::time::Duration;
 
 use crate::common::types::UniqueId;
 use crate::common::{config, thrift::thrift_binary_serialize};
-use crate::frontend_service;
 use crate::novarocks_logging::{error, warn};
 use crate::runtime::query_context::QueryId;
 use crate::service::grpc_client::{NovaRocksGrpcRemoteClient, proto};
-use crate::types;
+use crate::thrift::frontend_service;
+use crate::thrift::types;
 
 const NORMAL_REPORT_QUEUE_LIMIT: usize = 1_000;
 
@@ -533,8 +533,8 @@ mod tests {
                 Some(types::TUniqueId::new(501, 601)),
                 Some(0),
                 Some(types::TUniqueId::new(301, 401)),
-                Some(crate::status::TStatus::new(
-                    crate::status_code::TStatusCode::OK,
+                Some(crate::thrift::status::TStatus::new(
+                    crate::thrift::status_code::TStatusCode::OK,
                     None,
                 )),
                 Some(true),

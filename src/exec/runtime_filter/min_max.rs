@@ -39,7 +39,7 @@ use arrow::datatypes::{DataType, TimeUnit};
 
 use crate::common::largeint;
 use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
-use crate::types::TPrimitiveType;
+use crate::thrift::types::TPrimitiveType;
 
 use super::codec::{read_i8, read_i16_le, read_i32_le, read_i64_le, read_u8, read_u64_le};
 
@@ -1124,7 +1124,7 @@ mod tests {
     use super::{MinMaxValue, RuntimeMinMaxFilter};
     use crate::common::largeint;
     use crate::common::min_max_predicate::MinMaxPredicateValue;
-    use crate::types::TPrimitiveType;
+    use crate::thrift::types::TPrimitiveType;
 
     #[test]
     fn test_largeint_min_max_from_arrays() {

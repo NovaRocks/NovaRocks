@@ -446,9 +446,9 @@ pub(crate) fn build_iceberg_write_sink_spec(
         .cloned()
         .unwrap_or_else(|| format!("{}/data", table_location.trim_end_matches('/')));
     let cloud_configuration = (!cloud_properties.is_empty()).then(|| {
-        crate::cloud_configuration::TCloudConfiguration::new(
-            None::<crate::cloud_configuration::TCloudType>,
-            None::<Vec<crate::cloud_configuration::TCloudProperty>>,
+        crate::thrift::cloud_configuration::TCloudConfiguration::new(
+            None::<crate::thrift::cloud_configuration::TCloudType>,
+            None::<Vec<crate::thrift::cloud_configuration::TCloudProperty>>,
             Some(cloud_properties),
             None::<bool>,
         )
@@ -465,7 +465,7 @@ pub(crate) fn build_iceberg_write_sink_spec(
         target_partition_spec_id: metadata.default_partition_spec_id(),
         cloud_configuration,
         file_format: "parquet".to_string(),
-        compression: crate::types::TCompressionType::SNAPPY,
+        compression: crate::thrift::types::TCompressionType::SNAPPY,
     })
 }
 

@@ -17,14 +17,14 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::common::ids::SlotId;
-use crate::descriptors;
 use crate::exec::node::lookup::LookUpNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::exec::row_position::RowPositionDescriptor;
 use crate::lower::layout::{Layout, chunk_schema_for_layout};
 use crate::lower::node::Lowered;
-use crate::plan_nodes;
-use crate::types;
+use crate::thrift::descriptors;
+use crate::thrift::plan_nodes;
+use crate::thrift::types;
 
 fn lower_row_pos_descs(
     descs: &BTreeMap<i32, descriptors::TRowPositionDescriptor>,

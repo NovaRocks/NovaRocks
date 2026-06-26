@@ -1617,7 +1617,10 @@ mod tests {
         let cost = ctx
             .optimize_group(&memo, gid, &required)
             .expect("optimize_group should succeed");
-        assert!(cost.is_finite(), "group with two scans must have a finite cost");
+        assert!(
+            cost.is_finite(),
+            "group with two scans must have a finite cost"
+        );
 
         // The winner must be index 0: on equal cost the first-inserted
         // (lowest-index) physical expression wins because the comparison is

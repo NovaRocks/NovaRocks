@@ -18,7 +18,7 @@ use crate::exec::node::assert::{AssertNumRowsNode, Assertion};
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::lower::layout::Layout;
 use crate::lower::node::Lowered;
-use crate::plan_nodes;
+use crate::thrift::plan_nodes;
 
 pub(crate) fn lower_assert_num_rows_node(
     mut children: Vec<Lowered>,
@@ -70,7 +70,7 @@ pub(crate) fn lower_assert_num_rows_node(
 mod tests {
     use super::*;
     use crate::lower::layout::Layout;
-    use crate::plan_nodes::{TAssertNumRowsNode, TAssertion, TPlanNodeType};
+    use crate::thrift::plan_nodes::{TAssertNumRowsNode, TAssertion, TPlanNodeType};
     use std::collections::HashMap;
 
     #[test]

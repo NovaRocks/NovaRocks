@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::common::types::format_uuid;
-use crate::frontend_service::{self, TFrontendServiceSyncClient};
 use crate::service::disk_report;
 use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
-use crate::{internal_service, status, status_code, types};
+use crate::thrift::frontend_service::{self, TFrontendServiceSyncClient};
+use crate::thrift::{internal_service, status, status_code, types};
 
 use super::SchemaScanContext;
 
@@ -182,8 +182,8 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::plan_nodes;
     use crate::service::frontend_rpc::test_clear_shared_host_pools;
+    use crate::thrift::plan_nodes;
     mod fe_rpc_server {
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),

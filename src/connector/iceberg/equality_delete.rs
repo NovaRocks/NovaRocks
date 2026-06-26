@@ -30,10 +30,10 @@ use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, arrow_reader::ParquetRecordBatch
 
 use crate::cache::CachedRangeReader;
 use crate::connector::iceberg::position_delete::IcebergDeleteFileSpec;
-use crate::descriptors::THdfsFileFormat;
 use crate::formats::parquet::{ParquetCachedReader, ParquetReadCachePolicy};
 use crate::fs::opendal::OpendalRangeReaderFactory;
-use crate::types::TIcebergFileContent;
+use crate::thrift::descriptors::THdfsFileFormat;
+use crate::thrift::types::TIcebergFileContent;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum EqualityValue {
@@ -454,9 +454,9 @@ mod tests {
     use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 
     use crate::connector::iceberg::position_delete::IcebergDeleteFileSpec;
-    use crate::descriptors::THdfsFileFormat;
     use crate::fs::opendal::{OpendalRangeReaderFactory, build_fs_operator};
-    use crate::types::TIcebergFileContent;
+    use crate::thrift::descriptors::THdfsFileFormat;
+    use crate::thrift::types::TIcebergFileContent;
 
     fn temp_dir_for(name: &str) -> std::path::PathBuf {
         let mut dir = std::env::temp_dir();

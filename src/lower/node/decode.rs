@@ -35,7 +35,7 @@ use crate::lower::layout::{Layout, chunk_schema_for_layout, slot_arrow_type_look
 use crate::lower::node::Lowered;
 use crate::lower::type_lowering::arrow_type_from_desc;
 use crate::novarocks_logging::info;
-use crate::{data, descriptors, exprs, plan_nodes, types};
+use crate::thrift::{data, descriptors, exprs, plan_nodes, types};
 
 pub(crate) type QueryGlobalDictMap = HashMap<types::TSlotId, Arc<HashMap<i32, Vec<u8>>>>;
 

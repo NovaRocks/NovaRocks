@@ -1313,8 +1313,8 @@ fn equality_change_to_delete_spec(
         crate::connector::iceberg::position_delete::IcebergDeleteFileSpec {
             path: normalize_delete_projection_path(&delete.delete_file_path, object_store_config)
                 .map_err(|e| e.to_string())?,
-            file_format: crate::descriptors::THdfsFileFormat::PARQUET,
-            file_content: crate::types::TIcebergFileContent::EQUALITY_DELETES,
+            file_format: crate::thrift::descriptors::THdfsFileFormat::PARQUET,
+            file_content: crate::thrift::types::TIcebergFileContent::EQUALITY_DELETES,
             length: if delete.delete_file_size > 0 {
                 Some(delete.delete_file_size as u64)
             } else {
@@ -2251,8 +2251,8 @@ mod tests {
         .expect("factory");
         let spec = crate::connector::iceberg::position_delete::IcebergDeleteFileSpec {
             path: "eq.parquet".to_string(),
-            file_format: crate::descriptors::THdfsFileFormat::PARQUET,
-            file_content: crate::types::TIcebergFileContent::EQUALITY_DELETES,
+            file_format: crate::thrift::descriptors::THdfsFileFormat::PARQUET,
+            file_content: crate::thrift::types::TIcebergFileContent::EQUALITY_DELETES,
             length: Some(std::fs::metadata(&equality_path).expect("metadata").len()),
             content_offset: None,
             content_size_in_bytes: None,

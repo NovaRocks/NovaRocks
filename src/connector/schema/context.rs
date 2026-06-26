@@ -14,7 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use crate::{plan_nodes, types};
+use crate::thrift::{plan_nodes, types};
 
 #[derive(Clone, Debug)]
 #[allow(dead_code)]

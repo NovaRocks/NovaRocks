@@ -23,10 +23,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::internal_service;
-use crate::planner;
 use crate::sql::codegen::FragmentBuildResult;
-use crate::types;
+use crate::thrift::internal_service;
+use crate::thrift::planner;
+use crate::thrift::types;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ExecPlanFragmentParamOptions {
@@ -71,7 +71,7 @@ pub(crate) fn build_exec_plan_fragment_params(
         Some(true),                                  // is_pipeline
         Some(pipeline_dop),
         None::<BTreeMap<types::TPlanNodeId, i32>>, // per_scan_node_dop
-        None::<crate::work_group::TWorkGroup>,     // workgroup
+        None::<crate::thrift::work_group::TWorkGroup>, // workgroup
         None::<bool>,                              // enable_resource_group
         None::<i32>,                               // func_version
         None::<bool>,                              // enable_shared_scan
@@ -95,11 +95,11 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::data_sinks;
-    use crate::descriptors;
-    use crate::partitions;
     use crate::sql::codegen::FragmentBuildResult;
-    use crate::types;
+    use crate::thrift::data_sinks;
+    use crate::thrift::descriptors;
+    use crate::thrift::partitions;
+    use crate::thrift::types;
 
     /// Build a minimal `FragmentBuildResult` for testing.
     fn empty_fragment_build_result(finst_hi: i64, finst_lo: i64) -> FragmentBuildResult {
@@ -146,7 +146,7 @@ mod tests {
 
         FragmentBuildResult {
             fragment_id: 0,
-            plan: crate::plan_nodes::TPlan::new(vec![]),
+            plan: crate::thrift::plan_nodes::TPlan::new(vec![]),
             desc_tbl: descriptors::TDescriptorTable::new(vec![], vec![], vec![], false),
             exec_params,
             output_sink,
@@ -185,21 +185,21 @@ mod tests {
             None::<data_sinks::TSplitDataStreamSink>,
         );
         planner::TPlanFragment::new(
-            None::<crate::plan_nodes::TPlan>,
-            None::<Vec<crate::exprs::TExpr>>,
+            None::<crate::thrift::plan_nodes::TPlan>,
+            None::<Vec<crate::thrift::exprs::TExpr>>,
             Some(noop_sink),
             partitions::TDataPartition::new(
                 partitions::TPartitionType::UNPARTITIONED,
-                None::<Vec<crate::exprs::TExpr>>,
+                None::<Vec<crate::thrift::exprs::TExpr>>,
                 None::<Vec<partitions::TRangePartition>>,
                 None::<Vec<partitions::TBucketProperty>>,
             ),
             None::<i64>,
             None::<i64>,
-            None::<Vec<crate::data::TGlobalDict>>,
-            None::<Vec<crate::data::TGlobalDict>>,
+            None::<Vec<crate::thrift::data::TGlobalDict>>,
+            None::<Vec<crate::thrift::data::TGlobalDict>>,
             None::<planner::TCacheParam>,
-            None::<BTreeMap<i32, crate::exprs::TExpr>>,
+            None::<BTreeMap<i32, crate::thrift::exprs::TExpr>>,
             None::<planner::TGroupExecutionParam>,
         )
     }
@@ -255,7 +255,7 @@ mod tests {
 
     #[test]
     fn preserves_runtime_filter_params() {
-        use crate::runtime_filter;
+        use crate::thrift::runtime_filter;
 
         let fr = empty_fragment_build_result(1, 2);
         let mut exec_params = fr.exec_params.clone();

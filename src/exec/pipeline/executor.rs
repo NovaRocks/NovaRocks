@@ -56,7 +56,7 @@ pub(crate) fn execute_plan_with_pipeline(
     pipeline_dop: i32,
     runtime_state: std::sync::Arc<RuntimeState>,
     query_id: Option<crate::runtime::query_context::QueryId>,
-    fe_addr: Option<crate::types::TNetworkAddress>,
+    fe_addr: Option<crate::thrift::types::TNetworkAddress>,
     backend_num: Option<i32>,
 ) -> Result<(), String> {
     execute_plan_with_pipeline_with_root_sink_dop(
@@ -85,7 +85,7 @@ pub(crate) fn execute_plan_with_pipeline_with_root_sink_dop(
     pipeline_dop: i32,
     runtime_state: std::sync::Arc<RuntimeState>,
     query_id: Option<crate::runtime::query_context::QueryId>,
-    fe_addr: Option<crate::types::TNetworkAddress>,
+    fe_addr: Option<crate::thrift::types::TNetworkAddress>,
     backend_num: Option<i32>,
     root_sink_dop: Option<i32>,
 ) -> Result<(), String> {

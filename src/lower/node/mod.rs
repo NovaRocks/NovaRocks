@@ -53,7 +53,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::lower::expr::lower_t_expr_with_common_slot_map;
 use crate::lower::layout::{Layout, layout_for_row_tuples};
-use crate::{data, descriptors, exprs, internal_service, plan_nodes, runtime_filter, types};
+use crate::thrift::{
+    data, descriptors, exprs, internal_service, plan_nodes, runtime_filter, types,
+};
 
 pub(crate) use aggregate::lower_aggregate_node;
 pub(crate) use analytic::lower_analytic_node;
@@ -777,7 +779,7 @@ fn is_scan_node_type(t: plan_nodes::TPlanNodeType) -> bool {
 
 fn common_slot_map_for_node(
     node: &plan_nodes::TPlanNode,
-) -> Option<&BTreeMap<types::TSlotId, crate::exprs::TExpr>> {
+) -> Option<&BTreeMap<types::TSlotId, crate::thrift::exprs::TExpr>> {
     node.select_node
         .as_ref()
         .and_then(|n| n.common_slot_map.as_ref())

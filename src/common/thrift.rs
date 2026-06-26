@@ -21,7 +21,7 @@ use thrift::protocol::{
 };
 use thrift::transport::{TBufferChannel, TIoChannel};
 
-use crate::data;
+use crate::thrift::data;
 
 fn maybe_unique_id_uuid(map: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
     if map.len() != 2 || !map.contains_key("hi") || !map.contains_key("lo") {

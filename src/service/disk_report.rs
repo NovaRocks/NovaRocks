@@ -21,7 +21,7 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::novarocks_logging::{debug, warn};
 use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
-use crate::{master_service, status_code, types};
+use crate::thrift::{master_service, status_code, types};
 
 #[derive(Debug, Default)]
 struct ReportState {

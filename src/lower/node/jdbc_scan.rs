@@ -23,7 +23,7 @@ use crate::lower::layout::{
 };
 use crate::lower::node::{Lowered, local_rf_waiting_set};
 use crate::novarocks_connectors::{ConnectorRegistry, JdbcScanConfig, ScanConfig};
-use crate::{descriptors, internal_service, plan_nodes, types};
+use crate::thrift::{descriptors, internal_service, plan_nodes, types};
 
 /// Lower a JDBC_SCAN_NODE plan node to a `Lowered` ExecNode.
 pub(crate) fn lower_jdbc_scan_node(

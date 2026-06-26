@@ -46,10 +46,10 @@ use crate::exec::runtime_filter::{
     filter_chunk_by_membership_filters_with_exprs, filter_chunk_by_min_max_filters_with_exprs,
 };
 use crate::lower::type_lowering::scalar_type_desc;
-use crate::metrics;
 use crate::novarocks_logging::debug;
 use crate::runtime::profile::{OperatorProfiles, clamp_u128_to_i64};
-use crate::types;
+use crate::thrift::metrics;
+use crate::thrift::types;
 use arrow::array::{Array, ArrayRef, BooleanArray, Int32Array, Int64Array, StringArray};
 use arrow::compute::filter_record_batch;
 use roaring::RoaringTreemap;

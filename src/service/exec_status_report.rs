@@ -21,7 +21,7 @@ use crate::common::types::UniqueId;
 use crate::novarocks_logging::debug;
 use crate::runtime::query_context::QueryId;
 use crate::runtime::sink_commit;
-use crate::{data_cache, frontend_service, runtime_profile, status, types};
+use crate::thrift::{data_cache, frontend_service, runtime_profile, status, types};
 
 pub(crate) struct ExecStatusReportInput {
     pub(crate) finst_id: UniqueId,
@@ -132,7 +132,7 @@ pub(crate) fn build_report_params(
         (loaded_bytes > 0).then_some(loaded_bytes),
         Option::<i64>::None,
         Option::<i64>::None,
-        Option::<crate::internal_service::TLoadJobType>::None,
+        Option::<crate::thrift::internal_service::TLoadJobType>::None,
         tablet_fail_infos,
         (filtered_rows > 0).then_some(filtered_rows),
         Option::<i64>::None,
@@ -148,7 +148,7 @@ pub(crate) fn build_report_params(
 mod tests {
     use super::*;
     use crate::runtime::sink_commit;
-    use crate::{status_code, types};
+    use crate::thrift::{status_code, types};
 
     fn ok_status() -> status::TStatus {
         status::TStatus::new(status_code::TStatusCode::OK, None)

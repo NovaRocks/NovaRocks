@@ -38,7 +38,9 @@ use crate::service::exec_status_report::{self, ExecStatusReportInput};
 use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
 use crate::service::report_worker;
 use crate::service::standalone_exec_state_reporter::{self, StandaloneExecStateReportTask};
-use crate::{data_cache, frontend_service, metrics, runtime_profile, status, status_code, types};
+use crate::thrift::{
+    data_cache, frontend_service, metrics, runtime_profile, status, status_code, types,
+};
 
 #[derive(Clone, Debug)]
 enum ReportDestination {
@@ -811,11 +813,11 @@ mod tests {
         test_reset_report_registry,
     };
     use crate::common::types::UniqueId;
-    use crate::frontend_service;
     use crate::runtime::load_tracking;
     use crate::runtime::query_context::QueryId;
     use crate::service::exec_state_reporter;
-    use crate::{status, status_code, types};
+    use crate::thrift::frontend_service;
+    use crate::thrift::{status, status_code, types};
 
     #[test]
     fn query_gone_status_is_treated_as_benign() {

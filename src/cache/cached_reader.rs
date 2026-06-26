@@ -29,8 +29,8 @@ use crate::common::file_identity::FileIdentity;
 use crate::fs::coalesced_reader::{CoalescedRangeReader, CoalescedReadOptions};
 use crate::fs::opendal::OpendalRangeReader;
 use crate::fs::range_plan::PlannedIoRanges;
-use crate::metrics;
 use crate::runtime::profile::{CounterRef, RuntimeProfile, clamp_u128_to_i64};
+use crate::thrift::metrics;
 
 #[derive(Clone, Debug)]
 pub(crate) struct CacheIoCounters {
@@ -365,8 +365,8 @@ mod tests {
     use crate::cache::{CacheOptions, DataCacheManager};
     use crate::fs::opendal::OpendalRangeReaderFactory;
     use crate::fs::opendal::build_fs_operator;
-    use crate::metrics;
     use crate::runtime::profile::RuntimeProfile;
+    use crate::thrift::metrics;
 
     use super::CachedRangeReader;
 

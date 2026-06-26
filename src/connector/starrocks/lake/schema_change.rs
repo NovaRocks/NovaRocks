@@ -25,10 +25,6 @@ use arrow::compute::{cast, filter_record_batch, take};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use crate::agent_service::{
-    TAlterJobType, TAlterMaterializedViewParam, TAlterTabletReqV2, TCompactionStrategy,
-    TPersistentIndexType, TTabletMetaInfo, TTabletType, TUpdateTabletMetaInfoReq,
-};
 use crate::common::ids::SlotId;
 use crate::connector::starrocks::lake::context::{
     PartialUpdateWritePolicy, TabletWriteContext, get_tablet_runtime, register_tablet_runtime,
@@ -63,6 +59,10 @@ use crate::runtime::starlet_shard_registry::{self, S3StoreConfig};
 use crate::service::grpc_client::proto::starrocks::{
     CompactionStrategyPb, FlatJsonConfigPb, KeysType, MetadataUpdateInfoPb, PersistentIndexTypePb,
     RowsetMetadataPb, TabletMetadataPb, TabletSchemaPb, TxnLogPb, txn_log_pb,
+};
+use crate::thrift::agent_service::{
+    TAlterJobType, TAlterMaterializedViewParam, TAlterTabletReqV2, TCompactionStrategy,
+    TPersistentIndexType, TTabletMetaInfo, TTabletType, TUpdateTabletMetaInfoReq,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1266,7 +1266,7 @@ fn build_rollup_expr_input(
 }
 
 fn eval_rollup_expr(
-    expr: &crate::exprs::TExpr,
+    expr: &crate::thrift::exprs::TExpr,
     eval_input: &RollupExprInput,
     expr_context: &str,
     rowset_idx: usize,
@@ -1651,15 +1651,15 @@ mod tests {
         is_expected_initial_metadata_without_schema, resolve_target_schema, schemas_equivalent,
         should_patch_initial_metadata_schema, transform_rowset_batch_schema_change,
     };
-    use crate::agent_service::TAlterTabletReqV2;
     use crate::connector::starrocks::lake::context::PartialUpdateWritePolicy;
     use crate::connector::starrocks::lake::context::{
         TabletWriteContext, lock_runtime_test_state, register_tablet_runtime,
     };
-    use crate::descriptors;
     use crate::service::grpc_client::proto::starrocks::{
         ColumnPb, DelfileWithRowsetId, KeysType, RowsetMetadataPb, TabletMetadataPb, TabletSchemaPb,
     };
+    use crate::thrift::agent_service::TAlterTabletReqV2;
+    use crate::thrift::descriptors;
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -2020,19 +2020,19 @@ mod tests {
             base_schema_hash,
             new_schema_hash,
             None::<i64>,
-            None::<Vec<crate::agent_service::TAlterMaterializedViewParam>>,
-            None::<crate::agent_service::TTabletType>,
+            None::<Vec<crate::thrift::agent_service::TAlterMaterializedViewParam>>,
+            None::<crate::thrift::agent_service::TTabletType>,
             None::<i64>,
-            None::<crate::agent_service::TAlterTabletMaterializedColumnReq>,
+            None::<crate::thrift::agent_service::TAlterTabletMaterializedColumnReq>,
             None::<i64>,
-            None::<crate::internal_service::TQueryGlobals>,
-            None::<crate::internal_service::TQueryOptions>,
-            None::<Vec<crate::descriptors::TColumn>>,
-            None::<crate::agent_service::TAlterJobType>,
-            None::<crate::descriptors::TDescriptorTable>,
-            None::<crate::exprs::TExpr>,
+            None::<crate::thrift::internal_service::TQueryGlobals>,
+            None::<crate::thrift::internal_service::TQueryOptions>,
+            None::<Vec<crate::thrift::descriptors::TColumn>>,
+            None::<crate::thrift::agent_service::TAlterJobType>,
+            None::<crate::thrift::descriptors::TDescriptorTable>,
+            None::<crate::thrift::exprs::TExpr>,
             None::<Vec<String>>,
-            None::<crate::agent_service::TTabletSchema>,
+            None::<crate::thrift::agent_service::TTabletSchema>,
         )
     }
 }

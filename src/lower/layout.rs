@@ -20,13 +20,13 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use crate::common::ids::SlotId;
-use crate::descriptors;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
-use crate::exprs;
 use crate::novarocks_config::config as novarocks_app_config;
-use crate::planner;
-use crate::types;
-use crate::{data_sinks, partitions};
+use crate::thrift::descriptors;
+use crate::thrift::exprs;
+use crate::thrift::planner;
+use crate::thrift::types;
+use crate::thrift::{data_sinks, partitions};
 
 #[derive(Clone, Debug)]
 pub(crate) struct Layout {
@@ -731,9 +731,9 @@ mod tests {
         Layout, chunk_schema_for_layout, chunk_slot_schemas_for_layout, slot_arrow_type_lookup,
         slot_display_name_from_desc, slot_name_from_desc,
     };
-    use crate::descriptors;
     use crate::lower::type_lowering::scalar_type_desc;
-    use crate::types::TPrimitiveType;
+    use crate::thrift::descriptors;
+    use crate::thrift::types::TPrimitiveType;
     use arrow::datatypes::DataType;
 
     fn slot_desc(

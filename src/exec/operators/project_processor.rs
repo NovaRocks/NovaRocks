@@ -561,7 +561,7 @@ mod tests {
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::lower::type_lowering::scalar_type_desc;
-    use crate::types::TPrimitiveType;
+    use crate::thrift::types::TPrimitiveType;
 
     fn chunk_schema_of(schema: &Arc<Schema>, slot_ids: &[SlotId]) -> Arc<ChunkSchema> {
         ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), slot_ids)

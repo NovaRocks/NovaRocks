@@ -34,6 +34,7 @@
 
 namespace java com.starrocks.thrift
 namespace cpp starrocks
+namespace rs thrift
 
 include "Types.thrift"
 include "Status.thrift"

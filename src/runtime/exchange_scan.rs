@@ -186,26 +186,26 @@ impl ExchangeScanIter {
         profile.add_info_string("DestID", format!("{}", self.key.node_id));
         profile.counter_add(
             "RequestReceived",
-            crate::metrics::TUnit::UNIT,
+            crate::thrift::metrics::TUnit::UNIT,
             clamp_u128_to_i64(stats.request_received),
         );
         profile.counter_add(
             "BytesReceived",
-            crate::metrics::TUnit::BYTES,
+            crate::thrift::metrics::TUnit::BYTES,
             clamp_u128_to_i64(stats.bytes_received),
         );
         profile.counter_add(
             "DeserializeChunkTime",
-            crate::metrics::TUnit::TIME_NS,
+            crate::thrift::metrics::TUnit::TIME_NS,
             clamp_u128_to_i64(stats.deserialize_ns),
         );
         let elapsed_ns = clamp_u128_to_i64(elapsed.as_nanos());
         profile.counter_add(
             "ReceiverProcessTotalTime",
-            crate::metrics::TUnit::TIME_NS,
+            crate::thrift::metrics::TUnit::TIME_NS,
             elapsed_ns,
         );
         let wait_ns = clamp_u128_to_i64(elapsed.as_nanos().saturating_sub(stats.deserialize_ns));
-        profile.counter_add("WaitTime", crate::metrics::TUnit::TIME_NS, wait_ns);
+        profile.counter_add("WaitTime", crate::thrift::metrics::TUnit::TIME_NS, wait_ns);
     }
 }

@@ -18,9 +18,9 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use crate::frontend_service::TFrontendServiceSyncClient;
 use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
-use crate::{frontend_service, status_code, types};
+use crate::thrift::frontend_service::TFrontendServiceSyncClient;
+use crate::thrift::{frontend_service, status_code, types};
 
 #[derive(Clone, Copy, Debug)]
 struct AutoIncrementInterval {

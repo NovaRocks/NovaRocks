@@ -2,13 +2,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::common::min_max_predicate::MinMaxPredicate;
 use crate::connector::scan_planning::{ConnectorScanPlanner, ThriftScanContext};
-use crate::descriptors;
-use crate::exprs;
-use crate::internal_service;
 use crate::lower::expr::parse_min_max_conjuncts_with_column_resolver;
-use crate::partitions;
-use crate::plan_nodes;
-use crate::types;
+use crate::thrift::descriptors;
+use crate::thrift::exprs;
+use crate::thrift::internal_service;
+use crate::thrift::partitions;
+use crate::thrift::plan_nodes;
+use crate::thrift::types;
 
 use super::resolve::ResolvedTable;
 
@@ -196,12 +196,14 @@ fn build_hdfs_scan_node(
     let cloud_config = match &resolved.table.source {
         ScanSource::IcebergMetadataTable {
             cloud_properties, ..
-        } => Some(crate::cloud_configuration::TCloudConfiguration::new(
-            None::<crate::cloud_configuration::TCloudType>,
-            None::<Vec<crate::cloud_configuration::TCloudProperty>>,
-            Some(cloud_properties.clone()),
-            None::<bool>,
-        )),
+        } => Some(
+            crate::thrift::cloud_configuration::TCloudConfiguration::new(
+                None::<crate::thrift::cloud_configuration::TCloudType>,
+                None::<Vec<crate::thrift::cloud_configuration::TCloudProperty>>,
+                Some(cloud_properties.clone()),
+                None::<bool>,
+            ),
+        ),
         _ => None,
     };
 
@@ -249,7 +251,7 @@ fn build_hdfs_scan_node(
         serialized_predicate,
         None::<bool>,
         metadata_table_type,
-        None::<crate::data_cache::TDataCacheOptions>,
+        None::<crate::thrift::data_cache::TDataCacheOptions>,
         None::<Vec<types::TSlotId>>,
         None::<bool>,
         None::<Vec<partitions::TBucketProperty>>,
@@ -444,7 +446,7 @@ pub(crate) fn build_nestloop_join_node(
 
     node.nestloop_join_node = Some(plan_nodes::TNestLoopJoinNode::new(
         Some(join_op),
-        None::<Vec<crate::runtime_filter::TRuntimeFilterDescription>>,
+        None::<Vec<crate::thrift::runtime_filter::TRuntimeFilterDescription>>,
         if join_conjuncts.is_empty() {
             None
         } else {
@@ -698,12 +700,12 @@ pub(crate) fn build_exec_params_multi_with_refresh_context(
         types::TUniqueId::new(2, 2),
         per_node_scan_ranges,
         BTreeMap::new(),
-        None::<Vec<crate::data_sinks::TPlanFragmentDestination>>,
+        None::<Vec<crate::thrift::data_sinks::TPlanFragmentDestination>>,
         None::<i32>,
         None::<i32>,
         None::<bool>,
         None::<bool>,
-        None::<crate::runtime_filter::TRuntimeFilterParams>,
+        None::<crate::thrift::runtime_filter::TRuntimeFilterParams>,
         None::<i32>,
         None::<bool>,
         None::<BTreeMap<types::TPlanNodeId, BTreeMap<i32, Vec<internal_service::TScanRangeParams>>>>,
@@ -1170,7 +1172,7 @@ fn build_iceberg_metadata_scan_range_params() -> internal_service::TScanRangePar
         None::<String>,
         None::<String>,
         None::<i64>,
-        None::<crate::data_cache::TDataCacheOptions>,
+        None::<crate::thrift::data_cache::TDataCacheOptions>,
         None::<Vec<types::TSlotId>>,
         None::<bool>,
         None::<BTreeMap<String, String>>,
@@ -1222,12 +1224,12 @@ mod tests {
     };
     use crate::connector::iceberg::scan_planner::build_hdfs_scan_range_params;
     use crate::connector::scan_planning::ConnectorScanPlanner;
-    use crate::internal_service;
     use crate::sql::catalog::{
         ColumnDef, IcebergDataFileInfo, IcebergMvTargetStateScan, IcebergSchemaDef,
         IcebergTableInfo, ScanSource, TableDef,
     };
     use crate::sql::codegen::resolve::ResolvedTable;
+    use crate::thrift::internal_service;
 
     fn test_iceberg_table_info() -> IcebergTableInfo {
         IcebergTableInfo {
@@ -1245,8 +1247,8 @@ mod tests {
     }
 
     fn hdfs_range(
-        params: &crate::internal_service::TScanRangeParams,
-    ) -> &crate::plan_nodes::THdfsScanRange {
+        params: &crate::thrift::internal_service::TScanRangeParams,
+    ) -> &crate::thrift::plan_nodes::THdfsScanRange {
         params
             .scan_range
             .hdfs_scan_range

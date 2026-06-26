@@ -21,17 +21,17 @@ use crate::cache::ExternalDataCacheRangeOptions;
 use crate::connector::iceberg::equality_delete::EqualityDeleteSet;
 use crate::connector::iceberg::position_delete::IcebergDeleteFileSpec;
 use crate::connector::starrocks::scan::{LakeScanSchemaMeta, StarRocksScanRange};
-use crate::descriptors;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::ExprId;
 use crate::exec::node::{BoxedExecIter, RuntimeFilterProbeSpec};
 use crate::exec::row_position::{IcebergVirtualSpec, LakeRowPositionSpec, RowPositionSpec};
 use crate::exec::runtime_filter::{RuntimeInFilter, RuntimeMembershipFilter, RuntimeMinMaxFilter};
 use crate::fs::scan_context::FileScanRange;
-use crate::internal_service;
 use crate::novarocks_logging::warn;
 use crate::runtime::profile::RuntimeProfile;
 use crate::runtime::runtime_filter_hub::{RuntimeFilterHandle, RuntimeFilterSnapshot};
+use crate::thrift::descriptors;
+use crate::thrift::internal_service;
 
 #[derive(Clone, Debug)]
 pub enum ScanMorsel {

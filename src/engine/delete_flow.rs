@@ -1317,18 +1317,18 @@ fn load_delete_visibility_from_data_files(
             .map(|(resolved, original)| {
                 let file_format = match original.file_format {
                     crate::sql::catalog::IcebergDeleteFileFormat::Parquet => {
-                        crate::descriptors::THdfsFileFormat::PARQUET
+                        crate::thrift::descriptors::THdfsFileFormat::PARQUET
                     }
                     crate::sql::catalog::IcebergDeleteFileFormat::Puffin => {
-                        crate::descriptors::THdfsFileFormat::PARQUET
+                        crate::thrift::descriptors::THdfsFileFormat::PARQUET
                     }
                 };
                 let file_content = match original.file_content {
                     crate::sql::catalog::IcebergDeleteFileContent::Position => {
-                        crate::types::TIcebergFileContent::POSITION_DELETES
+                        crate::thrift::types::TIcebergFileContent::POSITION_DELETES
                     }
                     crate::sql::catalog::IcebergDeleteFileContent::Equality => {
-                        crate::types::TIcebergFileContent::EQUALITY_DELETES
+                        crate::thrift::types::TIcebergFileContent::EQUALITY_DELETES
                     }
                 };
                 Ok(
@@ -1760,9 +1760,9 @@ mod tests {
     use sqlparser::ast as sqlast;
 
     use crate::connector::iceberg::position_delete::IcebergDeleteFileSpec;
-    use crate::descriptors::THdfsFileFormat;
     use crate::fs::opendal::{OpendalRangeReaderFactory, build_fs_operator};
-    use crate::types::TIcebergFileContent;
+    use crate::thrift::descriptors::THdfsFileFormat;
+    use crate::thrift::types::TIcebergFileContent;
 
     fn temp_dir_for(name: &str) -> std::path::PathBuf {
         let mut dir = std::env::temp_dir();

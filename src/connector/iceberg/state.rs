@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use crate::{descriptors, types};
+use crate::thrift::{descriptors, types};
 
 static ICEBERG_TABLE_LOCATIONS: OnceLock<Mutex<HashMap<types::TTableId, String>>> = OnceLock::new();
 

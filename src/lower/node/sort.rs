@@ -23,13 +23,13 @@ use crate::exec::node::sort::{SortExpression, SortNode, SortTopNType};
 use crate::exec::node::{ExecNode, ExecNodeKind};
 
 use crate::common::ids::SlotId;
-use crate::descriptors;
 use crate::lower::expr::lower_t_expr;
 use crate::lower::layout::{Layout, chunk_schema_for_layout};
 use crate::lower::node::Lowered;
 use crate::lower::type_lowering::arrow_type_from_desc;
+use crate::thrift::descriptors;
 
-use crate::{exprs, plan_nodes, types};
+use crate::thrift::{exprs, plan_nodes, types};
 
 /// Lower a SORT_NODE plan node to a `Lowered` ExecNode.
 pub(crate) fn lower_sort_node(
@@ -571,9 +571,9 @@ mod tests {
     use super::*;
     use crate::exec::chunk::Chunk;
     use crate::exec::node::values::ValuesNode;
-    use crate::exprs::{TExpr, TExprNode, TExprNodeType, TSlotRef};
     use crate::lower::type_lowering::scalar_type_desc;
-    use crate::types::{TTypeDesc, TTypeNode, TTypeNodeType};
+    use crate::thrift::exprs::{TExpr, TExprNode, TExprNodeType, TSlotRef};
+    use crate::thrift::types::{TTypeDesc, TTypeNode, TTypeNodeType};
     use std::collections::HashMap;
 
     fn dummy_type_desc() -> TTypeDesc {

@@ -654,15 +654,16 @@ fn push_one_setop(
 
     let pushed_union_op = Operator::LogicalUnion(union.clone());
     let pushed_union_group =
-        find_existing_logical_group(memo, &pushed_union_op, &pushed_branch_groups)
-            .unwrap_or_else(|| {
+        find_existing_logical_group(memo, &pushed_union_op, &pushed_branch_groups).unwrap_or_else(
+            || {
                 let pushed_id = memo.next_expr_id();
                 memo.new_group(MExpr {
                     id: pushed_id,
                     op: pushed_union_op,
                     children: pushed_branch_groups.clone(),
                 })
-            });
+            },
+        );
     vec![NewExpr {
         op: Operator::LogicalTopN(topn.clone()),
         children: vec![pushed_union_group],

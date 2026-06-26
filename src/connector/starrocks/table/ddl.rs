@@ -254,7 +254,7 @@ pub(crate) fn create_starrocks_table(
         ObjectStoreProfile::from_s3_store_config(&starrocks_table_config.s3)?;
     let mut bootstrapped_tablet_ids = Vec::new();
     for tablet in &created.tablets {
-        let request = crate::agent_service::TCreateTabletReq {
+        let request = crate::thrift::agent_service::TCreateTabletReq {
             tablet_id: tablet.tablet_id,
             tablet_schema: request_schema.clone(),
             version: None,
@@ -270,7 +270,7 @@ pub(crate) fn create_starrocks_table(
             storage_format: None,
             tablet_type: None,
             enable_persistent_index: Some(false),
-            compression_type: Some(crate::types::TCompressionType::LZ4_FRAME),
+            compression_type: Some(crate::thrift::types::TCompressionType::LZ4_FRAME),
             binlog_config: None,
             persistent_index_type: None,
             primary_index_cache_expire_sec: None,
@@ -925,7 +925,7 @@ pub(crate) fn bootstrap_empty_partition_for_tablets(
 
 pub(crate) fn request_schema_from_runtime(
     runtime: &StarRocksTableRuntime,
-) -> Result<crate::agent_service::TTabletSchema, String> {
+) -> Result<crate::thrift::agent_service::TTabletSchema, String> {
     // Build a name -> aggregation-string lookup from the tablet schema PB so
     // we can restore the ColumnAggregation modifier (BITMAP_UNION, HLL_UNION,
     // SUM, …) that StoredStarRocksColumn does not carry.
@@ -1003,9 +1003,9 @@ pub(crate) fn build_create_tablet_request(
     tablet_id: i64,
     table_id: i64,
     partition_id: i64,
-    tablet_schema: crate::agent_service::TTabletSchema,
-) -> crate::agent_service::TCreateTabletReq {
-    crate::agent_service::TCreateTabletReq {
+    tablet_schema: crate::thrift::agent_service::TTabletSchema,
+) -> crate::thrift::agent_service::TCreateTabletReq {
+    crate::thrift::agent_service::TCreateTabletReq {
         tablet_id,
         tablet_schema,
         version: None,
@@ -1021,7 +1021,7 @@ pub(crate) fn build_create_tablet_request(
         storage_format: None,
         tablet_type: None,
         enable_persistent_index: Some(false),
-        compression_type: Some(crate::types::TCompressionType::LZ4_FRAME),
+        compression_type: Some(crate::thrift::types::TCompressionType::LZ4_FRAME),
         binlog_config: None,
         persistent_index_type: None,
         primary_index_cache_expire_sec: None,
@@ -1039,7 +1039,7 @@ pub(crate) fn build_tablet_schema(
     columns: &[TableColumnDef],
     key_desc: &TableKeyDesc,
     schema_id: i64,
-) -> Result<crate::agent_service::TTabletSchema, String> {
+) -> Result<crate::thrift::agent_service::TTabletSchema, String> {
     let key_columns = key_desc
         .columns
         .iter()
@@ -1085,7 +1085,7 @@ pub(crate) fn build_tablet_schema(
             match key_desc.kind {
                 TableKeyKind::Duplicate => None,
                 TableKeyKind::Unique | TableKeyKind::Primary => {
-                    Some(crate::types::TAggregationType::REPLACE)
+                    Some(crate::thrift::types::TAggregationType::REPLACE)
                 }
                 TableKeyKind::Aggregate => {
                     let aggregation = column.aggregation.ok_or_else(|| {
@@ -1097,7 +1097,7 @@ pub(crate) fn build_tablet_schema(
                 }
             }
         };
-        thrift_columns.push(crate::descriptors::TColumn {
+        thrift_columns.push(crate::thrift::descriptors::TColumn {
             column_name: normalized,
             column_type,
             aggregation_type,
@@ -1149,12 +1149,12 @@ pub(crate) fn build_tablet_schema(
         );
     }
     let key_count = key_indices.len();
-    Ok(crate::agent_service::TTabletSchema {
+    Ok(crate::thrift::agent_service::TTabletSchema {
         short_key_column_count: i16::try_from(key_count)
             .map_err(|_| "too many key columns for tablet schema".to_string())?,
         schema_hash: 1,
         keys_type: to_keys_type(key_desc.kind),
-        storage_type: crate::types::TStorageType::COLUMN,
+        storage_type: crate::thrift::types::TStorageType::COLUMN,
         columns: thrift_columns,
         bloom_filter_fpp: None,
         indexes: None,
@@ -1163,20 +1163,24 @@ pub(crate) fn build_tablet_schema(
         sort_key_idxes: Some(key_indices.clone()),
         sort_key_unique_ids: Some(key_indices),
         schema_version: Some(0),
-        compression_type: Some(crate::types::TCompressionType::LZ4_FRAME),
+        compression_type: Some(crate::thrift::types::TCompressionType::LZ4_FRAME),
         compression_level: None,
     })
 }
 
-fn column_aggregation_to_thrift(aggregation: ColumnAggregation) -> crate::types::TAggregationType {
+fn column_aggregation_to_thrift(
+    aggregation: ColumnAggregation,
+) -> crate::thrift::types::TAggregationType {
     match aggregation {
-        ColumnAggregation::Sum => crate::types::TAggregationType::SUM,
-        ColumnAggregation::Min => crate::types::TAggregationType::MIN,
-        ColumnAggregation::Max => crate::types::TAggregationType::MAX,
-        ColumnAggregation::Replace => crate::types::TAggregationType::REPLACE,
-        ColumnAggregation::ReplaceIfNotNull => crate::types::TAggregationType::REPLACE_IF_NOT_NULL,
-        ColumnAggregation::BitmapUnion => crate::types::TAggregationType::BITMAP_UNION,
-        ColumnAggregation::HllUnion => crate::types::TAggregationType::HLL_UNION,
+        ColumnAggregation::Sum => crate::thrift::types::TAggregationType::SUM,
+        ColumnAggregation::Min => crate::thrift::types::TAggregationType::MIN,
+        ColumnAggregation::Max => crate::thrift::types::TAggregationType::MAX,
+        ColumnAggregation::Replace => crate::thrift::types::TAggregationType::REPLACE,
+        ColumnAggregation::ReplaceIfNotNull => {
+            crate::thrift::types::TAggregationType::REPLACE_IF_NOT_NULL
+        }
+        ColumnAggregation::BitmapUnion => crate::thrift::types::TAggregationType::BITMAP_UNION,
+        ColumnAggregation::HllUnion => crate::thrift::types::TAggregationType::HLL_UNION,
     }
 }
 
@@ -1187,37 +1191,109 @@ fn is_complex_type(data_type: &SqlType) -> bool {
     )
 }
 
-fn sql_type_to_tcolumn_type(data_type: &SqlType) -> Result<crate::types::TColumnType, String> {
+fn sql_type_to_tcolumn_type(
+    data_type: &SqlType,
+) -> Result<crate::thrift::types::TColumnType, String> {
     let (primitive, len, precision, scale) = match data_type {
-        SqlType::TinyInt => (crate::types::TPrimitiveType::TINYINT, Some(1), None, None),
-        SqlType::SmallInt => (crate::types::TPrimitiveType::SMALLINT, Some(2), None, None),
-        SqlType::Int => (crate::types::TPrimitiveType::INT, Some(4), None, None),
-        SqlType::BigInt => (crate::types::TPrimitiveType::BIGINT, Some(8), None, None),
-        SqlType::LargeInt => (crate::types::TPrimitiveType::LARGEINT, Some(16), None, None),
-        SqlType::Float => (crate::types::TPrimitiveType::FLOAT, Some(4), None, None),
-        SqlType::Double => (crate::types::TPrimitiveType::DOUBLE, Some(8), None, None),
+        SqlType::TinyInt => (
+            crate::thrift::types::TPrimitiveType::TINYINT,
+            Some(1),
+            None,
+            None,
+        ),
+        SqlType::SmallInt => (
+            crate::thrift::types::TPrimitiveType::SMALLINT,
+            Some(2),
+            None,
+            None,
+        ),
+        SqlType::Int => (
+            crate::thrift::types::TPrimitiveType::INT,
+            Some(4),
+            None,
+            None,
+        ),
+        SqlType::BigInt => (
+            crate::thrift::types::TPrimitiveType::BIGINT,
+            Some(8),
+            None,
+            None,
+        ),
+        SqlType::LargeInt => (
+            crate::thrift::types::TPrimitiveType::LARGEINT,
+            Some(16),
+            None,
+            None,
+        ),
+        SqlType::Float => (
+            crate::thrift::types::TPrimitiveType::FLOAT,
+            Some(4),
+            None,
+            None,
+        ),
+        SqlType::Double => (
+            crate::thrift::types::TPrimitiveType::DOUBLE,
+            Some(8),
+            None,
+            None,
+        ),
         SqlType::String => (
-            crate::types::TPrimitiveType::VARCHAR,
+            crate::thrift::types::TPrimitiveType::VARCHAR,
             Some(65_533),
             None,
             None,
         ),
-        SqlType::Json => (crate::types::TPrimitiveType::JSON, Some(16), None, None),
-        SqlType::Bitmap => (crate::types::TPrimitiveType::OBJECT, None, None, None),
-        SqlType::Hll => (crate::types::TPrimitiveType::HLL, None, None, None),
-        SqlType::Boolean => (crate::types::TPrimitiveType::BOOLEAN, Some(1), None, None),
-        SqlType::Date => (crate::types::TPrimitiveType::DATE, Some(4), None, None),
-        SqlType::DateTime => (crate::types::TPrimitiveType::DATETIME, Some(8), None, None),
-        SqlType::DateTimeNs => (crate::types::TPrimitiveType::DATETIME, Some(8), None, None),
-        SqlType::Time => (crate::types::TPrimitiveType::TIME, Some(8), None, None),
+        SqlType::Json => (
+            crate::thrift::types::TPrimitiveType::JSON,
+            Some(16),
+            None,
+            None,
+        ),
+        SqlType::Bitmap => (
+            crate::thrift::types::TPrimitiveType::OBJECT,
+            None,
+            None,
+            None,
+        ),
+        SqlType::Hll => (crate::thrift::types::TPrimitiveType::HLL, None, None, None),
+        SqlType::Boolean => (
+            crate::thrift::types::TPrimitiveType::BOOLEAN,
+            Some(1),
+            None,
+            None,
+        ),
+        SqlType::Date => (
+            crate::thrift::types::TPrimitiveType::DATE,
+            Some(4),
+            None,
+            None,
+        ),
+        SqlType::DateTime => (
+            crate::thrift::types::TPrimitiveType::DATETIME,
+            Some(8),
+            None,
+            None,
+        ),
+        SqlType::DateTimeNs => (
+            crate::thrift::types::TPrimitiveType::DATETIME,
+            Some(8),
+            None,
+            None,
+        ),
+        SqlType::Time => (
+            crate::thrift::types::TPrimitiveType::TIME,
+            Some(8),
+            None,
+            None,
+        ),
         SqlType::Decimal { precision, scale } => (
-            crate::types::TPrimitiveType::DECIMAL128,
+            crate::thrift::types::TPrimitiveType::DECIMAL128,
             None,
             Some(i32::from(*precision)),
             Some(i32::from(*scale)),
         ),
         SqlType::Binary => (
-            crate::types::TPrimitiveType::VARBINARY,
+            crate::thrift::types::TPrimitiveType::VARBINARY,
             Some(65_533),
             None,
             None,
@@ -1233,7 +1309,7 @@ fn sql_type_to_tcolumn_type(data_type: &SqlType) -> Result<crate::types::TColumn
             );
         }
     };
-    Ok(crate::types::TColumnType {
+    Ok(crate::thrift::types::TColumnType {
         type_: primitive,
         len,
         index_len: len,
@@ -1245,20 +1321,20 @@ fn sql_type_to_tcolumn_type(data_type: &SqlType) -> Result<crate::types::TColumn
 /// Build a flat DFS list of `TTypeNode` that describes `data_type`.
 /// Handles nested ARRAY/MAP/STRUCT so they round-trip through the
 /// `create_tablet` protobuf path (`build_create_tablet_column_pb_from_type_desc`).
-fn sql_type_to_ttype_desc(data_type: &SqlType) -> Result<crate::types::TTypeDesc, String> {
+fn sql_type_to_ttype_desc(data_type: &SqlType) -> Result<crate::thrift::types::TTypeDesc, String> {
     let mut nodes = Vec::new();
     append_sql_type_nodes(data_type, &mut nodes)?;
-    Ok(crate::types::TTypeDesc { types: Some(nodes) })
+    Ok(crate::thrift::types::TTypeDesc { types: Some(nodes) })
 }
 
 fn append_sql_type_nodes(
     data_type: &SqlType,
-    nodes: &mut Vec<crate::types::TTypeNode>,
+    nodes: &mut Vec<crate::thrift::types::TTypeNode>,
 ) -> Result<(), String> {
     match data_type {
         SqlType::Array(element) => {
-            nodes.push(crate::types::TTypeNode {
-                type_: crate::types::TTypeNodeType::ARRAY,
+            nodes.push(crate::thrift::types::TTypeNode {
+                type_: crate::thrift::types::TTypeNodeType::ARRAY,
                 scalar_type: None,
                 is_named: None,
                 struct_fields: None,
@@ -1266,8 +1342,8 @@ fn append_sql_type_nodes(
             append_sql_type_nodes(element, nodes)
         }
         SqlType::Map(key, value) => {
-            nodes.push(crate::types::TTypeNode {
-                type_: crate::types::TTypeNodeType::MAP,
+            nodes.push(crate::thrift::types::TTypeNode {
+                type_: crate::thrift::types::TTypeNodeType::MAP,
                 scalar_type: None,
                 is_named: None,
                 struct_fields: None,
@@ -1279,7 +1355,7 @@ fn append_sql_type_nodes(
             let struct_fields = fields
                 .iter()
                 .map(|(name, _)| {
-                    crate::types::TStructField::new(
+                    crate::thrift::types::TStructField::new(
                         Some(name.clone()),
                         None::<String>,
                         None::<i32>,
@@ -1287,8 +1363,8 @@ fn append_sql_type_nodes(
                     )
                 })
                 .collect();
-            nodes.push(crate::types::TTypeNode {
-                type_: crate::types::TTypeNodeType::STRUCT,
+            nodes.push(crate::thrift::types::TTypeNode {
+                type_: crate::thrift::types::TTypeNodeType::STRUCT,
                 scalar_type: None,
                 is_named: None,
                 struct_fields: Some(struct_fields),
@@ -1300,9 +1376,9 @@ fn append_sql_type_nodes(
         }
         _ => {
             let scalar = sql_type_to_tcolumn_type(data_type)?;
-            nodes.push(crate::types::TTypeNode {
-                type_: crate::types::TTypeNodeType::SCALAR,
-                scalar_type: Some(crate::types::TScalarType {
+            nodes.push(crate::thrift::types::TTypeNode {
+                type_: crate::thrift::types::TTypeNodeType::SCALAR,
+                scalar_type: Some(crate::thrift::types::TScalarType {
                     type_: scalar.type_,
                     len: scalar.len,
                     precision: scalar.precision,
@@ -1374,12 +1450,12 @@ pub(crate) fn logical_type_name(data_type: &SqlType) -> String {
     }
 }
 
-fn to_keys_type(kind: TableKeyKind) -> crate::types::TKeysType {
+fn to_keys_type(kind: TableKeyKind) -> crate::thrift::types::TKeysType {
     match kind {
-        TableKeyKind::Duplicate => crate::types::TKeysType::DUP_KEYS,
-        TableKeyKind::Unique => crate::types::TKeysType::UNIQUE_KEYS,
-        TableKeyKind::Aggregate => crate::types::TKeysType::AGG_KEYS,
-        TableKeyKind::Primary => crate::types::TKeysType::PRIMARY_KEYS,
+        TableKeyKind::Duplicate => crate::thrift::types::TKeysType::DUP_KEYS,
+        TableKeyKind::Unique => crate::thrift::types::TKeysType::UNIQUE_KEYS,
+        TableKeyKind::Aggregate => crate::thrift::types::TKeysType::AGG_KEYS,
+        TableKeyKind::Primary => crate::thrift::types::TKeysType::PRIMARY_KEYS,
     }
 }
 
@@ -1533,11 +1609,11 @@ mod tests {
         )
         .expect("build aggregate-key schema");
 
-        assert_eq!(schema.keys_type, crate::types::TKeysType::AGG_KEYS);
+        assert_eq!(schema.keys_type, crate::thrift::types::TKeysType::AGG_KEYS);
         assert_eq!(schema.columns[0].aggregation_type, None);
         assert_eq!(
             schema.columns[1].aggregation_type,
-            Some(crate::types::TAggregationType::SUM)
+            Some(crate::thrift::types::TAggregationType::SUM)
         );
     }
 
@@ -2264,28 +2340,31 @@ mod tests {
         assert_eq!(schema.columns[1].column_name, "v_bm");
         assert_eq!(
             schema.columns[1].aggregation_type,
-            Some(crate::types::TAggregationType::BITMAP_UNION)
+            Some(crate::thrift::types::TAggregationType::BITMAP_UNION)
         );
 
         // v_hll: HLL_UNION value column
         assert_eq!(schema.columns[2].column_name, "v_hll");
         assert_eq!(
             schema.columns[2].aggregation_type,
-            Some(crate::types::TAggregationType::HLL_UNION)
+            Some(crate::thrift::types::TAggregationType::HLL_UNION)
         );
 
         // v_sum: SUM value column
         assert_eq!(schema.columns[3].column_name, "v_sum");
         assert_eq!(
             schema.columns[3].aggregation_type,
-            Some(crate::types::TAggregationType::SUM)
+            Some(crate::thrift::types::TAggregationType::SUM)
         );
     }
 
     #[test]
     fn starrocks_json_type_uses_starrocks_json_primitive() {
         let column_type = sql_type_to_tcolumn_type(&SqlType::Json).expect("json column type");
-        assert_eq!(column_type.type_, crate::types::TPrimitiveType::JSON);
+        assert_eq!(
+            column_type.type_,
+            crate::thrift::types::TPrimitiveType::JSON
+        );
         assert_eq!(column_type.len, Some(16));
         assert_eq!(logical_type_name(&SqlType::Json), "JSON");
         assert_eq!(
@@ -2296,10 +2375,10 @@ mod tests {
         let desc = sql_type_to_ttype_desc(&SqlType::Array(Box::new(SqlType::Json)))
             .expect("array<json> type desc");
         let nodes = desc.types.expect("type nodes");
-        assert_eq!(nodes[0].type_, crate::types::TTypeNodeType::ARRAY);
+        assert_eq!(nodes[0].type_, crate::thrift::types::TTypeNodeType::ARRAY);
         assert_eq!(
             nodes[1].scalar_type.as_ref().expect("scalar").type_,
-            crate::types::TPrimitiveType::JSON
+            crate::thrift::types::TPrimitiveType::JSON
         );
     }
 
@@ -2510,10 +2589,10 @@ mod tests {
     #[test]
     fn bitmap_hll_thrift_mapping() {
         let bm = sql_type_to_tcolumn_type(&SqlType::Bitmap).expect("bitmap thrift");
-        assert_eq!(bm.type_, crate::types::TPrimitiveType::OBJECT);
+        assert_eq!(bm.type_, crate::thrift::types::TPrimitiveType::OBJECT);
 
         let hv = sql_type_to_tcolumn_type(&SqlType::Hll).expect("hll thrift");
-        assert_eq!(hv.type_, crate::types::TPrimitiveType::HLL);
+        assert_eq!(hv.type_, crate::thrift::types::TPrimitiveType::HLL);
 
         assert_eq!(logical_type_name(&SqlType::Bitmap), "BITMAP");
         assert_eq!(logical_type_name(&SqlType::Hll), "HLL");

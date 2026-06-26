@@ -5,7 +5,6 @@
 
 use std::collections::HashMap;
 
-use crate::partitions;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{ExprKind, TypedExpr};
 use crate::sql::codegen::helpers::{group_win_exprs_by_sig, split_and_conjuncts_typed};
@@ -39,6 +38,7 @@ use crate::sql::planner::plan::{
     PlanSortNode as DistributedSortNode, PlanTableFunctionNode as DistributedTableFunctionNode,
     PlanValuesNode as DistributedValuesNode, PlanWindowNode as DistributedWindowNode,
 };
+use crate::thrift::partitions;
 
 use super::distributed_fragment::{
     DataPartition, DataSink, DistributedPlan, PartitionKind, PlanFragment,
@@ -1264,7 +1264,7 @@ fn tdata_partition_placeholder(
 ) -> partitions::TDataPartition {
     partitions::TDataPartition::new(
         partition_type,
-        None::<Vec<crate::exprs::TExpr>>,
+        None::<Vec<crate::thrift::exprs::TExpr>>,
         None::<Vec<partitions::TRangePartition>>,
         None::<Vec<partitions::TBucketProperty>>,
     )

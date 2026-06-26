@@ -29,7 +29,7 @@ use crate::lower::node::Lowered;
 use crate::novarocks_logging::warn;
 use crate::sql::types::wider_type;
 
-use crate::{descriptors, plan_nodes, runtime_filter, types};
+use crate::thrift::{descriptors, plan_nodes, runtime_filter, types};
 
 fn common_decimal_compare_type(left: &DataType, right: &DataType) -> Result<DataType, String> {
     let (lp, ls, left_is_256) = match left {
@@ -162,8 +162,8 @@ pub(crate) fn lower_hash_join_node(
     let mut eq_null_safe = Vec::with_capacity(join.eq_join_conjuncts.len());
     for cond in &join.eq_join_conjuncts {
         let null_safe = match cond.opcode {
-            Some(op) if op == crate::opcodes::TExprOpcode::EQ_FOR_NULL => true,
-            Some(op) if op == crate::opcodes::TExprOpcode::EQ => false,
+            Some(op) if op == crate::thrift::opcodes::TExprOpcode::EQ_FOR_NULL => true,
+            Some(op) if op == crate::thrift::opcodes::TExprOpcode::EQ => false,
             None => false,
             Some(other) => {
                 return Err(format!(

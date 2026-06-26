@@ -42,11 +42,11 @@ use crate::exec::runtime_filter::{
     RuntimeInFilter, RuntimeMembershipFilter, filter_chunk_by_in_filters_with_exprs,
     filter_chunk_by_membership_filters_with_exprs,
 };
-use crate::metrics;
 use crate::novarocks_logging::debug;
 use crate::runtime::exchange;
 use crate::runtime::runtime_filter_hub::{RuntimeFilterHub, RuntimeFilterProbe};
 use crate::runtime::runtime_state::RuntimeState;
+use crate::thrift::metrics;
 
 static EXCHANGE_SOURCE_READY_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 

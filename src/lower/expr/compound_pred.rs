@@ -17,8 +17,8 @@
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use arrow::datatypes::DataType;
 
-use crate::exprs;
-use crate::opcodes;
+use crate::thrift::exprs;
+use crate::thrift::opcodes;
 
 /// Lower COMPOUND_PRED expression to logical ExprNode.
 pub(crate) fn lower_compound_pred(
@@ -69,11 +69,11 @@ mod tests {
     use crate::common::ids::SlotId;
     use crate::exec::chunk::Chunk;
     use crate::exec::expr::ExprArena;
-    use crate::exprs::{TExpr, TExprNode, TExprNodeType};
     use crate::lower::expr::lower_t_expr;
     use crate::lower::layout::Layout;
-    use crate::opcodes::TExprOpcode;
-    use crate::types::{TTypeDesc, TTypeNode, TTypeNodeType};
+    use crate::thrift::exprs::{TExpr, TExprNode, TExprNodeType};
+    use crate::thrift::opcodes::TExprOpcode;
+    use crate::thrift::types::{TTypeDesc, TTypeNode, TTypeNodeType};
     use arrow::array::{
         Array, ArrayRef, BooleanArray, Int64Array, RecordBatch, RecordBatchOptions,
     };
@@ -177,7 +177,7 @@ mod tests {
             node_type: TExprNodeType::SLOT_REF,
             type_: create_dummy_type(),
             num_children: 0,
-            slot_ref: Some(crate::exprs::TSlotRef {
+            slot_ref: Some(crate::thrift::exprs::TSlotRef {
                 slot_id: 0,
                 tuple_id: 0,
             }),

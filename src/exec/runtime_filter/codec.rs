@@ -117,7 +117,7 @@ pub(crate) fn decode_starrocks_in_filter(
     let ltype = read_i32_le(data, &mut offset)?;
     let element_count = read_u32_le(data, &mut offset)? as usize;
 
-    use crate::types;
+    use crate::thrift::types;
     let t = types::TPrimitiveType(ltype);
     let values = if t == types::TPrimitiveType::BOOLEAN {
         let mut set = HashSet::new();
@@ -225,7 +225,7 @@ pub(crate) fn decode_starrocks_in_filter(
 
 /// Encode a runtime IN filter into StarRocks-compatible wire payload.
 pub(crate) fn encode_starrocks_in_filter(filter: &RuntimeInFilter) -> Result<Vec<u8>, String> {
-    use crate::types;
+    use crate::thrift::types;
     let (t, count, mut write_values): (types::TPrimitiveType, usize, RuntimeInFilterWriter<'_>) =
         match filter.values() {
             RuntimeInFilterValues::Bool(values) => {
@@ -448,7 +448,7 @@ pub(crate) fn decode_starrocks_membership_filter(
         return Err("runtime filter type is IN_FILTER".to_string());
     }
     let ltype = read_i32_le(data, &mut offset)?;
-    let ltype = crate::types::TPrimitiveType(ltype);
+    let ltype = crate::thrift::types::TPrimitiveType(ltype);
 
     match rf_type {
         RF_TYPE_BLOOM_FILTER => {
@@ -675,12 +675,12 @@ fn read_varchar(data: &[u8], offset: &mut usize) -> Result<String, String> {
 }
 
 fn write_min_max_i64(
-    ltype: &crate::types::TPrimitiveType,
+    ltype: &crate::thrift::types::TPrimitiveType,
     min_value: i64,
     max_value: i64,
     buf: &mut Vec<u8>,
 ) -> Result<(), String> {
-    use crate::types;
+    use crate::thrift::types;
     if *ltype == types::TPrimitiveType::BOOLEAN {
         if !(0..=1).contains(&min_value) || !(0..=1).contains(&max_value) {
             return Err("runtime bitset filter boolean min/max out of range".to_string());
@@ -765,11 +765,11 @@ fn write_min_max_i64(
 }
 
 fn read_min_max_i64(
-    ltype: &crate::types::TPrimitiveType,
+    ltype: &crate::thrift::types::TPrimitiveType,
     data: &[u8],
     offset: &mut usize,
 ) -> Result<(i64, i64), String> {
-    use crate::types;
+    use crate::thrift::types;
     if *ltype == types::TPrimitiveType::BOOLEAN {
         let min = read_u8(data, offset)? as i64;
         let max = read_u8(data, offset)? as i64;
@@ -830,8 +830,8 @@ fn read_min_max_i64(
     ))
 }
 
-fn unsupported_runtime_bitset_filter_type(ltype: &crate::types::TPrimitiveType) -> String {
-    use crate::types;
+fn unsupported_runtime_bitset_filter_type(ltype: &crate::thrift::types::TPrimitiveType) -> String {
+    use crate::thrift::types;
     let name = if *ltype == types::TPrimitiveType::LARGEINT {
         "LARGEINT"
     } else if *ltype == types::TPrimitiveType::DECIMAL128 {
@@ -972,7 +972,7 @@ mod tests {
         assert_eq!(buf[1], RF_TYPE_IN_FILTER);
         assert_eq!(
             i32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]),
-            crate::types::TPrimitiveType::VARCHAR.0
+            crate::thrift::types::TPrimitiveType::VARCHAR.0
         );
         assert_eq!(u32::from_le_bytes([buf[6], buf[7], buf[8], buf[9]]), 1);
         // value: [int32 len=2 LE]['a','b']
@@ -998,7 +998,7 @@ mod tests {
         assert_eq!(buf[1], RF_TYPE_IN_FILTER);
         assert_eq!(
             i32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]),
-            crate::types::TPrimitiveType::DECIMAL128.0
+            crate::thrift::types::TPrimitiveType::DECIMAL128.0
         );
         assert_eq!(u32::from_le_bytes([buf[6], buf[7], buf[8], buf[9]]), 1);
         // value: 16B i128 LE = 7
@@ -1027,7 +1027,7 @@ mod tests {
 
     #[test]
     fn decimal64_bitset_filter_round_trips() {
-        let ltype = crate::types::TPrimitiveType::DECIMAL64;
+        let ltype = crate::thrift::types::TPrimitiveType::DECIMAL64;
         let min_value = -123_456_789i64;
         let max_value = 987_654_321i64;
         let bitset = vec![0b1010_0101, 0b0101_1010, 0xff];
@@ -1082,7 +1082,11 @@ mod tests {
         let mut payload = Vec::new();
         payload.push(RF_VERSION_V3);
         payload.push(RF_TYPE_BITSET_FILTER);
-        payload.extend_from_slice(&crate::types::TPrimitiveType::DECIMAL128.0.to_le_bytes());
+        payload.extend_from_slice(
+            &crate::thrift::types::TPrimitiveType::DECIMAL128
+                .0
+                .to_le_bytes(),
+        );
         payload.push(0); // has_null
         payload.extend_from_slice(&0u64.to_le_bytes()); // size
         payload.push(0); // join_mode
@@ -1102,7 +1106,11 @@ mod tests {
         let mut payload = Vec::new();
         payload.push(RF_VERSION_V3);
         payload.push(RF_TYPE_BITSET_FILTER);
-        payload.extend_from_slice(&crate::types::TPrimitiveType::LARGEINT.0.to_le_bytes());
+        payload.extend_from_slice(
+            &crate::thrift::types::TPrimitiveType::LARGEINT
+                .0
+                .to_le_bytes(),
+        );
         payload.push(0); // has_null
         payload.extend_from_slice(&0u64.to_le_bytes()); // size
         payload.push(0); // join_mode

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
-use crate::types;
+use crate::thrift::types;
 use arrow::datatypes::DataType;
 
 /// Lower CAST_EXPR expression to ExprNode::Cast.

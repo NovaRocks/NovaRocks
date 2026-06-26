@@ -33,8 +33,8 @@ use crate::fs::coalesce_policy::AdaptiveCoalesceController;
 use crate::fs::opendal::OpendalRangeReaderFactory;
 use crate::fs::range_plan::PlannedIoRanges;
 use crate::fs::scan_context::{FileScanContext, FileScanRange};
-use crate::metrics;
 use crate::runtime::profile::{RuntimeProfile, clamp_u128_to_i64};
+use crate::thrift::metrics;
 
 const VIRTUAL_COUNT_COLUMN: &str = "___count___";
 static ORC_COALESCE_CONTROLLER: AdaptiveCoalesceController = AdaptiveCoalesceController::new();

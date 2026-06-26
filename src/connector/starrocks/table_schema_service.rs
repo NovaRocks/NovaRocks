@@ -20,14 +20,14 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use moka::sync::Cache;
 
-use crate::agent_service::TTabletSchema;
 use crate::common::config;
-use crate::frontend_service;
 use crate::service::disk_report;
 use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
-use crate::status::TStatus;
-use crate::status_code;
-use crate::types;
+use crate::thrift::agent_service::TTabletSchema;
+use crate::thrift::frontend_service;
+use crate::thrift::status::TStatus;
+use crate::thrift::status_code;
+use crate::thrift::types;
 
 #[derive(Clone, Debug)]
 pub(crate) struct TableSchemaFetchRequest {
@@ -230,7 +230,7 @@ impl TableSchemaService {
     ) -> Result<TTabletSchema, TableSchemaError> {
         let rpc_request = frontend_service::TBatchGetTableSchemaRequest {
             requests: Some(vec![frontend_service::TGetTableSchemaRequest {
-                schema_key: Some(crate::descriptors::TTableSchemaKey {
+                schema_key: Some(crate::thrift::descriptors::TTableSchemaKey {
                     db_id: Some(request.db_id),
                     table_id: Some(request.table_id),
                     schema_id: Some(request.schema_id),
@@ -526,9 +526,9 @@ mod tests {
 
     use moka::sync::Cache;
 
-    use crate::descriptors;
-    use crate::frontend_service;
-    use crate::types;
+    use crate::thrift::descriptors;
+    use crate::thrift::frontend_service;
+    use crate::thrift::types;
 
     use super::{SingleFlightGroup, TableSchemaError, TableSchemaFetchRequest, TableSchemaService};
 
@@ -537,8 +537,8 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
-    fn test_tablet_schema(schema_id: i64) -> crate::agent_service::TTabletSchema {
-        crate::agent_service::TTabletSchema {
+    fn test_tablet_schema(schema_id: i64) -> crate::thrift::agent_service::TTabletSchema {
+        crate::thrift::agent_service::TTabletSchema {
             short_key_column_count: 1,
             schema_hash: 1001,
             keys_type: types::TKeysType::DUP_KEYS,

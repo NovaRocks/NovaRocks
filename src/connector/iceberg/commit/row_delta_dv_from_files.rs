@@ -940,7 +940,7 @@ mod tests {
         crate::runtime::sink_commit::register(finst_id);
         crate::runtime::sink_commit::add(
             finst_id,
-            crate::types::TSinkCommitInfo {
+            crate::thrift::types::TSinkCommitInfo {
                 iceberg_data_file: Some(test_thrift_puffin_dv_file()),
                 hive_file_info: None,
                 is_overwrite: None,
@@ -1060,8 +1060,8 @@ mod tests {
         }
     }
 
-    fn test_thrift_puffin_dv_file() -> crate::types::TIcebergDataFile {
-        crate::types::TIcebergDataFile {
+    fn test_thrift_puffin_dv_file() -> crate::thrift::types::TIcebergDataFile {
+        crate::thrift::types::TIcebergDataFile {
             path: Some("s3://b/data/dv-00000000.puffin".to_string()),
             format: Some("puffin".to_string()),
             record_count: Some(3),
@@ -1070,12 +1070,12 @@ mod tests {
             split_offsets: None,
             column_stats: None,
             partition_null_fingerprint: None,
-            file_content: Some(crate::types::TIcebergFileContent::POSITION_DELETES),
+            file_content: Some(crate::thrift::types::TIcebergFileContent::POSITION_DELETES),
             referenced_data_file: Some("s3://b/data/f.parquet".to_string()),
             first_row_id: None,
             equality_ids: None,
             key_metadata: None,
-            partition_values_descriptor: Some(crate::types::TIcebergPartitionDescriptor {
+            partition_values_descriptor: Some(crate::thrift::types::TIcebergPartitionDescriptor {
                 values: Some(vec![]),
             }),
             partition_spec_id: Some(0),

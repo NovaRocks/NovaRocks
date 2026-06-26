@@ -18,7 +18,7 @@ use crate::common::ids::SlotId;
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::expr::ExprId;
 use crate::exec::node::ExecNode;
-use crate::types;
+use crate::thrift::types;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum JoinType {

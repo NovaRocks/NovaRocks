@@ -17,7 +17,7 @@
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
 use arrow::datatypes::DataType;
 
-use crate::exprs;
+use crate::thrift::exprs;
 
 /// Lower INFO_FUNC expression to ExprNode::Literal.
 pub(crate) fn lower_info_func(

@@ -27,7 +27,7 @@ use crate::runtime::runtime_state::RuntimeState;
 use crate::service::internal_service::{
     build_empty_fetch_result_batch_template, build_fetch_result_batch_for_chunk,
 };
-use crate::{data_sinks, exprs};
+use crate::thrift::{data_sinks, exprs};
 
 #[derive(Debug)]
 struct ResultBufferSinkShared {

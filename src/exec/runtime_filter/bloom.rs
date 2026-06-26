@@ -168,7 +168,7 @@ impl SimdBlockFilter {
 pub(crate) struct RuntimeBloomFilter {
     filter_id: i32,
     slot_id: SlotId,
-    ltype: crate::types::TPrimitiveType,
+    ltype: crate::thrift::types::TPrimitiveType,
     has_null: bool,
     join_mode: i8,
     size: u64,
@@ -180,7 +180,7 @@ impl RuntimeBloomFilter {
     pub(in crate::exec::runtime_filter) fn new(
         filter_id: i32,
         slot_id: SlotId,
-        ltype: crate::types::TPrimitiveType,
+        ltype: crate::thrift::types::TPrimitiveType,
         has_null: bool,
         join_mode: i8,
         size: u64,
@@ -207,7 +207,7 @@ impl RuntimeBloomFilter {
         self.slot_id
     }
 
-    pub(crate) fn ltype(&self) -> crate::types::TPrimitiveType {
+    pub(crate) fn ltype(&self) -> crate::thrift::types::TPrimitiveType {
         self.ltype
     }
 
@@ -343,7 +343,7 @@ impl RuntimeBloomFilter {
     pub(crate) fn build_from_array(
         filter_id: i32,
         slot_id: SlotId,
-        ltype: crate::types::TPrimitiveType,
+        ltype: crate::thrift::types::TPrimitiveType,
         array: &ArrayRef,
         join_mode: i8,
     ) -> Result<Self, String> {
@@ -371,7 +371,7 @@ impl RuntimeBloomFilter {
     pub(crate) fn with_capacity(
         filter_id: i32,
         slot_id: SlotId,
-        ltype: crate::types::TPrimitiveType,
+        ltype: crate::thrift::types::TPrimitiveType,
         join_mode: i8,
         size: u64,
         min_max: RuntimeMinMaxFilter,
@@ -471,7 +471,7 @@ fn decimal_hash(value: i128) -> u64 {
 
 fn apply_bloom_filter(
     bf: &SimdBlockFilter,
-    ltype: &crate::types::TPrimitiveType,
+    ltype: &crate::thrift::types::TPrimitiveType,
     has_null: bool,
     array: ArrayRef,
     keep: &mut [bool],
@@ -741,7 +741,7 @@ fn apply_bloom_filter(
 }
 
 fn build_bloom_from_array(
-    ltype: &crate::types::TPrimitiveType,
+    ltype: &crate::thrift::types::TPrimitiveType,
     array: &ArrayRef,
     bf: &mut SimdBlockFilter,
 ) -> Result<bool, String> {

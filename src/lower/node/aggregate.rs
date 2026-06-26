@@ -21,14 +21,14 @@ use crate::exec::node::aggregate::{
 };
 use crate::exec::node::{ExecNode, ExecNodeKind};
 
-use crate::descriptors;
 use crate::lower::expr::{lower_expr_node, lower_t_expr};
 use crate::lower::layout::{Layout, chunk_schema_for_layout};
 use crate::lower::node::Lowered;
 use crate::lower::type_lowering::arrow_type_from_desc;
 use crate::novarocks_logging::warn;
+use crate::thrift::descriptors;
 
-use crate::{exprs, plan_nodes, runtime_filter, types};
+use crate::thrift::{exprs, plan_nodes, runtime_filter, types};
 use arrow::datatypes::{DataType, Field, Fields};
 
 /// Lower an AGGREGATION_NODE plan node to a `Lowered` ExecNode.
@@ -37,7 +37,7 @@ pub(crate) fn lower_aggregate_node(
     node: &plan_nodes::TPlanNode,
     arena: &mut ExprArena,
     desc_tbl: Option<&descriptors::TDescriptorTable>,
-    query_opts: Option<&crate::internal_service::TQueryOptions>,
+    query_opts: Option<&crate::thrift::internal_service::TQueryOptions>,
     out_layout: &Layout,
     last_query_id: Option<&str>,
     fe_addr: Option<&types::TNetworkAddress>,
@@ -222,7 +222,7 @@ pub(crate) fn lower_aggregate_node(
     }
 
     let streaming_preaggregation_mode = agg.streaming_preaggregation_mode.map(|mode| {
-        use crate::plan_nodes::TStreamingPreaggregationMode;
+        use crate::thrift::plan_nodes::TStreamingPreaggregationMode;
         match mode {
             TStreamingPreaggregationMode::AUTO => StreamingPreaggregationMode::Auto,
             TStreamingPreaggregationMode::FORCE_STREAMING => {
@@ -281,7 +281,7 @@ fn agg_type_signature_from_node(node: &exprs::TExprNode) -> Result<AggTypeSignat
 fn encode_aggregate(
     node: &exprs::TExprNode,
     fn_name: &str,
-    query_opts: Option<&crate::internal_service::TQueryOptions>,
+    query_opts: Option<&crate::thrift::internal_service::TQueryOptions>,
 ) -> Result<(String, AggOrderSpec), String> {
     if matches!(
         fn_name,

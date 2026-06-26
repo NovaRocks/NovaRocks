@@ -42,7 +42,7 @@ use crate::lower::thrift::{Lowered, lower_plan};
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::runtime::runtime_state::RuntimeState;
-use crate::{data_sinks, descriptors, internal_service, planner, types};
+use crate::thrift::{data_sinks, descriptors, internal_service, planner, types};
 
 #[derive(Clone, Debug)]
 pub(crate) struct FragmentOutput {
@@ -625,7 +625,7 @@ pub(crate) fn execute_fragment(
 
 #[cfg(test)]
 mod tests {
-    use crate::data_sinks;
+    use crate::thrift::data_sinks;
 
     #[test]
     fn iceberg_dv_sink_lowers_to_deletion_vectors_mode() {

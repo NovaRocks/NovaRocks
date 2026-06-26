@@ -3366,7 +3366,7 @@ GROUP BY k1",
             .expect("request schema");
         assert_eq!(
             request_schema.keys_type,
-            crate::types::TKeysType::PRIMARY_KEYS
+            crate::thrift::types::TKeysType::PRIMARY_KEYS
         );
         let mut tablet_schema =
             crate::connector::starrocks::lake::schema::build_tablet_schema_pb_from_thrift(

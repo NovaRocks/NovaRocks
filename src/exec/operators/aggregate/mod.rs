@@ -374,7 +374,7 @@ impl AggregateProcessorOperator {
         if let Some(profile) = self.profiles.as_ref() {
             profile.common.counter_add(
                 "InputRowCount",
-                crate::metrics::TUnit::UNIT,
+                crate::thrift::metrics::TUnit::UNIT,
                 num_rows as i64,
             );
         }

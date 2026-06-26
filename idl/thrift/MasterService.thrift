@@ -34,6 +34,7 @@
 
 namespace cpp starrocks
 namespace java com.starrocks.thrift
+namespace rs thrift
 
 include "AgentService.thrift"
 include "InternalService.thrift"

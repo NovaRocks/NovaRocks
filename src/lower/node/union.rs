@@ -21,18 +21,18 @@ use arrow::compute::concat;
 use arrow::datatypes::{DataType, Field, Schema};
 
 use crate::common::ids::SlotId;
-use crate::descriptors;
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::expr::{ExprArena, cast_array_to_target};
 use crate::exec::node::project::ProjectNode;
 use crate::exec::node::union_all::UnionAllNode;
 use crate::exec::node::values::ValuesNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
+use crate::thrift::descriptors;
 
 use crate::lower::expr::lower_t_expr;
 use crate::lower::layout::{Layout, chunk_schema_for_layout, layout_from_slot_ids};
 use crate::lower::node::Lowered;
-use crate::{plan_nodes, types};
+use crate::thrift::{plan_nodes, types};
 
 /// Lower a UNION_NODE plan node to a `Lowered` ExecNode.
 pub(crate) fn lower_union_node(
@@ -400,7 +400,7 @@ fn chunk_from_const_arrays(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exprs;
+    use crate::thrift::exprs;
     use arrow::array::{StringArray, TimestampMicrosecondArray};
     use arrow::datatypes::TimeUnit;
     use std::collections::HashMap;

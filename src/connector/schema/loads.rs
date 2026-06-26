@@ -16,8 +16,8 @@
 // under the License.
 use chrono::NaiveDateTime;
 
-use crate::frontend_service;
-use crate::types;
+use crate::thrift::frontend_service;
+use crate::thrift::types;
 
 use super::SchemaScanContext;
 use super::chunk_builder::{SchemaRow, SchemaValue, normalize_column_key};

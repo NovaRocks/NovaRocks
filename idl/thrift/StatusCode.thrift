@@ -34,6 +34,7 @@
 
 namespace cpp starrocks
 namespace java com.starrocks.thrift
+namespace rs thrift
 
 // NOTE: Each item of StatusCode is explicitly assigned a constant value.
 // The TStatusCode struct is used in all FEs and BEs. In order to be able to

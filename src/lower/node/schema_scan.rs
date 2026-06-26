@@ -20,7 +20,6 @@ use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 
 use crate::connector::schema::{BeSchemaTable, SchemaScanContext, SchemaScanOp, SchemaTable};
-use crate::descriptors;
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::node::scan::ScanNode;
 use crate::exec::node::values::ValuesNode;
@@ -28,7 +27,8 @@ use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::lower::layout::{Layout, chunk_schema_for_layout, schema_for_layout};
 use crate::lower::node::Lowered;
 use crate::novarocks_logging::warn;
-use crate::{internal_service, plan_nodes, types};
+use crate::thrift::descriptors;
+use crate::thrift::{internal_service, plan_nodes, types};
 
 use super::local_rf_waiting_set;
 
@@ -217,7 +217,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::types;
+    use crate::thrift::types;
 
     fn schema_scan_plan_node(table_name: &str) -> plan_nodes::TPlanNode {
         plan_nodes::TPlanNode {
@@ -328,12 +328,12 @@ mod tests {
             types::TUniqueId { hi: 3, lo: 4 },
             per_node_scan_ranges,
             BTreeMap::new(),
-            Option::<Vec<crate::data_sinks::TPlanFragmentDestination>>::None,
+            Option::<Vec<crate::thrift::data_sinks::TPlanFragmentDestination>>::None,
             None::<i32>,
             None::<i32>,
             None::<bool>,
             None::<bool>,
-            None::<crate::runtime_filter::TRuntimeFilterParams>,
+            None::<crate::thrift::runtime_filter::TRuntimeFilterParams>,
             None::<i32>,
             None::<bool>,
             None::<BTreeMap<i32, BTreeMap<i32, Vec<internal_service::TScanRangeParams>>>>,

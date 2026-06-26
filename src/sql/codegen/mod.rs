@@ -21,11 +21,11 @@ pub(crate) mod type_infer;
 
 use arrow::datatypes::DataType;
 
-use crate::data_sinks;
-use crate::descriptors as thrift_descriptors;
-use crate::internal_service;
-use crate::partitions;
-use crate::plan_nodes;
+use crate::thrift::data_sinks;
+use crate::thrift::descriptors as thrift_descriptors;
+use crate::thrift::internal_service;
+use crate::thrift::partitions;
+use crate::thrift::plan_nodes;
 
 use super::analysis::cte::CteId;
 
@@ -81,13 +81,14 @@ pub(crate) struct PlanBuildResult {
     /// otherwise `None`. The execution path (`execute_plan`) must thread
     /// these into `lower_plan` — without them, every Decode in the plan
     /// fails with `missing query global dict for encoded slot_id=<N>`.
-    pub query_global_dicts: Option<Vec<crate::data::TGlobalDict>>,
+    pub query_global_dicts: Option<Vec<crate::thrift::data::TGlobalDict>>,
     /// Derived dictionary expressions keyed by target dict slot id. Mirrors
     /// `FragmentBuildResult.query_global_dict_exprs`. Empty today (Task 8
     /// derived-expr support is deferred); kept here so the execution path's
     /// `lower_plan` call signature stays consistent across single- and
     /// multi-fragment plans.
-    pub query_global_dict_exprs: Option<std::collections::BTreeMap<i32, crate::exprs::TExpr>>,
+    pub query_global_dict_exprs:
+        Option<std::collections::BTreeMap<i32, crate::thrift::exprs::TExpr>>,
 }
 
 #[derive(Clone)]
@@ -145,7 +146,7 @@ pub(crate) struct MultiFragmentBuildResult {
 pub(crate) struct RuntimeFilterPlanResult {
     /// filter_id -> RF description.
     pub all_filters:
-        std::collections::HashMap<i32, crate::runtime_filter::TRuntimeFilterDescription>,
+        std::collections::HashMap<i32, crate::thrift::runtime_filter::TRuntimeFilterDescription>,
     /// fragment_id -> build-side filter IDs in that fragment.
     pub build_side_filters: std::collections::HashMap<FragmentId, Vec<i32>>,
     /// fragment_id -> (filter_id, probe_target_node_id) for probe-side targets.
@@ -161,7 +162,7 @@ pub(crate) struct FragmentBuildResult {
     #[allow(dead_code)]
     // populated by fragment builder, will be read when standalone multi-fragment execution is wired
     pub output_sink: data_sinks::TDataSink,
-    pub output_exprs: Option<Vec<crate::exprs::TExpr>>,
+    pub output_exprs: Option<Vec<crate::thrift::exprs::TExpr>>,
     pub output_columns: Vec<OutputColumn>,
     pub direct_exec: Option<Box<DirectExecPlan>>,
     pub boundary_schemas: Vec<boundary_schema::BoundarySchemaReport>,
@@ -173,9 +174,10 @@ pub(crate) struct FragmentBuildResult {
     /// Per-fragment global dictionaries emitted to `TPlanFragment.query_global_dicts`.
     /// Populated by the fragment builder when a scan exposes a dict-encoded slot.
     /// `None` when this fragment has no dictionary-encoded slots.
-    pub query_global_dicts: Option<Vec<crate::data::TGlobalDict>>,
+    pub query_global_dicts: Option<Vec<crate::thrift::data::TGlobalDict>>,
     /// Per-fragment dictionary expressions emitted to
     /// `TPlanFragment.query_global_dict_exprs`. Wired through for Task 7+;
     /// today this stays `None` because no codegen path populates it.
-    pub query_global_dict_exprs: Option<std::collections::BTreeMap<i32, crate::exprs::TExpr>>,
+    pub query_global_dict_exprs:
+        Option<std::collections::BTreeMap<i32, crate::thrift::exprs::TExpr>>,
 }

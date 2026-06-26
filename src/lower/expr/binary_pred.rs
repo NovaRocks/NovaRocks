@@ -17,10 +17,10 @@
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use arrow::datatypes::DataType;
 
-use crate::exprs;
 use crate::lower::type_lowering::{arrow_type_from_desc, arrow_type_from_primitive};
-use crate::opcodes;
-use crate::types;
+use crate::thrift::exprs;
+use crate::thrift::opcodes;
+use crate::thrift::types;
 
 fn common_decimal_compare_type(left: &DataType, right: &DataType) -> Result<DataType, String> {
     let (lp, ls, left_is_256) = match left {

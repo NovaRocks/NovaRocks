@@ -50,7 +50,7 @@ use crate::lower::layout::{
 use crate::lower::node::Lowered;
 use crate::runtime::query_context::QueryId;
 use crate::service::grpc_client::proto::starrocks::{ColumnPb, TabletSchemaPb};
-use crate::{descriptors, internal_service, plan_nodes, types};
+use crate::thrift::{descriptors, internal_service, plan_nodes, types};
 
 use super::lake_scan::{build_lake_properties, load_lake_catalog};
 

@@ -48,7 +48,7 @@ use crate::novarocks_connectors::{
     ParquetScanConfig, ScanConfig,
 };
 use crate::novarocks_logging::{debug, warn};
-use crate::{descriptors, exprs, internal_service, plan_nodes, types};
+use crate::thrift::{descriptors, exprs, internal_service, plan_nodes, types};
 
 /// Cache Iceberg table locations from descriptor table for later use in HDFS scan lowering.
 pub(crate) fn cache_iceberg_table_locations(desc_tbl: Option<&descriptors::TDescriptorTable>) {
@@ -312,7 +312,7 @@ pub(crate) fn extract_change_op_from_extended_columns(
         ));
     }
     let node = &expr.nodes[0];
-    if node.node_type != crate::exprs::TExprNodeType::INT_LITERAL {
+    if node.node_type != crate::thrift::exprs::TExprNodeType::INT_LITERAL {
         return Err(format!(
             "{} expects INT_LITERAL extended column, got {:?}",
             context(),
@@ -1259,7 +1259,7 @@ pub(crate) fn lower_hdfs_scan_node(
             iceberg_delete_files.push(IcebergDeleteFileSpec {
                 path,
                 file_format: descriptors::THdfsFileFormat::UNKNOWN,
-                file_content: crate::types::TIcebergFileContent::POSITION_DELETES,
+                file_content: crate::thrift::types::TIcebergFileContent::POSITION_DELETES,
                 length: None,
                 content_offset: Some(offset),
                 content_size_in_bytes: Some(size),
@@ -1771,9 +1771,9 @@ mod tests {
     use crate::common::ids::SlotId;
     use crate::connector::FileScanRange;
     use crate::connector::iceberg::position_delete::IcebergDeleteFileSpec;
-    use crate::internal_service::TQueryOptions;
     use crate::lower::layout::layout_from_slot_ids;
-    use crate::{descriptors, exprs, plan_nodes, types};
+    use crate::thrift::internal_service::TQueryOptions;
+    use crate::thrift::{descriptors, exprs, plan_nodes, types};
     use arrow::datatypes::{DataType, Field};
 
     use super::{
@@ -1935,7 +1935,7 @@ mod tests {
     fn slot_binary_int_expr(
         slot_id: i32,
         value: i64,
-        opcode: crate::opcodes::TExprOpcode,
+        opcode: crate::thrift::opcodes::TExprOpcode,
     ) -> exprs::TExpr {
         let type_desc =
             crate::lower::type_lowering::scalar_type_desc(types::TPrimitiveType::BIGINT);
@@ -1966,7 +1966,7 @@ mod tests {
     }
 
     fn slot_eq_int_expr(slot_id: i32, value: i64) -> exprs::TExpr {
-        slot_binary_int_expr(slot_id, value, crate::opcodes::TExprOpcode::EQ)
+        slot_binary_int_expr(slot_id, value, crate::thrift::opcodes::TExprOpcode::EQ)
     }
 
     fn test_slot_info(
@@ -2260,7 +2260,7 @@ mod tests {
         )
         .expect("variant path plan");
         let layout = layout_from_slot_ids(1, [1, 2]);
-        let conjunct = slot_binary_int_expr(2, 5, crate::opcodes::TExprOpcode::GT);
+        let conjunct = slot_binary_int_expr(2, 5, crate::thrift::opcodes::TExprOpcode::GT);
 
         let predicates =
             parse_hdfs_scan_pruning_predicates(7, Some(&[conjunct]), &layout, &plan.specs)
@@ -2289,7 +2289,7 @@ mod tests {
         .expect("variant path plan");
         let layout = layout_from_slot_ids(1, [3, 2]);
         let physical = slot_eq_int_expr(3, 7);
-        let variant = slot_binary_int_expr(2, 5, crate::opcodes::TExprOpcode::GT);
+        let variant = slot_binary_int_expr(2, 5, crate::thrift::opcodes::TExprOpcode::GT);
 
         let predicates =
             parse_hdfs_scan_pruning_predicates(7, Some(&[physical, variant]), &layout, &plan.specs)
@@ -2313,7 +2313,7 @@ mod tests {
         .expect("variant path plan");
         let layout = layout_from_slot_ids(1, [3, 2]);
         let physical = slot_eq_int_expr(3, 7);
-        let variant = slot_binary_int_expr(2, 5, crate::opcodes::TExprOpcode::GT);
+        let variant = slot_binary_int_expr(2, 5, crate::thrift::opcodes::TExprOpcode::GT);
         let predicates =
             parse_hdfs_scan_pruning_predicates(7, Some(&[physical, variant]), &layout, &plan.specs)
                 .expect("parse pruning predicates");
@@ -2373,7 +2373,7 @@ mod tests {
         .expect("variant path plan");
         let layout = layout_from_slot_ids(1, [3, 2]);
         let physical = slot_eq_int_expr(3, 7);
-        let variant = slot_binary_int_expr(2, 5, crate::opcodes::TExprOpcode::GT);
+        let variant = slot_binary_int_expr(2, 5, crate::thrift::opcodes::TExprOpcode::GT);
         let predicates =
             parse_hdfs_scan_pruning_predicates(7, Some(&[physical, variant]), &layout, &plan.specs)
                 .expect("parse pruning predicates");
@@ -2410,7 +2410,7 @@ mod tests {
         .expect("variant path plan");
         let layout = layout_from_slot_ids(1, [3, 2]);
         let physical = slot_eq_int_expr(3, 7);
-        let variant = slot_binary_int_expr(2, 5, crate::opcodes::TExprOpcode::GT);
+        let variant = slot_binary_int_expr(2, 5, crate::thrift::opcodes::TExprOpcode::GT);
         let predicates =
             parse_hdfs_scan_pruning_predicates(7, Some(&[physical, variant]), &layout, &plan.specs)
                 .expect("parse pruning predicates");

@@ -17,7 +17,7 @@
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use arrow::datatypes::DataType;
 
-use crate::exprs;
+use crate::thrift::exprs;
 
 /// Lower IS_NULL_PRED expression to ExprNode::IsNull / ExprNode::IsNotNull.
 pub(crate) fn lower_is_null_pred(

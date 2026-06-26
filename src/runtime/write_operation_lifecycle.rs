@@ -106,7 +106,7 @@ fn staged_artifacts_from_writer_outputs(
     Ok(paths.into_iter().collect())
 }
 
-fn format_unique_id(id: &crate::types::TUniqueId) -> String {
+fn format_unique_id(id: &crate::thrift::types::TUniqueId) -> String {
     format!("{}/{}", id.hi, id.lo)
 }
 
@@ -134,7 +134,7 @@ mod tests {
         IcebergOperationFailureKind, IcebergOperationNextAction, IcebergOperationState,
     };
     use crate::runtime::write_coordinator::{WriteAbortInput, WriterKey};
-    use crate::types;
+    use crate::thrift::types;
 
     fn id(hi: i64, lo: i64) -> types::TUniqueId {
         types::TUniqueId::new(hi, lo)

@@ -33,8 +33,6 @@ use arrow::array::{Array, ArrayRef, Int32Array, UInt32Array};
 use arrow::compute::{concat, take};
 
 use crate::common::ids::SlotId;
-use crate::descriptors;
-use crate::descriptors::TRowPositionType;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
@@ -47,6 +45,8 @@ use crate::runtime::lookup::{
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::runtime::runtime_state::RuntimeState;
 use crate::service::grpc_proto as internal_proto;
+use crate::thrift::descriptors;
+use crate::thrift::descriptors::TRowPositionType;
 
 /// Factory for fetch processors that resolve deferred row/slot materialization.
 pub struct FetchProcessorFactory {
@@ -334,10 +334,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::FetchProcessor;
-    use crate::descriptors;
     use crate::runtime::query_context::QueryId;
     use crate::service::grpc_proto as internal_proto;
     use crate::service::internal_rpc_client;
+    use crate::thrift::descriptors;
 
     #[test]
     fn test_lookup_remote_uses_nodes_info_async_internal_port() {

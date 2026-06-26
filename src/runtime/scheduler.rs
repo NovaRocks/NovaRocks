@@ -50,15 +50,15 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
-use crate::data_sinks::TPlanFragmentDestination;
-use crate::internal_service::TScanRangeParams;
-use crate::partitions::TPartitionType;
-use crate::runtime_filter::TRuntimeFilterProberParams;
 use crate::sql::codegen::{
     FragmentBuildResult, FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind,
     RuntimeFilterPlanResult,
 };
-use crate::types::{TNetworkAddress, TUniqueId};
+use crate::thrift::data_sinks::TPlanFragmentDestination;
+use crate::thrift::internal_service::TScanRangeParams;
+use crate::thrift::partitions::TPartitionType;
+use crate::thrift::runtime_filter::TRuntimeFilterProberParams;
+use crate::thrift::types::{TNetworkAddress, TUniqueId};
 
 type LiveBackend = (usize, SocketAddr);
 
@@ -541,8 +541,8 @@ pub(crate) fn identify_root_fragment(
 }
 
 /// Return the plan-node ids of all scan nodes in `plan`.
-pub(crate) fn find_scan_plan_nodes(plan: &crate::plan_nodes::TPlan) -> Vec<i32> {
-    use crate::plan_nodes::TPlanNodeType;
+pub(crate) fn find_scan_plan_nodes(plan: &crate::thrift::plan_nodes::TPlan) -> Vec<i32> {
+    use crate::thrift::plan_nodes::TPlanNodeType;
     plan.nodes
         .iter()
         .filter(|n| {
@@ -572,16 +572,16 @@ mod tests {
     use std::net::SocketAddr;
     use std::str::FromStr;
 
-    use crate::data_sinks;
-    use crate::descriptors as thrift_descriptors;
-    use crate::internal_service;
-    use crate::partitions;
-    use crate::plan_nodes;
     use crate::sql::codegen::RuntimeFilterPlanResult;
     use crate::sql::codegen::{
         FragmentBuildResult, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
     };
-    use crate::types;
+    use crate::thrift::data_sinks;
+    use crate::thrift::descriptors as thrift_descriptors;
+    use crate::thrift::internal_service;
+    use crate::thrift::partitions;
+    use crate::thrift::plan_nodes;
+    use crate::thrift::types;
 
     // -----------------------------------------------------------------------
     // Test helpers
@@ -776,7 +776,7 @@ mod tests {
             target_exchange_node_id: exch_node_id,
             output_partition: partitions::TDataPartition::new(
                 ptype,
-                None::<Vec<crate::exprs::TExpr>>,
+                None::<Vec<crate::thrift::exprs::TExpr>>,
                 None::<Vec<partitions::TRangePartition>>,
                 None::<Vec<partitions::TBucketProperty>>,
             ),

@@ -36,7 +36,7 @@ use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::lower::type_lowering::scalar_type_desc;
 use crate::runtime::runtime_state::RuntimeState;
-use crate::types;
+use crate::thrift::types;
 use arrow::array::{Int64Array, new_null_array};
 use arrow::datatypes::{DataType, Field, Schema};
 

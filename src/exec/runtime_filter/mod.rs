@@ -71,8 +71,8 @@ pub(in crate::exec::runtime_filter) use in_filter::RuntimeInFilterValues;
 /// Map Arrow data type to StarRocks thrift primitive type for runtime filter serialization.
 pub(crate) fn data_type_to_tprimitive(
     data_type: &DataType,
-) -> Result<crate::types::TPrimitiveType, String> {
-    use crate::types;
+) -> Result<crate::thrift::types::TPrimitiveType, String> {
+    use crate::thrift::types;
     let t = match data_type {
         DataType::Boolean => types::TPrimitiveType::BOOLEAN,
         DataType::Int8 => types::TPrimitiveType::TINYINT,
@@ -104,7 +104,7 @@ pub(crate) fn data_type_to_tprimitive(
 mod tests {
     use arrow::datatypes::{DataType, TimeUnit};
 
-    use crate::types::TPrimitiveType;
+    use crate::thrift::types::TPrimitiveType;
 
     use super::data_type_to_tprimitive;
 

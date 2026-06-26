@@ -17,7 +17,7 @@
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use arrow::datatypes::DataType;
 
-use crate::exprs;
+use crate::thrift::exprs;
 
 pub(crate) fn lower_lambda_function(
     node: &exprs::TExprNode,

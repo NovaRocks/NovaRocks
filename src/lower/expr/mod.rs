@@ -43,12 +43,12 @@ use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use arrow::datatypes::DataType;
 use std::collections::{BTreeMap, HashMap};
 
-use crate::exprs;
 use crate::lower::layout::Layout;
 use crate::lower::type_lowering::{
     arrow_type_from_desc, arrow_type_from_primitive, primitive_type_from_desc,
 };
-use crate::types;
+use crate::thrift::exprs;
+use crate::thrift::types;
 
 // Import node handlers
 use arithmetic::lower_arithmetic;
@@ -559,9 +559,9 @@ mod tests {
     use crate::common::ids::SlotId;
     use crate::exec::chunk::Chunk;
     use crate::exec::expr::{ExprArena, ExprNode};
-    use crate::exprs::{TExpr, TExprNode, TExprNodeType, TSlotRef};
-    use crate::opcodes::TExprOpcode;
-    use crate::types::{TTypeDesc, TTypeNode, TTypeNodeType};
+    use crate::thrift::exprs::{TExpr, TExprNode, TExprNodeType, TSlotRef};
+    use crate::thrift::opcodes::TExprOpcode;
+    use crate::thrift::types::{TTypeDesc, TTypeNode, TTypeNodeType};
     use arrow::array::BooleanArray;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;

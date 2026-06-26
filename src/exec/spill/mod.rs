@@ -21,9 +21,9 @@ pub mod spill_channel;
 pub mod spill_stream;
 pub mod spiller;
 
-use crate::internal_service;
-use crate::metrics;
 use crate::runtime::profile::{CounterRef, Profiler, RuntimeProfile};
+use crate::thrift::internal_service;
+use crate::thrift::metrics;
 
 pub use spill_channel::{SpillChannelHandle, SpillIoExecutor, SpillTask};
 

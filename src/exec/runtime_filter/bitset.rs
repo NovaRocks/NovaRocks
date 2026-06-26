@@ -48,7 +48,7 @@ const DEFAULT_L3_CACHE_SIZE: usize = 32 * 1024 * 1024;
 pub(crate) struct RuntimeBitsetFilter {
     filter_id: i32,
     slot_id: SlotId,
-    ltype: crate::types::TPrimitiveType,
+    ltype: crate::thrift::types::TPrimitiveType,
     has_null: bool,
     join_mode: i8,
     size: u64,
@@ -62,7 +62,7 @@ impl RuntimeBitsetFilter {
     pub(in crate::exec::runtime_filter) fn new(
         filter_id: i32,
         slot_id: SlotId,
-        ltype: crate::types::TPrimitiveType,
+        ltype: crate::thrift::types::TPrimitiveType,
         has_null: bool,
         join_mode: i8,
         size: u64,
@@ -93,7 +93,7 @@ impl RuntimeBitsetFilter {
         self.slot_id
     }
 
-    pub(crate) fn ltype(&self) -> crate::types::TPrimitiveType {
+    pub(crate) fn ltype(&self) -> crate::thrift::types::TPrimitiveType {
         self.ltype
     }
 
@@ -235,7 +235,7 @@ impl RuntimeBitsetFilter {
 pub(crate) fn maybe_build_runtime_bitset_filter(
     filter_id: i32,
     slot_id: SlotId,
-    ltype: crate::types::TPrimitiveType,
+    ltype: crate::thrift::types::TPrimitiveType,
     join_mode: i8,
     size: u64,
     arrays: &[ArrayRef],
@@ -280,8 +280,8 @@ pub(crate) fn maybe_build_runtime_bitset_filter(
     )))
 }
 
-fn supports_runtime_bitset_ltype(ltype: &crate::types::TPrimitiveType) -> bool {
-    use crate::types::TPrimitiveType;
+fn supports_runtime_bitset_ltype(ltype: &crate::thrift::types::TPrimitiveType) -> bool {
+    use crate::thrift::types::TPrimitiveType;
     // Mirrors StarRocks bitset-supported logical types; DATETIME, VARCHAR,
     // LARGEINT, FLOAT, DOUBLE, and DECIMAL128 stay on bloom/min-max paths.
     matches!(
@@ -297,10 +297,11 @@ fn supports_runtime_bitset_ltype(ltype: &crate::types::TPrimitiveType) -> bool {
     )
 }
 
-fn is_decimal_bitset_ltype(ltype: &crate::types::TPrimitiveType) -> bool {
+fn is_decimal_bitset_ltype(ltype: &crate::thrift::types::TPrimitiveType) -> bool {
     matches!(
         *ltype,
-        crate::types::TPrimitiveType::DECIMAL32 | crate::types::TPrimitiveType::DECIMAL64
+        crate::thrift::types::TPrimitiveType::DECIMAL32
+            | crate::thrift::types::TPrimitiveType::DECIMAL64
     )
 }
 
@@ -319,7 +320,7 @@ fn should_use_bitset(bitset_memory_usage: usize, bloom_memory_usage: usize) -> b
 }
 
 fn scan_bitset_build_stats(
-    ltype: &crate::types::TPrimitiveType,
+    ltype: &crate::thrift::types::TPrimitiveType,
     arrays: &[ArrayRef],
 ) -> Result<Option<(bool, i64, i64)>, String> {
     let mut has_null = false;
@@ -338,7 +339,7 @@ fn scan_bitset_build_stats(
 
     for array in arrays {
         match array.data_type() {
-            DataType::Boolean if *ltype == crate::types::TPrimitiveType::BOOLEAN => {
+            DataType::Boolean if *ltype == crate::thrift::types::TPrimitiveType::BOOLEAN => {
                 let arr = array
                     .as_any()
                     .downcast_ref::<BooleanArray>()
@@ -351,7 +352,7 @@ fn scan_bitset_build_stats(
                     update(if arr.value(i) { 1 } else { 0 });
                 }
             }
-            DataType::Int8 if *ltype == crate::types::TPrimitiveType::TINYINT => {
+            DataType::Int8 if *ltype == crate::thrift::types::TPrimitiveType::TINYINT => {
                 let arr = array
                     .as_any()
                     .downcast_ref::<Int8Array>()
@@ -364,7 +365,7 @@ fn scan_bitset_build_stats(
                     update(arr.value(i) as i64);
                 }
             }
-            DataType::Int16 if *ltype == crate::types::TPrimitiveType::SMALLINT => {
+            DataType::Int16 if *ltype == crate::thrift::types::TPrimitiveType::SMALLINT => {
                 let arr = array
                     .as_any()
                     .downcast_ref::<Int16Array>()
@@ -377,7 +378,7 @@ fn scan_bitset_build_stats(
                     update(arr.value(i) as i64);
                 }
             }
-            DataType::Int32 if *ltype == crate::types::TPrimitiveType::INT => {
+            DataType::Int32 if *ltype == crate::thrift::types::TPrimitiveType::INT => {
                 let arr = array
                     .as_any()
                     .downcast_ref::<Int32Array>()
@@ -390,7 +391,7 @@ fn scan_bitset_build_stats(
                     update(arr.value(i) as i64);
                 }
             }
-            DataType::Int64 if *ltype == crate::types::TPrimitiveType::BIGINT => {
+            DataType::Int64 if *ltype == crate::thrift::types::TPrimitiveType::BIGINT => {
                 let arr = array
                     .as_any()
                     .downcast_ref::<Int64Array>()
@@ -403,7 +404,7 @@ fn scan_bitset_build_stats(
                     update(arr.value(i));
                 }
             }
-            DataType::Date32 if *ltype == crate::types::TPrimitiveType::DATE => {
+            DataType::Date32 if *ltype == crate::thrift::types::TPrimitiveType::DATE => {
                 let arr = array
                     .as_any()
                     .downcast_ref::<Date32Array>()
@@ -448,7 +449,7 @@ fn scan_bitset_build_stats(
 }
 
 fn fill_bitset_from_arrays(
-    ltype: &crate::types::TPrimitiveType,
+    ltype: &crate::thrift::types::TPrimitiveType,
     arrays: &[ArrayRef],
     min_value: i64,
     max_value: i64,
@@ -469,7 +470,7 @@ fn fill_bitset_from_arrays(
 
     for array in arrays {
         match array.data_type() {
-            DataType::Boolean if *ltype == crate::types::TPrimitiveType::BOOLEAN => {
+            DataType::Boolean if *ltype == crate::thrift::types::TPrimitiveType::BOOLEAN => {
                 let arr = array
                     .as_any()
                     .downcast_ref::<BooleanArray>()
@@ -481,7 +482,7 @@ fn fill_bitset_from_arrays(
                     set_value(if arr.value(i) { 1 } else { 0 });
                 }
             }
-            DataType::Int8 if *ltype == crate::types::TPrimitiveType::TINYINT => {
+            DataType::Int8 if *ltype == crate::thrift::types::TPrimitiveType::TINYINT => {
                 let arr = array
                     .as_any()
                     .downcast_ref::<Int8Array>()
@@ -493,7 +494,7 @@ fn fill_bitset_from_arrays(
                     set_value(arr.value(i) as i64);
                 }
             }
-            DataType::Int16 if *ltype == crate::types::TPrimitiveType::SMALLINT => {
+            DataType::Int16 if *ltype == crate::thrift::types::TPrimitiveType::SMALLINT => {
                 let arr = array
                     .as_any()
                     .downcast_ref::<Int16Array>()
@@ -505,7 +506,7 @@ fn fill_bitset_from_arrays(
                     set_value(arr.value(i) as i64);
                 }
             }
-            DataType::Int32 if *ltype == crate::types::TPrimitiveType::INT => {
+            DataType::Int32 if *ltype == crate::thrift::types::TPrimitiveType::INT => {
                 let arr = array
                     .as_any()
                     .downcast_ref::<Int32Array>()
@@ -517,7 +518,7 @@ fn fill_bitset_from_arrays(
                     set_value(arr.value(i) as i64);
                 }
             }
-            DataType::Int64 if *ltype == crate::types::TPrimitiveType::BIGINT => {
+            DataType::Int64 if *ltype == crate::thrift::types::TPrimitiveType::BIGINT => {
                 let arr = array
                     .as_any()
                     .downcast_ref::<Int64Array>()
@@ -529,7 +530,7 @@ fn fill_bitset_from_arrays(
                     set_value(arr.value(i));
                 }
             }
-            DataType::Date32 if *ltype == crate::types::TPrimitiveType::DATE => {
+            DataType::Date32 if *ltype == crate::thrift::types::TPrimitiveType::DATE => {
                 let arr = array
                     .as_any()
                     .downcast_ref::<Date32Array>()
@@ -573,7 +574,7 @@ mod tests {
 
     use arrow::array::{ArrayRef, Decimal128Array, StringArray, TimestampMicrosecondArray};
 
-    use crate::types::TPrimitiveType;
+    use crate::thrift::types::TPrimitiveType;
 
     use super::*;
 
@@ -711,7 +712,7 @@ mod tests {
 
 fn apply_bitset_filter(
     filter: &RuntimeBitsetFilter,
-    ltype: &crate::types::TPrimitiveType,
+    ltype: &crate::thrift::types::TPrimitiveType,
     has_null: bool,
     array: ArrayRef,
     keep: &mut [bool],

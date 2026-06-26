@@ -35,7 +35,7 @@ use crate::exec::pipeline::schedule::event_scheduler::EventScheduler;
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::QueryId;
 use crate::runtime::runtime_state::RuntimeState;
-use crate::types;
+use crate::thrift::types;
 
 /// Fragment-scoped runtime context shared across drivers and operator instances.
 pub(crate) struct FragmentContext {

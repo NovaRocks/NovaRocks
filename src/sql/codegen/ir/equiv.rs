@@ -473,7 +473,7 @@ mod tests {
             .plan
             .nodes
             .iter()
-            .find(|node| node.node_type == crate::plan_nodes::TPlanNodeType::DECODE_NODE)
+            .find(|node| node.node_type == crate::thrift::plan_nodes::TPlanNodeType::DECODE_NODE)
             .expect("decode node");
         let decode_payload = decode.decode_node.as_ref().expect("decode payload");
         let mapping = decode_payload
@@ -501,7 +501,7 @@ mod tests {
         let union = root.plan.nodes.first().expect("set op root");
         assert_eq!(
             union.node_type,
-            crate::plan_nodes::TPlanNodeType::UNION_NODE
+            crate::thrift::plan_nodes::TPlanNodeType::UNION_NODE
         );
         assert_eq!(union.num_children, 2);
         let first_expr = &union
@@ -511,7 +511,7 @@ mod tests {
             .result_expr_lists[0][0];
         assert_eq!(
             first_expr.nodes[0].node_type,
-            crate::exprs::TExprNodeType::SLOT_REF,
+            crate::thrift::exprs::TExprNodeType::SLOT_REF,
             "first set-op expression should read the declared string child column directly"
         );
     }
@@ -731,7 +731,7 @@ mod tests {
         let root = fragment_by_id("iceberg_sink", &distributed, distributed.root_fragment_id);
         assert_eq!(
             root.output_sink.type_,
-            crate::data_sinks::TDataSinkType::ICEBERG_TABLE_SINK
+            crate::thrift::data_sinks::TDataSinkType::ICEBERG_TABLE_SINK
         );
         assert!(
             root.output_sink.iceberg_table_sink.is_some(),
@@ -941,7 +941,7 @@ mod tests {
 
     fn assert_plan_node_ids_unique(
         case_name: &str,
-        plan: &crate::plan_nodes::TPlan,
+        plan: &crate::thrift::plan_nodes::TPlan,
         allows_direct_exec: bool,
     ) -> BTreeSet<i32> {
         if !allows_direct_exec {
@@ -962,7 +962,10 @@ mod tests {
         node_ids
     }
 
-    fn assert_plan_node_ids_follow_preorder(case_name: &str, plan: &crate::plan_nodes::TPlan) {
+    fn assert_plan_node_ids_follow_preorder(
+        case_name: &str,
+        plan: &crate::thrift::plan_nodes::TPlan,
+    ) {
         if plan.nodes.is_empty() {
             return;
         }
@@ -977,7 +980,7 @@ mod tests {
 
     fn assert_plan_subtree_node_ids_follow_preorder(
         case_name: &str,
-        nodes: &[crate::plan_nodes::TPlanNode],
+        nodes: &[crate::thrift::plan_nodes::TPlanNode],
         root_idx: usize,
     ) -> usize {
         let root = nodes
@@ -1094,7 +1097,7 @@ mod tests {
             });
         assert_eq!(
             node.node_type,
-            crate::plan_nodes::TPlanNodeType::EXCHANGE_NODE,
+            crate::thrift::plan_nodes::TPlanNodeType::EXCHANGE_NODE,
             "{case_name}: fragment {} {label} node {} must be EXCHANGE_NODE",
             fragment.fragment_id,
             node_id

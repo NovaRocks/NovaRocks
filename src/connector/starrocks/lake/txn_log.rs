@@ -4090,13 +4090,13 @@ mod tests {
     use crate::formats::starrocks::writer::layout::{
         DATA_DIR, join_tablet_path, txn_log_file_path, txn_log_file_path_with_load_id,
     };
-    use crate::frontend_service;
     use crate::service::frontend_rpc::test_clear_shared_host_pools;
     use crate::service::grpc_client::proto::starrocks::{
         BinaryPredicatePb, ColumnPb, DeletePredicatePb, KeysType, PUniqueId, RowsetMetadataPb,
         TabletMetadataPb, TabletSchemaPb,
     };
-    use crate::{status, status_code};
+    use crate::thrift::frontend_service;
+    use crate::thrift::{status, status_code};
     mod fe_rpc_server {
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),

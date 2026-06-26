@@ -17,7 +17,7 @@
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use arrow::datatypes::DataType;
 
-use crate::exprs;
+use crate::thrift::exprs;
 
 /// Lower CASE_EXPR expression to ExprNode::Case.
 pub(crate) fn lower_case(

@@ -3868,7 +3868,7 @@ mod tests {
     use crate::exec::chunk::{Chunk, ChunkFieldSchema, ChunkSchema, ChunkSlotSchema};
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
     use crate::lower::type_lowering::scalar_type_desc;
-    use crate::types;
+    use crate::thrift::types;
     use arrow::array::{
         ArrayRef, BinaryArray, Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Int8Array,
         Int32Array, Int64Array, LargeBinaryArray, StringArray, StructArray,

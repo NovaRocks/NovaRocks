@@ -285,7 +285,7 @@ impl IcebergCommitCollector {
     /// becomes visible to the commit-action or abort log.
     pub(crate) fn convert_sink_commit_info(
         &self,
-        info: crate::types::TSinkCommitInfo,
+        info: crate::thrift::types::TSinkCommitInfo,
     ) -> Result<WrittenFile, String> {
         let df = info
             .iceberg_data_file
@@ -298,7 +298,7 @@ impl IcebergCommitCollector {
     /// where the engine already collected all writer reports.
     pub(crate) fn inject_sink_commit_info(
         &self,
-        info: crate::types::TSinkCommitInfo,
+        info: crate::thrift::types::TSinkCommitInfo,
     ) -> Result<(), String> {
         self.inject_sink_commit_infos([info])
     }
@@ -308,7 +308,7 @@ impl IcebergCommitCollector {
     /// abort log remain unchanged.
     pub(crate) fn inject_sink_commit_infos<I>(&self, infos: I) -> Result<(), String>
     where
-        I: IntoIterator<Item = crate::types::TSinkCommitInfo>,
+        I: IntoIterator<Item = crate::thrift::types::TSinkCommitInfo>,
     {
         let files = infos
             .into_iter()
@@ -365,7 +365,7 @@ impl IcebergCommitCollector {
     ///   `runtime::sink_commit::take_sketch_sets`), which is in-process today.
     ///   Cross-node sketch transport is required only when multi-BE append is
     ///   cut over and is out of scope for PR-0.
-    fn convert(&self, df: crate::types::TIcebergDataFile) -> Result<WrittenFile, String> {
+    fn convert(&self, df: crate::thrift::types::TIcebergDataFile) -> Result<WrittenFile, String> {
         use iceberg::spec::{DataContentType, DataFileFormat};
 
         let path = df
@@ -379,11 +379,15 @@ impl IcebergCommitCollector {
         };
         let content = match df
             .file_content
-            .unwrap_or(crate::types::TIcebergFileContent::DATA)
+            .unwrap_or(crate::thrift::types::TIcebergFileContent::DATA)
         {
-            crate::types::TIcebergFileContent::DATA => DataContentType::Data,
-            crate::types::TIcebergFileContent::POSITION_DELETES => DataContentType::PositionDeletes,
-            crate::types::TIcebergFileContent::EQUALITY_DELETES => DataContentType::EqualityDeletes,
+            crate::thrift::types::TIcebergFileContent::DATA => DataContentType::Data,
+            crate::thrift::types::TIcebergFileContent::POSITION_DELETES => {
+                DataContentType::PositionDeletes
+            }
+            crate::thrift::types::TIcebergFileContent::EQUALITY_DELETES => {
+                DataContentType::EqualityDeletes
+            }
             other => {
                 return Err(format!(
                     "unexpected TIcebergFileContent variant {other:?} in sink_commit_info"
@@ -1015,7 +1019,7 @@ mod parity_tests {
             &values, spec_id, &metadata,
         )
         .expect("descriptor");
-        let thrift = crate::types::TIcebergDataFile {
+        let thrift = crate::thrift::types::TIcebergDataFile {
             path: Some("file:///warehouse/t/data/a.parquet".to_string()),
             format: Some("PARQUET".to_string()),
             record_count: Some(1),
@@ -1024,7 +1028,7 @@ mod parity_tests {
             split_offsets: None,
             column_stats: None,
             partition_null_fingerprint: Some("0".to_string()),
-            file_content: Some(crate::types::TIcebergFileContent::DATA),
+            file_content: Some(crate::thrift::types::TIcebergFileContent::DATA),
             referenced_data_file: None,
             first_row_id: None,
             content_offset: None,
@@ -1046,7 +1050,7 @@ mod parity_tests {
     #[test]
     fn convert_rejects_missing_partition_descriptor() {
         let (collector, _metadata, spec_id) = string_partition_collector();
-        let thrift = crate::types::TIcebergDataFile {
+        let thrift = crate::thrift::types::TIcebergDataFile {
             path: Some("file:///warehouse/t/data/a.parquet".to_string()),
             format: Some("PARQUET".to_string()),
             record_count: Some(1),
@@ -1055,7 +1059,7 @@ mod parity_tests {
             split_offsets: None,
             column_stats: None,
             partition_null_fingerprint: Some("0".to_string()),
-            file_content: Some(crate::types::TIcebergFileContent::DATA),
+            file_content: Some(crate::thrift::types::TIcebergFileContent::DATA),
             referenced_data_file: None,
             first_row_id: None,
             content_offset: None,
@@ -1087,7 +1091,7 @@ mod parity_tests {
             &values, spec_id, &metadata,
         )
         .expect("descriptor");
-        let thrift = crate::types::TIcebergDataFile {
+        let thrift = crate::thrift::types::TIcebergDataFile {
             path: Some("file:///warehouse/t/data/a.parquet".to_string()),
             format: Some("PARQUET".to_string()),
             record_count: Some(1),
@@ -1096,7 +1100,7 @@ mod parity_tests {
             split_offsets: None,
             column_stats: None,
             partition_null_fingerprint: Some("0".to_string()),
-            file_content: Some(crate::types::TIcebergFileContent::DATA),
+            file_content: Some(crate::thrift::types::TIcebergFileContent::DATA),
             referenced_data_file: None,
             first_row_id: None,
             content_offset: None,
@@ -1127,7 +1131,7 @@ mod parity_tests {
             &values, spec_id, &metadata,
         )
         .expect("descriptor");
-        let thrift = crate::types::TIcebergDataFile {
+        let thrift = crate::thrift::types::TIcebergDataFile {
             path: Some("file:///warehouse/t/data/a.parquet".to_string()),
             format: Some("PARQUET".to_string()),
             record_count: Some(1),
@@ -1136,7 +1140,7 @@ mod parity_tests {
             split_offsets: None,
             column_stats: None,
             partition_null_fingerprint: Some("0".to_string()),
-            file_content: Some(crate::types::TIcebergFileContent::DATA),
+            file_content: Some(crate::thrift::types::TIcebergFileContent::DATA),
             referenced_data_file: None,
             first_row_id: None,
             content_offset: None,
@@ -1195,7 +1199,7 @@ mod parity_tests {
             String::new(),
             String::new(),
             "PARQUET".to_string(),
-            crate::types::TIcebergFileContent::DATA,
+            crate::thrift::types::TIcebergFileContent::DATA,
             Some(0),
             &metadata,
         )
@@ -1225,7 +1229,7 @@ mod parity_tests {
             String::new(),
             String::new(),
             "PARQUET".to_string(),
-            crate::types::TIcebergFileContent::DATA,
+            crate::thrift::types::TIcebergFileContent::DATA,
             Some(0),
             &metadata,
         )
@@ -1233,7 +1237,7 @@ mod parity_tests {
 
         let collector = unpartitioned_collector(int_schema());
         collector
-            .inject_sink_commit_info(crate::types::TSinkCommitInfo {
+            .inject_sink_commit_info(crate::thrift::types::TSinkCommitInfo {
                 iceberg_data_file: Some(thrift),
                 ..Default::default()
             })
@@ -1255,7 +1259,7 @@ mod parity_tests {
     fn inject_sink_commit_info_rejects_missing_data_file() {
         let collector = unpartitioned_collector(int_schema());
         let err = collector
-            .inject_sink_commit_info(crate::types::TSinkCommitInfo {
+            .inject_sink_commit_info(crate::thrift::types::TSinkCommitInfo {
                 iceberg_data_file: None,
                 ..Default::default()
             })
@@ -1283,7 +1287,7 @@ mod parity_tests {
             String::new(),
             String::new(),
             "PARQUET".to_string(),
-            crate::types::TIcebergFileContent::DATA,
+            crate::thrift::types::TIcebergFileContent::DATA,
             Some(0),
             &metadata,
         )
@@ -1292,11 +1296,11 @@ mod parity_tests {
         let collector = unpartitioned_collector(int_schema());
         let err = collector
             .inject_sink_commit_infos([
-                crate::types::TSinkCommitInfo {
+                crate::thrift::types::TSinkCommitInfo {
                     iceberg_data_file: Some(thrift),
                     ..Default::default()
                 },
-                crate::types::TSinkCommitInfo {
+                crate::thrift::types::TSinkCommitInfo {
                     iceberg_data_file: None,
                     ..Default::default()
                 },
@@ -1341,7 +1345,7 @@ mod parity_tests {
             String::new(),
             String::new(),
             "PARQUET".to_string(),
-            crate::types::TIcebergFileContent::EQUALITY_DELETES,
+            crate::thrift::types::TIcebergFileContent::EQUALITY_DELETES,
             Some(0),
             &metadata,
         )
@@ -1393,7 +1397,7 @@ mod parity_tests {
             "k1=5".to_string(),
             String::new(),
             "PARQUET".to_string(),
-            crate::types::TIcebergFileContent::DATA,
+            crate::thrift::types::TIcebergFileContent::DATA,
             Some(0),
             &metadata,
         )
@@ -1447,7 +1451,7 @@ mod parity_tests {
             "k1_bucket=2".to_string(),
             String::new(),
             "PARQUET".to_string(),
-            crate::types::TIcebergFileContent::DATA,
+            crate::thrift::types::TIcebergFileContent::DATA,
             Some(0),
             &metadata,
         )
@@ -1492,7 +1496,7 @@ mod parity_tests {
             String::new(),
             String::new(),
             "PARQUET".to_string(),
-            crate::types::TIcebergFileContent::DATA,
+            crate::thrift::types::TIcebergFileContent::DATA,
             Some(0),
             &metadata,
         )
@@ -1520,13 +1524,13 @@ mod parity_tests {
                 &metadata,
             )
             .expect("descriptor");
-        let thrift = crate::types::TIcebergDataFile {
+        let thrift = crate::thrift::types::TIcebergDataFile {
             path: Some("file:///t/data-variant.parquet".to_string()),
             format: Some("PARQUET".to_string()),
             record_count: Some(1),
             file_size_in_bytes: Some(10),
             partition_path: Some(String::new()),
-            column_stats: Some(crate::types::TIcebergColumnStats {
+            column_stats: Some(crate::thrift::types::TIcebergColumnStats {
                 column_sizes: Some(BTreeMap::from([(2, 8)])),
                 value_counts: Some(BTreeMap::from([(2, 1)])),
                 null_value_counts: Some(BTreeMap::from([(2, 0)])),
@@ -1535,7 +1539,7 @@ mod parity_tests {
                 upper_bounds: Some(BTreeMap::from([(2, vec![4, 5, 6])])),
             }),
             partition_null_fingerprint: Some(String::new()),
-            file_content: Some(crate::types::TIcebergFileContent::DATA),
+            file_content: Some(crate::thrift::types::TIcebergFileContent::DATA),
             partition_values_descriptor: Some(partition_values_descriptor),
             partition_spec_id: Some(partition_spec_id),
             ..Default::default()
@@ -1612,12 +1616,12 @@ mod tests {
     #[test]
     fn convert_preserves_puffin_dv_descriptor() {
         let collector = unpartitioned_collector(int_schema());
-        let df = crate::types::TIcebergDataFile {
+        let df = crate::thrift::types::TIcebergDataFile {
             path: Some("s3://b/data/dv-00000000.puffin".to_string()),
             format: Some("puffin".to_string()),
             record_count: Some(3),
             file_size_in_bytes: Some(40),
-            file_content: Some(crate::types::TIcebergFileContent::POSITION_DELETES),
+            file_content: Some(crate::thrift::types::TIcebergFileContent::POSITION_DELETES),
             referenced_data_file: Some("s3://b/data/f.parquet".to_string()),
             partition_spec_id: Some(0),
             partition_values_descriptor: Some(
@@ -1644,13 +1648,15 @@ mod tests {
         );
     }
 
-    fn valid_puffin_dv_file(collector: &IcebergCommitCollector) -> crate::types::TIcebergDataFile {
-        crate::types::TIcebergDataFile {
+    fn valid_puffin_dv_file(
+        collector: &IcebergCommitCollector,
+    ) -> crate::thrift::types::TIcebergDataFile {
+        crate::thrift::types::TIcebergDataFile {
             path: Some("s3://b/data/dv-00000000.puffin".to_string()),
             format: Some("puffin".to_string()),
             record_count: Some(3),
             file_size_in_bytes: Some(40),
-            file_content: Some(crate::types::TIcebergFileContent::POSITION_DELETES),
+            file_content: Some(crate::thrift::types::TIcebergFileContent::POSITION_DELETES),
             referenced_data_file: Some("s3://b/data/f.parquet".to_string()),
             partition_spec_id: Some(0),
             partition_values_descriptor: Some(
@@ -1706,12 +1712,12 @@ mod tests {
     #[test]
     fn convert_parses_supported_non_parquet_format() {
         let collector = unpartitioned_collector(int_schema());
-        let df = crate::types::TIcebergDataFile {
+        let df = crate::thrift::types::TIcebergDataFile {
             path: Some("s3://b/data/a.orc".to_string()),
             format: Some("ORC".to_string()),
             record_count: Some(3),
             file_size_in_bytes: Some(40),
-            file_content: Some(crate::types::TIcebergFileContent::DATA),
+            file_content: Some(crate::thrift::types::TIcebergFileContent::DATA),
             partition_spec_id: Some(0),
             partition_values_descriptor: Some(
                 crate::connector::iceberg::write_descriptor::encode_partition_descriptor(
@@ -1732,12 +1738,12 @@ mod tests {
     #[test]
     fn convert_rejects_unsupported_format() {
         let collector = unpartitioned_collector(int_schema());
-        let df = crate::types::TIcebergDataFile {
+        let df = crate::thrift::types::TIcebergDataFile {
             path: Some("s3://b/data/a.csv".to_string()),
             format: Some("csv".to_string()),
             record_count: Some(3),
             file_size_in_bytes: Some(40),
-            file_content: Some(crate::types::TIcebergFileContent::DATA),
+            file_content: Some(crate::thrift::types::TIcebergFileContent::DATA),
             partition_spec_id: Some(0),
             partition_values_descriptor: Some(
                 crate::connector::iceberg::write_descriptor::encode_partition_descriptor(

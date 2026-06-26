@@ -22,7 +22,7 @@ use crate::common::ids::SlotId;
 use crate::fs::path::{ScanPathScheme, classify_scan_paths};
 use crate::runtime::starlet_shard_registry::{self, S3StoreConfig, StarletShardInfo};
 use crate::service::grpc_client::proto::starrocks::TabletSchemaPb;
-use crate::types;
+use crate::thrift::types;
 
 #[derive(Clone)]
 pub(crate) struct TabletRuntimeEntry {

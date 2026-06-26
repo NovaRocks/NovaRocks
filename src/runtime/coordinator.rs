@@ -25,11 +25,8 @@ use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::common::ids::SlotId;
-use crate::data_sinks;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::novarocks_logging::debug;
-use crate::partitions;
-use crate::planner;
 use crate::runtime::dispatcher::{FetchOutcome, FragmentDispatcher};
 use crate::runtime::exec_params::{ExecPlanFragmentParamOptions, build_exec_plan_fragment_params};
 use crate::runtime::query_state::QueryState;
@@ -38,12 +35,15 @@ use crate::runtime::write_coordinator::{
     WriteAbortInput, WriteCommitInput, WriteCoordinator, WriterKey, register_query,
     unregister_query,
 };
-use crate::runtime_filter;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::codegen::{
     FragmentEdge, FragmentEdgeKind, FragmentId, MultiFragmentBuildResult, RuntimeFilterPlanResult,
 };
-use crate::types;
+use crate::thrift::data_sinks;
+use crate::thrift::partitions;
+use crate::thrift::planner;
+use crate::thrift::runtime_filter;
+use crate::thrift::types;
 
 use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 
@@ -57,7 +57,7 @@ pub(crate) struct CoordinatedQueryResult {
     pub(crate) query_result: QueryResult,
     pub(crate) write_commit: Option<WriteCommitInput>,
     pub(crate) write_abort: Option<WriteAbortInput>,
-    pub(crate) fragment_profiles: Vec<crate::runtime_profile::TRuntimeProfileTree>,
+    pub(crate) fragment_profiles: Vec<crate::thrift::runtime_profile::TRuntimeProfileTree>,
 }
 
 /// Coordinates multi-fragment query execution across one or more backends.
@@ -69,7 +69,7 @@ pub(crate) struct ExecutionCoordinator {
     build_result: MultiFragmentBuildResult,
     dispatcher: Arc<dyn FragmentDispatcher>,
     scheduler: Arc<FragmentScheduler>,
-    query_options: Option<crate::internal_service::TQueryOptions>,
+    query_options: Option<crate::thrift::internal_service::TQueryOptions>,
 }
 
 impl ExecutionCoordinator {
@@ -77,7 +77,7 @@ impl ExecutionCoordinator {
         build_result: MultiFragmentBuildResult,
         dispatcher: Arc<dyn FragmentDispatcher>,
         scheduler: Arc<FragmentScheduler>,
-        query_options: Option<crate::internal_service::TQueryOptions>,
+        query_options: Option<crate::thrift::internal_service::TQueryOptions>,
     ) -> Self {
         Self {
             build_result,
@@ -268,7 +268,10 @@ impl ExecutionCoordinator {
         // are registered before an upstream producer can fail or send data.
         let mut submissions_by_fragment: BTreeMap<
             FragmentId,
-            Vec<(usize, crate::internal_service::TExecPlanFragmentParams)>,
+            Vec<(
+                usize,
+                crate::thrift::internal_service::TExecPlanFragmentParams,
+            )>,
         > = BTreeMap::new();
         let mut expected_writers = Vec::new();
 
@@ -373,7 +376,7 @@ impl ExecutionCoordinator {
                     None::<i64>,
                     None::<i64>,
                     fr.query_global_dicts.clone(),
-                    None::<Vec<crate::data::TGlobalDict>>,
+                    None::<Vec<crate::thrift::data::TGlobalDict>>,
                     None::<planner::TCacheParam>,
                     fr.query_global_dict_exprs.clone(),
                     None::<planner::TGroupExecutionParam>,
@@ -427,8 +430,10 @@ impl ExecutionCoordinator {
         if !submissions_by_fragment.contains_key(&root_fragment_id) {
             return Err("root fragment produced no placement".to_string());
         }
-        let mut submissions: Vec<(usize, crate::internal_service::TExecPlanFragmentParams)> =
-            Vec::new();
+        let mut submissions: Vec<(
+            usize,
+            crate::thrift::internal_service::TExecPlanFragmentParams,
+        )> = Vec::new();
         for fragment_id in topological_sort_bottom_up(&fragment_results, &edges)?
             .into_iter()
             .rev()
@@ -573,7 +578,7 @@ fn build_root_expected_chunk_schema(
             ));
         }
         let node = &expr.nodes[0];
-        if node.node_type != crate::exprs::TExprNodeType::SLOT_REF {
+        if node.node_type != crate::thrift::exprs::TExprNodeType::SLOT_REF {
             return Err(format!(
                 "root typed result output expr {idx} must be SLOT_REF, got {:?}",
                 node.node_type
@@ -695,7 +700,7 @@ fn align_fetch_chunk_to_output_columns(
 fn unpartitioned_partition() -> partitions::TDataPartition {
     partitions::TDataPartition::new(
         partitions::TPartitionType::UNPARTITIONED,
-        None::<Vec<crate::exprs::TExpr>>,
+        None::<Vec<crate::thrift::exprs::TExpr>>,
         None::<Vec<partitions::TRangePartition>>,
         None::<Vec<partitions::TBucketProperty>>,
     )
@@ -747,7 +752,7 @@ fn wrap_multi_cast_sink(
     )
 }
 
-fn is_write_sink(params: &crate::internal_service::TExecPlanFragmentParams) -> bool {
+fn is_write_sink(params: &crate::thrift::internal_service::TExecPlanFragmentParams) -> bool {
     params
         .fragment
         .as_ref()
@@ -768,7 +773,9 @@ fn data_sink_requires_write_report(sink: &data_sinks::TDataSink) -> bool {
     )
 }
 
-fn uses_result_buffer_sink(params: &crate::internal_service::TExecPlanFragmentParams) -> bool {
+fn uses_result_buffer_sink(
+    params: &crate::thrift::internal_service::TExecPlanFragmentParams,
+) -> bool {
     matches!(
         params
             .fragment
@@ -780,7 +787,10 @@ fn uses_result_buffer_sink(params: &crate::internal_service::TExecPlanFragmentPa
 }
 
 fn root_uses_result_buffer(
-    submissions: &[(usize, crate::internal_service::TExecPlanFragmentParams)],
+    submissions: &[(
+        usize,
+        crate::thrift::internal_service::TExecPlanFragmentParams,
+    )],
     root_finst_id: &types::TUniqueId,
 ) -> Result<bool, String> {
     let root = submissions
@@ -806,7 +816,10 @@ fn root_uses_result_buffer(
 }
 
 fn root_uses_typed_result_sink(
-    submissions: &[(usize, crate::internal_service::TExecPlanFragmentParams)],
+    submissions: &[(
+        usize,
+        crate::thrift::internal_service::TExecPlanFragmentParams,
+    )],
     root_finst_id: &types::TUniqueId,
 ) -> Result<bool, String> {
     let root = submissions
@@ -1057,7 +1070,7 @@ impl Drop for StandaloneQueryFailureGuard {
 #[derive(Default)]
 struct StandaloneQueryProfileRegistry {
     active: BTreeSet<(i64, i64)>,
-    profiles: BTreeMap<(i64, i64), Vec<crate::runtime_profile::TRuntimeProfileTree>>,
+    profiles: BTreeMap<(i64, i64), Vec<crate::thrift::runtime_profile::TRuntimeProfileTree>>,
 }
 
 fn standalone_query_profiles() -> &'static Mutex<StandaloneQueryProfileRegistry> {
@@ -1066,7 +1079,7 @@ fn standalone_query_profiles() -> &'static Mutex<StandaloneQueryProfileRegistry>
 }
 
 pub(crate) fn record_standalone_query_profile_report(
-    params: &crate::frontend_service::TReportExecStatusParams,
+    params: &crate::thrift::frontend_service::TReportExecStatusParams,
 ) -> Result<bool, String> {
     let Some(query_id) = params.query_id.as_ref() else {
         return Ok(false);
@@ -1085,7 +1098,7 @@ pub(crate) fn record_standalone_query_profile_report(
         .as_ref()
         .ok_or_else(|| "TReportExecStatusParams missing status".to_string())?;
     if done
-        && status.status_code == crate::status_code::TStatusCode::OK
+        && status.status_code == crate::thrift::status_code::TStatusCode::OK
         && let Some(profile) = params.profile.as_ref()
     {
         guard.profiles.entry(key).or_default().push(profile.clone());
@@ -1105,7 +1118,7 @@ fn standalone_query_profile_count(query_id: &types::TUniqueId) -> usize {
 
 fn take_standalone_query_profiles(
     query_id: &types::TUniqueId,
-) -> Vec<crate::runtime_profile::TRuntimeProfileTree> {
+) -> Vec<crate::thrift::runtime_profile::TRuntimeProfileTree> {
     standalone_query_profiles()
         .lock()
         .expect("standalone query profile registry lock")
@@ -1145,7 +1158,7 @@ pub(crate) struct SubmitAndFetchResult {
     pub(crate) chunks: Vec<crate::exec::chunk::Chunk>,
     pub(crate) write_commit: Option<WriteCommitInput>,
     pub(crate) write_abort: Option<WriteAbortInput>,
-    pub(crate) fragment_profiles: Vec<crate::runtime_profile::TRuntimeProfileTree>,
+    pub(crate) fragment_profiles: Vec<crate::thrift::runtime_profile::TRuntimeProfileTree>,
 }
 
 struct QueryStateRegistrationGuard {
@@ -1170,7 +1183,10 @@ impl Drop for QueryStateRegistrationGuard {
 pub(crate) fn submit_and_fetch_loop(
     dispatcher: &Arc<dyn FragmentDispatcher>,
     tracker: &mut InFlightTracker,
-    submissions: Vec<(usize, crate::internal_service::TExecPlanFragmentParams)>,
+    submissions: Vec<(
+        usize,
+        crate::thrift::internal_service::TExecPlanFragmentParams,
+    )>,
     root_backend_idx: usize,
     root_finst_id: types::TUniqueId,
     query_id: &types::TUniqueId,
@@ -1345,7 +1361,7 @@ fn wait_for_profile_reports(
     deadline: std::time::Instant,
     timeout_ms: i64,
     runtime_query_id: crate::runtime::query_context::QueryId,
-) -> Result<Vec<crate::runtime_profile::TRuntimeProfileTree>, String> {
+) -> Result<Vec<crate::thrift::runtime_profile::TRuntimeProfileTree>, String> {
     const PROFILE_REPORT_POLL_INTERVAL_MS: i64 = 10;
 
     if expected_reports == 0 {
@@ -1512,7 +1528,7 @@ mod tests {
     use crate::runtime::write_coordinator::{
         FragmentExecStatusReport, WriteCoordinator, WriterKey, write_registry_test_guard,
     };
-    use crate::{status, status_code};
+    use crate::thrift::{status, status_code};
     use arrow::array::{
         Array, ArrayRef, BinaryArray, Decimal128Array, FixedSizeBinaryArray, Int32Array,
     };
@@ -1695,7 +1711,7 @@ mod tests {
         fn submit_fragment(
             &self,
             _backend_idx: usize,
-            params: crate::internal_service::TExecPlanFragmentParams,
+            params: crate::thrift::internal_service::TExecPlanFragmentParams,
         ) -> Result<(), String> {
             let finst = params
                 .params
@@ -1885,7 +1901,7 @@ mod tests {
         fn submit_fragment(
             &self,
             _backend_idx: usize,
-            params: crate::internal_service::TExecPlanFragmentParams,
+            params: crate::thrift::internal_service::TExecPlanFragmentParams,
         ) -> Result<(), String> {
             let n = self.submit_count.fetch_add(1, Ordering::SeqCst) + 1;
             if self.fail_on_submit == Some(n) {
@@ -1934,7 +1950,7 @@ mod tests {
         fn submit_fragment(
             &self,
             _backend_idx: usize,
-            params: crate::internal_service::TExecPlanFragmentParams,
+            params: crate::thrift::internal_service::TExecPlanFragmentParams,
         ) -> Result<(), String> {
             let finst_id = params
                 .params
@@ -1985,7 +2001,7 @@ mod tests {
         fn submit_fragment(
             &self,
             _backend_idx: usize,
-            params: crate::internal_service::TExecPlanFragmentParams,
+            params: crate::thrift::internal_service::TExecPlanFragmentParams,
         ) -> Result<(), String> {
             let finst_id = params
                 .params
@@ -2029,7 +2045,7 @@ mod tests {
         fn submit_fragment(
             &self,
             _backend_idx: usize,
-            params: crate::internal_service::TExecPlanFragmentParams,
+            params: crate::thrift::internal_service::TExecPlanFragmentParams,
         ) -> Result<(), String> {
             let finst_id = params
                 .params
@@ -2071,8 +2087,8 @@ mod tests {
     fn make_params_with_finst(
         hi: i64,
         lo: i64,
-    ) -> crate::internal_service::TExecPlanFragmentParams {
-        use crate::{data_sinks, internal_service, partitions, types};
+    ) -> crate::thrift::internal_service::TExecPlanFragmentParams {
+        use crate::thrift::{data_sinks, internal_service, partitions, types};
 
         let result_sink = data_sinks::TDataSink::new(
             data_sinks::TDataSinkType::RESULT_SINK,
@@ -2092,23 +2108,23 @@ mod tests {
             None::<i64>,
             None::<data_sinks::TSplitDataStreamSink>,
         );
-        let fragment = crate::planner::TPlanFragment::new(
-            None::<crate::plan_nodes::TPlan>,
-            None::<Vec<crate::exprs::TExpr>>,
+        let fragment = crate::thrift::planner::TPlanFragment::new(
+            None::<crate::thrift::plan_nodes::TPlan>,
+            None::<Vec<crate::thrift::exprs::TExpr>>,
             Some(result_sink),
             partitions::TDataPartition::new(
                 partitions::TPartitionType::UNPARTITIONED,
-                None::<Vec<crate::exprs::TExpr>>,
+                None::<Vec<crate::thrift::exprs::TExpr>>,
                 None::<Vec<partitions::TRangePartition>>,
                 None::<Vec<partitions::TBucketProperty>>,
             ),
             None::<i64>,
             None::<i64>,
-            None::<Vec<crate::data::TGlobalDict>>,
-            None::<Vec<crate::data::TGlobalDict>>,
-            None::<crate::planner::TCacheParam>,
-            None::<std::collections::BTreeMap<i32, crate::exprs::TExpr>>,
-            None::<crate::planner::TGroupExecutionParam>,
+            None::<Vec<crate::thrift::data::TGlobalDict>>,
+            None::<Vec<crate::thrift::data::TGlobalDict>>,
+            None::<crate::thrift::planner::TCacheParam>,
+            None::<std::collections::BTreeMap<i32, crate::thrift::exprs::TExpr>>,
+            None::<crate::thrift::planner::TGroupExecutionParam>,
         );
         let exec_params = internal_service::TPlanFragmentExecParams {
             query_id: types::TUniqueId::new(hi, lo),
@@ -2132,7 +2148,7 @@ mod tests {
         internal_service::TExecPlanFragmentParams::new(
             internal_service::InternalServiceVersion::V1,
             Some(fragment),
-            None::<crate::descriptors::TDescriptorTable>,
+            None::<crate::thrift::descriptors::TDescriptorTable>,
             Some(exec_params),
             None::<types::TNetworkAddress>,
             None::<i32>,
@@ -2147,7 +2163,7 @@ mod tests {
             None::<bool>,
             None::<i32>,
             None::<std::collections::BTreeMap<types::TPlanNodeId, i32>>,
-            None::<crate::work_group::TWorkGroup>,
+            None::<crate::thrift::work_group::TWorkGroup>,
             None::<bool>,
             None::<i32>,
             None::<bool>,
@@ -2164,7 +2180,7 @@ mod tests {
 
     fn make_params_with_sink_type(
         sink_type: data_sinks::TDataSinkType,
-    ) -> crate::internal_service::TExecPlanFragmentParams {
+    ) -> crate::thrift::internal_service::TExecPlanFragmentParams {
         let mut params = make_params_with_finst(30, 40);
         params
             .fragment
@@ -2181,7 +2197,7 @@ mod tests {
         hi: i64,
         lo: i64,
         sink_type: data_sinks::TDataSinkType,
-    ) -> crate::internal_service::TExecPlanFragmentParams {
+    ) -> crate::thrift::internal_service::TExecPlanFragmentParams {
         let mut params = make_params_with_finst(hi, lo);
         params
             .fragment
@@ -2194,7 +2210,9 @@ mod tests {
         params
     }
 
-    fn is_write_sink_for_test(params: &crate::internal_service::TExecPlanFragmentParams) -> bool {
+    fn is_write_sink_for_test(
+        params: &crate::thrift::internal_service::TExecPlanFragmentParams,
+    ) -> bool {
         super::is_write_sink(params)
     }
 
@@ -2269,10 +2287,10 @@ mod tests {
     fn profile_report_params(
         query_id: types::TUniqueId,
         finst_id: types::TUniqueId,
-        profile: crate::runtime_profile::TRuntimeProfileTree,
-    ) -> crate::frontend_service::TReportExecStatusParams {
-        crate::frontend_service::TReportExecStatusParams::new(
-            crate::frontend_service::FrontendServiceVersion::V1,
+        profile: crate::thrift::runtime_profile::TRuntimeProfileTree,
+    ) -> crate::thrift::frontend_service::TReportExecStatusParams {
+        crate::thrift::frontend_service::TReportExecStatusParams::new(
+            crate::thrift::frontend_service::FrontendServiceVersion::V1,
             Some(query_id),
             Some(0),
             Some(finst_id),
@@ -2302,14 +2320,24 @@ mod tests {
         )
     }
 
-    fn profile_tree_for_plan_node(node_id: i32) -> crate::runtime_profile::TRuntimeProfileTree {
+    fn profile_tree_for_plan_node(
+        node_id: i32,
+    ) -> crate::thrift::runtime_profile::TRuntimeProfileTree {
         let profiler = crate::runtime::profile::Profiler::new("fragment");
         let common = profiler
             .child(format!("SCAN (plan_node_id={node_id})"))
             .child("CommonMetrics");
-        common.counter_set("PullRowNum", crate::metrics::TUnit::UNIT, 3);
-        common.counter_set("OperatorTotalTime", crate::metrics::TUnit::TIME_NS, 1_000);
-        common.counter_set("OperatorPeakMemoryUsage", crate::metrics::TUnit::BYTES, 64);
+        common.counter_set("PullRowNum", crate::thrift::metrics::TUnit::UNIT, 3);
+        common.counter_set(
+            "OperatorTotalTime",
+            crate::thrift::metrics::TUnit::TIME_NS,
+            1_000,
+        );
+        common.counter_set(
+            "OperatorPeakMemoryUsage",
+            crate::thrift::metrics::TUnit::BYTES,
+            64,
+        );
         profiler.to_thrift_tree()
     }
 
@@ -2319,8 +2347,11 @@ mod tests {
 
     /// Wrap a list of params as single-backend submissions (backend_idx=0).
     fn single_backend(
-        params: Vec<crate::internal_service::TExecPlanFragmentParams>,
-    ) -> Vec<(usize, crate::internal_service::TExecPlanFragmentParams)> {
+        params: Vec<crate::thrift::internal_service::TExecPlanFragmentParams>,
+    ) -> Vec<(
+        usize,
+        crate::thrift::internal_service::TExecPlanFragmentParams,
+    )> {
         params.into_iter().map(|p| (0usize, p)).collect()
     }
 
@@ -2386,7 +2417,7 @@ mod tests {
         fn submit_fragment(
             &self,
             _backend_idx: usize,
-            _params: crate::internal_service::TExecPlanFragmentParams,
+            _params: crate::thrift::internal_service::TExecPlanFragmentParams,
         ) -> Result<(), String> {
             Ok(())
         }

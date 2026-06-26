@@ -17,7 +17,7 @@
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue, function::FunctionKind};
 use arrow::datatypes::DataType;
 
-use crate::exprs;
+use crate::thrift::exprs;
 
 /// Lower ARRAY_ELEMENT_EXPR to internal array `element_at` function.
 pub(crate) fn lower_array_element_expr(
@@ -250,7 +250,7 @@ fn literal_struct_subscript(arena: &ExprArena, subscript: ExprId) -> Result<i64,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{TTypeDesc, TTypeNode, TTypeNodeType};
+    use crate::thrift::types::{TTypeDesc, TTypeNode, TTypeNodeType};
     use std::sync::Arc;
 
     fn create_dummy_type() -> TTypeDesc {

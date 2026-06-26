@@ -49,7 +49,7 @@ use crate::runtime::query_context::{
 };
 use crate::runtime::result_buffer;
 use crate::service::fe_report;
-use crate::{data, data_sinks, descriptors, exprs, internal_service, planner, types};
+use crate::thrift::{data, data_sinks, descriptors, exprs, internal_service, planner, types};
 
 const STATISTIC_DATA_VERSION_V1: i32 = 1;
 const STATISTIC_HISTOGRAM_VERSION: i32 = 2;
@@ -1082,7 +1082,7 @@ fn spawn_exec_fragment(
                 crate::runtime::profile::clamp_u128_to_i64(wall_start.elapsed().as_nanos());
             p.counter_set(
                 "QueryExecutionWallTime",
-                crate::metrics::TUnit::TIME_NS,
+                crate::thrift::metrics::TUnit::TIME_NS,
                 elapsed_ns,
             );
         }
@@ -1683,14 +1683,14 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{mark_query_failed_from_report, validate_internal_addresses};
-    use crate::{
-        common::types::UniqueId,
+    use crate::common::types::UniqueId;
+    use crate::runtime::{
+        exchange::{ExchangeKey, set_expected_senders, snapshot_receiver_state},
+        query_context::{QueryId, query_context_manager},
+        result_buffer::{self, FetchErrorKind, TryFetchResult},
+    };
+    use crate::thrift::{
         data_sinks, descriptors, exprs, internal_service, partitions, plan_nodes, planner,
-        runtime::{
-            exchange::{ExchangeKey, set_expected_senders, snapshot_receiver_state},
-            query_context::{QueryId, query_context_manager},
-            result_buffer::{self, FetchErrorKind, TryFetchResult},
-        },
         runtime_filter, types,
     };
 

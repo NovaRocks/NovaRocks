@@ -404,20 +404,20 @@ fn run_send_task(task: ExchangeSendTask, inflight: Arc<AtomicUsize>, reserve_byt
     if let Some(profile) = task.profiles.as_ref() {
         profile
             .common
-            .counter_add("RequestSent", crate::metrics::TUnit::UNIT, 1);
+            .counter_add("RequestSent", crate::thrift::metrics::TUnit::UNIT, 1);
         profile.common.counter_add(
             "BytesSent",
-            crate::metrics::TUnit::BYTES,
+            crate::thrift::metrics::TUnit::BYTES,
             clamp_u128_to_i64(task.payload_bytes as u128),
         );
         profile.unique.counter_add(
             "NetworkTime",
-            crate::metrics::TUnit::TIME_NS,
+            crate::thrift::metrics::TUnit::TIME_NS,
             clamp_u128_to_i64(send_ns),
         );
         profile.common.counter_add(
             "OverallTime",
-            crate::metrics::TUnit::TIME_NS,
+            crate::thrift::metrics::TUnit::TIME_NS,
             clamp_u128_to_i64(task.encode_ns.saturating_add(send_ns)),
         );
     }

@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap, hash_map::Entry};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::common::engine_error::EngineError;
-use crate::{frontend_service, status, status_code, types};
+use crate::thrift::{frontend_service, status, status_code, types};
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub(crate) struct WriterKey {

@@ -1,7 +1,7 @@
 use arrow::datatypes::{DataType, Field};
 
 use crate::lower::thrift::type_lowering::scalar_type_desc;
-use crate::types;
+use crate::thrift::types;
 
 /// Metadata key on a `Field` that overrides the inferred StarRocks primitive.
 /// Mirrors `crate::sql::analyzer::helpers::NR_LOGICAL_TYPE_KEY` (kept duplicated

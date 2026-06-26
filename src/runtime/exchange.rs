@@ -1347,7 +1347,7 @@ mod tests {
     };
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
-    use crate::types;
+    use crate::thrift::types;
 
     const EXCHANGE_TEST_SLOT_IDS: [SlotId; 4] = [
         SlotId::new(33),
@@ -1738,7 +1738,7 @@ mod tests {
     fn decode_chunks_for_sender_rejects_numeric_for_opaque_descriptor() {
         use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
         use crate::lower::type_lowering::scalar_type_desc;
-        use crate::types::TPrimitiveType;
+        use crate::thrift::types::TPrimitiveType;
 
         let key = ExchangeKey {
             finst_id_hi: 501,

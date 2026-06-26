@@ -29,9 +29,9 @@ use thrift::transport::{
 };
 
 use crate::common::config;
-use crate::frontend_service::{FrontendServiceSyncClient, TFrontendServiceSyncClient};
 use crate::novarocks_logging::{debug, info, warn};
-use crate::types;
+use crate::thrift::frontend_service::{FrontendServiceSyncClient, TFrontendServiceSyncClient};
+use crate::thrift::types;
 
 type FrontendRpcClientInner = FrontendServiceSyncClient<
     TBinaryInputProtocol<TBufferedReadTransport<TReadHalf<TTcpChannel>>>,
@@ -743,11 +743,11 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
-    use crate::descriptors;
-    use crate::frontend_service;
-    use crate::status;
-    use crate::status_code;
-    use crate::types;
+    use crate::thrift::descriptors;
+    use crate::thrift::frontend_service;
+    use crate::thrift::status;
+    use crate::thrift::status_code;
+    use crate::thrift::types;
 
     use super::{
         FrontendRpcCallOptions, FrontendRpcError, FrontendRpcKind, FrontendRpcManager,
@@ -780,8 +780,8 @@ mod tests {
         status::TStatus::new(status_code::TStatusCode::OK, None)
     }
 
-    fn test_tablet_schema(schema_id: i64) -> crate::agent_service::TTabletSchema {
-        crate::agent_service::TTabletSchema {
+    fn test_tablet_schema(schema_id: i64) -> crate::thrift::agent_service::TTabletSchema {
+        crate::thrift::agent_service::TTabletSchema {
             short_key_column_count: 1,
             schema_hash: 1001,
             keys_type: types::TKeysType::DUP_KEYS,
@@ -1038,7 +1038,7 @@ mod tests {
         }));
         let schema_request = frontend_service::TBatchGetTableSchemaRequest {
             requests: Some(vec![frontend_service::TGetTableSchemaRequest {
-                schema_key: Some(crate::descriptors::TTableSchemaKey {
+                schema_key: Some(crate::thrift::descriptors::TTableSchemaKey {
                     db_id: Some(1),
                     table_id: Some(2),
                     schema_id: Some(3),

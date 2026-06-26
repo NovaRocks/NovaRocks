@@ -38,7 +38,7 @@ use crate::exec::variant::{
     VariantMetadata, VariantPathSegment, VariantValue, parse_variant_path, split_serialized,
 };
 use crate::formats::parquet::VariantPathSpec;
-use crate::types;
+use crate::thrift::types;
 
 fn is_binary_like(dt: &DataType) -> bool {
     matches!(

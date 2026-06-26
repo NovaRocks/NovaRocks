@@ -20,7 +20,7 @@ use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::lower::layout::{Layout, chunk_schema_for_layout};
 use crate::lower::node::Lowered;
 
-use crate::{descriptors, plan_nodes};
+use crate::thrift::{descriptors, plan_nodes};
 
 /// Lower a CROSS_JOIN_NODE plan node to a `Lowered` ExecNode.
 pub(crate) fn lower_cross_join_node(

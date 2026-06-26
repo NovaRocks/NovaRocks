@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 
 use crate::runtime::profile::Profiler;
-use crate::runtime_profile;
+use crate::thrift::runtime_profile;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ActualMetrics {
@@ -365,8 +365,8 @@ mod tests {
         collect_distributed_profile_summary_from_profile_trees,
         collect_per_fragment_profile_summaries, merge_actual_metrics,
     };
-    use crate::metrics;
     use crate::runtime::profile::Profiler;
+    use crate::thrift::metrics;
 
     fn add_operator_metrics(
         parent: &Profiler,

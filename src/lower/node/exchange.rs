@@ -29,7 +29,7 @@ use crate::lower::expr::lower_t_expr;
 use crate::lower::layout::{Layout, chunk_schema_for_layout};
 use crate::lower::node::{Lowered, local_rf_waiting_set};
 use crate::runtime::exchange;
-use crate::{descriptors, internal_service, plan_nodes, types};
+use crate::thrift::{descriptors, internal_service, plan_nodes, types};
 
 /// Lower an EXCHANGE_NODE plan node to a `Lowered` ExecNode.
 ///
@@ -208,9 +208,9 @@ fn build_sort_order_by(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exprs::{TExpr, TExprNode, TExprNodeType, TSlotRef};
     use crate::lower::type_lowering::scalar_type_desc;
-    use crate::types::{TPrimitiveType, TTypeDesc};
+    use crate::thrift::exprs::{TExpr, TExprNode, TExprNodeType, TSlotRef};
+    use crate::thrift::types::{TPrimitiveType, TTypeDesc};
     use std::collections::{BTreeMap, HashMap};
 
     fn dummy_type_desc() -> TTypeDesc {
@@ -338,12 +338,12 @@ mod tests {
             types::TUniqueId { hi: 3, lo: 4 },
             BTreeMap::new(),
             per_exch_num_senders,
-            None::<Vec<crate::data_sinks::TPlanFragmentDestination>>,
+            None::<Vec<crate::thrift::data_sinks::TPlanFragmentDestination>>,
             None::<i32>,
             None::<i32>,
             None::<bool>,
             None::<bool>,
-            None::<crate::runtime_filter::TRuntimeFilterParams>,
+            None::<crate::thrift::runtime_filter::TRuntimeFilterParams>,
             None::<i32>,
             None::<bool>,
             None::<BTreeMap<i32, BTreeMap<i32, Vec<internal_service::TScanRangeParams>>>>,

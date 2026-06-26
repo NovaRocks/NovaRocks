@@ -29,9 +29,9 @@ use crate::exec::runtime_filter::{
 use crate::novarocks_logging::{debug, warn};
 use crate::runtime::query_context::QueryId;
 use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
-use crate::runtime_filter;
 use crate::service::exchange_sender;
 use crate::service::grpc_client::proto::starrocks::PTransmitRuntimeFilterParams;
+use crate::thrift::runtime_filter;
 
 pub(crate) struct RuntimeFilterWorker {
     query_id: QueryId,

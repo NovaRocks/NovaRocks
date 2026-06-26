@@ -24,12 +24,12 @@ use crate::exec::node::project::ProjectNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::novarocks_logging::debug;
 
-use crate::descriptors;
-use crate::exprs;
 use crate::lower::expr::{lower_t_expr, lower_t_expr_with_common_slot_map};
 use crate::lower::layout::{Layout, layout_from_slot_ids, slot_display_name_from_desc};
 use crate::lower::node::Lowered;
-use crate::{plan_nodes, types};
+use crate::thrift::descriptors;
+use crate::thrift::exprs;
+use crate::thrift::{plan_nodes, types};
 
 fn project_slot_schema_from_desc(
     desc_tbl: &descriptors::TDescriptorTable,
@@ -325,7 +325,7 @@ mod tests {
     use super::project_output_chunk_schema;
     use crate::common::ids::SlotId;
     use crate::exec::chunk::ChunkSlotSchema;
-    use crate::types::{TPrimitiveType, TScalarType, TTypeDesc, TTypeNode, TTypeNodeType};
+    use crate::thrift::types::{TPrimitiveType, TScalarType, TTypeDesc, TTypeNode, TTypeNodeType};
 
     fn scalar_type_desc(ty: TPrimitiveType) -> TTypeDesc {
         TTypeDesc::new(vec![TTypeNode {

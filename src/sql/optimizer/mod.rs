@@ -471,10 +471,8 @@ fn explore(
                             for new_expr in new_exprs {
                                 // Dedup: compare operator AND children to avoid
                                 // infinite JoinCommutativity A<->B oscillation.
-                                let already_exists = memo.groups[group_id]
-                                    .logical_exprs
-                                    .iter()
-                                    .any(|existing| {
+                                let already_exists =
+                                    memo.groups[group_id].logical_exprs.iter().any(|existing| {
                                         existing.children == new_expr.children
                                             && op_equal(&existing.op, &new_expr.op)
                                     });
@@ -563,10 +561,8 @@ fn implement(memo: &mut Memo, rules: &[Box<dyn Rule>], options: &options::Optimi
                         for binding in bindings_slice {
                             let new_exprs = rule.apply_bound(binding, memo);
                             for new_expr in new_exprs {
-                                let already_exists = memo.groups[group_id]
-                                    .physical_exprs
-                                    .iter()
-                                    .any(|existing| {
+                                let already_exists =
+                                    memo.groups[group_id].physical_exprs.iter().any(|existing| {
                                         existing.children == new_expr.children
                                             && op_equal(&existing.op, &new_expr.op)
                                     });

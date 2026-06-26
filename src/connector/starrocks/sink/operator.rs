@@ -65,7 +65,7 @@ use crate::novarocks_logging::{debug, info};
 use crate::runtime::runtime_state::RuntimeState;
 use crate::runtime::starlet_shard_registry;
 use crate::service::grpc_client::proto::starrocks::KeysType;
-use crate::types;
+use crate::thrift::types;
 
 const LOAD_OP_COLUMN: &str = "__op";
 
@@ -798,7 +798,7 @@ fn apply_index_where_clause(
     predicate_chunk: &Chunk,
     target_chunk: &Chunk,
     index_id: i64,
-    where_clause: Option<&crate::exprs::TExpr>,
+    where_clause: Option<&crate::thrift::exprs::TExpr>,
 ) -> Result<Option<Chunk>, String> {
     let Some(where_clause) = where_clause.filter(|expr| !expr.nodes.is_empty()) else {
         return Ok(Some(target_chunk.clone()));
@@ -1326,7 +1326,7 @@ impl OlapTableSinkOperator {
     fn ingest_auto_partition_response(
         &mut self,
         auto_partition: &crate::connector::starrocks::sink::factory::AutomaticPartitionPlan,
-        response: crate::frontend_service::TCreatePartitionResult,
+        response: crate::thrift::frontend_service::TCreatePartitionResult,
     ) -> Result<(), String> {
         let partitions = response.partitions.unwrap_or_default();
         let tablets = response.tablets.unwrap_or_default();
@@ -2665,19 +2665,21 @@ mod tests {
         PartitionKeySource, PartitionMode, PartitionRoutingEntry,
     };
     use crate::connector::starrocks::sink::routing::RowRoutingPlan;
-    use crate::descriptors::{TOlapTableIndexTablets, TOlapTablePartition, TTabletLocation};
     use crate::exec::chunk::Chunk;
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
     use crate::exec::pipeline::operator::ProcessorOperator;
     use crate::formats::starrocks::writer::{StarRocksWriteFormat, layout::txn_log_file_path};
-    use crate::frontend_service;
-    use crate::frontend_service::TCreatePartitionResult;
     use crate::runtime::runtime_state::RuntimeState;
     use crate::service::frontend_rpc::test_clear_shared_host_pools;
     use crate::service::grpc_client::proto::starrocks::{
         ColumnPb, KeysType, PUniqueId, TabletSchemaPb,
     };
-    use crate::{exprs, opcodes, status, status_code, types};
+    use crate::thrift::descriptors::{
+        TOlapTableIndexTablets, TOlapTablePartition, TTabletLocation,
+    };
+    use crate::thrift::frontend_service;
+    use crate::thrift::frontend_service::TCreatePartitionResult;
+    use crate::thrift::{exprs, opcodes, status, status_code, types};
     mod fe_rpc_server {
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -3443,34 +3445,34 @@ mod tests {
         register_test_runtime(9917, new_secondary_root.clone(), secondary_tablet_schema);
 
         let response = TCreatePartitionResult::new(
-            None::<crate::status::TStatus>,
+            None::<crate::thrift::status::TStatus>,
             Some(vec![TOlapTablePartition::new(
                 3005,
-                None::<crate::exprs::TExprNode>,
-                None::<crate::exprs::TExprNode>,
+                None::<crate::thrift::exprs::TExprNode>,
+                None::<crate::thrift::exprs::TExprNode>,
                 None::<i32>,
                 vec![
                     TOlapTableIndexTablets::new(
                         10,
                         vec![9916],
-                        None::<Vec<crate::descriptors::TOlapTableTablet>>,
+                        None::<Vec<crate::thrift::descriptors::TOlapTableTablet>>,
                     ),
                     TOlapTableIndexTablets::new(
                         20,
                         vec![9917],
-                        None::<Vec<crate::descriptors::TOlapTableTablet>>,
+                        None::<Vec<crate::thrift::descriptors::TOlapTableTablet>>,
                     ),
                 ],
-                None::<Vec<crate::exprs::TExprNode>>,
-                None::<Vec<crate::exprs::TExprNode>>,
-                None::<Vec<Vec<crate::exprs::TExprNode>>>,
+                None::<Vec<crate::thrift::exprs::TExprNode>>,
+                None::<Vec<crate::thrift::exprs::TExprNode>>,
+                None::<Vec<Vec<crate::thrift::exprs::TExprNode>>>,
                 Some(false),
             )]),
             Some(vec![
                 TTabletLocation::new(9916, vec![1001]),
                 TTabletLocation::new(9917, vec![1001]),
             ]),
-            None::<Vec<crate::descriptors::TNodeInfo>>,
+            None::<Vec<crate::thrift::descriptors::TNodeInfo>>,
         );
 
         let auto_partition = op.plan.auto_partition.clone().expect("auto partition plan");

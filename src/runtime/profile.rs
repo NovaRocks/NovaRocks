@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use crate::runtime::mem_tracker::MemTracker;
-use crate::{metrics, runtime_profile};
+use crate::thrift::{metrics, runtime_profile};
 
 #[derive(Clone, Debug)]
 struct CounterSnapshot {
@@ -675,7 +675,7 @@ fn merge_counter_values(
 #[cfg(test)]
 mod tests {
     use super::{ROOT_COUNTER, RuntimeProfile};
-    use crate::metrics;
+    use crate::thrift::metrics;
 
     #[test]
     fn thrift_tree_keeps_child_counter_hierarchy() {

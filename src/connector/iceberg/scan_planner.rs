@@ -11,7 +11,7 @@ use crate::sql::catalog::{
     IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
     IcebergTableInfo,
 };
-use crate::{descriptors, exprs, internal_service, partitions, plan_nodes, types};
+use crate::thrift::{descriptors, exprs, internal_service, partitions, plan_nodes, types};
 
 const CONNECTOR_ID: &str = "iceberg";
 const ICEBERG_SCAN_SPLIT_TARGET_BYTES: i64 = 128 * 1024 * 1024;
@@ -311,12 +311,14 @@ fn build_iceberg_hdfs_scan_node(
         None::<String>,
         None::<String>,
         Some(true),
-        Some(crate::cloud_configuration::TCloudConfiguration::new(
-            None::<crate::cloud_configuration::TCloudType>,
-            None::<Vec<crate::cloud_configuration::TCloudProperty>>,
-            Some(ctx.cloud_properties.clone()),
-            None::<bool>,
-        )),
+        Some(
+            crate::thrift::cloud_configuration::TCloudConfiguration::new(
+                None::<crate::thrift::cloud_configuration::TCloudType>,
+                None::<Vec<crate::thrift::cloud_configuration::TCloudProperty>>,
+                Some(ctx.cloud_properties.clone()),
+                None::<bool>,
+            ),
+        ),
         None::<bool>,
         None::<bool>,
         None::<bool>,
@@ -325,7 +327,7 @@ fn build_iceberg_hdfs_scan_node(
         None::<String>,
         None::<bool>,
         None::<String>,
-        None::<crate::data_cache::TDataCacheOptions>,
+        None::<crate::thrift::data_cache::TDataCacheOptions>,
         None::<Vec<types::TSlotId>>,
         None::<bool>,
         None::<Vec<partitions::TBucketProperty>>,
@@ -511,7 +513,7 @@ pub(crate) fn build_hdfs_scan_range_params(
         None::<String>,
         None::<String>,
         None::<i64>,
-        None::<crate::data_cache::TDataCacheOptions>,
+        None::<crate::thrift::data_cache::TDataCacheOptions>,
         None::<Vec<types::TSlotId>>,
         None::<bool>,
         None::<BTreeMap<String, String>>,
@@ -561,9 +563,9 @@ mod tests {
     use crate::connector::scan_planning::{
         ScanHandle, Split, ThriftScanContext, validate_split_connectors,
     };
-    use crate::plan_nodes;
     use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo};
     use crate::sql::{Literal, SqlType, TableColumnDef};
+    use crate::thrift::plan_nodes;
 
     fn dummy_iceberg_table_info() -> IcebergTableInfo {
         IcebergTableInfo {

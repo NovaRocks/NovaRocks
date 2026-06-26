@@ -24,7 +24,7 @@ impl InternalInvariantCode {
 #[derive(Clone, Debug)]
 pub enum EngineErrorDetail {
     WriteCoordinatorGone {
-        query_id: crate::types::TUniqueId,
+        query_id: crate::thrift::types::TUniqueId,
     },
     ProtocolDecode {
         message: String,
@@ -71,7 +71,7 @@ impl EngineError {
         self.code.as_str()
     }
 
-    pub fn write_coordinator_gone(query_id: crate::types::TUniqueId) -> Self {
+    pub fn write_coordinator_gone(query_id: crate::thrift::types::TUniqueId) -> Self {
         Self::new(
             EngineErrorCode::WriteCoordinatorGone,
             EngineErrorDetail::WriteCoordinatorGone { query_id },
@@ -185,15 +185,15 @@ impl EngineError {
         }
     }
 
-    pub fn to_tstatus_code(&self) -> crate::status_code::TStatusCode {
+    pub fn to_tstatus_code(&self) -> crate::thrift::status_code::TStatusCode {
         match self.code {
             EngineErrorCode::UnsupportedDistributedDmlShape => {
-                crate::status_code::TStatusCode::NOT_IMPLEMENTED_ERROR
+                crate::thrift::status_code::TStatusCode::NOT_IMPLEMENTED_ERROR
             }
             EngineErrorCode::ProtocolDecodeError => {
-                crate::status_code::TStatusCode::INVALID_ARGUMENT
+                crate::thrift::status_code::TStatusCode::INVALID_ARGUMENT
             }
-            _ => crate::status_code::TStatusCode::INTERNAL_ERROR,
+            _ => crate::thrift::status_code::TStatusCode::INTERNAL_ERROR,
         }
     }
 
@@ -252,12 +252,13 @@ mod tests {
 
     #[test]
     fn write_coordinator_gone_maps_to_query_gone_report_status() {
-        let err = EngineError::write_coordinator_gone(crate::types::TUniqueId { hi: 11, lo: 22 });
+        let err =
+            EngineError::write_coordinator_gone(crate::thrift::types::TUniqueId { hi: 11, lo: 22 });
         assert_eq!(err.code(), EngineErrorCode::WriteCoordinatorGone);
         assert_eq!(err.to_report_status_code(), REPORT_EXEC_STATUS_QUERY_GONE);
         assert_eq!(
             err.to_tstatus_code(),
-            crate::status_code::TStatusCode::INTERNAL_ERROR
+            crate::thrift::status_code::TStatusCode::INTERNAL_ERROR
         );
         assert!(err.to_user_message().contains("11/22"));
     }
@@ -278,7 +279,7 @@ mod tests {
         let err = EngineError::unsupported_distributed_dml_shape("insert", "missing coordinator");
         assert_eq!(
             err.to_tstatus_code(),
-            crate::status_code::TStatusCode::NOT_IMPLEMENTED_ERROR
+            crate::thrift::status_code::TStatusCode::NOT_IMPLEMENTED_ERROR
         );
         assert_eq!(
             err.to_mysql_error_kind(),
@@ -291,7 +292,7 @@ mod tests {
         let err = EngineError::protocol_decode("bad report payload");
         assert_eq!(
             err.to_tstatus_code(),
-            crate::status_code::TStatusCode::INVALID_ARGUMENT
+            crate::thrift::status_code::TStatusCode::INVALID_ARGUMENT
         );
         assert_eq!(
             err.to_mysql_error_kind(),
@@ -307,7 +308,7 @@ mod tests {
         );
         assert_eq!(
             err.to_tstatus_code(),
-            crate::status_code::TStatusCode::INTERNAL_ERROR
+            crate::thrift::status_code::TStatusCode::INTERNAL_ERROR
         );
         assert_eq!(
             err.to_mysql_error_kind(),

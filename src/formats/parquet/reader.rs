@@ -116,8 +116,8 @@ mod tests {
 
     use crate::cache::{DataCacheManager, DataCachePageCacheOptions};
     use crate::fs::opendal::{OpendalRangeReaderFactory, build_fs_operator};
-    use crate::metrics;
     use crate::runtime::profile::RuntimeProfile;
+    use crate::thrift::metrics;
 
     use super::{ParquetCachedReader, ParquetReadCachePolicy};
 

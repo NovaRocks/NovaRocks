@@ -22,7 +22,7 @@ use crate::connector::starrocks::starmgr;
 use crate::connector::starrocks::table_schema_service;
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::runtime::starlet_shard_registry;
-use crate::types;
+use crate::thrift::types;
 
 #[derive(Clone, Debug)]
 pub(crate) struct LakeTableIdentity {
@@ -379,8 +379,8 @@ pub(crate) fn fetch_table_schema_for_lake_scan(
     schema_id: i64,
     tablet_id: Option<i64>,
     query_id: Option<types::TUniqueId>,
-    local_schema: Option<&crate::agent_service::TTabletSchema>,
-) -> Result<crate::agent_service::TTabletSchema, String> {
+    local_schema: Option<&crate::thrift::agent_service::TTabletSchema>,
+) -> Result<crate::thrift::agent_service::TTabletSchema, String> {
     table_schema_service::fetch_table_schema_for_lake_scan(
         fe_addr,
         db_id,
@@ -617,15 +617,15 @@ mod tests {
 
     #[test]
     fn lake_scan_schema_fetch_allows_placeholder_catalog_ids() {
-        let request = crate::frontend_service::TGetTableSchemaRequest {
-            schema_key: Some(crate::descriptors::TTableSchemaKey {
+        let request = crate::thrift::frontend_service::TGetTableSchemaRequest {
+            schema_key: Some(crate::thrift::descriptors::TTableSchemaKey {
                 db_id: Some(-1),
                 table_id: Some(70_528),
                 schema_id: Some(70_528),
             }),
-            source: Some(crate::frontend_service::TTableSchemaRequestSource::SCAN),
+            source: Some(crate::thrift::frontend_service::TTableSchemaRequestSource::SCAN),
             tablet_id: Some(70_531),
-            query_id: Some(crate::types::TUniqueId { hi: 1, lo: 2 }),
+            query_id: Some(crate::thrift::types::TUniqueId { hi: 1, lo: 2 }),
             txn_id: None,
         };
         let schema_key = request

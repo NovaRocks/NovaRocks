@@ -37,7 +37,7 @@ use crate::lower::layout::{
 use crate::lower::node::{Lowered, local_rf_waiting_set};
 use crate::lower::type_lowering::arrow_type_from_desc;
 use crate::service::stream_load;
-use crate::{descriptors, internal_service, plan_nodes, types};
+use crate::thrift::{descriptors, internal_service, plan_nodes, types};
 
 #[derive(Clone, Debug)]
 struct CsvReadOptions {

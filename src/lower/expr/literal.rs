@@ -17,11 +17,11 @@
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
 use arrow::datatypes::DataType;
 
-use crate::exprs;
 use crate::lower::expr::literals::{
     build_date_literal, build_decimal_literal, build_float_literal, build_int_literal,
     build_large_int_literal,
 };
+use crate::thrift::exprs;
 
 /// Lower literal expressions to ExprNode::Literal.
 pub(crate) fn lower_literal(

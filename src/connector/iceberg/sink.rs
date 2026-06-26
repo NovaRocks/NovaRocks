@@ -81,7 +81,7 @@ use crate::lower::layout::Layout;
 use crate::runtime::global_async_runtime::data_block_on;
 use crate::runtime::runtime_state::RuntimeState;
 use crate::runtime::starlet_shard_registry::S3StoreConfig;
-use crate::{data_sinks, descriptors, exprs, types};
+use crate::thrift::{data_sinks, descriptors, exprs, types};
 
 /// Selects which kind of Iceberg file this sink writes. The caller picks the
 /// mode based on the upstream `TDataSinkType` (`ICEBERG_TABLE_SINK` →
@@ -3111,8 +3111,9 @@ mod tests {
 
     #[test]
     fn build_column_slot_map_uses_sink_output_column_names() {
-        let int_type =
-            crate::lower::type_lowering::scalar_type_desc(crate::types::TPrimitiveType::INT);
+        let int_type = crate::lower::type_lowering::scalar_type_desc(
+            crate::thrift::types::TPrimitiveType::INT,
+        );
         let id_expr =
             crate::sql::codegen::expr_compiler::build_slot_ref_texpr(10, 1, int_type.clone());
         let region_expr = crate::sql::codegen::expr_compiler::build_slot_ref_texpr(11, 1, int_type);
@@ -3220,7 +3221,7 @@ mod tests {
                 position_delete_data_file_partitions: HashMap::new(),
                 object_store_s3: None,
                 file_format: "parquet".to_string(),
-                compression: crate::types::TCompressionType::SNAPPY,
+                compression: crate::thrift::types::TCompressionType::SNAPPY,
                 output_schema: Arc::clone(&schema),
                 target_schema: schema,
                 equality_delete_columns: Vec::new(),
@@ -3237,113 +3238,115 @@ mod tests {
         assert_eq!(op.name(), "ICEBERG_TABLE_SINK");
     }
 
-    fn test_int_column(name: &str) -> crate::descriptors::TColumn {
-        let int_type =
-            crate::lower::type_lowering::scalar_type_desc(crate::types::TPrimitiveType::INT);
-        crate::descriptors::TColumn::new(
+    fn test_int_column(name: &str) -> crate::thrift::descriptors::TColumn {
+        let int_type = crate::lower::type_lowering::scalar_type_desc(
+            crate::thrift::types::TPrimitiveType::INT,
+        );
+        crate::thrift::descriptors::TColumn::new(
             name.to_string(),
-            None::<crate::types::TColumnType>,
-            None::<crate::types::TAggregationType>,
+            None::<crate::thrift::types::TColumnType>,
+            None::<crate::thrift::types::TAggregationType>,
             None::<bool>,
             Some(false),
             None::<String>,
             None::<bool>,
-            None::<crate::exprs::TExpr>,
+            None::<crate::thrift::exprs::TExpr>,
             None::<bool>,
             None::<i32>,
             None::<bool>,
-            None::<crate::types::TAggStateDesc>,
+            None::<crate::thrift::types::TAggStateDesc>,
             None::<i32>,
             Some(int_type),
-            None::<crate::exprs::TExpr>,
+            None::<crate::thrift::exprs::TExpr>,
         )
     }
 
-    fn test_varchar_column(name: &str) -> crate::descriptors::TColumn {
-        let varchar_type =
-            crate::lower::type_lowering::scalar_type_desc(crate::types::TPrimitiveType::VARCHAR);
-        crate::descriptors::TColumn::new(
+    fn test_varchar_column(name: &str) -> crate::thrift::descriptors::TColumn {
+        let varchar_type = crate::lower::type_lowering::scalar_type_desc(
+            crate::thrift::types::TPrimitiveType::VARCHAR,
+        );
+        crate::thrift::descriptors::TColumn::new(
             name.to_string(),
-            None::<crate::types::TColumnType>,
-            None::<crate::types::TAggregationType>,
+            None::<crate::thrift::types::TColumnType>,
+            None::<crate::thrift::types::TAggregationType>,
             None::<bool>,
             Some(true),
             None::<String>,
             None::<bool>,
-            None::<crate::exprs::TExpr>,
+            None::<crate::thrift::exprs::TExpr>,
             None::<bool>,
             None::<i32>,
             None::<bool>,
-            None::<crate::types::TAggStateDesc>,
+            None::<crate::thrift::types::TAggStateDesc>,
             None::<i32>,
             Some(varchar_type),
-            None::<crate::exprs::TExpr>,
+            None::<crate::thrift::exprs::TExpr>,
         )
     }
 
     fn test_iceberg_schema_field(
         name: &str,
         field_id: i32,
-    ) -> crate::descriptors::TIcebergSchemaField {
-        crate::descriptors::TIcebergSchemaField::new(
+    ) -> crate::thrift::descriptors::TIcebergSchemaField {
+        crate::thrift::descriptors::TIcebergSchemaField::new(
             Some(field_id),
             Some(name.to_string()),
             None::<String>,
-            None::<Vec<Box<crate::descriptors::TIcebergSchemaField>>>,
+            None::<Vec<Box<crate::thrift::descriptors::TIcebergSchemaField>>>,
         )
     }
 
     fn test_unpartitioned_desc_table_with_equality_delete_schema(
         table_id: i64,
         table_location: &str,
-    ) -> crate::descriptors::TDescriptorTable {
-        let iceberg_table = crate::descriptors::TIcebergTable::new(
+    ) -> crate::thrift::descriptors::TDescriptorTable {
+        let iceberg_table = crate::thrift::descriptors::TIcebergTable::new(
             Some(table_location.to_string()),
             Some(vec![
                 test_int_column("id"),
                 test_varchar_column("category"),
                 test_int_column("amount"),
             ]),
-            Some(crate::descriptors::TIcebergSchema::new(Some(vec![
+            Some(crate::thrift::descriptors::TIcebergSchema::new(Some(vec![
                 test_iceberg_schema_field("id", 11),
                 test_iceberg_schema_field("category", 12),
                 test_iceberg_schema_field("amount", 13),
             ]))),
             None::<Vec<String>>,
-            None::<crate::descriptors::TCompressedPartitionMap>,
-            None::<std::collections::BTreeMap<i64, crate::descriptors::THdfsPartition>>,
-            Some(crate::descriptors::TIcebergSchema::new(Some(vec![
+            None::<crate::thrift::descriptors::TCompressedPartitionMap>,
+            None::<std::collections::BTreeMap<i64, crate::thrift::descriptors::THdfsPartition>>,
+            Some(crate::thrift::descriptors::TIcebergSchema::new(Some(vec![
                 test_iceberg_schema_field("id", 11),
                 test_iceberg_schema_field("category", 12),
             ]))),
-            None::<Vec<crate::descriptors::TIcebergPartitionInfo>>,
-            None::<crate::descriptors::TSortOrder>,
+            None::<Vec<crate::thrift::descriptors::TIcebergPartitionInfo>>,
+            None::<crate::thrift::descriptors::TSortOrder>,
             None::<String>,
             None::<i64>,
         );
-        let table = crate::descriptors::TTableDescriptor::new(
+        let table = crate::thrift::descriptors::TTableDescriptor::new(
             table_id,
-            crate::types::TTableType::ICEBERG_TABLE,
+            crate::thrift::types::TTableType::ICEBERG_TABLE,
             3,
             0,
             "orders".to_string(),
             "db".to_string(),
-            None::<crate::descriptors::TMySQLTable>,
-            None::<crate::descriptors::TOlapTable>,
-            None::<crate::descriptors::TSchemaTable>,
-            None::<crate::descriptors::TBrokerTable>,
-            None::<crate::descriptors::TEsTable>,
-            None::<crate::descriptors::TJDBCTable>,
-            None::<crate::descriptors::THdfsTable>,
+            None::<crate::thrift::descriptors::TMySQLTable>,
+            None::<crate::thrift::descriptors::TOlapTable>,
+            None::<crate::thrift::descriptors::TSchemaTable>,
+            None::<crate::thrift::descriptors::TBrokerTable>,
+            None::<crate::thrift::descriptors::TEsTable>,
+            None::<crate::thrift::descriptors::TJDBCTable>,
+            None::<crate::thrift::descriptors::THdfsTable>,
             Some(iceberg_table),
-            None::<crate::descriptors::THudiTable>,
-            None::<crate::descriptors::TDeltaLakeTable>,
-            None::<crate::descriptors::TFileTable>,
-            None::<crate::descriptors::TTableFunctionTable>,
-            None::<crate::descriptors::TPaimonTable>,
+            None::<crate::thrift::descriptors::THudiTable>,
+            None::<crate::thrift::descriptors::TDeltaLakeTable>,
+            None::<crate::thrift::descriptors::TFileTable>,
+            None::<crate::thrift::descriptors::TTableFunctionTable>,
+            None::<crate::thrift::descriptors::TPaimonTable>,
         );
-        crate::descriptors::TDescriptorTable::new(
-            None::<Vec<crate::descriptors::TSlotDescriptor>>,
+        crate::thrift::descriptors::TDescriptorTable::new(
+            None::<Vec<crate::thrift::descriptors::TSlotDescriptor>>,
             Vec::new(),
             Some(vec![table]),
             None::<bool>,
@@ -3353,51 +3356,51 @@ mod tests {
     fn test_unpartitioned_desc_table_without_equality_delete_schema(
         table_id: i64,
         table_location: &str,
-    ) -> crate::descriptors::TDescriptorTable {
-        let iceberg_table = crate::descriptors::TIcebergTable::new(
+    ) -> crate::thrift::descriptors::TDescriptorTable {
+        let iceberg_table = crate::thrift::descriptors::TIcebergTable::new(
             Some(table_location.to_string()),
             Some(vec![
                 test_int_column("id"),
                 test_varchar_column("category"),
                 test_int_column("amount"),
             ]),
-            Some(crate::descriptors::TIcebergSchema::new(Some(vec![
+            Some(crate::thrift::descriptors::TIcebergSchema::new(Some(vec![
                 test_iceberg_schema_field("id", 11),
                 test_iceberg_schema_field("category", 12),
                 test_iceberg_schema_field("amount", 13),
             ]))),
             None::<Vec<String>>,
-            None::<crate::descriptors::TCompressedPartitionMap>,
-            None::<std::collections::BTreeMap<i64, crate::descriptors::THdfsPartition>>,
-            None::<crate::descriptors::TIcebergSchema>,
-            None::<Vec<crate::descriptors::TIcebergPartitionInfo>>,
-            None::<crate::descriptors::TSortOrder>,
+            None::<crate::thrift::descriptors::TCompressedPartitionMap>,
+            None::<std::collections::BTreeMap<i64, crate::thrift::descriptors::THdfsPartition>>,
+            None::<crate::thrift::descriptors::TIcebergSchema>,
+            None::<Vec<crate::thrift::descriptors::TIcebergPartitionInfo>>,
+            None::<crate::thrift::descriptors::TSortOrder>,
             None::<String>,
             None::<i64>,
         );
-        let table = crate::descriptors::TTableDescriptor::new(
+        let table = crate::thrift::descriptors::TTableDescriptor::new(
             table_id,
-            crate::types::TTableType::ICEBERG_TABLE,
+            crate::thrift::types::TTableType::ICEBERG_TABLE,
             3,
             0,
             "orders".to_string(),
             "db".to_string(),
-            None::<crate::descriptors::TMySQLTable>,
-            None::<crate::descriptors::TOlapTable>,
-            None::<crate::descriptors::TSchemaTable>,
-            None::<crate::descriptors::TBrokerTable>,
-            None::<crate::descriptors::TEsTable>,
-            None::<crate::descriptors::TJDBCTable>,
-            None::<crate::descriptors::THdfsTable>,
+            None::<crate::thrift::descriptors::TMySQLTable>,
+            None::<crate::thrift::descriptors::TOlapTable>,
+            None::<crate::thrift::descriptors::TSchemaTable>,
+            None::<crate::thrift::descriptors::TBrokerTable>,
+            None::<crate::thrift::descriptors::TEsTable>,
+            None::<crate::thrift::descriptors::TJDBCTable>,
+            None::<crate::thrift::descriptors::THdfsTable>,
             Some(iceberg_table),
-            None::<crate::descriptors::THudiTable>,
-            None::<crate::descriptors::TDeltaLakeTable>,
-            None::<crate::descriptors::TFileTable>,
-            None::<crate::descriptors::TTableFunctionTable>,
-            None::<crate::descriptors::TPaimonTable>,
+            None::<crate::thrift::descriptors::THudiTable>,
+            None::<crate::thrift::descriptors::TDeltaLakeTable>,
+            None::<crate::thrift::descriptors::TFileTable>,
+            None::<crate::thrift::descriptors::TTableFunctionTable>,
+            None::<crate::thrift::descriptors::TPaimonTable>,
         );
-        crate::descriptors::TDescriptorTable::new(
-            None::<Vec<crate::descriptors::TSlotDescriptor>>,
+        crate::thrift::descriptors::TDescriptorTable::new(
+            None::<Vec<crate::thrift::descriptors::TSlotDescriptor>>,
             Vec::new(),
             Some(vec![table]),
             None::<bool>,
@@ -3408,47 +3411,47 @@ mod tests {
         table_id: i64,
         table_location: &str,
         metadata: &iceberg::spec::TableMetadata,
-    ) -> crate::descriptors::TDescriptorTable {
-        let iceberg_table = crate::descriptors::TIcebergTable::new(
+    ) -> crate::thrift::descriptors::TDescriptorTable {
+        let iceberg_table = crate::thrift::descriptors::TIcebergTable::new(
             Some(table_location.to_string()),
             Some(vec![test_int_column("id")]),
-            Some(crate::descriptors::TIcebergSchema::new(Some(vec![
+            Some(crate::thrift::descriptors::TIcebergSchema::new(Some(vec![
                 test_iceberg_schema_field("id", 42),
             ]))),
             None::<Vec<String>>,
-            None::<crate::descriptors::TCompressedPartitionMap>,
-            None::<std::collections::BTreeMap<i64, crate::descriptors::THdfsPartition>>,
-            Some(crate::descriptors::TIcebergSchema::new(Some(vec![
+            None::<crate::thrift::descriptors::TCompressedPartitionMap>,
+            None::<std::collections::BTreeMap<i64, crate::thrift::descriptors::THdfsPartition>>,
+            Some(crate::thrift::descriptors::TIcebergSchema::new(Some(vec![
                 test_iceberg_schema_field("id", 42),
             ]))),
-            None::<Vec<crate::descriptors::TIcebergPartitionInfo>>,
-            None::<crate::descriptors::TSortOrder>,
+            None::<Vec<crate::thrift::descriptors::TIcebergPartitionInfo>>,
+            None::<crate::thrift::descriptors::TSortOrder>,
             Some(serde_json::to_string(metadata).expect("serialize metadata")),
             None::<i64>,
         );
-        let table = crate::descriptors::TTableDescriptor::new(
+        let table = crate::thrift::descriptors::TTableDescriptor::new(
             table_id,
-            crate::types::TTableType::ICEBERG_TABLE,
+            crate::thrift::types::TTableType::ICEBERG_TABLE,
             1,
             0,
             "orders".to_string(),
             "db".to_string(),
-            None::<crate::descriptors::TMySQLTable>,
-            None::<crate::descriptors::TOlapTable>,
-            None::<crate::descriptors::TSchemaTable>,
-            None::<crate::descriptors::TBrokerTable>,
-            None::<crate::descriptors::TEsTable>,
-            None::<crate::descriptors::TJDBCTable>,
-            None::<crate::descriptors::THdfsTable>,
+            None::<crate::thrift::descriptors::TMySQLTable>,
+            None::<crate::thrift::descriptors::TOlapTable>,
+            None::<crate::thrift::descriptors::TSchemaTable>,
+            None::<crate::thrift::descriptors::TBrokerTable>,
+            None::<crate::thrift::descriptors::TEsTable>,
+            None::<crate::thrift::descriptors::TJDBCTable>,
+            None::<crate::thrift::descriptors::THdfsTable>,
             Some(iceberg_table),
-            None::<crate::descriptors::THudiTable>,
-            None::<crate::descriptors::TDeltaLakeTable>,
-            None::<crate::descriptors::TFileTable>,
-            None::<crate::descriptors::TTableFunctionTable>,
-            None::<crate::descriptors::TPaimonTable>,
+            None::<crate::thrift::descriptors::THudiTable>,
+            None::<crate::thrift::descriptors::TDeltaLakeTable>,
+            None::<crate::thrift::descriptors::TFileTable>,
+            None::<crate::thrift::descriptors::TTableFunctionTable>,
+            None::<crate::thrift::descriptors::TPaimonTable>,
         );
-        crate::descriptors::TDescriptorTable::new(
-            None::<Vec<crate::descriptors::TSlotDescriptor>>,
+        crate::thrift::descriptors::TDescriptorTable::new(
+            None::<Vec<crate::thrift::descriptors::TSlotDescriptor>>,
             Vec::new(),
             Some(vec![table]),
             None::<bool>,
@@ -3459,7 +3462,7 @@ mod tests {
         table_id: i64,
         table_location: &str,
         metadata: &iceberg::spec::TableMetadata,
-    ) -> crate::descriptors::TDescriptorTable {
+    ) -> crate::thrift::descriptors::TDescriptorTable {
         test_partitioned_desc_table_with_metadata_and_snapshot_id(
             table_id,
             table_location,
@@ -3473,52 +3476,55 @@ mod tests {
         table_location: &str,
         metadata: &iceberg::spec::TableMetadata,
         current_snapshot_id: Option<i64>,
-    ) -> crate::descriptors::TDescriptorTable {
-        let int_type =
-            crate::lower::type_lowering::scalar_type_desc(crate::types::TPrimitiveType::INT);
+    ) -> crate::thrift::descriptors::TDescriptorTable {
+        let int_type = crate::lower::type_lowering::scalar_type_desc(
+            crate::thrift::types::TPrimitiveType::INT,
+        );
         let partition_expr =
             crate::sql::codegen::expr_compiler::build_slot_ref_texpr(3, 1, int_type);
-        let iceberg_table = crate::descriptors::TIcebergTable::new(
+        let iceberg_table = crate::thrift::descriptors::TIcebergTable::new(
             Some(table_location.to_string()),
             Some(vec![test_int_column("id")]),
-            None::<crate::descriptors::TIcebergSchema>,
+            None::<crate::thrift::descriptors::TIcebergSchema>,
             None::<Vec<String>>,
-            None::<crate::descriptors::TCompressedPartitionMap>,
-            None::<std::collections::BTreeMap<i64, crate::descriptors::THdfsPartition>>,
-            None::<crate::descriptors::TIcebergSchema>,
-            Some(vec![crate::descriptors::TIcebergPartitionInfo::new(
-                Some("id".to_string()),
-                Some("id_part".to_string()),
-                Some("identity".to_string()),
-                Some(partition_expr),
-            )]),
-            None::<crate::descriptors::TSortOrder>,
+            None::<crate::thrift::descriptors::TCompressedPartitionMap>,
+            None::<std::collections::BTreeMap<i64, crate::thrift::descriptors::THdfsPartition>>,
+            None::<crate::thrift::descriptors::TIcebergSchema>,
+            Some(vec![
+                crate::thrift::descriptors::TIcebergPartitionInfo::new(
+                    Some("id".to_string()),
+                    Some("id_part".to_string()),
+                    Some("identity".to_string()),
+                    Some(partition_expr),
+                ),
+            ]),
+            None::<crate::thrift::descriptors::TSortOrder>,
             Some(serde_json::to_string(metadata).expect("serialize metadata")),
             current_snapshot_id,
         );
-        let table = crate::descriptors::TTableDescriptor::new(
+        let table = crate::thrift::descriptors::TTableDescriptor::new(
             table_id,
-            crate::types::TTableType::ICEBERG_TABLE,
+            crate::thrift::types::TTableType::ICEBERG_TABLE,
             1,
             0,
             "orders".to_string(),
             "db".to_string(),
-            None::<crate::descriptors::TMySQLTable>,
-            None::<crate::descriptors::TOlapTable>,
-            None::<crate::descriptors::TSchemaTable>,
-            None::<crate::descriptors::TBrokerTable>,
-            None::<crate::descriptors::TEsTable>,
-            None::<crate::descriptors::TJDBCTable>,
-            None::<crate::descriptors::THdfsTable>,
+            None::<crate::thrift::descriptors::TMySQLTable>,
+            None::<crate::thrift::descriptors::TOlapTable>,
+            None::<crate::thrift::descriptors::TSchemaTable>,
+            None::<crate::thrift::descriptors::TBrokerTable>,
+            None::<crate::thrift::descriptors::TEsTable>,
+            None::<crate::thrift::descriptors::TJDBCTable>,
+            None::<crate::thrift::descriptors::THdfsTable>,
             Some(iceberg_table),
-            None::<crate::descriptors::THudiTable>,
-            None::<crate::descriptors::TDeltaLakeTable>,
-            None::<crate::descriptors::TFileTable>,
-            None::<crate::descriptors::TTableFunctionTable>,
-            None::<crate::descriptors::TPaimonTable>,
+            None::<crate::thrift::descriptors::THudiTable>,
+            None::<crate::thrift::descriptors::TDeltaLakeTable>,
+            None::<crate::thrift::descriptors::TFileTable>,
+            None::<crate::thrift::descriptors::TTableFunctionTable>,
+            None::<crate::thrift::descriptors::TPaimonTable>,
         );
-        crate::descriptors::TDescriptorTable::new(
-            None::<Vec<crate::descriptors::TSlotDescriptor>>,
+        crate::thrift::descriptors::TDescriptorTable::new(
+            None::<Vec<crate::thrift::descriptors::TSlotDescriptor>>,
             Vec::new(),
             Some(vec![table]),
             None::<bool>,
@@ -3528,14 +3534,14 @@ mod tests {
     fn test_iceberg_table_sink(
         table_id: i64,
         table_location: &str,
-    ) -> crate::data_sinks::TIcebergTableSink {
-        crate::data_sinks::TIcebergTableSink::new(
+    ) -> crate::thrift::data_sinks::TIcebergTableSink {
+        crate::thrift::data_sinks::TIcebergTableSink::new(
             Some(table_location.to_string()),
             Some("parquet".to_string()),
             Some(table_id),
-            Some(crate::types::TCompressionType::SNAPPY),
+            Some(crate::thrift::types::TCompressionType::SNAPPY),
             Some(false),
-            None::<crate::cloud_configuration::TCloudConfiguration>,
+            None::<crate::thrift::cloud_configuration::TCloudConfiguration>,
             None::<i64>,
             Some(1),
             Some(format!("{table_location}/data")),
@@ -3543,13 +3549,18 @@ mod tests {
         )
     }
 
-    fn test_delete_output_exprs(include_partition_source: bool) -> Vec<crate::exprs::TExpr> {
-        let varchar_type =
-            crate::lower::type_lowering::scalar_type_desc(crate::types::TPrimitiveType::VARCHAR);
-        let bigint_type =
-            crate::lower::type_lowering::scalar_type_desc(crate::types::TPrimitiveType::BIGINT);
-        let int_type =
-            crate::lower::type_lowering::scalar_type_desc(crate::types::TPrimitiveType::INT);
+    fn test_delete_output_exprs(
+        include_partition_source: bool,
+    ) -> Vec<crate::thrift::exprs::TExpr> {
+        let varchar_type = crate::lower::type_lowering::scalar_type_desc(
+            crate::thrift::types::TPrimitiveType::VARCHAR,
+        );
+        let bigint_type = crate::lower::type_lowering::scalar_type_desc(
+            crate::thrift::types::TPrimitiveType::BIGINT,
+        );
+        let int_type = crate::lower::type_lowering::scalar_type_desc(
+            crate::thrift::types::TPrimitiveType::INT,
+        );
         let mut exprs = vec![
             crate::sql::codegen::expr_compiler::build_slot_ref_texpr(1, 1, varchar_type),
             crate::sql::codegen::expr_compiler::build_slot_ref_texpr(2, 1, bigint_type),
@@ -3582,10 +3593,12 @@ mod tests {
         };
         let id_slot = SlotId::new(1);
         let category_slot = SlotId::new(2);
-        let int_type =
-            crate::lower::type_lowering::scalar_type_desc(crate::types::TPrimitiveType::INT);
-        let varchar_type =
-            crate::lower::type_lowering::scalar_type_desc(crate::types::TPrimitiveType::VARCHAR);
+        let int_type = crate::lower::type_lowering::scalar_type_desc(
+            crate::thrift::types::TPrimitiveType::INT,
+        );
+        let varchar_type = crate::lower::type_lowering::scalar_type_desc(
+            crate::thrift::types::TPrimitiveType::VARCHAR,
+        );
         let output_exprs = vec![
             crate::sql::codegen::expr_compiler::build_slot_ref_texpr(1, 1, int_type),
             crate::sql::codegen::expr_compiler::build_slot_ref_texpr(2, 1, varchar_type),
@@ -3671,7 +3684,7 @@ mod tests {
         assert_eq!(data_file.record_count, Some(2));
         assert_eq!(
             data_file.file_content,
-            Some(crate::types::TIcebergFileContent::EQUALITY_DELETES)
+            Some(crate::thrift::types::TIcebergFileContent::EQUALITY_DELETES)
         );
         assert_eq!(data_file.equality_ids, Some(vec![11, 12]));
         assert_eq!(data_file.partition_path.as_deref(), Some(""));
@@ -3699,10 +3712,12 @@ mod tests {
             order: Vec::new(),
             index: HashMap::new(),
         };
-        let int_type =
-            crate::lower::type_lowering::scalar_type_desc(crate::types::TPrimitiveType::INT);
-        let varchar_type =
-            crate::lower::type_lowering::scalar_type_desc(crate::types::TPrimitiveType::VARCHAR);
+        let int_type = crate::lower::type_lowering::scalar_type_desc(
+            crate::thrift::types::TPrimitiveType::INT,
+        );
+        let varchar_type = crate::lower::type_lowering::scalar_type_desc(
+            crate::thrift::types::TPrimitiveType::VARCHAR,
+        );
         let output_exprs = vec![
             crate::sql::codegen::expr_compiler::build_slot_ref_texpr(1, 1, int_type.clone()),
             crate::sql::codegen::expr_compiler::build_slot_ref_texpr(2, 1, varchar_type),
@@ -3751,8 +3766,9 @@ mod tests {
             order: Vec::new(),
             index: HashMap::new(),
         };
-        let int_type =
-            crate::lower::type_lowering::scalar_type_desc(crate::types::TPrimitiveType::INT);
+        let int_type = crate::lower::type_lowering::scalar_type_desc(
+            crate::thrift::types::TPrimitiveType::INT,
+        );
         let output_exprs = vec![crate::sql::codegen::expr_compiler::build_slot_ref_texpr(
             1, 1, int_type,
         )];
@@ -3945,8 +3961,9 @@ mod tests {
             order: Vec::new(),
             index: HashMap::new(),
         };
-        let int_type =
-            crate::lower::type_lowering::scalar_type_desc(crate::types::TPrimitiveType::INT);
+        let int_type = crate::lower::type_lowering::scalar_type_desc(
+            crate::thrift::types::TPrimitiveType::INT,
+        );
         let output_exprs = vec![crate::sql::codegen::expr_compiler::build_slot_ref_texpr(
             3, 1, int_type,
         )];
@@ -3989,7 +4006,7 @@ mod tests {
             position_delete_data_file_partitions: HashMap::new(),
             object_store_s3: None,
             file_format: "parquet".to_string(),
-            compression: crate::types::TCompressionType::SNAPPY,
+            compression: crate::thrift::types::TCompressionType::SNAPPY,
             output_schema: Arc::clone(&schema),
             target_schema: Arc::clone(&schema),
             equality_delete_columns: Vec::new(),
@@ -4029,7 +4046,7 @@ mod tests {
             "id_part=7".to_string(),
             "0".to_string(),
             "parquet".to_string(),
-            crate::types::TIcebergFileContent::DATA,
+            crate::thrift::types::TIcebergFileContent::DATA,
         )
         .expect("commit info");
         let data_file = commit_info.iceberg_data_file.expect("iceberg data file");
@@ -4106,7 +4123,7 @@ mod tests {
             position_delete_data_file_partitions: HashMap::new(),
             object_store_s3: None,
             file_format: "parquet".to_string(),
-            compression: crate::types::TCompressionType::SNAPPY,
+            compression: crate::thrift::types::TCompressionType::SNAPPY,
             output_schema: Arc::clone(&arrow_schema),
             target_schema: arrow_schema,
             equality_delete_columns: Vec::new(),
@@ -4165,7 +4182,7 @@ mod tests {
             position_delete_data_file_partitions: HashMap::new(),
             object_store_s3: None,
             file_format: "parquet".to_string(),
-            compression: crate::types::TCompressionType::SNAPPY,
+            compression: crate::thrift::types::TCompressionType::SNAPPY,
             output_schema: Arc::clone(&schema),
             target_schema: Arc::clone(&schema),
             equality_delete_columns: Vec::new(),
@@ -4230,7 +4247,7 @@ mod tests {
         assert_eq!(data_file.record_count, Some(2));
         assert_eq!(
             data_file.file_content,
-            Some(crate::types::TIcebergFileContent::DATA)
+            Some(crate::thrift::types::TIcebergFileContent::DATA)
         );
     }
 
@@ -4250,7 +4267,7 @@ mod tests {
             position_delete_data_file_partitions: HashMap::new(),
             object_store_s3: None,
             file_format: "parquet".to_string(),
-            compression: crate::types::TCompressionType::SNAPPY,
+            compression: crate::thrift::types::TCompressionType::SNAPPY,
             output_schema: Arc::clone(&target_schema),
             target_schema,
             equality_delete_columns: Vec::new(),
@@ -4377,7 +4394,7 @@ mod tests {
             position_delete_data_file_partitions: referenced_partitions,
             object_store_s3: None,
             file_format: "parquet".to_string(),
-            compression: crate::types::TCompressionType::SNAPPY,
+            compression: crate::thrift::types::TCompressionType::SNAPPY,
             output_schema: build_position_delete_output_schema(),
             target_schema,
             equality_delete_columns: Vec::new(),
@@ -4443,7 +4460,7 @@ mod tests {
         );
         assert_eq!(
             data_file.file_content,
-            Some(crate::types::TIcebergFileContent::POSITION_DELETES)
+            Some(crate::thrift::types::TIcebergFileContent::POSITION_DELETES)
         );
         assert_eq!(data_file.partition_spec_id, Some(7));
         assert!(
@@ -4523,7 +4540,7 @@ mod tests {
             position_delete_data_file_partitions: referenced_partitions,
             object_store_s3: None,
             file_format: "parquet".to_string(),
-            compression: crate::types::TCompressionType::SNAPPY,
+            compression: crate::thrift::types::TCompressionType::SNAPPY,
             output_schema: build_position_delete_output_schema(),
             target_schema,
             equality_delete_columns: Vec::new(),
@@ -4666,7 +4683,7 @@ mod tests {
             position_delete_data_file_partitions: referenced_partitions,
             object_store_s3: None,
             file_format: "parquet".to_string(),
-            compression: crate::types::TCompressionType::SNAPPY,
+            compression: crate::thrift::types::TCompressionType::SNAPPY,
             output_schema: build_position_delete_output_schema(),
             target_schema,
             equality_delete_columns: Vec::new(),
@@ -4789,7 +4806,7 @@ mod tests {
         assert_eq!(data_file.format.as_deref(), Some("puffin"));
         assert_eq!(
             data_file.file_content,
-            Some(crate::types::TIcebergFileContent::POSITION_DELETES)
+            Some(crate::thrift::types::TIcebergFileContent::POSITION_DELETES)
         );
         assert_eq!(data_file.referenced_data_file.as_deref(), Some(referenced));
         assert_eq!(data_file.cardinality, Some(2));

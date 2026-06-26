@@ -5,10 +5,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 
-use crate::exprs;
 use crate::lower::type_lowering::arrow_type_from_desc;
-use crate::partitions;
-use crate::plan_nodes;
 use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn as AnalysisOutputColumn, TypedExpr,
 };
@@ -50,7 +47,10 @@ use crate::sql::planner::optimizer_bridge::property::{
     ordering_spec_from_sort_items, window_ordering_spec,
 };
 use crate::sql::planner::plan::{AggregateCall, WindowExpr};
-use crate::types;
+use crate::thrift::exprs;
+use crate::thrift::partitions;
+use crate::thrift::plan_nodes;
+use crate::thrift::types;
 
 pub(crate) fn lower_distributed_plan(
     dp: &crate::sql::planner::DistributedPlan,
@@ -809,13 +809,13 @@ pub(in crate::sql::codegen) trait LoweringStateAccess<'a> {
     fn fragment_stack(&self) -> &[FragmentId];
     fn query_global_dicts_per_fragment(
         &mut self,
-    ) -> &mut HashMap<FragmentId, Vec<crate::data::TGlobalDict>>;
-    fn slot_to_global_dict(&self) -> &HashMap<i32, crate::data::TGlobalDict>;
-    fn slot_to_global_dict_mut(&mut self) -> &mut HashMap<i32, crate::data::TGlobalDict>;
+    ) -> &mut HashMap<FragmentId, Vec<crate::thrift::data::TGlobalDict>>;
+    fn slot_to_global_dict(&self) -> &HashMap<i32, crate::thrift::data::TGlobalDict>;
+    fn slot_to_global_dict_mut(&mut self) -> &mut HashMap<i32, crate::thrift::data::TGlobalDict>;
     fn rf_probe_targets(&mut self) -> &mut HashMap<i32, RfProbeTarget>;
     fn rf_all_filters(
         &mut self,
-    ) -> &mut HashMap<i32, crate::runtime_filter::TRuntimeFilterDescription>;
+    ) -> &mut HashMap<i32, crate::thrift::runtime_filter::TRuntimeFilterDescription>;
     fn rf_build_side_filters(&mut self) -> &mut HashMap<FragmentId, Vec<i32>>;
     fn rf_probe_side_filters(&mut self) -> &mut HashMap<FragmentId, Vec<(i32, i32)>>;
     fn scalar_arena(&self) -> &ScalarArena;
@@ -855,7 +855,7 @@ pub(in crate::sql::codegen) trait LoweringStateAccess<'a> {
         let Some(source_dict) = self.slot_to_global_dict().get(&source_slot_id).cloned() else {
             return;
         };
-        let new_dict = crate::data::TGlobalDict::new(
+        let new_dict = crate::thrift::data::TGlobalDict::new(
             Some(new_slot_id),
             source_dict.strings.clone(),
             source_dict.ids.clone(),
@@ -886,10 +886,10 @@ pub(crate) struct OwnedLoweringState<'a> {
     scan_tables: Vec<nodes::PlannedScanTable>,
     next_slot_id: Rc<RefCell<i32>>,
     fragment_stack: Vec<FragmentId>,
-    query_global_dicts_per_fragment: HashMap<FragmentId, Vec<crate::data::TGlobalDict>>,
-    slot_to_global_dict: HashMap<i32, crate::data::TGlobalDict>,
+    query_global_dicts_per_fragment: HashMap<FragmentId, Vec<crate::thrift::data::TGlobalDict>>,
+    slot_to_global_dict: HashMap<i32, crate::thrift::data::TGlobalDict>,
     rf_probe_targets: HashMap<i32, RfProbeTarget>,
-    rf_all_filters: HashMap<i32, crate::runtime_filter::TRuntimeFilterDescription>,
+    rf_all_filters: HashMap<i32, crate::thrift::runtime_filter::TRuntimeFilterDescription>,
     rf_build_side_filters: HashMap<FragmentId, Vec<i32>>,
     rf_probe_side_filters: HashMap<FragmentId, Vec<(i32, i32)>>,
     lowered_fragment_outputs: HashMap<FragmentId, LoweredFragmentOutput>,
@@ -1046,15 +1046,15 @@ impl<'a> LoweringStateAccess<'a> for OwnedLoweringState<'a> {
 
     fn query_global_dicts_per_fragment(
         &mut self,
-    ) -> &mut HashMap<FragmentId, Vec<crate::data::TGlobalDict>> {
+    ) -> &mut HashMap<FragmentId, Vec<crate::thrift::data::TGlobalDict>> {
         &mut self.query_global_dicts_per_fragment
     }
 
-    fn slot_to_global_dict(&self) -> &HashMap<i32, crate::data::TGlobalDict> {
+    fn slot_to_global_dict(&self) -> &HashMap<i32, crate::thrift::data::TGlobalDict> {
         &self.slot_to_global_dict
     }
 
-    fn slot_to_global_dict_mut(&mut self) -> &mut HashMap<i32, crate::data::TGlobalDict> {
+    fn slot_to_global_dict_mut(&mut self) -> &mut HashMap<i32, crate::thrift::data::TGlobalDict> {
         &mut self.slot_to_global_dict
     }
 
@@ -1064,7 +1064,7 @@ impl<'a> LoweringStateAccess<'a> for OwnedLoweringState<'a> {
 
     fn rf_all_filters(
         &mut self,
-    ) -> &mut HashMap<i32, crate::runtime_filter::TRuntimeFilterDescription> {
+    ) -> &mut HashMap<i32, crate::thrift::runtime_filter::TRuntimeFilterDescription> {
         &mut self.rf_all_filters
     }
 
@@ -1955,9 +1955,9 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     left: lt,
                     right: rt,
                     opcode: Some(if eq.null_safe {
-                        crate::opcodes::TExprOpcode::EQ_FOR_NULL
+                        crate::thrift::opcodes::TExprOpcode::EQ_FOR_NULL
                     } else {
-                        crate::opcodes::TExprOpcode::EQ
+                        crate::thrift::opcodes::TExprOpcode::EQ
                     }),
                 });
                 surviving_eq_origin.push(eq_index);
@@ -2191,8 +2191,8 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         surviving_eq_origin: &[usize],
         surviving_eq_build_exprs: &[TypedExpr],
         execution_distribution: Option<JoinExecutionDistribution>,
-    ) -> Result<Vec<crate::runtime_filter::TRuntimeFilterDescription>, String> {
-        use crate::runtime_filter;
+    ) -> Result<Vec<crate::thrift::runtime_filter::TRuntimeFilterDescription>, String> {
+        use crate::thrift::runtime_filter;
 
         if build_runtime_filters.is_empty() {
             return Ok(Vec::new());
@@ -2258,7 +2258,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 None::<Vec<i32>>,
                 None::<Vec<i32>>,
                 None::<Vec<i32>>,
-                None::<Vec<crate::partitions::TBucketProperty>>,
+                None::<Vec<crate::thrift::partitions::TBucketProperty>>,
             );
 
             let mut target_map = BTreeMap::new();
@@ -2273,11 +2273,11 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 target_map,
                 has_remote_targets,
                 None::<i64>,
-                None::<Vec<crate::types::TNetworkAddress>>,
+                None::<Vec<crate::thrift::types::TNetworkAddress>>,
                 build_join_mode,
-                None::<crate::types::TUniqueId>,
+                None::<crate::thrift::types::TUniqueId>,
                 join_node_id,
-                None::<Vec<crate::types::TUniqueId>>,
+                None::<Vec<crate::thrift::types::TUniqueId>>,
                 None::<Vec<runtime_filter::TRuntimeFilterDestination>>,
                 None::<Vec<i32>>,
                 None::<BTreeMap<i32, Vec<exprs::TExpr>>>,
@@ -2751,7 +2751,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 ids.push(value.id);
                 strings.push(value.bytes.clone());
             }
-            let global_dict = crate::data::TGlobalDict::new(
+            let global_dict = crate::thrift::data::TGlobalDict::new(
                 Some(*dict_slot_id),
                 Some(strings),
                 Some(ids),
@@ -4691,7 +4691,6 @@ mod tests {
     use crate::connector::ConnectorRegistry;
     use crate::connector::iceberg::IcebergMetadataTableType;
     use crate::lower::type_lowering::arrow_type_from_desc;
-    use crate::plan_nodes::TPlanNodeType;
     use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn, ProjectItem, TypedExpr};
     use crate::sql::catalog::{
         CatalogProvider, ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
@@ -4717,6 +4716,7 @@ mod tests {
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::optimizer::statistics::Statistics;
     use crate::sql::planner::optimizer_bridge::scalar::intern_project_items;
+    use crate::thrift::plan_nodes::TPlanNodeType;
 
     #[test]
     fn aggregate_slot_contract_uses_intermediate_only_for_non_finalize() {
@@ -5116,11 +5116,11 @@ mod tests {
             .expect("child fragment");
         assert_eq!(
             root.output_sink.type_,
-            crate::data_sinks::TDataSinkType::RESULT_SINK
+            crate::thrift::data_sinks::TDataSinkType::RESULT_SINK
         );
         assert_eq!(
             child.output_sink.type_,
-            crate::data_sinks::TDataSinkType::NOOP_SINK
+            crate::thrift::data_sinks::TDataSinkType::NOOP_SINK
         );
         assert_eq!(root.desc_tbl, child.desc_tbl);
         assert_eq!(root.exec_params, child.exec_params);
@@ -5443,11 +5443,11 @@ mod tests {
             source_fragment_id,
             target_fragment_id,
             target_exchange_node_id,
-            output_partition: crate::partitions::TDataPartition::new(
-                crate::partitions::TPartitionType::UNPARTITIONED,
-                None::<Vec<crate::exprs::TExpr>>,
-                None::<Vec<crate::partitions::TRangePartition>>,
-                None::<Vec<crate::partitions::TBucketProperty>>,
+            output_partition: crate::thrift::partitions::TDataPartition::new(
+                crate::thrift::partitions::TPartitionType::UNPARTITIONED,
+                None::<Vec<crate::thrift::exprs::TExpr>>,
+                None::<Vec<crate::thrift::partitions::TRangePartition>>,
+                None::<Vec<crate::thrift::partitions::TBucketProperty>>,
             ),
             stream_kind: FragmentStreamKind::Gather,
             edge_kind: FragmentEdgeKind::Stream,
@@ -5496,7 +5496,7 @@ mod tests {
             children: vec![],
             stats: PlanNodeStats::from_statistics(&Statistics::default()),
             kind: PlanNodeKind::Exchange(DistributedExchangeNode {
-                partition_type: crate::partitions::TPartitionType::UNPARTITIONED,
+                partition_type: crate::thrift::partitions::TPartitionType::UNPARTITIONED,
                 partition_exprs: vec![],
                 source_fragment_id,
                 output_columns: Vec::new(),

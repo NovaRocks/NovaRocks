@@ -20,7 +20,7 @@ pub mod cached_reader;
 pub mod data_cache;
 pub mod page_cache;
 
-use crate::internal_service;
+use crate::thrift::internal_service;
 
 pub use block_cache::{BlockCache, BlockCacheOptions, CacheKey};
 pub use cache_input_stream::{CacheBlockRead, CacheInputStream};
@@ -185,7 +185,7 @@ fn parse_non_negative_i64(name: &str, value: i64) -> Result<i64, String> {
 #[cfg(test)]
 mod tests {
     use super::CacheOptions;
-    use crate::internal_service::TQueryOptions;
+    use crate::thrift::internal_service::TQueryOptions;
 
     #[test]
     fn cache_switches_are_disabled_when_query_options_missing() {

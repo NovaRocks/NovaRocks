@@ -25,7 +25,7 @@ use crate::service::grpc_client::proto::starrocks::{
     ColumnPb, KeysType, PScalarType, PTypeDesc, PTypeNode, SegmentMetadataPb, TabletSchemaPb,
     TuplePb, VariantPb, VariantTypePb,
 };
-use crate::types::TPrimitiveType;
+use crate::thrift::types::TPrimitiveType;
 
 const TYPE_NODE_SCALAR: i32 = 0;
 const DATE32_UNIX_EPOCH_DAY_OFFSET: i32 = 719_163; // 1970-01-01 in proleptic Gregorian days
@@ -777,7 +777,7 @@ mod tests {
     use crate::service::grpc_client::proto::starrocks::{
         ColumnPb, KeysType, TabletSchemaPb, VariantTypePb,
     };
-    use crate::types::TPrimitiveType;
+    use crate::thrift::types::TPrimitiveType;
 
     fn one_bigint_tablet_schema() -> TabletSchemaPb {
         TabletSchemaPb {

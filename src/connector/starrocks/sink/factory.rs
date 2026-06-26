@@ -53,7 +53,6 @@ use crate::exec::node::{ExecNodeKind, ExecPlan};
 use crate::exec::pipeline::operator::Operator;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::formats::starrocks::writer::StarRocksWriteFormat;
-use crate::frontend_service::{self, TFrontendServiceSyncClient};
 use crate::fs::path::{ScanPathScheme, classify_scan_paths};
 use crate::lower::expr::lower_t_expr;
 use crate::lower::layout::Layout;
@@ -65,8 +64,9 @@ use crate::service::frontend_rpc::{
     FrontendRpcCallOptions, FrontendRpcError, FrontendRpcKind, FrontendRpcManager,
 };
 use crate::service::grpc_client::proto::starrocks::{KeysType, PUniqueId, TabletSchemaPb};
-use crate::status_code;
-use crate::{data_sinks, descriptors, exprs, types};
+use crate::thrift::frontend_service::{self, TFrontendServiceSyncClient};
+use crate::thrift::status_code;
+use crate::thrift::{data_sinks, descriptors, exprs, types};
 
 const LOAD_OP_COLUMN: &str = "__op";
 pub(crate) const STARROCKS_DEFAULT_PARTITION_VALUE: &str = "__STARROCKS_DEFAULT_PARTITION__";
@@ -1938,7 +1938,7 @@ mod tests {
     use crate::lower::layout::Layout;
     use crate::service::frontend_rpc::test_clear_shared_host_pools;
     use crate::service::grpc_client::proto::starrocks::{ColumnPb, KeysType, TabletSchemaPb};
-    use crate::{data_sinks, descriptors, exprs, types};
+    use crate::thrift::{data_sinks, descriptors, exprs, types};
     use tempfile::tempdir;
     mod fe_rpc_server {
         include!(concat!(
@@ -2682,14 +2682,14 @@ mod tests {
             0,
             Box::new(move |method, seq, i_prot, o_prot| match method {
                 "createPartition" => {
-                    let _req: crate::frontend_service::TCreatePartitionRequest =
+                    let _req: crate::thrift::frontend_service::TCreatePartitionRequest =
                         read_struct_arg(i_prot)?;
                     if calls_for_server.fetch_add(1, Ordering::AcqRel) == 0 {
                         return Ok(ServerAction::Close);
                     }
-                    let response = crate::frontend_service::TCreatePartitionResult {
-                        status: Some(crate::status::TStatus::new(
-                            crate::status_code::TStatusCode::OK,
+                    let response = crate::thrift::frontend_service::TCreatePartitionResult {
+                        status: Some(crate::thrift::status::TStatus::new(
+                            crate::thrift::status_code::TStatusCode::OK,
                             None,
                         )),
                         partitions: None,
@@ -2715,7 +2715,7 @@ mod tests {
 
         assert_eq!(
             response.status.map(|status| status.status_code),
-            Some(crate::status_code::TStatusCode::OK)
+            Some(crate::thrift::status_code::TStatusCode::OK)
         );
         assert_eq!(calls.load(Ordering::Acquire), 2);
         assert!(server.accepts() >= 2);
@@ -2732,12 +2732,12 @@ mod tests {
             0,
             Box::new(move |method, seq, i_prot, o_prot| match method {
                 "createPartition" => {
-                    let req: crate::frontend_service::TCreatePartitionRequest =
+                    let req: crate::thrift::frontend_service::TCreatePartitionRequest =
                         read_struct_arg(i_prot)?;
                     saw_temp_for_server.store(req.is_temp.unwrap_or(false), Ordering::Release);
-                    let response = crate::frontend_service::TCreatePartitionResult {
-                        status: Some(crate::status::TStatus::new(
-                            crate::status_code::TStatusCode::OK,
+                    let response = crate::thrift::frontend_service::TCreatePartitionResult {
+                        status: Some(crate::thrift::status::TStatus::new(
+                            crate::thrift::status_code::TStatusCode::OK,
                             None,
                         )),
                         partitions: None,
@@ -2775,14 +2775,14 @@ mod tests {
             0,
             Box::new(move |method, seq, i_prot, o_prot| match method {
                 "createPartition" => {
-                    let _req: crate::frontend_service::TCreatePartitionRequest =
+                    let _req: crate::thrift::frontend_service::TCreatePartitionRequest =
                         read_struct_arg(i_prot)?;
                     if calls_for_server.fetch_add(1, Ordering::AcqRel) < 2 {
                         return Ok(ServerAction::Close);
                     }
-                    let response = crate::frontend_service::TCreatePartitionResult {
-                        status: Some(crate::status::TStatus::new(
-                            crate::status_code::TStatusCode::OK,
+                    let response = crate::thrift::frontend_service::TCreatePartitionResult {
+                        status: Some(crate::thrift::status::TStatus::new(
+                            crate::thrift::status_code::TStatusCode::OK,
                             None,
                         )),
                         partitions: None,
@@ -2808,7 +2808,7 @@ mod tests {
 
         assert_eq!(
             response.status.map(|status| status.status_code),
-            Some(crate::status_code::TStatusCode::OK)
+            Some(crate::thrift::status_code::TStatusCode::OK)
         );
         assert_eq!(calls.load(Ordering::Acquire), 3);
         assert!(server.accepts() >= 3);

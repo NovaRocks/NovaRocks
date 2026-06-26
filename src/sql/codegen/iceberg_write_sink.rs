@@ -1,11 +1,11 @@
 use arrow::datatypes::{DataType, TimeUnit};
 use iceberg::spec::{PrimitiveType, Transform, Type};
 
-use crate::cloud_configuration::TCloudConfiguration;
-use crate::data_sinks;
-use crate::descriptors;
 use crate::sql::catalog::{ColumnDef, IcebergTableInfo, TableDef};
-use crate::types;
+use crate::thrift::cloud_configuration::TCloudConfiguration;
+use crate::thrift::data_sinks;
+use crate::thrift::descriptors;
+use crate::thrift::types;
 
 use super::type_infer::arrow_type_to_type_desc;
 
@@ -148,11 +148,11 @@ pub(crate) fn partition_info_from_serialized_metadata(
 fn partition_expr_from_transform(
     source: &iceberg::spec::NestedField,
     transform: &Transform,
-) -> Result<crate::exprs::TExpr, String> {
+) -> Result<crate::thrift::exprs::TExpr, String> {
     let source_type = iceberg_type_to_arrow_type(source.field_type.as_ref())?;
     let source_node = source_column_slot_ref_placeholder_node(&source_type)?;
     let expr = match transform {
-        Transform::Identity => crate::exprs::TExpr::new(vec![source_node]),
+        Transform::Identity => crate::thrift::exprs::TExpr::new(vec![source_node]),
         Transform::Void => transform_call_expr(
             "__iceberg_transform_void",
             vec![source_node],
@@ -198,26 +198,26 @@ fn partition_expr_from_transform(
 
 fn time_transform_expr(
     name: &str,
-    source_node: crate::exprs::TExprNode,
+    source_node: crate::thrift::exprs::TExprNode,
     source_type: DataType,
-) -> Result<crate::exprs::TExpr, String> {
+) -> Result<crate::thrift::exprs::TExpr, String> {
     transform_call_expr(name, vec![source_node], &[source_type], DataType::Int64)
 }
 
 fn transform_call_expr(
     name: &str,
-    children: Vec<crate::exprs::TExprNode>,
+    children: Vec<crate::thrift::exprs::TExprNode>,
     arg_types: &[DataType],
     return_type: DataType,
-) -> Result<crate::exprs::TExpr, String> {
+) -> Result<crate::thrift::exprs::TExpr, String> {
     let ret_type = arrow_type_to_type_desc(&return_type)?;
     let fn_arg_types = arg_types
         .iter()
         .map(arrow_type_to_type_desc)
         .collect::<Result<Vec<_>, _>>()?;
     let mut nodes = Vec::with_capacity(children.len() + 1);
-    nodes.push(crate::exprs::TExprNode {
-        node_type: crate::exprs::TExprNodeType::FUNCTION_CALL,
+    nodes.push(crate::thrift::exprs::TExprNode {
+        node_type: crate::thrift::exprs::TExprNodeType::FUNCTION_CALL,
         type_: ret_type.clone(),
         num_children: children.len() as i32,
         fn_: Some(types::TFunction {
@@ -248,12 +248,12 @@ fn transform_call_expr(
         ..super::expr_compiler::default_expr_node()
     });
     nodes.extend(children);
-    Ok(crate::exprs::TExpr::new(nodes))
+    Ok(crate::thrift::exprs::TExpr::new(nodes))
 }
 
 fn source_column_slot_ref_placeholder_node(
     source_type: &DataType,
-) -> Result<crate::exprs::TExprNode, String> {
+) -> Result<crate::thrift::exprs::TExprNode, String> {
     super::expr_compiler::build_slot_ref_texpr(0, 0, arrow_type_to_type_desc(source_type)?)
         .nodes
         .into_iter()
@@ -575,7 +575,7 @@ mod tests {
         assert_eq!(expr.nodes.len(), 1);
         assert_eq!(
             expr.nodes[0].node_type,
-            crate::exprs::TExprNodeType::SLOT_REF
+            crate::thrift::exprs::TExprNodeType::SLOT_REF
         );
         assert!(expr.nodes[0].slot_ref.is_some());
     }
@@ -607,7 +607,7 @@ mod tests {
         assert_eq!(expr.nodes.len(), 3);
         assert_eq!(
             expr.nodes[0].node_type,
-            crate::exprs::TExprNodeType::FUNCTION_CALL
+            crate::thrift::exprs::TExprNodeType::FUNCTION_CALL
         );
         assert_eq!(
             expr.nodes[0]
@@ -618,7 +618,7 @@ mod tests {
         );
         assert_eq!(
             expr.nodes[1].node_type,
-            crate::exprs::TExprNodeType::SLOT_REF
+            crate::thrift::exprs::TExprNodeType::SLOT_REF
         );
         assert_eq!(
             expr.nodes[2].int_literal.as_ref().map(|lit| lit.value),
@@ -639,7 +639,7 @@ mod tests {
         assert_eq!(expr.nodes.len(), 2);
         assert_eq!(
             expr.nodes[0].node_type,
-            crate::exprs::TExprNodeType::FUNCTION_CALL
+            crate::thrift::exprs::TExprNodeType::FUNCTION_CALL
         );
         assert_eq!(
             expr.nodes[0]
@@ -650,7 +650,7 @@ mod tests {
         );
         assert_eq!(
             expr.nodes[1].node_type,
-            crate::exprs::TExprNodeType::SLOT_REF
+            crate::thrift::exprs::TExprNodeType::SLOT_REF
         );
     }
 

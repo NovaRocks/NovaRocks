@@ -19,7 +19,7 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::common::types::UniqueId;
 use crate::connector::iceberg::stats_assembler::FileSketchSet;
-use crate::types::{TSinkCommitInfo, TTabletCommitInfo, TTabletFailInfo};
+use crate::thrift::types::{TSinkCommitInfo, TTabletCommitInfo, TTabletFailInfo};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct SinkLoadStats {

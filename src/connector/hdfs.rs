@@ -22,18 +22,18 @@ use crate::cache::ExternalDataCacheRangeOptions;
 use crate::connector::iceberg::position_delete::{
     IcebergDeleteFileSpec, convert_scan_range_delete_files, load_position_deletes,
 };
-use crate::descriptors;
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanOp};
 use crate::formats::{FileFormatConfig, build_format_iter};
 use crate::fs::scan_context::{FileScanContext, FileScanRange};
-use crate::internal_service;
 use crate::runtime::profile::RuntimeProfile;
+use crate::thrift::descriptors;
+use crate::thrift::internal_service;
 
 fn delete_files_have_position_deletes(delete_files: &[IcebergDeleteFileSpec]) -> bool {
-    delete_files
-        .iter()
-        .any(|file| file.file_content == crate::types::TIcebergFileContent::POSITION_DELETES)
+    delete_files.iter().any(|file| {
+        file.file_content == crate::thrift::types::TIcebergFileContent::POSITION_DELETES
+    })
 }
 
 fn apply_parquet_pruning_gate_for_delete_files(
@@ -63,7 +63,7 @@ pub struct HdfsScanConfig {
     pub object_store_config: Option<crate::fs::object_store::ObjectStoreConfig>,
     /// Cached Iceberg table locations keyed by `table_id`, used to resolve incremental
     /// scan ranges that only carry `relative_path`.
-    pub iceberg_table_locations: HashMap<crate::types::TTableId, String>,
+    pub iceberg_table_locations: HashMap<crate::thrift::types::TTableId, String>,
     /// Per-slot global dictionary encode maps (string bytes -> dict id) for
     /// dict-encoded output columns. Empty for all non-dict scans. Injected into
     /// the parquet format config in `execute_iter`; the reader reads the dict
@@ -464,10 +464,9 @@ impl ScanOp for HdfsScanOp {
         else {
             return Ok(None);
         };
-        if !delete_files
-            .iter()
-            .any(|file| file.file_content == crate::types::TIcebergFileContent::EQUALITY_DELETES)
-        {
+        if !delete_files.iter().any(|file| {
+            file.file_content == crate::thrift::types::TIcebergFileContent::EQUALITY_DELETES
+        }) {
             return Ok(None);
         }
         let mut loader_ranges: Vec<crate::fs::scan_context::FileScanRange> =
@@ -533,7 +532,7 @@ impl ScanOp for HdfsScanOp {
 
 fn extract_incremental_change_op(
     scan_range_id: i32,
-    hdfs_range: &crate::plan_nodes::THdfsScanRange,
+    hdfs_range: &crate::thrift::plan_nodes::THdfsScanRange,
 ) -> Result<Option<i8>, String> {
     let Some(extended_columns) = hdfs_range.extended_columns.as_ref() else {
         return Ok(None);
@@ -564,7 +563,7 @@ fn extract_incremental_change_op(
 }
 
 fn build_external_datacache_options(
-    hdfs_range: &crate::plan_nodes::THdfsScanRange,
+    hdfs_range: &crate::thrift::plan_nodes::THdfsScanRange,
 ) -> Option<ExternalDataCacheRangeOptions> {
     let candidate_node = hdfs_range
         .candidate_node
@@ -606,16 +605,16 @@ mod tests {
     use crate::common::ids::SlotId;
     use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
     use crate::connector::iceberg::position_delete::IcebergDeleteFileSpec;
-    use crate::descriptors;
     use crate::exec::chunk::ChunkSchema;
     use crate::exec::node::scan::{ScanMorsel, ScanOp};
     use crate::formats::parquet::{
         ParquetReadCachePolicy, ParquetScanConfig, VariantPathPruningPredicate,
     };
     use crate::fs::scan_context::FileScanRange;
-    use crate::internal_service;
-    use crate::plan_nodes;
-    use crate::{exprs, types};
+    use crate::thrift::descriptors;
+    use crate::thrift::internal_service;
+    use crate::thrift::plan_nodes;
+    use crate::thrift::{exprs, types};
 
     use super::{HdfsScanConfig, HdfsScanOp, apply_parquet_pruning_gate_for_delete_files};
 
@@ -629,7 +628,9 @@ mod tests {
     fn make_hdfs_range_with_extended(
         path: &str,
         first_row_id: Option<i64>,
-        extended_columns: Option<BTreeMap<crate::types::TSlotId, crate::exprs::TExpr>>,
+        extended_columns: Option<
+            BTreeMap<crate::thrift::types::TSlotId, crate::thrift::exprs::TExpr>,
+        >,
     ) -> internal_service::TScanRangeParams {
         let hdfs_scan_range = plan_nodes::THdfsScanRange::new(
             None::<String>,
@@ -648,11 +649,11 @@ mod tests {
             None::<String>,
             None::<String>,
             None::<i64>,
-            None::<crate::data_cache::TDataCacheOptions>,
-            None::<Vec<crate::types::TSlotId>>,
+            None::<crate::thrift::data_cache::TDataCacheOptions>,
+            None::<Vec<crate::thrift::types::TSlotId>>,
             None::<bool>,
             None::<std::collections::BTreeMap<String, String>>,
-            None::<Vec<crate::types::TSlotId>>,
+            None::<Vec<crate::thrift::types::TSlotId>>,
             None::<bool>,
             None::<String>,
             None::<bool>,
@@ -661,12 +662,12 @@ mod tests {
             None::<plan_nodes::TPaimonDeletionFile>,
             extended_columns,
             None::<descriptors::THdfsPartition>,
-            None::<crate::types::TTableId>,
+            None::<crate::thrift::types::TTableId>,
             None::<plan_nodes::TDeletionVectorDescriptor>,
             None::<String>,
             None::<i64>,
             None::<bool>,
-            None::<std::collections::BTreeMap<i32, crate::exprs::TExprMinMaxValue>>,
+            None::<std::collections::BTreeMap<i32, crate::thrift::exprs::TExprMinMaxValue>>,
             None::<i32>,
             first_row_id,
             None::<i64>, // data_sequence_number: not set in test helper

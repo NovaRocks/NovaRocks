@@ -17,9 +17,9 @@
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
 use arrow::datatypes::DataType;
 
-use crate::exprs;
 use crate::lower::type_lowering::{arrow_type_from_desc, arrow_type_from_primitive};
-use crate::types;
+use crate::thrift::exprs;
+use crate::thrift::types;
 
 fn is_temporal_type(data_type: &DataType) -> bool {
     matches!(data_type, DataType::Date32 | DataType::Timestamp(_, _))

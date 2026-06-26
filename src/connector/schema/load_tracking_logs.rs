@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use reqwest::blocking::Client;
 
-use crate::frontend_service::{self, TTrackingLoadInfo};
-use crate::types;
+use crate::thrift::frontend_service::{self, TTrackingLoadInfo};
+use crate::thrift::types;
 
 use super::SchemaScanContext;
 use super::chunk_builder::{SchemaRow, SchemaValue, normalize_column_key};

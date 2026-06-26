@@ -400,10 +400,10 @@ pub(crate) fn to_sink_commit_info(
     partition_path: String,
     null_fingerprint: String,
     format: String,
-    content: crate::types::TIcebergFileContent,
+    content: crate::thrift::types::TIcebergFileContent,
 ) -> Result<
     (
-        crate::types::TSinkCommitInfo,
+        crate::thrift::types::TSinkCommitInfo,
         Option<super::stats_assembler::FileSketchSet>,
     ),
     String,
@@ -419,7 +419,7 @@ pub(crate) fn to_sink_commit_info(
         staged.descriptor_partition_spec_id,
         staged.metadata.as_ref(),
     )?;
-    let commit_info = crate::types::TSinkCommitInfo {
+    let commit_info = crate::thrift::types::TSinkCommitInfo {
         iceberg_data_file: Some(data_file),
         hive_file_info: None,
         is_overwrite: None,
@@ -440,7 +440,7 @@ pub(crate) fn to_sink_commit_info(
 pub(crate) fn written_file_to_sink_commit_info(
     file: &super::commit::WrittenFile,
     metadata: &TableMetadata,
-) -> Result<crate::types::TSinkCommitInfo, String> {
+) -> Result<crate::thrift::types::TSinkCommitInfo, String> {
     let partition_spec = metadata
         .partition_spec_by_id(file.partition_spec_id)
         .ok_or_else(|| {
@@ -456,7 +456,7 @@ pub(crate) fn written_file_to_sink_commit_info(
             .map_err(|e| {
                 crate::common::engine_error::EngineError::from(e).to_bracketed_user_message()
             })?;
-    let data_file = crate::types::TIcebergDataFile {
+    let data_file = crate::thrift::types::TIcebergDataFile {
         path: Some(file.path.clone()),
         format: Some(file.format.to_string()),
         record_count: Some(u64_to_i64(file.record_count, "record_count")?),
@@ -479,7 +479,7 @@ pub(crate) fn written_file_to_sink_commit_info(
             .map(|value| u64_to_i64(value, "cardinality"))
             .transpose()?,
     };
-    Ok(crate::types::TSinkCommitInfo {
+    Ok(crate::thrift::types::TSinkCommitInfo {
         iceberg_data_file: Some(data_file),
         hive_file_info: None,
         is_overwrite: None,
@@ -491,21 +491,25 @@ pub(crate) fn written_file_to_sink_commit_info(
 pub(crate) fn written_file_to_sink_commit_info_for_metadata(
     file: &super::commit::WrittenFile,
     metadata: &TableMetadata,
-) -> Result<crate::types::TSinkCommitInfo, String> {
+) -> Result<crate::thrift::types::TSinkCommitInfo, String> {
     written_file_to_sink_commit_info(file, metadata)
 }
 
-fn thrift_file_content(content: DataContentType) -> crate::types::TIcebergFileContent {
+fn thrift_file_content(content: DataContentType) -> crate::thrift::types::TIcebergFileContent {
     match content {
-        DataContentType::Data => crate::types::TIcebergFileContent::DATA,
-        DataContentType::PositionDeletes => crate::types::TIcebergFileContent::POSITION_DELETES,
-        DataContentType::EqualityDeletes => crate::types::TIcebergFileContent::EQUALITY_DELETES,
+        DataContentType::Data => crate::thrift::types::TIcebergFileContent::DATA,
+        DataContentType::PositionDeletes => {
+            crate::thrift::types::TIcebergFileContent::POSITION_DELETES
+        }
+        DataContentType::EqualityDeletes => {
+            crate::thrift::types::TIcebergFileContent::EQUALITY_DELETES
+        }
     }
 }
 
 fn written_file_column_stats(
     file: &super::commit::WrittenFile,
-) -> Result<Option<crate::types::TIcebergColumnStats>, String> {
+) -> Result<Option<crate::thrift::types::TIcebergColumnStats>, String> {
     let column_sizes = u64_stats_to_i64(&file.column_sizes, "column_sizes")?;
     let value_counts = u64_stats_to_i64(&file.value_counts, "value_counts")?;
     let null_value_counts = u64_stats_to_i64(&file.null_value_counts, "null_value_counts")?;
@@ -521,7 +525,7 @@ fn written_file_column_stats(
         return Ok(None);
     }
 
-    Ok(Some(crate::types::TIcebergColumnStats {
+    Ok(Some(crate::thrift::types::TIcebergColumnStats {
         column_sizes: (!column_sizes.is_empty()).then_some(column_sizes),
         value_counts: (!value_counts.is_empty()).then_some(value_counts),
         null_value_counts: (!null_value_counts.is_empty()).then_some(null_value_counts),
@@ -600,10 +604,10 @@ pub(crate) fn data_file_to_iceberg_thrift(
     partition_path: String,
     null_fingerprint: String,
     format: String,
-    content: crate::types::TIcebergFileContent,
+    content: crate::thrift::types::TIcebergFileContent,
     partition_spec_id: Option<i32>,
     metadata: &TableMetadata,
-) -> Result<crate::types::TIcebergDataFile, String> {
+) -> Result<crate::thrift::types::TIcebergDataFile, String> {
     let partition_spec_id = partition_spec_id.ok_or_else(|| {
         crate::common::engine_error::EngineError::iceberg_write_descriptor_mismatch(
             "missing partition_spec_id",
@@ -627,17 +631,17 @@ fn data_file_to_iceberg_thrift_with_descriptor_spec(
     partition_path: String,
     null_fingerprint: String,
     format: String,
-    content: crate::types::TIcebergFileContent,
+    content: crate::thrift::types::TIcebergFileContent,
     partition_spec_id: i32,
     descriptor_partition_spec_id: i32,
     metadata: &TableMetadata,
-) -> Result<crate::types::TIcebergDataFile, String> {
+) -> Result<crate::thrift::types::TIcebergDataFile, String> {
     let partition_values_descriptor =
         encode_partition_descriptor(df.partition(), descriptor_partition_spec_id, metadata)
             .map_err(|e| {
                 crate::common::engine_error::EngineError::from(e).to_bracketed_user_message()
             })?;
-    Ok(crate::types::TIcebergDataFile {
+    Ok(crate::thrift::types::TIcebergDataFile {
         path: Some(df.file_path().to_string()),
         format: Some(format),
         record_count: Some(u64_to_i64(df.record_count(), "record_count")?),
@@ -661,7 +665,7 @@ fn data_file_to_iceberg_thrift_with_descriptor_spec(
 
 fn iceberg_data_file_to_column_stats(
     df: &DataFile,
-) -> Result<Option<crate::types::TIcebergColumnStats>, String> {
+) -> Result<Option<crate::thrift::types::TIcebergColumnStats>, String> {
     let column_sizes = u64_stats_to_i64(df.column_sizes(), "column_sizes")?;
     let value_counts = u64_stats_to_i64(df.value_counts(), "value_counts")?;
     let null_value_counts = u64_stats_to_i64(df.null_value_counts(), "null_value_counts")?;
@@ -679,7 +683,7 @@ fn iceberg_data_file_to_column_stats(
         return Ok(None);
     }
 
-    Ok(Some(crate::types::TIcebergColumnStats {
+    Ok(Some(crate::thrift::types::TIcebergColumnStats {
         column_sizes: (!column_sizes.is_empty()).then_some(column_sizes),
         value_counts: (!value_counts.is_empty()).then_some(value_counts),
         null_value_counts: (!null_value_counts.is_empty()).then_some(null_value_counts),
@@ -1397,7 +1401,7 @@ mod tests {
             "wrong=path".to_string(),
             "0".to_string(),
             "PARQUET".to_string(),
-            crate::types::TIcebergFileContent::DATA,
+            crate::thrift::types::TIcebergFileContent::DATA,
             Some(spec_id),
             &metadata,
         )
@@ -1431,7 +1435,7 @@ mod tests {
             "region=west".to_string(),
             "0".to_string(),
             "PARQUET".to_string(),
-            crate::types::TIcebergFileContent::DATA,
+            crate::thrift::types::TIcebergFileContent::DATA,
             None,
             &metadata,
         )
@@ -1466,7 +1470,7 @@ mod tests {
             "region=west".to_string(),
             "0".to_string(),
             "PARQUET".to_string(),
-            crate::types::TIcebergFileContent::DATA,
+            crate::thrift::types::TIcebergFileContent::DATA,
             Some(99),
             &metadata,
         )
@@ -1601,7 +1605,7 @@ mod tests {
         assert_eq!(df.path.as_deref(), Some("file:///t/delete-1.parquet"));
         assert_eq!(
             df.file_content,
-            Some(crate::types::TIcebergFileContent::POSITION_DELETES)
+            Some(crate::thrift::types::TIcebergFileContent::POSITION_DELETES)
         );
         assert_eq!(
             df.referenced_data_file.as_deref(),
@@ -1660,7 +1664,7 @@ mod tests {
         assert_eq!(df.format.as_deref(), Some("puffin"));
         assert_eq!(
             df.file_content,
-            Some(crate::types::TIcebergFileContent::POSITION_DELETES)
+            Some(crate::thrift::types::TIcebergFileContent::POSITION_DELETES)
         );
         assert_eq!(df.content_offset, Some(4));
         assert_eq!(df.content_size_in_bytes, Some(12));
@@ -1724,7 +1728,7 @@ mod tests {
             String::new(),
             String::new(),
             "PARQUET".to_string(),
-            crate::types::TIcebergFileContent::DATA,
+            crate::thrift::types::TIcebergFileContent::DATA,
             Some(spec_id),
             &metadata,
         )
@@ -1982,7 +1986,7 @@ mod tests {
             String::new(),
             String::new(),
             "parquet".to_string(),
-            crate::types::TIcebergFileContent::DATA,
+            crate::thrift::types::TIcebergFileContent::DATA,
         )
         .expect("commit info");
         let df = commit.iceberg_data_file.expect("iceberg data file");
@@ -1998,7 +2002,7 @@ mod tests {
         );
         assert_eq!(
             df.file_content,
-            Some(crate::types::TIcebergFileContent::DATA)
+            Some(crate::thrift::types::TIcebergFileContent::DATA)
         );
         assert_eq!(
             df.referenced_data_file,
@@ -2092,7 +2096,7 @@ mod tests {
             String::new(),
             String::new(),
             "parquet".to_string(),
-            crate::types::TIcebergFileContent::DATA,
+            crate::thrift::types::TIcebergFileContent::DATA,
         )
         .map(|_| ())
         .expect_err("overflow should be rejected");

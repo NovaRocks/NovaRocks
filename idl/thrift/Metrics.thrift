@@ -17,6 +17,7 @@
 
 namespace cpp starrocks
 namespace java com.starrocks.thrift
+namespace rs thrift
 
 // Metric and counter data types.
 enum TUnit {

@@ -37,7 +37,7 @@ use crate::connector::starrocks::sink::partition_key::{
     validate_partition_key_length,
 };
 use crate::exec::chunk::Chunk;
-use crate::{data_sinks, descriptors, exprs, types};
+use crate::thrift::{data_sinks, descriptors, exprs, types};
 
 const LOAD_OP_COLUMN: &str = "__op";
 
@@ -1052,7 +1052,7 @@ mod tests {
     use crate::common::ids::SlotId;
     use crate::connector::starrocks::sink::partition_key::{PartitionKeySource, PartitionSlotRef};
     use crate::exec::chunk::Chunk;
-    use crate::{data_sinks, descriptors, exprs, types};
+    use crate::thrift::{data_sinks, descriptors, exprs, types};
 
     fn build_test_schema() -> descriptors::TOlapTableSchemaParam {
         descriptors::TOlapTableSchemaParam {

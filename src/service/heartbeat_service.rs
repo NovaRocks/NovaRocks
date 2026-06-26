@@ -22,12 +22,12 @@ use thrift::server::TServer;
 use thrift::transport::{TBufferedReadTransportFactory, TBufferedWriteTransportFactory};
 
 use crate::runtime::backend_id as backend_id_store;
-use crate::{
+use crate::service::disk_report;
+use crate::thrift::{
     heartbeat_service::{
         HeartbeatServiceSyncHandler, HeartbeatServiceSyncProcessor, TBackendInfo, THeartbeatResult,
         TMasterInfo,
     },
-    service::disk_report,
     status::TStatus,
     status_code::TStatusCode,
 };

@@ -5,7 +5,7 @@ use arrow::datatypes::DataType;
 use crate::connector::scan_planning::{ScanHandle, Split};
 use crate::sql::catalog::TableDef;
 use crate::sql::column_id::ColumnId;
-use crate::types;
+use crate::thrift::types;
 
 #[derive(Clone, Debug)]
 pub(crate) struct PlannedConnectorScan {

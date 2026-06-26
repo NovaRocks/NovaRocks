@@ -21,8 +21,8 @@ use reqwest::blocking::Client;
 use serde_json::Value as JsonValue;
 use thrift::OrderedFloat;
 
-use crate::frontend_service;
-use crate::types;
+use crate::thrift::frontend_service;
+use crate::thrift::types;
 
 use super::chunk_builder::{SchemaRow, SchemaValue, normalize_column_key};
 use super::frontend::{

@@ -15,16 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::common::ids::SlotId;
-use crate::descriptors;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::project::ProjectNode;
 use crate::exec::node::set_op::{SetOpKind, SetOpNode};
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::exprs;
 use crate::lower::expr::lower_t_expr;
 use crate::lower::layout::{Layout, chunk_schema_for_layout, layout_from_slot_ids};
 use crate::lower::node::Lowered;
-use crate::{plan_nodes, types};
+use crate::thrift::descriptors;
+use crate::thrift::exprs;
+use crate::thrift::{plan_nodes, types};
 
 pub(crate) fn lower_intersect_node(
     children: Vec<Lowered>,

@@ -24,7 +24,7 @@ use crate::lower::expr::lower_t_expr;
 use crate::lower::layout::{Layout, chunk_schema_for_layout};
 use crate::lower::node::Lowered;
 
-use crate::{descriptors, plan_nodes, types};
+use crate::thrift::{descriptors, plan_nodes, types};
 
 /// Lower a NESTLOOP_JOIN_NODE plan node to a `Lowered` ExecNode.
 pub(crate) fn lower_nestloop_join_node(

@@ -52,7 +52,7 @@ struct BufferControlBlock {
     cancel_message: Option<String>,
     next_packet_seq: i64,
     mem_tracker: Option<Arc<MemTracker>>,
-    eos_template: Option<crate::data::TResultBatch>,
+    eos_template: Option<crate::thrift::data::TResultBatch>,
 }
 
 impl BufferControlBlock {
@@ -81,7 +81,7 @@ impl BufferControlBlock {
             result_batch: self
                 .eos_template
                 .clone()
-                .unwrap_or_else(|| crate::data::TResultBatch::new(vec![], false, 0, None)),
+                .unwrap_or_else(|| crate::thrift::data::TResultBatch::new(vec![], false, 0, None)),
         }
     }
 
@@ -370,7 +370,7 @@ pub(crate) fn set_mem_tracker(finst_id: UniqueId, tracker: Arc<MemTracker>) {
     }
 }
 
-pub(crate) fn set_eos_template(finst_id: UniqueId, template: crate::data::TResultBatch) {
+pub(crate) fn set_eos_template(finst_id: UniqueId, template: crate::thrift::data::TResultBatch) {
     let c = ctx();
     let mut guard = c.mu.lock().expect("ctx lock");
     let block = guard
@@ -651,7 +651,12 @@ mod tests {
             FetchResult {
                 packet_seq: 0,
                 eos: false,
-                result_batch: crate::data::TResultBatch::new(vec![b"a".to_vec()], false, 0, None),
+                result_batch: crate::thrift::data::TResultBatch::new(
+                    vec![b"a".to_vec()],
+                    false,
+                    0,
+                    None,
+                ),
             },
         );
         insert(
@@ -659,7 +664,12 @@ mod tests {
             FetchResult {
                 packet_seq: 0,
                 eos: false,
-                result_batch: crate::data::TResultBatch::new(vec![b"b".to_vec()], false, 0, None),
+                result_batch: crate::thrift::data::TResultBatch::new(
+                    vec![b"b".to_vec()],
+                    false,
+                    0,
+                    None,
+                ),
             },
         );
         close_ok(finst_id);
@@ -702,7 +712,12 @@ mod tests {
             FetchResult {
                 packet_seq: 0,
                 eos: false,
-                result_batch: crate::data::TResultBatch::new(vec![b"row".to_vec()], false, 0, None),
+                result_batch: crate::thrift::data::TResultBatch::new(
+                    vec![b"row".to_vec()],
+                    false,
+                    0,
+                    None,
+                ),
             },
         );
 
@@ -754,7 +769,7 @@ mod tests {
                 FetchResult {
                     packet_seq: 0,
                     eos: false,
-                    result_batch: crate::data::TResultBatch::new(
+                    result_batch: crate::thrift::data::TResultBatch::new(
                         vec![b"wait_data".to_vec()],
                         false,
                         0,
@@ -824,7 +839,12 @@ mod tests {
             FetchResult {
                 packet_seq: 0,
                 eos: false,
-                result_batch: crate::data::TResultBatch::new(vec![b"row".to_vec()], false, 0, None),
+                result_batch: crate::thrift::data::TResultBatch::new(
+                    vec![b"row".to_vec()],
+                    false,
+                    0,
+                    None,
+                ),
             },
         );
 

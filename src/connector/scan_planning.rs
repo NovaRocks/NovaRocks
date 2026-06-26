@@ -4,7 +4,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::common::min_max_predicate::MinMaxPredicate;
-use crate::{exprs, internal_service, plan_nodes, types};
+use crate::thrift::{exprs, internal_service, plan_nodes, types};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ConnectorId(String);

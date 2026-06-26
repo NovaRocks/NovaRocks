@@ -57,7 +57,7 @@ pub(crate) fn encode_partition_descriptor(
     values: &Struct,
     partition_spec_id: i32,
     metadata: &TableMetadata,
-) -> Result<crate::types::TIcebergPartitionDescriptor, IcebergWriteDescriptorError> {
+) -> Result<crate::thrift::types::TIcebergPartitionDescriptor, IcebergWriteDescriptorError> {
     let spec = metadata.partition_spec_by_id(partition_spec_id).ok_or(
         IcebergWriteDescriptorError::UnknownPartitionSpec {
             spec_id: partition_spec_id,
@@ -79,7 +79,7 @@ pub(crate) fn encode_partition_descriptor(
     let mut encoded = Vec::with_capacity(values.fields().len());
     for (idx, value) in values.fields().iter().enumerate() {
         match value {
-            None => encoded.push(crate::types::TIcebergPartitionValue {
+            None => encoded.push(crate::thrift::types::TIcebergPartitionValue {
                 is_null: Some(true),
                 datum_bytes: None,
             }),
@@ -91,7 +91,7 @@ pub(crate) fn encode_partition_descriptor(
                         message: format!("partition field type is not primitive: {field_type:?}"),
                     });
                 };
-                encoded.push(crate::types::TIcebergPartitionValue {
+                encoded.push(crate::thrift::types::TIcebergPartitionValue {
                     is_null: Some(false),
                     datum_bytes: Some(
                         primitive_literal_to_iceberg_bytes(primitive, primitive_type).map_err(
@@ -114,13 +114,13 @@ pub(crate) fn encode_partition_descriptor(
         }
     }
 
-    Ok(crate::types::TIcebergPartitionDescriptor {
+    Ok(crate::thrift::types::TIcebergPartitionDescriptor {
         values: Some(encoded),
     })
 }
 
 pub(crate) fn decode_partition_descriptor(
-    desc: Option<crate::types::TIcebergPartitionDescriptor>,
+    desc: Option<crate::thrift::types::TIcebergPartitionDescriptor>,
     partition_spec_id: i32,
     metadata: &TableMetadata,
 ) -> Result<Struct, IcebergWriteDescriptorError> {
@@ -758,8 +758,8 @@ mod tests {
     fn descriptor_decodes_minimal_negative_decimal_payload() {
         let metadata = metadata_with_decimal_partition();
         let spec_id = metadata.default_partition_spec_id();
-        let desc = crate::types::TIcebergPartitionDescriptor {
-            values: Some(vec![crate::types::TIcebergPartitionValue {
+        let desc = crate::thrift::types::TIcebergPartitionDescriptor {
+            values: Some(vec![crate::thrift::types::TIcebergPartitionValue {
                 is_null: Some(false),
                 datum_bytes: Some(vec![0xff]),
             }]),
@@ -780,8 +780,8 @@ mod tests {
         let spec_id = metadata.default_partition_spec_id();
         for value in [1000_i128, -1000_i128] {
             let bytes = i128_to_be_bytes_min(value);
-            let desc = crate::types::TIcebergPartitionDescriptor {
-                values: Some(vec![crate::types::TIcebergPartitionValue {
+            let desc = crate::thrift::types::TIcebergPartitionDescriptor {
+                values: Some(vec![crate::thrift::types::TIcebergPartitionValue {
                     is_null: Some(false),
                     datum_bytes: Some(bytes),
                 }]),
@@ -803,8 +803,8 @@ mod tests {
         let metadata = metadata_with_decimal_partition();
         let spec_id = metadata.default_partition_spec_id();
         for bytes in [vec![], vec![0x00, 0x00, 0x01], vec![0xff, 0xff, 0xff]] {
-            let desc = crate::types::TIcebergPartitionDescriptor {
-                values: Some(vec![crate::types::TIcebergPartitionValue {
+            let desc = crate::thrift::types::TIcebergPartitionDescriptor {
+                values: Some(vec![crate::thrift::types::TIcebergPartitionValue {
                     is_null: Some(false),
                     datum_bytes: Some(bytes.clone()),
                 }]),
@@ -840,8 +840,8 @@ mod tests {
     fn descriptor_rejects_decoded_fixed_length_mismatch() {
         let metadata = metadata_with_fixed_partition();
         let spec_id = metadata.default_partition_spec_id();
-        let desc = crate::types::TIcebergPartitionDescriptor {
-            values: Some(vec![crate::types::TIcebergPartitionValue {
+        let desc = crate::thrift::types::TIcebergPartitionDescriptor {
+            values: Some(vec![crate::thrift::types::TIcebergPartitionValue {
                 is_null: Some(false),
                 datum_bytes: Some(vec![1, 2, 3]),
             }]),
@@ -872,8 +872,8 @@ mod tests {
     fn descriptor_rejects_missing_payload_for_non_null_value() {
         let metadata = metadata_with_identity_partition();
         let spec_id = metadata.default_partition_spec_id();
-        let desc = crate::types::TIcebergPartitionDescriptor {
-            values: Some(vec![crate::types::TIcebergPartitionValue {
+        let desc = crate::thrift::types::TIcebergPartitionDescriptor {
+            values: Some(vec![crate::thrift::types::TIcebergPartitionValue {
                 is_null: Some(false),
                 datum_bytes: None,
             }]),
@@ -890,8 +890,8 @@ mod tests {
     fn descriptor_rejects_payload_for_null_value() {
         let metadata = metadata_with_identity_partition();
         let spec_id = metadata.default_partition_spec_id();
-        let desc = crate::types::TIcebergPartitionDescriptor {
-            values: Some(vec![crate::types::TIcebergPartitionValue {
+        let desc = crate::thrift::types::TIcebergPartitionDescriptor {
+            values: Some(vec![crate::thrift::types::TIcebergPartitionValue {
                 is_null: Some(true),
                 datum_bytes: Some(b"west".to_vec()),
             }]),
@@ -911,8 +911,8 @@ mod tests {
     fn descriptor_rejects_missing_null_marker() {
         let metadata = metadata_with_identity_partition();
         let spec_id = metadata.default_partition_spec_id();
-        let desc = crate::types::TIcebergPartitionDescriptor {
-            values: Some(vec![crate::types::TIcebergPartitionValue {
+        let desc = crate::thrift::types::TIcebergPartitionDescriptor {
+            values: Some(vec![crate::thrift::types::TIcebergPartitionValue {
                 is_null: None,
                 datum_bytes: Some(b"west".to_vec()),
             }]),
@@ -933,8 +933,8 @@ mod tests {
         let metadata = metadata_with_single_primitive_partition("flag", PrimitiveType::Boolean, 11);
         let spec_id = metadata.default_partition_spec_id();
         for bytes in [vec![], vec![2], vec![0, 0]] {
-            let desc = crate::types::TIcebergPartitionDescriptor {
-                values: Some(vec![crate::types::TIcebergPartitionValue {
+            let desc = crate::thrift::types::TIcebergPartitionDescriptor {
+                values: Some(vec![crate::thrift::types::TIcebergPartitionValue {
                     is_null: Some(false),
                     datum_bytes: Some(bytes.clone()),
                 }]),
@@ -955,8 +955,8 @@ mod tests {
     fn descriptor_rejects_promoted_long_payload() {
         let metadata = metadata_with_single_primitive_partition("l", PrimitiveType::Long, 12);
         let spec_id = metadata.default_partition_spec_id();
-        let desc = crate::types::TIcebergPartitionDescriptor {
-            values: Some(vec![crate::types::TIcebergPartitionValue {
+        let desc = crate::thrift::types::TIcebergPartitionDescriptor {
+            values: Some(vec![crate::thrift::types::TIcebergPartitionValue {
                 is_null: Some(false),
                 datum_bytes: Some(7_i32.to_le_bytes().to_vec()),
             }]),
@@ -976,8 +976,8 @@ mod tests {
     fn descriptor_rejects_promoted_double_payload() {
         let metadata = metadata_with_single_primitive_partition("d", PrimitiveType::Double, 13);
         let spec_id = metadata.default_partition_spec_id();
-        let desc = crate::types::TIcebergPartitionDescriptor {
-            values: Some(vec![crate::types::TIcebergPartitionValue {
+        let desc = crate::thrift::types::TIcebergPartitionDescriptor {
+            values: Some(vec![crate::thrift::types::TIcebergPartitionValue {
                 is_null: Some(false),
                 datum_bytes: Some(7.0_f32.to_le_bytes().to_vec()),
             }]),
@@ -1034,8 +1034,8 @@ mod tests {
         let metadata = metadata_with_single_primitive_partition("t", PrimitiveType::Time, 14);
         let spec_id = metadata.default_partition_spec_id();
         for value in [-1_i64, MAX_TIME_MICROS + 1] {
-            let desc = crate::types::TIcebergPartitionDescriptor {
-                values: Some(vec![crate::types::TIcebergPartitionValue {
+            let desc = crate::thrift::types::TIcebergPartitionDescriptor {
+                values: Some(vec![crate::thrift::types::TIcebergPartitionValue {
                     is_null: Some(false),
                     datum_bytes: Some(value.to_le_bytes().to_vec()),
                 }]),
@@ -1066,7 +1066,7 @@ mod tests {
     #[test]
     fn descriptor_rejects_unknown_partition_spec_id() {
         let metadata = metadata_with_identity_partition();
-        let desc = crate::types::TIcebergPartitionDescriptor {
+        let desc = crate::thrift::types::TIcebergPartitionDescriptor {
             values: Some(vec![]),
         };
 
@@ -1083,7 +1083,7 @@ mod tests {
     fn descriptor_rejects_field_count_mismatch() {
         let metadata = metadata_with_identity_partition();
         let spec_id = metadata.default_partition_spec_id();
-        let desc = crate::types::TIcebergPartitionDescriptor {
+        let desc = crate::thrift::types::TIcebergPartitionDescriptor {
             values: Some(vec![]),
         };
 

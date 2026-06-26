@@ -34,7 +34,7 @@ use crate::exec::expr::{ExprArena, ExprId};
 use crate::lower::expr::lower_t_expr;
 use crate::lower::layout::Layout;
 use crate::lower::type_lowering::{arrow_type_from_desc, primitive_type_from_node};
-use crate::{data_sinks, descriptors, exprs, types};
+use crate::thrift::{data_sinks, descriptors, exprs, types};
 
 #[derive(Clone)]
 pub(crate) enum PartitionKeySource {

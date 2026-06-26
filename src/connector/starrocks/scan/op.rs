@@ -25,11 +25,11 @@ use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{ScanMorsel, ScanMorsels, ScanOp};
 use crate::fs::path::{ScanPathScheme, classify_scan_paths};
-use crate::metrics;
 use crate::novarocks_logging::{info, warn};
 use crate::runtime::profile::RuntimeProfile;
 use crate::runtime::starlet_shard_registry;
-use crate::types;
+use crate::thrift::metrics;
+use crate::thrift::types;
 
 use super::reader::StarRocksNativeReader;
 

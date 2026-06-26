@@ -63,7 +63,7 @@ impl fmt::Display for UniqueId {
 pub struct FetchResult {
     pub packet_seq: i64,
     pub eos: bool,
-    pub result_batch: crate::data::TResultBatch,
+    pub result_batch: crate::thrift::data::TResultBatch,
 }
 
 #[cfg(test)]

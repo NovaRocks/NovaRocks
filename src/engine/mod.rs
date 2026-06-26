@@ -14,8 +14,8 @@ use tokio::runtime::Handle;
 use crate::engine::mv::refresh_context::MvRefreshPruningLimits;
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::novarocks_config;
-use crate::plan_nodes::TFileFormatType;
 use crate::runtime::global_async_runtime::data_block_on;
+use crate::thrift::plan_nodes::TFileFormatType;
 
 use self::catalog::{DEFAULT_DATABASE, InMemoryCatalog, normalize_identifier};
 use crate::connector::{
@@ -789,7 +789,7 @@ impl StandaloneSession {
         sql: &str,
         current_catalog: Option<&str>,
         current_database: &str,
-        query_opts: Option<crate::internal_service::TQueryOptions>,
+        query_opts: Option<crate::thrift::internal_service::TQueryOptions>,
     ) -> Result<StatementResult, String> {
         // Install the per-statement dictionary provider so optimizer
         // calls reached through nested engine entry points (insert,
@@ -811,7 +811,7 @@ impl StandaloneSession {
         sql: &str,
         current_catalog: Option<&str>,
         current_database: &str,
-        query_opts: Option<crate::internal_service::TQueryOptions>,
+        query_opts: Option<crate::thrift::internal_service::TQueryOptions>,
     ) -> Result<StatementResult, String> {
         use crate::sql::parser::dialect::{
             StarRocksDialect, looks_like_create_catalog, looks_like_create_database,
@@ -1942,7 +1942,7 @@ impl StandaloneSession {
         insert: &sqlparser::ast::Insert,
         current_catalog: Option<&str>,
         current_database: &str,
-        query_opts: Option<&crate::internal_service::TQueryOptions>,
+        query_opts: Option<&crate::thrift::internal_service::TQueryOptions>,
     ) -> Result<StatementResult, String> {
         self.execute_insert_via_custom_parser(insert, current_catalog, current_database, query_opts)
     }
@@ -1954,7 +1954,7 @@ impl StandaloneSession {
         insert: &sqlparser::ast::Insert,
         current_catalog: Option<&str>,
         current_database: &str,
-        query_opts: Option<&crate::internal_service::TQueryOptions>,
+        query_opts: Option<&crate::thrift::internal_service::TQueryOptions>,
     ) -> Result<StatementResult, String> {
         let insert_stmt = convert_sqlparser_insert_to_custom(insert)?;
         execute_insert_statement(
@@ -2785,7 +2785,7 @@ fn execute_query_direct_for_explicit_exception(
     codegen_catalog: &dyn crate::sql::catalog::CatalogProvider,
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
-    query_opts: Option<crate::internal_service::TQueryOptions>,
+    query_opts: Option<crate::thrift::internal_service::TQueryOptions>,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
@@ -2848,7 +2848,7 @@ fn aggregate_delta_row_ids_for_position_locator(
 }
 
 fn bind_scan_ranges_to_target_positions(
-    scan_ranges: &mut Vec<crate::internal_service::TScanRangeParams>,
+    scan_ranges: &mut Vec<crate::thrift::internal_service::TScanRangeParams>,
     positions_by_file: &std::collections::BTreeMap<String, Vec<i64>>,
     matched_files: &mut std::collections::BTreeSet<String>,
 ) {
@@ -2940,7 +2940,7 @@ fn bind_aggregate_old_input_positions_from_delta_preview(
     layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
     pruning_limits: crate::engine::mv::refresh_context::MvRefreshPruningLimits,
     locator: &crate::sql::codegen::AggregateStateTargetPositionLocator,
-    query_opts: Option<&crate::internal_service::TQueryOptions>,
+    query_opts: Option<&crate::thrift::internal_service::TQueryOptions>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
 ) -> Result<(), String> {
     let target = locator.target_table.identifier().to_string();
@@ -3136,7 +3136,7 @@ fn explain_analyze_query(
     codegen_catalog: &InMemoryCatalog,
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
-    query_opts: Option<crate::internal_service::TQueryOptions>,
+    query_opts: Option<crate::thrift::internal_service::TQueryOptions>,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
     use crate::sql::codegen::ir::explain_distributed_plan_analyze;
@@ -3351,7 +3351,7 @@ pub(crate) fn execute_query(
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     exchange_port: u16,
-    query_opts: Option<crate::internal_service::TQueryOptions>,
+    query_opts: Option<crate::thrift::internal_service::TQueryOptions>,
 ) -> Result<QueryResult, String> {
     execute_query_with_catalog_provider(
         query,
@@ -3370,7 +3370,7 @@ pub(crate) fn execute_query_with_catalog_mgr(
     current_catalog: Option<&str>,
     current_database: &str,
     query: &sqlparser::ast::Query,
-    query_opts: Option<crate::internal_service::TQueryOptions>,
+    query_opts: Option<crate::thrift::internal_service::TQueryOptions>,
 ) -> Result<QueryResult, String> {
     let catalog_snapshot = state
         .catalog
@@ -3469,7 +3469,7 @@ pub(crate) fn execute_query_as_iceberg_write(
     current_database: &str,
     query: &sqlparser::ast::Query,
     sink_spec: crate::sql::codegen::iceberg_write_sink::IcebergWriteSinkSpec,
-    query_opts: Option<crate::internal_service::TQueryOptions>,
+    query_opts: Option<crate::thrift::internal_service::TQueryOptions>,
     root_distribution_resolver: Option<IcebergWriteRootDistributionResolver>,
 ) -> Result<crate::runtime::coordinator::CoordinatedQueryResult, String> {
     // Time-travel: a branch DML write's scan carries `FOR VERSION AS OF '<branch>'`
@@ -3563,7 +3563,7 @@ pub(crate) fn execute_query_with_catalog_provider(
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     exchange_port: u16,
-    query_opts: Option<crate::internal_service::TQueryOptions>,
+    query_opts: Option<crate::thrift::internal_service::TQueryOptions>,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
     execute_query_with_options_and_imv_validator_with_catalog_provider(
@@ -3603,7 +3603,7 @@ pub(crate) fn execute_query_with_options(
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     exchange_port: u16,
-    query_opts: Option<crate::internal_service::TQueryOptions>,
+    query_opts: Option<crate::thrift::internal_service::TQueryOptions>,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
@@ -3630,7 +3630,7 @@ pub(crate) fn execute_query_with_options_and_imv_validator(
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     exchange_port: u16,
-    query_opts: Option<crate::internal_service::TQueryOptions>,
+    query_opts: Option<crate::thrift::internal_service::TQueryOptions>,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
@@ -3661,7 +3661,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     exchange_port: u16,
-    query_opts: Option<crate::internal_service::TQueryOptions>,
+    query_opts: Option<crate::thrift::internal_service::TQueryOptions>,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
@@ -3954,7 +3954,7 @@ fn wait_for_standalone_exchange_server(port: u16) -> Result<(), String> {
 fn lower_plan_build_result(
     result: PlanBuildResult,
     arena: &mut crate::exec::expr::ExprArena,
-    query_opts: Option<&crate::internal_service::TQueryOptions>,
+    query_opts: Option<&crate::thrift::internal_service::TQueryOptions>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
 ) -> Result<crate::exec::node::ExecNode, String> {
     use crate::lower::thrift::layout::{build_tuple_slot_order, reorder_tuple_slots};
@@ -4056,7 +4056,7 @@ fn lower_plan_build_result(
 
 fn execute_plan(
     result: PlanBuildResult,
-    query_opts: Option<crate::internal_service::TQueryOptions>,
+    query_opts: Option<crate::thrift::internal_service::TQueryOptions>,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     profiler: Option<crate::runtime::profile::Profiler>,
@@ -4747,21 +4747,21 @@ path = "{metadata_path}"
         offset: i64,
         length: i64,
         file_length: i64,
-    ) -> crate::internal_service::TScanRangeParams {
-        let mut hdfs_range = crate::plan_nodes::THdfsScanRange::default();
+    ) -> crate::thrift::internal_service::TScanRangeParams {
+        let mut hdfs_range = crate::thrift::plan_nodes::THdfsScanRange::default();
         hdfs_range.full_path = Some(full_path.to_string());
         hdfs_range.offset = Some(offset);
         hdfs_range.length = Some(length);
         hdfs_range.file_length = Some(file_length);
-        crate::internal_service::TScanRangeParams::new(
-            crate::plan_nodes::TScanRange::new(
-                None::<crate::plan_nodes::TInternalScanRange>,
+        crate::thrift::internal_service::TScanRangeParams::new(
+            crate::thrift::plan_nodes::TScanRange::new(
+                None::<crate::thrift::plan_nodes::TInternalScanRange>,
                 None::<Vec<u8>>,
-                None::<crate::plan_nodes::TBrokerScanRange>,
-                None::<crate::plan_nodes::TEsScanRange>,
+                None::<crate::thrift::plan_nodes::TBrokerScanRange>,
+                None::<crate::thrift::plan_nodes::TEsScanRange>,
                 Some(hdfs_range),
-                None::<crate::plan_nodes::TBinlogScanRange>,
-                None::<crate::plan_nodes::TBenchmarkScanRange>,
+                None::<crate::thrift::plan_nodes::TBinlogScanRange>,
+                None::<crate::thrift::plan_nodes::TBenchmarkScanRange>,
             ),
             None::<i32>,
             Some(false),

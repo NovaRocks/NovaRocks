@@ -26,7 +26,6 @@ use arrow::datatypes::DataType;
 use crate::cache::CacheOptions;
 use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
-use crate::descriptors;
 use crate::exec::node::scan::LakeGlmScanInfo;
 use crate::exec::node::scan::RowPositionScanConfig;
 use crate::exec::node::scan::ScanNode;
@@ -35,12 +34,13 @@ use crate::exec::pipeline::dependency::DependencyManager;
 use crate::exec::pipeline::global_driver_executor::FragmentCompletion;
 use crate::exec::row_position::RowPositionDescriptor;
 use crate::fs::scan_context::FileScanRange;
-use crate::internal_service;
 use crate::runtime::lookup::GlobalLateMaterializationContext;
 use crate::runtime::mem_tracker::{self, MemTracker};
 use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
 use crate::runtime::runtime_filter_worker::RuntimeFilterWorker;
-use crate::runtime_filter;
+use crate::thrift::descriptors;
+use crate::thrift::internal_service;
+use crate::thrift::runtime_filter;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct QueryId {

@@ -34,6 +34,7 @@
 
 namespace cpp starrocks
 namespace java com.starrocks.thrift
+namespace rs thrift
 
 struct TRowFormat {
   1: optional binary null_bits;

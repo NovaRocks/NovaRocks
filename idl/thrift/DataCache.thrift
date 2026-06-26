@@ -14,6 +14,7 @@
 //
 namespace cpp starrocks
 namespace java com.starrocks.thrift
+namespace rs thrift
 
 struct TDataCacheOptions {
     // just placeholder, not needed now

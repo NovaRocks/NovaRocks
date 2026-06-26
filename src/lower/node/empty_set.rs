@@ -19,13 +19,13 @@ use std::sync::Arc;
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 
-use crate::descriptors;
 use crate::exec::chunk::Chunk;
 use crate::exec::node::values::ValuesNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::lower::layout::{Layout, chunk_schema_for_layout, schema_for_layout};
 use crate::lower::node::Lowered;
-use crate::plan_nodes;
+use crate::thrift::descriptors;
+use crate::thrift::plan_nodes;
 
 /// Lower an EMPTY_SET_NODE plan node to a zero-row `ValuesNode`.
 pub(crate) fn lower_empty_set_node(

@@ -1247,7 +1247,7 @@ pub(crate) fn execute_insert_statement(
     overwrite_mode: crate::sql::parser::ast::OverwriteMode,
     current_catalog: Option<&str>,
     current_database: &str,
-    query_opts: Option<&crate::internal_service::TQueryOptions>,
+    query_opts: Option<&crate::thrift::internal_service::TQueryOptions>,
 ) -> Result<StatementResult, String> {
     crate::engine::insert_flow::run_insert(
         state,

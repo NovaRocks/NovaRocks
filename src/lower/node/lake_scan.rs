@@ -45,7 +45,7 @@ use crate::novarocks_connectors::{
 use crate::novarocks_logging::{debug, warn};
 use crate::runtime::query_context::QueryId;
 use crate::runtime::starlet_shard_registry::{self, S3StoreConfig};
-use crate::{descriptors, internal_service, plan_nodes, runtime_filter, types};
+use crate::thrift::{descriptors, internal_service, plan_nodes, runtime_filter, types};
 
 /// Lower a LAKE_SCAN_NODE plan node to a `Lowered` ExecNode.
 pub(crate) fn lower_lake_scan_node(
@@ -830,9 +830,9 @@ mod tests {
     use crate::connector::starrocks::StarRocksScanRange;
     use crate::exec::expr::ExprArena;
     use crate::exec::node::ExecNodeKind;
-    use crate::internal_service;
     use crate::sql::codegen::descriptors::DescriptorTableBuilder;
-    use crate::{descriptors, plan_nodes, types};
+    use crate::thrift::internal_service;
+    use crate::thrift::{descriptors, plan_nodes, types};
     use arrow::datatypes::DataType;
     use std::collections::{BTreeMap, HashMap};
 

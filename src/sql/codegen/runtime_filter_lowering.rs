@@ -1,10 +1,10 @@
-use crate::exprs;
-use crate::plan_nodes;
 use crate::sql::analysis::{ExprKind, TypedExpr};
 use crate::sql::codegen::FragmentId;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::JoinDistribution;
 use crate::sql::optimizer::physical_plan::JoinExecutionDistribution;
+use crate::thrift::exprs;
+use crate::thrift::plan_nodes;
 
 // ---------------------------------------------------------------------------
 // Scan/join ownership metadata (used by RF planning)
@@ -183,11 +183,11 @@ pub(in crate::sql::codegen) fn legacy_rf_distribution_to_execution(
 pub(in crate::sql::codegen) fn rf_layout_for_execution_distribution(
     distribution: JoinExecutionDistribution,
 ) -> (
-    crate::runtime_filter::TRuntimeFilterBuildJoinMode,
-    crate::runtime_filter::TRuntimeFilterLayoutMode,
-    crate::runtime_filter::TRuntimeFilterLayoutMode,
+    crate::thrift::runtime_filter::TRuntimeFilterBuildJoinMode,
+    crate::thrift::runtime_filter::TRuntimeFilterLayoutMode,
+    crate::thrift::runtime_filter::TRuntimeFilterLayoutMode,
 ) {
-    use crate::runtime_filter::{TRuntimeFilterBuildJoinMode, TRuntimeFilterLayoutMode};
+    use crate::thrift::runtime_filter::{TRuntimeFilterBuildJoinMode, TRuntimeFilterLayoutMode};
 
     match distribution {
         JoinExecutionDistribution::Broadcast => (

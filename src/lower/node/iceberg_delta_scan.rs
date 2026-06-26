@@ -29,7 +29,6 @@
 use std::sync::Arc;
 
 use crate::connector::iceberg::catalog::IcebergCatalogRegistry;
-use crate::descriptors;
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::node::iceberg_delta_scan::{
     ApplyKeySource, BaseTableIdent, DeltaScanDeleteSide, DeltaSourceFile, DeltaSourceRole,
@@ -39,7 +38,8 @@ use crate::exec::node::iceberg_delta_scan::{
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::lower::layout::{Layout, chunk_schema_for_layout};
 use crate::lower::node::Lowered;
-use crate::plan_nodes;
+use crate::thrift::descriptors;
+use crate::thrift::plan_nodes;
 
 /// Lower an `ICEBERG_DELTA_SCAN_NODE` into an `ExecNode` of kind
 /// `IcebergDeltaScan`. Requires an `IcebergCatalogRegistry` so the base

@@ -28,7 +28,7 @@ use crate::novarocks_connectors::{
 };
 use crate::novarocks_logging::debug;
 use crate::novarocks_logging::warn;
-use crate::{descriptors, internal_service, plan_nodes, runtime_filter, types};
+use crate::thrift::{descriptors, internal_service, plan_nodes, runtime_filter, types};
 
 /// Lower a STARROCKS_SCAN_NODE plan node to a `Lowered` ExecNode.
 pub(crate) fn lower_starrocks_scan_node(

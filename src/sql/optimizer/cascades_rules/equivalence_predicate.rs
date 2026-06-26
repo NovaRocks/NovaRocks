@@ -288,13 +288,7 @@ fn apply_inner(
         };
 
         if let Some(literal) = literal_by_column.get(&left_id).cloned() {
-            if !has_literal_equality_in_side(
-                memo,
-                right_group,
-                &join_literals,
-                right_id,
-                literal,
-            ) {
+            if !has_literal_equality_in_side(memo, right_group, &join_literals, right_id, literal) {
                 if let Some(column) = right_columns.get(&right_id) {
                     right_new.push(make_eq_literal_predicate(
                         &mut memo.scalars,

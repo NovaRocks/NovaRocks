@@ -45,7 +45,7 @@ use super::min_max::RuntimeMinMaxFilter;
 pub(crate) struct RuntimeMembershipFilterBuildParam {
     filter_id: i32,
     slot_id: SlotId,
-    ltype: crate::types::TPrimitiveType,
+    ltype: crate::thrift::types::TPrimitiveType,
     join_mode: i8,
     arrays: Vec<ArrayRef>,
 }
@@ -54,7 +54,7 @@ impl RuntimeMembershipFilterBuildParam {
     pub(crate) fn new(
         filter_id: i32,
         slot_id: SlotId,
-        ltype: crate::types::TPrimitiveType,
+        ltype: crate::thrift::types::TPrimitiveType,
         join_mode: i8,
     ) -> Self {
         Self {
@@ -78,7 +78,7 @@ impl RuntimeMembershipFilterBuildParam {
         self.slot_id
     }
 
-    pub(crate) fn ltype(&self) -> crate::types::TPrimitiveType {
+    pub(crate) fn ltype(&self) -> crate::thrift::types::TPrimitiveType {
         self.ltype
     }
 

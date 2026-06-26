@@ -17,7 +17,7 @@
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::expr::ExprId;
 use crate::exec::node::ExecNode;
-use crate::types::TPrimitiveType;
+use crate::thrift::types::TPrimitiveType;
 use arrow::datatypes::DataType;
 
 #[derive(Clone, Debug)]

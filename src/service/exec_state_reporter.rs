@@ -21,12 +21,12 @@ use std::time::{Duration, Instant};
 
 use crate::UniqueId;
 use crate::common::config;
-use crate::frontend_service;
 use crate::novarocks_logging::{debug, warn};
 use crate::runtime::query_context::QueryId;
 use crate::service::fe_report;
 use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
-use crate::types;
+use crate::thrift::frontend_service;
+use crate::thrift::types;
 
 const NORMAL_REPORT_QUEUE_LIMIT: usize = 1_000;
 
@@ -310,7 +310,7 @@ fn send_non_final_batch(tasks: Vec<ExecStateReportTask>) {
 
 fn handle_batch_response(
     tasks: Vec<ExecStateReportTask>,
-    status_list: Option<Vec<crate::status::TStatus>>,
+    status_list: Option<Vec<crate::thrift::status::TStatus>>,
 ) {
     let statuses = status_list.unwrap_or_default();
     if !statuses.is_empty() && statuses.len() != tasks.len() {
@@ -326,7 +326,7 @@ fn handle_batch_response(
         let Some(status) = statuses.get(idx) else {
             continue;
         };
-        if status.status_code == crate::status_code::TStatusCode::OK {
+        if status.status_code == crate::thrift::status_code::TStatusCode::OK {
             continue;
         }
         if fe_report::is_query_gone_status(status) {
@@ -372,14 +372,16 @@ fn send_final_report_with<F, S>(
     mut send: F,
     mut sleep: S,
 ) where
-    F: FnMut(&ExecStateReportTask) -> Result<Option<crate::status::TStatus>, FrontendRpcError>,
+    F: FnMut(
+        &ExecStateReportTask,
+    ) -> Result<Option<crate::thrift::status::TStatus>, FrontendRpcError>,
     S: FnMut(Duration),
 {
     let retry_limit = retry_limit.max(1);
     for attempt in 1..=retry_limit {
         match send(&task) {
             Ok(Some(status)) => {
-                if status.status_code == crate::status_code::TStatusCode::OK {
+                if status.status_code == crate::thrift::status_code::TStatusCode::OK {
                     return;
                 }
                 if fe_report::is_query_gone_status(&status) {
@@ -515,12 +517,12 @@ mod tests {
     use std::time::Duration;
 
     use crate::UniqueId;
-    use crate::frontend_service;
     use crate::runtime::query_context::QueryId;
     use crate::service::{fe_report, frontend_rpc};
-    use crate::status;
-    use crate::status_code;
-    use crate::types;
+    use crate::thrift::frontend_service;
+    use crate::thrift::status;
+    use crate::thrift::status_code;
+    use crate::thrift::types;
 
     use super::{
         ExecStateReportTask, ExecStateReporter, ExecStateReporterSettings, NormalQueue,

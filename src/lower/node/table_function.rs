@@ -25,7 +25,7 @@ use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::lower::layout::{Layout, chunk_schema_for_layout};
 use crate::lower::node::Lowered;
 use crate::lower::type_lowering::arrow_type_from_desc;
-use crate::{descriptors, plan_nodes};
+use crate::thrift::{descriptors, plan_nodes};
 
 pub(crate) fn lower_table_function_node(
     child: Lowered,

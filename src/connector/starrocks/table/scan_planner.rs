@@ -61,7 +61,7 @@ use crate::connector::scan_planning::{
     ThriftScanPlan, validate_split_connectors,
 };
 use crate::engine::StandaloneState;
-use crate::{internal_service, plan_nodes};
+use crate::thrift::{internal_service, plan_nodes};
 
 #[derive(Debug)]
 pub(crate) struct StarRocksTableScanPlanner {
@@ -189,7 +189,7 @@ impl StarRocksTableScanPlanner {
             back_pressure_throttle_time: None,
             back_pressure_throttle_time_upper_bound: None,
             back_pressure_num_rows: None,
-            schema_key: Some(crate::descriptors::TTableSchemaKey::new(
+            schema_key: Some(crate::thrift::descriptors::TTableSchemaKey::new(
                 Some(scan.table.db_id),
                 Some(scan.table.table_id),
                 Some(scan.schema_id),

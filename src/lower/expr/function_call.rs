@@ -18,9 +18,9 @@ use crate::common::largeint;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue, function};
 use arrow::datatypes::DataType;
 
-use crate::exprs;
 use crate::service::fe_report;
-use crate::types;
+use crate::thrift::exprs;
+use crate::thrift::types;
 
 fn is_numeric_like_type(data_type: &DataType) -> bool {
     matches!(

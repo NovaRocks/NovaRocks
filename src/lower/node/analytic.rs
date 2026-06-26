@@ -29,14 +29,14 @@ use crate::lower::expr::{lower_expr_node, lower_t_expr};
 use crate::lower::layout::{Layout, chunk_schema_for_layout};
 use crate::lower::node::Lowered;
 use crate::lower::type_lowering::arrow_type_from_desc;
-use crate::{exprs, plan_nodes, types};
+use crate::thrift::{exprs, plan_nodes, types};
 
 pub(crate) fn lower_analytic_node(
     child: Lowered,
     node: &plan_nodes::TPlanNode,
     arena: &mut ExprArena,
     out_layout: &Layout,
-    desc_tbl: &crate::descriptors::TDescriptorTable,
+    desc_tbl: &crate::thrift::descriptors::TDescriptorTable,
     tuple_slots: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
     last_query_id: Option<&str>,
     fe_addr: Option<&types::TNetworkAddress>,

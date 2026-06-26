@@ -21,7 +21,7 @@ use crate::exec::node::repeat::RepeatNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::lower::layout::Layout;
 use crate::lower::node::Lowered;
-use crate::{plan_nodes, types};
+use crate::thrift::{plan_nodes, types};
 
 pub(crate) fn lower_repeat_node(
     child: Lowered,

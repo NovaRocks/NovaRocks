@@ -61,7 +61,7 @@ pub(crate) mod test_support {
     use crate::runtime::write_coordinator::{
         WriteAbortInput, WriteCommitInput, WriterCommitInput, WriterKey,
     };
-    use crate::types;
+    use crate::thrift::types;
 
     fn staging_writer_key() -> WriterKey {
         let query_id = types::TUniqueId::new(10, 20);
@@ -128,7 +128,7 @@ mod tests {
     };
     use crate::meta::{MetaStoreProvider, SqliteMetaStoreProvider};
     use crate::runtime::write_coordinator::{WriteAbortInput, WriterCommitInput, WriterKey};
-    use crate::types;
+    use crate::thrift::types;
 
     struct WriterOperationTestState {
         state: Arc<StandaloneState>,

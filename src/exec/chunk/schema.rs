@@ -20,7 +20,7 @@ use std::sync::Arc;
 use crate::common::ids::SlotId;
 use crate::exec::chunk::type_compatibility::{CompatibilityPolicy, check};
 use crate::lower::type_lowering::{arrow_type_from_desc, primitive_type_from_desc};
-use crate::types;
+use crate::thrift::types;
 use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -684,7 +684,7 @@ mod tests {
     use crate::common::ids::SlotId;
     use crate::exec::chunk::Chunk;
     use crate::lower::type_lowering::scalar_type_desc;
-    use crate::types::TPrimitiveType;
+    use crate::thrift::types::TPrimitiveType;
 
     #[test]
     fn strict_rejects_duplicate_slot_id() {

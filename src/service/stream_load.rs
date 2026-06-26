@@ -24,19 +24,19 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use serde_json::{Map, Value, json};
 
-use crate::frontend_service::{
-    TFrontendServiceSyncClient, TLoadTxnBeginRequest, TLoadTxnBeginResult, TLoadTxnCommitRequest,
-    TLoadTxnCommitResult, TLoadTxnRollbackRequest, TLoadTxnRollbackResult, TStreamLoadPutRequest,
-    TStreamLoadPutResult,
-};
-use crate::plan_nodes::TFileFormatType;
 use crate::runtime::{backend_id, sink_commit};
 use crate::service::disk_report;
 use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
 use crate::service::internal_service;
-use crate::status::TStatus;
-use crate::status_code::TStatusCode;
-use crate::types::{self, TPartialUpdateMode, TUniqueId};
+use crate::thrift::frontend_service::{
+    TFrontendServiceSyncClient, TLoadTxnBeginRequest, TLoadTxnBeginResult, TLoadTxnCommitRequest,
+    TLoadTxnCommitResult, TLoadTxnRollbackRequest, TLoadTxnRollbackResult, TStreamLoadPutRequest,
+    TStreamLoadPutResult,
+};
+use crate::thrift::plan_nodes::TFileFormatType;
+use crate::thrift::status::TStatus;
+use crate::thrift::status_code::TStatusCode;
+use crate::thrift::types::{self, TPartialUpdateMode, TUniqueId};
 
 pub(crate) type HttpHeaders = HashMap<String, String>;
 
@@ -686,24 +686,27 @@ fn commit_txn(
     prepare_only: bool,
     stats: Option<&LoadStats>,
 ) -> Result<TLoadTxnCommitResult, ApiError> {
-    let txn_commit_attachment = stats.map(|stats| crate::frontend_service::TTxnCommitAttachment {
-        load_type: types::TLoadType::MANUAL_LOAD,
-        rl_task_txn_commit_attachment: None,
-        ml_txn_commit_attachment: None,
-        manual_load_txn_commit_attachment: Some(
-            crate::frontend_service::TManualLoadTxnCommitAttachment::new(
-                Some(stats.number_loaded_rows),
-                Some(stats.number_filtered_rows),
-                Option::<String>::None,
-                Some(stats.load_bytes),
-                Some(stats.load_bytes),
-                Some(stats.number_unselected_rows),
-                Some(stats.stream_load_plan_time_ms),
-                Some(stats.read_data_time_ms),
-                Some(stats.begin_txn_time_ms),
-            ),
-        ),
-    });
+    let txn_commit_attachment =
+        stats.map(
+            |stats| crate::thrift::frontend_service::TTxnCommitAttachment {
+                load_type: types::TLoadType::MANUAL_LOAD,
+                rl_task_txn_commit_attachment: None,
+                ml_txn_commit_attachment: None,
+                manual_load_txn_commit_attachment: Some(
+                    crate::thrift::frontend_service::TManualLoadTxnCommitAttachment::new(
+                        Some(stats.number_loaded_rows),
+                        Some(stats.number_filtered_rows),
+                        Option::<String>::None,
+                        Some(stats.load_bytes),
+                        Some(stats.load_bytes),
+                        Some(stats.number_unselected_rows),
+                        Some(stats.stream_load_plan_time_ms),
+                        Some(stats.read_data_time_ms),
+                        Some(stats.begin_txn_time_ms),
+                    ),
+                ),
+            },
+        );
     let request = TLoadTxnCommitRequest::new(
         Option::<String>::None,
         auth.user.clone(),
@@ -746,7 +749,7 @@ fn rollback_txn(
         txn_id,
         Some(reason.to_string()),
         Option::<i64>::None,
-        Option::<crate::frontend_service::TTxnCommitAttachment>::None,
+        Option::<crate::thrift::frontend_service::TTxnCommitAttachment>::None,
         Some(fail_infos),
         Some(commit_infos),
     );

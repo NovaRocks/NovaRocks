@@ -17,7 +17,7 @@
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue, function::FunctionKind};
 use arrow::datatypes::DataType;
 
-use crate::exprs;
+use crate::thrift::exprs;
 
 /// Lower SUBFIELD_EXPR to chained internal struct `subfield` function calls.
 pub(crate) fn lower_subfield_expr(

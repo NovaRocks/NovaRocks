@@ -16,10 +16,10 @@
 // under the License.
 use std::collections::HashMap;
 
-use crate::descriptors;
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::node::ExecNode;
 use crate::exec::row_position::RowPositionDescriptor;
+use crate::thrift::descriptors;
 
 #[derive(Clone, Debug)]
 pub struct FetchNode {

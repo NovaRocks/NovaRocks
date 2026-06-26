@@ -43,7 +43,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::sql::optimizer::memo::{GroupId, MExpr, Memo};
 use crate::sql::optimizer::operator::Operator;
-use crate::sql::optimizer::pattern::{op_kind, Pattern};
+use crate::sql::optimizer::pattern::{Pattern, op_kind};
 
 /// Process-global counter: incremented once each time [`bind`] truncates
 /// results at [`MAX_BINDINGS_PER_PATTERN`].  Used for observability and tests.
@@ -269,11 +269,11 @@ fn match_expr(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::common::JoinKind;
     use crate::sql::optimizer::memo::Memo;
+    use crate::sql::optimizer::operator::TopNPhase;
     use crate::sql::optimizer::operator::{LogicalJoinOp, Operator, ScanOp, TopNOp, UnionOp};
     use crate::sql::optimizer::pattern::{OpKind, Pattern};
-    use crate::sql::optimizer::operator::TopNPhase;
-    use crate::sql::common::JoinKind;
 
     // ----- inline construction helpers (do NOT depend on other test mods) ---
 
@@ -501,8 +501,15 @@ mod tests {
         let mut memo = Memo::new();
         let g = mk_scan_group(&mut memo);
         let bs = bind(&Pattern::Leaf, &memo, g, 0);
-        assert_eq!(bs.len(), 1, "Leaf root must yield exactly one root binding for the shim");
-        assert!(matches!(bs[0].root_mexpr(&memo).op, Operator::LogicalScan(_)));
+        assert_eq!(
+            bs.len(),
+            1,
+            "Leaf root must yield exactly one root binding for the shim"
+        );
+        assert!(matches!(
+            bs[0].root_mexpr(&memo).op,
+            Operator::LogicalScan(_)
+        ));
         // out-of-range root → no binding
         assert!(bind(&Pattern::Leaf, &memo, 999, 0).is_empty());
     }

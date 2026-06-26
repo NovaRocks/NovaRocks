@@ -26,7 +26,6 @@ use arrow::record_batch::RecordBatch;
 
 use crate::cache::DataCacheManager;
 use crate::common::ids::SlotId;
-use crate::descriptors;
 use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
 use crate::exec::node::scan::RowPositionScanConfig;
 use crate::exec::node::scan::ScanMorsel;
@@ -41,7 +40,8 @@ use crate::lower::type_lowering::{
 };
 use crate::novarocks_connectors::{StarRocksScanConfig, StarRocksScanOp};
 use crate::runtime::query_context::{QueryId, query_context_manager};
-use crate::types;
+use crate::thrift::descriptors;
+use crate::thrift::types;
 
 #[derive(Clone, Debug)]
 pub struct GlobalLateMaterializationContext {

@@ -14,6 +14,7 @@
 
 namespace java com.starrocks.thrift
 namespace cpp starrocks
+namespace rs thrift
 
 enum TBrokerOperationStatusCode {
     OK = 0;

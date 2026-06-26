@@ -21,14 +21,14 @@ use std::time::{Duration, Instant};
 use crate::common::config;
 use crate::common::types::UniqueId;
 use crate::exec::spill::{QuerySpillManager, SpillConfig};
-use crate::internal_service;
 use crate::novarocks_logging::debug;
 use crate::runtime::load_tracking;
 use crate::runtime::mem_tracker::{self, MemTracker};
 use crate::runtime::profile::clamp_u128_to_i64;
 use crate::runtime::query_context::QueryId;
 use crate::runtime::sink_commit;
-use crate::runtime_filter;
+use crate::thrift::internal_service;
+use crate::thrift::runtime_filter;
 
 /// RuntimeState is a per-fragment-instance execution context, similar to StarRocks BE RuntimeState.
 ///
@@ -167,7 +167,7 @@ impl RuntimeState {
         self.fragment_instance_id
     }
 
-    pub(crate) fn add_sink_commit_info(&self, info: crate::types::TSinkCommitInfo) {
+    pub(crate) fn add_sink_commit_info(&self, info: crate::thrift::types::TSinkCommitInfo) {
         let Some(finst_id) = self.fragment_instance_id else {
             debug!(
                 target: "novarocks::sink_commit",
@@ -252,7 +252,7 @@ impl RuntimeState {
         }
     }
 
-    pub(crate) fn add_tablet_commit_info(&self, info: crate::types::TTabletCommitInfo) {
+    pub(crate) fn add_tablet_commit_info(&self, info: crate::thrift::types::TTabletCommitInfo) {
         let Some(finst_id) = self.fragment_instance_id else {
             debug!(
                 target: "novarocks::sink_commit",
@@ -272,14 +272,14 @@ impl RuntimeState {
 
     pub(crate) fn add_tablet_commit_infos(
         &self,
-        infos: impl IntoIterator<Item = crate::types::TTabletCommitInfo>,
+        infos: impl IntoIterator<Item = crate::thrift::types::TTabletCommitInfo>,
     ) {
         for info in infos {
             self.add_tablet_commit_info(info);
         }
     }
 
-    pub(crate) fn add_tablet_fail_info(&self, info: crate::types::TTabletFailInfo) {
+    pub(crate) fn add_tablet_fail_info(&self, info: crate::thrift::types::TTabletFailInfo) {
         let Some(finst_id) = self.fragment_instance_id else {
             debug!(
                 target: "novarocks::sink_commit",
@@ -299,7 +299,7 @@ impl RuntimeState {
 
     pub(crate) fn add_tablet_fail_infos(
         &self,
-        infos: impl IntoIterator<Item = crate::types::TTabletFailInfo>,
+        infos: impl IntoIterator<Item = crate::thrift::types::TTabletFailInfo>,
     ) {
         for info in infos {
             self.add_tablet_fail_info(info);

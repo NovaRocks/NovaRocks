@@ -5,10 +5,10 @@ use std::sync::Arc;
 use arrow::datatypes::DataType;
 
 use crate::common::largeint;
-use crate::exprs;
 use crate::lower::thrift::type_lowering::scalar_type_desc;
-use crate::opcodes;
-use crate::types;
+use crate::thrift::exprs;
+use crate::thrift::opcodes;
+use crate::thrift::types;
 
 use super::resolve::{ColumnBinding, ExprScope};
 use super::type_infer::{arithmetic_result_type_with_op, arrow_type_to_type_desc, wider_type};
@@ -1633,7 +1633,7 @@ pub(crate) fn build_cast_texpr(child: exprs::TExpr, target_type: types::TTypeDes
         num_children: 1,
         ..default_expr_node()
     };
-    cast_node.opcode = Some(crate::opcodes::TExprOpcode::CAST);
+    cast_node.opcode = Some(crate::thrift::opcodes::TExprOpcode::CAST);
     let mut nodes = vec![cast_node];
     nodes.extend(child.nodes);
     exprs::TExpr::new(nodes)
@@ -3316,7 +3316,10 @@ mod tests {
             .compile_typed(&expr)
             .expect("binary literal should compile");
         let node = compiled.nodes.first().expect("literal node");
-        assert_eq!(node.node_type, crate::exprs::TExprNodeType::BINARY_LITERAL);
+        assert_eq!(
+            node.node_type,
+            crate::thrift::exprs::TExprNodeType::BINARY_LITERAL
+        );
         assert_eq!(
             node.binary_literal
                 .as_ref()

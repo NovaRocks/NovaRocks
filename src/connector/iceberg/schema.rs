@@ -20,12 +20,12 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
-use crate::descriptors;
 use crate::exec::row_position::{
     ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
     ICEBERG_RESERVED_FIELD_ID_ROW_ID, ICEBERG_ROW_ID_COL,
 };
 use crate::lower::type_lowering::arrow_type_from_desc;
+use crate::thrift::descriptors;
 
 const VIRTUAL_COUNT_COLUMN: &str = "___count___";
 pub const ICEBERG_INITIAL_DEFAULT_META_KEY: &str = "novarocks.iceberg.initial_default";
@@ -270,7 +270,7 @@ mod tests {
 
     #[test]
     fn apply_field_id_recursive_writes_initial_default_metadata() {
-        let mut schema_field = crate::descriptors::TIcebergSchemaField::default();
+        let mut schema_field = crate::thrift::descriptors::TIcebergSchemaField::default();
         schema_field.field_id = Some(1);
         schema_field.name = Some("c".into());
         schema_field.initial_default_json = Some("5".to_string());
@@ -285,7 +285,7 @@ mod tests {
 
     #[test]
     fn apply_field_id_recursive_omits_initial_default_when_absent() {
-        let mut schema_field = crate::descriptors::TIcebergSchemaField::default();
+        let mut schema_field = crate::thrift::descriptors::TIcebergSchemaField::default();
         schema_field.field_id = Some(1);
         schema_field.name = Some("c".into());
         // initial_default_json omitted
@@ -299,14 +299,14 @@ mod tests {
 
     #[test]
     fn projected_schema_accepts_internal_change_op_column() {
-        let mut physical_field = crate::descriptors::TIcebergSchemaField::default();
+        let mut physical_field = crate::thrift::descriptors::TIcebergSchemaField::default();
         physical_field.field_id = Some(1);
         physical_field.name = Some("id".to_string());
 
-        let mut schema = crate::descriptors::TIcebergSchema::default();
+        let mut schema = crate::thrift::descriptors::TIcebergSchema::default();
         schema.fields = Some(vec![physical_field]);
 
-        let mut iceberg = crate::descriptors::TIcebergTable::default();
+        let mut iceberg = crate::thrift::descriptors::TIcebergTable::default();
         iceberg.iceberg_schema = Some(schema);
 
         let projected = build_projected_output_schema(
