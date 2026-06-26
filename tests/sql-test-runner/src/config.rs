@@ -144,7 +144,8 @@ pub(crate) fn insert_placeholder_default(
 
 pub fn apply_suite_placeholder_defaults(variables: &mut HashMap<String, String>, suite_name: &str) {
     match suite_name {
-        "iceberg" | "iceberg-ddl" | "iceberg-dml" | "iceberg-ivm" | "iceberg-mv-scheduler" => {
+        "iceberg" | "iceberg-ddl" | "iceberg-dml" | "iceberg-ivm" | "iceberg-mv-apply"
+        | "iceberg-mv-scheduler" => {
             // Keep local suites that exercise Iceberg catalogs aligned with bootstrap
             // defaults so they run out of the box against the MinIO-backed dev setup.
             insert_placeholder_default(variables, "iceberg_catalog_type", "hadoop");

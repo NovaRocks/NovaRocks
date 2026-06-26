@@ -31,6 +31,7 @@ iceberg-compatibility
 iceberg-ddl
 iceberg-dml
 iceberg-ivm
+iceberg-mv-apply
 iceberg-rest
 
 # The suites below are not part of default daily mode yet.
