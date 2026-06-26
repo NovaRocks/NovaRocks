@@ -1,3 +1,11 @@
+//! Target-row location helpers for Iceberg MV incremental apply.
+//!
+//! `resolve_target_positions_via_framework` is the W1 framework-backed locator:
+//! it scans the target through NovaRocks and emits `_file`/`_pos` plus the
+//! apply key. The direct `locate_target_rows_*` iceberg-rust scan path remains
+//! temporarily for aggregate and merge-sink callers until their W3/W4/W5
+//! migrations land; join coalesce is already cut over as the W1 proof path.
+
 use crate::engine::mv::partition::TargetPartitionFilter;
 
 pub(crate) const ICEBERG_MV_APPLY_KEY_COLUMN: &str = "__nova_base_row_id";
