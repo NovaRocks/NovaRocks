@@ -9279,7 +9279,17 @@ fn first_refresh_iceberg_join_mv(
         CommitOpKind::FastAppend,
     );
     let flush_outcome = coalescer
-        .flush_to_iceberg_commit_collector(&target_table, Arc::clone(&collector), None)
+        .flush_to_iceberg_commit_collector(
+            crate::engine::mv::iceberg_join_coalesce::JoinCoalesceIcebergTarget {
+                state,
+                table: &target_table,
+                catalog_name: &target.catalog,
+                namespace: &target.namespace,
+                table_name: &target.table,
+            },
+            Arc::clone(&collector),
+            None,
+        )
         .map_err(|err| {
             handle_iceberg_mv_commit_error(
                 state,
@@ -10632,7 +10642,17 @@ fn execute_join_delta_branches(
         None
     };
     let flush_outcome = coalescer
-        .flush_to_iceberg_commit_collector(&target_table, Arc::clone(&collector), locator_inputs)
+        .flush_to_iceberg_commit_collector(
+            crate::engine::mv::iceberg_join_coalesce::JoinCoalesceIcebergTarget {
+                state,
+                table: &target_table,
+                catalog_name: &target.catalog,
+                namespace: &target.namespace,
+                table_name: &target.table,
+            },
+            Arc::clone(&collector),
+            locator_inputs,
+        )
         .map_err(|err| {
             handle_iceberg_mv_commit_error(
                 state,

@@ -21,6 +21,15 @@ pub(crate) struct JoinCoalesceFlushOutcome {
     pub(crate) deleted_rows: i64,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct JoinCoalesceIcebergTarget<'a> {
+    pub(crate) state: &'a Arc<crate::engine::StandaloneState>,
+    pub(crate) table: &'a iceberg::table::Table,
+    pub(crate) catalog_name: &'a str,
+    pub(crate) namespace: &'a str,
+    pub(crate) table_name: &'a str,
+}
+
 pub(crate) struct JoinDeltaCoalescer {
     left_table_uuid: String,
     right_table_uuid: String,
@@ -101,7 +110,7 @@ impl JoinDeltaCoalescer {
 
     pub(crate) fn flush_to_iceberg_commit_collector(
         &self,
-        target_table: &iceberg::table::Table,
+        target: JoinCoalesceIcebergTarget<'_>,
         collector: Arc<crate::connector::iceberg::commit::IcebergCommitCollector>,
         locator_inputs: Option<(
             crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
@@ -131,19 +140,21 @@ impl JoinDeltaCoalescer {
         let deleted_rows = i64::try_from(delete_keys.len())
             .map_err(|_| "join coalesce delete key count exceeds i64".to_string())?;
         let delete_groups = if !delete_keys.is_empty() {
-            let (existing_deletes_by_file, referenced_data_file_partitions) = locator_inputs
-                .ok_or_else(|| {
-                    "join coalesce needs target locator inputs for DELETE rows".to_string()
-                })?;
-            crate::runtime::global_async_runtime::data_block_on(
-                crate::engine::mv::iceberg_target_apply::locate_target_rows_by_apply_key_string(
-                    target_table,
-                    &delete_keys,
-                    &existing_deletes_by_file,
-                    &referenced_data_file_partitions,
-                    &crate::engine::mv::partition::TargetPartitionFilter::None,
-                ),
-            )??
+            let (_, referenced_data_file_partitions) = locator_inputs.ok_or_else(|| {
+                "join coalesce needs target locator inputs for DELETE rows".to_string()
+            })?;
+            crate::engine::mv::iceberg_target_apply::resolve_target_positions_via_framework(
+                target.state,
+                target.table,
+                target.catalog_name,
+                target.namespace,
+                target.table_name,
+                crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+                crate::engine::mv::iceberg_target_apply::ApplyKeyRequest::Utf8(&delete_keys),
+                &referenced_data_file_partitions,
+                &crate::engine::mv::partition::TargetPartitionFilter::None,
+            )?
+            .delete_groups
         } else {
             Vec::new()
         };
@@ -151,11 +162,11 @@ impl JoinDeltaCoalescer {
         if !insert_batches.is_empty() {
             let data_files = crate::runtime::global_async_runtime::data_block_on(
                 crate::connector::iceberg::data_writer::write_record_batches_as_data_files(
-                    target_table,
+                    target.table,
                     insert_batches,
                 ),
             )??;
-            let metadata = target_table.metadata();
+            let metadata = target.table.metadata();
             let partition_spec_id = metadata.default_partition_spec_id();
             let sink_commit_infos = data_files
                 .into_iter()
