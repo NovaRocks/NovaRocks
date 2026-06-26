@@ -67,7 +67,7 @@ use crate::meta::repository::iceberg_operation::{
     CreateIcebergOperationRequest, IcebergCommitOutcomeRecord, IcebergOperationFactUpdate,
     IcebergOperationFailureKind, IcebergOperationFailureRecord, IcebergOperationKind,
     IcebergOperationNextAction, IcebergOperationState, IcebergOperationTarget,
-    IcebergRecoveryEvidenceRecord, StoredIcebergOperation,
+    StoredIcebergOperation,
 };
 use crate::meta::repository::mv::{
     BeginIcebergMvRefreshRequest, CreateMvDefinitionRequest, MvRefreshFinalizeRequest,
@@ -3009,7 +3009,7 @@ pub(crate) fn repartition_iceberg_mv(
             &new_partition_contract,
             repartition_restore,
         );
-        result?;
+        result.map_err(IcebergMvRefreshExecutionError::into_message)?;
         register_iceberg_mv_target_in_catalog(state, &target)?;
         return Ok(StatementResult::Ok);
     }
@@ -6403,6 +6403,29 @@ fn mark_iceberg_mv_refresh_commit_error(
     txn.commit()
         .map_err(|e| format!("commit iceberg mv commit-error marker failed: {e}"))?;
     Ok(())
+}
+
+fn mark_iceberg_mv_refresh_commit_unknown(
+    state: &Arc<StandaloneState>,
+    refresh_id: i64,
+) -> Result<(), String> {
+    let provider = state
+        .metadata_provider
+        .as_ref()
+        .ok_or_else(|| "metadata provider required for iceberg mv refresh".to_string())?;
+    let txn = provider
+        .begin_read()
+        .map_err(|e| format!("open iceberg mv commit-unknown read transaction failed: {e}"))?;
+    let refresh = state
+        .mv_repo
+        .load_refresh(txn.as_ref(), refresh_id)
+        .map_err(|e| format!("load iceberg mv refresh for commit-unknown marker failed: {e}"))?
+        .ok_or_else(|| format!("mv refresh {refresh_id} not found"))?;
+    mark_iceberg_mv_refresh_recovery_commit_unknown(
+        state,
+        &refresh,
+        "iceberg MV refresh commit result is unknown",
+    )
 }
 
 fn mark_iceberg_mv_refresh_aborted(
@@ -10320,7 +10343,7 @@ fn repartition_iceberg_join_mv_overwrite(
     right_ref: &IcebergTableRef,
     partition_contract: &crate::meta::repository::mv_contract::MvPartitionContract,
     repartition_restore: RepartitionDefaultSpecRestore,
-) -> Result<StatementResult, String> {
+) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let target = &ctx.rewrite.target;
     let target_entry = &*ctx.target_entry;
     let iceberg_catalog = &ctx.iceberg_catalog;
@@ -10342,7 +10365,8 @@ fn repartition_iceberg_join_mv_overwrite(
             repartition_restore.new_default_spec_id,
             repartition_restore.old_default_spec_id,
             err,
-        ));
+        )
+        .into());
     }
     let target_table = match reload_iceberg_mv_target_table(target_entry, target) {
         Ok(table) => table,
@@ -10364,7 +10388,7 @@ fn repartition_iceberg_join_mv_overwrite(
         .get(left_ref)
         .ok_or_else(|| format!("missing refresh pin for {}", left_ref.fqn()))
         .map_err(|err| {
-            handle_iceberg_mv_commit_error_with_repartition_restore(
+            handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
                 state,
                 target,
                 target_entry,
@@ -10378,7 +10402,7 @@ fn repartition_iceberg_join_mv_overwrite(
         .get(right_ref)
         .ok_or_else(|| format!("missing refresh pin for {}", right_ref.fqn()))
         .map_err(|err| {
-            handle_iceberg_mv_commit_error_with_repartition_restore(
+            handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
                 state,
                 target,
                 target_entry,
@@ -10389,7 +10413,7 @@ fn repartition_iceberg_join_mv_overwrite(
             )
         })?;
     let mut query = parse_mv_select_query(&mv_definition.select_sql).map_err(|err| {
-        handle_iceberg_mv_commit_error_with_repartition_restore(
+        handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
             state,
             target,
             target_entry,
@@ -10409,7 +10433,7 @@ fn repartition_iceberg_join_mv_overwrite(
         &aliases.right_alias,
     )
     .map_err(|err| {
-        handle_iceberg_mv_commit_error_with_repartition_restore(
+        handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
             state,
             target,
             target_entry,
@@ -10424,7 +10448,7 @@ fn repartition_iceberg_join_mv_overwrite(
         &[(left_ref, left_snapshot), (right_ref, right_snapshot)],
     )
     .map_err(|err| {
-        handle_iceberg_mv_commit_error_with_repartition_restore(
+        handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
             state,
             target,
             target_entry,
@@ -10438,7 +10462,7 @@ fn repartition_iceberg_join_mv_overwrite(
         pin.uuid(left_ref)
             .ok_or_else(|| format!("missing uuid for {}", left_ref.fqn()))
             .map_err(|err| {
-                handle_iceberg_mv_commit_error_with_repartition_restore(
+                handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
                     state,
                     target,
                     target_entry,
@@ -10452,7 +10476,7 @@ fn repartition_iceberg_join_mv_overwrite(
         pin.uuid(right_ref)
             .ok_or_else(|| format!("missing uuid for {}", right_ref.fqn()))
             .map_err(|err| {
-                handle_iceberg_mv_commit_error_with_repartition_restore(
+                handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
                     state,
                     target,
                     target_entry,
@@ -10490,21 +10514,23 @@ fn repartition_iceberg_join_mv_overwrite(
             None,
         ) {
             drop(catalogs_guard);
-            return Err(handle_iceberg_mv_commit_error_with_repartition_restore(
-                state,
-                target,
-                target_entry,
-                staging_branch,
-                refresh_id,
-                err,
-                Some(repartition_restore),
-            ));
+            return Err(
+                handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
+                    state,
+                    target,
+                    target_entry,
+                    staging_branch,
+                    refresh_id,
+                    err,
+                    Some(repartition_restore),
+                ),
+            );
         }
     }
 
     let marker = load_iceberg_mv_refresh_marker(state, refresh_id, mv_definition.mv_id)
         .map_err(|err| {
-            handle_iceberg_mv_commit_error_with_repartition_restore(
+            handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
                 state,
                 target,
                 target_entry,
@@ -10516,7 +10542,7 @@ fn repartition_iceberg_join_mv_overwrite(
         })?
         .to_summary_properties();
     let ident = iceberg_mv_table_ident(target).map_err(|err| {
-        handle_iceberg_mv_commit_error_with_repartition_restore(
+        handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
             state,
             target,
             target_entry,
@@ -10533,9 +10559,19 @@ fn repartition_iceberg_join_mv_overwrite(
         CommitOpKind::Overwrite,
     );
     let flush_outcome = coalescer
-        .flush_to_iceberg_commit_collector(&target_table, Arc::clone(&collector), None)
+        .flush_to_iceberg_commit_collector(
+            crate::engine::mv::iceberg_join_coalesce::JoinCoalesceIcebergTarget {
+                state,
+                table: &target_table,
+                catalog_name: &target.catalog,
+                namespace: &target.namespace,
+                table_name: &target.table,
+            },
+            Arc::clone(&collector),
+            None,
+        )
         .map_err(|err| {
-            handle_iceberg_mv_commit_error_with_repartition_restore(
+            handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
                 state,
                 target,
                 target_entry,
@@ -10555,16 +10591,31 @@ fn repartition_iceberg_join_mv_overwrite(
         marker,
     )) {
         Ok(Ok(outcome)) => outcome.new_snapshot_id,
-        Ok(Err(err)) | Err(err) => {
-            return Err(handle_iceberg_mv_commit_error_with_repartition_restore(
-                state,
-                target,
-                target_entry,
-                staging_branch,
-                refresh_id,
-                err,
-                Some(repartition_restore),
-            ));
+        Ok(Err(err)) => {
+            return Err(
+                handle_iceberg_mv_commit_service_error_with_repartition_restore(
+                    state,
+                    target,
+                    target_entry,
+                    staging_branch,
+                    refresh_id,
+                    err,
+                    Some(repartition_restore),
+                ),
+            );
+        }
+        Err(err) => {
+            return Err(
+                handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
+                    state,
+                    target,
+                    target_entry,
+                    staging_branch,
+                    refresh_id,
+                    err,
+                    Some(repartition_restore),
+                ),
+            );
         }
     };
 
@@ -16371,6 +16422,7 @@ mod tests {
             }),
         )
         .expect_err("publish main mismatch should fail before publishing");
+        let err = err.into_message();
         assert!(err.contains("main snapshot mismatch"), "{err}");
 
         let after =
