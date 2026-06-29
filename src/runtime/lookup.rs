@@ -14,7 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -29,16 +29,17 @@ use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
 use crate::exec::node::scan::RowPositionScanConfig;
 use crate::exec::node::scan::ScanMorsel;
-use crate::exec::row_position::RowPositionDescriptor;
 use crate::formats::{
-    FileFormatConfig, build_format_iter, parquet::ParquetReadCachePolicy,
-    parquet::ParquetScanConfig, parquet::ParquetSlotKind,
+    build_format_iter, parquet::ParquetReadCachePolicy, parquet::ParquetScanConfig,
+    parquet::ParquetSlotKind,
 };
 use crate::fs::scan_context::{FileScanContext, FileScanRange};
 use crate::novarocks_connectors::{StarRocksScanConfig, StarRocksScanOp};
+use crate::runtime::descriptor_snapshot::{DescriptorSlot, DescriptorSnapshot};
+use crate::runtime::descriptor_snapshot_thrift::{
+    is_iceberg_v3_row_position, lookup_file_format_config,
+};
 use crate::runtime::query_context::{QueryId, query_context_manager};
-use crate::thrift::descriptors;
-use crate::types::arrow_thrift::thrift_desc_to_arrow_type;
 
 #[derive(Clone, Debug)]
 pub struct GlobalLateMaterializationContext {
@@ -67,95 +68,28 @@ impl GlobalLateMaterializationContext {
     }
 }
 
-#[derive(Clone, Debug)]
-struct SlotMeta {
-    name: String,
-    arrow_type: arrow::datatypes::DataType,
-}
-
-fn build_slot_meta_map(
-    desc_tbl: &descriptors::TDescriptorTable,
+fn lookup_slot_meta<'a>(
+    snapshot: &'a DescriptorSnapshot,
     tuple_id: i32,
     slots: &[SlotId],
-) -> Result<HashMap<SlotId, SlotMeta>, String> {
-    let slot_descs = desc_tbl
-        .slot_descriptors
-        .as_ref()
-        .ok_or_else(|| "missing slot_descriptors in desc_tbl".to_string())?;
-    let mut desc_by_tuple_slot = HashMap::new();
-    for s in slot_descs {
-        let (Some(parent), Some(id), Some(slot_type)) = (s.parent, s.id, s.slot_type.as_ref())
-        else {
-            continue;
-        };
-        if parent != tuple_id {
-            continue;
-        }
-        let arrow_type = thrift_desc_to_arrow_type(slot_type)
-            .ok_or_else(|| format!("unsupported slot_type for tuple_id={parent} slot_id={id}"))?;
-        let slot_id = SlotId::try_from(id)?;
-        desc_by_tuple_slot.insert(
-            slot_id,
-            SlotMeta {
-                name: crate::lower::layout::slot_display_name_from_desc(s),
-                arrow_type,
-            },
-        );
-    }
-
+) -> Result<HashMap<SlotId, &'a DescriptorSlot>, String> {
     let mut map = HashMap::with_capacity(slots.len());
     for slot in slots {
-        let meta = desc_by_tuple_slot
-            .get(slot)
-            .cloned()
+        let meta = snapshot
+            .slot(tuple_id, *slot)
             .ok_or_else(|| format!("missing slot meta for tuple_id={} slot {}", tuple_id, slot))?;
         map.insert(*slot, meta);
     }
     Ok(map)
 }
 
-fn parquet_slot_kind_from_arrow_type(data_type: &arrow::datatypes::DataType) -> ParquetSlotKind {
-    if matches!(data_type, arrow::datatypes::DataType::LargeBinary) {
+fn parquet_slot_kind_from_descriptor_slot(slot: &DescriptorSlot) -> ParquetSlotKind {
+    if slot.logical.is_variant() {
         ParquetSlotKind::Variant
     } else {
         ParquetSlotKind::Regular
     }
 }
-
-fn lookup_output_slots(
-    desc_tbl: &descriptors::TDescriptorTable,
-    tuple_id: i32,
-    row_pos_desc: &RowPositionDescriptor,
-) -> Result<Vec<SlotId>, String> {
-    let slot_descs = desc_tbl
-        .slot_descriptors
-        .as_ref()
-        .ok_or_else(|| "missing slot_descriptors in desc_tbl".to_string())?;
-    let mut ignore: HashSet<SlotId> = HashSet::new();
-    ignore.insert(row_pos_desc.row_source_slot);
-    for slot in &row_pos_desc.fetch_ref_slots {
-        ignore.insert(*slot);
-    }
-    for slot in &row_pos_desc.lookup_ref_slots {
-        ignore.insert(*slot);
-    }
-    let mut slots = Vec::new();
-    for s in slot_descs {
-        let (Some(id), Some(parent)) = (s.id, s.parent) else {
-            continue;
-        };
-        if parent != tuple_id {
-            continue;
-        }
-        let slot_id = SlotId::try_from(id)?;
-        if ignore.contains(&slot_id) {
-            continue;
-        }
-        slots.push(slot_id);
-    }
-    Ok(slots)
-}
-
 pub fn encode_column_ipc(array: &ArrayRef) -> Result<Vec<u8>, String> {
     let field = arrow::datatypes::Field::new("col", array.data_type().clone(), true);
     let schema = Arc::new(arrow::datatypes::Schema::new(vec![field]));
@@ -194,20 +128,20 @@ pub(crate) fn execute_lookup_request(
     let row_pos_desc = mgr
         .row_pos_desc(query_id, tuple_id)
         .ok_or_else(|| format!("row position descriptor missing for tuple_id={}", tuple_id))?;
-    if row_pos_desc.row_position_type != crate::exec::row_position::RowPositionType::Iceberg {
+    if !is_iceberg_v3_row_position(row_pos_desc.row_position_type) {
         return Err(format!(
             "unsupported row position type: {:?}",
             row_pos_desc.row_position_type
         ));
     }
-    let desc_tbl = mgr
-        .desc_tbl(query_id)
-        .ok_or_else(|| "descriptor table missing for lookup".to_string())?;
+    let snapshot = mgr
+        .descriptor_snapshot(query_id)
+        .ok_or_else(|| "descriptor snapshot missing for lookup".to_string())?;
     let cache_options = mgr
         .cache_options(query_id)
         .ok_or_else(|| "cache options missing for lookup".to_string())?;
-    let lookup_slots = lookup_output_slots(&desc_tbl, tuple_id, &row_pos_desc)?;
-    let slot_meta = build_slot_meta_map(&desc_tbl, tuple_id, &lookup_slots)?;
+    let lookup_slots = snapshot.lookup_output_slots(tuple_id, &row_pos_desc);
+    let slot_meta = lookup_slot_meta(&snapshot, tuple_id, &lookup_slots)?;
 
     let fetch_ref_slots = &row_pos_desc.fetch_ref_slots;
     if fetch_ref_slots.len() != 2 {
@@ -244,7 +178,7 @@ pub(crate) fn execute_lookup_request(
             let meta = slot_meta
                 .get(&slot)
                 .ok_or_else(|| format!("missing slot meta for slot {}", slot))?;
-            let empty = new_empty_array(&meta.arrow_type);
+            let empty = new_empty_array(meta.field.data_type());
             out.push((slot, empty));
         }
         return Ok(out);
@@ -293,7 +227,7 @@ pub(crate) fn execute_lookup_request(
         let columns = lookup_metas.iter().map(|m| m.name.clone()).collect();
         let slot_kinds = lookup_metas
             .iter()
-            .map(|meta| parquet_slot_kind_from_arrow_type(&meta.arrow_type))
+            .map(|meta| parquet_slot_kind_from_descriptor_slot(meta))
             .collect::<Vec<_>>();
         let chunk_schema = Arc::new(ChunkSchema::try_new(
             lookup_slots
@@ -303,13 +237,9 @@ pub(crate) fn execute_lookup_request(
                 .map(|(slot_id, meta)| {
                     ChunkSlotSchema::new_with_field(
                         slot_id,
-                        arrow::datatypes::Field::new(
-                            meta.name.clone(),
-                            meta.arrow_type.clone(),
-                            true,
-                        ),
+                        meta.field.clone(),
                         None,
-                        None,
+                        meta.unique_id,
                     )
                 })
                 .collect(),
@@ -335,12 +265,7 @@ pub(crate) fn execute_lookup_request(
             variant_path_columns: Vec::new(),
             query_global_dicts: Default::default(),
         };
-        let format = match scan_cfg.file_format {
-            descriptors::THdfsFileFormat::PARQUET => FileFormatConfig::Parquet(parquet_cfg),
-            other => {
-                return Err(format!("lookup only supports PARQUET, got {:?}", other));
-            }
-        };
+        let format = lookup_file_format_config(scan_cfg.file_format, parquet_cfg)?;
 
         let scan =
             FileScanContext::build(vec![scan_range.clone()], None, scan_cfg.oss_config.as_ref())?;
@@ -439,14 +364,14 @@ pub(crate) fn execute_lake_lookup_request(
     let row_pos_desc = mgr
         .row_pos_desc(query_id, tuple_id)
         .ok_or_else(|| format!("row position descriptor missing for tuple_id={}", tuple_id))?;
-    let desc_tbl = mgr
-        .desc_tbl(query_id)
-        .ok_or_else(|| "descriptor table missing for lake lookup".to_string())?;
-    let lookup_slots = lookup_output_slots(&desc_tbl, tuple_id, &row_pos_desc)?;
+    let snapshot = mgr
+        .descriptor_snapshot(query_id)
+        .ok_or_else(|| "descriptor snapshot missing for lake lookup".to_string())?;
+    let lookup_slots = snapshot.lookup_output_slots(tuple_id, &row_pos_desc);
     if lookup_slots.is_empty() {
         return Ok(Vec::new());
     }
-    let slot_meta = build_slot_meta_map(&desc_tbl, tuple_id, &lookup_slots)?;
+    let slot_meta = lookup_slot_meta(&snapshot, tuple_id, &lookup_slots)?;
 
     // fetch_ref_slots for LAKE: [tablet_id_slot, rss_id_slot, row_id_slot]
     let fetch_ref_slots = &row_pos_desc.fetch_ref_slots;
@@ -476,13 +401,20 @@ pub(crate) fn execute_lake_lookup_request(
         .ok_or_else(|| "row_id column must be Int64".to_string())?;
 
     let request_len = rss_ids.len();
+    if row_ids.len() != request_len {
+        return Err(format!(
+            "lake row position rss_id and row_id columns have different lengths: {} vs {}",
+            request_len,
+            row_ids.len()
+        ));
+    }
     if request_len == 0 {
         let mut out = Vec::new();
         for slot in lookup_slots {
             let meta = slot_meta
                 .get(&slot)
                 .ok_or_else(|| format!("missing slot meta for slot {}", slot))?;
-            let empty = new_empty_array(&meta.arrow_type);
+            let empty = new_empty_array(meta.field.data_type());
             out.push((slot, empty));
         }
         return Ok(out);
@@ -518,9 +450,9 @@ pub(crate) fn execute_lake_lookup_request(
                     .ok_or_else(|| format!("missing slot meta for slot {}", slot_id))?;
                 Ok(ChunkSlotSchema::new_with_field(
                     slot_id,
-                    arrow::datatypes::Field::new(meta.name.clone(), meta.arrow_type.clone(), true),
+                    meta.field.clone(),
                     None,
-                    None,
+                    meta.unique_id,
                 ))
             })
             .collect::<Result<Vec<_>, String>>()?,

@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::common::min_max_predicate::MinMaxPredicate;
-use crate::connector::scan_planning::{ConnectorScanPlanner, ThriftScanContext};
+use crate::connector::scan_planning::ConnectorScanPlanner;
 use crate::lower::expr::parse_min_max_conjuncts_with_column_resolver;
+use crate::sql::codegen::connector_scan_wire::{ThriftScanContext, to_thrift_scan};
 use crate::thrift::descriptors;
 use crate::thrift::exprs;
 use crate::thrift::internal_service;
@@ -49,7 +50,8 @@ pub(crate) fn build_scan_node(
                 )
             })?;
             let planner = connectors.scan_planner("starrocks")?;
-            let plan = planner.to_thrift_scan(
+            let plan = to_thrift_scan(
+                planner.name(),
                 &planned.scan,
                 &planned.splits,
                 ThriftScanContext {
@@ -78,7 +80,8 @@ pub(crate) fn build_scan_node(
                 )
             })?;
             let planner = connectors.scan_planner("iceberg")?;
-            let plan = planner.to_thrift_scan(
+            let plan = to_thrift_scan(
+                planner.name(),
                 &planned.scan,
                 &planned.splits,
                 ThriftScanContext {
@@ -1006,7 +1009,8 @@ pub(crate) fn build_exec_params_multi_with_refresh_context(
                         )
                     })?;
                     let planner = connectors.scan_planner("iceberg")?;
-                    let plan = planner.to_thrift_scan(
+                    let plan = to_thrift_scan(
+                        planner.name(),
                         &planned_scan.scan,
                         &planned_scan.splits,
                         ThriftScanContext {
@@ -1142,7 +1146,8 @@ fn build_iceberg_scan_ranges_from_source(
         &scan,
         crate::connector::scan_planning::SplitPlanningContext::default(),
     )?;
-    let plan = planner.to_thrift_scan(
+    let plan = to_thrift_scan(
+        planner.name(),
         &scan,
         &splits,
         ThriftScanContext {
@@ -1548,7 +1553,8 @@ pub(crate) fn build_starrocks_scan_ranges_from_planned_scan(
             resolved.database, resolved.table.name
         )
     })?;
-    let thrift = planner.to_thrift_scan(
+    let thrift = to_thrift_scan(
+        planner.name(),
         &planned_scan.scan,
         &planned_scan.splits,
         ThriftScanContext {
@@ -1675,11 +1681,34 @@ mod tests {
             .expect("hdfs scan range")
     }
 
+    #[derive(Debug)]
+    struct TestStarRocksScanPlanner;
+
+    impl crate::connector::scan_planning::ConnectorScanPlanner for TestStarRocksScanPlanner {
+        fn name(&self) -> &'static str {
+            "starrocks"
+        }
+
+        fn begin_scan(
+            &self,
+            _table: crate::connector::scan_planning::TableHandle,
+            _ctx: crate::connector::scan_planning::BeginScanContext,
+        ) -> Result<crate::connector::scan_planning::ScanHandle, String> {
+            Err("test planner should use pre-planned StarRocks scans".to_string())
+        }
+
+        fn plan_splits(
+            &self,
+            _scan: &crate::connector::scan_planning::ScanHandle,
+            _ctx: crate::connector::scan_planning::SplitPlanningContext,
+        ) -> Result<Vec<crate::connector::scan_planning::Split>, String> {
+            Err("test planner should use pre-planned StarRocks splits".to_string())
+        }
+    }
+
     fn test_connector_registry() -> crate::connector::ConnectorRegistry {
         let mut registry = crate::connector::ConnectorRegistry::new();
-        registry.register_scan_planner(Arc::new(
-            crate::connector::starrocks::table::StarRocksTableScanPlanner::stateless_for_codegen(),
-        ));
+        registry.register_scan_planner(Arc::new(TestStarRocksScanPlanner));
         registry.register_scan_planner(Arc::new(
             crate::connector::iceberg::IcebergConnectorScanPlanner::new(),
         ));

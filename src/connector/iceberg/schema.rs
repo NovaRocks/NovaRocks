@@ -24,6 +24,7 @@ use crate::exec::row_position::{
     ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
     ICEBERG_RESERVED_FIELD_ID_ROW_ID, ICEBERG_ROW_ID_COL,
 };
+use crate::runtime::descriptor_snapshot::{DescriptorIcebergSchema, DescriptorIcebergSchemaField};
 
 const VIRTUAL_COUNT_COLUMN: &str = "___count___";
 pub const ICEBERG_INITIAL_DEFAULT_META_KEY: &str = "novarocks.iceberg.initial_default";
@@ -143,6 +144,47 @@ pub fn build_projected_output_schema(
     Ok(Some(Arc::new(Schema::new(fields))))
 }
 
+pub(crate) fn build_projected_output_schema_from_descriptor(
+    iceberg_schema: Option<&DescriptorIcebergSchema>,
+    columns: &[IcebergArrowColumn],
+) -> Result<Option<SchemaRef>, String> {
+    let Some(schema) = iceberg_schema else {
+        return Ok(None);
+    };
+    let schema_fields = schema
+        .fields
+        .as_ref()
+        .ok_or_else(|| "iceberg schema missing fields".to_string())?;
+    let mut fields = Vec::with_capacity(columns.len());
+    for column in columns {
+        if column.name == VIRTUAL_COUNT_COLUMN {
+            fields.push(Field::new(column.name.clone(), DataType::Boolean, false));
+            continue;
+        }
+        if let Some(field) = build_reserved_row_lineage_projected_field(column)? {
+            fields.push(field);
+            continue;
+        }
+        let schema_field = schema_fields
+            .iter()
+            .find(|field| field.name.as_deref() == Some(column.name.as_str()))
+            .ok_or_else(|| {
+                format!(
+                    "iceberg projected column {} missing schema field descriptor",
+                    column.name
+                )
+            })?;
+        let field = Field::new(
+            column.name.clone(),
+            column.data_type.clone(),
+            column.nullable,
+        );
+        let field = apply_descriptor_field_id_recursive(field, schema_field)?;
+        fields.push(field);
+    }
+    Ok(Some(Arc::new(Schema::new(fields))))
+}
+
 fn build_reserved_row_lineage_projected_field(
     column: &IcebergArrowColumn,
 ) -> Result<Option<Field>, String> {
@@ -257,6 +299,105 @@ pub fn apply_field_id_recursive(
                 apply_field_id_recursive(entry_fields[0].as_ref().clone(), &schema_children[0])?;
             let value_field =
                 apply_field_id_recursive(entry_fields[1].as_ref().clone(), &schema_children[1])?;
+            let entries_struct = DataType::Struct(vec![key_field, value_field].into());
+            let entries_field = Field::new(
+                entries_field.name(),
+                entries_struct,
+                entries_field.is_nullable(),
+            );
+            DataType::Map(Arc::new(entries_field), *sorted)
+        }
+        other => other.clone(),
+    };
+    Ok(Field::new(field.name(), data_type, field.is_nullable()).with_metadata(meta))
+}
+
+fn apply_descriptor_field_id_recursive(
+    field: Field,
+    schema_field: &DescriptorIcebergSchemaField,
+) -> Result<Field, String> {
+    let field_id = schema_field
+        .field_id
+        .ok_or_else(|| format!("iceberg schema field {} missing field_id", field.name()))?;
+    let mut meta = field.metadata().clone();
+    meta.insert(PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string());
+    if let Some(json) = schema_field.initial_default_json.as_ref() {
+        meta.insert(ICEBERG_INITIAL_DEFAULT_META_KEY.to_string(), json.clone());
+    }
+    let data_type = match field.data_type() {
+        DataType::Struct(children) => {
+            let schema_children = schema_field
+                .children
+                .as_ref()
+                .ok_or_else(|| format!("iceberg schema field {} missing children", field.name()))?;
+            if children.len() != schema_children.len() {
+                return Err(format!(
+                    "iceberg schema children mismatch for {}: fields={} schema_fields={}",
+                    field.name(),
+                    children.len(),
+                    schema_children.len()
+                ));
+            }
+            let mut new_children = Vec::with_capacity(children.len());
+            for (child, schema_child) in children.iter().zip(schema_children.iter()) {
+                let new_child =
+                    apply_descriptor_field_id_recursive(child.as_ref().clone(), schema_child)?;
+                new_children.push(new_child);
+            }
+            DataType::Struct(new_children.into())
+        }
+        DataType::List(child) => {
+            let schema_children = schema_field
+                .children
+                .as_ref()
+                .ok_or_else(|| format!("iceberg schema field {} missing children", field.name()))?;
+            if schema_children.len() != 1 {
+                return Err(format!(
+                    "iceberg schema list field {} should have 1 child, got {}",
+                    field.name(),
+                    schema_children.len()
+                ));
+            }
+            let new_child =
+                apply_descriptor_field_id_recursive(child.as_ref().clone(), &schema_children[0])?;
+            DataType::List(Arc::new(new_child))
+        }
+        DataType::Map(entries, sorted) => {
+            let schema_children = schema_field
+                .children
+                .as_ref()
+                .ok_or_else(|| format!("iceberg schema field {} missing children", field.name()))?;
+            if schema_children.len() != 2 {
+                return Err(format!(
+                    "iceberg schema map field {} should have 2 children, got {}",
+                    field.name(),
+                    schema_children.len()
+                ));
+            }
+            let entries_field = entries.as_ref();
+            let entry_fields = match entries_field.data_type() {
+                DataType::Struct(fields) => fields,
+                _ => {
+                    return Err(format!(
+                        "iceberg map field {} has non-struct entries",
+                        field.name()
+                    ));
+                }
+            };
+            if entry_fields.len() != 2 {
+                return Err(format!(
+                    "iceberg map field {} entries should have 2 fields",
+                    field.name()
+                ));
+            }
+            let key_field = apply_descriptor_field_id_recursive(
+                entry_fields[0].as_ref().clone(),
+                &schema_children[0],
+            )?;
+            let value_field = apply_descriptor_field_id_recursive(
+                entry_fields[1].as_ref().clone(),
+                &schema_children[1],
+            )?;
             let entries_struct = DataType::Struct(vec![key_field, value_field].into());
             let entries_field = Field::new(
                 entries_field.name(),

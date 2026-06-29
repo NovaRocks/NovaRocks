@@ -34,6 +34,8 @@ use crate::exec::pipeline::dependency::DependencyManager;
 use crate::exec::pipeline::global_driver_executor::FragmentCompletion;
 use crate::exec::row_position::RowPositionDescriptor;
 use crate::fs::scan_context::FileScanRange;
+use crate::runtime::descriptor_snapshot::DescriptorSnapshot;
+use crate::runtime::descriptor_snapshot_thrift::descriptor_snapshot_from_thrift;
 use crate::runtime::lookup::GlobalLateMaterializationContext;
 use crate::runtime::mem_tracker::{self, MemTracker};
 use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
@@ -62,6 +64,7 @@ pub(crate) struct QueryContext {
     pub(crate) query_id: QueryId,
     pub(crate) cache_options: Option<CacheOptions>,
     pub(crate) desc_tbl: Option<descriptors::TDescriptorTable>,
+    pub(crate) desc_snapshot: Option<Arc<DescriptorSnapshot>>,
     pub(crate) num_fragments: usize,
     pub(crate) num_active_fragments: usize,
     pub(crate) total_fragments: Option<usize>,
@@ -107,6 +110,7 @@ impl QueryContext {
             query_id,
             cache_options: None,
             desc_tbl: None,
+            desc_snapshot: None,
             num_fragments: 0,
             num_active_fragments: 0,
             total_fragments: None,
@@ -638,6 +642,15 @@ impl QueryContextManager {
             .and_then(|ctx| ctx.desc_tbl.clone())
     }
 
+    pub(crate) fn descriptor_snapshot(&self, query_id: QueryId) -> Option<Arc<DescriptorSnapshot>> {
+        let guard = self.inner.lock().expect("query_ctx_manager lock");
+        guard
+            .active
+            .get(&query_id)
+            .or_else(|| guard.second_chance.get(&query_id))
+            .and_then(|ctx| ctx.desc_snapshot.clone())
+    }
+
     pub(crate) fn set_runtime_filter_hub(
         &self,
         query_id: QueryId,
@@ -1148,6 +1161,12 @@ pub(crate) fn resolve_desc_tbl_for_instance(
     mgr.with_context_mut(query_id, |ctx| {
         if let Some(desc) = incoming {
             if desc_tbl_is_cached(desc) {
+                if ctx.desc_snapshot.is_none() {
+                    let existing = ctx.desc_tbl.as_ref().ok_or_else(|| {
+                        "Query terminates prematurely (missing desc_tbl)".to_string()
+                    })?;
+                    ctx.desc_snapshot = Some(Arc::new(descriptor_snapshot_from_thrift(existing)?));
+                }
                 return ctx
                     .desc_tbl
                     .clone()
@@ -1155,14 +1174,18 @@ pub(crate) fn resolve_desc_tbl_for_instance(
                     .map(Some);
             }
             if !is_desc_tbl_effectively_empty(desc) {
+                let snapshot = descriptor_snapshot_from_thrift(desc)?;
                 ctx.desc_tbl = Some(desc.clone());
+                ctx.desc_snapshot = Some(Arc::new(snapshot));
                 return Ok(Some(desc.clone()));
             }
         }
         if let Some(desc) = fallback
             && !is_desc_tbl_effectively_empty(desc)
         {
+            let snapshot = descriptor_snapshot_from_thrift(desc)?;
             ctx.desc_tbl = Some(desc.clone());
+            ctx.desc_snapshot = Some(Arc::new(snapshot));
             return Ok(Some(desc.clone()));
         }
         Ok(ctx.desc_tbl.clone())
@@ -1185,4 +1208,119 @@ pub(crate) fn query_expire_durations(
         Duration::from_secs(delivery_timeout as u64),
         Duration::from_secs(query_timeout as u64),
     )
+}
+
+#[cfg(test)]
+mod descriptor_snapshot_tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    use super::{
+        QueryContextManager, QueryContextManagerInner, QueryId, is_desc_tbl_effectively_empty,
+        resolve_desc_tbl_for_instance,
+    };
+    use crate::common::ids::SlotId;
+    use crate::thrift::descriptors;
+    use crate::thrift::types::TPrimitiveType;
+
+    fn test_manager() -> QueryContextManager {
+        QueryContextManager {
+            inner: Mutex::new(QueryContextManagerInner::default()),
+            stopped: AtomicBool::new(false),
+        }
+    }
+
+    fn int_slot_desc_tbl(tuple_id: i32, slot_id: i32) -> descriptors::TDescriptorTable {
+        descriptors::TDescriptorTable::new(
+            Some(vec![descriptors::TSlotDescriptor {
+                id: Some(slot_id),
+                parent: Some(tuple_id),
+                slot_type: Some(crate::lower::type_lowering::scalar_type_desc(
+                    TPrimitiveType::INT,
+                )),
+                column_pos: None,
+                byte_offset: None,
+                null_indicator_byte: None,
+                null_indicator_bit: None,
+                col_name: Some("c1".to_string()),
+                slot_idx: None,
+                is_materialized: Some(true),
+                is_output_column: Some(true),
+                is_nullable: Some(true),
+                col_unique_id: Some(2001),
+                col_physical_name: None,
+                is_virtual_column: None,
+            }]),
+            vec![descriptors::TTupleDescriptor::new(
+                Some(tuple_id),
+                None,
+                None,
+                Some(100),
+                None,
+            )],
+            None::<Vec<descriptors::TTableDescriptor>>,
+            None,
+        )
+    }
+
+    fn cached_desc_tbl() -> descriptors::TDescriptorTable {
+        descriptors::TDescriptorTable::new(
+            None::<Vec<descriptors::TSlotDescriptor>>,
+            vec![],
+            None::<Vec<descriptors::TTableDescriptor>>,
+            Some(true),
+        )
+    }
+
+    #[test]
+    fn resolve_desc_tbl_caches_descriptor_snapshot() {
+        let mgr = test_manager();
+        let query_id = QueryId { hi: 11, lo: 22 };
+        mgr.get_or_register(
+            query_id,
+            false,
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+        )
+        .expect("query context must be created");
+        let desc = int_slot_desc_tbl(1, 7);
+
+        let resolved = resolve_desc_tbl_for_instance(&mgr, query_id, Some(&desc), None)
+            .expect("resolve")
+            .expect("desc");
+
+        assert!(!is_desc_tbl_effectively_empty(&resolved));
+        let snapshot = mgr.descriptor_snapshot(query_id).expect("snapshot");
+        assert!(snapshot.slot(1, SlotId::new(7)).is_some());
+        assert_eq!(snapshot.table_id_for_tuple(1), Some(100));
+    }
+
+    #[test]
+    fn cached_descriptor_rebuilds_missing_snapshot_from_existing_desc_tbl() {
+        let mgr = test_manager();
+        let query_id = QueryId { hi: 33, lo: 44 };
+        mgr.get_or_register(
+            query_id,
+            false,
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+        )
+        .expect("query context must be created");
+
+        let desc = int_slot_desc_tbl(2, 9);
+        mgr.with_context_mut(query_id, |ctx| {
+            ctx.desc_tbl = Some(desc);
+            ctx.desc_snapshot = None;
+            Ok(())
+        })
+        .expect("seed descriptor without snapshot");
+
+        resolve_desc_tbl_for_instance(&mgr, query_id, Some(&cached_desc_tbl()), None)
+            .expect("resolve cached descriptor")
+            .expect("cached desc");
+
+        let snapshot = mgr.descriptor_snapshot(query_id).expect("snapshot");
+        assert!(snapshot.slot(2, SlotId::new(9)).is_some());
+    }
 }

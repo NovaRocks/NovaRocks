@@ -58,10 +58,10 @@ pub(crate) fn starrocks_split(split: &Split) -> Result<&StarRocksSplit, String> 
 use std::sync::{Arc, Weak};
 
 use crate::connector::scan_planning::{
-    BeginScanContext, ConnectorScanPlanner, SplitPlanningContext, TableHandle, ThriftScanContext,
-    ThriftScanPlan, validate_split_connectors,
+    BeginScanContext, ConnectorScanPlanner, SplitPlanningContext, TableHandle,
 };
 use crate::engine::StandaloneState;
+use crate::sql::codegen::connector_scan_wire::{ThriftScanContext, ThriftScanPlan};
 use crate::thrift::{internal_service, plan_nodes};
 
 #[derive(Debug)]
@@ -74,16 +74,6 @@ impl StarRocksTableScanPlanner {
         Self {
             state: Arc::downgrade(state),
         }
-    }
-
-    /// Construct a planner instance that does not reference any
-    /// `StandaloneState`. Safe to use ONLY from tests that invoke methods
-    /// which never call `self.state()` — currently `to_thrift_scan`.
-    /// Adding a state-reading method without also updating call sites here
-    /// would panic at the upgrade in `state()`.
-    #[cfg(test)]
-    pub(crate) fn stateless_for_codegen() -> Self {
-        Self { state: Weak::new() }
     }
 
     fn state(&self) -> Result<Arc<StandaloneState>, String> {
@@ -258,41 +248,39 @@ impl ConnectorScanPlanner for StarRocksTableScanPlanner {
             })
             .collect())
     }
+}
 
-    fn to_thrift_scan(
-        &self,
-        scan: &ScanHandle,
-        splits: &[Split],
-        ctx: ThriftScanContext,
-    ) -> Result<ThriftScanPlan, String> {
-        validate_split_connectors(scan, splits)?;
-        let scan = starrocks_scan_handle(scan)?;
-        let scan_ranges = splits
-            .iter()
-            .map(|split| {
-                let split = starrocks_split(split)?;
-                Ok(Self::build_internal_scan_range_params(
-                    &ctx.database,
-                    &ctx.table,
-                    scan.schema_id,
-                    split,
-                ))
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        let node = Self::build_lake_scan_node(scan, &ctx);
-        Ok(ThriftScanPlan {
-            node: Some(node),
-            scan_ranges,
+pub(crate) fn starrocks_to_thrift_scan(
+    scan: &ScanHandle,
+    splits: &[Split],
+    ctx: ThriftScanContext,
+) -> Result<ThriftScanPlan, String> {
+    crate::connector::scan_planning::validate_split_connectors(scan, splits)?;
+    let scan = starrocks_scan_handle(scan)?;
+    let scan_ranges = splits
+        .iter()
+        .map(|split| {
+            let split = starrocks_split(split)?;
+            Ok(StarRocksTableScanPlanner::build_internal_scan_range_params(
+                &ctx.database,
+                &ctx.table,
+                scan.schema_id,
+                split,
+            ))
         })
-    }
+        .collect::<Result<Vec<_>, String>>()?;
+    let node = StarRocksTableScanPlanner::build_lake_scan_node(scan, &ctx);
+    Ok(ThriftScanPlan {
+        node: Some(node),
+        scan_ranges,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::scan_planning::{
-        ConnectorScanPlanner, ScanHandle, Split, ThriftScanContext, validate_split_connectors,
-    };
+    use crate::connector::scan_planning::{ScanHandle, Split, validate_split_connectors};
+    use crate::sql::codegen::connector_scan_wire::ThriftScanContext;
 
     #[test]
     fn downcasts_starrocks_scan_and_split() {
@@ -324,7 +312,6 @@ mod tests {
 
     #[test]
     fn to_thrift_scan_returns_lake_scan_node_and_scan_ranges() {
-        let planner = StarRocksTableScanPlanner::stateless_for_codegen();
         let scan = ScanHandle::new(
             CONNECTOR_ID,
             StarRocksScanHandle {
@@ -346,19 +333,18 @@ mod tests {
             },
         )];
 
-        let plan = planner
-            .to_thrift_scan(
-                &scan,
-                &splits,
-                ThriftScanContext {
-                    database: "default".to_string(),
-                    table: "orders".to_string(),
-                    node_id: 11,
-                    scan_tuple_id: 1,
-                    ..ThriftScanContext::default()
-                },
-            )
-            .expect("thrift scan plan");
+        let plan = starrocks_to_thrift_scan(
+            &scan,
+            &splits,
+            ThriftScanContext {
+                database: "default".to_string(),
+                table: "orders".to_string(),
+                node_id: 11,
+                scan_tuple_id: 1,
+                ..ThriftScanContext::default()
+            },
+        )
+        .expect("starrocks thrift scan");
 
         let node = plan.node.expect("lake scan node");
         assert_eq!(node.node_id, 11);

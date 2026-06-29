@@ -2473,27 +2473,12 @@ mod tests {
                 })
                 .collect())
         }
-
-        fn to_thrift_scan(
-            &self,
-            scan: &crate::connector::scan_planning::ScanHandle,
-            splits: &[crate::connector::scan_planning::Split],
-            ctx: crate::connector::scan_planning::ThriftScanContext,
-        ) -> Result<crate::connector::scan_planning::ThriftScanPlan, String> {
-            let planner =
-                crate::connector::starrocks::table::StarRocksTableScanPlanner::stateless_for_codegen();
-            <crate::connector::starrocks::table::StarRocksTableScanPlanner as crate::connector::scan_planning::ConnectorScanPlanner>::to_thrift_scan(
-                &planner, scan, splits, ctx,
-            )
-        }
     }
 
     #[derive(Debug, Default)]
     struct ScanPlannerCallCounts {
         begin_scan: std::sync::atomic::AtomicUsize,
         plan_splits: std::sync::atomic::AtomicUsize,
-        to_thrift_scan: std::sync::atomic::AtomicUsize,
-        thrift_contexts: std::sync::Mutex<Vec<crate::connector::scan_planning::ThriftScanContext>>,
     }
 
     #[derive(Debug)]
@@ -2527,23 +2512,6 @@ mod tests {
                 .plan_splits
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.inner.plan_splits(scan, ctx)
-        }
-
-        fn to_thrift_scan(
-            &self,
-            scan: &crate::connector::scan_planning::ScanHandle,
-            splits: &[crate::connector::scan_planning::Split],
-            ctx: crate::connector::scan_planning::ThriftScanContext,
-        ) -> Result<crate::connector::scan_planning::ThriftScanPlan, String> {
-            self.counts
-                .to_thrift_scan
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.counts
-                .thrift_contexts
-                .lock()
-                .expect("thrift contexts")
-                .push(ctx.clone());
-            self.inner.to_thrift_scan(scan, splits, ctx)
         }
     }
 
@@ -2605,24 +2573,6 @@ mod tests {
                     )
                 })
                 .collect())
-        }
-
-        fn to_thrift_scan(
-            &self,
-            scan: &crate::connector::scan_planning::ScanHandle,
-            splits: &[crate::connector::scan_planning::Split],
-            ctx: crate::connector::scan_planning::ThriftScanContext,
-        ) -> Result<crate::connector::scan_planning::ThriftScanPlan, String> {
-            self.counts
-                .to_thrift_scan
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.counts
-                .thrift_contexts
-                .lock()
-                .expect("thrift contexts")
-                .push(ctx.clone());
-            crate::connector::iceberg::IcebergConnectorScanPlanner::new()
-                .to_thrift_scan(scan, splits, ctx)
         }
     }
 
@@ -6150,13 +6100,6 @@ mod tests {
             1,
             "plan_splits must be invoked exactly once for the StarRocks scan"
         );
-        assert_eq!(
-            counts
-                .to_thrift_scan
-                .load(std::sync::atomic::Ordering::SeqCst),
-            2,
-            "to_thrift_scan must be invoked for both scan node and scan ranges"
-        );
         let root = built
             .fragment_results
             .iter()
@@ -6168,22 +6111,22 @@ mod tests {
             .iter()
             .find(|node| node.node_type == plan_nodes::TPlanNodeType::LAKE_SCAN_NODE)
             .expect("lake scan node");
-        let contexts = counts.thrift_contexts.lock().expect("thrift contexts");
-        assert_eq!(
-            contexts
-                .iter()
-                .map(|ctx| (ctx.node_id, ctx.scan_tuple_id))
-                .collect::<Vec<_>>(),
-            vec![(scan.node_id, scan.row_tuples[0]); 2],
-            "both to_thrift_scan calls must carry the real scan node and tuple ids"
+        assert_eq!(scan.row_tuples.len(), 1, "scan node must carry one tuple");
+        assert!(
+            scan.conjuncts
+                .as_ref()
+                .is_some_and(|exprs| !exprs.is_empty()),
+            "scan node emission must carry pushed predicates"
         );
-        let contexts_with_conjuncts = contexts
-            .iter()
-            .filter(|ctx| !ctx.conjuncts.is_empty())
-            .count();
+        let ranges = root
+            .exec_params
+            .per_node_scan_ranges
+            .get(&scan.node_id)
+            .expect("scan ranges must be keyed by the emitted scan node id");
         assert_eq!(
-            contexts_with_conjuncts, 1,
-            "exactly one to_thrift_scan call should carry node conjuncts; the range-only call should not"
+            ranges.len(),
+            layout.tablets.len(),
+            "range emission must use the planned connector splits"
         );
     }
 
@@ -6214,13 +6157,6 @@ mod tests {
             1,
             "plan_splits must be invoked exactly once for the Iceberg scan"
         );
-        assert_eq!(
-            counts
-                .to_thrift_scan
-                .load(std::sync::atomic::Ordering::SeqCst),
-            2,
-            "to_thrift_scan must be invoked for both scan node and scan ranges"
-        );
         let root = built
             .fragment_results
             .iter()
@@ -6232,22 +6168,22 @@ mod tests {
             .iter()
             .find(|node| node.node_type == plan_nodes::TPlanNodeType::HDFS_SCAN_NODE)
             .expect("hdfs scan node");
-        let contexts = counts.thrift_contexts.lock().expect("thrift contexts");
-        assert_eq!(
-            contexts
-                .iter()
-                .map(|ctx| (ctx.node_id, ctx.scan_tuple_id))
-                .collect::<Vec<_>>(),
-            vec![(scan.node_id, scan.row_tuples[0]); 2],
-            "both to_thrift_scan calls must carry the real scan node and tuple ids"
+        assert_eq!(scan.row_tuples.len(), 1, "scan node must carry one tuple");
+        assert!(
+            scan.conjuncts
+                .as_ref()
+                .is_some_and(|exprs| !exprs.is_empty()),
+            "scan node emission must carry pushed predicates"
         );
-        let contexts_with_conjuncts = contexts
-            .iter()
-            .filter(|ctx| !ctx.conjuncts.is_empty())
-            .count();
+        let ranges = root
+            .exec_params
+            .per_node_scan_ranges
+            .get(&scan.node_id)
+            .expect("scan ranges must be keyed by the emitted scan node id");
         assert_eq!(
-            contexts_with_conjuncts, 1,
-            "exactly one to_thrift_scan call should carry node conjuncts; the range-only call should not"
+            ranges.len(),
+            1,
+            "range emission must use the planned connector splits"
         );
     }
 

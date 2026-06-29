@@ -5,6 +5,7 @@
 //! plan structures expected by the pipeline executor.
 
 pub(crate) mod boundary_schema;
+pub(crate) mod connector_scan_wire;
 pub(crate) mod descriptors;
 pub(crate) mod expr_compiler;
 pub(crate) mod fallback_audit;

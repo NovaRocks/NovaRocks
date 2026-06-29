@@ -361,6 +361,7 @@ mod tests {
     use crate::exec::runtime_filter::{arrow_type_to_proto_type_desc, decode_starrocks_in_filter};
     use crate::fs::scan_context::FileScanRange;
     use crate::proto;
+    use crate::runtime::descriptor_snapshot_thrift::descriptor_snapshot_from_thrift;
     use crate::runtime::exchange;
     use crate::runtime::query_context::{QueryId, query_context_manager};
     #[cfg(feature = "compat")]
@@ -903,7 +904,11 @@ mod tests {
             .expect("set cache options");
         query_context_manager()
             .with_context_mut(query_id, |ctx| {
-                ctx.desc_tbl = Some(lookup_desc_tbl(tuple_id));
+                let desc_tbl = lookup_desc_tbl(tuple_id);
+                let snapshot =
+                    descriptor_snapshot_from_thrift(&desc_tbl).expect("descriptor snapshot");
+                ctx.desc_tbl = Some(desc_tbl);
+                ctx.desc_snapshot = Some(Arc::new(snapshot));
                 Ok(())
             })
             .expect("set descriptor table");

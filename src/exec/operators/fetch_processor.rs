@@ -27,7 +27,7 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use arrow::array::{Array, ArrayRef, Int32Array, UInt32Array};
 use arrow::compute::{concat, take};
@@ -36,8 +36,11 @@ use crate::common::ids::SlotId;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::exec::row_position::{RowPositionDescriptor, RowPositionType};
+use crate::exec::row_position::RowPositionDescriptor;
 use crate::proto as internal_proto;
+use crate::runtime::descriptor_snapshot_thrift::{
+    LookupNodeInfo, LookupNodesInfo, is_lake_row_position,
+};
 #[cfg(feature = "compat")]
 use crate::runtime::lookup::decode_column_ipc;
 use crate::runtime::lookup::{
@@ -45,7 +48,6 @@ use crate::runtime::lookup::{
 };
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::runtime::runtime_state::RuntimeState;
-use crate::thrift::descriptors;
 
 /// Factory for fetch processors that resolve deferred row/slot materialization.
 pub struct FetchProcessorFactory {
@@ -53,7 +55,7 @@ pub struct FetchProcessorFactory {
     node_id: i32,
     target_node_id: i32,
     row_pos_descs: HashMap<i32, RowPositionDescriptor>,
-    nodes_info: Option<descriptors::TNodesInfo>,
+    nodes_info: Option<LookupNodesInfo>,
     output_chunk_schema: ChunkSchemaRef,
 }
 
@@ -62,7 +64,7 @@ impl FetchProcessorFactory {
         node_id: i32,
         target_node_id: i32,
         row_pos_descs: HashMap<i32, RowPositionDescriptor>,
-        nodes_info: Option<descriptors::TNodesInfo>,
+        nodes_info: Option<LookupNodesInfo>,
         output_chunk_schema: ChunkSchemaRef,
     ) -> Self {
         Self {
@@ -100,7 +102,7 @@ struct FetchProcessor {
     node_id: i32,
     target_node_id: i32,
     row_pos_descs: HashMap<i32, RowPositionDescriptor>,
-    nodes_info: Option<descriptors::TNodesInfo>,
+    nodes_info: Option<LookupNodesInfo>,
     output_chunk_schema: ChunkSchemaRef,
     pending_output: Option<Chunk>,
     finishing: bool,
@@ -154,19 +156,19 @@ impl FetchProcessor {
         let Some(query_id) = state.query_id() else {
             return Err("FETCH_NODE requires query_id".to_string());
         };
-        let desc_tbl = query_context_manager()
-            .desc_tbl(query_id)
-            .ok_or_else(|| "descriptor table missing for fetch".to_string())?;
+        let snapshot = query_context_manager()
+            .descriptor_snapshot(query_id)
+            .ok_or_else(|| "descriptor snapshot missing for fetch".to_string())?;
         let output_chunk_schema = self.output_chunk_schema.clone();
 
         let mut fetched_columns: HashMap<SlotId, ArrayRef> = HashMap::new();
         for (tuple_id, row_pos_desc) in &self.row_pos_descs {
-            let lookup_slots = lookup_output_slots(&desc_tbl, *tuple_id, row_pos_desc)?;
+            let lookup_slots = snapshot.lookup_output_slots(*tuple_id, row_pos_desc);
             if lookup_slots.is_empty() {
                 continue;
             }
             let fetch_ref_slots = &row_pos_desc.fetch_ref_slots;
-            let is_lake = row_pos_desc.row_position_type == RowPositionType::Lake;
+            let is_lake = is_lake_row_position(row_pos_desc.row_position_type);
             let expected_ref_slots = if is_lake { 3 } else { 2 };
             if fetch_ref_slots.len() != expected_ref_slots {
                 return Err(format!(
@@ -334,9 +336,9 @@ mod tests {
 
     use super::FetchProcessor;
     use crate::proto as internal_proto;
+    use crate::runtime::descriptor_snapshot_thrift::test_lookup_nodes_info;
     use crate::runtime::query_context::QueryId;
     use crate::service::internal_rpc_client;
-    use crate::thrift::descriptors;
 
     #[test]
     fn test_lookup_remote_uses_nodes_info_async_internal_port() {
@@ -361,15 +363,7 @@ mod tests {
             node_id: 1,
             target_node_id: 2,
             row_pos_descs: HashMap::new(),
-            nodes_info: Some(descriptors::TNodesInfo::new(
-                1,
-                vec![descriptors::TNodeInfo::new(
-                    9,
-                    0,
-                    "remote-host".to_string(),
-                    9911,
-                )],
-            )),
+            nodes_info: Some(test_lookup_nodes_info(9, "remote-host", 9911)),
             pending_output: None,
             finishing: false,
             output_chunk_schema: Arc::new(crate::exec::chunk::ChunkSchema::empty()),
@@ -419,47 +413,9 @@ fn build_scatter_indices(groups: &[(i32, Vec<usize>)], total_rows: usize) -> Vec
     out
 }
 
-fn find_node(
-    nodes_info: &descriptors::TNodesInfo,
-    backend_id: i32,
-) -> Option<&descriptors::TNodeInfo> {
+fn find_node(nodes_info: &LookupNodesInfo, backend_id: i32) -> Option<&LookupNodeInfo> {
     nodes_info
         .nodes
         .iter()
         .find(|node| node.id == backend_id as i64)
-}
-
-fn lookup_output_slots(
-    desc_tbl: &descriptors::TDescriptorTable,
-    tuple_id: i32,
-    row_pos_desc: &RowPositionDescriptor,
-) -> Result<Vec<SlotId>, String> {
-    let slot_descs = desc_tbl
-        .slot_descriptors
-        .as_ref()
-        .ok_or_else(|| "missing slot_descriptors in desc_tbl".to_string())?;
-    let mut ignore: HashSet<SlotId> = HashSet::new();
-    ignore.insert(row_pos_desc.row_source_slot);
-    for slot in &row_pos_desc.fetch_ref_slots {
-        ignore.insert(*slot);
-    }
-    for slot in &row_pos_desc.lookup_ref_slots {
-        ignore.insert(*slot);
-    }
-
-    let mut slots = Vec::new();
-    for s in slot_descs {
-        let (Some(id), Some(parent)) = (s.id, s.parent) else {
-            continue;
-        };
-        if parent != tuple_id {
-            continue;
-        }
-        let slot_id = SlotId::try_from(id)?;
-        if ignore.contains(&slot_id) {
-            continue;
-        }
-        slots.push(slot_id);
-    }
-    Ok(slots)
 }

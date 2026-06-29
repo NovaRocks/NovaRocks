@@ -85,7 +85,7 @@ mod scan_planning_registry_tests {
     use super::ConnectorRegistry;
     use super::scan_planning::{
         BeginScanContext, ConnectorScanPlanner, ScanHandle, Split, SplitPlanningContext,
-        TableHandle, ThriftScanContext, ThriftScanPlan,
+        TableHandle,
     };
 
     #[derive(Debug)]
@@ -109,15 +109,6 @@ mod scan_planning_registry_tests {
             _scan: &ScanHandle,
             _ctx: SplitPlanningContext,
         ) -> Result<Vec<Split>, String> {
-            Err("not used".to_string())
-        }
-
-        fn to_thrift_scan(
-            &self,
-            _scan: &ScanHandle,
-            _splits: &[Split],
-            _ctx: ThriftScanContext,
-        ) -> Result<ThriftScanPlan, String> {
             Err("not used".to_string())
         }
     }

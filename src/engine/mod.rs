@@ -6057,8 +6057,7 @@ enable_path_style_access = true
         layout: &crate::sql::catalog::PhysicalTableLayout,
     ) -> crate::connector::ConnectorRegistry {
         use crate::connector::scan_planning::{
-            BeginScanContext, ConnectorScanPlanner, SplitPlanningContext, ThriftScanContext,
-            ThriftScanPlan,
+            BeginScanContext, ConnectorScanPlanner, SplitPlanningContext,
         };
         use crate::connector::starrocks::table::{
             StarRocksScanHandle, StarRocksSplit, StarRocksTableHandle,
@@ -6103,19 +6102,6 @@ enable_path_style_access = true
                     .iter()
                     .map(|s| crate::connector::scan_planning::Split::new("starrocks", s.clone()))
                     .collect())
-            }
-
-            fn to_thrift_scan(
-                &self,
-                scan: &crate::connector::scan_planning::ScanHandle,
-                splits: &[crate::connector::scan_planning::Split],
-                ctx: ThriftScanContext,
-            ) -> Result<ThriftScanPlan, String> {
-                let planner =
-                    crate::connector::starrocks::table::StarRocksTableScanPlanner::stateless_for_codegen();
-                <crate::connector::starrocks::table::StarRocksTableScanPlanner as ConnectorScanPlanner>::to_thrift_scan(
-                    &planner, scan, splits, ctx,
-                )
             }
         }
 

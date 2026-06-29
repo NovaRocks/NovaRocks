@@ -55,6 +55,7 @@ pub use metadata::{
 pub(crate) use scan_planner::{
     IcebergConnectorScanPlanner, IcebergScanHandle, IcebergSplit, IcebergTableHandle,
 };
+pub(crate) use schema::build_projected_output_schema_from_descriptor;
 pub use schema::{
     IcebergArrowColumn, IcebergPartitionInfo, IcebergSchemaDescriptor,
     IcebergSchemaFieldDescriptor, IcebergTableColumn, IcebergTableDescriptor,

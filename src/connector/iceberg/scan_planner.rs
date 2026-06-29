@@ -75,9 +75,9 @@ pub(crate) fn iceberg_split(split: &Split) -> Result<&IcebergSplit, String> {
 }
 
 use crate::connector::scan_planning::{
-    BeginScanContext, ConnectorScanPlanner, SplitPlanningContext, TableHandle, ThriftScanContext,
-    ThriftScanPlan, validate_split_connectors,
+    BeginScanContext, ConnectorScanPlanner, SplitPlanningContext, TableHandle,
 };
+use crate::sql::codegen::connector_scan_wire::{ThriftScanContext, ThriftScanPlan};
 
 #[derive(Default)]
 pub(crate) struct IcebergConnectorScanPlanner {
@@ -239,22 +239,21 @@ impl ConnectorScanPlanner for IcebergConnectorScanPlanner {
             .map(|file| Split::new(CONNECTOR_ID, IcebergSplit { data_file: file }))
             .collect())
     }
+}
 
-    fn to_thrift_scan(
-        &self,
-        scan: &ScanHandle,
-        splits: &[Split],
-        ctx: ThriftScanContext,
-    ) -> Result<ThriftScanPlan, String> {
-        validate_split_connectors(scan, splits)?;
-        let scan = iceberg_scan_handle(scan)?;
-        let scan_ranges = build_iceberg_scan_ranges(splits, &ctx)?;
-        let node = build_iceberg_hdfs_scan_node(scan, &ctx);
-        Ok(ThriftScanPlan {
-            node: Some(node),
-            scan_ranges,
-        })
-    }
+pub(crate) fn iceberg_to_thrift_scan(
+    scan: &ScanHandle,
+    splits: &[Split],
+    ctx: ThriftScanContext,
+) -> Result<ThriftScanPlan, String> {
+    crate::connector::scan_planning::validate_split_connectors(scan, splits)?;
+    let scan = iceberg_scan_handle(scan)?;
+    let scan_ranges = build_iceberg_scan_ranges(splits, &ctx)?;
+    let node = build_iceberg_hdfs_scan_node(scan, &ctx);
+    Ok(ThriftScanPlan {
+        node: Some(node),
+        scan_ranges,
+    })
 }
 
 fn build_iceberg_scan_ranges(
@@ -560,10 +559,9 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::{Arc, RwLock};
 
-    use crate::connector::scan_planning::{
-        ScanHandle, Split, ThriftScanContext, validate_split_connectors,
-    };
+    use crate::connector::scan_planning::{ScanHandle, Split, validate_split_connectors};
     use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo};
+    use crate::sql::codegen::connector_scan_wire::ThriftScanContext;
     use crate::sql::{Literal, SqlType, TableColumnDef};
     use crate::thrift::plan_nodes;
 
@@ -940,23 +938,22 @@ mod tests {
             .plan_splits(&scan, Default::default())
             .expect("plan_splits");
 
-        let plan = planner
-            .to_thrift_scan(
-                &scan,
-                &splits,
-                ThriftScanContext {
-                    database: "default".to_string(),
-                    table: "orders".to_string(),
-                    node_id: 17,
-                    scan_tuple_id: 2,
-                    cloud_properties: BTreeMap::from([(
-                        "aws.s3.endpoint".to_string(),
-                        "http://localhost:9000".to_string(),
-                    )]),
-                    ..ThriftScanContext::default()
-                },
-            )
-            .expect("to_thrift_scan");
+        let plan = iceberg_to_thrift_scan(
+            &scan,
+            &splits,
+            ThriftScanContext {
+                database: "default".to_string(),
+                table: "orders".to_string(),
+                node_id: 17,
+                scan_tuple_id: 2,
+                cloud_properties: BTreeMap::from([(
+                    "aws.s3.endpoint".to_string(),
+                    "http://localhost:9000".to_string(),
+                )]),
+                ..ThriftScanContext::default()
+            },
+        )
+        .expect("iceberg thrift scan");
 
         let node = plan.node.expect("hdfs scan node");
         assert_eq!(node.node_id, 17);

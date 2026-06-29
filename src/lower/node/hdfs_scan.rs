@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -27,127 +28,30 @@ use crate::connector::iceberg::delete_file::{
 };
 use crate::connector::iceberg::{
     IcebergArrowColumn, IcebergMetadataOutputColumn, IcebergMetadataScanConfig,
-    IcebergMetadataScanRange, IcebergMetadataTableType, IcebergPartitionInfo,
-    IcebergSchemaDescriptor, IcebergSchemaFieldDescriptor, IcebergTableColumn,
-    IcebergTableDescriptor, build_projected_output_schema, lookup_iceberg_table_location,
+    IcebergMetadataScanRange, IcebergMetadataTableType,
+    build_projected_output_schema_from_descriptor, lookup_iceberg_table_location,
     snapshot_iceberg_table_locations,
 };
+use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::formats::parquet::{
     ParquetReadCachePolicy, ParquetSlotKind, VariantPathPruningPredicate, VariantPathSpec,
 };
 use crate::lower::expr::parse_min_max_conjuncts_with_column_resolver;
-use crate::lower::layout::{
-    Layout, chunk_schema_for_layout, col_names_from_layout, find_tuple_descriptor,
-    layout_from_slot_ids,
-};
+use crate::lower::layout::{Layout, layout_from_slot_ids};
 use crate::lower::node::decode::{QueryGlobalDictMap, build_scan_query_global_dicts};
 use crate::lower::node::{Lowered, local_rf_waiting_set};
-use crate::lower::type_lowering::primitive_type_from_desc;
 use crate::novarocks_config::config as novarocks_app_config;
 use crate::novarocks_connectors::{
     ConnectorRegistry, FileFormatConfig, FileScanRange, HdfsScanConfig, OrcScanConfig,
     ParquetScanConfig, ScanConfig,
 };
 use crate::novarocks_logging::{debug, warn};
+use crate::runtime::descriptor_snapshot::{
+    DescriptorLogicalType, DescriptorSlot, DescriptorSnapshot,
+};
+use crate::runtime::descriptor_snapshot_thrift::descriptor_snapshot_from_thrift;
 use crate::thrift::{descriptors, exprs, internal_service, plan_nodes, types};
-
-fn iceberg_schema_field_descriptor_from_thrift(
-    field: &descriptors::TIcebergSchemaField,
-) -> Result<IcebergSchemaFieldDescriptor, String> {
-    let name = field
-        .name
-        .clone()
-        .ok_or_else(|| "iceberg schema field missing name".to_string())?;
-    let children = field
-        .children
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .map(|child| iceberg_schema_field_descriptor_from_thrift(child.as_ref()))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(IcebergSchemaFieldDescriptor {
-        name,
-        field_id: field.field_id,
-        children,
-        initial_default_json: field.initial_default_json.clone(),
-    })
-}
-
-fn iceberg_schema_descriptor_from_thrift(
-    schema: &descriptors::TIcebergSchema,
-) -> Result<IcebergSchemaDescriptor, String> {
-    let fields = schema
-        .fields
-        .as_ref()
-        .ok_or_else(|| "iceberg schema missing fields".to_string())?
-        .iter()
-        .map(iceberg_schema_field_descriptor_from_thrift)
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(IcebergSchemaDescriptor { fields })
-}
-
-fn iceberg_table_descriptor_from_thrift(
-    iceberg: &descriptors::TIcebergTable,
-) -> Result<IcebergTableDescriptor, String> {
-    let columns = iceberg
-        .columns
-        .as_ref()
-        .ok_or_else(|| "iceberg table missing columns".to_string())?
-        .iter()
-        .map(|column| {
-            let data_type = column
-                .type_desc
-                .as_ref()
-                .and_then(crate::types::arrow_thrift::thrift_desc_to_arrow_type)
-                .ok_or_else(|| {
-                    format!("iceberg column {} missing type_desc", column.column_name)
-                })?;
-            Ok(IcebergTableColumn {
-                name: column.column_name.clone(),
-                data_type,
-                nullable: column.is_allow_null.unwrap_or(true),
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let partition_info = iceberg
-        .partition_info
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .map(|info| {
-            Ok(IcebergPartitionInfo {
-                source_column_name: info.source_column_name.clone().ok_or_else(|| {
-                    "iceberg partition_info missing source_column_name".to_string()
-                })?,
-                partition_column_name: info.partition_column_name.clone().ok_or_else(|| {
-                    "iceberg partition_info missing partition_column_name".to_string()
-                })?,
-                transform_expr: info
-                    .transform_expr
-                    .clone()
-                    .ok_or_else(|| "iceberg partition_info missing transform_expr".to_string())?,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-
-    Ok(IcebergTableDescriptor {
-        columns,
-        iceberg_schema: iceberg
-            .iceberg_schema
-            .as_ref()
-            .map(iceberg_schema_descriptor_from_thrift)
-            .transpose()?,
-        equality_delete_schema: iceberg
-            .iceberg_equal_delete_schema
-            .as_ref()
-            .map(iceberg_schema_descriptor_from_thrift)
-            .transpose()?,
-        partition_info,
-        current_snapshot_id: iceberg.current_snapshot_id,
-        serialized_metadata: iceberg.serialized_metadata.clone(),
-    })
-}
 
 /// Cache Iceberg table locations from descriptor table for later use in HDFS scan lowering.
 pub(crate) fn cache_iceberg_table_locations(desc_tbl: Option<&descriptors::TDescriptorTable>) {
@@ -332,37 +236,6 @@ fn scan_ranges_have_position_delete_files(ranges: &[FileScanRange]) -> bool {
             .iter()
             .any(|delete_file| delete_file.file_content == IcebergFileContent::PositionDeletes)
     })
-}
-
-fn is_paimon_table(desc_tbl: &descriptors::TDescriptorTable, tuple_id: types::TTupleId) -> bool {
-    let Ok(tuple_desc) = find_tuple_descriptor(desc_tbl, tuple_id) else {
-        return false;
-    };
-    let Some(table_id) = tuple_desc.table_id else {
-        return false;
-    };
-    let Some(table_descs) = desc_tbl.table_descriptors.as_ref() else {
-        return false;
-    };
-    let Some(table_desc) = table_descs.iter().find(|t| t.id == table_id) else {
-        return false;
-    };
-    table_desc.paimon_table.is_some()
-}
-
-fn find_iceberg_table(
-    desc_tbl: &descriptors::TDescriptorTable,
-    tuple_id: types::TTupleId,
-) -> Option<descriptors::TIcebergTable> {
-    let Ok(tuple_desc) = find_tuple_descriptor(desc_tbl, tuple_id) else {
-        return None;
-    };
-    let table_id = tuple_desc.table_id?;
-    let table_descs = desc_tbl.table_descriptors.as_ref()?;
-    table_descs
-        .iter()
-        .find(|t| t.id == table_id)
-        .and_then(|t| t.iceberg_table.clone())
 }
 
 fn parse_true_false(value: &str) -> Option<bool> {
@@ -550,14 +423,28 @@ fn scan_ranges_have_extended_column(
 #[derive(Clone, Debug)]
 struct HdfsSlotInfo {
     name: String,
-    primitive: types::TPrimitiveType,
+    logical: DescriptorLogicalType,
+    field: Field,
     arrow_type: arrow::datatypes::DataType,
     nullable: bool,
     field_id: Option<i32>,
 }
 
-fn parquet_slot_kind_from_primitive(primitive: types::TPrimitiveType) -> ParquetSlotKind {
-    if primitive == types::TPrimitiveType::VARIANT {
+impl HdfsSlotInfo {
+    fn from_descriptor_slot(slot: &DescriptorSlot) -> Self {
+        Self {
+            name: slot.name.clone(),
+            logical: slot.logical.clone(),
+            field: slot.field.clone(),
+            arrow_type: slot.field.data_type().clone(),
+            nullable: slot.field.is_nullable(),
+            field_id: slot.unique_id,
+        }
+    }
+}
+
+fn parquet_slot_kind_from_logical(logical: &DescriptorLogicalType) -> ParquetSlotKind {
+    if logical.is_variant() {
         ParquetSlotKind::Variant
     } else {
         ParquetSlotKind::Regular
@@ -565,37 +452,55 @@ fn parquet_slot_kind_from_primitive(primitive: types::TPrimitiveType) -> Parquet
 }
 
 fn build_hdfs_slot_info_map(
-    slot_descs: &[descriptors::TSlotDescriptor],
+    snapshot: &DescriptorSnapshot,
     tuple_id: types::TTupleId,
 ) -> Result<HashMap<SlotId, HdfsSlotInfo>, String> {
     let mut slot_info_map: HashMap<SlotId, HdfsSlotInfo> = HashMap::new();
-    for s in slot_descs {
-        let (Some(parent), Some(id), Some(slot_type)) = (s.parent, s.id, s.slot_type.as_ref())
-        else {
-            continue;
-        };
-        if parent != tuple_id {
-            continue;
-        }
-        let name = crate::lower::layout::slot_display_name_from_desc(s);
-        let primitive =
-            primitive_type_from_desc(slot_type).unwrap_or(types::TPrimitiveType::INVALID_TYPE);
-        let arrow_type = crate::lower::type_lowering::arrow_type_from_desc(slot_type)
-            .ok_or_else(|| format!("unsupported slot_type for slot_id={id}"))?;
-        let nullable = s.is_nullable.unwrap_or(true);
-        let field_id = s.col_unique_id.filter(|v| *v > 0);
-        slot_info_map.insert(
-            SlotId::try_from(id)?,
-            HdfsSlotInfo {
-                name,
-                primitive,
-                arrow_type,
-                nullable,
-                field_id,
-            },
-        );
+    for slot_id in snapshot.tuple_slots(tuple_id) {
+        let slot = snapshot.slot(tuple_id, *slot_id).ok_or_else(|| {
+            format!(
+                "missing descriptor slot tuple_id={} slot_id={}",
+                tuple_id, slot_id
+            )
+        })?;
+        slot_info_map.insert(*slot_id, HdfsSlotInfo::from_descriptor_slot(slot));
     }
     Ok(slot_info_map)
+}
+
+fn col_names_from_snapshot_layout(
+    layout: &Layout,
+    slot_info_map: &HashMap<SlotId, HdfsSlotInfo>,
+) -> Result<Vec<String>, String> {
+    layout
+        .order
+        .iter()
+        .map(|(_, raw_slot_id)| {
+            let slot_id = SlotId::try_from(*raw_slot_id)?;
+            let info = slot_info_map
+                .get(&slot_id)
+                .ok_or_else(|| format!("missing slot info for slot_id={slot_id}"))?;
+            Ok(info.name.clone())
+        })
+        .collect()
+}
+
+fn chunk_schema_for_snapshot_layout(
+    layout: &Layout,
+    slot_info_map: &HashMap<SlotId, HdfsSlotInfo>,
+) -> Result<ChunkSchemaRef, String> {
+    let slots = layout
+        .order
+        .iter()
+        .map(|(_, raw_slot_id)| {
+            let slot_id = SlotId::try_from(*raw_slot_id)?;
+            let info = slot_info_map
+                .get(&slot_id)
+                .ok_or_else(|| format!("missing slot info for slot_id={slot_id}"))?;
+            ChunkSlotSchema::from_field(slot_id, &info.field, info.field_id)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Arc::new(ChunkSchema::try_new(slots)?))
 }
 
 #[derive(Clone, Debug, Default)]
@@ -612,7 +517,7 @@ impl HdfsScanReadColumns {
         self.columns.push(info.name.clone());
         self.slot_ids.push(read_slot_id);
         self.slot_kinds
-            .push(parquet_slot_kind_from_primitive(info.primitive));
+            .push(parquet_slot_kind_from_logical(&info.logical));
         self.fields.push(Field::new(
             info.name.clone(),
             info.arrow_type.clone(),
@@ -729,10 +634,10 @@ fn parse_hdfs_scan_variant_path_columns(
                 "HDFS_SCAN_NODE node_id={node_id} variant_path_columns[{idx}] output_slot_id={output_slot_id} has no slot descriptor"
             )
         })?;
-        if source_info.primitive != types::TPrimitiveType::VARIANT {
+        if !source_info.logical.is_variant() {
             return Err(format!(
                 "HDFS_SCAN_NODE node_id={node_id} variant_path_columns[{idx}] source_slot_id={source_slot_id} expects VARIANT, got {:?}",
-                source_info.primitive
+                source_info.logical
             ));
         }
         let source_name = required_variant_path_string(
@@ -1025,19 +930,15 @@ pub(crate) fn lower_hdfs_scan_node(
             node.node_id
         )
     })?;
-    let is_paimon = is_paimon_table(desc_tbl, tuple_id);
+    let desc_snapshot = descriptor_snapshot_from_thrift(desc_tbl)?;
+    let is_paimon = desc_snapshot.is_paimon_table_for_tuple(tuple_id);
     let hive_column_names = hdfs.hive_column_names.clone();
     let orc_use_column_names = query_opts
         .and_then(|opts| opts.orc_use_column_names)
         .unwrap_or(false);
 
-    let columns = col_names_from_layout(desc_tbl, &out_layout)?;
-
-    let slot_descs = desc_tbl
-        .slot_descriptors
-        .as_ref()
-        .ok_or_else(|| "missing slot_descriptors in desc_tbl".to_string())?;
-    let slot_info_map = build_hdfs_slot_info_map(slot_descs, tuple_id)?;
+    let slot_info_map = build_hdfs_slot_info_map(&desc_snapshot, tuple_id)?;
+    let columns = col_names_from_snapshot_layout(&out_layout, &slot_info_map)?;
     let has_row_position_marker_slots = slot_info_map.values().any(|info| {
         crate::exec::row_position::is_row_source_id(&info.name)
             || crate::exec::row_position::is_scan_range_id(&info.name)
@@ -1092,7 +993,7 @@ pub(crate) fn lower_hdfs_scan_node(
             .ok_or_else(|| format!("missing slot info for tuple_id={tuple_id} slot_id={slot_id}"))?
             .clone();
         let name = info.name.clone();
-        let primitive = info.primitive;
+        let logical = info.logical.clone();
         let arrow_type = info.arrow_type.clone();
         let nullable = info.nullable;
         slot_ids.push(slot_id);
@@ -1102,10 +1003,10 @@ pub(crate) fn lower_hdfs_scan_node(
         }
 
         if crate::exec::row_position::is_row_source_id(&name) {
-            if primitive != types::TPrimitiveType::INT {
+            if !logical.is_int32() {
                 return Err(format!(
                     "HDFS_SCAN_NODE node_id={} row_source_id slot_id={} expects INT, got {:?}",
-                    node.node_id, slot_id, primitive
+                    node.node_id, slot_id, logical
                 ));
             }
             row_source_slot = Some(slot_id);
@@ -1113,10 +1014,10 @@ pub(crate) fn lower_hdfs_scan_node(
             continue;
         }
         if crate::exec::row_position::is_scan_range_id(&name) {
-            if primitive != types::TPrimitiveType::INT {
+            if !logical.is_int32() {
                 return Err(format!(
                     "HDFS_SCAN_NODE node_id={} scan_range_id slot_id={} expects INT, got {:?}",
-                    node.node_id, slot_id, primitive
+                    node.node_id, slot_id, logical
                 ));
             }
             scan_range_slot = Some(slot_id);
@@ -1124,10 +1025,10 @@ pub(crate) fn lower_hdfs_scan_node(
             continue;
         }
         if has_row_position_marker_slots && crate::exec::row_position::is_row_id(&name) {
-            if primitive != types::TPrimitiveType::BIGINT {
+            if !logical.is_int64() {
                 return Err(format!(
                     "HDFS_SCAN_NODE node_id={} row_id slot_id={} expects BIGINT, got {:?}",
-                    node.node_id, slot_id, primitive
+                    node.node_id, slot_id, logical
                 ));
             }
             row_id_slot = Some(slot_id);
@@ -1136,10 +1037,10 @@ pub(crate) fn lower_hdfs_scan_node(
         }
         let is_physical_hdfs_column = physical_hdfs_columns.contains(&name.to_ascii_lowercase());
         if !is_physical_hdfs_column && crate::exec::row_position::is_iceberg_file_path(&name) {
-            if primitive != types::TPrimitiveType::VARCHAR {
+            if !matches!(logical, DescriptorLogicalType::Utf8) {
                 return Err(format!(
                     "HDFS_SCAN_NODE node_id={} _file slot_id={} expects VARCHAR, got {:?}",
-                    node.node_id, slot_id, primitive
+                    node.node_id, slot_id, logical
                 ));
             }
             iceberg_virtual_file_slot = Some(slot_id);
@@ -1148,10 +1049,10 @@ pub(crate) fn lower_hdfs_scan_node(
             continue;
         }
         if !is_physical_hdfs_column && crate::exec::row_position::is_iceberg_row_pos(&name) {
-            if primitive != types::TPrimitiveType::BIGINT {
+            if !logical.is_int64() {
                 return Err(format!(
                     "HDFS_SCAN_NODE node_id={} _pos slot_id={} expects BIGINT, got {:?}",
-                    node.node_id, slot_id, primitive
+                    node.node_id, slot_id, logical
                 ));
             }
             iceberg_virtual_pos_slot = Some(slot_id);
@@ -1168,10 +1069,10 @@ pub(crate) fn lower_hdfs_scan_node(
         // requires substantial scaffolding that the integration path already
         // covers more economically.
         if !is_physical_hdfs_column && crate::exec::row_position::is_iceberg_row_id(&name) {
-            if !matches!(arrow_type, arrow::datatypes::DataType::Int64) {
+            if !logical.is_int64() {
                 return Err(format!(
                     "HDFS_SCAN_NODE node_id={} _row_id slot_id={} expects BIGINT, got {:?}",
-                    node.node_id, slot_id, arrow_type
+                    node.node_id, slot_id, logical
                 ));
             }
             iceberg_virtual_row_id_slot = Some(slot_id);
@@ -1183,10 +1084,10 @@ pub(crate) fn lower_hdfs_scan_node(
         if !is_physical_hdfs_column
             && crate::exec::row_position::is_iceberg_last_updated_sequence_number(&name)
         {
-            if !matches!(arrow_type, arrow::datatypes::DataType::Int64) {
+            if !logical.is_int64() {
                 return Err(format!(
                     "HDFS_SCAN_NODE node_id={} _last_updated_sequence_number slot_id={} expects BIGINT, got {:?}",
-                    node.node_id, slot_id, arrow_type
+                    node.node_id, slot_id, logical
                 ));
             }
             iceberg_virtual_last_updated_seq_slot = Some(slot_id);
@@ -1197,10 +1098,10 @@ pub(crate) fn lower_hdfs_scan_node(
         if crate::exec::row_position::is_change_op(&name)
             && scan_ranges_have_extended_column(scan_ranges, slot_id)?
         {
-            if primitive != types::TPrimitiveType::TINYINT {
+            if !logical.is_int8() {
                 return Err(format!(
                     "HDFS_SCAN_NODE node_id={} __change_op slot_id={} expects TINYINT, got {:?}",
-                    node.node_id, slot_id, primitive
+                    node.node_id, slot_id, logical
                 ));
             }
             iceberg_virtual_change_op_slot = Some(slot_id);
@@ -1646,7 +1547,10 @@ pub(crate) fn lower_hdfs_scan_node(
                 crate::connector::ScanConfig::IcebergMetadata(cfg),
             )?
             .with_node_id(node.node_id)
-            .with_output_chunk_schema(chunk_schema_for_layout(desc_tbl, &out_layout)?)
+            .with_output_chunk_schema(chunk_schema_for_snapshot_layout(
+                &out_layout,
+                &slot_info_map,
+            )?)
             .with_limit(limit)
             .with_connector_io_tasks_per_scan_operator(connector_io_tasks_per_scan_operator)
             .with_accept_empty_scan_ranges(true)
@@ -1712,8 +1616,8 @@ pub(crate) fn lower_hdfs_scan_node(
     let external_datacache = DataCacheManager::instance().external_context(cache_options.clone());
     let (enable_file_metacache, enable_file_pagecache) =
         file_cache_flags_from_query_options(query_opts);
-    let iceberg_table = find_iceberg_table(desc_tbl, tuple_id);
-    if iceberg_table.is_some() && scan_format == Some(descriptors::THdfsFileFormat::ORC) {
+    let is_iceberg_table = desc_snapshot.is_iceberg_table_for_tuple(tuple_id);
+    if is_iceberg_table && scan_format == Some(descriptors::THdfsFileFormat::ORC) {
         return Err(format!(
             "HDFS_SCAN_NODE node_id={} does not support Iceberg ORC files; NovaRocks currently only supports Parquet for Iceberg schema/partition evolution",
             node.node_id
@@ -1728,7 +1632,7 @@ pub(crate) fn lower_hdfs_scan_node(
             node.node_id, scan_format
         ));
     }
-    if iceberg_table.is_some()
+    if is_iceberg_table
         && (iceberg_virtual_row_id_slot.is_some()
             || iceberg_virtual_last_updated_seq_slot.is_some())
     {
@@ -1802,15 +1706,15 @@ pub(crate) fn lower_hdfs_scan_node(
             }
         }
     }
-    let iceberg_output_schema = iceberg_table
-        .as_ref()
-        .map(|iceberg| {
-            let descriptor = iceberg_table_descriptor_from_thrift(iceberg)?;
-            build_projected_output_schema(&descriptor, &read_columns.iceberg_projected_columns)
-        })
-        .transpose()?
-        .flatten();
-    let output_chunk_schema = chunk_schema_for_layout(desc_tbl, &out_layout)?;
+    let iceberg_output_schema = if is_iceberg_table {
+        build_projected_output_schema_from_descriptor(
+            desc_snapshot.iceberg_schema_for_tuple(tuple_id),
+            &read_columns.iceberg_projected_columns,
+        )?
+    } else {
+        None
+    };
+    let output_chunk_schema = chunk_schema_for_snapshot_layout(&out_layout, &slot_info_map)?;
     // Parquet reader only materializes physical data columns (iceberg `_file` /
     // `_pos` are synthesized by the scan runner afterwards), so its chunk
     // schema must omit virtual-column slots to keep the column-count check on
@@ -1959,12 +1863,12 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
 
     use super::{
-        HdfsScanReadColumns, HdfsSlotInfo, apply_row_position_pruning_gate,
-        build_hdfs_slot_info_map, extract_change_op_from_extended_columns,
-        file_cache_flags_from_query_options, parse_hdfs_scan_pruning_predicates,
-        parse_hdfs_scan_variant_path_columns, resolve_cloud_object_store_config,
-        scan_ranges_have_position_delete_files, validate_included_positions_full_file_range,
-        variant_path_ensure_source_read_columns,
+        DescriptorLogicalType, HdfsScanReadColumns, HdfsSlotInfo, apply_row_position_pruning_gate,
+        build_hdfs_slot_info_map, descriptor_snapshot_from_thrift,
+        extract_change_op_from_extended_columns, file_cache_flags_from_query_options,
+        parse_hdfs_scan_pruning_predicates, parse_hdfs_scan_variant_path_columns,
+        resolve_cloud_object_store_config, scan_ranges_have_position_delete_files,
+        validate_included_positions_full_file_range, variant_path_ensure_source_read_columns,
     };
 
     #[test]
@@ -2159,10 +2063,36 @@ mod tests {
     ) -> HdfsSlotInfo {
         HdfsSlotInfo {
             name: name.to_string(),
-            primitive,
+            logical: logical_type_for_test(primitive),
+            field: Field::new(name, arrow_type.clone(), nullable),
             arrow_type,
             nullable,
             field_id: None,
+        }
+    }
+
+    fn logical_type_for_test(primitive: types::TPrimitiveType) -> DescriptorLogicalType {
+        match primitive {
+            types::TPrimitiveType::TINYINT => DescriptorLogicalType::Int8,
+            types::TPrimitiveType::SMALLINT => DescriptorLogicalType::Int16,
+            types::TPrimitiveType::INT => DescriptorLogicalType::Int32,
+            types::TPrimitiveType::BIGINT => DescriptorLogicalType::Int64,
+            types::TPrimitiveType::VARCHAR | types::TPrimitiveType::CHAR => {
+                DescriptorLogicalType::Utf8
+            }
+            types::TPrimitiveType::VARIANT => DescriptorLogicalType::Variant,
+            types::TPrimitiveType::JSON => DescriptorLogicalType::Json,
+            types::TPrimitiveType::HLL => DescriptorLogicalType::Hll,
+            types::TPrimitiveType::OBJECT => DescriptorLogicalType::Object,
+            types::TPrimitiveType::DECIMAL256 => DescriptorLogicalType::Decimal256 {
+                precision: 76,
+                scale: 0,
+            },
+            types::TPrimitiveType::DECIMAL128 => DescriptorLogicalType::Decimal128 {
+                precision: 38,
+                scale: 0,
+            },
+            _ => DescriptorLogicalType::Unknown,
         }
     }
 
@@ -2191,6 +2121,27 @@ mod tests {
             None::<String>,
             Some(false),
         )
+    }
+
+    fn test_slot_info_map_from_descs(
+        slot_descs: Vec<descriptors::TSlotDescriptor>,
+        tuple_id: i32,
+    ) -> HashMap<SlotId, HdfsSlotInfo> {
+        let desc = descriptors::TDescriptorTable::new(
+            Some(slot_descs),
+            vec![descriptors::TTupleDescriptor::new(
+                Some(tuple_id),
+                None,
+                None,
+                Some(100),
+                None,
+            )],
+            None::<Vec<descriptors::TTableDescriptor>>,
+            None,
+        );
+        let snapshot =
+            descriptor_snapshot_from_thrift(&desc).expect("descriptor snapshot for test");
+        build_hdfs_slot_info_map(&snapshot, tuple_id).expect("slot info map")
     }
 
     fn test_variant_path_column(
@@ -2310,7 +2261,7 @@ mod tests {
                 None,
             ),
         ];
-        let slot_info = build_hdfs_slot_info_map(&slot_descs, 11).expect("slot info map");
+        let slot_info = test_slot_info_map_from_descs(slot_descs, 11);
 
         let plan =
             parse_hdfs_scan_variant_path_columns(7, Some(variant_columns.as_slice()), &slot_info)
@@ -2341,7 +2292,7 @@ mod tests {
             ),
         ];
 
-        let slot_info = build_hdfs_slot_info_map(&slot_descs, 11).expect("slot info map");
+        let slot_info = test_slot_info_map_from_descs(slot_descs, 11);
 
         assert_eq!(slot_info.get(&SlotId::new(1)).unwrap().field_id, None);
         assert_eq!(slot_info.get(&SlotId::new(2)).unwrap().field_id, None);
