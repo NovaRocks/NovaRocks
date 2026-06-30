@@ -50,6 +50,10 @@ fn verify_node(
         }
         Operator::PhysicalGenerateSeries(op) => verify_generate_series(op),
         Operator::PhysicalCTEConsume(op) => {
+            op.validate_mapping()?;
+            for producer_id in &op.producer_column_ids {
+                verify_output_id(*producer_id, "PhysicalCTEConsume producer mapping")?;
+            }
             Ok(output_ids(op.output_columns.iter().map(|c| c.column_id)))
         }
 
@@ -593,7 +597,7 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
     use crate::sql::optimizer::operator::{
-        AggMode, PhysicalHashAggregateOp, ProjectOp, RepeatOp, ValuesOp,
+        AggMode, CTEConsumeOp, PhysicalHashAggregateOp, ProjectOp, RepeatOp, ValuesOp,
     };
     use crate::sql::optimizer::physical_plan::{PlanExecutionProps, attach_scalar_arena};
     use crate::sql::optimizer::scalar::ScalarArena;
@@ -851,5 +855,34 @@ mod tests {
 
         verify_id_binding(&aggregate)
             .expect("distribution must preserve Repeat grouping output id for aggregate grouping");
+    }
+
+    #[test]
+    fn p3_cte_consume_rejects_mapping_arity_mismatch() {
+        let consumer_a = ColumnId::new_for_test(1);
+        let consumer_b = ColumnId::new_for_test(2);
+        let producer_a = ColumnId::new_for_test(11);
+        let output_columns = vec![int_col(consumer_a, "a"), int_col(consumer_b, "b")];
+        let mut plan = PhysicalPlanNode {
+            op: Operator::PhysicalCTEConsume(CTEConsumeOp {
+                cte_id: 9,
+                alias: "cte9".to_string(),
+                output_columns: output_columns.clone(),
+                producer_column_ids: vec![producer_a],
+            }),
+            children: vec![],
+            stats: Statistics::default(),
+            output_columns,
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+        attach_scalar_arena(&mut plan, Arc::new(ScalarArena::new()));
+
+        let err = verify_id_binding(&plan).expect_err("CTEConsume arity mismatch must fail");
+        assert!(
+            err.contains("CTEConsume output/producers arity mismatch for cte_id=9"),
+            "unexpected err={err}"
+        );
     }
 }
