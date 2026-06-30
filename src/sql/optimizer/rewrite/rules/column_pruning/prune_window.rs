@@ -6,6 +6,7 @@
 
 use std::collections::HashSet;
 
+use crate::sql::analysis::OutputColumn;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::{Operator, WindowOp};
 use crate::sql::optimizer::opt_expr::OptExpr;
@@ -49,6 +50,31 @@ fn validate_window_output_contract(window: &WindowOp) -> Result<HashSet<ColumnId
         }
     }
     Ok(window_ids)
+}
+
+fn validate_retained_required_outputs(
+    needed: &HashSet<ColumnId>,
+    output_columns: &[OutputColumn],
+) -> Result<(), String> {
+    for id in needed {
+        let count = output_columns
+            .iter()
+            .filter(|column| column.column_id == *id)
+            .count();
+        if count == 0 {
+            return Err(format!(
+                "required window output column id {} is missing from retained WindowOp.output_columns",
+                id.0
+            ));
+        }
+        if count > 1 {
+            return Err(format!(
+                "required window output column id {} appears multiple times in retained WindowOp.output_columns",
+                id.0
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl LogicalRewriteRule for PruneWindowColumns {
@@ -131,6 +157,7 @@ impl LogicalRewriteRule for PruneWindowColumns {
                         && needed.contains(&column.column_id))
             })
             .collect();
+        validate_retained_required_outputs(&needed, &retained_output_columns)?;
 
         if retained_window_exprs.len() == original_window_expr_len
             && retained_output_columns.len() == original_output_len
@@ -333,6 +360,32 @@ mod tests {
         let err = PruneWindowColumns.apply(expr, &mut ctx()).unwrap_err();
 
         assert!(err.contains("required window output column id 999 is not produced by WindowOp"));
+    }
+
+    #[test]
+    fn prune_window_errors_when_required_child_id_is_missing_from_window_outputs() {
+        let id_a = ColumnId::new_for_test(1);
+        let id_rn = ColumnId::new_for_test(101);
+        let mut needed = HashSet::new();
+        needed.insert(id_a);
+        needed.insert(id_rn);
+
+        let mut expr = OptExpr::new(
+            Operator::LogicalWindow(WindowOp {
+                window_exprs: vec![make_window_spec(id_rn, "row_number")],
+                output_columns: vec![make_output_column(id_rn, "rn")],
+            }),
+            vec![dummy_input_with_columns(vec![make_output_column(
+                id_a, "a",
+            )])],
+        );
+        expr.required_output_columns = Some(needed);
+
+        let err = PruneWindowColumns.apply(expr, &mut ctx()).unwrap_err();
+
+        assert!(
+            err.contains("required window output column id 1 is missing from retained WindowOp")
+        );
     }
 
     #[test]
