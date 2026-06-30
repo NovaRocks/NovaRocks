@@ -234,8 +234,7 @@ pub(crate) fn rewrite_join_delta_coalesce_query_with_branch_queries_and_locator(
     Ok(parsed)
 }
 
-#[cfg(test)]
-pub(crate) fn rewrite_join_full_refresh_apply_query(
+pub(super) fn rewrite_join_full_refresh_apply_query(
     query: &sqlparser::ast::Query,
     full_refresh_query: sqlparser::ast::Query,
     left_uuid: &str,
@@ -252,7 +251,7 @@ pub(crate) fn rewrite_join_full_refresh_apply_query(
 }
 
 #[cfg(test)]
-pub(crate) fn rewrite_join_delta_append_only_query(
+pub(super) fn rewrite_join_delta_append_only_query(
     query: &sqlparser::ast::Query,
     branch_query: sqlparser::ast::Query,
     left_uuid: &str,

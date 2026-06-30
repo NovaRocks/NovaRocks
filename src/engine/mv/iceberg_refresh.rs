@@ -10665,7 +10665,6 @@ fn join_full_refresh_uses_logical_plan() -> bool {
     )
 }
 
-#[cfg(test)]
 fn rewrite_join_full_refresh_query(
     query: &mut sqlparser::ast::Query,
     left_ref: &IcebergTableRef,
@@ -10699,7 +10698,6 @@ fn rewrite_join_full_refresh_query(
     append_join_apply_hidden_projection(select, left_alias, right_alias, true)
 }
 
-#[cfg(test)]
 fn append_join_apply_hidden_projection(
     select: &mut sqlparser::ast::Select,
     left_alias: &str,
@@ -10740,7 +10738,6 @@ fn append_join_apply_hidden_projection(
     Ok(())
 }
 
-#[cfg(test)]
 fn join_row_id_select_item(alias: &str, output: &str) -> sqlparser::ast::SelectItem {
     sqlparser::ast::SelectItem::ExprWithAlias {
         expr: sqlparser::ast::Expr::CompoundIdentifier(vec![
