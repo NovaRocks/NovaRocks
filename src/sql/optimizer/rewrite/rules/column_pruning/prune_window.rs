@@ -88,9 +88,18 @@ impl LogicalRewriteRule for PruneWindowColumns {
         let input = children.remove(0);
         let original_window_expr_len = node.window_exprs.len();
         let original_output_len = node.output_columns.len();
-        validate_window_output_contract(&node)?;
+        let window_ids = validate_window_output_contract(&node)?;
 
         let child_output_ids = collect_output_ids_opt(&input);
+        for id in &needed {
+            if !child_output_ids.contains(id) && !window_ids.contains(id) {
+                return Err(format!(
+                    "required window output column id {} is not produced by WindowOp",
+                    id.0
+                ));
+            }
+        }
+
         let retained_window_exprs: Vec<_> = node
             .window_exprs
             .into_iter()
@@ -98,6 +107,14 @@ impl LogicalRewriteRule for PruneWindowColumns {
             .collect();
 
         if retained_window_exprs.is_empty() {
+            let mut input = input;
+            input.required_output_columns = Some(
+                needed
+                    .iter()
+                    .copied()
+                    .filter(|id| child_output_ids.contains(id))
+                    .collect(),
+            );
             return Ok(RewriteResult::Changed(input));
         }
 
@@ -251,16 +268,21 @@ mod tests {
     #[test]
     fn prune_window_eliminates_node_when_no_window_expr_is_required() {
         let id_a = ColumnId::new_for_test(1);
+        let id_b = ColumnId::new_for_test(2);
         let id_rn = ColumnId::new_for_test(101);
         let mut needed = HashSet::new();
         needed.insert(id_a);
 
-        let input = dummy_input_with_columns(vec![make_output_column(id_a, "a")]);
+        let input = dummy_input_with_columns(vec![
+            make_output_column(id_a, "a"),
+            make_output_column(id_b, "b"),
+        ]);
         let mut expr = OptExpr::new(
             Operator::LogicalWindow(WindowOp {
                 window_exprs: vec![make_window_spec(id_rn, "row_number")],
                 output_columns: vec![
                     make_output_column(id_a, "a"),
+                    make_output_column(id_b, "b"),
                     make_output_column(id_rn, "rn"),
                 ],
             }),
@@ -276,6 +298,41 @@ mod tests {
             !matches!(changed.op, Operator::LogicalWindow(_)),
             "Window must be removed when no window output is required"
         );
+        let Operator::LogicalScan(scan) = changed.op else {
+            panic!("expected the replacement to be the child scan");
+        };
+        let scan_output_ids: Vec<_> = scan.columns.iter().map(|c| c.column_id).collect();
+        assert_eq!(scan_output_ids, vec![id_a, id_b]);
+        let mut child_needed = HashSet::new();
+        child_needed.insert(id_a);
+        assert_eq!(changed.required_output_columns, Some(child_needed));
+    }
+
+    #[test]
+    fn prune_window_errors_when_required_id_is_not_produced_by_window() {
+        let id_a = ColumnId::new_for_test(1);
+        let id_rn = ColumnId::new_for_test(101);
+        let id_missing = ColumnId::new_for_test(999);
+        let mut needed = HashSet::new();
+        needed.insert(id_missing);
+
+        let mut expr = OptExpr::new(
+            Operator::LogicalWindow(WindowOp {
+                window_exprs: vec![make_window_spec(id_rn, "row_number")],
+                output_columns: vec![
+                    make_output_column(id_a, "a"),
+                    make_output_column(id_rn, "rn"),
+                ],
+            }),
+            vec![dummy_input_with_columns(vec![make_output_column(
+                id_a, "a",
+            )])],
+        );
+        expr.required_output_columns = Some(needed);
+
+        let err = PruneWindowColumns.apply(expr, &mut ctx()).unwrap_err();
+
+        assert!(err.contains("required window output column id 999 is not produced by WindowOp"));
     }
 
     #[test]
