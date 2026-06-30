@@ -782,10 +782,10 @@ impl HashJoinBuildSinkOperator {
             let mut seen_hosts = HashSet::new();
             if use_merge_nodes {
                 for addr in &spec.merge_nodes {
-                    if addr.hostname.is_empty() {
+                    if addr.host.is_empty() {
                         continue;
                     }
-                    if !seen_hosts.insert(addr.hostname.clone()) {
+                    if !seen_hosts.insert(addr.host.clone()) {
                         continue;
                     }
                     let req =
@@ -803,12 +803,11 @@ impl HashJoinBuildSinkOperator {
                             ..Default::default()
                         };
                     let dest_port = addr.port as u16;
-                    if let Err(e) =
-                        exchange_sender::send_runtime_filter(&addr.hostname, dest_port, req)
+                    if let Err(e) = exchange_sender::send_runtime_filter(&addr.host, dest_port, req)
                     {
                         warn!(
                             "send runtime filter failed: dest={} filter_id={} err={}",
-                            addr.hostname,
+                            addr.host,
                             filter.filter_id(),
                             e
                         );

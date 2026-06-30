@@ -20,7 +20,9 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field};
 
 use crate::exec::expr::{ExprArena, ExprNode};
-use crate::exec::node::join::{JoinDistributionMode, JoinNode, JoinRuntimeFilterSpec, JoinType};
+use crate::exec::node::join::{
+    JoinDistributionMode, JoinNode, JoinRuntimeFilterSpec, JoinType, RuntimeFilterMergeNode,
+};
 use crate::exec::node::{ExecNode, ExecNodeKind};
 
 use crate::lower::expr::lower_t_expr;
@@ -56,6 +58,19 @@ fn common_join_key_type(left: &DataType, right: &DataType) -> Result<Option<Data
         }
         _ => Ok(Some(wider_type(left, right))),
     }
+}
+
+fn lower_runtime_filter_merge_nodes(
+    nodes: Option<&[types::TNetworkAddress]>,
+) -> Vec<RuntimeFilterMergeNode> {
+    nodes
+        .unwrap_or_default()
+        .iter()
+        .map(|addr| RuntimeFilterMergeNode {
+            host: addr.hostname.clone(),
+            port: addr.port,
+        })
+        .collect()
 }
 
 /// Lower a HASH_JOIN_NODE plan node to a `Lowered` ExecNode.
@@ -301,7 +316,8 @@ pub(crate) fn lower_hash_join_node(
             let Some(ExprNode::SlotId(probe_slot_id)) = arena.node(*probe_key) else {
                 continue;
             };
-            let merge_nodes = desc.runtime_filter_merge_nodes.clone().unwrap_or_default();
+            let merge_nodes =
+                lower_runtime_filter_merge_nodes(desc.runtime_filter_merge_nodes.as_deref());
             let has_remote_targets = desc.has_remote_targets.unwrap_or(false);
             runtime_filters.push(JoinRuntimeFilterSpec {
                 filter_id,
@@ -394,6 +410,28 @@ mod tests {
         assert_eq!(
             common_join_key_type(&DataType::Int32, &DataType::Int64).unwrap(),
             Some(DataType::Int64)
+        );
+    }
+
+    #[test]
+    fn lower_runtime_filter_merge_nodes_preserves_host_and_port() {
+        let merge_nodes = vec![
+            types::TNetworkAddress::new("merge-a".to_string(), 18090),
+            types::TNetworkAddress::new("".to_string(), 18091),
+        ];
+
+        assert_eq!(
+            lower_runtime_filter_merge_nodes(Some(&merge_nodes)),
+            vec![
+                crate::exec::node::join::RuntimeFilterMergeNode {
+                    host: "merge-a".to_string(),
+                    port: 18090,
+                },
+                crate::exec::node::join::RuntimeFilterMergeNode {
+                    host: "".to_string(),
+                    port: 18091,
+                },
+            ]
         );
     }
 }

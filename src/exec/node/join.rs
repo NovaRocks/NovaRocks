@@ -18,7 +18,6 @@ use crate::common::ids::SlotId;
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::expr::ExprId;
 use crate::exec::node::ExecNode;
-use crate::thrift::types;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum JoinType {
@@ -39,13 +38,19 @@ pub enum JoinDistributionMode {
     Partitioned,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RuntimeFilterMergeNode {
+    pub host: String,
+    pub port: i32,
+}
+
 #[derive(Clone, Debug)]
 pub struct JoinRuntimeFilterSpec {
     pub filter_id: i32,
     pub expr_order: usize,
     pub probe_slot_id: SlotId,
     pub build_data_type: arrow::datatypes::DataType,
-    pub merge_nodes: Vec<types::TNetworkAddress>,
+    pub merge_nodes: Vec<RuntimeFilterMergeNode>,
     pub has_remote_targets: bool,
 }
 
