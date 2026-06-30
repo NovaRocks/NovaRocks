@@ -782,6 +782,7 @@ mod tests {
             ),
             stream_kind,
             edge_kind: FragmentEdgeKind::Stream,
+            output_slot_ids: Vec::new(),
         }
     }
 

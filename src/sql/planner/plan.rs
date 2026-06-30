@@ -302,6 +302,7 @@ pub(crate) enum ExchangeFlavor {
     },
     CteMulticast {
         cte_id: CteId,
+        receive_producer_column_ids: Vec<crate::sql::column_id::ColumnId>,
     },
 }
 

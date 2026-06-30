@@ -155,9 +155,11 @@ impl ExecutionCoordinator {
         // ---------------------------------------------------------------
         // Stream producer fragment id -> its single outgoing edge index.
         let mut stream_edge_by_source: BTreeMap<FragmentId, &FragmentEdge> = BTreeMap::new();
-        // CTE id -> list of (consumer_fragment_id, exchange_node_id, partition).
-        let mut cte_consumers: BTreeMap<CteId, Vec<(FragmentId, i32, partitions::TDataPartition)>> =
-            BTreeMap::new();
+        // CTE id -> list of (consumer_fragment_id, exchange_node_id, partition, output_slot_ids).
+        let mut cte_consumers: BTreeMap<
+            CteId,
+            Vec<(FragmentId, i32, partitions::TDataPartition, Vec<i32>)>,
+        > = BTreeMap::new();
 
         for e in &edges {
             match &e.edge_kind {
@@ -173,11 +175,12 @@ impl ExecutionCoordinator {
                         ));
                     }
                 }
-                FragmentEdgeKind::CteMulticast { cte_id } => {
+                FragmentEdgeKind::CteMulticast { cte_id, .. } => {
                     cte_consumers.entry(*cte_id).or_default().push((
                         e.target_fragment_id,
                         e.target_exchange_node_id,
                         e.output_partition.clone(),
+                        e.output_slot_ids.clone(),
                     ));
                 }
             }
@@ -185,13 +188,18 @@ impl ExecutionCoordinator {
         // CTE consumers may also be expressed via `cte_exchange_nodes` on the
         // consumer fragment when no explicit edge carries them.
         for fr in &fragment_results {
-            for (cte_id, exchange_node_id) in &fr.cte_exchange_nodes {
+            for (cte_id, exchange_node_id, _receive_producer_column_ids) in &fr.cte_exchange_nodes {
                 let consumers = cte_consumers.entry(*cte_id).or_default();
                 if !consumers
                     .iter()
-                    .any(|(fid, nid, _)| *fid == fr.fragment_id && *nid == *exchange_node_id)
+                    .any(|(fid, nid, _, _)| *fid == fr.fragment_id && *nid == *exchange_node_id)
                 {
-                    consumers.push((fr.fragment_id, *exchange_node_id, unpartitioned_partition()));
+                    consumers.push((
+                        fr.fragment_id,
+                        *exchange_node_id,
+                        unpartitioned_partition(),
+                        Vec::new(),
+                    ));
                 }
             }
         }
@@ -321,14 +329,21 @@ impl ExecutionCoordinator {
                     }
                     let mut sinks = Vec::with_capacity(consumers.len());
                     let mut destinations = Vec::with_capacity(consumers.len());
-                    for (consumer_fragment_id, exchange_node_id, partition) in &consumers {
+                    for (consumer_fragment_id, exchange_node_id, partition, output_slot_ids) in
+                        &consumers
+                    {
+                        let output_columns = if output_slot_ids.is_empty() {
+                            None::<Vec<i32>>
+                        } else {
+                            Some(output_slot_ids.clone())
+                        };
                         let stream_sink = data_sinks::TDataStreamSink::new(
                             *exchange_node_id,
                             partition.clone(),
                             None::<bool>,
                             None::<bool>,
                             None::<i32>,
-                            None::<Vec<i32>>,
+                            output_columns,
                             None::<i64>,
                         );
                         sinks.push(stream_sink);

@@ -1,6 +1,7 @@
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{OutputColumn, TypedExpr};
 use crate::sql::codegen::FragmentId;
+use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::scalar::ScalarArena;
 use std::sync::Arc;
 
@@ -64,7 +65,7 @@ pub(crate) struct PlanFragment {
     pub output_exprs: Option<Vec<TypedExpr>>,
     pub output_columns: Vec<OutputColumn>,
     pub cte_id: Option<CteId>,
-    pub cte_exchange_nodes: Vec<(CteId, i32)>,
+    pub cte_exchange_nodes: Vec<(CteId, i32, Vec<ColumnId>)>,
 }
 
 #[derive(Clone, Debug)]

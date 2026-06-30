@@ -29,6 +29,7 @@ use crate::thrift::partitions;
 use crate::thrift::plan_nodes;
 
 use super::analysis::cte::CteId;
+use super::column_id::ColumnId;
 
 pub(crate) type FragmentId = u32;
 
@@ -93,7 +94,10 @@ pub(crate) struct OutputColumn {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FragmentEdgeKind {
     Stream,
-    CteMulticast { cte_id: CteId },
+    CteMulticast {
+        cte_id: CteId,
+        receive_producer_column_ids: Vec<ColumnId>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,6 +118,7 @@ pub(crate) struct FragmentEdge {
     pub output_partition: partitions::TDataPartition,
     pub stream_kind: FragmentStreamKind,
     pub edge_kind: FragmentEdgeKind,
+    pub output_slot_ids: Vec<i32>,
 }
 
 pub(crate) struct MultiFragmentBuildResult {
@@ -160,8 +165,8 @@ pub(crate) struct FragmentBuildResult {
     /// CTE ID if this is a multicast fragment.
     pub cte_id: Option<CteId>,
     /// Exchange node IDs in this fragment that consume from CTE fragments:
-    /// `(cte_id, exchange_node_id)`.
-    pub cte_exchange_nodes: Vec<(CteId, i32)>,
+    /// `(cte_id, exchange_node_id, receive_producer_column_ids)`.
+    pub cte_exchange_nodes: Vec<(CteId, i32, Vec<ColumnId>)>,
     /// Per-fragment global dictionaries emitted to `TPlanFragment.query_global_dicts`.
     /// Populated by the fragment builder when a scan exposes a dict-encoded slot.
     /// `None` when this fragment has no dictionary-encoded slots.

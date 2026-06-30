@@ -13,6 +13,7 @@ use crate::sql::codegen::scalar_materialize::{
     materialize_sort_keys, materialize_window_exprs,
 };
 use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind};
+use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::cost::{CostInput, broadcast_decision, compute_cost_estimate};
 use crate::sql::optimizer::derive::PropertyAlternativeKind;
 use crate::sql::optimizer::operator::{
@@ -852,6 +853,7 @@ impl<'a> DistributedPlanBuilder<'a> {
             output_partition: tdata_partition_placeholder(partition_type),
             stream_kind,
             edge_kind: FragmentEdgeKind::Stream,
+            output_slot_ids: Vec::new(),
         });
 
         let mut exchange = build_exchange(child_fragment_id);
@@ -930,6 +932,14 @@ impl<'a> DistributedPlanBuilder<'a> {
             .copied()
             .ok_or_else(|| format!("CTE consume references unknown cte_id={}", op.cte_id))?;
         let cte_fragment_id = self.completed_fragments[cte_frag_idx].fragment_id;
+        op.validate_mapping()?;
+        if op.output_columns.len() != op.producer_column_ids.len() {
+            return Err(format!(
+                "CTE multicast receive/output arity mismatch for cte_id={}",
+                op.cte_id
+            ));
+        }
+        let receive_producer_column_ids = op.producer_column_ids.clone();
 
         let exchange_node_id = self.alloc_node();
         let exchange_tuple_id = self.alloc_tuple();
@@ -943,7 +953,11 @@ impl<'a> DistributedPlanBuilder<'a> {
                 partitions::TPartitionType::UNPARTITIONED,
             ),
             stream_kind: FragmentStreamKind::Broadcast,
-            edge_kind: FragmentEdgeKind::CteMulticast { cte_id: op.cte_id },
+            edge_kind: FragmentEdgeKind::CteMulticast {
+                cte_id: op.cte_id,
+                receive_producer_column_ids: receive_producer_column_ids.clone(),
+            },
+            output_slot_ids: Vec::new(),
         });
 
         Ok(DistributedPlanNode {
@@ -963,7 +977,10 @@ impl<'a> DistributedPlanBuilder<'a> {
                 source_fragment_id: cte_fragment_id,
                 output_columns: op.output_columns.clone(),
                 output_qualifier: Some(op.alias.clone()),
-                flavor: ExchangeFlavor::CteMulticast { cte_id: op.cte_id },
+                flavor: ExchangeFlavor::CteMulticast {
+                    cte_id: op.cte_id,
+                    receive_producer_column_ids,
+                },
             }),
         })
     }
@@ -1332,17 +1349,23 @@ pub(crate) fn build_distributed_plan(plan: &PhysicalPlanNode) -> Result<Distribu
     })
 }
 
-fn collect_cte_exchange_nodes(node: &DistributedPlanNode) -> Vec<(CteId, i32)> {
+fn collect_cte_exchange_nodes(node: &DistributedPlanNode) -> Vec<(CteId, i32, Vec<ColumnId>)> {
     let mut nodes = Vec::new();
     collect_cte_exchange_nodes_inner(node, &mut nodes);
     nodes
 }
 
-fn collect_cte_exchange_nodes_inner(node: &DistributedPlanNode, nodes: &mut Vec<(CteId, i32)>) {
+fn collect_cte_exchange_nodes_inner(
+    node: &DistributedPlanNode,
+    nodes: &mut Vec<(CteId, i32, Vec<ColumnId>)>,
+) {
     if let PlanNodeKind::Exchange(exchange) = &node.kind
-        && let ExchangeFlavor::CteMulticast { cte_id } = exchange.flavor
+        && let ExchangeFlavor::CteMulticast {
+            cte_id,
+            receive_producer_column_ids,
+        } = &exchange.flavor
     {
-        nodes.push((cte_id, node.node_id));
+        nodes.push((*cte_id, node.node_id, receive_producer_column_ids.clone()));
     }
     for child in &node.children {
         collect_cte_exchange_nodes_inner(child, nodes);
@@ -1358,13 +1381,14 @@ mod tests {
     use super::build_distributed_plan;
     use crate::sql::analysis::cte::CteId;
     use crate::sql::analysis::{
-        BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, SortItem, TypedExpr,
+        BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, SortItem, TypedExpr,
     };
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
         AssertOneRowOp, CTEAnchorOp, CTEConsumeOp, CTEProduceOp, FilterOp, LimitOp, Operator,
-        PhysicalDistributionOp, ProjectOp, ScanOp, SortOp, TopNOp, TopNPhase, UnionOp, WindowOp,
+        PhysicalDistributionOp, PhysicalNestLoopJoinOp, ProjectOp, ScanOp, SortOp, TopNOp,
+        TopNPhase, UnionOp, ValuesOp, WindowOp,
     };
     use crate::sql::optimizer::physical_plan::{
         PhysicalPlanNode, PlanExecutionProps, attach_scalar_arena,
@@ -1560,6 +1584,58 @@ mod tests {
             exchange.stats.cost_estimate.is_none(),
             "synthetic CTE multicast exchange should not display PhysicalCTEConsume cost"
         );
+    }
+
+    #[test]
+    fn cte_multicast_edges_carry_per_consumer_receive_columns() {
+        let p0 = output_col(100, "p0", DataType::Int64, false);
+        let p1 = output_col(101, "p1", DataType::Int64, false);
+        let p2 = output_col(102, "p2", DataType::Int64, false);
+        let produce = scan_plan_with_explicit_columns(vec![p0.clone(), p1, p2.clone()]);
+
+        let left = output_col(200, "left_p0", DataType::Int64, false);
+        let right = output_col(300, "right_p2", DataType::Int64, false);
+        let left_consume = physical_node(
+            Operator::PhysicalCTEConsume(CTEConsumeOp {
+                cte_id: 1,
+                alias: "cte_left".to_string(),
+                output_columns: vec![left.clone()],
+                producer_column_ids: vec![p0.column_id],
+            }),
+            vec![],
+            vec![left],
+        );
+        let right_consume = physical_node(
+            Operator::PhysicalCTEConsume(CTEConsumeOp {
+                cte_id: 1,
+                alias: "cte_right".to_string(),
+                output_columns: vec![right.clone()],
+                producer_column_ids: vec![p2.column_id],
+            }),
+            vec![],
+            vec![right],
+        );
+        let consume = physical_passthrough_join_for_cte_receive_test(left_consume, right_consume);
+        let anchor = cte_anchor_plan(produce, consume);
+
+        let dp = build_distributed_plan(&anchor).expect("build_distributed_plan");
+        let mut receive_lists = dp
+            .edges
+            .iter()
+            .filter_map(|edge| match &edge.edge_kind {
+                super::FragmentEdgeKind::CteMulticast {
+                    cte_id,
+                    receive_producer_column_ids,
+                } => {
+                    assert_eq!(*cte_id, 1);
+                    Some(receive_producer_column_ids.clone())
+                }
+                super::FragmentEdgeKind::Stream => None,
+            })
+            .collect::<Vec<_>>();
+        receive_lists.sort();
+
+        assert_eq!(receive_lists, vec![vec![p0.column_id], vec![p2.column_id]]);
     }
 
     #[test]
@@ -1787,6 +1863,33 @@ mod tests {
                 producer_column_ids: output_columns.iter().map(|c| c.column_id).collect(),
             }),
             vec![],
+            output_columns,
+        )
+    }
+
+    fn scan_plan_with_explicit_columns(output_columns: Vec<OutputColumn>) -> PhysicalPlanNode {
+        physical_node(
+            Operator::PhysicalValues(ValuesOp {
+                rows: vec![],
+                columns: output_columns.clone(),
+            }),
+            vec![],
+            output_columns,
+        )
+    }
+
+    fn physical_passthrough_join_for_cte_receive_test(
+        left: PhysicalPlanNode,
+        right: PhysicalPlanNode,
+    ) -> PhysicalPlanNode {
+        let mut output_columns = left.output_columns.clone();
+        output_columns.extend(right.output_columns.clone());
+        physical_node(
+            Operator::PhysicalNestLoopJoin(PhysicalNestLoopJoinOp {
+                join_type: JoinKind::Inner,
+                condition: None,
+            }),
+            vec![left, right],
             output_columns,
         )
     }

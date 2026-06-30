@@ -913,7 +913,8 @@ mod tests {
             &fragment.plan,
             fragment.direct_exec.is_some(),
         );
-        for (cte_id, exchange_node_id) in &fragment.cte_exchange_nodes {
+        for (cte_id, exchange_node_id, _receive_producer_column_ids) in &fragment.cte_exchange_nodes
+        {
             assert!(
                 node_ids.contains(exchange_node_id),
                 "{case_name}: fragment {} cte_id {} references missing exchange node {}",
@@ -1058,7 +1059,10 @@ mod tests {
                     edge.source_fragment_id, edge.target_fragment_id,
                     "{case_name}: stream edge {idx} must cross fragments"
                 ),
-                FragmentEdgeKind::CteMulticast { cte_id } => {
+                FragmentEdgeKind::CteMulticast {
+                    cte_id,
+                    receive_producer_column_ids,
+                } => {
                     assert_eq!(
                         cte_id_by_fragment.get(&edge.source_fragment_id),
                         Some(cte_id),
@@ -1066,12 +1070,18 @@ mod tests {
                     );
                     assert!(
                         target.cte_exchange_nodes.iter().any(
-                            |(target_cte_id, exchange_node_id)| {
+                            |(
+                                target_cte_id,
+                                exchange_node_id,
+                                target_receive_producer_column_ids,
+                            )| {
                                 target_cte_id == cte_id
                                     && *exchange_node_id == edge.target_exchange_node_id
+                                    && target_receive_producer_column_ids
+                                        == receive_producer_column_ids
                             }
                         ),
-                        "{case_name}: CTE edge {idx} target fragment must record exchange node"
+                        "{case_name}: CTE edge {idx} target fragment must record exchange node and receive columns"
                     );
                 }
             }

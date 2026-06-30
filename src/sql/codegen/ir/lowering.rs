@@ -427,9 +427,13 @@ fn validate_edge_target_node(
             Ok(())
         }
         (
-            crate::sql::codegen::FragmentEdgeKind::CteMulticast { cte_id },
+            crate::sql::codegen::FragmentEdgeKind::CteMulticast {
+                cte_id,
+                receive_producer_column_ids,
+            },
             super::kind::ExchangeFlavor::CteMulticast {
                 cte_id: exchange_cte_id,
+                receive_producer_column_ids: exchange_receive_producer_column_ids,
             },
         ) => {
             if cte_id != exchange_cte_id {
@@ -437,6 +441,15 @@ fn validate_edge_target_node(
                     "lower_distributed_plan CTE multicast edge cte_id={} does not match Exchange cte_id={} for target_exchange_node_id={} in target fragment id={}",
                     cte_id,
                     exchange_cte_id,
+                    edge.target_exchange_node_id,
+                    target_fragment.fragment_id
+                ));
+            }
+            if receive_producer_column_ids != exchange_receive_producer_column_ids {
+                return Err(format!(
+                    "lower_distributed_plan CTE multicast edge receive_producer_column_ids={:?} does not match Exchange receive_producer_column_ids={:?} for target_exchange_node_id={} in target fragment id={}",
+                    receive_producer_column_ids,
+                    exchange_receive_producer_column_ids,
                     edge.target_exchange_node_id,
                     target_fragment.fragment_id
                 ));
@@ -667,11 +680,27 @@ fn target_exchange_for_edge<'a>(
         | (
             crate::sql::codegen::FragmentEdgeKind::Stream,
             super::kind::ExchangeFlavor::TopNSplit { .. },
-        )
-        | (
-            crate::sql::codegen::FragmentEdgeKind::CteMulticast { .. },
-            super::kind::ExchangeFlavor::CteMulticast { .. },
         ) => Ok(exchange),
+        (
+            crate::sql::codegen::FragmentEdgeKind::CteMulticast {
+                cte_id,
+                receive_producer_column_ids,
+            },
+            super::kind::ExchangeFlavor::CteMulticast {
+                cte_id: exchange_cte_id,
+                receive_producer_column_ids: exchange_receive_producer_column_ids,
+            },
+        ) => {
+            if cte_id != exchange_cte_id
+                || receive_producer_column_ids != exchange_receive_producer_column_ids
+            {
+                return Err(format!(
+                    "lower_distributed_plan CTE multicast edge metadata does not match Exchange metadata for target_exchange_node_id={} in target fragment id={}",
+                    edge.target_exchange_node_id, target_fragment.fragment_id
+                ));
+            }
+            Ok(exchange)
+        }
         (crate::sql::codegen::FragmentEdgeKind::Stream, _) => Err(format!(
             "lower_distributed_plan stream edge target_exchange_node_id={} in target fragment id={} must target stream Exchange",
             edge.target_exchange_node_id, target_fragment.fragment_id
@@ -5604,6 +5633,7 @@ mod tests {
             ),
             stream_kind: FragmentStreamKind::Gather,
             edge_kind: FragmentEdgeKind::Stream,
+            output_slot_ids: Vec::new(),
         }
     }
 
