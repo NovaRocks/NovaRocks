@@ -1,6 +1,8 @@
 //! Transitional helpers between analyzer/planner expression wrappers and
 //! memo-native `ScalarId` wrappers.
 
+use std::collections::HashSet;
+
 use arrow::datatypes::DataType;
 
 use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
@@ -184,13 +186,38 @@ pub(crate) fn intern_window_exprs(
         .collect()
 }
 
+fn window_output_column<'a>(
+    expr: &ScalarWindowSpec,
+    output_columns: &'a [OutputColumn],
+) -> &'a OutputColumn {
+    assert!(
+        expr.output_column_id != ColumnId::UNSET,
+        "ScalarWindowSpec {} must carry output_column_id before materialization",
+        expr.name
+    );
+    let mut matches = output_columns
+        .iter()
+        .filter(|column| column.column_id == expr.output_column_id);
+    let output_column = matches.next().unwrap_or_else(|| {
+        panic!(
+            "window output column id {} missing from WindowOp.output_columns",
+            expr.output_column_id.0
+        )
+    });
+    assert!(
+        matches.next().is_none(),
+        "duplicate window output column id {}",
+        expr.output_column_id.0
+    );
+    output_column
+}
+
 pub(crate) fn materialize_window_expr(
     arena: &ScalarArena,
     expr: &ScalarWindowSpec,
-    output_column: Option<&OutputColumn>,
+    output_columns: &[OutputColumn],
 ) -> WindowExpr {
-    let output_column =
-        output_column.expect("window ScalarId bridge requires output column metadata");
+    let output_column = window_output_column(expr, output_columns);
     WindowExpr {
         name: expr.name.clone(),
         args: materialize_exprs(arena, &expr.args),
@@ -200,7 +227,7 @@ pub(crate) fn materialize_window_expr(
         window_frame: expr.window_frame.clone(),
         result_type: output_column.data_type.clone(),
         output_name: output_column.name.clone(),
-        output_column_id: output_column.column_id,
+        output_column_id: expr.output_column_id,
         ignore_nulls: expr.ignore_nulls,
     }
 }
@@ -210,16 +237,16 @@ pub(crate) fn materialize_window_exprs(
     exprs: &[ScalarWindowSpec],
     output_columns: &[OutputColumn],
 ) -> Vec<WindowExpr> {
-    assert!(
-        output_columns.len() >= exprs.len(),
-        "window output layout must include window result columns"
-    );
-    let window_output_start = output_columns.len() - exprs.len();
+    let mut seen = HashSet::new();
     exprs
         .iter()
-        .enumerate()
-        .map(|(idx, expr)| {
-            materialize_window_expr(arena, expr, output_columns.get(window_output_start + idx))
+        .map(|expr| {
+            assert!(
+                seen.insert(expr.output_column_id),
+                "duplicate ScalarWindowSpec output_column_id {}",
+                expr.output_column_id.0
+            );
+            materialize_window_expr(arena, expr, output_columns)
         })
         .collect()
 }
@@ -265,6 +292,29 @@ mod tests {
         }
     }
 
+    fn output_column(id: ColumnId, name: &str, data_type: DataType) -> OutputColumn {
+        OutputColumn {
+            column_id: id,
+            name: name.to_string(),
+            data_type,
+            nullable: true,
+            is_internal: false,
+        }
+    }
+
+    fn window_spec(output_column_id: ColumnId, name: &str) -> ScalarWindowSpec {
+        ScalarWindowSpec {
+            output_column_id,
+            name: name.to_string(),
+            args: vec![],
+            distinct: false,
+            partition_by: vec![],
+            order_by: vec![],
+            window_frame: None,
+            ignore_nulls: false,
+        }
+    }
+
     #[test]
     fn intern_window_expr_preserves_output_column_id() {
         let output_id = ColumnId::new_for_test(701);
@@ -281,6 +331,78 @@ mod tests {
         let mut arena = ScalarArena::new();
 
         let _ = intern_window_expr(&mut arena, &window_expr(ColumnId::UNSET, "rn"));
+    }
+
+    #[test]
+    fn materialize_window_exprs_matches_outputs_by_id_not_position() {
+        let arena = ScalarArena::new();
+        let id_rn = ColumnId::new_for_test(801);
+        let id_rank = ColumnId::new_for_test(802);
+        let output_columns = vec![
+            output_column(ColumnId::new_for_test(1), "a", DataType::Int32),
+            output_column(id_rank, "rk", DataType::Int64),
+            output_column(ColumnId::new_for_test(2), "b", DataType::Int32),
+            output_column(id_rn, "rn", DataType::UInt64),
+        ];
+
+        let exprs = materialize_window_exprs(
+            &arena,
+            &[
+                window_spec(id_rn, "row_number"),
+                window_spec(id_rank, "rank"),
+            ],
+            &output_columns,
+        );
+
+        assert_eq!(exprs[0].output_column_id, id_rn);
+        assert_eq!(exprs[0].output_name, "rn");
+        assert_eq!(exprs[0].result_type, DataType::UInt64);
+        assert_eq!(exprs[1].output_column_id, id_rank);
+        assert_eq!(exprs[1].output_name, "rk");
+        assert_eq!(exprs[1].result_type, DataType::Int64);
+    }
+
+    #[test]
+    #[should_panic(expected = "window output column id 803 missing from WindowOp.output_columns")]
+    fn materialize_window_exprs_rejects_missing_output_id() {
+        let arena = ScalarArena::new();
+        let missing_id = ColumnId::new_for_test(803);
+
+        let _ = materialize_window_exprs(&arena, &[window_spec(missing_id, "row_number")], &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate window output column id 804")]
+    fn materialize_window_exprs_rejects_duplicate_output_id() {
+        let arena = ScalarArena::new();
+        let duplicate_id = ColumnId::new_for_test(804);
+        let output_columns = vec![
+            output_column(duplicate_id, "rn_a", DataType::Int64),
+            output_column(duplicate_id, "rn_b", DataType::Int64),
+        ];
+
+        let _ = materialize_window_exprs(
+            &arena,
+            &[window_spec(duplicate_id, "row_number")],
+            &output_columns,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate ScalarWindowSpec output_column_id 805")]
+    fn materialize_window_exprs_rejects_duplicate_expr_output_id() {
+        let arena = ScalarArena::new();
+        let duplicate_id = ColumnId::new_for_test(805);
+        let output_columns = vec![output_column(duplicate_id, "rn", DataType::Int64)];
+
+        let _ = materialize_window_exprs(
+            &arena,
+            &[
+                window_spec(duplicate_id, "row_number"),
+                window_spec(duplicate_id, "rank"),
+            ],
+            &output_columns,
+        );
     }
 }
 
