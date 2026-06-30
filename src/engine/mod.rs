@@ -16,7 +16,6 @@ use crate::engine::query_options::StandaloneQueryOptions;
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::novarocks_config;
 use crate::runtime::global_async_runtime::data_block_on;
-use crate::thrift::plan_nodes::TFileFormatType;
 
 use self::catalog::{DEFAULT_DATABASE, InMemoryCatalog, normalize_identifier};
 use crate::connector::{
@@ -345,11 +344,18 @@ pub struct StandaloneStarRocksTableInfo {
     pub tablets: Vec<StandaloneStarRocksTabletInfo>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StandaloneStreamLoadFormat {
+    Json,
+    CsvPlain,
+    Unsupported(&'static str),
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct StandaloneStreamLoadRequest {
     pub database: String,
     pub table: String,
-    pub format_type: TFileFormatType,
+    pub format_type: StandaloneStreamLoadFormat,
     pub columns: Option<String>,
     pub column_separator: Option<String>,
     pub row_delimiter: Option<String>,
@@ -4656,13 +4662,13 @@ fn stream_load_starrocks_table(
     };
     let insert_columns = parse_stream_load_columns(request.columns.as_deref(), &table_def)?;
     let rows = match request.format_type {
-        TFileFormatType::FORMAT_JSON => parse_json_stream_load_rows(
+        StandaloneStreamLoadFormat::Json => parse_json_stream_load_rows(
             &request.payload,
             &insert_columns,
             request.jsonpaths.as_deref(),
             request.strip_outer_array.unwrap_or(false),
         )?,
-        TFileFormatType::FORMAT_CSV_PLAIN => parse_csv_stream_load_rows(
+        StandaloneStreamLoadFormat::CsvPlain => parse_csv_stream_load_rows(
             &request.payload,
             &insert_columns,
             request.column_separator.as_deref(),
@@ -4672,10 +4678,9 @@ fn stream_load_starrocks_table(
             request.enclose,
             request.escape,
         )?,
-        other => {
+        StandaloneStreamLoadFormat::Unsupported(format_name) => {
             return Err(format!(
-                "standalone stream load only supports CSV/JSON, got {:?}",
-                other
+                "standalone stream load only supports CSV/JSON, got {format_name}",
             ));
         }
     };

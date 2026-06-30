@@ -47,6 +47,11 @@ use crate::connector::iceberg::commit::{
     IcebergCommitCollector, WrittenFile, ensure_iceberg_write_supported,
     ensure_no_equality_deletes, ensure_overwrite_single_partition_spec,
 };
+use crate::connector::iceberg::position_delete_descriptor::{
+    ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN, ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
+    ICEBERG_POSITION_DELETE_POS_COLUMN, ICEBERG_POSITION_DELETE_POS_FIELD_ID,
+    PositionDeleteDescriptorInput, PositionDeleteOutputField, PositionDeletePartitionSourceField,
+};
 use crate::connector::starrocks::table::mv_refresh::query_result_to_chunks;
 use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::write_transaction::{
@@ -64,7 +69,8 @@ use crate::sql::catalog::{
     ScanSource, TableDef,
 };
 use crate::sql::codegen::iceberg_write_sink::{
-    IcebergWriteSinkMode, IcebergWriteSinkSpec, synthetic_iceberg_write_table_id,
+    IcebergWriteFileCompression, IcebergWriteSinkMode, IcebergWriteSinkSpec,
+    synthetic_iceberg_write_table_id, transform_to_sink_string,
 };
 use crate::sql::parser::ast::{InsertSource, Literal, SqlType};
 
@@ -445,14 +451,6 @@ pub(crate) fn build_iceberg_write_sink_spec(
         .get("write.data.path")
         .cloned()
         .unwrap_or_else(|| format!("{}/data", table_location.trim_end_matches('/')));
-    let cloud_configuration = (!cloud_properties.is_empty()).then(|| {
-        crate::thrift::cloud_configuration::TCloudConfiguration::new(
-            None::<crate::thrift::cloud_configuration::TCloudType>,
-            None::<Vec<crate::thrift::cloud_configuration::TCloudProperty>>,
-            Some(cloud_properties),
-            None::<bool>,
-        )
-    });
     let position_delete_output_descriptor = match mode {
         IcebergWriteSinkMode::PositionDeletes | IcebergWriteSinkMode::DeletionVectors => Some(
             build_position_delete_output_descriptor(metadata, &target_columns)?,
@@ -471,9 +469,9 @@ pub(crate) fn build_iceberg_write_sink_spec(
         table_location,
         data_location,
         target_partition_spec_id: metadata.default_partition_spec_id(),
-        cloud_configuration,
+        cloud_properties,
         file_format: "parquet".to_string(),
-        compression: crate::thrift::types::TCompressionType::SNAPPY,
+        compression: IcebergWriteFileCompression::Snappy,
         position_delete_output_descriptor,
     })
 }
@@ -579,13 +577,7 @@ fn position_delete_sink_input_columns(
 fn build_position_delete_output_descriptor(
     metadata: &iceberg::spec::TableMetadata,
     target_columns: &[ColumnDef],
-) -> Result<crate::thrift::data_sinks::TIcebergPositionDeleteOutputDescriptor, String> {
-    use crate::connector::iceberg::position_delete_descriptor::{
-        ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN, ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
-        ICEBERG_POSITION_DELETE_POS_COLUMN, ICEBERG_POSITION_DELETE_POS_FIELD_ID,
-    };
-    use crate::types::arrow_thrift::thrift_type_desc_from_primitive;
-
+) -> Result<PositionDeleteDescriptorInput, String> {
     let schema = metadata.current_schema();
     let partition_source_fields = metadata
         .default_partition_spec()
@@ -599,7 +591,7 @@ fn build_position_delete_output_descriptor(
                     field.source_id
                 )
             })?;
-            target_columns
+            let column = target_columns
                 .iter()
                 .find(|column| column.name.eq_ignore_ascii_case(&source.name))
                 .ok_or_else(|| {
@@ -612,44 +604,36 @@ fn build_position_delete_output_descriptor(
                 "[UnsupportedPositionDeleteDescriptor] position-delete partition source index overflow"
                     .to_string()
             })?;
-            Ok(crate::thrift::data_sinks::TIcebergPositionDeletePartitionSourceField::new(
-                Some(output_expr_index),
-                Some(source.name.clone()),
-                Some(field.name.clone()),
-                Some(crate::sql::codegen::iceberg_write_sink::transform_to_thrift_string(
-                    &field.transform,
-                )),
-                Some(field.source_id),
-            ))
+            Ok(PositionDeletePartitionSourceField {
+                output_expr_index: usize::try_from(output_expr_index).map_err(|_| {
+                    "[UnsupportedPositionDeleteDescriptor] position-delete partition source index overflow"
+                        .to_string()
+                })?,
+                source_column_name: source.name.clone(),
+                partition_field_name: field.name.clone(),
+                transform_expr: transform_to_sink_string(&field.transform),
+                source_field_id: field.source_id,
+                data_type: column.data_type.clone(),
+            })
         })
         .collect::<Result<Vec<_>, String>>()?;
 
-    Ok(
-        crate::thrift::data_sinks::TIcebergPositionDeleteOutputDescriptor::new(
-            Some(
-                crate::thrift::data_sinks::TIcebergPositionDeleteOutputField::new(
-                    Some(0),
-                    Some(ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN.to_string()),
-                    Some(thrift_type_desc_from_primitive(
-                        crate::thrift::types::TPrimitiveType::VARCHAR,
-                    )),
-                    Some(ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID),
-                ),
-            ),
-            Some(
-                crate::thrift::data_sinks::TIcebergPositionDeleteOutputField::new(
-                    Some(1),
-                    Some(ICEBERG_POSITION_DELETE_POS_COLUMN.to_string()),
-                    Some(thrift_type_desc_from_primitive(
-                        crate::thrift::types::TPrimitiveType::BIGINT,
-                    )),
-                    Some(ICEBERG_POSITION_DELETE_POS_FIELD_ID),
-                ),
-            ),
-            Some(partition_source_fields),
-            Some(metadata.default_partition_spec_id()),
-        ),
-    )
+    Ok(PositionDeleteDescriptorInput {
+        file_path: PositionDeleteOutputField {
+            output_expr_index: 0,
+            name: ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN.to_string(),
+            data_type: arrow::datatypes::DataType::Utf8,
+            field_id: ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
+        },
+        pos: PositionDeleteOutputField {
+            output_expr_index: 1,
+            name: ICEBERG_POSITION_DELETE_POS_COLUMN.to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            field_id: ICEBERG_POSITION_DELETE_POS_FIELD_ID,
+        },
+        partition_source_fields,
+        target_partition_spec_id: metadata.default_partition_spec_id(),
+    })
 }
 
 fn append_source_to_query(
@@ -1550,61 +1534,51 @@ mod tests {
     }
 
     fn assert_position_delete_output_field(
-        field: Option<&crate::thrift::data_sinks::TIcebergPositionDeleteOutputField>,
+        field: &crate::connector::iceberg::position_delete_descriptor::PositionDeleteOutputField,
         output_expr_index: i32,
         name: &str,
-        primitive: crate::thrift::types::TPrimitiveType,
+        data_type: &DataType,
         field_id: i32,
     ) {
-        let field = field.expect("position delete output field");
-        assert_eq!(field.output_expr_index, Some(output_expr_index));
-        assert_eq!(field.name.as_deref(), Some(name));
-        assert_eq!(field.field_id, Some(field_id));
-        assert_eq!(
-            field
-                .type_desc
-                .as_ref()
-                .and_then(crate::types::arrow_thrift::thrift_desc_to_primitive),
-            Some(primitive)
-        );
+        assert_eq!(field.output_expr_index, output_expr_index as usize);
+        assert_eq!(field.name, name);
+        assert_eq!(&field.data_type, data_type);
+        assert_eq!(field.field_id, field_id);
     }
 
     fn assert_position_delete_descriptor_contract(
-        desc: &crate::thrift::data_sinks::TIcebergPositionDeleteOutputDescriptor,
+        desc: &crate::connector::iceberg::position_delete_descriptor::PositionDeleteDescriptorInput,
     ) {
         use crate::connector::iceberg::position_delete_descriptor::{
             ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN, ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
             ICEBERG_POSITION_DELETE_POS_COLUMN, ICEBERG_POSITION_DELETE_POS_FIELD_ID,
         };
 
-        assert_eq!(desc.target_partition_spec_id, Some(7));
+        assert_eq!(desc.target_partition_spec_id, 7);
         assert_position_delete_output_field(
-            desc.file_path.as_ref(),
+            &desc.file_path,
             0,
             ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN,
-            crate::thrift::types::TPrimitiveType::VARCHAR,
+            &DataType::Utf8,
             ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
         );
         assert_position_delete_output_field(
-            desc.pos.as_ref(),
+            &desc.pos,
             1,
             ICEBERG_POSITION_DELETE_POS_COLUMN,
-            crate::thrift::types::TPrimitiveType::BIGINT,
+            &DataType::Int64,
             ICEBERG_POSITION_DELETE_POS_FIELD_ID,
         );
         let partition_field = desc
             .partition_source_fields
-            .as_ref()
-            .and_then(|fields| fields.first())
+            .first()
             .expect("partition source field");
-        assert_eq!(partition_field.output_expr_index, Some(2));
-        assert_eq!(partition_field.source_column_name.as_deref(), Some("id"));
-        assert_eq!(
-            partition_field.partition_field_name.as_deref(),
-            Some("id_bucket")
-        );
-        assert_eq!(partition_field.transform_expr.as_deref(), Some("bucket[8]"));
-        assert_eq!(partition_field.source_field_id, Some(42));
+        assert_eq!(partition_field.output_expr_index, 2);
+        assert_eq!(partition_field.source_column_name, "id");
+        assert_eq!(partition_field.partition_field_name, "id_bucket");
+        assert_eq!(partition_field.transform_expr, "bucket[8]");
+        assert_eq!(partition_field.source_field_id, 42);
+        assert_eq!(partition_field.data_type, DataType::Int32);
     }
 
     #[test]
@@ -1716,14 +1690,6 @@ mod tests {
             .as_ref()
             .expect("descriptor");
         assert_position_delete_descriptor_contract(desc);
-
-        let sink = spec.build_sink(17);
-        let sink_desc = sink
-            .iceberg_table_sink
-            .as_ref()
-            .and_then(|sink| sink.position_delete_output_descriptor.as_ref())
-            .expect("sink descriptor");
-        assert_position_delete_descriptor_contract(sink_desc);
     }
 
     #[test]

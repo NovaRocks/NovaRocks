@@ -265,6 +265,31 @@ fn parse_format(headers: &HttpHeaders) -> Result<TFileFormatType, ApiError> {
     ))
 }
 
+fn standalone_stream_load_format_from_thrift(
+    format: TFileFormatType,
+) -> crate::engine::StandaloneStreamLoadFormat {
+    match format {
+        TFileFormatType::FORMAT_JSON => crate::engine::StandaloneStreamLoadFormat::Json,
+        TFileFormatType::FORMAT_CSV_PLAIN => crate::engine::StandaloneStreamLoadFormat::CsvPlain,
+        TFileFormatType::FORMAT_CSV_GZ => {
+            crate::engine::StandaloneStreamLoadFormat::Unsupported("FORMAT_CSV_GZ")
+        }
+        TFileFormatType::FORMAT_CSV_BZ2 => {
+            crate::engine::StandaloneStreamLoadFormat::Unsupported("FORMAT_CSV_BZ2")
+        }
+        TFileFormatType::FORMAT_CSV_LZ4_FRAME => {
+            crate::engine::StandaloneStreamLoadFormat::Unsupported("FORMAT_CSV_LZ4_FRAME")
+        }
+        TFileFormatType::FORMAT_CSV_DEFLATE => {
+            crate::engine::StandaloneStreamLoadFormat::Unsupported("FORMAT_CSV_DEFLATE")
+        }
+        TFileFormatType::FORMAT_CSV_ZSTD => {
+            crate::engine::StandaloneStreamLoadFormat::Unsupported("FORMAT_CSV_ZSTD")
+        }
+        _ => crate::engine::StandaloneStreamLoadFormat::Unsupported("unsupported"),
+    }
+}
+
 fn parse_partial_update_mode(
     headers: &HttpHeaders,
 ) -> Result<Option<TPartialUpdateMode>, ApiError> {
@@ -1118,7 +1143,7 @@ pub(crate) fn handle_stream_load(
         let request = crate::engine::StandaloneStreamLoadRequest {
             database: db.clone(),
             table: table.clone(),
-            format_type: options.format_type,
+            format_type: standalone_stream_load_format_from_thrift(options.format_type),
             columns: options.columns.clone(),
             column_separator: options.column_separator.clone(),
             row_delimiter: options.row_delimiter.clone(),

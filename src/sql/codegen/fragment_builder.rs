@@ -20,8 +20,9 @@ use crate::sql::codegen::boundary_schema::{
 };
 use crate::sql::codegen::descriptors::DescriptorTableBuilder;
 use crate::sql::codegen::expr_compiler;
-use crate::sql::codegen::iceberg_write_sink::{
-    IcebergWriteSinkMode, IcebergWriteSinkSpec, partition_info_from_serialized_metadata,
+use crate::sql::codegen::iceberg_write_sink::{IcebergWriteSinkMode, IcebergWriteSinkSpec};
+use crate::sql::codegen::iceberg_write_sink_wire::{
+    build_iceberg_write_sink_thrift, partition_info_from_serialized_metadata,
 };
 use crate::sql::codegen::nodes;
 use crate::sql::codegen::scalar_materialize::materialize;
@@ -818,7 +819,8 @@ fn apply_iceberg_sink_to_build(
         sink_tuple_id,
         sink_spec.target_columns.len(),
     )?;
-    build.fragment_results[root_index].output_sink = sink_spec.build_sink(sink_tuple_id);
+    build.fragment_results[root_index].output_sink =
+        build_iceberg_write_sink_thrift(sink_spec, sink_tuple_id);
     build.fragment_results[root_index].output_exprs = Some(output_exprs);
 
     let mut desc_builder =
