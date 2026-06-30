@@ -12,7 +12,13 @@ k	payload
 payload
 300
 
--- query 9
+-- query 7
+k
+1
+2
+3
+
+-- query 10
 Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *

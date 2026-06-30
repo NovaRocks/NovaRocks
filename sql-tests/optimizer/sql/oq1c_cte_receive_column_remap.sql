@@ -31,6 +31,15 @@ WITH c AS (
 )
 SELECT payload FROM c WHERE v = 30;
 
+-- Aggregate-backed producer keeps its full child output when aggregate pruning is disabled.
+WITH c AS (
+    SELECT k, COUNT(*) AS cnt FROM ${case_db}.oq1c_cte_src GROUP BY k
+)
+SELECT l.k
+FROM c l
+JOIN c r ON l.k = r.k
+ORDER BY l.k;
+
 -- @skip_result_check=true
 -- @result_contains=CTE
 EXPLAIN LOGICAL
