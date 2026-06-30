@@ -17,13 +17,12 @@
 pub mod block_manager;
 pub mod dir_manager;
 pub mod ipc_serde;
+pub(crate) mod query_options_wire;
 pub mod spill_channel;
 pub mod spill_stream;
 pub mod spiller;
 
 use crate::runtime::profile::{CounterRef, Profiler, RuntimeProfile};
-use crate::thrift::internal_service;
-use crate::thrift::metrics;
 
 pub use spill_channel::{SpillChannelHandle, SpillIoExecutor, SpillTask};
 
@@ -35,23 +34,7 @@ pub enum SpillMode {
     Random,
 }
 
-impl TryFrom<internal_service::TSpillMode> for SpillMode {
-    type Error = String;
-
-    fn try_from(value: internal_service::TSpillMode) -> Result<Self, Self::Error> {
-        match value {
-            internal_service::TSpillMode::NONE => Ok(SpillMode::None),
-            internal_service::TSpillMode::FORCE => Ok(SpillMode::Force),
-            internal_service::TSpillMode::AUTO => Ok(SpillMode::Auto),
-            internal_service::TSpillMode::RANDOM => Ok(SpillMode::Random),
-            internal_service::TSpillMode(value) => {
-                Err(format!("unknown spill_mode value: {value}"))
-            }
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SpillConfig {
     pub enable_spill: bool,
     pub spill_mode: SpillMode,
@@ -63,90 +46,6 @@ pub struct SpillConfig {
     pub max_spill_read_buffer_bytes_per_driver: Option<i64>,
     pub spill_mem_table_size: Option<i32>,
     pub spill_mem_table_num: Option<i32>,
-}
-
-impl SpillConfig {
-    pub fn from_query_options(
-        query_opts: Option<&internal_service::TQueryOptions>,
-    ) -> Result<Option<Self>, String> {
-        let Some(opts) = query_opts else {
-            return Ok(None);
-        };
-        let enable_spill = opts.enable_spill.unwrap_or(false);
-        if !enable_spill {
-            return Ok(None);
-        }
-
-        let spill_opts = opts.spill_options.as_ref();
-
-        let spill_mode = spill_opts
-            .and_then(|v| v.spill_mode)
-            .or(opts.spill_mode)
-            .ok_or_else(|| "spill_mode is required when enable_spill=true".to_string())?
-            .try_into()?;
-        if spill_mode == SpillMode::Random {
-            return Err("spill_mode RANDOM is not supported yet".to_string());
-        }
-
-        let spill_enable_direct_io = spill_opts
-            .and_then(|v| v.spill_enable_direct_io)
-            .or(opts.spill_enable_direct_io)
-            .unwrap_or(false);
-        if spill_enable_direct_io {
-            return Err("spill_enable_direct_io=true is not supported".to_string());
-        }
-
-        let enable_spill_to_remote_storage = spill_opts
-            .and_then(|v| v.enable_spill_to_remote_storage)
-            .unwrap_or(false);
-        if enable_spill_to_remote_storage {
-            return Err("spill to remote storage is not supported".to_string());
-        }
-
-        if let Some(opts) = spill_opts.and_then(|v| v.spill_to_remote_storage_options.as_ref())
-            && opts.disable_spill_to_local_disk.unwrap_or(false)
-        {
-            return Err(
-                "spill_to_remote_storage_options.disable_spill_to_local_disk=true is not supported"
-                    .to_string(),
-            );
-        }
-
-        let spill_mem_table_size = spill_opts
-            .and_then(|v| v.spill_mem_table_size)
-            .or(opts.spill_mem_table_size);
-        let spill_mem_table_num = spill_opts
-            .and_then(|v| v.spill_mem_table_num)
-            .or(opts.spill_mem_table_num);
-        let spill_mem_limit_threshold = spill_opts
-            .and_then(|v| v.spill_mem_limit_threshold.map(|v| v.into_inner()))
-            .or_else(|| opts.spill_mem_limit_threshold.map(|v| v.into_inner()));
-        let spill_operator_min_bytes = spill_opts
-            .and_then(|v| v.spill_operator_min_bytes)
-            .or(opts.spill_operator_min_bytes);
-        let spill_operator_max_bytes = spill_opts
-            .and_then(|v| v.spill_operator_max_bytes)
-            .or(opts.spill_operator_max_bytes);
-        let spill_encode_level = spill_opts
-            .and_then(|v| v.spill_encode_level)
-            .or(opts.spill_encode_level);
-        let enable_spill_buffer_read = spill_opts.and_then(|v| v.enable_spill_buffer_read);
-        let max_spill_read_buffer_bytes_per_driver =
-            spill_opts.and_then(|v| v.max_spill_read_buffer_bytes_per_driver);
-
-        Ok(Some(SpillConfig {
-            enable_spill,
-            spill_mode,
-            spill_mem_limit_threshold,
-            spill_operator_min_bytes,
-            spill_operator_max_bytes,
-            spill_encode_level,
-            enable_spill_buffer_read,
-            max_spill_read_buffer_bytes_per_driver,
-            spill_mem_table_size,
-            spill_mem_table_num,
-        }))
-    }
 }
 
 #[derive(Clone)]
@@ -217,14 +116,14 @@ impl SpillProfile {
     pub fn new(profile: &RuntimeProfile) -> Self {
         let profile = profile.child("Spill");
         Self {
-            spill_rows: profile.add_counter("SpillRows", metrics::TUnit::UNIT),
-            spill_bytes: profile.add_counter("SpillBytes", metrics::TUnit::BYTES),
+            spill_rows: profile.add_unit_counter("SpillRows"),
+            spill_bytes: profile.add_bytes_counter("SpillBytes"),
             spill_time: profile.add_timer("SpillTime"),
-            restore_rows: profile.add_counter("RestoreRows", metrics::TUnit::UNIT),
-            restore_bytes: profile.add_counter("RestoreBytes", metrics::TUnit::BYTES),
+            restore_rows: profile.add_unit_counter("RestoreRows"),
+            restore_bytes: profile.add_bytes_counter("RestoreBytes"),
             restore_time: profile.add_timer("RestoreTime"),
-            spill_block_count: profile.add_counter("SpillBlockCount", metrics::TUnit::UNIT),
-            spill_read_io_count: profile.add_counter("SpillReadIoCount", metrics::TUnit::UNIT),
+            spill_block_count: profile.add_unit_counter("SpillBlockCount"),
+            spill_read_io_count: profile.add_unit_counter("SpillReadIoCount"),
         }
     }
 }

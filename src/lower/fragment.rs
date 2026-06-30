@@ -21,7 +21,7 @@ use std::time::Duration;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan, push_down_local_runtime_filters};
 use crate::exec::row_position::RowPositionDescriptor;
-use crate::exec::spill::{QuerySpillManager, SpillConfig};
+use crate::exec::spill::QuerySpillManager;
 use crate::novarocks_connectors::ConnectorRegistry;
 
 use crate::cache::CacheOptions;
@@ -213,7 +213,9 @@ pub(crate) fn execute_fragment(
         lo: params.fragment_instance_id.lo,
     });
     let cache_options = CacheOptions::from_query_options(query_opts.as_ref())?;
-    let spill_config = SpillConfig::from_query_options(query_opts.as_ref())?;
+    let spill_config = crate::exec::spill::query_options_wire::spill_config_from_query_options(
+        query_opts.as_ref(),
+    )?;
     let spill_manager = spill_config
         .as_ref()
         .map(|config| Arc::new(QuerySpillManager::new(config.clone(), profiler.as_ref())));

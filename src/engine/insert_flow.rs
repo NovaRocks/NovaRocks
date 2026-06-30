@@ -11,6 +11,7 @@ use crate::connector::backend::ResolvedTable;
 use crate::engine::backend_resolver::{TargetBackend, resolve_existing_table_target};
 use crate::engine::catalog::{ColumnDef, normalize_identifier};
 use crate::engine::insert::reorder_insert_rows;
+use crate::engine::query_options::StandaloneQueryOptions;
 use crate::engine::{StandaloneState, StatementResult};
 use crate::exec::expr::cast_with_special_rules;
 use crate::runtime::query_result::QueryResult;
@@ -25,7 +26,7 @@ pub(crate) fn run_insert(
     overwrite_mode: OverwriteMode,
     current_catalog: Option<&str>,
     current_database: &str,
-    query_opts: Option<&crate::thrift::internal_service::TQueryOptions>,
+    query_opts: Option<&StandaloneQueryOptions>,
 ) -> Result<StatementResult, String> {
     let is_overwrite = matches!(
         overwrite_mode,
@@ -196,7 +197,7 @@ pub(crate) fn execute_insert_from_query_on_pipeline(
     resolved: &ResolvedTable,
     insert_columns: &[String],
     query: &sqlparser::ast::Query,
-    query_opts: Option<&crate::thrift::internal_service::TQueryOptions>,
+    query_opts: Option<&StandaloneQueryOptions>,
 ) -> Result<RecordBatch, String> {
     let query_result = crate::engine::execute_query_with_catalog_mgr(
         state,

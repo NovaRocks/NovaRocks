@@ -1201,15 +1201,11 @@ async fn execute_sql_in_worker(
     let optimizer_settings = shim.optimizer_settings.clone();
     let allow_throw_exception =
         crate::sql::parser::set_var_hint::extract_allow_throw_exception(&sql);
-    let query_options = crate::thrift::internal_service::TQueryOptions {
+    let query_options = crate::engine::query_options::StandaloneQueryOptions {
         group_concat_max_len: Some(shim.group_concat_max_len),
         query_timeout: query_timeout.and_then(|secs| i32::try_from(secs).ok()),
         pipeline_dop: shim.pipeline_dop,
-        allow_throw_exception: if allow_throw_exception {
-            Some(true)
-        } else {
-            None
-        },
+        allow_throw_exception,
         ..Default::default()
     };
     let client_disconnect_signal = Arc::clone(&shim.client_disconnect_signal);
