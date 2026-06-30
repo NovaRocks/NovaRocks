@@ -15,7 +15,7 @@
 //!
 //! Spec: `docs/design/specs/2026-05-28-oq-1-column-pruning-arch-refactor-design.md` §5.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::CteId;
@@ -829,21 +829,14 @@ fn tag_cte_anchor(
     // This stamps required_output_columns on every CTEConsume for this cte_id.
     let consumer = tag_required_columns(consumer, arena, parent_needed.clone());
 
-    // --- Tag the producer subtree with None (keep all). ---
-    //
-    // Conservative choice: pass None to the CTEProduce body so all produce
-    // columns survive, rather than computing a narrowed produce_needed set.
-    //
-    // Why conservative: PruneCTEProduceColumns and PruneCTEConsumeColumns are
-    // no-ops (Gap-3 deferred).  The CTE multicast protocol sends ALL produce
-    // columns to every consumer exchange node; each consumer reads them by
-    // positional index.  A narrowed produce_needed set could prune leaf nodes
-    // (e.g. Scan) below the produce correctly in isolation, but since the
-    // produce's output_columns list is not pruned (no-op rule), the scan must
-    // still produce ALL columns that the produce's output_columns list names.
-    // Passing None ensures the scan's required_output_columns == all columns,
-    // which is the safe invariant until Gap-3 is implemented.
-    let produce = tag_required_columns(produce, arena, None);
+    let Operator::LogicalCTEAnchor(anchor) = &expr.op else {
+        unreachable!()
+    };
+    let mut produce_needed = HashSet::new();
+    collect_cte_producer_needs(&consumer, anchor.cte_id, &mut produce_needed);
+
+    // --- Walk 2: tag the producer subtree in producer ColumnId space. ---
+    let produce = tag_required_columns(produce, arena, Some(produce_needed));
 
     expr.children = vec![produce, consumer];
     expr.required_output_columns = parent_needed;
@@ -854,56 +847,38 @@ fn tag_cte_anchor(
 // CTE helpers
 // ---------------------------------------------------------------------------
 
-/// Recursively traverse `expr` and union all `required_output_columns` sets
-/// from `CTEConsume` nodes whose `cte_id` matches `target_id` into `acc`.
-fn collect_cte_consumer_needs(expr: &OptExpr, target_id: CteId, acc: &mut HashSet<ColumnId>) {
+/// Recursively traverse `expr` and union matching CTEConsume requirements after
+/// translating consumer-side ColumnIds to producer-side ColumnIds.
+fn collect_cte_producer_needs(expr: &OptExpr, target_id: CteId, acc: &mut HashSet<ColumnId>) {
     match &expr.op {
-        Operator::LogicalCTEConsume(c) if c.cte_id == target_id => {
-            if let Some(req) = &expr.required_output_columns {
-                acc.extend(req.iter().copied());
+        Operator::LogicalCTEConsume(consume) if consume.cte_id == target_id => {
+            debug_assert_eq!(
+                consume.output_columns.len(),
+                consume.producer_column_ids.len(),
+                "CTEConsume mapping arity must be validated before pruning"
+            );
+            let Some(required) = &expr.required_output_columns else {
+                for producer_id in &consume.producer_column_ids {
+                    acc.insert(*producer_id);
+                }
+                return;
+            };
+            if required.is_empty() {
+                if let Some((_, producer_id)) = consume.first_mapping_pair() {
+                    acc.insert(producer_id);
+                }
+                return;
             }
-            // A CTEConsume is a leaf; do not recurse further.
+            for consumer_id in required {
+                if let Some(producer_id) = consume.producer_column_for_consumer(*consumer_id) {
+                    acc.insert(producer_id);
+                }
+            }
         }
-        Operator::LogicalCTEConsume(_) => {
-            // Different cte_id — skip.
-        }
+        Operator::LogicalCTEConsume(_) => {}
         _ => {
             for child in &expr.children {
-                collect_cte_consumer_needs(child, target_id, acc);
-            }
-        }
-    }
-}
-
-/// Build a map from `consume_side_column_id` → `position` for the first
-/// matching `CTEConsume(target_id)` found in the subtree.
-///
-/// All consumers with the same `cte_id` share the same positional schema, so
-/// we stop at the first match.  The position is the index into
-/// `CTEConsume.output_columns`, which aligns with `CTEProduce.output_columns`.
-fn find_consume_position_map(expr: &OptExpr, target_id: CteId) -> HashMap<ColumnId, usize> {
-    let mut map = HashMap::new();
-    walk_consume_position_map(expr, target_id, &mut map);
-    map
-}
-
-fn walk_consume_position_map(expr: &OptExpr, target_id: CteId, map: &mut HashMap<ColumnId, usize>) {
-    match &expr.op {
-        Operator::LogicalCTEConsume(c) if c.cte_id == target_id => {
-            // Record consume_side_column_id -> position for each output column.
-            // Use `or_insert` so that if multiple consumers exist (multi-consumer
-            // case), the first one wins — positions are identical across all
-            // consumers with the same cte_id.
-            for (i, col) in c.output_columns.iter().enumerate() {
-                map.entry(col.column_id).or_insert(i);
-            }
-        }
-        Operator::LogicalCTEConsume(_) => {
-            // Different cte_id — skip.
-        }
-        _ => {
-            for child in &expr.children {
-                walk_consume_position_map(child, target_id, map);
+                collect_cte_producer_needs(child, target_id, acc);
             }
         }
     }
@@ -1779,143 +1754,113 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn tag_cte_anchor_produce_body_gets_keep_all_none() {
-        let cte_id: CteId = 7;
+    fn tag_cte_anchor_translates_consumer_needed_ids_to_producer_ids() {
         let arena_rc = make_arena();
-
-        let scan = make_scan_with_ids(&arena_rc, 10, 20, 30);
+        let arena = arena_rc.borrow();
+        let cte_id: CteId = 7;
+        let producer_k = make_output_column(ColumnId::new_for_test(101), "k");
+        let producer_v = make_output_column(ColumnId::new_for_test(102), "v");
+        let consumer_k = make_output_column(ColumnId::new_for_test(201), "k");
+        let consumer_v = make_output_column(ColumnId::new_for_test(202), "v");
 
         let produce = OptExpr::new(
             Operator::LogicalCTEProduce(CTEProduceOp {
                 cte_id,
-                output_columns: vec![
-                    make_output_column(ColumnId::new_for_test(10), "c0"),
-                    make_output_column(ColumnId::new_for_test(20), "c1"),
-                    make_output_column(ColumnId::new_for_test(30), "c2"),
-                ],
+                output_columns: vec![producer_k.clone(), producer_v.clone()],
             }),
-            vec![scan],
+            vec![make_scan_with_ids(&arena_rc, 101, 102, 900)],
         );
-
         let consume = OptExpr::leaf(Operator::LogicalCTEConsume(CTEConsumeOp {
             cte_id,
-            alias: "u1".to_string(),
-            output_columns: vec![
-                make_output_column(ColumnId::new_for_test(101), "k0"),
-                make_output_column(ColumnId::new_for_test(102), "k1"),
-                make_output_column(ColumnId::new_for_test(103), "k2"),
-            ],
-            producer_column_ids: vec![
-                ColumnId::new_for_test(10),
-                ColumnId::new_for_test(20),
-                ColumnId::new_for_test(30),
-            ],
+            alias: "c".to_string(),
+            output_columns: vec![consumer_k.clone(), consumer_v.clone()],
+            producer_column_ids: vec![producer_k.column_id, producer_v.column_id],
         }));
-
         let anchor = OptExpr::new(
             Operator::LogicalCTEAnchor(CTEAnchorOp { cte_id }),
             vec![produce, consume],
         );
 
-        let arena = arena_rc.borrow();
-        let tagged = tag_required_columns(anchor, &arena, Some(needed_set(&[102])));
-
-        assert!(matches!(&tagged.op, Operator::LogicalCTEAnchor(_)));
+        let tagged = tag_required_columns(anchor, &arena, Some(needed_set(&[202])));
         let produce = tagged.child(0);
-        assert!(matches!(&produce.op, Operator::LogicalCTEProduce(_)));
-        let produce_input = produce.unary_input();
-        assert!(matches!(&produce_input.op, Operator::LogicalScan(_)));
-        let req = required_columns(produce_input);
-        // Conservative keep-all: produce body scan keeps all 3 columns.
         assert_eq!(
-            req.len(),
-            3,
-            "scan must keep all columns (keep-all for CTE produce body)"
+            produce.required_output_columns.as_ref().unwrap(),
+            &needed_set(&[102])
         );
-        assert!(req.contains(&ColumnId::new_for_test(10)), "a@10 kept");
-        assert!(req.contains(&ColumnId::new_for_test(20)), "b@20 kept");
-        assert!(req.contains(&ColumnId::new_for_test(30)), "c@30 kept");
+        assert_eq!(
+            produce.child(0).required_output_columns.as_ref().unwrap(),
+            &needed_set(&[102])
+        );
     }
 
     #[test]
-    fn tag_cte_anchor_multi_consumer_produce_body_gets_keep_all_none() {
+    fn tag_cte_anchor_unions_multi_consumer_producer_ids() {
         let cte_id: CteId = 42;
         let arena_rc = make_arena();
+        let producer_a = make_output_column(ColumnId::new_for_test(101), "a");
+        let producer_b = make_output_column(ColumnId::new_for_test(102), "b");
+        let producer_c = make_output_column(ColumnId::new_for_test(103), "c");
 
-        let scan = make_scan_with_ids(&arena_rc, 10, 20, 30);
         let produce = OptExpr::new(
             Operator::LogicalCTEProduce(CTEProduceOp {
                 cte_id,
-                output_columns: vec![
-                    make_output_column(ColumnId::new_for_test(10), "c0"),
-                    make_output_column(ColumnId::new_for_test(20), "c1"),
-                    make_output_column(ColumnId::new_for_test(30), "c2"),
-                ],
+                output_columns: vec![producer_a.clone(), producer_b.clone(), producer_c.clone()],
             }),
-            vec![scan],
+            vec![make_scan_with_ids(&arena_rc, 101, 102, 103)],
         );
 
-        let consume1 = OptExpr::leaf(Operator::LogicalCTEConsume(CTEConsumeOp {
+        let consume_a = OptExpr::leaf(Operator::LogicalCTEConsume(CTEConsumeOp {
             cte_id,
-            alias: "u1".to_string(),
+            alias: "a".to_string(),
             output_columns: vec![
-                make_output_column(ColumnId::new_for_test(101), "k0"),
-                make_output_column(ColumnId::new_for_test(102), "k1"),
-                make_output_column(ColumnId::new_for_test(103), "k2"),
+                make_output_column(ColumnId::new_for_test(201), "a0"),
+                make_output_column(ColumnId::new_for_test(202), "a1"),
+                make_output_column(ColumnId::new_for_test(203), "a2"),
             ],
             producer_column_ids: vec![
-                ColumnId::new_for_test(10),
-                ColumnId::new_for_test(20),
-                ColumnId::new_for_test(30),
+                producer_a.column_id,
+                producer_b.column_id,
+                producer_c.column_id,
             ],
         }));
-        let consume2 = OptExpr::leaf(Operator::LogicalCTEConsume(CTEConsumeOp {
+        let consume_b = OptExpr::leaf(Operator::LogicalCTEConsume(CTEConsumeOp {
             cte_id,
-            alias: "u2".to_string(),
+            alias: "b".to_string(),
             output_columns: vec![
-                make_output_column(ColumnId::new_for_test(201), "m0"),
-                make_output_column(ColumnId::new_for_test(202), "m1"),
-                make_output_column(ColumnId::new_for_test(203), "m2"),
+                make_output_column(ColumnId::new_for_test(301), "b0"),
+                make_output_column(ColumnId::new_for_test(302), "b1"),
+                make_output_column(ColumnId::new_for_test(303), "b2"),
             ],
             producer_column_ids: vec![
-                ColumnId::new_for_test(10),
-                ColumnId::new_for_test(20),
-                ColumnId::new_for_test(30),
+                producer_a.column_id,
+                producer_b.column_id,
+                producer_c.column_id,
             ],
         }));
 
-        // Consumer subtree: Join of consume1 and consume2.
         let consumer = OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
                 condition: None,
             }),
-            vec![consume1, consume2],
+            vec![consume_a, consume_b],
         );
-
         let anchor = OptExpr::new(
             Operator::LogicalCTEAnchor(CTEAnchorOp { cte_id }),
             vec![produce, consumer],
         );
 
         let arena = arena_rc.borrow();
-        let tagged = tag_required_columns(anchor, &arena, Some(needed_set(&[102, 203])));
-
-        assert!(matches!(&tagged.op, Operator::LogicalCTEAnchor(_)));
+        let tagged = tag_required_columns(anchor, &arena, Some(needed_set(&[201, 303])));
         let produce = tagged.child(0);
-        assert!(matches!(&produce.op, Operator::LogicalCTEProduce(_)));
-        let produce_input = produce.unary_input();
-        assert!(matches!(&produce_input.op, Operator::LogicalScan(_)));
-        let req = required_columns(produce_input);
-        // Conservative keep-all: produce body scan keeps all 3 columns.
         assert_eq!(
-            req.len(),
-            3,
-            "scan must keep all columns (keep-all for CTE produce body)"
+            produce.required_output_columns.as_ref().unwrap(),
+            &needed_set(&[101, 103])
         );
-        assert!(req.contains(&ColumnId::new_for_test(10)), "a@10 kept");
-        assert!(req.contains(&ColumnId::new_for_test(20)), "b@20 kept");
-        assert!(req.contains(&ColumnId::new_for_test(30)), "c@30 kept");
+        assert_eq!(
+            produce.child(0).required_output_columns.as_ref().unwrap(),
+            &needed_set(&[101, 103])
+        );
     }
 
     // -----------------------------------------------------------------------
